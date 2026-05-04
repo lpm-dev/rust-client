@@ -1,4 +1,4 @@
-use crate::graph_render::{self, DepGraph, RenderOptions};
+use crate::graph_render::{self, DepGraph};
 use crate::output;
 use crate::overrides_state;
 use lpm_common::LpmError;
@@ -19,6 +19,18 @@ pub async fn run(
     json_output: bool,
     no_open: bool,
 ) -> Result<(), LpmError> {
+    // `--no-open` only governs the post-write browser launch under
+    // `--format html`. For any other format the flag is a silent no-op,
+    // which masks user mistakes (e.g. `lpm graph --no-open` without
+    // `--format html`). Surface a one-line warning so the user sees the
+    // flag has no effect in this configuration. Suppressed under --json
+    // to keep the JSON contract clean.
+    if no_open && format != "html" && !json_output {
+        output::warn(
+            "--no-open has no effect without `--format html` (other formats write to stdout).",
+        );
+    }
+
     // Load lockfile
     let lockfile_path = project_dir.join("lpm.lock");
     let lockfile = if lockfile_path.exists() {
@@ -117,7 +129,16 @@ pub async fn run(
             return Ok(());
         }
         graph_render::filter_graph(&mut graph, f);
-        recompute_stats(&mut graph);
+        graph_render::recompute_stats(&mut graph);
+    }
+
+    // Apply --depth at the graph level so every renderer (tree, dot,
+    // mermaid, json, stats, html) honors the same truncated set. Done
+    // after subtree restriction and filter so depth is measured against
+    // whatever ended up rooted at depth 0.
+    if let Some(max) = max_depth {
+        graph_render::prune_to_depth(&mut graph, max);
+        graph_render::recompute_stats(&mut graph);
     }
 
     // **Phase 32 Phase 5** — load the persisted override apply trace
@@ -158,16 +179,13 @@ pub async fn run(
         return Ok(());
     }
 
-    // Render based on format
-    let options = RenderOptions {
-        max_depth,
-        filter: None, // already applied at graph level
-    };
-
+    // Render based on format. `--filter` and `--depth` were already
+    // applied above as graph-level mutations, so every renderer below
+    // receives the same pruned graph.
     match format {
         "tree" | "" => {
             let use_color = std::io::IsTerminal::is_terminal(&std::io::stdout());
-            print!("{}", graph_render::render_tree(&graph, &options, use_color));
+            print!("{}", graph_render::render_tree(&graph, use_color));
         }
         "dot" => {
             print!("{}", graph_render::render_dot(&graph));
@@ -190,16 +208,16 @@ pub async fn run(
             std::fs::write(&out_path, &html)
                 .map_err(|e| LpmError::Script(format!("failed to write graph.html: {e}")))?;
 
-            let size = html.len();
             output::success(&format!(
-                "generated {} ({} KB)",
+                "generated {} ({})",
                 out_path.display(),
-                size / 1024,
+                format_byte_size(html.len()),
             ));
 
             // Open in browser unless suppressed (headless / CI).
-            if !no_open {
-                let _ = open::that(&out_path);
+            if !no_open && open::that(&out_path).is_err() && !json_output {
+                output::warn("Could not open browser automatically.");
+                println!("  Open this file manually: {}", out_path.display());
             }
         }
         _ => {
@@ -286,7 +304,7 @@ fn restrict_to_subtree(graph: &mut DepGraph, subtree_root: &str) {
     }
 
     // Recompute stats
-    recompute_stats(graph);
+    graph_render::recompute_stats(graph);
 }
 
 /// Remove nodes not reachable from the root.
@@ -315,53 +333,22 @@ fn prune_unreachable(graph: &mut DepGraph) {
     }
 
     graph.nodes.retain(|k, _| reachable.contains(k));
-    recompute_stats(graph);
+    graph_render::recompute_stats(graph);
 }
 
-/// Recompute graph stats after mutation (pruning or subtree restriction).
-fn recompute_stats(graph: &mut DepGraph) {
-    let lpm_count = graph
-        .nodes
-        .values()
-        .filter(|n| n.registry == graph_render::Registry::Lpm)
-        .count();
-    let npm_count = graph
-        .nodes
-        .values()
-        .filter(|n| n.registry == graph_render::Registry::Npm)
-        .count();
-    let max_depth = graph.nodes.values().map(|n| n.depth).max().unwrap_or(0);
-
-    // Recompute duplicates
-    let mut name_versions: std::collections::HashMap<String, Vec<String>> =
-        std::collections::HashMap::new();
-    for node in graph.nodes.values() {
-        name_versions
-            .entry(node.name.clone())
-            .or_default()
-            .push(node.version.clone());
+/// Format a byte count as a short human-readable string. Uses 1024-based
+/// units to match `du -h` / file managers; switches unit at the natural
+/// boundary so a 900-byte HTML never reads as "0 KB".
+fn format_byte_size(bytes: usize) -> String {
+    const KIB: usize = 1024;
+    const MIB: usize = 1024 * 1024;
+    if bytes >= MIB {
+        format!("{:.1} MB", bytes as f64 / MIB as f64)
+    } else if bytes >= KIB {
+        format!("{:.1} KB", bytes as f64 / KIB as f64)
+    } else {
+        format!("{bytes} B")
     }
-    let mut duplicates = Vec::new();
-    for (name, versions) in &name_versions {
-        let mut sorted = versions.clone();
-        sorted.sort();
-        sorted.dedup();
-        if sorted.len() > 1 {
-            duplicates.push((name.clone(), sorted));
-        }
-    }
-    duplicates.sort_by(|a, b| a.0.cmp(&b.0));
-
-    // Count root nodes to exclude from total
-    let root_count = graph.nodes.values().filter(|n| n.is_root).count();
-
-    graph.stats = graph_render::GraphStats {
-        total_packages: graph.nodes.len().saturating_sub(root_count),
-        lpm_packages: lpm_count,
-        npm_packages: npm_count,
-        max_depth,
-        duplicates,
-    };
 }
 
 #[cfg(test)]
@@ -555,7 +542,7 @@ mod tests {
     #[test]
     fn fixture_tree_output() {
         let graph = load_fixture_graph();
-        let tree = graph_render::render_tree(&graph, &RenderOptions::default(), false);
+        let tree = graph_render::render_tree(&graph, false);
         assert!(tree.contains("express@4.22.1"));
         assert!(tree.contains("@lpm.dev/neo.highlight@1.1.1"));
         assert!(tree.contains("vitest@1.6.0"));
@@ -648,28 +635,50 @@ mod tests {
 
     #[test]
     fn fixture_depth_limit() {
-        let graph = load_fixture_graph();
-        let opts = RenderOptions {
-            max_depth: Some(2),
-            ..Default::default()
-        };
-        let tree = graph_render::render_tree(&graph, &opts, false);
+        let mut graph = load_fixture_graph();
+        // --depth 2 keeps root + direct deps (express, neo.highlight, vitest)
+        graph_render::prune_to_depth(&mut graph, 2);
+        graph_render::recompute_stats(&mut graph);
+        let tree = graph_render::render_tree(&graph, false);
         assert!(tree.contains("express@4.22.1"), "direct dep should show");
-        // ms is depth 3+ (root→express→debug→ms), should NOT appear
+        // ms is at depth 3+ (root→express→debug→ms), should NOT appear
         assert!(!tree.contains("ms@2.0.0"), "deep dep should be hidden");
+    }
+
+    /// Depth-prune is applied at the graph level so non-tree formats see
+    /// the same truncated set. Regression for the bug where `--depth N`
+    /// only pruned the tree renderer and left dot/json/html unaffected.
+    #[test]
+    fn fixture_depth_limit_applies_to_json_format() {
+        let mut graph = load_fixture_graph();
+        graph_render::prune_to_depth(&mut graph, 2);
+        graph_render::recompute_stats(&mut graph);
+        let json = graph_render::render_json(&graph);
+        assert!(json.contains("express"), "direct dep should be in JSON");
+        // ms is depth 3+; before the fix this would still appear in JSON.
+        assert!(
+            !json.contains("\"ms\""),
+            "deep dep should be pruned from JSON: {json}"
+        );
+        // Stats reflect the pruned graph, not the original.
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert!(
+            parsed["packages"].as_u64().unwrap() < 8,
+            "package count should drop after depth prune: {json}"
+        );
     }
 
     /// Helper: apply graph-level filter (matches what `run()` does).
     fn apply_filter(graph: &mut DepGraph, filter: &str) {
         graph_render::filter_graph(graph, filter);
-        recompute_stats(graph);
+        graph_render::recompute_stats(graph);
     }
 
     #[test]
     fn fixture_filter_tree() {
         let mut graph = load_fixture_graph();
         apply_filter(&mut graph, "debug");
-        let tree = graph_render::render_tree(&graph, &RenderOptions::default(), false);
+        let tree = graph_render::render_tree(&graph, false);
         assert!(tree.contains("debug@2.6.9"), "matched node should show");
         assert!(tree.contains("express"), "parent of match should show");
         assert!(

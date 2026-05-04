@@ -31,6 +31,14 @@ pub enum Registry {
 }
 
 /// Statistics about the dependency graph.
+///
+/// `max_depth` is **1-based** to match the user-facing `--depth N` flag
+/// contract: the project root is level 1, direct deps are level 2, one
+/// transitive layer beyond is level 3. An empty graph has `max_depth = 0`.
+/// This matches `from_lockfile` and `recompute_stats` (both convert the
+/// 0-based BFS `node.depth` to the 1-based level by adding 1) so the
+/// number rendered into stats / json / html / tree summaries matches what
+/// the user typed for `--depth`.
 #[derive(Debug, Clone)]
 pub struct GraphStats {
     pub total_packages: usize,
@@ -38,6 +46,13 @@ pub struct GraphStats {
     pub npm_packages: usize,
     pub max_depth: usize,
     pub duplicates: Vec<(String, Vec<String>)>, // (name, [versions])
+}
+
+/// Convert the BFS `node.depth` set into the 1-based depth level shown
+/// in user-facing summaries. Empty graph stays at 0; root-only graph
+/// reports 1; deeper trees report `max(node.depth) + 1`.
+fn level_from_node_depths<'a>(depths: impl Iterator<Item = &'a usize>) -> usize {
+    depths.max().map(|d| d + 1).unwrap_or(0)
 }
 
 /// The full dependency graph.
@@ -48,13 +63,6 @@ pub struct DepGraph {
     pub roots: Vec<String>,
     /// Computed stats.
     pub stats: GraphStats,
-}
-
-/// Options for rendering.
-#[derive(Default)]
-pub struct RenderOptions {
-    pub max_depth: Option<usize>,
-    pub filter: Option<String>,
 }
 
 // ── Graph Construction ─────────────────────────────────────────────
@@ -174,7 +182,8 @@ impl DepGraph {
         }
         duplicates.sort_by(|a, b| a.0.cmp(&b.0));
 
-        let max_depth = nodes.values().map(|n| n.depth).max().unwrap_or(0);
+        // 1-based to match the `--depth N` flag contract (root = 1).
+        let max_depth = level_from_node_depths(nodes.values().map(|n| &n.depth));
         let lpm_count = nodes
             .values()
             .filter(|n| n.registry == Registry::Lpm)
@@ -274,7 +283,7 @@ impl DepGraph {
 
 // ── Tree Renderer ──────────────────────────────────────────────────
 
-pub fn render_tree(graph: &DepGraph, options: &RenderOptions, use_color: bool) -> String {
+pub fn render_tree(graph: &DepGraph, use_color: bool) -> String {
     let mut output = String::new();
 
     let mut sorted_roots = graph.roots.clone();
@@ -288,7 +297,6 @@ pub fn render_tree(graph: &DepGraph, options: &RenderOptions, use_color: bool) -
             "",
             is_last,
             1,
-            options,
             use_color,
             &mut HashSet::new(),
             &mut output,
@@ -327,17 +335,10 @@ fn render_tree_node(
     prefix: &str,
     is_last: bool,
     depth: usize,
-    options: &RenderOptions,
     use_color: bool,
     visited: &mut HashSet<String>,
     output: &mut String,
 ) {
-    if let Some(max) = options.max_depth
-        && depth > max
-    {
-        return;
-    }
-
     let connector = if depth == 1 {
         ""
     } else if is_last {
@@ -350,14 +351,6 @@ fn render_tree_node(
         Some(n) => n,
         None => return,
     };
-
-    // Apply filter: skip subtrees that don't contain the filter target
-    if let Some(ref filter) = options.filter
-        && !node.is_root
-        && !subtree_contains(graph, key, filter, &mut HashSet::new())
-    {
-        return;
-    }
 
     let label = format!("{}@{}", node.name, node.version);
     let colored_label = if use_color {
@@ -402,7 +395,6 @@ fn render_tree_node(
             &child_prefix,
             is_last_child,
             depth + 1,
-            options,
             use_color,
             visited,
             output,
@@ -410,40 +402,6 @@ fn render_tree_node(
     }
 
     visited.remove(key);
-}
-
-/// Check if a node or any of its descendants contain the filter string in their name.
-/// Uses backtracking (removes from visited after recursion) so that sibling subtrees
-/// sharing a common descendant can each independently find it.
-fn subtree_contains(
-    graph: &DepGraph,
-    key: &str,
-    filter: &str,
-    visited: &mut HashSet<String>,
-) -> bool {
-    if !visited.insert(key.to_string()) {
-        return false;
-    }
-
-    if graph
-        .nodes
-        .get(key)
-        .is_some_and(|n| n.name.contains(filter))
-    {
-        visited.remove(key);
-        return true;
-    }
-
-    let result = if let Some(node) = graph.nodes.get(key) {
-        node.dependencies
-            .iter()
-            .any(|dep_key| subtree_contains(graph, dep_key, filter, visited))
-    } else {
-        false
-    };
-
-    visited.remove(key);
-    result
 }
 
 // ── Graph-level filter ────────────────────────────────────────────
@@ -497,10 +455,19 @@ fn mark_matching_subtrees(
     let self_matches = node.name.contains(filter);
 
     // Check children (need to clone deps to avoid borrow conflict)
+    // Walk every child; do NOT use `.any()` here. `.any()` short-circuits
+    // on the first true, which silently drops sibling branches in a
+    // diamond pattern (root → {a, b} → shared-target). When `a` matches,
+    // `b` would never be visited and gets pruned even though its subtree
+    // also contains the target. Each child must be evaluated for its own
+    // sake so its mark / keep_subtree side effects fire.
     let deps = node.dependencies.clone();
-    let child_matches = deps
-        .iter()
-        .any(|dep_key| mark_matching_subtrees(graph, dep_key, filter, keep, visited));
+    let mut child_matches = false;
+    for dep_key in &deps {
+        if mark_matching_subtrees(graph, dep_key, filter, keep, visited) {
+            child_matches = true;
+        }
+    }
 
     visited.remove(key);
 
@@ -526,6 +493,98 @@ fn keep_subtree(graph: &DepGraph, key: &str, keep: &mut HashSet<String>) {
             }
         }
     }
+}
+
+// ── Graph-level depth limit ───────────────────────────────────────
+
+/// Drop nodes deeper than `max_depth` from the graph. The contract matches
+/// `lpm graph --depth N`: the project root counts as level 1, direct deps
+/// as level 2, and so on. `--depth 1` keeps just the root, `--depth 2` keeps
+/// root + direct deps, `--depth 3` keeps one transitive layer beyond.
+///
+/// Applied at the graph level (vs. inside the tree renderer) so every
+/// renderer — tree, dot, mermaid, json, stats, html — sees the same pruned
+/// graph. The caller is responsible for calling `recompute_stats` afterward
+/// so the summary line / `stats` / `html` header reflect the pruned counts.
+///
+/// Implemented as a BFS from `graph.roots` rather than reading
+/// `node.depth` directly. `from_lockfile`'s BFS leaves orphan packages
+/// (lockfile entries with no parent) at the default `depth = 0`, which
+/// would otherwise survive a `--depth 1` even though they are not in the
+/// reachable dependency tree.
+pub fn prune_to_depth(graph: &mut DepGraph, max_depth: usize) {
+    let mut keep: HashSet<String> = HashSet::new();
+    let mut queue: VecDeque<(String, usize)> = VecDeque::new();
+
+    for root_key in &graph.roots {
+        queue.push_back((root_key.clone(), 0));
+    }
+
+    while let Some((key, bfs_depth)) = queue.pop_front() {
+        if bfs_depth >= max_depth {
+            continue;
+        }
+        if !keep.insert(key.clone()) {
+            continue;
+        }
+        if let Some(node) = graph.nodes.get(&key) {
+            for dep_key in &node.dependencies {
+                queue.push_back((dep_key.clone(), bfs_depth + 1));
+            }
+        }
+    }
+
+    graph.nodes.retain(|k, _| keep.contains(k));
+
+    for node in graph.nodes.values_mut() {
+        node.dependencies.retain(|dep_key| keep.contains(dep_key));
+    }
+}
+
+/// Recompute graph stats after a mutation (filter, depth-prune,
+/// subtree restriction, unreachable prune). Counts exclude synthetic
+/// root nodes so `total_packages` is the user-meaningful count.
+pub fn recompute_stats(graph: &mut DepGraph) {
+    let lpm_count = graph
+        .nodes
+        .values()
+        .filter(|n| n.registry == Registry::Lpm)
+        .count();
+    let npm_count = graph
+        .nodes
+        .values()
+        .filter(|n| n.registry == Registry::Npm)
+        .count();
+    // 1-based to match the `--depth N` flag contract (root = 1).
+    let max_depth = level_from_node_depths(graph.nodes.values().map(|n| &n.depth));
+
+    let mut name_versions: HashMap<String, Vec<String>> = HashMap::new();
+    for node in graph.nodes.values() {
+        name_versions
+            .entry(node.name.clone())
+            .or_default()
+            .push(node.version.clone());
+    }
+    let mut duplicates = Vec::new();
+    for (name, versions) in &name_versions {
+        let mut sorted = versions.clone();
+        sorted.sort();
+        sorted.dedup();
+        if sorted.len() > 1 {
+            duplicates.push((name.clone(), sorted));
+        }
+    }
+    duplicates.sort_by(|a, b| a.0.cmp(&b.0));
+
+    let root_count = graph.nodes.values().filter(|n| n.is_root).count();
+
+    graph.stats = GraphStats {
+        total_packages: graph.nodes.len().saturating_sub(root_count),
+        lpm_packages: lpm_count,
+        npm_packages: npm_count,
+        max_depth,
+        duplicates,
+    };
 }
 
 // ── Escape Helpers ─────────────────────────────────────────────────
@@ -1138,7 +1197,7 @@ mod tests {
     #[test]
     fn tree_output_has_box_drawing() {
         let graph = DepGraph::from_lockfile(&mock_packages(), &direct_deps(), "test-app@1.0.0");
-        let tree = render_tree(&graph, &RenderOptions::default(), false);
+        let tree = render_tree(&graph, false);
         assert!(
             tree.contains("├──") || tree.contains("└──"),
             "tree should have box-drawing: {tree}"
@@ -1188,6 +1247,67 @@ mod tests {
         assert!(stats.contains("7 packages"));
         assert!(stats.contains("1 LPM"));
         assert!(stats.contains("Duplicates: 1"));
+    }
+
+    /// Regression: the displayed `Max depth` is 1-based to match the
+    /// user-facing `--depth N` contract (root = level 1, direct = level 2).
+    /// Before the fix, `recompute_stats` derived `max_depth` from raw
+    /// `node.depth` (0-based BFS depth), so `lpm graph --format stats
+    /// --depth 2` reported "Max depth: 1" — read as a contract violation
+    /// against the docs that said level 2 == direct deps.
+    #[test]
+    fn stats_max_depth_is_one_based_after_prune() {
+        let mut graph = DepGraph::from_lockfile(&mock_packages(), &direct_deps(), "test-app@1.0.0");
+        // --depth 2: root + direct deps. Highest node-depth is 1 (direct),
+        // user-facing level is 2.
+        prune_to_depth(&mut graph, 2);
+        recompute_stats(&mut graph);
+        assert_eq!(
+            graph.stats.max_depth, 2,
+            "stats.max_depth should match the --depth flag input (1-based)"
+        );
+
+        let stats = render_stats(&graph);
+        assert!(
+            stats.contains("Max depth: 2"),
+            "stats text should display 1-based level matching --depth: {stats}"
+        );
+
+        let json = render_json(&graph);
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            parsed["max_depth"].as_u64(),
+            Some(2),
+            "json max_depth must mirror the 1-based stats value: {json}"
+        );
+
+        let html = render_html(&graph);
+        assert!(
+            html.contains("Max depth: 2"),
+            "html stats summary must use the 1-based level"
+        );
+    }
+
+    /// Boundary cases for the 1-based level conversion.
+    #[test]
+    fn stats_max_depth_root_only_and_empty() {
+        // Root only — pruned to --depth 1 keeps just the synthetic root.
+        let mut graph = DepGraph::from_lockfile(&mock_packages(), &direct_deps(), "test-app@1.0.0");
+        prune_to_depth(&mut graph, 1);
+        recompute_stats(&mut graph);
+        assert_eq!(
+            graph.stats.max_depth, 1,
+            "root-only graph reports 1 level (the project itself)"
+        );
+
+        // Empty — pruned to --depth 0 drops everything.
+        let mut graph = DepGraph::from_lockfile(&mock_packages(), &direct_deps(), "test-app@1.0.0");
+        prune_to_depth(&mut graph, 0);
+        recompute_stats(&mut graph);
+        assert_eq!(
+            graph.stats.max_depth, 0,
+            "empty graph reports 0 levels (nothing rendered)"
+        );
     }
 
     #[test]
@@ -1286,12 +1406,9 @@ mod tests {
 
     #[test]
     fn filter_shows_matching_subtrees() {
-        let graph = DepGraph::from_lockfile(&mock_packages(), &direct_deps(), "test-app@1.0.0");
-        let opts = RenderOptions {
-            filter: Some("ms".into()),
-            ..Default::default()
-        };
-        let tree = render_tree(&graph, &opts, false);
+        let mut graph = DepGraph::from_lockfile(&mock_packages(), &direct_deps(), "test-app@1.0.0");
+        filter_graph(&mut graph, "ms");
+        let tree = render_tree(&graph, false);
         // "ms" is under express→debug→ms, so express and debug should appear
         assert!(
             tree.contains("express"),
@@ -1310,23 +1427,93 @@ mod tests {
 
     #[test]
     fn depth_limit() {
-        let graph = DepGraph::from_lockfile(&mock_packages(), &direct_deps(), "test-app@1.0.0");
-        // depth 2 = root + direct deps (express, neo.highlight)
-        let opts = RenderOptions {
-            max_depth: Some(2),
-            ..Default::default()
-        };
-        let tree = render_tree(&graph, &opts, false);
+        let mut graph = DepGraph::from_lockfile(&mock_packages(), &direct_deps(), "test-app@1.0.0");
+        // --depth 2 keeps root + direct deps (express, neo.highlight)
+        prune_to_depth(&mut graph, 2);
+        let tree = render_tree(&graph, false);
         assert!(
             tree.contains("express@4.22.1"),
             "should show direct dep: {tree}"
         );
         assert!(tree.contains("test-app"), "should show root: {tree}");
-        // ms is depth 4 (root→express→debug→ms), should NOT appear
+        // ms is depth 3+ (root→express→debug→ms), should NOT appear
         assert!(
             !tree.contains("ms@2.0.0"),
             "should not show deep transitive dep: {tree}"
         );
+    }
+
+    /// Regression: `--depth N` was historically only honored by the tree
+    /// renderer; dot/json/mermaid/stats/html silently rendered the full
+    /// graph. After the fix it is applied at the graph level so every
+    /// renderer sees the truncated set, including the duplicates summary
+    /// embedded in the HTML header.
+    #[test]
+    fn depth_limit_applies_to_all_formats() {
+        let mut graph = DepGraph::from_lockfile(&mock_packages(), &direct_deps(), "test-app@1.0.0");
+        prune_to_depth(&mut graph, 2);
+        // Mirror the production command flow: stats must be recomputed
+        // after a graph mutation or stale duplicate / count info leaks
+        // into the stats / html surfaces.
+        recompute_stats(&mut graph);
+
+        // dot
+        let dot = render_dot(&graph);
+        assert!(dot.contains("express"), "dot should keep direct dep");
+        assert!(
+            !dot.contains("ms@2.0.0"),
+            "dot should drop deep transitive: {dot}"
+        );
+
+        // mermaid
+        let mermaid = render_mermaid(&graph);
+        assert!(
+            mermaid.contains("express"),
+            "mermaid should keep direct dep"
+        );
+        assert!(
+            !mermaid.contains("ms@2.0.0"),
+            "mermaid should drop deep transitive"
+        );
+
+        // json
+        let json = render_json(&graph);
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let names: Vec<&str> = parsed["nodes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|n| n["name"].as_str().unwrap())
+            .collect();
+        assert!(
+            names.contains(&"express"),
+            "json should keep direct dep: {names:?}"
+        );
+        assert!(
+            !names.contains(&"ms"),
+            "json should drop deep transitive: {names:?}"
+        );
+
+        // html — stats summary embedded in the page header reflects the
+        // pruned graph, not the original duplicate set.
+        let html = render_html(&graph);
+        assert!(html.contains("express"), "html should keep direct dep");
+        assert!(
+            !html.contains("ms@2.0.0"),
+            "html should drop deep transitive"
+        );
+    }
+
+    /// Regression: pruning to depth 1 keeps just the root node. The
+    /// historical inline-tree-only check returned early on depth=1 before
+    /// drawing anything; the graph-level prune yields the same shape.
+    #[test]
+    fn depth_one_keeps_only_root() {
+        let mut graph = DepGraph::from_lockfile(&mock_packages(), &direct_deps(), "test-app@1.0.0");
+        prune_to_depth(&mut graph, 1);
+        // Only the synthetic root remains (depth 0).
+        assert_eq!(graph.nodes.len(), 1);
+        assert!(graph.nodes.contains_key("test-app@1.0.0"));
     }
 
     // ── Finding #1: XSS via unescaped __STATS__ in HTML ──────────────
@@ -1590,12 +1777,9 @@ mod tests {
             .iter()
             .map(|s| s.to_string())
             .collect();
-        let graph = DepGraph::from_lockfile(&packages, &direct, "app@1.0.0");
-        let opts = RenderOptions {
-            filter: Some("shared-target".into()),
-            ..Default::default()
-        };
-        let tree = render_tree(&graph, &opts, false);
+        let mut graph = DepGraph::from_lockfile(&packages, &direct, "app@1.0.0");
+        filter_graph(&mut graph, "shared-target");
+        let tree = render_tree(&graph, false);
         assert!(
             tree.contains("branch-a"),
             "branch-a should appear (leads to match): {tree}"
@@ -1661,7 +1845,7 @@ mod tests {
     #[test]
     fn render_tree_no_ansi_when_color_disabled() {
         let graph = DepGraph::from_lockfile(&mock_packages(), &direct_deps(), "test-app@1.0.0");
-        let tree = render_tree(&graph, &RenderOptions::default(), false);
+        let tree = render_tree(&graph, false);
         assert!(
             !tree.contains("\x1b["),
             "should have no ANSI codes when use_color=false: {tree}"
@@ -1671,7 +1855,7 @@ mod tests {
     #[test]
     fn render_tree_has_ansi_when_color_enabled() {
         let graph = DepGraph::from_lockfile(&mock_packages(), &direct_deps(), "test-app@1.0.0");
-        let tree = render_tree(&graph, &RenderOptions::default(), true);
+        let tree = render_tree(&graph, true);
         assert!(
             tree.contains("\x1b["),
             "should have ANSI codes when use_color=true: {tree}"
@@ -1893,7 +2077,7 @@ mod tests {
         assert_eq!(graph.stats.npm_packages, 0);
 
         // All renderers should handle it without panic
-        let _tree = render_tree(&graph, &RenderOptions::default(), false);
+        let _tree = render_tree(&graph, false);
         let _dot = render_dot(&graph);
         let _mermaid = render_mermaid(&graph);
         let _json = render_json(&graph);
@@ -2260,7 +2444,7 @@ mod tests {
         ];
         let direct: HashSet<String> = ["a"].iter().map(|s| s.to_string()).collect();
         let graph = DepGraph::from_lockfile(&packages, &direct, "app@1.0.0");
-        let tree = render_tree(&graph, &RenderOptions::default(), false);
+        let tree = render_tree(&graph, false);
         assert!(
             tree.contains("(circular)"),
             "should mark circular dependency: {tree}"

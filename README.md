@@ -68,7 +68,7 @@ lpm tunnel inspect             # View captured webhooks
 lpm tunnel replay <n>          # Replay a webhook
 lpm cert status                # Local HTTPS certificate info
 lpm cert trust                 # Install CA to trust store
-lpm graph                      # Dependency tree (--dot, --mermaid, --html)
+lpm graph                      # Dependency graph (--format tree|dot|mermaid|json|stats|html)
 lpm ports                      # Dev service port management
 
 # Workspaces & deployment
