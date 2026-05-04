@@ -532,8 +532,61 @@ pub async fn run(
         ensure_lpm_in_files(&pkg_json_path, &pkg_json)?;
     }
 
-    // Step 4c: Skills staleness check (LPM only)
-    if has_skills && targets_lpm {
+    // Step 4bb: OIDC auto-exchange (LPM target only, real publish + dry-run).
+    //
+    // Gated on `targets_lpm && !check_only`:
+    //
+    // - **`targets_lpm`** — `--npm` / `--github` / `--gitlab`-only publishes
+    //   never touch the LPM target client, so leaking the package name to the
+    //   LPM exchange endpoint would be a privacy violation with no upside.
+    // - **`!check_only`** — `--check` is a local-validation surface; running
+    //   a real CI OIDC exchange there mints a session token the user never
+    //   asked for and contradicts the documented contract. `--dry-run` IS
+    //   honored — it forms part of the LPM-side preflight (alongside the
+    //   skills-staleness lookup below) so OIDC trust misconfiguration
+    //   surfaces before a real publish. Note: dry-run does NOT cover the
+    //   later per-target auth checks (whoami/permissions) — those run only
+    //   on a real publish.
+    //
+    // Placed right before Step 4c so the skill-staleness check (the first
+    // LPM-target network call) gets the swapped client too.
+    //
+    // The origin requires `package` for `scope=publish` (see a-package-manager
+    // `app/api/registry/-/token/oidc/route.js`), and the package name only
+    // becomes known after `package.json` is parsed — that's why this can't
+    // live in main.rs.
+    //
+    // Failure is non-fatal: the original `client` is reused so a missing
+    // OIDC policy or a misconfigured token can still publish via the stored
+    // session token. The failure is debug-logged for diagnostics.
+    let oidc_swapped_client;
+    let client: &RegistryClient =
+        if targets_lpm && !check_only && oidc::registry_exchange_jwt_available() {
+            match oidc::exchange_oidc_token(client.base_url(), Some(name), "publish").await {
+                Ok(oidc_token) => {
+                    oidc_swapped_client = client.clone_with_config().with_token(oidc_token.token);
+                    if !json_output {
+                        output::info("Using OIDC-exchanged session token for LPM publish.");
+                    }
+                    &oidc_swapped_client
+                }
+                Err(e) => {
+                    tracing::debug!("OIDC publish auto-exchange failed, using stored token: {e}");
+                    client
+                }
+            }
+        } else {
+            client
+        };
+
+    // Step 4c: Skills staleness check (LPM only, real publish + dry-run).
+    //
+    // Gated to skip in `--check` mode: this is a network read against the
+    // LPM registry, and `--check` is the local-validation surface. Kept on
+    // for `--dry-run` because the staleness diagnostic ("your skills are
+    // identical to the previously published version") is part of the
+    // LPM-side preflight a dry-run is meant to surface.
+    if has_skills && targets_lpm && !check_only {
         let name_short = name.strip_prefix("@lpm.dev/").unwrap_or(name);
         match client.get_skills(name_short, None).await {
             Ok(prev) if !prev.skills.is_empty() => {
@@ -672,60 +725,16 @@ pub async fn run(
         "integrity": hashes.integrity,
     });
 
-    // Step 8b: Prepare OIDC JWT for Sigstore provenance (if --provenance)
-    // The JWT is fetched once; provenance is generated per-target after tarball rewriting.
+    // Step 8b: Prepare OIDC JWT for Sigstore provenance (if --provenance).
+    // Resolved once and reused per target — provenance is generated per-target
+    // after tarball rewriting so the SHA-512 in the SLSA statement matches the
+    // bytes actually uploaded.
     let provenance_context = if provenance_flag {
-        // C7: --provenance requires a CI environment with OIDC (strict)
-        let ci = oidc::detect_ci_environment().ok_or_else(|| {
-            LpmError::Registry(
-                "--provenance requires a CI environment with OIDC support \
-				 (GitHub Actions with `permissions: id-token: write`, or GitLab CI)"
-                    .into(),
-            )
-        })?;
-
         if !json_output {
             output::info("Preparing Sigstore provenance...");
         }
-
-        // Get raw OIDC JWT (not exchanged with LPM — sent directly to Fulcio)
-        let oidc_jwt = match ci {
-            oidc::CiEnvironment::GitHubActions => {
-                let request_url = std::env::var("ACTIONS_ID_TOKEN_REQUEST_URL").map_err(|_| {
-                    LpmError::Registry("ACTIONS_ID_TOKEN_REQUEST_URL not set".into())
-                })?;
-                let request_token =
-                    std::env::var("ACTIONS_ID_TOKEN_REQUEST_TOKEN").map_err(|_| {
-                        LpmError::Registry("ACTIONS_ID_TOKEN_REQUEST_TOKEN not set".into())
-                    })?;
-                let url = format!("{request_url}&audience=sigstore");
-                let resp = reqwest::Client::new()
-                    .get(&url)
-                    .bearer_auth(&request_token)
-                    .send()
-                    .await
-                    .map_err(|e| LpmError::Registry(format!("GitHub OIDC fetch failed: {e}")))?;
-                let body: serde_json::Value = resp
-                    .json()
-                    .await
-                    .map_err(|e| LpmError::Registry(format!("GitHub OIDC parse error: {e}")))?;
-                body.get("value")
-                    .and_then(|v| v.as_str())
-                    .map(|s| s.to_string())
-                    .ok_or_else(|| {
-                        LpmError::Registry("GitHub OIDC response missing 'value'".into())
-                    })?
-            }
-            oidc::CiEnvironment::GitLabCI => std::env::var("SIGSTORE_ID_TOKEN")
-                .or_else(|_| std::env::var("LPM_GITLAB_OIDC_TOKEN"))
-                .map_err(|_| {
-                    LpmError::Registry(
-						"GitLab CI: set SIGSTORE_ID_TOKEN or LPM_GITLAB_OIDC_TOKEN env var for provenance".into()
-					)
-                })?,
-        };
-
-        Some((ci, oidc_jwt))
+        let (ci, jwt) = oidc::resolve_provenance_jwt().await?;
+        Some((ci, jwt))
     } else {
         None
     };

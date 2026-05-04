@@ -913,14 +913,19 @@ async fn env_pull_oidc_writes_env_file_with_sorted_and_quoted_values() {
 }
 
 #[tokio::test]
-async fn env_pull_oidc_prefers_gitlab_ci_job_jwt_and_emits_json() {
+async fn env_pull_oidc_uses_lpm_oidc_token_canonical_and_ignores_ci_job_jwt_v2() {
+    // Locks the contract that LPM_OIDC_TOKEN is the canonical registry-exchange
+    // input on every provider, and CI_JOB_JWT_V2 (whose default audience is the
+    // GitLab instance URL, NOT https://lpm.dev) is intentionally ignored — the
+    // origin's vault verifier rejects anything but `aud=https://lpm.dev`, so
+    // honoring CI_JOB_JWT_V2 would produce confusing 401s.
     let project = TempProject::empty(r#"{"name":"vault-oidc-gitlab-json-test","version":"1.0.0"}"#);
     let mock = MockRegistry::start().await;
 
     project.write_file("lpm.json", r#"{"vault":"vault-gitlab-json-123"}"#);
 
     mock.with_oidc_exchange(
-        "gitlab-job-jwt",
+        "lpm-oidc-token-with-aud-lpm-dev",
         "vault-gitlab-json-123",
         Some("preview"),
         "lpm-gitlab-ci-token",
@@ -939,8 +944,12 @@ async fn env_pull_oidc_prefers_gitlab_ci_job_jwt_and_emits_json() {
 
     let output = lpm(&project)
         .env("LPM_REGISTRY_URL", mock.url())
-        .env("CI_JOB_JWT_V2", "gitlab-job-jwt")
-        .env("LPM_OIDC_TOKEN", "generic-fallback-token")
+        // Both set: the contract requires LPM_OIDC_TOKEN to win and
+        // CI_JOB_JWT_V2 to be ignored. If anyone reverts and starts honoring
+        // CI_JOB_JWT_V2 again, the mock's exchange handler will see the wrong
+        // input token and the test fails.
+        .env("CI_JOB_JWT_V2", "should-be-ignored")
+        .env("LPM_OIDC_TOKEN", "lpm-oidc-token-with-aud-lpm-dev")
         .args(["--json", "env", "pull", "--oidc", "--env=preview"])
         .output()
         .expect("failed to run GitLab OIDC pull --json");
@@ -1084,51 +1093,74 @@ async fn env_pull_oidc_uses_github_actions_runtime_token() {
 }
 
 #[tokio::test]
-async fn env_pull_oidc_requires_github_request_token_when_actions_env_is_set() {
-    let project = TempProject::empty(
-        r#"{"name":"vault-oidc-github-missing-request-token","version":"1.0.0"}"#,
-    );
+async fn env_pull_oidc_partial_github_signal_token_only_falls_through() {
+    // A partial GitHub Actions signal — only ACTIONS_ID_TOKEN_REQUEST_TOKEN
+    // set, no URL — must NOT trigger a runtime fetch attempt. With no other
+    // signal present, the resolver falls through to the named-vars error.
+    // This is the new contract: GITHUB_ACTIONS by itself is no longer a gate;
+    // both runtime vars must be present together to take the GH path.
+    let project =
+        TempProject::empty(r#"{"name":"vault-oidc-github-partial-token-only","version":"1.0.0"}"#);
 
-    project.write_file("lpm.json", r#"{"vault":"vault-github-missing-token-123"}"#);
+    project.write_file("lpm.json", r#"{"vault":"vault-github-partial-token-123"}"#);
 
     let output = lpm(&project)
         .env("GITHUB_ACTIONS", "true")
-        .env_remove("ACTIONS_ID_TOKEN_REQUEST_TOKEN")
+        .env("ACTIONS_ID_TOKEN_REQUEST_TOKEN", "partial-gh-token")
         .env_remove("ACTIONS_ID_TOKEN_REQUEST_URL")
-        .env("LPM_OIDC_TOKEN", "generic-fallback-token")
+        .env_remove("LPM_OIDC_TOKEN")
+        .env_remove("LPM_GITLAB_OIDC_TOKEN")
         .args(["env", "pull", "--oidc"])
         .output()
-        .expect("failed to run GitHub missing request token test");
+        .expect("failed to run GitHub partial-token-only test");
 
     assert!(
         !output.status.success(),
-        "missing GitHub request token unexpectedly succeeded"
+        "partial GitHub signal (token only) unexpectedly succeeded"
     );
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("ACTIONS_ID_TOKEN_REQUEST_TOKEN not set"));
+    assert!(
+        stderr.contains("no OIDC signal"),
+        "stderr should fall through to the named-vars error, got: {stderr}"
+    );
+    assert!(
+        stderr.contains("LPM_OIDC_TOKEN"),
+        "error must name the canonical bypass var: {stderr}"
+    );
 }
 
 #[tokio::test]
-async fn env_pull_oidc_requires_github_request_url_when_actions_env_is_set() {
+async fn env_pull_oidc_partial_github_signal_url_only_falls_through() {
+    // Symmetric to the token-only case: only the URL is set, no TOKEN. Must
+    // also fall through rather than try the runtime fetch with a half-built
+    // request.
     let project =
-        TempProject::empty(r#"{"name":"vault-oidc-github-missing-request-url","version":"1.0.0"}"#);
+        TempProject::empty(r#"{"name":"vault-oidc-github-partial-url-only","version":"1.0.0"}"#);
 
-    project.write_file("lpm.json", r#"{"vault":"vault-github-missing-url-123"}"#);
+    project.write_file("lpm.json", r#"{"vault":"vault-github-partial-url-123"}"#);
 
     let output = lpm(&project)
         .env("GITHUB_ACTIONS", "true")
-        .env("ACTIONS_ID_TOKEN_REQUEST_TOKEN", "github-request-token")
-        .env_remove("ACTIONS_ID_TOKEN_REQUEST_URL")
+        .env(
+            "ACTIONS_ID_TOKEN_REQUEST_URL",
+            "https://example.invalid/oidc",
+        )
+        .env_remove("ACTIONS_ID_TOKEN_REQUEST_TOKEN")
+        .env_remove("LPM_OIDC_TOKEN")
+        .env_remove("LPM_GITLAB_OIDC_TOKEN")
         .args(["env", "pull", "--oidc"])
         .output()
-        .expect("failed to run GitHub missing request url test");
+        .expect("failed to run GitHub partial-url-only test");
 
     assert!(
         !output.status.success(),
-        "missing GitHub request url unexpectedly succeeded"
+        "partial GitHub signal (URL only) unexpectedly succeeded"
     );
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("ACTIONS_ID_TOKEN_REQUEST_URL not set"));
+    assert!(
+        stderr.contains("no OIDC signal"),
+        "stderr should fall through to the named-vars error, got: {stderr}"
+    );
 }
 
 #[tokio::test]
@@ -1167,7 +1199,14 @@ async fn env_pull_oidc_surfaces_github_runtime_request_failures() {
         "GitHub runtime failure unexpectedly succeeded"
     );
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("GitHub OIDC token request failed (500 Internal Server Error)"));
+    assert!(
+        stderr.contains("GitHub OIDC fetch failed"),
+        "stderr should surface the runtime fetch failure, got: {stderr}"
+    );
+    assert!(
+        stderr.contains("500"),
+        "stderr should name the upstream status, got: {stderr}"
+    );
 }
 
 #[tokio::test]
@@ -1207,7 +1246,7 @@ async fn env_pull_oidc_rejects_github_runtime_responses_without_value() {
         "GitHub runtime response without value unexpectedly succeeded"
     );
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("no token in GitHub OIDC response"));
+    assert!(stderr.contains("GitHub OIDC response missing 'value' field"));
 }
 
 #[tokio::test]

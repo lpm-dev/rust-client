@@ -2701,37 +2701,8 @@ async fn async_main() -> Result<()> {
             }
             let cwd = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;
 
-            // OIDC: auto-detect CI environment for LPM token exchange
-            // (separate from Sigstore provenance — both can happen)
-            if oidc::detect_ci_environment().is_some() {
-                match oidc::exchange_oidc_token(registry_url, None, "publish").await {
-                    Ok(oidc_token) => {
-                        let oidc_client = client.clone_with_config().with_token(oidc_token.token);
-                        return commands::publish::run(
-                            &oidc_client,
-                            &cwd,
-                            dry_run,
-                            check,
-                            yes,
-                            cli.json,
-                            min_score,
-                            allow_secrets,
-                            npm,
-                            lpm,
-                            github,
-                            gitlab,
-                            publish_registry.as_deref(),
-                            provenance,
-                        )
-                        .await
-                        .into_diagnostic();
-                    }
-                    Err(e) => {
-                        tracing::debug!("OIDC auto-detect failed, using stored token: {e}");
-                    }
-                }
-            }
-
+            // OIDC auto-exchange happens inside publish::run after package.json
+            // is parsed — the origin requires `package` for `scope=publish`.
             commands::publish::run(
                 &client,
                 &cwd,
