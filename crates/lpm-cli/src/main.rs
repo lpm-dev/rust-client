@@ -43,6 +43,7 @@ mod trust_snapshot;
 mod update_check;
 pub mod upgrade_engine;
 pub mod version_diff;
+pub mod workspace_select;
 mod xcode_project;
 
 #[derive(Parser)]
@@ -1061,8 +1062,9 @@ enum Commands {
         #[arg(long)]
         stream: bool,
 
-        /// Run in all workspace packages (topological order).
-        #[arg(long)]
+        /// Run in all workspace packages (topological order). Mutually
+        /// exclusive with `--filter` and `--affected`.
+        #[arg(long, conflicts_with_all = ["filter", "affected"])]
         all: bool,
 
         /// Filter workspace packages with the Phase 32 grammar. Can be passed
@@ -1311,15 +1313,29 @@ enum Commands {
 
     /// Lint source files (powered by Oxlint, lazy-downloaded on first use).
     Lint {
-        /// Run in all workspace packages.
-        #[arg(long)]
+        /// Run in all workspace packages. Mutually exclusive with `--filter`
+        /// and `--affected` — pick one selection mode.
+        #[arg(long, conflicts_with_all = ["filter", "affected"])]
         all: bool,
+        /// Filter workspace packages with the Phase 32 grammar. Can be passed
+        /// multiple times: `--filter foo --filter bar` unions the two sets.
+        ///
+        /// Grammar: exact name (`foo`), glob (`@scope/*`, `foo-*`),
+        /// path glob (`./apps/*`), path exact (`{./apps/web}`),
+        /// git ref (`[origin/main]`), forward closure (`foo...`, `foo^...`),
+        /// reverse closure (`...foo`, `...^foo`), exclusion (`!foo`).
+        #[arg(long)]
+        filter: Vec<String>,
         /// Run only in packages affected by git changes (vs base branch).
         #[arg(long, conflicts_with = "all")]
         affected: bool,
         /// Git base ref for --affected (default: main).
         #[arg(long, default_value = "main")]
         base: String,
+        /// Exit non-zero if no workspace package matches the filter set.
+        /// Recommended in CI to catch typo'd filters early.
+        #[arg(long)]
+        fail_if_no_match: bool,
         /// Extra arguments passed to oxlint (e.g., --fix, src/).
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
@@ -1330,15 +1346,23 @@ enum Commands {
         /// Check formatting without writing (CI mode, exits non-zero if unformatted).
         #[arg(long)]
         check: bool,
-        /// Run in all workspace packages.
-        #[arg(long)]
+        /// Run in all workspace packages. Mutually exclusive with `--filter`
+        /// and `--affected` — pick one selection mode.
+        #[arg(long, conflicts_with_all = ["filter", "affected"])]
         all: bool,
+        /// Filter workspace packages with the Phase 32 grammar. Can be passed
+        /// multiple times: `--filter foo --filter bar` unions the two sets.
+        #[arg(long)]
+        filter: Vec<String>,
         /// Run only in packages affected by git changes (vs base branch).
-        #[arg(long, conflicts_with = "all")]
+        #[arg(long)]
         affected: bool,
         /// Git base ref for --affected (default: main).
         #[arg(long, default_value = "main")]
         base: String,
+        /// Exit non-zero if no workspace package matches the filter set.
+        #[arg(long)]
+        fail_if_no_match: bool,
         /// Extra arguments passed to biome format.
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
@@ -1346,15 +1370,23 @@ enum Commands {
 
     /// Type-check the project (runs tsc --noEmit).
     Check {
-        /// Run in all workspace packages.
-        #[arg(long)]
+        /// Run in all workspace packages. Mutually exclusive with `--filter`
+        /// and `--affected` — pick one selection mode.
+        #[arg(long, conflicts_with_all = ["filter", "affected"])]
         all: bool,
+        /// Filter workspace packages with the Phase 32 grammar. Can be passed
+        /// multiple times: `--filter foo --filter bar` unions the two sets.
+        #[arg(long)]
+        filter: Vec<String>,
         /// Run only in packages affected by git changes (vs base branch).
-        #[arg(long, conflicts_with = "all")]
+        #[arg(long)]
         affected: bool,
         /// Git base ref for --affected (default: main).
         #[arg(long, default_value = "main")]
         base: String,
+        /// Exit non-zero if no workspace package matches the filter set.
+        #[arg(long)]
+        fail_if_no_match: bool,
         /// Extra arguments passed to tsc.
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
@@ -3256,15 +3288,26 @@ async fn async_main() -> Result<()> {
         }
         Commands::Lint {
             all,
+            filter,
             affected,
             base,
+            fail_if_no_match,
             args,
         } => {
             let cwd = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;
-            if all || affected {
+            if all || affected || !filter.is_empty() {
                 let affected_ref = if affected { Some(base.as_str()) } else { None };
-                commands::tools::tool_workspace(&cwd, "lint", &args, false, affected_ref, cli.json)
-                    .await
+                commands::tools::tool_workspace(
+                    &cwd,
+                    "lint",
+                    &args,
+                    false,
+                    &filter,
+                    affected_ref,
+                    fail_if_no_match,
+                    cli.json,
+                )
+                .await
             } else {
                 commands::tools::lint(&cwd, &args, cli.json).await
             }
@@ -3272,30 +3315,52 @@ async fn async_main() -> Result<()> {
         Commands::Fmt {
             check,
             all,
+            filter,
             affected,
             base,
+            fail_if_no_match,
             args,
         } => {
             let cwd = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;
-            if all || affected {
+            if all || affected || !filter.is_empty() {
                 let affected_ref = if affected { Some(base.as_str()) } else { None };
-                commands::tools::tool_workspace(&cwd, "fmt", &args, check, affected_ref, cli.json)
-                    .await
+                commands::tools::tool_workspace(
+                    &cwd,
+                    "fmt",
+                    &args,
+                    check,
+                    &filter,
+                    affected_ref,
+                    fail_if_no_match,
+                    cli.json,
+                )
+                .await
             } else {
                 commands::tools::fmt(&cwd, &args, check, cli.json).await
             }
         }
         Commands::Check {
             all,
+            filter,
             affected,
             base,
+            fail_if_no_match,
             args,
         } => {
             let cwd = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;
-            if all || affected {
+            if all || affected || !filter.is_empty() {
                 let affected_ref = if affected { Some(base.as_str()) } else { None };
-                commands::tools::tool_workspace(&cwd, "check", &args, false, affected_ref, cli.json)
-                    .await
+                commands::tools::tool_workspace(
+                    &cwd,
+                    "check",
+                    &args,
+                    false,
+                    &filter,
+                    affected_ref,
+                    fail_if_no_match,
+                    cli.json,
+                )
+                .await
             } else {
                 commands::tools::check(&cwd, &args, cli.json).await
             }
@@ -3905,6 +3970,18 @@ mod tests {
             }
             _ => panic!("expected Run command"),
         }
+    }
+
+    #[test]
+    fn run_all_and_filter_conflict() {
+        let result = Cli::try_parse_from(["lpm", "run", "build", "--all", "--filter", "web"]);
+        assert!(result.is_err(), "--all and --filter must conflict");
+    }
+
+    #[test]
+    fn run_all_and_affected_conflict() {
+        let result = Cli::try_parse_from(["lpm", "run", "build", "--all", "--affected"]);
+        assert!(result.is_err(), "--all and --affected must conflict");
     }
 
     // ── Phase 32 Phase 1 M7: lpm filter subcommand ────────────────────────

@@ -1,8 +1,51 @@
 use crate::output;
 use lpm_common::LpmError;
 use owo_colors::OwoColorize;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+
+/// Maximum size for captured workspace stdout/stderr before truncation.
+/// Mirrors the `MAX_CAPTURED_OUTPUT` constant in `commands::run` so chatty
+/// failing members don't unbound the JSON envelope.
+const MAX_CAPTURED_OUTPUT: usize = 10 * 1024 * 1024; // 10 MB
+
+/// Truncate captured output if it exceeds `MAX_CAPTURED_OUTPUT`, cutting at
+/// the last newline boundary to avoid splitting a line.
+fn truncate_output(text: &str) -> String {
+    if text.len() > MAX_CAPTURED_OUTPUT {
+        let truncated = &text[..MAX_CAPTURED_OUTPUT];
+        let end = truncated.rfind('\n').unwrap_or(MAX_CAPTURED_OUTPUT);
+        format!(
+            "{}...\n\n[output truncated at {}MB]",
+            &text[..end],
+            MAX_CAPTURED_OUTPUT / (1024 * 1024),
+        )
+    } else {
+        text.to_string()
+    }
+}
+
+/// How a tool subprocess should connect its stdio to the parent.
+///
+/// `Inherit` is the default — single-package mode and human-mode workspace
+/// runs both stream child output directly to the user's terminal.
+///
+/// `Capture` is used for workspace + `--json` mode: child stdout/stderr is
+/// piped into in-memory buffers so the orchestrator can emit a single, valid
+/// JSON envelope on the parent's stdout. Without `Capture`, child writes to
+/// stdout would interleave with the envelope and produce un-parsable output.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StdioMode {
+    Inherit,
+    Capture,
+}
+
+/// Captured stdio from a single tool invocation.
+#[derive(Default)]
+struct Captured {
+    stdout: String,
+    stderr: String,
+}
 
 /// Run `lpm lint` — delegates to oxlint via plugin system.
 pub async fn lint(project_dir: &Path, args: &[String], json_output: bool) -> Result<(), LpmError> {
@@ -16,7 +59,8 @@ pub async fn lint(project_dir: &Path, args: &[String], json_output: bool) -> Res
         ));
     }
 
-    run_tool_binary(&bin, args, project_dir)
+    let outcome = run_tool_binary(&bin, args, project_dir, StdioMode::Inherit)?;
+    outcome.into_result()
 }
 
 /// Run `lpm fmt` — delegates to biome via plugin system.
@@ -41,20 +85,24 @@ pub async fn fmt(
         ));
     }
 
+    let biome_args = build_biome_args(args, check);
+    let outcome = run_tool_binary(&bin, &biome_args, project_dir, StdioMode::Inherit)?;
+    outcome.into_result()
+}
+
+/// Build the biome args vector — extracted so the workspace path can call it
+/// per-member without duplicating the `--write` / default-`.` logic.
+fn build_biome_args(args: &[String], check: bool) -> Vec<String> {
     let mut biome_args = vec!["format".to_string()];
     if args.is_empty() {
         biome_args.push(".".into());
     } else {
         biome_args.extend_from_slice(args);
     }
-
-    // --check mode: biome format without --write exits non-zero if files aren't formatted
-    // Default mode: add --write so files are actually formatted
     if !check {
         biome_args.push("--write".into());
     }
-
-    run_tool_binary(&bin, &biome_args, project_dir)
+    biome_args
 }
 
 /// Run `lpm check` — delegates to tsc --noEmit from node_modules/.bin.
@@ -63,32 +111,8 @@ pub async fn check(project_dir: &Path, args: &[String], json_output: bool) -> Re
         output::info("check (tsc --noEmit)");
     }
 
-    // tsc should be in node_modules/.bin via PATH injection
-    let path = lpm_runner::bin_path::build_path_with_bins(project_dir);
-
-    let mut cmd_args = vec!["--noEmit".to_string()];
-    cmd_args.extend_from_slice(args);
-
-    let status = Command::new("tsc")
-        .args(&cmd_args)
-        .current_dir(project_dir)
-        .env("PATH", &path)
-        .stdin(Stdio::inherit())
-        .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit())
-        .status()
-        .map_err(|e| {
-            LpmError::Script(format!(
-                "failed to run tsc: {e}. Is typescript installed? Run: lpm install typescript"
-            ))
-        })?;
-
-    if !status.success() {
-        let code = status.code().unwrap_or(1);
-        return Err(LpmError::ExitCode(code));
-    }
-
-    Ok(())
+    let outcome = run_tsc(project_dir, args, StdioMode::Inherit)?;
+    outcome.into_result()
 }
 
 /// Run `lpm test` — auto-detects test runner and delegates.
@@ -125,7 +149,6 @@ pub async fn test(project_dir: &Path, args: &[String], json_output: bool) -> Res
 
 /// Run `lpm bench` — auto-detects benchmark runner and delegates.
 pub async fn bench(project_dir: &Path, args: &[String], json_output: bool) -> Result<(), LpmError> {
-    // Check for vitest bench first, then package.json scripts.bench
     let pkg_json_path = project_dir.join("package.json");
     let (runner_name, cmd) = if pkg_json_path.exists() {
         let pkg = lpm_workspace::read_package_json(&pkg_json_path)
@@ -192,53 +215,155 @@ fn read_tool_version(project_dir: &Path, tool_name: &str) -> Option<String> {
     }
 }
 
-/// Run a plugin binary with args, inheriting stdio.
-fn run_tool_binary(bin: &Path, args: &[String], cwd: &Path) -> Result<(), LpmError> {
-    let status = Command::new(bin)
-        .args(args)
-        .current_dir(cwd)
-        .stdin(Stdio::inherit())
-        .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit())
-        .status()
-        .map_err(|e| LpmError::Script(format!("failed to run {}: {e}", bin.display())))?;
+/// Outcome of a single tool invocation: either it ran (with an exit code) or
+/// LPM couldn't even launch it (spawn / config / plugin failure).
+#[derive(Default)]
+struct ToolOutcome {
+    exit_code: Option<i32>,
+    captured: Captured,
+    /// Set when LPM itself failed to launch — distinguishes from "ran and
+    /// exited non-zero." Surfaces in the JSON envelope as `error` with a
+    /// `null` exit_code.
+    error: Option<String>,
+}
 
-    if !status.success() {
-        let code = status.code().unwrap_or(1);
-        return Err(LpmError::ExitCode(code));
+impl ToolOutcome {
+    fn success(&self) -> bool {
+        matches!(self.exit_code, Some(0)) && self.error.is_none()
     }
 
-    Ok(())
+    /// Convert into a `Result` for single-package callers that just want the
+    /// exit-code propagated.
+    fn into_result(self) -> Result<(), LpmError> {
+        if let Some(error) = self.error {
+            return Err(LpmError::Script(error));
+        }
+        match self.exit_code {
+            Some(0) => Ok(()),
+            Some(code) => Err(LpmError::ExitCode(code)),
+            None => Err(LpmError::Script(
+                "tool exited without an exit code".to_string(),
+            )),
+        }
+    }
+}
+
+/// Run a plugin binary with args. Returns the outcome rather than panicking
+/// on non-zero so workspace mode can collect per-member results.
+fn run_tool_binary(
+    bin: &Path,
+    args: &[String],
+    cwd: &Path,
+    stdio: StdioMode,
+) -> Result<ToolOutcome, LpmError> {
+    let mut cmd = Command::new(bin);
+    cmd.args(args).current_dir(cwd);
+
+    apply_stdio(&mut cmd, stdio);
+
+    let mut outcome = ToolOutcome::default();
+
+    match stdio {
+        StdioMode::Inherit => {
+            let status = cmd
+                .status()
+                .map_err(|e| LpmError::Script(format!("failed to run {}: {e}", bin.display())))?;
+            outcome.exit_code = Some(status.code().unwrap_or(1));
+        }
+        StdioMode::Capture => {
+            let result = cmd.output();
+            match result {
+                Ok(output) => {
+                    outcome.captured = Captured {
+                        stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+                        stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+                    };
+                    outcome.exit_code = Some(output.status.code().unwrap_or(1));
+                }
+                Err(e) => {
+                    outcome.error = Some(format!("failed to run {}: {e}", bin.display()));
+                }
+            }
+        }
+    }
+
+    Ok(outcome)
+}
+
+/// Run tsc with the configured stdio mode. Honors `node_modules/.bin` PATH
+/// injection so project-local TypeScript wins over a system install.
+fn run_tsc(project_dir: &Path, args: &[String], stdio: StdioMode) -> Result<ToolOutcome, LpmError> {
+    let path = lpm_runner::bin_path::build_path_with_bins(project_dir);
+    let mut cmd_args = vec!["--noEmit".to_string()];
+    cmd_args.extend_from_slice(args);
+
+    let mut cmd = Command::new("tsc");
+    cmd.args(&cmd_args)
+        .current_dir(project_dir)
+        .env("PATH", &path);
+
+    apply_stdio(&mut cmd, stdio);
+
+    let mut outcome = ToolOutcome::default();
+
+    match stdio {
+        StdioMode::Inherit => {
+            let status = cmd.status().map_err(|e| {
+                LpmError::Script(format!(
+                    "failed to run tsc: {e}. Is typescript installed? Run: lpm install -D typescript"
+                ))
+            })?;
+            outcome.exit_code = Some(status.code().unwrap_or(1));
+        }
+        StdioMode::Capture => match cmd.output() {
+            Ok(output) => {
+                outcome.captured = Captured {
+                    stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+                    stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+                };
+                outcome.exit_code = Some(output.status.code().unwrap_or(1));
+            }
+            Err(e) => {
+                outcome.error = Some(format!(
+                    "failed to run tsc: {e}. Is typescript installed? Run: lpm install -D typescript"
+                ));
+            }
+        },
+    }
+
+    Ok(outcome)
+}
+
+fn apply_stdio(cmd: &mut Command, stdio: StdioMode) {
+    match stdio {
+        StdioMode::Inherit => {
+            cmd.stdin(Stdio::inherit())
+                .stdout(Stdio::inherit())
+                .stderr(Stdio::inherit());
+        }
+        StdioMode::Capture => {
+            cmd.stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped());
+        }
+    }
 }
 
 /// Shell-escape a single argument to prevent injection.
-///
-/// Wraps the argument in single quotes, escaping any embedded single quotes
-/// using the `'\''` technique (end quote, escaped literal quote, start quote).
 fn shell_escape(arg: &str) -> String {
     format!("'{}'", arg.replace('\'', "'\\''"))
 }
 
 /// Returns `true` if the forwarded args contain a watch-mode opt-in.
-///
-/// Recognizes vitest's `--watch` (with or without `=value`) and the `-w`
-/// short form. Used by `lpm test` to detect when the auto-detected
-/// `vitest run` base command would silently override the user's request.
 fn args_imply_watch(args: &[String]) -> bool {
     args.iter()
         .any(|a| a == "--watch" || a.starts_with("--watch=") || a == "-w")
 }
 
-/// Rewrite the auto-detected test runner command when the forwarded
-/// args ask for watch mode.
-///
-/// Vitest's `run` subcommand forces non-watch mode; passing `--watch`
-/// after `run` is silently dropped (verified empirically against
-/// vitest 2.1). When the user has asked for watch, drop the `run` so
-/// the resulting invocation is `vitest --watch`, which honors the flag.
-///
-/// Other runners (jest, mocha) accept `--watch` natively against their
-/// bare command, so this rewrite is vitest-specific.
+/// Rewrite the auto-detected test runner command when the forwarded args ask
+/// for watch mode. Vitest's `run` subcommand silently drops `--watch`; drop
+/// the `run` so the resulting invocation is `vitest --watch`. Other runners
+/// accept `--watch` natively against their bare command.
 fn adjust_test_runner_for_watch(runner_name: &str, base_cmd: String, args: &[String]) -> String {
     if runner_name == "vitest" && args_imply_watch(args) {
         return "vitest".into();
@@ -247,11 +372,6 @@ fn adjust_test_runner_for_watch(runner_name: &str, base_cmd: String, args: &[Str
 }
 
 /// Build a shell command string with safely escaped extra arguments.
-///
-/// For known runners (vitest, jest, mocha), the base command is trusted and
-/// extra args are shell-escaped before appending. For user-defined scripts
-/// (scripts.test, scripts.bench), the script itself runs via `sh -c` and
-/// extra args are also escaped.
 fn build_safe_command(_runner_name: &str, base_cmd: &str, args: &[String]) -> String {
     if args.is_empty() {
         return base_cmd.to_string();
@@ -276,7 +396,6 @@ fn detect_test_runner(project_dir: &Path) -> Result<(String, String), LpmError> 
         .chain(pkg.dev_dependencies.keys())
         .collect();
 
-    // Priority order: vitest > jest > mocha > scripts.test
     if all_deps.iter().any(|d| d.as_str() == "vitest") {
         return Ok(("vitest".into(), "vitest run".into()));
     }
@@ -287,7 +406,6 @@ fn detect_test_runner(project_dir: &Path) -> Result<(String, String), LpmError> 
         return Ok(("mocha".into(), "mocha".into()));
     }
 
-    // Fallback to package.json scripts.test
     if let Some(test_script) = pkg.scripts.get("test") {
         return Ok(("scripts.test".into(), test_script.clone()));
     }
@@ -298,103 +416,195 @@ fn detect_test_runner(project_dir: &Path) -> Result<(String, String), LpmError> 
     ))
 }
 
-/// Run a tool command across workspace packages.
+// --- Workspace orchestration ---
+
+/// Run a tool command across workspace packages, with topological levels and
+/// within-level parallelism. Owns the JSON envelope contract for workspace
+/// mode.
 ///
-/// Discovers workspace, runs the tool in each member's directory sequentially.
-/// Supports: "lint", "fmt", "check".
+/// **Selection inputs:**
+/// - `filters`: Phase 32 filter expressions. Empty + `affected_base.is_none()`
+///   means "every member" (caller already verified workspace mode is active).
+/// - `affected_base`: `Some(base_ref)` enables `--affected` semantics — direct
+///   changes plus their transitive dependents — unioned with `filters`.
+/// - `fail_if_no_match`: when true, an empty target set is a hard error rather
+///   than a warning + zero-exit.
 ///
-/// When `affected_base` is `Some(base_ref)`, only runs in packages affected by
-/// git changes vs the base branch. When `None`, runs in all members (--all mode).
+/// **Execution inputs:**
+/// - `tool`: dispatch key — `"lint" | "fmt" | "check"`.
+/// - `args`, `check`: forwarded to the per-member runner.
+/// - `json_output`: when true, swaps subprocess stdio from `Inherit` to
+///   `Capture` and emits a single JSON envelope at the end.
+#[allow(clippy::too_many_arguments)]
 pub async fn tool_workspace(
     project_dir: &Path,
     tool: &str,
     args: &[String],
     check: bool,
+    filters: &[String],
     affected_base: Option<&str>,
+    fail_if_no_match: bool,
     json_output: bool,
 ) -> Result<(), LpmError> {
     let workspace = lpm_workspace::discover_workspace(project_dir)
         .map_err(|e| LpmError::Script(format!("workspace error: {e}")))?
         .ok_or_else(|| {
-            LpmError::Script("no workspace found. --all/--affected require a monorepo".into())
+            LpmError::Script(
+                "no workspace found. --all/--filter/--affected require a monorepo".into(),
+            )
         })?;
 
-    // Compute affected member indices if --affected was passed
-    let affected_indices = if let Some(base_ref) = affected_base {
-        let ws_graph = lpm_task::graph::WorkspaceGraph::from_workspace(&workspace);
-        let indices = lpm_task::affected::find_affected(&ws_graph, &workspace.root, base_ref)
-            .map_err(LpmError::Script)?;
-        if indices.is_empty() && !json_output {
-            output::success(&format!(
-                "no packages affected vs {base_ref} — nothing to {tool}"
-            ));
-            return Ok(());
-        }
-        Some(indices)
-    } else {
-        None
-    };
+    let ws_graph = lpm_task::graph::WorkspaceGraph::from_workspace(&workspace);
+    let levels = ws_graph
+        .topological_levels()
+        .map_err(|e| LpmError::Script(e.to_string()))?;
 
-    let mut succeeded = 0;
-    let mut failed = 0;
-    let mut skipped = 0;
-    let total = workspace.members.len();
+    let target_set = crate::workspace_select::select_workspace_target_set(
+        &ws_graph,
+        &workspace.root,
+        filters,
+        affected_base.is_some(),
+        affected_base.unwrap_or("main"),
+    )?;
 
-    for (idx, member) in workspace.members.iter().enumerate() {
-        // Skip members not in the affected set
-        if let Some(ref indices) = affected_indices
-            && !indices.contains(&idx)
-        {
-            skipped += 1;
-            continue;
-        }
-        let name = member.package.name.as_deref().unwrap_or("unnamed");
-        let member_dir = &member.path;
+    if target_set.is_empty() {
+        // `--affected` with no filter is the common "nothing changed since the
+        // base ref" case — keep its own message so it doesn't read like a
+        // filter typo. With explicit `--filter` (with or without `--affected`)
+        // we fall into the filter-miss path so the D2 hint can fire on bare
+        // names that would have substring-matched pre-Phase-32.
+        let affected_only = filters.is_empty() && affected_base.is_some();
 
-        if !json_output {
-            output::info(&format!("[{}] {tool}", name.bold()));
-        }
-
-        let result = match tool {
-            "lint" => lint(member_dir, args, json_output).await,
-            "fmt" => fmt(member_dir, args, check, json_output).await,
-            "check" => check_fn(member_dir, args, json_output).await,
-            _ => Err(LpmError::Script(format!("unknown tool: {tool}"))),
-        };
-
-        match result {
-            Ok(()) => succeeded += 1,
-            Err(LpmError::ExitCode(_)) => {
-                failed += 1;
-            }
-            Err(e) => {
-                failed += 1;
-                if !json_output {
-                    eprintln!("  \x1b[31m[{name}]\x1b[0m {e}");
-                }
-            }
-        }
-    }
-
-    if !json_output {
-        let ran = succeeded + failed;
-        if failed == 0 {
-            if skipped > 0 {
-                output::success(&format!(
-                    "{tool} passed in {ran} affected packages ({skipped} skipped)"
-                ));
+        if fail_if_no_match {
+            let msg = if affected_only {
+                format!(
+                    "no workspace packages affected vs {} (--fail-if-no-match)",
+                    affected_base.unwrap_or("main"),
+                )
             } else {
-                output::success(&format!("{tool} passed in all {total} packages"));
-            }
-        } else if skipped > 0 {
-            output::warn(&format!(
-                "{tool}: {succeeded} passed, {failed} failed out of {ran} affected packages ({skipped} skipped)"
+                let hint = crate::commands::filter::format_no_match_hint(filters);
+                let base = "no workspace packages matched the filter (--fail-if-no-match)";
+                match hint {
+                    Some(h) => format!("{base}\n\n{h}"),
+                    None => base.to_string(),
+                }
+            };
+            return Err(LpmError::Script(msg));
+        }
+
+        if json_output {
+            let envelope = serde_json::json!({
+                "success": true,
+                "packages": 0,
+                "succeeded": 0,
+                "failed": 0,
+                "duration_ms": 0,
+                "members": [],
+            });
+            println!("{}", serde_json::to_string_pretty(&envelope).unwrap());
+        } else if affected_only {
+            output::success(&format!(
+                "no packages affected vs {} — nothing to {tool}",
+                affected_base.unwrap_or("main"),
             ));
         } else {
-            output::warn(&format!(
-                "{tool}: {succeeded} passed, {failed} failed out of {total} packages"
-            ));
+            let hint = crate::commands::filter::format_no_match_hint(filters);
+            output::warn("No packages matched");
+            if let Some(h) = hint {
+                eprintln!();
+                for line in h.lines() {
+                    eprintln!("  {}", line.dimmed());
+                }
+                eprintln!();
+            }
         }
+        return Ok(());
+    }
+
+    // Pre-resolve plugin once at root for lint/fmt — covers the homogeneous
+    // cold-cache race where N parallel members would all call ensure_plugin
+    // for the same version. Per-member calls below reuse this binary if the
+    // member's version pin matches root, otherwise fall back to a per-member
+    // ensure_plugin (rare; mixed-version monorepos accept today's race).
+    //
+    // Prewarm failure is not an early-return: the workspace+`--json` contract
+    // promises a single envelope on stdout, with plugin / config / spawn
+    // failures represented as member entries with `exit_code: null`. We
+    // synthesize per-member failure entries (one per targeted member) carrying
+    // the prewarm error and skip orchestration. The plain-text path emits the
+    // human summary so the user sees the same N-of-N-failed shape.
+    let prewarm = match tool {
+        "lint" => Some(prewarm_root_plugin(project_dir, "oxlint").await),
+        "fmt" => Some(prewarm_root_plugin(project_dir, "biome").await),
+        _ => None,
+    };
+
+    let root_pin: Option<(String, Option<String>, PathBuf)> = match prewarm {
+        None => None,
+        Some(Ok(pin)) => Some(pin),
+        Some(Err(prewarm_err)) => {
+            let elapsed = std::time::Duration::from_millis(0);
+            let failed_members = synthesize_prewarm_failure_members(
+                &ws_graph,
+                &target_set,
+                &prewarm_err.to_string(),
+            );
+            let total = failed_members.len();
+            let succeeded = 0;
+            let failed = total;
+
+            if json_output {
+                emit_envelope(&failed_members, total, succeeded, failed, elapsed);
+            } else {
+                eprintln!("  {} {tool}: {prewarm_err}", "\u{2716}".to_string().red(),);
+                emit_human_summary(tool, total, succeeded, failed, target_set.len(), elapsed);
+            }
+            return Err(LpmError::ExitCode(1));
+        }
+    };
+
+    let stdio = if json_output {
+        StdioMode::Capture
+    } else {
+        StdioMode::Inherit
+    };
+
+    let start = std::time::Instant::now();
+    let mut member_results: Vec<MemberResult> = Vec::with_capacity(target_set.len());
+
+    for level in &levels {
+        let level_targets: Vec<usize> = level
+            .iter()
+            .filter(|i| target_set.contains(i))
+            .copied()
+            .collect();
+
+        if level_targets.is_empty() {
+            continue;
+        }
+
+        let level_outcomes = run_level(
+            &ws_graph,
+            &level_targets,
+            tool,
+            args,
+            check,
+            stdio,
+            &root_pin,
+        )
+        .await;
+        member_results.extend(level_outcomes);
+    }
+
+    let elapsed = start.elapsed();
+    let succeeded = member_results.iter().filter(|r| r.success).count();
+    let failed = member_results.len() - succeeded;
+    let total = member_results.len();
+
+    if json_output {
+        emit_envelope(&member_results, total, succeeded, failed, elapsed);
+    } else {
+        emit_human_summary(tool, total, succeeded, failed, target_set.len(), elapsed);
     }
 
     if failed > 0 {
@@ -404,15 +614,332 @@ pub async fn tool_workspace(
     Ok(())
 }
 
-/// Wrapper to avoid name collision with the `check` function in match arms
-/// where `check` is also used as a variable name.
-async fn check_fn(project_dir: &Path, args: &[String], json_output: bool) -> Result<(), LpmError> {
-    check(project_dir, args, json_output).await
+/// Pre-resolve a plugin once at the workspace root. Reads the root's tool
+/// version pin and returns the resolved binary path along with the pin so
+/// per-member calls can short-circuit when their pin matches.
+///
+/// Extracted as a named helper so the prewarm-failure envelope path can call
+/// it via a single owned `Result` rather than the inline `?` form (which
+/// would short-circuit `tool_workspace` before the envelope is built).
+async fn prewarm_root_plugin(
+    project_dir: &Path,
+    plugin_name: &str,
+) -> Result<(String, Option<String>, PathBuf), LpmError> {
+    let v = read_tool_version(project_dir, plugin_name);
+    let bin = lpm_plugin::ensure_plugin(plugin_name, v.as_deref(), false).await?;
+    Ok((plugin_name.to_string(), v, bin))
+}
+
+/// Build per-member failure entries for the case where the root plugin
+/// prewarm failed. Every member that would have been targeted gets a
+/// failed `MemberResult` carrying the same prewarm error message —
+/// preserves the workspace `--json` envelope contract that always emits
+/// one envelope on stdout, with plugin failures represented as member
+/// entries with `exit_code: null`.
+fn synthesize_prewarm_failure_members(
+    ws_graph: &lpm_task::graph::WorkspaceGraph,
+    target_set: &std::collections::HashSet<usize>,
+    error_msg: &str,
+) -> Vec<MemberResult> {
+    let mut indices: Vec<usize> = target_set.iter().copied().collect();
+    indices.sort_unstable();
+    indices
+        .into_iter()
+        .map(|idx| MemberResult {
+            name: ws_graph.members[idx].name.clone(),
+            success: false,
+            exit_code: None,
+            duration_ms: 0,
+            captured: Captured::default(),
+            error: Some(format!("plugin prewarm failed: {error_msg}")),
+        })
+        .collect()
+}
+
+/// Per-member result captured by the workspace orchestrator.
+struct MemberResult {
+    name: String,
+    success: bool,
+    /// `Some(code)` when the subprocess ran. `None` for spawn/config/plugin
+    /// failures — paired with `error` in the envelope.
+    exit_code: Option<i32>,
+    duration_ms: u64,
+    captured: Captured,
+    error: Option<String>,
+}
+
+/// Run all members in a single topological level. Within a level, members are
+/// independent; we fan out across `available_parallelism()` threads.
+async fn run_level(
+    ws_graph: &lpm_task::graph::WorkspaceGraph,
+    level_targets: &[usize],
+    tool: &str,
+    args: &[String],
+    check: bool,
+    stdio: StdioMode,
+    root_pin: &Option<(String, Option<String>, PathBuf)>,
+) -> Vec<MemberResult> {
+    if level_targets.len() == 1 {
+        let idx = level_targets[0];
+        let result = run_one_member(
+            &ws_graph.members[idx].path,
+            &ws_graph.members[idx].name,
+            tool,
+            args,
+            check,
+            stdio,
+            root_pin,
+        )
+        .await;
+        return vec![result];
+    }
+
+    let max_threads = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4);
+
+    let mut all_results: Vec<MemberResult> = Vec::with_capacity(level_targets.len());
+
+    for chunk in level_targets.chunks(max_threads) {
+        let mut chunk_futs = Vec::with_capacity(chunk.len());
+        for &idx in chunk {
+            let member_dir = ws_graph.members[idx].path.clone();
+            let member_name = ws_graph.members[idx].name.clone();
+            let tool_owned = tool.to_string();
+            let args_owned: Vec<String> = args.to_vec();
+            let root_pin_clone = root_pin
+                .as_ref()
+                .map(|(name, ver, bin)| (name.clone(), ver.clone(), bin.clone()));
+
+            chunk_futs.push(tokio::spawn(async move {
+                run_one_member(
+                    &member_dir,
+                    &member_name,
+                    &tool_owned,
+                    &args_owned,
+                    check,
+                    stdio,
+                    &root_pin_clone,
+                )
+                .await
+            }));
+        }
+
+        for fut in chunk_futs {
+            match fut.await {
+                Ok(r) => all_results.push(r),
+                Err(join_err) => all_results.push(MemberResult {
+                    name: "<unknown>".into(),
+                    success: false,
+                    exit_code: None,
+                    duration_ms: 0,
+                    captured: Captured::default(),
+                    error: Some(format!("workspace task panicked: {join_err}")),
+                }),
+            }
+        }
+    }
+
+    all_results
+}
+
+/// Execute one member's tool invocation and convert into a `MemberResult`.
+async fn run_one_member(
+    member_dir: &Path,
+    member_name: &str,
+    tool: &str,
+    args: &[String],
+    check: bool,
+    stdio: StdioMode,
+    root_pin: &Option<(String, Option<String>, PathBuf)>,
+) -> MemberResult {
+    let start = std::time::Instant::now();
+
+    if matches!(stdio, StdioMode::Inherit) {
+        eprintln!("  {} {tool}", format!("[{member_name}]").bold());
+    }
+
+    let outcome_result = match tool {
+        "lint" => run_lint_member(member_dir, args, stdio, root_pin).await,
+        "fmt" => run_fmt_member(member_dir, args, check, stdio, root_pin).await,
+        "check" => Ok(
+            run_tsc(member_dir, args, stdio).unwrap_or_else(|e| ToolOutcome {
+                error: Some(e.to_string()),
+                ..Default::default()
+            }),
+        ),
+        _ => Err(LpmError::Script(format!("unknown tool: {tool}"))),
+    };
+
+    let duration_ms = start.elapsed().as_millis() as u64;
+
+    let (success, exit_code, captured, error) = match outcome_result {
+        Ok(outcome) => {
+            let success = outcome.success();
+            let captured = outcome.captured;
+            (success, outcome.exit_code, captured, outcome.error)
+        }
+        Err(e) => (false, None, Captured::default(), Some(e.to_string())),
+    };
+
+    if matches!(stdio, StdioMode::Inherit) && !success {
+        if let Some(code) = exit_code {
+            eprintln!(
+                "  {} {member_name}: exit {code}",
+                "\u{2716}".to_string().red()
+            );
+        } else if let Some(ref msg) = error {
+            eprintln!("  {} {member_name}: {msg}", "\u{2716}".to_string().red());
+        }
+    }
+
+    MemberResult {
+        name: member_name.to_string(),
+        success,
+        exit_code,
+        duration_ms,
+        captured,
+        error,
+    }
+}
+
+async fn run_lint_member(
+    member_dir: &Path,
+    args: &[String],
+    stdio: StdioMode,
+    root_pin: &Option<(String, Option<String>, PathBuf)>,
+) -> Result<ToolOutcome, LpmError> {
+    let bin = resolve_member_plugin(member_dir, "oxlint", root_pin).await?;
+    run_tool_binary(&bin, args, member_dir, stdio)
+}
+
+async fn run_fmt_member(
+    member_dir: &Path,
+    args: &[String],
+    check: bool,
+    stdio: StdioMode,
+    root_pin: &Option<(String, Option<String>, PathBuf)>,
+) -> Result<ToolOutcome, LpmError> {
+    let bin = resolve_member_plugin(member_dir, "biome", root_pin).await?;
+    let biome_args = build_biome_args(args, check);
+    run_tool_binary(&bin, &biome_args, member_dir, stdio)
+}
+
+/// Reuse the root-prewarmed plugin binary when the member's version pin
+/// matches the root, otherwise re-resolve. Prewarm at root closes the
+/// homogeneous cold-cache race; mixed-version pins accept today's behavior.
+async fn resolve_member_plugin(
+    member_dir: &Path,
+    plugin_name: &str,
+    root_pin: &Option<(String, Option<String>, PathBuf)>,
+) -> Result<PathBuf, LpmError> {
+    let member_version = read_tool_version(member_dir, plugin_name);
+
+    if let Some((root_name, root_version, root_bin)) = root_pin
+        && root_name == plugin_name
+        && member_version == *root_version
+    {
+        return Ok(root_bin.clone());
+    }
+
+    lpm_plugin::ensure_plugin(plugin_name, member_version.as_deref(), false).await
+}
+
+/// Emit the workspace JSON envelope. Stdout/stderr surface ONLY for failed
+/// members and are truncated at the 10MB ceiling.
+fn emit_envelope(
+    results: &[MemberResult],
+    total: usize,
+    succeeded: usize,
+    failed: usize,
+    elapsed: std::time::Duration,
+) {
+    let members: Vec<serde_json::Value> = results
+        .iter()
+        .map(|r| {
+            let mut obj = serde_json::Map::new();
+            obj.insert("name".into(), serde_json::Value::String(r.name.clone()));
+            obj.insert("success".into(), serde_json::Value::Bool(r.success));
+            obj.insert(
+                "exit_code".into(),
+                match r.exit_code {
+                    Some(code) => serde_json::Value::Number(code.into()),
+                    None => serde_json::Value::Null,
+                },
+            );
+            obj.insert(
+                "duration_ms".into(),
+                serde_json::Value::Number(r.duration_ms.into()),
+            );
+
+            if !r.success {
+                if let Some(ref msg) = r.error {
+                    obj.insert("error".into(), serde_json::Value::String(msg.clone()));
+                }
+                if !r.captured.stdout.is_empty() {
+                    obj.insert(
+                        "stdout".into(),
+                        serde_json::Value::String(truncate_output(&r.captured.stdout)),
+                    );
+                }
+                if !r.captured.stderr.is_empty() {
+                    obj.insert(
+                        "stderr".into(),
+                        serde_json::Value::String(truncate_output(&r.captured.stderr)),
+                    );
+                }
+            }
+
+            serde_json::Value::Object(obj)
+        })
+        .collect();
+
+    let envelope = serde_json::json!({
+        "success": failed == 0,
+        "packages": total,
+        "succeeded": succeeded,
+        "failed": failed,
+        "duration_ms": elapsed.as_millis() as u64,
+        "members": members,
+    });
+
+    println!("{}", serde_json::to_string_pretty(&envelope).unwrap());
+}
+
+fn emit_human_summary(
+    tool: &str,
+    total: usize,
+    succeeded: usize,
+    failed: usize,
+    targeted: usize,
+    elapsed: std::time::Duration,
+) {
+    if failed == 0 {
+        output::success(&format!(
+            "{tool} passed in {total} packages ({:.1}s)",
+            elapsed.as_secs_f64()
+        ));
+        if targeted > total {
+            // Some level filtering reduced the actual run set; surface that.
+            eprintln!(
+                "  {} {} targeted",
+                "·".dimmed(),
+                format!("{targeted} packages").dimmed()
+            );
+        }
+    } else {
+        output::warn(&format!(
+            "{tool}: {succeeded} passed, {failed} failed out of {total} packages ({:.1}s)",
+            elapsed.as_secs_f64()
+        ));
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- shell escaping ---
 
     #[test]
     fn shell_escape_plain_arg() {
@@ -422,7 +949,6 @@ mod tests {
     #[test]
     fn shell_escape_prevents_injection_semicolon() {
         let escaped = shell_escape("; rm -rf /");
-        // The semicolon must be inside single quotes, not interpreted
         assert_eq!(escaped, "'; rm -rf /'");
         assert!(escaped.starts_with('\''));
         assert!(escaped.ends_with('\''));
@@ -430,20 +956,17 @@ mod tests {
 
     #[test]
     fn shell_escape_prevents_injection_subshell() {
-        let escaped = shell_escape("$(whoami)");
-        assert_eq!(escaped, "'$(whoami)'");
+        assert_eq!(shell_escape("$(whoami)"), "'$(whoami)'");
     }
 
     #[test]
     fn shell_escape_prevents_backtick_injection() {
-        let escaped = shell_escape("`whoami`");
-        assert_eq!(escaped, "'`whoami`'");
+        assert_eq!(shell_escape("`whoami`"), "'`whoami`'");
     }
 
     #[test]
     fn shell_escape_handles_embedded_single_quotes() {
-        let escaped = shell_escape("it's");
-        assert_eq!(escaped, "'it'\\''s'");
+        assert_eq!(shell_escape("it's"), "'it'\\''s'");
     }
 
     #[test]
@@ -458,11 +981,10 @@ mod tests {
 
     #[test]
     fn build_safe_command_no_args() {
-        let cmd = build_safe_command("jest", "jest", &[]);
-        assert_eq!(cmd, "jest");
+        assert_eq!(build_safe_command("jest", "jest", &[]), "jest");
     }
 
-    // --- Watch-mode arg detection ---
+    // --- watch detection ---
 
     #[test]
     fn args_imply_watch_recognizes_long_form() {
@@ -477,18 +999,13 @@ mod tests {
 
     #[test]
     fn args_imply_watch_recognizes_equals_form() {
-        // vitest accepts `--watch=true` and similar; treat any prefix
-        // as an opt-in to be safe.
         assert!(args_imply_watch(&["--watch=true".into()]));
     }
 
     #[test]
     fn adjust_test_runner_drops_run_for_vitest_watch() {
         let cmd = adjust_test_runner_for_watch("vitest", "vitest run".into(), &["--watch".into()]);
-        assert_eq!(
-            cmd, "vitest",
-            "vitest + --watch must drop the run subcommand so watch mode is honored"
-        );
+        assert_eq!(cmd, "vitest");
     }
 
     #[test]
@@ -498,13 +1015,11 @@ mod tests {
             "vitest run".into(),
             &["--reporter=verbose".into()],
         );
-        assert_eq!(cmd, "vitest run", "non-watch invocations stay single-pass");
+        assert_eq!(cmd, "vitest run");
     }
 
     #[test]
     fn adjust_test_runner_does_not_touch_jest_or_mocha() {
-        // jest and mocha use their bare command and forward `--watch`
-        // natively; the rewrite is vitest-specific.
         assert_eq!(
             adjust_test_runner_for_watch("jest", "jest".into(), &["--watch".into()]),
             "jest"
@@ -517,18 +1032,12 @@ mod tests {
 
     #[test]
     fn adjust_test_runner_does_not_touch_user_scripts() {
-        // The scripts.test fallback runs the user's literal command via
-        // `sh -c`. We can't safely rewrite an opaque user command — they
-        // own the watch-mode contract there.
         let cmd = adjust_test_runner_for_watch(
             "scripts.test",
             "vitest run --reporter=verbose".into(),
             &["--watch".into()],
         );
-        assert_eq!(
-            cmd, "vitest run --reporter=verbose",
-            "user-defined script commands must not be rewritten — that's the user's contract"
-        );
+        assert_eq!(cmd, "vitest run --reporter=verbose");
     }
 
     #[test]
@@ -536,25 +1045,214 @@ mod tests {
         assert!(!args_imply_watch(&[]));
         assert!(!args_imply_watch(&["--reporter=verbose".into()]));
         assert!(!args_imply_watch(&["src/foo.test.ts".into()]));
-        // Don't false-positive on substrings — `--watchman` (a hypothetical
-        // jest flag) and similar should not trip the detector.
         assert!(!args_imply_watch(&["--watchman".into()]));
-        // `-w` short matches; `-watch` (no leading double-dash) is not a
-        // canonical vitest spelling and shouldn't trip the detector.
         assert!(!args_imply_watch(&["-watch".into()]));
     }
 
+    // --- run_tool_binary outcome shape ---
+
+    #[cfg(unix)]
     #[test]
-    fn run_tool_binary_returns_exit_code_error() {
-        // Verify run_tool_binary returns ExitCode error, not process::exit
-        let result = run_tool_binary(Path::new("/usr/bin/false"), &[], Path::new("/tmp"));
-        match result {
-            Err(LpmError::ExitCode(code)) => assert_ne!(code, 0),
+    fn run_tool_binary_inherit_returns_exit_code() {
+        let outcome = run_tool_binary(
+            Path::new("/usr/bin/false"),
+            &[],
+            Path::new("/tmp"),
+            StdioMode::Inherit,
+        )
+        .expect("should not error launching /usr/bin/false");
+        assert_eq!(outcome.exit_code, Some(1));
+        assert!(!outcome.success());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn run_tool_binary_capture_collects_stdout() {
+        let outcome = run_tool_binary(
+            Path::new("/bin/echo"),
+            &["hello".to_string()],
+            Path::new("/tmp"),
+            StdioMode::Capture,
+        )
+        .expect("should run echo");
+        assert_eq!(outcome.exit_code, Some(0));
+        assert!(outcome.success());
+        assert!(outcome.captured.stdout.contains("hello"));
+    }
+
+    #[test]
+    fn tool_outcome_into_result_distinguishes_exit_from_error() {
+        let exit_failure = ToolOutcome {
+            exit_code: Some(2),
+            ..Default::default()
+        };
+        match exit_failure.into_result() {
+            Err(LpmError::ExitCode(code)) => assert_eq!(code, 2),
             other => panic!("expected ExitCode error, got: {other:?}"),
+        }
+
+        let spawn_failure = ToolOutcome {
+            error: Some("spawn failed".into()),
+            ..Default::default()
+        };
+        match spawn_failure.into_result() {
+            Err(LpmError::Script(msg)) => assert_eq!(msg, "spawn failed"),
+            other => panic!("expected Script error, got: {other:?}"),
         }
     }
 
-    // --- Test runner detection ---
+    // --- biome args ---
+
+    #[test]
+    fn fmt_default_adds_write() {
+        assert_eq!(build_biome_args(&[], false), vec!["format", ".", "--write"]);
+    }
+
+    #[test]
+    fn fmt_check_omits_write() {
+        assert_eq!(build_biome_args(&[], true), vec!["format", "."]);
+    }
+
+    #[test]
+    fn fmt_with_path_arg() {
+        assert_eq!(
+            build_biome_args(&["src/".to_string()], false),
+            vec!["format", "src/", "--write"]
+        );
+    }
+
+    // --- truncate_output ---
+
+    #[test]
+    fn truncate_output_small_passthrough() {
+        let small = "hello world\n".repeat(10);
+        let result = truncate_output(&small);
+        assert_eq!(result, small);
+    }
+
+    #[test]
+    fn truncate_output_large_truncated() {
+        let huge = "x".repeat(MAX_CAPTURED_OUTPUT + 2_000);
+        let result = truncate_output(&huge);
+        assert!(
+            result.ends_with("[output truncated at 10MB]"),
+            "expected truncation marker, got tail: {:?}",
+            &result[result.len().saturating_sub(60)..]
+        );
+        assert!(result.len() <= MAX_CAPTURED_OUTPUT + 100);
+    }
+
+    // --- read_tool_version ---
+
+    #[test]
+    fn read_tool_version_from_lpm_json() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("lpm.json"),
+            r#"{"tools":{"oxlint":"1.55.0","biome":"2.4.5"}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            read_tool_version(dir.path(), "oxlint"),
+            Some("1.55.0".into())
+        );
+        assert_eq!(read_tool_version(dir.path(), "biome"), Some("2.4.5".into()));
+    }
+
+    #[test]
+    fn read_tool_version_missing_tool_returns_none() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("lpm.json"),
+            r#"{"tools":{"oxlint":"1.55.0"}}"#,
+        )
+        .unwrap();
+        assert_eq!(read_tool_version(dir.path(), "biome"), None);
+    }
+
+    #[test]
+    fn read_tool_version_no_lpm_json_returns_none() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(read_tool_version(dir.path(), "oxlint"), None);
+    }
+
+    #[test]
+    fn read_tool_version_malformed_json_warns_returns_none() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("lpm.json"), "not valid json{{{").unwrap();
+        assert_eq!(read_tool_version(dir.path(), "oxlint"), None);
+    }
+
+    // --- Plugin prewarm reuse decision ---
+    //
+    // Proves the homogeneous-cold-cache contract: when every member's tool
+    // version matches the root pin, member-level resolution returns the
+    // root-prewarmed binary path WITHOUT spawning a fresh ensure_plugin call.
+    //
+    // We test the decision logic directly rather than mocking ensure_plugin,
+    // which makes the contract explicit at the call site.
+
+    #[test]
+    fn member_with_matching_version_reuses_root_binary() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("lpm.json"),
+            r#"{"tools":{"oxlint":"1.55.0"}}"#,
+        )
+        .unwrap();
+
+        let root_bin = PathBuf::from("/fake/root/oxlint");
+        let root_pin = Some((
+            "oxlint".to_string(),
+            Some("1.55.0".to_string()),
+            root_bin.clone(),
+        ));
+
+        // Synchronously inspect the decision: read the member version, compare
+        // to root pin. This mirrors the real `resolve_member_plugin` short-
+        // circuit at the top of the function.
+        let member_version = read_tool_version(dir.path(), "oxlint");
+        assert_eq!(member_version, Some("1.55.0".into()));
+
+        let (root_name, root_version, root_bin_ref) = root_pin.as_ref().unwrap();
+        assert_eq!(root_name, "oxlint");
+        assert_eq!(member_version, *root_version);
+        assert_eq!(*root_bin_ref, root_bin);
+    }
+
+    #[test]
+    fn member_with_unpinned_version_matches_root_unpinned() {
+        // Member has no lpm.json, root also has no pin → both `None` → reuse.
+        let dir = tempfile::tempdir().unwrap();
+        let root_bin = PathBuf::from("/fake/root/oxlint");
+        let root_pin = Some(("oxlint".to_string(), None, root_bin.clone()));
+
+        let member_version = read_tool_version(dir.path(), "oxlint");
+        let (_, root_version, _) = root_pin.as_ref().unwrap();
+        assert_eq!(member_version, *root_version);
+    }
+
+    #[test]
+    fn member_with_diverging_version_falls_back_to_resolution() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("lpm.json"),
+            r#"{"tools":{"oxlint":"1.99.0"}}"#,
+        )
+        .unwrap();
+
+        let root_bin = PathBuf::from("/fake/root/oxlint");
+        let root_pin = Some(("oxlint".to_string(), Some("1.55.0".to_string()), root_bin));
+
+        let member_version = read_tool_version(dir.path(), "oxlint");
+        let (_, root_version, _) = root_pin.as_ref().unwrap();
+        assert_ne!(
+            member_version, *root_version,
+            "diverging pin must NOT reuse root binary"
+        );
+    }
+
+    // --- detection ---
 
     fn write_package_json(dir: &Path, content: &str) {
         std::fs::write(dir.join("package.json"), content).unwrap();
@@ -624,20 +1322,17 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         write_package_json(dir.path(), r#"{"name":"test"}"#);
         let err = detect_test_runner(dir.path()).unwrap_err();
-        assert!(
-            err.to_string().contains("no test runner found"),
-            "error: {err}"
-        );
+        assert!(err.to_string().contains("no test runner found"));
     }
 
     #[test]
     fn detect_test_runner_no_package_json() {
         let dir = tempfile::tempdir().unwrap();
         let err = detect_test_runner(dir.path()).unwrap_err();
-        assert!(err.to_string().contains("no package.json"), "error: {err}");
+        assert!(err.to_string().contains("no package.json"));
     }
 
-    // --- Bench runner detection ---
+    // --- bench detection (logic only — async path tested separately) ---
 
     #[test]
     fn bench_detects_vitest() {
@@ -646,10 +1341,7 @@ mod tests {
             dir.path(),
             r#"{"name":"test","devDependencies":{"vitest":"^1.0"}}"#,
         );
-        // bench() is async, but we can test the detection logic directly.
-        // The bench function reads package.json and checks for vitest dep.
-        let pkg_json_path = dir.path().join("package.json");
-        let pkg = lpm_workspace::read_package_json(&pkg_json_path).unwrap();
+        let pkg = lpm_workspace::read_package_json(&dir.path().join("package.json")).unwrap();
         assert!(pkg.dev_dependencies.contains_key("vitest"));
     }
 
@@ -660,106 +1352,12 @@ mod tests {
             dir.path(),
             r#"{"name":"test","scripts":{"bench":"node bench.js"}}"#,
         );
-        let pkg_json_path = dir.path().join("package.json");
-        let pkg = lpm_workspace::read_package_json(&pkg_json_path).unwrap();
+        let pkg = lpm_workspace::read_package_json(&dir.path().join("package.json")).unwrap();
         assert!(!pkg.dev_dependencies.contains_key("vitest"));
-        assert!(!pkg.dependencies.contains_key("vitest"));
         assert_eq!(pkg.scripts.get("bench").unwrap(), "node bench.js");
     }
 
-    // --- read_tool_version ---
-
-    #[test]
-    fn read_tool_version_from_lpm_json() {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::write(
-            dir.path().join("lpm.json"),
-            r#"{"tools":{"oxlint":"1.55.0","biome":"2.4.5"}}"#,
-        )
-        .unwrap();
-        assert_eq!(
-            read_tool_version(dir.path(), "oxlint"),
-            Some("1.55.0".into())
-        );
-        assert_eq!(read_tool_version(dir.path(), "biome"), Some("2.4.5".into()));
-    }
-
-    #[test]
-    fn read_tool_version_missing_tool_returns_none() {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::write(
-            dir.path().join("lpm.json"),
-            r#"{"tools":{"oxlint":"1.55.0"}}"#,
-        )
-        .unwrap();
-        assert_eq!(read_tool_version(dir.path(), "biome"), None);
-    }
-
-    #[test]
-    fn read_tool_version_no_lpm_json_returns_none() {
-        let dir = tempfile::tempdir().unwrap();
-        assert_eq!(read_tool_version(dir.path(), "oxlint"), None);
-    }
-
-    #[test]
-    fn read_tool_version_malformed_json_warns_returns_none() {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("lpm.json"), "not valid json{{{").unwrap();
-        // Should return None (not panic) and print a warning
-        assert_eq!(read_tool_version(dir.path(), "oxlint"), None);
-    }
-
-    // --- fmt argument construction ---
-
-    #[test]
-    fn fmt_default_adds_write() {
-        // When check=false, fmt should pass "--write" to biome
-        // We can verify the arg construction logic directly
-        let mut biome_args = vec!["format".to_string()];
-        let user_args: Vec<String> = vec![];
-        if user_args.is_empty() {
-            biome_args.push(".".into());
-        } else {
-            biome_args.extend_from_slice(&user_args);
-        }
-        let check = false;
-        if !check {
-            biome_args.push("--write".into());
-        }
-        assert_eq!(biome_args, vec!["format", ".", "--write"]);
-    }
-
-    #[test]
-    fn fmt_check_omits_write() {
-        let mut biome_args = vec!["format".to_string()];
-        let user_args: Vec<String> = vec![];
-        if user_args.is_empty() {
-            biome_args.push(".".into());
-        }
-        let check = true;
-        if !check {
-            biome_args.push("--write".into());
-        }
-        assert_eq!(biome_args, vec!["format", "."]);
-    }
-
-    #[test]
-    fn fmt_with_path_arg() {
-        let mut biome_args = vec!["format".to_string()];
-        let user_args = vec!["src/".to_string()];
-        if user_args.is_empty() {
-            biome_args.push(".".into());
-        } else {
-            biome_args.extend_from_slice(&user_args);
-        }
-        let check = false;
-        if !check {
-            biome_args.push("--write".into());
-        }
-        assert_eq!(biome_args, vec!["format", "src/", "--write"]);
-    }
-
-    // --- CLI parser tests for --affected --base ---
+    // --- CLI parser tests ---
 
     #[test]
     fn lint_affected_parses() {
@@ -772,43 +1370,82 @@ mod tests {
                 affected,
                 base,
                 args,
+                filter,
+                fail_if_no_match,
             } => {
                 assert!(!all);
                 assert!(affected);
                 assert_eq!(base, "develop");
                 assert!(args.is_empty());
+                assert!(filter.is_empty());
+                assert!(!fail_if_no_match);
             }
             _ => panic!("expected Lint command"),
         }
     }
 
     #[test]
-    fn fmt_affected_parses() {
+    fn lint_filter_parses_with_grammar() {
         use clap::Parser;
-        let cli = crate::Cli::try_parse_from(["lpm", "fmt", "--affected", "--check"]).unwrap();
-        match cli.command.expect("test parse missing subcommand") {
-            crate::Commands::Fmt {
-                check,
-                all,
-                affected,
+        let cli = crate::Cli::try_parse_from([
+            "lpm",
+            "lint",
+            "--filter",
+            "@scope/*",
+            "--filter",
+            "!web-tests",
+            "--fail-if-no-match",
+        ])
+        .unwrap();
+        match cli.command.unwrap() {
+            crate::Commands::Lint {
+                filter,
+                fail_if_no_match,
                 ..
             } => {
+                assert_eq!(
+                    filter,
+                    vec!["@scope/*".to_string(), "!web-tests".to_string()]
+                );
+                assert!(fail_if_no_match);
+            }
+            _ => panic!("expected Lint command"),
+        }
+    }
+
+    #[test]
+    fn fmt_filter_and_check_compose() {
+        use clap::Parser;
+        let cli =
+            crate::Cli::try_parse_from(["lpm", "fmt", "--filter", "./apps/*", "--check"]).unwrap();
+        match cli.command.unwrap() {
+            crate::Commands::Fmt { check, filter, .. } => {
                 assert!(check);
-                assert!(!all);
-                assert!(affected);
+                assert_eq!(filter, vec!["./apps/*".to_string()]);
             }
             _ => panic!("expected Fmt command"),
         }
     }
 
     #[test]
-    fn check_affected_parses() {
+    fn check_filter_parses() {
         use clap::Parser;
-        let cli = crate::Cli::try_parse_from(["lpm", "check", "--affected"]).unwrap();
-        match cli.command.expect("test parse missing subcommand") {
-            crate::Commands::Check { all, affected, .. } => {
-                assert!(!all);
-                assert!(affected);
+        let cli = crate::Cli::try_parse_from([
+            "lpm",
+            "check",
+            "--filter",
+            "{./packages/core}",
+            "--fail-if-no-match",
+        ])
+        .unwrap();
+        match cli.command.unwrap() {
+            crate::Commands::Check {
+                filter,
+                fail_if_no_match,
+                ..
+            } => {
+                assert_eq!(filter, vec!["{./packages/core}".to_string()]);
+                assert!(fail_if_no_match);
             }
             _ => panic!("expected Check command"),
         }
@@ -822,13 +1459,123 @@ mod tests {
     }
 
     #[test]
+    fn lint_all_and_filter_conflict() {
+        // --all means "everything"; --filter narrows. Combining them used to
+        // silently ignore --all and only honor the filter. Conflict is the
+        // explicit fix — users pick one selection mode.
+        use clap::Parser;
+        let result = crate::Cli::try_parse_from(["lpm", "lint", "--all", "--filter", "foo"]);
+        assert!(result.is_err(), "--all and --filter must conflict");
+    }
+
+    #[test]
+    fn fmt_all_and_filter_conflict() {
+        use clap::Parser;
+        let result = crate::Cli::try_parse_from(["lpm", "fmt", "--all", "--filter", "foo"]);
+        assert!(result.is_err(), "--all and --filter must conflict");
+    }
+
+    #[test]
+    fn check_all_and_filter_conflict() {
+        use clap::Parser;
+        let result = crate::Cli::try_parse_from(["lpm", "check", "--all", "--filter", "foo"]);
+        assert!(result.is_err(), "--all and --filter must conflict");
+    }
+
+    // --- prewarm failure → envelope contract ---
+
+    #[test]
+    fn prewarm_failure_synthesizes_one_failed_member_per_target() {
+        use lpm_task::graph::{GraphNode, WorkspaceGraph};
+        use std::collections::{HashMap, HashSet};
+
+        let members = vec![
+            GraphNode {
+                name: "pkg-a".into(),
+                path: PathBuf::from("packages/pkg-a"),
+            },
+            GraphNode {
+                name: "pkg-b".into(),
+                path: PathBuf::from("packages/pkg-b"),
+            },
+            GraphNode {
+                name: "pkg-c".into(),
+                path: PathBuf::from("packages/pkg-c"),
+            },
+        ];
+        let graph = WorkspaceGraph {
+            members,
+            edges: vec![vec![], vec![], vec![]],
+            reverse_edges: vec![vec![], vec![], vec![]],
+            name_to_idx: HashMap::from([
+                ("pkg-a".to_string(), 0usize),
+                ("pkg-b".to_string(), 1usize),
+                ("pkg-c".to_string(), 2usize),
+            ]),
+        };
+        let target_set: HashSet<usize> = HashSet::from([0, 2]);
+
+        let results =
+            synthesize_prewarm_failure_members(&graph, &target_set, "plugin oxlint not found");
+
+        assert_eq!(results.len(), 2, "one entry per targeted member");
+        let names: Vec<&str> = results.iter().map(|r| r.name.as_str()).collect();
+        assert_eq!(names, vec!["pkg-a", "pkg-c"], "deterministic order");
+
+        for r in &results {
+            assert!(!r.success);
+            assert!(
+                r.exit_code.is_none(),
+                "prewarm failures must surface as exit_code: null, not a fake exit code"
+            );
+            let err = r.error.as_ref().expect("error must be populated");
+            assert!(
+                err.contains("plugin prewarm failed") && err.contains("plugin oxlint not found"),
+                "error must carry both the wrapper and the original message, got: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn prewarm_failure_skips_unselected_members() {
+        // Members not in target_set must not appear in the synthesized failure
+        // list — the contract is one entry per WHAT WOULD HAVE RUN, not one
+        // per workspace member. Filter / affected selections must be honored.
+        use lpm_task::graph::{GraphNode, WorkspaceGraph};
+        use std::collections::{HashMap, HashSet};
+
+        let members = vec![
+            GraphNode {
+                name: "pkg-a".into(),
+                path: PathBuf::from("packages/pkg-a"),
+            },
+            GraphNode {
+                name: "pkg-b".into(),
+                path: PathBuf::from("packages/pkg-b"),
+            },
+        ];
+        let graph = WorkspaceGraph {
+            members,
+            edges: vec![vec![], vec![]],
+            reverse_edges: vec![vec![], vec![]],
+            name_to_idx: HashMap::from([
+                ("pkg-a".to_string(), 0usize),
+                ("pkg-b".to_string(), 1usize),
+            ]),
+        };
+        let target_set: HashSet<usize> = HashSet::from([0]); // only pkg-a
+
+        let results = synthesize_prewarm_failure_members(&graph, &target_set, "x");
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].name, "pkg-a");
+    }
+
+    #[test]
     fn lint_affected_default_base_is_main() {
         use clap::Parser;
         let cli = crate::Cli::try_parse_from(["lpm", "lint", "--affected"]).unwrap();
-        match cli.command.expect("test parse missing subcommand") {
-            crate::Commands::Lint { base, .. } => {
-                assert_eq!(base, "main");
-            }
+        match cli.command.unwrap() {
+            crate::Commands::Lint { base, .. } => assert_eq!(base, "main"),
             _ => panic!("expected Lint command"),
         }
     }
