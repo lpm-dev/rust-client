@@ -1119,8 +1119,13 @@ pub async fn run_workspace(
         .topological_levels()
         .map_err(|e| LpmError::Script(e.to_string()))?;
 
-    let target_set =
-        select_workspace_target_set(&ws_graph, &workspace.root, filters, affected, base_ref)?;
+    let target_set = crate::workspace_select::select_workspace_target_set(
+        &ws_graph,
+        &workspace.root,
+        filters,
+        affected,
+        base_ref,
+    )?;
 
     if target_set.is_empty() {
         // Phase 32 D2 follow-through: surface the substring → glob migration
@@ -1273,79 +1278,6 @@ pub async fn run_workspace(
     } else {
         Ok(())
     }
-}
-
-/// Compute the workspace target set from the CLI flags. Wraps the shared
-/// `FilterEngine` so this command and every other Phase 32 consumer use
-/// identical filter semantics.
-///
-/// Composition rules:
-///
-/// - **No flags** (caller already verified `--all` is set): every member.
-/// - **`--affected` only**: legacy behavior (directly changed packages plus
-///   their transitive dependents) via `find_affected`. This matches the
-///   pre-Phase-32 contract — users who depended on `--affected` get the
-///   same behavior. Per design decision D1, this is intentional.
-/// - **`--filter <expr>...`**: parsed and evaluated through `FilterEngine`.
-///   Multi-filter unions are handled inside the engine.
-/// - **`--filter` AND `--affected`**: union of both target sets — `--affected`
-///   is treated as an implicit additional positive filter.
-fn select_workspace_target_set(
-    ws_graph: &lpm_task::graph::WorkspaceGraph,
-    workspace_root: &Path,
-    filters: &[String],
-    affected: bool,
-    base_ref: &str,
-) -> Result<HashSet<usize>, LpmError> {
-    use lpm_task::filter::{FilterEngine, FilterExpr};
-
-    // No filter and no --affected → every member (caller already gated
-    // workspace mode on `--all || filter || affected`).
-    if filters.is_empty() && !affected {
-        return Ok((0..ws_graph.len()).collect());
-    }
-
-    let engine = FilterEngine::new(ws_graph, workspace_root);
-
-    // Parse all --filter strings into FilterExpr ASTs.
-    let mut exprs: Vec<FilterExpr> = Vec::with_capacity(filters.len() + 1);
-    for raw in filters {
-        let parsed = FilterEngine::parse(raw).map_err(|e| {
-            LpmError::Script(format!(
-                "invalid --filter {raw:?}: {e}\n  \
-                 (Phase 32 removed substring matching; use a glob like '*{raw}*' \
-                 if you intended a partial match.)"
-            ))
-        })?;
-        exprs.push(parsed);
-    }
-
-    // If --affected is also set, union it in via find_affected (legacy
-    // dependents-included semantics, per D1). We pre-compute the set and
-    // bypass the parser by collecting member indices directly.
-    let affected_set: HashSet<usize> = if affected {
-        lpm_task::affected::find_affected(ws_graph, workspace_root, base_ref)
-            .map_err(LpmError::Script)?
-    } else {
-        HashSet::new()
-    };
-
-    // Evaluate the filter side. If there are no --filter args but --affected
-    // is set, the affected set IS the result.
-    let filter_target: HashSet<usize> = if exprs.is_empty() {
-        HashSet::new()
-    } else {
-        engine
-            .evaluate(&exprs)
-            .map_err(|e| LpmError::Script(format!("filter error: {e}")))?
-            .into_iter()
-            .collect()
-    };
-
-    // Union --filter result with --affected result.
-    let mut target_set: HashSet<usize> = filter_target;
-    target_set.extend(affected_set);
-    Ok(target_set)
 }
 
 /// Execute scripts in a single workspace package with task-graph awareness.
@@ -1936,42 +1868,7 @@ fn try_cache_store_with_output_and_config(
 mod tests {
     use super::*;
     use lpm_runner::bin_path::ManagedRuntimeHint::Unknown;
-    use lpm_task::graph::{GraphNode, WorkspaceGraph};
     use std::collections::HashMap;
-    use std::path::PathBuf;
-
-    fn make_workspace_graph() -> (WorkspaceGraph, Vec<Vec<usize>>, Vec<usize>) {
-        let members = vec![
-            GraphNode {
-                name: "pkg-a".into(),
-                path: PathBuf::from("packages/pkg-a"),
-            },
-            GraphNode {
-                name: "pkg-b".into(),
-                path: PathBuf::from("packages/pkg-b"),
-            },
-            GraphNode {
-                name: "tooling-app".into(),
-                path: PathBuf::from("apps/tooling-app"),
-            },
-        ];
-        let edges = vec![vec![], vec![0], vec![1]];
-        let reverse_edges = vec![vec![1], vec![2], vec![]];
-        let name_to_idx = HashMap::from([
-            ("pkg-a".to_string(), 0usize),
-            ("pkg-b".to_string(), 1usize),
-            ("tooling-app".to_string(), 2usize),
-        ]);
-        let graph = WorkspaceGraph {
-            members,
-            edges,
-            reverse_edges,
-            name_to_idx,
-        };
-        let levels = graph.topological_levels().unwrap();
-        let sorted: Vec<usize> = levels.iter().flatten().copied().collect();
-        (graph, levels, sorted)
-    }
 
     // --- Finding #1: transitive skip propagation ---
 
@@ -2040,193 +1937,10 @@ mod tests {
         assert!(!should_skip_task("A", &tasks, &failed_tasks));
     }
 
-    // ── Phase 32 Phase 1 M7: filter selection through FilterEngine ────────
-
-    #[test]
-    fn workspace_target_selection_no_filter_no_affected_returns_all_members() {
-        let (graph, _levels, _sorted) = make_workspace_graph();
-        let workspace_root = std::path::Path::new(".");
-
-        let result = select_workspace_target_set(&graph, workspace_root, &[], false, "main")
-            .expect("no-filter no-affected mode should succeed");
-
-        assert_eq!(result, HashSet::from([0usize, 1, 2]));
-    }
-
-    #[test]
-    fn workspace_target_selection_exact_name_filter_selects_one_member() {
-        let (graph, _levels, _sorted) = make_workspace_graph();
-        let workspace_root = std::path::Path::new(".");
-
-        let result = select_workspace_target_set(
-            &graph,
-            workspace_root,
-            &["pkg-b".to_string()],
-            false,
-            "main",
-        )
-        .unwrap();
-
-        assert_eq!(result, HashSet::from([1usize]));
-    }
-
-    #[test]
-    fn workspace_target_selection_glob_filter_matches_multiple_members() {
-        let (graph, _levels, _sorted) = make_workspace_graph();
-        let workspace_root = std::path::Path::new(".");
-
-        // pkg-a and pkg-b both match `pkg-*`, tooling-app does not.
-        let result = select_workspace_target_set(
-            &graph,
-            workspace_root,
-            &["pkg-*".to_string()],
-            false,
-            "main",
-        )
-        .unwrap();
-
-        assert_eq!(result, HashSet::from([0usize, 1]));
-    }
-
-    #[test]
-    fn workspace_target_selection_d2_substring_no_longer_matches() {
-        // D2 REGRESSION: in the pre-Phase-32 substring matcher, `pkg` would
-        // have matched `pkg-a` and `pkg-b`. With strict exact-match, it must
-        // return EMPTY (no package is literally named `pkg`).
-        let (graph, _levels, _sorted) = make_workspace_graph();
-        let workspace_root = std::path::Path::new(".");
-
-        let result = select_workspace_target_set(
-            &graph,
-            workspace_root,
-            &["pkg".to_string()],
-            false,
-            "main",
-        )
-        .unwrap();
-
-        assert!(
-            result.is_empty(),
-            "D2: bare 'pkg' must NOT match 'pkg-a' / 'pkg-b' via substring (use 'pkg-*' instead)"
-        );
-    }
-
-    #[test]
-    fn workspace_target_selection_d2_substring_error_message_suggests_glob() {
-        // When a parser-level error happens (e.g., invalid syntax), the
-        // error message must point users at the glob fix. We simulate this
-        // by passing a syntactically invalid filter.
-        let (graph, _levels, _sorted) = make_workspace_graph();
-        let workspace_root = std::path::Path::new(".");
-
-        let err = select_workspace_target_set(
-            &graph,
-            workspace_root,
-            &["foo!bar".to_string()],
-            false,
-            "main",
-        )
-        .expect_err("invalid syntax must error");
-
-        let msg = err.to_string();
-        assert!(
-            msg.contains("Phase 32") && msg.contains("glob"),
-            "error must mention the substring → glob migration, got: {msg}"
-        );
-    }
-
-    #[test]
-    fn workspace_target_selection_multi_filter_unions_results() {
-        let (graph, _levels, _sorted) = make_workspace_graph();
-        let workspace_root = std::path::Path::new(".");
-
-        let result = select_workspace_target_set(
-            &graph,
-            workspace_root,
-            &["pkg-a".to_string(), "tooling-app".to_string()],
-            false,
-            "main",
-        )
-        .unwrap();
-
-        assert_eq!(result, HashSet::from([0usize, 2]));
-    }
-
-    #[test]
-    fn workspace_target_selection_with_dependents_closure() {
-        // ...pkg-a expands to {pkg-a, pkg-b (depends on pkg-a), tooling-app (depends on pkg-b)}
-        let (graph, _levels, _sorted) = make_workspace_graph();
-        let workspace_root = std::path::Path::new(".");
-
-        let result = select_workspace_target_set(
-            &graph,
-            workspace_root,
-            &["...pkg-a".to_string()],
-            false,
-            "main",
-        )
-        .unwrap();
-
-        assert_eq!(result, HashSet::from([0usize, 1, 2]));
-    }
-
-    #[test]
-    fn workspace_target_selection_with_deps_closure() {
-        // tooling-app... = {tooling-app, pkg-b, pkg-a}
-        let (graph, _levels, _sorted) = make_workspace_graph();
-        let workspace_root = std::path::Path::new(".");
-
-        let result = select_workspace_target_set(
-            &graph,
-            workspace_root,
-            &["tooling-app...".to_string()],
-            false,
-            "main",
-        )
-        .unwrap();
-
-        assert_eq!(result, HashSet::from([0usize, 1, 2]));
-    }
-
-    #[test]
-    fn workspace_target_selection_exclude_subtracts_from_union() {
-        // pkg-* + tooling-app − pkg-a = {pkg-b, tooling-app}
-        let (graph, _levels, _sorted) = make_workspace_graph();
-        let workspace_root = std::path::Path::new(".");
-
-        let result = select_workspace_target_set(
-            &graph,
-            workspace_root,
-            &[
-                "pkg-*".to_string(),
-                "tooling-app".to_string(),
-                "!pkg-a".to_string(),
-            ],
-            false,
-            "main",
-        )
-        .unwrap();
-
-        assert_eq!(result, HashSet::from([1usize, 2]));
-    }
-
-    #[test]
-    fn workspace_target_selection_filter_returns_empty_for_no_match() {
-        // Empty result is OK at this layer (caller handles --fail-if-no-match)
-        let (graph, _levels, _sorted) = make_workspace_graph();
-        let workspace_root = std::path::Path::new(".");
-
-        let result = select_workspace_target_set(
-            &graph,
-            workspace_root,
-            &["does-not-exist".to_string()],
-            false,
-            "main",
-        )
-        .unwrap();
-
-        assert!(result.is_empty());
-    }
+    // ── Selection logic itself lives in `crate::workspace_select` (and is
+    // tested there). The test below verifies that the run-workspace caller
+    // surfaces the D2 substring → glob migration hint on the empty-match
+    // branch — that wiring lives here, not in the selector.
 
     #[test]
     fn workspace_target_selection_no_match_path_uses_d2_migration_hint() {
