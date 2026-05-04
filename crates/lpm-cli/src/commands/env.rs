@@ -2748,64 +2748,16 @@ async fn vars_oidc_pull(
     Ok(())
 }
 
-/// Get the OIDC token from the CI environment.
+/// Get the OIDC token from the CI environment for the env-vault flow.
 ///
-/// Checks platform-specific env vars:
-/// - GitHub Actions: `ACTIONS_ID_TOKEN_REQUEST_TOKEN` + `ACTIONS_ID_TOKEN_REQUEST_URL`
-/// - GitLab CI: `CI_JOB_JWT_V2` or `LPM_OIDC_TOKEN`
-/// - Generic: `LPM_OIDC_TOKEN`
+/// Audience is `https://lpm.dev` (the vault verifier rejects anything else),
+/// so this routes through the shared registry-exchange resolver. Honors
+/// `LPM_OIDC_TOKEN` (canonical), GitHub Actions runtime, and the legacy
+/// `LPM_GITLAB_OIDC_TOKEN` alias.
 async fn get_ci_oidc_token() -> Result<String, LpmError> {
-    // GitHub Actions: need to request the token from the runtime
-    if std::env::var("GITHUB_ACTIONS").is_ok() {
-        let request_token = std::env::var("ACTIONS_ID_TOKEN_REQUEST_TOKEN").map_err(|_| {
-            LpmError::Script(
-                "ACTIONS_ID_TOKEN_REQUEST_TOKEN not set. Add 'permissions: id-token: write' to your workflow.".into(),
-            )
-        })?;
-        let request_url = std::env::var("ACTIONS_ID_TOKEN_REQUEST_URL")
-            .map_err(|_| LpmError::Script("ACTIONS_ID_TOKEN_REQUEST_URL not set".into()))?;
-
-        // Request OIDC token from GitHub's runtime with our audience
-        let url = format!("{request_url}&audience=https://lpm.dev");
-        let client = reqwest::Client::new();
-        let response = client
-            .get(&url)
-            .header("Authorization", format!("Bearer {request_token}"))
-            .send()
-            .await
-            .map_err(|e| LpmError::Network(format!("failed to get GitHub OIDC token: {e}")))?;
-
-        if !response.status().is_success() {
-            return Err(LpmError::Script(format!(
-                "GitHub OIDC token request failed ({})",
-                response.status()
-            )));
-        }
-
-        let body: serde_json::Value = response
-            .json()
-            .await
-            .map_err(|e| LpmError::Script(format!("failed to parse OIDC response: {e}")))?;
-
-        return body["value"]
-            .as_str()
-            .map(|s: &str| s.to_string())
-            .ok_or_else(|| LpmError::Script("no token in GitHub OIDC response".into()));
-    }
-
-    // GitLab CI
-    if let Ok(token) = std::env::var("CI_JOB_JWT_V2") {
-        return Ok(token);
-    }
-
-    // Generic fallback
-    if let Ok(token) = std::env::var("LPM_OIDC_TOKEN") {
-        return Ok(token);
-    }
-
-    Err(LpmError::Script(
-        "no OIDC token found. Set LPM_OIDC_TOKEN or ensure your CI is configured for OIDC.".into(),
-    ))
+    crate::oidc::resolve_registry_exchange_jwt()
+        .await
+        .map_err(|e| LpmError::Script(format!("{e}")))
 }
 
 /// `lpm env pull --from <platform> [--env=<mode>] [--yes]`
