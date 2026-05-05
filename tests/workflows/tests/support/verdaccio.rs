@@ -20,6 +20,31 @@ const DEFAULT_USERNAME: &str = "lpm-workflows";
 const DEFAULT_PASSWORD: &str = "lpm-workflows-password";
 const DEFAULT_EMAIL: &str = "lpm-workflows@example.test";
 
+#[cfg(unix)]
+fn configure_process_group(command: &mut Command) {
+    use std::os::unix::process::CommandExt;
+
+    command.process_group(0);
+}
+
+#[cfg(not(unix))]
+fn configure_process_group(_command: &mut Command) {}
+
+#[cfg(unix)]
+fn terminate_child_tree(child: &mut Child) {
+    let pgid = child.id() as i32;
+    if pgid > 0 {
+        unsafe {
+            libc::kill(-pgid, libc::SIGKILL);
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn terminate_child_tree(child: &mut Child) {
+    let _ = child.kill();
+}
+
 pub struct VerdaccioRegistry {
     child: Child,
     config_dir: TempDir,
@@ -41,7 +66,8 @@ impl VerdaccioRegistry {
         let stderr = File::create(config_dir.path().join("verdaccio.stderr.log"))
             .expect("failed to create verdaccio stderr log");
 
-        let child = Command::new("npx")
+        let mut command = Command::new("npx");
+        command
             .arg("--yes")
             .arg(format!("verdaccio@{VERDACCIO_VERSION}"))
             .arg("--config")
@@ -51,7 +77,12 @@ impl VerdaccioRegistry {
             .current_dir(config_dir.path())
             .stdin(Stdio::null())
             .stdout(Stdio::from(stdout))
-            .stderr(Stdio::from(stderr))
+            .stderr(Stdio::from(stderr));
+        // `npx verdaccio` may outlive the front launcher process; put the
+        // whole launcher tree in its own Unix process group so drop cleanup
+        // can kill every descendant, not just the tracked front PID.
+        configure_process_group(&mut command);
+        let child = command
             .spawn()
             .expect("failed to spawn verdaccio via npx");
 
@@ -353,7 +384,7 @@ impl VerdaccioRegistry {
 
 impl Drop for VerdaccioRegistry {
     fn drop(&mut self) {
-        let _ = self.child.kill();
+        terminate_child_tree(&mut self.child);
         let _ = self.child.wait();
     }
 }
