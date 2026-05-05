@@ -58,6 +58,80 @@ fn parse_remote_pull_payload_for_overwrite(
     Err("failed to parse pulled vault data".to_string())
 }
 
+/// Read `lpm.json` for an `lpm env push` surface (personal or org).
+///
+/// Returns `Some(config)` on a clean parse and `None` when the file is
+/// absent. When the file is present but malformed, emits a stderr warning
+/// (and a tracing entry) then returns `None` rather than failing the push.
+/// Push is the user's mainline action and a metadata read should never
+/// block it; the stderr warning surfaces the silent-stale-schema failure
+/// mode (push succeeds, server keeps last-known-good schema).
+fn read_lpm_json_for_push(
+    project_dir: &std::path::Path,
+) -> Option<lpm_runner::lpm_json::LpmJsonConfig> {
+    match lpm_runner::lpm_json::read_lpm_json(project_dir) {
+        Ok(opt) => opt,
+        Err(e) => {
+            output::warn(&format!(
+                "lpm.json could not be parsed: {e}. Pushing without schema metadata; server keeps the last-known-good schema."
+            ));
+            tracing::warn!("lpm.json parse error during env push: {e}");
+            None
+        }
+    }
+}
+
+/// Build the `schema` JSON value sent alongside a vault push.
+///
+/// Shape: `{ version: 2, envSchema?, envConfig?, environments? }`. The
+/// dashboard renders these read-only so a teammate sees which keys are
+/// required, secret, etc. Wire shape is identical for personal and org
+/// vaults — the calling layer decides whether to send it. Returns `None`
+/// when the project has no `lpm.json` (or it failed to parse — see
+/// [`read_lpm_json_for_push`]).
+fn build_push_schema_value(
+    config: Option<&lpm_runner::lpm_json::LpmJsonConfig>,
+) -> Option<serde_json::Value> {
+    let c = config?;
+    let mut obj = serde_json::Map::new();
+    obj.insert("version".into(), serde_json::json!(2));
+
+    // envSchema: flat var map (serialize .vars directly, not the EnvSchema wrapper)
+    if let Some(env_schema) = &c.env_schema
+        && let Ok(v) = serde_json::to_value(&env_schema.vars)
+    {
+        obj.insert("envSchema".into(), v);
+    }
+
+    // envConfig: alias → canonical mapping from lpm.json "env" field
+    if !c.env.is_empty() {
+        let env_config: serde_json::Map<_, _> = c
+            .env
+            .iter()
+            .filter_map(|(alias, file_path)| {
+                let mode = lpm_env::resolver::extract_mode_from_env_path(file_path)?;
+                Some((
+                    alias.clone(),
+                    serde_json::json!({
+                        "canonical": mode,
+                        "file": file_path,
+                    }),
+                ))
+            })
+            .collect();
+        obj.insert("envConfig".into(), serde_json::Value::Object(env_config));
+    }
+
+    // environments: inheritance config (extends, file, sensitive)
+    if let Some(envs) = &c.environments
+        && let Ok(v) = serde_json::to_value(envs)
+    {
+        obj.insert("environments".into(), v);
+    }
+
+    Some(serde_json::Value::Object(obj))
+}
+
 /// Resolve an LPM session bearer for env vault sync sites.
 ///
 /// `lpm env` subcommands build their own reqwest client (long timeouts,
@@ -343,9 +417,7 @@ pub async fn run(
                 return Err(LpmError::Script("vault is empty, nothing to push".into()));
             }
 
-            let config = lpm_runner::lpm_json::read_lpm_json(project_dir)
-                .ok()
-                .flatten();
+            let config = read_lpm_json_for_push(project_dir);
             let empty_env_map = HashMap::new();
             let env_map = config.as_ref().map_or(&empty_env_map, |c| &c.env);
             let environments = config.as_ref().and_then(|c| c.environments.as_ref());
@@ -387,45 +459,7 @@ pub async fn run(
             let secrets_json = serde_json::to_string(&secrets_for_sync)
                 .map_err(|e| LpmError::Script(format!("failed to serialize: {e}")))?;
 
-            let schema_value = config.as_ref().map(|c| {
-                let mut obj = serde_json::Map::new();
-                obj.insert("version".into(), serde_json::json!(2));
-
-                // envSchema: flat var map (serialize .vars directly, not the EnvSchema wrapper)
-                if let Some(env_schema) = &c.env_schema
-                    && let Ok(v) = serde_json::to_value(&env_schema.vars)
-                {
-                    obj.insert("envSchema".into(), v);
-                }
-
-                // envConfig: alias → canonical mapping from lpm.json "env" field
-                if !c.env.is_empty() {
-                    let env_config: serde_json::Map<_, _> = c
-                        .env
-                        .iter()
-                        .filter_map(|(alias, file_path)| {
-                            let mode = lpm_env::resolver::extract_mode_from_env_path(file_path)?;
-                            Some((
-                                alias.clone(),
-                                serde_json::json!({
-                                    "canonical": mode,
-                                    "file": file_path,
-                                }),
-                            ))
-                        })
-                        .collect();
-                    obj.insert("envConfig".into(), serde_json::Value::Object(env_config));
-                }
-
-                // environments: inheritance config (extends, file, sensitive)
-                if let Some(envs) = &c.environments
-                    && let Ok(v) = serde_json::to_value(envs)
-                {
-                    obj.insert("environments".into(), v);
-                }
-
-                serde_json::Value::Object(obj)
-            });
+            let schema_value = build_push_schema_value(config.as_ref());
 
             let push_metadata = lpm_vault::sync::PushMetadata {
                 name: Some(&project_name),
@@ -689,9 +723,7 @@ pub async fn run(
 
             output::info("ensuring your X25519 public key is registered...");
 
-            let config = lpm_runner::lpm_json::read_lpm_json(project_dir)
-                .ok()
-                .flatten();
+            let config = read_lpm_json_for_push(project_dir);
             let empty_env_map = HashMap::new();
             let env_map = config.as_ref().map_or(&empty_env_map, |c| &c.env);
             let environments = config.as_ref().and_then(|c| c.environments.as_ref());
@@ -700,6 +732,13 @@ pub async fn run(
             wrapper.insert("environments".to_string(), non_empty_envs);
             let secrets_json = serde_json::to_string(&wrapper)
                 .map_err(|e| LpmError::Script(format!("failed to serialize: {e}")))?;
+
+            let project_name = lpm_vault::vault_id::read_project_name(project_dir);
+            let schema_value = build_push_schema_value(config.as_ref());
+            let push_metadata = lpm_vault::sync::PushMetadata {
+                name: Some(&project_name),
+                schema: schema_value.as_ref(),
+            };
 
             output::info(&format!(
                 "sharing vault with org {} ({} keys across {} environments)...",
@@ -715,6 +754,7 @@ pub async fn run(
                 &vault_id,
                 &secrets_json,
                 expected_org_sync_version(project_dir, org_slug),
+                Some(&push_metadata),
             )
             .await
             .map_err(LpmError::Script)?;
@@ -3384,6 +3424,113 @@ fn vars_validate(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── env push schema metadata helpers ────────────────────────────
+
+    #[test]
+    fn build_push_schema_value_returns_none_when_config_is_missing() {
+        // No lpm.json → push sends no schema → server keeps last-known-good schema.
+        assert!(build_push_schema_value(None).is_none());
+    }
+
+    #[test]
+    fn build_push_schema_value_always_emits_version_marker() {
+        // Even an empty config carries the version marker so the server can
+        // distinguish "CLI-fresh, but author cleared the schema" from
+        // "CLI never sent metadata" (None).
+        let cfg = lpm_runner::lpm_json::LpmJsonConfig::default();
+        let value =
+            build_push_schema_value(Some(&cfg)).expect("empty config still emits an object");
+        let obj = value.as_object().expect("schema must be a JSON object");
+        assert_eq!(obj.get("version"), Some(&serde_json::json!(2)));
+        assert!(!obj.contains_key("envSchema"));
+        assert!(!obj.contains_key("envConfig"));
+        assert!(!obj.contains_key("environments"));
+    }
+
+    #[test]
+    fn build_push_schema_value_includes_env_schema_vars() {
+        let mut cfg = lpm_runner::lpm_json::LpmJsonConfig::default();
+        let mut vars = std::collections::HashMap::new();
+        vars.insert(
+            "DATABASE_URL".to_string(),
+            lpm_env::EnvVarRule {
+                required: true,
+                ..Default::default()
+            },
+        );
+        cfg.env_schema = Some(lpm_env::EnvSchema { vars });
+
+        let value =
+            build_push_schema_value(Some(&cfg)).expect("config with envSchema emits a value");
+        let env_schema = value
+            .get("envSchema")
+            .expect("envSchema field must round-trip on push");
+        assert!(
+            env_schema.get("DATABASE_URL").is_some(),
+            "var entries must be flat, not wrapped in EnvSchema"
+        );
+    }
+
+    #[test]
+    fn build_push_schema_value_includes_env_config_when_aliases_defined() {
+        let mut cfg = lpm_runner::lpm_json::LpmJsonConfig::default();
+        cfg.env.insert("dev".into(), ".env.development".into());
+
+        let value = build_push_schema_value(Some(&cfg)).expect("config with env emits a value");
+        let env_config = value
+            .get("envConfig")
+            .and_then(|v| v.as_object())
+            .expect("envConfig must serialize as an object");
+        let dev = env_config
+            .get("dev")
+            .and_then(|v| v.as_object())
+            .expect("alias entry must serialize as an object");
+        assert_eq!(
+            dev.get("canonical"),
+            Some(&serde_json::json!("development"))
+        );
+        assert_eq!(
+            dev.get("file"),
+            Some(&serde_json::json!(".env.development"))
+        );
+    }
+
+    #[test]
+    fn read_lpm_json_for_push_returns_none_when_file_missing() {
+        // Absent lpm.json is not a warning condition — push just doesn't send schema.
+        let dir = tempfile::tempdir().expect("tempdir");
+        assert!(read_lpm_json_for_push(dir.path()).is_none());
+    }
+
+    #[test]
+    fn read_lpm_json_for_push_returns_none_on_malformed_lpm_json() {
+        // Malformed lpm.json must not abort the push — return None and (in practice)
+        // emit a stderr warning so the silent-stale-schema state is observable.
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("lpm.json"), "{ this is not json")
+            .expect("seed broken lpm.json");
+        let parsed = read_lpm_json_for_push(dir.path());
+        assert!(
+            parsed.is_none(),
+            "malformed lpm.json must yield None so the push proceeds without metadata"
+        );
+    }
+
+    #[test]
+    fn read_lpm_json_for_push_returns_some_on_valid_lpm_json() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            dir.path().join("lpm.json"),
+            r#"{"envSchema":{"vars":{"FOO":{"required":true}}}}"#,
+        )
+        .expect("seed valid lpm.json");
+        let parsed = read_lpm_json_for_push(dir.path()).expect("valid lpm.json must parse");
+        assert!(
+            parsed.env_schema.is_some(),
+            "envSchema field must round-trip through the parser helper"
+        );
+    }
 
     #[test]
     fn build_sync_environments_canonicalizes_legacy_alias_keys() {
