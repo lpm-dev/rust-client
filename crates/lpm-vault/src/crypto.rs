@@ -10,7 +10,10 @@
 //!
 //! ## Legacy migration
 //! - Old versions derived wrapping key from `SHA256("lpm-vault-wrap:" + auth_token)`
-//! - On decrypt failure with new key, we try the legacy key and re-encrypt if it works
+//! - On decrypt failure with the stored key, the legacy key is tried as a fallback
+//! - If the legacy key works, the caller (`pull` / `pull_raw`) re-encrypts with
+//!   the stored key and pushes back on the same call, converging without user action.
+//!   Migration push is best-effort: failures are logged and retried on the next pull.
 //!
 //! ## Org sync
 //! - X25519 keypairs per user
@@ -276,7 +279,7 @@ pub fn decrypt_vault_from_sync(
     let text = String::from_utf8(plaintext).map_err(|e| format!("utf8 error: {e}"))?;
 
     tracing::info!(
-        "vault decrypted with legacy key — will re-encrypt with stored key on next push"
+        "vault decrypted with legacy key — re-encrypting under stored key (caller pushes back)"
     );
 
     Ok(DecryptResult {

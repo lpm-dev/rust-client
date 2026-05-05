@@ -273,29 +273,9 @@ pub async fn pull(
     let result = crypto::decrypt_vault_from_sync(auth_token, &encrypted_blob, &wrapped_key)?;
     let secrets_json = &result.plaintext;
 
-    // If decrypted with legacy key, re-encrypt with new stored key and push back
     if result.needs_reencrypt {
-        tracing::info!("migrating vault {vault_id} to stored wrapping key");
-        if let Ok((new_blob, new_wrapped)) = crypto::encrypt_vault_for_sync(secrets_json) {
-            let reencrypt_client = reqwest::Client::builder()
-                .timeout(sync_request_timeout(std::time::Duration::from_secs(15)))
-                .build();
-            let reencrypt_url = format!("{registry_url}/api/vaults/{vault_id}/sync");
-            let reencrypt_body = serde_json::json!({
-                "encryptedBlob": new_blob,
-                "wrappedKey": new_wrapped,
-                "expectedVersion": version,
-            });
-            // Best-effort re-push — don't fail the pull if this fails
-            if let Ok(reencrypt_client) = reencrypt_client {
-                let _ = reencrypt_client
-                    .post(&reencrypt_url)
-                    .header("Authorization", format!("Bearer {auth_token}"))
-                    .json(&reencrypt_body)
-                    .send()
-                    .await;
-            }
-        }
+        attempt_legacy_reencrypt_push(registry_url, auth_token, vault_id, version, secrets_json)
+            .await;
     }
 
     // Try environments format first: {"environments": {"default": {...}, "live": {...}}}
@@ -353,31 +333,91 @@ pub async fn pull_raw(
 
     let result = crypto::decrypt_vault_from_sync(auth_token, &encrypted_blob, &wrapped_key)?;
 
-    // Best-effort re-encrypt on legacy migration
     if result.needs_reencrypt {
-        tracing::info!("migrating vault {vault_id} to stored wrapping key (pull_raw)");
-        if let Ok((new_blob, new_wrapped)) = crypto::encrypt_vault_for_sync(&result.plaintext) {
-            let reencrypt_client = reqwest::Client::builder()
-                .timeout(sync_request_timeout(std::time::Duration::from_secs(10)))
-                .build();
-            let reencrypt_url = format!("{registry_url}/api/vaults/{vault_id}/sync");
-            let reencrypt_body = serde_json::json!({
-                "encryptedBlob": new_blob,
-                "wrappedKey": new_wrapped,
-                "expectedVersion": version,
-            });
-            if let Ok(reencrypt_client) = reencrypt_client {
-                let _ = reencrypt_client
-                    .post(&reencrypt_url)
-                    .header("Authorization", format!("Bearer {auth_token}"))
-                    .json(&reencrypt_body)
-                    .send()
-                    .await;
-            }
-        }
+        attempt_legacy_reencrypt_push(
+            registry_url,
+            auth_token,
+            vault_id,
+            version,
+            &result.plaintext,
+        )
+        .await;
     }
 
     Ok((result.plaintext, version))
+}
+
+/// Re-encrypt a legacy-decrypted vault with the new stored wrapping key and
+/// push the result back, on a best-effort basis. Called by `pull` and
+/// `pull_raw` after [`crypto::decrypt_vault_from_sync`] reports
+/// `needs_reencrypt = true` so the vault converges to the new key without
+/// an extra user step.
+///
+/// Best-effort by design — a successful pull must not fail because the
+/// migration push hit a transient network error or version race. Failures
+/// are logged at `warn` so they're observable, not silently swallowed; the
+/// next successful pull will re-attempt the migration.
+async fn attempt_legacy_reencrypt_push(
+    registry_url: &str,
+    auth_token: &str,
+    vault_id: &str,
+    version: i32,
+    secrets_json: &str,
+) {
+    tracing::info!("migrating vault {vault_id} to stored wrapping key");
+
+    let (new_blob, new_wrapped) = match crypto::encrypt_vault_for_sync(secrets_json) {
+        Ok(pair) => pair,
+        Err(e) => {
+            tracing::warn!(
+                "legacy vault migration: encrypt failed for vault {vault_id}: {e} \
+                 (will retry on next successful pull)"
+            );
+            return;
+        }
+    };
+
+    let client = match reqwest::Client::builder()
+        .timeout(sync_request_timeout(std::time::Duration::from_secs(15)))
+        .build()
+    {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::warn!("legacy vault migration: client build failed for vault {vault_id}: {e}");
+            return;
+        }
+    };
+
+    let url = format!("{registry_url}/api/vaults/{vault_id}/sync");
+    let body = serde_json::json!({
+        "encryptedBlob": new_blob,
+        "wrappedKey": new_wrapped,
+        "expectedVersion": version,
+    });
+
+    match client
+        .post(&url)
+        .header("Authorization", format!("Bearer {auth_token}"))
+        .json(&body)
+        .send()
+        .await
+    {
+        Ok(response) => {
+            let status = response.status();
+            if !status.is_success() {
+                tracing::warn!(
+                    "legacy vault migration: re-push returned {status} for vault {vault_id} \
+                     (will retry on next successful pull)"
+                );
+            }
+        }
+        Err(e) => {
+            tracing::warn!(
+                "legacy vault migration: re-push failed for vault {vault_id}: {e} \
+                 (will retry on next successful pull)"
+            );
+        }
+    }
 }
 
 /// Pull secrets for a specific environment from the cloud vault.
@@ -667,6 +707,7 @@ pub async fn push_org_with_keys(
     vault_id: &str,
     secrets_json: &str,
     expected_version: Option<i32>,
+    metadata: Option<&PushMetadata<'_>>,
 ) -> Result<PushResponse, String> {
     // 1. Ensure our public key is registered
     let _private = ensure_public_key(registry_url, auth_token).await?;
@@ -698,6 +739,14 @@ pub async fn push_org_with_keys(
     });
     if let Some(version) = expected_version {
         body["expectedVersion"] = serde_json::json!(version);
+    }
+    if let Some(meta) = metadata {
+        if let Some(name) = meta.name {
+            body["name"] = serde_json::json!(name);
+        }
+        if let Some(schema) = meta.schema {
+            body["schema"] = schema.clone();
+        }
     }
 
     let response = client
@@ -1120,6 +1169,147 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[tokio::test]
+    async fn pull_attempts_migration_repush_after_legacy_decrypt() {
+        // When the cloud blob is encrypted with the legacy token-derived key
+        // but the local stored key has rotated past it, decrypt_vault_from_sync
+        // falls back, returns plaintext + needs_reencrypt = true, and `pull`
+        // re-encrypts under the stored key and pushes back. This pins the
+        // automatic-migration contract end-to-end.
+        let _guard = env_lock().lock().await;
+        let _isolated = IsolatedVaultKeyEnv::new();
+
+        // Encrypt the blob under the legacy auth-token-derived key so the
+        // stored-key path fails first and the legacy fallback succeeds.
+        let auth_token = "auth-token";
+        let secrets_json = r#"{"DATABASE_URL":"postgres://legacy"}"#;
+        let legacy_wrapping_key = crypto::derive_legacy_wrapping_key(auth_token);
+        let aes_key = crypto::generate_aes_key();
+        let encrypted_blob =
+            crypto::encrypt(&aes_key, secrets_json.as_bytes()).expect("encrypt legacy blob");
+        let wrapped_key =
+            crypto::wrap_key(&legacy_wrapping_key, &aes_key).expect("wrap aes under legacy key");
+
+        let server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/api/vaults/vault-legacy/sync"))
+            .and(header("authorization", &*format!("Bearer {auth_token}")))
+            .respond_with(signed_ok_response(
+                serde_json::json!({
+                    "encryptedBlob": encrypted_blob,
+                    "wrappedKey": wrapped_key,
+                    "version": 9
+                }),
+                auth_token,
+            ))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let migration_hits = Arc::new(StdMutex::new(0u32));
+        let hits_for_responder = Arc::clone(&migration_hits);
+
+        #[derive(Clone)]
+        struct CountingMigrationResponder {
+            hits: Arc<StdMutex<u32>>,
+            auth_token: &'static str,
+        }
+        impl Respond for CountingMigrationResponder {
+            fn respond(&self, _request: &Request) -> ResponseTemplate {
+                *self.hits.lock().unwrap() += 1;
+                let body = serde_json::json!({ "version": 10, "status": "ok" });
+                let body_str = serde_json::to_string(&body).expect("serialize");
+                let sig = signature::sign_body(body_str.as_bytes(), self.auth_token);
+                ResponseTemplate::new(200)
+                    .insert_header("Content-Type", "application/json")
+                    .insert_header(signature::SIGNATURE_HEADER, sig.as_str())
+                    .set_body_string(body_str)
+            }
+        }
+
+        Mock::given(method("POST"))
+            .and(path("/api/vaults/vault-legacy/sync"))
+            .respond_with(CountingMigrationResponder {
+                hits: hits_for_responder,
+                auth_token,
+            })
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let (secrets, version) = pull(&server.uri(), auth_token, "vault-legacy")
+            .await
+            .expect("pull must succeed when legacy fallback unwraps the blob");
+
+        assert_eq!(version, 9, "pull returns the server-reported version");
+        assert_eq!(
+            secrets.get("DATABASE_URL").map(String::as_str),
+            Some("postgres://legacy"),
+            "legacy-encrypted secrets must round-trip into the returned map"
+        );
+        assert_eq!(
+            *migration_hits.lock().unwrap(),
+            1,
+            "pull must attempt exactly one migration re-push after legacy decrypt"
+        );
+    }
+
+    #[tokio::test]
+    async fn pull_succeeds_even_when_migration_repush_fails() {
+        // Migration is best-effort: a pull must still return Ok with the
+        // decrypted secrets when the re-push fails (network blip, version
+        // race, or transient origin error). Failure is logged at warn for
+        // observability; the next successful pull retries the migration.
+        let _guard = env_lock().lock().await;
+        let _isolated = IsolatedVaultKeyEnv::new();
+
+        let auth_token = "auth-token";
+        let secrets_json = r#"{"API_KEY":"legacy-value"}"#;
+        let legacy_wrapping_key = crypto::derive_legacy_wrapping_key(auth_token);
+        let aes_key = crypto::generate_aes_key();
+        let encrypted_blob =
+            crypto::encrypt(&aes_key, secrets_json.as_bytes()).expect("encrypt legacy blob");
+        let wrapped_key =
+            crypto::wrap_key(&legacy_wrapping_key, &aes_key).expect("wrap aes under legacy key");
+
+        let server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/api/vaults/vault-legacy-fail/sync"))
+            .and(header("authorization", &*format!("Bearer {auth_token}")))
+            .respond_with(signed_ok_response(
+                serde_json::json!({
+                    "encryptedBlob": encrypted_blob,
+                    "wrappedKey": wrapped_key,
+                    "version": 1
+                }),
+                auth_token,
+            ))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        // Migration re-push returns 500 — pull must still succeed.
+        Mock::given(method("POST"))
+            .and(path("/api/vaults/vault-legacy-fail/sync"))
+            .respond_with(ResponseTemplate::new(500).set_body_string("internal error"))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let (secrets, version) = pull(&server.uri(), auth_token, "vault-legacy-fail")
+            .await
+            .expect("pull must remain Ok even when the migration re-push fails");
+
+        assert_eq!(version, 1);
+        assert_eq!(
+            secrets.get("API_KEY").map(String::as_str),
+            Some("legacy-value"),
+            "decrypted secrets must round-trip even when the migration push fails"
+        );
     }
 
     #[tokio::test]
@@ -1703,6 +1893,7 @@ mod tests {
                 "vault-123",
                 r#"{"API_KEY":"secret-value"}"#,
                 Some(7),
+                None,
             )
             .await
             .expect("org push should succeed with a mixed member-key set");
@@ -1729,6 +1920,288 @@ mod tests {
             );
             assert!(push_body.contains("\"encryptedBlob\":\""));
             assert!(push_body.contains("\"wrappedKeys\":["));
+        });
+
+        match original_home {
+            Some(value) => unsafe { std::env::set_var("HOME", value) },
+            None => unsafe { std::env::remove_var("HOME") },
+        }
+        match original_force_file_vault {
+            Some(value) => unsafe { std::env::set_var("LPM_FORCE_FILE_VAULT", value) },
+            None => unsafe { std::env::remove_var("LPM_FORCE_FILE_VAULT") },
+        }
+    }
+
+    #[test]
+    fn push_org_with_keys_round_trips_name_and_schema_metadata() {
+        // Org pushes used to omit `name` + `schema` from the request body, so
+        // the dashboard for an org vault froze whatever schema was set at
+        // creation time and never reflected later CLI pushes. This test pins
+        // the contract: when the caller passes `PushMetadata`, both fields
+        // land on the wire alongside the encrypted blob and wrapped keys.
+        let _guard = env_lock().blocking_lock();
+        let temp = tempfile::tempdir().expect("tempdir for metadata round-trip test");
+        let original_home = std::env::var_os("HOME");
+        let original_force_file_vault = std::env::var_os("LPM_FORCE_FILE_VAULT");
+
+        unsafe {
+            std::env::set_var("HOME", temp.path());
+            std::env::set_var("LPM_FORCE_FILE_VAULT", "1");
+        }
+
+        let runtime = tokio::runtime::Runtime::new().expect("tokio runtime");
+        runtime.block_on(async {
+            #[derive(Clone)]
+            struct CapturePushResponder {
+                body: Arc<StdMutex<Option<String>>>,
+                auth_token: &'static str,
+            }
+
+            impl Respond for CapturePushResponder {
+                fn respond(&self, request: &Request) -> ResponseTemplate {
+                    let body = String::from_utf8(request.body.clone())
+                        .expect("push request body must be valid utf-8");
+                    *self.body.lock().unwrap() = Some(body);
+                    let response_body = serde_json::json!({
+                        "version": 4,
+                        "status": "ok"
+                    });
+                    let body_str = serde_json::to_string(&response_body).expect("serialize");
+                    let sig = signature::sign_body(body_str.as_bytes(), self.auth_token);
+                    ResponseTemplate::new(200)
+                        .insert_header("Content-Type", "application/json")
+                        .insert_header(signature::SIGNATURE_HEADER, sig.as_str())
+                        .set_body_string(body_str)
+                }
+            }
+
+            let server = MockServer::start().await;
+            let captured_body = Arc::new(StdMutex::new(None));
+            let (_, member_public_key) = crypto::generate_x25519_keypair();
+
+            // ensure_public_key: server has no key → CLI uploads its key.
+            // We can't predict the locally-generated keypair, so the GET
+            // returns 404 and the POST upload accepts whatever the CLI sends.
+            Mock::given(method("GET"))
+                .and(path("/api/users/me/public-key"))
+                .respond_with(ResponseTemplate::new(404).set_body_string("missing"))
+                .mount(&server)
+                .await;
+
+            Mock::given(method("POST"))
+                .and(path("/api/users/me/public-key"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "success": true
+                })))
+                .mount(&server)
+                .await;
+
+            Mock::given(method("GET"))
+                .and(path("/api/orgs/acme/members/public-keys"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
+                    {
+                        "userId": "user-1",
+                        "role": "admin",
+                        "publicKey": BASE64.encode(member_public_key),
+                        "hasPublicKey": true
+                    }
+                ])))
+                .expect(1)
+                .mount(&server)
+                .await;
+
+            Mock::given(method("POST"))
+                .and(path("/api/orgs/acme/vaults/vault-meta"))
+                .respond_with(CapturePushResponder {
+                    body: Arc::clone(&captured_body),
+                    auth_token: "auth-token",
+                })
+                .expect(1)
+                .mount(&server)
+                .await;
+
+            let schema = serde_json::json!({
+                "version": 2,
+                "envSchema": {
+                    "DATABASE_URL": { "required": true, "format": "url" }
+                }
+            });
+            let metadata = PushMetadata {
+                name: Some("acme-api"),
+                schema: Some(&schema),
+            };
+
+            let result = push_org_with_keys(
+                &server.uri(),
+                "auth-token",
+                "acme",
+                "vault-meta",
+                r#"{"DATABASE_URL":"postgres://"}"#,
+                Some(3),
+                Some(&metadata),
+            )
+            .await
+            .expect("org push should succeed when metadata is supplied");
+
+            assert_eq!(result.version, Some(4));
+
+            let raw = captured_body
+                .lock()
+                .unwrap()
+                .clone()
+                .expect("captured push body");
+            let parsed: serde_json::Value =
+                serde_json::from_str(&raw).expect("push body must be valid JSON");
+
+            assert_eq!(
+                parsed.get("name"),
+                Some(&serde_json::json!("acme-api")),
+                "org push must round-trip the project name field"
+            );
+            assert_eq!(
+                parsed
+                    .get("schema")
+                    .and_then(|s| s.get("envSchema"))
+                    .and_then(|e| e.get("DATABASE_URL"))
+                    .and_then(|d| d.get("required")),
+                Some(&serde_json::json!(true)),
+                "org push must round-trip the envSchema content alongside the encrypted blob"
+            );
+            assert!(
+                parsed.get("encryptedBlob").is_some(),
+                "encryptedBlob field must still be present alongside metadata"
+            );
+            assert!(
+                parsed.get("wrappedKeys").is_some(),
+                "wrappedKeys field must still be present alongside metadata"
+            );
+            assert_eq!(
+                parsed.get("expectedVersion"),
+                Some(&serde_json::json!(3)),
+                "expectedVersion must still be present alongside metadata"
+            );
+        });
+
+        match original_home {
+            Some(value) => unsafe { std::env::set_var("HOME", value) },
+            None => unsafe { std::env::remove_var("HOME") },
+        }
+        match original_force_file_vault {
+            Some(value) => unsafe { std::env::set_var("LPM_FORCE_FILE_VAULT", value) },
+            None => unsafe { std::env::remove_var("LPM_FORCE_FILE_VAULT") },
+        }
+    }
+
+    #[test]
+    fn push_org_with_keys_omits_metadata_fields_when_caller_passes_none() {
+        // Symmetry with the round-trip test above: when no metadata is
+        // supplied, the body must NOT contain `name` or `schema` fields.
+        // This pins the "explicit None means don't touch dashboard
+        // metadata" contract — server keeps last-known-good schema/name.
+        let _guard = env_lock().blocking_lock();
+        let temp = tempfile::tempdir().expect("tempdir for None-metadata test");
+        let original_home = std::env::var_os("HOME");
+        let original_force_file_vault = std::env::var_os("LPM_FORCE_FILE_VAULT");
+
+        unsafe {
+            std::env::set_var("HOME", temp.path());
+            std::env::set_var("LPM_FORCE_FILE_VAULT", "1");
+        }
+
+        let runtime = tokio::runtime::Runtime::new().expect("tokio runtime");
+        runtime.block_on(async {
+            #[derive(Clone)]
+            struct CapturePushResponder {
+                body: Arc<StdMutex<Option<String>>>,
+                auth_token: &'static str,
+            }
+
+            impl Respond for CapturePushResponder {
+                fn respond(&self, request: &Request) -> ResponseTemplate {
+                    let body = String::from_utf8(request.body.clone()).expect("push body utf-8");
+                    *self.body.lock().unwrap() = Some(body);
+                    let response_body = serde_json::json!({
+                        "version": 1,
+                        "status": "ok"
+                    });
+                    let body_str = serde_json::to_string(&response_body).expect("serialize");
+                    let sig = signature::sign_body(body_str.as_bytes(), self.auth_token);
+                    ResponseTemplate::new(200)
+                        .insert_header("Content-Type", "application/json")
+                        .insert_header(signature::SIGNATURE_HEADER, sig.as_str())
+                        .set_body_string(body_str)
+                }
+            }
+
+            let server = MockServer::start().await;
+            let captured_body = Arc::new(StdMutex::new(None));
+            let (_, member_public_key) = crypto::generate_x25519_keypair();
+
+            Mock::given(method("GET"))
+                .and(path("/api/users/me/public-key"))
+                .respond_with(ResponseTemplate::new(404).set_body_string("missing"))
+                .mount(&server)
+                .await;
+
+            Mock::given(method("POST"))
+                .and(path("/api/users/me/public-key"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "success": true
+                })))
+                .mount(&server)
+                .await;
+
+            Mock::given(method("GET"))
+                .and(path("/api/orgs/acme/members/public-keys"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
+                    {
+                        "userId": "user-1",
+                        "role": "admin",
+                        "publicKey": BASE64.encode(member_public_key),
+                        "hasPublicKey": true
+                    }
+                ])))
+                .mount(&server)
+                .await;
+
+            Mock::given(method("POST"))
+                .and(path("/api/orgs/acme/vaults/vault-no-meta"))
+                .respond_with(CapturePushResponder {
+                    body: Arc::clone(&captured_body),
+                    auth_token: "auth-token",
+                })
+                .expect(1)
+                .mount(&server)
+                .await;
+
+            push_org_with_keys(
+                &server.uri(),
+                "auth-token",
+                "acme",
+                "vault-no-meta",
+                r#"{"K":"V"}"#,
+                None,
+                None,
+            )
+            .await
+            .expect("org push should succeed without metadata");
+
+            let raw = captured_body
+                .lock()
+                .unwrap()
+                .clone()
+                .expect("captured body");
+            let parsed: serde_json::Value =
+                serde_json::from_str(&raw).expect("body must parse as JSON");
+
+            assert!(
+                parsed.get("name").is_none(),
+                "name must not be sent when metadata is None"
+            );
+            assert!(
+                parsed.get("schema").is_none(),
+                "schema must not be sent when metadata is None"
+            );
         });
 
         match original_home {
