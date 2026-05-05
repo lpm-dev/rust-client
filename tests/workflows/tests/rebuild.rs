@@ -208,10 +208,9 @@ async fn rebuild_deny_policy_dry_run_json_envelope_matches_snapshot() {
         String::from_utf8_lossy(&out.stderr)
     );
 
-    let envelope: serde_json::Value = serde_json::from_str(strip_ansi(
-        &String::from_utf8_lossy(&out.stdout),
-    ).trim())
-    .unwrap_or_else(|e| panic!("stdout not valid JSON: {e}"));
+    let envelope: serde_json::Value =
+        serde_json::from_str(strip_ansi(&String::from_utf8_lossy(&out.stdout)).trim())
+            .unwrap_or_else(|e| panic!("stdout not valid JSON: {e}"));
 
     insta::assert_json_snapshot!("rebuild_deny_policy_dry_run_envelope", envelope);
 }
@@ -222,12 +221,7 @@ async fn rebuild_deny_policy_dry_run_json_envelope_matches_snapshot() {
 #[tokio::test]
 async fn rebuild_deny_policy_dry_run_filters_to_trusted_only() {
     let project = TempProject::empty("");
-    write_policy_manifest(
-        &project,
-        "rebuild-deny-filter",
-        None,
-        &["trusted-pkg"],
-    );
+    write_policy_manifest(&project, "rebuild-deny-filter", None, &["trusted-pkg"]);
     seed_scripted_package(&project, "trusted-pkg", "1.0.0", "echo hi");
     seed_scripted_package(&project, "untrusted-pkg", "1.0.0", "echo hi");
     write_lockfile_for_packages(
@@ -338,7 +332,10 @@ fn rebuild_allow_policy_via_cli_override_or_yolo_alias_also_widens() {
         .output()
         .expect("spawn lpm rebuild --policy=allow");
     let stdout_policy = strip_ansi(&String::from_utf8_lossy(&out_policy.stdout));
-    assert!(out_policy.status.success(), "exit 0 expected; stdout:\n{stdout_policy}");
+    assert!(
+        out_policy.status.success(),
+        "exit 0 expected; stdout:\n{stdout_policy}"
+    );
     assert!(
         stdout_policy.contains("green-native") && stdout_policy.contains("amber-playwright"),
         "--policy=allow must widen at the selection step; stdout:\n{stdout_policy}"
@@ -350,7 +347,10 @@ fn rebuild_allow_policy_via_cli_override_or_yolo_alias_also_widens() {
         .output()
         .expect("spawn lpm rebuild --yolo");
     let stdout_yolo = strip_ansi(&String::from_utf8_lossy(&out_yolo.stdout));
-    assert!(out_yolo.status.success(), "exit 0 expected; stdout:\n{stdout_yolo}");
+    assert!(
+        out_yolo.status.success(),
+        "exit 0 expected; stdout:\n{stdout_yolo}"
+    );
     assert!(
         stdout_yolo.contains("green-native") && stdout_yolo.contains("amber-playwright"),
         "--yolo (alias for --policy=allow) must widen too; stdout:\n{stdout_yolo}"
@@ -530,7 +530,10 @@ fn rebuild_triage_dry_run_all_labels_green_with_promotion_suffix() {
         .output()
         .expect("spawn lpm rebuild");
     let stdout = strip_ansi(&String::from_utf8_lossy(&out.stdout));
-    assert!(out.status.success(), "rebuild --dry-run --all must exit 0; stdout:\n{stdout}");
+    assert!(
+        out.status.success(),
+        "rebuild --dry-run --all must exit 0; stdout:\n{stdout}"
+    );
 
     // All three present (--all bypasses trust filter at selection time).
     assert!(stdout.contains("green-native"), "stdout:\n{stdout}");

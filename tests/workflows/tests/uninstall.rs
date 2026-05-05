@@ -54,11 +54,15 @@ fn uninstall_without_package_args_fails_with_clear_message() {
         .args(["uninstall"])
         .output()
         .expect("spawn lpm uninstall");
-    assert!(!out.status.success(), "uninstall with no args must exit non-zero");
+    assert!(
+        !out.status.success(),
+        "uninstall with no args must exit non-zero"
+    );
 
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
-        stderr.contains("specify at least one package") || stderr.to_lowercase().contains("package"),
+        stderr.contains("specify at least one package")
+            || stderr.to_lowercase().contains("package"),
         "stderr should explain that a package arg is required; got:\n{stderr}"
     );
 }
@@ -131,7 +135,10 @@ fn uninstall_removes_dev_dependency_in_same_pass() {
 fn uninstall_drops_lpm_lock_entirely_after_removal() {
     let project = TempProject::empty("");
     seed_installed_package(&project, "drop-lock", "2.0.0");
-    assert!(project.path().join("lpm.lock").exists(), "seed must produce lpm.lock");
+    assert!(
+        project.path().join("lpm.lock").exists(),
+        "seed must produce lpm.lock"
+    );
 
     lpm(&project)
         .args(["uninstall", "drop-lock"])
@@ -172,7 +179,8 @@ fn uninstall_unknown_package_warns_and_exits_zero() {
     let pkg_json: serde_json::Value =
         serde_json::from_str(&project.read_file("package.json")).unwrap();
     assert_eq!(
-        pkg_json["dependencies"]["present"], serde_json::json!("^1.0.0"),
+        pkg_json["dependencies"]["present"],
+        serde_json::json!("^1.0.0"),
         "manifest must be untouched when no target was actually removed"
     );
 }

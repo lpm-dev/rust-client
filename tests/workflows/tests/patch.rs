@@ -257,7 +257,10 @@ fn patch_commit_writes_patch_file_and_updates_manifest() {
     assert_eq!(parsed2["files_changed"].as_u64(), Some(1));
     assert!(parsed2["insertions"].as_u64().unwrap() >= 1);
     assert!(parsed2["deletions"].as_u64().unwrap() >= 1);
-    assert_eq!(parsed2["original_integrity"].as_str(), Some(integrity.as_str()));
+    assert_eq!(
+        parsed2["original_integrity"].as_str(),
+        Some(integrity.as_str())
+    );
 
     // Patch file on disk + content.
     let patch_file = project.path().join("patches/lodash@4.17.21.patch");
@@ -269,8 +272,7 @@ fn patch_commit_writes_patch_file_and_updates_manifest() {
     assert!(patch_text.contains("+module.exports = 'PATCHED'"));
 
     // Manifest has the new entry.
-    let pkg: serde_json::Value =
-        serde_json::from_str(&project.read_file("package.json")).unwrap();
+    let pkg: serde_json::Value = serde_json::from_str(&project.read_file("package.json")).unwrap();
     assert_eq!(
         pkg["lpm"]["patchedDependencies"]["lodash@4.17.21"]["path"].as_str(),
         Some("patches/lodash@4.17.21.patch")

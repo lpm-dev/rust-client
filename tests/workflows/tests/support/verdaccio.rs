@@ -82,9 +82,7 @@ impl VerdaccioRegistry {
         // whole launcher tree in its own Unix process group so drop cleanup
         // can kill every descendant, not just the tracked front PID.
         configure_process_group(&mut command);
-        let child = command
-            .spawn()
-            .expect("failed to spawn verdaccio via npx");
+        let child = command.spawn().expect("failed to spawn verdaccio via npx");
 
         let mut registry = VerdaccioRegistry {
             child,
@@ -137,9 +135,7 @@ impl VerdaccioRegistry {
 
     pub fn read_tarball_bytes(&self, name: &str, version: &str) -> Vec<u8> {
         std::fs::read(self.tarball_path(name, version)).unwrap_or_else(|err| {
-            panic!(
-                "failed to read verdaccio tarball bytes for {name}@{version}: {err}"
-            )
+            panic!("failed to read verdaccio tarball bytes for {name}@{version}: {err}")
         })
     }
 
@@ -216,8 +212,7 @@ impl VerdaccioRegistry {
 
         std::fs::write(
             &metadata_path,
-            serde_json::to_vec_pretty(&value)
-                .expect("verdaccio metadata rewrite should serialize"),
+            serde_json::to_vec_pretty(&value).expect("verdaccio metadata rewrite should serialize"),
         )
         .unwrap_or_else(|err| {
             panic!(

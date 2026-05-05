@@ -77,8 +77,7 @@ fn integrity(data: &[u8]) -> String {
 /// passes. Test EXERCISES the cooldown gate (which reads metadata via
 /// the routed path post-day-4.6), it doesn't bypass it.
 fn iso8601_30_days_ago() -> String {
-    (chrono::Utc::now() - chrono::Duration::days(30))
-        .to_rfc3339_opts(SecondsFormat::Millis, true)
+    (chrono::Utc::now() - chrono::Duration::days(30)).to_rfc3339_opts(SecondsFormat::Millis, true)
 }
 
 // ─── Test ───────────────────────────────────────────────────────────────
@@ -124,7 +123,9 @@ async fn npmrc_authenticated_install_attaches_bearer_on_every_registry_request()
         .mount(server)
         .await;
     Mock::given(method("GET"))
-        .and(path(format!("/{PACKAGE_NAME}/-/{PACKAGE_NAME}-{VERSION}.tgz")))
+        .and(path(format!(
+            "/{PACKAGE_NAME}/-/{PACKAGE_NAME}-{VERSION}.tgz"
+        )))
         .and(header("Authorization", auth_value.as_str()))
         .respond_with(
             ResponseTemplate::new(200)
@@ -171,7 +172,11 @@ async fn npmrc_authenticated_install_attaches_bearer_on_every_registry_request()
 
     // Package landed in node_modules.
     assert!(
-        project.path().join("node_modules").join(PACKAGE_NAME).exists(),
+        project
+            .path()
+            .join("node_modules")
+            .join(PACKAGE_NAME)
+            .exists(),
         "expected node_modules/{PACKAGE_NAME} to exist after install; stdout:\n{}\nstderr:\n{}",
         String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr)
@@ -216,9 +221,7 @@ async fn npmrc_authenticated_install_attaches_bearer_on_every_registry_request()
                     "    [{j}] {} {} auth={:?}",
                     r.method,
                     r.url,
-                    r.headers
-                        .get("Authorization")
-                        .and_then(|h| h.to_str().ok())
+                    r.headers.get("Authorization").and_then(|h| h.to_str().ok())
                 ))
                 .collect::<Vec<_>>()
                 .join("\n")

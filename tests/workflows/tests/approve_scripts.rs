@@ -252,7 +252,10 @@ fn approve_scripts_list_dry_run_is_silent_no_op_with_uniform_dry_run_flag() {
         .args(["--json", "approve-scripts", "--list"])
         .output()
         .expect("spawn lpm approve-scripts --list");
-    assert!(out_plain.status.success(), "plain --list --json must succeed");
+    assert!(
+        out_plain.status.success(),
+        "plain --list --json must succeed"
+    );
     let parsed_plain: serde_json::Value =
         serde_json::from_str(String::from_utf8_lossy(&out_plain.stdout).trim()).unwrap();
     assert_eq!(
@@ -266,7 +269,10 @@ fn approve_scripts_list_dry_run_is_silent_no_op_with_uniform_dry_run_flag() {
         .args(["--json", "approve-scripts", "--list", "--dry-run"])
         .output()
         .expect("spawn lpm approve-scripts --list --dry-run");
-    assert!(out_dry.status.success(), "--list --dry-run --json must succeed");
+    assert!(
+        out_dry.status.success(),
+        "--list --dry-run --json must succeed"
+    );
     let parsed_dry: serde_json::Value =
         serde_json::from_str(String::from_utf8_lossy(&out_dry.stdout).trim()).unwrap();
     assert_eq!(
@@ -763,8 +769,9 @@ fn approve_scripts_list_json_emits_structured_version_diff_on_script_hash_drift(
     let stdout = strip_ansi(&String::from_utf8_lossy(&out.stdout));
     assert!(out.status.success());
 
-    let parsed: serde_json::Value = serde_json::from_str(stdout.trim())
-        .unwrap_or_else(|e| panic!("approve-scripts --list --json must be parseable: {e}\nstdout:\n{stdout}"));
+    let parsed: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap_or_else(|e| {
+        panic!("approve-scripts --list --json must be parseable: {e}\nstdout:\n{stdout}")
+    });
 
     assert_eq!(parsed["schema_version"].as_u64(), Some(3));
     let blocked = parsed["blocked"]
@@ -776,7 +783,10 @@ fn approve_scripts_list_json_emits_structured_version_diff_on_script_hash_drift(
     assert_eq!(entry["version"], serde_json::json!("2.0.0"));
 
     let vd = &entry["version_diff"];
-    assert!(vd.is_object(), "version_diff must be object when prior binding exists; entry={entry}");
+    assert!(
+        vd.is_object(),
+        "version_diff must be object when prior binding exists; entry={entry}"
+    );
     assert_eq!(vd["reason"], serde_json::json!("script-hash-drift"));
     assert_eq!(vd["prior_version"], serde_json::json!("1.0.0"));
     assert_eq!(vd["candidate_version"], serde_json::json!("2.0.0"));
@@ -1048,7 +1058,10 @@ fn approve_scripts_legacy_array_upgrade_preserves_esbuild_after_subsequent_insta
 
     let manifest = read_manifest(&project);
     let td = &manifest["lpm"]["trustedDependencies"];
-    assert!(td.is_object(), "trustedDependencies must upgrade to Rich form");
+    assert!(
+        td.is_object(),
+        "trustedDependencies must upgrade to Rich form"
+    );
     let map = td.as_object().unwrap();
     assert!(
         map.contains_key("esbuild@*"),
@@ -1063,7 +1076,12 @@ fn approve_scripts_legacy_array_upgrade_preserves_esbuild_after_subsequent_insta
     write_build_state_audit(
         &project,
         &[
-            ("esbuild", "0.25.1", "sha512-esbuild-int", "sha256-esbuild-h"),
+            (
+                "esbuild",
+                "0.25.1",
+                "sha512-esbuild-int",
+                "sha256-esbuild-h",
+            ),
             ("sharp", "0.32.1", "sha512-sharp-int", "sha256-sharp-h"),
         ],
     );
@@ -1073,7 +1091,10 @@ fn approve_scripts_legacy_array_upgrade_preserves_esbuild_after_subsequent_insta
         .args(["--json", "approve-scripts", "--list"])
         .output()
         .expect("spawn lpm approve-scripts --list --json");
-    assert!(out2.status.success(), "approve-scripts --list --json must succeed");
+    assert!(
+        out2.status.success(),
+        "approve-scripts --list --json must succeed"
+    );
     let parsed: serde_json::Value =
         serde_json::from_str(&strip_ansi(&String::from_utf8_lossy(&out2.stdout))).unwrap();
     assert_eq!(
@@ -1092,7 +1113,12 @@ fn approve_scripts_list_filters_already_approved_packages_after_yes() {
     let project = TempProject::empty(r#"{"name":"audit-d-impl-2-list","version":"0.0.0"}"#);
     write_build_state_audit(
         &project,
-        &[("esbuild", "0.25.1", "sha512-esbuild-int", "sha256-esbuild-h")],
+        &[(
+            "esbuild",
+            "0.25.1",
+            "sha512-esbuild-int",
+            "sha256-esbuild-h",
+        )],
     );
 
     // Approve esbuild via --yes.
@@ -1144,7 +1170,12 @@ fn approve_scripts_specific_pkg_arg_for_already_approved_emits_friendly_error() 
     );
     write_build_state_audit(
         &project,
-        &[("esbuild", "0.25.1", "sha512-esbuild-int", "sha256-esbuild-h")],
+        &[(
+            "esbuild",
+            "0.25.1",
+            "sha512-esbuild-int",
+            "sha256-esbuild-h",
+        )],
     );
 
     let out = lpm(&project)
@@ -1176,10 +1207,7 @@ fn approve_scripts_specific_pkg_arg_for_already_approved_emits_friendly_error() 
 #[test]
 fn approve_scripts_yes_json_emits_exactly_one_valid_json_payload_on_stdout() {
     let project = TempProject::empty(r#"{"name":"audit-d-impl-3-yes","version":"0.0.0"}"#);
-    write_build_state_audit(
-        &project,
-        &[("esbuild", "0.25.1", "sha512-int", "sha256-h")],
-    );
+    write_build_state_audit(&project, &[("esbuild", "0.25.1", "sha512-int", "sha256-h")]);
 
     let out = lpm(&project)
         .args(["--json", "approve-scripts", "--yes"])

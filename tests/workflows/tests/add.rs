@@ -229,12 +229,15 @@ async fn lpm_add_json_envelope_with_simple_source_pkg_matches_snapshot() {
         "files": [{ "src": "Snap.tsx" }]
     });
     let snap_bytes = b"export const Snap = () => null;\n";
-    let tarball =
-        make_source_pkg_tarball("snap-add-pkg", "1.0.0", lpm_config, &[("Snap.tsx", snap_bytes)]);
+    let tarball = make_source_pkg_tarball(
+        "snap-add-pkg",
+        "1.0.0",
+        lpm_config,
+        &[("Snap.tsx", snap_bytes)],
+    );
     mock.with_package("snap-add-pkg", "1.0.0", &tarball).await;
 
-    let project =
-        TempProject::empty(r#"{"name":"add-snap","version":"1.0.0","dependencies":{}}"#);
+    let project = TempProject::empty(r#"{"name":"add-snap","version":"1.0.0","dependencies":{}}"#);
 
     let out = lpm_with_registry(&project, &mock.url())
         .args([
@@ -621,9 +624,8 @@ async fn add_rejects_relative_dotdot_dest_and_creates_no_external_directory() {
     let tarball = make_traversal_tarball(pkg, "1.0.0", "../../escaped/evil.txt");
     mock.with_package(pkg, "1.0.0", &tarball).await;
 
-    let project = TempProject::empty(
-        r#"{"name":"add-traversal-rel","version":"1.0.0","dependencies":{}}"#,
-    );
+    let project =
+        TempProject::empty(r#"{"name":"add-traversal-rel","version":"1.0.0","dependencies":{}}"#);
     let entries_before = snapshot_dir_entries(project.path());
 
     let out = lpm_with_registry(&project, &mock.url())
@@ -693,9 +695,8 @@ async fn add_rejects_absolute_dest_and_creates_no_external_directory() {
     let tarball = make_traversal_tarball(pkg, "1.0.0", &evil_dest_str);
     mock.with_package(pkg, "1.0.0", &tarball).await;
 
-    let project = TempProject::empty(
-        r#"{"name":"add-traversal-abs","version":"1.0.0","dependencies":{}}"#,
-    );
+    let project =
+        TempProject::empty(r#"{"name":"add-traversal-abs","version":"1.0.0","dependencies":{}}"#);
 
     let out = lpm_with_registry(&project, &mock.url())
         .args([
@@ -745,11 +746,10 @@ async fn add_rejects_absolute_dest_and_creates_no_external_directory() {
 async fn add_simple_yes_without_path_errors_and_does_not_mutate_manifest() {
     let pkg = "phase60-simple-no-path-yes";
     let mock = MockRegistry::start().await;
-    mock.with_package(pkg, "1.0.0", &make_simple_npm_tarball(pkg, "1.0.0")).await;
+    mock.with_package(pkg, "1.0.0", &make_simple_npm_tarball(pkg, "1.0.0"))
+        .await;
 
-    let project = TempProject::empty(
-        r#"{"name":"host","version":"1.0.0","dependencies":{}}"#,
-    );
+    let project = TempProject::empty(r#"{"name":"host","version":"1.0.0","dependencies":{}}"#);
 
     let out = lpm_with_registry(&project, &mock.url())
         .args(["add", pkg, "--yes"])
@@ -776,11 +776,10 @@ async fn add_simple_yes_without_path_errors_and_does_not_mutate_manifest() {
 async fn add_simple_json_without_path_errors_and_does_not_mutate_manifest() {
     let pkg = "phase60-simple-no-path-json";
     let mock = MockRegistry::start().await;
-    mock.with_package(pkg, "1.0.0", &make_simple_npm_tarball(pkg, "1.0.0")).await;
+    mock.with_package(pkg, "1.0.0", &make_simple_npm_tarball(pkg, "1.0.0"))
+        .await;
 
-    let project = TempProject::empty(
-        r#"{"name":"host","version":"1.0.0","dependencies":{}}"#,
-    );
+    let project = TempProject::empty(r#"{"name":"host","version":"1.0.0","dependencies":{}}"#);
 
     let out = lpm_with_registry(&project, &mock.url())
         .args(["add", pkg, "--json"])
@@ -804,18 +803,15 @@ async fn add_simple_json_without_path_errors_and_does_not_mutate_manifest() {
 async fn add_simple_no_tty_without_path_errors_and_does_not_mutate_manifest() {
     let pkg = "phase60-simple-no-path-notty";
     let mock = MockRegistry::start().await;
-    mock.with_package(pkg, "1.0.0", &make_simple_npm_tarball(pkg, "1.0.0")).await;
+    mock.with_package(pkg, "1.0.0", &make_simple_npm_tarball(pkg, "1.0.0"))
+        .await;
 
-    let project = TempProject::empty(
-        r#"{"name":"host","version":"1.0.0","dependencies":{}}"#,
-    );
+    let project = TempProject::empty(r#"{"name":"host","version":"1.0.0","dependencies":{}}"#);
 
     let mut cmd = lpm_with_registry(&project, &mock.url());
     cmd.args(["add", pkg]);
     // Force non-TTY stdin so `is_terminal()` returns false in the child.
-    let out = cmd
-        .output()
-        .expect("spawn lpm add");
+    let out = cmd.output().expect("spawn lpm add");
     assert_add_path_guard_error(&out, "non-TTY without --path");
 
     let manifest: serde_json::Value =
@@ -834,11 +830,10 @@ async fn add_simple_no_tty_without_path_errors_and_does_not_mutate_manifest() {
 async fn add_simple_yes_with_path_succeeds_and_copies_files_directly() {
     let pkg = "phase60-simple-with-path";
     let mock = MockRegistry::start().await;
-    mock.with_package(pkg, "1.0.0", &make_simple_npm_tarball(pkg, "1.0.0")).await;
+    mock.with_package(pkg, "1.0.0", &make_simple_npm_tarball(pkg, "1.0.0"))
+        .await;
 
-    let project = TempProject::empty(
-        r#"{"name":"host","version":"1.0.0","dependencies":{}}"#,
-    );
+    let project = TempProject::empty(r#"{"name":"host","version":"1.0.0","dependencies":{}}"#);
 
     lpm_with_registry(&project, &mock.url())
         .args([
@@ -872,11 +867,14 @@ async fn add_simple_yes_with_path_succeeds_and_copies_files_directly() {
 async fn add_simple_npm_pkg_copies_files_and_surfaces_bare_imports() {
     let pkg = "phase60-npm-simple-e2e";
     let mock = MockRegistry::start().await;
-    mock.with_package(pkg, "1.0.0", &make_npm_tarball_with_bare_imports(pkg, "1.0.0")).await;
+    mock.with_package(
+        pkg,
+        "1.0.0",
+        &make_npm_tarball_with_bare_imports(pkg, "1.0.0"),
+    )
+    .await;
 
-    let project = TempProject::empty(
-        r#"{"name":"host","version":"1.0.0","dependencies":{}}"#,
-    );
+    let project = TempProject::empty(r#"{"name":"host","version":"1.0.0","dependencies":{}}"#);
 
     let out = lpm_with_registry(&project, &mock.url())
         .args([
@@ -943,11 +941,14 @@ async fn add_simple_npm_pkg_copies_files_and_surfaces_bare_imports() {
 async fn add_simple_npm_pkg_json_envelope_includes_external_imports_and_npm_name() {
     let pkg = "phase60-npm-simple-json";
     let mock = MockRegistry::start().await;
-    mock.with_package(pkg, "1.0.0", &make_npm_tarball_with_bare_imports(pkg, "1.0.0")).await;
+    mock.with_package(
+        pkg,
+        "1.0.0",
+        &make_npm_tarball_with_bare_imports(pkg, "1.0.0"),
+    )
+    .await;
 
-    let project = TempProject::empty(
-        r#"{"name":"host","version":"1.0.0","dependencies":{}}"#,
-    );
+    let project = TempProject::empty(r#"{"name":"host","version":"1.0.0","dependencies":{}}"#);
 
     let out = lpm_with_registry(&project, &mock.url())
         .args([

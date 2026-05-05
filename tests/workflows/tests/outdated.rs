@@ -47,7 +47,10 @@ async fn outdated_without_package_json_fails_clearly() {
         .env_remove("LPM_TOKEN");
 
     let out = cmd.args(["outdated"]).output().expect("spawn lpm outdated");
-    assert!(!out.status.success(), "outdated must fail with no package.json");
+    assert!(
+        !out.status.success(),
+        "outdated must fail with no package.json"
+    );
 
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
@@ -97,12 +100,16 @@ async fn outdated_reports_non_lpm_packages_by_default() {
         .args(["outdated", "--json"])
         .output()
         .expect("spawn lpm outdated --json");
-    assert!(out.status.success(), "outdated should exit 0 on npm-only project");
+    assert!(
+        out.status.success(),
+        "outdated should exit 0 on npm-only project"
+    );
 
     let envelope: serde_json::Value =
         serde_json::from_slice(&out.stdout).expect("valid JSON envelope");
     assert_eq!(
-        envelope["count"], serde_json::json!(1),
+        envelope["count"],
+        serde_json::json!(1),
         "npm dependencies should now be included in outdated results; got envelope: {envelope:#}"
     );
     assert_eq!(envelope["outdated_count"], serde_json::json!(1));
@@ -158,7 +165,10 @@ async fn outdated_reports_newer_version_for_outdated_lpm_dep() {
         .args(["outdated", "--json"])
         .output()
         .expect("spawn lpm outdated --json");
-    assert!(out.status.success(), "outdated exits 0 even when packages are outdated");
+    assert!(
+        out.status.success(),
+        "outdated exits 0 even when packages are outdated"
+    );
 
     let envelope: serde_json::Value =
         serde_json::from_slice(&out.stdout).expect("valid JSON envelope");
@@ -194,7 +204,8 @@ async fn outdated_reports_zero_when_installed_matches_latest() {
         serde_json::from_slice(&out.stdout).expect("valid JSON envelope");
     assert_eq!(envelope["count"], serde_json::json!(1));
     assert_eq!(
-        envelope["outdated_count"], serde_json::json!(0),
+        envelope["outdated_count"],
+        serde_json::json!(0),
         "outdated_count must be 0 when current == latest"
     );
 

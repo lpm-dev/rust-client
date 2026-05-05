@@ -67,8 +67,7 @@ fn sigstore_bundle_for_identity(
     let path_tail = workflow_path
         .strip_prefix(".github/workflows/")
         .unwrap_or(workflow_path);
-    let uri =
-        format!("https://github.com/{org_repo}/.github/workflows/{path_tail}@{workflow_ref}");
+    let uri = format!("https://github.com/{org_repo}/.github/workflows/{path_tail}@{workflow_ref}");
     sigstore_bundle_with_cert(&cert_der_with_san_uri(&uri))
 }
 
@@ -154,11 +153,7 @@ enum AttestationResponse {
 
 /// Mount metadata (single-package GET + batch POST), tarball GET, and
 /// optionally the attestation-bundle endpoint, for `pkg@version`.
-async fn mount_package_version(
-    mock: &MockRegistry,
-    version: &str,
-    shape: AttestationShape,
-) {
+async fn mount_package_version(mock: &MockRegistry, version: &str, shape: AttestationShape) {
     let tarball = make_minimal_tarball(version);
     let dist_attestations = match &shape {
         AttestationShape::NoField => None,
@@ -204,8 +199,11 @@ async fn mount_package_version(
                 publisher,
                 workflow_path,
                 workflow_ref,
-            } => ResponseTemplate::new(200)
-                .set_body_json(sigstore_bundle_for_identity(publisher, workflow_path, workflow_ref)),
+            } => ResponseTemplate::new(200).set_body_json(sigstore_bundle_for_identity(
+                publisher,
+                workflow_path,
+                workflow_ref,
+            )),
             AttestationResponse::Http500 => {
                 ResponseTemplate::new(500).set_body_string("simulated transient failure")
             }

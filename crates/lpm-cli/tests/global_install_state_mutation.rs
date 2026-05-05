@@ -718,7 +718,8 @@ fn cli_startup_recovery_rolls_forward_ready_pending_install() {
     ))
     .unwrap();
 
-    let (status, stdout, stderr) = common::run_lpm(&cwd, &lpm_home, None, &["--json", "global", "list"]);
+    let (status, stdout, stderr) =
+        common::run_lpm(&cwd, &lpm_home, None, &["--json", "global", "list"]);
     assert!(
         status.success(),
         "global list should trigger recovery. stdout={stdout} stderr={stderr}"

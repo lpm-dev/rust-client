@@ -6,7 +6,9 @@
 mod support;
 
 use support::assertions;
-use support::mock_registry::{MockRegistry, compute_integrity, make_tarball, make_tarball_from_pkg_json};
+use support::mock_registry::{
+    MockRegistry, compute_integrity, make_tarball, make_tarball_from_pkg_json,
+};
 use support::{TempProject, lpm, lpm_with_registry};
 
 // ─── No package.json ─────────────────────────────────────────────
@@ -486,9 +488,8 @@ async fn install_json_envelope_with_one_package_matches_snapshot() {
         .expect("failed to run lpm install --json");
     assert!(output.status.success(), "install --json failed: {output:?}");
 
-    let envelope: serde_json::Value = serde_json::from_slice(&output.stdout).expect(
-        "install --json stdout must be valid JSON; got non-JSON output (mixed with logs?)",
-    );
+    let envelope: serde_json::Value = serde_json::from_slice(&output.stdout)
+        .expect("install --json stdout must be valid JSON; got non-JSON output (mixed with logs?)");
     assert_eq!(envelope["overrides_fingerprint"], serde_json::Value::Null);
     assert_eq!(envelope["patches_fingerprint"], serde_json::Value::Null);
     assert_eq!(envelope["blocked_set_fingerprint"], serde_json::Value::Null);
@@ -3009,7 +3010,13 @@ fn offline_install_reruns_workspace_member_bfs_expansion() {
     // Wipe node_modules; offline install must rebuild both symlinks.
     std::fs::remove_dir_all(project.path().join("node_modules")).unwrap();
     let out_offline = lpm_with_registry(&project, "http://127.0.0.1:1")
-        .args(["install", "--offline", "--no-security-summary", "--no-skills", "--no-editor-setup"])
+        .args([
+            "install",
+            "--offline",
+            "--no-security-summary",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
         .output()
         .expect("spawn lpm install --offline");
     assert!(
@@ -3053,7 +3060,13 @@ fn offline_install_handles_f9_deduped_workspace_member() {
 
     std::fs::remove_dir_all(project.path().join("node_modules")).unwrap();
     let out_offline = lpm_with_registry(&project, "http://127.0.0.1:1")
-        .args(["install", "--offline", "--no-security-summary", "--no-skills", "--no-editor-setup"])
+        .args([
+            "install",
+            "--offline",
+            "--no-security-summary",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
         .output()
         .expect("spawn lpm install --offline");
     assert!(
@@ -3121,7 +3134,13 @@ async fn offline_install_mixed_registry_and_file_dep_uses_lockfile_fast_path() {
     // Wipe node_modules; offline install must rebuild from lockfile + store.
     std::fs::remove_dir_all(project.path().join("node_modules")).unwrap();
     let out_offline = lpm_with_registry(&project, &mock.url())
-        .args(["install", "--offline", "--no-security-summary", "--no-skills", "--no-editor-setup"])
+        .args([
+            "install",
+            "--offline",
+            "--no-security-summary",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
         .output()
         .expect("spawn lpm install --offline");
     assert!(
@@ -3183,7 +3202,13 @@ fn install_workspace_alias_and_transitive_target_both_get_root_links() {
     // Offline rebuild must produce the same set.
     std::fs::remove_dir_all(project.path().join("node_modules")).unwrap();
     let out_offline = lpm_with_registry(&project, "http://127.0.0.1:1")
-        .args(["install", "--offline", "--no-security-summary", "--no-skills", "--no-editor-setup"])
+        .args([
+            "install",
+            "--offline",
+            "--no-security-summary",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
         .output()
         .expect("spawn lpm install --offline");
     assert!(
@@ -3281,7 +3306,13 @@ fn offline_install_workspace_ghost_transitive_after_manifest_edit_fails_closed()
     std::fs::remove_dir_all(project.path().join("node_modules")).unwrap();
 
     let out_offline = lpm_with_registry(&project, "http://127.0.0.1:1")
-        .args(["install", "--offline", "--no-security-summary", "--no-skills", "--no-editor-setup"])
+        .args([
+            "install",
+            "--offline",
+            "--no-security-summary",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
         .output()
         .expect("spawn lpm install --offline");
     assert!(
@@ -3319,9 +3350,8 @@ fn offline_install_workspace_ghost_transitive_after_manifest_edit_fails_closed()
 /// emit the loud warning on stderr with `<dir>/.npmrc:1` source citation.
 #[test]
 fn install_strict_ssl_false_emits_loud_warning_with_source_citation() {
-    let project = TempProject::empty(
-        r#"{"name":"strict-ssl-warn","version":"1.0.0","dependencies":{}}"#,
-    );
+    let project =
+        TempProject::empty(r#"{"name":"strict-ssl-warn","version":"1.0.0","dependencies":{}}"#);
     project.write_file(".npmrc", "strict-ssl=false\n");
     let npmrc_abs = project.path().join(".npmrc");
 
@@ -3373,8 +3403,9 @@ fn install_strict_ssl_false_emits_warning_even_in_json_mode() {
 
     // Stdout: valid JSON envelope, no warning text leaked.
     let stdout = String::from_utf8_lossy(&out.stdout);
-    let parsed: serde_json::Value = serde_json::from_str(stdout.trim())
-        .unwrap_or_else(|e| panic!("stdout must be valid JSON in --json mode: {e}\nstdout:\n{stdout}"));
+    let parsed: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap_or_else(|e| {
+        panic!("stdout must be valid JSON in --json mode: {e}\nstdout:\n{stdout}")
+    });
     assert_eq!(parsed["success"], serde_json::json!(true));
 
     // Stderr: warning + source citation.
@@ -3395,9 +3426,8 @@ fn install_strict_ssl_false_emits_warning_even_in_json_mode() {
 /// `Some(true)` by accident.
 #[test]
 fn install_no_strict_ssl_setting_emits_no_warning() {
-    let project = TempProject::empty(
-        r#"{"name":"strict-ssl-clean","version":"1.0.0","dependencies":{}}"#,
-    );
+    let project =
+        TempProject::empty(r#"{"name":"strict-ssl-clean","version":"1.0.0","dependencies":{}}"#);
     project.write_file(".npmrc", "registry=https://example.com/\n");
 
     let out = lpm_with_registry(&project, "http://127.0.0.1:1")
@@ -3444,13 +3474,8 @@ fn iso8601_n_secs_ago(n_secs: i64) -> String {
 /// timestamp. Wires single-package metadata + batch-metadata + tarball.
 async fn mount_release_age_pkg(mock: &MockRegistry, published_at: &str) {
     let tarball = make_tarball(RELEASE_AGE_PKG, RELEASE_AGE_VERSION);
-    mock.with_package_published_at(
-        RELEASE_AGE_PKG,
-        RELEASE_AGE_VERSION,
-        &tarball,
-        published_at,
-    )
-    .await;
+    mock.with_package_published_at(RELEASE_AGE_PKG, RELEASE_AGE_VERSION, &tarball, published_at)
+        .await;
     mock.with_batch_metadata(vec![serde_json::json!({
         "name": RELEASE_AGE_PKG,
         "dist-tags": { "latest": RELEASE_AGE_VERSION },
