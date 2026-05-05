@@ -25,7 +25,7 @@
 //! 2. Call `common::run_lpm`, `common::mount_mock_registry`, etc.
 //! 3. Add file-local helpers only for genuinely test-specific state
 //!    (e.g., global-install manifest seeding in
-//!    `global_phase37_e2e.rs`).
+//!    `global_install_state_mutation.rs`).
 //!
 //! Different cli-binary tests use different subsets of this module,
 //! so unused-helper warnings are expected and silenced with

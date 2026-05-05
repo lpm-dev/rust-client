@@ -1,4 +1,4 @@
-//! Phase 37 CLI-level regressions for the global install surface.
+//! CLI-level end-to-end coverage for the global install state surface.
 //!
 //! **Tier placement: cli-binary** (per CLAUDE.md `# Testing Tier
 //! Discipline`). Justification class: **global-install state

@@ -1,4 +1,4 @@
-use clap::{ArgAction, Parser, Subcommand};
+use clap::{ArgAction, Parser, Subcommand, ValueEnum};
 use clap_complete::Shell;
 use miette::{IntoDiagnostic, Result};
 use owo_colors::OwoColorize;
@@ -100,6 +100,12 @@ struct Cli {
     /// Allow insecure HTTP connections to non-localhost registries.
     #[arg(long, global = true)]
     insecure: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+enum OutdatedRegistryScope {
+    All,
+    Lpm,
 }
 
 #[derive(Subcommand)]
@@ -669,8 +675,15 @@ enum Commands {
     #[command(name = "token-rotate")]
     TokenRotate,
 
-    /// Check for newer versions of LPM dependencies.
-    Outdated,
+    /// Check for newer versions of direct dependencies.
+    ///
+    /// By default this checks both `@lpm.dev/*` and npm dependencies
+    /// listed in `package.json`.
+    Outdated {
+        /// Limit checks to a single registry ecosystem.
+        #[arg(long = "registry-only", value_enum, default_value_t = OutdatedRegistryScope::All)]
+        registry_only: OutdatedRegistryScope,
+    },
 
     /// Upgrade outdated LPM dependencies to latest versions.
     ///
@@ -797,11 +810,15 @@ enum Commands {
         #[arg(long)]
         level: Option<String>,
 
-        /// CI exit code policy: what triggers a non-zero exit code.
-        ///   vuln     — only confirmed vulnerabilities (OSV/registry)
-        ///   behavior — only critical/high behavioral flags
-        ///   all      — either vulnerabilities or behavioral flags (default)
-        #[arg(long, value_name = "POLICY")]
+        /// CI exit code policy (`vuln`, `behavior`, or `all`).
+        #[arg(
+            long,
+            value_name = "POLICY",
+            long_help = "CI exit code policy: what triggers a non-zero exit code.\n\n\
+  vuln     — only confirmed vulnerabilities (OSV/registry)\n\
+  behavior — only critical/high behavioral flags\n\
+  all      — either vulnerabilities or behavioral flags (default)"
+        )]
         fail_on: Option<String>,
 
         /// Scan installed packages for hardcoded secrets (API keys, tokens, private keys).
@@ -2945,9 +2962,15 @@ async fn async_main() -> Result<()> {
             commands::setup::run(effective_registry, &cwd, cli.json, oidc, eff_proxy).await
         }
         Commands::TokenRotate => commands::token::run_rotate(&client, registry_url, cli.json).await,
-        Commands::Outdated => {
+        Commands::Outdated { registry_only } => {
             let cwd = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;
-            commands::outdated::run(&client, &cwd, cli.json).await
+            commands::outdated::run(
+                &client,
+                &cwd,
+                cli.json,
+                matches!(registry_only, OutdatedRegistryScope::All),
+            )
+            .await
         }
         Commands::Upgrade {
             major,

@@ -749,11 +749,9 @@ impl MockRegistry {
 
         Mock::given(method("POST"))
             .and(path("/v1/querybatch"))
-            .respond_with(
-                ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                    "results": results,
-                })),
-            )
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "results": results,
+            })))
             .mount(&self.server)
             .await;
         self

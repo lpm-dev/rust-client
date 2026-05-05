@@ -9,31 +9,17 @@ expression: envelope
   "degraded": false,
   "scanned": 1,
   "checked_lpm": 0,
-  "packages_with_issues": 1,
-  "total_issues": 1,
+  "packages_with_issues": 0,
+  "total_issues": 0,
   "osv_vulnerabilities": 1,
   "counts": {
     "critical": 0,
     "high": 1,
     "moderate": 0,
     "low": 0,
-    "info": 1
+    "info": 0
   },
-  "packages": [
-    {
-      "name": "snap-pkg",
-      "version": "1.0.0",
-      "quality_score": null,
-      "issues": [
-        {
-          "severity": "info",
-          "category": "behavior",
-          "message": "flags: no license",
-          "source": "local"
-        }
-      ]
-    }
-  ],
+  "packages": [],
   "vulnerabilities": [
     {
       "package": "snap-pkg",

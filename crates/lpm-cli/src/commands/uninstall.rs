@@ -53,19 +53,20 @@ fn cleanup_removed_packages(project_dir: &Path, removed: &[String]) -> Result<()
     let node_modules = project_dir.join("node_modules");
     for name in removed {
         let link = node_modules.join(name);
-        if link.symlink_metadata().is_ok()
-            && (link.is_dir()
-                || link
-                    .symlink_metadata()
-                    .map(|metadata| metadata.file_type().is_symlink())
-                    .unwrap_or(false))
-        {
+        let Ok(metadata) = link.symlink_metadata() else {
+            continue;
+        };
+
+        if metadata.file_type().is_symlink() {
             #[cfg(unix)]
-            std::fs::remove_file(&link)
-                .or_else(|_| std::fs::remove_dir(&link))
-                .ok();
+            std::fs::remove_file(&link).or_else(|_| std::fs::remove_dir(&link))?;
             #[cfg(windows)]
-            std::fs::remove_dir(&link).ok();
+            std::fs::remove_dir(&link).or_else(|_| std::fs::remove_file(&link))?;
+            continue;
+        }
+
+        if metadata.is_dir() {
+            std::fs::remove_dir_all(&link)?;
         }
     }
 

@@ -7,8 +7,48 @@
 
 mod support;
 
-use support::mock_registry::{MockRegistry, make_tarball};
-use support::{TempProject, lpm_with_registry};
+use support::mock_registry::{MockRegistry, make_tarball_from_pkg_json};
+use support::{TempProject, lpm, lpm_with_registry};
+
+#[test]
+fn audit_help_lists_fail_on_policies_on_separate_lines() {
+    let project = TempProject::empty(r#"{"name":"audit-help","version":"1.0.0"}"#);
+
+    let output = lpm(&project)
+        .args(["audit", "--help"])
+        .output()
+        .expect("failed to run lpm audit --help");
+    assert!(output.status.success(), "audit --help must exit successfully");
+
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+
+    assert!(
+        combined.contains("CI exit code policy: what triggers a non-zero exit code."),
+        "expected fail-on policy intro in help output; got:\n{combined}"
+    );
+    assert!(
+        combined.contains("vuln     — only confirmed vulnerabilities (OSV/registry)\n"),
+        "expected vuln policy on its own help line; got:\n{combined}"
+    );
+    assert!(
+        combined.contains("behavior — only critical/high behavioral flags\n"),
+        "expected behavior policy on its own help line; got:\n{combined}"
+    );
+    assert!(
+        combined.contains("all      — either vulnerabilities or behavioral flags (default)"),
+        "expected all policy on its own help line; got:\n{combined}"
+    );
+    assert!(
+        !combined.contains(
+            "vuln     — only confirmed vulnerabilities (OSV/registry) behavior —"
+        ),
+        "fail-on policies must not collapse into one run-on line; got:\n{combined}"
+    );
+}
 
 /// Run `lpm audit` against `project`, with OSV calls redirected at
 /// `mock`'s `/v1/querybatch` endpoint. Returns the full Output so the
@@ -32,7 +72,42 @@ fn run_audit(
 /// Returns the original tarball bytes (callers don't need them yet but
 /// the future-OSV-helper-per-package shape may).
 async fn install_one(project: &TempProject, mock: &MockRegistry, pkg: &str) {
-    let tarball = make_tarball(pkg, "1.0.0");
+    install_one_with_pkg_json(
+        project,
+        mock,
+        pkg,
+        serde_json::json!({
+            "name": pkg,
+            "version": "1.0.0",
+            "license": "MIT",
+            "main": "index.js"
+        }),
+    )
+    .await;
+}
+
+async fn install_one_private_no_license(project: &TempProject, mock: &MockRegistry, pkg: &str) {
+    install_one_with_pkg_json(
+        project,
+        mock,
+        pkg,
+        serde_json::json!({
+            "name": pkg,
+            "version": "1.0.0",
+            "private": true,
+            "main": "index.js"
+        }),
+    )
+    .await;
+}
+
+async fn install_one_with_pkg_json(
+    project: &TempProject,
+    mock: &MockRegistry,
+    pkg: &str,
+    pkg_json: serde_json::Value,
+) {
+    let tarball = make_tarball_from_pkg_json(pkg_json, &[]);
     mock.with_package(pkg, "1.0.0", &tarball).await;
     mock.with_batch_metadata(vec![serde_json::json!({
         "name": pkg,
@@ -205,6 +280,31 @@ async fn audit_fail_on_behavior_does_not_trigger_on_vuln_alone() {
         String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr),
     );
+}
+
+#[tokio::test]
+async fn audit_private_package_without_license_does_not_emit_no_license_flag() {
+    let project = TempProject::empty(
+        r#"{"name":"private-audit","version":"1.0.0","dependencies":{"private-pkg":"^1.0.0"}}"#,
+    );
+    let mock = MockRegistry::start().await;
+    install_one_private_no_license(&project, &mock, "private-pkg").await;
+    mock.with_osv_querybatch(vec![vec![]]).await;
+
+    let out = run_audit(&project, &mock, &["--json"]);
+    assert!(
+        out.status.success(),
+        "private package without a license should not fail audit by itself; stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+
+    let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+    let envelope: serde_json::Value = serde_json::from_str(&stdout)
+        .unwrap_or_else(|e| panic!("audit --json stdout must be valid JSON: {e}\n---\n{stdout}"));
+
+    assert_eq!(envelope["counts"]["info"], serde_json::json!(0));
+    assert_eq!(envelope["packages"], serde_json::json!([]));
 }
 
 // ─── JSON contract ──────────────────────────────────────────────────────

@@ -51,30 +51,52 @@ pub fn analyze_manifest(
     dev_dependencies: Option<&HashMap<String, String>>,
     optional_dependencies: Option<&HashMap<String, String>>,
 ) -> ManifestTags {
+    analyze_manifest_with_privacy(
+        license,
+        false,
+        dependencies,
+        dev_dependencies,
+        optional_dependencies,
+    )
+}
+
+pub fn analyze_manifest_with_privacy(
+    license: Option<&str>,
+    private_package: bool,
+    dependencies: Option<&HashMap<String, String>>,
+    dev_dependencies: Option<&HashMap<String, String>>,
+    optional_dependencies: Option<&HashMap<String, String>>,
+) -> ManifestTags {
     let mut tags = ManifestTags::default();
 
     // ── License checks ────────────────────────────────────────
 
-    match license {
-        None | Some("") => {
-            tags.no_license = true;
-        }
-        Some(lic) => {
-            let lower = lic.to_lowercase();
-
-            // No-license patterns
-            if lower == "unlicensed"
-                || lower == "none"
-                || lower.starts_with("see license in")
-                || lower == "proprietary"
-            {
+    if !private_package {
+        match license {
+            None | Some("") => {
                 tags.no_license = true;
             }
+            Some(lic) => {
+                let lower = lic.to_lowercase();
 
-            // Copyleft check — scan SPDX expression for copyleft identifiers
-            if !tags.no_license && is_copyleft(&lower) {
-                tags.copyleft_license = true;
+                // No-license patterns
+                if lower == "unlicensed"
+                    || lower == "none"
+                    || lower.starts_with("see license in")
+                    || lower == "proprietary"
+                {
+                    tags.no_license = true;
+                }
             }
+        }
+    }
+
+    if let Some(lic) = license {
+        let lower = lic.to_lowercase();
+
+        // Copyleft check — scan SPDX expression for copyleft identifiers
+        if !tags.no_license && is_copyleft(&lower) {
+            tags.copyleft_license = true;
         }
     }
 
@@ -175,6 +197,13 @@ mod tests {
     fn no_license_missing() {
         let tags = analyze_manifest(None, None, None, None);
         assert!(tags.no_license);
+        assert!(!tags.copyleft_license);
+    }
+
+    #[test]
+    fn no_license_private_package_is_ignored() {
+        let tags = analyze_manifest_with_privacy(None, true, None, None, None);
+        assert!(!tags.no_license);
         assert!(!tags.copyleft_license);
     }
 

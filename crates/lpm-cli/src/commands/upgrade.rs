@@ -117,7 +117,7 @@ pub async fn run(
     // PackageJson for the patches map.
     let original_content = std::fs::read_to_string(&pkg_json_path)
         .map_err(|e| LpmError::Script(format!("failed to read package.json: {e}")))?;
-    let doc: serde_json::Value = serde_json::from_str(&original_content)
+    let mut doc: serde_json::Value = serde_json::from_str(&original_content)
         .map_err(|e| LpmError::Script(format!("failed to parse package.json: {e}")))?;
 
     let pkg_typed = lpm_workspace::read_package_json(&pkg_json_path)
@@ -348,6 +348,7 @@ pub async fn run(
         if json_output {
             let json = serde_json::json!({
                 "success": true,
+                "dry_run": dry_run,
                 "upgraded": 0,
                 "packages": [],
                 "fetch_errors": fetch_errors,
@@ -429,16 +430,12 @@ pub async fn run(
 
     // ── Mutate package.json ─────────────────────────────────────────
 
-    let mut updated_content = original_content.clone();
-    for u in &deduped {
-        updated_content = updated_content.replace(
-            &format!("\"{}\": \"{}\"", u.name, u.current_range),
-            &format!("\"{}\": \"{}\"", u.name, u.new_range),
-        );
-    }
+    apply_upgrades_to_manifest(&mut doc, &deduped)?;
+    let updated_content = serde_json::to_string_pretty(&doc)
+        .map_err(|e| LpmError::Script(format!("failed to serialize package.json: {e}")))?;
 
     let tmp_path = pkg_json_path.with_extension("json.tmp");
-    std::fs::write(&tmp_path, &updated_content)
+    std::fs::write(&tmp_path, format!("{updated_content}\n"))
         .map_err(|e| LpmError::Script(format!("failed to write temp package.json: {e}")))?;
     std::fs::rename(&tmp_path, &pkg_json_path)
         .map_err(|e| LpmError::Script(format!("failed to rename temp package.json: {e}")))?;
@@ -655,6 +652,49 @@ fn candidate_to_json(c: &EnrichedCandidate) -> serde_json::Value {
         "peer_impact": c.peer_impact,
         "patch_invalidation": c.patch_invalidation,
     })
+}
+
+fn apply_upgrades_to_manifest(
+    doc: &mut serde_json::Value,
+    upgrades: &[EnrichedCandidate],
+) -> Result<(), LpmError> {
+    for upgrade in upgrades {
+        let dep_key = if upgrade.is_dev {
+            "devDependencies"
+        } else {
+            "dependencies"
+        };
+
+        let deps = doc
+            .get_mut(dep_key)
+            .and_then(|value| value.as_object_mut())
+            .ok_or_else(|| {
+                LpmError::Script(format!(
+                    "package.json is missing `{dep_key}` while upgrading {}",
+                    upgrade.name
+                ))
+            })?;
+
+        match deps.get_mut(&upgrade.name) {
+            Some(serde_json::Value::String(current)) => {
+                if current != &upgrade.current_range {
+                    return Err(LpmError::Script(format!(
+                        "package.json drifted before upgrade could write {}: expected `{}`, found `{}`",
+                        upgrade.name, upgrade.current_range, current
+                    )));
+                }
+                *current = upgrade.new_range.clone();
+            }
+            _ => {
+                return Err(LpmError::Script(format!(
+                    "package.json is missing string dependency entry `{}` in `{dep_key}`",
+                    upgrade.name
+                )));
+            }
+        }
+    }
+
+    Ok(())
 }
 
 // ── Preserved helpers from the original upgrade.rs ──────────────────
