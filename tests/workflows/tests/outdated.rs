@@ -1,9 +1,9 @@
 //! Workflow tests for `lpm outdated`.
 //!
-//! `lpm outdated` checks `@lpm.dev/*` deps in `package.json` against the
-//! registry's latest tag. npm packages are intentionally skipped (see
-//! [outdated.rs:40](crates/lpm-cli/src/commands/outdated.rs#L40)) — these
-//! tests document that behavior alongside the LPM-package happy paths.
+//! `lpm outdated` checks `package.json` dependencies against the
+//! registry's latest tag. By default it covers both `@lpm.dev/*` and
+//! npm packages; `--registry-only lpm` preserves the narrower
+//! LPM-only scan for callers that want it.
 
 mod support;
 
@@ -79,23 +79,19 @@ async fn outdated_empty_deps_emits_empty_json_envelope() {
 
 // ─── Behavior contracts ─────────────────────────────────────────────────
 
-/// `lpm outdated` filters to `@lpm.dev/*` packages only; npm dependencies
-/// listed in `package.json` are silently skipped. This test pins that
-/// contract — a regression that started reporting npm packages would
-/// break CI integrations expecting a fixed shape, and a regression that
-/// lost the filter entirely would generate spurious "out of date" noise
-/// for every npm dep on every run.
+/// A pure-npm project should now surface outdated packages in the
+/// default report instead of returning a false-clean zero-count
+/// envelope.
 #[tokio::test]
-async fn outdated_skips_non_lpm_packages() {
+async fn outdated_reports_non_lpm_packages_by_default() {
     let project = TempProject::empty(
         r#"{"name":"npm-only","version":"1.0.0","dependencies":{"ms":"^2.1.3"}}"#,
     );
     write_minimal_lockfile(&project, "ms", "2.1.3");
 
     let mock = MockRegistry::start().await;
-    // Mount ms with a *newer* version. If the filter regresses, this
-    // entry would surface as outdated.
-    mock.with_package("ms", "9.9.9", &make_tarball("ms", "9.9.9")).await;
+    mock.with_package("ms", "9.9.9", &make_tarball("ms", "9.9.9"))
+        .await;
 
     let out = lpm_with_registry(&project, &mock.url())
         .args(["outdated", "--json"])
@@ -106,9 +102,44 @@ async fn outdated_skips_non_lpm_packages() {
     let envelope: serde_json::Value =
         serde_json::from_slice(&out.stdout).expect("valid JSON envelope");
     assert_eq!(
-        envelope["count"], serde_json::json!(0),
-        "npm packages must be filtered out of outdated results; got envelope: {envelope:#}"
+        envelope["count"], serde_json::json!(1),
+        "npm dependencies should now be included in outdated results; got envelope: {envelope:#}"
     );
+    assert_eq!(envelope["outdated_count"], serde_json::json!(1));
+
+    let entry = &envelope["packages"][0];
+    assert_eq!(entry["name"], serde_json::json!("ms"));
+    assert_eq!(entry["current"], serde_json::json!("2.1.3"));
+    assert_eq!(entry["wanted"], serde_json::json!("^2.1.3"));
+    assert_eq!(entry["latest"], serde_json::json!("9.9.9"));
+    assert_eq!(entry["outdated"], serde_json::json!(true));
+}
+
+/// `--registry-only lpm` keeps the previous LPM-only scope for users
+/// who explicitly want to ignore npm dependencies in the report.
+#[tokio::test]
+async fn outdated_registry_only_lpm_skips_non_lpm_packages() {
+    let project = TempProject::empty(
+        r#"{"name":"npm-only","version":"1.0.0","dependencies":{"ms":"^2.1.3"}}"#,
+    );
+    write_minimal_lockfile(&project, "ms", "2.1.3");
+
+    let mock = MockRegistry::start().await;
+    mock.with_package("ms", "9.9.9", &make_tarball("ms", "9.9.9"))
+        .await;
+
+    let out = lpm_with_registry(&project, &mock.url())
+        .args(["outdated", "--json", "--registry-only", "lpm"])
+        .output()
+        .expect("spawn lpm outdated --json --registry-only lpm");
+    assert!(
+        out.status.success(),
+        "outdated should still exit 0 when narrowed to LPM-only coverage"
+    );
+
+    let envelope: serde_json::Value =
+        serde_json::from_slice(&out.stdout).expect("valid JSON envelope");
+    assert_eq!(envelope["count"], serde_json::json!(0));
     assert_eq!(envelope["outdated_count"], serde_json::json!(0));
 }
 

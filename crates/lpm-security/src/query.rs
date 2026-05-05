@@ -1066,7 +1066,7 @@ mod tests {
 
     fn default_analysis() -> PackageAnalysis {
         PackageAnalysis {
-            version: 2,
+            version: crate::behavioral::SCHEMA_VERSION,
             analyzed_at: String::new(),
             source: SourceTags::default(),
             supply_chain: SupplyChainTags::default(),

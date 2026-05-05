@@ -9,6 +9,7 @@ pub async fn run(
     client: &RegistryClient,
     project_dir: &Path,
     json_output: bool,
+    include_npm: bool,
 ) -> Result<(), LpmError> {
     let pkg_json_path = project_dir.join("package.json");
     if !pkg_json_path.exists() {
@@ -34,34 +35,41 @@ pub async fn run(
         return Ok(());
     }
 
+    let lockfile_path = project_dir.join("lpm.lock");
+    let lockfile = if lockfile_path.exists() {
+        lpm_lockfile::Lockfile::read_fast(&lockfile_path).ok()
+    } else {
+        None
+    };
+
+    let mut dep_entries: Vec<_> = deps.iter().collect();
+    dep_entries.sort_by(|(left, _), (right, _)| left.cmp(right));
+
     let mut results = Vec::new();
 
-    for (name, range) in &deps {
-        if !name.starts_with("@lpm.dev/") {
-            continue; // Only check LPM packages
-        }
-
-        let pkg_name = match PackageName::parse(name) {
-            Ok(n) => n,
-            Err(_) => continue,
+    for (name, range) in dep_entries {
+        let metadata = if name.starts_with("@lpm.dev/") {
+            let pkg_name = match PackageName::parse(name) {
+                Ok(n) => n,
+                Err(_) => continue,
+            };
+            client.get_package_metadata(&pkg_name).await
+        } else if include_npm {
+            client.get_npm_package_metadata(name).await
+        } else {
+            continue;
         };
 
-        match client.get_package_metadata(&pkg_name).await {
+        match metadata {
             Ok(metadata) => {
                 let latest = metadata
                     .latest_version_tag()
                     .unwrap_or("unknown")
                     .to_string();
 
-                // Check lockfile for installed version
-                let lockfile_path = project_dir.join("lpm.lock");
-                let installed = if lockfile_path.exists() {
-                    lpm_lockfile::Lockfile::read_fast(&lockfile_path)
-                        .ok()
-                        .and_then(|lf| lf.find_package(name).map(|p| p.version.clone()))
-                } else {
-                    None
-                };
+                let installed = lockfile
+                    .as_ref()
+                    .and_then(|lf| lf.find_package(name).map(|p| p.version.clone()));
 
                 let installed_str = installed.as_deref().unwrap_or("?");
                 let is_outdated = installed.as_deref() != Some(latest.as_str());
@@ -90,7 +98,12 @@ pub async fn run(
     } else {
         let outdated: Vec<_> = results.iter().filter(|r| r["outdated"] == true).collect();
         if outdated.is_empty() {
-            output::success("All LPM packages are up to date");
+            let message = if include_npm {
+                "All checked package.json dependencies are up to date"
+            } else {
+                "All checked LPM dependencies are up to date"
+            };
+            output::success(message);
         } else {
             println!();
             println!(

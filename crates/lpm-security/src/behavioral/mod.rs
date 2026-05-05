@@ -38,9 +38,9 @@ use std::path::Path;
 use supply_chain::SupplyChainTags;
 
 /// Current schema version for `.lpm-security.json`.
-/// Bump this when adding new tags — cached files with older versions
-/// will be automatically re-analyzed.
-pub const SCHEMA_VERSION: u32 = 2;
+/// Bump this when adding new tags or changing tag semantics — cached
+/// files with older versions will be automatically re-analyzed.
+pub const SCHEMA_VERSION: u32 = 3;
 
 /// Maximum file size to scan (2MB). Files larger than this are skipped.
 /// No legitimate single source file is this large — it's bundled/generated.
@@ -431,6 +431,10 @@ fn analyze_package_manifest(package_dir: &Path) -> ManifestTags {
     };
 
     let license = parsed.get("license").and_then(|v| v.as_str());
+    let private_package = parsed
+        .get("private")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
 
     // Also check "licence" typo
     let license = license.or_else(|| parsed.get("licence").and_then(|v| v.as_str()));
@@ -439,8 +443,9 @@ fn analyze_package_manifest(package_dir: &Path) -> ManifestTags {
     let dev_dependencies = parse_deps_map(parsed.get("devDependencies"));
     let optional_dependencies = parse_deps_map(parsed.get("optionalDependencies"));
 
-    manifest::analyze_manifest(
+    manifest::analyze_manifest_with_privacy(
         license,
+        private_package,
         dependencies.as_ref(),
         dev_dependencies.as_ref(),
         optional_dependencies.as_ref(),
@@ -800,6 +805,21 @@ mod tests {
 
         let analysis = analyze_package(dir.path());
         assert!(analysis.manifest.no_license);
+    }
+
+    #[test]
+    fn analyze_private_package_without_license() {
+        let dir = tempfile::tempdir().unwrap();
+        create_test_package(
+            dir.path(),
+            &[
+                ("package.json", r#"{"name":"test","private":true}"#),
+                ("index.js", "module.exports = 42"),
+            ],
+        );
+
+        let analysis = analyze_package(dir.path());
+        assert!(!analysis.manifest.no_license);
     }
 
     #[test]

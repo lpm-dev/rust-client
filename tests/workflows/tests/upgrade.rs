@@ -105,6 +105,7 @@ async fn upgrade_emits_zero_upgraded_when_lpm_dep_already_at_latest() {
 
     let envelope: serde_json::Value =
         serde_json::from_slice(&out.stdout).expect("valid JSON envelope");
+    assert_eq!(envelope["dry_run"], serde_json::json!(false));
     assert_eq!(envelope["upgraded"], serde_json::json!(0));
     assert_eq!(envelope["packages"], serde_json::json!([]));
 }
@@ -233,6 +234,48 @@ async fn upgrade_writes_new_range_to_manifest_and_lockfile() {
         entry.version, "2.0.0",
         "lockfile must record the upgraded version"
     );
+}
+
+/// Minified `package.json` input (`"name":"value"` with no space after
+/// the colon) must still be upgraded correctly. The pre-fix
+/// string-replace rewrite only matched `"name": "value"` and silently
+/// left compact JSON manifests unchanged.
+#[tokio::test]
+async fn upgrade_rewrites_minified_manifest_json() {
+    let pkg = "@lpm.dev/owner.compact-json";
+    let project = TempProject::empty(&format!(
+        r#"{{"name":"upgrade-compact","version":"1.0.0","dependencies":{{"{pkg}":"^1.0.0"}}}}"#
+    ));
+
+    let mock = MockRegistry::start().await;
+    mount_lpm_pkg(&mock, pkg, "2.0.0").await;
+
+    let out = lpm_with_registry(&project, &mock.url())
+        .args(["upgrade", "-y", "--major"])
+        .output()
+        .expect("spawn lpm upgrade on minified manifest");
+    assert!(
+        out.status.success(),
+        "upgrade must succeed for minified package.json; stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let pkg_json: serde_json::Value =
+        serde_json::from_str(&project.read_file("package.json")).unwrap();
+    assert_eq!(
+        pkg_json["dependencies"][pkg], serde_json::json!("^2.0.0"),
+        "minified manifest dep range must still be rewritten; got: {pkg_json:#}"
+    );
+
+    let lockfile = lpm_lockfile::Lockfile::read_from_file(&project.path().join("lpm.lock"))
+        .expect("read lpm.lock");
+    let entry = lockfile
+        .packages
+        .iter()
+        .find(|p| p.name == pkg)
+        .expect("lockfile must contain the upgraded pkg");
+    assert_eq!(entry.version, "2.0.0");
 }
 
 // ─── JSON contract ──────────────────────────────────────────────────────
@@ -922,4 +965,3 @@ async fn upgrade_yes_dry_run_json_envelope_with_full_enrichment_smoke() {
         serde_json::json!(format!("{UP7_PKG}@{UP7_CURRENT}"))
     );
 }
-

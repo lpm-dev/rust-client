@@ -489,6 +489,9 @@ async fn install_json_envelope_with_one_package_matches_snapshot() {
     let envelope: serde_json::Value = serde_json::from_slice(&output.stdout).expect(
         "install --json stdout must be valid JSON; got non-JSON output (mixed with logs?)",
     );
+    assert_eq!(envelope["overrides_fingerprint"], serde_json::Value::Null);
+    assert_eq!(envelope["patches_fingerprint"], serde_json::Value::Null);
+    assert_eq!(envelope["blocked_set_fingerprint"], serde_json::Value::Null);
 
     insta::with_settings!({
         filters => vec![
@@ -936,6 +939,65 @@ async fn install_offline_with_store_succeeds() {
     // node_modules should be re-populated
     assertions::assert_node_modules_exists(project.path());
     assertions::assert_in_node_modules(project.path(), "ms");
+}
+
+#[tokio::test]
+async fn install_offline_json_empty_fingerprints_emit_null() {
+    let mock = MockRegistry::start().await;
+    mount_ms_2_1_3(&mock).await;
+
+    let project = TempProject::empty(
+        r#"{
+        "name": "offline-json-fingerprints",
+        "version": "1.0.0",
+        "dependencies": {
+            "ms": "^2.1.3"
+        }
+    }"#,
+    );
+
+    lpm_with_registry(&project, &mock.url())
+        .args([
+            "install",
+            "--no-security-summary",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
+        .assert()
+        .success();
+
+    let nm = project.path().join("node_modules");
+    if nm.exists() {
+        std::fs::remove_dir_all(&nm).unwrap();
+    }
+
+    let output = lpm_with_registry(&project, &mock.url())
+        .args([
+            "install",
+            "--offline",
+            "--json",
+            "--no-security-summary",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
+        .output()
+        .expect("failed to run offline install --json");
+
+    assert!(
+        output.status.success(),
+        "offline install --json failed:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let envelope: serde_json::Value = serde_json::from_slice(&output.stdout)
+        .expect("offline install --json must emit valid JSON");
+
+    assert_eq!(envelope["offline"], serde_json::json!(true));
+    assert_eq!(envelope["patches_count"], serde_json::json!(0));
+    assert_eq!(envelope["patches_fingerprint"], serde_json::Value::Null);
+    assert_eq!(envelope["blocked_count"], serde_json::json!(0));
+    assert_eq!(envelope["blocked_set_fingerprint"], serde_json::Value::Null);
 }
 
 // ─── Offline Without Lockfile Fails ──────────────────────────────

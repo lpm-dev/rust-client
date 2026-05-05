@@ -44,6 +44,8 @@
 pub mod assertions;
 pub mod auth_state;
 pub mod mock_registry;
+pub mod verdaccio;
+pub mod verdaccio_proxy;
 
 use std::path::{Path, PathBuf};
 use tempfile::TempDir;

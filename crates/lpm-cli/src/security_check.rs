@@ -618,7 +618,7 @@ mod tests {
         manifest: ManifestTags,
     ) -> PackageAnalysis {
         PackageAnalysis {
-            version: 2,
+            version: lpm_security::behavioral::SCHEMA_VERSION,
             analyzed_at: "2026-04-04T00:00:00Z".into(),
             source,
             supply_chain,

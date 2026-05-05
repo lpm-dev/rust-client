@@ -923,6 +923,19 @@ fn applied_patches_to_json(
     )
 }
 
+/// Emit a fingerprint field for JSON output.
+///
+/// Empty feature sets are represented as `null` instead of the SHA-256
+/// of empty input so consumers don't need to recognize a sentinel hash
+/// to distinguish "no entries" from "some concrete set".
+fn fingerprint_json_value(count: usize, fingerprint: impl Into<String>) -> serde_json::Value {
+    if count == 0 {
+        serde_json::Value::Null
+    } else {
+        serde_json::json!(fingerprint.into())
+    }
+}
+
 /// **Phase 32 Phase 6 — `lpm patch` apply pass.**
 ///
 /// Run unconditionally after the linker (and the workspace-member
@@ -4952,6 +4965,7 @@ async fn run_with_options_under_store_lock(
                     )
                     .await?
                 };
+                let package_key = p.package_key();
 
                 // Phase 39 P2b: spawn per-pkg link immediately — pkg is
                 // now materialized. Runs on the blocking pool in parallel
@@ -4972,7 +4986,6 @@ async fn run_with_options_under_store_lock(
                 // computed_sri available now; for them the
                 // package_key's source_id was set at pre_resolve
                 // time from the same SRI, so it stays consistent.
-                let pkg_key = p.package_key();
                 Ok::<
                     (
                         lpm_lockfile::PackageKey,
@@ -4982,7 +4995,7 @@ async fn run_with_options_under_store_lock(
                         Option<String>,
                     ),
                     LpmError,
-                >((pkg_key, computed_sri, task_timings, link_h, Some(final_url)))
+                >((package_key, computed_sri, task_timings, link_h, Some(final_url)))
             }));
         }
 
@@ -6092,7 +6105,8 @@ async fn run_with_options_under_store_lock(
             );
         }
         json["overrides_count"] = serde_json::json!(override_set.len());
-        json["overrides_fingerprint"] = serde_json::json!(override_set.fingerprint());
+        json["overrides_fingerprint"] =
+            fingerprint_json_value(override_set.len(), override_set.fingerprint());
 
         // **Phase 32 Phase 6** — surface the patch apply trace + counts.
         // Audit fix (2026-04-12): filter to entries that ACTUALLY did
@@ -6109,14 +6123,17 @@ async fn run_with_options_under_store_lock(
             .collect();
         json["applied_patches"] = applied_patches_to_json(&applied_patches_summary, project_dir);
         json["patches_count"] = serde_json::json!(current_patches.len());
-        json["patches_fingerprint"] = serde_json::json!(current_patch_fingerprint);
+        json["patches_fingerprint"] =
+            fingerprint_json_value(current_patches.len(), current_patch_fingerprint);
 
         // **Phase 32 Phase 4 M3:** surface the install-time blocked set so
         // agents and CI can drive `lpm approve-scripts` without re-scanning.
         json["blocked_count"] = serde_json::json!(blocked_capture.state.blocked_packages.len());
         json["blocked_set_changed"] = serde_json::json!(blocked_capture.should_emit_warning);
-        json["blocked_set_fingerprint"] =
-            serde_json::json!(blocked_capture.state.blocked_set_fingerprint);
+        json["blocked_set_fingerprint"] = fingerprint_json_value(
+            blocked_capture.state.blocked_packages.len(),
+            blocked_capture.state.blocked_set_fingerprint.clone(),
+        );
         // Phase 46 P6 Chunk 4 + P7 Chunk 4: per-entry shape now
         // includes `static_tier` (P6) and `version_diff` (P7) via
         // the shared `version_diff::blocked_to_json` helper, which
@@ -7480,15 +7497,19 @@ async fn run_link_and_finish(
         // idempotent rerun reports an empty array.
         json["applied_patches"] = applied_patches_to_json(&applied_patches_summary, project_dir);
         json["patches_count"] = serde_json::json!(current_patches.len());
-        json["patches_fingerprint"] =
-            serde_json::json!(patch_state::compute_fingerprint(&current_patches));
+        json["patches_fingerprint"] = fingerprint_json_value(
+            current_patches.len(),
+            patch_state::compute_fingerprint(&current_patches),
+        );
         // **Phase 32 Phase 4 M3:** surface the install-time blocked set so
         // agents and CI can drive `lpm approve-scripts` without re-scanning.
         // Mirrors the online path.
         json["blocked_count"] = serde_json::json!(blocked_capture.state.blocked_packages.len());
         json["blocked_set_changed"] = serde_json::json!(blocked_capture.should_emit_warning);
-        json["blocked_set_fingerprint"] =
-            serde_json::json!(blocked_capture.state.blocked_set_fingerprint);
+        json["blocked_set_fingerprint"] = fingerprint_json_value(
+            blocked_capture.state.blocked_packages.len(),
+            blocked_capture.state.blocked_set_fingerprint.clone(),
+        );
         // Phase 46 P6 Chunk 4 + P7 Chunk 4: per-entry shape now
         // includes `static_tier` (P6) and `version_diff` (P7) via
         // the shared `version_diff::blocked_to_json` helper —
@@ -7791,6 +7812,14 @@ fn spawn_speculation_dispatcher(
                     return;
                 }
 
+                let skip_auth_bearing_custom_speculation = matches!(
+                    route_table_spec.route_for_package(&name),
+                    UpstreamRoute::Custom {
+                        auth: Some(_),
+                        ..
+                    }
+                );
+
                 // Already-in-store: free store hit, no speculation needed.
                 if store_spec.has_package(&name, &version) {
                     return;
@@ -7818,6 +7847,15 @@ fn spawn_speculation_dispatcher(
                     for (dep_name, dep_range) in &vm.dependencies {
                         work_queue.push((dep_name.clone(), dep_range.clone(), depth + 1, false));
                     }
+                }
+
+                // Skip tarball speculation for auth-bearing custom
+                // registries. The real fetch loop already owns
+                // correctness and user-facing failures; speculative
+                // requests here only duplicate authenticated traffic
+                // against private mirrors.
+                if skip_auth_bearing_custom_speculation {
+                    return;
                 }
 
                 // Spawn the download.
@@ -7848,7 +7886,7 @@ fn spawn_speculation_dispatcher(
                     }
                     Err(e) => {
                         tracing::debug!(
-                            "speculative download {name}@{version} failed (will be retried by real fetch): {e}"
+                            "speculative download {name}@{version} failed (real fetch remains authoritative): {e}"
                         );
                     }
                 }

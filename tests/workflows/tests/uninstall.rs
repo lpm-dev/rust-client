@@ -244,6 +244,74 @@ async fn uninstall_after_real_install_removes_isolated_symlink() {
     assert!(pkg_json["dependencies"].get("real-installed").is_none());
 }
 
+/// Hoisted mode plants a real directory at `node_modules/<pkg>` instead
+/// of the isolated-mode symlink. Uninstall must remove that non-empty
+/// directory too — leaving it behind creates a phantom dependency shape
+/// that the next install can see on disk even though the manifest and
+/// lockfile are already clean.
+#[tokio::test]
+async fn uninstall_after_real_install_removes_hoisted_directory() {
+    let mock = MockRegistry::start().await;
+    let tarball = make_tarball("real-hoisted", "1.0.0");
+    mock.with_package("real-hoisted", "1.0.0", &tarball).await;
+    mock.with_batch_metadata(vec![serde_json::json!({
+        "name": "real-hoisted",
+        "dist-tags": { "latest": "1.0.0" },
+        "versions": {
+            "1.0.0": {
+                "name": "real-hoisted",
+                "version": "1.0.0",
+                "dist": {
+                    "tarball": format!("{}/tarballs/real-hoisted-1.0.0.tgz", mock.url()),
+                    "integrity": support::mock_registry::compute_integrity(&tarball),
+                },
+                "dependencies": {}
+            }
+        },
+        "time": { "1.0.0": "2025-01-01T00:00:00.000Z" }
+    })])
+    .await;
+
+    let project = TempProject::empty(
+        r#"{"name":"roundtrip-hoisted","version":"1.0.0","dependencies":{"real-hoisted":"^1.0.0"}}"#,
+    );
+
+    lpm_with_registry(&project, &mock.url())
+        .args([
+            "install",
+            "--linker",
+            "hoisted",
+            "--no-security-summary",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
+        .assert()
+        .success();
+
+    let nm_entry = project.path().join("node_modules/real-hoisted");
+    let metadata = nm_entry
+        .symlink_metadata()
+        .expect("install must create node_modules/real-hoisted");
+    assert!(
+        metadata.is_dir() && !metadata.file_type().is_symlink(),
+        "hoisted install must materialize a real directory, got metadata: {metadata:?}"
+    );
+
+    lpm(&project)
+        .args(["uninstall", "real-hoisted"])
+        .assert()
+        .success();
+
+    assert!(
+        nm_entry.symlink_metadata().is_err(),
+        "uninstall must remove the hoisted node_modules directory (was: {:?})",
+        nm_entry.symlink_metadata()
+    );
+    let pkg_json: serde_json::Value =
+        serde_json::from_str(&project.read_file("package.json")).unwrap();
+    assert!(pkg_json["dependencies"].get("real-hoisted").is_none());
+}
+
 // ─── JSON contract ──────────────────────────────────────────────────────
 
 /// `uninstall --json` envelope shape pinned via insta. Dynamic temp-dir

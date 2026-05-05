@@ -24,12 +24,12 @@ expression: envelope
   "warnings": [],
   "errors": [],
   "overrides_count": 0,
-  "overrides_fingerprint": "sha256-e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+  "overrides_fingerprint": null,
   "applied_patches": [],
   "patches_count": 0,
-  "patches_fingerprint": "sha256-e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+  "patches_fingerprint": null,
   "blocked_count": 0,
   "blocked_set_changed": false,
-  "blocked_set_fingerprint": "sha256-e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+  "blocked_set_fingerprint": null,
   "blocked_packages": []
 }
