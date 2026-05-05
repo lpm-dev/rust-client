@@ -18,7 +18,10 @@ fn audit_help_lists_fail_on_policies_on_separate_lines() {
         .args(["audit", "--help"])
         .output()
         .expect("failed to run lpm audit --help");
-    assert!(output.status.success(), "audit --help must exit successfully");
+    assert!(
+        output.status.success(),
+        "audit --help must exit successfully"
+    );
 
     let combined = format!(
         "{}{}",
@@ -43,9 +46,7 @@ fn audit_help_lists_fail_on_policies_on_separate_lines() {
         "expected all policy on its own help line; got:\n{combined}"
     );
     assert!(
-        !combined.contains(
-            "vuln     — only confirmed vulnerabilities (OSV/registry) behavior —"
-        ),
+        !combined.contains("vuln     — only confirmed vulnerabilities (OSV/registry) behavior —"),
         "fail-on policies must not collapse into one run-on line; got:\n{combined}"
     );
 }

@@ -214,12 +214,7 @@ async fn install_fails_on_verdaccio_integrity_mismatch_without_creating_install_
     let package_name = "verdaccio-integrity-pkg";
     let version = "1.0.0";
     registry.publish_package(package_name, version);
-    registry.rewrite_dist(
-        package_name,
-        version,
-        None,
-        Some("sha512-AAAAAAAAAA=="),
-    );
+    registry.rewrite_dist(package_name, version, None, Some("sha512-AAAAAAAAAA=="));
 
     let project = TempProject::empty(
         r#"{
@@ -357,13 +352,9 @@ async fn install_follows_same_origin_redirect_tarball_proxy() {
     let package_name = "verdaccio-redirect-pkg";
     let version = "1.0.0";
     registry.publish_package(package_name, version);
-    let proxy = VerdaccioProxyRegistry::start(
-        &registry,
-        package_name,
-        version,
-        TarballBehavior::Redirect,
-    )
-    .await;
+    let proxy =
+        VerdaccioProxyRegistry::start(&registry, package_name, version, TarballBehavior::Redirect)
+            .await;
 
     let project = TempProject::empty(
         r#"{
@@ -389,11 +380,15 @@ async fn install_follows_same_origin_redirect_tarball_proxy() {
 
     let received_paths = proxy.received_paths().await;
     assert!(
-        received_paths.iter().any(|path| path == proxy.metadata_path()),
+        received_paths
+            .iter()
+            .any(|path| path == proxy.metadata_path()),
         "proxy must receive the metadata request; got {received_paths:?}"
     );
     assert!(
-        received_paths.iter().any(|path| path == proxy.tarball_path()),
+        received_paths
+            .iter()
+            .any(|path| path == proxy.tarball_path()),
         "proxy must receive the initial tarball request; got {received_paths:?}"
     );
     assert!(
@@ -410,13 +405,9 @@ async fn install_accepts_http_gzip_wrapped_tarball_from_same_origin_proxy() {
     let package_name = "verdaccio-http-gzip-pkg";
     let version = "1.0.0";
     registry.publish_package(package_name, version);
-    let proxy = VerdaccioProxyRegistry::start(
-        &registry,
-        package_name,
-        version,
-        TarballBehavior::HttpGzip,
-    )
-    .await;
+    let proxy =
+        VerdaccioProxyRegistry::start(&registry, package_name, version, TarballBehavior::HttpGzip)
+            .await;
 
     let project = TempProject::empty(
         r#"{

@@ -63,9 +63,7 @@ fn write_lockfile(project: &TempProject, entries: &[(&str, &str, &[&str])]) {
                     .join(", ");
                 format!("\ndependencies = [{inner}]")
             };
-            format!(
-                "[[packages]]\nname = \"{name}\"\nversion = \"{version}\"{deps_block}\n"
-            )
+            format!("[[packages]]\nname = \"{name}\"\nversion = \"{version}\"{deps_block}\n")
         })
         .collect();
     let toml = format!(
@@ -432,7 +430,10 @@ fn offline_install_succeeds_when_overrides_fingerprint_matches() {
     );
 
     let state_path = project.path().join(".lpm").join("overrides-state.json");
-    assert!(state_path.exists(), "fixture must produce overrides-state.json");
+    assert!(
+        state_path.exists(),
+        "fixture must produce overrides-state.json"
+    );
 
     let out = lpm_with_registry(&project, "http://127.0.0.1:1")
         .args(["install", "--offline"])

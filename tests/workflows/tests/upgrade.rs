@@ -46,7 +46,12 @@ async fn mount_lpm_pkg(mock: &MockRegistry, pkg: &str, latest_version: &str) {
 /// (space after colon) — `lpm upgrade`'s string-replace path at
 /// [upgrade.rs:434](crates/lpm-cli/src/commands/upgrade.rs#L434) only
 /// matches that exact format.
-fn seed_pinned_dep(project: &TempProject, pkg: &str, installed_range: &str, installed_version: &str) {
+fn seed_pinned_dep(
+    project: &TempProject,
+    pkg: &str,
+    installed_range: &str,
+    installed_version: &str,
+) {
     project.write_file(
         "package.json",
         &format!(
@@ -78,7 +83,10 @@ fn upgrade_without_package_json_fails_clearly() {
         .env("LPM_NO_UPDATE_CHECK", "1")
         .env_remove("LPM_TOKEN");
 
-    let out = cmd.args(["upgrade", "-y"]).output().expect("spawn lpm upgrade");
+    let out = cmd
+        .args(["upgrade", "-y"])
+        .output()
+        .expect("spawn lpm upgrade");
     assert!(!out.status.success());
 
     let stderr = String::from_utf8_lossy(&out.stderr);
@@ -131,18 +139,23 @@ async fn upgrade_skips_npm_packages_in_dependencies() {
     let mock = MockRegistry::start().await;
     // Mount ms with a much newer version; the filter regression would
     // rewrite the manifest to ^9.9.9.
-    mock.with_package("ms", "9.9.9", &make_tarball("ms", "9.9.9")).await;
+    mock.with_package("ms", "9.9.9", &make_tarball("ms", "9.9.9"))
+        .await;
 
     let out = lpm_with_registry(&project, &mock.url())
         .args(["upgrade", "-y", "--json"])
         .output()
         .expect("spawn lpm upgrade --json");
-    assert!(out.status.success(), "upgrade should exit 0 on npm-only project");
+    assert!(
+        out.status.success(),
+        "upgrade should exit 0 on npm-only project"
+    );
 
     let envelope: serde_json::Value =
         serde_json::from_slice(&out.stdout).expect("valid JSON envelope");
     assert_eq!(
-        envelope["upgraded"], serde_json::json!(0),
+        envelope["upgraded"],
+        serde_json::json!(0),
         "npm packages must be filtered out of upgrade candidates; envelope: {envelope:#}"
     );
 
@@ -219,7 +232,8 @@ async fn upgrade_writes_new_range_to_manifest_and_lockfile() {
     let pkg_json: serde_json::Value =
         serde_json::from_str(&project.read_file("package.json")).unwrap();
     assert_eq!(
-        pkg_json["dependencies"][pkg], serde_json::json!("^2.0.0"),
+        pkg_json["dependencies"][pkg],
+        serde_json::json!("^2.0.0"),
         "manifest dep range must be rewritten to ^2.0.0; got: {pkg_json:#}"
     );
 
@@ -264,7 +278,8 @@ async fn upgrade_rewrites_minified_manifest_json() {
     let pkg_json: serde_json::Value =
         serde_json::from_str(&project.read_file("package.json")).unwrap();
     assert_eq!(
-        pkg_json["dependencies"][pkg], serde_json::json!("^2.0.0"),
+        pkg_json["dependencies"][pkg],
+        serde_json::json!("^2.0.0"),
         "minified manifest dep range must still be rewritten; got: {pkg_json:#}"
     );
 
@@ -728,8 +743,14 @@ fn upgrade_interactive_with_json_is_hard_error() {
         String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr)
     );
-    assert!(combined.contains("interactive"), "error must name interactive: {combined}");
-    assert!(combined.contains("json"), "error must name json: {combined}");
+    assert!(
+        combined.contains("interactive"),
+        "error must name interactive: {combined}"
+    );
+    assert!(
+        combined.contains("json"),
+        "error must name json: {combined}"
+    );
 }
 
 /// `-i -y` is mutually exclusive — clap-level rejection. Error names
@@ -776,7 +797,10 @@ fn upgrade_major_in_interactive_mode_is_hard_error() {
         String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr)
     );
-    assert!(combined.contains("--major"), "error must name --major: {combined}");
+    assert!(
+        combined.contains("--major"),
+        "error must name --major: {combined}"
+    );
     assert!(
         combined.contains("interactive mode"),
         "error must name interactive mode: {combined}"
@@ -822,7 +846,10 @@ async fn upgrade_yes_marks_install_scripts_in_json() {
     assert!(out.status.success());
 
     let json = parse_stdout_json(&out.stdout, &out.stderr);
-    assert_eq!(json["packages"][0]["has_install_scripts"], serde_json::json!(true));
+    assert_eq!(
+        json["packages"][0]["has_install_scripts"],
+        serde_json::json!(true)
+    );
 }
 
 /// `peer_impact.ok: false` with the violating peer's name + have/want
@@ -842,9 +869,18 @@ async fn upgrade_yes_marks_peer_violation_in_json() {
     let peer_impact = &json["packages"][0]["peer_impact"];
     assert_eq!(peer_impact["ok"], serde_json::json!(false));
     assert_eq!(peer_impact["basis"], serde_json::json!("current_lockfile"));
-    assert_eq!(peer_impact["violations"][0]["name"], serde_json::json!("react"));
-    assert_eq!(peer_impact["violations"][0]["have"], serde_json::json!("17.0.2"));
-    assert_eq!(peer_impact["violations"][0]["want"], serde_json::json!("^18.0.0"));
+    assert_eq!(
+        peer_impact["violations"][0]["name"],
+        serde_json::json!("react")
+    );
+    assert_eq!(
+        peer_impact["violations"][0]["have"],
+        serde_json::json!("17.0.2")
+    );
+    assert_eq!(
+        peer_impact["violations"][0]["want"],
+        serde_json::json!("^18.0.0")
+    );
 }
 
 /// `patch_invalidation` populated when the upgrade would orphan a

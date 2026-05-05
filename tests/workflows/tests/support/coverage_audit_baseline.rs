@@ -97,8 +97,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         workflow: false,
         cli_binary: false,
         json_contract: false,
-        references: &[
-        ],
+        references: &[],
     },
     SurfaceBaseline {
         id: 2,
@@ -108,8 +107,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         workflow: false,
         cli_binary: false,
         json_contract: false,
-        references: &[
-        ],
+        references: &[],
     },
     SurfaceBaseline {
         id: 3,
@@ -119,8 +117,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         workflow: false,
         cli_binary: false,
         json_contract: false,
-        references: &[
-        ],
+        references: &[],
     },
     SurfaceBaseline {
         id: 4,
@@ -143,9 +140,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         workflow: true,
         cli_binary: false,
         json_contract: true,
-        references: &[
-            "tests/workflows/tests/json_output.rs",
-        ],
+        references: &["tests/workflows/tests/json_output.rs"],
     },
     SurfaceBaseline {
         id: 6,
@@ -155,8 +150,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         workflow: false,
         cli_binary: false,
         json_contract: false,
-        references: &[
-        ],
+        references: &[],
     },
     SurfaceBaseline {
         id: 7,
@@ -166,8 +160,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         workflow: false,
         cli_binary: false,
         json_contract: false,
-        references: &[
-        ],
+        references: &[],
     },
     SurfaceBaseline {
         id: 8,
@@ -177,9 +170,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         workflow: true,
         cli_binary: false,
         json_contract: true,
-        references: &[
-            "tests/workflows/tests/outdated.rs",
-        ],
+        references: &["tests/workflows/tests/outdated.rs"],
     },
     SurfaceBaseline {
         id: 9,
@@ -203,8 +194,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         workflow: false,
         cli_binary: false,
         json_contract: false,
-        references: &[
-        ],
+        references: &[],
     },
     SurfaceBaseline {
         id: 11,
@@ -214,8 +204,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         workflow: false,
         cli_binary: false,
         json_contract: false,
-        references: &[
-        ],
+        references: &[],
     },
     SurfaceBaseline {
         id: 12,
@@ -238,9 +227,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         workflow: true,
         cli_binary: false,
         json_contract: true,
-        references: &[
-            "tests/workflows/tests/install.rs",
-        ],
+        references: &["tests/workflows/tests/install.rs"],
     },
     SurfaceBaseline {
         id: 14,
@@ -250,9 +237,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         workflow: true,
         cli_binary: false,
         json_contract: false,
-        references: &[
-            "tests/workflows/tests/install.rs",
-        ],
+        references: &["tests/workflows/tests/install.rs"],
     },
     SurfaceBaseline {
         id: 15,
@@ -262,9 +247,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         workflow: true,
         cli_binary: false,
         json_contract: false,
-        references: &[
-            "tests/workflows/tests/install.rs",
-        ],
+        references: &["tests/workflows/tests/install.rs"],
     },
     SurfaceBaseline {
         id: 16,
@@ -287,8 +270,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         workflow: false,
         cli_binary: false,
         json_contract: false,
-        references: &[
-        ],
+        references: &[],
     },
     SurfaceBaseline {
         id: 18,
@@ -337,8 +319,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         workflow: false,
         cli_binary: false,
         json_contract: false,
-        references: &[
-        ],
+        references: &[],
     },
     SurfaceBaseline {
         id: 22,
@@ -361,8 +342,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         workflow: false,
         cli_binary: false,
         json_contract: false,
-        references: &[
-        ],
+        references: &[],
     },
     SurfaceBaseline {
         id: 24,
@@ -385,9 +365,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         workflow: true,
         cli_binary: false,
         json_contract: false,
-        references: &[
-            "tests/workflows/tests/upgrade.rs",
-        ],
+        references: &["tests/workflows/tests/upgrade.rs"],
     },
     SurfaceBaseline {
         id: 26,
@@ -397,9 +375,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         workflow: true,
         cli_binary: false,
         json_contract: false,
-        references: &[
-            "tests/workflows/tests/upgrade.rs",
-        ],
+        references: &["tests/workflows/tests/upgrade.rs"],
     },
     SurfaceBaseline {
         id: 27,
@@ -436,9 +412,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         workflow: true,
         cli_binary: false,
         json_contract: false,
-        references: &[
-            "tests/workflows/tests/publish.rs",
-        ],
+        references: &["tests/workflows/tests/publish.rs"],
     },
     SurfaceBaseline {
         id: 30,
@@ -448,9 +422,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         workflow: true,
         cli_binary: false,
         json_contract: false,
-        references: &[
-            "tests/workflows/tests/publish.rs",
-        ],
+        references: &["tests/workflows/tests/publish.rs"],
     },
     SurfaceBaseline {
         id: 31,
@@ -460,8 +432,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         workflow: false,
         cli_binary: false,
         json_contract: false,
-        references: &[
-        ],
+        references: &[],
     },
     SurfaceBaseline {
         id: 32,
@@ -536,9 +507,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         workflow: true,
         cli_binary: false,
         json_contract: false,
-        references: &[
-            "tests/workflows/tests/auth_lifecycle.rs",
-        ],
+        references: &["tests/workflows/tests/auth_lifecycle.rs"],
     },
     SurfaceBaseline {
         id: 38,
@@ -548,9 +517,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         workflow: true,
         cli_binary: false,
         json_contract: false,
-        references: &[
-            "tests/workflows/tests/auth_lifecycle.rs",
-        ],
+        references: &["tests/workflows/tests/auth_lifecycle.rs"],
     },
     SurfaceBaseline {
         id: 39,
@@ -560,9 +527,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         workflow: true,
         cli_binary: false,
         json_contract: false,
-        references: &[
-            "tests/workflows/tests/auth_lifecycle.rs",
-        ],
+        references: &["tests/workflows/tests/auth_lifecycle.rs"],
     },
     SurfaceBaseline {
         id: 40,
@@ -572,8 +537,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         workflow: false,
         cli_binary: false,
         json_contract: false,
-        references: &[
-        ],
+        references: &[],
     },
     SurfaceBaseline {
         id: 41,
@@ -583,9 +547,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         workflow: false,
         cli_binary: true,
         json_contract: false,
-        references: &[
-            "crates/lpm-cli/tests/oidc_setup_snippet_contract.rs",
-        ],
+        references: &["crates/lpm-cli/tests/oidc_setup_snippet_contract.rs"],
     },
     SurfaceBaseline {
         id: 42,
@@ -595,8 +557,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         workflow: false,
         cli_binary: false,
         json_contract: false,
-        references: &[
-        ],
+        references: &[],
     },
     SurfaceBaseline {
         id: 43,
@@ -606,8 +567,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         workflow: false,
         cli_binary: false,
         json_contract: false,
-        references: &[
-        ],
+        references: &[],
     },
     SurfaceBaseline {
         id: 44,
@@ -617,8 +577,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         workflow: false,
         cli_binary: false,
         json_contract: false,
-        references: &[
-        ],
+        references: &[],
     },
     SurfaceBaseline {
         id: 45,
@@ -628,8 +587,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         workflow: false,
         cli_binary: false,
         json_contract: false,
-        references: &[
-        ],
+        references: &[],
     },
     SurfaceBaseline {
         id: 46,
@@ -639,8 +597,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         workflow: false,
         cli_binary: false,
         json_contract: false,
-        references: &[
-        ],
+        references: &[],
     },
     SurfaceBaseline {
         id: 47,
@@ -650,9 +607,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         workflow: false,
         cli_binary: false,
         json_contract: false,
-        references: &[
-            "crates/lpm-cli/src/commands/cache.rs",
-        ],
+        references: &["crates/lpm-cli/src/commands/cache.rs"],
     },
     SurfaceBaseline {
         id: 48,
@@ -662,8 +617,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         workflow: false,
         cli_binary: false,
         json_contract: false,
-        references: &[
-        ],
+        references: &[],
     },
     SurfaceBaseline {
         id: 49,
@@ -673,9 +627,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         workflow: false,
         cli_binary: false,
         json_contract: false,
-        references: &[
-            "crates/lpm-cli/src/commands/store.rs",
-        ],
+        references: &["crates/lpm-cli/src/commands/store.rs"],
     },
     SurfaceBaseline {
         id: 50,
@@ -685,9 +637,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         workflow: false,
         cli_binary: false,
         json_contract: false,
-        references: &[
-            "tests/integration/tests/core.rs",
-        ],
+        references: &["tests/integration/tests/core.rs"],
     },
     SurfaceBaseline {
         id: 51,
@@ -697,8 +647,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         workflow: false,
         cli_binary: false,
         json_contract: false,
-        references: &[
-        ],
+        references: &[],
     },
     SurfaceBaseline {
         id: 52,
@@ -708,9 +657,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         workflow: false,
         cli_binary: false,
         json_contract: false,
-        references: &[
-            "tests/integration/tests/output_parity.rs",
-        ],
+        references: &["tests/integration/tests/output_parity.rs"],
     },
     SurfaceBaseline {
         id: 53,
@@ -720,8 +667,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         workflow: false,
         cli_binary: false,
         json_contract: false,
-        references: &[
-        ],
+        references: &[],
     },
     SurfaceBaseline {
         id: 54,
@@ -744,9 +690,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         workflow: false,
         cli_binary: true,
         json_contract: true,
-        references: &[
-            "crates/lpm-cli/tests/global_install_state_mutation.rs",
-        ],
+        references: &["crates/lpm-cli/tests/global_install_state_mutation.rs"],
     },
     SurfaceBaseline {
         id: 56,
@@ -756,8 +700,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         workflow: false,
         cli_binary: false,
         json_contract: false,
-        references: &[
-        ],
+        references: &[],
     },
     SurfaceBaseline {
         id: 57,
@@ -767,8 +710,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         workflow: false,
         cli_binary: false,
         json_contract: false,
-        references: &[
-        ],
+        references: &[],
     },
     SurfaceBaseline {
         id: 58,
@@ -778,9 +720,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         workflow: false,
         cli_binary: true,
         json_contract: true,
-        references: &[
-            "crates/lpm-cli/tests/global_install_state_mutation.rs",
-        ],
+        references: &["crates/lpm-cli/tests/global_install_state_mutation.rs"],
     },
     SurfaceBaseline {
         id: 59,
@@ -803,9 +743,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         workflow: false,
         cli_binary: false,
         json_contract: false,
-        references: &[
-            "crates/lpm-cli/src/commands/trust.rs",
-        ],
+        references: &["crates/lpm-cli/src/commands/trust.rs"],
     },
     SurfaceBaseline {
         id: 61,
@@ -815,8 +753,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         workflow: false,
         cli_binary: false,
         json_contract: false,
-        references: &[
-        ],
+        references: &[],
     },
     SurfaceBaseline {
         id: 62,
@@ -826,8 +763,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         workflow: false,
         cli_binary: false,
         json_contract: false,
-        references: &[
-        ],
+        references: &[],
     },
     SurfaceBaseline {
         id: 63,
@@ -850,9 +786,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         workflow: true,
         cli_binary: false,
         json_contract: false,
-        references: &[
-            "tests/workflows/tests/audit.rs",
-        ],
+        references: &["tests/workflows/tests/audit.rs"],
     },
     SurfaceBaseline {
         id: 65,
@@ -862,8 +796,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         workflow: false,
         cli_binary: false,
         json_contract: false,
-        references: &[
-        ],
+        references: &[],
     },
     SurfaceBaseline {
         id: 66,
@@ -873,9 +806,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         workflow: false,
         cli_binary: false,
         json_contract: false,
-        references: &[
-            "crates/lpm-cli/src/commands/query.rs",
-        ],
+        references: &["crates/lpm-cli/src/commands/query.rs"],
     },
     SurfaceBaseline {
         id: 67,
@@ -885,8 +816,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         workflow: false,
         cli_binary: false,
         json_contract: false,
-        references: &[
-        ],
+        references: &[],
     },
     SurfaceBaseline {
         id: 68,
@@ -909,9 +839,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         workflow: true,
         cli_binary: false,
         json_contract: false,
-        references: &[
-            "tests/workflows/tests/rebuild.rs",
-        ],
+        references: &["tests/workflows/tests/rebuild.rs"],
     },
     SurfaceBaseline {
         id: 70,
@@ -921,9 +849,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         workflow: true,
         cli_binary: false,
         json_contract: false,
-        references: &[
-            "tests/workflows/tests/rebuild.rs",
-        ],
+        references: &["tests/workflows/tests/rebuild.rs"],
     },
     SurfaceBaseline {
         id: 71,
@@ -933,9 +859,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         workflow: true,
         cli_binary: false,
         json_contract: true,
-        references: &[
-            "tests/workflows/tests/rebuild.rs",
-        ],
+        references: &["tests/workflows/tests/rebuild.rs"],
     },
     SurfaceBaseline {
         id: 72,
@@ -945,9 +869,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         workflow: false,
         cli_binary: false,
         json_contract: false,
-        references: &[
-            "crates/lpm-cli/src/commands/approve_scripts.rs",
-        ],
+        references: &["crates/lpm-cli/src/commands/approve_scripts.rs"],
     },
     SurfaceBaseline {
         id: 73,
@@ -957,9 +879,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         workflow: true,
         cli_binary: false,
         json_contract: true,
-        references: &[
-            "tests/workflows/tests/approve_scripts.rs",
-        ],
+        references: &["tests/workflows/tests/approve_scripts.rs"],
     },
     SurfaceBaseline {
         id: 74,
@@ -969,9 +889,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         workflow: true,
         cli_binary: false,
         json_contract: true,
-        references: &[
-            "tests/workflows/tests/approve_scripts.rs",
-        ],
+        references: &["tests/workflows/tests/approve_scripts.rs"],
     },
     SurfaceBaseline {
         id: 75,
@@ -981,9 +899,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         workflow: true,
         cli_binary: false,
         json_contract: false,
-        references: &[
-            "tests/workflows/tests/approve_scripts.rs",
-        ],
+        references: &["tests/workflows/tests/approve_scripts.rs"],
     },
     SurfaceBaseline {
         id: 76,
@@ -993,9 +909,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         workflow: true,
         cli_binary: false,
         json_contract: true,
-        references: &[
-            "tests/workflows/tests/approve_scripts.rs",
-        ],
+        references: &["tests/workflows/tests/approve_scripts.rs"],
     },
     SurfaceBaseline {
         id: 77,
@@ -1005,9 +919,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         workflow: true,
         cli_binary: false,
         json_contract: true,
-        references: &[
-            "tests/workflows/tests/approve_scripts.rs",
-        ],
+        references: &["tests/workflows/tests/approve_scripts.rs"],
     },
     SurfaceBaseline {
         id: 78,
@@ -1030,9 +942,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         workflow: true,
         cli_binary: false,
         json_contract: false,
-        references: &[
-            "tests/workflows/tests/patch.rs",
-        ],
+        references: &["tests/workflows/tests/patch.rs"],
     },
     SurfaceBaseline {
         id: 80,
@@ -1042,9 +952,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         workflow: false,
         cli_binary: false,
         json_contract: false,
-        references: &[
-            "crates/lpm-cli/src/commands/filter.rs",
-        ],
+        references: &["crates/lpm-cli/src/commands/filter.rs"],
     },
     SurfaceBaseline {
         id: 81,
@@ -1054,9 +962,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         workflow: false,
         cli_binary: false,
         json_contract: false,
-        references: &[
-            "crates/lpm-cli/src/commands/deploy.rs",
-        ],
+        references: &["crates/lpm-cli/src/commands/deploy.rs"],
     },
     SurfaceBaseline {
         id: 82,
@@ -1066,8 +972,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         workflow: false,
         cli_binary: false,
         json_contract: false,
-        references: &[
-        ],
+        references: &[],
     },
     SurfaceBaseline {
         id: 83,
@@ -1104,8 +1009,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         workflow: false,
         cli_binary: false,
         json_contract: false,
-        references: &[
-        ],
+        references: &[],
     },
     SurfaceBaseline {
         id: 86,
@@ -1115,8 +1019,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         workflow: false,
         cli_binary: false,
         json_contract: false,
-        references: &[
-        ],
+        references: &[],
     },
     SurfaceBaseline {
         id: 87,
@@ -1126,8 +1029,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         workflow: false,
         cli_binary: false,
         json_contract: false,
-        references: &[
-        ],
+        references: &[],
     },
     SurfaceBaseline {
         id: 88,
@@ -1150,8 +1052,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         workflow: false,
         cli_binary: false,
         json_contract: false,
-        references: &[
-        ],
+        references: &[],
     },
     SurfaceBaseline {
         id: 90,
@@ -1161,8 +1062,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         workflow: false,
         cli_binary: false,
         json_contract: false,
-        references: &[
-        ],
+        references: &[],
     },
     SurfaceBaseline {
         id: 91,
@@ -1172,9 +1072,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         workflow: true,
         cli_binary: false,
         json_contract: true,
-        references: &[
-            "tests/workflows/tests/tools.rs",
-        ],
+        references: &["tests/workflows/tests/tools.rs"],
     },
     SurfaceBaseline {
         id: 92,
@@ -1184,9 +1082,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         workflow: true,
         cli_binary: false,
         json_contract: true,
-        references: &[
-            "tests/workflows/tests/tools.rs",
-        ],
+        references: &["tests/workflows/tests/tools.rs"],
     },
     SurfaceBaseline {
         id: 93,
@@ -1196,9 +1092,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         workflow: true,
         cli_binary: false,
         json_contract: false,
-        references: &[
-            "tests/workflows/tests/tools.rs",
-        ],
+        references: &["tests/workflows/tests/tools.rs"],
     },
     SurfaceBaseline {
         id: 94,
@@ -1208,8 +1102,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         workflow: false,
         cli_binary: false,
         json_contract: false,
-        references: &[
-        ],
+        references: &[],
     },
     SurfaceBaseline {
         id: 95,
@@ -1219,8 +1112,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         workflow: false,
         cli_binary: false,
         json_contract: false,
-        references: &[
-        ],
+        references: &[],
     },
     SurfaceBaseline {
         id: 96,
@@ -1230,9 +1122,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         workflow: false,
         cli_binary: true,
         json_contract: false,
-        references: &[
-            "crates/lpm-cli/tests/oidc_setup_snippet_contract.rs",
-        ],
+        references: &["crates/lpm-cli/tests/oidc_setup_snippet_contract.rs"],
     },
     SurfaceBaseline {
         id: 97,
@@ -1242,9 +1132,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         workflow: false,
         cli_binary: false,
         json_contract: false,
-        references: &[
-            "crates/lpm-cli/src/commands/env.rs",
-        ],
+        references: &["crates/lpm-cli/src/commands/env.rs"],
     },
     SurfaceBaseline {
         id: 98,
@@ -1254,8 +1142,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         workflow: false,
         cli_binary: false,
         json_contract: false,
-        references: &[
-        ],
+        references: &[],
     },
     SurfaceBaseline {
         id: 99,
@@ -1265,8 +1152,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         workflow: false,
         cli_binary: false,
         json_contract: false,
-        references: &[
-        ],
+        references: &[],
     },
     SurfaceBaseline {
         id: 100,
@@ -1276,8 +1162,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         workflow: false,
         cli_binary: false,
         json_contract: false,
-        references: &[
-        ],
+        references: &[],
     },
     SurfaceBaseline {
         id: 101,
@@ -1287,8 +1172,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         workflow: false,
         cli_binary: false,
         json_contract: false,
-        references: &[
-        ],
+        references: &[],
     },
     SurfaceBaseline {
         id: 102,
@@ -1298,9 +1182,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         workflow: true,
         cli_binary: false,
         json_contract: false,
-        references: &[
-            "tests/workflows/tests/env_vault.rs",
-        ],
+        references: &["tests/workflows/tests/env_vault.rs"],
     },
     SurfaceBaseline {
         id: 103,
@@ -1310,8 +1192,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         workflow: false,
         cli_binary: false,
         json_contract: false,
-        references: &[
-        ],
+        references: &[],
     },
     SurfaceBaseline {
         id: 104,
@@ -1321,9 +1202,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         workflow: true,
         cli_binary: false,
         json_contract: false,
-        references: &[
-            "tests/workflows/tests/env_vault.rs",
-        ],
+        references: &["tests/workflows/tests/env_vault.rs"],
     },
     SurfaceBaseline {
         id: 105,
@@ -1333,9 +1212,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         workflow: true,
         cli_binary: false,
         json_contract: false,
-        references: &[
-            "tests/workflows/tests/env_vault.rs",
-        ],
+        references: &["tests/workflows/tests/env_vault.rs"],
     },
     SurfaceBaseline {
         id: 106,
@@ -1345,8 +1222,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         workflow: false,
         cli_binary: false,
         json_contract: false,
-        references: &[
-        ],
+        references: &[],
     },
     SurfaceBaseline {
         id: 107,
@@ -1356,9 +1232,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         workflow: true,
         cli_binary: false,
         json_contract: true,
-        references: &[
-            "tests/workflows/tests/env_vault.rs",
-        ],
+        references: &["tests/workflows/tests/env_vault.rs"],
     },
     SurfaceBaseline {
         id: 108,
@@ -1368,9 +1242,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         workflow: true,
         cli_binary: false,
         json_contract: true,
-        references: &[
-            "tests/workflows/tests/env_vault.rs",
-        ],
+        references: &["tests/workflows/tests/env_vault.rs"],
     },
     SurfaceBaseline {
         id: 109,
@@ -1380,9 +1252,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         workflow: true,
         cli_binary: false,
         json_contract: true,
-        references: &[
-            "tests/workflows/tests/env_vault.rs",
-        ],
+        references: &["tests/workflows/tests/env_vault.rs"],
     },
     SurfaceBaseline {
         id: 110,
@@ -1392,9 +1262,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         workflow: false,
         cli_binary: false,
         json_contract: false,
-        references: &[
-            "crates/lpm-cli/src/commands/dev.rs",
-        ],
+        references: &["crates/lpm-cli/src/commands/dev.rs"],
     },
     SurfaceBaseline {
         id: 111,
@@ -1404,8 +1272,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         workflow: false,
         cli_binary: false,
         json_contract: false,
-        references: &[
-        ],
+        references: &[],
     },
     SurfaceBaseline {
         id: 112,
@@ -1415,8 +1282,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         workflow: false,
         cli_binary: false,
         json_contract: false,
-        references: &[
-        ],
+        references: &[],
     },
     SurfaceBaseline {
         id: 113,
@@ -1439,9 +1305,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         workflow: true,
         cli_binary: false,
         json_contract: true,
-        references: &[
-            "tests/workflows/tests/graph.rs",
-        ],
+        references: &["tests/workflows/tests/graph.rs"],
     },
     SurfaceBaseline {
         id: 115,
@@ -1451,9 +1315,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         workflow: true,
         cli_binary: false,
         json_contract: false,
-        references: &[
-            "tests/workflows/tests/graph.rs",
-        ],
+        references: &["tests/workflows/tests/graph.rs"],
     },
     SurfaceBaseline {
         id: 116,
@@ -1463,9 +1325,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         workflow: true,
         cli_binary: false,
         json_contract: false,
-        references: &[
-            "tests/workflows/tests/graph.rs",
-        ],
+        references: &["tests/workflows/tests/graph.rs"],
     },
     SurfaceBaseline {
         id: 117,
@@ -1475,9 +1335,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         workflow: true,
         cli_binary: false,
         json_contract: true,
-        references: &[
-            "tests/workflows/tests/graph.rs",
-        ],
+        references: &["tests/workflows/tests/graph.rs"],
     },
     SurfaceBaseline {
         id: 118,
@@ -1487,8 +1345,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         workflow: false,
         cli_binary: false,
         json_contract: false,
-        references: &[
-        ],
+        references: &[],
     },
     SurfaceBaseline {
         id: 119,
@@ -1498,9 +1355,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         workflow: false,
         cli_binary: false,
         json_contract: false,
-        references: &[
-            "crates/lpm-cli/src/commands/tunnel.rs",
-        ],
+        references: &["crates/lpm-cli/src/commands/tunnel.rs"],
     },
     SurfaceBaseline {
         id: 120,
@@ -1510,8 +1365,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         workflow: false,
         cli_binary: false,
         json_contract: false,
-        references: &[
-        ],
+        references: &[],
     },
     SurfaceBaseline {
         id: 121,
@@ -1521,8 +1375,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         workflow: false,
         cli_binary: false,
         json_contract: false,
-        references: &[
-        ],
+        references: &[],
     },
     SurfaceBaseline {
         id: 122,
@@ -1574,8 +1427,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         workflow: false,
         cli_binary: false,
         json_contract: false,
-        references: &[
-        ],
+        references: &[],
     },
     SurfaceBaseline {
         id: 126,
@@ -1585,8 +1437,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         workflow: false,
         cli_binary: false,
         json_contract: false,
-        references: &[
-        ],
+        references: &[],
     },
     SurfaceBaseline {
         id: 127,
@@ -1596,9 +1447,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         workflow: false,
         cli_binary: false,
         json_contract: false,
-        references: &[
-            "crates/lpm-cli/src/commands/self_update.rs",
-        ],
+        references: &["crates/lpm-cli/src/commands/self_update.rs"],
     },
     SurfaceBaseline {
         id: 128,
@@ -1608,8 +1457,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         workflow: false,
         cli_binary: false,
         json_contract: false,
-        references: &[
-        ],
+        references: &[],
     },
     SurfaceBaseline {
         id: 129,
@@ -1632,9 +1480,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         workflow: false,
         cli_binary: false,
         json_contract: false,
-        references: &[
-            "crates/lpm-cli/src/commands/mcp.rs",
-        ],
+        references: &["crates/lpm-cli/src/commands/mcp.rs"],
     },
     SurfaceBaseline {
         id: 131,
@@ -1644,9 +1490,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         workflow: false,
         cli_binary: false,
         json_contract: false,
-        references: &[
-            "crates/lpm-cli/src/commands/use.rs",
-        ],
+        references: &["crates/lpm-cli/src/commands/use.rs"],
     },
     SurfaceBaseline {
         id: 132,
@@ -1656,8 +1500,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         workflow: false,
         cli_binary: false,
         json_contract: false,
-        references: &[
-        ],
+        references: &[],
     },
     SurfaceBaseline {
         id: 133,
@@ -1667,8 +1510,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         workflow: false,
         cli_binary: false,
         json_contract: false,
-        references: &[
-        ],
+        references: &[],
     },
     SurfaceBaseline {
         id: 134,
@@ -1691,9 +1533,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         workflow: false,
         cli_binary: true,
         json_contract: false,
-        references: &[
-            "crates/lpm-cli/tests/schema_drift.rs",
-        ],
+        references: &["crates/lpm-cli/tests/schema_drift.rs"],
     },
     SurfaceBaseline {
         id: 136,
@@ -1703,8 +1543,6 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         workflow: true,
         cli_binary: false,
         json_contract: true,
-        references: &[
-            "tests/workflows/tests/install.rs",
-        ],
+        references: &["tests/workflows/tests/install.rs"],
     },
 ];

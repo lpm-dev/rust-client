@@ -299,9 +299,7 @@ fn write_simple_lockfile(project: &TempProject, entries: &[(&str, &str, &[&str])
                     .join(", ");
                 format!("\ndependencies = [{inner}]")
             };
-            format!(
-                "[[packages]]\nname = \"{name}\"\nversion = \"{version}\"{deps_block}\n"
-            )
+            format!("[[packages]]\nname = \"{name}\"\nversion = \"{version}\"{deps_block}\n")
         })
         .collect();
     let toml = format!(
@@ -431,7 +429,11 @@ fn graph_why_json_output_includes_applied_overrides() {
     let arr = parsed["applied_overrides"]
         .as_array()
         .expect("applied_overrides must be an array");
-    assert_eq!(arr.len(), 1, "applied_overrides should have one entry; got: {parsed}");
+    assert_eq!(
+        arr.len(),
+        1,
+        "applied_overrides should have one entry; got: {parsed}"
+    );
     assert_eq!(arr[0]["package"].as_str(), Some("lodash"));
     assert_eq!(arr[0]["from_version"].as_str(), Some("4.17.21"));
     assert_eq!(arr[0]["to_version"].as_str(), Some("4.17.20"));
@@ -481,13 +483,13 @@ fn graph_why_json_output_returns_empty_overrides_when_no_state_file() {
 // truth — these tests stage it directly without driving an install.
 
 type AppliedPatchTuple<'a> = (
-    &'a str,    // name
-    &'a str,    // version
-    &'a str,    // patch_path
+    &'a str,       // name
+    &'a str,       // version
+    &'a str,       // patch_path
     &'a [&'a str], // locations
-    usize,      // modified
-    usize,      // added
-    usize,      // deleted
+    usize,         // modified
+    usize,         // added
+    usize,         // deleted
 );
 
 /// Write a synthetic `.lpm/patch-state.json` for `lpm graph --why`
@@ -514,18 +516,20 @@ fn write_patch_state(
         .collect();
     let applied_json: Vec<serde_json::Value> = applied
         .iter()
-        .map(|(name, version, patch_path, locations, modified, added, deleted)| {
-            serde_json::json!({
-                "raw_key": format!("{name}@{version}"),
-                "name": name,
-                "version": version,
-                "patch_path": patch_path,
-                "locations": locations.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
-                "files_modified": modified,
-                "files_added": added,
-                "files_deleted": deleted,
-            })
-        })
+        .map(
+            |(name, version, patch_path, locations, modified, added, deleted)| {
+                serde_json::json!({
+                    "raw_key": format!("{name}@{version}"),
+                    "name": name,
+                    "version": version,
+                    "patch_path": patch_path,
+                    "locations": locations.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
+                    "files_modified": modified,
+                    "files_added": added,
+                    "files_deleted": deleted,
+                })
+            },
+        )
         .collect();
     let state = serde_json::json!({
         "state_version": 1,
@@ -551,7 +555,12 @@ fn graph_why_human_output_shows_patch_trace() {
     write_patch_state(
         &project,
         "sha256-test-fp",
-        &[("lodash@4.17.21", "lodash", "4.17.21", "patches/lodash@4.17.21.patch")],
+        &[(
+            "lodash@4.17.21",
+            "lodash",
+            "4.17.21",
+            "patches/lodash@4.17.21.patch",
+        )],
         &[(
             "lodash",
             "4.17.21",
@@ -596,7 +605,12 @@ fn graph_why_json_output_includes_applied_patches() {
     write_patch_state(
         &project,
         "sha256-test-fp",
-        &[("lodash@4.17.21", "lodash", "4.17.21", "patches/lodash@4.17.21.patch")],
+        &[(
+            "lodash@4.17.21",
+            "lodash",
+            "4.17.21",
+            "patches/lodash@4.17.21.patch",
+        )],
         &[(
             "lodash",
             "4.17.21",
@@ -619,8 +633,9 @@ fn graph_why_json_output_includes_applied_patches() {
         String::from_utf8_lossy(&out.stderr)
     );
 
-    let parsed: serde_json::Value = serde_json::from_str(&strip_ansi(&String::from_utf8_lossy(&out.stdout)))
-        .unwrap_or_else(|e| panic!("stdout not valid JSON: {e}"));
+    let parsed: serde_json::Value =
+        serde_json::from_str(&strip_ansi(&String::from_utf8_lossy(&out.stdout)))
+            .unwrap_or_else(|e| panic!("stdout not valid JSON: {e}"));
     let arr = parsed["applied_patches"].as_array().unwrap();
     assert_eq!(arr.len(), 1);
     assert_eq!(arr[0]["name"].as_str(), Some("lodash"));
@@ -653,7 +668,8 @@ fn graph_why_json_output_returns_empty_applied_patches_when_no_state_file() {
         String::from_utf8_lossy(&out.stderr)
     );
 
-    let parsed: serde_json::Value = serde_json::from_str(&strip_ansi(&String::from_utf8_lossy(&out.stdout))).unwrap();
+    let parsed: serde_json::Value =
+        serde_json::from_str(&strip_ansi(&String::from_utf8_lossy(&out.stdout))).unwrap();
     let arr = parsed["applied_patches"]
         .as_array()
         .expect("applied_patches must be an array, not null/absent");
@@ -733,7 +749,8 @@ fn graph_why_includes_original_integrity_in_human_and_json() {
         .output()
         .expect("spawn lpm graph --why --json");
     assert!(out_json.status.success());
-    let parsed: serde_json::Value = serde_json::from_str(&strip_ansi(&String::from_utf8_lossy(&out_json.stdout))).unwrap();
+    let parsed: serde_json::Value =
+        serde_json::from_str(&strip_ansi(&String::from_utf8_lossy(&out_json.stdout))).unwrap();
     let arr = parsed["applied_patches"].as_array().unwrap();
     assert_eq!(arr.len(), 1);
     assert_eq!(

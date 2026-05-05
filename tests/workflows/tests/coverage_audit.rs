@@ -48,8 +48,14 @@ fn coverage_audit_baseline_shape_matches_phase65_matrix() {
         .iter()
         .filter(|surface| !surface.has_any_coverage())
         .count();
-    assert_eq!(covered, 112, "Phase 65 baseline should have 112 covered rows");
-    assert_eq!(uncovered, 24, "Phase 65 baseline should have 24 uncovered rows");
+    assert_eq!(
+        covered, 112,
+        "Phase 65 baseline should have 112 covered rows"
+    );
+    assert_eq!(
+        uncovered, 24,
+        "Phase 65 baseline should have 24 uncovered rows"
+    );
 }
 
 #[test]

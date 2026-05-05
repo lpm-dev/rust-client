@@ -4995,7 +4995,13 @@ async fn run_with_options_under_store_lock(
                         Option<String>,
                     ),
                     LpmError,
-                >((package_key, computed_sri, task_timings, link_h, Some(final_url)))
+                >((
+                    package_key,
+                    computed_sri,
+                    task_timings,
+                    link_h,
+                    Some(final_url),
+                ))
             }));
         }
 
@@ -7814,10 +7820,7 @@ fn spawn_speculation_dispatcher(
 
                 let skip_auth_bearing_custom_speculation = matches!(
                     route_table_spec.route_for_package(&name),
-                    UpstreamRoute::Custom {
-                        auth: Some(_),
-                        ..
-                    }
+                    UpstreamRoute::Custom { auth: Some(_), .. }
                 );
 
                 // Already-in-store: free store hit, no speculation needed.

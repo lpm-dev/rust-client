@@ -118,13 +118,13 @@ fn phase6_fingerprint(entries: &[(&str, &str, &str)]) -> String {
 }
 
 type AppliedTuple<'a> = (
-    &'a str,    // name
-    &'a str,    // version
-    &'a str,    // patch_path
+    &'a str,       // name
+    &'a str,       // version
+    &'a str,       // patch_path
     &'a [&'a str], // locations
-    usize,      // modified
-    usize,      // added
-    usize,      // deleted
+    usize,         // modified
+    usize,         // added
+    usize,         // deleted
 );
 
 /// Write `.lpm/patch-state.json` capturing parsed + applied entries.
@@ -149,18 +149,20 @@ fn write_patch_state(
         .collect();
     let applied_json: Vec<serde_json::Value> = applied
         .iter()
-        .map(|(name, version, patch_path, locations, modified, added, deleted)| {
-            serde_json::json!({
-                "raw_key": format!("{name}@{version}"),
-                "name": name,
-                "version": version,
-                "patch_path": patch_path,
-                "locations": locations.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
-                "files_modified": modified,
-                "files_added": added,
-                "files_deleted": deleted,
-            })
-        })
+        .map(
+            |(name, version, patch_path, locations, modified, added, deleted)| {
+                serde_json::json!({
+                    "raw_key": format!("{name}@{version}"),
+                    "name": name,
+                    "version": version,
+                    "patch_path": patch_path,
+                    "locations": locations.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
+                    "files_modified": modified,
+                    "files_added": added,
+                    "files_deleted": deleted,
+                })
+            },
+        )
         .collect();
     let state = serde_json::json!({
         "state_version": 1,
@@ -235,8 +237,7 @@ fn install_patches_applied_after_link_in_isolated_layout() {
     let project = TempProject::empty("");
     let original = "module.exports = 'orig'\n";
     let patched = "module.exports = 'PATCHED'\n";
-    let patch_text =
-        "--- a/index.js\n+++ b/index.js\n@@ -1 +1 @@\n-module.exports = 'orig'\n+module.exports = 'PATCHED'\n";
+    let patch_text = "--- a/index.js\n+++ b/index.js\n@@ -1 +1 @@\n-module.exports = 'orig'\n+module.exports = 'PATCHED'\n";
     build_patch_install_fixture(
         &project,
         "install-applies-patch",
@@ -312,9 +313,7 @@ fn install_patches_hard_errors_on_integrity_drift() {
 
     // Mutate `.integrity` after the fixture was built so the live store
     // reports a different value than the one bound in the manifest.
-    let store_integrity = project
-        .store_dir()
-        .join("v1/lodash@4.17.21/.integrity");
+    let store_integrity = project.store_dir().join("v1/lodash@4.17.21/.integrity");
     std::fs::write(&store_integrity, "sha512-different-from-recorded").unwrap();
 
     let out = lpm_with_registry(&project, "http://127.0.0.1:1")
@@ -332,8 +331,14 @@ fn install_patches_hard_errors_on_integrity_drift() {
         String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr)
     ));
-    assert!(combined.contains("drift"), "error must mention 'drift'; got:\n{combined}");
-    assert!(combined.contains("lodash"), "error must name the package; got:\n{combined}");
+    assert!(
+        combined.contains("drift"),
+        "error must mention 'drift'; got:\n{combined}"
+    );
+    assert!(
+        combined.contains("lodash"),
+        "error must name the package; got:\n{combined}"
+    );
 }
 
 /// Manifest references `patches/missing.patch` but the file is absent.
@@ -541,7 +546,12 @@ fn install_patches_offline_hard_errors_on_patch_fingerprint_mismatch() {
     write_patch_state(
         &project,
         "sha256-completely-different-from-current",
-        &[("lodash@4.17.21", "lodash", "4.17.21", "patches/lodash@4.17.21.patch")],
+        &[(
+            "lodash@4.17.21",
+            "lodash",
+            "4.17.21",
+            "patches/lodash@4.17.21.patch",
+        )],
         &[],
     );
 
@@ -641,7 +651,12 @@ fn install_patches_offline_hard_errors_when_patches_removed_with_prior_state() {
     write_patch_state(
         &project,
         "sha256-prior-fingerprint",
-        &[("lodash@4.17.21", "lodash", "4.17.21", "patches/lodash@4.17.21.patch")],
+        &[(
+            "lodash@4.17.21",
+            "lodash",
+            "4.17.21",
+            "patches/lodash@4.17.21.patch",
+        )],
         &[(
             "lodash",
             "4.17.21",
@@ -732,10 +747,9 @@ fn install_json_envelope_includes_applied_patches_field() {
         String::from_utf8_lossy(&out.stderr)
     );
 
-    let parsed: serde_json::Value = serde_json::from_str(&strip_ansi(
-        &String::from_utf8_lossy(&out.stdout),
-    ))
-    .unwrap_or_else(|e| panic!("install --json invalid: {e}"));
+    let parsed: serde_json::Value =
+        serde_json::from_str(&strip_ansi(&String::from_utf8_lossy(&out.stdout)))
+            .unwrap_or_else(|e| panic!("install --json invalid: {e}"));
     let arr = parsed["applied_patches"].as_array().unwrap();
     assert_eq!(arr.len(), 1, "applied_patches must contain one entry");
     assert_eq!(arr[0]["name"].as_str(), Some("lodash"));
@@ -772,12 +786,15 @@ fn install_patches_idempotent_rerun_reports_no_applied_patches_per_run() {
         "first install must succeed; stderr:\n{}",
         String::from_utf8_lossy(&out1.stderr)
     );
-    let p1: serde_json::Value = serde_json::from_str(&strip_ansi(
-        &String::from_utf8_lossy(&out1.stdout),
-    ))
-    .unwrap_or_else(|e| panic!("first install --json invalid: {e}"));
+    let p1: serde_json::Value =
+        serde_json::from_str(&strip_ansi(&String::from_utf8_lossy(&out1.stdout)))
+            .unwrap_or_else(|e| panic!("first install --json invalid: {e}"));
     let arr1 = p1["applied_patches"].as_array().unwrap();
-    assert_eq!(arr1.len(), 1, "first install should report one applied patch");
+    assert_eq!(
+        arr1.len(),
+        1,
+        "first install should report one applied patch"
+    );
     assert_eq!(arr1[0]["files_modified"].as_u64(), Some(1));
 
     let nm_file = project
@@ -795,10 +812,9 @@ fn install_patches_idempotent_rerun_reports_no_applied_patches_per_run() {
         "second install must succeed; stderr:\n{}",
         String::from_utf8_lossy(&out2.stderr)
     );
-    let p2: serde_json::Value = serde_json::from_str(&strip_ansi(
-        &String::from_utf8_lossy(&out2.stdout),
-    ))
-    .unwrap_or_else(|e| panic!("second install --json invalid: {e}"));
+    let p2: serde_json::Value =
+        serde_json::from_str(&strip_ansi(&String::from_utf8_lossy(&out2.stdout)))
+            .unwrap_or_else(|e| panic!("second install --json invalid: {e}"));
     let arr2 = p2["applied_patches"].as_array().unwrap();
     assert!(
         arr2.is_empty(),
@@ -822,7 +838,10 @@ fn install_patches_idempotent_rerun_reports_no_applied_patches_per_run() {
 
     // State file persists across no-op reruns.
     let state_path = project.path().join(".lpm/patch-state.json");
-    assert!(state_path.exists(), "state file must persist across no-op reruns");
+    assert!(
+        state_path.exists(),
+        "state file must persist across no-op reruns"
+    );
     let state: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(&state_path).unwrap()).unwrap();
     let state_applied = state["applied"].as_array().unwrap();

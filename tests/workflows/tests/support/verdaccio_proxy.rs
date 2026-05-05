@@ -161,7 +161,9 @@ impl VerdaccioProxyRegistry {
                 Mock::given(method("GET"))
                     .and(path(tarball_path.clone()))
                     .and(header("authorization", auth_header.as_str()))
-                    .respond_with(ResponseTemplate::new(401).set_body_string("proxy tarball auth failed"))
+                    .respond_with(
+                        ResponseTemplate::new(401).set_body_string("proxy tarball auth failed"),
+                    )
                     .mount(&server)
                     .await;
             }
