@@ -1,0 +1,19 @@
+---
+source: tests/workflows/tests/outdated.rs
+assertion_line: 197
+expression: envelope
+---
+{
+  "success": true,
+  "packages": [
+    {
+      "name": "@lpm.dev/owner.snap-outdated",
+      "current": "1.0.0",
+      "wanted": "^1.0.0",
+      "latest": "2.0.0",
+      "outdated": true
+    }
+  ],
+  "count": 1,
+  "outdated_count": 1
+}

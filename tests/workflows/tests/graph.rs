@@ -255,3 +255,490 @@ fn graph_stats_max_depth_matches_flag_input() {
         "json max_depth must match the --depth input: {parsed}"
     );
 }
+
+// ─── Phase 65 Step 6.2d-ii — `lpm graph --why <pkg>` overrides trace ────
+//
+// When `.lpm/overrides-state.json` records an applied override for a
+// package, `lpm graph --why <pkg>` decorates output (human + JSON) with
+// the from→to summary. The state file is the source of truth — graph
+// loads it directly, no install pipeline needed.
+
+/// UTF-8-safe ANSI escape stripper. Iterates `chars()` and skips CSI
+/// sequences without re-encoding bytes individually.
+fn strip_ansi(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\u{1b}' && chars.peek() == Some(&'[') {
+            chars.next();
+            for cc in chars.by_ref() {
+                let cb = cc as u32;
+                if (0x40..=0x7e).contains(&cb) {
+                    break;
+                }
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+/// Synthetic `lpm.lock` containing the given `(name, version, deps)` entries.
+fn write_simple_lockfile(project: &TempProject, entries: &[(&str, &str, &[&str])]) {
+    let pkgs: Vec<String> = entries
+        .iter()
+        .map(|(name, version, deps)| {
+            let deps_block = if deps.is_empty() {
+                String::new()
+            } else {
+                let inner = deps
+                    .iter()
+                    .map(|d| format!("\"{d}\""))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                format!("\ndependencies = [{inner}]")
+            };
+            format!(
+                "[[packages]]\nname = \"{name}\"\nversion = \"{version}\"{deps_block}\n"
+            )
+        })
+        .collect();
+    let toml = format!(
+        "[metadata]\nlockfile-version = 1\nresolved-with = \"pubgrub\"\n\n{}\n",
+        pkgs.join("\n")
+    );
+    project.write_file("lpm.lock", &toml);
+}
+
+/// Write a synthetic `.lpm/overrides-state.json`. Mirrors what the
+/// install pipeline persists; lets these graph tests run without
+/// driving a real install.
+fn write_overrides_state(
+    project: &TempProject,
+    fingerprint: &str,
+    parsed: &[(&str, &str)],
+    applied: &[(&str, &str, &str, Option<&str>)],
+) {
+    let parsed_json: Vec<serde_json::Value> = parsed
+        .iter()
+        .map(|(key, target)| {
+            serde_json::json!({
+                "raw_key": key,
+                "source": "lpm.overrides",
+                "selector": { "kind": "name", "name": key },
+                "target": target,
+            })
+        })
+        .collect();
+    let applied_json: Vec<serde_json::Value> = applied
+        .iter()
+        .map(|(pkg, from, to, via)| {
+            serde_json::json!({
+                "raw_key": pkg,
+                "source": "lpm.overrides",
+                "package": pkg,
+                "from_version": from,
+                "to_version": to,
+                "via_parent": via,
+            })
+        })
+        .collect();
+    let state = serde_json::json!({
+        "state_version": 1,
+        "fingerprint": fingerprint,
+        "captured_at": "2026-04-11T00:00:00Z",
+        "parsed": parsed_json,
+        "applied": applied_json,
+    });
+    project.write_file(
+        ".lpm/overrides-state.json",
+        &serde_json::to_string_pretty(&state).unwrap(),
+    );
+}
+
+/// Human output of `lpm graph --why <pkg>` shows the override section
+/// with the from→to summary and a source reference.
+#[test]
+fn graph_why_human_output_shows_override_trace() {
+    let project = TempProject::empty(
+        r#"{"name":"why-human-trace","version":"0.0.0","dependencies":{"lodash":"^4.17.0"}}"#,
+    );
+    write_simple_lockfile(&project, &[("lodash", "4.17.20", &[])]);
+    write_overrides_state(
+        &project,
+        "sha256-test-fp",
+        &[("lodash", "4.17.20")],
+        &[("lodash", "4.17.21", "4.17.20", None)],
+    );
+
+    let out = lpm(&project)
+        .args(["graph", "--why", "lodash"])
+        .output()
+        .expect("spawn lpm graph --why");
+    assert!(
+        out.status.success(),
+        "graph --why must succeed; stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let stdout_clean = strip_ansi(&String::from_utf8_lossy(&out.stdout));
+    assert!(
+        stdout_clean.contains("Overrides applied to this package"),
+        "human output must show override section; got:\n{stdout_clean}"
+    );
+    assert!(
+        stdout_clean.contains("4.17.21 → 4.17.20"),
+        "human output must show from→to; got:\n{stdout_clean}"
+    );
+    assert!(
+        stdout_clean.contains("lpm.overrides.lodash"),
+        "human output must reference source; got:\n{stdout_clean}"
+    );
+}
+
+/// `lpm graph --why <pkg> --json` emits an `applied_overrides` array
+/// populated from `.lpm/overrides-state.json`. Per-entry fields:
+/// `package`, `from_version`, `to_version`, `via_parent`.
+#[test]
+fn graph_why_json_output_includes_applied_overrides() {
+    let project = TempProject::empty(
+        r#"{"name":"why-json-trace","version":"0.0.0","dependencies":{"lodash":"^4.17.0"}}"#,
+    );
+    write_simple_lockfile(&project, &[("lodash", "4.17.20", &[])]);
+    write_overrides_state(
+        &project,
+        "sha256-test-fp",
+        &[("lodash", "4.17.20")],
+        &[("lodash", "4.17.21", "4.17.20", Some("debug"))],
+    );
+
+    let out = lpm(&project)
+        .args(["--json", "graph", "--why", "lodash"])
+        .output()
+        .expect("spawn lpm graph --why --json");
+    assert!(
+        out.status.success(),
+        "graph --why --json must succeed; stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let stdout_clean = strip_ansi(&String::from_utf8_lossy(&out.stdout));
+    let parsed: serde_json::Value = serde_json::from_str(&stdout_clean)
+        .unwrap_or_else(|e| panic!("stdout not valid JSON: {e}\nstdout:\n{stdout_clean}"));
+    let arr = parsed["applied_overrides"]
+        .as_array()
+        .expect("applied_overrides must be an array");
+    assert_eq!(arr.len(), 1, "applied_overrides should have one entry; got: {parsed}");
+    assert_eq!(arr[0]["package"].as_str(), Some("lodash"));
+    assert_eq!(arr[0]["from_version"].as_str(), Some("4.17.21"));
+    assert_eq!(arr[0]["to_version"].as_str(), Some("4.17.20"));
+    assert_eq!(arr[0]["via_parent"].as_str(), Some("debug"));
+}
+
+/// Graceful absence: with no `.lpm/overrides-state.json`, JSON output
+/// still succeeds and emits an empty `applied_overrides` array — not
+/// `null`, not absent. Pins the empty-state contract for downstream
+/// consumers that diff the array.
+#[test]
+fn graph_why_json_output_returns_empty_overrides_when_no_state_file() {
+    let project = TempProject::empty(
+        r#"{"name":"why-no-state","version":"0.0.0","dependencies":{"lodash":"^4.17.0"}}"#,
+    );
+    write_simple_lockfile(&project, &[("lodash", "4.17.20", &[])]);
+    // No overrides-state.json on disk.
+
+    let out = lpm(&project)
+        .args(["--json", "graph", "--why", "lodash"])
+        .output()
+        .expect("spawn lpm graph --why --json");
+    assert!(
+        out.status.success(),
+        "graph --why --json must succeed without state file; stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let stdout_clean = strip_ansi(&String::from_utf8_lossy(&out.stdout));
+    let parsed: serde_json::Value = serde_json::from_str(&stdout_clean)
+        .unwrap_or_else(|e| panic!("stdout not valid JSON: {e}\nstdout:\n{stdout_clean}"));
+    let arr = parsed["applied_overrides"]
+        .as_array()
+        .expect("applied_overrides must be present as an empty array, not null/absent");
+    assert!(
+        arr.is_empty(),
+        "applied_overrides should be empty when no state file; got: {parsed}"
+    );
+}
+
+// ─── Phase 65 Step 6.4c — `lpm graph --why <pkg>` patch trace ───────────
+//
+// `lpm graph --why <pkg>` reads `.lpm/patch-state.json` and surfaces the
+// patch provenance: patch-path reference (human + JSON) and the
+// `originalIntegrity` recorded at apply-time. State is the source of
+// truth — these tests stage it directly without driving an install.
+
+type AppliedPatchTuple<'a> = (
+    &'a str,    // name
+    &'a str,    // version
+    &'a str,    // patch_path
+    &'a [&'a str], // locations
+    usize,      // modified
+    usize,      // added
+    usize,      // deleted
+);
+
+/// Write a synthetic `.lpm/patch-state.json` for `lpm graph --why`
+/// decoration. The `parsed` arm encodes the manifest's
+/// `lpm.patchedDependencies` map; the `applied` arm encodes per-package
+/// apply outcomes.
+fn write_patch_state(
+    project: &TempProject,
+    fingerprint: &str,
+    parsed: &[(&str, &str, &str, &str)],
+    applied: &[AppliedPatchTuple<'_>],
+) {
+    let parsed_json: Vec<serde_json::Value> = parsed
+        .iter()
+        .map(|(raw_key, name, version, path)| {
+            serde_json::json!({
+                "raw_key": raw_key,
+                "name": name,
+                "version": version,
+                "path": path,
+                "original_integrity": "sha512-fixture",
+            })
+        })
+        .collect();
+    let applied_json: Vec<serde_json::Value> = applied
+        .iter()
+        .map(|(name, version, patch_path, locations, modified, added, deleted)| {
+            serde_json::json!({
+                "raw_key": format!("{name}@{version}"),
+                "name": name,
+                "version": version,
+                "patch_path": patch_path,
+                "locations": locations.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
+                "files_modified": modified,
+                "files_added": added,
+                "files_deleted": deleted,
+            })
+        })
+        .collect();
+    let state = serde_json::json!({
+        "state_version": 1,
+        "fingerprint": fingerprint,
+        "captured_at": "2026-04-12T00:00:00Z",
+        "parsed": parsed_json,
+        "applied": applied_json,
+    });
+    project.write_file(
+        ".lpm/patch-state.json",
+        &serde_json::to_string_pretty(&state).unwrap(),
+    );
+}
+
+/// Human output of `lpm graph --why <pkg>` shows the "Patches applied
+/// to this package" section with the patch-path reference.
+#[test]
+fn graph_why_human_output_shows_patch_trace() {
+    let project = TempProject::empty(
+        r#"{"name":"why-patch-human","version":"0.0.0","dependencies":{"lodash":"^4.17.0"}}"#,
+    );
+    write_simple_lockfile(&project, &[("lodash", "4.17.21", &[])]);
+    write_patch_state(
+        &project,
+        "sha256-test-fp",
+        &[("lodash@4.17.21", "lodash", "4.17.21", "patches/lodash@4.17.21.patch")],
+        &[(
+            "lodash",
+            "4.17.21",
+            "patches/lodash@4.17.21.patch",
+            &[".lpm/wrappers/lodash@4.17.21/node_modules/lodash"],
+            2,
+            0,
+            0,
+        )],
+    );
+
+    let out = lpm(&project)
+        .args(["graph", "--why", "lodash"])
+        .output()
+        .expect("spawn lpm graph --why");
+    assert!(
+        out.status.success(),
+        "graph --why must succeed; stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let stdout_clean = strip_ansi(&String::from_utf8_lossy(&out.stdout));
+    assert!(
+        stdout_clean.contains("Patches applied to this package"),
+        "human output must include patches section; got:\n{stdout_clean}"
+    );
+    assert!(
+        stdout_clean.contains("patches/lodash@4.17.21.patch"),
+        "human output must reference the patch path; got:\n{stdout_clean}"
+    );
+}
+
+/// `--json` output's `applied_patches[]` is populated from
+/// `.lpm/patch-state.json` with `name`, `patch_path`, `files_modified`.
+#[test]
+fn graph_why_json_output_includes_applied_patches() {
+    let project = TempProject::empty(
+        r#"{"name":"why-patch-json","version":"0.0.0","dependencies":{"lodash":"^4.17.0"}}"#,
+    );
+    write_simple_lockfile(&project, &[("lodash", "4.17.21", &[])]);
+    write_patch_state(
+        &project,
+        "sha256-test-fp",
+        &[("lodash@4.17.21", "lodash", "4.17.21", "patches/lodash@4.17.21.patch")],
+        &[(
+            "lodash",
+            "4.17.21",
+            "patches/lodash@4.17.21.patch",
+            &[".lpm/wrappers/lodash@4.17.21/node_modules/lodash"],
+            2,
+            0,
+            0,
+        )],
+    );
+
+    let out = lpm(&project)
+        .args(["--json", "graph", "--why", "lodash"])
+        .output()
+        .expect("spawn lpm graph --why --json");
+    assert!(
+        out.status.success(),
+        "graph --why --json must succeed; stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let parsed: serde_json::Value = serde_json::from_str(&strip_ansi(&String::from_utf8_lossy(&out.stdout)))
+        .unwrap_or_else(|e| panic!("stdout not valid JSON: {e}"));
+    let arr = parsed["applied_patches"].as_array().unwrap();
+    assert_eq!(arr.len(), 1);
+    assert_eq!(arr[0]["name"].as_str(), Some("lodash"));
+    assert_eq!(
+        arr[0]["patch_path"].as_str(),
+        Some("patches/lodash@4.17.21.patch")
+    );
+    assert_eq!(arr[0]["files_modified"].as_u64(), Some(2));
+}
+
+/// No `.lpm/patch-state.json` → `applied_patches` is an empty array
+/// (not null/absent). Pin the empty-state contract for downstream
+/// consumers that diff the array.
+#[test]
+fn graph_why_json_output_returns_empty_applied_patches_when_no_state_file() {
+    let project = TempProject::empty(
+        r#"{"name":"why-patch-no-state","version":"0.0.0","dependencies":{"lodash":"^4.17.0"}}"#,
+    );
+    write_simple_lockfile(&project, &[("lodash", "4.17.21", &[])]);
+    // No patch-state.json on disk.
+
+    let out = lpm(&project)
+        .args(["--json", "graph", "--why", "lodash"])
+        .output()
+        .expect("spawn lpm graph --why --json");
+    assert!(
+        out.status.success(),
+        "graph --why --json must succeed without state; stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let parsed: serde_json::Value = serde_json::from_str(&strip_ansi(&String::from_utf8_lossy(&out.stdout))).unwrap();
+    let arr = parsed["applied_patches"]
+        .as_array()
+        .expect("applied_patches must be an array, not null/absent");
+    assert!(arr.is_empty(), "applied_patches should be empty");
+}
+
+/// Audit fix (2026-04-12, Low): patch provenance must include the
+/// recorded `originalIntegrity` in both human and JSON output. Pre-fix,
+/// human emitted the literal "originalIntegrity recorded" placeholder
+/// and JSON omitted the field.
+#[test]
+fn graph_why_includes_original_integrity_in_human_and_json() {
+    let project = TempProject::empty(
+        r#"{"name":"why-patch-integrity","version":"0.0.0","dependencies":{"lodash":"^4.17.0"}}"#,
+    );
+    write_simple_lockfile(&project, &[("lodash", "4.17.21", &[])]);
+
+    // Recognizable integrity hash to match against.
+    let test_integrity = "sha512-AbCdEfGhIjKlMnOpQrStUvWxYz0123456789aBcDeFgHiJkLmNoPqRsTuVwXyZ";
+
+    // Write the state file directly with `original_integrity` populated
+    // on the applied entry (the helper writes "sha512-fixture" by
+    // default, which doesn't exercise this path).
+    let state = serde_json::json!({
+        "state_version": 1,
+        "fingerprint": "sha256-test",
+        "captured_at": "2026-04-12T00:00:00Z",
+        "parsed": [{
+            "raw_key": "lodash@4.17.21",
+            "name": "lodash",
+            "version": "4.17.21",
+            "path": "patches/lodash@4.17.21.patch",
+            "original_integrity": test_integrity,
+        }],
+        "applied": [{
+            "raw_key": "lodash@4.17.21",
+            "name": "lodash",
+            "version": "4.17.21",
+            "patch_path": "patches/lodash@4.17.21.patch",
+            "original_integrity": test_integrity,
+            "locations": [".lpm/wrappers/lodash@4.17.21/node_modules/lodash"],
+            "files_modified": 1,
+            "files_added": 0,
+            "files_deleted": 0,
+        }],
+    });
+    project.write_file(
+        ".lpm/patch-state.json",
+        &serde_json::to_string_pretty(&state).unwrap(),
+    );
+
+    // Human mode: surfaces the integrity prefix; must NOT emit the
+    // literal "originalIntegrity recorded" placeholder.
+    let out_human = lpm(&project)
+        .args(["graph", "--why", "lodash"])
+        .output()
+        .expect("spawn lpm graph --why");
+    assert!(
+        out_human.status.success(),
+        "graph --why must succeed; stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&out_human.stdout),
+        String::from_utf8_lossy(&out_human.stderr)
+    );
+    let stdout_clean = strip_ansi(&String::from_utf8_lossy(&out_human.stdout));
+    assert!(
+        !stdout_clean.contains("originalIntegrity recorded"),
+        "human output must NOT emit the literal placeholder; got:\n{stdout_clean}"
+    );
+    assert!(
+        stdout_clean.contains("sha512-AbCdEfGh"),
+        "human output must include the integrity prefix; got:\n{stdout_clean}"
+    );
+
+    // JSON mode: full integrity hash present in `applied_patches[0].original_integrity`.
+    let out_json = lpm(&project)
+        .args(["--json", "graph", "--why", "lodash"])
+        .output()
+        .expect("spawn lpm graph --why --json");
+    assert!(out_json.status.success());
+    let parsed: serde_json::Value = serde_json::from_str(&strip_ansi(&String::from_utf8_lossy(&out_json.stdout))).unwrap();
+    let arr = parsed["applied_patches"].as_array().unwrap();
+    assert_eq!(arr.len(), 1);
+    assert_eq!(
+        arr[0]["original_integrity"].as_str(),
+        Some(test_integrity),
+        "JSON output must include the full original_integrity hash"
+    );
+}

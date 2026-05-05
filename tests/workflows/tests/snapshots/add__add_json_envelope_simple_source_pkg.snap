@@ -1,0 +1,29 @@
+---
+source: tests/workflows/tests/add.rs
+assertion_line: 266
+expression: envelope
+---
+{
+  "success": true,
+  "package": {
+    "name": "snap-add-pkg",
+    "version": "1.0.0",
+    "ecosystem": "js"
+  },
+  "files": [
+    {
+      "src": "Snap.tsx",
+      "dest": "Snap.tsx",
+      "action": "create"
+    }
+  ],
+  "install_path": "components",
+  "files_copied": 1,
+  "files_skipped": 0,
+  "dependencies_installed": 0,
+  "external_imports": [],
+  "config": {},
+  "alias": null,
+  "warnings": [],
+  "errors": []
+}

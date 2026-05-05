@@ -1,0 +1,35 @@
+---
+source: tests/workflows/tests/install.rs
+assertion_line: 503
+expression: envelope
+---
+{
+  "success": true,
+  "packages": [
+    {
+      "name": "ms",
+      "version": "2.1.3",
+      "source": "registry+https://lpm.dev",
+      "direct": true
+    }
+  ],
+  "count": 1,
+  "downloaded": 1,
+  "cached": 0,
+  "linked": 1,
+  "symlinked": 2,
+  "used_lockfile": false,
+  "duration_ms": "[DURATION]",
+  "timing": "[TIMING]",
+  "warnings": [],
+  "errors": [],
+  "overrides_count": 0,
+  "overrides_fingerprint": "sha256-e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+  "applied_patches": [],
+  "patches_count": 0,
+  "patches_fingerprint": "sha256-e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+  "blocked_count": 0,
+  "blocked_set_changed": false,
+  "blocked_set_fingerprint": "sha256-e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+  "blocked_packages": []
+}

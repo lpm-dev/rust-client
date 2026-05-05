@@ -211,6 +211,62 @@ async fn lpm_add_with_mixed_registry_deps_installs_and_writes_resolved_specs() {
     );
 }
 
+// ─── Phase 65 Step 5: JSON envelope contract ────────────────────────
+
+/// `lpm add --json` envelope shape locked via insta. Source-package add
+/// with no declared deps so the envelope stays minimal — sub-fields
+/// that vary across platforms (e.g. config-driven extras) are not in
+/// scope for the no-config-no-deps base case.
+#[tokio::test]
+async fn lpm_add_json_envelope_with_simple_source_pkg_matches_snapshot() {
+    let mock = MockRegistry::start().await;
+
+    // Source pkg ships an lpm.config.json declaring zero deps + one file.
+    // The envelope's `dependencies_installed` must be 0 and
+    // `external_imports` must be [] — clean snapshot baseline.
+    let lpm_config = serde_json::json!({
+        "ecosystem": "js",
+        "files": [{ "src": "Snap.tsx" }]
+    });
+    let snap_bytes = b"export const Snap = () => null;\n";
+    let tarball =
+        make_source_pkg_tarball("snap-add-pkg", "1.0.0", lpm_config, &[("Snap.tsx", snap_bytes)]);
+    mock.with_package("snap-add-pkg", "1.0.0", &tarball).await;
+
+    let project =
+        TempProject::empty(r#"{"name":"add-snap","version":"1.0.0","dependencies":{}}"#);
+
+    let out = lpm_with_registry(&project, &mock.url())
+        .args([
+            "add",
+            "snap-add-pkg",
+            "--json",
+            "--yes",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
+        .output()
+        .expect("spawn lpm add --json");
+    assert!(
+        out.status.success(),
+        "lpm add --json failed:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+
+    let envelope: serde_json::Value = serde_json::from_slice(&out.stdout)
+        .unwrap_or_else(|e| panic!("add --json must be valid JSON: {e}"));
+
+    insta::with_settings!({
+        filters => vec![
+            // Mock registry URL (dynamic port) → [REGISTRY]
+            (r"http://127\.0\.0\.1:\d+", "[REGISTRY]"),
+        ],
+    }, {
+        insta::assert_json_snapshot!("add_json_envelope_simple_source_pkg", envelope);
+    });
+}
+
 // ─── Test 2: #9.4 preflight ─────────────────────────────────────────
 
 #[tokio::test]
@@ -390,5 +446,555 @@ async fn lpm_add_rollback_restores_manifest_and_source_files_on_install_failure(
         !project.file_exists("components/Baz.tsx"),
         "source file copied during the failed run must be deleted on \
          rollback (#9.3 contract)"
+    );
+}
+
+// ─── Phase 65 Step 6.3 — security + non-interactive + npm-simple paths ───
+//
+// Three behavior clusters migrated from cli/tests/:
+// 1. Path-traversal containment (`--path ..`, `--path /abs`)
+// 2. Non-interactive `--path` requirement (`--yes`, `--json`, no-TTY)
+// 3. NPM simple-path source delivery (no `lpm.config.json`, bare imports)
+
+use std::io::Write as _;
+
+/// Build an npm tarball with a malicious `lpm.config.json` that asks
+/// `lpm add` to write `src/evil.txt` to the supplied dest. The dest can
+/// be a `..`-prefixed relative path or an absolute path — both must be
+/// rejected by the destination-side containment check.
+fn make_traversal_tarball(name: &str, version: &str, evil_dest: &str) -> Vec<u8> {
+    let mut builder = tar::Builder::new(Vec::new());
+
+    let pkg_json = serde_json::json!({ "name": name, "version": version });
+    let pkg_bytes = serde_json::to_vec_pretty(&pkg_json).unwrap();
+    let mut h = tar::Header::new_gnu();
+    h.set_path("package/package.json").unwrap();
+    h.set_size(pkg_bytes.len() as u64);
+    h.set_mode(0o644);
+    h.set_cksum();
+    builder.append(&h, &pkg_bytes[..]).unwrap();
+
+    let lpm_config = serde_json::json!({
+        "files": [{ "src": "src/evil.txt", "dest": evil_dest }]
+    });
+    let lpm_bytes = serde_json::to_vec_pretty(&lpm_config).unwrap();
+    let mut h = tar::Header::new_gnu();
+    h.set_path("package/lpm.config.json").unwrap();
+    h.set_size(lpm_bytes.len() as u64);
+    h.set_mode(0o644);
+    h.set_cksum();
+    builder.append(&h, &lpm_bytes[..]).unwrap();
+
+    let evil_content = b"benign content but malicious dest\n";
+    let mut h = tar::Header::new_gnu();
+    h.set_path("package/src/evil.txt").unwrap();
+    h.set_size(evil_content.len() as u64);
+    h.set_mode(0o644);
+    h.set_cksum();
+    builder.append(&h, &evil_content[..]).unwrap();
+
+    let tar_bytes = builder.into_inner().unwrap();
+    let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+    encoder.write_all(&tar_bytes).unwrap();
+    encoder.finish().unwrap()
+}
+
+/// Build a minimal npm tarball with NO `lpm.config.json` — forces the
+/// simple path inside `lpm add`.
+fn make_simple_npm_tarball(name: &str, version: &str) -> Vec<u8> {
+    let mut builder = tar::Builder::new(Vec::new());
+
+    let pkg = serde_json::json!({ "name": name, "version": version });
+    let pkg_bytes = serde_json::to_vec_pretty(&pkg).unwrap();
+    let mut h = tar::Header::new_gnu();
+    h.set_path("package/package.json").unwrap();
+    h.set_size(pkg_bytes.len() as u64);
+    h.set_mode(0o644);
+    h.set_cksum();
+    builder.append(&h, &pkg_bytes[..]).unwrap();
+
+    let index_js = b"export const x = 42;\n";
+    let mut h = tar::Header::new_gnu();
+    h.set_path("package/index.js").unwrap();
+    h.set_size(index_js.len() as u64);
+    h.set_mode(0o644);
+    h.set_cksum();
+    builder.append(&h, &index_js[..]).unwrap();
+
+    let tar_bytes = builder.into_inner().unwrap();
+    let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+    encoder.write_all(&tar_bytes).unwrap();
+    encoder.finish().unwrap()
+}
+
+/// Build an npm tarball with bare imports + a relative import for the
+/// external-imports notice tests. No `lpm.config.json` (simple path).
+fn make_npm_tarball_with_bare_imports(name: &str, version: &str) -> Vec<u8> {
+    let mut builder = tar::Builder::new(Vec::new());
+
+    let pkg_json = serde_json::json!({
+        "name": name,
+        "version": version,
+        "main": "index.js",
+        // Tarball declares deps but the simple-path dep gate must NOT
+        // auto-install them.
+        "dependencies": { "react": "^18.0.0" }
+    });
+    let pkg_bytes = serde_json::to_vec_pretty(&pkg_json).unwrap();
+    let mut h = tar::Header::new_gnu();
+    h.set_path("package/package.json").unwrap();
+    h.set_size(pkg_bytes.len() as u64);
+    h.set_mode(0o644);
+    h.set_cksum();
+    builder.append(&h, &pkg_bytes[..]).unwrap();
+
+    let index_js = br#"import { useState } from "react";
+import { Slot } from "@radix-ui/react-slot";
+import { cn } from "./utils";
+export const Foo = () => useState();
+"#;
+    let mut h = tar::Header::new_gnu();
+    h.set_path("package/index.js").unwrap();
+    h.set_size(index_js.len() as u64);
+    h.set_mode(0o644);
+    h.set_cksum();
+    builder.append(&h, &index_js[..]).unwrap();
+
+    let utils_js = b"export const cn = (...s) => s.join(' ');\n";
+    let mut h = tar::Header::new_gnu();
+    h.set_path("package/utils.js").unwrap();
+    h.set_size(utils_js.len() as u64);
+    h.set_mode(0o644);
+    h.set_cksum();
+    builder.append(&h, &utils_js[..]).unwrap();
+
+    let tar_bytes = builder.into_inner().unwrap();
+    let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+    encoder.write_all(&tar_bytes).unwrap();
+    encoder.finish().unwrap()
+}
+
+/// Top-level entries of `path` as a sorted set. Used by path-traversal
+/// tests to detect side-effect directories the failed add might have
+/// left behind.
+fn snapshot_dir_entries(path: &std::path::Path) -> std::collections::BTreeSet<String> {
+    std::fs::read_dir(path)
+        .map(|it| {
+            it.flatten()
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Assert the install output carries the non-interactive `--path`
+/// requirement guard. miette wraps long error lines, so substring
+/// fragments must be checked individually rather than against the
+/// joined string.
+fn assert_add_path_guard_error(out: &std::process::Output, scenario: &str) {
+    assert!(
+        !out.status.success(),
+        "[{scenario}] expected non-zero exit; stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        combined.contains("non-interactive mode") && combined.contains("lpm.config.json"),
+        "[{scenario}] expected guard message; got:\n{combined}"
+    );
+}
+
+// ─── Path-traversal containment ─────────────────────────────────────────
+
+/// Tarball's `lpm.config.json` asks to write a file at `../../escaped/evil.txt`.
+/// The destination-side containment check must reject up-front and leave
+/// no escape directory on disk.
+#[tokio::test]
+async fn add_rejects_relative_dotdot_dest_and_creates_no_external_directory() {
+    let pkg = "phase60-traversal-fixture-rel";
+    let mock = MockRegistry::start().await;
+    let tarball = make_traversal_tarball(pkg, "1.0.0", "../../escaped/evil.txt");
+    mock.with_package(pkg, "1.0.0", &tarball).await;
+
+    let project = TempProject::empty(
+        r#"{"name":"add-traversal-rel","version":"1.0.0","dependencies":{}}"#,
+    );
+    let entries_before = snapshot_dir_entries(project.path());
+
+    let out = lpm_with_registry(&project, &mock.url())
+        .args([
+            "add",
+            pkg,
+            "--yes",
+            "--path",
+            "src/copied",
+            "--no-install-deps",
+            "--no-skills",
+        ])
+        .output()
+        .expect("spawn lpm add");
+    assert!(
+        !out.status.success(),
+        "expected non-zero exit on traversal; stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        combined.contains("'..'") || combined.contains("parent-directory"),
+        "expected lexical `..` reject; got:\n{combined}"
+    );
+
+    // No file at the would-be escape path AND no escape directory.
+    assert!(
+        !project.path().join("escaped").join("evil.txt").exists(),
+        "containment failure: escaped file written"
+    );
+    assert!(
+        !project.path().join("escaped").exists(),
+        "containment failure: escape directory was created as a side-effect"
+    );
+
+    // Top-level entries unchanged modulo the legitimate `src/` from
+    // `--path src/copied`.
+    let entries_after = snapshot_dir_entries(project.path());
+    let unexpected: Vec<_> = entries_after
+        .difference(&entries_before)
+        .filter(|n| n.as_str() != "src")
+        .collect();
+    assert!(
+        unexpected.is_empty(),
+        "unexpected new top-level entries during failed add: {unexpected:?}"
+    );
+}
+
+/// Tarball's `lpm.config.json` asks to write at an absolute path
+/// outside the project. `Path::join(absolute)` returns the absolute
+/// path verbatim — must be rejected before any `mkdir`.
+#[tokio::test]
+async fn add_rejects_absolute_dest_and_creates_no_external_directory() {
+    let pkg = "phase60-traversal-fixture-abs";
+    let elsewhere =
+        std::env::temp_dir().join(format!("lpm-phase65-abs-escape-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&elsewhere);
+    let evil_dest_str = elsewhere.join("evil.txt").to_string_lossy().into_owned();
+
+    let mock = MockRegistry::start().await;
+    let tarball = make_traversal_tarball(pkg, "1.0.0", &evil_dest_str);
+    mock.with_package(pkg, "1.0.0", &tarball).await;
+
+    let project = TempProject::empty(
+        r#"{"name":"add-traversal-abs","version":"1.0.0","dependencies":{}}"#,
+    );
+
+    let out = lpm_with_registry(&project, &mock.url())
+        .args([
+            "add",
+            pkg,
+            "--yes",
+            "--path",
+            "src/copied",
+            "--no-install-deps",
+            "--no-skills",
+        ])
+        .output()
+        .expect("spawn lpm add");
+    assert!(
+        !out.status.success(),
+        "expected non-zero exit on absolute-dest traversal; stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        combined.contains("absolute"),
+        "expected lexical absolute-path reject; got:\n{combined}"
+    );
+
+    // External dir MUST NOT have been created.
+    assert!(
+        !elsewhere.exists(),
+        "containment failure: absolute-dest mkdir leaked outside target — {} created",
+        elsewhere.display()
+    );
+    let _ = std::fs::remove_dir_all(&elsewhere); // paranoia cleanup
+}
+
+// ─── Non-interactive `--path` guard ─────────────────────────────────────
+
+/// `--yes` without `--path` against a no-`lpm.config.json` package must
+/// hard-error. The interactive prompt path can't fire under `--yes`, so
+/// the guard catches the dest ambiguity up-front. Manifest must be
+/// untouched (guard fires before any mutation).
+#[tokio::test]
+async fn add_simple_yes_without_path_errors_and_does_not_mutate_manifest() {
+    let pkg = "phase60-simple-no-path-yes";
+    let mock = MockRegistry::start().await;
+    mock.with_package(pkg, "1.0.0", &make_simple_npm_tarball(pkg, "1.0.0")).await;
+
+    let project = TempProject::empty(
+        r#"{"name":"host","version":"1.0.0","dependencies":{}}"#,
+    );
+
+    let out = lpm_with_registry(&project, &mock.url())
+        .args(["add", pkg, "--yes"])
+        .output()
+        .expect("spawn lpm add");
+    assert_add_path_guard_error(&out, "--yes without --path");
+
+    let manifest: serde_json::Value =
+        serde_json::from_str(&project.read_file("package.json")).unwrap();
+    let dep_count = manifest["dependencies"]
+        .as_object()
+        .map(|o| o.len())
+        .unwrap_or(0);
+    assert_eq!(
+        dep_count, 0,
+        "guard must fire BEFORE any package.json mutation; got {dep_count} deps"
+    );
+}
+
+/// `--json` without `--path` against a no-`lpm.config.json` package
+/// must hard-error too. JSON mode is non-interactive by definition, so
+/// the same guard applies.
+#[tokio::test]
+async fn add_simple_json_without_path_errors_and_does_not_mutate_manifest() {
+    let pkg = "phase60-simple-no-path-json";
+    let mock = MockRegistry::start().await;
+    mock.with_package(pkg, "1.0.0", &make_simple_npm_tarball(pkg, "1.0.0")).await;
+
+    let project = TempProject::empty(
+        r#"{"name":"host","version":"1.0.0","dependencies":{}}"#,
+    );
+
+    let out = lpm_with_registry(&project, &mock.url())
+        .args(["add", pkg, "--json"])
+        .output()
+        .expect("spawn lpm add");
+    assert_add_path_guard_error(&out, "--json without --path");
+
+    let manifest: serde_json::Value =
+        serde_json::from_str(&project.read_file("package.json")).unwrap();
+    let dep_count = manifest["dependencies"]
+        .as_object()
+        .map(|o| o.len())
+        .unwrap_or(0);
+    assert_eq!(dep_count, 0);
+}
+
+/// Bare invocation with closed stdin (non-TTY) without `--path` must
+/// fail the same guard. Closes stdin via `Stdio::null()` so
+/// `is_terminal()` returns false even when the runner inherits a TTY.
+#[tokio::test]
+async fn add_simple_no_tty_without_path_errors_and_does_not_mutate_manifest() {
+    let pkg = "phase60-simple-no-path-notty";
+    let mock = MockRegistry::start().await;
+    mock.with_package(pkg, "1.0.0", &make_simple_npm_tarball(pkg, "1.0.0")).await;
+
+    let project = TempProject::empty(
+        r#"{"name":"host","version":"1.0.0","dependencies":{}}"#,
+    );
+
+    let mut cmd = lpm_with_registry(&project, &mock.url());
+    cmd.args(["add", pkg]);
+    // Force non-TTY stdin so `is_terminal()` returns false in the child.
+    let out = cmd
+        .output()
+        .expect("spawn lpm add");
+    assert_add_path_guard_error(&out, "non-TTY without --path");
+
+    let manifest: serde_json::Value =
+        serde_json::from_str(&project.read_file("package.json")).unwrap();
+    let dep_count = manifest["dependencies"]
+        .as_object()
+        .map(|o| o.len())
+        .unwrap_or(0);
+    assert_eq!(dep_count, 0);
+}
+
+/// Sanity check: `--yes --path` does NOT trip the guard. Source files
+/// land directly under the supplied path, with no auto-nest under a
+/// package-name subdirectory (Phase 60 simple-path contract).
+#[tokio::test]
+async fn add_simple_yes_with_path_succeeds_and_copies_files_directly() {
+    let pkg = "phase60-simple-with-path";
+    let mock = MockRegistry::start().await;
+    mock.with_package(pkg, "1.0.0", &make_simple_npm_tarball(pkg, "1.0.0")).await;
+
+    let project = TempProject::empty(
+        r#"{"name":"host","version":"1.0.0","dependencies":{}}"#,
+    );
+
+    lpm_with_registry(&project, &mock.url())
+        .args([
+            "add",
+            pkg,
+            "--yes",
+            "--path",
+            "src/copied",
+            "--no-install-deps",
+            "--no-skills",
+        ])
+        .assert()
+        .success();
+
+    assert!(
+        project.file_exists("src/copied/index.js"),
+        "expected src/copied/index.js"
+    );
+    assert!(
+        !project.path().join("src/copied").join(pkg).exists(),
+        "simple path must NOT auto-nest under package-name subdirectory"
+    );
+}
+
+// ─── NPM simple-path source delivery (full pipeline) ────────────────────
+
+/// Full simple-path pipeline against an npm package with bare imports:
+/// files copied verbatim, bare-imports notice surfaces, manifest
+/// untouched, no `.lpm/skills/` for non-`@lpm.dev/*` packages.
+#[tokio::test]
+async fn add_simple_npm_pkg_copies_files_and_surfaces_bare_imports() {
+    let pkg = "phase60-npm-simple-e2e";
+    let mock = MockRegistry::start().await;
+    mock.with_package(pkg, "1.0.0", &make_npm_tarball_with_bare_imports(pkg, "1.0.0")).await;
+
+    let project = TempProject::empty(
+        r#"{"name":"host","version":"1.0.0","dependencies":{}}"#,
+    );
+
+    let out = lpm_with_registry(&project, &mock.url())
+        .args([
+            "add",
+            pkg,
+            "--yes",
+            "--path",
+            "src/copied",
+            "--no-install-deps",
+            "--no-skills",
+        ])
+        .output()
+        .expect("spawn lpm add");
+    assert!(
+        out.status.success(),
+        "expected success; stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // 1. Files copied directly under target — no auto-nest.
+    assert!(project.file_exists("src/copied/index.js"));
+    assert!(project.file_exists("src/copied/utils.js"));
+    assert!(
+        !project.path().join("src/copied").join(pkg).exists(),
+        "simple path must NOT auto-nest under package-name subdirectory"
+    );
+
+    // 2. Bare-imports notice surfaced on stderr.
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("Source uses external imports")
+            && stderr.contains("react")
+            && stderr.contains("@radix-ui/react-slot"),
+        "expected bare-imports notice listing react + @radix-ui/react-slot; stderr:\n{stderr}"
+    );
+
+    // 3. package.json NOT mutated — simple path doesn't auto-install
+    //    the tarball's `dependencies` (60.1 dep gate).
+    let manifest: serde_json::Value =
+        serde_json::from_str(&project.read_file("package.json")).unwrap();
+    let dep_count = manifest["dependencies"]
+        .as_object()
+        .map(|o| o.len())
+        .unwrap_or(0);
+    assert_eq!(
+        dep_count, 0,
+        "simple path must not auto-install deps; got {dep_count} entries"
+    );
+
+    // 4. No `.lpm/skills/` — non-@lpm.dev packages don't get skills (60.2 scope gate).
+    assert!(
+        !project.path().join(".lpm").join("skills").exists(),
+        "skills directory must not be created for non-@lpm.dev packages"
+    );
+}
+
+/// `--json` envelope on the npm simple path includes `external_imports`
+/// (sorted bare specifiers, relative imports excluded), and
+/// `package.name` is the verbatim npm spec — NOT the @lpm.dev/-prefixed
+/// form (Phase 60.0.a regression check: pre-fix the JSON always used
+/// `name.scoped()`).
+#[tokio::test]
+async fn add_simple_npm_pkg_json_envelope_includes_external_imports_and_npm_name() {
+    let pkg = "phase60-npm-simple-json";
+    let mock = MockRegistry::start().await;
+    mock.with_package(pkg, "1.0.0", &make_npm_tarball_with_bare_imports(pkg, "1.0.0")).await;
+
+    let project = TempProject::empty(
+        r#"{"name":"host","version":"1.0.0","dependencies":{}}"#,
+    );
+
+    let out = lpm_with_registry(&project, &mock.url())
+        .args([
+            "add",
+            pkg,
+            "--json",
+            "--path",
+            "src/copied",
+            "--no-install-deps",
+            "--no-skills",
+        ])
+        .output()
+        .expect("spawn lpm add --json");
+    assert!(
+        out.status.success(),
+        "expected success; stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let parsed: serde_json::Value = serde_json::from_str(&stdout)
+        .unwrap_or_else(|e| panic!("expected valid JSON on stdout: {e}\nstdout:\n{stdout}"));
+
+    assert_eq!(parsed["success"], serde_json::json!(true));
+    assert_eq!(
+        parsed["package"]["name"].as_str(),
+        Some(pkg),
+        "json package.name should be the verbatim npm spec, not @lpm.dev/-prefixed"
+    );
+
+    let externals: Vec<&str> = parsed["external_imports"]
+        .as_array()
+        .expect("external_imports must be an array")
+        .iter()
+        .filter_map(|v| v.as_str())
+        .collect();
+    assert!(
+        externals.contains(&"react"),
+        "expected 'react' in external_imports; got {externals:?}"
+    );
+    assert!(
+        externals.contains(&"@radix-ui/react-slot"),
+        "expected '@radix-ui/react-slot' in external_imports; got {externals:?}"
+    );
+    assert!(
+        !externals.contains(&"./utils"),
+        "relative imports must not appear in external_imports; got {externals:?}"
     );
 }

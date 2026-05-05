@@ -1,0 +1,27 @@
+---
+source: tests/workflows/tests/upgrade.rs
+assertion_line: 257
+expression: envelope
+---
+{
+  "success": true,
+  "dry_run": true,
+  "upgraded": 1,
+  "packages": [
+    {
+      "name": "@lpm.dev/owner.snap-upgrade",
+      "from": "1.0.0",
+      "to": "1.5.0",
+      "new_range": "^1.5.0",
+      "is_dev": false,
+      "semver_class": "minor",
+      "has_install_scripts": false,
+      "peer_impact": {
+        "ok": true,
+        "basis": "current_lockfile"
+      },
+      "patch_invalidation": null
+    }
+  ],
+  "fetch_errors": 0
+}

@@ -1,3 +1,13 @@
+//! **Tier placement: cli-binary** (per CLAUDE.md `# Testing Tier
+//! Discipline`). Justification class: **intentionally minimal
+//! binary-surface repros**. Cross-command contract pin: ensures the
+//! `lpm ci setup gitlab` snippet's `LPM_OIDC_TOKEN` env var name +
+//! `aud=https://lpm.dev` audience match what `lpm setup --oidc`
+//! actually exchanges. Single focused assertion against a raw
+//! wiremock request body. A workflow tier port would inflate this
+//! tight contract pin into harness boilerplate that doesn't add
+//! coverage.
+//!
 //! Locks the contract emitted by `lpm ci setup gitlab` against the resolver
 //! that backs `lpm setup --oidc`.
 //!

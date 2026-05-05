@@ -1431,8 +1431,14 @@ async fn query_osv_batch(packages: &[(String, String)]) -> Result<Vec<OsvVulnera
 
     let body = serde_json::json!({ "queries": queries });
 
+    // Test hook: workflow tests redirect to a mock OSV endpoint via
+    // LPM_OSV_URL. Falls through to the public OSV API when unset, so
+    // production behavior is unchanged.
+    let osv_url = std::env::var("LPM_OSV_URL")
+        .unwrap_or_else(|_| "https://api.osv.dev/v1/querybatch".to_string());
+
     let response = client
-        .post("https://api.osv.dev/v1/querybatch")
+        .post(&osv_url)
         .json(&body)
         .timeout(std::time::Duration::from_secs(10))
         .send()

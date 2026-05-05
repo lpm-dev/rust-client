@@ -605,6 +605,68 @@ impl MockRegistry {
         self
     }
 
+    /// Mount a single-version package whose `time[version]` is the
+    /// caller-supplied ISO-8601 timestamp. Used by the cooldown gate
+    /// (release-age) tests where the publication time must be a fixed
+    /// offset from `now()` rather than the static date `with_package`
+    /// hardcodes.
+    ///
+    /// Mounts: single-package GET metadata + tarball GET. Pair with
+    /// `with_batch_metadata` for resolver-batch coverage.
+    pub async fn with_package_published_at(
+        &self,
+        name: &str,
+        version: &str,
+        tarball_bytes: &[u8],
+        published_at: &str,
+    ) -> &Self {
+        let tarball_url = format!("{}/tarballs/{name}-{version}.tgz", self.server.uri());
+        let integrity = compute_integrity(tarball_bytes);
+
+        let metadata = serde_json::json!({
+            "name": name,
+            "dist-tags": { "latest": version },
+            "versions": {
+                version: {
+                    "name": name,
+                    "version": version,
+                    "dist": {
+                        "tarball": tarball_url,
+                        "integrity": integrity,
+                    },
+                    "dependencies": {}
+                }
+            },
+            "time": { version: published_at }
+        });
+
+        let metadata_path = format!("/api/registry/{name}");
+        Mock::given(method("GET"))
+            .and(path(&metadata_path))
+            .respond_with(ResponseTemplate::new(200).set_body_json(metadata.clone()))
+            .mount(&self.server)
+            .await;
+        let npm_direct_path = format!("/{name}");
+        Mock::given(method("GET"))
+            .and(path(&npm_direct_path))
+            .respond_with(ResponseTemplate::new(200).set_body_json(metadata.clone()))
+            .mount(&self.server)
+            .await;
+
+        let tarball_path = format!("/tarballs/{name}-{version}.tgz");
+        Mock::given(method("GET"))
+            .and(path(&tarball_path))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_bytes(tarball_bytes.to_vec())
+                    .insert_header("content-type", "application/octet-stream"),
+            )
+            .mount(&self.server)
+            .await;
+
+        self
+    }
+
     /// Mount a batch-metadata endpoint that returns metadata for all registered packages.
     ///
     /// The install pipeline calls `POST /api/registry/batch-metadata` with `{"packages": [...], "deep": true}`
@@ -672,6 +734,41 @@ impl MockRegistry {
         self
     }
 
+    /// Mount the OSV `POST /v1/querybatch` endpoint with a fixed response.
+    ///
+    /// Tests redirect `lpm audit`'s OSV calls here by setting
+    /// `LPM_OSV_URL = "{mock.url()}/v1/querybatch"`. `vulns_per_query`
+    /// is a list with one entry per query slot — pass an empty Vec for
+    /// "no vulns for this package" or one or more `OsvVulnerability`-shaped
+    /// JSON values for "this package matched these vulns."
+    pub async fn with_osv_querybatch(&self, vulns_per_query: Vec<Vec<serde_json::Value>>) -> &Self {
+        let results: Vec<serde_json::Value> = vulns_per_query
+            .into_iter()
+            .map(|vulns| serde_json::json!({ "vulns": vulns }))
+            .collect();
+
+        Mock::given(method("POST"))
+            .and(path("/v1/querybatch"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "results": results,
+                })),
+            )
+            .mount(&self.server)
+            .await;
+        self
+    }
+
+    /// Build an OSV vulnerability JSON object with the shape `lpm audit`
+    /// expects: `id`, `summary`, `severity = [{ type: "CVSS_V3", score: ... }]`.
+    pub fn osv_vuln(id: &str, summary: &str, cvss_score: &str) -> serde_json::Value {
+        serde_json::json!({
+            "id": id,
+            "summary": summary,
+            "severity": [{ "type": "CVSS_V3", "score": cvss_score }],
+        })
+    }
+
     /// Access the underlying `MockServer` for custom mock setups.
     pub fn server(&self) -> &MockServer {
         &self.server
@@ -679,7 +776,7 @@ impl MockRegistry {
 }
 
 /// Compute sha512 SRI integrity hash for tarball bytes.
-fn compute_integrity(data: &[u8]) -> String {
+pub fn compute_integrity(data: &[u8]) -> String {
     // Simple SHA-512: read all bytes, hash, base64-encode
     let digest = {
         // Use a basic sha2 approach — we have it as a transitive dep
