@@ -92,6 +92,37 @@ jobs:
       - name: Install nextest
         uses: taiki-e/install-action@nextest
 
+      # The verdaccio workflow test harness spawns one Verdaccio instance
+      # per test via `npx --yes verdaccio@<VERSION>` (see
+      # `tests/workflows/tests/support/verdaccio.rs`). On a cold ~/.npm
+      # cache the install eats ~20+ seconds — longer than the harness's
+      # 20s readiness deadline — so the first batch of parallel install
+      # tests fails reliably under nextest. Caching ~/.npm + pre-warming
+      # the Verdaccio install once removes the race entirely and keeps
+      # the tight readiness deadline meaningful for genuinely-broken
+      # Verdaccio.
+      #
+      # Cache key includes a hash of verdaccio.rs so a version bump in
+      # the harness invalidates cleanly; the restore-keys fallback lets
+      # npm fetch only the diff against the last cached snapshot.
+      - name: Cache npm (Verdaccio test harness)
+        uses: actions/cache@v4
+        with:
+          path: ~/.npm
+          key: ${{ runner.os }}-npm-verdaccio-${{ hashFiles('tests/workflows/tests/support/verdaccio.rs') }}
+          restore-keys: ${{ runner.os }}-npm-verdaccio-
+
+      - name: Pre-warm Verdaccio in npm cache
+        run: |
+          set -e
+          VERDACCIO_VERSION=$(grep -oE 'VERDACCIO_VERSION: &str = "[^"]+"' tests/workflows/tests/support/verdaccio.rs | sed -E 's/.*"([^"]+)".*/\1/')
+          if [ -z "$VERDACCIO_VERSION" ]; then
+            echo "::error::Could not extract VERDACCIO_VERSION from verdaccio.rs"
+            exit 1
+          fi
+          echo "Pre-warming npm cache for verdaccio@$VERDACCIO_VERSION"
+          npx --yes "verdaccio@$VERDACCIO_VERSION" --version
+
       - name: Build
         run: cargo build --workspace
 
