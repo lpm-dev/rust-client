@@ -6,7 +6,7 @@
 mod support;
 
 use support::assertions;
-use support::mock_registry::{MockRegistry, make_tarball, make_tarball_from_pkg_json};
+use support::mock_registry::{MockRegistry, compute_integrity, make_tarball, make_tarball_from_pkg_json};
 use support::{TempProject, lpm, lpm_with_registry};
 
 // ─── No package.json ─────────────────────────────────────────────
@@ -434,6 +434,84 @@ async fn install_single_package_via_mock_registry() {
     // Verify node_modules was populated
     assertions::assert_node_modules_exists(project.path());
     assertions::assert_in_node_modules(project.path(), "ms");
+}
+
+// ─── JSON Envelope Snapshot ──────────────────────────────────────
+
+/// Install one package with `--json` and snapshot the envelope shape.
+///
+/// Locks the structural contract of `lpm install --json` for the
+/// dashboard / CI integrations that consume it: top-level
+/// `success` / `count` / `packages[]` / `up_to_date` etc. plus the
+/// per-package shape under `packages`. Highly-variable fields
+/// (`duration_ms`, the entire `timing` sub-tree, integrity hashes,
+/// resolver-internal counters) are redacted to keep the snapshot
+/// stable across runs and across resolver-internal refactors.
+#[tokio::test]
+async fn install_json_envelope_with_one_package_matches_snapshot() {
+    let mock = MockRegistry::start().await;
+    let tarball = make_tarball("ms", "2.1.3");
+    mock.with_package("ms", "2.1.3", &tarball).await;
+    mock.with_batch_metadata(vec![serde_json::json!({
+        "name": "ms",
+        "dist-tags": { "latest": "2.1.3" },
+        "versions": {
+            "2.1.3": {
+                "name": "ms",
+                "version": "2.1.3",
+                "dist": {
+                    "tarball": format!("{}/tarballs/ms-2.1.3.tgz", mock.url()),
+                    "integrity": "sha512-placeholder",
+                },
+                "dependencies": {}
+            }
+        },
+        "time": { "2.1.3": "2025-01-01T00:00:00.000Z" }
+    })])
+    .await;
+
+    let project = TempProject::empty(
+        r#"{"name":"snap-install","version":"1.0.0","dependencies":{"ms":"^2.1.3"}}"#,
+    );
+
+    let output = lpm_with_registry(&project, &mock.url())
+        .args([
+            "install",
+            "--json",
+            "--no-security-summary",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
+        .output()
+        .expect("failed to run lpm install --json");
+    assert!(output.status.success(), "install --json failed: {output:?}");
+
+    let envelope: serde_json::Value = serde_json::from_slice(&output.stdout).expect(
+        "install --json stdout must be valid JSON; got non-JSON output (mixed with logs?)",
+    );
+
+    insta::with_settings!({
+        filters => vec![
+            // Mock registry URL (dynamic port) → [REGISTRY]
+            (r"http://127\.0\.0\.1:\d+", "[REGISTRY]"),
+            // Temp HOME / project / store paths → [TEMP]
+            (r#"/var/folders/[^"\s]+"#, "[TEMP]"),
+            (r#"/private/var/folders/[^"\s]+"#, "[TEMP]"),
+            (r#"/tmp/[^"\s]+"#, "[TEMP]"),
+        ],
+    }, {
+        insta::assert_json_snapshot!("install_json_envelope_one_package", envelope, {
+            // High-variance numeric / hash fields — locking values would
+            // make the snapshot a flake magnet.
+            ".duration_ms" => "[DURATION]",
+            ".timing" => "[TIMING]",
+            ".packages[].integrity" => "[INTEGRITY]",
+            ".packages[].duration_ms" => "[DURATION]",
+            // Resolver-arm telemetry counters vary by route mode + arm.
+            ".resolver" => "[RESOLVER]",
+            ".cache" => "[CACHE]",
+        });
+    });
 }
 
 // ─── Lockfile Content Snapshot ───────────────────────────────────
@@ -1923,4 +2001,1598 @@ async fn install_lockfile_is_deterministic_across_fresh_installs() {
         normalize(lock_b),
         "lpm.lock content differed between two independent fresh installs of the same package.json"
     );
+}
+
+// ─── Phase 65 Step 3 — install hardening (workspace, peer, optional, integrity) ───
+
+/// A workspace member referenced via `workspace:*` from the root manifest
+/// must be planted as a symlink at `node_modules/<member>` resolving back
+/// to `packages/<member>`. No registry interaction — workspace deps are
+/// fully local.
+#[test]
+fn install_workspace_star_dep_plants_root_symlink_to_member() {
+    let project = TempProject::empty(
+        r#"{
+  "name": "ws-star-root",
+  "version": "1.0.0",
+  "private": true,
+  "workspaces": ["packages/*"],
+  "dependencies": {
+    "ws-member-a": "workspace:*"
+  }
+}"#,
+    );
+
+    let member_dir = project.path().join("packages").join("ws-member-a");
+    project.write_file(
+        "packages/ws-member-a/package.json",
+        r#"{"name":"ws-member-a","version":"1.2.3"}"#,
+    );
+
+    lpm(&project)
+        .args([
+            "install",
+            "--no-security-summary",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
+        .assert()
+        .success();
+
+    let link = project.path().join("node_modules").join("ws-member-a");
+    let symlink_meta = std::fs::symlink_metadata(&link)
+        .unwrap_or_else(|e| panic!("node_modules/ws-member-a missing after install: {e}"));
+    assert!(
+        symlink_meta.file_type().is_symlink(),
+        "node_modules/ws-member-a must be a symlink (got {:?})",
+        symlink_meta.file_type()
+    );
+
+    let resolved = std::fs::canonicalize(&link).expect("resolve symlink target");
+    let expected = std::fs::canonicalize(&member_dir).expect("resolve member dir");
+    assert_eq!(
+        resolved, expected,
+        "workspace:* symlink must resolve to packages/ws-member-a"
+    );
+}
+
+/// `workspace:^` is a published-time hint — the member is still installed
+/// locally as a symlink. Pins the [Phase 32 Phase 2 audit fix](crates/lpm-cli/src/commands/install.rs#L3209)
+/// that previously rewrote `workspace:^` into a registry range and 404'd
+/// against the upstream proxy.
+#[test]
+fn install_workspace_caret_dep_resolves_to_local_member() {
+    let project = TempProject::empty(
+        r#"{
+  "name": "ws-caret-root",
+  "version": "1.0.0",
+  "private": true,
+  "workspaces": ["packages/*"],
+  "dependencies": {
+    "ws-member-b": "workspace:^"
+  }
+}"#,
+    );
+
+    let member_dir = project.path().join("packages").join("ws-member-b");
+    project.write_file(
+        "packages/ws-member-b/package.json",
+        r#"{"name":"ws-member-b","version":"2.5.0"}"#,
+    );
+
+    lpm(&project)
+        .args([
+            "install",
+            "--no-security-summary",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
+        .assert()
+        .success();
+
+    let link = project.path().join("node_modules").join("ws-member-b");
+    let symlink_meta = std::fs::symlink_metadata(&link)
+        .unwrap_or_else(|e| panic!("node_modules/ws-member-b missing after install: {e}"));
+    assert!(
+        symlink_meta.file_type().is_symlink(),
+        "node_modules/ws-member-b must be a symlink for workspace:^ deps"
+    );
+
+    let resolved = std::fs::canonicalize(&link).expect("resolve symlink target");
+    let expected = std::fs::canonicalize(&member_dir).expect("resolve member dir");
+    assert_eq!(
+        resolved, expected,
+        "workspace:^ symlink must resolve to packages/ws-member-b (not get rewritten to a registry range)"
+    );
+}
+
+/// In hoisted mode (`--linker hoisted`), a transitive dep must land at
+/// `node_modules/<C>` directly — flat npm-v3 layout — not nested under
+/// the package that pulled it in. Default isolated mode is exercised by
+/// every other install test in this file; this one pins the hoisted
+/// surface so a regression in the flatten pass is caught.
+#[tokio::test]
+async fn install_hoisted_mode_places_transitive_dep_at_root() {
+    let mock = MockRegistry::start().await;
+
+    let leaf_tarball = make_tarball("leaf-pkg", "1.0.0");
+    let middle_tarball = make_tarball("middle-pkg", "1.0.0");
+    let parent_tarball = make_tarball("parent-pkg", "1.0.0");
+
+    mock.with_package("leaf-pkg", "1.0.0", &leaf_tarball).await;
+    mock.with_package_and_deps(
+        "middle-pkg",
+        "1.0.0",
+        &middle_tarball,
+        serde_json::json!({ "leaf-pkg": "^1.0.0" }),
+    )
+    .await;
+    mock.with_package_and_deps(
+        "parent-pkg",
+        "1.0.0",
+        &parent_tarball,
+        serde_json::json!({ "middle-pkg": "^1.0.0" }),
+    )
+    .await;
+
+    mock.with_batch_metadata(vec![
+        serde_json::json!({
+            "name": "parent-pkg",
+            "dist-tags": { "latest": "1.0.0" },
+            "versions": {
+                "1.0.0": {
+                    "name": "parent-pkg",
+                    "version": "1.0.0",
+                    "dist": {
+                        "tarball": format!("{}/tarballs/parent-pkg-1.0.0.tgz", mock.url()),
+                        "integrity": compute_integrity(&parent_tarball),
+                    },
+                    "dependencies": { "middle-pkg": "^1.0.0" }
+                }
+            },
+            "time": { "1.0.0": "2025-01-01T00:00:00.000Z" }
+        }),
+        serde_json::json!({
+            "name": "middle-pkg",
+            "dist-tags": { "latest": "1.0.0" },
+            "versions": {
+                "1.0.0": {
+                    "name": "middle-pkg",
+                    "version": "1.0.0",
+                    "dist": {
+                        "tarball": format!("{}/tarballs/middle-pkg-1.0.0.tgz", mock.url()),
+                        "integrity": compute_integrity(&middle_tarball),
+                    },
+                    "dependencies": { "leaf-pkg": "^1.0.0" }
+                }
+            },
+            "time": { "1.0.0": "2025-01-01T00:00:00.000Z" }
+        }),
+        serde_json::json!({
+            "name": "leaf-pkg",
+            "dist-tags": { "latest": "1.0.0" },
+            "versions": {
+                "1.0.0": {
+                    "name": "leaf-pkg",
+                    "version": "1.0.0",
+                    "dist": {
+                        "tarball": format!("{}/tarballs/leaf-pkg-1.0.0.tgz", mock.url()),
+                        "integrity": compute_integrity(&leaf_tarball),
+                    },
+                    "dependencies": {}
+                }
+            },
+            "time": { "1.0.0": "2025-01-01T00:00:00.000Z" }
+        }),
+    ])
+    .await;
+
+    let project = TempProject::empty(
+        r#"{"name":"hoist-test","version":"1.0.0","dependencies":{"parent-pkg":"^1.0.0"}}"#,
+    );
+
+    lpm_with_registry(&project, &mock.url())
+        .args([
+            "install",
+            "--linker",
+            "hoisted",
+            "--no-security-summary",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
+        .assert()
+        .success();
+
+    let nm = project.path().join("node_modules");
+    assert!(
+        nm.join("parent-pkg").join("package.json").exists(),
+        "parent-pkg must land at node_modules/parent-pkg"
+    );
+    assert!(
+        nm.join("middle-pkg").join("package.json").exists(),
+        "middle-pkg must hoist to node_modules/middle-pkg in hoisted mode"
+    );
+    assert!(
+        nm.join("leaf-pkg").join("package.json").exists(),
+        "leaf-pkg (depth-2 transitive) must hoist to node_modules/leaf-pkg in hoisted mode, \
+         not stay nested under parent-pkg/node_modules/middle-pkg/node_modules/"
+    );
+}
+
+/// A package that declares a `peerDependencies` entry must NOT cause LPM
+/// to install the peer automatically. The peer is the consumer's
+/// responsibility — pre-npm-v7 semantics, which LPM follows.
+#[tokio::test]
+async fn install_does_not_auto_install_peer_dependencies() {
+    let mock = MockRegistry::start().await;
+
+    let host_tarball = make_tarball("peer-host", "1.0.0");
+    mock.with_package("peer-host", "1.0.0", &host_tarball).await;
+
+    // Override metadata to inject peerDependencies (with_package_and_deps
+    // only sets `dependencies`).
+    mock.with_batch_metadata(vec![serde_json::json!({
+        "name": "peer-host",
+        "dist-tags": { "latest": "1.0.0" },
+        "versions": {
+            "1.0.0": {
+                "name": "peer-host",
+                "version": "1.0.0",
+                "dist": {
+                    "tarball": format!("{}/tarballs/peer-host-1.0.0.tgz", mock.url()),
+                    "integrity": compute_integrity(&host_tarball),
+                },
+                "dependencies": {},
+                "peerDependencies": { "ghost-peer": "^1.0.0" }
+            }
+        },
+        "time": { "1.0.0": "2025-01-01T00:00:00.000Z" }
+    })])
+    .await;
+
+    let project = TempProject::empty(
+        r#"{"name":"peer-test","version":"1.0.0","dependencies":{"peer-host":"^1.0.0"}}"#,
+    );
+
+    lpm_with_registry(&project, &mock.url())
+        .args([
+            "install",
+            "--no-security-summary",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
+        .assert()
+        .success();
+
+    let nm = project.path().join("node_modules");
+    assert!(
+        nm.join("peer-host").join("package.json").exists(),
+        "peer-host (the host package) must be installed"
+    );
+    assert!(
+        !nm.join("ghost-peer").exists(),
+        "ghost-peer (declared as peerDependency only) must NOT be auto-installed; \
+         peer deps are the consumer's responsibility"
+    );
+}
+
+/// A package whose `optionalDependencies` cannot be satisfied (the optional
+/// is unreachable on the registry) must NOT abort the install. Mandatory
+/// deps and the host package itself must still land.
+#[tokio::test]
+async fn install_optional_dep_failure_does_not_abort_install() {
+    let mock = MockRegistry::start().await;
+
+    let mandatory_tarball = make_tarball("mandatory-pkg", "1.0.0");
+    let host_tarball = make_tarball("opt-host", "1.0.0");
+
+    mock.with_package("mandatory-pkg", "1.0.0", &mandatory_tarball)
+        .await;
+    mock.with_package("opt-host", "1.0.0", &host_tarball).await;
+
+    // opt-host declares an optional dep on a package that is NOT mounted
+    // anywhere on this mock registry. The install must complete with
+    // mandatory-pkg + opt-host present and the optional silently dropped.
+    mock.with_batch_metadata(vec![
+        serde_json::json!({
+            "name": "opt-host",
+            "dist-tags": { "latest": "1.0.0" },
+            "versions": {
+                "1.0.0": {
+                    "name": "opt-host",
+                    "version": "1.0.0",
+                    "dist": {
+                        "tarball": format!("{}/tarballs/opt-host-1.0.0.tgz", mock.url()),
+                        "integrity": compute_integrity(&host_tarball),
+                    },
+                    "dependencies": {},
+                    "optionalDependencies": { "phantom-optional": "^1.0.0" }
+                }
+            },
+            "time": { "1.0.0": "2025-01-01T00:00:00.000Z" }
+        }),
+        serde_json::json!({
+            "name": "mandatory-pkg",
+            "dist-tags": { "latest": "1.0.0" },
+            "versions": {
+                "1.0.0": {
+                    "name": "mandatory-pkg",
+                    "version": "1.0.0",
+                    "dist": {
+                        "tarball": format!("{}/tarballs/mandatory-pkg-1.0.0.tgz", mock.url()),
+                        "integrity": compute_integrity(&mandatory_tarball),
+                    },
+                    "dependencies": {}
+                }
+            },
+            "time": { "1.0.0": "2025-01-01T00:00:00.000Z" }
+        }),
+    ])
+    .await;
+
+    let project = TempProject::empty(
+        r#"{"name":"opt-test","version":"1.0.0","dependencies":{"opt-host":"^1.0.0","mandatory-pkg":"^1.0.0"}}"#,
+    );
+
+    lpm_with_registry(&project, &mock.url())
+        .args([
+            "install",
+            "--no-security-summary",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
+        .assert()
+        .success();
+
+    let nm = project.path().join("node_modules");
+    assert!(
+        nm.join("opt-host").join("package.json").exists(),
+        "opt-host must install even though its optional dep is unreachable"
+    );
+    assert!(
+        nm.join("mandatory-pkg").join("package.json").exists(),
+        "mandatory-pkg must install — the optional failure must not abort the run"
+    );
+    assert!(
+        !nm.join("phantom-optional").exists(),
+        "phantom-optional must not appear; the registry never served it"
+    );
+}
+
+/// End-to-end integrity verification: the SRI claim recorded in the
+/// lockfile, the SRI persisted in the global store's `.integrity` file,
+/// and a fresh recomputation from the original tarball bytes must all
+/// agree byte-for-byte. A regression in any link of that chain — bad
+/// metadata reads, store mis-write, lockfile downgrade — would diverge.
+#[tokio::test]
+async fn install_lockfile_integrity_matches_stored_tarball_sha512() {
+    let mock = MockRegistry::start().await;
+
+    let tarball = make_tarball("integrity-pkg", "1.0.0");
+    let expected_integrity = compute_integrity(&tarball);
+
+    mock.with_package("integrity-pkg", "1.0.0", &tarball).await;
+    mock.with_batch_metadata(vec![serde_json::json!({
+        "name": "integrity-pkg",
+        "dist-tags": { "latest": "1.0.0" },
+        "versions": {
+            "1.0.0": {
+                "name": "integrity-pkg",
+                "version": "1.0.0",
+                "dist": {
+                    "tarball": format!("{}/tarballs/integrity-pkg-1.0.0.tgz", mock.url()),
+                    "integrity": expected_integrity.clone(),
+                },
+                "dependencies": {}
+            }
+        },
+        "time": { "1.0.0": "2025-01-01T00:00:00.000Z" }
+    })])
+    .await;
+
+    let project = TempProject::empty(
+        r#"{"name":"integrity-test","version":"1.0.0","dependencies":{"integrity-pkg":"^1.0.0"}}"#,
+    );
+
+    lpm_with_registry(&project, &mock.url())
+        .args([
+            "install",
+            "--no-security-summary",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
+        .assert()
+        .success();
+
+    // 1. Lockfile claim
+    let lockfile = lpm_lockfile::Lockfile::read_from_file(&project.path().join("lpm.lock"))
+        .expect("read lpm.lock");
+    let pkg = lockfile
+        .packages
+        .iter()
+        .find(|p| p.name == "integrity-pkg" && p.version == "1.0.0")
+        .expect("lockfile must contain integrity-pkg@1.0.0");
+    let lockfile_integrity = pkg
+        .integrity
+        .clone()
+        .expect("lockfile entry for registry dep must carry an integrity field");
+    assert_eq!(
+        lockfile_integrity, expected_integrity,
+        "lockfile integrity must match SHA-512 of the served tarball bytes"
+    );
+
+    // 2. Stored .integrity file
+    let store_integrity_path = project
+        .store_dir()
+        .join("v1")
+        .join("integrity-pkg@1.0.0")
+        .join(".integrity");
+    let stored_integrity = std::fs::read_to_string(&store_integrity_path)
+        .unwrap_or_else(|e| panic!("read {}: {e}", store_integrity_path.display()))
+        .trim()
+        .to_string();
+    assert_eq!(
+        stored_integrity, expected_integrity,
+        "store .integrity file must match the lockfile claim and the tarball hash"
+    );
+}
+
+// ─── Phase 65 Step 6.1a — pre-resolver rejection of transitive non-registry / workspace specs ───
+//
+// File: deps from local sources can carry transitive specs that LPM cannot
+// resolve (tarball URLs, raw `workspace:` references against non-workspace
+// consumers). The install pipeline must reject these BEFORE reaching the
+// resolver — pre-fix the resolver crashed with cryptic `invalid range`
+// errors. These tests pin both the rejection AND the structured-error
+// contract (named dep, raw spec, source dir, workaround hint).
+
+/// A `file:` source whose own manifest depends on a tarball URL must be
+/// rejected at the pre-resolver `recurse_local_source_deps` boundary —
+/// not crash the resolver on an unparseable spec. Stderr must name the
+/// dep, the raw spec, the local source directory, AND a workaround hint.
+#[test]
+fn install_rejects_transitive_tarball_url_from_file_source_before_resolver() {
+    let project = TempProject::empty(
+        r#"{
+  "name": "transitive-tarball-url",
+  "version": "1.0.0",
+  "dependencies": { "foo": "file:./packages/foo" }
+}"#,
+    );
+    project.write_file(
+        "packages/foo/package.json",
+        r#"{
+  "name": "foo",
+  "version": "1.0.0",
+  "dependencies": { "bar": "https://example.com/bar.tgz" }
+}"#,
+    );
+
+    // Use an unreachable registry URL to defend against any path that
+    // might inadvertently try a network call before reaching the
+    // pre-resolver gate.
+    let out = lpm_with_registry(&project, "http://127.0.0.1:1")
+        .args(["install"])
+        .output()
+        .expect("spawn lpm install");
+    assert!(
+        !out.status.success(),
+        "install must reject transitive tarball URL; stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let stderr_compact: String = stderr
+        .chars()
+        .filter(|c| c.is_ascii() && !c.is_whitespace())
+        .collect();
+
+    assert!(
+        stderr.contains("transitive non-registry dep `bar`"),
+        "stderr must categorize the failure and name the offending dep; got:\n{stderr}"
+    );
+    assert!(
+        stderr_compact.contains("https://example.com/bar.tgz"),
+        "stderr must echo the raw offending spec; got:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("tarball URL"),
+        "stderr must categorize the unsupported shape; got:\n{stderr}"
+    );
+    assert!(
+        stderr_compact.contains("hoistthedeptoyourproject'spackage.json"),
+        "stderr must include the workaround hint; got:\n{stderr}"
+    );
+    assert!(
+        !stderr.contains("invalid semver range"),
+        "rejection must happen BEFORE resolver range parsing; got:\n{stderr}"
+    );
+}
+
+/// A non-workspace consumer with a `file:` source whose manifest carries
+/// a `workspace:^1.0.0` transitive must be rejected with a clear
+/// "consumer is not a workspace" message — not crash the resolver with
+/// "invalid range 'workspace:'".
+#[test]
+fn install_rejects_transitive_workspace_spec_in_non_workspace_consumer() {
+    let project = TempProject::empty(
+        r#"{
+  "name": "transitive-workspace-non-ws",
+  "version": "1.0.0",
+  "dependencies": { "foo": "file:./packages/foo" }
+}"#,
+    );
+    project.write_file(
+        "packages/foo/package.json",
+        r#"{
+  "name": "foo",
+  "version": "1.0.0",
+  "dependencies": { "bar": "workspace:^1.0.0" }
+}"#,
+    );
+
+    let out = lpm_with_registry(&project, "http://127.0.0.1:1")
+        .args(["install"])
+        .output()
+        .expect("spawn lpm install");
+    assert!(
+        !out.status.success(),
+        "install must reject `workspace:` transitive in non-workspace project; stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let stderr_compact: String = stderr
+        .chars()
+        .filter(|c| c.is_ascii() && !c.is_whitespace())
+        .collect();
+
+    assert!(
+        stderr.contains("transitive `workspace:` dep `bar`"),
+        "stderr must categorize the failure and name the dep; got:\n{stderr}"
+    );
+    assert!(
+        stderr_compact.contains("workspace:^1.0.0"),
+        "stderr must echo the raw workspace: spec; got:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("not a workspace"),
+        "stderr must explain the consumer isn't a workspace; got:\n{stderr}"
+    );
+    assert!(
+        !stderr.contains("invalid range") && !stderr.contains("invalid version range"),
+        "rejection must happen BEFORE resolver range parsing — pre-fix the \
+         resolver crashed on `invalid range 'workspace:'`. Got:\n{stderr}"
+    );
+}
+
+/// A real workspace whose root depends on a member via `file:`, and
+/// where that member's manifest declares `workspace:*` against a
+/// SIBLING workspace member, must install successfully — the
+/// pre-resolver `workspace:` membership check must consult the FULL
+/// workspace member set, not just the top-level extracted slice.
+#[test]
+fn install_workspace_transitive_resolves_against_full_membership_set() {
+    let project = TempProject::empty(
+        r#"{
+  "name": "ws-transitive-membership",
+  "version": "1.0.0",
+  "private": true,
+  "workspaces": ["packages/*"],
+  "dependencies": { "foo": "file:./packages/foo" }
+}"#,
+    );
+    project.write_file(
+        "packages/foo/package.json",
+        r#"{
+  "name": "foo",
+  "version": "1.0.0",
+  "dependencies": { "bar": "workspace:*" }
+}"#,
+    );
+    project.write_file(
+        "packages/bar/package.json",
+        r#"{ "name": "bar", "version": "1.2.3" }"#,
+    );
+
+    let out = lpm_with_registry(&project, "http://127.0.0.1:1")
+        .args(["install"])
+        .output()
+        .expect("spawn lpm install");
+
+    assert!(
+        out.status.success(),
+        "install of a real workspace with `workspace:*` against a sibling member \
+         must succeed (full-membership-set lookup, not top-level-extracted slice). \
+         status: {:?}\nstdout:\n{}\nstderr:\n{}",
+        out.status,
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !stderr.contains("not a workspace member"),
+        "transitive `workspace:*` against a real workspace member must NOT trip \
+         the 'not a workspace member' branch — that branch fires when the \
+         membership slice is the extracted top-level subset, not the full \
+         ws.members set. stderr:\n{stderr}"
+    );
+    assert!(
+        !stderr.contains("invalid range") && !stderr.contains("invalid version range"),
+        "install must not crash the resolver on `workspace:`. stderr:\n{stderr}"
+    );
+}
+
+// ─── Phase 65 Step 6.1b — workspace member root-symlink discovery paths ───
+//
+// Three discovery paths plant `node_modules/<member>` symlinks: the
+// top-level `workspace:` extractor, the F9 immediate-file-dedupe path,
+// and the BFS walk over linked members' transitive `workspace:` refs.
+// Each test below pins one entry point of that union.
+
+/// Assert `node_modules/<root_name>` is a symlink whose canonical path
+/// equals the canonical path of `expected_target`.
+fn assert_root_symlink_resolves_to(
+    project: &TempProject,
+    root_name: &str,
+    expected_target: &std::path::Path,
+) {
+    let link = project.path().join("node_modules").join(root_name);
+    assert!(
+        link.symlink_metadata().is_ok(),
+        "missing root symlink: node_modules/{root_name} (looked at {link:?})",
+    );
+    let resolved = link
+        .canonicalize()
+        .unwrap_or_else(|e| panic!("failed to canonicalize {link:?}: {e}"));
+    let expected = expected_target
+        .canonicalize()
+        .unwrap_or_else(|e| panic!("failed to canonicalize {expected_target:?}: {e}"));
+    assert_eq!(
+        resolved, expected,
+        "node_modules/{root_name} resolved to {resolved:?}, expected {expected:?}"
+    );
+}
+
+/// F9 immediate-file-dedupe path: a workspace where the root depends on
+/// `foo` via `file:./packages/foo` AND foo is a workspace member must
+/// plant `node_modules/foo` as a symlink — even though `foo` isn't a
+/// `workspace:` reference at the top level. Pre-fix the F9 dedupe
+/// silently dropped the symlink.
+#[test]
+fn install_workspace_file_dedupe_plants_root_symlink_for_member() {
+    let project = TempProject::empty(
+        r#"{
+  "name": "ws-file-dedupe-root",
+  "version": "1.0.0",
+  "private": true,
+  "workspaces": ["packages/*"],
+  "dependencies": { "foo": "file:./packages/foo" }
+}"#,
+    );
+    project.write_file(
+        "packages/foo/package.json",
+        r#"{ "name": "foo", "version": "1.0.0" }"#,
+    );
+    let foo_dir = project.path().join("packages").join("foo");
+
+    let out = lpm_with_registry(&project, "http://127.0.0.1:1")
+        .args(["install"])
+        .output()
+        .expect("spawn lpm install");
+    assert!(
+        out.status.success(),
+        "install must succeed; stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+
+    assert_root_symlink_resolves_to(&project, "foo", &foo_dir);
+
+    // F9 path actually fired — guards against a future fix that plants
+    // the symlink via a different path while leaving F9 silently broken.
+    let combined = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        combined.contains("resolves to workspace member"),
+        "F9 dedupe note expected (proves the F9 path itself plants the symlink):\n{combined}"
+    );
+}
+
+/// BFS over linked members' manifests: root depends on `foo` via
+/// `workspace:*`, and foo's manifest declares `bar: workspace:*` against
+/// a sibling member. Both `foo` AND `bar` must end up root-symlinked —
+/// the BFS continues into linked members rather than stopping at the
+/// top-level extracted set.
+#[test]
+fn install_workspace_transitive_protocol_plants_sibling_root_symlink() {
+    let project = TempProject::empty(
+        r#"{
+  "name": "ws-transitive-root",
+  "version": "1.0.0",
+  "private": true,
+  "workspaces": ["packages/*"],
+  "dependencies": { "foo": "workspace:*" }
+}"#,
+    );
+    project.write_file(
+        "packages/foo/package.json",
+        r#"{
+  "name": "foo",
+  "version": "1.0.0",
+  "dependencies": { "bar": "workspace:*" }
+}"#,
+    );
+    project.write_file(
+        "packages/bar/package.json",
+        r#"{ "name": "bar", "version": "1.2.3" }"#,
+    );
+    let foo_dir = project.path().join("packages").join("foo");
+    let bar_dir = project.path().join("packages").join("bar");
+
+    let out = lpm_with_registry(&project, "http://127.0.0.1:1")
+        .args(["install"])
+        .output()
+        .expect("spawn lpm install");
+    assert!(
+        out.status.success(),
+        "install must succeed; stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+
+    assert_root_symlink_resolves_to(&project, "foo", &foo_dir);
+    assert_root_symlink_resolves_to(&project, "bar", &bar_dir);
+}
+
+/// Three-deep chain combining both discovery paths: root → foo via
+/// `file:` (F9 path) → bar via `workspace:*` (BFS path) → baz via
+/// `workspace:*` (BFS path again). All three must root-symlink. Pre-fix
+/// the deepest link (baz) was lost when the BFS started from the
+/// extracted top-level set rather than from F9-discovered members.
+#[test]
+fn install_workspace_file_dedupe_then_transitive_chain_plants_all_root_symlinks() {
+    let project = TempProject::empty(
+        r#"{
+  "name": "ws-chain-root",
+  "version": "1.0.0",
+  "private": true,
+  "workspaces": ["packages/*"],
+  "dependencies": { "foo": "file:./packages/foo" }
+}"#,
+    );
+    project.write_file(
+        "packages/foo/package.json",
+        r#"{
+  "name": "foo",
+  "version": "1.0.0",
+  "dependencies": { "bar": "workspace:*" }
+}"#,
+    );
+    project.write_file(
+        "packages/bar/package.json",
+        r#"{
+  "name": "bar",
+  "version": "1.0.0",
+  "dependencies": { "baz": "workspace:*" }
+}"#,
+    );
+    project.write_file(
+        "packages/baz/package.json",
+        r#"{ "name": "baz", "version": "1.0.0" }"#,
+    );
+
+    let foo_dir = project.path().join("packages").join("foo");
+    let bar_dir = project.path().join("packages").join("bar");
+    let baz_dir = project.path().join("packages").join("baz");
+
+    let out = lpm_with_registry(&project, "http://127.0.0.1:1")
+        .args(["install"])
+        .output()
+        .expect("spawn lpm install");
+    assert!(
+        out.status.success(),
+        "install must succeed; stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+
+    assert_root_symlink_resolves_to(&project, "foo", &foo_dir);
+    assert_root_symlink_resolves_to(&project, "bar", &bar_dir);
+    assert_root_symlink_resolves_to(&project, "baz", &baz_dir);
+}
+
+// ─── Phase 65 Step 6.1c — install-hash freshness, offline, ghost members ───
+//
+// Six workspace-discovery edge cases plus one offline mixed-registry+file
+// test. Together they pin the install-hash member-manifest sensitivity
+// (round-6 fix), the offline workspace-BFS expansion, the F9 offline
+// pre-pass, the alias-vs-canonical disambiguation, and ghost workspace
+// transitives failing closed both online and offline.
+
+const WORKSPACE_INSTALL_FLAGS: &[&str] = &[
+    "install",
+    "--no-security-summary",
+    "--no-skills",
+    "--no-editor-setup",
+];
+
+fn assert_root_symlink_exists(project: &TempProject, root_name: &str) {
+    let link = project.path().join("node_modules").join(root_name);
+    assert!(
+        link.symlink_metadata().is_ok(),
+        "missing root symlink: node_modules/{root_name} (looked at {link:?})",
+    );
+}
+
+fn assert_root_symlink_missing(project: &TempProject, root_name: &str) {
+    let link = project.path().join("node_modules").join(root_name);
+    assert!(
+        link.symlink_metadata().is_err(),
+        "unexpected root symlink: node_modules/{root_name} (was created at {link:?})",
+    );
+}
+
+/// Install-hash must fold member manifests into its freshness key. A
+/// workspace member's `package.json` edit that introduces a transitive
+/// `workspace:` ref must invalidate the cached hash so the second
+/// install actually re-runs the BFS expansion. Pre-fix the member
+/// manifests were invisible to the install-hash and the second install
+/// hit "up to date (0ms)" — leaving the new sibling root symlink unset.
+#[test]
+fn install_hash_invalidates_on_workspace_member_manifest_change() {
+    let project = TempProject::empty(
+        r#"{
+  "name": "ws-hash-freshness",
+  "private": true,
+  "workspaces": ["packages/*"],
+  "dependencies": { "foo": "workspace:*" }
+}"#,
+    );
+    project.write_file(
+        "packages/foo/package.json",
+        r#"{ "name": "foo", "version": "1.0.0" }"#,
+    );
+    project.write_file(
+        "packages/bar/package.json",
+        r#"{ "name": "bar", "version": "1.0.0" }"#,
+    );
+
+    // First install — only foo gets root-linked (bar isn't yet a
+    // transitive `workspace:` ref of any linked member).
+    let out1 = lpm_with_registry(&project, "http://127.0.0.1:1")
+        .args(WORKSPACE_INSTALL_FLAGS)
+        .output()
+        .expect("spawn lpm install (first)");
+    assert!(
+        out1.status.success(),
+        "first install failed:\n{}",
+        String::from_utf8_lossy(&out1.stderr)
+    );
+    assert_root_symlink_exists(&project, "foo");
+    assert_root_symlink_missing(&project, "bar");
+
+    // Edit foo's manifest to add `bar: workspace:*`.
+    project.write_file(
+        "packages/foo/package.json",
+        r#"{
+  "name": "foo",
+  "version": "1.0.0",
+  "dependencies": { "bar": "workspace:*" }
+}"#,
+    );
+
+    // Second install must NOT take the up-to-date fast-exit; the
+    // member-manifest hash fold causes invalidation and the BFS plants
+    // the new bar symlink.
+    let out2 = lpm_with_registry(&project, "http://127.0.0.1:1")
+        .args(WORKSPACE_INSTALL_FLAGS)
+        .output()
+        .expect("spawn lpm install (second)");
+    assert!(
+        out2.status.success(),
+        "second install failed:\n{}",
+        String::from_utf8_lossy(&out2.stderr)
+    );
+    assert_root_symlink_exists(&project, "foo");
+    assert_root_symlink_exists(&project, "bar");
+}
+
+/// `lpm install --offline` re-runs the workspace-member BFS expansion
+/// rather than skipping it — pre-fix the offline branch handed the
+/// extracted top-level slice straight to `run_link_and_finish` and the
+/// transitively-discovered sibling member symlink was lost.
+#[test]
+fn offline_install_reruns_workspace_member_bfs_expansion() {
+    let project = TempProject::empty(
+        r#"{
+  "name": "ws-offline-bfs",
+  "private": true,
+  "workspaces": ["packages/*"],
+  "dependencies": { "foo": "workspace:*" }
+}"#,
+    );
+    project.write_file(
+        "packages/foo/package.json",
+        r#"{
+  "name": "foo",
+  "version": "1.0.0",
+  "dependencies": { "bar": "workspace:*" }
+}"#,
+    );
+    project.write_file(
+        "packages/bar/package.json",
+        r#"{ "name": "bar", "version": "1.2.3" }"#,
+    );
+
+    // Online install plants both root symlinks (BFS expansion).
+    let out_online = lpm_with_registry(&project, "http://127.0.0.1:1")
+        .args(WORKSPACE_INSTALL_FLAGS)
+        .output()
+        .expect("spawn lpm install (online)");
+    assert!(
+        out_online.status.success(),
+        "online install failed:\n{}",
+        String::from_utf8_lossy(&out_online.stderr)
+    );
+    assert_root_symlink_exists(&project, "foo");
+    assert_root_symlink_exists(&project, "bar");
+
+    // Wipe node_modules; offline install must rebuild both symlinks.
+    std::fs::remove_dir_all(project.path().join("node_modules")).unwrap();
+    let out_offline = lpm_with_registry(&project, "http://127.0.0.1:1")
+        .args(["install", "--offline", "--no-security-summary", "--no-skills", "--no-editor-setup"])
+        .output()
+        .expect("spawn lpm install --offline");
+    assert!(
+        out_offline.status.success(),
+        "offline install failed:\n{}",
+        String::from_utf8_lossy(&out_offline.stderr)
+    );
+    assert_root_symlink_exists(&project, "foo");
+    assert_root_symlink_exists(&project, "bar");
+}
+
+/// `lpm install --offline` must accept a `file:` dep against a workspace
+/// member without bailing on "—offline requires a lockfile". Pre-fix
+/// the F9 dedupe lived in the online-only pre_resolve, so the offline
+/// fast-path saw foo as a missing root dep against the lockfile.
+#[test]
+fn offline_install_handles_f9_deduped_workspace_member() {
+    let project = TempProject::empty(
+        r#"{
+  "name": "ws-offline-f9",
+  "private": true,
+  "workspaces": ["packages/*"],
+  "dependencies": { "foo": "file:./packages/foo" }
+}"#,
+    );
+    project.write_file(
+        "packages/foo/package.json",
+        r#"{ "name": "foo", "version": "1.0.0" }"#,
+    );
+
+    let out_online = lpm_with_registry(&project, "http://127.0.0.1:1")
+        .args(WORKSPACE_INSTALL_FLAGS)
+        .output()
+        .expect("spawn lpm install (online)");
+    assert!(
+        out_online.status.success(),
+        "online install failed:\n{}",
+        String::from_utf8_lossy(&out_online.stderr)
+    );
+    assert_root_symlink_exists(&project, "foo");
+
+    std::fs::remove_dir_all(project.path().join("node_modules")).unwrap();
+    let out_offline = lpm_with_registry(&project, "http://127.0.0.1:1")
+        .args(["install", "--offline", "--no-security-summary", "--no-skills", "--no-editor-setup"])
+        .output()
+        .expect("spawn lpm install --offline");
+    assert!(
+        out_offline.status.success(),
+        "offline install failed (F9 pre-pass should route foo to workspace_member_deps):\n\
+         stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&out_offline.stdout),
+        String::from_utf8_lossy(&out_offline.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&out_offline.stderr);
+    assert!(
+        !stderr.contains("--offline requires a lockfile")
+            && !stderr.contains("could not load the lockfile"),
+        "offline install must not bail with the lockfile error:\n{stderr}"
+    );
+    assert_root_symlink_exists(&project, "foo");
+}
+
+/// Mixed project with one `file:` dep and one registry dep must
+/// install offline after a successful online run — the lockfile
+/// fast-path must accept the `directory+` source entry under
+/// `accept_unsafe_sources = true` rather than bailing on it.
+#[tokio::test]
+async fn offline_install_mixed_registry_and_file_dep_uses_lockfile_fast_path() {
+    let mock = MockRegistry::start().await;
+    let tarball = make_tarball("is-number", "1.0.0");
+    mock.with_package("is-number", "1.0.0", &tarball).await;
+    mock.with_batch_metadata(vec![serde_json::json!({
+        "name": "is-number",
+        "dist-tags": { "latest": "1.0.0" },
+        "versions": {
+            "1.0.0": {
+                "name": "is-number",
+                "version": "1.0.0",
+                "dist": {
+                    "tarball": format!("{}/tarballs/is-number-1.0.0.tgz", mock.url()),
+                    "integrity": compute_integrity(&tarball),
+                },
+                "dependencies": {}
+            }
+        },
+        "time": { "1.0.0": "2025-01-01T00:00:00.000Z" }
+    })])
+    .await;
+
+    let project = TempProject::empty(
+        r#"{
+  "name": "offline-mixed",
+  "dependencies": { "foo": "file:./packages/foo", "is-number": "1.0.0" }
+}"#,
+    );
+    project.write_file(
+        "packages/foo/package.json",
+        r#"{ "name": "foo", "version": "1.0.0" }"#,
+    );
+
+    // Online install populates lockfile + per-project store.
+    lpm_with_registry(&project, &mock.url())
+        .args(WORKSPACE_INSTALL_FLAGS)
+        .assert()
+        .success();
+    assert_root_symlink_exists(&project, "foo");
+    assert_root_symlink_exists(&project, "is-number");
+
+    // Wipe node_modules; offline install must rebuild from lockfile + store.
+    std::fs::remove_dir_all(project.path().join("node_modules")).unwrap();
+    let out_offline = lpm_with_registry(&project, &mock.url())
+        .args(["install", "--offline", "--no-security-summary", "--no-skills", "--no-editor-setup"])
+        .output()
+        .expect("spawn lpm install --offline");
+    assert!(
+        out_offline.status.success(),
+        "offline install failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&out_offline.stdout),
+        String::from_utf8_lossy(&out_offline.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&out_offline.stderr);
+    assert!(
+        !stderr.contains("--offline requires a lockfile"),
+        "offline install must accept the directory+ lockfile entry:\n{stderr}"
+    );
+    assert_root_symlink_exists(&project, "foo");
+    assert_root_symlink_exists(&project, "is-number");
+}
+
+/// Both online and offline arms must plant the canonical AND the alias
+/// root link when they share a target. Pre-fix the shared BFS deduped
+/// only by canonical realpath, so the alias seed suppressed the
+/// canonical `node_modules/foo` link.
+#[test]
+fn install_workspace_alias_and_transitive_target_both_get_root_links() {
+    let project = TempProject::empty(
+        r#"{
+  "name": "ws-alias-transitive",
+  "private": true,
+  "workspaces": ["packages/*"],
+  "dependencies": { "bar": "workspace:*", "aliasfoo": "file:./packages/foo" }
+}"#,
+    );
+    project.write_file(
+        "packages/foo/package.json",
+        r#"{ "name": "foo", "version": "1.0.0" }"#,
+    );
+    project.write_file(
+        "packages/bar/package.json",
+        r#"{
+  "name": "bar",
+  "version": "1.0.0",
+  "dependencies": { "foo": "workspace:*" }
+}"#,
+    );
+
+    // Online: all three root links (canonical foo + alias aliasfoo + bar).
+    let out = lpm_with_registry(&project, "http://127.0.0.1:1")
+        .args(WORKSPACE_INSTALL_FLAGS)
+        .output()
+        .expect("spawn lpm install (online)");
+    assert!(
+        out.status.success(),
+        "install failed:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_root_symlink_exists(&project, "bar");
+    assert_root_symlink_exists(&project, "aliasfoo");
+    assert_root_symlink_exists(&project, "foo");
+
+    // Offline rebuild must produce the same set.
+    std::fs::remove_dir_all(project.path().join("node_modules")).unwrap();
+    let out_offline = lpm_with_registry(&project, "http://127.0.0.1:1")
+        .args(["install", "--offline", "--no-security-summary", "--no-skills", "--no-editor-setup"])
+        .output()
+        .expect("spawn lpm install --offline");
+    assert!(
+        out_offline.status.success(),
+        "offline install failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&out_offline.stdout),
+        String::from_utf8_lossy(&out_offline.stderr)
+    );
+    assert_root_symlink_exists(&project, "bar");
+    assert_root_symlink_exists(&project, "aliasfoo");
+    assert_root_symlink_exists(&project, "foo");
+}
+
+/// A workspace member referencing a non-existent member via
+/// `workspace:*` must error with an actionable diagnostic — not silently
+/// continue. Pins the fail-closed contract for ghost transitives.
+#[test]
+fn install_workspace_ghost_transitive_fails_closed_with_actionable_error() {
+    let project = TempProject::empty(
+        r#"{
+  "name": "ws-ghost-transitive",
+  "private": true,
+  "workspaces": ["packages/*"],
+  "dependencies": { "foo": "workspace:*" }
+}"#,
+    );
+    project.write_file(
+        "packages/foo/package.json",
+        r#"{
+  "name": "foo",
+  "version": "1.0.0",
+  "dependencies": { "ghost": "workspace:*" }
+}"#,
+    );
+
+    let out = lpm_with_registry(&project, "http://127.0.0.1:1")
+        .args(WORKSPACE_INSTALL_FLAGS)
+        .output()
+        .expect("spawn lpm install");
+    assert!(
+        !out.status.success(),
+        "install must fail on ghost workspace transitive; stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("ghost")
+            && stderr.contains("workspace:*")
+            && stderr.contains("not a workspace member")
+            && stderr.contains("Available members:"),
+        "ghost workspace transitive should fail closed with an actionable error:\n{stderr}"
+    );
+}
+
+/// Offline arm must enforce the same ghost-transitive rejection. After
+/// a successful workspace install, editing a member's manifest to
+/// introduce an invalid `workspace:*` ref must fail the next
+/// `--offline` install — not silently link from stale data.
+#[test]
+fn offline_install_workspace_ghost_transitive_after_manifest_edit_fails_closed() {
+    let project = TempProject::empty(
+        r#"{
+  "name": "ws-offline-ghost",
+  "private": true,
+  "workspaces": ["packages/*"],
+  "dependencies": { "foo": "workspace:*" }
+}"#,
+    );
+    project.write_file(
+        "packages/foo/package.json",
+        r#"{ "name": "foo", "version": "1.0.0" }"#,
+    );
+
+    let out_online = lpm_with_registry(&project, "http://127.0.0.1:1")
+        .args(WORKSPACE_INSTALL_FLAGS)
+        .output()
+        .expect("spawn lpm install (online)");
+    assert!(
+        out_online.status.success(),
+        "online install failed:\n{}",
+        String::from_utf8_lossy(&out_online.stderr)
+    );
+
+    // Introduce a ghost transitive via manifest edit, then run offline.
+    project.write_file(
+        "packages/foo/package.json",
+        r#"{
+  "name": "foo",
+  "version": "1.0.0",
+  "dependencies": { "ghost": "workspace:*" }
+}"#,
+    );
+    std::fs::remove_dir_all(project.path().join("node_modules")).unwrap();
+
+    let out_offline = lpm_with_registry(&project, "http://127.0.0.1:1")
+        .args(["install", "--offline", "--no-security-summary", "--no-skills", "--no-editor-setup"])
+        .output()
+        .expect("spawn lpm install --offline");
+    assert!(
+        !out_offline.status.success(),
+        "offline install unexpectedly succeeded with ghost transitive:\n\
+         stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&out_offline.stdout),
+        String::from_utf8_lossy(&out_offline.stderr)
+    );
+
+    let stderr = String::from_utf8_lossy(&out_offline.stderr);
+    assert!(
+        stderr.contains("ghost")
+            && stderr.contains("workspace:*")
+            && stderr.contains("not a workspace member")
+            && stderr.contains("Available members:"),
+        "offline ghost workspace transitive should fail closed with an actionable error:\n{stderr}"
+    );
+}
+
+// ─── Phase 65 Step 6.2a — strict-ssl=false install-start security warning ───
+//
+// `strict-ssl=false` in `.npmrc` is advisory (it does NOT block install)
+// but the warning is a SECURITY signal that must reach CI / agent logs
+// regardless of output mode. Three properties pinned: (1) install
+// completes, (2) stderr carries the loud warning with source citation,
+// (3) the warning fires under `--json` mode too — pre-fix it was
+// silenced for the exact automation users most likely to need it.
+//
+// Subprocess tests because unit tests can't observe fd 1 vs fd 2
+// separation — the contract under test is "warning on stderr, JSON on
+// stdout, neither leaks into the other."
+
+/// Empty-deps install with `.npmrc strict-ssl=false` must succeed AND
+/// emit the loud warning on stderr with `<dir>/.npmrc:1` source citation.
+#[test]
+fn install_strict_ssl_false_emits_loud_warning_with_source_citation() {
+    let project = TempProject::empty(
+        r#"{"name":"strict-ssl-warn","version":"1.0.0","dependencies":{}}"#,
+    );
+    project.write_file(".npmrc", "strict-ssl=false\n");
+    let npmrc_abs = project.path().join(".npmrc");
+
+    let out = lpm_with_registry(&project, "http://127.0.0.1:1")
+        .args(["install"])
+        .output()
+        .expect("spawn lpm install");
+    assert!(
+        out.status.success(),
+        "install with empty deps must succeed even with strict-ssl=false; \
+         stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("DISABLED"),
+        "stderr must contain the DISABLED warning marker; got:\n{stderr}"
+    );
+    let cite = format!("{}:1", npmrc_abs.display());
+    assert!(
+        stderr.contains(&cite),
+        "stderr must cite the contributing source:line ({cite}); got:\n{stderr}"
+    );
+}
+
+/// Same warning + citation must fire under `--json`. JSON goes to
+/// stdout; the warning is on stderr — no conflict. Pre-fix the warning
+/// was wrapped in a `json_output` guard that silenced it for CI/agents.
+#[test]
+fn install_strict_ssl_false_emits_warning_even_in_json_mode() {
+    let project = TempProject::empty(
+        r#"{"name":"strict-ssl-warn-json","version":"1.0.0","dependencies":{}}"#,
+    );
+    project.write_file(".npmrc", "strict-ssl=false\n");
+    let npmrc_abs = project.path().join(".npmrc");
+
+    let out = lpm_with_registry(&project, "http://127.0.0.1:1")
+        .args(["install", "--json"])
+        .output()
+        .expect("spawn lpm install --json");
+    assert!(
+        out.status.success(),
+        "install --json with empty deps must succeed; stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // Stdout: valid JSON envelope, no warning text leaked.
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let parsed: serde_json::Value = serde_json::from_str(stdout.trim())
+        .unwrap_or_else(|e| panic!("stdout must be valid JSON in --json mode: {e}\nstdout:\n{stdout}"));
+    assert_eq!(parsed["success"], serde_json::json!(true));
+
+    // Stderr: warning + source citation.
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("DISABLED"),
+        "stderr must contain DISABLED warning even under --json; got:\n{stderr}"
+    );
+    let cite = format!("{}:1", npmrc_abs.display());
+    assert!(
+        stderr.contains(&cite),
+        "stderr must cite source:line ({cite}) even under --json; got:\n{stderr}"
+    );
+}
+
+/// Negative case: a `.npmrc` without `strict-ssl=false` must NOT emit
+/// the warning. Guards against a future change that fires on `None` /
+/// `Some(true)` by accident.
+#[test]
+fn install_no_strict_ssl_setting_emits_no_warning() {
+    let project = TempProject::empty(
+        r#"{"name":"strict-ssl-clean","version":"1.0.0","dependencies":{}}"#,
+    );
+    project.write_file(".npmrc", "registry=https://example.com/\n");
+
+    let out = lpm_with_registry(&project, "http://127.0.0.1:1")
+        .args(["install"])
+        .output()
+        .expect("spawn lpm install");
+    assert!(
+        out.status.success(),
+        "install must succeed with a bland .npmrc; stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !stderr.contains("TLS certificate verification is DISABLED"),
+        "stderr must NOT contain the strict-ssl warning when the setting isn't \
+         flipped; got:\n{stderr}"
+    );
+}
+
+// ─── Phase 65 Step 6.2b — release-age cooldown gate ─────────────────────
+//
+// Phase 46 P3 ship criteria: the install-time cooldown gate that blocks
+// recently-published packages. Five behaviors pinned: (1) `--min-release-age`
+// CLI override fires, (2) `--allow-new` is an orthogonal bypass, (3)
+// `~/.lpm/config.toml` overrides the 24h default, (4) `package.json > lpm
+// > minimumReleaseAge` overrides the global config, (5) explicit version
+// pins do NOT bypass the cooldown (D7 plan decision — pin-bypass would
+// open the renovate/dependabot supply-chain attack vector).
+
+const RELEASE_AGE_PKG: &str = "@lpm.dev/acme.widget";
+const RELEASE_AGE_VERSION: &str = "1.0.0";
+
+/// ISO-8601 UTC timestamp `n_secs` ago. The cooldown parser accepts
+/// `2025-01-01T00:00:00.000Z`-style strings.
+fn iso8601_n_secs_ago(n_secs: i64) -> String {
+    use chrono::SecondsFormat;
+    let dt = chrono::Utc::now() - chrono::Duration::seconds(n_secs);
+    dt.to_rfc3339_opts(SecondsFormat::Millis, true)
+}
+
+/// Mount `@lpm.dev/acme.widget@1.0.0` with the supplied `published_at`
+/// timestamp. Wires single-package metadata + batch-metadata + tarball.
+async fn mount_release_age_pkg(mock: &MockRegistry, published_at: &str) {
+    let tarball = make_tarball(RELEASE_AGE_PKG, RELEASE_AGE_VERSION);
+    mock.with_package_published_at(
+        RELEASE_AGE_PKG,
+        RELEASE_AGE_VERSION,
+        &tarball,
+        published_at,
+    )
+    .await;
+    mock.with_batch_metadata(vec![serde_json::json!({
+        "name": RELEASE_AGE_PKG,
+        "dist-tags": { "latest": RELEASE_AGE_VERSION },
+        "versions": {
+            RELEASE_AGE_VERSION: {
+                "name": RELEASE_AGE_PKG,
+                "version": RELEASE_AGE_VERSION,
+                "dist": {
+                    "tarball": format!(
+                        "{}/tarballs/{RELEASE_AGE_PKG}-{RELEASE_AGE_VERSION}.tgz",
+                        mock.url()
+                    ),
+                    "integrity": compute_integrity(&tarball),
+                },
+                "dependencies": {}
+            }
+        },
+        "time": { RELEASE_AGE_VERSION: published_at }
+    })])
+    .await;
+}
+
+/// Write the consumer's `package.json` for the release-age tests.
+/// `manifest_min_release_age` injects `lpm.minimumReleaseAge = <secs>`.
+fn write_release_age_manifest(project: &TempProject, manifest_min_release_age: Option<u64>) {
+    let mut manifest = serde_json::json!({
+        "name": "release-age-test",
+        "version": "1.0.0",
+        "dependencies": { RELEASE_AGE_PKG: RELEASE_AGE_VERSION }
+    });
+    if let Some(secs) = manifest_min_release_age {
+        manifest["lpm"] = serde_json::json!({ "minimumReleaseAge": secs });
+    }
+    project.write_file(
+        "package.json",
+        &serde_json::to_string_pretty(&manifest).unwrap(),
+    );
+}
+
+/// Write `<HOME>/.lpm/config.toml` with `minimum-release-age-secs = N`.
+fn write_release_age_global_config(project: &TempProject, secs: u64) {
+    let lpm_dir = project.home().join(".lpm");
+    std::fs::create_dir_all(&lpm_dir).unwrap();
+    std::fs::write(
+        lpm_dir.join("config.toml"),
+        format!("minimum-release-age-secs = {secs}\n"),
+    )
+    .unwrap();
+}
+
+fn assert_cooldown_blocked(out: &std::process::Output) {
+    assert!(
+        !out.status.success(),
+        "install must fail with a cooldown block; stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        combined.contains("blocked by minimumReleaseAge")
+            || combined.contains("published too recently"),
+        "output must name the cooldown block; got:\n{combined}"
+    );
+}
+
+fn assert_cooldown_not_blocked(out: &std::process::Output) {
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        !combined.contains("blocked by minimumReleaseAge")
+            && !combined.contains("published too recently"),
+        "cooldown must not fire but the block message appeared; got:\n{combined}"
+    );
+}
+
+/// `--min-release-age=72h` blocks a 1h-old package. Manifest disables
+/// the default (Some(0) short-circuits), so the CLI override is what
+/// took effect — the `259200` (72h in seconds) value should be
+/// rendered in the diagnostic.
+#[tokio::test]
+async fn install_min_release_age_cli_override_blocks_fresh_package() {
+    let project = TempProject::empty("");
+    write_release_age_manifest(&project, Some(0));
+
+    let mock = MockRegistry::start().await;
+    mount_release_age_pkg(&mock, &iso8601_n_secs_ago(3_600)).await;
+
+    let out = lpm_with_registry(&project, &mock.url())
+        .args(["install", "--min-release-age=72h"])
+        .output()
+        .expect("spawn lpm install");
+
+    assert_cooldown_blocked(&out);
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        combined.contains("259200"),
+        "output must render the effective 72h=259200s window; got:\n{combined}"
+    );
+}
+
+/// `--allow-new` bypasses the cooldown even alongside `--min-release-age`.
+/// They are orthogonal escape hatches per the plan's D16 — `--allow-new`
+/// short-circuits the gate before the resolver runs. We assert only
+/// "cooldown does not fire"; downstream install behavior may still fail
+/// in a hermetic test environment for unrelated reasons.
+#[tokio::test]
+async fn install_allow_new_bypasses_min_release_age_cli_override() {
+    let project = TempProject::empty("");
+    write_release_age_manifest(&project, Some(0));
+
+    let mock = MockRegistry::start().await;
+    mount_release_age_pkg(&mock, &iso8601_n_secs_ago(3_600)).await;
+
+    let out = lpm_with_registry(&project, &mock.url())
+        .args(["install", "--allow-new", "--min-release-age=72h"])
+        .output()
+        .expect("spawn lpm install");
+
+    assert_cooldown_not_blocked(&out);
+}
+
+/// `~/.lpm/config.toml > minimum-release-age-secs` overrides the 24h
+/// default when no CLI flag and no `package.json` key are set. Package
+/// is 30min old; global = 3600s (1h). The default 86400s would also
+/// block, so we assert the global value (3600) is what actually fired.
+#[tokio::test]
+async fn install_global_config_min_release_age_overrides_default() {
+    let project = TempProject::empty("");
+    write_release_age_manifest(&project, None);
+    write_release_age_global_config(&project, 3_600);
+
+    let mock = MockRegistry::start().await;
+    mount_release_age_pkg(&mock, &iso8601_n_secs_ago(1_800)).await;
+
+    let out = lpm_with_registry(&project, &mock.url())
+        .args(["install"])
+        .output()
+        .expect("spawn lpm install");
+
+    assert_cooldown_blocked(&out);
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        combined.contains("3600"),
+        "output must render the global config's 3600s window; got:\n{combined}"
+    );
+    assert!(
+        !combined.contains("86400"),
+        "default 86400s must NOT appear when the global config overrides it; got:\n{combined}"
+    );
+}
+
+/// `package.json > lpm > minimumReleaseAge` overrides the global config.
+/// Package is 30min old; global says 1h (would block); manifest says
+/// 60s (would allow). Manifest layer wins → no cooldown block.
+#[tokio::test]
+async fn install_package_json_min_release_age_overrides_global_config() {
+    let project = TempProject::empty("");
+    write_release_age_manifest(&project, Some(60));
+    write_release_age_global_config(&project, 3_600);
+
+    let mock = MockRegistry::start().await;
+    mount_release_age_pkg(&mock, &iso8601_n_secs_ago(1_800)).await;
+
+    let out = lpm_with_registry(&project, &mock.url())
+        .args(["install"])
+        .output()
+        .expect("spawn lpm install");
+
+    assert_cooldown_not_blocked(&out);
+}
+
+/// Plan D7 regression: an explicit version pin (`pkg@1.0.0`) must NOT
+/// bypass the cooldown. v1 of the plan proposed pin-bypass; v2 rejected
+/// it because renovate/dependabot auto-pin PRs would otherwise land
+/// compromised versions during the detection window. This test guards
+/// that the rejected behavior never re-lands.
+#[tokio::test]
+async fn install_explicit_version_pin_does_not_bypass_cooldown() {
+    let project = TempProject::empty("");
+    write_release_age_manifest(&project, None);
+
+    let mock = MockRegistry::start().await;
+    mount_release_age_pkg(&mock, &iso8601_n_secs_ago(3_600)).await;
+
+    let pinned_spec = format!("{RELEASE_AGE_PKG}@{RELEASE_AGE_VERSION}");
+    let out = lpm_with_registry(&project, &mock.url())
+        .args(["install", &pinned_spec])
+        .output()
+        .expect("spawn lpm install");
+
+    assert_cooldown_blocked(&out);
 }

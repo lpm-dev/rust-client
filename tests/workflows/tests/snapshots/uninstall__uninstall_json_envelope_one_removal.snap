@@ -1,0 +1,15 @@
+---
+source: tests/workflows/tests/uninstall.rs
+assertion_line: 278
+expression: envelope
+---
+{
+  "success": true,
+  "removed": [
+    "snap-pkg"
+  ],
+  "not_found": [],
+  "target_set": [
+    "[MANIFEST]"
+  ]
+}

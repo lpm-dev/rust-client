@@ -1,9 +1,45 @@
 #![allow(dead_code)]
 
-//! Test harness for binary-level workflow tests.
+//! Test harness for the workflow tier — the **default** location for any
+//! new end-to-end test that exercises a CLI command surface.
 //!
 //! Provides `TempProject` (fixture copying + environment isolation) and
-//! `lpm()` (pre-configured `assert_cmd::Command` for the real binary).
+//! `lpm()` (pre-configured `assert_cmd::Command` for the real binary),
+//! plus `MockRegistry` (wiremock-backed) under `mock_registry`.
+//!
+//! # Where new tests go (Phase 65 tier discipline)
+//!
+//! - **Default — workflow tier** (`tests/workflows/tests/<feature>.rs`):
+//!   any test that exercises a multi-step user flow through the CLI.
+//!   Use [`TempProject`] + [`lpm`] + `MockRegistry` from this module.
+//!   Test names must be falsifiable behavior claims — never phase
+//!   numbers, audit round IDs, or ticket codes.
+//!
+//! - **Cli-binary** (`crates/lpm-cli/tests/`): only for cases that
+//!   genuinely cannot live here — TTY/stdin interactive paths,
+//!   global-install state mutation (`~/.lpm/global/`), parser/schema
+//!   corpora, intentionally minimal binary-surface repros. Every
+//!   file in that tier must justify its placement in a header
+//!   docstring. If you're tempted to drop a test there because
+//!   "it's just easier to copy `CommandOutput`," it belongs here
+//!   instead.
+//!
+//! - **Integration** (`tests/integration/tests/`): cross-crate local
+//!   pipelines that don't need a binary or HOME isolation.
+//!
+//! - **Unit** (inline `#[cfg(test)]`): private helpers, pure logic,
+//!   internal invariants. **Not** command-behavior or CLI-contract
+//!   regressions — those go here in the workflow tier.
+//!
+//! # JSON contracts
+//!
+//! Every `--json` command surface gets an `insta::assert_json_snapshot!`
+//! envelope test (with redactions for temp paths, mock URLs, timestamps).
+//! Where the contract is more than shape (stable doctor codes, error
+//! code strings), keep semantic field assertions alongside the snapshot.
+//!
+//! Full rules: see `# Testing Tier Discipline` in the rust-client
+//! `CLAUDE.md` at the workspace root.
 
 pub mod assertions;
 pub mod auth_state;

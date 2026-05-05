@@ -1,3 +1,14 @@
+//! **Tier placement: cli-binary** (per CLAUDE.md `# Testing Tier
+//! Discipline`). Justification class: **intentionally minimal
+//! binary-surface repros**. These are contract pins for the exact
+//! request shape the binary emits to lpm.dev's OIDC exchange route.
+//! The assertions inspect specific JSON fields on the wiremock-recorded
+//! request body (`scope`, `package`, `targets_lpm` gating). The
+//! workflow harness's higher-level abstractions (`MockRegistry::with_*`
+//! helpers) would obscure the byte-level request inspection these
+//! tests need; a focused cli-binary file with raw `wiremock` access
+//! reads cleaner.
+//!
 //! Regression tests for the `lpm publish` OIDC auto-exchange contract:
 //!
 //! 1. **`package` field**: the origin's OIDC exchange route requires `package`

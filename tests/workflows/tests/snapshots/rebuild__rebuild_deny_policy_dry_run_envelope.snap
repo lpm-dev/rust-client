@@ -1,0 +1,18 @@
+---
+source: tests/workflows/tests/rebuild.rs
+assertion_line: 170
+expression: envelope
+---
+{
+  "dry_run": true,
+  "packages": [
+    {
+      "name": "trusted-pkg",
+      "version": "1.0.0",
+      "scripts": {
+        "postinstall": "echo hi"
+      },
+      "trusted": true
+    }
+  ]
+}

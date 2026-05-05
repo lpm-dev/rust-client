@@ -1,3 +1,13 @@
+//! **Tier placement: cli-binary** (per CLAUDE.md `# Testing Tier
+//! Discipline`). Justification class: **parser/schema corpus**. This
+//! file walks up the workspace tree from `CARGO_MANIFEST_DIR` to find
+//! the `a-package-manager/public/schemas/` directory and diffs it
+//! against the binary's current schema output. Cross-repo path
+//! resolution + direct schema-source comparison both anchor on
+//! `lpm-cli`'s manifest dir; the workflow tier's project-isolated
+//! `TempProject` would obscure the cross-repo location instead of
+//! using it.
+//!
 //! Drift guard between the rust-client schema source-of-truth and the
 //! static copies served by `a-package-manager` at
 //! `https://lpm.dev/schemas/<name>.json`.

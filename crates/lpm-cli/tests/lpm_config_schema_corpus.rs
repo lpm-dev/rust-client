@@ -1,3 +1,15 @@
+//! **Tier placement: cli-binary** (per CLAUDE.md `# Testing Tier
+//! Discipline`). Justification class: **parser/schema corpus**. This
+//! file iterates JSON fixtures under `tests/fixtures/lpm_config_corpus/`
+//! and validates each against the hand-authored schema using the
+//! `jsonschema::Validator` directly — no binary spawn, no
+//! `TempProject`. Corpus tests belong in cli-binary tier because (a)
+//! they need direct access to the schema source under
+//! `crates/lpm-cli/`, (b) the fixture-relative paths are anchored on
+//! `CARGO_MANIFEST_DIR` of the lpm-cli crate, and (c) the workflow
+//! harness's subprocess-with-isolated-HOME pattern adds nothing to a
+//! pure-deserialization test.
+//!
 //! Validates the hand-authored `lpm.config.json` schema against a
 //! curated corpus of fixtures.
 //!
