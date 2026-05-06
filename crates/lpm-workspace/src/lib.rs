@@ -204,6 +204,132 @@ const OTHER_PM_ENGINE_KEYS: &[(&str, &str)] = &[
     ("bun", "engines_bun_ignored"),
 ];
 
+/// Static catalog metadata for one manifest-compatibility code.
+///
+/// Pairs with [`ManifestCompatIssue`] (the runtime row): the runtime
+/// row carries the per-package `entries` list and the prose computed
+/// from the diff, while this struct carries the static description /
+/// when-fires / remediation that document the check itself.
+///
+/// `lpm doctor list` (in `lpm-cli`) consumes this catalog through an
+/// adapter so the inventory surface speaks one shape for both
+/// CLI-side codes and workspace-owned codes — without duplicating
+/// the prose.
+#[derive(Debug, Clone, Copy)]
+pub struct ManifestCompatCatalogEntry {
+    /// Stable snake_case identifier. Matches the corresponding
+    /// [`ManifestCompatIssue::code`] emitted at runtime.
+    pub code: &'static str,
+    /// Human-readable label suitable for a check name column.
+    pub name: &'static str,
+    /// One-line description of what this code expresses.
+    pub description: &'static str,
+    /// Conditions under which the issue actually fires.
+    pub when_fires: &'static str,
+    /// Suggested remediation. CLI command, doc pointer, or
+    /// "remove the field". Stable across emissions; detail
+    /// strings on individual rows may evolve.
+    pub remediation: &'static str,
+    /// Severities this code can emit, as the stable strings used
+    /// in `lpm doctor --json` (`pass | warn | fail`). Strings rather
+    /// than an enum so the cross-crate boundary stays free of an
+    /// `lpm-cli` type dependency.
+    pub possible_severities: &'static [&'static str],
+}
+
+// Individual catalog constants — exposed so downstream crates
+// (`lpm-cli`'s doctor catalog) can build typed `CheckEntry` statics
+// that point at this prose without duplicating it. The slice
+// [`MANIFEST_COMPAT_CATALOG`] iterates these in stable order.
+
+/// Catalog entry for `pnpm_overrides_drift`.
+pub const PNPM_OVERRIDES_DRIFT_META: ManifestCompatCatalogEntry = ManifestCompatCatalogEntry {
+    code: "pnpm_overrides_drift",
+    name: "Manifest compat: pnpm.overrides",
+    description: "Entries in `pnpm.overrides` that LPM is not honoring through `lpm.overrides`, top-level `overrides`, or `resolutions`.",
+    when_fires: "Any `pnpm.overrides` entry is missing from the LPM-readable mirrors, has a different target version, or uses a value shape LPM does not support (object form, etc.).",
+    remediation: "Run `lpm migrate` to translate, or mirror the entries verbatim in `lpm.overrides`.",
+    possible_severities: &["warn"],
+};
+
+/// Catalog entry for `pnpm_patches_drift`.
+pub const PNPM_PATCHES_DRIFT_META: ManifestCompatCatalogEntry = ManifestCompatCatalogEntry {
+    code: "pnpm_patches_drift",
+    name: "Manifest compat: pnpm.patchedDependencies",
+    description: "Entries in `pnpm.patchedDependencies` whose patch files LPM cannot bind to via `lpm.patchedDependencies`.",
+    when_fires: "Any `pnpm.patchedDependencies` entry is missing from `lpm.patchedDependencies` or points at a different patch path.",
+    remediation: "Re-author with `lpm patch` or mirror the entries into `lpm.patchedDependencies` after verifying the patch applies cleanly under LPM's stricter integrity binding.",
+    possible_severities: &["warn"],
+};
+
+/// Catalog entry for `pnpm_peer_rules_drift`.
+pub const PNPM_PEER_RULES_DRIFT_META: ManifestCompatCatalogEntry = ManifestCompatCatalogEntry {
+    code: "pnpm_peer_rules_drift",
+    name: "Manifest compat: pnpm.peerDependencyRules",
+    description: "Sub-key entries (`ignoreMissing`, `allowedVersions`, `allowAny`) that LPM is not honoring via `lpm.peerDependencyRules`.",
+    when_fires: "Any `pnpm.peerDependencyRules.*` entry is missing from `lpm.peerDependencyRules.*`. Coverage is checked per sub-key with selector parity.",
+    remediation: "Run `lpm migrate` (the planner translates selector keys 1:1) or mirror the rules under `lpm.peerDependencyRules`.",
+    possible_severities: &["warn"],
+};
+
+/// Catalog entry for `engines_npm_ignored`.
+pub const ENGINES_NPM_IGNORED_META: ManifestCompatCatalogEntry = ManifestCompatCatalogEntry {
+    code: "engines_npm_ignored",
+    name: "Manifest compat: engines.npm",
+    description: "`engines.npm` is declared but LPM is not the npm CLI and does not enforce its constraint.",
+    when_fires: "`engines.npm` is set on the (workspace root) `package.json`.",
+    remediation: "Remove the field, or accept that LPM ignores it. `engines.node` and `engines.lpm` are enforced.",
+    possible_severities: &["warn"],
+};
+
+/// Catalog entry for `engines_pnpm_ignored`.
+pub const ENGINES_PNPM_IGNORED_META: ManifestCompatCatalogEntry = ManifestCompatCatalogEntry {
+    code: "engines_pnpm_ignored",
+    name: "Manifest compat: engines.pnpm",
+    description: "`engines.pnpm` is declared but LPM does not enforce pnpm's version constraint.",
+    when_fires: "`engines.pnpm` is set on the (workspace root) `package.json`.",
+    remediation: "Remove the field, or accept that LPM ignores it. `engines.node` and `engines.lpm` are enforced.",
+    possible_severities: &["warn"],
+};
+
+/// Catalog entry for `engines_yarn_ignored`.
+pub const ENGINES_YARN_IGNORED_META: ManifestCompatCatalogEntry = ManifestCompatCatalogEntry {
+    code: "engines_yarn_ignored",
+    name: "Manifest compat: engines.yarn",
+    description: "`engines.yarn` is declared but LPM does not enforce yarn's version constraint.",
+    when_fires: "`engines.yarn` is set on the (workspace root) `package.json`.",
+    remediation: "Remove the field, or accept that LPM ignores it. `engines.node` and `engines.lpm` are enforced.",
+    possible_severities: &["warn"],
+};
+
+/// Catalog entry for `engines_bun_ignored`.
+pub const ENGINES_BUN_IGNORED_META: ManifestCompatCatalogEntry = ManifestCompatCatalogEntry {
+    code: "engines_bun_ignored",
+    name: "Manifest compat: engines.bun",
+    description: "`engines.bun` is declared but LPM does not enforce bun's version constraint.",
+    when_fires: "`engines.bun` is set on the (workspace root) `package.json`.",
+    remediation: "Remove the field, or accept that LPM ignores it. `engines.node` and `engines.lpm` are enforced.",
+    possible_severities: &["warn"],
+};
+
+/// Static catalog of every code emitted by
+/// [`PackageJson::manifest_compat_issues`]. Exposed for
+/// `lpm doctor list` so the inventory surface and the runtime
+/// detectors can never disagree on which codes exist.
+///
+/// Order mirrors the runtime emission order from
+/// `manifest_compat_issues()` so a side-by-side comparison stays
+/// reviewable.
+pub static MANIFEST_COMPAT_CATALOG: &[ManifestCompatCatalogEntry] = &[
+    PNPM_OVERRIDES_DRIFT_META,
+    PNPM_PATCHES_DRIFT_META,
+    PNPM_PEER_RULES_DRIFT_META,
+    ENGINES_NPM_IGNORED_META,
+    ENGINES_PNPM_IGNORED_META,
+    ENGINES_YARN_IGNORED_META,
+    ENGINES_BUN_IGNORED_META,
+];
+
 impl PackageJson {
     /// Run every manifest-side compatibility detector against this
     /// `PackageJson`. The returned vec is the single source of truth
@@ -1924,6 +2050,83 @@ mod tests {
 
     fn create_package_json(dir: &Path, content: &str) {
         fs::write(dir.join("package.json"), content).unwrap();
+    }
+
+    /// Drift-guard: every code emitted by `manifest_compat_issues()`
+    /// in production must have a matching entry in
+    /// [`MANIFEST_COMPAT_CATALOG`]. Asserted across a fixture that
+    /// exercises every detector. Catches "added a new detector,
+    /// forgot to register it in the catalog" at review time.
+    #[test]
+    fn manifest_compat_catalog_covers_every_emitted_code() {
+        let dir = tempfile::tempdir().unwrap();
+        create_package_json(
+            dir.path(),
+            r#"{
+                "name": "drift-guard",
+                "version": "1.0.0",
+                "engines": {"node": ">=22", "npm": ">=10", "pnpm": ">=9", "yarn": ">=4", "bun": ">=1"},
+                "pnpm": {
+                    "overrides": {"lodash": "^4.17.21"},
+                    "patchedDependencies": {"react@18.0.0": "patches/react.patch"},
+                    "peerDependencyRules": {
+                        "ignoreMissing": ["react"]
+                    }
+                }
+            }"#,
+        );
+        let pkg = read_package_json(&dir.path().join("package.json")).unwrap();
+        let issues = pkg.manifest_compat_issues();
+        assert!(
+            !issues.is_empty(),
+            "fixture must trigger at least one detector"
+        );
+
+        for issue in &issues {
+            let in_catalog = MANIFEST_COMPAT_CATALOG
+                .iter()
+                .any(|entry| entry.code == issue.code);
+            assert!(
+                in_catalog,
+                "manifest-compat code `{}` is emitted but missing from MANIFEST_COMPAT_CATALOG",
+                issue.code
+            );
+        }
+
+        // Also assert every catalog entry has a unique code (catches
+        // duplicated rows with identical codes that would confuse the
+        // doctor list output).
+        let codes: Vec<&str> = MANIFEST_COMPAT_CATALOG.iter().map(|e| e.code).collect();
+        let mut sorted = codes.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(
+            codes.len(),
+            sorted.len(),
+            "MANIFEST_COMPAT_CATALOG has duplicate codes"
+        );
+    }
+
+    #[test]
+    fn manifest_compat_catalog_entries_declare_known_severities() {
+        // Every catalog entry's possible_severities must be drawn from
+        // the {pass, warn, fail} set so cross-crate consumers don't
+        // need to special-case unknown values.
+        for entry in MANIFEST_COMPAT_CATALOG {
+            for sev in entry.possible_severities {
+                assert!(
+                    matches!(*sev, "pass" | "warn" | "fail"),
+                    "catalog entry `{}` declares unknown severity `{}`",
+                    entry.code,
+                    sev
+                );
+            }
+            assert!(
+                !entry.possible_severities.is_empty(),
+                "catalog entry `{}` declares no severities",
+                entry.code
+            );
+        }
     }
 
     #[test]
