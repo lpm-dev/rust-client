@@ -59,16 +59,18 @@ to block them entirely.
 
 **Surface:** `lpm install -g <pkg> --min-release-age=<DUR>` /
 `--allow-new`.
-**Status:** The flag is rejected when combined with `-g`. The
+**Status:** Both flags are rejected when combined with `-g`. The
 24-hour default cooldown still fires via the
 `package.json > lpm > minimumReleaseAge` /
 `~/.lpm/config.toml > minimum-release-age-secs` chain.
 **Source string:** [`main.rs::validate_global_install_project_scoped_flags`](crates/lpm-cli/src/main.rs)
 emits "`--min-release-age` is not supported on `lpm install -g` yet
-— global-scope cooldown overrides aren't wired up."
-**Why deferred:** The `-g` install path doesn't have a per-package
-cooldown override slot in its persisted manifest.
-**Workaround:** Drop the flag; rely on the chain default.
+— global-scope cooldown overrides aren't wired up." and
+"`--allow-new` is not supported on `lpm install -g` yet —
+global-scope cooldown bypass isn't wired up."
+**Why deferred:** The `-g` install path doesn't have a global-scope
+slot for per-invocation cooldown policy overrides or bypasses.
+**Workaround:** Drop either flag and rely on the chain default.
 
 ## Global-scope provenance-drift overrides
 
@@ -111,16 +113,19 @@ based per-package triage — isn't built yet.
 clap doc on `--policy=triage`: "The LLM triage layer is not
 available yet."
 **Why deferred:** Needs a vetted prompt pipeline + cost guardrails
-+ per-package determinism story. None of those are designed.
-**Workaround:** Triage works without the LLM layer — ambers and
-reds simply route to manual review via `lpm approve-scripts`.
 
-## mTLS / per-origin TLS via `.npmrc`
+- per-package determinism story. None of those are designed.
+  **Workaround:** Triage works without the LLM layer — ambers and
+  reds simply route to manual review via `lpm approve-scripts`.
 
-**Surface:** `.npmrc` keys `cafile` / `certfile` / `keyfile`, both
-global and per-origin (`//host/:certfile=...`).
-**Status:** Parsed and warned. Requests use the global TLS config
-regardless of what `.npmrc` declares.
+## mTLS client certs / per-origin TLS via `.npmrc`
+
+**Surface:** global `.npmrc` keys `certfile` / `keyfile`, plus
+per-origin `//host/:cafile=` / `:certfile=` / `:keyfile=`.
+**Status:** Global `cafile=` / `ca=` are already wired and do feed
+the HTTP client's extra root store. The deferred pieces are mTLS
+client certs and per-origin TLS overrides: they parse, warn, and the
+request falls back to the process-wide TLS config.
 **Source string:** [`npmrc.rs`](crates/lpm-registry/src/npmrc.rs)
 emits "per-origin '`certfile`' is not supported yet ..." and "`certfile`
 (mTLS client cert) is not supported yet."
@@ -128,8 +133,10 @@ emits "per-origin '`certfile`' is not supported yet ..." and "`certfile`
 client builder; today reqwest is constructed once at process start.
 mTLS client certs need PKCS#12 / PEM loading + key-passphrase prompt
 support.
-**Workaround:** Configure mTLS at the system / network proxy level,
-or use a registry that doesn't require client certs.
+**Workaround:** Use global `cafile=` / `ca=` when you only need extra
+root CAs. For mTLS or host-specific TLS, configure it at the system /
+network proxy level, or use a registry that doesn't require client
+certs.
 
 ## Workspace deploy: local-package injection
 

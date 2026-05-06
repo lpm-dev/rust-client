@@ -1978,6 +1978,7 @@ fn validate_global_install_project_scoped_flags(
     workspace_root: bool,
     fail_if_no_match: bool,
     yes: bool,
+    allow_new: bool,
     // Phase 46 P3 D13/D19: `--min-release-age` is wired on the shared
     // `lpm install` surface, but per-invocation cooldown override for
     // global installs is explicitly out of P3 scope. Reject rather than
@@ -1999,6 +2000,15 @@ fn validate_global_install_project_scoped_flags(
         return Err(lpm_common::LpmError::Script(
             "`-g` is mutually exclusive with `-D` / `--filter` / `-w` / \
              `--fail-if-no-match` / `-y` (those are project-scoped)."
+                .into(),
+        ));
+    }
+    if allow_new {
+        return Err(lpm_common::LpmError::Script(
+            "`--allow-new` is not supported on `lpm install -g` yet — global-scope \
+             cooldown bypass isn't wired up. Drop the flag for global installs; \
+             the cooldown still follows the package.json / ~/.lpm/config.toml / \
+             24h default chain."
                 .into(),
         ));
     }
@@ -2429,6 +2439,7 @@ async fn async_main() -> Result<()> {
                     workspace_root,
                     fail_if_no_match,
                     yes,
+                    allow_new,
                     min_release_age.as_deref(),
                     &ignore_provenance_drift,
                     ignore_provenance_drift_all,
@@ -2445,7 +2456,6 @@ async fn async_main() -> Result<()> {
                 let _ = (
                     offline,
                     force,
-                    allow_new,
                     linker,
                     no_skills,
                     no_editor_setup,
@@ -2455,8 +2465,8 @@ async fn async_main() -> Result<()> {
                     tilde,
                     save_prefix,
                 ); // M3.2 honors none of these yet; M3.4/M5 will wire selected flags.
-                // `min_release_age`, `ignore_provenance_drift`, and
-                // `ignore_provenance_drift_all` are already rejected by
+                // `allow_new`, `min_release_age`, `ignore_provenance_drift`,
+                // and `ignore_provenance_drift_all` are already rejected by
                 // `validate_global_install_project_scoped_flags` above,
                 // so none of them reach this point as a populated value
                 // — no discard needed.
@@ -4451,6 +4461,7 @@ mod tests {
                     workspace_root,
                     fail_if_no_match,
                     yes,
+                    false,
                     None,
                     &[],
                     false,
@@ -4507,6 +4518,7 @@ mod tests {
                         workspace_root,
                         fail_if_no_match,
                         yes,
+                        false,
                         min_release_age.as_deref(),
                         &[],
                         false,
@@ -4576,6 +4588,7 @@ mod tests {
                     workspace_root,
                     fail_if_no_match,
                     yes,
+                    false,
                     None,
                     &ignore_provenance_drift,
                     ignore_provenance_drift_all,
@@ -4637,6 +4650,7 @@ mod tests {
                     workspace_root,
                     fail_if_no_match,
                     yes,
+                    false,
                     None,
                     &ignore_provenance_drift,
                     ignore_provenance_drift_all,
@@ -4649,6 +4663,59 @@ mod tests {
                             message.contains("--ignore-provenance-drift-all")
                                 || message.contains("--ignore-provenance-drift"),
                             "error must name a drift-override flag, got: {message}",
+                        );
+                        assert!(
+                            message.contains("not supported") && message.contains("global"),
+                            "error must say the flag isn't supported on global installs, \
+                             got: {message}",
+                        );
+                    }
+                    other => panic!("expected Script error, got {other:?}"),
+                }
+            }
+            _ => panic!("expected Install command"),
+        }
+    }
+
+    /// `--allow-new` is a project-install cooldown escape hatch today.
+    /// Global installs currently accept then drop it, which is the
+    /// exact contract gap this regression test pins: the flag must
+    /// hard-error on `-g` instead of silently disappearing.
+    #[test]
+    fn install_global_rejects_allow_new_flag() {
+        let cli = Cli::try_parse_from(["lpm", "install", "-g", "eslint", "--allow-new"]).unwrap();
+        match cli.command.expect("test parse missing subcommand") {
+            Commands::Install {
+                save_dev,
+                filter,
+                workspace_root,
+                fail_if_no_match,
+                yes,
+                allow_new,
+                global,
+                ..
+            } => {
+                assert!(global);
+                assert!(allow_new);
+
+                let err = validate_global_install_project_scoped_flags(
+                    save_dev,
+                    &filter,
+                    workspace_root,
+                    fail_if_no_match,
+                    yes,
+                    allow_new,
+                    None,
+                    &[],
+                    false,
+                )
+                .unwrap_err();
+
+                match err {
+                    lpm_common::LpmError::Script(message) => {
+                        assert!(
+                            message.contains("--allow-new"),
+                            "error must name the flag, got: {message}",
                         );
                         assert!(
                             message.contains("not supported") && message.contains("global"),
