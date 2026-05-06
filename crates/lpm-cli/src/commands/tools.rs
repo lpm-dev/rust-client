@@ -106,13 +106,76 @@ fn build_biome_args(args: &[String], check: bool) -> Vec<String> {
 }
 
 /// Run `lpm check` — delegates to tsc --noEmit from node_modules/.bin.
+///
+/// Argument-aware preflight: when the user passes an explicit project
+/// path (`-p` / `--project`) or a positional input file, we trust the
+/// user knows the layout and skip the missing-tsconfig hint. Without
+/// an explicit target, we surface "no tsconfig.json" / "typescript
+/// not installed" as LPM-formatted errors before tsc would emit a
+/// less actionable message.
 pub async fn check(project_dir: &Path, args: &[String], json_output: bool) -> Result<(), LpmError> {
     if !json_output {
         output::info("check (tsc --noEmit)");
     }
 
+    if !user_targeted_explicit_input(args) {
+        check_preflight(project_dir)?;
+    }
+
     let outcome = run_tsc(project_dir, args, StdioMode::Inherit)?;
     outcome.into_result()
+}
+
+/// True when the user passed `-p` / `--project <path>` or any
+/// positional (non-flag) argument. In those cases the user has named
+/// the input target explicitly and a missing root `tsconfig.json` is
+/// not a problem — preflight should defer to tsc.
+fn user_targeted_explicit_input(args: &[String]) -> bool {
+    let mut iter = args.iter().peekable();
+    while let Some(arg) = iter.next() {
+        if arg == "-p" || arg == "--project" {
+            return iter.peek().is_some();
+        }
+        if arg.starts_with("-p=") || arg.starts_with("--project=") {
+            return true;
+        }
+        if !arg.starts_with('-') {
+            return true;
+        }
+    }
+    false
+}
+
+/// Surface the two common setup gaps with LPM-formatted messages
+/// before spawning tsc:
+///
+/// - `tsconfig.json` missing → suggest `lpm init` or pass `-p`.
+/// - typescript not reachable at all → suggest `lpm install -D typescript`
+///   (or `lpm install` when the dep is declared but not installed).
+///
+/// The post-spawn fallback in `run_tsc` still wraps any race-condition
+/// failure with the same install hint.
+fn check_preflight(project_dir: &Path) -> Result<(), LpmError> {
+    if !project_dir.join("tsconfig.json").is_file() {
+        return Err(LpmError::Script(format!(
+            "no tsconfig.json found in {}. Add one (or pass `-p <path>` to use a different one)",
+            project_dir.display(),
+        )));
+    }
+
+    let status = crate::tsc_status::TscStatus::probe(project_dir);
+    if !status.runnable() {
+        if status.in_deps {
+            return Err(LpmError::Script(
+                "typescript declared in package.json but not installed. Run: lpm install".into(),
+            ));
+        }
+        return Err(LpmError::Script(
+            "typescript not installed. Run: lpm install -D typescript".into(),
+        ));
+    }
+
+    Ok(())
 }
 
 /// Run `lpm test` — auto-detects test runner and delegates.
@@ -1170,6 +1233,56 @@ mod tests {
     #[test]
     fn build_safe_command_no_args() {
         assert_eq!(build_safe_command("jest", "jest", &[]), "jest");
+    }
+
+    // --- check preflight argument parsing ---
+
+    #[test]
+    fn user_targeted_explicit_input_detects_dash_p_with_value() {
+        assert!(user_targeted_explicit_input(&[
+            "-p".into(),
+            "tsconfig.test.json".into()
+        ]));
+    }
+
+    #[test]
+    fn user_targeted_explicit_input_detects_long_project_with_value() {
+        assert!(user_targeted_explicit_input(&[
+            "--project".into(),
+            "tsconfig.test.json".into()
+        ]));
+    }
+
+    #[test]
+    fn user_targeted_explicit_input_detects_eq_form() {
+        assert!(user_targeted_explicit_input(&[
+            "-p=tsconfig.test.json".into()
+        ]));
+        assert!(user_targeted_explicit_input(&[
+            "--project=tsconfig.test.json".into()
+        ]));
+    }
+
+    #[test]
+    fn user_targeted_explicit_input_detects_positional_file() {
+        assert!(user_targeted_explicit_input(&["src/foo.ts".into()]));
+    }
+
+    #[test]
+    fn user_targeted_explicit_input_no_target_for_only_flags() {
+        assert!(!user_targeted_explicit_input(&[]));
+        assert!(!user_targeted_explicit_input(&["--pretty".into()]));
+        assert!(!user_targeted_explicit_input(&[
+            "--noEmit".into(),
+            "--strict".into()
+        ]));
+    }
+
+    #[test]
+    fn user_targeted_explicit_input_dash_p_without_value_is_not_targeted() {
+        // A dangling `-p` with no following arg is malformed; we let
+        // tsc surface its own error rather than asserting our own.
+        assert!(!user_targeted_explicit_input(&["-p".into()]));
     }
 
     // --- watch detection ---

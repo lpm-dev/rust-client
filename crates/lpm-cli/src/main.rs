@@ -39,7 +39,9 @@ mod sigstore;
 mod swift_manifest;
 #[cfg(test)]
 mod test_env;
+mod tool_pin_validation;
 mod trust_snapshot;
+mod tsc_status;
 mod update_check;
 pub mod upgrade_engine;
 pub mod version_diff;
@@ -3355,6 +3357,7 @@ async fn async_main() -> Result<()> {
             args,
         } => {
             let cwd = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;
+            tool_pin_validation::warn_unsupported_tool_pins_once(&cwd);
             if all || affected || !filter.is_empty() {
                 let affected_ref = if affected { Some(base.as_str()) } else { None };
                 commands::tools::tool_workspace(
@@ -3382,6 +3385,7 @@ async fn async_main() -> Result<()> {
             args,
         } => {
             let cwd = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;
+            tool_pin_validation::warn_unsupported_tool_pins_once(&cwd);
             if all || affected || !filter.is_empty() {
                 let affected_ref = if affected { Some(base.as_str()) } else { None };
                 commands::tools::tool_workspace(
@@ -3408,6 +3412,7 @@ async fn async_main() -> Result<()> {
             args,
         } => {
             let cwd = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;
+            tool_pin_validation::warn_unsupported_tool_pins_once(&cwd);
             if all || affected || !filter.is_empty() {
                 let affected_ref = if affected { Some(base.as_str()) } else { None };
                 commands::tools::tool_workspace(
@@ -3434,6 +3439,7 @@ async fn async_main() -> Result<()> {
             args,
         } => {
             let cwd = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;
+            tool_pin_validation::warn_unsupported_tool_pins_once(&cwd);
             commands::tools::dispatch_test_or_bench(
                 &cwd,
                 "test",
@@ -3456,6 +3462,7 @@ async fn async_main() -> Result<()> {
             args,
         } => {
             let cwd = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;
+            tool_pin_validation::warn_unsupported_tool_pins_once(&cwd);
             commands::tools::dispatch_test_or_bench(
                 &cwd,
                 "bench",

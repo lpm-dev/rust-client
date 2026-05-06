@@ -355,10 +355,12 @@ pub async fn run(
         checks.push(fmt_result);
     }
 
-    // 11. TypeScript check (if tsc available)
-    if let Some(ts_result) = run_typecheck(project_dir) {
-        checks.push(ts_result);
-    }
+    // 11. TypeScript readiness — workspace-aware reachability check.
+    //     Cheap local-bin lookup + dep-declaration check, no blocking
+    //     `tsc --noEmit` invocation. The actual type-check belongs to
+    //     `lpm check`; doctor only verifies the project is set up so
+    //     that `lpm check` will work when the user runs it.
+    checks.extend(check_typescript_setup(project_dir));
 
     // === Plugins (Phase 4) ===
 
@@ -818,41 +820,101 @@ fn run_fmt_check(project_dir: &Path) -> Option<Check> {
     }
 }
 
-/// Run tsc --noEmit silently (30s timeout).
-fn run_typecheck(project_dir: &Path) -> Option<Check> {
-    if !project_dir.join("tsconfig.json").exists() {
-        return None;
+/// TypeScript readiness checks — one per tsconfig-owning directory.
+/// Workspace-aware: in a monorepo this emits a check for the root (if
+/// it has a `tsconfig.json`) plus every member with a local
+/// `tsconfig.json`.
+///
+/// Codes:
+///
+/// - `typescript_healthy` (pass) — `tsc` resolves through the local
+///   `node_modules/.bin` chain. Editor (`tsserver` from
+///   `node_modules/typescript`) and CI agree on the version.
+/// - `typescript_missing_for_tsconfig` (warn) — `tsc` runs only via
+///   the system `PATH`. The project lacks a local install, so editor
+///   and CI may use a different version. Fix: `lpm install -D typescript`.
+/// - `typescript_unavailable` (fail) — `tsc` cannot run at all. Fix
+///   depends on whether `typescript` is already declared (run `lpm
+///   install`) or needs to be added (run `lpm install -D typescript`).
+fn check_typescript_setup(project_dir: &Path) -> Vec<Check> {
+    let mut checks = Vec::new();
+
+    let dirs = collect_tsconfig_dirs(project_dir);
+    if dirs.is_empty() {
+        return checks;
     }
 
-    let path = lpm_runner::bin_path::build_path_with_bins(project_dir);
-    let tsc_path = std::path::PathBuf::from("tsc");
+    for dir in dirs {
+        let status = crate::tsc_status::TscStatus::probe(&dir);
+        let label = label_for_tsconfig(project_dir, &dir);
 
-    let (stdout, _stderr, code) =
-        run_tool_with_timeout(&tsc_path, &["--noEmit"], project_dir, Some(&path))?;
-
-    if code == 0 {
-        return Some(Check::pass(
-            "typecheck_clean",
-            "TypeScript",
-            "no type errors",
-        ));
+        if let Some(ref bin) = status.local_bin {
+            checks.push(Check::pass(
+                "typescript_healthy",
+                "TypeScript",
+                &format!("{label}local tsc resolves at {}", bin.display()),
+            ));
+        } else if status.system_bin.is_some() {
+            checks.push(Check::warn(
+                "typescript_missing_for_tsconfig",
+                "TypeScript",
+                &format!(
+                    "{label}using system tsc — editor + CI may diverge. Run: lpm install -D typescript"
+                ),
+            ));
+        } else if status.in_deps {
+            checks.push(Check::fail(
+                "typescript_unavailable",
+                "TypeScript",
+                &format!("{label}declared but not installed — run: lpm install"),
+            ));
+        } else {
+            checks.push(Check::fail(
+                "typescript_unavailable",
+                "TypeScript",
+                &format!("{label}not installed — run: lpm install -D typescript"),
+            ));
+        }
     }
 
-    // Try to count TS errors, fall back to exit code
-    let error_count = stdout.lines().filter(|l| l.contains("error TS")).count();
-    if error_count > 0 {
-        Some(Check::fail(
-            "typecheck_errors",
-            "TypeScript",
-            &format!("{error_count} type error(s) — run: lpm check"),
-        ))
-    } else {
-        Some(Check::fail(
-            "typecheck_other_failure",
-            "TypeScript",
-            &format!("type errors found (exit {code}) — run: lpm check"),
-        ))
+    checks
+}
+
+/// Collect every directory in the workspace that owns a `tsconfig.json`.
+/// Always includes `project_dir` if it has one. In a workspace, also
+/// includes every member directory with a `tsconfig.json` — covers the
+/// monorepo case where `run_typecheck` previously missed every member.
+fn collect_tsconfig_dirs(project_dir: &Path) -> Vec<std::path::PathBuf> {
+    let mut dirs = Vec::new();
+
+    if project_dir.join("tsconfig.json").is_file() {
+        dirs.push(project_dir.to_path_buf());
     }
+
+    if let Ok(Some(workspace)) = lpm_workspace::discover_workspace(project_dir) {
+        for member in &workspace.members {
+            if member.path == project_dir {
+                continue;
+            }
+            if member.path.join("tsconfig.json").is_file() {
+                dirs.push(member.path.clone());
+            }
+        }
+    }
+
+    dirs
+}
+
+/// Format a relative-path prefix for a tsconfig directory. Empty when
+/// `dir` is the project root (the common single-package case).
+fn label_for_tsconfig(project_dir: &Path, dir: &Path) -> String {
+    if dir == project_dir {
+        return String::new();
+    }
+    if let Ok(rel) = dir.strip_prefix(project_dir) {
+        return format!("{}: ", rel.display());
+    }
+    format!("{}: ", dir.display())
 }
 
 /// Check installed plugins for available updates.
