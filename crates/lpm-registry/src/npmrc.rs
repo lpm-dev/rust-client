@@ -1156,11 +1156,11 @@ fn classify_and_apply(
                     // metadata, irrelevant to install routing.
                 }
                 "cafile" | "certfile" | "keyfile" => {
-                    // Per-origin TLS — Phase 58.3 mTLS territory.
+                    // Per-origin TLS / mTLS — not wired up yet.
                     cfg.warnings.push(format!(
-                        "{source_label}:{lineno}: per-origin '{attr}' is not yet \
-                         wired up in lpm — see Phase 58.3 (mTLS / per-origin TLS); \
-                         request will use the global TLS config"
+                        "{source_label}:{lineno}: per-origin '{attr}' is not supported yet \
+                         (per-origin mTLS / TLS is not wired up); request will use \
+                         the global TLS config"
                     ));
                 }
                 _ => {
@@ -1278,10 +1278,9 @@ fn classify_and_apply(
         return;
     }
     if key == "certfile" || key == "keyfile" {
-        // Global mTLS client cert — Phase 58.3.
+        // Global mTLS client cert — not wired up yet.
         cfg.warnings.push(format!(
-            "{source_label}:{lineno}: '{key}' (mTLS client cert) is not yet \
-             wired up in lpm — see Phase 58.3"
+            "{source_label}:{lineno}: '{key}' (mTLS client cert) is not supported yet"
         ));
         return;
     }
@@ -1799,31 +1798,31 @@ mod tests {
     }
 
     #[test]
-    fn certfile_keyfile_global_warn_with_phase58_3_pointer() {
+    fn certfile_keyfile_global_warn_with_unsupported_pointer() {
         let cfg = NpmrcConfig::parse("certfile=/path/cert.pem\n", "test", &no_env);
         assert_eq!(cfg.warnings.len(), 1);
-        assert!(cfg.warnings[0].contains("mTLS") && cfg.warnings[0].contains("58.3"));
+        assert!(cfg.warnings[0].contains("mTLS") && cfg.warnings[0].contains("not supported yet"));
 
         let cfg = NpmrcConfig::parse("keyfile=/path/key.pem\n", "test", &no_env);
         assert_eq!(cfg.warnings.len(), 1);
-        assert!(cfg.warnings[0].contains("mTLS") && cfg.warnings[0].contains("58.3"));
+        assert!(cfg.warnings[0].contains("mTLS") && cfg.warnings[0].contains("not supported yet"));
     }
 
     #[test]
-    fn certfile_keyfile_per_origin_warn_with_phase58_3_pointer() {
+    fn certfile_keyfile_per_origin_warn_with_unsupported_pointer() {
         let cfg = NpmrcConfig::parse("//npm.internal/:certfile=/path/cert.pem\n", "test", &no_env);
         assert_eq!(cfg.warnings.len(), 1);
-        assert!(cfg.warnings[0].contains("Phase 58.3"));
+        assert!(cfg.warnings[0].contains("not supported yet"));
     }
 
     #[test]
-    fn cafile_per_origin_still_warns_phase58_3() {
-        // Per-origin server CA is exotic; deferred. Make sure the
-        // per-origin warning didn't get conflated with the global cafile
-        // wire-up.
+    fn cafile_per_origin_still_warns_unsupported() {
+        // Per-origin server CA is exotic; not wired up yet. Make sure
+        // the per-origin warning didn't get conflated with the global
+        // cafile wire-up.
         let cfg = NpmrcConfig::parse("//npm.internal/:cafile=/path/ca.pem\n", "test", &no_env);
         assert_eq!(cfg.warnings.len(), 1);
-        assert!(cfg.warnings[0].contains("Phase 58.3"));
+        assert!(cfg.warnings[0].contains("not supported yet"));
         assert!(
             cfg.tls.extra_roots.is_empty(),
             "per-origin cafile must not feed global extra_roots"

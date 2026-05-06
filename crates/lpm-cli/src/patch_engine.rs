@@ -72,16 +72,15 @@ pub const STAGING_BREADCRUMB_FILE: &str = ".lpm-patch.json";
 // ── Key parsing ───────────────────────────────────────────────────────
 
 /// Parse a `lpm.patchedDependencies` key like `"lodash@4.17.21"` or
-/// `"@types/node@20.10.0"` into `(name, version)`. Phase 6 accepts only
-/// exact-version pins.
+/// `"@types/node@20.10.0"` into `(name, version)`. Only exact-version
+/// pins are accepted today; range support is a future addition.
 ///
 /// **Errors:**
 /// - Empty input.
 /// - Missing `@` separator.
 /// - Empty name or version segment.
-/// - Range-style version (`4.x`, `^4.0.0`, `>=4`) — these are
-///   reserved for Phase 6.1 and rejected with a clear "exact pins
-///   only" message.
+/// - Range-style version (`4.x`, `^4.0.0`, `>=4`) — rejected with a
+///   clear "exact pins only" message.
 pub fn parse_patch_key(key: &str) -> Result<(String, String), LpmError> {
     if key.is_empty() {
         return Err(LpmError::Script(
@@ -113,8 +112,8 @@ pub fn parse_patch_key(key: &str) -> Result<(String, String), LpmError> {
     if is_range_version(&version) {
         return Err(LpmError::Script(format!(
             "patch key {key:?} uses a range version ({version:?}); \
-             Phase 6 accepts only exact pins like `name@1.2.3`. \
-             Range selectors are reserved for Phase 6.1."
+             only exact pins like `name@1.2.3` are accepted. \
+             Range selectors are not supported yet."
         )));
     }
     Ok((name, version))
@@ -519,7 +518,7 @@ fn classify_patch_op(patch: &Patch<'_, str>) -> Result<PatchOp, LpmError> {
             let m = strip(modified.unwrap());
             if o != m {
                 return Err(LpmError::Script(format!(
-                    "patch chunk renames {o} → {m}; renames are not supported in Phase 6"
+                    "patch chunk renames {o} → {m}; renames are not supported yet"
                 )));
             }
             Ok(PatchOp::Modify { rel_path: m })
@@ -774,7 +773,10 @@ mod tests {
         let err = parse_patch_key("lodash@^4.17.0").unwrap_err();
         let msg = format!("{err}");
         assert!(msg.contains("range version"));
-        assert!(msg.contains("Phase 6.1"));
+        assert!(
+            msg.contains("not supported yet"),
+            "error must say range support isn't available yet; got: {msg}"
+        );
     }
 
     #[test]

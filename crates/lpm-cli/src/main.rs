@@ -358,12 +358,12 @@ enum Commands {
         /// second `--auto-build` flag to actually fire scripts; that
         /// two-step is now collapsed.)
         ///
-        /// `triage`: four-layer tiered gate (Phase 46 P2–P6). Greens
-        /// auto-approve and run in the filesystem sandbox; ambers
-        /// and reds remain in the blocked set for manual review via
-        /// `lpm approve-scripts`. Triage requires `--auto-build` or
-        /// `lpm.scripts.autoBuild: true` to run greens automatically.
-        /// Layer 4 (LLM triage) ships in Phase 46.1.
+        /// `triage`: four-layer tiered gate. Greens auto-approve and
+        /// run in the filesystem sandbox; ambers and reds remain in the
+        /// blocked set for manual review via `lpm approve-scripts`.
+        /// Triage requires `--auto-build` or `lpm.scripts.autoBuild: true`
+        /// to run greens automatically. The LLM triage layer is not
+        /// available yet.
         ///
         /// Precedence: this flag > `package.json > lpm > scriptPolicy`
         /// > `~/.lpm/config.toml` key `script-policy` > default (deny).
@@ -1318,12 +1318,10 @@ enum Commands {
     /// diff under `patches/` and register it in `package.json` under
     /// `lpm.patchedDependencies`. The patch is bound to the original
     /// store integrity — drift on a future install is a hard error.
-    ///
-    /// Phase 32 Phase 6.
     #[command(name = "patch")]
     Patch {
-        /// Package selector (`name@exact-version`). Phase 6 accepts
-        /// only exact pins; range selectors are reserved for Phase 6.1.
+        /// Package selector (`name@exact-version`). Only exact pins are
+        /// accepted today; range selectors are not supported yet.
         key: String,
     },
 
@@ -2003,8 +2001,8 @@ fn validate_global_install_project_scoped_flags(
     }
     if min_release_age.is_some() {
         return Err(lpm_common::LpmError::Script(
-            "`--min-release-age` is not supported on `lpm install -g` in Phase 46 P3 \
-             (global scope is tracked for Phase 46.1). Drop the flag for global installs; \
+            "`--min-release-age` is not supported on `lpm install -g` yet — global-scope \
+             cooldown overrides aren't wired up. Drop the flag for global installs; \
              the cooldown still fires via the package.json / ~/.lpm/config.toml / 24h default chain."
                 .into(),
         ));
@@ -2012,8 +2010,8 @@ fn validate_global_install_project_scoped_flags(
     if !ignore_provenance_drift.is_empty() || ignore_provenance_drift_all {
         return Err(lpm_common::LpmError::Script(
             "`--ignore-provenance-drift` / `--ignore-provenance-drift-all` are not \
-             supported on `lpm install -g` in Phase 46 P4 (global trust store is tracked \
-             for Phase 46.1). Drop the flag for global installs."
+             supported on `lpm install -g` yet — the global trust store doesn't accept \
+             per-package drift overrides. Drop the flag for global installs."
                 .into(),
         ));
     }
@@ -4515,8 +4513,9 @@ mod tests {
                                 "error must name the flag, got: {message}"
                             );
                             assert!(
-                                message.contains("Phase 46.1"),
-                                "error must point at the Phase 46.1 follow-up, got: {message}"
+                                message.contains("not supported") && message.contains("global"),
+                                "error must say the flag isn't supported on global installs, \
+                                 got: {message}"
                             );
                         }
                         other => panic!("expected Script error, got {other:?}"),
@@ -4583,8 +4582,9 @@ mod tests {
                             "error must name the flag, got: {message}",
                         );
                         assert!(
-                            message.contains("Phase 46.1"),
-                            "error must point at Phase 46.1 follow-up, got: {message}",
+                            message.contains("not supported") && message.contains("global"),
+                            "error must say the flag isn't supported on global installs, \
+                             got: {message}",
                         );
                     }
                     other => panic!("expected Script error, got {other:?}"),
@@ -4644,8 +4644,9 @@ mod tests {
                             "error must name a drift-override flag, got: {message}",
                         );
                         assert!(
-                            message.contains("Phase 46.1"),
-                            "error must point at Phase 46.1 follow-up, got: {message}",
+                            message.contains("not supported") && message.contains("global"),
+                            "error must say the flag isn't supported on global installs, \
+                             got: {message}",
                         );
                     }
                     other => panic!("expected Script error, got {other:?}"),
