@@ -140,7 +140,8 @@ pub struct CheckEntry {
     pub name: &'static str,
     /// Top-level grouping for inventory display.
     pub category: Category,
-    /// One-sentence description of what this code expresses.
+    /// Short description of what this code expresses. Typically one
+    /// sentence; up to two for codes whose context needs a clarifier.
     pub description: &'static str,
     /// Conditions under which the row actually fires at runtime.
     pub when_fires: &'static str,
@@ -161,20 +162,8 @@ impl CheckEntry {
     /// True when `severity` is one of the entry's declared
     /// `possible_severities`. Drives the `debug_assert!` inside the
     /// `Check` constructors.
-    pub const fn permits(&self, severity: Severity) -> bool {
-        let mut i = 0;
-        while i < self.possible_severities.len() {
-            if matches!(
-                (self.possible_severities[i], severity),
-                (Severity::Pass, Severity::Pass)
-                    | (Severity::Fail, Severity::Fail)
-                    | (Severity::Warn, Severity::Warn)
-            ) {
-                return true;
-            }
-            i += 1;
-        }
-        false
+    pub fn permits(&self, severity: Severity) -> bool {
+        self.possible_severities.contains(&severity)
     }
 }
 
@@ -1434,7 +1423,7 @@ pub static CLI_CATALOG: &[&CheckEntry] = &[
 /// shape from [`lpm_workspace::ManifestCompatCatalogEntry`] without
 /// duplicating their prose — the workspace crate stays the source
 /// of truth for that subset.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct InventoryRow {
     pub code: &'static str,
     pub name: &'static str,
@@ -1442,34 +1431,22 @@ pub struct InventoryRow {
     pub description: &'static str,
     pub when_fires: &'static str,
     pub remediation: &'static str,
-    pub possible_severities: &'static [&'static str],
+    pub possible_severities: Vec<&'static str>,
     pub auto_fix: Option<&'static str>,
 }
 
 impl InventoryRow {
     fn from_cli(entry: &'static CheckEntry) -> Self {
-        // Convert the typed-Severity slice to a `&[&str]` view by
-        // reading each variant's stable `as_str()`. The catalog only
-        // declares small slices (1–2 severities per entry) so this
-        // cost is negligible.
-        const POOL_PASS: &[&str] = &["pass"];
-        const POOL_FAIL: &[&str] = &["fail"];
-        const POOL_WARN: &[&str] = &["warn"];
-        let possible_severities: &[&str] = match entry.possible_severities {
-            [Severity::Pass] => POOL_PASS,
-            [Severity::Fail] => POOL_FAIL,
-            [Severity::Warn] => POOL_WARN,
-            // Multi-severity entries fall back to leaking small slices.
-            // None today; if we ever add multi-severity codes, expand
-            // the match (catches drift via the unreachable warning).
-            other => Box::leak(
-                other
-                    .iter()
-                    .map(|s| s.as_str())
-                    .collect::<Vec<_>>()
-                    .into_boxed_slice(),
-            ),
-        };
+        // Convert each typed-Severity variant to its stable `as_str()`.
+        // ~96 catalog entries with 1–2 severities each — negligible work
+        // on a non-hot path. Owned `Vec` keeps the row self-contained
+        // (no static pools, no leak path, multi-severity Just Works
+        // when the catalog grows to support it).
+        let possible_severities = entry
+            .possible_severities
+            .iter()
+            .map(|s| s.as_str())
+            .collect();
         Self {
             code: entry.code,
             name: entry.name,
@@ -1648,6 +1625,57 @@ mod tests {
             len,
             "duplicate code(s) across CLI_CATALOG and MANIFEST_COMPAT_CATALOG"
         );
+    }
+
+    /// Cross-crate parity drift-guard.
+    ///
+    /// `lpm_workspace::MANIFEST_COMPAT_CATALOG` is the source of truth
+    /// for manifest-compat code prose; `lpm_cli` declares a typed
+    /// `&'static CheckEntry` wrapper per code in
+    /// [`MANIFEST_COMPAT_ENTRIES`]. Both lists are hand-maintained.
+    /// Adding a code to the workspace catalog without adding the CLI
+    /// wrapper would compile fine, pass the workspace-side guard, AND
+    /// pass the CLI-side `every_pub_static_check_entry_is_registered_for_listing`
+    /// guard — but the runtime adapter at
+    /// [`crate::commands::doctor::check_manifest_compat`] would
+    /// silently drop the issue (no matching `&'static CheckEntry`
+    /// resolves), and `lpm doctor list` would not list the new code.
+    ///
+    /// This test asserts every workspace-declared code resolves to a
+    /// CLI-side wrapper via [`manifest_compat_entry`]. Adding a code
+    /// to one list without the other fails this test before merge.
+    #[test]
+    fn manifest_compat_entries_cover_workspace_catalog() {
+        for entry in lpm_workspace::MANIFEST_COMPAT_CATALOG {
+            let resolved = manifest_compat_entry(entry.code);
+            assert!(
+                resolved.is_some(),
+                "lpm_workspace::MANIFEST_COMPAT_CATALOG declares code `{}` but \
+                 lpm_cli::doctor_catalog::MANIFEST_COMPAT_ENTRIES has no matching \
+                 `pub static CheckEntry` wrapper. Add a wrapper that references \
+                 `lpm_workspace::{}_META` (or the equivalent const) and register \
+                 it into `MANIFEST_COMPAT_ENTRIES`.",
+                entry.code,
+                entry.code.to_uppercase(),
+            );
+        }
+
+        // Symmetric check: no CLI wrapper exists for a code the
+        // workspace doesn't declare. Catches stale wrappers left behind
+        // when a workspace code gets removed.
+        let workspace_codes: HashSet<&str> = lpm_workspace::MANIFEST_COMPAT_CATALOG
+            .iter()
+            .map(|e| e.code)
+            .collect();
+        for entry in MANIFEST_COMPAT_ENTRIES {
+            assert!(
+                workspace_codes.contains(entry.code),
+                "lpm_cli::doctor_catalog::MANIFEST_COMPAT_ENTRIES carries `{}` but \
+                 the workspace catalog no longer declares it. Remove the stale \
+                 wrapper from `MANIFEST_COMPAT_ENTRIES`.",
+                entry.code,
+            );
+        }
     }
 
     #[test]

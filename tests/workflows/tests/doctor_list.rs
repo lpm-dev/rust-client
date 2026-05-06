@@ -77,9 +77,12 @@ fn doctor_list_each_entry_has_required_fields() {
         .expect("entries must be an array");
 
     for entry in entries {
+        // `check` is the human-readable label, matching the field name
+        // used by `lpm doctor --json` so consumers using both surfaces
+        // can match on one schema.
         for field in [
             "code",
-            "name",
+            "check",
             "category",
             "description",
             "when_fires",
@@ -135,6 +138,47 @@ fn doctor_list_filter_by_code_returns_single_entry() {
     assert_eq!(
         json["entries"][0]["category"],
         serde_json::json!("TypeScript")
+    );
+}
+
+#[test]
+fn doctor_list_filter_by_code_typo_exits_nonzero_and_emits_single_json_envelope() {
+    // `--code` is exact-match: a typo should fail loudly so automation
+    // gating on a specific code doesn't silently pass when the code
+    // doesn't exist. JSON mode must still emit a single valid JSON
+    // document (the standard `LpmError` envelope) — no double-emit.
+    let project = TempProject::empty(r#"{"name":"x","version":"1.0.0"}"#);
+    let output = lpm(&project)
+        .args(["--json", "doctor", "list", "--code", "does_not_exist"])
+        .output()
+        .expect("failed to run lpm doctor list --json --code typo");
+
+    assert!(
+        !output.status.success(),
+        "lpm doctor list --code <typo> must exit non-zero. exit: {}\nstdout:\n{}\nstderr:\n{}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+
+    let raw = String::from_utf8_lossy(&output.stdout);
+    let json: serde_json::Value = serde_json::from_str(raw.trim()).unwrap_or_else(|e| {
+        panic!("stdout must be a single valid JSON document. Parse error: {e}\nRaw stdout:\n{raw}")
+    });
+    assert_eq!(json["success"], serde_json::json!(false));
+    assert_eq!(
+        json["error_code"].as_str(),
+        Some("script"),
+        "expected canonical error_code = `script`; got: {}",
+        json["error_code"]
+    );
+    assert!(
+        json["error"]
+            .as_str()
+            .unwrap_or("")
+            .contains("does_not_exist"),
+        "error message should name the offending code; got: {}",
+        json["error"]
     );
 }
 

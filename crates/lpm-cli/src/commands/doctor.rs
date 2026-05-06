@@ -75,13 +75,14 @@ impl Check {
     }
 
     /// Stable machine-readable identifier — match on this in
-    /// automation. Mirrors `entry.code`, surfaced as a method so
-    /// existing callers that read `check.code` keep working.
+    /// automation. Flat accessor over `entry.code` so the JSON
+    /// serializer and human renderer don't need to reach through
+    /// the catalog reference.
     fn code(&self) -> &'static str {
         self.entry.code
     }
 
-    /// Human-readable label. Mirrors `entry.name`.
+    /// Human-readable label. Flat accessor over `entry.name`.
     fn name(&self) -> &'static str {
         self.entry.name
     }
@@ -97,9 +98,13 @@ impl Check {
 /// can match on.
 ///
 /// Filters:
-/// - `code` selects a single entry by exact code match.
-/// - `category` is a case-insensitive substring filter against
-///   the catalog category label.
+/// - `code` selects a single entry by exact code match. An empty
+///   result is treated as a user error (likely typo) and exits
+///   non-zero — automation gating on a code shouldn't silently pass
+///   when the code doesn't exist.
+/// - `category` is a case-insensitive substring filter against the
+///   catalog category label. Empty result is benign (substring
+///   semantics) and exits zero with a stderr note.
 ///
 /// `--json` returns the structured array; without it, the listing
 /// is grouped by category and rendered for terminals.
@@ -118,13 +123,32 @@ pub fn list(
         rows.retain(|r| r.category.as_str().to_lowercase().contains(needle.as_str()));
     }
 
+    // `--code` is exact-match — an empty result almost always means
+    // the user typo'd a code. Surface this as a hard error so
+    // automation doesn't silently pass when the gating code doesn't
+    // exist. The error propagates through the standard `LpmError`
+    // path; in `--json` mode the outer handler wraps it in the
+    // canonical `{success: false, error, error_code}` envelope, so
+    // stdout stays a single valid JSON document either way.
+    if let Some(code) = code_filter
+        && rows.is_empty()
+    {
+        return Err(LpmError::Script(format!(
+            "no catalog entry matches code `{code}` — run `lpm doctor list` to see the full inventory",
+        )));
+    }
+
     if json_output {
+        // Field-name parity with `lpm doctor --json`: the runtime
+        // emission surface uses `check` for the human-readable label,
+        // so the inventory surface uses the same key. Match on `code`
+        // in automation; `check` is human-only.
         let entries: Vec<_> = rows
             .iter()
             .map(|r| {
                 serde_json::json!({
                     "code": r.code,
-                    "name": r.name,
+                    "check": r.name,
                     "category": r.category.as_str(),
                     "description": r.description,
                     "when_fires": r.when_fires,
@@ -1797,7 +1821,30 @@ fn check_manifest_compat(project_dir: &Path) -> Vec<Check> {
         .manifest_compat_issues()
         .into_iter()
         .filter_map(|issue| {
-            let entry = doctor_catalog::manifest_compat_entry(issue.code)?;
+            let entry = match doctor_catalog::manifest_compat_entry(issue.code) {
+                Some(entry) => entry,
+                None => {
+                    // Orphan code: lpm-workspace declared a new
+                    // manifest-compat code without a matching CLI-side
+                    // wrapper in `MANIFEST_COMPAT_ENTRIES`. The
+                    // cross-crate parity test in `lpm-cli`
+                    // (`manifest_compat_entries_cover_workspace_catalog`)
+                    // pins this at unit-test time; the `debug_assert!`
+                    // here is a runtime tripwire so debug builds fail
+                    // loudly if the parity test is ever bypassed.
+                    debug_assert!(
+                        false,
+                        "orphan manifest-compat code `{}` — \
+                         `lpm_workspace::MANIFEST_COMPAT_CATALOG` declares it \
+                         but `lpm_cli::doctor_catalog::MANIFEST_COMPAT_ENTRIES` \
+                         is missing the corresponding `pub static CheckEntry` \
+                         wrapper. Add the wrapper or `lpm doctor` will \
+                         silently drop the issue.",
+                        issue.code,
+                    );
+                    return None;
+                }
+            };
             let detail = format!("{}. {}", issue.detail, issue.remediation);
             let check = match issue.severity {
                 lpm_workspace::ManifestCompatSeverity::Warn => Check::warn(entry, &detail),
