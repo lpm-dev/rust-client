@@ -126,7 +126,7 @@ jobs:
       - name: Build
         run: cargo build --workspace
 
-      - name: Test (unit + integration, excluding workflow tests)
+      - name: Test (workspace, excluding lpm-integration-tests)
         run: cargo nextest run --workspace --exclude lpm-integration-tests --no-fail-fast
 
   bench:
