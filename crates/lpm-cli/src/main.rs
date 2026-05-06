@@ -1754,7 +1754,7 @@ enum Commands {
         #[arg(long)]
         dry_run: bool,
 
-        /// Overwrite existing lpm.lock without prompting.
+        /// Overwrite an existing lpm.lock.
         #[arg(long)]
         force: bool,
 
@@ -1762,7 +1762,10 @@ enum Commands {
         #[arg(long)]
         rollback: bool,
 
-        /// Skip confirmation prompts, use defaults (implies --force).
+        /// Reserved. The migrate flow is non-interactive today, so this
+        /// flag is a no-op. It exists so scripts that already set `-y`
+        /// continue to parse cleanly, and so the public CLI keeps the
+        /// flag namespace once interactive prompts are wired in.
         #[arg(long, short = 'y')]
         yes: bool,
     },
@@ -3776,8 +3779,12 @@ async fn async_main() -> Result<()> {
             dry_run,
             force,
             rollback,
-            yes,
+            yes: _yes,
         } => {
+            // `-y` is reserved (non-interactive flag) and intentionally
+            // does NOT imply `--force`. The migrate flow has no
+            // interactive prompts today; if the user wants to clobber
+            // an existing lpm.lock they must pass `--force` explicitly.
             let cwd = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;
             commands::migrate::run(
                 &client,
@@ -3788,7 +3795,7 @@ async fn async_main() -> Result<()> {
                 ci,
                 no_install,
                 dry_run,
-                force || yes,
+                force,
                 rollback,
                 cli.json,
             )

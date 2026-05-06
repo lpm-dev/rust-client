@@ -523,10 +523,56 @@ fn migrate_rollback_restores_original() {
         .assert()
         .success();
 
-    // After rollback, the lpm lockfiles should be gone and original restored
+    // After rollback, BOTH lpm lockfiles must be gone — `lpm.lockb` is
+    // derived from `lpm.lock`, so leaving it on disk produces a stale
+    // binary lockfile that would mislead the next install. The backup
+    // layer tracks both files (the migrate command registers them as
+    // freshly-created) so rollback cleans them up uniformly.
     assert!(
         !project.file_exists("lpm.lock"),
         "lpm.lock should be removed after rollback"
+    );
+    assert!(
+        !project.file_exists("lpm.lockb"),
+        "lpm.lockb should be removed after rollback (it's derived from lpm.lock)"
+    );
+}
+
+/// `-y` is reserved (non-interactive flag) and intentionally does NOT
+/// imply `--force`. Without an explicit `--force`, migrate must refuse
+/// to overwrite an existing lpm.lock even when `-y` is set.
+#[test]
+fn migrate_yes_alone_does_not_overwrite_existing_lockfile() {
+    let project = TempProject::from_fixture("migrate-npm");
+
+    // Plant an lpm.lock first (simulates a project mid-migration or
+    // a re-run scenario).
+    std::fs::write(
+        project.path().join("lpm.lock"),
+        "# user's hand-tuned lockfile that we MUST NOT clobber\n",
+    )
+    .unwrap();
+    let pre_bytes = std::fs::read(project.path().join("lpm.lock")).unwrap();
+
+    // -y should NOT clobber the existing lpm.lock — that's the job of
+    // --force, and the public contract is now that the two are decoupled.
+    let output = lpm(&project)
+        .args(["migrate", "--no-install", "-y"])
+        .output()
+        .expect("failed to run lpm migrate -y");
+
+    assert!(
+        !output.status.success(),
+        "lpm migrate -y must refuse to overwrite without --force; \
+         stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+
+    let post_bytes = std::fs::read(project.path().join("lpm.lock")).unwrap();
+    assert_eq!(
+        pre_bytes, post_bytes,
+        "lpm.lock must be byte-identical to its pre-`-y` state"
     );
 }
 
