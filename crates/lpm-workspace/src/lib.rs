@@ -694,7 +694,10 @@ pub struct LpmConfig {
     #[serde(default, rename = "strictDeps")]
     pub strict_deps: Option<String>,
 
-    /// node_modules linker mode: "symlink" or "hoisted".
+    /// node_modules linker mode: `"isolated"` (default, pnpm-style) or
+    /// `"hoisted"` (npm-style). Validated against
+    /// `lpm_linker::LinkerMode::parse_str` at install time — unknown values
+    /// fail loudly rather than silently falling back.
     #[serde(default)]
     pub linker: Option<String>,
 
@@ -2159,7 +2162,7 @@ mod tests {
                 "name": "my-app",
                 "lpm": {
                     "strictDeps": "strict",
-                    "linker": "symlink"
+                    "linker": "isolated"
                 }
             }"#,
         );
@@ -2167,6 +2170,30 @@ mod tests {
         let pkg = read_package_json(&dir.path().join("package.json")).unwrap();
         let lpm = pkg.lpm.unwrap();
         assert_eq!(lpm.strict_deps.as_deref(), Some("strict"));
+        assert_eq!(lpm.linker.as_deref(), Some("isolated"));
+    }
+
+    /// `lpm.linker` is read as `Option<String>` at deserialization time so
+    /// every command that touches `package.json` can be tolerant — the
+    /// install pipeline runs `lpm_linker::LinkerMode::parse_str` and rejects
+    /// unknown values (including the legacy `"symlink"` alias) loudly. This
+    /// test pins that the deserialize layer doesn't enforce, so a stricter
+    /// future seam can't accidentally drop the install-time validator and
+    /// land a silent fallback again.
+    #[test]
+    fn lpm_linker_accepts_arbitrary_strings_at_deserialize_layer() {
+        let dir = tempfile::tempdir().unwrap();
+        create_package_json(
+            dir.path(),
+            r#"{
+                "name": "my-app",
+                "lpm": { "linker": "symlink" }
+            }"#,
+        );
+
+        let pkg = read_package_json(&dir.path().join("package.json")).unwrap();
+        let lpm = pkg.lpm.unwrap();
+        // Deserialize: tolerant. Validation: install-time.
         assert_eq!(lpm.linker.as_deref(), Some("symlink"));
     }
 

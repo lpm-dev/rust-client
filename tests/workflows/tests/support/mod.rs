@@ -190,6 +190,13 @@ pub fn lpm(project: &TempProject) -> assert_cmd::Command {
     cmd.env("LPM_TEST_FAST_SCRYPT", "1");
     cmd.env("LPM_FORCE_FILE_VAULT", "1");
 
+    // Clear `LPM_LINKER` so a developer's exported value (or a prior test
+    // process) can't override the package.json + config.toml linker chain
+    // we're trying to exercise. Tests that intentionally probe the env-var
+    // surface re-set it on their own command builder.
+    cmd.env_remove("LPM_LINKER");
+    cmd.env_remove("LPM_CONCURRENT_DOWNLOADS");
+
     // Disable color for deterministic output in assertions
     cmd.env("NO_COLOR", "1");
 

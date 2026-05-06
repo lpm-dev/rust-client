@@ -17,6 +17,7 @@ mod graph_render;
 mod import_rewriter;
 pub mod install_state;
 pub mod intelligence;
+mod linker_config;
 mod manifest_tx;
 pub mod migration_warnings;
 mod oidc;
@@ -58,7 +59,8 @@ mod xcode_project;
     //   (b) append the cached "update available" notice — clap's built-in
     //       version handler prints + exits before we get a chance to
     //       enrich the output.
-    // The replacement is the global `version: bool` field below.
+    // The replacement is a top-level argv pre-check for `--version`
+    // plus the short `-V` / `-v` clap flag below.
     disable_version_flag = true,
     about = "LPM — the package manager for modern software",
     long_about = "Rust-based LPM client. Fast, correct, registry-aware."
@@ -69,17 +71,16 @@ struct Cli {
 
     /// Print version and exit.
     ///
-    /// Accepts `-V`, `-v`, and `--version`. The short alias `-v` matches
-    /// npm/pnpm/yarn convention; users coming from `cargo` (where `-v`
-    /// is verbose) should use `--verbose` instead.
+    /// Accepts `-V` and `-v`. Long `--version` is handled before clap
+    /// parsing so subcommands like `info` and `download` can safely use
+    /// `--version <package-version>`.
     #[arg(
         short = 'V',
-        long = "version",
         visible_short_alias = 'v',
         global = true,
         action = ArgAction::SetTrue,
     )]
-    version: bool,
+    version_flag: bool,
 
     /// Use a specific auth token instead of the stored one.
     #[arg(long, global = true, env = "LPM_TOKEN")]
@@ -111,6 +112,31 @@ enum OutdatedRegistryScope {
     Lpm,
 }
 
+/// Linker mode as accepted by the `--linker` CLI flag. Clap clamps the input
+/// at parse time so any unknown value fails before the command runs. Mirrors
+/// `lpm_linker::LinkerMode::ACCEPTED_VALUES`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+enum LinkerCli {
+    Isolated,
+    Hoisted,
+}
+
+impl LinkerCli {
+    fn into_linker_mode(self) -> lpm_linker::LinkerMode {
+        match self {
+            Self::Isolated => lpm_linker::LinkerMode::Isolated,
+            Self::Hoisted => lpm_linker::LinkerMode::Hoisted,
+        }
+    }
+}
+
+// Linker override resolution moved to `linker_config` module + the
+// install pipeline so every install entry point (top-level `lpm install`,
+// `lpm add`, `lpm upgrade`, `lpm dev`, `lpm migrate`, `lpm deploy`,
+// `lpm dlx`, `lpm install -g`, `lpm global update`, `lpm doctor --fix`)
+// honors the same precedence chain. Top-level dispatch only translates
+// the CLI flag — the rest of the chain is handled inside install.
+
 #[derive(Subcommand)]
 #[command(allow_external_subcommands = true)]
 enum Commands {
@@ -120,8 +146,8 @@ enum Commands {
         package: String,
 
         /// Show a specific version instead of latest.
-        #[arg(long)]
-        version: Option<String>,
+        #[arg(long = "version")]
+        package_version: Option<String>,
     },
 
     /// Search for packages.
@@ -152,8 +178,8 @@ enum Commands {
         package: String,
 
         /// Version to download (default: latest).
-        #[arg(long)]
-        version: Option<String>,
+        #[arg(long = "version")]
+        package_version: Option<String>,
 
         /// Directory to extract into (default: current directory).
         #[arg(long, short)]
@@ -275,9 +301,12 @@ enum Commands {
         #[arg(long)]
         ignore_provenance_drift_all: bool,
 
-        /// Linking mode: isolated (default, pnpm-style) or hoisted (npm-style).
-        #[arg(long)]
-        linker: Option<String>,
+        /// Linking mode: `isolated` (default, pnpm-style) or `hoisted`
+        /// (npm-style). Unknown values are rejected by clap at parse time.
+        /// Overrides `package.json > lpm > linker`,
+        /// `~/.lpm/config.toml > linker`, and `LPM_LINKER`.
+        #[arg(long, value_enum)]
+        linker: Option<LinkerCli>,
 
         /// Skip skills auto-install.
         #[arg(long)]
@@ -1888,6 +1917,24 @@ fn print_version_with_notice() {
     }
 }
 
+fn argv_requests_top_level_version<I, S>(args: I) -> bool
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<std::ffi::OsStr>,
+{
+    let mut args = args.into_iter();
+    let _program = args.next();
+    let Some(flag) = args.next() else {
+        return false;
+    };
+
+    if args.next().is_some() {
+        return false;
+    }
+
+    flag.as_ref() == std::ffi::OsStr::new("--version")
+}
+
 fn command_needs_global_state(cmd: &Commands) -> bool {
     match cmd {
         // `install -g` (the actual install pipeline lands in M3.2 — for
@@ -2031,6 +2078,11 @@ fn spawn_background_update_check() {
 }
 
 fn main() -> Result<()> {
+    if argv_requests_top_level_version(std::env::args_os()) {
+        print_version_with_notice();
+        return Ok(());
+    }
+
     // ── Phase 34.1: sync fast lane ──────────────────────────────────
     // If this is a bare `lpm install` (or `lpm i`) with no disqualifying
     // flags and the project is already up to date, exit immediately
@@ -2125,16 +2177,16 @@ async fn async_main() -> Result<()> {
     // "update available" notice. Runs before tracing setup / subcommand
     // dispatch — there is nothing to log and nothing to do beyond
     // printing the version line.
-    if cli.version {
+    if cli.version_flag {
         print_version_with_notice();
         return Ok(());
     }
 
-    // No subcommand and no `--version` → print help and exit 2 (clap's
+    // No subcommand and no version request → print help and exit 2 (clap's
     // standard "missing required argument" semantics). We can't lean on
-    // clap's automatic `arg_required_else_help` because making `version`
-    // a global flag with a default of `false` defeats it; the user-typed
-    // `lpm` (no args, no flags) needs explicit handling.
+    // clap's automatic `arg_required_else_help` because the global short
+    // version flag still defaults to `false`; the user-typed `lpm` (no
+    // args, no flags) needs explicit handling.
     let Some(command) = cli.command else {
         use clap::CommandFactory;
         let mut cmd = Cli::command();
@@ -2286,9 +2338,10 @@ async fn async_main() -> Result<()> {
     }
 
     let result = match command {
-        Commands::Info { package, version } => {
-            commands::info::run(&client, &package, version.as_deref(), cli.json).await
-        }
+        Commands::Info {
+            package,
+            package_version,
+        } => commands::info::run(&client, &package, package_version.as_deref(), cli.json).await,
         Commands::Search { query, limit } => {
             commands::search::run(&client, &query, limit, cli.json).await
         }
@@ -2297,13 +2350,13 @@ async fn async_main() -> Result<()> {
         Commands::Health => commands::health::run(&client, registry_url, cli.json).await,
         Commands::Download {
             package,
-            version,
+            package_version,
             output,
         } => {
             commands::download::run(
                 &client,
                 &package,
-                version.as_deref(),
+                package_version.as_deref(),
                 output.as_deref(),
                 cli.json,
             )
@@ -2547,7 +2600,14 @@ async fn async_main() -> Result<()> {
                     let eff_no_sec =
                         no_security_summary || cfg.get_bool("noSecuritySummary").unwrap_or(false);
                     let eff_auto_build = auto_build || cfg.get_bool("autoBuild").unwrap_or(false);
-                    let eff_linker = linker.or_else(|| cfg.get_str("linker").map(String::from));
+                    // Top-level dispatch passes ONLY the CLI flag through;
+                    // `~/.lpm/config.toml > linker`, `LPM_LINKER`, and
+                    // `package.json > lpm > linker` are resolved inside the
+                    // install pipeline so every internal caller (add /
+                    // upgrade / dev / migrate / deploy / dlx / -g / global
+                    // update / doctor) gets the same precedence chain
+                    // without each call site re-implementing it.
+                    let cli_linker = linker.map(LinkerCli::into_linker_mode);
 
                     commands::install::run_with_options(
                         &client,
@@ -2557,7 +2617,7 @@ async fn async_main() -> Result<()> {
                         force,
                         eff_allow_new,
                         strict_integrity,
-                        eff_linker.as_deref(),
+                        cli_linker,
                         eff_no_skills,
                         eff_no_editor,
                         eff_no_sec,
@@ -3835,29 +3895,38 @@ mod tests {
     #[test]
     fn capital_v_sets_version_flag_with_no_subcommand() {
         let cli = Cli::try_parse_from(["lpm", "-V"]).unwrap();
-        assert!(cli.version, "-V must set version flag");
+        assert!(cli.version_flag, "-V must set version flag");
         assert!(cli.command.is_none(), "no subcommand expected");
     }
 
     #[test]
     fn lowercase_v_sets_version_flag_with_no_subcommand() {
         let cli = Cli::try_parse_from(["lpm", "-v"]).unwrap();
-        assert!(cli.version, "-v must set version flag");
+        assert!(cli.version_flag, "-v must set version flag");
         assert!(cli.command.is_none(), "no subcommand expected");
     }
 
     #[test]
-    fn long_version_flag_sets_version_with_no_subcommand() {
-        let cli = Cli::try_parse_from(["lpm", "--version"]).unwrap();
-        assert!(cli.version, "--version must set version flag");
-        assert!(cli.command.is_none(), "no subcommand expected");
+    fn top_level_long_version_is_handled_before_clap() {
+        assert!(argv_requests_top_level_version(["lpm", "--version"]));
+        assert!(!argv_requests_top_level_version(["lpm", "info", "react"]));
+        assert!(!argv_requests_top_level_version([
+            "lpm",
+            "info",
+            "react",
+            "--version",
+            "1.0.0"
+        ]));
     }
 
     #[test]
     fn verbose_long_form_survives() {
         let cli = Cli::try_parse_from(["lpm", "--verbose", "whoami"]).unwrap();
         assert!(cli.verbose, "--verbose must still parse");
-        assert!(!cli.version, "--verbose must not trigger version output");
+        assert!(
+            !cli.version_flag,
+            "--verbose must not trigger version output"
+        );
         assert!(matches!(cli.command, Some(Commands::Whoami)));
     }
 
@@ -3868,11 +3937,46 @@ mod tests {
         // matching npm/pnpm/yarn. Anyone scripting `lpm <cmd> -v`
         // for verbose output must switch to `--verbose`.
         let cli = Cli::try_parse_from(["lpm", "whoami", "-v"]).unwrap();
-        assert!(cli.version, "-v after subcommand must set version flag");
+        assert!(
+            cli.version_flag,
+            "-v after subcommand must set version flag"
+        );
         assert!(
             !cli.verbose,
             "-v must NOT set verbose (long --verbose only)"
         );
+    }
+
+    #[test]
+    fn info_subcommand_long_version_parses_as_package_version() {
+        let cli = Cli::try_parse_from(["lpm", "info", "react", "--version", "1.0.0"]).unwrap();
+        match cli.command {
+            Some(Commands::Info {
+                package,
+                package_version,
+            }) => {
+                assert_eq!(package, "react");
+                assert_eq!(package_version.as_deref(), Some("1.0.0"));
+            }
+            _ => panic!("expected info command"),
+        }
+    }
+
+    #[test]
+    fn download_subcommand_long_version_parses_as_package_version() {
+        let cli = Cli::try_parse_from(["lpm", "download", "react", "--version", "1.0.0"]).unwrap();
+        match cli.command {
+            Some(Commands::Download {
+                package,
+                package_version,
+                output,
+            }) => {
+                assert_eq!(package, "react");
+                assert_eq!(package_version.as_deref(), Some("1.0.0"));
+                assert!(output.is_none());
+            }
+            _ => panic!("expected download command"),
+        }
     }
 
     #[test]

@@ -55,48 +55,70 @@ pub struct InstallState {
 // "up to date" fast-exit, and the auditor's HIGH 1 repro showed
 // `node_modules/bar` never landed.
 //
-// Bumping the schema tag is mostly informational — for workspace
-// projects the new hash function naturally produces a different
-// digest from the v4 cache because the new buffer contains member
-// manifest bytes that v4 didn't, so the upgrade triggers one re-
-// resolve regardless. The bump documents that fact. v4 → v5 is
-// otherwise a no-op for projects with no file:/link: AND no
-// workspace members.
-const INSTALL_HASH_SCHEMA_TAG: &[u8] = b"lpm-install-hash-v5\x00";
+// **v6 — linker mode folds into the hash.** Pre-v6 the install-hash
+// only keyed off manifest/lock content, so a post-install change to
+// `LPM_LINKER` or `~/.lpm/config.toml > linker` left the hash matching
+// and the "up to date" fast-exit fired — silently leaving the project
+// on the prior layout with no re-link. v6 includes the resolved linker
+// mode (via `compute_install_hash_v6`) AND the install-hash file gains
+// an `l:<isolated|hoisted>` line so the mtime fast path can detect a
+// linker change without recomputing the full hash. Same upgrade
+// posture as v3→v4→v5: existing v5 hashes mismatch on first read and
+// trigger one full re-resolve, after which the v6 cache is warm.
+const INSTALL_HASH_SCHEMA_TAG: &[u8] = b"lpm-install-hash-v6\x00";
 
-/// Compute the install hash from raw file contents (v3 backwards-
-/// compat shim — passes empty `file_link_manifests`, equivalent to a
-/// project with zero file:/link: deps).
-///
-/// Deterministic SHA-256:
-/// `schema_tag || pkg || 0x00 || lock || 0x00 || file_link_bytes`.
-///
-/// Most callers (test fixtures, dev.rs's manifest hashing, the install-
-/// state pin) use this 2-arg shim. The install pipeline's full
-/// up-to-date check goes through [`compute_install_hash_v3`] directly
-/// so it can pass real file/link manifest bytes.
+/// Compute the install hash from raw file contents — back-compat shim
+/// that defaults file/link bytes to empty AND linker mode to isolated.
+/// Used by test fixtures and `dev.rs`'s deterministic-hash unit tests
+/// where the linker is not under test. Production callers use
+/// [`compute_install_hash_v6`] directly.
 pub fn compute_install_hash(pkg_content: &str, lock_content: &str) -> String {
-    compute_install_hash_v3(pkg_content, lock_content, &[])
+    compute_install_hash_v6(
+        pkg_content,
+        lock_content,
+        &[],
+        lpm_linker::LinkerMode::Isolated,
+    )
 }
 
-/// **Phase 59.1 day-3 (F7a)** — full install hash with file/link
-/// directory dep manifest bytes folded in.
-///
-/// `file_link_manifests` is a deterministically-ordered byte sequence
-/// produced by [`collect_file_link_manifest_bytes`] — typically empty
-/// for projects without local-source deps (matches the v2 behavior in
-/// that case, modulo the schema-tag invalidation).
-///
-/// Order discipline: `schema_tag || pkg || \0 || lock || \0 || flb`
-/// uses an explicit domain separator before the file/link bytes so a
-/// future caller passing pre-concatenated input can't collide with a
-/// fresh-pre-resolve invocation. The `\0` is impossible to find inside
-/// the lockfile content (TOML is text-only) but the separator is
-/// belt-and-braces against future binary lockfile formats.
+/// Same shape as [`compute_install_hash_v6`] minus the linker arg —
+/// retained ONLY to keep the v3 name available to callers that
+/// explicitly want the isolated default. Behaves identically to
+/// `compute_install_hash_v6(..., LinkerMode::Isolated)`. New code
+/// should call `compute_install_hash_v6` and pass the resolved mode.
 pub fn compute_install_hash_v3(
     pkg_content: &str,
     lock_content: &str,
     file_link_manifests: &[u8],
+) -> String {
+    compute_install_hash_v6(
+        pkg_content,
+        lock_content,
+        file_link_manifests,
+        lpm_linker::LinkerMode::Isolated,
+    )
+}
+
+/// Full install hash with manifest content + lockfile + file/link
+/// manifests + resolved linker mode folded in.
+///
+/// Including linker in the hash closes the post-install env/config
+/// freshness gap: if a user runs `lpm install` once with the default
+/// isolated layout and then sets `LPM_LINKER=hoisted`, pre-v6 the hash
+/// stayed the same and the "up to date" fast-exit fired — leaving
+/// the project on isolated despite the requested switch. v6 keys the
+/// hash on the resolved linker so any flip invalidates the cache.
+///
+/// Order discipline: `schema_tag || pkg || \0 || lock || \0 || flb ||
+/// \0 || linker`. Each section is preceded by an explicit `\0` domain
+/// separator so a future caller can't construct an ambiguous input.
+/// The linker byte is the canonical string from [`LinkerMode::as_str`]
+/// (`"isolated"` or `"hoisted"`).
+pub fn compute_install_hash_v6(
+    pkg_content: &str,
+    lock_content: &str,
+    file_link_manifests: &[u8],
+    linker_mode: lpm_linker::LinkerMode,
 ) -> String {
     let mut hasher = Sha256::new();
     hasher.update(INSTALL_HASH_SCHEMA_TAG);
@@ -105,6 +127,8 @@ pub fn compute_install_hash_v3(
     hasher.update(lock_content.as_bytes());
     hasher.update(b"\x00");
     hasher.update(file_link_manifests);
+    hasher.update(b"\x00");
+    hasher.update(linker_mode.as_str().as_bytes());
     format!("{:x}", hasher.finalize())
 }
 
@@ -295,30 +319,85 @@ pub fn check_install_state(project_dir: &Path) -> InstallState {
         };
     }
 
-    // Phase 44 mtime short-circuit — attempt without touching pkg.json/lpm.lock.
-    if let Some(state) = try_mtime_fast_path(project_dir) {
-        return state;
-    }
-
-    // Fall through: full-read path.
+    // Read package.json + resolve linker BEFORE any freshness comparison.
+    // pkg-read failure → no readable manifest, return hash=None.
     let Ok(pkg_content) = std::fs::read_to_string(&pkg_json) else {
         return InstallState {
             up_to_date: false,
             hash: None,
         };
     };
-    check_install_state_with_content(project_dir, &pkg_content)
+
+    let cfg = crate::commands::config::GlobalConfig::load();
+    let linker_mode =
+        match crate::linker_config::resolve_effective_linker_from_bytes(None, &pkg_content, &cfg) {
+            Ok(mode) => mode,
+            Err(_) => return invalid_linker_state(project_dir, &pkg_content),
+        };
+
+    // Single mtime probe lives inside `check_install_state_with_linker`
+    // — no pre-delegation probe here, otherwise the stale path would
+    // pay the same filesystem checks twice (once on the early bail,
+    // once after delegation re-runs them).
+    check_install_state_with_linker(project_dir, &pkg_content, linker_mode)
 }
 
 /// Same semantics as [`check_install_state`] but accepts a pre-read
 /// `package.json` content from the caller — used by the top-of-main
 /// fast lane which already read the file for the workspace-root check.
-/// Saves one redundant file read.
+/// Saves one redundant file read. Linker resolution still runs
+/// internally with `cli_override = None`.
 pub fn check_install_state_with_content(project_dir: &Path, pkg_content: &str) -> InstallState {
+    let cfg = crate::commands::config::GlobalConfig::load();
+    let linker_mode =
+        match crate::linker_config::resolve_effective_linker_from_bytes(None, pkg_content, &cfg) {
+            Ok(mode) => mode,
+            Err(_) => return invalid_linker_state(project_dir, pkg_content),
+        };
+    check_install_state_with_linker(project_dir, pkg_content, linker_mode)
+}
+
+/// Invalid-linker freshness signal. Shared by [`check_install_state`]
+/// and [`check_install_state_with_content`]: when the env / config /
+/// `package.json` linker chain has a syntactically invalid value, the
+/// freshness predicate must NOT short-circuit as up-to-date — the
+/// trailing install pipeline is the seam that surfaces the parse error.
+///
+/// Returns `up_to_date: false` (never up-to-date when config is
+/// broken) with a `hash: Some(_)` placeholder computed against
+/// `LinkerMode::Isolated`. The `Some` matters: `dev.rs::needs_install`
+/// treats `hash: None` as "no package.json" and skips the install
+/// step entirely, which would silently mask the linker error from a
+/// user running `lpm dev`. With a placeholder hash, dev triggers the
+/// install attempt that fails loud — same posture as `lpm install`.
+fn invalid_linker_state(project_dir: &Path, pkg_content: &str) -> InstallState {
+    let lock_content = std::fs::read_to_string(project_dir.join("lpm.lock")).unwrap_or_default();
+    let file_link_bytes = collect_file_link_manifest_bytes(project_dir, pkg_content);
+    let placeholder = compute_install_hash_v6(
+        pkg_content,
+        &lock_content,
+        &file_link_bytes,
+        lpm_linker::LinkerMode::Isolated,
+    );
+    InstallState {
+        up_to_date: false,
+        hash: Some(placeholder),
+    }
+}
+
+/// Same as [`check_install_state_with_content`] but takes a
+/// pre-resolved linker mode from the caller. Used by the install
+/// pipeline, which already resolved the linker (and validated it
+/// fail-loud) for its own dispatch — saves a duplicate resolution.
+pub fn check_install_state_with_linker(
+    project_dir: &Path,
+    pkg_content: &str,
+    linker_mode: lpm_linker::LinkerMode,
+) -> InstallState {
     // Phase 44 mtime short-circuit also applies here. The caller may have
     // already read pkg.json for an earlier check, but the fast path still
     // skips the read of lpm.lock + the SHA-256 pass.
-    if let Some(state) = try_mtime_fast_path(project_dir) {
+    if let Some(state) = try_mtime_fast_path(project_dir, linker_mode) {
         return state;
     }
 
@@ -333,7 +412,8 @@ pub fn check_install_state_with_content(project_dir: &Path, pkg_content: &str) -
     // projects without local-source deps — matches the v2 semantic
     // (modulo the schema-tag bump invalidating v2 caches once).
     let file_link_bytes = collect_file_link_manifest_bytes(project_dir, pkg_content);
-    let current_hash = compute_install_hash_v3(pkg_content, &lock_content, &file_link_bytes);
+    let current_hash =
+        compute_install_hash_v6(pkg_content, &lock_content, &file_link_bytes, linker_mode);
 
     // Validate that package.json parses into the typed PackageJson struct —
     // the same deserialization the full install path uses via read_package_json()
@@ -429,7 +509,10 @@ pub fn check_install_state_with_content(project_dir: &Path, pkg_content: &str) -
 /// (which calls [`collect_file_link_manifest_bytes`] and recomputes
 /// the v3 hash) whenever the sentinel is present. The single-stat
 /// cost is negligible compared to the fast path's ~4 stats.
-fn try_mtime_fast_path(project_dir: &Path) -> Option<InstallState> {
+fn try_mtime_fast_path(
+    project_dir: &Path,
+    linker_mode: lpm_linker::LinkerMode,
+) -> Option<InstallState> {
     let nm = project_dir.join("node_modules");
     if !nm.exists() {
         return None;
@@ -464,6 +547,17 @@ fn try_mtime_fast_path(project_dir: &Path) -> Option<InstallState> {
     let (pkg_ns_str, lock_ns_str) = rest.split_once(':')?;
     let stored_pkg_ns: u64 = pkg_ns_str.parse().ok()?;
     let stored_lock_ns: u64 = lock_ns_str.parse().ok()?;
+
+    // v6: the install-hash gains an `l:<linker_mode>` line so the mtime
+    // fast path can detect a post-install env/config linker flip
+    // without recomputing the full SHA-256 over the manifest. Absent
+    // line → legacy v5-or-earlier file → bail to slow path; the v6
+    // schema tag will then mismatch and force re-install.
+    let linker_line = lines.next()?;
+    let stored_linker = linker_line.strip_prefix("l:")?;
+    if stored_linker != linker_mode.as_str() {
+        return None;
+    }
 
     let pkg_ns = mtime_ns(&project_dir.join("package.json"))?;
     // lpm.lock may be absent on a never-installed fast-lane entry; 0
@@ -500,11 +594,11 @@ fn mtime_ns(path: &Path) -> Option<u64> {
     Some(dur.as_nanos() as u64)
 }
 
-/// Phase 44: write `.lpm/install-hash` in the v2 format (hash line +
-/// optional mtime line). Callers just provide the pre-computed hash;
-/// this helper captures the current mtimes of `package.json` and
-/// `lpm.lock` at write time so subsequent up-to-date checks can take
-/// the mtime fast path.
+/// Write `.lpm/install-hash` in the v6 format (hash line + mtime line +
+/// linker line). Callers provide the pre-computed hash AND the linker
+/// mode that was effective for the install — both are needed so the
+/// mtime fast path can detect a post-install env/config linker flip
+/// without recomputing the full SHA-256.
 ///
 /// On any failure reading an mtime (typically missing lpm.lock on a
 /// dependency-less project), falls back to a `0` sentinel. A mismatch
@@ -514,13 +608,18 @@ fn mtime_ns(path: &Path) -> Option<u64> {
 /// Writes `.lpm/install-hash` atomically via `fs::write`, same as the
 /// prior byte-string-only writes — the ManifestTransaction snapshot
 /// machinery is unaffected.
-pub fn write_install_hash(project_dir: &Path, hash: &str) -> std::io::Result<()> {
+pub fn write_install_hash(
+    project_dir: &Path,
+    hash: &str,
+    linker_mode: lpm_linker::LinkerMode,
+) -> std::io::Result<()> {
     let pkg_ns = mtime_ns(&project_dir.join("package.json")).unwrap_or(0);
     let lock_ns = mtime_ns(&project_dir.join("lpm.lock")).unwrap_or(0);
 
     let hash_dir = project_dir.join(".lpm");
     std::fs::create_dir_all(&hash_dir)?;
-    let content = format!("{hash}\nm:{pkg_ns}:{lock_ns}\n");
+    let linker_str = linker_mode.as_str();
+    let content = format!("{hash}\nm:{pkg_ns}:{lock_ns}\nl:{linker_str}\n");
     std::fs::write(hash_dir.join("install-hash"), content)?;
 
     // Phase 59.1 day-3 (F7a) + round-6 audit response — manage the
@@ -822,18 +921,18 @@ mod tests {
         // that any accidental change to `INSTALL_HASH_SCHEMA_TAG` — or
         // removal of the `hasher.update(tag)` line — makes this test
         // fail loudly. The expected value below was computed from
-        //   SHA256("lpm-install-hash-v5\x00" || "pkg" || "\x00" || "lock" || "\x00")
-        // at the time the schema was bumped to v5 (Phase 59.1 round-6
-        // audit response, 2026-04-29). The trailing empty
-        // `file_link_manifests` section produces the final `\x00`
-        // separator with no content — same shape as a project with
-        // zero file:/link: deps and no workspace members. Updating
-        // this constant is a deliberate act that must accompany any
-        // schema-version bump.
+        //   SHA256("lpm-install-hash-v6\x00" || "pkg" || "\x00" || "lock"
+        //          || "\x00" || "\x00" || "isolated")
+        // at the time the schema was bumped to v6 (post-install linker
+        // freshness fold). `compute_install_hash` defaults the linker
+        // arg to `LinkerMode::Isolated`, so the v6 hash for the canonical
+        // inputs ends with `\x00 || "isolated"`. Updating this constant
+        // is a deliberate act that must accompany any schema-version
+        // bump.
         let actual = compute_install_hash("pkg", "lock");
-        let expected_v5 = "1273634afbd5aa082da8b470ec40833047135f97e9549c7ff618141cb1ae80aa";
+        let expected_v6 = "3adc9b6970027883b955378cd3dc894ff3a40df5875b4f3150e42254d04b623e";
         assert_eq!(
-            actual, expected_v5,
+            actual, expected_v6,
             "install-hash schema tag drift — bump INSTALL_HASH_SCHEMA_TAG and update this test \
              together. Current tag must produce the pinned hash for the fixed inputs."
         );
@@ -913,7 +1012,7 @@ mod tests {
             &fs::read_to_string(p.join("package.json")).unwrap(),
             "lock-content",
         );
-        write_install_hash(p, &hash).unwrap();
+        write_install_hash(p, &hash, lpm_linker::LinkerMode::Isolated).unwrap();
         dir
     }
 
@@ -992,16 +1091,16 @@ mod tests {
     }
 
     #[test]
-    fn write_install_hash_produces_v2_format() {
-        // Contract: the file content starts with the hash followed by
-        // `\nm:<pkg>:<lock>\n`. Pins the on-disk format so rollback
-        // compatibility (a v1 reader sees the hash on line 1 after trim)
-        // is preserved.
+    fn write_install_hash_produces_v6_format() {
+        // Contract: file content is hash + mtime line + linker line.
+        // Pins the on-disk format so a v1 reader still gets the hash on
+        // line 1 (legacy compat), AND the v6 mtime fast-path can detect
+        // a post-install linker flip without recomputing the full hash.
         let dir = TempDir::new().unwrap();
         let p = dir.path();
         fs::write(p.join("package.json"), r#"{"dependencies":{}}"#).unwrap();
         fs::write(p.join("lpm.lock"), "").unwrap();
-        write_install_hash(p, "abc123").unwrap();
+        write_install_hash(p, "abc123", lpm_linker::LinkerMode::Hoisted).unwrap();
         let content = fs::read_to_string(p.join(".lpm").join("install-hash")).unwrap();
         let mut lines = content.lines();
         assert_eq!(lines.next().unwrap(), "abc123");
@@ -1015,6 +1114,107 @@ mod tests {
         assert_eq!(parts.len(), 2, "mtime line must have two fields");
         assert!(parts[0].parse::<u64>().is_ok(), "pkg mtime must be u64");
         assert!(parts[1].parse::<u64>().is_ok(), "lock mtime must be u64");
+        let linker_line = lines.next().unwrap();
+        assert_eq!(
+            linker_line, "l:hoisted",
+            "expected linker line `l:hoisted`, got {linker_line:?}"
+        );
+    }
+
+    #[test]
+    fn linker_mode_folds_into_install_hash() {
+        // v6 contract: switching linker mode must produce a different
+        // hash for the same manifest + lockfile. Pre-v6 the hash only
+        // keyed off content, so a post-install env/config flip left
+        // the hash matching and the up-to-date fast-exit fired.
+        let isolated =
+            compute_install_hash_v6("pkg", "lock", &[], lpm_linker::LinkerMode::Isolated);
+        let hoisted = compute_install_hash_v6("pkg", "lock", &[], lpm_linker::LinkerMode::Hoisted);
+        assert_ne!(
+            isolated, hoisted,
+            "v6 must distinguish linker modes — otherwise the freshness \
+             cache stays warm across `LPM_LINKER` flips and silently \
+             leaves the project on the prior layout."
+        );
+    }
+
+    #[test]
+    fn mtime_fast_path_bails_when_stored_linker_differs() {
+        // Pin: an install-hash file whose stored linker line says
+        // `l:isolated` must NOT short-circuit a freshness check that
+        // resolves to `hoisted`. Without this guard, a user setting
+        // `LPM_LINKER=hoisted` after a successful isolated install
+        // would see "up to date" until they touched a manifest.
+        let dir = TempDir::new().unwrap();
+        let p = dir.path();
+        fs::write(p.join("package.json"), r#"{"dependencies":{}}"#).unwrap();
+        fs::write(p.join("lpm.lock"), "lock").unwrap();
+        fs::create_dir_all(p.join("node_modules")).unwrap();
+        // Write the install-hash for an isolated layout.
+        write_install_hash(p, "deadbeef", lpm_linker::LinkerMode::Isolated).unwrap();
+        // Mtime fast path with matching linker → up_to_date.
+        let same = try_mtime_fast_path(p, lpm_linker::LinkerMode::Isolated);
+        assert!(
+            same.map(|s| s.up_to_date).unwrap_or(false),
+            "matching linker should keep up_to_date=true on the fast path"
+        );
+        // Mtime fast path with FLIPPED linker → bails (returns None).
+        let flipped = try_mtime_fast_path(p, lpm_linker::LinkerMode::Hoisted);
+        assert!(
+            flipped.is_none(),
+            "stored linker `isolated` must NOT short-circuit a check \
+             resolving to `hoisted` — the freshness gate is the load-\
+             bearing seam for env/config-driven layout flips"
+        );
+    }
+
+    #[test]
+    fn check_install_state_with_content_returns_not_up_to_date_on_invalid_lpm_linker() {
+        // Pin: even when the cache is warm and would otherwise match,
+        // a syntactically invalid `LPM_LINKER` MUST surface as
+        // `up_to_date = false` so the trailing install pipeline can
+        // emit the parse error. Pre-fix the helper fell back to
+        // `LinkerMode::Isolated` and silently produced `up_to_date =
+        // true` — letting the bare `lpm install` sync fast lane and
+        // `lpm dev`'s `needs_install` helper short-circuit on
+        // misconfigured environments.
+        let _env = crate::test_env::ScopedEnv::set([("LPM_LINKER", "symlink".into())]);
+
+        let dir = setup_up_to_date_project_v2();
+        let pkg_content = fs::read_to_string(dir.path().join("package.json")).unwrap();
+        let state = check_install_state_with_content(dir.path(), &pkg_content);
+
+        assert!(
+            !state.up_to_date,
+            "warm cache must NOT short-circuit when LPM_LINKER is invalid \
+             — the trailing install pipeline is the fail-loud seam"
+        );
+        // `dev.rs::needs_install` reads `state.hash`; `None` means "no
+        // package.json" and skips install. The placeholder hash forces
+        // an install attempt instead, which surfaces the parse error.
+        assert!(
+            state.hash.is_some(),
+            "hash must be Some(_) so dev / sync-fast-lane callers \
+             trigger install — None signals 'no package.json' and \
+             would silently mask the misconfigured env"
+        );
+    }
+
+    #[test]
+    fn check_install_state_returns_not_up_to_date_on_invalid_lpm_linker() {
+        // Sibling pin for the entry point that does its own pkg.json
+        // read. Same contract as the `_with_content` variant above.
+        let _env = crate::test_env::ScopedEnv::set([("LPM_LINKER", "symlink".into())]);
+
+        let dir = setup_up_to_date_project_v2();
+        let state = check_install_state(dir.path());
+
+        assert!(
+            !state.up_to_date,
+            "warm cache must NOT short-circuit through `check_install_state` \
+             when LPM_LINKER is invalid"
+        );
+        assert!(state.hash.is_some());
     }
 
     #[test]
@@ -1247,7 +1447,7 @@ mod tests {
         // WOULD (with file/link bytes folded in).
         let bytes = collect_file_link_manifest_bytes(p, pkg);
         let initial_hash = compute_install_hash_v3(pkg, "lock-content", &bytes);
-        write_install_hash(p, &initial_hash).unwrap();
+        write_install_hash(p, &initial_hash, lpm_linker::LinkerMode::Isolated).unwrap();
 
         // Sanity: up-to-date right after install.
         assert!(check_install_state(p).up_to_date);
@@ -1402,8 +1602,8 @@ mod tests {
         fs::create_dir_all(p.join("node_modules")).unwrap();
         fs::create_dir_all(p.join(".lpm")).unwrap();
         let hash = compute_install_hash(pkg_json, lock);
-        // Use the real writer so the v2 mtime line is captured.
-        write_install_hash(p, &hash).unwrap();
+        // Use the real writer so the v6 mtime + linker lines are captured.
+        write_install_hash(p, &hash, lpm_linker::LinkerMode::Isolated).unwrap();
         // Populate legacy layout AFTER write_install_hash so the
         // mtime check on node_modules vs hash file isn't the thing
         // that bails (we want the migration gate to be the bailing

@@ -72,12 +72,80 @@ impl FetchCoordinator {
 /// doc for the full matrix.
 const DEFAULT_MAX_CONCURRENT_DOWNLOADS: usize = 24;
 
+/// Read `LPM_CONCURRENT_DOWNLOADS` from the environment. Valid values are
+/// integers in `1..=256`. Anything else (unparseable, zero, > 256) falls back
+/// to `DEFAULT_MAX_CONCURRENT_DOWNLOADS` AFTER emitting a stderr warning so
+/// users notice their override silently didn't apply. Unset → default,
+/// silently.
 fn max_concurrent_downloads() -> usize {
-    std::env::var("LPM_CONCURRENT_DOWNLOADS")
-        .ok()
-        .and_then(|v| v.parse::<usize>().ok())
-        .filter(|&n| n > 0 && n <= 256)
-        .unwrap_or(DEFAULT_MAX_CONCURRENT_DOWNLOADS)
+    let Some(raw) = std::env::var("LPM_CONCURRENT_DOWNLOADS").ok() else {
+        return DEFAULT_MAX_CONCURRENT_DOWNLOADS;
+    };
+    match raw.parse::<usize>() {
+        Ok(n) if n > 0 && n <= 256 => n,
+        _ => {
+            crate::output::warn(&format!(
+                "LPM_CONCURRENT_DOWNLOADS={raw:?} is not a valid integer in 1..=256 \
+                 — falling back to default ({DEFAULT_MAX_CONCURRENT_DOWNLOADS})"
+            ));
+            DEFAULT_MAX_CONCURRENT_DOWNLOADS
+        }
+    }
+}
+
+/// Single owner of the `.lpm/install-hash` write. Called from every
+/// successful exit path of [`run_with_options_under_store_lock`] —
+/// the empty-deps short-circuit AND the canonical end-of-function —
+/// so the freshness cache stays consistent regardless of which exit
+/// the install took. `dev.rs::auto_install_if_stale` used to
+/// double-write the hash with stale pre-install state, clobbering
+/// the v6 mtime/linker metadata; that block was removed when this
+/// helper became the single writer.
+///
+/// Re-reads `package.json` and `lpm.lock` AFTER the install rather
+/// than reusing pre-install captures, because save policy may have
+/// rewritten ranges (e.g., `"*"` → `"^4.3.6"`) and the linker may
+/// have written a fresh lockfile entry. A read failure on either
+/// (for example a partial install before lockfile materialization)
+/// falls back to empty-string content — same shape
+/// `check_install_state` uses on the freshness side, so the
+/// round-trip stays consistent.
+///
+/// Logs a `tracing::warn!` if the actual write fails. Pre-fix this
+/// was `let _ = ...` (silent), which left both this writer AND the
+/// retired dev.rs writer with no observability on disk failures.
+fn write_post_install_v6_hash(project_dir: &Path, linker_mode: lpm_linker::LinkerMode) {
+    let pkg = std::fs::read_to_string(project_dir.join("package.json")).unwrap_or_default();
+    let lock = std::fs::read_to_string(project_dir.join("lpm.lock")).unwrap_or_default();
+    let file_link_bytes = crate::install_state::collect_file_link_manifest_bytes(project_dir, &pkg);
+    let hash =
+        crate::install_state::compute_install_hash_v6(&pkg, &lock, &file_link_bytes, linker_mode);
+    if let Err(e) = crate::install_state::write_install_hash(project_dir, &hash, linker_mode) {
+        tracing::warn!(
+            "failed to write `.lpm/install-hash` after install ({e}) — \
+             the next freshness check will fall through to the slow path"
+        );
+    }
+}
+
+/// Empty installs still need the same durable on-disk markers the
+/// freshness cache keys on: `lpm.lock`, `node_modules/`, and the
+/// standard `lpm.lockb`/`.gitattributes` sidecar written by the main
+/// lockfile path. Without these, the empty-deps short-circuit would
+/// succeed once but never become warm-cache fresh, so every later
+/// `lpm install`, `lpm dev`, and sync fast-lane probe would fall back
+/// to the slow path despite the manifest already being fully applied.
+fn materialize_empty_install_artifacts(project_dir: &Path) -> Result<(), LpmError> {
+    let lockfile_path = project_dir.join(lpm_lockfile::LOCKFILE_NAME);
+    lpm_lockfile::Lockfile::default()
+        .write_all(&lockfile_path)
+        .map_err(|e| LpmError::Registry(format!("failed to write empty lockfile: {e}")))?;
+
+    lpm_lockfile::ensure_gitattributes(project_dir)
+        .map_err(|e| LpmError::Registry(format!("failed to ensure .gitattributes: {e}")))?;
+
+    std::fs::create_dir_all(project_dir.join("node_modules")).map_err(LpmError::Io)?;
+    Ok(())
 }
 
 /// Per-package fetch-stage timings collected inside one download task.
@@ -89,9 +157,9 @@ fn max_concurrent_downloads() -> usize {
 #[derive(Debug, Clone, Copy, Default)]
 struct TaskTimings {
     /// Time from tokio spawn to successful semaphore acquire. High values
-    /// indicate download concurrency (the 16-wide permit pool) is the
-    /// bottleneck — tasks are queued waiting for a slot rather than
-    /// running I/O.
+    /// indicate download concurrency (the configured permit pool, default
+    /// 24, overridable via `LPM_CONCURRENT_DOWNLOADS`) is the bottleneck —
+    /// tasks are queued waiting for a slot rather than running I/O.
     queue_wait_ms: u128,
     /// Phase 43 — time spent resolving the tarball URL (registry
     /// metadata round-trip when the lockfile didn't have a usable
@@ -2976,7 +3044,11 @@ pub async fn run_with_options(
     // trusted; only the manifest-boundary trust-on-first-use is
     // disabled.
     strict_integrity: bool,
-    linker_override: Option<&str>,
+    // Already-resolved linker override from CLI / `~/.lpm/config.toml` / env.
+    // `None` means fall through to `package.json > lpm > linker` (which is
+    // validated against `lpm_linker::LinkerMode::parse_str` inside the
+    // install pipeline) and finally the default isolated layout.
+    linker_override: Option<lpm_linker::LinkerMode>,
     no_skills: bool,
     no_editor_setup: bool,
     no_security_summary: bool,
@@ -3070,7 +3142,7 @@ async fn run_with_options_under_store_lock(
     force: bool,
     allow_new: bool,
     strict_integrity: bool,
-    linker_override: Option<&str>,
+    linker_override: Option<lpm_linker::LinkerMode>,
     no_skills: bool,
     no_editor_setup: bool,
     no_security_summary: bool,
@@ -3098,13 +3170,48 @@ async fn run_with_options_under_store_lock(
     let pkg = lpm_workspace::read_package_json(&pkg_json_path)
         .map_err(|e| LpmError::Registry(format!("failed to read package.json: {e}")))?;
 
-    // Fast-exit: if package.json + lockfile haven't changed and node_modules
-    // is intact, skip the entire install pipeline. Two stats + one read + one
-    // SHA-256 hash ≈ 1-2ms vs 82ms for a full warm install.
+    // Resolve the effective linker BEFORE the freshness check so:
+    //   1. Invalid CLI / config.toml / `LPM_LINKER` / `package.json > lpm
+    //      > linker` values fail loudly here, regardless of whether the
+    //      cache would otherwise short-circuit the install. Pre-fix, an
+    //      invalid env value was silently masked on the up-to-date path.
+    //   2. The resolved mode folds into the install-hash via
+    //      `check_install_state_with_linker`, so a post-install flip of
+    //      `LPM_LINKER` or `~/.lpm/config.toml > linker` invalidates the
+    //      "up to date" cache and triggers a re-link.
+    // Precedence: caller-supplied CLI override > config.toml > env >
+    // `package.json > lpm > linker` > default isolated. Lives in the
+    // shared `linker_config::resolve_effective_linker` so every install
+    // entry point (top-level + the 9 internal callers) honors the same
+    // chain.
+    let global_cfg = crate::commands::config::GlobalConfig::load();
+    let linker_mode =
+        crate::linker_config::resolve_effective_linker(linker_override, &pkg, &global_cfg)
+            .map_err(|e| {
+                LpmError::Script(format!(
+                    "{e} \
+             Update the offending surface or override with \
+             `--linker=<isolated|hoisted>`."
+                ))
+            })?;
+
+    // Fast-exit: if package.json + lockfile haven't changed AND the
+    // resolved linker matches the one used for the prior install, skip
+    // the entire install pipeline. Two stats + one read + one SHA-256
+    // hash ≈ 1-2ms vs 82ms for a full warm install.
     // --force bypasses this check to force a full re-install.
     //
-    // Phase 34.1: uses the shared install_state predicate (single source of truth).
-    let install_state = crate::install_state::check_install_state(project_dir);
+    // Linker freshness: `check_install_state_with_linker` folds the
+    // mode into the hash so a post-install flip of `LPM_LINKER` /
+    // `~/.lpm/config.toml > linker` invalidates the cache. The mtime
+    // fast path also reads the `l:<mode>` line written by
+    // `write_install_hash` to detect the same flip without re-hashing.
+    let pkg_content_for_state = std::fs::read_to_string(&pkg_json_path).unwrap_or_default();
+    let install_state = crate::install_state::check_install_state_with_linker(
+        project_dir,
+        &pkg_content_for_state,
+        linker_mode,
+    );
     if !force && !offline && install_state.up_to_date {
         let elapsed = start.elapsed();
         let total_ms = elapsed.as_millis();
@@ -3427,6 +3534,11 @@ async fn run_with_options_under_store_lock(
         ));
     }
 
+    // `linker_mode` was resolved above — before `check_install_state` —
+    // so it covers both validation (fail-loud on invalid values) and
+    // freshness (post-install env/config flips invalidate the cache).
+    // No re-resolution here.
+
     if deps.is_empty() && workspace_member_deps.is_empty() {
         // Phase 32 Phase 2 audit fix: emit a proper JSON object even on the
         // empty-deps short-circuit so agents driving install always get a
@@ -3467,6 +3579,17 @@ async fn run_with_options_under_store_lock(
         {
             tracing::warn!("failed to delete stale overrides-state.json: {e}");
         }
+        // Single-writer ownership: the install pipeline writes the v6
+        // install-hash on EVERY successful exit path so `dev.rs` and
+        // the freshness helpers don't need a parallel writer that
+        // would (a) duplicate the write and (b) clobber the v6 mtime
+        // / linker metadata with a stale single-line bare hash. The
+        // empty-deps case is meaningful when the project transitioned
+        // from "had deps" → "removed all deps": the hash captures the
+        // post-removal state so a future freshness check sees a
+        // consistent fingerprint instead of the pre-removal hash.
+        materialize_empty_install_artifacts(project_dir)?;
+        write_post_install_v6_hash(project_dir, linker_mode);
         return Ok(());
     }
 
@@ -3526,15 +3649,6 @@ async fn run_with_options_under_store_lock(
              invalidating lockfile fast path"
         );
     }
-
-    // Determine linker mode early: CLI flag > package.json config > default (isolated)
-    let linker_mode = linker_override
-        .or_else(|| pkg.lpm.as_ref().and_then(|l| l.linker.as_deref()))
-        .map(|s| match s {
-            "hoisted" => lpm_linker::LinkerMode::Hoisted,
-            _ => lpm_linker::LinkerMode::Isolated,
-        })
-        .unwrap_or(lpm_linker::LinkerMode::Isolated);
 
     // Step 2: Try lockfile fast path, else resolve
     let lockfile_path = project_dir.join(lpm_lockfile::LOCKFILE_NAME);
@@ -6263,18 +6377,7 @@ async fn run_with_options_under_store_lock(
     // Phase 44: delegated to `write_install_hash`, which also captures
     // manifest mtimes into the v2 file format so the next up-to-date
     // check can take the mtime fast path.
-    if let (Ok(pkg), Ok(lock)) = (
-        std::fs::read_to_string(project_dir.join("package.json")),
-        std::fs::read_to_string(project_dir.join("lpm.lock")),
-    ) {
-        // Phase 59.1 day-3 (F7a): write the v3 hash including file/
-        // link manifest bytes so the next up-to-date check matches
-        // exactly what `check_install_state_with_content` recomputes.
-        let file_link_bytes =
-            crate::install_state::collect_file_link_manifest_bytes(project_dir, &pkg);
-        let hash = crate::install_state::compute_install_hash_v3(&pkg, &lock, &file_link_bytes);
-        let _ = crate::install_state::write_install_hash(project_dir, &hash);
-    }
+    write_post_install_v6_hash(project_dir, linker_mode);
 
     // Phase 33 audit Finding 1 fix: surface the direct-dep version map
     // for callers (`run_add_packages`, `run_install_filtered_add`) that

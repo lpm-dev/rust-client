@@ -185,6 +185,88 @@ pub enum LinkerMode {
     Hoisted,
 }
 
+impl LinkerMode {
+    /// Accepted string values across every config surface: the `--linker`
+    /// CLI flag (clamped at parse time by clap), `package.json > lpm > linker`,
+    /// `~/.lpm/config.toml > linker`, and the `LPM_LINKER` env var.
+    pub const ACCEPTED_VALUES: &'static [&'static str] = &["isolated", "hoisted"];
+
+    /// Parse a linker mode string from any non-CLI config surface
+    /// (`package.json`, `config.toml`, env). Unknown values produce a
+    /// human-readable error so the install entry point can surface them
+    /// loudly before any work begins. The CLI surface is parsed by clap
+    /// directly via the `LinkerCli` value-enum and never reaches this
+    /// function as a free string.
+    pub fn parse_str(s: &str) -> Result<Self, String> {
+        match s {
+            "isolated" => Ok(Self::Isolated),
+            "hoisted" => Ok(Self::Hoisted),
+            other => Err(format!(
+                "unknown linker mode {other:?}. Accepted values: {accepted}.",
+                accepted = Self::ACCEPTED_VALUES
+                    .iter()
+                    .map(|v| format!("{v:?}"))
+                    .collect::<Vec<_>>()
+                    .join(", "),
+            )),
+        }
+    }
+
+    /// Stable string representation that round-trips through `parse_str`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Isolated => "isolated",
+            Self::Hoisted => "hoisted",
+        }
+    }
+}
+
+#[cfg(test)]
+mod linker_mode_tests {
+    use super::LinkerMode;
+
+    #[test]
+    fn parse_str_accepts_canonical_values() {
+        assert_eq!(
+            LinkerMode::parse_str("isolated").unwrap(),
+            LinkerMode::Isolated
+        );
+        assert_eq!(
+            LinkerMode::parse_str("hoisted").unwrap(),
+            LinkerMode::Hoisted
+        );
+    }
+
+    #[test]
+    fn parse_str_rejects_legacy_symlink_alias() {
+        // "symlink" was documented as a legacy alias on the package.json
+        // schema but never recognized by the install dispatch — typing it
+        // silently fell back to Isolated. The new contract is fail-loud.
+        let err = LinkerMode::parse_str("symlink").unwrap_err();
+        assert!(err.contains("unknown linker mode"));
+        assert!(err.contains("\"isolated\""));
+        assert!(err.contains("\"hoisted\""));
+    }
+
+    #[test]
+    fn parse_str_rejects_typos_loudly() {
+        for bad in ["hosited", "Isolated", "HOISTED", "", " hoisted ", "default"] {
+            let err = LinkerMode::parse_str(bad).unwrap_err();
+            assert!(
+                err.contains("unknown linker mode"),
+                "value {bad:?} should reject"
+            );
+        }
+    }
+
+    #[test]
+    fn as_str_round_trips() {
+        for mode in [LinkerMode::Isolated, LinkerMode::Hoisted] {
+            assert_eq!(LinkerMode::parse_str(mode.as_str()).unwrap(), mode);
+        }
+    }
+}
+
 /// Create a symlink (Unix) or junction (Windows) from `link` pointing to `target`.
 ///
 /// On Windows, NTFS junctions don't require admin privileges (unlike symlinks).

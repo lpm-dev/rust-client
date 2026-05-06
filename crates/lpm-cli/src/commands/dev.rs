@@ -860,18 +860,23 @@ async fn auto_install_if_stale(
 
     let start = std::time::Instant::now();
 
-    let (stale, hash) = needs_install(project_dir);
+    let (stale, _) = needs_install(project_dir);
     if !stale {
         let elapsed = start.elapsed();
         return Ok(format!("up to date ({})", format_duration(elapsed)));
     }
 
-    // Hash was already computed by needs_install — reuse it
-    let current_hash = hash.unwrap();
-    let hash_file = project_dir.join(".lpm").join("install-hash");
-
     output::info("Dependencies out of date, installing...");
 
+    // Single-writer ownership: `run_with_options` is the only writer
+    // of `.lpm/install-hash`. Pre-fix this branch wrote a stale,
+    // pre-install single-line hash AFTER the install returned,
+    // clobbering the v6 mtime / linker metadata the install pipeline
+    // had just written and (worse) using the pre-install hash even
+    // though save policy may have rewritten ranges during install.
+    // The install pipeline now writes the correct v6 hash on every
+    // successful exit path; this branch just propagates success.
+    //
     // Phase 35 Step 6 fix: use the injected client. Pre-fix this
     // built a fresh `RegistryClient::new()` with no token, so any
     // `@lpm.dev` package required by the dev project would have been
@@ -898,17 +903,6 @@ async fn auto_install_if_stale(
     .await
     {
         Ok(()) => {
-            // Write install hash so the next `lpm dev` skips install if deps are unchanged
-            if let Err(e) = std::fs::create_dir_all(project_dir.join(".lpm")) {
-                output::warn(&format!(
-                    "Could not create .lpm directory: {e}\n    Dependency check will re-run next time."
-                ));
-            }
-            if let Err(e) = std::fs::write(&hash_file, &current_hash) {
-                output::warn(&format!(
-                    "Could not save install hash: {e}\n    Dependency check will re-run next time."
-                ));
-            }
             let elapsed = start.elapsed();
             Ok(format!("installed in {}", format_duration(elapsed)))
         }
@@ -1342,6 +1336,107 @@ mod tests {
         let (stale, hash) = needs_install(dir.path());
         assert!(!stale);
         assert!(hash.is_none());
+    }
+
+    /// Dev composed contract: `auto_install_if_stale` MUST leave a
+    /// v6-shaped `.lpm/install-hash` on disk (3 lines: hash + `m:` +
+    /// `l:`). Pre-fix dev wrote a competing bare single-line hash
+    /// post-install, clobbering the v6 mtime / linker metadata that
+    /// `run_with_options` had just written; the post-fix design
+    /// delegates the entire write to the install pipeline. This test
+    /// exercises the real seam — calls `auto_install_if_stale` against
+    /// an empty-deps project (no network needed; the install pipeline
+    /// short-circuits at the empty-deps branch), then asserts the
+    /// install-hash file is v6 shape. A future regression that
+    /// reintroduces a parallel bare-hash overwrite in `auto_install_if_stale`
+    /// (or anywhere else in the dev flow) fails here immediately.
+    #[tokio::test]
+    async fn auto_install_if_stale_writes_v6_install_hash_for_empty_deps() {
+        // Isolate every env var the install pipeline reads so a
+        // developer's exported state can't pollute the test. `LPM_HOME`
+        // redirects the store + cache + global config away from the
+        // user's real `~/.lpm/`. `LPM_LINKER` is cleared so the install
+        // resolves to the default Isolated. CI env vars are cleared so
+        // OIDC paths don't fire.
+        let home = TempDir::new().unwrap();
+        let project = TempDir::new().unwrap();
+        let p = project.path();
+        let pkg = r#"{"name":"dev-auto-install-v6","version":"1.0.0","dependencies":{}}"#;
+        fs::write(p.join("package.json"), pkg).unwrap();
+
+        let _env = crate::test_env::ScopedEnv::update([
+            (
+                "LPM_HOME",
+                Some(std::ffi::OsString::from(home.path().as_os_str())),
+            ),
+            (
+                "HOME",
+                Some(std::ffi::OsString::from(home.path().as_os_str())),
+            ),
+            ("LPM_LINKER", None),
+            ("LPM_TOKEN", None),
+            ("NPM_TOKEN", None),
+            ("GITHUB_ACTIONS", None),
+            ("GITLAB_CI", None),
+            ("LPM_FORCE_FILE_AUTH", Some(std::ffi::OsString::from("1"))),
+            ("LPM_NO_UPDATE_CHECK", Some(std::ffi::OsString::from("1"))),
+        ]);
+
+        // RegistryClient::new() doesn't make network calls; the
+        // empty-deps install short-circuits before any registry round-
+        // trip would fire.
+        let client = lpm_registry::RegistryClient::new();
+
+        // Pre-condition: project is stale (no install-hash yet).
+        let (stale_before, _) = needs_install(p);
+        assert!(
+            stale_before,
+            "fresh project must look stale before auto_install_if_stale runs"
+        );
+
+        // Exercise the real dev seam.
+        let result = auto_install_if_stale(&client, p).await;
+        assert!(
+            result.is_ok(),
+            "auto_install_if_stale must succeed on empty-deps project, got: {result:?}"
+        );
+
+        // Load-bearing pin: install-hash on disk has v6 shape (3 lines).
+        // A regression that reintroduces `fs::write(install_hash, &bare_hash)`
+        // anywhere in the dev path — inside auto_install_if_stale or a
+        // helper it calls — fails the line-count assertion here.
+        let on_disk = fs::read_to_string(p.join(".lpm").join("install-hash"))
+            .expect("install-hash must exist after auto_install_if_stale");
+        let lines: Vec<&str> = on_disk.lines().collect();
+        assert_eq!(
+            lines.len(),
+            3,
+            "install-hash MUST be v6 (3 lines: hash + m: + l:), got:\n{on_disk}\n\
+             A bare-hash overwrite anywhere in the dev path would fail here."
+        );
+        assert_eq!(lines[0].len(), 64, "line 1 must be a SHA-256 hex hash");
+        assert!(
+            lines[1].starts_with("m:"),
+            "line 2 must be mtime, got {:?}",
+            lines[1]
+        );
+        assert_eq!(
+            lines[2], "l:isolated",
+            "line 3 must be linker, got {:?}",
+            lines[2]
+        );
+
+        // Round-trip: needs_install reads the v6 shape as up-to-date.
+        let (stale_after, hash) = needs_install(p);
+        assert!(
+            !stale_after,
+            "after auto_install_if_stale, needs_install must report up-to-date"
+        );
+        assert_eq!(
+            hash.as_deref(),
+            Some(lines[0]),
+            "needs_install must return the same hash that's on disk"
+        );
     }
 
     // ── Finding #1: should_open_browser logic ──

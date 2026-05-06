@@ -10,6 +10,40 @@ use support::assertions::{JsonType, assert_json_field, parse_json_output};
 use support::mock_registry::MockRegistry;
 use support::{TempProject, lpm, lpm_with_registry};
 
+// ─── lpm info --json ───────────────────────────────────────────────
+
+#[tokio::test]
+async fn info_json_accepts_subcommand_version_flag_without_panic() {
+    let project = TempProject::empty(r#"{"name": "test", "version": "1.0.0"}"#);
+    let mock = MockRegistry::start().await;
+    let tarball = support::mock_registry::make_tarball("@lpm.dev/owner.react", "1.0.0");
+    mock.with_package("@lpm.dev/owner.react", "1.0.0", &tarball)
+        .await;
+
+    let output = lpm_with_registry(&project, &mock.url())
+        .args(["info", "owner.react", "--version", "1.0.0", "--json"])
+        .output()
+        .expect("failed to run lpm info --json");
+
+    assert!(
+        output.status.success(),
+        "lpm info --json failed:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+
+    let json = parse_json_output(&output.stdout);
+    assert_json_field(&json, "success", JsonType::Bool);
+    assert_json_field(&json, "name", JsonType::String);
+    assert_eq!(json["success"], true);
+    assert_eq!(json["name"], "@lpm.dev/owner.react");
+    assert_eq!(json["dist-tags"]["latest"], "1.0.0");
+    assert!(
+        json["versions"].get("1.0.0").is_some(),
+        "info --json must include the requested version metadata"
+    );
+}
+
 // ─── lpm health --json ───────────────────────────────────────────
 
 #[tokio::test]
