@@ -502,6 +502,6 @@ mod tests {
         let npmrc = NpmrcConfig::parse(content, "test", &no_env);
         let table = RouteTable::new(RouteMode::Direct, npmrc).expect("warnings don't block");
         assert_eq!(table.npmrc_warnings().len(), 1);
-        assert!(table.npmrc_warnings()[0].contains("Phase 58.3"));
+        assert!(table.npmrc_warnings()[0].contains("not supported yet"));
     }
 }

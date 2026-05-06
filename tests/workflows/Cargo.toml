@@ -23,6 +23,7 @@ rcgen = { version = "0.13", features = ["pem"] }
 reqwest = { workspace = true }
 lpm-vault = { path = "../../crates/lpm-vault" }
 lpm-lockfile = { path = "../../crates/lpm-lockfile" }
+lpm-security = { path = "../../crates/lpm-security" }
 tar = { workspace = true }
 flate2 = { workspace = true }
 aes-gcm = { workspace = true }

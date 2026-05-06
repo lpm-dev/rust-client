@@ -44,6 +44,67 @@ pub enum Selector {
     },
 }
 
+/// Group a behavioral tag belongs to. The 22 tags split across three
+/// groups: source-behavior tags (what the code does), supply-chain
+/// tags (what the artifact looks like), and manifest tags (what
+/// `package.json` declares).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum TagGroup {
+    /// Source-code behavior — what the package does at runtime.
+    Source,
+    /// Supply-chain / artifact-shape signals (obfuscation, minified, …).
+    SupplyChain,
+    /// `package.json` declarations (license, wildcard deps, …).
+    Manifest,
+}
+
+impl fmt::Display for TagGroup {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Source => write!(f, "source"),
+            Self::SupplyChain => write!(f, "supply-chain"),
+            Self::Manifest => write!(f, "manifest"),
+        }
+    }
+}
+
+/// One row of the behavioral-tag catalog — single source of truth for
+/// the 22 tags emitted by `lpm audit` / `lpm query`. Includes the CLI
+/// token (e.g., `:eval`), the group it belongs to, the severity tier,
+/// and a short user-facing description. The drift test in
+/// `lpm-workflows` asserts the doc tables in `security-audit.mdx` and
+/// `query.mdx` round-trip against this catalog exactly.
+#[derive(Debug, Clone, Copy)]
+pub struct BehavioralTagInfo {
+    /// CLI token with leading colon (e.g., `:eval`).
+    pub token: &'static str,
+    /// Group the tag belongs to.
+    pub group: TagGroup,
+    /// Severity tier reported by `lpm query --count`.
+    pub severity: Severity,
+    /// Short user-facing description ("Detects" / "Matches" prose).
+    pub description: &'static str,
+}
+
+/// The full behavioral-tag catalog, in display order. Length is the
+/// authoritative tag count — every doc page that mentions "N tags"
+/// should derive its number from this rather than hardcoding it.
+pub fn behavioral_tag_catalog() -> Vec<BehavioralTagInfo> {
+    PseudoClass::all_behavioral()
+        .iter()
+        .map(|&pc| BehavioralTagInfo {
+            token: pc.display_name(),
+            group: pc
+                .group()
+                .expect("all_behavioral entries must have a group"),
+            severity: pc.severity(),
+            description: pc
+                .description()
+                .expect("all_behavioral entries must have a description"),
+        })
+        .collect()
+}
+
 /// All recognized pseudo-class selectors.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum PseudoClass {
@@ -192,7 +253,10 @@ impl PseudoClass {
         }
     }
 
-    /// All 22 behavioral tag pseudo-classes (excludes state/severity/special).
+    /// All behavioral tag pseudo-classes (excludes state/severity/special).
+    /// Length is intentionally not exposed as a public constant — every
+    /// caller that wants to display "N tags" should derive it from
+    /// `behavioral_tag_catalog().len()` so doc count prose can't drift.
     pub fn all_behavioral() -> &'static [PseudoClass] {
         &[
             Self::Eval,
@@ -218,6 +282,74 @@ impl PseudoClass {
             Self::Copyleft,
             Self::NoLicense,
         ]
+    }
+
+    /// Tag group — `Source`, `SupplyChain`, or `Manifest` for the 22
+    /// behavioral tags; `None` for state / severity / special selectors
+    /// that aren't part of the behavioral analysis catalog.
+    pub fn group(self) -> Option<TagGroup> {
+        match self {
+            Self::Eval
+            | Self::Network
+            | Self::Fs
+            | Self::Shell
+            | Self::ChildProcess
+            | Self::Native
+            | Self::Crypto
+            | Self::DynamicRequire
+            | Self::Env
+            | Self::Ws => Some(TagGroup::Source),
+            Self::Obfuscated
+            | Self::HighEntropy
+            | Self::Minified
+            | Self::Telemetry
+            | Self::UrlStrings
+            | Self::Trivial
+            | Self::Protestware => Some(TagGroup::SupplyChain),
+            Self::GitDep | Self::HttpDep | Self::WildcardDep | Self::Copyleft | Self::NoLicense => {
+                Some(TagGroup::Manifest)
+            }
+            _ => None,
+        }
+    }
+
+    /// Short user-facing description ("Detects" prose). Returned for
+    /// every behavioral pseudo-class; `None` for state / severity /
+    /// special selectors. Doc tables MUST mirror these strings — the
+    /// drift test in `lpm-workflows` enforces parity, so editing this
+    /// catalog is the single source of truth.
+    pub fn description(self) -> Option<&'static str> {
+        Some(match self {
+            // Source behavior
+            Self::Eval => "Use `eval`, `Function()`, or `vm.runInThisContext`",
+            Self::Network => "Make outbound HTTP / WS connections",
+            Self::Fs => "Touch the filesystem outside their own directory",
+            Self::Shell => "Spawn shells (`spawn`, `exec`, `execSync`)",
+            Self::ChildProcess => "Use `child_process` (any form)",
+            Self::Native => "Ship native modules (`.node`, `.wasm`)",
+            Self::Crypto => "Use cryptographic primitives",
+            Self::DynamicRequire => "Use dynamic `require()` (variable arg)",
+            Self::Env => "Read `process.env`",
+            Self::Ws => "Use WebSockets",
+            // Supply chain
+            Self::Obfuscated => "Show signs of code obfuscation",
+            Self::HighEntropy => "Contain high-entropy string blobs",
+            Self::Minified => "Ship minified-only source",
+            Self::Telemetry => "Make telemetry / analytics calls",
+            Self::UrlStrings => "Contain URL string literals",
+            Self::Trivial => "Tiny — measured by AST node count",
+            Self::Protestware => {
+                "Match a curated list of known protest-license / sabotage packages"
+            }
+            // Manifest
+            Self::GitDep => "Installed from a git URL",
+            Self::HttpDep => "Installed from an HTTP tarball URL",
+            Self::WildcardDep => "Declared with `*` or `latest`",
+            Self::Copyleft => "Copyleft license (GPL family)",
+            Self::NoLicense => "No `license` field",
+            // State / severity / special — no catalog entry
+            _ => return None,
+        })
     }
 
     /// Severity tier for this pseudo-class (for --count grouping).
@@ -1063,6 +1195,71 @@ mod tests {
         AnalysisMeta, PackageAnalysis, manifest::ManifestTags, source::SourceTags,
         supply_chain::SupplyChainTags,
     };
+
+    // ── Catalog sanity tests ────────────────────────────────────────
+
+    #[test]
+    fn behavioral_tag_catalog_has_an_entry_for_every_all_behavioral_member() {
+        let catalog = behavioral_tag_catalog();
+        let by_token: std::collections::HashMap<&str, &BehavioralTagInfo> =
+            catalog.iter().map(|t| (t.token, t)).collect();
+        for &pc in PseudoClass::all_behavioral() {
+            let token = pc.display_name();
+            assert!(
+                by_token.contains_key(token),
+                "behavioral catalog missing entry for {token}"
+            );
+        }
+        assert_eq!(catalog.len(), PseudoClass::all_behavioral().len());
+    }
+
+    #[test]
+    fn behavioral_tag_catalog_groups_partition_into_source_supply_manifest() {
+        let catalog = behavioral_tag_catalog();
+        let mut source = 0;
+        let mut supply = 0;
+        let mut manifest = 0;
+        for tag in &catalog {
+            match tag.group {
+                TagGroup::Source => source += 1,
+                TagGroup::SupplyChain => supply += 1,
+                TagGroup::Manifest => manifest += 1,
+            }
+        }
+        assert_eq!(
+            source + supply + manifest,
+            catalog.len(),
+            "every catalog entry must have a group"
+        );
+        assert!(source >= 1, "at least one source-behavior tag must exist");
+        assert!(supply >= 1, "at least one supply-chain tag must exist");
+        assert!(manifest >= 1, "at least one manifest tag must exist");
+    }
+
+    #[test]
+    fn behavioral_tag_descriptions_are_non_empty() {
+        for &pc in PseudoClass::all_behavioral() {
+            let desc = pc
+                .description()
+                .unwrap_or_else(|| panic!("{} must have a description", pc.display_name()));
+            assert!(
+                !desc.trim().is_empty(),
+                "{}'s description must not be empty",
+                pc.display_name()
+            );
+        }
+    }
+
+    #[test]
+    fn behavioral_tag_tokens_round_trip_through_from_name() {
+        for &pc in PseudoClass::all_behavioral() {
+            let token = pc.display_name();
+            let name = token.strip_prefix(':').expect("token must start with ':'");
+            let parsed = PseudoClass::from_name(name)
+                .unwrap_or_else(|| panic!("{token} must round-trip through from_name"));
+            assert_eq!(parsed, pc, "{token} round-trip mismatch");
+        }
+    }
 
     fn default_analysis() -> PackageAnalysis {
         PackageAnalysis {

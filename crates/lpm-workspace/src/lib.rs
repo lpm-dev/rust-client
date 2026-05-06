@@ -743,13 +743,12 @@ pub struct LpmConfig {
     #[serde(default)]
     pub overrides: HashMap<String, String>,
 
-    /// **Phase 32 Phase 6** — local-only patches applied to packages
-    /// after install (the `patch-package` workflow). Map of selector →
-    /// patch metadata.
+    /// Local-only patches applied to packages after install (the
+    /// `patch-package` workflow). Map of selector → patch metadata.
     ///
     /// Selector format: `"<name>@<exact-version>"` (e.g.,
-    /// `"lodash@4.17.21"`). Phase 6 accepts only exact-version pins;
-    /// range selectors are reserved for Phase 6.1.
+    /// `"lodash@4.17.21"`). Only exact-version pins are accepted today;
+    /// range selectors are not supported yet.
     ///
     /// The patch metadata records the path to the `.patch` file (under
     /// `patches/` next to this `package.json`) and the SRI integrity

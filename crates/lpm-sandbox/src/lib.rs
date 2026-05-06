@@ -250,7 +250,7 @@ pub enum SandboxError {
     /// (the whole platform lacks a backend) so callers + tests can
     /// distinguish "no containment here" from "no diagnostic mode
     /// here, but Enforce works fine."
-    #[error("sandbox mode {mode:?} is not supported on {platform} in Phase 46 P5 — {remediation}")]
+    #[error("sandbox mode {mode:?} is not supported on {platform} — {remediation}")]
     ModeNotSupportedOnPlatform {
         /// Lowercase platform identifier (`"linux"`, `"windows"`, …).
         platform: String,
@@ -408,12 +408,11 @@ pub fn prepare_writable_dirs(spec: &SandboxSpec) -> Result<(), SandboxError> {
 
 /// User-facing remediation string for [`SandboxError::UnsupportedPlatform`].
 ///
-/// Centralized so Windows (Phase 46.1 deferral) and generic-unix
-/// platforms share consistent wording, and so Chunk 4's CLI-side
-/// message test has a single source of truth.
+/// Centralized so unsupported platforms share consistent wording and
+/// the CLI-side message test has a single source of truth.
 pub fn unsupported_remediation(platform: &str) -> String {
     match platform {
-        "windows" => "enforcement deferred to Phase 46.1. Re-run with \
+        "windows" => "sandbox enforcement isn't supported on Windows yet. Re-run with \
 			 --unsafe-full-env --no-sandbox to execute scripts without \
 			 containment, or set script-policy = deny."
             .to_string(),
@@ -571,7 +570,7 @@ mod tests {
         };
         let msg = format!("{e}");
         assert!(msg.contains("windows"), "got: {msg}");
-        assert!(msg.contains("Phase 46.1"), "got: {msg}");
+        assert!(msg.contains("isn't supported"), "got: {msg}");
         assert!(msg.contains("--unsafe-full-env --no-sandbox"), "got: {msg}");
     }
 
@@ -631,9 +630,9 @@ mod tests {
     }
 
     #[test]
-    fn unsupported_remediation_windows_points_to_46_1_and_escape_hatch() {
+    fn unsupported_remediation_windows_says_not_supported_yet_and_names_escape_hatch() {
         let s = unsupported_remediation("windows");
-        assert!(s.contains("Phase 46.1"));
+        assert!(s.contains("isn't supported"));
         assert!(s.contains("--unsafe-full-env --no-sandbox"));
         assert!(s.contains("script-policy = deny"));
     }

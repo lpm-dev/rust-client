@@ -241,11 +241,23 @@ pub async fn run(
     // Back up existing lpm.lock if overwriting
     migration_backup.backup_file(&lockfile_path)?;
 
-    // Back up .gitattributes if it exists (will be modified by ensure_gitattributes)
+    // Back up lpm.lockb too — `Lockfile::write_all` writes both files
+    // atomically (the binary file is derived from the TOML content), so
+    // both need to round-trip through the backup chain. Without this
+    // line, a fresh migration's freshly-created lpm.lockb would survive
+    // `lpm migrate --rollback` even after lpm.lock was removed from the
+    // `created` list, leaving the project with a stale binary lockfile.
+    let lockb_path = cwd.join("lpm.lockb");
+    migration_backup.backup_file(&lockb_path)?;
+
+    // Back up .gitattributes unconditionally — `ensure_gitattributes`
+    // creates the file when missing AND modifies it when present, so
+    // the backup chain needs to track it on both paths. With the
+    // existence guard the v2 manifest's `created` array would miss the
+    // newly-created file, leaving a stray `.gitattributes` on disk
+    // after `lpm migrate --rollback`.
     let gitattributes_path = cwd.join(".gitattributes");
-    if gitattributes_path.exists() {
-        migration_backup.backup_file(&gitattributes_path)?;
-    }
+    migration_backup.backup_file(&gitattributes_path)?;
 
     // Phase 64 #34 / #35 — back up package.json IFF EITHER plan is
     // about to write to it. Skipping when there's nothing to apply
@@ -554,6 +566,11 @@ pub async fn run(
             )
             .dimmed(),
         );
+        eprintln!(
+            "    {} Need to undo? Run {}",
+            "3.".dimmed(),
+            "lpm migrate --rollback".bold(),
+        );
         eprintln!();
     }
 
@@ -829,13 +846,11 @@ fn run_rollback(cwd: &Path, json: bool) -> Result<(), LpmError> {
         );
     }
 
+    // The backup layer's v2 manifest tracks lpm.lock + lpm.lockb both as
+    // "newly created" (when the migration was fresh) or as restored from
+    // backup (when overwriting). No special-case handling needed here —
+    // every file the migration touched round-trips through the manifest.
     let restored = backup::rollback_from_backups(cwd)?;
-
-    // Also remove lpm.lockb if lpm.lock was restored (the binary lockfile is derived)
-    let lockb_path = cwd.join("lpm.lockb");
-    if lockb_path.exists() && restored.iter().any(|f| f == "lpm.lock") {
-        let _ = std::fs::remove_file(&lockb_path);
-    }
 
     if json {
         let output = serde_json::json!({

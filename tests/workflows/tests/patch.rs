@@ -5,7 +5,7 @@
 //!   sentinels), prints a breadcrumb, and surfaces the staging path.
 //! - `lpm patch-commit <dir>` writes `patches/<key>.patch`, updates
 //!   `package.json > lpm > patchedDependencies`, and cleans up staging.
-//! - Range version keys are rejected (Phase 6.1 reserved territory).
+//! - Range version keys are rejected (only exact pins are supported today).
 //! - Binary-file changes are rejected (text-only patch contract).
 //! - "No changes" attempts hard-error with a clear diagnostic.
 //!
@@ -195,9 +195,13 @@ fn patch_rejects_range_keys() {
         String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr)
     ));
+    // miette may wrap the message across lines, so check the two halves
+    // independently rather than as a single substring.
     assert!(
-        combined.contains("range version") || combined.contains("Phase 6.1"),
-        "error must mention range / Phase 6.1; got:\n{combined}"
+        combined.contains("range version")
+            && (combined.contains("not\n") || combined.contains("not "))
+            && combined.contains("supported yet"),
+        "error must say range version isn't supported yet; got:\n{combined}"
     );
 }
 

@@ -508,6 +508,16 @@ fn migrate_dry_run_does_not_write_lockfile() {
 fn migrate_rollback_restores_original() {
     let project = TempProject::from_fixture("migrate-npm");
 
+    // The migrate-npm fixture intentionally has no .gitattributes —
+    // verifying upfront that a freshly-created file gets cleaned up
+    // on rollback (otherwise this test reduces to "we restored from a
+    // backup", which is the easy case).
+    assert!(
+        !project.file_exists(".gitattributes"),
+        "fixture must NOT pre-ship a .gitattributes for this test \
+         to exercise the freshly-created path",
+    );
+
     // First, migrate (creates lockfile + backup)
     lpm(&project)
         .args(["migrate", "--no-install", "--force"])
@@ -516,6 +526,10 @@ fn migrate_rollback_restores_original() {
 
     assertions::assert_both_lockfiles_exist(project.path());
     assertions::assert_backup_exists(project.path(), "package-lock.json");
+    assert!(
+        project.file_exists(".gitattributes"),
+        "migrate must create .gitattributes (records lpm.lockb as binary)"
+    );
 
     // Now rollback
     lpm(&project)
@@ -523,10 +537,61 @@ fn migrate_rollback_restores_original() {
         .assert()
         .success();
 
-    // After rollback, the lpm lockfiles should be gone and original restored
+    // After rollback, every file the migration created must be gone —
+    // `lpm.lock` and `lpm.lockb` (the lockfile pair), plus
+    // `.gitattributes` which `ensure_gitattributes` may create when
+    // absent. The backup layer's v2 `created` array tracks all three;
+    // any of them surviving means the rollback contract is broken.
     assert!(
         !project.file_exists("lpm.lock"),
         "lpm.lock should be removed after rollback"
+    );
+    assert!(
+        !project.file_exists("lpm.lockb"),
+        "lpm.lockb should be removed after rollback (it's derived from lpm.lock)"
+    );
+    assert!(
+        !project.file_exists(".gitattributes"),
+        ".gitattributes should be removed after rollback when migrate \
+         created it (didn't exist pre-migration)"
+    );
+}
+
+/// `-y` is reserved (non-interactive flag) and intentionally does NOT
+/// imply `--force`. Without an explicit `--force`, migrate must refuse
+/// to overwrite an existing lpm.lock even when `-y` is set.
+#[test]
+fn migrate_yes_alone_does_not_overwrite_existing_lockfile() {
+    let project = TempProject::from_fixture("migrate-npm");
+
+    // Plant an lpm.lock first (simulates a project mid-migration or
+    // a re-run scenario).
+    std::fs::write(
+        project.path().join("lpm.lock"),
+        "# user's hand-tuned lockfile that we MUST NOT clobber\n",
+    )
+    .unwrap();
+    let pre_bytes = std::fs::read(project.path().join("lpm.lock")).unwrap();
+
+    // -y should NOT clobber the existing lpm.lock — that's the job of
+    // --force, and the public contract is now that the two are decoupled.
+    let output = lpm(&project)
+        .args(["migrate", "--no-install", "-y"])
+        .output()
+        .expect("failed to run lpm migrate -y");
+
+    assert!(
+        !output.status.success(),
+        "lpm migrate -y must refuse to overwrite without --force; \
+         stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+
+    let post_bytes = std::fs::read(project.path().join("lpm.lock")).unwrap();
+    assert_eq!(
+        pre_bytes, post_bytes,
+        "lpm.lock must be byte-identical to its pre-`-y` state"
     );
 }
 
