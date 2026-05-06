@@ -437,7 +437,7 @@ fn emit_list_human(root: &LpmRoot, manifest: &GlobalManifest, verbose: bool) {
         output::info("No globally-installed packages.");
         if !root.global_manifest().exists() {
             output::info(&format!(
-                "Manifest does not exist yet at {}. Try `lpm install -g <pkg>` once M3 lands.",
+                "Run `lpm install -g <pkg>` to install one. Manifest lives at {}.",
                 root.global_manifest().display()
             ));
         }
