@@ -128,6 +128,21 @@ fn parse_tag_rows(mdx: &str) -> HashMap<String, String> {
             continue;
         }
         let token = first.trim_start_matches('`').trim_end_matches('`');
+        // Reject anything that isn't a simple `:name` token. The
+        // Combinators table on query.mdx contains rows like `` `:a, :b` ``
+        // and `` `:root > :child` `` — those are syntax samples, not real
+        // tag tokens, and must not be treated as catalog entries.
+        let body = match token.strip_prefix(':') {
+            Some(b) => b,
+            None => continue,
+        };
+        let is_simple_token = !body.is_empty()
+            && body
+                .chars()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-');
+        if !is_simple_token {
+            continue;
+        }
         let description = cells[1..].join(" | ");
         rows.insert(token.to_string(), description);
     }
@@ -283,6 +298,45 @@ fn query_mdx_mirrors_catalog() {
     let catalog = behavioral_tag_catalog();
     let all_tokens: HashSet<&str> = catalog.iter().map(|t| t.token).collect();
     assert_doc_covers_catalog("query.mdx", &mdx_path, &catalog, &all_tokens);
+
+    // Reverse-direction stray-tag check (mirrors security-audit's).
+    // Without it, an extra `:bogus-tag` row added to query.mdx would
+    // pass CI as long as none of the real catalog rows go missing.
+    // query.mdx documents the same non-behavioral tokens as
+    // security-audit (state, severity, special), so the tolerance list
+    // matches.
+    let mdx = std::fs::read_to_string(&mdx_path).unwrap();
+    let rows = parse_tag_rows(&mdx);
+    let mut stray = Vec::new();
+    for token in rows.keys() {
+        if all_tokens.contains(token.as_str()) {
+            continue;
+        }
+        const NON_BEHAVIORAL: &[&str] = &[
+            ":scripts",
+            ":built",
+            ":vulnerable",
+            ":deprecated",
+            ":lpm",
+            ":npm",
+            ":critical",
+            ":high",
+            ":medium",
+            ":info",
+            ":root",
+            ":workspace-root",
+        ];
+        if NON_BEHAVIORAL.contains(&token.as_str()) {
+            continue;
+        }
+        stray.push(token.clone());
+    }
+    assert!(
+        stray.is_empty(),
+        "query.mdx has tag rows that aren't in the catalog: {stray:?}\n\
+         Either add them to lpm_security::query::PseudoClass + \
+         behavioral_tag_catalog() or remove them from the doc."
+    );
 }
 
 /// Sanity: the catalog itself partitions cleanly into the three

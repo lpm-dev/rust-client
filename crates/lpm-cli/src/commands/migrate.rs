@@ -250,11 +250,14 @@ pub async fn run(
     let lockb_path = cwd.join("lpm.lockb");
     migration_backup.backup_file(&lockb_path)?;
 
-    // Back up .gitattributes if it exists (will be modified by ensure_gitattributes)
+    // Back up .gitattributes unconditionally — `ensure_gitattributes`
+    // creates the file when missing AND modifies it when present, so
+    // the backup chain needs to track it on both paths. With the
+    // existence guard the v2 manifest's `created` array would miss the
+    // newly-created file, leaving a stray `.gitattributes` on disk
+    // after `lpm migrate --rollback`.
     let gitattributes_path = cwd.join(".gitattributes");
-    if gitattributes_path.exists() {
-        migration_backup.backup_file(&gitattributes_path)?;
-    }
+    migration_backup.backup_file(&gitattributes_path)?;
 
     // Phase 64 #34 / #35 — back up package.json IFF EITHER plan is
     // about to write to it. Skipping when there's nothing to apply
