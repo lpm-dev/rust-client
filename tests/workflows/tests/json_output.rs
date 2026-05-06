@@ -248,10 +248,16 @@ async fn doctor_json_surfaces_manifest_compat_issues_with_stable_codes() {
             Some("warn"),
             "expected {code} to be a warn",
         );
-        // Manifest-compat issues all use the same human label so
-        // they group together in the human view; the codes do the
-        // distinguishing work.
-        assert_eq!(entry["check"].as_str(), Some("Manifest compat"));
+        // Manifest-compat issues share the `Manifest compat:` prefix
+        // so they group together in the human view; the suffix
+        // identifies the specific drifting field.
+        let check_name = entry["check"]
+            .as_str()
+            .unwrap_or_else(|| panic!("expected `check` to be a string for code {code}"));
+        assert!(
+            check_name.starts_with("Manifest compat"),
+            "expected `{check_name}` to start with `Manifest compat` for code {code}",
+        );
     }
 
     // Engines.yarn / .bun were not set, so those codes must NOT fire.

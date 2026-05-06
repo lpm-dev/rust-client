@@ -1,3 +1,4 @@
+use crate::doctor_catalog::{self, CheckEntry, Severity};
 use crate::{auth, output};
 use lpm_common::LpmError;
 use lpm_registry::RegistryClient;
@@ -9,67 +10,202 @@ use std::time::Duration;
 
 /// Check result emitted by `lpm doctor`.
 ///
-/// `code` is a stable, machine-readable identifier and is the key
-/// consumers should match on (`lpm doctor --json` emits it as the
-/// `"code"` field). It is also the dispatch key for `--fix`. The
-/// `name` is human-only — wording can change without breaking
-/// automation. Codes never change once shipped.
+/// Carries a typed reference to a [`CheckEntry`] from
+/// [`crate::doctor_catalog`] — every emitted code is, by
+/// construction, a registered catalog entry. The constructor
+/// `debug_assert!`s that the chosen severity is one the catalog
+/// declares the code can take, so wording-and-severity drift cannot
+/// silently slip in.
+///
+/// `name` and `code` flow from the entry; only `detail` and
+/// `severity` are runtime-owned.
 struct Check {
-    /// Stable machine-readable identifier (snake_case, namespaced).
-    /// Examples: `auth_invalid`, `node_modules_missing`,
-    /// `pnpm_overrides_drift`. Required on every check.
-    code: &'static str,
-    name: String,
+    /// Reference to the canonical catalog entry. `code` and `name`
+    /// flow from here.
+    entry: &'static CheckEntry,
     passed: bool,
     detail: String,
     severity: Severity,
 }
 
-#[derive(Clone, Copy)]
-enum Severity {
-    Pass,
-    Fail,
-    Warn,
-}
-
-impl Severity {
-    fn as_str(&self) -> &'static str {
-        match self {
-            Severity::Pass => "pass",
-            Severity::Fail => "fail",
-            Severity::Warn => "warn",
-        }
-    }
-}
-
 impl Check {
-    fn pass(code: &'static str, name: &str, detail: &str) -> Self {
+    fn pass(entry: &'static CheckEntry, detail: &str) -> Self {
+        debug_assert!(
+            entry.permits(Severity::Pass),
+            "catalog entry `{}` does not permit Pass — declared severities: {:?}",
+            entry.code,
+            entry.possible_severities,
+        );
         Self {
-            code,
-            name: name.into(),
+            entry,
             passed: true,
             detail: detail.into(),
             severity: Severity::Pass,
         }
     }
-    fn fail(code: &'static str, name: &str, detail: &str) -> Self {
+
+    fn fail(entry: &'static CheckEntry, detail: &str) -> Self {
+        debug_assert!(
+            entry.permits(Severity::Fail),
+            "catalog entry `{}` does not permit Fail — declared severities: {:?}",
+            entry.code,
+            entry.possible_severities,
+        );
         Self {
-            code,
-            name: name.into(),
+            entry,
             passed: false,
             detail: detail.into(),
             severity: Severity::Fail,
         }
     }
-    fn warn(code: &'static str, name: &str, detail: &str) -> Self {
+
+    fn warn(entry: &'static CheckEntry, detail: &str) -> Self {
+        debug_assert!(
+            entry.permits(Severity::Warn),
+            "catalog entry `{}` does not permit Warn — declared severities: {:?}",
+            entry.code,
+            entry.possible_severities,
+        );
         Self {
-            code,
-            name: name.into(),
+            entry,
             passed: true,
             detail: detail.into(),
             severity: Severity::Warn,
         }
     }
+
+    /// Stable machine-readable identifier — match on this in
+    /// automation. Flat accessor over `entry.code` so the JSON
+    /// serializer and human renderer don't need to reach through
+    /// the catalog reference.
+    fn code(&self) -> &'static str {
+        self.entry.code
+    }
+
+    /// Human-readable label. Flat accessor over `entry.name`.
+    fn name(&self) -> &'static str {
+        self.entry.name
+    }
+}
+
+/// Render the canonical catalog inventory.
+///
+/// `lpm doctor list` is the documentation surface — it enumerates
+/// every check `lpm doctor` can emit (CLI-side and workspace-owned
+/// manifest-compat) along with description, when-fires, remediation,
+/// possible severities, and auto-fix metadata. Stable shape: every
+/// row carries a non-empty `code` field that downstream automation
+/// can match on.
+///
+/// Filters:
+/// - `code` selects a single entry by exact code match. An empty
+///   result is treated as a user error (likely typo) and exits
+///   non-zero — automation gating on a code shouldn't silently pass
+///   when the code doesn't exist.
+/// - `category` is a case-insensitive substring filter against the
+///   catalog category label. Empty result is benign (substring
+///   semantics) and exits zero with a stderr note.
+///
+/// `--json` returns the structured array; without it, the listing
+/// is grouped by category and rendered for terminals.
+pub fn list(
+    json_output: bool,
+    code_filter: Option<&str>,
+    category_filter: Option<&str>,
+) -> Result<(), LpmError> {
+    let mut rows = doctor_catalog::all_entries();
+
+    if let Some(code) = code_filter {
+        rows.retain(|r| r.code == code);
+    }
+    if let Some(cat) = category_filter {
+        let needle = cat.to_lowercase();
+        rows.retain(|r| r.category.as_str().to_lowercase().contains(needle.as_str()));
+    }
+
+    // `--code` is exact-match — an empty result almost always means
+    // the user typo'd a code. Surface this as a hard error so
+    // automation doesn't silently pass when the gating code doesn't
+    // exist. The error propagates through the standard `LpmError`
+    // path; in `--json` mode the outer handler wraps it in the
+    // canonical `{success: false, error, error_code}` envelope, so
+    // stdout stays a single valid JSON document either way.
+    if let Some(code) = code_filter
+        && rows.is_empty()
+    {
+        return Err(LpmError::Script(format!(
+            "no catalog entry matches code `{code}` — run `lpm doctor list` to see the full inventory",
+        )));
+    }
+
+    if json_output {
+        // Field-name parity with `lpm doctor --json`: the runtime
+        // emission surface uses `check` for the human-readable label,
+        // so the inventory surface uses the same key. Match on `code`
+        // in automation; `check` is human-only.
+        let entries: Vec<_> = rows
+            .iter()
+            .map(|r| {
+                serde_json::json!({
+                    "code": r.code,
+                    "check": r.name,
+                    "category": r.category.as_str(),
+                    "description": r.description,
+                    "when_fires": r.when_fires,
+                    "remediation": r.remediation,
+                    "possible_severities": r.possible_severities,
+                    "auto_fix": r.auto_fix,
+                })
+            })
+            .collect();
+        let output = serde_json::to_string_pretty(&serde_json::json!({
+            "success": true,
+            "count": entries.len(),
+            "entries": entries,
+        }))
+        .map_err(|e| LpmError::Script(format!("failed to serialize catalog: {e}")))?;
+        println!("{output}");
+        return Ok(());
+    }
+
+    if rows.is_empty() {
+        eprintln!("No catalog entries matched the given filter.");
+        return Ok(());
+    }
+
+    output::print_header();
+    println!();
+    println!(
+        "  {} {} catalog entries",
+        rows.len().to_string().bold(),
+        "doctor".dimmed()
+    );
+    println!();
+
+    let mut current_category: Option<doctor_catalog::Category> = None;
+    for row in &rows {
+        if Some(row.category) != current_category {
+            current_category = Some(row.category);
+            println!("  {}", row.category.as_str().bold().underline());
+            println!();
+        }
+        let severities = row.possible_severities.join(", ");
+        println!(
+            "    {}  {}",
+            row.code.bold(),
+            format!("[{severities}]").dimmed()
+        );
+        println!("      {}: {}", "name".dimmed(), row.name);
+        println!("      {}", row.description);
+        println!("      {} {}", "when:".dimmed(), row.when_fires);
+        println!("      {} {}", "fix:".dimmed(), row.remediation);
+        if let Some(auto) = row.auto_fix {
+            println!("      {} {}", "auto-fix:".dimmed(), auto);
+        }
+        println!();
+    }
+
+    Ok(())
 }
 
 /// Enhanced health check: verify auth, registry, store, project state, runtime, tools, lpm.json.
@@ -102,28 +238,28 @@ pub async fn run(
     // 1. Registry reachable?
     let registry_ok = registry_result.unwrap_or(false);
     if registry_ok {
-        checks.push(Check::pass("registry_reachable", "Registry", registry_url));
+        checks.push(Check::pass(
+            &doctor_catalog::REGISTRY_REACHABLE,
+            registry_url,
+        ));
     } else {
         checks.push(Check::fail(
-            "registry_unreachable",
-            "Registry",
+            &doctor_catalog::REGISTRY_UNREACHABLE,
             &format!("{registry_url} — unreachable. Check your network or try again later"),
         ));
     }
 
     // 2. Auth token valid?
     if auth_result {
-        checks.push(Check::pass("auth_valid", "Authentication", "valid token"));
+        checks.push(Check::pass(&doctor_catalog::AUTH_VALID, "valid token"));
     } else if token_exists {
         checks.push(Check::fail(
-            "auth_invalid",
-            "Authentication",
+            &doctor_catalog::AUTH_INVALID,
             "token exists but invalid — run: lpm login",
         ));
     } else {
         checks.push(Check::fail(
-            "auth_missing",
-            "Authentication",
+            &doctor_catalog::AUTH_MISSING,
             "no token — run: lpm login",
         ));
     }
@@ -136,14 +272,12 @@ pub async fn run(
         .unwrap_or_else(|_| "inaccessible".into());
     if store_ok {
         checks.push(Check::pass(
-            "global_store_accessible",
-            "Global store",
+            &doctor_catalog::GLOBAL_STORE_ACCESSIBLE,
             &store_detail,
         ));
     } else {
         checks.push(Check::fail(
-            "global_store_inaccessible",
-            "Global store",
+            &doctor_catalog::GLOBAL_STORE_INACCESSIBLE,
             &store_detail,
         ));
     }
@@ -153,11 +287,10 @@ pub async fn run(
     // 4. package.json exists?
     let pkg_json_path = project_dir.join("package.json");
     if pkg_json_path.exists() {
-        checks.push(Check::pass("package_json_present", "package.json", "found"));
+        checks.push(Check::pass(&doctor_catalog::PACKAGE_JSON_PRESENT, "found"));
     } else {
         checks.push(Check::fail(
-            "package_json_missing",
-            "package.json",
+            &doctor_catalog::PACKAGE_JSON_MISSING,
             "not found — run: lpm init (or cd to your project root)",
         ));
     }
@@ -180,19 +313,14 @@ pub async fn run(
     // doesn't read as healthy.
     let layout = lpm_linker::LayoutPaths::for_project(project_dir);
     if layout.needs_layout_migration() {
-        checks.push(Check::warn(
-            "node_modules_legacy_layout",
-            "node_modules",
-            "legacy wrapper layout detected — run: lpm install (one-time migration to .lpm/wrappers/)",
-        ));
+        checks.push(Check::warn(&doctor_catalog::NODE_MODULES_LEGACY_LAYOUT, "legacy wrapper layout detected — run: lpm install (one-time migration to .lpm/wrappers/)",));
     } else {
         match layout.install_appears_healthy() {
             lpm_linker::InstallHealth::Healthy {
                 layout: lpm_linker::LinkerLayout::Isolated,
             } => {
                 checks.push(Check::pass(
-                    "node_modules_isolated_healthy",
-                    "node_modules",
+                    &doctor_catalog::NODE_MODULES_ISOLATED_HEALTHY,
                     "exists with .lpm/wrappers store",
                 ));
             }
@@ -200,8 +328,7 @@ pub async fn run(
                 layout: lpm_linker::LinkerLayout::Hoisted,
             } => {
                 checks.push(Check::pass(
-                    "node_modules_hoisted_healthy",
-                    "node_modules",
+                    &doctor_catalog::NODE_MODULES_HOISTED_HEALTHY,
                     "exists with hoisted layout",
                 ));
             }
@@ -209,22 +336,19 @@ pub async fn run(
                 layout: lpm_linker::LinkerLayout::Mixed,
             } => {
                 checks.push(Check::warn(
-                    "node_modules_mixed_layout",
-                    "node_modules",
+                    &doctor_catalog::NODE_MODULES_MIXED_LAYOUT,
                     "both isolated + hoisted state present — re-run: lpm install",
                 ));
             }
             lpm_linker::InstallHealth::NodeModulesPresentButNoStore => {
                 checks.push(Check::warn(
-                    "node_modules_no_store",
-                    "node_modules",
+                    &doctor_catalog::NODE_MODULES_NO_STORE,
                     "exists but no .lpm store — run: lpm install",
                 ));
             }
             lpm_linker::InstallHealth::NoNodeModules => {
                 checks.push(Check::fail(
-                    "node_modules_missing",
-                    "node_modules",
+                    &doctor_catalog::NODE_MODULES_MISSING,
                     "not found — run: lpm install",
                 ));
             }
@@ -297,23 +421,17 @@ pub async fn run(
 
         if let Some(ver) = matched_managed {
             checks.push(Check::pass(
-                "node_managed_match",
-                "Node.js",
+                &doctor_catalog::NODE_MANAGED_MATCH,
                 &format!("v{ver} (managed, from {})", det.source),
             ));
         } else if let Some(sys) = &system_node {
-            checks.push(Check::warn(
-				"node_pinned_unmet",
-				"Node.js",
-				&format!(
+            checks.push(Check::warn(&doctor_catalog::NODE_PINNED_UNMET, &format!(
 					"{sys} (system) — pinned {spec} from {} not installed. Run: lpm use node@{clean}",
 					det.source
-				),
-			));
+				),));
         } else {
             checks.push(Check::fail(
-                "node_missing_pinned",
-                "Node.js",
+                &doctor_catalog::NODE_MISSING_PINNED,
                 &format!(
                     "not found — pinned {spec} from {}. Run: lpm use node@{clean}",
                     det.source
@@ -324,14 +442,12 @@ pub async fn run(
         let sys = get_system_node_version(project_dir);
         if let Some(v) = sys {
             checks.push(Check::pass(
-                "node_system_unpinned",
-                "Node.js",
+                &doctor_catalog::NODE_SYSTEM_UNPINNED,
                 &format!("{v} (system, no version pinned)"),
             ));
         } else {
             checks.push(Check::fail(
-                "node_missing_unpinned",
-                "Node.js",
+                &doctor_catalog::NODE_MISSING_UNPINNED,
                 "not found — run: lpm use node@22",
             ));
         }
@@ -418,7 +534,7 @@ pub async fn run(
             // remediation; passing-state codes never reach here because
             // the outer loop only enters `--fix` when there's something
             // to fix.
-            match check.code {
+            match check.code() {
                 "node_modules_missing"
                 | "node_modules_no_store"
                 | "node_modules_legacy_layout"
@@ -563,8 +679,8 @@ pub async fn run(
             .iter()
             .map(|c| {
                 serde_json::json!({
-                    "code": c.code,
-                    "check": c.name,
+                    "code": c.code(),
+                    "check": c.name(),
                     "passed": c.passed,
                     "severity": c.severity.as_str(),
                     "detail": c.detail,
@@ -601,7 +717,7 @@ pub async fn run(
                 Severity::Fail => "✖".red().to_string(),
                 Severity::Warn => "⚠".yellow().to_string(),
             };
-            println!("  {icon} {} {}", check.name.bold(), check.detail.dimmed());
+            println!("  {icon} {} {}", check.name().bold(), check.detail.dimmed());
         }
         println!();
 
@@ -756,7 +872,7 @@ fn run_lint_check(project_dir: &Path) -> Option<Check> {
     let (stdout, _stderr, code) = run_tool_with_timeout(&bin, &["."], project_dir, None)?;
 
     if code == 0 {
-        return Some(Check::pass("lint_clean", "Lint (oxlint)", "no issues"));
+        return Some(Check::pass(&doctor_catalog::LINT_CLEAN, "no issues"));
     }
 
     // Try to parse oxlint summary line, fall back to exit code
@@ -764,22 +880,19 @@ fn run_lint_check(project_dir: &Path) -> Option<Check> {
         let has_errors = summary.contains("error");
         if has_errors {
             Some(Check::fail(
-                "lint_errors",
-                "Lint (oxlint)",
+                &doctor_catalog::LINT_ERRORS,
                 &format!("{} — run: lpm lint --fix", summary.trim()),
             ))
         } else {
             Some(Check::warn(
-                "lint_warnings",
-                "Lint (oxlint)",
+                &doctor_catalog::LINT_WARNINGS,
                 &format!("{} — run: lpm lint --fix", summary.trim()),
             ))
         }
     } else {
         // Fallback: couldn't parse output, use exit code
         Some(Check::warn(
-            "lint_unparseable",
-            "Lint (oxlint)",
+            &doctor_catalog::LINT_UNPARSEABLE,
             &format!("exited with code {code} — run: lpm lint for details"),
         ))
     }
@@ -794,8 +907,7 @@ fn run_fmt_check(project_dir: &Path) -> Option<Check> {
 
     if code == 0 {
         return Some(Check::pass(
-            "fmt_clean",
-            "Format (biome)",
+            &doctor_catalog::FMT_CLEAN,
             "all files formatted",
         ));
     }
@@ -807,14 +919,12 @@ fn run_fmt_check(project_dir: &Path) -> Option<Check> {
         .count();
     if count > 0 {
         Some(Check::warn(
-            "fmt_unformatted",
-            "Format (biome)",
+            &doctor_catalog::FMT_UNFORMATTED,
             &format!("{count} file(s) need formatting — run: lpm fmt"),
         ))
     } else {
         Some(Check::warn(
-            "fmt_other_issue",
-            "Format (biome)",
+            &doctor_catalog::FMT_OTHER_ISSUE,
             &format!("formatting issues found (exit {code}) — run: lpm fmt"),
         ))
     }
@@ -850,28 +960,21 @@ fn check_typescript_setup(project_dir: &Path) -> Vec<Check> {
 
         if let Some(ref bin) = status.local_bin {
             checks.push(Check::pass(
-                "typescript_healthy",
-                "TypeScript",
+                &doctor_catalog::TYPESCRIPT_HEALTHY,
                 &format!("{label}local tsc resolves at {}", bin.display()),
             ));
         } else if status.system_bin.is_some() {
-            checks.push(Check::warn(
-                "typescript_missing_for_tsconfig",
-                "TypeScript",
-                &format!(
+            checks.push(Check::warn(&doctor_catalog::TYPESCRIPT_MISSING_FOR_TSCONFIG, &format!(
                     "{label}using system tsc — editor + CI may diverge. Run: lpm install -D typescript"
-                ),
-            ));
+                ),));
         } else if status.in_deps {
             checks.push(Check::fail(
-                "typescript_unavailable",
-                "TypeScript",
+                &doctor_catalog::TYPESCRIPT_UNAVAILABLE,
                 &format!("{label}declared but not installed — run: lpm install"),
             ));
         } else {
             checks.push(Check::fail(
-                "typescript_unavailable",
-                "TypeScript",
+                &doctor_catalog::TYPESCRIPT_UNAVAILABLE,
                 &format!("{label}not installed — run: lpm install -D typescript"),
             ));
         }
@@ -948,17 +1051,15 @@ async fn check_plugins() -> Vec<Check> {
 
         if *current == latest {
             checks.push(Check::pass(
-                "plugin_up_to_date",
-                &format!("Plugin: {}", def.name),
-                &format!("v{current} (up to date)"),
+                &doctor_catalog::PLUGIN_UP_TO_DATE,
+                &format!("{}: v{current} (up to date)", def.name),
             ));
         } else {
             checks.push(Check::warn(
-                "plugin_update_available",
-                &format!("Plugin: {}", def.name),
+                &doctor_catalog::PLUGIN_UPDATE_AVAILABLE,
                 &format!(
-                    "v{current} → v{latest} available — run: lpm plugin update {}",
-                    def.name
+                    "{}: v{current} → v{latest} available — run: lpm plugin update {}",
+                    def.name, def.name,
                 ),
             ));
         }
@@ -974,13 +1075,11 @@ fn check_workspace(project_dir: &Path) -> Option<Check> {
 
     match graph.topological_sort() {
         Ok(sorted) => Some(Check::pass(
-            "workspace_acyclic",
-            "Workspace",
+            &doctor_catalog::WORKSPACE_ACYCLIC,
             &format!("{} packages, no dependency cycles", sorted.len()),
         )),
         Err(e) => Some(Check::fail(
-            "workspace_cycle",
-            "Workspace",
+            &doctor_catalog::WORKSPACE_CYCLE,
             &format!("{e} — resolve circular dependencies"),
         )),
     }
@@ -1014,8 +1113,7 @@ async fn check_tunnel_domain(
     // RFC-compliant domain length checks (RFC 1035 / RFC 1123)
     if domain.len() > 253 {
         checks.push(Check::warn(
-            "tunnel_domain_too_long",
-            "Tunnel",
+            &doctor_catalog::TUNNEL_DOMAIN_TOO_LONG,
             &format!(
                 "domain \"{}\" exceeds 253 character limit ({} chars)",
                 domain,
@@ -1029,16 +1127,14 @@ async fn check_tunnel_domain(
     for label in domain.split('.') {
         if label.is_empty() {
             checks.push(Check::warn(
-                "tunnel_domain_empty_label",
-                "Tunnel",
+                &doctor_catalog::TUNNEL_DOMAIN_EMPTY_LABEL,
                 &format!("domain \"{domain}\" contains empty label (consecutive dots)"),
             ));
             return checks;
         }
         if label.len() > 63 {
             checks.push(Check::warn(
-                "tunnel_domain_label_too_long",
-                "Tunnel",
+                &doctor_catalog::TUNNEL_DOMAIN_LABEL_TOO_LONG,
                 &format!(
                     "domain label \"{}\" exceeds 63 character limit ({} chars)",
                     label,
@@ -1052,8 +1148,7 @@ async fn check_tunnel_domain(
     // Validate domain format: must have at least one dot
     if !domain.contains('.') {
         checks.push(Check::warn(
-            "tunnel_domain_no_dot",
-            "Tunnel",
+            &doctor_catalog::TUNNEL_DOMAIN_NO_DOT,
             &format!(
                 "\"{}\" is not a full domain — use: {}.lpm.fyi or {}.lpm.llc",
                 domain, domain, domain
@@ -1070,8 +1165,7 @@ async fn check_tunnel_domain(
     // Check subdomain format
     if subdomain.len() < 3 || subdomain.len() > 32 {
         checks.push(Check::warn(
-            "tunnel_subdomain_length",
-            "Tunnel",
+            &doctor_catalog::TUNNEL_SUBDOMAIN_LENGTH,
             &format!("subdomain \"{subdomain}\" must be 3-32 characters"),
         ));
         return checks;
@@ -1081,16 +1175,14 @@ async fn check_tunnel_domain(
         .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
     {
         checks.push(Check::warn(
-            "tunnel_subdomain_chars",
-            "Tunnel",
+            &doctor_catalog::TUNNEL_SUBDOMAIN_CHARS,
             &format!("subdomain \"{subdomain}\" must be lowercase alphanumeric + hyphens"),
         ));
         return checks;
     }
     if subdomain.starts_with('-') || subdomain.ends_with('-') {
         checks.push(Check::warn(
-            "tunnel_subdomain_hyphen",
-            "Tunnel",
+            &doctor_catalog::TUNNEL_SUBDOMAIN_HYPHEN,
             &format!("subdomain \"{subdomain}\" must not start or end with a hyphen"),
         ));
         return checks;
@@ -1100,8 +1192,7 @@ async fn check_tunnel_domain(
     let known_bases = ["lpm.fyi", "lpm.llc"];
     if !known_bases.contains(&base_domain) {
         checks.push(Check::warn(
-            "tunnel_unknown_base",
-            "Tunnel",
+            &doctor_catalog::TUNNEL_UNKNOWN_BASE,
             &format!(
                 "unknown base domain \"{base_domain}\" (available: {})",
                 known_bases.join(", ")
@@ -1113,8 +1204,7 @@ async fn check_tunnel_domain(
     // === Ownership check (requires auth) ===
     if !is_authenticated {
         checks.push(Check::pass(
-            "tunnel_unauthenticated",
-            "Tunnel",
+            &doctor_catalog::TUNNEL_UNAUTHENTICATED,
             &format!("{domain} (configured, login to verify ownership)"),
         ));
         return checks;
@@ -1128,8 +1218,7 @@ async fn check_tunnel_domain(
 
             if !found {
                 checks.push(Check::warn(
-                    "tunnel_not_claimed",
-                    "Tunnel",
+                    &doctor_catalog::TUNNEL_NOT_CLAIMED,
                     &format!("{domain} — not claimed. Run: lpm tunnel claim {domain}"),
                 ));
                 return checks;
@@ -1137,8 +1226,7 @@ async fn check_tunnel_domain(
 
             if !owned {
                 checks.push(Check::warn(
-                    "tunnel_owned_by_other",
-                    "Tunnel",
+                    &doctor_catalog::TUNNEL_OWNED_BY_OTHER,
                     &format!("{domain} — claimed by another user or org"),
                 ));
                 return checks;
@@ -1149,22 +1237,19 @@ async fn check_tunnel_domain(
             match reachability {
                 TunnelReachability::Active => {
                     checks.push(Check::pass(
-                        "tunnel_active",
-                        "Tunnel",
+                        &doctor_catalog::TUNNEL_ACTIVE,
                         &format!("{domain} (claimed, active)"),
                     ));
                 }
                 TunnelReachability::Idle => {
                     checks.push(Check::pass(
-                        "tunnel_idle",
-                        "Tunnel",
+                        &doctor_catalog::TUNNEL_IDLE,
                         &format!("{domain} (claimed, idle)"),
                     ));
                 }
                 TunnelReachability::Unreachable => {
                     checks.push(Check::warn(
-                        "tunnel_unreachable",
-                        "Tunnel",
+                        &doctor_catalog::TUNNEL_UNREACHABLE,
                         &format!("{domain} (claimed) — unreachable, DNS may not be configured"),
                     ));
                 }
@@ -1173,8 +1258,7 @@ async fn check_tunnel_domain(
         Err(_) => {
             // API call failed — fall back to format-only validation
             checks.push(Check::pass(
-                "tunnel_unverified",
-                "Tunnel",
+                &doctor_catalog::TUNNEL_UNVERIFIED,
                 &format!("{domain} (configured, could not verify ownership)"),
             ));
         }
@@ -1276,18 +1360,16 @@ fn check_local_source_paths(project_dir: &Path) -> Vec<Check> {
                     // Directory target — must have package.json.
                     if !abs.join("package.json").is_file() {
                         checks.push(Check::fail(
-                            "local_source_dir_no_pkg",
-                            &format!("local source `{name}`"),
+                            &doctor_catalog::LOCAL_SOURCE_DIR_NO_PKG,
                             &format!(
-                                "{kind_label}{path_str} resolves to a directory \
+                                "`{name}`: {kind_label}{path_str} resolves to a directory \
                                  without package.json — install will error",
                             ),
                         ));
                     } else {
                         checks.push(Check::pass(
-                            "local_source_dir_ok",
-                            &format!("local source `{name}`"),
-                            &format!("{kind_label}{path_str} (directory)"),
+                            &doctor_catalog::LOCAL_SOURCE_DIR_OK,
+                            &format!("`{name}`: {kind_label}{path_str} (directory)"),
                         ));
                     }
                 }
@@ -1295,28 +1377,25 @@ fn check_local_source_paths(project_dir: &Path) -> Vec<Check> {
                     if expected_dir {
                         // link: requires a directory.
                         checks.push(Check::fail(
-                            "local_source_link_to_file",
-                            &format!("local source `{name}`"),
+                            &doctor_catalog::LOCAL_SOURCE_LINK_TO_FILE,
                             &format!(
-                                "{kind_label}{path_str} resolves to a regular file; \
+                                "`{name}`: {kind_label}{path_str} resolves to a regular file; \
                                  link: requires a directory. Use file:./<name>.tgz \
                                  for tarballs",
                             ),
                         ));
                     } else {
                         checks.push(Check::pass(
-                            "local_source_tarball_ok",
-                            &format!("local source `{name}`"),
-                            &format!("{kind_label}{path_str} (tarball)"),
+                            &doctor_catalog::LOCAL_SOURCE_TARBALL_OK,
+                            &format!("`{name}`: {kind_label}{path_str} (tarball)"),
                         ));
                     }
                 }
                 Ok(_) => {
                     checks.push(Check::fail(
-                        "local_source_invalid_type",
-                        &format!("local source `{name}`"),
+                        &doctor_catalog::LOCAL_SOURCE_INVALID_TYPE,
                         &format!(
-                            "{kind_label}{path_str} resolves to neither a regular \
+                            "`{name}`: {kind_label}{path_str} resolves to neither a regular \
                              file nor a directory (device/socket/etc.) — install \
                              will error",
                         ),
@@ -1324,10 +1403,9 @@ fn check_local_source_paths(project_dir: &Path) -> Vec<Check> {
                 }
                 Err(e) => {
                     checks.push(Check::fail(
-                        "local_source_unreadable",
-                        &format!("local source `{name}`"),
+                        &doctor_catalog::LOCAL_SOURCE_UNREADABLE,
                         &format!(
-                            "{kind_label}{path_str} is unreadable: {e}. Check the \
+                            "`{name}`: {kind_label}{path_str} is unreadable: {e}. Check the \
                              path in package.json",
                         ),
                     ));
@@ -1344,7 +1422,7 @@ fn check_lockfile_state(project_dir: &Path) -> Vec<Check> {
     let mut checks = Vec::new();
 
     if lockfile.exists() {
-        checks.push(Check::pass("lockfile_present", "Lockfile", "lpm.lock"));
+        checks.push(Check::pass(&doctor_catalog::LOCKFILE_PRESENT, "lpm.lock"));
 
         if lockb_path.exists() {
             // Binary exists — check if in sync
@@ -1358,23 +1436,20 @@ fn check_lockfile_state(project_dir: &Path) -> Vec<Check> {
 
             if is_stale {
                 checks.push(Check::warn(
-                    "lockfile_binary_stale",
-                    "Binary lockfile",
+                    &doctor_catalog::LOCKFILE_BINARY_STALE,
                     "lpm.lockb is stale — run lpm install to regenerate",
                 ));
             } else {
                 // Validate header
                 match lpm_lockfile::binary::BinaryLockfileReader::open(&lockb_path) {
                     Ok(Some(_)) => checks.push(Check::pass(
-                        "lockfile_binary_valid",
-                        "Binary lockfile",
+                        &doctor_catalog::LOCKFILE_BINARY_VALID,
                         "lpm.lockb (in sync, valid)",
                     )),
                     Ok(None) => {} // shouldn't happen since we checked exists
                     Err(_) => {
                         checks.push(Check::warn(
-                            "lockfile_binary_corrupt",
-                            "Binary lockfile",
+                            &doctor_catalog::LOCKFILE_BINARY_CORRUPT,
                             "lpm.lockb is corrupt — run lpm install to regenerate",
                         ));
                     }
@@ -1382,15 +1457,13 @@ fn check_lockfile_state(project_dir: &Path) -> Vec<Check> {
             }
         } else {
             checks.push(Check::warn(
-                "lockfile_binary_missing",
-                "Binary lockfile",
+                &doctor_catalog::LOCKFILE_BINARY_MISSING,
                 "lpm.lockb missing — run lpm install to generate",
             ));
         }
     } else {
         checks.push(Check::warn(
-            "lockfile_missing",
-            "Lockfile",
+            &doctor_catalog::LOCKFILE_MISSING,
             "not found — run: lpm install to generate",
         ));
     }
@@ -1410,21 +1483,18 @@ fn check_gitattributes_state(project_dir: &Path) -> Vec<Check> {
             let ga_content = std::fs::read_to_string(&ga_path).unwrap_or_default();
             if ga_content.lines().any(|l| l.trim() == "lpm.lockb binary") {
                 checks.push(Check::pass(
-                    "gitattributes_lockb_marked",
-                    ".gitattributes",
+                    &doctor_catalog::GITATTRIBUTES_LOCKB_MARKED,
                     "lpm.lockb marked as binary",
                 ));
             } else {
                 checks.push(Check::warn(
-                    "gitattributes_lockb_unmarked",
-                    ".gitattributes",
+                    &doctor_catalog::GITATTRIBUTES_LOCKB_UNMARKED,
                     "lpm.lockb not marked as binary — run lpm install to fix",
                 ));
             }
         } else {
             checks.push(Check::warn(
-                "gitattributes_missing",
-                ".gitattributes",
+                &doctor_catalog::GITATTRIBUTES_MISSING,
                 "missing — run lpm install to create (marks lpm.lockb as binary)",
             ));
         }
@@ -1516,14 +1586,12 @@ fn check_deps_in_sync(project_dir: &Path) -> Option<Check> {
 
     if missing.is_empty() {
         Some(Check::pass(
-            "deps_sync_clean",
-            "Deps sync",
+            &doctor_catalog::DEPS_SYNC_CLEAN,
             "lockfile matches package.json",
         ))
     } else if missing.len() <= 3 {
         Some(Check::warn(
-            "deps_sync_drift",
-            "Deps sync",
+            &doctor_catalog::DEPS_SYNC_DRIFT,
             &format!(
                 "lockfile missing: {} — run: lpm install",
                 missing.join(", ")
@@ -1531,8 +1599,7 @@ fn check_deps_in_sync(project_dir: &Path) -> Option<Check> {
         ))
     } else {
         Some(Check::warn(
-            "deps_sync_drift",
-            "Deps sync",
+            &doctor_catalog::DEPS_SYNC_DRIFT,
             &format!(
                 "{} deps not in lockfile ({}, ...) — run: lpm install",
                 missing.len(),
@@ -1562,8 +1629,7 @@ fn validate_lpm_json(project_dir: &Path) -> Option<Check> {
         Ok(c) => c,
         Err(e) => {
             return Some(Check::fail(
-                "lpm_json_unreadable",
-                "lpm.json",
+                &doctor_catalog::LPM_JSON_UNREADABLE,
                 &format!("cannot read: {e}"),
             ));
         }
@@ -1574,8 +1640,7 @@ fn validate_lpm_json(project_dir: &Path) -> Option<Check> {
         Ok(v) => v,
         Err(e) => {
             return Some(Check::fail(
-                "lpm_json_invalid_syntax",
-                "lpm.json",
+                &doctor_catalog::LPM_JSON_INVALID_SYNTAX,
                 &format!("invalid JSON at line {} — {}", e.line(), e),
             ));
         }
@@ -1585,8 +1650,7 @@ fn validate_lpm_json(project_dir: &Path) -> Option<Check> {
         Some(o) => o,
         None => {
             return Some(Check::fail(
-                "lpm_json_not_object",
-                "lpm.json",
+                &doctor_catalog::LPM_JSON_NOT_OBJECT,
                 "must be a JSON object, not an array or primitive",
             ));
         }
@@ -1710,17 +1774,15 @@ fn validate_lpm_json(project_dir: &Path) -> Option<Check> {
     }
 
     if warnings.is_empty() {
-        Some(Check::pass("lpm_json_valid", "lpm.json", "valid"))
+        Some(Check::pass(&doctor_catalog::LPM_JSON_VALID, "valid"))
     } else if warnings.len() == 1 {
         Some(Check::warn(
-            "lpm_json_schema_warnings",
-            "lpm.json",
+            &doctor_catalog::LPM_JSON_SCHEMA_WARNINGS,
             &warnings[0],
         ))
     } else {
         Some(Check::warn(
-            "lpm_json_schema_warnings",
-            "lpm.json",
+            &doctor_catalog::LPM_JSON_SCHEMA_WARNINGS,
             &format!("{} issues: {}", warnings.len(), warnings.join("; ")),
         ))
     }
@@ -1758,17 +1820,37 @@ fn check_manifest_compat(project_dir: &Path) -> Vec<Check> {
     root_pkg
         .manifest_compat_issues()
         .into_iter()
-        .map(|issue| match issue.severity {
-            lpm_workspace::ManifestCompatSeverity::Warn => Check::warn(
-                issue.code,
-                "Manifest compat",
-                &format!("{}. {}", issue.detail, issue.remediation),
-            ),
-            lpm_workspace::ManifestCompatSeverity::Info => Check::pass(
-                issue.code,
-                "Manifest compat",
-                &format!("{}. {}", issue.detail, issue.remediation),
-            ),
+        .filter_map(|issue| {
+            let entry = match doctor_catalog::manifest_compat_entry(issue.code) {
+                Some(entry) => entry,
+                None => {
+                    // Orphan code: lpm-workspace declared a new
+                    // manifest-compat code without a matching CLI-side
+                    // wrapper in `MANIFEST_COMPAT_ENTRIES`. The
+                    // cross-crate parity test in `lpm-cli`
+                    // (`manifest_compat_entries_cover_workspace_catalog`)
+                    // pins this at unit-test time; the `debug_assert!`
+                    // here is a runtime tripwire so debug builds fail
+                    // loudly if the parity test is ever bypassed.
+                    debug_assert!(
+                        false,
+                        "orphan manifest-compat code `{}` — \
+                         `lpm_workspace::MANIFEST_COMPAT_CATALOG` declares it \
+                         but `lpm_cli::doctor_catalog::MANIFEST_COMPAT_ENTRIES` \
+                         is missing the corresponding `pub static CheckEntry` \
+                         wrapper. Add the wrapper or `lpm doctor` will \
+                         silently drop the issue.",
+                        issue.code,
+                    );
+                    return None;
+                }
+            };
+            let detail = format!("{}. {}", issue.detail, issue.remediation);
+            let check = match issue.severity {
+                lpm_workspace::ManifestCompatSeverity::Warn => Check::warn(entry, &detail),
+                lpm_workspace::ManifestCompatSeverity::Info => Check::pass(entry, &detail),
+            };
+            Some(check)
         })
         .collect()
 }
@@ -1822,15 +1904,13 @@ fn check_global_manifest_validity(root: &lpm_common::LpmRoot) -> Check {
     let path = root.global_manifest();
     if !path.exists() {
         return Check::pass(
-            "global_manifest_absent",
-            "Global manifest",
+            &doctor_catalog::GLOBAL_MANIFEST_ABSENT,
             "not present (no global installs yet)",
         );
     }
     match lpm_global::read_for(root) {
         Ok(manifest) => Check::pass(
-            "global_manifest_valid",
-            "Global manifest",
+            &doctor_catalog::GLOBAL_MANIFEST_VALID,
             &format!(
                 "{} package{}, {} alias{}, {} tombstone{}",
                 manifest.packages.len(),
@@ -1854,8 +1934,7 @@ fn check_global_manifest_validity(root: &lpm_common::LpmRoot) -> Check {
             ),
         ),
         Err(e) => Check::fail(
-            "global_manifest_corrupt",
-            "Global manifest",
+            &doctor_catalog::GLOBAL_MANIFEST_CORRUPT,
             &format!(
                 "{}: {e}. Fix hint: inspect the file or delete it to reset the global tree.",
                 path.display(),
@@ -1869,14 +1948,12 @@ fn check_bin_dir_on_path(root: &lpm_common::LpmRoot) -> Check {
     let path_env = std::env::var("PATH").unwrap_or_default();
     if crate::path_onboarding::is_bin_dir_on_path_str(&bin_dir, &path_env) {
         Check::pass(
-            "global_bin_on_path",
-            "Global bin on PATH",
+            &doctor_catalog::GLOBAL_BIN_ON_PATH,
             &bin_dir.display().to_string(),
         )
     } else {
         Check::warn(
-            "global_bin_off_path",
-            "Global bin on PATH",
+            &doctor_catalog::GLOBAL_BIN_OFF_PATH,
             &format!(
                 "{} not on PATH. Fix hint: add it to your shell init (see `lpm global bin`).",
                 bin_dir.display(),
@@ -1892,8 +1969,7 @@ fn check_orphaned_bin_shims(
     let bin_dir = root.bin_dir();
     if !bin_dir.exists() {
         return Check::pass(
-            "global_shims_no_dir",
-            "Orphaned shims",
+            &doctor_catalog::GLOBAL_SHIMS_NO_DIR,
             "bin dir does not exist yet",
         );
     }
@@ -1910,8 +1986,7 @@ fn check_orphaned_bin_shims(
     let mut orphans: Vec<String> = Vec::new();
     let Ok(entries) = std::fs::read_dir(&bin_dir) else {
         return Check::warn(
-            "global_shims_unreadable",
-            "Orphaned shims",
+            &doctor_catalog::GLOBAL_SHIMS_UNREADABLE,
             &format!("could not read {}", bin_dir.display()),
         );
     };
@@ -1934,8 +2009,7 @@ fn check_orphaned_bin_shims(
 
     if orphans.is_empty() {
         Check::pass(
-            "global_shims_clean",
-            "Orphaned shims",
+            &doctor_catalog::GLOBAL_SHIMS_CLEAN,
             &format!(
                 "{} owned shim{} in {}",
                 owned_names.len(),
@@ -1951,8 +2025,7 @@ fn check_orphaned_bin_shims(
             String::new()
         };
         Check::warn(
-            "global_shims_orphans",
-            "Orphaned shims",
+            &doctor_catalog::GLOBAL_SHIMS_ORPHANS,
             &format!(
                 "{} shim{} in {} not owned by any manifest entry ({}{}). Fix hint: \
                  `lpm store gc` sweeps tombstoned roots but does not rm orphaned shims; \
@@ -1973,8 +2046,7 @@ fn check_install_root_consistency(
 ) -> Check {
     if manifest.packages.is_empty() {
         return Check::pass(
-            "global_install_roots_empty",
-            "Global install roots",
+            &doctor_catalog::GLOBAL_INSTALL_ROOTS_EMPTY,
             "no packages to check",
         );
     }
@@ -2023,8 +2095,7 @@ fn check_install_root_consistency(
 
     if missing.is_empty() && not_ready.is_empty() {
         return Check::pass(
-            "global_install_roots_healthy",
-            "Global install roots",
+            &doctor_catalog::GLOBAL_INSTALL_ROOTS_HEALTHY,
             &format!(
                 "{} root{} healthy (marker + bin targets + lockfile validated)",
                 manifest.packages.len(),
@@ -2063,8 +2134,7 @@ fn check_install_root_consistency(
         ));
     }
     Check::fail(
-        "global_install_roots_unhealthy",
-        "Global install roots",
+        &doctor_catalog::GLOBAL_INSTALL_ROOTS_UNHEALTHY,
         &format!(
             "{}. Fix hint: `lpm uninstall -g <pkg>` and re-install to rebuild the install root.",
             issues.join("; "),
@@ -2167,8 +2237,7 @@ fn check_force_security_floor() -> Option<Check> {
         ),
     };
     Some(Check::warn(
-        "policy_force_security_floor",
-        "Force-security-floor",
+        &doctor_catalog::POLICY_FORCE_SECURITY_FLOOR,
         &detail,
     ))
 }
@@ -2208,8 +2277,7 @@ fn scope_boundary_note_if_globals_present(root: &lpm_common::LpmRoot) -> Option<
         .unwrap_or(false);
     if manifest_has_installs {
         Some(Check::pass(
-            "policy_scope_project_only",
-            "Script policy scope",
+            &doctor_catalog::POLICY_SCOPE_PROJECT_ONLY,
             "project installs only — global installs use a separate trust store at \
              ~/.lpm/global/trusted-dependencies.json; Phase 46.1 extends the tiered \
              gate + sandbox containment to globals",
@@ -2244,8 +2312,7 @@ fn probe_sandbox_backend() -> Check {
 
     match new_for_platform(spec, SandboxMode::Enforce) {
         Ok(sb) => Check::pass(
-            "sandbox_available",
-            "Sandbox",
+            &doctor_catalog::SANDBOX_AVAILABLE,
             &format!(
                 "{} available on {} — lifecycle scripts run under Enforce mode",
                 sb.backend_name(),
@@ -2256,8 +2323,7 @@ fn probe_sandbox_backend() -> Check {
             platform,
             remediation,
         }) => Check::warn(
-            "sandbox_unsupported_platform",
-            "Sandbox",
+            &doctor_catalog::SANDBOX_UNSUPPORTED_PLATFORM,
             &format!(
                 "unavailable on {platform} — {remediation}. Lifecycle scripts under \
                  `script-policy = \"triage\"` or `\"allow\"`, and any `lpm rebuild` \
@@ -2270,16 +2336,14 @@ fn probe_sandbox_backend() -> Check {
             required,
             remediation,
         }) => Check::warn(
-            "sandbox_kernel_too_old",
-            "Sandbox",
+            &doctor_catalog::SANDBOX_KERNEL_TOO_OLD,
             &format!(
                 "Linux kernel {detected} is below the landlock requirement \
                  ({required}+). {remediation}"
             ),
         ),
         Err(e) => Check::fail(
-            "sandbox_probe_failed",
-            "Sandbox",
+            &doctor_catalog::SANDBOX_PROBE_FAILED,
             &format!(
                 "probe failed: {e}. This is unexpected — the synthetic spec is \
                  well-formed; file an issue with `lpm doctor --json` output."
@@ -2294,43 +2358,39 @@ mod tests {
 
     #[test]
     fn check_pass_sets_passed_true() {
-        let c = Check::pass("test_code", "test", "ok");
-        assert_eq!(c.code, "test_code");
+        let c = Check::pass(&doctor_catalog::REGISTRY_REACHABLE, "ok");
+        assert_eq!(c.code(), "registry_reachable");
         assert!(c.passed);
         assert!(matches!(c.severity, Severity::Pass));
     }
 
     #[test]
     fn check_fail_sets_passed_false() {
-        let c = Check::fail("test_code", "test", "bad");
-        assert_eq!(c.code, "test_code");
+        let c = Check::fail(&doctor_catalog::REGISTRY_UNREACHABLE, "bad");
+        assert_eq!(c.code(), "registry_unreachable");
         assert!(!c.passed);
         assert!(matches!(c.severity, Severity::Fail));
     }
 
     #[test]
     fn check_warn_sets_passed_true_but_severity_warn() {
-        let c = Check::warn("test_code", "test", "meh");
-        assert_eq!(c.code, "test_code");
+        let c = Check::warn(&doctor_catalog::DEPS_SYNC_DRIFT, "meh");
+        assert_eq!(c.code(), "deps_sync_drift");
         assert!(c.passed);
         assert!(matches!(c.severity, Severity::Warn));
     }
 
-    /// Codes are mandatory and non-empty across the board. This is the
-    /// in-crate counterpart to the `lpm doctor --json` workflow test —
-    /// any new helper that constructs a `Check` must pass through the
-    /// `pass / fail / warn` constructors, which require a `&'static str`
-    /// code at compile time. This test is a tripwire: if a future
-    /// refactor relaxes the constructor signature, the workflow test
-    /// will catch real call sites at runtime, but this catches the
-    /// constructor change locally.
+    /// Codes flow from the catalog entry, never the call site.
+    /// Verifies every constructor exposes a non-empty code via the
+    /// `code()` method, mirroring the contract pinned by the
+    /// `lpm doctor --json` workflow test.
     #[test]
-    fn check_constructors_require_non_empty_code() {
-        let p = Check::pass("p_code", "p", "");
-        let f = Check::fail("f_code", "f", "");
-        let w = Check::warn("w_code", "w", "");
+    fn check_constructors_expose_non_empty_code_from_catalog() {
+        let p = Check::pass(&doctor_catalog::REGISTRY_REACHABLE, "");
+        let f = Check::fail(&doctor_catalog::AUTH_INVALID, "");
+        let w = Check::warn(&doctor_catalog::DEPS_SYNC_DRIFT, "");
         for c in [&p, &f, &w] {
-            assert!(!c.code.is_empty(), "every check needs a non-empty code");
+            assert!(!c.code().is_empty(), "every check needs a non-empty code");
         }
     }
 
@@ -2347,9 +2407,9 @@ mod tests {
             "sandbox_probe_failed",
         ];
         assert!(
-            allowed.contains(&c.code),
+            allowed.contains(&c.code()),
             "unexpected sandbox probe code: {} (allowed: {:?})",
-            c.code,
+            c.code(),
             allowed
         );
     }
@@ -2367,7 +2427,7 @@ mod tests {
     #[test]
     fn sandbox_probe_always_returns_a_check() {
         let c = probe_sandbox_backend();
-        assert_eq!(c.name, "Sandbox");
+        assert_eq!(c.name(), "Sandbox");
         // Severity ∈ {Pass, Warn, Fail}. All three are acceptable
         // depending on platform + kernel; what matters is that the
         // probe didn't panic and produced a named Check.
@@ -2482,7 +2542,8 @@ commands = []
 
         let note = scope_boundary_note_if_globals_present(&root);
         let note = note.expect("scope-boundary note must fire when globals exist");
-        assert_eq!(note.name, "Script policy scope");
+        assert_eq!(note.code(), "policy_scope_project_only");
+        assert_eq!(note.name(), "Script policy");
         assert!(matches!(note.severity, Severity::Pass));
         assert!(
             note.detail.contains("46.1"),
@@ -2507,7 +2568,8 @@ commands = []
         let out = check_script_policy_surface();
         assert!(!out.is_empty(), "must emit at least the sandbox probe");
         assert_eq!(
-            out[0].name, "Sandbox",
+            out[0].name(),
+            "Sandbox",
             "sandbox probe must be the first entry so it renders \
              next to the other infrastructure checks"
         );
@@ -2516,10 +2578,10 @@ commands = []
     #[test]
     fn warning_count_with_mixed_checks() {
         let checks = [
-            Check::pass("code_a", "a", "ok"),
-            Check::warn("code_b", "b", "meh"),
-            Check::fail("code_c", "c", "bad"),
-            Check::warn("code_d", "d", "meh2"),
+            Check::pass(&doctor_catalog::REGISTRY_REACHABLE, "ok"),
+            Check::warn(&doctor_catalog::DEPS_SYNC_DRIFT, "meh"),
+            Check::fail(&doctor_catalog::AUTH_INVALID, "bad"),
+            Check::warn(&doctor_catalog::LOCKFILE_MISSING, "meh2"),
         ];
 
         let warning_count = checks
@@ -2542,8 +2604,8 @@ commands = []
     fn no_failures_true_with_warnings_but_clean_false() {
         // Warnings don't count as failures, but the run is not "clean"
         let checks = [
-            Check::pass("code_a", "a", "ok"),
-            Check::warn("code_b", "b", "meh"),
+            Check::pass(&doctor_catalog::REGISTRY_REACHABLE, "ok"),
+            Check::warn(&doctor_catalog::DEPS_SYNC_DRIFT, "meh"),
         ];
         let no_failures = checks.iter().all(|c| c.passed);
         let has_warnings = checks.iter().any(|c| matches!(c.severity, Severity::Warn));
@@ -2557,8 +2619,8 @@ commands = []
     #[test]
     fn clean_true_only_when_all_pass_no_warnings() {
         let checks = [
-            Check::pass("code_a", "a", "ok"),
-            Check::pass("code_b", "b", "fine"),
+            Check::pass(&doctor_catalog::REGISTRY_REACHABLE, "ok"),
+            Check::pass(&doctor_catalog::AUTH_VALID, "fine"),
         ];
         let no_failures = checks.iter().all(|c| c.passed);
         let has_warnings = checks.iter().any(|c| matches!(c.severity, Severity::Warn));
@@ -2675,7 +2737,7 @@ commands = []
         let dir = tempfile::tempdir().unwrap();
         let checks = check_lockfile_state(dir.path());
         assert_eq!(checks.len(), 1);
-        assert_eq!(checks[0].name, "Lockfile");
+        assert_eq!(checks[0].name(), "Lockfile");
         assert!(matches!(checks[0].severity, Severity::Warn));
         assert!(checks[0].detail.contains("not found"));
     }
@@ -2688,9 +2750,9 @@ commands = []
 
         let checks = check_lockfile_state(dir.path());
         assert_eq!(checks.len(), 2);
-        assert_eq!(checks[0].name, "Lockfile");
+        assert_eq!(checks[0].name(), "Lockfile");
         assert!(matches!(checks[0].severity, Severity::Pass));
-        assert_eq!(checks[1].name, "Binary lockfile");
+        assert_eq!(checks[1].name(), "Binary lockfile");
         assert!(matches!(checks[1].severity, Severity::Warn));
         assert!(checks[1].detail.contains("missing"));
     }
@@ -2707,7 +2769,7 @@ commands = []
         let checks = check_lockfile_state(dir.path());
         assert_eq!(checks.len(), 2);
         assert!(matches!(checks[0].severity, Severity::Pass));
-        assert_eq!(checks[1].name, "Binary lockfile");
+        assert_eq!(checks[1].name(), "Binary lockfile");
         assert!(matches!(checks[1].severity, Severity::Pass));
         assert!(checks[1].detail.contains("in sync, valid"));
     }
@@ -2723,7 +2785,7 @@ commands = []
 
         let checks = check_lockfile_state(dir.path());
         assert_eq!(checks.len(), 2);
-        assert_eq!(checks[1].name, "Binary lockfile");
+        assert_eq!(checks[1].name(), "Binary lockfile");
         assert!(matches!(checks[1].severity, Severity::Warn));
         assert!(checks[1].detail.contains("stale"));
     }
@@ -2739,7 +2801,7 @@ commands = []
 
         let checks = check_lockfile_state(dir.path());
         assert_eq!(checks.len(), 2);
-        assert_eq!(checks[1].name, "Binary lockfile");
+        assert_eq!(checks[1].name(), "Binary lockfile");
         assert!(matches!(checks[1].severity, Severity::Warn));
         assert!(checks[1].detail.contains("corrupt"));
     }
