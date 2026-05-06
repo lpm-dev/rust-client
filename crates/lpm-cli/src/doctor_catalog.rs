@@ -4,27 +4,52 @@
 //! emitted row carries the runtime severity + dynamic detail, while
 //! a [`CheckEntry`] in this module carries the static metadata —
 //! description, when-fires, remediation, possible severities,
-//! optional auto-fix command. Constructors take a `&'static
-//! CheckEntry` reference, so every emitted code is, by construction,
-//! a registered catalog entry — drift between "code I emit" and
-//! "code I document" is impossible.
+//! optional auto-fix command.
+//!
+//! ## Drift posture
+//!
+//! Two layers of guarantee, with different strengths:
+//!
+//! 1. **Call site → catalog reference (by construction).**
+//!    The `Check::pass / fail / warn` constructors take
+//!    `&'static CheckEntry`, not `&str`. Code that runs at runtime
+//!    must point at a registered static — there is no path to emit
+//!    a `Check` whose code is not a static defined in this module.
+//!
+//! 2. **Catalog static → inventory list (test-guarded).**
+//!    The [`CLI_CATALOG`] and [`MANIFEST_COMPAT_ENTRIES`] slices
+//!    that drive `lpm doctor list` are **hand-maintained**. A new
+//!    `pub static FOO: CheckEntry` can compile and run perfectly
+//!    without being registered into either slice — in which case
+//!    the inventory would silently miss it. The drift-guard test
+//!    `every_pub_static_check_entry_is_registered_for_listing`
+//!    closes that gap by parsing this file's source and asserting
+//!    every `pub static <NAME>: CheckEntry` declaration appears as
+//!    `&NAME,` in one of the registration slices.
+//!
+//! Together these mean: the runtime cannot emit an unregistered
+//! code, and a catalog static cannot be declared without showing up
+//! in `lpm doctor list`. Drift is caught at unit-test time before it
+//! can land.
 //!
 //! `lpm doctor list [--json]` reads this catalog plus the workspace-
 //! owned [`lpm_workspace::MANIFEST_COMPAT_CATALOG`] and emits the
-//! unified inventory. The two surfaces (runtime emission +
-//! inventory listing) read from one source.
+//! unified inventory.
 //!
 //! ## Adding a new check
 //!
-//! 1. Add a new `pub static` `CheckEntry` in this module, in the
-//!    matching category section.
-//! 2. Use it at the emission site as `Check::pass(&FOO, detail)` /
+//! 1. Add a new `pub static FOO: CheckEntry = CheckEntry { ... }` in
+//!    this module, in the matching category section.
+//! 2. Add `&FOO,` to [`CLI_CATALOG`] (or [`MANIFEST_COMPAT_ENTRIES`])
+//!    so the listing surface picks it up. The drift-guard test
+//!    `every_pub_static_check_entry_is_registered_for_listing` will
+//!    fail loudly if you forget.
+//! 3. Use it at the emission site as `Check::pass(&FOO, detail)` /
 //!    `Check::fail` / `Check::warn`. The constructor `debug_assert!`s
 //!    that the chosen severity is in `entry.possible_severities`.
-//! 3. The drift-guard test `every_catalog_entry_has_unique_code`
-//!    pins the catalog's internal consistency; an integration test
-//!    in `tests/workflows/tests/check_typescript.rs` (or similar)
-//!    pins the new code's emission contract.
+//! 4. Add an integration test (e.g.
+//!    `tests/workflows/tests/check_typescript.rs`) that pins the
+//!    new code's emission contract end-to-end.
 
 use std::fmt;
 
@@ -1477,6 +1502,79 @@ pub fn all_entries() -> Vec<InventoryRow> {
 mod tests {
     use super::*;
     use std::collections::HashSet;
+
+    /// Catalog completeness drift-guard. Closes the second-hop gap
+    /// the constructor signature alone cannot enforce.
+    ///
+    /// `Check::pass / fail / warn` already require `&'static CheckEntry`
+    /// at the call site, so an emitted code is, by construction, a
+    /// registered static. But [`CLI_CATALOG`] and [`MANIFEST_COMPAT_ENTRIES`]
+    /// are still hand-maintained slices — a `pub static FOO: CheckEntry`
+    /// can be defined and used at a call site without being added to
+    /// those lists, in which case `lpm doctor list` would silently miss
+    /// it AND the JSON inventory would be incomplete.
+    ///
+    /// This test parses this module's own source via `include_str!`,
+    /// extracts every `pub static <NAME>: CheckEntry` declaration, and
+    /// asserts each `<NAME>` appears as `&NAME,` in the source — the
+    /// substring used by both registration slices. Define-but-don't-
+    /// register fails the test with a pointer to the offending name.
+    #[test]
+    fn every_pub_static_check_entry_is_registered_for_listing() {
+        const SRC: &str = include_str!("doctor_catalog.rs");
+
+        // Walk the file and pull every `pub static <NAME>: CheckEntry`
+        // declaration. rustfmt keeps the declaration on a single line
+        // (the `=` opens a struct literal across many lines), so a
+        // line-based scan is robust.
+        let mut declared: Vec<&str> = Vec::new();
+        for line in SRC.lines() {
+            let trim = line.trim_start();
+            if let Some(rest) = trim.strip_prefix("pub static ")
+                && let Some(idx) = rest.find(": CheckEntry =")
+            {
+                declared.push(&rest[..idx]);
+            }
+        }
+
+        assert!(
+            !declared.is_empty(),
+            "scanner found no `pub static` CheckEntry declarations — \
+             the source layout changed; update this test rather than \
+             skipping it"
+        );
+
+        // Each declared name must appear in the source as `&NAME,`,
+        // which is the literal form used inside both registration
+        // slices. The trailing comma anchors the match so a
+        // substring-prefix collision (`&FOO_BAR` vs `&FOO`) cannot
+        // false-pass.
+        let mut unregistered: Vec<&str> = Vec::new();
+        for name in &declared {
+            let needle = format!("&{name},");
+            if !SRC.contains(&needle) {
+                unregistered.push(name);
+            }
+        }
+
+        assert!(
+            unregistered.is_empty(),
+            "catalog static(s) defined but not registered in CLI_CATALOG \
+             or MANIFEST_COMPAT_ENTRIES — `lpm doctor list` would miss \
+             them. Add `&{first},` (and the rest) to the appropriate \
+             slice in `doctor_catalog.rs`. Unregistered: {unregistered:?}",
+            first = unregistered[0]
+        );
+
+        // Sanity floor: the catalog has many entries; if this number
+        // ever drops sharply, something else is wrong.
+        assert!(
+            declared.len() >= 50,
+            "expected at least 50 `pub static CheckEntry` declarations; \
+             found {}. Has the catalog been gutted?",
+            declared.len()
+        );
+    }
 
     #[test]
     fn every_catalog_entry_has_unique_code() {
