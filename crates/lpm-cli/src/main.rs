@@ -8,6 +8,7 @@ pub mod build_state;
 pub mod capability;
 mod commands;
 pub mod constraints;
+pub mod doctor_catalog;
 pub mod editor_skills;
 pub mod engine_check;
 pub mod engine_strict_config;
@@ -985,14 +986,28 @@ enum Commands {
     },
 
     /// Health check: verify auth, registry, store, project state.
+    ///
+    /// Without a subcommand, runs the full check set against the
+    /// current project. Subcommands target the inventory surface:
+    ///
+    ///   lpm doctor list                — dump every code doctor can emit
+    ///   lpm doctor list --code <code>  — show one entry
+    ///   lpm doctor list --category Tunnel  — filter by category
     Doctor {
         /// Auto-fix issues (install missing Node, run lpm install, run lpm fmt).
+        ///
+        /// Ignored when a subcommand is provided.
         #[arg(long)]
         fix: bool,
 
         /// Skip confirmation prompts for auto-fix actions (implies --fix).
+        ///
+        /// Ignored when a subcommand is provided.
         #[arg(long, short = 'y')]
         yes: bool,
+
+        #[command(subcommand)]
+        action: Option<DoctorAction>,
     },
 
     /// Configure Swift Package Manager to use LPM as a package registry (SE-0292).
@@ -1788,6 +1803,28 @@ enum Commands {
     /// e.g., `lpm dev` runs the "dev" script if no built-in command matches.
     #[command(external_subcommand)]
     External(Vec<String>),
+}
+
+/// Subcommands of `lpm doctor`. Currently only `list` (the inventory
+/// surface). Without a subcommand, `lpm doctor` runs the full check
+/// set against the current project.
+#[derive(Subcommand)]
+enum DoctorAction {
+    /// Dump the canonical catalog of every check `lpm doctor` can emit.
+    ///
+    /// Use `--json` for the structured form (suitable for piping into
+    /// docs generators or automation). Filter with `--code <code>` for
+    /// a single entry, or `--category <substring>` to scope by group.
+    List {
+        /// Filter by exact code match (e.g., `typescript_unavailable`).
+        #[arg(long)]
+        code: Option<String>,
+        /// Filter by category — case-insensitive substring match
+        /// against the catalog's category labels (e.g., `tunnel`,
+        /// `manifest`).
+        #[arg(long)]
+        category: Option<String>,
+    },
 }
 
 // `GlobalCmd` lives in `commands::global` so the subcommand type is in
@@ -3145,10 +3182,15 @@ async fn async_main() -> Result<()> {
             )
             .await
         }
-        Commands::Doctor { fix, yes } => {
-            let cwd = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;
-            commands::doctor::run(&client, registry_url, &cwd, cli.json, fix || yes, yes).await
-        }
+        Commands::Doctor { fix, yes, action } => match action {
+            Some(DoctorAction::List { code, category }) => {
+                commands::doctor::list(cli.json, code.as_deref(), category.as_deref())
+            }
+            None => {
+                let cwd = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;
+                commands::doctor::run(&client, registry_url, &cwd, cli.json, fix || yes, yes).await
+            }
+        },
         Commands::SwiftRegistry { force } => {
             commands::swift_registry::run(registry_url, cli.json, force).await
         }
