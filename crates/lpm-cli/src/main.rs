@@ -358,12 +358,12 @@ enum Commands {
         /// second `--auto-build` flag to actually fire scripts; that
         /// two-step is now collapsed.)
         ///
-        /// `triage`: four-layer tiered gate (Phase 46 P2–P6). Greens
-        /// auto-approve and run in the filesystem sandbox; ambers
-        /// and reds remain in the blocked set for manual review via
-        /// `lpm approve-scripts`. Triage requires `--auto-build` or
-        /// `lpm.scripts.autoBuild: true` to run greens automatically.
-        /// Layer 4 (LLM triage) ships in Phase 46.1.
+        /// `triage`: four-layer tiered gate. Greens auto-approve and
+        /// run in the filesystem sandbox; ambers and reds remain in the
+        /// blocked set for manual review via `lpm approve-scripts`.
+        /// Triage requires `--auto-build` or `lpm.scripts.autoBuild: true`
+        /// to run greens automatically. The LLM triage layer is not
+        /// available yet.
         ///
         /// Precedence: this flag > `package.json > lpm > scriptPolicy`
         /// > `~/.lpm/config.toml` key `script-policy` > default (deny).
@@ -1318,12 +1318,10 @@ enum Commands {
     /// diff under `patches/` and register it in `package.json` under
     /// `lpm.patchedDependencies`. The patch is bound to the original
     /// store integrity — drift on a future install is a hard error.
-    ///
-    /// Phase 32 Phase 6.
     #[command(name = "patch")]
     Patch {
-        /// Package selector (`name@exact-version`). Phase 6 accepts
-        /// only exact pins; range selectors are reserved for Phase 6.1.
+        /// Package selector (`name@exact-version`). Only exact pins are
+        /// accepted today; range selectors are not supported yet.
         key: String,
     },
 
@@ -1756,7 +1754,7 @@ enum Commands {
         #[arg(long)]
         dry_run: bool,
 
-        /// Overwrite existing lpm.lock without prompting.
+        /// Overwrite an existing lpm.lock.
         #[arg(long)]
         force: bool,
 
@@ -1764,7 +1762,10 @@ enum Commands {
         #[arg(long)]
         rollback: bool,
 
-        /// Skip confirmation prompts, use defaults (implies --force).
+        /// Reserved. The migrate flow is non-interactive today, so this
+        /// flag is a no-op. It exists so scripts that already set `-y`
+        /// continue to parse cleanly, and so the public CLI keeps the
+        /// flag namespace once interactive prompts are wired in.
         #[arg(long, short = 'y')]
         yes: bool,
     },
@@ -1977,6 +1978,7 @@ fn validate_global_install_project_scoped_flags(
     workspace_root: bool,
     fail_if_no_match: bool,
     yes: bool,
+    allow_new: bool,
     // Phase 46 P3 D13/D19: `--min-release-age` is wired on the shared
     // `lpm install` surface, but per-invocation cooldown override for
     // global installs is explicitly out of P3 scope. Reject rather than
@@ -2001,10 +2003,19 @@ fn validate_global_install_project_scoped_flags(
                 .into(),
         ));
     }
+    if allow_new {
+        return Err(lpm_common::LpmError::Script(
+            "`--allow-new` is not supported on `lpm install -g` yet — global-scope \
+             cooldown bypass isn't wired up. Drop the flag for global installs; \
+             the cooldown still follows the package.json / ~/.lpm/config.toml / \
+             24h default chain."
+                .into(),
+        ));
+    }
     if min_release_age.is_some() {
         return Err(lpm_common::LpmError::Script(
-            "`--min-release-age` is not supported on `lpm install -g` in Phase 46 P3 \
-             (global scope is tracked for Phase 46.1). Drop the flag for global installs; \
+            "`--min-release-age` is not supported on `lpm install -g` yet — global-scope \
+             cooldown overrides aren't wired up. Drop the flag for global installs; \
              the cooldown still fires via the package.json / ~/.lpm/config.toml / 24h default chain."
                 .into(),
         ));
@@ -2012,8 +2023,8 @@ fn validate_global_install_project_scoped_flags(
     if !ignore_provenance_drift.is_empty() || ignore_provenance_drift_all {
         return Err(lpm_common::LpmError::Script(
             "`--ignore-provenance-drift` / `--ignore-provenance-drift-all` are not \
-             supported on `lpm install -g` in Phase 46 P4 (global trust store is tracked \
-             for Phase 46.1). Drop the flag for global installs."
+             supported on `lpm install -g` yet — the global trust store doesn't accept \
+             per-package drift overrides. Drop the flag for global installs."
                 .into(),
         ));
     }
@@ -2428,6 +2439,7 @@ async fn async_main() -> Result<()> {
                     workspace_root,
                     fail_if_no_match,
                     yes,
+                    allow_new,
                     min_release_age.as_deref(),
                     &ignore_provenance_drift,
                     ignore_provenance_drift_all,
@@ -2444,7 +2456,6 @@ async fn async_main() -> Result<()> {
                 let _ = (
                     offline,
                     force,
-                    allow_new,
                     linker,
                     no_skills,
                     no_editor_setup,
@@ -2454,8 +2465,8 @@ async fn async_main() -> Result<()> {
                     tilde,
                     save_prefix,
                 ); // M3.2 honors none of these yet; M3.4/M5 will wire selected flags.
-                // `min_release_age`, `ignore_provenance_drift`, and
-                // `ignore_provenance_drift_all` are already rejected by
+                // `allow_new`, `min_release_age`, `ignore_provenance_drift`,
+                // and `ignore_provenance_drift_all` are already rejected by
                 // `validate_global_install_project_scoped_flags` above,
                 // so none of them reach this point as a populated value
                 // — no discard needed.
@@ -3778,8 +3789,12 @@ async fn async_main() -> Result<()> {
             dry_run,
             force,
             rollback,
-            yes,
+            yes: _yes,
         } => {
+            // `-y` is reserved (non-interactive flag) and intentionally
+            // does NOT imply `--force`. The migrate flow has no
+            // interactive prompts today; if the user wants to clobber
+            // an existing lpm.lock they must pass `--force` explicitly.
             let cwd = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;
             commands::migrate::run(
                 &client,
@@ -3790,7 +3805,7 @@ async fn async_main() -> Result<()> {
                 ci,
                 no_install,
                 dry_run,
-                force || yes,
+                force,
                 rollback,
                 cli.json,
             )
@@ -4446,6 +4461,7 @@ mod tests {
                     workspace_root,
                     fail_if_no_match,
                     yes,
+                    false,
                     None,
                     &[],
                     false,
@@ -4502,6 +4518,7 @@ mod tests {
                         workspace_root,
                         fail_if_no_match,
                         yes,
+                        false,
                         min_release_age.as_deref(),
                         &[],
                         false,
@@ -4515,8 +4532,9 @@ mod tests {
                                 "error must name the flag, got: {message}"
                             );
                             assert!(
-                                message.contains("Phase 46.1"),
-                                "error must point at the Phase 46.1 follow-up, got: {message}"
+                                message.contains("not supported") && message.contains("global"),
+                                "error must say the flag isn't supported on global installs, \
+                                 got: {message}"
                             );
                         }
                         other => panic!("expected Script error, got {other:?}"),
@@ -4570,6 +4588,7 @@ mod tests {
                     workspace_root,
                     fail_if_no_match,
                     yes,
+                    false,
                     None,
                     &ignore_provenance_drift,
                     ignore_provenance_drift_all,
@@ -4583,8 +4602,9 @@ mod tests {
                             "error must name the flag, got: {message}",
                         );
                         assert!(
-                            message.contains("Phase 46.1"),
-                            "error must point at Phase 46.1 follow-up, got: {message}",
+                            message.contains("not supported") && message.contains("global"),
+                            "error must say the flag isn't supported on global installs, \
+                             got: {message}",
                         );
                     }
                     other => panic!("expected Script error, got {other:?}"),
@@ -4630,6 +4650,7 @@ mod tests {
                     workspace_root,
                     fail_if_no_match,
                     yes,
+                    false,
                     None,
                     &ignore_provenance_drift,
                     ignore_provenance_drift_all,
@@ -4644,8 +4665,62 @@ mod tests {
                             "error must name a drift-override flag, got: {message}",
                         );
                         assert!(
-                            message.contains("Phase 46.1"),
-                            "error must point at Phase 46.1 follow-up, got: {message}",
+                            message.contains("not supported") && message.contains("global"),
+                            "error must say the flag isn't supported on global installs, \
+                             got: {message}",
+                        );
+                    }
+                    other => panic!("expected Script error, got {other:?}"),
+                }
+            }
+            _ => panic!("expected Install command"),
+        }
+    }
+
+    /// `--allow-new` is a project-install cooldown escape hatch today.
+    /// Global installs currently accept then drop it, which is the
+    /// exact contract gap this regression test pins: the flag must
+    /// hard-error on `-g` instead of silently disappearing.
+    #[test]
+    fn install_global_rejects_allow_new_flag() {
+        let cli = Cli::try_parse_from(["lpm", "install", "-g", "eslint", "--allow-new"]).unwrap();
+        match cli.command.expect("test parse missing subcommand") {
+            Commands::Install {
+                save_dev,
+                filter,
+                workspace_root,
+                fail_if_no_match,
+                yes,
+                allow_new,
+                global,
+                ..
+            } => {
+                assert!(global);
+                assert!(allow_new);
+
+                let err = validate_global_install_project_scoped_flags(
+                    save_dev,
+                    &filter,
+                    workspace_root,
+                    fail_if_no_match,
+                    yes,
+                    allow_new,
+                    None,
+                    &[],
+                    false,
+                )
+                .unwrap_err();
+
+                match err {
+                    lpm_common::LpmError::Script(message) => {
+                        assert!(
+                            message.contains("--allow-new"),
+                            "error must name the flag, got: {message}",
+                        );
+                        assert!(
+                            message.contains("not supported") && message.contains("global"),
+                            "error must say the flag isn't supported on global installs, \
+                             got: {message}",
                         );
                     }
                     other => panic!("expected Script error, got {other:?}"),

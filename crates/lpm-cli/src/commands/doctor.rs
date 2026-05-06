@@ -2279,8 +2279,8 @@ fn scope_boundary_note_if_globals_present(root: &lpm_common::LpmRoot) -> Option<
         Some(Check::pass(
             &doctor_catalog::POLICY_SCOPE_PROJECT_ONLY,
             "project installs only — global installs use a separate trust store at \
-             ~/.lpm/global/trusted-dependencies.json; Phase 46.1 extends the tiered \
-             gate + sandbox containment to globals",
+             ~/.lpm/global/trusted-dependencies.json. The tiered gate and sandbox \
+             containment don't extend to globals yet",
         ))
     } else {
         None
@@ -2327,8 +2327,8 @@ fn probe_sandbox_backend() -> Check {
             &format!(
                 "unavailable on {platform} — {remediation}. Lifecycle scripts under \
                  `script-policy = \"triage\"` or `\"allow\"`, and any `lpm rebuild` \
-                 invocation, run without filesystem containment on this platform \
-                 until Phase 46.1."
+                 invocation, run without filesystem containment on this platform — \
+                 sandbox enforcement isn't supported here yet."
             ),
         ),
         Err(SandboxError::KernelTooOld {
@@ -2473,14 +2473,14 @@ mod tests {
         );
     }
 
-    /// On Windows, the probe must Warn with the Phase 46.1
-    /// pointer. §17.4 commits to this user-facing message: users
-    /// need to know that triage + sandbox containment is deferred
-    /// on their platform and the 46.0 interim is opt-out via
+    /// On Windows, the probe must Warn with the
+    /// "sandbox enforcement isn't supported here yet" pointer. Users
+    /// need to know that triage + sandbox containment is unavailable
+    /// on their platform and the interim is opt-out via
     /// `--unsafe-full-env --no-sandbox`.
     #[cfg(target_os = "windows")]
     #[test]
-    fn sandbox_probe_on_windows_warns_with_phase_46_1_pointer() {
+    fn sandbox_probe_on_windows_warns_when_unsupported() {
         let c = probe_sandbox_backend();
         assert!(
             matches!(c.severity, Severity::Warn),
@@ -2488,8 +2488,10 @@ mod tests {
             c.detail
         );
         assert!(
-            c.detail.contains("46.1"),
-            "Windows warn message must point at Phase 46.1 per §17.4. detail={}",
+            c.detail.contains("not supported")
+                || c.detail.contains("sandbox enforcement isn't supported"),
+            "Windows warn message must say sandbox enforcement isn't supported here \
+             yet. detail={}",
             c.detail
         );
     }
@@ -2546,8 +2548,9 @@ commands = []
         assert_eq!(note.name(), "Script policy");
         assert!(matches!(note.severity, Severity::Pass));
         assert!(
-            note.detail.contains("46.1"),
-            "note must name the 46.1 parity closure. detail={}",
+            note.detail.contains("don't extend to globals yet")
+                || note.detail.contains("globals yet"),
+            "note must say the gate doesn't extend to globals yet. detail={}",
             note.detail
         );
         assert!(

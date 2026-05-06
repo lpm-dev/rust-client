@@ -45,7 +45,7 @@ pub fn select_workspace_target_set(
         let parsed = FilterEngine::parse(raw).map_err(|e| {
             LpmError::Script(format!(
                 "invalid --filter {raw:?}: {e}\n  \
-                 (Phase 32 removed substring matching; use a glob like '*{raw}*' \
+                 (substring matching is not supported; use a glob like '*{raw}*' \
                  if you intended a partial match.)"
             ))
         })?;
@@ -178,7 +178,7 @@ mod tests {
         .expect_err("invalid syntax must error");
         let msg = err.to_string();
         assert!(
-            msg.contains("Phase 32") && msg.contains("glob"),
+            msg.contains("substring matching is not supported") && msg.contains("glob"),
             "error must mention the substring → glob migration, got: {msg}"
         );
     }
