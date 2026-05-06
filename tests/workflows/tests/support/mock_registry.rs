@@ -30,6 +30,94 @@ impl MockRegistry {
         self.server.uri()
     }
 
+    /// Mount `GET /api/search/packages` for a specific query + limit.
+    pub async fn with_search_results(
+        &self,
+        query: &str,
+        limit: u32,
+        packages: Vec<serde_json::Value>,
+    ) -> &Self {
+        Mock::given(method("GET"))
+            .and(path("/api/search/packages"))
+            .and(query_param("q", query))
+            .and(query_param("limit", &limit.min(20).to_string()))
+            .and(query_param("mode", "semantic"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "packages": packages,
+            })))
+            .mount(&self.server)
+            .await;
+        self
+    }
+
+    /// Mount `GET /api/registry/quality` for a specific package.
+    pub async fn with_quality_report(&self, name: &str, report: serde_json::Value) -> &Self {
+        Mock::given(method("GET"))
+            .and(path("/api/registry/quality"))
+            .and(query_param("name", name))
+            .respond_with(ResponseTemplate::new(200).set_body_json(report))
+            .mount(&self.server)
+            .await;
+        self
+    }
+
+    /// Mount `POST /api/registry/-/token/create` for `lpm setup-npmrc`.
+    pub async fn with_npmrc_token_create(
+        &self,
+        expiry_days: u32,
+        token: &str,
+        expires_at: &str,
+    ) -> &Self {
+        Mock::given(method("POST"))
+            .and(path("/api/registry/-/token/create"))
+            .and(body_string_contains("\"scope\":\"read\""))
+            .and(body_string_contains(format!("\"expiryDays\":{expiry_days}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "token": token,
+                "expiresAt": expires_at,
+            })))
+            .expect(1)
+            .mount(&self.server)
+            .await;
+        self
+    }
+
+    /// Mount `POST /api/registry/-/token/rotate` for `lpm token-rotate`.
+    pub async fn with_token_rotate(
+        &self,
+        bearer_token: &str,
+        token: &str,
+        expires_at: &str,
+    ) -> &Self {
+        Mock::given(method("POST"))
+            .and(path("/api/registry/-/token/rotate"))
+            .and(header("authorization", format!("Bearer {bearer_token}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "token": token,
+                "expiresAt": expires_at,
+            })))
+            .expect(1)
+            .mount(&self.server)
+            .await;
+        self
+    }
+
+    /// Mount `GET /api/registry/pool/stats` for `lpm pool`.
+    pub async fn with_pool_stats(
+        &self,
+        bearer_token: &str,
+        stats: serde_json::Value,
+    ) -> &Self {
+        Mock::given(method("GET"))
+            .and(path("/api/registry/pool/stats"))
+            .and(header("authorization", format!("Bearer {bearer_token}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(stats))
+            .expect(1)
+            .mount(&self.server)
+            .await;
+        self
+    }
+
     /// Mount a healthy `/api/registry/health` endpoint.
     pub async fn with_health(&self) -> &Self {
         Mock::given(method("GET"))

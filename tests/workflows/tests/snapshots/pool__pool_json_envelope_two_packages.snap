@@ -1,0 +1,31 @@
+---
+source: tests/workflows/tests/pool.rs
+assertion_line: 99
+expression: envelope
+---
+{
+  "billingPeriod": "2026-05",
+  "totalWeightedDownloads": 3210,
+  "estimatedEarningsCents": 12345,
+  "packages": [
+    {
+      "name": "@lpm.dev/neo.widget",
+      "owner": null,
+      "packageName": null,
+      "installCount": null,
+      "weightedDownloads": 2100,
+      "sharePercentage": null,
+      "estimatedEarningsCents": 8000
+    },
+    {
+      "name": "@lpm.dev/neo.button",
+      "owner": null,
+      "packageName": null,
+      "installCount": null,
+      "weightedDownloads": 1110,
+      "sharePercentage": null,
+      "estimatedEarningsCents": 4345
+    }
+  ],
+  "success": true
+}

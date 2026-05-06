@@ -8,6 +8,7 @@ use rcgen::{CertificateParams, DistinguishedName, DnType, KeyPair, SanType};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::path::Path;
 use time::{Duration, OffsetDateTime};
+use x509_parser::extensions::GeneralName;
 
 /// Certificate info extracted from an existing cert file.
 #[derive(Debug, Clone)]
@@ -99,6 +100,35 @@ pub fn needs_renewal(cert_path: &Path) -> Result<bool, LpmError> {
     Ok(not_after <= renewal_threshold)
 }
 
+/// Check whether a certificate already covers the requested extra hostnames.
+pub fn covers_requested_hostnames(
+    cert_path: &Path,
+    requested_hostnames: &[String],
+) -> Result<bool, LpmError> {
+    if requested_hostnames.is_empty() {
+        return Ok(true);
+    }
+
+    let pem_str = std::fs::read_to_string(cert_path)
+        .map_err(|e| LpmError::Cert(format!("failed to read cert: {e}")))?;
+
+    let pem = pem::parse(&pem_str).map_err(|e| LpmError::Cert(format!("invalid PEM: {e}")))?;
+
+    let (_, cert) = x509_parser::parse_x509_certificate(pem.contents())
+        .map_err(|e| LpmError::Cert(format!("invalid X.509: {e}")))?;
+
+    let Some(san) = cert.subject_alternative_name().ok().flatten() else {
+        return Ok(false);
+    };
+
+    Ok(requested_hostnames.iter().all(|requested_hostname| {
+        san.value
+            .general_names
+            .iter()
+            .any(|name| general_name_matches_requested_host(name, requested_hostname))
+    }))
+}
+
 /// Read certificate information from a PEM file.
 pub fn read_cert_info(cert_path: &Path) -> Result<CertInfo, LpmError> {
     let pem_str = std::fs::read_to_string(cert_path)
@@ -162,6 +192,22 @@ pub fn read_cert_info(cert_path: &Path) -> Result<CertInfo, LpmError> {
 fn format_asn1_time(time: &x509_parser::time::ASN1Time) -> String {
     let dt = time.to_datetime();
     format!("{}-{:02}-{:02}", dt.year(), dt.month() as u8, dt.day())
+}
+
+fn general_name_matches_requested_host(name: &GeneralName<'_>, requested_host: &str) -> bool {
+    if let Ok(ip) = requested_host.parse::<IpAddr>() {
+        return match (ip, name) {
+            (IpAddr::V4(ip), GeneralName::IPAddress(bytes)) => {
+                *bytes == ip.octets().as_slice()
+            }
+            (IpAddr::V6(ip), GeneralName::IPAddress(bytes)) => {
+                *bytes == ip.octets().as_slice()
+            }
+            _ => false,
+        };
+    }
+
+    matches!(name, GeneralName::DNSName(hostname) if *hostname == requested_host)
 }
 
 #[cfg(test)]
@@ -292,5 +338,20 @@ mod tests {
         assert_eq!(info.issuer, "LPM Local Development CA");
         assert!(!info.is_ca);
         assert!(!info.san_entries.is_empty());
+    }
+
+    #[test]
+    fn covers_requested_hostnames_detects_missing_requested_sans() {
+        let (ca_cert_pem, ca_key_pem) = ca::generate_ca().unwrap();
+        let extras = vec!["myapp.test".to_string(), "192.168.1.42".to_string()];
+        let (cert_pem, _) = generate_project_cert(&ca_cert_pem, &ca_key_pem, &extras).unwrap();
+
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(tmp.path(), &cert_pem).unwrap();
+
+        assert!(covers_requested_hostnames(tmp.path(), &extras).unwrap());
+        assert!(
+            !covers_requested_hostnames(tmp.path(), &["missing.test".to_string()]).unwrap()
+        );
     }
 }

@@ -1,0 +1,24 @@
+---
+source: tests/workflows/tests/search.rs
+assertion_line: 125
+expression: envelope
+---
+{
+  "packages": [
+    {
+      "id": null,
+      "name": "react",
+      "owner": "neo",
+      "description": "Fast UI package",
+      "distributionMode": "pool",
+      "downloadCount": 12345,
+      "latestVersion": "1.2.3",
+      "category": null,
+      "avatarUrl": null,
+      "isOrg": null,
+      "archived": null
+    }
+  ],
+  "success": true,
+  "count": 1
+}

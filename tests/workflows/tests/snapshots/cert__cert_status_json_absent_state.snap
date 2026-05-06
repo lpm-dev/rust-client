@@ -1,0 +1,20 @@
+---
+source: tests/workflows/tests/cert.rs
+assertion_line: 59
+expression: envelope
+---
+{
+  "success": true,
+  "ca": {
+    "exists": false,
+    "trusted": false,
+    "expires": null,
+    "subject": null
+  },
+  "project": {
+    "exists": false,
+    "expires": null,
+    "hostnames": [],
+    "needs_renewal": false
+  }
+}

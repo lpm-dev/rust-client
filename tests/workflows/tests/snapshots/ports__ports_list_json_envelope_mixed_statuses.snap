@@ -1,0 +1,20 @@
+---
+source: tests/workflows/tests/ports.rs
+assertion_line: 81
+expression: envelope
+---
+{
+  "success": true,
+  "ports": [
+    {
+      "service": "api",
+      "port": "[PORT]",
+      "status": "free"
+    },
+    {
+      "service": "web",
+      "port": "[PORT]",
+      "status": "in_use"
+    }
+  ]
+}

@@ -1,0 +1,33 @@
+---
+source: tests/workflows/tests/quality.rs
+assertion_line: 111
+expression: envelope
+---
+{
+  "name": "owner.widget",
+  "score": 73,
+  "maxScore": 100,
+  "tier": "silver",
+  "ecosystem": "node",
+  "checks": [
+    {
+      "id": "readme",
+      "category": "docs",
+      "label": "README present",
+      "passed": true,
+      "points": 10,
+      "maxPoints": 10,
+      "detail": "this detail must stay hidden"
+    },
+    {
+      "id": "provenance",
+      "category": "security",
+      "label": "Provenance attestations",
+      "passed": false,
+      "points": 0,
+      "maxPoints": 20,
+      "detail": "missing provenance attestations"
+    }
+  ],
+  "success": true
+}

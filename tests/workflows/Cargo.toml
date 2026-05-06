@@ -21,6 +21,8 @@ tokio = { version = "1", features = ["full"] }
 chrono = { workspace = true }
 rcgen = { version = "0.13", features = ["pem"] }
 reqwest = { workspace = true }
+lpm-common = { path = "../../crates/lpm-common" }
+lpm-runner = { path = "../../crates/lpm-runner" }
 lpm-vault = { path = "../../crates/lpm-vault" }
 lpm-lockfile = { path = "../../crates/lpm-lockfile" }
 lpm-security = { path = "../../crates/lpm-security" }
