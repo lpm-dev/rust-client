@@ -130,6 +130,19 @@ impl GlobalConfig {
         Self { table }
     }
 
+    /// Construct an empty config — used by in-crate tests that need a
+    /// deterministic "no overrides" baseline without touching
+    /// `~/.lpm/config.toml`. `pub(crate)` because no external caller
+    /// has a legitimate use; `#[cfg(test)]` because no production code
+    /// path constructs an empty config — `load()` is the production
+    /// path and a missing file already produces an empty table.
+    #[cfg(test)]
+    pub(crate) fn empty() -> Self {
+        Self {
+            table: toml::map::Map::new(),
+        }
+    }
+
     /// Get a string value.
     pub fn get_str(&self, key: &str) -> Option<&str> {
         self.table.get(key)?.as_str()

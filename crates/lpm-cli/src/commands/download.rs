@@ -120,13 +120,22 @@ pub async fn run(
     let elapsed = start.elapsed();
 
     if json_output {
+        // Resolve to an absolute path now that extraction has created the
+        // directory. Fall back to the lexical form if canonicalize fails
+        // (e.g., target_dir was deleted out from under us mid-run).
+        let absolute_output_dir = target_dir
+            .canonicalize()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|_| target_dir.display().to_string());
         let json = serde_json::json!({
             "success": true,
             "package": name.to_string(),
             "version": version_key,
-            "size_bytes": size,
+            "tarball_url": tarball_url,
+            "integrity": integrity_str,
             "integrity_verified": integrity_verified,
-            "output_dir": target_dir.display().to_string(),
+            "size_bytes": size,
+            "output_dir": absolute_output_dir,
             "files_extracted": files.len(),
             "elapsed_secs": (elapsed.as_millis() as f64) / 1000.0,
         });

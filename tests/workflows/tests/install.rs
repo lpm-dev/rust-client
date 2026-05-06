@@ -75,6 +75,120 @@ fn install_with_no_dependencies_succeeds() {
     );
 }
 
+/// Single-writer ownership pin: the empty-deps short-circuit at the
+/// top of `run_with_options_under_store_lock` MUST emit a v6
+/// `.lpm/install-hash` (3 lines: `<hash>\nm:<pkg_ns>:<lock_ns>\nl:<mode>\n`)
+/// just like the canonical end-of-function path. Pre-fix the
+/// short-circuit returned without writing anything, and `dev.rs`
+/// covered the gap by writing a single-line bare hash post-install
+/// — which clobbered v6 metadata on the canonical path AND used
+/// stale pre-install state. With the install pipeline owning every
+/// successful exit, a freshly installed empty-deps project lands
+/// the same v6 shape any other install does.
+#[test]
+fn empty_deps_install_writes_v6_install_hash() {
+    let project = TempProject::empty(
+        r#"{
+        "name": "empty-deps-hash",
+        "version": "1.0.0",
+        "dependencies": {}
+    }"#,
+    );
+
+    let output = lpm(&project)
+        .args(["install"])
+        .output()
+        .expect("failed to run lpm install");
+    assert!(
+        output.status.success(),
+        "install with empty deps failed:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+
+    let install_hash = project.path().join(".lpm").join("install-hash");
+    assert!(
+        install_hash.exists(),
+        "empty-deps install must write `.lpm/install-hash` — pre-fix the \
+         short-circuit returned without writing and `dev.rs` covered the \
+         gap with a stale single-line hash"
+    );
+    let content = std::fs::read_to_string(&install_hash).expect("install-hash readable");
+    let lines: Vec<&str> = content.lines().collect();
+    assert!(
+        lines.len() >= 3,
+        "v6 install-hash must have at least 3 lines (hash + `m:` + `l:`), got:\n{content}"
+    );
+    assert!(
+        !lines[0].is_empty() && lines[0].chars().all(|c| c.is_ascii_hexdigit()),
+        "line 1 must be a non-empty hex hash, got {:?}",
+        lines[0]
+    );
+    assert!(
+        lines[1].starts_with("m:"),
+        "line 2 must start with `m:` (mtime line), got {:?}",
+        lines[1]
+    );
+    assert!(
+        lines[2] == "l:isolated" || lines[2] == "l:hoisted",
+        "line 3 must be `l:isolated` or `l:hoisted`, got {:?}",
+        lines[2]
+    );
+}
+
+#[test]
+fn empty_deps_second_install_is_up_to_date() {
+    let project = TempProject::empty(
+        r#"{
+        "name": "empty-deps-fresh",
+        "version": "1.0.0",
+        "dependencies": {}
+    }"#,
+    );
+
+    let first = lpm(&project)
+        .args(["install"])
+        .output()
+        .expect("failed to run first lpm install");
+    assert!(
+        first.status.success(),
+        "first empty-deps install failed:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&first.stdout),
+        String::from_utf8_lossy(&first.stderr),
+    );
+
+    assert!(
+        project.path().join("lpm.lock").is_file(),
+        "empty-deps install must materialize lpm.lock for freshness"
+    );
+    assert!(
+        project.path().join("node_modules").is_dir(),
+        "empty-deps install must materialize node_modules for freshness"
+    );
+
+    let second = lpm(&project)
+        .args(["install"])
+        .output()
+        .expect("failed to run second lpm install");
+    assert!(
+        second.status.success(),
+        "second empty-deps install failed:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&second.stdout),
+        String::from_utf8_lossy(&second.stderr),
+    );
+
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&second.stdout),
+        String::from_utf8_lossy(&second.stderr),
+    );
+
+    assert!(
+        combined.contains("up to date"),
+        "expected second empty-deps install to hit freshness fast path, got:\n{combined}"
+    );
+}
+
 // ─── Phase 64 #34: install-time warning for `pnpm.overrides` ─────
 
 /// A project with `pnpm.overrides` but no LPM-readable equivalent
@@ -3682,4 +3796,374 @@ async fn install_explicit_version_pin_does_not_bypass_cooldown() {
         .expect("spawn lpm install");
 
     assert_cooldown_blocked(&out);
+}
+
+// ─── Linker validation ───────────────────────────────────────────
+
+/// `package.json > lpm > linker` is parsed via `LinkerMode::parse_str` at
+/// install time. Unknown values — including the legacy `"symlink"` alias
+/// the docstring previously claimed was accepted — must abort with a
+/// helpful error before the install runs, not silently fall back to the
+/// default isolated layout. Pins the contract at the binary boundary.
+#[test]
+fn install_rejects_unknown_lpm_linker_value_loudly() {
+    let project = TempProject::empty(
+        r#"{
+        "name": "linker-bad",
+        "version": "0.0.1",
+        "lpm": { "linker": "symlink" }
+    }"#,
+    );
+
+    let out = lpm(&project)
+        .args(["install"])
+        .output()
+        .expect("spawn lpm install");
+
+    assert!(
+        !out.status.success(),
+        "install with `lpm.linker = symlink` should fail loudly; \
+         stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("lpm.linker") || stderr.contains("linker"),
+        "stderr must name the linker field; got:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("isolated") && stderr.contains("hoisted"),
+        "stderr must list accepted values; got:\n{stderr}"
+    );
+}
+
+/// CLI flag `--linker symlink` is rejected by clap at parse time. The
+/// install pipeline never sees an unknown value through this surface, so
+/// the error format is clap's standard "invalid value" message rather than
+/// the install-time message.
+#[test]
+fn install_cli_linker_flag_rejects_unknown_value_at_parse_time() {
+    let project = TempProject::empty(
+        r#"{
+        "name": "linker-cli-bad",
+        "version": "0.0.1"
+    }"#,
+    );
+
+    let out = lpm(&project)
+        .args(["install", "--linker", "symlink"])
+        .output()
+        .expect("spawn lpm install");
+
+    assert!(
+        !out.status.success(),
+        "`--linker symlink` should fail at clap parse time"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("invalid value")
+            || stderr.contains("possible values")
+            || stderr.contains("isolated"),
+        "stderr must surface the clap rejection; got:\n{stderr}"
+    );
+}
+
+/// `lpm migrate` calls `run_with_options` after generating `lpm.lock`. The
+/// linker resolution chain (CLI > config.toml > LPM_LINKER > package.json)
+/// must apply uniformly across every install entry point — not just the
+/// top-level `lpm install` dispatch — or a user with `LPM_LINKER=hoisted`
+/// would silently get `isolated` whenever they run `lpm migrate`,
+/// `lpm upgrade`, `lpm add`, etc. This test pins that contract through
+/// migrate, where the install pipeline is invoked with `linker_override =
+/// None` from the caller. With the seam wired only at top-level dispatch
+/// the bad value would slip through to silent fallback; with the seam
+/// inside `run_with_options` it fails loudly here, before any network call.
+///
+/// `lpm migrate` itself exits 0 even when the post-migration install
+/// fails (its design: lockfile generation succeeded, the install failure
+/// is logged as a warning with a "run lpm install manually" hint). So the
+/// test asserts on the error *message* in stderr, not the exit code —
+/// the message is the load-bearing signal that the env var was honored.
+#[test]
+fn migrate_honors_lpm_linker_env_in_install_pipeline() {
+    let project = TempProject::from_fixture("migrate-npm");
+
+    let out = lpm(&project)
+        .args(["migrate", "--force"])
+        .env("LPM_LINKER", "symlink")
+        .output()
+        .expect("spawn lpm migrate");
+
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("LPM_LINKER"),
+        "stderr must name LPM_LINKER — proves the env var (not just the \
+         CLI flag or package.json) is honored from a non-`lpm install` \
+         caller; got:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("unknown linker mode") || stderr.contains("invalid LPM_LINKER"),
+        "stderr must surface the install-pipeline rejection; got:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("isolated") && stderr.contains("hoisted"),
+        "stderr must list accepted values; got:\n{stderr}"
+    );
+}
+
+/// Post-install env-driven linker flip MUST invalidate the "up to date"
+/// freshness cache. Without the v6 hash fold, the second install would
+/// short-circuit on the up-to-date fast-exit because pkg.json + lockfile
+/// are unchanged — leaving the project on the prior layout despite the
+/// requested switch. Pinning the contract end-to-end through the real
+/// install pipeline + mock registry: install once with the default
+/// isolated layout, then re-run with `LPM_LINKER=hoisted` and assert the
+/// command did NOT print "up to date".
+#[tokio::test]
+async fn install_invalidates_freshness_cache_on_lpm_linker_flip() {
+    let mock = MockRegistry::start().await;
+    let tarball = make_tarball("ms", "2.1.3");
+    mock.with_package("ms", "2.1.3", &tarball).await;
+    let batch_meta = serde_json::json!({
+        "name": "ms",
+        "dist-tags": { "latest": "2.1.3" },
+        "versions": {
+            "2.1.3": {
+                "name": "ms",
+                "version": "2.1.3",
+                "dist": {
+                    "tarball": format!("{}/tarballs/ms-2.1.3.tgz", mock.url()),
+                    "integrity": format!("sha512-placeholder"),
+                },
+                "dependencies": {}
+            }
+        },
+        "time": { "2.1.3": "2025-01-01T00:00:00.000Z" }
+    });
+    mock.with_batch_metadata(vec![batch_meta]).await;
+
+    let project = TempProject::empty(
+        r#"{
+        "name": "linker-freshness",
+        "version": "1.0.0",
+        "dependencies": { "ms": "^2.1.3" }
+    }"#,
+    );
+
+    // First install — establishes the freshness baseline under the
+    // default isolated layout. After this completes, .lpm/install-hash
+    // contains a hash keyed on `linker_mode = isolated`.
+    let first = lpm_with_registry(&project, &mock.url())
+        .args([
+            "install",
+            "--no-security-summary",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
+        .output()
+        .expect("spawn first install");
+    assert!(
+        first.status.success(),
+        "first install failed:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&first.stdout),
+        String::from_utf8_lossy(&first.stderr),
+    );
+
+    // Sanity: a no-flag re-install should be "up to date" because the
+    // resolved linker still matches what the cache encoded.
+    let cached = lpm_with_registry(&project, &mock.url())
+        .args([
+            "install",
+            "--no-security-summary",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
+        .output()
+        .expect("spawn cached re-install");
+    assert!(cached.status.success());
+    let cached_stderr = String::from_utf8_lossy(&cached.stderr);
+    assert!(
+        cached_stderr.contains("up to date"),
+        "no-flag re-install must short-circuit when nothing changed; \
+         got stderr:\n{cached_stderr}"
+    );
+
+    // The load-bearing assertion: re-install with `LPM_LINKER=hoisted`
+    // must NOT short-circuit as "up to date" — the env-driven layout
+    // flip has to invalidate the freshness cache and trigger a real
+    // re-link.
+    let flipped = lpm_with_registry(&project, &mock.url())
+        .args([
+            "install",
+            "--no-security-summary",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
+        .env("LPM_LINKER", "hoisted")
+        .output()
+        .expect("spawn flipped re-install");
+    assert!(
+        flipped.status.success(),
+        "flipped re-install failed:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&flipped.stdout),
+        String::from_utf8_lossy(&flipped.stderr),
+    );
+    let flipped_stderr = String::from_utf8_lossy(&flipped.stderr);
+    assert!(
+        !flipped_stderr.contains("up to date"),
+        "freshness cache MUST invalidate on `LPM_LINKER` flip — second \
+         install short-circuited as `up to date` despite the layout \
+         change. This is the bug GPT's audit caught: pre-fix, the install-\
+         hash didn't fold in the linker mode, so a post-install env flip \
+         left the cache warm and the project stayed on the prior layout. \
+         Got stderr:\n{flipped_stderr}"
+    );
+}
+
+/// Cached-install fail-loud regression: warm install-hash on disk +
+/// invalid `LPM_LINKER` MUST surface the parse error, not short-circuit
+/// as "up to date". This pins the **sync fast lane** at `main.rs:2087`
+/// — the pre-clap pre-tokio path that calls
+/// `check_install_state_with_content` before the install dispatch
+/// ever runs. Pre-fix the freshness helpers coerced the linker
+/// resolution error to `LinkerMode::Isolated`, the stored isolated
+/// hash matched, and the fast lane printed `up to date (Nms)` and
+/// exited 0 — the user never learned their env was broken.
+///
+/// The fast lane is gated by `argv_qualifies_for_fast_lane()`
+/// ([install_state.rs:681](../../crates/lpm-cli/src/install_state.rs)).
+/// `--registry`, `--insecure`, `--no-skills`, `--no-editor-setup`,
+/// `--no-security-summary`, and any other install flag disqualify it,
+/// so the bad-env repro MUST be a plain bare `lpm install` to actually
+/// hit the fast lane. The warm phase still uses `lpm_with_registry`
+/// because that's how the mock-backed install lands a real warm cache;
+/// the bad-env phase drops to `lpm()` and routes the registry override
+/// through `LPM_REGISTRY_URL` (env-based, doesn't appear in argv) so
+/// the fast-lane gate sees a bare argv.
+#[tokio::test]
+async fn install_invalid_lpm_linker_surfaces_through_sync_fast_lane() {
+    let mock = MockRegistry::start().await;
+    let tarball = make_tarball("ms", "2.1.3");
+    mock.with_package("ms", "2.1.3", &tarball).await;
+    let batch_meta = serde_json::json!({
+        "name": "ms",
+        "dist-tags": { "latest": "2.1.3" },
+        "versions": {
+            "2.1.3": {
+                "name": "ms",
+                "version": "2.1.3",
+                "dist": {
+                    "tarball": format!("{}/tarballs/ms-2.1.3.tgz", mock.url()),
+                    "integrity": format!("sha512-placeholder"),
+                },
+                "dependencies": {}
+            }
+        },
+        "time": { "2.1.3": "2025-01-01T00:00:00.000Z" }
+    });
+    mock.with_batch_metadata(vec![batch_meta]).await;
+
+    let project = TempProject::empty(
+        r#"{
+        "name": "linker-cached-fail-loud",
+        "version": "1.0.0",
+        "dependencies": { "ms": "^2.1.3" }
+    }"#,
+    );
+
+    // Warm the cache with a successful install at the default isolated
+    // layout. After this, .lpm/install-hash holds the v6 isolated-keyed
+    // hash and the mtime fast path is primed. Flags here don't matter
+    // for the load-bearing assertion below — the warm install just has
+    // to land state on disk.
+    let warmed = lpm_with_registry(&project, &mock.url())
+        .args([
+            "install",
+            "--no-security-summary",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
+        .output()
+        .expect("spawn warm install");
+    assert!(
+        warmed.status.success(),
+        "warming install failed:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&warmed.stdout),
+        String::from_utf8_lossy(&warmed.stderr),
+    );
+
+    // GPT's repro, hardened: a TRULY bare `lpm install` with
+    // `LPM_LINKER=symlink` against the warm cache. Critically NO
+    // disqualifying flags — no `--registry`, no `--insecure`, no
+    // `--no-*`. Registry override moves to `LPM_REGISTRY_URL` so the
+    // mock is still reachable if the fast lane falls through, but the
+    // fast-lane argv gate sees a bare invocation. Pre-fix this short-
+    // circuited as `up to date` because the freshness helper swallowed
+    // the LPM_LINKER parse error.
+    let bad_env = lpm(&project)
+        .arg("install")
+        .env("LPM_REGISTRY_URL", mock.url())
+        .env("LPM_LINKER", "symlink")
+        .output()
+        .expect("spawn bare install with bad LPM_LINKER");
+
+    let stderr = String::from_utf8_lossy(&bad_env.stderr);
+    let stdout = String::from_utf8_lossy(&bad_env.stdout);
+
+    assert!(
+        !bad_env.status.success(),
+        "bare `lpm install` against warm cache with `LPM_LINKER=symlink` \
+         MUST exit non-zero. Pre-fix the sync fast lane printed `up to \
+         date` and exited 0 because `check_install_state_with_content` \
+         coerced the linker resolution error to Isolated and the stored \
+         isolated hash matched. \nstdout: {stdout}\nstderr: {stderr}"
+    );
+    assert!(
+        !stdout.contains("up to date") && !stderr.contains("up to date"),
+        "stdout/stderr MUST NOT contain `up to date` — that string is \
+         the load-bearing tell that the sync fast lane returned \
+         up_to_date=true and the binary exited before the install \
+         dispatch could surface the LPM_LINKER error. \
+         \nstdout: {stdout}\nstderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("LPM_LINKER"),
+        "stderr must name LPM_LINKER so the user can fix their env. \
+         \nstderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("isolated") && stderr.contains("hoisted"),
+        "stderr must list the accepted values. \nstderr: {stderr}"
+    );
+}
+
+/// `LPM_LINKER` is documented as equivalent to `--linker=hoisted`. An
+/// unknown value must surface the same fail-loud posture as the other
+/// surfaces — silent fallback is the bug class this whole tranche closed.
+#[test]
+fn install_lpm_linker_env_rejects_unknown_value_loudly() {
+    let project = TempProject::empty(
+        r#"{
+        "name": "linker-env-bad",
+        "version": "0.0.1"
+    }"#,
+    );
+
+    let out = lpm(&project)
+        .args(["install"])
+        .env("LPM_LINKER", "symlink")
+        .output()
+        .expect("spawn lpm install");
+
+    assert!(
+        !out.status.success(),
+        "`LPM_LINKER=symlink` should fail loudly; stderr:\n{}",
+        String::from_utf8_lossy(&out.stderr),
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("LPM_LINKER"),
+        "stderr must name LPM_LINKER; got:\n{stderr}"
+    );
 }
