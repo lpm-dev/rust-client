@@ -300,6 +300,17 @@ pub static NODE_MODULES_HOISTED_HEALTHY: CheckEntry = CheckEntry {
     auto_fix: None,
 };
 
+pub static NODE_MODULES_VIRTUAL_HEALTHY: CheckEntry = CheckEntry {
+    code: "node_modules_virtual_healthy",
+    name: "node_modules",
+    category: Category::ProjectState,
+    description: "`node_modules/` symlinks point into the virtual store at `~/.lpm/store/v2/links/`.",
+    when_fires: "User opted into `LPM_STORE_VERSION=v2` (Phase 66 dev-only flag) and the virtual-store layout is intact.",
+    remediation: "No action — informational pass.",
+    possible_severities: &[Severity::Pass],
+    auto_fix: None,
+};
+
 pub static NODE_MODULES_MIXED_LAYOUT: CheckEntry = CheckEntry {
     code: "node_modules_mixed_layout",
     name: "node_modules",
@@ -1329,6 +1340,7 @@ pub static CLI_CATALOG: &[&CheckEntry] = &[
     &PACKAGE_JSON_MISSING,
     &NODE_MODULES_ISOLATED_HEALTHY,
     &NODE_MODULES_HOISTED_HEALTHY,
+    &NODE_MODULES_VIRTUAL_HEALTHY,
     &NODE_MODULES_MIXED_LAYOUT,
     &NODE_MODULES_NO_STORE,
     &NODE_MODULES_LEGACY_LAYOUT,
