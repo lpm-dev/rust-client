@@ -590,6 +590,14 @@ async fn install_json_envelope_with_one_package_matches_snapshot() {
         r#"{"name":"snap-install","version":"1.0.0","dependencies":{"ms":"^2.1.3"}}"#,
     );
 
+    // Phase 66 Phase 4f: pin to `LPM_LINKER=isolated` so the JSON
+    // envelope's `symlinked` count stays stable across the default
+    // flip. The 4f flip moved `LinkerMode::default()` to Hoisted,
+    // which produces 0 root-level symlinks (real dirs flat in
+    // `node_modules/`); isolated produces 2 (one per direct dep
+    // root + scope). The snapshot is pinning the envelope SHAPE,
+    // not the linker behavior — pinning the linker keeps the shape
+    // assertion meaningful.
     let output = lpm_with_registry(&project, &mock.url())
         .args([
             "install",
@@ -598,6 +606,7 @@ async fn install_json_envelope_with_one_package_matches_snapshot() {
             "--no-skills",
             "--no-editor-setup",
         ])
+        .env("LPM_LINKER", "isolated")
         .output()
         .expect("failed to run lpm install --json");
     assert!(output.status.success(), "install --json failed: {output:?}");
@@ -3917,9 +3926,13 @@ fn migrate_honors_lpm_linker_env_in_install_pipeline() {
 /// short-circuit on the up-to-date fast-exit because pkg.json + lockfile
 /// are unchanged — leaving the project on the prior layout despite the
 /// requested switch. Pinning the contract end-to-end through the real
-/// install pipeline + mock registry: install once with the default
-/// isolated layout, then re-run with `LPM_LINKER=hoisted` and assert the
-/// command did NOT print "up to date".
+/// install pipeline + mock registry: install once with the active
+/// default layout, then re-run with `LPM_LINKER` pointed at the OTHER
+/// layout and assert the command did NOT print "up to date". The
+/// invariant is direction-agnostic — pre-Phase-4f the default was
+/// Isolated and the test flipped to Hoisted; post-4f the default is
+/// Hoisted and the test flips to Isolated. Either way the cache MUST
+/// invalidate.
 #[tokio::test]
 async fn install_invalidates_freshness_cache_on_lpm_linker_flip() {
     let mock = MockRegistry::start().await;
@@ -3989,10 +4002,17 @@ async fn install_invalidates_freshness_cache_on_lpm_linker_flip() {
          got stderr:\n{cached_stderr}"
     );
 
-    // The load-bearing assertion: re-install with `LPM_LINKER=hoisted`
-    // must NOT short-circuit as "up to date" — the env-driven layout
-    // flip has to invalidate the freshness cache and trigger a real
-    // re-link.
+    // The load-bearing assertion: re-install with `LPM_LINKER` flipped
+    // to the non-default mode must NOT short-circuit as "up to date" —
+    // the env-driven layout flip has to invalidate the freshness cache
+    // and trigger a real re-link. Use the opposite of the active
+    // default so this test stays meaningful across future default
+    // flips (Phase 4f flipped Isolated → Hoisted; pre-4f the test
+    // flipped to "hoisted").
+    let opposite = match lpm_linker::LinkerMode::default() {
+        lpm_linker::LinkerMode::Hoisted => "isolated",
+        lpm_linker::LinkerMode::Isolated => "hoisted",
+    };
     let flipped = lpm_with_registry(&project, &mock.url())
         .args([
             "install",
@@ -4000,7 +4020,7 @@ async fn install_invalidates_freshness_cache_on_lpm_linker_flip() {
             "--no-skills",
             "--no-editor-setup",
         ])
-        .env("LPM_LINKER", "hoisted")
+        .env("LPM_LINKER", opposite)
         .output()
         .expect("spawn flipped re-install");
     assert!(

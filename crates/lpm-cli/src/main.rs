@@ -301,12 +301,17 @@ enum Commands {
         #[arg(long)]
         ignore_provenance_drift_all: bool,
 
-        /// Linking mode: `isolated` (default — pnpm-style isolation) or
-        /// `hoisted` (npm v3+ flat layout). Hoisted is faster on full-wipe /
-        /// CI cold-cache workloads, identical on everyday installs, and has
-        /// stricter peer-dep semantics — opt-in only. Unknown values are
-        /// rejected by clap at parse time. Overrides `package.json > lpm >
-        /// linker`, `~/.lpm/config.toml > linker`, and `LPM_LINKER`.
+        /// Linking mode: `hoisted` (default since Phase 66 4f — npm v3+
+        /// flat layout) or `isolated` (pnpm-style strict isolation).
+        /// Both materialize as project `node_modules/<dep>` symlinks
+        /// into the global virtual store at `~/.lpm/store/v2/links/`,
+        /// so warm-install latency is identical between modes; the
+        /// distinction is whether transitive deps are reachable at the
+        /// project root (hoisted: yes — npm-compat) or only through
+        /// each consumer's own siblings (isolated: no — phantom-dep
+        /// catcher). Unknown values are rejected by clap at parse
+        /// time. Overrides `package.json > lpm > linker`,
+        /// `~/.lpm/config.toml > linker`, and `LPM_LINKER`.
         #[arg(long, value_enum)]
         linker: Option<LinkerCli>,
 

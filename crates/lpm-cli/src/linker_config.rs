@@ -1,7 +1,7 @@
 //! Linker mode resolution for the install pipeline.
 //!
-//! Surfaces — in precedence order — that can override the default isolated
-//! layout:
+//! Surfaces — in precedence order — that can override the default
+//! hoisted layout (default flipped from `Isolated` in Phase 66 4f):
 //!
 //! 1. `--linker <isolated|hoisted>` CLI flag (clamped at clap parse time
 //!    via `LinkerCli` and supplied by the caller as
@@ -15,7 +15,7 @@
 //!    CI runs.
 //! 4. `package.json > lpm > linker` — project-scoped value (read inside
 //!    the install pipeline because it lives next to the manifest read).
-//! 5. Default `LinkerMode::Isolated` (pnpm-style).
+//! 5. Default [`LinkerMode::default`] = `Hoisted` (Phase 66 4f).
 //!
 //! Unknown values from any non-CLI surface return an error pointing at the
 //! offending surface so the install pipeline can surface them as
@@ -80,7 +80,7 @@ pub(crate) fn resolve_effective_linker(
         return LinkerMode::parse_str(s)
             .map_err(|e| format!("invalid `lpm.linker` in package.json: {e}"));
     }
-    Ok(LinkerMode::Isolated)
+    Ok(LinkerMode::default())
 }
 
 /// Same as [`resolve_effective_linker`] but driven from raw `pkg_content`
@@ -112,7 +112,7 @@ pub(crate) fn resolve_effective_linker_from_bytes(
 ) -> Result<LinkerMode, String> {
     let pkg: PackageJson = match serde_json::from_str(pkg_content) {
         Ok(p) => p,
-        Err(_) => return Ok(LinkerMode::Isolated),
+        Err(_) => return Ok(LinkerMode::default()),
     };
     resolve_effective_linker(cli_override, &pkg, cfg)
 }
