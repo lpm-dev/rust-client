@@ -568,8 +568,9 @@ impl LpmDependencyProvider {
                     .block_on(self.client.get_package_metadata(&pkg_name))
                     .map_err(classify_registry_error)?;
 
-                // Phase 34.5: use shared parser (LPM packages include prereleases)
-                let info = parse_metadata_to_cache_info(&metadata, false);
+                // Phase 34.5: use shared parser. Prereleases included
+                // (range matcher handles npm prerelease semantics).
+                let info = parse_metadata_to_cache_info(&metadata);
                 self.insert_and_notify(key, info);
                 Ok(())
             }
@@ -602,8 +603,9 @@ impl LpmDependencyProvider {
                 }
                 .map_err(|e| ProviderError::Registry(format!("npm:{name}: {e}")))?;
 
-                // Phase 34.5: use shared parser (npm packages skip prereleases)
-                let info = parse_metadata_to_cache_info(&metadata, true);
+                // Phase 34.5: use shared parser. Prereleases are kept; the
+                // range matcher handles npm prerelease semantics.
+                let info = parse_metadata_to_cache_info(&metadata);
                 tracing::debug!("npm package {name}: {} versions", info.versions.len());
                 self.insert_and_notify(key, info);
                 Ok(())
@@ -830,10 +832,21 @@ impl LpmDependencyProvider {
 /// from a `PackageMetadata` response. Shared by `ensure_cached` (provider
 /// escape-hatch fetches) and the Phase 49 walker (`BfsWalker::commit_manifest`).
 ///
-/// `skip_prerelease`: true for npm packages (noisy prereleases), false for LPM.
+/// **Prerelease handling.** All versions, including prereleases, are kept
+/// in the cache. The range matcher (`NpmRange::satisfies` in lpm-semver)
+/// implements correct npm prerelease semantics — prereleases only match
+/// ranges that explicitly include a prerelease on the same
+/// major.minor.patch tuple, so a non-prerelease range like `^1.0.0`
+/// correctly skips `1.0.0-beta.27` even when both are in the cache. The
+/// pre-2026-05-07 behavior unconditionally stripped prereleases for npm
+/// packages, which broke any dep that declared an explicit prerelease
+/// range (e.g. `@rolldown/pluginutils@^1.0.0-beta.27`,
+/// `gensync@^1.0.0-beta.2`) — the cache had zero candidates and the
+/// resolver returned `no version satisfies range (versions available:
+/// 1)`. See the Phase 2 hoisted-mode audit results for the
+/// reproduction (vite-react / nextjs-minimal / babel-presets fixtures).
 pub(crate) fn parse_metadata_to_cache_info(
     metadata: &lpm_registry::PackageMetadata,
-    skip_prerelease: bool,
 ) -> CachedPackageInfo {
     let version_count = metadata.versions.len();
     let mut versions: Vec<NpmVersion> = Vec::with_capacity(version_count);
@@ -867,10 +880,6 @@ pub(crate) fn parse_metadata_to_cache_info(
             continue;
         }
         if let Ok(v) = NpmVersion::parse(ver_str) {
-            if skip_prerelease && v.is_prerelease() {
-                continue;
-            }
-
             let mut ver_deps = HashMap::new();
             let mut ver_aliases: HashMap<String, String> = HashMap::new();
 
@@ -1943,6 +1952,113 @@ mod tests {
             dist: HashMap::new(),
             aliases: HashMap::new(),
         }
+    }
+
+    /// Build a minimal PackageMetadata fixture with the given versions
+    /// (each version gets the same trivial deps map). Used by
+    /// [`parse_metadata_keeps_prerelease_versions`] and friends to
+    /// exercise [`parse_metadata_to_cache_info`] directly.
+    fn metadata_with_versions(
+        name: &str,
+        versions: &[(&str, &[(&str, &str)])],
+    ) -> lpm_registry::PackageMetadata {
+        let mut versions_map = serde_json::Map::new();
+        for (ver, deps) in versions {
+            let deps_obj: serde_json::Map<String, serde_json::Value> = deps
+                .iter()
+                .map(|(n, r)| (n.to_string(), serde_json::Value::String(r.to_string())))
+                .collect();
+            versions_map.insert(
+                ver.to_string(),
+                serde_json::json!({
+                    "name": name,
+                    "version": ver,
+                    "dist": {
+                        "tarball": format!("https://example.com/{name}-{ver}.tgz"),
+                        "integrity": "sha512-test"
+                    },
+                    "dependencies": deps_obj,
+                }),
+            );
+        }
+        let value = serde_json::json!({
+            "name": name,
+            "dist-tags": { "latest": versions[0].0 },
+            "versions": serde_json::Value::Object(versions_map),
+        });
+        serde_json::from_value(value).expect("valid PackageMetadata")
+    }
+
+    /// Regression test for the prerelease-stripping bug found in the
+    /// 2026-05-07 hoisted-mode compatibility audit (vite-react,
+    /// nextjs-minimal, babel-presets fixtures all failed with
+    /// `no version satisfies range (versions available: 1)` when a
+    /// dependency declared a prerelease range like `^1.0.0-beta.27`).
+    ///
+    /// Pre-fix, [`parse_metadata_to_cache_info`] unconditionally
+    /// stripped prereleases for npm packages (the `skip_prerelease`
+    /// param). Post-fix, all versions including prereleases are kept
+    /// — the range matcher (`NpmRange::satisfies`) handles npm
+    /// prerelease semantics correctly per
+    /// [`crate::ranges`] and the `lpm-semver` crate's
+    /// `prerelease_only_matches_same_major_minor_patch` rule.
+    #[test]
+    fn parse_metadata_keeps_prerelease_versions() {
+        let meta = metadata_with_versions(
+            "pluginutils",
+            &[
+                ("1.0.0-beta.27", &[]),
+                ("1.0.0-beta.26", &[]),
+                ("0.9.0", &[]),
+            ],
+        );
+        let info = parse_metadata_to_cache_info(&meta);
+        let strs: Vec<String> = info.versions.iter().map(|v| v.to_string()).collect();
+        assert!(
+            strs.contains(&"1.0.0-beta.27".to_string()),
+            "1.0.0-beta.27 must remain in cache after parse — pre-fix this was stripped, breaking ^1.0.0-beta.27 ranges"
+        );
+        assert!(strs.contains(&"1.0.0-beta.26".to_string()));
+        assert!(strs.contains(&"0.9.0".to_string()));
+        assert_eq!(info.versions.len(), 3);
+    }
+
+    /// The kept-prerelease must actually satisfy a prerelease range
+    /// of its own major.minor.patch — otherwise we've kept the data
+    /// but the range matcher still misses (defense-in-depth check).
+    #[test]
+    fn parse_metadata_prerelease_satisfies_explicit_prerelease_range() {
+        let meta = metadata_with_versions("gensync", &[("1.0.0-beta.2", &[])]);
+        let info = parse_metadata_to_cache_info(&meta);
+        let range = NpmRange::parse("^1.0.0-beta.2").expect("valid range");
+        let any = info.versions.iter().any(|v| range.satisfies(v));
+        assert!(
+            any,
+            "prerelease 1.0.0-beta.2 must satisfy ^1.0.0-beta.2 — this is what \
+             unblocks the resolver for deps like gensync@^1.0.0-beta.2 (Babel chain)"
+        );
+    }
+
+    /// And the inverse — a non-prerelease range must NOT match a
+    /// prerelease that happens to be in the cache. This pins npm
+    /// semver's "prereleases excluded from non-prerelease ranges"
+    /// rule from inside the resolver, not just the lpm-semver crate.
+    #[test]
+    fn parse_metadata_non_prerelease_range_skips_prereleases() {
+        let meta = metadata_with_versions(
+            "ambient",
+            &[("2.0.0-beta.1", &[]), ("1.5.0", &[])],
+        );
+        let info = parse_metadata_to_cache_info(&meta);
+        let range = NpmRange::parse("^1.0.0").expect("valid range");
+        let chosen = info.versions.iter().find(|v| range.satisfies(v));
+        assert_eq!(
+            chosen.map(|v| v.to_string()),
+            Some("1.5.0".to_string()),
+            "^1.0.0 must skip 2.0.0-beta.1 and pick 1.5.0 — pre-fix the \
+             prerelease wasn't even in the cache, post-fix the range matcher \
+             (correctly) refuses to match a different-major prerelease"
+        );
     }
 
     // === choose_version: override warning behavior ===

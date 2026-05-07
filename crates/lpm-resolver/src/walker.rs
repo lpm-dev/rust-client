@@ -835,7 +835,8 @@ impl BfsWalker {
         // (1) Insert into shared cache. Keep a clone to return so the
         // caller can drive dep expansion without re-parsing or looking
         // the entry back out of the DashMap.
-        let info = parse_metadata_to_cache_info(meta, is_npm);
+        let info = parse_metadata_to_cache_info(meta);
+        let _ = is_npm; // 2026-05-07: prerelease filter removed; param retained on caller for future use
         // Phase 55 W4: cache stores Arc<CachedPackageInfo> so per-edge
         // resolver lookups are refcount bumps. The clone here happens
         // once per fetch (this function), not per edge.
@@ -1281,7 +1282,7 @@ mod tests {
         let root_meta: PackageMetadata =
             serde_json::from_value(metadata_json("root-cached", &[("leaf-x", "^1.0.0")]))
                 .expect("parse root fixture");
-        let root_info = parse_metadata_to_cache_info(&root_meta, true);
+        let root_info = parse_metadata_to_cache_info(&root_meta);
         shared_cache.insert(CanonicalKey::npm("root-cached"), Arc::new(root_info));
 
         let (spec_tx, mut spec_rx) = mpsc::channel(16);
