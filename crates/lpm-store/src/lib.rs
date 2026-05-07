@@ -30,7 +30,7 @@ use std::path::{Path, PathBuf};
 // `src/v2/mod.rs` for the on-disk shape and identity model.
 pub mod v2;
 
-/// Phase 66 Phase 4b — store layout version selector.
+/// Phase 66 store layout version selector.
 ///
 /// Threaded through the install pipeline so a single env-var probe
 /// at the top of `lpm install` decides whether the run materializes
@@ -38,23 +38,29 @@ pub mod v2;
 /// or v2 (`<HOME>/.lpm/store/v2/{objects,links}/...` with project
 /// `node_modules/<dep>` symlinks pointing into `links/<graph-key>/`).
 ///
-/// **Default is v1.** v2 is opt-in via `LPM_STORE_VERSION=v2` for
-/// the entire Phase 4b/4c window. Phase 4d flips the default and
-/// retires the env var.
+/// **Default is v2 as of Phase 66 Phase 4d.** v1 stays available as
+/// an explicit downgrade via `LPM_STORE_VERSION=v1` for users who
+/// hit a v2 regression and need to roll back without redownloading
+/// lpm-rs. The pre-Phase-4d default was v1; Phase 4d wires the v1 →
+/// v2 migration sequence into the install pipeline so the flip is
+/// silent for upgrade-in-place users.
 ///
 /// Read once per install via [`StoreVersion::from_env`] so a single
 /// invocation is internally consistent — flipping the env mid-install
 /// would otherwise produce a half-v1/half-v2 layout.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
 pub enum StoreVersion {
-    /// Today's default — wrappers under `<project>/.lpm/wrappers/`,
+    /// Pre-Phase-4d default — wrappers under `<project>/.lpm/wrappers/`,
     /// canonical bytes at `<HOME>/.lpm/store/v1/<pkg>/<version>/`.
-    #[default]
+    /// Now selected only via explicit `LPM_STORE_VERSION=v1`
+    /// (downgrade-rollback path).
     V1,
     /// Virtual-store layout — canonical bytes at
     /// `<HOME>/.lpm/store/v2/objects/<sri>/`, per-context wrappers at
     /// `<HOME>/.lpm/store/v2/links/<graph-key>/`, project
-    /// `node_modules/<dep>` is a symlink into the link entry.
+    /// `node_modules/<dep>` is a symlink into the link entry. **Default
+    /// from Phase 4d onward.**
+    #[default]
     V2,
 }
 
@@ -64,13 +70,17 @@ impl StoreVersion {
     pub const ENV_VAR: &'static str = "LPM_STORE_VERSION";
 
     /// Read the active store version from `LPM_STORE_VERSION`. Returns
-    /// `V1` when the var is unset, empty, or set to anything other
-    /// than a recognized v2 value.
+    /// `V2` (the Phase-4d default) when the var is unset; recognized
+    /// values otherwise.
     ///
-    /// Recognized v2 values: `v2`, `V2`, `2` (trimmed and lowercased
-    /// for ergonomics — `LPM_STORE_VERSION=2`, `= V2 `, and `=v2` are
-    /// equivalent). Anything else falls back to v1 + a warning trace,
-    /// so a typo doesn't silently activate the dev-only path.
+    /// Recognized values:
+    /// - Unset, empty, or `v2`/`2` → `V2` (default).
+    /// - `v1`/`1` → `V1` (explicit downgrade-rollback for users
+    ///   hitting a v2 regression).
+    /// - Anything else → `V2` + a warning trace, so a typo doesn't
+    ///   silently activate v1.
+    ///
+    /// Trimmed and lowercased for ergonomics.
     pub fn from_env() -> Self {
         Self::parse(std::env::var(Self::ENV_VAR).ok().as_deref())
     }
@@ -81,18 +91,18 @@ impl StoreVersion {
     /// environment (which would race other parallel tests).
     pub fn parse(raw: Option<&str>) -> Self {
         let Some(raw) = raw else {
-            return Self::V1;
+            return Self::V2;
         };
         let normalized = raw.trim().to_ascii_lowercase();
         match normalized.as_str() {
-            "" | "v1" | "1" => Self::V1,
-            "v2" | "2" => Self::V2,
+            "" | "v2" | "2" => Self::V2,
+            "v1" | "1" => Self::V1,
             other => {
                 tracing::warn!(
-                    "{}={other:?} not recognized; falling back to v1 (valid: v1, v2)",
+                    "{}={other:?} not recognized; falling back to v2 (valid: v1, v2)",
                     Self::ENV_VAR
                 );
-                Self::V1
+                Self::V2
             }
         }
     }
@@ -2460,32 +2470,25 @@ mod tests {
         assert_eq!(path_a, path_b);
     }
 
-    // ── Phase 66 Phase 4b — StoreVersion env-var parser ─────────
+    // ── Phase 66 Phase 4d — StoreVersion env-var parser ─────────
 
     #[test]
-    fn store_version_default_is_v1() {
-        assert_eq!(StoreVersion::default(), StoreVersion::V1);
+    fn store_version_default_is_v2() {
+        // Phase 4d flipped the default from v1 → v2. Pre-flip the
+        // default was v1 (dev-only opt-in for v2).
+        assert_eq!(StoreVersion::default(), StoreVersion::V2);
     }
 
     #[test]
-    fn store_version_parse_unset_is_v1() {
-        assert_eq!(StoreVersion::parse(None), StoreVersion::V1);
-    }
-
-    #[test]
-    fn store_version_parse_recognizes_v1_aliases() {
-        for s in ["", "v1", "V1", "1", "  v1  "] {
-            assert_eq!(
-                StoreVersion::parse(Some(s)),
-                StoreVersion::V1,
-                "input {s:?} should resolve to v1"
-            );
-        }
+    fn store_version_parse_unset_is_v2() {
+        // Unset env var yields the new v2 default.
+        assert_eq!(StoreVersion::parse(None), StoreVersion::V2);
     }
 
     #[test]
     fn store_version_parse_recognizes_v2_aliases() {
-        for s in ["v2", "V2", "2", "  V2  ", "v2\n"] {
+        // Empty string normalizes to v2 (the post-Phase-4d default).
+        for s in ["", "v2", "V2", "2", "  V2  ", "v2\n"] {
             assert_eq!(
                 StoreVersion::parse(Some(s)),
                 StoreVersion::V2,
@@ -2495,14 +2498,27 @@ mod tests {
     }
 
     #[test]
-    fn store_version_parse_unknown_falls_back_to_v1() {
-        // Typos and stray values must NOT activate v2 silently —
-        // dev-only path stays opt-in via exact alias.
-        for s in ["v3", "v2x", "true", "yes", "on", "junk"] {
+    fn store_version_parse_recognizes_v1_downgrade_aliases() {
+        // Phase 4d retains v1 as an explicit downgrade-rollback path.
+        for s in ["v1", "V1", "1", "  v1  "] {
             assert_eq!(
                 StoreVersion::parse(Some(s)),
                 StoreVersion::V1,
-                "input {s:?} should fall back to v1"
+                "input {s:?} should resolve to v1 (explicit downgrade)"
+            );
+        }
+    }
+
+    #[test]
+    fn store_version_parse_unknown_falls_back_to_v2() {
+        // Typos and stray values fall through to the default (v2),
+        // not v1 — pre-Phase-4d the fallback was v1 because v2 was
+        // dev-only opt-in. Post-flip the safe default is v2.
+        for s in ["v3", "v2x", "true", "yes", "on", "junk"] {
+            assert_eq!(
+                StoreVersion::parse(Some(s)),
+                StoreVersion::V2,
+                "input {s:?} should fall back to v2"
             );
         }
     }

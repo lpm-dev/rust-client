@@ -1876,6 +1876,13 @@ mod tests {
                     ("HOME", home.as_os_str().to_owned()),
                     ("LPM_HOME", lpm_home.as_os_str().to_owned()),
                     ("LPM_REGISTRY_URL", registry_url.into()),
+                    // Phase 66 Phase 4d — install_global tests assert on
+                    // v1 store-pipeline interactions (tarball fetch counts,
+                    // wrapper layout, etc.). Pin to v1 since v2's
+                    // regression coverage lives in the audit-fixture CI
+                    // matrix; install_global's v2 surface is a Phase 4
+                    // follow-up.
+                    ("LPM_STORE_VERSION", "v1".into()),
                 ]),
             }
         }
