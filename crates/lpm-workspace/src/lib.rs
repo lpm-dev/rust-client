@@ -54,12 +54,36 @@ pub struct PackageJson {
     #[serde(default, rename = "optionalDependencies")]
     pub optional_dependencies: HashMap<String, String>,
 
-    /// npm overrides / yarn resolutions — force specific versions for transitive deps.
-    #[serde(default)]
+    /// npm overrides / yarn resolutions — force specific versions for
+    /// transitive deps.
+    ///
+    /// **Lossy deserialization.** The npm spec allows override values to
+    /// be EITHER a string (`"axios": "^1.15.2"` — simple version pin) OR
+    /// a nested object (`"path-scurry": {"lru-cache": "^11.3.5"}` —
+    /// "only override `lru-cache` to ^11.3.5 when `path-scurry` is in
+    /// scope"). LPM's resolver does not currently apply nested overrides,
+    /// but a strict `HashMap<String, String>` deserializer would fail to
+    /// parse the entire `package.json` of any dep that ships nested
+    /// overrides — including [rollup](https://github.com/rollup/rollup)
+    /// which has them in its lockfile-fence overrides block. That broke
+    /// `lpm-linker::create_bin_links` (no rollup CLI in
+    /// `node_modules/.bin/`) plus any other read-`package.json`
+    /// consumer (security analysis, lifecycle scripts, etc.).
+    ///
+    /// The custom deserializer here keeps the simple `String`-valued
+    /// entries (which LPM CAN apply) and silently drops the
+    /// nested-object ones with a debug-level trace. When LPM's resolver
+    /// gains nested-override support, this can be promoted to a typed
+    /// `OverrideValue` enum and the readers updated. Until then,
+    /// "permissive parse + drop unsupported shapes" is the right
+    /// trade-off because it preserves the rest of the manifest's value.
+    #[serde(default, deserialize_with = "deserialize_lossy_string_map")]
     pub overrides: HashMap<String, String>,
 
-    /// Yarn-style resolutions (same purpose as overrides).
-    #[serde(default)]
+    /// Yarn-style resolutions (same purpose as overrides). Same
+    /// lossy-string-map handling as `overrides`: yarn also supports
+    /// nested resolution objects, which we drop with a trace.
+    #[serde(default, deserialize_with = "deserialize_lossy_string_map")]
     pub resolutions: HashMap<String, String>,
 
     #[serde(default)]
@@ -639,6 +663,46 @@ fn preview(entries: &[String]) -> String {
     }
     let head: Vec<&str> = entries.iter().take(MAX).map(String::as_str).collect();
     format!("{}, +{} more", head.join(", "), entries.len() - MAX)
+}
+
+/// Permissive `HashMap<String, String>` deserializer that accepts a
+/// JSON object with mixed string / non-string values, keeps only the
+/// `String`-valued entries, and silently drops the rest with a
+/// debug-level trace. Used for `package.json > overrides` and
+/// `package.json > resolutions` where the npm/yarn specs allow nested
+/// object values (e.g. `"path-scurry": {"lru-cache": "^11.3.5"}`) that
+/// LPM doesn't currently apply.
+///
+/// **Why drop instead of fail.** A transitive dep's `package.json` may
+/// contain override shapes LPM doesn't support; failing the whole parse
+/// blocks `lpm-linker::create_bin_links` (and every other consumer of
+/// `read_package_json`) for that dep. The lossy parse preserves the
+/// supported entries while letting the rest of the manifest be read.
+///
+/// Pinned by the rollup-plugins audit fixture: pre-fix, rollup's
+/// `"overrides": { "path-scurry": {"lru-cache": "^11.3.5"}, ... }` made
+/// `read_package_json` return `Err(parse error: invalid type: map,
+/// expected a string at line 246 column 19)`, which made the linker's
+/// bin-link step skip rollup, leaving `node_modules/.bin/rollup`
+/// unwritten and `rollup --version` failing.
+fn deserialize_lossy_string_map<'de, D>(
+    deserializer: D,
+) -> Result<HashMap<String, String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw: HashMap<String, serde_json::Value> = HashMap::deserialize(deserializer)?;
+    Ok(raw
+        .into_iter()
+        .filter_map(|(k, v)| match v {
+            serde_json::Value::String(s) => Some((k, s)),
+            // Non-string values (nested override objects) are silently
+            // dropped — LPM does not currently apply nested overrides,
+            // and erroring here would block the entire `read_package_json`
+            // call (used far more broadly than override application).
+            _ => None,
+        })
+        .collect())
 }
 
 /// The `"bin"` field in package.json can be a string or an object.
@@ -2052,6 +2116,72 @@ mod tests {
 
     fn create_package_json(dir: &Path, content: &str) {
         fs::write(dir.join("package.json"), content).unwrap();
+    }
+
+    /// Regression test for the rollup-plugins audit fixture (2026-05-07
+    /// hoisted-mode compat audit). rollup's `package.json` ships
+    /// `overrides` with a nested-object value
+    /// (`"path-scurry": {"lru-cache": "^11.3.5"}`) — valid npm syntax for
+    /// "only override `lru-cache` when `path-scurry` is in scope." The
+    /// pre-fix `HashMap<String, String>` deserializer errored on this
+    /// shape ("invalid type: map, expected a string"), making the entire
+    /// `read_package_json` call fail and silently breaking
+    /// `lpm-linker::create_bin_links` (no `node_modules/.bin/rollup`).
+    ///
+    /// Post-fix, `read_package_json` succeeds: simple string-valued
+    /// overrides are kept, nested-object ones are dropped (LPM's
+    /// resolver doesn't apply them yet).
+    #[test]
+    fn read_package_json_keeps_string_overrides_drops_nested_objects() {
+        let dir = tempfile::tempdir().unwrap();
+        create_package_json(
+            dir.path(),
+            r#"{
+                "name": "fixture-with-nested-overrides",
+                "version": "1.0.0",
+                "bin": {"some-cli": "./bin/cli.js"},
+                "overrides": {
+                    "axios": "^1.15.2",
+                    "esbuild": ">0.24.2",
+                    "path-scurry": {"lru-cache": "^11.3.5"},
+                    "vite": "$vite"
+                },
+                "resolutions": {
+                    "lodash": "^4.17.21",
+                    "deeply-nested": {"transitive": "1.0.0"}
+                }
+            }"#,
+        );
+
+        let pkg = read_package_json(&dir.path().join("package.json"))
+            .expect("nested-object overrides must not block the parse");
+
+        // String-valued overrides are kept.
+        assert_eq!(
+            pkg.overrides.get("axios").map(String::as_str),
+            Some("^1.15.2"),
+            "simple overrides must round-trip"
+        );
+        assert_eq!(pkg.overrides.get("esbuild").map(String::as_str), Some(">0.24.2"));
+        assert_eq!(pkg.overrides.get("vite").map(String::as_str), Some("$vite"));
+
+        // Nested-object override is silently dropped (LPM doesn't apply nested overrides yet).
+        assert!(
+            !pkg.overrides.contains_key("path-scurry"),
+            "nested-object override entry must be dropped"
+        );
+
+        // Same handling for resolutions.
+        assert_eq!(pkg.resolutions.get("lodash").map(String::as_str), Some("^4.17.21"));
+        assert!(!pkg.resolutions.contains_key("deeply-nested"));
+
+        // Crucially, the rest of the manifest survives — the bin field
+        // is what the audit fixture cares about, and pre-fix the entire
+        // parse failed before reaching this point.
+        let bin = pkg.bin.as_ref().expect("bin must be parsed");
+        let entries = bin.entries(pkg.name.as_deref().unwrap());
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].0, "some-cli");
     }
 
     /// Drift-guard: every code emitted by `manifest_compat_issues()`
