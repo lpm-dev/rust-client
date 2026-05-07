@@ -312,10 +312,19 @@ pub async fn run(
     // covers both legacy layouts; we surface this as a warn so it
     // doesn't read as healthy.
     let layout = lpm_linker::LayoutPaths::for_project(project_dir);
+    // Phase 66 §4 — pass the v2 links root so the health probe can
+    // recognize a virtual-store install (no `.lpm/wrappers/` and no
+    // `.lpm/hoisted/metadata.json`, but project-side `node_modules/`
+    // symlinks pointing into `~/.lpm/store/v2/links/`). On a system
+    // where `LpmRoot::from_env` fails (extremely rare; no $HOME and
+    // no $LPM_HOME), the check degrades to legacy v1-only detection.
+    let v2_links_root = lpm_common::LpmRoot::from_env()
+        .ok()
+        .map(|root| lpm_store::v2::StoreV2Paths::from_lpm_root(&root).links_root());
     if layout.needs_layout_migration() {
         checks.push(Check::warn(&doctor_catalog::NODE_MODULES_LEGACY_LAYOUT, "legacy wrapper layout detected — run: lpm install (one-time migration to .lpm/wrappers/)",));
     } else {
-        match layout.install_appears_healthy() {
+        match layout.install_appears_healthy_with_v2(v2_links_root.as_deref()) {
             lpm_linker::InstallHealth::Healthy {
                 layout: lpm_linker::LinkerLayout::Isolated,
             } => {
@@ -330,6 +339,14 @@ pub async fn run(
                 checks.push(Check::pass(
                     &doctor_catalog::NODE_MODULES_HOISTED_HEALTHY,
                     "exists with hoisted layout",
+                ));
+            }
+            lpm_linker::InstallHealth::Healthy {
+                layout: lpm_linker::LinkerLayout::Virtual,
+            } => {
+                checks.push(Check::pass(
+                    &doctor_catalog::NODE_MODULES_VIRTUAL_HEALTHY,
+                    "symlinks into ~/.lpm/store/v2/links/",
                 ));
             }
             lpm_linker::InstallHealth::Healthy {

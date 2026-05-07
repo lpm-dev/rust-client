@@ -532,6 +532,118 @@ impl Store {
             }
         }
     }
+
+    // ── Phase 4c read API ────────────────────────────────────────────
+
+    /// Iterate every link-entry directory under `links/` that has a
+    /// readable `.lpm-link-meta.json` sidecar.
+    ///
+    /// Yields `(link_dir, sidecar)` tuples in directory-iteration order
+    /// (filesystem-defined, not sorted — callers that need stable order
+    /// sort downstream).
+    ///
+    /// Skips:
+    /// - Non-directories at the `links/` level (defensive — a stray
+    ///   file there isn't a link entry).
+    /// - Directories with a missing or malformed sidecar (mid-write
+    ///   tmp dirs from a crashed populate, prune leftovers, etc.).
+    ///   These get a debug trace; callers see them as absent rather
+    ///   than failing the whole walk.
+    ///
+    /// Used by [`Self::find_link_package_dir`] (Phase 4c rebuild's
+    /// transitive-package lookup) and by `lpm cache prune` (Phase 4e).
+    /// Walking the directory listing is cheap on every reasonable cache
+    /// size — a 10k-entry store is ~1 ms on macOS APFS — so neither
+    /// caller bothers caching results.
+    pub fn iter_link_entries(
+        &self,
+    ) -> Result<impl Iterator<Item = (PathBuf, LinkMeta)> + '_, LpmError> {
+        let links_root = self.paths.links_root();
+        if !links_root.exists() {
+            // Empty store (or a fresh `~/.lpm/` on an upgrade-in-place
+            // user with no v2 installs yet) — return an empty iterator.
+            return Ok(
+                Box::new(std::iter::empty()) as Box<dyn Iterator<Item = (PathBuf, LinkMeta)>>
+            );
+        }
+        let read_dir = std::fs::read_dir(&links_root).map_err(|e| {
+            LpmError::Store(format!(
+                "failed to enumerate v2 links root at {}: {e}",
+                links_root.display()
+            ))
+        })?;
+        let iter = read_dir.filter_map(|entry| {
+            let entry = entry.ok()?;
+            let link_dir = entry.path();
+            if !link_dir.is_dir() {
+                return None;
+            }
+            match LinkMeta::read_from(&link_dir) {
+                Ok(meta) => Some((link_dir, meta)),
+                Err(e) => {
+                    tracing::debug!(
+                        "v2 store: skipping {}: sidecar unreadable ({e})",
+                        link_dir.display()
+                    );
+                    None
+                }
+            }
+        });
+        Ok(Box::new(iter) as Box<dyn Iterator<Item = (PathBuf, LinkMeta)>>)
+    }
+
+    /// Find the package directory for `(name, version)` by walking the
+    /// link entries. Returns the absolute path to
+    /// `links/<key>/node_modules/<name>/` of the first matching entry,
+    /// or `Ok(None)` if no link entry has this `(name, version)`.
+    ///
+    /// **Match shape.** A link entry matches when its sidecar's name
+    /// and version exactly equal the caller's. Multi-source-same-coords
+    /// per Phase 66 §2.2 means two distinct sources can share the
+    /// (name, version) pair and produce different graph keys; this
+    /// lookup picks the first match in directory-iteration order,
+    /// which is non-deterministic on its own but acceptable for
+    /// `rebuild`'s lifecycle-script path. The audit-fixture scope
+    /// never exercises multi-source-same-coords with lifecycle
+    /// scripts.
+    ///
+    /// Phase 4 follow-up: a full `(name, version, wrapper_id)` lookup
+    /// once `wrapper_id` is threaded through dep edges and persisted
+    /// in the lockfile.
+    pub fn find_link_package_dir(
+        &self,
+        name: &str,
+        version: &str,
+    ) -> Result<Option<PathBuf>, LpmError> {
+        for (link_dir, meta) in self.iter_link_entries()? {
+            if meta.name == name && meta.version == version {
+                return Ok(Some(link_dir.join(LINK_NODE_MODULES).join(name)));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Returns `true` iff `path` (after symlink resolution) lives under
+    /// this store's `links/` root. Used by `lpm doctor` and `lpm
+    /// rebuild` to detect a v2-shaped install — every v2 project-side
+    /// `node_modules/<dep>` symlink resolves into `links/<key>/...`.
+    ///
+    /// `path` is canonicalized internally; callers can pass the raw
+    /// symlink path and let this function dereference. Any I/O error
+    /// during canonicalization (broken symlink, permission denied)
+    /// returns `false` — it's a "best evidence" predicate, not a
+    /// validity check.
+    pub fn path_lives_in_store(&self, path: &Path) -> bool {
+        let canonical = match std::fs::canonicalize(path) {
+            Ok(c) => c,
+            Err(_) => return false,
+        };
+        let canonical_links_root = match std::fs::canonicalize(self.paths.links_root()) {
+            Ok(c) => c,
+            Err(_) => return false,
+        };
+        canonical.starts_with(canonical_links_root)
+    }
 }
 
 fn populate_into(
@@ -1500,5 +1612,154 @@ mod tests {
         super::create_dir_symlink(&target, &link).unwrap();
         let read = std::fs::read_link(&link).unwrap();
         assert_eq!(read, target);
+    }
+
+    // ── Phase 4c read API tests ──────────────────────────────────────
+
+    /// Populate two link entries, then iterate. Both must surface with
+    /// readable sidecars, in some order.
+    #[test]
+    fn iter_link_entries_returns_populated_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::at(dir.path());
+
+        let sri_a = synthetic_sri(b"iter_link_entries/a");
+        let sri_b = synthetic_sri(b"iter_link_entries/b");
+        write_object(
+            &store,
+            &sri_a,
+            &[("package.json", b"{\"name\":\"a\",\"version\":\"1.0.0\"}")],
+        );
+        write_object(
+            &store,
+            &sri_b,
+            &[("package.json", b"{\"name\":\"b\",\"version\":\"2.0.0\"}")],
+        );
+
+        let key_a = sample_key("a", "1.0.0");
+        let key_b = sample_key("b", "2.0.0");
+        store
+            .populate_link_entry(LinkEntryRequest {
+                graph_key: key_a,
+                source_sri: sri_a,
+                object_dir: store
+                    .paths()
+                    .object_dir(&synthetic_sri(b"iter_link_entries/a"))
+                    .unwrap(),
+                deps: vec![],
+                platform: sample_meta_platform(),
+            })
+            .unwrap();
+        store
+            .populate_link_entry(LinkEntryRequest {
+                graph_key: key_b,
+                source_sri: sri_b,
+                object_dir: store
+                    .paths()
+                    .object_dir(&synthetic_sri(b"iter_link_entries/b"))
+                    .unwrap(),
+                deps: vec![],
+                platform: sample_meta_platform(),
+            })
+            .unwrap();
+
+        let mut names: Vec<String> = store
+            .iter_link_entries()
+            .unwrap()
+            .map(|(_dir, meta)| meta.name)
+            .collect();
+        names.sort();
+        assert_eq!(names, vec!["a".to_string(), "b".to_string()]);
+    }
+
+    /// Empty store (no `links/` root yet) returns an empty iterator
+    /// rather than an error. Mirrors the upgrade-in-place case where a
+    /// user runs `lpm doctor` before any v2 install has populated the
+    /// store.
+    #[test]
+    fn iter_link_entries_handles_missing_links_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::at(dir.path());
+        let count = store.iter_link_entries().unwrap().count();
+        assert_eq!(count, 0);
+    }
+
+    /// `find_link_package_dir` returns the package dir for a `(name,
+    /// version)` that's been populated. Used by `lpm rebuild` to find
+    /// transitive packages with lifecycle scripts under v2.
+    #[test]
+    fn find_link_package_dir_locates_populated_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::at(dir.path());
+
+        let sri = synthetic_sri(b"find_link_package_dir/c");
+        let object_dir = write_object(
+            &store,
+            &sri,
+            &[("package.json", b"{\"name\":\"c\",\"version\":\"3.1.4\"}")],
+        );
+        let key = sample_key("c", "3.1.4");
+        store
+            .populate_link_entry(LinkEntryRequest {
+                graph_key: key.clone(),
+                source_sri: sri,
+                object_dir,
+                deps: vec![],
+                platform: sample_meta_platform(),
+            })
+            .unwrap();
+
+        let resolved = store.find_link_package_dir("c", "3.1.4").unwrap();
+        assert!(resolved.is_some(), "must locate populated entry");
+        let resolved = resolved.unwrap();
+        assert_eq!(resolved, store.paths().link_package_dir(&key));
+        assert!(resolved.join("package.json").is_file());
+
+        // Wrong version → None.
+        assert_eq!(store.find_link_package_dir("c", "0.0.0").unwrap(), None);
+        // Wrong name → None.
+        assert_eq!(store.find_link_package_dir("nope", "3.1.4").unwrap(), None);
+    }
+
+    /// `path_lives_in_store` returns `true` iff the canonicalized path
+    /// is inside this store's `links/` root. Used by doctor / rebuild
+    /// to decide if a project-side symlink leads to a v2 install.
+    #[test]
+    #[cfg(unix)]
+    fn path_lives_in_store_recognizes_canonical_descendants() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::at(dir.path());
+
+        let sri = synthetic_sri(b"path_lives_in_store/d");
+        let object_dir = write_object(
+            &store,
+            &sri,
+            &[("package.json", b"{\"name\":\"d\",\"version\":\"1.0.0\"}")],
+        );
+        let key = sample_key("d", "1.0.0");
+        let entry = store
+            .populate_link_entry(LinkEntryRequest {
+                graph_key: key.clone(),
+                source_sri: sri,
+                object_dir,
+                deps: vec![],
+                platform: sample_meta_platform(),
+            })
+            .unwrap();
+
+        // Direct probe.
+        assert!(store.path_lives_in_store(&entry.link_dir));
+        assert!(store.path_lives_in_store(&store.paths().link_package_dir(&key)));
+
+        // A symlink pointing at the link entry — the canonicalize step
+        // dereferences and the predicate still recognizes the target.
+        let proxy_dir = dir.path().join("proxy");
+        std::os::unix::fs::symlink(&entry.link_dir, &proxy_dir).unwrap();
+        assert!(store.path_lives_in_store(&proxy_dir));
+
+        // A path completely outside the store.
+        let outside = dir.path().join("not-the-store");
+        std::fs::create_dir_all(&outside).unwrap();
+        assert!(!store.path_lives_in_store(&outside));
     }
 }
