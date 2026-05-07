@@ -2162,7 +2162,10 @@ mod tests {
             Some("^1.15.2"),
             "simple overrides must round-trip"
         );
-        assert_eq!(pkg.overrides.get("esbuild").map(String::as_str), Some(">0.24.2"));
+        assert_eq!(
+            pkg.overrides.get("esbuild").map(String::as_str),
+            Some(">0.24.2")
+        );
         assert_eq!(pkg.overrides.get("vite").map(String::as_str), Some("$vite"));
 
         // Nested-object override is silently dropped (LPM doesn't apply nested overrides yet).
@@ -2172,7 +2175,10 @@ mod tests {
         );
 
         // Same handling for resolutions.
-        assert_eq!(pkg.resolutions.get("lodash").map(String::as_str), Some("^4.17.21"));
+        assert_eq!(
+            pkg.resolutions.get("lodash").map(String::as_str),
+            Some("^4.17.21")
+        );
         assert!(!pkg.resolutions.contains_key("deeply-nested"));
 
         // Crucially, the rest of the manifest survives — the bin field
