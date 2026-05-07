@@ -760,18 +760,47 @@ enum Commands {
         value: Option<String>,
     },
 
-    /// Manage ephemeral caches under ~/.lpm/cache/ (metadata, tasks, dlx).
+    /// Manage ephemeral caches under ~/.lpm/cache/ (metadata, tasks, dlx)
+    /// and the v2 virtual store at ~/.lpm/store/v2/.
     ///
     /// Phase 37: `cache` now exclusively touches caches. For package-store
     /// maintenance, use `lpm store gc` or `lpm store clean`.
+    ///
+    /// Phase 66 Phase 4e: `lpm cache prune` walks the v2 virtual store
+    /// (`~/.lpm/store/v2/{links,objects}/`) and removes orphan link
+    /// entries + objects no longer reachable from any registered
+    /// project. The flags are inert for the `clean` and `path` actions.
     Cache {
-        /// Action: clean, path.
+        /// Action: clean, path, prune.
         action: String,
 
         /// Optional subcategory: metadata, tasks, or dlx.
         /// When omitted, `clean` clears all three and `path` prints the
-        /// cache root.
+        /// cache root. Ignored by `prune`.
         subcategory: Option<String>,
+
+        /// `prune` only: actually remove orphan entries. Default is
+        /// dry-run (list orphans only).
+        #[arg(long)]
+        apply: bool,
+
+        /// `prune` only: filter to entries whose `last_referenced_at`
+        /// is older than this duration (`30d`, `24h`, etc.).
+        #[arg(long)]
+        max_age: Option<String>,
+
+        /// `prune` only: manual repair mode. Walk only this project's
+        /// `node_modules/` to collect roots; ignore the registry. Use
+        /// when the registry is corrupt or after a machine restore.
+        #[arg(long, value_name = "PATH")]
+        project: Option<String>,
+
+        /// `prune` only: also wipe the legacy v1 store at
+        /// `~/.lpm/store/v1/`. Use AFTER confirming all your projects
+        /// have migrated to v2 (post-Phase-4d this is the natural
+        /// state on a re-installed machine).
+        #[arg(long)]
+        legacy_v1: bool,
     },
 
     /// Manage the global content-addressable package store.
@@ -3103,7 +3132,24 @@ async fn async_main() -> Result<()> {
         Commands::Cache {
             action,
             subcategory,
-        } => commands::cache::run(&action, subcategory.as_deref(), cli.json).await,
+            apply,
+            max_age,
+            project,
+            legacy_v1,
+        } => {
+            commands::cache::run(
+                &action,
+                subcategory.as_deref(),
+                cli.json,
+                commands::cache::PruneFlags {
+                    apply,
+                    max_age: max_age.as_deref(),
+                    project: project.as_deref(),
+                    legacy_v1,
+                },
+            )
+            .await
+        }
         Commands::Store {
             action,
             deep,

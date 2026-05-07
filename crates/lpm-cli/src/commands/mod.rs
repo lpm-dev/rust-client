@@ -2,6 +2,7 @@ pub mod add;
 pub mod approve_scripts;
 pub mod audit;
 pub mod cache;
+pub mod cache_prune;
 pub mod cert;
 pub mod ci;
 pub mod completions;
