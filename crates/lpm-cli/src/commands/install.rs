@@ -8844,32 +8844,34 @@ async fn fetch_and_store_streaming(
     // Everything below runs on the blocking pool — frees the tokio async
     // workers to keep driving network reads. No download permit is held.
     let extract_start = std::time::Instant::now();
-    let (computed_sri, stage) = tokio::task::spawn_blocking(move || -> Result<(String, lpm_store::StageTimings), LpmError> {
-        if let Some(store_v2) = store_v2_owned {
-            // Phase 66 Phase 4b — v2 path. Bytes flow through
-            // `extract_object_from_bytes`: SHA-512 hash → integrity
-            // verify → extract into `objects/<sri>/` → security
-            // analysis → atomic rename. SizeLimit is enforced
-            // upstream by `download_tarball_streaming`'s
-            // Content-Length check (same as the v1 streaming path's
-            // `SizeLimitedReader`), so the buffered `body` is
-            // already bounded.
-            let (_obj_dir, sri, timings) =
-                store_v2.extract_object_from_bytes(&body, expected_integrity.as_deref())?;
-            Ok((sri, timings))
-        } else {
-            let cursor = std::io::Cursor::new(body);
-            store_owned
-                .stream_and_store_package(
-                    &name,
-                    &version,
-                    cursor,
-                    expected_integrity.as_deref(),
-                    lpm_registry::MAX_COMPRESSED_TARBALL_SIZE,
-                )
-                .map(|(_path, sri, timings)| (sri, timings))
-        }
-    })
+    let (computed_sri, stage) = tokio::task::spawn_blocking(
+        move || -> Result<(String, lpm_store::StageTimings), LpmError> {
+            if let Some(store_v2) = store_v2_owned {
+                // Phase 66 Phase 4b — v2 path. Bytes flow through
+                // `extract_object_from_bytes`: SHA-512 hash → integrity
+                // verify → extract into `objects/<sri>/` → security
+                // analysis → atomic rename. SizeLimit is enforced
+                // upstream by `download_tarball_streaming`'s
+                // Content-Length check (same as the v1 streaming path's
+                // `SizeLimitedReader`), so the buffered `body` is
+                // already bounded.
+                let (_obj_dir, sri, timings) =
+                    store_v2.extract_object_from_bytes(&body, expected_integrity.as_deref())?;
+                Ok((sri, timings))
+            } else {
+                let cursor = std::io::Cursor::new(body);
+                store_owned
+                    .stream_and_store_package(
+                        &name,
+                        &version,
+                        cursor,
+                        expected_integrity.as_deref(),
+                        lpm_registry::MAX_COMPRESSED_TARBALL_SIZE,
+                    )
+                    .map(|(_path, sri, timings)| (sri, timings))
+            }
+        },
+    )
     .await
     .map_err(|e| LpmError::Registry(format!("streaming extract task panicked: {e}")))??;
     let pipeline_ms = extract_start.elapsed().as_millis();
@@ -13572,10 +13574,16 @@ mod tests {
         let client = Arc::new(RegistryClient::new());
         let pkg = install_package_for_tarball(&url, None);
 
-        let (computed_sri, timings, final_url) =
-            fetch_and_store_tarball_url(&client, &store, None, &pkg, 0, install_pkg_acquire_permit())
-                .await
-                .expect("tarball install must succeed");
+        let (computed_sri, timings, final_url) = fetch_and_store_tarball_url(
+            &client,
+            &store,
+            None,
+            &pkg,
+            0,
+            install_pkg_acquire_permit(),
+        )
+        .await
+        .expect("tarball install must succeed");
 
         // Returned SRI matches an independent SHA-512 of the bytes.
         assert_eq!(computed_sri, expected_sri);
@@ -13615,10 +13623,16 @@ mod tests {
         let client = Arc::new(RegistryClient::new());
         let pkg = install_package_for_tarball(&url, Some(&expected_sri));
 
-        let (computed_sri, _, _) =
-            fetch_and_store_tarball_url(&client, &store, None, &pkg, 0, install_pkg_acquire_permit())
-                .await
-                .expect("matching SRI must succeed");
+        let (computed_sri, _, _) = fetch_and_store_tarball_url(
+            &client,
+            &store,
+            None,
+            &pkg,
+            0,
+            install_pkg_acquire_permit(),
+        )
+        .await
+        .expect("matching SRI must succeed");
         assert_eq!(computed_sri, expected_sri);
         assert!(store.has_tarball(&computed_sri));
     }
@@ -13651,9 +13665,15 @@ mod tests {
         let client = Arc::new(RegistryClient::new());
         let pkg = install_package_for_tarball(&url, Some(&wrong_sri));
 
-        let result =
-            fetch_and_store_tarball_url(&client, &store, None, &pkg, 0, install_pkg_acquire_permit())
-                .await;
+        let result = fetch_and_store_tarball_url(
+            &client,
+            &store,
+            None,
+            &pkg,
+            0,
+            install_pkg_acquire_permit(),
+        )
+        .await;
 
         assert!(
             matches!(result, Err(LpmError::IntegrityMismatch { .. })),
@@ -13706,20 +13726,32 @@ mod tests {
         let client = Arc::new(RegistryClient::new());
         let pkg = install_package_for_tarball(&url, None);
 
-        let (sri1, _, _) =
-            fetch_and_store_tarball_url(&client, &store, None, &pkg, 0, install_pkg_acquire_permit())
-                .await
-                .unwrap();
+        let (sri1, _, _) = fetch_and_store_tarball_url(
+            &client,
+            &store,
+            None,
+            &pkg,
+            0,
+            install_pkg_acquire_permit(),
+        )
+        .await
+        .unwrap();
         let cas_path = store.tarball_store_path(&sri1).unwrap();
         let mtime1 = std::fs::metadata(cas_path.join("package.json"))
             .unwrap()
             .modified()
             .unwrap();
 
-        let (sri2, _, _) =
-            fetch_and_store_tarball_url(&client, &store, None, &pkg, 0, install_pkg_acquire_permit())
-                .await
-                .unwrap();
+        let (sri2, _, _) = fetch_and_store_tarball_url(
+            &client,
+            &store,
+            None,
+            &pkg,
+            0,
+            install_pkg_acquire_permit(),
+        )
+        .await
+        .unwrap();
         assert_eq!(sri1, sri2);
         let mtime2 = std::fs::metadata(cas_path.join("package.json"))
             .unwrap()
@@ -16759,10 +16791,16 @@ mod tests {
         let client = Arc::new(RegistryClient::new());
         let pkg = install_package_for_tarball(&declared_url, None);
 
-        let (computed_sri, _, final_url) =
-            fetch_and_store_tarball_url(&client, &store, None, &pkg, 0, install_pkg_acquire_permit())
-                .await
-                .expect("redirect must be followed");
+        let (computed_sri, _, final_url) = fetch_and_store_tarball_url(
+            &client,
+            &store,
+            None,
+            &pkg,
+            0,
+            install_pkg_acquire_permit(),
+        )
+        .await
+        .expect("redirect must be followed");
 
         // Bytes arrived: SRI matches independent calc on the final
         // body (proves redirect was followed and content is right).
