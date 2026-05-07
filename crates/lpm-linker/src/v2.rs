@@ -190,10 +190,26 @@ pub fn link_packages_v2(
 /// Optional peers (declared in `peerDependenciesMeta` with
 /// `optional: true`) are silently skipped when the install set
 /// doesn't include the peer's package — matches npm's behavior.
+///
+/// **Transitive closure.** When package A's peer is B, and B itself
+/// declares C as a peer, the v2 isolated layout requires C as a
+/// sibling of A (not just of B), because Node's module resolution
+/// from inside `<links/A-key>/node_modules/A/` walks up to
+/// `<links/A-key>/node_modules/`, then stops — it never reaches B's
+/// link entry directly. Without recursive closure, A's
+/// `require('react')` (declared by B = rehackt) fails because react
+/// isn't a sibling of A's link entry. v1 reaches the project root
+/// via the relative `<project>/.lpm/wrappers/` chain and resolves the
+/// peer there; v2's absolute store paths break that walk-up.
+///
+/// We iterate to a fixed point: repeatedly walk every (re-)augmented
+/// target's peers and pull in newly-discovered peers, until no
+/// target gains a new edge. Bounded by depth-limit to avoid
+/// pathological cycles.
 fn augment_with_peer_edges(targets: &[V2Target], store: &Store) -> Result<Vec<V2Target>, LpmError> {
-    // Build a name → (version, has-target) lookup. For 4b's
-    // single-version-per-name scope this is unambiguous; multi-source
-    // -same-name disambiguation is a Phase 4 follow-up.
+    // Build a name → version lookup once. For 4b's single-version-
+    // per-name scope this is unambiguous; multi-source-same-name
+    // disambiguation is a Phase 4 follow-up.
     let mut by_name: HashMap<String, String> = HashMap::with_capacity(targets.len());
     for v2t in targets {
         by_name
@@ -201,16 +217,15 @@ fn augment_with_peer_edges(targets: &[V2Target], store: &Store) -> Result<Vec<V2
             .or_insert_with(|| v2t.target.version.clone());
     }
 
-    let mut out = Vec::with_capacity(targets.len());
+    // Read every target's `peerDependencies` once. Cached so the
+    // fixed-point loop doesn't re-parse package.json on every pass.
+    let mut peers_by_name: HashMap<String, Vec<String>> = HashMap::with_capacity(targets.len());
     for v2t in targets {
         let object_dir = store.paths().object_dir(&v2t.source_sri)?;
         let pkg_json_path = object_dir.join("package.json");
         if !pkg_json_path.exists() {
-            // No package.json — pass through unchanged. Should be
-            // unreachable for real npm tarballs (every tarball has
-            // one), but keeps the v2 linker robust to malformed
-            // input rather than panicking.
-            out.push(v2t.clone());
+            // No package.json — treat as no peers. Should be
+            // unreachable for real npm tarballs.
             continue;
         }
         let pkg_json = match lpm_workspace::read_package_json(&pkg_json_path) {
@@ -220,57 +235,83 @@ fn augment_with_peer_edges(targets: &[V2Target], store: &Store) -> Result<Vec<V2
                     "v2 linker: failed to parse {}/package.json for peer-edge synthesis: {e}",
                     object_dir.display()
                 );
-                out.push(v2t.clone());
                 continue;
             }
         };
-        let mut augmented = v2t.clone();
-        let already_declared: std::collections::HashSet<String> = augmented
-            .target
-            .dependencies
-            .iter()
-            .map(|(local, _)| local.clone())
-            .collect();
-        for peer_name in pkg_json.peer_dependencies.keys() {
-            // Skip peers already in the regular `dependencies` map
-            // (rare, but legal — npm allows declaring a peer also as
-            // a dep). Avoids double-edge.
-            if already_declared.contains(peer_name) {
-                continue;
-            }
-            let resolved_version = match by_name.get(peer_name) {
-                Some(v) => v.clone(),
-                None => {
-                    // Peer not in install set. Could be:
-                    //   1. Optional peer (`peerDependenciesMeta`
-                    //      `{ optional: true }`). 4b doesn't read
-                    //      that field — `PackageJson` doesn't surface
-                    //      it as a typed slot today. Treat-as-skip is
-                    //      the npm-compat behavior (npm warns + lets
-                    //      install proceed); a Phase 4 follow-up adds
-                    //      typed `peerDependenciesMeta` plumbing.
-                    //   2. Required peer the resolver missed. Today's
-                    //      `check_unmet_peers` is supposed to fail
-                    //      resolution upstream; if it didn't, surface
-                    //      a debug trace and continue. Node will fail
-                    //      to resolve at runtime — exactly the same
-                    //      end-state as v1's isolated layout when
-                    //      a peer is genuinely unresolvable.
-                    tracing::debug!(
-                        "v2 linker: peer dep {peer_name} of {}@{} not in install set — skipping",
-                        v2t.target.name,
-                        v2t.target.version
-                    );
-                    continue;
-                }
+        let names: Vec<String> = pkg_json.peer_dependencies.keys().cloned().collect();
+        if !names.is_empty() {
+            peers_by_name.insert(v2t.target.name.clone(), names);
+        }
+    }
+
+    let mut out: Vec<V2Target> = targets.to_vec();
+
+    // Bound iterations to avoid cycles. The closure depth is at most
+    // the longest peer-chain length in the install set; 64 is two
+    // orders of magnitude beyond any real npm graph.
+    const MAX_PEER_CLOSURE_PASSES: usize = 64;
+    for _ in 0..MAX_PEER_CLOSURE_PASSES {
+        let mut changed = false;
+        for v2t in out.iter_mut() {
+            let peers = match peers_by_name.get(&v2t.target.name) {
+                Some(p) => p,
+                None => continue,
             };
-            augmented
+            let already_declared: std::collections::HashSet<String> = v2t
                 .target
                 .dependencies
-                .push((peer_name.clone(), resolved_version));
+                .iter()
+                .map(|(local, _)| local.clone())
+                .collect();
+            for peer_name in peers {
+                if already_declared.contains(peer_name) {
+                    continue;
+                }
+                let resolved_version = match by_name.get(peer_name) {
+                    Some(v) => v.clone(),
+                    None => {
+                        // Peer not in install set. Could be:
+                        //   1. Optional peer (`peerDependenciesMeta`
+                        //      `{ optional: true }`). 4b doesn't read
+                        //      that field — `PackageJson` doesn't
+                        //      surface it as a typed slot today.
+                        //      Treat-as-skip is the npm-compat
+                        //      behavior (npm warns + lets install
+                        //      proceed); a Phase 4 follow-up adds
+                        //      typed `peerDependenciesMeta` plumbing.
+                        //   2. Required peer the resolver missed.
+                        //      `check_unmet_peers` is supposed to
+                        //      fail resolution upstream; if it
+                        //      didn't, surface a debug trace and
+                        //      continue. Node will fail to resolve
+                        //      at runtime — exactly the same
+                        //      end-state as v1's isolated layout
+                        //      when a peer is genuinely unresolvable.
+                        tracing::debug!(
+                            "v2 linker: peer dep {peer_name} of {}@{} not in install set — skipping",
+                            v2t.target.name,
+                            v2t.target.version
+                        );
+                        continue;
+                    }
+                };
+                v2t.target
+                    .dependencies
+                    .push((peer_name.clone(), resolved_version));
+                changed = true;
+            }
         }
-        out.push(augmented);
+        if !changed {
+            return Ok(out);
+        }
     }
+    // Hit the depth bound — surface a debug trace and accept the
+    // current closure. Real graphs never approach the cap; if they
+    // do, return what we have rather than fail the install.
+    tracing::debug!(
+        "v2 linker: peer-edge closure hit MAX_PEER_CLOSURE_PASSES={MAX_PEER_CLOSURE_PASSES}; \
+         possible cycle in peer chain"
+    );
     Ok(out)
 }
 

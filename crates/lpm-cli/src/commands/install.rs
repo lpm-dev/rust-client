@@ -4534,7 +4534,22 @@ async fn run_with_options_under_store_lock(
         // path repopulates the object. (Phase 4 follow-up:
         // detect-and-translate v1 → v2 to skip re-download for
         // already-extracted bytes.)
-        if !force && !v2_mode && p.store_has_source_aware(&store, project_dir) {
+        //
+        // Per-source carve-out: local sources (`Source::Directory`
+        // / `Source::Link`) are NOT content-addressable and bypass
+        // both v1 and v2 stores. They live at the source realpath
+        // and their `store_has_source_aware` returns true iff that
+        // path resolves to a directory with a package.json. Sending
+        // them through the fetch loop under v2 mode is wrong:
+        // there's nothing to download, and the loop assigns them an
+        // empty integrity which then trips the binary lockfile's
+        // empty-string-vs-None guard.
+        let is_local_source = matches!(
+            p.source_kind(),
+            Ok(lpm_lockfile::Source::Directory { .. }) | Ok(lpm_lockfile::Source::Link { .. })
+        );
+        if !force && (is_local_source || !v2_mode) && p.store_has_source_aware(&store, project_dir)
+        {
             cached += 1;
             // Phase 39 P2b: spawn per-pkg link task immediately — this
             // package is already materialized in the store, so Phase 1
@@ -5323,12 +5338,19 @@ async fn run_with_options_under_store_lock(
             materialized: materialized_all,
         }
     } else if let Some(store_v2) = store_v2_handle.as_deref() {
-        // Phase 66 Phase 4b — v2 path. Build `V2Target`s by joining
-        // each `LinkTarget` with the `source_sri` recorded on its
-        // matching `InstallPackage`. Audit-fixture installs all have
-        // unique (name, version) pairs, so the lookup is unambiguous;
-        // multi-source-same-name-version is a documented Phase 4
-        // follow-up (see `lpm_linker::v2` module docs).
+        // Phase 66 Phase 4b — v2 path with per-source routing.
+        //
+        // Per the v2 preplan (§9), CAS-backed sources (Registry,
+        // Tarball remote+local, Git) flow through the v2 store +
+        // link-entry materialization. Local-source kinds
+        // (`Source::Directory` = `file:`, `Source::Link` = `link:`)
+        // are NOT content-addressable (the source can be edited at
+        // any time) and intentionally stay outside the global v2
+        // store. They land as project-side symlinks pointing at the
+        // source realpath — same observable contract as v1's
+        // wrapper-based path for the audit-fixture scope (the local
+        // source has no transitive deps, so Node's module resolution
+        // doesn't need a wrapper boundary).
         let sri_by_pkg: HashMap<(String, String), String> = packages
             .iter()
             .filter_map(|p| {
@@ -5339,28 +5361,98 @@ async fn run_with_options_under_store_lock(
             .collect();
 
         let mut v2_targets: Vec<lpm_linker::v2::V2Target> = Vec::with_capacity(link_targets.len());
+        let mut local_targets: Vec<&LinkTarget> = Vec::new();
         for t in &link_targets {
-            let sri = sri_by_pkg
-                .get(&(t.name.clone(), t.version.clone()))
-                .cloned()
-                .ok_or_else(|| {
-                    LpmError::Registry(format!(
-                        "v2 install: missing source SRI for {}@{}",
-                        t.name, t.version
-                    ))
-                })?;
-            v2_targets.push(lpm_linker::v2::V2Target {
-                target: t.clone(),
-                source_sri: sri,
-            });
+            match t.materialization {
+                lpm_linker::Materialization::CasBacked => {
+                    let sri = sri_by_pkg
+                        .get(&(t.name.clone(), t.version.clone()))
+                        .cloned()
+                        .ok_or_else(|| {
+                            LpmError::Registry(format!(
+                                "v2 install: missing source SRI for {}@{}",
+                                t.name, t.version
+                            ))
+                        })?;
+                    v2_targets.push(lpm_linker::v2::V2Target {
+                        target: t.clone(),
+                        source_sri: sri,
+                    });
+                }
+                lpm_linker::Materialization::DirectorySource => {
+                    local_targets.push(t);
+                }
+            }
         }
-        lpm_linker::v2::link_packages_v2(
+
+        let mut result = lpm_linker::v2::link_packages_v2(
             project_dir,
             &v2_targets,
             store_v2,
             linker_mode,
             pkg.name.as_deref(),
-        )?
+        )?;
+
+        // Materialize directory-source targets via project-side
+        // symlink to the source realpath. `link_packages_v2` already
+        // wiped + recreated `<project>/node_modules/`, so we append
+        // here.
+        if !local_targets.is_empty() {
+            let nm = project_dir.join("node_modules");
+            std::fs::create_dir_all(&nm).map_err(|e| {
+                LpmError::Registry(format!(
+                    "v2 install (local-source): failed to ensure node_modules at {}: {e}",
+                    nm.display()
+                ))
+            })?;
+            for t in local_targets {
+                let names: Vec<String> = if let Some(rl) = &t.root_link_names {
+                    rl.clone()
+                } else if t.is_direct {
+                    vec![t.name.clone()]
+                } else {
+                    Vec::new()
+                };
+                for root_name in &names {
+                    let link_path = nm.join(root_name);
+                    if let Some(parent) = link_path.parent()
+                        && parent != nm
+                        && !parent.exists()
+                    {
+                        std::fs::create_dir_all(parent).map_err(|e| {
+                            LpmError::Registry(format!(
+                                "v2 install (local-source): failed to create scope dir at {}: {e}",
+                                parent.display()
+                            ))
+                        })?;
+                    }
+                    if link_path.symlink_metadata().is_ok() {
+                        // CAS root symlink already at slot — local-source
+                        // dep with the same root_link_name would only
+                        // occur via aliasing, which the resolver
+                        // disambiguates upstream. Defensive skip.
+                        continue;
+                    }
+                    lpm_common::symlink::create_dir_symlink_or_junction(&t.store_path, &link_path)
+                        .map_err(|e| {
+                            LpmError::Registry(format!(
+                                "v2 install (local-source): failed to symlink {} → {}: {e}",
+                                link_path.display(),
+                                t.store_path.display()
+                            ))
+                        })?;
+                    result.symlinked += 1;
+                }
+                result.materialized.push(MaterializedPackage {
+                    name: t.name.clone(),
+                    version: t.version.clone(),
+                    destination: t.store_path.clone(),
+                });
+                result.linked += 1;
+            }
+        }
+
+        result
     } else {
         match linker_mode {
             lpm_linker::LinkerMode::Hoisted => lpm_linker::link_packages_hoisted(
