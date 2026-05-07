@@ -4151,6 +4151,7 @@ async fn run_with_options_under_store_lock(
                     fetch_semaphore.clone(),
                     fetch_coord.clone(),
                     deps.clone(),
+                    store_v2_handle.clone(),
                 );
 
                 // No-op walker stub keeps `WalkerJoin` shape uniform
@@ -4272,6 +4273,7 @@ async fn run_with_options_under_store_lock(
                     fetch_semaphore.clone(),
                     fetch_coord.clone(),
                     deps.clone(),
+                    store_v2_handle.clone(),
                 );
 
                 // Resolver — awaits roots_ready then solves against the
@@ -4569,6 +4571,51 @@ async fn run_with_options_under_store_lock(
             p.source_kind(),
             Ok(lpm_lockfile::Source::Directory { .. }) | Ok(lpm_lockfile::Source::Link { .. })
         );
+
+        // Phase 66 §4 — v1 → v2 cache-hit translation.
+        //
+        // When we're under v2 mode AND v1 already has the extracted
+        // bytes for this package AND we know the SRI (lockfile-fast-
+        // path or prior install populated `p.integrity`), copy the
+        // bytes from `~/.lpm/store/v1/<name>/<version>/` into
+        // `~/.lpm/store/v2/objects/<sri>/` instead of forcing a fresh
+        // tarball download. The translation is bounded by a single
+        // `copy_dir_recursively` (kernel CoW reflink on supporting
+        // filesystems, plain copy elsewhere) — cheaper than the
+        // network + extract round-trip.
+        //
+        // After translation, this package falls into the same
+        // `cached += 1; continue;` slot as the v1 cache-hit gate
+        // below, because the v2 link dispatch (around L5325) reads
+        // `~/.lpm/store/v2/objects/<sri>/` directly and the object
+        // is now populated.
+        //
+        // Falls through to the regular fetch path on any error — the
+        // re-download is the correct fallback and matches pre-Phase-66
+        // behavior under v2 mode.
+        if !force
+            && v2_mode
+            && !is_local_source
+            && let Some(v2_store) = store_v2_handle.as_deref()
+            && let Some(sri) = p.integrity.as_deref()
+            && p.store_has_source_aware(&store, project_dir)
+            && let Ok(v1_pkg_dir) = p.store_path_or_err(&store, project_dir, None)
+        {
+            match v2_store.populate_object_from_v1(&v1_pkg_dir, sri) {
+                Ok(_) => {
+                    cached += 1;
+                    continue;
+                }
+                Err(e) => {
+                    tracing::debug!(
+                        "v1→v2 translation for {}@{} failed: {e} (falling back to fetch)",
+                        p.name,
+                        p.version
+                    );
+                }
+            }
+        }
+
         if !force && (is_local_source || !v2_mode) && p.store_has_source_aware(&store, project_dir)
         {
             cached += 1;
@@ -8055,6 +8102,12 @@ fn spawn_speculation_dispatcher(
     semaphore: Arc<Semaphore>,
     coord: Arc<FetchCoordinator>,
     deps: HashMap<String, String>,
+    // Phase 66 §4 — under v2 mode the dispatcher routes downloaded
+    // bytes through `v2::Store::extract_object_from_bytes` instead of
+    // v1's per-`(name, version)` slot. `None` keeps the legacy v1 path
+    // for callers running with the env var unset (and for the migration-
+    // window code paths that still write v1 alongside).
+    store_v2: Option<Arc<lpm_store::v2::Store>>,
 ) -> (tokio::task::JoinHandle<()>, DispatcherCounters) {
     use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 
@@ -8064,6 +8117,7 @@ fn spawn_speculation_dispatcher(
     let store_spec = store;
     let sem_spec = semaphore;
     let coord_spec = coord;
+    let store_v2_spec = store_v2;
 
     let dispatched = Arc::new(AtomicU64::new(0));
     let completed = Arc::new(AtomicU64::new(0));
@@ -8083,23 +8137,19 @@ fn spawn_speculation_dispatcher(
 
     let mut rx = rx;
     let handle = tokio::spawn(async move {
-        // Phase 66 Phase 4b — under v2 mode, the speculative
-        // dispatcher would write to v1's `<HOME>/.lpm/store/v1/`
-        // (it constructs `PackageStore::stream_and_store_package`
-        // calls directly — no v2 plumbing). Drain the channel as a
-        // no-op so the resolver-owned `spec_tx` doesn't error out,
-        // and let the real fetch loop below populate v2's
-        // `objects/<sri>/` instead. Phase 4 follow-up: route
-        // speculation through `v2::Store::extract_object_from_bytes`
-        // for the v2 fast path.
-        if lpm_store::StoreVersion::from_env().is_v2() {
-            tracing::debug!("v2 mode: speculative dispatcher draining without prefetch");
-            while rx.recv().await.is_some() {
-                // Drain and discard. Resolver's send completes; the
-                // real fetch loop handles every package.
-            }
-            return;
-        }
+        // Phase 66 Phase 4d — under v2 mode the dispatcher writes to
+        // v2's `objects/<sri>/` via `extract_object_from_bytes`. The
+        // store handle threads through `speculative_download_and_store`
+        // below; when `store_v2_spec` is `Some`, the spec download
+        // collects bytes (rather than streaming straight to disk) and
+        // hands them to the v2 store's idempotent extract. The legacy
+        // v1 path runs when `store_v2_spec` is `None`.
+        //
+        // Pre-Phase-4d this branch drained the channel as a no-op,
+        // forcing the real fetch loop to do all download work — v2
+        // installs paid full per-package fetch latency on the hot
+        // path. With this wired, v2 cold installs match v1's
+        // pipelined-fetch shape.
 
         // Work queue items: (package_name, range_string, depth, is_root).
         // Depth is 1 for roots, N+1 for each transitive hop. Capped at
@@ -8205,12 +8255,14 @@ fn spawn_speculation_dispatcher(
                 let coord = coord_spec.clone();
                 let completed_task = completed_c.clone();
                 let task_ms_task = task_ms_c.clone();
+                let store_v2_task = store_v2_spec.clone();
                 spec_tasks.push(tokio::spawn(async move {
                 let task_start = std::time::Instant::now();
                 match speculative_download_and_store(
                     &c,
                     &rt,
                     &s,
+                    store_v2_task.as_deref(),
                     &sem,
                     &coord,
                     &name,
@@ -8326,6 +8378,11 @@ async fn speculative_download_and_store(
     client: &Arc<RegistryClient>,
     route_table: &RouteTable,
     store: &PackageStore,
+    // Phase 66 §4 — when `Some`, route the downloaded bytes through
+    // v2's `extract_object_from_bytes` (idempotent on object hits)
+    // instead of v1's `stream_and_store_package`. Each spec task
+    // gets its own clone of the `Arc<Store>`.
+    store_v2: Option<&lpm_store::v2::Store>,
     semaphore: &Arc<Semaphore>,
     coord: &Arc<FetchCoordinator>,
     name: &str,
@@ -8354,7 +8411,25 @@ async fn speculative_download_and_store(
     let key_lock = coord.lock_for(speculation_key).await;
     let _key_guard = key_lock.lock().await;
 
-    if store.has_package(name, version) {
+    // Phase 66 §4 — store-hit short-circuit, layout-aware. Under v2
+    // mode the SRI determines the object dir; if the SRI is
+    // unavailable (TOFU resolution path) we fall back to v1's
+    // `(name, version)` check, which is harmless under v2 (it just
+    // misses an opportunity to skip).
+    let already_present = if let Some(v2) = store_v2 {
+        match integrity {
+            Some(sri) => v2
+                .paths()
+                .object_dir(sri)
+                .ok()
+                .map(|dir| dir.exists())
+                .unwrap_or(false),
+            None => store.has_package(name, version),
+        }
+    } else {
+        store.has_package(name, version)
+    };
+    if already_present {
         return Ok(());
     }
 
@@ -8369,9 +8444,33 @@ async fn speculative_download_and_store(
     let response = client
         .download_tarball_streaming_routed(route_table, name, url)
         .await?;
+
+    if let Some(v2) = store_v2 {
+        // v2 path: collect bytes, extract via v2 store. Streaming-to-
+        // disk into v2 is a future optimization (Phase 4d/4f); for
+        // speculation the in-memory shape is fine because spec sets
+        // are bounded (a few hundred packages parallel, each typically
+        // <500 KB compressed). The semaphore upstream caps the
+        // concurrent allocator pressure.
+        let body = response.bytes().await.map_err(|e| {
+            LpmError::Registry(format!("spec body fetch failed for {name}@{version}: {e}"))
+        })?;
+        let v2_clone = v2.clone();
+        let bytes = body.to_vec();
+        let integrity_c = integrity.map(|s| s.to_string());
+        tokio::task::spawn_blocking(move || {
+            v2_clone
+                .extract_object_from_bytes(&bytes, integrity_c.as_deref())
+                .map(|_| ())
+        })
+        .await
+        .map_err(|e| LpmError::Registry(format!("spec v2 blocking task: {e}")))??;
+        return Ok(());
+    }
+
+    // v1 path: streaming straight to the per-`(name, version)` slot.
     let byte_stream = response.bytes_stream().map_err(std::io::Error::other);
     let async_reader = StreamReader::new(byte_stream);
-
     let name_c = name.to_string();
     let version_c = version.to_string();
     let integrity_c = integrity.map(|s| s.to_string());
