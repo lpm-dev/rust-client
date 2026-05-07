@@ -4486,7 +4486,14 @@ async fn run_with_options_under_store_lock(
     let serial_link = std::env::var("LPM_SERIAL_LINK")
         .map(|v| v == "1")
         .unwrap_or(false);
-    let event_driven_link = !serial_link && matches!(linker_mode, lpm_linker::LinkerMode::Isolated);
+    // Phase 66 Phase 4b — under v2 mode, link_packages_v2 needs the
+    // full LinkTarget set in one batch so the GraphKey pre-pass can
+    // resolve cross-references. Per-package event-driven linking
+    // (which v1's isolated path uses) doesn't fit the v2 dispatcher's
+    // shape, so v2 always takes the serial path.
+    let v2_mode = store_v2_handle.is_some();
+    let event_driven_link =
+        !serial_link && !v2_mode && matches!(linker_mode, lpm_linker::LinkerMode::Isolated);
 
     // Phase 39 P2b: collection of per-package link handles. Cached
     // packages push into this before the fetch loop; fetch tasks push
@@ -4520,7 +4527,14 @@ async fn run_with_options_under_store_lock(
         // NOT satisfy the tarball dependency (would be silent
         // substitution). Trust-on-first-use Source::Tarball
         // (no recorded integrity) returns false → fetch runs.
-        if !force && p.store_has_source_aware(&store, project_dir) {
+        //
+        // Phase 66 Phase 4b — under v2 mode, a hit in v1's
+        // `<HOME>/.lpm/store/v1/` does NOT mean v2's
+        // `objects/<sri>/` is populated. Force a fetch so the v2
+        // path repopulates the object. (Phase 4 follow-up:
+        // detect-and-translate v1 → v2 to skip re-download for
+        // already-extracted bytes.)
+        if !force && !v2_mode && p.store_has_source_aware(&store, project_dir) {
             cached += 1;
             // Phase 39 P2b: spawn per-pkg link task immediately — this
             // package is already materialized in the store, so Phase 1
@@ -5308,6 +5322,45 @@ async fn run_with_options_under_store_lock(
             self_referenced: finalize.self_referenced,
             materialized: materialized_all,
         }
+    } else if let Some(store_v2) = store_v2_handle.as_deref() {
+        // Phase 66 Phase 4b — v2 path. Build `V2Target`s by joining
+        // each `LinkTarget` with the `source_sri` recorded on its
+        // matching `InstallPackage`. Audit-fixture installs all have
+        // unique (name, version) pairs, so the lookup is unambiguous;
+        // multi-source-same-name-version is a documented Phase 4
+        // follow-up (see `lpm_linker::v2` module docs).
+        let sri_by_pkg: HashMap<(String, String), String> = packages
+            .iter()
+            .filter_map(|p| {
+                p.integrity
+                    .clone()
+                    .map(|sri| ((p.name.clone(), p.version.clone()), sri))
+            })
+            .collect();
+
+        let mut v2_targets: Vec<lpm_linker::v2::V2Target> = Vec::with_capacity(link_targets.len());
+        for t in &link_targets {
+            let sri = sri_by_pkg
+                .get(&(t.name.clone(), t.version.clone()))
+                .cloned()
+                .ok_or_else(|| {
+                    LpmError::Registry(format!(
+                        "v2 install: missing source SRI for {}@{}",
+                        t.name, t.version
+                    ))
+                })?;
+            v2_targets.push(lpm_linker::v2::V2Target {
+                target: t.clone(),
+                source_sri: sri,
+            });
+        }
+        lpm_linker::v2::link_packages_v2(
+            project_dir,
+            &v2_targets,
+            store_v2,
+            linker_mode,
+            pkg.name.as_deref(),
+        )?
     } else {
         match linker_mode {
             lpm_linker::LinkerMode::Hoisted => lpm_linker::link_packages_hoisted(
@@ -7908,6 +7961,24 @@ fn spawn_speculation_dispatcher(
 
     let mut rx = rx;
     let handle = tokio::spawn(async move {
+        // Phase 66 Phase 4b — under v2 mode, the speculative
+        // dispatcher would write to v1's `<HOME>/.lpm/store/v1/`
+        // (it constructs `PackageStore::stream_and_store_package`
+        // calls directly — no v2 plumbing). Drain the channel as a
+        // no-op so the resolver-owned `spec_tx` doesn't error out,
+        // and let the real fetch loop below populate v2's
+        // `objects/<sri>/` instead. Phase 4 follow-up: route
+        // speculation through `v2::Store::extract_object_from_bytes`
+        // for the v2 fast path.
+        if lpm_store::StoreVersion::from_env().is_v2() {
+            tracing::debug!("v2 mode: speculative dispatcher draining without prefetch");
+            while rx.recv().await.is_some() {
+                // Drain and discard. Resolver's send completes; the
+                // real fetch loop handles every package.
+            }
+            return;
+        }
+
         // Work queue items: (package_name, range_string, depth, is_root).
         // Depth is 1 for roots, N+1 for each transitive hop. Capped at
         // SPECULATION_MAX_DEPTH.

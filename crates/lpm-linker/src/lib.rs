@@ -47,6 +47,11 @@ use std::path::{Component, Path, PathBuf};
 pub mod layout;
 pub use layout::{InstallHealth, LayoutPaths, LinkerLayout};
 
+// Phase 66 Phase 4b — virtual-store-aware linker. Selected when
+// `LPM_STORE_VERSION=v2`; sits next to the v1 isolated/hoisted code
+// paths in this crate. See `src/v2.rs` for the design doc.
+pub mod v2;
+
 /// Phase 39 P2b per-package link outcome — exposes Phase 1 action + Phase 2
 /// symlink count to the event-driven caller so totals match the
 /// single-shot [`link_packages`] path.

@@ -48,7 +48,9 @@ pub mod link_meta;
 pub mod platform;
 pub mod store;
 
-pub use graph_key::{GraphKey, GraphKeyInputs};
-pub use link_meta::{LINK_META_FILENAME, LINK_META_SCHEMA_VERSION, LinkMeta, LinkMetaDep};
+pub use graph_key::{DepEdge, GraphKey, GraphKeyInputs, LinkerModeTag, PeerEntry};
+pub use link_meta::{
+    LINK_META_FILENAME, LINK_META_SCHEMA_VERSION, LinkMeta, LinkMetaDep, LinkMetaPlatform,
+};
 pub use platform::PlatformTuple;
-pub use store::{LinkEntry, LinkEntryRequest, Store, StoreV2Paths};
+pub use store::{DepLink, LinkEntry, LinkEntryRequest, Store, StoreV2Paths};
