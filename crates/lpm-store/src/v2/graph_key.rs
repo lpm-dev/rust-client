@@ -124,6 +124,23 @@ pub struct GraphKeyInputs {
     ///
     /// [`LinkTarget::root_link_names`]: ../../../lpm-linker/src/lib.rs
     pub root_link_names: Option<Vec<String>>,
+    /// **Phase 66 §2.2 / preplan day-7 audit response** — source-identity
+    /// disambiguator. Mirrors `LinkTarget.wrapper_id`:
+    /// - `None` for `Source::Registry` (registry is the only source
+    ///   that doesn't share `(name, version)` namespace with other
+    ///   source kinds, so no disambiguation needed).
+    /// - `Some(<source-id>)` for non-Registry sources (Tarball
+    ///   remote/local, Directory, Link, Git).
+    ///
+    /// Folded into the GraphKey so `Source::Registry { foo@1.0.0 }`
+    /// and `Source::Tarball { foo@1.0.0 from a custom URL }` produce
+    /// distinct keys — the link entries materialize independently and
+    /// the `links/<key>/` namespace stays collision-free under
+    /// multi-source installs. Empty / `None` means "no source-identity
+    /// constraint", matching the legacy registry-only shape so a
+    /// pre-Phase-66 GraphKey for a registry package doesn't suddenly
+    /// invalidate.
+    pub wrapper_id: Option<String>,
 }
 
 impl GraphKeyInputs {
@@ -144,7 +161,16 @@ impl GraphKeyInputs {
             deps: Vec::new(),
             aliases: BTreeMap::new(),
             root_link_names: None,
+            wrapper_id: None,
         }
+    }
+
+    /// Replace the source-identity disambiguator. `None` is the
+    /// pre-Phase-66 shape (registry-only); `Some(...)` is the
+    /// non-Registry-source case.
+    pub fn with_wrapper_id(mut self, wrapper_id: Option<String>) -> Self {
+        self.wrapper_id = wrapper_id;
+        self
     }
 
     /// Replace the peer-context. Order doesn't matter (hashing sorts).
@@ -261,6 +287,13 @@ impl GraphKey {
 
         let root_names_str = format_root_link_names(inputs.root_link_names.as_deref());
         write_field(&mut hasher, b"root_link_names", root_names_str.as_bytes());
+
+        // Phase 66 §2.2 — source-identity disambiguation. Empty when
+        // wrapper_id is None (registry default), preserving the
+        // pre-Phase-66 hash for registry packages so existing v2
+        // store entries don't get invalidated by this addition.
+        let wrapper_str = inputs.wrapper_id.as_deref().unwrap_or("");
+        write_field(&mut hasher, b"wrapper_id", wrapper_str.as_bytes());
 
         let digest = hasher.finalize();
         Self {
