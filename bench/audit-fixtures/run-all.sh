@@ -5,6 +5,20 @@ set -e
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
 
+# Wipe the work-dir parent ONCE at suite start. `run-audit.sh` already
+# wipes `/tmp/lpm-audit-work/<fixture>-<mode>/` per fixture, but it
+# does not clean the parent — so a previous suite run that ever
+# populated `/tmp/lpm-audit-work/.lpm/wrappers/` (e.g., a fixture's
+# `lpm install` cwd-relative behavior, or a manual debug session)
+# leaves leftover wrappers that Node's symlink walk-up resolves
+# through. That produced false-positive PASSes for fixtures missing
+# real peer deps in their package.json — see Phase 66 4b's
+# `peer-heavy/apollo-graphql`, `tooling/eslint-flat-config`, and
+# `workspace/monorepo-basic` archaeology. Wiping the parent makes
+# every suite run fixture-isolated and the baseline trustworthy.
+WORK_PARENT="${LPM_AUDIT_WORK_BASE:-/tmp/lpm-audit-work}"
+rm -rf "$WORK_PARENT"
+
 # All fixtures, deterministically ordered.
 FIXTURES=(
     "peer-heavy/react-ssr"
