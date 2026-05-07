@@ -163,20 +163,12 @@ fn relative_symlink_target_from_parent(target: &Path, link_parent: &Path) -> Pat
     pathdiff::diff_paths(target, &link_parent_canonical).unwrap_or_else(|| target.to_path_buf())
 }
 
-/// Check if a path string contains cmd.exe metacharacters that could enable injection.
-/// Returns `Err(reason)` if dangerous characters are found.
+// Phase 66 Phase 4a follow-up: cmd-path validation moved to
+// `lpm_common::symlink` so lpm-store v2 shares the same security check
+// (was duplicated). Re-imported under the legacy local name to keep
+// the surrounding call sites untouched.
 #[cfg(windows)]
-fn validate_cmd_path(path: &str) -> Result<(), String> {
-    const DANGEROUS: &[char] = &['"', '&', '|', '<', '>', '^', '%', '\n', '\r'];
-    for ch in DANGEROUS {
-        if path.contains(*ch) {
-            return Err(format!(
-                "bin target path contains dangerous character '{ch}' for cmd.exe"
-            ));
-        }
-    }
-    Ok(())
-}
+use lpm_common::symlink::validate_cmd_path;
 
 /// Linking strategy for node_modules.
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
@@ -277,110 +269,13 @@ mod linker_mode_tests {
 /// Junctions require absolute paths, so we resolve relative targets before creating.
 /// Falls back to `symlink_dir` if junction creation fails.
 ///
-/// On Unix, creates a standard symlink (relative paths work fine).
-/// Lexically simplify `..` and `.` segments in a path, without
-/// touching the filesystem. Used by [`create_symlink_or_junction`]
-/// on Windows so junction creation receives a canonical target string.
-///
-/// Phase 61.1: needed because the Tier 2 relayout produces relative
-/// targets like `../.lpm/wrappers/...` that, when joined with a
-/// canonicalized link parent (`\\?\C:\proj\node_modules\`), embed an
-/// unresolved `..` segment. Plain `Path::join` doesn't simplify, and
-/// `\\?\`-prefixed paths under Windows extended-length semantics
-/// don't get implicit `..` resolution from the kernel — `mklink /J`
-/// would target a path containing the literal `..`.
-///
-/// Pure lexical normalization: `a/b/../c` → `a/c`, `./a` → `a`,
-/// `..` segments at the start are preserved (we have no parent to
-/// pop into). Doesn't touch leading `RootDir` / `Prefix` components.
-#[cfg(windows)]
-fn lexically_clean(p: &Path) -> PathBuf {
-    let mut out = PathBuf::new();
-    for component in p.components() {
-        match component {
-            Component::ParentDir => {
-                // Only pop a normal name; don't pop past root or
-                // discard a leading `..` (which would change semantics
-                // for relative paths). A trailing `..` after a normal
-                // pops cleanly; a `..` after another `..` accumulates.
-                let last_is_normal =
-                    matches!(out.components().next_back(), Some(Component::Normal(_)));
-                if last_is_normal {
-                    out.pop();
-                } else {
-                    out.push("..");
-                }
-            }
-            Component::CurDir => {
-                // Drop redundant `.` segments.
-            }
-            other => out.push(other.as_os_str()),
-        }
-    }
-    out
-}
-
-#[cfg(windows)]
-fn create_symlink_or_junction(target: &Path, link: &Path) -> std::io::Result<()> {
-    // Try symlink_dir first — works without admin on many modern Windows setups
-    // (Developer Mode, or appropriate policy settings).
-    if std::os::windows::fs::symlink_dir(target, link).is_ok() {
-        return Ok(());
-    }
-
-    // Junctions require absolute target paths. If target is relative,
-    // resolve it relative to the link's parent directory, then
-    // lexically clean any `..` segments from the join — `\\?\`-prefixed
-    // paths handed to `mklink /J` don't get implicit `..` resolution
-    // from the kernel, so an unresolved `..` segment in the target
-    // would silently produce a broken junction.
-    let abs_target = if target.is_relative() {
-        let base = link.parent().unwrap_or(Path::new("."));
-        let joined = match base.canonicalize() {
-            Ok(abs_base) => abs_base.join(target),
-            Err(_) => base.join(target),
-        };
-        lexically_clean(&joined)
-    } else {
-        target.to_path_buf()
-    };
-
-    // Validate paths before passing to cmd to prevent command injection.
-    let link_str = link.to_string_lossy();
-    let target_str = abs_target.to_string_lossy();
-    if let Err(reason) = validate_cmd_path(&link_str) {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            format!("refusing junction: link path {reason}"),
-        ));
-    }
-    if let Err(reason) = validate_cmd_path(&target_str) {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            format!("refusing junction: target path {reason}"),
-        ));
-    }
-
-    // Fallback: junction via cmd /c mklink /J (no admin required)
-    let status = std::process::Command::new("cmd")
-        .args(["/c", "mklink", "/J", &link_str, &target_str])
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status();
-
-    match status {
-        Ok(s) if s.success() => Ok(()),
-        _ => Err(std::io::Error::new(
-            std::io::ErrorKind::Other,
-            "failed to create junction or symlink",
-        )),
-    }
-}
-
-#[cfg(unix)]
-fn create_symlink_or_junction(target: &Path, link: &Path) -> std::io::Result<()> {
-    std::os::unix::fs::symlink(target, link)
-}
+// Phase 66 Phase 4a follow-up: directory-link creation moved to
+// `lpm_common::symlink::create_dir_symlink_or_junction` so lpm-store
+// v2 shares the same Windows symlink-then-junction fallback (`mklink
+// /J`) — duplicating it would have left v2 regressing on Windows
+// setups without Developer Mode. Re-imported under the legacy local
+// name to keep call sites untouched.
+use lpm_common::symlink::create_dir_symlink_or_junction as create_symlink_or_junction;
 
 /// **Phase 59.1 audit response (post-day-7)** — drives the Phase-1
 /// materialization branch in [`link_one_package`].
