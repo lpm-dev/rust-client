@@ -1505,12 +1505,64 @@ pub fn link_workspace_member(
     Ok(())
 }
 
+/// Walk the consumer chain from `start_idx` upward until we find a
+/// package whose `(name, version)` IS the hoisted-at-root instance for
+/// its name (i.e., `hoisted[pkg.name] == cur_idx`). Returns that
+/// package's name — the **anchor** under which a conflict-version
+/// package should be nested. Returns `None` if no hoisted ancestor
+/// exists in the chain (orphan, cycle, or chain that exits the graph).
+///
+/// **Why this is the right anchor.** In hoisted layout, Node's resolver
+/// for a package P@v at `<anchor>/node_modules/P/` walks up through
+/// `<anchor>/node_modules/` first, then the project root. Sibling-style
+/// placement (P@v directly inside the anchor's node_modules, not nested
+/// further inside the consumer that needs P@v) is npm v3's layout
+/// strategy and is correct because Node walks `node_modules/` directories
+/// upward — finding P@v as a sibling of the consumer, before reaching
+/// the root's conflicting version, satisfies the consumer's `require`.
+///
+/// **Pre-fix bug this resolves.** The old algorithm picked the consumer
+/// by NAME alone (`depended_by: HashMap<(String, String), Vec<String>>`)
+/// and used that name directly as the parent. When the same consumer
+/// name existed at multiple versions (e.g., minimatch@3 hoisted +
+/// minimatch@10 nested), the parent lookup couldn't tell them apart,
+/// so brace-expansion@5 (consumed by minimatch@10) was placed under
+/// `node_modules/minimatch/` — which was minimatch@3's slot. Node's
+/// resolver from any caller of minimatch@3 then found brace-expansion@5
+/// nested there, with the wrong API for v1, and crashed.
+fn find_hoisted_anchor(
+    start_idx: usize,
+    hoisted: &HashMap<String, usize>,
+    packages: &[LinkTarget],
+    depended_by: &HashMap<(String, String), Vec<usize>>,
+) -> Option<String> {
+    let mut cur = start_idx;
+    let mut visited: std::collections::HashSet<usize> = std::collections::HashSet::new();
+    while visited.insert(cur) {
+        let pkg = &packages[cur];
+        // If this package is the hoisted-at-root instance for its name,
+        // we've found the anchor.
+        if hoisted.get(&pkg.name) == Some(&cur) {
+            return Some(pkg.name.clone());
+        }
+        // Otherwise walk up: find a consumer of this package and recurse.
+        // Pick the first consumer (deterministic — packages are processed
+        // in resolver-determined order, so first-encountered is stable).
+        match depended_by.get(&(pkg.name.clone(), pkg.version.clone())) {
+            Some(consumers) if !consumers.is_empty() => cur = consumers[0],
+            _ => return None,
+        }
+    }
+    None // cycle detected
+}
+
 /// Create the npm v3+ style hoisted node_modules layout.
 ///
 /// All packages are placed directly into `node_modules/` (flat). When two packages
 /// need different versions of the same dependency, the direct dependency (or the
-/// first encountered) wins the root position, and the other is nested under its
-/// dependent's `node_modules/`.
+/// first encountered) wins the root position, and the other is nested under a
+/// hoisted ancestor of its consumer (sibling-style nesting — see
+/// [`find_hoisted_anchor`] for the placement rule).
 ///
 /// Layout:
 /// ```text
@@ -1656,20 +1708,40 @@ pub fn link_packages_hoisted(
     //      - Among equal priority, first-come-first-served (stable for determinism).
     //   3. The loser gets nested under one of its dependents.
     let mut hoisted: HashMap<String, usize> = HashMap::with_capacity(packages.len());
-    // (package_index, parent_name) -- packages that must be nested
+    // (package_index, parent_name) -- packages that must be nested.
+    // `parent_name` is the name of a hoisted ancestor under which this
+    // conflict-version is placed (npm v3 sibling-style nesting).
     let mut nested: Vec<(usize, String)> = Vec::new();
 
-    // Build a reverse-dependency map: (package_name, version) -> list of dependent names.
-    // Used to decide where to nest a conflicting package.
-    let mut depended_by: HashMap<(String, String), Vec<String>> = HashMap::new();
-    for pkg in packages {
+    // Reverse-dependency map: dep (name, version) → list of consumer
+    // package indices. **Indices, not names** — when the same name
+    // appears as a consumer at multiple versions (e.g., minimatch@3
+    // consumes brace-expansion@1 AND minimatch@10 consumes
+    // brace-expansion@5), we need to know WHICH instance consumes
+    // which version of the dep. Keying by index instead of name
+    // preserves the (name, version) identity through the lookup chain
+    // — `depended_by[(brace-expansion, 5.0.5)][0]` is minimatch@10's
+    // index, not just "minimatch". The pre-fix code used names and
+    // misplaced brace-expansion@5 under whatever minimatch happened to
+    // be hoisted (v3), which broke ESLint 9's flat-config because
+    // v3 needs brace-expansion@1's API and Node resolved to v5's.
+    let mut depended_by: HashMap<(String, String), Vec<usize>> = HashMap::new();
+    for (idx, pkg) in packages.iter().enumerate() {
         for (dep_name, dep_ver) in &pkg.dependencies {
             depended_by
                 .entry((dep_name.clone(), dep_ver.clone()))
                 .or_default()
-                .push(pkg.name.clone());
+                .push(idx);
         }
     }
+
+    // (package_index_to_nest, consumer_index_or_None) — Phase 1
+    // records this; Phase 1.5 resolves each consumer_index to a
+    // hoisted-ancestor name via `find_hoisted_anchor`. None means
+    // "no consumer found in the graph for this conflict version,"
+    // which can happen for orphan-nested entries; the resolution
+    // step falls back to the conflict name itself in that case.
+    let mut nested_pending: Vec<(usize, Option<usize>)> = Vec::new();
 
     for (idx, pkg) in packages.iter().enumerate() {
         if let Some(&existing_idx) = hoisted.get(&pkg.name) {
@@ -1681,23 +1753,44 @@ pub fn link_packages_hoisted(
             // Version conflict. Direct dep wins root position.
             if pkg.is_direct && !existing.is_direct {
                 // Evict existing to nested, hoist the new one.
-                let parent = depended_by
+                let consumer_idx = depended_by
                     .get(&(existing.name.clone(), existing.version.clone()))
-                    .and_then(|v: &Vec<String>| v.first().cloned())
-                    .unwrap_or_else(|| pkg.name.clone());
-                nested.push((existing_idx, parent));
+                    .and_then(|v: &Vec<usize>| v.first().copied());
+                nested_pending.push((existing_idx, consumer_idx));
                 hoisted.insert(pkg.name.clone(), idx);
             } else {
                 // Keep existing at root, nest the new one.
-                let parent = depended_by
+                let consumer_idx = depended_by
                     .get(&(pkg.name.clone(), pkg.version.clone()))
-                    .and_then(|v: &Vec<String>| v.first().cloned())
-                    .unwrap_or_else(|| existing.name.clone());
-                nested.push((idx, parent));
+                    .and_then(|v: &Vec<usize>| v.first().copied());
+                nested_pending.push((idx, consumer_idx));
             }
         } else {
             hoisted.insert(pkg.name.clone(), idx);
         }
+    }
+
+    // Phase 1.5: resolve each pending nested entry's anchor.
+    //
+    // For a conflict-versioned package P@v that won't be hoisted,
+    // find a "hoisted ancestor" by walking from one of its consumers
+    // up the consumer chain until we hit a package whose `(name,
+    // version)` IS the hoisted instance for that name. Place P@v
+    // under that ancestor's name in node_modules — sibling-style
+    // (npm v3 layout: `node_modules/<anchor>/node_modules/P/`). This
+    // is correct because Node's resolver from P@v's location walks
+    // up through `<anchor>/node_modules/` and finds P@v there
+    // before reaching the root's conflicting version.
+    //
+    // If no hoisted ancestor exists in the chain (orphan, cycle, or
+    // graph error), fall back to the conflict's own name — same as
+    // the pre-fix behavior, which Phase 3's `hoisted.contains_key`
+    // gate handles correctly via `hoisted_nested_root()`.
+    for (idx, consumer_idx) in nested_pending {
+        let parent = consumer_idx
+            .and_then(|c_idx| find_hoisted_anchor(c_idx, &hoisted, packages, &depended_by))
+            .unwrap_or_else(|| packages[idx].name.clone());
+        nested.push((idx, parent));
     }
 
     // Build the desired layout snapshot: name → "name@version" for both hoisted
@@ -4076,6 +4169,146 @@ mod tests {
 
         // 4 root + 2 nested = 6
         assert_eq!(result.linked, 6);
+    }
+
+    /// Regression test for the conflict-nesting bug found in the
+    /// 2026-05-07 hoisted-mode compatibility audit (eslint-flat-config
+    /// fixture). Pre-fix, when two conflict-versioned packages had
+    /// different consumers that were themselves at different versions,
+    /// the algorithm misplaced the deeper conflict under whichever
+    /// hoisted package shared the consumer's name — which was the
+    /// **wrong** consumer instance.
+    ///
+    /// Setup mirrors the real eslint failure mode in miniature:
+    /// - `anchor` (direct, hoisted) → depends on `consumer@10`
+    /// - `consumer@3` (transitive, hoisted) → depends on `dep@1`
+    /// - `dep@1` (hoisted)
+    /// - `consumer@10` (transitive, nested under `anchor`) → depends on `dep@5`
+    /// - `dep@5` (transitive, must nest under **anchor**, NOT under hoisted `consumer@3`)
+    ///
+    /// Pre-fix lpm placed `dep@5` at `node_modules/consumer/node_modules/dep`
+    /// (under `consumer@3`!), which broke Node resolution because
+    /// `consumer@3` would `require('dep')` and find v5 first instead of
+    /// the v1 it actually needs. Post-fix, `dep@5` lands at
+    /// `node_modules/anchor/node_modules/dep` — sibling to `consumer@10`,
+    /// which is where Node's resolver finds it from `consumer@10`'s
+    /// position when walking up.
+    #[test]
+    fn hoisted_mode_nests_conflict_under_consumer_anchor_not_same_named_root() {
+        let store_dir = tempfile::tempdir().unwrap();
+        let project_dir = tempfile::tempdir().unwrap();
+
+        let anchor_store = create_fake_store_package(store_dir.path(), "anchor");
+        let consumer_v3_store = create_fake_store_package(store_dir.path(), "consumer-v3");
+        let consumer_v10_store = create_fake_store_package(store_dir.path(), "consumer-v10");
+        let dep_v1_store = create_fake_store_package(store_dir.path(), "dep-v1");
+        let dep_v5_store = create_fake_store_package(store_dir.path(), "dep-v5");
+
+        let packages = vec![
+            // anchor (direct) → consumer@10
+            LinkTarget {
+                name: "anchor".to_string(),
+                version: "1.0.0".to_string(),
+                store_path: anchor_store,
+                dependencies: vec![("consumer".to_string(), "10.0.0".to_string())],
+                aliases: HashMap::new(),
+                is_direct: true,
+                root_link_names: None,
+                wrapper_id: None,
+                materialization: Materialization::CasBacked,
+            },
+            // consumer@3 (transitive, encountered first → hoisted) → dep@1
+            LinkTarget {
+                name: "consumer".to_string(),
+                version: "3.0.0".to_string(),
+                store_path: consumer_v3_store,
+                dependencies: vec![("dep".to_string(), "1.0.0".to_string())],
+                aliases: HashMap::new(),
+                is_direct: false,
+                root_link_names: None,
+                wrapper_id: None,
+                materialization: Materialization::CasBacked,
+            },
+            // dep@1 (transitive, hoisted)
+            LinkTarget {
+                name: "dep".to_string(),
+                version: "1.0.0".to_string(),
+                store_path: dep_v1_store,
+                dependencies: vec![],
+                aliases: HashMap::new(),
+                is_direct: false,
+                root_link_names: None,
+                wrapper_id: None,
+                materialization: Materialization::CasBacked,
+            },
+            // some-other-direct (forces consumer@3 to come before consumer@10
+            // in declaration order — this test would be vacuous without
+            // ordering control). Actually we rely on packages-vec order.
+            LinkTarget {
+                name: "consumer".to_string(),
+                version: "10.0.0".to_string(),
+                store_path: consumer_v10_store,
+                dependencies: vec![("dep".to_string(), "5.0.0".to_string())],
+                aliases: HashMap::new(),
+                is_direct: false,
+                root_link_names: None,
+                wrapper_id: None,
+                materialization: Materialization::CasBacked,
+            },
+            // dep@5 (transitive, must nest under anchor)
+            LinkTarget {
+                name: "dep".to_string(),
+                version: "5.0.0".to_string(),
+                store_path: dep_v5_store,
+                dependencies: vec![],
+                aliases: HashMap::new(),
+                is_direct: false,
+                root_link_names: None,
+                wrapper_id: None,
+                materialization: Materialization::CasBacked,
+            },
+        ];
+
+        let result = link_packages_hoisted(project_dir.path(), &packages, false, None).unwrap();
+
+        // Hoisted at root: anchor, consumer@3, dep@1.
+        assert!(project_dir.path().join("node_modules/anchor").exists());
+        assert!(project_dir.path().join("node_modules/consumer").exists());
+        assert!(project_dir.path().join("node_modules/dep").exists());
+
+        // consumer@10 nests under anchor (its consumer is anchor, hoisted).
+        assert!(
+            project_dir
+                .path()
+                .join("node_modules/anchor/node_modules/consumer")
+                .exists(),
+            "consumer@10 should nest under anchor, its hoisted consumer"
+        );
+
+        // **The bug fix.** dep@5 must nest under `anchor`, NOT under
+        // `consumer` (which is consumer@3's slot). Pre-fix, the algorithm
+        // would have placed dep@5 at node_modules/consumer/node_modules/dep,
+        // which is WRONG because consumer@3 needs dep@1, not dep@5.
+        assert!(
+            project_dir
+                .path()
+                .join("node_modules/anchor/node_modules/dep")
+                .exists(),
+            "dep@5 MUST nest under anchor (consumer@10's hoisted ancestor), \
+             not under consumer (which is consumer@3's slot — would shadow dep@1 \
+             from consumer@3's perspective and break Node resolution)"
+        );
+        assert!(
+            !project_dir
+                .path()
+                .join("node_modules/consumer/node_modules/dep")
+                .exists(),
+            "dep@5 must NOT be nested under consumer@3 (the pre-fix bug)"
+        );
+
+        // Total linked = anchor + consumer@3 + dep@1 (3 hoisted) +
+        // consumer@10 + dep@5 (2 nested) = 5.
+        assert_eq!(result.linked, 5);
     }
 
     #[test]
