@@ -1,0 +1,13 @@
+{
+  "fixture": "dogfood/realworld-app",
+  "mode": "isolated",
+  "timestamp": "20260507-133602",
+  "install_exit": 0,
+  "install_ms": 727,
+  "top_level_dep_count": 21,
+  "require_pass": 20,
+  "require_fail": 0,
+  "smoke_exit": 0,
+  "verdict": "PASS",
+  "fail_reason": ""
+}

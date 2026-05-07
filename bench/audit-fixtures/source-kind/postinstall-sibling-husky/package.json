@@ -1,0 +1,12 @@
+{
+	"name": "audit-fixture-postinstall-sibling-husky",
+	"version": "1.0.0",
+	"private": true,
+	"_comment": "Phase 2 hoisted compat audit. Postinstall-sibling-mutation fixture. husky is the canonical example of a package whose postinstall writes OUTSIDE its own directory — specifically, it creates `.husky/` at the project root (a sibling of node_modules). lpm's lifecycle script sandbox has to allow this write OR the install can't complete. Same way under both linker modes if the sandbox config is correct.",
+	"dependencies": {
+		"husky": "^9.1.0"
+	},
+	"scripts": {
+		"prepare": "husky"
+	}
+}

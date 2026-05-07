@@ -1,0 +1,13 @@
+{
+  "fixture": "native/prisma-codegen",
+  "mode": "isolated",
+  "timestamp": "20260507-132829",
+  "install_exit": 0,
+  "install_ms": 2147,
+  "top_level_dep_count": 3,
+  "require_pass": 1,
+  "require_fail": 1,
+  "smoke_exit": 0,
+  "verdict": "FAIL",
+  "fail_reason": "1 of 2 requires failed"
+}

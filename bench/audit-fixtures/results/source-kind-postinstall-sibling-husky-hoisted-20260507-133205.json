@@ -1,0 +1,13 @@
+{
+  "fixture": "source-kind/postinstall-sibling-husky",
+  "mode": "hoisted",
+  "timestamp": "20260507-133205",
+  "install_exit": 0,
+  "install_ms": 136,
+  "top_level_dep_count": 2,
+  "require_pass": 1,
+  "require_fail": 0,
+  "smoke_exit": 0,
+  "verdict": "PASS",
+  "fail_reason": ""
+}

@@ -1,0 +1,28 @@
+{
+	"name": "audit-fixture-realworld-app",
+	"version": "1.0.0",
+	"private": true,
+	"_comment": "Phase 2 hoisted compat audit. Dogfood/large-graph fixture. Mirrors the bench/fixture-large dep list (21 direct deps from the 'webpack-adjacent mix') so the audit covers a realistically-sized real-world dep graph — ~266 transitive packages. Bench harness times this graph; this fixture verifies CORRECTNESS on it (every direct dep loads, smoke exercises a handful of common code paths). The bench and the audit reading the same dep set is intentional: any regression that fails the audit but slips the bench is a correctness gap.",
+	"dependencies": {
+		"lodash": "^4.17.21",
+		"axios": "^1.7.0",
+		"express": "^4.21.0",
+		"zod": "^3.24.0",
+		"typescript": "^5.7.0",
+		"eslint": "^9.17.0",
+		"dayjs": "^1.11.13",
+		"uuid": "^11.1.0",
+		"semver": "^7.7.1",
+		"commander": "^13.1.0",
+		"yaml": "^2.7.1",
+		"react": "^18.3.0",
+		"react-dom": "^18.3.0",
+		"dotenv": "^16.5.0",
+		"chalk": "^5.4.1",
+		"ora": "^8.2.0",
+		"pino": "^9.6.0",
+		"undici": "^7.8.0",
+		"ws": "^8.18.0",
+		"nanoid": "^5.1.5"
+	}
+}

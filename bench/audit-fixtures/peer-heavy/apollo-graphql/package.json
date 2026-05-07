@@ -1,0 +1,10 @@
+{
+	"name": "audit-fixture-apollo-graphql",
+	"version": "1.0.0",
+	"private": true,
+	"_comment": "Phase 2 hoisted compat audit. Peer-heavy fixture: Apollo Client + GraphQL. Apollo's modular packages (`@apollo/client`, `graphql`) have a tight peer-dep coupling — the GraphQL package version must match what `@apollo/client` was built against. A hoisting bug that nests a wrong graphql version under apollo would break query parsing at runtime.",
+	"dependencies": {
+		"@apollo/client": "^3.11.0",
+		"graphql": "^16.9.0"
+	}
+}

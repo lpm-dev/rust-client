@@ -1,0 +1,11 @@
+{
+	"name": "audit-fixture-vue-3-ecosystem",
+	"version": "1.0.0",
+	"private": true,
+	"_comment": "Phase 2 hoisted compat audit. Peer-heavy fixture: Vue 3 ecosystem analogue to React's react-ssr fixture. Vue + Pinia (state) + vue-router. Pinia and vue-router both declare vue as a peer dep — same instance-invariant risk as ReactDOM/React, just on the other major framework. The Vue 3 reactive system is module-scoped (similar to React's hooks dispatcher), so cross-instance use crashes loudly.",
+	"dependencies": {
+		"vue": "^3.5.0",
+		"pinia": "^2.3.0",
+		"vue-router": "^4.5.0"
+	}
+}

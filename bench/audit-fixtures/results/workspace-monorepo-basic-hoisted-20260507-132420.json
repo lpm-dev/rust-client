@@ -1,0 +1,13 @@
+{
+  "fixture": "workspace/monorepo-basic",
+  "mode": "hoisted",
+  "timestamp": "20260507-132420",
+  "install_exit": 0,
+  "install_ms": 21,
+  "top_level_dep_count": 4,
+  "require_pass": 3,
+  "require_fail": 0,
+  "smoke_exit": 0,
+  "verdict": "PASS",
+  "fail_reason": ""
+}

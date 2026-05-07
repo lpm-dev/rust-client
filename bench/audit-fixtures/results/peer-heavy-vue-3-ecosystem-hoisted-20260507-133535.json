@@ -1,0 +1,13 @@
+{
+  "fixture": "peer-heavy/vue-3-ecosystem",
+  "mode": "hoisted",
+  "timestamp": "20260507-133535",
+  "install_exit": 0,
+  "install_ms": 415,
+  "top_level_dep_count": 16,
+  "require_pass": 3,
+  "require_fail": 0,
+  "smoke_exit": 0,
+  "verdict": "PASS",
+  "fail_reason": ""
+}
