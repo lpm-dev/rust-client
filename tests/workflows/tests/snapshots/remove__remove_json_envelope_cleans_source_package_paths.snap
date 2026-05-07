@@ -1,0 +1,13 @@
+---
+source: tests/workflows/tests/remove.rs
+assertion_line: 37
+expression: envelope
+---
+{
+  "success": true,
+  "package": "owner.widget",
+  "removed": [
+    ".lpm/skills/owner.widget/",
+    "components/widget/"
+  ]
+}

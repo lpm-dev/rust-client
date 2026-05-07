@@ -1,0 +1,11 @@
+---
+source: tests/workflows/tests/init.rs
+assertion_line: 44
+expression: envelope
+---
+{
+  "success": true,
+  "name": "@lpm.dev/neo.package",
+  "version": "1.0.0",
+  "path": "[PACKAGE_JSON]"
+}

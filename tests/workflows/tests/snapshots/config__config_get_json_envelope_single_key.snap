@@ -1,0 +1,9 @@
+---
+source: tests/workflows/tests/config.rs
+assertion_line: 67
+expression: envelope
+---
+{
+  "success": true,
+  "registry": "https://registry.example.test"
+}

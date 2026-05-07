@@ -49,12 +49,12 @@ fn coverage_audit_baseline_shape_matches_phase65_matrix() {
         .filter(|surface| !surface.has_any_coverage())
         .count();
     assert_eq!(
-        covered, 112,
-        "Phase 65 baseline should have 112 covered rows"
+        covered, 135,
+        "Phase 65 baseline should have 135 covered rows"
     );
     assert_eq!(
-        uncovered, 24,
-        "Phase 65 baseline should have 24 uncovered rows"
+        uncovered, 1,
+        "Phase 65 baseline should have 1 uncovered row"
     );
 }
 
@@ -151,6 +151,7 @@ fn supplemental_references(surface_id: u16) -> &'static [&'static str] {
         89 | 90 => &["crates/lpm-cli/src/commands/tools.rs"],
         98 | 99 | 100 | 101 | 103 | 106 => &["crates/lpm-cli/src/commands/env.rs"],
         111 => &["crates/lpm-cli/src/commands/dev.rs"],
+        118 => &["tests/workflows/tests/ports.rs"],
         120 | 121 => &["crates/lpm-cli/src/commands/tunnel.rs"],
         125 => &[
             "crates/lpm-cli/src/commands/migrate_overrides.rs",

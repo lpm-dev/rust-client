@@ -1,0 +1,10 @@
+---
+source: tests/workflows/tests/config.rs
+assertion_line: 133
+expression: envelope
+---
+{
+  "color": "always",
+  "registry": "https://registry.example.test",
+  "success": true
+}

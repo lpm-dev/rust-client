@@ -9,6 +9,39 @@ use std::process::Command;
 
 #[cfg(any(target_os = "macos", target_os = "windows"))]
 const CA_COMMON_NAME: &str = "LPM Local Development CA";
+const TEST_TRUST_STORE_DIR_ENV: &str = "LPM_CERT_TEST_TRUST_STORE_DIR";
+
+fn test_trust_store_path() -> Option<std::path::PathBuf> {
+    std::env::var_os(TEST_TRUST_STORE_DIR_ENV)
+        .map(std::path::PathBuf::from)
+        .map(|dir| dir.join("lpm-local-ca.pem"))
+}
+
+fn install_ca_test(ca_cert_path: &Path, trust_store_path: &Path) -> Result<(), LpmError> {
+    if let Some(parent) = trust_store_path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| LpmError::Cert(format!("failed to create test trust store: {e}")))?;
+    }
+
+    std::fs::copy(ca_cert_path, trust_store_path)
+        .map_err(|e| LpmError::Cert(format!("failed to install CA to test trust store: {e}")))?;
+
+    Ok(())
+}
+
+fn is_ca_installed_test(trust_store_path: &Path) -> bool {
+    trust_store_path.exists()
+}
+
+fn uninstall_ca_test(trust_store_path: &Path) -> Result<(), LpmError> {
+    if trust_store_path.exists() {
+        std::fs::remove_file(trust_store_path).map_err(|e| {
+            LpmError::Cert(format!("failed to remove CA from test trust store: {e}"))
+        })?;
+    }
+
+    Ok(())
+}
 
 /// Install the CA certificate into the system trust store.
 ///
@@ -17,6 +50,10 @@ const CA_COMMON_NAME: &str = "LPM Local Development CA";
 /// - Linux: copies to ca-certificates dir + runs update-ca-certificates (needs sudo)
 /// - Windows: uses certutil to add to Root store (UAC prompt)
 pub fn install_ca(ca_cert_path: &Path) -> Result<(), LpmError> {
+    if let Some(trust_store_path) = test_trust_store_path() {
+        return install_ca_test(ca_cert_path, &trust_store_path);
+    }
+
     let path_str = ca_cert_path.to_string_lossy();
 
     #[cfg(target_os = "macos")]
@@ -46,6 +83,10 @@ pub fn install_ca(ca_cert_path: &Path) -> Result<(), LpmError> {
 
 /// Check if the LPM CA is currently installed in the system trust store.
 pub fn is_ca_installed(_ca_cert_path: &Path) -> Result<bool, LpmError> {
+    if let Some(trust_store_path) = test_trust_store_path() {
+        return Ok(is_ca_installed_test(&trust_store_path));
+    }
+
     #[cfg(target_os = "macos")]
     {
         is_ca_installed_macos()
@@ -70,6 +111,10 @@ pub fn is_ca_installed(_ca_cert_path: &Path) -> Result<bool, LpmError> {
 
 /// Remove the LPM CA from the system trust store.
 pub fn uninstall_ca() -> Result<(), LpmError> {
+    if let Some(trust_store_path) = test_trust_store_path() {
+        return uninstall_ca_test(&trust_store_path);
+    }
+
     #[cfg(target_os = "macos")]
     {
         uninstall_ca_macos()

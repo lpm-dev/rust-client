@@ -1,0 +1,12 @@
+---
+source: tests/workflows/tests/cert.rs
+assertion_line: 172
+expression: envelope
+---
+{
+  "success": true,
+  "cert_path": "[CERT_PATH]",
+  "key_path": "[KEY_PATH]",
+  "ca_freshly_installed": false,
+  "cert_freshly_generated": true
+}
