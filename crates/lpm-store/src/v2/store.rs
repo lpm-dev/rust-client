@@ -14,6 +14,7 @@ use std::path::{Path, PathBuf};
 use lpm_common::integrity::{HashAlgorithm, Integrity};
 use lpm_common::{LpmError, LpmRoot};
 
+use crate::StageTimings;
 use crate::v2::graph_key::GraphKey;
 use crate::v2::link_meta::{LinkMeta, LinkMetaDep, LinkMetaPlatform};
 
@@ -209,21 +210,45 @@ impl Store {
     }
 
     /// Extract the supplied tarball bytes into
-    /// `objects/<algo>-<hex>/`. Idempotent: returns the existing object
-    /// dir if it's already populated.
+    /// `objects/<algo>-<hex>/`, run behavioral security analysis, write
+    /// the cache file, and atomically rename into place. Idempotent:
+    /// returns the existing object dir if it's already populated.
     ///
     /// Atomic via the standard `dir.with_extension(tmp.<pid>.<tid>)` →
-    /// `rename` pattern (mirrors v1's `store_package_into` to keep the
-    /// failure-recovery story consistent).
+    /// `rename` pattern. `.integrity` and `.lpm-security.json` are
+    /// staged inside the tmp dir before the rename, so the published
+    /// entry is observable only with both files present.
     ///
-    /// **Note:** Phase 4a ships extraction into `objects/<sri>/` only.
-    /// Behavioral security analysis (`.lpm-security.json` from
-    /// `lpm-security::behavioral`) is intentionally NOT run here — Phase
-    /// 4b will decide whether the analysis lives next to the object
-    /// (current v1 placement) or next to each link entry. Either way
-    /// the question doesn't gate Phase 4a's primitives.
+    /// **Phase 4b decision (2026-05-07):** behavioral security analysis
+    /// lives next to the OBJECT (matches v1's placement at
+    /// `<HOME>/.lpm/store/v1/<pkg>/<version>/.lpm-security.json`), not
+    /// next to each link entry. The analysis is a property of the
+    /// content bytes; link entries with the same `source_sri` share
+    /// the same analysis result, so duplicating it per link entry
+    /// would be redundant.
+    ///
+    /// **Perf note (Phase 4b):** v2 runs the post-extract directory
+    /// walker (`analyze_package`), matching v1's NON-streaming
+    /// `store_at_dir` path. v1's streaming path uses the fused
+    /// extractor+analyzer (lib.rs:604-613) which overlaps the extract
+    /// and scan phases. A v2 streaming variant is a Phase 4d/4f
+    /// optimization before the default flip.
     pub fn extract_object(&self, sri: &str, tarball_data: &[u8]) -> Result<PathBuf, LpmError> {
+        Ok(self.extract_object_with_timings(sri, tarball_data)?.0)
+    }
+
+    /// Same as [`Self::extract_object`] plus a [`StageTimings`]
+    /// breakdown. Used by the install pipeline so `lpm install --json`
+    /// keeps emitting an extract / security / finalize split under v2
+    /// mode that's shape-compatible with the v1 telemetry. On the
+    /// store-hit fast path every field is zero.
+    pub fn extract_object_with_timings(
+        &self,
+        sri: &str,
+        tarball_data: &[u8],
+    ) -> Result<(PathBuf, StageTimings), LpmError> {
         let object_dir = self.paths.object_dir(sri)?;
+        let mut timings = StageTimings::default();
 
         // Mirrors v1's `store_at_dir` recovery: a leftover `objects/<sri>/`
         // from a crashed extract (no `.integrity`, no `package.json`) is
@@ -237,7 +262,7 @@ impl Store {
                     target = %object_dir.display(),
                     "v2 store: object hit"
                 );
-                return Ok(object_dir);
+                return Ok((object_dir, timings));
             }
 
             tracing::warn!(
@@ -262,16 +287,35 @@ impl Store {
             let _ = std::fs::remove_dir_all(&tmp_dir);
         }
 
+        let extract_start = std::time::Instant::now();
         if let Err(error) = lpm_extractor::extract_tarball(tarball_data, &tmp_dir) {
             let _ = std::fs::remove_dir_all(&tmp_dir);
             return Err(error);
         }
+        timings.extract_ms = extract_start.elapsed().as_millis();
+
+        // Behavioral security analysis — same shape as v1's
+        // non-streaming `store_at_dir` path (lib.rs:348-357). Done
+        // BEFORE the atomic rename so the cache file is part of the
+        // atomically-published state. Analysis failures are
+        // non-fatal: warn and continue (subsequent installs will
+        // retry).
+        let security_start = std::time::Instant::now();
+        let analysis = lpm_security::behavioral::analyze_package(&tmp_dir);
+        if let Err(e) = lpm_security::behavioral::write_cached_analysis(&tmp_dir, &analysis) {
+            tracing::warn!(
+                target = %tmp_dir.display(),
+                "v2 store: failed to write .lpm-security.json: {e}"
+            );
+        }
+        timings.security_ms = security_start.elapsed().as_millis();
 
         // Persist the SRI alongside the object bytes for
         // post-extraction integrity verification — same `.integrity`
         // file as v1 so `lpm store verify --deep` keeps working in
         // mixed-v1/v2 environments. Also load-bearing for
         // [`is_complete_object_dir`]'s incompleteness probe.
+        let finalize_start = std::time::Instant::now();
         if let Err(e) = std::fs::write(tmp_dir.join(".integrity"), sri) {
             let _ = std::fs::remove_dir_all(&tmp_dir);
             return Err(LpmError::Store(format!(
@@ -279,13 +323,13 @@ impl Store {
             )));
         }
 
-        match std::fs::rename(&tmp_dir, &object_dir) {
-            Ok(()) => Ok(object_dir),
+        let result = match std::fs::rename(&tmp_dir, &object_dir) {
+            Ok(()) => Ok(object_dir.clone()),
             Err(_) if is_complete_object_dir(&object_dir) => {
                 // Concurrent install populated the same object first —
                 // discard our stage and use theirs.
                 let _ = std::fs::remove_dir_all(&tmp_dir);
-                Ok(object_dir)
+                Ok(object_dir.clone())
             }
             Err(e) => {
                 let _ = std::fs::remove_dir_all(&tmp_dir);
@@ -293,7 +337,50 @@ impl Store {
                     "failed to atomically install v2 object: {e}"
                 )))
             }
+        };
+        timings.finalize_ms = finalize_start.elapsed().as_millis();
+
+        result.map(|dir| (dir, timings))
+    }
+
+    /// Extract from a buffered byte slice when the SRI isn't known
+    /// upfront. Hashes the bytes (SHA-512), verifies against
+    /// `expected_integrity` if provided, then delegates to
+    /// [`Self::extract_object_with_timings`].
+    ///
+    /// This is the install pipeline's v2 entry point: it pairs with
+    /// the post-W6a flow that buffers `response.bytes()` into memory
+    /// before extracting (the permit is released between download
+    /// and extract, so the buffer doesn't pin a network slot).
+    ///
+    /// `expected_integrity` is the registry-supplied SRI. If `Some`
+    /// and starts with `sha512-`, mismatch returns
+    /// [`LpmError::IntegrityMismatch`]. Non-sha512 expected values
+    /// are logged + trusted (matches v1's
+    /// `stream_and_store_package` policy at lib.rs:644-658).
+    pub fn extract_object_from_bytes(
+        &self,
+        tarball_data: &[u8],
+        expected_integrity: Option<&str>,
+    ) -> Result<(PathBuf, String, StageTimings), LpmError> {
+        let computed_sri = crate::compute_sri_hash(tarball_data);
+
+        if let Some(expected) = expected_integrity {
+            if expected.starts_with("sha512-") && expected != computed_sri {
+                return Err(LpmError::IntegrityMismatch {
+                    expected: expected.to_string(),
+                    actual: computed_sri,
+                });
+            }
+            if !expected.starts_with("sha512-") {
+                tracing::warn!(
+                    "v2 store: non-sha512 expected integrity ({expected}); trusting computed {computed_sri}"
+                );
+            }
         }
+
+        let (object_dir, timings) = self.extract_object_with_timings(&computed_sri, tarball_data)?;
+        Ok((object_dir, computed_sri, timings))
     }
 
     /// Populate `links/<graph-key>/` with the package bytes, sibling
@@ -1275,6 +1362,127 @@ mod tests {
             version: "18.3.0".into(),
         }];
         let _ = GraphKey::derive(&input);
+    }
+
+    /// Build a small gzip+tar tarball with `package/<path>` entries —
+    /// matches the npm-tarball convention. Used by the Phase 4b
+    /// extract-from-bytes tests below.
+    fn build_test_tarball(files: &[(&str, &[u8])]) -> Vec<u8> {
+        use flate2::Compression;
+        use flate2::write::GzEncoder;
+        use std::io::Write;
+
+        let mut tar_data = Vec::new();
+        {
+            let mut builder = tar::Builder::new(&mut tar_data);
+            for (path, content) in files {
+                let mut header = tar::Header::new_gnu();
+                header.set_size(content.len() as u64);
+                header.set_mode(0o644);
+                header.set_cksum();
+                builder
+                    .append_data(&mut header, format!("package/{path}"), &content[..])
+                    .unwrap();
+            }
+            builder.finish().unwrap();
+        }
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(&tar_data).unwrap();
+        encoder.finish().unwrap()
+    }
+
+    #[test]
+    fn extract_object_from_bytes_populates_object_dir() {
+        // Phase 4b: end-to-end round trip from raw bytes through SRI
+        // computation, extraction, security analysis, and atomic
+        // rename. Confirms the install pipeline's v2 entry point
+        // produces a complete object dir (package.json + .integrity +
+        // .lpm-security.json all present).
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::at(dir.path());
+        let tarball = build_test_tarball(&[(
+            "package.json",
+            b"{\"name\":\"x\",\"version\":\"1.0.0\"}",
+        )]);
+
+        let (obj_dir, sri, _timings) = store
+            .extract_object_from_bytes(&tarball, None)
+            .unwrap();
+
+        assert!(sri.starts_with("sha512-"));
+        assert!(obj_dir.is_dir());
+        assert!(obj_dir.join("package.json").is_file());
+        assert!(obj_dir.join(".integrity").is_file());
+        // Phase 4b decision: security cache lives next to the object.
+        assert!(
+            obj_dir.join(".lpm-security.json").is_file(),
+            "v2 security analysis must run inside extract_object"
+        );
+    }
+
+    #[test]
+    fn extract_object_from_bytes_verifies_expected_integrity() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::at(dir.path());
+        let tarball = build_test_tarball(&[("package.json", b"{}")]);
+
+        // Wrong expected SRI (sha512 form) → IntegrityMismatch.
+        let bogus = "sha512-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA==";
+        let err = store
+            .extract_object_from_bytes(&tarball, Some(bogus))
+            .unwrap_err();
+        match err {
+            LpmError::IntegrityMismatch { expected, .. } => {
+                assert_eq!(expected, bogus);
+            }
+            other => panic!("expected IntegrityMismatch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn extract_object_from_bytes_accepts_correct_integrity() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::at(dir.path());
+        let tarball = build_test_tarball(&[("package.json", b"{}")]);
+
+        // Compute the SRI ourselves and pass it as expected — the
+        // verification path should accept it.
+        let expected = crate::compute_sri_hash(&tarball);
+        let (_obj_dir, sri, _) = store
+            .extract_object_from_bytes(&tarball, Some(&expected))
+            .unwrap();
+        assert_eq!(sri, expected);
+    }
+
+    #[test]
+    fn extract_object_from_bytes_emits_nonzero_timings_on_first_extract() {
+        // Cold extract should record non-zero extract_ms (security
+        // analysis can short-circuit to zero on a tiny tarball, so
+        // we don't assert on security_ms / finalize_ms — only that
+        // extract_ms reflects real wall-clock work).
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::at(dir.path());
+        let tarball = build_test_tarball(&[(
+            "package.json",
+            b"{\"name\":\"x\",\"version\":\"1.0.0\"}",
+        )]);
+
+        let (_, _, timings) = store
+            .extract_object_from_bytes(&tarball, None)
+            .unwrap();
+        assert!(
+            timings.extract_ms > 0 || timings.finalize_ms > 0,
+            "first extract should record at least extract_ms or finalize_ms wall time"
+        );
+
+        // Hot path (already populated) — re-extract takes the
+        // store-hit short-circuit and emits zero timings.
+        let (_, _, timings_hot) = store
+            .extract_object_from_bytes(&tarball, None)
+            .unwrap();
+        assert_eq!(timings_hot.extract_ms, 0);
+        assert_eq!(timings_hot.security_ms, 0);
+        assert_eq!(timings_hot.finalize_ms, 0);
     }
 
     #[test]

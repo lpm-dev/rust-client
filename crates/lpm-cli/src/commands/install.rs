@@ -3876,6 +3876,32 @@ async fn run_with_options_under_store_lock(
     // handle (cheap Arc-style clone underneath).
     let store = PackageStore::default_location()?;
 
+    // Phase 66 Phase 4b — read the store-version flag once per
+    // install. `LPM_STORE_VERSION=v2` opts in to the virtual-store
+    // pipeline; everything else (unset, "v1", typos) takes the v1
+    // path that's been shipping.
+    //
+    // The v2 store handle is constructed eagerly when the flag is
+    // active, then wrapped in `Arc` so per-package spawn tasks can
+    // capture a cheap clone alongside the v1 `store_ref`. Holding
+    // it as `Option<Arc<…>>` keeps the v1-default code path
+    // allocation-free.
+    let store_version = lpm_store::StoreVersion::from_env();
+    let store_v2_handle: Option<std::sync::Arc<lpm_store::v2::Store>> = if store_version.is_v2() {
+        let lpm_root = lpm_common::LpmRoot::from_env()?;
+        Some(std::sync::Arc::new(lpm_store::v2::Store::from_lpm_root(
+            &lpm_root,
+        )))
+    } else {
+        None
+    };
+    if store_v2_handle.is_some() {
+        tracing::info!(
+            "{}=v2 — install pipeline routing object extracts to ~/.lpm/store/v2/",
+            lpm_store::StoreVersion::ENV_VAR
+        );
+    }
+
     // **Phase 59.0 day-6a (F4 manifest wiring)** — pre-resolve direct
     // tarball-URL deps from the manifest BEFORE the resolver runs.
     // Each tarball-URL dep is downloaded, extracted into the
@@ -4897,6 +4923,10 @@ async fn run_with_options_under_store_lock(
             let sem = semaphore.clone();
             let client = arc_client.clone();
             let store_ref = store.clone();
+            // Phase 66 Phase 4b — clone the Optional v2 handle into the
+            // per-package spawn. `Option::clone` is a Some/None match
+            // and `Arc::clone` is a refcount bump; cheap.
+            let store_v2_ref = store_v2_handle.clone();
             let coord = fetch_coord.clone();
             let overall = overall.clone();
             let force_flag = force;
@@ -5051,14 +5081,23 @@ async fn run_with_options_under_store_lock(
                 // store path is content-addressable by integrity.
                 let is_tarball_source =
                     matches!(p.source_kind(), Ok(lpm_lockfile::Source::Tarball { .. }));
+                let store_v2_arg = store_v2_ref.as_deref();
                 let (computed_sri, task_timings, final_url) = if is_tarball_source {
-                    fetch_and_store_tarball_url(&client, &store_ref, &p, queue_wait_ms, permit)
-                        .await?
+                    fetch_and_store_tarball_url(
+                        &client,
+                        &store_ref,
+                        store_v2_arg,
+                        &p,
+                        queue_wait_ms,
+                        permit,
+                    )
+                    .await?
                 } else if streaming_fetch {
                     fetch_and_store_streaming(
                         &client,
                         &route_table_c,
                         &store_ref,
+                        store_v2_arg,
                         &p,
                         queue_wait_ms,
                         &project_dir_buf,
@@ -5071,6 +5110,7 @@ async fn run_with_options_under_store_lock(
                         &client,
                         &route_table_c,
                         &store_ref,
+                        store_v2_arg,
                         &p,
                         queue_wait_ms,
                         &project_dir_buf,
@@ -8281,6 +8321,9 @@ async fn fetch_and_store_legacy(
     client: &Arc<RegistryClient>,
     route_table: &RouteTable,
     store: &PackageStore,
+    // Phase 66 Phase 4b — see [`fetch_and_store_streaming`] for the
+    // contract. None → v1 (default + every release through Phase 4d).
+    store_v2: Option<&lpm_store::v2::Store>,
     p: &InstallPackage,
     queue_wait_ms: u128,
     project_dir: &Path,
@@ -8430,12 +8473,32 @@ async fn fetch_and_store_legacy(
     }
     let integrity_ms = integrity_start.elapsed().as_millis();
 
-    let (_, stage) = store.store_package_from_file_timed(
-        &p.name,
-        &p.version,
-        downloaded.file.path(),
-        &computed_sri,
-    )?;
+    let stage = if let Some(store_v2) = store_v2 {
+        // Phase 66 Phase 4b — v2 path. Read the on-disk tarball into
+        // memory and route through `extract_object_from_bytes`. The
+        // legacy fetch path's whole point is to spool the download
+        // to a temp file (vs the streaming path's in-memory body), so
+        // we incur the read-to-bytes cost here rather than refactor
+        // the streaming abstraction; the perf delta is bounded by
+        // tarball size which already passed the size limit upstream.
+        let bytes = std::fs::read(downloaded.file.path()).map_err(|e| {
+            LpmError::Registry(format!(
+                "v2 store: failed to re-read downloaded tarball at {}: {e}",
+                downloaded.file.path().display()
+            ))
+        })?;
+        let (_obj_dir, _sri, timings) =
+            store_v2.extract_object_from_bytes(&bytes, p.integrity.as_deref())?;
+        timings
+    } else {
+        let (_, stage) = store.store_package_from_file_timed(
+            &p.name,
+            &p.version,
+            downloaded.file.path(),
+            &computed_sri,
+        )?;
+        stage
+    };
 
     Ok((
         computed_sri,
@@ -8478,6 +8541,9 @@ async fn fetch_and_store_legacy(
 async fn fetch_and_store_tarball_url(
     client: &Arc<RegistryClient>,
     store: &PackageStore,
+    // Phase 66 Phase 4b — see [`fetch_and_store_streaming`] for the
+    // contract. None → v1 (default + every release through Phase 4d).
+    store_v2: Option<&lpm_store::v2::Store>,
     p: &InstallPackage,
     queue_wait_ms: u128,
     permit: tokio::sync::OwnedSemaphorePermit,
@@ -8507,8 +8573,23 @@ async fn fetch_and_store_tarball_url(
     let integrity_ms = 0;
 
     let extract_start = std::time::Instant::now();
-    let _store_path = store.store_tarball_at_cas_path(&computed_sri, &data)?;
-    let extract_ms = extract_start.elapsed().as_millis();
+    let extract_ms = if let Some(store_v2) = store_v2 {
+        // Phase 66 Phase 4b — v2 path. The Source::Tarball case
+        // already has bytes + SRI in hand; route them straight into
+        // `extract_object_from_bytes`. Re-verification through the
+        // expected_integrity arg is a no-op (caller passes the same
+        // SRI download_tarball_with_integrity already produced).
+        let (_obj_dir, _sri, timings) =
+            store_v2.extract_object_from_bytes(&data, Some(&computed_sri))?;
+        // Tarball-URL path's telemetry historically lumps everything
+        // under extract_ms (see comment at the v1 timings construction
+        // below); under v2 we surface the v2 timings' total instead so
+        // the JSON shape stays meaningful.
+        timings.extract_ms + timings.security_ms + timings.finalize_ms
+    } else {
+        let _store_path = store.store_tarball_at_cas_path(&computed_sri, &data)?;
+        extract_start.elapsed().as_millis()
+    };
 
     // Permit released here — extract is done, this task is finished.
     drop(permit);
@@ -8547,6 +8628,11 @@ async fn fetch_and_store_streaming(
     client: &Arc<RegistryClient>,
     route_table: &RouteTable,
     store: &PackageStore,
+    // Phase 66 Phase 4b — when `Some`, the install pipeline is running
+    // under `LPM_STORE_VERSION=v2`. Bytes flow into the v2
+    // `objects/<sri>/` path instead of v1's `<name>@<version>/`. None
+    // → v1 path (today's default + every release through Phase 4d).
+    store_v2: Option<&lpm_store::v2::Store>,
     p: &InstallPackage,
     queue_wait_ms: u128,
     project_dir: &Path,
@@ -8678,21 +8764,40 @@ async fn fetch_and_store_streaming(
     let version = p.version.clone();
     let expected_integrity = p.integrity.clone();
     let store_owned = store.clone();
+    // Phase 66 Phase 4b — capture the Optional v2 handle into the
+    // blocking task. Cloning an `Option<Store>` is cheap (the inner
+    // `Store` derives Clone over a single PathBuf), and `None` keeps
+    // the existing v1 path byte-for-byte.
+    let store_v2_owned = store_v2.cloned();
 
     // Everything below runs on the blocking pool — frees the tokio async
     // workers to keep driving network reads. No download permit is held.
     let extract_start = std::time::Instant::now();
-    let (computed_sri, stage) = tokio::task::spawn_blocking(move || {
-        let cursor = std::io::Cursor::new(body);
-        store_owned
-            .stream_and_store_package(
-                &name,
-                &version,
-                cursor,
-                expected_integrity.as_deref(),
-                lpm_registry::MAX_COMPRESSED_TARBALL_SIZE,
-            )
-            .map(|(_path, sri, timings)| (sri, timings))
+    let (computed_sri, stage) = tokio::task::spawn_blocking(move || -> Result<(String, lpm_store::StageTimings), LpmError> {
+        if let Some(store_v2) = store_v2_owned {
+            // Phase 66 Phase 4b — v2 path. Bytes flow through
+            // `extract_object_from_bytes`: SHA-512 hash → integrity
+            // verify → extract into `objects/<sri>/` → security
+            // analysis → atomic rename. SizeLimit is enforced
+            // upstream by `download_tarball_streaming`'s
+            // Content-Length check (same as the v1 streaming path's
+            // `SizeLimitedReader`), so the buffered `body` is
+            // already bounded.
+            let (_obj_dir, sri, timings) =
+                store_v2.extract_object_from_bytes(&body, expected_integrity.as_deref())?;
+            Ok((sri, timings))
+        } else {
+            let cursor = std::io::Cursor::new(body);
+            store_owned
+                .stream_and_store_package(
+                    &name,
+                    &version,
+                    cursor,
+                    expected_integrity.as_deref(),
+                    lpm_registry::MAX_COMPRESSED_TARBALL_SIZE,
+                )
+                .map(|(_path, sri, timings)| (sri, timings))
+        }
     })
     .await
     .map_err(|e| LpmError::Registry(format!("streaming extract task panicked: {e}")))??;
@@ -13397,7 +13502,7 @@ mod tests {
         let pkg = install_package_for_tarball(&url, None);
 
         let (computed_sri, timings, final_url) =
-            fetch_and_store_tarball_url(&client, &store, &pkg, 0, install_pkg_acquire_permit())
+            fetch_and_store_tarball_url(&client, &store, None, &pkg, 0, install_pkg_acquire_permit())
                 .await
                 .expect("tarball install must succeed");
 
@@ -13440,7 +13545,7 @@ mod tests {
         let pkg = install_package_for_tarball(&url, Some(&expected_sri));
 
         let (computed_sri, _, _) =
-            fetch_and_store_tarball_url(&client, &store, &pkg, 0, install_pkg_acquire_permit())
+            fetch_and_store_tarball_url(&client, &store, None, &pkg, 0, install_pkg_acquire_permit())
                 .await
                 .expect("matching SRI must succeed");
         assert_eq!(computed_sri, expected_sri);
@@ -13476,7 +13581,7 @@ mod tests {
         let pkg = install_package_for_tarball(&url, Some(&wrong_sri));
 
         let result =
-            fetch_and_store_tarball_url(&client, &store, &pkg, 0, install_pkg_acquire_permit())
+            fetch_and_store_tarball_url(&client, &store, None, &pkg, 0, install_pkg_acquire_permit())
                 .await;
 
         assert!(
@@ -13531,7 +13636,7 @@ mod tests {
         let pkg = install_package_for_tarball(&url, None);
 
         let (sri1, _, _) =
-            fetch_and_store_tarball_url(&client, &store, &pkg, 0, install_pkg_acquire_permit())
+            fetch_and_store_tarball_url(&client, &store, None, &pkg, 0, install_pkg_acquire_permit())
                 .await
                 .unwrap();
         let cas_path = store.tarball_store_path(&sri1).unwrap();
@@ -13541,7 +13646,7 @@ mod tests {
             .unwrap();
 
         let (sri2, _, _) =
-            fetch_and_store_tarball_url(&client, &store, &pkg, 0, install_pkg_acquire_permit())
+            fetch_and_store_tarball_url(&client, &store, None, &pkg, 0, install_pkg_acquire_permit())
                 .await
                 .unwrap();
         assert_eq!(sri1, sri2);
@@ -16584,7 +16689,7 @@ mod tests {
         let pkg = install_package_for_tarball(&declared_url, None);
 
         let (computed_sri, _, final_url) =
-            fetch_and_store_tarball_url(&client, &store, &pkg, 0, install_pkg_acquire_permit())
+            fetch_and_store_tarball_url(&client, &store, None, &pkg, 0, install_pkg_acquire_permit())
                 .await
                 .expect("redirect must be followed");
 
