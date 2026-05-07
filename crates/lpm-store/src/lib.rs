@@ -30,6 +30,93 @@ use std::path::{Path, PathBuf};
 // `src/v2/mod.rs` for the on-disk shape and identity model.
 pub mod v2;
 
+/// Phase 66 Phase 4b — store layout version selector.
+///
+/// Threaded through the install pipeline so a single env-var probe
+/// at the top of `lpm install` decides whether the run materializes
+/// to v1 (`<HOME>/.lpm/store/v1/...` + `<project>/.lpm/wrappers/...`)
+/// or v2 (`<HOME>/.lpm/store/v2/{objects,links}/...` with project
+/// `node_modules/<dep>` symlinks pointing into `links/<graph-key>/`).
+///
+/// **Default is v1.** v2 is opt-in via `LPM_STORE_VERSION=v2` for
+/// the entire Phase 4b/4c window. Phase 4d flips the default and
+/// retires the env var.
+///
+/// Read once per install via [`StoreVersion::from_env`] so a single
+/// invocation is internally consistent — flipping the env mid-install
+/// would otherwise produce a half-v1/half-v2 layout.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum StoreVersion {
+    /// Today's default — wrappers under `<project>/.lpm/wrappers/`,
+    /// canonical bytes at `<HOME>/.lpm/store/v1/<pkg>/<version>/`.
+    V1,
+    /// Virtual-store layout — canonical bytes at
+    /// `<HOME>/.lpm/store/v2/objects/<sri>/`, per-context wrappers at
+    /// `<HOME>/.lpm/store/v2/links/<graph-key>/`, project
+    /// `node_modules/<dep>` is a symlink into the link entry.
+    V2,
+}
+
+impl StoreVersion {
+    /// Env var name. Defined as a constant so callers that want to
+    /// log "the user set X" can reference it without re-string-typing.
+    pub const ENV_VAR: &'static str = "LPM_STORE_VERSION";
+
+    /// Read the active store version from `LPM_STORE_VERSION`. Returns
+    /// `V1` when the var is unset, empty, or set to anything other
+    /// than a recognized v2 value.
+    ///
+    /// Recognized v2 values: `v2`, `V2`, `2` (trimmed and lowercased
+    /// for ergonomics — `LPM_STORE_VERSION=2`, `= V2 `, and `=v2` are
+    /// equivalent). Anything else falls back to v1 + a warning trace,
+    /// so a typo doesn't silently activate the dev-only path.
+    pub fn from_env() -> Self {
+        Self::parse(std::env::var(Self::ENV_VAR).ok().as_deref())
+    }
+
+    /// Pure parser for the env-var value. Extracted from
+    /// [`Self::from_env`] so unit tests can exercise the recognized /
+    /// rejected / fallback branches without manipulating process
+    /// environment (which would race other parallel tests).
+    pub fn parse(raw: Option<&str>) -> Self {
+        let Some(raw) = raw else {
+            return Self::V1;
+        };
+        let normalized = raw.trim().to_ascii_lowercase();
+        match normalized.as_str() {
+            "" | "v1" | "1" => Self::V1,
+            "v2" | "2" => Self::V2,
+            other => {
+                tracing::warn!(
+                    "{}={other:?} not recognized; falling back to v1 (valid: v1, v2)",
+                    Self::ENV_VAR
+                );
+                Self::V1
+            }
+        }
+    }
+
+    /// `true` iff this is [`StoreVersion::V2`].
+    pub fn is_v2(self) -> bool {
+        matches!(self, Self::V2)
+    }
+}
+
+impl Default for StoreVersion {
+    fn default() -> Self {
+        Self::V1
+    }
+}
+
+impl std::fmt::Display for StoreVersion {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::V1 => f.write_str("v1"),
+            Self::V2 => f.write_str("v2"),
+        }
+    }
+}
+
 /// Store version for the directory layout.
 const STORE_VERSION: &str = "v1";
 
@@ -2376,5 +2463,66 @@ mod tests {
             .store_local_tarball_at_cas_path(&hex, &tarball)
             .unwrap();
         assert_eq!(path_a, path_b);
+    }
+
+    // ── Phase 66 Phase 4b — StoreVersion env-var parser ─────────
+
+    #[test]
+    fn store_version_default_is_v1() {
+        assert_eq!(StoreVersion::default(), StoreVersion::V1);
+    }
+
+    #[test]
+    fn store_version_parse_unset_is_v1() {
+        assert_eq!(StoreVersion::parse(None), StoreVersion::V1);
+    }
+
+    #[test]
+    fn store_version_parse_recognizes_v1_aliases() {
+        for s in ["", "v1", "V1", "1", "  v1  "] {
+            assert_eq!(
+                StoreVersion::parse(Some(s)),
+                StoreVersion::V1,
+                "input {s:?} should resolve to v1"
+            );
+        }
+    }
+
+    #[test]
+    fn store_version_parse_recognizes_v2_aliases() {
+        for s in ["v2", "V2", "2", "  V2  ", "v2\n"] {
+            assert_eq!(
+                StoreVersion::parse(Some(s)),
+                StoreVersion::V2,
+                "input {s:?} should resolve to v2"
+            );
+        }
+    }
+
+    #[test]
+    fn store_version_parse_unknown_falls_back_to_v1() {
+        // Typos and stray values must NOT activate v2 silently —
+        // dev-only path stays opt-in via exact alias.
+        for s in ["v3", "v2x", "true", "yes", "on", "junk"] {
+            assert_eq!(
+                StoreVersion::parse(Some(s)),
+                StoreVersion::V1,
+                "input {s:?} should fall back to v1"
+            );
+        }
+    }
+
+    #[test]
+    fn store_version_is_v2_predicate() {
+        assert!(StoreVersion::V2.is_v2());
+        assert!(!StoreVersion::V1.is_v2());
+    }
+
+    #[test]
+    fn store_version_display_round_trips_through_parse() {
+        for v in [StoreVersion::V1, StoreVersion::V2] {
+            let rendered = format!("{v}");
+            assert_eq!(StoreVersion::parse(Some(&rendered)), v);
+        }
     }
 }
