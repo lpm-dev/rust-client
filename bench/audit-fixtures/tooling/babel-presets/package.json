@@ -1,0 +1,11 @@
+{
+	"name": "audit-fixture-babel-presets",
+	"version": "1.0.0",
+	"private": true,
+	"_comment": "Phase 2 hoisted compat audit. Tooling fixture: @babel/core + presets. Preset resolution walks node_modules looking for @babel/preset-* packages.",
+	"dependencies": {
+		"@babel/core": "^7.25.0",
+		"@babel/preset-env": "^7.25.0",
+		"@babel/preset-typescript": "^7.25.0"
+	}
+}

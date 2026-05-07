@@ -1,0 +1,11 @@
+{
+	"name": "audit-fixture-rollup-plugins",
+	"version": "1.0.0",
+	"private": true,
+	"_comment": "Phase 2 hoisted compat audit. Tooling fixture: Rollup + node-resolve and commonjs plugins. Plugin loading exercises the resolver-walk-up pattern.",
+	"dependencies": {
+		"rollup": "^4.18.0",
+		"@rollup/plugin-node-resolve": "^15.2.0",
+		"@rollup/plugin-commonjs": "^28.0.0"
+	}
+}

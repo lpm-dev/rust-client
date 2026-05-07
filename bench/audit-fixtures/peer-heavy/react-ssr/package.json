@@ -1,0 +1,10 @@
+{
+	"name": "audit-fixture-react-ssr",
+	"version": "1.0.0",
+	"private": true,
+	"_comment": "Phase 2 hoisted compat audit. Peer-heavy fixture: ReactDOM declares React as a peer dep. Risk: hoisted layout could give ReactDOM a different React module instance than the user's `require('react')`, violating React's 'single instance' invariant at runtime. Smoke test renders a component to string — fails loudly if instances diverge (React's hooks dispatcher is module-scoped).",
+	"dependencies": {
+		"react": "^18.3.0",
+		"react-dom": "^18.3.0"
+	}
+}

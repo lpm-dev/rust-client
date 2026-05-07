@@ -1,0 +1,13 @@
+{
+	"name": "audit-fixture-eslint-flat-config",
+	"version": "1.0.0",
+	"private": true,
+	"_comment": "Phase 2 hoisted compat audit. Tooling fixture. ESLint 9 with flat config + two popular plugins. Risk: ESLint walks node_modules to discover plugins; some plugins import their own peer (eslint-plugin-react-hooks needs eslint as peer). Hoisted layout has plugins at top level — should work. Isolated layout has plugins behind a symlink — also should work. Failure mode would be plugin not finding its peer, or a plugin's transitive dep missing.",
+	"type": "module",
+	"dependencies": {
+		"eslint": "^9.17.0",
+		"@typescript-eslint/eslint-plugin": "^8.18.0",
+		"@typescript-eslint/parser": "^8.18.0",
+		"eslint-plugin-react-hooks": "^5.1.0"
+	}
+}
