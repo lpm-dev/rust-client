@@ -623,6 +623,109 @@ impl Store {
         Ok(None)
     }
 
+    /// **Phase 66 §4 — v1 → v2 cache-hit translation.** When the v1
+    /// store already has the extracted bytes for a `(name, version)`
+    /// at `<HOME>/.lpm/store/v1/<name>/<version>/`, populate the v2
+    /// `objects/<sri>/` directly from those bytes instead of
+    /// re-downloading the tarball.
+    ///
+    /// Idempotent: if the v2 object dir is already complete, no work
+    /// happens. Otherwise the helper recursively copies every file
+    /// from `v1_pkg_dir` into a tmp staging dir, then atomically
+    /// renames into place — same atomicity contract as
+    /// [`Self::extract_object`].
+    ///
+    /// **What gets copied.**
+    /// - All package files at the root of `v1_pkg_dir` (e.g.,
+    ///   `package.json`, `index.js`, `dist/`).
+    /// - The `.integrity` sidecar (rewritten to `sri` for byte-
+    ///   accuracy, since v1 may have a slightly different normalized
+    ///   form).
+    /// - The `.lpm-security.json` cache, if present in `v1_pkg_dir`.
+    ///   Security analysis is content-determined; copying the cache
+    ///   skips the multi-millisecond re-analysis on warm-cache
+    ///   migrations. If absent, the helper re-runs analysis to
+    ///   match `extract_object`'s post-write contract.
+    ///
+    /// **Limitation.** This helper trusts the caller to provide a
+    /// `(v1_pkg_dir, sri)` pair where the SRI matches the extracted
+    /// bytes. The install pipeline derives `sri` from the lockfile
+    /// or from the prior install's recorded integrity; both come
+    /// from the same SHA-512 the v1 extract recorded, so the trust
+    /// is sound under normal flows. A pathological `(v1_pkg_dir,
+    /// wrong_sri)` pair would land bytes at the wrong v2 key, but
+    /// that's an upstream programmer error, not a security boundary
+    /// the helper enforces.
+    pub fn populate_object_from_v1(
+        &self,
+        v1_pkg_dir: &Path,
+        sri: &str,
+    ) -> Result<PathBuf, LpmError> {
+        let object_dir = self.paths.object_dir(sri)?;
+        if object_dir.exists() && is_complete_object_dir(&object_dir) {
+            return Ok(object_dir);
+        }
+        if !v1_pkg_dir.is_dir() {
+            return Err(LpmError::Store(format!(
+                "v1 → v2 translation: source dir {} is not readable",
+                v1_pkg_dir.display()
+            )));
+        }
+        if let Some(parent) = object_dir.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| LpmError::Store(format!("failed to create v2 objects dir: {e}")))?;
+        }
+        let tmp_dir = tmp_sibling(&object_dir);
+        if tmp_dir.exists() {
+            let _ = std::fs::remove_dir_all(&tmp_dir);
+        }
+
+        copy_dir_recursively(v1_pkg_dir, &tmp_dir).map_err(|e| {
+            let _ = std::fs::remove_dir_all(&tmp_dir);
+            LpmError::Store(format!(
+                "v1 → v2 translation: failed to copy {} → {}: {e}",
+                v1_pkg_dir.display(),
+                tmp_dir.display()
+            ))
+        })?;
+
+        // Re-write `.integrity` from the caller-supplied SRI rather
+        // than trusting whatever v1 happened to record — keeps the
+        // v2 object's integrity field byte-equivalent to what
+        // `extract_object` would write for the same SRI.
+        if let Err(e) = std::fs::write(tmp_dir.join(".integrity"), sri) {
+            let _ = std::fs::remove_dir_all(&tmp_dir);
+            return Err(LpmError::Store(format!(
+                "failed to write v2 .integrity during v1 translation: {e}"
+            )));
+        }
+
+        // If v1 didn't ship a security cache (rare, but possible on
+        // a stale or partial v1 entry), re-run analysis so the v2
+        // post-write contract holds.
+        if !tmp_dir.join(".lpm-security.json").is_file() {
+            let analysis = lpm_security::behavioral::analyze_package(&tmp_dir);
+            if let Err(e) = lpm_security::behavioral::write_cached_analysis(&tmp_dir, &analysis) {
+                tracing::warn!("v2 translation: failed to write .lpm-security.json: {e}");
+            }
+        }
+
+        match std::fs::rename(&tmp_dir, &object_dir) {
+            Ok(()) => Ok(object_dir),
+            Err(_) if is_complete_object_dir(&object_dir) => {
+                // Concurrent install completed first — discard ours.
+                let _ = std::fs::remove_dir_all(&tmp_dir);
+                Ok(object_dir)
+            }
+            Err(e) => {
+                let _ = std::fs::remove_dir_all(&tmp_dir);
+                Err(LpmError::Store(format!(
+                    "v1 → v2 translation: failed to atomically install v2 object: {e}"
+                )))
+            }
+        }
+    }
+
     /// Returns `true` iff `path` (after symlink resolution) lives under
     /// this store's `links/` root. Used by `lpm doctor` and `lpm
     /// rebuild` to detect a v2-shaped install — every v2 project-side
@@ -803,6 +906,48 @@ fn tmp_sibling(dir: &Path) -> PathBuf {
     let pid = std::process::id();
     let tid = format!("{:?}", std::thread::current().id());
     dir.with_extension(format!("tmp.{pid}.{tid}"))
+}
+
+/// Recursively copy `src/` to `dst/`. Used by Phase 4d's v1 → v2
+/// cache-hit translation. `std::fs::copy` invokes the kernel's
+/// `copy_file_range(2)` on Linux (CoW reflink on Btrfs/XFS) and
+/// `fcopyfile(2)` on macOS, so the copy is essentially free on
+/// reflink-capable filesystems and bounded by a single tar-extract's
+/// IO cost otherwise. We don't reach for `clonefile()` directly — the
+/// translation runs once per package per machine, never on the hot
+/// install path.
+fn copy_dir_recursively(src: &Path, dst: &Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(dst)?;
+    for entry in std::fs::read_dir(src)? {
+        let entry = entry?;
+        let entry_src = entry.path();
+        let entry_dst = dst.join(entry.file_name());
+        let ft = entry.file_type()?;
+        if ft.is_dir() {
+            copy_dir_recursively(&entry_src, &entry_dst)?;
+        } else if ft.is_symlink() {
+            // Preserve symlinks verbatim — the v1 store already
+            // dereferences extracts on write, so a symlink in
+            // `<v1>/.../` is an explicitly-shipped tarball symlink
+            // (rare but legal in npm), not an internal link.
+            let target = std::fs::read_link(&entry_src)?;
+            #[cfg(unix)]
+            std::os::unix::fs::symlink(&target, &entry_dst)?;
+            #[cfg(windows)]
+            {
+                if target.is_dir() {
+                    std::os::windows::fs::symlink_dir(&target, &entry_dst)?;
+                } else {
+                    std::os::windows::fs::symlink_file(&target, &entry_dst)?;
+                }
+            }
+        } else if ft.is_file() {
+            std::fs::copy(&entry_src, &entry_dst)?;
+        }
+        // Block / char / fifo entries inside an extracted npm
+        // package would be malformed input — silently skip.
+    }
+    Ok(())
 }
 
 // Phase 66 Phase 4a follow-up: shared with `lpm-linker` via
@@ -1724,6 +1869,91 @@ mod tests {
     /// `path_lives_in_store` returns `true` iff the canonicalized path
     /// is inside this store's `links/` root. Used by doctor / rebuild
     /// to decide if a project-side symlink leads to a v2 install.
+    /// Phase 66 §4 v1 → v2 cache-hit translation:
+    /// `populate_object_from_v1` copies an extracted v1 package dir
+    /// into a v2 object dir (atomic), preserving package contents
+    /// and `.lpm-security.json` if present.
+    #[test]
+    fn populate_object_from_v1_copies_extracted_package_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::at(dir.path());
+
+        // Synthesize a fake v1 package dir at an arbitrary location.
+        // Real v1's `<HOME>/.lpm/store/v1/<name>/<version>/` is just
+        // a directory of extracted bytes plus `.integrity` +
+        // `.lpm-security.json`; the helper accepts any directory in
+        // the same shape.
+        let v1_pkg_dir = dir.path().join("fake-v1/pkg/1.0.0");
+        std::fs::create_dir_all(&v1_pkg_dir).unwrap();
+        std::fs::write(
+            v1_pkg_dir.join("package.json"),
+            b"{\"name\":\"e\",\"version\":\"1.0.0\"}",
+        )
+        .unwrap();
+        std::fs::write(v1_pkg_dir.join("index.js"), b"module.exports = 42;").unwrap();
+        std::fs::create_dir_all(v1_pkg_dir.join("src")).unwrap();
+        std::fs::write(v1_pkg_dir.join("src/inner.js"), b"// inner").unwrap();
+        std::fs::write(v1_pkg_dir.join(".lpm-security.json"), b"{\"tags\":[]}").unwrap();
+        std::fs::write(v1_pkg_dir.join(".integrity"), b"sha512-stale").unwrap();
+
+        let sri = synthetic_sri(b"populate_object_from_v1");
+        let object_dir = store.populate_object_from_v1(&v1_pkg_dir, &sri).unwrap();
+        assert_eq!(object_dir, store.paths().object_dir(&sri).unwrap());
+        // Package contents copied through.
+        assert_eq!(
+            std::fs::read(object_dir.join("package.json")).unwrap(),
+            b"{\"name\":\"e\",\"version\":\"1.0.0\"}"
+        );
+        assert_eq!(
+            std::fs::read(object_dir.join("index.js")).unwrap(),
+            b"module.exports = 42;"
+        );
+        assert_eq!(
+            std::fs::read(object_dir.join("src/inner.js")).unwrap(),
+            b"// inner"
+        );
+        // `.lpm-security.json` preserved (skips re-analysis).
+        assert_eq!(
+            std::fs::read(object_dir.join(".lpm-security.json")).unwrap(),
+            b"{\"tags\":[]}"
+        );
+        // `.integrity` rewritten to the caller-supplied SRI rather
+        // than v1's stale value.
+        assert_eq!(
+            std::fs::read(object_dir.join(".integrity")).unwrap(),
+            sri.as_bytes()
+        );
+
+        // Idempotent: second call returns the same path without
+        // touching anything.
+        let again = store.populate_object_from_v1(&v1_pkg_dir, &sri).unwrap();
+        assert_eq!(again, object_dir);
+    }
+
+    /// When `.lpm-security.json` is missing in v1 (rare, e.g. a
+    /// partial or pre-security-cache install), the helper re-runs
+    /// behavioral analysis so v2's post-write contract holds.
+    #[test]
+    fn populate_object_from_v1_runs_analysis_when_security_cache_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::at(dir.path());
+
+        let v1_pkg_dir = dir.path().join("fake-v1/pkg-no-cache/1.0.0");
+        std::fs::create_dir_all(&v1_pkg_dir).unwrap();
+        std::fs::write(
+            v1_pkg_dir.join("package.json"),
+            b"{\"name\":\"f\",\"version\":\"1.0.0\"}",
+        )
+        .unwrap();
+
+        let sri = synthetic_sri(b"populate_object_from_v1_no_cache");
+        let object_dir = store.populate_object_from_v1(&v1_pkg_dir, &sri).unwrap();
+        assert!(
+            object_dir.join(".lpm-security.json").is_file(),
+            "translation must regenerate security cache when v1 didn't ship one"
+        );
+    }
+
     #[test]
     #[cfg(unix)]
     fn path_lives_in_store_recognizes_canonical_descendants() {
