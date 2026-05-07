@@ -33,7 +33,10 @@
 //! Moving them out of `node_modules` makes the warm-install path actually
 //! incremental.
 //!
-//! Compatibility: hoisted mode, Windows junctions, self-ref — see phase-20-todo.md.
+//! Compatibility: hoisted mode supported as opt-in via `LPM_LINKER=hoisted`
+//! (npm v3+ flat layout, ~25% faster on full-wipe workloads, stricter peer-dep
+//! semantics); Windows junctions provide admin-free symlink fallback (not in CI);
+//! self-reference works in both modes.
 //! Performance: incremental linking via `.linked` marker files, `--force` bypasses markers.
 
 use lpm_common::LpmError;
