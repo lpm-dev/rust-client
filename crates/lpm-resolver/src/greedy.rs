@@ -406,7 +406,8 @@ pub async fn resolve_greedy_fused(
                     // spec_tx send. Avoids cloning the ~50 KB
                     // metadata blob (~6.7 MB allocator churn at 134
                     // packages on bench/fixture-large).
-                    let info = parse_metadata_to_cache_info(&meta, is_npm);
+                    let info = parse_metadata_to_cache_info(&meta);
+                    let _ = is_npm; // 2026-05-07: prerelease filter removed; param retained on caller for future use
                     let info_arc = Arc::new(info);
                     shared_cache.insert(canonical.clone(), info_arc);
                     if let Some(tx) = spec_tx.as_ref() {
@@ -1022,8 +1023,7 @@ async fn direct_fetch(
     canonical: &CanonicalKey,
 ) -> Result<CachedPackageInfo, ResolveError> {
     let metadata = fetch_metadata_raw(client, route_table, canonical).await?;
-    let is_npm = matches!(canonical, CanonicalKey::Npm { .. });
-    Ok(parse_metadata_to_cache_info(&metadata, is_npm))
+    Ok(parse_metadata_to_cache_info(&metadata))
 }
 
 /// Phase 56 W2 — raw-metadata fetch, factored out of [`direct_fetch`]

@@ -1558,8 +1558,7 @@ mod tests {
         if let Some(batch) = prefetched {
             for (name, metadata) in batch {
                 let key = CanonicalKey::from_dep_name(&name);
-                let is_npm = !name.starts_with("@lpm.dev/");
-                let info = crate::provider::parse_metadata_to_cache_info(&metadata, is_npm);
+                let info = crate::provider::parse_metadata_to_cache_info(&metadata);
                 shared_cache.insert(key, Arc::new(info));
             }
         }
