@@ -2,6 +2,7 @@ pub mod error;
 pub mod integrity;
 pub mod package_name;
 pub mod paths;
+pub mod symlink;
 
 pub use error::LpmError;
 pub use integrity::Integrity;
@@ -12,6 +13,7 @@ pub use paths::{
     try_with_exclusive_lock, with_exclusive_lock, with_exclusive_lock_async, with_shared_lock,
     with_shared_lock_async,
 };
+pub use symlink::create_dir_symlink_or_junction;
 
 /// The LPM scope prefix. All LPM packages live under this scope.
 pub const LPM_SCOPE: &str = "@lpm.dev";
