@@ -1,0 +1,13 @@
+{
+  "fixture": "peer-heavy/vite-react",
+  "mode": "hoisted",
+  "timestamp": "20260507-123437",
+  "install_exit": 0,
+  "install_ms": 517,
+  "top_level_dep_count": 38,
+  "require_pass": 4,
+  "require_fail": 0,
+  "smoke_exit": 0,
+  "verdict": "PASS",
+  "fail_reason": ""
+}
