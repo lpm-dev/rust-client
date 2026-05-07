@@ -46,7 +46,10 @@ async fn init_yes_json_uses_profile_username_and_creates_gitattributes() {
 
     let package_json: serde_json::Value = serde_json::from_str(&project.read_file("package.json"))
         .expect("created package.json must be valid JSON");
-    assert_eq!(package_json["name"], serde_json::json!("@lpm.dev/neo.package"));
+    assert_eq!(
+        package_json["name"],
+        serde_json::json!("@lpm.dev/neo.package")
+    );
     assert!(
         project.file_exists(".gitattributes"),
         "init must pre-create .gitattributes"

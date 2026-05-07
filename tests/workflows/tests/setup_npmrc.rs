@@ -23,9 +23,8 @@ async fn setup_npmrc_json_writes_scoped_config_gitignore_and_read_only_token() {
     );
 
     let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
-    let envelope: serde_json::Value = serde_json::from_str(&stdout).unwrap_or_else(|e| {
-        panic!("setup-npmrc --json must be valid JSON: {e}\n---\n{stdout}")
-    });
+    let envelope: serde_json::Value = serde_json::from_str(&stdout)
+        .unwrap_or_else(|e| panic!("setup-npmrc --json must be valid JSON: {e}\n---\n{stdout}"));
 
     assert_eq!(envelope["success"], serde_json::json!(true));
     assert_eq!(envelope["proxy"], serde_json::json!(false));
@@ -72,7 +71,11 @@ async fn setup_npmrc_json_writes_scoped_config_gitignore_and_read_only_token() {
         .received_requests()
         .await
         .expect("wiremock request log must be available");
-    assert_eq!(requests.len(), 1, "expected exactly one token-create request");
+    assert_eq!(
+        requests.len(),
+        1,
+        "expected exactly one token-create request"
+    );
 
     let body: serde_json::Value =
         serde_json::from_slice(&requests[0].body).expect("token-create body must be JSON");

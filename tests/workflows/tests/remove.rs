@@ -6,7 +6,10 @@ use support::{TempProject, lpm};
 fn remove_json_cleans_source_package_paths_and_editor_links() {
     let project = TempProject::empty(r#"{"name":"remove-test","version":"1.0.0"}"#);
     project.write_file(".lpm/skills/owner.widget/build.md", "# Widget skill\n");
-    project.write_file("components/widget/index.ts", "export const widget = true;\n");
+    project.write_file(
+        "components/widget/index.ts",
+        "export const widget = true;\n",
+    );
     project.write_file(".cursor/rules/owner.widget--build.md", "linked skill\n");
 
     let output = lpm(&project)
@@ -29,10 +32,7 @@ fn remove_json_cleans_source_package_paths_and_editor_links() {
     assert_eq!(envelope["package"], serde_json::json!("owner.widget"));
     assert_eq!(
         envelope["removed"],
-        serde_json::json!([
-            ".lpm/skills/owner.widget/",
-            "components/widget/"
-        ])
+        serde_json::json!([".lpm/skills/owner.widget/", "components/widget/"])
     );
 
     insta::assert_json_snapshot!("remove_json_envelope_cleans_source_package_paths", envelope);
@@ -60,7 +60,10 @@ fn rm_alias_warns_and_exits_zero_when_no_files_match() {
         .output()
         .expect("failed to run lpm rm");
 
-    assert!(output.status.success(), "lpm rm must exit zero when nothing matches");
+    assert!(
+        output.status.success(),
+        "lpm rm must exit zero when nothing matches"
+    );
 
     let combined = format!(
         "{}{}",

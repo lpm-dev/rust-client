@@ -6,8 +6,7 @@ use std::path::Path;
 use support::{TempProject, lpm};
 
 fn bind_ephemeral_port() -> (u16, TcpListener) {
-    let listener =
-        TcpListener::bind("127.0.0.1:0").expect("failed to bind an ephemeral test port");
+    let listener = TcpListener::bind("127.0.0.1:0").expect("failed to bind an ephemeral test port");
     let port = listener
         .local_addr()
         .expect("listener must expose its local address")
@@ -22,7 +21,10 @@ fn reserve_then_release_port() -> u16 {
 }
 
 fn project_key(project_dir: &Path) -> String {
-    format!("project_{}", deterministic_hash(&project_dir.to_string_lossy()))
+    format!(
+        "project_{}",
+        deterministic_hash(&project_dir.to_string_lossy())
+    )
 }
 
 #[test]

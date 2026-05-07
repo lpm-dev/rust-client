@@ -197,12 +197,8 @@ fn format_asn1_time(time: &x509_parser::time::ASN1Time) -> String {
 fn general_name_matches_requested_host(name: &GeneralName<'_>, requested_host: &str) -> bool {
     if let Ok(ip) = requested_host.parse::<IpAddr>() {
         return match (ip, name) {
-            (IpAddr::V4(ip), GeneralName::IPAddress(bytes)) => {
-                *bytes == ip.octets().as_slice()
-            }
-            (IpAddr::V6(ip), GeneralName::IPAddress(bytes)) => {
-                *bytes == ip.octets().as_slice()
-            }
+            (IpAddr::V4(ip), GeneralName::IPAddress(bytes)) => *bytes == ip.octets().as_slice(),
+            (IpAddr::V6(ip), GeneralName::IPAddress(bytes)) => *bytes == ip.octets().as_slice(),
             _ => false,
         };
     }
@@ -350,8 +346,6 @@ mod tests {
         std::fs::write(tmp.path(), &cert_pem).unwrap();
 
         assert!(covers_requested_hostnames(tmp.path(), &extras).unwrap());
-        assert!(
-            !covers_requested_hostnames(tmp.path(), &["missing.test".to_string()]).unwrap()
-        );
+        assert!(!covers_requested_hostnames(tmp.path(), &["missing.test".to_string()]).unwrap());
     }
 }

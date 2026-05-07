@@ -35,8 +35,9 @@ fn is_ca_installed_test(trust_store_path: &Path) -> bool {
 
 fn uninstall_ca_test(trust_store_path: &Path) -> Result<(), LpmError> {
     if trust_store_path.exists() {
-        std::fs::remove_file(trust_store_path)
-            .map_err(|e| LpmError::Cert(format!("failed to remove CA from test trust store: {e}")))?;
+        std::fs::remove_file(trust_store_path).map_err(|e| {
+            LpmError::Cert(format!("failed to remove CA from test trust store: {e}"))
+        })?;
     }
 
     Ok(())

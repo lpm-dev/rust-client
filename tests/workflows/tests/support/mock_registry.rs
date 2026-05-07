@@ -71,7 +71,9 @@ impl MockRegistry {
         Mock::given(method("POST"))
             .and(path("/api/registry/-/token/create"))
             .and(body_string_contains("\"scope\":\"read\""))
-            .and(body_string_contains(format!("\"expiryDays\":{expiry_days}")))
+            .and(body_string_contains(format!(
+                "\"expiryDays\":{expiry_days}"
+            )))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "token": token,
                 "expiresAt": expires_at,
@@ -103,11 +105,7 @@ impl MockRegistry {
     }
 
     /// Mount `GET /api/registry/pool/stats` for `lpm pool`.
-    pub async fn with_pool_stats(
-        &self,
-        bearer_token: &str,
-        stats: serde_json::Value,
-    ) -> &Self {
+    pub async fn with_pool_stats(&self, bearer_token: &str, stats: serde_json::Value) -> &Self {
         Mock::given(method("GET"))
             .and(path("/api/registry/pool/stats"))
             .and(header("authorization", format!("Bearer {bearer_token}")))

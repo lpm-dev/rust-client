@@ -7,8 +7,13 @@ fn plugin_root(project: &TempProject) -> std::path::PathBuf {
 }
 
 fn seed_installed_plugin(project: &TempProject, name: &str, version: &str) {
-    std::fs::create_dir_all(plugin_root(project).join(name).join(version).join("darwin-arm64"))
-        .expect("failed to seed installed plugin directory");
+    std::fs::create_dir_all(
+        plugin_root(project)
+            .join(name)
+            .join(version)
+            .join("darwin-arm64"),
+    )
+    .expect("failed to seed installed plugin directory");
 }
 
 fn plugin_entry<'a>(plugins: &'a [serde_json::Value], name: &str) -> &'a serde_json::Value {
@@ -36,9 +41,8 @@ fn plugin_list_json_reports_installed_versions_and_known_latest_versions() {
     );
 
     let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
-    let envelope: serde_json::Value = serde_json::from_str(&stdout).unwrap_or_else(|e| {
-        panic!("plugin list --json must be valid JSON: {e}\n---\n{stdout}")
-    });
+    let envelope: serde_json::Value = serde_json::from_str(&stdout)
+        .unwrap_or_else(|e| panic!("plugin list --json must be valid JSON: {e}\n---\n{stdout}"));
 
     assert_eq!(envelope["success"], serde_json::json!(true));
     let plugins = envelope["plugins"]
@@ -74,9 +78,8 @@ fn plugin_update_json_reports_zero_updates_when_no_plugins_are_installed() {
     );
 
     let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
-    let envelope: serde_json::Value = serde_json::from_str(&stdout).unwrap_or_else(|e| {
-        panic!("plugin update --json must be valid JSON: {e}\n---\n{stdout}")
-    });
+    let envelope: serde_json::Value = serde_json::from_str(&stdout)
+        .unwrap_or_else(|e| panic!("plugin update --json must be valid JSON: {e}\n---\n{stdout}"));
 
     assert_eq!(envelope["success"], serde_json::json!(true));
     assert_eq!(envelope["count"], serde_json::json!(0));

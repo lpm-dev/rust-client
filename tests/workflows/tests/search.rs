@@ -25,7 +25,10 @@ async fn search_without_matches_warns_and_exits_zero() {
         .output()
         .expect("failed to run lpm search");
 
-    assert!(output.status.success(), "search with zero results must exit 0");
+    assert!(
+        output.status.success(),
+        "search with zero results must exit 0"
+    );
 
     let combined = format!(
         "{}{}",

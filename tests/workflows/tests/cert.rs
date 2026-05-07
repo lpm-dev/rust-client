@@ -85,8 +85,14 @@ fn cert_trust_json_generates_ca_and_installs_into_isolated_test_store() {
 
     insta::assert_json_snapshot!("cert_trust_json_installs_ca", envelope);
 
-    assert!(ca_cert_path(&project).exists(), "trust must write the root CA cert");
-    assert!(ca_key_path(&project).exists(), "trust must write the root CA key");
+    assert!(
+        ca_cert_path(&project).exists(),
+        "trust must write the root CA cert"
+    );
+    assert!(
+        ca_key_path(&project).exists(),
+        "trust must write the root CA key"
+    );
     assert!(
         trust_store_entry(&project).exists(),
         "trust must install the CA into the isolated test trust store"
@@ -128,8 +134,14 @@ fn cert_uninstall_json_removes_trust_store_entry_but_keeps_ca_files() {
 
     insta::assert_json_snapshot!("cert_uninstall_json_removes_trust_store_entry", envelope);
 
-    assert!(ca_cert_path(&project).exists(), "uninstall must keep the CA cert on disk");
-    assert!(ca_key_path(&project).exists(), "uninstall must keep the CA key on disk");
+    assert!(
+        ca_cert_path(&project).exists(),
+        "uninstall must keep the CA cert on disk"
+    );
+    assert!(
+        ca_key_path(&project).exists(),
+        "uninstall must keep the CA key on disk"
+    );
     assert!(
         !trust_store_entry(&project).exists(),
         "uninstall must remove the isolated trust-store marker"
@@ -167,20 +179,38 @@ fn cert_generate_json_regenerates_when_requested_host_is_missing() {
         .output()
         .expect("failed to rerun lpm cert generate --json with --host");
 
-    assert_success(&refreshed_output, "lpm cert generate --json --host myapp.local");
+    assert_success(
+        &refreshed_output,
+        "lpm cert generate --json --host myapp.local",
+    );
 
-    let mut envelope = json_envelope(&refreshed_output, "lpm cert generate --json --host myapp.local");
+    let mut envelope = json_envelope(
+        &refreshed_output,
+        "lpm cert generate --json --host myapp.local",
+    );
     assert_eq!(envelope["success"], serde_json::json!(true));
     assert_eq!(envelope["ca_freshly_installed"], serde_json::json!(false));
     assert_eq!(envelope["cert_freshly_generated"], serde_json::json!(true));
 
-    assert!(project_cert_path(&project).exists(), "generate must write the project cert");
-    assert!(project_key_path(&project).exists(), "generate must write the project key");
-    assert!(trust_store_entry(&project).exists(), "generate must install the CA into the isolated test trust store");
+    assert!(
+        project_cert_path(&project).exists(),
+        "generate must write the project cert"
+    );
+    assert!(
+        project_key_path(&project).exists(),
+        "generate must write the project key"
+    );
+    assert!(
+        trust_store_entry(&project).exists(),
+        "generate must install the CA into the isolated test trust store"
+    );
 
     envelope["cert_path"] = serde_json::json!("[CERT_PATH]");
     envelope["key_path"] = serde_json::json!("[KEY_PATH]");
-    insta::assert_json_snapshot!("cert_generate_json_regenerates_for_requested_host", envelope);
+    insta::assert_json_snapshot!(
+        "cert_generate_json_regenerates_for_requested_host",
+        envelope
+    );
 
     let status_output = cert_command(&project)
         .args(["cert", "status", "--json"])
