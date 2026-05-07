@@ -1,0 +1,13 @@
+{
+  "fixture": "peer-heavy/nextjs-minimal",
+  "mode": "hoisted",
+  "timestamp": "20260507-125818",
+  "install_exit": 0,
+  "install_ms": 1476,
+  "top_level_dep_count": 20,
+  "require_pass": 3,
+  "require_fail": 0,
+  "smoke_exit": 0,
+  "verdict": "PASS",
+  "fail_reason": ""
+}
