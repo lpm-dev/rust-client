@@ -20,6 +20,22 @@ mod support;
 use std::path::PathBuf;
 use support::{TempProject, lpm_with_registry};
 
+/// Phase 66 Phase 4f — every test in this file asserts on the
+/// `<project>/.lpm/wrappers/<seg>/...` path shape, which is v1
+/// isolated layout. The 4f default flip moved
+/// `LinkerMode::default()` to Hoisted, so a no-flag install would
+/// land hoisted-flat and break the assertions wholesale. This helper
+/// pins `LPM_LINKER=isolated` on every spawned `lpm` to preserve
+/// the historical contract; the helper takes precedence below
+/// `--linker` and below `~/.lpm/config.toml > linker`, so any test
+/// that explicitly tests env-vs-config precedence still works
+/// (the per-test override comes after this in the env stack).
+fn lpm_isolated(project: &TempProject, url: &str) -> assert_cmd::Command {
+    let mut cmd = lpm_with_registry(project, url);
+    cmd.env("LPM_LINKER", "isolated");
+    cmd
+}
+
 // ─── Helpers ────────────────────────────────────────────────────────────
 
 fn strip_ansi(s: &str) -> String {
@@ -247,7 +263,7 @@ fn install_patches_applied_after_link_in_isolated_layout() {
         patch_text,
     );
 
-    lpm_with_registry(&project, "http://127.0.0.1:1")
+    lpm_isolated(&project, "http://127.0.0.1:1")
         .args(["install", "--offline"])
         .assert()
         .success();
@@ -280,11 +296,11 @@ fn install_patches_idempotent_across_repeated_installs() {
         patch_text,
     );
 
-    lpm_with_registry(&project, "http://127.0.0.1:1")
+    lpm_isolated(&project, "http://127.0.0.1:1")
         .args(["install", "--offline"])
         .assert()
         .success();
-    lpm_with_registry(&project, "http://127.0.0.1:1")
+    lpm_isolated(&project, "http://127.0.0.1:1")
         .args(["install", "--offline"])
         .assert()
         .success();
@@ -316,7 +332,7 @@ fn install_patches_hard_errors_on_integrity_drift() {
     let store_integrity = project.store_dir().join("v1/lodash@4.17.21/.integrity");
     std::fs::write(&store_integrity, "sha512-different-from-recorded").unwrap();
 
-    let out = lpm_with_registry(&project, "http://127.0.0.1:1")
+    let out = lpm_isolated(&project, "http://127.0.0.1:1")
         .args(["install", "--offline"])
         .output()
         .expect("spawn lpm install");
@@ -377,7 +393,7 @@ fn install_patches_hard_errors_on_missing_patch_file() {
         &[],
     );
 
-    let out = lpm_with_registry(&project, "http://127.0.0.1:1")
+    let out = lpm_isolated(&project, "http://127.0.0.1:1")
         .args(["install", "--offline"])
         .output()
         .expect("spawn lpm install");
@@ -415,7 +431,7 @@ fn install_patches_hard_errors_on_fuzzy_hunk() {
         patch_text,
     );
 
-    let out = lpm_with_registry(&project, "http://127.0.0.1:1")
+    let out = lpm_isolated(&project, "http://127.0.0.1:1")
         .args(["install", "--offline"])
         .output()
         .expect("spawn lpm install");
@@ -480,7 +496,7 @@ fn install_patches_offline_hard_errors_when_patches_change_between_runs() {
     );
 
     // First install — succeeds with v1 applied.
-    lpm_with_registry(&project, "http://127.0.0.1:1")
+    lpm_isolated(&project, "http://127.0.0.1:1")
         .args(["install", "--offline"])
         .assert()
         .success();
@@ -489,7 +505,7 @@ fn install_patches_offline_hard_errors_when_patches_change_between_runs() {
     let manifest_v2 = manifest_v1.replace("patches/v1.patch", "patches/v2.patch");
     project.write_file("package.json", &manifest_v2);
 
-    let out = lpm_with_registry(&project, "http://127.0.0.1:1")
+    let out = lpm_isolated(&project, "http://127.0.0.1:1")
         .args(["install", "--offline"])
         .output()
         .expect("spawn lpm install");
@@ -555,7 +571,7 @@ fn install_patches_offline_hard_errors_on_patch_fingerprint_mismatch() {
         &[],
     );
 
-    let out = lpm_with_registry(&project, "http://127.0.0.1:1")
+    let out = lpm_isolated(&project, "http://127.0.0.1:1")
         .args(["install", "--offline"])
         .output()
         .expect("spawn lpm install");
@@ -611,7 +627,7 @@ fn install_patches_offline_hard_errors_when_patches_exist_but_no_state_file() {
     write_lockfile(&project, &[("lodash", "4.17.21", &[])]);
     // Intentionally no patch-state.json.
 
-    let out = lpm_with_registry(&project, "http://127.0.0.1:1")
+    let out = lpm_isolated(&project, "http://127.0.0.1:1")
         .args(["install", "--offline"])
         .output()
         .expect("spawn lpm install");
@@ -668,7 +684,7 @@ fn install_patches_offline_hard_errors_when_patches_removed_with_prior_state() {
         )],
     );
 
-    let out = lpm_with_registry(&project, "http://127.0.0.1:1")
+    let out = lpm_isolated(&project, "http://127.0.0.1:1")
         .args(["install", "--offline"])
         .output()
         .expect("spawn lpm install");
@@ -708,7 +724,7 @@ fn install_patches_deletes_patch_state_file_when_patches_removed() {
     let empty_fp = phase6_fingerprint(&[]);
     write_patch_state(&project, &empty_fp, &[], &[]);
 
-    lpm_with_registry(&project, "http://127.0.0.1:1")
+    lpm_isolated(&project, "http://127.0.0.1:1")
         .args(["install", "--offline"])
         .assert()
         .success();
@@ -736,7 +752,7 @@ fn install_json_envelope_includes_applied_patches_field() {
         patch_text,
     );
 
-    let out = lpm_with_registry(&project, "http://127.0.0.1:1")
+    let out = lpm_isolated(&project, "http://127.0.0.1:1")
         .args(["--json", "install", "--offline"])
         .output()
         .expect("spawn lpm install --json");
@@ -777,7 +793,7 @@ fn install_patches_idempotent_rerun_reports_no_applied_patches_per_run() {
     );
 
     // First install: actually applies.
-    let out1 = lpm_with_registry(&project, "http://127.0.0.1:1")
+    let out1 = lpm_isolated(&project, "http://127.0.0.1:1")
         .args(["--json", "install", "--offline"])
         .output()
         .expect("spawn lpm install --json (first)");
@@ -803,7 +819,7 @@ fn install_patches_idempotent_rerun_reports_no_applied_patches_per_run() {
     assert_eq!(std::fs::read_to_string(&nm_file).unwrap(), patched);
 
     // Second install: nothing to do. JSON applied_patches MUST be empty.
-    let out2 = lpm_with_registry(&project, "http://127.0.0.1:1")
+    let out2 = lpm_isolated(&project, "http://127.0.0.1:1")
         .args(["--json", "install", "--offline"])
         .output()
         .expect("spawn lpm install --json (second)");
@@ -825,7 +841,7 @@ fn install_patches_idempotent_rerun_reports_no_applied_patches_per_run() {
     assert_eq!(std::fs::read_to_string(&nm_file).unwrap(), patched);
 
     // Third install in human mode: must NOT print "Applied N patches".
-    let out3 = lpm_with_registry(&project, "http://127.0.0.1:1")
+    let out3 = lpm_isolated(&project, "http://127.0.0.1:1")
         .args(["install", "--offline"])
         .output()
         .expect("spawn lpm install (third)");

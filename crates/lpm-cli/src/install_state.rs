@@ -68,23 +68,27 @@ pub struct InstallState {
 const INSTALL_HASH_SCHEMA_TAG: &[u8] = b"lpm-install-hash-v6\x00";
 
 /// Compute the install hash from raw file contents — back-compat shim
-/// that defaults file/link bytes to empty AND linker mode to isolated.
-/// Used by test fixtures and `dev.rs`'s deterministic-hash unit tests
-/// where the linker is not under test. Production callers use
-/// [`compute_install_hash_v6`] directly.
+/// that defaults file/link bytes to empty AND linker mode to the
+/// active default. Used by test fixtures and `dev.rs`'s
+/// deterministic-hash unit tests where the linker is not under test.
+/// Production callers use [`compute_install_hash_v6`] directly.
+///
+/// Phase 66 Phase 4f flipped [`LinkerMode::default`] from Isolated to
+/// Hoisted; this shim follows the flip so callers expecting "the hash
+/// for a default install" get the post-4f shape.
 pub fn compute_install_hash(pkg_content: &str, lock_content: &str) -> String {
     compute_install_hash_v6(
         pkg_content,
         lock_content,
         &[],
-        lpm_linker::LinkerMode::Isolated,
+        lpm_linker::LinkerMode::default(),
     )
 }
 
 /// Same shape as [`compute_install_hash_v6`] minus the linker arg —
 /// retained ONLY to keep the v3 name available to callers that
-/// explicitly want the isolated default. Behaves identically to
-/// `compute_install_hash_v6(..., LinkerMode::Isolated)`. New code
+/// explicitly want the active default. Behaves identically to
+/// `compute_install_hash_v6(..., LinkerMode::default())`. New code
 /// should call `compute_install_hash_v6` and pass the resolved mode.
 pub fn compute_install_hash_v3(
     pkg_content: &str,
@@ -95,7 +99,7 @@ pub fn compute_install_hash_v3(
         pkg_content,
         lock_content,
         file_link_manifests,
-        lpm_linker::LinkerMode::Isolated,
+        lpm_linker::LinkerMode::default(),
     )
 }
 
@@ -966,12 +970,17 @@ mod tests {
         //   SHA256("lpm-install-hash-v6\x00" || "pkg" || "\x00" || "lock"
         //          || "\x00" || "\x00" || "isolated")
         // at the time the schema was bumped to v6 (post-install linker
-        // freshness fold). `compute_install_hash` defaults the linker
-        // arg to `LinkerMode::Isolated`, so the v6 hash for the canonical
-        // inputs ends with `\x00 || "isolated"`. Updating this constant
+        // freshness fold).
+        //
+        // Phase 66 Phase 4f note: `compute_install_hash` now defaults
+        // to `LinkerMode::default()` which flipped to Hoisted in 4f.
+        // To keep this test schema-pinned (not coupled to whichever
+        // linker is the default), call `compute_install_hash_v6`
+        // explicitly with `LinkerMode::Isolated` — the value used at
+        // the time the schema was last bumped. Updating this constant
         // is a deliberate act that must accompany any schema-version
         // bump.
-        let actual = compute_install_hash("pkg", "lock");
+        let actual = compute_install_hash_v6("pkg", "lock", &[], lpm_linker::LinkerMode::Isolated);
         let expected_v6 = "3adc9b6970027883b955378cd3dc894ff3a40df5875b4f3150e42254d04b623e";
         assert_eq!(
             actual, expected_v6,

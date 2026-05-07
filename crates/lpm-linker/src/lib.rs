@@ -176,12 +176,44 @@ fn relative_symlink_target_from_parent(target: &Path, link_parent: &Path) -> Pat
 use lpm_common::symlink::validate_cmd_path;
 
 /// Linking strategy for node_modules.
+///
+/// **Default flipped to [`Hoisted`] in Phase 66 Phase 4f**
+/// (post-virtual-store-ship). Pre-Phase-4f the default was
+/// [`Isolated`] — the strict pnpm-style layout — but its everyday
+/// dev workflow (`rm -rf node_modules` → `lpm install`) under v1
+/// required clonefiling all bytes back from `~/.lpm/store/v1/`,
+/// which made hoisted 2.7× slower than isolated on warm install
+/// and would have made the flip user-hostile despite hoisted's
+/// 1.3× cold-install win.
+///
+/// Phase 66's virtual store ([`lpm_store::v2`]) restructured both
+/// modes to symlink project `node_modules/<dep>` into a global
+/// `~/.lpm/store/v2/links/<graph-key>/` materialization. After 4d
+/// the default `LPM_STORE_VERSION=v2` made warm-install identical
+/// between modes (Phase 4f bench: isolated median 110 ms, hoisted
+/// median 110 ms, paired delta +0 ms). Flipping the default to
+/// `Hoisted` gives users:
+///
+/// - Cold-install win — hoisted is ~497 ms faster than isolated
+///   on `bench/fixture-large` cold/full (active-roadmap §2.6).
+/// - Same warm-install (post-v2 — see above).
+/// - Phantom-dep accessibility for tooling that relied on
+///   npm-style flat node_modules (most ecosystem projects).
+///
+/// [`Isolated`] remains a valid opt-in via `LPM_LINKER=isolated`,
+/// `package.json > lpm > linker`, `~/.lpm/config.toml > linker`,
+/// or `--linker isolated`. Use it when you want strict
+/// no-phantom-deps semantics — the layout that catches "I forgot
+/// to declare this dep" bugs early.
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub enum LinkerMode {
-    /// pnpm-style isolated layout (default). Strict, no phantom deps.
-    #[default]
+    /// pnpm-style isolated layout. Strict, no phantom deps.
+    /// Available via explicit `--linker isolated` /
+    /// `LPM_LINKER=isolated` / `package.json > lpm > linker`.
     Isolated,
     /// npm v3+ style hoisted layout. Flat, phantom deps accessible.
+    /// **Default since Phase 66 Phase 4f.**
+    #[default]
     Hoisted,
 }
 

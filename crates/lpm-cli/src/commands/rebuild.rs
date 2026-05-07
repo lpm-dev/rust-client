@@ -2265,13 +2265,25 @@ mod tests {
         // the pre-Phase-57 behavior (store_path) so failures match what
         // users were already seeing rather than introducing a new "no
         // working directory" error class.
+        //
+        // Phase 66 §4 — use `live_package_dir_with_v2(None)` so the v2
+        // store walk is fully disabled. The env-coupled
+        // `live_package_dir` would otherwise probe the developer's
+        // real `~/.lpm/store/v2/links/` and find a stale entry from
+        // an earlier install (e.g. `esbuild@0.21.5` from a prior
+        // bench run) — flaky test isolation.
         let project = tempfile::tempdir().unwrap();
-        // Project has node_modules/ but neither .lpm/.../node_modules/<pkg>/
-        // nor a hoisted node_modules/<pkg>/.
         std::fs::create_dir_all(project.path().join("node_modules")).unwrap();
         let store_fallback = std::path::PathBuf::from("/store/some/where");
 
-        let resolved = live_package_dir(project.path(), "esbuild", "0.21.5", None, &store_fallback);
+        let resolved = live_package_dir_with_v2(
+            project.path(),
+            "esbuild",
+            "0.21.5",
+            None,
+            &store_fallback,
+            None,
+        );
         assert_eq!(resolved, store_fallback);
     }
 

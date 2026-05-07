@@ -1420,8 +1420,16 @@ mod tests {
             "line 2 must be mtime, got {:?}",
             lines[1]
         );
+        // Phase 66 Phase 4f flipped `LinkerMode::default()` from
+        // Isolated to Hoisted. The hash file's third line reflects
+        // whatever default `auto_install_if_stale` resolves through
+        // the linker chain — when no override is set, that's the
+        // current default's `as_str()`. Asserting on the literal
+        // `LinkerMode::default()` keeps the test stable across
+        // future default flips.
         assert_eq!(
-            lines[2], "l:isolated",
+            lines[2],
+            format!("l:{}", lpm_linker::LinkerMode::default().as_str()),
             "line 3 must be linker, got {:?}",
             lines[2]
         );
