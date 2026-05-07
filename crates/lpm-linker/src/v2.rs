@@ -14,31 +14,46 @@
 //! 3. Calls [`Store::populate_link_entry`] per target, which clonefiles
 //!    the package bytes from `objects/<sri>/` into
 //!    `links/<graph-key>/node_modules/<name>/` and writes sibling
-//!    dep symlinks alongside.
+//!    dep + peer symlinks alongside.
 //! 4. Writes project-side `node_modules/<root_link_name>` symlinks
 //!    pointing into the materialized link entries.
 //! 5. Generates `.bin/` shims by walking the project-side symlinks —
 //!    same shape as v1's, but resolving through v2 paths.
 //!
-//! # Phase 4b limitations (documented for the dev-only checkpoint)
+//! # Peer-context (preplan §2.5)
 //!
-//! - **Empty peer-context.** [`LinkTarget`] doesn't currently carry
-//!   peer-resolution info. v2's preplan §2.5 says isolated graph keys
-//!   should fold in peer-context for cross-project sharing. For 4b
-//!   we derive keys with empty peers and accept the consequence:
-//!   two projects whose `react@18.3.0` resolves the SAME edge graph
-//!   but different peer pinning would share the same wrapper
-//!   directory. Phase 4 follow-up (post-4b.4) threads peer-context
-//!   through the resolver → install → linker chain. Audit-fixtures
-//!   gate "v2 mode produces a working install per fixture" — they
-//!   don't gate cross-project peer correctness, so 4b acceptance
-//!   isn't blocked.
-//! - **Single source per (name, version).** The `dep_key_map` is
-//!   keyed by `(target_name, target_version)`, so an install with
-//!   two LinkTargets sharing `(name, version)` (e.g. one Registry
-//!   source + one Tarball source distinguished by `wrapper_id`)
-//!   would alias one onto the other. None of the audit fixtures
-//!   exercise this; logged as a Phase 4 follow-up.
+//! Each [`LinkTarget`] carries `peers: Vec<(String, String)>`
+//! threaded through from the resolver
+//! (`ResolvedPackage.peers` → `InstallPackage.peers` →
+//! `LinkTarget.peers`). The linker uses these to:
+//!
+//! - Synthesize peer-edge sibling symlinks INSIDE each link entry
+//!   (a peer is `<links/A-key>/node_modules/<peer>` → symlink to
+//!   `<links/peer-key>/node_modules/<peer>/`). Without this,
+//!   Node's symlink-walk-up from inside the link entry never
+//!   reaches the peer.
+//! - Fold the peer-context into [`GraphKey`] via
+//!   `GraphKeyInputs::with_peers`, so two projects sharing the same
+//!   edge graph but different peer pinning produce distinct keys.
+//!   Without this, cross-project sharing of `links/<key>/` would be
+//!   incorrect for any package whose peer resolution depends on
+//!   the consuming project's other packages.
+//!
+//! When `LinkTarget.peers` is empty (lockfile fast-path doesn't
+//! persist peers today), the linker falls back to deriving them
+//! from the just-extracted `package.json` in `objects/<sri>/` and
+//! intersecting with the install-set's `(name, version)` map. This
+//! keeps cold-resolve and warm-fast-path producing the same
+//! GraphKeys for the same package.
+//!
+//! # Multi-source disambiguation (preplan §2.2)
+//!
+//! The internal key map keys by `(name, version, wrapper_id)`, not
+//! `(name, version)`. Two `LinkTarget`s with the same `(name,
+//! version)` but different sources (e.g., one `Source::Registry` +
+//! one `Source::Tarball` distinguished by `wrapper_id`) get
+//! distinct GraphKeys via `with_root_link_names` + the dep-edge
+//! disambiguation that flows from each target's own `wrapper_id`.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -107,30 +122,24 @@ pub fn link_packages_v2(
     // paths the v2 linker never touches.
     cleanup_v1_state(project_dir)?;
 
-    // Phase 66 Phase 4b: synthesize peer-edge siblings for each
-    // target. v1's isolated linker relies on Node's symlink walk-up
-    // to reach project-level peers (relative `<project>/.lpm/wrappers/`
-    // chain stays inside the project). v2's project-side symlinks
-    // jump straight into `<HOME>/.lpm/store/v2/links/<key>/`, so the
-    // walk-up never reaches the project's `node_modules/<peer>` — every
-    // peer must be present as a sibling INSIDE the consumer's link
-    // entry. The resolver doesn't surface resolved peers per-package
-    // today (`ResolvedPackage.dependencies` only carries declared
-    // `dependencies` / `optionalDependencies`), so the v2 linker
-    // derives them from the just-extracted `package.json` files in
-    // each `objects/<sri>/` and maps each `peerDependencies` entry to
-    // the install-set's matching `(name, version)`. Phase 4 follow-up:
-    // thread peers through the resolver so cross-project sharing
-    // (where two projects might pin the same peer differently)
-    // produces distinct graph keys.
-    let augmented_targets = augment_with_peer_edges(targets, store)?;
+    // Peer-context: ensure every target has its peer set populated.
+    // For fresh-resolve the resolver already threaded peers through
+    // (via `ResolvedPackage.peers` → `InstallPackage.peers` →
+    // `LinkTarget.peers`); for the lockfile fast-path the lockfile
+    // doesn't persist peers, so `LinkTarget.peers` arrives empty and
+    // we derive it here from the just-extracted package.json. Either
+    // way, after this call `target.peers` is the authoritative
+    // peer-edge set used for both sibling-symlink synthesis and
+    // GraphKey derivation.
+    let augmented_targets = ensure_peer_context(targets, store)?;
     let augmented_slice = &augmented_targets[..];
 
-    // Pre-pass: every (name, version) → its GraphKey. Used twice — to
-    // build the per-target dep edges (which require the OTHER targets'
-    // keys) and to compute symlink targets for project-side root
-    // entries.
-    let key_map = derive_graph_keys(augmented_slice, &platform, linker_tag);
+    // Pre-pass: every (name, version, wrapper_id) → its GraphKey.
+    // The triple disambiguates the rare cross-source same-coords case
+    // (Registry + Tarball both at `foo@1.0.0`), which `wrapper_id`
+    // already carves apart at the .lpm/segment level under v1; v2
+    // mirrors that into the link-entry namespace.
+    let key_map = derive_graph_keys(augmented_slice, &platform, linker_tag)?;
 
     // Materialize each link entry. Phase 4b runs sequentially for
     // simplicity — the v2 store's own atomicity already serializes
@@ -181,35 +190,40 @@ pub fn link_packages_v2(
     })
 }
 
-/// Read each target's `package.json` from its v2 object dir, parse
-/// out `peerDependencies`, and append edges to the matching
-/// install-set entries. Returns a fresh `Vec<V2Target>` with the
-/// augmented dep edges; the input is left untouched so callers that
-/// still want the pre-augment view (e.g., for diagnostics) can keep it.
+/// Make sure every target in the install set has its
+/// `LinkTarget.peers` populated.
 ///
-/// Optional peers (declared in `peerDependenciesMeta` with
-/// `optional: true`) are silently skipped when the install set
-/// doesn't include the peer's package — matches npm's behavior.
+/// Trust order:
+/// - If a target arrives with non-empty `peers`, the resolver
+///   already supplied authoritative peer-context — leave it alone.
+/// - Otherwise (lockfile fast-path, hand-built test fixtures,
+///   migration-state installs), derive peers locally by reading the
+///   target's `package.json` from `<store>/objects/<sri>/` and
+///   intersecting `peerDependencies` against the install set's
+///   resolved versions.
 ///
-/// **Transitive closure.** When package A's peer is B, and B itself
-/// declares C as a peer, the v2 isolated layout requires C as a
-/// sibling of A (not just of B), because Node's module resolution
-/// from inside `<links/A-key>/node_modules/A/` walks up to
-/// `<links/A-key>/node_modules/`, then stops — it never reaches B's
-/// link entry directly. Without recursive closure, A's
-/// `require('react')` (declared by B = rehackt) fails because react
-/// isn't a sibling of A's link entry. v1 reaches the project root
-/// via the relative `<project>/.lpm/wrappers/` chain and resolves the
-/// peer there; v2's absolute store paths break that walk-up.
+/// `peerDependenciesMeta.optional` controls log behavior on a
+/// missing peer:
+/// - Optional peer not in install set → silent skip (npm-compat).
+/// - Required peer not in install set → debug-level trace pointing
+///   at the upstream `check_unmet_peers` gap.
 ///
-/// We iterate to a fixed point: repeatedly walk every (re-)augmented
-/// target's peers and pull in newly-discovered peers, until no
-/// target gains a new edge. Bounded by depth-limit to avoid
-/// pathological cycles.
-fn augment_with_peer_edges(targets: &[V2Target], store: &Store) -> Result<Vec<V2Target>, LpmError> {
-    // Build a name → version lookup once. For 4b's single-version-
-    // per-name scope this is unambiguous; multi-source-same-name
-    // disambiguation is a Phase 4 follow-up.
+/// We do NOT close the peer set transitively here. The resolver's
+/// per-package peer view already encodes the in-scope set for each
+/// consumer; once the v2 linker creates a sibling symlink for each
+/// peer, that peer's OWN link entry has its own peer siblings
+/// materialized when its turn comes through the loop. Node's
+/// symlink-walk-up from inside the consumer's link entry reaches
+/// the consumer's siblings, and from inside the peer's package dir
+/// (post-symlink-resolve) reaches the peer's own siblings. The
+/// transitive closure is encoded in the per-target loop, not in
+/// per-target peer edges.
+fn ensure_peer_context(targets: &[V2Target], store: &Store) -> Result<Vec<V2Target>, LpmError> {
+    // Build a name → version lookup so the fallback derivation can
+    // intersect declared peers against the install set. The
+    // single-version-per-name shape is correct for the audit-fixture
+    // scope; multi-source-same-name disambiguation flows through
+    // wrapper_id at the GraphKey level (see preplan §2.2).
     let mut by_name: HashMap<String, String> = HashMap::with_capacity(targets.len());
     for v2t in targets {
         by_name
@@ -217,29 +231,22 @@ fn augment_with_peer_edges(targets: &[V2Target], store: &Store) -> Result<Vec<V2
             .or_insert_with(|| v2t.target.version.clone());
     }
 
-    // Read every target's `peerDependencies` + `peerDependenciesMeta`
-    // once. Cached so the fixed-point loop doesn't re-parse package.json
-    // on every pass. Each peer carries an `is_optional` flag, derived
-    // from `peerDependenciesMeta.<name>.optional` (npm contract:
-    // missing entry = required peer).
-    struct PeerInfo {
-        name: String,
-        is_optional: bool,
-    }
-    let mut peers_by_name: HashMap<String, Vec<PeerInfo>> = HashMap::with_capacity(targets.len());
-    for v2t in targets {
+    let mut out: Vec<V2Target> = targets.to_vec();
+    for v2t in out.iter_mut() {
+        if !v2t.target.peers.is_empty() {
+            // Resolver-threaded — trust it.
+            continue;
+        }
         let object_dir = store.paths().object_dir(&v2t.source_sri)?;
         let pkg_json_path = object_dir.join("package.json");
         if !pkg_json_path.exists() {
-            // No package.json — treat as no peers. Should be
-            // unreachable for real npm tarballs.
             continue;
         }
         let pkg_json = match lpm_workspace::read_package_json(&pkg_json_path) {
             Ok(p) => p,
             Err(e) => {
                 tracing::debug!(
-                    "v2 linker: failed to parse {}/package.json for peer-edge synthesis: {e}",
+                    "v2 linker: failed to parse {}/package.json for peer derivation: {e}",
                     object_dir.display()
                 );
                 continue;
@@ -248,95 +255,33 @@ fn augment_with_peer_edges(targets: &[V2Target], store: &Store) -> Result<Vec<V2
         if pkg_json.peer_dependencies.is_empty() {
             continue;
         }
-        let infos: Vec<PeerInfo> = pkg_json
-            .peer_dependencies
-            .keys()
-            .map(|name| PeerInfo {
-                name: name.clone(),
-                is_optional: pkg_json
-                    .peer_dependencies_meta
-                    .get(name)
-                    .map(|meta| meta.optional)
-                    .unwrap_or(false),
-            })
-            .collect();
-        peers_by_name.insert(v2t.target.name.clone(), infos);
-    }
-
-    let mut out: Vec<V2Target> = targets.to_vec();
-
-    // Bound iterations to avoid cycles. The closure depth is at most
-    // the longest peer-chain length in the install set; 64 is two
-    // orders of magnitude beyond any real npm graph.
-    const MAX_PEER_CLOSURE_PASSES: usize = 64;
-    for _ in 0..MAX_PEER_CLOSURE_PASSES {
-        let mut changed = false;
-        for v2t in out.iter_mut() {
-            let peers = match peers_by_name.get(&v2t.target.name) {
-                Some(p) => p,
-                None => continue,
-            };
-            let already_declared: std::collections::HashSet<String> = v2t
-                .target
-                .dependencies
-                .iter()
-                .map(|(local, _)| local.clone())
-                .collect();
-            for peer in peers {
-                if already_declared.contains(&peer.name) {
-                    continue;
+        let mut derived: Vec<(String, String)> = Vec::new();
+        for peer_name in pkg_json.peer_dependencies.keys() {
+            let is_optional = pkg_json
+                .peer_dependencies_meta
+                .get(peer_name)
+                .map(|meta| meta.optional)
+                .unwrap_or(false);
+            match by_name.get(peer_name) {
+                Some(ver) => derived.push((peer_name.clone(), ver.clone())),
+                None if !is_optional => {
+                    tracing::debug!(
+                        "v2 linker: REQUIRED peer dep {peer_name} of {}@{} not in install set — \
+                         resolver should have caught this in check_unmet_peers",
+                        v2t.target.name,
+                        v2t.target.version
+                    );
                 }
-                let resolved_version = match by_name.get(&peer.name) {
-                    Some(v) => v.clone(),
-                    None => {
-                        // Peer not in install set. Two distinct cases:
-                        //
-                        //   1. Optional peer (`peerDependenciesMeta`
-                        //      `{ optional: true }`) — npm-compat
-                        //      behavior is silent skip. No log; this
-                        //      is normal. Example: an apollo plugin
-                        //      that optionally integrates with a
-                        //      framework the user doesn't have.
-                        //
-                        //   2. Required peer the resolver missed.
-                        //      `check_unmet_peers` is supposed to
-                        //      fail resolution upstream; reaching this
-                        //      branch means it didn't. Surface a debug
-                        //      trace so the gap is visible under
-                        //      `RUST_LOG=debug` without spamming the
-                        //      default install output. Node will fail
-                        //      to resolve at runtime — exactly the
-                        //      same end-state as v1's isolated layout
-                        //      when a peer is genuinely unresolvable.
-                        if !peer.is_optional {
-                            tracing::debug!(
-                                "v2 linker: REQUIRED peer dep {} of {}@{} not in install set — \
-                                 resolver should have caught this in check_unmet_peers",
-                                peer.name,
-                                v2t.target.name,
-                                v2t.target.version
-                            );
-                        }
-                        continue;
-                    }
-                };
-                v2t.target
-                    .dependencies
-                    .push((peer.name.clone(), resolved_version));
-                changed = true;
+                None => {
+                    // Optional peer not in install set — silent skip.
+                }
             }
         }
-        if !changed {
-            return Ok(out);
-        }
+        // Sorted for deterministic GraphKey hashing — must match the
+        // sort applied by the resolver-threaded path.
+        derived.sort_by(|a, b| a.0.cmp(&b.0));
+        v2t.target.peers = derived;
     }
-    // Hit the depth bound — surface a debug trace and accept the
-    // current closure. Real graphs never approach the cap; if they
-    // do, return what we have rather than fail the install.
-    tracing::debug!(
-        "v2 linker: peer-edge closure hit MAX_PEER_CLOSURE_PASSES={MAX_PEER_CLOSURE_PASSES}; \
-         possible cycle in peer chain"
-    );
     Ok(out)
 }
 
@@ -351,45 +296,76 @@ struct PopulatedEntry {
 fn populate_one(
     v2t: &V2Target,
     store: &Store,
-    key_map: &HashMap<(String, String), GraphKey>,
+    key_map: &KeyMap,
     platform: &PlatformTuple,
 ) -> Result<PopulatedEntry, LpmError> {
-    let key = key_map
-        .get(&(v2t.target.name.clone(), v2t.target.version.clone()))
-        .cloned()
-        .ok_or_else(|| {
-            LpmError::Store(format!(
-                "v2 linker: missing graph key for {}@{} (key map pre-pass failed)",
-                v2t.target.name, v2t.target.version
-            ))
-        })?;
+    let key = key_map.get_for(&v2t.target).cloned().ok_or_else(|| {
+        LpmError::Store(format!(
+            "v2 linker: missing graph key for {}@{} (key map pre-pass failed)",
+            v2t.target.name, v2t.target.version
+        ))
+    })?;
 
     let object_dir = store.paths().object_dir(&v2t.source_sri)?;
 
-    let deps: Vec<DepLink> = v2t
-        .target
-        .dependencies
-        .iter()
-        .map(|(local, ver)| {
-            let canonical = v2t
-                .target
-                .aliases
-                .get(local)
-                .cloned()
-                .unwrap_or_else(|| local.clone());
-            let dep_key = key_map.get(&(canonical.clone(), ver.clone())).cloned();
-            match dep_key {
-                Some(dep_key) => Ok(DepLink {
-                    local: local.clone(),
-                    target: dep_key,
-                }),
-                None => Err(LpmError::Store(format!(
+    // Dep edges resolve through the alias map (consumer's local name
+    // may differ from the canonical target). Peer edges always use
+    // the canonical name as the local (peers are never npm-aliased
+    // — `peerDependencies` keys ARE the canonical name by spec).
+    let mut deps: Vec<DepLink> =
+        Vec::with_capacity(v2t.target.dependencies.len() + v2t.target.peers.len());
+    for (local, ver) in &v2t.target.dependencies {
+        let canonical = v2t
+            .target
+            .aliases
+            .get(local)
+            .cloned()
+            .unwrap_or_else(|| local.clone());
+        let dep_key = key_map
+            .get_by_coords(&canonical, ver)
+            .ok_or_else(|| {
+                LpmError::Store(format!(
                     "v2 linker: dep {local}@{ver} of {}@{} has no resolved graph key",
                     v2t.target.name, v2t.target.version
-                ))),
+                ))
+            })?
+            .clone();
+        deps.push(DepLink {
+            local: local.clone(),
+            target: dep_key,
+        });
+    }
+    // Peer-edge siblings. Each resolved peer becomes a sibling
+    // symlink in the consumer's link entry — without this, Node's
+    // walk-up from the consumer's package dir never reaches the
+    // peer (v2 link entries are absolute paths into the global
+    // store, not the project tree).
+    let already_local: std::collections::HashSet<String> =
+        deps.iter().map(|d| d.local.clone()).collect();
+    for (peer_name, peer_ver) in &v2t.target.peers {
+        if already_local.contains(peer_name) {
+            // Peer is also declared as a regular dep — already
+            // covered by the dep-edge pass. Avoids a duplicate
+            // sibling symlink (which would conflict at the link
+            // entry's `node_modules/<peer>` slot).
+            continue;
+        }
+        let peer_key = match key_map.get_by_coords(peer_name, peer_ver) {
+            Some(k) => k.clone(),
+            None => {
+                // Peer not in install set. ensure_peer_context already
+                // distinguished optional from required and emitted
+                // the relevant trace; here we silently skip — a
+                // missing peer becomes a runtime require failure,
+                // mirroring v1's behavior under the same shape.
+                continue;
             }
-        })
-        .collect::<Result<_, _>>()?;
+        };
+        deps.push(DepLink {
+            local: peer_name.clone(),
+            target: peer_key,
+        });
+    }
 
     let request = LinkEntryRequest {
         graph_key: key.clone(),
@@ -413,18 +389,92 @@ fn link_meta_platform(p: &PlatformTuple) -> LinkMetaPlatform {
     }
 }
 
+/// Per-install lookup table from `(name, version, wrapper_id)` to the
+/// derived `GraphKey`.
+///
+/// Two indexes:
+/// - `by_triple` — full `(name, version, wrapper_id)` identity. Used
+///   by `populate_one` to fetch THIS target's own key.
+/// - `by_coords` — `(name, version)` only. Used to resolve dep / peer
+///   edges, which carry only `(name, version)` today. Multi-source
+///   collisions are detected at construction time and surface a hard
+///   error before any link entry materializes.
+struct KeyMap {
+    by_triple: HashMap<(String, String, Option<String>), GraphKey>,
+    by_coords: HashMap<(String, String), GraphKey>,
+}
+
+impl KeyMap {
+    fn get_for(&self, target: &LinkTarget) -> Option<&GraphKey> {
+        self.by_triple.get(&(
+            target.name.clone(),
+            target.version.clone(),
+            target.wrapper_id.clone(),
+        ))
+    }
+
+    fn get_by_coords(&self, name: &str, version: &str) -> Option<&GraphKey> {
+        self.by_coords.get(&(name.to_string(), version.to_string()))
+    }
+}
+
 fn derive_graph_keys(
     targets: &[V2Target],
     platform: &PlatformTuple,
     linker_tag: LinkerModeTag,
-) -> HashMap<(String, String), GraphKey> {
-    let mut out = HashMap::with_capacity(targets.len());
+) -> Result<KeyMap, LpmError> {
+    let mut by_triple: HashMap<(String, String, Option<String>), GraphKey> =
+        HashMap::with_capacity(targets.len());
+    let mut by_coords: HashMap<(String, String), GraphKey> = HashMap::with_capacity(targets.len());
+    let mut coords_seen: HashMap<(String, String), Option<String>> =
+        HashMap::with_capacity(targets.len());
+
     for v2t in targets {
         let inputs = build_inputs(&v2t.target, platform, linker_tag);
         let key = GraphKey::derive(&inputs);
-        out.insert((v2t.target.name.clone(), v2t.target.version.clone()), key);
+        let triple = (
+            v2t.target.name.clone(),
+            v2t.target.version.clone(),
+            v2t.target.wrapper_id.clone(),
+        );
+        if by_triple.insert(triple.clone(), key.clone()).is_some() {
+            return Err(LpmError::Store(format!(
+                "v2 linker: duplicate LinkTarget for {}@{} wrapper_id={:?}",
+                v2t.target.name, v2t.target.version, v2t.target.wrapper_id
+            )));
+        }
+
+        let coords = (v2t.target.name.clone(), v2t.target.version.clone());
+        match coords_seen.entry(coords.clone()) {
+            std::collections::hash_map::Entry::Vacant(e) => {
+                e.insert(v2t.target.wrapper_id.clone());
+                by_coords.insert(coords, key);
+            }
+            std::collections::hash_map::Entry::Occupied(existing) => {
+                // Multi-source-same-coords. Dep edges carry only
+                // `(name, version)`, so we can't disambiguate which
+                // GraphKey a `dep on foo@1.0.0` should point at. Hard
+                // error rather than silently aliasing one onto the
+                // other (the audit-fixture suite never exercises this
+                // shape today; threading wrapper_id through dep edges
+                // is a Phase 4 follow-up that lifts the constraint).
+                return Err(LpmError::Store(format!(
+                    "v2 linker: multi-source LinkTarget collision for {}@{} \
+                     (existing wrapper_id={:?}, new wrapper_id={:?}). \
+                     Multi-source disambiguation requires wrapper_id-aware \
+                     dep edges (Phase 4 follow-up).",
+                    v2t.target.name,
+                    v2t.target.version,
+                    existing.get(),
+                    v2t.target.wrapper_id,
+                )));
+            }
+        }
     }
-    out
+    Ok(KeyMap {
+        by_triple,
+        by_coords,
+    })
 }
 
 fn build_inputs(
@@ -445,15 +495,19 @@ fn build_inputs(
         }
     });
 
+    let peer_entries = target.peers.iter().map(|(name, ver)| PeerEntry {
+        name: name.clone(),
+        version: ver.clone(),
+    });
+
     let alias_iter = target.aliases.iter().map(|(k, v)| (k.clone(), v.clone()));
 
     GraphKeyInputs::new(&target.name, &target.version, platform.clone(), linker_tag)
-        // Phase 4b limitation: peers stay empty until peer-context
-        // threading lands (preplan §2.5 / module docs above).
-        .with_peers(Vec::<PeerEntry>::new())
+        .with_peers(peer_entries)
         .with_deps(dep_edges)
         .with_aliases(alias_iter)
         .with_root_link_names(target.root_link_names.clone())
+        .with_wrapper_id(target.wrapper_id.clone())
 }
 
 /// Wipe v1-style project link state so the v2 install starts clean.
@@ -502,7 +556,7 @@ fn create_root_symlinks(
     project_dir: &Path,
     targets: &[V2Target],
     store: &Store,
-    key_map: &HashMap<(String, String), GraphKey>,
+    key_map: &KeyMap,
 ) -> Result<usize, LpmError> {
     let nm = project_dir.join("node_modules");
     std::fs::create_dir_all(&nm).map_err(|e| {
@@ -518,14 +572,12 @@ fn create_root_symlinks(
         if names.is_empty() {
             continue;
         }
-        let key = key_map
-            .get(&(v2t.target.name.clone(), v2t.target.version.clone()))
-            .ok_or_else(|| {
-                LpmError::Store(format!(
-                    "v2 linker: missing graph key for {}@{} during root-symlink pass",
-                    v2t.target.name, v2t.target.version
-                ))
-            })?;
+        let key = key_map.get_for(&v2t.target).ok_or_else(|| {
+            LpmError::Store(format!(
+                "v2 linker: missing graph key for {}@{} during root-symlink pass",
+                v2t.target.name, v2t.target.version
+            ))
+        })?;
         let target_path = store.paths().link_package_dir(key);
         for root_name in names {
             let link_path = nm.join(&root_name);
@@ -594,7 +646,7 @@ fn create_bin_links_v2(
     project_dir: &Path,
     targets: &[V2Target],
     store: &Store,
-    key_map: &HashMap<(String, String), GraphKey>,
+    key_map: &KeyMap,
 ) -> Result<usize, LpmError> {
     let bin_dir = project_dir.join("node_modules").join(".bin");
 
@@ -603,7 +655,7 @@ fn create_bin_links_v2(
         if !is_direct(&v2t.target) {
             continue;
         }
-        let key = match key_map.get(&(v2t.target.name.clone(), v2t.target.version.clone())) {
+        let key = match key_map.get_for(&v2t.target) {
             Some(k) => k,
             None => continue,
         };
@@ -784,6 +836,7 @@ mod tests {
                 root_link_names: None,
                 wrapper_id: None,
                 materialization: crate::Materialization::CasBacked,
+                peers: Vec::new(),
             },
             source_sri: sri.into(),
         }
@@ -1008,6 +1061,243 @@ mod tests {
         assert!(
             msg.contains("phantom@9.9.9"),
             "missing-dep error must name the missing edge: {msg}"
+        );
+    }
+
+    /// **Cross-project peer-divergence — preplan §2.5 invariant.**
+    ///
+    /// The same consumer package + edge graph but a different
+    /// resolved-peer version MUST produce distinct GraphKeys, so two
+    /// projects that pin the same peer differently get separate
+    /// `links/<key>/` entries instead of silently sharing. Pre-Phase-66
+    /// this was the load-bearing gap behind the empty-peers
+    /// `with_peers(Vec::<PeerEntry>::new())` call in `build_inputs`.
+    ///
+    /// Setup: two installs, each with consumer `c@1.0.0` declaring
+    /// peer `react`. Install 1 has `react@18.0.0` in its install set;
+    /// install 2 has `react@19.0.0`. Both call `link_packages_v2` and
+    /// the resulting MaterializedPackage destinations for `c@1.0.0`
+    /// must differ (because the GraphKey path component differs).
+    #[test]
+    fn link_packages_v2_distinct_keys_for_peer_divergent_projects() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = V2Store::at(tmp.path().join("store"));
+
+        let c_pkg_json =
+            b"{\"name\":\"c\",\"version\":\"1.0.0\",\"peerDependencies\":{\"react\":\"*\"}}";
+        let c_sri = synthetic_sri(b"peer_divergent/c");
+        write_object(&store, &c_sri, &[("package.json", c_pkg_json)]);
+
+        let r18_sri = synthetic_sri(b"peer_divergent/react@18");
+        write_object(
+            &store,
+            &r18_sri,
+            &[(
+                "package.json",
+                b"{\"name\":\"react\",\"version\":\"18.0.0\"}",
+            )],
+        );
+        let r19_sri = synthetic_sri(b"peer_divergent/react@19");
+        write_object(
+            &store,
+            &r19_sri,
+            &[(
+                "package.json",
+                b"{\"name\":\"react\",\"version\":\"19.0.0\"}",
+            )],
+        );
+
+        // Project 1: c + react@18. `LinkTarget.peers` arrives empty
+        // here — same shape as the lockfile fast path — so
+        // `ensure_peer_context` derives peers by reading c's
+        // `package.json` and intersecting with the install set.
+        let proj1 = tmp.path().join("project1");
+        std::fs::create_dir_all(&proj1).unwrap();
+        let result_p1 = link_packages_v2(
+            &proj1,
+            &[
+                target("c", "1.0.0", &c_sri, true),
+                target("react", "18.0.0", &r18_sri, false),
+            ],
+            &store,
+            LinkerMode::Isolated,
+            None,
+        )
+        .unwrap();
+
+        // Project 2: c + react@19.
+        let proj2 = tmp.path().join("project2");
+        std::fs::create_dir_all(&proj2).unwrap();
+        let result_p2 = link_packages_v2(
+            &proj2,
+            &[
+                target("c", "1.0.0", &c_sri, true),
+                target("react", "19.0.0", &r19_sri, false),
+            ],
+            &store,
+            LinkerMode::Isolated,
+            None,
+        )
+        .unwrap();
+
+        let c_dest_p1 = result_p1
+            .materialized
+            .iter()
+            .find(|m| m.name == "c")
+            .map(|m| m.destination.clone())
+            .expect("c materialized in project 1");
+        let c_dest_p2 = result_p2
+            .materialized
+            .iter()
+            .find(|m| m.name == "c")
+            .map(|m| m.destination.clone())
+            .expect("c materialized in project 2");
+        assert_ne!(
+            c_dest_p1, c_dest_p2,
+            "peer-divergent installs must produce distinct link entries for c@1.0.0; \
+             pre-Phase-66 they shared a GraphKey because peers were always empty"
+        );
+
+        // And each project resolves its peer to the version IT
+        // actually has — proj1 sees react@18, proj2 sees react@19.
+        // The link entry's sibling symlink targets the version-
+        // specific link package dir.
+        let r_sibling_p1 = c_dest_p1
+            .parent()
+            .unwrap()
+            .join("react")
+            .join("package.json");
+        let r_sibling_p2 = c_dest_p2
+            .parent()
+            .unwrap()
+            .join("react")
+            .join("package.json");
+        let r1_pkg = std::fs::read_to_string(&r_sibling_p1).unwrap();
+        let r2_pkg = std::fs::read_to_string(&r_sibling_p2).unwrap();
+        assert!(
+            r1_pkg.contains("18.0.0"),
+            "project 1's c link entry must point at react@18: got {r1_pkg}"
+        );
+        assert!(
+            r2_pkg.contains("19.0.0"),
+            "project 2's c link entry must point at react@19: got {r2_pkg}"
+        );
+    }
+
+    /// Inverse of the divergence test: same consumer + same resolved
+    /// peer version across two installs MUST produce the same
+    /// GraphKey, so the global v2 store can share `links/<key>/`
+    /// across projects. Without this, every project pays a fresh
+    /// materialization tax even when the dep + peer graph is
+    /// identical — defeating the cross-project sharing the v2
+    /// rewrite is supposed to unlock.
+    #[test]
+    fn link_packages_v2_shares_keys_for_peer_identical_projects() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = V2Store::at(tmp.path().join("store"));
+
+        let c_pkg_json =
+            b"{\"name\":\"c\",\"version\":\"1.0.0\",\"peerDependencies\":{\"react\":\"*\"}}";
+        let c_sri = synthetic_sri(b"peer_shared/c");
+        write_object(&store, &c_sri, &[("package.json", c_pkg_json)]);
+
+        let r_sri = synthetic_sri(b"peer_shared/react");
+        write_object(
+            &store,
+            &r_sri,
+            &[(
+                "package.json",
+                b"{\"name\":\"react\",\"version\":\"18.0.0\"}",
+            )],
+        );
+
+        let proj1 = tmp.path().join("project1");
+        let proj2 = tmp.path().join("project2");
+        std::fs::create_dir_all(&proj1).unwrap();
+        std::fs::create_dir_all(&proj2).unwrap();
+
+        let result_p1 = link_packages_v2(
+            &proj1,
+            &[
+                target("c", "1.0.0", &c_sri, true),
+                target("react", "18.0.0", &r_sri, false),
+            ],
+            &store,
+            LinkerMode::Isolated,
+            None,
+        )
+        .unwrap();
+        let result_p2 = link_packages_v2(
+            &proj2,
+            &[
+                target("c", "1.0.0", &c_sri, true),
+                target("react", "18.0.0", &r_sri, false),
+            ],
+            &store,
+            LinkerMode::Isolated,
+            None,
+        )
+        .unwrap();
+
+        let c_dest_p1 = result_p1
+            .materialized
+            .iter()
+            .find(|m| m.name == "c")
+            .map(|m| m.destination.clone())
+            .unwrap();
+        let c_dest_p2 = result_p2
+            .materialized
+            .iter()
+            .find(|m| m.name == "c")
+            .map(|m| m.destination.clone())
+            .unwrap();
+        assert_eq!(
+            c_dest_p1, c_dest_p2,
+            "same edge graph + same peer pinning across two projects must share the link entry"
+        );
+    }
+
+    /// Multi-source-same-coords (two `LinkTarget`s with the same
+    /// `(name, version)` but different `wrapper_id`) currently can't
+    /// be disambiguated through the dep edges (which carry only
+    /// `(name, version)`). Until that's threaded through the resolver,
+    /// `derive_graph_keys` MUST surface a hard error rather than
+    /// silently aliasing — the audit-fixture suite never exercises
+    /// this shape, so the error is reachable only by a malformed
+    /// install set.
+    #[test]
+    fn link_packages_v2_errors_on_multi_source_same_coords() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = V2Store::at(tmp.path().join("store"));
+        let project = tmp.path().join("project");
+        std::fs::create_dir_all(&project).unwrap();
+
+        // Two LinkTargets at the same (name, version) with distinct
+        // wrapper_ids.
+        let sri_a = synthetic_sri(b"multi_source/a");
+        let sri_b = synthetic_sri(b"multi_source/b");
+        write_object(
+            &store,
+            &sri_a,
+            &[("package.json", b"{\"name\":\"x\",\"version\":\"1.0.0\"}")],
+        );
+        write_object(
+            &store,
+            &sri_b,
+            &[("package.json", b"{\"name\":\"x\",\"version\":\"1.0.0\"}")],
+        );
+
+        let mut a = target("x", "1.0.0", &sri_a, true);
+        a.target.wrapper_id = Some("t-aaaaaaaaaaaaaaaa".into());
+        let mut b = target("x", "1.0.0", &sri_b, true);
+        b.target.wrapper_id = Some("t-bbbbbbbbbbbbbbbb".into());
+
+        let err =
+            link_packages_v2(&project, &[a, b], &store, LinkerMode::Isolated, None).unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("multi-source") && msg.contains("x@1.0.0"),
+            "multi-source collision error must name the package: {msg}"
         );
     }
 }

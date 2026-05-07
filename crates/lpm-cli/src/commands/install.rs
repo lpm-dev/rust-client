@@ -1147,6 +1147,21 @@ struct InstallPackage {
     is_direct: bool,
     /// Whether this is an LPM package (for tarball fetching)
     is_lpm: bool,
+    /// **Phase 66 §2.5** — resolved peers in scope for THIS package's
+    /// instance in this install graph: `(peer_name, resolved_version)`.
+    /// Sorted by peer_name for deterministic GraphKey hashing.
+    ///
+    /// Carried verbatim from the resolver's
+    /// [`lpm_resolver::ResolvedPackage::peers`] field. The v2 linker
+    /// uses this to (a) synthesize peer-edge siblings inside each
+    /// link entry without re-reading package.json, and (b) fold the
+    /// peer-context into [`lpm_store::v2::GraphKey`] so two projects
+    /// with the same edge graph but different peer pinning produce
+    /// distinct keys (preplan §2.5 cross-project sharing
+    /// invariant). v1 ignores this field — its relative-symlink
+    /// wrappers walk up to the project root for peers, so threading
+    /// is informational under v1.
+    peers: Vec<(String, String)>,
     /// SRI integrity hash for verification (e.g. "sha512-...")
     integrity: Option<String>,
     /// Tarball URL from resolution — avoids re-fetching metadata during download.
@@ -1842,6 +1857,7 @@ async fn pre_resolve_non_registry_deps(
             root_link_names: Some(vec![local_name]),
             is_direct: true,
             is_lpm: false,
+            peers: Vec::new(),
             integrity: Some(computed_sri),
             tarball_url: Some(url),
         });
@@ -1925,6 +1941,7 @@ async fn pre_resolve_non_registry_deps(
             root_link_names: Some(vec![local_name]),
             is_direct: true,
             is_lpm: false,
+            peers: Vec::new(),
             integrity: Some(integrity_sri),
             // tarball_url is Phase 43 fresh-URL writeback (registry-
             // specific). Local tarballs have no remote URL, so leave
@@ -2058,6 +2075,7 @@ async fn pre_resolve_non_registry_deps(
             // applies (any value would invalidate on the next edit).
             // F7a's install-hash extension folds in the source's
             // package.json content as the freshness signal instead.
+            peers: Vec::new(),
             integrity: None,
             tarball_url: None,
         });
@@ -2156,6 +2174,7 @@ async fn pre_resolve_non_registry_deps(
             // Link deps share directory deps' mutable-content posture
             // — no integrity SRI; F7a folds the source's package.json
             // content into the install-hash freshness signal.
+            peers: Vec::new(),
             integrity: None,
             tarball_url: None,
         });
@@ -2875,6 +2894,7 @@ fn recurse_local_source_deps(
                     root_link_names: Some(Vec::new()),
                     is_direct: false,
                     is_lpm: false,
+                    peers: Vec::new(),
                     integrity: None,
                     tarball_url: None,
                 });
@@ -4472,6 +4492,7 @@ async fn run_with_options_under_store_lock(
                 root_link_names: p.root_link_names.clone(),
                 wrapper_id: p.wrapper_id_for_source(),
                 materialization: p.materialization_for_source(),
+                peers: p.peers.clone(),
             })
         })
         .collect::<Result<_, _>>()?;
@@ -4573,6 +4594,7 @@ async fn run_with_options_under_store_lock(
                     root_link_names: p.root_link_names.clone(),
                     wrapper_id: p.wrapper_id_for_source(),
                     materialization: p.materialization_for_source(),
+                    peers: p.peers.clone(),
                 };
                 let pd = project_dir.to_path_buf();
                 let force_flag = force;
@@ -5025,6 +5047,7 @@ async fn run_with_options_under_store_lock(
                         root_link_names: p.root_link_names.clone(),
                         wrapper_id: p.wrapper_id_for_source(),
                         materialization: p.materialization_for_source(),
+                        peers: p.peers.clone(),
                     };
                     let pd = project_dir_buf.clone();
                     Ok(Some(tokio::task::spawn_blocking(move || {
@@ -7287,6 +7310,7 @@ fn try_lockfile_fast_path(
                 root_link_names,
                 is_direct: direct_target_names.contains(&lp.name),
                 is_lpm,
+                peers: Vec::new(),
                 integrity: lp.integrity.clone(),
                 // Phase 43 — gate a stored URL against scheme/shape/
                 // origin before reusing it. Any rejection downgrades
@@ -7498,6 +7522,11 @@ fn resolved_to_install_packages(
                 root_link_names,
                 is_direct: direct_target_names.contains(&name),
                 is_lpm,
+                // Phase 66 §2.5 — peer-context threading. The resolver
+                // intersected this package's declared peers against
+                // the install set; carry the resulting
+                // `(peer_name, version)` list straight through.
+                peers: r.peers.clone(),
                 integrity: r.integrity.clone(),
                 tarball_url: r.tarball_url.clone(),
             })
@@ -7546,6 +7575,7 @@ async fn run_link_and_finish(
                 root_link_names: p.root_link_names.clone(),
                 wrapper_id: p.wrapper_id_for_source(),
                 materialization: p.materialization_for_source(),
+                peers: p.peers.clone(),
             })
         })
         .collect::<Result<_, _>>()?;
@@ -11687,6 +11717,7 @@ mod tests {
             root_link_names: None,
             is_direct,
             is_lpm: false,
+            peers: Vec::new(),
             integrity: None,
             tarball_url: None,
         }
@@ -12676,6 +12707,7 @@ mod tests {
             version: NpmVersion::parse(version).expect("valid version"),
             dependencies: Vec::new(),
             aliases: HashMap::new(),
+            peers: Vec::new(),
             tarball_url: None,
             integrity: None,
         }
@@ -13633,6 +13665,7 @@ mod tests {
             root_link_names: None,
             is_direct: true,
             is_lpm: false,
+            peers: Vec::new(),
             integrity: integrity.map(|s| s.to_string()),
             tarball_url: Some(url.to_string()),
         }
@@ -14939,6 +14972,7 @@ mod tests {
                 root_link_names: None,
                 is_direct: true,
                 is_lpm: false,
+                peers: Vec::new(),
                 integrity: None,
                 tarball_url: None,
             };
@@ -14982,6 +15016,7 @@ mod tests {
             root_link_names: None,
             is_direct: true,
             is_lpm: false,
+            peers: Vec::new(),
             integrity: None,
             tarball_url: None,
         };
@@ -14994,6 +15029,7 @@ mod tests {
             root_link_names: None,
             is_direct: true,
             is_lpm: false,
+            peers: Vec::new(),
             integrity: None,
             tarball_url: None,
         };
@@ -15329,6 +15365,7 @@ mod tests {
             root_link_names: Some(vec!["p1".to_string()]),
             is_direct: true,
             is_lpm: false,
+            peers: Vec::new(),
             integrity: None,
             tarball_url: None,
         };
@@ -15360,6 +15397,7 @@ mod tests {
             root_link_names: Some(vec!["missing".to_string()]),
             is_direct: true,
             is_lpm: false,
+            peers: Vec::new(),
             integrity: None,
             tarball_url: None,
         };
@@ -15905,6 +15943,7 @@ mod tests {
             root_link_names: Some(vec!["linked".to_string()]),
             is_direct: true,
             is_lpm: false,
+            peers: Vec::new(),
             integrity: None,
             tarball_url: None,
         };
@@ -16263,6 +16302,7 @@ mod tests {
                 root_link_names: Some(vec!["a".to_string()]),
                 is_direct: true,
                 is_lpm: false,
+                peers: Vec::new(),
                 integrity: None,
                 tarball_url: None,
             },
@@ -16275,6 +16315,7 @@ mod tests {
                 root_link_names: None,
                 is_direct: false,
                 is_lpm: false,
+                peers: Vec::new(),
                 integrity: None,
                 tarball_url: None,
             },
@@ -16287,6 +16328,7 @@ mod tests {
                 root_link_names: Some(Vec::new()), // transitive
                 is_direct: false,
                 is_lpm: false,
+                peers: Vec::new(),
                 integrity: None,
                 tarball_url: None,
             },
@@ -16348,6 +16390,7 @@ mod tests {
             root_link_names: Some(vec!["a".to_string()]),
             is_direct: true,
             is_lpm: false,
+            peers: Vec::new(),
             integrity: None,
             tarball_url: None,
         }];
