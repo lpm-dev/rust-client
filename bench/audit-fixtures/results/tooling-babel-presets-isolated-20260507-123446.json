@@ -1,0 +1,13 @@
+{
+  "fixture": "tooling/babel-presets",
+  "mode": "isolated",
+  "timestamp": "20260507-123446",
+  "install_exit": 0,
+  "install_ms": 698,
+  "top_level_dep_count": 2,
+  "require_pass": 3,
+  "require_fail": 0,
+  "smoke_exit": 0,
+  "verdict": "PASS",
+  "fail_reason": ""
+}
