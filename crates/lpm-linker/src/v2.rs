@@ -217,9 +217,16 @@ fn augment_with_peer_edges(targets: &[V2Target], store: &Store) -> Result<Vec<V2
             .or_insert_with(|| v2t.target.version.clone());
     }
 
-    // Read every target's `peerDependencies` once. Cached so the
-    // fixed-point loop doesn't re-parse package.json on every pass.
-    let mut peers_by_name: HashMap<String, Vec<String>> = HashMap::with_capacity(targets.len());
+    // Read every target's `peerDependencies` + `peerDependenciesMeta`
+    // once. Cached so the fixed-point loop doesn't re-parse package.json
+    // on every pass. Each peer carries an `is_optional` flag, derived
+    // from `peerDependenciesMeta.<name>.optional` (npm contract:
+    // missing entry = required peer).
+    struct PeerInfo {
+        name: String,
+        is_optional: bool,
+    }
+    let mut peers_by_name: HashMap<String, Vec<PeerInfo>> = HashMap::with_capacity(targets.len());
     for v2t in targets {
         let object_dir = store.paths().object_dir(&v2t.source_sri)?;
         let pkg_json_path = object_dir.join("package.json");
@@ -238,10 +245,22 @@ fn augment_with_peer_edges(targets: &[V2Target], store: &Store) -> Result<Vec<V2
                 continue;
             }
         };
-        let names: Vec<String> = pkg_json.peer_dependencies.keys().cloned().collect();
-        if !names.is_empty() {
-            peers_by_name.insert(v2t.target.name.clone(), names);
+        if pkg_json.peer_dependencies.is_empty() {
+            continue;
         }
+        let infos: Vec<PeerInfo> = pkg_json
+            .peer_dependencies
+            .keys()
+            .map(|name| PeerInfo {
+                name: name.clone(),
+                is_optional: pkg_json
+                    .peer_dependencies_meta
+                    .get(name)
+                    .map(|meta| meta.optional)
+                    .unwrap_or(false),
+            })
+            .collect();
+        peers_by_name.insert(v2t.target.name.clone(), infos);
     }
 
     let mut out: Vec<V2Target> = targets.to_vec();
@@ -263,41 +282,47 @@ fn augment_with_peer_edges(targets: &[V2Target], store: &Store) -> Result<Vec<V2
                 .iter()
                 .map(|(local, _)| local.clone())
                 .collect();
-            for peer_name in peers {
-                if already_declared.contains(peer_name) {
+            for peer in peers {
+                if already_declared.contains(&peer.name) {
                     continue;
                 }
-                let resolved_version = match by_name.get(peer_name) {
+                let resolved_version = match by_name.get(&peer.name) {
                     Some(v) => v.clone(),
                     None => {
-                        // Peer not in install set. Could be:
+                        // Peer not in install set. Two distinct cases:
+                        //
                         //   1. Optional peer (`peerDependenciesMeta`
-                        //      `{ optional: true }`). 4b doesn't read
-                        //      that field — `PackageJson` doesn't
-                        //      surface it as a typed slot today.
-                        //      Treat-as-skip is the npm-compat
-                        //      behavior (npm warns + lets install
-                        //      proceed); a Phase 4 follow-up adds
-                        //      typed `peerDependenciesMeta` plumbing.
+                        //      `{ optional: true }`) — npm-compat
+                        //      behavior is silent skip. No log; this
+                        //      is normal. Example: an apollo plugin
+                        //      that optionally integrates with a
+                        //      framework the user doesn't have.
+                        //
                         //   2. Required peer the resolver missed.
                         //      `check_unmet_peers` is supposed to
-                        //      fail resolution upstream; if it
-                        //      didn't, surface a debug trace and
-                        //      continue. Node will fail to resolve
-                        //      at runtime — exactly the same
-                        //      end-state as v1's isolated layout
+                        //      fail resolution upstream; reaching this
+                        //      branch means it didn't. Surface a debug
+                        //      trace so the gap is visible under
+                        //      `RUST_LOG=debug` without spamming the
+                        //      default install output. Node will fail
+                        //      to resolve at runtime — exactly the
+                        //      same end-state as v1's isolated layout
                         //      when a peer is genuinely unresolvable.
-                        tracing::debug!(
-                            "v2 linker: peer dep {peer_name} of {}@{} not in install set — skipping",
-                            v2t.target.name,
-                            v2t.target.version
-                        );
+                        if !peer.is_optional {
+                            tracing::debug!(
+                                "v2 linker: REQUIRED peer dep {} of {}@{} not in install set — \
+                                 resolver should have caught this in check_unmet_peers",
+                                peer.name,
+                                v2t.target.name,
+                                v2t.target.version
+                            );
+                        }
                         continue;
                     }
                 };
                 v2t.target
                     .dependencies
-                    .push((peer_name.clone(), resolved_version));
+                    .push((peer.name.clone(), resolved_version));
                 changed = true;
             }
         }

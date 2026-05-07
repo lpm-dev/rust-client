@@ -51,6 +51,24 @@ pub struct PackageJson {
     #[serde(default, rename = "peerDependencies")]
     pub peer_dependencies: HashMap<String, String>,
 
+    /// `peerDependenciesMeta` — per-peer typed metadata.
+    ///
+    /// Today only the `optional` flag is read. npm's contract: when
+    /// `optional: true`, an unresolved peer is a silent skip; when
+    /// `optional: false` (or absent), an unresolved peer is a
+    /// resolution error. LPM's existing `check_unmet_peers` enforces
+    /// this at the resolver, and the v2 linker's peer-edge synthesis
+    /// (`augment_with_peer_edges`) needs the same distinction so it
+    /// can emit a clearer trace for the truly-optional case versus
+    /// the "resolver should have caught this" case.
+    ///
+    /// Lossy parse: any nested shape we don't model is silently
+    /// dropped. The Default flag for an entry is `false`, which
+    /// matches the implicit npm contract (peer is required unless
+    /// declared otherwise).
+    #[serde(default, rename = "peerDependenciesMeta")]
+    pub peer_dependencies_meta: HashMap<String, PeerDependencyMeta>,
+
     #[serde(default, rename = "optionalDependencies")]
     pub optional_dependencies: HashMap<String, String>,
 
@@ -131,6 +149,20 @@ pub struct PackageJson {
     /// can't translate.
     #[serde(default)]
     pub pnpm: Option<PnpmRaw>,
+}
+
+/// Per-peer metadata from `peerDependenciesMeta`.
+///
+/// npm spec: each key in `peerDependenciesMeta` mirrors a key in
+/// `peerDependencies` (or, less commonly, declares a peer that's
+/// purely optional and not listed in `peerDependencies`). The value
+/// is an object with optional flags. Today LPM only reads `optional`.
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+pub struct PeerDependencyMeta {
+    /// `true` iff this peer is optional — an unresolved peer is a
+    /// silent skip rather than a resolution error.
+    #[serde(default)]
+    pub optional: bool,
 }
 
 /// Untyped capture of the `pnpm` namespace in `package.json`.
