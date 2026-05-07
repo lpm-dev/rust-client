@@ -129,6 +129,66 @@ jobs:
       - name: Test (workspace, excluding lpm-integration-tests)
         run: cargo nextest run --workspace --exclude lpm-integration-tests --no-fail-fast
 
+  audit-fixtures:
+    name: Hoisted-mode compat audit
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    # Run the audit fixtures on every push to main + every PR. The
+    # suite catches mode-asymmetric regressions: a fix that lands and
+    # accidentally breaks hoisted (or isolated) for a real-world
+    # package shape. Equal-outcome failures across modes (e.g. an
+    # ecosystem-side ESLint 9 incompat) don't gate the build — only
+    # asymmetric outcomes do.
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-audit-${{ env.RUST_TOOLCHAIN }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-audit-${{ env.RUST_TOOLCHAIN }}-
+
+      - name: Install Node 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      # The audit harness alternates lpm + bun on every fixture so each
+      # mode sees the same network state. Bun ships prebuilt binaries
+      # via npm; the official action handles platform detection.
+      - name: Install bun
+        uses: oven-sh/setup-bun@v2
+
+      - name: Build lpm-rs (release)
+        run: cargo build --release -p lpm-cli
+
+      - name: Run audit fixtures
+        run: ./bench/audit-fixtures/run-all.sh
+        env:
+          # `--no-skills` keeps the audit deterministic; the skills
+          # auto-install layer adds non-fixture work that varies with
+          # the registry's response time.
+          LPM_NO_SKILLS: "1"
+
+      # Always upload result JSONs — useful for triaging mode-asymmetric
+      # outcomes in CI without re-running locally.
+      - name: Upload audit result artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: audit-fixtures-results
+          path: bench/audit-fixtures/results/
+          retention-days: 14
+
   bench:
     name: Benchmarks
     runs-on: ubuntu-latest
