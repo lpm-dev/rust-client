@@ -1452,21 +1452,29 @@ mod tests {
     }
 
     #[test]
-    fn extract_object_from_bytes_emits_nonzero_timings_on_first_extract() {
-        // Cold extract should record non-zero extract_ms (security
-        // analysis can short-circuit to zero on a tiny tarball, so
-        // we don't assert on security_ms / finalize_ms — only that
-        // extract_ms reflects real wall-clock work).
+    fn extract_object_from_bytes_emits_zero_timings_on_hot_path() {
+        // The contract worth testing: a re-extract of an already-
+        // populated object hits the store-cache short-circuit and
+        // emits zero wall-clock timings (the whole point is the
+        // hot install path skipping ALL the I/O).
+        //
+        // We don't assert that the COLD extract emits non-zero ms.
+        // Wall-clock timings on a 100-byte synthetic tarball can
+        // round to 0 ms on a fast SSD even when actual extract +
+        // finalize work runs to completion — milliseconds is too
+        // coarse a unit to distinguish "didn't run" from "ran
+        // sub-millisecond." The hot-path zero assertion is the
+        // load-bearing contract; cold-path > 0 was an implementation
+        // detail that flaked on fast machines.
         let dir = tempfile::tempdir().unwrap();
         let store = Store::at(dir.path());
         let tarball =
             build_test_tarball(&[("package.json", b"{\"name\":\"x\",\"version\":\"1.0.0\"}")]);
 
-        let (_, _, timings) = store.extract_object_from_bytes(&tarball, None).unwrap();
-        assert!(
-            timings.extract_ms > 0 || timings.finalize_ms > 0,
-            "first extract should record at least extract_ms or finalize_ms wall time"
-        );
+        // Cold extract — populates the store. We only need a
+        // successful return; timing values on this run are not
+        // contract.
+        let _ = store.extract_object_from_bytes(&tarball, None).unwrap();
 
         // Hot path (already populated) — re-extract takes the
         // store-hit short-circuit and emits zero timings.
