@@ -40,7 +40,7 @@ impl MockRegistry {
         Mock::given(method("GET"))
             .and(path("/api/search/packages"))
             .and(query_param("q", query))
-            .and(query_param("limit", &limit.min(20).to_string()))
+            .and(query_param("limit", limit.min(20).to_string()))
             .and(query_param("mode", "semantic"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "packages": packages,
