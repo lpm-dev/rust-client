@@ -1,0 +1,13 @@
+{
+	"name": "audit-fixture-nextjs-minimal",
+	"version": "1.0.0",
+	"private": true,
+	"_comment": "Phase 2 hoisted compat audit. Peer-heavy fixture: Next.js + React + ESLint config. Next has the deepest peer chain in the JS ecosystem; eslint-config-next pulls plugins that need eslint as peer.",
+	"dependencies": {
+		"next": "^14.2.0",
+		"react": "^18.3.0",
+		"react-dom": "^18.3.0",
+		"eslint": "^9.17.0",
+		"eslint-config-next": "^14.2.0"
+	}
+}
