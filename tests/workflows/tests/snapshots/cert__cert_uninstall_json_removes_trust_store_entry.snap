@@ -1,0 +1,9 @@
+---
+source: tests/workflows/tests/cert.rs
+assertion_line: 124
+expression: envelope
+---
+{
+  "success": true,
+  "ca_uninstalled": true
+}

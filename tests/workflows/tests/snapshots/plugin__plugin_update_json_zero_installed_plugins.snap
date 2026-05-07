@@ -1,0 +1,10 @@
+---
+source: tests/workflows/tests/plugin.rs
+assertion_line: 82
+expression: envelope
+---
+{
+  "success": true,
+  "updated": [],
+  "count": 0
+}

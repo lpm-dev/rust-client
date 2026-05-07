@@ -1,0 +1,10 @@
+---
+source: tests/workflows/tests/token_rotate.rs
+assertion_line: 49
+expression: envelope
+---
+{
+  "success": true,
+  "rotated": true,
+  "expires_at": "2032-01-03T04:05:06Z"
+}

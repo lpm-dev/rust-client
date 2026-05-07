@@ -1,0 +1,13 @@
+---
+source: tests/workflows/tests/setup_npmrc.rs
+assertion_line: 43
+expression: envelope
+---
+{
+  "success": true,
+  "npmrc_path": "[NPMRC_PATH]",
+  "proxy": false,
+  "expires_at": "2030-01-02T03:04:05Z",
+  "expiry_days": 14,
+  "gitignore_updated": true
+}

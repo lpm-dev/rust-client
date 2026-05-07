@@ -236,3 +236,55 @@ fn publish_multi_target_flags_accepted() {
         "--lpm --npm flags should be recognized, got:\n{stderr}"
     );
 }
+
+#[test]
+fn publish_custom_registry_dry_run_json_surfaces_registry_url_and_resolved_name() {
+    let project = TempProject::empty(
+        r#"{
+        "name": "custom-publish-pkg",
+        "version": "1.2.3",
+        "description": "Custom registry dry-run test",
+        "main": "index.js",
+        "license": "MIT"
+    }"#,
+    );
+
+    project.write_file("index.js", "module.exports = {}");
+
+    let registry_url = "https://packages.example.test/npm";
+    let output = lpm(&project)
+        .args([
+            "publish",
+            "--publish-registry",
+            registry_url,
+            "--dry-run",
+            "--yes",
+            "--json",
+        ])
+        .output()
+        .expect("failed to run lpm publish --publish-registry --dry-run --json");
+
+    assert!(
+        output.status.success(),
+        "custom registry dry-run must succeed:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    let envelope: serde_json::Value = serde_json::from_str(&stdout).unwrap_or_else(|e| {
+        panic!("publish --publish-registry --json must be valid JSON: {e}\n---\n{stdout}")
+    });
+
+    assert_eq!(envelope["success"], serde_json::json!(true));
+    assert_eq!(envelope["dry_run"], serde_json::json!(true));
+    assert_eq!(envelope["name"], serde_json::json!("custom-publish-pkg"));
+    assert_eq!(envelope["version"], serde_json::json!("1.2.3"));
+
+    let targets = envelope["targets"]
+        .as_array()
+        .expect("targets must be an array");
+    assert_eq!(targets.len(), 1, "custom dry-run should resolve one target");
+    assert_eq!(targets[0]["registry"], serde_json::json!(registry_url));
+    assert_eq!(targets[0]["name"], serde_json::json!("custom-publish-pkg"));
+}

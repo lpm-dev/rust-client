@@ -1,0 +1,16 @@
+---
+source: tests/workflows/tests/resolve.rs
+assertion_line: 135
+expression: envelope
+---
+{
+  "success": true,
+  "packages": [
+    {
+      "package": "@lpm.dev/owner.react",
+      "version": "1.0.0"
+    }
+  ],
+  "count": 1,
+  "elapsed_secs": "[elapsed]"
+}

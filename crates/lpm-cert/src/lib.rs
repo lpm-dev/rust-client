@@ -127,30 +127,32 @@ pub fn ensure_https(
     let proj_cert_path = project_cert_dir.join("cert.pem");
     let proj_key_path = project_cert_dir.join("key.pem");
 
-    let cert_freshly_generated =
-        if !proj_cert_path.exists() || cert::needs_renewal(&proj_cert_path)? {
-            tracing::info!("generating project certificate...");
-            std::fs::create_dir_all(&project_cert_dir)
-                .map_err(|e| LpmError::Cert(format!("failed to create project cert dir: {e}")))?;
+    let cert_freshly_generated = if !proj_cert_path.exists()
+        || cert::needs_renewal(&proj_cert_path)?
+        || !cert::covers_requested_hostnames(&proj_cert_path, extra_hostnames)?
+    {
+        tracing::info!("generating project certificate...");
+        std::fs::create_dir_all(&project_cert_dir)
+            .map_err(|e| LpmError::Cert(format!("failed to create project cert dir: {e}")))?;
 
-            let ca_cert_pem = std::fs::read_to_string(paths::ca_cert_path()?)
-                .map_err(|e| LpmError::Cert(format!("failed to read CA cert: {e}")))?;
-            let ca_key_pem = std::fs::read_to_string(paths::ca_key_path()?)
-                .map_err(|e| LpmError::Cert(format!("failed to read CA key: {e}")))?;
+        let ca_cert_pem = std::fs::read_to_string(paths::ca_cert_path()?)
+            .map_err(|e| LpmError::Cert(format!("failed to read CA cert: {e}")))?;
+        let ca_key_pem = std::fs::read_to_string(paths::ca_key_path()?)
+            .map_err(|e| LpmError::Cert(format!("failed to read CA key: {e}")))?;
 
-            let (cert_pem, key_pem) =
-                cert::generate_project_cert(&ca_cert_pem, &ca_key_pem, extra_hostnames)
-                    .map_err(|e| LpmError::Cert(format!("failed to generate project cert: {e}")))?;
+        let (cert_pem, key_pem) =
+            cert::generate_project_cert(&ca_cert_pem, &ca_key_pem, extra_hostnames)
+                .map_err(|e| LpmError::Cert(format!("failed to generate project cert: {e}")))?;
 
-            std::fs::write(&proj_cert_path, &cert_pem)
-                .map_err(|e| LpmError::Cert(format!("failed to write project cert: {e}")))?;
-            write_key_file(&proj_key_path, key_pem.as_bytes())
-                .map_err(|e| LpmError::Cert(format!("failed to write project key: {e}")))?;
+        std::fs::write(&proj_cert_path, &cert_pem)
+            .map_err(|e| LpmError::Cert(format!("failed to write project cert: {e}")))?;
+        write_key_file(&proj_key_path, key_pem.as_bytes())
+            .map_err(|e| LpmError::Cert(format!("failed to write project key: {e}")))?;
 
-            true
-        } else {
-            false
-        };
+        true
+    } else {
+        false
+    };
 
     // Step 3: Build env vars for the dev server
     let ca_cert_path_str = paths::ca_cert_path()?.to_string_lossy().to_string();

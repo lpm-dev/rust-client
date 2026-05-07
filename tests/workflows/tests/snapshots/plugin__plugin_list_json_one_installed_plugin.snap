@@ -1,0 +1,23 @@
+---
+source: tests/workflows/tests/plugin.rs
+assertion_line: 56
+expression: envelope
+---
+{
+  "success": true,
+  "plugins": [
+    {
+      "name": "oxlint",
+      "installed": [
+        "1.57.0"
+      ],
+      "latest": "1.58.0"
+    },
+    {
+      "name": "biome",
+      "installed": [],
+      "latest": "2.4.10"
+    }
+  ],
+  "count": 2
+}
