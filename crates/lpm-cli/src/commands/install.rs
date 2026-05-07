@@ -6742,6 +6742,19 @@ async fn run_with_options_under_store_lock(
     // check can take the mtime fast path.
     write_post_install_v6_hash(project_dir, linker_mode);
 
+    // Phase 66 Phase 4e — register the project in the machine-global
+    // known-projects registry. `lpm cache prune` walks this set to
+    // determine which v2-store link entries are reachable. Errors are
+    // logged + dropped: the registry is non-load-bearing (prune
+    // degrades gracefully without it) so a flaky write must never
+    // block a successful install.
+    if let Ok(lpm_root) = lpm_common::LpmRoot::from_env()
+        && let Err(e) =
+            lpm_common::known_projects::register(&lpm_root.known_projects(), project_dir)
+    {
+        tracing::debug!("phase 4e: failed to register project in known-projects registry: {e}");
+    }
+
     // Phase 33 audit Finding 1 fix: surface the direct-dep version map
     // for callers (`run_add_packages`, `run_install_filtered_add`) that
     // need to finalize a placeholder-staged manifest entry. The map

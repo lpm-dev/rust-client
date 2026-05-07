@@ -726,6 +726,49 @@ impl Store {
         }
     }
 
+    /// Iterate every object directory under `objects/` that has a
+    /// readable `.integrity` marker (i.e., looks complete).
+    ///
+    /// Yields `(object_dir, sri_segment)` tuples in directory-iteration
+    /// order. `sri_segment` is the on-disk filename (e.g.
+    /// `sha512-deadbeef.../`) and matches what `LinkMeta.object_path`
+    /// records as its trailing component — `lpm cache prune` uses
+    /// this as the join key when computing object orphan reachability
+    /// per preplan §4.4.
+    ///
+    /// Skips:
+    /// - Non-directories at the `objects/` level.
+    /// - Directories without a `.integrity` marker (incomplete
+    ///   extracts, mid-write tmp dirs).
+    /// - Empty `objects/` root or missing root entirely.
+    pub fn iter_object_dirs(
+        &self,
+    ) -> Result<impl Iterator<Item = (PathBuf, String)> + '_, LpmError> {
+        let objects_root = self.paths.objects_root();
+        if !objects_root.exists() {
+            return Ok(Box::new(std::iter::empty()) as Box<dyn Iterator<Item = (PathBuf, String)>>);
+        }
+        let read_dir = std::fs::read_dir(&objects_root).map_err(|e| {
+            LpmError::Store(format!(
+                "failed to enumerate v2 objects root at {}: {e}",
+                objects_root.display()
+            ))
+        })?;
+        let iter = read_dir.filter_map(|entry| {
+            let entry = entry.ok()?;
+            let object_dir = entry.path();
+            if !object_dir.is_dir() {
+                return None;
+            }
+            if !object_dir.join(".integrity").is_file() {
+                return None;
+            }
+            let segment = object_dir.file_name()?.to_string_lossy().to_string();
+            Some((object_dir, segment))
+        });
+        Ok(Box::new(iter) as Box<dyn Iterator<Item = (PathBuf, String)>>)
+    }
+
     /// Returns `true` iff `path` (after symlink resolution) lives under
     /// this store's `links/` root. Used by `lpm doctor` and `lpm
     /// rebuild` to detect a v2-shaped install — every v2 project-side

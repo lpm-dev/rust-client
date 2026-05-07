@@ -372,6 +372,39 @@ pub async fn run(
         }
     }
 
+    // Phase 66 Phase 4e — v2 store orphan stats (preplan §4.5).
+    // Cheap: walks `~/.lpm/store/v2/links/<*>/.lpm-link-meta.json`
+    // sidecars + the registered-projects set, surfaces a count of
+    // orphans not reachable from any project. Pass when zero;
+    // warn-with-remediation when non-zero.
+    if let Ok(lpm_root) = lpm_common::LpmRoot::from_env() {
+        let v2_store = lpm_store::v2::Store::from_lpm_root(&lpm_root);
+        let plan = crate::commands::cache_prune::compute_prune_plan(
+            &lpm_root,
+            &v2_store,
+            &crate::commands::cache::PruneFlags::default(),
+            None,
+        );
+        if let Ok(plan) = plan {
+            let orphan_links = plan.link_entries_orphaned.len();
+            let orphan_objects = plan.object_entries_orphaned.len();
+            if orphan_links == 0 && orphan_objects == 0 {
+                checks.push(Check::pass(&doctor_catalog::V2_STORE_ORPHANS, "no orphans"));
+            } else {
+                checks.push(Check::warn(
+                    &doctor_catalog::V2_STORE_ORPHANS,
+                    &format!(
+                        "{orphan_links} link orphan{} + {orphan_objects} object orphan{} \
+                         ({}); run: lpm cache prune --apply",
+                        if orphan_links == 1 { "" } else { "s" },
+                        if orphan_objects == 1 { "" } else { "s" },
+                        lpm_common::format_bytes(plan.bytes_freed_or_eligible),
+                    ),
+                ));
+            }
+        }
+    }
+
     // 6. Lockfile?
     let lockfile = project_dir.join("lpm.lock");
     checks.extend(check_lockfile_state(project_dir));
