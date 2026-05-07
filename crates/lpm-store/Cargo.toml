@@ -11,9 +11,23 @@ lpm-common = { workspace = true }
 lpm-extractor = { workspace = true }
 lpm-security = { workspace = true }
 sha2 = { workspace = true }
+# Phase 66 Phase 4a: graph-key hashing for the v2 store layout
+# (`src/v2/graph_key.rs`). ~3× faster than SHA-256 in microbenches;
+# computed once per resolved package per install. Content-integrity
+# hashes stay on SHA-512 SRI (per registry contract).
+blake3 = { workspace = true }
 base64 = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+chrono = { workspace = true }
+hex = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
+
+[target.'cfg(unix)'.dependencies]
+# Phase 66 Phase 4a: clonefile syscall on macOS for v2 link-entry
+# population. Linux + Windows fall back to hardlink + copy.
+libc = "0.2"
 
 [dev-dependencies]
 tempfile = "3"

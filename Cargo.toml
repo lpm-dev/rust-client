@@ -86,6 +86,11 @@ thiserror = "2"
 
 # Hashing & crypto
 sha2 = "0.10"
+# Phase 66 Phase 4a: BLAKE3 for v2 store graph-key derivation. ~3× faster
+# than SHA-256 on common hardware; runs once per resolved package per
+# install (hot path, post-resolution). Not used for content-integrity
+# (that stays SHA-512 SRI per registry contract).
+blake3 = "1"
 base64 = "0.22"
 x25519-dalek = { version = "2", features = ["static_secrets"] }
 hkdf = "0.12"

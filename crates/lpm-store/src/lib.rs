@@ -24,6 +24,12 @@ use lpm_common::{LpmError, LpmRoot};
 use sha2::{Digest, Sha512};
 use std::path::{Path, PathBuf};
 
+// Phase 66 Phase 4a: virtual-store v2 layout primitives. Currently
+// dead code — Phase 4b wires writes behind `LPM_STORE_VERSION=v2`,
+// Phase 4c teaches the read paths, Phase 4d flips the default. See
+// `src/v2/mod.rs` for the on-disk shape and identity model.
+pub mod v2;
+
 /// Store version for the directory layout.
 const STORE_VERSION: &str = "v1";
 
