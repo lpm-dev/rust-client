@@ -301,10 +301,12 @@ enum Commands {
         #[arg(long)]
         ignore_provenance_drift_all: bool,
 
-        /// Linking mode: `isolated` (default, pnpm-style) or `hoisted`
-        /// (npm-style). Unknown values are rejected by clap at parse time.
-        /// Overrides `package.json > lpm > linker`,
-        /// `~/.lpm/config.toml > linker`, and `LPM_LINKER`.
+        /// Linking mode: `isolated` (default — pnpm-style isolation) or
+        /// `hoisted` (npm v3+ flat layout). Hoisted is faster on full-wipe /
+        /// CI cold-cache workloads, identical on everyday installs, and has
+        /// stricter peer-dep semantics — opt-in only. Unknown values are
+        /// rejected by clap at parse time. Overrides `package.json > lpm >
+        /// linker`, `~/.lpm/config.toml > linker`, and `LPM_LINKER`.
         #[arg(long, value_enum)]
         linker: Option<LinkerCli>,
 
