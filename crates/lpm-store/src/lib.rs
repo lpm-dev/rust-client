@@ -45,10 +45,11 @@ pub mod v2;
 /// Read once per install via [`StoreVersion::from_env`] so a single
 /// invocation is internally consistent — flipping the env mid-install
 /// would otherwise produce a half-v1/half-v2 layout.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
 pub enum StoreVersion {
     /// Today's default — wrappers under `<project>/.lpm/wrappers/`,
     /// canonical bytes at `<HOME>/.lpm/store/v1/<pkg>/<version>/`.
+    #[default]
     V1,
     /// Virtual-store layout — canonical bytes at
     /// `<HOME>/.lpm/store/v2/objects/<sri>/`, per-context wrappers at
@@ -99,12 +100,6 @@ impl StoreVersion {
     /// `true` iff this is [`StoreVersion::V2`].
     pub fn is_v2(self) -> bool {
         matches!(self, Self::V2)
-    }
-}
-
-impl Default for StoreVersion {
-    fn default() -> Self {
-        Self::V1
     }
 }
 

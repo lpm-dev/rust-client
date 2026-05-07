@@ -379,7 +379,8 @@ impl Store {
             }
         }
 
-        let (object_dir, timings) = self.extract_object_with_timings(&computed_sri, tarball_data)?;
+        let (object_dir, timings) =
+            self.extract_object_with_timings(&computed_sri, tarball_data)?;
         Ok((object_dir, computed_sri, timings))
     }
 
@@ -1400,14 +1401,10 @@ mod tests {
         // .lpm-security.json all present).
         let dir = tempfile::tempdir().unwrap();
         let store = Store::at(dir.path());
-        let tarball = build_test_tarball(&[(
-            "package.json",
-            b"{\"name\":\"x\",\"version\":\"1.0.0\"}",
-        )]);
+        let tarball =
+            build_test_tarball(&[("package.json", b"{\"name\":\"x\",\"version\":\"1.0.0\"}")]);
 
-        let (obj_dir, sri, _timings) = store
-            .extract_object_from_bytes(&tarball, None)
-            .unwrap();
+        let (obj_dir, sri, _timings) = store.extract_object_from_bytes(&tarball, None).unwrap();
 
         assert!(sri.starts_with("sha512-"));
         assert!(obj_dir.is_dir());
@@ -1462,14 +1459,10 @@ mod tests {
         // extract_ms reflects real wall-clock work).
         let dir = tempfile::tempdir().unwrap();
         let store = Store::at(dir.path());
-        let tarball = build_test_tarball(&[(
-            "package.json",
-            b"{\"name\":\"x\",\"version\":\"1.0.0\"}",
-        )]);
+        let tarball =
+            build_test_tarball(&[("package.json", b"{\"name\":\"x\",\"version\":\"1.0.0\"}")]);
 
-        let (_, _, timings) = store
-            .extract_object_from_bytes(&tarball, None)
-            .unwrap();
+        let (_, _, timings) = store.extract_object_from_bytes(&tarball, None).unwrap();
         assert!(
             timings.extract_ms > 0 || timings.finalize_ms > 0,
             "first extract should record at least extract_ms or finalize_ms wall time"
@@ -1477,9 +1470,7 @@ mod tests {
 
         // Hot path (already populated) — re-extract takes the
         // store-hit short-circuit and emits zero timings.
-        let (_, _, timings_hot) = store
-            .extract_object_from_bytes(&tarball, None)
-            .unwrap();
+        let (_, _, timings_hot) = store.extract_object_from_bytes(&tarball, None).unwrap();
         assert_eq!(timings_hot.extract_ms, 0);
         assert_eq!(timings_hot.security_ms, 0);
         assert_eq!(timings_hot.finalize_ms, 0);

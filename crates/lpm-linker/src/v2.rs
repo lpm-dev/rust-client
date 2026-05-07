@@ -46,8 +46,8 @@ use std::path::Path;
 use lpm_common::LpmError;
 use lpm_common::symlink::create_dir_symlink_or_junction;
 use lpm_store::v2::{
-    DepEdge, DepLink, GraphKey, GraphKeyInputs, LinkEntryRequest, LinkMetaPlatform,
-    LinkerModeTag, PeerEntry, PlatformTuple, Store,
+    DepEdge, DepLink, GraphKey, GraphKeyInputs, LinkEntryRequest, LinkMetaPlatform, LinkerModeTag,
+    PeerEntry, PlatformTuple, Store,
 };
 
 use crate::{LinkResult, LinkTarget, LinkerMode, MaterializedPackage};
@@ -190,10 +190,7 @@ pub fn link_packages_v2(
 /// Optional peers (declared in `peerDependenciesMeta` with
 /// `optional: true`) are silently skipped when the install set
 /// doesn't include the peer's package — matches npm's behavior.
-fn augment_with_peer_edges(
-    targets: &[V2Target],
-    store: &Store,
-) -> Result<Vec<V2Target>, LpmError> {
+fn augment_with_peer_edges(targets: &[V2Target], store: &Store) -> Result<Vec<V2Target>, LpmError> {
     // Build a name → (version, has-target) lookup. For 4b's
     // single-version-per-name scope this is unambiguous; multi-source
     // -same-name disambiguation is a Phase 4 follow-up.
@@ -607,8 +604,8 @@ fn create_bin_links_v2(
             if link_path.symlink_metadata().is_ok() {
                 let _ = std::fs::remove_file(&link_path);
             }
-            let relative = pathdiff::diff_paths(&bin_target, &bin_dir)
-                .unwrap_or_else(|| bin_target.clone());
+            let relative =
+                pathdiff::diff_paths(&bin_target, &bin_dir).unwrap_or_else(|| bin_target.clone());
             #[cfg(unix)]
             std::os::unix::fs::symlink(&relative, &link_path).map_err(|e| {
                 LpmError::Store(format!(
@@ -627,9 +624,7 @@ fn create_bin_links_v2(
                 // on.)
                 let target_str = bin_target.to_string_lossy();
                 if let Err(reason) = lpm_common::symlink::validate_cmd_path(&target_str) {
-                    tracing::warn!(
-                        "v2 linker: skipping .cmd shim for {cmd_name}: {reason}"
-                    );
+                    tracing::warn!("v2 linker: skipping .cmd shim for {cmd_name}: {reason}");
                     continue;
                 }
                 let cmd_content = format!(
@@ -806,7 +801,13 @@ mod tests {
         assert_eq!(result.symlinked, 1);
 
         let consumer_root = project.join("node_modules").join("consumer");
-        assert!(consumer_root.symlink_metadata().unwrap().file_type().is_symlink());
+        assert!(
+            consumer_root
+                .symlink_metadata()
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
 
         // Sibling symlink lives at `<consumer_link_dir>/node_modules/lib`,
         // not nested inside `consumer/`. From the project, the
@@ -822,7 +823,11 @@ mod tests {
         let consumer_link_dir = consumer_link_pkg.parent().unwrap().parent().unwrap();
         let lib_sibling = consumer_link_dir.join("node_modules").join("lib");
         assert!(
-            lib_sibling.symlink_metadata().unwrap().file_type().is_symlink(),
+            lib_sibling
+                .symlink_metadata()
+                .unwrap()
+                .file_type()
+                .is_symlink(),
             "sibling lib must be a symlink alongside consumer in the same node_modules/"
         );
         // And the symlink target resolves to the lib link entry's
@@ -879,8 +884,7 @@ mod tests {
 
         let mut t = target("a", "1.0.0", &sri, true);
         t.target.root_link_names = Some(vec![]);
-        let result =
-            link_packages_v2(&project, &[t], &store, LinkerMode::Isolated, None).unwrap();
+        let result = link_packages_v2(&project, &[t], &store, LinkerMode::Isolated, None).unwrap();
         assert_eq!(result.symlinked, 0);
         assert!(!project.join("node_modules").join("a").exists());
     }
@@ -933,8 +937,7 @@ mod tests {
         // Dep 'phantom@9.9.9' has no matching LinkTarget in the set.
         t.target.dependencies = vec![("phantom".into(), "9.9.9".into())];
 
-        let err = link_packages_v2(&project, &[t], &store, LinkerMode::Isolated, None)
-            .unwrap_err();
+        let err = link_packages_v2(&project, &[t], &store, LinkerMode::Isolated, None).unwrap_err();
         let msg = format!("{err}");
         assert!(
             msg.contains("phantom@9.9.9"),
