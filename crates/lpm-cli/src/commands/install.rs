@@ -1565,6 +1565,62 @@ fn registry_source_url_for(name: &str, route_table: &RouteTable) -> String {
     }
 }
 
+/// Phase 66 Phase 4d — `true` iff `project_dir` is on a legacy v1
+/// layout that must be wiped before a v2 install can run cleanly.
+///
+/// Either signal is enough — a project running v1 isolated has
+/// `<project>/.lpm/wrappers/`, hoisted has `<project>/.lpm/hoisted/`,
+/// and a project mid-mode-switch may have both. v2 has neither
+/// (project node_modules holds only symlinks into the global store),
+/// so the predicate also returns `false` on a clean v2 install (which
+/// is what makes it idempotent on re-runs after migration).
+///
+/// Detection lives in this module rather than `lpm-linker`'s
+/// `LayoutPaths` because migration is an install-pipeline concern —
+/// the linker shouldn't know about lpm-rs upgrade lifecycle.
+fn needs_v2_migration(project_dir: &Path) -> bool {
+    project_dir.join(".lpm").join("wrappers").exists()
+        || project_dir.join(".lpm").join("hoisted").exists()
+}
+
+/// Phase 66 Phase 4d migration sequence (preplan §3.2).
+///
+/// Wipe order matters for the install-state freshness gate:
+/// 1. `<project>/.lpm/wrappers/` (legacy isolated wrapper root).
+/// 2. `<project>/.lpm/hoisted/` (legacy hoisted state).
+/// 3. `<project>/node_modules/` entirely, INCLUDING `.bin/`. Bin
+///    shims regenerate from the post-migration install layout; a
+///    stale `.bin/` would point at deleted wrapper paths and crash
+///    every `npx <bin>` afterwards.
+/// 4. `<project>/.lpm/install-hash` — the prior hash assumed v1
+///    layout. Without removal, the freshness check would short-
+///    circuit and skip the v2 install.
+///
+/// Each step is idempotent: a non-existent path is a no-op. A crash
+/// mid-migration leaves a half-wiped project; the next install
+/// re-runs the same wipes (no-ops) and re-attempts the v2 install.
+///
+/// `~/.lpm/store/v1/` is intentionally NOT wiped here — it may still
+/// serve other projects on the same machine until the user runs
+/// `lpm cache prune --legacy-v1` (Phase 4e).
+fn migrate_v1_to_v2(project_dir: &Path) -> std::io::Result<()> {
+    let dot_lpm = project_dir.join(".lpm");
+    for stale in [dot_lpm.join("wrappers"), dot_lpm.join("hoisted")] {
+        if stale.exists() {
+            std::fs::remove_dir_all(&stale)?;
+        }
+    }
+    let nm = project_dir.join("node_modules");
+    if nm.exists() {
+        std::fs::remove_dir_all(&nm)?;
+    }
+    let install_hash = dot_lpm.join("install-hash");
+    if install_hash.exists() {
+        std::fs::remove_file(&install_hash)?;
+    }
+    Ok(())
+}
+
 /// **Phase 59.0 day-6a (F4) + Phase 59.1 day-1 (F6)** — pre-resolve
 /// non-registry dependencies from the manifest before the PubGrub
 /// resolver runs.
@@ -3922,6 +3978,28 @@ async fn run_with_options_under_store_lock(
         );
     }
 
+    // Phase 66 Phase 4d — silent v1 → v2 layout migration on first
+    // v2-mode install in this project.
+    //
+    // Detection (preplan §3.1): the project is on v1 if either
+    // `<project>/.lpm/wrappers/` or `<project>/.lpm/hoisted/` exists.
+    // Both are wiped during migration so the v2 install can populate
+    // a clean slate. The store-side `~/.lpm/store/v1/` is NOT touched
+    // here — it may still serve other projects on the same machine
+    // until the user runs `lpm cache prune --legacy-v1` (Phase 4e).
+    //
+    // Migration is idempotent: re-running on partial state succeeds
+    // (every `rm -rf` is a no-op on already-clean state). A crash
+    // mid-migration leaves a half-wiped project; the next install
+    // re-runs the same wipes and re-attempts the v2 install.
+    if store_v2_handle.is_some() && needs_v2_migration(project_dir) {
+        if !json_output {
+            output::info("migrating to v2 store layout (one-time, ~5\u{2013}10s)");
+        }
+        migrate_v1_to_v2(project_dir)
+            .map_err(|e| LpmError::Registry(format!("v1→v2 migration failed: {e}")))?;
+    }
+
     // **Phase 59.0 day-6a (F4 manifest wiring)** — pre-resolve direct
     // tarball-URL deps from the manifest BEFORE the resolver runs.
     // Each tarball-URL dep is downloaded, extracted into the
@@ -4571,6 +4649,36 @@ async fn run_with_options_under_store_lock(
             p.source_kind(),
             Ok(lpm_lockfile::Source::Directory { .. }) | Ok(lpm_lockfile::Source::Link { .. })
         );
+
+        // Phase 66 §4 — v2 native cache-hit short-circuit.
+        //
+        // When v2 mode is active AND the v2 object dir for this
+        // package's SRI already exists (populated by a prior install
+        // OR by the speculative pre-fetcher earlier in this install),
+        // skip the fetch entirely. The v2 link dispatch reads
+        // `objects/<sri>/` directly, so no per-package linker hint
+        // is needed here — same shape as the v1 cache-hit gate
+        // below.
+        //
+        // Pre-Phase-4d this branch was missing because the v2 fetch
+        // path is itself idempotent (`extract_object_from_bytes`
+        // short-circuits on object hits), so a duplicate fetch was
+        // "free" in correctness terms but wasted network on every
+        // package. Workflow tests that mock the registry with
+        // `expect(1)` per tarball relied on the speculation path
+        // being a no-op (pre-4d drain) and broke under the wired-up
+        // 4d spec path because every package was downloaded twice.
+        if !force
+            && v2_mode
+            && !is_local_source
+            && let Some(v2_store) = store_v2_handle.as_deref()
+            && let Some(sri) = p.integrity.as_deref()
+            && let Ok(object_dir) = v2_store.paths().object_dir(sri)
+            && object_dir.exists()
+        {
+            cached += 1;
+            continue;
+        }
 
         // Phase 66 §4 — v1 → v2 cache-hit translation.
         //
@@ -10582,6 +10690,100 @@ mod tests {
     fn confirm_prompt_test_lock() -> std::sync::MutexGuard<'static, ()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
         LOCK.get_or_init(|| Mutex::new(())).lock().unwrap()
+    }
+
+    // ── Phase 66 Phase 4d migration tests ───────────────────────────
+
+    #[test]
+    fn needs_v2_migration_detects_legacy_isolated_wrappers() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".lpm/wrappers/express@4.21.0")).unwrap();
+        assert!(needs_v2_migration(dir.path()));
+    }
+
+    #[test]
+    fn needs_v2_migration_detects_legacy_hoisted_metadata() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".lpm/hoisted")).unwrap();
+        std::fs::write(dir.path().join(".lpm/hoisted/metadata.json"), b"{}").unwrap();
+        assert!(needs_v2_migration(dir.path()));
+    }
+
+    #[test]
+    fn needs_v2_migration_returns_false_on_clean_v2_or_fresh_project() {
+        let dir = tempfile::tempdir().unwrap();
+        // Fresh project (no .lpm at all) — must NOT trigger migration.
+        assert!(!needs_v2_migration(dir.path()));
+
+        // Clean v2 install: project node_modules has symlinks but no
+        // legacy `.lpm/wrappers/` or `.lpm/hoisted/`.
+        std::fs::create_dir_all(dir.path().join("node_modules")).unwrap();
+        std::fs::create_dir_all(dir.path().join(".lpm")).unwrap();
+        std::fs::write(dir.path().join(".lpm/install-hash"), b"hash").unwrap();
+        assert!(
+            !needs_v2_migration(dir.path()),
+            "v2 install with no legacy markers must not request migration"
+        );
+    }
+
+    #[test]
+    fn migrate_v1_to_v2_wipes_all_required_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path();
+
+        // Synthesize a fully-populated v1 isolated install.
+        let wrappers = project.join(".lpm/wrappers/express@4.21.0/node_modules/express");
+        std::fs::create_dir_all(&wrappers).unwrap();
+        std::fs::write(wrappers.join("package.json"), b"{}").unwrap();
+        std::fs::write(project.join(".lpm/install-hash"), b"deadbeef").unwrap();
+        let nm = project.join("node_modules");
+        std::fs::create_dir_all(nm.join(".bin")).unwrap();
+        std::fs::write(nm.join(".bin/some-shim"), b"#!/bin/sh").unwrap();
+        std::fs::create_dir_all(nm.join("express")).unwrap();
+        // Also a hoisted-mode sidecar to verify both legacy roots are wiped.
+        std::fs::create_dir_all(project.join(".lpm/hoisted")).unwrap();
+        std::fs::write(project.join(".lpm/hoisted/metadata.json"), b"{}").unwrap();
+
+        migrate_v1_to_v2(project).unwrap();
+
+        assert!(!project.join(".lpm/wrappers").exists());
+        assert!(!project.join(".lpm/hoisted").exists());
+        assert!(!project.join("node_modules").exists());
+        assert!(!project.join(".lpm/install-hash").exists());
+        // Project root + .lpm dir itself survive — only the legacy
+        // children get wiped, so other lpm sidecars (build-state,
+        // trust-snapshot) aren't accidentally collateral.
+        assert!(project.exists());
+        assert!(project.join(".lpm").exists());
+    }
+
+    #[test]
+    fn migrate_v1_to_v2_is_idempotent_on_clean_state() {
+        let dir = tempfile::tempdir().unwrap();
+        // No legacy state at all — migration must succeed as a no-op.
+        migrate_v1_to_v2(dir.path()).unwrap();
+        // Second call also a no-op.
+        migrate_v1_to_v2(dir.path()).unwrap();
+    }
+
+    #[test]
+    fn migrate_v1_to_v2_preserves_project_lpm_sidecars() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path();
+
+        // build-state and trust-snapshot live alongside install-hash
+        // but persist across installs (they encode user-approved
+        // policy); migration must NOT wipe them.
+        std::fs::create_dir_all(project.join(".lpm")).unwrap();
+        std::fs::write(project.join(".lpm/build-state.json"), b"{}").unwrap();
+        std::fs::write(project.join(".lpm/trust-snapshot.json"), b"{}").unwrap();
+        std::fs::create_dir_all(project.join(".lpm/wrappers")).unwrap();
+
+        migrate_v1_to_v2(project).unwrap();
+
+        assert!(project.join(".lpm/build-state.json").exists());
+        assert!(project.join(".lpm/trust-snapshot.json").exists());
+        assert!(!project.join(".lpm/wrappers").exists());
     }
 
     /// Phase 46 P5 Chunk 5 regression guard: the P4 drift gate MUST
