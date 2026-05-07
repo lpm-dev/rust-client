@@ -205,7 +205,28 @@ impl GraphKey {
     const SHORT_HEX_LEN: usize = 16;
 
     /// Compute the graph key from a complete [`GraphKeyInputs`] struct.
+    ///
+    /// **Hoisted peer-collapse is enforced here, not at the caller.**
+    /// Preplan §2.2 locks "peers are empty in hoisted mode" as the
+    /// invariant that lets cross-project hoisted wrappers share. If
+    /// the primitive trusted callers to normalize, a single missed
+    /// site in Phase 4b would silently fragment the cache (one wrapper
+    /// per peer-context instead of one per name+edge-set), throwing
+    /// away the hoisted-side win this whole rewrite is supposed to
+    /// unlock. We collapse `inputs.peers` to empty when
+    /// `linker_mode == Hoisted` and `debug_assert!` to surface the
+    /// caller's mistake during dev/test builds.
     pub fn derive(inputs: &GraphKeyInputs) -> Self {
+        debug_assert!(
+            !matches!(inputs.linker_mode, LinkerModeTag::Hoisted) || inputs.peers.is_empty(),
+            "GraphKey::derive: hoisted graph keys must not carry peers \
+             (collapsing silently in release; caller should pass an \
+             empty Vec). Got {} peers for {}@{}.",
+            inputs.peers.len(),
+            inputs.name,
+            inputs.version,
+        );
+
         let mut hasher = blake3::Hasher::new();
         hasher.update(Self::SCHEMA);
         hasher.update(b"\0");
@@ -222,7 +243,14 @@ impl GraphKey {
             inputs.linker_mode.as_str().as_bytes(),
         );
 
-        let peers_str = format_peers(&inputs.peers);
+        // Defense-in-depth: even if a caller slips a non-empty peer
+        // list past the debug_assert (release build), peers do NOT
+        // contribute to the hoisted graph key.
+        let effective_peers: &[PeerEntry] = match inputs.linker_mode {
+            LinkerModeTag::Isolated => &inputs.peers,
+            LinkerModeTag::Hoisted => &[],
+        };
+        let peers_str = format_peers(effective_peers);
         write_field(&mut hasher, b"peers", peers_str.as_bytes());
 
         let edges_str = format_deps(&inputs.deps);
