@@ -1,0 +1,10 @@
+{
+	"name": "audit-fixture-link-protocol",
+	"version": "1.0.0",
+	"private": true,
+	"_comment": "Phase 2 hoisted compat audit. Source-kind fixture: `link:./path` protocol. Like file: but creates a SYMLINK instead of a copy — the runtime must resolve through the symlink to the live source. Edits to the source are reflected immediately (the entire reason link: exists vs file:).",
+	"dependencies": {
+		"linked-counter": "link:./local/counter",
+		"lodash": "^4.17.21"
+	}
+}

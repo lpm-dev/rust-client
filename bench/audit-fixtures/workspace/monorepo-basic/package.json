@@ -1,0 +1,12 @@
+{
+	"name": "audit-fixture-workspace-monorepo",
+	"version": "1.0.0",
+	"private": true,
+	"_comment": "Phase 2 hoisted compat audit. Workspace fixture (no other coverage exists). Three-member monorepo with internal cross-deps via workspace:* and external deps. Verifies (1) workspace resolution under both linker modes, (2) internal symlink creation per-member, (3) hoisting of shared external deps without breaking workspace identity. The root workspace:* references are needed because lpm's bare `install` only processes member deps when the root references them — different shape than npm/bun which auto-recurse, but it's what's wired today.",
+	"dependencies": {
+		"audit-utility": "workspace:*",
+		"audit-core": "workspace:*",
+		"audit-consumer": "workspace:*"
+	},
+	"workspaces": ["packages/*"]
+}

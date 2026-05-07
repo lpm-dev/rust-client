@@ -1,0 +1,13 @@
+{
+  "fixture": "peer-heavy/apollo-graphql",
+  "mode": "hoisted",
+  "timestamp": "20260507-133155",
+  "install_exit": 0,
+  "install_ms": 321,
+  "top_level_dep_count": 19,
+  "require_pass": 2,
+  "require_fail": 0,
+  "smoke_exit": 0,
+  "verdict": "PASS",
+  "fail_reason": ""
+}

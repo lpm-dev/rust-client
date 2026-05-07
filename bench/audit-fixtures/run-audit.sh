@@ -39,17 +39,50 @@ FIXTURE_NAME="$(echo "$FIXTURE_REL" | tr '/' '-')"
 TS="$(date +%Y%m%d-%H%M%S)"
 mkdir -p "$RESULTS_DIR"
 
+# Optional `requirements.sh` per fixture: if it exists and exits
+# non-zero, the audit is SKIPPED (not failed) for this fixture.
+# Used for env-conditional fixtures (better-sqlite3 needs node-gyp on
+# PATH; without it the install can't compile). The reason is
+# captured from the script's stderr.
+if [[ -x "$FIXTURE_DIR/requirements.sh" ]]; then
+    set +e
+    skip_log="$(bash "$FIXTURE_DIR/requirements.sh" 2>&1)"
+    skip_exit=$?
+    set -e
+    if [[ $skip_exit -ne 0 ]]; then
+        echo "[audit] $FIXTURE_REL — SKIP (requirements not met)"
+        printf "  %s\n" "$skip_log"
+        # Write a SKIP result JSON so aggregators can distinguish skip-
+        # from-fail.
+        for mode in isolated hoisted; do
+            python3 - <<EOF > "$RESULTS_DIR/$FIXTURE_NAME-$mode-$TS.json"
+import json
+print(json.dumps({
+    "fixture": "$FIXTURE_REL",
+    "mode": "$mode",
+    "timestamp": "$TS",
+    "verdict": "SKIP",
+    "skip_reason": """$skip_log""",
+}, indent=2))
+EOF
+        done
+        exit 0
+    fi
+fi
+
 now_ms() { python3 -c 'import time;print(int(time.perf_counter_ns()))'; }
 
 # Read direct deps from the fixture's package.json (one per line).
+# Only `dependencies` — devDependencies are typically CLI tools (vitest,
+# prisma, eslint, etc.) where `require()` isn't the validation path
+# (vitest is ESM-only, prisma's @prisma/client needs `prisma generate`
+# first, etc.). The fixture's smoke.sh exercises devDeps as needed.
 direct_deps() {
     python3 - <<EOF
 import json, sys
 with open("$FIXTURE_DIR/package.json") as f:
     pkg = json.load(f)
 for k in (pkg.get("dependencies") or {}).keys():
-    print(k)
-for k in (pkg.get("devDependencies") or {}).keys():
     print(k)
 EOF
 }
@@ -69,7 +102,7 @@ run_mode() {
     for f in "$FIXTURE_DIR"/*; do
         local base="$(basename "$f")"
         case "$base" in
-            README.md|smoke.sh) continue ;;
+            README.md|smoke.sh|requirements.sh) continue ;;
             *) cp -R "$f" "$work/" ;;
         esac
     done

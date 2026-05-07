@@ -1,0 +1,13 @@
+{
+  "fixture": "source-kind/file-protocol",
+  "mode": "hoisted",
+  "timestamp": "20260507-133607",
+  "install_exit": 0,
+  "install_ms": 242,
+  "top_level_dep_count": 3,
+  "require_pass": 2,
+  "require_fail": 0,
+  "smoke_exit": 0,
+  "verdict": "PASS",
+  "fail_reason": ""
+}

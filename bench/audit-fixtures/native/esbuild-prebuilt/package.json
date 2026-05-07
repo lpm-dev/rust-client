@@ -1,0 +1,9 @@
+{
+	"name": "audit-fixture-esbuild-prebuilt",
+	"version": "1.0.0",
+	"private": true,
+	"_comment": "Phase 2 hoisted compat audit. Native fixture (always-runnable companion to better-sqlite3). esbuild is the canonical example of a JS package that ships per-platform native binaries via optionalDependencies — `@esbuild/darwin-arm64`, `@esbuild/linux-x64`, etc. — and uses a small JS postinstall to verify the right binary is wired up. No node-gyp, no compilation, no ~/.npm dance. Tests three things at once: (1) optional+platform-specific dep installation, (2) postinstall script execution, (3) native binary load + actual native call (transform).",
+	"dependencies": {
+		"esbuild": "^0.24.0"
+	}
+}

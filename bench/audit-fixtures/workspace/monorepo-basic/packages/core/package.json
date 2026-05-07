@@ -1,0 +1,10 @@
+{
+	"name": "audit-core",
+	"version": "1.0.0",
+	"private": true,
+	"main": "index.js",
+	"dependencies": {
+		"audit-utility": "workspace:*",
+		"lodash": "^4.17.21"
+	}
+}
