@@ -278,6 +278,17 @@ pub static PACKAGE_JSON_MISSING: CheckEntry = CheckEntry {
     auto_fix: None,
 };
 
+pub static LINKER_MODE_RESOLVED: CheckEntry = CheckEntry {
+    code: "linker_mode_resolved",
+    name: "Linker mode",
+    category: Category::ProjectState,
+    description: "Reports the LinkerMode the install pipeline would resolve to plus which surface in the precedence chain produced it (CLI flag / global config / env var / package.json / workspace auto-detected / default).",
+    when_fires: "Always — runs after `package.json` is read so the resolution chain reflects the manifest's `lpm.linker` setting.",
+    remediation: "No action — informational. To change the result, set one of the higher-precedence surfaces (e.g. `--linker=isolated`, `LPM_LINKER`, `package.json > lpm > linker`).",
+    possible_severities: &[Severity::Pass],
+    auto_fix: None,
+};
+
 pub static NODE_MODULES_ISOLATED_HEALTHY: CheckEntry = CheckEntry {
     code: "node_modules_isolated_healthy",
     name: "node_modules",
@@ -1349,6 +1360,7 @@ pub static CLI_CATALOG: &[&CheckEntry] = &[
     // Project state
     &PACKAGE_JSON_PRESENT,
     &PACKAGE_JSON_MISSING,
+    &LINKER_MODE_RESOLVED,
     &NODE_MODULES_ISOLATED_HEALTHY,
     &NODE_MODULES_HOISTED_HEALTHY,
     &NODE_MODULES_VIRTUAL_HEALTHY,

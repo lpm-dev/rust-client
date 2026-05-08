@@ -333,11 +333,15 @@ pub fn check_install_state(project_dir: &Path) -> InstallState {
     };
 
     let cfg = crate::commands::config::GlobalConfig::load();
-    let linker_mode =
-        match crate::linker_config::resolve_effective_linker_from_bytes(None, &pkg_content, &cfg) {
-            Ok(mode) => mode,
-            Err(_) => return invalid_linker_state(project_dir, &pkg_content),
-        };
+    let linker_mode = match crate::linker_config::resolve_effective_linker_from_bytes(
+        None,
+        &pkg_content,
+        &cfg,
+        project_dir,
+    ) {
+        Ok(mode) => mode,
+        Err(_) => return invalid_linker_state(project_dir, &pkg_content),
+    };
 
     // Single mtime probe lives inside `check_install_state_with_linker`
     // — no pre-delegation probe here, otherwise the stale path would
@@ -353,11 +357,15 @@ pub fn check_install_state(project_dir: &Path) -> InstallState {
 /// internally with `cli_override = None`.
 pub fn check_install_state_with_content(project_dir: &Path, pkg_content: &str) -> InstallState {
     let cfg = crate::commands::config::GlobalConfig::load();
-    let linker_mode =
-        match crate::linker_config::resolve_effective_linker_from_bytes(None, pkg_content, &cfg) {
-            Ok(mode) => mode,
-            Err(_) => return invalid_linker_state(project_dir, pkg_content),
-        };
+    let linker_mode = match crate::linker_config::resolve_effective_linker_from_bytes(
+        None,
+        pkg_content,
+        &cfg,
+        project_dir,
+    ) {
+        Ok(mode) => mode,
+        Err(_) => return invalid_linker_state(project_dir, pkg_content),
+    };
     check_install_state_with_linker(project_dir, pkg_content, linker_mode)
 }
 

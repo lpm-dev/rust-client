@@ -295,6 +295,35 @@ pub async fn run(
         ));
     }
 
+    // 4.5. Resolved linker mode + source — surfaces "why is my linker
+    // mode X?" so users running `lpm doctor` after the workspace-aware
+    // default flip can see whether the result came from an explicit
+    // override or auto-detection. Skipped silently when there's no
+    // readable package.json (no manifest → no resolution to report);
+    // the resolution-error path emits a fail anyway via the install
+    // pipeline. Best-effort: any I/O / parse failure here downgrades
+    // to a quiet skip rather than failing doctor.
+    if let Ok(pkg_content) = std::fs::read_to_string(&pkg_json_path)
+        && let Ok(pkg_parsed) = serde_json::from_str::<lpm_workspace::PackageJson>(&pkg_content)
+    {
+        let cfg = crate::commands::config::GlobalConfig::load();
+        if let Ok((mode, source)) = crate::linker_config::resolve_effective_linker_with_source(
+            None,
+            &pkg_parsed,
+            &cfg,
+            project_dir,
+        ) {
+            let mode_str = match mode {
+                lpm_linker::LinkerMode::Isolated => "isolated",
+                lpm_linker::LinkerMode::Hoisted => "hoisted",
+            };
+            checks.push(Check::pass(
+                &doctor_catalog::LINKER_MODE_RESOLVED,
+                &format!("{mode_str} (source: {})", source.as_str()),
+            ));
+        }
+    }
+
     // 5. node_modules intact?
     //
     // Phase 61.4 + hoisted-symmetry: predicate is layout-aware via

@@ -3261,15 +3261,19 @@ async fn run_with_options_under_store_lock(
     // entry point (top-level + the 9 internal callers) honors the same
     // chain.
     let global_cfg = crate::commands::config::GlobalConfig::load();
-    let linker_mode =
-        crate::linker_config::resolve_effective_linker(linker_override, &pkg, &global_cfg)
-            .map_err(|e| {
-                LpmError::Script(format!(
-                    "{e} \
+    let linker_mode = crate::linker_config::resolve_effective_linker(
+        linker_override,
+        &pkg,
+        &global_cfg,
+        project_dir,
+    )
+    .map_err(|e| {
+        LpmError::Script(format!(
+            "{e} \
              Update the offending surface or override with \
              `--linker=<isolated|hoisted>`."
-                ))
-            })?;
+        ))
+    })?;
 
     // Fast-exit: if package.json + lockfile haven't changed AND the
     // resolved linker matches the one used for the prior install, skip
