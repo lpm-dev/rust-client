@@ -111,6 +111,20 @@ where
 {
     let decoder = GzDecoder::new(reader);
     let mut archive = Archive::new(decoder);
+    // **Phase 66 perf followup #1 (samply-driven, 2026-05-08).**
+    // npm tarballs are typically authored on different OSs / FS layouts
+    // and ship with arbitrary uid/gid + mode bits that mean nothing to
+    // a downstream Node consumer. The tar crate's default unpack path
+    // calls `fchmodat` + `fchownat` per regular file (≈ 9 % of cold-
+    // install CPU on `bench/fixture-large` per the
+    // `tar::EntryFields::unpack::set_ownerships` self-time hotspot).
+    // For a 256-package install at ~80 entries each, that's ~20k
+    // unnecessary metadata syscalls. We don't preserve perms or
+    // ownerships in the global store — extracted files inherit the
+    // lpm process's umask and uid, which is what every downstream
+    // `require()` actually expects.
+    archive.set_preserve_permissions(false);
+    archive.set_preserve_ownerships(false);
     let mut extracted_files = Vec::new();
     let mut created_dirs = Vec::new();
     let mut total_size: u64 = 0;
