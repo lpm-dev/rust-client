@@ -80,17 +80,24 @@ impl PackageInventory {
         // Load project-level audit cache
         let mut project_cache = ProjectAuditCache::read(&discovery.project_root);
 
-        // Try LPM store for store-backed packages
-        let lpm_store = lpm_store::PackageStore::default_location().ok();
+        // S5c — v2-aware store lookup; see `audit/mod.rs` for the
+        // full rationale. Routes through `find_installed_package_baseline`
+        // (v2-first, v1-fallback) so v2-installed packages don't all
+        // fall through to the project_cache miss path.
+        let lpm_root = lpm_common::LpmRoot::from_env().ok();
 
         for pkg in &scannable {
             let analysis = if pkg.scan_mode == ScanMode::RegistryAndStore {
                 // LPM store: try store cache first, then project cache
-                lpm_store
+                lpm_root
                     .as_ref()
-                    .and_then(|store| {
-                        let pkg_dir = store.package_dir(&pkg.name, &pkg.version);
-                        lpm_security::behavioral::read_cached_analysis(&pkg_dir)
+                    .and_then(|root| {
+                        lpm_store::find_installed_package_baseline(root, &pkg.name, &pkg.version)
+                            .ok()
+                            .flatten()
+                    })
+                    .and_then(|baseline| {
+                        lpm_security::behavioral::read_cached_analysis(&baseline.package_dir)
                     })
                     .or_else(|| {
                         project_cache

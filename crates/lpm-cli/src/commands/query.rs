@@ -72,16 +72,29 @@ pub async fn run(
     let mut is_built_map: HashMap<String, bool> = HashMap::new();
 
     let inv: PackageInventory = if is_lpm_project {
-        let lock_path = lpm_common::LpmRoot::from_env()?.store_lock();
+        // S5c — v2-aware store lookup. Pre-fix used the v1-only
+        // `PackageStore::package_dir`; under v2 the path doesn't
+        // exist, so `check_has_lifecycle_scripts` and the
+        // BUILD_MARKER probe both pointed at thin air. The fall-
+        // through to `project_root.join(&pkg.path)` (which is the
+        // live `node_modules/<pkg>/` path) was correct on the
+        // none-store branch but unreachable on the v2 install
+        // because the Some(store) branch always took priority.
+        let lpm_root_outer = lpm_common::LpmRoot::from_env()?;
+        let lock_path = lpm_root_outer.store_lock();
+        let lpm_root_inner = lpm_root_outer.clone();
         lpm_common::with_shared_lock(lock_path, || {
             let inv = PackageInventory::from_discovery(pre_discovery)?;
-            let store = lpm_store::PackageStore::default_location().ok();
             for pkg in &inv.discovery.packages {
-                let pkg_dir = if let Some(s) = &store {
-                    s.package_dir(&pkg.name, &pkg.version)
-                } else {
-                    inv.discovery.project_root.join(&pkg.path)
-                };
+                let pkg_dir = lpm_store::find_installed_package_baseline(
+                    &lpm_root_inner,
+                    &pkg.name,
+                    &pkg.version,
+                )
+                .ok()
+                .flatten()
+                .map(|b| b.package_dir)
+                .unwrap_or_else(|| inv.discovery.project_root.join(&pkg.path));
                 let key = if use_path_keys {
                     pkg.path.clone()
                 } else {

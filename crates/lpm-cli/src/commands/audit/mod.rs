@@ -602,8 +602,16 @@ fn run_behavioral_analysis(
     // - lpm: fallback cache when store entries are missing
     let mut project_cache = ProjectAuditCache::read(&discovery.project_root);
 
-    // Try LPM store for store-backed packages
-    let lpm_store = lpm_store::PackageStore::default_location().ok();
+    // S5c — v2-aware store lookup. `find_installed_package_baseline`
+    // prefers v2 (default since Phase 66 4b) and falls back to v1.
+    // Pre-fix this used the v1-only `PackageStore::package_dir` and
+    // every v2-installed package fell through to the slower
+    // project_cache path on every audit run. The clonefile that
+    // populates the v2 link entry copies the `.lpm-security.json`
+    // sidecar from the object dir into the link's `node_modules/<pkg>/`,
+    // so reading from the baseline-resolved path picks up the
+    // pre-computed analysis written at install time.
+    let lpm_root = lpm_common::LpmRoot::from_env().ok();
 
     // Progress indicator for large scans
     let show_progress = !json_output && scannable.len() > 50;
@@ -635,12 +643,16 @@ fn run_behavioral_analysis(
         // 2. Project-level audit cache (cheap — from prior lpm audit run)
         // 3. Fresh scan on node_modules/ directory (expensive — reads source files)
         let analysis = if pkg.scan_mode == ScanMode::RegistryAndStore {
-            // Try LPM store first, then fall back to project cache
-            lpm_store
+            // Try LPM store first, then fall back to project cache.
+            lpm_root
                 .as_ref()
-                .and_then(|store| {
-                    let pkg_dir = store.package_dir(&pkg.name, &pkg.version);
-                    lpm_security::behavioral::read_cached_analysis(&pkg_dir)
+                .and_then(|root| {
+                    lpm_store::find_installed_package_baseline(root, &pkg.name, &pkg.version)
+                        .ok()
+                        .flatten()
+                })
+                .and_then(|baseline| {
+                    lpm_security::behavioral::read_cached_analysis(&baseline.package_dir)
                 })
                 .or_else(|| {
                     project_cache
