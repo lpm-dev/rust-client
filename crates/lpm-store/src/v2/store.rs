@@ -227,12 +227,15 @@ impl Store {
     /// the same analysis result, so duplicating it per link entry
     /// would be redundant.
     ///
-    /// **Perf note (Phase 4b):** v2 runs the post-extract directory
-    /// walker (`analyze_package`), matching v1's NON-streaming
-    /// `store_at_dir` path. v1's streaming path uses the fused
-    /// extractor+analyzer (lib.rs:604-613) which overlaps the extract
-    /// and scan phases. A v2 streaming variant is a Phase 4d/4f
-    /// optimization before the default flip.
+    /// **Perf note (Phase 66 followup #5, 2026-05-09):** uses the fused
+    /// extractor+analyzer path — `PackageAnalyzer::should_scan` filters
+    /// scannable source entries during the tar walk, and the inspector
+    /// closure feeds their bytes into the analyzer while still in the
+    /// extractor's write buffer. Eliminates the post-extract directory
+    /// walk (`collect_source_files_recursive`) and the per-source-file
+    /// disk re-read that the pre-followup non-streaming path incurred.
+    /// Mirrors v1's `stream_and_store_package` topology
+    /// ([lib.rs:594-618](super::super::stream_and_store_package)).
     pub fn extract_object(&self, sri: &str, tarball_data: &[u8]) -> Result<PathBuf, LpmError> {
         Ok(self.extract_object_with_timings(sri, tarball_data)?.0)
     }
@@ -287,21 +290,52 @@ impl Store {
             let _ = std::fs::remove_dir_all(&tmp_dir);
         }
 
+        // Phase 66 followup #5 (post-flamegraph, 2026-05-09): fused
+        // extract + behavioral scan in a single pass. Mirrors v1's
+        // `stream_and_store_package` (lib.rs:594-618). The pre-followup
+        // path called `extract_tarball` then `analyze_package`, which
+        // walked the just-written tree a second time and re-`read()` every
+        // source file from disk — symbolicated samply attributed ~10 % of
+        // active CPU to that redundancy (`collect_source_files_recursive`
+        // 1.5 % + `analyze_single_file` re-reads 4.9 % +
+        // `analyze_package` 3.8 %).
+        //
+        // The fused topology: `should_scan` filters per entry inside the
+        // tar walk; the inspector closure feeds matching entries' bytes
+        // into the analyzer while still in the extractor's write buffer.
+        // The post-extract `finalize` only reads `package.json` (one
+        // open) for manifest-level tags — the per-source-file pass is
+        // gone.
+        //
+        // `tarball_data` is `&[u8]`; slices implement `Read` directly so
+        // we don't need to wrap in a `Cursor`. RefCell wraps the analyzer
+        // so the closure (`FnMut`) can mutate it without exclusive
+        // borrows escaping the call site.
         let extract_start = std::time::Instant::now();
-        if let Err(error) = lpm_extractor::extract_tarball(tarball_data, &tmp_dir) {
+        let analyzer =
+            std::cell::RefCell::new(lpm_security::behavioral::PackageAnalyzer::new());
+        let extract_result = lpm_extractor::extract_tarball_from_reader_with_inspector(
+            tarball_data,
+            &tmp_dir,
+            lpm_security::behavioral::PackageAnalyzer::should_scan,
+            |entry| {
+                if let Some(bytes) = entry.bytes {
+                    analyzer.borrow_mut().feed(entry.relative_path, bytes);
+                }
+            },
+        );
+        if let Err(error) = extract_result {
             let _ = std::fs::remove_dir_all(&tmp_dir);
             return Err(error);
         }
         timings.extract_ms = extract_start.elapsed().as_millis();
 
-        // Behavioral security analysis — same shape as v1's
-        // non-streaming `store_at_dir` path (lib.rs:348-357). Done
-        // BEFORE the atomic rename so the cache file is part of the
-        // atomically-published state. Analysis failures are
-        // non-fatal: warn and continue (subsequent installs will
-        // retry).
+        // Manifest-level analysis + cache write. Done BEFORE the atomic
+        // rename so the cache file is part of the atomically-published
+        // state. Analysis failures are non-fatal: warn and continue
+        // (subsequent installs will retry).
         let security_start = std::time::Instant::now();
-        let analysis = lpm_security::behavioral::analyze_package(&tmp_dir);
+        let analysis = analyzer.into_inner().finalize(&tmp_dir);
         if let Err(e) = lpm_security::behavioral::write_cached_analysis(&tmp_dir, &analysis) {
             tracing::warn!(
                 target = %tmp_dir.display(),
