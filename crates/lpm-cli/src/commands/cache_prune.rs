@@ -249,13 +249,24 @@ pub fn compute_prune_plan(
         if reachable.contains(dir) {
             continue;
         }
-        if let Some(max_age) = max_age
-            && (now - meta.last_referenced_at) < max_age
-        {
-            // Young entry — preserve under the "registry might be
-            // stale; entry might be in-use by an unrecorded project"
-            // assumption.
-            continue;
+        if let Some(max_age) = max_age {
+            // Phase 66 followup #3 — the JSON `last_referenced_at`
+            // field is set at first population and never rewritten
+            // post-followup; cache-hit installs refresh the sidecar
+            // file's mtime instead. `effective_last_referenced_at`
+            // returns max(json_field, file_mtime) so this filter
+            // sees fresh installs even though the JSON itself is
+            // immutable. Schema-compatible with pre-followup
+            // sidecars (where touch rewrote the field — the json
+            // field is still ≤ mtime in the worst case).
+            let sidecar_path = dir.join(lpm_store::v2::LINK_META_FILENAME);
+            let last_seen = meta.effective_last_referenced_at(&sidecar_path);
+            if (now - last_seen) < max_age {
+                // Young entry — preserve under the "registry might
+                // be stale; entry might be in-use by an unrecorded
+                // project" assumption.
+                continue;
+            }
         }
         link_entries_orphaned.push(dir.clone());
     }

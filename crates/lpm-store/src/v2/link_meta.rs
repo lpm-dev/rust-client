@@ -145,6 +145,66 @@ impl LinkMeta {
         self.last_referenced_at = Utc::now();
     }
 
+    /// Phase 66 followup #3 — refresh the sidecar's "last touched"
+    /// signal via a single [`std::fs::File::set_modified`] call (one
+    /// `utimes(2)` syscall) instead of read+modify+write+rename (three
+    /// syscalls plus serde JSON round-trip).
+    ///
+    /// The on-disk JSON's `last_referenced_at` field becomes a stale
+    /// snapshot from the initial population; prune reconciles it
+    /// against the file mtime via
+    /// [`Self::effective_last_referenced_at`]. Schema-compatible —
+    /// older sidecars predating this change still parse cleanly and
+    /// their `last_referenced_at` remains valid (just always ≤ mtime).
+    ///
+    /// Idempotent. Errors from the underlying `set_modified` are
+    /// returned as `LpmError::Store`; callers may safely treat the
+    /// failure as non-fatal (a missed touch only widens prune's
+    /// view of cold entries by one install cycle).
+    pub fn touch_on_disk(sidecar_path: &Path) -> Result<(), LpmError> {
+        let file = std::fs::File::options()
+            .write(true)
+            .open(sidecar_path)
+            .map_err(|e| {
+                LpmError::Store(format!(
+                    "failed to open v2 link sidecar for touch at {}: {e}",
+                    sidecar_path.display()
+                ))
+            })?;
+        file.set_modified(std::time::SystemTime::now())
+            .map_err(|e| {
+                LpmError::Store(format!(
+                    "failed to update v2 link sidecar mtime at {}: {e}",
+                    sidecar_path.display()
+                ))
+            })?;
+        Ok(())
+    }
+
+    /// Phase 66 followup #3 — the touch-time prune actually consults.
+    ///
+    /// Returns `max(self.last_referenced_at, file_mtime(sidecar_path))`.
+    /// Under [`Self::touch_on_disk`] semantics, file mtime is the
+    /// authoritative "last referenced" signal post-population; the
+    /// JSON field is preserved only for backward-compat with
+    /// pre-followup-#3 sidecars (where `touch` rewrote the field).
+    /// Falling back to the JSON field when mtime is unreadable means
+    /// the prune contract degrades gracefully on permission/EIO
+    /// failures rather than over-aggressively expiring entries.
+    pub fn effective_last_referenced_at(&self, sidecar_path: &Path) -> DateTime<Utc> {
+        match std::fs::metadata(sidecar_path).and_then(|m| m.modified()) {
+            Ok(mtime) => {
+                let mtime_utc: DateTime<Utc> = mtime.into();
+                if mtime_utc > self.last_referenced_at {
+                    mtime_utc
+                } else {
+                    self.last_referenced_at
+                }
+            }
+            Err(_) => self.last_referenced_at,
+        }
+    }
+
     /// Read a sidecar from `<link_dir>/.lpm-link-meta.json`.
     ///
     /// Returns [`LpmError::Store`] on missing-file / malformed JSON /
@@ -341,6 +401,42 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(2));
         meta.touch();
         assert!(meta.last_referenced_at > before);
+    }
+
+    #[test]
+    fn touch_on_disk_advances_file_mtime() {
+        let dir = tempfile::tempdir().unwrap();
+        let meta = sample_meta();
+        let path = meta.write_to(dir.path()).unwrap();
+        let mtime_before = std::fs::metadata(&path).unwrap().modified().unwrap();
+        // FAT/CIFS-tolerant sleep so the mtime delta is observable on
+        // every supported test runner.
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        LinkMeta::touch_on_disk(&path).unwrap();
+        let mtime_after = std::fs::metadata(&path).unwrap().modified().unwrap();
+        assert!(mtime_after > mtime_before);
+    }
+
+    #[test]
+    fn effective_last_referenced_at_takes_max_of_json_and_mtime() {
+        let dir = tempfile::tempdir().unwrap();
+        let meta = sample_meta();
+        let path = meta.write_to(dir.path()).unwrap();
+        // The JSON field and the mtime are both ~now after `write_to`
+        // — the effective value is dominated by whichever is higher.
+        let original_json_field = meta.last_referenced_at;
+        let effective = meta.effective_last_referenced_at(&path);
+        assert!(
+            effective >= original_json_field,
+            "effective is at least the JSON field"
+        );
+
+        // After a touch, mtime advances past the (frozen) JSON field —
+        // effective tracks mtime, NOT the JSON field.
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        LinkMeta::touch_on_disk(&path).unwrap();
+        let after_touch = meta.effective_last_referenced_at(&path);
+        assert!(after_touch > original_json_field);
     }
 
     #[test]
