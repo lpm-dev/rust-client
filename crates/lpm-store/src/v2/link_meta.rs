@@ -182,6 +182,11 @@ impl LinkMeta {
     /// then renamed into place — concurrent installs pointing at the
     /// same graph-key see either the old payload or the new payload,
     /// never a half-written one.
+    ///
+    /// Use [`Self::write_to_unpublished`] when the caller already holds an
+    /// unpublished staging directory (e.g. cold population): the outer
+    /// atomic-rename of the staging dir provides the visibility boundary,
+    /// so the inner tmp+rename is pure overhead.
     pub fn write_to(&self, link_dir: &Path) -> Result<PathBuf, LpmError> {
         let final_path = link_dir.join(LINK_META_FILENAME);
         let tmp_path = link_dir.join(format!("{LINK_META_FILENAME}.tmp.{}", std::process::id()));
@@ -210,6 +215,33 @@ impl LinkMeta {
             ))
         })?;
 
+        Ok(final_path)
+    }
+
+    /// Write the sidecar directly into a directory that is NOT yet
+    /// observable to other processes. Skips the inner tmp+rename used by
+    /// [`Self::write_to`].
+    ///
+    /// Atomicity invariant: the caller MUST be writing into a staging dir
+    /// that will be published via a single atomic rename later (e.g.
+    /// `populate_link_entry`'s `links/<key>.tmp.<pid>.<tid>/` →
+    /// `links/<key>/`). Under that contract, no observer can ever see the
+    /// half-written sidecar — the outer rename is the visibility
+    /// boundary, so the inner tmp+rename is dead syscalls.
+    ///
+    /// Wins ~35 % of cold-install rename syscalls (one per link entry ×
+    /// hundreds of packages) per Phase 66 post-flamegraph audit
+    /// (2026-05-09).
+    pub fn write_to_unpublished(&self, staging_dir: &Path) -> Result<PathBuf, LpmError> {
+        let final_path = staging_dir.join(LINK_META_FILENAME);
+        let bytes = serde_json::to_vec_pretty(self)
+            .map_err(|e| LpmError::Store(format!("failed to serialize v2 link sidecar: {e}")))?;
+        std::fs::write(&final_path, &bytes).map_err(|e| {
+            LpmError::Store(format!(
+                "failed to write v2 link sidecar at {}: {e}",
+                final_path.display()
+            ))
+        })?;
         Ok(final_path)
     }
 }

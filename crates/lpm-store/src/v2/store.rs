@@ -844,7 +844,11 @@ fn populate_into(
         deps_meta,
         platform.clone(),
     );
-    sidecar.write_to(tmp_dir)?;
+    // `tmp_dir` is the unpublished staging dir; the outer rename in
+    // `populate_link_entry` is the visibility boundary, so we can skip the
+    // tmp+rename dance and write the sidecar straight in. See
+    // [`LinkMeta::write_to_unpublished`] for the atomicity contract.
+    sidecar.write_to_unpublished(tmp_dir)?;
 
     Ok(sidecar)
 }

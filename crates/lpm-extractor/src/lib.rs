@@ -111,20 +111,27 @@ where
 {
     let decoder = GzDecoder::new(reader);
     let mut archive = Archive::new(decoder);
-    // **Phase 66 perf followup #1 (samply-driven, 2026-05-08).**
-    // npm tarballs are typically authored on different OSs / FS layouts
-    // and ship with arbitrary uid/gid + mode bits that mean nothing to
-    // a downstream Node consumer. The tar crate's default unpack path
-    // calls `fchmodat` + `fchownat` per regular file (≈ 9 % of cold-
-    // install CPU on `bench/fixture-large` per the
-    // `tar::EntryFields::unpack::set_ownerships` self-time hotspot).
-    // For a 256-package install at ~80 entries each, that's ~20k
-    // unnecessary metadata syscalls. We don't preserve perms or
-    // ownerships in the global store — extracted files inherit the
-    // lpm process's umask and uid, which is what every downstream
-    // `require()` actually expects.
+    // **Phase 66 perf followup #1 (samply-driven, 2026-05-08; extended 2026-05-09
+    // post-flamegraph).** npm tarballs ship arbitrary uid/gid/mode/mtime that
+    // mean nothing to a downstream Node consumer. The tar crate's defaults call
+    // `fchmodat` + `fchownat` + `filetime::set_file_handle_times` per regular
+    // file. Disabling all three:
+    // - `preserve_permissions(false)` — drops ownership-aware chmod policy.
+    // - `preserve_ownerships(false)` — drops `fchownat`.
+    // - `preserve_mtime(false)` — drops `set_file_handle_times` →
+    //   `fsetattrlist` on macOS. Pre-fix flamegraph attributed 2.0 % of active
+    //   CPU (`fsetattrlist` 100 % from `extract_tarball`) directly to mtime
+    //   preservation. mtime is meaningless for content-addressable store
+    //   bytes — `require()` doesn't read it; `lpm doctor` doesn't use it.
+    // Note: even with `preserve_permissions=false`, tar 0.4.45's `_set_perms`
+    // still unconditionally calls `set_permissions` (the flag only controls
+    // SUID-bit retention). Eliminating the residual ~1.7 % `__fchmod` cost
+    // requires bypassing `entry.unpack()` for non-buffered entries — see the
+    // `write_buffered_entry` analogue used for source files below; tracked as
+    // a follow-up.
     archive.set_preserve_permissions(false);
     archive.set_preserve_ownerships(false);
+    archive.set_preserve_mtime(false);
     let mut extracted_files = Vec::new();
     let mut created_dirs = Vec::new();
     let mut total_size: u64 = 0;
@@ -307,12 +314,25 @@ where
                 }
                 Some(buf)
             } else {
-                if let Err(error) = entry.unpack(&target_path) {
+                // **Phase 66 perf followup #4 (post-flamegraph, 2026-05-09).**
+                // Stream directly to disk via `io::copy` instead of
+                // `entry.unpack()`. Even with `set_preserve_permissions(false)`
+                // / `set_preserve_ownerships(false)` / `set_preserve_mtime(false)`
+                // the tar 0.4.45 unpack path unconditionally calls
+                // `_set_perms` (entry.rs:814) — the flag only controls SUID-bit
+                // retention. Bypassing it here drops the residual `__fchmod`
+                // that the flamegraph attributed at 1.7 % of active CPU
+                // (100 % of `__fchmod` samples → `extract_tarball`).
+                //
+                // Same minimal write semantics as [`write_buffered_entry`]:
+                // create-or-truncate, default mode (`umask`-respecting), no
+                // post-write metadata calls.
+                if let Err(error) = stream_entry_to_disk(&mut entry, &target_path) {
                     return rollback_extraction(
                         &extraction_root,
                         &extracted_files,
                         &created_dirs,
-                        LpmError::Io(error),
+                        error,
                     );
                 }
                 None
@@ -340,6 +360,19 @@ fn write_buffered_entry(target_path: &Path, bytes: &[u8]) -> Result<(), LpmError
     use std::io::Write;
     let mut file = std::fs::File::create(target_path).map_err(LpmError::Io)?;
     file.write_all(bytes).map_err(LpmError::Io)?;
+    Ok(())
+}
+
+/// Stream a tar entry's bytes directly to disk via `io::copy`, skipping
+/// the chmod/chown/utimes epilogue `tar::Entry::unpack` always emits.
+/// Used by the non-buffered branch of the extractor — see Phase 66
+/// post-flamegraph followup #4.
+fn stream_entry_to_disk<R: std::io::Read>(
+    entry: &mut tar::Entry<'_, R>,
+    target_path: &Path,
+) -> Result<(), LpmError> {
+    let mut file = std::fs::File::create(target_path).map_err(LpmError::Io)?;
+    std::io::copy(entry, &mut file).map_err(LpmError::Io)?;
     Ok(())
 }
 
