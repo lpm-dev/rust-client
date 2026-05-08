@@ -1413,6 +1413,7 @@ mod tests {
             integrity: None,
             dependencies: Vec::new(),
             alias_dependencies: vec![],
+            peers: vec![],
             tarball: None,
         });
         for (name, version) in deps {
@@ -1423,6 +1424,7 @@ mod tests {
                 integrity: None,
                 dependencies: Vec::new(),
                 alias_dependencies: vec![],
+                peers: vec![],
                 tarball: None,
             });
         }

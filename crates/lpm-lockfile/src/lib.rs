@@ -76,7 +76,28 @@ impl PackageKey {
 }
 
 /// Current lockfile schema version.
-pub const LOCKFILE_VERSION: u32 = 1;
+///
+/// **Version history:**
+/// - **v1** (pre-R2.5): everything up through R2.4. May or may not
+///   contain `ambient-peer-installs` / per-package `peers` depending
+///   on whether the writer ran an R2.2-R2.4 build (which auto-
+///   installed peers but didn't persist either field) or an
+///   R2.5+ build. The `ambient-peer-installs` field defaults to
+///   empty when absent, which is INDISTINGUISHABLE from "auto-install
+///   was off and there were no ambient installs."
+/// - **v2** (R2.5+): explicit signal that the writer was R2.5-aware.
+///   `ambient-peer-installs` field is authoritative — empty means
+///   "no ambient installs," NOT "field absent." Per-package `peers`
+///   is also authoritative for v2 lockfiles, enabling deterministic
+///   v2 graph-key reproduction across cold-and-warm installs.
+///
+/// **Why this matters:** install.rs's lockfile fast path uses the
+/// version to decide whether the absence of `ambient-peer-installs`
+/// is meaningful. On v1 + `auto_install_peers = true`, the absence
+/// could be a buggy-writer artifact, so the fast path is invalidated
+/// and a fresh resolve runs (which writes a v2 lockfile, restoring
+/// fast-path eligibility on subsequent installs).
+pub const LOCKFILE_VERSION: u32 = 2;
 
 /// Default lockfile filename.
 pub const LOCKFILE_NAME: &str = "lpm.lock";
@@ -100,6 +121,32 @@ pub struct Lockfile {
         skip_serializing_if = "std::collections::BTreeMap::is_empty"
     )]
     pub root_aliases: std::collections::BTreeMap<String, String>,
+    /// **Phase 66 R2.5** — canonical names of packages the resolver
+    /// auto-installed at root scope to satisfy unmet `peerDependencies`
+    /// (eager peer auto-install, the bun-parity default since R2.2).
+    /// Persisted so the lockfile fast path on warm installs reproduces
+    /// the same top-level `node_modules/<peer>/` symlinks the
+    /// fresh-resolve install produced.
+    ///
+    /// **Why this is a separate top-level field, not folded into
+    /// `packages` somehow:** `packages` is keyed on `(name, version,
+    /// source_id)`. An ambient peer install IS already in `packages`
+    /// (it was extracted into the v2 store and resolved like any
+    /// other dep). What `packages` does NOT carry is the
+    /// "this is a top-level link target even though it's not in
+    /// `pkg.dependencies`" signal. That signal is symmetric with
+    /// [`Self::root_aliases`] — it's project-side install-orchestration
+    /// metadata, not per-package state. Hence sibling field.
+    ///
+    /// Empty + skipped from serialization on the common no-auto-
+    /// install path (project's `pkg.dependencies` already covers all
+    /// declared peers).
+    #[serde(
+        default,
+        rename = "ambient-peer-installs",
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    pub ambient_peer_installs: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -145,6 +192,33 @@ pub struct LockedPackage {
         skip_serializing_if = "Vec::is_empty"
     )]
     pub alias_dependencies: Vec<[String; 2]>,
+    /// **Phase 66 R2.5** — resolved peer dependencies for this
+    /// package. Each entry is `<peer_name>@<resolved_version>` (same
+    /// format as [`Self::dependencies`]) and represents one entry
+    /// from the package's `peerDependencies` map intersected with the
+    /// install set's resolved versions.
+    ///
+    /// **Why this is load-bearing for warm-install correctness:** the
+    /// v2 store's [`GraphKey`] derivation hashes peer pinning into
+    /// the link-entry identity (`lpm-store::v2::graph_key.rs`). Two
+    /// projects with the same dep tree but different peer ranges
+    /// produce DISTINCT `links/<key>/` entries, and the v2 linker
+    /// reproduces those keys deterministically per install. If the
+    /// lockfile fast path forgets the peer pinning and reconstructs
+    /// the package with empty peers, the warm install computes a
+    /// different graph key than the cold install, materializes a
+    /// fresh link entry, and silently breaks peer-isolation
+    /// invariants (worse: a sibling project sharing the dep tree but
+    /// not the peer pinning could now share the link entry).
+    ///
+    /// Sorted by peer name for deterministic lockfile output, then
+    /// skipped from serialization for packages without peer
+    /// dependencies (the common case — keeps lockfiles of pre-R2.5
+    /// projects byte-identical).
+    ///
+    /// [`GraphKey`]: <internal v2 store identity type — see lpm-store crate>
+    #[serde(default, rename = "peers", skip_serializing_if = "Vec::is_empty")]
+    pub peers: Vec<String>,
     /// **Phase 43** — tarball URL as returned by the registry at
     /// resolve time (e.g.,
     /// `https://registry.npmjs.org/lodash/-/lodash-4.17.21.tgz`).
@@ -273,6 +347,12 @@ impl Lockfile {
             },
             packages: Vec::new(),
             root_aliases: std::collections::BTreeMap::new(),
+            // R2.5 — populated by `install.rs` from
+            // `ResolveResult.ambient_peer_installs` on cold-resolve
+            // lockfile writes; empty on warm/lockfile-fast-path
+            // returns from `Lockfile::read_fast` until the writer
+            // updates an existing lockfile.
+            ambient_peer_installs: Vec::new(),
         }
     }
 
@@ -651,6 +731,7 @@ mod tests {
             integrity: Some("sha512-abc123...".to_string()),
             dependencies: vec!["react@999.999.999".to_string()],
             alias_dependencies: vec![],
+            peers: vec![],
             tarball: None,
         });
         lf.add_package(LockedPackage {
@@ -660,6 +741,7 @@ mod tests {
             integrity: None,
             dependencies: vec![],
             alias_dependencies: vec![],
+            peers: vec![],
             tarball: None,
         });
         lf
@@ -679,7 +761,10 @@ mod tests {
         let toml_str = lf.to_toml().unwrap();
 
         assert!(toml_str.contains("[metadata]"));
-        assert!(toml_str.contains("lockfile-version = 1"));
+        // R2.5 bumped LOCKFILE_VERSION to 2; the assertion follows
+        // the constant rather than pinning a literal so a future
+        // bump only updates `LOCKFILE_VERSION` in one place.
+        assert!(toml_str.contains(&format!("lockfile-version = {}", LOCKFILE_VERSION)));
         assert!(toml_str.contains("[[packages]]"));
         assert!(toml_str.contains("@lpm.dev/neo.highlight"));
         assert!(toml_str.contains("react"));
@@ -720,6 +805,7 @@ mod tests {
             integrity: None,
             dependencies: vec![],
             alias_dependencies: vec![],
+            peers: vec![],
             tarball: None,
         });
         lf.add_package(LockedPackage {
@@ -729,6 +815,7 @@ mod tests {
             integrity: None,
             dependencies: vec![],
             alias_dependencies: vec![],
+            peers: vec![],
             tarball: None,
         });
 
@@ -754,6 +841,7 @@ mod tests {
             integrity: Some("sha512-xyz".to_string()),
             dependencies: vec![],
             alias_dependencies: vec![],
+            peers: vec![],
             tarball: Some("https://registry.npmjs.org/lodash/-/lodash-4.17.21.tgz".to_string()),
         });
 
@@ -806,6 +894,7 @@ mod tests {
             integrity: None,
             dependencies: vec![],
             alias_dependencies: vec![],
+            peers: vec![],
             tarball: None, // old entry, not yet re-resolved
         });
         lf.add_package(LockedPackage {
@@ -815,6 +904,7 @@ mod tests {
             integrity: None,
             dependencies: vec![],
             alias_dependencies: vec![],
+            peers: vec![],
             tarball: Some("https://registry.npmjs.org/lodash/-/lodash-4.17.21.tgz".to_string()),
         });
 
@@ -1060,6 +1150,7 @@ version = "1.0.0"
             integrity: Some("sha512-abc".to_string()),
             dependencies: vec!["ansi-regex@5.0.1".to_string()],
             alias_dependencies: vec![],
+            peers: vec![],
             tarball: None,
         });
         lf.add_package(LockedPackage {
@@ -1069,6 +1160,7 @@ version = "1.0.0"
             integrity: None,
             dependencies: vec!["strip-ansi-cjs@6.0.1".to_string()],
             alias_dependencies: vec![["strip-ansi-cjs".to_string(), "strip-ansi".to_string()]],
+            peers: vec![],
             tarball: None,
         });
 
@@ -1110,6 +1202,7 @@ version = "1.0.0"
             integrity: None,
             dependencies: vec![],
             alias_dependencies: vec![],
+            peers: vec![],
             tarball: None,
         });
         lf.write_all(&toml_path).unwrap();
@@ -1139,6 +1232,7 @@ version = "1.0.0"
             integrity: None,
             dependencies: vec![],
             alias_dependencies: vec![],
+            peers: vec![],
             tarball: None,
         });
         let toml_str = lf.to_toml().unwrap();
@@ -1195,6 +1289,7 @@ version = "1.0.0"
             integrity: None,
             dependencies: vec![],
             alias_dependencies: vec![],
+            peers: vec![],
             tarball: None,
         });
         lf2.write_to_file(&toml_path).unwrap();
@@ -1376,6 +1471,7 @@ version = "1.0.0"
             integrity: None,
             dependencies: vec![],
             alias_dependencies: vec![],
+            peers: vec![],
             tarball: None,
         }
     }
@@ -1463,6 +1559,7 @@ version = "1.0.0"
             integrity: None,
             dependencies: vec![],
             alias_dependencies: vec![],
+            peers: vec![],
             tarball: tarball.map(|s| s.to_string()),
         }
     }
@@ -1639,6 +1736,7 @@ version = "1.0.0"
             integrity: Some("sha256-abc123def456".to_string()),
             dependencies: vec![],
             alias_dependencies: vec![],
+            peers: vec![],
             tarball: None,
         });
         let toml = lf.to_toml().expect("serialize");
@@ -1679,6 +1777,7 @@ version = "1.0.0"
             integrity: Some("sha512-lodash".to_string()),
             dependencies: vec![],
             alias_dependencies: vec![],
+            peers: vec![],
             tarball: Some("https://registry.npmjs.org/lodash/-/lodash-4.17.21.tgz".to_string()),
         });
         lf.add_package(LockedPackage {
@@ -1688,6 +1787,7 @@ version = "1.0.0"
             integrity: Some("sha512-remoteFork".to_string()),
             dependencies: vec![],
             alias_dependencies: vec![],
+            peers: vec![],
             tarball: None,
         });
         lf.add_package(LockedPackage {
@@ -1697,6 +1797,7 @@ version = "1.0.0"
             integrity: Some("sha256-localTarball".to_string()),
             dependencies: vec![],
             alias_dependencies: vec![],
+            peers: vec![],
             tarball: None,
         });
         lf.add_package(LockedPackage {
@@ -1706,6 +1807,7 @@ version = "1.0.0"
             integrity: None,
             dependencies: vec![],
             alias_dependencies: vec![],
+            peers: vec![],
             tarball: None,
         });
         lf.add_package(LockedPackage {
@@ -1715,6 +1817,7 @@ version = "1.0.0"
             integrity: None,
             dependencies: vec![],
             alias_dependencies: vec![],
+            peers: vec![],
             tarball: None,
         });
 
@@ -1990,6 +2093,7 @@ version = "1.0.0"
             integrity: None,
             dependencies: vec![],
             alias_dependencies: vec![],
+            peers: vec![],
             tarball: Some("https://registry.npmjs.org/good-pkg/-/good-pkg-1.0.0.tgz".to_string()),
         });
         lf.add_package(LockedPackage {
@@ -1999,6 +2103,7 @@ version = "1.0.0"
             integrity: None,
             dependencies: vec![],
             alias_dependencies: vec![],
+            peers: vec![],
             tarball: Some("https://e.com/bad.tgz".to_string()),
         });
         match lf.to_toml() {
@@ -2052,6 +2157,7 @@ version = "1.0.0"
             integrity: None,
             dependencies: vec![],
             alias_dependencies: vec![],
+            peers: vec![],
             tarball: None,
         };
         let tar = LockedPackage {
@@ -2061,6 +2167,7 @@ version = "1.0.0"
             integrity: None,
             dependencies: vec![],
             alias_dependencies: vec![],
+            peers: vec![],
             tarball: None,
         };
 
@@ -2083,6 +2190,7 @@ version = "1.0.0"
             integrity: None,
             dependencies: vec![],
             alias_dependencies: vec![],
+            peers: vec![],
             tarball: None,
         };
         assert_eq!(pkg.package_key().source_id, PackageKey::UNKNOWN_SOURCE_ID);
@@ -2103,6 +2211,7 @@ version = "1.0.0"
             integrity: None,
             dependencies: vec![],
             alias_dependencies: vec![],
+            peers: vec![],
             tarball: None,
         });
         lf.add_package(LockedPackage {
@@ -2112,6 +2221,7 @@ version = "1.0.0"
             integrity: None,
             dependencies: vec![],
             alias_dependencies: vec![],
+            peers: vec![],
             tarball: None,
         });
 
@@ -2146,6 +2256,7 @@ version = "1.0.0"
             integrity: Some("sha512-AAAAAAAAAA==".to_string()),
             dependencies: vec![],
             alias_dependencies: vec![],
+            peers: vec![],
             tarball: None,
         };
         let tarball_pkg = LockedPackage {
@@ -2155,6 +2266,7 @@ version = "1.0.0"
             integrity: Some("sha512-BBBBBBBBBB==".to_string()),
             dependencies: vec![],
             alias_dependencies: vec![],
+            peers: vec![],
             tarball: None,
         };
         let reg_key = registry_pkg.package_key();
@@ -2180,6 +2292,198 @@ version = "1.0.0"
         assert_eq!(by_tar.integrity.as_deref(), Some("sha512-BBBBBBBBBB=="));
     }
 
+    // ── R2.5 — peers + ambient_peer_installs round-trip ──────────
+    //
+    // The lockfile schema acquired two new fields in R2.5:
+    //   - `Lockfile.ambient_peer_installs` (canonical names of
+    //     auto-installed peers from R2.2's resolver-side synthesis).
+    //   - `LockedPackage.peers` (per-package peer pinning: each
+    //     entry is `<peer_name>@<version>`).
+    //
+    // Both are LOAD-BEARING for warm-install correctness: the v2
+    // store hashes peers + root-link names into its graph-key
+    // identity. Lockfile fast paths that drop these fields would
+    // produce a different graph key than the cold install, breaking
+    // peer-divergent link-entry isolation.
+    //
+    // These tests pin: (1) round-trip preservation through TOML
+    // serialization, (2) backward-compat with pre-R2.5 lockfiles
+    // that have neither field, (3) binary-fast-path fallback when
+    // either field is non-empty.
+
+    #[test]
+    fn r25_lockfile_ambient_peers_round_trip_through_toml() {
+        // Cold-resolve writes a lockfile with two ambient peer
+        // installs. Round-trip through TOML must preserve them in
+        // alphabetical order.
+        let mut lf = Lockfile::new();
+        lf.ambient_peer_installs = vec!["react".to_string(), "@types/react".to_string()];
+        // Sort here mirrors the resolver's drain-tail dedup+sort
+        // (`greedy.rs::830-840`); the ordering invariant is part of
+        // the contract so tests pin both serialize and deserialize
+        // sides agree.
+        lf.ambient_peer_installs.sort();
+
+        let toml = lf.to_toml().expect("serialize must succeed");
+        // Field present in serialized form.
+        assert!(
+            toml.contains("ambient-peer-installs"),
+            "non-empty ambient_peer_installs must serialize: {toml}"
+        );
+
+        let restored = Lockfile::from_toml(&toml).expect("parse must succeed");
+        assert_eq!(
+            restored.ambient_peer_installs, lf.ambient_peer_installs,
+            "ambient_peer_installs must round-trip exactly"
+        );
+    }
+
+    #[test]
+    fn r25_lockfile_ambient_peers_empty_skipped_in_serialization() {
+        // Backward-compat: a lockfile with NO ambient peers must
+        // serialize WITHOUT the `ambient-peer-installs` field. This
+        // keeps lockfiles of pre-R2.5 / non-auto-install projects
+        // byte-identical to what they were before R2.5.
+        let lf = Lockfile::new();
+        assert!(lf.ambient_peer_installs.is_empty());
+
+        let toml = lf.to_toml().expect("serialize must succeed");
+        assert!(
+            !toml.contains("ambient-peer-installs"),
+            "empty ambient_peer_installs must be skipped from serialization: {toml}"
+        );
+    }
+
+    #[test]
+    fn r25_locked_package_peers_round_trip_through_toml() {
+        // A package with two peer pins survives TOML round-trip.
+        let mut lf = Lockfile::new();
+        lf.add_package(LockedPackage {
+            name: "react-redux".to_string(),
+            version: "9.2.0".to_string(),
+            source: Some("registry+https://registry.npmjs.org".to_string()),
+            integrity: None,
+            dependencies: vec!["use-sync-external-store@1.6.0".to_string()],
+            alias_dependencies: vec![],
+            peers: vec!["react@18.2.0".to_string(), "redux@5.0.1".to_string()],
+            tarball: None,
+        });
+
+        let toml = lf.to_toml().expect("serialize must succeed");
+        assert!(
+            toml.contains("peers ="),
+            "non-empty peers must serialize: {toml}"
+        );
+
+        let restored = Lockfile::from_toml(&toml).expect("parse must succeed");
+        let pkg = restored.find_package("react-redux").unwrap();
+        assert_eq!(
+            pkg.peers,
+            vec!["react@18.2.0".to_string(), "redux@5.0.1".to_string()],
+            "per-package peers must round-trip exactly — load-bearing for v2 \
+             graph-key reproducibility on warm installs"
+        );
+    }
+
+    #[test]
+    fn r25_locked_package_peers_empty_skipped_in_serialization() {
+        // Backward-compat: a package WITHOUT peers must serialize
+        // WITHOUT the `peers = [...]` line. Keeps non-peer-declaring
+        // packages byte-identical pre/post-R2.5.
+        let mut lf = Lockfile::new();
+        lf.add_package(LockedPackage {
+            name: "lodash".to_string(),
+            version: "4.17.21".to_string(),
+            source: None,
+            integrity: None,
+            dependencies: vec![],
+            alias_dependencies: vec![],
+            peers: vec![],
+            tarball: None,
+        });
+
+        let toml = lf.to_toml().expect("serialize must succeed");
+        assert!(
+            !toml.contains("peers ="),
+            "empty peers must be skipped from serialization: {toml}"
+        );
+    }
+
+    #[test]
+    fn r25_pre_r25_lockfile_parses_with_default_empty_fields() {
+        // A lockfile written before R2.5 has no `ambient-peer-installs`
+        // top-level field and no `peers = [...]` per-package field.
+        // serde defaults must populate both as empty Vec so old
+        // lockfiles parse cleanly under the new struct shape.
+        let pre_r25_toml = r#"
+[metadata]
+lockfile-version = 1
+resolved-with = "greedy-fusion"
+
+[[packages]]
+name = "react"
+version = "18.2.0"
+source = "registry+https://registry.npmjs.org"
+integrity = "sha512-pre-r25"
+dependencies = []
+"#;
+        let lf = Lockfile::from_toml(pre_r25_toml).expect("pre-R2.5 lockfile must parse");
+        assert!(lf.ambient_peer_installs.is_empty());
+        assert_eq!(lf.packages.len(), 1);
+        assert!(lf.packages[0].peers.is_empty());
+    }
+
+    #[test]
+    fn r25_binary_format_falls_back_when_ambient_peers_present() {
+        // The binary mmap format has fixed entry slots with no room
+        // for R2.5 metadata. `binary_format_supports` must return
+        // false when the lockfile carries ANY R2.5 state, so the
+        // writer skips the binary path and the warm-install reader
+        // falls back to TOML — preserving the auto-install state
+        // that the binary roundtrip would silently drop.
+        let mut lf = Lockfile::new();
+        lf.add_package(LockedPackage {
+            name: "react".to_string(),
+            version: "18.2.0".to_string(),
+            source: None,
+            integrity: None,
+            dependencies: vec![],
+            alias_dependencies: vec![],
+            peers: vec![],
+            tarball: None,
+        });
+        // Without R2.5 fields → binary format OK.
+        assert!(crate::binary::binary_format_supports(&lf));
+
+        // Now add an ambient install → binary format must reject.
+        lf.ambient_peer_installs = vec!["react".to_string()];
+        assert!(
+            !crate::binary::binary_format_supports(&lf),
+            "ambient_peer_installs must trigger binary fallback to TOML"
+        );
+    }
+
+    #[test]
+    fn r25_binary_format_falls_back_when_per_package_peers_present() {
+        // Same gate, on the LockedPackage side. Even ONE package with
+        // a non-empty `peers` field is enough to fall back to TOML.
+        let mut lf = Lockfile::new();
+        lf.add_package(LockedPackage {
+            name: "react-redux".to_string(),
+            version: "9.2.0".to_string(),
+            source: None,
+            integrity: None,
+            dependencies: vec![],
+            alias_dependencies: vec![],
+            peers: vec!["react@18.2.0".to_string()],
+            tarball: None,
+        });
+        assert!(
+            !crate::binary::binary_format_supports(&lf),
+            "per-package peers must trigger binary fallback to TOML"
+        );
+    }
+
     #[test]
     fn legacy_find_package_returns_a_match_under_collision_but_audit_warns() {
         // Documents the pre-existing name-only behavior: returns
@@ -2193,6 +2497,7 @@ version = "1.0.0"
             integrity: None,
             dependencies: vec![],
             alias_dependencies: vec![],
+            peers: vec![],
             tarball: None,
         });
         lf.add_package(LockedPackage {
@@ -2202,6 +2507,7 @@ version = "1.0.0"
             integrity: None,
             dependencies: vec![],
             alias_dependencies: vec![],
+            peers: vec![],
             tarball: None,
         });
         // Returns *some* react entry. Don't depend on which one.

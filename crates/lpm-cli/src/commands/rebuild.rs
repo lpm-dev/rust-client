@@ -2726,6 +2726,7 @@ mod tests {
                 integrity: None,
                 dependencies: vec![],
                 alias_dependencies: vec![],
+                peers: vec![],
                 tarball: None,
             },
             lpm_lockfile::LockedPackage {
@@ -2735,6 +2736,7 @@ mod tests {
                 integrity: None,
                 dependencies: vec!["a@1.0.0".into()],
                 alias_dependencies: vec![],
+                peers: vec![],
                 tarball: None,
             },
         ];

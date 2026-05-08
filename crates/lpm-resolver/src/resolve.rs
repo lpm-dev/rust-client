@@ -121,6 +121,26 @@ pub struct ResolveResult {
     /// this to (a) drive root `node_modules/<local>/` symlinks and (b)
     /// persist aliases in the lockfile for deterministic re-install.
     pub root_aliases: HashMap<String, String>,
+    /// **Phase 66 R2.2** — ambient installs synthesized by the eager
+    /// peer-drain pass. Shape: each entry is the canonical name of a
+    /// package the resolver auto-installed because some consumer
+    /// declared it as a required peer that wasn't otherwise in the
+    /// resolved tree. Sorted alphabetically for deterministic output.
+    ///
+    /// Why this exists as a separate field: the install pipeline's
+    /// `resolved_to_install_packages` derives "is this a top-level
+    /// node_modules entry?" from `pkg.dependencies` (the user's
+    /// `package.json`). An ambient peer install is NOT in
+    /// `package.json` — it was synthesized at resolve-time — so
+    /// without this field the install pipeline would extract the
+    /// package into the store but never surface it at
+    /// `node_modules/<name>/`, defeating the whole R2.2 contract.
+    /// Install-side merges this set with `pkg.dependencies` when
+    /// computing top-level link names + direct-dep flags.
+    ///
+    /// Empty when no peers needed synthesis OR when
+    /// `auto_install_peers` was false.
+    pub ambient_peer_installs: Vec<String>,
     /// **Phase 40 P3a** — substage breakdown of cold-resolve wall-clock.
     /// Observability-only; the fields and their overlap contract are
     /// documented on [`StageTiming`].
@@ -232,6 +252,38 @@ pub struct StageTiming {
     /// walker arm (where speculation runs through the separate
     /// `spawn_speculation_dispatcher` instead).
     pub tarball_dispatched_count: u64,
+    /// **Phase 66 R2.4** — count of speculative peer-manifest fetches
+    /// the fused dispatcher dispatched concurrent with the regular
+    /// dep walk. Each prefetch corresponds to one `peerDependencies`
+    /// requirement that (at the moment Phase A drained) was:
+    /// non-optional, not yet satisfied by the resolved tree, not yet
+    /// in the shared cache, and not yet in flight from a sibling
+    /// dispatch.
+    ///
+    /// **What this counter means observability-wise:**
+    /// - `0` — no required peers were missing at any point during the
+    ///   resolve, OR `auto_install_peers` was off. Either way, R2.4
+    ///   did no work and the resolver behaves identically to R2.2.
+    /// - `> 0` — peer fetches that R2.2 would have run SERIALLY in
+    ///   the post-loop drain pass instead ran concurrently with the
+    ///   regular dep dispatch. Each prefetch saves one network
+    ///   round-trip from the critical path; the wall-clock saving
+    ///   is approximately `count × (single-fetch RTT)` minus any
+    ///   overlap with regular deps.
+    /// - The counter MAY be lower than `len(ambient_peer_installs)`:
+    ///   a peer canonical that gets pulled in as a regular transitive
+    ///   AFTER the prefetch dispatched (sibling Phase A win) is still
+    ///   counted (we dispatched a fetch); but a peer canonical
+    ///   pulled in as a regular transitive BEFORE the prefetch even
+    ///   evaluated (cache hit at picker time) will NOT bump this
+    ///   counter (no prefetch dispatched, but the peer is still
+    ///   resolved). This is by design — the counter measures
+    ///   "prefetches we issued," not "peers that ultimately landed."
+    ///
+    /// Zero on the walker arm (R2.4 is fused-only by design — the
+    /// walker arm is the legacy opt-out and not a performance
+    /// target).
+    pub peer_prefetch_count: u64,
 }
 
 /// Resolve dependencies for a project.
@@ -247,6 +299,11 @@ pub async fn resolve_dependencies(
     client: Arc<RegistryClient>,
     dependencies: HashMap<String, String>,
 ) -> Result<ResolveResult, ResolveError> {
+    // Phase 66 R2.2 default: bun-parity eager peer auto-install ON.
+    // The convenience wrapper preserves the legacy two-arg signature;
+    // callers that need warn-only semantics use the lower-level
+    // `resolve_with_shared_cache` directly with `auto_install_peers =
+    // false`.
     resolve_dependencies_with_overrides(client, dependencies, OverrideSet::empty()).await
 }
 
@@ -288,6 +345,7 @@ pub async fn resolve_dependencies_with_overrides(
         Duration::ZERO,
         RouteTable::from_mode_only(RouteMode::Proxy), // preserve pre-49 proxy behavior for callers that bypass install.rs
         StreamingBfsMetrics::new(),
+        true, // R2.2 default: bun-parity auto-install peers ON.
     )
     .await
 }
@@ -315,6 +373,7 @@ pub async fn resolve_with_shared_cache(
     fetch_wait_timeout: Duration,
     route_table: RouteTable,
     metrics: StreamingBfsMetrics,
+    auto_install_peers: bool,
 ) -> Result<ResolveResult, ResolveError> {
     // **Default flip (post-Phase-60).** Greedy is the default; users
     // opt out to the legacy PubGrub-with-split-retry resolver via
@@ -342,6 +401,7 @@ pub async fn resolve_with_shared_cache(
             fetch_wait_timeout,
             route_table,
             metrics,
+            auto_install_peers,
         )
         .await;
     }
@@ -462,6 +522,14 @@ pub async fn resolve_with_shared_cache(
                     applied_overrides,
                     platform_skipped,
                     root_aliases,
+                    // R2.2 — pubgrub arm doesn't implement eager peer
+                    // auto-install today (it predates R2 entirely and
+                    // is a pure-correctness opt-out via
+                    // `LPM_RESOLVER=pubgrub`). Empty here matches
+                    // pre-R2 behavior; users who pin to pubgrub get
+                    // pre-R2 warn-only peer semantics, same as
+                    // `auto_install_peers = false`.
+                    ambient_peer_installs: Vec::new(),
                     stage_timing,
                 });
             }
@@ -1572,6 +1640,61 @@ pub enum ResolveError {
 
     #[error("internal error: {0}")]
     Internal(String),
+
+    /// **Phase 66 R2.2 — eager-peer auto-install.** Two or more
+    /// consumers in the install set declare `peerDependencies` for
+    /// `canonical` whose ranges have no version in common, AND at
+    /// least one of those consumers is non-optional. The auto-install
+    /// path can't pick a single version that satisfies every required
+    /// consumer's range, so we surface the conflict instead of
+    /// silently first-version-wins'ing one of them.
+    ///
+    /// `requirements` lists every contributing consumer with its
+    /// declared range so the user can act on the conflict (typically:
+    /// pin a version of one of the consumers, or use
+    /// `lpm.overrides` to force a peer version).
+    ///
+    /// **Why this is an error and not a warning:** the alternative is
+    /// pre-R2 behavior (warn-only post-resolve), which leaves the
+    /// install in a half-broken state where one consumer silently
+    /// gets a peer that doesn't satisfy its declared range. Per the
+    /// R2 design, an unsatisfiable peer with at least one required
+    /// consumer is "the package set the user described cannot be
+    /// installed coherently"; that's the same shape as
+    /// [`Self::NoSolution`] for regular deps.
+    #[error(
+        "peer dependency conflict for `{canonical}`: {} consumer(s) declare incompatible ranges. \
+         Consumers: {}",
+        requirements.len(),
+        format_peer_conflict_consumers(requirements)
+    )]
+    PeerConflict {
+        /// Registry identity of the conflicted peer.
+        canonical: String,
+        /// One entry per contributing consumer:
+        /// `(consumer_canonical, declared_range, optional)`.
+        requirements: Vec<(String, String, bool)>,
+    },
+}
+
+/// Format the `requirements` list on a [`ResolveError::PeerConflict`]
+/// for the `Display` impl. Sorted deterministically by `(consumer
+/// name, range)` so two failing runs produce byte-identical error
+/// messages regardless of `HashMap` iteration order.
+fn format_peer_conflict_consumers(reqs: &[(String, String, bool)]) -> String {
+    let mut sorted: Vec<&(String, String, bool)> = reqs.iter().collect();
+    sorted.sort_by(|a, b| (a.0.as_str(), a.1.as_str()).cmp(&(b.0.as_str(), b.1.as_str())));
+    sorted
+        .iter()
+        .map(|(consumer, range, optional)| {
+            if *optional {
+                format!("{consumer} → {range} (optional)")
+            } else {
+                format!("{consumer} → {range}")
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("; ")
 }
 
 #[cfg(test)]
@@ -1664,6 +1787,8 @@ mod tests {
             Duration::ZERO,
             RouteTable::from_mode_only(RouteMode::Proxy),
             StreamingBfsMetrics::new(),
+            true, // R2.2: tests default to auto-install on; tests
+                  // exercising warn-only behavior pass false explicitly.
         )
         .await
     }

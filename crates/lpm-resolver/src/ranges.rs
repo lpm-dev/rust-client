@@ -132,6 +132,23 @@ pub struct NpmAlias {
     pub range: String,
 }
 
+/// **R3 / B2 defense-in-depth.** True when `range_str` is a
+/// `workspace:` specifier. The `workspace:` protocol is a manifest-
+/// level opt-in for "this dep lives in the workspace, not the
+/// registry"; resolution happens upstream in [`crate::specifier`] +
+/// `lpm-workspace` which rewrite such deps before either resolver arm
+/// runs. If a raw `workspace:<rest>` reaches the resolver — through a
+/// future refactor that drops the upstream layer, a hand-edited
+/// manifest, or a malformed cache entry — the caller deserves a
+/// specific diagnostic rather than the opaque semver-parse failure
+/// that `NpmRange::parse("workspace:*")` would otherwise produce.
+///
+/// Lifted to `crate::ranges` so both resolver arms (greedy/fused +
+/// pubgrub) consult the same predicate.
+pub fn is_workspace_specifier(range_str: &str) -> bool {
+    range_str.trim_start().starts_with("workspace:")
+}
+
 /// Detect + parse the `npm:<target>@<range>` alias syntax. Returns
 /// `None` for any non-alias range string (so the caller can fall
 /// through to the regular semver parser).

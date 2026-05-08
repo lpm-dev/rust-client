@@ -2707,6 +2707,7 @@ mod tests {
                 integrity: None,
                 dependencies: Vec::new(),
                 alias_dependencies: vec![],
+                peers: vec![],
                 tarball: None,
             });
         }

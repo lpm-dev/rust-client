@@ -1398,6 +1398,24 @@ impl DependencyProvider for LpmDependencyProvider {
                 self.ensure_cached(&pkg)?;
                 let available = self.available_versions(&pkg);
 
+                // **R3 / B2 defense-in-depth.** `workspace:<rest>` must
+                // be rewritten upstream by `lpm-workspace` before
+                // reaching the resolver. If it slips through (future
+                // refactor drops the upstream layer, hand-edited
+                // manifest, malformed cache), `NpmRange::parse` would
+                // fail with an opaque semver error. Surface the actual
+                // diagnosis to the maintainer. Mirrors the greedy arm's
+                // root-seed guard at `greedy::seed_root_edges`.
+                if crate::ranges::is_workspace_specifier(&range_str) {
+                    return Err(ProviderError::InvalidRange(format!(
+                        "root dep {dep_name}: range '{range_str}' uses the \
+                         `workspace:` protocol, which must be resolved by \
+                         `lpm-workspace` before reaching the resolver. This is \
+                         an internal bug — please file an issue at \
+                         https://github.com/lpm-dev/rust-client/issues"
+                    )));
+                }
+
                 let npm_range = NpmRange::parse(&range_str).map_err(ProviderError::InvalidRange)?;
 
                 let range = if available.is_empty() {
@@ -1545,6 +1563,29 @@ impl DependencyProvider for LpmDependencyProvider {
         }
 
         for (dep_name, dep_range_str) in &ver_deps {
+            // **R3 / B2 defense-in-depth.** Detect a leaked
+            // `workspace:` specifier BEFORE the alias rewrite +
+            // ensure_cached path runs — otherwise we'd try to fetch
+            // a registry package named after the workspace local
+            // identity (e.g., `internal`), waste a network round-trip,
+            // and surface an opaque 404 instead of the actual cause.
+            // Mirrors `greedy::enqueue_child_deps`. Registry-published
+            // packages should never declare `workspace:` deps (npm
+            // rejects at publish time); landing one in the constraint
+            // loop signals a malformed cache or upstream bypass.
+            if crate::ranges::is_workspace_specifier(dep_range_str) {
+                tracing::warn!(
+                    "ignoring transitive `workspace:` dep '{}' from {}@{} → {} \
+                     (workspace: must be resolved upstream by lpm-workspace; \
+                     a registry-published package should not declare it)",
+                    dep_range_str,
+                    package,
+                    version,
+                    dep_name,
+                );
+                continue;
+            }
+
             // Phase 40 P2 — resolve alias edges under the TARGET identity.
             //
             // For non-aliased deps the local name == target name, so
@@ -2574,6 +2615,91 @@ mod tests {
                     "optional dep with only platform-incompatible versions should be silently skipped"
                 );
             }
+            _ => panic!("expected Available dependencies"),
+        }
+    }
+
+    // ── R3 / B2 — workspace: defense-in-depth on the pubgrub arm ──
+    //
+    // `workspace:<rest>` is rewritten upstream by `lpm-workspace`
+    // before any resolver runs. If a raw `workspace:` slips through
+    // (future refactor drops the upstream layer, hand-edited manifest,
+    // malformed cache entry), `NpmRange::parse` would fail with an
+    // opaque semver-error surface. These two tests pin the workspace-
+    // specific diagnostic at both root and transitive sites so a
+    // future regression points the maintainer at the actual cause.
+
+    #[test]
+    fn get_dependencies_root_rejects_workspace_specifier() {
+        // Root dep declares `workspace:*` — pubgrub arm must hard-fail
+        // with a workspace-specific message, not the generic semver
+        // parse error.
+        let mut root_deps = HashMap::new();
+        root_deps.insert("internal-pkg".to_string(), "workspace:*".to_string());
+
+        // Pre-populate the cache so `ensure_cached` short-circuits and
+        // we reach the range-parse step. The version list doesn't
+        // matter — we error before pubgrub ever sees the constraint.
+        let pkg = ResolverPackage::npm("internal-pkg");
+        let info = make_info(&["1.0.0"], vec![], vec![], vec![]);
+        let provider = make_provider_with_cache(root_deps, vec![(pkg, info)]);
+
+        // The DependencyProvider trait's `get_dependencies` is what
+        // pubgrub calls during resolution. Driving it through the root
+        // path is what the integration would do.
+        let root_pkg = ResolverPackage::Root;
+        let result = provider.get_dependencies(&root_pkg, &NpmVersion::new(0, 0, 0));
+        // `Dependencies<...>` doesn't implement Debug, so match
+        // explicitly rather than `expect_err`.
+        let err = match result {
+            Ok(_) => panic!("workspace: root dep must produce an error"),
+            Err(e) => e,
+        };
+        let msg = format!("{err:?}");
+        assert!(
+            msg.contains("workspace:") && msg.contains("lpm-workspace"),
+            "expected workspace-specific diagnostic, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn get_dependencies_transitive_skips_workspace_specifier() {
+        // Transitive dep manifest declares `workspace:*` — pubgrub arm
+        // must skip it (a registry-published package shouldn't have
+        // such a dep) and continue resolving siblings.
+        let pkg = ResolverPackage::npm("buggy-published");
+        let info = make_info(
+            &["1.0.0"],
+            vec![(
+                "1.0.0",
+                vec![("legit-sibling", "^1.0.0"), ("internal", "workspace:*")],
+            )],
+            vec![],
+            vec![],
+        );
+        let sibling = ResolverPackage::npm("legit-sibling");
+        let sibling_info = make_info(&["1.2.3"], vec![], vec![], vec![]);
+
+        let provider = make_provider_with_cache(
+            HashMap::new(),
+            vec![(pkg.clone(), info), (sibling, sibling_info)],
+        );
+
+        let deps = provider
+            .get_dependencies(&pkg, &NpmVersion::parse("1.0.0").unwrap())
+            .expect("workspace: transitive dep must be skipped, not error");
+        match deps {
+            Dependencies::Available(map) => {
+                assert!(
+                    map.contains_key(&ResolverPackage::npm("legit-sibling")),
+                    "non-workspace sibling must still resolve"
+                );
+                assert!(
+                    !map.contains_key(&ResolverPackage::npm("internal")),
+                    "workspace: dep must be skipped from constraints"
+                );
+            }
+            // Dependencies isn't Debug, so use a generic message.
             _ => panic!("expected Available dependencies"),
         }
     }

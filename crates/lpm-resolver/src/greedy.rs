@@ -111,6 +111,51 @@ struct Edge {
     behavior: DepBehavior,
 }
 
+/// **Phase 66 R2.1 — eager-peer groundwork.** A single
+/// `peerDependencies[name]` declaration captured during the walk.
+///
+/// Distinct shape from [`Edge`]: peer requirements are NOT enqueued
+/// on the dispatcher's `task_queue`. The R2 design draft (see commit
+/// message + `DOCS/`-equivalent in handoff doc) treats peers as a
+/// separate input class so they map to `ResolvedPackage.peers` rather
+/// than `ResolvedPackage.dependencies`. The v2 store's graph-key
+/// derivation depends on this separation; silently routing peers
+/// through `n.children` would break peer-divergent link-entry
+/// isolation.
+///
+/// R2.1 collects these requirements but does NOT yet drain them —
+/// this is the contract-locking slice. R2.2 will add the fused-
+/// dispatcher peer drain that turns missing required peers into
+/// ambient root-scoped install requests.
+// Fields are read by R2.1 tests below + R2.2's drain. `#[allow(dead_code)]`
+// at the struct level rather than per-field keeps the doc readable —
+// the struct doc explains the future-use contract.
+#[allow(dead_code)]
+#[derive(Debug, Clone)]
+struct PeerRequirement {
+    /// The package that DECLARED this peer dep — i.e. the consumer
+    /// of the peer. Stored as a [`NodeId`] (already-allocated node)
+    /// because peer collection happens at child-deps-enqueue time,
+    /// when the consumer node is known.
+    consumer: NodeId,
+    /// Local name of the peer as it appears in `peerDependencies`.
+    /// May differ from [`Self::canonical`] only in the (rare) case
+    /// where an `npm:<target>@<range>` alias is also declared on the
+    /// peer key — npm permits this and the canonical is then the
+    /// alias target.
+    peer_name: String,
+    /// Registry identity (alias-aware).
+    canonical: CanonicalKey,
+    /// Parsed range from the `peerDependencies` value.
+    range: NpmRange,
+    /// `peerDependenciesMeta.<name>.optional` flag for this peer.
+    /// R2.2's drain step skips optional peers when synthesizing
+    /// ambient installs (the manifest author opted out); R5's
+    /// post-resolve `check_unmet_peers` already suppresses the
+    /// missing-peer warning for this set.
+    optional: bool,
+}
+
 /// Bitfield matching bun's `Dependency.Behavior` (`dependency.zig:35-37`).
 /// W1 collapses dev under required at the root level (only root
 /// edges are ever marked dev — transitive `devDependencies` are not
@@ -138,6 +183,17 @@ type ManifestState = Arc<CachedPackageInfo>;
 /// Entry point — same signature shape as
 /// [`crate::resolve::resolve_with_shared_cache`] so the dispatch in
 /// `resolve.rs` can swap implementations behind a feature flag.
+///
+/// **`auto_install_peers`** (Phase 66 R2.2) — `true` to enable
+/// bun-parity eager peer auto-install: any non-optional
+/// `peerDependency` not already satisfied by the resolved tree gets
+/// promoted to an ambient root-scoped install. `false` falls back to
+/// pre-R2 warn-only behavior (the post-resolve
+/// [`crate::check_unmet_peers`] pass surfaces missing peers as
+/// `PeerWarning`s, no auto-install). The lpm beta default is `true`
+/// — install.rs reads `package.json > lpm > autoInstallPeers` /
+/// `~/.lpm/config.toml > auto-install-peers` to derive the value at
+/// the call site.
 #[allow(clippy::too_many_arguments)] // mirrors resolve_with_shared_cache for drop-in dispatch
 pub async fn resolve_greedy(
     client: Arc<RegistryClient>,
@@ -149,6 +205,7 @@ pub async fn resolve_greedy(
     fetch_wait_timeout: Duration,
     route_table: RouteTable,
     metrics: StreamingBfsMetrics,
+    auto_install_peers: bool,
 ) -> Result<ResolveResult, ResolveError> {
     let _span = tracing::debug_span!("resolve_greedy", n_deps = dependencies.len()).entered();
     let pass_start = Instant::now();
@@ -163,19 +220,80 @@ pub async fn resolve_greedy(
     let mut state = ResolveState::new(dependencies, overrides);
     state.seed_root_edges()?;
 
-    while let Some(edge) = state.task_queue.pop_front() {
-        let info = ensure_manifest(
-            &edge.canonical,
-            client.clone(),
-            &route_table,
-            &shared_cache,
-            &notify_map,
-            &walker_done,
-            fetch_wait_timeout,
-            &metrics,
+    // ── Main task_queue + R2.2 peer-drain fixed-point loop ─────────
+    //
+    // Pre-R2.2 this was a single `while let Some(edge)` drain. R2.2
+    // wraps it in a fixed-point loop over `state.peer_requirements`:
+    // each iteration drains the task_queue, then runs ONE peer-drain
+    // pass that may synthesize ambient root-scoped install edges; if
+    // any were synthesized, we re-enter the task_queue drain to
+    // process them (and their children, which may themselves declare
+    // peers — caught by the next iteration). Termination: both
+    // task_queue and peer_requirements empty after a single pass.
+    loop {
+        // Inner: drain task_queue exactly as before.
+        while let Some(edge) = state.task_queue.pop_front() {
+            let info = ensure_manifest(
+                &edge.canonical,
+                client.clone(),
+                &route_table,
+                &shared_cache,
+                &notify_map,
+                &walker_done,
+                fetch_wait_timeout,
+                &metrics,
+            )
+            .await?;
+            process_edge(&edge, &info, &mut state)?;
+        }
+
+        // Outer: peer-drain pass. Skips synthesis when
+        // `auto_install_peers` is false (still drains the worklist
+        // so the resolver doesn't busy-loop on a non-empty Vec).
+        let client_drain = client.clone();
+        let route_table_drain = route_table.clone();
+        let shared_cache_drain = shared_cache.clone();
+        let notify_map_drain = notify_map.clone();
+        let walker_done_drain = walker_done.clone();
+        let metrics_drain = metrics.clone();
+        let synthesized = drain_peer_requirements_one_pass(
+            &mut state,
+            auto_install_peers,
+            move |canonical: CanonicalKey| {
+                let client = client_drain.clone();
+                let route_table = route_table_drain.clone();
+                let shared_cache = shared_cache_drain.clone();
+                let notify_map = notify_map_drain.clone();
+                let walker_done = walker_done_drain.clone();
+                let metrics = metrics_drain.clone();
+                async move {
+                    ensure_manifest(
+                        &canonical,
+                        client,
+                        &route_table,
+                        &shared_cache,
+                        &notify_map,
+                        &walker_done,
+                        fetch_wait_timeout,
+                        &metrics,
+                    )
+                    .await
+                }
+            },
         )
         .await?;
-        process_edge(&edge, &info, &mut state)?;
+
+        if synthesized.is_empty() {
+            // No new ambient installs and the task_queue is empty —
+            // nothing more to drain. Exit the fixed point.
+            break;
+        }
+
+        // Push synthesized ambient edges; the next iteration's inner
+        // drain processes them via the regular `process_edge` path.
+        for edge in synthesized {
+            state.task_queue.push_back(edge);
+        }
     }
 
     let resolver_ms = pass_start.elapsed().as_millis() as u64;
@@ -199,6 +317,12 @@ pub async fn resolve_greedy(
     // consumes the state.
     let platform_skipped = state.platform_skipped;
     let root_aliases = std::mem::take(&mut state.root_aliases);
+    // R2.2 — drain ambient peer installs and dedup+sort. Same canonical
+    // can be synthesized once per fixed-point iteration (a transitive
+    // peer chain), so dedup before exposing.
+    let mut ambient_peer_installs = std::mem::take(&mut state.ambient_peer_installs);
+    ambient_peer_installs.sort();
+    ambient_peer_installs.dedup();
     // Phase 32 P5 — drain the override apply trace before `state` is
     // moved by `into_resolved_packages`. `take_hits` sorts deterministically
     // by (package, raw_key), matching the pubgrub arm's contract for
@@ -216,6 +340,7 @@ pub async fn resolve_greedy(
         // when a root dep declares `npm:target@range`. Empty when no
         // root dep uses alias syntax.
         root_aliases,
+        ambient_peer_installs,
         stage_timing: StageTiming {
             followup_rpc_ms: snap.metadata_rpc.as_millis() as u64,
             followup_rpc_count: snap.metadata_rpc_count,
@@ -272,11 +397,14 @@ pub async fn resolve_greedy(
 /// starve metadata fetches that would unblock the resolver.
 ///
 /// **Counters.** `dispatcher_rpc_count`, `inflight_high_water`,
-/// `parked_max_depth`, `tarball_dispatched_count` are populated on
+/// `parked_max_depth`, `tarball_dispatched_count`, and
+/// `peer_prefetch_count` (R2.4) are populated on
 /// `ResolveResult.stage_timing` for `--json` consumption under
 /// `timing.resolve.dispatcher.*` (W1 plumbing). `walker_rpc_count` and
 /// `escape_hatch_rpc_count` are zero on the fusion arm by construction
 /// (no walker → no escape-hatch path).
+/// **`auto_install_peers`** — see the doc on [`resolve_greedy`] for
+/// the contract. Same semantic on the fused arm.
 #[allow(clippy::too_many_arguments)] // mirrors resolve_with_shared_cache's plumbing surface
 pub async fn resolve_greedy_fused(
     client: Arc<RegistryClient>,
@@ -285,6 +413,7 @@ pub async fn resolve_greedy_fused(
     route_table: RouteTable,
     npm_fanout: usize,
     spec_tx: Option<tokio::sync::mpsc::Sender<(String, lpm_registry::PackageMetadata)>>,
+    auto_install_peers: bool,
 ) -> Result<ResolveResult, ResolveError> {
     let _span = tracing::debug_span!(
         "resolve_greedy_fused",
@@ -315,6 +444,10 @@ pub async fn resolve_greedy_fused(
     // increment them before the main loop starts.
     let mut dispatcher_rpc_count: u64 = 0;
     let mut tarball_dispatched_count: u64 = 0;
+    // R2.4 — speculative peer-manifest fetches dispatched concurrent
+    // with regular dep dispatch. Bumped in Phase A2 below; surfaces
+    // on `StageTiming.peer_prefetch_count`.
+    let mut peer_prefetch_count: u64 = 0;
 
     // Pre-batch the root-level `@lpm.dev/*` deps in one round trip
     // before the main fetch loop. Without this, each such dep would
@@ -447,6 +580,55 @@ pub async fn resolve_greedy_fused(
             }
         }
 
+        // ── Phase A2 — R2.4 speculative peer-manifest prefetch ────
+        //
+        // For every peer requirement collected during the just-drained
+        // batch of regular dep edges, dispatch a metadata fetch
+        // CONCURRENT with the rest of the dispatch. By the time the
+        // main loop terminates and the R2.2 peer-drain pass runs, the
+        // manifest is already in `shared_cache` — the drain becomes a
+        // pure classify-and-synthesize pass with zero serial network
+        // round-trips on the critical path.
+        //
+        // Pre-R2.4, the drain helper's fetch closure ran a serial
+        // `fetch_metadata_raw` per missing peer canonical AFTER the
+        // main loop had already terminated. For typical projects with
+        // 0–3 unmet peers this added ~50–300 ms of pure-network
+        // latency. R2.4 overlaps that with the regular dep dispatch.
+        //
+        // Idempotency: `pick_peer_prefetch_candidates` filters out
+        // canonicals that are already cached or already in flight, so
+        // re-running this block in the next iteration won't double-
+        // dispatch. The dispatcher's `inflight.insert` guard would
+        // catch any miss but is redundant here.
+        if auto_install_peers {
+            let candidates = pick_peer_prefetch_candidates(&state, &shared_cache, &inflight);
+            for canonical in candidates {
+                // Mirror Phase A's cache-miss spawn — same metadata
+                // semaphore, same is_npm derivation, same tarball-spec
+                // forward when the manifest lands. The completion path
+                // in Phase C below treats peer prefetches identically
+                // to regular cache-miss completions; `parked.remove()`
+                // returns None (we didn't park anything) so the resume
+                // step is a no-op.
+                inflight.insert(canonical.clone());
+                let client_c = client.clone();
+                let permit = metadata_sem.clone();
+                let is_npm = matches!(canonical, CanonicalKey::Npm { .. });
+                let route_table_c = route_table.clone();
+                metadata_jobs.spawn(async move {
+                    let _p = permit
+                        .acquire_owned()
+                        .await
+                        .expect("metadata semaphore must outlive the resolver");
+                    let result = fetch_metadata_raw(&client_c, &route_table_c, &canonical).await;
+                    (canonical, is_npm, result)
+                });
+                dispatcher_rpc_count += 1;
+                peer_prefetch_count += 1;
+            }
+        }
+
         // High-water samples. O(unique-canonicals-parked) per tick;
         // ~tens of entries × ~134 ticks on bench/fixture-large is
         // negligible vs the network wall.
@@ -460,16 +642,14 @@ pub async fn resolve_greedy_fused(
             parked_max_depth = max_park;
         }
 
-        // ── Phase B — termination invariant ───────────────────────
+        // ── Phase B — termination invariant + R2.2 peer-drain hook ─
         // Both queues empty + zero in-flight metadata jobs ⇒ no
-        // future edges can appear (the only way to grow `task_queue`
-        // is `process_edge → enqueue_child_deps` from a cache hit;
-        // the only way to grow `metadata_jobs` is from Phase A's
-        // miss path). And every parked edge has its canonical in
-        // `inflight`, which is 1:1 with `metadata_jobs` — so an
-        // empty `metadata_jobs` implies empty `parked`. The
-        // `debug_assert!` documents this invariant; if it ever fires
-        // in CI/tests we have a real bug, not a benign edge case.
+        // future edges can appear from the regular dep walk. Before
+        // declaring victory, run ONE R2.2 peer-drain pass: it may
+        // synthesize ambient root-scoped install edges for unmet
+        // peers, which re-arms the loop. The pass is a no-op when
+        // `peer_requirements` is empty OR `auto_install_peers`
+        // is false.
         if metadata_jobs.is_empty() && state.task_queue.is_empty() {
             debug_assert!(
                 parked.is_empty(),
@@ -477,7 +657,61 @@ pub async fn resolve_greedy_fused(
                  (parked_keys={:?})",
                 parked.keys().collect::<Vec<_>>()
             );
-            break;
+
+            // R2.2 peer-drain pass. The fetch closure consults
+            // `shared_cache` first (hot path — manifests for peer
+            // canonicals are usually already there because the regular
+            // dep walk pulled them as transitive children). On true
+            // cache miss, fetch directly via `fetch_metadata_raw` —
+            // no need to park/spawn through the dispatcher because
+            // we're outside Phase A here, drains run sequentially.
+            let client_drain = client.clone();
+            let route_table_drain = route_table.clone();
+            let shared_cache_drain = shared_cache.clone();
+            let synthesized = drain_peer_requirements_one_pass(
+                &mut state,
+                auto_install_peers,
+                move |canonical: CanonicalKey| {
+                    let client = client_drain.clone();
+                    let route_table = route_table_drain.clone();
+                    let shared_cache = shared_cache_drain.clone();
+                    async move {
+                        // Cache hit: refcount bump, return immediately.
+                        if let Some(info_arc) =
+                            shared_cache.get(&canonical).map(|e| e.value().clone())
+                        {
+                            return Ok(info_arc);
+                        }
+                        // Cache miss: direct fetch + parse + insert.
+                        // R2.2 peer manifests are typically a small
+                        // tail (e.g., react when only react-dom was a
+                        // direct dep), so the serial fetch here is
+                        // bounded by the count of unmet-peer canonicals
+                        // — usually 0–3.
+                        let meta = fetch_metadata_raw(&client, &route_table, &canonical).await?;
+                        let info = parse_metadata_to_cache_info(&meta);
+                        let info_arc = Arc::new(info);
+                        shared_cache.insert(canonical.clone(), info_arc.clone());
+                        Ok(info_arc)
+                    }
+                },
+            )
+            .await?;
+
+            if synthesized.is_empty() {
+                // Fixed point reached: no more edges, no more peer
+                // requirements that needed synthesis. Done.
+                break;
+            }
+
+            // Push synthesized ambient edges; the next iteration's
+            // Phase A processes them via the regular cache-hit path
+            // (the drain pre-populated `shared_cache` for every
+            // canonical it touched).
+            for edge in synthesized {
+                state.task_queue.push_back(edge);
+            }
+            continue;
         }
 
         // ── Phase C — bounded await ──────────────────────────────
@@ -556,6 +790,12 @@ pub async fn resolve_greedy_fused(
         .collect();
     let platform_skipped = state.platform_skipped;
     let root_aliases = std::mem::take(&mut state.root_aliases);
+    // R2.2 — same drain semantic as walker arm: dedup + sort the
+    // ambient install set so the install pipeline gets a clean,
+    // deterministic list to union with `pkg.dependencies`.
+    let mut ambient_peer_installs = std::mem::take(&mut state.ambient_peer_installs);
+    ambient_peer_installs.sort();
+    ambient_peer_installs.dedup();
     // Phase 32 P5 — drain the override apply trace before `state` is
     // moved by `into_resolved_packages`. Same shape + order contract
     // as the walker arm above.
@@ -569,6 +809,7 @@ pub async fn resolve_greedy_fused(
         applied_overrides,
         platform_skipped,
         root_aliases,
+        ambient_peer_installs,
         stage_timing: StageTiming {
             followup_rpc_ms: snap.metadata_rpc.as_millis() as u64,
             followup_rpc_count: snap.metadata_rpc_count,
@@ -587,6 +828,7 @@ pub async fn resolve_greedy_fused(
             dispatcher_inflight_high_water: inflight_high_water,
             parked_max_depth,
             tarball_dispatched_count,
+            peer_prefetch_count,
         },
     })
 }
@@ -639,6 +881,37 @@ struct ResolveState {
     /// `take_hits()` drains the trace into `ResolveResult.applied_overrides`
     /// at the tail of each resolver arm.
     overrides: OverrideSet,
+    /// **Phase 66 R2.1 (eager-peer groundwork).** Per-consumer record
+    /// of every `peerDependencies` entry observed during the walk.
+    /// **Collected here, never enqueued onto [`Self::task_queue`].**
+    /// Peers are intentionally distinct from regular deps: they map to
+    /// `ResolvedPackage.peers` (not `dependencies`), and the v2 store's
+    /// graph-key derivation depends on that separation
+    /// (`install.rs::4620-4686` — peer pinning is folded into the
+    /// graph key so two installs with the same dep tree but different
+    /// peer ranges produce distinct `links/<key>/` entries). If we
+    /// silently smuggled peers in as `n.children` edges, peer-divergent
+    /// installs would share a single link entry and contaminate each
+    /// other's `node_modules/`.
+    ///
+    /// **R2.1 semantic:** populate-only. The downstream contract is
+    /// unchanged on this slice; the Vec exists to (a) lock the
+    /// requirement shape into `ResolveState` and (b) supply R2.2's
+    /// fused-dispatcher peer drain with a well-formed worklist.
+    /// `into_resolved_packages` continues to derive
+    /// `ResolvedPackage.peers` from the metadata cache, so this slice
+    /// produces byte-identical resolved trees compared to pre-R2.1.
+    peer_requirements: Vec<PeerRequirement>,
+    /// **Phase 66 R2.2** — canonical names of packages the peer-drain
+    /// pass synthesized as ambient root-scoped installs. Drained into
+    /// `ResolveResult.ambient_peer_installs` at each arm's tail. The
+    /// install pipeline reads this set to surface ambient peers at
+    /// the project's `node_modules/<name>/` top level — without it,
+    /// the auto-installed peer extracts into the global store but
+    /// never gets a project-side symlink, defeating R2.2's contract.
+    ///
+    /// Sorted alphabetically before drain for deterministic output.
+    ambient_peer_installs: Vec<String>,
 }
 
 /// In-flight resolved node — accumulated during the loop, finalized
@@ -662,6 +935,13 @@ impl ResolveState {
             platform_skipped: 0,
             root_aliases: HashMap::new(),
             overrides,
+            // Most installs declare zero peers at any given level. Even
+            // bench/fixture-large produces ~10s of total peer entries
+            // across 250+ packages. Start small; Vec::push amortizes.
+            peer_requirements: Vec::new(),
+            // R2.2: typically 0 (most installs don't need ambient
+            // synthesis). Allocated lazily on first push.
+            ambient_peer_installs: Vec::new(),
         }
     }
 
@@ -1047,16 +1327,35 @@ fn process_edge_inner(
         }
     };
 
-    // Reuse-or-allocate against `target_version`. With an override,
-    // dedupe is exact-match (so distinct overrides allocate distinct
-    // nodes). Without an override but with overrides parsed, the target
-    // is the natural pick and exact-match is also correct because no
-    // earlier edge picked anything different (the pre-override path
-    // would have reused a range-satisfying node — but we already
-    // bypassed that branch by entering the slow path; check it here
-    // too so we don't churn duplicate nodes for compatible siblings).
+    // Reuse-or-allocate against `target_version`.
+    //
+    // **Dedupe rule.** Exact-match when EITHER (a) this edge applied an
+    // override, OR (b) the canonical is in `OverrideSet::split_targets()`
+    // — i.e., at least one path-selector targets it. Otherwise
+    // range-satisfies (the pre-override hot-path semantic).
+    //
+    // Why split-targeted canonicals must use exact-match even when THIS
+    // edge didn't apply an override: a sibling edge from a path-matching
+    // parent may have already allocated a forced node at a different
+    // version. With range-satisfies dedupe, this edge would silently
+    // inherit that forced version — leaking the override into a parent
+    // it wasn't selecting. Exact-match against the natural pick avoids
+    // the leak; a second non-matching sibling agreeing on the same
+    // natural pick still dedupes correctly.
+    //
+    // The hot path (no overrides parsed) is in the `forced.is_none()`
+    // branch above and never reaches here, so this gate has zero cost
+    // on installs without overrides. The `split_targets().is_empty()`
+    // short-circuit also keeps slow-path installs with name-only
+    // overrides off the `to_string()` allocation.
+    let split_gate = !state.overrides.split_targets().is_empty()
+        && state
+            .overrides
+            .split_targets()
+            .contains(&edge.canonical.to_string());
+    let must_exact_match = override_hit.is_some() || split_gate;
     let existing_id: Option<NodeId> = state.resolved.get(&edge.canonical).and_then(|nodes| {
-        if override_hit.is_some() {
+        if must_exact_match {
             nodes
                 .iter()
                 .find(|(v, _)| v == &target_version)
@@ -1314,7 +1613,426 @@ fn enqueue_child_deps(
             },
         });
     }
+
+    // **Phase 66 R2.1 — eager-peer groundwork (collection only).**
+    // Capture every `peerDependencies` entry on this (canonical, version)
+    // as a `PeerRequirement`. Peers are NOT pushed onto `state.task_queue`
+    // because they must NOT become `n.children` edges — see the
+    // [`PeerRequirement`] doc + the v2 graph-key rationale on
+    // `state.peer_requirements`.
+    //
+    // Same alias / workspace / range-parse defenses as the regular-deps
+    // loop above; bundled-deps gate doesn't apply to peers (npm forbids
+    // peerBundle interactions; no real package ships both).
+    if let Some(peer_deps) = info.peer_deps.get(&ver_str) {
+        let optional_peers = info.optional_peer_names.get(&ver_str);
+        let peer_aliases = info.aliases.get(&ver_str);
+        let mut peer_entries: Vec<(&String, &String)> = peer_deps.iter().collect();
+        peer_entries.sort_by(|(a, _), (b, _)| a.cmp(b));
+
+        for (peer_name, peer_range_str) in peer_entries {
+            // R3 / B2 defense — `workspace:` peers from a registry-
+            // published package shouldn't exist (npm rejects them at
+            // publish time). Skip with a specific log rather than
+            // letting `NpmRange::parse` emit an opaque error.
+            if is_workspace_specifier(peer_range_str) {
+                tracing::warn!(
+                    "ignoring `workspace:` peer dep '{}' from {}@{} → {} \
+                     (workspace: must be resolved upstream by lpm-workspace; \
+                     a registry-published package should not declare it)",
+                    peer_range_str,
+                    parent_canonical,
+                    ver_str,
+                    peer_name,
+                );
+                continue;
+            }
+
+            // Alias-aware canonical lookup. Mirrors the regular-deps
+            // loop: a `"peer-local": "npm:target@range"` declaration
+            // (rare on peers, but legal) keys the requirement on
+            // `target` so the resolver consults the correct manifest.
+            let canonical = match peer_aliases.and_then(|a| a.get(peer_name)) {
+                Some(target) => CanonicalKey::from_dep_name(target),
+                None => CanonicalKey::from_dep_name(peer_name),
+            };
+
+            let range = match NpmRange::parse(peer_range_str) {
+                Ok(r) => r,
+                Err(e) => {
+                    tracing::warn!(
+                        "invalid peer range '{}' on {}@{} → {}: {e}",
+                        peer_range_str,
+                        parent_canonical,
+                        ver_str,
+                        peer_name,
+                    );
+                    continue;
+                }
+            };
+
+            let optional = optional_peers
+                .map(|set| set.contains(peer_name))
+                .unwrap_or(false);
+
+            state.peer_requirements.push(PeerRequirement {
+                consumer: parent_id,
+                peer_name: peer_name.clone(),
+                canonical,
+                range,
+                optional,
+            });
+        }
+    }
+
     Ok(())
+}
+
+// ── Phase 66 R2.2 — eager peer auto-install drain ─────────────────
+//
+// Design (see CLAUDE.md feedback chain + R2 plan-of-record):
+//   - Peer requirements are collected during `enqueue_child_deps`
+//     (R2.1) onto `state.peer_requirements`, NEVER as `task_queue`
+//     edges.
+//   - After the main task_queue drains, R2.2 runs a peer-drain pass:
+//     1. Group requirements by `canonical`.
+//     2. For each group, check if any node in `state.resolved` for
+//        that canonical satisfies EVERY consumer's range. Yes → skip
+//        (the existing `into_resolved_packages` peer derivation will
+//        record the consumer→peer edge from cache).
+//     3. If unsatisfied AND `auto_install_peers` is on AND at least
+//        one consumer is non-optional, look up the canonical's
+//        manifest (arm-specific fetch closure), find the newest
+//        version satisfying every consumer's range, and synthesize a
+//        ROOT-SCOPED ambient `Edge` pinning that exact version.
+//     4. If no version satisfies every required consumer's range →
+//        `ResolveError::PeerConflict` (the user must fix the manifest
+//        or pin via `lpm.overrides`).
+//   - Caller pushes synthesized edges to `task_queue`, re-drains the
+//     main loop, and re-runs the drain pass. Repeat until both
+//     queues are empty (transitive peers from ambient installs may
+//     spawn further requirements).
+//
+// **Architectural correction (vs. earlier draft).** Peers are
+// deliberately NOT routed as `n.children` edges of the consumer.
+// `ResolvedPackage.dependencies` and `ResolvedPackage.peers` are
+// distinct fields; the v2 store's graph-key derivation depends on
+// the separation
+// (`install.rs::4620-4686` / `lpm-resolver::resolve.rs::36+61`).
+// Smuggling peers in as children would break peer-divergent link-
+// entry isolation under v2 (default). Hence: ambient install at
+// ROOT scope, satisfying the peer's canonical from the side without
+// modifying the consumer's child list.
+
+/// Classification outcome for a single peer-canonical group during
+/// the drain pass.
+enum PeerDrainOutcome {
+    /// Some node already in `state.resolved` for this canonical
+    /// satisfies every requirement in the group. No work to do —
+    /// `into_resolved_packages` will record the per-consumer peer
+    /// edges from the metadata cache.
+    SatisfiedByExisting,
+    /// All consumers in the group declared the peer as optional, OR
+    /// `auto_install_peers` is off. Skip without synthesis; R5's
+    /// `check_unmet_peers` warning pass handles user-visible output.
+    SkippedOptOut,
+    /// At least one consumer is required and the group can be
+    /// satisfied by version `chosen` from the canonical's manifest.
+    /// Caller synthesizes a root-scoped ambient `Edge` with an
+    /// exact-version range pinning `chosen`. `find_version_satisfying_all`
+    /// applies the platform filter, so a returned version is always
+    /// platform-compatible — the synthesis path never bumps
+    /// `state.platform_skipped`.
+    Synthesize { chosen: NpmVersion },
+}
+
+/// Walk `info.versions` newest-first, return the first version that
+/// satisfies EVERY requirement's range AND is platform-compatible.
+/// Mirrors `find_best_version`'s contract for a single range, but
+/// generalized to N ranges that all must be satisfied simultaneously.
+///
+/// Returns `None` when no version threads every range; callers turn
+/// that into either a `PeerConflict` (any required consumer present)
+/// or a silent skip (all consumers optional).
+fn find_version_satisfying_all(
+    info: &CachedPackageInfo,
+    reqs: &[&PeerRequirement],
+) -> Option<NpmVersion> {
+    for v in &info.versions {
+        // Every requirement's range must accept this version.
+        if !reqs.iter().all(|r| r.range.satisfies(v)) {
+            continue;
+        }
+        // Platform filter — same gate the regular dep path uses, so
+        // an ambient install never lands a tarball the current OS/CPU
+        // can't use.
+        let platform_ok = info
+            .platform
+            .get(&v.to_string())
+            .is_none_or(crate::provider::is_platform_compatible);
+        if !platform_ok {
+            continue;
+        }
+        return Some(v.clone());
+    }
+    None
+}
+
+/// True iff at least one node currently in `state.resolved[canonical]`
+/// is at a version that satisfies EVERY requirement in the group. The
+/// existing `into_resolved_packages` peer-derivation pass picks up the
+/// resolved version from `resolved_by_canonical`, so a satisfied group
+/// needs no further work.
+fn group_satisfied_by_existing(
+    state: &ResolveState,
+    canonical: &CanonicalKey,
+    reqs: &[&PeerRequirement],
+) -> bool {
+    let Some(nodes) = state.resolved.get(canonical) else {
+        return false;
+    };
+    nodes
+        .iter()
+        .any(|(v, _)| reqs.iter().all(|r| r.range.satisfies(v)))
+}
+
+/// One peer-drain pass.
+///
+/// Drains the current `state.peer_requirements` snapshot (replacing
+/// the field with an empty Vec so the next pass collects fresh
+/// requirements from any ambient installs synthesized during this
+/// pass). Returns the synthesized edges for the caller to push onto
+/// `state.task_queue` and drain through the main loop.
+///
+/// **Phase 66 R2.4** — pick canonicals that should be speculatively
+/// prefetched concurrent with the regular dep walk.
+///
+/// Returns canonicals from `state.peer_requirements` that satisfy
+/// ALL of:
+///   - at least one consumer in the group is non-optional
+///     (optional-only groups never auto-install, so prefetching
+///     would be wasted bandwidth);
+///   - no node in `state.resolved` for the canonical satisfies any
+///     consumer's range (i.e., not already met by an ancestor);
+///   - the canonical is not in `cached_canonicals` (manifest already
+///     in the shared cache — the eventual drain pass will hit the
+///     fast path);
+///   - the canonical is not in `inflight_canonicals` (some sibling
+///     dispatch already started a fetch — the dispatcher's existing
+///     dedup handles us).
+///
+/// Returned canonicals are sorted alphabetically for deterministic
+/// dispatch ordering across runs (same lockfile-equivalence guarantee
+/// the regular dep loop holds).
+///
+/// **Pure function:** no I/O, no `&mut` parameters that would couple
+/// it to the dispatcher's spawn machinery. The fused arm calls this
+/// once per main-loop iteration to pick prefetch candidates, then
+/// spawns metadata jobs through its existing infrastructure. Tests
+/// can drive it directly with hand-built state + cached/inflight
+/// sets to verify the four predicates.
+fn pick_peer_prefetch_candidates(
+    state: &ResolveState,
+    cached_canonicals: &dashmap::DashMap<CanonicalKey, Arc<CachedPackageInfo>>,
+    inflight_canonicals: &HashSet<CanonicalKey>,
+) -> Vec<CanonicalKey> {
+    if state.peer_requirements.is_empty() {
+        return Vec::new();
+    }
+
+    // Group reqs by canonical so the all-optional check is per-group,
+    // not per-individual-requirement (an optional consumer alone
+    // shouldn't keep a prefetch from happening when a sibling
+    // required-consumer for the SAME canonical exists).
+    let mut grouped: HashMap<&CanonicalKey, Vec<&PeerRequirement>> = HashMap::new();
+    for req in &state.peer_requirements {
+        grouped.entry(&req.canonical).or_default().push(req);
+    }
+
+    let mut picks: Vec<CanonicalKey> = Vec::new();
+    for (canonical, reqs) in grouped {
+        // All-optional → no auto-install regardless of cache state.
+        if reqs.iter().all(|r| r.optional) {
+            continue;
+        }
+        // Already satisfied by an existing node in the resolved tree.
+        if let Some(nodes) = state.resolved.get(canonical)
+            && nodes
+                .iter()
+                .any(|(v, _)| reqs.iter().all(|r| r.range.satisfies(v)))
+        {
+            continue;
+        }
+        // Manifest already in cache — drain pass will hit the fast
+        // path; no prefetch needed.
+        if cached_canonicals.contains_key(canonical) {
+            continue;
+        }
+        // Some sibling dispatch already started a fetch for this
+        // canonical (regular transitive dep is racing with us). The
+        // dispatcher's `inflight` guard would dedup our spawn anyway;
+        // skipping here saves the spawn allocation + the redundant
+        // `dispatcher_rpc_count` bump.
+        if inflight_canonicals.contains(canonical) {
+            continue;
+        }
+        picks.push(canonical.clone());
+    }
+
+    // Deterministic dispatch order. With ~tens of peer requirements
+    // even on bench/fixture-large, sort cost is negligible.
+    picks.sort_by_key(|c| c.to_string());
+    picks
+}
+
+/// `fetch_manifest` is the arm-specific closure that resolves a
+/// canonical to its `Arc<CachedPackageInfo>`, using whatever caching
+/// and dispatch machinery the calling arm has (walker arm:
+/// synchronous `ensure_manifest`; fused arm: `shared_cache` lookup
+/// then direct fetch on miss).
+async fn drain_peer_requirements_one_pass<F, Fut>(
+    state: &mut ResolveState,
+    auto_install_peers: bool,
+    mut fetch_manifest: F,
+) -> Result<Vec<Edge>, ResolveError>
+where
+    F: FnMut(CanonicalKey) -> Fut,
+    Fut: std::future::Future<Output = Result<Arc<CachedPackageInfo>, ResolveError>>,
+{
+    // Take ownership of the current snapshot so subsequent passes
+    // start clean. Synthesized ambient installs may produce further
+    // peer requirements via `enqueue_child_deps`; those are caught by
+    // the next pass.
+    let pending = std::mem::take(&mut state.peer_requirements);
+    if pending.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    // Group by canonical, deterministically. The HashMap walk would
+    // produce non-reproducible synthesis order; collect-then-sort
+    // gives byte-identical lockfile output across runs.
+    let mut grouped: HashMap<CanonicalKey, Vec<PeerRequirement>> = HashMap::new();
+    for req in pending {
+        grouped.entry(req.canonical.clone()).or_default().push(req);
+    }
+    let mut canonicals: Vec<CanonicalKey> = grouped.keys().cloned().collect();
+    canonicals.sort_by_key(|c| c.to_string());
+
+    let mut synthesized: Vec<Edge> = Vec::new();
+    for canonical in canonicals {
+        let reqs_owned = grouped.remove(&canonical).expect("just collected key");
+        let reqs: Vec<&PeerRequirement> = reqs_owned.iter().collect();
+
+        let outcome = classify_peer_group(
+            state,
+            &canonical,
+            &reqs,
+            auto_install_peers,
+            &mut fetch_manifest,
+        )
+        .await?;
+
+        match outcome {
+            PeerDrainOutcome::SatisfiedByExisting => continue,
+            PeerDrainOutcome::SkippedOptOut => continue,
+            PeerDrainOutcome::Synthesize { chosen } => {
+                // Pin the synthesized edge to the exact chosen version.
+                // `find_best_version` will return the same version
+                // (only one match for an exact pin), and dedupe-on-
+                // canonical reuses any existing node at that version
+                // (e.g., if a transitive regular dep already pulled it
+                // in at the same version).
+                let exact_range = NpmRange::parse(&chosen.to_string()).map_err(|e| {
+                    ResolveError::Internal(format!(
+                        "R2.2: synthesized exact-pin range '{chosen}' for {canonical} \
+                         failed to parse: {e}"
+                    ))
+                })?;
+                let canonical_name = canonical.to_string();
+                synthesized.push(Edge {
+                    parent: 0,                          // root scope
+                    local_name: canonical_name.clone(), // ambient install — local name = canonical
+                    canonical: canonical.clone(),
+                    range: exact_range,
+                    behavior: DepBehavior {
+                        // Ambient install at root scope is a regular
+                        // required dep; the `peer` provenance is
+                        // already captured in the original consumer's
+                        // `peers` field, derived from the metadata
+                        // cache by `into_resolved_packages`.
+                        required: true,
+                        peer: false,
+                        optional: false,
+                    },
+                });
+                // Record the canonical so the install pipeline can
+                // surface it at top-level `node_modules/<name>/`. The
+                // resolver-side allocation alone isn't enough: install
+                // pipeline derives "is this a top-level link?" from
+                // `pkg.dependencies` ∪ `ambient_peer_installs`, not
+                // from the resolver's `root.children` (which gets
+                // filtered out at `into_resolved_packages`).
+                state.ambient_peer_installs.push(canonical_name);
+                tracing::debug!(
+                    "R2.2 ambient-install: {} @ {} (consumers: {})",
+                    canonical,
+                    chosen,
+                    reqs_owned.len(),
+                );
+            }
+        }
+    }
+
+    Ok(synthesized)
+}
+
+/// Classify one peer-canonical group. Splits the satisfaction check
+/// from the synthesis path so callers can short-circuit the manifest
+/// fetch when it's not needed.
+async fn classify_peer_group<F, Fut>(
+    state: &ResolveState,
+    canonical: &CanonicalKey,
+    reqs: &[&PeerRequirement],
+    auto_install_peers: bool,
+    fetch_manifest: &mut F,
+) -> Result<PeerDrainOutcome, ResolveError>
+where
+    F: FnMut(CanonicalKey) -> Fut,
+    Fut: std::future::Future<Output = Result<Arc<CachedPackageInfo>, ResolveError>>,
+{
+    // Step 1 — already satisfied?
+    if group_satisfied_by_existing(state, canonical, reqs) {
+        return Ok(PeerDrainOutcome::SatisfiedByExisting);
+    }
+
+    // Step 2 — opt-out gates. If every requirement is optional, the
+    // manifest author asked us not to fail; same skip path as
+    // `auto_install_peers = false`.
+    let any_required = reqs.iter().any(|r| !r.optional);
+    if !any_required || !auto_install_peers {
+        return Ok(PeerDrainOutcome::SkippedOptOut);
+    }
+
+    // Step 3 — synthesis path. Fetch the manifest, find the version
+    // satisfying every consumer's range, or surface a conflict.
+    let info = fetch_manifest(canonical.clone()).await?;
+    match find_version_satisfying_all(&info, reqs) {
+        Some(chosen) => Ok(PeerDrainOutcome::Synthesize { chosen }),
+        None => Err(ResolveError::PeerConflict {
+            canonical: canonical.to_string(),
+            requirements: reqs
+                .iter()
+                .map(|r| {
+                    let consumer_canonical = state
+                        .nodes
+                        .get(r.consumer as usize)
+                        .map(|n| n.canonical.to_string())
+                        .unwrap_or_else(|| "<unknown>".to_string());
+                    (consumer_canonical, r.range.to_string(), r.optional)
+                })
+                .collect(),
+        }),
+    }
 }
 
 /// Outcome of `find_best_version`. Distinguishes "no version exists
@@ -1333,17 +2051,13 @@ enum VersionPick {
     PlatformFiltered,
 }
 
-/// R3 defense-in-depth — detect a leaked `workspace:` specifier
-/// before [`NpmRange::parse`] gets to it. The `workspace:` protocol
-/// is a manifest-level opt-in for "this dep lives in the workspace,
-/// not the registry"; resolution happens upstream in
-/// [`lpm_workspace`] which rewrites such deps before the resolver
-/// runs. If `workspace:<rest>` reaches here, something upstream
-/// failed and the caller deserves a specific error rather than the
-/// opaque semver-parse failure `NpmRange::parse("workspace:*")`
-/// would otherwise produce.
+/// R3 / B2 defense-in-depth — detect a leaked `workspace:` specifier
+/// before [`NpmRange::parse`] gets to it. The implementation lives in
+/// [`crate::ranges::is_workspace_specifier`] so both resolver arms
+/// consult the same predicate; this thin re-export keeps the local
+/// callsite readable.
 fn is_workspace_specifier(range_str: &str) -> bool {
-    range_str.trim_start().starts_with("workspace:")
+    crate::ranges::is_workspace_specifier(range_str)
 }
 
 /// Greedy first-match version pick. Iterates `info.versions` (sorted
@@ -2048,22 +2762,33 @@ mod tests {
         // `lodash` edge keeps its natural pick. Two distinct lodash
         // nodes coexist in the resolved tree (split-by-context).
         //
-        // Both consumers declare `>=3.0.0` so the override target
-        // (3.10.1) sits inside both ranges — the split is purely a
-        // function of which parent the edge originates from, not of
-        // mutually exclusive ranges. (The
-        // `process_edge_allocates_second_version_on_incompatible_range`
-        // test covers the range-mismatch split path; this one
-        // isolates the override-driven split.)
+        // **B1 / split_targets gate.** This test enqueues the
+        // override-bearing edge BEFORE the natural edge, so the
+        // override allocates `lodash@3.10.1` first; the subsequent
+        // root edge must NOT silently inherit that forced version
+        // via range-satisfies dedupe (3.10.1 satisfies `>=3.0.0`).
+        // Pre-fix, that's exactly what happened — the path-selector
+        // override leaked into every sibling of `react`. Post-fix,
+        // `OverrideSet::split_targets` (containing "lodash") forces
+        // exact-match dedupe on every slow-path edge, so the root
+        // edge allocates the natural 4.17.21 in its own node.
         let info = mk_info(&["4.17.21", "3.10.1"], &[]);
         let mut deps = HashMap::new();
         deps.insert("lodash".to_string(), ">=3.0.0".to_string());
         let mut state = ResolveState::new(deps, override_set("react>lodash", "3.10.1"));
-        state.seed_root_edges().unwrap();
 
-        // Synthesize a `react` parent that ALSO pulls lodash@>=3.0.0
-        // — without the path-selector override, this would reuse the
-        // root's lodash@4.17.21. With the override, it splits.
+        // Hand-seed both parents WITHOUT calling `seed_root_edges()`,
+        // which would push the root>lodash edge first. Reverse order
+        // (react edge enqueued before root edge) is what surfaces the
+        // pre-fix bug.
+        state.nodes.push(ResolvedNodeBuilder {
+            canonical: CanonicalKey::Root,
+            version: NpmVersion::new(0, 0, 0),
+            children: Vec::new(),
+        });
+        state
+            .resolved
+            .insert(CanonicalKey::Root, vec![(NpmVersion::new(0, 0, 0), 0)]);
         state.nodes.push(ResolvedNodeBuilder {
             canonical: CanonicalKey::npm("react"),
             version: NpmVersion::parse("18.0.0").unwrap(),
@@ -2073,8 +2798,23 @@ mod tests {
             CanonicalKey::npm("react"),
             vec![(NpmVersion::parse("18.0.0").unwrap(), 1)],
         );
+
+        // React edge first — applies override, allocates lodash@3.10.1.
         state.task_queue.push_back(Edge {
             parent: 1,
+            local_name: "lodash".to_string(),
+            canonical: CanonicalKey::npm("lodash"),
+            range: NpmRange::parse(">=3.0.0").unwrap(),
+            behavior: DepBehavior {
+                required: true,
+                peer: false,
+                optional: false,
+            },
+        });
+        // Root edge second — must allocate natural 4.17.21, NOT reuse
+        // the forced 3.10.1 the react edge just allocated.
+        state.task_queue.push_back(Edge {
+            parent: 0,
             local_name: "lodash".to_string(),
             canonical: CanonicalKey::npm("lodash"),
             range: NpmRange::parse(">=3.0.0").unwrap(),
@@ -2095,7 +2835,8 @@ mod tests {
         assert_eq!(
             versions,
             vec!["3.10.1", "4.17.21"],
-            "path-selector override splits lodash into two versions"
+            "path-selector override splits lodash into two versions \
+             regardless of edge processing order"
         );
 
         // The root edge resolved to natural (4.17.21).
@@ -2107,7 +2848,8 @@ mod tests {
             .unwrap();
         assert_eq!(
             state.nodes[root_lodash_id as usize].version.to_string(),
-            "4.17.21"
+            "4.17.21",
+            "root edge must resolve to natural pick (B1: not leaked from earlier-allocated forced node)"
         );
 
         // The react edge resolved to the override (3.10.1).
@@ -2126,6 +2868,110 @@ mod tests {
         assert_eq!(hits.len(), 1, "only the path-selector edge records a hit");
         assert_eq!(hits[0].via_parent.as_deref(), Some("react"));
         assert_eq!(hits[0].to_version, "3.10.1");
+    }
+
+    #[test]
+    fn process_edge_path_selector_does_not_leak_to_sibling_parent() {
+        // **B1 regression test.** Two transitive parents pull the same
+        // canonical: `react > lodash` (path-selector matched) and
+        // `redux > lodash` (NOT matched). The override edge processes
+        // first, allocating `lodash@3.10.1`. Without the
+        // `split_targets` gate, the redux edge's range-satisfies dedupe
+        // would find 3.10.1 satisfying `>=3.0.0` and silently reuse —
+        // leaking the path-selector override into a parent the user
+        // didn't select. With the gate, redux gets the natural pick
+        // (4.17.21) in its own node.
+        let info = mk_info(&["4.17.21", "3.10.1"], &[]);
+        // No root-level lodash edge — the leak is parent-to-parent
+        // among transitive deps, not parent-to-root.
+        let deps = HashMap::new();
+        let mut state = ResolveState::new(deps, override_set("react>lodash", "3.10.1"));
+
+        // Root pseudo-node + two parents.
+        state.nodes.push(ResolvedNodeBuilder {
+            canonical: CanonicalKey::Root,
+            version: NpmVersion::new(0, 0, 0),
+            children: Vec::new(),
+        });
+        state
+            .resolved
+            .insert(CanonicalKey::Root, vec![(NpmVersion::new(0, 0, 0), 0)]);
+        state.nodes.push(ResolvedNodeBuilder {
+            canonical: CanonicalKey::npm("react"),
+            version: NpmVersion::parse("18.0.0").unwrap(),
+            children: Vec::new(),
+        });
+        state.resolved.insert(
+            CanonicalKey::npm("react"),
+            vec![(NpmVersion::parse("18.0.0").unwrap(), 1)],
+        );
+        state.nodes.push(ResolvedNodeBuilder {
+            canonical: CanonicalKey::npm("redux"),
+            version: NpmVersion::parse("4.0.0").unwrap(),
+            children: Vec::new(),
+        });
+        state.resolved.insert(
+            CanonicalKey::npm("redux"),
+            vec![(NpmVersion::parse("4.0.0").unwrap(), 2)],
+        );
+
+        // React's lodash edge first (path-selector match, override applies).
+        state.task_queue.push_back(Edge {
+            parent: 1,
+            local_name: "lodash".to_string(),
+            canonical: CanonicalKey::npm("lodash"),
+            range: NpmRange::parse(">=3.0.0").unwrap(),
+            behavior: DepBehavior {
+                required: true,
+                peer: false,
+                optional: false,
+            },
+        });
+        // Redux's lodash edge second (no path-selector match, must
+        // allocate natural — must NOT reuse react's forced 3.10.1).
+        state.task_queue.push_back(Edge {
+            parent: 2,
+            local_name: "lodash".to_string(),
+            canonical: CanonicalKey::npm("lodash"),
+            range: NpmRange::parse(">=3.0.0").unwrap(),
+            behavior: DepBehavior {
+                required: true,
+                peer: false,
+                optional: false,
+            },
+        });
+
+        while let Some(edge) = state.task_queue.pop_front() {
+            process_edge(&edge, &info, &mut state).unwrap();
+        }
+
+        let react_lodash_id = state.nodes[1]
+            .children
+            .iter()
+            .find(|(name, _)| name == "lodash")
+            .map(|(_, id)| *id)
+            .unwrap();
+        let redux_lodash_id = state.nodes[2]
+            .children
+            .iter()
+            .find(|(name, _)| name == "lodash")
+            .map(|(_, id)| *id)
+            .unwrap();
+
+        assert_eq!(
+            state.nodes[react_lodash_id as usize].version.to_string(),
+            "3.10.1",
+            "react > lodash applies the path-selector override"
+        );
+        assert_eq!(
+            state.nodes[redux_lodash_id as usize].version.to_string(),
+            "4.17.21",
+            "redux > lodash does NOT inherit react's forced version (B1: split_targets gate)"
+        );
+        assert_ne!(
+            react_lodash_id, redux_lodash_id,
+            "the two parents resolve to distinct lodash nodes"
+        );
     }
 
     // ── R4 — bundleDependencies skip ─────────────────────────────
@@ -2284,6 +3130,1067 @@ mod tests {
         assert!(!is_workspace_specifier("workspaces:*"));
     }
 
+    // ── R2.1 — eager-peer groundwork (collection only) ───────────
+    //
+    // R2.1's contract:
+    //   1. Every `peerDependencies` entry on the (canonical, version)
+    //      under enqueue produces ONE `PeerRequirement` on
+    //      `state.peer_requirements`.
+    //   2. Peers are NEVER pushed to `state.task_queue` and NEVER
+    //      added to the consumer's `n.children`.
+    //   3. Defenses (workspace, invalid range, alias rewrite) match
+    //      the regular-deps loop semantically.
+    //   4. `optional_peer_names` flag propagates onto the
+    //      requirement's `optional` field.
+    //
+    // The full eager-peer auto-install lands in R2.2, which drains
+    // `state.peer_requirements` into root-scoped ambient install
+    // edges through the fused dispatcher. R2.1 ships the collection
+    // contract first so R2.2 can be a pure consumer of well-formed
+    // requirements.
+
+    /// Build a `CachedPackageInfo` with peer_deps + optional_peer_names
+    /// populated for a single version. Mirrors `mk_info`'s shape.
+    fn mk_info_with_peers(
+        versions: &[&str],
+        deps_of_latest: &[(&str, &str)],
+        peers_of_latest: &[(&str, &str)],
+        optional_peers_of_latest: &[&str],
+    ) -> CachedPackageInfo {
+        let mut info = mk_info(versions, deps_of_latest);
+        let Some(latest) = versions.first() else {
+            return info;
+        };
+        let mut peer_map = HashMap::new();
+        for (n, r) in peers_of_latest {
+            peer_map.insert(n.to_string(), r.to_string());
+        }
+        info.peer_deps.insert(latest.to_string(), peer_map);
+        if !optional_peers_of_latest.is_empty() {
+            let mut optional = HashSet::new();
+            for n in optional_peers_of_latest {
+                optional.insert(n.to_string());
+            }
+            info.optional_peer_names
+                .insert(latest.to_string(), optional);
+        }
+        info
+    }
+
+    /// Drive `enqueue_child_deps` against a freshly-allocated parent
+    /// node and return the mutated state for assertion. Encapsulates
+    /// the ResolveState scaffolding that every R2.1 test needs.
+    fn enqueue_for_parent(
+        parent_canonical: CanonicalKey,
+        info: &CachedPackageInfo,
+    ) -> ResolveState {
+        let mut state = ResolveState::new(HashMap::new(), OverrideSet::empty());
+        state.nodes.push(ResolvedNodeBuilder {
+            canonical: parent_canonical.clone(),
+            version: NpmVersion::parse("1.0.0").unwrap(),
+            children: Vec::new(),
+        });
+        enqueue_child_deps(
+            0,
+            &parent_canonical,
+            &NpmVersion::parse("1.0.0").unwrap(),
+            info,
+            &mut state,
+        )
+        .unwrap();
+        state
+    }
+
+    #[test]
+    fn peer_collection_records_one_requirement_per_peer() {
+        // Parent declares `peerDependencies: { react: "^18.0.0" }`.
+        // After `enqueue_child_deps`, exactly one PeerRequirement
+        // should be on the worklist — keyed on the consumer node id,
+        // canonical "react", and parsed range "^18.0.0".
+        let info = mk_info_with_peers(&["1.0.0"], &[], &[("react", "^18.0.0")], &[]);
+        let state = enqueue_for_parent(CanonicalKey::npm("parent"), &info);
+
+        assert_eq!(
+            state.peer_requirements.len(),
+            1,
+            "exactly one peer requirement should be recorded"
+        );
+        let req = &state.peer_requirements[0];
+        assert_eq!(req.consumer, 0, "consumer id is the parent node");
+        assert_eq!(req.peer_name, "react");
+        assert_eq!(req.canonical, CanonicalKey::npm("react"));
+        assert!(
+            req.range.satisfies(&NpmVersion::parse("18.2.0").unwrap()),
+            "range parsed correctly (18.2.0 satisfies ^18.0.0)"
+        );
+        assert!(!req.optional, "optional flag defaults to false");
+    }
+
+    #[test]
+    fn peer_collection_does_not_push_to_task_queue() {
+        // **Contract assertion.** The whole point of R2.1 is that
+        // peers go on `peer_requirements`, NOT `task_queue`. If a
+        // future regression switches the push site, this test fires.
+        let info = mk_info_with_peers(
+            &["1.0.0"],
+            &[("regular-dep", "^1.0.0")],
+            &[("peer-dep", "^2.0.0")],
+            &[],
+        );
+        let state = enqueue_for_parent(CanonicalKey::npm("parent"), &info);
+
+        let queued: Vec<&str> = state
+            .task_queue
+            .iter()
+            .map(|e| e.local_name.as_str())
+            .collect();
+        assert_eq!(
+            queued,
+            vec!["regular-dep"],
+            "task_queue gets ONLY regular deps; peers must not leak in"
+        );
+        assert_eq!(state.peer_requirements.len(), 1);
+        assert_eq!(state.peer_requirements[0].peer_name, "peer-dep");
+    }
+
+    #[test]
+    fn peer_collection_does_not_mutate_consumer_children() {
+        // **Contract assertion.** The consumer node's `children` list
+        // must not gain a peer entry. If R2.2 (or a future change)
+        // accidentally pushes a peer onto `n.children`, the v2 graph-
+        // key derivation would silently fold the peer into the
+        // dependency portion of the key, breaking peer-divergent
+        // link-entry isolation.
+        let info = mk_info_with_peers(&["1.0.0"], &[], &[("react", "^18.0.0")], &[]);
+        let state = enqueue_for_parent(CanonicalKey::npm("parent"), &info);
+
+        assert!(
+            state.nodes[0].children.is_empty(),
+            "consumer.children must remain empty when only peers are declared \
+             (peer collection must not write to children)"
+        );
+        assert_eq!(state.peer_requirements.len(), 1);
+    }
+
+    #[test]
+    fn peer_collection_optional_flag_propagated() {
+        // R5 metadata flow: `peerDependenciesMeta.optional: true`
+        // lands in `info.optional_peer_names`. R2.1's collector
+        // copies the flag onto the requirement so R2.2 can skip
+        // ambient-install synthesis for opted-out peers.
+        let info = mk_info_with_peers(
+            &["1.0.0"],
+            &[],
+            &[("react", "^18.0.0"), ("redux", "^4.0.0")],
+            &["react"], // react is optional, redux is required
+        );
+        let state = enqueue_for_parent(CanonicalKey::npm("parent"), &info);
+
+        assert_eq!(state.peer_requirements.len(), 2);
+        let mut by_name: HashMap<&str, &PeerRequirement> = HashMap::new();
+        for req in &state.peer_requirements {
+            by_name.insert(req.peer_name.as_str(), req);
+        }
+        assert!(
+            by_name["react"].optional,
+            "react is in optional_peer_names → optional=true"
+        );
+        assert!(
+            !by_name["redux"].optional,
+            "redux is NOT in optional_peer_names → optional=false"
+        );
+    }
+
+    #[test]
+    fn peer_collection_alias_aware() {
+        // npm permits a peer to be declared via alias —
+        // `"my-react": "npm:react@^18"` is equivalent to
+        // `peerDependencies: { react: "^18" }` re-keyed under
+        // `my-react`. The collector must record the canonical as
+        // `react` (registry identity) so R2.2 fetches the right
+        // manifest, while preserving the local `peer_name = "my-react"`
+        // for the eventual `ResolvedPackage.peers` edge label.
+        let mut info = mk_info_with_peers(&["1.0.0"], &[], &[("my-react", "^18.0.0")], &[]);
+        // Inject the alias map for the latest version.
+        let mut aliases = HashMap::new();
+        aliases.insert("my-react".to_string(), "react".to_string());
+        info.aliases.insert("1.0.0".to_string(), aliases);
+
+        let state = enqueue_for_parent(CanonicalKey::npm("parent"), &info);
+        assert_eq!(state.peer_requirements.len(), 1);
+        let req = &state.peer_requirements[0];
+        assert_eq!(req.peer_name, "my-react", "local name preserved");
+        assert_eq!(
+            req.canonical,
+            CanonicalKey::npm("react"),
+            "canonical resolved through alias to the registry target"
+        );
+    }
+
+    #[test]
+    fn peer_collection_skips_workspace_specifier() {
+        // R3 / B2 defense — a registry-published manifest declaring a
+        // `workspace:` peer is malformed (npm rejects at publish
+        // time). The collector skips it with a workspace-specific
+        // log rather than letting `NpmRange::parse` emit an opaque
+        // semver error. Mirrors the regular-deps loop.
+        let info = mk_info_with_peers(
+            &["1.0.0"],
+            &[],
+            &[("legit-peer", "^1.0.0"), ("internal-peer", "workspace:*")],
+            &[],
+        );
+        let state = enqueue_for_parent(CanonicalKey::npm("parent"), &info);
+
+        let names: Vec<&str> = state
+            .peer_requirements
+            .iter()
+            .map(|r| r.peer_name.as_str())
+            .collect();
+        assert_eq!(
+            names,
+            vec!["legit-peer"],
+            "workspace: peer skipped; legit peer recorded"
+        );
+    }
+
+    #[test]
+    fn peer_collection_skips_invalid_range() {
+        // Defense: an unparseable peer range emits a debug warn and
+        // is skipped. Does NOT panic / propagate an error — the
+        // resolver must continue resolving the rest of the graph.
+        let info = mk_info_with_peers(
+            &["1.0.0"],
+            &[],
+            &[("good-peer", "^1.0.0"), ("bad-peer", "this-is-not-semver")],
+            &[],
+        );
+        let state = enqueue_for_parent(CanonicalKey::npm("parent"), &info);
+
+        let names: Vec<&str> = state
+            .peer_requirements
+            .iter()
+            .map(|r| r.peer_name.as_str())
+            .collect();
+        assert_eq!(
+            names,
+            vec!["good-peer"],
+            "unparseable peer range skipped silently"
+        );
+    }
+
+    #[test]
+    fn peer_collection_deterministic_order() {
+        // The collector sorts peer entries alphabetically before
+        // pushing — same contract as the regular-deps loop. Without
+        // this, HashMap iteration order would leak into
+        // `peer_requirements`'s order, producing non-reproducible
+        // lockfile output once R2.2 starts driving ambient-install
+        // edge ordering off the worklist.
+        let info = mk_info_with_peers(
+            &["1.0.0"],
+            &[],
+            // Insertion order is intentionally the WORST possible
+            // for a stable sort: reverse-alphabetic.
+            &[("zoo", "^1.0.0"), ("middle", "^1.0.0"), ("alpha", "^1.0.0")],
+            &[],
+        );
+        let state = enqueue_for_parent(CanonicalKey::npm("parent"), &info);
+        let names: Vec<&str> = state
+            .peer_requirements
+            .iter()
+            .map(|r| r.peer_name.as_str())
+            .collect();
+        assert_eq!(
+            names,
+            vec!["alpha", "middle", "zoo"],
+            "peer requirements sorted alphabetically for determinism"
+        );
+    }
+
+    #[test]
+    fn peer_collection_no_peer_deps_is_empty_worklist() {
+        // Hot path / sanity baseline: a package with NO peer
+        // declarations produces an empty worklist. Pre-R2.1 there
+        // was no such field; this test guards against an accidental
+        // regression where peer collection becomes noisy (e.g., a
+        // stray `entry().or_insert_with` populating empty entries).
+        let info = mk_info(&["1.0.0"], &[("regular", "^1.0.0")]);
+        let state = enqueue_for_parent(CanonicalKey::npm("parent"), &info);
+        assert!(state.peer_requirements.is_empty());
+        assert_eq!(state.task_queue.len(), 1, "regular dep enqueued normally");
+    }
+
+    // ── R2.2 — eager peer auto-install drain ─────────────────────
+    //
+    // R2.2's contract:
+    //   1. `drain_peer_requirements_one_pass` is a pure
+    //      classify-and-synthesize pass: it reads `state.resolved`
+    //      and `state.peer_requirements`, fetches manifests for
+    //      unmet canonicals via the supplied closure, and returns
+    //      ambient root-scoped Edges for the caller to drain.
+    //   2. Satisfied groups (some node in `state.resolved` already
+    //      threads every range) are SKIPPED — no synthesis, the
+    //      existing `into_resolved_packages` peer-derivation handles
+    //      output.
+    //   3. All-optional groups are SKIPPED regardless of
+    //      `auto_install_peers`.
+    //   4. With `auto_install_peers = false`, ALL groups are
+    //      skipped — pre-R2 warn-only behavior.
+    //   5. Required-but-unsatisfiable groups (no version threads
+    //      every range) raise `ResolveError::PeerConflict`.
+    //   6. Synthesized Edges are root-scoped (`parent = 0`), behave
+    //      as regular required deps, and pin the canonical to the
+    //      exact chosen version.
+    //
+    // These tests drive the helper directly with a hand-built
+    // closure that returns pre-canned manifests. End-to-end
+    // integration through the dispatcher is exercised by the
+    // resolve-tier tests in `resolve.rs`.
+
+    /// Stand-in for an `Arc<CachedPackageInfo>` returned by the
+    /// fetch closure. Tests pre-populate a name → info map and the
+    /// closure looks up by canonical name.
+    fn mk_info_arc(versions: &[&str], deps_of_latest: &[(&str, &str)]) -> Arc<CachedPackageInfo> {
+        Arc::new(mk_info(versions, deps_of_latest))
+    }
+
+    /// Build a minimal `state.peer_requirements` entry. The
+    /// `consumer` is encoded as a plain `NodeId` — tests pre-create
+    /// the consumer node so `state.nodes[consumer]` resolves for
+    /// `PeerConflict` error rendering.
+    fn mk_peer_req(
+        consumer: NodeId,
+        peer_name: &str,
+        canonical: CanonicalKey,
+        range: &str,
+        optional: bool,
+    ) -> PeerRequirement {
+        PeerRequirement {
+            consumer,
+            peer_name: peer_name.to_string(),
+            canonical,
+            range: NpmRange::parse(range).unwrap(),
+            optional,
+        }
+    }
+
+    /// Pre-allocate a consumer node and return its NodeId. Mirrors
+    /// what `process_edge` would produce after consuming a regular
+    /// dep edge for the consumer.
+    fn push_node(state: &mut ResolveState, canonical: CanonicalKey, version: &str) -> NodeId {
+        let id = state.nodes.len() as NodeId;
+        state.nodes.push(ResolvedNodeBuilder {
+            canonical: canonical.clone(),
+            version: NpmVersion::parse(version).unwrap(),
+            children: Vec::new(),
+        });
+        state
+            .resolved
+            .entry(canonical)
+            .or_default()
+            .push((NpmVersion::parse(version).unwrap(), id));
+        id
+    }
+
+    #[tokio::test]
+    async fn r22_drain_satisfied_by_existing_skips_synthesis() {
+        // The peer's canonical already has a node in the resolved
+        // tree (e.g., react was a regular root dep) at a version
+        // satisfying every consumer's range. The drain pass must
+        // detect this and skip synthesis entirely — no fetch, no
+        // ambient install.
+        let mut state = ResolveState::new(HashMap::new(), OverrideSet::empty());
+        let _root = push_node(&mut state, CanonicalKey::Root, "0.0.0");
+        let _react = push_node(&mut state, CanonicalKey::npm("react"), "18.2.0");
+        let consumer = push_node(&mut state, CanonicalKey::npm("react-redux"), "9.0.0");
+
+        state.peer_requirements.push(mk_peer_req(
+            consumer,
+            "react",
+            CanonicalKey::npm("react"),
+            "^18.0.0",
+            false,
+        ));
+
+        let synth = drain_peer_requirements_one_pass(
+            &mut state,
+            true,
+            // Closure must NOT be called — satisfied-by-existing
+            // should short-circuit before any fetch.
+            |canonical: CanonicalKey| async move {
+                panic!("fetch closure called for already-satisfied peer {canonical}")
+            },
+        )
+        .await
+        .unwrap();
+        assert!(
+            synth.is_empty(),
+            "no ambient install when peer is satisfied"
+        );
+        assert!(state.peer_requirements.is_empty(), "worklist drained");
+    }
+
+    #[tokio::test]
+    async fn r22_drain_synthesizes_ambient_for_missing_peer() {
+        // The peer's canonical is NOT in the tree. With
+        // `auto_install_peers = true`, the drain pass fetches the
+        // manifest, picks the newest version satisfying the
+        // consumer's range, and synthesizes a root-scoped Edge
+        // pinning that version.
+        let mut state = ResolveState::new(HashMap::new(), OverrideSet::empty());
+        let _root = push_node(&mut state, CanonicalKey::Root, "0.0.0");
+        let consumer = push_node(&mut state, CanonicalKey::npm("react-redux"), "9.0.0");
+
+        state.peer_requirements.push(mk_peer_req(
+            consumer,
+            "react",
+            CanonicalKey::npm("react"),
+            "^18.0.0",
+            false,
+        ));
+
+        let info_arc = mk_info_arc(&["19.0.0", "18.2.0", "18.0.0", "17.0.2"], &[]);
+        let synth =
+            drain_peer_requirements_one_pass(&mut state, true, |canonical: CanonicalKey| {
+                let info = info_arc.clone();
+                async move {
+                    assert_eq!(canonical, CanonicalKey::npm("react"));
+                    Ok(info)
+                }
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(synth.len(), 1, "exactly one ambient install");
+        let edge = &synth[0];
+        assert_eq!(edge.parent, 0, "ambient install is root-scoped");
+        assert_eq!(edge.canonical, CanonicalKey::npm("react"));
+        assert_eq!(edge.local_name, "react");
+        assert!(
+            edge.range.satisfies(&NpmVersion::parse("18.2.0").unwrap()),
+            "exact-pin range satisfies the chosen version"
+        );
+        assert!(
+            !edge.range.satisfies(&NpmVersion::parse("19.0.0").unwrap()),
+            "exact-pin range does NOT satisfy a sibling version"
+        );
+        assert!(
+            edge.behavior.required && !edge.behavior.peer && !edge.behavior.optional,
+            "ambient install behaves as a required regular dep"
+        );
+    }
+
+    #[tokio::test]
+    async fn r22_drain_picks_newest_satisfying_all_consumer_ranges() {
+        // Two consumers declare the SAME peer at compatible-but-
+        // distinct ranges. The drain must pick a version satisfying
+        // BOTH ranges (intersection semantic), not just the first
+        // consumer's range.
+        let mut state = ResolveState::new(HashMap::new(), OverrideSet::empty());
+        let _root = push_node(&mut state, CanonicalKey::Root, "0.0.0");
+        let consumer_a = push_node(&mut state, CanonicalKey::npm("pkg-a"), "1.0.0");
+        let consumer_b = push_node(&mut state, CanonicalKey::npm("pkg-b"), "1.0.0");
+
+        // Consumer A wants `>=18.0.0`, Consumer B wants `<19.0.0`.
+        // Intersection: `>=18.0.0 <19.0.0`. Newest available: 18.2.0.
+        state.peer_requirements.push(mk_peer_req(
+            consumer_a,
+            "react",
+            CanonicalKey::npm("react"),
+            ">=18.0.0",
+            false,
+        ));
+        state.peer_requirements.push(mk_peer_req(
+            consumer_b,
+            "react",
+            CanonicalKey::npm("react"),
+            "<19.0.0",
+            false,
+        ));
+
+        let info_arc = mk_info_arc(&["19.0.0", "18.2.0", "17.0.2"], &[]);
+        let synth = drain_peer_requirements_one_pass(&mut state, true, |_canonical| {
+            let info = info_arc.clone();
+            async move { Ok(info) }
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(synth.len(), 1, "one ambient install for the joined group");
+        assert!(
+            synth[0]
+                .range
+                .satisfies(&NpmVersion::parse("18.2.0").unwrap()),
+            "chose newest version satisfying both consumer ranges"
+        );
+        assert!(
+            !synth[0]
+                .range
+                .satisfies(&NpmVersion::parse("19.0.0").unwrap()),
+            "did NOT pick the newest overall (19.0.0 violates consumer B's <19.0.0)"
+        );
+    }
+
+    #[tokio::test]
+    async fn r22_drain_returns_peer_conflict_for_incompatible_ranges() {
+        // Two consumers declare incompatible ranges (`^17` vs `^18`).
+        // No version satisfies both → `PeerConflict`. At least one
+        // consumer is required, so the conflict is hard.
+        let mut state = ResolveState::new(HashMap::new(), OverrideSet::empty());
+        let _root = push_node(&mut state, CanonicalKey::Root, "0.0.0");
+        let consumer_a = push_node(&mut state, CanonicalKey::npm("legacy-pkg"), "1.0.0");
+        let consumer_b = push_node(&mut state, CanonicalKey::npm("modern-pkg"), "2.0.0");
+
+        state.peer_requirements.push(mk_peer_req(
+            consumer_a,
+            "react",
+            CanonicalKey::npm("react"),
+            "^17.0.0",
+            false,
+        ));
+        state.peer_requirements.push(mk_peer_req(
+            consumer_b,
+            "react",
+            CanonicalKey::npm("react"),
+            "^18.0.0",
+            false,
+        ));
+
+        let info_arc = mk_info_arc(&["18.2.0", "17.0.2"], &[]);
+        let result = drain_peer_requirements_one_pass(&mut state, true, |_canonical| {
+            let info = info_arc.clone();
+            async move { Ok(info) }
+        })
+        .await;
+
+        match result {
+            Err(ResolveError::PeerConflict {
+                canonical,
+                requirements,
+            }) => {
+                assert_eq!(canonical, "react");
+                assert_eq!(requirements.len(), 2);
+                let consumers: Vec<&str> =
+                    requirements.iter().map(|(c, _, _)| c.as_str()).collect();
+                assert!(
+                    consumers.contains(&"legacy-pkg"),
+                    "conflict reports legacy-pkg as a contributing consumer"
+                );
+                assert!(
+                    consumers.contains(&"modern-pkg"),
+                    "conflict reports modern-pkg as a contributing consumer"
+                );
+            }
+            other => panic!("expected PeerConflict, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn r22_drain_does_not_conflict_when_all_consumers_optional() {
+        // All consumers in a conflicted group are optional → skip
+        // silently rather than raising PeerConflict. Mirrors npm
+        // v7+'s behavior for `peerDependenciesMeta.optional = true`.
+        let mut state = ResolveState::new(HashMap::new(), OverrideSet::empty());
+        let _root = push_node(&mut state, CanonicalKey::Root, "0.0.0");
+        let consumer_a = push_node(&mut state, CanonicalKey::npm("opt-a"), "1.0.0");
+        let consumer_b = push_node(&mut state, CanonicalKey::npm("opt-b"), "2.0.0");
+
+        state.peer_requirements.push(mk_peer_req(
+            consumer_a,
+            "react",
+            CanonicalKey::npm("react"),
+            "^17.0.0",
+            true, // optional
+        ));
+        state.peer_requirements.push(mk_peer_req(
+            consumer_b,
+            "react",
+            CanonicalKey::npm("react"),
+            "^18.0.0",
+            true, // optional
+        ));
+
+        let synth = drain_peer_requirements_one_pass(
+            &mut state,
+            true,
+            // Closure must NOT be called — all-optional groups skip
+            // before reaching the manifest fetch.
+            |canonical: CanonicalKey| async move {
+                panic!("fetch called for all-optional peer {canonical}")
+            },
+        )
+        .await
+        .unwrap();
+        assert!(synth.is_empty(), "all-optional group is skipped silently");
+    }
+
+    #[tokio::test]
+    async fn r22_drain_respects_auto_install_peers_false_opt_out() {
+        // When `auto_install_peers = false`, even a missing required
+        // peer is NOT auto-installed; the drain returns no
+        // synthesized edges. Pre-R2 warn-only semantics: the
+        // post-resolve `check_unmet_peers` pass surfaces the missing
+        // peer as a `PeerWarning` later.
+        let mut state = ResolveState::new(HashMap::new(), OverrideSet::empty());
+        let _root = push_node(&mut state, CanonicalKey::Root, "0.0.0");
+        let consumer = push_node(&mut state, CanonicalKey::npm("react-redux"), "9.0.0");
+
+        state.peer_requirements.push(mk_peer_req(
+            consumer,
+            "react",
+            CanonicalKey::npm("react"),
+            "^18.0.0",
+            false,
+        ));
+
+        let synth = drain_peer_requirements_one_pass(
+            &mut state,
+            false, // opt-out
+            // Closure must NOT be called — opt-out skips before fetch.
+            |canonical: CanonicalKey| async move {
+                panic!("fetch called under auto_install_peers=false for {canonical}")
+            },
+        )
+        .await
+        .unwrap();
+        assert!(synth.is_empty(), "no synthesis under opt-out");
+    }
+
+    #[tokio::test]
+    async fn r22_drain_skips_optional_when_required_sibling_satisfied() {
+        // Mixed group: one required + one optional consumer for the
+        // same canonical, with overlapping ranges. The required
+        // consumer drives synthesis; the optional consumer's range
+        // ALSO must be honored (intersection across BOTH). If the
+        // version satisfies both, we synthesize. This guards against
+        // a regression where "any optional in group" silently bypassed
+        // the required consumer's needs.
+        let mut state = ResolveState::new(HashMap::new(), OverrideSet::empty());
+        let _root = push_node(&mut state, CanonicalKey::Root, "0.0.0");
+        let consumer_req = push_node(&mut state, CanonicalKey::npm("required-pkg"), "1.0.0");
+        let consumer_opt = push_node(&mut state, CanonicalKey::npm("optional-pkg"), "1.0.0");
+
+        // Both want react^18, one is optional. Intersection is `^18`,
+        // newest available is 18.2.0 → synthesize.
+        state.peer_requirements.push(mk_peer_req(
+            consumer_req,
+            "react",
+            CanonicalKey::npm("react"),
+            "^18.0.0",
+            false,
+        ));
+        state.peer_requirements.push(mk_peer_req(
+            consumer_opt,
+            "react",
+            CanonicalKey::npm("react"),
+            "^18.2.0",
+            true, // optional
+        ));
+
+        let info_arc = mk_info_arc(&["19.0.0", "18.2.0", "18.0.0"], &[]);
+        let synth = drain_peer_requirements_one_pass(&mut state, true, |_canonical| {
+            let info = info_arc.clone();
+            async move { Ok(info) }
+        })
+        .await
+        .unwrap();
+        assert_eq!(synth.len(), 1);
+        assert!(
+            synth[0]
+                .range
+                .satisfies(&NpmVersion::parse("18.2.0").unwrap()),
+            "chose 18.2.0 (newest satisfying both ^18.0.0 and ^18.2.0)"
+        );
+    }
+
+    #[tokio::test]
+    async fn r22_drain_does_not_modify_consumer_children() {
+        // **Contract assertion** (R2 architectural correction): the
+        // drain pass MUST NOT add the synthesized peer to the
+        // consumer's `children` list. Children is dependency-only;
+        // the consumer's `peers` list is derived from the metadata
+        // cache by `into_resolved_packages` AFTER the resolved tree
+        // is final. If synthesis ever wrote to `consumer.children`,
+        // the v2 graph-key derivation would silently fold the peer
+        // into the dependency portion, breaking peer-divergent
+        // link-entry isolation.
+        let mut state = ResolveState::new(HashMap::new(), OverrideSet::empty());
+        let _root = push_node(&mut state, CanonicalKey::Root, "0.0.0");
+        let consumer = push_node(&mut state, CanonicalKey::npm("react-redux"), "9.0.0");
+
+        state.peer_requirements.push(mk_peer_req(
+            consumer,
+            "react",
+            CanonicalKey::npm("react"),
+            "^18.0.0",
+            false,
+        ));
+
+        let info_arc = mk_info_arc(&["18.2.0"], &[]);
+        let synth = drain_peer_requirements_one_pass(&mut state, true, |_canonical| {
+            let info = info_arc.clone();
+            async move { Ok(info) }
+        })
+        .await
+        .unwrap();
+        assert_eq!(synth.len(), 1);
+        assert!(
+            state.nodes[consumer as usize].children.is_empty(),
+            "consumer.children must remain empty — peers are NOT routed as children"
+        );
+    }
+
+    #[tokio::test]
+    async fn r22_drain_clears_peer_requirements_each_pass() {
+        // After one pass, `state.peer_requirements` is empty so the
+        // next pass starts fresh. Required because synthesized
+        // ambient installs may themselves declare peers (transitive
+        // chains), and the caller's outer fixed-point loop relies on
+        // each pass starting with whatever the previous pass left
+        // behind via `enqueue_child_deps`.
+        let mut state = ResolveState::new(HashMap::new(), OverrideSet::empty());
+        let _root = push_node(&mut state, CanonicalKey::Root, "0.0.0");
+        let consumer = push_node(&mut state, CanonicalKey::npm("a"), "1.0.0");
+        state.peer_requirements.push(mk_peer_req(
+            consumer,
+            "react",
+            CanonicalKey::npm("react"),
+            "^18.0.0",
+            false,
+        ));
+
+        let info_arc = mk_info_arc(&["18.2.0"], &[]);
+        drain_peer_requirements_one_pass(&mut state, true, |_| {
+            let info = info_arc.clone();
+            async move { Ok(info) }
+        })
+        .await
+        .unwrap();
+        assert!(
+            state.peer_requirements.is_empty(),
+            "drain consumes the worklist regardless of synthesis outcome"
+        );
+    }
+
+    #[tokio::test]
+    async fn r23_drain_records_ambient_peer_installs() {
+        // **R2.3 wiring assertion.** The install pipeline derives
+        // top-level `node_modules/<name>/` symlinks from
+        // `pkg.dependencies` ∪ `ResolveResult.ambient_peer_installs`.
+        // If the drain helper synthesizes an Edge but DOESN'T record
+        // the canonical onto `state.ambient_peer_installs`, the
+        // package extracts into the v2 store but never gets a
+        // project-side symlink — exactly the regression I caught
+        // running the audit fixture pre-R2.3 (`react@19.2.6` in
+        // `~/.lpm/store/v2/links/` but missing from
+        // `node_modules/`). This test pins the behavior so a future
+        // refactor can't silently drop the recording.
+        let mut state = ResolveState::new(HashMap::new(), OverrideSet::empty());
+        let _root = push_node(&mut state, CanonicalKey::Root, "0.0.0");
+        let consumer = push_node(&mut state, CanonicalKey::npm("react-redux"), "9.2.0");
+        state.peer_requirements.push(mk_peer_req(
+            consumer,
+            "react",
+            CanonicalKey::npm("react"),
+            "^18.0.0",
+            false,
+        ));
+
+        let info_arc = mk_info_arc(&["18.2.0"], &[]);
+        let synth = drain_peer_requirements_one_pass(&mut state, true, |_| {
+            let info = info_arc.clone();
+            async move { Ok(info) }
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(synth.len(), 1, "ambient edge synthesized");
+        assert_eq!(
+            state.ambient_peer_installs,
+            vec!["react".to_string()],
+            "the canonical of every synthesized ambient install must be \
+             recorded on `state.ambient_peer_installs`; the install \
+             pipeline reads this set to surface the package at \
+             top-level node_modules/"
+        );
+    }
+
+    #[tokio::test]
+    async fn r23_drain_does_not_record_satisfied_or_skipped_groups() {
+        // The recording must be tight: only ACTUALLY-synthesized
+        // groups land in `ambient_peer_installs`. Satisfied-by-
+        // existing groups don't (no install was synthesized).
+        // All-optional groups don't (no install was synthesized).
+        let mut state = ResolveState::new(HashMap::new(), OverrideSet::empty());
+        let _root = push_node(&mut state, CanonicalKey::Root, "0.0.0");
+        // Already-satisfied: react is in the tree at 18.2.0.
+        let _react = push_node(&mut state, CanonicalKey::npm("react"), "18.2.0");
+        let consumer1 = push_node(&mut state, CanonicalKey::npm("react-redux"), "9.2.0");
+        // All-optional consumer: optional peer on @types/react.
+        let consumer2 = push_node(&mut state, CanonicalKey::npm("opt-pkg"), "1.0.0");
+
+        state.peer_requirements.push(mk_peer_req(
+            consumer1,
+            "react",
+            CanonicalKey::npm("react"),
+            "^18.0.0",
+            false,
+        ));
+        state.peer_requirements.push(mk_peer_req(
+            consumer2,
+            "@types/react",
+            CanonicalKey::npm("@types/react"),
+            "^18.0.0",
+            true, // optional
+        ));
+
+        let synth = drain_peer_requirements_one_pass(
+            &mut state,
+            true,
+            // Closure must NOT be called — both groups short-circuit
+            // before fetch (one satisfied, one all-optional).
+            |canonical: CanonicalKey| async move { panic!("unexpected fetch for {canonical}") },
+        )
+        .await
+        .unwrap();
+
+        assert!(synth.is_empty(), "neither group should synthesize");
+        assert!(
+            state.ambient_peer_installs.is_empty(),
+            "ambient_peer_installs records ONLY synthesized groups"
+        );
+    }
+
+    // ── R2.4 — speculative peer-manifest prefetch picker ──────────
+    //
+    // R2.4 makes peer manifest fetches concurrent with the regular
+    // dep walk by selecting prefetch candidates at the top of every
+    // main-loop iteration and dispatching them through the existing
+    // metadata_jobs JoinSet. The picker is a pure function: it reads
+    // `state` plus the dispatcher's `shared_cache` + `inflight` set
+    // and returns the canonicals that should be fetched. These tests
+    // pin the four predicate gates (all-optional, satisfied-by-
+    // existing, already-cached, in-flight) and the deterministic
+    // ordering contract.
+
+    /// Empty cache + inflight for tests that don't exercise either.
+    fn empty_cache() -> dashmap::DashMap<CanonicalKey, Arc<CachedPackageInfo>> {
+        dashmap::DashMap::new()
+    }
+    fn empty_inflight() -> HashSet<CanonicalKey> {
+        HashSet::new()
+    }
+
+    #[test]
+    fn r24_picker_returns_unsatisfied_required_peer() {
+        // Baseline: a single required peer with no node in the
+        // resolved tree, no cache hit, no in-flight dispatch. Must
+        // be picked.
+        let mut state = ResolveState::new(HashMap::new(), OverrideSet::empty());
+        let _root = push_node(&mut state, CanonicalKey::Root, "0.0.0");
+        let consumer = push_node(&mut state, CanonicalKey::npm("react-redux"), "9.0.0");
+        state.peer_requirements.push(mk_peer_req(
+            consumer,
+            "react",
+            CanonicalKey::npm("react"),
+            "^18.0.0",
+            false,
+        ));
+
+        let picks = pick_peer_prefetch_candidates(&state, &empty_cache(), &empty_inflight());
+        assert_eq!(picks, vec![CanonicalKey::npm("react")]);
+    }
+
+    #[test]
+    fn r24_picker_skips_satisfied_by_existing() {
+        // The peer's canonical is in the resolved tree at a version
+        // satisfying the consumer's range. No prefetch — the drain
+        // pass will see this group as already-satisfied.
+        let mut state = ResolveState::new(HashMap::new(), OverrideSet::empty());
+        let _root = push_node(&mut state, CanonicalKey::Root, "0.0.0");
+        let _react = push_node(&mut state, CanonicalKey::npm("react"), "18.2.0");
+        let consumer = push_node(&mut state, CanonicalKey::npm("react-redux"), "9.0.0");
+        state.peer_requirements.push(mk_peer_req(
+            consumer,
+            "react",
+            CanonicalKey::npm("react"),
+            "^18.0.0",
+            false,
+        ));
+
+        let picks = pick_peer_prefetch_candidates(&state, &empty_cache(), &empty_inflight());
+        assert!(
+            picks.is_empty(),
+            "satisfied-by-existing groups must NOT trigger a prefetch"
+        );
+    }
+
+    #[test]
+    fn r24_picker_skips_all_optional_groups() {
+        // A group of consumers all marked `peerDependenciesMeta.optional`.
+        // Per R5 + R2.2, optional-only groups never auto-install, so
+        // prefetching is wasted bandwidth.
+        let mut state = ResolveState::new(HashMap::new(), OverrideSet::empty());
+        let _root = push_node(&mut state, CanonicalKey::Root, "0.0.0");
+        let consumer1 = push_node(&mut state, CanonicalKey::npm("opt-a"), "1.0.0");
+        let consumer2 = push_node(&mut state, CanonicalKey::npm("opt-b"), "1.0.0");
+        for consumer in [consumer1, consumer2] {
+            state.peer_requirements.push(mk_peer_req(
+                consumer,
+                "react",
+                CanonicalKey::npm("react"),
+                "^18.0.0",
+                true, // optional
+            ));
+        }
+
+        let picks = pick_peer_prefetch_candidates(&state, &empty_cache(), &empty_inflight());
+        assert!(picks.is_empty(), "all-optional group must skip prefetch");
+    }
+
+    #[test]
+    fn r24_picker_picks_when_at_least_one_consumer_is_required() {
+        // Mixed group: one optional + one required. Prefetch fires
+        // because the required consumer drives auto-install.
+        let mut state = ResolveState::new(HashMap::new(), OverrideSet::empty());
+        let _root = push_node(&mut state, CanonicalKey::Root, "0.0.0");
+        let consumer_req = push_node(&mut state, CanonicalKey::npm("required-pkg"), "1.0.0");
+        let consumer_opt = push_node(&mut state, CanonicalKey::npm("optional-pkg"), "1.0.0");
+        state.peer_requirements.push(mk_peer_req(
+            consumer_req,
+            "react",
+            CanonicalKey::npm("react"),
+            "^18.0.0",
+            false,
+        ));
+        state.peer_requirements.push(mk_peer_req(
+            consumer_opt,
+            "react",
+            CanonicalKey::npm("react"),
+            "^18.0.0",
+            true,
+        ));
+
+        let picks = pick_peer_prefetch_candidates(&state, &empty_cache(), &empty_inflight());
+        assert_eq!(picks, vec![CanonicalKey::npm("react")]);
+    }
+
+    #[test]
+    fn r24_picker_skips_canonicals_already_cached() {
+        // Sibling regular-dep walk already pulled the peer's manifest
+        // into the shared cache. The drain pass will hit the fast
+        // path; no need to dispatch a prefetch.
+        let mut state = ResolveState::new(HashMap::new(), OverrideSet::empty());
+        let _root = push_node(&mut state, CanonicalKey::Root, "0.0.0");
+        let consumer = push_node(&mut state, CanonicalKey::npm("react-redux"), "9.0.0");
+        state.peer_requirements.push(mk_peer_req(
+            consumer,
+            "react",
+            CanonicalKey::npm("react"),
+            "^18.0.0",
+            false,
+        ));
+
+        let cache = empty_cache();
+        cache.insert(CanonicalKey::npm("react"), mk_info_arc(&["18.2.0"], &[]));
+
+        let picks = pick_peer_prefetch_candidates(&state, &cache, &empty_inflight());
+        assert!(
+            picks.is_empty(),
+            "cached canonical must not be re-dispatched"
+        );
+    }
+
+    #[test]
+    fn r24_picker_skips_canonicals_already_in_flight() {
+        // A sibling Phase A cache-miss already dispatched a fetch for
+        // the canonical. The dispatcher's inflight guard would dedup
+        // a redundant spawn anyway; skipping at the picker level
+        // saves the spawn allocation.
+        let mut state = ResolveState::new(HashMap::new(), OverrideSet::empty());
+        let _root = push_node(&mut state, CanonicalKey::Root, "0.0.0");
+        let consumer = push_node(&mut state, CanonicalKey::npm("react-redux"), "9.0.0");
+        state.peer_requirements.push(mk_peer_req(
+            consumer,
+            "react",
+            CanonicalKey::npm("react"),
+            "^18.0.0",
+            false,
+        ));
+
+        let mut inflight = empty_inflight();
+        inflight.insert(CanonicalKey::npm("react"));
+
+        let picks = pick_peer_prefetch_candidates(&state, &empty_cache(), &inflight);
+        assert!(
+            picks.is_empty(),
+            "in-flight canonical must not be re-dispatched"
+        );
+    }
+
+    #[test]
+    fn r24_picker_returns_alphabetic_order() {
+        // Multiple unmet peers in pathological insertion order. The
+        // picker must return them sorted alphabetically — the same
+        // determinism contract as the regular `enqueue_child_deps`
+        // sort. Without it, lockfile output across runs would shift
+        // based on HashMap iteration.
+        let mut state = ResolveState::new(HashMap::new(), OverrideSet::empty());
+        let _root = push_node(&mut state, CanonicalKey::Root, "0.0.0");
+        let consumer = push_node(&mut state, CanonicalKey::npm("multi-peer"), "1.0.0");
+        for (name, range) in [("zoo", "^1.0.0"), ("alpha", "^1.0.0"), ("middle", "^1.0.0")] {
+            state.peer_requirements.push(mk_peer_req(
+                consumer,
+                name,
+                CanonicalKey::npm(name),
+                range,
+                false,
+            ));
+        }
+
+        let picks = pick_peer_prefetch_candidates(&state, &empty_cache(), &empty_inflight());
+        let names: Vec<String> = picks.iter().map(|c| c.to_string()).collect();
+        assert_eq!(names, vec!["alpha", "middle", "zoo"]);
+    }
+
+    #[test]
+    fn r24_picker_dedups_same_canonical_across_multiple_consumers() {
+        // Two consumers both peer the same canonical. The picker
+        // groups by canonical first, so we should get exactly ONE
+        // entry for that canonical (not two).
+        let mut state = ResolveState::new(HashMap::new(), OverrideSet::empty());
+        let _root = push_node(&mut state, CanonicalKey::Root, "0.0.0");
+        let consumer_a = push_node(&mut state, CanonicalKey::npm("pkg-a"), "1.0.0");
+        let consumer_b = push_node(&mut state, CanonicalKey::npm("pkg-b"), "1.0.0");
+        for consumer in [consumer_a, consumer_b] {
+            state.peer_requirements.push(mk_peer_req(
+                consumer,
+                "react",
+                CanonicalKey::npm("react"),
+                "^18.0.0",
+                false,
+            ));
+        }
+
+        let picks = pick_peer_prefetch_candidates(&state, &empty_cache(), &empty_inflight());
+        assert_eq!(
+            picks,
+            vec![CanonicalKey::npm("react")],
+            "shared canonical produces ONE prefetch — the dispatcher \
+             handles N consumers via dedupe-on-canonical"
+        );
+    }
+
+    #[test]
+    fn r24_picker_empty_when_peer_requirements_empty() {
+        // Hot-path baseline: no peers declared → empty result. Pre-
+        // R2.4 behavior is byte-identical.
+        let state = ResolveState::new(HashMap::new(), OverrideSet::empty());
+        let picks = pick_peer_prefetch_candidates(&state, &empty_cache(), &empty_inflight());
+        assert!(picks.is_empty());
+    }
+
     #[test]
     fn process_edge_zero_overrides_takes_hot_path_unchanged() {
         // Sanity check: with no overrides, the slow-path branch is
@@ -2389,6 +4296,7 @@ mod tests {
             RouteTable::from_mode_only(RouteMode::Proxy),
             8,
             None,
+            true, // R2.2: tests default to auto-install on
         )
         .await
         .expect("empty deps must resolve to empty result");
@@ -2443,6 +4351,7 @@ mod tests {
             RouteTable::from_mode_only(RouteMode::Proxy),
             8,
             None,
+            true, // R2.2: tests default to auto-install on
         )
         .await;
         assert!(result.is_ok());
@@ -2514,6 +4423,7 @@ mod tests {
             RouteTable::from_mode_only(RouteMode::Proxy),
             8,
             None,
+            true, // R2.2: tests default to auto-install on
         )
         .await
         .expect("pre-batched lpm.dev resolve should succeed");
@@ -2584,6 +4494,7 @@ mod tests {
             RouteTable::from_mode_only(RouteMode::Proxy),
             8,
             None,
+            true, // R2.2: tests default to auto-install on
         )
         .await
         .expect(
@@ -2621,6 +4532,7 @@ mod tests {
             RouteTable::from_mode_only(RouteMode::Direct), // npm-direct route — discard port (9) errors immediately
             8,
             None,
+            true, // R2.2: tests default to auto-install on
         )
         .await;
         // Either the fetch errors or NoSolution; both are acceptable

@@ -28,6 +28,7 @@ FIXTURES=(
     "peer-heavy/apollo-graphql"
     "peer-heavy/nestjs-deep"
     "peer-heavy/optional-peers"
+    "peer-heavy/auto-install-peer"
     "tooling/eslint-flat-config"
     "tooling/babel-presets"
     "tooling/rollup-plugins"

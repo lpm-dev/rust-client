@@ -481,6 +481,7 @@ mod tests {
                 })
                 .collect(),
             root_aliases: std::collections::BTreeMap::new(),
+            ambient_peer_installs: Vec::new(),
         }
     }
 
