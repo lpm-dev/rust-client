@@ -19,9 +19,15 @@
 //!   eagerly installed; the existing post-resolve [`crate::check_unmet_peers`]
 //!   pass continues to surface peer warnings. W3 will add bun's "queue peer
 //!   edge, drain after main pass" semantics.
-//! - **Phase 32 P5 path-selector overrides** are surfaced through
-//!   `OverrideSet::split_targets` but NOT applied at version-pick time.
-//!   W4 wires that.
+//! - **Phase 32 P5 overrides** are applied at version-pick time inside
+//!   [`process_edge`]. Mirrors [`crate::provider::LpmDependencyProvider::choose_version`]'s
+//!   pubgrub-arm semantics: compute the natural version, look up
+//!   `OverrideSet::find_match` against (canonical, natural, parent_ctx),
+//!   apply the [`OverrideTarget`] against the consumer range, record an
+//!   [`OverrideHit`] on success, fall through to the natural version on
+//!   target/range mismatch (legacy "irreconcilable override" debug warn).
+//!   `OverrideSet::split_targets` informs reuse-vs-allocate so two parents
+//!   forcing distinct versions split into independent nodes.
 //! - **Phase 40 P2 npm-aliases** are passed through from the cache (the
 //!   `aliases` map on each `CachedPackageInfo` is already populated by
 //!   [`crate::provider::parse_metadata_to_cache_info`]) and surfaced in the
@@ -53,7 +59,7 @@
 //! install on `bench/fixture-large`, each ~µs.
 
 use crate::npm_version::NpmVersion;
-use crate::overrides::OverrideSet;
+use crate::overrides::{OverrideHit, OverrideSet, OverrideTarget};
 use crate::package::{CanonicalKey, ResolverPackage};
 use crate::provider::{
     CachedPackageInfo, NotifyMap, SharedCache, StreamingBfsMetrics, WalkerDone,
@@ -136,7 +142,7 @@ type ManifestState = Arc<CachedPackageInfo>;
 pub async fn resolve_greedy(
     client: Arc<RegistryClient>,
     dependencies: HashMap<String, String>,
-    _overrides: OverrideSet,
+    overrides: OverrideSet,
     shared_cache: SharedCache,
     notify_map: NotifyMap,
     walker_done: WalkerDone,
@@ -154,7 +160,7 @@ pub async fn resolve_greedy(
     crate::profile::reset_all();
     lpm_registry::timing::reset();
 
-    let mut state = ResolveState::new(dependencies);
+    let mut state = ResolveState::new(dependencies, overrides);
     state.seed_root_edges()?;
 
     while let Some(edge) = state.task_queue.pop_front() {
@@ -193,14 +199,18 @@ pub async fn resolve_greedy(
     // consumes the state.
     let platform_skipped = state.platform_skipped;
     let root_aliases = std::mem::take(&mut state.root_aliases);
+    // Phase 32 P5 — drain the override apply trace before `state` is
+    // moved by `into_resolved_packages`. `take_hits` sorts deterministically
+    // by (package, raw_key), matching the pubgrub arm's contract for
+    // `applied_overrides` ordering on `--json` output.
+    let applied_overrides = state.overrides.take_hits();
     let packages = state.into_resolved_packages(&cache);
 
     let snap = lpm_registry::timing::snapshot();
     Ok(ResolveResult {
         packages,
         cache,
-        // Phase 32 P5 overrides: not yet applied in W1 (see module docs).
-        applied_overrides: Vec::new(),
+        applied_overrides,
         platform_skipped,
         // Phase 40 P2 root aliases: populated during seed_root_edges
         // when a root dep declares `npm:target@range`. Empty when no
@@ -271,7 +281,7 @@ pub async fn resolve_greedy(
 pub async fn resolve_greedy_fused(
     client: Arc<RegistryClient>,
     dependencies: HashMap<String, String>,
-    _overrides: OverrideSet,
+    overrides: OverrideSet,
     route_table: RouteTable,
     npm_fanout: usize,
     spec_tx: Option<tokio::sync::mpsc::Sender<(String, lpm_registry::PackageMetadata)>>,
@@ -291,7 +301,7 @@ pub async fn resolve_greedy_fused(
     crate::profile::reset_all();
     lpm_registry::timing::reset();
 
-    let mut state = ResolveState::new(dependencies);
+    let mut state = ResolveState::new(dependencies, overrides);
     state.seed_root_edges()?;
 
     // Loop-local state, owned by this single task. No Arcs needed
@@ -546,13 +556,17 @@ pub async fn resolve_greedy_fused(
         .collect();
     let platform_skipped = state.platform_skipped;
     let root_aliases = std::mem::take(&mut state.root_aliases);
+    // Phase 32 P5 — drain the override apply trace before `state` is
+    // moved by `into_resolved_packages`. Same shape + order contract
+    // as the walker arm above.
+    let applied_overrides = state.overrides.take_hits();
     let packages = state.into_resolved_packages(&cache);
 
     let snap = lpm_registry::timing::snapshot();
     Ok(ResolveResult {
         packages,
         cache,
-        applied_overrides: Vec::new(),
+        applied_overrides,
         platform_skipped,
         root_aliases,
         stage_timing: StageTiming {
@@ -617,6 +631,14 @@ struct ResolveState {
     /// closes the gap that previously made the greedy/fused arms
     /// reject `npm:` ranges at the root.
     root_aliases: HashMap<String, String>,
+    /// Phase 32 P5 — parsed override set. [`process_edge`] consults
+    /// `overrides.find_match` against (canonical, natural_version,
+    /// parent_ctx) for every edge whose canonical satisfies a
+    /// non-empty range; on hit, [`apply_override_target_greedy`]
+    /// produces the forced version and an [`OverrideHit`] is recorded.
+    /// `take_hits()` drains the trace into `ResolveResult.applied_overrides`
+    /// at the tail of each resolver arm.
+    overrides: OverrideSet,
 }
 
 /// In-flight resolved node — accumulated during the loop, finalized
@@ -630,7 +652,7 @@ struct ResolvedNodeBuilder {
 }
 
 impl ResolveState {
-    fn new(root_deps: HashMap<String, String>) -> Self {
+    fn new(root_deps: HashMap<String, String>, overrides: OverrideSet) -> Self {
         ResolveState {
             root_deps,
             task_queue: VecDeque::with_capacity(256),
@@ -639,6 +661,7 @@ impl ResolveState {
             children_enqueued: HashSet::with_capacity(512),
             platform_skipped: 0,
             root_aliases: HashMap::new(),
+            overrides,
         }
     }
 
@@ -858,28 +881,143 @@ fn canonical_to_resolver_package(key: &CanonicalKey) -> ResolverPackage {
 /// allocate when not" model — same as npm + pnpm semantics. PubGrub's
 /// flat-then-split-retry workaround is unnecessary because
 /// multi-version is the natural representation here.
+///
+/// **Phase 32 P5 overrides.** When `state.overrides` is non-empty, we
+/// compute the natural pick FIRST and consult `find_match` for an
+/// applicable [`OverrideTarget`]. A successful override produces a
+/// forced version that becomes the dedupe target — reuse falls through
+/// to exact-version-match (so two parents forcing different versions
+/// allocate independent nodes), and the [`OverrideHit`] is recorded for
+/// the install summary. The empty-overrides hot path skips this entire
+/// branch with one [`OverrideSet::is_empty`] check (single-bool
+/// indirection, zero allocs) so installs without overrides keep their
+/// pre-Phase-32-P5 cost model.
 fn process_edge(
     edge: &Edge,
     info: &CachedPackageInfo,
     state: &mut ResolveState,
 ) -> Result<(), ResolveError> {
-    // Step 1: do we already have a node whose version satisfies this
-    // edge's range? Lookup is scoped to release the borrow before any
-    // mutation below.
-    let existing_id: Option<NodeId> = state.resolved.get(&edge.canonical).and_then(|nodes| {
-        nodes
-            .iter()
-            .find(|(v, _)| edge.range.satisfies(v))
-            .map(|(_, id)| *id)
-    });
+    // Hot path: zero-overrides installs (the common case) skip the
+    // natural-pick computation entirely. Behavior matches the pre-
+    // override implementation byte-for-byte.
+    if state.overrides.is_empty() {
+        return process_edge_inner(edge, info, None, state);
+    }
 
-    let child_id = match existing_id {
-        Some(id) => id,
+    // Slow path: at least one override entry exists. Compute the
+    // natural pick (the version greedy WOULD pick without any
+    // override) and consult `find_match`.
+    let parent_ctx_owned = if edge.parent == 0 {
+        None
+    } else {
+        Some(state.nodes[edge.parent as usize].canonical.to_string())
+    };
+    let canonical_name = edge.canonical.to_string();
+
+    let natural_pick = find_best_version(info, &edge.range);
+    let natural_ver = match &natural_pick {
+        VersionPick::Picked(v) => Some(v.clone()),
+        VersionPick::NoSatisfying | VersionPick::PlatformFiltered => None,
+    };
+
+    // No natural version means there's nothing to evaluate the
+    // override selector's range filter against. Mirrors the pubgrub
+    // arm — when natural is None, override can't apply, so we surface
+    // the no-version outcome directly.
+    let Some(natural) = natural_ver else {
+        return match natural_pick {
+            VersionPick::NoSatisfying => handle_no_version(edge, info, false, state),
+            VersionPick::PlatformFiltered => handle_no_version(edge, info, true, state),
+            VersionPick::Picked(_) => unreachable!(),
+        };
+    };
+
+    let parent_ctx_ref = parent_ctx_owned.as_deref();
+    let override_outcome: Option<(NpmVersion, OverrideHit)> = match state.overrides.find_match(
+        &canonical_name,
+        &natural,
+        parent_ctx_ref,
+    ) {
+        Some(entry) => match apply_override_target_greedy(info, &entry.target, &edge.range) {
+            Some(forced) => {
+                let hit = OverrideHit {
+                    raw_key: entry.raw_key.clone(),
+                    source: entry.source,
+                    package: canonical_name.clone(),
+                    from_version: natural.to_string(),
+                    to_version: forced.to_string(),
+                    via_parent: parent_ctx_ref.map(str::to_string),
+                };
+                tracing::debug!(
+                    "override applied: {} {} → {} (via {})",
+                    hit.package,
+                    hit.from_version,
+                    hit.to_version,
+                    hit.source_display()
+                );
+                Some((forced, hit))
+            }
+            None => {
+                // Mirrors pubgrub arm's "irreconcilable override" warn:
+                // target is outside the consumer range. We fall through
+                // to the natural version — DO NOT silently pretend the
+                // override applied. Phase 5.x will turn this into a
+                // hard error gated on a flag.
+                tracing::warn!(
+                    "override {} could not be satisfied: target {} is outside consumer range for {}",
+                    entry.raw_key,
+                    entry.target.raw(),
+                    canonical_name
+                );
+                None
+            }
+        },
+        None => None,
+    };
+
+    process_edge_inner(edge, info, Some((natural, override_outcome)), state)
+}
+
+/// Core reuse-or-allocate logic. The `forced` parameter, when present,
+/// carries (natural_version, optional_override) computed by the override
+/// branch in [`process_edge`]. When `None`, the function uses the
+/// pre-override fast path: any existing node satisfying the edge range
+/// is reused, otherwise [`find_best_version`] picks the newest match.
+fn process_edge_inner(
+    edge: &Edge,
+    info: &CachedPackageInfo,
+    forced: Option<(NpmVersion, Option<(NpmVersion, OverrideHit)>)>,
+    state: &mut ResolveState,
+) -> Result<(), ResolveError> {
+    // Determine the target version for THIS edge. Without overrides,
+    // the target is whichever existing node satisfies the range, else
+    // the newest in-range pick. With an override applied, the target
+    // is the override-forced version (used for exact-match dedupe so
+    // distinct overrides split correctly). With overrides parsed but
+    // not matching this edge, the target is the natural pick — same as
+    // the no-overrides path but skipping the redundant find_best_version.
+    let (target_version, override_hit): (NpmVersion, Option<OverrideHit>) = match forced {
+        Some((natural, Some((forced_v, hit)))) => {
+            let _ = natural;
+            (forced_v, Some(hit))
+        }
+        Some((natural, None)) => (natural, None),
         None => {
-            // Step 2: pick a version for this range. Greedy first-match
-            // (newest-first per find_best_version's contract). Platform
-            // filter applied inline so the picked version is always one
-            // the host can install.
+            // Hot path — no overrides parsed. Reuse-on-range-satisfies
+            // is byte-identical to the pre-Phase-32-P5 implementation.
+            let existing_id: Option<NodeId> =
+                state.resolved.get(&edge.canonical).and_then(|nodes| {
+                    nodes
+                        .iter()
+                        .find(|(v, _)| edge.range.satisfies(v))
+                        .map(|(_, id)| *id)
+                });
+            if let Some(id) = existing_id {
+                state.nodes[edge.parent as usize]
+                    .children
+                    .push((edge.local_name.clone(), id));
+                return Ok(());
+            }
             let version = match find_best_version(info, &edge.range) {
                 VersionPick::Picked(v) => v,
                 VersionPick::NoSatisfying => {
@@ -889,42 +1027,127 @@ fn process_edge(
                     return handle_no_version(edge, info, true, state);
                 }
             };
+            (version, None)
+        }
+    };
 
-            // Step 3: allocate a new node. Both versions of a multi-
-            // version canonical end up here — `state.resolved` keeps
-            // a list per canonical so every version has its own
-            // (version, id) entry.
+    // Reuse-or-allocate against `target_version`. With an override,
+    // dedupe is exact-match (so distinct overrides allocate distinct
+    // nodes). Without an override but with overrides parsed, the target
+    // is the natural pick and exact-match is also correct because no
+    // earlier edge picked anything different (the pre-override path
+    // would have reused a range-satisfying node — but we already
+    // bypassed that branch by entering the slow path; check it here
+    // too so we don't churn duplicate nodes for compatible siblings).
+    let existing_id: Option<NodeId> = state.resolved.get(&edge.canonical).and_then(|nodes| {
+        if override_hit.is_some() {
+            nodes
+                .iter()
+                .find(|(v, _)| v == &target_version)
+                .map(|(_, id)| *id)
+        } else {
+            nodes
+                .iter()
+                .find(|(v, _)| edge.range.satisfies(v))
+                .map(|(_, id)| *id)
+        }
+    });
+
+    let child_id = match existing_id {
+        Some(id) => id,
+        None => {
             let new_id = state.nodes.len() as NodeId;
             state.nodes.push(ResolvedNodeBuilder {
                 canonical: edge.canonical.clone(),
-                version: version.clone(),
+                version: target_version.clone(),
                 children: Vec::new(),
             });
             state
                 .resolved
                 .entry(edge.canonical.clone())
                 .or_default()
-                .push((version.clone(), new_id));
+                .push((target_version.clone(), new_id));
 
-            // Step 4: enqueue this version's deps once. Different
-            // versions of the same canonical each get their own
-            // children-enqueued entry because dep lists are version-
-            // specific (lodash@4 has different deps from lodash@3).
-            let key = (edge.canonical.clone(), version.clone());
+            // Enqueue this version's deps once. Different versions of
+            // the same canonical each get their own children-enqueued
+            // entry because dep lists are version-specific (lodash@4
+            // has different deps from lodash@3).
+            let key = (edge.canonical.clone(), target_version.clone());
             if !state.children_enqueued.contains(&key) {
                 state.children_enqueued.insert(key);
-                enqueue_child_deps(new_id, &edge.canonical, &version, info, state)?;
+                enqueue_child_deps(new_id, &edge.canonical, &target_version, info, state)?;
             }
             new_id
         }
     };
 
-    // Record the parent → child edge.
+    // Record override AFTER node allocation so we never trace an
+    // override that didn't actually take effect.
+    if let Some(hit) = override_hit {
+        state.overrides.record_hit(hit);
+    }
+
     state.nodes[edge.parent as usize]
         .children
         .push((edge.local_name.clone(), child_id));
 
     Ok(())
+}
+
+/// Phase 32 P5 — apply an [`OverrideTarget`] against the consumer's
+/// range, walking THIS canonical's cached versions to produce a final
+/// forced version. Mirrors [`crate::provider::LpmDependencyProvider::apply_override_target`]'s
+/// pubgrub-arm semantics:
+///
+/// - `PinnedVersion` returns the pinned version verbatim, but ONLY if
+///   it satisfies the consumer's declared range. Phase 5's contract is
+///   "never pick a version the consumer didn't ask for and silently
+///   pretend it works" — out-of-range targets return `None` so the
+///   caller can fall through to the natural pick.
+/// - `Range` intersects the override range with the consumer range
+///   (over the cache's available versions list for THIS package) and
+///   picks the newest match. Platform-incompatible candidates are
+///   skipped; this can return `None` even when an in-range version
+///   exists if every candidate is filtered out.
+fn apply_override_target_greedy(
+    info: &CachedPackageInfo,
+    target: &OverrideTarget,
+    range: &NpmRange,
+) -> Option<NpmVersion> {
+    match target {
+        OverrideTarget::PinnedVersion { version, .. } => {
+            if range.satisfies(version) {
+                Some(version.clone())
+            } else {
+                None
+            }
+        }
+        OverrideTarget::Range {
+            range: target_range,
+            ..
+        } => {
+            // Versions are sorted newest-first by
+            // `parse_metadata_to_cache_info`, so the first match is
+            // the newest match — same contract as `find_best_version`.
+            for v in &info.versions {
+                if !range.satisfies(v) {
+                    continue;
+                }
+                if !target_range.satisfies(v) {
+                    continue;
+                }
+                let platform_ok = info
+                    .platform
+                    .get(&v.to_string())
+                    .is_none_or(crate::provider::is_platform_compatible);
+                if !platform_ok {
+                    continue;
+                }
+                return Some(v.clone());
+            }
+            None
+        }
+    }
 }
 
 fn handle_no_version(
@@ -1430,7 +1653,7 @@ mod tests {
         deps.insert("zebra".to_string(), "^1.0.0".to_string());
         deps.insert("alpha".to_string(), "^1.0.0".to_string());
         deps.insert("middle".to_string(), "^1.0.0".to_string());
-        let mut state = ResolveState::new(deps);
+        let mut state = ResolveState::new(deps, OverrideSet::empty());
         state.seed_root_edges().unwrap();
         let order: Vec<&str> = state
             .task_queue
@@ -1457,7 +1680,7 @@ mod tests {
         // A non-aliased sibling proves the alias-vs-non-alias branch
         // both work in one seeding pass.
         deps.insert("rxjs".to_string(), "^7.8.0".to_string());
-        let mut state = ResolveState::new(deps);
+        let mut state = ResolveState::new(deps, OverrideSet::empty());
         state.seed_root_edges().unwrap();
 
         // root_aliases is populated only for the aliased entry.
@@ -1505,7 +1728,7 @@ mod tests {
     fn seed_root_edges_seeds_root_node() {
         let mut deps = HashMap::new();
         deps.insert("only".to_string(), "^1.0.0".to_string());
-        let mut state = ResolveState::new(deps);
+        let mut state = ResolveState::new(deps, OverrideSet::empty());
         state.seed_root_edges().unwrap();
         assert_eq!(state.nodes.len(), 1);
         assert!(matches!(state.nodes[0].canonical, CanonicalKey::Root));
@@ -1523,7 +1746,7 @@ mod tests {
         let info = mk_info(&["4.17.21"], &[]);
         let mut deps = HashMap::new();
         deps.insert("lodash".to_string(), "^4.0.0".to_string());
-        let mut state = ResolveState::new(deps);
+        let mut state = ResolveState::new(deps, OverrideSet::empty());
         state.seed_root_edges().unwrap();
 
         // Add a second parent (simulate a transitive that also needs lodash)
@@ -1584,7 +1807,7 @@ mod tests {
         let info = mk_info(&["4.17.21", "4.0.0", "3.10.1", "3.0.0"], &[]);
         let mut deps = HashMap::new();
         deps.insert("lodash".to_string(), "^4.0.0".to_string());
-        let mut state = ResolveState::new(deps);
+        let mut state = ResolveState::new(deps, OverrideSet::empty());
         state.seed_root_edges().unwrap();
 
         // Second parent wants ^3 — incompatible with the first parent's ^4.
@@ -1648,6 +1871,216 @@ mod tests {
         );
     }
 
+    // ── Phase 32 P5 — override application on the greedy arm ──────
+    //
+    // These tests pin the contract closed by the R1 fix: user-declared
+    // `lpm.overrides` / `package.json > overrides` actually take effect
+    // on the default resolver path. Pre-fix, both arms accepted the
+    // OverrideSet as `_overrides` (unused) and hardcoded
+    // `applied_overrides: Vec::new()`. The tests here exercise the
+    // three semantic surfaces of `OverrideSet::find_match`:
+    //   - Name selectors (apply to every resolution of a canonical)
+    //   - Path selectors (apply only via a specific parent)
+    //   - Irreconcilable targets (out-of-range — fall back to natural)
+
+    /// Helper: build an OverrideSet from a single `lpm.overrides`
+    /// entry. Path-selector tests use a separate path-key form via
+    /// the same parser.
+    fn override_set(key: &str, target: &str) -> OverrideSet {
+        let mut lpm = HashMap::new();
+        lpm.insert(key.to_string(), target.to_string());
+        OverrideSet::parse(&lpm, &HashMap::new(), &HashMap::new())
+            .expect("test override should parse")
+    }
+
+    #[test]
+    fn process_edge_applies_name_selector_override() {
+        // `lpm.overrides: { "lodash": "3.10.1" }` — every lodash
+        // resolution is forced to 3.10.1, even when the consumer's
+        // range nominally satisfies 4.17.21. Mirrors
+        // `LpmDependencyProvider::choose_version`'s pubgrub-arm
+        // semantics (provider.rs:1185-1207).
+        let info = mk_info(&["4.17.21", "4.0.0", "3.10.1", "3.0.0"], &[]);
+        let mut deps = HashMap::new();
+        deps.insert("lodash".to_string(), "^3.0.0 || ^4.0.0".to_string());
+        let mut state = ResolveState::new(deps, override_set("lodash", "3.10.1"));
+        state.seed_root_edges().unwrap();
+        while let Some(edge) = state.task_queue.pop_front() {
+            process_edge(&edge, &info, &mut state).unwrap();
+        }
+
+        let lodash_entries = &state.resolved[&CanonicalKey::npm("lodash")];
+        assert_eq!(lodash_entries.len(), 1, "single forced version");
+        assert_eq!(lodash_entries[0].0.to_string(), "3.10.1");
+
+        let hits = state.overrides.take_hits();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].package, "lodash");
+        assert_eq!(hits[0].from_version, "4.17.21");
+        assert_eq!(hits[0].to_version, "3.10.1");
+        assert_eq!(hits[0].via_parent, None, "Name selector — no parent ctx");
+    }
+
+    #[test]
+    fn process_edge_range_target_picks_newest_in_intersection() {
+        // `lpm.overrides: { "lodash": "^3.0.0" }` — constrains the
+        // candidate set to 3.x and lets the resolver pick the newest
+        // match in the consumer's range × override range intersection.
+        let info = mk_info(&["4.17.21", "3.10.1", "3.0.0"], &[]);
+        let mut deps = HashMap::new();
+        deps.insert("lodash".to_string(), "*".to_string());
+        let mut state = ResolveState::new(deps, override_set("lodash", "^3.0.0"));
+        state.seed_root_edges().unwrap();
+        while let Some(edge) = state.task_queue.pop_front() {
+            process_edge(&edge, &info, &mut state).unwrap();
+        }
+
+        let lodash_entries = &state.resolved[&CanonicalKey::npm("lodash")];
+        assert_eq!(lodash_entries.len(), 1);
+        assert_eq!(
+            lodash_entries[0].0.to_string(),
+            "3.10.1",
+            "newest version in 3.x — consumer's `*` × override's `^3.0.0`"
+        );
+    }
+
+    #[test]
+    fn process_edge_irreconcilable_override_falls_through_to_natural() {
+        // Pinned target is OUTSIDE the consumer's declared range. The
+        // resolver should fall through to the natural pick rather than
+        // silently picking a version the consumer never asked for. No
+        // OverrideHit is recorded — the override didn't take effect.
+        let info = mk_info(&["4.17.21", "3.10.1"], &[]);
+        let mut deps = HashMap::new();
+        deps.insert("lodash".to_string(), "^4.0.0".to_string());
+        // Override pin to 3.10.1 — outside ^4.0.0.
+        let mut state = ResolveState::new(deps, override_set("lodash", "3.10.1"));
+        state.seed_root_edges().unwrap();
+        while let Some(edge) = state.task_queue.pop_front() {
+            process_edge(&edge, &info, &mut state).unwrap();
+        }
+
+        let lodash_entries = &state.resolved[&CanonicalKey::npm("lodash")];
+        assert_eq!(lodash_entries.len(), 1);
+        assert_eq!(
+            lodash_entries[0].0.to_string(),
+            "4.17.21",
+            "irreconcilable override falls through to natural pick"
+        );
+        assert!(
+            state.overrides.take_hits().is_empty(),
+            "no OverrideHit when override didn't apply"
+        );
+    }
+
+    #[test]
+    fn process_edge_path_selector_splits_two_parents() {
+        // `lpm.overrides: { "react>lodash": "3.10.1" }` — only the
+        // edge originating from `react` is forced; the root-level
+        // `lodash` edge keeps its natural pick. Two distinct lodash
+        // nodes coexist in the resolved tree (split-by-context).
+        //
+        // Both consumers declare `>=3.0.0` so the override target
+        // (3.10.1) sits inside both ranges — the split is purely a
+        // function of which parent the edge originates from, not of
+        // mutually exclusive ranges. (The
+        // `process_edge_allocates_second_version_on_incompatible_range`
+        // test covers the range-mismatch split path; this one
+        // isolates the override-driven split.)
+        let info = mk_info(&["4.17.21", "3.10.1"], &[]);
+        let mut deps = HashMap::new();
+        deps.insert("lodash".to_string(), ">=3.0.0".to_string());
+        let mut state = ResolveState::new(deps, override_set("react>lodash", "3.10.1"));
+        state.seed_root_edges().unwrap();
+
+        // Synthesize a `react` parent that ALSO pulls lodash@>=3.0.0
+        // — without the path-selector override, this would reuse the
+        // root's lodash@4.17.21. With the override, it splits.
+        state.nodes.push(ResolvedNodeBuilder {
+            canonical: CanonicalKey::npm("react"),
+            version: NpmVersion::parse("18.0.0").unwrap(),
+            children: Vec::new(),
+        });
+        state.resolved.insert(
+            CanonicalKey::npm("react"),
+            vec![(NpmVersion::parse("18.0.0").unwrap(), 1)],
+        );
+        state.task_queue.push_back(Edge {
+            parent: 1,
+            local_name: "lodash".to_string(),
+            canonical: CanonicalKey::npm("lodash"),
+            range: NpmRange::parse(">=3.0.0").unwrap(),
+            behavior: DepBehavior {
+                required: true,
+                peer: false,
+                optional: false,
+            },
+        });
+
+        while let Some(edge) = state.task_queue.pop_front() {
+            process_edge(&edge, &info, &mut state).unwrap();
+        }
+
+        let lodash_entries = &state.resolved[&CanonicalKey::npm("lodash")];
+        let mut versions: Vec<String> = lodash_entries.iter().map(|(v, _)| v.to_string()).collect();
+        versions.sort();
+        assert_eq!(
+            versions,
+            vec!["3.10.1", "4.17.21"],
+            "path-selector override splits lodash into two versions"
+        );
+
+        // The root edge resolved to natural (4.17.21).
+        let root_lodash_id = state.nodes[0]
+            .children
+            .iter()
+            .find(|(name, _)| name == "lodash")
+            .map(|(_, id)| *id)
+            .unwrap();
+        assert_eq!(
+            state.nodes[root_lodash_id as usize].version.to_string(),
+            "4.17.21"
+        );
+
+        // The react edge resolved to the override (3.10.1).
+        let react_lodash_id = state.nodes[1]
+            .children
+            .iter()
+            .find(|(name, _)| name == "lodash")
+            .map(|(_, id)| *id)
+            .unwrap();
+        assert_eq!(
+            state.nodes[react_lodash_id as usize].version.to_string(),
+            "3.10.1"
+        );
+
+        let hits = state.overrides.take_hits();
+        assert_eq!(hits.len(), 1, "only the path-selector edge records a hit");
+        assert_eq!(hits[0].via_parent.as_deref(), Some("react"));
+        assert_eq!(hits[0].to_version, "3.10.1");
+    }
+
+    #[test]
+    fn process_edge_zero_overrides_takes_hot_path_unchanged() {
+        // Sanity check: with no overrides, the slow-path branch is
+        // never entered — the existing (range.satisfies → reuse,
+        // else find_best_version → allocate) semantic is byte-
+        // identical. Guards against an accidental regression where
+        // the slow path becomes the default.
+        let info = mk_info(&["4.17.21", "4.0.0"], &[]);
+        let mut deps = HashMap::new();
+        deps.insert("lodash".to_string(), "^4.0.0".to_string());
+        let mut state = ResolveState::new(deps, OverrideSet::empty());
+        state.seed_root_edges().unwrap();
+        while let Some(edge) = state.task_queue.pop_front() {
+            process_edge(&edge, &info, &mut state).unwrap();
+        }
+        let lodash_entries = &state.resolved[&CanonicalKey::npm("lodash")];
+        assert_eq!(lodash_entries.len(), 1);
+        assert_eq!(lodash_entries[0].0.to_string(), "4.17.21");
+        assert!(state.overrides.take_hits().is_empty());
+    }
+
     #[test]
     fn handle_no_version_optional_skips() {
         let info = mk_info(&["1.0.0"], &[]);
@@ -1662,7 +2095,7 @@ mod tests {
                 optional: true,
             },
         };
-        let mut state = ResolveState::new(HashMap::new());
+        let mut state = ResolveState::new(HashMap::new(), OverrideSet::empty());
         assert!(handle_no_version(&edge, &info, false, &mut state).is_ok());
         assert_eq!(state.platform_skipped, 0);
     }
@@ -1681,7 +2114,7 @@ mod tests {
                 optional: true,
             },
         };
-        let mut state = ResolveState::new(HashMap::new());
+        let mut state = ResolveState::new(HashMap::new(), OverrideSet::empty());
         assert!(handle_no_version(&edge, &info, true, &mut state).is_ok());
         assert_eq!(state.platform_skipped, 1);
     }
@@ -1700,7 +2133,7 @@ mod tests {
                 optional: false,
             },
         };
-        let mut state = ResolveState::new(HashMap::new());
+        let mut state = ResolveState::new(HashMap::new(), OverrideSet::empty());
         assert!(matches!(
             handle_no_version(&edge, &info, false, &mut state),
             Err(ResolveError::DependencyFetch { .. })
@@ -1772,7 +2205,7 @@ mod tests {
             version: "*".to_string(),
             detail: "connection refused".to_string(),
         };
-        let mut state = ResolveState::new(HashMap::new());
+        let mut state = ResolveState::new(HashMap::new(), OverrideSet::empty());
         assert!(propagate_fetch_error(&edge, &err, &mut state).is_ok());
 
         // And the full-loop variant: zero deps means zero parked

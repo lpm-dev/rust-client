@@ -44,6 +44,7 @@ FIXTURES=(
     "source-kind/postinstall-sibling-husky"
     "source-kind/bundle-deps"
     "source-kind/npm-aliases"
+    "source-kind/overrides"
     "source-kind/patches"
     "source-kind/postinstall-introspects-layout"
     "source-kind/self-referential"
