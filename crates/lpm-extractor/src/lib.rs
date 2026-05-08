@@ -358,7 +358,7 @@ where
 /// unpack path.
 fn write_buffered_entry(target_path: &Path, bytes: &[u8]) -> Result<(), LpmError> {
     use std::io::Write;
-    let mut file = std::fs::File::create(target_path).map_err(LpmError::Io)?;
+    let mut file = create_leaf_file(target_path)?;
     file.write_all(bytes).map_err(LpmError::Io)?;
     Ok(())
 }
@@ -371,7 +371,7 @@ fn stream_entry_to_disk<R: std::io::Read>(
     entry: &mut tar::Entry<'_, R>,
     target_path: &Path,
 ) -> Result<(), LpmError> {
-    let mut file = std::fs::File::create(target_path).map_err(LpmError::Io)?;
+    let mut file = create_leaf_file(target_path)?;
     std::io::copy(entry, &mut file).map_err(LpmError::Io)?;
     Ok(())
 }
@@ -416,15 +416,22 @@ fn prepare_output_path(
         current.push(component.as_os_str());
         let is_last = components.peek().is_none();
 
+        // The leaf is the per-entry FILE path. We don't need to stat
+        // it here — the file-create call handles leaf-symlink defense
+        // via [`create_leaf_file`] (`O_NOFOLLOW` on unix, explicit
+        // pre-create stat on windows). Walking the leaf in this loop
+        // would just add a `symlink_metadata` syscall per file (~18 K
+        // syscalls on a fixture-large install) for a check that the
+        // open already enforces atomically.
+        if is_last {
+            break;
+        }
+
         // **Phase 66 perf followup #3.** Skip the `symlink_metadata`
         // syscall when we've already verified or created this exact
         // intermediate dir on a prior entry in this extraction. Only
-        // applies to NON-leaf components (the leaf is the per-entry
-        // file path which we still need to stat for the symlink-
-        // attack guard below). The HashSet only carries verified
-        // PARENT directories; a leaf hit can never live here so no
-        // safety regression.
-        if !is_last && verified_parents.contains(&current) {
+        // applies to NON-leaf components.
+        if verified_parents.contains(&current) {
             continue;
         }
 
@@ -437,28 +444,78 @@ fn prepare_output_path(
                     )));
                 }
 
-                if !is_last && !metadata.is_dir() {
+                if !metadata.is_dir() {
                     return Err(LpmError::Registry(format!(
                         "non-directory path blocks tarball extraction: {}",
                         original_path.display()
                     )));
                 }
-                if !is_last {
-                    verified_parents.insert(current.clone());
-                }
+                verified_parents.insert(current.clone());
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                if !is_last {
-                    std::fs::create_dir(&current).map_err(LpmError::Io)?;
-                    created_dirs.push(current.clone());
-                    verified_parents.insert(current.clone());
-                }
+                std::fs::create_dir(&current).map_err(LpmError::Io)?;
+                created_dirs.push(current.clone());
+                verified_parents.insert(current.clone());
             }
             Err(error) => return Err(LpmError::Io(error)),
         }
     }
 
     Ok((current, created_dirs))
+}
+
+/// Create-or-truncate the leaf file at `target_path` while atomically
+/// rejecting symlinks at that path.
+///
+/// On unix this opens with `O_NOFOLLOW`; if a symlink (orphaned from a
+/// prior failed extraction or planted by another process) sits at the
+/// path, the kernel returns `ELOOP` and the open fails — same posture
+/// as the previous explicit `symlink_metadata` pre-check, fewer
+/// syscalls. On windows the optimization is skipped (no `O_NOFOLLOW`
+/// equivalent in `OpenOptions`); we fall back to an explicit stat.
+fn create_leaf_file(target_path: &Path) -> Result<std::fs::File, LpmError> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            // `O_NOFOLLOW` only checks the FINAL path component — the
+            // parent walk in `prepare_output_path` already verified
+            // every intermediate dir is a real directory, not a
+            // symlink, so this single flag closes the leaf-symlink
+            // attack vector with no extra syscall.
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(target_path)
+            .map_err(|e| match e.raw_os_error() {
+                // `ELOOP` (or `EMLINK` on some BSDs) from `O_NOFOLLOW`
+                // turns into the same registry-error shape the
+                // previous explicit-stat path produced.
+                Some(libc::ELOOP) => LpmError::Registry(format!(
+                    "path traversal detected via symlink in tarball target: {}",
+                    target_path.display()
+                )),
+                _ => LpmError::Io(e),
+            })
+    }
+    #[cfg(not(unix))]
+    {
+        // Windows: explicit pre-create stat for the leaf-symlink
+        // guard. NTFS reparse points behave differently than POSIX
+        // symlinks; mirroring the legacy behavior keeps cross-platform
+        // semantics identical.
+        match std::fs::symlink_metadata(target_path) {
+            Ok(meta) if meta.file_type().is_symlink() => {
+                return Err(LpmError::Registry(format!(
+                    "path traversal detected via symlink in tarball target: {}",
+                    target_path.display()
+                )));
+            }
+            Ok(_) | Err(_) => {}
+        }
+        std::fs::File::create(target_path).map_err(LpmError::Io)
+    }
 }
 
 fn rollback_extraction(
@@ -1021,6 +1078,46 @@ mod tests {
         assert!(
             !outside.path().join("escape.txt").exists(),
             "extractor must not write files outside the target through an existing symlink parent"
+        );
+    }
+
+    /// **Phase 66 perf followup #C** — `create_leaf_file` replaced
+    /// the explicit per-leaf `symlink_metadata` pre-check with
+    /// `O_NOFOLLOW` on the file open. This test pins the security
+    /// guarantee: a pre-existing leaf symlink (e.g., orphaned from a
+    /// crashed extraction) MUST NOT cause the extractor to write
+    /// through it. The legacy explicit-stat path returned the same
+    /// error shape; this test asserts the post-#C path keeps that
+    /// invariant.
+    #[cfg(unix)]
+    #[test]
+    fn extract_rejects_existing_leaf_symlink() {
+        let tgz = create_test_tarball("victim.txt", b"new bytes");
+        let dir = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let outside_target = outside.path().join("escape.txt");
+        std::fs::write(&outside_target, b"original outside content").unwrap();
+
+        // Pre-plant a leaf symlink at the path the tarball wants to
+        // write to. Pre-#C this was caught by `prepare_output_path`'s
+        // leaf stat; post-#C it's caught by `O_NOFOLLOW` on the open.
+        std::os::unix::fs::symlink(&outside_target, dir.path().join("victim.txt")).unwrap();
+
+        let result = extract_tarball(&tgz, dir.path());
+
+        assert!(
+            result.is_err(),
+            "extractor must reject pre-existing leaf symlinks"
+        );
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("path traversal detected"),
+            "error must surface as path-traversal, got: {err}",
+        );
+        let outside_content = std::fs::read_to_string(&outside_target).unwrap();
+        assert_eq!(
+            outside_content, "original outside content",
+            "extractor must NOT write through the leaf symlink to the outside path",
         );
     }
 
