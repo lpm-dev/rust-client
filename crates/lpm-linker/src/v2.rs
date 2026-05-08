@@ -141,24 +141,71 @@ pub fn link_packages_v2(
     // mirrors that into the link-entry namespace.
     let key_map = derive_graph_keys(augmented_slice, &platform, linker_tag)?;
 
-    // Materialize each link entry. Phase 4b runs sequentially for
-    // simplicity — the v2 store's own atomicity already serializes
-    // concurrent writers via atomic-rename, but exercising parallelism
-    // here pays for the rayon thread-pool cost on small installs and
-    // the audit-fixture set is small. Phase 4d/4f can revisit.
-    let mut linked_count = 0usize;
-    let mut materialized: Vec<MaterializedPackage> = Vec::with_capacity(augmented_slice.len());
-    for v2t in augmented_slice {
-        let entry = populate_one(v2t, store, &key_map, &platform)?;
-        if entry.freshly_populated {
-            linked_count += 1;
-        }
-        materialized.push(MaterializedPackage {
-            name: v2t.target.name.clone(),
-            version: v2t.target.version.clone(),
-            destination: store.paths().link_package_dir(&entry.key),
-        });
-    }
+    // **Phase 66 perf followup #5 (samply-driven, 2026-05-08).** Materialize
+    // link entries in parallel for installs above the threshold.
+    //
+    // Phase 4b shipped this loop sequentially with the explicit
+    // "Phase 4d/4f can revisit" follow-up note. The 2026-05-08 paired
+    // A/B bench (lpm-rs-pre66 on `main` vs lpm-rs-post66 with the v2
+    // stack) attributed the +157 ms cold/clean regression to this
+    // exact loop: pre-66 isolated ran event-driven per-package link
+    // tasks in parallel with the fetch loop, so `link_ms` was 42 ms
+    // (mostly overlapped); v2's serial loop pushed `link_ms` to
+    // 191 ms blocking the wall-clock critical path. Closing this gap
+    // is the single biggest Phase 66 follow-up perf win.
+    //
+    // **Atomicity invariant** (preplan §2.4 + Phase 4a). The v2
+    // store's `populate_link_entry` already serializes concurrent
+    // writers via atomic-rename — two threads racing on the same
+    // graph_key both write into a tmp sibling and one's `rename` wins;
+    // the loser observes the completed final dir on its second probe
+    // and short-circuits. No external lock is needed.
+    //
+    // **Threshold.** Rayon's global thread pool spin-up cost is
+    // measurable (~3-5 ms first call); for small installs the
+    // sequential loop is cheaper. 32 is the cross-over point on
+    // M5 macOS APFS — below that, the thread-pool overhead exceeds
+    // the parallelism gain.
+    use rayon::prelude::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    const PARALLEL_THRESHOLD: usize = 32;
+
+    let linked_count_atomic = AtomicUsize::new(0);
+    let materialized_results: Vec<Result<MaterializedPackage, LpmError>> =
+        if augmented_slice.len() > PARALLEL_THRESHOLD {
+            augmented_slice
+                .par_iter()
+                .map(|v2t| {
+                    let entry = populate_one(v2t, store, &key_map, &platform)?;
+                    if entry.freshly_populated {
+                        linked_count_atomic.fetch_add(1, Ordering::Relaxed);
+                    }
+                    Ok(MaterializedPackage {
+                        name: v2t.target.name.clone(),
+                        version: v2t.target.version.clone(),
+                        destination: store.paths().link_package_dir(&entry.key),
+                    })
+                })
+                .collect()
+        } else {
+            augmented_slice
+                .iter()
+                .map(|v2t| {
+                    let entry = populate_one(v2t, store, &key_map, &platform)?;
+                    if entry.freshly_populated {
+                        linked_count_atomic.fetch_add(1, Ordering::Relaxed);
+                    }
+                    Ok(MaterializedPackage {
+                        name: v2t.target.name.clone(),
+                        version: v2t.target.version.clone(),
+                        destination: store.paths().link_package_dir(&entry.key),
+                    })
+                })
+                .collect()
+        };
+    let materialized: Vec<MaterializedPackage> =
+        materialized_results.into_iter().collect::<Result<_, _>>()?;
+    let linked_count = linked_count_atomic.into_inner();
 
     // Project-side root symlinks: one per entry in `root_link_names`
     // (or the default `[name]` for direct deps with `None`).
@@ -1299,5 +1346,67 @@ mod tests {
             msg.contains("multi-source") && msg.contains("x@1.0.0"),
             "multi-source collision error must name the package: {msg}"
         );
+    }
+
+    /// **Phase 66 perf followup #5.** Parallel materialization above
+    /// the `PARALLEL_THRESHOLD = 32` cross-over must produce the same
+    /// `LinkResult` shape as the sequential path: every input target
+    /// gets a populated link entry, materialized count matches the
+    /// input length, and `linked` (count of freshly-populated
+    /// entries) sums correctly across rayon worker threads via the
+    /// atomic counter.
+    #[test]
+    fn link_packages_v2_parallel_materialization_above_threshold() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = V2Store::at(tmp.path().join("store"));
+        let project = tmp.path().join("project");
+        std::fs::create_dir_all(&project).unwrap();
+
+        // 50 distinct packages — comfortably above the 32-package
+        // threshold so the parallel branch fires.
+        const N: usize = 50;
+        let mut targets = Vec::with_capacity(N);
+        for i in 0..N {
+            let name = format!("pkg-{i}");
+            let sri = synthetic_sri(format!("parallel/{name}").as_bytes());
+            let pkg_json = format!(r#"{{"name":"{name}","version":"1.0.0"}}"#);
+            write_object(&store, &sri, &[("package.json", pkg_json.as_bytes())]);
+            targets.push(target(&name, "1.0.0", &sri, true));
+        }
+
+        let result =
+            link_packages_v2(&project, &targets, &store, LinkerMode::Isolated, None).unwrap();
+
+        // Every package freshly populated: linked counter must match N.
+        assert_eq!(
+            result.linked, N,
+            "atomic counter must sum correctly across rayon workers"
+        );
+        // Each direct dep gets one root symlink: symlinked must match N.
+        assert_eq!(result.symlinked, N);
+        // Materialized list preserves one entry per input.
+        assert_eq!(result.materialized.len(), N);
+        // Every materialized destination resolves to a real package
+        // dir — proves the link entry was actually populated, not just
+        // counted.
+        for m in &result.materialized {
+            assert!(
+                m.destination.join("package.json").is_file(),
+                "package dir {} must contain package.json post-materialization",
+                m.destination.display()
+            );
+        }
+        // Every project-side root symlink resolves through to the link
+        // entry — confirms the post-parallel `create_root_symlinks`
+        // pass saw all `N` graph keys via the key_map.
+        for i in 0..N {
+            let name = format!("pkg-{i}");
+            let link = project.join("node_modules").join(&name);
+            assert!(
+                link.symlink_metadata().unwrap().file_type().is_symlink(),
+                "project-side root symlink for {name} must exist after parallel materialization"
+            );
+            assert!(link.join("package.json").is_file());
+        }
     }
 }
