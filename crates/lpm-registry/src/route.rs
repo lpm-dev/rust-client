@@ -1,14 +1,10 @@
 //! Upstream routing policy for package metadata fetches.
 //!
-//! Phase 49 (preplan §3, §5.4): `@lpm.dev/*` packages ALWAYS route via
-//! the LPM Worker (auth + batch endpoint + cost attribution). For
-//! everything else, [`RouteMode`] picks between the LPM Worker proxy
-//! and a direct fetch from `registry.npmjs.org`.
-//!
-//! The shipped default is [`RouteMode::Direct`] — Phase 49's whole
-//! point is to stop paying Cloudflare for 100%-free npm traffic.
-//! [`RouteMode::Proxy`] exists as an undocumented debug escape hatch
-//! via the `LPM_NPM_ROUTE` env var; it is NOT a user-facing knob.
+//! `@lpm.dev/*` packages always route via the LPM Worker (auth + batch
+//! endpoint). Everything else fetches direct from `registry.npmjs.org`
+//! by default — same shape as `npm`, `yarn`, `pnpm`, and `bun`. The
+//! `LPM_NPM_ROUTE` env var stays as an internal debug knob; it is not
+//! a user-facing setting.
 //!
 //! ## Phase 58 — Custom registries via `.npmrc`
 //!
@@ -35,14 +31,12 @@ use crate::npmrc::{NpmrcConfig, RegistryAuth, RegistryTarget};
 /// route through the LPM Worker for auth + batched cost attribution.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum RouteMode {
-    /// Fetch non-`@lpm.dev/*` packages via the LPM Worker proxy.
-    /// Preserves the pre-Phase-49 routing shape. Undocumented escape
-    /// hatch.
+    /// Fetch non-`@lpm.dev/*` packages via the LPM Worker. Internal
+    /// debug knob only.
     Proxy,
 
     /// Fetch non-`@lpm.dev/*` packages direct from
-    /// `registry.npmjs.org`. The shipped default per preplan §3 —
-    /// stops the double hop `client → CF Worker → npm`.
+    /// `registry.npmjs.org`. Default — matches `npm`/`yarn`/`pnpm`/`bun`.
     #[default]
     Direct,
 }
