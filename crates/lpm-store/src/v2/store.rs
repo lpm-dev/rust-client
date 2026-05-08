@@ -16,7 +16,7 @@ use lpm_common::{LpmError, LpmRoot};
 
 use crate::StageTimings;
 use crate::v2::graph_key::GraphKey;
-use crate::v2::link_meta::{LinkMeta, LinkMetaDep, LinkMetaPlatform};
+use crate::v2::link_meta::{LINK_META_FILENAME, LinkMeta, LinkMetaDep, LinkMetaPlatform};
 
 /// v2 layout version segment under `~/.lpm/store/`. Bumped whenever
 /// the on-disk shape changes; lpm reading a higher-numbered store
@@ -174,8 +174,15 @@ pub struct LinkEntry {
     /// Whether the entry was newly populated this call (`true`) or
     /// already existed and we short-circuited (`false`).
     pub freshly_populated: bool,
-    /// Sidecar that was written / refreshed.
-    pub sidecar: LinkMeta,
+    /// Sidecar payload.
+    ///
+    /// `Some` only when [`Self::freshly_populated`] is `true` —
+    /// callers that need the sidecar after a cache hit should read
+    /// it lazily via [`crate::v2::LinkMeta::read_from`] from
+    /// [`Self::link_dir`]. Phase 66 followup #3 dropped the eager
+    /// read+parse on cache hits to save the JSON round-trip per
+    /// package on warm installs (256 packages × ~30 µs adds up).
+    pub sidecar: Option<LinkMeta>,
 }
 
 /// I/O front-end for the v2 store.
@@ -451,13 +458,26 @@ impl Store {
         // to hard-fail with ENOTEMPTY against a non-empty leftover.
         if final_dir.exists() {
             if is_complete_link_entry(&final_dir, &graph_key) {
-                let mut existing = LinkMeta::read_from(&final_dir)?;
-                existing.touch();
-                existing.write_to(&final_dir)?;
+                // Phase 66 followup #3 — refresh the sidecar's "last
+                // referenced" via a single set_modified() call.
+                // Pre-followup we did read+touch+write+rename here on
+                // every cache hit; on a 256-package warm install
+                // that's 256 JSON parses + 256 atomic-rename
+                // syscall trios. `lpm cache prune --max-age` reads
+                // the effective time via
+                // `LinkMeta::effective_last_referenced_at`, which
+                // takes max(json_field, file_mtime) — schema-
+                // compatible with pre-followup sidecars.
+                let sidecar_path = final_dir.join(LINK_META_FILENAME);
+                if let Err(e) = LinkMeta::touch_on_disk(&sidecar_path) {
+                    // Non-fatal: a missed touch only widens prune's
+                    // view of cold entries by one install cycle.
+                    tracing::debug!("v2 store: cache-hit touch failed: {e}");
+                }
                 return Ok(LinkEntry {
                     link_dir: final_dir,
                     freshly_populated: false,
-                    sidecar: existing,
+                    sidecar: None,
                 });
             }
 
@@ -509,19 +529,20 @@ impl Store {
             Ok(()) => Ok(LinkEntry {
                 link_dir: final_dir,
                 freshly_populated: true,
-                sidecar,
+                sidecar: Some(sidecar),
             }),
             Err(_) if is_complete_link_entry(&final_dir, &graph_key) => {
                 // Concurrent install beat us — discard our stage and
-                // refresh the existing sidecar's last-referenced time.
+                // refresh the existing sidecar's mtime (followup #3).
                 let _ = std::fs::remove_dir_all(&tmp_dir);
-                let mut existing = LinkMeta::read_from(&final_dir)?;
-                existing.touch();
-                existing.write_to(&final_dir)?;
+                let sidecar_path = final_dir.join(LINK_META_FILENAME);
+                if let Err(e) = LinkMeta::touch_on_disk(&sidecar_path) {
+                    tracing::debug!("v2 store: race-loss touch failed: {e}");
+                }
                 Ok(LinkEntry {
                     link_dir: final_dir,
                     freshly_populated: false,
-                    sidecar: existing,
+                    sidecar: None,
                 })
             }
             Err(_) if final_dir.exists() => {
@@ -547,7 +568,7 @@ impl Store {
                     Ok(()) => Ok(LinkEntry {
                         link_dir: final_dir,
                         freshly_populated: true,
-                        sidecar,
+                        sidecar: Some(sidecar),
                     }),
                     Err(e) => {
                         let _ = std::fs::remove_dir_all(&tmp_dir);
@@ -1311,15 +1332,44 @@ mod tests {
 
         let first = store.populate_link_entry(req()).unwrap();
         assert!(first.freshly_populated);
+        assert!(first.sidecar.is_some(), "fresh population returns sidecar");
+        let first_sidecar = first.sidecar.unwrap();
+        let sidecar_path = first.link_dir.join(LINK_META_FILENAME);
+        let mtime_before = std::fs::metadata(&sidecar_path)
+            .unwrap()
+            .modified()
+            .unwrap();
 
-        // Sleep enough that chrono's UTC nanosecond clock advances.
-        std::thread::sleep(std::time::Duration::from_millis(2));
+        // Sleep enough that the file mtime granularity advances on
+        // every supported FS — APFS resolves to ns, ext4 to ms, but
+        // some test runners hit FAT-style 1-s granularity. 1100 ms
+        // is the conservative floor.
+        std::thread::sleep(std::time::Duration::from_millis(1100));
 
         let second = store.populate_link_entry(req()).unwrap();
         assert!(!second.freshly_populated);
         assert_eq!(second.link_dir, first.link_dir);
-        assert!(second.sidecar.last_referenced_at >= first.sidecar.last_referenced_at);
-        assert!(second.sidecar.created_at == first.sidecar.created_at);
+        // Phase 66 followup #3 — cache-hit returns no sidecar; the
+        // touch is observable via the sidecar file's mtime, and the
+        // effective last-referenced timestamp is max(json, mtime).
+        assert!(second.sidecar.is_none(), "cache hit skips sidecar read");
+        let mtime_after = std::fs::metadata(&sidecar_path)
+            .unwrap()
+            .modified()
+            .unwrap();
+        assert!(
+            mtime_after > mtime_before,
+            "sidecar mtime must advance on cache hit"
+        );
+        let read_back = LinkMeta::read_from(&first.link_dir).unwrap();
+        assert_eq!(
+            read_back.created_at, first_sidecar.created_at,
+            "created_at is immutable across cache hits"
+        );
+        // The JSON `last_referenced_at` is frozen at creation under
+        // followup #3; the effective time tracks file mtime.
+        let effective = read_back.effective_last_referenced_at(&sidecar_path);
+        assert!(effective > first_sidecar.last_referenced_at);
     }
 
     #[test]
@@ -1374,9 +1424,10 @@ mod tests {
         assert!(sibling.join("package.json").is_file());
 
         // Sidecar records the dep edge.
-        assert_eq!(entry.sidecar.deps.len(), 1);
-        assert_eq!(entry.sidecar.deps[0].local, "debug");
-        assert_eq!(entry.sidecar.deps[0].target_graph_key, dep_key.digest_hex());
+        let sidecar = entry.sidecar.expect("fresh population returns sidecar");
+        assert_eq!(sidecar.deps.len(), 1);
+        assert_eq!(sidecar.deps[0].local, "debug");
+        assert_eq!(sidecar.deps[0].target_graph_key, dep_key.digest_hex());
     }
 
     #[test]
