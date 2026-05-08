@@ -708,6 +708,22 @@ impl ResolveState {
                 None => (name.clone(), range_str.clone()),
             };
             let canonical = CanonicalKey::from_dep_name(&canonical_name);
+            // R3 defense-in-depth — `workspace:<rest>` must be rewritten
+            // upstream by `lpm-workspace` before reaching the resolver.
+            // If a raw `workspace:` slips through (e.g., a future
+            // refactor drops the upstream layer or a manifest is
+            // hand-edited), `NpmRange::parse` would fail with an
+            // opaque semver error. This guard surfaces the actual
+            // diagnosis to the maintainer.
+            if is_workspace_specifier(&effective_range) {
+                return Err(ResolveError::Internal(format!(
+                    "root dep {name}: range '{effective_range}' uses the \
+                     `workspace:` protocol, which must be resolved by \
+                     `lpm-workspace` before reaching the resolver. This is \
+                     an internal bug — please file an issue at \
+                     https://github.com/lpm-dev/rust-client/issues"
+                )));
+            }
             let range = NpmRange::parse(&effective_range).map_err(|e| {
                 ResolveError::Internal(format!("failed to parse range for root dep {name}: {e}"))
             })?;
@@ -1219,6 +1235,7 @@ fn enqueue_child_deps(
     };
     let aliases = info.aliases.get(&ver_str);
     let optional_names = info.optional_dep_names.get(&ver_str);
+    let bundled_names = info.bundled_dep_names.get(&ver_str);
 
     // Sort for deterministic edge ordering — keeps test diffs stable
     // and the resolved tree reproducible across runs.
@@ -1226,10 +1243,46 @@ fn enqueue_child_deps(
     entries.sort_by(|(a, _), (b, _)| a.cmp(b));
 
     for (local_name, range_str) in entries {
+        // R4 — bundled deps are vendored inside the parent's tarball
+        // (`node_modules/<bundled>/` extracted alongside the parent's
+        // own files). Skip enqueueing them as separate edges so the
+        // resolver doesn't fetch a registry copy that the linker
+        // might shadow over the bundled one. The extractor preserves
+        // the in-tarball subtree implicitly; the resolver's job is
+        // just to NOT introduce a redundant registry fetch.
+        if bundled_names.is_some_and(|s| s.contains(local_name)) {
+            tracing::debug!(
+                "skipping bundled dep {} of {}@{} — provided by parent's tarball",
+                local_name,
+                parent_canonical,
+                ver_str,
+            );
+            continue;
+        }
+
         let canonical = match aliases.and_then(|a| a.get(local_name)) {
             Some(target) => CanonicalKey::from_dep_name(target),
             None => CanonicalKey::from_dep_name(local_name),
         };
+
+        // R3 defense-in-depth — registry-published packages should
+        // never declare `workspace:` deps (npm rejects them at publish
+        // time), but a malformed cache entry or a future regression
+        // could land one here. Skip with a specific log line rather
+        // than the generic "invalid range" branch so the diagnosis
+        // points at the actual cause.
+        if is_workspace_specifier(range_str) {
+            tracing::warn!(
+                "ignoring transitive `workspace:` dep '{}' from {}@{} → {} \
+                 (workspace: must be resolved upstream by lpm-workspace; \
+                 a registry-published package should not declare it)",
+                range_str,
+                parent_canonical,
+                ver_str,
+                local_name,
+            );
+            continue;
+        }
 
         let range = match NpmRange::parse(range_str) {
             Ok(r) => r,
@@ -1278,6 +1331,19 @@ enum VersionPick {
     /// Optional deps in this state are silently skipped and counted
     /// in `ResolveResult.platform_skipped`.
     PlatformFiltered,
+}
+
+/// R3 defense-in-depth — detect a leaked `workspace:` specifier
+/// before [`NpmRange::parse`] gets to it. The `workspace:` protocol
+/// is a manifest-level opt-in for "this dep lives in the workspace,
+/// not the registry"; resolution happens upstream in
+/// [`lpm_workspace`] which rewrites such deps before the resolver
+/// runs. If `workspace:<rest>` reaches here, something upstream
+/// failed and the caller deserves a specific error rather than the
+/// opaque semver-parse failure `NpmRange::parse("workspace:*")`
+/// would otherwise produce.
+fn is_workspace_specifier(range_str: &str) -> bool {
+    range_str.trim_start().starts_with("workspace:")
 }
 
 /// Greedy first-match version pick. Iterates `info.versions` (sorted
@@ -1556,6 +1622,8 @@ mod tests {
             deps: deps_map,
             peer_deps: HashMap::new(),
             optional_dep_names: HashMap::new(),
+            optional_peer_names: HashMap::new(),
+            bundled_dep_names: HashMap::new(),
             platform: HashMap::new(),
             dist: versions
                 .iter()
@@ -2058,6 +2126,162 @@ mod tests {
         assert_eq!(hits.len(), 1, "only the path-selector edge records a hit");
         assert_eq!(hits[0].via_parent.as_deref(), Some("react"));
         assert_eq!(hits[0].to_version, "3.10.1");
+    }
+
+    // ── R4 — bundleDependencies skip ─────────────────────────────
+
+    #[test]
+    fn enqueue_child_deps_skips_bundled_names() {
+        // Parent declares `bundleDependencies: ["lodash"]` AND
+        // `dependencies: { lodash: "^4", react: "^18" }`. The
+        // resolver must NOT enqueue `lodash` as a separate edge —
+        // it's vendored inside the parent's tarball — but must still
+        // enqueue `react`.
+        let mut info = mk_info(&["1.0.0"], &[]);
+        let mut deps_of_latest = HashMap::new();
+        deps_of_latest.insert("lodash".to_string(), "^4.0.0".to_string());
+        deps_of_latest.insert("react".to_string(), "^18.0.0".to_string());
+        info.deps.insert("1.0.0".to_string(), deps_of_latest);
+        let mut bundled = HashSet::new();
+        bundled.insert("lodash".to_string());
+        info.bundled_dep_names.insert("1.0.0".to_string(), bundled);
+
+        let mut state = ResolveState::new(HashMap::new(), OverrideSet::empty());
+        state.nodes.push(ResolvedNodeBuilder {
+            canonical: CanonicalKey::npm("parent"),
+            version: NpmVersion::parse("1.0.0").unwrap(),
+            children: Vec::new(),
+        });
+        enqueue_child_deps(
+            0,
+            &CanonicalKey::npm("parent"),
+            &NpmVersion::parse("1.0.0").unwrap(),
+            &info,
+            &mut state,
+        )
+        .unwrap();
+
+        let queued: Vec<&str> = state
+            .task_queue
+            .iter()
+            .map(|e| e.local_name.as_str())
+            .collect();
+        assert_eq!(
+            queued,
+            vec!["react"],
+            "lodash skipped (bundled); react enqueued"
+        );
+    }
+
+    #[test]
+    fn enqueue_child_deps_no_bundled_names_unchanged() {
+        // Sanity baseline: with no bundleDependencies, every dep
+        // gets enqueued (the no-bundling fast path is byte-identical
+        // to pre-R4 behavior).
+        let mut info = mk_info(&["1.0.0"], &[]);
+        let mut deps_of_latest = HashMap::new();
+        deps_of_latest.insert("lodash".to_string(), "^4.0.0".to_string());
+        deps_of_latest.insert("react".to_string(), "^18.0.0".to_string());
+        info.deps.insert("1.0.0".to_string(), deps_of_latest);
+        // No bundled_dep_names entry for 1.0.0.
+
+        let mut state = ResolveState::new(HashMap::new(), OverrideSet::empty());
+        state.nodes.push(ResolvedNodeBuilder {
+            canonical: CanonicalKey::npm("parent"),
+            version: NpmVersion::parse("1.0.0").unwrap(),
+            children: Vec::new(),
+        });
+        enqueue_child_deps(
+            0,
+            &CanonicalKey::npm("parent"),
+            &NpmVersion::parse("1.0.0").unwrap(),
+            &info,
+            &mut state,
+        )
+        .unwrap();
+
+        let mut queued: Vec<&str> = state
+            .task_queue
+            .iter()
+            .map(|e| e.local_name.as_str())
+            .collect();
+        queued.sort();
+        assert_eq!(queued, vec!["lodash", "react"]);
+    }
+
+    // ── R3 — workspace: defense-in-depth at resolver entry ───────
+
+    #[test]
+    fn seed_root_edges_rejects_workspace_specifier() {
+        // A `workspace:*` root dep means lpm-workspace's upstream
+        // rewrite step missed this entry — the resolver must surface
+        // a specific error pointing at the real cause, not propagate
+        // an opaque semver-parse failure from `NpmRange::parse`.
+        let mut deps = HashMap::new();
+        deps.insert("internal-pkg".to_string(), "workspace:*".to_string());
+        let mut state = ResolveState::new(deps, OverrideSet::empty());
+        let err = state.seed_root_edges().unwrap_err();
+        match err {
+            ResolveError::Internal(msg) => {
+                assert!(
+                    msg.contains("workspace:") && msg.contains("lpm-workspace"),
+                    "error must point at the workspace-rewrite layer: {msg}"
+                );
+            }
+            other => panic!("expected Internal error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn enqueue_child_deps_skips_workspace_specifier_with_warn() {
+        // Registry-published packages should not declare `workspace:`
+        // deps. If a malformed cache entry slips one in, the transitive
+        // edge is silently skipped (continue) rather than failing the
+        // whole resolve. Mirrors the existing "invalid range" branch's
+        // skip-with-warn semantic.
+        let mut info = mk_info(&["1.0.0"], &[]);
+        let mut deps_of_latest = HashMap::new();
+        deps_of_latest.insert("workspace-leak".to_string(), "workspace:^1".to_string());
+        deps_of_latest.insert("plain-dep".to_string(), "^2.0.0".to_string());
+        info.deps.insert("1.0.0".to_string(), deps_of_latest);
+
+        let mut state = ResolveState::new(HashMap::new(), OverrideSet::empty());
+        state.nodes.push(ResolvedNodeBuilder {
+            canonical: CanonicalKey::npm("parent"),
+            version: NpmVersion::parse("1.0.0").unwrap(),
+            children: Vec::new(),
+        });
+        enqueue_child_deps(
+            0,
+            &CanonicalKey::npm("parent"),
+            &NpmVersion::parse("1.0.0").unwrap(),
+            &info,
+            &mut state,
+        )
+        .unwrap();
+
+        // Only `plain-dep` should have been enqueued; `workspace-leak`
+        // got skipped at the workspace-specifier guard.
+        let queued: Vec<&str> = state
+            .task_queue
+            .iter()
+            .map(|e| e.local_name.as_str())
+            .collect();
+        assert_eq!(queued, vec!["plain-dep"]);
+    }
+
+    #[test]
+    fn is_workspace_specifier_detects_the_prefix() {
+        assert!(is_workspace_specifier("workspace:*"));
+        assert!(is_workspace_specifier("workspace:^1.0.0"));
+        assert!(is_workspace_specifier("  workspace:~"));
+        assert!(!is_workspace_specifier("^1.0.0"));
+        assert!(!is_workspace_specifier("npm:foo@^1"));
+        assert!(!is_workspace_specifier(""));
+        // The match is on the literal prefix; `workspaces:` (typo)
+        // should NOT trigger so the caller's normal range-parse
+        // failure surfaces the real issue.
+        assert!(!is_workspace_specifier("workspaces:*"));
     }
 
     #[test]

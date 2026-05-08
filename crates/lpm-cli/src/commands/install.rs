@@ -11266,6 +11266,8 @@ mod tests {
                     dependencies: Default::default(),
                     dev_dependencies: Default::default(),
                     peer_dependencies: Default::default(),
+                    peer_dependencies_meta: Default::default(),
+                    bundle_dependencies: Default::default(),
                     optional_dependencies: Default::default(),
                     os: vec![],
                     cpu: vec![],

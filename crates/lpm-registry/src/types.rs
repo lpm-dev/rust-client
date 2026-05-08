@@ -5,6 +5,22 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
+/// Per-peer metadata as declared in a package's
+/// `peerDependenciesMeta` map. The npm spec is open-ended; today
+/// the resolver consumes only the `optional` flag (R5). Unknown
+/// keys round-trip via `serde`'s default `deny_unknown_fields = false`
+/// so a future flag added by the npm spec doesn't break parsing.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct PeerDependencyMeta {
+    /// True when the peer is marked optional. Missing optional peers
+    /// produce no `unmet peer` warning in [`check_unmet_peers`];
+    /// optional peers that ARE present but at the wrong version still
+    /// warn (the user opted into having a peer — just at an
+    /// incompatible version).
+    #[serde(default)]
+    pub optional: bool,
+}
+
 // ─── Package Metadata ──────────────────────────────────────────────
 
 /// Full package metadata returned by GET /api/registry/@lpm.dev/owner.pkg
@@ -58,6 +74,31 @@ pub struct VersionMetadata {
 
     #[serde(default, rename = "peerDependencies")]
     pub peer_dependencies: HashMap<String, String>,
+
+    /// **Phase 66 confidence-followup R5** — `peerDependenciesMeta`
+    /// flags from package.json. The npm spec defines a per-peer
+    /// metadata bag; today only the `optional: true` flag is read
+    /// (other future keys flow through verbatim). Empty when the
+    /// manifest declares no metadata, which is the common case.
+    /// Consumers gate the unmet-peer warning on
+    /// `peer_dependencies_meta[name].optional`.
+    #[serde(default, rename = "peerDependenciesMeta")]
+    pub peer_dependencies_meta: HashMap<String, PeerDependencyMeta>,
+
+    /// **Phase 66 confidence-followup R4** — names this version
+    /// vendors inside its published tarball's `node_modules/` dir.
+    /// npm's spec accepts both `bundleDependencies` and
+    /// `bundledDependencies` spellings (former is canonical, latter
+    /// is npm's historical alias); both deserialize into this field.
+    /// Consumers (resolver) skip enqueuing these names as separate
+    /// installs — they're already provided by the parent's tarball.
+    #[serde(
+        default,
+        rename = "bundleDependencies",
+        alias = "bundledDependencies",
+        deserialize_with = "deserialize_bundle_dependencies"
+    )]
+    pub bundle_dependencies: Vec<String>,
 
     #[serde(default, rename = "optionalDependencies")]
     pub optional_dependencies: HashMap<String, String>,
@@ -893,6 +934,64 @@ pub struct MarketplaceEarningsResponse {
 
     #[serde(default, rename = "netRevenueCents")]
     pub net_revenue_cents: Option<u64>,
+}
+
+/// Deserializer for `bundleDependencies` / `bundledDependencies`.
+///
+/// The npm spec accepts two shapes:
+///   - `["foo", "bar"]` — list of canonical names (the canonical form).
+///   - `true` — historical alias meaning "bundle every entry in
+///     `dependencies`" (rare in practice).
+///
+/// We deserialize the list shape directly. `true` / `false` collapse
+/// to an empty list with a debug log — pre-R4 behavior was "ignore
+/// bundling entirely," so this preserves the no-regression contract
+/// for the rare `bundleDependencies: true` packages while keeping the
+/// common list form first-class.
+fn deserialize_bundle_dependencies<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::{self, Visitor};
+    use std::fmt;
+
+    struct BundleVisitor;
+
+    impl<'de> Visitor<'de> for BundleVisitor {
+        type Value = Vec<String>;
+
+        fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.write_str("a list of dependency names, a boolean, or null")
+        }
+
+        fn visit_unit<E: de::Error>(self) -> Result<Self::Value, E> {
+            Ok(Vec::new())
+        }
+
+        fn visit_bool<E: de::Error>(self, value: bool) -> Result<Self::Value, E> {
+            if value {
+                tracing::debug!(
+                    "bundleDependencies: true — collapsing to empty list \
+                     (whole-deps bundling is rare and not yet implemented; \
+                     pre-R4 behavior preserved)"
+                );
+            }
+            Ok(Vec::new())
+        }
+
+        fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+        where
+            A: de::SeqAccess<'de>,
+        {
+            let mut out = Vec::new();
+            while let Some(s) = seq.next_element::<String>()? {
+                out.push(s);
+            }
+            Ok(out)
+        }
+    }
+
+    deserializer.deserialize_any(BundleVisitor)
 }
 
 #[cfg(test)]

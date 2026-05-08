@@ -1319,13 +1319,20 @@ pub fn check_unmet_peers(
         // version. Phase 49: canonicalize — split-retry variants share
         // a single cache entry under the canonical key.
         let key = CanonicalKey::from(&resolved_pkg.package);
-        let peer_deps = cache
-            .get(&key)
-            .and_then(|info| info.peer_deps.get(&ver_str));
+        let info = cache.get(&key);
+        let peer_deps = info.and_then(|i| i.peer_deps.get(&ver_str));
 
         let Some(peer_deps) = peer_deps else {
             continue;
         };
+
+        // R5 — set of peer names this version marked optional via
+        // `peerDependenciesMeta.optional`. Empty for the common case.
+        // Used below to suppress the missing-peer warning ONLY — an
+        // optional peer that's present but at the wrong version still
+        // warrants a warning (the user opted into having a peer, just
+        // at an incompatible version).
+        let optional_peers = info.and_then(|i| i.optional_peer_names.get(&ver_str));
 
         for (peer_name, peer_range_str) in peer_deps {
             let resolved_peer_ver = resolve_peer_version(
@@ -1379,6 +1386,15 @@ pub fn check_unmet_peers(
                     // tree. peerDependencyRules.ignoreMissing can
                     // suppress the warning entirely.
                     if peer_rules.ignore_missing_matches(peer_name) {
+                        continue;
+                    }
+                    // R5 — `peerDependenciesMeta.optional: true` is
+                    // the manifest author's explicit "this peer is
+                    // optional; no warning if it's missing." pnpm
+                    // and yarn both honor this; npm v7+ honors it.
+                    // Gate ONLY the missing-peer branch — version-
+                    // mismatch above still warrants a warning.
+                    if optional_peers.is_some_and(|set| set.contains(peer_name)) {
                         continue;
                     }
                     warnings.push(PeerWarning {
@@ -1766,6 +1782,8 @@ these are incompatible
                 })
                 .collect(),
             optional_dep_names: HashMap::new(),
+            optional_peer_names: HashMap::new(),
+            bundled_dep_names: HashMap::new(),
             platform: HashMap::new(),
             dist: HashMap::new(),
             aliases: HashMap::new(),
@@ -2700,6 +2718,103 @@ these are incompatible
         assert_eq!(warnings[0].peer, "react");
         assert_eq!(warnings[0].required_range, "^18.0.0");
         assert_eq!(warnings[0].resolved_version.as_deref(), Some("17.0.2"));
+    }
+
+    /// **Phase 66 confidence-followup R5** — `peerDependenciesMeta.optional`
+    /// suppresses the missing-peer warning. Real-world example:
+    /// `react-redux@9` declares optional peer for older React; users
+    /// who don't install those see noisy warnings without this gate.
+    #[test]
+    fn peer_check_optional_peer_missing_no_warning() {
+        let pkg = ResolverPackage::npm("react-redux");
+
+        let resolved = vec![ResolvedPackage {
+            package: pkg.clone(),
+            version: NpmVersion::parse("9.0.0").unwrap(),
+            dependencies: vec![],
+            aliases: HashMap::new(),
+            peers: Vec::new(),
+            tarball_url: None,
+            integrity: None,
+        }];
+
+        let mut cache = HashMap::new();
+        let mut info = (*make_cached_info(
+            &["9.0.0"],
+            vec![],
+            vec![("9.0.0", vec![("react", "^18 || ^19")])],
+        ))
+        .clone();
+        // Mark `react` as optional via peerDependenciesMeta — the
+        // missing-peer warning must be suppressed.
+        let mut opt_peers = HashSet::new();
+        opt_peers.insert("react".to_string());
+        info.optional_peer_names
+            .insert("9.0.0".to_string(), opt_peers);
+        cache.insert(CanonicalKey::from(&pkg), std::sync::Arc::new(info));
+
+        let warnings = check_unmet_peers(&resolved, &cache, &CompiledPeerRules::default());
+        assert!(
+            warnings.is_empty(),
+            "optional missing peer must NOT produce a warning: {warnings:?}"
+        );
+    }
+
+    /// R5 — optional peers that ARE present but at the wrong version
+    /// still produce a warning. Pin: an optional flag is opt-out for
+    /// the missing case only; if the user opted into having the peer,
+    /// the version-mismatch contract still applies.
+    #[test]
+    fn peer_check_optional_peer_wrong_version_still_warns() {
+        let pkg = ResolverPackage::npm("react-redux");
+        let react_pkg = ResolverPackage::npm("react");
+
+        let resolved = vec![
+            ResolvedPackage {
+                package: pkg.clone(),
+                version: NpmVersion::parse("9.0.0").unwrap(),
+                dependencies: vec![],
+                aliases: HashMap::new(),
+                peers: Vec::new(),
+                tarball_url: None,
+                integrity: None,
+            },
+            ResolvedPackage {
+                package: react_pkg.clone(),
+                version: NpmVersion::parse("17.0.2").unwrap(),
+                dependencies: vec![],
+                aliases: HashMap::new(),
+                peers: Vec::new(),
+                tarball_url: None,
+                integrity: None,
+            },
+        ];
+
+        let mut cache = HashMap::new();
+        let mut info = (*make_cached_info(
+            &["9.0.0"],
+            vec![],
+            vec![("9.0.0", vec![("react", "^18 || ^19")])],
+        ))
+        .clone();
+        let mut opt_peers = HashSet::new();
+        opt_peers.insert("react".to_string());
+        info.optional_peer_names
+            .insert("9.0.0".to_string(), opt_peers);
+        cache.insert(CanonicalKey::from(&pkg), std::sync::Arc::new(info));
+        cache.insert(
+            CanonicalKey::from(&react_pkg),
+            make_cached_info(&["17.0.2"], vec![], vec![]),
+        );
+
+        let warnings = check_unmet_peers(&resolved, &cache, &CompiledPeerRules::default());
+        assert_eq!(warnings.len(), 1);
+        assert_eq!(warnings[0].peer, "react");
+        assert_eq!(
+            warnings[0].resolved_version.as_deref(),
+            Some("17.0.2"),
+            "warning is for the version mismatch, not for missing"
+        );
     }
 
     #[test]
