@@ -111,6 +111,27 @@ where
 {
     let decoder = GzDecoder::new(reader);
     let mut archive = Archive::new(decoder);
+    // **Phase 66 perf followup #1 (samply-driven, 2026-05-08; extended 2026-05-09
+    // post-flamegraph).** npm tarballs ship arbitrary uid/gid/mode/mtime that
+    // mean nothing to a downstream Node consumer. The tar crate's defaults call
+    // `fchmodat` + `fchownat` + `filetime::set_file_handle_times` per regular
+    // file. Disabling all three:
+    // - `preserve_permissions(false)` — drops ownership-aware chmod policy.
+    // - `preserve_ownerships(false)` — drops `fchownat`.
+    // - `preserve_mtime(false)` — drops `set_file_handle_times` →
+    //   `fsetattrlist` on macOS. Pre-fix flamegraph attributed 2.0 % of active
+    //   CPU (`fsetattrlist` 100 % from `extract_tarball`) directly to mtime
+    //   preservation. mtime is meaningless for content-addressable store
+    //   bytes — `require()` doesn't read it; `lpm doctor` doesn't use it.
+    // Note: even with `preserve_permissions=false`, tar 0.4.45's `_set_perms`
+    // still unconditionally calls `set_permissions` (the flag only controls
+    // SUID-bit retention). Eliminating the residual ~1.7 % `__fchmod` cost
+    // requires bypassing `entry.unpack()` for non-buffered entries — see the
+    // `write_buffered_entry` analogue used for source files below; tracked as
+    // a follow-up.
+    archive.set_preserve_permissions(false);
+    archive.set_preserve_ownerships(false);
+    archive.set_preserve_mtime(false);
     let mut extracted_files = Vec::new();
     let mut created_dirs = Vec::new();
     let mut total_size: u64 = 0;
@@ -118,6 +139,23 @@ where
 
     std::fs::create_dir_all(target_dir)?;
     let extraction_root = target_dir.canonicalize().map_err(LpmError::Io)?;
+    // **Phase 66 perf followup #3 (samply-driven, 2026-05-08).**
+    // Memoize parent dirs we've already verified-or-created so the
+    // per-file `prepare_output_path` walk doesn't re-`symlink_metadata`
+    // every component on every entry. For an npm tarball with ~80
+    // entries averaging 4 path components, the pre-fix walk did
+    // ~320 `symlink_metadata` syscalls; with the cache, ~84 (each
+    // unique dir prefix once). Per fixture-large's samply hot-path
+    // self-time of ~4.4 % in `prepare_output_path`, expected savings
+    // ~30-50 ms cold-install wall.
+    //
+    // Capacity heuristic: number of components in the deepest
+    // expected path × ~10 (most npm tarballs have ≤ 10 distinct
+    // intermediate dirs). 64 covers the long tail without
+    // over-allocating.
+    let mut verified_parents: std::collections::HashSet<PathBuf> =
+        std::collections::HashSet::with_capacity(64);
+    verified_parents.insert(extraction_root.clone());
 
     for entry_result in archive.entries()? {
         let mut entry = match entry_result {
@@ -215,21 +253,25 @@ where
             );
         }
 
-        let target_path =
-            match prepare_output_path(&extraction_root, &relative_path, &original_path) {
-                Ok((path, mut entry_created_dirs)) => {
-                    created_dirs.append(&mut entry_created_dirs);
-                    path
-                }
-                Err(error) => {
-                    return rollback_extraction(
-                        &extraction_root,
-                        &extracted_files,
-                        &created_dirs,
-                        error,
-                    );
-                }
-            };
+        let target_path = match prepare_output_path(
+            &extraction_root,
+            &relative_path,
+            &original_path,
+            &mut verified_parents,
+        ) {
+            Ok((path, mut entry_created_dirs)) => {
+                created_dirs.append(&mut entry_created_dirs);
+                path
+            }
+            Err(error) => {
+                return rollback_extraction(
+                    &extraction_root,
+                    &extracted_files,
+                    &created_dirs,
+                    error,
+                );
+            }
+        };
 
         // Safety: prevent path traversal
         if !target_path.starts_with(&extraction_root) {
@@ -272,12 +314,25 @@ where
                 }
                 Some(buf)
             } else {
-                if let Err(error) = entry.unpack(&target_path) {
+                // **Phase 66 perf followup #4 (post-flamegraph, 2026-05-09).**
+                // Stream directly to disk via `io::copy` instead of
+                // `entry.unpack()`. Even with `set_preserve_permissions(false)`
+                // / `set_preserve_ownerships(false)` / `set_preserve_mtime(false)`
+                // the tar 0.4.45 unpack path unconditionally calls
+                // `_set_perms` (entry.rs:814) — the flag only controls SUID-bit
+                // retention. Bypassing it here drops the residual `__fchmod`
+                // that the flamegraph attributed at 1.7 % of active CPU
+                // (100 % of `__fchmod` samples → `extract_tarball`).
+                //
+                // Same minimal write semantics as [`write_buffered_entry`]:
+                // create-or-truncate, default mode (`umask`-respecting), no
+                // post-write metadata calls.
+                if let Err(error) = stream_entry_to_disk(&mut entry, &target_path) {
                     return rollback_extraction(
                         &extraction_root,
                         &extracted_files,
                         &created_dirs,
-                        LpmError::Io(error),
+                        error,
                     );
                 }
                 None
@@ -305,6 +360,19 @@ fn write_buffered_entry(target_path: &Path, bytes: &[u8]) -> Result<(), LpmError
     use std::io::Write;
     let mut file = std::fs::File::create(target_path).map_err(LpmError::Io)?;
     file.write_all(bytes).map_err(LpmError::Io)?;
+    Ok(())
+}
+
+/// Stream a tar entry's bytes directly to disk via `io::copy`, skipping
+/// the chmod/chown/utimes epilogue `tar::Entry::unpack` always emits.
+/// Used by the non-buffered branch of the extractor — see Phase 66
+/// post-flamegraph followup #4.
+fn stream_entry_to_disk<R: std::io::Read>(
+    entry: &mut tar::Entry<'_, R>,
+    target_path: &Path,
+) -> Result<(), LpmError> {
+    let mut file = std::fs::File::create(target_path).map_err(LpmError::Io)?;
+    std::io::copy(entry, &mut file).map_err(LpmError::Io)?;
     Ok(())
 }
 
@@ -338,6 +406,7 @@ fn prepare_output_path(
     target_dir: &Path,
     relative_path: &Path,
     original_path: &Path,
+    verified_parents: &mut std::collections::HashSet<PathBuf>,
 ) -> Result<(PathBuf, Vec<PathBuf>), LpmError> {
     let mut current = target_dir.to_path_buf();
     let mut created_dirs = Vec::new();
@@ -346,6 +415,18 @@ fn prepare_output_path(
     while let Some(component) = components.next() {
         current.push(component.as_os_str());
         let is_last = components.peek().is_none();
+
+        // **Phase 66 perf followup #3.** Skip the `symlink_metadata`
+        // syscall when we've already verified or created this exact
+        // intermediate dir on a prior entry in this extraction. Only
+        // applies to NON-leaf components (the leaf is the per-entry
+        // file path which we still need to stat for the symlink-
+        // attack guard below). The HashSet only carries verified
+        // PARENT directories; a leaf hit can never live here so no
+        // safety regression.
+        if !is_last && verified_parents.contains(&current) {
+            continue;
+        }
 
         match std::fs::symlink_metadata(&current) {
             Ok(metadata) => {
@@ -362,11 +443,15 @@ fn prepare_output_path(
                         original_path.display()
                     )));
                 }
+                if !is_last {
+                    verified_parents.insert(current.clone());
+                }
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 if !is_last {
                     std::fs::create_dir(&current).map_err(LpmError::Io)?;
                     created_dirs.push(current.clone());
+                    verified_parents.insert(current.clone());
                 }
             }
             Err(error) => return Err(LpmError::Io(error)),

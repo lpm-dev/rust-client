@@ -22,6 +22,7 @@ chrono = { workspace = true }
 rcgen = { version = "0.13", features = ["pem"] }
 reqwest = { workspace = true }
 lpm-common = { path = "../../crates/lpm-common" }
+lpm-linker = { path = "../../crates/lpm-linker" }
 lpm-runner = { path = "../../crates/lpm-runner" }
 lpm-vault = { path = "../../crates/lpm-vault" }
 lpm-lockfile = { path = "../../crates/lpm-lockfile" }

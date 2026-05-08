@@ -992,6 +992,35 @@ fn live_package_dir(
     wrapper_id: Option<&str>,
     store_path: &Path,
 ) -> std::path::PathBuf {
+    // Phase 66 §4 — production v2 store handle resolves once per
+    // call from the active `~/.lpm/`. Tests use the
+    // [`live_package_dir_with_v2`] seam directly with a synthetic
+    // store rooted in a tempdir, so the env-coupled wrapper here
+    // stays simple.
+    let v2_store = lpm_common::LpmRoot::from_env()
+        .ok()
+        .map(|root| lpm_store::v2::Store::from_lpm_root(&root));
+    live_package_dir_with_v2(
+        project_dir,
+        name,
+        version,
+        wrapper_id,
+        store_path,
+        v2_store.as_ref(),
+    )
+}
+
+/// Test-friendly variant of [`live_package_dir`] that takes the v2
+/// store handle explicitly instead of resolving it from the
+/// environment. Production callers use the env-coupled wrapper.
+fn live_package_dir_with_v2(
+    project_dir: &Path,
+    name: &str,
+    version: &str,
+    wrapper_id: Option<&str>,
+    store_path: &Path,
+    v2_store: Option<&lpm_store::v2::Store>,
+) -> std::path::PathBuf {
     let layout = lpm_linker::LayoutPaths::for_project(project_dir);
     let nm = project_dir.join("node_modules");
 
@@ -1021,9 +1050,32 @@ fn live_package_dir(
     // Hoisted layout: node_modules/<name>/. Doesn't disambiguate
     // version conflicts (a different version nested under a parent
     // would not be found by this probe), but covers the common case.
+    //
+    // **Phase 66 §4 — virtual-store-aware via symlink-follow.** Under
+    // v2 mode the project's `node_modules/<name>` is a symlink into
+    // `~/.lpm/store/v2/links/<key>/node_modules/<name>/`. `is_dir()`
+    // follows the symlink, so this branch returns the (symlink) path
+    // for direct-dep v2 installs — Node resolves through the symlink
+    // at script time. No code change needed for direct deps under v2.
     let hoisted = nm.join(name);
     if hoisted.is_dir() {
         return hoisted;
+    }
+
+    // Phase 66 §4 — v2 store walk for transitive lifecycle scripts.
+    // Direct deps under v2 are covered by the previous branch via the
+    // project-side symlink; transitives have no project-root symlink,
+    // so without a store walk they'd fall through to the pathological
+    // store_path fallback (which under v2 isn't even meaningful — v2
+    // doesn't populate v1's `~/.lpm/store/v1/<pkg>/<version>/`).
+    //
+    // The walk reads `links/<*>/.lpm-link-meta.json` sidecars and
+    // returns the first matching `(name, version)`. Cheap on
+    // realistic store sizes (10k entries ≈ 1 ms on APFS).
+    if let Some(store) = v2_store
+        && let Ok(Some(v2_pkg)) = store.find_link_package_dir(name, version)
+    {
+        return v2_pkg;
     }
 
     // Pathological fallback: package isn't linked. Lifecycle scripts
@@ -2213,14 +2265,114 @@ mod tests {
         // the pre-Phase-57 behavior (store_path) so failures match what
         // users were already seeing rather than introducing a new "no
         // working directory" error class.
+        //
+        // Phase 66 §4 — use `live_package_dir_with_v2(None)` so the v2
+        // store walk is fully disabled. The env-coupled
+        // `live_package_dir` would otherwise probe the developer's
+        // real `~/.lpm/store/v2/links/` and find a stale entry from
+        // an earlier install (e.g. `esbuild@0.21.5` from a prior
+        // bench run) — flaky test isolation.
         let project = tempfile::tempdir().unwrap();
-        // Project has node_modules/ but neither .lpm/.../node_modules/<pkg>/
-        // nor a hoisted node_modules/<pkg>/.
         std::fs::create_dir_all(project.path().join("node_modules")).unwrap();
         let store_fallback = std::path::PathBuf::from("/store/some/where");
 
-        let resolved = live_package_dir(project.path(), "esbuild", "0.21.5", None, &store_fallback);
+        let resolved = live_package_dir_with_v2(
+            project.path(),
+            "esbuild",
+            "0.21.5",
+            None,
+            &store_fallback,
+            None,
+        );
         assert_eq!(resolved, store_fallback);
+    }
+
+    /// Phase 66 §4 — direct deps under v2: project's `node_modules/<name>`
+    /// is a symlink into `~/.lpm/store/v2/links/<key>/.../<name>/`.
+    /// The hoisted-probe branch's `is_dir()` follows the symlink and
+    /// returns the project-side path, which Node resolves through at
+    /// script time.
+    #[test]
+    #[cfg(unix)]
+    fn live_package_dir_resolves_v2_direct_dep_via_project_symlink() {
+        let project = tempfile::tempdir().unwrap();
+        let nm = project.path().join("node_modules");
+        std::fs::create_dir_all(&nm).unwrap();
+
+        // Synthesize a v2-shaped link entry and a project-side symlink
+        // pointing at it. The detection doesn't care about the exact
+        // store layout — only that `nm.join(name)` is `is_dir()`.
+        let link_entry = project
+            .path()
+            .join("fake-store/v2/links/express@4.21.0+abc/node_modules/express");
+        std::fs::create_dir_all(&link_entry).unwrap();
+        std::os::unix::fs::symlink(&link_entry, nm.join("express")).unwrap();
+        let store_fallback = std::path::PathBuf::from("/store/should-not-be-used");
+
+        let resolved = live_package_dir(project.path(), "express", "4.21.0", None, &store_fallback);
+        // Returns the project-side symlink path; Node follows it at
+        // script time.
+        assert_eq!(resolved, nm.join("express"));
+    }
+
+    /// Phase 66 §4 — transitive deps under v2: no project-side symlink
+    /// exists, so `live_package_dir_with_v2` walks the v2 store via
+    /// `find_link_package_dir` and returns the canonical link-entry
+    /// package dir.
+    #[test]
+    fn live_package_dir_resolves_v2_transitive_via_store_walk() {
+        use lpm_store::v2::{LinkEntryRequest, Store as V2Store};
+
+        let project = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(project.path().join("node_modules")).unwrap();
+
+        let store_dir = tempfile::tempdir().unwrap();
+        let v2_store = V2Store::at(store_dir.path());
+
+        // Materialize one link entry for a "transitive-only" package
+        // (no project-side symlink).
+        let sri = lpm_store::compute_sri_hash(b"live_package_dir_v2_transitive");
+        let object_dir = v2_store.paths().object_dir(&sri).unwrap();
+        std::fs::create_dir_all(&object_dir).unwrap();
+        std::fs::write(
+            object_dir.join("package.json"),
+            b"{\"name\":\"deeply-nested\",\"version\":\"1.0.0\"}",
+        )
+        .unwrap();
+        std::fs::write(object_dir.join(".integrity"), &sri).unwrap();
+
+        let inputs = lpm_store::v2::GraphKeyInputs::new(
+            "deeply-nested",
+            "1.0.0",
+            lpm_store::v2::PlatformTuple::current(),
+            lpm_store::v2::LinkerModeTag::Isolated,
+        );
+        let key = lpm_store::v2::GraphKey::derive(&inputs);
+        let entry = v2_store
+            .populate_link_entry(LinkEntryRequest {
+                graph_key: key.clone(),
+                source_sri: sri,
+                object_dir,
+                deps: vec![],
+                platform: lpm_store::v2::LinkMetaPlatform {
+                    os: "darwin".into(),
+                    cpu: "arm64".into(),
+                    libc: None,
+                },
+            })
+            .unwrap();
+        let expected = entry.link_dir.join("node_modules").join("deeply-nested");
+
+        let store_fallback = std::path::PathBuf::from("/store/should-not-be-used");
+        let resolved = live_package_dir_with_v2(
+            project.path(),
+            "deeply-nested",
+            "1.0.0",
+            None,
+            &store_fallback,
+            Some(&v2_store),
+        );
+        assert_eq!(resolved, expected);
     }
 
     #[test]

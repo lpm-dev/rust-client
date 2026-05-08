@@ -130,7 +130,7 @@ jobs:
         run: cargo nextest run --workspace --exclude lpm-integration-tests --no-fail-fast
 
   audit-fixtures:
-    name: Hoisted-mode compat audit
+    name: Hoisted-mode compat audit (${{ matrix.store_version }})
     runs-on: ubuntu-latest
     timeout-minutes: 30
     # Run the audit fixtures on every push to main + every PR. The
@@ -139,6 +139,20 @@ jobs:
     # package shape. Equal-outcome failures across modes (e.g. an
     # ecosystem-side ESLint 9 incompat) don't gate the build — only
     # asymmetric outcomes do.
+    #
+    # Phase 66 Phase 4d: matrix runs the suite under both the new
+    # default (v2 — virtual store) AND the explicit-downgrade v1
+    # path (`LPM_STORE_VERSION=v1`). Both must produce the same
+    # per-fixture outcomes:
+    # - v2 row gates the active production install pipeline.
+    # - v1 row gates the downgrade-rollback path that ships post-4d
+    #   for users hitting a v2 regression.
+    # Pre-Phase-4d this matrix was inverted (v1 default + v2 opt-in)
+    # while v2 was a dev-only flag.
+    strategy:
+      fail-fast: false
+      matrix:
+        store_version: ["v2", "v1"]
     steps:
       - uses: actions/checkout@v5
 
@@ -178,6 +192,12 @@ jobs:
           # auto-install layer adds non-fixture work that varies with
           # the registry's response time.
           LPM_NO_SKILLS: "1"
+          # Phase 66 Phase 4d: v2 is the new default, so the v2 row
+          # leaves the var unset and exercises the natural production
+          # path. The v1 row sets `LPM_STORE_VERSION=v1` to verify
+          # the explicit downgrade-rollback still produces correct
+          # installs.
+          LPM_STORE_VERSION: ${{ matrix.store_version == 'v1' && 'v1' || '' }}
 
       # Always upload result JSONs — useful for triaging mode-asymmetric
       # outcomes in CI without re-running locally.
@@ -185,7 +205,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: audit-fixtures-results
+          name: audit-fixtures-results-${{ matrix.store_version }}
           path: bench/audit-fixtures/results/
           retention-days: 14
 

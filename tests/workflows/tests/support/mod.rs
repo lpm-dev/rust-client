@@ -197,6 +197,21 @@ pub fn lpm(project: &TempProject) -> assert_cmd::Command {
     cmd.env_remove("LPM_LINKER");
     cmd.env_remove("LPM_CONCURRENT_DOWNLOADS");
 
+    // Phase 66 Phase 4d — workflow tests assert on v1 layout shape
+    // (e.g., `<project>/.lpm/wrappers/<seg>/`, hoisted-flat
+    // `node_modules/<dep>` real dirs, hardlink-detach behavior). The
+    // Phase-4d default flip to v2 changes these to symlinks-into-the-
+    // global-store, which would break shape assertions wholesale.
+    //
+    // Pin every workflow test to v1 explicitly. v2's regression
+    // coverage lives in the audit-fixture CI matrix (see
+    // `bench/audit-fixtures/run-all.sh` + `.github/workflows/ci.yml`),
+    // which runs the same 18-fixture suite under both `LPM_STORE_VERSION`
+    // values and gates on no-asymmetric-outcomes. Tests that
+    // intentionally exercise the v2 shape re-set this on their own
+    // command builder.
+    cmd.env("LPM_STORE_VERSION", "v1");
+
     // Disable color for deterministic output in assertions
     cmd.env("NO_COLOR", "1");
 

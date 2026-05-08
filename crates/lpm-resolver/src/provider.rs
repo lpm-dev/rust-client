@@ -2045,10 +2045,7 @@ mod tests {
     /// rule from inside the resolver, not just the lpm-semver crate.
     #[test]
     fn parse_metadata_non_prerelease_range_skips_prereleases() {
-        let meta = metadata_with_versions(
-            "ambient",
-            &[("2.0.0-beta.1", &[]), ("1.5.0", &[])],
-        );
+        let meta = metadata_with_versions("ambient", &[("2.0.0-beta.1", &[]), ("1.5.0", &[])]);
         let info = parse_metadata_to_cache_info(&meta);
         let range = NpmRange::parse("^1.0.0").expect("valid range");
         let chosen = info.versions.iter().find(|v| range.satisfies(v));

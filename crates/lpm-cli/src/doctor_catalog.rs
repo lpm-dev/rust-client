@@ -300,6 +300,28 @@ pub static NODE_MODULES_HOISTED_HEALTHY: CheckEntry = CheckEntry {
     auto_fix: None,
 };
 
+pub static NODE_MODULES_VIRTUAL_HEALTHY: CheckEntry = CheckEntry {
+    code: "node_modules_virtual_healthy",
+    name: "node_modules",
+    category: Category::ProjectState,
+    description: "`node_modules/` symlinks point into the virtual store at `~/.lpm/store/v2/links/`.",
+    when_fires: "User opted into `LPM_STORE_VERSION=v2` (Phase 66 dev-only flag) and the virtual-store layout is intact.",
+    remediation: "No action — informational pass.",
+    possible_severities: &[Severity::Pass],
+    auto_fix: None,
+};
+
+pub static V2_STORE_ORPHANS: CheckEntry = CheckEntry {
+    code: "v2_store_orphans",
+    name: "v2 virtual store",
+    category: Category::ProjectState,
+    description: "v2 store at `~/.lpm/store/v2/` has link entries or objects no longer reachable from any registered project.",
+    when_fires: "After projects are deleted or move on disk; the v2 store grows monotonically across all projects on the machine until pruned.",
+    remediation: "Run `lpm cache prune` for a dry-run preview, then `lpm cache prune --apply` to remove orphans.",
+    possible_severities: &[Severity::Pass, Severity::Warn],
+    auto_fix: Some("lpm cache prune --apply"),
+};
+
 pub static NODE_MODULES_MIXED_LAYOUT: CheckEntry = CheckEntry {
     code: "node_modules_mixed_layout",
     name: "node_modules",
@@ -1329,10 +1351,12 @@ pub static CLI_CATALOG: &[&CheckEntry] = &[
     &PACKAGE_JSON_MISSING,
     &NODE_MODULES_ISOLATED_HEALTHY,
     &NODE_MODULES_HOISTED_HEALTHY,
+    &NODE_MODULES_VIRTUAL_HEALTHY,
     &NODE_MODULES_MIXED_LAYOUT,
     &NODE_MODULES_NO_STORE,
     &NODE_MODULES_LEGACY_LAYOUT,
     &NODE_MODULES_MISSING,
+    &V2_STORE_ORPHANS,
     &LOCKFILE_PRESENT,
     &LOCKFILE_MISSING,
     &LOCKFILE_BINARY_VALID,
