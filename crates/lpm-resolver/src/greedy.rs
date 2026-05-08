@@ -303,6 +303,77 @@ pub async fn resolve_greedy_fused(
     // canonicals they're fetching.
     let shared_cache: SharedCache = Arc::new(dashmap::DashMap::new());
     let metadata_sem = Arc::new(tokio::sync::Semaphore::new(npm_fanout));
+
+    // Counters. Declared here so the lpm.dev pre-batch below can
+    // increment them before the main loop starts.
+    let mut dispatcher_rpc_count: u64 = 0;
+    let mut tarball_dispatched_count: u64 = 0;
+
+    // Pre-batch the root-level `@lpm.dev/*` deps in one round trip
+    // before the main fetch loop. Without this, each such dep would
+    // fire its own [`fetch_metadata_raw`] call inside the dispatcher
+    // (~one RPC per package). The walker arm in `walker.rs` already
+    // batches lpm.dev names; this pre-pass brings the fused arm to
+    // parity.
+    //
+    // Why pre-resolve, not inside the loop:
+    //   - The `shared_cache` fast-path at the top of Phase A short-
+    //     circuits any edge whose canonical is already cached, so
+    //     populating it BEFORE [`seed_root_edges`]'s edges drain
+    //     turns N lpm.dev RPCs into 1.
+    //   - `batch_metadata_deep` walks transitive lpm.dev deps server-
+    //     side, so an install with several lpm.dev packages and
+    //     transitive lpm.dev deps gets the whole sub-tree pre-warmed
+    //     in one round trip.
+    //
+    // Failure-mode contract:
+    //   - On batch error (auth/network/server fault), fall through
+    //     silently — each lpm.dev root dep will be fetched
+    //     individually by the main loop. Slower but correct.
+    //   - On per-name parse failure (server returned something we
+    //     can't interpret as a CanonicalKey), skip that entry and
+    //     let the main loop refetch it.
+    let lpm_root_names: Vec<String> = state
+        .root_deps
+        .keys()
+        .filter(|k| k.starts_with("@lpm.dev/"))
+        .cloned()
+        .collect();
+    if !lpm_root_names.is_empty() {
+        match client.batch_metadata_deep(&lpm_root_names).await {
+            Ok(batch) => {
+                // One actual HTTP round trip regardless of
+                // batch.len(). The dispatcher_rpc_count metric tracks
+                // RPCs (not packages); record exactly 1 for the batch
+                // — keeps the metric semantics stable across arms.
+                dispatcher_rpc_count += 1;
+                for (name, meta) in batch {
+                    let canonical = crate::package::CanonicalKey::from_dep_name(&name);
+                    // `from_dep_name` returns `Npm` for any name that
+                    // doesn't match the `@lpm.dev/owner.name` shape.
+                    // We trust the server here, but defend against a
+                    // mis-shaped key landing in the lpm.dev cache.
+                    if !matches!(canonical, crate::package::CanonicalKey::Lpm { .. }) {
+                        continue;
+                    }
+                    let info_arc = Arc::new(parse_metadata_to_cache_info(&meta));
+                    shared_cache.insert(canonical.clone(), info_arc);
+                    if let Some(tx) = spec_tx.as_ref()
+                        && tx.try_send((canonical.to_string(), meta)).is_ok()
+                    {
+                        tarball_dispatched_count += 1;
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::debug!(
+                    "greedy-fusion: lpm.dev pre-batch failed ({} names): {e} \
+                     — falling back to per-package dispatch",
+                    lpm_root_names.len()
+                );
+            }
+        }
+    }
     // **Phase 66 perf followup #4 (samply-driven, 2026-05-08).**
     // Pre-size both maps to the expected steady-state cardinality.
     // For `bench/fixture-large` (266 transitive packages) the default-
@@ -322,10 +393,11 @@ pub async fn resolve_greedy_fused(
     // Counters. High-water marks update at the boundary of each Phase
     // A→B transition so the post-loop value reflects the peak across
     // the run, not just the final tick.
-    let mut dispatcher_rpc_count: u64 = 0;
+    // `dispatcher_rpc_count` and `tarball_dispatched_count` are
+    // declared above the lpm.dev pre-batch so it can pre-increment
+    // them.
     let mut inflight_high_water: u64 = 0;
     let mut parked_max_depth: u32 = 0;
-    let mut tarball_dispatched_count: u64 = 0;
 
     loop {
         // ── Phase A — drain `task_queue` synchronously ────────────
@@ -1187,6 +1259,32 @@ mod tests {
     use super::*;
     use crate::provider::{CachedDistInfo, CachedPackageInfo};
 
+    /// Build a minimal npm-packument JSON shape for wiremock-based
+    /// resolver tests. Mirrors `walker::tests::metadata_json` so the
+    /// fixture shape stays identical across resolver-arm tests.
+    fn metadata_json(name: &str, deps: &[(&str, &str)]) -> serde_json::Value {
+        let deps_obj: serde_json::Map<String, serde_json::Value> = deps
+            .iter()
+            .map(|(n, r)| (n.to_string(), serde_json::Value::String(r.to_string())))
+            .collect();
+        serde_json::json!({
+            "name": name,
+            "dist-tags": { "latest": "1.0.0" },
+            "versions": {
+                "1.0.0": {
+                    "name": name,
+                    "version": "1.0.0",
+                    "dist": {
+                        "tarball": "https://example.com/pkg.tgz",
+                        "integrity": "sha512-test"
+                    },
+                    "dependencies": deps_obj
+                }
+            },
+            "time": { "1.0.0": "2025-01-01T00:00:00.000Z" }
+        })
+    }
+
     /// Build a minimal CachedPackageInfo for a synthesized npm package.
     /// `versions` are passed already in descending order to mirror
     /// `parse_metadata_to_cache_info`'s contract.
@@ -1603,6 +1701,157 @@ mod tests {
         )
         .await;
         assert!(result.is_ok());
+    }
+
+    /// **Phase 66 followup #B** — root-level `@lpm.dev/*` deps are
+    /// pre-batched in one round trip before the main fetch loop. This
+    /// test asserts:
+    ///   1. The pre-batch HTTP call hits exactly once for any number
+    ///      of root lpm.dev names (not once per name).
+    ///   2. Pre-batched results land in `shared_cache` so the main
+    ///      loop's cache-hit fast path picks them up — no per-package
+    ///      `fetch_metadata_raw` RPCs fire.
+    ///   3. `dispatcher_rpc_count` reflects the batch as a single RPC.
+    #[tokio::test(flavor = "current_thread")]
+    async fn fusion_pre_batches_lpm_dev_root_deps() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        // Two root-level lpm.dev packages. The pre-batch must hit
+        // POST /api/registry/batch-metadata exactly once and bundle
+        // both names; subsequent main-loop `fetch_metadata_raw` calls
+        // for these MUST NOT fire (cache pre-populated).
+        let lpm_a_meta = metadata_json("@lpm.dev/owner.foo", &[]);
+        let lpm_b_meta = metadata_json("@lpm.dev/owner.bar", &[]);
+        Mock::given(method("POST"))
+            .and(path("/api/registry/batch-metadata"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .append_header("content-type", "application/json")
+                    .set_body_json(serde_json::json!({
+                        "packages": {
+                            "@lpm.dev/owner.foo": lpm_a_meta,
+                            "@lpm.dev/owner.bar": lpm_b_meta,
+                        }
+                    })),
+            )
+            // `expect(1)` is the load-bearing assertion — if pre-batch
+            // were skipped and the main loop fell back to per-package
+            // dispatch, this mock would either receive >1 hits (one
+            // per package) or zero (the per-package endpoint is
+            // GET /api/registry/<name>, not POST) and the test would
+            // fail. Either failure mode catches a regression.
+            .expect(1)
+            .mount(&server)
+            .await;
+        // Per-package GET endpoints are NOT mounted. If the pre-batch
+        // succeeded, the main loop hits the cache and never calls
+        // GET. If pre-batch fails or is skipped, the main loop tries
+        // GET /api/registry/@lpm.dev/owner.foo and wiremock returns
+        // 404 — we assert the resolver succeeds, so 404s here would
+        // surface as a hard-fail.
+
+        let client = Arc::new(
+            RegistryClient::new()
+                .with_base_url(server.uri())
+                .with_cache_dir(None),
+        );
+
+        let mut deps = HashMap::new();
+        deps.insert("@lpm.dev/owner.foo".into(), "^1.0.0".into());
+        deps.insert("@lpm.dev/owner.bar".into(), "^1.0.0".into());
+
+        let result = resolve_greedy_fused(
+            client,
+            deps,
+            OverrideSet::empty(),
+            RouteTable::from_mode_only(RouteMode::Proxy),
+            8,
+            None,
+        )
+        .await
+        .expect("pre-batched lpm.dev resolve should succeed");
+
+        // Both lpm.dev packages resolved.
+        assert_eq!(result.packages.len(), 2);
+        let names: std::collections::HashSet<_> = result
+            .packages
+            .iter()
+            .map(|p| p.package.canonical_name())
+            .collect();
+        assert!(names.contains("@lpm.dev/owner.foo"));
+        assert!(names.contains("@lpm.dev/owner.bar"));
+
+        // Exactly 1 dispatcher RPC counted — the batch. No per-package
+        // RPCs fired (those would each tick the counter).
+        assert_eq!(
+            result.stage_timing.dispatcher_rpc_count, 1,
+            "batch counts as 1 RPC; per-package dispatch would tick once per name (would be 2)"
+        );
+    }
+
+    /// Pre-batch fallback: when the batch endpoint errors, the main
+    /// loop must still resolve via per-package `fetch_metadata_raw`.
+    /// This test pins the failure-mode contract: batch error →
+    /// graceful fall-through, no hang, no propagated error.
+    #[tokio::test(flavor = "current_thread")]
+    async fn fusion_falls_through_on_lpm_dev_batch_failure() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        // Batch endpoint returns 500 — pre-batch must log and
+        // fall through.
+        Mock::given(method("POST"))
+            .and(path("/api/registry/batch-metadata"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&server)
+            .await;
+        // Per-package GET endpoint serves the lpm.dev metadata as a
+        // fallback. Path matches the GET /api/registry/<scoped> shape
+        // `get_package_metadata` calls.
+        let lpm_meta = metadata_json("@lpm.dev/owner.foo", &[]);
+        Mock::given(method("GET"))
+            .and(path("/api/registry/@lpm.dev/owner.foo"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .append_header("content-type", "application/json")
+                    .set_body_json(lpm_meta),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = Arc::new(
+            RegistryClient::new()
+                .with_base_url(server.uri())
+                .with_cache_dir(None),
+        );
+
+        let mut deps = HashMap::new();
+        deps.insert("@lpm.dev/owner.foo".into(), "^1.0.0".into());
+
+        let result = resolve_greedy_fused(
+            client,
+            deps,
+            OverrideSet::empty(),
+            RouteTable::from_mode_only(RouteMode::Proxy),
+            8,
+            None,
+        )
+        .await
+        .expect(
+            "batch failure must fall through to per-package dispatch — \
+             resolve still succeeds",
+        );
+
+        assert_eq!(result.packages.len(), 1);
+        // 1 dispatcher RPC — the per-package fallback. The failed
+        // batch attempt does NOT increment dispatcher_rpc_count
+        // (we only count successful batches; failures are
+        // observability noise, not real RPCs that resolved data).
+        assert_eq!(result.stage_timing.dispatcher_rpc_count, 1);
     }
 
     /// Required dep with a client that fails: the resolver must
