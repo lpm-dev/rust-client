@@ -4606,9 +4606,131 @@ async fn run_with_options_under_store_lock(
         >,
     > = Vec::new();
 
+    // Phase 66 followup #6b — event-driven v2 link dispatch.
+    //
+    // Predicate: the v2 plan can be precomputed BEFORE fetch iff every
+    // CAS-backed target arrives with both
+    //   (a) a known SRI (`p.integrity = Some(_)`), and
+    //   (b) resolver-threaded peers (`LinkTarget.peers` populated, or
+    //       the package declares no peer dependencies).
+    // Otherwise `link_v2_prepare` would silently produce an
+    // empty-peer-context graph key for any target whose peers are
+    // discovered post-fetch by reading `objects/<sri>/package.json`,
+    // diverging from the serial path. On predicate failure we fall
+    // through to today's serial v2 link at the link stage.
+    //
+    // Local-source targets (`Materialization::DirectorySource`) stay
+    // outside the v2 store and continue through the existing tail
+    // loop after `link_v2_finalize`; they are filtered out before the
+    // gate is checked.
+    //
+    // Mode independence: `link_v2_prepare` / `link_v2_one` /
+    // `link_v2_finalize` are linker-mode-agnostic for per-package
+    // work. `linker_mode` feeds into `LinkerModeTag` which is folded
+    // into graph-key derivation (Isolated vs Hoisted both produce
+    // valid keys), and `link_v2_finalize` handles project-side
+    // wiring identically across modes. So the gate does NOT require
+    // Isolated — the post-Phase-66-4f Hoisted default is fully
+    // supported.
+    let v2_cas_targets_pre: Vec<lpm_linker::v2::V2Target> = if v2_mode && !serial_link {
+        let mut acc: Vec<lpm_linker::v2::V2Target> = Vec::with_capacity(link_targets.len());
+        let mut all_have_sri = true;
+        for (lt, p) in link_targets.iter().zip(packages.iter()) {
+            if !matches!(lt.materialization, lpm_linker::Materialization::CasBacked) {
+                continue;
+            }
+            match p.integrity.as_deref() {
+                Some(sri) => acc.push(lpm_linker::v2::V2Target {
+                    target: lt.clone(),
+                    source_sri: sri.to_string(),
+                }),
+                None => {
+                    all_have_sri = false;
+                    break;
+                }
+            }
+        }
+        if all_have_sri { acc } else { Vec::new() }
+    } else {
+        Vec::new()
+    };
+    // Why `!used_lockfile` instead of
+    // `LinkPlanV2::all_targets_have_resolver_threaded_peers`:
+    //   `LinkTarget.peers` is empty for THREE reasons documented on the
+    //   field — (a) package declares no peer deps, (b) all declared
+    //   peers absent from install set, (c) lockfile fast-path didn't
+    //   thread peers. (a) + (b) are legitimate empty results from a
+    //   live resolver; (c) is the actual hazard the gate must catch.
+    //   The library helper `all_targets_have_resolver_threaded_peers`
+    //   uses `peers.is_empty()` as its sole signal, which conflates
+    //   (a)+(b) with (c) and would reject most fresh-resolution
+    //   installs (any package with no peer deps fails it). On a fresh
+    //   resolution (`!used_lockfile`), the resolver always traverses
+    //   peer-context, so any empty `peers` field is by construction
+    //   case (a) or (b) — `ensure_peer_context` would re-derive the
+    //   same empty set from `package.json`. On the lockfile fast-path
+    //   (`used_lockfile`), peers are NOT persisted today (per the
+    //   `LinkTarget.peers` doc), so we must fall back to serial v2.
+    let v2_event_driven =
+        v2_mode && !serial_link && !v2_cas_targets_pre.is_empty() && !used_lockfile;
+
+    // Plan + per-key V2Target index — both shared across the cache-hit
+    // dispatch loop and every per-pkg fetch task. `Arc<LinkPlanV2>`
+    // because the plan is read-only after build and lives across many
+    // blocking tasks. Empty on the !v2_event_driven path; the link
+    // stage falls through to `link_packages_v2` unchanged.
+    let v2_plan: Option<std::sync::Arc<lpm_linker::v2::LinkPlanV2>> = if v2_event_driven {
+        let plan = lpm_linker::v2::link_v2_prepare(
+            project_dir,
+            &v2_cas_targets_pre,
+            store_v2_handle
+                .as_deref()
+                .expect("v2_event_driven implies v2 store"),
+            linker_mode,
+        )?;
+        Some(std::sync::Arc::new(plan))
+    } else {
+        None
+    };
+    let v2_target_by_key: std::collections::HashMap<
+        lpm_lockfile::PackageKey,
+        lpm_linker::v2::V2Target,
+    > = if v2_event_driven {
+        packages
+            .iter()
+            .zip(link_targets.iter())
+            .filter_map(|(p, lt)| {
+                if !matches!(lt.materialization, lpm_linker::Materialization::CasBacked) {
+                    return None;
+                }
+                let sri = p.integrity.as_deref()?.to_string();
+                Some((
+                    p.package_key(),
+                    lpm_linker::v2::V2Target {
+                        target: lt.clone(),
+                        source_sri: sri,
+                    },
+                ))
+            })
+            .collect()
+    } else {
+        std::collections::HashMap::new()
+    };
+
+    // Per-package v2 link handles populated by both the cache-hit
+    // short-circuits below and the fetch tasks further down. Drained
+    // at the link stage and folded into the LinkResult.
+    type V2LinkHandle = tokio::task::JoinHandle<Result<(MaterializedPackage, bool), LpmError>>;
+    let mut v2_event_link_handles: Vec<V2LinkHandle> = Vec::new();
+
     // Phase 39 P2b: stale-entry cleanup runs once, up front — must
     // happen before any per-pkg link spawn touches `.lpm/` so the
     // `read_dir` scan sees a stable snapshot.
+    //
+    // Phase 66 followup #6b: under v2_event_driven, `link_v2_prepare`
+    // above already ran `cleanup_v1_state` (the v2-side equivalent),
+    // so this v1-shaped cleanup is skipped — running it would wipe
+    // node_modules a second time with no benefit.
     if event_driven_link {
         lpm_linker::cleanup_stale_entries(project_dir, &link_targets)?;
     }
@@ -4677,6 +4799,24 @@ async fn run_with_options_under_store_lock(
             && object_dir.exists()
         {
             cached += 1;
+            // Phase 66 followup #6b — dispatch link_v2_one immediately.
+            // The v2 object is already populated, so the link entry's
+            // clonefile pass can run on the blocking pool in parallel
+            // with sibling fetches. Awaited at the link stage below.
+            if v2_event_driven
+                && let Some(plan) = v2_plan.as_ref()
+                && let Some(target) = v2_target_by_key.get(&p.package_key()).cloned()
+            {
+                let plan_arc = std::sync::Arc::clone(plan);
+                let store_arc = std::sync::Arc::clone(
+                    store_v2_handle
+                        .as_ref()
+                        .expect("v2_event_driven implies v2 store"),
+                );
+                v2_event_link_handles.push(tokio::task::spawn_blocking(move || {
+                    lpm_linker::v2::link_v2_one(&plan_arc, &target, &store_arc)
+                }));
+            }
             continue;
         }
 
@@ -4712,6 +4852,23 @@ async fn run_with_options_under_store_lock(
             match v2_store.populate_object_from_v1(&v1_pkg_dir, sri) {
                 Ok(_) => {
                     cached += 1;
+                    // Phase 66 followup #6b — see the v2 SRI-direct
+                    // cache-hit branch above. Translation populated
+                    // `objects/<sri>/`; dispatch link immediately.
+                    if v2_event_driven
+                        && let Some(plan) = v2_plan.as_ref()
+                        && let Some(target) = v2_target_by_key.get(&p.package_key()).cloned()
+                    {
+                        let plan_arc = std::sync::Arc::clone(plan);
+                        let store_arc = std::sync::Arc::clone(
+                            store_v2_handle
+                                .as_ref()
+                                .expect("v2_event_driven implies v2 store"),
+                        );
+                        v2_event_link_handles.push(tokio::task::spawn_blocking(move || {
+                            lpm_linker::v2::link_v2_one(&plan_arc, &target, &store_arc)
+                        }));
+                    }
                     continue;
                 }
                 Err(e) => {
@@ -5146,11 +5303,28 @@ async fn run_with_options_under_store_lock(
             // the per-package fetch task. Cheap clone (Arc ref-bump
             // for the inner NpmrcConfig).
             let route_table_c = route_table.clone();
+            // Phase 66 followup #6b — per-task v2 event-driven link
+            // captures. `v2_plan_arc` is None on the !v2_event_driven
+            // path; `v2_target_for_pkg` resolved here once so the
+            // per-task closure doesn't carry the whole index map.
+            let v2_plan_arc = v2_plan.as_ref().map(std::sync::Arc::clone);
+            let v2_target_for_pkg = if v2_event_driven {
+                v2_target_by_key.get(&p.package_key()).cloned()
+            } else {
+                None
+            };
 
             handles.push(tokio::spawn(async move {
                 type LinkHandle = tokio::task::JoinHandle<
                     Result<(MaterializedPackage, lpm_linker::OnePackageResult), LpmError>,
                 >;
+                // Phase 66 followup #6b — v2-shape link handle. Mutually
+                // exclusive with `LinkHandle` at runtime: under v2_mode,
+                // `event_link` is false (so `LinkHandle` is always None);
+                // under !v2_mode, `v2_plan_arc` is None (so this is
+                // always None).
+                type V2LinkHandle =
+                    tokio::task::JoinHandle<Result<(MaterializedPackage, bool), LpmError>>;
 
                 // P0 timing: spawn→key-lock→permit captures the full time this
                 // task sat queued. Phase 39 P2: now also covers the
@@ -5242,6 +5416,28 @@ async fn run_with_options_under_store_lock(
                     // URL value.
                     let sri = lpm_store::read_stored_integrity(&existing_path).unwrap_or_default();
                     let link_h = spawn_link(&p, None)?;
+                    // Phase 66 followup #6b — sibling-skip path. The
+                    // v2 object dir was populated by the sibling's
+                    // fetch task (or the sibling is in the middle of
+                    // populating it; the per-key fetch lock above
+                    // ensures we observe the post-extract state).
+                    // Dispatch the v2 link entry materialization in
+                    // the same shape as the post-fetch path below.
+                    let v2_link_h: Option<V2LinkHandle> =
+                        if let (Some(plan), Some(target), Some(store_v2)) = (
+                            v2_plan_arc.as_ref(),
+                            v2_target_for_pkg.as_ref(),
+                            store_v2_ref.as_ref(),
+                        ) {
+                            let plan_c = std::sync::Arc::clone(plan);
+                            let target_c = target.clone();
+                            let store_c = std::sync::Arc::clone(store_v2);
+                            Some(tokio::task::spawn_blocking(move || {
+                                lpm_linker::v2::link_v2_one(&plan_c, &target_c, &store_c)
+                            }))
+                        } else {
+                            None
+                        };
                     overall.inc(1);
                     // Phase 59.0 day-7 (F1 finish-line): emit the
                     // source-aware key (matches the spawn return
@@ -5252,6 +5448,7 @@ async fn run_with_options_under_store_lock(
                             String,
                             TaskTimings,
                             Option<LinkHandle>,
+                            Option<V2LinkHandle>,
                             Option<String>,
                         ),
                         LpmError,
@@ -5263,6 +5460,7 @@ async fn run_with_options_under_store_lock(
                             ..Default::default()
                         },
                         link_h,
+                        v2_link_h,
                         None,
                     ));
                 }
@@ -5339,6 +5537,27 @@ async fn run_with_options_under_store_lock(
                 // registry slot. Registry sources ignore the override.
                 let link_h = spawn_link(&p, Some(&computed_sri))?;
 
+                // Phase 66 followup #6b — dispatch v2 link entry
+                // materialization on the blocking pool now that the
+                // tarball is extracted into `objects/<sri>/`. Runs in
+                // parallel with sibling fetch tasks still downloading
+                // and (importantly) cuts the post-fetch link-stage tail.
+                let v2_link_h: Option<V2LinkHandle> =
+                    if let (Some(plan), Some(target), Some(store_v2)) = (
+                        v2_plan_arc.as_ref(),
+                        v2_target_for_pkg.as_ref(),
+                        store_v2_ref.as_ref(),
+                    ) {
+                        let plan_c = std::sync::Arc::clone(plan);
+                        let target_c = target.clone();
+                        let store_c = std::sync::Arc::clone(store_v2);
+                        Some(tokio::task::spawn_blocking(move || {
+                            lpm_linker::v2::link_v2_one(&plan_c, &target_c, &store_c)
+                        }))
+                    } else {
+                        None
+                    };
+
                 overall.inc(1);
                 // Phase 59.0 day-7 (F1 finish-line): emit the
                 // source-aware PackageKey so the post-fetch
@@ -5353,6 +5572,7 @@ async fn run_with_options_under_store_lock(
                         String,
                         TaskTimings,
                         Option<LinkHandle>,
+                        Option<V2LinkHandle>,
                         Option<String>,
                     ),
                     LpmError,
@@ -5361,6 +5581,7 @@ async fn run_with_options_under_store_lock(
                     computed_sri,
                     task_timings,
                     link_h,
+                    v2_link_h,
                     Some(final_url),
                 ))
             }));
@@ -5381,13 +5602,19 @@ async fn run_with_options_under_store_lock(
         let mut integrity_map: std::collections::HashMap<lpm_lockfile::PackageKey, String> =
             std::collections::HashMap::new();
         for handle in handles {
-            let (pkg_key, sri, timings, link_h, final_url) = handle
+            let (pkg_key, sri, timings, link_h, v2_link_h, final_url) = handle
                 .await
                 .map_err(|e| LpmError::Registry(format!("download task panicked: {e}")))??;
             integrity_map.insert(pkg_key.clone(), sri);
             fetch_breakdown.record(timings);
             if let Some(lh) = link_h {
                 event_link_handles.push(lh);
+            }
+            // Phase 66 followup #6b — funnel v2 link handles emitted
+            // by the fetch tasks into the same drain queue the cache-
+            // hit branches above feed.
+            if let Some(lh) = v2_link_h {
+                v2_event_link_handles.push(lh);
             }
             if let Some(url) = final_url {
                 fresh_urls.insert(pkg_key, url);
@@ -5563,18 +5790,58 @@ async fn run_with_options_under_store_lock(
             }
         }
 
-        let mut result = lpm_linker::v2::link_packages_v2(
-            project_dir,
-            &v2_targets,
-            store_v2,
-            linker_mode,
-            pkg.name.as_deref(),
-        )?;
+        // Phase 66 followup #6b — event-driven v2 path.
+        //
+        // When `v2_event_driven` was true, `link_v2_prepare` already
+        // ran above and per-package `link_v2_one` tasks were spawned
+        // by the cache-hit short-circuits and the fetch tasks.
+        // Here we just await those handles, run `link_v2_finalize`,
+        // and assemble the same `LinkResult` shape `link_packages_v2`
+        // would have produced. The serial fall-back below keeps the
+        // shape of the pre-#6b path for installs that didn't pass the
+        // gate (e.g. `Source::Tarball` TOFU before the SRI is known).
+        let mut result = if v2_event_driven {
+            let plan = v2_plan
+                .as_ref()
+                .expect("v2_event_driven implies v2_plan is Some");
+            let mut materialized_all: Vec<MaterializedPackage> =
+                Vec::with_capacity(v2_event_link_handles.len());
+            let mut linked_count = 0usize;
+            for h in v2_event_link_handles.drain(..) {
+                let (m, fresh) = h
+                    .await
+                    .map_err(|e| LpmError::Registry(format!("v2 link task panicked: {e}")))??;
+                materialized_all.push(m);
+                if fresh {
+                    linked_count += 1;
+                }
+            }
+            let finalize =
+                lpm_linker::v2::link_v2_finalize(project_dir, plan, store_v2, pkg.name.as_deref())?;
+            let cas_total = plan.augmented_targets.len();
+            LinkResult {
+                linked: linked_count,
+                symlinked: finalize.symlinked,
+                bin_linked: finalize.bin_count,
+                skipped: cas_total.saturating_sub(linked_count),
+                self_referenced: finalize.self_referenced,
+                materialized: materialized_all,
+            }
+        } else {
+            lpm_linker::v2::link_packages_v2(
+                project_dir,
+                &v2_targets,
+                store_v2,
+                linker_mode,
+                pkg.name.as_deref(),
+            )?
+        };
 
         // Materialize directory-source targets via project-side
-        // symlink to the source realpath. `link_packages_v2` already
-        // wiped + recreated `<project>/node_modules/`, so we append
-        // here.
+        // symlink to the source realpath. Both the event-driven
+        // `link_v2_finalize` path and the serial `link_packages_v2`
+        // path wipe + recreate `<project>/node_modules/`, so we
+        // append here either way.
         if !local_targets.is_empty() {
             let nm = project_dir.join("node_modules");
             std::fs::create_dir_all(&nm).map_err(|e| {
