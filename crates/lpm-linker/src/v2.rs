@@ -80,6 +80,81 @@ pub struct V2Target {
     pub source_sri: String,
 }
 
+/// Pre-computed plan handed across the three-phase v2 link API
+/// ([`link_v2_prepare`] → [`link_v2_one`] → [`link_v2_finalize`]).
+///
+/// **Why three phases (Phase 66 followup #6, post-flamegraph 2026-05-09).**
+/// The pre-followup [`link_packages_v2`] entry took the entire `targets`
+/// slice and ran prepare → populate-loop → finalize sequentially after
+/// the fetch barrier. With the post-resolve plan precomputed once,
+/// per-package [`link_v2_one`] tasks can be spawned by the install
+/// pipeline as each object materializes — overlapping link wall-time
+/// with the fetch loop instead of accumulating it on the critical
+/// path.
+///
+/// The pre-followup wrapper [`link_packages_v2`] now drives all three
+/// phases internally and stays as the contract for callers (tests,
+/// non-event-driven install paths) that don't want to thread per-pkg
+/// dispatch.
+pub struct LinkPlanV2 {
+    /// Targets after [`ensure_peer_context`] resolved any missing
+    /// peer-context (lockfile fast-path fallback). The same slice
+    /// downstream phases iterate.
+    pub augmented_targets: Vec<V2Target>,
+    /// `(name, version, wrapper_id) → GraphKey` lookup table populated
+    /// by [`derive_graph_keys`]. Read-only for the per-package and
+    /// finalize phases.
+    pub key_map: KeyMap,
+    /// Host platform tuple stamped into every sidecar.
+    pub platform: PlatformTuple,
+    /// Linker-mode tag — propagates into [`LinkerModeTag`] for
+    /// per-target graph-key derivation in case any caller wants to
+    /// re-derive a key after prepare (none today, but the plan is
+    /// authoritative).
+    pub linker_mode: LinkerMode,
+}
+
+impl LinkPlanV2 {
+    /// Are all targets ready for the event-driven path? True iff every
+    /// `LinkTarget.peers` is already populated (resolver-threaded
+    /// greedy-fusion path) and `ensure_peer_context` made no
+    /// modifications. When false, callers should fall back to the
+    /// serial wrapper [`link_packages_v2`] — the lockfile fast-path
+    /// reads `package.json` from `objects/<sri>/` to derive peers,
+    /// which requires the object to be extracted; calling
+    /// `link_v2_prepare` before fetch would silently produce empty
+    /// peer-context graph keys.
+    pub fn all_targets_have_resolver_threaded_peers(targets: &[V2Target]) -> bool {
+        // Empty install set is event-driven-safe (zero work to dispatch).
+        // Targets with declared peers but resolver-empty peers indicate
+        // the lockfile-fast-path; those need ensure_peer_context to
+        // read from extracted package.json — incompatible with the
+        // pre-fetch prepare phase.
+        targets.iter().all(|v2t| {
+            // A target has "no peer context required" iff it either
+            // has populated peers OR its package declares zero peer
+            // dependencies. We can't cheaply prove the latter without
+            // reading package.json, so be conservative: only the
+            // resolver-threaded shape qualifies.
+            !v2t.target.peers.is_empty() || target_declares_no_peers(&v2t.target)
+        })
+    }
+}
+
+/// Heuristic: does this target carry no peer-context information that
+/// `ensure_peer_context` would need to discover? Today the only signal
+/// available without disk I/O is `peers.is_empty()` plus a "best-effort
+/// trust-the-resolver" path. Used by
+/// [`LinkPlanV2::all_targets_have_resolver_threaded_peers`] to gate
+/// the event-driven dispatch.
+fn target_declares_no_peers(_target: &LinkTarget) -> bool {
+    // Conservative default: if the resolver didn't thread peers, we
+    // can't tell whether the package declares peers without reading
+    // its package.json. Return false so the caller falls back to the
+    // serial path.
+    false
+}
+
 /// Materialize the install set under the v2 store layout.
 ///
 /// Returns a [`LinkResult`] in the same shape v1 produces so the
@@ -109,50 +184,11 @@ pub fn link_packages_v2(
         });
     }
 
-    let platform = PlatformTuple::current();
-    let linker_tag = match linker_mode {
-        LinkerMode::Isolated => LinkerModeTag::Isolated,
-        LinkerMode::Hoisted => LinkerModeTag::Hoisted,
-    };
-
-    // Wipe v1-style project link state. The v2 install always rebuilds
-    // `node_modules/` from scratch — under v2 there's no per-project
-    // wrapper tree to incrementally update, and stale v1 wrappers
-    // would otherwise leave dangling symlinks pointing at `.lpm/`
-    // paths the v2 linker never touches.
-    cleanup_v1_state(project_dir)?;
-
-    // Peer-context: ensure every target has its peer set populated.
-    // For fresh-resolve the resolver already threaded peers through
-    // (via `ResolvedPackage.peers` → `InstallPackage.peers` →
-    // `LinkTarget.peers`); for the lockfile fast-path the lockfile
-    // doesn't persist peers, so `LinkTarget.peers` arrives empty and
-    // we derive it here from the just-extracted package.json. Either
-    // way, after this call `target.peers` is the authoritative
-    // peer-edge set used for both sibling-symlink synthesis and
-    // GraphKey derivation.
-    let augmented_targets = ensure_peer_context(targets, store)?;
-    let augmented_slice = &augmented_targets[..];
-
-    // Pre-pass: every (name, version, wrapper_id) → its GraphKey.
-    // The triple disambiguates the rare cross-source same-coords case
-    // (Registry + Tarball both at `foo@1.0.0`), which `wrapper_id`
-    // already carves apart at the .lpm/segment level under v1; v2
-    // mirrors that into the link-entry namespace.
-    let key_map = derive_graph_keys(augmented_slice, &platform, linker_tag)?;
+    let plan = link_v2_prepare(project_dir, targets, store, linker_mode)?;
+    let augmented_slice = &plan.augmented_targets[..];
 
     // **Phase 66 perf followup #5 (samply-driven, 2026-05-08).** Materialize
     // link entries in parallel for installs above the threshold.
-    //
-    // Phase 4b shipped this loop sequentially with the explicit
-    // "Phase 4d/4f can revisit" follow-up note. The 2026-05-08 paired
-    // A/B bench (lpm-rs-pre66 on `main` vs lpm-rs-post66 with the v2
-    // stack) attributed the +157 ms cold/clean regression to this
-    // exact loop: pre-66 isolated ran event-driven per-package link
-    // tasks in parallel with the fetch loop, so `link_ms` was 42 ms
-    // (mostly overlapped); v2's serial loop pushed `link_ms` to
-    // 191 ms blocking the wall-clock critical path. Closing this gap
-    // is the single biggest Phase 66 follow-up perf win.
     //
     // **Atomicity invariant** (preplan §2.4 + Phase 4a). The v2
     // store's `populate_link_entry` already serializes concurrent
@@ -176,30 +212,22 @@ pub fn link_packages_v2(
             augmented_slice
                 .par_iter()
                 .map(|v2t| {
-                    let entry = populate_one(v2t, store, &key_map, &platform)?;
-                    if entry.freshly_populated {
+                    let (mat, fresh) = link_v2_one(&plan, v2t, store)?;
+                    if fresh {
                         linked_count_atomic.fetch_add(1, Ordering::Relaxed);
                     }
-                    Ok(MaterializedPackage {
-                        name: v2t.target.name.clone(),
-                        version: v2t.target.version.clone(),
-                        destination: store.paths().link_package_dir(&entry.key),
-                    })
+                    Ok(mat)
                 })
                 .collect()
         } else {
             augmented_slice
                 .iter()
                 .map(|v2t| {
-                    let entry = populate_one(v2t, store, &key_map, &platform)?;
-                    if entry.freshly_populated {
+                    let (mat, fresh) = link_v2_one(&plan, v2t, store)?;
+                    if fresh {
                         linked_count_atomic.fetch_add(1, Ordering::Relaxed);
                     }
-                    Ok(MaterializedPackage {
-                        name: v2t.target.name.clone(),
-                        version: v2t.target.version.clone(),
-                        destination: store.paths().link_package_dir(&entry.key),
-                    })
+                    Ok(mat)
                 })
                 .collect()
         };
@@ -207,33 +235,138 @@ pub fn link_packages_v2(
         materialized_results.into_iter().collect::<Result<_, _>>()?;
     let linked_count = linked_count_atomic.into_inner();
 
-    // Project-side root symlinks: one per entry in `root_link_names`
-    // (or the default `[name]` for direct deps with `None`).
-    let symlinked_count = create_root_symlinks(project_dir, augmented_slice, store, &key_map)?;
+    let finalize = link_v2_finalize(project_dir, &plan, store, self_package_name)?;
 
-    // Bin shims — walk each link entry's package.json directly via
-    // the store path. Doesn't need the project-side symlinks to
-    // resolve, which keeps the order independent of root-symlink
-    // creation timing.
-    let bin_count = create_bin_links_v2(project_dir, augmented_slice, store, &key_map)?;
+    Ok(LinkResult {
+        linked: linked_count,
+        symlinked: finalize.symlinked,
+        bin_linked: finalize.bin_count,
+        skipped: augmented_slice.len().saturating_sub(linked_count),
+        self_referenced: finalize.self_referenced,
+        materialized,
+    })
+}
 
-    // Self-reference: project's `node_modules/<self_pkg_name>` →
-    // `<project_dir>`. Same shape as v1 (`node_modules/<self>` is a
-    // symlink to the project root). Skipped if a direct dep already
-    // occupies the slot.
+/// Phase 66 followup #6 — phase 1 of the event-driven v2 link API.
+///
+/// Runs the post-resolve, pre-fetch sync work that the install pipeline
+/// can complete without any object on disk:
+/// 1. [`cleanup_v1_state`] — wipes legacy `<project>/.lpm/wrappers/`,
+///    `<project>/.lpm/hoisted/`, and `<project>/node_modules/`. v2 always
+///    rebuilds the project tree from scratch; per-package
+///    [`link_v2_one`] tasks only write under
+///    `~/.lpm/store/v2/links/<key>/`, so wiping early frees us to spawn
+///    them in parallel with fetch.
+/// 2. [`ensure_peer_context`] — best-effort fill-in for targets whose
+///    [`LinkTarget::peers`] arrived empty (lockfile fast-path). Reads
+///    `package.json` from extracted `objects/<sri>/`. **For
+///    pre-fetch event-driven dispatch, callers MUST pre-check
+///    [`LinkPlanV2::all_targets_have_resolver_threaded_peers`] and
+///    fall back to the serial wrapper if it returns false.** Otherwise
+///    peer-context for those targets is silently empty and graph keys
+///    diverge from the serial path.
+/// 3. [`derive_graph_keys`] — computes the
+///    `(name, version, wrapper_id) → GraphKey` map. Pure compute over
+///    in-memory targets, no I/O. Multi-source-same-coords collisions
+///    surface as a hard error here.
+///
+/// Returns a [`LinkPlanV2`] handed by reference into the per-package
+/// and finalize phases.
+pub fn link_v2_prepare(
+    project_dir: &Path,
+    targets: &[V2Target],
+    store: &Store,
+    linker_mode: LinkerMode,
+) -> Result<LinkPlanV2, LpmError> {
+    cleanup_v1_state(project_dir)?;
+    let augmented_targets = ensure_peer_context(targets, store)?;
+    let platform = PlatformTuple::current();
+    let linker_tag = match linker_mode {
+        LinkerMode::Isolated => LinkerModeTag::Isolated,
+        LinkerMode::Hoisted => LinkerModeTag::Hoisted,
+    };
+    let key_map = derive_graph_keys(&augmented_targets[..], &platform, linker_tag)?;
+    Ok(LinkPlanV2 {
+        augmented_targets,
+        key_map,
+        platform,
+        linker_mode,
+    })
+}
+
+/// Phase 66 followup #6 — phase 2 of the event-driven v2 link API.
+///
+/// Materializes a single link entry in `~/.lpm/store/v2/links/<key>/`
+/// from a precomputed [`LinkPlanV2`]. Idempotent — concurrent calls
+/// targeting the same graph key serialize through the v2 store's
+/// atomic-rename machinery (preplan §2.4).
+///
+/// Returns `(MaterializedPackage, freshly_populated)` so the caller can
+/// distinguish cache hits from new materializations for telemetry.
+/// Safe to call from any thread; safe to call concurrently for
+/// distinct targets.
+///
+/// **Object precondition.** `<store>/objects/<source_sri>/` must already
+/// be populated by `Store::extract_object_from_bytes` before this
+/// function is called for `target`. Calling earlier returns an error
+/// from `populate_link_entry`'s clonefile step.
+pub fn link_v2_one(
+    plan: &LinkPlanV2,
+    target: &V2Target,
+    store: &Store,
+) -> Result<(MaterializedPackage, bool), LpmError> {
+    let entry = populate_one(target, store, &plan.key_map, &plan.platform)?;
+    let mat = MaterializedPackage {
+        name: target.target.name.clone(),
+        version: target.target.version.clone(),
+        destination: store.paths().link_package_dir(&entry.key),
+    };
+    Ok((mat, entry.freshly_populated))
+}
+
+/// Result handle for [`link_v2_finalize`] — separated from
+/// [`LinkResult`] so the caller assembles the final result with its
+/// own `linked` / `materialized` counts (which the per-package phase
+/// owns).
+pub struct LinkV2FinalizeResult {
+    /// Number of `<project>/node_modules/<root>` symlinks written.
+    pub symlinked: usize,
+    /// Number of `<project>/node_modules/.bin/<cmd>` shims written.
+    pub bin_count: usize,
+    /// Whether `<project>/node_modules/<self_pkg_name>` was created.
+    pub self_referenced: bool,
+}
+
+/// Phase 66 followup #6 — phase 3 of the event-driven v2 link API.
+///
+/// Runs the post-fetch sequential project-side wiring:
+/// 1. Project root symlinks (one per `root_link_names` per direct dep).
+/// 2. `.bin/` shims — read each direct dep's `package.json` from the
+///    materialized link entry, write per-command shims.
+/// 3. Self-reference symlink at `<project>/node_modules/<self>` → project
+///    root, when `self_package_name` is `Some`.
+///
+/// Must be called AFTER all [`link_v2_one`] calls for `plan` complete —
+/// the bin-shim pass reads `package.json` from inside each link entry,
+/// which only exists once `populate_link_entry` finishes.
+pub fn link_v2_finalize(
+    project_dir: &Path,
+    plan: &LinkPlanV2,
+    store: &Store,
+    self_package_name: Option<&str>,
+) -> Result<LinkV2FinalizeResult, LpmError> {
+    let augmented_slice = &plan.augmented_targets[..];
+    let symlinked = create_root_symlinks(project_dir, augmented_slice, store, &plan.key_map)?;
+    let bin_count = create_bin_links_v2(project_dir, augmented_slice, store, &plan.key_map)?;
     let self_referenced = if let Some(self_name) = self_package_name {
         create_self_ref(project_dir, self_name)?
     } else {
         false
     };
-
-    Ok(LinkResult {
-        linked: linked_count,
-        symlinked: symlinked_count,
-        bin_linked: bin_count,
-        skipped: augmented_slice.len().saturating_sub(linked_count),
+    Ok(LinkV2FinalizeResult {
+        symlinked,
+        bin_count,
         self_referenced,
-        materialized,
     })
 }
 
@@ -439,6 +572,11 @@ fn link_meta_platform(p: &PlatformTuple) -> LinkMetaPlatform {
 /// Per-install lookup table from `(name, version, wrapper_id)` to the
 /// derived `GraphKey`.
 ///
+/// Built once during [`link_v2_prepare`], stored on [`LinkPlanV2`],
+/// consulted by every [`link_v2_one`] / [`link_v2_finalize`] call.
+/// Public so callers can hold a reference across spawn boundaries
+/// without reaching into linker private API.
+///
 /// Two indexes:
 /// - `by_triple` — full `(name, version, wrapper_id)` identity. Used
 ///   by `populate_one` to fetch THIS target's own key.
@@ -446,7 +584,7 @@ fn link_meta_platform(p: &PlatformTuple) -> LinkMetaPlatform {
 ///   edges, which carry only `(name, version)` today. Multi-source
 ///   collisions are detected at construction time and surface a hard
 ///   error before any link entry materializes.
-struct KeyMap {
+pub struct KeyMap {
     by_triple: HashMap<(String, String, Option<String>), GraphKey>,
     by_coords: HashMap<(String, String), GraphKey>,
 }
