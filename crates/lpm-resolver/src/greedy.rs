@@ -192,6 +192,7 @@ pub async fn resolve_greedy(
     // Snapshot the platform-skipped counter before `into_resolved_packages`
     // consumes the state.
     let platform_skipped = state.platform_skipped;
+    let root_aliases = std::mem::take(&mut state.root_aliases);
     let packages = state.into_resolved_packages(&cache);
 
     let snap = lpm_registry::timing::snapshot();
@@ -201,14 +202,10 @@ pub async fn resolve_greedy(
         // Phase 32 P5 overrides: not yet applied in W1 (see module docs).
         applied_overrides: Vec::new(),
         platform_skipped,
-        // Phase 40 P2 root aliases: walker / metadata-parser already
-        // populates aliases on each `CachedPackageInfo`; the per-package
-        // alias edges flow through `into_resolved_packages`. Root aliases
-        // (the resolved-result's `root_aliases` field) require detecting
-        // `npm:<target>@<range>` in the *root* `package.json`. W4 wires
-        // that. For now: empty map — the bench/project fixture has no
-        // root aliases.
-        root_aliases: HashMap::new(),
+        // Phase 40 P2 root aliases: populated during seed_root_edges
+        // when a root dep declares `npm:target@range`. Empty when no
+        // root dep uses alias syntax.
+        root_aliases,
         stage_timing: StageTiming {
             followup_rpc_ms: snap.metadata_rpc.as_millis() as u64,
             followup_rpc_count: snap.metadata_rpc_count,
@@ -548,6 +545,7 @@ pub async fn resolve_greedy_fused(
         .map(|entry| (entry.key().clone(), Arc::clone(entry.value())))
         .collect();
     let platform_skipped = state.platform_skipped;
+    let root_aliases = std::mem::take(&mut state.root_aliases);
     let packages = state.into_resolved_packages(&cache);
 
     let snap = lpm_registry::timing::snapshot();
@@ -556,7 +554,7 @@ pub async fn resolve_greedy_fused(
         cache,
         applied_overrides: Vec::new(),
         platform_skipped,
-        root_aliases: HashMap::new(),
+        root_aliases,
         stage_timing: StageTiming {
             followup_rpc_ms: snap.metadata_rpc.as_millis() as u64,
             followup_rpc_count: snap.metadata_rpc_count,
@@ -608,6 +606,17 @@ struct ResolveState {
     /// in `ResolveResult.platform_skipped` for the install pipeline's
     /// `--json` output. Matches `provider.rs`'s semantics.
     platform_skipped: usize,
+    /// Phase 40 P2 — root-level npm alias map. Populated during
+    /// [`Self::seed_root_edges`] when a root dep declares
+    /// `"local": "npm:target@range"`: keyed by `local` (the alias name
+    /// the consumer wrote), valued by `target` (the real registry
+    /// identity). Drained into `ResolveResult.root_aliases` at the
+    /// end of each resolver arm so the install pipeline can build
+    /// `node_modules/<local>/` symlinks pointing at the target's
+    /// content. Mirrors `provider.rs`'s legacy-pubgrub semantics; this
+    /// closes the gap that previously made the greedy/fused arms
+    /// reject `npm:` ranges at the root.
+    root_aliases: HashMap<String, String>,
 }
 
 /// In-flight resolved node — accumulated during the loop, finalized
@@ -629,6 +638,7 @@ impl ResolveState {
             nodes: Vec::with_capacity(512),
             children_enqueued: HashSet::with_capacity(512),
             platform_skipped: 0,
+            root_aliases: HashMap::new(),
         }
     }
 
@@ -652,13 +662,30 @@ impl ResolveState {
         // resolved-tree shape.
         self.resolved
             .insert(CanonicalKey::Root, vec![(NpmVersion::new(0, 0, 0), 0)]);
-        // Phase 40 P2 alias rewriting on root edges happens in W4;
-        // here we just take the package.json declaration verbatim.
+        // Phase 40 P2 root-level alias rewrite. If the consumer's
+        // package.json declares `"local": "npm:target@range"`, the
+        // resolver must (a) key the canonical on `target` (the real
+        // registry identity) so metadata fetch + version resolution
+        // hit the right package, (b) parse the inner range, and
+        // (c) record `local → target` in `self.root_aliases` so the
+        // install pipeline can build `node_modules/<local>/` from the
+        // target's content. Mirrors `provider.rs::1311-1328`'s
+        // legacy-pubgrub behavior — that arm has worked since
+        // Phase 40 P2 landed; this closes the same gap on the
+        // greedy/fused arm.
         let mut entries: Vec<_> = self.root_deps.iter().collect();
         entries.sort_by(|(a, _), (b, _)| a.cmp(b));
         for (name, range_str) in entries {
-            let canonical = CanonicalKey::from_dep_name(name);
-            let range = NpmRange::parse(range_str).map_err(|e| {
+            let (canonical_name, effective_range) = match crate::ranges::parse_npm_alias(range_str)
+            {
+                Some(alias) => {
+                    self.root_aliases.insert(name.clone(), alias.target.clone());
+                    (alias.target, alias.range)
+                }
+                None => (name.clone(), range_str.clone()),
+            };
+            let canonical = CanonicalKey::from_dep_name(&canonical_name);
+            let range = NpmRange::parse(&effective_range).map_err(|e| {
                 ResolveError::Internal(format!("failed to parse range for root dep {name}: {e}"))
             })?;
             self.task_queue.push_back(Edge {
@@ -1411,6 +1438,67 @@ mod tests {
             .map(|e| e.local_name.as_str())
             .collect();
         assert_eq!(order, vec!["alpha", "middle", "zebra"]);
+    }
+
+    #[test]
+    fn seed_root_edges_rewrites_npm_alias_root_dep() {
+        // Phase 40 P2 — root dep declared as `"local": "npm:target@range"`
+        // must (a) emit an Edge whose canonical is keyed on the TARGET
+        // (`lodash`), not the alias (`lodash-cjs`), so metadata fetch
+        // hits the right package; (b) parse the inner range
+        // (`^4.17.21`); (c) preserve the alias as `local_name` so the
+        // install pipeline knows which `node_modules/<alias>/` slot to
+        // build; (d) record `local → target` in `root_aliases` for
+        // ResolveResult downstream consumption. Mirrors
+        // `resolve.rs::resolve_with_prefetch_handles_root_npm_alias`'s
+        // contract on the legacy-pubgrub arm.
+        let mut deps = HashMap::new();
+        deps.insert("lodash-cjs".to_string(), "npm:lodash@^4.17.21".to_string());
+        // A non-aliased sibling proves the alias-vs-non-alias branch
+        // both work in one seeding pass.
+        deps.insert("rxjs".to_string(), "^7.8.0".to_string());
+        let mut state = ResolveState::new(deps);
+        state.seed_root_edges().unwrap();
+
+        // root_aliases is populated only for the aliased entry.
+        assert_eq!(state.root_aliases.len(), 1);
+        assert_eq!(
+            state.root_aliases.get("lodash-cjs"),
+            Some(&"lodash".to_string())
+        );
+
+        // Edges keyed on canonical = target for the alias, canonical =
+        // alias-key (== package name) for the non-alias.
+        let edges_by_local: HashMap<&str, &Edge> = state
+            .task_queue
+            .iter()
+            .map(|e| (e.local_name.as_str(), e))
+            .collect();
+        assert_eq!(edges_by_local.len(), 2);
+
+        let alias_edge = edges_by_local["lodash-cjs"];
+        assert_eq!(
+            alias_edge.canonical,
+            CanonicalKey::from_dep_name("lodash"),
+            "alias canonical must be the TARGET, not the local key"
+        );
+        assert_eq!(
+            alias_edge.local_name, "lodash-cjs",
+            "local_name preserves the alias key for the install pipeline"
+        );
+        // Inner range must parse as a normal semver range. `^4.17.21`
+        // satisfies 4.17.21 and not 5.0.0.
+        let v_4_17_21 = NpmVersion::new(4, 17, 21);
+        let v_5_0_0 = NpmVersion::new(5, 0, 0);
+        assert!(alias_edge.range.satisfies(&v_4_17_21));
+        assert!(!alias_edge.range.satisfies(&v_5_0_0));
+
+        let plain_edge = edges_by_local["rxjs"];
+        assert_eq!(
+            plain_edge.canonical,
+            CanonicalKey::from_dep_name("rxjs"),
+            "non-alias canonical equals the dep name"
+        );
     }
 
     #[test]
