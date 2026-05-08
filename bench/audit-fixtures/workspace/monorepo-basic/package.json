@@ -2,11 +2,12 @@
 	"name": "audit-fixture-workspace-monorepo",
 	"version": "1.0.0",
 	"private": true,
-	"_comment": "Phase 2 hoisted compat audit. Workspace fixture (no other coverage exists). Three-member monorepo with internal cross-deps via workspace:* and external deps. Verifies (1) workspace resolution under both linker modes, (2) internal symlink creation per-member, (3) hoisting of shared external deps without breaking workspace identity. The root workspace:* references are needed because lpm's bare `install` only processes member deps when the root references them — different shape than npm/bun which auto-recurse, but it's what's wired today.",
+	"_comment": "Phase 2 hoisted compat audit. Workspace fixture (no other coverage exists). Three-member monorepo with internal cross-deps via workspace:* and external deps. Verifies (1) workspace resolution under both linker modes, (2) internal symlink creation per-member, (3) hoisting of shared external deps without breaking workspace identity. The root workspace:* references are needed because lpm's bare `install` only processes member deps when the root references them — different shape than npm/bun which auto-recurse, but it's what's wired today. Phase 66 4b: lodash is also declared at root because lpm's v1 resolver does NOT recurse into workspace member `dependencies` (a separate v1 bug, tracked outside Phase 66's v2 store work). Real-world monorepos commonly hoist shared external deps to the root anyway, so this is a realistic shape. Pre-Phase-66, the audit harness's leaked `/tmp/lpm-audit-work/.lpm/wrappers/` from sibling fixtures accidentally satisfied the require via Node's symlink walk-up — a false positive.",
 	"dependencies": {
 		"audit-utility": "workspace:*",
 		"audit-core": "workspace:*",
-		"audit-consumer": "workspace:*"
+		"audit-consumer": "workspace:*",
+		"lodash": "^4.17.21"
 	},
 	"workspaces": ["packages/*"]
 }

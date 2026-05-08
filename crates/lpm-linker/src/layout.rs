@@ -80,6 +80,13 @@ pub enum LinkerLayout {
     /// (post-symmetry); legacy variants are
     /// `node_modules/.lpm-metadata.json` + `node_modules/.lpm/nested/`.
     Hoisted,
+    /// **Phase 66 §4.** Virtual-store layout: project
+    /// `node_modules/<dep>` is a symlink into
+    /// `~/.lpm/store/v2/links/<graph-key>/node_modules/<dep>/`. Neither
+    /// `<project>/.lpm/wrappers/` nor `<project>/.lpm/hoisted/` is
+    /// populated — the canonical bytes live globally and the project
+    /// holds only the entry-point symlinks. Detected by [`LayoutPaths::is_v2_install`].
+    Virtual,
     /// Both isolated and hoisted state is present on disk. The most
     /// common cause is a half-completed `lpm install` during the 61.3
     /// migration. `lpm install` is idempotent — re-running it converges
@@ -386,7 +393,22 @@ impl<'a> LayoutPaths<'a> {
     ///
     /// Used by `lpm doctor` (61.4) and could be reused elsewhere if a
     /// pre-flight check needs to fail-fast on a clearly-broken install.
+    ///
+    /// **Phase 66 §4 — v2 detection.** Pass `Some(v2_links_root)` to
+    /// teach the predicate about the virtual-store layout, where
+    /// neither `<project>/.lpm/wrappers/` nor
+    /// `<project>/.lpm/hoisted/metadata.json` is populated and the
+    /// project holds only entry-point symlinks into
+    /// `~/.lpm/store/v2/links/`. Pass `None` for the legacy probe
+    /// (returns `NodeModulesPresentButNoStore` for any v2 install).
     pub fn install_appears_healthy(&self) -> InstallHealth {
+        self.install_appears_healthy_with_v2(None)
+    }
+
+    /// Layout-aware variant that recognizes the virtual-store shape.
+    /// See [`Self::install_appears_healthy`] for the predicate's
+    /// no-v2 contract.
+    pub fn install_appears_healthy_with_v2(&self, v2_links_root: Option<&Path>) -> InstallHealth {
         let nm = self.project_dir.join("node_modules");
         if !nm.exists() {
             return InstallHealth::NoNodeModules;
@@ -396,17 +418,94 @@ impl<'a> LayoutPaths<'a> {
         let hoisted_present = self.hoisted_metadata_path().exists();
 
         match (isolated_present, hoisted_present) {
-            (true, true) => InstallHealth::Healthy {
-                layout: LinkerLayout::Mixed,
-            },
-            (true, false) => InstallHealth::Healthy {
-                layout: LinkerLayout::Isolated,
-            },
-            (false, true) => InstallHealth::Healthy {
-                layout: LinkerLayout::Hoisted,
-            },
-            (false, false) => InstallHealth::NodeModulesPresentButNoStore,
+            (true, true) => {
+                return InstallHealth::Healthy {
+                    layout: LinkerLayout::Mixed,
+                };
+            }
+            (true, false) => {
+                return InstallHealth::Healthy {
+                    layout: LinkerLayout::Isolated,
+                };
+            }
+            (false, true) => {
+                return InstallHealth::Healthy {
+                    layout: LinkerLayout::Hoisted,
+                };
+            }
+            (false, false) => {}
         }
+
+        // Neither v1 marker is populated. Probe for v2 shape if the
+        // caller supplied the virtual-store links root.
+        if let Some(links_root) = v2_links_root
+            && self.is_v2_install(links_root)
+        {
+            return InstallHealth::Healthy {
+                layout: LinkerLayout::Virtual,
+            };
+        }
+
+        InstallHealth::NodeModulesPresentButNoStore
+    }
+
+    /// Returns `true` iff this project's `node_modules/` contains at
+    /// least one entry whose canonicalized path lives under
+    /// `v2_links_root`. The probe is intentionally cheap — it stops at
+    /// the first match — so a healthy v2 install with hundreds of
+    /// deps still resolves in microseconds.
+    ///
+    /// Skipped: `.bin`, dotfile entries, and entries that fail to
+    /// canonicalize (broken symlinks, permission issues). Workspace
+    /// member symlinks (e.g. `file:./packages/foo`) canonicalize into
+    /// the project tree, NOT under the v2 links root, so they don't
+    /// trip this predicate.
+    pub fn is_v2_install(&self, v2_links_root: &Path) -> bool {
+        let nm = self.project_dir.join("node_modules");
+        let Ok(entries) = std::fs::read_dir(&nm) else {
+            return false;
+        };
+        let canonical_links_root = match std::fs::canonicalize(v2_links_root) {
+            Ok(c) => c,
+            Err(_) => return false,
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            // Skip `.bin/` (always a real dir of shim symlinks pointing
+            // at v2 link entries — but the dir ITSELF isn't a v2
+            // marker; its contents are ALSO v2 symlinks but pointing
+            // at bin scripts, not link-entry roots, so checking
+            // `.bin/` would over-fire on the wrong shape) and any
+            // dotfile entry (lpm housekeeping).
+            if name.starts_with('.') {
+                continue;
+            }
+            let path = entry.path();
+            // For scoped packages (`@scope/foo`), the `@scope/` parent
+            // is a real directory and its contents are the actual
+            // symlinks. Recurse one level for scoped roots.
+            if name.starts_with('@') && path.is_dir() {
+                let Ok(scoped) = std::fs::read_dir(&path) else {
+                    continue;
+                };
+                for scoped_entry in scoped.flatten() {
+                    let scoped_path = scoped_entry.path();
+                    if let Ok(canonical) = std::fs::canonicalize(&scoped_path)
+                        && canonical.starts_with(&canonical_links_root)
+                    {
+                        return true;
+                    }
+                }
+                continue;
+            }
+            if let Ok(canonical) = std::fs::canonicalize(&path)
+                && canonical.starts_with(&canonical_links_root)
+            {
+                return true;
+            }
+        }
+        false
     }
 }
 
@@ -1003,6 +1102,106 @@ mod tests {
         assert_eq!(
             layout.install_appears_healthy(),
             InstallHealth::NodeModulesPresentButNoStore,
+        );
+    }
+
+    /// Phase 66 §4 — virtual-store layout detection. A project whose
+    /// `node_modules/<dep>` symlinks resolve into the v2 links root
+    /// MUST register as `Healthy { Virtual }`, not the
+    /// `NodeModulesPresentButNoStore` fall-through.
+    #[test]
+    fn install_appears_healthy_virtual_store() {
+        let dir = tmp_project();
+        let nm = dir.path().join("node_modules");
+        fs::create_dir_all(&nm).unwrap();
+
+        // Synthesize a fake v2 links root with one populated link entry.
+        // The shape doesn't have to be a real LPM-shaped store — only the
+        // canonical-path-prefix relationship matters for detection.
+        let v2_root = dir.path().join("fake-lpm-home").join("store").join("v2");
+        let links_root = v2_root.join("links");
+        let link_entry = links_root.join("react@18.0.0+abc123/node_modules/react");
+        fs::create_dir_all(&link_entry).unwrap();
+        fs::write(link_entry.join("package.json"), b"{}").unwrap();
+
+        // Wire the project-side symlink. On Unix we use `symlink`;
+        // Windows would need `symlink_dir` but this test is gated on
+        // Unix below.
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&link_entry, nm.join("react")).unwrap();
+
+        let layout = LayoutPaths::for_project(dir.path());
+
+        // Sanity: legacy-only probe must still report no-store, since
+        // neither v1 marker is populated.
+        #[cfg(unix)]
+        {
+            assert_eq!(
+                layout.install_appears_healthy(),
+                InstallHealth::NodeModulesPresentButNoStore,
+                "legacy probe must NOT report a virtual install as healthy"
+            );
+
+            // v2-aware probe must recognize the layout.
+            assert_eq!(
+                layout.install_appears_healthy_with_v2(Some(&links_root)),
+                InstallHealth::Healthy {
+                    layout: LinkerLayout::Virtual
+                }
+            );
+
+            assert!(layout.is_v2_install(&links_root));
+        }
+    }
+
+    /// Workspace-member symlinks (`file:./packages/foo`) point into the
+    /// project tree, NOT into the v2 links root. The v2 detection MUST
+    /// not over-fire on a non-v2 install with workspace members.
+    #[test]
+    #[cfg(unix)]
+    fn is_v2_install_does_not_fire_on_workspace_member_symlinks() {
+        let dir = tmp_project();
+        let nm = dir.path().join("node_modules");
+        fs::create_dir_all(&nm).unwrap();
+
+        let workspace_member = dir.path().join("packages").join("foo");
+        fs::create_dir_all(&workspace_member).unwrap();
+        fs::write(workspace_member.join("package.json"), b"{}").unwrap();
+        std::os::unix::fs::symlink(&workspace_member, nm.join("foo")).unwrap();
+
+        // Synthesize an unrelated v2 links root somewhere else.
+        let v2_root = dir.path().join("fake-lpm-home").join("store").join("v2");
+        let links_root = v2_root.join("links");
+        fs::create_dir_all(&links_root).unwrap();
+
+        let layout = LayoutPaths::for_project(dir.path());
+        assert!(
+            !layout.is_v2_install(&links_root),
+            "workspace-member symlinks resolve inside the project tree, not the v2 links root"
+        );
+    }
+
+    /// Scoped-package directory under v2 — `<project>/node_modules/@scope/`
+    /// is a real directory, with its scoped entries as the actual
+    /// symlinks into the v2 store. Detection must recurse one level.
+    #[test]
+    #[cfg(unix)]
+    fn is_v2_install_recurses_scoped_package_directory() {
+        let dir = tmp_project();
+        let nm = dir.path().join("node_modules");
+        fs::create_dir_all(nm.join("@scope")).unwrap();
+
+        let v2_root = dir.path().join("fake-lpm-home").join("store").join("v2");
+        let links_root = v2_root.join("links");
+        let link_entry = links_root.join("@scope+pkg@1.0.0+abc123/node_modules/@scope/pkg");
+        fs::create_dir_all(&link_entry).unwrap();
+        fs::write(link_entry.join("package.json"), b"{}").unwrap();
+        std::os::unix::fs::symlink(&link_entry, nm.join("@scope").join("pkg")).unwrap();
+
+        let layout = LayoutPaths::for_project(dir.path());
+        assert!(
+            layout.is_v2_install(&links_root),
+            "scoped-package symlinks are nested one level under node_modules/@scope/"
         );
     }
 }

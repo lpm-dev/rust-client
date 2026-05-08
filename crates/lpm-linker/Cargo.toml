@@ -8,6 +8,10 @@ description = "node_modules layout manager (symlink/hoist) for LPM"
 
 [dependencies]
 lpm-common = { workspace = true }
+# Phase 66 Phase 4b: v2 linker (`src/v2.rs`) builds graph-keyed link
+# entries via `lpm_store::v2::Store`. Confined to the v2 module — v1
+# code paths don't import `lpm_store`.
+lpm-store = { workspace = true }
 lpm-workspace = { workspace = true }
 pathdiff = { workspace = true }
 rayon = { workspace = true }

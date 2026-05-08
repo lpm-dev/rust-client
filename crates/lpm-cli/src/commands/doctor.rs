@@ -312,10 +312,19 @@ pub async fn run(
     // covers both legacy layouts; we surface this as a warn so it
     // doesn't read as healthy.
     let layout = lpm_linker::LayoutPaths::for_project(project_dir);
+    // Phase 66 §4 — pass the v2 links root so the health probe can
+    // recognize a virtual-store install (no `.lpm/wrappers/` and no
+    // `.lpm/hoisted/metadata.json`, but project-side `node_modules/`
+    // symlinks pointing into `~/.lpm/store/v2/links/`). On a system
+    // where `LpmRoot::from_env` fails (extremely rare; no $HOME and
+    // no $LPM_HOME), the check degrades to legacy v1-only detection.
+    let v2_links_root = lpm_common::LpmRoot::from_env()
+        .ok()
+        .map(|root| lpm_store::v2::StoreV2Paths::from_lpm_root(&root).links_root());
     if layout.needs_layout_migration() {
         checks.push(Check::warn(&doctor_catalog::NODE_MODULES_LEGACY_LAYOUT, "legacy wrapper layout detected — run: lpm install (one-time migration to .lpm/wrappers/)",));
     } else {
-        match layout.install_appears_healthy() {
+        match layout.install_appears_healthy_with_v2(v2_links_root.as_deref()) {
             lpm_linker::InstallHealth::Healthy {
                 layout: lpm_linker::LinkerLayout::Isolated,
             } => {
@@ -330,6 +339,14 @@ pub async fn run(
                 checks.push(Check::pass(
                     &doctor_catalog::NODE_MODULES_HOISTED_HEALTHY,
                     "exists with hoisted layout",
+                ));
+            }
+            lpm_linker::InstallHealth::Healthy {
+                layout: lpm_linker::LinkerLayout::Virtual,
+            } => {
+                checks.push(Check::pass(
+                    &doctor_catalog::NODE_MODULES_VIRTUAL_HEALTHY,
+                    "symlinks into ~/.lpm/store/v2/links/",
                 ));
             }
             lpm_linker::InstallHealth::Healthy {
@@ -350,6 +367,39 @@ pub async fn run(
                 checks.push(Check::fail(
                     &doctor_catalog::NODE_MODULES_MISSING,
                     "not found — run: lpm install",
+                ));
+            }
+        }
+    }
+
+    // Phase 66 Phase 4e — v2 store orphan stats (preplan §4.5).
+    // Cheap: walks `~/.lpm/store/v2/links/<*>/.lpm-link-meta.json`
+    // sidecars + the registered-projects set, surfaces a count of
+    // orphans not reachable from any project. Pass when zero;
+    // warn-with-remediation when non-zero.
+    if let Ok(lpm_root) = lpm_common::LpmRoot::from_env() {
+        let v2_store = lpm_store::v2::Store::from_lpm_root(&lpm_root);
+        let plan = crate::commands::cache_prune::compute_prune_plan(
+            &lpm_root,
+            &v2_store,
+            &crate::commands::cache::PruneFlags::default(),
+            None,
+        );
+        if let Ok(plan) = plan {
+            let orphan_links = plan.link_entries_orphaned.len();
+            let orphan_objects = plan.object_entries_orphaned.len();
+            if orphan_links == 0 && orphan_objects == 0 {
+                checks.push(Check::pass(&doctor_catalog::V2_STORE_ORPHANS, "no orphans"));
+            } else {
+                checks.push(Check::warn(
+                    &doctor_catalog::V2_STORE_ORPHANS,
+                    &format!(
+                        "{orphan_links} link orphan{} + {orphan_objects} object orphan{} \
+                         ({}); run: lpm cache prune --apply",
+                        if orphan_links == 1 { "" } else { "s" },
+                        if orphan_objects == 1 { "" } else { "s" },
+                        lpm_common::format_bytes(plan.bytes_freed_or_eligible),
+                    ),
                 ));
             }
         }

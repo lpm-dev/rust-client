@@ -1147,6 +1147,21 @@ struct InstallPackage {
     is_direct: bool,
     /// Whether this is an LPM package (for tarball fetching)
     is_lpm: bool,
+    /// **Phase 66 §2.5** — resolved peers in scope for THIS package's
+    /// instance in this install graph: `(peer_name, resolved_version)`.
+    /// Sorted by peer_name for deterministic GraphKey hashing.
+    ///
+    /// Carried verbatim from the resolver's
+    /// [`lpm_resolver::ResolvedPackage::peers`] field. The v2 linker
+    /// uses this to (a) synthesize peer-edge siblings inside each
+    /// link entry without re-reading package.json, and (b) fold the
+    /// peer-context into [`lpm_store::v2::GraphKey`] so two projects
+    /// with the same edge graph but different peer pinning produce
+    /// distinct keys (preplan §2.5 cross-project sharing
+    /// invariant). v1 ignores this field — its relative-symlink
+    /// wrappers walk up to the project root for peers, so threading
+    /// is informational under v1.
+    peers: Vec<(String, String)>,
     /// SRI integrity hash for verification (e.g. "sha512-...")
     integrity: Option<String>,
     /// Tarball URL from resolution — avoids re-fetching metadata during download.
@@ -1550,6 +1565,62 @@ fn registry_source_url_for(name: &str, route_table: &RouteTable) -> String {
     }
 }
 
+/// Phase 66 Phase 4d — `true` iff `project_dir` is on a legacy v1
+/// layout that must be wiped before a v2 install can run cleanly.
+///
+/// Either signal is enough — a project running v1 isolated has
+/// `<project>/.lpm/wrappers/`, hoisted has `<project>/.lpm/hoisted/`,
+/// and a project mid-mode-switch may have both. v2 has neither
+/// (project node_modules holds only symlinks into the global store),
+/// so the predicate also returns `false` on a clean v2 install (which
+/// is what makes it idempotent on re-runs after migration).
+///
+/// Detection lives in this module rather than `lpm-linker`'s
+/// `LayoutPaths` because migration is an install-pipeline concern —
+/// the linker shouldn't know about lpm-rs upgrade lifecycle.
+fn needs_v2_migration(project_dir: &Path) -> bool {
+    project_dir.join(".lpm").join("wrappers").exists()
+        || project_dir.join(".lpm").join("hoisted").exists()
+}
+
+/// Phase 66 Phase 4d migration sequence (preplan §3.2).
+///
+/// Wipe order matters for the install-state freshness gate:
+/// 1. `<project>/.lpm/wrappers/` (legacy isolated wrapper root).
+/// 2. `<project>/.lpm/hoisted/` (legacy hoisted state).
+/// 3. `<project>/node_modules/` entirely, INCLUDING `.bin/`. Bin
+///    shims regenerate from the post-migration install layout; a
+///    stale `.bin/` would point at deleted wrapper paths and crash
+///    every `npx <bin>` afterwards.
+/// 4. `<project>/.lpm/install-hash` — the prior hash assumed v1
+///    layout. Without removal, the freshness check would short-
+///    circuit and skip the v2 install.
+///
+/// Each step is idempotent: a non-existent path is a no-op. A crash
+/// mid-migration leaves a half-wiped project; the next install
+/// re-runs the same wipes (no-ops) and re-attempts the v2 install.
+///
+/// `~/.lpm/store/v1/` is intentionally NOT wiped here — it may still
+/// serve other projects on the same machine until the user runs
+/// `lpm cache prune --legacy-v1` (Phase 4e).
+fn migrate_v1_to_v2(project_dir: &Path) -> std::io::Result<()> {
+    let dot_lpm = project_dir.join(".lpm");
+    for stale in [dot_lpm.join("wrappers"), dot_lpm.join("hoisted")] {
+        if stale.exists() {
+            std::fs::remove_dir_all(&stale)?;
+        }
+    }
+    let nm = project_dir.join("node_modules");
+    if nm.exists() {
+        std::fs::remove_dir_all(&nm)?;
+    }
+    let install_hash = dot_lpm.join("install-hash");
+    if install_hash.exists() {
+        std::fs::remove_file(&install_hash)?;
+    }
+    Ok(())
+}
+
 /// **Phase 59.0 day-6a (F4) + Phase 59.1 day-1 (F6)** — pre-resolve
 /// non-registry dependencies from the manifest before the PubGrub
 /// resolver runs.
@@ -1842,6 +1913,7 @@ async fn pre_resolve_non_registry_deps(
             root_link_names: Some(vec![local_name]),
             is_direct: true,
             is_lpm: false,
+            peers: Vec::new(),
             integrity: Some(computed_sri),
             tarball_url: Some(url),
         });
@@ -1925,6 +1997,7 @@ async fn pre_resolve_non_registry_deps(
             root_link_names: Some(vec![local_name]),
             is_direct: true,
             is_lpm: false,
+            peers: Vec::new(),
             integrity: Some(integrity_sri),
             // tarball_url is Phase 43 fresh-URL writeback (registry-
             // specific). Local tarballs have no remote URL, so leave
@@ -2058,6 +2131,7 @@ async fn pre_resolve_non_registry_deps(
             // applies (any value would invalidate on the next edit).
             // F7a's install-hash extension folds in the source's
             // package.json content as the freshness signal instead.
+            peers: Vec::new(),
             integrity: None,
             tarball_url: None,
         });
@@ -2156,6 +2230,7 @@ async fn pre_resolve_non_registry_deps(
             // Link deps share directory deps' mutable-content posture
             // — no integrity SRI; F7a folds the source's package.json
             // content into the install-hash freshness signal.
+            peers: Vec::new(),
             integrity: None,
             tarball_url: None,
         });
@@ -2875,6 +2950,7 @@ fn recurse_local_source_deps(
                     root_link_names: Some(Vec::new()),
                     is_direct: false,
                     is_lpm: false,
+                    peers: Vec::new(),
                     integrity: None,
                     tarball_url: None,
                 });
@@ -3876,6 +3952,54 @@ async fn run_with_options_under_store_lock(
     // handle (cheap Arc-style clone underneath).
     let store = PackageStore::default_location()?;
 
+    // Phase 66 Phase 4b — read the store-version flag once per
+    // install. `LPM_STORE_VERSION=v2` opts in to the virtual-store
+    // pipeline; everything else (unset, "v1", typos) takes the v1
+    // path that's been shipping.
+    //
+    // The v2 store handle is constructed eagerly when the flag is
+    // active, then wrapped in `Arc` so per-package spawn tasks can
+    // capture a cheap clone alongside the v1 `store_ref`. Holding
+    // it as `Option<Arc<…>>` keeps the v1-default code path
+    // allocation-free.
+    let store_version = lpm_store::StoreVersion::from_env();
+    let store_v2_handle: Option<std::sync::Arc<lpm_store::v2::Store>> = if store_version.is_v2() {
+        let lpm_root = lpm_common::LpmRoot::from_env()?;
+        Some(std::sync::Arc::new(lpm_store::v2::Store::from_lpm_root(
+            &lpm_root,
+        )))
+    } else {
+        None
+    };
+    if store_v2_handle.is_some() {
+        tracing::info!(
+            "{}=v2 — install pipeline routing object extracts to ~/.lpm/store/v2/",
+            lpm_store::StoreVersion::ENV_VAR
+        );
+    }
+
+    // Phase 66 Phase 4d — silent v1 → v2 layout migration on first
+    // v2-mode install in this project.
+    //
+    // Detection (preplan §3.1): the project is on v1 if either
+    // `<project>/.lpm/wrappers/` or `<project>/.lpm/hoisted/` exists.
+    // Both are wiped during migration so the v2 install can populate
+    // a clean slate. The store-side `~/.lpm/store/v1/` is NOT touched
+    // here — it may still serve other projects on the same machine
+    // until the user runs `lpm cache prune --legacy-v1` (Phase 4e).
+    //
+    // Migration is idempotent: re-running on partial state succeeds
+    // (every `rm -rf` is a no-op on already-clean state). A crash
+    // mid-migration leaves a half-wiped project; the next install
+    // re-runs the same wipes and re-attempts the v2 install.
+    if store_v2_handle.is_some() && needs_v2_migration(project_dir) {
+        if !json_output {
+            output::info("migrating to v2 store layout (one-time, ~5\u{2013}10s)");
+        }
+        migrate_v1_to_v2(project_dir)
+            .map_err(|e| LpmError::Registry(format!("v1→v2 migration failed: {e}")))?;
+    }
+
     // **Phase 59.0 day-6a (F4 manifest wiring)** — pre-resolve direct
     // tarball-URL deps from the manifest BEFORE the resolver runs.
     // Each tarball-URL dep is downloaded, extracted into the
@@ -4105,6 +4229,7 @@ async fn run_with_options_under_store_lock(
                     fetch_semaphore.clone(),
                     fetch_coord.clone(),
                     deps.clone(),
+                    store_v2_handle.clone(),
                 );
 
                 // No-op walker stub keeps `WalkerJoin` shape uniform
@@ -4226,6 +4351,7 @@ async fn run_with_options_under_store_lock(
                     fetch_semaphore.clone(),
                     fetch_coord.clone(),
                     deps.clone(),
+                    store_v2_handle.clone(),
                 );
 
                 // Resolver — awaits roots_ready then solves against the
@@ -4446,6 +4572,7 @@ async fn run_with_options_under_store_lock(
                 root_link_names: p.root_link_names.clone(),
                 wrapper_id: p.wrapper_id_for_source(),
                 materialization: p.materialization_for_source(),
+                peers: p.peers.clone(),
             })
         })
         .collect::<Result<_, _>>()?;
@@ -4460,7 +4587,14 @@ async fn run_with_options_under_store_lock(
     let serial_link = std::env::var("LPM_SERIAL_LINK")
         .map(|v| v == "1")
         .unwrap_or(false);
-    let event_driven_link = !serial_link && matches!(linker_mode, lpm_linker::LinkerMode::Isolated);
+    // Phase 66 Phase 4b — under v2 mode, link_packages_v2 needs the
+    // full LinkTarget set in one batch so the GraphKey pre-pass can
+    // resolve cross-references. Per-package event-driven linking
+    // (which v1's isolated path uses) doesn't fit the v2 dispatcher's
+    // shape, so v2 always takes the serial path.
+    let v2_mode = store_v2_handle.is_some();
+    let event_driven_link =
+        !serial_link && !v2_mode && matches!(linker_mode, lpm_linker::LinkerMode::Isolated);
 
     // Phase 39 P2b: collection of per-package link handles. Cached
     // packages push into this before the fetch loop; fetch tasks push
@@ -4472,9 +4606,131 @@ async fn run_with_options_under_store_lock(
         >,
     > = Vec::new();
 
+    // Phase 66 followup #6b — event-driven v2 link dispatch.
+    //
+    // Predicate: the v2 plan can be precomputed BEFORE fetch iff every
+    // CAS-backed target arrives with both
+    //   (a) a known SRI (`p.integrity = Some(_)`), and
+    //   (b) resolver-threaded peers (`LinkTarget.peers` populated, or
+    //       the package declares no peer dependencies).
+    // Otherwise `link_v2_prepare` would silently produce an
+    // empty-peer-context graph key for any target whose peers are
+    // discovered post-fetch by reading `objects/<sri>/package.json`,
+    // diverging from the serial path. On predicate failure we fall
+    // through to today's serial v2 link at the link stage.
+    //
+    // Local-source targets (`Materialization::DirectorySource`) stay
+    // outside the v2 store and continue through the existing tail
+    // loop after `link_v2_finalize`; they are filtered out before the
+    // gate is checked.
+    //
+    // Mode independence: `link_v2_prepare` / `link_v2_one` /
+    // `link_v2_finalize` are linker-mode-agnostic for per-package
+    // work. `linker_mode` feeds into `LinkerModeTag` which is folded
+    // into graph-key derivation (Isolated vs Hoisted both produce
+    // valid keys), and `link_v2_finalize` handles project-side
+    // wiring identically across modes. So the gate does NOT require
+    // Isolated — the post-Phase-66-4f Hoisted default is fully
+    // supported.
+    let v2_cas_targets_pre: Vec<lpm_linker::v2::V2Target> = if v2_mode && !serial_link {
+        let mut acc: Vec<lpm_linker::v2::V2Target> = Vec::with_capacity(link_targets.len());
+        let mut all_have_sri = true;
+        for (lt, p) in link_targets.iter().zip(packages.iter()) {
+            if !matches!(lt.materialization, lpm_linker::Materialization::CasBacked) {
+                continue;
+            }
+            match p.integrity.as_deref() {
+                Some(sri) => acc.push(lpm_linker::v2::V2Target {
+                    target: lt.clone(),
+                    source_sri: sri.to_string(),
+                }),
+                None => {
+                    all_have_sri = false;
+                    break;
+                }
+            }
+        }
+        if all_have_sri { acc } else { Vec::new() }
+    } else {
+        Vec::new()
+    };
+    // Why `!used_lockfile` instead of
+    // `LinkPlanV2::all_targets_have_resolver_threaded_peers`:
+    //   `LinkTarget.peers` is empty for THREE reasons documented on the
+    //   field — (a) package declares no peer deps, (b) all declared
+    //   peers absent from install set, (c) lockfile fast-path didn't
+    //   thread peers. (a) + (b) are legitimate empty results from a
+    //   live resolver; (c) is the actual hazard the gate must catch.
+    //   The library helper `all_targets_have_resolver_threaded_peers`
+    //   uses `peers.is_empty()` as its sole signal, which conflates
+    //   (a)+(b) with (c) and would reject most fresh-resolution
+    //   installs (any package with no peer deps fails it). On a fresh
+    //   resolution (`!used_lockfile`), the resolver always traverses
+    //   peer-context, so any empty `peers` field is by construction
+    //   case (a) or (b) — `ensure_peer_context` would re-derive the
+    //   same empty set from `package.json`. On the lockfile fast-path
+    //   (`used_lockfile`), peers are NOT persisted today (per the
+    //   `LinkTarget.peers` doc), so we must fall back to serial v2.
+    let v2_event_driven =
+        v2_mode && !serial_link && !v2_cas_targets_pre.is_empty() && !used_lockfile;
+
+    // Plan + per-key V2Target index — both shared across the cache-hit
+    // dispatch loop and every per-pkg fetch task. `Arc<LinkPlanV2>`
+    // because the plan is read-only after build and lives across many
+    // blocking tasks. Empty on the !v2_event_driven path; the link
+    // stage falls through to `link_packages_v2` unchanged.
+    let v2_plan: Option<std::sync::Arc<lpm_linker::v2::LinkPlanV2>> = if v2_event_driven {
+        let plan = lpm_linker::v2::link_v2_prepare(
+            project_dir,
+            &v2_cas_targets_pre,
+            store_v2_handle
+                .as_deref()
+                .expect("v2_event_driven implies v2 store"),
+            linker_mode,
+        )?;
+        Some(std::sync::Arc::new(plan))
+    } else {
+        None
+    };
+    let v2_target_by_key: std::collections::HashMap<
+        lpm_lockfile::PackageKey,
+        lpm_linker::v2::V2Target,
+    > = if v2_event_driven {
+        packages
+            .iter()
+            .zip(link_targets.iter())
+            .filter_map(|(p, lt)| {
+                if !matches!(lt.materialization, lpm_linker::Materialization::CasBacked) {
+                    return None;
+                }
+                let sri = p.integrity.as_deref()?.to_string();
+                Some((
+                    p.package_key(),
+                    lpm_linker::v2::V2Target {
+                        target: lt.clone(),
+                        source_sri: sri,
+                    },
+                ))
+            })
+            .collect()
+    } else {
+        std::collections::HashMap::new()
+    };
+
+    // Per-package v2 link handles populated by both the cache-hit
+    // short-circuits below and the fetch tasks further down. Drained
+    // at the link stage and folded into the LinkResult.
+    type V2LinkHandle = tokio::task::JoinHandle<Result<(MaterializedPackage, bool), LpmError>>;
+    let mut v2_event_link_handles: Vec<V2LinkHandle> = Vec::new();
+
     // Phase 39 P2b: stale-entry cleanup runs once, up front — must
     // happen before any per-pkg link spawn touches `.lpm/` so the
     // `read_dir` scan sees a stable snapshot.
+    //
+    // Phase 66 followup #6b: under v2_event_driven, `link_v2_prepare`
+    // above already ran `cleanup_v1_state` (the v2-side equivalent),
+    // so this v1-shaped cleanup is skipped — running it would wipe
+    // node_modules a second time with no benefit.
     if event_driven_link {
         lpm_linker::cleanup_stale_entries(project_dir, &link_targets)?;
     }
@@ -4494,7 +4750,139 @@ async fn run_with_options_under_store_lock(
         // NOT satisfy the tarball dependency (would be silent
         // substitution). Trust-on-first-use Source::Tarball
         // (no recorded integrity) returns false → fetch runs.
-        if !force && p.store_has_source_aware(&store, project_dir) {
+        //
+        // Phase 66 Phase 4b — under v2 mode, a hit in v1's
+        // `<HOME>/.lpm/store/v1/` does NOT mean v2's
+        // `objects/<sri>/` is populated. Force a fetch so the v2
+        // path repopulates the object. (Phase 4 follow-up:
+        // detect-and-translate v1 → v2 to skip re-download for
+        // already-extracted bytes.)
+        //
+        // Per-source carve-out: local sources (`Source::Directory`
+        // / `Source::Link`) are NOT content-addressable and bypass
+        // both v1 and v2 stores. They live at the source realpath
+        // and their `store_has_source_aware` returns true iff that
+        // path resolves to a directory with a package.json. Sending
+        // them through the fetch loop under v2 mode is wrong:
+        // there's nothing to download, and the loop assigns them an
+        // empty integrity which then trips the binary lockfile's
+        // empty-string-vs-None guard.
+        let is_local_source = matches!(
+            p.source_kind(),
+            Ok(lpm_lockfile::Source::Directory { .. }) | Ok(lpm_lockfile::Source::Link { .. })
+        );
+
+        // Phase 66 §4 — v2 native cache-hit short-circuit.
+        //
+        // When v2 mode is active AND the v2 object dir for this
+        // package's SRI already exists (populated by a prior install
+        // OR by the speculative pre-fetcher earlier in this install),
+        // skip the fetch entirely. The v2 link dispatch reads
+        // `objects/<sri>/` directly, so no per-package linker hint
+        // is needed here — same shape as the v1 cache-hit gate
+        // below.
+        //
+        // Pre-Phase-4d this branch was missing because the v2 fetch
+        // path is itself idempotent (`extract_object_from_bytes`
+        // short-circuits on object hits), so a duplicate fetch was
+        // "free" in correctness terms but wasted network on every
+        // package. Workflow tests that mock the registry with
+        // `expect(1)` per tarball relied on the speculation path
+        // being a no-op (pre-4d drain) and broke under the wired-up
+        // 4d spec path because every package was downloaded twice.
+        if !force
+            && v2_mode
+            && !is_local_source
+            && let Some(v2_store) = store_v2_handle.as_deref()
+            && let Some(sri) = p.integrity.as_deref()
+            && let Ok(object_dir) = v2_store.paths().object_dir(sri)
+            && object_dir.exists()
+        {
+            cached += 1;
+            // Phase 66 followup #6b — dispatch link_v2_one immediately.
+            // The v2 object is already populated, so the link entry's
+            // clonefile pass can run on the blocking pool in parallel
+            // with sibling fetches. Awaited at the link stage below.
+            if v2_event_driven
+                && let Some(plan) = v2_plan.as_ref()
+                && let Some(target) = v2_target_by_key.get(&p.package_key()).cloned()
+            {
+                let plan_arc = std::sync::Arc::clone(plan);
+                let store_arc = std::sync::Arc::clone(
+                    store_v2_handle
+                        .as_ref()
+                        .expect("v2_event_driven implies v2 store"),
+                );
+                v2_event_link_handles.push(tokio::task::spawn_blocking(move || {
+                    lpm_linker::v2::link_v2_one(&plan_arc, &target, &store_arc)
+                }));
+            }
+            continue;
+        }
+
+        // Phase 66 §4 — v1 → v2 cache-hit translation.
+        //
+        // When we're under v2 mode AND v1 already has the extracted
+        // bytes for this package AND we know the SRI (lockfile-fast-
+        // path or prior install populated `p.integrity`), copy the
+        // bytes from `~/.lpm/store/v1/<name>/<version>/` into
+        // `~/.lpm/store/v2/objects/<sri>/` instead of forcing a fresh
+        // tarball download. The translation is bounded by a single
+        // `copy_dir_recursively` (kernel CoW reflink on supporting
+        // filesystems, plain copy elsewhere) — cheaper than the
+        // network + extract round-trip.
+        //
+        // After translation, this package falls into the same
+        // `cached += 1; continue;` slot as the v1 cache-hit gate
+        // below, because the v2 link dispatch (around L5325) reads
+        // `~/.lpm/store/v2/objects/<sri>/` directly and the object
+        // is now populated.
+        //
+        // Falls through to the regular fetch path on any error — the
+        // re-download is the correct fallback and matches pre-Phase-66
+        // behavior under v2 mode.
+        if !force
+            && v2_mode
+            && !is_local_source
+            && let Some(v2_store) = store_v2_handle.as_deref()
+            && let Some(sri) = p.integrity.as_deref()
+            && p.store_has_source_aware(&store, project_dir)
+            && let Ok(v1_pkg_dir) = p.store_path_or_err(&store, project_dir, None)
+        {
+            match v2_store.populate_object_from_v1(&v1_pkg_dir, sri) {
+                Ok(_) => {
+                    cached += 1;
+                    // Phase 66 followup #6b — see the v2 SRI-direct
+                    // cache-hit branch above. Translation populated
+                    // `objects/<sri>/`; dispatch link immediately.
+                    if v2_event_driven
+                        && let Some(plan) = v2_plan.as_ref()
+                        && let Some(target) = v2_target_by_key.get(&p.package_key()).cloned()
+                    {
+                        let plan_arc = std::sync::Arc::clone(plan);
+                        let store_arc = std::sync::Arc::clone(
+                            store_v2_handle
+                                .as_ref()
+                                .expect("v2_event_driven implies v2 store"),
+                        );
+                        v2_event_link_handles.push(tokio::task::spawn_blocking(move || {
+                            lpm_linker::v2::link_v2_one(&plan_arc, &target, &store_arc)
+                        }));
+                    }
+                    continue;
+                }
+                Err(e) => {
+                    tracing::debug!(
+                        "v1→v2 translation for {}@{} failed: {e} (falling back to fetch)",
+                        p.name,
+                        p.version
+                    );
+                }
+            }
+        }
+
+        if !force && (is_local_source || !v2_mode) && p.store_has_source_aware(&store, project_dir)
+        {
             cached += 1;
             // Phase 39 P2b: spawn per-pkg link task immediately — this
             // package is already materialized in the store, so Phase 1
@@ -4518,6 +4906,7 @@ async fn run_with_options_under_store_lock(
                     root_link_names: p.root_link_names.clone(),
                     wrapper_id: p.wrapper_id_for_source(),
                     materialization: p.materialization_for_source(),
+                    peers: p.peers.clone(),
                 };
                 let pd = project_dir.to_path_buf();
                 let force_flag = force;
@@ -4897,6 +5286,10 @@ async fn run_with_options_under_store_lock(
             let sem = semaphore.clone();
             let client = arc_client.clone();
             let store_ref = store.clone();
+            // Phase 66 Phase 4b — clone the Optional v2 handle into the
+            // per-package spawn. `Option::clone` is a Some/None match
+            // and `Arc::clone` is a refcount bump; cheap.
+            let store_v2_ref = store_v2_handle.clone();
             let coord = fetch_coord.clone();
             let overall = overall.clone();
             let force_flag = force;
@@ -4910,11 +5303,28 @@ async fn run_with_options_under_store_lock(
             // the per-package fetch task. Cheap clone (Arc ref-bump
             // for the inner NpmrcConfig).
             let route_table_c = route_table.clone();
+            // Phase 66 followup #6b — per-task v2 event-driven link
+            // captures. `v2_plan_arc` is None on the !v2_event_driven
+            // path; `v2_target_for_pkg` resolved here once so the
+            // per-task closure doesn't carry the whole index map.
+            let v2_plan_arc = v2_plan.as_ref().map(std::sync::Arc::clone);
+            let v2_target_for_pkg = if v2_event_driven {
+                v2_target_by_key.get(&p.package_key()).cloned()
+            } else {
+                None
+            };
 
             handles.push(tokio::spawn(async move {
                 type LinkHandle = tokio::task::JoinHandle<
                     Result<(MaterializedPackage, lpm_linker::OnePackageResult), LpmError>,
                 >;
+                // Phase 66 followup #6b — v2-shape link handle. Mutually
+                // exclusive with `LinkHandle` at runtime: under v2_mode,
+                // `event_link` is false (so `LinkHandle` is always None);
+                // under !v2_mode, `v2_plan_arc` is None (so this is
+                // always None).
+                type V2LinkHandle =
+                    tokio::task::JoinHandle<Result<(MaterializedPackage, bool), LpmError>>;
 
                 // P0 timing: spawn→key-lock→permit captures the full time this
                 // task sat queued. Phase 39 P2: now also covers the
@@ -4966,6 +5376,7 @@ async fn run_with_options_under_store_lock(
                         root_link_names: p.root_link_names.clone(),
                         wrapper_id: p.wrapper_id_for_source(),
                         materialization: p.materialization_for_source(),
+                        peers: p.peers.clone(),
                     };
                     let pd = project_dir_buf.clone();
                     Ok(Some(tokio::task::spawn_blocking(move || {
@@ -5005,6 +5416,28 @@ async fn run_with_options_under_store_lock(
                     // URL value.
                     let sri = lpm_store::read_stored_integrity(&existing_path).unwrap_or_default();
                     let link_h = spawn_link(&p, None)?;
+                    // Phase 66 followup #6b — sibling-skip path. The
+                    // v2 object dir was populated by the sibling's
+                    // fetch task (or the sibling is in the middle of
+                    // populating it; the per-key fetch lock above
+                    // ensures we observe the post-extract state).
+                    // Dispatch the v2 link entry materialization in
+                    // the same shape as the post-fetch path below.
+                    let v2_link_h: Option<V2LinkHandle> =
+                        if let (Some(plan), Some(target), Some(store_v2)) = (
+                            v2_plan_arc.as_ref(),
+                            v2_target_for_pkg.as_ref(),
+                            store_v2_ref.as_ref(),
+                        ) {
+                            let plan_c = std::sync::Arc::clone(plan);
+                            let target_c = target.clone();
+                            let store_c = std::sync::Arc::clone(store_v2);
+                            Some(tokio::task::spawn_blocking(move || {
+                                lpm_linker::v2::link_v2_one(&plan_c, &target_c, &store_c)
+                            }))
+                        } else {
+                            None
+                        };
                     overall.inc(1);
                     // Phase 59.0 day-7 (F1 finish-line): emit the
                     // source-aware key (matches the spawn return
@@ -5015,6 +5448,7 @@ async fn run_with_options_under_store_lock(
                             String,
                             TaskTimings,
                             Option<LinkHandle>,
+                            Option<V2LinkHandle>,
                             Option<String>,
                         ),
                         LpmError,
@@ -5026,6 +5460,7 @@ async fn run_with_options_under_store_lock(
                             ..Default::default()
                         },
                         link_h,
+                        v2_link_h,
                         None,
                     ));
                 }
@@ -5051,14 +5486,23 @@ async fn run_with_options_under_store_lock(
                 // store path is content-addressable by integrity.
                 let is_tarball_source =
                     matches!(p.source_kind(), Ok(lpm_lockfile::Source::Tarball { .. }));
+                let store_v2_arg = store_v2_ref.as_deref();
                 let (computed_sri, task_timings, final_url) = if is_tarball_source {
-                    fetch_and_store_tarball_url(&client, &store_ref, &p, queue_wait_ms, permit)
-                        .await?
+                    fetch_and_store_tarball_url(
+                        &client,
+                        &store_ref,
+                        store_v2_arg,
+                        &p,
+                        queue_wait_ms,
+                        permit,
+                    )
+                    .await?
                 } else if streaming_fetch {
                     fetch_and_store_streaming(
                         &client,
                         &route_table_c,
                         &store_ref,
+                        store_v2_arg,
                         &p,
                         queue_wait_ms,
                         &project_dir_buf,
@@ -5071,6 +5515,7 @@ async fn run_with_options_under_store_lock(
                         &client,
                         &route_table_c,
                         &store_ref,
+                        store_v2_arg,
                         &p,
                         queue_wait_ms,
                         &project_dir_buf,
@@ -5092,6 +5537,27 @@ async fn run_with_options_under_store_lock(
                 // registry slot. Registry sources ignore the override.
                 let link_h = spawn_link(&p, Some(&computed_sri))?;
 
+                // Phase 66 followup #6b — dispatch v2 link entry
+                // materialization on the blocking pool now that the
+                // tarball is extracted into `objects/<sri>/`. Runs in
+                // parallel with sibling fetch tasks still downloading
+                // and (importantly) cuts the post-fetch link-stage tail.
+                let v2_link_h: Option<V2LinkHandle> =
+                    if let (Some(plan), Some(target), Some(store_v2)) = (
+                        v2_plan_arc.as_ref(),
+                        v2_target_for_pkg.as_ref(),
+                        store_v2_ref.as_ref(),
+                    ) {
+                        let plan_c = std::sync::Arc::clone(plan);
+                        let target_c = target.clone();
+                        let store_c = std::sync::Arc::clone(store_v2);
+                        Some(tokio::task::spawn_blocking(move || {
+                            lpm_linker::v2::link_v2_one(&plan_c, &target_c, &store_c)
+                        }))
+                    } else {
+                        None
+                    };
+
                 overall.inc(1);
                 // Phase 59.0 day-7 (F1 finish-line): emit the
                 // source-aware PackageKey so the post-fetch
@@ -5106,6 +5572,7 @@ async fn run_with_options_under_store_lock(
                         String,
                         TaskTimings,
                         Option<LinkHandle>,
+                        Option<V2LinkHandle>,
                         Option<String>,
                     ),
                     LpmError,
@@ -5114,6 +5581,7 @@ async fn run_with_options_under_store_lock(
                     computed_sri,
                     task_timings,
                     link_h,
+                    v2_link_h,
                     Some(final_url),
                 ))
             }));
@@ -5134,13 +5602,19 @@ async fn run_with_options_under_store_lock(
         let mut integrity_map: std::collections::HashMap<lpm_lockfile::PackageKey, String> =
             std::collections::HashMap::new();
         for handle in handles {
-            let (pkg_key, sri, timings, link_h, final_url) = handle
+            let (pkg_key, sri, timings, link_h, v2_link_h, final_url) = handle
                 .await
                 .map_err(|e| LpmError::Registry(format!("download task panicked: {e}")))??;
             integrity_map.insert(pkg_key.clone(), sri);
             fetch_breakdown.record(timings);
             if let Some(lh) = link_h {
                 event_link_handles.push(lh);
+            }
+            // Phase 66 followup #6b — funnel v2 link handles emitted
+            // by the fetch tasks into the same drain queue the cache-
+            // hit branches above feed.
+            if let Some(lh) = v2_link_h {
+                v2_event_link_handles.push(lh);
             }
             if let Some(url) = final_url {
                 fresh_urls.insert(pkg_key, url);
@@ -5268,6 +5742,162 @@ async fn run_with_options_under_store_lock(
             self_referenced: finalize.self_referenced,
             materialized: materialized_all,
         }
+    } else if let Some(store_v2) = store_v2_handle.as_deref() {
+        // Phase 66 Phase 4b — v2 path with per-source routing.
+        //
+        // Per the v2 preplan (§9), CAS-backed sources (Registry,
+        // Tarball remote+local, Git) flow through the v2 store +
+        // link-entry materialization. Local-source kinds
+        // (`Source::Directory` = `file:`, `Source::Link` = `link:`)
+        // are NOT content-addressable (the source can be edited at
+        // any time) and intentionally stay outside the global v2
+        // store. They land as project-side symlinks pointing at the
+        // source realpath — same observable contract as v1's
+        // wrapper-based path for the audit-fixture scope (the local
+        // source has no transitive deps, so Node's module resolution
+        // doesn't need a wrapper boundary).
+        let sri_by_pkg: HashMap<(String, String), String> = packages
+            .iter()
+            .filter_map(|p| {
+                p.integrity
+                    .clone()
+                    .map(|sri| ((p.name.clone(), p.version.clone()), sri))
+            })
+            .collect();
+
+        let mut v2_targets: Vec<lpm_linker::v2::V2Target> = Vec::with_capacity(link_targets.len());
+        let mut local_targets: Vec<&LinkTarget> = Vec::new();
+        for t in &link_targets {
+            match t.materialization {
+                lpm_linker::Materialization::CasBacked => {
+                    let sri = sri_by_pkg
+                        .get(&(t.name.clone(), t.version.clone()))
+                        .cloned()
+                        .ok_or_else(|| {
+                            LpmError::Registry(format!(
+                                "v2 install: missing source SRI for {}@{}",
+                                t.name, t.version
+                            ))
+                        })?;
+                    v2_targets.push(lpm_linker::v2::V2Target {
+                        target: t.clone(),
+                        source_sri: sri,
+                    });
+                }
+                lpm_linker::Materialization::DirectorySource => {
+                    local_targets.push(t);
+                }
+            }
+        }
+
+        // Phase 66 followup #6b — event-driven v2 path.
+        //
+        // When `v2_event_driven` was true, `link_v2_prepare` already
+        // ran above and per-package `link_v2_one` tasks were spawned
+        // by the cache-hit short-circuits and the fetch tasks.
+        // Here we just await those handles, run `link_v2_finalize`,
+        // and assemble the same `LinkResult` shape `link_packages_v2`
+        // would have produced. The serial fall-back below keeps the
+        // shape of the pre-#6b path for installs that didn't pass the
+        // gate (e.g. `Source::Tarball` TOFU before the SRI is known).
+        let mut result = if v2_event_driven {
+            let plan = v2_plan
+                .as_ref()
+                .expect("v2_event_driven implies v2_plan is Some");
+            let mut materialized_all: Vec<MaterializedPackage> =
+                Vec::with_capacity(v2_event_link_handles.len());
+            let mut linked_count = 0usize;
+            for h in v2_event_link_handles.drain(..) {
+                let (m, fresh) = h
+                    .await
+                    .map_err(|e| LpmError::Registry(format!("v2 link task panicked: {e}")))??;
+                materialized_all.push(m);
+                if fresh {
+                    linked_count += 1;
+                }
+            }
+            let finalize =
+                lpm_linker::v2::link_v2_finalize(project_dir, plan, store_v2, pkg.name.as_deref())?;
+            let cas_total = plan.augmented_targets.len();
+            LinkResult {
+                linked: linked_count,
+                symlinked: finalize.symlinked,
+                bin_linked: finalize.bin_count,
+                skipped: cas_total.saturating_sub(linked_count),
+                self_referenced: finalize.self_referenced,
+                materialized: materialized_all,
+            }
+        } else {
+            lpm_linker::v2::link_packages_v2(
+                project_dir,
+                &v2_targets,
+                store_v2,
+                linker_mode,
+                pkg.name.as_deref(),
+            )?
+        };
+
+        // Materialize directory-source targets via project-side
+        // symlink to the source realpath. Both the event-driven
+        // `link_v2_finalize` path and the serial `link_packages_v2`
+        // path wipe + recreate `<project>/node_modules/`, so we
+        // append here either way.
+        if !local_targets.is_empty() {
+            let nm = project_dir.join("node_modules");
+            std::fs::create_dir_all(&nm).map_err(|e| {
+                LpmError::Registry(format!(
+                    "v2 install (local-source): failed to ensure node_modules at {}: {e}",
+                    nm.display()
+                ))
+            })?;
+            for t in local_targets {
+                let names: Vec<String> = if let Some(rl) = &t.root_link_names {
+                    rl.clone()
+                } else if t.is_direct {
+                    vec![t.name.clone()]
+                } else {
+                    Vec::new()
+                };
+                for root_name in &names {
+                    let link_path = nm.join(root_name);
+                    if let Some(parent) = link_path.parent()
+                        && parent != nm
+                        && !parent.exists()
+                    {
+                        std::fs::create_dir_all(parent).map_err(|e| {
+                            LpmError::Registry(format!(
+                                "v2 install (local-source): failed to create scope dir at {}: {e}",
+                                parent.display()
+                            ))
+                        })?;
+                    }
+                    if link_path.symlink_metadata().is_ok() {
+                        // CAS root symlink already at slot — local-source
+                        // dep with the same root_link_name would only
+                        // occur via aliasing, which the resolver
+                        // disambiguates upstream. Defensive skip.
+                        continue;
+                    }
+                    lpm_common::symlink::create_dir_symlink_or_junction(&t.store_path, &link_path)
+                        .map_err(|e| {
+                            LpmError::Registry(format!(
+                                "v2 install (local-source): failed to symlink {} → {}: {e}",
+                                link_path.display(),
+                                t.store_path.display()
+                            ))
+                        })?;
+                    result.symlinked += 1;
+                }
+                result.materialized.push(MaterializedPackage {
+                    name: t.name.clone(),
+                    version: t.version.clone(),
+                    destination: t.store_path.clone(),
+                });
+                result.linked += 1;
+            }
+        }
+
+        result
     } else {
         match linker_mode {
             lpm_linker::LinkerMode::Hoisted => lpm_linker::link_packages_hoisted(
@@ -6379,6 +7009,19 @@ async fn run_with_options_under_store_lock(
     // check can take the mtime fast path.
     write_post_install_v6_hash(project_dir, linker_mode);
 
+    // Phase 66 Phase 4e — register the project in the machine-global
+    // known-projects registry. `lpm cache prune` walks this set to
+    // determine which v2-store link entries are reachable. Errors are
+    // logged + dropped: the registry is non-load-bearing (prune
+    // degrades gracefully without it) so a flaky write must never
+    // block a successful install.
+    if let Ok(lpm_root) = lpm_common::LpmRoot::from_env()
+        && let Err(e) =
+            lpm_common::known_projects::register(&lpm_root.known_projects(), project_dir)
+    {
+        tracing::debug!("phase 4e: failed to register project in known-projects registry: {e}");
+    }
+
     // Phase 33 audit Finding 1 fix: surface the direct-dep version map
     // for callers (`run_add_packages`, `run_install_filtered_add`) that
     // need to finalize a placeholder-staged manifest entry. The map
@@ -7102,6 +7745,7 @@ fn try_lockfile_fast_path(
                 root_link_names,
                 is_direct: direct_target_names.contains(&lp.name),
                 is_lpm,
+                peers: Vec::new(),
                 integrity: lp.integrity.clone(),
                 // Phase 43 — gate a stored URL against scheme/shape/
                 // origin before reusing it. Any rejection downgrades
@@ -7313,6 +7957,11 @@ fn resolved_to_install_packages(
                 root_link_names,
                 is_direct: direct_target_names.contains(&name),
                 is_lpm,
+                // Phase 66 §2.5 — peer-context threading. The resolver
+                // intersected this package's declared peers against
+                // the install set; carry the resulting
+                // `(peer_name, version)` list straight through.
+                peers: r.peers.clone(),
                 integrity: r.integrity.clone(),
                 tarball_url: r.tarball_url.clone(),
             })
@@ -7361,6 +8010,7 @@ async fn run_link_and_finish(
                 root_link_names: p.root_link_names.clone(),
                 wrapper_id: p.wrapper_id_for_source(),
                 materialization: p.materialization_for_source(),
+                peers: p.peers.clone(),
             })
         })
         .collect::<Result<_, _>>()?;
@@ -7840,6 +8490,12 @@ fn spawn_speculation_dispatcher(
     semaphore: Arc<Semaphore>,
     coord: Arc<FetchCoordinator>,
     deps: HashMap<String, String>,
+    // Phase 66 §4 — under v2 mode the dispatcher routes downloaded
+    // bytes through `v2::Store::extract_object_from_bytes` instead of
+    // v1's per-`(name, version)` slot. `None` keeps the legacy v1 path
+    // for callers running with the env var unset (and for the migration-
+    // window code paths that still write v1 alongside).
+    store_v2: Option<Arc<lpm_store::v2::Store>>,
 ) -> (tokio::task::JoinHandle<()>, DispatcherCounters) {
     use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 
@@ -7849,6 +8505,7 @@ fn spawn_speculation_dispatcher(
     let store_spec = store;
     let sem_spec = semaphore;
     let coord_spec = coord;
+    let store_v2_spec = store_v2;
 
     let dispatched = Arc::new(AtomicU64::new(0));
     let completed = Arc::new(AtomicU64::new(0));
@@ -7868,6 +8525,20 @@ fn spawn_speculation_dispatcher(
 
     let mut rx = rx;
     let handle = tokio::spawn(async move {
+        // Phase 66 Phase 4d — under v2 mode the dispatcher writes to
+        // v2's `objects/<sri>/` via `extract_object_from_bytes`. The
+        // store handle threads through `speculative_download_and_store`
+        // below; when `store_v2_spec` is `Some`, the spec download
+        // collects bytes (rather than streaming straight to disk) and
+        // hands them to the v2 store's idempotent extract. The legacy
+        // v1 path runs when `store_v2_spec` is `None`.
+        //
+        // Pre-Phase-4d this branch drained the channel as a no-op,
+        // forcing the real fetch loop to do all download work — v2
+        // installs paid full per-package fetch latency on the hot
+        // path. With this wired, v2 cold installs match v1's
+        // pipelined-fetch shape.
+
         // Work queue items: (package_name, range_string, depth, is_root).
         // Depth is 1 for roots, N+1 for each transitive hop. Capped at
         // SPECULATION_MAX_DEPTH.
@@ -7972,12 +8643,14 @@ fn spawn_speculation_dispatcher(
                 let coord = coord_spec.clone();
                 let completed_task = completed_c.clone();
                 let task_ms_task = task_ms_c.clone();
+                let store_v2_task = store_v2_spec.clone();
                 spec_tasks.push(tokio::spawn(async move {
                 let task_start = std::time::Instant::now();
                 match speculative_download_and_store(
                     &c,
                     &rt,
                     &s,
+                    store_v2_task.as_deref(),
                     &sem,
                     &coord,
                     &name,
@@ -8093,6 +8766,11 @@ async fn speculative_download_and_store(
     client: &Arc<RegistryClient>,
     route_table: &RouteTable,
     store: &PackageStore,
+    // Phase 66 §4 — when `Some`, route the downloaded bytes through
+    // v2's `extract_object_from_bytes` (idempotent on object hits)
+    // instead of v1's `stream_and_store_package`. Each spec task
+    // gets its own clone of the `Arc<Store>`.
+    store_v2: Option<&lpm_store::v2::Store>,
     semaphore: &Arc<Semaphore>,
     coord: &Arc<FetchCoordinator>,
     name: &str,
@@ -8121,7 +8799,25 @@ async fn speculative_download_and_store(
     let key_lock = coord.lock_for(speculation_key).await;
     let _key_guard = key_lock.lock().await;
 
-    if store.has_package(name, version) {
+    // Phase 66 §4 — store-hit short-circuit, layout-aware. Under v2
+    // mode the SRI determines the object dir; if the SRI is
+    // unavailable (TOFU resolution path) we fall back to v1's
+    // `(name, version)` check, which is harmless under v2 (it just
+    // misses an opportunity to skip).
+    let already_present = if let Some(v2) = store_v2 {
+        match integrity {
+            Some(sri) => v2
+                .paths()
+                .object_dir(sri)
+                .ok()
+                .map(|dir| dir.exists())
+                .unwrap_or(false),
+            None => store.has_package(name, version),
+        }
+    } else {
+        store.has_package(name, version)
+    };
+    if already_present {
         return Ok(());
     }
 
@@ -8136,9 +8832,33 @@ async fn speculative_download_and_store(
     let response = client
         .download_tarball_streaming_routed(route_table, name, url)
         .await?;
+
+    if let Some(v2) = store_v2 {
+        // v2 path: collect bytes, extract via v2 store. Streaming-to-
+        // disk into v2 is a future optimization (Phase 4d/4f); for
+        // speculation the in-memory shape is fine because spec sets
+        // are bounded (a few hundred packages parallel, each typically
+        // <500 KB compressed). The semaphore upstream caps the
+        // concurrent allocator pressure.
+        let body = response.bytes().await.map_err(|e| {
+            LpmError::Registry(format!("spec body fetch failed for {name}@{version}: {e}"))
+        })?;
+        let v2_clone = v2.clone();
+        let bytes = body.to_vec();
+        let integrity_c = integrity.map(|s| s.to_string());
+        tokio::task::spawn_blocking(move || {
+            v2_clone
+                .extract_object_from_bytes(&bytes, integrity_c.as_deref())
+                .map(|_| ())
+        })
+        .await
+        .map_err(|e| LpmError::Registry(format!("spec v2 blocking task: {e}")))??;
+        return Ok(());
+    }
+
+    // v1 path: streaming straight to the per-`(name, version)` slot.
     let byte_stream = response.bytes_stream().map_err(std::io::Error::other);
     let async_reader = StreamReader::new(byte_stream);
-
     let name_c = name.to_string();
     let version_c = version.to_string();
     let integrity_c = integrity.map(|s| s.to_string());
@@ -8281,6 +9001,9 @@ async fn fetch_and_store_legacy(
     client: &Arc<RegistryClient>,
     route_table: &RouteTable,
     store: &PackageStore,
+    // Phase 66 Phase 4b — see [`fetch_and_store_streaming`] for the
+    // contract. None → v1 (default + every release through Phase 4d).
+    store_v2: Option<&lpm_store::v2::Store>,
     p: &InstallPackage,
     queue_wait_ms: u128,
     project_dir: &Path,
@@ -8430,12 +9153,32 @@ async fn fetch_and_store_legacy(
     }
     let integrity_ms = integrity_start.elapsed().as_millis();
 
-    let (_, stage) = store.store_package_from_file_timed(
-        &p.name,
-        &p.version,
-        downloaded.file.path(),
-        &computed_sri,
-    )?;
+    let stage = if let Some(store_v2) = store_v2 {
+        // Phase 66 Phase 4b — v2 path. Read the on-disk tarball into
+        // memory and route through `extract_object_from_bytes`. The
+        // legacy fetch path's whole point is to spool the download
+        // to a temp file (vs the streaming path's in-memory body), so
+        // we incur the read-to-bytes cost here rather than refactor
+        // the streaming abstraction; the perf delta is bounded by
+        // tarball size which already passed the size limit upstream.
+        let bytes = std::fs::read(downloaded.file.path()).map_err(|e| {
+            LpmError::Registry(format!(
+                "v2 store: failed to re-read downloaded tarball at {}: {e}",
+                downloaded.file.path().display()
+            ))
+        })?;
+        let (_obj_dir, _sri, timings) =
+            store_v2.extract_object_from_bytes(&bytes, p.integrity.as_deref())?;
+        timings
+    } else {
+        let (_, stage) = store.store_package_from_file_timed(
+            &p.name,
+            &p.version,
+            downloaded.file.path(),
+            &computed_sri,
+        )?;
+        stage
+    };
 
     Ok((
         computed_sri,
@@ -8478,6 +9221,9 @@ async fn fetch_and_store_legacy(
 async fn fetch_and_store_tarball_url(
     client: &Arc<RegistryClient>,
     store: &PackageStore,
+    // Phase 66 Phase 4b — see [`fetch_and_store_streaming`] for the
+    // contract. None → v1 (default + every release through Phase 4d).
+    store_v2: Option<&lpm_store::v2::Store>,
     p: &InstallPackage,
     queue_wait_ms: u128,
     permit: tokio::sync::OwnedSemaphorePermit,
@@ -8507,8 +9253,23 @@ async fn fetch_and_store_tarball_url(
     let integrity_ms = 0;
 
     let extract_start = std::time::Instant::now();
-    let _store_path = store.store_tarball_at_cas_path(&computed_sri, &data)?;
-    let extract_ms = extract_start.elapsed().as_millis();
+    let extract_ms = if let Some(store_v2) = store_v2 {
+        // Phase 66 Phase 4b — v2 path. The Source::Tarball case
+        // already has bytes + SRI in hand; route them straight into
+        // `extract_object_from_bytes`. Re-verification through the
+        // expected_integrity arg is a no-op (caller passes the same
+        // SRI download_tarball_with_integrity already produced).
+        let (_obj_dir, _sri, timings) =
+            store_v2.extract_object_from_bytes(&data, Some(&computed_sri))?;
+        // Tarball-URL path's telemetry historically lumps everything
+        // under extract_ms (see comment at the v1 timings construction
+        // below); under v2 we surface the v2 timings' total instead so
+        // the JSON shape stays meaningful.
+        timings.extract_ms + timings.security_ms + timings.finalize_ms
+    } else {
+        let _store_path = store.store_tarball_at_cas_path(&computed_sri, &data)?;
+        extract_start.elapsed().as_millis()
+    };
 
     // Permit released here — extract is done, this task is finished.
     drop(permit);
@@ -8547,6 +9308,11 @@ async fn fetch_and_store_streaming(
     client: &Arc<RegistryClient>,
     route_table: &RouteTable,
     store: &PackageStore,
+    // Phase 66 Phase 4b — when `Some`, the install pipeline is running
+    // under `LPM_STORE_VERSION=v2`. Bytes flow into the v2
+    // `objects/<sri>/` path instead of v1's `<name>@<version>/`. None
+    // → v1 path (today's default + every release through Phase 4d).
+    store_v2: Option<&lpm_store::v2::Store>,
     p: &InstallPackage,
     queue_wait_ms: u128,
     project_dir: &Path,
@@ -8678,22 +9444,43 @@ async fn fetch_and_store_streaming(
     let version = p.version.clone();
     let expected_integrity = p.integrity.clone();
     let store_owned = store.clone();
+    // Phase 66 Phase 4b — capture the Optional v2 handle into the
+    // blocking task. Cloning an `Option<Store>` is cheap (the inner
+    // `Store` derives Clone over a single PathBuf), and `None` keeps
+    // the existing v1 path byte-for-byte.
+    let store_v2_owned = store_v2.cloned();
 
     // Everything below runs on the blocking pool — frees the tokio async
     // workers to keep driving network reads. No download permit is held.
     let extract_start = std::time::Instant::now();
-    let (computed_sri, stage) = tokio::task::spawn_blocking(move || {
-        let cursor = std::io::Cursor::new(body);
-        store_owned
-            .stream_and_store_package(
-                &name,
-                &version,
-                cursor,
-                expected_integrity.as_deref(),
-                lpm_registry::MAX_COMPRESSED_TARBALL_SIZE,
-            )
-            .map(|(_path, sri, timings)| (sri, timings))
-    })
+    let (computed_sri, stage) = tokio::task::spawn_blocking(
+        move || -> Result<(String, lpm_store::StageTimings), LpmError> {
+            if let Some(store_v2) = store_v2_owned {
+                // Phase 66 Phase 4b — v2 path. Bytes flow through
+                // `extract_object_from_bytes`: SHA-512 hash → integrity
+                // verify → extract into `objects/<sri>/` → security
+                // analysis → atomic rename. SizeLimit is enforced
+                // upstream by `download_tarball_streaming`'s
+                // Content-Length check (same as the v1 streaming path's
+                // `SizeLimitedReader`), so the buffered `body` is
+                // already bounded.
+                let (_obj_dir, sri, timings) =
+                    store_v2.extract_object_from_bytes(&body, expected_integrity.as_deref())?;
+                Ok((sri, timings))
+            } else {
+                let cursor = std::io::Cursor::new(body);
+                store_owned
+                    .stream_and_store_package(
+                        &name,
+                        &version,
+                        cursor,
+                        expected_integrity.as_deref(),
+                        lpm_registry::MAX_COMPRESSED_TARBALL_SIZE,
+                    )
+                    .map(|(_path, sri, timings)| (sri, timings))
+            }
+        },
+    )
     .await
     .map_err(|e| LpmError::Registry(format!("streaming extract task panicked: {e}")))??;
     let pipeline_ms = extract_start.elapsed().as_millis();
@@ -10185,6 +10972,100 @@ mod tests {
         LOCK.get_or_init(|| Mutex::new(())).lock().unwrap()
     }
 
+    // ── Phase 66 Phase 4d migration tests ───────────────────────────
+
+    #[test]
+    fn needs_v2_migration_detects_legacy_isolated_wrappers() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".lpm/wrappers/express@4.21.0")).unwrap();
+        assert!(needs_v2_migration(dir.path()));
+    }
+
+    #[test]
+    fn needs_v2_migration_detects_legacy_hoisted_metadata() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".lpm/hoisted")).unwrap();
+        std::fs::write(dir.path().join(".lpm/hoisted/metadata.json"), b"{}").unwrap();
+        assert!(needs_v2_migration(dir.path()));
+    }
+
+    #[test]
+    fn needs_v2_migration_returns_false_on_clean_v2_or_fresh_project() {
+        let dir = tempfile::tempdir().unwrap();
+        // Fresh project (no .lpm at all) — must NOT trigger migration.
+        assert!(!needs_v2_migration(dir.path()));
+
+        // Clean v2 install: project node_modules has symlinks but no
+        // legacy `.lpm/wrappers/` or `.lpm/hoisted/`.
+        std::fs::create_dir_all(dir.path().join("node_modules")).unwrap();
+        std::fs::create_dir_all(dir.path().join(".lpm")).unwrap();
+        std::fs::write(dir.path().join(".lpm/install-hash"), b"hash").unwrap();
+        assert!(
+            !needs_v2_migration(dir.path()),
+            "v2 install with no legacy markers must not request migration"
+        );
+    }
+
+    #[test]
+    fn migrate_v1_to_v2_wipes_all_required_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path();
+
+        // Synthesize a fully-populated v1 isolated install.
+        let wrappers = project.join(".lpm/wrappers/express@4.21.0/node_modules/express");
+        std::fs::create_dir_all(&wrappers).unwrap();
+        std::fs::write(wrappers.join("package.json"), b"{}").unwrap();
+        std::fs::write(project.join(".lpm/install-hash"), b"deadbeef").unwrap();
+        let nm = project.join("node_modules");
+        std::fs::create_dir_all(nm.join(".bin")).unwrap();
+        std::fs::write(nm.join(".bin/some-shim"), b"#!/bin/sh").unwrap();
+        std::fs::create_dir_all(nm.join("express")).unwrap();
+        // Also a hoisted-mode sidecar to verify both legacy roots are wiped.
+        std::fs::create_dir_all(project.join(".lpm/hoisted")).unwrap();
+        std::fs::write(project.join(".lpm/hoisted/metadata.json"), b"{}").unwrap();
+
+        migrate_v1_to_v2(project).unwrap();
+
+        assert!(!project.join(".lpm/wrappers").exists());
+        assert!(!project.join(".lpm/hoisted").exists());
+        assert!(!project.join("node_modules").exists());
+        assert!(!project.join(".lpm/install-hash").exists());
+        // Project root + .lpm dir itself survive — only the legacy
+        // children get wiped, so other lpm sidecars (build-state,
+        // trust-snapshot) aren't accidentally collateral.
+        assert!(project.exists());
+        assert!(project.join(".lpm").exists());
+    }
+
+    #[test]
+    fn migrate_v1_to_v2_is_idempotent_on_clean_state() {
+        let dir = tempfile::tempdir().unwrap();
+        // No legacy state at all — migration must succeed as a no-op.
+        migrate_v1_to_v2(dir.path()).unwrap();
+        // Second call also a no-op.
+        migrate_v1_to_v2(dir.path()).unwrap();
+    }
+
+    #[test]
+    fn migrate_v1_to_v2_preserves_project_lpm_sidecars() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path();
+
+        // build-state and trust-snapshot live alongside install-hash
+        // but persist across installs (they encode user-approved
+        // policy); migration must NOT wipe them.
+        std::fs::create_dir_all(project.join(".lpm")).unwrap();
+        std::fs::write(project.join(".lpm/build-state.json"), b"{}").unwrap();
+        std::fs::write(project.join(".lpm/trust-snapshot.json"), b"{}").unwrap();
+        std::fs::create_dir_all(project.join(".lpm/wrappers")).unwrap();
+
+        migrate_v1_to_v2(project).unwrap();
+
+        assert!(project.join(".lpm/build-state.json").exists());
+        assert!(project.join(".lpm/trust-snapshot.json").exists());
+        assert!(!project.join(".lpm/wrappers").exists());
+    }
+
     /// Phase 46 P5 Chunk 5 regression guard: the P4 drift gate MUST
     /// appear in `install::run` before the `rebuild::run` auto-build
     /// call site. If a future refactor moves the drift check past
@@ -11417,6 +12298,7 @@ mod tests {
             root_link_names: None,
             is_direct,
             is_lpm: false,
+            peers: Vec::new(),
             integrity: None,
             tarball_url: None,
         }
@@ -12406,6 +13288,7 @@ mod tests {
             version: NpmVersion::parse(version).expect("valid version"),
             dependencies: Vec::new(),
             aliases: HashMap::new(),
+            peers: Vec::new(),
             tarball_url: None,
             integrity: None,
         }
@@ -13363,6 +14246,7 @@ mod tests {
             root_link_names: None,
             is_direct: true,
             is_lpm: false,
+            peers: Vec::new(),
             integrity: integrity.map(|s| s.to_string()),
             tarball_url: Some(url.to_string()),
         }
@@ -13396,10 +14280,16 @@ mod tests {
         let client = Arc::new(RegistryClient::new());
         let pkg = install_package_for_tarball(&url, None);
 
-        let (computed_sri, timings, final_url) =
-            fetch_and_store_tarball_url(&client, &store, &pkg, 0, install_pkg_acquire_permit())
-                .await
-                .expect("tarball install must succeed");
+        let (computed_sri, timings, final_url) = fetch_and_store_tarball_url(
+            &client,
+            &store,
+            None,
+            &pkg,
+            0,
+            install_pkg_acquire_permit(),
+        )
+        .await
+        .expect("tarball install must succeed");
 
         // Returned SRI matches an independent SHA-512 of the bytes.
         assert_eq!(computed_sri, expected_sri);
@@ -13439,10 +14329,16 @@ mod tests {
         let client = Arc::new(RegistryClient::new());
         let pkg = install_package_for_tarball(&url, Some(&expected_sri));
 
-        let (computed_sri, _, _) =
-            fetch_and_store_tarball_url(&client, &store, &pkg, 0, install_pkg_acquire_permit())
-                .await
-                .expect("matching SRI must succeed");
+        let (computed_sri, _, _) = fetch_and_store_tarball_url(
+            &client,
+            &store,
+            None,
+            &pkg,
+            0,
+            install_pkg_acquire_permit(),
+        )
+        .await
+        .expect("matching SRI must succeed");
         assert_eq!(computed_sri, expected_sri);
         assert!(store.has_tarball(&computed_sri));
     }
@@ -13475,9 +14371,15 @@ mod tests {
         let client = Arc::new(RegistryClient::new());
         let pkg = install_package_for_tarball(&url, Some(&wrong_sri));
 
-        let result =
-            fetch_and_store_tarball_url(&client, &store, &pkg, 0, install_pkg_acquire_permit())
-                .await;
+        let result = fetch_and_store_tarball_url(
+            &client,
+            &store,
+            None,
+            &pkg,
+            0,
+            install_pkg_acquire_permit(),
+        )
+        .await;
 
         assert!(
             matches!(result, Err(LpmError::IntegrityMismatch { .. })),
@@ -13530,20 +14432,32 @@ mod tests {
         let client = Arc::new(RegistryClient::new());
         let pkg = install_package_for_tarball(&url, None);
 
-        let (sri1, _, _) =
-            fetch_and_store_tarball_url(&client, &store, &pkg, 0, install_pkg_acquire_permit())
-                .await
-                .unwrap();
+        let (sri1, _, _) = fetch_and_store_tarball_url(
+            &client,
+            &store,
+            None,
+            &pkg,
+            0,
+            install_pkg_acquire_permit(),
+        )
+        .await
+        .unwrap();
         let cas_path = store.tarball_store_path(&sri1).unwrap();
         let mtime1 = std::fs::metadata(cas_path.join("package.json"))
             .unwrap()
             .modified()
             .unwrap();
 
-        let (sri2, _, _) =
-            fetch_and_store_tarball_url(&client, &store, &pkg, 0, install_pkg_acquire_permit())
-                .await
-                .unwrap();
+        let (sri2, _, _) = fetch_and_store_tarball_url(
+            &client,
+            &store,
+            None,
+            &pkg,
+            0,
+            install_pkg_acquire_permit(),
+        )
+        .await
+        .unwrap();
         assert_eq!(sri1, sri2);
         let mtime2 = std::fs::metadata(cas_path.join("package.json"))
             .unwrap()
@@ -14639,6 +15553,7 @@ mod tests {
                 root_link_names: None,
                 is_direct: true,
                 is_lpm: false,
+                peers: Vec::new(),
                 integrity: None,
                 tarball_url: None,
             };
@@ -14682,6 +15597,7 @@ mod tests {
             root_link_names: None,
             is_direct: true,
             is_lpm: false,
+            peers: Vec::new(),
             integrity: None,
             tarball_url: None,
         };
@@ -14694,6 +15610,7 @@ mod tests {
             root_link_names: None,
             is_direct: true,
             is_lpm: false,
+            peers: Vec::new(),
             integrity: None,
             tarball_url: None,
         };
@@ -15029,6 +15946,7 @@ mod tests {
             root_link_names: Some(vec!["p1".to_string()]),
             is_direct: true,
             is_lpm: false,
+            peers: Vec::new(),
             integrity: None,
             tarball_url: None,
         };
@@ -15060,6 +15978,7 @@ mod tests {
             root_link_names: Some(vec!["missing".to_string()]),
             is_direct: true,
             is_lpm: false,
+            peers: Vec::new(),
             integrity: None,
             tarball_url: None,
         };
@@ -15605,6 +16524,7 @@ mod tests {
             root_link_names: Some(vec!["linked".to_string()]),
             is_direct: true,
             is_lpm: false,
+            peers: Vec::new(),
             integrity: None,
             tarball_url: None,
         };
@@ -15963,6 +16883,7 @@ mod tests {
                 root_link_names: Some(vec!["a".to_string()]),
                 is_direct: true,
                 is_lpm: false,
+                peers: Vec::new(),
                 integrity: None,
                 tarball_url: None,
             },
@@ -15975,6 +16896,7 @@ mod tests {
                 root_link_names: None,
                 is_direct: false,
                 is_lpm: false,
+                peers: Vec::new(),
                 integrity: None,
                 tarball_url: None,
             },
@@ -15987,6 +16909,7 @@ mod tests {
                 root_link_names: Some(Vec::new()), // transitive
                 is_direct: false,
                 is_lpm: false,
+                peers: Vec::new(),
                 integrity: None,
                 tarball_url: None,
             },
@@ -16048,6 +16971,7 @@ mod tests {
             root_link_names: Some(vec!["a".to_string()]),
             is_direct: true,
             is_lpm: false,
+            peers: Vec::new(),
             integrity: None,
             tarball_url: None,
         }];
@@ -16583,10 +17507,16 @@ mod tests {
         let client = Arc::new(RegistryClient::new());
         let pkg = install_package_for_tarball(&declared_url, None);
 
-        let (computed_sri, _, final_url) =
-            fetch_and_store_tarball_url(&client, &store, &pkg, 0, install_pkg_acquire_permit())
-                .await
-                .expect("redirect must be followed");
+        let (computed_sri, _, final_url) = fetch_and_store_tarball_url(
+            &client,
+            &store,
+            None,
+            &pkg,
+            0,
+            install_pkg_acquire_permit(),
+        )
+        .await
+        .expect("redirect must be followed");
 
         // Bytes arrived: SRI matches independent calc on the final
         // body (proves redirect was followed and content is right).

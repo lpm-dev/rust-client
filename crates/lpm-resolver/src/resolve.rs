@@ -42,6 +42,23 @@ pub struct ResolvedPackage {
     /// callers compute `aliases.get(local).unwrap_or(local)` to get
     /// the target.
     pub aliases: HashMap<String, String>,
+    /// Resolved peers that ARE in scope for this consumer in the
+    /// install set. Shape: `(peer_name, resolved_version)` — same
+    /// edge shape as `dependencies`, but read from
+    /// `peerDependencies` / `peerDependenciesMeta` and intersected
+    /// against the install set's resolved versions.
+    ///
+    /// Sorted by peer_name for deterministic lockfile / GraphKey
+    /// hashing. Empty when this package declares no peers OR when
+    /// every declared peer is missing from the install set
+    /// (`check_unmet_peers` surfaces those as `PeerWarning`s).
+    ///
+    /// **Phase 66 §2.5** — the v2 GraphKey folds these in so two
+    /// projects sharing the same edge graph but different peer
+    /// pinning produce distinct keys. Without this field, v2's
+    /// `links/<key>/` entries silently shared across peer-divergent
+    /// installs.
+    pub peers: Vec<(String, String)>,
     /// Tarball download URL from registry metadata.
     /// Carried from resolution → download to avoid re-fetching metadata.
     pub tarball_url: Option<String>,
@@ -588,11 +605,21 @@ fn format_solution(
                 .map(|d| (d.tarball_url.clone(), d.integrity.clone()))
                 .unwrap_or_default();
 
+            // Phase 66 §2.5 — surface resolved peers per package. The
+            // resolver already proved each peer's range was satisfied
+            // (or surfaced a `PeerWarning` for the gap); here we just
+            // intersect the declared peers against the install set's
+            // resolved-versions lookup. Missing peers (warnings)
+            // simply don't appear in the output Vec — the linker /
+            // GraphKey only cares about peers that ARE present.
+            let peers = compute_resolved_peers(&package, &ver_str, cache, &resolved_versions);
+
             ResolvedPackage {
                 package,
                 version,
                 dependencies,
                 aliases,
+                peers,
                 tarball_url,
                 integrity,
             }
@@ -600,6 +627,55 @@ fn format_solution(
         .collect();
     resolved.sort_by(|a, b| a.package.to_string().cmp(&b.package.to_string()));
     resolved
+}
+
+/// Intersect a consumer's declared `peerDependencies` against the
+/// install set's resolved-versions lookup. Returns
+/// `(peer_name, resolved_version)` pairs sorted by peer_name (stable
+/// for GraphKey hashing).
+///
+/// **What "resolved" means here.** The pubgrub / greedy arms have
+/// already finished resolution by the time we reach this helper, so
+/// the install set is fixed. Peer resolution at this stage is just a
+/// lookup: for each declared peer, does the install set contain a
+/// version of that package? If yes, that version IS the resolved
+/// peer (peer-dep ranges don't multi-select — a peer is whatever
+/// version of the named package is in scope).
+///
+/// **What's NOT here.** Split-aware peer resolution (consumer in
+/// context X picks peer in context X first, falling back to
+/// unsplit). The upstream `check_unmet_peers` does this for warning
+/// generation. For the v2 GraphKey we use the simpler lookup because
+/// the audit-fixture scope doesn't exercise splits, and a
+/// pessimistic (slightly over-binding) GraphKey is acceptable —
+/// worst case is fewer cross-project sharing hits, never an
+/// incorrect share. When split-aware resolution becomes load-bearing
+/// (post-Phase-66 cross-project benchmarks), this helper grows the
+/// `unsplit_versions` parameter the same way `resolve_peer_version`
+/// already does.
+fn compute_resolved_peers(
+    consumer: &ResolverPackage,
+    consumer_version: &str,
+    cache: &HashMap<CanonicalKey, std::sync::Arc<CachedPackageInfo>>,
+    resolved_versions: &HashMap<String, String>,
+) -> Vec<(String, String)> {
+    let key = CanonicalKey::from(consumer);
+    let Some(peer_deps) = cache
+        .get(&key)
+        .and_then(|info| info.peer_deps.get(consumer_version))
+    else {
+        return Vec::new();
+    };
+    let mut peers: Vec<(String, String)> = peer_deps
+        .keys()
+        .filter_map(|peer_name| {
+            resolved_versions
+                .get(peer_name)
+                .map(|ver| (peer_name.clone(), ver.clone()))
+        })
+        .collect();
+    peers.sort_by(|a, b| a.0.cmp(&b.0));
+    peers
 }
 
 /// A warning about an unmet peer dependency.
@@ -2541,6 +2617,7 @@ these are incompatible
                 version: NpmVersion::parse("5.0.0").unwrap(),
                 dependencies: vec![],
                 aliases: HashMap::new(),
+                peers: Vec::new(),
                 tarball_url: None,
                 integrity: None,
             },
@@ -2549,6 +2626,7 @@ these are incompatible
                 version: NpmVersion::parse("17.0.2").unwrap(),
                 dependencies: vec![],
                 aliases: HashMap::new(),
+                peers: Vec::new(),
                 tarball_url: None,
                 integrity: None,
             },
@@ -2588,6 +2666,7 @@ these are incompatible
                 version: NpmVersion::parse("6.0.0").unwrap(),
                 dependencies: vec![],
                 aliases: HashMap::new(),
+                peers: Vec::new(),
                 tarball_url: None,
                 integrity: None,
             },
@@ -2596,6 +2675,7 @@ these are incompatible
                 version: NpmVersion::parse("17.0.2").unwrap(),
                 dependencies: vec![],
                 aliases: HashMap::new(),
+                peers: Vec::new(),
                 tarball_url: None,
                 integrity: None,
             },
@@ -2633,6 +2713,7 @@ these are incompatible
             version: NpmVersion::parse("5.0.0").unwrap(),
             dependencies: vec![],
             aliases: HashMap::new(),
+            peers: Vec::new(),
             tarball_url: None,
             integrity: None,
         }];
@@ -2678,6 +2759,7 @@ these are incompatible
                 version: NpmVersion::parse("5.0.0").unwrap(),
                 dependencies: vec![],
                 aliases: HashMap::new(),
+                peers: Vec::new(),
                 tarball_url: None,
                 integrity: None,
             },
@@ -2686,6 +2768,7 @@ these are incompatible
                 version: NpmVersion::parse("17.0.2").unwrap(),
                 dependencies: vec![],
                 aliases: HashMap::new(),
+                peers: Vec::new(),
                 tarball_url: None,
                 integrity: None,
             },
@@ -2728,6 +2811,7 @@ these are incompatible
                 version: NpmVersion::parse("1.0.0").unwrap(),
                 dependencies: vec![],
                 aliases: HashMap::new(),
+                peers: Vec::new(),
                 tarball_url: None,
                 integrity: None,
             },
@@ -2736,6 +2820,7 @@ these are incompatible
                 version: NpmVersion::parse("17.0.2").unwrap(),
                 dependencies: vec![],
                 aliases: HashMap::new(),
+                peers: Vec::new(),
                 tarball_url: None,
                 integrity: None,
             },
@@ -2744,6 +2829,7 @@ these are incompatible
                 version: NpmVersion::parse("18.2.0").unwrap(),
                 dependencies: vec![],
                 aliases: HashMap::new(),
+                peers: Vec::new(),
                 tarball_url: None,
                 integrity: None,
             },
@@ -2787,6 +2873,7 @@ these are incompatible
                 version: NpmVersion::parse("1.0.0").unwrap(),
                 dependencies: vec![],
                 aliases: HashMap::new(),
+                peers: Vec::new(),
                 tarball_url: None,
                 integrity: None,
             },
@@ -2795,6 +2882,7 @@ these are incompatible
                 version: NpmVersion::parse("2.0.0").unwrap(),
                 dependencies: vec![],
                 aliases: HashMap::new(),
+                peers: Vec::new(),
                 tarball_url: None,
                 integrity: None,
             },
@@ -2803,6 +2891,7 @@ these are incompatible
                 version: NpmVersion::parse("18.2.0").unwrap(),
                 dependencies: vec![],
                 aliases: HashMap::new(),
+                peers: Vec::new(),
                 tarball_url: None,
                 integrity: None,
             },
@@ -2856,6 +2945,7 @@ these are incompatible
             version: NpmVersion::parse("4.17.21").unwrap(),
             dependencies: vec![],
             aliases: HashMap::new(),
+            peers: Vec::new(),
             tarball_url: None,
             integrity: None,
         }];
@@ -2968,6 +3058,7 @@ these are incompatible
             version: NpmVersion::parse("5.0.0").unwrap(),
             dependencies: vec![],
             aliases: HashMap::new(),
+            peers: Vec::new(),
             tarball_url: None,
             integrity: None,
         }];
@@ -3016,6 +3107,7 @@ these are incompatible
                 version: NpmVersion::parse("5.0.0").unwrap(),
                 dependencies: vec![("react".into(), "17.0.2".into())],
                 aliases: HashMap::new(),
+                peers: Vec::new(),
                 tarball_url: None,
                 integrity: None,
             },
@@ -3024,6 +3116,7 @@ these are incompatible
                 version: NpmVersion::parse("17.0.2").unwrap(),
                 dependencies: vec![],
                 aliases: HashMap::new(),
+                peers: Vec::new(),
                 tarball_url: None,
                 integrity: None,
             },
@@ -3089,6 +3182,7 @@ these are incompatible
                 version: NpmVersion::parse("5.0.0").unwrap(),
                 dependencies: vec![("@babel/core".into(), "7.5.0".into())],
                 aliases: HashMap::new(),
+                peers: Vec::new(),
                 tarball_url: None,
                 integrity: None,
             },
@@ -3097,6 +3191,7 @@ these are incompatible
                 version: NpmVersion::parse("7.5.0").unwrap(),
                 dependencies: vec![],
                 aliases: HashMap::new(),
+                peers: Vec::new(),
                 tarball_url: None,
                 integrity: None,
             },
@@ -3108,6 +3203,7 @@ these are incompatible
             version: NpmVersion::parse("5.0.0").unwrap(),
             dependencies: vec![],
             aliases: HashMap::new(),
+            peers: Vec::new(),
             tarball_url: None,
             integrity: None,
         }];
@@ -3282,6 +3378,7 @@ these are incompatible
                 version: NpmVersion::parse("1.0.0").unwrap(),
                 dependencies: vec![("react".into(), "17.0.0".into())],
                 aliases: HashMap::new(),
+                peers: Vec::new(),
                 tarball_url: None,
                 integrity: None,
             },
@@ -3290,6 +3387,7 @@ these are incompatible
                 version: NpmVersion::parse("1.0.0").unwrap(),
                 dependencies: vec![("react".into(), "17.0.0".into())],
                 aliases: HashMap::new(),
+                peers: Vec::new(),
                 tarball_url: None,
                 integrity: None,
             },
@@ -3298,6 +3396,7 @@ these are incompatible
                 version: NpmVersion::parse("17.0.0").unwrap(),
                 dependencies: vec![],
                 aliases: HashMap::new(),
+                peers: Vec::new(),
                 tarball_url: None,
                 integrity: None,
             },
@@ -3358,6 +3457,7 @@ these are incompatible
                 version: NpmVersion::parse("2.5.0").unwrap(),
                 dependencies: vec![("react".into(), "17.0.0".into())],
                 aliases: HashMap::new(),
+                peers: Vec::new(),
                 tarball_url: None,
                 integrity: None,
             },
@@ -3366,6 +3466,7 @@ these are incompatible
                 version: NpmVersion::parse("17.0.0").unwrap(),
                 dependencies: vec![],
                 aliases: HashMap::new(),
+                peers: Vec::new(),
                 tarball_url: None,
                 integrity: None,
             },
@@ -3377,6 +3478,7 @@ these are incompatible
                 version: NpmVersion::parse("1.5.0").unwrap(),
                 dependencies: vec![("react".into(), "17.0.0".into())],
                 aliases: HashMap::new(),
+                peers: Vec::new(),
                 tarball_url: None,
                 integrity: None,
             },
@@ -3385,6 +3487,7 @@ these are incompatible
                 version: NpmVersion::parse("17.0.0").unwrap(),
                 dependencies: vec![],
                 aliases: HashMap::new(),
+                peers: Vec::new(),
                 tarball_url: None,
                 integrity: None,
             },

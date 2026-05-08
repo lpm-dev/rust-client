@@ -47,6 +47,11 @@ use std::path::{Component, Path, PathBuf};
 pub mod layout;
 pub use layout::{InstallHealth, LayoutPaths, LinkerLayout};
 
+// Phase 66 Phase 4b — virtual-store-aware linker. Selected when
+// `LPM_STORE_VERSION=v2`; sits next to the v1 isolated/hoisted code
+// paths in this crate. See `src/v2.rs` for the design doc.
+pub mod v2;
+
 /// Phase 39 P2b per-package link outcome — exposes Phase 1 action + Phase 2
 /// symlink count to the event-driven caller so totals match the
 /// single-shot [`link_packages`] path.
@@ -163,28 +168,52 @@ fn relative_symlink_target_from_parent(target: &Path, link_parent: &Path) -> Pat
     pathdiff::diff_paths(target, &link_parent_canonical).unwrap_or_else(|| target.to_path_buf())
 }
 
-/// Check if a path string contains cmd.exe metacharacters that could enable injection.
-/// Returns `Err(reason)` if dangerous characters are found.
+// Phase 66 Phase 4a follow-up: cmd-path validation moved to
+// `lpm_common::symlink` so lpm-store v2 shares the same security check
+// (was duplicated). Re-imported under the legacy local name to keep
+// the surrounding call sites untouched.
 #[cfg(windows)]
-fn validate_cmd_path(path: &str) -> Result<(), String> {
-    const DANGEROUS: &[char] = &['"', '&', '|', '<', '>', '^', '%', '\n', '\r'];
-    for ch in DANGEROUS {
-        if path.contains(*ch) {
-            return Err(format!(
-                "bin target path contains dangerous character '{ch}' for cmd.exe"
-            ));
-        }
-    }
-    Ok(())
-}
+use lpm_common::symlink::validate_cmd_path;
 
 /// Linking strategy for node_modules.
+///
+/// **Default flipped to [`Hoisted`] in Phase 66 Phase 4f**
+/// (post-virtual-store-ship). Pre-Phase-4f the default was
+/// [`Isolated`] — the strict pnpm-style layout — but its everyday
+/// dev workflow (`rm -rf node_modules` → `lpm install`) under v1
+/// required clonefiling all bytes back from `~/.lpm/store/v1/`,
+/// which made hoisted 2.7× slower than isolated on warm install
+/// and would have made the flip user-hostile despite hoisted's
+/// 1.3× cold-install win.
+///
+/// Phase 66's virtual store ([`lpm_store::v2`]) restructured both
+/// modes to symlink project `node_modules/<dep>` into a global
+/// `~/.lpm/store/v2/links/<graph-key>/` materialization. After 4d
+/// the default `LPM_STORE_VERSION=v2` made warm-install identical
+/// between modes (Phase 4f bench: isolated median 110 ms, hoisted
+/// median 110 ms, paired delta +0 ms). Flipping the default to
+/// `Hoisted` gives users:
+///
+/// - Cold-install win — hoisted is ~497 ms faster than isolated
+///   on `bench/fixture-large` cold/full (active-roadmap §2.6).
+/// - Same warm-install (post-v2 — see above).
+/// - Phantom-dep accessibility for tooling that relied on
+///   npm-style flat node_modules (most ecosystem projects).
+///
+/// [`Isolated`] remains a valid opt-in via `LPM_LINKER=isolated`,
+/// `package.json > lpm > linker`, `~/.lpm/config.toml > linker`,
+/// or `--linker isolated`. Use it when you want strict
+/// no-phantom-deps semantics — the layout that catches "I forgot
+/// to declare this dep" bugs early.
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub enum LinkerMode {
-    /// pnpm-style isolated layout (default). Strict, no phantom deps.
-    #[default]
+    /// pnpm-style isolated layout. Strict, no phantom deps.
+    /// Available via explicit `--linker isolated` /
+    /// `LPM_LINKER=isolated` / `package.json > lpm > linker`.
     Isolated,
     /// npm v3+ style hoisted layout. Flat, phantom deps accessible.
+    /// **Default since Phase 66 Phase 4f.**
+    #[default]
     Hoisted,
 }
 
@@ -277,110 +306,13 @@ mod linker_mode_tests {
 /// Junctions require absolute paths, so we resolve relative targets before creating.
 /// Falls back to `symlink_dir` if junction creation fails.
 ///
-/// On Unix, creates a standard symlink (relative paths work fine).
-/// Lexically simplify `..` and `.` segments in a path, without
-/// touching the filesystem. Used by [`create_symlink_or_junction`]
-/// on Windows so junction creation receives a canonical target string.
-///
-/// Phase 61.1: needed because the Tier 2 relayout produces relative
-/// targets like `../.lpm/wrappers/...` that, when joined with a
-/// canonicalized link parent (`\\?\C:\proj\node_modules\`), embed an
-/// unresolved `..` segment. Plain `Path::join` doesn't simplify, and
-/// `\\?\`-prefixed paths under Windows extended-length semantics
-/// don't get implicit `..` resolution from the kernel — `mklink /J`
-/// would target a path containing the literal `..`.
-///
-/// Pure lexical normalization: `a/b/../c` → `a/c`, `./a` → `a`,
-/// `..` segments at the start are preserved (we have no parent to
-/// pop into). Doesn't touch leading `RootDir` / `Prefix` components.
-#[cfg(windows)]
-fn lexically_clean(p: &Path) -> PathBuf {
-    let mut out = PathBuf::new();
-    for component in p.components() {
-        match component {
-            Component::ParentDir => {
-                // Only pop a normal name; don't pop past root or
-                // discard a leading `..` (which would change semantics
-                // for relative paths). A trailing `..` after a normal
-                // pops cleanly; a `..` after another `..` accumulates.
-                let last_is_normal =
-                    matches!(out.components().next_back(), Some(Component::Normal(_)));
-                if last_is_normal {
-                    out.pop();
-                } else {
-                    out.push("..");
-                }
-            }
-            Component::CurDir => {
-                // Drop redundant `.` segments.
-            }
-            other => out.push(other.as_os_str()),
-        }
-    }
-    out
-}
-
-#[cfg(windows)]
-fn create_symlink_or_junction(target: &Path, link: &Path) -> std::io::Result<()> {
-    // Try symlink_dir first — works without admin on many modern Windows setups
-    // (Developer Mode, or appropriate policy settings).
-    if std::os::windows::fs::symlink_dir(target, link).is_ok() {
-        return Ok(());
-    }
-
-    // Junctions require absolute target paths. If target is relative,
-    // resolve it relative to the link's parent directory, then
-    // lexically clean any `..` segments from the join — `\\?\`-prefixed
-    // paths handed to `mklink /J` don't get implicit `..` resolution
-    // from the kernel, so an unresolved `..` segment in the target
-    // would silently produce a broken junction.
-    let abs_target = if target.is_relative() {
-        let base = link.parent().unwrap_or(Path::new("."));
-        let joined = match base.canonicalize() {
-            Ok(abs_base) => abs_base.join(target),
-            Err(_) => base.join(target),
-        };
-        lexically_clean(&joined)
-    } else {
-        target.to_path_buf()
-    };
-
-    // Validate paths before passing to cmd to prevent command injection.
-    let link_str = link.to_string_lossy();
-    let target_str = abs_target.to_string_lossy();
-    if let Err(reason) = validate_cmd_path(&link_str) {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            format!("refusing junction: link path {reason}"),
-        ));
-    }
-    if let Err(reason) = validate_cmd_path(&target_str) {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            format!("refusing junction: target path {reason}"),
-        ));
-    }
-
-    // Fallback: junction via cmd /c mklink /J (no admin required)
-    let status = std::process::Command::new("cmd")
-        .args(["/c", "mklink", "/J", &link_str, &target_str])
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status();
-
-    match status {
-        Ok(s) if s.success() => Ok(()),
-        _ => Err(std::io::Error::new(
-            std::io::ErrorKind::Other,
-            "failed to create junction or symlink",
-        )),
-    }
-}
-
-#[cfg(unix)]
-fn create_symlink_or_junction(target: &Path, link: &Path) -> std::io::Result<()> {
-    std::os::unix::fs::symlink(target, link)
-}
+// Phase 66 Phase 4a follow-up: directory-link creation moved to
+// `lpm_common::symlink::create_dir_symlink_or_junction` so lpm-store
+// v2 shares the same Windows symlink-then-junction fallback (`mklink
+// /J`) — duplicating it would have left v2 regressing on Windows
+// setups without Developer Mode. Re-imported under the legacy local
+// name to keep call sites untouched.
+use lpm_common::symlink::create_dir_symlink_or_junction as create_symlink_or_junction;
 
 /// **Phase 59.1 audit response (post-day-7)** — drives the Phase-1
 /// materialization branch in [`link_one_package`].
@@ -523,6 +455,33 @@ pub struct LinkTarget {
     /// EXCEPT `Source::Directory` and `Source::Link` materializes
     /// from the global CAS store via [`link_dir_recursive`].
     pub materialization: Materialization,
+    /// **Phase 66 §2.5** — resolved peers in scope for this package's
+    /// instance in the install graph.
+    ///
+    /// Shape: `(peer_name, resolved_version)`, sorted by peer_name.
+    /// Empty under any of:
+    /// - The package declares no peers in its `package.json`.
+    /// - All declared peers are absent from the install set
+    ///   (`check_unmet_peers` surfaces those upstream).
+    /// - The lockfile fast-path constructed this LinkTarget (peers
+    ///   not persisted in the lockfile today; v2 linker re-derives
+    ///   from the extracted `package.json` when needed).
+    ///
+    /// **Used by the v2 isolated linker** to:
+    /// 1. Synthesize peer-edge sibling symlinks inside each link
+    ///    entry (peer must be a sibling of the consumer's package
+    ///    dir for Node's symlink-walk-up resolution).
+    /// 2. Fold into [`lpm_store::v2::GraphKeyInputs::with_peers`] so
+    ///    two projects with the same edge graph but different peer
+    ///    pinning produce distinct graph keys (the cross-project
+    ///    sharing invariant from preplan §2.5).
+    ///
+    /// **Ignored under v1** — v1's relative-symlink wrappers walk
+    /// up to the project root for peers, so threading is
+    /// informational. The field is populated regardless so a future
+    /// hoisted-mode v1 wanting to share wrappers across projects
+    /// can fold it in.
+    pub peers: Vec<(String, String)>,
 }
 
 impl LinkTarget {
@@ -2823,6 +2782,7 @@ mod tests {
             root_link_names: None,
             wrapper_id: None,
             materialization: Materialization::CasBacked,
+            peers: Vec::new(),
         }];
 
         let result = link_packages(project_dir.path(), &packages, false, None).unwrap();
@@ -2855,6 +2815,7 @@ mod tests {
                 root_link_names: None,
                 wrapper_id: None,
                 materialization: Materialization::CasBacked,
+                peers: Vec::new(),
             },
             LinkTarget {
                 name: "debug".to_string(),
@@ -2866,6 +2827,7 @@ mod tests {
                 root_link_names: None,
                 wrapper_id: None,
                 materialization: Materialization::CasBacked,
+                peers: Vec::new(),
             },
         ];
 
@@ -2917,6 +2879,7 @@ mod tests {
                 root_link_names: None,
                 wrapper_id: None,
                 materialization: Materialization::CasBacked,
+                peers: Vec::new(),
             }],
             false,
             None,
@@ -2961,6 +2924,7 @@ mod tests {
             root_link_names: None,
             wrapper_id: None,
             materialization: Materialization::CasBacked,
+            peers: Vec::new(),
         }];
 
         let result = link_packages(project_dir.path(), &packages, false, None).unwrap();
@@ -2994,6 +2958,7 @@ mod tests {
             root_link_names: None,
             wrapper_id: None,
             materialization: Materialization::CasBacked,
+            peers: Vec::new(),
         }];
 
         let result = link_packages(project_dir.path(), &packages, false, None).unwrap();
@@ -3033,6 +2998,7 @@ mod tests {
             root_link_names: None,
             wrapper_id: None,
             materialization: Materialization::CasBacked,
+            peers: Vec::new(),
         }];
 
         let result = link_packages(project_dir.path(), &packages, false, None).unwrap();
@@ -3057,6 +3023,7 @@ mod tests {
             root_link_names: None,
             wrapper_id: None,
             materialization: Materialization::CasBacked,
+            peers: Vec::new(),
         }];
 
         link_packages(project_dir.path(), &packages, false, None).unwrap();
@@ -3086,6 +3053,7 @@ mod tests {
             root_link_names: None,
             wrapper_id: None,
             materialization: Materialization::CasBacked,
+            peers: Vec::new(),
         }];
 
         // First link — creates everything
@@ -3124,6 +3092,7 @@ mod tests {
             root_link_names: None,
             wrapper_id: None,
             materialization: Materialization::CasBacked,
+            peers: Vec::new(),
         }];
 
         // First link — creates marker
@@ -3167,6 +3136,7 @@ mod tests {
             root_link_names: None,
             wrapper_id: None,
             materialization: Materialization::CasBacked,
+            peers: Vec::new(),
         }];
 
         // First link
@@ -3200,6 +3170,7 @@ mod tests {
             root_link_names: None,
             wrapper_id: None,
             materialization: Materialization::CasBacked,
+            peers: Vec::new(),
         }];
 
         // First link
@@ -3235,6 +3206,7 @@ mod tests {
             root_link_names: None,
             wrapper_id: None,
             materialization: Materialization::CasBacked,
+            peers: Vec::new(),
         }];
 
         // First link in hoisted mode
@@ -3273,6 +3245,7 @@ mod tests {
             root_link_names: None,
             wrapper_id: None,
             materialization: Materialization::CasBacked,
+            peers: Vec::new(),
         }];
 
         let result =
@@ -3304,6 +3277,7 @@ mod tests {
             root_link_names: None,
             wrapper_id: None,
             materialization: Materialization::CasBacked,
+            peers: Vec::new(),
         }];
 
         let result = link_packages(
@@ -3344,6 +3318,7 @@ mod tests {
             root_link_names: None,
             wrapper_id: None,
             materialization: Materialization::CasBacked,
+            peers: Vec::new(),
         }];
 
         let result = link_packages(project_dir.path(), &packages, false, None).unwrap();
@@ -3368,6 +3343,7 @@ mod tests {
             root_link_names: None,
             wrapper_id: None,
             materialization: Materialization::CasBacked,
+            peers: Vec::new(),
         }];
 
         // Self-package name matches a direct dep — dep should win
@@ -3405,6 +3381,7 @@ mod tests {
                 root_link_names: None,
                 wrapper_id: None,
                 materialization: Materialization::CasBacked,
+                peers: Vec::new(),
             },
             LinkTarget {
                 name: "debug".to_string(),
@@ -3416,6 +3393,7 @@ mod tests {
                 root_link_names: None,
                 wrapper_id: None,
                 materialization: Materialization::CasBacked,
+                peers: Vec::new(),
             },
             LinkTarget {
                 name: "ms".to_string(),
@@ -3427,6 +3405,7 @@ mod tests {
                 root_link_names: None,
                 wrapper_id: None,
                 materialization: Materialization::CasBacked,
+                peers: Vec::new(),
             },
         ];
 
@@ -3460,6 +3439,7 @@ mod tests {
                 root_link_names: None,
                 wrapper_id: None,
                 materialization: Materialization::CasBacked,
+                peers: Vec::new(),
             },
             LinkTarget {
                 name: "debug".to_string(),
@@ -3471,6 +3451,7 @@ mod tests {
                 root_link_names: None,
                 wrapper_id: None,
                 materialization: Materialization::CasBacked,
+                peers: Vec::new(),
             },
             LinkTarget {
                 name: "other".to_string(),
@@ -3482,6 +3463,7 @@ mod tests {
                 root_link_names: None,
                 wrapper_id: None,
                 materialization: Materialization::CasBacked,
+                peers: Vec::new(),
             },
             LinkTarget {
                 name: "debug".to_string(),
@@ -3493,6 +3475,7 @@ mod tests {
                 root_link_names: None,
                 wrapper_id: None,
                 materialization: Materialization::CasBacked,
+                peers: Vec::new(),
             },
         ];
 
@@ -3534,6 +3517,7 @@ mod tests {
                 root_link_names: None,
                 wrapper_id: None,
                 materialization: Materialization::CasBacked,
+                peers: Vec::new(),
             },
             LinkTarget {
                 name: "debug".to_string(),
@@ -3545,6 +3529,7 @@ mod tests {
                 root_link_names: None,
                 wrapper_id: None,
                 materialization: Materialization::CasBacked,
+                peers: Vec::new(),
             },
             // Direct dep with different version should win root
             LinkTarget {
@@ -3557,6 +3542,7 @@ mod tests {
                 root_link_names: None,
                 wrapper_id: None,
                 materialization: Materialization::CasBacked,
+                peers: Vec::new(),
             },
         ];
 
@@ -3612,6 +3598,7 @@ mod tests {
             root_link_names: None,
             wrapper_id: None,
             materialization: Materialization::CasBacked,
+            peers: Vec::new(),
         }];
 
         let result = link_packages(project_dir.path(), &packages, false, None).unwrap();
@@ -3731,6 +3718,7 @@ mod tests {
             root_link_names: None,
             wrapper_id: None,
             materialization: Materialization::CasBacked,
+            peers: Vec::new(),
         }];
 
         let result = link_packages(project_dir.path(), &packages, false, None).unwrap();
@@ -3773,6 +3761,7 @@ mod tests {
             root_link_names: None,
             wrapper_id: None,
             materialization: Materialization::CasBacked,
+            peers: Vec::new(),
         }];
 
         let lexical_root = project_dir.path();
@@ -3830,6 +3819,7 @@ mod tests {
             root_link_names: None,
             wrapper_id: None,
             materialization: Materialization::CasBacked,
+            peers: Vec::new(),
         }];
 
         let result = link_packages_hoisted(project_dir.path(), &packages, false, None).unwrap();
@@ -3868,6 +3858,7 @@ mod tests {
             root_link_names: None,
             wrapper_id: None,
             materialization: Materialization::CasBacked,
+            peers: Vec::new(),
         }];
 
         let result = link_packages(project_dir.path(), &packages, false, None).unwrap();
@@ -3907,6 +3898,7 @@ mod tests {
             root_link_names: None,
             wrapper_id: None,
             materialization: Materialization::CasBacked,
+            peers: Vec::new(),
         }];
 
         let result = link_packages(project_dir.path(), &packages, false, None).unwrap();
@@ -3942,6 +3934,7 @@ mod tests {
             root_link_names: None,
             wrapper_id: None,
             materialization: Materialization::CasBacked,
+            peers: Vec::new(),
         }];
 
         let result = link_packages(project_dir.path(), &packages, false, None).unwrap();
@@ -4005,6 +3998,7 @@ mod tests {
             root_link_names: None,
             wrapper_id: None,
             materialization: Materialization::CasBacked,
+            peers: Vec::new(),
         }];
 
         // Use a traversal name — should not create symlink, should not error
@@ -4045,6 +4039,7 @@ mod tests {
             root_link_names: None,
             wrapper_id: None,
             materialization: Materialization::CasBacked,
+            peers: Vec::new(),
         }];
 
         let result = link_packages_hoisted(project_dir.path(), &packages, false, None).unwrap();
@@ -4084,6 +4079,7 @@ mod tests {
                 root_link_names: None,
                 wrapper_id: None,
                 materialization: Materialization::CasBacked,
+                peers: Vec::new(),
             },
             LinkTarget {
                 name: "shared".to_string(),
@@ -4095,6 +4091,7 @@ mod tests {
                 root_link_names: None,
                 wrapper_id: None,
                 materialization: Materialization::CasBacked,
+                peers: Vec::new(),
             },
             LinkTarget {
                 name: "util".to_string(),
@@ -4106,6 +4103,7 @@ mod tests {
                 root_link_names: None,
                 wrapper_id: None,
                 materialization: Materialization::CasBacked,
+                peers: Vec::new(),
             },
             LinkTarget {
                 name: "b".to_string(),
@@ -4120,6 +4118,7 @@ mod tests {
                 root_link_names: None,
                 wrapper_id: None,
                 materialization: Materialization::CasBacked,
+                peers: Vec::new(),
             },
             LinkTarget {
                 name: "shared".to_string(),
@@ -4131,6 +4130,7 @@ mod tests {
                 root_link_names: None,
                 wrapper_id: None,
                 materialization: Materialization::CasBacked,
+                peers: Vec::new(),
             },
             LinkTarget {
                 name: "util".to_string(),
@@ -4142,6 +4142,7 @@ mod tests {
                 root_link_names: None,
                 wrapper_id: None,
                 materialization: Materialization::CasBacked,
+                peers: Vec::new(),
             },
         ];
 
@@ -4216,6 +4217,7 @@ mod tests {
                 root_link_names: None,
                 wrapper_id: None,
                 materialization: Materialization::CasBacked,
+                peers: Vec::new(),
             },
             // consumer@3 (transitive, encountered first → hoisted) → dep@1
             LinkTarget {
@@ -4228,6 +4230,7 @@ mod tests {
                 root_link_names: None,
                 wrapper_id: None,
                 materialization: Materialization::CasBacked,
+                peers: Vec::new(),
             },
             // dep@1 (transitive, hoisted)
             LinkTarget {
@@ -4240,6 +4243,7 @@ mod tests {
                 root_link_names: None,
                 wrapper_id: None,
                 materialization: Materialization::CasBacked,
+                peers: Vec::new(),
             },
             // some-other-direct (forces consumer@3 to come before consumer@10
             // in declaration order — this test would be vacuous without
@@ -4254,6 +4258,7 @@ mod tests {
                 root_link_names: None,
                 wrapper_id: None,
                 materialization: Materialization::CasBacked,
+                peers: Vec::new(),
             },
             // dep@5 (transitive, must nest under anchor)
             LinkTarget {
@@ -4266,6 +4271,7 @@ mod tests {
                 root_link_names: None,
                 wrapper_id: None,
                 materialization: Materialization::CasBacked,
+                peers: Vec::new(),
             },
         ];
 
@@ -4338,6 +4344,7 @@ mod tests {
             root_link_names: None,
             wrapper_id: None,
             materialization: Materialization::CasBacked,
+            peers: Vec::new(),
         }];
 
         let result = link_packages(project_dir.path(), &packages, false, None).unwrap();
@@ -4385,6 +4392,7 @@ mod tests {
             root_link_names: None,
             wrapper_id: None,
             materialization: Materialization::CasBacked,
+            peers: Vec::new(),
         }];
 
         let result =
@@ -4415,6 +4423,7 @@ mod tests {
             root_link_names: None,
             wrapper_id: None,
             materialization: Materialization::CasBacked,
+            peers: Vec::new(),
         }];
 
         let result =
@@ -4447,6 +4456,7 @@ mod tests {
             root_link_names: None,
             wrapper_id: None,
             materialization: Materialization::CasBacked,
+            peers: Vec::new(),
         }];
 
         let result = link_packages_hoisted(
@@ -4483,6 +4493,7 @@ mod tests {
             root_link_names: None,
             wrapper_id: None,
             materialization: Materialization::CasBacked,
+            peers: Vec::new(),
         }];
 
         let result = link_packages_hoisted(project_dir.path(), &packages, false, None).unwrap();
@@ -4508,6 +4519,7 @@ mod tests {
             root_link_names: None,
             wrapper_id: None,
             materialization: Materialization::CasBacked,
+            peers: Vec::new(),
         }];
 
         link_packages_hoisted(project_dir.path(), &packages, false, None).unwrap();
@@ -4540,6 +4552,7 @@ mod tests {
             root_link_names: None,
             wrapper_id: None,
             materialization: Materialization::CasBacked,
+            peers: Vec::new(),
         }];
 
         // First link — should actually link
@@ -4571,6 +4584,7 @@ mod tests {
             root_link_names: None,
             wrapper_id: None,
             materialization: Materialization::CasBacked,
+            peers: Vec::new(),
         }];
 
         // First link with v1
@@ -4588,6 +4602,7 @@ mod tests {
             root_link_names: None,
             wrapper_id: None,
             materialization: Materialization::CasBacked,
+            peers: Vec::new(),
         }];
 
         let r2 = link_packages_hoisted(project_dir.path(), &packages_v2, false, None).unwrap();
@@ -4615,6 +4630,7 @@ mod tests {
                 root_link_names: None,
                 wrapper_id: None,
                 materialization: Materialization::CasBacked,
+                peers: Vec::new(),
             },
             LinkTarget {
                 name: "pkg-b".to_string(),
@@ -4626,6 +4642,7 @@ mod tests {
                 root_link_names: None,
                 wrapper_id: None,
                 materialization: Materialization::CasBacked,
+                peers: Vec::new(),
             },
         ];
 
@@ -4643,6 +4660,7 @@ mod tests {
             root_link_names: None,
             wrapper_id: None,
             materialization: Materialization::CasBacked,
+            peers: Vec::new(),
         }];
 
         let _r2 = link_packages_hoisted(project_dir.path(), &packages_v2, false, None).unwrap();
@@ -4678,6 +4696,7 @@ mod tests {
             root_link_names: None,
             wrapper_id: None,
             materialization: Materialization::CasBacked,
+            peers: Vec::new(),
         }];
 
         // First link
@@ -4713,6 +4732,7 @@ mod tests {
             root_link_names: None,
             wrapper_id: None,
             materialization: Materialization::CasBacked,
+            peers: Vec::new(),
         }];
 
         // Step 1 — hoisted install. Plants a real directory at
@@ -4783,6 +4803,7 @@ mod tests {
             root_link_names: None,
             wrapper_id: None,
             materialization: Materialization::CasBacked,
+            peers: Vec::new(),
         }];
 
         // Step 1 — isolated install. Plants a root symlink at
@@ -4855,6 +4876,7 @@ mod tests {
             root_link_names: None,
             wrapper_id: None,
             materialization: Materialization::CasBacked,
+            peers: Vec::new(),
         }];
 
         // Must not panic / error on the broken symlink.
@@ -4896,6 +4918,7 @@ mod tests {
             root_link_names: None,
             wrapper_id: None,
             materialization: Materialization::CasBacked,
+            peers: Vec::new(),
         }];
 
         let self_name = "myproj";
@@ -4945,6 +4968,7 @@ mod tests {
             root_link_names: None,
             wrapper_id: None,
             materialization: Materialization::CasBacked,
+            peers: Vec::new(),
         }];
 
         let self_name = "@myorg/foo";
@@ -4994,6 +5018,7 @@ mod tests {
             root_link_names: None,
             wrapper_id: None,
             materialization: Materialization::CasBacked,
+            peers: Vec::new(),
         }];
 
         // Hoisted install — synthesizes node_modules/@types/node/ as
@@ -5048,6 +5073,7 @@ mod tests {
             root_link_names: None,
             wrapper_id: None,
             materialization: Materialization::CasBacked,
+            peers: Vec::new(),
         }];
 
         let result = link_packages(project_dir.path(), &packages, false, None).unwrap();
@@ -5086,6 +5112,7 @@ mod tests {
             root_link_names: None,
             wrapper_id: None,
             materialization: Materialization::CasBacked,
+            peers: Vec::new(),
         }];
 
         // First link populates the marker
@@ -5121,6 +5148,7 @@ mod tests {
                 root_link_names: None,
                 wrapper_id: None,
                 materialization: Materialization::CasBacked,
+                peers: Vec::new(),
             },
             LinkTarget {
                 name: "debug".to_string(),
@@ -5132,6 +5160,7 @@ mod tests {
                 root_link_names: None,
                 wrapper_id: None,
                 materialization: Materialization::CasBacked,
+                peers: Vec::new(),
             },
         ];
 
@@ -5188,6 +5217,7 @@ mod tests {
                 root_link_names: None,
                 wrapper_id: None,
                 materialization: Materialization::CasBacked,
+                peers: Vec::new(),
             },
             LinkTarget {
                 name: "trans".to_string(),
@@ -5199,6 +5229,7 @@ mod tests {
                 root_link_names: None,
                 wrapper_id: None,
                 materialization: Materialization::CasBacked,
+                peers: Vec::new(),
             },
             // Force a second `trans` version so trans@1.0.0 is NOT hoisted
             // (the second version wins root because it's identical here;
@@ -5214,6 +5245,7 @@ mod tests {
                 root_link_names: None,
                 wrapper_id: None,
                 materialization: Materialization::CasBacked,
+                peers: Vec::new(),
             },
             LinkTarget {
                 name: "debug".to_string(),
@@ -5225,6 +5257,7 @@ mod tests {
                 root_link_names: None,
                 wrapper_id: None,
                 materialization: Materialization::CasBacked,
+                peers: Vec::new(),
             },
             LinkTarget {
                 name: "debug".to_string(),
@@ -5236,6 +5269,7 @@ mod tests {
                 root_link_names: None,
                 wrapper_id: None,
                 materialization: Materialization::CasBacked,
+                peers: Vec::new(),
             },
         ];
 
@@ -5295,6 +5329,7 @@ mod tests {
                 root_link_names: None,
                 wrapper_id: None,
                 materialization: Materialization::CasBacked,
+                peers: Vec::new(),
             },
             LinkTarget {
                 name: "debug".to_string(),
@@ -5306,6 +5341,7 @@ mod tests {
                 root_link_names: None,
                 wrapper_id: None,
                 materialization: Materialization::CasBacked,
+                peers: Vec::new(),
             },
         ];
 
@@ -5563,6 +5599,7 @@ mod tests {
             root_link_names: None,
             wrapper_id: None,
             materialization: Materialization::CasBacked,
+            peers: Vec::new(),
         };
         assert_eq!(target.wrapper_segment(), "express@4.22.1");
     }
@@ -5579,6 +5616,7 @@ mod tests {
             root_link_names: None,
             wrapper_id: Some("f-1234567890abcdef".to_string()),
             materialization: Materialization::DirectorySource,
+            peers: Vec::new(),
         };
         assert_eq!(target.wrapper_segment(), "my-lib+f-1234567890abcdef");
     }
@@ -5598,6 +5636,7 @@ mod tests {
             root_link_names: None,
             wrapper_id: None,
             materialization: Materialization::CasBacked,
+            peers: Vec::new(),
         };
         assert_eq!(cas.wrapper_segment(), "@scope+pkg@1.0.0");
 
@@ -5611,6 +5650,7 @@ mod tests {
             root_link_names: None,
             wrapper_id: Some("f-abcd".to_string()),
             materialization: Materialization::DirectorySource,
+            peers: Vec::new(),
         };
         assert_eq!(local.wrapper_segment(), "@scope+pkg+f-abcd");
     }
@@ -5898,6 +5938,7 @@ mod tests {
             root_link_names: Some(vec!["local-foo".to_string()]),
             wrapper_id: Some("f-deadbeef00000000".to_string()),
             materialization: Materialization::DirectorySource,
+            peers: Vec::new(),
         };
 
         let result = link_packages(&project_dir, &[target], false, None).unwrap();
@@ -5949,6 +5990,7 @@ mod tests {
             root_link_names: None,
             wrapper_id: None,
             materialization: Materialization::CasBacked,
+            peers: Vec::new(),
         };
 
         link_packages(&project_dir, &[target], false, None).unwrap();
@@ -5994,6 +6036,7 @@ mod tests {
             root_link_names: None,
             wrapper_id: None,
             materialization: Materialization::CasBacked,
+            peers: Vec::new(),
         };
 
         link_packages(&project_dir, std::slice::from_ref(&target), false, None).unwrap();
@@ -6046,6 +6089,7 @@ mod tests {
             root_link_names: None,
             wrapper_id: None,
             materialization: Materialization::CasBacked,
+            peers: Vec::new(),
         };
         link_packages(&project_dir, &[target_a], false, None).unwrap();
 
@@ -6077,6 +6121,7 @@ mod tests {
             root_link_names: None,
             wrapper_id: None,
             materialization: Materialization::CasBacked,
+            peers: Vec::new(),
         };
         link_packages(&project_dir, std::slice::from_ref(&target_b), false, None).unwrap();
 
@@ -6144,6 +6189,7 @@ mod tests {
             root_link_names: None,
             wrapper_id: None,
             materialization: Materialization::CasBacked,
+            peers: Vec::new(),
         };
         link_packages(&project_dir, std::slice::from_ref(&target), false, None).unwrap();
 
@@ -6196,6 +6242,7 @@ mod tests {
             root_link_names: Some(Vec::new()),
             wrapper_id: None,
             materialization: Materialization::CasBacked,
+            peers: Vec::new(),
         };
 
         // First install: target A declares a `leftpad` dep, so the
@@ -6217,6 +6264,7 @@ mod tests {
             root_link_names: Some(vec!["foo".to_string()]),
             wrapper_id: None,
             materialization: Materialization::CasBacked,
+            peers: Vec::new(),
         };
         link_packages(
             &project_dir,
@@ -6255,6 +6303,7 @@ mod tests {
             root_link_names: Some(vec!["foo".to_string()]),
             wrapper_id: None,
             materialization: Materialization::CasBacked,
+            peers: Vec::new(),
         };
         link_packages(&project_dir, &[target_b, leftpad_target], false, None).unwrap();
 
@@ -6307,6 +6356,7 @@ mod tests {
             root_link_names: Some(Vec::new()),
             wrapper_id: None,
             materialization: Materialization::CasBacked,
+            peers: Vec::new(),
         };
         let leftpad2_store = create_fake_store_package(&store_dir, "leftpad-v2");
         let leftpad2_target = LinkTarget {
@@ -6319,6 +6369,7 @@ mod tests {
             root_link_names: Some(Vec::new()),
             wrapper_id: None,
             materialization: Materialization::CasBacked,
+            peers: Vec::new(),
         };
 
         // The same `foo` source — same `store_path` across both runs.
@@ -6334,6 +6385,7 @@ mod tests {
             root_link_names: Some(vec!["foo".to_string()]),
             wrapper_id: Some("f-aaaa".to_string()),
             materialization: Materialization::DirectorySource,
+            peers: Vec::new(),
         };
         link_packages(&project_dir, &[leftpad1_target, target_a], false, None).unwrap();
 
@@ -6361,6 +6413,7 @@ mod tests {
             root_link_names: Some(vec!["foo".to_string()]),
             wrapper_id: Some("f-aaaa".to_string()),
             materialization: Materialization::DirectorySource,
+            peers: Vec::new(),
         };
         link_packages(&project_dir, &[leftpad2_target, target_b], false, None).unwrap();
 
@@ -6392,6 +6445,7 @@ mod tests {
             root_link_names: None,
             wrapper_id: Some("t-deadbeef".to_string()),
             materialization: Materialization::CasBacked,
+            peers: Vec::new(),
         };
         let s1 = compute_link_stamp(&target);
         let s2 = compute_link_stamp(&target);
@@ -6418,6 +6472,7 @@ mod tests {
             root_link_names: None,
             wrapper_id: None,
             materialization: Materialization::CasBacked,
+            peers: Vec::new(),
         };
 
         // Same wrapper segment (`foo@1.0.0`), DIFFERENT store_path:
@@ -6432,6 +6487,7 @@ mod tests {
         // Different materialization.
         let other_mat = LinkTarget {
             materialization: Materialization::DirectorySource,
+            peers: Vec::new(),
             ..base.clone()
         };
         assert_ne!(compute_link_stamp(&base), compute_link_stamp(&other_mat));
@@ -6461,6 +6517,7 @@ mod tests {
             root_link_names: None,
             wrapper_id: None,
             materialization: Materialization::CasBacked,
+            peers: Vec::new(),
         };
 
         // Missing.
@@ -6520,6 +6577,7 @@ mod tests {
             root_link_names: None,
             wrapper_id: Some("f-deadbeef00000000".to_string()),
             materialization: Materialization::DirectorySource,
+            peers: Vec::new(),
         };
 
         cleanup_stale_entries(&project_dir, &[target]).unwrap();
@@ -6546,6 +6604,7 @@ mod tests {
             root_link_names: Some(vec!["local-bar".to_string()]),
             wrapper_id: Some("f-cafebabe00000000".to_string()),
             materialization: Materialization::DirectorySource,
+            peers: Vec::new(),
         };
 
         link_packages(&project_dir, &[target], false, None).unwrap();
@@ -6609,6 +6668,7 @@ mod tests {
             root_link_names: Some(vec!["express".to_string()]),
             wrapper_id: None,
             materialization: Materialization::CasBacked,
+            peers: Vec::new(),
         };
 
         cleanup_stale_entries(&project_dir, &[express]).unwrap();
@@ -6660,6 +6720,7 @@ mod tests {
             root_link_names: Some(vec!["@types/node".to_string()]),
             wrapper_id: None,
             materialization: Materialization::CasBacked,
+            peers: Vec::new(),
         };
 
         cleanup_stale_entries(&project_dir, &[types_node]).unwrap();
@@ -6704,6 +6765,7 @@ mod tests {
             root_link_names: Some(vec!["express".to_string()]),
             wrapper_id: None,
             materialization: Materialization::CasBacked,
+            peers: Vec::new(),
         };
 
         cleanup_stale_entries(&project_dir, &[express]).unwrap();
@@ -6744,6 +6806,7 @@ mod tests {
             root_link_names: Some(vec!["foo".to_string()]),
             wrapper_id: None,
             materialization: Materialization::CasBacked,
+            peers: Vec::new(),
         };
 
         cleanup_stale_entries(&project_dir, &[foo]).unwrap();
@@ -6779,6 +6842,7 @@ mod tests {
             root_link_names: Some(vec!["self-pkg".to_string()]),
             wrapper_id: None,
             materialization: Materialization::CasBacked,
+            peers: Vec::new(),
         };
 
         cleanup_stale_entries(&project_dir, &[self_pkg]).unwrap();
@@ -6828,6 +6892,7 @@ mod tests {
                 root_link_names: None,
                 wrapper_id: None,
                 materialization: Materialization::CasBacked,
+                peers: Vec::new(),
             }],
             false,
             None,
@@ -6886,6 +6951,7 @@ mod tests {
             root_link_names: None,
             wrapper_id: None,
             materialization: Materialization::CasBacked,
+            peers: Vec::new(),
         };
 
         link_packages(&project_dir, &[parent], false, None).unwrap();
@@ -6920,6 +6986,7 @@ mod tests {
             root_link_names: None,
             wrapper_id: None,
             materialization: Materialization::CasBacked,
+            peers: Vec::new(),
         };
 
         link_packages(&project_dir, &[parent], false, None).unwrap();
@@ -6954,6 +7021,7 @@ mod tests {
             root_link_names: None,
             wrapper_id: None,
             materialization: Materialization::CasBacked,
+            peers: Vec::new(),
         };
 
         link_packages(&project_dir, &[parent], false, None).unwrap();

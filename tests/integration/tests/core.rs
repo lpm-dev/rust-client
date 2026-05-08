@@ -557,6 +557,7 @@ fn linker_isolated_mode_creates_lpm_dir() {
         root_link_names: None,
         wrapper_id: None,
         materialization: lpm_linker::Materialization::CasBacked,
+        peers: Vec::new(),
     }];
 
     let result = lpm_linker::link_packages(&project_dir, &targets, false, None).unwrap();
@@ -591,6 +592,7 @@ fn linker_hoisted_mode_flattens() {
         root_link_names: None,
         wrapper_id: None,
         materialization: lpm_linker::Materialization::CasBacked,
+        peers: Vec::new(),
     }];
 
     let result = lpm_linker::link_packages_hoisted(&project_dir, &targets, false, None).unwrap();
@@ -973,6 +975,7 @@ fn linker_directory_dep_creates_plus_wrapper_with_live_symlinks() {
         // the `+`-shape branch.
         wrapper_id: Some("f-deadbeef00000000".to_string()),
         materialization: lpm_linker::Materialization::DirectorySource,
+        peers: Vec::new(),
     };
 
     let result = lpm_linker::link_packages(&project_dir, &[target], false, None).unwrap();
@@ -1068,6 +1071,7 @@ fn linker_link_dep_creates_l_prefix_wrapper_with_live_symlinks() {
         // segment level.
         wrapper_id: Some("l-cafebabe00000000".to_string()),
         materialization: lpm_linker::Materialization::DirectorySource,
+        peers: Vec::new(),
     };
 
     let result = lpm_linker::link_packages(&project_dir, &[target], false, None).unwrap();
@@ -1189,6 +1193,7 @@ fn linker_directory_dep_with_transitive_directory_dep_creates_sibling_symlink() 
         root_link_names: Some(vec!["a".to_string()]),
         wrapper_id: Some(a_source_id.clone()),
         materialization: lpm_linker::Materialization::DirectorySource,
+        peers: Vec::new(),
     };
     let target_b = lpm_linker::LinkTarget {
         name: "b".to_string(),
@@ -1200,6 +1205,7 @@ fn linker_directory_dep_with_transitive_directory_dep_creates_sibling_symlink() 
         root_link_names: Some(vec![]), // transitive — no root link
         wrapper_id: Some(b_source_id.clone()),
         materialization: lpm_linker::Materialization::DirectorySource,
+        peers: Vec::new(),
     };
 
     lpm_linker::link_packages(&project_dir, &[target_a, target_b], false, None).unwrap();
@@ -1384,6 +1390,7 @@ fn linker_cross_source_coexistence_all_five_kinds_in_one_install() {
         root_link_names: Some(vec!["foo".to_string()]),
         wrapper_id: None,
         materialization: lpm_linker::Materialization::CasBacked,
+        peers: Vec::new(),
     };
     let tarball_remote_target = lpm_linker::LinkTarget {
         name: "foo".to_string(),
@@ -1395,6 +1402,7 @@ fn linker_cross_source_coexistence_all_five_kinds_in_one_install() {
         root_link_names: Some(vec!["foo-from-tarball-remote".to_string()]),
         wrapper_id: Some(TARBALL_REMOTE_WID.to_string()),
         materialization: lpm_linker::Materialization::CasBacked,
+        peers: Vec::new(),
     };
     let tarball_local_target = lpm_linker::LinkTarget {
         name: "foo".to_string(),
@@ -1406,6 +1414,7 @@ fn linker_cross_source_coexistence_all_five_kinds_in_one_install() {
         root_link_names: Some(vec!["foo-from-tarball-local".to_string()]),
         wrapper_id: Some(TARBALL_LOCAL_WID.to_string()),
         materialization: lpm_linker::Materialization::CasBacked,
+        peers: Vec::new(),
     };
     let file_target = lpm_linker::LinkTarget {
         name: "foo".to_string(),
@@ -1417,6 +1426,7 @@ fn linker_cross_source_coexistence_all_five_kinds_in_one_install() {
         root_link_names: Some(vec!["foo-from-file".to_string()]),
         wrapper_id: Some(FILE_WID.to_string()),
         materialization: lpm_linker::Materialization::DirectorySource,
+        peers: Vec::new(),
     };
     let link_target = lpm_linker::LinkTarget {
         name: "foo".to_string(),
@@ -1428,6 +1438,7 @@ fn linker_cross_source_coexistence_all_five_kinds_in_one_install() {
         root_link_names: Some(vec!["foo-from-link".to_string()]),
         wrapper_id: Some(LINK_WID.to_string()),
         materialization: lpm_linker::Materialization::DirectorySource,
+        peers: Vec::new(),
     };
 
     let result = lpm_linker::link_packages(

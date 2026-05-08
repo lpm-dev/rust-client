@@ -303,8 +303,18 @@ pub async fn resolve_greedy_fused(
     // canonicals they're fetching.
     let shared_cache: SharedCache = Arc::new(dashmap::DashMap::new());
     let metadata_sem = Arc::new(tokio::sync::Semaphore::new(npm_fanout));
-    let mut inflight: HashSet<CanonicalKey> = HashSet::new();
-    let mut parked: HashMap<CanonicalKey, Vec<Edge>> = HashMap::new();
+    // **Phase 66 perf followup #4 (samply-driven, 2026-05-08).**
+    // Pre-size both maps to the expected steady-state cardinality.
+    // For `bench/fixture-large` (266 transitive packages) the default-
+    // sized HashMap rehashes ~5-7 times growing from 0 → 266; samply
+    // surfaced `hashbrown::reserve_rehash` at ~6.7 % of cold-install
+    // CPU. `npm_fanout` (the metadata-semaphore size, default 256)
+    // is the closest proxy we have for "how many manifests this
+    // resolver might track simultaneously" without threading a
+    // dependency-count estimate through. Slight over-allocation is
+    // strictly cheaper than rehashing.
+    let mut inflight: HashSet<CanonicalKey> = HashSet::with_capacity(npm_fanout);
+    let mut parked: HashMap<CanonicalKey, Vec<Edge>> = HashMap::with_capacity(npm_fanout);
     type FetchResult = Result<lpm_registry::PackageMetadata, ResolveError>;
     let mut metadata_jobs: tokio::task::JoinSet<(CanonicalKey, bool, FetchResult)> =
         tokio::task::JoinSet::new();
@@ -606,6 +616,21 @@ impl ResolveState {
         // time, so children[i].1 is always the correct node id).
         let id_to_version: Vec<String> = self.nodes.iter().map(|n| n.version.to_string()).collect();
 
+        // Phase 66 §2.5 — canonical-name → resolved-version lookup
+        // for peer resolution. Mirrors `format_solution`'s
+        // `resolved_versions`. Built from the same node table
+        // (filtered to non-root) so peer name-lookups intersect the
+        // active install set. `CanonicalKey`'s Display impl emits
+        // the canonical-name form (`@lpm.dev/owner.name` or `react`),
+        // matching how `peerDependencies` keys are spelled in
+        // package.json.
+        let resolved_by_canonical: HashMap<String, String> = self
+            .nodes
+            .iter()
+            .filter(|n| !matches!(n.canonical, CanonicalKey::Root))
+            .map(|n| (n.canonical.to_string(), n.version.to_string()))
+            .collect();
+
         let mut out: Vec<ResolvedPackage> = self
             .nodes
             .into_iter()
@@ -653,11 +678,34 @@ impl ResolveState {
                     .map(|d| (d.tarball_url.clone(), d.integrity.clone()))
                     .unwrap_or_default();
 
+                // Phase 66 §2.5 — surface resolved peers per package
+                // so the v2 GraphKey can fold them in. Greedy arm
+                // builds the resolved-versions lookup from the same
+                // node table; reuse `id_to_version` indexed by
+                // canonical name.
+                let peers: Vec<(String, String)> = cache
+                    .get(&n.canonical)
+                    .and_then(|info| info.peer_deps.get(&ver_str))
+                    .map(|peer_deps| {
+                        let mut out: Vec<(String, String)> = peer_deps
+                            .keys()
+                            .filter_map(|peer_name| {
+                                resolved_by_canonical
+                                    .get(peer_name)
+                                    .map(|ver| (peer_name.clone(), ver.clone()))
+                            })
+                            .collect();
+                        out.sort_by(|a, b| a.0.cmp(&b.0));
+                        out
+                    })
+                    .unwrap_or_default();
+
                 ResolvedPackage {
                     package: pkg,
                     version: n.version,
                     dependencies,
                     aliases,
+                    peers,
                     tarball_url,
                     integrity,
                 }

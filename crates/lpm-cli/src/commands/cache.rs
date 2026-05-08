@@ -26,18 +26,36 @@ use std::time::{Duration, SystemTime};
 
 const RECENT_STORE_ACTIVITY_WINDOW: Duration = Duration::from_secs(24 * 60 * 60);
 
+/// Phase 66 Phase 4e — flags shared by every `lpm cache <action>` call
+/// site so the dispatcher signature stays stable across actions.
+/// `clean` and `path` ignore every field; `prune` reads them.
+#[derive(Debug, Clone, Default)]
+pub struct PruneFlags<'a> {
+    /// Default `false` (dry-run); `true` actually removes orphans.
+    pub apply: bool,
+    /// Filter by `last_referenced_at` age (e.g., `30d`, `24h`).
+    pub max_age: Option<&'a str>,
+    /// Manual repair mode — use ONLY this project's `node_modules/`
+    /// as the root set; ignore the registry.
+    pub project: Option<&'a str>,
+    /// Also wipe `~/.lpm/store/v1/` (post-migration cleanup).
+    pub legacy_v1: bool,
+}
+
 pub async fn run(
     action: &str,
     subcategory: Option<&str>,
     json_output: bool,
+    prune_flags: PruneFlags<'_>,
 ) -> Result<(), LpmError> {
     let root = LpmRoot::from_env()?;
 
     match action {
         "clean" | "clear" => run_clean(&root, subcategory, json_output),
         "path" => run_path(&root, subcategory, json_output),
+        "prune" => super::cache_prune::run(&root, json_output, prune_flags).await,
         other => Err(LpmError::Registry(format!(
-            "unknown cache action '{other}'. Use: clean [metadata|tasks|dlx], path [metadata|tasks|dlx]"
+            "unknown cache action '{other}'. Use: clean [metadata|tasks|dlx], path [metadata|tasks|dlx], prune [--apply] [--max-age <dur>] [--project <path>] [--legacy-v1]"
         ))),
     }
 }
@@ -306,7 +324,9 @@ mod tests {
 
         // Drive the command via its public surface.
         let _env = scoped_lpm_home(tmp.path());
-        run("clean", None, true).await.unwrap();
+        run("clean", None, true, PruneFlags::default())
+            .await
+            .unwrap();
 
         assert!(!root.cache_metadata().exists(), "metadata should be gone");
         assert!(!root.cache_tasks().exists(), "tasks should be gone");
@@ -327,7 +347,9 @@ mod tests {
         populate(&root.cache_dlx().join("hash1"), &["package.json"]);
 
         let _env = scoped_lpm_home(tmp.path());
-        run("clean", Some("metadata"), true).await.unwrap();
+        run("clean", Some("metadata"), true, PruneFlags::default())
+            .await
+            .unwrap();
 
         assert!(!root.cache_metadata().exists());
         assert!(root.cache_tasks().join("b.json").exists());
@@ -347,7 +369,9 @@ mod tests {
         populate(&root.store_v1().join("react@19.0.0"), &["index.js"]);
 
         let _env = scoped_lpm_home(tmp.path());
-        run("clean", None, true).await.unwrap();
+        run("clean", None, true, PruneFlags::default())
+            .await
+            .unwrap();
 
         assert!(!root.cache_metadata().exists());
         assert!(root.store_v1().join("lodash@4.17.21").exists());
@@ -386,7 +410,9 @@ mod tests {
         // Human-readable path triggers the notice; JSON path deliberately
         // does not (see emit_clean_json callers). This test exercises the
         // human branch.
-        run("clean", None, false).await.unwrap();
+        run("clean", None, false, PruneFlags::default())
+            .await
+            .unwrap();
 
         assert!(
             root.cache_clean_notice_marker().exists(),
@@ -402,7 +428,9 @@ mod tests {
         populate(&root.cache_metadata(), &["a.json"]);
 
         let _env = scoped_lpm_home(tmp.path());
-        run("clean", None, false).await.unwrap();
+        run("clean", None, false, PruneFlags::default())
+            .await
+            .unwrap();
         // Capture marker mtime; second run must not rewrite it.
         let first_mtime = std::fs::metadata(root.cache_clean_notice_marker())
             .unwrap()
@@ -410,7 +438,9 @@ mod tests {
             .unwrap();
 
         populate(&root.cache_metadata(), &["a.json"]);
-        run("clean", None, false).await.unwrap();
+        run("clean", None, false, PruneFlags::default())
+            .await
+            .unwrap();
 
         let second_mtime = std::fs::metadata(root.cache_clean_notice_marker())
             .unwrap()
@@ -426,17 +456,27 @@ mod tests {
         // We can't easily capture stdout from inside a tokio test without
         // pulling in a redirect harness; we assert success + sane behavior
         // and trust the emit_* helpers. The JSON path is deterministic.
-        run("path", None, true).await.unwrap();
-        run("path", Some("metadata"), true).await.unwrap();
-        run("path", Some("tasks"), true).await.unwrap();
-        run("path", Some("dlx"), true).await.unwrap();
+        run("path", None, true, PruneFlags::default())
+            .await
+            .unwrap();
+        run("path", Some("metadata"), true, PruneFlags::default())
+            .await
+            .unwrap();
+        run("path", Some("tasks"), true, PruneFlags::default())
+            .await
+            .unwrap();
+        run("path", Some("dlx"), true, PruneFlags::default())
+            .await
+            .unwrap();
     }
 
     #[tokio::test]
     async fn unknown_action_errors() {
         let tmp = TempDir::new().unwrap();
         let _env = scoped_lpm_home(tmp.path());
-        let err = run("bogus", None, true).await.unwrap_err();
+        let err = run("bogus", None, true, PruneFlags::default())
+            .await
+            .unwrap_err();
         let msg = format!("{err}");
         assert!(msg.contains("unknown cache action"), "got: {msg}");
     }

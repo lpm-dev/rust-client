@@ -68,23 +68,27 @@ pub struct InstallState {
 const INSTALL_HASH_SCHEMA_TAG: &[u8] = b"lpm-install-hash-v6\x00";
 
 /// Compute the install hash from raw file contents — back-compat shim
-/// that defaults file/link bytes to empty AND linker mode to isolated.
-/// Used by test fixtures and `dev.rs`'s deterministic-hash unit tests
-/// where the linker is not under test. Production callers use
-/// [`compute_install_hash_v6`] directly.
+/// that defaults file/link bytes to empty AND linker mode to the
+/// active default. Used by test fixtures and `dev.rs`'s
+/// deterministic-hash unit tests where the linker is not under test.
+/// Production callers use [`compute_install_hash_v6`] directly.
+///
+/// Phase 66 Phase 4f flipped [`LinkerMode::default`] from Isolated to
+/// Hoisted; this shim follows the flip so callers expecting "the hash
+/// for a default install" get the post-4f shape.
 pub fn compute_install_hash(pkg_content: &str, lock_content: &str) -> String {
     compute_install_hash_v6(
         pkg_content,
         lock_content,
         &[],
-        lpm_linker::LinkerMode::Isolated,
+        lpm_linker::LinkerMode::default(),
     )
 }
 
 /// Same shape as [`compute_install_hash_v6`] minus the linker arg —
 /// retained ONLY to keep the v3 name available to callers that
-/// explicitly want the isolated default. Behaves identically to
-/// `compute_install_hash_v6(..., LinkerMode::Isolated)`. New code
+/// explicitly want the active default. Behaves identically to
+/// `compute_install_hash_v6(..., LinkerMode::default())`. New code
 /// should call `compute_install_hash_v6` and pass the resolved mode.
 pub fn compute_install_hash_v3(
     pkg_content: &str,
@@ -95,7 +99,7 @@ pub fn compute_install_hash_v3(
         pkg_content,
         lock_content,
         file_link_manifests,
-        lpm_linker::LinkerMode::Isolated,
+        lpm_linker::LinkerMode::default(),
     )
 }
 
@@ -454,6 +458,33 @@ pub fn check_install_state_with_linker(
         };
     }
 
+    // Phase 66 Phase 4d — v1 → v2 store-layout migration gate. After
+    // the Phase 4d default flip, an upgrade-in-place user (still with
+    // v1's `<project>/.lpm/wrappers/` or `<project>/.lpm/hoisted/`
+    // populated) needs the install pipeline to run the v1→v2 wipe-
+    // and-rebuild sequence. Without this gate the sync fast lane in
+    // `main.rs` short-circuits with "up to date" and the user's
+    // project stays on the legacy layout indefinitely. The dual-gate
+    // shape mirrors Phase 61.3 D8c: legacy state populated + new
+    // store version active = freshness reset.
+    //
+    // Detection mirrors the install-pipeline's
+    // [`commands::install::needs_v2_migration`] but is duplicated
+    // here intentionally: importing the install module from
+    // install_state would create a cyclic-ish coupling for one
+    // two-line predicate, and the predicate is small enough that
+    // drift won't realistically diverge.
+    if lpm_store::StoreVersion::from_env().is_v2() {
+        let legacy_isolated = project_dir.join(".lpm").join("wrappers");
+        let legacy_hoisted = project_dir.join(".lpm").join("hoisted");
+        if legacy_isolated.exists() || legacy_hoisted.exists() {
+            return InstallState {
+                up_to_date: false,
+                hash: Some(current_hash),
+            };
+        }
+    }
+
     // Hash comparison — read only the first line of the file so v1 (bare
     // hash) and v2 (hash + mtime line) formats both parse identically.
     let Ok(cached_hash_file) = std::fs::read_to_string(&hash_file) else {
@@ -534,6 +565,21 @@ fn try_mtime_fast_path(
     // returned.
     if lpm_linker::LayoutPaths::for_project(project_dir).needs_layout_migration() {
         return None;
+    }
+
+    // Phase 66 Phase 4d — v1 → v2 store migration gate. Must mirror
+    // the slow-path guard in `check_install_state_with_content`
+    // because the mtime fast lane skips that function entirely on
+    // mtime hits. Without this, an upgrade-in-place user whose
+    // package.json + lpm.lock mtimes haven't changed would
+    // permanently short-circuit at "up to date" and never run the
+    // v1 → v2 wipe-and-rebuild sequence.
+    if lpm_store::StoreVersion::from_env().is_v2() {
+        let legacy_isolated = project_dir.join(".lpm").join("wrappers");
+        let legacy_hoisted = project_dir.join(".lpm").join("hoisted");
+        if legacy_isolated.exists() || legacy_hoisted.exists() {
+            return None;
+        }
     }
 
     let hash_file = project_dir.join(".lpm").join("install-hash");
@@ -924,12 +970,17 @@ mod tests {
         //   SHA256("lpm-install-hash-v6\x00" || "pkg" || "\x00" || "lock"
         //          || "\x00" || "\x00" || "isolated")
         // at the time the schema was bumped to v6 (post-install linker
-        // freshness fold). `compute_install_hash` defaults the linker
-        // arg to `LinkerMode::Isolated`, so the v6 hash for the canonical
-        // inputs ends with `\x00 || "isolated"`. Updating this constant
+        // freshness fold).
+        //
+        // Phase 66 Phase 4f note: `compute_install_hash` now defaults
+        // to `LinkerMode::default()` which flipped to Hoisted in 4f.
+        // To keep this test schema-pinned (not coupled to whichever
+        // linker is the default), call `compute_install_hash_v6`
+        // explicitly with `LinkerMode::Isolated` — the value used at
+        // the time the schema was last bumped. Updating this constant
         // is a deliberate act that must accompany any schema-version
         // bump.
-        let actual = compute_install_hash("pkg", "lock");
+        let actual = compute_install_hash_v6("pkg", "lock", &[], lpm_linker::LinkerMode::Isolated);
         let expected_v6 = "3adc9b6970027883b955378cd3dc894ff3a40df5875b4f3150e42254d04b623e";
         assert_eq!(
             actual, expected_v6,
@@ -1645,28 +1696,34 @@ mod tests {
         assert!(state.up_to_date, "empty legacy dir must not gate install");
     }
 
+    /// Phase 61.3 D8c contract — historically asserted that "both
+    /// legacy + new isolated wrapper layouts populated → migration
+    /// complete → up-to-date". Phase 66 Phase 4d's default flip to
+    /// v2 changes this: `<project>/.lpm/wrappers/` is now the
+    /// LEGACY-V1 marker and triggers a v2 migration regardless of
+    /// the legacy isolated-vs-new-isolated distinction. The 4d gate
+    /// fires unconditionally on v1 wrappers when the active store
+    /// version is v2, and `StoreVersion::default()` is v2 since the
+    /// flip — so this test now asserts the post-Phase-4d contract:
+    /// v1 wrappers populated → v2 migration owed → up-to-date is
+    /// false. The pre-Phase-4d "both isolated layouts populated →
+    /// fresh" contract is intentionally retired.
     #[test]
-    fn populated_new_layout_does_not_force_install() {
-        // The migration gate is "legacy populated AND new empty."
-        // Once the new layout is also populated, the migration is
-        // (presumably) complete and the gate stops firing.
-        //
-        // Same mtime-discipline as `empty_legacy_dir_does_not_force_install`:
-        // both layouts must be populated BEFORE the hash is written.
+    fn populated_v1_wrappers_force_v2_migration_on_default() {
         let dir = TempDir::new().unwrap();
         let p = dir.path();
         let pkg_json = r#"{"dependencies":{"a":"^1.0.0"}}"#;
         fs::write(p.join("package.json"), pkg_json).unwrap();
         fs::write(p.join("lpm.lock"), "lock-content").unwrap();
-        fs::create_dir_all(p.join("node_modules/.lpm/express@4.22.1")).unwrap();
+        fs::create_dir_all(p.join("node_modules")).unwrap();
         fs::create_dir_all(p.join(".lpm/wrappers/express@4.22.1")).unwrap();
         let hash = compute_install_hash(pkg_json, "lock-content");
         fs::write(p.join(".lpm").join("install-hash"), &hash).unwrap();
 
         let state = check_install_state(p);
         assert!(
-            state.up_to_date,
-            "both layouts populated → migration considered complete"
+            !state.up_to_date,
+            "v1 wrappers under post-4d v2 default must trigger migration"
         );
     }
 }

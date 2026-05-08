@@ -243,6 +243,24 @@ impl LpmRoot {
             .join(format!("{safe_name}@{version}"))
     }
 
+    // ─── Phase 66 Phase 4e — known-projects registry ────────────────
+
+    /// Machine-global registry of project directories that have ever
+    /// completed an `lpm install`. Lives at
+    /// `~/.lpm/known-projects.json`. Used by
+    /// [`lpm cache prune`](../../lpm-cli/src/commands/cache.rs) as the
+    /// root set when computing v2-store orphan reachability — every
+    /// project here contributes its `node_modules/<dep>` symlinks
+    /// to the "graph keys still in use" set; entries not reachable
+    /// from any registered project are pruneable.
+    ///
+    /// Schema is owned by [`lpm_common::known_projects`]; see that
+    /// module for the on-disk JSON shape, atomic-rewrite contract,
+    /// and silent-drop policy for moved/deleted projects.
+    pub fn known_projects(&self) -> PathBuf {
+        self.home.join("known-projects.json")
+    }
+
     // ─── Onboarding / notice markers ────────────────────────────────
 
     /// Sentinel file created after the first successful `install -g` on a
