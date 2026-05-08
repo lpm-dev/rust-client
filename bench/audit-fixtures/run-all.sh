@@ -27,6 +27,7 @@ FIXTURES=(
     "peer-heavy/vue-3-ecosystem"
     "peer-heavy/apollo-graphql"
     "peer-heavy/nestjs-deep"
+    "peer-heavy/optional-peers"
     "tooling/eslint-flat-config"
     "tooling/babel-presets"
     "tooling/rollup-plugins"
@@ -35,10 +36,17 @@ FIXTURES=(
     "native/better-sqlite3"
     "native/prisma-codegen"
     "workspace/monorepo-basic"
+    "workspace/cyclic-deps"
+    "workspace/large-monorepo"
     "dogfood/realworld-app"
     "source-kind/file-protocol"
     "source-kind/link-protocol"
     "source-kind/postinstall-sibling-husky"
+    "source-kind/bundle-deps"
+    "source-kind/npm-aliases"
+    "source-kind/patches"
+    "source-kind/postinstall-introspects-layout"
+    "source-kind/self-referential"
 )
 
 declare -a RESULTS=()

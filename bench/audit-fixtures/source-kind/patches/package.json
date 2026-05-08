@@ -1,0 +1,17 @@
+{
+	"name": "audit-fixture-patches",
+	"version": "1.0.0",
+	"private": true,
+	"_comment": "Phase 66 confidence-followup §2f. Tests lpm's patch system (Phase 32 P6) under both linker modes. The contract: a patch declared in `lpm.patchedDependencies` is applied to every physical destination of the target package — `apply_patches_for_install` in install.rs filters `link_result.materialized` to find each layout shape (isolated wrapper, hoisted root, hoisted-nested fallback). Risk per the followup doc: 'hoisted's materialized-package list is computed differently than isolated's; patches that worked in isolated might not find their target in hoisted's flat layout.' The patch appends a sentinel function (`lpmPatchProof()`) to ms@2.1.3's index.js; the smoke verifies the function is present and returns its expected string from a require()'d ms instance under both modes.",
+	"dependencies": {
+		"ms": "2.1.3"
+	},
+	"lpm": {
+		"patchedDependencies": {
+			"ms@2.1.3": {
+				"path": "patches/ms@2.1.3.patch",
+				"originalIntegrity": "sha512-6FlzubTLZG3J2a/NVCAleEhjzq5oxgHyaCU9yYXvcLsvoVaHJq/s5xXI6/XXP6tz7R9xAOtHnSO/tXtF3WRTlA=="
+			}
+		}
+	}
+}
