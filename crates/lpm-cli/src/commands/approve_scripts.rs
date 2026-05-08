@@ -917,13 +917,15 @@ fn print_version_diff_card_for_blocked(blocked: &BlockedPackage, trusted: &Trust
     if !diff.is_drift() {
         return;
     }
-    let store = match lpm_store::PackageStore::default_location() {
-        Ok(s) => s,
+    // Phase 66 confidence-followup S5a — v2-aware lookup. Pre-fix, the
+    // PackageStore::package_dir paths below were v1-only — under the
+    // v2-default install pipeline, both `prior` and `candidate`
+    // resolved to non-existent paths, so `read_install_phase_bodies`
+    // returned empty vecs and the version-diff card silently degraded
+    // to the "scripts not in store" fallback for every v2 install.
+    let lpm_root = match lpm_common::LpmRoot::from_env() {
+        Ok(r) => r,
         Err(_) => {
-            // Store unavailable — still render the structured part of
-            // the card (header, tag delta, provenance) but the
-            // script-body section will degrade. Pass None for both
-            // sides; the renderer's fallback note is appropriate.
             if let Some(card) =
                 crate::version_diff::render_preflight_card(&diff, &blocked.name, None, None)
             {
@@ -934,12 +936,20 @@ fn print_version_diff_card_for_blocked(blocked: &BlockedPackage, trusted: &Trust
             return;
         }
     };
-    let prior_pairs = crate::build_state::read_install_phase_bodies(
-        &store.package_dir(&blocked.name, prior_version),
-    );
-    let candidate_pairs = crate::build_state::read_install_phase_bodies(
-        &store.package_dir(&blocked.name, &blocked.version),
-    );
+    let store_dir_for = |version: &str| -> Option<std::path::PathBuf> {
+        lpm_store::find_installed_package_baseline(&lpm_root, &blocked.name, version)
+            .ok()
+            .flatten()
+            .map(|b| b.package_dir)
+    };
+    let prior_pairs = match store_dir_for(prior_version) {
+        Some(dir) => crate::build_state::read_install_phase_bodies(&dir),
+        None => Vec::new(),
+    };
+    let candidate_pairs = match store_dir_for(&blocked.version) {
+        Some(dir) => crate::build_state::read_install_phase_bodies(&dir),
+        None => Vec::new(),
+    };
     let prior_bodies = if prior_pairs.is_empty() {
         None
     } else {
@@ -1216,14 +1226,36 @@ fn truncate_for_display(s: &str, max: usize) -> String {
 /// match what the build pipeline executes — same source-of-truth as the
 /// script-hash function.
 fn print_full_script(_project_dir: &Path, blocked: &BlockedPackage) {
-    let store = match lpm_store::PackageStore::default_location() {
-        Ok(s) => s,
+    // Phase 66 confidence-followup S5a — `find_installed_package_baseline`
+    // (v2-first, v1-fallback) replaces the v1-only `PackageStore::package_dir`
+    // call. Pre-fix, "View full script" emitted "could not read
+    // package.json from store" for every v2-installed package because
+    // the v1 path didn't exist.
+    let lpm_root = match lpm_common::LpmRoot::from_env() {
+        Ok(r) => r,
         Err(e) => {
-            output::warn(&format!("could not open store: {e}"));
+            output::warn(&format!("could not resolve lpm root: {e}"));
             return;
         }
     };
-    let pkg_dir = store.package_dir(&blocked.name, &blocked.version);
+    let pkg_dir = match lpm_store::find_installed_package_baseline(
+        &lpm_root,
+        &blocked.name,
+        &blocked.version,
+    ) {
+        Ok(Some(b)) => b.package_dir,
+        Ok(None) => {
+            output::warn(&format!(
+                "{}@{}: not found in store (workspace/file/link source, or corrupt install)",
+                blocked.name, blocked.version
+            ));
+            return;
+        }
+        Err(e) => {
+            output::warn(&format!("could not query store: {e}"));
+            return;
+        }
+    };
     let pkg_json_path = pkg_dir.join("package.json");
     let content = match std::fs::read_to_string(&pkg_json_path) {
         Ok(c) => c,

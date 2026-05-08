@@ -1134,7 +1134,7 @@ mod tests {
     #[test]
     fn verify_integrity_passes_on_v2_link_entry() {
         use chrono::Utc;
-        use lpm_store::v2::{LinkMeta, LinkMetaPlatform, LINK_META_SCHEMA_VERSION};
+        use lpm_store::v2::{LINK_META_SCHEMA_VERSION, LinkMeta, LinkMetaPlatform};
 
         let home = tempfile::tempdir().unwrap();
         // Materialize a v2 link entry: <store>/v2/links/<safe>@<ver>+<hash>/node_modules/<name>/
@@ -1179,7 +1179,10 @@ mod tests {
         let err =
             verify_original_integrity(&store, "lodash", "4.17.21", "sha512-OTHER").unwrap_err();
         let msg = format!("{err}");
-        assert!(msg.contains("drift"), "error must mark this as drift: {msg}");
+        assert!(
+            msg.contains("drift"),
+            "error must mark this as drift: {msg}"
+        );
         assert!(
             msg.contains("sha512-v2-baseline"),
             "drift error must surface the v2 baseline SRI: {msg}"

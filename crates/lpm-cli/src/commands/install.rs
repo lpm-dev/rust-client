@@ -3955,6 +3955,14 @@ async fn run_with_options_under_store_lock(
     // resolve phase. Post-resolve, the fetch loop rebinds to the same
     // handle (cheap Arc-style clone underneath).
     let store = PackageStore::default_location()?;
+    // Phase 66 confidence-followup S5b — `lpm_root` lifted to function
+    // scope so post-install helpers (`show_install_build_hint`,
+    // `all_scripted_packages_trusted`) can reach the v2 store via
+    // `find_installed_package_baseline`. Pre-fix, those helpers took
+    // `&PackageStore` (v1-only) and silently dropped every v2-installed
+    // scripted package — auto-build never fired, build hints reported
+    // 0 packages even when prisma / esbuild / sharp were waiting.
+    let lpm_root = lpm_common::LpmRoot::from_env()?;
 
     // Phase 66 Phase 4b — read the store-version flag once per
     // install. `LPM_STORE_VERSION=v2` opts in to the virtual-store
@@ -3968,7 +3976,6 @@ async fn run_with_options_under_store_lock(
     // allocation-free.
     let store_version = lpm_store::StoreVersion::from_env();
     let store_v2_handle: Option<std::sync::Arc<lpm_store::v2::Store>> = if store_version.is_v2() {
-        let lpm_root = lpm_common::LpmRoot::from_env()?;
         Some(std::sync::Arc::new(lpm_store::v2::Store::from_lpm_root(
             &lpm_root,
         )))
@@ -6083,7 +6090,7 @@ async fn run_with_options_under_store_lock(
                     .map(|p| (p.name.clone(), p.version.clone(), p.integrity.clone()))
                     .collect();
                 crate::commands::rebuild::show_install_build_hint(
-                    &store,
+                    &lpm_root,
                     &all_pkgs,
                     &policy,
                     project_dir,
@@ -6439,7 +6446,7 @@ async fn run_with_options_under_store_lock(
         .get_bool("force-security-floor")
         .unwrap_or(false);
     let all_trusted = crate::commands::rebuild::all_scripted_packages_trusted(
-        &store,
+        &lpm_root,
         &all_pkgs_for_build,
         &policy,
         project_dir,
@@ -7997,6 +8004,9 @@ async fn run_link_and_finish(
     script_policy_override: Option<crate::script_policy_config::ScriptPolicy>,
 ) -> Result<(), LpmError> {
     let store = PackageStore::default_location()?;
+    // Phase 66 confidence-followup S5b — same hoist as `run_with_options`;
+    // post-install helpers route through `find_installed_package_baseline`.
+    let lpm_root = lpm_common::LpmRoot::from_env()?;
 
     let link_targets: Vec<LinkTarget> = packages
         .iter()
@@ -8161,7 +8171,7 @@ async fn run_link_and_finish(
                     .map(|p| (p.name.clone(), p.version.clone(), p.integrity.clone()))
                     .collect();
                 crate::commands::rebuild::show_install_build_hint(
-                    &store,
+                    &lpm_root,
                     &all_pkgs,
                     &policy,
                     project_dir,

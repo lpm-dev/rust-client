@@ -45,14 +45,13 @@ async fn run_patch_inner(key: &str, json_output: bool) -> Result<(), LpmError> {
     // Pre-fix this called `store.has_package(...)` (v1-only), which
     // always returned false under v2 → "not in the global store".
     let lpm_root = lpm_common::LpmRoot::from_env()?;
-    let baseline = find_installed_package_baseline(&lpm_root, &name, &version)?.ok_or_else(
-        || {
+    let baseline =
+        find_installed_package_baseline(&lpm_root, &name, &version)?.ok_or_else(|| {
             LpmError::Script(format!(
                 "{name}@{version} is not in the global store. \
                  Run `lpm install {name}@{version}` first."
             ))
-        },
-    )?;
+        })?;
     let store_path = baseline.package_dir;
 
     // Build a unique staging directory under the OS temp root. We
@@ -167,14 +166,12 @@ async fn run_patch_commit_inner(
     // call so we no longer need a separate `read_stored_integrity`
     // probe at step 4.
     let lpm_root = lpm_common::LpmRoot::from_env()?;
-    let baseline = find_installed_package_baseline(&lpm_root, name, version)?.ok_or_else(
-        || {
-            LpmError::Script(format!(
-                "{name}@{version} is no longer in the global store; \
+    let baseline = find_installed_package_baseline(&lpm_root, name, version)?.ok_or_else(|| {
+        LpmError::Script(format!(
+            "{name}@{version} is no longer in the global store; \
                  cannot generate patch baseline"
-            ))
-        },
-    )?;
+        ))
+    })?;
     let store_path = baseline.package_dir.clone();
 
     let edited_dir = staging_dir.join("node_modules").join(name);
