@@ -312,8 +312,7 @@ impl Store {
         // so the closure (`FnMut`) can mutate it without exclusive
         // borrows escaping the call site.
         let extract_start = std::time::Instant::now();
-        let analyzer =
-            std::cell::RefCell::new(lpm_security::behavioral::PackageAnalyzer::new());
+        let analyzer = std::cell::RefCell::new(lpm_security::behavioral::PackageAnalyzer::new());
         let extract_result = lpm_extractor::extract_tarball_from_reader_with_inspector(
             tarball_data,
             &tmp_dir,
