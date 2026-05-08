@@ -303,8 +303,18 @@ pub async fn resolve_greedy_fused(
     // canonicals they're fetching.
     let shared_cache: SharedCache = Arc::new(dashmap::DashMap::new());
     let metadata_sem = Arc::new(tokio::sync::Semaphore::new(npm_fanout));
-    let mut inflight: HashSet<CanonicalKey> = HashSet::new();
-    let mut parked: HashMap<CanonicalKey, Vec<Edge>> = HashMap::new();
+    // **Phase 66 perf followup #4 (samply-driven, 2026-05-08).**
+    // Pre-size both maps to the expected steady-state cardinality.
+    // For `bench/fixture-large` (266 transitive packages) the default-
+    // sized HashMap rehashes ~5-7 times growing from 0 → 266; samply
+    // surfaced `hashbrown::reserve_rehash` at ~6.7 % of cold-install
+    // CPU. `npm_fanout` (the metadata-semaphore size, default 256)
+    // is the closest proxy we have for "how many manifests this
+    // resolver might track simultaneously" without threading a
+    // dependency-count estimate through. Slight over-allocation is
+    // strictly cheaper than rehashing.
+    let mut inflight: HashSet<CanonicalKey> = HashSet::with_capacity(npm_fanout);
+    let mut parked: HashMap<CanonicalKey, Vec<Edge>> = HashMap::with_capacity(npm_fanout);
     type FetchResult = Result<lpm_registry::PackageMetadata, ResolveError>;
     let mut metadata_jobs: tokio::task::JoinSet<(CanonicalKey, bool, FetchResult)> =
         tokio::task::JoinSet::new();
