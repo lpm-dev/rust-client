@@ -1220,26 +1220,35 @@ impl V2BaselineIndex {
         if let Ok(read_dir) = std::fs::read_dir(&nm_root) {
             for entry in read_dir.flatten() {
                 let symlink_path = entry.path();
-                // `read_link` reads the symlink target without
-                // following further symlinks. v2 plants ABSOLUTE
-                // symlinks at the project root; if we ever switch to
-                // relative we'd `canonicalize` here.
-                let target = match std::fs::read_link(&symlink_path) {
+                seed_project_link_dir(&symlink_path, &links_root, &mut visited, &mut to_visit);
+
+                // Scoped direct deps live at `node_modules/@scope/pkg`,
+                // so the project root contains a REAL `@scope/` dir and
+                // the symlink is one level deeper. Without this extra
+                // walk, `for_project` misses every scoped direct dep.
+                let file_type = match entry.file_type() {
                     Ok(t) => t,
-                    Err(_) => continue, // not a symlink (e.g. self-link
-                                        // self-package dir) → skip
+                    Err(_) => continue,
                 };
-                let target = if target.is_absolute() {
-                    target
-                } else {
-                    // Resolve relative-to-project — defensive even though
-                    // v2 doesn't write these today.
-                    nm_root.join(target)
-                };
-                if let Some(link_dir) = link_dir_from_target(&target, &links_root)
-                    && visited.insert(link_dir.clone())
-                {
-                    to_visit.push_back(link_dir);
+                let is_scope_dir = file_type.is_dir()
+                    && entry
+                        .file_name()
+                        .to_str()
+                        .map(|name| name.starts_with('@'))
+                        .unwrap_or(false);
+                if !is_scope_dir {
+                    continue;
+                }
+
+                if let Ok(scope_entries) = std::fs::read_dir(&symlink_path) {
+                    for scope_entry in scope_entries.flatten() {
+                        seed_project_link_dir(
+                            &scope_entry.path(),
+                            &links_root,
+                            &mut visited,
+                            &mut to_visit,
+                        );
+                    }
                 }
             }
         }
@@ -1365,13 +1374,45 @@ impl V2BaselineIndex {
     }
 }
 
+fn seed_project_link_dir(
+    symlink_path: &Path,
+    links_root: &Path,
+    visited: &mut std::collections::HashSet<PathBuf>,
+    to_visit: &mut std::collections::VecDeque<PathBuf>,
+) {
+    // `read_link` reads the symlink target without following further
+    // symlinks. v2 plants ABSOLUTE symlinks at the project root today,
+    // but nested scoped entries should still resolve relative to their
+    // own parent dir if that ever changes.
+    let target = match std::fs::read_link(symlink_path) {
+        Ok(t) => t,
+        Err(_) => return,
+    };
+    let target = if target.is_absolute() {
+        target
+    } else {
+        symlink_path
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .join(target)
+    };
+    if let Some(link_dir) = link_dir_from_target(&target, links_root)
+        && visited.insert(link_dir.clone())
+    {
+        to_visit.push_back(link_dir);
+    }
+}
+
 /// **Phase 66 confidence-followup F1+F2 review** — given a path that a
 /// project-side symlink resolves to, reconstruct the v2 link entry
 /// directory that owns it.
 ///
 /// v2 plants the project's `<project>/node_modules/<dep>` symlink to
-/// point at `<links_root>/<key_dir>/node_modules/<dep>/`. Stripping
-/// the trailing `node_modules/<pkg>/` segment recovers `<key_dir>`.
+/// point at `<links_root>/<key_dir>/node_modules/<dep>/`. Scoped deps
+/// add one more segment (`node_modules/@scope/<pkg>/`). Rather than
+/// trying to strip a fixed suffix width, walk ancestors until the
+/// first path whose parent is exactly `<links_root>` — that ancestor
+/// is the owning `<key_dir>` for both unscoped and scoped targets.
 /// Returns `None` when the target lives outside `links_root` (e.g. a
 /// project-local file:/link: dep, a v1-installed package with a
 /// custom symlink shape, or a legitimately-broken symlink).
@@ -1381,14 +1422,10 @@ impl V2BaselineIndex {
 /// with `/private/var/.../links/...` vs `/var/.../links/...` on macOS)
 /// still matches when the input target is canonical.
 fn link_dir_from_target(target: &Path, links_root: &Path) -> Option<PathBuf> {
-    // The expected suffix structure from any well-formed v2 symlink:
-    //   <links_root>/<key_dir>/node_modules/<pkg>
-    //                     ^ this is the link_dir we want
-    // Walk ancestors twice (parent of `<pkg>` is `node_modules`,
-    // parent of that is `<key_dir>`).
-    let key_dir = target.parent()?.parent()?;
-    if key_dir.parent() == Some(links_root) {
-        return Some(key_dir.to_path_buf());
+    for ancestor in target.ancestors() {
+        if ancestor.parent() == Some(links_root) {
+            return Some(ancestor.to_path_buf());
+        }
     }
     // macOS canonicalization mismatch fallback: if direct parent
     // comparison missed, check via `starts_with` against the
@@ -1402,12 +1439,12 @@ fn link_dir_from_target(target: &Path, links_root: &Path) -> Option<PathBuf> {
         Ok(p) => p,
         Err(_) => return None,
     };
-    let key_dir = canonical_target.parent()?.parent()?;
-    if key_dir.parent() == Some(canonical_links_root.as_path()) {
-        Some(key_dir.to_path_buf())
-    } else {
-        None
+    for ancestor in canonical_target.ancestors() {
+        if ancestor.parent() == Some(canonical_links_root.as_path()) {
+            return Some(ancestor.to_path_buf());
+        }
     }
+    None
 }
 
 /// Index-aware variant of [`find_installed_package_baseline`]. Hits
@@ -3360,6 +3397,68 @@ mod tests {
              else (got: {:?}, expected under {:?})",
             tslib_hit.package_dir,
             tslib_entry,
+        );
+    }
+
+    /// Scoped direct deps live under `node_modules/@scope/pkg`, so the
+    /// project root contains a real `@scope/` directory and the actual
+    /// package symlink is nested one level deeper. `for_project` must
+    /// seed from that nested symlink too, otherwise rebuild / install-
+    /// hint silently skip the entire scoped direct-dependency surface.
+    #[test]
+    fn f1f2_for_project_includes_scoped_direct_dependencies() {
+        use crate::v2::link_meta::{LinkMeta, LinkMetaPlatform};
+        use chrono::Utc;
+
+        let dir = tempfile::tempdir().unwrap();
+        let lpm_root = lpm_common::LpmRoot::from_dir(dir.path());
+
+        let v2_links_root = dir.path().join("store").join("v2").join("links");
+        let entry = v2_links_root.join("@scope+pkg@1.0.0+cccccccccccccccc");
+        let pkg_dir = entry.join("node_modules").join("@scope/pkg");
+        std::fs::create_dir_all(&pkg_dir).unwrap();
+        std::fs::write(
+            pkg_dir.join("package.json"),
+            r#"{"name":"@scope/pkg","version":"1.0.0"}"#,
+        )
+        .unwrap();
+        let meta = LinkMeta {
+            schema: 1,
+            graph_key: "@scope+pkg@1.0.0+cccccccccccccccc".into(),
+            graph_key_digest_hex:
+                "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc".into(),
+            name: "@scope/pkg".into(),
+            version: "1.0.0".into(),
+            source_sri: "sha512-stub-scoped".into(),
+            object_path: "objects/sha512-stub-scoped".into(),
+            deps: vec![],
+            platform: LinkMetaPlatform {
+                os: "darwin".into(),
+                cpu: "arm64".into(),
+                libc: None,
+            },
+            created_at: Utc::now(),
+            last_referenced_at: Utc::now(),
+        };
+        meta.write_to(&entry).unwrap();
+
+        let project = dir.path().join("project");
+        let project_scope_dir = project.join("node_modules").join("@scope");
+        std::fs::create_dir_all(&project_scope_dir).unwrap();
+        std::os::unix::fs::symlink(
+            entry.join("node_modules").join("@scope/pkg"),
+            project_scope_dir.join("pkg"),
+        )
+        .unwrap();
+
+        let index = V2BaselineIndex::for_project(&project, &lpm_root).unwrap();
+        let hit = index
+            .lookup("@scope/pkg", "1.0.0")
+            .expect("scoped direct dependency must seed the project-scoped index");
+        assert!(
+            hit.package_dir.starts_with(entry.join("node_modules")),
+            "scoped direct dep must resolve to its link entry; got {:?}",
+            hit.package_dir
         );
     }
 
