@@ -2715,7 +2715,6 @@ mod tests {
             &store_pkg,
             store_root.path(),
             None,
-            None,
         )
         .unwrap();
 
