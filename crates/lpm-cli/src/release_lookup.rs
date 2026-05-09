@@ -986,27 +986,25 @@ mod tests {
     /// users redirect the probe. Empty string is treated as unset to
     /// avoid blowing away the default if a script does
     /// `export LPM_NPM_REGISTRY_URL_OVERRIDE=` on accident.
+    ///
+    /// Routes through the same `acquire_env_override_lock` as the
+    /// async wiremock tests so plain `cargo test` (parallel by default)
+    /// doesn't race this against them — a previous version held no
+    /// lock and reproduced GitHub rate-limit bleed-through during PR
+    /// #42 review.
     #[test]
     fn npm_registry_url_respects_override_env_var() {
-        // Locking behavior, not concrete env state — use temp_env if it
-        // gets flaky, but for now this is a single-threaded check that
-        // also restores the original value.
-        let key = "LPM_NPM_REGISTRY_URL_OVERRIDE";
-        let prev = std::env::var(key).ok();
-        // SAFETY: tests in this module run single-threaded under nextest
-        // because they each share the process env.
-        unsafe { std::env::set_var(key, "http://localhost:9999/foo") };
+        let _restore = acquire_env_override_lock();
+        // SAFETY: lock held for the lifetime of `_restore`.
+        unsafe { std::env::set_var(NPM_OVERRIDE_KEY, "http://localhost:9999/foo") };
         assert_eq!(npm_registry_url(), "http://localhost:9999/foo");
-        unsafe { std::env::set_var(key, "") };
+        unsafe { std::env::set_var(NPM_OVERRIDE_KEY, "") };
         assert_eq!(
             npm_registry_url(),
             NPM_REGISTRY_URL_DEFAULT,
             "empty override falls back to default"
         );
-        match prev {
-            Some(v) => unsafe { std::env::set_var(key, v) },
-            None => unsafe { std::env::remove_var(key) },
-        }
+        // `_restore`'s Drop runs at end of scope and rewinds env state.
     }
 
     /// End-to-end cascade test: when the npm primary returns a fresh
@@ -1234,32 +1232,91 @@ mod tests {
         assert!(s.contains("npm dns failed"), "expected npm error: {s}");
     }
 
+    // ─── Env-override test isolation ─────────────────────────────────
+    //
+    // The `with_env_overrides` async helper AND the sync
+    // `npm_registry_url_respects_override_env_var` test both mutate
+    // the same process-global override env vars
+    // (`LPM_NPM_REGISTRY_URL_OVERRIDE` /
+    // `LPM_GITHUB_RELEASES_URL_OVERRIDE`). Under default `cargo test`
+    // parallelism these races caused flakes — when two wiremock tests
+    // ran concurrently they could swap each other's URLs mid-probe and
+    // hit the real registries. PR #42 review reproduced GitHub
+    // rate-limit bleed-through in exactly this shape.
+    //
+    // Lock is a plain `std::sync::Mutex<()>` (held across `.await` in
+    // async tests) because `#[tokio::test]` defaults to the
+    // current-thread runtime — there's no work-stealing scheduler that
+    // could move the future across threads while the guard is held.
+    // The `unwrap_or_else(into_inner)` shape ignores poison: if a test
+    // panics while holding the lock, downstream tests still serialize
+    // correctly; the guarded `()` carries no state to corrupt.
+
+    const NPM_OVERRIDE_KEY: &str = "LPM_NPM_REGISTRY_URL_OVERRIDE";
+    const GH_OVERRIDE_KEY: &str = "LPM_GITHUB_RELEASES_URL_OVERRIDE";
+
+    fn env_override_lock() -> &'static std::sync::Mutex<()> {
+        static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+        LOCK.get_or_init(|| std::sync::Mutex::new(()))
+    }
+
+    /// RAII guard that restores the override env vars on drop.
+    /// Restores fire on normal scope exit AND on panic, so a failing
+    /// test doesn't pollute env state for the next test in line.
+    /// Captured previous values are stored verbatim — `None` means
+    /// "was unset", `Some(v)` means "was `v`".
+    struct EnvOverrideGuard {
+        npm_prev: Option<String>,
+        gh_prev: Option<String>,
+        _lock: std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl Drop for EnvOverrideGuard {
+        fn drop(&mut self) {
+            // SAFETY: env mutation is unsafe in 2024 edition; serialised
+            // via `_lock` so no other thread can observe a half-restored
+            // pair.
+            unsafe {
+                match &self.npm_prev {
+                    Some(v) => std::env::set_var(NPM_OVERRIDE_KEY, v),
+                    None => std::env::remove_var(NPM_OVERRIDE_KEY),
+                }
+                match &self.gh_prev {
+                    Some(v) => std::env::set_var(GH_OVERRIDE_KEY, v),
+                    None => std::env::remove_var(GH_OVERRIDE_KEY),
+                }
+            }
+        }
+    }
+
+    /// Acquire the global env-override lock and snapshot the current
+    /// values. The returned guard restores both vars when dropped.
+    fn acquire_env_override_lock() -> EnvOverrideGuard {
+        let lock = env_override_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        EnvOverrideGuard {
+            npm_prev: std::env::var(NPM_OVERRIDE_KEY).ok(),
+            gh_prev: std::env::var(GH_OVERRIDE_KEY).ok(),
+            _lock: lock,
+        }
+    }
+
     /// Helper: set npm + GitHub URL overrides for the duration of an
-    /// async block, then restore. Single-threaded by construction —
-    /// callers must not run two of these in parallel.
+    /// async block. Lock-isolated and panic-safe via
+    /// [`EnvOverrideGuard`].
     async fn with_env_overrides<F>(npm_url: &str, gh_url: &str, fut: F)
     where
         F: std::future::Future<Output = ()>,
     {
-        let npm_key = "LPM_NPM_REGISTRY_URL_OVERRIDE";
-        let gh_key = "LPM_GITHUB_RELEASES_URL_OVERRIDE";
-        let prev_npm = std::env::var(npm_key).ok();
-        let prev_gh = std::env::var(gh_key).ok();
+        let _restore = acquire_env_override_lock();
+        // SAFETY: lock held for the lifetime of `_restore`.
         unsafe {
-            std::env::set_var(npm_key, npm_url);
-            std::env::set_var(gh_key, gh_url);
+            std::env::set_var(NPM_OVERRIDE_KEY, npm_url);
+            std::env::set_var(GH_OVERRIDE_KEY, gh_url);
         }
         fut.await;
-        unsafe {
-            match prev_npm {
-                Some(v) => std::env::set_var(npm_key, v),
-                None => std::env::remove_var(npm_key),
-            }
-            match prev_gh {
-                Some(v) => std::env::set_var(gh_key, v),
-                None => std::env::remove_var(gh_key),
-            }
-        }
+        // `_restore`'s Drop runs at end of scope and rewinds env state.
     }
 
     #[test]
