@@ -68,8 +68,8 @@
 		},
 		{
 			"name": "eleventy-base-blog",
-			"category": "ssg",
-			"why": "11ty + a heavy plugin chain (rss, syntaxhighlight, navigation). Tests SSG plugin discovery and `.bin` link materialization. Smoke is bin-version probe; the project's full build relies on filesystem-path includes of transitives (`{% include 'node_modules/prismjs/...' %}`) that lpm hoisted intentionally doesn't bubble — that's a separate design item, not a per-fixture regression.",
+			"category": "npm-compat",
+			"why": "11ty + a heavy plugin chain (rss, syntaxhighlight, navigation). Tests SSG plugin discovery and `.bin` link materialization. The smoke is narrowed to `--version` because the project's full build uses Nunjucks `{% include 'node_modules/prismjs/themes/...' %}` — a literal filesystem-path include of a transitive dependency. npm/yarn hoist all transitives to project-root `node_modules/`; lpm (both isolated AND hoisted) keeps transitives inside per-package wrapper dirs in the v2 store. **Both lpm linker modes fail this build symmetrically — this is an lpm-vs-npm compatibility decision, NOT a hoisted-default confidence gap.** Tracked separately; the asymmetric-only gate doesn't catch it because both modes diverge from npm equally.",
 			"git_url": "https://github.com/11ty/eleventy-base-blog.git",
 			"git_ref": "v9.0.0",
 			"subpath": ".",
