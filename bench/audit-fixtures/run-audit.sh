@@ -114,8 +114,15 @@ run_mode() {
 
     echo "--- $FIXTURE_REL [$mode] ---"
 
-    # Wipe everything so we get a true cold install.
-    rm -rf "$work" "$HOME/.lpm/cache" "$HOME/.lpm/store"
+    # Wipe everything so we get a true cold install. Honor LPM_HOME if
+    # set — `LpmRoot::from_env` uses `$LPM_HOME` as the root directly
+    # (no `.lpm` suffix; see crates/lpm-common/src/paths.rs:86-103).
+    # Pre-fix this only wiped `$HOME/.lpm`, so callers that set
+    # LPM_HOME (top-npm-audit's per-slot homes) leaked state across
+    # modes — hoisted reused the populated store from the prior
+    # isolated pass, weakening §1b's cold-state signal.
+    local lpm_root="${LPM_HOME:-$HOME/.lpm}"
+    rm -rf "$work" "$lpm_root/cache" "$lpm_root/store"
     mkdir -p "$work"
     # Copy every file in the fixture dir except readme/smoke (those
     # aren't part of the install input).

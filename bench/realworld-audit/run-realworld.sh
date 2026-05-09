@@ -20,6 +20,13 @@ CACHE_DIR="${LPM_REALWORLD_CACHE:-$HERE/.cache}"
 BIN="${LPM_BIN:-$REPO_ROOT/target/release/lpm-rs}"
 WORK_BASE="${LPM_REALWORLD_WORK_BASE:-/tmp/lpm-realworld-work}"
 MANIFEST="$HERE/projects.json"
+# Per-smoke timeout (seconds). A real lpm bug surfaced as
+# vitepress@1.5 hanging forever on `--version` after install — pre-fix
+# that wedged a `run-all.sh` for 312 s before SIGKILL. Anything past
+# this cap kills the smoke and reports `smoke_exit=124` (matches GNU
+# `timeout`'s convention) so a single bad project can't stall a weekly
+# or manual sweep. Override via LPM_REALWORLD_SMOKE_TIMEOUT_S.
+SMOKE_TIMEOUT_S="${LPM_REALWORLD_SMOKE_TIMEOUT_S:-300}"
 
 if [[ ! -x "$BIN" ]]; then
     echo "ERROR: lpm binary not found or not executable: $BIN" >&2
@@ -64,6 +71,41 @@ TS="$(date +%Y%m%d-%H%M%S)"
 mkdir -p "$RESULTS_DIR" "$CACHE_DIR"
 
 now_ms() { python3 -c 'import time;print(int(time.perf_counter_ns()))'; }
+
+# Portable timeout wrapper. GNU `timeout` isn't on macOS by default
+# (renames to `gtimeout` via coreutils); Windows Git Bash also lacks
+# it. Perl is preinstalled on macOS, every CI Linux image, and Git
+# Bash, so the harness can rely on it without a `requirements.sh`.
+#
+# Implementation:
+#   - fork a child; child does setpgrp + exec — runs in its own
+#     process group ($child_pid)
+#   - parent installs ALRM handler that kills the child's group
+#     (-$child_pid) WITHOUT killing itself
+#   - on timeout: wait reap, exit 124 (matches GNU `timeout`'s
+#     convention so callers can distinguish "killed by timeout" from
+#     "smoke exited nonzero")
+#   - on success: propagate child's exit code
+run_with_timeout() {
+    local secs="$1"; shift
+    perl -e '
+        my $t = shift;
+        my $pid = fork();
+        if ($pid == 0) {
+            setpgrp(0, 0);
+            exec @ARGV or exit 127;
+        }
+        $SIG{ALRM} = sub {
+            kill -9, $pid;
+            waitpid $pid, 0;
+            exit 124;
+        };
+        alarm $t;
+        waitpid $pid, 0;
+        my $rc = $?;
+        exit($rc == 0 ? 0 : ($rc >> 8 || 1));
+    ' "$secs" "$@"
+}
 
 # Clone (or refresh) the source repo into a name-keyed cache. We clone
 # at the pinned ref with --depth 1 so re-runs hit the cache. Different
@@ -135,8 +177,12 @@ run_mode() {
 
     echo "--- $PROJECT_NAME [$mode] ---"
 
-    # Wipe everything for true cold install.
-    rm -rf "$work" "$HOME/.lpm/cache" "$HOME/.lpm/store"
+    # Wipe everything for true cold install. Honor LPM_HOME (mirrors
+    # the audit-fixtures runner — see that file for the full
+    # rationale). Without this, callers that set LPM_HOME for
+    # parallelism leak state from one mode to the next.
+    local lpm_root="${LPM_HOME:-$HOME/.lpm}"
+    rm -rf "$work" "$lpm_root/cache" "$lpm_root/store"
     mkdir -p "$work"
 
     if [[ "$FROM_SCRATCH" == "true" ]]; then
@@ -186,20 +232,29 @@ run_mode() {
         top_count=$(find "$work/node_modules" -mindepth 1 -maxdepth 1 \( -type d -o -type l \) -not -name '.bin' -not -name '.lpm*' 2>/dev/null | wc -l | tr -d ' ')
     fi
 
-    # Smoke test.
+    # Smoke test. Wrapped in `run_with_timeout` so a hanging CLI
+    # (vitepress@1.5 `--version` did this in pre-§1a smoke) can't wedge
+    # the suite. Timeout fires `kill 9 -$$` to take down the whole
+    # process group — important for `npx`/`node` sub-processes.
     local smoke_log="$work/.lpm-smoke.log"
     local smoke_exit=0
+    local smoke_ms=0
     if [[ $install_exit -eq 0 ]]; then
         local ss=$(now_ms)
         set +e
-        (cd "$work" && bash -c "$SMOKE") > "$smoke_log" 2>&1
+        (
+            cd "$work" && \
+            run_with_timeout "$SMOKE_TIMEOUT_S" bash -c "$SMOKE"
+        ) > "$smoke_log" 2>&1
         smoke_exit=$?
         set -e
         local se=$(now_ms)
-        local smoke_ms=$(( (se-ss)/1000000 ))
+        smoke_ms=$(( (se-ss)/1000000 ))
+        if [[ $smoke_exit -eq 124 ]]; then
+            echo "(smoke killed: exceeded ${SMOKE_TIMEOUT_S}s)" >> "$smoke_log"
+        fi
     else
         smoke_exit=99
-        local smoke_ms=0
         echo "(install failed; smoke skipped)" > "$smoke_log"
     fi
 
@@ -208,6 +263,8 @@ run_mode() {
     local fail_reason=""
     if [[ $install_exit -ne 0 ]]; then
         verdict="FAIL"; fail_reason="install exited $install_exit"
+    elif [[ $smoke_exit -eq 124 ]]; then
+        verdict="FAIL"; fail_reason="smoke timed out (${SMOKE_TIMEOUT_S}s)"
     elif [[ $smoke_exit -ne 0 ]]; then
         verdict="FAIL"; fail_reason="smoke exit $smoke_exit"
     fi
