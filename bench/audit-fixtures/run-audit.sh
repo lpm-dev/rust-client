@@ -14,8 +14,28 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 REPO_ROOT="$(cd "$HERE/../.." && pwd)"
 FIXTURE_DIR="$HERE/$FIXTURE_REL"
 RESULTS_DIR="$HERE/results"
-BIN="${LPM_BIN:-$REPO_ROOT/target/release/lpm-rs}"
-WORK_BASE="/tmp/lpm-audit-work"
+
+# Phase 66 confidence-followup §3b — Windows portability.
+# On Git Bash (Windows-latest runner), the binary lands at
+# `target/release/lpm-rs.exe` and `/tmp` resolves to the host's MSYS
+# tmp dir (per-user, not shared) which is fine. Auto-append `.exe` and
+# honor RUNNER_TEMP so cross-platform paths don't bake in.
+IS_WINDOWS=0
+case "${OSTYPE:-}" in
+    msys*|cygwin*|win32*) IS_WINDOWS=1 ;;
+esac
+case "${OS:-}" in
+    Windows_NT) IS_WINDOWS=1 ;;
+esac
+
+DEFAULT_BIN="$REPO_ROOT/target/release/lpm-rs"
+if [[ $IS_WINDOWS -eq 1 && ! -e "$DEFAULT_BIN" && -e "${DEFAULT_BIN}.exe" ]]; then
+    DEFAULT_BIN="${DEFAULT_BIN}.exe"
+fi
+BIN="${LPM_BIN:-$DEFAULT_BIN}"
+# Work base: prefer RUNNER_TEMP on CI (windows-latest sets this);
+# fall back to /tmp on Linux/macOS. Lets one harness handle all three.
+WORK_BASE="${LPM_AUDIT_WORK_BASE:-${RUNNER_TEMP:-/tmp}/lpm-audit-work}"
 
 if [[ ! -d "$FIXTURE_DIR" ]]; then
     echo "ERROR: fixture not found: $FIXTURE_DIR" >&2

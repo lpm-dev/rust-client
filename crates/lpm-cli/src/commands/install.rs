@@ -4646,6 +4646,31 @@ async fn run_with_options_under_store_lock(
                     packages.len().to_string().bold(),
                     ms
                 ));
+                // §1a — surface best-effort peer-conflict reports as
+                // warnings so the user knows which transitive
+                // consumers got a peer version outside their declared
+                // range. Not gated to a specific verbosity flag —
+                // these are always actionable signal (mirrors npm
+                // v7+'s unconditional `npm WARN` behavior). Suppressed
+                // under `--json` to keep machine-readable output
+                // clean; `--json` consumers can read the same data
+                // from `resolve_result.peer_conflicts` if exposed via
+                // a future telemetry surface.
+                for report in &resolve_result.peer_conflicts {
+                    let unsatisfied_str = report
+                        .unsatisfied_consumers
+                        .iter()
+                        .map(|(c, r)| format!("{c} wants {r}"))
+                        .collect::<Vec<_>>()
+                        .join("; ");
+                    output::warn(&format!(
+                        "peer {} pinned to {} but {} unsatisfied consumer(s): {}",
+                        report.canonical.bold(),
+                        report.chosen_version,
+                        report.unsatisfied_consumers.len(),
+                        unsatisfied_str,
+                    ));
+                }
             }
             (packages, ms, false, platform_skipped)
         }
