@@ -396,7 +396,10 @@ mod tests {
             s.starts_with("update check paused:"),
             "expected dedicated prefix, got: {s}"
         );
-        assert!(!s.contains("network error"), "must not leak into Network category: {s}");
+        assert!(
+            !s.contains("network error"),
+            "must not leak into Network category: {s}"
+        );
     }
 
     #[test]

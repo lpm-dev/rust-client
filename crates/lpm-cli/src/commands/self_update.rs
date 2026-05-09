@@ -361,7 +361,7 @@ fn detect_install_method_from_path(exe: Option<&std::path::Path>) -> InstallMeth
         .components()
         .filter_map(|c| c.as_os_str().to_str())
         .collect();
-    let has = |name: &str| components.iter().any(|c| *c == name);
+    let has = |name: &str| components.contains(&name);
 
     // Homebrew first. After canonicalize, `Cellar` is the unique
     // component on every Homebrew-managed binary regardless of
@@ -387,7 +387,7 @@ fn detect_install_method_from_path(exe: Option<&std::path::Path>) -> InstallMeth
 /// `"npm"` anywhere in it (e.g. `/Users/npmtest/...` false-positived as
 /// npm-installed) and missed Volta / fnm / asdf / pnpm-global entirely.
 fn is_npm_managed(components: &[&str]) -> bool {
-    let has = |name: &str| components.iter().any(|c| *c == name);
+    let has = |name: &str| components.contains(&name);
 
     // The reliable signal: every `npm install -g` and `npx` install
     // routes through a `node_modules` directory.
@@ -577,8 +577,14 @@ mod tests {
         use std::path::Path;
         let cases: &[(&str, InstallMethod)] = &[
             // Homebrew
-            ("/opt/homebrew/Cellar/lpm/0.37.0/bin/lpm", InstallMethod::Homebrew),
-            ("/usr/local/Cellar/lpm/0.37.0/bin/lpm", InstallMethod::Homebrew),
+            (
+                "/opt/homebrew/Cellar/lpm/0.37.0/bin/lpm",
+                InstallMethod::Homebrew,
+            ),
+            (
+                "/usr/local/Cellar/lpm/0.37.0/bin/lpm",
+                InstallMethod::Homebrew,
+            ),
             (
                 "/home/linuxbrew/.linuxbrew/Cellar/lpm/0.37.0/bin/lpm",
                 InstallMethod::Homebrew,
@@ -588,13 +594,28 @@ mod tests {
             // Cargo
             ("/Users/x/.cargo/bin/lpm", InstallMethod::Cargo),
             // Direct npm install
-            ("/usr/local/lib/node_modules/@lpm-registry/cli/lpm-bin", InstallMethod::Npm),
-            ("/Users/x/.npm/_npx/abc/node_modules/@lpm-registry/cli/lpm-bin", InstallMethod::Npm),
+            (
+                "/usr/local/lib/node_modules/@lpm-registry/cli/lpm-bin",
+                InstallMethod::Npm,
+            ),
+            (
+                "/Users/x/.npm/_npx/abc/node_modules/@lpm-registry/cli/lpm-bin",
+                InstallMethod::Npm,
+            ),
             // npm version managers
-            ("/Users/x/.nvm/versions/node/v20.0.0/bin/lpm", InstallMethod::Npm),
-            ("/Users/x/.volta/tools/image/packages/@lpm-registry/cli/bin/lpm", InstallMethod::Npm),
+            (
+                "/Users/x/.nvm/versions/node/v20.0.0/bin/lpm",
+                InstallMethod::Npm,
+            ),
+            (
+                "/Users/x/.volta/tools/image/packages/@lpm-registry/cli/bin/lpm",
+                InstallMethod::Npm,
+            ),
             ("/Users/x/.fnm/aliases/default/bin/lpm", InstallMethod::Npm),
-            ("/Users/x/.asdf/installs/nodejs/20.0.0/bin/lpm", InstallMethod::Npm),
+            (
+                "/Users/x/.asdf/installs/nodejs/20.0.0/bin/lpm",
+                InstallMethod::Npm,
+            ),
             // pnpm global (requires BOTH `pnpm` and `global` segments)
             (
                 "/Users/x/.local/share/pnpm/global/5/node_modules/@lpm-registry/cli/lpm-bin",
@@ -607,7 +628,10 @@ mod tests {
         for (raw, expected) in cases {
             let p = Path::new(raw);
             let got = detect_install_method_from_path(Some(p));
-            assert_eq!(got, *expected, "path {raw}: expected {expected:?}, got {got:?}");
+            assert_eq!(
+                got, *expected,
+                "path {raw}: expected {expected:?}, got {got:?}"
+            );
         }
     }
 
@@ -830,7 +854,10 @@ mod tests {
     #[test]
     fn lookup_error_rate_limit_maps_to_self_update_rate_limited() {
         let err = lookup_error_to_lpm(LookupError::RateLimited { reset_at: Some(0) });
-        assert!(matches!(err, LpmError::SelfUpdateRateLimited(_)), "got {err:?}");
+        assert!(
+            matches!(err, LpmError::SelfUpdateRateLimited(_)),
+            "got {err:?}"
+        );
         // And — explicitly NOT Forbidden, the historical wrong category.
         assert!(
             !matches!(err, LpmError::Forbidden(_)),
