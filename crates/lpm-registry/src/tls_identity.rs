@@ -137,65 +137,61 @@ impl PassphraseProvider for EnvThenTtyPassphrase {
         // Resolve the path the same way `load_identity` does, so
         // cache key + UI display + canonicalization all agree.
         let resolved = key.resolve();
-
-        // Cache lookup (process-lifetime memoize, keyed by canonical
-        // keyfile path). The same encrypted key loaded for both
-        // metadata and tarball client builds prompts at most once.
         let canonical = std::fs::canonicalize(&resolved).unwrap_or_else(|_| resolved.clone());
-        if let Some(pp) = self.cache.get(&canonical) {
-            return Ok(pp);
-        }
 
-        // Tier 1: env var.
-        if let Ok(val) = std::env::var(KEY_PASSPHRASE_ENV)
-            && !val.is_empty()
-        {
-            let pp = SecretString::from(val);
-            self.cache.insert(canonical, pp.clone());
-            return Ok(pp);
-        }
-
-        // Tier 2: TTY prompt (both stdin and stdout must be terminals,
-        // and `--json`-equivalent must not have disabled prompting).
-        if !self.disable_prompt
-            && std::io::stdin().is_terminal()
-            && std::io::stdout().is_terminal()
-        {
-            let raw = rpassword::prompt_password(format!(
-                "Enter passphrase for keyfile {} (configured at {}:{}): ",
-                resolved.display(),
-                key.source,
-                key.line
-            ))
-            .map_err(|e| {
-                LpmError::Cert(format!(
-                    "{}:{}: failed to read passphrase from TTY: {e}",
-                    key.source, key.line
-                ))
-            })?;
-            if raw.is_empty() {
-                return Err(LpmError::Cert(format!(
-                    "{}:{}: empty passphrase entered for encrypted keyfile {}",
-                    key.source,
-                    key.line,
-                    resolved.display()
-                )));
+        // Single-flight via `PassphraseCache::get_or_compute` — two
+        // concurrent T3 lazy builds for the same encrypted keyfile
+        // resolve via one prompt / env read, not two. The closure
+        // runs at most once per unique canonical path.
+        self.cache.get_or_compute(&canonical, || {
+            // Tier 1: env var.
+            if let Ok(val) = std::env::var(KEY_PASSPHRASE_ENV)
+                && !val.is_empty()
+            {
+                return Ok(SecretString::from(val));
             }
-            let pp = SecretString::from(raw);
-            self.cache.insert(canonical, pp.clone());
-            return Ok(pp);
-        }
 
-        // Tier 3: hard error.
-        Err(LpmError::Cert(format!(
-            "{}:{}: keyfile {} is encrypted but no passphrase is available; \
-             set the {} environment variable or run interactively with both \
-             stdin and stdout connected to a terminal",
-            key.source,
-            key.line,
-            resolved.display(),
-            KEY_PASSPHRASE_ENV
-        )))
+            // Tier 2: TTY prompt (both stdin and stdout must be
+            // terminals, and `--json`-equivalent must not have
+            // disabled prompting).
+            if !self.disable_prompt
+                && std::io::stdin().is_terminal()
+                && std::io::stdout().is_terminal()
+            {
+                let raw = rpassword::prompt_password(format!(
+                    "Enter passphrase for keyfile {} (configured at {}:{}): ",
+                    resolved.display(),
+                    key.source,
+                    key.line
+                ))
+                .map_err(|e| {
+                    LpmError::Cert(format!(
+                        "{}:{}: failed to read passphrase from TTY: {e}",
+                        key.source, key.line
+                    ))
+                })?;
+                if raw.is_empty() {
+                    return Err(LpmError::Cert(format!(
+                        "{}:{}: empty passphrase entered for encrypted keyfile {}",
+                        key.source,
+                        key.line,
+                        resolved.display()
+                    )));
+                }
+                return Ok(SecretString::from(raw));
+            }
+
+            // Tier 3: hard error.
+            Err(LpmError::Cert(format!(
+                "{}:{}: keyfile {} is encrypted but no passphrase is available; \
+                 set the {} environment variable or run interactively with both \
+                 stdin and stdout connected to a terminal",
+                key.source,
+                key.line,
+                resolved.display(),
+                KEY_PASSPHRASE_ENV
+            )))
+        })
     }
 }
 
@@ -209,14 +205,42 @@ pub struct PassphraseCache {
 }
 
 impl PassphraseCache {
-    fn get(&self, key: &Path) -> Option<SecretString> {
-        self.inner.lock().ok()?.get(key).cloned()
-    }
-
-    fn insert(&self, key: PathBuf, value: SecretString) {
-        if let Ok(mut guard) = self.inner.lock() {
-            guard.insert(key, value);
+    /// **Single-flight** get-or-compute. Two concurrent callers for
+    /// the same `key` serialize on the cache lock: the first runs
+    /// `compute`, inserts the result, and returns it; the second
+    /// blocks on the lock, then sees the freshly-cached value and
+    /// returns it without re-computing.
+    ///
+    /// Phase 58.3 — closes GPT's post-carry-forward finding that the
+    /// previous `get` then (unlocked) compute then `insert` shape
+    /// could double-prompt under concurrent T3 lazy builds for the
+    /// same encrypted keyfile. Holding the lock through `compute` is
+    /// fine for the prompt-or-env-read tier (TTY input is sequential
+    /// by nature; concurrent prompts on a single TTY are unusable
+    /// anyway).
+    ///
+    /// Errors are NOT cached. A failed prompt (wrong passphrase
+    /// typed, TTY EOF, etc.) leaves the slot empty so the next
+    /// caller can retry. `Ok` results are inserted before the lock
+    /// drops so the second caller cannot observe an empty slot.
+    ///
+    /// Mutex poisoning is recovered (a panic in one thread's
+    /// `compute` shouldn't take the cache out of service for the
+    /// rest of the install).
+    pub fn get_or_compute<F>(&self, key: &Path, compute: F) -> Result<SecretString, LpmError>
+    where
+        F: FnOnce() -> Result<SecretString, LpmError>,
+    {
+        let mut guard = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(pp) = guard.get(key).cloned() {
+            return Ok(pp);
         }
+        let pp = compute()?;
+        guard.insert(key.to_path_buf(), pp.clone());
+        Ok(pp)
     }
 }
 
@@ -803,13 +827,101 @@ mod tests {
     }
 
     #[test]
-    fn passphrase_cache_memoizes_per_canonical_path() {
+    fn passphrase_cache_get_or_compute_memoizes_per_canonical_path() {
         let cache = PassphraseCache::default();
         let path = PathBuf::from("/tmp/some-key.pem");
-        cache.insert(path.clone(), SecretString::from("secret".to_string()));
-        let got = cache.get(&path).expect("cache hit");
+        // First call computes + inserts.
+        let got = cache
+            .get_or_compute(&path, || Ok(SecretString::from("secret".to_string())))
+            .expect("first compute");
         assert_eq!(got.expose_secret(), "secret");
-        assert!(cache.get(Path::new("/tmp/other-key.pem")).is_none());
+        // Second call hits cache; closure must NOT run.
+        let got2 = cache
+            .get_or_compute(&path, || {
+                panic!("compute closure must not run on cache hit")
+            })
+            .expect("cache hit");
+        assert_eq!(got2.expose_secret(), "secret");
+        // Other keys remain unpopulated.
+        let other = cache
+            .get_or_compute(Path::new("/tmp/other-key.pem"), || {
+                Ok(SecretString::from("other".to_string()))
+            })
+            .expect("compute other");
+        assert_eq!(other.expose_secret(), "other");
+    }
+
+    #[test]
+    fn passphrase_cache_get_or_compute_does_not_cache_errors() {
+        // Phase 58.3 — failed prompts (wrong passphrase, TTY EOF)
+        // must leave the slot empty so the next caller can retry.
+        let cache = PassphraseCache::default();
+        let path = PathBuf::from("/tmp/transient-fail.pem");
+        let first = cache.get_or_compute(&path, || {
+            Err(LpmError::Cert("first attempt failed".into()))
+        });
+        assert!(first.is_err());
+        // Slot should still be empty — second call's compute runs.
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+        let second = cache.get_or_compute(&path, || {
+            calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(SecretString::from("recovered".to_string()))
+        });
+        assert_eq!(second.unwrap().expose_secret(), "recovered");
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    /// Phase 58.3 — pin the single-flight contract that closes
+    /// GPT's post-carry-forward finding.
+    ///
+    /// 16 concurrent threads racing on the same canonical key MUST
+    /// see the compute closure run AT MOST ONCE. Without
+    /// `get_or_compute` holding the cache lock through the closure,
+    /// two-or-more threads can both miss the cache and both run the
+    /// closure (double prompt / double env read).
+    #[test]
+    fn passphrase_cache_get_or_compute_is_single_flight_under_concurrency() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let cache = Arc::new(PassphraseCache::default());
+        let calls = Arc::new(AtomicUsize::new(0));
+        let key = PathBuf::from("/tmp/single-flight.pem");
+
+        // 16 threads is enough to make the race observable on
+        // hardware without reliance on backoff timing tricks. If
+        // single-flight is broken, `calls` will exceed 1.
+        let n = 16;
+        let handles: Vec<_> = (0..n)
+            .map(|_| {
+                let cache = Arc::clone(&cache);
+                let calls = Arc::clone(&calls);
+                let key = key.clone();
+                std::thread::spawn(move || {
+                    cache.get_or_compute(&key, || {
+                        // Bump the counter; stall briefly so other
+                        // threads have time to race in IF the lock
+                        // weren't held through the closure. With
+                        // single-flight intact, only one thread
+                        // runs this body and the rest hit the cache.
+                        calls.fetch_add(1, Ordering::SeqCst);
+                        std::thread::sleep(std::time::Duration::from_millis(20));
+                        Ok(SecretString::from("computed".to_string()))
+                    })
+                })
+            })
+            .collect();
+
+        for h in handles {
+            let pp = h.join().expect("thread panicked").expect("compute ok");
+            assert_eq!(pp.expose_secret(), "computed");
+        }
+
+        let total = calls.load(Ordering::SeqCst);
+        assert_eq!(
+            total, 1,
+            "single-flight broken: compute closure ran {total} times across {n} threads"
+        );
     }
 
     /// Serialize env-mutation across the two tiers exercised here.
