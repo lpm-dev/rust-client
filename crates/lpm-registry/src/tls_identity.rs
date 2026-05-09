@@ -455,28 +455,23 @@ fn decrypt_pkcs8(
 
     // Resolve passphrase (env → TTY → cached).
     let pp = passphrase.for_keyfile(key_meta)?;
-    let plaintext = info
-        .decrypt(pp.expose_secret().as_bytes())
-        .map_err(|e| {
-            LpmError::Cert(format!(
-                "{}:{}: encrypted PKCS#8 decryption failed (wrong passphrase?): {e}",
-                key_meta.source, key_meta.line
-            ))
-        })?;
-
-    // Re-encode as unencrypted PKCS#8 PEM.
-    let der_bytes = plaintext.as_bytes();
-    let pem = pkcs8::der::pem::encode_string(
-        "PRIVATE KEY",
-        pkcs8::der::pem::LineEnding::LF,
-        der_bytes,
-    )
-    .map_err(|e| {
+    let plaintext = info.decrypt(pp.expose_secret().as_bytes()).map_err(|e| {
         LpmError::Cert(format!(
-            "{}:{}: failed to re-encode decrypted PKCS#8 as PEM: {e}",
+            "{}:{}: encrypted PKCS#8 decryption failed (wrong passphrase?): {e}",
             key_meta.source, key_meta.line
         ))
     })?;
+
+    // Re-encode as unencrypted PKCS#8 PEM.
+    let der_bytes = plaintext.as_bytes();
+    let pem =
+        pkcs8::der::pem::encode_string("PRIVATE KEY", pkcs8::der::pem::LineEnding::LF, der_bytes)
+            .map_err(|e| {
+            LpmError::Cert(format!(
+                "{}:{}: failed to re-encode decrypted PKCS#8 as PEM: {e}",
+                key_meta.source, key_meta.line
+            ))
+        })?;
     Ok(pem)
 }
 
@@ -532,8 +527,8 @@ mod tests {
     fn gen_rsa_pair() -> (String, String) {
         // rcgen 0.13 emits PKCS#8 ("PRIVATE KEY") PEM for the keypair
         // by default — exactly what `Identity::from_pem` accepts.
-        let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()])
-            .expect("rcgen self-sign");
+        let cert =
+            rcgen::generate_simple_self_signed(vec!["localhost".into()]).expect("rcgen self-sign");
         (cert.cert.pem(), cert.key_pair.serialize_pem())
     }
 
@@ -697,7 +692,11 @@ mod tests {
         // and is not pure ASCII." Synthesize a minimal byte sequence
         // that satisfies that.
         let dir = TempDir::new().unwrap();
-        let cert_path = write(dir.path(), "cert.pem", "-----BEGIN CERTIFICATE-----\n...\n-----END CERTIFICATE-----\n");
+        let cert_path = write(
+            dir.path(),
+            "cert.pem",
+            "-----BEGIN CERTIFICATE-----\n...\n-----END CERTIFICATE-----\n",
+        );
         let key_path = dir.path().join("key.pfx");
         // Real-ish PKCS#12 prefix: SEQUENCE tag + length + non-ASCII body.
         std::fs::write(&key_path, [0x30u8, 0x82, 0x04, 0x00, 0xff, 0xfe, 0xfd]).unwrap();
@@ -877,9 +876,8 @@ mod tests {
         // must leave the slot empty so the next caller can retry.
         let cache = PassphraseCache::default();
         let path = PathBuf::from("/tmp/transient-fail.pem");
-        let first = cache.get_or_compute(&path, || {
-            Err(LpmError::Cert("first attempt failed".into()))
-        });
+        let first =
+            cache.get_or_compute(&path, || Err(LpmError::Cert("first attempt failed".into())));
         assert!(first.is_err());
         // Slot should still be empty — second call's compute runs.
         let calls = std::sync::atomic::AtomicUsize::new(0);
