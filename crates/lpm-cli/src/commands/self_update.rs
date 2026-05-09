@@ -330,26 +330,89 @@ fn standalone_command_for(version: &str, platform: &str, ext: &str, exe: Option<
 
 fn detect_install_method() -> InstallMethod {
     let exe = std::env::current_exe().ok();
-    let exe_path = exe
+    // Resolve symlinks so `/usr/local/bin/lpm → ~/.volta/bin/lpm` (or
+    // any version-manager shim) classifies as the underlying channel,
+    // not Standalone. `canonicalize` can fail on Windows for some
+    // symlink targets — fall back to the raw path so detection still
+    // works on the common case where the exe IS the canonical binary.
+    let resolved = exe
         .as_ref()
-        .map(|p| p.to_string_lossy().to_string())
-        .unwrap_or_default();
+        .and_then(|p| std::fs::canonicalize(p).ok())
+        .or(exe);
+    detect_install_method_from_path(resolved.as_deref())
+}
 
-    if exe_path.contains("homebrew")
-        || exe_path.contains("Cellar")
-        || exe_path.contains("linuxbrew")
-    {
-        InstallMethod::Homebrew
-    } else if exe_path.contains(".cargo") {
-        InstallMethod::Cargo
-    } else if exe_path.contains("node_modules")
-        || exe_path.contains("npm")
-        || exe_path.contains("nvm")
-    {
-        InstallMethod::Npm
-    } else {
-        InstallMethod::Standalone
+/// Pure helper for [`detect_install_method`]. Split out so the
+/// per-shim classification can be unit-tested with synthetic paths
+/// without depending on whatever package manager happens to own the
+/// running binary.
+fn detect_install_method_from_path(exe: Option<&std::path::Path>) -> InstallMethod {
+    let Some(path) = exe else {
+        return InstallMethod::Standalone;
+    };
+    let components: Vec<&str> = path
+        .components()
+        .filter_map(|c| c.as_os_str().to_str())
+        .collect();
+    let has = |name: &str| components.iter().any(|c| *c == name);
+
+    // Homebrew first. After canonicalize, `Cellar` is the unique
+    // component on every Homebrew-managed binary regardless of
+    // `/opt/homebrew` vs `/usr/local` prefix on macOS, and Linuxbrew
+    // also routes through `/home/linuxbrew/.linuxbrew/Cellar/...`.
+    // `homebrew` is kept as a fallback signal for the rare cases where
+    // canonicalize fails and we end up testing the bin-shim path
+    // (`/opt/homebrew/bin/lpm`) directly.
+    if has("Cellar") || has("homebrew") || has("linuxbrew") {
+        return InstallMethod::Homebrew;
     }
+    if has(".cargo") {
+        return InstallMethod::Cargo;
+    }
+    if is_npm_managed(&components) {
+        return InstallMethod::Npm;
+    }
+    InstallMethod::Standalone
+}
+
+/// Path-component (not substring) match against npm-ecosystem install
+/// roots. The previous substring-based check matched any path with
+/// `"npm"` anywhere in it (e.g. `/Users/npmtest/...` false-positived as
+/// npm-installed) and missed Volta / fnm / asdf / pnpm-global entirely.
+fn is_npm_managed(components: &[&str]) -> bool {
+    let has = |name: &str| components.iter().any(|c| *c == name);
+
+    // The reliable signal: every `npm install -g` and `npx` install
+    // routes through a `node_modules` directory.
+    if has("node_modules") {
+        return true;
+    }
+
+    // Version manager and alternative install roots. Component-level
+    // exact match avoids the substring trap.
+    const SHIMS: &[&str] = &[
+        ".npm",   // npm cache root (`~/.npm`)
+        ".nvm",   // nvm install root (`~/.nvm`)
+        ".volta", // Volta install root (`~/.volta`)
+        ".fnm",   // fnm install root (`~/.fnm`)
+        ".asdf",  // asdf install root (`~/.asdf`)
+        "nvm",    // nvm shared-install variants
+        "volta",  // Volta shared-install variants
+        "fnm",    // fnm shared-install variants
+        "asdf",   // asdf shared-install variants
+    ];
+    if SHIMS.iter().any(|s| has(s)) {
+        return true;
+    }
+
+    // pnpm global installs have BOTH `pnpm` AND `global` as components.
+    // Requiring both avoids matching pnpm's content-addressable store
+    // (e.g. `~/.pnpm-store/...`), which is not a global-install root.
+    if has("pnpm") && has("global") {
+        return true;
+    }
+
+    false
 }
 
 /// Run an external command for package-manager-based upgrades.
@@ -493,6 +556,92 @@ mod tests {
     fn install_method_name_not_empty() {
         let method = detect_install_method();
         assert!(!method.name().is_empty());
+    }
+
+    /// Per-channel detection table. Synthetic paths drive the pure
+    /// helper so the test holds regardless of what package manager
+    /// owns the running test binary.
+    ///
+    /// The substring-based predecessor false-positived on any path
+    /// containing the literal `"npm"` (e.g. `/Users/npmtest/...`) and
+    /// missed Volta / fnm / asdf / pnpm-global outright.
+    #[test]
+    fn detect_install_method_from_path_classifies_each_channel() {
+        use std::path::Path;
+        let cases: &[(&str, InstallMethod)] = &[
+            // Homebrew
+            ("/opt/homebrew/Cellar/lpm/0.37.0/bin/lpm", InstallMethod::Homebrew),
+            ("/usr/local/Cellar/lpm/0.37.0/bin/lpm", InstallMethod::Homebrew),
+            (
+                "/home/linuxbrew/.linuxbrew/Cellar/lpm/0.37.0/bin/lpm",
+                InstallMethod::Homebrew,
+            ),
+            // Homebrew bin-shim fallback (pre-canonicalize path)
+            ("/opt/homebrew/bin/lpm", InstallMethod::Homebrew),
+            // Cargo
+            ("/Users/x/.cargo/bin/lpm", InstallMethod::Cargo),
+            // Direct npm install
+            ("/usr/local/lib/node_modules/@lpm-registry/cli/lpm-bin", InstallMethod::Npm),
+            ("/Users/x/.npm/_npx/abc/node_modules/@lpm-registry/cli/lpm-bin", InstallMethod::Npm),
+            // npm version managers
+            ("/Users/x/.nvm/versions/node/v20.0.0/bin/lpm", InstallMethod::Npm),
+            ("/Users/x/.volta/tools/image/packages/@lpm-registry/cli/bin/lpm", InstallMethod::Npm),
+            ("/Users/x/.fnm/aliases/default/bin/lpm", InstallMethod::Npm),
+            ("/Users/x/.asdf/installs/nodejs/20.0.0/bin/lpm", InstallMethod::Npm),
+            // pnpm global (requires BOTH `pnpm` and `global` segments)
+            (
+                "/Users/x/.local/share/pnpm/global/5/node_modules/@lpm-registry/cli/lpm-bin",
+                InstallMethod::Npm,
+            ),
+            // Standalone — no shim, no node_modules
+            ("/Users/x/.lpm/bin/lpm", InstallMethod::Standalone),
+            ("/usr/local/bin/lpm", InstallMethod::Standalone),
+        ];
+        for (raw, expected) in cases {
+            let p = Path::new(raw);
+            let got = detect_install_method_from_path(Some(p));
+            assert_eq!(got, *expected, "path {raw}: expected {expected:?}, got {got:?}");
+        }
+    }
+
+    /// Substring-trap regression: a literal `"npm"` anywhere in the
+    /// path used to false-positive as an npm install. With component
+    /// matching, only exact path components count.
+    #[test]
+    fn detect_install_method_substring_npm_does_not_false_positive() {
+        use std::path::Path;
+        // `npmtest` contains "npm" as a substring but is not an npm
+        // path component. Must classify as Standalone.
+        let p = Path::new("/Users/npmtest/.lpm/bin/lpm");
+        assert_eq!(
+            detect_install_method_from_path(Some(p)),
+            InstallMethod::Standalone,
+        );
+    }
+
+    /// pnpm content-addressable store has a `pnpm` component but NOT
+    /// `global`. Must NOT classify as Npm — it's not an install root,
+    /// and routing the upgrade through `npm install -g` would corrupt
+    /// the store.
+    #[test]
+    fn detect_install_method_pnpm_store_alone_is_not_global_install() {
+        use std::path::Path;
+        let p = Path::new("/Users/x/.pnpm-store/v3/files/aa/bb/lpm-bin");
+        assert_eq!(
+            detect_install_method_from_path(Some(p)),
+            InstallMethod::Standalone,
+            "pnpm store without `global` segment is not an install root"
+        );
+    }
+
+    /// `None` (no exe path resolvable) falls through to Standalone.
+    /// Keeps the function total and the upgrade flow predictable.
+    #[test]
+    fn detect_install_method_none_falls_back_to_standalone() {
+        assert_eq!(
+            detect_install_method_from_path(None),
+            InstallMethod::Standalone
+        );
     }
 
     #[test]
