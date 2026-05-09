@@ -74,9 +74,12 @@ pub async fn run(json_output: bool, refresh: bool) -> Result<(), LpmError> {
         }
         let elapsed = now.saturating_sub(cache.last_failure_check);
         let remaining = FAILURE_BACKOFF.as_secs().saturating_sub(elapsed);
-        return Err(LpmError::Network(format!(
-            "Update check skipped: a previous attempt failed {} ago. \
-             Try again in {}, or pass --refresh to retry now.",
+        // SelfUpdatePaused — not Network. The failure isn't a live
+        // transport problem; it's a local cache decision to back off.
+        // The variant's help text surfaces `--refresh` so we don't have
+        // to repeat that hint inside the message body.
+        return Err(LpmError::SelfUpdatePaused(format!(
+            "last attempt failed {} ago, retrying automatically in {}",
             humanize_seconds(elapsed),
             humanize_seconds(remaining),
         )));
@@ -218,12 +221,28 @@ pub async fn run(json_output: bool, refresh: bool) -> Result<(), LpmError> {
 /// Map a `LookupError` into `LpmError` so the existing CLI error
 /// surface (miette / `--json`) renders it without losing the typed
 /// rate-limit info.
+///
+/// Mapping is purpose-specific so error categories match user intent:
+/// - Transport / HTTP / malformed → `Network`. Live network problem.
+/// - GitHub-API rate limit → `SelfUpdateRateLimited`. Not a permission
+///   issue (the historical `Forbidden` mapping read like the user was
+///   blocked); it's a quota issue with a clear remediation surfaced in
+///   the variant's help text (`GITHUB_TOKEN` / `GH_TOKEN`).
 fn lookup_error_to_lpm(e: LookupError) -> LpmError {
     match e {
         LookupError::Transport(_) | LookupError::HttpStatus { .. } => {
             LpmError::Network(format!("failed to check for updates: {e}"))
         }
-        LookupError::RateLimited { .. } => LpmError::Forbidden(e.to_string()),
+        LookupError::RateLimited { reset_at } => {
+            // Drop the GITHUB_TOKEN env-var guidance from the body —
+            // it's now in the variant's help text, so repeating it
+            // inline would double-print on the user's screen.
+            let body = match reset_at {
+                Some(epoch) => crate::release_lookup::format_rate_limit_summary(epoch),
+                None => "GitHub Releases fallback rate-limited".to_string(),
+            };
+            LpmError::SelfUpdateRateLimited(body)
+        }
         LookupError::MalformedResponse(_) => {
             LpmError::Network(format!("failed to check for updates: {e}"))
         }
@@ -649,13 +668,37 @@ mod tests {
         assert_eq!(format_bytes(2_621_440), "2.5 MB");
     }
 
+    /// Rate-limit lands on `SelfUpdateRateLimited`, not `Forbidden`.
+    /// `Forbidden` is the user-permission category and reads to users
+    /// as "you're banned" — wrong category for a quota-reset wait.
     #[test]
-    fn lookup_error_rate_limit_maps_to_forbidden() {
-        // Sanity-check the LpmError mapping so a future variant rename
-        // in lpm-common doesn't silently swap which surface 403s
-        // land on.
+    fn lookup_error_rate_limit_maps_to_self_update_rate_limited() {
         let err = lookup_error_to_lpm(LookupError::RateLimited { reset_at: Some(0) });
-        assert!(matches!(err, LpmError::Forbidden(_)), "got {err:?}");
+        assert!(matches!(err, LpmError::SelfUpdateRateLimited(_)), "got {err:?}");
+        // And — explicitly NOT Forbidden, the historical wrong category.
+        assert!(
+            !matches!(err, LpmError::Forbidden(_)),
+            "must not regress to Forbidden: {err:?}"
+        );
+    }
+
+    /// Rendered body must not duplicate the GITHUB_TOKEN hint — that
+    /// guidance now lives in the variant's miette help text. Doubling
+    /// it would print the same instruction twice.
+    #[test]
+    fn lookup_error_rate_limit_body_is_not_doubled_with_help_text() {
+        let err = lookup_error_to_lpm(LookupError::RateLimited { reset_at: Some(0) });
+        let LpmError::SelfUpdateRateLimited(body) = err else {
+            panic!("expected SelfUpdateRateLimited variant");
+        };
+        assert!(
+            !body.contains("GITHUB_TOKEN"),
+            "body must not duplicate help text: {body}"
+        );
+        assert!(
+            !body.contains("GH_TOKEN"),
+            "body must not duplicate help text: {body}"
+        );
     }
 
     #[test]
