@@ -1,0 +1,97 @@
+{
+	"_comment": "Real-world project audit manifest. Phase 66 confidence-followup §1a. Each entry: a real-world project pinned to a specific commit, its install directory (sometimes a subpath inside a monorepo), and a smoke command that exercises a meaningful slice of the project. The harness clones --depth 1 at the pinned ref, replaces the project's install with `lpm install --linker hoisted` and `--linker isolated` separately, and reports asymmetric outcomes the same way as bench/audit-fixtures. Add new entries here; the suite runner picks them up automatically.",
+	"projects": [
+		{
+			"name": "next-blog-starter",
+			"category": "framework-starter",
+			"why": "Next.js + React + remark/rehype markdown pipeline. Exercises the React peer-dep instance invariant + Webpack plugin discovery via Next's compiler.",
+			"git_url": "https://github.com/vercel/next.js.git",
+			"git_ref": "v15.0.3",
+			"subpath": "examples/blog-starter",
+			"smoke": "npx --no-install next build"
+		},
+		{
+			"name": "astro-basics",
+			"category": "framework-starter",
+			"why": "Astro + Vite + multiple integrations. Exercises Astro's plugin ecosystem and Vite peer requirements simultaneously.",
+			"git_url": "https://github.com/withastro/astro.git",
+			"git_ref": "astro@5.0.0",
+			"subpath": "examples/basics",
+			"smoke": "npx --no-install astro check && npx --no-install astro build"
+		},
+		{
+			"name": "vite-vue-ts",
+			"category": "framework-starter",
+			"why": "Vue 3 + Vite + TypeScript starter shape. Exercises Vue's reactive-system peer chain plus volar/vue-tsc through Vite's plugin layer.",
+			"git_url": "https://github.com/vitejs/vite.git",
+			"git_ref": "create-vite@6.0.1",
+			"subpath": "packages/create-vite/template-vue-ts",
+			"pre_install": "node -e \"const fs=require('fs');const p=JSON.parse(fs.readFileSync('package.json','utf8'));p.name='audit-vite-vue-ts';p.private=true;fs.writeFileSync('package.json',JSON.stringify(p,null,2));\"",
+			"smoke": "npx --no-install vue-tsc -b && npx --no-install vite build"
+		},
+		{
+			"name": "nest-typescript-starter",
+			"category": "framework-starter",
+			"why": "NestJS deep DI + decorator peer chain (rxjs + reflect-metadata + class-validator). Real-world version of audit-fixtures/peer-heavy/nestjs-deep with a full TS build.",
+			"git_url": "https://github.com/nestjs/typescript-starter.git",
+			"git_ref": "c4d9330f5513eda0fb5df594f6b34a11fde1a934",
+			"subpath": ".",
+			"smoke": "npx --no-install nest build"
+		},
+		{
+			"name": "remix-blues-stack",
+			"category": "framework-starter",
+			"why": "Remix + Prisma + Vitest + Playwright. Exercises bundler integration with React peers + Prisma codegen postinstall.",
+			"git_url": "https://github.com/remix-run/blues-stack.git",
+			"git_ref": "7390646d6f3b6e6cb7ef722e4b61cdbffb997afc",
+			"subpath": ".",
+			"pre_install": "rm -f .npmrc",
+			"smoke": "npx --no-install prisma generate && node -e \"require('@remix-run/node'); require('@prisma/client'); console.log('require chain ok')\""
+		},
+		{
+			"name": "vite-react-ts",
+			"category": "framework-starter",
+			"why": "Minimal Vite + React + TS. Lighter than Next.js but exercises the same React-peer + Vite-plugin invariants. Used as a smoke-control: if this fails the whole audit is suspect.",
+			"git_url": "https://github.com/vitejs/vite.git",
+			"git_ref": "create-vite@6.0.1",
+			"subpath": "packages/create-vite/template-react-ts",
+			"pre_install": "node -e \"const fs=require('fs');const p=JSON.parse(fs.readFileSync('package.json','utf8'));p.name='audit-vite-react-ts';p.private=true;fs.writeFileSync('package.json',JSON.stringify(p,null,2));\"",
+			"smoke": "npx --no-install tsc -b && npx --no-install vite build"
+		},
+		{
+			"name": "vitepress-install",
+			"category": "ssg",
+			"why": "Vue + Markdown-it + Shiki. Exercises the heavy plugin chain on install: ~250 transitives across the Vue ecosystem, vite-plugin-vue, Algolia search, Shiki syntax highlighting. Smoke is `import('vitepress')` — proves install correctness + ESM resolution from the v2 store layout. Full doc-site builds rely on project config files which would couple this audit to vitepress's own quirks; the install graph itself is the unit-under-test.",
+			"from_scratch": true,
+			"pre_install": "node -e \"const fs=require('fs');fs.writeFileSync('package.json',JSON.stringify({name:'audit-vitepress-install',version:'1.0.0',private:true,type:'module',dependencies:{vitepress:'1.5.0',vue:'^3.4.0'}},null,2));\"",
+			"smoke": "node --input-type=module -e \"const m = await import('vitepress'); if (typeof m.defineConfig !== 'function') { throw new Error('vitepress.defineConfig not exported'); } console.log('vitepress import ok');\""
+		},
+		{
+			"name": "eleventy-base-blog",
+			"category": "npm-compat",
+			"why": "11ty + a heavy plugin chain (rss, syntaxhighlight, navigation). Tests SSG plugin discovery and `.bin` link materialization. The smoke is narrowed to `--version` because the project's full build uses Nunjucks `{% include 'node_modules/prismjs/themes/...' %}` — a literal filesystem-path include of a transitive dependency. npm/yarn hoist all transitives to project-root `node_modules/`; lpm (both isolated AND hoisted) keeps transitives inside per-package wrapper dirs in the v2 store. **Both lpm linker modes fail this build symmetrically — this is an lpm-vs-npm compatibility decision, NOT a hoisted-default confidence gap.** Tracked separately; the asymmetric-only gate doesn't catch it because both modes diverge from npm equally.",
+			"git_url": "https://github.com/11ty/eleventy-base-blog.git",
+			"git_ref": "v9.0.0",
+			"subpath": ".",
+			"smoke": "npx --no-install @11ty/eleventy --version"
+		},
+		{
+			"name": "express-mongoose-api",
+			"category": "backend",
+			"why": "Express + Mongoose. Backend stack with a deep transitive native-module chain (bson, mongoose internals).",
+			"git_url": "https://github.com/hagopj13/node-express-boilerplate.git",
+			"git_ref": "179ae84efec61b14206d0305d941daed6c6d07f9",
+			"subpath": ".",
+			"smoke": "node -e \"require('express'); require('mongoose'); console.log('require chain ok')\""
+		},
+		{
+			"name": "hardhat-tutorial",
+			"category": "native+js",
+			"why": "Hardhat + ethers + native solc bindings. Combines compile-on-install + heavy native deps + plugin chain.",
+			"git_url": "https://github.com/NomicFoundation/hardhat-boilerplate.git",
+			"git_ref": "638fd58ec882990d3b654d45e37907eb15695bd2",
+			"subpath": ".",
+			"smoke": "npx --no-install hardhat compile"
+		}
+	]
+}

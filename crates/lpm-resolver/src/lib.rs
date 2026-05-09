@@ -17,6 +17,7 @@ mod resolve;
 pub mod specifier;
 mod walker;
 
+pub use greedy::PeerConflictReport;
 pub use greedy::resolve_greedy_fused;
 pub use npm_version::NpmVersion;
 pub use overrides::{

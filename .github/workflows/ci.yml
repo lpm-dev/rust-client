@@ -5,6 +5,17 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+  # Phase 66 confidence-followup §1a — manual + weekly real-world audit.
+  # `workflow_dispatch` lets developers run on demand; `schedule`
+  # catches "real-world project X broke under hoisted" without waiting
+  # on a user report. The realworld-audit job below is gated to these
+  # triggers — it clones whole projects + runs their builds, which is
+  # too expensive for every PR.
+  workflow_dispatch:
+  schedule:
+    # Every Monday 09:00 UTC. Fires off-peak relative to the
+    # weekday push-traffic peak so it doesn't compete with PR CI.
+    - cron: "0 9 * * 1"
 
 # Cancel in-progress CI for the same branch (don't waste minutes)
 concurrency:
@@ -130,8 +141,8 @@ jobs:
         run: cargo nextest run --workspace --exclude lpm-integration-tests --no-fail-fast
 
   audit-fixtures:
-    name: Hoisted-mode compat audit (${{ matrix.store_version }})
-    runs-on: ubuntu-latest
+    name: Hoisted-mode compat audit (${{ matrix.os }} / ${{ matrix.store_version }})
+    runs-on: ${{ matrix.os }}
     timeout-minutes: 30
     # Run the audit fixtures on every push to main + every PR. The
     # suite catches mode-asymmetric regressions: a fix that lands and
@@ -149,10 +160,28 @@ jobs:
     #   for users hitting a v2 regression.
     # Pre-Phase-4d this matrix was inverted (v1 default + v2 opt-in)
     # while v2 was a dev-only flag.
+    #
+    # Phase 66 confidence-followup §3b: cross-platform expansion. The
+    # ubuntu-latest rows gate the build (every fixture must PASS/PASS
+    # symmetric or PASS/PASS). The windows-latest row uses Git Bash to
+    # run the same harness — `continue-on-error: true` is set so first-
+    # time Windows-specific failures (mostly native fixtures lacking
+    # node-gyp / vcredist) surface as signal without blocking the
+    # build. Once the Windows row stabilizes, drop continue-on-error
+    # to make it a hard gate.
     strategy:
       fail-fast: false
       matrix:
+        os: [ubuntu-latest, windows-latest]
         store_version: ["v2", "v1"]
+        # Windows row: only run the v2 default — the v1 downgrade path
+        # is tested implicitly on Linux. Saves ~30 minutes of CI per PR
+        # while still catching cross-platform v2 regressions.
+        exclude:
+          - os: windows-latest
+            store_version: "v1"
+    # §3b: tolerate Windows-specific incompat for now (see job comment).
+    continue-on-error: ${{ matrix.os == 'windows-latest' }}
     steps:
       - uses: actions/checkout@v5
 
@@ -174,7 +203,7 @@ jobs:
       - name: Install Node 22
         uses: actions/setup-node@v4
         with:
-          node-version: '22'
+          node-version: "22"
 
       # The audit harness alternates lpm + bun on every fixture so each
       # mode sees the same network state. Bun ships prebuilt binaries
@@ -185,18 +214,15 @@ jobs:
       - name: Build lpm-rs (release)
         run: cargo build --release -p lpm-cli
 
+      # §3b: drive the bash harness from Git Bash on Windows. The
+      # `windows-latest` runner has Git Bash preinstalled at
+      # `C:\Program Files\Git\bin\bash.exe`; `shell: bash` resolves to
+      # it natively.
       - name: Run audit fixtures
+        shell: bash
         run: ./bench/audit-fixtures/run-all.sh
         env:
-          # `--no-skills` keeps the audit deterministic; the skills
-          # auto-install layer adds non-fixture work that varies with
-          # the registry's response time.
           LPM_NO_SKILLS: "1"
-          # Phase 66 Phase 4d: v2 is the new default, so the v2 row
-          # leaves the var unset and exercises the natural production
-          # path. The v1 row sets `LPM_STORE_VERSION=v1` to verify
-          # the explicit downgrade-rollback still produces correct
-          # installs.
           LPM_STORE_VERSION: ${{ matrix.store_version == 'v1' && 'v1' || '' }}
 
       # Always upload result JSONs — useful for triaging mode-asymmetric
@@ -205,9 +231,124 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: audit-fixtures-results-${{ matrix.store_version }}
+          name: audit-fixtures-results-${{ matrix.os }}-${{ matrix.store_version }}
           path: bench/audit-fixtures/results/
           retention-days: 14
+
+  realworld-audit:
+    name: Real-world project audit
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    # Phase 66 confidence-followup §1a — gated to workflow_dispatch +
+    # weekly schedule. Each project clones whole repos and runs their
+    # build/test, so per-PR coverage is too expensive. The
+    # audit-fixtures job catches ~95% of mode-asymmetric regressions
+    # in <2 minutes; this job is the long-tail safety net.
+    if: github.event_name == 'workflow_dispatch' || github.event_name == 'schedule'
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-realworld-${{ env.RUST_TOOLCHAIN }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-realworld-${{ env.RUST_TOOLCHAIN }}-
+
+      - name: Install Node 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Install jq
+        run: sudo apt-get update && sudo apt-get install -y jq
+
+      - name: Build lpm-rs (release)
+        run: cargo build --release -p lpm-cli
+
+      - name: Run real-world audit suite
+        run: ./bench/realworld-audit/run-all.sh
+        env:
+          # Mirror audit-fixtures' deterministic posture — `--no-skills`
+          # avoids skills-auto-install variance.
+          LPM_NO_SKILLS: "1"
+
+      - name: Upload realworld result artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: realworld-audit-results
+          path: bench/realworld-audit/results/
+          retention-days: 30
+
+  top-npm-audit:
+    name: Top-N npm package audit
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    # Phase 66 confidence-followup §1b — gated to workflow_dispatch +
+    # weekly schedule. Generates ~100 single-dep fixtures and smokes
+    # each package's programmatic entrypoint under both modes
+    # (require-first, with import fallback only for genuine ESM-only
+    # surfaces). Asymmetric outcomes are the regression signal;
+    # symmetric failures are bin-only packages / upstream load issues
+    # and don't gate.
+    if: github.event_name == 'workflow_dispatch' || github.event_name == 'schedule'
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-topnpm-${{ env.RUST_TOOLCHAIN }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-topnpm-${{ env.RUST_TOOLCHAIN }}-
+
+      - name: Install Node 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Install jq
+        run: sudo apt-get update && sudo apt-get install -y jq
+
+      - name: Build lpm-rs (release)
+        run: cargo build --release -p lpm-cli
+
+      - name: Run top-N npm audit
+        run: ./bench/top-npm-audit/run-all.sh
+        env:
+          LPM_NO_SKILLS: "1"
+          # Higher parallelism on CI — 8 slots gives us better utilization
+          # than the default 4 without saturating the 2-core runner's
+          # network or store contention.
+          LPM_TOP_NPM_PARALLEL: "8"
+
+      - name: Upload top-npm result artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: top-npm-audit-results
+          # The result JSONs land in bench/audit-fixtures/results/
+          # because run-audit.sh writes there; pick them up by their
+          # `top-npm-` filename prefix to keep artifacts focused.
+          path: bench/audit-fixtures/results/top-npm-*.json
+          retention-days: 30
 
   bench:
     name: Benchmarks

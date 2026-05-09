@@ -156,6 +156,27 @@ struct PeerRequirement {
     optional: bool,
 }
 
+/// One best-effort peer-conflict report. Phase 66 confidence-followup
+/// §1a. Surfaced when a peer canonical has multiple required consumers
+/// whose ranges are pairwise-incompatible — lpm picks the version that
+/// satisfies the most consumers and records the unsatisfied ones here
+/// for the install pipeline to warn about. Mirrors npm v7+'s "pick
+/// one + warn the rest" behavior on hoisted layouts.
+#[derive(Debug, Clone)]
+pub struct PeerConflictReport {
+    /// Peer canonical name (e.g., `"react"` or `"@scope/foo"`).
+    pub canonical: String,
+    /// Version lpm chose to ambient-install at top level. Satisfies at
+    /// least one required consumer's range (if zero consumers were
+    /// satisfiable, the resolver hard-errors with `PeerConflict`
+    /// instead of producing this report).
+    pub chosen_version: String,
+    /// `(consumer_canonical, declared_range)` for required consumers
+    /// whose range does NOT include `chosen_version`. Stable order:
+    /// matches the order the requirements were registered in.
+    pub unsatisfied_consumers: Vec<(String, String)>,
+}
+
 /// Bitfield matching bun's `Dependency.Behavior` (`dependency.zig:35-37`).
 /// W1 collapses dev under required at the root level (only root
 /// edges are ever marked dev — transitive `devDependencies` are not
@@ -323,6 +344,11 @@ pub async fn resolve_greedy(
     let mut ambient_peer_installs = std::mem::take(&mut state.ambient_peer_installs);
     ambient_peer_installs.sort();
     ambient_peer_installs.dedup();
+    // §1a — drain peer-conflict reports. Sort by canonical for
+    // deterministic install-side warning order. Empty in the common
+    // case (no transitive peer-version conflicts).
+    let mut peer_conflicts = std::mem::take(&mut state.peer_conflicts);
+    peer_conflicts.sort_by(|a, b| a.canonical.cmp(&b.canonical));
     // Phase 32 P5 — drain the override apply trace before `state` is
     // moved by `into_resolved_packages`. `take_hits` sorts deterministically
     // by (package, raw_key), matching the pubgrub arm's contract for
@@ -341,6 +367,7 @@ pub async fn resolve_greedy(
         // root dep uses alias syntax.
         root_aliases,
         ambient_peer_installs,
+        peer_conflicts,
         stage_timing: StageTiming {
             followup_rpc_ms: snap.metadata_rpc.as_millis() as u64,
             followup_rpc_count: snap.metadata_rpc_count,
@@ -796,6 +823,10 @@ pub async fn resolve_greedy_fused(
     let mut ambient_peer_installs = std::mem::take(&mut state.ambient_peer_installs);
     ambient_peer_installs.sort();
     ambient_peer_installs.dedup();
+    // §1a — same drain semantic as walker arm: best-effort peer
+    // conflicts surface as warnings on the install pipeline.
+    let mut peer_conflicts = std::mem::take(&mut state.peer_conflicts);
+    peer_conflicts.sort_by(|a, b| a.canonical.cmp(&b.canonical));
     // Phase 32 P5 — drain the override apply trace before `state` is
     // moved by `into_resolved_packages`. Same shape + order contract
     // as the walker arm above.
@@ -810,6 +841,7 @@ pub async fn resolve_greedy_fused(
         platform_skipped,
         root_aliases,
         ambient_peer_installs,
+        peer_conflicts,
         stage_timing: StageTiming {
             followup_rpc_ms: snap.metadata_rpc.as_millis() as u64,
             followup_rpc_count: snap.metadata_rpc_count,
@@ -912,6 +944,15 @@ struct ResolveState {
     ///
     /// Sorted alphabetically before drain for deterministic output.
     ambient_peer_installs: Vec<String>,
+    /// **Phase 66 confidence-followup §1a** — peer-group conflicts the
+    /// drain resolved best-effort. Each entry corresponds to one
+    /// canonical whose required consumer ranges were
+    /// pairwise-incompatible: lpm picked the version satisfying the
+    /// most consumers, recorded the unsatisfied ones here, and
+    /// continued. Drained into `ResolveResult.peer_conflicts` at the
+    /// arm tail; install pipeline prints a single warning per entry.
+    /// Empty when no peer group needed best-effort fallback.
+    peer_conflicts: Vec<PeerConflictReport>,
 }
 
 /// In-flight resolved node — accumulated during the loop, finalized
@@ -942,6 +983,9 @@ impl ResolveState {
             // R2.2: typically 0 (most installs don't need ambient
             // synthesis). Allocated lazily on first push.
             ambient_peer_installs: Vec::new(),
+            // §1a: typically 0 (most installs have a clean peer
+            // graph). Allocated lazily on first conflict.
+            peer_conflicts: Vec::new(),
         }
     }
 
@@ -1744,6 +1788,20 @@ enum PeerDrainOutcome {
     /// platform-compatible — the synthesis path never bumps
     /// `state.platform_skipped`.
     Synthesize { chosen: NpmVersion },
+    /// Best-effort synthesis: required consumer ranges are
+    /// pairwise-incompatible, so no single version satisfies every
+    /// consumer. Caller still synthesizes a root-scoped ambient Edge
+    /// at `chosen` (the version satisfying the most consumers, ties
+    /// broken by newest), AND records a [`PeerConflictReport`] so the
+    /// install pipeline can warn about the unsatisfied consumers.
+    /// Mirrors npm v7+ / pnpm behavior — pick one peer at top level,
+    /// warn the rest. The unreachable terminal case (no version
+    /// satisfies ANY required consumer) keeps the hard
+    /// [`ResolveError::PeerConflict`] surface.
+    BestEffortSynthesize {
+        chosen: NpmVersion,
+        unsatisfied: Vec<(String, String)>, // (consumer_canonical, range)
+    },
 }
 
 /// Walk `info.versions` newest-first, return the first version that
@@ -1752,8 +1810,9 @@ enum PeerDrainOutcome {
 /// generalized to N ranges that all must be satisfied simultaneously.
 ///
 /// Returns `None` when no version threads every range; callers turn
-/// that into either a `PeerConflict` (any required consumer present)
-/// or a silent skip (all consumers optional).
+/// that into a best-effort fallback via [`find_version_satisfying_most`]
+/// (warn + synthesize the most-satisfying version) or a silent skip
+/// (all consumers optional).
 fn find_version_satisfying_all(
     info: &CachedPackageInfo,
     reqs: &[&PeerRequirement],
@@ -1776,6 +1835,73 @@ fn find_version_satisfying_all(
         return Some(v.clone());
     }
     None
+}
+
+/// Best-effort fallback when no version satisfies EVERY required
+/// consumer's range (transitive peer conflict). Returns
+/// `Some((chosen, unsatisfied_required_indices))` where:
+/// - `chosen` is the platform-compatible version that satisfies the
+///   most REQUIRED consumer ranges (ties broken by newest semver — the
+///   `info.versions` walk is already newest-first);
+/// - `unsatisfied_required_indices` indexes into `reqs` for required
+///   consumers whose range does NOT include `chosen`. Optional
+///   consumers are excluded from the unsatisfied list — they're never
+///   surfaced as warnings.
+///
+/// Returns `None` when no platform-compatible version satisfies even
+/// ONE required consumer's range — that's the truly-irreconcilable
+/// terminal case the caller should turn into a hard `PeerConflict`
+/// error.
+///
+/// Mirrors npm v7+ / pnpm hoisted-mode behavior: pick a single
+/// top-level peer version, warn about consumers stuck with the wrong
+/// one. lpm pre-fix raised `PeerConflict` here, blocking real-world
+/// installs (e.g. nestjs/typescript-starter's transitive
+/// ajv-keywords@5 vs @8 chain). See Phase 66 confidence-followup §1a.
+fn find_version_satisfying_most<'a>(
+    info: &CachedPackageInfo,
+    reqs: &'a [&'a PeerRequirement],
+) -> Option<(NpmVersion, Vec<usize>)> {
+    let required_indices: Vec<usize> = reqs
+        .iter()
+        .enumerate()
+        .filter_map(|(i, r)| (!r.optional).then_some(i))
+        .collect();
+    if required_indices.is_empty() {
+        return None;
+    }
+
+    let mut best: Option<(NpmVersion, usize, Vec<usize>)> = None;
+    for v in &info.versions {
+        let platform_ok = info
+            .platform
+            .get(&v.to_string())
+            .is_none_or(crate::provider::is_platform_compatible);
+        if !platform_ok {
+            continue;
+        }
+        let mut hits = 0usize;
+        let mut misses: Vec<usize> = Vec::new();
+        for &i in &required_indices {
+            if reqs[i].range.satisfies(v) {
+                hits += 1;
+            } else {
+                misses.push(i);
+            }
+        }
+        if hits == 0 {
+            continue;
+        }
+        // Newest-first walk + strictly-greater hit count = stable
+        // tiebreak on newest. Equal hit count loses to the version
+        // already chosen (which was newer in the walk).
+        match &best {
+            None => best = Some((v.clone(), hits, misses)),
+            Some((_, prev_hits, _)) if hits > *prev_hits => best = Some((v.clone(), hits, misses)),
+            _ => {}
+        }
+    }
+    best.map(|(v, _, misses)| (v, misses))
 }
 
 /// True iff at least one node currently in `state.resolved[canonical]`
@@ -1936,54 +2062,94 @@ where
             PeerDrainOutcome::SatisfiedByExisting => continue,
             PeerDrainOutcome::SkippedOptOut => continue,
             PeerDrainOutcome::Synthesize { chosen } => {
-                // Pin the synthesized edge to the exact chosen version.
-                // `find_best_version` will return the same version
-                // (only one match for an exact pin), and dedupe-on-
-                // canonical reuses any existing node at that version
-                // (e.g., if a transitive regular dep already pulled it
-                // in at the same version).
-                let exact_range = NpmRange::parse(&chosen.to_string()).map_err(|e| {
-                    ResolveError::Internal(format!(
-                        "R2.2: synthesized exact-pin range '{chosen}' for {canonical} \
-                         failed to parse: {e}"
-                    ))
-                })?;
-                let canonical_name = canonical.to_string();
-                synthesized.push(Edge {
-                    parent: 0,                          // root scope
-                    local_name: canonical_name.clone(), // ambient install — local name = canonical
-                    canonical: canonical.clone(),
-                    range: exact_range,
-                    behavior: DepBehavior {
-                        // Ambient install at root scope is a regular
-                        // required dep; the `peer` provenance is
-                        // already captured in the original consumer's
-                        // `peers` field, derived from the metadata
-                        // cache by `into_resolved_packages`.
-                        required: true,
-                        peer: false,
-                        optional: false,
-                    },
-                });
-                // Record the canonical so the install pipeline can
-                // surface it at top-level `node_modules/<name>/`. The
-                // resolver-side allocation alone isn't enough: install
-                // pipeline derives "is this a top-level link?" from
-                // `pkg.dependencies` ∪ `ambient_peer_installs`, not
-                // from the resolver's `root.children` (which gets
-                // filtered out at `into_resolved_packages`).
-                state.ambient_peer_installs.push(canonical_name);
-                tracing::debug!(
-                    "R2.2 ambient-install: {} @ {} (consumers: {})",
+                synthesize_ambient_edge(
+                    state,
+                    &canonical,
+                    &chosen,
+                    reqs_owned.len(),
+                    &mut synthesized,
+                )?;
+            }
+            PeerDrainOutcome::BestEffortSynthesize {
+                chosen,
+                unsatisfied,
+            } => {
+                synthesize_ambient_edge(
+                    state,
+                    &canonical,
+                    &chosen,
+                    reqs_owned.len(),
+                    &mut synthesized,
+                )?;
+                // Best-effort synthesis still installs the canonical
+                // at top level — but at most one consumer range. Store
+                // the conflict so install.rs can warn the user about
+                // the consumers that DIDN'T match. tracing::warn!
+                // surfaces in `--json=false` runs even when stderr is
+                // capped; install.rs additionally formats the report
+                // human-readably below the install summary.
+                tracing::warn!(
+                    "ambient peer-install best-effort: {} @ {} satisfies {} of {} required consumer(s); \
+                     unsatisfied: {}",
                     canonical,
                     chosen,
-                    reqs_owned.len(),
+                    reqs_owned.len() - unsatisfied.len(),
+                    reqs_owned.iter().filter(|r| !r.optional).count(),
+                    unsatisfied
+                        .iter()
+                        .map(|(c, r)| format!("{c} wants {r}"))
+                        .collect::<Vec<_>>()
+                        .join("; ")
                 );
+                state.peer_conflicts.push(PeerConflictReport {
+                    canonical: canonical.to_string(),
+                    chosen_version: chosen.to_string(),
+                    unsatisfied_consumers: unsatisfied,
+                });
             }
         }
     }
 
     Ok(synthesized)
+}
+
+/// Push a single ambient root-scoped Edge for the chosen peer version
+/// and record the canonical on `state.ambient_peer_installs`. Shared
+/// between the strict-satisfies-all path and the best-effort
+/// satisfies-most fallback so both paths produce byte-identical edges.
+fn synthesize_ambient_edge(
+    state: &mut ResolveState,
+    canonical: &CanonicalKey,
+    chosen: &NpmVersion,
+    consumer_count: usize,
+    out: &mut Vec<Edge>,
+) -> Result<(), ResolveError> {
+    let exact_range = NpmRange::parse(&chosen.to_string()).map_err(|e| {
+        ResolveError::Internal(format!(
+            "R2.2: synthesized exact-pin range '{chosen}' for {canonical} \
+             failed to parse: {e}"
+        ))
+    })?;
+    let canonical_name = canonical.to_string();
+    out.push(Edge {
+        parent: 0,
+        local_name: canonical_name.clone(),
+        canonical: canonical.clone(),
+        range: exact_range,
+        behavior: DepBehavior {
+            required: true,
+            peer: false,
+            optional: false,
+        },
+    });
+    state.ambient_peer_installs.push(canonical_name);
+    tracing::debug!(
+        "R2.2 ambient-install: {} @ {} (consumers: {})",
+        canonical,
+        chosen,
+        consumer_count,
+    );
+    Ok(())
 }
 
 /// Classify one peer-canonical group. Splits the satisfaction check
@@ -2014,25 +2180,52 @@ where
     }
 
     // Step 3 — synthesis path. Fetch the manifest, find the version
-    // satisfying every consumer's range, or surface a conflict.
+    // satisfying every consumer's range. Pre-Phase-66-followup-§1a
+    // this raised `PeerConflict` when no version threaded every
+    // range; that broke real-world installs whose TRANSITIVE tree
+    // declares incompatible peer ranges (e.g. nestjs's chain pulling
+    // both `ajv-keywords@5` peer'ing ajv@^6 and `ajv-keywords@8`
+    // peer'ing ajv@^8). npm v7+ + pnpm hoist a single top-level peer
+    // and warn about the stuck consumers; lpm now matches.
     let info = fetch_manifest(canonical.clone()).await?;
-    match find_version_satisfying_all(&info, reqs) {
-        Some(chosen) => Ok(PeerDrainOutcome::Synthesize { chosen }),
-        None => Err(ResolveError::PeerConflict {
-            canonical: canonical.to_string(),
-            requirements: reqs
-                .iter()
-                .map(|r| {
-                    let consumer_canonical = state
-                        .nodes
-                        .get(r.consumer as usize)
-                        .map(|n| n.canonical.to_string())
-                        .unwrap_or_else(|| "<unknown>".to_string());
-                    (consumer_canonical, r.range.to_string(), r.optional)
-                })
-                .collect(),
-        }),
+    if let Some(chosen) = find_version_satisfying_all(&info, reqs) {
+        return Ok(PeerDrainOutcome::Synthesize { chosen });
     }
+    if let Some((chosen, unsatisfied_idx)) = find_version_satisfying_most(&info, reqs) {
+        let unsatisfied: Vec<(String, String)> = unsatisfied_idx
+            .into_iter()
+            .map(|i| {
+                let consumer_canonical = state
+                    .nodes
+                    .get(reqs[i].consumer as usize)
+                    .map(|n| n.canonical.to_string())
+                    .unwrap_or_else(|| "<unknown>".to_string());
+                (consumer_canonical, reqs[i].range.to_string())
+            })
+            .collect();
+        return Ok(PeerDrainOutcome::BestEffortSynthesize {
+            chosen,
+            unsatisfied,
+        });
+    }
+    // Truly irreconcilable: no platform-compatible version satisfies
+    // any required consumer's range. Hard error — this means the
+    // canonical's published versions don't include anything any
+    // required consumer accepts, which the resolver can't paper over.
+    Err(ResolveError::PeerConflict {
+        canonical: canonical.to_string(),
+        requirements: reqs
+            .iter()
+            .map(|r| {
+                let consumer_canonical = state
+                    .nodes
+                    .get(r.consumer as usize)
+                    .map(|n| n.canonical.to_string())
+                    .unwrap_or_else(|| "<unknown>".to_string());
+                (consumer_canonical, r.range.to_string(), r.optional)
+            })
+            .collect(),
+    })
 }
 
 /// Outcome of `find_best_version`. Distinguishes "no version exists
@@ -3633,10 +3826,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn r22_drain_returns_peer_conflict_for_incompatible_ranges() {
-        // Two consumers declare incompatible ranges (`^17` vs `^18`).
-        // No version satisfies both → `PeerConflict`. At least one
-        // consumer is required, so the conflict is hard.
+    async fn r22_drain_best_effort_synthesizes_for_incompatible_required_ranges() {
+        // Phase 66 confidence-followup §1a — two required consumers
+        // declare incompatible ranges (`^17` vs `^18`). No version
+        // satisfies both. Pre-§1a this raised `PeerConflict` and broke
+        // real-world installs (nestjs's transitive ajv-keywords
+        // chain). Post-§1a: pick the version satisfying the most
+        // consumers, ambient-install it, and record the unsatisfied
+        // ones in `state.peer_conflicts` for the install pipeline to
+        // warn about. Mirrors npm v7+ / pnpm hoisted behavior.
         let mut state = ResolveState::new(HashMap::new(), OverrideSet::empty());
         let _root = push_node(&mut state, CanonicalKey::Root, "0.0.0");
         let consumer_a = push_node(&mut state, CanonicalKey::npm("legacy-pkg"), "1.0.0");
@@ -3658,6 +3856,63 @@ mod tests {
         ));
 
         let info_arc = mk_info_arc(&["18.2.0", "17.0.2"], &[]);
+        let synth = drain_peer_requirements_one_pass(&mut state, true, |_canonical| {
+            let info = info_arc.clone();
+            async move { Ok(info) }
+        })
+        .await
+        .expect("best-effort synthesis must NOT raise PeerConflict");
+
+        assert_eq!(
+            synth.len(),
+            1,
+            "exactly one ambient install — the chosen peer version"
+        );
+        // Tied hit count (each version satisfies one consumer).
+        // Newest-first walk picks 18.2.0 first; the tiebreak favors
+        // it over 17.0.2.
+        assert!(
+            synth[0]
+                .range
+                .satisfies(&NpmVersion::parse("18.2.0").unwrap()),
+            "newest tied-hit version wins (18.2.0 satisfies modern-pkg)"
+        );
+
+        // Conflict report must record the unsatisfied required
+        // consumer (legacy-pkg wants ^17 but we picked 18.2.0).
+        assert_eq!(
+            state.peer_conflicts.len(),
+            1,
+            "one conflict report for the react peer group"
+        );
+        let report = &state.peer_conflicts[0];
+        assert_eq!(report.canonical, "react");
+        assert_eq!(report.chosen_version, "18.2.0");
+        assert_eq!(report.unsatisfied_consumers.len(), 1);
+        assert_eq!(report.unsatisfied_consumers[0].0, "legacy-pkg");
+        assert_eq!(report.unsatisfied_consumers[0].1, "^17.0.0");
+    }
+
+    #[tokio::test]
+    async fn r22_drain_hard_errors_when_no_required_consumer_satisfiable() {
+        // Phase 66 confidence-followup §1a — terminal case retained.
+        // No platform-compatible version satisfies any required
+        // consumer's range (here: required consumer wants ^99 but
+        // only 18 + 17 are published). Hard error survives because
+        // there's no version to "best-effort" pick that helps anyone.
+        let mut state = ResolveState::new(HashMap::new(), OverrideSet::empty());
+        let _root = push_node(&mut state, CanonicalKey::Root, "0.0.0");
+        let consumer = push_node(&mut state, CanonicalKey::npm("future-pkg"), "1.0.0");
+
+        state.peer_requirements.push(mk_peer_req(
+            consumer,
+            "react",
+            CanonicalKey::npm("react"),
+            "^99.0.0",
+            false,
+        ));
+
+        let info_arc = mk_info_arc(&["18.2.0", "17.0.2"], &[]);
         let result = drain_peer_requirements_one_pass(&mut state, true, |_canonical| {
             let info = info_arc.clone();
             async move { Ok(info) }
@@ -3670,20 +3925,61 @@ mod tests {
                 requirements,
             }) => {
                 assert_eq!(canonical, "react");
-                assert_eq!(requirements.len(), 2);
-                let consumers: Vec<&str> =
-                    requirements.iter().map(|(c, _, _)| c.as_str()).collect();
-                assert!(
-                    consumers.contains(&"legacy-pkg"),
-                    "conflict reports legacy-pkg as a contributing consumer"
-                );
-                assert!(
-                    consumers.contains(&"modern-pkg"),
-                    "conflict reports modern-pkg as a contributing consumer"
-                );
+                assert_eq!(requirements.len(), 1);
+                assert_eq!(requirements[0].0, "future-pkg");
+                assert_eq!(requirements[0].1, "^99.0.0");
             }
-            other => panic!("expected PeerConflict, got {other:?}"),
+            other => {
+                panic!("expected PeerConflict for unsatisfiable required range, got {other:?}")
+            }
         }
+    }
+
+    #[tokio::test]
+    async fn r22_drain_best_effort_picks_version_satisfying_most_consumers() {
+        // §1a — three required consumers; two want ^18, one wants
+        // ^17. Best-effort picks 18.2.0 (satisfies 2 of 3) over 17.x
+        // (satisfies 1 of 3). The unsatisfied consumer is recorded.
+        let mut state = ResolveState::new(HashMap::new(), OverrideSet::empty());
+        let _root = push_node(&mut state, CanonicalKey::Root, "0.0.0");
+        let c_modern_a = push_node(&mut state, CanonicalKey::npm("modern-a"), "1.0.0");
+        let c_modern_b = push_node(&mut state, CanonicalKey::npm("modern-b"), "1.0.0");
+        let c_legacy = push_node(&mut state, CanonicalKey::npm("legacy"), "1.0.0");
+
+        for (consumer, range) in [
+            (c_modern_a, "^18.0.0"),
+            (c_modern_b, "^18.0.0"),
+            (c_legacy, "^17.0.0"),
+        ] {
+            state.peer_requirements.push(mk_peer_req(
+                consumer,
+                "react",
+                CanonicalKey::npm("react"),
+                range,
+                false,
+            ));
+        }
+
+        let info_arc = mk_info_arc(&["18.2.0", "17.0.2"], &[]);
+        let synth = drain_peer_requirements_one_pass(&mut state, true, |_canonical| {
+            let info = info_arc.clone();
+            async move { Ok(info) }
+        })
+        .await
+        .expect("majority-satisfiable conflict should NOT hard-error");
+
+        assert_eq!(synth.len(), 1);
+        assert!(
+            synth[0]
+                .range
+                .satisfies(&NpmVersion::parse("18.2.0").unwrap()),
+            "majority pick is the newest version satisfying the most consumers"
+        );
+        assert_eq!(state.peer_conflicts.len(), 1);
+        let report = &state.peer_conflicts[0];
+        assert_eq!(report.chosen_version, "18.2.0");
+        assert_eq!(report.unsatisfied_consumers.len(), 1);
+        assert_eq!(report.unsatisfied_consumers[0].0, "legacy");
     }
 
     #[tokio::test]
