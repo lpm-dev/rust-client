@@ -340,9 +340,16 @@ fn extract_version(source: Source, body: &serde_json::Value) -> Result<String, L
 /// Cascade rules:
 /// - npm success → return immediately, GitHub never contacted.
 /// - npm transport / HTTP failure → try GitHub. If GitHub succeeds, the
-///   user sees a successful update check; if both fail, the npm error
-///   is reported (it's the primary path and the more actionable one for
-///   most users — github failures often need a token).
+///   user sees a successful update check.
+/// - both legs fail → return the **more actionable** of the two errors:
+///   GitHub's `RateLimited` (carries a structured reset hint and pairs
+///   with the `LpmError::SelfUpdateRateLimited` UX wrapper) wins over
+///   the generic npm transport / HTTP failure. Without this rule the
+///   rate-limit surface that ships in this PR was unreachable end-to-end:
+///   the only way the GitHub-only `RateLimited` variant gets constructed
+///   is the fallback leg, and the cascade would always pin the npm error
+///   instead. Anything else (npm transport vs GitHub HTTP 5xx, etc.)
+///   defaults to the npm error since npm is the primary path.
 /// - npm `MalformedResponse` → also fall back to GitHub. A malformed
 ///   primary shouldn't block updates if the fallback works.
 pub async fn probe_release(cache: &mut UpdateCache) -> Result<FetchOutcome, LookupError> {
@@ -353,8 +360,22 @@ pub async fn probe_release(cache: &mut UpdateCache) -> Result<FetchOutcome, Look
 
     match probe_one(Source::GitHub, cache).await {
         Ok(outcome) => Ok(outcome),
-        Err(_gh_err) => Err(npm_err),
+        Err(gh_err) => Err(prefer_more_actionable(npm_err, gh_err)),
     }
+}
+
+/// Pick the error that's more useful to surface to the user when both
+/// probe legs failed. Split out so the policy is unit-testable without
+/// wiremock and so the rule itself is named for future readers.
+fn prefer_more_actionable(npm_err: LookupError, gh_err: LookupError) -> LookupError {
+    // RateLimited is GitHub-only and carries a typed reset hint plus a
+    // dedicated `LpmError::SelfUpdateRateLimited` wrapper with help
+    // text. It's strictly more actionable than the npm-side
+    // alternatives we'd otherwise return, so it wins.
+    if matches!(gh_err, LookupError::RateLimited { .. }) {
+        return gh_err;
+    }
+    npm_err
 }
 
 /// Probe a single release source. On success, mutates `cache` with the
@@ -1081,8 +1102,8 @@ mod tests {
         .await;
     }
 
-    /// End-to-end cascade test: when both probes fail, the npm error is
-    /// reported (it's the primary path).
+    /// End-to-end cascade test: when both probes fail with non-rate-limit
+    /// errors, the npm error is reported (it's the primary path).
     #[tokio::test]
     async fn probe_release_reports_npm_error_when_both_fail() {
         use wiremock::matchers::{method, path};
@@ -1114,6 +1135,103 @@ mod tests {
             assert!(s.contains("503"), "expected primary npm error: {s}");
         })
         .await;
+    }
+
+    /// Cascade reachability for `LookupError::RateLimited`: when npm
+    /// fails (any non-rate-limit reason) AND GitHub returns a 403 with
+    /// `x-ratelimit-remaining: 0`, the user must see the GitHub
+    /// rate-limit error — NOT the generic npm error. Without this
+    /// preference rule the entire `SelfUpdateRateLimited` UX surface
+    /// ships dead: the only way `RateLimited` gets constructed is the
+    /// GitHub leg, and the npm-error-wins cascade would shadow it on
+    /// every two-leg failure that hits a rate limit on the fallback.
+    #[tokio::test]
+    async fn probe_release_surfaces_github_rate_limit_over_npm_failure() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let npm = MockServer::start().await;
+        let gh = MockServer::start().await;
+
+        // npm leg: generic 503 — could equally be transport error or
+        // 5xx, none carry a structured remediation.
+        Mock::given(method("GET"))
+            .and(path("/@lpm-registry/cli/latest"))
+            .respond_with(ResponseTemplate::new(503).set_body_string("npm temporarily down"))
+            .mount(&npm)
+            .await;
+
+        // GitHub leg: 403 with the primary-rate-limit headers so the
+        // wrapper surfaces `LpmError::SelfUpdateRateLimited` with
+        // GITHUB_TOKEN help text — the payoff of running the cascade
+        // in this order.
+        let reset_at = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs()
+            + 600;
+        let reset_at_header = reset_at.to_string();
+        Mock::given(method("GET"))
+            .and(path("/repos/lpm-dev/rust-client/releases/latest"))
+            .respond_with(
+                ResponseTemplate::new(403)
+                    .insert_header("x-ratelimit-remaining", "0")
+                    .insert_header("x-ratelimit-reset", reset_at_header.as_str())
+                    .set_body_string("rate limited"),
+            )
+            .mount(&gh)
+            .await;
+
+        let npm_url = format!("{}/@lpm-registry/cli/latest", npm.uri());
+        let gh_url = format!("{}/repos/lpm-dev/rust-client/releases/latest", gh.uri());
+        with_env_overrides(&npm_url, &gh_url, async {
+            let mut cache = UpdateCache::default();
+            let err = probe_release(&mut cache).await.expect_err("both legs fail");
+            assert!(
+                matches!(err, LookupError::RateLimited { .. }),
+                "expected RateLimited to win the cascade, got {err:?}"
+            );
+            let LookupError::RateLimited { reset_at: got } = err else {
+                unreachable!()
+            };
+            assert_eq!(
+                got,
+                Some(reset_at),
+                "x-ratelimit-reset must round-trip from the GitHub leg"
+            );
+        })
+        .await;
+    }
+
+    /// Pure unit test for the cascade preference rule. Locks the
+    /// "RateLimited wins, otherwise npm wins" policy independently of
+    /// the wiremock end-to-end so a future refactor that inverts the
+    /// rule fails this small focused test first.
+    #[test]
+    fn prefer_more_actionable_picks_github_rate_limit_over_npm_error() {
+        let npm = LookupError::HttpStatus {
+            status: 503,
+            body_excerpt: "npm down".into(),
+        };
+        let gh = LookupError::RateLimited {
+            reset_at: Some(1_700_000_600),
+        };
+        let chosen = prefer_more_actionable(npm, gh);
+        assert!(matches!(chosen, LookupError::RateLimited { .. }));
+    }
+
+    #[test]
+    fn prefer_more_actionable_picks_npm_when_github_is_not_rate_limited() {
+        let npm = LookupError::Transport("npm dns failed".into());
+        let gh = LookupError::HttpStatus {
+            status: 500,
+            body_excerpt: "gh down".into(),
+        };
+        let chosen = prefer_more_actionable(npm, gh);
+        // npm is the primary; non-rate-limit GitHub failure does not
+        // displace it.
+        let s = chosen.to_string();
+        assert!(s.contains("npm dns failed"), "expected npm error: {s}");
     }
 
     /// Helper: set npm + GitHub URL overrides for the duration of an
