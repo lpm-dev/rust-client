@@ -399,6 +399,7 @@ fn is_npm_managed(components: &[&str]) -> bool {
         ".volta", // Volta install root (`~/.volta`)
         ".fnm",   // fnm install root (`~/.fnm`)
         ".asdf",  // asdf install root (`~/.asdf`)
+        ".n",     // `n` install root with custom `N_PREFIX=~/.n`
         "nvm",    // nvm shared-install variants
         "volta",  // Volta shared-install variants
         "fnm",    // fnm shared-install variants
@@ -412,6 +413,17 @@ fn is_npm_managed(components: &[&str]) -> bool {
     // Requiring both avoids matching pnpm's content-addressable store
     // (e.g. `~/.pnpm-store/...`), which is not a global-install root.
     if has("pnpm") && has("global") {
+        return true;
+    }
+
+    // The `n` version manager's default install layout has BOTH `n`
+    // and `versions` as path components — e.g.
+    // `/usr/local/n/versions/node/20.0.0/bin/lpm` (system) or
+    // `~/n/versions/node/20.0.0/bin/lpm` (default `N_PREFIX=$HOME`).
+    // Bare `n` alone would be too aggressive (matches any folder
+    // literally named `n`); requiring `versions` as well anchors the
+    // match to n's actual directory shape.
+    if has("n") && has("versions") {
         return true;
     }
 
@@ -612,6 +624,16 @@ mod tests {
                 "/Users/x/.asdf/installs/nodejs/20.0.0/bin/lpm",
                 InstallMethod::Npm,
             ),
+            // `n` version manager — three real-world layouts. Pre-fix,
+            // these fell through to Standalone, so self-update would
+            // overwrite n's binary tree with a GitHub Releases
+            // download instead of going through `npm install -g`.
+            ("/Users/x/.n/bin/lpm", InstallMethod::Npm),
+            ("/Users/x/n/versions/node/20.0.0/bin/lpm", InstallMethod::Npm),
+            (
+                "/usr/local/n/versions/node/20.0.0/bin/lpm",
+                InstallMethod::Npm,
+            ),
             // pnpm global (requires BOTH `pnpm` and `global` segments)
             (
                 "/Users/x/.local/share/pnpm/global/5/node_modules/@lpm-registry/cli/lpm-bin",
@@ -643,6 +665,23 @@ mod tests {
         assert_eq!(
             detect_install_method_from_path(Some(p)),
             InstallMethod::Standalone,
+        );
+    }
+
+    /// Bare `n` component without `versions` must NOT classify as
+    /// Npm. The `n` version manager's directory layout always has
+    /// both segments, so a stray folder named `n` (project source,
+    /// initial of a username, etc.) doesn't get misclassified.
+    #[test]
+    fn detect_install_method_bare_n_without_versions_is_standalone() {
+        use std::path::Path;
+        // No `versions` segment — could be a project folder named `n`,
+        // not the n version manager.
+        let p = Path::new("/Users/x/projects/n/bin/lpm");
+        assert_eq!(
+            detect_install_method_from_path(Some(p)),
+            InstallMethod::Standalone,
+            "bare `n` segment without `versions` must not classify as Npm"
         );
     }
 
