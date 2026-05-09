@@ -7,7 +7,7 @@
 //! coloured notice formatter.
 
 use crate::release_lookup::{
-    default_cache_path, is_newer_semver, is_stale as base_is_stale, probe_github, read_cache_at,
+    default_cache_path, is_newer_semver, is_stale as base_is_stale, probe_release, read_cache_at,
     write_cache_at,
 };
 use owo_colors::OwoColorize;
@@ -65,11 +65,14 @@ pub async fn refresh_cache_now() {
     };
 
     let mut cache = read_cache_at(&path).unwrap_or_default();
-    // `probe_github` mutates `cache` in-place on every outcome:
+    // `probe_release` mutates `cache` in-place on every outcome:
     // fresh / not-modified bumps `last_check`; failure bumps
     // `last_failure_check`. Either way, persist so the next
     // invocation's staleness gate sees the new state.
-    let _ = probe_github(&mut cache).await;
+    //
+    // npm registry is the primary source; GitHub Releases is the
+    // fallback. See `release_lookup::probe_release` for cascade rules.
+    let _ = probe_release(&mut cache).await;
     let _ = write_cache_at(&path, &cache);
 }
 
