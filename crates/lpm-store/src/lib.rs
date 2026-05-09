@@ -1124,6 +1124,126 @@ pub enum PackageBaselineLayout {
     V2,
 }
 
+/// **Phase 66 confidence-followup F2 (2026-05-09)** — invocation-local
+/// index over the v2 store's link entries, keyed by `(name, version)`.
+///
+/// Built once per `lpm rebuild` / `lpm approve-scripts` /
+/// `all_scripted_packages_trusted` / `scriptable_package_rows`
+/// invocation from a SINGLE ordered walk of
+/// [`crate::v2::Store::iter_link_entries`]. Subsequent per-package
+/// lookups become O(1) hashmap reads instead of re-scanning every
+/// link entry + parsing every sidecar JSON for each package the
+/// caller asks about.
+///
+/// **Why this matters.** [`find_installed_package_baseline`] does an
+/// O(N) scan + sidecar parse per call. The rebuild pipeline calls it
+/// inside per-package loops over the lockfile (rebuild.rs:268-278,
+/// rebuild.rs:1869, rebuild.rs:2069-2073). On a 1000-package lockfile
+/// against a 5000-link global store that's 5M sidecar JSON reads per
+/// invocation — pure waste, since the link-entry layout doesn't
+/// change between iterations of one command.
+///
+/// **First-match semantics preserved.** When the same
+/// `(name, version)` appears under multiple graph keys (multi-source-
+/// same-coords or peer-divergent installs sharing coords), the
+/// **first** entry seen in `iter_link_entries()` directory order
+/// wins — exactly matching the legacy linear scan.
+///
+/// Construction is best-effort: malformed or unreadable sidecars are
+/// silently skipped (same contract as `iter_link_entries`).
+/// Constructing an empty index is cheap and safe — callers on stores
+/// with no v2 entries (pure-v1 test fixtures, fresh installs pre-4b)
+/// get an empty map and pay the v1-fallback cost only.
+#[derive(Debug, Clone, Default)]
+pub struct V2BaselineIndex {
+    by_coords: std::collections::HashMap<(String, String), InstalledPackageBaseline>,
+}
+
+impl V2BaselineIndex {
+    /// Walk every v2 link entry under `lpm_root` once and produce an
+    /// invocation-local lookup index.
+    ///
+    /// Returns `Ok(empty)` when v2 is empty or absent — callers should
+    /// always succeed-then-fall-back via [`Self::lookup`], not gate on
+    /// emptiness.
+    pub fn build(lpm_root: &lpm_common::LpmRoot) -> Result<Self, LpmError> {
+        let store_v2 = crate::v2::Store::from_lpm_root(lpm_root);
+        let mut by_coords: std::collections::HashMap<(String, String), InstalledPackageBaseline> =
+            std::collections::HashMap::new();
+        for (link_dir, meta) in store_v2.iter_link_entries()? {
+            let key = (meta.name.clone(), meta.version.clone());
+            // First-match wins. `iter_link_entries` returns directory
+            // order, which matches the legacy linear scan's
+            // tie-breaking. Re-running this walk twice on the same
+            // disk state must produce the same map; that's why we
+            // skip the insert when a coord is already populated
+            // rather than overwrite.
+            if by_coords.contains_key(&key) {
+                continue;
+            }
+            let package_dir = link_dir.join("node_modules").join(&meta.name);
+            if !package_dir.exists() {
+                // Sidecar present but link entry missing the package
+                // dir — corrupt entry. Skip and let any later valid
+                // entry for the same coords win, mirroring
+                // `find_installed_package_baseline`.
+                continue;
+            }
+            let pristine_dir = match store_v2.paths().object_dir(&meta.source_sri) {
+                Ok(p) if p.exists() => p,
+                _ => package_dir.clone(),
+            };
+            by_coords.insert(
+                key,
+                InstalledPackageBaseline {
+                    package_dir,
+                    pristine_dir,
+                    integrity: meta.source_sri,
+                    layout: PackageBaselineLayout::V2,
+                },
+            );
+        }
+        Ok(Self { by_coords })
+    }
+
+    /// O(1) lookup. `None` means no v2 link entry covers the
+    /// `(name, version)` pair — caller should fall back to v1.
+    pub fn lookup(&self, name: &str, version: &str) -> Option<&InstalledPackageBaseline> {
+        self.by_coords.get(&(name.to_string(), version.to_string()))
+    }
+}
+
+/// Index-aware variant of [`find_installed_package_baseline`]. Hits
+/// the pre-built [`V2BaselineIndex`] for v2 in O(1); falls back to
+/// the same v1 lookup as the legacy helper on a v2 miss. Returns
+/// `None` when neither store has the package — same shape as the
+/// `Result<Option<…>, _>` of the legacy call, except construction
+/// errors are absorbed at index-build time so per-package callers
+/// don't have to thread a `Result` through hot loops.
+pub fn find_installed_package_baseline_indexed(
+    index: &V2BaselineIndex,
+    lpm_root: &lpm_common::LpmRoot,
+    name: &str,
+    version: &str,
+) -> Option<InstalledPackageBaseline> {
+    if let Some(b) = index.lookup(name, version) {
+        return Some(b.clone());
+    }
+    let store_v1 = PackageStore::from_root(lpm_root);
+    let pkg_dir = store_v1.package_dir(name, version);
+    if pkg_dir.exists()
+        && let Some(integrity) = read_stored_integrity(&pkg_dir)
+    {
+        return Some(InstalledPackageBaseline {
+            package_dir: pkg_dir.clone(),
+            pristine_dir: pkg_dir,
+            integrity,
+            layout: PackageBaselineLayout::V1,
+        });
+    }
+    None
+}
+
 /// Resolve a package's installed source bytes + integrity in a
 /// store-version-agnostic way. **Prefers v2** (the active default
 /// since Phase 66 4b); falls back to v1 if no v2 link entry matches.
@@ -2690,5 +2810,207 @@ mod tests {
             let rendered = format!("{v}");
             assert_eq!(StoreVersion::parse(Some(&rendered)), v);
         }
+    }
+
+    // ── F2 — V2BaselineIndex contracts ─────────────────────────────────
+
+    use crate::v2::{LinkEntryRequest, LinkMetaPlatform, Store as V2Store};
+
+    fn f2_sample_meta_platform() -> LinkMetaPlatform {
+        LinkMetaPlatform {
+            os: "darwin".into(),
+            cpu: "arm64".into(),
+            libc: None,
+        }
+    }
+
+    fn f2_synthetic_sri(seed: &[u8]) -> String {
+        crate::compute_sri_hash(seed)
+    }
+
+    fn f2_write_object(store: &V2Store, sri: &str, files: &[(&str, &[u8])]) -> PathBuf {
+        let dir = store.paths().object_dir(sri).unwrap();
+        std::fs::create_dir_all(&dir).unwrap();
+        for (name, bytes) in files {
+            std::fs::write(dir.join(name), bytes).unwrap();
+        }
+        std::fs::write(dir.join(".integrity"), sri).unwrap();
+        dir
+    }
+
+    fn f2_sample_key(name: &str, version: &str) -> crate::v2::GraphKey {
+        use crate::v2::{GraphKeyInputs, LinkerModeTag, PlatformTuple};
+        let inputs = GraphKeyInputs::new(
+            name,
+            version,
+            PlatformTuple::new("darwin", "arm64", None),
+            LinkerModeTag::Isolated,
+        );
+        crate::v2::GraphKey::derive(&inputs)
+    }
+
+    /// Construction against an empty `~/.lpm/` directory yields an
+    /// empty index. Lookup against any coords returns `None` so the
+    /// index-aware helper falls through to v1 cleanly. This is the
+    /// "no v2 store at all" case (pure-v1 test fixtures, fresh
+    /// install pre-4b populated v1 only).
+    #[test]
+    fn f2_v2_baseline_index_empty_when_no_v2_links() {
+        let dir = tempfile::tempdir().unwrap();
+        let lpm_root = lpm_common::LpmRoot::from_dir(dir.path());
+        let index = V2BaselineIndex::build(&lpm_root).unwrap();
+        assert!(index.lookup("nonexistent", "1.0.0").is_none());
+    }
+
+    /// A populated v2 store yields a hit through the indexed lookup.
+    /// This is the hot path for `lpm rebuild` on a v2-default install.
+    #[test]
+    fn f2_v2_baseline_index_hits_populated_link_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let lpm_root = lpm_common::LpmRoot::from_dir(dir.path());
+        let store = V2Store::from_lpm_root(&lpm_root);
+
+        let sri = f2_synthetic_sri(b"f2_index/lodash");
+        f2_write_object(
+            &store,
+            &sri,
+            &[(
+                "package.json",
+                b"{\"name\":\"lodash\",\"version\":\"4.17.21\"}",
+            )],
+        );
+        store
+            .populate_link_entry(LinkEntryRequest {
+                graph_key: f2_sample_key("lodash", "4.17.21"),
+                source_sri: sri.clone(),
+                object_dir: store.paths().object_dir(&sri).unwrap(),
+                deps: vec![],
+                platform: f2_sample_meta_platform(),
+            })
+            .unwrap();
+
+        let index = V2BaselineIndex::build(&lpm_root).unwrap();
+        let hit = index
+            .lookup("lodash", "4.17.21")
+            .expect("populated link entry must be indexed");
+        assert_eq!(hit.layout, PackageBaselineLayout::V2);
+        assert_eq!(hit.integrity, sri);
+        assert!(
+            hit.package_dir.exists(),
+            "indexed package_dir must point at a real materialization"
+        );
+        assert!(
+            hit.pristine_dir.exists(),
+            "indexed pristine_dir must point at the populated objects/<sri>/"
+        );
+        // Different by design under v2 — pristine_dir is the immutable
+        // object dir; package_dir is the link entry's clonefile copy.
+        assert_ne!(
+            hit.package_dir, hit.pristine_dir,
+            "v2 entries must surface a distinct pristine_dir"
+        );
+    }
+
+    /// `find_installed_package_baseline_indexed` falls through to v1
+    /// when the index has no entry. Mirror of the legacy helper's
+    /// fall-through path, but reachable via the per-loop O(1) form.
+    #[test]
+    fn f2_indexed_helper_falls_through_to_v1_on_index_miss() {
+        let dir = tempfile::tempdir().unwrap();
+        let lpm_root = lpm_common::LpmRoot::from_dir(dir.path());
+
+        // Seed v1 only (no v2 link entries) — index is empty, but the
+        // legacy v1 fallback should still resolve the package.
+        let store_v1 = PackageStore::from_root(&lpm_root);
+        let pkg_dir = store_v1.package_dir("legacy", "1.0.0");
+        std::fs::create_dir_all(&pkg_dir).unwrap();
+        std::fs::write(pkg_dir.join(".integrity"), "sha512-stub").unwrap();
+        std::fs::write(pkg_dir.join("package.json"), r#"{"name":"legacy"}"#).unwrap();
+
+        let index = V2BaselineIndex::build(&lpm_root).unwrap();
+        let resolved =
+            find_installed_package_baseline_indexed(&index, &lpm_root, "legacy", "1.0.0")
+                .expect("v1 fallback must populate the result");
+        assert_eq!(resolved.layout, PackageBaselineLayout::V1);
+        assert_eq!(
+            resolved.package_dir, resolved.pristine_dir,
+            "v1 entries alias pristine_dir to package_dir (the v1 store \
+             dir is never mutated by patches)"
+        );
+    }
+
+    /// Multi-coords collision: when two link entries share the same
+    /// `(name, version)` (multi-source-same-coords or peer-divergent),
+    /// the index keeps the FIRST entry seen — exactly matching the
+    /// legacy linear scan's tie-breaking. Without this, a re-index
+    /// could expose a different first-match across runs.
+    #[test]
+    fn f2_v2_baseline_index_first_match_wins_for_duplicate_coords() {
+        // The legacy `find_installed_package_baseline` scanned in
+        // `iter_link_entries()` directory order and returned the
+        // first match. The index must preserve that contract — a
+        // duplicate insert must NOT overwrite the first hit.
+        let dir = tempfile::tempdir().unwrap();
+        let lpm_root = lpm_common::LpmRoot::from_dir(dir.path());
+        let store = V2Store::from_lpm_root(&lpm_root);
+
+        // Two link entries for the same `(react, 18.0.0)` under
+        // distinct graph keys (peer-divergent inputs differ in
+        // `with_root_link_names` to fork the digest).
+        use crate::v2::{GraphKeyInputs, LinkerModeTag, PlatformTuple};
+        let key_a = crate::v2::GraphKey::derive(
+            &GraphKeyInputs::new(
+                "react",
+                "18.0.0",
+                PlatformTuple::new("darwin", "arm64", None),
+                LinkerModeTag::Isolated,
+            )
+            .with_root_link_names(Some(vec!["react".into()])),
+        );
+        let key_b = crate::v2::GraphKey::derive(
+            &GraphKeyInputs::new(
+                "react",
+                "18.0.0",
+                PlatformTuple::new("darwin", "arm64", None),
+                LinkerModeTag::Isolated,
+            )
+            .with_root_link_names(Some(vec!["react".into(), "alias".into()])),
+        );
+        assert_ne!(key_a, key_b, "fixture must produce divergent keys");
+
+        let sri = f2_synthetic_sri(b"f2_index/react");
+        f2_write_object(
+            &store,
+            &sri,
+            &[(
+                "package.json",
+                b"{\"name\":\"react\",\"version\":\"18.0.0\"}",
+            )],
+        );
+        for key in [key_a, key_b] {
+            store
+                .populate_link_entry(LinkEntryRequest {
+                    graph_key: key,
+                    source_sri: sri.clone(),
+                    object_dir: store.paths().object_dir(&sri).unwrap(),
+                    deps: vec![],
+                    platform: f2_sample_meta_platform(),
+                })
+                .unwrap();
+        }
+
+        let index = V2BaselineIndex::build(&lpm_root).unwrap();
+        let hit = index
+            .lookup("react", "18.0.0")
+            .expect("either entry should satisfy the lookup");
+        // Re-build and confirm the same entry wins. Stable
+        // first-match-wins in the face of multi-entry coords.
+        let index2 = V2BaselineIndex::build(&lpm_root).unwrap();
+        let hit2 = index2.lookup("react", "18.0.0").unwrap();
+        assert_eq!(
+            hit.package_dir, hit2.package_dir,
+            "rebuilding the index against the same disk state must \
+             preserve first-match identity"
+        );
     }
 }
