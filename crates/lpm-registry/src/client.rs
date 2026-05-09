@@ -923,6 +923,16 @@ impl RegistryClient {
         self.http.render_effective_tls_summary()
     }
 
+    /// Phase 58.3 — read access to the underlying [`HttpClients`]
+    /// bundle. Exposed primarily for integration tests that need
+    /// pointer-identity assertions on the dispatch path
+    /// (`for_url_no_build`'s borrow). Production code should use
+    /// the higher-level request methods on [`RegistryClient`]; this
+    /// accessor is intentionally read-only.
+    pub fn http(&self) -> &HttpClients {
+        &self.http
+    }
+
     /// Phase 43 — returns true if the URL's origin matches one of
     /// the origins this client is configured to talk to (the LPM
     /// `base_url` or the npm `npm_registry_url`). Used by
