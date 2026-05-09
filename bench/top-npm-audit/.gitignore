@@ -1,0 +1,3 @@
+# Generated fixtures — regenerate with `bash generate.sh`.
+# Stored under bench/audit-fixtures/top-npm/ to reuse the existing
+# audit harness without modification.
