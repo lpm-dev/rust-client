@@ -234,6 +234,7 @@ fn build_client(cfg: ClientConfig, ca_pem: &str) -> RegistryClient {
                     line: 1,
                 }],
                 strict_ssl: None,
+                ..Default::default()
             };
             base.with_tls_overrides(&tls).expect("builder ok")
         }
@@ -245,6 +246,7 @@ fn build_client(cfg: ClientConfig, ca_pem: &str) -> RegistryClient {
                     source: "test:.npmrc".into(),
                     line: 1,
                 }),
+                ..Default::default()
             };
             base.with_tls_overrides(&tls).expect("builder ok")
         }

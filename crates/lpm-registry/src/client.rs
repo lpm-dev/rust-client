@@ -8003,6 +8003,7 @@ mod tests {
                 source: "test".into(),
                 line: 1,
             }),
+            ..Default::default()
         };
         let client = RegistryClient::new();
         assert!(client.with_tls_overrides(&tls).is_ok());
@@ -8018,6 +8019,7 @@ mod tests {
                 line: 1,
             }],
             strict_ssl: None,
+            ..Default::default()
         };
         let client = RegistryClient::new();
         assert!(client.with_tls_overrides(&tls).is_ok());
@@ -8046,6 +8048,7 @@ mod tests {
                 line: 7,
             }],
             strict_ssl: None,
+            ..Default::default()
         };
         let client = RegistryClient::new();
         match client.with_tls_overrides(&tls) {
@@ -8073,6 +8076,7 @@ mod tests {
                 source: "test".into(),
                 line: 1,
             }),
+            ..Default::default()
         };
         let client = RegistryClient::new();
         assert!(client.with_tls_overrides(&tls).is_ok());
@@ -8094,6 +8098,7 @@ mod tests {
                 source: "test".into(),
                 line: 2,
             }),
+            ..Default::default()
         };
         let client = RegistryClient::new();
         assert!(client.with_tls_overrides(&tls).is_ok());
@@ -8120,6 +8125,7 @@ mod tests {
                 line: 12,
             }],
             strict_ssl: None,
+            ..Default::default()
         };
         let client = RegistryClient::new();
         match client.with_tls_overrides(&tls) {
@@ -8153,6 +8159,7 @@ mod tests {
                 line: 1,
             }],
             strict_ssl: None,
+            ..Default::default()
         };
         let client = RegistryClient::new();
         assert!(
