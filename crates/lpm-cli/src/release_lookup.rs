@@ -150,6 +150,14 @@ impl std::fmt::Display for LookupError {
     }
 }
 
+/// Public form of `format_reset_hint` used by callers building the body
+/// of a `LpmError::SelfUpdateRateLimited` message. The user-visible
+/// shape is identical to the inline `Display` rendering — drift between
+/// the two would confuse anyone comparing CLI output across versions.
+pub fn format_rate_limit_summary(reset_at: u64) -> String {
+    format!("GitHub fallback rate-limited. {}", format_reset_hint(reset_at))
+}
+
 /// Render `x-ratelimit-reset` (unix epoch) as a "try again in N min/sec"
 /// hint relative to the current wall clock.
 fn format_reset_hint(reset_at: u64) -> String {
