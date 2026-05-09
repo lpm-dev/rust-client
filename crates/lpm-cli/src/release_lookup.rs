@@ -1,4 +1,4 @@
-//! Shared GitHub Releases lookup with on-disk cache.
+//! Release version lookup with on-disk cache.
 //!
 //! Two consumers share this module:
 //! - `update_check` — background banner refresh (24h success TTL).
@@ -7,21 +7,53 @@
 //! Both read and write the same file (`~/.lpm/update-check.json`) so an
 //! explicit `lpm self-update` doubles as a banner refresh.
 //!
-//! Network calls go through a single helper that:
-//! - Sends `If-None-Match` from the cached etag (304 → reuse cached version).
-//! - Honours `GITHUB_TOKEN` / `GH_TOKEN` (60→5000 req/hr).
-//! - Maps 403 + `x-ratelimit-remaining: 0` to a typed rate-limit error
-//!   carrying the reset epoch from `x-ratelimit-reset`.
-//! - Stamps `last_failure_check` on every failed attempt so the staleness
-//!   gate backs off offline / rate-limited callers instead of forking a
-//!   doomed background child on every invocation.
+//! Two probe sources are tried in order:
+//!
+//! 1. **npm registry** (`registry.npmjs.org/@lpm-registry/cli/latest`) —
+//!    anonymous, no rate limit in practice, used by every install
+//!    channel. The npm `latest` dist-tag stays in lockstep with our
+//!    GitHub Releases, so version reporting is identical regardless of
+//!    how the user installed `lpm`.
+//! 2. **GitHub Releases** — fallback only, when npm is unreachable. The
+//!    primary problem this fixes: every channel used to share a single
+//!    60 req/hr unauthenticated GitHub IP bucket and rate-limit each
+//!    other.
+//!
+//! Each probe sends `If-None-Match` from a per-source cached etag
+//! (304 → reuse cached version). The GitHub probe additionally honours
+//! `GITHUB_TOKEN` / `GH_TOKEN` (60→5000 req/hr) and maps 403 +
+//! `x-ratelimit-remaining: 0` to a typed rate-limit error carrying the
+//! reset epoch from `x-ratelimit-reset`. Any failure stamps
+//! `last_failure_check` so the staleness gate backs off offline /
+//! rate-limited callers instead of forking a doomed background child on
+//! every invocation.
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-const GITHUB_RELEASES_URL: &str =
+const NPM_REGISTRY_URL_DEFAULT: &str = "https://registry.npmjs.org/@lpm-registry/cli/latest";
+const GITHUB_RELEASES_URL_DEFAULT: &str =
     "https://api.github.com/repos/lpm-dev/rust-client/releases/latest";
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Resolve the npm registry endpoint. Honours
+/// `LPM_NPM_REGISTRY_URL_OVERRIDE` so tests (and users behind a private
+/// npm mirror) can redirect the probe without a binary rebuild.
+fn npm_registry_url() -> String {
+    std::env::var("LPM_NPM_REGISTRY_URL_OVERRIDE")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| NPM_REGISTRY_URL_DEFAULT.to_string())
+}
+
+/// Resolve the GitHub Releases endpoint. Honours
+/// `LPM_GITHUB_RELEASES_URL_OVERRIDE` for tests.
+fn github_releases_url() -> String {
+    std::env::var("LPM_GITHUB_RELEASES_URL_OVERRIDE")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| GITHUB_RELEASES_URL_DEFAULT.to_string())
+}
 
 /// Cache file shape. All fields beyond `latest` / `last_check` are
 /// optional so the original `{latest, lastCheck}` JSON written by the
@@ -42,11 +74,19 @@ pub struct UpdateCache {
     #[serde(rename = "lastFailureCheck", default, skip_serializing_if = "is_zero")]
     pub last_failure_check: u64,
 
-    /// Cached `ETag` from the most recent successful response.
-    /// Sent as `If-None-Match` on the next probe so a 304 reuses the
-    /// stored `latest` without re-downloading the JSON.
+    /// Cached `ETag` from the most recent successful GitHub Releases
+    /// response. Sent as `If-None-Match` on the next GitHub probe so a
+    /// 304 reuses the stored `latest` without re-downloading the JSON.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub etag: String,
+
+    /// Cached `ETag` from the most recent successful npm registry
+    /// response. Tracked separately from `etag` because npm and GitHub
+    /// generate etags from independent storage backends — sending an
+    /// npm-shaped etag to GitHub (or vice versa) would either be
+    /// ignored or yield a spurious 304 against the wrong body.
+    #[serde(rename = "npmEtag", default, skip_serializing_if = "String::is_empty")]
+    pub npm_etag: String,
 }
 
 fn is_zero(v: &u64) -> bool {
@@ -80,32 +120,38 @@ pub enum LookupError {
 
 impl std::fmt::Display for LookupError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Body framing concerns:
+        // - `LookupError` is shared by the npm and GitHub probe paths,
+        //   so source-specific wording ("GitHub API …") only appears
+        //   on variants that can ONLY come from the GitHub leg
+        //   (`RateLimited`). Source-agnostic variants stay neutral.
+        // - The `GITHUB_TOKEN` / `GH_TOKEN` remediation hint that used
+        //   to live here moved into the wrapping
+        //   `LpmError::SelfUpdateRateLimited` miette help text. Repeating
+        //   it here would print the same instruction twice on screen.
         match self {
             Self::Transport(msg) => write!(f, "network error: {msg}"),
             Self::RateLimited { reset_at } => match reset_at {
-                Some(epoch) => write!(
-                    f,
-                    "GitHub API rate limit hit. {}. \
-					 Set GITHUB_TOKEN or GH_TOKEN for 5000 req/hr (vs 60 unauthenticated).",
-                    format_reset_hint(*epoch)
-                ),
-                None => write!(
-                    f,
-                    "GitHub API rate limit hit. \
-					 Set GITHUB_TOKEN or GH_TOKEN for 5000 req/hr (vs 60 unauthenticated)."
-                ),
+                Some(epoch) => {
+                    write!(
+                        f,
+                        "GitHub API rate limit hit. {}",
+                        format_reset_hint(*epoch)
+                    )
+                }
+                None => write!(f, "GitHub API rate limit hit"),
             },
             Self::HttpStatus {
                 status,
                 body_excerpt,
             } => {
                 if body_excerpt.is_empty() {
-                    write!(f, "GitHub API returned HTTP {status}")
+                    write!(f, "release lookup returned HTTP {status}")
                 } else {
-                    write!(f, "GitHub API returned HTTP {status}: {body_excerpt}")
+                    write!(f, "release lookup returned HTTP {status}: {body_excerpt}")
                 }
             }
-            Self::MalformedResponse(msg) => write!(f, "malformed GitHub response: {msg}"),
+            Self::MalformedResponse(msg) => write!(f, "malformed release-lookup response: {msg}"),
         }
     }
 }
@@ -257,13 +303,88 @@ fn github_token() -> Option<String> {
         .filter(|t| !t.is_empty())
 }
 
-/// Probe GitHub Releases. On success, mutates `cache` with the fresh
-/// version + new etag + bumps `last_check`. On 304, just bumps
-/// `last_check` (cached version stays). On any failure, bumps
-/// `last_failure_check` and returns the typed error.
+/// Which release source we're probing. Drives both the etag slot in
+/// the cache and the version-extraction shape of the response.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Source {
+    Npm,
+    GitHub,
+}
+
+/// Pull the version string out of the parsed JSON for a given source.
+///
+/// Split out as a pure function so the parsing contract is unit-testable
+/// without spinning up wiremock — the failure modes here (missing field,
+/// empty value, non-string type) historically cause silent regressions
+/// when a registry tweaks its response shape.
+fn extract_version(source: Source, body: &serde_json::Value) -> Result<String, LookupError> {
+    match source {
+        Source::Npm => match body.get("version").and_then(|v| v.as_str()) {
+            Some(v) if !v.is_empty() => Ok(v.to_string()),
+            _ => Err(LookupError::MalformedResponse(
+                "missing version on npm registry response".into(),
+            )),
+        },
+        Source::GitHub => match body.get("tag_name").and_then(|v| v.as_str()) {
+            Some(t) if !t.is_empty() => Ok(t.strip_prefix('v').unwrap_or(t).to_string()),
+            _ => Err(LookupError::MalformedResponse(
+                "missing tag_name on github releases response".into(),
+            )),
+        },
+    }
+}
+
+/// Try the npm registry first, fall back to GitHub Releases. The
+/// foreground command and the background banner refresh both call this.
+///
+/// Cascade rules:
+/// - npm success → return immediately, GitHub never contacted.
+/// - npm transport / HTTP failure → try GitHub. If GitHub succeeds, the
+///   user sees a successful update check.
+/// - both legs fail → return the **more actionable** of the two errors:
+///   GitHub's `RateLimited` (carries a structured reset hint and pairs
+///   with the `LpmError::SelfUpdateRateLimited` UX wrapper) wins over
+///   the generic npm transport / HTTP failure. Without this rule the
+///   rate-limit surface that ships in this PR was unreachable end-to-end:
+///   the only way the GitHub-only `RateLimited` variant gets constructed
+///   is the fallback leg, and the cascade would always pin the npm error
+///   instead. Anything else (npm transport vs GitHub HTTP 5xx, etc.)
+///   defaults to the npm error since npm is the primary path.
+/// - npm `MalformedResponse` → also fall back to GitHub. A malformed
+///   primary shouldn't block updates if the fallback works.
+pub async fn probe_release(cache: &mut UpdateCache) -> Result<FetchOutcome, LookupError> {
+    let npm_err = match probe_one(Source::Npm, cache).await {
+        Ok(outcome) => return Ok(outcome),
+        Err(e) => e,
+    };
+
+    match probe_one(Source::GitHub, cache).await {
+        Ok(outcome) => Ok(outcome),
+        Err(gh_err) => Err(prefer_more_actionable(npm_err, gh_err)),
+    }
+}
+
+/// Pick the error that's more useful to surface to the user when both
+/// probe legs failed. Split out so the policy is unit-testable without
+/// wiremock and so the rule itself is named for future readers.
+fn prefer_more_actionable(npm_err: LookupError, gh_err: LookupError) -> LookupError {
+    // RateLimited is GitHub-only and carries a typed reset hint plus a
+    // dedicated `LpmError::SelfUpdateRateLimited` wrapper with help
+    // text. It's strictly more actionable than the npm-side
+    // alternatives we'd otherwise return, so it wins.
+    if matches!(gh_err, LookupError::RateLimited { .. }) {
+        return gh_err;
+    }
+    npm_err
+}
+
+/// Probe a single release source. On success, mutates `cache` with the
+/// fresh version + the per-source etag + bumps `last_check`. On 304,
+/// just bumps `last_check` (cached version stays). On any failure,
+/// bumps `last_failure_check` and returns the typed error.
 ///
 /// Caller is responsible for persisting the cache via `write_cache_at`.
-pub async fn probe_github(cache: &mut UpdateCache) -> Result<FetchOutcome, LookupError> {
+async fn probe_one(source: Source, cache: &mut UpdateCache) -> Result<FetchOutcome, LookupError> {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
@@ -277,16 +398,32 @@ pub async fn probe_github(cache: &mut UpdateCache) -> Result<FetchOutcome, Looku
             LookupError::Transport(format!("failed to build HTTP client: {e}"))
         })?;
 
-    let mut req = client
-        .get(GITHUB_RELEASES_URL)
-        .header("User-Agent", "lpm-cli")
-        .header("Accept", "application/vnd.github.v3+json");
+    let url = match source {
+        Source::Npm => npm_registry_url(),
+        Source::GitHub => github_releases_url(),
+    };
 
-    if !cache.etag.is_empty() {
-        req = req.header("If-None-Match", &cache.etag);
+    let mut req = client.get(&url).header("User-Agent", "lpm-cli");
+
+    let cached_etag = match source {
+        Source::Npm => cache.npm_etag.clone(),
+        Source::GitHub => cache.etag.clone(),
+    };
+
+    match source {
+        Source::Npm => {
+            req = req.header("Accept", "application/json");
+        }
+        Source::GitHub => {
+            req = req.header("Accept", "application/vnd.github.v3+json");
+            if let Some(token) = github_token() {
+                req = req.header("Authorization", format!("Bearer {token}"));
+            }
+        }
     }
-    if let Some(token) = github_token() {
-        req = req.header("Authorization", format!("Bearer {token}"));
+
+    if !cached_etag.is_empty() {
+        req = req.header("If-None-Match", &cached_etag);
     }
 
     let resp = match req.send().await {
@@ -307,8 +444,11 @@ pub async fn probe_github(cache: &mut UpdateCache) -> Result<FetchOutcome, Looku
         });
     }
 
-    // 403 with primary rate limit: parse reset hint before returning.
-    if status.as_u16() == 403
+    // 403 with primary rate limit (GitHub-specific) — npm doesn't gate
+    // anonymous reads this way, so the rate-limit detection is scoped
+    // to the GitHub path.
+    if source == Source::GitHub
+        && status.as_u16() == 403
         && resp
             .headers()
             .get("x-ratelimit-remaining")
@@ -353,19 +493,21 @@ pub async fn probe_github(cache: &mut UpdateCache) -> Result<FetchOutcome, Looku
         }
     };
 
-    let tag = match body.get("tag_name").and_then(|v| v.as_str()) {
-        Some(t) if !t.is_empty() => t,
-        _ => {
+    let version = match extract_version(source, &body) {
+        Ok(v) => v,
+        Err(e) => {
             cache.last_failure_check = now;
-            return Err(LookupError::MalformedResponse("missing tag_name".into()));
+            return Err(e);
         }
     };
-    let version = tag.strip_prefix('v').unwrap_or(tag).to_string();
 
     cache.latest = version.clone();
     cache.last_check = now;
     cache.last_failure_check = 0;
-    cache.etag = etag;
+    match source {
+        Source::Npm => cache.npm_etag = etag,
+        Source::GitHub => cache.etag = etag,
+    }
 
     Ok(FetchOutcome::Fresh { version })
 }
@@ -441,10 +583,37 @@ mod tests {
             last_check: 1_700_000_000,
             last_failure_check: 0,
             etag: "W/\"abc123\"".into(),
+            npm_etag: "\"npm-xyz789\"".into(),
         };
         write_cache_at(&path, &cache).unwrap();
         let loaded = read_cache_at(&path).unwrap();
         assert_eq!(loaded, cache);
+    }
+
+    /// Per-source etags are persisted separately. Mixing them would
+    /// produce spurious 304s when the wrong endpoint receives the wrong
+    /// `If-None-Match`.
+    #[test]
+    fn npm_and_github_etags_round_trip_independently() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("update-check.json");
+        let cache = UpdateCache {
+            latest: "0.25.0".into(),
+            last_check: 1_700_000_000,
+            etag: "github-etag".into(),
+            npm_etag: "npm-etag".into(),
+            ..Default::default()
+        };
+        write_cache_at(&path, &cache).unwrap();
+        let raw = std::fs::read_to_string(&path).unwrap();
+        // Field name visibility: legacy `etag` for GitHub, `npmEtag`
+        // for npm. Locks the on-disk shape so a future struct rename
+        // doesn't silently break older cache files.
+        assert!(raw.contains("\"etag\":\"github-etag\""), "raw: {raw}");
+        assert!(raw.contains("\"npmEtag\":\"npm-etag\""), "raw: {raw}");
+        let loaded = read_cache_at(&path).unwrap();
+        assert_eq!(loaded.etag, "github-etag");
+        assert_eq!(loaded.npm_etag, "npm-etag");
     }
 
     #[test]
@@ -461,12 +630,14 @@ mod tests {
                 last_check: 1_700_000_000,
                 last_failure_check: 0,
                 etag: String::new(),
+                npm_etag: String::new(),
             },
         )
         .unwrap();
         let raw = std::fs::read_to_string(&path).unwrap();
         assert!(!raw.contains("lastFailureCheck"), "raw: {raw}");
         assert!(!raw.contains("etag"), "raw: {raw}");
+        assert!(!raw.contains("npmEtag"), "raw: {raw}");
     }
 
     #[test]
@@ -670,7 +841,18 @@ mod tests {
         let s = err.to_string();
         assert!(s.contains("rate limit"), "msg: {s}");
         assert!(s.contains("Try again in"), "msg: {s}");
-        assert!(s.contains("GITHUB_TOKEN"), "msg: {s}");
+        // GITHUB_TOKEN guidance must NOT live in the LookupError body
+        // any more — it's owned by the wrapping
+        // `LpmError::SelfUpdateRateLimited` miette help text.
+        // Duplicating it here would double-print on screen.
+        assert!(
+            !s.contains("GITHUB_TOKEN"),
+            "GITHUB_TOKEN hint must not duplicate the wrapper's help: {s}"
+        );
+        assert!(
+            !s.contains("GH_TOKEN"),
+            "GH_TOKEN hint must not duplicate the wrapper's help: {s}"
+        );
     }
 
     #[test]
@@ -678,6 +860,29 @@ mod tests {
         let s = LookupError::RateLimited { reset_at: None }.to_string();
         assert!(s.contains("rate limit"));
         assert!(!s.contains("Try again in"));
+        assert!(!s.contains("GITHUB_TOKEN"));
+    }
+
+    /// Rendered body must not carry stray tab characters from the
+    /// previous multi-line continuation. The pre-cleanup body had a
+    /// hard-tab indent inside the format string that surfaced as
+    /// `…minutes.\t\t\t\t Set GITHUB_TOKEN…` in the user's terminal.
+    #[test]
+    fn lookup_error_display_has_no_stray_whitespace_artifacts() {
+        let now = now_secs();
+        let with_reset = LookupError::RateLimited {
+            reset_at: Some(now + 600),
+        }
+        .to_string();
+        assert!(
+            !with_reset.contains('\t'),
+            "tab leaked into body: {with_reset:?}"
+        );
+        // Also: no double spaces from concatenation gone wrong.
+        assert!(
+            !with_reset.contains("  "),
+            "double space leaked into body: {with_reset:?}"
+        );
     }
 
     #[test]
@@ -689,6 +894,429 @@ mod tests {
         .to_string();
         assert!(s.contains("502"));
         assert!(s.contains("bad gateway"));
+        // Source-agnostic wording: `HttpStatus` can come from either
+        // the npm or GitHub probe leg, so the body must NOT pre-blame
+        // GitHub. The pre-cleanup wording attributed every HTTP error
+        // to "GitHub API" which lied for npm-leg failures.
+        assert!(
+            !s.contains("GitHub"),
+            "HttpStatus body must stay source-agnostic: {s}"
+        );
+    }
+
+    /// Same source-neutrality contract for `MalformedResponse` — both
+    /// probe legs construct it on parse failure, so the body must not
+    /// pre-blame either.
+    #[test]
+    fn lookup_error_display_malformed_is_source_agnostic() {
+        let s = LookupError::MalformedResponse("missing version".into()).to_string();
+        assert!(
+            !s.contains("GitHub") && !s.contains("npm"),
+            "MalformedResponse body must stay source-agnostic: {s}"
+        );
+        assert!(s.contains("missing version"));
+    }
+
+    /// npm registry response: extract `version`. Shape is `{ "name":
+    /// "@lpm-registry/cli", "version": "0.37.0", ... }`.
+    #[test]
+    fn extract_version_npm_happy_path() {
+        let body = serde_json::json!({
+            "name": "@lpm-registry/cli",
+            "version": "0.37.0",
+        });
+        let v = extract_version(Source::Npm, &body).unwrap();
+        assert_eq!(v, "0.37.0");
+    }
+
+    /// npm responses have a bare numeric version (no `v` prefix). The
+    /// strip-prefix branch is GitHub-only — verify we don't accidentally
+    /// strip the leading digit.
+    #[test]
+    fn extract_version_npm_does_not_strip_v_prefix() {
+        let body = serde_json::json!({ "version": "v0.37.0" });
+        let v = extract_version(Source::Npm, &body).unwrap();
+        assert_eq!(v, "v0.37.0", "npm version field is verbatim");
+    }
+
+    #[test]
+    fn extract_version_npm_missing_field_errors() {
+        let body = serde_json::json!({ "name": "@lpm-registry/cli" });
+        assert!(matches!(
+            extract_version(Source::Npm, &body),
+            Err(LookupError::MalformedResponse(_))
+        ));
+    }
+
+    #[test]
+    fn extract_version_npm_empty_field_errors() {
+        let body = serde_json::json!({ "version": "" });
+        assert!(matches!(
+            extract_version(Source::Npm, &body),
+            Err(LookupError::MalformedResponse(_))
+        ));
+    }
+
+    /// GitHub Releases response: extract `tag_name` and strip the `v`
+    /// prefix to match the user-facing semver.
+    #[test]
+    fn extract_version_github_strips_v_prefix() {
+        let body = serde_json::json!({ "tag_name": "v0.37.0" });
+        let v = extract_version(Source::GitHub, &body).unwrap();
+        assert_eq!(v, "0.37.0");
+    }
+
+    #[test]
+    fn extract_version_github_without_v_prefix() {
+        let body = serde_json::json!({ "tag_name": "0.37.0" });
+        let v = extract_version(Source::GitHub, &body).unwrap();
+        assert_eq!(v, "0.37.0");
+    }
+
+    #[test]
+    fn extract_version_github_missing_field_errors() {
+        let body = serde_json::json!({});
+        assert!(matches!(
+            extract_version(Source::GitHub, &body),
+            Err(LookupError::MalformedResponse(_))
+        ));
+    }
+
+    /// `LPM_NPM_REGISTRY_URL_OVERRIDE` lets tests and private-mirror
+    /// users redirect the probe. Empty string is treated as unset to
+    /// avoid blowing away the default if a script does
+    /// `export LPM_NPM_REGISTRY_URL_OVERRIDE=` on accident.
+    ///
+    /// Routes through the same `acquire_env_override_lock` as the
+    /// async wiremock tests so plain `cargo test` (parallel by default)
+    /// doesn't race this against them — a previous version held no
+    /// lock and reproduced GitHub rate-limit bleed-through during PR
+    /// #42 review.
+    #[test]
+    fn npm_registry_url_respects_override_env_var() {
+        let _restore = acquire_env_override_lock();
+        // SAFETY: lock held for the lifetime of `_restore`.
+        unsafe { std::env::set_var(NPM_OVERRIDE_KEY, "http://localhost:9999/foo") };
+        assert_eq!(npm_registry_url(), "http://localhost:9999/foo");
+        unsafe { std::env::set_var(NPM_OVERRIDE_KEY, "") };
+        assert_eq!(
+            npm_registry_url(),
+            NPM_REGISTRY_URL_DEFAULT,
+            "empty override falls back to default"
+        );
+        // `_restore`'s Drop runs at end of scope and rewinds env state.
+    }
+
+    /// End-to-end cascade test: when the npm primary returns a fresh
+    /// version, GitHub is never contacted. Counts requests against a
+    /// wiremock instance to prove it.
+    #[tokio::test]
+    async fn probe_release_uses_npm_primary_when_healthy() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let npm = MockServer::start().await;
+        let gh = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/@lpm-registry/cli/latest"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({ "version": "9.9.9" })),
+            )
+            .expect(1)
+            .mount(&npm)
+            .await;
+
+        // GitHub mock with `expect(0)` makes wiremock fail on drop if
+        // it ever receives a request — proves the cascade short-circuits.
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(500))
+            .expect(0)
+            .mount(&gh)
+            .await;
+
+        let npm_url = format!("{}/@lpm-registry/cli/latest", npm.uri());
+        let gh_url = format!("{}/repos/lpm-dev/rust-client/releases/latest", gh.uri());
+        with_env_overrides(&npm_url, &gh_url, async {
+            let mut cache = UpdateCache::default();
+            let outcome = probe_release(&mut cache).await.expect("npm probe ok");
+            assert_eq!(
+                outcome,
+                FetchOutcome::Fresh {
+                    version: "9.9.9".into()
+                }
+            );
+            assert_eq!(cache.latest, "9.9.9");
+            assert_ne!(cache.last_check, 0);
+            assert_eq!(cache.last_failure_check, 0);
+        })
+        .await;
+    }
+
+    /// End-to-end cascade test: when the npm primary fails (e.g. 503),
+    /// GitHub is contacted and a successful fallback response wins.
+    #[tokio::test]
+    async fn probe_release_falls_back_to_github_on_npm_failure() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let npm = MockServer::start().await;
+        let gh = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/@lpm-registry/cli/latest"))
+            .respond_with(ResponseTemplate::new(503))
+            .expect(1)
+            .mount(&npm)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path("/repos/lpm-dev/rust-client/releases/latest"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({ "tag_name": "v8.8.8" })),
+            )
+            .expect(1)
+            .mount(&gh)
+            .await;
+
+        let npm_url = format!("{}/@lpm-registry/cli/latest", npm.uri());
+        let gh_url = format!("{}/repos/lpm-dev/rust-client/releases/latest", gh.uri());
+        with_env_overrides(&npm_url, &gh_url, async {
+            let mut cache = UpdateCache::default();
+            let outcome = probe_release(&mut cache).await.expect("github fallback ok");
+            assert_eq!(
+                outcome,
+                FetchOutcome::Fresh {
+                    version: "8.8.8".into()
+                }
+            );
+            assert_eq!(cache.latest, "8.8.8");
+            // last_failure_check must end at 0: the cascade succeeded
+            // overall, even though the npm leg of it bumped the
+            // failure timestamp before the GitHub leg cleared it.
+            assert_eq!(cache.last_failure_check, 0);
+        })
+        .await;
+    }
+
+    /// End-to-end cascade test: when both probes fail with non-rate-limit
+    /// errors, the npm error is reported (it's the primary path).
+    #[tokio::test]
+    async fn probe_release_reports_npm_error_when_both_fail() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let npm = MockServer::start().await;
+        let gh = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/@lpm-registry/cli/latest"))
+            .respond_with(ResponseTemplate::new(503).set_body_string("npm down"))
+            .mount(&npm)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path("/repos/lpm-dev/rust-client/releases/latest"))
+            .respond_with(ResponseTemplate::new(500).set_body_string("gh down"))
+            .mount(&gh)
+            .await;
+
+        let npm_url = format!("{}/@lpm-registry/cli/latest", npm.uri());
+        let gh_url = format!("{}/repos/lpm-dev/rust-client/releases/latest", gh.uri());
+        with_env_overrides(&npm_url, &gh_url, async {
+            let mut cache = UpdateCache::default();
+            let err = probe_release(&mut cache).await.expect_err("both legs fail");
+            // Primary error wins. The npm 503 body excerpt should
+            // appear, not the GitHub 500 body.
+            let s = err.to_string();
+            assert!(s.contains("503"), "expected primary npm error: {s}");
+        })
+        .await;
+    }
+
+    /// Cascade reachability for `LookupError::RateLimited`: when npm
+    /// fails (any non-rate-limit reason) AND GitHub returns a 403 with
+    /// `x-ratelimit-remaining: 0`, the user must see the GitHub
+    /// rate-limit error — NOT the generic npm error. Without this
+    /// preference rule the entire `SelfUpdateRateLimited` UX surface
+    /// ships dead: the only way `RateLimited` gets constructed is the
+    /// GitHub leg, and the npm-error-wins cascade would shadow it on
+    /// every two-leg failure that hits a rate limit on the fallback.
+    #[tokio::test]
+    async fn probe_release_surfaces_github_rate_limit_over_npm_failure() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let npm = MockServer::start().await;
+        let gh = MockServer::start().await;
+
+        // npm leg: generic 503 — could equally be transport error or
+        // 5xx, none carry a structured remediation.
+        Mock::given(method("GET"))
+            .and(path("/@lpm-registry/cli/latest"))
+            .respond_with(ResponseTemplate::new(503).set_body_string("npm temporarily down"))
+            .mount(&npm)
+            .await;
+
+        // GitHub leg: 403 with the primary-rate-limit headers so the
+        // wrapper surfaces `LpmError::SelfUpdateRateLimited` with
+        // GITHUB_TOKEN help text — the payoff of running the cascade
+        // in this order.
+        let reset_at = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs()
+            + 600;
+        let reset_at_header = reset_at.to_string();
+        Mock::given(method("GET"))
+            .and(path("/repos/lpm-dev/rust-client/releases/latest"))
+            .respond_with(
+                ResponseTemplate::new(403)
+                    .insert_header("x-ratelimit-remaining", "0")
+                    .insert_header("x-ratelimit-reset", reset_at_header.as_str())
+                    .set_body_string("rate limited"),
+            )
+            .mount(&gh)
+            .await;
+
+        let npm_url = format!("{}/@lpm-registry/cli/latest", npm.uri());
+        let gh_url = format!("{}/repos/lpm-dev/rust-client/releases/latest", gh.uri());
+        with_env_overrides(&npm_url, &gh_url, async {
+            let mut cache = UpdateCache::default();
+            let err = probe_release(&mut cache).await.expect_err("both legs fail");
+            assert!(
+                matches!(err, LookupError::RateLimited { .. }),
+                "expected RateLimited to win the cascade, got {err:?}"
+            );
+            let LookupError::RateLimited { reset_at: got } = err else {
+                unreachable!()
+            };
+            assert_eq!(
+                got,
+                Some(reset_at),
+                "x-ratelimit-reset must round-trip from the GitHub leg"
+            );
+        })
+        .await;
+    }
+
+    /// Pure unit test for the cascade preference rule. Locks the
+    /// "RateLimited wins, otherwise npm wins" policy independently of
+    /// the wiremock end-to-end so a future refactor that inverts the
+    /// rule fails this small focused test first.
+    #[test]
+    fn prefer_more_actionable_picks_github_rate_limit_over_npm_error() {
+        let npm = LookupError::HttpStatus {
+            status: 503,
+            body_excerpt: "npm down".into(),
+        };
+        let gh = LookupError::RateLimited {
+            reset_at: Some(1_700_000_600),
+        };
+        let chosen = prefer_more_actionable(npm, gh);
+        assert!(matches!(chosen, LookupError::RateLimited { .. }));
+    }
+
+    #[test]
+    fn prefer_more_actionable_picks_npm_when_github_is_not_rate_limited() {
+        let npm = LookupError::Transport("npm dns failed".into());
+        let gh = LookupError::HttpStatus {
+            status: 500,
+            body_excerpt: "gh down".into(),
+        };
+        let chosen = prefer_more_actionable(npm, gh);
+        // npm is the primary; non-rate-limit GitHub failure does not
+        // displace it.
+        let s = chosen.to_string();
+        assert!(s.contains("npm dns failed"), "expected npm error: {s}");
+    }
+
+    // ─── Env-override test isolation ─────────────────────────────────
+    //
+    // The `with_env_overrides` async helper AND the sync
+    // `npm_registry_url_respects_override_env_var` test both mutate
+    // the same process-global override env vars
+    // (`LPM_NPM_REGISTRY_URL_OVERRIDE` /
+    // `LPM_GITHUB_RELEASES_URL_OVERRIDE`). Under default `cargo test`
+    // parallelism these races caused flakes — when two wiremock tests
+    // ran concurrently they could swap each other's URLs mid-probe and
+    // hit the real registries. PR #42 review reproduced GitHub
+    // rate-limit bleed-through in exactly this shape.
+    //
+    // Lock is a plain `std::sync::Mutex<()>` (held across `.await` in
+    // async tests) because `#[tokio::test]` defaults to the
+    // current-thread runtime — there's no work-stealing scheduler that
+    // could move the future across threads while the guard is held.
+    // The `unwrap_or_else(into_inner)` shape ignores poison: if a test
+    // panics while holding the lock, downstream tests still serialize
+    // correctly; the guarded `()` carries no state to corrupt.
+
+    const NPM_OVERRIDE_KEY: &str = "LPM_NPM_REGISTRY_URL_OVERRIDE";
+    const GH_OVERRIDE_KEY: &str = "LPM_GITHUB_RELEASES_URL_OVERRIDE";
+
+    fn env_override_lock() -> &'static std::sync::Mutex<()> {
+        static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+        LOCK.get_or_init(|| std::sync::Mutex::new(()))
+    }
+
+    /// RAII guard that restores the override env vars on drop.
+    /// Restores fire on normal scope exit AND on panic, so a failing
+    /// test doesn't pollute env state for the next test in line.
+    /// Captured previous values are stored verbatim — `None` means
+    /// "was unset", `Some(v)` means "was `v`".
+    struct EnvOverrideGuard {
+        npm_prev: Option<String>,
+        gh_prev: Option<String>,
+        _lock: std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl Drop for EnvOverrideGuard {
+        fn drop(&mut self) {
+            // SAFETY: env mutation is unsafe in 2024 edition; serialised
+            // via `_lock` so no other thread can observe a half-restored
+            // pair.
+            unsafe {
+                match &self.npm_prev {
+                    Some(v) => std::env::set_var(NPM_OVERRIDE_KEY, v),
+                    None => std::env::remove_var(NPM_OVERRIDE_KEY),
+                }
+                match &self.gh_prev {
+                    Some(v) => std::env::set_var(GH_OVERRIDE_KEY, v),
+                    None => std::env::remove_var(GH_OVERRIDE_KEY),
+                }
+            }
+        }
+    }
+
+    /// Acquire the global env-override lock and snapshot the current
+    /// values. The returned guard restores both vars when dropped.
+    fn acquire_env_override_lock() -> EnvOverrideGuard {
+        let lock = env_override_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        EnvOverrideGuard {
+            npm_prev: std::env::var(NPM_OVERRIDE_KEY).ok(),
+            gh_prev: std::env::var(GH_OVERRIDE_KEY).ok(),
+            _lock: lock,
+        }
+    }
+
+    /// Helper: set npm + GitHub URL overrides for the duration of an
+    /// async block. Lock-isolated and panic-safe via
+    /// [`EnvOverrideGuard`].
+    async fn with_env_overrides<F>(npm_url: &str, gh_url: &str, fut: F)
+    where
+        F: std::future::Future<Output = ()>,
+    {
+        let _restore = acquire_env_override_lock();
+        // SAFETY: lock held for the lifetime of `_restore`.
+        unsafe {
+            std::env::set_var(NPM_OVERRIDE_KEY, npm_url);
+            std::env::set_var(GH_OVERRIDE_KEY, gh_url);
+        }
+        fut.await;
+        // `_restore`'s Drop runs at end of scope and rewinds env state.
     }
 
     #[test]

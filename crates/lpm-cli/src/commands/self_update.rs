@@ -1,6 +1,6 @@
 use crate::output;
 use crate::release_lookup::{
-    FetchOutcome, LookupError, clear_cache_at, default_cache_path, is_newer_semver, probe_github,
+    FetchOutcome, LookupError, clear_cache_at, default_cache_path, is_newer_semver, probe_release,
     read_cache_at, write_cache_at,
 };
 use lpm_common::LpmError;
@@ -28,6 +28,13 @@ const FAILURE_BACKOFF: Duration = Duration::from_secs(60 * 60);
 /// Detects the installation method from the executable path and runs
 /// the appropriate upgrade command. Supports npm, Homebrew, cargo,
 /// and standalone (curl) installations.
+///
+/// Version discovery probes the npm registry first
+/// (`registry.npmjs.org/@lpm-registry/cli/latest`) and falls back to
+/// GitHub Releases. The npm primary is anonymous and unmetered for our
+/// purposes, so most users never touch the rate-limited GitHub path.
+/// The two sources stay in lockstep because every release publishes
+/// from the same tag.
 pub async fn run(json_output: bool, refresh: bool) -> Result<(), LpmError> {
     let current = env!("CARGO_PKG_VERSION");
 
@@ -74,9 +81,12 @@ pub async fn run(json_output: bool, refresh: bool) -> Result<(), LpmError> {
         }
         let elapsed = now.saturating_sub(cache.last_failure_check);
         let remaining = FAILURE_BACKOFF.as_secs().saturating_sub(elapsed);
-        return Err(LpmError::Network(format!(
-            "Update check skipped: a previous attempt failed {} ago. \
-             Try again in {}, or pass --refresh to retry now.",
+        // SelfUpdatePaused — not Network. The failure isn't a live
+        // transport problem; it's a local cache decision to back off.
+        // The variant's help text surfaces `--refresh` so we don't have
+        // to repeat that hint inside the message body.
+        return Err(LpmError::SelfUpdatePaused(format!(
+            "last attempt failed {} ago, retrying automatically in {}",
             humanize_seconds(elapsed),
             humanize_seconds(remaining),
         )));
@@ -85,7 +95,7 @@ pub async fn run(json_output: bool, refresh: bool) -> Result<(), LpmError> {
     let latest = if cache_hit {
         cache.latest.clone()
     } else {
-        match probe_github(&mut cache).await {
+        match probe_release(&mut cache).await {
             Ok(FetchOutcome::Fresh { version }) | Ok(FetchOutcome::NotModified { version }) => {
                 if let Some(p) = cache_path.as_deref() {
                     let _ = write_cache_at(p, &cache);
@@ -218,12 +228,24 @@ pub async fn run(json_output: bool, refresh: bool) -> Result<(), LpmError> {
 /// Map a `LookupError` into `LpmError` so the existing CLI error
 /// surface (miette / `--json`) renders it without losing the typed
 /// rate-limit info.
+///
+/// Mapping is purpose-specific so error categories match user intent:
+/// - Transport / HTTP / malformed → `Network`. Live network problem.
+/// - GitHub-API rate limit → `SelfUpdateRateLimited`. Not a permission
+///   issue (the historical `Forbidden` mapping read like the user was
+///   blocked); it's a quota issue with a clear remediation surfaced in
+///   the variant's help text (`GITHUB_TOKEN` / `GH_TOKEN`).
+///
+/// `LookupError`'s own `Display` is the canonical body — it owns the
+/// reset-hint formatting and intentionally omits the `GITHUB_TOKEN`
+/// guidance (which lives in the wrapping variant's miette help). The
+/// wrapper here just adds the user-facing context prefix.
 fn lookup_error_to_lpm(e: LookupError) -> LpmError {
-    match e {
+    match &e {
         LookupError::Transport(_) | LookupError::HttpStatus { .. } => {
             LpmError::Network(format!("failed to check for updates: {e}"))
         }
-        LookupError::RateLimited { .. } => LpmError::Forbidden(e.to_string()),
+        LookupError::RateLimited { .. } => LpmError::SelfUpdateRateLimited(e.to_string()),
         LookupError::MalformedResponse(_) => {
             LpmError::Network(format!("failed to check for updates: {e}"))
         }
@@ -311,26 +333,101 @@ fn standalone_command_for(version: &str, platform: &str, ext: &str, exe: Option<
 
 fn detect_install_method() -> InstallMethod {
     let exe = std::env::current_exe().ok();
-    let exe_path = exe
+    // Resolve symlinks so `/usr/local/bin/lpm → ~/.volta/bin/lpm` (or
+    // any version-manager shim) classifies as the underlying channel,
+    // not Standalone. `canonicalize` can fail on Windows for some
+    // symlink targets — fall back to the raw path so detection still
+    // works on the common case where the exe IS the canonical binary.
+    let resolved = exe
         .as_ref()
-        .map(|p| p.to_string_lossy().to_string())
-        .unwrap_or_default();
+        .and_then(|p| std::fs::canonicalize(p).ok())
+        .or(exe);
+    detect_install_method_from_path(resolved.as_deref())
+}
 
-    if exe_path.contains("homebrew")
-        || exe_path.contains("Cellar")
-        || exe_path.contains("linuxbrew")
-    {
-        InstallMethod::Homebrew
-    } else if exe_path.contains(".cargo") {
-        InstallMethod::Cargo
-    } else if exe_path.contains("node_modules")
-        || exe_path.contains("npm")
-        || exe_path.contains("nvm")
-    {
-        InstallMethod::Npm
-    } else {
-        InstallMethod::Standalone
+/// Pure helper for [`detect_install_method`]. Split out so the
+/// per-shim classification can be unit-tested with synthetic paths
+/// without depending on whatever package manager happens to own the
+/// running binary.
+fn detect_install_method_from_path(exe: Option<&std::path::Path>) -> InstallMethod {
+    let Some(path) = exe else {
+        return InstallMethod::Standalone;
+    };
+    let components: Vec<&str> = path
+        .components()
+        .filter_map(|c| c.as_os_str().to_str())
+        .collect();
+    let has = |name: &str| components.contains(&name);
+
+    // Homebrew first. After canonicalize, `Cellar` is the unique
+    // component on every Homebrew-managed binary regardless of
+    // `/opt/homebrew` vs `/usr/local` prefix on macOS, and Linuxbrew
+    // also routes through `/home/linuxbrew/.linuxbrew/Cellar/...`.
+    // `homebrew` is kept as a fallback signal for the rare cases where
+    // canonicalize fails and we end up testing the bin-shim path
+    // (`/opt/homebrew/bin/lpm`) directly.
+    if has("Cellar") || has("homebrew") || has("linuxbrew") {
+        return InstallMethod::Homebrew;
     }
+    if has(".cargo") {
+        return InstallMethod::Cargo;
+    }
+    if is_npm_managed(&components) {
+        return InstallMethod::Npm;
+    }
+    InstallMethod::Standalone
+}
+
+/// Path-component (not substring) match against npm-ecosystem install
+/// roots. The previous substring-based check matched any path with
+/// `"npm"` anywhere in it (e.g. `/Users/npmtest/...` false-positived as
+/// npm-installed) and missed Volta / fnm / asdf / pnpm-global entirely.
+fn is_npm_managed(components: &[&str]) -> bool {
+    let has = |name: &str| components.contains(&name);
+
+    // The reliable signal: every `npm install -g` and `npx` install
+    // routes through a `node_modules` directory.
+    if has("node_modules") {
+        return true;
+    }
+
+    // Version manager and alternative install roots. Component-level
+    // exact match avoids the substring trap.
+    const SHIMS: &[&str] = &[
+        ".npm",   // npm cache root (`~/.npm`)
+        ".nvm",   // nvm install root (`~/.nvm`)
+        ".volta", // Volta install root (`~/.volta`)
+        ".fnm",   // fnm install root (`~/.fnm`)
+        ".asdf",  // asdf install root (`~/.asdf`)
+        ".n",     // `n` install root with custom `N_PREFIX=~/.n`
+        "nvm",    // nvm shared-install variants
+        "volta",  // Volta shared-install variants
+        "fnm",    // fnm shared-install variants
+        "asdf",   // asdf shared-install variants
+    ];
+    if SHIMS.iter().any(|s| has(s)) {
+        return true;
+    }
+
+    // pnpm global installs have BOTH `pnpm` AND `global` as components.
+    // Requiring both avoids matching pnpm's content-addressable store
+    // (e.g. `~/.pnpm-store/...`), which is not a global-install root.
+    if has("pnpm") && has("global") {
+        return true;
+    }
+
+    // The `n` version manager's default install layout has BOTH `n`
+    // and `versions` as path components — e.g.
+    // `/usr/local/n/versions/node/20.0.0/bin/lpm` (system) or
+    // `~/n/versions/node/20.0.0/bin/lpm` (default `N_PREFIX=$HOME`).
+    // Bare `n` alone would be too aggressive (matches any folder
+    // literally named `n`); requiring `versions` as well anchors the
+    // match to n's actual directory shape.
+    if has("n") && has("versions") {
+        return true;
+    }
+
+    false
 }
 
 /// Run an external command for package-manager-based upgrades.
@@ -474,6 +571,146 @@ mod tests {
     fn install_method_name_not_empty() {
         let method = detect_install_method();
         assert!(!method.name().is_empty());
+    }
+
+    /// Per-channel detection table. Synthetic paths drive the pure
+    /// helper so the test holds regardless of what package manager
+    /// owns the running test binary.
+    ///
+    /// The substring-based predecessor false-positived on any path
+    /// containing the literal `"npm"` (e.g. `/Users/npmtest/...`) and
+    /// missed Volta / fnm / asdf / pnpm-global outright.
+    #[test]
+    fn detect_install_method_from_path_classifies_each_channel() {
+        use std::path::Path;
+        let cases: &[(&str, InstallMethod)] = &[
+            // Homebrew
+            (
+                "/opt/homebrew/Cellar/lpm/0.37.0/bin/lpm",
+                InstallMethod::Homebrew,
+            ),
+            (
+                "/usr/local/Cellar/lpm/0.37.0/bin/lpm",
+                InstallMethod::Homebrew,
+            ),
+            (
+                "/home/linuxbrew/.linuxbrew/Cellar/lpm/0.37.0/bin/lpm",
+                InstallMethod::Homebrew,
+            ),
+            // Homebrew bin-shim fallback (pre-canonicalize path)
+            ("/opt/homebrew/bin/lpm", InstallMethod::Homebrew),
+            // Cargo
+            ("/Users/x/.cargo/bin/lpm", InstallMethod::Cargo),
+            // Direct npm install
+            (
+                "/usr/local/lib/node_modules/@lpm-registry/cli/lpm-bin",
+                InstallMethod::Npm,
+            ),
+            (
+                "/Users/x/.npm/_npx/abc/node_modules/@lpm-registry/cli/lpm-bin",
+                InstallMethod::Npm,
+            ),
+            // npm version managers
+            (
+                "/Users/x/.nvm/versions/node/v20.0.0/bin/lpm",
+                InstallMethod::Npm,
+            ),
+            (
+                "/Users/x/.volta/tools/image/packages/@lpm-registry/cli/bin/lpm",
+                InstallMethod::Npm,
+            ),
+            ("/Users/x/.fnm/aliases/default/bin/lpm", InstallMethod::Npm),
+            (
+                "/Users/x/.asdf/installs/nodejs/20.0.0/bin/lpm",
+                InstallMethod::Npm,
+            ),
+            // `n` version manager — three real-world layouts. Pre-fix,
+            // these fell through to Standalone, so self-update would
+            // overwrite n's binary tree with a GitHub Releases
+            // download instead of going through `npm install -g`.
+            ("/Users/x/.n/bin/lpm", InstallMethod::Npm),
+            (
+                "/Users/x/n/versions/node/20.0.0/bin/lpm",
+                InstallMethod::Npm,
+            ),
+            (
+                "/usr/local/n/versions/node/20.0.0/bin/lpm",
+                InstallMethod::Npm,
+            ),
+            // pnpm global (requires BOTH `pnpm` and `global` segments)
+            (
+                "/Users/x/.local/share/pnpm/global/5/node_modules/@lpm-registry/cli/lpm-bin",
+                InstallMethod::Npm,
+            ),
+            // Standalone — no shim, no node_modules
+            ("/Users/x/.lpm/bin/lpm", InstallMethod::Standalone),
+            ("/usr/local/bin/lpm", InstallMethod::Standalone),
+        ];
+        for (raw, expected) in cases {
+            let p = Path::new(raw);
+            let got = detect_install_method_from_path(Some(p));
+            assert_eq!(
+                got, *expected,
+                "path {raw}: expected {expected:?}, got {got:?}"
+            );
+        }
+    }
+
+    /// Substring-trap regression: a literal `"npm"` anywhere in the
+    /// path used to false-positive as an npm install. With component
+    /// matching, only exact path components count.
+    #[test]
+    fn detect_install_method_substring_npm_does_not_false_positive() {
+        use std::path::Path;
+        // `npmtest` contains "npm" as a substring but is not an npm
+        // path component. Must classify as Standalone.
+        let p = Path::new("/Users/npmtest/.lpm/bin/lpm");
+        assert_eq!(
+            detect_install_method_from_path(Some(p)),
+            InstallMethod::Standalone,
+        );
+    }
+
+    /// Bare `n` component without `versions` must NOT classify as
+    /// Npm. The `n` version manager's directory layout always has
+    /// both segments, so a stray folder named `n` (project source,
+    /// initial of a username, etc.) doesn't get misclassified.
+    #[test]
+    fn detect_install_method_bare_n_without_versions_is_standalone() {
+        use std::path::Path;
+        // No `versions` segment — could be a project folder named `n`,
+        // not the n version manager.
+        let p = Path::new("/Users/x/projects/n/bin/lpm");
+        assert_eq!(
+            detect_install_method_from_path(Some(p)),
+            InstallMethod::Standalone,
+            "bare `n` segment without `versions` must not classify as Npm"
+        );
+    }
+
+    /// pnpm content-addressable store has a `pnpm` component but NOT
+    /// `global`. Must NOT classify as Npm — it's not an install root,
+    /// and routing the upgrade through `npm install -g` would corrupt
+    /// the store.
+    #[test]
+    fn detect_install_method_pnpm_store_alone_is_not_global_install() {
+        use std::path::Path;
+        let p = Path::new("/Users/x/.pnpm-store/v3/files/aa/bb/lpm-bin");
+        assert_eq!(
+            detect_install_method_from_path(Some(p)),
+            InstallMethod::Standalone,
+            "pnpm store without `global` segment is not an install root"
+        );
+    }
+
+    /// `None` (no exe path resolvable) falls through to Standalone.
+    /// Keeps the function total and the upgrade flow predictable.
+    #[test]
+    fn detect_install_method_none_falls_back_to_standalone() {
+        assert_eq!(
+            detect_install_method_from_path(None),
+            InstallMethod::Standalone
+        );
     }
 
     #[test]
@@ -649,13 +886,40 @@ mod tests {
         assert_eq!(format_bytes(2_621_440), "2.5 MB");
     }
 
+    /// Rate-limit lands on `SelfUpdateRateLimited`, not `Forbidden`.
+    /// `Forbidden` is the user-permission category and reads to users
+    /// as "you're banned" — wrong category for a quota-reset wait.
     #[test]
-    fn lookup_error_rate_limit_maps_to_forbidden() {
-        // Sanity-check the LpmError mapping so a future variant rename
-        // in lpm-common doesn't silently swap which surface 403s
-        // land on.
+    fn lookup_error_rate_limit_maps_to_self_update_rate_limited() {
         let err = lookup_error_to_lpm(LookupError::RateLimited { reset_at: Some(0) });
-        assert!(matches!(err, LpmError::Forbidden(_)), "got {err:?}");
+        assert!(
+            matches!(err, LpmError::SelfUpdateRateLimited(_)),
+            "got {err:?}"
+        );
+        // And — explicitly NOT Forbidden, the historical wrong category.
+        assert!(
+            !matches!(err, LpmError::Forbidden(_)),
+            "must not regress to Forbidden: {err:?}"
+        );
+    }
+
+    /// Rendered body must not duplicate the GITHUB_TOKEN hint — that
+    /// guidance now lives in the variant's miette help text. Doubling
+    /// it would print the same instruction twice.
+    #[test]
+    fn lookup_error_rate_limit_body_is_not_doubled_with_help_text() {
+        let err = lookup_error_to_lpm(LookupError::RateLimited { reset_at: Some(0) });
+        let LpmError::SelfUpdateRateLimited(body) = err else {
+            panic!("expected SelfUpdateRateLimited variant");
+        };
+        assert!(
+            !body.contains("GITHUB_TOKEN"),
+            "body must not duplicate help text: {body}"
+        );
+        assert!(
+            !body.contains("GH_TOKEN"),
+            "body must not duplicate help text: {body}"
+        );
     }
 
     #[test]
