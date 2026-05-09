@@ -36,7 +36,7 @@ use lpm_sandbox::SandboxMode;
 use lpm_security::script_hash::compute_script_hash;
 use lpm_security::triage::StaticTier;
 use lpm_security::{EXECUTED_INSTALL_PHASES, SecurityPolicy, TrustMatch};
-use lpm_store::find_installed_package_baseline;
+use lpm_store::{V2BaselineIndex, find_installed_package_baseline_indexed};
 // `PackageStore` lives behind a cfg(test) gate now — production
 // callers of post-install lookups route through
 // `find_installed_package_baseline` (v2-first, v1-fallback). Tests
@@ -62,15 +62,21 @@ use lpm_store::PackageStore;
 /// path for the *runtime* of a script. This helper is the upstream
 /// store-side reader that read-only inspections (script bodies,
 /// trust-gate hashing) consume.
-fn package_baseline_dir(
+///
+/// **Phase 66 confidence-followup F2 (2026-05-09).** Hot-loop variant.
+/// Takes an invocation-local [`V2BaselineIndex`] and turns each
+/// lookup into an O(1) hashmap read. The three rebuild loops
+/// (`run_under_store_lock`, `scriptable_package_rows`,
+/// `all_scripted_packages_trusted`) MUST use this form — pre-fix
+/// each iteration re-walked every link entry + parsed every sidecar
+/// JSON, costing O(M·N) per command invocation.
+fn package_baseline_dir_indexed(
+    index: &V2BaselineIndex,
     lpm_root: &lpm_common::LpmRoot,
     name: &str,
     version: &str,
 ) -> Option<std::path::PathBuf> {
-    find_installed_package_baseline(lpm_root, name, version)
-        .ok()
-        .flatten()
-        .map(|b| b.package_dir)
+    find_installed_package_baseline_indexed(index, lpm_root, name, version).map(|b| b.package_dir)
 }
 use owo_colors::OwoColorize;
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -262,20 +268,30 @@ async fn run_under_store_lock(
             .map_err(|e| LpmError::Registry(format!("{e}")))?;
     let user_bound = crate::capability::UserBound::from_global_config(&global_config);
 
+    // **Phase 66 confidence-followup F2.** Build the v2 link-entry
+    // index ONCE before the per-package loop. Pre-fix the loop body
+    // re-walked every link entry on every iteration; on a 1000-pkg
+    // lockfile against a 5000-link store that's 5M sidecar JSON reads
+    // per `lpm rebuild`. Post-fix the cost is one ordered scan + M
+    // hashmap lookups.
+    let baseline_index = V2BaselineIndex::build(&lpm_root)?;
+
     // Collect packages that have lifecycle scripts
     let mut scriptable_packages: Vec<ScriptablePackage> = Vec::new();
 
     for lp in &lockfile.packages {
-        // Phase 66 confidence-followup S5b — v2-aware lookup.
+        // Phase 66 confidence-followup S5b — v2-aware lookup, F2 —
+        // routed through the invocation-local index.
         // `live_package_dir` returns `None` when the package isn't in
         // either store (workspace/file/link sources, corrupt
         // installs); silent skip preserves the pre-fix
         // `pkg_json_path.exists()` semantic for non-store sources
         // while fixing the v2-installed-and-skipped data-loss bug.
-        let pkg_dir = match package_baseline_dir(&lpm_root, &lp.name, &lp.version) {
-            Some(p) => p,
-            None => continue,
-        };
+        let pkg_dir =
+            match package_baseline_dir_indexed(&baseline_index, &lpm_root, &lp.name, &lp.version) {
+                Some(p) => p,
+                None => continue,
+            };
         let pkg_json_path = pkg_dir.join("package.json");
 
         if !pkg_json_path.exists() {
@@ -1849,6 +1865,17 @@ pub(crate) fn scriptable_package_rows(
     // the per-package step into a pure in-memory glob match.
     let trusted_scopes = parse_trusted_scopes(project_dir);
 
+    // **Phase 66 confidence-followup F2.** Build the v2 link-entry
+    // index ONCE before the rayon walk. Per-package lookups become
+    // O(1) map reads; without this every parallel worker would
+    // re-walk every link entry independently.
+    //
+    // Index-build errors are upgraded to "no v2 store available"
+    // because the legacy code silently fell back to v1 for any
+    // non-Some result. Surfacing the error here would change the
+    // contract observable to callers (silent skip → hard error).
+    let baseline_index = V2BaselineIndex::build(lpm_root).unwrap_or_default();
+
     let walk_start = std::time::Instant::now();
 
     // **Phase 51 W2: parallelize the per-package walk via rayon.**
@@ -1863,10 +1890,11 @@ pub(crate) fn scriptable_package_rows(
     // input order anyway under rayon's stable collect.
     let per_pkg = |(name, version, integrity): &(String, String, Option<String>)|
      -> Option<ScriptableHintRow> {
-        // Phase 66 confidence-followup S5b — v2-aware lookup. See
+        // Phase 66 confidence-followup S5b — v2-aware lookup, F2 —
+        // routed through the invocation-local index. See
         // [`package_baseline_dir`] for the silent-skip-vs-real-skip
         // semantic.
-        let pkg_dir = package_baseline_dir(lpm_root, name, version)?;
+        let pkg_dir = package_baseline_dir_indexed(&baseline_index, lpm_root, name, version)?;
         let pkg_json_path = pkg_dir.join("package.json");
 
         let scripts = match read_lifecycle_scripts(&pkg_json_path) {
@@ -2061,13 +2089,22 @@ pub fn all_scripted_packages_trusted(
     requested_capabilities: &crate::capability::CapabilitySet,
     user_bound: &crate::capability::UserBound,
 ) -> bool {
+    // **Phase 66 confidence-followup F2.** Build the v2 link-entry
+    // index ONCE before the per-package loop. Same rationale as
+    // `scriptable_package_rows` — install-time auto-build predicate
+    // checks every lockfile entry, and pre-fix every check re-walked
+    // every link entry. Falling back to an empty index on construction
+    // failure preserves the legacy silent-skip-of-v1-only semantic.
+    let baseline_index = V2BaselineIndex::build(lpm_root).unwrap_or_default();
+
     let mut has_any_unbuilt = false;
 
     for (name, version, integrity) in packages {
-        // Phase 66 confidence-followup S5b — v2-aware lookup. Same
+        // Phase 66 confidence-followup S5b — v2-aware lookup, F2 —
+        // routed through the invocation-local index. Same
         // silent-skip semantics as the main loop; see
         // [`package_baseline_dir`] doc.
-        let pkg_dir = match package_baseline_dir(lpm_root, name, version) {
+        let pkg_dir = match package_baseline_dir_indexed(&baseline_index, lpm_root, name, version) {
             Some(p) => p,
             None => continue,
         };
