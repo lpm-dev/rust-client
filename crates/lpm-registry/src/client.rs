@@ -376,6 +376,28 @@ pub struct HttpClients {
     /// builds (eager + lazy). The inner `PassphraseCache` memoizes
     /// across calls; a fresh provider per build would defeat it.
     passphrase: Arc<dyn PassphraseProvider>,
+    /// Phase 58.3 T3.5 fix — pre-computed identity fingerprints for
+    /// every origin that has per-origin TLS configured. Populated
+    /// at `with_tls_overrides_for` time by reading + hashing each
+    /// origin's certfile (or inheriting the global identity_fp when
+    /// the origin has per-origin cafile but no own identity).
+    ///
+    /// **Why this exists.** Cache-key composition is sync and runs
+    /// BEFORE any actual dispatch. For lazy-target origins (those
+    /// configured in `tls.per_origin` but not in the eager set), the
+    /// lazy client hasn't been built yet — so consulting the lazy
+    /// map at cache-key-compose time misses, and the key would be
+    /// computed from the default client's identity_fp instead. That
+    /// means a rotated per-origin cert wouldn't change the cache
+    /// namespace, leaking entries across principals on lazy origins.
+    /// Pre-computation keeps `identity_fp_for_url` sync while
+    /// honoring the actual identity each origin will use at request
+    /// time.
+    ///
+    /// Cert read failures here are non-fatal — the entry stays
+    /// absent and the lazy build will surface a cited error if/when
+    /// the origin is actually reached.
+    per_origin_identity_fps: HashMap<OriginKey, Arc<str>>,
 }
 
 impl std::fmt::Debug for HttpClients {
@@ -446,6 +468,7 @@ impl HttpClients {
             lazy: tokio::sync::Mutex::new(HashMap::new()),
             tls_overrides: Arc::new(TlsOverrides::default()),
             passphrase: Arc::new(EnvThenTtyPassphrase::new()),
+            per_origin_identity_fps: HashMap::new(),
         })
     }
 
@@ -477,25 +500,53 @@ impl HttpClients {
     }
 
     /// Phase 58.3 T3.5 — identity fingerprint for the client that
-    /// would handle a request to `url` based on the eager map.
+    /// would handle a request to `url`, consulting eager + the
+    /// pre-computed lazy-target map + default fallback.
     ///
     /// Used by metadata cache-key composition: the fingerprint is
     /// included in the namespace so a re-issued client cert
-    /// invalidates cached entries cleanly. Falls through to the
-    /// default client's fingerprint when no per-origin entry matches
-    /// — meaning a default client carrying a global mTLS identity
-    /// still partitions its cache by that identity.
+    /// invalidates cached entries cleanly.
     ///
-    /// Sync — only consults the eager map; lazy builds happen on the
-    /// async `for_url` path. For URLs that would lazy-build, this
-    /// returns the default client's fingerprint (which is correct
-    /// for the eager-or-default routing today; lazy entries don't
-    /// typically share metadata cache keys with the default since
-    /// per-origin clients are URL-host-partitioned anyway).
+    /// Resolution order:
+    /// 1. **Eager hit** (port-exact then port-none) — return that
+    ///    client's `identity_fp`.
+    /// 2. **Pre-computed lazy-target fp** (port-exact then port-none) —
+    ///    same fallback rule. The map was populated at
+    ///    `with_tls_overrides_for` time by hashing every configured
+    ///    per-origin certfile (deferred-read, like the rest of
+    ///    Phase 58.3, but the read-and-hash is non-fatal). Origins
+    ///    with per-origin cafile only (no own identity) inherit the
+    ///    global identity_fp at populate time.
+    /// 3. **Default** — the global identity_fp on the default client.
+    ///
+    /// Sync. The pre-computation step is what closes GPT's HIGH
+    /// finding from the post-T4 audit: lazy-only origins were
+    /// previously identity-blind because cache-key composition runs
+    /// BEFORE the actual lazy dispatch.
     pub fn identity_fp_for_url(&self, url: &str) -> Option<&str> {
-        self.cached_for_url_no_build(url)
-            .identity_fp
-            .as_deref()
+        let Some(origin) = OriginKey::from_request_url(url) else {
+            return self.default.identity_fp.as_deref();
+        };
+        // Tier 1: eager hit.
+        if let Some(c) = self.eager.get(&origin) {
+            return c.identity_fp.as_deref();
+        }
+        let any_port = OriginKey {
+            host_lower: origin.host_lower.clone(),
+            port: None,
+        };
+        if let Some(c) = self.eager.get(&any_port) {
+            return c.identity_fp.as_deref();
+        }
+        // Tier 2: pre-computed lazy-target fp.
+        if let Some(fp) = self.per_origin_identity_fps.get(&origin) {
+            return Some(fp.as_ref());
+        }
+        if let Some(fp) = self.per_origin_identity_fps.get(&any_port) {
+            return Some(fp.as_ref());
+        }
+        // Tier 3: default client's fp (global identity, if any).
+        self.default.identity_fp.as_deref()
     }
 
     /// Look up (or lazily build) a client for `url`. Returns the eager
@@ -1054,12 +1105,41 @@ impl RegistryClient {
             )?;
             eager_map.insert(origin.clone(), cached);
         }
+        // Phase 58.3 T3.5 fix — pre-compute identity fingerprints
+        // for every configured per-origin TLS entry so cache-key
+        // composition (sync, runs BEFORE lazy dispatch) can answer
+        // correctly for lazy-target origins. Origins with their own
+        // certfile: hash that cert. Origins with per-origin cafile
+        // but no own identity: inherit the global identity_fp.
+        // Cert read failures here are non-fatal — the entry stays
+        // absent and the lazy build will surface a cited error if
+        // and when the origin is actually reached.
+        let mut per_origin_identity_fps: HashMap<OriginKey, Arc<str>> = HashMap::new();
+        for (origin, per_origin) in &tls.per_origin {
+            let fp = if let Some(cert) = &per_origin.certfile {
+                match std::fs::read(cert.resolve()) {
+                    Ok(bytes) => Some(cert_pem_fingerprint(&bytes)),
+                    Err(_) => None,
+                }
+            } else {
+                // No own identity → inherits global. Carry the global
+                // fp into the per-origin map so the lookup tier-2 hit
+                // returns it (else tier-3 default would catch it,
+                // but only when no other entry exists — having it in
+                // tier-2 keeps the resolution rule uniform).
+                default_cached.identity_fp.clone()
+            };
+            if let Some(fp) = fp {
+                per_origin_identity_fps.insert(origin.clone(), fp);
+            }
+        }
         let http = Arc::new(HttpClients {
             default: default_cached,
             eager: eager_map,
             lazy: tokio::sync::Mutex::new(HashMap::new()),
             tls_overrides: Arc::new(tls.clone()),
             passphrase,
+            per_origin_identity_fps,
         });
         self.http = http;
         Ok(self)
@@ -8834,6 +8914,7 @@ mod tests {
             lazy: tokio::sync::Mutex::new(HashMap::new()),
             tls_overrides: Arc::new(TlsOverrides::default()),
             passphrase: Arc::new(crate::tls_identity::EnvThenTtyPassphrase::new()),
+            per_origin_identity_fps: HashMap::new(),
         });
         let mut client = RegistryClient::new();
         client.http = http;
@@ -8878,6 +8959,7 @@ mod tests {
             lazy: tokio::sync::Mutex::new(HashMap::new()),
             tls_overrides: Arc::new(TlsOverrides::default()),
             passphrase: Arc::new(crate::tls_identity::EnvThenTtyPassphrase::new()),
+            per_origin_identity_fps: HashMap::new(),
         });
         let mut client = RegistryClient::new();
         client.http = http;
@@ -8929,6 +9011,7 @@ mod tests {
             lazy: tokio::sync::Mutex::new(HashMap::new()),
             tls_overrides: Arc::new(tls),
             passphrase: Arc::new(crate::tls_identity::EnvThenTtyPassphrase::new()),
+            per_origin_identity_fps: HashMap::new(),
         });
         // First call must build + insert.
         let c1 = http.for_url("https://lazy.internal/pkg").await.expect("ok");
@@ -8971,6 +9054,7 @@ mod tests {
             lazy: tokio::sync::Mutex::new(HashMap::new()),
             tls_overrides: Arc::new(TlsOverrides::default()),
             passphrase: Arc::new(crate::tls_identity::EnvThenTtyPassphrase::new()),
+            per_origin_identity_fps: HashMap::new(),
         });
         let _ = http.for_url("https://anywhere.example/foo").await.expect("ok");
         // Lazy map must remain empty (no per-origin TLS to build).
@@ -9014,6 +9098,7 @@ mod tests {
             lazy: tokio::sync::Mutex::new(HashMap::new()),
             tls_overrides: Arc::new(tls),
             passphrase: Arc::new(crate::tls_identity::EnvThenTtyPassphrase::new()),
+            per_origin_identity_fps: HashMap::new(),
         });
         let result = http.for_url("https://halfconf.internal/foo").await;
         match result {
@@ -9063,6 +9148,7 @@ mod tests {
             lazy: tokio::sync::Mutex::new(HashMap::new()),
             tls_overrides: Arc::new(tls),
             passphrase: Arc::new(crate::tls_identity::EnvThenTtyPassphrase::new()),
+            per_origin_identity_fps: HashMap::new(),
         });
         // Request to a DIFFERENT origin must succeed (lookup → default).
         let _ = http
@@ -9225,6 +9311,95 @@ mod tests {
         let other = b"-----BEGIN CERTIFICATE-----\nEFGH\n-----END CERTIFICATE-----\n";
         let fp_other = cert_pem_fingerprint(other);
         assert_ne!(&*fp1, &*fp_other);
+    }
+
+    /// **GPT post-T4 HIGH finding (regression):** lazy-target
+    /// per-origin TLS origins (those configured but NOT in the eager
+    /// set) must report a non-default identity_fp BEFORE the lazy
+    /// build fires. Pre-fix, `identity_fp_for_url` only consulted the
+    /// eager + default maps, so a rotated cert on a lazy origin
+    /// would reuse the old cache namespace. Post-fix,
+    /// `with_tls_overrides_for` pre-computes an identity_fp for every
+    /// configured per-origin TLS entry.
+    ///
+    /// Test shape: build a client with per-origin certfile configured
+    /// for `lazy.internal` BUT pass an empty eager set. Then call
+    /// `identity_fp_for_url("https://lazy.internal/...")` and verify
+    /// it returns a fingerprint, not None / not the default's fp.
+    /// Rotate the cert (write different PEM bytes), rebuild, and
+    /// verify the fp changes.
+    #[test]
+    fn lazy_target_origin_identity_fp_namespaces_cache_pre_dispatch() {
+        let dir = tempfile::tempdir().unwrap();
+        let cert_path = dir.path().join("client.pem");
+        let key_path = dir.path().join("client.key");
+
+        // First identity.
+        let cert_a = rcgen::generate_simple_self_signed(vec!["localhost".to_string()])
+            .expect("rcgen a");
+        std::fs::write(&cert_path, cert_a.cert.pem()).unwrap();
+        std::fs::write(&key_path, cert_a.key_pair.serialize_pem()).unwrap();
+
+        let origin = OriginKey {
+            host_lower: "lazy.internal".into(),
+            port: None,
+        };
+        let mut per_origin_map = HashMap::new();
+        per_origin_map.insert(
+            origin.clone(),
+            crate::npmrc::OriginTlsOverrides {
+                cafiles: vec![],
+                certfile: Some(crate::npmrc::TaggedPath {
+                    path: cert_path.clone(),
+                    source: "test".into(),
+                    line: 1,
+                    source_dir: None,
+                }),
+                keyfile: Some(crate::npmrc::TaggedPath {
+                    path: key_path.clone(),
+                    source: "test".into(),
+                    line: 2,
+                    source_dir: None,
+                }),
+            },
+        );
+        let tls_a = TlsOverrides {
+            per_origin: per_origin_map.clone(),
+            ..Default::default()
+        };
+        // CRUCIAL: pass empty eager_origins — origin is lazy-only.
+        let client_a = RegistryClient::new()
+            .with_tls_overrides_for(&tls_a, &[])
+            .expect("build a");
+        // Pre-fix this would have been None / default-fp; post-fix
+        // it MUST be a real fingerprint of cert_a's PEM.
+        let fp_a = client_a
+            .http
+            .identity_fp_for_url("https://lazy.internal/foo")
+            .expect("lazy-target origin must report a non-default fp");
+        assert_eq!(fp_a.len(), 16);
+
+        // Rotate the cert: write a DIFFERENT cert+key pair to the
+        // same paths, rebuild HttpClients. fp must change.
+        let cert_b = rcgen::generate_simple_self_signed(vec!["localhost".to_string()])
+            .expect("rcgen b");
+        std::fs::write(&cert_path, cert_b.cert.pem()).unwrap();
+        std::fs::write(&key_path, cert_b.key_pair.serialize_pem()).unwrap();
+        let tls_b = TlsOverrides {
+            per_origin: per_origin_map,
+            ..Default::default()
+        };
+        let client_b = RegistryClient::new()
+            .with_tls_overrides_for(&tls_b, &[])
+            .expect("build b");
+        let fp_b = client_b
+            .http
+            .identity_fp_for_url("https://lazy.internal/foo")
+            .expect("after rotation, lazy-target fp still present");
+        assert_ne!(
+            fp_a, fp_b,
+            "rotated cert must change cache namespace for lazy-target origin"
+        );
     }
 
     /// End-to-end: a client built with a per-origin cert via the real

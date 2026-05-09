@@ -212,9 +212,27 @@ pub async fn run(
     // eager-build per-origin clients for the intersection with
     // configured per-origin TLS. Origins surfaced later (transitive
     // deps, tarball CDNs) go through the lazy path in HttpClients.
-    let top_level_spec = target.display();
+    //
+    // Alias resolution (GPT post-T4 MEDIUM finding): for
+    // `lpm add foo@npm:react@18`, `target.display()` is `foo` but
+    // the actual route key is `react`. Parse the version_spec when
+    // present and prefer the NpmAlias target; otherwise fall back
+    // to the display name. Local-source / file / tarball-URL specs
+    // don't route by package name and stay out of the eager set.
+    let route_key: Option<String> = match version_spec.as_deref() {
+        Some(v) => match lpm_resolver::Specifier::parse(v) {
+            Ok(lpm_resolver::Specifier::NpmAlias { target: t, .. }) => Some(t),
+            Ok(lpm_resolver::Specifier::SemverRange(_)) => Some(target.display()),
+            // Tarball / File / Link / Workspace / Git → no registry
+            // route; lazy path covers any TLS needs.
+            _ => None,
+        },
+        // No version spec → default range against the named registry.
+        None => Some(target.display()),
+    };
+    let top_level_specs: Vec<String> = route_key.into_iter().collect();
     let eager_origins = route_table.effective_registry_origins(
-        std::slice::from_ref(&top_level_spec),
+        &top_level_specs,
         client.base_url(),
         client.npm_registry_url(),
     );
