@@ -1499,10 +1499,27 @@ fn find_hoisted_anchor(
     let mut visited: std::collections::HashSet<usize> = std::collections::HashSet::new();
     while visited.insert(cur) {
         let pkg = &packages[cur];
-        // If this package is the hoisted-at-root instance for its name,
-        // we've found the anchor.
-        if hoisted.get(&pkg.name) == Some(&cur) {
-            return Some(pkg.name.clone());
+        // **R2.5 fix-1.5 — alias-aware anchor lookup.**
+        //
+        // Pre-fix this checked `hoisted.get(&pkg.name) == Some(&cur)`.
+        // That breaks under aliases: an aliased direct dep with
+        // `root_link_names = ["a-alias"]` and `pkg.name = "lodash"`
+        // is hoisted at slot "a-alias", not "lodash" — the lookup
+        // by pkg.name returns nothing and the anchor walk fails
+        // even though `cur` IS the hoisted-at-root instance.
+        //
+        // Generalize: check whether `cur` IS hoisted under ANY slot.
+        // If yes, return that slot — it's the on-disk parent dir
+        // name. The scan is O(hoisted_count) per anchor step. With
+        // typical install sizes (hundreds of packages, single-digit
+        // anchor walks) this is negligible vs the link-recursive
+        // wall. Deterministic order: scan via `iter()`, take first
+        // match. Multi-slot (aliased package with several
+        // root_link_names) returns whichever slot enumerates first
+        // — which is fine since any of them is a valid Node-resolver
+        // walk-up target.
+        if let Some((slot, _)) = hoisted.iter().find(|&(_, &idx)| idx == cur) {
+            return Some(slot.clone());
         }
         // Otherwise walk up: find a consumer of this package and recurse.
         // Pick the first consumer (deterministic — packages are processed
@@ -1702,30 +1719,72 @@ pub fn link_packages_hoisted(
     // step falls back to the conflict name itself in that case.
     let mut nested_pending: Vec<(usize, Option<usize>)> = Vec::new();
 
+    // **R2.5 fix-1.5 — npm-alias root-slot claiming.**
+    //
+    // Pre-fix Phase 1 claimed slots keyed strictly on `pkg.name` (the
+    // canonical/registry identity). For a `npm:<target>@<range>` alias
+    // declared at root level, `resolved_to_install_packages` populates
+    // `LinkTarget.root_link_names` with the LOCAL alias name(s) — which
+    // can differ from `pkg.name` (e.g., user wrote `lodash-a:
+    // npm:lodash@^4`, so root_link_names = ["lodash-a"] and pkg.name =
+    // "lodash"). The pre-fix loop would claim slot "lodash" for the
+    // package and never create `node_modules/lodash-a/`, leaving the
+    // alias unresolvable at runtime. Symmetric with v2's
+    // [`v2.rs::root_link_names`] helper but extended to the hoisting
+    // algorithm's slot-claim level rather than just the symlink-emit
+    // level.
+    //
+    // Slot derivation (per package):
+    //   - `Some(names)`: claim each entry. Empty Vec means "explicitly
+    //     no root surface" — the package still gets bin shims via
+    //     other paths but no top-level `node_modules/<name>/` entry
+    //     (matches v2's contract).
+    //   - `None`: claim `[pkg.name]`. Covers transitive deps (always
+    //     None) and direct deps that pre-date alias plumbing or
+    //     deliberately use the canonical-only shape.
+    let slots_for_pkg = |pkg: &LinkTarget| -> Vec<String> {
+        match &pkg.root_link_names {
+            Some(names) => names.clone(),
+            None => vec![pkg.name.clone()],
+        }
+    };
+
     for (idx, pkg) in packages.iter().enumerate() {
-        if let Some(&existing_idx) = hoisted.get(&pkg.name) {
-            let existing = &packages[existing_idx];
-            if existing.version == pkg.version {
-                // Same name, same version: already hoisted, skip duplicate.
-                continue;
-            }
-            // Version conflict. Direct dep wins root position.
-            if pkg.is_direct && !existing.is_direct {
-                // Evict existing to nested, hoist the new one.
-                let consumer_idx = depended_by
-                    .get(&(existing.name.clone(), existing.version.clone()))
-                    .and_then(|v: &Vec<usize>| v.first().copied());
-                nested_pending.push((existing_idx, consumer_idx));
-                hoisted.insert(pkg.name.clone(), idx);
+        for slot in slots_for_pkg(pkg) {
+            if let Some(&existing_idx) = hoisted.get(&slot) {
+                let existing = &packages[existing_idx];
+                if existing.version == pkg.version && existing.name == pkg.name {
+                    // Same identity, already hoisted. Common path for
+                    // duplicate (canonical, version) entries the
+                    // resolver dedupes upstream + the bench cases
+                    // where the same alias surfaces multiple times.
+                    continue;
+                }
+                // Slot conflict: two distinct packages want the same
+                // top-level slot. Direct dep wins; transitive nests.
+                // Note: under aliases, this is reached when an
+                // aliased direct dep collides with an unaliased
+                // transitive at the same name (rare but legal —
+                // e.g., a user aliases `lodash-a → npm:react@…` while
+                // a transitive also wants `lodash-a`). The tie-breaker
+                // is identical to the canonical-only path.
+                if pkg.is_direct && !existing.is_direct {
+                    // Evict existing to nested, hoist the new one.
+                    let consumer_idx = depended_by
+                        .get(&(existing.name.clone(), existing.version.clone()))
+                        .and_then(|v: &Vec<usize>| v.first().copied());
+                    nested_pending.push((existing_idx, consumer_idx));
+                    hoisted.insert(slot, idx);
+                } else {
+                    // Keep existing at root, nest the new one.
+                    let consumer_idx = depended_by
+                        .get(&(pkg.name.clone(), pkg.version.clone()))
+                        .and_then(|v: &Vec<usize>| v.first().copied());
+                    nested_pending.push((idx, consumer_idx));
+                }
             } else {
-                // Keep existing at root, nest the new one.
-                let consumer_idx = depended_by
-                    .get(&(pkg.name.clone(), pkg.version.clone()))
-                    .and_then(|v: &Vec<usize>| v.first().copied());
-                nested_pending.push((idx, consumer_idx));
+                hoisted.insert(slot, idx);
             }
-        } else {
-            hoisted.insert(pkg.name.clone(), idx);
         }
     }
 
@@ -3416,6 +3475,104 @@ mod tests {
         assert!(project_dir.path().join("node_modules/express").exists());
         assert!(project_dir.path().join("node_modules/debug").exists());
         assert!(project_dir.path().join("node_modules/ms").exists());
+    }
+
+    #[test]
+    fn hoisted_mode_creates_top_level_dir_per_alias_root_link_name() {
+        // **R2.5 fix-1.5 regression test.**
+        //
+        // Pre-fix `link_packages_hoisted` claimed root slots strictly
+        // by `pkg.name` (canonical/registry identity). For an
+        // `npm:<target>@<range>` alias declared at root level,
+        // `LinkTarget.root_link_names` carries the LOCAL alias
+        // surface, which can differ from `pkg.name`. Pre-fix the
+        // alias slots were never claimed → no
+        // `node_modules/<alias>/` directory → `require('<alias>')`
+        // hard-failed at runtime.
+        //
+        // Surfaced by `bench/audit-fixtures/source-kind/npm-aliases`
+        // under `LPM_STORE_VERSION=v1` + hoisted: 4 of 5 require()s
+        // failed because the alias dirs were missing. v2 hoisted
+        // worked because `v2.rs::root_link_names` already iterated
+        // the alias surface at the symlink-emit level — v1's
+        // hoisting algorithm needed the same generalization at the
+        // slot-claim level.
+        //
+        // This test pins the v1 contract: a single LinkTarget with
+        // multiple `root_link_names` entries produces a top-level
+        // `node_modules/<name>/` directory FOR EACH name, all
+        // backed by the same store path. The alias-rich npm-aliases
+        // audit fixture exercises the multi-store-package shape;
+        // this test isolates the slot-claim logic without the audit
+        // harness scaffolding so a future regression fires here
+        // first.
+        let store_dir = tempfile::tempdir().unwrap();
+        let project_dir = tempfile::tempdir().unwrap();
+        let lodash_store = create_fake_store_package(store_dir.path(), "lodash");
+
+        // One LinkTarget for lodash@4.18.1 with FOUR root link slots:
+        // the canonical name + three npm-alias names. Mirrors what
+        // `resolved_to_install_packages` produces for a project
+        // that declares `lodash, lodash-a: npm:lodash, lodash-b:
+        // npm:lodash, lodash-c: npm:lodash`.
+        let packages = vec![LinkTarget {
+            name: "lodash".to_string(),
+            version: "4.18.1".to_string(),
+            store_path: lodash_store,
+            dependencies: vec![],
+            aliases: HashMap::new(),
+            is_direct: true,
+            root_link_names: Some(vec![
+                "lodash".to_string(),
+                "lodash-a".to_string(),
+                "lodash-b".to_string(),
+                "lodash-c".to_string(),
+            ]),
+            wrapper_id: None,
+            materialization: Materialization::CasBacked,
+            peers: Vec::new(),
+        }];
+
+        let result = link_packages_hoisted(project_dir.path(), &packages, false, None).unwrap();
+        // Four top-level slots → four link operations.
+        assert_eq!(
+            result.linked, 4,
+            "v1 hoisted must materialize each root_link_names entry as a \
+             distinct top-level node_modules/<name>/ directory; pre-fix \
+             only the canonical (`lodash`) was created and the three \
+             aliases lost their dirs"
+        );
+
+        for slot in ["lodash", "lodash-a", "lodash-b", "lodash-c"] {
+            let path = project_dir.path().join("node_modules").join(slot);
+            assert!(
+                path.exists(),
+                "node_modules/{slot}/ must exist after install — pre-fix \
+                 only `lodash` survived; aliases were silently dropped"
+            );
+            // Each alias dir must carry the canonical's package.json
+            // contents (the alias is just a different on-disk name
+            // for the same source bytes).
+            let pj = path.join("package.json");
+            assert!(
+                pj.exists(),
+                "node_modules/{slot}/package.json must be the canonical \
+                 lodash manifest — alias slots are different on-disk \
+                 names backed by the same store entry"
+            );
+        }
+
+        // Sanity: aliased deps are NOT direct UNDER the alias name —
+        // the canonical's `is_direct = true` is preserved through
+        // the slot expansion. (Materialized records use `pkg.name`
+        // for identity, so all 4 destinations share `name=lodash`.)
+        assert_eq!(result.materialized.len(), 4);
+        assert!(
+            result.materialized.iter().all(|m| m.name == "lodash"),
+            "all 4 MaterializedPackage entries must share the canonical \
+             name (`lodash`) — the slot only affects on-disk path, not \
+             package identity used by patches and lifecycle scripts"
+        );
     }
 
     #[test]
