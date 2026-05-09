@@ -7,11 +7,13 @@
 //! Remaining: 2FA header injection, batched metadata.
 //! ETag/304 revalidation, MessagePack cache, HMAC-signed cache entries (constant-time verified).
 
-use crate::npmrc::TlsOverrides;
+use crate::npmrc::{OriginKey, OriginTlsOverrides, TaggedRoot, TlsOverrides};
+use crate::tls_identity::{EnvThenTtyPassphrase, PassphraseProvider, load_identity};
 use crate::types::*;
 use lpm_auth::{RefreshPolicy, SessionManager};
 use lpm_common::{DEFAULT_REGISTRY_URL, LpmError, LpmRoot, NPM_REGISTRY_URL, PackageName};
 use secrecy::{ExposeSecret, SecretString};
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -241,7 +243,11 @@ pub struct FanOutStats {
 
 /// Client for communicating with the LPM registry.
 pub struct RegistryClient {
-    http: reqwest::Client,
+    /// Phase 58.3 — bundle of HTTP clients keyed by origin. Default
+    /// client + eager + lazy per-origin clients all live behind one
+    /// `Arc<HttpClients>` so cloning the registry client is one
+    /// ref-bump and the per-origin pool fragmentation is contained.
+    http: Arc<HttpClients>,
     /// Base URL of the LPM registry (default: https://lpm.dev).
     base_url: String,
     /// Base URL of the direct npm registry fallback.
@@ -277,6 +283,260 @@ pub struct RegistryClient {
     /// they keep using `self.token`. Step 4 layers on the posture-aware
     /// dispatch and the 401 → refresh → retry path.
     session: Option<Arc<SessionManager>>,
+}
+
+// ============================================================================
+// Phase 58.3 — Per-origin HTTP client cache
+// ============================================================================
+
+/// Bundle of HTTP clients keyed by origin. One [`RegistryClient`] holds
+/// one of these via `Arc<>` so the per-origin clients survive
+/// `clone_with_config` and ride along every request the
+/// resolver/installer issues.
+///
+/// **Three tiers:**
+///
+/// 1. `default` — used for any origin not in `eager` or `lazy`. Built
+///    with the global TLS surface (extra_roots, global identity,
+///    strict_ssl).
+/// 2. `eager` — pre-built clients for origins this invocation provably
+///    reaches. Computed by T4's effective_registry_origins from the
+///    explicit top-level request set + the route table. Read-only
+///    after `with_tls_overrides_for` returns; lookups don't lock.
+/// 3. `lazy` — clients built on first request to a previously-unseen
+///    origin (tarball CDN that differs from the metadata host, etc.).
+///    Single-flight per origin via the tokio mutex: concurrent callers
+///    for the same new origin queue on the lock, second sees the
+///    entry inserted by the first.
+///
+/// **Fallback rule** for both eager and lazy: try `(host, Some(port))`
+/// first, fall back to `(host, None)` so an `.npmrc` entry without an
+/// explicit port covers any port for that host. Mirrors
+/// [`OriginKey`]'s scheme-agnostic auth lookup.
+pub struct HttpClients {
+    default: reqwest::Client,
+    eager: HashMap<OriginKey, reqwest::Client>,
+    lazy: tokio::sync::Mutex<HashMap<OriginKey, reqwest::Client>>,
+    /// Snapshot of the TLS overrides used to build `default` and
+    /// `eager`. Held here so lazy builds can construct matching
+    /// per-origin clients on demand.
+    tls_overrides: Arc<TlsOverrides>,
+    /// Shared passphrase provider — one instance across all per-origin
+    /// builds (eager + lazy). The inner `PassphraseCache` memoizes
+    /// across calls; a fresh provider per build would defeat it.
+    passphrase: Arc<dyn PassphraseProvider>,
+}
+
+impl std::fmt::Debug for HttpClients {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HttpClients")
+            .field(
+                "eager_origins",
+                &self.eager.keys().map(|k| k.to_string()).collect::<Vec<_>>(),
+            )
+            .field("tls_overrides", &self.tls_overrides)
+            .finish_non_exhaustive()
+    }
+}
+
+impl HttpClients {
+    /// Build an `HttpClients` whose `default` is the supplied client
+    /// and whose eager/lazy maps are empty. Used by [`RegistryClient::new`]
+    /// before any `.npmrc` is loaded.
+    fn from_default_client(default: reqwest::Client) -> Arc<Self> {
+        Arc::new(Self {
+            default,
+            eager: HashMap::new(),
+            lazy: tokio::sync::Mutex::new(HashMap::new()),
+            tls_overrides: Arc::new(TlsOverrides::default()),
+            passphrase: Arc::new(EnvThenTtyPassphrase::new()),
+        })
+    }
+
+    /// Look up a client for `url` without lazy-building. Returns the
+    /// eager-built per-origin client if one exists, else the default.
+    /// Sync, infallible — suitable for hot paths.
+    pub fn for_url_no_build(&self, url: &str) -> &reqwest::Client {
+        let Some(origin) = OriginKey::from_request_url(url) else {
+            return &self.default;
+        };
+        if let Some(c) = self.eager.get(&origin) {
+            return c;
+        }
+        let any_port = OriginKey {
+            host_lower: origin.host_lower,
+            port: None,
+        };
+        if let Some(c) = self.eager.get(&any_port) {
+            return c;
+        }
+        &self.default
+    }
+
+    /// Look up (or lazily build) a client for `url`. Returns the eager
+    /// or lazy per-origin client if one exists OR can be constructed
+    /// for an origin that has per-origin TLS configuration; otherwise
+    /// returns the default.
+    ///
+    /// Async + fallible because lazy build can perform IO (read
+    /// per-origin cafile, decrypt PKCS#8 keyfile via the passphrase
+    /// provider). For origins guaranteed to be eager-built, prefer
+    /// [`Self::for_url_no_build`] — it's sync and infallible.
+    ///
+    /// Single-flight: while the build is in flight, concurrent callers
+    /// queue on `lazy.lock()`. The second caller observes the
+    /// just-inserted entry and skips the build.
+    pub async fn for_url(&self, url: &str) -> Result<reqwest::Client, LpmError> {
+        let Some(origin) = OriginKey::from_request_url(url) else {
+            return Ok(self.default.clone());
+        };
+        if let Some(c) = self.eager.get(&origin) {
+            return Ok(c.clone());
+        }
+        let any_port = OriginKey {
+            host_lower: origin.host_lower.clone(),
+            port: None,
+        };
+        if let Some(c) = self.eager.get(&any_port) {
+            return Ok(c.clone());
+        }
+        let mut guard = self.lazy.lock().await;
+        if let Some(c) = guard.get(&origin) {
+            return Ok(c.clone());
+        }
+        if let Some(c) = guard.get(&any_port) {
+            return Ok(c.clone());
+        }
+        // No client cached. Look up per-origin TLS for this origin.
+        let per_origin_tls = self
+            .tls_overrides
+            .per_origin
+            .get(&origin)
+            .or_else(|| self.tls_overrides.per_origin.get(&any_port));
+        let Some(per_origin_tls) = per_origin_tls else {
+            // No per-origin TLS → use default client.
+            return Ok(self.default.clone());
+        };
+        // Build under lock — single-flight per origin.
+        let client = build_per_origin_http_client(
+            &self.tls_overrides,
+            per_origin_tls,
+            &origin,
+            self.passphrase.as_ref(),
+        )?;
+        guard.insert(origin, client.clone());
+        Ok(client)
+    }
+}
+
+/// Build a `reqwest::Client` for a specific origin, layering its
+/// per-origin TLS overrides on top of the global TLS surface.
+///
+/// Composition rules:
+///
+/// - **Trust roots**: global `extra_roots` PLUS this origin's
+///   `cafiles` (additive — both are valid). Per-origin `cafile=` is
+///   read here (deferred-read per Phase 58.3 Δ1 scoping); IO failures
+///   surface with cited source/line.
+/// - **Identity**: per-origin `(certfile, keyfile)` REPLACES the
+///   global identity for this origin. Per-origin XOR validation fires
+///   here (Δ2 scoping), so a half-configured per-origin identity
+///   only fails the install if THIS origin is built.
+/// - **strict-ssl**: global only. Per-origin strict-ssl is not
+///   supported in v1; the parser warns if used per-origin.
+///
+/// Caller is responsible for caching the returned client. The
+/// passphrase provider is shared across all per-origin builds so its
+/// inner `PassphraseCache` memoizes across calls.
+fn build_per_origin_http_client(
+    global: &TlsOverrides,
+    per_origin: &OriginTlsOverrides,
+    origin: &OriginKey,
+    passphrase: &dyn PassphraseProvider,
+) -> Result<reqwest::Client, LpmError> {
+    // Step 1 — compose extra roots: global + per-origin (additive).
+    // Per-origin cafiles are deferred-read; do the IO here.
+    let mut all_roots: Vec<TaggedRoot> = global.extra_roots.clone();
+    for cafile in &per_origin.cafiles {
+        let resolved = cafile.resolve();
+        let bytes = std::fs::read(&resolved).map_err(|e| {
+            LpmError::Cert(format!(
+                "{}:{}: failed to read per-origin cafile for {origin} ({}): {e}",
+                cafile.source,
+                cafile.line,
+                resolved.display()
+            ))
+        })?;
+        if !contains_pem_certificate_block_inline(&bytes) {
+            return Err(LpmError::Cert(format!(
+                "{}:{}: per-origin cafile for {origin} ({}) contains no '-----BEGIN CERTIFICATE-----' block",
+                cafile.source,
+                cafile.line,
+                resolved.display()
+            )));
+        }
+        all_roots.push(TaggedRoot {
+            pem_bytes: bytes,
+            source: cafile.source.clone(),
+            line: cafile.line,
+        });
+    }
+
+    // Step 2 — resolve identity. Per-origin replaces global; per-origin
+    // XOR validation is Δ2-scoped (only fatal when this origin is built).
+    let identity: Option<reqwest::Identity> =
+        match (per_origin.certfile.as_ref(), per_origin.keyfile.as_ref()) {
+            (Some(cert), Some(key)) => Some(load_identity(cert, key, passphrase)?),
+            (Some(cert), None) => {
+                return Err(LpmError::Cert(format!(
+                    "{}:{}: per-origin certfile is set for {origin} but matching keyfile is missing across all merged layers — both must be set or both absent",
+                    cert.source, cert.line
+                )));
+            }
+            (None, Some(key)) => {
+                return Err(LpmError::Cert(format!(
+                    "{}:{}: per-origin keyfile is set for {origin} but matching certfile is missing across all merged layers — both must be set or both absent",
+                    key.source, key.line
+                )));
+            }
+            // No per-origin identity → inherit global (if any).
+            (None, None) => match (
+                global.identity_certfile.as_ref(),
+                global.identity_keyfile.as_ref(),
+            ) {
+                (Some(cert), Some(key)) => Some(load_identity(cert, key, passphrase)?),
+                // Global XOR is finalize-time fatal; if we got here
+                // with half-set, finalize would have aborted upstream.
+                // Treat as "no identity" defensively.
+                _ => None,
+            },
+        };
+
+    // Step 3 — synthesize a per-origin TlsOverrides view: combined
+    // roots + global strict_ssl. Per-origin map cleared (this is a
+    // single-origin client — no further dispatch lives below it).
+    let synthetic = TlsOverrides {
+        extra_roots: all_roots,
+        strict_ssl: global.strict_ssl.clone(),
+        identity_certfile: None,
+        identity_keyfile: None,
+        per_origin: HashMap::new(),
+    };
+    RegistryClient::build_http_client_with_tls_and_identity(
+        CONNECT_TIMEOUT,
+        READ_TIMEOUT,
+        &synthetic,
+        identity,
+    )
+}
+
+/// Inline PEM marker check — duplicates the parser-time helper in
+/// `npmrc.rs` since that one is private. Kept private here too;
+/// the duplication is one byte-search per per-origin cafile build,
+/// which is negligible.
+fn contains_pem_certificate_block_inline(bytes: &[u8]) -> bool {
+    const MARKER: &[u8] = b"-----BEGIN CERTIFICATE-----";
+    bytes.windows(MARKER.len()).any(|w| w == MARKER)
 }
 
 impl RegistryClient {
@@ -345,6 +605,43 @@ impl RegistryClient {
         read_timeout: Duration,
         tls: &TlsOverrides,
     ) -> Result<reqwest::Client, LpmError> {
+        // Resolve the global identity (Phase 58.3) inline so existing
+        // call sites that don't yet thread per-origin TLS through still
+        // pick up `certfile=`/`keyfile=` from `~/.npmrc` correctly.
+        // The XOR contract is enforced at `NpmrcConfig::finalize`, so
+        // by the time we get here, either both are present or neither.
+        let global_identity = match (
+            tls.identity_certfile.as_ref(),
+            tls.identity_keyfile.as_ref(),
+        ) {
+            (Some(cert), Some(key)) => {
+                let pp = EnvThenTtyPassphrase::new();
+                Some(load_identity(cert, key, &pp)?)
+            }
+            _ => None,
+        };
+        Self::build_http_client_with_tls_and_identity(
+            connect_timeout,
+            read_timeout,
+            tls,
+            global_identity,
+        )
+    }
+
+    /// Phase 58.3 — variant of `build_http_client_with_tls` that takes
+    /// a pre-resolved [`reqwest::Identity`].
+    ///
+    /// Used by the per-origin client builder (`build_per_origin_http_client`)
+    /// which resolves the effective identity for each origin (per-origin
+    /// overrides global) before calling here. The wrapping
+    /// `build_http_client_with_tls` handles the global-identity case
+    /// inline so prior call sites continue to work.
+    fn build_http_client_with_tls_and_identity(
+        connect_timeout: Duration,
+        read_timeout: Duration,
+        tls: &TlsOverrides,
+        identity: Option<reqwest::Identity>,
+    ) -> Result<reqwest::Client, LpmError> {
         let mut b = reqwest::Client::builder()
             .connect_timeout(connect_timeout)
             .read_timeout(read_timeout)
@@ -378,13 +675,17 @@ impl RegistryClient {
         {
             b = b.danger_accept_invalid_certs(true);
         }
+        if let Some(id) = identity {
+            b = b.identity(id);
+        }
         b.build()
             .map_err(|e| LpmError::Cert(format!("HTTP client build failed: {e}")))
     }
 
     /// Create a new registry client with default settings.
     pub fn new() -> Self {
-        let http = Self::build_http_client(CONNECT_TIMEOUT, READ_TIMEOUT);
+        let default_client = Self::build_http_client(CONNECT_TIMEOUT, READ_TIMEOUT);
+        let http = HttpClients::from_default_client(default_client);
 
         // Initialize metadata cache at ~/.lpm/cache/metadata/ via LpmRoot.
         // `None` here is a graceful degradation: if we can't even resolve a
@@ -490,25 +791,97 @@ impl RegistryClient {
 
     /// Phase 58.1 — apply `.npmrc`-derived TLS overrides to this client.
     ///
-    /// Rebuilds the inner `reqwest::Client` with `cafile`/`ca` extra roots
-    /// attached and `strict-ssl=false` honored. Called once by `install.rs`
-    /// after building the `RouteTable`, before any network is touched.
+    /// Rebuilds the inner default `reqwest::Client` with `cafile`/`ca`
+    /// extra roots attached, `strict-ssl=false` honored, and (Phase
+    /// 58.3) global `certfile`/`keyfile` mTLS identity attached.
+    ///
+    /// Phase 58.3 layered: this builds only the DEFAULT client. To
+    /// also pre-build per-origin clients for the origins this
+    /// invocation provably reaches, use [`Self::with_tls_overrides_for`]
+    /// (the route-table-aware variant) instead. `install.rs` and
+    /// `add.rs` will call `_for` once T4 is wired; `with_tls_overrides`
+    /// remains for callers that don't need per-origin pre-building.
     ///
     /// Fast path: with `TlsOverrides::default()` (no `.npmrc`, or one
-    /// that says nothing about TLS), this returns `self` unchanged — the
-    /// default `reqwest` client already has full system-root verification
-    /// enabled, so no rebuild is needed.
+    /// that says nothing about TLS), this returns `self` unchanged.
     ///
     /// **Orthogonal to `--insecure`.** That flag widens scheme acceptance
-    /// (HTTP non-localhost); this widens cert verification. The two flags
-    /// solve different threat models and are independent.
-    pub fn with_tls_overrides(mut self, tls: &TlsOverrides) -> Result<Self, LpmError> {
-        let needs_rebuild =
-            !tls.extra_roots.is_empty() || matches!(tls.strict_ssl.as_ref(), Some(t) if !t.value);
-        if !needs_rebuild {
+    /// (HTTP non-localhost); this widens cert verification.
+    pub fn with_tls_overrides(self, tls: &TlsOverrides) -> Result<Self, LpmError> {
+        // Empty effective set → no eager per-origin clients. Δ1 default.
+        self.with_tls_overrides_for(tls, &[])
+    }
+
+    /// Phase 58.3 — apply `.npmrc`-derived TLS overrides AND eagerly
+    /// build per-origin clients for the supplied set of origins.
+    ///
+    /// `eager_origins` is the request-aware effective-origin set
+    /// computed by T4 from the top-level package request + the route
+    /// table. Origins not in the set, but with per-origin TLS
+    /// configured, build lazily on first use via
+    /// [`HttpClients::for_url`].
+    ///
+    /// **Eager-build failure semantics.** If any of the supplied
+    /// origins has per-origin TLS configured AND its identity load
+    /// (encrypted PKCS#8 decryption, file IO, etc.) fails, this
+    /// method returns `Err(LpmError::Cert(...))` with the cited
+    /// source/line. Origins NOT in `eager_origins` (transitive
+    /// scopes, tarball CDNs) are not touched here — half-configured
+    /// per-origin TLS for unreached origins does not abort the
+    /// install, per Phase 58.3 Δ2 scoping.
+    pub fn with_tls_overrides_for(
+        mut self,
+        tls: &TlsOverrides,
+        eager_origins: &[OriginKey],
+    ) -> Result<Self, LpmError> {
+        let needs_rebuild = !tls.extra_roots.is_empty()
+            || matches!(tls.strict_ssl.as_ref(), Some(t) if !t.value)
+            || tls.identity_certfile.is_some()
+            || tls.identity_keyfile.is_some()
+            || !tls.per_origin.is_empty();
+        if !needs_rebuild && eager_origins.is_empty() {
             return Ok(self);
         }
-        self.http = Self::build_http_client_with_tls(CONNECT_TIMEOUT, READ_TIMEOUT, tls)?;
+        // Reuse the existing passphrase provider so its inner cache
+        // (built up across previous calls) survives into the new
+        // HttpClients. First-build path falls back to a fresh provider.
+        let passphrase = Arc::clone(&self.http.passphrase);
+        let default_client =
+            Self::build_http_client_with_tls(CONNECT_TIMEOUT, READ_TIMEOUT, tls)?;
+        // Eager per-origin builds — only for origins in the supplied
+        // set that ALSO have per-origin TLS configured. Δ1 narrows
+        // the set further at the data layer.
+        let mut eager_map = HashMap::new();
+        for origin in eager_origins {
+            // Look up per-origin TLS using the same (host, Some(port))
+            // → (host, None) fallback as the auth path.
+            let any_port = OriginKey {
+                host_lower: origin.host_lower.clone(),
+                port: None,
+            };
+            let per_origin_tls = tls
+                .per_origin
+                .get(origin)
+                .or_else(|| tls.per_origin.get(&any_port));
+            let Some(per_origin_tls) = per_origin_tls else {
+                continue;
+            };
+            let client = build_per_origin_http_client(
+                tls,
+                per_origin_tls,
+                origin,
+                passphrase.as_ref(),
+            )?;
+            eager_map.insert(origin.clone(), client);
+        }
+        let http = Arc::new(HttpClients {
+            default: default_client,
+            eager: eager_map,
+            lazy: tokio::sync::Mutex::new(HashMap::new()),
+            tls_overrides: Arc::new(tls.clone()),
+            passphrase,
+        });
+        self.http = http;
         Ok(self)
     }
 
@@ -678,6 +1051,7 @@ impl RegistryClient {
             .execute_with_recovery(AuthPosture::AuthRequired, || async {
                 let mut req = self
                     .http
+                    .for_url_no_build(&url)
                     .post(&url)
                     .header("Accept", "application/x-ndjson")
                     .json(&body);
@@ -1106,6 +1480,7 @@ impl RegistryClient {
         let response = match self
             .send_with_retry(
                 self.http
+                    .for_url_no_build(&npm_url)
                     .get(&npm_url)
                     .header("Accept", "application/vnd.npm.install-v1+json"),
             )
@@ -1159,6 +1534,7 @@ impl RegistryClient {
         let response = match self
             .send_with_retry(
                 self.http
+                    .for_url_no_build(&npm_url)
                     .get(&npm_url)
                     .header("Accept", "application/vnd.npm.install-v1+json"),
             )
@@ -1308,6 +1684,7 @@ impl RegistryClient {
         tracing::debug!("fetching {name} from custom registry {base_url}");
         let req = self
             .http
+            .for_url_no_build(&url)
             .get(&url)
             .header("Accept", "application/vnd.npm.install-v1+json");
         // `apply_npmrc_auth` does the origin-mismatch defensive check
@@ -1624,7 +2001,7 @@ impl RegistryClient {
         max_compressed_size: u64,
     ) -> Result<DownloadedTarball, LpmError> {
         self.check_tarball_url_scheme(url)?;
-        let req = self.http.get(url);
+        let req = self.http.for_url_no_build(url).get(url);
         let req = apply_npmrc_auth(req, url, auth)?;
         let mut response = self.send_with_retry(req).await?;
 
@@ -1699,7 +2076,7 @@ impl RegistryClient {
         auth: Option<&crate::npmrc::RegistryAuth>,
     ) -> Result<reqwest::Response, LpmError> {
         self.check_tarball_url_scheme(url)?;
-        let req = self.http.get(url);
+        let req = self.http.for_url_no_build(url).get(url);
         let req = apply_npmrc_auth(req, url, auth)?;
         let response = self.send_with_retry(req).await?;
 
@@ -2078,7 +2455,7 @@ impl RegistryClient {
                 .current_bearer(AuthPosture::AuthRequired)
                 .ok_or_else(|| LpmError::Registry("no token to revoke".to_string()))?;
             let body = serde_json::json!({ "token": bearer });
-            let req = self.http.post(&url).bearer_auth(&bearer).json(&body);
+            let req = self.http.for_url_no_build(&url).post(&url).bearer_auth(&bearer).json(&body);
             let response = self.send_with_retry(req).await?;
             if response.status().is_success() {
                 Ok(())
@@ -2379,7 +2756,7 @@ impl RegistryClient {
             )
         };
         self.execute_with_recovery(AuthPosture::SessionRequired, || async {
-            let mut req = self.http.delete(&url);
+            let mut req = self.http.for_url_no_build(&url).delete(&url);
             if let Some(bearer) = self.current_bearer(AuthPosture::SessionRequired) {
                 req = req.bearer_auth(bearer);
             }
@@ -2702,7 +3079,7 @@ impl RegistryClient {
         url: &str,
         body: &serde_json::Value,
     ) -> Result<reqwest::Response, LpmError> {
-        let mut req = self.http.post(url).json(body);
+        let mut req = self.http.for_url_no_build(url).post(url).json(body);
         if let Some(bearer) = self.current_bearer(AuthPosture::AuthRequired) {
             req = req.bearer_auth(bearer);
         }
@@ -2724,7 +3101,7 @@ impl RegistryClient {
     /// returns `None` for those postures, so this just wires the
     /// caller's choice through.
     fn build_get_with_posture(&self, url: &str, posture: AuthPosture) -> reqwest::RequestBuilder {
-        let mut req = self.http.get(url);
+        let mut req = self.http.for_url_no_build(url).get(url);
         if let Some(bearer) = self.current_bearer(posture) {
             req = req.bearer_auth(bearer);
         }
@@ -2918,7 +3295,11 @@ impl RegistryClient {
                 LpmError::Network("request body cannot be retried (not cloneable)".into())
             })?;
 
-            match self.http.execute(req).await {
+            // Phase 58.3 — route via the request's URL so a per-origin
+            // client (eager hit) handles its own TLS context. Falls
+            // back to default for any URL not in the eager set.
+            let client_for_req = self.http.for_url_no_build(req.url().as_str());
+            match client_for_req.execute(req).await {
                 Ok(response) => {
                     let status = response.status().as_u16();
 
@@ -3038,7 +3419,9 @@ impl RegistryClient {
                 LpmError::Network("request body cannot be retried (not cloneable)".into())
             })?;
 
-            match self.http.execute(req).await {
+            // Phase 58.3 — same URL-aware routing as the publish path.
+            let client_for_req = self.http.for_url_no_build(req.url().as_str());
+            match client_for_req.execute(req).await {
                 Ok(response) => {
                     let status = response.status().as_u16();
 
@@ -6995,7 +7378,7 @@ mod tests {
         // that bound by sending every 300 ms.
         let tmp = tempfile::tempdir().expect("temp dir");
         let short = std::time::Duration::from_millis(500);
-        let http = RegistryClient::build_http_client(short, short);
+        let http_default = RegistryClient::build_http_client(short, short);
 
         // Stream 4 NDJSON lines at 200 ms apart → 800 ms wall-clock
         // total. That's ~1.6× the 500 ms window a wall-clock
@@ -7009,7 +7392,9 @@ mod tests {
                 .await;
 
         let mut client = RegistryClient::new().with_base_url(&base_url);
-        client.http = http;
+        // Phase 58.3 — `http` is now `Arc<HttpClients>`. Wrap the
+        // short-timeout default client in a fresh HttpClients shell.
+        client.http = HttpClients::from_default_client(http_default);
         client.cache_dir = Some(tmp.path().to_path_buf());
 
         let started = std::time::Instant::now();
@@ -7066,7 +7451,8 @@ mod tests {
                 .await;
 
         let mut client = RegistryClient::new().with_base_url(&base_url);
-        client.http = old_style_http;
+        // Phase 58.3 — wrap the wall-clock-timeout client in HttpClients.
+        client.http = HttpClients::from_default_client(old_style_http);
         client.cache_dir = Some(tmp.path().to_path_buf());
 
         let result = client.batch_metadata_deep(&packages).await;
@@ -8166,5 +8552,345 @@ mod tests {
             client.with_tls_overrides(&tls).is_ok(),
             "two valid concatenated cert blocks must pass"
         );
+    }
+
+    // ---- Phase 58.3 — HttpClients dispatch ----
+
+    /// Default + empty eager + empty lazy → every URL routes to default.
+    #[test]
+    fn http_clients_default_only_returns_default_for_every_url() {
+        let client = RegistryClient::new();
+        // Two distinct origins, both fall through to default since no
+        // per-origin TLS is configured.
+        let c1 = client.http.for_url_no_build("https://registry.npmjs.org/react");
+        let c2 = client.http.for_url_no_build("https://corp.internal/lib");
+        // Pointer equality on `&reqwest::Client` is the precise check —
+        // both must point to the SAME default client, not equivalent
+        // copies. (`Arc`-internal so equality of the underlying Arc
+        // pointers is what we want.)
+        assert!(std::ptr::eq(c1, c2), "every URL must route to default");
+    }
+
+    /// Eager hit: if the eager map has an entry for this origin, the
+    /// dispatcher returns that client, NOT the default. This is the
+    /// load-bearing test for `with_tls_overrides_for` per-origin
+    /// pre-build.
+    #[test]
+    fn http_clients_eager_hit_overrides_default() {
+        // Build with a per-origin cafile entry (deferred-read; no
+        // actual file IO since we'll synthesize the eager entry).
+        let pem = rcgen_pem();
+        // Synthesize an HttpClients directly so the test doesn't need
+        // a real .npmrc parse (the eager build path needs file IO,
+        // which we exercise in the integration test for mTLS proper).
+        let default = RegistryClient::build_http_client(CONNECT_TIMEOUT, READ_TIMEOUT);
+        let per_origin_client = reqwest::Client::builder()
+            .add_root_certificate(reqwest::Certificate::from_pem(&pem).expect("rcgen pem"))
+            .build()
+            .expect("client build");
+        let origin = OriginKey {
+            host_lower: "corp.internal".into(),
+            port: None,
+        };
+        let mut eager = HashMap::new();
+        eager.insert(origin.clone(), per_origin_client.clone());
+        let http = Arc::new(HttpClients {
+            default: default.clone(),
+            eager,
+            lazy: tokio::sync::Mutex::new(HashMap::new()),
+            tls_overrides: Arc::new(TlsOverrides::default()),
+            passphrase: Arc::new(crate::tls_identity::EnvThenTtyPassphrase::new()),
+        });
+        let mut client = RegistryClient::new();
+        client.http = http;
+        // Eager origin → per_origin_client (NOT default).
+        let picked = client.http.for_url_no_build("https://corp.internal:443/foo");
+        // Different origin → default.
+        let other = client.http.for_url_no_build("https://other.example/bar");
+        // Pointer-eq each against the source it should match.
+        assert!(
+            std::ptr::eq(picked, client.http.eager.get(&origin).unwrap()),
+            "eager origin must dispatch to its registered client"
+        );
+        assert!(
+            std::ptr::eq(other, &client.http.default),
+            "non-eager origin must dispatch to default"
+        );
+    }
+
+    /// Port fallback: an eager entry with `port: None` must match
+    /// requests on any port for that host. Mirrors auth_for_url's
+    /// match rule.
+    #[test]
+    fn http_clients_eager_port_none_matches_any_port() {
+        let default = RegistryClient::build_http_client(CONNECT_TIMEOUT, READ_TIMEOUT);
+        let pem = rcgen_pem();
+        let per_origin_client = reqwest::Client::builder()
+            .add_root_certificate(reqwest::Certificate::from_pem(&pem).expect("rcgen pem"))
+            .build()
+            .expect("client build");
+        // Insert with port: None.
+        let key_no_port = OriginKey {
+            host_lower: "host.internal".into(),
+            port: None,
+        };
+        let mut eager = HashMap::new();
+        eager.insert(key_no_port.clone(), per_origin_client);
+        let http = Arc::new(HttpClients {
+            default,
+            eager,
+            lazy: tokio::sync::Mutex::new(HashMap::new()),
+            tls_overrides: Arc::new(TlsOverrides::default()),
+            passphrase: Arc::new(crate::tls_identity::EnvThenTtyPassphrase::new()),
+        });
+        let mut client = RegistryClient::new();
+        client.http = http;
+        // Both 443 (default https) and 8443 must hit the no-port entry.
+        let picked_443 = client.http.for_url_no_build("https://host.internal/foo");
+        let picked_8443 = client.http.for_url_no_build("https://host.internal:8443/bar");
+        let stored = client.http.eager.get(&key_no_port).unwrap();
+        assert!(std::ptr::eq(picked_443, stored));
+        assert!(std::ptr::eq(picked_8443, stored));
+    }
+
+    /// Lazy build: an origin with per-origin TLS configured but NOT
+    /// in the eager set should be lazy-built on first request, then
+    /// cached.
+    #[tokio::test]
+    async fn http_clients_lazy_builds_and_memoizes() {
+        // Synthesize TlsOverrides with a per-origin cafile pointing
+        // at a real PEM file, but don't pre-build the eager client.
+        let pem = rcgen_pem();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let ca_path = dir.path().join("ca.pem");
+        std::fs::write(&ca_path, &pem).unwrap();
+        let origin = OriginKey {
+            host_lower: "lazy.internal".into(),
+            port: None,
+        };
+        let mut per_origin_map = HashMap::new();
+        per_origin_map.insert(
+            origin.clone(),
+            crate::npmrc::OriginTlsOverrides {
+                cafiles: vec![crate::npmrc::TaggedPath {
+                    path: ca_path,
+                    source: "test".into(),
+                    line: 1,
+                    source_dir: None,
+                }],
+                certfile: None,
+                keyfile: None,
+            },
+        );
+        let tls = TlsOverrides {
+            per_origin: per_origin_map,
+            ..Default::default()
+        };
+        let default = RegistryClient::build_http_client(CONNECT_TIMEOUT, READ_TIMEOUT);
+        let http = Arc::new(HttpClients {
+            default,
+            eager: HashMap::new(),
+            lazy: tokio::sync::Mutex::new(HashMap::new()),
+            tls_overrides: Arc::new(tls),
+            passphrase: Arc::new(crate::tls_identity::EnvThenTtyPassphrase::new()),
+        });
+        // First call must build + insert.
+        let c1 = http.for_url("https://lazy.internal/pkg").await.expect("ok");
+        // Second call must hit the lazy cache (not rebuild).
+        let c2 = http.for_url("https://lazy.internal/other").await.expect("ok");
+        // Same origin → same cached entry. The dispatcher inserts
+        // under the URL's concrete-port origin (`Some(443)` for
+        // HTTPS), not the configured port-None entry — both calls
+        // produce the same key, so the second call's `guard.get`
+        // hits without rebuild. Verify the lazy map has exactly one
+        // entry, keyed by the concrete-port origin.
+        let concrete_port_key = OriginKey {
+            host_lower: "lazy.internal".into(),
+            port: Some(443),
+        };
+        let map = http.lazy.lock().await;
+        assert_eq!(map.len(), 1, "lazy map must contain exactly one entry");
+        assert!(
+            map.contains_key(&concrete_port_key),
+            "lazy entry must be keyed by the URL's concrete-port origin (got keys: {:?})",
+            map.keys().map(|k| k.to_string()).collect::<Vec<_>>()
+        );
+        // The originally-configured port-None origin is the per_origin
+        // TLS lookup key, not the lazy cache key — the dispatcher's
+        // (host, Some(port)) → (host, None) fallback bridges the two.
+        // Reference but unused: prevents the unused-binding warning.
+        let _ = origin;
+        // Sanity: both returned clients are usable Client values.
+        let _ = (c1, c2);
+    }
+
+    /// No per-origin TLS configured → lazy lookup falls through to
+    /// default without building anything.
+    #[tokio::test]
+    async fn http_clients_no_per_origin_tls_falls_through_to_default() {
+        let default = RegistryClient::build_http_client(CONNECT_TIMEOUT, READ_TIMEOUT);
+        let http = Arc::new(HttpClients {
+            default: default.clone(),
+            eager: HashMap::new(),
+            lazy: tokio::sync::Mutex::new(HashMap::new()),
+            tls_overrides: Arc::new(TlsOverrides::default()),
+            passphrase: Arc::new(crate::tls_identity::EnvThenTtyPassphrase::new()),
+        });
+        let _ = http.for_url("https://anywhere.example/foo").await.expect("ok");
+        // Lazy map must remain empty (no per-origin TLS to build).
+        let map = http.lazy.lock().await;
+        assert!(map.is_empty());
+    }
+
+    /// Per-origin half-config (certfile alone, no keyfile) for a
+    /// reached origin must surface a cited error per Δ2 scoping.
+    #[tokio::test]
+    async fn http_clients_per_origin_certfile_xor_is_fatal_at_build() {
+        let dir = tempfile::tempdir().unwrap();
+        let cert_path = dir.path().join("cert.pem");
+        std::fs::write(&cert_path, "-----BEGIN CERTIFICATE-----\nx\n-----END CERTIFICATE-----\n").unwrap();
+        let origin = OriginKey {
+            host_lower: "halfconf.internal".into(),
+            port: None,
+        };
+        let mut per_origin_map = HashMap::new();
+        per_origin_map.insert(
+            origin.clone(),
+            crate::npmrc::OriginTlsOverrides {
+                cafiles: vec![],
+                certfile: Some(crate::npmrc::TaggedPath {
+                    path: cert_path,
+                    source: "test:.npmrc".into(),
+                    line: 7,
+                    source_dir: None,
+                }),
+                keyfile: None,
+            },
+        );
+        let tls = TlsOverrides {
+            per_origin: per_origin_map,
+            ..Default::default()
+        };
+        let default = RegistryClient::build_http_client(CONNECT_TIMEOUT, READ_TIMEOUT);
+        let http = Arc::new(HttpClients {
+            default,
+            eager: HashMap::new(),
+            lazy: tokio::sync::Mutex::new(HashMap::new()),
+            tls_overrides: Arc::new(tls),
+            passphrase: Arc::new(crate::tls_identity::EnvThenTtyPassphrase::new()),
+        });
+        let result = http.for_url("https://halfconf.internal/foo").await;
+        match result {
+            Err(LpmError::Cert(msg)) => {
+                assert!(msg.contains("test:.npmrc:7"), "msg: {msg}");
+                assert!(msg.contains("certfile"), "msg: {msg}");
+                assert!(msg.contains("keyfile"), "msg: {msg}");
+                assert!(msg.contains("halfconf.internal"), "msg: {msg}");
+            }
+            other => panic!("expected Cert error, got: {other:?}"),
+        }
+    }
+
+    /// Configured-but-unreached half-config for a different origin
+    /// must NOT abort an unrelated build (Δ1 + Δ2 scoping).
+    #[tokio::test]
+    async fn http_clients_unreached_half_config_does_not_break_unrelated_lookup() {
+        let dir = tempfile::tempdir().unwrap();
+        let cert_path = dir.path().join("cert.pem");
+        std::fs::write(&cert_path, "-----BEGIN CERTIFICATE-----\nx\n-----END CERTIFICATE-----\n").unwrap();
+        let unreached_origin = OriginKey {
+            host_lower: "unused.internal".into(),
+            port: None,
+        };
+        let mut per_origin_map = HashMap::new();
+        per_origin_map.insert(
+            unreached_origin,
+            crate::npmrc::OriginTlsOverrides {
+                cafiles: vec![],
+                certfile: Some(crate::npmrc::TaggedPath {
+                    path: cert_path,
+                    source: "test:.npmrc".into(),
+                    line: 7,
+                    source_dir: None,
+                }),
+                keyfile: None,
+            },
+        );
+        let tls = TlsOverrides {
+            per_origin: per_origin_map,
+            ..Default::default()
+        };
+        let default = RegistryClient::build_http_client(CONNECT_TIMEOUT, READ_TIMEOUT);
+        let http = Arc::new(HttpClients {
+            default,
+            eager: HashMap::new(),
+            lazy: tokio::sync::Mutex::new(HashMap::new()),
+            tls_overrides: Arc::new(tls),
+            passphrase: Arc::new(crate::tls_identity::EnvThenTtyPassphrase::new()),
+        });
+        // Request to a DIFFERENT origin must succeed (lookup → default).
+        let _ = http
+            .for_url("https://different.example/foo")
+            .await
+            .expect("unrelated lookup must not fail on unreached half-config");
+    }
+
+    /// `with_tls_overrides_for` eager-builds clients for the supplied
+    /// origin set when those origins have per-origin TLS configured.
+    /// Verified by spot-checking the eager map.
+    #[test]
+    fn with_tls_overrides_for_eager_builds_only_supplied_origins() {
+        // Two origins configured; we'll only ask for one.
+        let pem = rcgen_pem();
+        let dir = tempfile::tempdir().unwrap();
+        let ca1 = dir.path().join("ca1.pem");
+        let ca2 = dir.path().join("ca2.pem");
+        std::fs::write(&ca1, &pem).unwrap();
+        std::fs::write(&ca2, &pem).unwrap();
+        let origin1 = OriginKey {
+            host_lower: "wanted.internal".into(),
+            port: None,
+        };
+        let origin2 = OriginKey {
+            host_lower: "ignored.internal".into(),
+            port: None,
+        };
+        let mut per_origin_map = HashMap::new();
+        per_origin_map.insert(
+            origin1.clone(),
+            crate::npmrc::OriginTlsOverrides {
+                cafiles: vec![crate::npmrc::TaggedPath {
+                    path: ca1,
+                    source: "test".into(),
+                    line: 1,
+                    source_dir: None,
+                }],
+                certfile: None,
+                keyfile: None,
+            },
+        );
+        per_origin_map.insert(
+            origin2.clone(),
+            crate::npmrc::OriginTlsOverrides {
+                cafiles: vec![crate::npmrc::TaggedPath {
+                    path: ca2,
+                    source: "test".into(),
+                    line: 2,
+                    source_dir: None,
+                }],
+                certfile: None,
+                keyfile: None,
+            },
+        );
+        let tls = TlsOverrides {
+            per_origin: per_origin_map,
+            ..Default::default()
+        };
+        let client = RegistryClient::new()
+            .with_tls_overrides_for(&tls, std::slice::from_ref(&origin1))
+            .expect("eager build ok");
+        // Only origin1 was eager-built.
+        assert!(client.http.eager.contains_key(&origin1));
+        assert!(!client.http.eager.contains_key(&origin2));
     }
 }
