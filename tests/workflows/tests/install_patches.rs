@@ -108,7 +108,7 @@ fn write_lockfile(project: &TempProject, entries: &[(&str, &str, &[&str])]) {
         })
         .collect();
     let toml = format!(
-        "[metadata]\nlockfile-version = 1\nresolved-with = \"pubgrub\"\n\n{}\n",
+        "[metadata]\nlockfile-version = 2\nresolved-with = \"pubgrub\"\n\n{}\n",
         pkgs.join("\n")
     );
     project.write_file("lpm.lock", &toml);

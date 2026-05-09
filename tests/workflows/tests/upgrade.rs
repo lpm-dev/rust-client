@@ -62,7 +62,7 @@ fn seed_pinned_dep(
     project.write_file(
         "lpm.lock",
         &format!(
-            "[metadata]\nlockfile-version = 1\nresolved-with = \"greedy-fusion\"\n\n\
+            "[metadata]\nlockfile-version = 2\nresolved-with = \"greedy-fusion\"\n\n\
              [[packages]]\nname = \"{pkg}\"\nversion = \"{installed_version}\"\n\
              source = \"registry+https://lpm.dev\"\n",
         ),
@@ -131,7 +131,7 @@ async fn upgrade_skips_npm_packages_in_dependencies() {
     );
     project.write_file(
         "lpm.lock",
-        "[metadata]\nlockfile-version = 1\nresolved-with = \"greedy-fusion\"\n\n\
+        "[metadata]\nlockfile-version = 2\nresolved-with = \"greedy-fusion\"\n\n\
          [[packages]]\nname = \"ms\"\nversion = \"2.1.3\"\n\
          source = \"registry+https://lpm.dev\"\n",
     );
@@ -472,7 +472,7 @@ fn up7_write_lockfile(project: &TempProject, entries: &[(&str, &str)]) {
         .map(|(n, v)| format!("[[packages]]\nname = \"{n}\"\nversion = \"{v}\"\n"))
         .collect();
     let lf = format!(
-        "[metadata]\nlockfile-version = 1\nresolved-with = \"pubgrub\"\n\n{}\n",
+        "[metadata]\nlockfile-version = 2\nresolved-with = \"pubgrub\"\n\n{}\n",
         pkgs.join("\n")
     );
     project.write_file("lpm.lock", &lf);

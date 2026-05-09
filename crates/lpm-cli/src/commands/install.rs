@@ -3853,7 +3853,7 @@ async fn run_with_options_under_store_lock(
         // strict (`false`) — they have the fresh-resolve fallback for
         // any non-admissible lockfile shape, and skipping the fresh-
         // resolve re-checks would be a real correctness regression.
-        let locked = try_lockfile_fast_path(&lockfile_path, &deps, client, &gate_stats, true)
+        let fast = try_lockfile_fast_path(&lockfile_path, &deps, client, &gate_stats, true)
             .ok_or_else(|| {
                 LpmError::Registry(
                     "--offline could not load the lockfile. Possible causes: (1) lpm.lock is \
@@ -3863,8 +3863,33 @@ async fn run_with_options_under_store_lock(
                          Run `lpm install` online to reconcile."
                         .into(),
                 )
-            })?
-            .packages; // Offline mode skips the writeback machinery —
+            })?;
+        // **R2.5 fix-1 (offline arm).** Same repair-gate semantic as
+        // the online path, but `--offline` can't re-resolve to
+        // re-derive the missing R2.5 state. The choice is between
+        // replaying a known-broken tree (pre-R2.5 v1 lockfiles
+        // produced by R2.2-R2.4 buggy writers were missing
+        // `ambient-peer-installs` and per-package `peers`, so
+        // `node_modules/<auto-installed-peer>/` is dropped on
+        // replay and `require('react-redux')` hard-fails at runtime)
+        // and refusing the install with an actionable message.
+        // Refusing is the only safe answer: the offline path
+        // cannot detect whether the v1 lockfile was ever buggy or
+        // always correct, so it has to assume the worst when
+        // `auto_install_peers` is on.
+        if lockfile_needs_r25_repair(&fast.lockfile, auto_install_peers) {
+            return Err(LpmError::Registry(
+                "--offline cannot use a pre-R2.5 lockfile under \
+                 `lpm.autoInstallPeers = true`: the lockfile may be missing \
+                 ambient-peer-install state from R2.2-R2.4 builds. Run \
+                 `lpm install` (online) once to re-derive and upgrade the \
+                 lockfile to v2, then retry --offline. To bypass this check \
+                 and accept warn-only peer semantics, set \
+                 `lpm.autoInstallPeers = false` in package.json."
+                    .into(),
+            ));
+        }
+        let locked = fast.packages; // Offline mode skips the writeback machinery —
         // no fetch happens, no URLs diverge, and any v1
         // → v2 binary migration is deferred to the next
         // online install (intentional — `--offline` is

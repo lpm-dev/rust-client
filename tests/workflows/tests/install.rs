@@ -4280,6 +4280,118 @@ fn install_silent_when_lpm_resolver_pubgrub_with_auto_install_peers_off() {
     );
 }
 
+// ─── R2.5 fix-1 — offline arm refuses pre-R2.5 v1 lockfiles ────
+//
+// The repair gate that lives on the online fast-path branch
+// (`install.rs::lockfile_needs_r25_repair`) drops the fast-path
+// result and forces a fresh resolve when the lockfile is v1 and
+// `auto_install_peers = true`. The `--offline` branch can't fall
+// back to a fresh resolve (no network), so the same gate becomes
+// a hard error: refuse the install with an actionable
+// "run online once" message. Replaying the v1 lockfile silently
+// would reproduce the pre-R2.5 broken-tree state — exactly the
+// hole R2.5 was meant to close.
+
+#[test]
+fn install_offline_refuses_pre_r25_v1_lockfile_under_auto_install_peers() {
+    // Hand-craft a v1 lockfile that LOOKS valid under the new
+    // schema (serde defaults populate the missing fields with
+    // empty Vec) but is actually a pre-R2.5 artifact. The package
+    // shape doesn't matter — the gate fires off the metadata
+    // version + auto_install_peers config.
+    let project = TempProject::empty(
+        r#"{
+        "name": "stale-v1-lockfile",
+        "version": "0.0.1",
+        "dependencies": { "lodash": "^4.0.0" }
+    }"#,
+    );
+    // Write a v1 lockfile by hand. `lockfile-version = 1` is the
+    // tell — even an otherwise-valid lockfile under the new schema
+    // is treated as "may be missing R2.5 state" because R2.2-R2.4
+    // buggy writers wrote the same shape.
+    let lockfile_toml = r#"[metadata]
+lockfile-version = 1
+resolved-with = "greedy-fusion"
+
+[[packages]]
+name = "lodash"
+version = "4.17.21"
+source = "registry+https://registry.npmjs.org"
+integrity = "sha512-v2kDEe57lecTulaDIuNTPy3Ry4gLGJ6Z1O3vE1krgXZNrsQ+LFTGHVxVjcXPs17LhbZVGedAJv8XZ1tvj5FvSg=="
+"#;
+    std::fs::write(project.path().join("lpm.lock"), lockfile_toml).unwrap();
+
+    let out = lpm(&project)
+        .args(["install", "--offline"])
+        .output()
+        .expect("spawn lpm install --offline");
+
+    assert!(
+        !out.status.success(),
+        "--offline must refuse a v1 lockfile under auto_install_peers=true; \
+         silently replaying would reproduce the pre-R2.5 broken-tree state. \
+         stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("pre-R2.5 lockfile"),
+        "error message must explain the cause; got:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("Run `lpm install` (online)"),
+        "error message must offer the remediation path; got:\n{stderr}"
+    );
+}
+
+#[test]
+fn install_offline_accepts_pre_r25_v1_lockfile_when_auto_install_peers_off() {
+    // Inverse: with `lpm.autoInstallPeers = false` the user has
+    // explicitly opted out of auto-install, so the v1 lockfile can
+    // be trusted (no ambient peers were ever generated). The
+    // offline arm must NOT refuse — that would be a regression for
+    // every project that pinned `autoInstallPeers = false` to
+    // preserve pre-R2 semantics.
+    //
+    // The install will likely fail later (no store seeded, no
+    // network) but it must NOT fail with the R2.5 repair-gate
+    // message. We assert on stderr content, not exit code.
+    let project = TempProject::empty(
+        r#"{
+        "name": "opt-out-v1-lockfile",
+        "version": "0.0.1",
+        "dependencies": { "lodash": "^4.0.0" },
+        "lpm": { "autoInstallPeers": false }
+    }"#,
+    );
+    let lockfile_toml = r#"[metadata]
+lockfile-version = 1
+resolved-with = "greedy-fusion"
+
+[[packages]]
+name = "lodash"
+version = "4.17.21"
+source = "registry+https://registry.npmjs.org"
+integrity = "sha512-v2kDEe57lecTulaDIuNTPy3Ry4gLGJ6Z1O3vE1krgXZNrsQ+LFTGHVxVjcXPs17LhbZVGedAJv8XZ1tvj5FvSg=="
+"#;
+    std::fs::write(project.path().join("lpm.lock"), lockfile_toml).unwrap();
+
+    let out = lpm(&project)
+        .args(["install", "--offline"])
+        .output()
+        .expect("spawn lpm install --offline");
+
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !stderr.contains("pre-R2.5 lockfile"),
+        "v1 lockfile under autoInstallPeers=false must NOT trip the \
+         repair gate — opt-out installs never produced ambient peers, \
+         so the v1 lockfile is correct as-is. stderr was:\n{stderr}"
+    );
+}
+
 #[test]
 fn install_silent_when_default_resolver_with_auto_install_peers_on() {
     // The other inverse: greedy-fusion is the default resolver and

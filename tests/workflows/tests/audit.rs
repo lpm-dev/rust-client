@@ -149,7 +149,7 @@ async fn audit_empty_lockfile_reports_no_packages_and_exits_zero() {
     let project = TempProject::empty(r#"{"name":"empty-audit","version":"1.0.0"}"#);
     project.write_file(
         "lpm.lock",
-        "[metadata]\nlockfile-version = 1\nresolved-with = \"greedy-fusion\"\n",
+        "[metadata]\nlockfile-version = 2\nresolved-with = \"greedy-fusion\"\n",
     );
 
     let mock = MockRegistry::start().await;
