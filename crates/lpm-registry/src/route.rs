@@ -740,6 +740,50 @@ mod tests {
         assert_eq!(got[0].host_lower, "registry.npmjs.org");
     }
 
+    /// **GPT post-T4 MEDIUM finding contract:** the eager set must
+    /// reflect the actual top-level network request surface, not
+    /// just the dep map keys. The CLI is responsible for filtering
+    /// `deps` to network-routing entries (skipping `file:`, `link:`,
+    /// `tarball:` URL, `git:`, `workspace:` specs) and for unwrapping
+    /// `npm:<target>` aliases to their underlying target name BEFORE
+    /// passing to `effective_registry_origins`. This route-side test
+    /// pins the end-to-end shape: given the filtered + unwrapped
+    /// list, the right origins emerge.
+    #[test]
+    fn effective_origins_consume_filtered_unwrapped_top_level_set() {
+        // Synthesize what a CLI caller would have computed AFTER
+        // filtering for network-routing entries and unwrapping npm
+        // aliases. Inputs:
+        //   - "react"            (SemverRange, npmjs.org route)
+        //   - "@wanted/foo"      (SemverRange, custom @wanted scope)
+        //   - "react"            (alias unwrap target — same as above; dedupe)
+        //   - "vue"              (alias unwrap target — different; same default)
+        // Inputs that the CLI WOULD have skipped (and therefore
+        // don't appear in the slice we pass): `file:./local`,
+        // `link:../sibling`, `https://cdn/foo.tgz`, `workspace:*`.
+        let table = make_table(
+            "@wanted:registry=https://wanted.internal/\n",
+            RouteMode::Direct,
+        );
+        let filtered: Vec<String> = vec![
+            "react".to_string(),
+            "@wanted/foo".to_string(),
+            "react".to_string(),
+            "vue".to_string(),
+        ];
+        let got = table.effective_registry_origins(
+            &filtered,
+            "https://lpm.dev",
+            "https://registry.npmjs.org",
+        );
+        // Expected: npmjs.org (react + vue) + wanted.internal.
+        // De-duped to 2 distinct origins.
+        let hosts: Vec<&str> = got.iter().map(|o| o.host_lower.as_str()).collect();
+        assert_eq!(got.len(), 2, "got: {hosts:?}");
+        assert!(hosts.contains(&"registry.npmjs.org"));
+        assert!(hosts.contains(&"wanted.internal"));
+    }
+
     /// Malformed worker / direct URLs → silently skipped (no
     /// crash, no spurious entry). Real callers always pass valid
     /// http(s) URLs; this is defense in depth.

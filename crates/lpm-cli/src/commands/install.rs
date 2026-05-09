@@ -3854,15 +3854,32 @@ async fn run_with_options_under_store_lock(
     // directly, not `arc_client`) sees the configured client. The
     // `route_table` itself was built earlier (above the empty-deps
     // short-circuit) so its warnings always surface.
-    // Phase 58.3 — request-aware eager-build (Δ1). The top-level
-    // request for `lpm install` is the dep map's keys (name → range
-    // entries from `package.json`). For `lpm install <spec>` form,
-    // those entries already include the new spec by the time we
-    // reach here. Workspace-member deps are local file refs — they
-    // don't route to external registries, so they're excluded from
-    // the effective set. Transitive deps surfacing later go through
-    // the lazy path in HttpClients.
-    let top_level_specs: Vec<String> = deps.keys().cloned().collect();
+    // Phase 58.3 — request-aware eager-build (Δ1). Filter `deps` to
+    // entries that ACTUALLY route through a registry by package name;
+    // local/file/link/tarball-URL/git/workspace specs don't, and
+    // would either eager-build unrelated origins (causing failures
+    // on configured-but-unused TLS) or mask the real registry origin
+    // for npm aliases. GPT post-T4 MEDIUM finding.
+    //
+    // Mapping per Specifier variant:
+    // - SemverRange     → local_name routes through scope/default
+    // - NpmAlias{target} → target routes (NOT the local alias)
+    // - File/Link/Workspace/Tarball/Git → no registry route, skip
+    // - parse error     → skip (the install will fail later anyway)
+    //
+    // Workspace-member deps are local file refs — they don't route
+    // through registries, so they stay out of the effective set.
+    // Transitive deps surfacing later go through the lazy path.
+    let top_level_specs: Vec<String> = deps
+        .iter()
+        .filter_map(|(local_name, range)| {
+            match lpm_resolver::Specifier::parse(range) {
+                Ok(lpm_resolver::Specifier::SemverRange(_)) => Some(local_name.clone()),
+                Ok(lpm_resolver::Specifier::NpmAlias { target, .. }) => Some(target),
+                _ => None,
+            }
+        })
+        .collect();
     let eager_origins = route_table.effective_registry_origins(
         &top_level_specs,
         client.base_url(),
