@@ -206,10 +206,29 @@ pub async fn run(
             tagged.source, tagged.line
         ));
     }
+    // Phase 58.3 — request-aware eager-build: `lpm add <spec>`'s
+    // top-level request is exactly `{spec}`. Compute the effective
+    // origin set from that single spec + the route table, then
+    // eager-build per-origin clients for the intersection with
+    // configured per-origin TLS. Origins surfaced later (transitive
+    // deps, tarball CDNs) go through the lazy path in HttpClients.
+    let top_level_spec = target.display();
+    let eager_origins = route_table.effective_registry_origins(
+        std::slice::from_ref(&top_level_spec),
+        client.base_url(),
+        client.npm_registry_url(),
+    );
     let owned_client = client
         .clone_with_config()
-        .with_tls_overrides(route_table.tls_overrides())?;
+        .with_tls_overrides_for(route_table.tls_overrides(), &eager_origins)?;
     let client = &owned_client;
+    // Phase 58.3 — install-start summary of effective TLS overrides
+    // (mirrors install.rs:3859 wiring).
+    if !json_output
+        && let Some(line) = client.render_effective_tls_summary()
+    {
+        output::info(&line);
+    }
 
     // Step 3: Routed metadata fetch (Phase 60.0.d).
     // - AddTarget::Lpm → lpm.dev metadata API (LpmWorker route, forced

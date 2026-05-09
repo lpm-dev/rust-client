@@ -3854,10 +3854,34 @@ async fn run_with_options_under_store_lock(
     // directly, not `arc_client`) sees the configured client. The
     // `route_table` itself was built earlier (above the empty-deps
     // short-circuit) so its warnings always surface.
+    // Phase 58.3 — request-aware eager-build (Δ1). The top-level
+    // request for `lpm install` is the dep map's keys (name → range
+    // entries from `package.json`). For `lpm install <spec>` form,
+    // those entries already include the new spec by the time we
+    // reach here. Workspace-member deps are local file refs — they
+    // don't route to external registries, so they're excluded from
+    // the effective set. Transitive deps surfacing later go through
+    // the lazy path in HttpClients.
+    let top_level_specs: Vec<String> = deps.keys().cloned().collect();
+    let eager_origins = route_table.effective_registry_origins(
+        &top_level_specs,
+        client.base_url(),
+        client.npm_registry_url(),
+    );
     let owned_client = client
         .clone_with_config()
-        .with_tls_overrides(route_table.tls_overrides())?;
+        .with_tls_overrides_for(route_table.tls_overrides(), &eager_origins)?;
     let client = &owned_client;
+    // Phase 58.3 — emit a one-line summary of EFFECTIVE TLS overrides
+    // (default surface + eager per-origin clients). `None` ⇒ nothing
+    // active ⇒ no line. Suppressed under `--json` so structured stdout
+    // stays clean; the strict-ssl=false security warning above remains
+    // unconditional regardless.
+    if !json_output
+        && let Some(line) = client.render_effective_tls_summary()
+    {
+        output::info(&line);
+    }
 
     let arc_client = Arc::new(client.clone_with_config());
 

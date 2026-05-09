@@ -340,6 +340,48 @@ impl std::fmt::Debug for HttpClients {
 }
 
 impl HttpClients {
+    /// Phase 58.3 — render a one-line summary of TLS overrides
+    /// actually applied this invocation. Returns `None` when nothing
+    /// is in effect (default-only, no global identity, no eager
+    /// per-origin clients) so callers can suppress the line cleanly.
+    ///
+    /// **Effective-only.** Configured-but-unreached per-origin TLS
+    /// (entries in `tls_overrides.per_origin` for origins NOT in the
+    /// eager set) is deliberately excluded — it might still fire
+    /// later via the lazy path, and reporting it eagerly would
+    /// imply a CI failure precondition that doesn't actually exist.
+    /// The `strict-ssl=false` security warning is rendered separately
+    /// by `install.rs` / `add.rs`; this summary covers extra roots,
+    /// mTLS identity, and per-origin TLS only.
+    pub fn render_effective_tls_summary(&self) -> Option<String> {
+        let global_roots = self.tls_overrides.extra_roots.len();
+        let global_identity = self.tls_overrides.identity_certfile.is_some()
+            && self.tls_overrides.identity_keyfile.is_some();
+        let per_origin_count = self.eager.len();
+        if global_roots == 0 && !global_identity && per_origin_count == 0 {
+            return None;
+        }
+        let mut parts: Vec<String> = Vec::new();
+        if global_roots > 0 {
+            parts.push(format!(
+                "{global_roots} extra root certificate{}",
+                if global_roots == 1 { "" } else { "s" }
+            ));
+        }
+        if global_identity {
+            parts.push("global mTLS identity".to_string());
+        }
+        if per_origin_count > 0 {
+            // Sort origins for deterministic rendering — install logs
+            // diff cleanly between runs.
+            let mut origins: Vec<String> =
+                self.eager.keys().map(|o| o.to_string()).collect();
+            origins.sort();
+            parts.push(format!("per-origin TLS for {}", origins.join(", ")));
+        }
+        Some(format!("TLS overrides active: {}", parts.join("; ")))
+    }
+
     /// Build an `HttpClients` whose `default` is the supplied client
     /// and whose eager/lazy maps are empty. Used by [`RegistryClient::new`]
     /// before any `.npmrc` is loaded.
@@ -716,6 +758,23 @@ impl RegistryClient {
     /// Get the current base URL.
     pub fn base_url(&self) -> &str {
         &self.base_url
+    }
+
+    /// Get the configured direct-npm registry URL (default
+    /// `https://registry.npmjs.org`). Phase 58.3 — exposed so
+    /// install/add can pass it to
+    /// [`crate::route::RouteTable::effective_registry_origins`]
+    /// when computing the request-aware eager set.
+    pub fn npm_registry_url(&self) -> &str {
+        &self.npm_registry_url
+    }
+
+    /// Phase 58.3 — render a one-line install-start summary of TLS
+    /// overrides actually applied this invocation. Delegates to
+    /// [`HttpClients::render_effective_tls_summary`]; see that
+    /// method's doc for the effective-only rationale.
+    pub fn render_effective_tls_summary(&self) -> Option<String> {
+        self.http.render_effective_tls_summary()
     }
 
     /// Phase 43 — returns true if the URL's origin matches one of
@@ -8945,6 +9004,144 @@ mod tests {
         assert!(
             lazy.contains_key(&concrete_port_key),
             "lazy entry must be keyed by URL's concrete-port origin"
+        );
+    }
+
+    // ---- Phase 58.3 — effective TLS summary line ----
+
+    #[test]
+    fn render_effective_tls_summary_returns_none_when_default_only() {
+        let client = RegistryClient::new();
+        assert!(client.render_effective_tls_summary().is_none());
+    }
+
+    #[test]
+    fn render_effective_tls_summary_reports_global_extra_roots() {
+        let pem = rcgen_pem();
+        let tls = TlsOverrides {
+            extra_roots: vec![TaggedRoot {
+                pem_bytes: pem,
+                source: "test".into(),
+                line: 1,
+            }],
+            ..Default::default()
+        };
+        let client = RegistryClient::new()
+            .with_tls_overrides_for(&tls, &[])
+            .expect("build ok");
+        let summary = client.render_effective_tls_summary().expect("summary");
+        assert!(summary.contains("1 extra root certificate"), "got: {summary}");
+        assert!(!summary.contains("extra root certificates "), "must singularize");
+    }
+
+    #[test]
+    fn render_effective_tls_summary_pluralizes_extra_roots() {
+        let mut bundle = rcgen_pem();
+        bundle.push(b'\n');
+        bundle.extend_from_slice(&rcgen_pem());
+        let tls = TlsOverrides {
+            extra_roots: vec![
+                TaggedRoot {
+                    pem_bytes: rcgen_pem(),
+                    source: "a".into(),
+                    line: 1,
+                },
+                TaggedRoot {
+                    pem_bytes: rcgen_pem(),
+                    source: "b".into(),
+                    line: 2,
+                },
+            ],
+            ..Default::default()
+        };
+        let client = RegistryClient::new()
+            .with_tls_overrides_for(&tls, &[])
+            .expect("build ok");
+        let summary = client.render_effective_tls_summary().expect("summary");
+        assert!(summary.contains("2 extra root certificates"), "got: {summary}");
+    }
+
+    /// Configured-but-unreached per-origin TLS must NOT appear in the
+    /// summary. This is the core "effective-only" contract — we don't
+    /// imply CI failure preconditions for origins that might or might
+    /// not be hit via the lazy path later.
+    #[test]
+    fn render_effective_tls_summary_omits_unreached_per_origin_overrides() {
+        let pem = rcgen_pem();
+        let dir = tempfile::tempdir().unwrap();
+        let ca_path = dir.path().join("ca.pem");
+        std::fs::write(&ca_path, &pem).unwrap();
+        // Configure per-origin TLS for `unused.internal`...
+        let unused = OriginKey {
+            host_lower: "unused.internal".into(),
+            port: None,
+        };
+        let mut per_origin_map = HashMap::new();
+        per_origin_map.insert(
+            unused,
+            crate::npmrc::OriginTlsOverrides {
+                cafiles: vec![crate::npmrc::TaggedPath {
+                    path: ca_path,
+                    source: "test".into(),
+                    line: 1,
+                    source_dir: None,
+                }],
+                certfile: None,
+                keyfile: None,
+            },
+        );
+        let tls = TlsOverrides {
+            per_origin: per_origin_map,
+            ..Default::default()
+        };
+        // ...but pass empty eager_origins (effective set is empty).
+        let client = RegistryClient::new()
+            .with_tls_overrides_for(&tls, &[])
+            .expect("build ok");
+        // Nothing was eager-built and no global surface → None.
+        assert!(
+            client.render_effective_tls_summary().is_none(),
+            "configured-but-unreached origin must not appear in summary"
+        );
+    }
+
+    /// When an origin IS in the effective set + has per-origin TLS
+    /// configured, its origin string appears in the summary.
+    #[test]
+    fn render_effective_tls_summary_lists_eager_per_origin_clients() {
+        let pem = rcgen_pem();
+        let dir = tempfile::tempdir().unwrap();
+        let ca_path = dir.path().join("ca.pem");
+        std::fs::write(&ca_path, &pem).unwrap();
+        let origin = OriginKey {
+            host_lower: "corp.internal".into(),
+            port: None,
+        };
+        let mut per_origin_map = HashMap::new();
+        per_origin_map.insert(
+            origin.clone(),
+            crate::npmrc::OriginTlsOverrides {
+                cafiles: vec![crate::npmrc::TaggedPath {
+                    path: ca_path,
+                    source: "test".into(),
+                    line: 1,
+                    source_dir: None,
+                }],
+                certfile: None,
+                keyfile: None,
+            },
+        );
+        let tls = TlsOverrides {
+            per_origin: per_origin_map,
+            ..Default::default()
+        };
+        let client = RegistryClient::new()
+            .with_tls_overrides_for(&tls, std::slice::from_ref(&origin))
+            .expect("build ok");
+        let summary = client.render_effective_tls_summary().expect("summary");
+        assert!(
+            summary.contains("per-origin TLS for //corp.internal/"),
+            "got: {summary}"
         );
     }
 

@@ -238,6 +238,71 @@ impl RouteTable {
     pub fn mode(&self) -> RouteMode {
         self.mode
     }
+
+    /// Phase 58.3 — the **request-aware effective-origin set** for
+    /// `with_tls_overrides_for`'s eager-build pass.
+    ///
+    /// Walks `top_level_specs` and emits the origin each spec would
+    /// route to per the current [`RouteMode`] + npmrc table. Returns
+    /// a deduplicated `Vec` (insertion order preserved). Caller passes
+    /// this to [`crate::client::RegistryClient::with_tls_overrides_for`],
+    /// which intersects it with the per-origin TLS map and eager-builds
+    /// only for the intersection.
+    ///
+    /// **Why request-aware (not config-union):** if `~/.npmrc` declares
+    /// per-origin TLS for `//legacy.artifactory/` and the current
+    /// invocation never touches that origin, we MUST NOT eager-build
+    /// for it. A bad `certfile=` path / missing passphrase / wrong
+    /// passphrase for a configured-but-unreached origin would otherwise
+    /// abort an unrelated install. Transitive scopes / tarball CDNs
+    /// surfacing later go through the lazy path. See Phase 58.3 Δ1
+    /// in the plan doc.
+    ///
+    /// **Sources of origins:**
+    /// 1. [`UpstreamRoute::LpmWorker`] specs → `lpm_worker_url`'s origin.
+    /// 2. [`UpstreamRoute::NpmDirect`] specs → `npm_direct_url`'s origin.
+    /// 3. [`UpstreamRoute::Custom`] specs (scope or default registry hits)
+    ///    → the target's origin.
+    ///
+    /// Origins parsed from URLs that aren't valid http/https are
+    /// silently skipped — they couldn't dispatch anyway.
+    pub fn effective_registry_origins(
+        &self,
+        top_level_specs: &[String],
+        lpm_worker_url: &str,
+        npm_direct_url: &str,
+    ) -> Vec<crate::npmrc::OriginKey> {
+        use crate::npmrc::OriginKey;
+        // De-dup with insertion order preserved — small N (1-3
+        // typical), linear scan is fine and avoids a HashSet
+        // dependency for stability.
+        let mut origins: Vec<OriginKey> = Vec::new();
+        let mut push_if_new = |o: OriginKey| {
+            if !origins.contains(&o) {
+                origins.push(o);
+            }
+        };
+        for spec in top_level_specs {
+            match self.route_for_package(spec) {
+                UpstreamRoute::LpmWorker => {
+                    if let Some(o) = OriginKey::from_request_url(lpm_worker_url) {
+                        push_if_new(o);
+                    }
+                }
+                UpstreamRoute::NpmDirect => {
+                    if let Some(o) = OriginKey::from_request_url(npm_direct_url) {
+                        push_if_new(o);
+                    }
+                }
+                UpstreamRoute::Custom { target, .. } => {
+                    if let Some(o) = OriginKey::from_request_url(&target.base_url) {
+                        push_if_new(o);
+                    }
+                }
+            }
+        }
+        origins
+    }
 }
 
 /// Fatal `.npmrc` parse errors that block `RouteTable` construction.
@@ -503,5 +568,190 @@ mod tests {
         let table = RouteTable::new(RouteMode::Direct, npmrc).expect("warnings don't block");
         assert_eq!(table.npmrc_warnings().len(), 1);
         assert!(table.npmrc_warnings()[0].contains("path-scoped"));
+    }
+
+    // ---- Phase 58.3 — effective_registry_origins (Δ1: request-aware) ----
+
+    fn make_table(npmrc_content: &str, mode: RouteMode) -> RouteTable {
+        let npmrc = NpmrcConfig::parse(npmrc_content, "test", &no_env);
+        RouteTable::new(mode, npmrc).expect("npmrc clean")
+    }
+
+    /// Empty top-level → empty effective set, no matter what's in
+    /// `.npmrc`. The whole point of request-aware Δ1: nothing is
+    /// "implied" by config alone.
+    #[test]
+    fn effective_origins_empty_top_level_returns_empty() {
+        let table = make_table(
+            "registry=https://default.internal/\n\
+             @scope:registry=https://scope.internal/\n",
+            RouteMode::Direct,
+        );
+        let got = table.effective_registry_origins(
+            &[],
+            "https://lpm.dev",
+            "https://registry.npmjs.org",
+        );
+        assert!(got.is_empty());
+    }
+
+    /// Only `@lpm.dev/*` in top-level → only the LPM Worker origin
+    /// is effective. npmjs.org is NOT included even though
+    /// `RouteMode::Direct` would route non-LPM specs there.
+    #[test]
+    fn effective_origins_only_lpm_dev_scopes_to_worker() {
+        let table = make_table("", RouteMode::Direct);
+        let specs = vec!["@lpm.dev/owner.pkg".to_string()];
+        let got = table.effective_registry_origins(
+            &specs,
+            "https://lpm.dev",
+            "https://registry.npmjs.org",
+        );
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].host_lower, "lpm.dev");
+    }
+
+    /// Only non-`@lpm.dev/*` in top-level under `Direct` mode →
+    /// only npmjs.org's origin. LPM Worker is NOT included.
+    #[test]
+    fn effective_origins_npm_direct_scopes_to_npmjs() {
+        let table = make_table("", RouteMode::Direct);
+        let specs = vec!["react".to_string(), "lodash".to_string()];
+        let got = table.effective_registry_origins(
+            &specs,
+            "https://lpm.dev",
+            "https://registry.npmjs.org",
+        );
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].host_lower, "registry.npmjs.org");
+    }
+
+    /// Mixed top-level: one `@lpm.dev/*` + one bare → BOTH origins.
+    /// Order is insertion order (lpm spec first → lpm.dev first).
+    #[test]
+    fn effective_origins_mixed_lpm_and_npm_emits_both() {
+        let table = make_table("", RouteMode::Direct);
+        let specs = vec!["@lpm.dev/owner.pkg".to_string(), "react".to_string()];
+        let got = table.effective_registry_origins(
+            &specs,
+            "https://lpm.dev",
+            "https://registry.npmjs.org",
+        );
+        assert_eq!(got.len(), 2);
+        assert_eq!(got[0].host_lower, "lpm.dev");
+        assert_eq!(got[1].host_lower, "registry.npmjs.org");
+    }
+
+    /// Scope mapping in `.npmrc` → that origin is effective ONLY
+    /// when the scope appears in top-level. Other configured scopes
+    /// stay LAZY (Δ1 contract: unrelated config doesn't pollute
+    /// the eager set).
+    #[test]
+    fn effective_origins_scope_registry_only_when_scope_in_top_level() {
+        let table = make_table(
+            "@wanted:registry=https://wanted.internal/\n\
+             @ignored:registry=https://ignored.internal/\n",
+            RouteMode::Direct,
+        );
+        // Top-level uses @wanted but NOT @ignored.
+        let specs = vec!["@wanted/foo".to_string()];
+        let got = table.effective_registry_origins(
+            &specs,
+            "https://lpm.dev",
+            "https://registry.npmjs.org",
+        );
+        // Only the wanted scope's origin appears.
+        let hosts: Vec<&str> = got.iter().map(|o| o.host_lower.as_str()).collect();
+        assert!(hosts.contains(&"wanted.internal"));
+        assert!(
+            !hosts.contains(&"ignored.internal"),
+            "ignored scope must not pollute the eager set"
+        );
+    }
+
+    /// `npmrc.default_registry` → that origin is effective ONLY when
+    /// a non-LPM, non-scope-mapped spec falls through to it.
+    #[test]
+    fn effective_origins_default_registry_only_when_a_spec_falls_through() {
+        let table = make_table("registry=https://default.internal/\n", RouteMode::Direct);
+        let specs = vec!["lodash".to_string()];
+        let got = table.effective_registry_origins(
+            &specs,
+            "https://lpm.dev",
+            "https://registry.npmjs.org",
+        );
+        assert_eq!(got.len(), 1);
+        // default_registry override means non-LPM specs route to
+        // `Custom`, NOT `NpmDirect`. So registry.npmjs.org should
+        // NOT appear.
+        assert_eq!(got[0].host_lower, "default.internal");
+        assert!(got.iter().all(|o| o.host_lower != "registry.npmjs.org"));
+    }
+
+    /// Default registry + only `@lpm.dev/*` specs in top-level →
+    /// default registry is NOT effective (no spec falls through).
+    #[test]
+    fn effective_origins_default_registry_not_emitted_when_no_fallthrough_spec() {
+        let table = make_table("registry=https://default.internal/\n", RouteMode::Direct);
+        let specs = vec!["@lpm.dev/owner.pkg".to_string()];
+        let got = table.effective_registry_origins(
+            &specs,
+            "https://lpm.dev",
+            "https://registry.npmjs.org",
+        );
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].host_lower, "lpm.dev");
+        assert!(got.iter().all(|o| o.host_lower != "default.internal"));
+    }
+
+    /// `RouteMode::Proxy` → non-LPM specs route to Worker, NOT to
+    /// npmjs.org. The effective set reflects that.
+    #[test]
+    fn effective_origins_proxy_mode_routes_npm_specs_to_worker() {
+        let table = make_table("", RouteMode::Proxy);
+        let specs = vec!["react".to_string()];
+        let got = table.effective_registry_origins(
+            &specs,
+            "https://lpm.dev",
+            "https://registry.npmjs.org",
+        );
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].host_lower, "lpm.dev");
+        // npmjs.org must NOT be included (proxy mode skips it).
+        assert!(got.iter().all(|o| o.host_lower != "registry.npmjs.org"));
+    }
+
+    /// De-dup contract: same scope twice in top-level → one origin.
+    #[test]
+    fn effective_origins_dedupes_duplicate_routes() {
+        let table = make_table("", RouteMode::Direct);
+        let specs = vec![
+            "react".to_string(),
+            "lodash".to_string(),
+            "vue".to_string(),
+        ];
+        let got = table.effective_registry_origins(
+            &specs,
+            "https://lpm.dev",
+            "https://registry.npmjs.org",
+        );
+        // All three route to npmjs.org → one entry.
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].host_lower, "registry.npmjs.org");
+    }
+
+    /// Malformed worker / direct URLs → silently skipped (no
+    /// crash, no spurious entry). Real callers always pass valid
+    /// http(s) URLs; this is defense in depth.
+    #[test]
+    fn effective_origins_silently_skips_invalid_urls() {
+        let table = make_table("", RouteMode::Direct);
+        let specs = vec!["react".to_string()];
+        let got = table.effective_registry_origins(
+            &specs,
+            "not a url",
+            "also not a url",
+        );
+        assert!(got.is_empty());
     }
 }
