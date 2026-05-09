@@ -1051,7 +1051,8 @@ impl RegistryClient {
             .execute_with_recovery(AuthPosture::AuthRequired, || async {
                 let mut req = self
                     .http
-                    .for_url_no_build(&url)
+                    .for_url(&url)
+                    .await?
                     .post(&url)
                     .header("Accept", "application/x-ndjson")
                     .json(&body);
@@ -1340,7 +1341,7 @@ impl RegistryClient {
         let result = self
             .execute_with_recovery(AuthPosture::AuthRequired, || async {
                 let cache_content = self.read_cache_content(&cache_key);
-                let mut req = self.build_get(&url);
+                let mut req = self.build_get(&url).await?;
                 if let Some(etag) = cache_content.as_ref().and_then(|c| c.etag.as_deref()) {
                     req = req.header("If-None-Match", etag);
                 }
@@ -1357,7 +1358,7 @@ impl RegistryClient {
                         tracing::debug!("metadata cache revalidated (304): {}", name.scoped());
                         return Ok(meta);
                     }
-                    response = self.send_with_retry(self.build_get(&url)).await?;
+                    response = self.send_with_retry(self.build_get(&url).await?).await?;
                 }
 
                 let etag = response
@@ -1414,7 +1415,7 @@ impl RegistryClient {
         let proxy_url = format!("{}/api/registry/{}", self.base_url, name);
         let cache_content = self.read_cache_content(&cache_key);
 
-        let mut req = self.build_get(&proxy_url);
+        let mut req = self.build_get(&proxy_url).await?;
         if let Some(etag) = cache_content.as_ref().and_then(|c| c.etag.as_deref()) {
             req = req.header("If-None-Match", etag);
         }
@@ -1432,7 +1433,7 @@ impl RegistryClient {
                         tracing::debug!("metadata cache revalidated (304): npm:{name}");
                         return Ok(meta);
                     }
-                    response = self.send_with_retry(self.build_get(&proxy_url)).await?;
+                    response = self.send_with_retry(self.build_get(&proxy_url).await?).await?;
                 }
 
                 if response.status().is_success() {
@@ -1480,7 +1481,8 @@ impl RegistryClient {
         let response = match self
             .send_with_retry(
                 self.http
-                    .for_url_no_build(&npm_url)
+                    .for_url(&npm_url)
+                    .await?
                     .get(&npm_url)
                     .header("Accept", "application/vnd.npm.install-v1+json"),
             )
@@ -1534,7 +1536,8 @@ impl RegistryClient {
         let response = match self
             .send_with_retry(
                 self.http
-                    .for_url_no_build(&npm_url)
+                    .for_url(&npm_url)
+                    .await?
                     .get(&npm_url)
                     .header("Accept", "application/vnd.npm.install-v1+json"),
             )
@@ -1684,7 +1687,8 @@ impl RegistryClient {
         tracing::debug!("fetching {name} from custom registry {base_url}");
         let req = self
             .http
-            .for_url_no_build(&url)
+            .for_url(&url)
+            .await?
             .get(&url)
             .header("Accept", "application/vnd.npm.install-v1+json");
         // `apply_npmrc_auth` does the origin-mismatch defensive check
@@ -1942,7 +1946,7 @@ impl RegistryClient {
     pub async fn download_tarball(&self, url: &str) -> Result<Vec<u8>, LpmError> {
         self.check_tarball_url_scheme(url)?;
 
-        let response = self.send_with_retry(self.build_get(url)).await?;
+        let response = self.send_with_retry(self.build_get(url).await?).await?;
 
         let bytes = response
             .bytes()
@@ -2001,7 +2005,7 @@ impl RegistryClient {
         max_compressed_size: u64,
     ) -> Result<DownloadedTarball, LpmError> {
         self.check_tarball_url_scheme(url)?;
-        let req = self.http.for_url_no_build(url).get(url);
+        let req = self.http.for_url(url).await?.get(url);
         let req = apply_npmrc_auth(req, url, auth)?;
         let mut response = self.send_with_retry(req).await?;
 
@@ -2076,7 +2080,7 @@ impl RegistryClient {
         auth: Option<&crate::npmrc::RegistryAuth>,
     ) -> Result<reqwest::Response, LpmError> {
         self.check_tarball_url_scheme(url)?;
-        let req = self.http.for_url_no_build(url).get(url);
+        let req = self.http.for_url(url).await?.get(url);
         let req = apply_npmrc_auth(req, url, auth)?;
         let response = self.send_with_retry(req).await?;
 
@@ -2102,7 +2106,7 @@ impl RegistryClient {
     ) -> Result<DownloadedTarball, LpmError> {
         self.check_tarball_url_scheme(url)?;
 
-        let mut response = self.send_with_retry(self.build_get(url)).await?;
+        let mut response = self.send_with_retry(self.build_get(url).await?).await?;
 
         if let Some(content_length) = response.content_length()
             && content_length > max_compressed_size
@@ -2198,7 +2202,7 @@ impl RegistryClient {
     ) -> Result<reqwest::Response, LpmError> {
         self.check_tarball_url_scheme(url)?;
 
-        let response = self.send_with_retry(self.build_get(url)).await?;
+        let response = self.send_with_retry(self.build_get(url).await?).await?;
 
         if let Some(content_length) = response.content_length()
             && content_length > MAX_COMPRESSED_TARBALL_SIZE
@@ -2455,7 +2459,7 @@ impl RegistryClient {
                 .current_bearer(AuthPosture::AuthRequired)
                 .ok_or_else(|| LpmError::Registry("no token to revoke".to_string()))?;
             let body = serde_json::json!({ "token": bearer });
-            let req = self.http.for_url_no_build(&url).post(&url).bearer_auth(&bearer).json(&body);
+            let req = self.http.for_url(&url).await?.post(&url).bearer_auth(&bearer).json(&body);
             let response = self.send_with_retry(req).await?;
             if response.status().is_success() {
                 Ok(())
@@ -2667,7 +2671,10 @@ impl RegistryClient {
     pub async fn health_check(&self) -> Result<bool, LpmError> {
         let url = format!("{}/api/registry/health", self.base_url);
         let response = self
-            .send_with_retry(self.build_get_with_posture(&url, AuthPosture::AnonymousOnly))
+            .send_with_retry(
+                self.build_get_with_posture(&url, AuthPosture::AnonymousOnly)
+                    .await?,
+            )
             .await?;
         Ok(response.status().is_success())
     }
@@ -2756,7 +2763,7 @@ impl RegistryClient {
             )
         };
         self.execute_with_recovery(AuthPosture::SessionRequired, || async {
-            let mut req = self.http.for_url_no_build(&url).delete(&url);
+            let mut req = self.http.for_url(&url).await?.delete(&url);
             if let Some(bearer) = self.current_bearer(AuthPosture::SessionRequired) {
                 req = req.bearer_auth(bearer);
             }
@@ -3079,7 +3086,7 @@ impl RegistryClient {
         url: &str,
         body: &serde_json::Value,
     ) -> Result<reqwest::Response, LpmError> {
-        let mut req = self.http.for_url_no_build(url).post(url).json(body);
+        let mut req = self.http.for_url(url).await?.post(url).json(body);
         if let Some(bearer) = self.current_bearer(AuthPosture::AuthRequired) {
             req = req.bearer_auth(bearer);
         }
@@ -3089,8 +3096,12 @@ impl RegistryClient {
     /// Build a GET request with auth headers (legacy entry point —
     /// defaults to `AuthRequired` posture, attaching the bearer when
     /// available). Use `build_get_with_posture` for explicit control.
-    fn build_get(&self, url: &str) -> reqwest::RequestBuilder {
-        self.build_get_with_posture(url, AuthPosture::AuthRequired)
+    ///
+    /// Phase 58.3 — async + fallible because the underlying client
+    /// dispatch may lazy-build a per-origin client (and that build
+    /// can fail with a cited cert error).
+    async fn build_get(&self, url: &str) -> Result<reqwest::RequestBuilder, LpmError> {
+        self.build_get_with_posture(url, AuthPosture::AuthRequired).await
     }
 
     /// Build a GET request honoring the caller's auth posture.
@@ -3100,12 +3111,18 @@ impl RegistryClient {
     /// when one is stored — see plan §9.2. `current_bearer` already
     /// returns `None` for those postures, so this just wires the
     /// caller's choice through.
-    fn build_get_with_posture(&self, url: &str, posture: AuthPosture) -> reqwest::RequestBuilder {
-        let mut req = self.http.for_url_no_build(url).get(url);
+    ///
+    /// Phase 58.3 — async + fallible (see [`Self::build_get`]).
+    async fn build_get_with_posture(
+        &self,
+        url: &str,
+        posture: AuthPosture,
+    ) -> Result<reqwest::RequestBuilder, LpmError> {
+        let mut req = self.http.for_url(url).await?.get(url);
         if let Some(bearer) = self.current_bearer(posture) {
             req = req.bearer_auth(bearer);
         }
-        req
+        Ok(req)
     }
 
     /// Generic GET → deserialize JSON helper at a specified posture.
@@ -3122,7 +3139,7 @@ impl RegistryClient {
              use get_json + execute_with_recovery for AuthRequired/SessionRequired"
         );
         let response = self
-            .send_with_retry(self.build_get_with_posture(url, posture))
+            .send_with_retry(self.build_get_with_posture(url, posture).await?)
             .await?;
         response
             .json()
@@ -3264,7 +3281,7 @@ impl RegistryClient {
 
     /// Generic GET → deserialize JSON helper (with auth).
     async fn get_json<T: serde::de::DeserializeOwned>(&self, url: &str) -> Result<T, LpmError> {
-        let response = self.send_with_retry(self.build_get(url)).await?;
+        let response = self.send_with_retry(self.build_get(url).await?).await?;
         response
             .json()
             .await
@@ -3296,9 +3313,12 @@ impl RegistryClient {
             })?;
 
             // Phase 58.3 — route via the request's URL so a per-origin
-            // client (eager hit) handles its own TLS context. Falls
-            // back to default for any URL not in the eager set.
-            let client_for_req = self.http.for_url_no_build(req.url().as_str());
+            // client (eager hit OR lazy build) handles its own TLS
+            // context. Lazy build fires for transitive registry / CDN
+            // origins that surface from resolved metadata after the
+            // eager set was computed; first retry attempt builds and
+            // caches, subsequent retries hit the cache.
+            let client_for_req = self.http.for_url(req.url().as_str()).await?;
             match client_for_req.execute(req).await {
                 Ok(response) => {
                     let status = response.status().as_u16();
@@ -3326,8 +3346,19 @@ impl RegistryClient {
                             // Check if the version exists by GETting the package
                             let check_url =
                                 format!("{}/api/registry/{}", self.base_url, encoded_name);
-                            if let Ok(check_resp) =
-                                self.send_with_retry(self.build_get(&check_url)).await
+                            // `build_get` is fallible here; on cert load
+                            // failure for the recovery probe origin,
+                            // we can't verify whether the publish
+                            // succeeded server-side. Treat as not-OK
+                            // (don't fall through to the retry-as-success
+                            // branch) and let the outer loop continue.
+                            let probe = match self.build_get(&check_url).await {
+                                Ok(req) => self.send_with_retry(req).await,
+                                Err(_) => Err(LpmError::Network(
+                                    "publish recovery probe failed to build (TLS)".into(),
+                                )),
+                            };
+                            if let Ok(check_resp) = probe
                                 && check_resp.status().is_success()
                             {
                                 // Version was stored despite the 500 — treat as success.
@@ -3420,7 +3451,7 @@ impl RegistryClient {
             })?;
 
             // Phase 58.3 — same URL-aware routing as the publish path.
-            let client_for_req = self.http.for_url_no_build(req.url().as_str());
+            let client_for_req = self.http.for_url(req.url().as_str()).await?;
             match client_for_req.execute(req).await {
                 Ok(response) => {
                     let status = response.status().as_u16();
@@ -8833,6 +8864,88 @@ mod tests {
             .for_url("https://different.example/foo")
             .await
             .expect("unrelated lookup must not fail on unreached half-config");
+    }
+
+    /// **GPT post-T3 finding (regression):** the lazy per-origin
+    /// dispatch path must actually fire from production request flows,
+    /// not only from explicit `for_url` calls in tests.
+    ///
+    /// Verifies that `download_tarball_to_file_with_auth` (a real
+    /// production entry point that now goes through `for_url(...).await?`)
+    /// triggers a lazy build for an origin that is configured in
+    /// `tls_overrides.per_origin` but NOT in the eager set. Pre-fix, the
+    /// path used `for_url_no_build` and silently fell through to the
+    /// default client, ignoring per-origin TLS for transitive scopes /
+    /// CDN origins.
+    #[tokio::test]
+    async fn production_tarball_path_triggers_lazy_build_for_per_origin_tls() {
+        // Synthesize a per-origin TLS config for a host that's NOT in
+        // the eager set. Use a self-signed CA so the per-origin client
+        // build works (we never actually connect — the test fails
+        // before that on URL scheme / DNS, which is fine; we're
+        // verifying that the LAZY MAP gets populated).
+        let pem = rcgen_pem();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let ca_path = dir.path().join("ca.pem");
+        std::fs::write(&ca_path, &pem).unwrap();
+        let origin = OriginKey {
+            host_lower: "lazy-target.invalid".into(),
+            port: None,
+        };
+        let mut per_origin_map = HashMap::new();
+        per_origin_map.insert(
+            origin.clone(),
+            crate::npmrc::OriginTlsOverrides {
+                cafiles: vec![crate::npmrc::TaggedPath {
+                    path: ca_path,
+                    source: "test".into(),
+                    line: 1,
+                    source_dir: None,
+                }],
+                certfile: None,
+                keyfile: None,
+            },
+        );
+        let tls = TlsOverrides {
+            per_origin: per_origin_map,
+            ..Default::default()
+        };
+        // Build via the real entry point — empty eager_origins so the
+        // origin can ONLY surface via lazy. This is the exact shape
+        // T4's request-aware effective set will produce for transitive
+        // origins.
+        let client = RegistryClient::new()
+            .with_tls_overrides_for(&tls, &[])
+            .expect("build ok");
+        // Sanity: eager is empty.
+        assert!(client.http.eager.is_empty());
+        // Trigger a tarball download. The connection will fail (host
+        // is .invalid + no listener), but the lazy build of the
+        // per-origin client must happen BEFORE the network attempt.
+        // We don't care about the request outcome — only that the
+        // lazy map gets populated.
+        let url = "https://lazy-target.invalid/foo/-/foo-1.0.0.tgz";
+        let _ = client
+            .download_tarball_to_file_with_auth(url, None)
+            .await;
+        // Verify: lazy map now contains an entry for the URL's
+        // concrete-port origin (per-origin lookup with port=None
+        // fallback hit; insertion key is the URL's resolved origin).
+        let lazy = client.http.lazy.lock().await;
+        let concrete_port_key = OriginKey {
+            host_lower: "lazy-target.invalid".into(),
+            port: Some(443),
+        };
+        assert_eq!(
+            lazy.len(),
+            1,
+            "lazy map must be populated by production tarball path; got: {:?}",
+            lazy.keys().map(|k| k.to_string()).collect::<Vec<_>>()
+        );
+        assert!(
+            lazy.contains_key(&concrete_port_key),
+            "lazy entry must be keyed by URL's concrete-port origin"
+        );
     }
 
     /// `with_tls_overrides_for` eager-builds clients for the supplied
