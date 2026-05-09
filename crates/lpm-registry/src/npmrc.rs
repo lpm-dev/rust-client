@@ -22,30 +22,48 @@
 //!   populated; caller surfaces and exits before any network).
 //! - Comments (`;` and `#`), blank lines, CRLF, BOM, trailing whitespace.
 //!
-//! ## TLS settings (Phase 58.1)
+//! ## TLS settings (Phase 58.1 + 58.3)
 //!
-//! - `cafile=<path>` — global. PEM is read from disk at parse time
+//! Global keys:
+//! - `cafile=<path>` — PEM is read from disk at parse time
 //!   (fail-fast: typos surface as `cfg.errors` before any network).
 //!   Bytes are stored on `NpmrcConfig::tls` for
-//!   `RegistryClient::with_tls_overrides` to attach via
+//!   `RegistryClient::with_tls_overrides_for` to attach via
 //!   `ClientBuilder::add_root_certificate`.
-//! - `ca=<pem>` — global, inline PEM. Multiple lines accumulate.
-//! - `strict-ssl=false` — global. Maps to
+//! - `ca=<pem>` — inline PEM. Multiple lines accumulate.
+//! - `strict-ssl=false` — maps to
 //!   `ClientBuilder::danger_accept_invalid_certs(true)` and a loud
 //!   install-start warning (cites contributing source/line). Default
 //!   and explicit `=true` are no-ops.
+//! - `certfile=<path>` + `keyfile=<path>` — global mTLS identity.
+//!   Path-only at parse time; the actual cert/key file is read at
+//!   client-build time. XOR contract (both set or both absent) is
+//!   enforced at `finalize()` across all merged layers.
 //! - `always-auth=<bool>` — silently accepted at any scope. lpm always
 //!   sends a matching-origin token regardless; the per-registry
 //!   `always-auth` distinction was deprecated in npm 7+ and is vestigial.
+//!
+//! Per-origin keys (`//host[:port]/:<key>=...`):
+//! - `:cafile=<path>` — additive trust root for that origin only.
+//!   Deferred-read: file IO happens at client-build time for the
+//!   matching origin, NOT at parse time. Δ1 scoping rule.
+//! - `:certfile=<path>` + `:keyfile=<path>` — per-origin mTLS
+//!   identity. Replaces the global identity for that origin. XOR
+//!   validation is build-time per origin (Δ2 scoping) — half-config
+//!   for an unreached origin doesn't abort unrelated installs.
 //!
 //! ## What we don't parse (v1)
 //!
 //! - Path-prefix-scoped auth (`//host/some/path/:_authToken=...`). v1 matches
 //!   by origin (host + port) only, which covers ~99% of `.npmrc` files seen
 //!   in the wild. v1.1 adds prefix matching.
-//! - Per-origin TLS settings (`//host/:cafile=`, `:certfile=`, `:keyfile=`)
-//!   and global mTLS client certs (`certfile=`, `keyfile=`). Recognized at
-//!   parse time but unwired — Phase 58.3 (mTLS).
+//! - Per-origin `strict-ssl=false`. Global only — the parser warns on
+//!   per-origin use. Disabling cert verification per host is a
+//!   security footgun once shipped; v1 keeps it global with the
+//!   loud install-start warning.
+//! - PKCS#12 (`.p12`/`.pfx`) cert/key archives. rustls (the TLS
+//!   backend) doesn't ingest them; the loader emits a cited error
+//!   pointing the user at the openssl conversion recipe.
 //! - Yarn / pnpm extensions.
 //!
 //! ## Origin matching nuance
