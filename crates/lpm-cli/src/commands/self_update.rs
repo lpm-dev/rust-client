@@ -629,7 +629,10 @@ mod tests {
             // overwrite n's binary tree with a GitHub Releases
             // download instead of going through `npm install -g`.
             ("/Users/x/.n/bin/lpm", InstallMethod::Npm),
-            ("/Users/x/n/versions/node/20.0.0/bin/lpm", InstallMethod::Npm),
+            (
+                "/Users/x/n/versions/node/20.0.0/bin/lpm",
+                InstallMethod::Npm,
+            ),
             (
                 "/usr/local/n/versions/node/20.0.0/bin/lpm",
                 InstallMethod::Npm,

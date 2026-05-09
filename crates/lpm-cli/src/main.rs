@@ -2095,15 +2095,24 @@ fn validate_global_uninstall_project_scoped_flags(
 /// Whether the trailing "update available" banner should be suppressed
 /// for this invocation.
 ///
-/// Only one case suppresses: the user just ran `lpm self-update` AND it
-/// errored. Re-running self-update is exactly what the banner tells
-/// them to do, so emitting it after a self-update failure (cooldown,
-/// rate limit, transport error) sends the user back into the same loop
-/// they're already escaping. The suppression is per-invocation; the
-/// on-disk cache is unchanged, so any other command still surfaces
-/// the banner.
-fn should_suppress_update_banner(is_self_update_command: bool, command_errored: bool) -> bool {
-    is_self_update_command && command_errored
+/// The banner is suppressed for every `lpm self-update` invocation,
+/// regardless of outcome:
+///
+/// - Failure (cooldown, rate limit, transport error): the user already
+///   saw the failure message; "run lpm self-update" sends them back
+///   into the same loop they're trying to escape.
+/// - Success: the running process is still the old version (the new
+///   binary lives on disk but doesn't replace this PID), and the
+///   on-disk cache now has the just-upgraded version stamped. The
+///   banner predicate (`cache.latest > current`) therefore fires —
+///   so the user would see `Updated to 0.38.0` immediately followed
+///   by `Update available: 0.37.0 → 0.38.0 — run lpm self-update`.
+///   That contradicts itself.
+///
+/// Suppression is per-invocation; the on-disk cache is unchanged, so
+/// any other command still surfaces the banner on the next run.
+fn should_suppress_update_banner(is_self_update_command: bool) -> bool {
+    is_self_update_command
 }
 
 /// Phase 34.2: spawn a detached child process to refresh the update cache.
@@ -3923,15 +3932,17 @@ async fn async_main() -> Result<()> {
 
     // Update check: show notice from previous check (instant, no network).
     //
-    // Suppress the banner when the just-run command was `lpm self-update`
-    // and it errored. The banner exists to nudge users toward
-    // `lpm self-update`; printing "run lpm self-update" immediately after
-    // the command itself failed (cooldown, rate limit, transport error)
-    // sends the user back into the same loop and reads as a bug. The
-    // suppression is per-invocation only — the on-disk cache is
-    // untouched, so the next unrelated command still surfaces the
-    // banner.
-    let suppress_banner = should_suppress_update_banner(is_self_update_command, result.is_err());
+    // Suppress the banner whenever the just-run command was
+    // `lpm self-update`, regardless of outcome. On failure the banner
+    // would loop the user back into the same command that just errored;
+    // on success the running PID is still the old binary while the
+    // on-disk cache now reflects the just-upgraded `latest`, so the
+    // banner predicate (`cache.latest > current`) fires and produces
+    // the contradictory `Updated to 0.38.0` + `Update available:
+    // 0.37.0 → 0.38.0` pair. The suppression is per-invocation; the
+    // on-disk cache is untouched, so the next unrelated command still
+    // surfaces the banner.
+    let suppress_banner = should_suppress_update_banner(is_self_update_command);
     if !cli.json
         && !suppress_banner
         && let Some(notice) = update_check::read_cached_notice()
@@ -4029,30 +4040,29 @@ mod tests {
         );
     }
 
-    /// Banner suppression: the four-quadrant truth table.
+    /// Banner suppression: every `lpm self-update` invocation
+    /// suppresses the trailing banner; everything else lets it through.
     ///
-    /// Suppress only when both conditions hold — self-update was the
-    /// command AND it errored. Any other combination must let the
-    /// banner through, otherwise a transient failure on an unrelated
-    /// command (e.g. `lpm install` with a network blip) would silently
-    /// swallow the user's "you're behind on releases" signal.
+    /// Failure case: re-emitting "run lpm self-update" right after the
+    /// command itself failed loops the user.
+    ///
+    /// Success case: the running PID is still the old binary while the
+    /// on-disk cache has been stamped with the just-upgraded `latest`,
+    /// so the banner predicate fires and produces the contradictory
+    /// `Updated to X` + `Update available: <old> → X` pair.
+    ///
+    /// Other commands must NOT suppress: a transient failure on
+    /// `lpm install` would otherwise swallow the user's "you're behind
+    /// on releases" signal.
     #[test]
-    fn should_suppress_update_banner_truth_table() {
+    fn should_suppress_update_banner_only_on_self_update() {
         assert!(
-            should_suppress_update_banner(true, true),
-            "self-update + Err → suppress"
+            should_suppress_update_banner(true),
+            "self-update → suppress (covers both failure-loop and success-contradiction)"
         );
         assert!(
-            !should_suppress_update_banner(true, false),
-            "self-update + Ok → show banner (user just upgraded successfully — banner reflects newer cache)"
-        );
-        assert!(
-            !should_suppress_update_banner(false, true),
-            "other command + Err → show banner (unrelated failure must not eat the update notice)"
-        );
-        assert!(
-            !should_suppress_update_banner(false, false),
-            "other command + Ok → show banner (normal happy path)"
+            !should_suppress_update_banner(false),
+            "any other command → show banner"
         );
     }
 
