@@ -137,14 +137,89 @@ pub struct TaggedBool {
     pub line: usize,
 }
 
-/// TLS overrides parsed from `.npmrc`. All settings are global; per-origin
-/// `cafile`/`certfile`/`keyfile` and global mTLS client certs stay
-/// parse-warned (deferred to Phase 58.3 mTLS).
+/// Filesystem path tagged with its contributing source — used for
+/// `certfile=` / `keyfile=` (global and per-origin). Path is stored
+/// verbatim from `.npmrc`; the loader resolves and reads at client-
+/// build time so per-origin entries the install never reaches don't
+/// turn into ambient-config preconditions. Phase 58.3 (mTLS).
+#[derive(Clone, Debug)]
+pub struct TaggedPath {
+    pub path: PathBuf,
+    pub source: String,
+    pub line: usize,
+}
+
+/// Per-origin TLS settings parsed from `//host[:port]/:cafile=` /
+/// `:certfile=` / `:keyfile=`. Empty by default; only origins with at
+/// least one TLS key set get an entry in [`TlsOverrides::per_origin`].
 ///
-/// The consumer is `RegistryClient::with_tls_overrides`, which converts
-/// `extra_roots` to `reqwest::Certificate` via `ClientBuilder::add_root_certificate`
-/// and wires `strict_ssl == Some(false)` to
-/// `ClientBuilder::danger_accept_invalid_certs(true)`. Phase 58.1.
+/// **Deferred-read contract.** Unlike global `cafile=`, per-origin
+/// `cafile=` stores only the path here — the loader reads the PEM at
+/// client-build time for the matching origin. This keeps unrelated
+/// `.npmrc` entries (e.g., a stale corporate registry path on a
+/// shared `~/.npmrc`) from breaking installs that never touch the
+/// configured origin. Same scoping rule applies to `certfile` /
+/// `keyfile`.
+///
+/// **Identity atomicity.** `certfile` and `keyfile` must both be set
+/// or both absent. If only one is set, the loader emits a fatal
+/// error citing the present line — but only when this origin is
+/// actually built into a client (eager or lazy). Configured-but-
+/// unreached half-configs do not abort the install. Phase 58.3.
+#[derive(Default, Clone, Debug)]
+pub struct OriginTlsOverrides {
+    /// Extra root certificates from `//host/:cafile=<path>`. Stored
+    /// as path-only (deferred-read) — the loader stat+reads at
+    /// build time and surfaces IO errors cited at this line.
+    pub cafiles: Vec<TaggedPath>,
+    /// Per-origin mTLS client certificate file. Pairs with `keyfile`
+    /// — see struct doc for the atomicity contract.
+    pub certfile: Option<TaggedPath>,
+    /// Per-origin mTLS private key file. Pairs with `certfile`.
+    pub keyfile: Option<TaggedPath>,
+}
+
+impl OriginTlsOverrides {
+    /// Whether this origin has any TLS settings configured. Used by
+    /// the per-origin client builder (Phase 58.3 / T3) to skip
+    /// building a separate client for an origin whose entry exists
+    /// only because `merge_over` created it empty.
+    pub fn is_empty(&self) -> bool {
+        self.cafiles.is_empty() && self.certfile.is_none() && self.keyfile.is_none()
+    }
+
+    /// Merge `other` ON TOP OF `self` per field. Used when a higher-
+    /// precedence `.npmrc` layer adds keys for the same origin a
+    /// lower-precedence layer already covered.
+    fn merge_over(&mut self, other: OriginTlsOverrides) {
+        // cafiles concatenate (multiple roots may stack).
+        self.cafiles.extend(other.cafiles);
+        if other.certfile.is_some() {
+            self.certfile = other.certfile;
+        }
+        if other.keyfile.is_some() {
+            self.keyfile = other.keyfile;
+        }
+    }
+}
+
+/// TLS overrides parsed from `.npmrc`. The split between global and
+/// per-origin is intentional:
+///
+/// - **Global** (`extra_roots`, `strict_ssl`, `identity_certfile`,
+///   `identity_keyfile`) applies to every request from the default
+///   client. Wrong here breaks every fetch, so wrong values are
+///   surfaced at parse/finalize time and abort the install.
+///
+/// - **Per-origin** (`per_origin`) applies only to clients built for
+///   matching origins. Wrong here is surfaced at client-build time
+///   for that specific origin, not globally — so an unrelated bad
+///   entry in a shared `~/.npmrc` never breaks an unrelated install.
+///
+/// The consumer is `RegistryClient::with_tls_overrides_for` (Phase
+/// 58.3), which builds the default client from the global surface
+/// and per-origin clients eagerly for the request set's reached
+/// origins (lazy for the rest).
 #[derive(Default, Debug, Clone)]
 pub struct TlsOverrides {
     /// Extra root certificates from `cafile=<path>` and `ca=<pem>`.
@@ -167,6 +242,21 @@ pub struct TlsOverrides {
     /// higher-silent doesn't clear lower. A user's `~/.npmrc strict-ssl=false`
     /// persists across projects unless a project explicitly says `=true`.
     pub strict_ssl: Option<TaggedBool>,
+
+    /// Global mTLS client certificate file (`certfile=<path>`). Pairs
+    /// with [`Self::identity_keyfile`]. Atomicity: both must be set
+    /// or both absent — `finalize()` enforces this with a fatal
+    /// `cfg.errors` entry citing the present line.
+    pub identity_certfile: Option<TaggedPath>,
+
+    /// Global mTLS private key file (`keyfile=<path>`). Pairs with
+    /// [`Self::identity_certfile`].
+    pub identity_keyfile: Option<TaggedPath>,
+
+    /// Per-origin TLS settings, keyed by `//host[:port]/`. Looked up
+    /// via [`NpmrcConfig::tls_for_origin`] with the same `(host,
+    /// Some(port))` → `(host, None)` fallback rule the auth path uses.
+    pub per_origin: HashMap<OriginKey, OriginTlsOverrides>,
 }
 
 /// Origin key for auth lookup: case-insensitive host + optional port.
@@ -635,6 +725,14 @@ impl NpmrcConfig {
     /// drained on first call). Emits warnings for any partial /
     /// malformed credentials, citing the source label of whichever
     /// subkey contributed the partial state (Gemini Finding 3).
+    ///
+    /// **Phase 58.3** — also enforces the GLOBAL mTLS identity XOR
+    /// contract: `certfile=` and `keyfile=` at the top level must
+    /// both be set or both absent. A half-configured global identity
+    /// gets a fatal `cfg.errors` entry citing the present line and
+    /// naming the missing key. The same contract for per-origin
+    /// identities is enforced later, at client-build time, so a
+    /// half-config for an unreached origin never aborts the install.
     pub fn finalize(&mut self) {
         if self.finalized {
             return;
@@ -644,6 +742,30 @@ impl NpmrcConfig {
             if let Some(auth) = buf.resolve(&origin, &mut self.warnings) {
                 self.origin_auth.insert(origin, auth);
             }
+        }
+        // GLOBAL mTLS identity XOR check (Phase 58.3). Per-origin
+        // identities are validated at client-build time, not here —
+        // see Δ2 in the phase-67 plan doc for the scoping rationale.
+        match (
+            self.tls.identity_certfile.as_ref(),
+            self.tls.identity_keyfile.as_ref(),
+        ) {
+            (Some(cert), None) => {
+                self.errors.push(format!(
+                    "{}:{}: 'certfile' (mTLS client cert) is set but 'keyfile' is missing across all merged layers; both must be set or both absent",
+                    cert.source, cert.line
+                ));
+            }
+            (None, Some(key)) => {
+                self.errors.push(format!(
+                    "{}:{}: 'keyfile' (mTLS private key) is set but 'certfile' is missing across all merged layers; both must be set or both absent",
+                    key.source, key.line
+                ));
+            }
+            // (Some, Some) → complete pair, validated further at
+            // identity-load time (concat + Identity::from_pem).
+            // (None, None) → no global mTLS, nothing to check.
+            _ => {}
         }
         self.finalized = true;
     }
@@ -703,6 +825,33 @@ impl NpmrcConfig {
         if other.tls.strict_ssl.is_some() {
             self.tls.strict_ssl = other.tls.strict_ssl;
         }
+        // Phase 58.3 — global mTLS identity. Same merge shape as
+        // `default_registry`: higher-explicit wins. The XOR-validation
+        // contract (both certfile + keyfile, or neither) is enforced
+        // at finalize time across all merged layers, so a user can
+        // legitimately set `certfile=` in `~/.npmrc` and `keyfile=`
+        // in a project `.npmrc` and have them compose.
+        if other.tls.identity_certfile.is_some() {
+            self.tls.identity_certfile = other.tls.identity_certfile;
+        }
+        if other.tls.identity_keyfile.is_some() {
+            self.tls.identity_keyfile = other.tls.identity_keyfile;
+        }
+        // Phase 58.3 — per-origin TLS. Each origin's settings merge
+        // independently via `OriginTlsOverrides::merge_over`:
+        // - `cafiles` accumulate (multiple roots stack);
+        // - `certfile` / `keyfile` higher-explicit wins.
+        // The per-origin XOR-validation contract is NOT enforced
+        // here — it's deferred to client-build time so a half-config
+        // for an origin this invocation never reaches doesn't abort
+        // unrelated installs.
+        for (origin, other_per_origin) in other.tls.per_origin {
+            self.tls
+                .per_origin
+                .entry(origin)
+                .or_default()
+                .merge_over(other_per_origin);
+        }
         self.warnings.extend(other.warnings);
         self.errors.extend(other.errors);
     }
@@ -755,6 +904,30 @@ impl NpmrcConfig {
             port: None,
         };
         self.origin_auth.get(&any_port)
+    }
+
+    /// Look up per-origin TLS settings for a request URL. Mirrors
+    /// [`Self::auth_for_url`]'s match rule: try `(host, Some(port))`
+    /// first, fall back to `(host, None)` so an `.npmrc` entry
+    /// without an explicit port covers any port for that host.
+    /// Phase 58.3 (mTLS).
+    pub fn tls_for_url(&self, url: &str) -> Option<&OriginTlsOverrides> {
+        let exact = OriginKey::from_request_url(url)?;
+        self.tls_for_origin(&exact)
+    }
+
+    /// Look up per-origin TLS settings by `OriginKey`. Used by the
+    /// per-origin client builder (Phase 58.3) which already has the
+    /// resolved origin and doesn't need a URL parse round-trip.
+    pub fn tls_for_origin(&self, origin: &OriginKey) -> Option<&OriginTlsOverrides> {
+        if let Some(t) = self.tls.per_origin.get(origin) {
+            return Some(t);
+        }
+        let any_port = OriginKey {
+            host_lower: origin.host_lower.clone(),
+            port: None,
+        };
+        self.tls.per_origin.get(&any_port)
     }
 
     // ---- Filesystem walker (Phase 58 day-2) ----
@@ -1131,23 +1304,36 @@ fn classify_and_apply(
                 return;
             };
             // V1 limitation: warn if the user wrote a path-prefixed key.
-            // We're matching by origin only — which means the token
-            // applies to ALL paths on that origin, which is more
-            // permissive than what the user wrote. Loud warning so this
-            // can't surprise anyone.
+            // We're matching by origin only, so whatever the key
+            // configures (auth token, mTLS identity, extra root, …)
+            // will apply to ALL paths on that origin — broader than
+            // what the user wrote. Loud warning so this can't surprise
+            // anyone. Phase 58.3: keep the wording neutral so it
+            // covers both auth and TLS attrs through the same branch.
             if origin_part.contains('/') {
                 cfg.warnings.push(format!(
-                    "{source_label}:{lineno}: path-scoped auth ('{key}') is parsed as origin-only in v1; \
-                     token will apply to ALL paths on {origin} — see Phase 58 docs"
+                    "{source_label}:{lineno}: path-scoped npmrc key ('{key}') is parsed as origin-only in v1; \
+                     setting will apply to ALL paths on {origin} — see Phase 58 docs"
                 ));
             }
             let tagged = TaggedValue::new(value.to_string(), source_label, lineno);
-            let buf = cfg.auth_buffers.entry(origin).or_default();
+            // Auth subkeys go into the per-origin auth buffer.
+            // TLS subkeys go into the per-origin TLS buffer (Phase 58.3).
+            // Two distinct entry maps share the same `OriginKey` so a
+            // matching-origin lookup at request time fetches both.
             match attr {
-                "_authToken" => buf.auth_token = Some(tagged),
-                "_auth" => buf.auth_b64 = Some(tagged),
-                "_username" => buf.username = Some(tagged),
-                "_password" => buf.password_b64 = Some(tagged),
+                "_authToken" => {
+                    cfg.auth_buffers.entry(origin).or_default().auth_token = Some(tagged);
+                }
+                "_auth" => {
+                    cfg.auth_buffers.entry(origin).or_default().auth_b64 = Some(tagged);
+                }
+                "_username" => {
+                    cfg.auth_buffers.entry(origin).or_default().username = Some(tagged);
+                }
+                "_password" => {
+                    cfg.auth_buffers.entry(origin).or_default().password_b64 = Some(tagged);
+                }
                 "always-auth" | "email" => {
                     // Silently accepted at origin scope (Phase 58.1).
                     // `always-auth` is vestigial — modern npm 7+ removed
@@ -1155,13 +1341,70 @@ fn classify_and_apply(
                     // matching-origin tokens. `email` is publish-flow
                     // metadata, irrelevant to install routing.
                 }
-                "cafile" | "certfile" | "keyfile" => {
-                    // Per-origin TLS / mTLS — not wired up yet.
-                    cfg.warnings.push(format!(
-                        "{source_label}:{lineno}: per-origin '{attr}' is not supported yet \
-                         (per-origin mTLS / TLS is not wired up); request will use \
-                         the global TLS config"
-                    ));
+                "cafile" => {
+                    // Phase 58.3 — per-origin extra root. DEFERRED-READ
+                    // by design: the PEM is read at client-build time
+                    // for the matching origin, NOT at parse time. This
+                    // keeps unrelated `.npmrc` entries (e.g., a stale
+                    // path on a shared `~/.npmrc`) from breaking
+                    // installs that never reach the configured origin.
+                    if value.is_empty() {
+                        cfg.warnings.push(format!(
+                            "{source_label}:{lineno}: empty per-origin cafile path; skipped"
+                        ));
+                        return;
+                    }
+                    cfg.tls
+                        .per_origin
+                        .entry(origin)
+                        .or_default()
+                        .cafiles
+                        .push(TaggedPath {
+                            path: PathBuf::from(value),
+                            source: source_label.to_string(),
+                            line: lineno,
+                        });
+                }
+                "certfile" => {
+                    // Phase 58.3 — per-origin mTLS client cert path.
+                    // Path-only at parse time; XOR-pair validation +
+                    // file read deferred to client-build time. See Δ2
+                    // in the phase-67 plan: configured-but-unreached
+                    // half-configs do not abort the install.
+                    if value.is_empty() {
+                        cfg.warnings.push(format!(
+                            "{source_label}:{lineno}: empty per-origin certfile path; skipped"
+                        ));
+                        return;
+                    }
+                    cfg.tls
+                        .per_origin
+                        .entry(origin)
+                        .or_default()
+                        .certfile = Some(TaggedPath {
+                        path: PathBuf::from(value),
+                        source: source_label.to_string(),
+                        line: lineno,
+                    });
+                }
+                "keyfile" => {
+                    // Phase 58.3 — per-origin mTLS private key path.
+                    // Same deferred-read contract as `certfile`.
+                    if value.is_empty() {
+                        cfg.warnings.push(format!(
+                            "{source_label}:{lineno}: empty per-origin keyfile path; skipped"
+                        ));
+                        return;
+                    }
+                    cfg.tls
+                        .per_origin
+                        .entry(origin)
+                        .or_default()
+                        .keyfile = Some(TaggedPath {
+                        path: PathBuf::from(value),
+                        source: source_label.to_string(),
+                        line: lineno,
+                    });
                 }
                 _ => {
                     // Unknown attribute on a `//host` key. Silent ignore
@@ -1278,10 +1521,28 @@ fn classify_and_apply(
         return;
     }
     if key == "certfile" || key == "keyfile" {
-        // Global mTLS client cert — not wired up yet.
-        cfg.warnings.push(format!(
-            "{source_label}:{lineno}: '{key}' (mTLS client cert) is not supported yet"
-        ));
+        // Phase 58.3 — global mTLS identity (cert chain + private key).
+        // Path-only at parse time; the actual cert/key file is read at
+        // client-build time. The XOR-pair contract (both set or both
+        // absent) is enforced at finalize() across all merged layers,
+        // so a `~/.npmrc certfile=` plus a project `.npmrc keyfile=`
+        // legitimately compose into a single global identity.
+        if value.is_empty() {
+            cfg.warnings.push(format!(
+                "{source_label}:{lineno}: empty {key} path; skipped"
+            ));
+            return;
+        }
+        let tagged_path = TaggedPath {
+            path: PathBuf::from(value),
+            source: source_label.to_string(),
+            line: lineno,
+        };
+        if key == "certfile" {
+            cfg.tls.identity_certfile = Some(tagged_path);
+        } else {
+            cfg.tls.identity_keyfile = Some(tagged_path);
+        }
         return;
     }
     if key == "always-auth" {
@@ -1797,35 +2058,219 @@ mod tests {
         assert!(cfg.warnings.is_empty(), "warnings: {:?}", cfg.warnings);
     }
 
+    // ---- Phase 58.3: per-origin TLS / mTLS parsing ----
+
     #[test]
-    fn certfile_keyfile_global_warn_with_unsupported_pointer() {
+    fn global_certfile_xor_keyfile_is_fatal_with_cited_line() {
+        // Half-configured global identity at finalize time → fatal,
+        // citing the line of the present key and naming the missing
+        // one. Phase 58.3 Δ2: this is GLOBAL state — wrong here breaks
+        // every fetch, so install must abort before any network.
         let cfg = NpmrcConfig::parse("certfile=/path/cert.pem\n", "test", &no_env);
-        assert_eq!(cfg.warnings.len(), 1);
-        assert!(cfg.warnings[0].contains("mTLS") && cfg.warnings[0].contains("not supported yet"));
+        assert_eq!(cfg.errors.len(), 1, "errors: {:?}", cfg.errors);
+        assert!(cfg.errors[0].contains("test:1"));
+        assert!(cfg.errors[0].contains("certfile"));
+        assert!(cfg.errors[0].contains("keyfile"));
 
         let cfg = NpmrcConfig::parse("keyfile=/path/key.pem\n", "test", &no_env);
-        assert_eq!(cfg.warnings.len(), 1);
-        assert!(cfg.warnings[0].contains("mTLS") && cfg.warnings[0].contains("not supported yet"));
+        assert_eq!(cfg.errors.len(), 1, "errors: {:?}", cfg.errors);
+        assert!(cfg.errors[0].contains("test:1"));
+        assert!(cfg.errors[0].contains("keyfile"));
+        assert!(cfg.errors[0].contains("certfile"));
     }
 
     #[test]
-    fn certfile_keyfile_per_origin_warn_with_unsupported_pointer() {
-        let cfg = NpmrcConfig::parse("//npm.internal/:certfile=/path/cert.pem\n", "test", &no_env);
-        assert_eq!(cfg.warnings.len(), 1);
-        assert!(cfg.warnings[0].contains("not supported yet"));
+    fn global_certfile_and_keyfile_complete_pair_is_clean() {
+        let content = "certfile=/path/cert.pem\nkeyfile=/path/key.pem\n";
+        let cfg = NpmrcConfig::parse(content, "test", &no_env);
+        assert!(cfg.errors.is_empty(), "errors: {:?}", cfg.errors);
+        assert!(cfg.warnings.is_empty(), "warnings: {:?}", cfg.warnings);
+        assert_eq!(
+            cfg.tls.identity_certfile.as_ref().unwrap().path,
+            PathBuf::from("/path/cert.pem")
+        );
+        assert_eq!(
+            cfg.tls.identity_keyfile.as_ref().unwrap().path,
+            PathBuf::from("/path/key.pem")
+        );
     }
 
     #[test]
-    fn cafile_per_origin_still_warns_unsupported() {
-        // Per-origin server CA is exotic; not wired up yet. Make sure
-        // the per-origin warning didn't get conflated with the global
-        // cafile wire-up.
-        let cfg = NpmrcConfig::parse("//npm.internal/:cafile=/path/ca.pem\n", "test", &no_env);
+    fn global_certfile_keyfile_compose_across_layers() {
+        // certfile in lower-precedence + keyfile in higher-precedence
+        // should compose into a complete pair, NOT trigger the XOR
+        // fatal — the contract is across all merged layers.
+        let mut acc = NpmrcConfig::parse_layer(
+            "certfile=/etc/cert.pem\n",
+            "system",
+            &no_env,
+        );
+        let higher = NpmrcConfig::parse_layer(
+            "keyfile=/home/u/key.pem\n",
+            "user",
+            &no_env,
+        );
+        acc.merge_over(higher);
+        acc.finalize();
+        assert!(acc.errors.is_empty(), "errors: {:?}", acc.errors);
+        assert_eq!(
+            acc.tls.identity_certfile.as_ref().unwrap().source,
+            "system"
+        );
+        assert_eq!(acc.tls.identity_keyfile.as_ref().unwrap().source, "user");
+    }
+
+    #[test]
+    fn global_certfile_empty_value_warns_skipped() {
+        let cfg = NpmrcConfig::parse("certfile=\n", "test", &no_env);
+        // Empty value warned + skipped means no certfile is set,
+        // which means no XOR fatal either.
+        assert!(cfg.errors.is_empty(), "errors: {:?}", cfg.errors);
         assert_eq!(cfg.warnings.len(), 1);
-        assert!(cfg.warnings[0].contains("not supported yet"));
+        assert!(cfg.warnings[0].contains("empty certfile"));
+        assert!(cfg.tls.identity_certfile.is_none());
+    }
+
+    #[test]
+    fn per_origin_cafile_populates_per_origin_not_global_roots() {
+        let cfg = NpmrcConfig::parse(
+            "//npm.internal/:cafile=/path/ca.pem\n",
+            "test",
+            &no_env,
+        );
+        // Phase 58.3: per-origin cafile is path-only at parse time
+        // (deferred-read), so a non-existent path here is NOT a
+        // parse-time error. Only loaded at client-build time for
+        // the matching origin, and only if this invocation reaches it.
+        assert!(cfg.errors.is_empty(), "errors: {:?}", cfg.errors);
+        assert!(cfg.warnings.is_empty(), "warnings: {:?}", cfg.warnings);
         assert!(
             cfg.tls.extra_roots.is_empty(),
             "per-origin cafile must not feed global extra_roots"
+        );
+        let origin = OriginKey {
+            host_lower: "npm.internal".into(),
+            port: None,
+        };
+        let per_origin = cfg.tls.per_origin.get(&origin).expect("entry");
+        assert_eq!(per_origin.cafiles.len(), 1);
+        assert_eq!(per_origin.cafiles[0].path, PathBuf::from("/path/ca.pem"));
+        assert_eq!(per_origin.cafiles[0].source, "test");
+        assert_eq!(per_origin.cafiles[0].line, 1);
+    }
+
+    #[test]
+    fn per_origin_certfile_keyfile_populate_per_origin_not_global() {
+        let content = "//npm.internal/:certfile=/path/cert.pem\n\
+                       //npm.internal/:keyfile=/path/key.pem\n";
+        let cfg = NpmrcConfig::parse(content, "test", &no_env);
+        assert!(cfg.errors.is_empty(), "errors: {:?}", cfg.errors);
+        assert!(cfg.warnings.is_empty(), "warnings: {:?}", cfg.warnings);
+        assert!(cfg.tls.identity_certfile.is_none());
+        assert!(cfg.tls.identity_keyfile.is_none());
+        let origin = OriginKey {
+            host_lower: "npm.internal".into(),
+            port: None,
+        };
+        let per_origin = cfg.tls.per_origin.get(&origin).expect("entry");
+        assert_eq!(
+            per_origin.certfile.as_ref().unwrap().path,
+            PathBuf::from("/path/cert.pem")
+        );
+        assert_eq!(
+            per_origin.keyfile.as_ref().unwrap().path,
+            PathBuf::from("/path/key.pem")
+        );
+    }
+
+    #[test]
+    fn per_origin_half_configured_identity_does_not_abort_at_finalize() {
+        // Phase 58.3 Δ2: per-origin half-configs are NOT fatal at
+        // finalize. They become fatal only when that origin is
+        // actually built into a client (eager or lazy). Configured-
+        // but-unreached half-configs do not break unrelated installs.
+        let cfg = NpmrcConfig::parse(
+            "//unused.internal/:certfile=/path/cert.pem\n",
+            "test",
+            &no_env,
+        );
+        assert!(cfg.errors.is_empty(), "errors: {:?}", cfg.errors);
+    }
+
+    #[test]
+    fn tls_for_origin_falls_back_to_any_port() {
+        let cfg = NpmrcConfig::parse(
+            "//npm.internal/:cafile=/path/ca.pem\n",
+            "test",
+            &no_env,
+        );
+        // Lookup with a concrete port should fall back to the
+        // port-less entry, mirroring auth_for_url's semantics.
+        let with_port = OriginKey {
+            host_lower: "npm.internal".into(),
+            port: Some(443),
+        };
+        assert!(cfg.tls_for_origin(&with_port).is_some());
+        let other_host = OriginKey {
+            host_lower: "other.internal".into(),
+            port: Some(443),
+        };
+        assert!(cfg.tls_for_origin(&other_host).is_none());
+    }
+
+    #[test]
+    fn merge_over_per_origin_cafiles_concatenate() {
+        let mut acc = NpmrcConfig::parse_layer(
+            "//npm.internal/:cafile=/system/ca.pem\n",
+            "system",
+            &no_env,
+        );
+        let higher = NpmrcConfig::parse_layer(
+            "//npm.internal/:cafile=/user/ca.pem\n",
+            "user",
+            &no_env,
+        );
+        acc.merge_over(higher);
+        acc.finalize();
+        let origin = OriginKey {
+            host_lower: "npm.internal".into(),
+            port: None,
+        };
+        let per_origin = acc.tls.per_origin.get(&origin).expect("entry");
+        assert_eq!(per_origin.cafiles.len(), 2);
+        assert_eq!(per_origin.cafiles[0].source, "system");
+        assert_eq!(per_origin.cafiles[1].source, "user");
+    }
+
+    #[test]
+    fn merge_over_per_origin_certfile_higher_wins() {
+        let mut acc = NpmrcConfig::parse_layer(
+            "//npm.internal/:certfile=/system/cert.pem\n\
+             //npm.internal/:keyfile=/system/key.pem\n",
+            "system",
+            &no_env,
+        );
+        let higher = NpmrcConfig::parse_layer(
+            "//npm.internal/:certfile=/user/cert.pem\n",
+            "user",
+            &no_env,
+        );
+        acc.merge_over(higher);
+        acc.finalize();
+        let origin = OriginKey {
+            host_lower: "npm.internal".into(),
+            port: None,
+        };
+        let per_origin = acc.tls.per_origin.get(&origin).expect("entry");
+        assert_eq!(
+            per_origin.certfile.as_ref().unwrap().source,
+            "user",
+            "higher layer's certfile must win"
+        );
+        assert_eq!(
+            per_origin.keyfile.as_ref().unwrap().source,
+            "system",
+            "lower layer's keyfile is preserved when higher doesn't set it"
         );
     }
 
@@ -2140,7 +2585,9 @@ mod tests {
             _ => panic!("expected Bearer"),
         }
         assert!(
-            cfg.warnings.iter().any(|w| w.contains("path-scoped auth")),
+            cfg.warnings
+                .iter()
+                .any(|w| w.contains("path-scoped npmrc key")),
             "path-prefix warning required; got {:?}",
             cfg.warnings
         );

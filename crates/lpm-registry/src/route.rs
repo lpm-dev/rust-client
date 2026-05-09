@@ -488,14 +488,20 @@ mod tests {
 
     #[test]
     fn route_table_new_succeeds_with_only_warnings() {
-        // Warnings (per-origin TLS / path-prefix tokens) are advisory —
-        // they do NOT block construction. Only fatal errors do.
-        // Per-origin cafile is still parse-warned in Phase 58.1 (deferred
-        // to 58.3 mTLS); use that as a deterministic warning trigger.
-        let content = "//npm.internal/:cafile=/etc/ssl/cert.pem\n";
+        // Warnings (path-prefix tokens, malformed lines, etc.) are
+        // advisory — they do NOT block construction. Only fatal
+        // errors do.
+        //
+        // Phase 58.3: per-origin cafile/certfile/keyfile no longer
+        // emit "not supported yet" warnings (they populate per-origin
+        // TLS state instead). Use a path-scoped auth-token line as the
+        // deterministic warning trigger — that warning is independent
+        // of TLS feature gating and stays warning-level (path-scoped
+        // auth keys parse as origin-only in v1).
+        let content = "//npm.internal/some/path/:_authToken=t\n";
         let npmrc = NpmrcConfig::parse(content, "test", &no_env);
         let table = RouteTable::new(RouteMode::Direct, npmrc).expect("warnings don't block");
         assert_eq!(table.npmrc_warnings().len(), 1);
-        assert!(table.npmrc_warnings()[0].contains("not supported yet"));
+        assert!(table.npmrc_warnings()[0].contains("path-scoped"));
     }
 }
