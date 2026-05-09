@@ -1,6 +1,6 @@
 ---
 source: tests/workflows/tests/install.rs
-assertion_line: 503
+assertion_line: 630
 expression: envelope
 ---
 {
@@ -25,6 +25,7 @@ expression: envelope
   "errors": [],
   "overrides_count": 0,
   "overrides_fingerprint": null,
+  "peer_conflicts": [],
   "applied_patches": [],
   "patches_count": 0,
   "patches_fingerprint": null,

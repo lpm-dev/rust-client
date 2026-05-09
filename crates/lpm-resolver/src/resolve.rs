@@ -141,6 +141,18 @@ pub struct ResolveResult {
     /// Empty when no peers needed synthesis OR when
     /// `auto_install_peers` was false.
     pub ambient_peer_installs: Vec<String>,
+    /// **Phase 66 confidence-followup §1a** — best-effort peer-conflict
+    /// reports. Each entry is one peer canonical whose required
+    /// consumer ranges were pairwise-incompatible: lpm picked the
+    /// version satisfying the most consumers and recorded the
+    /// unsatisfied ones here. Mirrors npm v7+ / pnpm hoisted-mode
+    /// behavior — pick one peer top-level, warn the rest. The
+    /// install pipeline prints a single warning block per entry
+    /// after the install summary.
+    ///
+    /// Sorted alphabetically by `canonical` for deterministic warning
+    /// order. Empty when the resolved peer graph is clean.
+    pub peer_conflicts: Vec<crate::greedy::PeerConflictReport>,
     /// **Phase 40 P3a** — substage breakdown of cold-resolve wall-clock.
     /// Observability-only; the fields and their overlap contract are
     /// documented on [`StageTiming`].
@@ -530,6 +542,7 @@ pub async fn resolve_with_shared_cache(
                     // pre-R2 warn-only peer semantics, same as
                     // `auto_install_peers = false`.
                     ambient_peer_installs: Vec::new(),
+                    peer_conflicts: Vec::new(),
                     stage_timing,
                 });
             }

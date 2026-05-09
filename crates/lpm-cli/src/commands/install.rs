@@ -3358,6 +3358,9 @@ async fn run_with_options_under_store_lock(
                     "link_ms": 0u128,
                     "total_ms": total_ms,
                 },
+                // §1a — always-present empty array: up-to-date fast
+                // path runs no resolve, so no fresh conflict trace.
+                "peer_conflicts": [],
             });
             // Phase 2: surface workspace target set for agents.
             if let Some(targets) = target_set {
@@ -3686,6 +3689,9 @@ async fn run_with_options_under_store_lock(
                     "link_ms": 0u128,
                     "total_ms": total_ms,
                 },
+                // §1a — always-present empty array: zero deps means
+                // zero peer requirements means zero conflicts.
+                "peer_conflicts": [],
             });
             if let Some(targets) = target_set {
                 json["target_set"] = serde_json::Value::Array(
@@ -4034,6 +4040,21 @@ async fn run_with_options_under_store_lock(
     // preserve the previously-recorded trace from disk in that case);
     // populated for fresh resolution from the resolver's apply log.
     let mut applied_overrides: Vec<OverrideHit> = Vec::new();
+
+    // **Phase 66 confidence-followup §1a** — best-effort peer-conflict
+    // reports from the resolver. Each entry is one peer canonical
+    // whose required consumer ranges were pairwise-incompatible: the
+    // resolver picked the version satisfying the most consumers and
+    // recorded the unsatisfied ones here. Surfaced as a `WARN` block
+    // in text mode AND as the always-present `peer_conflicts` array
+    // on `--json` output so machine consumers (CI, dashboards, audit
+    // tooling) can rely on the field's existence.
+    //
+    // Empty for the lockfile-fast-path (no fresh resolve); empty when
+    // the peer graph is clean. Always serialized as an array — even
+    // empty — to match the `applied_patches` shape contract that
+    // tooling already depends on.
+    let mut peer_conflicts: Vec<lpm_resolver::PeerConflictReport> = Vec::new();
 
     // **R2.5** — ambient peer installs synthesized by the resolver,
     // captured here so the cold-resolve lockfile-write site below
@@ -4596,6 +4617,14 @@ async fn run_with_options_under_store_lock(
             // summary, the JSON output, and `.lpm/overrides-state.json`.
             applied_overrides = resolve_result.applied_overrides.clone();
 
+            // §1a — capture best-effort peer-conflict reports. Drained
+            // alongside applied_overrides so the JSON envelope below
+            // can serialize them whether or not the user is running
+            // with `--json`. Cloned (not moved) because
+            // `resolve_result` is consumed by `resolved_to_install_packages`
+            // a few lines down.
+            peer_conflicts = resolve_result.peer_conflicts.clone();
+
             // **Phase 40 P1** — capture the platform-filtered optional
             // skip count. Surfaced as `timing.resolve.platform_skipped`
             // in `--json` output.
@@ -4646,6 +4675,30 @@ async fn run_with_options_under_store_lock(
                     packages.len().to_string().bold(),
                     ms
                 ));
+                // §1a — surface best-effort peer-conflict reports as
+                // warnings so the user knows which transitive
+                // consumers got a peer version outside their declared
+                // range. Mirrors npm v7+'s unconditional `npm WARN`
+                // behavior. Suppressed under `--json` to keep
+                // machine-readable output clean; `--json` consumers
+                // get the same data on the always-present
+                // `peer_conflicts` array in the install JSON envelope
+                // (constructed below).
+                for report in &resolve_result.peer_conflicts {
+                    let unsatisfied_str = report
+                        .unsatisfied_consumers
+                        .iter()
+                        .map(|(c, r)| format!("{c} wants {r}"))
+                        .collect::<Vec<_>>()
+                        .join("; ");
+                    output::warn(&format!(
+                        "peer {} pinned to {} but {} unsatisfied consumer(s): {}",
+                        report.canonical.bold(),
+                        report.chosen_version,
+                        report.unsatisfied_consumers.len(),
+                        unsatisfied_str,
+                    ));
+                }
             }
             (packages, ms, false, platform_skipped)
         }
@@ -7014,6 +7067,32 @@ async fn run_with_options_under_store_lock(
         json["overrides_count"] = serde_json::json!(override_set.len());
         json["overrides_fingerprint"] =
             fingerprint_json_value(override_set.len(), override_set.fingerprint());
+
+        // **Phase 66 confidence-followup §1a** — best-effort peer-
+        // conflict reports as an ALWAYS-PRESENT array. Empty when the
+        // peer graph is clean OR on the lockfile fast path (no fresh
+        // resolve produces no fresh conflict trace). Field is
+        // unconditional so machine consumers can rely on its
+        // existence — same shape contract as `applied_patches`.
+        json["peer_conflicts"] = serde_json::Value::Array(
+            peer_conflicts
+                .iter()
+                .map(|r| {
+                    serde_json::json!({
+                        "canonical": r.canonical,
+                        "chosen_version": r.chosen_version,
+                        "unsatisfied_consumers": r
+                            .unsatisfied_consumers
+                            .iter()
+                            .map(|(consumer, range)| serde_json::json!({
+                                "consumer": consumer,
+                                "range": range,
+                            }))
+                            .collect::<Vec<_>>(),
+                    })
+                })
+                .collect(),
+        );
 
         // **Phase 32 Phase 6** — surface the patch apply trace + counts.
         // Audit fix (2026-04-12): filter to entries that ACTUALLY did
