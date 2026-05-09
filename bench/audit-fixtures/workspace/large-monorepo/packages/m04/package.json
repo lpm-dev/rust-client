@@ -1,0 +1,6 @@
+{
+	"name": "audit-large-m04",
+	"version": "1.0.0",
+	"private": true,
+	"main": "index.js"
+}

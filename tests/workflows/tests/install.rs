@@ -4187,3 +4187,234 @@ fn install_lpm_linker_env_rejects_unknown_value_loudly() {
         "stderr must name LPM_LINKER; got:\n{stderr}"
     );
 }
+
+// ─── R2.5 fix-2 — pubgrub-mismatch warning visibility ──────────
+//
+// **The hole.** Pre-fix, the `LPM_RESOLVER=pubgrub +
+// auto_install_peers=true` warning was emitted only when
+// `!json_output`. That silenced the warning for every CI/wrapper/
+// tooling caller that requested `--json` — exactly the audience
+// that needs the signal MOST, since they consume the install
+// programmatically. The user/operator running interactively at
+// least sees the warning; an automated pipeline silently took the
+// install-tree-divergence and called the run a success.
+//
+// **The fix.** The warning fires unconditionally on stderr (no
+// `!json_output` gate). `--json` consumers parse stdout for the
+// envelope; stderr is unaffected. The standard pattern across the
+// rest of the install pipeline (`output::warn`) writes to stderr,
+// so this matches every other warning in the same surface.
+//
+// **What this test pins:** running `lpm install --json` with
+// `LPM_RESOLVER=pubgrub` set MUST emit the diagnostic to stderr.
+// The install itself can succeed or fail (we use an empty-deps
+// project so it succeeds without any registry), but the warning
+// must appear regardless. If a future refactor re-adds the
+// `!json_output` gate or shoves the warning into stdout JSON,
+// this test fires.
+
+#[test]
+fn install_warns_when_lpm_resolver_pubgrub_with_auto_install_peers_under_json() {
+    // Empty deps + auto_install_peers default-true (we set nothing).
+    // No network needed. The warning should fire purely off the
+    // env-var + config combination.
+    let project = TempProject::empty(
+        r#"{
+        "name": "pubgrub-mismatch",
+        "version": "0.0.1",
+        "dependencies": {}
+    }"#,
+    );
+
+    let out = lpm(&project)
+        .args(["--json", "install"])
+        .env("LPM_RESOLVER", "pubgrub")
+        .output()
+        .expect("spawn lpm install --json");
+
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("LPM_RESOLVER=pubgrub does not support eager peer auto-install"),
+        "pubgrub-mismatch warning must fire on stderr even under --json; \
+         stdout-vs-stderr separation means tooling consumers can still \
+         parse stdout JSON without the warning leaking into the envelope. \
+         stderr was:\n{stderr}"
+    );
+
+    // The contract is "stderr-only"; stdout must remain valid JSON
+    // so consumers can still parse the install envelope.
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        !stdout.contains("LPM_RESOLVER=pubgrub does not support"),
+        "warning text must NOT leak into stdout (which carries the \
+         JSON envelope); got stdout:\n{stdout}"
+    );
+}
+
+#[test]
+fn install_silent_when_lpm_resolver_pubgrub_with_auto_install_peers_off() {
+    // Inverse case: with `lpm.autoInstallPeers = false` the user has
+    // explicitly acknowledged warn-only semantics, so the
+    // pubgrub-mismatch warning is moot. Verifies the warning gate
+    // doesn't fire spuriously.
+    let project = TempProject::empty(
+        r#"{
+        "name": "pubgrub-opt-out",
+        "version": "0.0.1",
+        "dependencies": {},
+        "lpm": { "autoInstallPeers": false }
+    }"#,
+    );
+
+    let out = lpm(&project)
+        .args(["--json", "install"])
+        .env("LPM_RESOLVER", "pubgrub")
+        .output()
+        .expect("spawn lpm install --json");
+
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !stderr.contains("LPM_RESOLVER=pubgrub does not support eager peer auto-install"),
+        "warning must NOT fire when autoInstallPeers is explicitly false \
+         (user has acknowledged the warn-only semantic); stderr was:\n{stderr}"
+    );
+}
+
+// ─── R2.5 fix-1 — offline arm refuses pre-R2.5 v1 lockfiles ────
+//
+// The repair gate that lives on the online fast-path branch
+// (`install.rs::lockfile_needs_r25_repair`) drops the fast-path
+// result and forces a fresh resolve when the lockfile is v1 and
+// `auto_install_peers = true`. The `--offline` branch can't fall
+// back to a fresh resolve (no network), so the same gate becomes
+// a hard error: refuse the install with an actionable
+// "run online once" message. Replaying the v1 lockfile silently
+// would reproduce the pre-R2.5 broken-tree state — exactly the
+// hole R2.5 was meant to close.
+
+#[test]
+fn install_offline_refuses_pre_r25_v1_lockfile_under_auto_install_peers() {
+    // Hand-craft a v1 lockfile that LOOKS valid under the new
+    // schema (serde defaults populate the missing fields with
+    // empty Vec) but is actually a pre-R2.5 artifact. The package
+    // shape doesn't matter — the gate fires off the metadata
+    // version + auto_install_peers config.
+    let project = TempProject::empty(
+        r#"{
+        "name": "stale-v1-lockfile",
+        "version": "0.0.1",
+        "dependencies": { "lodash": "^4.0.0" }
+    }"#,
+    );
+    // Write a v1 lockfile by hand. `lockfile-version = 1` is the
+    // tell — even an otherwise-valid lockfile under the new schema
+    // is treated as "may be missing R2.5 state" because R2.2-R2.4
+    // buggy writers wrote the same shape.
+    let lockfile_toml = r#"[metadata]
+lockfile-version = 1
+resolved-with = "greedy-fusion"
+
+[[packages]]
+name = "lodash"
+version = "4.17.21"
+source = "registry+https://registry.npmjs.org"
+integrity = "sha512-v2kDEe57lecTulaDIuNTPy3Ry4gLGJ6Z1O3vE1krgXZNrsQ+LFTGHVxVjcXPs17LhbZVGedAJv8XZ1tvj5FvSg=="
+"#;
+    std::fs::write(project.path().join("lpm.lock"), lockfile_toml).unwrap();
+
+    let out = lpm(&project)
+        .args(["install", "--offline"])
+        .output()
+        .expect("spawn lpm install --offline");
+
+    assert!(
+        !out.status.success(),
+        "--offline must refuse a v1 lockfile under auto_install_peers=true; \
+         silently replaying would reproduce the pre-R2.5 broken-tree state. \
+         stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("pre-R2.5 lockfile"),
+        "error message must explain the cause; got:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("Run `lpm install` (online)"),
+        "error message must offer the remediation path; got:\n{stderr}"
+    );
+}
+
+#[test]
+fn install_offline_accepts_pre_r25_v1_lockfile_when_auto_install_peers_off() {
+    // Inverse: with `lpm.autoInstallPeers = false` the user has
+    // explicitly opted out of auto-install, so the v1 lockfile can
+    // be trusted (no ambient peers were ever generated). The
+    // offline arm must NOT refuse — that would be a regression for
+    // every project that pinned `autoInstallPeers = false` to
+    // preserve pre-R2 semantics.
+    //
+    // The install will likely fail later (no store seeded, no
+    // network) but it must NOT fail with the R2.5 repair-gate
+    // message. We assert on stderr content, not exit code.
+    let project = TempProject::empty(
+        r#"{
+        "name": "opt-out-v1-lockfile",
+        "version": "0.0.1",
+        "dependencies": { "lodash": "^4.0.0" },
+        "lpm": { "autoInstallPeers": false }
+    }"#,
+    );
+    let lockfile_toml = r#"[metadata]
+lockfile-version = 1
+resolved-with = "greedy-fusion"
+
+[[packages]]
+name = "lodash"
+version = "4.17.21"
+source = "registry+https://registry.npmjs.org"
+integrity = "sha512-v2kDEe57lecTulaDIuNTPy3Ry4gLGJ6Z1O3vE1krgXZNrsQ+LFTGHVxVjcXPs17LhbZVGedAJv8XZ1tvj5FvSg=="
+"#;
+    std::fs::write(project.path().join("lpm.lock"), lockfile_toml).unwrap();
+
+    let out = lpm(&project)
+        .args(["install", "--offline"])
+        .output()
+        .expect("spawn lpm install --offline");
+
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !stderr.contains("pre-R2.5 lockfile"),
+        "v1 lockfile under autoInstallPeers=false must NOT trip the \
+         repair gate — opt-out installs never produced ambient peers, \
+         so the v1 lockfile is correct as-is. stderr was:\n{stderr}"
+    );
+}
+
+#[test]
+fn install_silent_when_default_resolver_with_auto_install_peers_on() {
+    // The other inverse: greedy-fusion is the default resolver and
+    // DOES support auto-install. No warning under default config.
+    // Pins that the warning is specifically conditional on the
+    // `pubgrub` opt-out, not a stray "any-resolver-mode" emit.
+    let project = TempProject::empty(
+        r#"{
+        "name": "default-resolver",
+        "version": "0.0.1",
+        "dependencies": {}
+    }"#,
+    );
+
+    let out = lpm(&project)
+        .args(["--json", "install"])
+        .output()
+        .expect("spawn lpm install --json");
+
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !stderr.contains("LPM_RESOLVER=pubgrub does not support eager peer auto-install"),
+        "warning must NOT fire on the default greedy-fusion resolver; \
+         stderr was:\n{stderr}"
+    );
+}

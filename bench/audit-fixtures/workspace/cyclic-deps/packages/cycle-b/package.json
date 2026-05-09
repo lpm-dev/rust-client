@@ -1,0 +1,9 @@
+{
+	"name": "audit-cycle-b",
+	"version": "1.0.0",
+	"private": true,
+	"main": "index.js",
+	"dependencies": {
+		"audit-cycle-a": "workspace:*"
+	}
+}

@@ -1,0 +1,21 @@
+{
+	"name": "audit-fixture-large-monorepo",
+	"version": "1.0.0",
+	"private": true,
+	"_comment": "Phase 66 confidence-followup §2g. 10-member workspace with a multi-level cross-dep DAG (m10 → m09 → m08 → m07 → … → m01/m02/m04 leaves). Every member is a workspace:* dep, every cross-dep is workspace:*, and the full graph reaches every leaf from m10. Risk per the followup doc: O(N²) hoisting decisions might surface at scale, and a large workspace symlink count could trip path-walk limits. The realworld-app dogfood fixture has lots of EXTERNAL deps; this one stresses INTERNAL cross-deps (10 root-level workspace symlinks + per-member node_modules with cross-symlinks). All members are listed at the root because lpm's v1 resolver does not recurse into workspace member dependencies (same shape as monorepo-basic + cyclic-deps). External shared deps (lodash, chalk) verify hoisted/wrapped externals coexist with the dense internal symlink graph.",
+	"dependencies": {
+		"audit-large-m01": "workspace:*",
+		"audit-large-m02": "workspace:*",
+		"audit-large-m03": "workspace:*",
+		"audit-large-m04": "workspace:*",
+		"audit-large-m05": "workspace:*",
+		"audit-large-m06": "workspace:*",
+		"audit-large-m07": "workspace:*",
+		"audit-large-m08": "workspace:*",
+		"audit-large-m09": "workspace:*",
+		"audit-large-m10": "workspace:*",
+		"lodash": "^4.17.21",
+		"chalk": "^4.1.2"
+	},
+	"workspaces": ["packages/*"]
+}

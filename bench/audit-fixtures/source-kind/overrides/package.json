@@ -1,0 +1,14 @@
+{
+	"name": "audit-fixture-overrides",
+	"version": "1.0.0",
+	"private": true,
+	"_comment": "Phase 66 confidence-followup R1. Tests `lpm.overrides` actually take effect on the default greedy resolver path. Pre-R1, both pubgrub and greedy parsed the OverrideSet but only pubgrub's `choose_version` (provider.rs:1185-1207) applied it — greedy.rs accepted `_overrides` (underscored = unused) and shipped `applied_overrides: Vec::new()`, silently dropping every user-declared override. Without the fix, this fixture symmetric-FAILs (both linker modes ship 4.17.21 instead of 4.17.20). With R1, both modes PASS. Fixture pins `lodash` to 4.17.20 via `lpm.overrides`; without the override the resolver would pick 4.17.21 (newest in `^4.0.0`).",
+	"dependencies": {
+		"lodash": "^4.0.0"
+	},
+	"lpm": {
+		"overrides": {
+			"lodash": "4.17.20"
+		}
+	}
+}

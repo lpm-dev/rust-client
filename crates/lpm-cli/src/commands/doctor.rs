@@ -2742,6 +2742,7 @@ commands = []
             integrity: None,
             dependencies: vec![],
             alias_dependencies: vec![],
+            peers: vec![],
             tarball: None,
         });
         lockfile
@@ -2784,6 +2785,7 @@ commands = []
             integrity: None,
             dependencies: vec![],
             alias_dependencies: vec![],
+            peers: vec![],
             tarball: None,
         });
         lockfile
@@ -2954,6 +2956,7 @@ commands = []
             integrity: None,
             dependencies: vec![],
             alias_dependencies: vec![],
+            peers: vec![],
             tarball: None,
         });
         lf.write_to_file(&dir.path().join("lpm.lock")).unwrap();

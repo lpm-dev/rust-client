@@ -24,7 +24,7 @@ fn write_minimal_lockfile(project: &TempProject, name: &str, version: &str) {
     project.write_file(
         "lpm.lock",
         &format!(
-            "[metadata]\nlockfile-version = 1\nresolved-with = \"greedy-fusion\"\n\n\
+            "[metadata]\nlockfile-version = 2\nresolved-with = \"greedy-fusion\"\n\n\
              [[packages]]\nname = \"{name}\"\nversion = \"{version}\"\n\
              source = \"registry+https://lpm.dev\"\n",
         ),

@@ -180,6 +180,22 @@ impl PackageStore {
         PackageStore { root: root.into() }
     }
 
+    /// Derive an [`lpm_common::LpmRoot`] from this store's root.
+    /// `PackageStore::root` is `<lpm_root>/store/`, so the LpmRoot is
+    /// the parent. Used by callers that need to consult the v2
+    /// virtual store (constructed via [`crate::v2::Store::from_lpm_root`])
+    /// without threading an additional `LpmRoot` parameter through
+    /// every API.
+    pub fn lpm_root(&self) -> Result<lpm_common::LpmRoot, LpmError> {
+        let parent = self.root.parent().ok_or_else(|| {
+            LpmError::Store(format!(
+                "package store root {:?} has no parent — cannot derive LpmRoot",
+                self.root
+            ))
+        })?;
+        Ok(lpm_common::LpmRoot::from_dir(parent))
+    }
+
     /// Get the store directory for a package version.
     /// e.g., `~/.lpm/store/v1/react@19.2.4/`
     pub fn package_dir(&self, name: &str, version: &str) -> PathBuf {
@@ -1057,6 +1073,98 @@ pub fn compute_sri_hash(data: &[u8]) -> String {
 pub fn read_stored_integrity(store_dir: &Path) -> Option<String> {
     let integrity_path = store_dir.join(".integrity");
     std::fs::read_to_string(integrity_path).ok()
+}
+
+/// Resolved location of a package's source bytes along with the
+/// integrity SRI recorded for that copy. Returned by
+/// [`find_installed_package_baseline`].
+#[derive(Debug, Clone)]
+pub struct InstalledPackageBaseline {
+    /// Absolute path to the package directory whose contents match the
+    /// extracted tarball. Under v1 this is `<store>/v1/<safe>@<ver>/`;
+    /// under v2 this is `<store>/v2/links/<graph-key>/node_modules/<name>/`
+    /// (the link's clonefile-materialized copy of the object-addressed
+    /// bytes).
+    pub package_dir: PathBuf,
+    /// SRI string of the source tarball — `meta.source_sri` under v2,
+    /// `<package_dir>/.integrity` under v1.
+    pub integrity: String,
+    /// Which store the lookup hit. Callers that need to read sentinel
+    /// files (e.g. `<v1_dir>/.integrity`) only when on v1 can branch on
+    /// this.
+    pub layout: PackageBaselineLayout,
+}
+
+/// Discriminator for [`InstalledPackageBaseline`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PackageBaselineLayout {
+    /// Package found at `<store>/v1/<safe>@<ver>/`.
+    V1,
+    /// Package found at `<store>/v2/links/<graph-key>/node_modules/<name>/`.
+    V2,
+}
+
+/// Resolve a package's installed source bytes + integrity in a
+/// store-version-agnostic way. **Prefers v2** (the active default
+/// since Phase 66 4b); falls back to v1 if no v2 link entry matches.
+///
+/// Designed for downstream commands that read package metadata or
+/// source files post-install — `lpm patch`, `lpm patch-commit`,
+/// `lpm rebuild`, `lpm approve-scripts --show-scripts`, etc. — which
+/// must not blindly call [`PackageStore::package_dir`] (v1-only)
+/// under v2 installs.
+///
+/// **Multi-source-same-coords:** under Phase 66 §2.2, two distinct
+/// sources can share the same `(name, version)` pair and produce
+/// different graph keys. This helper picks the first v2 link entry
+/// that matches in `iter_link_entries` directory order. That's
+/// non-deterministic for multi-source-same-coords + lifecycle
+/// scripts, but acceptable for the patch path (the user's patch is
+/// keyed on `<name>@<version>` and should apply equally to every
+/// graph-key sharing those coords). A future refinement is a full
+/// `(name, version, wrapper_id)` lookup once `wrapper_id` is
+/// threaded through the lockfile — same follow-up
+/// [`crate::v2::Store::find_link_package_dir`] documents.
+pub fn find_installed_package_baseline(
+    lpm_root: &lpm_common::LpmRoot,
+    name: &str,
+    version: &str,
+) -> Result<Option<InstalledPackageBaseline>, LpmError> {
+    // v2 first — that's the default since Phase 66 4b. Iterating link
+    // entries reads each sidecar `.lpm-link-meta.json`; the iterator
+    // gracefully skips malformed entries (per
+    // [`crate::v2::Store::iter_link_entries`]'s docs) so a corrupt
+    // sibling never blocks a valid match.
+    let store_v2 = crate::v2::Store::from_lpm_root(lpm_root);
+    for (link_dir, meta) in store_v2.iter_link_entries()? {
+        if meta.name == name && meta.version == version {
+            let package_dir = link_dir.join("node_modules").join(name);
+            if package_dir.exists() {
+                return Ok(Some(InstalledPackageBaseline {
+                    package_dir,
+                    integrity: meta.source_sri,
+                    layout: PackageBaselineLayout::V2,
+                }));
+            }
+            // The sidecar pointed at us, but the materialized package
+            // dir is missing — corrupt link entry. Continue scanning
+            // for another link that might satisfy the request.
+        }
+    }
+    // v1 fallback — older installs, the migration grace window, or
+    // ad-hoc test fixtures that populate v1 directly.
+    let store_v1 = PackageStore::from_root(lpm_root);
+    let pkg_dir = store_v1.package_dir(name, version);
+    if pkg_dir.exists()
+        && let Some(integrity) = read_stored_integrity(&pkg_dir)
+    {
+        return Ok(Some(InstalledPackageBaseline {
+            package_dir: pkg_dir,
+            integrity,
+            layout: PackageBaselineLayout::V1,
+        }));
+    }
+    Ok(None)
 }
 
 /// Phase 38 P1 helper: transparent `Read` wrapper that feeds every byte

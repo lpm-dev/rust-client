@@ -288,6 +288,22 @@ where
 
         // Only extract regular files (skip symlinks for security)
         if entry.header().entry_type().is_file() {
+            // **Phase 66 confidence-followup S1 (2026-05-08).** Capture
+            // the tar entry's exec bits BEFORE any read; the header is
+            // parsed up-front by the tar crate. We honor whichever
+            // execute bits the tarball declares (user / group / other)
+            // and OR them onto the default 0644 mode after the write.
+            // SUID / SGID / sticky bits are deliberately dropped — same
+            // security posture as `set_preserve_permissions(false)`.
+            //
+            // Most npm package files are 0644 (no exec) and skip the
+            // post-write `set_permissions` call entirely. The only
+            // affected files are bin scripts (typically 0755) — usually
+            // 0–5 per package, so the syscall cost is negligible vs
+            // the install-side breakage when a `.bin` script lands as
+            // 0644 (EACCES on `execve`).
+            let exec_bits = entry.header().mode().unwrap_or(0o644) & 0o111;
+
             // P2 fused-scan hook: if the caller asked us to buffer this
             // entry's bytes for inspection, read the entry into memory,
             // write those bytes to disk, and hand them to the inspector.
@@ -337,6 +353,26 @@ where
                 }
                 None
             };
+
+            // **Phase 66 confidence-followup S1.** Restore the exec
+            // bits captured before the write. Skipped on Windows
+            // (NTFS doesn't have POSIX mode bits — bin scripts are
+            // dispatched by extension, not the X bit).
+            #[cfg(unix)]
+            if exec_bits != 0 {
+                use std::os::unix::fs::PermissionsExt;
+                let perms = std::fs::Permissions::from_mode(0o644 | exec_bits);
+                if let Err(error) = std::fs::set_permissions(&target_path, perms) {
+                    return rollback_extraction(
+                        &extraction_root,
+                        &extracted_files,
+                        &created_dirs,
+                        LpmError::Io(error),
+                    );
+                }
+            }
+            #[cfg(not(unix))]
+            let _ = exec_bits;
 
             inspector(EntryInfo {
                 relative_path: &relative_path,
@@ -1160,5 +1196,85 @@ mod tests {
 
         assert_eq!(files.len(), 1);
         assert_eq!(files[0], PathBuf::from("lib.js"));
+    }
+
+    /// **Phase 66 confidence-followup S1.** Tar entries with execute
+    /// bits set (typical for npm package bins, mode 0755) must keep
+    /// those bits after extraction. Pre-fix the v2 store extractor
+    /// stripped them entirely (umask-respecting 0644), causing
+    /// `EACCES` when Node tried to spawn shell-script bins (esbuild,
+    /// tsc, etc.). Caught by `bench/audit-fixtures/native/esbuild-prebuilt`
+    /// regressing PASS→FAIL between Phase 2.7 and Phase 4b.
+    #[cfg(unix)]
+    #[test]
+    fn extract_preserves_executable_bit_for_bin_files() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let mut tar_data = Vec::new();
+        {
+            let mut builder = tar::Builder::new(&mut tar_data);
+
+            // Regular file at 0644 — should land non-executable.
+            let mut readme = tar::Header::new_gnu();
+            readme.set_size(b"# readme\n".len() as u64);
+            readme.set_mode(0o644);
+            readme.set_cksum();
+            builder
+                .append_data(&mut readme, "package/README.md", &b"# readme\n"[..])
+                .unwrap();
+
+            // Bin script at 0755 — must land with all three exec bits.
+            let mut bin = tar::Header::new_gnu();
+            bin.set_size(b"#!/bin/sh\necho hi\n".len() as u64);
+            bin.set_mode(0o755);
+            bin.set_cksum();
+            builder
+                .append_data(&mut bin, "package/bin/cli.sh", &b"#!/bin/sh\necho hi\n"[..])
+                .unwrap();
+
+            // User-only exec (0o744) — must preserve the user-X bit
+            // without restoring group/other-X (which weren't in the
+            // tarball).
+            let mut user_exec = tar::Header::new_gnu();
+            user_exec.set_size(b"x\n".len() as u64);
+            user_exec.set_mode(0o744);
+            user_exec.set_cksum();
+            builder
+                .append_data(&mut user_exec, "package/bin/private.sh", &b"x\n"[..])
+                .unwrap();
+
+            builder.finish().unwrap();
+        }
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(&tar_data).unwrap();
+        let tgz = encoder.finish().unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let files = extract_tarball(&tgz, dir.path()).unwrap();
+        assert_eq!(files.len(), 3);
+
+        let mode_of = |rel: &str| {
+            std::fs::metadata(dir.path().join(rel))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777
+        };
+
+        assert_eq!(
+            mode_of("README.md") & 0o111,
+            0,
+            "non-executable file must NOT acquire exec bits",
+        );
+        assert_eq!(
+            mode_of("bin/cli.sh") & 0o111,
+            0o111,
+            "0755 tar entry must preserve all three exec bits",
+        );
+        assert_eq!(
+            mode_of("bin/private.sh") & 0o111,
+            0o100,
+            "0744 tar entry must preserve user-only exec bit, no group/other",
+        );
     }
 }

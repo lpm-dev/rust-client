@@ -1,0 +1,12 @@
+{
+	"name": "audit-fixture-bundle-deps",
+	"version": "1.0.0",
+	"private": true,
+	"_comment": "Phase 66 confidence-followup §2a. The `npm` package itself is the canonical real-world bundleDependencies user — npm@11 ships 65 bundled deps inside its published tarball's `node_modules/` directory. lpm has zero explicit bundleDependencies handling (verified via `grep bundleDep crates/`), so the test verifies the implicit invariant: the extractor preserves the tarball-internal `node_modules/` subtree as part of the package source, and the linker doesn't strip or shadow it. Risk per the followup doc: 'hoisted layout might overwrite vendored deps if the same package name appears at top level via another transitive path.' lodash is added as a direct dep (resolver-fetched, sits next to npm in the top-level layout). npm itself is in devDependencies because npm@8+ intentionally throws when `require('npm')` runs at module load (programmatic API removed) — the harness's per-direct-dep require check would trip on that even though the bundleDeps invariant is intact. Smoke verifies the layout directly, not via require().",
+	"dependencies": {
+		"lodash": "^4.17.21"
+	},
+	"devDependencies": {
+		"npm": "^11.0.0"
+	}
+}

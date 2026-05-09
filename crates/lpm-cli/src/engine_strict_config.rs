@@ -78,6 +78,7 @@ mod tests {
                 overrides: Default::default(),
                 patched_dependencies: Default::default(),
                 peer_dependency_rules: Default::default(),
+                auto_install_peers: None,
             }),
             ..Default::default()
         }

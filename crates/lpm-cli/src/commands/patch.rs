@@ -23,7 +23,7 @@ use crate::patch_engine::{
     GeneratedPatch, STAGING_BREADCRUMB_FILE, copy_store_to_staging, generate_patch, parse_patch_key,
 };
 use lpm_common::LpmError;
-use lpm_store::{PackageStore, read_stored_integrity};
+use lpm_store::find_installed_package_baseline;
 use owo_colors::OwoColorize;
 use serde_json::json;
 use std::path::Path;
@@ -39,14 +39,20 @@ pub async fn run_patch(_project_dir: &Path, key: &str, json_output: bool) -> Res
 async fn run_patch_inner(key: &str, json_output: bool) -> Result<(), LpmError> {
     let (name, version) = parse_patch_key(key)?;
 
-    let store = PackageStore::default_location()?;
-    if !store.has_package(&name, &version) {
-        return Err(LpmError::Script(format!(
-            "{name}@{version} is not in the global store. \
-             Run `lpm install {name}@{version}` first."
-        )));
-    }
-    let store_path = store.package_dir(&name, &version);
+    // **Phase 66 confidence-followup S3 (2026-05-08).** Lookup goes
+    // through `find_installed_package_baseline`, which prefers the
+    // v2 virtual store (default since Phase 4b) and falls back to v1.
+    // Pre-fix this called `store.has_package(...)` (v1-only), which
+    // always returned false under v2 → "not in the global store".
+    let lpm_root = lpm_common::LpmRoot::from_env()?;
+    let baseline =
+        find_installed_package_baseline(&lpm_root, &name, &version)?.ok_or_else(|| {
+            LpmError::Script(format!(
+                "{name}@{version} is not in the global store. \
+                 Run `lpm install {name}@{version}` first."
+            ))
+        })?;
+    let store_path = baseline.package_dir;
 
     // Build a unique staging directory under the OS temp root. We
     // explicitly do NOT use `TempDir` (which would auto-delete on
@@ -154,14 +160,19 @@ async fn run_patch_commit_inner(
     // 2. Locate the store baseline. We re-read it from the live store
     // (not the breadcrumb's recorded path) so that store relocations
     // between `patch` and `patch-commit` don't break commit.
-    let store = PackageStore::default_location()?;
-    if !store.has_package(name, version) {
-        return Err(LpmError::Script(format!(
+    // **Phase 66 confidence-followup S3 (2026-05-08).** v2-aware via
+    // `find_installed_package_baseline` — same shape as
+    // `run_patch_inner` above; the integrity comes back in the same
+    // call so we no longer need a separate `read_stored_integrity`
+    // probe at step 4.
+    let lpm_root = lpm_common::LpmRoot::from_env()?;
+    let baseline = find_installed_package_baseline(&lpm_root, name, version)?.ok_or_else(|| {
+        LpmError::Script(format!(
             "{name}@{version} is no longer in the global store; \
-             cannot generate patch baseline"
-        )));
-    }
-    let store_path = store.package_dir(name, version);
+                 cannot generate patch baseline"
+        ))
+    })?;
+    let store_path = baseline.package_dir.clone();
 
     let edited_dir = staging_dir.join("node_modules").join(name);
     if !edited_dir.exists() {
@@ -191,12 +202,10 @@ async fn run_patch_commit_inner(
         )));
     }
 
-    // 4. Read the original integrity from the store baseline.
-    let integrity = read_stored_integrity(&store_path).ok_or_else(|| {
-        LpmError::Script(format!(
-            "store entry {store_path:?} missing .integrity for {name}@{version}"
-        ))
-    })?;
+    // 4. Original integrity comes from the v2 link sidecar
+    // (`meta.source_sri`) or v1's `.integrity` sentinel — both
+    // resolved in step 2's lookup, so no second probe needed.
+    let integrity = baseline.integrity;
 
     // 5. Write patches/<safe_key>.patch. Scoped names get `/` → `__`
     //    so the file is portable across platforms (mirrors pnpm).

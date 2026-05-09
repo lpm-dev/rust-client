@@ -591,4 +591,95 @@ mod tests {
         let b = base_inputs().with_aliases([("baz", "qux"), ("foo", "bar")]);
         assert_eq!(GraphKey::derive(&a), GraphKey::derive(&b));
     }
+
+    // ── R2.3 — peer-divergent installs MUST produce distinct keys ──
+    //
+    // **Load-bearing for R2.2.** If two projects (or the same project
+    // across reinstalls) have identical dep edges + linker mode +
+    // platform but differ in WHICH version of a peer they pinned,
+    // they are semantically different materializations: each
+    // consumer's runtime sees a different peer instance. The v2
+    // store's per-graph-key link entries MUST be distinct so the
+    // copies of the consumer's bytes don't share state across
+    // peer-divergent installs.
+    //
+    // Pre-R2.2 the resolver didn't auto-install peers, so the
+    // distinction rarely surfaced — most peer-declared packages
+    // either errored out or relied on the user to install a peer
+    // version manually, and the consumer's GraphKey-input `peers` was
+    // empty in either case. R2.2 makes auto-install the default, so
+    // the same consumer (e.g., react-redux) can land with react@18 in
+    // project A and react@19 in project B from the same lockfile-fast-
+    // path entry. The link-entry isolation has to work.
+
+    #[test]
+    fn r23_different_peer_versions_yield_different_keys() {
+        // Same consumer, same dep edges, same linker mode, same
+        // platform. Only the peer pin differs. Keys must diverge so
+        // the link entries can't share bytes across peer-divergent
+        // installs.
+        let consumer_with_react_18 = base_inputs().with_peers([PeerEntry {
+            name: "react".into(),
+            version: "18.3.1".into(),
+        }]);
+        let consumer_with_react_19 = base_inputs().with_peers([PeerEntry {
+            name: "react".into(),
+            version: "19.0.0".into(),
+        }]);
+        assert_ne!(
+            GraphKey::derive(&consumer_with_react_18),
+            GraphKey::derive(&consumer_with_react_19),
+            "peer-version divergence MUST split link entries — without this, \
+             two projects pinning different react majors would share a \
+             single materialization of the consumer's bytes and the v2 \
+             store would silently corrupt cross-project peer isolation"
+        );
+    }
+
+    #[test]
+    fn r23_different_peer_names_yield_different_keys() {
+        // Two consumers with same dep edges but different peer SETS
+        // (not just versions). E.g., one peers `react` only; the
+        // other peers both `react` and `react-dom`. The keys must
+        // distinguish these — the consumer's runtime context differs
+        // by which peers are in scope.
+        let only_react = base_inputs().with_peers([PeerEntry {
+            name: "react".into(),
+            version: "18.3.1".into(),
+        }]);
+        let react_and_dom = base_inputs().with_peers([
+            PeerEntry {
+                name: "react".into(),
+                version: "18.3.1".into(),
+            },
+            PeerEntry {
+                name: "react-dom".into(),
+                version: "18.3.1".into(),
+            },
+        ]);
+        assert_ne!(
+            GraphKey::derive(&only_react),
+            GraphKey::derive(&react_and_dom),
+            "different peer sets must split link entries"
+        );
+    }
+
+    #[test]
+    fn r23_no_peers_vs_one_peer_yields_different_keys() {
+        // Empty peer set vs single-peer set must differ. Important
+        // because a consumer with no peer requirements at all
+        // (post-R5 optional-peer skip → empty peers field) must NOT
+        // collide with a consumer that has the same dep tree plus a
+        // single resolved peer.
+        let no_peers = base_inputs();
+        let one_peer = base_inputs().with_peers([PeerEntry {
+            name: "react".into(),
+            version: "18.3.1".into(),
+        }]);
+        assert_ne!(
+            GraphKey::derive(&no_peers),
+            GraphKey::derive(&one_peer),
+            "empty-peer-set must differ from non-empty-peer-set"
+        );
+    }
 }

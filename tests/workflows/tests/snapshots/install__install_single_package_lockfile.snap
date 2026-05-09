@@ -1,10 +1,10 @@
 ---
 source: tests/workflows/tests/install.rs
-assertion_line: 500
+assertion_line: 705
 expression: lockfile
 ---
 [metadata]
-lockfile-version = 1
+lockfile-version = 2
 resolved-with = "greedy-fusion"
 
 [[packages]]
