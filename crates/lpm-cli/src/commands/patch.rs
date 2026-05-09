@@ -52,7 +52,12 @@ async fn run_patch_inner(key: &str, json_output: bool) -> Result<(), LpmError> {
                  Run `lpm install {name}@{version}` first."
             ))
         })?;
-    let store_path = baseline.package_dir;
+    // **Phase 66 confidence-followup F1.** Seed the staging copy from
+    // the PRISTINE bytes — `objects/<sri>/` under v2, or the v1 store
+    // dir (which v1 patches never mutate). Reading `package_dir` on
+    // an already-patched v2 link entry would seed the staging dir
+    // with previously-applied edits, defeating the workflow.
+    let store_path = baseline.pristine_dir;
 
     // Build a unique staging directory under the OS temp root. We
     // explicitly do NOT use `TempDir` (which would auto-delete on
@@ -172,7 +177,12 @@ async fn run_patch_commit_inner(
                  cannot generate patch baseline"
         ))
     })?;
-    let store_path = baseline.package_dir.clone();
+    // **Phase 66 confidence-followup F1.** Diff against the PRISTINE
+    // bytes (`objects/<sri>/` under v2, the v1 store dir under v1) so
+    // a re-run of `lpm patch` + edit + `lpm patch-commit` against an
+    // already-patched install produces the correct delta-from-upstream
+    // patch — not a delta-from-previously-patched-state patch.
+    let store_path = baseline.pristine_dir.clone();
 
     let edited_dir = staging_dir.join("node_modules").join(name);
     if !edited_dir.exists() {

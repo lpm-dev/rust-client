@@ -1012,6 +1012,66 @@ fn fingerprint_json_value(count: usize, fingerprint: impl Into<String>) -> serde
 /// and apply the patch there. Drift, fuzzy hunks, missing files, and
 /// internal-file modification attempts are all hard install errors.
 ///
+/// **Phase 66 confidence-followup F1 (2026-05-09)** — compute the
+/// per-target patch fingerprint map that the link pipeline folds into
+/// each `LinkTarget.patch_fingerprint` (and downstream into v2's
+/// [`lpm_store::v2::GraphKeyInputs::patch_fingerprint`]).
+///
+/// Without this, two projects with the same dep graph share a single
+/// `<store>/v2/links/<key>/...` materialization, and project A's
+/// `apply_patch` mutation propagates into project B's view via the
+/// shared link entry. The fix is to fold patch identity into the
+/// graph key so a patched install lands in its own dir.
+///
+/// **Hash inputs:** `sha256(patch_bytes || 0x00 || originalIntegrity || 0x01)`,
+/// truncated to 16 hex chars and prefixed `p-`. Content-derived so:
+/// - Two projects applying the **same** patch text against the same
+///   pinned baseline collide on the same fingerprint and share a
+///   single link entry (the cheap, correct case).
+/// - Any edit to the patch text — or rotation of `originalIntegrity` —
+///   splits into a fresh entry. Old patched bytes never leak forward.
+///
+/// **Hot-path cost:** zero allocation when `patches.is_empty()`. One
+/// `read` + one `Sha256::finalize` per declared patch otherwise.
+/// Surfacing missing-file errors here (rather than deferring to the
+/// later `apply_patches_for_install`) keeps the install trace pointed
+/// at the right cause when a patch file goes missing.
+fn compute_patch_fingerprints(
+    patches: &HashMap<String, PatchedDependencyEntry>,
+    project_dir: &Path,
+) -> Result<HashMap<(String, String), String>, LpmError> {
+    use sha2::{Digest, Sha256};
+
+    if patches.is_empty() {
+        return Ok(HashMap::new());
+    }
+
+    let mut out = HashMap::with_capacity(patches.len());
+    let mut sorted_keys: Vec<&String> = patches.keys().collect();
+    sorted_keys.sort();
+
+    for key in sorted_keys {
+        let entry = &patches[key];
+        let (name, version) = patch_engine::parse_patch_key(key)?;
+        let patch_path = project_dir.join(&entry.path);
+        let patch_bytes = std::fs::read(&patch_path).map_err(|e| {
+            LpmError::Script(format!(
+                "patch file {} declared in lpm.patchedDependencies[{key}] cannot be read: {e}",
+                entry.path
+            ))
+        })?;
+        let mut hasher = Sha256::new();
+        hasher.update(&patch_bytes);
+        hasher.update(b"\x00");
+        hasher.update(entry.original_integrity.as_bytes());
+        hasher.update(b"\x01");
+        let digest = hasher.finalize();
+        let short = &hex::encode(digest)[..16];
+        out.insert((name, version), format!("p-{short}"));
+    }
+    Ok(out)
+}
+
 /// Both online (`run_with_options`) and offline (`run_link_and_finish`)
 /// install paths call this exact function — there is no parallel apply
 /// logic to keep in sync.
@@ -4723,6 +4783,12 @@ async fn run_with_options_under_store_lock(
     let mut fresh_urls: std::collections::HashMap<lpm_lockfile::PackageKey, String> =
         std::collections::HashMap::new();
 
+    // **Phase 66 confidence-followup F1.** Pre-compute the per-target
+    // patch fingerprint map so each `LinkTarget` carries its own
+    // `Some("p-…")` when patched. v2's GraphKey folds it in, splitting
+    // patched installs into project-isolated link entries.
+    let patch_fingerprints = compute_patch_fingerprints(&current_patches, project_dir)?;
+
     // Phase 39 P2b: build link_targets up front so the event-driven
     // path can start per-package linking as each tarball lands.
     // `LinkTarget` fields don't depend on fetch completion — just on
@@ -4752,6 +4818,9 @@ async fn run_with_options_under_store_lock(
                 wrapper_id: p.wrapper_id_for_source(),
                 materialization: p.materialization_for_source(),
                 peers: p.peers.clone(),
+                patch_fingerprint: patch_fingerprints
+                    .get(&(p.name.clone(), p.version.clone()))
+                    .cloned(),
             })
         })
         .collect::<Result<_, _>>()?;
@@ -5086,6 +5155,9 @@ async fn run_with_options_under_store_lock(
                     wrapper_id: p.wrapper_id_for_source(),
                     materialization: p.materialization_for_source(),
                     peers: p.peers.clone(),
+                    patch_fingerprint: patch_fingerprints
+                        .get(&(p.name.clone(), p.version.clone()))
+                        .cloned(),
                 };
                 let pd = project_dir.to_path_buf();
                 let force_flag = force;
@@ -5492,6 +5564,14 @@ async fn run_with_options_under_store_lock(
             } else {
                 None
             };
+            // Phase 66 confidence-followup F1 — pre-resolve THIS
+            // package's patch fingerprint outside the move closure so
+            // the closure doesn't carry the whole map. `None` for the
+            // overwhelmingly common case (package has no
+            // `lpm.patchedDependencies` entry).
+            let patch_fingerprint_for_pkg = patch_fingerprints
+                .get(&(p.name.clone(), p.version.clone()))
+                .cloned();
 
             handles.push(tokio::spawn(async move {
                 type LinkHandle = tokio::task::JoinHandle<
@@ -5556,6 +5636,7 @@ async fn run_with_options_under_store_lock(
                         wrapper_id: p.wrapper_id_for_source(),
                         materialization: p.materialization_for_source(),
                         peers: p.peers.clone(),
+                        patch_fingerprint: patch_fingerprint_for_pkg.clone(),
                     };
                     let pd = project_dir_buf.clone();
                     Ok(Some(tokio::task::spawn_blocking(move || {
@@ -8355,6 +8436,21 @@ async fn run_link_and_finish(
     // post-install helpers route through `find_installed_package_baseline`.
     let lpm_root = lpm_common::LpmRoot::from_env()?;
 
+    // **Phase 66 confidence-followup F1.** Mirror of the online-arm
+    // hoist: pre-resolve the per-target patch fingerprint map before
+    // building LinkTargets so v2's GraphKey can fold patch identity
+    // into the link-entry directory. The drift gate in
+    // `run_with_options` already validated that `current_patches`
+    // matches the persisted fingerprint by the time we reach here, so
+    // any read failures are an integrity bug rather than user-visible
+    // drift.
+    let current_patches_for_link: HashMap<String, PatchedDependencyEntry> = pkg
+        .lpm
+        .as_ref()
+        .map(|l| l.patched_dependencies.clone())
+        .unwrap_or_default();
+    let patch_fingerprints = compute_patch_fingerprints(&current_patches_for_link, project_dir)?;
+
     let link_targets: Vec<LinkTarget> = packages
         .iter()
         .map(|p| -> Result<LinkTarget, LpmError> {
@@ -8372,6 +8468,9 @@ async fn run_link_and_finish(
                 wrapper_id: p.wrapper_id_for_source(),
                 materialization: p.materialization_for_source(),
                 peers: p.peers.clone(),
+                patch_fingerprint: patch_fingerprints
+                    .get(&(p.name.clone(), p.version.clone()))
+                    .cloned(),
             })
         })
         .collect::<Result<_, _>>()?;
@@ -8410,11 +8509,15 @@ async fn run_link_and_finish(
     // integrity binding per-package and is safe to run offline because
     // the store baseline is local-only and the linker has just
     // materialized everything.
-    let current_patches: HashMap<String, PatchedDependencyEntry> = pkg
-        .lpm
-        .as_ref()
-        .map(|l| l.patched_dependencies.clone())
-        .unwrap_or_default();
+    //
+    // **F1 follow-up:** the `current_patches` map was already read
+    // above into `current_patches_for_link` to feed
+    // `compute_patch_fingerprints`. Re-bind here under the original
+    // name so the rest of the function (state-file persist, JSON
+    // envelope writes) keeps the symmetric naming with the online
+    // path; the underlying clone is one HashMap and patches are rare,
+    // so the cost is negligible.
+    let current_patches = current_patches_for_link;
     let applied_patches = apply_patches_for_install(
         &current_patches,
         &link_result,

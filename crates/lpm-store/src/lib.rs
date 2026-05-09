@@ -1086,6 +1086,26 @@ pub struct InstalledPackageBaseline {
     /// (the link's clonefile-materialized copy of the object-addressed
     /// bytes).
     pub package_dir: PathBuf,
+    /// **Phase 66 confidence-followup F1 (2026-05-09)** — absolute path
+    /// to a directory holding the **pristine, never-mutated** copy of
+    /// the published bytes for `(name, version)`.
+    ///
+    /// - Under v1, equals [`Self::package_dir`]. The v1 store dir IS
+    ///   pristine — patches mutate the project-private wrapper at
+    ///   `<project>/.lpm/<seg>/node_modules/<name>/`, not the store
+    ///   itself.
+    /// - Under v2, points at `<store>/v2/objects/<sri-segment>/`. The
+    ///   v2 link entry at `package_dir` IS the materialization
+    ///   destination — patches written via `apply_patch` mutate it in
+    ///   place. Reading patch baselines from `package_dir` under v2
+    ///   would re-feed already-patched bytes to a second
+    ///   `apply_patch` and break re-install idempotency.
+    ///
+    /// Read-only baseline consumers (the patch engine's pre-image
+    /// reads, store-internal-file existence checks for ADD / DELETE
+    /// hunks) MUST consult this field rather than `package_dir` to
+    /// stay correct under both layouts.
+    pub pristine_dir: PathBuf,
     /// SRI string of the source tarball — `meta.source_sri` under v2,
     /// `<package_dir>/.integrity` under v1.
     pub integrity: String,
@@ -1140,8 +1160,29 @@ pub fn find_installed_package_baseline(
         if meta.name == name && meta.version == version {
             let package_dir = link_dir.join("node_modules").join(name);
             if package_dir.exists() {
+                // F1: derive the pristine object dir from the source SRI.
+                // Phase 66 4b populates link entries via clonefile from
+                // `objects/<sri>/`, so for a well-formed install the
+                // object dir is always derivable AND present on disk.
+                //
+                // **Defensive aliasing.** If either `sri_to_segment`
+                // can't parse the SRI (synthetic test fixtures) or
+                // the resolved path is missing on disk (manual
+                // pruning, partial migration), fall back to aliasing
+                // `package_dir`. Patch consumers will then re-read
+                // the link entry directly — same shape as v1, where
+                // `pristine_dir == package_dir` by construction. A
+                // genuinely-corrupt v2 install fails later with a
+                // patch-engine drift error rather than swallowing
+                // the lookup here, which keeps the user-facing
+                // failure mode close to the cause.
+                let pristine_dir = match store_v2.paths().object_dir(&meta.source_sri) {
+                    Ok(p) if p.exists() => p,
+                    _ => package_dir.clone(),
+                };
                 return Ok(Some(InstalledPackageBaseline {
                     package_dir,
+                    pristine_dir,
                     integrity: meta.source_sri,
                     layout: PackageBaselineLayout::V2,
                 }));
@@ -1159,7 +1200,13 @@ pub fn find_installed_package_baseline(
         && let Some(integrity) = read_stored_integrity(&pkg_dir)
     {
         return Ok(Some(InstalledPackageBaseline {
-            package_dir: pkg_dir,
+            package_dir: pkg_dir.clone(),
+            // F1: under v1 the store dir IS pristine — patches mutate
+            // project-private wrappers, never the v1 store. Aliasing
+            // the same path here keeps the patch engine layout-agnostic
+            // (read pristine bytes from `pristine_dir`, write
+            // destinations via `MaterializedPackage.destination`).
+            pristine_dir: pkg_dir,
             integrity,
             layout: PackageBaselineLayout::V1,
         }));

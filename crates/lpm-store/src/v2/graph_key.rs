@@ -22,6 +22,16 @@
 //! 8. Sorted aliases: `local => canonical_target_name`
 //!    joined by `,`
 //! 9. Sorted root-link names joined by `,`
+//! 10. Source-identity disambiguator (`wrapper_id`)
+//! 11. Patch fingerprint (Phase 66 confidence-followup F1) — `Some("p-…")`
+//!     for any package that carries a `lpm.patchedDependencies` entry,
+//!     `None` otherwise. Folded in so a project applying a patch gets a
+//!     distinct link entry from any other project's unpatched (or
+//!     differently-patched) install of the same coords. Without this,
+//!     v2's cross-project sharing of `<store>/v2/links/<key>/...`
+//!     dirs would let project A's patched bytes leak into project B
+//!     via shared materialization (the `links/` dir is the on-disk
+//!     destination, not a project-private wrapper).
 //!
 //! Each component is preceded by a labeled NUL-delimited prefix
 //! (e.g. `name=\0...\0`) so cross-component byte boundaries are
@@ -141,6 +151,17 @@ pub struct GraphKeyInputs {
     /// pre-Phase-66 GraphKey for a registry package doesn't suddenly
     /// invalidate.
     pub wrapper_id: Option<String>,
+    /// **Phase 66 confidence-followup F1 (2026-05-09)** — patch identity.
+    /// When the install pipeline detects a `lpm.patchedDependencies`
+    /// entry for `(name, version)`, the caller computes
+    /// `sha256(patch_bytes || originalIntegrity)` (truncated to 16 hex
+    /// chars, prefixed `p-`) and threads it here. Folded into the
+    /// GraphKey so a patched install lands in its own
+    /// `<store>/v2/links/<key>+<short-hash>/` directory and never
+    /// shares bytes with an unpatched install of the same coords in
+    /// another project. `None` for unpatched packages — preserves the
+    /// pre-F1 hash so existing v2 link entries don't get invalidated.
+    pub patch_fingerprint: Option<String>,
 }
 
 impl GraphKeyInputs {
@@ -162,6 +183,7 @@ impl GraphKeyInputs {
             aliases: BTreeMap::new(),
             root_link_names: None,
             wrapper_id: None,
+            patch_fingerprint: None,
         }
     }
 
@@ -170,6 +192,14 @@ impl GraphKeyInputs {
     /// non-Registry-source case.
     pub fn with_wrapper_id(mut self, wrapper_id: Option<String>) -> Self {
         self.wrapper_id = wrapper_id;
+        self
+    }
+
+    /// Replace the patch fingerprint. `None` is the unpatched shape
+    /// (preserves the pre-F1 hash); `Some("p-…")` indicates a
+    /// `lpm.patchedDependencies` entry covers this `(name, version)`.
+    pub fn with_patch_fingerprint(mut self, patch_fingerprint: Option<String>) -> Self {
+        self.patch_fingerprint = patch_fingerprint;
         self
     }
 
@@ -294,6 +324,18 @@ impl GraphKey {
         // store entries don't get invalidated by this addition.
         let wrapper_str = inputs.wrapper_id.as_deref().unwrap_or("");
         write_field(&mut hasher, b"wrapper_id", wrapper_str.as_bytes());
+
+        // Phase 66 confidence-followup F1 — patch identity. Empty when
+        // unpatched, preserving the pre-F1 hash so unpatched v2 link
+        // entries don't get invalidated by this addition. Non-empty
+        // for any `(name, version)` covered by a
+        // `lpm.patchedDependencies` entry; the caller derives the
+        // value from `sha256(patch_bytes || originalIntegrity)` so two
+        // semantically identical patches collide on the same hash and
+        // share a link entry, while edits to the patch (or to the
+        // pinned baseline integrity) split into a fresh entry.
+        let patch_str = inputs.patch_fingerprint.as_deref().unwrap_or("");
+        write_field(&mut hasher, b"patch_fingerprint", patch_str.as_bytes());
 
         let digest = hasher.finalize();
         Self {
@@ -662,6 +704,68 @@ mod tests {
             GraphKey::derive(&react_and_dom),
             "different peer sets must split link entries"
         );
+    }
+
+    // ── F1 — patch_fingerprint identity ─────────────────────────────
+    //
+    // **Load-bearing for cross-project patch isolation.** Two projects
+    // with identical dep edges + linker mode + platform + peers
+    // resolve to the same v2 link entry by design (preplan §2.2 — the
+    // sharing invariant unlocks the v2 install hot path). That sharing
+    // means project A's mutation of `<store>/v2/links/<key>/...`
+    // would propagate to project B via shared materialization. The
+    // F1 fix folds patch identity into the key so a patched install
+    // gets its own link entry and never collides with an unpatched
+    // install (or a different-patch install) of the same coords.
+
+    #[test]
+    fn f1_patched_vs_unpatched_yields_different_keys() {
+        let unpatched = base_inputs();
+        let patched = base_inputs().with_patch_fingerprint(Some("p-deadbeefdeadbeef".into()));
+        assert_ne!(
+            GraphKey::derive(&unpatched),
+            GraphKey::derive(&patched),
+            "an installed-with-patch wrapper MUST be distinct from an \
+             unpatched wrapper of the same coords — without this, \
+             project A's patched bytes leak into project B via shared \
+             v2 link materialization"
+        );
+    }
+
+    #[test]
+    fn f1_different_patch_fingerprints_yield_different_keys() {
+        let patch_a = base_inputs().with_patch_fingerprint(Some("p-aaaaaaaaaaaaaaaa".into()));
+        let patch_b = base_inputs().with_patch_fingerprint(Some("p-bbbbbbbbbbbbbbbb".into()));
+        assert_ne!(
+            GraphKey::derive(&patch_a),
+            GraphKey::derive(&patch_b),
+            "different patch contents (or different originalIntegrity \
+             baselines) MUST split link entries"
+        );
+    }
+
+    #[test]
+    fn f1_same_patch_fingerprint_collides_for_sharing() {
+        // Two projects applying the SAME patch with the SAME baseline
+        // SHOULD share a single link entry — that's the whole point
+        // of content-derived fingerprinting. Re-applying byte-identical
+        // patches across projects is safe and expensive to duplicate.
+        let p1 = base_inputs().with_patch_fingerprint(Some("p-1234567890abcdef".into()));
+        let p2 = base_inputs().with_patch_fingerprint(Some("p-1234567890abcdef".into()));
+        assert_eq!(GraphKey::derive(&p1), GraphKey::derive(&p2));
+    }
+
+    #[test]
+    fn f1_unpatched_key_unchanged_by_field_addition() {
+        // Defense-in-depth check: the empty-fingerprint default
+        // hashes the same way the explicit `with_patch_fingerprint(None)`
+        // call does. Together with the empty-string-on-None encoding
+        // in `derive`, this preserves the pre-F1 hash for unpatched
+        // registry packages so existing on-disk link entries stay
+        // valid after the upgrade.
+        let default = base_inputs();
+        let explicit_none = base_inputs().with_patch_fingerprint(None);
+        assert_eq!(GraphKey::derive(&default), GraphKey::derive(&explicit_none));
     }
 
     #[test]
