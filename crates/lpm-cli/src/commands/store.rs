@@ -152,11 +152,18 @@ fn run_verify(
 
     if packages.is_empty() {
         if json_output {
+            // F4: empty-store envelope mirrors the populated-store
+            // shape so downstream consumers don't need to special-case
+            // the zero path. `verified` retained as an alias of
+            // `entries_verified` for the legacy field name.
             println!(
                 "{}",
                 serde_json::to_string_pretty(&serde_json::json!({
                     "success": true,
+                    "entries_verified": 0,
                     "verified": 0,
+                    "unique_coords": 0,
+                    "duplicated_entries": 0,
                     "corrupted": 0,
                     "issues": [],
                 }))
@@ -367,10 +374,36 @@ fn run_verify(
         verified += 1;
     }
 
+    // **Phase 66 confidence-followup F4 (2026-05-09).** Distinguish
+    // "store entries" (one per v1 dir + one per v2 link entry) from
+    // "unique packages" (deduped on `(name, version)`). During v1↔v2
+    // migration AND under multi-source-same-coords + cross-project
+    // graph-key splits, the same `(name, version)` legitimately appears
+    // multiple times in the merged input list — each entry is
+    // independently verifiable bytes-on-disk and the count stays
+    // truthful. Pre-fix the human-output line said "N packages
+    // verified", which suggested unique-package inventory; the count
+    // was inflated relative to that mental model and confused users
+    // looking at an in-flight migration.
+    //
+    // Fix: present the entry count under the term "store entries" and
+    // surface a secondary `unique_coords` count for both human and
+    // JSON output. Optional duplication breakdown when the two
+    // diverge.
+    let (unique_coords, duplicated_count) = compute_verify_dedup_counts(&packages);
+
     if json_output {
         let mut result = serde_json::json!({
             "success": true,
+            // **F4** — `verified` was previously documented as "packages"
+            // but counted store entries. Renamed to `entries_verified`
+            // to match the actual semantic. `verified` retained as an
+            // alias for one release window so JSON consumers (CI
+            // dashboards, audit scripts) don't break overnight.
+            "entries_verified": verified,
             "verified": verified,
+            "unique_coords": unique_coords,
+            "duplicated_entries": duplicated_count,
             "corrupted": corrupted.len(),
             "issues": corrupted,
         });
@@ -380,7 +413,17 @@ fn run_verify(
         }
         println!("{}", serde_json::to_string_pretty(&result).unwrap());
     } else if corrupted.is_empty() {
-        let mut msg = format!("{verified} packages verified, all OK");
+        // F4: noun is "store entries" (truthful for v1+v2 merged
+        // walks); secondary `(N unique packages)` parenthetical when
+        // the two counts differ — almost always during a v1→v2
+        // migration or after a multi-source-same-coords install.
+        let mut msg = if duplicated_count > 0 {
+            format!(
+                "{verified} store entries verified ({unique_coords} unique packages, {duplicated_count} duplicated across v1+v2 / graph keys), all OK"
+            )
+        } else {
+            format!("{verified} store entries verified, all OK")
+        };
         if deep && security_reanalyzed > 0 {
             msg.push_str(&format!(
                 " ({security_reanalyzed} security cache{} refreshed)",
@@ -389,12 +432,12 @@ fn run_verify(
         }
         if deep && security_mismatches > 0 && !fix {
             output::warn(&format!(
-                "{verified} packages verified, {security_mismatches} security analysis mismatch{} (use --fix to refresh)",
+                "{verified} store entries verified, {security_mismatches} security analysis mismatch{} (use --fix to refresh)",
                 if security_mismatches == 1 { "" } else { "es" }
             ));
         } else if deep && security_mismatches > 0 && fix {
             output::warn(&format!(
-                "{verified} packages verified, {security_mismatches} security analysis mismatch{} (fixed)",
+                "{verified} store entries verified, {security_mismatches} security analysis mismatch{} (fixed)",
                 if security_mismatches == 1 { "" } else { "es" }
             ));
         } else {
@@ -422,6 +465,27 @@ fn run_verify(
     }
 
     Ok(())
+}
+
+/// **Phase 66 confidence-followup F4 (2026-05-09)** — derive the
+/// `(unique_coords, duplicated_count)` pair from the merged v1+v2
+/// entry list. Pure compute over already-walked input, factored out
+/// for unit testability.
+///
+/// `unique_coords` counts distinct `(name, version)` pairs across the
+/// whole list. `duplicated_count` is `entries.len() - unique_coords`,
+/// surfaced separately so the human-output line can describe what
+/// drove the divergence (almost always "N entries split across v1+v2
+/// during a migration" or "N entries split across graph keys via
+/// multi-source-same-coords").
+fn compute_verify_dedup_counts(entries: &[StoreVerifyEntry]) -> (usize, usize) {
+    let mut seen = std::collections::HashSet::with_capacity(entries.len());
+    for entry in entries {
+        seen.insert((entry.name.clone(), entry.version.clone()));
+    }
+    let unique = seen.len();
+    let duplicated = entries.len().saturating_sub(unique);
+    (unique, duplicated)
 }
 
 fn list_v1_verify_entries(store: &PackageStore) -> Result<Vec<StoreVerifyEntry>, LpmError> {
@@ -1387,6 +1451,86 @@ mod tests {
 
         run_verify(&lpm_root, &store, true, false, true)
             .expect("verify must walk both v1 and v2 entries");
+    }
+
+    // ─── F4 — verify dedup-count contract ───────────────────────────
+
+    fn verify_entry_stub(name: &str, version: &str) -> StoreVerifyEntry {
+        StoreVerifyEntry {
+            name: name.to_string(),
+            version: version.to_string(),
+            dir: std::path::PathBuf::from(format!("/tmp/{name}@{version}")),
+            inline_integrity: None,
+        }
+    }
+
+    /// Empty input — no entries, no duplicates, no unique coords. The
+    /// run_verify empty-store branch short-circuits before this is
+    /// called in production, but the helper must still be safe to
+    /// invoke on an empty slice.
+    #[test]
+    fn f4_compute_verify_dedup_counts_empty() {
+        assert_eq!(compute_verify_dedup_counts(&[]), (0, 0));
+    }
+
+    /// All entries have distinct coords — `duplicated_count` is 0
+    /// and the human-output line falls into the "no duplication"
+    /// branch (no parenthetical secondary count).
+    #[test]
+    fn f4_compute_verify_dedup_counts_all_distinct() {
+        let entries = vec![
+            verify_entry_stub("a", "1.0.0"),
+            verify_entry_stub("b", "2.0.0"),
+            verify_entry_stub("c", "3.0.0"),
+        ];
+        let (unique, duplicated) = compute_verify_dedup_counts(&entries);
+        assert_eq!(unique, 3);
+        assert_eq!(duplicated, 0);
+    }
+
+    /// **The load-bearing F4 case.** A `(name, version)` legitimately
+    /// shows up in BOTH v1 (post-migration) and v2 (post-install) for
+    /// the same package — each entry is independently verifiable, the
+    /// `verified` count stays accurate, but `unique_coords` reports
+    /// the user-meaningful "actual distinct packages on disk" number.
+    /// Without this distinction the human-output line said
+    /// "{N} packages verified" where N was double-counted.
+    #[test]
+    fn f4_compute_verify_dedup_counts_dedupe_v1_v2_overlap() {
+        let entries = vec![
+            // v1 + v2 entry for the same package — the migration
+            // overlap case.
+            verify_entry_stub("lodash", "4.17.21"),
+            verify_entry_stub("lodash", "4.17.21"),
+            // A standalone package (no overlap).
+            verify_entry_stub("react", "18.0.0"),
+            // Multi-source-same-coords case: two graph keys for the
+            // same coords.
+            verify_entry_stub("typescript", "5.0.0"),
+            verify_entry_stub("typescript", "5.0.0"),
+            verify_entry_stub("typescript", "5.0.0"),
+        ];
+        let (unique, duplicated) = compute_verify_dedup_counts(&entries);
+        assert_eq!(unique, 3, "lodash + react + typescript = 3 unique coords");
+        assert_eq!(
+            duplicated, 3,
+            "1 dup of lodash + 2 extra typescript copies = 3 duplicated entries"
+        );
+    }
+
+    /// Versions matter: same name across two versions counts as TWO
+    /// unique coords, never collapsed. Defense-in-depth against an
+    /// accidental name-only dedupe ever sneaking into the helper.
+    #[test]
+    fn f4_compute_verify_dedup_counts_distinguishes_versions() {
+        let entries = vec![
+            verify_entry_stub("react", "17.0.0"),
+            verify_entry_stub("react", "18.0.0"),
+            verify_entry_stub("react", "19.0.0"),
+        ];
+        let (unique, duplicated) = compute_verify_dedup_counts(&entries);
+        assert_eq!(unique, 3);
+        assert_eq!(duplicated, 0);
     }
 
     // ─── Phase 37 M3.5: global-install reference union ───────────────
