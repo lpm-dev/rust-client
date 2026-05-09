@@ -1,6 +1,6 @@
 use crate::output;
 use crate::release_lookup::{
-    FetchOutcome, LookupError, clear_cache_at, default_cache_path, is_newer_semver, probe_github,
+    FetchOutcome, LookupError, clear_cache_at, default_cache_path, is_newer_semver, probe_release,
     read_cache_at, write_cache_at,
 };
 use lpm_common::LpmError;
@@ -85,7 +85,7 @@ pub async fn run(json_output: bool, refresh: bool) -> Result<(), LpmError> {
     let latest = if cache_hit {
         cache.latest.clone()
     } else {
-        match probe_github(&mut cache).await {
+        match probe_release(&mut cache).await {
             Ok(FetchOutcome::Fresh { version }) | Ok(FetchOutcome::NotModified { version }) => {
                 if let Some(p) = cache_path.as_deref() {
                     let _ = write_cache_at(p, &cache);
