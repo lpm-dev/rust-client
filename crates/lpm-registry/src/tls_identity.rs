@@ -79,10 +79,17 @@ fn looks_like_pkcs12(bytes: &[u8]) -> bool {
 
 /// Provider for keyfile passphrases. Production uses
 /// [`EnvThenTtyPassphrase`]; tests inject a deterministic stub.
-pub trait PassphraseProvider {
+///
+/// **`&self` (interior mutability) is intentional.** Per-origin
+/// client builds (eager + lazy) all need to share ONE provider so
+/// the [`PassphraseCache`] memoizes across them — a fresh provider
+/// per build would defeat the cache. `&self` lets callers stash an
+/// `Arc<dyn PassphraseProvider + Send + Sync>` and pass references
+/// through without locking the outer container.
+pub trait PassphraseProvider: Send + Sync {
     /// Return the passphrase for the given keyfile, or an
     /// [`LpmError::Cert`] citing why one couldn't be obtained.
-    fn for_keyfile(&mut self, key: &TaggedPath) -> Result<SecretString, LpmError>;
+    fn for_keyfile(&self, key: &TaggedPath) -> Result<SecretString, LpmError>;
 }
 
 /// Production passphrase provider: env first, then TTY prompt
@@ -126,11 +133,15 @@ impl Default for EnvThenTtyPassphrase {
 }
 
 impl PassphraseProvider for EnvThenTtyPassphrase {
-    fn for_keyfile(&mut self, key: &TaggedPath) -> Result<SecretString, LpmError> {
-        // Cache lookup (process-lifetime memoize, keyed by absolute
-        // keyfile path). Resolves the same encrypted key being loaded
-        // for both metadata and tarball clients without re-prompting.
-        let canonical = std::fs::canonicalize(&key.path).unwrap_or_else(|_| key.path.clone());
+    fn for_keyfile(&self, key: &TaggedPath) -> Result<SecretString, LpmError> {
+        // Resolve the path the same way `load_identity` does, so
+        // cache key + UI display + canonicalization all agree.
+        let resolved = key.resolve();
+
+        // Cache lookup (process-lifetime memoize, keyed by canonical
+        // keyfile path). The same encrypted key loaded for both
+        // metadata and tarball client builds prompts at most once.
+        let canonical = std::fs::canonicalize(&resolved).unwrap_or_else(|_| resolved.clone());
         if let Some(pp) = self.cache.get(&canonical) {
             return Ok(pp);
         }
@@ -152,7 +163,7 @@ impl PassphraseProvider for EnvThenTtyPassphrase {
         {
             let raw = rpassword::prompt_password(format!(
                 "Enter passphrase for keyfile {} (configured at {}:{}): ",
-                key.path.display(),
+                resolved.display(),
                 key.source,
                 key.line
             ))
@@ -167,7 +178,7 @@ impl PassphraseProvider for EnvThenTtyPassphrase {
                     "{}:{}: empty passphrase entered for encrypted keyfile {}",
                     key.source,
                     key.line,
-                    key.path.display()
+                    resolved.display()
                 )));
             }
             let pp = SecretString::from(raw);
@@ -182,7 +193,7 @@ impl PassphraseProvider for EnvThenTtyPassphrase {
              stdin and stdout connected to a terminal",
             key.source,
             key.line,
-            key.path.display(),
+            resolved.display(),
             KEY_PASSPHRASE_ENV
         )))
     }
@@ -226,22 +237,28 @@ impl PassphraseCache {
 pub fn load_identity(
     cert: &TaggedPath,
     key: &TaggedPath,
-    passphrase: &mut dyn PassphraseProvider,
+    passphrase: &dyn PassphraseProvider,
 ) -> Result<reqwest::Identity, LpmError> {
-    let cert_bytes = std::fs::read(&cert.path).map_err(|e| {
+    // Phase 58.3 GPT pre-T3 finding — resolve relative paths against
+    // the source `.npmrc`'s parent dir, NOT `${PWD}`. `TaggedPath::resolve`
+    // returns the original path unchanged for absolute inputs and for
+    // tests whose source is a non-file label.
+    let cert_path = cert.resolve();
+    let key_path = key.resolve();
+    let cert_bytes = std::fs::read(&cert_path).map_err(|e| {
         LpmError::Cert(format!(
             "{}:{}: failed to read certfile {}: {e}",
             cert.source,
             cert.line,
-            cert.path.display()
+            cert_path.display()
         ))
     })?;
-    let key_bytes = std::fs::read(&key.path).map_err(|e| {
+    let key_bytes = std::fs::read(&key_path).map_err(|e| {
         LpmError::Cert(format!(
             "{}:{}: failed to read keyfile {}: {e}",
             key.source,
             key.line,
-            key.path.display()
+            key_path.display()
         ))
     })?;
 
@@ -258,7 +275,7 @@ pub fn load_identity(
              \nThen point certfile= at cert.pem and keyfile= at key.pem.",
             key.source,
             key.line,
-            key.path.display()
+            key_path.display()
         )));
     }
     if looks_like_pkcs12(&cert_bytes) {
@@ -274,7 +291,7 @@ pub fn load_identity(
              PKCS#12, extract it separately with `-nocerts -nodes -out key.pem`).",
             cert.source,
             cert.line,
-            cert.path.display()
+            cert_path.display()
         )));
     }
 
@@ -284,7 +301,7 @@ pub fn load_identity(
             "{}:{}: certfile {} is not valid UTF-8 (PEM expected): {e}",
             cert.source,
             cert.line,
-            cert.path.display()
+            cert_path.display()
         ))
     })?;
     if !cert_text.contains("-----BEGIN CERTIFICATE-----") {
@@ -292,7 +309,7 @@ pub fn load_identity(
             "{}:{}: certfile {} contains no '-----BEGIN CERTIFICATE-----' block",
             cert.source,
             cert.line,
-            cert.path.display()
+            cert_path.display()
         )));
     }
 
@@ -302,7 +319,7 @@ pub fn load_identity(
             "{}:{}: keyfile {} is not valid UTF-8 (PEM expected): {e}",
             key.source,
             key.line,
-            key.path.display()
+            key_path.display()
         ))
     })?;
 
@@ -318,7 +335,7 @@ pub fn load_identity(
              \nThen point keyfile= at the new key.pem.",
             key.source,
             key.line,
-            key.path.display()
+            key_path.display()
         )));
     }
 
@@ -334,7 +351,7 @@ pub fn load_identity(
              'ENCRYPTED PRIVATE KEY')",
             key.source,
             key.line,
-            key.path.display()
+            key_path.display()
         )));
     };
 
@@ -364,7 +381,7 @@ pub fn load_identity(
 fn decrypt_pkcs8(
     pem_text: &str,
     key_meta: &TaggedPath,
-    passphrase: &mut dyn PassphraseProvider,
+    passphrase: &dyn PassphraseProvider,
 ) -> Result<String, LpmError> {
     use pkcs8::EncryptedPrivateKeyInfo;
     use pkcs8::der::Decode;
@@ -422,33 +439,34 @@ fn decrypt_pkcs8(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::cell::RefCell;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use tempfile::TempDir;
 
-    /// Test stub: returns a fixed passphrase, panics if asked twice
-    /// when `expect_one_call` is set (verifies passphrase memoization
-    /// when paired with a real `PassphraseCache`).
+    /// Test stub: returns a fixed passphrase. Uses `AtomicUsize` for
+    /// the call counter so the stub satisfies `Sync` — a v1
+    /// requirement for any production-shaped `PassphraseProvider`
+    /// (see trait doc on the `Send + Sync` bound).
     struct FixedPassphrase {
         pp: SecretString,
-        calls: RefCell<usize>,
+        calls: AtomicUsize,
     }
 
     impl FixedPassphrase {
         fn new(pp: &str) -> Self {
             Self {
                 pp: SecretString::from(pp.to_string()),
-                calls: RefCell::new(0),
+                calls: AtomicUsize::new(0),
             }
         }
 
         fn call_count(&self) -> usize {
-            *self.calls.borrow()
+            self.calls.load(Ordering::Relaxed)
         }
     }
 
     impl PassphraseProvider for FixedPassphrase {
-        fn for_keyfile(&mut self, _key: &TaggedPath) -> Result<SecretString, LpmError> {
-            *self.calls.borrow_mut() += 1;
+        fn for_keyfile(&self, _key: &TaggedPath) -> Result<SecretString, LpmError> {
+            self.calls.fetch_add(1, Ordering::Relaxed);
             Ok(self.pp.clone())
         }
     }
@@ -457,7 +475,7 @@ mod tests {
     struct NoPassphrase;
 
     impl PassphraseProvider for NoPassphrase {
-        fn for_keyfile(&mut self, key: &TaggedPath) -> Result<SecretString, LpmError> {
+        fn for_keyfile(&self, key: &TaggedPath) -> Result<SecretString, LpmError> {
             Err(LpmError::Cert(format!(
                 "{}:{}: stub: no passphrase available",
                 key.source, key.line
@@ -486,6 +504,7 @@ mod tests {
             path,
             source: "test:.npmrc".into(),
             line: 1,
+            source_dir: None,
         }
     }
 
@@ -495,8 +514,109 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let cert = tagged(write(dir.path(), "cert.pem", &cert_pem));
         let key = tagged(write(dir.path(), "key.pem", &key_pem));
-        let mut pp = NoPassphrase;
-        load_identity(&cert, &key, &mut pp).expect("identity ok");
+        let pp = NoPassphrase;
+        load_identity(&cert, &key, &pp).expect("identity ok");
+    }
+
+    /// Phase 58.3 GPT pre-T3 finding: relative paths in `~/.npmrc`
+    /// must resolve against the `.npmrc`'s directory, not `${PWD}`.
+    /// Tagged paths plumbed via `parse_layer_with_source_dir` should
+    /// land at the right file regardless of where the install is run
+    /// from.
+    #[test]
+    fn relative_certfile_keyfile_resolve_against_source_dir() {
+        let (cert_pem, key_pem) = gen_rsa_pair();
+        let dir = TempDir::new().unwrap();
+        // Files live alongside the (fictional) .npmrc in `dir/`.
+        std::fs::write(dir.path().join("corp-cert.pem"), &cert_pem).unwrap();
+        std::fs::write(dir.path().join("corp-key.pem"), &key_pem).unwrap();
+        // Tagged paths carry RELATIVE values + source_dir.
+        let cert = TaggedPath {
+            path: PathBuf::from("corp-cert.pem"),
+            source: format!("{}/.npmrc", dir.path().display()),
+            line: 5,
+            source_dir: Some(dir.path().to_path_buf()),
+        };
+        let key = TaggedPath {
+            path: PathBuf::from("corp-key.pem"),
+            source: format!("{}/.npmrc", dir.path().display()),
+            line: 6,
+            source_dir: Some(dir.path().to_path_buf()),
+        };
+        // resolve() should compose source_dir + relative path.
+        assert_eq!(cert.resolve(), dir.path().join("corp-cert.pem"));
+        assert_eq!(key.resolve(), dir.path().join("corp-key.pem"));
+        // End-to-end: load_identity reads via resolve(), not `path`
+        // verbatim — so a CWD that doesn't contain the files still
+        // works as long as source_dir is correct.
+        let pp = NoPassphrase;
+        load_identity(&cert, &key, &pp).expect("identity ok via resolved paths");
+    }
+
+    #[test]
+    fn absolute_path_ignores_source_dir() {
+        // Absolute paths bypass the join. This is the contract that
+        // protects users who explicitly write `/etc/ssl/foo.pem` from
+        // a surprising prefix.
+        let (cert_pem, key_pem) = gen_rsa_pair();
+        let dir = TempDir::new().unwrap();
+        let abs_cert = write(dir.path(), "cert.pem", &cert_pem);
+        let abs_key = write(dir.path(), "key.pem", &key_pem);
+        let cert = TaggedPath {
+            path: abs_cert.clone(),
+            source: "test".into(),
+            line: 1,
+            source_dir: Some(PathBuf::from("/totally/wrong/place")),
+        };
+        let key = TaggedPath {
+            path: abs_key.clone(),
+            source: "test".into(),
+            line: 1,
+            source_dir: Some(PathBuf::from("/totally/wrong/place")),
+        };
+        assert_eq!(cert.resolve(), abs_cert);
+        assert_eq!(key.resolve(), abs_key);
+        let pp = NoPassphrase;
+        load_identity(&cert, &key, &pp).expect("absolute paths win over source_dir");
+    }
+
+    /// Phase 58.3 — provider-lifetime contract from GPT pre-T3 audit.
+    /// One `EnvThenTtyPassphrase` instance shared across multiple
+    /// `for_keyfile` calls must memoize via the inner cache. A fresh
+    /// instance per call would defeat the cache and reprompt.
+    #[test]
+    fn shared_provider_instance_memoizes_via_cache() {
+        // Set the env var so the provider has a passphrase to cache.
+        let _guard = ENV_PASSPHRASE_GUARD
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        unsafe {
+            std::env::set_var(KEY_PASSPHRASE_ENV, "shared-pp");
+        }
+        let provider = EnvThenTtyPassphrase::new_no_prompt();
+
+        // Ensure the canonicalize() inside the provider has a real
+        // file to canonicalize, so the cache key is stable.
+        let dir = TempDir::new().unwrap();
+        let key_path = write(dir.path(), "key.pem", "doesn't matter for this test");
+
+        let key = TaggedPath {
+            path: key_path,
+            source: "test".into(),
+            line: 1,
+            source_dir: None,
+        };
+        // First call resolves via env tier and inserts into cache.
+        let first = provider.for_keyfile(&key).expect("first lookup ok");
+        // Remove the env var. Second call MUST hit the cache, not
+        // fall through to the (now-empty) env tier and fail.
+        unsafe {
+            std::env::remove_var(KEY_PASSPHRASE_ENV);
+        }
+        let second = provider
+            .for_keyfile(&key)
+            .expect("second lookup must hit cache despite missing env");
+        assert_eq!(first.expose_secret(), second.expose_secret());
     }
 
     #[test]
@@ -511,8 +631,8 @@ mod tests {
         std::fs::write(&cert_path, [0x30u8, 0x82, 0x04, 0x00, 0xff, 0xfe, 0xfd]).unwrap();
         let cert = tagged(cert_path);
         let key = tagged(write(dir.path(), "key.pem", &key_pem));
-        let mut pp = NoPassphrase;
-        match load_identity(&cert, &key, &mut pp) {
+        let pp = NoPassphrase;
+        match load_identity(&cert, &key, &pp) {
             Err(LpmError::Cert(msg)) => {
                 assert!(msg.contains("PKCS#12"), "msg: {msg}");
                 // Self-contained recipe — must NOT punt to a sibling error.
@@ -539,8 +659,8 @@ mod tests {
         std::fs::write(&key_path, [0x30u8, 0x82, 0x04, 0x00, 0xff, 0xfe, 0xfd]).unwrap();
         let cert = tagged(cert_path);
         let key = tagged(key_path);
-        let mut pp = NoPassphrase;
-        match load_identity(&cert, &key, &mut pp) {
+        let pp = NoPassphrase;
+        match load_identity(&cert, &key, &pp) {
             Err(LpmError::Cert(msg)) => {
                 assert!(msg.contains("PKCS#12"), "msg: {msg}");
                 assert!(msg.contains("openssl pkcs12"), "msg: {msg}");
@@ -562,8 +682,8 @@ mod tests {
                           deadbeef\n\
                           -----END RSA PRIVATE KEY-----\n";
         let key = tagged(write(dir.path(), "key.pem", legacy_key));
-        let mut pp = NoPassphrase;
-        match load_identity(&cert, &key, &mut pp) {
+        let pp = NoPassphrase;
+        match load_identity(&cert, &key, &pp) {
             Err(LpmError::Cert(msg)) => {
                 assert!(msg.contains("legacy PKCS#1"), "msg: {msg}");
                 assert!(msg.contains("openssl pkcs8 -topk8"), "msg: {msg}");
@@ -580,8 +700,8 @@ mod tests {
         let cert = tagged(write(dir.path(), "cert.pem", &cert_pem));
         let bogus = "-----BEGIN SOMETHING ELSE-----\nbody\n-----END SOMETHING ELSE-----\n";
         let key = tagged(write(dir.path(), "key.pem", bogus));
-        let mut pp = NoPassphrase;
-        match load_identity(&cert, &key, &mut pp) {
+        let pp = NoPassphrase;
+        match load_identity(&cert, &key, &pp) {
             Err(LpmError::Cert(msg)) => {
                 assert!(msg.contains("no recognized PEM private-key"), "msg: {msg}");
             }
@@ -595,8 +715,8 @@ mod tests {
         let (_, key_pem) = gen_rsa_pair();
         let cert = tagged(write(dir.path(), "cert.pem", "this is not pem"));
         let key = tagged(write(dir.path(), "key.pem", &key_pem));
-        let mut pp = NoPassphrase;
-        match load_identity(&cert, &key, &mut pp) {
+        let pp = NoPassphrase;
+        match load_identity(&cert, &key, &pp) {
             Err(LpmError::Cert(msg)) => {
                 assert!(msg.contains("BEGIN CERTIFICATE"), "msg: {msg}");
             }
@@ -610,8 +730,8 @@ mod tests {
         let (_, key_pem) = gen_rsa_pair();
         let cert = tagged(dir.path().join("does-not-exist.pem"));
         let key = tagged(write(dir.path(), "key.pem", &key_pem));
-        let mut pp = NoPassphrase;
-        match load_identity(&cert, &key, &mut pp) {
+        let pp = NoPassphrase;
+        match load_identity(&cert, &key, &pp) {
             Err(LpmError::Cert(msg)) => {
                 assert!(msg.contains("failed to read certfile"), "msg: {msg}");
                 assert!(msg.contains("test:.npmrc:1"), "msg: {msg}");
@@ -667,13 +787,13 @@ mod tests {
         let key = tagged(write(dir.path(), "key.pem", &encrypted_pem));
 
         // Correct passphrase → identity loads.
-        let mut good_pp = FixedPassphrase::new(passphrase);
-        load_identity(&cert, &key, &mut good_pp).expect("decryption ok");
+        let good_pp = FixedPassphrase::new(passphrase);
+        load_identity(&cert, &key, &good_pp).expect("decryption ok");
         assert_eq!(good_pp.call_count(), 1);
 
         // Wrong passphrase → cited decryption error.
-        let mut bad_pp = FixedPassphrase::new("nope");
-        match load_identity(&cert, &key, &mut bad_pp) {
+        let bad_pp = FixedPassphrase::new("nope");
+        match load_identity(&cert, &key, &bad_pp) {
             Err(LpmError::Cert(msg)) => {
                 assert!(msg.contains("decryption failed"), "msg: {msg}");
                 assert!(msg.contains("test:.npmrc:1"), "msg: {msg}");
@@ -724,12 +844,13 @@ mod tests {
         unsafe {
             std::env::set_var(KEY_PASSPHRASE_ENV, "from-env");
         }
-        let mut provider = EnvThenTtyPassphrase::new_no_prompt();
+        let provider = EnvThenTtyPassphrase::new_no_prompt();
         let got = provider
             .for_keyfile(&TaggedPath {
                 path: PathBuf::from("/nonexistent"),
                 source: "test".into(),
                 line: 1,
+                source_dir: None,
             })
             .expect("env tier resolves");
         assert_eq!(got.expose_secret(), "from-env");
@@ -740,11 +861,12 @@ mod tests {
         unsafe {
             std::env::remove_var(KEY_PASSPHRASE_ENV);
         }
-        let mut provider = EnvThenTtyPassphrase::new_no_prompt();
+        let provider = EnvThenTtyPassphrase::new_no_prompt();
         match provider.for_keyfile(&TaggedPath {
             path: PathBuf::from("/nonexistent"),
             source: "test:.npmrc".into(),
             line: 9,
+            source_dir: None,
         }) {
             Err(LpmError::Cert(msg)) => {
                 assert!(msg.contains("test:.npmrc:9"), "msg: {msg}");

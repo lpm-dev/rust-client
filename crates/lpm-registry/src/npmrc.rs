@@ -142,11 +142,43 @@ pub struct TaggedBool {
 /// verbatim from `.npmrc`; the loader resolves and reads at client-
 /// build time so per-origin entries the install never reaches don't
 /// turn into ambient-config preconditions. Phase 58.3 (mTLS).
+///
+/// **Relative-path resolution.** When the user writes
+/// `certfile=corp-ca.pem` in `~/.npmrc`, they expect the file to be
+/// found next to `~/.npmrc`, not next to `${PWD}`. `source_dir`
+/// carries the directory of the contributing `.npmrc` file so
+/// [`Self::resolve`] can compose `<source_dir>/<path>` for relative
+/// `path` values. `None` means the source is a non-file label (test
+/// stub) or the loader should resolve against `${PWD}`.
 #[derive(Clone, Debug)]
 pub struct TaggedPath {
     pub path: PathBuf,
     pub source: String,
     pub line: usize,
+    /// Directory of the `.npmrc` file that contained this entry, when
+    /// known. Used by [`Self::resolve`] for relative paths.
+    pub source_dir: Option<PathBuf>,
+}
+
+impl TaggedPath {
+    /// Resolve to an absolute path the loader can stat/read.
+    ///
+    /// - If `path` is already absolute, return it verbatim.
+    /// - Else if `source_dir` is `Some`, return `source_dir.join(path)`.
+    /// - Else return `path` (loader will resolve against `${PWD}`,
+    ///   matching npm's behavior for paths whose source is unknown).
+    ///
+    /// Phase 58.3 — addresses GPT pre-T3 finding "TLS paths from
+    /// `~/.npmrc` would otherwise resolve against the process cwd."
+    pub fn resolve(&self) -> PathBuf {
+        if self.path.is_absolute() {
+            return self.path.clone();
+        }
+        if let Some(dir) = self.source_dir.as_ref() {
+            return dir.join(&self.path);
+        }
+        self.path.clone()
+    }
 }
 
 /// Per-origin TLS settings parsed from `//host[:port]/:cafile=` /
@@ -664,6 +696,26 @@ impl NpmrcConfig {
         source_label: &str,
         env_lookup: &dyn Fn(&str) -> Option<String>,
     ) -> Self {
+        Self::parse_layer_with_source_dir(content, source_label, None, env_lookup)
+    }
+
+    /// Phase 58.3 — parse a single `.npmrc` layer and tag every TLS
+    /// path entry with the source directory.
+    ///
+    /// `source_dir` is the parent directory of the `.npmrc` file
+    /// being parsed. Used by [`TaggedPath::resolve`] to compose
+    /// absolute paths from relative `certfile=` / `keyfile=` /
+    /// per-origin `cafile=` values. Pass `None` for in-memory tests
+    /// or any caller whose source isn't a file on disk.
+    ///
+    /// Production: [`Self::load_from_paths`] passes
+    /// `Some(file_path.parent())` for each layer.
+    pub fn parse_layer_with_source_dir(
+        content: &str,
+        source_label: &str,
+        source_dir: Option<&Path>,
+        env_lookup: &dyn Fn(&str) -> Option<String>,
+    ) -> Self {
         let mut cfg = NpmrcConfig::default();
 
         // Strip leading UTF-8 BOM if present. Some Windows editors save
@@ -701,7 +753,14 @@ impl NpmrcConfig {
                 }
             };
 
-            classify_and_apply(key, &interpolated, source_label, lineno + 1, &mut cfg);
+            classify_and_apply(
+                key,
+                &interpolated,
+                source_label,
+                source_dir,
+                lineno + 1,
+                &mut cfg,
+            );
         }
 
         cfg
@@ -1002,7 +1061,18 @@ impl NpmrcConfig {
             match std::fs::read_to_string(path) {
                 Ok(content) => {
                     let label = path.display().to_string();
-                    let layer = NpmrcConfig::parse_layer(&content, &label, env_lookup);
+                    // Phase 58.3 — pass the file's parent dir so any
+                    // `certfile=` / `keyfile=` / per-origin `cafile=`
+                    // tagged paths resolve relative to *this* `.npmrc`
+                    // (not `${PWD}`), per GPT pre-T3 finding on path
+                    // resolution.
+                    let source_dir = path.parent();
+                    let layer = NpmrcConfig::parse_layer_with_source_dir(
+                        &content,
+                        &label,
+                        source_dir,
+                        env_lookup,
+                    );
                     acc.merge_over(layer);
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -1253,10 +1323,16 @@ fn interpolate_env(
 /// All control flow lives here so the parser loop stays readable. Auth
 /// subkeys are written into `cfg.auth_buffers` as `TaggedValue`s; they
 /// don't get resolved into `RegistryAuth` until `NpmrcConfig::finalize`.
+///
+/// `source_dir` is the directory of the `.npmrc` file being parsed
+/// (Phase 58.3); when populated, every emitted [`TaggedPath`] carries
+/// it so [`TaggedPath::resolve`] can turn relative paths into
+/// absolute ones at load time. Test stubs pass `None`.
 fn classify_and_apply(
     key: &str,
     value: &str,
     source_label: &str,
+    source_dir: Option<&Path>,
     lineno: usize,
     cfg: &mut NpmrcConfig,
 ) {
@@ -1363,6 +1439,7 @@ fn classify_and_apply(
                             path: PathBuf::from(value),
                             source: source_label.to_string(),
                             line: lineno,
+                            source_dir: source_dir.map(|p| p.to_path_buf()),
                         });
                 }
                 "certfile" => {
@@ -1385,6 +1462,7 @@ fn classify_and_apply(
                         path: PathBuf::from(value),
                         source: source_label.to_string(),
                         line: lineno,
+                        source_dir: source_dir.map(|p| p.to_path_buf()),
                     });
                 }
                 "keyfile" => {
@@ -1404,6 +1482,7 @@ fn classify_and_apply(
                         path: PathBuf::from(value),
                         source: source_label.to_string(),
                         line: lineno,
+                        source_dir: source_dir.map(|p| p.to_path_buf()),
                     });
                 }
                 _ => {
@@ -1537,6 +1616,7 @@ fn classify_and_apply(
             path: PathBuf::from(value),
             source: source_label.to_string(),
             line: lineno,
+            source_dir: source_dir.map(|p| p.to_path_buf()),
         };
         if key == "certfile" {
             cfg.tls.identity_certfile = Some(tagged_path);
@@ -2240,6 +2320,72 @@ mod tests {
         assert_eq!(per_origin.cafiles.len(), 2);
         assert_eq!(per_origin.cafiles[0].source, "system");
         assert_eq!(per_origin.cafiles[1].source, "user");
+    }
+
+    #[test]
+    fn parse_layer_with_source_dir_tags_certfile_for_resolve() {
+        // Phase 58.3 — when parse_layer_with_source_dir is given
+        // a directory, every TaggedPath in this layer (global +
+        // per-origin) must carry it so `TaggedPath::resolve()` can
+        // compose absolute paths from relative `.npmrc` values.
+        let dir = std::path::Path::new("/etc/npm");
+        let content = "certfile=corp-cert.pem\n\
+                       keyfile=corp-key.pem\n\
+                       //npm.internal/:cafile=ca.pem\n\
+                       //npm.internal/:certfile=client.pem\n\
+                       //npm.internal/:keyfile=client.key\n";
+        let cfg = NpmrcConfig::parse_layer_with_source_dir(content, "/etc/npmrc", Some(dir), &no_env);
+
+        // Global identity tags both paths with source_dir.
+        let global_cert = cfg.tls.identity_certfile.as_ref().unwrap();
+        assert_eq!(global_cert.path, PathBuf::from("corp-cert.pem"));
+        assert_eq!(global_cert.source_dir.as_deref(), Some(dir));
+        assert_eq!(global_cert.resolve(), PathBuf::from("/etc/npm/corp-cert.pem"));
+
+        let global_key = cfg.tls.identity_keyfile.as_ref().unwrap();
+        assert_eq!(global_key.resolve(), PathBuf::from("/etc/npm/corp-key.pem"));
+
+        // Per-origin entries: same scoping.
+        let origin = OriginKey {
+            host_lower: "npm.internal".into(),
+            port: None,
+        };
+        let per_origin = cfg.tls.per_origin.get(&origin).expect("per_origin entry");
+        assert_eq!(per_origin.cafiles.len(), 1);
+        assert_eq!(
+            per_origin.cafiles[0].resolve(),
+            PathBuf::from("/etc/npm/ca.pem")
+        );
+        assert_eq!(
+            per_origin.certfile.as_ref().unwrap().resolve(),
+            PathBuf::from("/etc/npm/client.pem")
+        );
+        assert_eq!(
+            per_origin.keyfile.as_ref().unwrap().resolve(),
+            PathBuf::from("/etc/npm/client.key")
+        );
+    }
+
+    #[test]
+    fn parse_layer_without_source_dir_leaves_path_unchanged_on_resolve() {
+        // Tests / single-file convenience callers pass None — the
+        // resolve() helper returns the verbatim path so loaders
+        // fall back to ${PWD}-relative resolution (matching the
+        // pre-58.3 behavior).
+        let cfg = NpmrcConfig::parse(
+            "certfile=/abs/cert.pem\nkeyfile=relative.pem\n",
+            "test",
+            &no_env,
+        );
+        let cert = cfg.tls.identity_certfile.as_ref().unwrap();
+        assert!(cert.source_dir.is_none());
+        // Absolute path: unchanged regardless.
+        assert_eq!(cert.resolve(), PathBuf::from("/abs/cert.pem"));
+
+        let key = cfg.tls.identity_keyfile.as_ref().unwrap();
+        assert!(key.source_dir.is_none());
+        // Relative + no source_dir → returned as-is (loader resolves vs cwd).
+        assert_eq!(key.resolve(), PathBuf::from("relative.pem"));
     }
 
     #[test]
