@@ -207,30 +207,17 @@ pub async fn run(
         ));
     }
     // Phase 58.3 — request-aware eager-build: `lpm add <spec>`'s
-    // top-level request is exactly `{spec}`. Compute the effective
-    // origin set from that single spec + the route table, then
-    // eager-build per-origin clients for the intersection with
-    // configured per-origin TLS. Origins surfaced later (transitive
-    // deps, tarball CDNs) go through the lazy path in HttpClients.
-    //
-    // Alias resolution (GPT post-T4 MEDIUM finding): for
-    // `lpm add foo@npm:react@18`, `target.display()` is `foo` but
-    // the actual route key is `react`. Parse the version_spec when
-    // present and prefer the NpmAlias target; otherwise fall back
-    // to the display name. Local-source / file / tarball-URL specs
-    // don't route by package name and stay out of the eager set.
-    let route_key: Option<String> = match version_spec.as_deref() {
-        Some(v) => match lpm_resolver::Specifier::parse(v) {
-            Ok(lpm_resolver::Specifier::NpmAlias { target: t, .. }) => Some(t),
-            Ok(lpm_resolver::Specifier::SemverRange(_)) => Some(target.display()),
-            // Tarball / File / Link / Workspace / Git → no registry
-            // route; lazy path covers any TLS needs.
-            _ => None,
-        },
-        // No version spec → default range against the named registry.
-        None => Some(target.display()),
-    };
-    let top_level_specs: Vec<String> = route_key.into_iter().collect();
+    // top-level request is exactly `{spec}`. The fetch site below
+    // (`get_npm_metadata_routed(spec, …)`) and version resolution
+    // (`resolve_version_spec(version_spec)`) both operate on the
+    // raw `target` and `version_spec` strings — npm aliases like
+    // `lpm add foo@npm:react@18` are NOT currently supported by
+    // those paths (they'd route + fetch as `foo`, not `react`). So
+    // the eager-set inputs mirror actual fetch behavior: the local
+    // target name, no alias unwrapping. If alias support lands for
+    // `lpm add` later, the alias-target unwrap should be applied
+    // here AND in the fetch + resolve paths in lockstep.
+    let top_level_specs: Vec<String> = vec![target.display()];
     let eager_origins = route_table.effective_registry_origins(
         &top_level_specs,
         client.base_url(),
