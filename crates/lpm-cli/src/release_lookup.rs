@@ -155,7 +155,10 @@ impl std::fmt::Display for LookupError {
 /// shape is identical to the inline `Display` rendering — drift between
 /// the two would confuse anyone comparing CLI output across versions.
 pub fn format_rate_limit_summary(reset_at: u64) -> String {
-    format!("GitHub fallback rate-limited. {}", format_reset_hint(reset_at))
+    format!(
+        "GitHub fallback rate-limited. {}",
+        format_reset_hint(reset_at)
+    )
 }
 
 /// Render `x-ratelimit-reset` (unix epoch) as a "try again in N min/sec"
@@ -949,8 +952,7 @@ mod tests {
         Mock::given(method("GET"))
             .and(path("/@lpm-registry/cli/latest"))
             .respond_with(
-                ResponseTemplate::new(200)
-                    .set_body_json(serde_json::json!({ "version": "9.9.9" })),
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({ "version": "9.9.9" })),
             )
             .expect(1)
             .mount(&npm)
@@ -1013,9 +1015,7 @@ mod tests {
         let gh_url = format!("{}/repos/lpm-dev/rust-client/releases/latest", gh.uri());
         with_env_overrides(&npm_url, &gh_url, async {
             let mut cache = UpdateCache::default();
-            let outcome = probe_release(&mut cache)
-                .await
-                .expect("github fallback ok");
+            let outcome = probe_release(&mut cache).await.expect("github fallback ok");
             assert_eq!(
                 outcome,
                 FetchOutcome::Fresh {
@@ -1057,9 +1057,7 @@ mod tests {
         let gh_url = format!("{}/repos/lpm-dev/rust-client/releases/latest", gh.uri());
         with_env_overrides(&npm_url, &gh_url, async {
             let mut cache = UpdateCache::default();
-            let err = probe_release(&mut cache)
-                .await
-                .expect_err("both legs fail");
+            let err = probe_release(&mut cache).await.expect_err("both legs fail");
             // Primary error wins. The npm 503 body excerpt should
             // appear, not the GitHub 500 body.
             let s = err.to_string();
