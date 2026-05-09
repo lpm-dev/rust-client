@@ -1814,11 +1814,18 @@ enum Commands {
     },
 
     /// Update LPM to the latest version.
+    ///
+    /// Detects the installation channel from the executable path
+    /// (npm, Homebrew, cargo, or standalone) and runs the matching
+    /// upgrade command. Version discovery probes the npm registry
+    /// first and falls back to GitHub Releases — no token required
+    /// for either path on the common case.
     #[command(name = "self-update")]
     SelfUpdate {
-        /// Bypass the 10-minute version-lookup cache and probe GitHub
-        /// directly. Only affects the version check — not the upgrade
-        /// itself, which always installs the resolved release.
+        /// Bypass the 10-minute version-lookup cache and the
+        /// post-failure cooldown. Forces a fresh probe regardless of
+        /// recent state. Only affects the version check — not the
+        /// upgrade itself, which always installs the resolved release.
         #[arg(long)]
         refresh: bool,
     },
@@ -3993,6 +4000,34 @@ mod tests {
     // - `--verbose` long form survives.
     // - `-v` is NO LONGER the short for `--verbose` — it was reclaimed
     //   for `--version` to match npm/pnpm/yarn convention.
+
+    /// User-facing help for `lpm self-update --help` must NOT promise
+    /// "probes GitHub directly" any more — that wording was tied to
+    /// the old single-source design and would mislead users into
+    /// thinking they need a `GITHUB_TOKEN` for the common case. Lock
+    /// the new wording so a future doc edit doesn't silently regress.
+    #[test]
+    fn self_update_help_text_does_not_promise_github_probe() {
+        use clap::CommandFactory;
+        let mut cmd = Cli::command();
+        let mut buf = Vec::new();
+        cmd.find_subcommand_mut("self-update")
+            .expect("self-update subcommand registered")
+            .write_long_help(&mut buf)
+            .unwrap();
+        let help = String::from_utf8(buf).unwrap();
+        assert!(
+            !help.contains("probe GitHub directly"),
+            "stale wording still in help: {help}"
+        );
+        // Affirmative anchor: help must mention the npm-first probe so
+        // users know the GITHUB_TOKEN hint in error messages is rare,
+        // not the default path.
+        assert!(
+            help.contains("npm registry"),
+            "help should mention npm registry as the primary probe: {help}"
+        );
+    }
 
     /// Banner suppression: the four-quadrant truth table.
     ///

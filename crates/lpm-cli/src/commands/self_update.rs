@@ -28,6 +28,13 @@ const FAILURE_BACKOFF: Duration = Duration::from_secs(60 * 60);
 /// Detects the installation method from the executable path and runs
 /// the appropriate upgrade command. Supports npm, Homebrew, cargo,
 /// and standalone (curl) installations.
+///
+/// Version discovery probes the npm registry first
+/// (`registry.npmjs.org/@lpm-registry/cli/latest`) and falls back to
+/// GitHub Releases. The npm primary is anonymous and unmetered for our
+/// purposes, so most users never touch the rate-limited GitHub path.
+/// The two sources stay in lockstep because every release publishes
+/// from the same tag.
 pub async fn run(json_output: bool, refresh: bool) -> Result<(), LpmError> {
     let current = env!("CARGO_PKG_VERSION");
 
