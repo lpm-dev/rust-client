@@ -693,6 +693,7 @@ fn build_inputs(
         .with_aliases(alias_iter)
         .with_root_link_names(target.root_link_names.clone())
         .with_wrapper_id(target.wrapper_id.clone())
+        .with_patch_fingerprint(target.patch_fingerprint.clone())
 }
 
 /// Wipe v1-style project link state so the v2 install starts clean.
@@ -1022,6 +1023,7 @@ mod tests {
                 wrapper_id: None,
                 materialization: crate::Materialization::CasBacked,
                 peers: Vec::new(),
+                patch_fingerprint: None,
             },
             source_sri: sri.into(),
         }
@@ -1483,6 +1485,153 @@ mod tests {
         assert!(
             msg.contains("multi-source") && msg.contains("x@1.0.0"),
             "multi-source collision error must name the package: {msg}"
+        );
+    }
+
+    // ── F1 — patch_fingerprint cross-project isolation ──────────────────
+    //
+    // **Load-bearing for the patch-engine contract under v2.** Patches
+    // are documented as repo-local (`crates/lpm-cli/src/commands/patch.rs:18`):
+    // "Patches travel with the repo. The next `lpm install` automatically
+    // re-applies them after linking." Under v2's cross-project link
+    // sharing (preplan §2.2), two projects with identical dep graphs
+    // resolve to the same `<store>/v2/links/<key>/...` directory by
+    // design. Without F1's `patch_fingerprint` dimension, project A's
+    // `apply_patch` mutation lands in the shared dir and project B's
+    // symlinks resolve through it — silently leaking patched bytes
+    // across project boundaries.
+    //
+    // The fix folds patch identity into the GraphKey so:
+    // 1. A patched install lands in its own `links/<key>+<patch-hash>/`
+    //    directory, distinct from any unpatched install of the same
+    //    coords.
+    // 2. Two projects applying byte-identical patches with the same
+    //    pinned baseline still share (correct — equivalent
+    //    materializations are interchangeable).
+    // 3. Edits to the patch text or `originalIntegrity` rotation split
+    //    into a fresh entry (old patched bytes can never leak forward).
+
+    #[test]
+    fn link_packages_v2_isolates_patched_install_from_unpatched() {
+        // Two projects pin lodash@1.0.0 with identical dep graphs.
+        // Project A declares a patch (carries `patch_fingerprint`);
+        // project B is unpatched. The two installs MUST land at
+        // different link-entry directories.
+        let tmp = tempfile::tempdir().unwrap();
+        let store = V2Store::at(tmp.path().join("store"));
+
+        let sri = synthetic_sri(b"f1_isolation/lodash");
+        write_object(
+            &store,
+            &sri,
+            &[
+                (
+                    "package.json",
+                    b"{\"name\":\"lodash\",\"version\":\"1.0.0\"}",
+                ),
+                ("index.js", b"module.exports = 'orig';\n"),
+            ],
+        );
+
+        let proj_a = tmp.path().join("project-a-patched");
+        let proj_b = tmp.path().join("project-b-unpatched");
+        std::fs::create_dir_all(&proj_a).unwrap();
+        std::fs::create_dir_all(&proj_b).unwrap();
+
+        let mut t_a = target("lodash", "1.0.0", &sri, true);
+        t_a.target.patch_fingerprint = Some("p-aaaaaaaaaaaaaaaa".into());
+        let t_b = target("lodash", "1.0.0", &sri, true); // unpatched
+
+        let r_a = link_packages_v2(&proj_a, &[t_a], &store, LinkerMode::Isolated, None).unwrap();
+        let r_b = link_packages_v2(&proj_b, &[t_b], &store, LinkerMode::Isolated, None).unwrap();
+
+        let dest_a = r_a
+            .materialized
+            .iter()
+            .find(|m| m.name == "lodash")
+            .map(|m| m.destination.clone())
+            .unwrap();
+        let dest_b = r_b
+            .materialized
+            .iter()
+            .find(|m| m.name == "lodash")
+            .map(|m| m.destination.clone())
+            .unwrap();
+        assert_ne!(
+            dest_a, dest_b,
+            "patched install MUST land in a different link entry than \
+             an unpatched install of the same coords — without this, \
+             `apply_patch` mutates the dir project B's symlinks resolve \
+             through, silently exporting the patch across projects"
+        );
+
+        // Byte-isolation cross-check: simulate what `apply_patch` does
+        // (`remove_file` + `write` to break inode-share) on project A's
+        // destination, then assert project B's bytes are pristine.
+        // Combined with the assert_ne above this is the full F1
+        // contract: distinct paths + distinct bytes after mutation.
+        let a_file = dest_a.join("index.js");
+        let b_file = dest_b.join("index.js");
+        std::fs::remove_file(&a_file).unwrap();
+        std::fs::write(&a_file, b"module.exports = 'PATCHED';\n").unwrap();
+
+        let b_bytes = std::fs::read(&b_file).unwrap();
+        assert_eq!(
+            b_bytes, b"module.exports = 'orig';\n",
+            "project B's bytes MUST remain pristine after project A patches its own link entry"
+        );
+    }
+
+    #[test]
+    fn link_packages_v2_shares_link_entry_for_byte_identical_patches() {
+        // Two projects applying byte-identical patches against the
+        // same baseline SHOULD share a single link entry — that's the
+        // whole point of content-derived patch fingerprinting (the
+        // cheap, correct case the F1 design unlocks). Without this,
+        // every project would pay a fresh materialization tax even
+        // when the patched output is byte-equivalent.
+        let tmp = tempfile::tempdir().unwrap();
+        let store = V2Store::at(tmp.path().join("store"));
+
+        let sri = synthetic_sri(b"f1_shared_patch/lodash");
+        write_object(
+            &store,
+            &sri,
+            &[(
+                "package.json",
+                b"{\"name\":\"lodash\",\"version\":\"1.0.0\"}",
+            )],
+        );
+
+        let proj_a = tmp.path().join("project-a");
+        let proj_b = tmp.path().join("project-b");
+        std::fs::create_dir_all(&proj_a).unwrap();
+        std::fs::create_dir_all(&proj_b).unwrap();
+
+        let mut t_a = target("lodash", "1.0.0", &sri, true);
+        t_a.target.patch_fingerprint = Some("p-1234567890abcdef".into());
+        let mut t_b = target("lodash", "1.0.0", &sri, true);
+        t_b.target.patch_fingerprint = Some("p-1234567890abcdef".into());
+
+        let r_a = link_packages_v2(&proj_a, &[t_a], &store, LinkerMode::Isolated, None).unwrap();
+        let r_b = link_packages_v2(&proj_b, &[t_b], &store, LinkerMode::Isolated, None).unwrap();
+
+        let dest_a = r_a
+            .materialized
+            .iter()
+            .find(|m| m.name == "lodash")
+            .map(|m| m.destination.clone())
+            .unwrap();
+        let dest_b = r_b
+            .materialized
+            .iter()
+            .find(|m| m.name == "lodash")
+            .map(|m| m.destination.clone())
+            .unwrap();
+        assert_eq!(
+            dest_a, dest_b,
+            "byte-identical patch + identical baseline across two \
+             projects MUST share the link entry"
         );
     }
 

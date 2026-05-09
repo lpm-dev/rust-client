@@ -1277,4 +1277,132 @@ mod tests {
             "0744 tar entry must preserve user-only exec bit, no group/other",
         );
     }
+
+    /// **Phase 66 confidence-followup F3 (2026-05-09)** — lock down the
+    /// 0o644-floor mode-normalization contract. The extractor floors
+    /// every regular file at 0o644 (`rw-r--r--`) and OR's the
+    /// tarball's exec bits on top, regardless of what read/write
+    /// permissions the tarball header declared.
+    ///
+    /// **Why this matters.** A surprising number of npm tarballs ship
+    /// files with weird modes (0o600 user-only, 0o400 read-only, etc.)
+    /// from arbitrary build environments. Honoring those modes
+    /// would make the published files unreadable to other Unix users
+    /// running Node — `EACCES` on `require()`. Both npm and pnpm
+    /// flatten to a world-readable floor; this test pins LPM to the
+    /// same posture.
+    ///
+    /// **Why we re-affirm it.** Issue F3 in the Phase 66 confidence
+    /// audit flagged the floor as a possible widening (a tarball
+    /// declaring 0o600 ends up world-readable). Decision: leave alone
+    /// — it matches npm/pnpm — but pin the behavior with this test
+    /// so a future audit doesn't re-flag the line and a refactor
+    /// can't silently switch to the tar header's mode without
+    /// breaking this assertion.
+    ///
+    /// SUID / SGID / sticky bits are explicitly NOT carried through —
+    /// see the block comment at the post-write `set_permissions` site
+    /// for the security rationale ("same security posture as
+    /// `set_preserve_permissions(false)`").
+    #[cfg(unix)]
+    #[test]
+    fn extract_floors_read_bits_at_0o644_and_strips_suid_sgid_sticky() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let mut tar_data = Vec::new();
+        {
+            let mut builder = tar::Builder::new(&mut tar_data);
+
+            // 0o600 (user-only rw, no group/other) → must become 0o644.
+            // Locks the npm/pnpm-compat widening: a tarball with a
+            // restrictive owner-only mode is normalized to a
+            // world-readable file in node_modules so any process can
+            // `require()` it.
+            let mut user_only = tar::Header::new_gnu();
+            user_only.set_size(b"a\n".len() as u64);
+            user_only.set_mode(0o600);
+            user_only.set_cksum();
+            builder
+                .append_data(&mut user_only, "package/user_only.txt", &b"a\n"[..])
+                .unwrap();
+
+            // 0o400 (read-only) → must become 0o644 (gain user-write
+            // and world-read). Same widening rationale.
+            let mut readonly = tar::Header::new_gnu();
+            readonly.set_size(b"b\n".len() as u64);
+            readonly.set_mode(0o400);
+            readonly.set_cksum();
+            builder
+                .append_data(&mut readonly, "package/readonly.txt", &b"b\n"[..])
+                .unwrap();
+
+            // 0o4755 (SUID + 0o755) → must drop the SUID bit but
+            // keep the exec bits. Defense-in-depth against a
+            // malicious tarball trying to plant a setuid binary in
+            // node_modules — the post-write `set_permissions` call
+            // builds its mask as `0o644 | exec_bits`, where
+            // `exec_bits = mode & 0o111`, so SUID/SGID/sticky are
+            // structurally absent from the result.
+            let mut suid = tar::Header::new_gnu();
+            suid.set_size(b"c\n".len() as u64);
+            suid.set_mode(0o4755);
+            suid.set_cksum();
+            builder
+                .append_data(&mut suid, "package/bin/suid.sh", &b"c\n"[..])
+                .unwrap();
+
+            // 0o2755 (SGID) — same defense: drop SGID, keep exec.
+            let mut sgid = tar::Header::new_gnu();
+            sgid.set_size(b"d\n".len() as u64);
+            sgid.set_mode(0o2755);
+            sgid.set_cksum();
+            builder
+                .append_data(&mut sgid, "package/bin/sgid.sh", &b"d\n"[..])
+                .unwrap();
+
+            builder.finish().unwrap();
+        }
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(&tar_data).unwrap();
+        let tgz = encoder.finish().unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        extract_tarball(&tgz, dir.path()).unwrap();
+
+        let mode_of = |rel: &str| {
+            std::fs::metadata(dir.path().join(rel))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o7777 // include high bits to detect SUID/SGID/sticky
+        };
+
+        // 0o600 → 0o644 (no exec bits).
+        assert_eq!(
+            mode_of("user_only.txt"),
+            0o644,
+            "0o600 tar entry must be widened to 0o644 (npm/pnpm-compat \
+             world-read floor); without this, downstream Node processes \
+             running as a non-owner user hit EACCES on require()"
+        );
+        // 0o400 → 0o644 (no exec bits, gains user-write).
+        assert_eq!(
+            mode_of("readonly.txt"),
+            0o644,
+            "0o400 tar entry must be widened to 0o644 (npm/pnpm-compat)"
+        );
+        // 0o4755 → 0o755 (SUID stripped, exec preserved).
+        assert_eq!(
+            mode_of("bin/suid.sh"),
+            0o755,
+            "SUID bit MUST be stripped — never permit a tarball to \
+             plant a setuid binary in node_modules"
+        );
+        // 0o2755 → 0o755 (SGID stripped, exec preserved).
+        assert_eq!(
+            mode_of("bin/sgid.sh"),
+            0o755,
+            "SGID bit MUST be stripped — same security posture as SUID"
+        );
+    }
 }

@@ -36,7 +36,7 @@ use lpm_sandbox::SandboxMode;
 use lpm_security::script_hash::compute_script_hash;
 use lpm_security::triage::StaticTier;
 use lpm_security::{EXECUTED_INSTALL_PHASES, SecurityPolicy, TrustMatch};
-use lpm_store::find_installed_package_baseline;
+use lpm_store::{V2BaselineIndex, find_installed_package_baseline_indexed};
 // `PackageStore` lives behind a cfg(test) gate now — production
 // callers of post-install lookups route through
 // `find_installed_package_baseline` (v2-first, v1-fallback). Tests
@@ -62,15 +62,21 @@ use lpm_store::PackageStore;
 /// path for the *runtime* of a script. This helper is the upstream
 /// store-side reader that read-only inspections (script bodies,
 /// trust-gate hashing) consume.
-fn package_baseline_dir(
+///
+/// **Phase 66 confidence-followup F2 (2026-05-09).** Hot-loop variant.
+/// Takes an invocation-local [`V2BaselineIndex`] and turns each
+/// lookup into an O(1) hashmap read. The three rebuild loops
+/// (`run_under_store_lock`, `scriptable_package_rows`,
+/// `all_scripted_packages_trusted`) MUST use this form — pre-fix
+/// each iteration re-walked every link entry + parsed every sidecar
+/// JSON, costing O(M·N) per command invocation.
+fn package_baseline_dir_indexed(
+    index: &V2BaselineIndex,
     lpm_root: &lpm_common::LpmRoot,
     name: &str,
     version: &str,
 ) -> Option<std::path::PathBuf> {
-    find_installed_package_baseline(lpm_root, name, version)
-        .ok()
-        .flatten()
-        .map(|b| b.package_dir)
+    find_installed_package_baseline_indexed(index, lpm_root, name, version).map(|b| b.package_dir)
 }
 use owo_colors::OwoColorize;
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -262,20 +268,32 @@ async fn run_under_store_lock(
             .map_err(|e| LpmError::Registry(format!("{e}")))?;
     let user_bound = crate::capability::UserBound::from_global_config(&global_config);
 
+    // **Phase 66 confidence-followup F2 + F1+F2 review.** Build the
+    // v2 link-entry index ONCE before the per-package loop, scoped to
+    // THIS project's tree. Pre-fix the loop body re-walked every link
+    // entry on every iteration; F2 reduced that to a single global
+    // scan; the F1+F2 review tightened it further to a project-scoped
+    // walk because post-F1 the global scan can return the WRONG link
+    // entry (a sibling project's patched copy of the same coords)
+    // when same-coord duplicates legitimately coexist.
+    let baseline_index = V2BaselineIndex::for_project(project_dir, &lpm_root)?;
+
     // Collect packages that have lifecycle scripts
     let mut scriptable_packages: Vec<ScriptablePackage> = Vec::new();
 
     for lp in &lockfile.packages {
-        // Phase 66 confidence-followup S5b — v2-aware lookup.
+        // Phase 66 confidence-followup S5b — v2-aware lookup, F2 —
+        // routed through the invocation-local index.
         // `live_package_dir` returns `None` when the package isn't in
         // either store (workspace/file/link sources, corrupt
         // installs); silent skip preserves the pre-fix
         // `pkg_json_path.exists()` semantic for non-store sources
         // while fixing the v2-installed-and-skipped data-loss bug.
-        let pkg_dir = match package_baseline_dir(&lpm_root, &lp.name, &lp.version) {
-            Some(p) => p,
-            None => continue,
-        };
+        let pkg_dir =
+            match package_baseline_dir_indexed(&baseline_index, &lpm_root, &lp.name, &lp.version) {
+                Some(p) => p,
+                None => continue,
+            };
         let pkg_json_path = pkg_dir.join("package.json");
 
         if !pkg_json_path.exists() {
@@ -826,6 +844,7 @@ async fn run_under_store_lock(
             pkg.wrapper_id.as_deref(),
             &pkg.store_path,
             &store_root,
+            Some(&baseline_index),
         ) {
             Ok(d) => d,
             Err(e) => {
@@ -1042,6 +1061,7 @@ fn live_package_dir(
     version: &str,
     wrapper_id: Option<&str>,
     store_path: &Path,
+    baseline_index: Option<&V2BaselineIndex>,
 ) -> std::path::PathBuf {
     // Phase 66 §4 — production v2 store handle resolves once per
     // call from the active `~/.lpm/`. Tests use the
@@ -1058,12 +1078,22 @@ fn live_package_dir(
         wrapper_id,
         store_path,
         v2_store.as_ref(),
+        baseline_index,
     )
 }
 
 /// Test-friendly variant of [`live_package_dir`] that takes the v2
 /// store handle explicitly instead of resolving it from the
 /// environment. Production callers use the env-coupled wrapper.
+///
+/// **F1+F2 review.** The optional `baseline_index` is the project-
+/// scoped lookup the transitive-fallback branch uses. When present
+/// it's authoritative — the global `find_link_package_dir` walk is
+/// only used as a backstop for callers that haven't built an index
+/// (test fixtures, defensive paths). Under post-F1 same-coord
+/// coexistence the global walk can return the wrong sibling
+/// project's link entry; the project-scoped index is the correct
+/// disambiguation.
 fn live_package_dir_with_v2(
     project_dir: &Path,
     name: &str,
@@ -1071,6 +1101,7 @@ fn live_package_dir_with_v2(
     wrapper_id: Option<&str>,
     store_path: &Path,
     v2_store: Option<&lpm_store::v2::Store>,
+    baseline_index: Option<&V2BaselineIndex>,
 ) -> std::path::PathBuf {
     let layout = lpm_linker::LayoutPaths::for_project(project_dir);
     let nm = project_dir.join("node_modules");
@@ -1120,9 +1151,24 @@ fn live_package_dir_with_v2(
     // store_path fallback (which under v2 isn't even meaningful — v2
     // doesn't populate v1's `~/.lpm/store/v1/<pkg>/<version>/`).
     //
-    // The walk reads `links/<*>/.lpm-link-meta.json` sidecars and
-    // returns the first matching `(name, version)`. Cheap on
-    // realistic store sizes (10k entries ≈ 1 ms on APFS).
+    // **F1+F2 review.** Authoritative path: consult the project-scoped
+    // `V2BaselineIndex`. Its BFS over `LinkMeta.deps` reaches every
+    // transitive that THIS project actually uses, and a hit there is
+    // unambiguously the right link entry under post-F1 same-coord
+    // coexistence (a sibling project's patched copy can't appear in
+    // a project that didn't symlink it).
+    if let Some(index) = baseline_index
+        && let Some(b) = index.lookup(name, version)
+    {
+        return b.package_dir.clone();
+    }
+    // Backstop for callers without an index in scope (test fixtures,
+    // defensive paths). The global walk is correct when only one
+    // link entry exists per `(name, version)` — i.e. the pre-F1
+    // state and most production v2 caches today. When duplicates
+    // exist on disk, this branch may pick the wrong entry; that's
+    // acceptable as a fallback because the index branch above
+    // covers every reachable production path.
     if let Some(store) = v2_store
         && let Ok(Some(v2_pkg)) = store.find_link_package_dir(name, version)
     {
@@ -1185,8 +1231,16 @@ fn prepare_live_package_dir(
     wrapper_id: Option<&str>,
     store_path: &Path,
     store_root: &Path,
+    baseline_index: Option<&V2BaselineIndex>,
 ) -> Result<PathBuf, String> {
-    let live = live_package_dir(project_dir, pkg_name, pkg_version, wrapper_id, store_path);
+    let live = live_package_dir(
+        project_dir,
+        pkg_name,
+        pkg_version,
+        wrapper_id,
+        store_path,
+        baseline_index,
+    );
 
     // Phase 61.2 D8a — hard-error when the resolved live path lands
     // in the store. Pre-fix this branch silently skipped detach AND
@@ -1849,6 +1903,19 @@ pub(crate) fn scriptable_package_rows(
     // the per-package step into a pure in-memory glob match.
     let trusted_scopes = parse_trusted_scopes(project_dir);
 
+    // **Phase 66 confidence-followup F2 + F1+F2 review.** Build the
+    // v2 link-entry index ONCE before the rayon walk, scoped to this
+    // project's tree. Per-package lookups become O(1) map reads;
+    // the project scoping prevents the post-F1 ambiguity where a
+    // global scan might return a sibling project's link entry for
+    // the same `(name, version)`.
+    //
+    // Index-build errors are upgraded to "no v2 store available"
+    // because the legacy code silently fell back to v1 for any
+    // non-Some result. Surfacing the error here would change the
+    // contract observable to callers (silent skip → hard error).
+    let baseline_index = V2BaselineIndex::for_project(project_dir, lpm_root).unwrap_or_default();
+
     let walk_start = std::time::Instant::now();
 
     // **Phase 51 W2: parallelize the per-package walk via rayon.**
@@ -1863,10 +1930,11 @@ pub(crate) fn scriptable_package_rows(
     // input order anyway under rayon's stable collect.
     let per_pkg = |(name, version, integrity): &(String, String, Option<String>)|
      -> Option<ScriptableHintRow> {
-        // Phase 66 confidence-followup S5b — v2-aware lookup. See
+        // Phase 66 confidence-followup S5b — v2-aware lookup, F2 —
+        // routed through the invocation-local index. See
         // [`package_baseline_dir`] for the silent-skip-vs-real-skip
         // semantic.
-        let pkg_dir = package_baseline_dir(lpm_root, name, version)?;
+        let pkg_dir = package_baseline_dir_indexed(&baseline_index, lpm_root, name, version)?;
         let pkg_json_path = pkg_dir.join("package.json");
 
         let scripts = match read_lifecycle_scripts(&pkg_json_path) {
@@ -2061,13 +2129,24 @@ pub fn all_scripted_packages_trusted(
     requested_capabilities: &crate::capability::CapabilitySet,
     user_bound: &crate::capability::UserBound,
 ) -> bool {
+    // **Phase 66 confidence-followup F2 + F1+F2 review.** Build the
+    // v2 link-entry index ONCE before the per-package loop, scoped to
+    // this project's tree. Same rationale as `scriptable_package_rows`
+    // — install-time auto-build predicate checks every lockfile entry,
+    // and the global walk could otherwise return a sibling project's
+    // link entry under post-F1 same-coord coexistence. Falling back
+    // to an empty index on construction failure preserves the legacy
+    // silent-skip-of-v1-only semantic.
+    let baseline_index = V2BaselineIndex::for_project(project_dir, lpm_root).unwrap_or_default();
+
     let mut has_any_unbuilt = false;
 
     for (name, version, integrity) in packages {
-        // Phase 66 confidence-followup S5b — v2-aware lookup. Same
+        // Phase 66 confidence-followup S5b — v2-aware lookup, F2 —
+        // routed through the invocation-local index. Same
         // silent-skip semantics as the main loop; see
         // [`package_baseline_dir`] doc.
-        let pkg_dir = match package_baseline_dir(lpm_root, name, version) {
+        let pkg_dir = match package_baseline_dir_indexed(&baseline_index, lpm_root, name, version) {
             Some(p) => p,
             None => continue,
         };
@@ -2294,7 +2373,14 @@ mod tests {
         std::fs::create_dir_all(&live).unwrap();
         let store_fallback = std::path::PathBuf::from("/store/should-not-be-used");
 
-        let resolved = live_package_dir(project.path(), "esbuild", "0.21.5", None, &store_fallback);
+        let resolved = live_package_dir(
+            project.path(),
+            "esbuild",
+            "0.21.5",
+            None,
+            &store_fallback,
+            None,
+        );
         assert_eq!(resolved, live);
     }
 
@@ -2321,6 +2407,7 @@ mod tests {
             "0.21.5",
             None,
             &store_fallback,
+            None,
         );
         assert_eq!(resolved, live);
     }
@@ -2336,7 +2423,14 @@ mod tests {
         std::fs::create_dir_all(&live).unwrap();
         let store_fallback = std::path::PathBuf::from("/store/should-not-be-used");
 
-        let resolved = live_package_dir(project.path(), "esbuild", "0.21.5", None, &store_fallback);
+        let resolved = live_package_dir(
+            project.path(),
+            "esbuild",
+            "0.21.5",
+            None,
+            &store_fallback,
+            None,
+        );
         assert_eq!(resolved, live);
     }
 
@@ -2349,7 +2443,7 @@ mod tests {
         // users were already seeing rather than introducing a new "no
         // working directory" error class.
         //
-        // Phase 66 §4 — use `live_package_dir_with_v2(None)` so the v2
+        // Phase 66 §4 — use `live_package_dir_with_v2(None, None)` so the v2
         // store walk is fully disabled. The env-coupled
         // `live_package_dir` would otherwise probe the developer's
         // real `~/.lpm/store/v2/links/` and find a stale entry from
@@ -2365,6 +2459,7 @@ mod tests {
             "0.21.5",
             None,
             &store_fallback,
+            None,
             None,
         );
         assert_eq!(resolved, store_fallback);
@@ -2392,7 +2487,14 @@ mod tests {
         std::os::unix::fs::symlink(&link_entry, nm.join("express")).unwrap();
         let store_fallback = std::path::PathBuf::from("/store/should-not-be-used");
 
-        let resolved = live_package_dir(project.path(), "express", "4.21.0", None, &store_fallback);
+        let resolved = live_package_dir(
+            project.path(),
+            "express",
+            "4.21.0",
+            None,
+            &store_fallback,
+            None,
+        );
         // Returns the project-side symlink path; Node follows it at
         // script time.
         assert_eq!(resolved, nm.join("express"));
@@ -2454,6 +2556,7 @@ mod tests {
             None,
             &store_fallback,
             Some(&v2_store),
+            None,
         );
         assert_eq!(resolved, expected);
     }
@@ -2475,7 +2578,14 @@ mod tests {
         std::fs::create_dir_all(&hoisted).unwrap();
         let store_fallback = std::path::PathBuf::from("/store/should-not-be-used");
 
-        let resolved = live_package_dir(project.path(), "esbuild", "0.21.5", None, &store_fallback);
+        let resolved = live_package_dir(
+            project.path(),
+            "esbuild",
+            "0.21.5",
+            None,
+            &store_fallback,
+            None,
+        );
         assert_eq!(resolved, isolated);
     }
 
@@ -2509,6 +2619,7 @@ mod tests {
             None,
             &store_pkg,
             store_root.path(),
+            None,
         )
         .unwrap();
         assert_eq!(resolved, live);
@@ -2542,6 +2653,7 @@ mod tests {
             None,
             &store_pkg,
             store_root.path(),
+            None,
         )
         .unwrap_err();
         // The error message must mention "not linked into project" so
@@ -2602,6 +2714,7 @@ mod tests {
             None,
             &store_pkg,
             store_root.path(),
+            None,
         )
         .unwrap();
 
