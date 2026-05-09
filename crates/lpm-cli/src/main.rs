@@ -2085,6 +2085,20 @@ fn validate_global_uninstall_project_scoped_flags(
     Ok(())
 }
 
+/// Whether the trailing "update available" banner should be suppressed
+/// for this invocation.
+///
+/// Only one case suppresses: the user just ran `lpm self-update` AND it
+/// errored. Re-running self-update is exactly what the banner tells
+/// them to do, so emitting it after a self-update failure (cooldown,
+/// rate limit, transport error) sends the user back into the same loop
+/// they're already escaping. The suppression is per-invocation; the
+/// on-disk cache is unchanged, so any other command still surfaces
+/// the banner.
+fn should_suppress_update_banner(is_self_update_command: bool, command_errored: bool) -> bool {
+    is_self_update_command && command_errored
+}
+
 /// Phase 34.2: spawn a detached child process to refresh the update cache.
 ///
 /// The child re-execs the current binary with `internal-update-check`.
@@ -2383,6 +2397,15 @@ async fn async_main() -> Result<()> {
             }
         }
     }
+
+    // Capture whether the user invoked `lpm self-update` directly so the
+    // post-command "update available" banner (read from disk, printed
+    // unconditionally below) can be suppressed when the just-run command
+    // tells the user to "run lpm self-update" — they did, and the cooldown
+    // already explained why it didn't proceed. Suppressing here keeps the
+    // suppression scoped to this invocation only; the next command still
+    // sees the banner.
+    let is_self_update_command = matches!(command, Commands::SelfUpdate { .. });
 
     let result = match command {
         Commands::Info {
@@ -3891,8 +3914,19 @@ async fn async_main() -> Result<()> {
         }
     };
 
-    // Update check: show notice from previous check (instant, no network)
+    // Update check: show notice from previous check (instant, no network).
+    //
+    // Suppress the banner when the just-run command was `lpm self-update`
+    // and it errored. The banner exists to nudge users toward
+    // `lpm self-update`; printing "run lpm self-update" immediately after
+    // the command itself failed (cooldown, rate limit, transport error)
+    // sends the user back into the same loop and reads as a bug. The
+    // suppression is per-invocation only — the on-disk cache is
+    // untouched, so the next unrelated command still surfaces the
+    // banner.
+    let suppress_banner = should_suppress_update_banner(is_self_update_command, result.is_err());
     if !cli.json
+        && !suppress_banner
         && let Some(notice) = update_check::read_cached_notice()
     {
         eprint!("{notice}");
@@ -3959,6 +3993,33 @@ mod tests {
     // - `--verbose` long form survives.
     // - `-v` is NO LONGER the short for `--verbose` — it was reclaimed
     //   for `--version` to match npm/pnpm/yarn convention.
+
+    /// Banner suppression: the four-quadrant truth table.
+    ///
+    /// Suppress only when both conditions hold — self-update was the
+    /// command AND it errored. Any other combination must let the
+    /// banner through, otherwise a transient failure on an unrelated
+    /// command (e.g. `lpm install` with a network blip) would silently
+    /// swallow the user's "you're behind on releases" signal.
+    #[test]
+    fn should_suppress_update_banner_truth_table() {
+        assert!(
+            should_suppress_update_banner(true, true),
+            "self-update + Err → suppress"
+        );
+        assert!(
+            !should_suppress_update_banner(true, false),
+            "self-update + Ok → show banner (user just upgraded successfully — banner reflects newer cache)"
+        );
+        assert!(
+            !should_suppress_update_banner(false, true),
+            "other command + Err → show banner (unrelated failure must not eat the update notice)"
+        );
+        assert!(
+            !should_suppress_update_banner(false, false),
+            "other command + Ok → show banner (normal happy path)"
+        );
+    }
 
     #[test]
     fn capital_v_sets_version_flag_with_no_subcommand() {
