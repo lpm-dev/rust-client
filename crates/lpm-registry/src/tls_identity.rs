@@ -244,6 +244,22 @@ impl PassphraseCache {
     }
 }
 
+/// Output of [`load_identity`] — a built [`reqwest::Identity`] plus
+/// the cert chain PEM bytes used to build it.
+///
+/// The `cert_pem` field is exposed so callers can hash it for
+/// principal-aware cache fingerprinting (Phase 58.3 T3.5). Hashing
+/// here avoids re-reading the cert file on every cache-key
+/// composition. Private keys are deliberately NOT exposed —
+/// fingerprinting hashes the cert, not the key, since that's the
+/// public-facing identity and a key in a hash chain is one
+/// compromise away from a leak.
+#[derive(Debug)]
+pub struct LoadedIdentity {
+    pub identity: reqwest::Identity,
+    pub cert_pem: Vec<u8>,
+}
+
 /// Load a [`reqwest::Identity`] from a `(certfile, keyfile)` pair.
 ///
 /// Failure modes (all surfaced as [`LpmError::Cert`] citing the
@@ -262,7 +278,7 @@ pub fn load_identity(
     cert: &TaggedPath,
     key: &TaggedPath,
     passphrase: &dyn PassphraseProvider,
-) -> Result<reqwest::Identity, LpmError> {
+) -> Result<LoadedIdentity, LpmError> {
     // Phase 58.3 GPT pre-T3 finding — resolve relative paths against
     // the source `.npmrc`'s parent dir, NOT `${PWD}`. `TaggedPath::resolve`
     // returns the original path unchanged for absolute inputs and for
@@ -387,11 +403,15 @@ pub fn load_identity(
     }
     bundle.extend_from_slice(&cert_bytes);
 
-    reqwest::Identity::from_pem(&bundle).map_err(|e| {
+    let identity = reqwest::Identity::from_pem(&bundle).map_err(|e| {
         LpmError::Cert(format!(
             "{}:{} + {}:{}: failed to build TLS identity from cert+key: {e}",
             cert.source, cert.line, key.source, key.line
         ))
+    })?;
+    Ok(LoadedIdentity {
+        identity,
+        cert_pem: cert_bytes,
     })
 }
 
