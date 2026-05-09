@@ -33,7 +33,9 @@ LPM_TOP_NPM_PARALLEL=8 ./bench/top-npm-audit/run-all.sh
 
 1. **Generate** — `generate.sh` produces a `package.json` + `smoke.sh`
    per package under `bench/audit-fixtures/top-npm/<safe-name>/`.
-   Each smoke is `node -e "require('<pkg>')"`.
+   Each smoke tries `require('<pkg>')` first, then falls back to
+   `import('<pkg>')` only when the require failure looks genuinely
+   ESM-only.
 2. **Run** — `run-all.sh` invokes the existing
    `bench/audit-fixtures/run-audit.sh` for each generated fixture in
    parallel, with per-slot `LPM_HOME` so concurrent installs don't
@@ -43,9 +45,10 @@ LPM_TOP_NPM_PARALLEL=8 ./bench/top-npm-audit/run-all.sh
 ## Result interpretation
 
 - **PASS/PASS** — done.
-- **FAIL/FAIL** — symmetric. Likely upstream incompat (ESM-only
-  package can't be `require`d, native bin missing, etc.). Not a
-  hoisted regression. Filter by triaging `results/<name>-<mode>-*.json`.
+- **FAIL/FAIL** — symmetric. Likely bin-only package with no
+  programmatic entry point, native/tooling issue, or a real upstream
+  load failure. Not a hoisted regression. Filter by triaging
+  `results/<name>-<mode>-*.json`.
 - **PASS/FAIL or FAIL/PASS** — asymmetric. Real hoisted regression.
   Investigate immediately.
 
@@ -53,10 +56,13 @@ LPM_TOP_NPM_PARALLEL=8 ./bench/top-npm-audit/run-all.sh
 
 `top-100.txt` is hand-curated. Refresh quarterly from npm download
 stats (npms.io / npm-stat). Skip:
+
 - Packages requiring native toolchain (better-sqlite3, sharp) — those
   belong in the curated audit-fixtures bucket with a `requirements.sh`.
-- ESM-only packages that genuinely don't expose a CJS entry — they'll
-  fail symmetrically and clutter triage.
+
+ESM-only packages are now first-class citizens in this audit tier;
+bin-only packages with no programmatic entry point may still fail
+symmetrically and require manual triage.
 
 ## CI gating
 

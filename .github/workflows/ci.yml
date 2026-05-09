@@ -15,7 +15,7 @@ on:
   schedule:
     # Every Monday 09:00 UTC. Fires off-peak relative to the
     # weekday push-traffic peak so it doesn't compete with PR CI.
-    - cron: '0 9 * * 1'
+    - cron: "0 9 * * 1"
 
 # Cancel in-progress CI for the same branch (don't waste minutes)
 concurrency:
@@ -203,7 +203,7 @@ jobs:
       - name: Install Node 22
         uses: actions/setup-node@v4
         with:
-          node-version: '22'
+          node-version: "22"
 
       # The audit harness alternates lpm + bun on every fixture so each
       # mode sees the same network state. Bun ships prebuilt binaries
@@ -266,7 +266,7 @@ jobs:
       - name: Install Node 22
         uses: actions/setup-node@v4
         with:
-          node-version: '22'
+          node-version: "22"
 
       - name: Install jq
         run: sudo apt-get update && sudo apt-get install -y jq
@@ -295,9 +295,11 @@ jobs:
     timeout-minutes: 60
     # Phase 66 confidence-followup §1b — gated to workflow_dispatch +
     # weekly schedule. Generates ~100 single-dep fixtures and smokes
-    # `require()` for each under both modes. Asymmetric outcomes are
-    # the regression signal; symmetric failures are upstream incompat
-    # (ESM-only packages without CJS exports, etc.) and don't gate.
+    # each package's programmatic entrypoint under both modes
+    # (require-first, with import fallback only for genuine ESM-only
+    # surfaces). Asymmetric outcomes are the regression signal;
+    # symmetric failures are bin-only packages / upstream load issues
+    # and don't gate.
     if: github.event_name == 'workflow_dispatch' || github.event_name == 'schedule'
     steps:
       - uses: actions/checkout@v5
@@ -320,7 +322,7 @@ jobs:
       - name: Install Node 22
         uses: actions/setup-node@v4
         with:
-          node-version: '22'
+          node-version: "22"
 
       - name: Install jq
         run: sudo apt-get update && sudo apt-get install -y jq
