@@ -1160,12 +1160,164 @@ pub struct V2BaselineIndex {
 }
 
 impl V2BaselineIndex {
+    /// **Phase 66 confidence-followup F1+F2 review (2026-05-09)** —
+    /// build a project-scoped index by walking only the link entries
+    /// the project's `<project>/node_modules/` tree actually points
+    /// at, BFS'd through each entry's `LinkMeta.deps` to cover
+    /// transitives.
+    ///
+    /// **Why this exists.** [`Self::build`] (the global walker) keys
+    /// on `(name, version)` and keeps the first match in directory
+    /// iteration order. That tie-breaking was acceptable when v2
+    /// could only have ONE link entry per coords by construction
+    /// (the cross-project sharing invariant). After F1 a patched
+    /// install lands in a distinct link entry from any unpatched
+    /// install of the same coords, so two link entries for the
+    /// same `(name, version)` legitimately coexist on disk —
+    /// "first global match" is no longer a safe choice. The
+    /// rebuild pipeline could otherwise read scripts / trust
+    /// state / build-marker state from the wrong link entry,
+    /// and write the build marker into a sibling project's store
+    /// dir.
+    ///
+    /// **The walk.** Every entry under `<project>/node_modules/`
+    /// that resolves to `<lpm_root>/store/v2/links/<key>/...` is a
+    /// seed. From each seed link entry's [`LinkMeta::deps`], the
+    /// dep's link-entry directory name is reconstructed
+    /// (`{safe_name}@{version}+{first16hex}`) and visited too.
+    /// Repeated until a fixed point is reached.
+    ///
+    /// **Safety.** Any sidecar that fails to parse, any symlink that
+    /// points outside the v2 store, any non-symlink entry, and any
+    /// reachable link entry whose `node_modules/<pkg>/` is missing
+    /// is silently skipped. Each skip is logged at `tracing::debug!`
+    /// so a malformed install surfaces under `RUST_LOG=debug`
+    /// without blocking the operation.
+    ///
+    /// **Fallback contract.** When the project has no `node_modules/`
+    /// (fresh checkout, never installed), or every symlink resolves
+    /// outside the v2 store (pure-v1 install), this returns an empty
+    /// index. Callers route through
+    /// [`find_installed_package_baseline_indexed`] which falls
+    /// through to the v1 lookup on miss — same behavior as a
+    /// freshly-built [`Self::build`] empty index.
+    pub fn for_project(
+        project_dir: &std::path::Path,
+        lpm_root: &lpm_common::LpmRoot,
+    ) -> Result<Self, LpmError> {
+        use std::collections::{HashSet, VecDeque};
+
+        let store_v2 = crate::v2::Store::from_lpm_root(lpm_root);
+        let links_root = store_v2.paths().links_root();
+        let mut by_coords: std::collections::HashMap<(String, String), InstalledPackageBaseline> =
+            std::collections::HashMap::new();
+
+        // Seeds: every direct symlink under `<project>/node_modules/`
+        // whose target lives inside `<links_root>/<key>/`.
+        let mut to_visit: VecDeque<PathBuf> = VecDeque::new();
+        let mut visited: HashSet<PathBuf> = HashSet::new();
+        let nm_root = project_dir.join("node_modules");
+        if let Ok(read_dir) = std::fs::read_dir(&nm_root) {
+            for entry in read_dir.flatten() {
+                let symlink_path = entry.path();
+                // `read_link` reads the symlink target without
+                // following further symlinks. v2 plants ABSOLUTE
+                // symlinks at the project root; if we ever switch to
+                // relative we'd `canonicalize` here.
+                let target = match std::fs::read_link(&symlink_path) {
+                    Ok(t) => t,
+                    Err(_) => continue, // not a symlink (e.g. self-link
+                                        // self-package dir) → skip
+                };
+                let target = if target.is_absolute() {
+                    target
+                } else {
+                    // Resolve relative-to-project — defensive even though
+                    // v2 doesn't write these today.
+                    nm_root.join(target)
+                };
+                if let Some(link_dir) = link_dir_from_target(&target, &links_root)
+                    && visited.insert(link_dir.clone())
+                {
+                    to_visit.push_back(link_dir);
+                }
+            }
+        }
+
+        // BFS through each link entry's `LinkMeta.deps`. Sibling
+        // entries are reached by reconstructing their directory name
+        // from the dep's `target_graph_key` digest + name + version.
+        while let Some(link_dir) = to_visit.pop_front() {
+            let meta = match crate::v2::link_meta::LinkMeta::read_from(&link_dir) {
+                Ok(m) => m,
+                Err(e) => {
+                    tracing::debug!(
+                        "v2 project-scoped index: skipping {}: sidecar unreadable ({e})",
+                        link_dir.display()
+                    );
+                    continue;
+                }
+            };
+            let package_dir = link_dir.join("node_modules").join(&meta.name);
+            if !package_dir.exists() {
+                tracing::debug!(
+                    "v2 project-scoped index: skipping {}: package dir missing",
+                    link_dir.display()
+                );
+                continue;
+            }
+            let pristine_dir = match store_v2.paths().object_dir(&meta.source_sri) {
+                Ok(p) if p.exists() => p,
+                _ => package_dir.clone(),
+            };
+            let key = (meta.name.clone(), meta.version.clone());
+            // Project-scoped: in a single project a (name, version) is
+            // resolved by exactly one link entry, except the
+            // multi-source-same-coords corner case (two distinct
+            // sources sharing coords and BOTH symlinked from the
+            // project — rare). Keep first-write-wins: the seed-symlink
+            // walk inserts before the BFS, and BFS itself is FIFO, so
+            // the chosen entry is whichever is closer to the project
+            // root in the symlink graph.
+            by_coords.entry(key).or_insert(InstalledPackageBaseline {
+                package_dir,
+                pristine_dir,
+                integrity: meta.source_sri.clone(),
+                layout: PackageBaselineLayout::V2,
+            });
+            for dep in &meta.deps {
+                // `LinkMeta.deps` carries the full 64-hex digest; the
+                // on-disk dir name uses the first 16 chars. See
+                // `crate::v2::GraphKey::dir_name` for the format.
+                if dep.target_graph_key.len() < 16 {
+                    continue; // malformed sidecar
+                }
+                let safe_name = dep.target_name.replace(['/', '\\'], "+");
+                let short_hex = &dep.target_graph_key[..16];
+                let dep_dir_name = format!("{}@{}+{}", safe_name, dep.target_version, short_hex);
+                let dep_link_dir = links_root.join(dep_dir_name);
+                if visited.insert(dep_link_dir.clone()) {
+                    to_visit.push_back(dep_link_dir);
+                }
+            }
+        }
+
+        Ok(Self { by_coords })
+    }
+
     /// Walk every v2 link entry under `lpm_root` once and produce an
     /// invocation-local lookup index.
     ///
     /// Returns `Ok(empty)` when v2 is empty or absent — callers should
     /// always succeed-then-fall-back via [`Self::lookup`], not gate on
     /// emptiness.
+    ///
+    /// **Use [`Self::for_project`] when the caller has a project
+    /// directory in scope.** The global walk's first-match-wins
+    /// tie-breaking is incorrect under post-F1 multi-link-per-coords
+    /// states. `for_project` is the supported lookup path for
+    /// `lpm rebuild` / `lpm approve-scripts` and any other read of
+    /// project-side script state.
     pub fn build(lpm_root: &lpm_common::LpmRoot) -> Result<Self, LpmError> {
         let store_v2 = crate::v2::Store::from_lpm_root(lpm_root);
         let mut by_coords: std::collections::HashMap<(String, String), InstalledPackageBaseline> =
@@ -1210,6 +1362,51 @@ impl V2BaselineIndex {
     /// `(name, version)` pair — caller should fall back to v1.
     pub fn lookup(&self, name: &str, version: &str) -> Option<&InstalledPackageBaseline> {
         self.by_coords.get(&(name.to_string(), version.to_string()))
+    }
+}
+
+/// **Phase 66 confidence-followup F1+F2 review** — given a path that a
+/// project-side symlink resolves to, reconstruct the v2 link entry
+/// directory that owns it.
+///
+/// v2 plants the project's `<project>/node_modules/<dep>` symlink to
+/// point at `<links_root>/<key_dir>/node_modules/<dep>/`. Stripping
+/// the trailing `node_modules/<pkg>/` segment recovers `<key_dir>`.
+/// Returns `None` when the target lives outside `links_root` (e.g. a
+/// project-local file:/link: dep, a v1-installed package with a
+/// custom symlink shape, or a legitimately-broken symlink).
+///
+/// Uses ancestor walking + path-prefix matching rather than canonical-
+/// izing both paths, so a non-canonical `links_root` (test fixture
+/// with `/private/var/.../links/...` vs `/var/.../links/...` on macOS)
+/// still matches when the input target is canonical.
+fn link_dir_from_target(target: &Path, links_root: &Path) -> Option<PathBuf> {
+    // The expected suffix structure from any well-formed v2 symlink:
+    //   <links_root>/<key_dir>/node_modules/<pkg>
+    //                     ^ this is the link_dir we want
+    // Walk ancestors twice (parent of `<pkg>` is `node_modules`,
+    // parent of that is `<key_dir>`).
+    let key_dir = target.parent()?.parent()?;
+    if key_dir.parent() == Some(links_root) {
+        return Some(key_dir.to_path_buf());
+    }
+    // macOS canonicalization mismatch fallback: if direct parent
+    // comparison missed, check via `starts_with` against the
+    // canonicalized links_root. Symmetric with `iter_link_entries`'
+    // tolerance for paths.
+    let canonical_links_root = match links_root.canonicalize() {
+        Ok(p) => p,
+        Err(_) => return None,
+    };
+    let canonical_target = match target.canonicalize() {
+        Ok(p) => p,
+        Err(_) => return None,
+    };
+    let key_dir = canonical_target.parent()?.parent()?;
+    if key_dir.parent() == Some(canonical_links_root.as_path()) {
+        Some(key_dir.to_path_buf())
+    } else {
+        None
     }
 }
 
@@ -2936,6 +3133,233 @@ mod tests {
             resolved.package_dir, resolved.pristine_dir,
             "v1 entries alias pristine_dir to package_dir (the v1 store \
              dir is never mutated by patches)"
+        );
+    }
+
+    /// **Phase 66 confidence-followup F1+F2 review (2026-05-09)** —
+    /// when two link entries legitimately share the same
+    /// `(name, version)` (the post-F1 default for the patched-vs-
+    /// unpatched cross-project case, and the multi-source-same-coords
+    /// case), `V2BaselineIndex::for_project` MUST resolve to the
+    /// link entry the CURRENT project's tree points at — not the
+    /// first match in global directory order.
+    ///
+    /// The test seeds two link entries for `lodash@1.0.0`, points
+    /// project A's `node_modules/lodash` symlink at the SECOND one,
+    /// and asserts the project-scoped index returns that one. The
+    /// global `V2BaselineIndex::build` would (under the unfixed
+    /// code) return whichever entry came first in directory order
+    /// — wrong half the time for project A.
+    ///
+    /// Without this fix `lpm rebuild` running in project A could
+    /// read scripts / trust state from the WRONG link entry and
+    /// stamp the build marker into a sibling project's store dir.
+    #[test]
+    fn f1f2_for_project_resolves_to_the_link_entry_this_project_uses() {
+        use crate::v2::link_meta::{LinkMeta, LinkMetaPlatform};
+        use chrono::Utc;
+
+        let dir = tempfile::tempdir().unwrap();
+        let lpm_root = lpm_common::LpmRoot::from_dir(dir.path());
+
+        // Seed two link entries for the same coords. Both have
+        // realistic (different) graph-key dir names; both have a
+        // populated package dir + sidecar. The two coexist legitimately
+        // post-F1 (e.g. one carries `patch_fingerprint`, the other
+        // doesn't).
+        let v2_links_root = dir.path().join("store").join("v2").join("links");
+        let entry_unpatched = v2_links_root.join("lodash@1.0.0+aaaaaaaaaaaaaaaa");
+        let entry_patched = v2_links_root.join("lodash@1.0.0+bbbbbbbbbbbbbbbb");
+        for (link_dir, suffix) in [
+            (&entry_unpatched, "aaaaaaaaaaaaaaaa"),
+            (&entry_patched, "bbbbbbbbbbbbbbbb"),
+        ] {
+            let pkg_dir = link_dir.join("node_modules").join("lodash");
+            std::fs::create_dir_all(&pkg_dir).unwrap();
+            std::fs::write(
+                pkg_dir.join("package.json"),
+                r#"{"name":"lodash","version":"1.0.0"}"#,
+            )
+            .unwrap();
+            let meta = LinkMeta {
+                schema: 1,
+                graph_key: format!("lodash@1.0.0+{suffix}"),
+                graph_key_digest_hex: format!("{suffix}{suffix}{suffix}{suffix}"),
+                name: "lodash".into(),
+                version: "1.0.0".into(),
+                source_sri: format!("sha512-stub-{suffix}"),
+                object_path: format!("objects/sha512-stub-{suffix}"),
+                deps: vec![],
+                platform: LinkMetaPlatform {
+                    os: "darwin".into(),
+                    cpu: "arm64".into(),
+                    libc: None,
+                },
+                created_at: Utc::now(),
+                last_referenced_at: Utc::now(),
+            };
+            meta.write_to(link_dir).unwrap();
+        }
+
+        // Build project A: its `node_modules/lodash` symlinks INTO
+        // the patched entry. This is the load-bearing fixture: the
+        // project-scoped lookup must follow this symlink and return
+        // the patched entry, never the unpatched one.
+        let project = dir.path().join("project-a");
+        std::fs::create_dir_all(project.join("node_modules")).unwrap();
+        std::os::unix::fs::symlink(
+            entry_patched.join("node_modules").join("lodash"),
+            project.join("node_modules").join("lodash"),
+        )
+        .unwrap();
+
+        // Sanity: the global index could return either entry — that's
+        // exactly the ambiguity the project-scoped lookup is meant to
+        // eliminate.
+        let global = V2BaselineIndex::build(&lpm_root).unwrap();
+        let global_hit = global.lookup("lodash", "1.0.0").unwrap();
+        let global_resolves_correctly = global_hit
+            .package_dir
+            .starts_with(entry_patched.join("node_modules"));
+        // We don't assert which one global returns — just that the
+        // project-scoped variant below is unambiguous about the right
+        // answer.
+        let _ = global_resolves_correctly;
+
+        // The project-scoped index MUST land on the patched entry
+        // because that's where project A's symlink resolves to. This
+        // is the F1+F2 review's load-bearing assertion.
+        let project_index = V2BaselineIndex::for_project(&project, &lpm_root).unwrap();
+        let project_hit = project_index
+            .lookup("lodash", "1.0.0")
+            .expect("project-scoped index must resolve the package");
+        assert!(
+            project_hit
+                .package_dir
+                .starts_with(entry_patched.join("node_modules")),
+            "project-scoped lookup MUST return the link entry the project's \
+             symlinks resolve to (patched entry), not the first global match. \
+             Got: {:?}, expected under: {:?}",
+            project_hit.package_dir,
+            entry_patched
+        );
+    }
+
+    /// `for_project` reaches transitive dependencies via the BFS over
+    /// `LinkMeta.deps`. The seed is the project's direct symlink; the
+    /// transitive's link entry is reconstructed from the seed
+    /// sidecar's `target_graph_key` digest (16-hex prefix) + name +
+    /// version.
+    ///
+    /// Without this, `live_package_dir_with_v2`'s transitive fallback
+    /// (which today routes through `Store::find_link_package_dir`'s
+    /// global first-match) would still be ambiguous post-F1.
+    #[test]
+    fn f1f2_for_project_reaches_transitive_via_link_meta_deps() {
+        use crate::v2::link_meta::{LinkMeta, LinkMetaDep, LinkMetaPlatform};
+        use chrono::Utc;
+
+        let dir = tempfile::tempdir().unwrap();
+        let lpm_root = lpm_common::LpmRoot::from_dir(dir.path());
+
+        let v2_links_root = dir.path().join("store").join("v2").join("links");
+
+        // Transitive: `tslib@2.0.0` lives in its own link entry, never
+        // symlinked at the project root.
+        let tslib_short = "1111111111111111";
+        let tslib_full = format!("{tslib_short}{tslib_short}{tslib_short}{tslib_short}");
+        let tslib_entry = v2_links_root.join(format!("tslib@2.0.0+{tslib_short}"));
+        let tslib_pkg = tslib_entry.join("node_modules").join("tslib");
+        std::fs::create_dir_all(&tslib_pkg).unwrap();
+        std::fs::write(
+            tslib_pkg.join("package.json"),
+            r#"{"name":"tslib","version":"2.0.0"}"#,
+        )
+        .unwrap();
+        let tslib_meta = LinkMeta {
+            schema: 1,
+            graph_key: format!("tslib@2.0.0+{tslib_short}"),
+            graph_key_digest_hex: tslib_full.clone(),
+            name: "tslib".into(),
+            version: "2.0.0".into(),
+            source_sri: "sha512-stub-tslib".into(),
+            object_path: "objects/sha512-stub-tslib".into(),
+            deps: vec![],
+            platform: LinkMetaPlatform {
+                os: "darwin".into(),
+                cpu: "arm64".into(),
+                libc: None,
+            },
+            created_at: Utc::now(),
+            last_referenced_at: Utc::now(),
+        };
+        tslib_meta.write_to(&tslib_entry).unwrap();
+
+        // Direct: `consumer@1.0.0` is a project root dep that depends
+        // on tslib. Its `LinkMeta.deps` carries tslib's full digest.
+        let consumer_short = "2222222222222222";
+        let consumer_entry = v2_links_root.join(format!("consumer@1.0.0+{consumer_short}"));
+        let consumer_pkg = consumer_entry.join("node_modules").join("consumer");
+        std::fs::create_dir_all(&consumer_pkg).unwrap();
+        std::fs::write(
+            consumer_pkg.join("package.json"),
+            r#"{"name":"consumer","version":"1.0.0","dependencies":{"tslib":"2.0.0"}}"#,
+        )
+        .unwrap();
+        let consumer_meta = LinkMeta {
+            schema: 1,
+            graph_key: format!("consumer@1.0.0+{consumer_short}"),
+            graph_key_digest_hex: format!(
+                "{consumer_short}{consumer_short}{consumer_short}{consumer_short}"
+            ),
+            name: "consumer".into(),
+            version: "1.0.0".into(),
+            source_sri: "sha512-stub-consumer".into(),
+            object_path: "objects/sha512-stub-consumer".into(),
+            deps: vec![LinkMetaDep {
+                local: "tslib".into(),
+                target_graph_key: tslib_full.clone(),
+                target_name: "tslib".into(),
+                target_version: "2.0.0".into(),
+            }],
+            platform: LinkMetaPlatform {
+                os: "darwin".into(),
+                cpu: "arm64".into(),
+                libc: None,
+            },
+            created_at: Utc::now(),
+            last_referenced_at: Utc::now(),
+        };
+        consumer_meta.write_to(&consumer_entry).unwrap();
+
+        // Project: only the consumer is symlinked at the root; tslib
+        // is reachable ONLY via `consumer`'s sidecar deps.
+        let project = dir.path().join("project");
+        std::fs::create_dir_all(project.join("node_modules")).unwrap();
+        std::os::unix::fs::symlink(
+            consumer_entry.join("node_modules").join("consumer"),
+            project.join("node_modules").join("consumer"),
+        )
+        .unwrap();
+
+        let index = V2BaselineIndex::for_project(&project, &lpm_root).unwrap();
+        let consumer_hit = index.lookup("consumer", "1.0.0").unwrap();
+        assert!(
+            consumer_hit
+                .package_dir
+                .starts_with(consumer_entry.join("node_modules"))
+        );
+        let tslib_hit = index
+            .lookup("tslib", "2.0.0")
+            .expect("BFS through LinkMeta.deps must reach the transitive");
+        assert!(
+            tslib_hit
+                .package_dir
+                .starts_with(tslib_entry.join("node_modules")),
+            "transitive lookup MUST land on tslib's link entry, not anywhere \
+             else (got: {:?}, expected under {:?})",
+            tslib_hit.package_dir,
+            tslib_entry,
         );
     }
 

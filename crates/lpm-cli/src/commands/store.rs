@@ -59,21 +59,35 @@ pub async fn run(
     }
 }
 
-/// Blunt store wipe — removes `~/.lpm/store/v1/` in its entirety.
+/// Blunt store wipe — removes `~/.lpm/store/v1/` AND
+/// `~/.lpm/store/v2/` in their entirety.
 ///
-/// This is the phase-37 counterpart to the old `lpm cache clean` behavior:
-/// an explicit, scoped, named command for the rare "nuke everything"
-/// workflow. For everyday maintenance use `lpm store gc`, which is
-/// reference-aware and won't evict packages currently referenced by a
-/// project lockfile.
+/// This is the phase-37 counterpart to the old `lpm cache clean`
+/// behavior: an explicit, scoped, named command for the rare "nuke
+/// everything" workflow. For everyday maintenance use
+/// `lpm store gc`, which is reference-aware and won't evict packages
+/// currently referenced by a project lockfile.
 ///
-/// The v1 subdirectory is the unit of removal so the outer `store/` dir
-/// (which may contain `.gc.lock` and — post-M3 — other control files)
-/// remains intact.
+/// **Phase 66 confidence-followup F1+F2 review (2026-05-09).**
+/// Pre-fix this only wiped `v1/`, leaving `v2/links/` and
+/// `v2/objects/` intact. Under the v2-default install path that
+/// shipped in Phase 4b, that meant `lpm store clean` was a silent
+/// near-no-op for users running the default — the tarball CAS, link
+/// entries, and patched-bytes link variants survived. The verify
+/// command now speaks in merged v1+v2 terms (F4); `clean` mirrors
+/// that surface so the human-output line "Wiped package store" is
+/// truthful again.
+///
+/// The two version subdirectories are the unit of removal so the
+/// outer `store/` dir (`.gc.lock`, other control files) stays intact.
 fn run_clean(root: &LpmRoot, json_output: bool) -> Result<(), LpmError> {
     let v1 = root.store_v1();
+    let v2 = root.store_root().join("v2");
 
-    if !v1.exists() {
+    let v1_existed = v1.exists();
+    let v2_existed = v2.exists();
+
+    if !v1_existed && !v2_existed {
         if json_output {
             println!(
                 "{}",
@@ -81,7 +95,10 @@ fn run_clean(root: &LpmRoot, json_output: bool) -> Result<(), LpmError> {
                     "success": true,
                     "removed_bytes": 0,
                     "removed": format_bytes(0),
-                    "path": v1.display().to_string(),
+                    "v1_path": v1.display().to_string(),
+                    "v2_path": v2.display().to_string(),
+                    "v1_removed_bytes": 0,
+                    "v2_removed_bytes": 0,
                 }))
                 .unwrap()
             );
@@ -91,8 +108,25 @@ fn run_clean(root: &LpmRoot, json_output: bool) -> Result<(), LpmError> {
         return Ok(());
     }
 
-    let bytes_before = crate::commands::cache::dir_size(&v1).unwrap_or(0);
-    std::fs::remove_dir_all(&v1)?;
+    let v1_bytes = if v1_existed {
+        crate::commands::cache::dir_size(&v1).unwrap_or(0)
+    } else {
+        0
+    };
+    let v2_bytes = if v2_existed {
+        crate::commands::cache::dir_size(&v2).unwrap_or(0)
+    } else {
+        0
+    };
+
+    if v1_existed {
+        std::fs::remove_dir_all(&v1)?;
+    }
+    if v2_existed {
+        std::fs::remove_dir_all(&v2)?;
+    }
+
+    let bytes_before = v1_bytes + v2_bytes;
 
     if json_output {
         println!(
@@ -101,7 +135,10 @@ fn run_clean(root: &LpmRoot, json_output: bool) -> Result<(), LpmError> {
                 "success": true,
                 "removed_bytes": bytes_before,
                 "removed": format_bytes(bytes_before),
-                "path": v1.display().to_string(),
+                "v1_path": v1.display().to_string(),
+                "v2_path": v2.display().to_string(),
+                "v1_removed_bytes": v1_bytes,
+                "v2_removed_bytes": v2_bytes,
             }))
             .unwrap()
         );
@@ -1515,6 +1552,70 @@ mod tests {
         assert_eq!(
             duplicated, 3,
             "1 dup of lodash + 2 extra typescript copies = 3 duplicated entries"
+        );
+    }
+
+    /// **Phase 66 confidence-followup F1+F2 review (2026-05-09)** —
+    /// `lpm store clean` MUST wipe BOTH `v1/` and `v2/`. Pre-fix it
+    /// was a v1-only wipe; under the v2-default install path that
+    /// meant the tarball CAS, link entries, and patched-bytes link
+    /// variants all survived a "clean" — silently misleading the
+    /// user looking at an in-flight migration.
+    #[test]
+    fn f3_review_run_clean_wipes_both_v1_and_v2() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = LpmRoot::from_dir(dir.path());
+
+        // Seed both store generations with byte content.
+        let v1 = root.store_v1();
+        std::fs::create_dir_all(&v1).unwrap();
+        std::fs::write(v1.join("v1-seed.bin"), b"v1-data").unwrap();
+
+        let v2 = root.store_root().join("v2");
+        std::fs::create_dir_all(&v2).unwrap();
+        std::fs::write(v2.join("v2-seed.bin"), b"v2-data").unwrap();
+
+        // Sanity — both exist before run_clean.
+        assert!(v1.exists() && v2.exists());
+
+        run_clean(&root, true).unwrap();
+
+        assert!(!v1.exists(), "v1 store directory must be wiped");
+        assert!(
+            !v2.exists(),
+            "v2 store directory MUST be wiped — pre-fix this was the silent gap"
+        );
+    }
+
+    /// Empty-store branch handles the case where neither generation
+    /// has any state on disk (fresh install, or a prior `clean` was
+    /// already run). Must succeed silently.
+    #[test]
+    fn f3_review_run_clean_empty_store_is_a_silent_noop() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = LpmRoot::from_dir(dir.path());
+        // Neither v1 nor v2 dir exists; `run_clean` must not error.
+        run_clean(&root, true).expect("empty store must not error");
+    }
+
+    /// Mixed: only v2 exists (the post-Phase-4b default install
+    /// state). The v1-only `if !v1.exists()` early-return pre-fix
+    /// would have hit the empty-store branch and printed "already
+    /// empty" while leaving v2 intact. Post-fix: v2 gets wiped.
+    #[test]
+    fn f3_review_run_clean_wipes_v2_when_v1_is_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = LpmRoot::from_dir(dir.path());
+        let v2 = root.store_root().join("v2");
+        std::fs::create_dir_all(&v2).unwrap();
+        std::fs::write(v2.join("seed.bin"), b"v2-data").unwrap();
+        assert!(v2.exists());
+
+        run_clean(&root, true).unwrap();
+        assert!(
+            !v2.exists(),
+            "v2 must be wiped even when v1 is absent — pre-fix this was the \
+             silent-no-op case for the default v2 install path"
         );
     }
 
