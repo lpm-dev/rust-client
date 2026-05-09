@@ -20,6 +20,7 @@ pub use npmrc::{
 };
 pub use route::{NpmrcLoadErrors, RouteMode, RouteTable, UpstreamRoute};
 pub use tls_identity::{
-    EnvThenTtyPassphrase, KEY_PASSPHRASE_ENV, PassphraseCache, PassphraseProvider, load_identity,
+    EnvThenTtyPassphrase, KEY_PASSPHRASE_ENV, LoadedIdentity, PassphraseCache, PassphraseProvider,
+    load_identity,
 };
 pub use types::*;

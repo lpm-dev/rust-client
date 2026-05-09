@@ -169,37 +169,73 @@ fn apply_npmrc_auth(
     Ok(req)
 }
 
-/// Compute a stable opaque fingerprint for a `RegistryAuth` credential,
-/// for inclusion in cache keys (Phase 58 day-3.5 review fix).
+/// Compute a stable opaque fingerprint for a `RegistryAuth` credential
+/// PLUS the TLS client identity's cert PEM (Phase 58 day-3.5 + Phase
+/// 58.3 T3.5).
 ///
-/// `None` → `"anon"` (canonical no-auth namespace).
-/// `Some(_)` → `"auth-<16hex>"`, where `<16hex>` is the first 16 hex
-/// chars of `SHA-256(variant_tag || credential_bytes)`. The variant
-/// tag (`b:` for Bearer, `a:` for Basic) prevents a token used as both
-/// `_authToken` and `_auth` from collapsing to the same fingerprint.
+/// **Combinatorics:** the cache namespace is `(auth, identity)`-pair
+/// scoped, not auth-only. Same URL + same auth + DIFFERENT identity
+/// (e.g., user re-issued their client cert) → different cache
+/// namespace. Without this, a private registry that varies content
+/// per client identity could leak data across principals on the same
+/// machine.
 ///
-/// **Why a hash and not the raw secret:** the cache key string flows
-/// through `tracing::debug!` calls and may end up in stack traces /
-/// panic messages. A pre-image-resistant SHA-256 truncation reveals
-/// nothing about the token, while still being deterministic enough for
-/// warm-hit reuse across calls with the same credential.
-fn auth_fingerprint(auth: Option<&crate::npmrc::RegistryAuth>) -> String {
+/// **Output shape:**
+/// - Auth `None` + identity `None` → `"anon"` (canonical empty).
+/// - Anything else → `"principal-<16hex>"`, where `<16hex>` is the
+///   first 16 hex chars of `SHA-256(tagged_inputs)`. Variant tags
+///   (`b:` Bearer, `a:` Basic, `i:` Identity) prevent shape
+///   collisions across input kinds.
+///
+/// **Why hashes, not raw secrets:** the cache key flows through
+/// `tracing::debug!` calls and may surface in stack traces / panic
+/// messages. SHA-256 truncation reveals nothing about the credential
+/// or cert while staying deterministic enough for warm-hit reuse
+/// across calls with the same principal.
+fn principal_fingerprint(
+    auth: Option<&crate::npmrc::RegistryAuth>,
+    identity_fp: Option<&str>,
+) -> String {
     use secrecy::ExposeSecret;
     use sha2::{Digest, Sha256};
     let mut hasher = Sha256::new();
+    let mut tagged = false;
     match auth {
-        None => return "anon".to_string(),
+        None => {}
         Some(crate::npmrc::RegistryAuth::Bearer { token, .. }) => {
             hasher.update(b"b:");
             hasher.update(token.expose_secret().as_bytes());
+            tagged = true;
         }
         Some(crate::npmrc::RegistryAuth::Basic { credential, .. }) => {
             hasher.update(b"a:");
             hasher.update(credential.expose_secret().as_bytes());
+            tagged = true;
         }
     }
+    if let Some(fp) = identity_fp {
+        hasher.update(b"i:");
+        hasher.update(fp.as_bytes());
+        tagged = true;
+    }
+    if !tagged {
+        return "anon".to_string();
+    }
     let hash = format!("{:x}", hasher.finalize());
-    format!("auth-{}", &hash[..16])
+    format!("principal-{}", &hash[..16])
+}
+
+/// SHA-256 truncated fingerprint of a cert PEM blob — used as the
+/// `identity_fp` input to [`principal_fingerprint`]. Hashing happens
+/// once at client-build time; the resulting `Arc<str>` rides along
+/// the cached client and feeds every cache-key composition for
+/// requests that route to it.
+fn cert_pem_fingerprint(pem: &[u8]) -> Arc<str> {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(pem);
+    let hash = format!("{:x}", hasher.finalize());
+    Arc::from(&hash[..16])
 }
 
 /// Maximum compressed tarball size (500 MB). Enforced during download to prevent
@@ -289,6 +325,21 @@ pub struct RegistryClient {
 // Phase 58.3 — Per-origin HTTP client cache
 // ============================================================================
 
+/// A cached HTTP client paired with an opaque fingerprint of the
+/// TLS identity it was built with (Phase 58.3 T3.5).
+///
+/// `identity_fp` is `Some(<16-hex>)` when the client uses a client
+/// certificate (per-origin or global) and `None` for clients with no
+/// mTLS identity. The fingerprint feeds the metadata cache key via
+/// [`principal_fingerprint`] so a re-issued or rotated client cert
+/// invalidates the cache cleanly — same URL + same auth + new
+/// identity = different cache namespace.
+#[derive(Clone)]
+struct CachedClient {
+    client: reqwest::Client,
+    identity_fp: Option<Arc<str>>,
+}
+
 /// Bundle of HTTP clients keyed by origin. One [`RegistryClient`] holds
 /// one of these via `Arc<>` so the per-origin clients survive
 /// `clone_with_config` and ride along every request the
@@ -314,9 +365,9 @@ pub struct RegistryClient {
 /// explicit port covers any port for that host. Mirrors
 /// [`OriginKey`]'s scheme-agnostic auth lookup.
 pub struct HttpClients {
-    default: reqwest::Client,
-    eager: HashMap<OriginKey, reqwest::Client>,
-    lazy: tokio::sync::Mutex<HashMap<OriginKey, reqwest::Client>>,
+    default: CachedClient,
+    eager: HashMap<OriginKey, CachedClient>,
+    lazy: tokio::sync::Mutex<HashMap<OriginKey, CachedClient>>,
     /// Snapshot of the TLS overrides used to build `default` and
     /// `eager`. Held here so lazy builds can construct matching
     /// per-origin clients on demand.
@@ -387,7 +438,10 @@ impl HttpClients {
     /// before any `.npmrc` is loaded.
     fn from_default_client(default: reqwest::Client) -> Arc<Self> {
         Arc::new(Self {
-            default,
+            default: CachedClient {
+                client: default,
+                identity_fp: None,
+            },
             eager: HashMap::new(),
             lazy: tokio::sync::Mutex::new(HashMap::new()),
             tls_overrides: Arc::new(TlsOverrides::default()),
@@ -395,10 +449,10 @@ impl HttpClients {
         })
     }
 
-    /// Look up a client for `url` without lazy-building. Returns the
-    /// eager-built per-origin client if one exists, else the default.
-    /// Sync, infallible — suitable for hot paths.
-    pub fn for_url_no_build(&self, url: &str) -> &reqwest::Client {
+    /// Look up a cached client for `url` without lazy-building.
+    /// Returns the eager-built per-origin entry if one exists, else
+    /// the default. Sync, infallible — suitable for hot paths.
+    fn cached_for_url_no_build(&self, url: &str) -> &CachedClient {
         let Some(origin) = OriginKey::from_request_url(url) else {
             return &self.default;
         };
@@ -413,6 +467,35 @@ impl HttpClients {
             return c;
         }
         &self.default
+    }
+
+    /// Public-API variant returning the underlying `reqwest::Client`.
+    /// Kept for callers that don't care about the cached fingerprint
+    /// (the retry executors, request-builder helpers, tests).
+    pub fn for_url_no_build(&self, url: &str) -> &reqwest::Client {
+        &self.cached_for_url_no_build(url).client
+    }
+
+    /// Phase 58.3 T3.5 — identity fingerprint for the client that
+    /// would handle a request to `url` based on the eager map.
+    ///
+    /// Used by metadata cache-key composition: the fingerprint is
+    /// included in the namespace so a re-issued client cert
+    /// invalidates cached entries cleanly. Falls through to the
+    /// default client's fingerprint when no per-origin entry matches
+    /// — meaning a default client carrying a global mTLS identity
+    /// still partitions its cache by that identity.
+    ///
+    /// Sync — only consults the eager map; lazy builds happen on the
+    /// async `for_url` path. For URLs that would lazy-build, this
+    /// returns the default client's fingerprint (which is correct
+    /// for the eager-or-default routing today; lazy entries don't
+    /// typically share metadata cache keys with the default since
+    /// per-origin clients are URL-host-partitioned anyway).
+    pub fn identity_fp_for_url(&self, url: &str) -> Option<&str> {
+        self.cached_for_url_no_build(url)
+            .identity_fp
+            .as_deref()
     }
 
     /// Look up (or lazily build) a client for `url`. Returns the eager
@@ -430,24 +513,24 @@ impl HttpClients {
     /// just-inserted entry and skips the build.
     pub async fn for_url(&self, url: &str) -> Result<reqwest::Client, LpmError> {
         let Some(origin) = OriginKey::from_request_url(url) else {
-            return Ok(self.default.clone());
+            return Ok(self.default.client.clone());
         };
         if let Some(c) = self.eager.get(&origin) {
-            return Ok(c.clone());
+            return Ok(c.client.clone());
         }
         let any_port = OriginKey {
             host_lower: origin.host_lower.clone(),
             port: None,
         };
         if let Some(c) = self.eager.get(&any_port) {
-            return Ok(c.clone());
+            return Ok(c.client.clone());
         }
         let mut guard = self.lazy.lock().await;
         if let Some(c) = guard.get(&origin) {
-            return Ok(c.clone());
+            return Ok(c.client.clone());
         }
         if let Some(c) = guard.get(&any_port) {
-            return Ok(c.clone());
+            return Ok(c.client.clone());
         }
         // No client cached. Look up per-origin TLS for this origin.
         let per_origin_tls = self
@@ -457,17 +540,18 @@ impl HttpClients {
             .or_else(|| self.tls_overrides.per_origin.get(&any_port));
         let Some(per_origin_tls) = per_origin_tls else {
             // No per-origin TLS → use default client.
-            return Ok(self.default.clone());
+            return Ok(self.default.client.clone());
         };
         // Build under lock — single-flight per origin.
-        let client = build_per_origin_http_client(
+        let cached = build_per_origin_http_client(
             &self.tls_overrides,
             per_origin_tls,
             &origin,
             self.passphrase.as_ref(),
         )?;
-        guard.insert(origin, client.clone());
-        Ok(client)
+        let out = cached.client.clone();
+        guard.insert(origin, cached);
+        Ok(out)
     }
 }
 
@@ -495,7 +579,7 @@ fn build_per_origin_http_client(
     per_origin: &OriginTlsOverrides,
     origin: &OriginKey,
     passphrase: &dyn PassphraseProvider,
-) -> Result<reqwest::Client, LpmError> {
+) -> Result<CachedClient, LpmError> {
     // Step 1 — compose extra roots: global + per-origin (additive).
     // Per-origin cafiles are deferred-read; do the IO here.
     let mut all_roots: Vec<TaggedRoot> = global.extra_roots.clone();
@@ -526,7 +610,9 @@ fn build_per_origin_http_client(
 
     // Step 2 — resolve identity. Per-origin replaces global; per-origin
     // XOR validation is Δ2-scoped (only fatal when this origin is built).
-    let identity: Option<reqwest::Identity> =
+    // The `LoadedIdentity` carries cert PEM bytes alongside the
+    // `reqwest::Identity` so we can fingerprint without re-reading.
+    let loaded: Option<crate::tls_identity::LoadedIdentity> =
         match (per_origin.certfile.as_ref(), per_origin.keyfile.as_ref()) {
             (Some(cert), Some(key)) => Some(load_identity(cert, key, passphrase)?),
             (Some(cert), None) => {
@@ -554,6 +640,11 @@ fn build_per_origin_http_client(
             },
         };
 
+    // Hash the cert PEM once (Phase 58.3 T3.5) so cache-key composition
+    // doesn't re-read or re-hash on every request.
+    let identity_fp = loaded.as_ref().map(|l| cert_pem_fingerprint(&l.cert_pem));
+    let identity = loaded.map(|l| l.identity);
+
     // Step 3 — synthesize a per-origin TlsOverrides view: combined
     // roots + global strict_ssl. Per-origin map cleared (this is a
     // single-origin client — no further dispatch lives below it).
@@ -564,12 +655,16 @@ fn build_per_origin_http_client(
         identity_keyfile: None,
         per_origin: HashMap::new(),
     };
-    RegistryClient::build_http_client_with_tls_and_identity(
+    let client = RegistryClient::build_http_client_with_tls_and_identity(
         CONNECT_TIMEOUT,
         READ_TIMEOUT,
         &synthetic,
         identity,
-    )
+    )?;
+    Ok(CachedClient {
+        client,
+        identity_fp,
+    })
 }
 
 /// Inline PEM marker check — duplicates the parser-time helper in
@@ -658,7 +753,7 @@ impl RegistryClient {
         ) {
             (Some(cert), Some(key)) => {
                 let pp = EnvThenTtyPassphrase::new();
-                Some(load_identity(cert, key, &pp)?)
+                Some(load_identity(cert, key, &pp)?.identity)
             }
             _ => None,
         };
@@ -905,8 +1000,34 @@ impl RegistryClient {
         // (built up across previous calls) survives into the new
         // HttpClients. First-build path falls back to a fresh provider.
         let passphrase = Arc::clone(&self.http.passphrase);
-        let default_client =
-            Self::build_http_client_with_tls(CONNECT_TIMEOUT, READ_TIMEOUT, tls)?;
+
+        // Resolve the GLOBAL identity (if any) once here so we can
+        // both attach it to the default client AND fingerprint the
+        // cert PEM for cache-key composition. Phase 58.3 T3.5: a
+        // default-routed URL still carries the global identity in its
+        // cache namespace, so re-issued global certs invalidate
+        // cleanly. Global XOR was enforced at finalize.
+        let global_loaded = match (
+            tls.identity_certfile.as_ref(),
+            tls.identity_keyfile.as_ref(),
+        ) {
+            (Some(cert), Some(key)) => Some(load_identity(cert, key, passphrase.as_ref())?),
+            _ => None,
+        };
+        let default_identity_fp = global_loaded
+            .as_ref()
+            .map(|l| cert_pem_fingerprint(&l.cert_pem));
+        let default_identity = global_loaded.map(|l| l.identity);
+        let default_reqwest_client = Self::build_http_client_with_tls_and_identity(
+            CONNECT_TIMEOUT,
+            READ_TIMEOUT,
+            tls,
+            default_identity,
+        )?;
+        let default_cached = CachedClient {
+            client: default_reqwest_client,
+            identity_fp: default_identity_fp,
+        };
         // Eager per-origin builds — only for origins in the supplied
         // set that ALSO have per-origin TLS configured. Δ1 narrows
         // the set further at the data layer.
@@ -925,16 +1046,16 @@ impl RegistryClient {
             let Some(per_origin_tls) = per_origin_tls else {
                 continue;
             };
-            let client = build_per_origin_http_client(
+            let cached = build_per_origin_http_client(
                 tls,
                 per_origin_tls,
                 origin,
                 passphrase.as_ref(),
             )?;
-            eager_map.insert(origin.clone(), client);
+            eager_map.insert(origin.clone(), cached);
         }
         let http = Arc::new(HttpClients {
-            default: default_client,
+            default: default_cached,
             eager: eager_map,
             lazy: tokio::sync::Mutex::new(HashMap::new()),
             tls_overrides: Arc::new(tls.clone()),
@@ -1726,7 +1847,13 @@ impl RegistryClient {
         // namespaces. `anon` is the canonical no-auth namespace.
         // The fingerprint is a SHA-256 truncation, so debug logs of
         // the cache key never expose raw tokens.
-        let cache_key = format!("npm:{}:{url}", auth_fingerprint(auth));
+        // Phase 58.3 T3.5 — principal fingerprint = auth + identity
+        // hash. Re-issued client certs invalidate cache cleanly even
+        // when URL + auth are unchanged.
+        let cache_key = format!(
+            "npm:{}:{url}",
+            principal_fingerprint(auth, self.http.identity_fp_for_url(&url))
+        );
 
         // Tier 1: TTL+magic cache hit.
         if let Some((cached, _etag)) = self.read_metadata_cache(&cache_key) {
@@ -2934,7 +3061,13 @@ impl RegistryClient {
         auth: Option<&crate::npmrc::RegistryAuth>,
     ) {
         let url = format!("{base_url}/{name}");
-        let cache_key = format!("npm:{}:{url}", auth_fingerprint(auth));
+        // Phase 58.3 T3.5 — principal fingerprint = auth + identity
+        // hash. Re-issued client certs invalidate cache cleanly even
+        // when URL + auth are unchanged.
+        let cache_key = format!(
+            "npm:{}:{url}",
+            principal_fingerprint(auth, self.http.identity_fp_for_url(&url))
+        );
         if let Some(path) = self.cache_path(&cache_key)
             && path.exists()
         {
@@ -8458,6 +8591,17 @@ mod tests {
         cert.cert.pem().into_bytes()
     }
 
+    /// Test helper: wrap a `reqwest::Client` in a `CachedClient` with
+    /// no identity fingerprint. The dispatch tests don't exercise
+    /// principal_fingerprint (that's its own test), so identity_fp
+    /// stays None.
+    fn cached(client: reqwest::Client) -> CachedClient {
+        CachedClient {
+            client,
+            identity_fp: None,
+        }
+    }
+
     #[test]
     fn with_tls_overrides_default_is_noop() {
         // No extra roots, no strict_ssl set → no rebuild, no error.
@@ -8683,9 +8827,9 @@ mod tests {
             port: None,
         };
         let mut eager = HashMap::new();
-        eager.insert(origin.clone(), per_origin_client.clone());
+        eager.insert(origin.clone(), cached(per_origin_client.clone()));
         let http = Arc::new(HttpClients {
-            default: default.clone(),
+            default: cached(default.clone()),
             eager,
             lazy: tokio::sync::Mutex::new(HashMap::new()),
             tls_overrides: Arc::new(TlsOverrides::default()),
@@ -8698,12 +8842,14 @@ mod tests {
         // Different origin → default.
         let other = client.http.for_url_no_build("https://other.example/bar");
         // Pointer-eq each against the source it should match.
+        // `for_url_no_build` returns `&reqwest::Client` (the .client
+        // field of CachedClient), so pierce CachedClient on the rhs.
         assert!(
-            std::ptr::eq(picked, client.http.eager.get(&origin).unwrap()),
+            std::ptr::eq(picked, &client.http.eager.get(&origin).unwrap().client),
             "eager origin must dispatch to its registered client"
         );
         assert!(
-            std::ptr::eq(other, &client.http.default),
+            std::ptr::eq(other, &client.http.default.client),
             "non-eager origin must dispatch to default"
         );
     }
@@ -8725,9 +8871,9 @@ mod tests {
             port: None,
         };
         let mut eager = HashMap::new();
-        eager.insert(key_no_port.clone(), per_origin_client);
+        eager.insert(key_no_port.clone(), cached(per_origin_client));
         let http = Arc::new(HttpClients {
-            default,
+            default: cached(default),
             eager,
             lazy: tokio::sync::Mutex::new(HashMap::new()),
             tls_overrides: Arc::new(TlsOverrides::default()),
@@ -8738,7 +8884,7 @@ mod tests {
         // Both 443 (default https) and 8443 must hit the no-port entry.
         let picked_443 = client.http.for_url_no_build("https://host.internal/foo");
         let picked_8443 = client.http.for_url_no_build("https://host.internal:8443/bar");
-        let stored = client.http.eager.get(&key_no_port).unwrap();
+        let stored = &client.http.eager.get(&key_no_port).unwrap().client;
         assert!(std::ptr::eq(picked_443, stored));
         assert!(std::ptr::eq(picked_8443, stored));
     }
@@ -8778,7 +8924,7 @@ mod tests {
         };
         let default = RegistryClient::build_http_client(CONNECT_TIMEOUT, READ_TIMEOUT);
         let http = Arc::new(HttpClients {
-            default,
+            default: cached(default),
             eager: HashMap::new(),
             lazy: tokio::sync::Mutex::new(HashMap::new()),
             tls_overrides: Arc::new(tls),
@@ -8820,7 +8966,7 @@ mod tests {
     async fn http_clients_no_per_origin_tls_falls_through_to_default() {
         let default = RegistryClient::build_http_client(CONNECT_TIMEOUT, READ_TIMEOUT);
         let http = Arc::new(HttpClients {
-            default: default.clone(),
+            default: cached(default.clone()),
             eager: HashMap::new(),
             lazy: tokio::sync::Mutex::new(HashMap::new()),
             tls_overrides: Arc::new(TlsOverrides::default()),
@@ -8863,7 +9009,7 @@ mod tests {
         };
         let default = RegistryClient::build_http_client(CONNECT_TIMEOUT, READ_TIMEOUT);
         let http = Arc::new(HttpClients {
-            default,
+            default: cached(default),
             eager: HashMap::new(),
             lazy: tokio::sync::Mutex::new(HashMap::new()),
             tls_overrides: Arc::new(tls),
@@ -8912,7 +9058,7 @@ mod tests {
         };
         let default = RegistryClient::build_http_client(CONNECT_TIMEOUT, READ_TIMEOUT);
         let http = Arc::new(HttpClients {
-            default,
+            default: cached(default),
             eager: HashMap::new(),
             lazy: tokio::sync::Mutex::new(HashMap::new()),
             tls_overrides: Arc::new(tls),
@@ -9005,6 +9151,138 @@ mod tests {
             lazy.contains_key(&concrete_port_key),
             "lazy entry must be keyed by URL's concrete-port origin"
         );
+    }
+
+    // ---- Phase 58.3 T3.5 — principal_fingerprint (auth + identity) ----
+
+    #[test]
+    fn principal_fingerprint_anon_when_no_auth_no_identity() {
+        let fp = principal_fingerprint(None, None);
+        assert_eq!(fp, "anon");
+    }
+
+    #[test]
+    fn principal_fingerprint_changes_with_identity_alone() {
+        // Same auth (none), different identity hash → different
+        // fingerprint. This is the core T3.5 contract: re-issued
+        // client cert invalidates cache cleanly.
+        let fp_a = principal_fingerprint(None, Some("aaaaaaaaaaaaaaaa"));
+        let fp_b = principal_fingerprint(None, Some("bbbbbbbbbbbbbbbb"));
+        assert_ne!(fp_a, fp_b);
+        assert!(fp_a.starts_with("principal-"));
+        assert!(fp_b.starts_with("principal-"));
+    }
+
+    #[test]
+    fn principal_fingerprint_changes_with_auth_alone() {
+        use crate::npmrc::{OriginKey, RegistryAuth};
+        let bearer_a = RegistryAuth::Bearer {
+            origin: OriginKey {
+                host_lower: "x".into(),
+                port: None,
+            },
+            token: SecretString::from("token-a".to_string()),
+        };
+        let bearer_b = RegistryAuth::Bearer {
+            origin: OriginKey {
+                host_lower: "x".into(),
+                port: None,
+            },
+            token: SecretString::from("token-b".to_string()),
+        };
+        let fp_a = principal_fingerprint(Some(&bearer_a), None);
+        let fp_b = principal_fingerprint(Some(&bearer_b), None);
+        assert_ne!(fp_a, fp_b);
+    }
+
+    #[test]
+    fn principal_fingerprint_auth_plus_identity_differs_from_auth_alone() {
+        // The auth + identity composition is non-trivial: same auth
+        // with vs. without an identity hash MUST produce distinct
+        // fingerprints, otherwise a client that re-issues a cert
+        // would still hit the old cache entry under the same auth.
+        use crate::npmrc::{OriginKey, RegistryAuth};
+        let bearer = RegistryAuth::Bearer {
+            origin: OriginKey {
+                host_lower: "x".into(),
+                port: None,
+            },
+            token: SecretString::from("tok".to_string()),
+        };
+        let fp_no_id = principal_fingerprint(Some(&bearer), None);
+        let fp_with_id = principal_fingerprint(Some(&bearer), Some("ffffffffffffffff"));
+        assert_ne!(fp_no_id, fp_with_id);
+    }
+
+    #[test]
+    fn cert_pem_fingerprint_is_deterministic_and_truncated() {
+        let pem = b"-----BEGIN CERTIFICATE-----\nABCD\n-----END CERTIFICATE-----\n";
+        let fp1 = cert_pem_fingerprint(pem);
+        let fp2 = cert_pem_fingerprint(pem);
+        assert_eq!(&*fp1, &*fp2);
+        assert_eq!(fp1.len(), 16);
+        // Different bytes → different fingerprint.
+        let other = b"-----BEGIN CERTIFICATE-----\nEFGH\n-----END CERTIFICATE-----\n";
+        let fp_other = cert_pem_fingerprint(other);
+        assert_ne!(&*fp1, &*fp_other);
+    }
+
+    /// End-to-end: a client built with a per-origin cert via the real
+    /// `with_tls_overrides_for` entry point reports its identity_fp
+    /// for URLs targeting that origin. The fingerprint is then what
+    /// `principal_fingerprint` consumes for cache-key namespacing.
+    #[test]
+    fn http_clients_identity_fp_for_url_reflects_per_origin_cert() {
+        // Generate a matching cert+key pair (same signing_key). Using
+        // separate `rcgen_pem()` calls for cert and key would produce
+        // a mismatched pair that fails `Identity::from_pem`.
+        let cert_with_key = rcgen::generate_simple_self_signed(vec!["localhost".to_string()])
+            .expect("rcgen");
+        let cert_pem_str = cert_with_key.cert.pem();
+        let key_pem_str = cert_with_key.key_pair.serialize_pem();
+        let dir = tempfile::tempdir().unwrap();
+        let cert_path = dir.path().join("client.pem");
+        std::fs::write(&cert_path, &cert_pem_str).unwrap();
+        let key_path = dir.path().join("client.key");
+        std::fs::write(&key_path, &key_pem_str).unwrap();
+        let origin = OriginKey {
+            host_lower: "corp.internal".into(),
+            port: None,
+        };
+        let mut per_origin_map = HashMap::new();
+        per_origin_map.insert(
+            origin.clone(),
+            crate::npmrc::OriginTlsOverrides {
+                cafiles: vec![],
+                certfile: Some(crate::npmrc::TaggedPath {
+                    path: cert_path,
+                    source: "test".into(),
+                    line: 1,
+                    source_dir: None,
+                }),
+                keyfile: Some(crate::npmrc::TaggedPath {
+                    path: key_path,
+                    source: "test".into(),
+                    line: 2,
+                    source_dir: None,
+                }),
+            },
+        );
+        let tls = TlsOverrides {
+            per_origin: per_origin_map,
+            ..Default::default()
+        };
+        let client = RegistryClient::new()
+            .with_tls_overrides_for(&tls, std::slice::from_ref(&origin))
+            .expect("build ok");
+        // URL targeting the eager origin → fp present.
+        let fp = client.http.identity_fp_for_url("https://corp.internal/foo");
+        assert!(fp.is_some(), "per-origin client must carry an identity_fp");
+        assert_eq!(fp.unwrap().len(), 16);
+        // URL for an unrelated origin (default-routed, no global
+        // identity configured) → fp None.
+        let fp_other = client.http.identity_fp_for_url("https://other.example/bar");
+        assert!(fp_other.is_none(), "default client without global identity must have None fp");
     }
 
     // ---- Phase 58.3 — effective TLS summary line ----
