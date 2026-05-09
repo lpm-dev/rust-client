@@ -185,6 +185,31 @@ pub enum LpmError {
         actual: String,
         from: String,
     },
+
+    /// `lpm self-update` is in cooldown after a previous failed probe.
+    /// Distinct from `Network` because the failure isn't a live network
+    /// problem — it's a local cache decision to back off and not
+    /// re-hammer the rate-limited / unreachable endpoint.
+    #[error("update check paused: {0}")]
+    #[diagnostic(
+        code(lpm::self_update_paused),
+        help("Re-run with --refresh to bypass the cooldown and retry immediately.")
+    )]
+    SelfUpdatePaused(String),
+
+    /// Update check hit a GitHub API rate limit on the fallback path.
+    /// Distinct from `Forbidden` (which reads to users as "you're
+    /// banned") because the fix is "wait" or "raise the limit", not
+    /// "check your permissions".
+    #[error("update check rate-limited: {0}")]
+    #[diagnostic(
+        code(lpm::self_update_rate_limited),
+        help(
+            "The GitHub Releases fallback is rate-limited. Wait for the reset, or set \
+             GITHUB_TOKEN / GH_TOKEN to raise the limit from 60 to 5000 req/hr."
+        )
+    )]
+    SelfUpdateRateLimited(String),
 }
 
 impl LpmError {
@@ -220,6 +245,8 @@ impl LpmError {
             LpmError::Workspace(_) => "workspace",
             LpmError::EnvValidation(_) => "env_validation",
             LpmError::EngineMismatch { .. } => "engine_mismatch",
+            LpmError::SelfUpdatePaused(_) => "self_update_paused",
+            LpmError::SelfUpdateRateLimited(_) => "self_update_rate_limited",
         }
     }
 }
@@ -345,6 +372,8 @@ mod tests {
                 actual: "0.32.0".into(),
                 from: "package.json > engines.lpm".into(),
             },
+            LpmError::SelfUpdatePaused("x".into()),
+            LpmError::SelfUpdateRateLimited("x".into()),
         ];
 
         for variant in &variants {
@@ -354,6 +383,55 @@ mod tests {
                 "error_code() returned empty for: {variant}"
             );
         }
+    }
+
+    /// Self-update categories must render with their own user-facing
+    /// prefixes — not the historical `network error:` (cooldown) or
+    /// `forbidden:` (rate limit) which both miscategorised the failure.
+    #[test]
+    fn self_update_paused_renders_with_correct_prefix() {
+        let err = LpmError::SelfUpdatePaused("last attempt failed 10 minutes ago".into());
+        let s = err.to_string();
+        assert!(
+            s.starts_with("update check paused:"),
+            "expected dedicated prefix, got: {s}"
+        );
+        assert!(
+            !s.contains("network error"),
+            "must not leak into Network category: {s}"
+        );
+    }
+
+    #[test]
+    fn self_update_rate_limited_renders_with_correct_prefix() {
+        let err = LpmError::SelfUpdateRateLimited("Try again in 13 minutes".into());
+        let s = err.to_string();
+        assert!(
+            s.starts_with("update check rate-limited:"),
+            "expected dedicated prefix, got: {s}"
+        );
+        assert!(
+            !s.contains("forbidden"),
+            "must not leak into Forbidden category: {s}"
+        );
+    }
+
+    /// Help text for the paused variant must surface `--refresh` since
+    /// it's the user-controllable knob; help text for the rate-limited
+    /// variant must mention GITHUB_TOKEN / GH_TOKEN.
+    #[test]
+    fn self_update_paused_help_mentions_refresh() {
+        let err = LpmError::SelfUpdatePaused("x".into());
+        let help = err.help().unwrap().to_string();
+        assert!(help.contains("--refresh"), "help: {help}");
+    }
+
+    #[test]
+    fn self_update_rate_limited_help_mentions_token_env_vars() {
+        let err = LpmError::SelfUpdateRateLimited("x".into());
+        let help = err.help().unwrap().to_string();
+        assert!(help.contains("GITHUB_TOKEN"), "help: {help}");
+        assert!(help.contains("GH_TOKEN"), "help: {help}");
     }
 
     #[test]

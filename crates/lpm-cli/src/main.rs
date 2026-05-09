@@ -1814,11 +1814,18 @@ enum Commands {
     },
 
     /// Update LPM to the latest version.
+    ///
+    /// Detects the installation channel from the executable path
+    /// (npm, Homebrew, cargo, or standalone) and runs the matching
+    /// upgrade command. Version discovery probes the npm registry
+    /// first and falls back to GitHub Releases — no token required
+    /// for either path on the common case.
     #[command(name = "self-update")]
     SelfUpdate {
-        /// Bypass the 10-minute version-lookup cache and probe GitHub
-        /// directly. Only affects the version check — not the upgrade
-        /// itself, which always installs the resolved release.
+        /// Bypass the 10-minute version-lookup cache and the
+        /// post-failure cooldown. Forces a fresh probe regardless of
+        /// recent state. Only affects the version check — not the
+        /// upgrade itself, which always installs the resolved release.
         #[arg(long)]
         refresh: bool,
     },
@@ -2083,6 +2090,29 @@ fn validate_global_uninstall_project_scoped_flags(
     }
 
     Ok(())
+}
+
+/// Whether the trailing "update available" banner should be suppressed
+/// for this invocation.
+///
+/// The banner is suppressed for every `lpm self-update` invocation,
+/// regardless of outcome:
+///
+/// - Failure (cooldown, rate limit, transport error): the user already
+///   saw the failure message; "run lpm self-update" sends them back
+///   into the same loop they're trying to escape.
+/// - Success: the running process is still the old version (the new
+///   binary lives on disk but doesn't replace this PID), and the
+///   on-disk cache now has the just-upgraded version stamped. The
+///   banner predicate (`cache.latest > current`) therefore fires —
+///   so the user would see `Updated to 0.38.0` immediately followed
+///   by `Update available: 0.37.0 → 0.38.0 — run lpm self-update`.
+///   That contradicts itself.
+///
+/// Suppression is per-invocation; the on-disk cache is unchanged, so
+/// any other command still surfaces the banner on the next run.
+fn should_suppress_update_banner(is_self_update_command: bool) -> bool {
+    is_self_update_command
 }
 
 /// Phase 34.2: spawn a detached child process to refresh the update cache.
@@ -2383,6 +2413,15 @@ async fn async_main() -> Result<()> {
             }
         }
     }
+
+    // Capture whether the user invoked `lpm self-update` directly so the
+    // post-command "update available" banner (read from disk, printed
+    // unconditionally below) can be suppressed when the just-run command
+    // tells the user to "run lpm self-update" — they did, and the cooldown
+    // already explained why it didn't proceed. Suppressing here keeps the
+    // suppression scoped to this invocation only; the next command still
+    // sees the banner.
+    let is_self_update_command = matches!(command, Commands::SelfUpdate { .. });
 
     let result = match command {
         Commands::Info {
@@ -3891,8 +3930,21 @@ async fn async_main() -> Result<()> {
         }
     };
 
-    // Update check: show notice from previous check (instant, no network)
+    // Update check: show notice from previous check (instant, no network).
+    //
+    // Suppress the banner whenever the just-run command was
+    // `lpm self-update`, regardless of outcome. On failure the banner
+    // would loop the user back into the same command that just errored;
+    // on success the running PID is still the old binary while the
+    // on-disk cache now reflects the just-upgraded `latest`, so the
+    // banner predicate (`cache.latest > current`) fires and produces
+    // the contradictory `Updated to 0.38.0` + `Update available:
+    // 0.37.0 → 0.38.0` pair. The suppression is per-invocation; the
+    // on-disk cache is untouched, so the next unrelated command still
+    // surfaces the banner.
+    let suppress_banner = should_suppress_update_banner(is_self_update_command);
     if !cli.json
+        && !suppress_banner
         && let Some(notice) = update_check::read_cached_notice()
     {
         eprint!("{notice}");
@@ -3959,6 +4011,60 @@ mod tests {
     // - `--verbose` long form survives.
     // - `-v` is NO LONGER the short for `--verbose` — it was reclaimed
     //   for `--version` to match npm/pnpm/yarn convention.
+
+    /// User-facing help for `lpm self-update --help` must NOT promise
+    /// "probes GitHub directly" any more — that wording was tied to
+    /// the old single-source design and would mislead users into
+    /// thinking they need a `GITHUB_TOKEN` for the common case. Lock
+    /// the new wording so a future doc edit doesn't silently regress.
+    #[test]
+    fn self_update_help_text_does_not_promise_github_probe() {
+        use clap::CommandFactory;
+        let mut cmd = Cli::command();
+        let mut buf = Vec::new();
+        cmd.find_subcommand_mut("self-update")
+            .expect("self-update subcommand registered")
+            .write_long_help(&mut buf)
+            .unwrap();
+        let help = String::from_utf8(buf).unwrap();
+        assert!(
+            !help.contains("probe GitHub directly"),
+            "stale wording still in help: {help}"
+        );
+        // Affirmative anchor: help must mention the npm-first probe so
+        // users know the GITHUB_TOKEN hint in error messages is rare,
+        // not the default path.
+        assert!(
+            help.contains("npm registry"),
+            "help should mention npm registry as the primary probe: {help}"
+        );
+    }
+
+    /// Banner suppression: every `lpm self-update` invocation
+    /// suppresses the trailing banner; everything else lets it through.
+    ///
+    /// Failure case: re-emitting "run lpm self-update" right after the
+    /// command itself failed loops the user.
+    ///
+    /// Success case: the running PID is still the old binary while the
+    /// on-disk cache has been stamped with the just-upgraded `latest`,
+    /// so the banner predicate fires and produces the contradictory
+    /// `Updated to X` + `Update available: <old> → X` pair.
+    ///
+    /// Other commands must NOT suppress: a transient failure on
+    /// `lpm install` would otherwise swallow the user's "you're behind
+    /// on releases" signal.
+    #[test]
+    fn should_suppress_update_banner_only_on_self_update() {
+        assert!(
+            should_suppress_update_banner(true),
+            "self-update → suppress (covers both failure-loop and success-contradiction)"
+        );
+        assert!(
+            !should_suppress_update_banner(false),
+            "any other command → show banner"
+        );
+    }
 
     #[test]
     fn capital_v_sets_version_flag_with_no_subcommand() {
