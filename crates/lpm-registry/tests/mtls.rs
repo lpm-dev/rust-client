@@ -64,7 +64,10 @@ use tls_server::{
 /// return the two paths. `lpm-registry`'s `load_identity` reads from
 /// disk only — there's no in-memory entry point — so every mTLS
 /// test that wants to attach an identity has to spool to disk.
-fn write_client_identity(dir: &std::path::Path, leaf: &ClientLeaf) -> (std::path::PathBuf, std::path::PathBuf) {
+fn write_client_identity(
+    dir: &std::path::Path,
+    leaf: &ClientLeaf,
+) -> (std::path::PathBuf, std::path::PathBuf) {
     let cert_path = dir.join("client-cert.pem");
     let key_path = dir.join("client-key.pem");
     std::fs::write(&cert_path, &leaf.cert_pem).expect("write cert");
@@ -160,8 +163,7 @@ async fn mtls_no_client_id_handshake_fails() {
     let server_ca = make_root_ca();
     let client_trust_ca = make_root_ca(); // Independent CA for client trust.
     let leaf = make_leaf(&server_ca, LeafShape::Valid);
-    let (port, _handle) =
-        spawn_tls_server_mutual(leaf, &server_ca, &client_trust_ca).await;
+    let (port, _handle) = spawn_tls_server_mutual(leaf, &server_ca, &client_trust_ca).await;
 
     let client = build_client_with_ca_only(&server_ca.cert_pem);
     let result = probe(&client, port).await;
@@ -188,12 +190,8 @@ async fn mtls_correct_client_id_succeeds() {
     let leaf = make_leaf(&server_ca, LeafShape::Valid);
     let (port, _handle) = spawn_tls_server_mutual(leaf, &server_ca, &server_ca).await;
 
-    let client = build_client_with_per_origin_identity(
-        &server_ca.cert_pem,
-        &cert_path,
-        &key_path,
-        port,
-    );
+    let client =
+        build_client_with_per_origin_identity(&server_ca.cert_pem, &cert_path, &key_path, port);
     probe(&client, port)
         .await
         .expect("valid client identity must complete mTLS handshake");
@@ -217,12 +215,8 @@ async fn mtls_wrong_ca_client_id_handshake_fails() {
     // identities are rejected.
     let (port, _handle) = spawn_tls_server_mutual(leaf, &server_ca, &server_ca).await;
 
-    let client = build_client_with_per_origin_identity(
-        &server_ca.cert_pem,
-        &cert_path,
-        &key_path,
-        port,
-    );
+    let client =
+        build_client_with_per_origin_identity(&server_ca.cert_pem, &cert_path, &key_path, port);
     let result = probe(&client, port).await;
     assert!(
         result.is_err(),
@@ -253,8 +247,7 @@ async fn mtls_per_origin_isolation() {
 
     // Listener A: requires mTLS.
     let leaf_a = make_leaf(&server_ca, LeafShape::Valid);
-    let (port_a, _handle_a) =
-        spawn_tls_server_mutual(leaf_a, &server_ca, &server_ca).await;
+    let (port_a, _handle_a) = spawn_tls_server_mutual(leaf_a, &server_ca, &server_ca).await;
 
     // Listener B: NO mTLS (server-only TLS). Same CA so the cafile
     // covers both servers' chains.
@@ -409,8 +402,8 @@ async fn mtls_encrypted_pkcs8_with_correct_passphrase_succeeds() {
 
     // Encrypt the client key with a known passphrase via the public
     // pkcs8 API. Same pattern as the unit-layer encrypted-PKCS#8 test.
-    let (label, plain_der) = pkcs8::der::pem::decode_vec(client_leaf.key_pem.as_bytes())
-        .expect("decode plain key pem");
+    let (label, plain_der) =
+        pkcs8::der::pem::decode_vec(client_leaf.key_pem.as_bytes()).expect("decode plain key pem");
     assert_eq!(label, "PRIVATE KEY", "expected PKCS#8 PEM label");
     let plain_info = PrivateKeyInfo::try_from(plain_der.as_slice()).expect("parse pkcs8");
     let mut rng = rand::thread_rng();
@@ -438,12 +431,8 @@ async fn mtls_encrypted_pkcs8_with_correct_passphrase_succeeds() {
     // including panic — via `EnvVarGuard::drop`.
     let _env = EnvVarGuard::set("LPM_KEY_PASSPHRASE", passphrase);
 
-    let client = build_client_with_per_origin_identity(
-        &server_ca.cert_pem,
-        &cert_path,
-        &key_path,
-        port,
-    );
+    let client =
+        build_client_with_per_origin_identity(&server_ca.cert_pem, &cert_path, &key_path, port);
     probe(&client, port)
         .await
         .expect("encrypted PKCS#8 + env passphrase must complete mTLS handshake");

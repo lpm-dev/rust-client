@@ -229,9 +229,7 @@ pub async fn run(
     let client = &owned_client;
     // Phase 58.3 — install-start summary of effective TLS overrides
     // (mirrors install.rs:3859 wiring).
-    if !json_output
-        && let Some(line) = client.render_effective_tls_summary()
-    {
+    if !json_output && let Some(line) = client.render_effective_tls_summary() {
         output::info(&line);
     }
 

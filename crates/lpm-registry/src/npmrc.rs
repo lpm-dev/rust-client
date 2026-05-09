@@ -1086,10 +1086,7 @@ impl NpmrcConfig {
                     // resolution.
                     let source_dir = path.parent();
                     let layer = NpmrcConfig::parse_layer_with_source_dir(
-                        &content,
-                        &label,
-                        source_dir,
-                        env_lookup,
+                        &content, &label, source_dir, env_lookup,
                     );
                     acc.merge_over(layer);
                 }
@@ -1472,11 +1469,7 @@ fn classify_and_apply(
                         ));
                         return;
                     }
-                    cfg.tls
-                        .per_origin
-                        .entry(origin)
-                        .or_default()
-                        .certfile = Some(TaggedPath {
+                    cfg.tls.per_origin.entry(origin).or_default().certfile = Some(TaggedPath {
                         path: PathBuf::from(value),
                         source: source_label.to_string(),
                         line: lineno,
@@ -1492,11 +1485,7 @@ fn classify_and_apply(
                         ));
                         return;
                     }
-                    cfg.tls
-                        .per_origin
-                        .entry(origin)
-                        .or_default()
-                        .keyfile = Some(TaggedPath {
+                    cfg.tls.per_origin.entry(origin).or_default().keyfile = Some(TaggedPath {
                         path: PathBuf::from(value),
                         source: source_label.to_string(),
                         line: lineno,
@@ -2198,23 +2187,12 @@ mod tests {
         // certfile in lower-precedence + keyfile in higher-precedence
         // should compose into a complete pair, NOT trigger the XOR
         // fatal — the contract is across all merged layers.
-        let mut acc = NpmrcConfig::parse_layer(
-            "certfile=/etc/cert.pem\n",
-            "system",
-            &no_env,
-        );
-        let higher = NpmrcConfig::parse_layer(
-            "keyfile=/home/u/key.pem\n",
-            "user",
-            &no_env,
-        );
+        let mut acc = NpmrcConfig::parse_layer("certfile=/etc/cert.pem\n", "system", &no_env);
+        let higher = NpmrcConfig::parse_layer("keyfile=/home/u/key.pem\n", "user", &no_env);
         acc.merge_over(higher);
         acc.finalize();
         assert!(acc.errors.is_empty(), "errors: {:?}", acc.errors);
-        assert_eq!(
-            acc.tls.identity_certfile.as_ref().unwrap().source,
-            "system"
-        );
+        assert_eq!(acc.tls.identity_certfile.as_ref().unwrap().source, "system");
         assert_eq!(acc.tls.identity_keyfile.as_ref().unwrap().source, "user");
     }
 
@@ -2231,11 +2209,7 @@ mod tests {
 
     #[test]
     fn per_origin_cafile_populates_per_origin_not_global_roots() {
-        let cfg = NpmrcConfig::parse(
-            "//npm.internal/:cafile=/path/ca.pem\n",
-            "test",
-            &no_env,
-        );
+        let cfg = NpmrcConfig::parse("//npm.internal/:cafile=/path/ca.pem\n", "test", &no_env);
         // Phase 58.3: per-origin cafile is path-only at parse time
         // (deferred-read), so a non-existent path here is NOT a
         // parse-time error. Only loaded at client-build time for
@@ -2297,11 +2271,7 @@ mod tests {
 
     #[test]
     fn tls_for_origin_falls_back_to_any_port() {
-        let cfg = NpmrcConfig::parse(
-            "//npm.internal/:cafile=/path/ca.pem\n",
-            "test",
-            &no_env,
-        );
+        let cfg = NpmrcConfig::parse("//npm.internal/:cafile=/path/ca.pem\n", "test", &no_env);
         // Lookup with a concrete port should fall back to the
         // port-less entry, mirroring auth_for_url's semantics.
         let with_port = OriginKey {
@@ -2318,16 +2288,10 @@ mod tests {
 
     #[test]
     fn merge_over_per_origin_cafiles_concatenate() {
-        let mut acc = NpmrcConfig::parse_layer(
-            "//npm.internal/:cafile=/system/ca.pem\n",
-            "system",
-            &no_env,
-        );
-        let higher = NpmrcConfig::parse_layer(
-            "//npm.internal/:cafile=/user/ca.pem\n",
-            "user",
-            &no_env,
-        );
+        let mut acc =
+            NpmrcConfig::parse_layer("//npm.internal/:cafile=/system/ca.pem\n", "system", &no_env);
+        let higher =
+            NpmrcConfig::parse_layer("//npm.internal/:cafile=/user/ca.pem\n", "user", &no_env);
         acc.merge_over(higher);
         acc.finalize();
         let origin = OriginKey {
@@ -2352,13 +2316,17 @@ mod tests {
                        //npm.internal/:cafile=ca.pem\n\
                        //npm.internal/:certfile=client.pem\n\
                        //npm.internal/:keyfile=client.key\n";
-        let cfg = NpmrcConfig::parse_layer_with_source_dir(content, "/etc/npmrc", Some(dir), &no_env);
+        let cfg =
+            NpmrcConfig::parse_layer_with_source_dir(content, "/etc/npmrc", Some(dir), &no_env);
 
         // Global identity tags both paths with source_dir.
         let global_cert = cfg.tls.identity_certfile.as_ref().unwrap();
         assert_eq!(global_cert.path, PathBuf::from("corp-cert.pem"));
         assert_eq!(global_cert.source_dir.as_deref(), Some(dir));
-        assert_eq!(global_cert.resolve(), PathBuf::from("/etc/npm/corp-cert.pem"));
+        assert_eq!(
+            global_cert.resolve(),
+            PathBuf::from("/etc/npm/corp-cert.pem")
+        );
 
         let global_key = cfg.tls.identity_keyfile.as_ref().unwrap();
         assert_eq!(global_key.resolve(), PathBuf::from("/etc/npm/corp-key.pem"));
@@ -2414,11 +2382,8 @@ mod tests {
             "system",
             &no_env,
         );
-        let higher = NpmrcConfig::parse_layer(
-            "//npm.internal/:certfile=/user/cert.pem\n",
-            "user",
-            &no_env,
-        );
+        let higher =
+            NpmrcConfig::parse_layer("//npm.internal/:certfile=/user/cert.pem\n", "user", &no_env);
         acc.merge_over(higher);
         acc.finalize();
         let origin = OriginKey {

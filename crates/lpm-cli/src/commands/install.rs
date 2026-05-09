@@ -3872,13 +3872,13 @@ async fn run_with_options_under_store_lock(
     // Transitive deps surfacing later go through the lazy path.
     let top_level_specs: Vec<String> = deps
         .iter()
-        .filter_map(|(local_name, range)| {
-            match lpm_resolver::Specifier::parse(range) {
+        .filter_map(
+            |(local_name, range)| match lpm_resolver::Specifier::parse(range) {
                 Ok(lpm_resolver::Specifier::SemverRange(_)) => Some(local_name.clone()),
                 Ok(lpm_resolver::Specifier::NpmAlias { target, .. }) => Some(target),
                 _ => None,
-            }
-        })
+            },
+        )
         .collect();
     let eager_origins = route_table.effective_registry_origins(
         &top_level_specs,
@@ -3894,9 +3894,7 @@ async fn run_with_options_under_store_lock(
     // active ⇒ no line. Suppressed under `--json` so structured stdout
     // stays clean; the strict-ssl=false security warning above remains
     // unconditional regardless.
-    if !json_output
-        && let Some(line) = client.render_effective_tls_summary()
-    {
+    if !json_output && let Some(line) = client.render_effective_tls_summary() {
         output::info(&line);
     }
 

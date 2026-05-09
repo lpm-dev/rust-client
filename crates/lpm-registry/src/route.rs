@@ -587,11 +587,8 @@ mod tests {
              @scope:registry=https://scope.internal/\n",
             RouteMode::Direct,
         );
-        let got = table.effective_registry_origins(
-            &[],
-            "https://lpm.dev",
-            "https://registry.npmjs.org",
-        );
+        let got =
+            table.effective_registry_origins(&[], "https://lpm.dev", "https://registry.npmjs.org");
         assert!(got.is_empty());
     }
 
@@ -725,11 +722,7 @@ mod tests {
     #[test]
     fn effective_origins_dedupes_duplicate_routes() {
         let table = make_table("", RouteMode::Direct);
-        let specs = vec![
-            "react".to_string(),
-            "lodash".to_string(),
-            "vue".to_string(),
-        ];
+        let specs = vec!["react".to_string(), "lodash".to_string(), "vue".to_string()];
         let got = table.effective_registry_origins(
             &specs,
             "https://lpm.dev",
@@ -791,11 +784,7 @@ mod tests {
     fn effective_origins_silently_skips_invalid_urls() {
         let table = make_table("", RouteMode::Direct);
         let specs = vec!["react".to_string()];
-        let got = table.effective_registry_origins(
-            &specs,
-            "not a url",
-            "also not a url",
-        );
+        let got = table.effective_registry_origins(&specs, "not a url", "also not a url");
         assert!(got.is_empty());
     }
 }

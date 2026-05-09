@@ -447,8 +447,7 @@ impl HttpClients {
         if per_origin_count > 0 {
             // Sort origins for deterministic rendering — install logs
             // diff cleanly between runs.
-            let mut origins: Vec<String> =
-                self.eager.keys().map(|o| o.to_string()).collect();
+            let mut origins: Vec<String> = self.eager.keys().map(|o| o.to_string()).collect();
             origins.sort();
             parts.push(format!("per-origin TLS for {}", origins.join(", ")));
         }
@@ -663,33 +662,35 @@ fn build_per_origin_http_client(
     // XOR validation is Δ2-scoped (only fatal when this origin is built).
     // The `LoadedIdentity` carries cert PEM bytes alongside the
     // `reqwest::Identity` so we can fingerprint without re-reading.
-    let loaded: Option<crate::tls_identity::LoadedIdentity> =
-        match (per_origin.certfile.as_ref(), per_origin.keyfile.as_ref()) {
+    let loaded: Option<crate::tls_identity::LoadedIdentity> = match (
+        per_origin.certfile.as_ref(),
+        per_origin.keyfile.as_ref(),
+    ) {
+        (Some(cert), Some(key)) => Some(load_identity(cert, key, passphrase)?),
+        (Some(cert), None) => {
+            return Err(LpmError::Cert(format!(
+                "{}:{}: per-origin certfile is set for {origin} but matching keyfile is missing across all merged layers — both must be set or both absent",
+                cert.source, cert.line
+            )));
+        }
+        (None, Some(key)) => {
+            return Err(LpmError::Cert(format!(
+                "{}:{}: per-origin keyfile is set for {origin} but matching certfile is missing across all merged layers — both must be set or both absent",
+                key.source, key.line
+            )));
+        }
+        // No per-origin identity → inherit global (if any).
+        (None, None) => match (
+            global.identity_certfile.as_ref(),
+            global.identity_keyfile.as_ref(),
+        ) {
             (Some(cert), Some(key)) => Some(load_identity(cert, key, passphrase)?),
-            (Some(cert), None) => {
-                return Err(LpmError::Cert(format!(
-                    "{}:{}: per-origin certfile is set for {origin} but matching keyfile is missing across all merged layers — both must be set or both absent",
-                    cert.source, cert.line
-                )));
-            }
-            (None, Some(key)) => {
-                return Err(LpmError::Cert(format!(
-                    "{}:{}: per-origin keyfile is set for {origin} but matching certfile is missing across all merged layers — both must be set or both absent",
-                    key.source, key.line
-                )));
-            }
-            // No per-origin identity → inherit global (if any).
-            (None, None) => match (
-                global.identity_certfile.as_ref(),
-                global.identity_keyfile.as_ref(),
-            ) {
-                (Some(cert), Some(key)) => Some(load_identity(cert, key, passphrase)?),
-                // Global XOR is finalize-time fatal; if we got here
-                // with half-set, finalize would have aborted upstream.
-                // Treat as "no identity" defensively.
-                _ => None,
-            },
-        };
+            // Global XOR is finalize-time fatal; if we got here
+            // with half-set, finalize would have aborted upstream.
+            // Treat as "no identity" defensively.
+            _ => None,
+        },
+    };
 
     // Hash the cert PEM once (Phase 58.3 T3.5) so cache-key composition
     // doesn't re-read or re-hash on every request.
@@ -1107,12 +1108,8 @@ impl RegistryClient {
             let Some(per_origin_tls) = per_origin_tls else {
                 continue;
             };
-            let cached = build_per_origin_http_client(
-                tls,
-                per_origin_tls,
-                origin,
-                passphrase.as_ref(),
-            )?;
+            let cached =
+                build_per_origin_http_client(tls, per_origin_tls, origin, passphrase.as_ref())?;
             eager_map.insert(origin.clone(), cached);
         }
         // Phase 58.3 T3.5 fix — pre-compute identity fingerprints
@@ -1703,7 +1700,9 @@ impl RegistryClient {
                         tracing::debug!("metadata cache revalidated (304): npm:{name}");
                         return Ok(meta);
                     }
-                    response = self.send_with_retry(self.build_get(&proxy_url).await?).await?;
+                    response = self
+                        .send_with_retry(self.build_get(&proxy_url).await?)
+                        .await?;
                 }
 
                 if response.status().is_success() {
@@ -2735,7 +2734,13 @@ impl RegistryClient {
                 .current_bearer(AuthPosture::AuthRequired)
                 .ok_or_else(|| LpmError::Registry("no token to revoke".to_string()))?;
             let body = serde_json::json!({ "token": bearer });
-            let req = self.http.for_url(&url).await?.post(&url).bearer_auth(&bearer).json(&body);
+            let req = self
+                .http
+                .for_url(&url)
+                .await?
+                .post(&url)
+                .bearer_auth(&bearer)
+                .json(&body);
             let response = self.send_with_retry(req).await?;
             if response.status().is_success() {
                 Ok(())
@@ -3383,7 +3388,8 @@ impl RegistryClient {
     /// dispatch may lazy-build a per-origin client (and that build
     /// can fail with a cited cert error).
     async fn build_get(&self, url: &str) -> Result<reqwest::RequestBuilder, LpmError> {
-        self.build_get_with_posture(url, AuthPosture::AuthRequired).await
+        self.build_get_with_posture(url, AuthPosture::AuthRequired)
+            .await
     }
 
     /// Build a GET request honoring the caller's auth posture.
@@ -8886,7 +8892,9 @@ mod tests {
         let client = RegistryClient::new();
         // Two distinct origins, both fall through to default since no
         // per-origin TLS is configured.
-        let c1 = client.http.for_url_no_build("https://registry.npmjs.org/react");
+        let c1 = client
+            .http
+            .for_url_no_build("https://registry.npmjs.org/react");
         let c2 = client.http.for_url_no_build("https://corp.internal/lib");
         // Pointer equality on `&reqwest::Client` is the precise check —
         // both must point to the SAME default client, not equivalent
@@ -8929,7 +8937,9 @@ mod tests {
         let mut client = RegistryClient::new();
         client.http = http;
         // Eager origin → per_origin_client (NOT default).
-        let picked = client.http.for_url_no_build("https://corp.internal:443/foo");
+        let picked = client
+            .http
+            .for_url_no_build("https://corp.internal:443/foo");
         // Different origin → default.
         let other = client.http.for_url_no_build("https://other.example/bar");
         // Pointer-eq each against the source it should match.
@@ -8975,7 +8985,9 @@ mod tests {
         client.http = http;
         // Both 443 (default https) and 8443 must hit the no-port entry.
         let picked_443 = client.http.for_url_no_build("https://host.internal/foo");
-        let picked_8443 = client.http.for_url_no_build("https://host.internal:8443/bar");
+        let picked_8443 = client
+            .http
+            .for_url_no_build("https://host.internal:8443/bar");
         let stored = &client.http.eager.get(&key_no_port).unwrap().client;
         assert!(std::ptr::eq(picked_443, stored));
         assert!(std::ptr::eq(picked_8443, stored));
@@ -9026,7 +9038,10 @@ mod tests {
         // First call must build + insert.
         let c1 = http.for_url("https://lazy.internal/pkg").await.expect("ok");
         // Second call must hit the lazy cache (not rebuild).
-        let c2 = http.for_url("https://lazy.internal/other").await.expect("ok");
+        let c2 = http
+            .for_url("https://lazy.internal/other")
+            .await
+            .expect("ok");
         // Same origin → same cached entry. The dispatcher inserts
         // under the URL's concrete-port origin (`Some(443)` for
         // HTTPS), not the configured port-None entry — both calls
@@ -9066,7 +9081,10 @@ mod tests {
             passphrase: Arc::new(crate::tls_identity::EnvThenTtyPassphrase::new()),
             per_origin_identity_fps: HashMap::new(),
         });
-        let _ = http.for_url("https://anywhere.example/foo").await.expect("ok");
+        let _ = http
+            .for_url("https://anywhere.example/foo")
+            .await
+            .expect("ok");
         // Lazy map must remain empty (no per-origin TLS to build).
         let map = http.lazy.lock().await;
         assert!(map.is_empty());
@@ -9078,7 +9096,11 @@ mod tests {
     async fn http_clients_per_origin_certfile_xor_is_fatal_at_build() {
         let dir = tempfile::tempdir().unwrap();
         let cert_path = dir.path().join("cert.pem");
-        std::fs::write(&cert_path, "-----BEGIN CERTIFICATE-----\nx\n-----END CERTIFICATE-----\n").unwrap();
+        std::fs::write(
+            &cert_path,
+            "-----BEGIN CERTIFICATE-----\nx\n-----END CERTIFICATE-----\n",
+        )
+        .unwrap();
         let origin = OriginKey {
             host_lower: "halfconf.internal".into(),
             port: None,
@@ -9128,7 +9150,11 @@ mod tests {
     async fn http_clients_unreached_half_config_does_not_break_unrelated_lookup() {
         let dir = tempfile::tempdir().unwrap();
         let cert_path = dir.path().join("cert.pem");
-        std::fs::write(&cert_path, "-----BEGIN CERTIFICATE-----\nx\n-----END CERTIFICATE-----\n").unwrap();
+        std::fs::write(
+            &cert_path,
+            "-----BEGIN CERTIFICATE-----\nx\n-----END CERTIFICATE-----\n",
+        )
+        .unwrap();
         let unreached_origin = OriginKey {
             host_lower: "unused.internal".into(),
             port: None,
@@ -9226,9 +9252,7 @@ mod tests {
         // We don't care about the request outcome — only that the
         // lazy map gets populated.
         let url = "https://lazy-target.invalid/foo/-/foo-1.0.0.tgz";
-        let _ = client
-            .download_tarball_to_file_with_auth(url, None)
-            .await;
+        let _ = client.download_tarball_to_file_with_auth(url, None).await;
         // Verify: lazy map now contains an entry for the URL's
         // concrete-port origin (per-origin lookup with port=None
         // fallback hit; insertion key is the URL's resolved origin).
@@ -9345,8 +9369,8 @@ mod tests {
         let key_path = dir.path().join("client.key");
 
         // First identity.
-        let cert_a = rcgen::generate_simple_self_signed(vec!["localhost".to_string()])
-            .expect("rcgen a");
+        let cert_a =
+            rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).expect("rcgen a");
         std::fs::write(&cert_path, cert_a.cert.pem()).unwrap();
         std::fs::write(&key_path, cert_a.key_pair.serialize_pem()).unwrap();
 
@@ -9391,8 +9415,8 @@ mod tests {
 
         // Rotate the cert: write a DIFFERENT cert+key pair to the
         // same paths, rebuild HttpClients. fp must change.
-        let cert_b = rcgen::generate_simple_self_signed(vec!["localhost".to_string()])
-            .expect("rcgen b");
+        let cert_b =
+            rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).expect("rcgen b");
         std::fs::write(&cert_path, cert_b.cert.pem()).unwrap();
         std::fs::write(&key_path, cert_b.key_pair.serialize_pem()).unwrap();
         let tls_b = TlsOverrides {
@@ -9421,8 +9445,8 @@ mod tests {
         // Generate a matching cert+key pair (same signing_key). Using
         // separate `rcgen_pem()` calls for cert and key would produce
         // a mismatched pair that fails `Identity::from_pem`.
-        let cert_with_key = rcgen::generate_simple_self_signed(vec!["localhost".to_string()])
-            .expect("rcgen");
+        let cert_with_key =
+            rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).expect("rcgen");
         let cert_pem_str = cert_with_key.cert.pem();
         let key_pem_str = cert_with_key.key_pair.serialize_pem();
         let dir = tempfile::tempdir().unwrap();
@@ -9467,7 +9491,10 @@ mod tests {
         // URL for an unrelated origin (default-routed, no global
         // identity configured) → fp None.
         let fp_other = client.http.identity_fp_for_url("https://other.example/bar");
-        assert!(fp_other.is_none(), "default client without global identity must have None fp");
+        assert!(
+            fp_other.is_none(),
+            "default client without global identity must have None fp"
+        );
     }
 
     // ---- Phase 58.3 — effective TLS summary line ----
@@ -9493,8 +9520,14 @@ mod tests {
             .with_tls_overrides_for(&tls, &[])
             .expect("build ok");
         let summary = client.render_effective_tls_summary().expect("summary");
-        assert!(summary.contains("1 extra root certificate"), "got: {summary}");
-        assert!(!summary.contains("extra root certificates "), "must singularize");
+        assert!(
+            summary.contains("1 extra root certificate"),
+            "got: {summary}"
+        );
+        assert!(
+            !summary.contains("extra root certificates "),
+            "must singularize"
+        );
     }
 
     #[test]
@@ -9521,7 +9554,10 @@ mod tests {
             .with_tls_overrides_for(&tls, &[])
             .expect("build ok");
         let summary = client.render_effective_tls_summary().expect("summary");
-        assert!(summary.contains("2 extra root certificates"), "got: {summary}");
+        assert!(
+            summary.contains("2 extra root certificates"),
+            "got: {summary}"
+        );
     }
 
     /// Configured-but-unreached per-origin TLS must NOT appear in the

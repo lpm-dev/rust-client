@@ -36,8 +36,8 @@
 //!   0.23's ring provider (idempotent — safe across tests).
 
 use rcgen::{
-    BasicConstraints, CertificateParams, DistinguishedName, ExtendedKeyUsagePurpose, IsCa,
-    KeyPair, KeyUsagePurpose,
+    BasicConstraints, CertificateParams, DistinguishedName, ExtendedKeyUsagePurpose, IsCa, KeyPair,
+    KeyUsagePurpose,
 };
 use rustls::ServerConfig;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
@@ -167,8 +167,8 @@ pub struct ClientLeaf {
 /// cases by swapping the signing CA, not by shape.
 #[allow(dead_code)]
 pub fn make_client_leaf(ca: &TestCa) -> ClientLeaf {
-    let mut params = CertificateParams::new(vec!["lpm test client".to_string()])
-        .expect("client leaf params");
+    let mut params =
+        CertificateParams::new(vec!["lpm test client".to_string()]).expect("client leaf params");
     params.distinguished_name = DistinguishedName::new();
     params
         .distinguished_name
