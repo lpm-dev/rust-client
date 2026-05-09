@@ -91,16 +91,7 @@ fn run_clean(root: &LpmRoot, json_output: bool) -> Result<(), LpmError> {
         if json_output {
             println!(
                 "{}",
-                serde_json::to_string_pretty(&serde_json::json!({
-                    "success": true,
-                    "removed_bytes": 0,
-                    "removed": format_bytes(0),
-                    "v1_path": v1.display().to_string(),
-                    "v2_path": v2.display().to_string(),
-                    "v1_removed_bytes": 0,
-                    "v2_removed_bytes": 0,
-                }))
-                .unwrap()
+                serde_json::to_string_pretty(&clean_json_payload(&v1, &v2, 0, 0)).unwrap()
             );
         } else {
             output::info("Store is already empty");
@@ -131,16 +122,8 @@ fn run_clean(root: &LpmRoot, json_output: bool) -> Result<(), LpmError> {
     if json_output {
         println!(
             "{}",
-            serde_json::to_string_pretty(&serde_json::json!({
-                "success": true,
-                "removed_bytes": bytes_before,
-                "removed": format_bytes(bytes_before),
-                "v1_path": v1.display().to_string(),
-                "v2_path": v2.display().to_string(),
-                "v1_removed_bytes": v1_bytes,
-                "v2_removed_bytes": v2_bytes,
-            }))
-            .unwrap()
+            serde_json::to_string_pretty(&clean_json_payload(&v1, &v2, v1_bytes, v2_bytes))
+                .unwrap()
         );
     } else {
         output::success(&format!(
@@ -151,6 +134,28 @@ fn run_clean(root: &LpmRoot, json_output: bool) -> Result<(), LpmError> {
     }
 
     Ok(())
+}
+
+fn clean_json_payload(
+    v1: &std::path::Path,
+    v2: &std::path::Path,
+    v1_removed_bytes: u64,
+    v2_removed_bytes: u64,
+) -> serde_json::Value {
+    let removed_bytes = v1_removed_bytes + v2_removed_bytes;
+    serde_json::json!({
+        "success": true,
+        "removed_bytes": removed_bytes,
+        "removed": format_bytes(removed_bytes),
+        // Legacy alias retained for clients that previously read the
+        // v1-only clean response. `v1_path` / `v2_path` are the
+        // authoritative fields post-v2.
+        "path": v1.display().to_string(),
+        "v1_path": v1.display().to_string(),
+        "v2_path": v2.display().to_string(),
+        "v1_removed_bytes": v1_removed_bytes,
+        "v2_removed_bytes": v2_removed_bytes,
+    })
 }
 
 /// One walked store entry — v1 or v2 — handed to the unified verify
@@ -1617,6 +1622,29 @@ mod tests {
             "v2 must be wiped even when v1 is absent — pre-fix this was the \
              silent-no-op case for the default v2 install path"
         );
+    }
+
+    #[test]
+    fn f3_review_clean_json_retains_legacy_path_alias() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = LpmRoot::from_dir(dir.path());
+        let v1 = root.store_v1();
+        let v2 = root.store_root().join("v2");
+
+        let payload = clean_json_payload(&v1, &v2, 5, 7);
+        assert_eq!(
+            payload["path"].as_str(),
+            Some(v1.to_string_lossy().as_ref())
+        );
+        assert_eq!(
+            payload["v1_path"].as_str(),
+            Some(v1.to_string_lossy().as_ref())
+        );
+        assert_eq!(
+            payload["v2_path"].as_str(),
+            Some(v2.to_string_lossy().as_ref())
+        );
+        assert_eq!(payload["removed_bytes"].as_u64(), Some(12));
     }
 
     /// Versions matter: same name across two versions counts as TWO
