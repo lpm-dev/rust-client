@@ -894,6 +894,33 @@ pub struct LpmConfig {
     /// [`lpm_resolver::CompiledPeerRules`] for the runtime matcher.
     #[serde(default, rename = "peerDependencyRules")]
     pub peer_dependency_rules: PeerDependencyRules,
+
+    /// **Phase 66 R2.2** — eager peer auto-install opt-out.
+    ///
+    /// When `true` (or unset), missing non-optional peer dependencies
+    /// are automatically promoted to ambient root-scoped installs by
+    /// the resolver — bun-parity behavior. When `false`, missing peers
+    /// fall back to pre-R2 warn-only semantics: the post-resolve
+    /// [`lpm_resolver::check_unmet_peers`] pass surfaces them as
+    /// `PeerWarning`s and the user manually adds them to
+    /// `dependencies`.
+    ///
+    /// **Default is `true` (auto-install on)** — beta-default favors
+    /// the eager model so peer-declaring packages "just work" without
+    /// the user having to re-read the install log to find missing
+    /// names. Set to `false` for the pnpm-classic / npm-classic
+    /// experience.
+    ///
+    /// Precedence (resolved in `install.rs`):
+    ///   `package.json > lpm > autoInstallPeers`
+    ///   → `~/.lpm/config.toml > auto-install-peers`
+    ///   → default (`true`).
+    ///
+    /// Optional peers (`peerDependenciesMeta.<name>.optional = true`)
+    /// are NEVER auto-installed regardless of this flag — the manifest
+    /// author opted out of the dependency entirely.
+    #[serde(default, rename = "autoInstallPeers")]
+    pub auto_install_peers: Option<bool>,
 }
 
 /// `package.json :: lpm.peerDependencyRules` — peer-dep behavior

@@ -96,10 +96,23 @@ pub fn binary_format_supports(lockfile: &Lockfile) -> bool {
     if !lockfile.root_aliases.is_empty() {
         return false;
     }
+    // **R2.5** — extending the same "skip binary fast path when the
+    // lockfile carries metadata the binary schema can't encode" gate.
+    // Both `Lockfile.ambient_peer_installs` and per-package
+    // `LockedPackage.peers` are R2-era additions; the binary format's
+    // fixed entry shape (binary.rs:670-720) doesn't have slots for
+    // them. Falling back to TOML-only is the same conservative move
+    // we make for npm-aliases — projects without any auto-installed
+    // peers AND no per-package peer pinning still take the fast
+    // binary path. Most non-React projects fall through this filter
+    // unaffected.
+    if !lockfile.ambient_peer_installs.is_empty() {
+        return false;
+    }
     lockfile
         .packages
         .iter()
-        .all(|p| p.alias_dependencies.is_empty())
+        .all(|p| p.alias_dependencies.is_empty() && p.peers.is_empty())
 }
 
 /// Serialize a `Lockfile` into the binary format.
@@ -549,6 +562,12 @@ impl BinaryLockfileReader {
             // correspond to an alias-free lockfile and this field is
             // always empty.
             root_aliases: std::collections::BTreeMap::new(),
+            // R2.5 — same reasoning as `root_aliases`: projects with
+            // ambient peer installs skip the binary write entirely,
+            // so any `to_lockfile()` we'd reach is for a binary-
+            // representable lockfile, which by construction has no
+            // ambient peers.
+            ambient_peer_installs: Vec::new(),
         }
     }
 
@@ -683,6 +702,13 @@ impl<'a> PackageEntryView<'a> {
             // aliased projects makes the TOML fallback a reasonable
             // interim trade-off.
             alias_dependencies: Vec::new(),
+            // R2.5 — same gate as alias_dependencies: per-package
+            // peers are part of the R2.5 metadata the binary format
+            // doesn't encode. Projects with peers fail
+            // `binary_format_supports` and fall back to TOML, so any
+            // binary entry we round-trip here is by construction
+            // peer-free.
+            peers: Vec::new(),
             // Phase 43, v2+ — read the tarball URL directly from the
             // mmap via the accessor; `None` when the slot is the
             // `(0, 0)` null sentinel.
@@ -769,6 +795,7 @@ mod tests {
             integrity: Some("sha512-abc123".to_string()),
             dependencies: vec!["react@18.2.0".to_string()],
             alias_dependencies: vec![],
+            peers: vec![],
             tarball: None,
         });
         lf.add_package(LockedPackage {
@@ -778,6 +805,7 @@ mod tests {
             integrity: None,
             dependencies: vec![],
             alias_dependencies: vec![],
+            peers: vec![],
             tarball: None,
         });
         lf
@@ -865,6 +893,7 @@ mod tests {
             integrity: Some("sha512-registry".to_string()),
             dependencies: vec!["loose-envify@1.4.0".to_string()],
             alias_dependencies: vec![],
+            peers: vec![],
             tarball: None,
         });
         // Tarball-URL react@19.0.0 (a fork bundling the same name+version)
@@ -875,6 +904,7 @@ mod tests {
             integrity: Some("sha512-fork".to_string()),
             dependencies: vec![],
             alias_dependencies: vec![],
+            peers: vec![],
             tarball: None,
         });
         lf
@@ -1237,6 +1267,7 @@ mod tests {
                     vec![]
                 },
                 alias_dependencies: vec![],
+                peers: vec![],
                 tarball: None,
             });
         }
@@ -1265,6 +1296,7 @@ mod tests {
             integrity: None,
             dependencies: deps.clone(),
             alias_dependencies: vec![],
+            peers: vec![],
             tarball: None,
         });
         for i in 0..100 {
@@ -1275,6 +1307,7 @@ mod tests {
                 integrity: None,
                 dependencies: vec![],
                 alias_dependencies: vec![],
+                peers: vec![],
                 tarball: None,
             });
         }
@@ -1304,6 +1337,7 @@ mod tests {
                     vec![]
                 },
                 alias_dependencies: vec![],
+                peers: vec![],
                 tarball: None,
             });
         }
@@ -1502,6 +1536,7 @@ mod tests {
                 integrity: Some(integrity.to_string()),
                 dependencies: vec![],
                 alias_dependencies: vec![],
+                peers: vec![],
                 tarball: None,
             });
         }
@@ -1598,6 +1633,7 @@ mod tests {
             integrity: Some("sha512-xyz".to_string()),
             dependencies: vec![],
             alias_dependencies: vec![],
+            peers: vec![],
             tarball: Some("https://registry.npmjs.org/lodash/-/lodash-4.17.21.tgz".to_string()),
         });
 
@@ -1632,6 +1668,7 @@ mod tests {
             integrity: None,
             dependencies: vec![],
             alias_dependencies: vec![],
+            peers: vec![],
             tarball: None,
         });
         lf.add_package(LockedPackage {
@@ -1641,6 +1678,7 @@ mod tests {
             integrity: None,
             dependencies: vec![],
             alias_dependencies: vec![],
+            peers: vec![],
             tarball: Some("https://registry.npmjs.org/lodash/-/lodash-4.17.21.tgz".to_string()),
         });
 
@@ -1670,6 +1708,7 @@ mod tests {
             integrity: None,
             dependencies: vec![],
             alias_dependencies: vec![],
+            peers: vec![],
             tarball: Some(String::new()),
         });
 
@@ -1696,6 +1735,7 @@ mod tests {
             integrity: None,
             dependencies: vec![],
             alias_dependencies: vec![],
+            peers: vec![],
             tarball: None,
         });
         let err = to_binary(&lf_source).expect_err("empty source must be rejected");
@@ -1712,6 +1752,7 @@ mod tests {
             integrity: Some(String::new()),
             dependencies: vec![],
             alias_dependencies: vec![],
+            peers: vec![],
             tarball: None,
         });
         let err = to_binary(&lf_integ).expect_err("empty integrity must be rejected");
@@ -1781,6 +1822,7 @@ mod tests {
             integrity: None,
             dependencies: vec![],
             alias_dependencies: vec![],
+            peers: vec![],
             tarball: Some("https://example.com/foo/-/foo-1.0.0.tgz".to_string()),
         });
         let mut binary = to_binary(&lf).unwrap();
@@ -1820,6 +1862,7 @@ mod tests {
                 integrity: None,
                 dependencies: vec![],
                 alias_dependencies: vec![],
+                peers: vec![],
                 tarball: Some("https://example.com/foo/-/foo-1.0.0.tgz".to_string()),
             });
             lf
@@ -1856,6 +1899,7 @@ mod tests {
             integrity: None,
             dependencies: vec![],
             alias_dependencies: vec![],
+            peers: vec![],
             tarball: None,
         });
 
@@ -1887,6 +1931,7 @@ mod tests {
             integrity: None,
             dependencies: vec![],
             alias_dependencies: vec![],
+            peers: vec![],
             tarball: None,
         });
 
@@ -1913,6 +1958,7 @@ mod tests {
             integrity: None,
             dependencies: vec![],
             alias_dependencies: vec![],
+            peers: vec![],
             tarball: None,
         });
 
@@ -1940,6 +1986,7 @@ mod tests {
             integrity: Some("sha256-deadbeefcafebabe".to_string()),
             dependencies: vec![],
             alias_dependencies: vec![],
+            peers: vec![],
             tarball: None,
         });
 
@@ -1973,6 +2020,7 @@ mod tests {
             integrity: Some("sha512-lodash".to_string()),
             dependencies: vec![],
             alias_dependencies: vec![],
+            peers: vec![],
             tarball: Some("https://registry.npmjs.org/lodash/-/lodash-4.17.21.tgz".to_string()),
         });
         lf.add_package(LockedPackage {
@@ -1982,6 +2030,7 @@ mod tests {
             integrity: Some("sha512-remote".to_string()),
             dependencies: vec![],
             alias_dependencies: vec![],
+            peers: vec![],
             tarball: None,
         });
         lf.add_package(LockedPackage {
@@ -1991,6 +2040,7 @@ mod tests {
             integrity: Some("sha256-local".to_string()),
             dependencies: vec![],
             alias_dependencies: vec![],
+            peers: vec![],
             tarball: None,
         });
         lf.add_package(LockedPackage {
@@ -2000,6 +2050,7 @@ mod tests {
             integrity: None,
             dependencies: vec![],
             alias_dependencies: vec![],
+            peers: vec![],
             tarball: None,
         });
         lf.add_package(LockedPackage {
@@ -2009,6 +2060,7 @@ mod tests {
             integrity: None,
             dependencies: vec![],
             alias_dependencies: vec![],
+            peers: vec![],
             tarball: None,
         });
 

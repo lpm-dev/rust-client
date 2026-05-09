@@ -47,7 +47,7 @@
 use diffy::Patch;
 use lpm_common::LpmError;
 use lpm_linker::MaterializedPackage;
-use lpm_store::{PackageStore, read_stored_integrity};
+use lpm_store::PackageStore;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
@@ -526,28 +526,39 @@ fn classify_patch_op(patch: &Patch<'_, str>) -> Result<PatchOp, LpmError> {
     }
 }
 
-/// Verify that the store entry's `.integrity` matches the
+/// Verify that the store entry's recorded SRI matches the
 /// `originalIntegrity` recorded in `package.json`. Hard-errors on
 /// mismatch — this is the drift gate.
+///
+/// **Phase 66 confidence-followup S2 (2026-05-08).** Resolves the
+/// baseline via [`lpm_store::find_installed_package_baseline`], which
+/// prefers the v2 virtual store (link's `meta.source_sri`) and falls
+/// back to v1's per-package `.integrity` sentinel. Pre-fix this
+/// function read directly from `store.package_dir(name, version)/.integrity`
+/// (v1-only) and silently failed under v2 with "store entry ...
+/// missing .integrity" even though the package was fully linked in
+/// `node_modules/`.
 pub fn verify_original_integrity(
     store: &PackageStore,
     name: &str,
     version: &str,
     expected_integrity: &str,
 ) -> Result<(), LpmError> {
-    let store_dir = store.package_dir(name, version);
-    let actual = read_stored_integrity(&store_dir).ok_or_else(|| {
-        LpmError::Script(format!(
-            "store entry {store_dir:?} missing .integrity — \
-             cannot verify patch baseline for {name}@{version}"
-        ))
-    })?;
-    if actual != expected_integrity {
+    let lpm_root = store.lpm_root()?;
+    let baseline = lpm_store::find_installed_package_baseline(&lpm_root, name, version)?
+        .ok_or_else(|| {
+            LpmError::Script(format!(
+                "no v1 or v2 store entry for {name}@{version} — \
+                 cannot verify patch baseline. Run `lpm install {name}@{version}` first."
+            ))
+        })?;
+    if baseline.integrity != expected_integrity {
         return Err(LpmError::Script(format!(
             "patch baseline drift for {name}@{version}: \
-             stored integrity {actual} does not match \
+             stored integrity {} does not match \
              package.json originalIntegrity {expected_integrity}. \
-             Regenerate the patch with `lpm patch {name}@{version}`."
+             Regenerate the patch with `lpm patch {name}@{version}`.",
+            baseline.integrity
         )));
     }
     Ok(())
@@ -570,8 +581,28 @@ pub fn apply_patch(
     name: &str,
     version: &str,
 ) -> Result<AppliedPatch, LpmError> {
-    // 1. Drift gate
-    verify_original_integrity(store, name, version, expected_integrity)?;
+    // 1. Drift gate + v2-aware baseline lookup. `find_installed_package_baseline`
+    // prefers the v2 link entry (returns `<links/<key>/node_modules/<name>>`)
+    // and falls back to v1's `<store>/v1/<safe>@<ver>/`. Both layouts
+    // hold a real directory of bytes that mirrors the published tarball;
+    // the diff baseline reads source files from whichever was found.
+    let lpm_root = store.lpm_root()?;
+    let baseline = lpm_store::find_installed_package_baseline(&lpm_root, name, version)?
+        .ok_or_else(|| {
+            LpmError::Script(format!(
+                "no v1 or v2 store entry for {name}@{version} — \
+                 cannot apply patch. Run `lpm install {name}@{version}` first."
+            ))
+        })?;
+    if baseline.integrity != expected_integrity {
+        return Err(LpmError::Script(format!(
+            "patch baseline drift for {name}@{version}: \
+             stored integrity {} does not match \
+             package.json originalIntegrity {expected_integrity}. \
+             Regenerate the patch with `lpm patch {name}@{version}`.",
+            baseline.integrity
+        )));
+    }
 
     // 2. Read + split into per-file chunks
     let patch_text = std::fs::read_to_string(patch_file)
@@ -593,7 +624,7 @@ pub fn apply_patch(
     let mut files_modified = 0;
     let mut files_added = 0;
     let mut files_deleted = 0;
-    let store_dir = store.package_dir(name, version);
+    let store_dir = baseline.package_dir;
 
     for chunk in chunks {
         let patch = Patch::from_str(chunk).map_err(|e| {
@@ -1095,8 +1126,80 @@ mod tests {
         assert!(msg.contains("sha512-DIFFERENT"));
     }
 
+    /// **Phase 66 confidence-followup S2.** A v2-only install — no v1
+    /// dir; package bytes at `<store>/v2/links/<key>/node_modules/<name>/`
+    /// alongside a sidecar `.lpm-link-meta.json` — must satisfy the
+    /// patch baseline lookup. Pre-fix the resolver only walked v1 and
+    /// reported "missing .integrity" for every v2-installed package.
     #[test]
-    fn verify_integrity_fails_when_integrity_file_missing() {
+    fn verify_integrity_passes_on_v2_link_entry() {
+        use chrono::Utc;
+        use lpm_store::v2::{LINK_META_SCHEMA_VERSION, LinkMeta, LinkMetaPlatform};
+
+        let home = tempfile::tempdir().unwrap();
+        // Materialize a v2 link entry: <store>/v2/links/<safe>@<ver>+<hash>/node_modules/<name>/
+        let link_dir = home
+            .path()
+            .join(".lpm")
+            .join("store")
+            .join("v2")
+            .join("links")
+            .join("lodash@4.17.21+abcdef0123456789");
+        let pkg_dir = link_dir.join("node_modules").join("lodash");
+        std::fs::create_dir_all(&pkg_dir).unwrap();
+        std::fs::write(pkg_dir.join("package.json"), r#"{"name":"lodash"}"#).unwrap();
+
+        // Sidecar drives the integrity lookup.
+        let sidecar = LinkMeta {
+            schema: LINK_META_SCHEMA_VERSION,
+            graph_key: "lodash@4.17.21+abcdef0123456789".to_string(),
+            graph_key_digest_hex: "abcdef0123456789".repeat(4),
+            name: "lodash".to_string(),
+            version: "4.17.21".to_string(),
+            source_sri: "sha512-v2-baseline".to_string(),
+            object_path: "objects/sha512-zzz".to_string(),
+            deps: Vec::new(),
+            platform: LinkMetaPlatform {
+                os: "test".into(),
+                cpu: "test".into(),
+                libc: None,
+            },
+            created_at: Utc::now(),
+            last_referenced_at: Utc::now(),
+        };
+        sidecar.write_to(&link_dir).unwrap();
+
+        let store = fixture_store(&home);
+        // Match → Ok. The v2 lookup short-circuits before touching v1.
+        assert!(
+            verify_original_integrity(&store, "lodash", "4.17.21", "sha512-v2-baseline").is_ok(),
+            "v2 sidecar baseline must satisfy the drift gate"
+        );
+        // Mismatch → drift error citing the sidecar's SRI, not v1's.
+        let err =
+            verify_original_integrity(&store, "lodash", "4.17.21", "sha512-OTHER").unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("drift"),
+            "error must mark this as drift: {msg}"
+        );
+        assert!(
+            msg.contains("sha512-v2-baseline"),
+            "drift error must surface the v2 baseline SRI: {msg}"
+        );
+    }
+
+    #[test]
+    fn verify_integrity_fails_when_no_store_entry_resolvable() {
+        // Phase 66 confidence-followup S2: with the v2-aware lookup,
+        // a v1 dir present but missing `.integrity` is treated as "no
+        // resolvable baseline" — same outcome as v1+v2 both empty —
+        // because `find_installed_package_baseline` only returns Some
+        // when an integrity is recoverable. The user-facing error
+        // wording shifted from "missing .integrity" to "no v1 or v2
+        // store entry"; both convey the same actionable next step
+        // ("re-install the package"), but the new message is correct
+        // for both store layouts.
         let home = tempfile::tempdir().unwrap();
         let store_dir = home
             .path()
@@ -1108,7 +1211,15 @@ mod tests {
         std::fs::write(store_dir.join("package.json"), r#"{"name":"lodash"}"#).unwrap();
         let store = fixture_store(&home);
         let err = verify_original_integrity(&store, "lodash", "4.17.21", "sha512-x").unwrap_err();
-        assert!(format!("{err}").contains("missing .integrity"));
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("no v1 or v2 store entry"),
+            "expected v2-aware error wording; got: {msg}"
+        );
+        assert!(
+            msg.contains("lpm install"),
+            "error must point user at the fix; got: {msg}"
+        );
     }
 
     // ── apply_patch contracts ────────────────────────────────────────

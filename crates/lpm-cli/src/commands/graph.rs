@@ -366,6 +366,7 @@ mod tests {
                 integrity: None,
                 dependencies: vec!["accepts@1.0.0".into()],
                 alias_dependencies: vec![],
+                peers: vec![],
                 tarball: None,
             },
             LockedPackage {
@@ -375,6 +376,7 @@ mod tests {
                 integrity: None,
                 dependencies: vec![],
                 alias_dependencies: vec![],
+                peers: vec![],
                 tarball: None,
             },
             LockedPackage {
@@ -384,6 +386,7 @@ mod tests {
                 integrity: None,
                 dependencies: vec!["test-util@1.0.0".into()],
                 alias_dependencies: vec![],
+                peers: vec![],
                 tarball: None,
             },
             LockedPackage {
@@ -393,6 +396,7 @@ mod tests {
                 integrity: None,
                 dependencies: vec![],
                 alias_dependencies: vec![],
+                peers: vec![],
                 tarball: None,
             },
         ]

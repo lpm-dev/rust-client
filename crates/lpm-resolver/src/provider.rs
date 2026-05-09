@@ -168,6 +168,25 @@ pub struct CachedPackageInfo {
     /// Optional dependency names (per version). Included in deps but resolution failure
     /// for these is non-fatal.
     pub optional_dep_names: HashMap<String, HashSet<String>>,
+    /// **Phase 66 confidence-followup R5** — `peerDependenciesMeta.optional`
+    /// flags per version: `version_string → { peer_name }` for peers
+    /// the manifest marked optional. Consumed by [`crate::check_unmet_peers`]
+    /// to suppress the missing-peer warning (an opt-out the manifest
+    /// author requested). Optional peers that ARE present but at the
+    /// wrong version still produce a warning — the user opted into
+    /// having a peer, just at an incompatible version.
+    pub optional_peer_names: HashMap<String, HashSet<String>>,
+    /// **Phase 66 confidence-followup R4** — `bundleDependencies` /
+    /// `bundledDependencies` names per version. Per-version because
+    /// the same package's bundling intent can change across releases
+    /// (e.g., a maintainer drops bundling between major versions).
+    /// The resolver skips enqueueing these names as separate installs
+    /// — they're already provided by the parent's tarball. The
+    /// extractor preserves the in-tarball `node_modules/<bundled>/`
+    /// subtree implicitly; without R4 the resolver also fetches a
+    /// registry copy of the bundled name, which the linker may then
+    /// shadow over the bundled copy depending on hoisting precedence.
+    pub bundled_dep_names: HashMap<String, HashSet<String>>,
     /// Platform restrictions per version: version_string → PlatformMeta.
     /// Only populated for versions that declare os/cpu restrictions.
     pub platform: HashMap<String, PlatformMeta>,
@@ -853,6 +872,8 @@ pub(crate) fn parse_metadata_to_cache_info(
     let mut deps: HashMap<String, HashMap<String, String>> = HashMap::with_capacity(version_count);
     let mut peer_deps: HashMap<String, HashMap<String, String>> = HashMap::new();
     let mut optional_dep_names: HashMap<String, HashSet<String>> = HashMap::new();
+    let mut optional_peer_names: HashMap<String, HashSet<String>> = HashMap::new();
+    let mut bundled_dep_names: HashMap<String, HashSet<String>> = HashMap::new();
     let mut platform: HashMap<String, PlatformMeta> = HashMap::new();
     let mut dist_info: HashMap<String, CachedDistInfo> = HashMap::with_capacity(version_count);
     // Phase 40 P2 — per-version alias map: local_name → target_canonical_name.
@@ -941,6 +962,48 @@ pub(crate) fn parse_metadata_to_cache_info(
                 peer_deps.insert(ver_str.clone(), ver_peers);
             }
 
+            // R4 — collect bundled dep names. The extractor preserves
+            // the bundled subtree implicitly; this set lets the
+            // resolver skip enqueuing those names as separate fetches
+            // so the registry copy can't shadow the vendored one
+            // depending on hoisting precedence.
+            if !ver_meta.bundle_dependencies.is_empty() {
+                let mut bundled = HashSet::new();
+                for name in &ver_meta.bundle_dependencies {
+                    if !is_valid_dep_name(name) {
+                        tracing::warn!("skipping invalid bundleDependency name: {name:?}");
+                        continue;
+                    }
+                    bundled.insert(name.clone());
+                }
+                if !bundled.is_empty() {
+                    bundled_dep_names.insert(ver_str.clone(), bundled);
+                }
+            }
+
+            // R5 — collect optional peer names from `peerDependenciesMeta`.
+            // Only entries whose `optional` flag is true are stored; the
+            // open-ended npm spec allows other keys today, none of which
+            // the resolver consumes. Filtering by name validity matches
+            // the peer-deps loop above so a malformed key in one source
+            // can't poison the other.
+            if !ver_meta.peer_dependencies_meta.is_empty() {
+                let mut opt_peers = HashSet::new();
+                for (peer_name, peer_meta) in &ver_meta.peer_dependencies_meta {
+                    if !peer_meta.optional {
+                        continue;
+                    }
+                    if !is_valid_dep_name(peer_name) {
+                        tracing::warn!("skipping invalid optional-peer name: {peer_name:?}");
+                        continue;
+                    }
+                    opt_peers.insert(peer_name.clone());
+                }
+                if !opt_peers.is_empty() {
+                    optional_peer_names.insert(ver_str.clone(), opt_peers);
+                }
+            }
+
             if !ver_meta.os.is_empty() || !ver_meta.cpu.is_empty() {
                 platform.insert(
                     ver_str.clone(),
@@ -971,6 +1034,8 @@ pub(crate) fn parse_metadata_to_cache_info(
         deps,
         peer_deps,
         optional_dep_names,
+        optional_peer_names,
+        bundled_dep_names,
         platform,
         dist: dist_info,
         aliases,
@@ -1333,6 +1398,24 @@ impl DependencyProvider for LpmDependencyProvider {
                 self.ensure_cached(&pkg)?;
                 let available = self.available_versions(&pkg);
 
+                // **R3 / B2 defense-in-depth.** `workspace:<rest>` must
+                // be rewritten upstream by `lpm-workspace` before
+                // reaching the resolver. If it slips through (future
+                // refactor drops the upstream layer, hand-edited
+                // manifest, malformed cache), `NpmRange::parse` would
+                // fail with an opaque semver error. Surface the actual
+                // diagnosis to the maintainer. Mirrors the greedy arm's
+                // root-seed guard at `greedy::seed_root_edges`.
+                if crate::ranges::is_workspace_specifier(&range_str) {
+                    return Err(ProviderError::InvalidRange(format!(
+                        "root dep {dep_name}: range '{range_str}' uses the \
+                         `workspace:` protocol, which must be resolved by \
+                         `lpm-workspace` before reaching the resolver. This is \
+                         an internal bug — please file an issue at \
+                         https://github.com/lpm-dev/rust-client/issues"
+                    )));
+                }
+
                 let npm_range = NpmRange::parse(&range_str).map_err(ProviderError::InvalidRange)?;
 
                 let range = if available.is_empty() {
@@ -1351,7 +1434,7 @@ impl DependencyProvider for LpmDependencyProvider {
 
         let ver_str = version.to_string();
         let key = CanonicalKey::from(package);
-        let (ver_deps, optional_names, ver_aliases) = {
+        let (ver_deps, optional_names, ver_aliases, bundled_names) = {
             let info = match self.cache.get(&key) {
                 Some(info) => info,
                 None => {
@@ -1360,7 +1443,7 @@ impl DependencyProvider for LpmDependencyProvider {
                     )));
                 }
             };
-            let deps = match info.deps.get(&ver_str) {
+            let mut deps = match info.deps.get(&ver_str) {
                 Some(deps) => deps.clone(),
                 None => return Ok(Dependencies::Available(pubgrub::Map::default())),
             };
@@ -1372,8 +1455,35 @@ impl DependencyProvider for LpmDependencyProvider {
             // Phase 40 P2 — local_name → target_name. Empty for most
             // packages (bare-identity deps).
             let aliases = info.aliases.get(&ver_str).cloned().unwrap_or_default();
-            (deps, opt, aliases)
+            // R4 — collect bundled dep names for this version. Used
+            // below to drop them from `deps` BEFORE the prefetch +
+            // pubgrub-constraint loop runs — pubgrub never sees the
+            // bundled names so it doesn't try to resolve them as
+            // separate registry packages.
+            let bundled = info
+                .bundled_dep_names
+                .get(&ver_str)
+                .cloned()
+                .unwrap_or_default();
+            // R4 — strip bundled deps from the constraint set up front.
+            // Done here rather than per-loop-iteration so the prefetch
+            // batch below also skips them (they're not in the registry
+            // under their bundled identity, so prefetching is wasted
+            // work + a likely 404).
+            if !bundled.is_empty() {
+                let before = deps.len();
+                deps.retain(|name, _| !bundled.contains(name));
+                let dropped = before - deps.len();
+                if dropped > 0 {
+                    tracing::debug!(
+                        "skipping {dropped} bundled dep(s) of {package}@{ver_str} \
+                         — provided by parent's tarball"
+                    );
+                }
+            }
+            (deps, opt, aliases, bundled)
         };
+        let _ = bundled_names; // currently consumed up front; kept for future use
 
         // Phase 40 P4 — scope key for a child of a split parent must
         // include the parent's OWN split context, not just its canonical
@@ -1453,6 +1563,29 @@ impl DependencyProvider for LpmDependencyProvider {
         }
 
         for (dep_name, dep_range_str) in &ver_deps {
+            // **R3 / B2 defense-in-depth.** Detect a leaked
+            // `workspace:` specifier BEFORE the alias rewrite +
+            // ensure_cached path runs — otherwise we'd try to fetch
+            // a registry package named after the workspace local
+            // identity (e.g., `internal`), waste a network round-trip,
+            // and surface an opaque 404 instead of the actual cause.
+            // Mirrors `greedy::enqueue_child_deps`. Registry-published
+            // packages should never declare `workspace:` deps (npm
+            // rejects at publish time); landing one in the constraint
+            // loop signals a malformed cache or upstream bypass.
+            if crate::ranges::is_workspace_specifier(dep_range_str) {
+                tracing::warn!(
+                    "ignoring transitive `workspace:` dep '{}' from {}@{} → {} \
+                     (workspace: must be resolved upstream by lpm-workspace; \
+                     a registry-published package should not declare it)",
+                    dep_range_str,
+                    package,
+                    version,
+                    dep_name,
+                );
+                continue;
+            }
+
             // Phase 40 P2 — resolve alias edges under the TARGET identity.
             //
             // For non-aliased deps the local name == target name, so
@@ -1706,6 +1839,8 @@ mod tests {
             deps: HashMap::new(),
             peer_deps,
             optional_dep_names: HashMap::new(),
+            optional_peer_names: HashMap::new(),
+            bundled_dep_names: HashMap::new(),
             platform: HashMap::new(),
             dist: HashMap::new(),
             aliases: HashMap::new(),
@@ -1928,6 +2063,8 @@ mod tests {
                 })
                 .collect(),
             peer_deps: HashMap::new(),
+            optional_peer_names: HashMap::new(),
+            bundled_dep_names: HashMap::new(),
             optional_dep_names: optional_names
                 .into_iter()
                 .map(|(v, names)| {
@@ -2478,6 +2615,91 @@ mod tests {
                     "optional dep with only platform-incompatible versions should be silently skipped"
                 );
             }
+            _ => panic!("expected Available dependencies"),
+        }
+    }
+
+    // ── R3 / B2 — workspace: defense-in-depth on the pubgrub arm ──
+    //
+    // `workspace:<rest>` is rewritten upstream by `lpm-workspace`
+    // before any resolver runs. If a raw `workspace:` slips through
+    // (future refactor drops the upstream layer, hand-edited manifest,
+    // malformed cache entry), `NpmRange::parse` would fail with an
+    // opaque semver-error surface. These two tests pin the workspace-
+    // specific diagnostic at both root and transitive sites so a
+    // future regression points the maintainer at the actual cause.
+
+    #[test]
+    fn get_dependencies_root_rejects_workspace_specifier() {
+        // Root dep declares `workspace:*` — pubgrub arm must hard-fail
+        // with a workspace-specific message, not the generic semver
+        // parse error.
+        let mut root_deps = HashMap::new();
+        root_deps.insert("internal-pkg".to_string(), "workspace:*".to_string());
+
+        // Pre-populate the cache so `ensure_cached` short-circuits and
+        // we reach the range-parse step. The version list doesn't
+        // matter — we error before pubgrub ever sees the constraint.
+        let pkg = ResolverPackage::npm("internal-pkg");
+        let info = make_info(&["1.0.0"], vec![], vec![], vec![]);
+        let provider = make_provider_with_cache(root_deps, vec![(pkg, info)]);
+
+        // The DependencyProvider trait's `get_dependencies` is what
+        // pubgrub calls during resolution. Driving it through the root
+        // path is what the integration would do.
+        let root_pkg = ResolverPackage::Root;
+        let result = provider.get_dependencies(&root_pkg, &NpmVersion::new(0, 0, 0));
+        // `Dependencies<...>` doesn't implement Debug, so match
+        // explicitly rather than `expect_err`.
+        let err = match result {
+            Ok(_) => panic!("workspace: root dep must produce an error"),
+            Err(e) => e,
+        };
+        let msg = format!("{err:?}");
+        assert!(
+            msg.contains("workspace:") && msg.contains("lpm-workspace"),
+            "expected workspace-specific diagnostic, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn get_dependencies_transitive_skips_workspace_specifier() {
+        // Transitive dep manifest declares `workspace:*` — pubgrub arm
+        // must skip it (a registry-published package shouldn't have
+        // such a dep) and continue resolving siblings.
+        let pkg = ResolverPackage::npm("buggy-published");
+        let info = make_info(
+            &["1.0.0"],
+            vec![(
+                "1.0.0",
+                vec![("legit-sibling", "^1.0.0"), ("internal", "workspace:*")],
+            )],
+            vec![],
+            vec![],
+        );
+        let sibling = ResolverPackage::npm("legit-sibling");
+        let sibling_info = make_info(&["1.2.3"], vec![], vec![], vec![]);
+
+        let provider = make_provider_with_cache(
+            HashMap::new(),
+            vec![(pkg.clone(), info), (sibling, sibling_info)],
+        );
+
+        let deps = provider
+            .get_dependencies(&pkg, &NpmVersion::parse("1.0.0").unwrap())
+            .expect("workspace: transitive dep must be skipped, not error");
+        match deps {
+            Dependencies::Available(map) => {
+                assert!(
+                    map.contains_key(&ResolverPackage::npm("legit-sibling")),
+                    "non-workspace sibling must still resolve"
+                );
+                assert!(
+                    !map.contains_key(&ResolverPackage::npm("internal")),
+                    "workspace: dep must be skipped from constraints"
+                );
+            }
+            // Dependencies isn't Debug, so use a generic message.
             _ => panic!("expected Available dependencies"),
         }
     }

@@ -1904,6 +1904,7 @@ mod tests {
                 integrity: None,
                 dependencies: vec!["body-parser@1.20.0".into(), "debug@4.3.4".into()],
                 alias_dependencies: vec![],
+                peers: vec![],
                 tarball: None,
             },
             lpm_lockfile::LockedPackage {
@@ -1913,6 +1914,7 @@ mod tests {
                 integrity: None,
                 dependencies: vec!["debug@4.3.4".into()],
                 alias_dependencies: vec![],
+                peers: vec![],
                 tarball: None,
             },
             lpm_lockfile::LockedPackage {
@@ -1922,6 +1924,7 @@ mod tests {
                 integrity: None,
                 dependencies: vec![],
                 alias_dependencies: vec![],
+                peers: vec![],
                 tarball: None,
             },
             lpm_lockfile::LockedPackage {
@@ -1931,6 +1934,7 @@ mod tests {
                 integrity: None,
                 dependencies: vec![],
                 alias_dependencies: vec![],
+                peers: vec![],
                 tarball: None,
             },
         ]
@@ -2478,6 +2482,7 @@ mod tests {
                 integrity: None,
                 dependencies: vec!["qs@1.0.0".to_string()],
                 alias_dependencies: vec![],
+                peers: vec![],
                 tarball: None,
             },
             lpm_lockfile::LockedPackage {
@@ -2487,6 +2492,7 @@ mod tests {
                 integrity: None,
                 dependencies: vec![],
                 alias_dependencies: vec![],
+                peers: vec![],
                 tarball: None,
             },
         ];

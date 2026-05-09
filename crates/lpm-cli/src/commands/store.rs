@@ -31,7 +31,7 @@ pub async fn run(
 
     match action {
         "verify" => with_shared_lock(root.store_lock(), || {
-            run_verify(&store, deep, fix, json_output)
+            run_verify(&root, &store, deep, fix, json_output)
         }),
         "list" | "ls" => with_shared_lock(root.store_lock(), || run_list(&store, json_output)),
         "path" => {
@@ -116,19 +116,39 @@ fn run_clean(root: &LpmRoot, json_output: bool) -> Result<(), LpmError> {
     Ok(())
 }
 
+/// One walked store entry — v1 or v2 — handed to the unified verify
+/// loop. `inline_integrity` is `Some` on v2 (read from the link
+/// sidecar's `source_sri`) and `None` on v1 (the loop falls back to
+/// `read_stored_integrity` against `<dir>/.integrity`).
+struct StoreVerifyEntry {
+    name: String,
+    version: String,
+    dir: std::path::PathBuf,
+    inline_integrity: Option<String>,
+}
+
 /// Verify integrity of all packages in the store.
 ///
 /// Basic mode: checks that each package directory has a `package.json` and is non-empty.
 /// Deep mode (`--deep`): additionally parses `package.json` to validate name/version consistency
 /// and verifies that the directory name matches the declared name@version.
 /// Fix mode (`--fix`): auto-repair issues like stale security caches. Without `--fix`, verify is read-only.
+///
+/// **Phase 66 confidence-followup S4** — extended to walk both the
+/// v1 store (`<store>/v1/<safe>@<ver>/`) AND the v2 link entries
+/// (`<store>/v2/links/<key>/node_modules/<name>/`). Pre-fix, this
+/// command was a silent no-op under the v2-default install pipeline:
+/// it walked v1 only and reported zero packages even though hundreds
+/// of links were materialized in v2.
 fn run_verify(
+    lpm_root: &LpmRoot,
     store: &PackageStore,
     deep: bool,
     fix: bool,
     json_output: bool,
 ) -> Result<(), LpmError> {
-    let packages = list_store_verify_entries(store)?;
+    let mut packages: Vec<StoreVerifyEntry> = list_v1_verify_entries(store)?;
+    packages.extend(list_v2_verify_entries(lpm_root)?);
 
     if packages.is_empty() {
         if json_output {
@@ -177,8 +197,13 @@ fn run_verify(
     let mut security_mismatches = 0u32;
     let mut security_reanalyzed = 0u32;
 
-    for (name, version) in &packages {
-        let dir = store.package_dir(name, version);
+    for entry in &packages {
+        let StoreVerifyEntry {
+            name,
+            version,
+            dir,
+            inline_integrity,
+        } = entry;
 
         // Check 1: directory exists
         if !dir.exists() {
@@ -195,7 +220,7 @@ fn run_verify(
 
         // Check 3: directory is non-empty (has at least package.json + something else,
         // or at minimum package.json itself)
-        let file_count = match std::fs::read_dir(&dir) {
+        let file_count = match std::fs::read_dir(dir) {
             Ok(entries) => entries.count(),
             Err(e) => {
                 corrupted.push(format!("{name}@{version} — unreadable directory: {e}"));
@@ -247,10 +272,16 @@ fn run_verify(
                 }
             }
 
-            // Verify integrity hash: compare stored .integrity with lockfile
+            // Verify integrity hash: compare stored integrity with lockfile.
+            // V2 entries carry `inline_integrity` (the link sidecar's
+            // `source_sri`); V1 entries fall back to
+            // `read_stored_integrity` (`.integrity` sentinel file).
             let key = format!("{name}@{version}");
             if let Some(expected_integrity) = lockfile_integrity.get(&key) {
-                match lpm_store::read_stored_integrity(&dir) {
+                let stored = inline_integrity
+                    .clone()
+                    .or_else(|| lpm_store::read_stored_integrity(dir));
+                match stored {
                     Some(stored) => {
                         if stored != *expected_integrity {
                             corrupted.push(format!(
@@ -262,10 +293,12 @@ fn run_verify(
                         }
                     }
                     None => {
-                        // No .integrity file — package was stored before integrity tracking.
-                        // Not an error, but noted at debug level.
+                        // No `.integrity` file AND no v2 sidecar
+                        // integrity — package was stored before
+                        // integrity tracking. Not an error, but noted
+                        // at debug level.
                         tracing::debug!(
-                            "{name}@{version}: no .integrity file (pre-integrity store)"
+                            "{name}@{version}: no integrity record (pre-integrity store)"
                         );
                     }
                 }
@@ -273,8 +306,8 @@ fn run_verify(
 
             // Security cross-check: re-run behavioral analysis and compare with cached.
             // Read-only by default — only writes when --fix is passed.
-            let cached = lpm_security::behavioral::read_cached_analysis(&dir);
-            let fresh = lpm_security::behavioral::analyze_package(&dir);
+            let cached = lpm_security::behavioral::read_cached_analysis(dir);
+            let fresh = lpm_security::behavioral::analyze_package(dir);
 
             match cached {
                 Some(ref cached_analysis) => {
@@ -282,7 +315,7 @@ fn run_verify(
                         security_mismatches += 1;
                         if fix {
                             if let Err(e) =
-                                lpm_security::behavioral::write_cached_analysis(&dir, &fresh)
+                                lpm_security::behavioral::write_cached_analysis(dir, &fresh)
                             {
                                 tracing::warn!(
                                     "failed to re-write .lpm-security.json for {name}@{version}: {e}"
@@ -307,8 +340,7 @@ fn run_verify(
                 None => {
                     security_mismatches += 1;
                     if fix {
-                        if let Err(e) =
-                            lpm_security::behavioral::write_cached_analysis(&dir, &fresh)
+                        if let Err(e) = lpm_security::behavioral::write_cached_analysis(dir, &fresh)
                         {
                             tracing::warn!(
                                 "failed to write .lpm-security.json for {name}@{version}: {e}"
@@ -392,7 +424,7 @@ fn run_verify(
     Ok(())
 }
 
-fn list_store_verify_entries(store: &PackageStore) -> Result<Vec<(String, String)>, LpmError> {
+fn list_v1_verify_entries(store: &PackageStore) -> Result<Vec<StoreVerifyEntry>, LpmError> {
     let store_dir = store.root().join("v1");
     if !store_dir.exists() {
         return Ok(Vec::new());
@@ -421,10 +453,49 @@ fn list_store_verify_entries(store: &PackageStore) -> Result<Vec<(String, String
             continue;
         }
 
-        packages.push((name, version));
+        let dir = store.package_dir(&name, &version);
+        packages.push(StoreVerifyEntry {
+            name,
+            version,
+            dir,
+            inline_integrity: None,
+        });
     }
 
-    packages.sort();
+    packages.sort_by(|a, b| (a.name.as_str(), a.version.as_str()).cmp(&(&b.name, &b.version)));
+    Ok(packages)
+}
+
+/// **Phase 66 confidence-followup S4** — enumerate v2 link entries
+/// for `lpm store verify`. Each link's sidecar (`.lpm-link-meta.json`)
+/// supplies `(name, version, source_sri)` directly; the materialized
+/// package dir is `<link>/node_modules/<name>/`. Links missing a
+/// sidecar are silently skipped (graceful — matches
+/// [`Store::iter_link_entries`]'s contract). Multi-source-same-coords
+/// (Phase 66 §2.2) yields one entry per link, so two links sharing
+/// `(name, version)` get verified independently.
+///
+/// Returns an empty vec for stores with no v2 links (the common case
+/// pre-Phase-66-4b and for v1-only test fixtures).
+fn list_v2_verify_entries(lpm_root: &LpmRoot) -> Result<Vec<StoreVerifyEntry>, LpmError> {
+    let store_v2 = lpm_store::v2::Store::from_lpm_root(lpm_root);
+    let mut packages = Vec::new();
+    for (link_dir, meta) in store_v2.iter_link_entries()? {
+        let pkg_dir = link_dir.join("node_modules").join(&meta.name);
+        packages.push(StoreVerifyEntry {
+            name: meta.name,
+            version: meta.version,
+            dir: pkg_dir,
+            inline_integrity: Some(meta.source_sri),
+        });
+    }
+    packages.sort_by(|a, b| {
+        (a.name.as_str(), a.version.as_str(), a.dir.as_path()).cmp(&(
+            &b.name,
+            &b.version,
+            b.dir.as_path(),
+        ))
+    });
     Ok(packages)
 }
 
@@ -1076,7 +1147,7 @@ mod tests {
         let before = std::fs::read_to_string(pkg_dir.join(".lpm-security.json")).unwrap();
 
         // Verify without --fix: should NOT rewrite the cache
-        run_verify(&store, true, false, true).unwrap();
+        run_verify(&LpmRoot::from_dir(dir.path()), &store, true, false, true).unwrap();
         let after = std::fs::read_to_string(pkg_dir.join(".lpm-security.json")).unwrap();
         assert_eq!(
             before, after,
@@ -1105,7 +1176,7 @@ mod tests {
         let before = std::fs::read_to_string(pkg_dir.join(".lpm-security.json")).unwrap();
 
         // Verify WITH --fix: should rewrite the cache
-        run_verify(&store, true, true, true).unwrap();
+        run_verify(&LpmRoot::from_dir(dir.path()), &store, true, true, true).unwrap();
         let after = std::fs::read_to_string(pkg_dir.join(".lpm-security.json")).unwrap();
         assert_ne!(
             before, after,
@@ -1128,7 +1199,7 @@ mod tests {
         .unwrap();
 
         // Verify without --fix: should not create the cache file
-        run_verify(&store, true, false, true).unwrap();
+        run_verify(&LpmRoot::from_dir(dir.path()), &store, true, false, true).unwrap();
         assert!(
             !pkg_dir.join(".lpm-security.json").exists(),
             "verify without --fix must not create .lpm-security.json"
@@ -1150,11 +1221,172 @@ mod tests {
         .unwrap();
 
         // Verify WITH --fix: should create the cache file
-        run_verify(&store, true, true, true).unwrap();
+        run_verify(&LpmRoot::from_dir(dir.path()), &store, true, true, true).unwrap();
         assert!(
             pkg_dir.join(".lpm-security.json").exists(),
             "verify with --fix must create .lpm-security.json"
         );
+    }
+
+    /// **Phase 66 confidence-followup S4 — v2 verify branch.** Pre-fix,
+    /// `run_verify` walked `<store>/v1/` only. Under v2 the v1 dir
+    /// doesn't exist, so the command silently reported zero packages
+    /// even when hundreds of links sat in `<store>/v2/links/`. This
+    /// test seeds a single v2 link entry (sidecar + node_modules dir +
+    /// package.json) and asserts:
+    ///   1. `list_v2_verify_entries` enumerates the link entry exactly.
+    ///   2. `run_verify` walks the entry without error.
+    ///   3. The integrity check uses the sidecar's `source_sri`
+    ///      directly (no `.integrity` file in v2 link dirs).
+    ///
+    /// Walking `populate_link_entry` would require an extracted object
+    /// directory + the full materialization pipeline; this test
+    /// short-circuits by writing the sidecar via `LinkMeta::write_to`
+    /// directly. Same on-disk shape, smaller test surface — and it
+    /// pins the contract `iter_link_entries` consumes.
+    #[test]
+    fn verify_walks_v2_link_entries() {
+        use lpm_store::v2::link_meta::LinkMeta;
+
+        let dir = tempfile::tempdir().unwrap();
+        let lpm_root = LpmRoot::from_dir(dir.path());
+        let store = PackageStore::at(dir.path().join("store"));
+
+        // Synthesize a v2 link entry on disk. `iter_link_entries`
+        // walks `<lpm_root>/store/v2/links/<key>/` and reads the
+        // `.lpm-link-meta.json` sidecar; the package dir lives at
+        // `links/<key>/node_modules/<name>/`.
+        let v2_links_root = dir.path().join("store").join("v2").join("links");
+        let link_dir = v2_links_root.join("test-pkg@1.0.0+0123456789abcdef");
+        let pkg_dir = link_dir.join("node_modules").join("test-pkg");
+        std::fs::create_dir_all(&pkg_dir).unwrap();
+        std::fs::write(
+            pkg_dir.join("package.json"),
+            r#"{"name":"test-pkg","version":"1.0.0"}"#,
+        )
+        .unwrap();
+        std::fs::write(pkg_dir.join("index.js"), "// nothing").unwrap();
+
+        // Write a sidecar matching the on-disk layout. `write_to`
+        // serializes via the public LinkMeta JSON schema; the
+        // arbitrary `graph_key` / digest values here don't matter for
+        // verify — only `name` / `version` / `source_sri` are read.
+        let meta = LinkMeta {
+            schema: 1,
+            graph_key: "test-pkg@1.0.0+0123456789abcdef".to_string(),
+            graph_key_digest_hex:
+                "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".to_string(),
+            name: "test-pkg".to_string(),
+            version: "1.0.0".to_string(),
+            source_sri: "sha512-test-fake".to_string(),
+            object_path: "objects/sha512-test-fake".to_string(),
+            deps: vec![],
+            platform: lpm_store::v2::link_meta::LinkMetaPlatform {
+                os: "darwin".to_string(),
+                cpu: "arm64".to_string(),
+                libc: None,
+            },
+            created_at: chrono::Utc::now(),
+            last_referenced_at: chrono::Utc::now(),
+        };
+        meta.write_to(&link_dir).unwrap();
+
+        // Step 1: the v2 walker enumerates the entry.
+        let entries = list_v2_verify_entries(&lpm_root).unwrap();
+        assert_eq!(
+            entries.len(),
+            1,
+            "v2 walker must report the seeded link entry"
+        );
+        assert_eq!(entries[0].name, "test-pkg");
+        assert_eq!(entries[0].version, "1.0.0");
+        assert_eq!(
+            entries[0].inline_integrity.as_deref(),
+            Some("sha512-test-fake")
+        );
+        assert!(entries[0].dir.ends_with("node_modules/test-pkg"));
+
+        // Step 2: end-to-end `run_verify` (deep mode, no fix). The
+        // entry passes every check — directory exists, package.json
+        // present, name/version match — and the call returns Ok.
+        // Pre-S4-fix, this assertion would still pass (verify silently
+        // walks no packages and reports "Store is empty"), but step 1
+        // above caught the missing enumeration. The test exists for
+        // both signals.
+        run_verify(&lpm_root, &store, true, false, true)
+            .expect("verify must complete cleanly with one v2 entry");
+    }
+
+    /// **Phase 66 confidence-followup S4** — sanity-check that v1 and
+    /// v2 entries verify side-by-side without one shadowing the other.
+    /// A user mid-migration (some packages installed under v1, others
+    /// under v2) sees both walked.
+    #[test]
+    fn verify_walks_v1_and_v2_entries_concurrently() {
+        use lpm_store::v2::link_meta::LinkMeta;
+
+        let dir = tempfile::tempdir().unwrap();
+        let lpm_root = LpmRoot::from_dir(dir.path());
+        let store = PackageStore::at(dir.path().join("store"));
+
+        // Seed a v1 entry.
+        let v1_pkg_dir = dir.path().join("store").join("v1").join("v1-pkg@1.0.0");
+        std::fs::create_dir_all(&v1_pkg_dir).unwrap();
+        std::fs::write(
+            v1_pkg_dir.join("package.json"),
+            r#"{"name":"v1-pkg","version":"1.0.0"}"#,
+        )
+        .unwrap();
+        std::fs::write(v1_pkg_dir.join(".integrity"), "sha512-v1-test").unwrap();
+
+        // Seed a v2 entry.
+        let v2_link_dir = dir
+            .path()
+            .join("store")
+            .join("v2")
+            .join("links")
+            .join("v2-pkg@2.0.0+abcdef0123456789");
+        let v2_pkg_dir = v2_link_dir.join("node_modules").join("v2-pkg");
+        std::fs::create_dir_all(&v2_pkg_dir).unwrap();
+        std::fs::write(
+            v2_pkg_dir.join("package.json"),
+            r#"{"name":"v2-pkg","version":"2.0.0"}"#,
+        )
+        .unwrap();
+        let meta = LinkMeta {
+            schema: 1,
+            graph_key: "v2-pkg@2.0.0+abcdef0123456789".to_string(),
+            graph_key_digest_hex:
+                "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789".to_string(),
+            name: "v2-pkg".to_string(),
+            version: "2.0.0".to_string(),
+            source_sri: "sha512-v2-test".to_string(),
+            object_path: "objects/sha512-v2-test".to_string(),
+            deps: vec![],
+            platform: lpm_store::v2::link_meta::LinkMetaPlatform {
+                os: "darwin".to_string(),
+                cpu: "arm64".to_string(),
+                libc: None,
+            },
+            created_at: chrono::Utc::now(),
+            last_referenced_at: chrono::Utc::now(),
+        };
+        meta.write_to(&v2_link_dir).unwrap();
+
+        let v1_entries = list_v1_verify_entries(&store).unwrap();
+        let v2_entries = list_v2_verify_entries(&lpm_root).unwrap();
+        assert_eq!(v1_entries.len(), 1);
+        assert_eq!(v2_entries.len(), 1);
+        assert_eq!(v1_entries[0].name, "v1-pkg");
+        assert_eq!(v2_entries[0].name, "v2-pkg");
+        // V1 entries leave inline_integrity None; the verify loop
+        // falls back to `read_stored_integrity`. V2 entries carry
+        // it pre-resolved.
+        assert!(v1_entries[0].inline_integrity.is_none());
+        assert!(v2_entries[0].inline_integrity.is_some());
+
+        run_verify(&lpm_root, &store, true, false, true)
+            .expect("verify must walk both v1 and v2 entries");
     }
 
     // ─── Phase 37 M3.5: global-install reference union ───────────────
@@ -1181,6 +1413,7 @@ mod tests {
             integrity: None,
             dependencies: Vec::new(),
             alias_dependencies: vec![],
+            peers: vec![],
             tarball: None,
         });
         for (name, version) in deps {
@@ -1191,6 +1424,7 @@ mod tests {
                 integrity: None,
                 dependencies: Vec::new(),
                 alias_dependencies: vec![],
+                peers: vec![],
                 tarball: None,
             });
         }

@@ -774,6 +774,7 @@ mod tests {
                 ..Default::default()
             }],
             root_aliases: Default::default(),
+            ambient_peer_installs: Vec::new(),
         };
         let lock_toml = lockfile.to_toml().unwrap();
         std::fs::write(dir.path().join("lpm.lock"), lock_toml).unwrap();
@@ -903,6 +904,7 @@ mod tests {
                 ..Default::default()
             }],
             root_aliases: Default::default(),
+            ambient_peer_installs: Vec::new(),
         };
         std::fs::write(dir.path().join("lpm.lock"), lockfile.to_toml().unwrap()).unwrap();
 
@@ -940,6 +942,7 @@ mod tests {
                 ..Default::default()
             }],
             root_aliases: Default::default(),
+            ambient_peer_installs: Vec::new(),
         };
         std::fs::write(dir.path().join("lpm.lock"), lockfile.to_toml().unwrap()).unwrap();
 
@@ -970,6 +973,7 @@ mod tests {
             },
             packages: vec![],
             root_aliases: Default::default(),
+            ambient_peer_installs: Vec::new(),
         };
         std::fs::write(dir.path().join("lpm.lock"), lockfile.to_toml().unwrap()).unwrap();
 

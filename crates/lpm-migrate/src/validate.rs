@@ -243,6 +243,7 @@ mod tests {
             },
             packages,
             root_aliases: std::collections::BTreeMap::new(),
+            ambient_peer_installs: Vec::new(),
         }
     }
 
@@ -263,6 +264,7 @@ mod tests {
                 integrity: Some("sha512-abc".to_string()),
                 dependencies: vec!["accepts@1.3.8".to_string()],
                 alias_dependencies: vec![],
+                peers: vec![],
                 tarball: None,
             },
             LockedPackage {
@@ -272,6 +274,7 @@ mod tests {
                 integrity: Some("sha512-def".to_string()),
                 dependencies: vec![],
                 alias_dependencies: vec![],
+                peers: vec![],
                 tarball: None,
             },
         ]);
@@ -295,6 +298,7 @@ mod tests {
             integrity: Some("sha512-abc".to_string()),
             dependencies: vec!["missing-dep@1.0.0".to_string()],
             alias_dependencies: vec![],
+            peers: vec![],
             tarball: None,
         }]);
 
@@ -319,6 +323,7 @@ mod tests {
             integrity: Some("sha512-abc".to_string()),
             dependencies: vec![],
             alias_dependencies: vec![],
+            peers: vec![],
             tarball: None,
         }]);
 
@@ -338,6 +343,7 @@ mod tests {
             integrity: Some("md5-notvalid".to_string()),
             dependencies: vec![],
             alias_dependencies: vec![],
+            peers: vec![],
             tarball: None,
         }]);
 
@@ -357,6 +363,7 @@ mod tests {
             integrity: Some("sha512-abc".to_string()),
             dependencies: vec![],
             alias_dependencies: vec![],
+            peers: vec![],
             tarball: None,
         }]);
 
@@ -389,6 +396,7 @@ mod tests {
                 integrity: None,
                 dependencies: vec![],
                 alias_dependencies: vec![],
+                peers: vec![],
                 tarball: None,
             })
             .collect();
@@ -412,6 +420,7 @@ mod tests {
                 integrity: Some("sha256-abc".to_string()),
                 dependencies: vec![],
                 alias_dependencies: vec![],
+                peers: vec![],
                 tarball: None,
             },
             LockedPackage {
@@ -421,6 +430,7 @@ mod tests {
                 integrity: Some("sha384-def".to_string()),
                 dependencies: vec![],
                 alias_dependencies: vec![],
+                peers: vec![],
                 tarball: None,
             },
             LockedPackage {
@@ -430,6 +440,7 @@ mod tests {
                 integrity: Some("sha512-ghi".to_string()),
                 dependencies: vec![],
                 alias_dependencies: vec![],
+                peers: vec![],
                 tarball: None,
             },
             LockedPackage {
@@ -439,6 +450,7 @@ mod tests {
                 integrity: Some("sha1-jkl".to_string()),
                 dependencies: vec![],
                 alias_dependencies: vec![],
+                peers: vec![],
                 tarball: None,
             },
         ]);
@@ -477,6 +489,7 @@ mod tests {
                 integrity: None,
                 dependencies: vec!["b@1.0.0".to_string()],
                 alias_dependencies: vec![],
+                peers: vec![],
                 tarball: None,
             },
             LockedPackage {
@@ -486,6 +499,7 @@ mod tests {
                 integrity: None,
                 dependencies: vec!["a@1.0.0".to_string()],
                 alias_dependencies: vec![],
+                peers: vec![],
                 tarball: None,
             },
         ]);
@@ -510,6 +524,7 @@ mod tests {
                 integrity: None,
                 dependencies: vec!["b@1.0.0".to_string()],
                 alias_dependencies: vec![],
+                peers: vec![],
                 tarball: None,
             },
             LockedPackage {
@@ -519,6 +534,7 @@ mod tests {
                 integrity: None,
                 dependencies: vec!["c@1.0.0".to_string()],
                 alias_dependencies: vec![],
+                peers: vec![],
                 tarball: None,
             },
             LockedPackage {
@@ -528,6 +544,7 @@ mod tests {
                 integrity: None,
                 dependencies: vec!["a@1.0.0".to_string()],
                 alias_dependencies: vec![],
+                peers: vec![],
                 tarball: None,
             },
         ]);
@@ -552,6 +569,7 @@ mod tests {
                 integrity: None,
                 dependencies: vec!["b@1.0.0".to_string(), "c@1.0.0".to_string()],
                 alias_dependencies: vec![],
+                peers: vec![],
                 tarball: None,
             },
             LockedPackage {
@@ -561,6 +579,7 @@ mod tests {
                 integrity: None,
                 dependencies: vec!["c@1.0.0".to_string()],
                 alias_dependencies: vec![],
+                peers: vec![],
                 tarball: None,
             },
             LockedPackage {
@@ -570,6 +589,7 @@ mod tests {
                 integrity: None,
                 dependencies: vec![],
                 alias_dependencies: vec![],
+                peers: vec![],
                 tarball: None,
             },
         ]);

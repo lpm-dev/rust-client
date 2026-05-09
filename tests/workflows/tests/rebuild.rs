@@ -132,7 +132,7 @@ fn write_lockfile_for_packages(project: &TempProject, packages: &[(&str, &str)])
         .map(|(n, v)| format!("[[packages]]\nname = \"{n}\"\nversion = \"{v}\"\n"))
         .collect();
     let toml = format!(
-        "[metadata]\nlockfile-version = 1\nresolved-with = \"pubgrub\"\n\n{}\n",
+        "[metadata]\nlockfile-version = 2\nresolved-with = \"pubgrub\"\n\n{}\n",
         pkg_entries.join("\n")
     );
     project.write_file("lpm.lock", &toml);

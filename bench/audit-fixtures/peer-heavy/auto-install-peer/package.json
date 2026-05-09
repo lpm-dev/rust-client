@@ -1,0 +1,9 @@
+{
+	"name": "audit-fixture-auto-install-peer",
+	"version": "1.0.0",
+	"private": true,
+	"_comment": "Phase 66 R2.2 — eager peer auto-install (bun-parity). Declares react-redux ONLY; react (a required peer of react-redux@^9) is intentionally absent from `dependencies`. Pre-R2.2: install completed but react was missing from node_modules and `require('react-redux')` hard-failed at the top-level `require('react')` inside react-redux's CJS shim — exactly the DX the user paid the package manager to avoid. Post-R2.2: the resolver's peer-drain pass detects the unmet required peer and synthesizes a root-scoped ambient install, so react lands at `node_modules/react/` and react-redux loads cleanly. Symmetric-PASS expected post-R2.2; symmetric-FAIL pre-R2.2.",
+	"dependencies": {
+		"react-redux": "^9.0.0"
+	}
+}

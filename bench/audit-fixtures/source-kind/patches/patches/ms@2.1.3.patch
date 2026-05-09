@@ -1,0 +1,11 @@
+--- a/index.js	2026-05-08 16:47:54
++++ b/index.js	2026-05-08 16:47:54
+@@ -160,3 +160,8 @@
+   var isPlural = msAbs >= n * 1.5;
+   return Math.round(ms / n) + ' ' + name + (isPlural ? 's' : '');
+ }
++
++// PATCH-SENTINEL: lpm-patch-fixture
++module.exports.lpmPatchProof = function () {
++  return 'patched-by-lpm-fixture-2f';
++};

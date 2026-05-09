@@ -30,7 +30,7 @@ fn seed_installed_package(project: &TempProject, pkg: &str, version: &str) {
     project.write_file(
         "lpm.lock",
         &format!(
-            "[metadata]\nlockfile-version = 1\nresolved-with = \"greedy-fusion\"\n\n\
+            "[metadata]\nlockfile-version = 2\nresolved-with = \"greedy-fusion\"\n\n\
              [[packages]]\nname = \"{pkg}\"\nversion = \"{version}\"\n\
              source = \"registry+https://lpm.dev\"\n",
         ),
@@ -332,7 +332,7 @@ fn uninstall_json_envelope_with_one_removal_matches_snapshot() {
     );
     project.write_file(
         "lpm.lock",
-        "[metadata]\nlockfile-version = 1\nresolved-with = \"greedy-fusion\"\n",
+        "[metadata]\nlockfile-version = 2\nresolved-with = \"greedy-fusion\"\n",
     );
 
     let out = lpm(&project)

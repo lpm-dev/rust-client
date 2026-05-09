@@ -32,6 +32,7 @@ fn lockfile_toml_binary_roundtrip() {
                 vec![]
             },
             alias_dependencies: vec![],
+            peers: vec![],
             tarball: None,
         });
     }
@@ -65,6 +66,7 @@ fn lockfile_binary_corrupt_falls_back_to_toml() {
         integrity: None,
         dependencies: vec![],
         alias_dependencies: vec![],
+        peers: vec![],
         tarball: None,
     });
 

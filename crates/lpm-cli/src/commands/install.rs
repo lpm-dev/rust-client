@@ -3246,6 +3246,54 @@ async fn run_with_options_under_store_lock(
     let pkg = lpm_workspace::read_package_json(&pkg_json_path)
         .map_err(|e| LpmError::Registry(format!("failed to read package.json: {e}")))?;
 
+    // **R2.5 — pre-flight `auto_install_peers` resolution.** Hoisted
+    // here (above the empty-deps short-circuit, the lockfile fast
+    // path, and the freshness check) so the v1-lockfile gate AND
+    // the pubgrub-mismatch warning fire regardless of which install
+    // codepath ultimately runs. Same precedence chain documented on
+    // `LpmConfig.auto_install_peers`:
+    //   `package.json > lpm > autoInstallPeers`
+    //   → `~/.lpm/config.toml > auto-install-peers`
+    //   → default `true` (bun-parity beta).
+    let auto_install_peers: bool = pkg
+        .lpm
+        .as_ref()
+        .and_then(|l| l.auto_install_peers)
+        .or_else(|| crate::commands::config::GlobalConfig::load().get_bool("auto-install-peers"))
+        .unwrap_or(true);
+    let pubgrub_opt_out = std::env::var("LPM_RESOLVER").as_deref() == Ok("pubgrub");
+
+    // **R2.5 fix-2 — pubgrub-mismatch warning.**
+    //
+    // Pre-fix this warning was emitted only when `!json_output`,
+    // which silenced it for any wrapper, CI, or tooling using
+    // `--json` — exactly the audience that needs the signal MOST,
+    // since they consume the install programmatically and otherwise
+    // silently take the install-tree-divergence between
+    // `LPM_RESOLVER=pubgrub` (no auto-install) and the default
+    // greedy-fusion (auto-install on).
+    //
+    // Post-fix the warning fires unconditionally on stderr.
+    // `--json` consumers parse stdout for the envelope; stderr is
+    // separate. Matches every other warning in the install pipeline
+    // (`output::warn` → stderr).
+    //
+    // Hoisted above the empty-deps short-circuit + lockfile fast
+    // path so the warning surfaces even on installs that don't run
+    // the resolver — the same env-var + config combination produces
+    // a different install tree on a non-empty `lpm install` later,
+    // and surfacing the warning early gives the user a chance to
+    // notice before they hit it.
+    if pubgrub_opt_out && auto_install_peers {
+        output::warn(
+            "LPM_RESOLVER=pubgrub does not support eager peer auto-install \
+             (lpm.autoInstallPeers = true). Missing peers will surface as \
+             warnings only — the install tree will differ from the default \
+             greedy-fusion resolver. To silence this warning, either unset \
+             LPM_RESOLVER or set `lpm.autoInstallPeers = false` in package.json.",
+        );
+    }
+
     // Resolve the effective linker BEFORE the freshness check so:
     //   1. Invalid CLI / config.toml / `LPM_LINKER` / `package.json > lpm
     //      > linker` values fail loudly here, regardless of whether the
@@ -3805,7 +3853,7 @@ async fn run_with_options_under_store_lock(
         // strict (`false`) — they have the fresh-resolve fallback for
         // any non-admissible lockfile shape, and skipping the fresh-
         // resolve re-checks would be a real correctness regression.
-        let locked = try_lockfile_fast_path(&lockfile_path, &deps, client, &gate_stats, true)
+        let fast = try_lockfile_fast_path(&lockfile_path, &deps, client, &gate_stats, true)
             .ok_or_else(|| {
                 LpmError::Registry(
                     "--offline could not load the lockfile. Possible causes: (1) lpm.lock is \
@@ -3815,8 +3863,33 @@ async fn run_with_options_under_store_lock(
                          Run `lpm install` online to reconcile."
                         .into(),
                 )
-            })?
-            .packages; // Offline mode skips the writeback machinery —
+            })?;
+        // **R2.5 fix-1 (offline arm).** Same repair-gate semantic as
+        // the online path, but `--offline` can't re-resolve to
+        // re-derive the missing R2.5 state. The choice is between
+        // replaying a known-broken tree (pre-R2.5 v1 lockfiles
+        // produced by R2.2-R2.4 buggy writers were missing
+        // `ambient-peer-installs` and per-package `peers`, so
+        // `node_modules/<auto-installed-peer>/` is dropped on
+        // replay and `require('react-redux')` hard-fails at runtime)
+        // and refusing the install with an actionable message.
+        // Refusing is the only safe answer: the offline path
+        // cannot detect whether the v1 lockfile was ever buggy or
+        // always correct, so it has to assume the worst when
+        // `auto_install_peers` is on.
+        if lockfile_needs_r25_repair(&fast.lockfile, auto_install_peers) {
+            return Err(LpmError::Registry(
+                "--offline cannot use a pre-R2.5 lockfile under \
+                 `lpm.autoInstallPeers = true`: the lockfile may be missing \
+                 ambient-peer-install state from R2.2-R2.4 builds. Run \
+                 `lpm install` (online) once to re-derive and upgrade the \
+                 lockfile to v2, then retry --offline. To bypass this check \
+                 and accept warn-only peer semantics, set \
+                 `lpm.autoInstallPeers = false` in package.json."
+                    .into(),
+            ));
+        }
+        let locked = fast.packages; // Offline mode skips the writeback machinery —
         // no fetch happens, no URLs diverge, and any v1
         // → v2 binary migration is deferred to the next
         // online install (intentional — `--offline` is
@@ -3920,6 +3993,12 @@ async fn run_with_options_under_store_lock(
         .await;
     }
 
+    // **R2.5** — `auto_install_peers` and `pubgrub_opt_out` are
+    // computed at the top of `run_with_options` (above the empty-deps
+    // short-circuit) so the pubgrub-mismatch warning fires regardless
+    // of which install codepath ultimately runs. The lockfile-repair
+    // gate below reuses the same `auto_install_peers` value.
+
     // --force skips lockfile fast path to force fresh resolution from registry.
     // --overrides-changed also skips it (Phase 32 Phase 5).
     // --patches-changed also skips it (Phase 32 Phase 6) — re-applying a
@@ -3935,13 +4014,34 @@ async fn run_with_options_under_store_lock(
         // fresh resolve. The offline arm at line 3395 passes `true`
         // and trusts the lockfile because fresh-resolve isn't
         // available offline.
-        try_lockfile_fast_path(&lockfile_path, &deps, client, &gate_stats, false)
+        let candidate = try_lockfile_fast_path(&lockfile_path, &deps, client, &gate_stats, false);
+        match candidate {
+            Some(fast) if lockfile_needs_r25_repair(&fast.lockfile, auto_install_peers) => {
+                if !json_output {
+                    output::info(
+                        "Lockfile is from a pre-R2.5 build; rebuilding to capture \
+                         eager peer auto-install state. Subsequent installs will \
+                         be fast.",
+                    );
+                }
+                None
+            }
+            other => other,
+        }
     };
     // **Phase 32 Phase 5** — applied-override trace for the rest of the
     // install pipeline. Empty for the lockfile-fast-path branch (we
     // preserve the previously-recorded trace from disk in that case);
     // populated for fresh resolution from the resolver's apply log.
     let mut applied_overrides: Vec<OverrideHit> = Vec::new();
+
+    // **R2.5** — ambient peer installs synthesized by the resolver,
+    // captured here so the cold-resolve lockfile-write site below
+    // can persist them. Empty when the fast path takes over (we
+    // already have the lockfile, no need to re-derive); populated by
+    // the fresh-resolve branch from
+    // `resolve_result.ambient_peer_installs`.
+    let mut ambient_peer_installs_for_lockfile: Vec<String> = Vec::new();
 
     // Phase 38 P3: fetch semaphore hoisted out of the fetch loop so the
     // optional speculative dispatcher can share the 16-permit download
@@ -3955,6 +4055,14 @@ async fn run_with_options_under_store_lock(
     // resolve phase. Post-resolve, the fetch loop rebinds to the same
     // handle (cheap Arc-style clone underneath).
     let store = PackageStore::default_location()?;
+    // Phase 66 confidence-followup S5b — `lpm_root` lifted to function
+    // scope so post-install helpers (`show_install_build_hint`,
+    // `all_scripted_packages_trusted`) can reach the v2 store via
+    // `find_installed_package_baseline`. Pre-fix, those helpers took
+    // `&PackageStore` (v1-only) and silently dropped every v2-installed
+    // scripted package — auto-build never fired, build hints reported
+    // 0 packages even when prisma / esbuild / sharp were waiting.
+    let lpm_root = lpm_common::LpmRoot::from_env()?;
 
     // Phase 66 Phase 4b — read the store-version flag once per
     // install. `LPM_STORE_VERSION=v2` opts in to the virtual-store
@@ -3968,7 +4076,6 @@ async fn run_with_options_under_store_lock(
     // allocation-free.
     let store_version = lpm_store::StoreVersion::from_env();
     let store_v2_handle: Option<std::sync::Arc<lpm_store::v2::Store>> = if store_version.is_v2() {
-        let lpm_root = lpm_common::LpmRoot::from_env()?;
         Some(std::sync::Arc::new(lpm_store::v2::Store::from_lpm_root(
             &lpm_root,
         )))
@@ -4196,7 +4303,12 @@ async fn run_with_options_under_store_lock(
             // -3,603 ms median delta, paired t = -23.27. The default-
             // flip preserves these numbers (now reachable without the
             // `LPM_RESOLVER=greedy` opt-in env var).
-            let pubgrub_opt_out = std::env::var("LPM_RESOLVER").as_deref() == Ok("pubgrub");
+            // **R2.5 hoist.** `pubgrub_opt_out` and `auto_install_peers`
+            // are computed at the top of `run_with_options` (above
+            // the lockfile fast-path call) so the v1-lockfile gate
+            // and the pubgrub-mismatch warning fire even on warm
+            // installs that take the lockfile fast path. The two
+            // values are reused unchanged here.
             let fusion_disabled = std::env::var("LPM_GREEDY_FUSION").as_deref() == Ok("0");
             let fusion_enabled_local = !pubgrub_opt_out && !fusion_disabled;
 
@@ -4262,6 +4374,7 @@ async fn run_with_options_under_store_lock(
                     route_table.clone(),
                     npm_fanout,
                     Some(spec_tx),
+                    auto_install_peers,
                 )
                 .await
                 .map_err(|e| LpmError::Registry(format!("resolution failed: {e}")));
@@ -4400,6 +4513,7 @@ async fn run_with_options_under_store_lock(
                         std::time::Duration::from_secs(5),
                         route_table.clone(),
                         streaming_metrics_for_resolve,
+                        auto_install_peers,
                     )
                     .await
                     .map_err(|e| LpmError::Registry(format!("resolution failed: {e}")));
@@ -4493,10 +4607,18 @@ async fn run_with_options_under_store_lock(
             // observability story in `timing.resolve.*`.
             resolver_stage_timing = resolve_result.stage_timing;
 
+            // **R2.5** — clone the ambient peer install set BEFORE we
+            // hand `resolve_result` off to `resolved_to_install_packages`
+            // (which only borrows it). Persisted to the lockfile far
+            // below at the cold-resolve write site so warm reinstalls
+            // reproduce the same top-level node_modules layout.
+            ambient_peer_installs_for_lockfile = resolve_result.ambient_peer_installs.clone();
+
             let mut packages = resolved_to_install_packages(
                 &resolve_result.packages,
                 &deps,
                 &resolve_result.root_aliases,
+                &resolve_result.ambient_peer_installs,
                 &route_table,
             );
 
@@ -6083,7 +6205,7 @@ async fn run_with_options_under_store_lock(
                     .map(|p| (p.name.clone(), p.version.clone(), p.integrity.clone()))
                     .collect();
                 crate::commands::rebuild::show_install_build_hint(
-                    &store,
+                    &lpm_root,
                     &all_pkgs,
                     &policy,
                     project_dir,
@@ -6288,6 +6410,19 @@ async fn run_with_options_under_store_lock(
                 .map(|(local, target)| [local.clone(), target.clone()])
                 .collect();
 
+            // **R2.5** — persist resolved peers per package as
+            // `<peer_name>@<version>` strings (same shape as
+            // `dependencies`). Sorted upstream by `format_solution` /
+            // `into_resolved_packages`; copied verbatim. Empty for
+            // packages without peers — the serde
+            // `skip_serializing_if = "Vec::is_empty"` keeps lockfiles
+            // of pre-R2.5 projects byte-identical.
+            let peer_strings: Vec<String> = p
+                .peers
+                .iter()
+                .map(|(name, version)| format!("{name}@{version}"))
+                .collect();
+
             lockfile.add_package(lpm_lockfile::LockedPackage {
                 name: p.name.clone(),
                 version: p.version.clone(),
@@ -6295,6 +6430,7 @@ async fn run_with_options_under_store_lock(
                 integrity: p.integrity.clone(),
                 dependencies: dep_strings,
                 alias_dependencies: alias_pairs,
+                peers: peer_strings,
                 // Phase 43 — persist the tarball URL the registry
                 // returned at resolve time so warm installs can skip
                 // the per-package metadata round-trip. Consumed by
@@ -6309,6 +6445,14 @@ async fn run_with_options_under_store_lock(
         // gives deterministic serialized order, matching the
         // sort-by-name policy on `packages`.
         lockfile.root_aliases = root_aliases_for_lockfile(&packages, &deps);
+
+        // **R2.5** — persist the resolver's `ambient_peer_installs`
+        // set so the warm-install fast path knows which canonicals
+        // to surface as top-level node_modules entries. Without this,
+        // `rm -rf node_modules && lpm install` from the lockfile
+        // would skip the auto-installed peer (it isn't in
+        // `pkg.dependencies`) and produce a broken tree.
+        lockfile.ambient_peer_installs = ambient_peer_installs_for_lockfile.clone();
 
         lockfile
             .write_all(&lockfile_path)
@@ -6439,7 +6583,7 @@ async fn run_with_options_under_store_lock(
         .get_bool("force-security-floor")
         .unwrap_or(false);
     let all_trusted = crate::commands::rebuild::all_scripted_packages_trusted(
-        &store,
+        &lpm_root,
         &all_pkgs_for_build,
         &policy,
         project_dir,
@@ -6684,6 +6828,13 @@ async fn run_with_options_under_store_lock(
                     //                           dispatcher (parity with
                     //                           pre-fusion `speculative`
                     //                           on the walker arm).
+                    //   peer_prefetch_count   — Phase 66 R2.4: speculative
+                    //                           peer-manifest fetches
+                    //                           dispatched concurrent with
+                    //                           the regular dep walk.
+                    //                           Each such fetch saved one
+                    //                           sequential round-trip from
+                    //                           the post-loop drain pass.
                     "dispatcher": {
                         "rpc_count": resolver_stage_timing.dispatcher_rpc_count,
                         "inflight_high_water":
@@ -6691,6 +6842,8 @@ async fn run_with_options_under_store_lock(
                         "parked_max_depth": resolver_stage_timing.parked_max_depth,
                         "tarball_dispatched":
                             resolver_stage_timing.tarball_dispatched_count,
+                        "peer_prefetch_count":
+                            resolver_stage_timing.peer_prefetch_count,
                     },
                     // Phase 49 §6: streaming-BFS observability per
                     // preplan §5.6. Null on warm lockfile-fast-path
@@ -7564,6 +7717,38 @@ struct LockfileFastPath {
     needs_binary_upgrade: bool,
 }
 
+/// **R2.5 fix-1** — gate that decides whether a fast-path lockfile
+/// candidate must be discarded in favor of a fresh resolve so the
+/// pre-R2.5 ambient-peer hole gets repaired.
+///
+/// **The hole.** R2.2 through R2.4 builds auto-installed missing
+/// required peers but did not persist `ambient-peer-installs` or
+/// per-package `peers` to the lockfile (R2.5 added both fields).
+/// A user upgrading from one of those builds to R2.5+ has a v1
+/// lockfile that LOOKS legal under the new schema (the new fields
+/// have `#[serde(default)]`) but is silently missing data the v2
+/// linker needs to reproduce the cold-install tree. Without this
+/// gate, `rm -rf node_modules && lpm install` would replay the v1
+/// lockfile, skip surfacing the auto-installed peer at top level,
+/// and produce a tree where `require('react-redux')` fails because
+/// `node_modules/react/` is absent.
+///
+/// **The gate.** When `auto_install_peers` is on and the lockfile's
+/// metadata version is older than the current `LOCKFILE_VERSION`,
+/// we can't trust that an empty `ambient-peer-installs` field
+/// reflects truth (vs. "field was absent in source TOML"). Discard
+/// the fast path; the cold resolve below writes a v2 lockfile,
+/// restoring fast-path eligibility on subsequent installs.
+///
+/// **When this returns false (fast path proceeds):**
+/// - v2+ lockfile (authoritative empty-vs-non-empty distinction).
+/// - v1 lockfile under `auto_install_peers = false` — under opt-out,
+///   no ambient installs were ever performed, so the v1 lockfile
+///   is correct as-is.
+fn lockfile_needs_r25_repair(lockfile: &lpm_lockfile::Lockfile, auto_install_peers: bool) -> bool {
+    auto_install_peers && lockfile.metadata.lockfile_version < lpm_lockfile::LOCKFILE_VERSION
+}
+
 fn try_lockfile_fast_path(
     lockfile_path: &Path,
     deps: &HashMap<String, String>,
@@ -7698,6 +7883,28 @@ fn try_lockfile_fast_path(
                 .push(local.clone());
         }
     }
+    // **R2.5** — surface lockfile-recorded ambient peer installs
+    // (auto-installed peers from the cold resolve) at the project's
+    // top-level `node_modules/<peer>/`. Without this, a warm install
+    // from a lockfile produced by an R2.2+ cold resolve would skip
+    // the auto-installed peer entirely (it's not in
+    // `pkg.dependencies` so `deps.keys()` above never visits it),
+    // leaving react-redux unable to resolve its `react` peer at
+    // runtime. Mirrors the cold-resolve surface logic in
+    // `resolved_to_install_packages` (install.rs:7942-7971).
+    //
+    // Dedup against `deps.keys()` matches the cold-resolve writer:
+    // if the user later moves the auto-installed peer into their
+    // `dependencies`, we don't want a double-link entry.
+    for ambient in &lockfile.ambient_peer_installs {
+        if let Some(lp) = lockfile.find_package(ambient) {
+            let key = lp.package_key();
+            let entry = root_link_map.entry(key).or_default();
+            if !entry.iter().any(|l| l == ambient) {
+                entry.push(ambient.clone());
+            }
+        }
+    }
     for locals in root_link_map.values_mut() {
         locals.sort();
     }
@@ -7729,6 +7936,35 @@ fn try_lockfile_fast_path(
                 .map(|pair| (pair[0].clone(), pair[1].clone()))
                 .collect();
 
+            // **R2.5** — restore per-package peer pinning from the
+            // lockfile. Same string shape as `dependencies`:
+            // `<peer_name>@<version>`. Empty for packages without
+            // peer dependencies (most of the tree). Load-bearing for
+            // v2 graph-key reproducibility — the v2 linker hashes
+            // peer pinning into the link-entry identity, so a warm
+            // install that forgets peer state computes a different
+            // graph key than the cold install and silently
+            // materializes a separate link entry (worst case: shares
+            // an entry with an unrelated project that happens to
+            // have matching dep edges + empty peers).
+            //
+            // Pre-R2.5 lockfiles have no `peers = [...]` field; serde
+            // defaults to empty Vec. The first warm install on such
+            // a lockfile reconstructs with empty peers, which
+            // happens to match what the v2 linker would have
+            // produced under the empty-peer-context graph key — same
+            // wrong-but-self-consistent shape as before R2.5.
+            // Re-running a fresh resolve writes the peers field and
+            // upgrades the project to the correct shape.
+            let peers: Vec<(String, String)> = lp
+                .peers
+                .iter()
+                .filter_map(|s| {
+                    s.rfind('@')
+                        .map(|at| (s[..at].to_string(), s[at + 1..].to_string()))
+                })
+                .collect();
+
             // Phase 59.0 day-7: lookup by PackageKey to match the
             // map's source-aware key shape.
             let root_link_names = root_link_map.get(&lp.package_key()).cloned();
@@ -7749,7 +7985,7 @@ fn try_lockfile_fast_path(
                 root_link_names,
                 is_direct: direct_target_names.contains(&lp.name),
                 is_lpm,
-                peers: Vec::new(),
+                peers,
                 integrity: lp.integrity.clone(),
                 // Phase 43 — gate a stored URL against scheme/shape/
                 // origin before reusing it. Any rejection downgrades
@@ -7846,10 +8082,26 @@ fn root_aliases_for_lockfile(
 /// `ResolvedPackage.aliases`. Root-level `root_link_names` are
 /// filled in later in the install pipeline, since they require
 /// matching resolved versions against the root `deps` map.
+///
+/// **Phase 66 R2.2** — `ambient_peer_installs` carries the canonical
+/// names the resolver synthesized as ambient root-scoped installs to
+/// satisfy unmet required peers (auto-install). They are NOT in
+/// `deps` (the user's `package.json > dependencies`), but they MUST
+/// surface at the project's top-level `node_modules/<name>/` so
+/// runtime `require()` from peer-declaring consumers resolves
+/// correctly. This function unions them with `deps.keys()` when
+/// computing both `direct_target_names` (for `is_direct`/script
+/// gating) and `root_link_map` (for top-level node_modules symlinks).
+/// Ambient installs are NOT marked `is_direct = true` because they
+/// aren't user-declared — they shouldn't trigger scripts that the
+/// user didn't opt into. They DO get root-link entries so the
+/// linker exposes them at the canonical module-resolution path.
 fn resolved_to_install_packages(
     resolved: &[ResolvedPackage],
     deps: &HashMap<String, String>,
     root_aliases: &HashMap<String, String>,
+    // Phase 66 R2.2 — see doc above.
+    ambient_peer_installs: &[String],
     // Phase 59.0 (post-review) — supplied so the source string
     // reflects the actual registry the package was fetched from
     // (`.npmrc`-mapped private mirrors, etc.) rather than a
@@ -7861,6 +8113,11 @@ fn resolved_to_install_packages(
     // Targets the root either declares directly OR reaches via an
     // npm-alias: each such target's (any version's) resolved package
     // is considered a direct dep for scripts/display.
+    //
+    // **Note:** ambient_peer_installs are intentionally NOT folded
+    // into `direct_target_names` — they aren't user-declared, so
+    // they don't get `is_direct = true` (which gates script
+    // execution + display). They DO get root_link entries below.
     let direct_target_names: std::collections::HashSet<String> = deps
         .keys()
         .map(|local| {
@@ -7896,6 +8153,24 @@ fn resolved_to_install_packages(
                 ))
                 .or_default()
                 .push(local.clone());
+        }
+    }
+    // **R2.2** — ambient peer installs also need top-level link
+    // entries so `node_modules/<peer>/` resolves at runtime. Unioned
+    // here rather than in `deps` so `is_direct` (above) stays false
+    // for them — same key shape, separate provenance.
+    for ambient in ambient_peer_installs {
+        if let Some(version) = resolved_target_meta.get(ambient) {
+            let registry_url = registry_source_url_for(ambient, route_table);
+            let source_id = lpm_lockfile::Source::Registry { url: registry_url }.source_id();
+            let key = lpm_lockfile::PackageKey::new(ambient.clone(), version.clone(), source_id);
+            // Avoid duplicate locals if the user ALSO listed the peer
+            // in their `dependencies` (in which case `deps.keys()`
+            // already covered it; we shouldn't double-link).
+            let entry = root_link_map.entry(key).or_default();
+            if !entry.iter().any(|l| l == ambient) {
+                entry.push(ambient.clone());
+            }
         }
     }
     // Stable ordering so snapshot tests and binary round-trips don't
@@ -7997,6 +8272,9 @@ async fn run_link_and_finish(
     script_policy_override: Option<crate::script_policy_config::ScriptPolicy>,
 ) -> Result<(), LpmError> {
     let store = PackageStore::default_location()?;
+    // Phase 66 confidence-followup S5b — same hoist as `run_with_options`;
+    // post-install helpers route through `find_installed_package_baseline`.
+    let lpm_root = lpm_common::LpmRoot::from_env()?;
 
     let link_targets: Vec<LinkTarget> = packages
         .iter()
@@ -8161,7 +8439,7 @@ async fn run_link_and_finish(
                     .map(|p| (p.name.clone(), p.version.clone(), p.integrity.clone()))
                     .collect();
                 crate::commands::rebuild::show_install_build_hint(
-                    &store,
+                    &lpm_root,
                     &all_pkgs,
                     &policy,
                     project_dir,
@@ -11256,6 +11534,8 @@ mod tests {
                     dependencies: Default::default(),
                     dev_dependencies: Default::default(),
                     peer_dependencies: Default::default(),
+                    peer_dependencies_meta: Default::default(),
+                    bundle_dependencies: Default::default(),
                     optional_dependencies: Default::default(),
                     os: vec![],
                     cpu: vec![],
@@ -13316,6 +13596,7 @@ mod tests {
             &resolved,
             &deps,
             &HashMap::new(),
+            &[], // R2.2: tests don't exercise ambient peer installs
             &lpm_registry::RouteTable::from_mode_only(lpm_registry::RouteMode::Direct),
         );
 
@@ -13342,6 +13623,85 @@ mod tests {
         );
     }
 
+    // ── R2.5 fix-1 — pre-R2.5 lockfile repair gate ─────────────────
+    //
+    // The gate's contract:
+    //   - v2+ lockfile (authoritative schema): trust empty
+    //     `ambient-peer-installs` as "no ambient installs."
+    //   - v1 lockfile + `auto_install_peers = true`: discard.
+    //   - v1 lockfile + `auto_install_peers = false`: trust (no
+    //     ambient installs were ever performed under opt-out).
+    //
+    // These tests pin the four-way truth table so a future schema
+    // bump or precedence change can't silently re-open the hole.
+
+    fn make_lockfile_with_version(v: u32) -> lpm_lockfile::Lockfile {
+        let mut lf = lpm_lockfile::Lockfile::new();
+        lf.metadata.lockfile_version = v;
+        lf
+    }
+
+    #[test]
+    fn r25_repair_gate_v2_lockfile_with_auto_install_takes_fast_path() {
+        // The post-R2.5 happy path: v2 lockfile, auto-install on,
+        // schema is authoritative. Don't repair.
+        let lf = make_lockfile_with_version(lpm_lockfile::LOCKFILE_VERSION);
+        assert!(
+            !lockfile_needs_r25_repair(&lf, true),
+            "v2 lockfile with auto-install on must take fast path — \
+             empty ambient-peer-installs is authoritative"
+        );
+    }
+
+    #[test]
+    fn r25_repair_gate_v1_lockfile_with_auto_install_forces_repair() {
+        // The load-bearing test. A v1 lockfile (pre-R2.5) under
+        // `auto_install_peers = true` is suspect: it could be an
+        // R2.2-R2.4 buggy-writer artifact. Discard fast path so a
+        // fresh resolve repopulates the new fields.
+        let lf = make_lockfile_with_version(1);
+        assert!(
+            lockfile_needs_r25_repair(&lf, true),
+            "v1 lockfile under auto_install_peers=true must force \
+             fresh resolve — the silent ambient-peer-installs hole \
+             from R2.2-R2.4 cannot be repaired any other way"
+        );
+    }
+
+    #[test]
+    fn r25_repair_gate_v1_lockfile_with_auto_install_off_takes_fast_path() {
+        // The opt-out path: with `auto_install_peers = false`, no
+        // ambient installs were ever performed, so a v1 lockfile is
+        // correct as-is. Honor it.
+        let lf = make_lockfile_with_version(1);
+        assert!(
+            !lockfile_needs_r25_repair(&lf, false),
+            "v1 lockfile under auto_install_peers=false must take \
+             fast path — opt-out installs never produced ambient peers"
+        );
+    }
+
+    #[test]
+    fn r25_repair_gate_v2_lockfile_with_auto_install_off_takes_fast_path() {
+        // Sanity baseline: v2 + opt-out → trust fast path. Symmetric
+        // with the v2 + on case above; covered for completeness so
+        // no future logic branch can silently invert it.
+        let lf = make_lockfile_with_version(lpm_lockfile::LOCKFILE_VERSION);
+        assert!(!lockfile_needs_r25_repair(&lf, false));
+    }
+
+    #[test]
+    fn r25_lockfile_version_is_2() {
+        // The schema-bump anchor. R2.5's writer side puts version=2
+        // on every fresh lockfile via `Lockfile::new`. If a future
+        // refactor drops this back to 1 without thinking through the
+        // gate's truth table, this test fails first. Keep paired with
+        // the gate tests above.
+        assert_eq!(lpm_lockfile::LOCKFILE_VERSION, 2);
+        let lf = lpm_lockfile::Lockfile::new();
+        assert_eq!(lf.metadata.lockfile_version, 2);
+    }
+
     #[test]
     fn resolved_to_install_packages_keeps_distinct_versions() {
         // Different versions of the same name must NOT be deduped — only
@@ -13357,6 +13717,7 @@ mod tests {
             &resolved,
             &deps,
             &HashMap::new(),
+            &[], // R2.2: tests don't exercise ambient peer installs
             &lpm_registry::RouteTable::from_mode_only(lpm_registry::RouteMode::Direct),
         );
 
@@ -13383,6 +13744,7 @@ mod tests {
             &resolved,
             &deps,
             &HashMap::new(),
+            &[], // R2.2: tests don't exercise ambient peer installs
             &lpm_registry::RouteTable::from_mode_only(lpm_registry::RouteMode::Direct),
         );
 
@@ -13425,6 +13787,7 @@ mod tests {
             &resolved,
             &deps,
             &HashMap::new(),
+            &[], // R2.2: tests don't exercise ambient peer installs
             &lpm_registry::RouteTable::from_mode_only(lpm_registry::RouteMode::Direct),
         );
 
@@ -13443,6 +13806,7 @@ mod tests {
             &resolved,
             &deps,
             &HashMap::new(),
+            &[], // R2.2: tests don't exercise ambient peer installs
             &lpm_registry::RouteTable::from_mode_only(lpm_registry::RouteMode::Direct),
         );
 
@@ -13469,8 +13833,13 @@ mod tests {
         let resolved = vec![fake_resolved("react", "19.0.0", None)];
         let deps: HashMap<String, String> = [("react".to_string(), "^19.0.0".to_string())].into();
 
-        let installed =
-            resolved_to_install_packages(&resolved, &deps, &HashMap::new(), &route_table);
+        let installed = resolved_to_install_packages(
+            &resolved,
+            &deps,
+            &HashMap::new(),
+            &[], // R2.2: tests don't exercise ambient peer installs
+            &route_table,
+        );
 
         assert_eq!(installed.len(), 1);
         assert_eq!(
@@ -13550,6 +13919,7 @@ mod tests {
             integrity: None,
             dependencies: vec![],
             alias_dependencies: vec![],
+            peers: vec![],
             tarball: None,
         });
         lf.write_to_file(&lockfile_path).unwrap();
@@ -13612,6 +13982,7 @@ mod tests {
             integrity: None,
             dependencies: vec![],
             alias_dependencies: vec![],
+            peers: vec![],
             tarball: None,
         });
         lf.write_to_file(&lockfile_path).unwrap();
@@ -13646,6 +14017,7 @@ mod tests {
             integrity: None,
             dependencies: vec![],
             alias_dependencies: vec![],
+            peers: vec![],
             tarball: None,
         });
         // `write_all` writes BOTH the TOML and the v2 binary, so the
@@ -13693,6 +14065,7 @@ mod tests {
             integrity: Some("sha512-test".to_string()),
             dependencies: vec![],
             alias_dependencies: vec![],
+            peers: vec![],
             tarball: Some(canonical_url.to_string()),
         });
         lf.write_all(&lockfile_path).unwrap();
@@ -13740,6 +14113,7 @@ mod tests {
                 integrity: Some("sha512-test".to_string()),
                 dependencies: vec![],
                 alias_dependencies: vec![],
+                peers: vec![],
                 tarball: Some(tarball.to_string()),
             });
             lf.write_all(&lockfile_path).unwrap();
@@ -13802,6 +14176,7 @@ mod tests {
             integrity: Some("sha512-test".to_string()),
             dependencies: vec![],
             alias_dependencies: vec![],
+            peers: vec![],
             tarball: None,
         });
         lf.write_all(&lockfile_path).unwrap();

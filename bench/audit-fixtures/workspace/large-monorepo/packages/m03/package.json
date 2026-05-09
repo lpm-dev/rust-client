@@ -1,0 +1,10 @@
+{
+	"name": "audit-large-m03",
+	"version": "1.0.0",
+	"private": true,
+	"main": "index.js",
+	"dependencies": {
+		"audit-large-m01": "workspace:*",
+		"audit-large-m02": "workspace:*"
+	}
+}
