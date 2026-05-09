@@ -584,8 +584,14 @@ pub fn apply_patch(
     // 1. Drift gate + v2-aware baseline lookup. `find_installed_package_baseline`
     // prefers the v2 link entry (returns `<links/<key>/node_modules/<name>>`)
     // and falls back to v1's `<store>/v1/<safe>@<ver>/`. Both layouts
-    // hold a real directory of bytes that mirrors the published tarball;
-    // the diff baseline reads source files from whichever was found.
+    // expose a `pristine_dir` field that points at NEVER-mutated bytes:
+    // - V1: `<store>/v1/<safe>@<ver>/` (the v1 store dir itself; v1
+    //   patches mutate the project-private wrapper, not the store).
+    // - V2: `<store>/v2/objects/<sri-segment>/` (the immutable
+    //   content-addressed object dir; v2 patches mutate the link
+    //   entry at `package_dir`, so reading baseline from
+    //   `package_dir` would feed already-patched bytes back into a
+    //   subsequent `apply_patch`).
     let lpm_root = store.lpm_root()?;
     let baseline = lpm_store::find_installed_package_baseline(&lpm_root, name, version)?
         .ok_or_else(|| {
@@ -624,7 +630,12 @@ pub fn apply_patch(
     let mut files_modified = 0;
     let mut files_added = 0;
     let mut files_deleted = 0;
-    let store_dir = baseline.package_dir;
+    // **F1.** Read baseline bytes (pre-image for MODIFY hunks; existence
+    // probes for ADD / DELETE) from the PRISTINE dir, never from
+    // `package_dir`. Under v2 the latter is the link entry — where
+    // patches are written to — and reading it back would corrupt the
+    // re-install idempotency contract.
+    let store_dir = baseline.pristine_dir;
 
     for chunk in chunks {
         let patch = Patch::from_str(chunk).map_err(|e| {
