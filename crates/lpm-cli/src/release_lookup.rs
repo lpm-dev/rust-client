@@ -120,45 +120,40 @@ pub enum LookupError {
 
 impl std::fmt::Display for LookupError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Body framing concerns:
+        // - `LookupError` is shared by the npm and GitHub probe paths,
+        //   so source-specific wording ("GitHub API …") only appears
+        //   on variants that can ONLY come from the GitHub leg
+        //   (`RateLimited`). Source-agnostic variants stay neutral.
+        // - The `GITHUB_TOKEN` / `GH_TOKEN` remediation hint that used
+        //   to live here moved into the wrapping
+        //   `LpmError::SelfUpdateRateLimited` miette help text. Repeating
+        //   it here would print the same instruction twice on screen.
         match self {
             Self::Transport(msg) => write!(f, "network error: {msg}"),
             Self::RateLimited { reset_at } => match reset_at {
-                Some(epoch) => write!(
-                    f,
-                    "GitHub API rate limit hit. {}. \
-					 Set GITHUB_TOKEN or GH_TOKEN for 5000 req/hr (vs 60 unauthenticated).",
-                    format_reset_hint(*epoch)
-                ),
-                None => write!(
-                    f,
-                    "GitHub API rate limit hit. \
-					 Set GITHUB_TOKEN or GH_TOKEN for 5000 req/hr (vs 60 unauthenticated)."
-                ),
+                Some(epoch) => {
+                    write!(
+                        f,
+                        "GitHub API rate limit hit. {}",
+                        format_reset_hint(*epoch)
+                    )
+                }
+                None => write!(f, "GitHub API rate limit hit"),
             },
             Self::HttpStatus {
                 status,
                 body_excerpt,
             } => {
                 if body_excerpt.is_empty() {
-                    write!(f, "GitHub API returned HTTP {status}")
+                    write!(f, "release lookup returned HTTP {status}")
                 } else {
-                    write!(f, "GitHub API returned HTTP {status}: {body_excerpt}")
+                    write!(f, "release lookup returned HTTP {status}: {body_excerpt}")
                 }
             }
-            Self::MalformedResponse(msg) => write!(f, "malformed GitHub response: {msg}"),
+            Self::MalformedResponse(msg) => write!(f, "malformed release-lookup response: {msg}"),
         }
     }
-}
-
-/// Public form of `format_reset_hint` used by callers building the body
-/// of a `LpmError::SelfUpdateRateLimited` message. The user-visible
-/// shape is identical to the inline `Display` rendering — drift between
-/// the two would confuse anyone comparing CLI output across versions.
-pub fn format_rate_limit_summary(reset_at: u64) -> String {
-    format!(
-        "GitHub fallback rate-limited. {}",
-        format_reset_hint(reset_at)
-    )
 }
 
 /// Render `x-ratelimit-reset` (unix epoch) as a "try again in N min/sec"
@@ -825,7 +820,18 @@ mod tests {
         let s = err.to_string();
         assert!(s.contains("rate limit"), "msg: {s}");
         assert!(s.contains("Try again in"), "msg: {s}");
-        assert!(s.contains("GITHUB_TOKEN"), "msg: {s}");
+        // GITHUB_TOKEN guidance must NOT live in the LookupError body
+        // any more — it's owned by the wrapping
+        // `LpmError::SelfUpdateRateLimited` miette help text.
+        // Duplicating it here would double-print on screen.
+        assert!(
+            !s.contains("GITHUB_TOKEN"),
+            "GITHUB_TOKEN hint must not duplicate the wrapper's help: {s}"
+        );
+        assert!(
+            !s.contains("GH_TOKEN"),
+            "GH_TOKEN hint must not duplicate the wrapper's help: {s}"
+        );
     }
 
     #[test]
@@ -833,6 +839,29 @@ mod tests {
         let s = LookupError::RateLimited { reset_at: None }.to_string();
         assert!(s.contains("rate limit"));
         assert!(!s.contains("Try again in"));
+        assert!(!s.contains("GITHUB_TOKEN"));
+    }
+
+    /// Rendered body must not carry stray tab characters from the
+    /// previous multi-line continuation. The pre-cleanup body had a
+    /// hard-tab indent inside the format string that surfaced as
+    /// `…minutes.\t\t\t\t Set GITHUB_TOKEN…` in the user's terminal.
+    #[test]
+    fn lookup_error_display_has_no_stray_whitespace_artifacts() {
+        let now = now_secs();
+        let with_reset = LookupError::RateLimited {
+            reset_at: Some(now + 600),
+        }
+        .to_string();
+        assert!(
+            !with_reset.contains('\t'),
+            "tab leaked into body: {with_reset:?}"
+        );
+        // Also: no double spaces from concatenation gone wrong.
+        assert!(
+            !with_reset.contains("  "),
+            "double space leaked into body: {with_reset:?}"
+        );
     }
 
     #[test]
@@ -844,6 +873,27 @@ mod tests {
         .to_string();
         assert!(s.contains("502"));
         assert!(s.contains("bad gateway"));
+        // Source-agnostic wording: `HttpStatus` can come from either
+        // the npm or GitHub probe leg, so the body must NOT pre-blame
+        // GitHub. The pre-cleanup wording attributed every HTTP error
+        // to "GitHub API" which lied for npm-leg failures.
+        assert!(
+            !s.contains("GitHub"),
+            "HttpStatus body must stay source-agnostic: {s}"
+        );
+    }
+
+    /// Same source-neutrality contract for `MalformedResponse` — both
+    /// probe legs construct it on parse failure, so the body must not
+    /// pre-blame either.
+    #[test]
+    fn lookup_error_display_malformed_is_source_agnostic() {
+        let s = LookupError::MalformedResponse("missing version".into()).to_string();
+        assert!(
+            !s.contains("GitHub") && !s.contains("npm"),
+            "MalformedResponse body must stay source-agnostic: {s}"
+        );
+        assert!(s.contains("missing version"));
     }
 
     /// npm registry response: extract `version`. Shape is `{ "name":

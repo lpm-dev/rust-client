@@ -235,21 +235,17 @@ pub async fn run(json_output: bool, refresh: bool) -> Result<(), LpmError> {
 ///   issue (the historical `Forbidden` mapping read like the user was
 ///   blocked); it's a quota issue with a clear remediation surfaced in
 ///   the variant's help text (`GITHUB_TOKEN` / `GH_TOKEN`).
+///
+/// `LookupError`'s own `Display` is the canonical body — it owns the
+/// reset-hint formatting and intentionally omits the `GITHUB_TOKEN`
+/// guidance (which lives in the wrapping variant's miette help). The
+/// wrapper here just adds the user-facing context prefix.
 fn lookup_error_to_lpm(e: LookupError) -> LpmError {
-    match e {
+    match &e {
         LookupError::Transport(_) | LookupError::HttpStatus { .. } => {
             LpmError::Network(format!("failed to check for updates: {e}"))
         }
-        LookupError::RateLimited { reset_at } => {
-            // Drop the GITHUB_TOKEN env-var guidance from the body —
-            // it's now in the variant's help text, so repeating it
-            // inline would double-print on the user's screen.
-            let body = match reset_at {
-                Some(epoch) => crate::release_lookup::format_rate_limit_summary(epoch),
-                None => "GitHub Releases fallback rate-limited".to_string(),
-            };
-            LpmError::SelfUpdateRateLimited(body)
-        }
+        LookupError::RateLimited { .. } => LpmError::SelfUpdateRateLimited(e.to_string()),
         LookupError::MalformedResponse(_) => {
             LpmError::Network(format!("failed to check for updates: {e}"))
         }
