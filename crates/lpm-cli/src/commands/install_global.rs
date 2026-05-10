@@ -260,7 +260,7 @@ pub async fn run(
     // Fresh installs rarely tombstone (the rollback branch does),
     // but running a sweep post-commit means any leftover tombstones
     // from a prior failed tx get cleared as part of the happy path —
-    // users don't have to remember to `lpm store gc`.
+    // users don't have to remember to `lpm cache prune --apply`.
     //
     // `try_*` (non-blocking): another global command may be running in
     // parallel; we'd rather move on than wait. Errors are logged and

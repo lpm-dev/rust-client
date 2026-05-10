@@ -61,7 +61,7 @@ pub async fn run(
     // `.lpm-security.json` from store package dirs (inventory.rs:71-72),
     // and the disk-state loop below also reads from store paths. Both
     // store-touching slices must run under the shared store lock so
-    // they can't race `lpm store gc` / `lpm store clean`.
+    // they can't race `lpm cache prune --apply` / `lpm store clean`.
     //
     // For non-LPM projects, neither slice touches the store; no lock.
     //

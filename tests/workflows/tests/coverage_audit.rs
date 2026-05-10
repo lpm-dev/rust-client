@@ -49,8 +49,8 @@ fn coverage_audit_baseline_shape_matches_phase65_matrix() {
         .filter(|surface| !surface.has_any_coverage())
         .count();
     assert_eq!(
-        covered, 135,
-        "Phase 65 baseline should have 135 covered rows"
+        covered, 134,
+        "Phase 65 baseline should have 134 covered rows"
     );
     assert_eq!(
         uncovered, 1,
@@ -137,28 +137,32 @@ fn combined_references(surface: &SurfaceBaseline) -> Vec<&'static str> {
 }
 
 fn supplemental_references(surface_id: u16) -> &'static [&'static str] {
+    // IDs ≥ 50 shifted down by 1 after `lpm store list` (formerly id 50)
+    // was removed from the audited surface; `lpm cache prune` took id 51
+    // (formerly `lpm store gc` at id 52). Anything that was ≥ 50 in the
+    // original Phase 65 matrix has shifted down by one.
     match surface_id {
         10 => &["crates/lpm-cli/src/commands/doctor.rs"],
         17 => &["crates/lpm-cli/src/commands/install.rs"],
         21 => &["crates/lpm-cli/src/commands/uninstall.rs"],
         48 => &["crates/lpm-cli/src/commands/cache.rs"],
-        51 | 53 => &["crates/lpm-cli/src/commands/store.rs"],
-        56 | 57 => &["crates/lpm-cli/src/commands/global.rs"],
-        61 => &["crates/lpm-cli/src/commands/trust.rs"],
-        65 => &["crates/lpm-cli/src/commands/audit/mod.rs"],
-        67 => &["crates/lpm-cli/src/commands/query.rs"],
-        85 => &["crates/lpm-cli/src/commands/run.rs"],
-        89 | 90 => &["crates/lpm-cli/src/commands/tools.rs"],
-        98 | 99 | 100 | 101 | 103 | 106 => &["crates/lpm-cli/src/commands/env.rs"],
-        111 => &["crates/lpm-cli/src/commands/dev.rs"],
-        118 => &["tests/workflows/tests/ports.rs"],
-        120 | 121 => &["crates/lpm-cli/src/commands/tunnel.rs"],
-        125 => &[
+        50 | 52 => &["crates/lpm-cli/src/commands/store.rs"],
+        55 | 56 => &["crates/lpm-cli/src/commands/global.rs"],
+        60 => &["crates/lpm-cli/src/commands/trust.rs"],
+        64 => &["crates/lpm-cli/src/commands/audit/mod.rs"],
+        66 => &["crates/lpm-cli/src/commands/query.rs"],
+        84 => &["crates/lpm-cli/src/commands/run.rs"],
+        88 | 89 => &["crates/lpm-cli/src/commands/tools.rs"],
+        97 | 98 | 99 | 100 | 102 | 105 => &["crates/lpm-cli/src/commands/env.rs"],
+        110 => &["crates/lpm-cli/src/commands/dev.rs"],
+        117 => &["tests/workflows/tests/ports.rs"],
+        119 | 120 => &["crates/lpm-cli/src/commands/tunnel.rs"],
+        124 => &[
             "crates/lpm-cli/src/commands/migrate_overrides.rs",
             "crates/lpm-cli/src/commands/migrate_patches.rs",
         ],
-        128 => &["crates/lpm-cli/src/update_check.rs"],
-        132 => &["crates/lpm-cli/src/commands/use.rs"],
+        127 => &["crates/lpm-cli/src/update_check.rs"],
+        131 => &["crates/lpm-cli/src/commands/use.rs"],
         _ => &[],
     }
 }

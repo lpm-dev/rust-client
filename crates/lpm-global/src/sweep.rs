@@ -22,8 +22,8 @@
 //! - After every successful `install -g` / `uninstall -g` / `update -g`
 //!   (post-commit, best-effort; ignored errors because the tx already
 //!   succeeded).
-//! - Inside `lpm store gc` (which is the user-facing "clean everything"
-//!   command — runs the sweep as one of its steps).
+//! - Inside `lpm cache prune --apply` (the user-facing reachability-aware
+//!   cleanup command — runs the sweep as one of its steps).
 //! - Inside recovery if we ever add it there (currently recovery only
 //!   *appends* to tombstones; sweeping in recovery would be an optimisation).
 //!
@@ -78,7 +78,7 @@ pub struct SweepFailure {
 ///
 /// This is the version the **opportunistic** post-commit hooks call:
 /// they don't want to block on another process's sweep, and they don't
-/// want an error either. `lpm store gc` should use
+/// want an error either. `lpm cache prune --apply` should use
 /// [`sweep_tombstones`] instead, which blocks until it gets the lock.
 pub fn try_sweep_tombstones(root: &LpmRoot) -> Result<SweepReport, LpmError> {
     let lock_path = root.global_tx_lock();
@@ -91,11 +91,21 @@ pub fn try_sweep_tombstones(root: &LpmRoot) -> Result<SweepReport, LpmError> {
     }
 }
 
-/// Blocking sweep under the global tx lock. Used by `lpm store gc` and
-/// tests. Callers that may run during another user-facing global command
+/// Blocking sweep under the global tx lock. Used by `lpm cache prune --apply`
+/// and tests. Callers that may run during another user-facing global command
 /// should prefer [`try_sweep_tombstones`].
 pub fn sweep_tombstones(root: &LpmRoot) -> Result<SweepReport, LpmError> {
     lpm_common::with_exclusive_lock(root.global_tx_lock(), || sweep_under_lock(root))
+}
+
+/// Count pending tombstones without acquiring the tx lock. Used for
+/// `lpm cache prune` dry-run preview — races are cosmetic (the actual
+/// non-dry-run sweep takes the lock and is authoritative).
+pub fn count_pending_tombstones(root: &LpmRoot) -> usize {
+    if !root.global_manifest().exists() {
+        return 0;
+    }
+    read_for(root).map(|m| m.tombstones.len()).unwrap_or(0)
 }
 
 fn sweep_under_lock(root: &LpmRoot) -> Result<SweepReport, LpmError> {
@@ -128,7 +138,7 @@ fn sweep_under_lock(root: &LpmRoot) -> Result<SweepReport, LpmError> {
         //
         // Bad entries are RETAINED in the manifest (not silently
         // dropped) and surfaced via `SweepReport.retained` so an
-        // operator running `lpm store gc` actually sees that the
+        // operator running `lpm cache prune --apply` actually sees that the
         // manifest is poisoned, instead of having the evidence
         // quietly cleaned up.
         let abs = match validated_tombstone_path(&global_root, &relative_path) {
@@ -356,6 +366,24 @@ mod tests {
     }
 
     #[test]
+    fn count_pending_tombstones_returns_len_when_manifest_exists() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = LpmRoot::from_dir(tmp.path());
+        seed_manifest_with_tombstones(
+            &root,
+            &["installs/a@1.0.0", "installs/b@2.0.0", "installs/c@3.0.0"],
+        );
+        assert_eq!(count_pending_tombstones(&root), 3);
+    }
+
+    #[test]
+    fn count_pending_tombstones_returns_zero_when_no_manifest() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = LpmRoot::from_dir(tmp.path());
+        assert_eq!(count_pending_tombstones(&root), 0);
+    }
+
+    #[test]
     fn sweep_empty_tombstones_is_a_noop() {
         let tmp = tempfile::tempdir().unwrap();
         let root = LpmRoot::from_dir(tmp.path());
@@ -505,7 +533,7 @@ mod tests {
     // tombstones back from a TOML file on disk that's editable by anyone
     // with $LPM_HOME write access (or by a corrupt downgrade / a future
     // bug). Without consume-side validation, a poisoned manifest could
-    // make `lpm store gc` recursively delete arbitrary directories
+    // make `lpm cache prune --apply` recursively delete arbitrary directories
     // outside the global tree — `Path::join` doesn't normalize `..`,
     // and joining an absolute path replaces the base.
     //

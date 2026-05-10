@@ -128,7 +128,7 @@ impl LpmRoot {
     /// Path to the store's reader/writer lock file.
     ///
     /// `lpm install` and other store-reading commands acquire it as
-    /// shared (multiple readers OK); `lpm store gc` and
+    /// shared (multiple readers OK); `lpm cache prune --apply` and
     /// `lpm store clean` acquire it as exclusive (waits for in-flight
     /// readers, then blocks new ones until done).
     ///
@@ -600,7 +600,7 @@ fn acquire_exclusive_with_hint(
 ///
 /// Used by store-reading commands (`lpm install`, `lpm patch`,
 /// `lpm rebuild`, `lpm approve-scripts`, `lpm inventory`,
-/// `lpm store path`) so they don't race with `lpm store gc` /
+/// `lpm store path`) so they don't race with `lpm cache prune --apply` /
 /// `lpm store clean` mid-read.
 pub fn with_shared_lock<P, F, R>(lock_path: P, body: F) -> Result<R, LpmError>
 where
@@ -645,7 +645,7 @@ pub async fn with_shared_lock_async<R>(
 /// directory). The lock releases when the internal handle is dropped,
 /// so even a panic inside `body` frees it. This is the canonical
 /// primitive for serializing destructive machine-global operations —
-/// `lpm cache clean`, `lpm store clean`, `lpm store gc`, and the
+/// `lpm cache clean`, `lpm store clean`, `lpm cache prune --apply`, and the
 /// `.tx.lock`-guarded install-commit section.
 ///
 /// On contention, emits the same one-shot "waiting for…" hint as
@@ -655,7 +655,7 @@ pub async fn with_shared_lock_async<R>(
 /// serialization domain must pass the *same* path. Established roots:
 ///
 /// - [`LpmRoot::cache_clean_lock`] — `lpm cache clean`
-/// - [`LpmRoot::store_lock`]       — store readers (shared) + `lpm store gc` / `lpm store clean` (exclusive)
+/// - [`LpmRoot::store_lock`]       — store readers (shared) + `lpm cache prune --apply` / `lpm store clean` (exclusive)
 /// - `LpmRoot::global_tx_lock`     — install/uninstall tx
 ///
 /// **Advisory semantics.** Processes that don't participate in the

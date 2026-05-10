@@ -158,7 +158,7 @@ pub async fn run(
     // Phase 64 Round 2: hold the shared store lock across rebuild —
     // it traverses store package dirs to read package.json, compute
     // script hashes, and (for already-built check) inspect the
-    // `.lpm-built` markers. A concurrent `lpm store gc` could
+    // `.lpm-built` markers. A concurrent `lpm cache prune --apply` could
     // remove an entry mid-traversal without this gate.
     let lock_path = lpm_common::LpmRoot::from_env()?.store_lock();
     lpm_common::with_shared_lock_async(
