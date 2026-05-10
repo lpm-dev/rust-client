@@ -785,15 +785,13 @@ enum Commands {
     },
 
     /// Manage ephemeral caches under ~/.lpm/cache/ (metadata, tasks, dlx)
-    /// and the v2 virtual store at ~/.lpm/store/v2/.
+    /// and prune the global package store under ~/.lpm/store/.
     ///
-    /// Phase 37: `cache` now exclusively touches caches. For package-store
-    /// maintenance, use `lpm store gc` or `lpm store clean`.
-    ///
-    /// Phase 66 Phase 4e: `lpm cache prune` walks the v2 virtual store
-    /// (`~/.lpm/store/v2/{links,objects}/`) and removes orphan link
-    /// entries + objects no longer reachable from any registered
-    /// project. The flags are inert for the `clean` and `path` actions.
+    /// `lpm cache clean` wipes ephemeral caches only; `lpm cache prune`
+    /// walks the global store and removes link entries + objects no
+    /// longer reachable from any registered project, and sweeps any
+    /// pending global-install tombstones from prior `lpm uninstall -g`
+    /// runs. For a blunt store wipe, use `lpm store clean`.
     Cache {
         /// Action: clean, path, prune.
         action: String,
@@ -803,8 +801,8 @@ enum Commands {
         /// cache root. Ignored by `prune`.
         subcategory: Option<String>,
 
-        /// `prune` only: actually remove orphan entries. Default is
-        /// dry-run (list orphans only).
+        /// `prune` only: actually remove orphan entries and sweep
+        /// pending global-install tombstones. Default is dry-run.
         #[arg(long)]
         apply: bool,
 
@@ -818,35 +816,19 @@ enum Commands {
         /// when the registry is corrupt or after a machine restore.
         #[arg(long, value_name = "PATH")]
         project: Option<String>,
-
-        /// `prune` only: also wipe the legacy v1 store at
-        /// `~/.lpm/store/v1/`. Use AFTER confirming all your projects
-        /// have migrated to v2 (post-Phase-4d this is the natural
-        /// state on a re-installed machine).
-        #[arg(long)]
-        legacy_v1: bool,
     },
 
     /// Manage the global content-addressable package store.
+    ///
+    /// Actions: verify, path, clean. For reachability-aware orphan
+    /// cleanup, use `lpm cache prune`.
     Store {
-        /// Action: verify, list, path, gc, clean.
+        /// Action: verify, path, clean.
         action: String,
 
         /// Deep verification: parse package.json and validate name/version consistency.
         #[arg(long)]
         deep: bool,
-
-        /// Preview what GC would remove without actually deleting anything.
-        #[arg(long)]
-        dry_run: bool,
-
-        /// Only remove packages older than this duration (e.g., "30d", "7d", "24h").
-        #[arg(long)]
-        older_than: Option<String>,
-
-        /// Force GC even when no lockfile is found (removes ALL unreferenced packages).
-        #[arg(long)]
-        force: bool,
 
         /// Auto-fix issues found during verify (e.g., refresh stale security caches).
         #[arg(long)]
@@ -2012,10 +1994,14 @@ fn command_needs_global_state(cmd: &Commands) -> bool {
         Commands::Uninstall { global: true, .. } => true,
         // Every `lpm global *` subcommand reads at minimum the manifest.
         Commands::Global { .. } => true,
-        // `store gc` and `store verify` need the manifest settled so
-        // reference collection sees the right [packages.*] rows; per
-        // the plan, gc unions global lockfiles into the reference set.
-        Commands::Store { action, .. } if matches!(action.as_str(), "gc" | "verify") => true,
+        // `store verify` needs the manifest settled so the walker sees
+        // the right per-package state. `cache prune` covers the
+        // reachability-aware union (which is itself listed below).
+        Commands::Store { action, .. } if action == "verify" => true,
+        // `cache prune --apply` walks every globally-installed package's
+        // lockfile + sweeps deferred tombstones — the manifest must be
+        // settled before either step runs.
+        Commands::Cache { action, .. } if action == "prune" => true,
         // Any `cache clean` invocation, regardless of subcategory.
         // Bare `cache clean` cleans metadata + tasks + dlx, so the dlx
         // dir is always in scope; the per-subcategory form trivially
@@ -3226,7 +3212,6 @@ async fn async_main() -> Result<()> {
             apply,
             max_age,
             project,
-            legacy_v1,
         } => {
             commands::cache::run(
                 &action,
@@ -3236,29 +3221,12 @@ async fn async_main() -> Result<()> {
                     apply,
                     max_age: max_age.as_deref(),
                     project: project.as_deref(),
-                    legacy_v1,
                 },
             )
             .await
         }
-        Commands::Store {
-            action,
-            deep,
-            dry_run,
-            older_than,
-            force,
-            fix,
-        } => {
-            commands::store::run(
-                &action,
-                deep,
-                dry_run,
-                older_than.as_deref(),
-                force,
-                fix,
-                cli.json,
-            )
-            .await
+        Commands::Store { action, deep, fix } => {
+            commands::store::run(&action, deep, fix, cli.json).await
         }
         Commands::Global { action } => commands::global::run(&client, action, cli.json).await,
         Commands::Trust { action } => {
@@ -4258,10 +4226,19 @@ mod tests {
     }
 
     #[test]
-    fn predicate_true_for_store_gc_and_verify() {
-        assert!(command_needs_global_state(&parse(&["lpm", "store", "gc"])));
+    fn predicate_true_for_store_verify_and_cache_prune() {
+        // `store verify` reads per-package state from the manifest;
+        // `cache prune --apply` walks every globally-installed package's
+        // lockfile + sweeps deferred tombstones. Both need the manifest
+        // settled before they run.
         assert!(command_needs_global_state(&parse(&[
             "lpm", "store", "verify"
+        ])));
+        assert!(command_needs_global_state(&parse(&[
+            "lpm", "cache", "prune"
+        ])));
+        assert!(command_needs_global_state(&parse(&[
+            "lpm", "cache", "prune", "--apply"
         ])));
     }
 

@@ -52,7 +52,7 @@ impl PackageInventory {
     /// behavioral-analysis caches from the LPM store
     /// (`.lpm-security.json` per package dir) — callers must hold the
     /// shared store lock around this call to avoid racing
-    /// `lpm store gc` / `lpm store clean`.
+    /// `lpm cache prune --apply` / `lpm store clean`.
     pub fn from_discovery(
         discovery: discovery::DiscoveryResult,
     ) -> Result<Self, lpm_common::LpmError> {

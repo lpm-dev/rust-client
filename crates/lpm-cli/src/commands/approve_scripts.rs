@@ -225,7 +225,7 @@ pub async fn run(
 ) -> Result<(), LpmError> {
     // Phase 64 Round 2: hold the shared store lock — the approval
     // flow reads store package dirs to inspect prior installs and
-    // diff scripts. A concurrent `lpm store gc` could remove an
+    // diff scripts. A concurrent `lpm cache prune --apply` could remove an
     // entry mid-walk without this gate.
     let lock_path = lpm_common::LpmRoot::from_env()?.store_lock();
     lpm_common::with_shared_lock_async(

@@ -312,7 +312,7 @@ fn print_success(out: &UninstallOutcome, json_output: bool) {
     }
     if out.install_root_remaining {
         output::warn(&format!(
-            "Install root could not be removed (locked or permission). Queued as tombstone for `lpm store gc` to retry: {}",
+            "Install root could not be removed (locked or permission). Queued as tombstone for `lpm cache prune --apply` to retry: {}",
             out.install_root.display()
         ));
     }

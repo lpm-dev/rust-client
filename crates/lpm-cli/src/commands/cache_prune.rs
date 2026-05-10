@@ -24,11 +24,10 @@
 //!   registered project — the registry might be stale and the entry
 //!   might be in-use by an unrecorded project.
 //!
-//! - **`--apply`:** actually delete orphan entries. Default is
-//!   dry-run.
-//!
-//! - **`--legacy-v1`:** also wipe `~/.lpm/store/v1/` (post-Phase-4d
-//!   migration cleanup).
+//! - **`--apply`:** actually delete orphan entries AND sweep any
+//!   pending global-install tombstones (deferred deletion roots from
+//!   prior `lpm uninstall -g` runs that couldn't delete inline).
+//!   Default is dry-run.
 //!
 //! ## Safety rails (preplan §4.3)
 //!
@@ -36,16 +35,20 @@
 //!   accumulate aliased entries.
 //! - Atomic registry rewrites via `<path>.tmp.<pid>` → rename in
 //!   [`lpm_common::known_projects::write`].
-//! - `last_seen` tracking on every install registration so
-//!   `--max-age` filtering is meaningful.
+//! - `last_seen` tracking on every install registration so future
+//!   registry-GC workflows have a basis to filter on.
 //! - Silent drop on missing project paths during the registry walk.
-//! - Dry-run-only when the registry is missing AND no `--project` is
-//!   supplied — apply requires either a healthy registry or explicit
-//!   roots.
+//! - Tombstone-only degraded mode when the registry is unusable
+//!   (missing, malformed JSON, schema mismatch, or unreadable) AND no
+//!   `--project` is supplied. Orphan detection is skipped; the
+//!   tombstone sweep still runs under `--apply`. Treating an unusable
+//!   registry as "no recorded projects" instead of refusing to walk
+//!   would mark every link entry as orphaned and wipe the live store
+//!   on the next apply — the degraded path is the safety contract.
 
 use crate::output;
 use chrono::{Duration as ChronoDuration, Utc};
-use lpm_common::{LpmError, LpmRoot, known_projects};
+use lpm_common::{LpmError, LpmRoot, known_projects, with_exclusive_lock, with_shared_lock};
 use lpm_store::v2::Store as V2Store;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -82,13 +85,53 @@ pub struct PruneSummary {
     /// Sum of `link_entries_orphaned` + `object_entries_orphaned`
     /// directory sizes.
     pub bytes_freed_or_eligible: u64,
-    /// `--legacy-v1` mode only: bytes freed by wiping
-    /// `~/.lpm/store/v1/`.
-    pub legacy_v1_bytes_freed: u64,
+    /// Number of pending global-install tombstones (deferred-uninstall
+    /// roots from `lpm uninstall -g`) counted at preview time. Both
+    /// dry-run and `--apply` populate this — it represents the count
+    /// the sweep WILL operate on.
+    pub tombstones_pending: usize,
+    /// Tombstones successfully swept under `--apply`. Zero in dry-run.
+    pub tombstones_swept: usize,
+    /// Tombstones whose on-disk delete failed under `--apply` (e.g.
+    /// Windows sharing violation, perms). Stays in the global manifest
+    /// for the next sweep to retry.
+    pub tombstones_retained: Vec<lpm_global::SweepFailure>,
+    /// Bytes freed across successful tombstone deletes under `--apply`.
+    pub tombstone_bytes_freed: u64,
+    /// `true` when the project registry is missing AND no explicit
+    /// `--project` was passed. In this state we have no roots, so
+    /// orphan detection is unsafe (every link entry would look
+    /// unreachable). The orphan walk is skipped, but `--apply` still
+    /// runs the tombstone sweep — `lpm uninstall -g`'s deferred
+    /// cleanup must remain reachable without a populated registry.
+    pub registry_missing: bool,
+    /// `true` when the project registry exists but is corrupt
+    /// (malformed JSON, schema mismatch, or unreadable). Same
+    /// orphan-walk-skipped behavior as [`Self::registry_missing`] —
+    /// treating a corrupt registry as an empty root set would wipe
+    /// the live store on `--apply`. Surfaced as a distinct field
+    /// (vs. folding into `registry_missing`) so the human + JSON
+    /// emitters can produce an actionable corruption warning instead
+    /// of "no registry yet" which would mislead the user.
+    pub registry_corrupt: bool,
+    /// Human-readable description of why the registry was rejected,
+    /// populated alongside [`Self::registry_corrupt`]. Empty on the
+    /// healthy and missing-but-not-corrupt paths.
+    pub registry_corrupt_reason: String,
 }
 
 /// Entry point for the CLI dispatcher. Resolves the v2 store + flags,
-/// runs the algorithm, and emits human or JSON output.
+/// runs the algorithm under the store reader/writer lock, and emits
+/// human or JSON output.
+///
+/// Locking. Coordinate with concurrent installs / audits / queries
+/// through the store reader/writer lock at `~/.lpm/store/.gc.lock`.
+/// Dry-run only reads the store + sidecars + project registry, so it
+/// takes the **shared** half. `--apply` mutates the store (rm orphans,
+/// sweep tombstones) and takes the **exclusive** half — it queues
+/// behind in-flight readers and blocks new readers until the apply
+/// finishes. The locking model is documented at
+/// [`lpm store` — Locking model](https://cli.lpm.dev/docs/infra/store#locking-model).
 pub async fn run(root: &LpmRoot, json_output: bool, flags: PruneFlags<'_>) -> Result<(), LpmError> {
     let v2_store = V2Store::from_lpm_root(root);
     let max_age = match flags.max_age {
@@ -96,56 +139,83 @@ pub async fn run(root: &LpmRoot, json_output: bool, flags: PruneFlags<'_>) -> Re
         None => None,
     };
 
-    let summary = compute_prune_plan(root, &v2_store, &flags, max_age)?;
-
-    // Apply phase: actually delete the orphans + optionally wipe v1.
-    let mut summary = summary;
-    if flags.apply {
-        for orphan in &summary.link_entries_orphaned {
-            std::fs::remove_dir_all(orphan).map_err(|e| {
-                LpmError::Store(format!(
-                    "cache prune: failed to remove {}: {e}",
-                    orphan.display()
-                ))
-            })?;
-        }
-        for orphan in &summary.object_entries_orphaned {
-            std::fs::remove_dir_all(orphan).map_err(|e| {
-                LpmError::Store(format!(
-                    "cache prune: failed to remove {}: {e}",
-                    orphan.display()
-                ))
-            })?;
-        }
-        if flags.legacy_v1 {
-            let legacy = root.store_v1();
-            if legacy.exists() {
-                let bytes = dir_size(&legacy).unwrap_or(0);
-                std::fs::remove_dir_all(&legacy).map_err(|e| {
-                    LpmError::Store(format!(
-                        "cache prune --legacy-v1: failed to remove {}: {e}",
-                        legacy.display()
-                    ))
-                })?;
-                summary.legacy_v1_bytes_freed = bytes;
-            }
-        }
-        summary.applied = true;
-    } else if flags.legacy_v1 {
-        // Dry-run reporting for --legacy-v1: surface what WOULD be freed.
-        let legacy = root.store_v1();
-        if legacy.exists() {
-            summary.legacy_v1_bytes_freed = dir_size(&legacy).unwrap_or(0);
-        }
-    }
+    let summary = if flags.apply {
+        with_exclusive_lock(root.store_lock(), || {
+            run_locked(root, &v2_store, &flags, max_age)
+        })?
+    } else {
+        with_shared_lock(root.store_lock(), || {
+            run_locked(root, &v2_store, &flags, max_age)
+        })?
+    };
 
     if json_output {
         emit_json(&summary);
     } else {
-        emit_human(&summary, flags.apply, flags.legacy_v1);
+        emit_human(&summary, flags.apply);
     }
 
     Ok(())
+}
+
+/// Inner body executed under the store lock. Pulled out so the lock
+/// closure has a single sync entry point.
+fn run_locked(
+    root: &LpmRoot,
+    v2_store: &V2Store,
+    flags: &PruneFlags<'_>,
+    max_age: Option<ChronoDuration>,
+) -> Result<PruneSummary, LpmError> {
+    let mut summary = compute_prune_plan(root, v2_store, flags, max_age)?;
+
+    if flags.apply {
+        // When the registry is missing OR corrupt AND no explicit
+        // `--project` was given, `compute_prune_plan` skipped the
+        // reachability walk and `link_entries_orphaned` /
+        // `object_entries_orphaned` are empty — orphan deletion must
+        // be skipped to avoid erroneously wiping the store. The
+        // tombstone sweep below still runs because it's independent
+        // of project reachability.
+        if !summary.registry_missing && !summary.registry_corrupt {
+            for orphan in &summary.link_entries_orphaned {
+                std::fs::remove_dir_all(orphan).map_err(|e| {
+                    LpmError::Store(format!(
+                        "cache prune: failed to remove {}: {e}",
+                        orphan.display()
+                    ))
+                })?;
+            }
+            for orphan in &summary.object_entries_orphaned {
+                std::fs::remove_dir_all(orphan).map_err(|e| {
+                    LpmError::Store(format!(
+                        "cache prune: failed to remove {}: {e}",
+                        orphan.display()
+                    ))
+                })?;
+            }
+        }
+
+        // Sweep deferred global-uninstall tombstones — best-effort,
+        // never fails the caller. Runs unconditionally under
+        // `--apply`, including the registry-missing degraded path so
+        // `lpm uninstall -g`'s deferred-cleanup retry remains
+        // reachable when `~/.lpm/known-projects.json` hasn't been
+        // populated yet (registry writes are best-effort during
+        // install per `crates/lpm-common/src/known_projects.rs:102`).
+        let sweep = match lpm_global::sweep_tombstones(root) {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!("cache prune: global tombstone sweep failed: {e}");
+                lpm_global::SweepReport::default()
+            }
+        };
+        summary.tombstones_swept = sweep.swept.len();
+        summary.tombstones_retained = sweep.retained;
+        summary.tombstone_bytes_freed = sweep.freed_bytes;
+        summary.applied = true;
+    }
+
+    Ok(summary)
 }
 
 /// Compute (but don't apply) the prune plan. Pulled out so unit tests
@@ -162,6 +232,9 @@ pub fn compute_prune_plan(
     let mut projects: Vec<PathBuf> = Vec::new();
     let mut registry_entries_dropped = 0usize;
 
+    let mut registry_missing = false;
+    let mut registry_corrupt = false;
+    let mut registry_corrupt_reason = String::new();
     if let Some(explicit) = flags.project {
         // Manual repair mode: ignore the registry.
         let p = std::fs::canonicalize(explicit).map_err(|e| {
@@ -172,21 +245,73 @@ pub fn compute_prune_plan(
         })?;
         projects.push(p);
     } else {
-        // Default mode: registry-backed. If the registry is missing
-        // AND we'd be in --apply mode, refuse — the safety rail per
-        // preplan §4.3.
-        if !registry_path.exists() && flags.apply {
-            return Err(LpmError::Registry(
-                "cache prune --apply requires a populated known-projects \
-                 registry or an explicit --project path. Run a `lpm install` \
-                 first, or pass --project <path> for manual repair."
-                    .to_string(),
-            ));
+        // Default mode, registry-backed. Dry-run must not mutate the
+        // registry — the shared store lock allows multiple readers
+        // (installs, audits, queries) to run concurrently, and a
+        // concurrent install's `register()` write could race a
+        // dry-run's `drop_missing()` rewrite and lose the freshly
+        // registered project. Read-only walk in dry-run; conditional
+        // rewrite in `--apply` (under the exclusive store lock, where
+        // installs are blocked from holding the shared half).
+        //
+        // `try_load` distinguishes missing-vs-corrupt. The lossy
+        // [`known_projects::load`] used by the install path collapses
+        // both to an empty registry — fine for installs (they degrade
+        // to "no recorded projects yet"), DANGEROUS for prune
+        // (`--apply` would treat the empty root set as authoritative
+        // and mark every link entry as orphaned). Both degraded
+        // states here skip the orphan walk; the corrupt branch also
+        // emits an actionable reason so the user knows to delete the
+        // file or pass `--project`.
+        match known_projects::try_load(&registry_path) {
+            Ok(registry) => {
+                let mut missing_count = 0usize;
+                for entry in &registry.projects {
+                    if entry.path.exists() {
+                        projects.push(entry.path.clone());
+                    } else {
+                        missing_count += 1;
+                    }
+                }
+                if flags.apply && missing_count > 0 {
+                    registry_entries_dropped = known_projects::drop_missing(&registry_path)?;
+                } else {
+                    registry_entries_dropped = missing_count;
+                }
+            }
+            Err(known_projects::LoadError::NotFound) => {
+                registry_missing = true;
+            }
+            Err(other) => {
+                registry_corrupt = true;
+                registry_corrupt_reason = other.to_string();
+            }
         }
-        registry_entries_dropped = known_projects::drop_missing(&registry_path)?;
-        let registry = known_projects::load(&registry_path);
-        for entry in &registry.projects {
-            projects.push(entry.path.clone());
+
+        if registry_missing || registry_corrupt {
+            // No usable roots — return an empty plan that
+            // [`run_locked`] will treat as tombstone-only. The
+            // tombstone count is populated so dry-run still surfaces
+            // the work `--apply` will do.
+            return Ok(PruneSummary {
+                applied: false,
+                projects_walked: 0,
+                registry_entries_dropped: 0,
+                link_entries_total: 0,
+                link_entries_reachable: 0,
+                link_entries_orphaned: Vec::new(),
+                object_entries_total: 0,
+                object_entries_reachable: 0,
+                object_entries_orphaned: Vec::new(),
+                bytes_freed_or_eligible: 0,
+                tombstones_pending: lpm_global::count_pending_tombstones(root),
+                tombstones_swept: 0,
+                tombstones_retained: Vec::new(),
+                tombstone_bytes_freed: 0,
+                registry_missing,
+                registry_corrupt,
+                registry_corrupt_reason,
+            });
         }
     }
 
@@ -326,7 +451,13 @@ pub fn compute_prune_plan(
         object_entries_reachable: object_referenced_segments.len(),
         object_entries_orphaned,
         bytes_freed_or_eligible,
-        legacy_v1_bytes_freed: 0,
+        tombstones_pending: lpm_global::count_pending_tombstones(root),
+        tombstones_swept: 0,
+        tombstones_retained: Vec::new(),
+        tombstone_bytes_freed: 0,
+        registry_missing,
+        registry_corrupt,
+        registry_corrupt_reason,
     })
 }
 
@@ -424,10 +555,35 @@ fn dir_size(dir: &Path) -> std::io::Result<u64> {
     Ok(total)
 }
 
-fn emit_human(summary: &PruneSummary, applied: bool, legacy_v1: bool) {
+fn emit_human(summary: &PruneSummary, applied: bool) {
     use lpm_common::format_bytes;
 
-    if applied {
+    if summary.registry_corrupt {
+        // Corruption path: registry file exists but parses as
+        // garbage / wrong schema / unreadable. Treat as no roots
+        // (same as missing) but flag the corruption so the user can
+        // act — silently degrading would hide a real problem with
+        // their machine state.
+        output::warn(&format!(
+            "Project registry at ~/.lpm/known-projects.json is unusable ({reason}). \
+             Delete the file (a fresh `lpm install` will recreate it) or pass \
+             `--project <path>` to walk a specific project. Orphan detection is \
+             skipped to avoid wiping the store; tombstone sweep still runs under --apply.",
+            reason = summary.registry_corrupt_reason,
+        ));
+    } else if summary.registry_missing {
+        // Degraded path: no project registry → no roots → orphan
+        // detection is unsafe. Tombstone sweep still runs under
+        // `--apply`. Surface this prominently so the user knows
+        // why the orphan numbers aren't reported.
+        output::warn(
+            "No project registry at ~/.lpm/known-projects.json — \
+             run `lpm install` in a project to populate it, or pass \
+             `--project <path>` to walk a specific project. Orphan \
+             detection is skipped without roots; tombstone sweep \
+             still runs under --apply.",
+        );
+    } else if applied {
         output::success(&format!(
             "Pruned {} link entr{} + {} object{} ({})",
             summary.link_entries_orphaned.len(),
@@ -452,11 +608,26 @@ fn emit_human(summary: &PruneSummary, applied: bool, legacy_v1: bool) {
             format_bytes(summary.bytes_freed_or_eligible),
         ));
     }
-    if legacy_v1 && summary.legacy_v1_bytes_freed > 0 {
+    if applied && summary.tombstones_swept > 0 {
+        output::success(&format!(
+            "Swept {} global-install tombstone(s) (freed {})",
+            summary.tombstones_swept,
+            format_bytes(summary.tombstone_bytes_freed),
+        ));
+    }
+    if applied && !summary.tombstones_retained.is_empty() {
+        output::warn(&format!(
+            "{} tombstone(s) could not be cleaned (files in use?); will retry on next prune",
+            summary.tombstones_retained.len(),
+        ));
+        for failure in &summary.tombstones_retained {
+            output::warn(&format!("  {}: {}", failure.relative_path, failure.reason));
+        }
+    }
+    if !applied && summary.tombstones_pending > 0 {
         output::info(&format!(
-            "Legacy v1 store: {} ({})",
-            if applied { "freed" } else { "eligible" },
-            format_bytes(summary.legacy_v1_bytes_freed),
+            "{} pending global-install tombstone(s) — `lpm cache prune --apply` will sweep them",
+            summary.tombstones_pending,
         ));
     }
     if summary.registry_entries_dropped > 0 {
@@ -500,7 +671,20 @@ fn emit_json(summary: &PruneSummary) {
             .map(|p| p.display().to_string())
             .collect::<Vec<_>>(),
         "bytes_freed_or_eligible": summary.bytes_freed_or_eligible,
-        "legacy_v1_bytes_freed": summary.legacy_v1_bytes_freed,
+        "registry_missing": summary.registry_missing,
+        "registry_corrupt": summary.registry_corrupt,
+        "registry_corrupt_reason": summary.registry_corrupt_reason,
+        "tombstones_pending": summary.tombstones_pending,
+        "tombstones_swept": summary.tombstones_swept,
+        "tombstones_retained": summary
+            .tombstones_retained
+            .iter()
+            .map(|f| serde_json::json!({
+                "relative_path": f.relative_path,
+                "reason": f.reason,
+            }))
+            .collect::<Vec<_>>(),
+        "tombstone_bytes_freed": summary.tombstone_bytes_freed,
     });
     println!("{}", serde_json::to_string_pretty(&json).unwrap());
 }
