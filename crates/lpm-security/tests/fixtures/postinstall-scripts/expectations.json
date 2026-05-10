@@ -2088,5 +2088,30 @@
     "id": "amber-audit-reserved-003-dd-trace",
     "expected": "amber",
     "notes": "dd-trace (rank 3391, 30M dl/mo) \u2014 preinstall=`node scripts/preinstall.js` fetcher convention"
+  },
+  {
+    "id": "green-audit-noop-001-datadog-pprof",
+    "expected": "green",
+    "notes": "@datadog/pprof (rank ~3164) \u2014 preinstall=`exit 0` placeholder for binary-resolution flow"
+  },
+  {
+    "id": "green-audit-noop-002-datadog-native-appsec",
+    "expected": "green",
+    "notes": "@datadog/native-appsec \u2014 same `exit 0` no-op placeholder"
+  },
+  {
+    "id": "green-audit-noop-003-datadog-native-iast-taint-tracking",
+    "expected": "green",
+    "notes": "@datadog/native-iast-taint-tracking \u2014 same `exit 0` no-op placeholder"
+  },
+  {
+    "id": "green-audit-noop-004-datadog-native-metrics",
+    "expected": "green",
+    "notes": "@datadog/native-metrics \u2014 same `exit 0` no-op placeholder"
+  },
+  {
+    "id": "green-audit-noop-005-google-genai",
+    "expected": "green",
+    "notes": "@google/genai \u2014 preinstall=`echo 'preinstall: no-op'` single static-literal placeholder"
   }
 ]
