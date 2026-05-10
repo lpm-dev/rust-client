@@ -21,3 +21,4 @@ serde_json = { workspace = true }
 clap = { workspace = true }
 indicatif = { workspace = true }
 shlex = { workspace = true }
+time = { version = "0.3", features = ["formatting", "parsing"] }
