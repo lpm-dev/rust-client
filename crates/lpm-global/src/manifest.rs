@@ -17,7 +17,7 @@
 //! - `tombstones = ["installs/..."]` — old install roots whose deletion
 //!   is deferred outside the `.tx.lock` critical section so a Windows
 //!   `tsc --watch` holding files in the old root doesn't trap the user
-//!   in a recovery crash loop. Swept by `lpm store gc` and the post-commit
+//!   in a recovery crash loop. Swept by `lpm cache prune --apply` and the post-commit
 //!   janitor.
 //!
 //! ## Atomic write contract

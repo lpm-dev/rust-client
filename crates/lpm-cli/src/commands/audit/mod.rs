@@ -278,7 +278,7 @@ pub async fn run(
     // touch `~/.lpm/store/`. If none are present — pure npm / pnpm /
     // yarn / bun project — we skip the store lock entirely. Otherwise
     // we hold the shared store lock for the duration of the scan so
-    // it can't race a concurrent `lpm store gc` / `lpm store clean`.
+    // it can't race a concurrent `lpm cache prune --apply` / `lpm store clean`.
     let needs_store_lock = discovery
         .packages
         .iter()

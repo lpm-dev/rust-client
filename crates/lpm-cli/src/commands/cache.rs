@@ -26,20 +26,19 @@ use std::time::{Duration, SystemTime};
 
 const RECENT_STORE_ACTIVITY_WINDOW: Duration = Duration::from_secs(24 * 60 * 60);
 
-/// Phase 66 Phase 4e — flags shared by every `lpm cache <action>` call
-/// site so the dispatcher signature stays stable across actions.
-/// `clean` and `path` ignore every field; `prune` reads them.
+/// Flags shared by every `lpm cache <action>` call site so the
+/// dispatcher signature stays stable across actions. `clean` and `path`
+/// ignore every field; `prune` reads them.
 #[derive(Debug, Clone, Default)]
 pub struct PruneFlags<'a> {
-    /// Default `false` (dry-run); `true` actually removes orphans.
+    /// Default `false` (dry-run); `true` actually removes orphans
+    /// AND sweeps deferred global-install tombstones.
     pub apply: bool,
     /// Filter by `last_referenced_at` age (e.g., `30d`, `24h`).
     pub max_age: Option<&'a str>,
     /// Manual repair mode — use ONLY this project's `node_modules/`
     /// as the root set; ignore the registry.
     pub project: Option<&'a str>,
-    /// Also wipe `~/.lpm/store/v1/` (post-migration cleanup).
-    pub legacy_v1: bool,
 }
 
 pub async fn run(
@@ -55,7 +54,7 @@ pub async fn run(
         "path" => run_path(&root, subcategory, json_output),
         "prune" => super::cache_prune::run(&root, json_output, prune_flags).await,
         other => Err(LpmError::Registry(format!(
-            "unknown cache action '{other}'. Use: clean [metadata|tasks|dlx], path [metadata|tasks|dlx], prune [--apply] [--max-age <dur>] [--project <path>] [--legacy-v1]"
+            "unknown cache action '{other}'. Use: clean [metadata|tasks|dlx], path [metadata|tasks|dlx], prune [--apply] [--max-age <dur>] [--project <path>]"
         ))),
     }
 }
@@ -232,8 +231,8 @@ fn maybe_show_semantic_change_notice(root: &LpmRoot) {
     }
     eprintln!();
     eprintln!("Note: `lpm cache clean` now cleans metadata, task, and dlx caches only.");
-    eprintln!("The package store was left untouched. Use `lpm store gc` for reference-aware");
-    eprintln!("cleanup, or `lpm store clean` to wipe the store.");
+    eprintln!("The package store was left untouched. Use `lpm cache prune --apply` for");
+    eprintln!("reference-aware cleanup, or `lpm store clean` to wipe the store.");
     eprintln!();
     let _ = std::fs::write(&marker, b"");
 }

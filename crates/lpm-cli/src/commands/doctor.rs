@@ -2107,8 +2107,8 @@ fn check_orphaned_bin_shims(
             &doctor_catalog::GLOBAL_SHIMS_ORPHANS,
             &format!(
                 "{} shim{} in {} not owned by any manifest entry ({}{}). Fix hint: \
-                 `lpm store gc` sweeps tombstoned roots but does not rm orphaned shims; \
-                 remove manually or re-run the owning install to reclaim.",
+                 `lpm cache prune --apply` sweeps tombstoned roots but does not rm \
+                 orphaned shims; remove manually or re-run the owning install to reclaim.",
                 orphans.len(),
                 if orphans.len() == 1 { "" } else { "s" },
                 bin_dir.display(),

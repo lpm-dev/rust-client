@@ -19,8 +19,12 @@
 //!
 //! Paths are stored canonicalized (`std::fs::canonicalize`) so symlink-cwd
 //! quirks and `~/`-relative variations don't accumulate aliased entries.
-//! `last_seen` is updated on every successful install; `lpm cache prune
-//! --max-age <duration>` reads this to filter stale roots.
+//! `last_seen` is set by [`register`] on every successful install (and
+//! refreshed when an existing entry is re-registered). It is **not**
+//! read by `lpm cache prune --max-age` — that filter operates on each
+//! v2 link entry's `last_referenced_at` sidecar field. The registry
+//! `last_seen` exists so future workflows that want to expire stale
+//! root entries (e.g., `--gc-registry`) have a basis to filter on.
 //!
 //! ## Atomic rewrite contract
 //!
@@ -32,15 +36,30 @@
 //!
 //! ## Missing / unreadable registry policy
 //!
-//! [`load`] returns `Ok(default)` on missing-file, malformed-JSON, or
-//! schema-mismatch — the registry is best-effort, not load-bearing.
-//! Callers (the install pipeline's `register` path, prune's root walk)
-//! treat a degraded registry as "no recorded projects yet" and rebuild
-//! it on the next successful install / prune walk.
+//! Two helpers, two postures:
 //!
-//! `lpm cache prune` exits dry-run-only when the registry is missing
-//! AND no `--project <path>` argument was supplied — see preplan §4.3
-//! "Dry-run-only on unreadable registry" safety rail.
+//! - [`load`] is **lossy** — collapses missing-file, malformed-JSON,
+//!   and schema-mismatch all to an empty [`Registry`]. Used by the
+//!   install pipeline's `register()` path: the registry is a
+//!   performance + UX cache there, not load-bearing, and a degraded
+//!   file must never block a successful install. The next install
+//!   rebuilds the file from scratch.
+//!
+//! - [`try_load`] surfaces specific failure modes via [`LoadError`].
+//!   Used by `lpm cache prune` so a corrupt registry can be detected
+//!   and treated as "no usable roots" rather than silently as "no
+//!   registered projects" — the latter would mark every link entry as
+//!   orphaned and wipe the live store under `--apply`.
+//!
+//! `lpm cache prune` degrades to **tombstone-only mode** whenever the
+//! registry is unusable AND no `--project <path>` argument was
+//! supplied — covering `NotFound`, `MalformedJson`, `SchemaMismatch`,
+//! and `Io` outcomes from [`try_load`]. Orphan detection is skipped
+//! (no roots → unsafe), but the global-install tombstone sweep still
+//! runs under `--apply` so `lpm uninstall -g`'s deferred cleanup
+//! retry remains reachable without a populated registry. The corrupt
+//! variants emit an actionable warning naming the failure reason; the
+//! missing variant emits a fresh-machine-state warning.
 
 use crate::LpmError;
 use chrono::{DateTime, Utc};
@@ -74,8 +93,11 @@ pub struct Entry {
     /// canonical (not user-typed) so symlink-cwd accumulations don't
     /// produce duplicate aliased entries.
     pub path: PathBuf,
-    /// When the install pipeline last touched this entry (registration
-    /// or post-prune-walk). Drives `lpm cache prune --max-age`.
+    /// When [`register`] last touched this entry (initial registration
+    /// or re-registration on a subsequent successful install). Not read
+    /// by `lpm cache prune --max-age` (that filter operates on link-
+    /// entry sidecar timestamps); reserved for future registry-GC
+    /// workflows.
     pub last_seen: DateTime<Utc>,
 }
 
@@ -89,7 +111,45 @@ impl Registry {
     }
 }
 
-/// Load the registry from the supplied path.
+/// Specific failure modes for [`try_load`]. The install pipeline uses
+/// the lossy [`load`] helper because a degraded registry must never
+/// block a successful install. `lpm cache prune --apply` uses
+/// [`try_load`] because treating a corrupt registry as an empty root
+/// set would mark every link entry as orphaned and wipe the live
+/// store on the next apply — distinguishing the failure modes is
+/// load-bearing for safety there.
+#[derive(Debug)]
+pub enum LoadError {
+    /// The registry file does not exist at the given path. Normal on a
+    /// fresh machine; callers that want to gate on this state should
+    /// match it explicitly.
+    NotFound,
+    /// The file exists but `serde_json` couldn't parse it. Indicates
+    /// disk corruption or a hand-edit gone wrong.
+    MalformedJson,
+    /// The file parses as JSON but its `version` field doesn't match
+    /// [`REGISTRY_VERSION`]. Indicates a schema downgrade or a future
+    /// build wrote it.
+    SchemaMismatch,
+    /// `std::fs::read` failed for a reason other than `NotFound`
+    /// (permissions, I/O error, etc.).
+    Io(std::io::Error),
+}
+
+impl std::fmt::Display for LoadError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            LoadError::NotFound => write!(f, "registry file does not exist"),
+            LoadError::MalformedJson => write!(f, "registry file is not valid JSON"),
+            LoadError::SchemaMismatch => write!(f, "registry file has unknown schema version"),
+            LoadError::Io(e) => write!(f, "registry file unreadable: {e}"),
+        }
+    }
+}
+
+/// Load the registry from the supplied path. **Lossy** — see [`load`]'s
+/// rationale. Use [`try_load`] when the caller needs to distinguish
+/// missing-from-corrupt.
 ///
 /// Returns `Ok(Registry::new())` (empty + current schema) on:
 /// - File doesn't exist.
@@ -97,27 +157,30 @@ impl Registry {
 /// - File has a `version` other than [`REGISTRY_VERSION`].
 ///
 /// The "best-effort" posture is intentional — the registry is a
-/// performance + UX cache, not a load-bearing data structure. Real
-/// errors here would block every install on every machine that ever
-/// shipped a buggy registry write; instead we degrade silently and
-/// rebuild on the next successful install.
+/// performance + UX cache, not a load-bearing data structure for the
+/// install pipeline. Real errors here would block every install on
+/// every machine that ever shipped a buggy registry write; instead we
+/// degrade silently and rebuild on the next successful install.
 pub fn load(path: &Path) -> Registry {
-    let Ok(bytes) = std::fs::read(path) else {
-        return Registry::new();
+    try_load(path).unwrap_or_else(|_| Registry::new())
+}
+
+/// Load the registry, surfacing specific failure modes via [`LoadError`].
+///
+/// Used by `lpm cache prune` so a corrupted registry can be detected
+/// and treated as "no usable roots" rather than silently as "no
+/// registered projects" — the latter would mark every link entry as
+/// orphaned and wipe the live store under `--apply`.
+pub fn try_load(path: &Path) -> Result<Registry, LoadError> {
+    let bytes = match std::fs::read(path) {
+        Ok(b) => b,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Err(LoadError::NotFound),
+        Err(e) => return Err(LoadError::Io(e)),
     };
     match serde_json::from_slice::<Registry>(&bytes) {
-        Ok(r) if r.version == REGISTRY_VERSION => r,
-        Ok(other) => {
-            // Schema mismatch — silently degrade to empty rather than
-            // failing every install. Pulling `tracing` into lpm-common
-            // for a single debug log would be a heavyweight dep on
-            // every consumer; if a future debug session needs to see
-            // these mismatches, the caller can wrap [`load`] with a
-            // tracing-aware variant.
-            let _ = other;
-            Registry::new()
-        }
-        Err(_) => Registry::new(),
+        Ok(r) if r.version == REGISTRY_VERSION => Ok(r),
+        Ok(_) => Err(LoadError::SchemaMismatch),
+        Err(_) => Err(LoadError::MalformedJson),
     }
 }
 

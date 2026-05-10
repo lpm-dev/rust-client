@@ -118,7 +118,7 @@ pub enum LpmError {
     #[diagnostic(
         code(lpm::store),
         help(
-            "The global package store at ~/.lpm/store may be corrupted. Try `lpm store gc` or remove it."
+            "The global package store at ~/.lpm/store may be corrupted. Try `lpm cache prune --apply` or `lpm store clean`."
         )
     )]
     Store(String),
