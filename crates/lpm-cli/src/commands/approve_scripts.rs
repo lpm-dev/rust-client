@@ -99,70 +99,19 @@ fn approval_metadata_from_blocked(
 /// `provenance_at_approval` (the value this function feeds into the
 /// binding) as its reference.
 ///
-/// Returns a map keyed by `(name, version)` → fetched snapshot.
-/// Missing entries (no `LpmRoot`, registry didn't return metadata,
-/// no attestation URL, network failure) map to `None`. Callers
-/// degrade gracefully: a `None` value persists as
-/// `provenance_at_approval = None`, which the next install's drift
-/// gate treats as "first observation, no drift" — same behavior as
-/// today's pre-W2 path when the install-time fetcher degraded.
+/// **Phase 68:** delegates to
+/// [`crate::provenance_fetch::fetch_provenance_for_pkgs`], the
+/// single source of truth shared with the global-scope approve path
+/// (`lpm approve-scripts --global`). This wrapper keeps the
+/// `BlockedPackage` shape callers used pre-Phase-68 working unchanged.
 async fn fetch_provenance_for_effective_set(
     packages: &[BlockedPackage],
 ) -> HashMap<(String, String), Option<ProvenanceSnapshot>> {
-    let cache_root = match lpm_common::paths::LpmRoot::from_env() {
-        Ok(root) => root.cache_metadata_attestations(),
-        Err(_) => {
-            // Degraded — no cache root. Match the pre-W2 install
-            // behavior: every package gets `None`.
-            return packages
-                .iter()
-                .map(|p| ((p.name.clone(), p.version.clone()), None))
-                .collect();
-        }
-    };
-    let http = reqwest::Client::new();
-    let registry = lpm_registry::RegistryClient::new();
-
-    let cache_root_ref = &cache_root;
-    let http_ref = &http;
-    let registry_ref = &registry;
-
-    let futures = packages.iter().map(move |p| async move {
-        // Fetch metadata to extract the attestation URL. The lpm /
-        // npm split mirrors `install.rs::build_blocked_set_metadata`.
-        // The 5-min metadata cache absorbs the typical "install then
-        // immediately approve-scripts" case (no network call).
-        let meta = if p.name.starts_with("@lpm.dev/") {
-            match lpm_common::PackageName::parse(&p.name) {
-                Ok(pkg_name) => registry_ref.get_package_metadata(&pkg_name).await.ok(),
-                Err(_) => None,
-            }
-        } else {
-            registry_ref.get_npm_package_metadata(&p.name).await.ok()
-        };
-        let attestation_ref = meta
-            .as_ref()
-            .and_then(|m| m.versions.get(&p.version))
-            .and_then(|v| v.dist.as_ref())
-            .and_then(|d| d.attestations.clone());
-
-        let snapshot = crate::provenance_fetch::fetch_provenance_snapshot(
-            http_ref,
-            cache_root_ref,
-            &p.name,
-            &p.version,
-            attestation_ref.as_ref(),
-            None,
-        )
-        .await
-        .ok()
-        .flatten();
-        ((p.name.clone(), p.version.clone()), snapshot)
-    });
-    futures::future::join_all(futures)
-        .await
-        .into_iter()
-        .collect()
+    let pkgs: Vec<(String, String)> = packages
+        .iter()
+        .map(|p| (p.name.clone(), p.version.clone()))
+        .collect();
+    crate::provenance_fetch::fetch_provenance_for_pkgs(&pkgs).await
 }
 
 /// Stable schema version for the `--json` output. Bump on any breaking
@@ -1732,32 +1681,127 @@ fn print_global_list(
     Ok(())
 }
 
+// ─── Phase 68: rerun-hint helpers (origin-aware) ─────────────────────
+//
+// After `lpm approve-scripts --global` writes a binding, the user must
+// reinstall the affected globals to actually re-execute the lifecycle
+// scripts that were blocked at install time. `lpm rebuild --global`
+// is a planned follow-up; until then, the truthful path is
+// `lpm uninstall -g <origin> && lpm install -g <origin>`.
+//
+// IMPORTANT: the affected origins are the TOP-LEVEL globally-installed
+// packages whose tree contains the approved blocked row, NOT the
+// approved row's own name. A transitive approval (e.g., `esbuild`
+// pulled in by `eslint` and `vite-plugin-foo`) needs the user to
+// reinstall both top-level globals; the row's name (`esbuild`) may
+// not even be a valid `lpm uninstall -g` target.
+
+/// Compute the sorted-deduped union of `origins` across many aggregate
+/// rows. Used to render a single rerun-hint covering the full scope of
+/// a bulk approval.
+fn union_origins<'a>(
+    rows: impl IntoIterator<Item = &'a crate::global_blocked_set::AggregateBlockedRow>,
+) -> Vec<String> {
+    let mut set: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    for r in rows {
+        for o in &r.origins {
+            set.insert(o.clone());
+        }
+    }
+    set.into_iter().collect()
+}
+
+/// Render the post-approval rerun hint to stderr. Empty `origins`
+/// triggers an actionable fallback that points the user at `--list`
+/// rather than dropping silent guidance.
+fn emit_rerun_hint_stderr(origins: &[String]) {
+    if origins.is_empty() {
+        output::info(
+            "Unable to derive the affected global list. Run \
+             `lpm approve-scripts --global --list` to see which globals \
+             were affected, then reinstall those to execute approved scripts.",
+        );
+        return;
+    }
+    if origins.len() == 1 {
+        output::info(&format!(
+            "Next step — reinstall to execute approved scripts: \
+             `lpm uninstall -g {0} && lpm install -g {0}`. \
+             (`lpm rebuild --global` is a planned follow-up.)",
+            origins[0],
+        ));
+        return;
+    }
+    output::info("Next step — reinstall the affected globals to execute approved scripts:");
+    for o in origins {
+        eprintln!("    lpm uninstall -g {o} && lpm install -g {o}");
+    }
+    eprintln!("(`lpm rebuild --global` is a planned follow-up.)");
+}
+
+/// Build the structured `next_step` JSON payload that mirrors
+/// [`emit_rerun_hint_stderr`]. Agents can act on the structured form
+/// without parsing the prose.
+fn rerun_next_step_json(origins: &[String]) -> serde_json::Value {
+    serde_json::json!({
+        "kind": "reinstall_globals",
+        "origins": origins,
+    })
+}
+
 /// `--yes` implementation: approve every row in the aggregate in one
-/// write. Loud — emits a warning banner in non-JSON mode; in JSON mode
-/// surfaces the warning via the structured `warnings` field so agents
-/// can detect bulk-approval flows.
+/// transactional write under the global tx lock. Loud — emits a warning
+/// banner in non-JSON mode; in JSON mode surfaces the warning via the
+/// structured `warnings` field so agents can detect bulk-approval flows.
+///
+/// **Lock order:** `store_lock` (outer shared, held by the parent
+/// [`run_global_under_store_lock`]) → `global_tx_lock` (inner exclusive,
+/// taken here). Do not invert.
 async fn run_global_bulk_yes(
     root: &lpm_common::LpmRoot,
     aggregate: &crate::global_blocked_set::AggregateBlockedSet,
     dry_run: bool,
     json_output: bool,
 ) -> Result<(), LpmError> {
-    let mut trust = lpm_global::trusted_deps::read_for(root)?;
-    for row in &aggregate.rows {
-        trust.insert_strict(
-            &row.name,
-            &row.version,
-            row.integrity.clone(),
-            row.script_hash.clone(),
-        );
-    }
-    // Phase 46 close-out Chunk 3: the only mutation site on this
-    // path. Under `--dry-run`, skip the write but still emit the
-    // would-approve count + warning so the user / agent sees the
-    // scope of the pending decision.
-    if !dry_run {
-        lpm_global::trusted_deps::write_for(root, &trust)?;
-    }
+    // Network fetch (provenance) happens BEFORE the lock so the
+    // critical section stays bounded. Fetch failures degrade to
+    // `None` per `fetch_provenance_for_pkgs` contract.
+    let pairs: Vec<(String, String)> = aggregate
+        .rows
+        .iter()
+        .map(|r| (r.name.clone(), r.version.clone()))
+        .collect();
+    let provenance = crate::provenance_fetch::fetch_provenance_for_pkgs(&pairs).await;
+
+    // Inside the tx lock — bounded read-modify-write.
+    let lock_path = root.global_tx_lock();
+    let root_for_body = root;
+    let aggregate_for_body = aggregate;
+    let provenance_for_body = &provenance;
+    lpm_common::with_exclusive_lock_async(lock_path, async move {
+        let mut trust = lpm_global::trusted_deps::read_for(root_for_body)?;
+        for row in &aggregate_for_body.rows {
+            let snap = provenance_for_body
+                .get(&(row.name.clone(), row.version.clone()))
+                .and_then(|s| s.clone());
+            trust.insert_binding(
+                &row.name,
+                &row.version,
+                lpm_global::TrustedDependencyBinding {
+                    integrity: row.integrity.clone(),
+                    script_hash: row.script_hash.clone(),
+                    provenance_at_approval: snap,
+                },
+            );
+        }
+        if !dry_run {
+            lpm_global::trusted_deps::write_for(root_for_body, &trust)?;
+        }
+        Ok(())
+    })
+    .await?;
+
+    let origins = union_origins(&aggregate.rows);
 
     if json_output {
         let warning = if dry_run {
@@ -1771,7 +1815,7 @@ async fn run_global_bulk_yes(
                 aggregate.rows.len()
             )
         };
-        let body = serde_json::json!({
+        let mut body = serde_json::json!({
             "schema_version": SCHEMA_VERSION,
             "command": "approve-scripts",
             "scope": "global",
@@ -1782,6 +1826,15 @@ async fn run_global_bulk_yes(
             "warnings": [warning],
             "errors": [],
         });
+        // `next_step` directs agents to run a follow-up command. Under
+        // `--dry-run` no mutation happened, so emitting a follow-up
+        // would mislead automation into reinstalling globals whose
+        // approval was never persisted. Only emit on real writes.
+        if !dry_run {
+            body.as_object_mut()
+                .unwrap()
+                .insert("next_step".into(), rerun_next_step_json(&origins));
+        }
         println!("{}", serde_json::to_string_pretty(&body).unwrap());
     } else if dry_run {
         output::warn(&format!(
@@ -1799,13 +1852,19 @@ async fn run_global_bulk_yes(
             "Trust is bound to the current (name, version, integrity, script_hash) tuple — \
              any subsequent drift re-opens review.",
         );
+        emit_rerun_hint_stderr(&origins);
     }
     Ok(())
 }
 
 /// Named-package approval: `lpm approve-scripts --global esbuild` or
 /// `--global esbuild@0.25.1`. Finds the matching row by name or
-/// `name@version` substring, writes one trust binding.
+/// `name@version` substring, writes one trust binding under the global
+/// tx lock.
+///
+/// **Lock order:** `store_lock` (outer shared, held by the parent
+/// [`run_global_under_store_lock`]) → `global_tx_lock` (inner exclusive,
+/// taken here). Do not invert.
 async fn run_global_named(
     root: &lpm_common::LpmRoot,
     aggregate: &crate::global_blocked_set::AggregateBlockedSet,
@@ -1847,24 +1906,43 @@ async fn run_global_named(
             )));
         }
     };
-    let mut trust = lpm_global::trusted_deps::read_for(root)?;
-    trust.insert_strict(
-        &row.name,
-        &row.version,
-        row.integrity.clone(),
-        row.script_hash.clone(),
-    );
-    // Phase 46 close-out Chunk 3: the only mutation site on this
-    // path. Under `--dry-run`, skip the write and label the output
-    // accordingly; the row match + candidate identification remain
-    // fully exercised so preview surfaces identical feedback to a
-    // live approval aside from the write itself.
-    if !dry_run {
-        lpm_global::trusted_deps::write_for(root, &trust)?;
-    }
+
+    // Phase 68: fetch provenance OUTSIDE the tx lock so a slow
+    // network response doesn't block parallel `--global` invocations.
+    let pairs = vec![(row.name.clone(), row.version.clone())];
+    let provenance = crate::provenance_fetch::fetch_provenance_for_pkgs(&pairs).await;
+    let snap = provenance
+        .get(&(row.name.clone(), row.version.clone()))
+        .and_then(|s| s.clone());
+
+    let lock_path = root.global_tx_lock();
+    let root_for_body = root;
+    let row_for_body = row;
+    let snap_for_body = snap;
+    lpm_common::with_exclusive_lock_async(lock_path, async move {
+        let mut trust = lpm_global::trusted_deps::read_for(root_for_body)?;
+        trust.insert_binding(
+            &row_for_body.name,
+            &row_for_body.version,
+            lpm_global::TrustedDependencyBinding {
+                integrity: row_for_body.integrity.clone(),
+                script_hash: row_for_body.script_hash.clone(),
+                provenance_at_approval: snap_for_body,
+            },
+        );
+        if !dry_run {
+            lpm_global::trusted_deps::write_for(root_for_body, &trust)?;
+        }
+        Ok(())
+    })
+    .await?;
+
+    // Origin enumeration uses the matched row's `origins`. Sorted +
+    // deduped via `union_origins([row])` so the rendering is stable.
+    let origins = union_origins(std::iter::once(row));
 
     if json_output {
-        let body = serde_json::json!({
+        let mut body = serde_json::json!({
             "schema_version": SCHEMA_VERSION,
             "command": "approve-scripts",
             "scope": "global",
@@ -1881,6 +1959,13 @@ async fn run_global_named(
             "warnings": [],
             "errors": [],
         });
+        // Same dry-run contract as `run_global_bulk_yes`: omit
+        // `next_step` when no mutation was performed.
+        if !dry_run {
+            body.as_object_mut()
+                .unwrap()
+                .insert("next_step".into(), rerun_next_step_json(&origins));
+        }
         println!("{}", serde_json::to_string_pretty(&body).unwrap());
     } else if dry_run {
         output::info(&format!(
@@ -1894,6 +1979,7 @@ async fn run_global_named(
             row.name.bold(),
             row.version.dimmed()
         ));
+        emit_rerun_hint_stderr(&origins);
     }
     Ok(())
 }
@@ -2026,9 +2112,54 @@ fn print_origin_group_card(origin: &str, rows: &[&crate::global_blocked_set::Agg
     println!();
 }
 
+/// Commit a single approval to `~/.lpm/global/trusted-dependencies.json`
+/// under the global tx lock. Reads the on-disk file, inserts the
+/// row's binding (with provenance fetched outside this critical
+/// section), and writes back atomically. Skipped under `--dry-run`.
+///
+/// **Lock order:** caller (interactive walk) holds `store_lock`
+/// (outer shared); this function takes `global_tx_lock` (inner
+/// exclusive). Do not invert.
+///
+/// Re-reading inside the lock — rather than relying on a long-lived
+/// in-memory copy seeded before the prompt loop — is what makes the
+/// interactive walk race-safe against parallel `approve-scripts
+/// --global` invocations.
+async fn commit_global_approval(
+    root: &lpm_common::LpmRoot,
+    row: &crate::global_blocked_set::AggregateBlockedRow,
+    snap: Option<lpm_common::ProvenanceSnapshot>,
+    dry_run: bool,
+) -> Result<(), LpmError> {
+    let lock_path = root.global_tx_lock();
+    lpm_common::with_exclusive_lock_async(lock_path, async move {
+        let mut trust = lpm_global::trusted_deps::read_for(root)?;
+        trust.insert_binding(
+            &row.name,
+            &row.version,
+            lpm_global::TrustedDependencyBinding {
+                integrity: row.integrity.clone(),
+                script_hash: row.script_hash.clone(),
+                provenance_at_approval: snap,
+            },
+        );
+        if !dry_run {
+            lpm_global::trusted_deps::write_for(root, &trust)?;
+        }
+        Ok(())
+    })
+    .await
+}
+
 /// Interactive walk. Flat mode prompts one aggregate row at a time.
 /// Grouped mode prompts by top-level global first, but still records
 /// approvals as individual dependency binding rows.
+///
+/// Phase 68: provenance is pre-fetched for the full aggregate before
+/// the prompt loop so per-decision writes don't pay HTTP latency
+/// while the lock is held. The per-decision writes go through
+/// [`commit_global_approval`], which takes `global_tx_lock` so each
+/// per-row commit is serialized against parallel `--global` flows.
 async fn run_global_interactive(
     root: &lpm_common::LpmRoot,
     aggregate: &crate::global_blocked_set::AggregateBlockedSet,
@@ -2038,7 +2169,17 @@ async fn run_global_interactive(
 ) -> Result<(), LpmError> {
     use crate::prompt::prompt_err;
 
-    let mut trust = lpm_global::trusted_deps::read_for(root)?;
+    // Phase 68: pre-fetch provenance for every aggregate row in one
+    // parallel batch BEFORE the prompt loop. Cheap (~5–10 packages
+    // typical) and the on-disk attestation cache absorbs repeats. Keeps
+    // the per-decision tx-lock window bounded to a read-modify-write.
+    let pairs: Vec<(String, String)> = aggregate
+        .rows
+        .iter()
+        .map(|r| (r.name.clone(), r.version.clone()))
+        .collect();
+    let provenance = crate::provenance_fetch::fetch_provenance_for_pkgs(&pairs).await;
+
     let mut approved: Vec<&crate::global_blocked_set::AggregateBlockedRow> = Vec::new();
     let mut skipped: Vec<&crate::global_blocked_set::AggregateBlockedRow> = Vec::new();
 
@@ -2077,17 +2218,12 @@ async fn run_global_interactive(
             match choice {
                 "approve_all" => {
                     for row in &rows {
-                        trust.insert_strict(
-                            &row.name,
-                            &row.version,
-                            row.integrity.clone(),
-                            row.script_hash.clone(),
-                        );
+                        let snap = provenance
+                            .get(&(row.name.clone(), row.version.clone()))
+                            .and_then(|s| s.clone());
+                        commit_global_approval(root, row, snap, dry_run).await?;
                         approved.push(*row);
                         decided.insert(AggregateRowKey::from_row(row));
-                    }
-                    if !dry_run {
-                        lpm_global::trusted_deps::write_for(root, &trust)?;
                     }
                 }
                 "skip_all" => {
@@ -2115,17 +2251,12 @@ async fn run_global_interactive(
 
                         match row_choice {
                             "approve" => {
-                                trust.insert_strict(
-                                    &row.name,
-                                    &row.version,
-                                    row.integrity.clone(),
-                                    row.script_hash.clone(),
-                                );
+                                let snap = provenance
+                                    .get(&(row.name.clone(), row.version.clone()))
+                                    .and_then(|s| s.clone());
+                                commit_global_approval(root, row, snap, dry_run).await?;
                                 approved.push(row);
                                 decided.insert(key);
-                                if !dry_run {
-                                    lpm_global::trusted_deps::write_for(root, &trust)?;
-                                }
                             }
                             "skip" => {
                                 skipped.push(row);
@@ -2158,6 +2289,22 @@ async fn run_global_interactive(
                 skipped.len(),
                 aggregate.rows.len() - approved.len() - skipped.len(),
             ));
+        } else if !approved.is_empty() {
+            output::success(&format!(
+                "{} approved, {} skipped, {} remaining.",
+                approved.len(),
+                skipped.len(),
+                aggregate.rows.len() - approved.len() - skipped.len(),
+            ));
+            // Always emit the rerun hint when at least one row was
+            // approved — `emit_rerun_hint_stderr` owns the empty-origins
+            // fallback (actionable "run --list to see which globals were
+            // affected" prose), so guarding here would silently drop
+            // that fallback when an aggregate row arrives without
+            // origins (defensive: shouldn't happen, but the hint is
+            // load-bearing if it does).
+            let origins = union_origins(approved.iter().copied());
+            emit_rerun_hint_stderr(&origins);
         } else {
             output::success(&format!(
                 "{} approved, {} skipped, {} remaining.",
@@ -2181,20 +2328,17 @@ async fn run_global_interactive(
 
         match choice {
             "approve" => {
-                trust.insert_strict(
-                    &row.name,
-                    &row.version,
-                    row.integrity.clone(),
-                    row.script_hash.clone(),
-                );
+                let snap = provenance
+                    .get(&(row.name.clone(), row.version.clone()))
+                    .and_then(|s| s.clone());
+                // Phase 68: per-row write goes through `commit_global_approval`,
+                // which acquires the global tx lock and re-reads trust
+                // from disk so the commit is race-safe against parallel
+                // `approve-scripts --global` invocations. Ctrl+C mid-walk
+                // still preserves earlier rows because each was committed
+                // atomically.
+                commit_global_approval(root, row, snap, dry_run).await?;
                 approved.push(row);
-                // Write after each approval so Ctrl+C mid-walk doesn't
-                // lose previously-approved rows. Under `--dry-run` the
-                // per-row flush skips; the user's decisions still
-                // populate `approved` / `skipped` for the summary.
-                if !dry_run {
-                    lpm_global::trusted_deps::write_for(root, &trust)?;
-                }
             }
             "skip" => skipped.push(row),
             "quit" => break,
@@ -2209,6 +2353,19 @@ async fn run_global_interactive(
             skipped.len(),
             aggregate.rows.len() - approved.len() - skipped.len(),
         ));
+    } else if !approved.is_empty() {
+        output::success(&format!(
+            "{} approved, {} skipped, {} remaining.",
+            approved.len(),
+            skipped.len(),
+            aggregate.rows.len() - approved.len() - skipped.len(),
+        ));
+        // See `commit_global_approval`'s grouped-mode counterpart:
+        // `emit_rerun_hint_stderr` owns the empty-origins fallback,
+        // so guarding here would silently drop that prose when a row
+        // legitimately has no origin metadata.
+        let origins = union_origins(approved.iter().copied());
+        emit_rerun_hint_stderr(&origins);
     } else {
         output::success(&format!(
             "{} approved, {} skipped, {} remaining.",
@@ -4251,5 +4408,87 @@ mod tests {
             effective.is_empty(),
             "strict-matched + baseline request → filtered out"
         );
+    }
+
+    // ─── Phase 68: provenance + tx-lock + origin-aware banner ────────
+
+    // End-to-end provenance persistence (cache hit → binding has
+    // populated `provenance_at_approval`) lives in the workflow tests
+    // under tests/workflows/tests/install_global_drift.rs, where a mock
+    // registry can declare `dist.attestations.url` so the cache is
+    // actually consulted. In-process unit tests can't easily reach that
+    // path because the cache is bypassed when registry metadata reports
+    // no attestation URL (and the unit-test environment has no network /
+    // no mock to declare one). The schema round-trip and binding-shape
+    // dimensions of provenance persistence are pinned by:
+    //   - `crates/lpm-global/src/trusted_deps.rs::tests::round_trip_preserves_provenance_at_approval`
+    //   - `crates/lpm-global/src/trusted_deps.rs::tests::insert_binding_stores_rich_binding_and_overwrites`
+
+    /// Round-3 finding (i): two parallel `--global` named approvals
+    /// against DISJOINT rows must both land in the final trust file.
+    /// Pre-fix the shared `store_lock` allowed the second writer's
+    /// read to happen before the first writer's write completed,
+    /// dropping one binding from the final state. The new
+    /// `with_exclusive_lock_async(global_tx_lock())` serializes them.
+    ///
+    /// Disjoint approvals (esbuild vs sharp) — not `--yes` against
+    /// identical sets — force a non-overlapping insert pattern so a
+    /// silent clobber is observable as a missing binding.
+    #[tokio::test]
+    async fn global_named_approvals_do_not_clobber_each_other() {
+        let tmp = tempdir().unwrap();
+        let _env = scoped_lpm_home(tmp.path());
+        let root_path = tmp.path().to_path_buf();
+        let agg = AggregateBlockedSet {
+            rows: vec![
+                row("esbuild", "0.25.1", &["eslint"]),
+                row("sharp", "0.33.0", &["typescript"]),
+            ],
+            unreadable_origins: vec![],
+        };
+        let agg_a = agg.clone();
+        let agg_b = agg.clone();
+        let root_a = root_path.clone();
+        let root_b = root_path.clone();
+        let task_a = tokio::spawn(async move {
+            let root = lpm_common::LpmRoot::from_dir(&root_a);
+            run_global_named(&root, &agg_a, "esbuild@0.25.1", false, true).await
+        });
+        let task_b = tokio::spawn(async move {
+            let root = lpm_common::LpmRoot::from_dir(&root_b);
+            run_global_named(&root, &agg_b, "sharp@0.33.0", false, true).await
+        });
+        task_a.await.unwrap().unwrap();
+        task_b.await.unwrap().unwrap();
+        let root = lpm_common::LpmRoot::from_dir(&root_path);
+        let trust = lpm_global::trusted_deps::read_for(&root).unwrap();
+        assert!(
+            trust.trusted.contains_key("esbuild@0.25.1"),
+            "first writer's binding survived",
+        );
+        assert!(
+            trust.trusted.contains_key("sharp@0.33.0"),
+            "second writer's binding survived",
+        );
+    }
+
+    /// Origin-list helpers: empty-origins fallback + single-origin
+    /// rendering + multi-origin sorted-deduped union.
+    #[test]
+    fn union_origins_sorts_and_deduplicates() {
+        let rows = [
+            row("esbuild", "0.25.1", &["vite-plugin-foo", "eslint"]),
+            row("sharp", "0.33.0", &["eslint", "typescript"]),
+        ];
+        let origins = union_origins(rows.iter());
+        assert_eq!(origins, vec!["eslint", "typescript", "vite-plugin-foo"]);
+    }
+
+    #[test]
+    fn rerun_next_step_json_shape_is_stable() {
+        let payload = rerun_next_step_json(&["eslint".into(), "typescript".into()]);
+        assert_eq!(payload["kind"], "reinstall_globals");
+        assert_eq!(payload["origins"][0], "eslint");
+        assert_eq!(payload["origins"][1], "typescript");
     }
 }
