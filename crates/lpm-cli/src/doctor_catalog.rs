@@ -1205,16 +1205,9 @@ pub static SANDBOX_PROBE_FAILED: CheckEntry = CheckEntry {
     auto_fix: None,
 };
 
-pub static POLICY_SCOPE_PROJECT_ONLY: CheckEntry = CheckEntry {
-    code: "policy_scope_project_only",
-    name: "Script policy",
-    category: Category::Sandbox,
-    description: "Script policy is scoped to project installs only.",
-    when_fires: "Default scope. Globals are queued for a future phase.",
-    remediation: "No action — informational pass.",
-    possible_severities: &[Severity::Pass],
-    auto_fix: None,
-};
+// Phase 68: `POLICY_SCOPE_PROJECT_ONLY` was removed — `lpm install -g`
+// now honors the same script-policy / sandbox / cooldown / drift gates
+// as project installs, so the boundary it described no longer exists.
 
 pub static POLICY_FORCE_SECURITY_FLOOR: CheckEntry = CheckEntry {
     code: "policy_force_security_floor",
@@ -1450,7 +1443,6 @@ pub static CLI_CATALOG: &[&CheckEntry] = &[
     &SANDBOX_KERNEL_TOO_OLD,
     &SANDBOX_UNSUPPORTED_PLATFORM,
     &SANDBOX_PROBE_FAILED,
-    &POLICY_SCOPE_PROJECT_ONLY,
     &POLICY_FORCE_SECURITY_FLOOR,
 ];
 

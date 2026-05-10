@@ -43,7 +43,7 @@ use lpm_registry::AttestationRef;
 use lpm_workspace::ProvenanceSnapshot;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
@@ -261,6 +261,79 @@ pub async fn fetch_provenance_snapshot(
         );
     }
     Ok(Some(snapshot))
+}
+
+/// Batch-fetch attestation snapshots for many `(name, version)` pairs
+/// in parallel. Single source of truth for both the project-level
+/// `lpm approve-scripts` write path and the global-scope
+/// `lpm approve-scripts --global` write path (Phase 68 P4 parity).
+///
+/// Returns one entry per input pair. Missing entries (no `LpmRoot`,
+/// registry didn't return metadata, no attestation URL, network
+/// failure) map to `None`. Callers degrade gracefully: a `None` value
+/// persists as `provenance_at_approval = None`, which the next
+/// install's drift gate treats as "first observation, no drift" —
+/// same behavior as the pre-Phase-52 path when the install-time
+/// fetcher degraded.
+///
+/// The lpm-vs-npm metadata-fetch dispatch by `@lpm.dev/` name prefix
+/// mirrors `install.rs::build_blocked_set_metadata`. The 5-min metadata
+/// cache absorbs the typical "install then immediately approve-scripts"
+/// case (no network call); the on-disk attestation cache under
+/// `~/.lpm/cache/metadata/attestations/` (7-day TTL) covers repeated
+/// approvals across runs.
+pub async fn fetch_provenance_for_pkgs(
+    pkgs: &[(String, String)],
+) -> HashMap<(String, String), Option<ProvenanceSnapshot>> {
+    let cache_root = match lpm_common::paths::LpmRoot::from_env() {
+        Ok(root) => root.cache_metadata_attestations(),
+        Err(_) => {
+            // Degraded — no cache root. Match the pre-Phase-52 install
+            // behavior: every package gets `None`.
+            return pkgs.iter().map(|p| (p.clone(), None)).collect();
+        }
+    };
+    let http = reqwest::Client::new();
+    let registry = lpm_registry::RegistryClient::new();
+
+    let cache_root_ref = &cache_root;
+    let http_ref = &http;
+    let registry_ref = &registry;
+
+    let futures = pkgs.iter().map(move |(name, version)| async move {
+        // lpm vs npm dispatch by name prefix mirrors
+        // `install.rs::build_blocked_set_metadata`.
+        let meta = if name.starts_with("@lpm.dev/") {
+            match lpm_common::PackageName::parse(name) {
+                Ok(pkg_name) => registry_ref.get_package_metadata(&pkg_name).await.ok(),
+                Err(_) => None,
+            }
+        } else {
+            registry_ref.get_npm_package_metadata(name).await.ok()
+        };
+        let attestation_ref = meta
+            .as_ref()
+            .and_then(|m| m.versions.get(version))
+            .and_then(|v| v.dist.as_ref())
+            .and_then(|d| d.attestations.clone());
+
+        let snapshot = fetch_provenance_snapshot(
+            http_ref,
+            cache_root_ref,
+            name,
+            version,
+            attestation_ref.as_ref(),
+            None,
+        )
+        .await
+        .ok()
+        .flatten();
+        ((name.clone(), version.clone()), snapshot)
+    });
+    futures::future::join_all(futures)
+        .await
+        .into_iter()
+        .collect()
 }
 
 // ── Cache primitives ────────────────────────────────────────────

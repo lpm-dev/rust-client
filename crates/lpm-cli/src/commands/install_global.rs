@@ -167,11 +167,26 @@ impl CollisionResolution {
     }
 }
 
+/// Phase 68: per-invocation security overrides forwarded from `lpm install -g`.
+/// Bundles the five flags the dispatcher used to silently drop so the
+/// `do_install` boundary is clear and adding/removing a knob doesn't
+/// touch every call site.
+#[derive(Debug, Clone, Default)]
+pub struct InstallGlobalOverrides {
+    pub allow_new: bool,
+    pub min_release_age_override: Option<u64>,
+    pub drift_ignore_policy: crate::provenance_fetch::DriftIgnorePolicy,
+    pub script_policy_override: Option<crate::script_policy_config::ScriptPolicy>,
+    pub auto_build: bool,
+}
+
+#[allow(clippy::too_many_arguments)]
 pub async fn run(
     client: &RegistryClient,
     spec: &str,
     resolution: CollisionResolution,
     json_output: bool,
+    overrides: InstallGlobalOverrides,
 ) -> Result<(), LpmError> {
     let root = LpmRoot::from_env()?;
     // Phase 35 Step 6 fix: use the injected client (carries
@@ -202,7 +217,7 @@ pub async fn run(
     // validate_install_root returns MissingMarker, and roll-back
     // removes the pending row + cleans the install root. Single
     // cleanup code path, called from one place.
-    do_install(&root, &registry, &prep, json_output).await?;
+    do_install(&root, &registry, &prep, json_output, &overrides).await?;
     let commands = discover_bin_commands(&prep.install_root, &prep.name)?;
     if commands.is_empty() {
         return Err(LpmError::Script(format!(
@@ -515,6 +530,7 @@ async fn do_install(
     registry: &RegistryClient,
     prep: &PrepResult,
     suppress_nested_output: bool,
+    overrides: &InstallGlobalOverrides,
 ) -> Result<(), LpmError> {
     // Mirror dlx's pattern: write a synthetic package.json with the
     // single dependency, then call the project install pipeline against
@@ -528,6 +544,13 @@ async fn do_install(
     // recorded via `lpm approve-scripts --global`. Without this, every
     // scripts-carrying transitive dep would block on every global
     // install even after the user approved it.
+    //
+    // Phase 68: also threads the user's `--allow-new`,
+    // `--min-release-age`, `--ignore-provenance-drift[-all]`,
+    // `--policy`/`--triage`/`--yolo`, and `--auto-build` overrides
+    // into the inner pipeline so all four security gates (cooldown,
+    // drift, script-policy, sandbox auto-build) fire end-to-end on `-g`.
+    //
     // Phase 37 M0 (rev 6): route the install-root creation + synthetic
     // package.json write through `as_extended_path` so a deeply-nested
     // `~/.lpm/global/installs/` path doesn't truncate at the legacy
@@ -549,21 +572,25 @@ async fn do_install(
     crate::commands::install::run_with_options(
         registry,
         &prep.install_root,
-        false, // json_output
+        false, // json_output (outer command owns stdout)
         false, // offline
         false, // force
-        false, // allow_new
+        overrides.allow_new,
         false, // strict_integrity (Phase 59.0 F5) — global installs use lockfile path
         None,  // linker_override
         true,  // no_skills (global installs skip skill auto-install)
         true,  // no_editor_setup (global installs are not project-specific)
-        true,  // no_security_summary (M5 will add approve-scripts capture)
-        false, // auto_build (M5 surface)
+        // Phase 68 §5d: keep the inner project-shape security summary
+        // suppressed — the global wrapper banner at
+        // `emit_post_install_blocked_warning` is the right surface and
+        // routes users to `lpm approve-scripts --global`.
+        true, // no_security_summary
+        overrides.auto_build,
         None,
         None,
-        None, // script_policy_override: global install does not expose policy flags
-        None, // min_release_age_override: D13/D19 — global scope is out of P3, cooldown uses the chain
-        crate::provenance_fetch::DriftIgnorePolicy::default(), // drift-ignore: D13/D19 — global scope is out of P4 as well
+        overrides.script_policy_override,
+        overrides.min_release_age_override,
+        overrides.drift_ignore_policy.clone(),
     )
     .await?;
 
@@ -2211,6 +2238,7 @@ mod tests {
             "cypress@15.13.1",
             CollisionResolution::default(),
             true,
+            InstallGlobalOverrides::default(),
         )
         .await
         .expect("install -g should succeed for the real cypress multi-conflict subset");
