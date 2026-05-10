@@ -206,10 +206,32 @@ pub async fn run(
             tagged.source, tagged.line
         ));
     }
+    // Phase 58.3 — request-aware eager-build: `lpm add <spec>`'s
+    // top-level request is exactly `{spec}`. The fetch site below
+    // (`get_npm_metadata_routed(spec, …)`) and version resolution
+    // (`resolve_version_spec(version_spec)`) both operate on the
+    // raw `target` and `version_spec` strings — npm aliases like
+    // `lpm add foo@npm:react@18` are NOT currently supported by
+    // those paths (they'd route + fetch as `foo`, not `react`). So
+    // the eager-set inputs mirror actual fetch behavior: the local
+    // target name, no alias unwrapping. If alias support lands for
+    // `lpm add` later, the alias-target unwrap should be applied
+    // here AND in the fetch + resolve paths in lockstep.
+    let top_level_specs: Vec<String> = vec![target.display()];
+    let eager_origins = route_table.effective_registry_origins(
+        &top_level_specs,
+        client.base_url(),
+        client.npm_registry_url(),
+    );
     let owned_client = client
         .clone_with_config()
-        .with_tls_overrides(route_table.tls_overrides())?;
+        .with_tls_overrides_for(route_table.tls_overrides(), &eager_origins)?;
     let client = &owned_client;
+    // Phase 58.3 — install-start summary of effective TLS overrides
+    // (mirrors install.rs:3859 wiring).
+    if !json_output && let Some(line) = client.render_effective_tls_summary() {
+        output::info(&line);
+    }
 
     // Step 3: Routed metadata fetch (Phase 60.0.d).
     // - AddTarget::Lpm → lpm.dev metadata API (LpmWorker route, forced

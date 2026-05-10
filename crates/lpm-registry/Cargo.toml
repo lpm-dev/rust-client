@@ -27,6 +27,10 @@ filetime = { workspace = true }
 secrecy = { workspace = true }
 dirs = { workspace = true }
 tempfile = "3"
+# Phase 58.3 (mTLS) — encrypted PKCS#8 private-key decryption +
+# TTY passphrase prompt. See `tls_identity.rs` for the loader.
+pkcs8 = { workspace = true }
+rpassword = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
