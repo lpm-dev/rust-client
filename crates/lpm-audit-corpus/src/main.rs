@@ -37,6 +37,10 @@ use indicatif::{ProgressBar, ProgressStyle};
 use lpm_security::SecurityPolicy;
 use lpm_security::static_gate::classify;
 use lpm_security::triage::StaticTier;
+use lpm_triage_advisor::{
+    Advisor, AdvisorFailure, AdvisorVerdict as TriageVerdict, AmberScript as TriageAmberScript,
+    ClaudeCliAdapter, CodexAdapter, OllamaAdapter, Provider as AdvisorProvider,
+};
 use serde::{Deserialize, Serialize};
 
 type BoxError = Box<dyn Error + Send + Sync>;
@@ -107,6 +111,14 @@ struct Args {
     /// include L3 because the portable contract requires it.
     #[arg(long, default_value_t = false)]
     skip_l3: bool,
+
+    /// Invoke the named Layer 4 advisor on every package whose
+    /// portable outcome is `Prompt`, recording the verdict on
+    /// `advisor_outcome`. Reported as a separate uplift line, never
+    /// blended with the portable baseline. Valid values:
+    /// `claude-cli` / `codex` / `ollama`.
+    #[arg(long)]
+    advisor: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -143,11 +155,16 @@ struct PackageAudit {
     /// principle that triage must mean the same thing on every machine.
     #[serde(default)]
     portable_outcome: Option<PortableOutcome>,
-    /// Reserved for Part B. Populated only when an advisor was
-    /// invoked; otherwise `None` and the portable outcome is the
-    /// authoritative answer for this run.
+    /// Populated only when an advisor was invoked on this package;
+    /// otherwise `None` and the portable outcome is the authoritative
+    /// answer for this run.
     #[serde(default)]
     advisor_outcome: Option<AdvisorOutcome>,
+    /// Provider slug for the advisor that produced `advisor_outcome`
+    /// (e.g. `"claude-cli"`). Lets the report name the advisor in
+    /// its conclusion sentence without an out-of-band side channel.
+    #[serde(default)]
+    advisor_provider: Option<String>,
     /// Empty unless the manifest fetch errored.
     fetch_error: Option<String>,
 }
@@ -351,7 +368,7 @@ async fn main() -> Result<(), BoxError> {
     let args = Args::parse();
 
     if args.reclassify {
-        return reclassify_from_cache(&args);
+        return reclassify_from_cache(&args).await;
     }
 
     let client = reqwest::Client::builder()
@@ -392,6 +409,10 @@ async fn main() -> Result<(), BoxError> {
         enrich_l3_in_place(&client, &mut audits, args.concurrency).await;
     }
     finalize_outcomes(&mut audits);
+
+    if let Some(name) = &args.advisor {
+        enrich_advisor_in_place(name, &mut audits).await?;
+    }
 
     std::fs::write(&args.results, serde_json::to_vec_pretty(&audits)?)?;
     println!(
@@ -505,6 +526,9 @@ async fn enrich_l3_from_cache(client: &reqwest::Client, args: &Args) -> Result<(
     refresh_shapes(&mut audits);
     enrich_l3_in_place(client, &mut audits, args.concurrency).await;
     finalize_outcomes(&mut audits);
+    if let Some(name) = &args.advisor {
+        enrich_advisor_in_place(name, &mut audits).await?;
+    }
 
     std::fs::write(&args.results, serde_json::to_vec_pretty(&audits)?)?;
     let report = build_report(&audits);
@@ -518,6 +542,153 @@ async fn enrich_l3_from_cache(client: &reqwest::Client, args: &Args) -> Result<(
 
     print_summary(&audits);
     Ok(())
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// Layer 4 enrichment: invoke an advisor over every prompted package.
+// ─────────────────────────────────────────────────────────────────────
+
+/// Spawn the named advisor and invoke it on every `portable_outcome
+/// = Prompt` package. Records the verdict on `advisor_outcome` and
+/// recomputes the advisor-enhanced final outcome.
+///
+/// Failures are surfaced as records, not run aborts: an
+/// `EnvironmentNotReady` for one package downgrades that package's
+/// advisor outcome to whatever the portable outcome was (no uplift),
+/// but the audit continues. An `IntegrationFailure` is the same — the
+/// audit harness's job is to MEASURE, not to fix the advisor mid-run.
+async fn enrich_advisor_in_place(name: &str, audits: &mut [PackageAudit]) -> Result<(), BoxError> {
+    let provider = AdvisorProvider::from_slug(name)
+        .ok_or_else(|| format!("unknown advisor '{name}'; valid: claude-cli / codex / ollama"))?;
+    let advisor: Box<dyn Advisor> = match provider {
+        AdvisorProvider::ClaudeCli => Box::new(ClaudeCliAdapter),
+        AdvisorProvider::Codex => Box::new(CodexAdapter),
+        AdvisorProvider::Ollama => Box::new(OllamaAdapter::default()),
+    };
+
+    // Pre-flight: detect + test-invoke. If either fails we abort the
+    // L4 phase entirely; running the audit with a broken adapter would
+    // produce noise, not data.
+    if !advisor.detect().await {
+        return Err(format!(
+            "advisor '{name}' not available on this machine (detect probe failed)"
+        )
+        .into());
+    }
+    match advisor.test_invoke().await {
+        Ok(_v) => println!("L4 advisor '{name}': test invoke OK"),
+        Err(AdvisorFailure::EnvironmentNotReady(msg)) => {
+            return Err(format!("advisor '{name}' environment not ready: {msg}").into());
+        }
+        Err(AdvisorFailure::IntegrationFailure(msg)) => {
+            return Err(format!("advisor '{name}' integration failure: {msg}").into());
+        }
+    }
+
+    let targets: Vec<usize> = audits
+        .iter()
+        .enumerate()
+        .filter(|(_, a)| a.portable_outcome == Some(PortableOutcome::Prompt))
+        .map(|(i, _)| i)
+        .collect();
+    if targets.is_empty() {
+        println!("L4 advisor: no prompted packages — nothing to advise");
+        return Ok(());
+    }
+    println!(
+        "L4 advisor: classifying {} prompted package(s) via {name}",
+        targets.len()
+    );
+
+    let pb = Arc::new(ProgressBar::new(targets.len() as u64));
+    pb.set_style(progress_style("L4 advise"));
+
+    for idx in targets {
+        let (verdict_label, advisor_outcome) =
+            classify_one_with_advisor(&*advisor, &audits[idx]).await;
+        audits[idx].advisor_outcome = Some(advisor_outcome);
+        audits[idx].advisor_provider = Some(provider.slug().to_string());
+        if let Some(l) = verdict_label {
+            tracing::info!(target: "lpm_audit_corpus::advisor", rank = audits[idx].rank, name = %audits[idx].name, verdict = l, "advisor verdict");
+        }
+        pb.inc(1);
+    }
+    pb.finish_with_message("L4 advisor complete");
+
+    Ok(())
+}
+
+/// Run the advisor on a single package's amber script(s). Worst-of
+/// across phases (matches the L1 worst-of-phases logic). Returns
+/// `(verdict_label_for_logging, final_advisor_outcome)`.
+async fn classify_one_with_advisor(
+    advisor: &dyn Advisor,
+    pkg: &PackageAudit,
+) -> (Option<&'static str>, AdvisorOutcome) {
+    let phases = scripted_phases(pkg);
+    let amber_phases: Vec<(&'static str, &ScriptAudit)> = phases
+        .into_iter()
+        .filter(|(_, s)| matches!(s.tier, StaticTier::Amber | StaticTier::AmberLlm))
+        .collect();
+    if amber_phases.is_empty() {
+        return (None, AdvisorOutcome::Prompt);
+    }
+
+    let version = pkg.version.as_deref().unwrap_or("unknown");
+    let mut worst = TriageVerdict::Approve;
+    let mut saw_failure = false;
+    for (phase_name, script) in &amber_phases {
+        let amber = TriageAmberScript {
+            package_name: &pkg.name,
+            package_version: version,
+            phase: phase_name,
+            script_body: &script.script,
+        };
+        match advisor.classify_amber(&amber).await {
+            Ok(v) => worst = combine_verdict(worst, v),
+            Err(e) => {
+                saw_failure = true;
+                tracing::warn!(
+                    target: "lpm_audit_corpus::advisor",
+                    package = %pkg.name,
+                    phase = phase_name,
+                    error = %e,
+                    "advisor classify failed; treating as no-uplift for this package"
+                );
+            }
+        }
+    }
+
+    if saw_failure {
+        // Per the contract: degrade to portable outcome for this
+        // package, never block.
+        return (Some("failure"), AdvisorOutcome::Prompt);
+    }
+
+    let outcome = match worst {
+        TriageVerdict::Approve => AdvisorOutcome::AutoRun,
+        TriageVerdict::Manual => AdvisorOutcome::Prompt,
+        TriageVerdict::Abstain => AdvisorOutcome::Prompt,
+    };
+    let label = match worst {
+        TriageVerdict::Approve => "approve",
+        TriageVerdict::Manual => "manual",
+        TriageVerdict::Abstain => "abstain",
+    };
+    (Some(label), outcome)
+}
+
+/// Worst-of reducer over advisor verdicts: Manual > Abstain >
+/// Approve. Mirrors the L1 `StaticTier::worse_of` discipline so a
+/// single "manual" phase on a multi-phase package pulls the whole
+/// package back into the prompt bucket.
+fn combine_verdict(a: TriageVerdict, b: TriageVerdict) -> TriageVerdict {
+    use TriageVerdict::*;
+    match (a, b) {
+        (Manual, _) | (_, Manual) => Manual,
+        (Abstain, _) | (_, Abstain) => Abstain,
+        (Approve, Approve) => Approve,
+    }
 }
 
 fn print_summary(audits: &[PackageAudit]) {
@@ -544,6 +715,62 @@ fn print_summary(audits: &[PackageAudit]) {
             (portable.auto_run as f64) * 100.0 / total_scripted as f64,
         );
     }
+
+    let advisor = summarise_advisor(audits);
+    if advisor.invoked > 0 {
+        println!(
+            "Advisor-enhanced (L1-4): auto-run={} prompt={} hard-block={} (invoked on {} prompted)",
+            advisor.auto_run, advisor.prompt, advisor.hard_block, advisor.invoked,
+        );
+        let total = advisor.auto_run + advisor.prompt + advisor.hard_block;
+        if total > 0 {
+            println!(
+                "Advisor-enhanced auto-run rate over scripted = {:.1}% (uplift = +{:.1}pp)",
+                (advisor.auto_run as f64) * 100.0 / total as f64,
+                (advisor.auto_run as f64 - portable.auto_run as f64) * 100.0 / total as f64,
+            );
+        }
+    }
+}
+
+/// Distribution over the advisor-enhanced outcome (`portable_outcome`
+/// with prompted packages overridden by the L4 advisor's verdict).
+/// `invoked` is the count of packages the advisor actually ran on;
+/// the others retain their portable outcome verbatim.
+#[derive(Debug, Default)]
+struct AdvisorSummary {
+    invoked: usize,
+    auto_run: usize,
+    prompt: usize,
+    hard_block: usize,
+}
+
+fn summarise_advisor(audits: &[PackageAudit]) -> AdvisorSummary {
+    let mut s = AdvisorSummary::default();
+    for a in audits {
+        if a.fetch_error.is_some() {
+            continue;
+        }
+        // Effective outcome: advisor_outcome if set (the advisor ran),
+        // otherwise the portable outcome cast to the same shape.
+        let outcome = match (a.advisor_outcome, a.portable_outcome) {
+            (Some(o), _) => {
+                s.invoked += 1;
+                o
+            }
+            (None, Some(PortableOutcome::AutoRun)) => AdvisorOutcome::AutoRun,
+            (None, Some(PortableOutcome::Prompt)) => AdvisorOutcome::Prompt,
+            (None, Some(PortableOutcome::HardBlock)) => AdvisorOutcome::HardBlock,
+            (None, Some(PortableOutcome::NoScripts)) | (None, None) => continue,
+        };
+        match outcome {
+            AdvisorOutcome::AutoRun => s.auto_run += 1,
+            AdvisorOutcome::Prompt => s.prompt += 1,
+            AdvisorOutcome::HardBlock => s.hard_block += 1,
+            AdvisorOutcome::NoScripts => {}
+        }
+    }
+    s
 }
 
 /// Read the cached results JSON and re-run `classify()` on every
@@ -552,7 +779,7 @@ fn print_summary(audits: &[PackageAudit]) {
 ///
 /// This is the fast path for evaluating a `static_gate.rs` change
 /// against the same 5000-package dataset the prior run captured.
-fn reclassify_from_cache(args: &Args) -> Result<(), BoxError> {
+async fn reclassify_from_cache(args: &Args) -> Result<(), BoxError> {
     let bytes = std::fs::read(&args.results)
         .map_err(|e| format!("--reclassify requires {}: {e}", args.results.display()))?;
     let mut audits: Vec<PackageAudit> = serde_json::from_slice(&bytes)?;
@@ -582,6 +809,15 @@ fn reclassify_from_cache(args: &Args) -> Result<(), BoxError> {
     println!("reclassify: {changed} package tier(s) changed");
 
     finalize_outcomes(&mut audits);
+
+    if let Some(name) = &args.advisor {
+        // Clear stale advisor outcomes before re-running so a previous
+        // run's verdicts don't bleed into this one's report.
+        for a in &mut audits {
+            a.advisor_outcome = None;
+        }
+        enrich_advisor_in_place(name, &mut audits).await?;
+    }
 
     std::fs::write(&args.results, serde_json::to_vec_pretty(&audits)?)?;
     let report = build_report(&audits);
@@ -782,6 +1018,7 @@ async fn audit_one(
         l3_outcome: None,
         portable_outcome: None,
         advisor_outcome: None,
+        advisor_provider: None,
         fetch_error: None,
     };
 
@@ -1689,15 +1926,122 @@ fn section_advisor_baseline_placeholder(out: &mut String, audits: &[PackageAudit
         out.push_str(
             "_No advisor configured (`triage-advisor = \"none\"`). \
              Portable baseline above is the authoritative outcome for \
-             this run. Advisor uplift will appear here once Part B \
-             lands._\n\n",
+             this run. Re-run with `--advisor claude-cli` / `--advisor \
+             codex` / `--advisor ollama` to populate this section._\n\n",
         );
-    } else {
-        // Reserved for Part B; not yet implemented in detail.
-        out.push_str(
-            "_Part B reporting placeholder — populate once advisor outcomes are recorded._\n\n",
-        );
+        return;
     }
+
+    let portable = summarise_portable(audits);
+    let advisor = summarise_advisor(audits);
+    let total_scripted = advisor.auto_run + advisor.prompt + advisor.hard_block;
+    let pct = |n: usize, denom: usize| {
+        if denom == 0 {
+            0.0
+        } else {
+            n as f64 * 100.0 / denom as f64
+        }
+    };
+
+    out.push_str(
+        "Reported as a separate uplift line, **never blended** with the \
+         portable baseline. The advisor only converts amber → auto-run; \
+         the L1 red and L3 hard-blocks are unchanged.\n\n",
+    );
+    out.push_str("| Outcome | Portable (L1-3) | Advisor-enhanced (L1-4) | Δ |\n");
+    out.push_str("|---------|----------------:|------------------------:|--:|\n");
+    out.push_str(&format!(
+        "| auto-run | {} ({:.1}%) | {} ({:.1}%) | +{} |\n",
+        portable.auto_run,
+        pct(portable.auto_run, total_scripted),
+        advisor.auto_run,
+        pct(advisor.auto_run, total_scripted),
+        advisor.auto_run as i64 - portable.auto_run as i64,
+    ));
+    out.push_str(&format!(
+        "| prompt | {} ({:.1}%) | {} ({:.1}%) | {} |\n",
+        portable.prompt,
+        pct(portable.prompt, total_scripted),
+        advisor.prompt,
+        pct(advisor.prompt, total_scripted),
+        advisor.prompt as i64 - portable.prompt as i64,
+    ));
+    out.push_str(&format!(
+        "| hard-block | {} | {} | {} |\n\n",
+        portable.hard_block,
+        advisor.hard_block,
+        advisor.hard_block as i64 - portable.hard_block as i64,
+    ));
+    out.push_str(&format!(
+        "Advisor invoked on **{} prompted package(s)**.\n\n",
+        advisor.invoked
+    ));
+
+    // Per-verdict breakdown — which prompted packages did the advisor
+    // approve / mark manual / abstain on? Visibility into the
+    // per-package judgment is what makes the uplift number actionable.
+    out.push_str("### Per-package advisor verdicts\n\n");
+    out.push_str("| Rank | Package | Portable | Advisor outcome |\n");
+    out.push_str("|-----:|---------|----------|-----------------|\n");
+    let mut rows: Vec<&PackageAudit> = audits
+        .iter()
+        .filter(|a| a.advisor_outcome.is_some())
+        .collect();
+    rows.sort_by_key(|a| a.rank);
+    for a in rows.iter().take(50) {
+        let advisor_label = match a.advisor_outcome {
+            Some(AdvisorOutcome::AutoRun) => "**auto-run** (approve)",
+            Some(AdvisorOutcome::Prompt) => "prompt (manual/abstain/fail)",
+            Some(AdvisorOutcome::HardBlock) => "hard-block",
+            Some(AdvisorOutcome::NoScripts) => "no-scripts",
+            None => "—",
+        };
+        let portable_label = match a.portable_outcome {
+            Some(PortableOutcome::Prompt) => "prompt",
+            Some(PortableOutcome::AutoRun) => "auto-run",
+            Some(PortableOutcome::HardBlock) => "hard-block",
+            Some(PortableOutcome::NoScripts) => "no-scripts",
+            None => "—",
+        };
+        out.push_str(&format!(
+            "| {} | `{}` | {} | {} |\n",
+            a.rank, a.name, portable_label, advisor_label,
+        ));
+    }
+    out.push('\n');
+
+    // Explicit conclusion. Otherwise readers see "L4 complete" and
+    // mentally inflate what the advisor actually bought. The numbers
+    // in this sentence are derived from the same summaries used in
+    // the table above so they can't drift out of sync.
+    let uplift_packages = advisor.auto_run as i64 - portable.auto_run as i64;
+    let uplift_pp = if total_scripted > 0 {
+        (advisor.auto_run as f64 - portable.auto_run as f64) * 100.0 / total_scripted as f64
+    } else {
+        0.0
+    };
+    let unresolved = advisor.prompt;
+    let provider_label =
+        advisor_provider_name(audits).unwrap_or_else(|| "configured advisor".to_string());
+    out.push_str(&format!(
+        "**Conclusion.** Advisor-enhanced run with `{provider_label}` increased \
+         auto-run by {uplift_packages} package(s) (+{uplift_pp:.1}pp over portable) \
+         and left {unresolved} of {invoked} prompted packages unresolved. \
+         Advisor uplift is real but modest; **portable L1-3 remains the \
+         decision-grade baseline**.\n\n",
+        invoked = advisor.invoked,
+    ));
+}
+
+/// Best-effort: name the advisor provider the audit was run with,
+/// for the conclusion sentence. Reads `advisor_provider` off any
+/// record that was advised, since the harness attaches the slug
+/// per-record during the L4 enrichment pass.
+fn advisor_provider_name(audits: &[PackageAudit]) -> Option<String> {
+    audits
+        .iter()
+        .filter_map(|a| a.advisor_provider.clone())
+        .next()
 }
 
 fn scripted_phases(a: &PackageAudit) -> Vec<(&'static str, &ScriptAudit)> {

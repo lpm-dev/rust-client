@@ -28,6 +28,7 @@ members = [
     "crates/lpm-env",
     "crates/lpm-global",
     "crates/lpm-audit-corpus",
+    "crates/lpm-triage-advisor",
     "tests/integration",
     "tests/workflows",
 ]
