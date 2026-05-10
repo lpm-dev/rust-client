@@ -1661,8 +1661,8 @@ fn needs_v2_migration(project_dir: &Path) -> bool {
 /// re-runs the same wipes (no-ops) and re-attempts the v2 install.
 ///
 /// `~/.lpm/store/v1/` is intentionally NOT wiped here — it may still
-/// serve other projects on the same machine until the user runs
-/// `lpm cache prune --legacy-v1` (Phase 4e).
+/// serve other projects on the same machine. `lpm store clean` is the
+/// blunt-wipe escape hatch for users who want to discard it.
 fn migrate_v1_to_v2(project_dir: &Path) -> std::io::Result<()> {
     let dot_lpm = project_dir.join(".lpm");
     for stale in [dot_lpm.join("wrappers"), dot_lpm.join("hoisted")] {
@@ -3232,7 +3232,7 @@ pub async fn run_with_options(
 ) -> Result<(), LpmError> {
     // Phase 64 Round 2: hold a shared lock on the store for the
     // entire install pipeline. Multiple concurrent installs share it
-    // freely; `lpm store gc` and `lpm store clean` (which take it
+    // freely; `lpm cache prune --apply` and `lpm store clean` (which take it
     // exclusively) wait until every in-flight install releases. This
     // closes the read-vs-write race where gc could `remove_dir_all`
     // a CAS entry mid-`link_dir_recursive`.
@@ -4216,8 +4216,8 @@ async fn run_with_options_under_store_lock(
     // `<project>/.lpm/wrappers/` or `<project>/.lpm/hoisted/` exists.
     // Both are wiped during migration so the v2 install can populate
     // a clean slate. The store-side `~/.lpm/store/v1/` is NOT touched
-    // here — it may still serve other projects on the same machine
-    // until the user runs `lpm cache prune --legacy-v1` (Phase 4e).
+    // here — it may still serve other projects on the same machine.
+    // `lpm store clean` is the blunt-wipe escape hatch.
     //
     // Migration is idempotent: re-running on partial state succeeds
     // (every `rm -rf` is a no-op on already-clean state). A crash

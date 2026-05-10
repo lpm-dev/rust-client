@@ -21,7 +21,7 @@ impl SurfaceBaseline {
     }
 }
 
-pub const EXPECTED_SURFACE_COUNT: usize = 136;
+pub const EXPECTED_SURFACE_COUNT: usize = 135;
 
 pub const EXPECTED_COMMAND_VARIANTS: &[&str] = &[
     "Info",
@@ -631,16 +631,6 @@ pub const SURFACES: &[SurfaceBaseline] = &[
     },
     SurfaceBaseline {
         id: 50,
-        name: "`lpm store list`",
-        unit: true,
-        integration: true,
-        workflow: false,
-        cli_binary: false,
-        json_contract: false,
-        references: &["tests/integration/tests/core.rs"],
-    },
-    SurfaceBaseline {
-        id: 51,
         name: "`lpm store path`",
         unit: true,
         integration: false,
@@ -650,17 +640,20 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         references: &[],
     },
     SurfaceBaseline {
-        id: 52,
-        name: "`lpm store gc`",
+        id: 51,
+        name: "`lpm cache prune`",
         unit: true,
-        integration: true,
-        workflow: false,
+        integration: false,
+        workflow: true,
         cli_binary: false,
-        json_contract: false,
-        references: &["tests/integration/tests/output_parity.rs"],
+        json_contract: true,
+        references: &[
+            "crates/lpm-cli/src/commands/cache_prune.rs",
+            "tests/workflows/tests/cache_prune.rs",
+        ],
     },
     SurfaceBaseline {
-        id: 53,
+        id: 52,
         name: "`lpm store clean`",
         unit: true,
         integration: false,
@@ -670,7 +663,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         references: &[],
     },
     SurfaceBaseline {
-        id: 54,
+        id: 53,
         name: "`lpm global list`",
         unit: true,
         integration: false,
@@ -683,7 +676,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         ],
     },
     SurfaceBaseline {
-        id: 55,
+        id: 54,
         name: "`lpm global list --outdated`",
         unit: true,
         integration: false,
@@ -693,7 +686,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         references: &["crates/lpm-cli/tests/global_install_state_mutation.rs"],
     },
     SurfaceBaseline {
-        id: 56,
+        id: 55,
         name: "`lpm global bin`",
         unit: true,
         integration: false,
@@ -703,7 +696,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         references: &[],
     },
     SurfaceBaseline {
-        id: 57,
+        id: 56,
         name: "`lpm global path <pkg>`",
         unit: true,
         integration: false,
@@ -713,7 +706,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         references: &[],
     },
     SurfaceBaseline {
-        id: 58,
+        id: 57,
         name: "`lpm global remove`",
         unit: true,
         integration: false,
@@ -723,7 +716,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         references: &["crates/lpm-cli/tests/global_install_state_mutation.rs"],
     },
     SurfaceBaseline {
-        id: 59,
+        id: 58,
         name: "`lpm global update`",
         unit: true,
         integration: false,
@@ -736,7 +729,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         ],
     },
     SurfaceBaseline {
-        id: 60,
+        id: 59,
         name: "`lpm trust diff`",
         unit: true,
         integration: false,
@@ -746,7 +739,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         references: &["crates/lpm-cli/src/commands/trust.rs"],
     },
     SurfaceBaseline {
-        id: 61,
+        id: 60,
         name: "`lpm trust prune`",
         unit: true,
         integration: false,
@@ -756,7 +749,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         references: &[],
     },
     SurfaceBaseline {
-        id: 62,
+        id: 61,
         name: "`lpm pool`",
         unit: false,
         integration: false,
@@ -766,7 +759,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         references: &["tests/workflows/tests/pool.rs"],
     },
     SurfaceBaseline {
-        id: 63,
+        id: 62,
         name: "`lpm audit`",
         unit: true,
         integration: false,
@@ -779,7 +772,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         ],
     },
     SurfaceBaseline {
-        id: 64,
+        id: 63,
         name: "`lpm audit --fail-on=<policy>`",
         unit: true,
         integration: false,
@@ -789,7 +782,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         references: &["tests/workflows/tests/audit.rs"],
     },
     SurfaceBaseline {
-        id: 65,
+        id: 64,
         name: "`lpm audit --secrets`",
         unit: true,
         integration: false,
@@ -799,7 +792,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         references: &[],
     },
     SurfaceBaseline {
-        id: 66,
+        id: 65,
         name: "`lpm query <selector>`",
         unit: true,
         integration: false,
@@ -809,7 +802,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         references: &["crates/lpm-cli/src/commands/query.rs"],
     },
     SurfaceBaseline {
-        id: 67,
+        id: 66,
         name: "`lpm query --count / --assert-none / --format mermaid`",
         unit: true,
         integration: false,
@@ -819,7 +812,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         references: &[],
     },
     SurfaceBaseline {
-        id: 68,
+        id: 67,
         name: "`lpm rebuild` (bare, trusted-only)",
         unit: true,
         integration: false,
@@ -832,7 +825,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         ],
     },
     SurfaceBaseline {
-        id: 69,
+        id: 68,
         name: "`lpm rebuild --all`",
         unit: true,
         integration: false,
@@ -842,7 +835,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         references: &["tests/workflows/tests/rebuild.rs"],
     },
     SurfaceBaseline {
-        id: 70,
+        id: 69,
         name: "`lpm rebuild --policy=allow / --yolo`",
         unit: true,
         integration: false,
@@ -852,7 +845,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         references: &["tests/workflows/tests/rebuild.rs"],
     },
     SurfaceBaseline {
-        id: 71,
+        id: 70,
         name: "`lpm rebuild --policy=triage / --triage`",
         unit: true,
         integration: false,
@@ -862,7 +855,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         references: &["tests/workflows/tests/rebuild.rs"],
     },
     SurfaceBaseline {
-        id: 72,
+        id: 71,
         name: "`lpm approve-scripts` (interactive)",
         unit: true,
         integration: false,
@@ -872,7 +865,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         references: &["crates/lpm-cli/src/commands/approve_scripts.rs"],
     },
     SurfaceBaseline {
-        id: 73,
+        id: 72,
         name: "`lpm approve-scripts --list`",
         unit: true,
         integration: false,
@@ -882,7 +875,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         references: &["tests/workflows/tests/approve_scripts.rs"],
     },
     SurfaceBaseline {
-        id: 74,
+        id: 73,
         name: "`lpm approve-scripts --yes`",
         unit: true,
         integration: false,
@@ -892,7 +885,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         references: &["tests/workflows/tests/approve_scripts.rs"],
     },
     SurfaceBaseline {
-        id: 75,
+        id: 74,
         name: "`lpm approve-scripts <pkg>`",
         unit: true,
         integration: false,
@@ -902,7 +895,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         references: &["tests/workflows/tests/approve_scripts.rs"],
     },
     SurfaceBaseline {
-        id: 76,
+        id: 75,
         name: "`lpm approve-scripts --global`",
         unit: true,
         integration: false,
@@ -912,7 +905,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         references: &["tests/workflows/tests/approve_scripts.rs"],
     },
     SurfaceBaseline {
-        id: 77,
+        id: 76,
         name: "`lpm approve-scripts --dry-run`",
         unit: true,
         integration: false,
@@ -922,7 +915,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         references: &["tests/workflows/tests/approve_scripts.rs"],
     },
     SurfaceBaseline {
-        id: 78,
+        id: 77,
         name: "`lpm patch <key>`",
         unit: true,
         integration: false,
@@ -935,7 +928,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         ],
     },
     SurfaceBaseline {
-        id: 79,
+        id: 78,
         name: "`lpm patch-commit <dir>`",
         unit: true,
         integration: false,
@@ -945,7 +938,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         references: &["tests/workflows/tests/patch.rs"],
     },
     SurfaceBaseline {
-        id: 80,
+        id: 79,
         name: "`lpm filter <expr>`",
         unit: true,
         integration: false,
@@ -955,7 +948,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         references: &["crates/lpm-cli/src/commands/filter.rs"],
     },
     SurfaceBaseline {
-        id: 81,
+        id: 80,
         name: "`lpm deploy <out> --filter`",
         unit: true,
         integration: false,
@@ -965,7 +958,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         references: &["crates/lpm-cli/src/commands/deploy.rs"],
     },
     SurfaceBaseline {
-        id: 82,
+        id: 81,
         name: "`lpm plugin list / update`",
         unit: false,
         integration: false,
@@ -975,7 +968,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         references: &["tests/workflows/tests/plugin.rs"],
     },
     SurfaceBaseline {
-        id: 83,
+        id: 82,
         name: "`lpm skills list/install/validate/clean`",
         unit: true,
         integration: true,
@@ -988,7 +981,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         ],
     },
     SurfaceBaseline {
-        id: 84,
+        id: 83,
         name: "`lpm run <script>`",
         unit: true,
         integration: false,
@@ -1002,7 +995,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         ],
     },
     SurfaceBaseline {
-        id: 85,
+        id: 84,
         name: "`lpm run --filter / --all / --affected`",
         unit: true,
         integration: false,
@@ -1012,7 +1005,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         references: &[],
     },
     SurfaceBaseline {
-        id: 86,
+        id: 85,
         name: "`lpm exec <file>`",
         unit: false,
         integration: false,
@@ -1022,7 +1015,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         references: &["tests/workflows/tests/exec.rs"],
     },
     SurfaceBaseline {
-        id: 87,
+        id: 86,
         name: "`lpm dlx <pkg>`",
         unit: false,
         integration: false,
@@ -1032,7 +1025,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         references: &["tests/workflows/tests/dlx.rs"],
     },
     SurfaceBaseline {
-        id: 88,
+        id: 87,
         name: "`lpm lint`",
         unit: true,
         integration: false,
@@ -1045,7 +1038,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         ],
     },
     SurfaceBaseline {
-        id: 89,
+        id: 88,
         name: "`lpm fmt` (write)",
         unit: true,
         integration: false,
@@ -1055,7 +1048,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         references: &[],
     },
     SurfaceBaseline {
-        id: 90,
+        id: 89,
         name: "`lpm fmt --check`",
         unit: true,
         integration: false,
@@ -1065,7 +1058,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         references: &[],
     },
     SurfaceBaseline {
-        id: 91,
+        id: 90,
         name: "`lpm check`",
         unit: true,
         integration: false,
@@ -1075,7 +1068,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         references: &["tests/workflows/tests/tools.rs"],
     },
     SurfaceBaseline {
-        id: 92,
+        id: 91,
         name: "`lpm test`",
         unit: true,
         integration: false,
@@ -1085,7 +1078,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         references: &["tests/workflows/tests/tools.rs"],
     },
     SurfaceBaseline {
-        id: 93,
+        id: 92,
         name: "`lpm bench`",
         unit: true,
         integration: false,
@@ -1095,7 +1088,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         references: &["tests/workflows/tests/tools.rs"],
     },
     SurfaceBaseline {
-        id: 94,
+        id: 93,
         name: "`lpm ci env`",
         unit: false,
         integration: false,
@@ -1105,7 +1098,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         references: &["tests/workflows/tests/ci.rs"],
     },
     SurfaceBaseline {
-        id: 95,
+        id: 94,
         name: "`lpm ci setup github-actions`",
         unit: false,
         integration: false,
@@ -1115,7 +1108,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         references: &["tests/workflows/tests/ci.rs"],
     },
     SurfaceBaseline {
-        id: 96,
+        id: 95,
         name: "`lpm ci setup gitlab`",
         unit: false,
         integration: false,
@@ -1125,7 +1118,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         references: &["crates/lpm-cli/tests/oidc_setup_snippet_contract.rs"],
     },
     SurfaceBaseline {
-        id: 97,
+        id: 96,
         name: "`lpm env init`",
         unit: true,
         integration: false,
@@ -1135,7 +1128,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         references: &["crates/lpm-cli/src/commands/env.rs"],
     },
     SurfaceBaseline {
-        id: 98,
+        id: 97,
         name: "`lpm env ls / list`",
         unit: true,
         integration: false,
@@ -1145,7 +1138,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         references: &[],
     },
     SurfaceBaseline {
-        id: 99,
+        id: 98,
         name: "`lpm env set / get / delete`",
         unit: true,
         integration: false,
@@ -1155,7 +1148,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         references: &[],
     },
     SurfaceBaseline {
-        id: 100,
+        id: 99,
         name: "`lpm env import / export / print / copy`",
         unit: true,
         integration: false,
@@ -1165,7 +1158,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         references: &[],
     },
     SurfaceBaseline {
-        id: 101,
+        id: 100,
         name: "`lpm env diff / validate / check`",
         unit: true,
         integration: false,
@@ -1175,7 +1168,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         references: &[],
     },
     SurfaceBaseline {
-        id: 102,
+        id: 101,
         name: "`lpm env push / pull` (cloud)",
         unit: true,
         integration: false,
@@ -1185,7 +1178,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         references: &["tests/workflows/tests/env_vault.rs"],
     },
     SurfaceBaseline {
-        id: 103,
+        id: 102,
         name: "`lpm env share`",
         unit: true,
         integration: false,
@@ -1195,7 +1188,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         references: &[],
     },
     SurfaceBaseline {
-        id: 104,
+        id: 103,
         name: "`lpm env pair`",
         unit: true,
         integration: false,
@@ -1205,7 +1198,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         references: &["tests/workflows/tests/env_vault.rs"],
     },
     SurfaceBaseline {
-        id: 105,
+        id: 104,
         name: "`lpm env unpair`",
         unit: true,
         integration: false,
@@ -1215,7 +1208,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         references: &["tests/workflows/tests/env_vault.rs"],
     },
     SurfaceBaseline {
-        id: 106,
+        id: 105,
         name: "`lpm env connect / status / log / rotate-key / list-remote`",
         unit: true,
         integration: false,
@@ -1225,7 +1218,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         references: &[],
     },
     SurfaceBaseline {
-        id: 107,
+        id: 106,
         name: "`lpm env oidc allow`",
         unit: true,
         integration: false,
@@ -1235,7 +1228,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         references: &["tests/workflows/tests/env_vault.rs"],
     },
     SurfaceBaseline {
-        id: 108,
+        id: 107,
         name: "`lpm env oidc list`",
         unit: true,
         integration: false,
@@ -1245,7 +1238,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         references: &["tests/workflows/tests/env_vault.rs"],
     },
     SurfaceBaseline {
-        id: 109,
+        id: 108,
         name: "`lpm env oidc pull`",
         unit: true,
         integration: false,
@@ -1255,7 +1248,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         references: &["tests/workflows/tests/env_vault.rs"],
     },
     SurfaceBaseline {
-        id: 110,
+        id: 109,
         name: "`lpm dev`",
         unit: true,
         integration: false,
@@ -1265,7 +1258,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         references: &["crates/lpm-cli/src/commands/dev.rs"],
     },
     SurfaceBaseline {
-        id: 111,
+        id: 110,
         name: "`lpm dev --tunnel / --https / --network`",
         unit: true,
         integration: false,
@@ -1275,7 +1268,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         references: &[],
     },
     SurfaceBaseline {
-        id: 112,
+        id: 111,
         name: "`lpm cert status / trust / uninstall / generate`",
         unit: false,
         integration: false,
@@ -1285,7 +1278,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         references: &["tests/workflows/tests/cert.rs"],
     },
     SurfaceBaseline {
-        id: 113,
+        id: 112,
         name: "`lpm graph` (tree default)",
         unit: true,
         integration: false,
@@ -1298,7 +1291,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         ],
     },
     SurfaceBaseline {
-        id: 114,
+        id: 113,
         name: "`lpm graph --format json`",
         unit: true,
         integration: false,
@@ -1308,7 +1301,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         references: &["tests/workflows/tests/graph.rs"],
     },
     SurfaceBaseline {
-        id: 115,
+        id: 114,
         name: "`lpm graph --format html`",
         unit: true,
         integration: false,
@@ -1318,7 +1311,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         references: &["tests/workflows/tests/graph.rs"],
     },
     SurfaceBaseline {
-        id: 116,
+        id: 115,
         name: "`lpm graph --format dot / mermaid / stats`",
         unit: true,
         integration: false,
@@ -1328,7 +1321,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         references: &["tests/workflows/tests/graph.rs"],
     },
     SurfaceBaseline {
-        id: 117,
+        id: 116,
         name: "`lpm graph --why <pkg>`",
         unit: true,
         integration: false,
@@ -1338,7 +1331,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         references: &["tests/workflows/tests/graph.rs"],
     },
     SurfaceBaseline {
-        id: 118,
+        id: 117,
         name: "`lpm ports list / kill / reset`",
         unit: false,
         integration: false,
@@ -1348,7 +1341,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         references: &["tests/workflows/tests/ports.rs"],
     },
     SurfaceBaseline {
-        id: 119,
+        id: 118,
         name: "`lpm tunnel <port>` (start)",
         unit: true,
         integration: false,
@@ -1358,7 +1351,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         references: &["crates/lpm-cli/src/commands/tunnel.rs"],
     },
     SurfaceBaseline {
-        id: 120,
+        id: 119,
         name: "`lpm tunnel claim / unclaim / list / domains`",
         unit: true,
         integration: false,
@@ -1368,7 +1361,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         references: &[],
     },
     SurfaceBaseline {
-        id: 121,
+        id: 120,
         name: "`lpm tunnel inspect / replay / log`",
         unit: true,
         integration: false,
@@ -1378,7 +1371,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         references: &[],
     },
     SurfaceBaseline {
-        id: 122,
+        id: 121,
         name: "`lpm migrate` (auto-detect npm/yarn/pnpm/bun)",
         unit: true,
         integration: true,
@@ -1394,7 +1387,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         ],
     },
     SurfaceBaseline {
-        id: 123,
+        id: 122,
         name: "`lpm migrate --rollback`",
         unit: true,
         integration: true,
@@ -1407,7 +1400,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         ],
     },
     SurfaceBaseline {
-        id: 124,
+        id: 123,
         name: "`lpm migrate --dry-run`",
         unit: true,
         integration: false,
@@ -1420,7 +1413,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         ],
     },
     SurfaceBaseline {
-        id: 125,
+        id: 124,
         name: "`lpm migrate --ci / --no-npmrc`",
         unit: true,
         integration: false,
@@ -1430,7 +1423,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         references: &[],
     },
     SurfaceBaseline {
-        id: 126,
+        id: 125,
         name: "`lpm vault open / update / version`",
         unit: false,
         integration: false,
@@ -1440,7 +1433,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         references: &[],
     },
     SurfaceBaseline {
-        id: 127,
+        id: 126,
         name: "`lpm self-update`",
         unit: true,
         integration: false,
@@ -1450,7 +1443,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         references: &["crates/lpm-cli/src/commands/self_update.rs"],
     },
     SurfaceBaseline {
-        id: 128,
+        id: 127,
         name: "`lpm internal-update-check` (hidden)",
         unit: true,
         integration: false,
@@ -1460,7 +1453,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         references: &[],
     },
     SurfaceBaseline {
-        id: 129,
+        id: 128,
         name: "`lpm swift-registry`",
         unit: true,
         integration: false,
@@ -1473,7 +1466,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         ],
     },
     SurfaceBaseline {
-        id: 130,
+        id: 129,
         name: "`lpm mcp setup / remove / status`",
         unit: true,
         integration: false,
@@ -1483,7 +1476,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         references: &["crates/lpm-cli/src/commands/mcp.rs"],
     },
     SurfaceBaseline {
-        id: 131,
+        id: 130,
         name: "`lpm use node@<v>`",
         unit: true,
         integration: false,
@@ -1493,7 +1486,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         references: &["crates/lpm-cli/src/commands/use.rs"],
     },
     SurfaceBaseline {
-        id: 132,
+        id: 131,
         name: "`lpm use --list`",
         unit: true,
         integration: false,
@@ -1503,7 +1496,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         references: &[],
     },
     SurfaceBaseline {
-        id: 133,
+        id: 132,
         name: "`lpm completions <shell>`",
         unit: false,
         integration: false,
@@ -1513,7 +1506,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         references: &["tests/workflows/tests/completions.rs"],
     },
     SurfaceBaseline {
-        id: 134,
+        id: 133,
         name: "`lpm schema lpm.json`",
         unit: true,
         integration: false,
@@ -1526,7 +1519,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         ],
     },
     SurfaceBaseline {
-        id: 135,
+        id: 134,
         name: "`lpm schema lpm.config.json`",
         unit: true,
         integration: false,
@@ -1536,7 +1529,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         references: &["crates/lpm-cli/tests/schema_drift.rs"],
     },
     SurfaceBaseline {
-        id: 136,
+        id: 135,
         name: "`lpm strict-ssl warning` (cross-cmd installer warning)",
         unit: false,
         integration: false,
