@@ -365,15 +365,28 @@ enum Commands {
         /// second `--auto-build` flag to actually fire scripts; that
         /// two-step is now collapsed.)
         ///
-        /// `triage`: four-layer tiered gate. Greens auto-approve and
-        /// run in the filesystem sandbox; ambers and reds remain in the
-        /// blocked set for manual review via `lpm approve-scripts`.
-        /// Triage requires `--auto-build` or `lpm.scripts.autoBuild: true`
-        /// to run greens automatically. The LLM triage layer is not
-        /// available yet.
+        /// `triage`: four-layer tiered gate. Auto-runs when every
+        /// unbuilt scripted package is trusted/green; if any amber or
+        /// red remains, scripts defer to `lpm approve-scripts` review
+        /// unless an explicit auto-build signal is set. On project
+        /// installs that signal is `--auto-build` or
+        /// `package.json > lpm > scripts.autoBuild = true`; on global
+        /// installs (`-g`), only `--auto-build` applies — `-g` uses a
+        /// synthesized package.json that does not project per-project
+        /// script knobs. Greens auto-execute in the filesystem sandbox;
+        /// ambers and reds never auto-execute. The LLM triage layer
+        /// is not available yet.
         ///
         /// Precedence: this flag > `package.json > lpm > scriptPolicy`
         /// > `~/.lpm/config.toml` key `script-policy` > default (deny).
+        ///
+        /// On `-g` the `package.json` tier is N/A; the chain collapses to
+        /// CLI flag > `~/.lpm/config.toml` > default.
+        ///
+        /// On `lpm install -g`, blocked scripts can only be re-executed
+        /// by reinstalling the affected global(s) (`lpm uninstall -g
+        /// <pkg> && lpm install -g <pkg>`) after `lpm approve-scripts
+        /// --global`. `lpm rebuild --global` is a planned follow-up.
         ///
         /// Mutually exclusive with `--yolo` and `--triage`.
         #[arg(
@@ -388,6 +401,9 @@ enum Commands {
         /// auto-build fires automatically; no separate `--auto-build`
         /// flag needed).
         ///
+        /// See `--policy` for the global rerun caveat (`-g` blocked
+        /// scripts require uninstall+reinstall after approval).
+        ///
         /// Mutually exclusive with `--policy` and `--triage`.
         #[arg(long, conflicts_with_all = ["policy", "triage_alias"])]
         yolo: bool,
@@ -396,6 +412,9 @@ enum Commands {
         /// tiered gate (Phase 46 P2–P6): greens auto-approve and
         /// run in the sandbox; ambers and reds route to
         /// `lpm approve-scripts` for manual review.
+        ///
+        /// See `--policy` for the global rerun caveat (`-g` blocked
+        /// scripts require uninstall+reinstall after approval).
         ///
         /// Mutually exclusive with `--policy` and `--yolo`.
         #[arg(long = "triage", id = "triage_alias", conflicts_with_all = ["policy", "yolo"])]
@@ -2014,31 +2033,76 @@ fn command_needs_global_state(cmd: &Commands) -> bool {
     }
 }
 
+/// Phase 68: assemble the per-invocation security overrides forwarded
+/// from `lpm install -g` into the global install pipeline.
+///
+/// Centralizes three steps that previously lived inline in the
+/// dispatcher arm:
+///   1. Collapse the three mutually-exclusive policy aliases
+///      (`--policy=<v>` / `--yolo` / `--triage`) into a single
+///      `Option<ScriptPolicy>` via [`crate::script_policy_config::collapse_policy_flags`].
+///   2. Resolve the effective policy through [`crate::script_policy_config::resolve_script_policy`]
+///      with `ScriptPolicyConfig::default()` so the user-config tier
+///      (`~/.lpm/config.toml`) and `force-security-floor` semantics
+///      still fire — only the project-config tier (which doesn't apply
+///      to `-g`, since the synthetic package.json never carries
+///      `lpm.scriptPolicy`) is collapsed.
+///   3. Parse `--min-release-age=<DUR>` and canonicalize the drift
+///      flags via [`crate::provenance_fetch::DriftIgnorePolicy::from_cli`].
+///
+/// Extracted to make the wiring unit-testable: a regression that drops
+/// any of the five overrides on the way to `install_global::run` is
+/// caught by the tests in this module.
 #[allow(clippy::too_many_arguments)]
+fn build_install_global_overrides(
+    allow_new: bool,
+    auto_build: bool,
+    policy: Option<&str>,
+    yolo: bool,
+    triage_alias: bool,
+    min_release_age: Option<&str>,
+    ignore_provenance_drift: Vec<String>,
+    ignore_provenance_drift_all: bool,
+) -> Result<commands::install_global::InstallGlobalOverrides, lpm_common::LpmError> {
+    let cli_policy_override =
+        crate::script_policy_config::collapse_policy_flags(policy, yolo, triage_alias)
+            .map_err(lpm_common::LpmError::Script)?;
+    let global_policy_cfg = crate::script_policy_config::ScriptPolicyConfig::default();
+    let resolved_policy =
+        crate::script_policy_config::resolve_script_policy(cli_policy_override, &global_policy_cfg);
+    let min_release_age_override = match min_release_age {
+        Some(s) => Some(crate::release_age_config::parse_duration(s)?),
+        None => None,
+    };
+    let drift_ignore_policy = crate::provenance_fetch::DriftIgnorePolicy::from_cli(
+        ignore_provenance_drift,
+        ignore_provenance_drift_all,
+    );
+    Ok(commands::install_global::InstallGlobalOverrides {
+        allow_new,
+        min_release_age_override,
+        drift_ignore_policy,
+        // Forward the resolved policy as `Some(p)` so the inner
+        // pipeline's resolver doesn't double-resolve against its own
+        // (project-shape) chain.
+        script_policy_override: Some(resolved_policy),
+        auto_build,
+    })
+}
+
 fn validate_global_install_project_scoped_flags(
     save_dev: bool,
     filter: &[String],
     workspace_root: bool,
     fail_if_no_match: bool,
     yes: bool,
-    allow_new: bool,
-    // Phase 46 P3 D13/D19: `--min-release-age` is wired on the shared
-    // `lpm install` surface, but per-invocation cooldown override for
-    // global installs is explicitly out of P3 scope. Reject rather than
-    // silently drop — the reviewer caught a contract bug where the flag
-    // was parsed after the `-g` early-return, so even `--min-release-age=garbage`
-    // would be silently accepted on the global path.
-    min_release_age: Option<&str>,
-    // Phase 46 P4 Chunk 4: mirrors the P3 rejection pattern for the
-    // drift-override flags. Global install trust store has no
-    // `provenance_at_approval` today (it's a separate schema; see
-    // §3.9 + §17 in the plan), so `--ignore-provenance-drift` and
-    // `--ignore-provenance-drift-all` have no semantic target on the
-    // `-g` path. Reject explicitly rather than silently drop, same
-    // reasoning as the cooldown flag above.
-    ignore_provenance_drift: &[String],
-    ignore_provenance_drift_all: bool,
 ) -> Result<(), lpm_common::LpmError> {
+    // Phase 68: `--allow-new`, `--min-release-age`, and
+    // `--ignore-provenance-drift[-all]` are now forwarded into the
+    // global install pipeline (their gates fire end-to-end against the
+    // synthetic project's package.json), so they are no longer rejected
+    // here. The flags below remain genuinely project-scoped and have no
+    // meaningful semantics on `-g`.
     if save_dev || !filter.is_empty() || workspace_root || fail_if_no_match || yes {
         return Err(lpm_common::LpmError::Script(
             "`-g` is mutually exclusive with `-D` / `--filter` / `-w` / \
@@ -2046,32 +2110,6 @@ fn validate_global_install_project_scoped_flags(
                 .into(),
         ));
     }
-    if allow_new {
-        return Err(lpm_common::LpmError::Script(
-            "`--allow-new` is not supported on `lpm install -g` yet — global-scope \
-             cooldown bypass isn't wired up. Drop the flag for global installs; \
-             the cooldown still follows the package.json / ~/.lpm/config.toml / \
-             24h default chain."
-                .into(),
-        ));
-    }
-    if min_release_age.is_some() {
-        return Err(lpm_common::LpmError::Script(
-            "`--min-release-age` is not supported on `lpm install -g` yet — global-scope \
-             cooldown overrides aren't wired up. Drop the flag for global installs; \
-             the cooldown still fires via the package.json / ~/.lpm/config.toml / 24h default chain."
-                .into(),
-        ));
-    }
-    if !ignore_provenance_drift.is_empty() || ignore_provenance_drift_all {
-        return Err(lpm_common::LpmError::Script(
-            "`--ignore-provenance-drift` / `--ignore-provenance-drift-all` are not \
-             supported on `lpm install -g` yet — the global trust store doesn't accept \
-             per-package drift overrides. Drop the flag for global installs."
-                .into(),
-        ));
-    }
-
     Ok(())
 }
 
@@ -2514,10 +2552,6 @@ async fn async_main() -> Result<()> {
                     workspace_root,
                     fail_if_no_match,
                     yes,
-                    allow_new,
-                    min_release_age.as_deref(),
-                    &ignore_provenance_drift,
-                    ignore_provenance_drift_all,
                 )
                 .into_diagnostic()?;
                 // Phase 37 M4: parse collision-resolution flags. Syntactic
@@ -2535,19 +2569,32 @@ async fn async_main() -> Result<()> {
                     no_skills,
                     no_editor_setup,
                     no_security_summary,
-                    auto_build,
                     exact,
                     tilde,
                     save_prefix,
-                ); // M3.2 honors none of these yet; M3.4/M5 will wire selected flags.
-                // `allow_new`, `min_release_age`, `ignore_provenance_drift`,
-                // and `ignore_provenance_drift_all` are already rejected by
-                // `validate_global_install_project_scoped_flags` above,
-                // so none of them reach this point as a populated value
-                // — no discard needed.
-                return commands::install_global::run(&client, &packages[0], resolution, cli.json)
-                    .await
-                    .into_diagnostic();
+                ); // M3.2 honors none of these yet; M3.4 will wire selected flags.
+
+                let overrides = build_install_global_overrides(
+                    allow_new,
+                    auto_build,
+                    policy.as_deref(),
+                    yolo,
+                    triage_alias,
+                    min_release_age.as_deref(),
+                    ignore_provenance_drift,
+                    ignore_provenance_drift_all,
+                )
+                .into_diagnostic()?;
+
+                return commands::install_global::run(
+                    &client,
+                    &packages[0],
+                    resolution,
+                    cli.json,
+                    overrides,
+                )
+                .await
+                .into_diagnostic();
             }
 
             // M4 audit Finding 2: reject collision-resolution flags on
@@ -4620,10 +4667,6 @@ mod tests {
                     workspace_root,
                     fail_if_no_match,
                     yes,
-                    false,
-                    None,
-                    &[],
-                    false,
                 )
                 .unwrap_err();
 
@@ -4639,254 +4682,256 @@ mod tests {
         }
     }
 
-    /// Phase 46 P3 reviewer finding: `-g` + `--min-release-age=<anything>`
-    /// must hard-error before the flag is even parsed, so that invalid
-    /// values (`=garbage`) don't silently pass and no-op values (`=0`)
-    /// don't mislead the user into thinking global installs honor the
-    /// override. The flag is documented on the shared `Install` clap
-    /// variant but its semantics are explicitly project-only per D13/D19
-    /// in the Phase 46 plan.
+    // Phase 68: the previous Phase 46 P3/P4 tests that pinned validator
+    // rejections for `--allow-new`, `--min-release-age`, and
+    // `--ignore-provenance-drift[-all]` on `-g` are removed because
+    // those flags are now FORWARDED into the global install pipeline.
+    // End-to-end coverage that they actually take effect on `-g` lives
+    // in `tests/workflows/tests/install_global_drift.rs` and
+    // `tests/workflows/tests/install_global_policy.rs`.
+
+    /// Confirm the Phase 68 contract on the validator's surface area:
+    /// the four flags previously rejected on `-g` are now accepted by
+    /// the validator, and `-y` remains the project-only flag it
+    /// rejects.
     #[test]
-    fn install_global_rejects_min_release_age_flag() {
-        for value in ["0", "72h", "garbage", "+5h"] {
-            let cli = Cli::try_parse_from([
-                "lpm",
-                "install",
-                "-g",
-                "eslint",
-                &format!("--min-release-age={value}"),
-            ])
+    fn install_global_validator_only_rejects_project_scoped_grouping_flags() {
+        // Genuine project-only flag: still rejected.
+        let err = validate_global_install_project_scoped_flags(true, &[], false, false, false)
+            .unwrap_err();
+        match err {
+            lpm_common::LpmError::Script(message) => {
+                assert!(message.contains("project-scoped"));
+            }
+            other => panic!("expected Script error, got {other:?}"),
+        }
+
+        // No project-only flags set → accept.
+        validate_global_install_project_scoped_flags(false, &[], false, false, false).unwrap();
+    }
+
+    // ── Phase 68 forwarding regression tests ─────────────────────────
+    //
+    // These tests pin the wiring between CLI args and
+    // `InstallGlobalOverrides`. A regression that drops any of the
+    // five overrides on the way to `install_global::run` is caught
+    // here. Validator acceptance (above) is necessary but not
+    // sufficient — without these, a future refactor that silently
+    // hardcoded e.g. `allow_new: false` inside the bundle constructor
+    // would still leave the validator-acceptance suite green.
+
+    use crate::provenance_fetch::DriftIgnorePolicy;
+    use crate::script_policy_config::ScriptPolicy;
+
+    #[test]
+    fn build_install_global_overrides_threads_allow_new_and_auto_build_bools() {
+        let o = build_install_global_overrides(true, true, None, false, false, None, vec![], false)
             .unwrap();
-            match cli.command.expect("test parse missing subcommand") {
-                Commands::Install {
-                    save_dev,
-                    filter,
-                    workspace_root,
-                    fail_if_no_match,
-                    yes,
-                    global,
-                    min_release_age,
-                    ..
-                } => {
-                    assert!(global, "-g must parse into global=true");
-                    assert_eq!(min_release_age.as_deref(), Some(value));
+        assert!(
+            o.allow_new,
+            "allow_new must reach the bundle so the cooldown gate is bypassed"
+        );
+        assert!(
+            o.auto_build,
+            "auto_build must reach the bundle so triage greens auto-execute"
+        );
 
-                    let err = validate_global_install_project_scoped_flags(
-                        save_dev,
-                        &filter,
-                        workspace_root,
-                        fail_if_no_match,
-                        yes,
-                        false,
-                        min_release_age.as_deref(),
-                        &[],
-                        false,
-                    )
-                    .unwrap_err();
-
-                    match err {
-                        lpm_common::LpmError::Script(message) => {
-                            assert!(
-                                message.contains("--min-release-age"),
-                                "error must name the flag, got: {message}"
-                            );
-                            assert!(
-                                message.contains("not supported") && message.contains("global"),
-                                "error must say the flag isn't supported on global installs, \
-                                 got: {message}"
-                            );
-                        }
-                        other => panic!("expected Script error, got {other:?}"),
-                    }
-                }
-                _ => panic!("expected Install command"),
-            }
-        }
+        let o =
+            build_install_global_overrides(false, false, None, false, false, None, vec![], false)
+                .unwrap();
+        assert!(!o.allow_new);
+        assert!(!o.auto_build);
     }
 
-    /// Phase 46 P4 Chunk 4: `-g` + `--ignore-provenance-drift <pkg>`
-    /// must hard-error. Mirrors the P3 `--min-release-age` rejection
-    /// pattern. D13/D19 keeps global out of P4 scope; the override
-    /// has no semantic target on the `-g` path (global trust store
-    /// is a separate schema, §3.9).
     #[test]
-    fn install_global_rejects_ignore_provenance_drift_flag() {
-        let cli = Cli::try_parse_from([
-            "lpm",
-            "install",
-            "-g",
-            "eslint",
-            "--ignore-provenance-drift",
-            "axios",
-            "--ignore-provenance-drift",
-            "lodash",
-        ])
+    fn build_install_global_overrides_parses_min_release_age_duration() {
+        let o = build_install_global_overrides(
+            false,
+            false,
+            None,
+            false,
+            false,
+            Some("72h"),
+            vec![],
+            false,
+        )
         .unwrap();
-        match cli.command.expect("test parse missing subcommand") {
-            Commands::Install {
-                save_dev,
-                filter,
-                workspace_root,
-                fail_if_no_match,
-                yes,
-                global,
-                ignore_provenance_drift,
-                ignore_provenance_drift_all,
-                ..
-            } => {
-                assert!(global);
-                assert_eq!(
-                    ignore_provenance_drift,
-                    vec!["axios".to_string(), "lodash".to_string()],
-                );
-                assert!(!ignore_provenance_drift_all);
+        assert_eq!(
+            o.min_release_age_override,
+            Some(72 * 3600),
+            "72h must parse to 259_200 seconds and reach the bundle"
+        );
 
-                let err = validate_global_install_project_scoped_flags(
-                    save_dev,
-                    &filter,
-                    workspace_root,
-                    fail_if_no_match,
-                    yes,
-                    false,
-                    None,
-                    &ignore_provenance_drift,
-                    ignore_provenance_drift_all,
-                )
-                .unwrap_err();
-
-                match err {
-                    lpm_common::LpmError::Script(message) => {
-                        assert!(
-                            message.contains("--ignore-provenance-drift"),
-                            "error must name the flag, got: {message}",
-                        );
-                        assert!(
-                            message.contains("not supported") && message.contains("global"),
-                            "error must say the flag isn't supported on global installs, \
-                             got: {message}",
-                        );
-                    }
-                    other => panic!("expected Script error, got {other:?}"),
-                }
-            }
-            _ => panic!("expected Install command"),
-        }
-    }
-
-    /// Phase 46 P4 Chunk 4: `-g` + `--ignore-provenance-drift-all`
-    /// must hard-error. Separate test from the per-package variant so
-    /// CI can tell which specific user command triggered the
-    /// regression if the validator ever stops enforcing one branch.
-    #[test]
-    fn install_global_rejects_ignore_provenance_drift_all_flag() {
-        let cli = Cli::try_parse_from([
-            "lpm",
-            "install",
-            "-g",
-            "eslint",
-            "--ignore-provenance-drift-all",
-        ])
+        let o = build_install_global_overrides(
+            false,
+            false,
+            None,
+            false,
+            false,
+            Some("0"),
+            vec![],
+            false,
+        )
         .unwrap();
-        match cli.command.expect("test parse missing subcommand") {
-            Commands::Install {
-                save_dev,
-                filter,
-                workspace_root,
-                fail_if_no_match,
-                yes,
-                global,
-                ignore_provenance_drift,
-                ignore_provenance_drift_all,
-                ..
-            } => {
-                assert!(global);
-                assert!(ignore_provenance_drift.is_empty());
-                assert!(ignore_provenance_drift_all);
+        assert_eq!(
+            o.min_release_age_override,
+            Some(0),
+            "explicit zero must reach the bundle (disables cooldown for this invocation)"
+        );
 
-                let err = validate_global_install_project_scoped_flags(
-                    save_dev,
-                    &filter,
-                    workspace_root,
-                    fail_if_no_match,
-                    yes,
-                    false,
-                    None,
-                    &ignore_provenance_drift,
-                    ignore_provenance_drift_all,
-                )
-                .unwrap_err();
-
-                match err {
-                    lpm_common::LpmError::Script(message) => {
-                        assert!(
-                            message.contains("--ignore-provenance-drift-all")
-                                || message.contains("--ignore-provenance-drift"),
-                            "error must name a drift-override flag, got: {message}",
-                        );
-                        assert!(
-                            message.contains("not supported") && message.contains("global"),
-                            "error must say the flag isn't supported on global installs, \
-                             got: {message}",
-                        );
-                    }
-                    other => panic!("expected Script error, got {other:?}"),
-                }
-            }
-            _ => panic!("expected Install command"),
-        }
+        // No override → None reaches the bundle (fallback to chain default).
+        let o =
+            build_install_global_overrides(false, false, None, false, false, None, vec![], false)
+                .unwrap();
+        assert!(o.min_release_age_override.is_none());
     }
 
-    /// `--allow-new` is a project-install cooldown escape hatch today.
-    /// Global installs currently accept then drop it, which is the
-    /// exact contract gap this regression test pins: the flag must
-    /// hard-error on `-g` instead of silently disappearing.
     #[test]
-    fn install_global_rejects_allow_new_flag() {
-        let cli = Cli::try_parse_from(["lpm", "install", "-g", "eslint", "--allow-new"]).unwrap();
-        match cli.command.expect("test parse missing subcommand") {
-            Commands::Install {
-                save_dev,
-                filter,
-                workspace_root,
-                fail_if_no_match,
-                yes,
-                allow_new,
-                global,
-                ..
-            } => {
-                assert!(global);
-                assert!(allow_new);
+    fn build_install_global_overrides_rejects_garbage_min_release_age() {
+        let err = build_install_global_overrides(
+            false,
+            false,
+            None,
+            false,
+            false,
+            Some("garbage"),
+            vec![],
+            false,
+        )
+        .unwrap_err();
+        // Don't pin the exact wording (owned by release_age_config),
+        // but the parser MUST surface an error rather than silently
+        // dropping the override.
+        assert!(
+            err.to_string().contains("garbage"),
+            "garbage min-release-age must surface a parser error: {err}"
+        );
+    }
 
-                let err = validate_global_install_project_scoped_flags(
-                    save_dev,
-                    &filter,
-                    workspace_root,
-                    fail_if_no_match,
-                    yes,
-                    allow_new,
-                    None,
-                    &[],
-                    false,
-                )
-                .unwrap_err();
-
-                match err {
-                    lpm_common::LpmError::Script(message) => {
-                        assert!(
-                            message.contains("--allow-new"),
-                            "error must name the flag, got: {message}",
-                        );
-                        assert!(
-                            message.contains("not supported") && message.contains("global"),
-                            "error must say the flag isn't supported on global installs, \
-                             got: {message}",
-                        );
-                    }
-                    other => panic!("expected Script error, got {other:?}"),
-                }
+    #[test]
+    fn build_install_global_overrides_canonicalizes_drift_ignore_policy() {
+        // Per-package list → IgnoreNames.
+        let o = build_install_global_overrides(
+            false,
+            false,
+            None,
+            false,
+            false,
+            None,
+            vec!["axios".to_string(), "lodash".to_string()],
+            false,
+        )
+        .unwrap();
+        match o.drift_ignore_policy {
+            DriftIgnorePolicy::IgnoreNames(set) => {
+                assert!(set.contains("axios") && set.contains("lodash"));
             }
-            _ => panic!("expected Install command"),
+            other => panic!("expected IgnoreNames, got {other:?}"),
         }
+
+        // -all wins over per-package list.
+        let o = build_install_global_overrides(
+            false,
+            false,
+            None,
+            false,
+            false,
+            None,
+            vec!["axios".to_string()],
+            true,
+        )
+        .unwrap();
+        assert!(matches!(
+            o.drift_ignore_policy,
+            DriftIgnorePolicy::IgnoreAll
+        ));
+
+        // Empty + false → EnforceAll.
+        let o =
+            build_install_global_overrides(false, false, None, false, false, None, vec![], false)
+                .unwrap();
+        assert!(matches!(
+            o.drift_ignore_policy,
+            DriftIgnorePolicy::EnforceAll
+        ));
+    }
+
+    #[test]
+    fn build_install_global_overrides_resolves_script_policy_aliases() {
+        // --policy=allow → resolved Allow.
+        let o = build_install_global_overrides(
+            false,
+            false,
+            Some("allow"),
+            false,
+            false,
+            None,
+            vec![],
+            false,
+        )
+        .unwrap();
+        assert_eq!(o.script_policy_override, Some(ScriptPolicy::Allow));
+
+        // --yolo → Allow.
+        let o =
+            build_install_global_overrides(false, false, None, true, false, None, vec![], false)
+                .unwrap();
+        assert_eq!(o.script_policy_override, Some(ScriptPolicy::Allow));
+
+        // --triage → Triage.
+        let o =
+            build_install_global_overrides(false, false, None, false, true, None, vec![], false)
+                .unwrap();
+        assert_eq!(o.script_policy_override, Some(ScriptPolicy::Triage));
+
+        // --policy=deny → Deny (explicit; not ambient default).
+        let o = build_install_global_overrides(
+            false,
+            false,
+            Some("deny"),
+            false,
+            false,
+            None,
+            vec![],
+            false,
+        )
+        .unwrap();
+        assert_eq!(o.script_policy_override, Some(ScriptPolicy::Deny));
+
+        // No flag → resolves to the default (Deny) via the resolver.
+        // Use a scoped HOME so the developer's ~/.lpm/config.toml
+        // doesn't leak into the test (the resolver consults the
+        // user-config tier).
+        let _env = crate::test_env::ScopedEnv::set([(
+            "HOME",
+            std::ffi::OsString::from(std::env::temp_dir().to_str().unwrap()),
+        )]);
+        let o =
+            build_install_global_overrides(false, false, None, false, false, None, vec![], false)
+                .unwrap();
+        // The resolver returns the default — Some(Deny). We forward
+        // it as `Some` so the inner pipeline's resolver doesn't
+        // double-resolve.
+        assert!(o.script_policy_override.is_some());
+    }
+
+    #[test]
+    fn build_install_global_overrides_rejects_unknown_policy_value() {
+        let err = build_install_global_overrides(
+            false,
+            false,
+            Some("yolo"), // Not a canonical --policy value (the alias is `--yolo`, not `--policy=yolo`).
+            false,
+            false,
+            None,
+            vec![],
+            false,
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("yolo"),
+            "unknown policy value must surface a parser error: {err}"
+        );
     }
 
     // ── Phase 32 Phase 2 M3: uninstall --filter / -w / --fail-if-no-match ──

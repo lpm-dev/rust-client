@@ -53,13 +53,26 @@ use std::path::Path;
 
 /// Binding metadata for one entry in the global trusted-deps map.
 ///
-/// Wire-identical to `lpm_workspace::TrustedDependencyBinding` —
-/// same field names, same serde rename for `scriptHash`, same
-/// `skip_serializing_if = Option::is_none`. Duplicated here rather
-/// than imported so `lpm-global` stays lower-layer and can't
-/// accidentally pull in the broader workspace / manifest dependency
-/// graph. If the two ever drift, `approve-scripts --global` is the
-/// integration layer responsible for reconciling; for v1 they match.
+/// Mirrors the subset of `lpm_workspace::TrustedDependencyBinding`
+/// enforced on the global install path: `integrity`, `script_hash`,
+/// and `provenance_at_approval` (which drives the install-time drift
+/// gate via the synthetic `package.json > lpm > trustedDependencies`
+/// projection in `install_global::synthesize_pkg_json`). The
+/// project-only fields — `behavioral_tags_hash`, `behavioral_tags`,
+/// `capability_hash` — are NOT yet captured here; revisit when the
+/// matching gates extend to globals.
+///
+/// Duplicated rather than imported so `lpm-global` stays lower-layer
+/// and can't accidentally pull in the broader workspace / manifest
+/// dependency graph. The serde shape (field names + renames +
+/// `skip_serializing_if`) is intentionally byte-compatible with the
+/// project-level binding so a snapshot stored here deserializes into
+/// the project-shape binding cleanly when the inner install pipeline
+/// reads the synthetic package.json.
+///
+/// `ProvenanceSnapshot` lives in `lpm-common` (re-exported from
+/// `lpm-workspace`) specifically so both bindings can share that
+/// type without `lpm-global` needing to depend on `lpm-workspace`.
 #[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
 pub struct TrustedDependencyBinding {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -70,6 +83,23 @@ pub struct TrustedDependencyBinding {
         skip_serializing_if = "Option::is_none"
     )]
     pub script_hash: Option<String>,
+    /// Snapshot of the publisher identity tuple captured at the moment
+    /// this binding was approved (Phase 68 P4-parity addition). The
+    /// install-time drift gate compares this against the candidate
+    /// version's freshly-fetched provenance to detect publisher drift
+    /// across the approval boundary. `None` means the binding pre-dates
+    /// provenance capture (legacy upgrade path) OR the approved version
+    /// had no attestation; both cases degrade to "cannot detect drift"
+    /// and the other strict-gate dimensions still fire on their own.
+    ///
+    /// Non-breaking via `#[serde(default, skip_serializing_if)]`:
+    /// pre-Phase-68 entries on disk round-trip unchanged.
+    #[serde(
+        default,
+        rename = "provenanceAtApproval",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub provenance_at_approval: Option<lpm_common::ProvenanceSnapshot>,
 }
 
 pub const SCHEMA_VERSION: u32 = 1;
@@ -166,6 +196,11 @@ impl GlobalTrustedDependencies {
     /// response that lacked the SRI). Approving anyway is a deliberate
     /// user choice — the strict query degrades to drift-detection for
     /// any missing field pair.
+    ///
+    /// **Phase 68:** kept as the legacy two-field shortcut for tests
+    /// and any caller that genuinely doesn't want to capture provenance.
+    /// Production `--global` write paths should use [`Self::insert_binding`]
+    /// to persist a richer binding (including `provenance_at_approval`).
     pub fn insert_strict(
         &mut self,
         name: &str,
@@ -178,8 +213,18 @@ impl GlobalTrustedDependencies {
             TrustedDependencyBinding {
                 integrity,
                 script_hash,
+                provenance_at_approval: None,
             },
         );
+    }
+
+    /// Insert-or-overwrite a fully-populated trust binding. Used by
+    /// `lpm approve-scripts --global` to persist `provenance_at_approval`
+    /// alongside `integrity` and `script_hash` so the install-time
+    /// drift gate has a reference snapshot to compare future versions
+    /// against.
+    pub fn insert_binding(&mut self, name: &str, version: &str, binding: TrustedDependencyBinding) {
+        self.trusted.insert(rich_key(name, version), binding);
     }
 
     /// Remove a trust binding. Used on `uninstall -g <pkg>` to sweep
@@ -276,6 +321,17 @@ mod tests {
         TrustedDependencyBinding {
             integrity: integ.map(String::from),
             script_hash: script.map(String::from),
+            provenance_at_approval: None,
+        }
+    }
+
+    fn provenance_snap(publisher: &str, workflow_path: &str) -> lpm_common::ProvenanceSnapshot {
+        lpm_common::ProvenanceSnapshot {
+            present: true,
+            publisher: Some(publisher.into()),
+            workflow_path: Some(workflow_path.into()),
+            workflow_ref: Some("refs/tags/v1.0.0".into()),
+            attestation_cert_sha256: Some("sha256-cert".into()),
         }
     }
 
@@ -504,7 +560,117 @@ mod tests {
         let b = TrustedDependencyBinding {
             integrity: Some("i".into()),
             script_hash: Some("s".into()),
+            provenance_at_approval: None,
         };
         assert_eq!(a, b);
+    }
+
+    // ── Phase 68: provenance_at_approval round-trip + insert_binding ──
+
+    /// A binding with a full provenance snapshot must round-trip
+    /// through the on-disk JSON unchanged. Drives the drift gate via
+    /// `synthesize_pkg_json`'s `serde_json::to_value(binding)`.
+    #[test]
+    fn round_trip_preserves_provenance_at_approval() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join(FILENAME);
+        let mut gtd = GlobalTrustedDependencies::default();
+        gtd.insert_binding(
+            "esbuild",
+            "0.25.1",
+            TrustedDependencyBinding {
+                integrity: Some("sha512-e".into()),
+                script_hash: Some("sha256-s".into()),
+                provenance_at_approval: Some(provenance_snap(
+                    "github:evanw/esbuild",
+                    ".github/workflows/release.yml",
+                )),
+            },
+        );
+        write_at(&path, &gtd).unwrap();
+        let read = read_at(&path).unwrap();
+        assert_eq!(read, gtd);
+        let snap = read.trusted["esbuild@0.25.1"]
+            .provenance_at_approval
+            .as_ref()
+            .expect("provenance must round-trip");
+        assert_eq!(snap.publisher.as_deref(), Some("github:evanw/esbuild"));
+    }
+
+    /// Pre-Phase-68 entries on disk (no `provenanceAtApproval` field)
+    /// must deserialize cleanly with `provenance_at_approval = None`.
+    /// Additive `serde(default)` is the load-bearing guarantee here.
+    #[test]
+    fn read_old_schema_without_provenance_defaults_to_none() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join(FILENAME);
+        let body = r#"{
+            "schema_version": 1,
+            "trusted": {
+                "esbuild@0.25.1": {
+                    "integrity": "sha512-e",
+                    "scriptHash": "sha256-s"
+                }
+            }
+        }"#;
+        std::fs::write(&path, body).unwrap();
+        let read = read_at(&path).unwrap();
+        let bind = &read.trusted["esbuild@0.25.1"];
+        assert_eq!(bind.integrity.as_deref(), Some("sha512-e"));
+        assert_eq!(bind.script_hash.as_deref(), Some("sha256-s"));
+        assert!(bind.provenance_at_approval.is_none());
+    }
+
+    /// `insert_binding` is the new write API for paths that capture
+    /// provenance. Asserts overwrite semantics + that the rich
+    /// binding survives.
+    #[test]
+    fn insert_binding_stores_rich_binding_and_overwrites() {
+        let mut gtd = GlobalTrustedDependencies::default();
+        gtd.insert_binding(
+            "esbuild",
+            "0.25.1",
+            TrustedDependencyBinding {
+                integrity: Some("sha512-old".into()),
+                script_hash: None,
+                provenance_at_approval: None,
+            },
+        );
+        let new = TrustedDependencyBinding {
+            integrity: Some("sha512-new".into()),
+            script_hash: Some("sha256-s".into()),
+            provenance_at_approval: Some(provenance_snap(
+                "github:evanw/esbuild",
+                ".github/workflows/release.yml",
+            )),
+        };
+        gtd.insert_binding("esbuild", "0.25.1", new.clone());
+        assert_eq!(gtd.trusted.len(), 1);
+        assert_eq!(gtd.trusted["esbuild@0.25.1"], new);
+    }
+
+    /// `matches_strict` is the aggregate-filter query and the post-
+    /// install-banner query. Neither consumes `provenance_at_approval`
+    /// — drift comparison happens against the project-shape binding
+    /// inside the inner install pipeline. Pin that contract: two
+    /// otherwise-identical bindings that differ only in
+    /// `provenance_at_approval` must both report `Strict`.
+    #[test]
+    fn matches_strict_ignores_provenance_at_approval() {
+        let mut gtd = GlobalTrustedDependencies::default();
+        gtd.insert_binding(
+            "esbuild",
+            "0.25.1",
+            TrustedDependencyBinding {
+                integrity: Some("sha512-e".into()),
+                script_hash: Some("sha256-s".into()),
+                provenance_at_approval: Some(provenance_snap(
+                    "github:evanw/esbuild",
+                    ".github/workflows/release.yml",
+                )),
+            },
+        );
+        let m = gtd.matches_strict("esbuild", "0.25.1", Some("sha512-e"), Some("sha256-s"));
+        assert_eq!(m, TrustMatch::Strict);
     }
 }

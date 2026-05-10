@@ -2264,12 +2264,12 @@ fn check_script_policy_surface() -> Vec<Check> {
     // 18. Sandbox availability.
     out.push(probe_sandbox_backend());
 
-    // 19. Scope-boundary note — only when globals are present.
-    if let Ok(root) = lpm_common::LpmRoot::from_env()
-        && let Some(check) = scope_boundary_note_if_globals_present(&root)
-    {
-        out.push(check);
-    }
+    // Phase 68: the scope-boundary note that previously fired here
+    // when globals were present is gone — `lpm install -g` now honors
+    // the same script-policy / sandbox / cooldown / drift gates as
+    // project installs, so the boundary it described no longer exists.
+    // The matching `POLICY_SCOPE_PROJECT_ONLY` doctor-catalog entry was
+    // also removed.
 
     // **Phase 48 P0 slice 4.** 20. Force-security-floor kill-switch
     // status. Only surfaces when the flag is set — unset is the
@@ -2343,26 +2343,6 @@ fn count_suspended_approvals_in_cwd() -> Option<usize> {
         serde_json::Value::Array(arr) => Some(arr.len()),
         serde_json::Value::Object(obj) => Some(obj.len()),
         _ => Some(0),
-    }
-}
-
-/// Emit the scope-boundary note iff the global manifest carries at
-/// least one active install. Split out from [`check_script_policy_surface`]
-/// so a unit test can feed a synthetic [`LpmRoot`] and assert the
-/// firing condition without touching the real `~/.lpm/global/`.
-fn scope_boundary_note_if_globals_present(root: &lpm_common::LpmRoot) -> Option<Check> {
-    let manifest_has_installs = lpm_global::read_for(root)
-        .map(|m| !m.packages.is_empty())
-        .unwrap_or(false);
-    if manifest_has_installs {
-        Some(Check::pass(
-            &doctor_catalog::POLICY_SCOPE_PROJECT_ONLY,
-            "project installs only — global installs use a separate trust store at \
-             ~/.lpm/global/trusted-dependencies.json. The tiered gate and sandbox \
-             containment don't extend to globals yet",
-        ))
-    } else {
-        None
     }
 }
 
@@ -2577,32 +2557,15 @@ mod tests {
 
     /// Scope-boundary note: NOT emitted when the global manifest
     /// has no active installs (fresh machine / never used
-    /// `lpm install -g`). Keeps the doctor output clean for the
-    /// project-install-only users — the 46.0 scope boundary is
-    /// irrelevant to them until they opt into globals.
+    /// Phase 68: the scope-boundary note has been removed because
+    /// `lpm install -g` now honors the same script-policy / sandbox /
+    /// cooldown / drift gates as project installs. Doctor must NOT
+    /// emit a `policy_scope_project_only` check anymore even when
+    /// globals are present.
     #[test]
-    fn scope_boundary_note_is_absent_when_no_global_installs() {
+    fn doctor_does_not_emit_policy_scope_boundary_for_globals() {
         let tmp = tempfile::tempdir().unwrap();
         let root = lpm_common::LpmRoot::from_dir(tmp.path());
-        // No `global/manifest.toml` present — `lpm_global::read_for`
-        // returns default (empty).
-        let note = scope_boundary_note_if_globals_present(&root);
-        assert!(
-            note.is_none(),
-            "scope-boundary note must stay silent on fresh machines"
-        );
-    }
-
-    /// Scope-boundary note: IS emitted when the global manifest
-    /// has at least one active install. Text must name the 46.1
-    /// closure for the scope gap so users know when the parity
-    /// ships.
-    #[test]
-    fn scope_boundary_note_fires_when_global_installs_exist() {
-        let tmp = tempfile::tempdir().unwrap();
-        let root = lpm_common::LpmRoot::from_dir(tmp.path());
-        // Seed a minimal manifest.toml with one active install.
-        // Matches the on-disk shape `lpm_global::write_for` produces.
         let global_root = root.global_root();
         std::fs::create_dir_all(&global_root).unwrap();
         std::fs::write(
@@ -2620,31 +2583,22 @@ commands = []
 "#,
         )
         .unwrap();
-
-        let note = scope_boundary_note_if_globals_present(&root);
-        let note = note.expect("scope-boundary note must fire when globals exist");
-        assert_eq!(note.code(), "policy_scope_project_only");
-        assert_eq!(note.name(), "Script policy");
-        assert!(matches!(note.severity, Severity::Pass));
-        assert!(
-            note.detail.contains("don't extend to globals yet")
-                || note.detail.contains("globals yet"),
-            "note must say the gate doesn't extend to globals yet. detail={}",
-            note.detail
-        );
-        assert!(
-            note.detail.contains("project installs only"),
-            "note must lead with the scope statement. detail={}",
-            note.detail
-        );
+        let _env =
+            crate::test_env::ScopedEnv::set([("LPM_HOME", tmp.path().as_os_str().to_owned())]);
+        let out = check_script_policy_surface();
+        for c in &out {
+            assert_ne!(
+                c.code(),
+                "policy_scope_project_only",
+                "scope-boundary check must no longer fire after Phase 68",
+            );
+        }
     }
 
     /// `check_script_policy_surface` always emits the sandbox probe
-    /// (never conditional) and appends the scope-boundary note
-    /// conditionally. This test pins the aggregator's contract
+    /// (never conditional). This test pins the aggregator's contract
     /// against regression — a future refactor that accidentally
-    /// gated the sandbox probe behind a globals-exist check would
-    /// be caught here.
+    /// gated the sandbox probe behind some condition would be caught here.
     #[test]
     fn check_script_policy_surface_always_includes_sandbox_probe() {
         let out = check_script_policy_surface();
