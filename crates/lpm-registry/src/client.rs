@@ -575,6 +575,15 @@ impl HttpClients {
         if let Some(c) = self.eager.get(&any_port) {
             return Ok(c.client.clone());
         }
+        // Fast path: no per-origin TLS configured at all → the lazy map is
+        // guaranteed empty and the build below would no-op to default. Skip
+        // the tokio mutex entirely. This is the common case for installs
+        // with no .npmrc per-origin TLS (default public-registry traffic),
+        // where many concurrent metadata fetches would otherwise serialize
+        // briefly on `lazy.lock().await`.
+        if self.tls_overrides.per_origin.is_empty() {
+            return Ok(self.default.client.clone());
+        }
         let mut guard = self.lazy.lock().await;
         if let Some(c) = guard.get(&origin) {
             return Ok(c.client.clone());
