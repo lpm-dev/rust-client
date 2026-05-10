@@ -1145,12 +1145,28 @@ fn summarise(audits: &[PackageAudit]) -> Summary {
 }
 
 /// Distribution over [`PortableOutcome`] — the decision-grade view.
+/// `prompt_tuneable` is `prompt` minus packages whose dominant
+/// amber-script shape is policy-permanent — i.e. amber by §4.1
+/// design (binary-fetcher / prebuild-fallback). The tuneable count is
+/// the standing "how much classifier headroom is left" number.
 #[derive(Debug, Default)]
 struct PortableSummary {
     auto_run: usize,
     prompt: usize,
+    /// Subset of `prompt` excluding policy-permanent shapes. Always
+    /// `<= prompt`.
+    prompt_tuneable: usize,
     hard_block: usize,
     no_scripts: usize,
+    /// Hard ship-gate number — must always be 0 per §4.1.
+    zero_fp_red_count: usize,
+    /// L3 cooldown blocks broken out separately so the standing table
+    /// can distinguish "blocked because L1 red" from "blocked because
+    /// L3 said the release is too new".
+    cooldown_blocks: usize,
+    /// Attestation coverage over scripted packages.
+    attestation_present: usize,
+    scripted_total: usize,
 }
 
 fn summarise_portable(audits: &[PackageAudit]) -> PortableSummary {
@@ -1164,12 +1180,45 @@ fn summarise_portable(audits: &[PackageAudit]) -> PortableSummary {
         }
         match a.portable_outcome {
             Some(PortableOutcome::AutoRun) => s.auto_run += 1,
-            Some(PortableOutcome::Prompt) => s.prompt += 1,
+            Some(PortableOutcome::Prompt) => {
+                s.prompt += 1;
+                if !package_is_policy_permanent_amber(a) {
+                    s.prompt_tuneable += 1;
+                }
+            }
             Some(PortableOutcome::HardBlock) => s.hard_block += 1,
             Some(PortableOutcome::NoScripts) | None => s.no_scripts += 1,
         }
+        if a.tier == Some(StaticTier::Red) {
+            s.zero_fp_red_count += 1;
+        }
+        if a.tier.is_some() {
+            s.scripted_total += 1;
+            if let Some(l3) = &a.l3_outcome {
+                if l3.cooldown_block {
+                    s.cooldown_blocks += 1;
+                }
+                if l3.attestation_present {
+                    s.attestation_present += 1;
+                }
+            }
+        }
     }
     s
+}
+
+/// Is the dominant amber-tier script on this package classified under
+/// a policy-permanent shape? Worst-tier-of-shapes wins (matches the
+/// classifier's worst-of-phases logic). A `None` shape (older cached
+/// records pre-dating the field) is treated as tunable, since we
+/// can't prove permanence without re-bucketing.
+fn package_is_policy_permanent_amber(a: &PackageAudit) -> bool {
+    [&a.preinstall, &a.install, &a.postinstall]
+        .into_iter()
+        .flatten()
+        .filter(|s| matches!(s.tier, StaticTier::Amber | StaticTier::AmberLlm))
+        .filter_map(|s| s.shape)
+        .any(is_policy_permanent_amber_shape)
 }
 
 fn build_report(audits: &[PackageAudit]) -> String {
@@ -1177,15 +1226,166 @@ fn build_report(audits: &[PackageAudit]) -> String {
     out.push_str("# Phase 46 — Top-N audit (L1-3, portable)\n\n");
     out.push_str(&format!("Total packages audited: **{}**\n\n", audits.len()));
 
+    section_standing_benchmark(&mut out, audits);
     section_l1_tier_distribution(&mut out, audits);
     section_portable_outcome(&mut out, audits);
     section_l1_to_portable_transition(&mut out, audits);
+    section_prompt_shape_breakdown(&mut out, audits);
     section_l3_detail(&mut out, audits);
+    section_runtime_review_candidates(&mut out, audits);
     section_red_packages(&mut out, audits);
-    section_amber_shape_buckets(&mut out, audits);
     section_advisor_baseline_placeholder(&mut out, audits);
 
     out
+}
+
+/// Locked standing benchmark per the Phase 46 audit Part A closeout.
+/// These 7 numbers are the canonical comparison points for future
+/// audit iterations.
+fn section_standing_benchmark(out: &mut String, audits: &[PackageAudit]) {
+    let p = summarise_portable(audits);
+    let pct_scripted = |n: usize| {
+        if p.scripted_total == 0 {
+            0.0
+        } else {
+            n as f64 * 100.0 / p.scripted_total as f64
+        }
+    };
+    out.push_str("## Standing benchmark table\n\n");
+    out.push_str(
+        "Locked Part A closeout metrics. These are the canonical \
+         comparison points for future audit iterations.\n\n",
+    );
+    out.push_str("| Metric | Value | Notes |\n");
+    out.push_str("|--------|------:|-------|\n");
+    out.push_str(&format!(
+        "| auto-run | {} | L1 green + L2 strict-match (always 0 in first-install audit) |\n",
+        p.auto_run
+    ));
+    out.push_str(&format!(
+        "| prompt (total) | {} | L1 amber that passed L2 + L3 |\n",
+        p.prompt
+    ));
+    out.push_str(&format!(
+        "| prompt (tuneable) | {} | Excludes policy-permanent shapes (binary-fetcher, prebuild-fallback) — the standing \"classifier headroom\" number |\n",
+        p.prompt_tuneable
+    ));
+    out.push_str(&format!(
+        "| hard-block | {} | L1 red + L1 amber blocked by L3 |\n",
+        p.hard_block
+    ));
+    out.push_str(&format!(
+        "| no-scripts | {} | Manifest had no lifecycle scripts |\n",
+        p.no_scripts
+    ));
+    out.push_str(&format!(
+        "| **zero-FP-red** | **{}** | **§4.1 ship gate — MUST stay 0** |\n",
+        p.zero_fp_red_count
+    ));
+    out.push_str(&format!(
+        "| cooldown-blocks | {} | L3 cooldown gate fires (release < 24h old) |\n",
+        p.cooldown_blocks
+    ));
+    out.push_str(&format!(
+        "| attestation-coverage | {}/{} ({:.1}%) | Forward indicator for future provenance-drift gating |\n\n",
+        p.attestation_present,
+        p.scripted_total,
+        pct_scripted(p.attestation_present)
+    ));
+}
+
+fn section_prompt_shape_breakdown(out: &mut String, audits: &[PackageAudit]) {
+    let mut buckets: BTreeMap<ScriptShape, ShapeBucket> = BTreeMap::new();
+    for a in audits {
+        if a.portable_outcome != Some(PortableOutcome::Prompt) {
+            continue;
+        }
+        for (_phase, s) in scripted_phases(a) {
+            if matches!(s.tier, StaticTier::Amber | StaticTier::AmberLlm) {
+                let shape = s.shape.unwrap_or(ScriptShape::Other);
+                let bucket = buckets.entry(shape).or_default();
+                bucket.count += 1;
+                if bucket.examples.len() < 5 {
+                    bucket.examples.push((a.name.clone(), s.script.clone()));
+                }
+            }
+        }
+    }
+    let mut sorted: Vec<(ScriptShape, ShapeBucket)> = buckets.into_iter().collect();
+    sorted.sort_by(|a, b| b.1.count.cmp(&a.1.count));
+    out.push_str("## Prompt-shape breakdown\n\n");
+    out.push_str(
+        "Each prompted script categorised by normalised shape. The \
+         `policy-permanent?` flag marks shapes that are amber by §4.1 \
+         design (binary-fetcher / prebuild-fallback) — they should \
+         NOT be treated as classifier-tuning candidates in future \
+         iterations.\n\n",
+    );
+    out.push_str("| Shape | Count | Policy-permanent? | Sample packages → script |\n");
+    out.push_str("|-------|------:|:------------------|----|\n");
+    for (shape, bucket) in sorted {
+        let perm = if is_policy_permanent_amber_shape(shape) {
+            "**yes — §4.1 D18**"
+        } else {
+            "no"
+        };
+        let samples = bucket
+            .examples
+            .iter()
+            .map(|(pkg, s)| format!("`{pkg}` → `{}`", escape_md(s)))
+            .collect::<Vec<_>>()
+            .join("<br>");
+        out.push_str(&format!(
+            "| `{}` | {} | {} | {} |\n",
+            shape_label(shape),
+            bucket.count,
+            perm,
+            samples
+        ));
+    }
+    out.push('\n');
+}
+
+#[derive(Debug, Default)]
+struct ShapeBucket {
+    count: usize,
+    examples: Vec<(String, String)>,
+}
+
+fn section_runtime_review_candidates(out: &mut String, audits: &[PackageAudit]) {
+    let green_names: std::collections::HashSet<&str> = audits
+        .iter()
+        .filter(|a| a.portable_outcome == Some(PortableOutcome::AutoRun))
+        .map(|a| a.name.as_str())
+        .collect();
+
+    let present: Vec<(&str, &str)> = RUNTIME_REVIEW_CANDIDATES
+        .iter()
+        .copied()
+        .filter(|(name, _)| green_names.contains(name))
+        .collect();
+
+    out.push_str("## Runtime-review candidates\n\n");
+    out.push_str(
+        "Currently-green packages whose actual behaviour lives in a \
+         JS file the static gate can't read. These are sandbox/runtime \
+         concerns, **not classifier bugs** — surfacing them here keeps \
+         the boundary explicit so future iterations don't try to \
+         solve runtime-behavior questions with filename heuristics.\n\n",
+    );
+    if present.is_empty() {
+        out.push_str(
+            "_None of the curated runtime-review candidates appear \
+             green in this run._\n\n",
+        );
+        return;
+    }
+    out.push_str("| Package | Runtime concern |\n");
+    out.push_str("|---------|-----------------|\n");
+    for (name, reason) in present {
+        out.push_str(&format!("| `{name}` | {reason} |\n"));
+    }
+    out.push('\n');
 }
 
 fn section_l1_tier_distribution(out: &mut String, audits: &[PackageAudit]) {
@@ -1424,51 +1624,6 @@ fn section_red_packages(out: &mut String, audits: &[PackageAudit]) {
     out.push('\n');
 }
 
-fn section_amber_shape_buckets(out: &mut String, audits: &[PackageAudit]) {
-    let mut buckets: BTreeMap<ScriptShape, AmberBucket> = BTreeMap::new();
-    for a in audits {
-        for (_phase, script) in scripted_phases(a) {
-            if !matches!(script.tier, StaticTier::Amber | StaticTier::AmberLlm) {
-                continue;
-            }
-            let shape = script.shape.unwrap_or(ScriptShape::Other);
-            let bucket = buckets.entry(shape).or_default();
-            bucket.count += 1;
-            if bucket.examples.len() < 5 {
-                bucket
-                    .examples
-                    .push((a.name.clone(), script.script.clone()));
-            }
-        }
-    }
-    let mut bucket_vec: Vec<(ScriptShape, AmberBucket)> = buckets.into_iter().collect();
-    bucket_vec.sort_by(|a, b| b.1.count.cmp(&a.1.count));
-
-    out.push_str("## Amber scripts grouped by normalised shape\n\n");
-    out.push_str(
-        "Replaces the lossy first-token bucketing. Each shape is a \
-         green-allowlist-iteration candidate: if a shape clusters \
-         packages we trust, that's a green-list expansion target.\n\n",
-    );
-    out.push_str("| Shape | Amber count | Sample packages → script |\n");
-    out.push_str("|-------|-----------:|----|\n");
-    for (shape, bucket) in bucket_vec.iter() {
-        let samples = bucket
-            .examples
-            .iter()
-            .map(|(pkg, s)| format!("`{pkg}` → `{}`", escape_md(s)))
-            .collect::<Vec<_>>()
-            .join("<br>");
-        out.push_str(&format!(
-            "| `{}` | {} | {} |\n",
-            shape_label(*shape),
-            bucket.count,
-            samples
-        ));
-    }
-    out.push('\n');
-}
-
 fn shape_label(s: ScriptShape) -> &'static str {
     match s {
         ScriptShape::SoftfailWrapper => "softfail-wrapper",
@@ -1481,6 +1636,51 @@ fn shape_label(s: ScriptShape) -> &'static str {
         ScriptShape::Other => "other",
     }
 }
+
+/// Whether a shape is **policy-permanent amber** — amber by explicit
+/// §4.1 design (binary-fetcher / prebuild-fallback are D18 downloader
+/// classes; widening them would erode the user-acknowledges-binary-
+/// download contract). Used to compute `prompt-tuneable`: the subset
+/// of prompts that classifier work could still plausibly reduce.
+///
+/// Shapes NOT marked permanent are tunable in principle, though the
+/// individual packages within a shape may still be amber for
+/// per-package reasons (e.g. softfail-wrappers with reserved
+/// basenames). Per-package permanence requires inspecting the script
+/// body, not just the shape; this coarser flag is the standing
+/// reporting view.
+fn is_policy_permanent_amber_shape(s: ScriptShape) -> bool {
+    matches!(
+        s,
+        ScriptShape::BinaryFetcher | ScriptShape::PrebuildFallback
+    )
+}
+
+/// Hand-curated list of currently-green packages whose actual runtime
+/// behaviour lives in a JS file the classifier can't read. They are
+/// **runtime-review candidates** — sandbox/runtime is the right gate,
+/// not more filename heuristics. Surfacing them here keeps the
+/// boundary explicit so future classifier work doesn't try to solve
+/// runtime-behavior questions with filename rules.
+///
+/// Each entry is the package name as it appears in the registry.
+/// Update this list when the green-list expands; the standing
+/// runtime-review-candidate report section reflects whatever names
+/// are in here that also appear in the audit's green set.
+const RUNTIME_REVIEW_CANDIDATES: &[(&str, &str)] = &[
+    (
+        "@parcel/watcher",
+        "build-from-source script may fetch source tarballs from a remote",
+    ),
+    (
+        "prisma",
+        "bootstraps the prisma engine binary download in the JS file",
+    ),
+    (
+        "@scarf/scarf",
+        "performs anonymous network telemetry on every install",
+    ),
+];
 
 fn section_advisor_baseline_placeholder(out: &mut String, audits: &[PackageAudit]) {
     let any_advisor = audits.iter().any(|a| a.advisor_outcome.is_some());
@@ -1498,12 +1698,6 @@ fn section_advisor_baseline_placeholder(out: &mut String, audits: &[PackageAudit
             "_Part B reporting placeholder — populate once advisor outcomes are recorded._\n\n",
         );
     }
-}
-
-#[derive(Debug, Default)]
-struct AmberBucket {
-    count: usize,
-    examples: Vec<(String, String)>,
 }
 
 fn scripted_phases(a: &PackageAudit) -> Vec<(&'static str, &ScriptAudit)> {

@@ -120,7 +120,7 @@ pub fn classify(script: &str) -> StaticTier {
     }
 
     // Step 5 — green allowlist.
-    if tokens_match_green(&tokens) {
+    if tokens_match_green(&tokens, script) {
         return StaticTier::Green;
     }
 
@@ -682,7 +682,7 @@ fn tokens_are_compound(tokens: &[String]) -> bool {
 // Step 5 — green allowlist
 // ─────────────────────────────────────────────────────────────────────
 
-fn tokens_match_green(tokens: &[String]) -> bool {
+fn tokens_match_green(tokens: &[String], script: &str) -> bool {
     match tokens.first().map(String::as_str) {
         Some("node-gyp") => matches_node_gyp(tokens),
         Some("node-gyp-build") => tokens.len() == 1,
@@ -692,8 +692,65 @@ fn tokens_match_green(tokens: &[String]) -> bool {
         Some("prisma") => matches_prisma(tokens),
         Some("husky") => matches_husky(tokens),
         Some("node") => matches_node_relative(tokens) || matches_node_eval_softfail_green(tokens),
+        Some("exit") => matches_exit_noop(tokens),
+        Some(":") => tokens.len() == 1,
+        Some("echo") => matches_echo_noop(tokens, script),
         _ => false,
     }
+}
+
+/// `exit` (no args) or `exit 0` — script-body no-op. Many native-
+/// binding packages (e.g. `@datadog/native-*`) ship this as a
+/// placeholder preinstall to satisfy npm's lifecycle-script schema
+/// while the real work happens via optional platform dependencies.
+fn matches_exit_noop(tokens: &[String]) -> bool {
+    match tokens.len() {
+        1 => true,
+        2 => tokens[1] == "0",
+        _ => false,
+    }
+}
+
+/// `echo` (no args, prints newline) or `echo <static-literal>` —
+/// trivially safe.
+///
+/// **Strict guard** on the single-argument form: the literal must NOT
+/// be a flag (`-e`, `-n`, …), must not contain `$` (variable
+/// expansion / command substitution sigil), backticks (command
+/// substitution), or backslash (escape sequences). Multi-argument
+/// forms stay amber. The audit-found case `echo 'preinstall: no-op'`
+/// passes the guards (shlex strips the quotes, the literal contains
+/// only printable ASCII and a colon).
+///
+/// Takes the raw script too because shlex CONSUMES unquoted
+/// backslashes during tokenization (the user's `echo a\nb` arrives
+/// here as `["echo", "anb"]` — the token-level check can't see the
+/// backslash). Inspecting the raw script catches that case.
+fn matches_echo_noop(tokens: &[String], script: &str) -> bool {
+    // Raw-script backslash check: shlex would have eaten the escape
+    // during tokenization, so any unquoted `\` in the body means the
+    // green rule's "no backslashes" guard is violated.
+    if script.contains('\\') {
+        return false;
+    }
+    match tokens.len() {
+        1 => true,
+        2 => is_static_echo_literal(&tokens[1]),
+        _ => false,
+    }
+}
+
+/// Per-token guard for the single-argument `echo` green path.
+/// Conservative: anything that could trigger shell expansion or
+/// command substitution stays amber.
+fn is_static_echo_literal(arg: &str) -> bool {
+    if arg.starts_with('-') {
+        return false;
+    }
+    if arg.contains('$') || arg.contains('`') || arg.contains('\\') {
+        return false;
+    }
+    true
 }
 
 /// `node-gyp rebuild` with optional `--release` / `--debug`.
@@ -1163,6 +1220,79 @@ mod tests {
         assert_eq!(tier("node-gyp-build-optional-packages"), StaticTier::Green);
     }
 
+    // ── Green: no-op shapes (Phase 46 audit follow-up Part A closeout) ─
+
+    #[test]
+    fn green_exit_noop_variants() {
+        // Bare `exit` and `exit 0` — script-body no-ops. The
+        // @datadog/native-* family ships `exit 0` as a placeholder
+        // preinstall.
+        assert_eq!(tier("exit"), StaticTier::Green);
+        assert_eq!(tier("exit 0"), StaticTier::Green);
+    }
+
+    #[test]
+    fn amber_exit_nonzero_or_with_extras() {
+        // Non-zero exit codes are unusual in a preinstall and the
+        // green rule deliberately doesn't widen here.
+        assert_eq!(tier("exit 1"), StaticTier::Amber);
+        assert_eq!(tier("exit 2"), StaticTier::Amber);
+        // Extra arg → amber.
+        assert_eq!(tier("exit 0 silently"), StaticTier::Amber);
+    }
+
+    #[test]
+    fn green_colon_noop() {
+        // POSIX `:` builtin — strictly a no-op.
+        assert_eq!(tier(":"), StaticTier::Green);
+    }
+
+    #[test]
+    fn green_echo_noop_variants() {
+        // Bare `echo` writes a newline; `echo <static-literal>` is the
+        // @google/genai shape. Both are no-ops at the security-relevant
+        // level.
+        assert_eq!(tier("echo"), StaticTier::Green);
+        assert_eq!(tier("echo hello"), StaticTier::Green);
+        // The audit-found case: shlex strips the single quotes, leaving
+        // one token `preinstall: no-op` — passes the literal guard.
+        assert_eq!(tier("echo 'preinstall: no-op'"), StaticTier::Green);
+        // Empty-string literal is also a static literal.
+        assert_eq!(tier("echo \"\""), StaticTier::Green);
+    }
+
+    #[test]
+    fn amber_echo_with_variable_or_command_substitution() {
+        // `$VAR` / `$()` / `\`...\`` / backslash sequences could
+        // expand to shell commands at runtime — keep amber.
+        assert_eq!(tier("echo $HOME"), StaticTier::Amber);
+        assert_eq!(tier("echo \"$HOME\""), StaticTier::Amber);
+        assert_eq!(tier("echo $(whoami)"), StaticTier::Amber);
+        assert_eq!(tier("echo `whoami`"), StaticTier::Amber);
+        // Backslash escapes.
+        assert_eq!(tier("echo a\\nb"), StaticTier::Amber);
+    }
+
+    #[test]
+    fn amber_echo_with_flags() {
+        // `-e` enables backslash interpretation; `-n` suppresses
+        // newline. Both are flags, not safe static literals.
+        assert_eq!(tier("echo -e hi"), StaticTier::Amber);
+        assert_eq!(tier("echo -n hi"), StaticTier::Amber);
+        assert_eq!(tier("echo --help"), StaticTier::Amber);
+    }
+
+    #[test]
+    fn amber_echo_with_multiple_args() {
+        // Strict single-arg rule: even fully-literal multiple args
+        // stay amber so the green path can't drift into "echo $A $B"
+        // territory through future broadening.
+        assert_eq!(tier("echo a b"), StaticTier::Amber);
+        assert_eq!(tier("echo hello world"), StaticTier::Amber);
+    }
+
+    // ── Green: node-gyp-build family (P1 — kept here for context) ────
+
     #[test]
     fn amber_node_gyp_build_with_args() {
         // node-gyp-build's bin.js passes `process.argv[2]` to a child
@@ -1336,13 +1466,19 @@ mod tests {
 
     #[test]
     fn normalizer_leaves_quoted_operators_alone() {
-        // A single-quoted literal containing `|` is content, not an
-        // operator. Must remain a single token and NOT trip the
-        // pipe-to-shell detector.
-        assert_eq!(tier("echo 'a|b|c'"), StaticTier::Amber);
-        // Same for double-quoted.
-        assert_eq!(tier("echo \"a>b\""), StaticTier::Amber);
-        // An escape sequence must also be preserved.
+        // Quoted operator characters inside a single-arg echo are
+        // content, not operators — they must NOT trip the pipe-to-
+        // shell or compound-detection paths. Post-Part-A-closeout
+        // these now classify green via the static-literal echo rule
+        // (no `$`, no backticks, no backslashes, no flags, one arg).
+        // The original intent of this test was "doesn't false-
+        // positive red" — that contract still holds; the resting
+        // tier is now green instead of amber.
+        assert_eq!(tier("echo 'a|b|c'"), StaticTier::Green);
+        assert_eq!(tier("echo \"a>b\""), StaticTier::Green);
+        // Backslash escapes stay AMBER (the strict echo guard
+        // rejects any `\` in the raw script — even quoted-string
+        // content where shell semantics would render it literal).
         assert_eq!(tier("echo a\\|b"), StaticTier::Amber);
     }
 
