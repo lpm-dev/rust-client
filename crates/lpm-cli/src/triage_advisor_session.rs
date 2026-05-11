@@ -2,9 +2,21 @@
 //!
 //! Owns the once-per-install lifecycle of the optional triage advisor.
 //!
-//! **Read.** `triage-advisor` is resolved from the precedence chain:
-//! CLI flag → `package.json > lpm > triageAdvisor` → `./lpm.toml` →
-//! `~/.lpm/config.toml` → default `none`.
+//! **Read.** `triage-advisor` is resolved from this precedence chain
+//! (highest first):
+//!
+//! - `--advisor` CLI flag — reserved; not wired in slice 1, accepted
+//!   by [`AdvisorSession::preflight`] for forward-compat.
+//! - `package.json > lpm > triageAdvisor` — per-project, shared
+//!   across machines via the manifest.
+//! - `~/.lpm/config.toml` — per-user / per-machine, written by
+//!   `lpm config triage`.
+//! - Default `none`.
+//!
+//! `./lpm.toml` is **not** in this chain by repo convention (see
+//! Phase 46 §5.2 in the plan doc) — that file is reserved for the
+//! save-policy reader today; a general project-config loader is a
+//! separate follow-up.
 //!
 //! **Preflight.** The configured adapter is probed exactly once via
 //! `detect()` + `test_invoke()`. If either fails, the session
@@ -14,10 +26,19 @@
 //!
 //! **Classify.** Prompted amber packages flow through
 //! `classify_amber()`. Only packages where EVERY amber phase returns
-//! `Approve` land in the ephemeral `(name, version)` approval set.
-//! Any `Manual` / `Abstain` / failure on any phase blocks the
-//! package from the set — it stays prompted (blocked set on disk →
-//! `lpm approve-scripts`).
+//! `Approve` land in the ephemeral
+//! `(name, version, Option<integrity>)` approval set. Any `Manual` /
+//! `Abstain` / failure on any phase blocks the package from the set —
+//! it stays prompted (blocked set on disk → `lpm approve-scripts`).
+//!
+//! **Source-aware identity.** The approval key includes the
+//! integrity hash (or `None` when no integrity is available, e.g.
+//! workspace / link / file sources), NOT just `(name, version)`. The
+//! install pipeline treats same-coord packages from different
+//! sources as distinct, so collapsing identity to a pair would mean
+//! approving one source's `pkg@1.0.0` could auto-run a different
+//! source's `pkg@1.0.0` in the same install. Triple keying matches
+//! `compute_blocked_packages_with_metadata`'s identity exactly.
 //!
 //! # Ephemeral by construction
 //!
@@ -56,10 +77,15 @@ pub struct AdvisorSession {
     /// Provider slug as configured — used in the warn-once line so
     /// the user knows which advisor was attempted.
     configured_slug: Option<String>,
-    /// (name, version) → `Approve` verdict. The set the install path
-    /// hands to `compute_blocked_packages_with_metadata` and
-    /// `evaluate_trust` as the ephemeral approval list.
-    approvals: HashSet<(String, String)>,
+    /// `(name, version, Option<integrity>)` → `Approve` verdict. The
+    /// set the install path hands to
+    /// `compute_blocked_packages_with_metadata` and `evaluate_trust`
+    /// as the ephemeral approval list. The integrity slot makes the
+    /// key source-aware: workspace / file / link installations of
+    /// the same coord with no registry integrity are distinct
+    /// entries from registry installs that carry integrity, so an
+    /// approval on one source cannot leak to a sibling source.
+    approvals: HashSet<(String, String, Option<String>)>,
     /// Set to `true` after the single degrade-warning fires. Guards
     /// against repeat warnings if a future caller does extra preflight.
     warned_about_unavailable: bool,
@@ -234,7 +260,7 @@ impl AdvisorSession {
             }
             if package_verdict == PackageAdvisorOutcome::Approve && !c.amber_phases.is_empty() {
                 self.approvals
-                    .insert((c.name.to_string(), c.version.to_string()));
+                    .insert((c.name.clone(), c.version.clone(), c.integrity.clone()));
             }
         }
     }
@@ -244,7 +270,7 @@ impl AdvisorSession {
     /// (`compute_blocked_packages_with_metadata`) both consult this
     /// view; both must see the SAME set so a package can't be
     /// blocked while its script also runs.
-    pub fn approvals(&self) -> &HashSet<(String, String)> {
+    pub fn approvals(&self) -> &HashSet<(String, String, Option<String>)> {
         &self.approvals
     }
 }
@@ -261,6 +287,13 @@ impl AdvisorSession {
 pub struct AmberPackageRequest {
     pub name: String,
     pub version: String,
+    /// Integrity hash (typically `sha512-...`) for this package's
+    /// resolved source. `None` for workspace / link / file sources
+    /// that don't carry integrity. The advisor doesn't classify on
+    /// integrity — but the session keys its approval set by it, so
+    /// the request must carry the same identity the downstream
+    /// trust-evaluation path will use.
+    pub integrity: Option<String>,
     /// `(phase_name, script_body)` for every amber phase. An empty
     /// list means the package has no amber phases and won't be
     /// approved (the empty-product case in the worst-of reduction
@@ -400,11 +433,68 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn precedence_cli_wins_over_package_json_and_global() {
+        // Highest-priority slot. We can't actually preflight without
+        // a real binary, but we can assert the resolver picks the
+        // CLI value first by passing different bogus slugs at each
+        // layer — only the topmost is reported as the configured
+        // slug (or, when unknown, surfaces via the warn-once path).
+        // Using `"anthropic-api"` (a known-invalid slug) at the CLI
+        // layer guarantees `configured_slug` reflects it even
+        // though preflight degrades to none.
+        let s = AdvisorSession::preflight(
+            Some("cli-bogus"),
+            Some("pkgjson-bogus"),
+            Some("global-bogus"),
+            true,
+        )
+        .await;
+        // The resolver picked the CLI layer; degraded with the CLI
+        // slug recorded.
+        assert_eq!(s.provider_slug(), Some("cli-bogus"));
+    }
+
+    #[tokio::test]
+    async fn precedence_package_json_wins_over_global() {
+        // **Locked precedence (review finding Medium 2).** When no
+        // CLI flag is given, `package.json > lpm > triageAdvisor`
+        // wins over `~/.lpm/config.toml`. This is the layer slice 1
+        // wires explicitly; previously the install callsite passed
+        // None for package.json, making the feature non-reproducible
+        // across machines.
+        let s = AdvisorSession::preflight(None, Some("pkgjson-bogus"), Some("global-bogus"), true)
+            .await;
+        assert_eq!(s.provider_slug(), Some("pkgjson-bogus"));
+    }
+
+    #[tokio::test]
+    async fn precedence_global_used_when_package_json_absent() {
+        // Symmetric to the above: with no CLI flag and no
+        // package.json value, the global config layer wins.
+        let s = AdvisorSession::preflight(None, None, Some("global-bogus"), true).await;
+        assert_eq!(s.provider_slug(), Some("global-bogus"));
+    }
+
+    #[tokio::test]
+    async fn precedence_explicit_none_at_higher_layer_does_not_fall_through() {
+        // A user who sets `package.json > lpm > triageAdvisor =
+        // "none"` is making an explicit per-project opt-out. The
+        // resolver must respect it, NOT fall through to the global
+        // layer where a different value might live.
+        let s = AdvisorSession::preflight(None, Some("none"), Some("claude-cli"), true).await;
+        assert!(
+            !s.is_active(),
+            "explicit none at higher layer must short-circuit"
+        );
+    }
+
+    #[tokio::test]
     async fn classify_no_op_when_inactive() {
         let mut s = AdvisorSession::preflight(None, None, None, false).await;
         let req = AmberPackageRequest {
             name: "p".into(),
             version: "1.0.0".into(),
+            integrity: None,
             amber_phases: vec![("postinstall".into(), "tsc".into())],
         };
         s.classify_amber(&[req]).await;
@@ -436,26 +526,31 @@ mod tests {
             AmberPackageRequest {
                 name: "approve-me".into(),
                 version: "1.0.0".into(),
+                integrity: None,
                 amber_phases: one_phase(),
             },
             AmberPackageRequest {
                 name: "manual".into(),
                 version: "1.0.0".into(),
+                integrity: None,
                 amber_phases: one_phase(),
             },
             AmberPackageRequest {
                 name: "abstain".into(),
                 version: "1.0.0".into(),
+                integrity: None,
                 amber_phases: one_phase(),
             },
             AmberPackageRequest {
                 name: "env-fail".into(),
                 version: "1.0.0".into(),
+                integrity: None,
                 amber_phases: one_phase(),
             },
             AmberPackageRequest {
                 name: "int-fail".into(),
                 version: "1.0.0".into(),
+                integrity: None,
                 amber_phases: one_phase(),
             },
         ];
@@ -463,7 +558,7 @@ mod tests {
         assert_eq!(s.approvals().len(), 1);
         assert!(
             s.approvals()
-                .contains(&("approve-me".into(), "1.0.0".into()))
+                .contains(&("approve-me".into(), "1.0.0".into(), None))
         );
         let log = call_log.lock().await.clone();
         // Manual short-circuits the per-package loop, so we expect
@@ -497,6 +592,7 @@ mod tests {
         let req = AmberPackageRequest {
             name: "two-phase-trap".into(),
             version: "1.0.0".into(),
+            integrity: None,
             amber_phases: vec![
                 ("preinstall".into(), "tsc".into()),
                 ("postinstall".into(), "node install.js".into()),
@@ -528,6 +624,7 @@ mod tests {
         let req = AmberPackageRequest {
             name: "edge".into(),
             version: "1.0.0".into(),
+            integrity: None,
             amber_phases: Vec::new(),
         };
         s.classify_amber(&[req]).await;

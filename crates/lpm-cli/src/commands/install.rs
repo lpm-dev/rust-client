@@ -6293,6 +6293,89 @@ async fn run_with_options_under_store_lock(
             .map_err(|e| LpmError::Registry(format!("{e}")))?;
     let install_user_bound =
         crate::capability::UserBound::from_global_config(&install_capability_cfg);
+
+    // **Phase 46 slice 1 — resolve script-policy + preflight advisor
+    // BEFORE the blocked-set capture.**
+    //
+    // The capture writes to `.lpm/build-state.json`. If the advisor
+    // approves an amber package this run, that package's scripts run
+    // via the AdvisorApprovedThisRun trust path during autoBuild; we
+    // therefore want it EXCLUDED from the persisted blocked set so
+    // post-install JSON + the "remain blocked after auto-build"
+    // pointer don't report stale state.
+    //
+    // Order:
+    //   1. Read project script-policy config (one disk read; reused
+    //      by the autoBuild branch later).
+    //   2. Resolve effective policy through the precedence chain.
+    //   3. Build the AdvisorSession (preflight + classify amber).
+    //   4. Pass `session.approvals()` into the capture call below.
+    let step10_script_policy_cfg =
+        crate::script_policy_config::ScriptPolicyConfig::from_package_json(project_dir);
+    let config_auto_build = step10_script_policy_cfg.auto_build;
+    let step10_effective_policy = crate::script_policy_config::resolve_script_policy(
+        script_policy_override,
+        &step10_script_policy_cfg,
+    );
+
+    // Phase 46 P1: include integrity so the auto-build predicate's
+    // strict gate matches what `rebuild::run` will do. Same data
+    // shape as `installed_with_integrity` above; named separately
+    // because it's consumed by `all_scripted_packages_trusted`
+    // later and historically lived next to that call.
+    let all_pkgs_for_build: Vec<(String, String, Option<String>)> = packages
+        .iter()
+        .map(|p| (p.name.clone(), p.version.clone(), p.integrity.clone()))
+        .collect();
+
+    // **Phase 46 slice 1 — install-time L4 advisor consumption.**
+    //
+    // Preflight the configured advisor ONCE per run. Session stays
+    // active only when:
+    // - script-policy resolved to `triage`,
+    // - `triage-advisor` is set to something other than `none`,
+    // - detect + test-invoke succeed.
+    //
+    // Any failure degrades to none with a single warning. Per-
+    // package classification failures later stay silent — preflight
+    // already warned (or didn't, if the user configured `none`).
+    //
+    // Precedence chain for `triage-advisor` (highest first):
+    //   - CLI `--advisor` flag (reserved; not wired in slice 1)
+    //   - `package.json > lpm > triageAdvisor`
+    //   - `~/.lpm/config.toml` `triage-advisor` key
+    //   - default `none`
+    let advisor_session =
+        if step10_effective_policy == crate::script_policy_config::ScriptPolicy::Triage {
+            let triage_advisor_pkg_json = step10_script_policy_cfg.triage_advisor.as_deref();
+            let triage_advisor_global = install_capability_cfg.get_str("triage-advisor");
+            let mut session = crate::triage_advisor_session::AdvisorSession::preflight(
+                None, // CLI flag reserved for a future slice
+                triage_advisor_pkg_json,
+                triage_advisor_global,
+                json_output,
+            )
+            .await;
+            // If the session is active, classify every amber package
+            // declared in the current install set. The advisor's
+            // `Approve` verdicts populate an in-memory approval set
+            // that's threaded into the blocked-set capture (so
+            // approved packages are excluded from the persisted
+            // blocked set), the autoBuild predicate, AND
+            // `rebuild::run` (the actual script-execution path).
+            // The set never persists.
+            if session.is_active() {
+                let amber_requests =
+                    collect_amber_classification_requests(&store, &installed_with_integrity);
+                // `classify_amber` is async + serial. Slice 1 keeps
+                // it simple; future parallel-fanout can ride on top.
+                session.classify_amber(&amber_requests).await;
+            }
+            Some(session)
+        } else {
+            None
+        };
+
     let capture_start = std::time::Instant::now();
     let blocked_capture = crate::build_state::capture_blocked_set_after_install_with_metadata(
         project_dir,
@@ -6302,6 +6385,7 @@ async fn run_with_options_under_store_lock(
         &blocked_set_metadata,
         &install_requested_capabilities,
         &install_user_bound,
+        advisor_session.as_ref().map(|s| s.approvals()),
     )?;
     tracing::debug!(
         "perf.capture_blocked_set pkgs={} ms={}",
@@ -6716,70 +6800,13 @@ async fn run_with_options_under_store_lock(
     // Phase 46 P1: consolidated into ScriptPolicyConfig so all four
     // script-related keys come from a single read.
     //
-    // Phase 46 P6 Chunk 1: resolve the effective script-policy here and
-    // thread it into both the auto-build predicate and `rebuild::run`.
-    // The value is not yet consulted by either callee (Chunks 2/3 wire
-    // the green-tier auto-trust through the shared helper); landing the
-    // plumbing first keeps that behavior diff small and reviewable.
-    let step10_script_policy_cfg =
-        crate::script_policy_config::ScriptPolicyConfig::from_package_json(project_dir);
-    let config_auto_build = step10_script_policy_cfg.auto_build;
-    let step10_effective_policy = crate::script_policy_config::resolve_script_policy(
-        script_policy_override,
-        &step10_script_policy_cfg,
-    );
+    // Phase 46 slice 1 moved the script-policy resolution + advisor
+    // preflight UP to before the blocked-set capture (so approved
+    // packages can be excluded from the persisted set). The
+    // `step10_*` locals + `all_pkgs_for_build` + `advisor_session`
+    // they produce are still in scope here; only the autoBuild
+    // predicate + the rebuild::run call read them. No duplication.
 
-    // Phase 46 P1: include integrity so the auto-build predicate's
-    // strict gate matches what `rebuild::run` will do. A drifted rich
-    // binding previously satisfied this predicate via the lenient
-    // name-only gate and triggered auto-build for a package
-    // `rebuild::run` then skipped.
-    let all_pkgs_for_build: Vec<(String, String, Option<String>)> = packages
-        .iter()
-        .map(|p| (p.name.clone(), p.version.clone(), p.integrity.clone()))
-        .collect();
-
-    // **Phase 46 slice 1 — install-time L4 advisor consumption.**
-    //
-    // Preflight the configured advisor ONCE per run. The session
-    // remains active only when:
-    // - `script-policy` resolved to `triage` (advisor is inert
-    //   under `deny` / `allow`),
-    // - `triage-advisor` is set to something other than `none`,
-    // - detect + test-invoke succeed.
-    //
-    // Any failure degrades to none with a single warning. Per-
-    // package classification failures later in this flow stay
-    // silent — preflight already warned (or didn't, if the user
-    // configured `none`).
-    let advisor_session = if step10_effective_policy
-        == crate::script_policy_config::ScriptPolicy::Triage
-    {
-        let triage_advisor_config = install_capability_cfg.get_str("triage-advisor");
-        let mut session = crate::triage_advisor_session::AdvisorSession::preflight(
-            None, // no `--advisor` CLI flag in slice 1
-            None, // package.json `lpm > triageAdvisor` reader is a follow-up
-            triage_advisor_config,
-            json_output,
-        )
-        .await;
-        // If the session is active, classify every amber package
-        // declared in the current install set. The advisor's
-        // `Approve` verdicts populate an in-memory approval set
-        // that's threaded into both `all_scripted_packages_trusted`
-        // (auto-build predicate) and `rebuild::run` (the actual
-        // script-execution path). The set never persists.
-        if session.is_active() {
-            let amber_requests = collect_amber_classification_requests(&store, &all_pkgs_for_build);
-            // `classify_amber` is async + serial. Slice 1 keeps it
-            // simple; a future parallel-fanout optimisation can
-            // ride on top without changing the contract.
-            session.classify_amber(&amber_requests).await;
-        }
-        Some(session)
-    } else {
-        None
-    };
     // **Phase 48 P0 slice 4 + sub-slice 6c.** Read the force-
     // security-floor kill-switch once, plus the project's requested
     // capability set and the user's configured bounds. Thread all
@@ -7800,7 +7827,7 @@ fn collect_amber_classification_requests(
 ) -> Vec<crate::triage_advisor_session::AmberPackageRequest> {
     use lpm_security::triage::StaticTier;
     let mut out = Vec::new();
-    for (name, version, _integrity) in packages {
+    for (name, version, integrity) in packages {
         let pkg_dir = store.package_dir(name, version);
         let bodies = crate::build_state::read_install_phase_bodies(&pkg_dir);
         if bodies.is_empty() {
@@ -7822,9 +7849,16 @@ fn collect_amber_classification_requests(
         if amber_phases.is_empty() {
             continue;
         }
+        // The integrity slot carries source identity. Workspace /
+        // file / link sources are `None`; registry sources carry the
+        // resolved integrity hash. The same (name, version) from two
+        // different sources produces TWO distinct approval keys
+        // downstream — required so an approval on one source cannot
+        // leak to a sibling source in the same install.
         out.push(crate::triage_advisor_session::AmberPackageRequest {
             name: name.clone(),
             version: version.clone(),
+            integrity: integrity.clone(),
             amber_phases,
         });
     }
@@ -8685,6 +8719,10 @@ async fn run_link_and_finish(
             .map_err(|e| LpmError::Registry(format!("{e}")))?;
     let offline_user_bound =
         crate::capability::UserBound::from_global_config(&offline_capability_cfg);
+    // Phase 46 slice 1 — the fast-path / offline install does NOT
+    // run the L4 advisor (scope was tightened to the online install
+    // path). `None` passes through `compute_blocked_packages_with_metadata`
+    // unchanged for this call.
     let blocked_capture = crate::build_state::capture_blocked_set_after_install_with_metadata(
         project_dir,
         &store,
@@ -8693,6 +8731,7 @@ async fn run_link_and_finish(
         &crate::build_state::BlockedSetMetadata::default(),
         &offline_requested_capabilities,
         &offline_user_bound,
+        None,
     )?;
 
     // Phase 46 P1: snapshot write on the fast path too — a warm

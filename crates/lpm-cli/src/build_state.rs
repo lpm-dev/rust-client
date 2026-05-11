@@ -402,6 +402,7 @@ pub fn compute_blocked_packages(
         &BlockedSetMetadata::default(),
         &crate::capability::CapabilitySet::default(),
         &crate::capability::UserBound::default(),
+        None,
     )
 }
 
@@ -435,6 +436,16 @@ pub fn compute_blocked_packages_with_metadata(
     // short-circuit applies as before.
     requested_capabilities: &crate::capability::CapabilitySet,
     user_bound: &crate::capability::UserBound,
+    // **Phase 46 slice 1.** Ephemeral advisor approval set keyed
+    // by `(name, version, Option<integrity>)`. Packages whose
+    // triple appears here are EXCLUDED from the blocked set so
+    // post-install messaging + `lpm approve-scripts` don't report
+    // them as still-blocked after the autoBuild path executed
+    // their scripts via the AdvisorApprovedThisRun trust path.
+    //
+    // Standalone callers (no install context) pass `None` →
+    // identical to the pre-slice-1 behavior.
+    advisor_approvals: Option<&std::collections::HashSet<(String, String, Option<String>)>>,
 ) -> Vec<BlockedPackage> {
     use rayon::prelude::*;
 
@@ -453,6 +464,19 @@ pub fn compute_blocked_packages_with_metadata(
     // builds hit this path more heavily).
     let per_pkg =
         |(name, version, integrity): &(String, String, Option<String>)| -> Option<BlockedPackage> {
+            // **Phase 46 slice 1.** Advisor-approved packages are
+            // EXCLUDED from the blocked set entirely. They executed
+            // their scripts via the AdvisorApprovedThisRun trust path
+            // during this install's autoBuild, so listing them as
+            // "still blocked" would emit stale UI + JSON. Keyed on
+            // the full triple so two sources of the same coord don't
+            // cross-approve.
+            if let Some(set) = advisor_approvals
+                && set.contains(&(name.clone(), version.clone(), integrity.clone()))
+            {
+                return None;
+            }
+
             let pkg_dir = store.package_dir(name, version);
 
             // Compute the script hash. None means "no install-phase scripts" —
@@ -627,6 +651,7 @@ pub fn capture_blocked_set_after_install(
         &BlockedSetMetadata::default(),
         &crate::capability::CapabilitySet::default(),
         &crate::capability::UserBound::default(),
+        None,
     )
 }
 
@@ -646,6 +671,13 @@ pub fn capture_blocked_set_after_install_with_metadata(
     // match on script-hash.
     requested_capabilities: &crate::capability::CapabilitySet,
     user_bound: &crate::capability::UserBound,
+    // Phase 46 slice 1 — see `compute_blocked_packages_with_metadata`.
+    // Advisor-approved triples are removed from the persisted
+    // blocked set before fingerprint + write, so post-install JSON
+    // + the "remain blocked after auto-build" pointer don't report
+    // stale state for packages whose scripts already executed via
+    // the AdvisorApprovedThisRun trust path.
+    advisor_approvals: Option<&std::collections::HashSet<(String, String, Option<String>)>>,
 ) -> Result<BlockedSetCapture, LpmError> {
     let blocked = compute_blocked_packages_with_metadata(
         store,
@@ -654,6 +686,7 @@ pub fn capture_blocked_set_after_install_with_metadata(
         metadata,
         requested_capabilities,
         user_bound,
+        advisor_approvals,
     );
     let fingerprint = compute_blocked_set_fingerprint(&blocked);
 
@@ -1720,6 +1753,7 @@ mod tests {
             &metadata,
             &crate::capability::CapabilitySet::default(),
             &crate::capability::UserBound::default(),
+            None,
         );
 
         assert_eq!(blocked.len(), 1);
@@ -1757,6 +1791,7 @@ mod tests {
             &metadata,
             &crate::capability::CapabilitySet::default(),
             &crate::capability::UserBound::default(),
+            None,
         );
 
         assert_eq!(blocked.len(), 1);
@@ -1795,6 +1830,7 @@ mod tests {
             &metadata,
             &crate::capability::CapabilitySet::default(),
             &crate::capability::UserBound::default(),
+            None,
         );
 
         assert_eq!(blocked.len(), 1);
@@ -1874,6 +1910,7 @@ mod tests {
             &meta_a,
             &crate::capability::CapabilitySet::default(),
             &crate::capability::UserBound::default(),
+            None,
         );
         let bp_b = compute_blocked_packages_with_metadata(
             &store,
@@ -1882,6 +1919,7 @@ mod tests {
             &meta_b,
             &crate::capability::CapabilitySet::default(),
             &crate::capability::UserBound::default(),
+            None,
         );
         let fp_a = compute_blocked_set_fingerprint(&bp_a);
         let fp_b = compute_blocked_set_fingerprint(&bp_b);
@@ -2002,6 +2040,7 @@ mod tests {
             &BlockedSetMetadata::default(),
             &crate::capability::CapabilitySet::default(),
             &crate::capability::UserBound::default(),
+            None,
         );
 
         assert_eq!(blocked.len(), 1);
@@ -2032,6 +2071,7 @@ mod tests {
             &BlockedSetMetadata::default(),
             &crate::capability::CapabilitySet::default(),
             &crate::capability::UserBound::default(),
+            None,
         );
 
         assert_eq!(blocked.len(), 1);
@@ -2068,6 +2108,7 @@ mod tests {
             &BlockedSetMetadata::default(),
             &crate::capability::CapabilitySet::default(),
             &crate::capability::UserBound::default(),
+            None,
         );
 
         assert_eq!(blocked.len(), 1);
@@ -2080,6 +2121,118 @@ mod tests {
             blocked[0].phases_present,
             vec!["preinstall".to_string(), "postinstall".to_string()],
             "phases_present should list BOTH present phases",
+        );
+    }
+
+    // ── Phase 46 slice 1 — advisor-approved packages are excluded
+    //                       from the persisted blocked set ──────────
+
+    #[test]
+    fn slice1_advisor_approved_amber_excluded_from_blocked_set() {
+        // **Locked semantic (review finding Medium 1).** A package
+        // the advisor approves this run must NOT appear in the
+        // blocked set written to `.lpm/build-state.json`. Without
+        // this, post-install JSON + the "remain blocked after auto-
+        // build" pointer would emit stale state for packages whose
+        // scripts already executed via AdvisorApprovedThisRun.
+        let project = tempdir().unwrap();
+        std::fs::create_dir_all(project.path().join(".lpm")).unwrap();
+        let store = lpm_store::PackageStore::at(project.path().join("store"));
+        store_pkg_with_scripts(
+            &store,
+            "amber-pkg",
+            "1.0.0",
+            &serde_json::json!({"postinstall": "node install.js"}),
+        );
+        let installed = vec![(
+            "amber-pkg".to_string(),
+            "1.0.0".to_string(),
+            Some("sha512-test-integrity".to_string()),
+        )];
+
+        // Baseline: NO approvals → package appears in blocked set.
+        let blocked_without_approval = compute_blocked_packages_with_metadata(
+            &store,
+            &installed,
+            &empty_policy(),
+            &BlockedSetMetadata::default(),
+            &crate::capability::CapabilitySet::default(),
+            &crate::capability::UserBound::default(),
+            None,
+        );
+        assert_eq!(blocked_without_approval.len(), 1);
+        assert_eq!(blocked_without_approval[0].name, "amber-pkg");
+
+        // With the matching triple in the approval set: EXCLUDED.
+        let mut approvals = std::collections::HashSet::new();
+        approvals.insert((
+            "amber-pkg".to_string(),
+            "1.0.0".to_string(),
+            Some("sha512-test-integrity".to_string()),
+        ));
+        let blocked_with_approval = compute_blocked_packages_with_metadata(
+            &store,
+            &installed,
+            &empty_policy(),
+            &BlockedSetMetadata::default(),
+            &crate::capability::CapabilitySet::default(),
+            &crate::capability::UserBound::default(),
+            Some(&approvals),
+        );
+        assert!(
+            blocked_with_approval.is_empty(),
+            "advisor-approved package must be excluded; got {:?}",
+            blocked_with_approval
+                .iter()
+                .map(|b| &b.name)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn slice1_approval_for_other_integrity_does_not_exclude_blocked() {
+        // Counter-test for the source-aware key: an approval that
+        // shares (name, version) but has different integrity must
+        // NOT remove this install's package from the blocked set.
+        // Without integrity in the key, the previous run's approval
+        // on the registry copy could silently mask the workspace
+        // copy's blocked entry — the exact safety property finding
+        // High was about.
+        let project = tempdir().unwrap();
+        std::fs::create_dir_all(project.path().join(".lpm")).unwrap();
+        let store = lpm_store::PackageStore::at(project.path().join("store"));
+        store_pkg_with_scripts(
+            &store,
+            "amber-pkg",
+            "1.0.0",
+            &serde_json::json!({"postinstall": "node install.js"}),
+        );
+        let installed = vec![(
+            "amber-pkg".to_string(),
+            "1.0.0".to_string(),
+            Some("sha512-WORKSPACE-source".to_string()),
+        )];
+
+        // Approve a DIFFERENT integrity for the same coord.
+        let mut approvals = std::collections::HashSet::new();
+        approvals.insert((
+            "amber-pkg".to_string(),
+            "1.0.0".to_string(),
+            Some("sha512-REGISTRY-source".to_string()),
+        ));
+        let blocked = compute_blocked_packages_with_metadata(
+            &store,
+            &installed,
+            &empty_policy(),
+            &BlockedSetMetadata::default(),
+            &crate::capability::CapabilitySet::default(),
+            &crate::capability::UserBound::default(),
+            Some(&approvals),
+        );
+        assert_eq!(
+            blocked.len(),
+            1,
+            "different-integrity approval must not cross-exclude"
         );
     }
 
@@ -2106,6 +2259,7 @@ mod tests {
             &BlockedSetMetadata::default(),
             &crate::capability::CapabilitySet::default(),
             &crate::capability::UserBound::default(),
+            None,
         );
 
         assert_eq!(blocked.len(), 1);
@@ -2152,6 +2306,7 @@ mod tests {
             &BlockedSetMetadata::default(),
             &crate::capability::CapabilitySet::default(),
             &crate::capability::UserBound::default(),
+            None,
         );
 
         assert_eq!(blocked.len(), 3);
@@ -2306,6 +2461,7 @@ mod tests {
             &BlockedSetMetadata::default(),
             &widening,
             &UserBound::default(),
+            None,
         );
 
         assert_eq!(
@@ -2354,6 +2510,7 @@ mod tests {
             &BlockedSetMetadata::default(),
             &CapabilitySet::default(),
             &UserBound::default(),
+            None,
         );
         assert!(
             blocked.is_empty(),
