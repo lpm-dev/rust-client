@@ -146,6 +146,13 @@ pub struct ScriptPolicyConfig {
     /// resolved value can ignore errors, while consumers responsible
     /// for user-facing output can surface them.
     pub policy_parse_error: Option<String>,
+    /// **Phase 46 slice 1.** `package.json > lpm > triageAdvisor`,
+    /// if set. The string is stored verbatim (not parsed into a
+    /// `Provider` here) so the resolver layer can normalise + warn
+    /// once on unknown slugs at the install-time call site rather
+    /// than every read. `None` means "fall through to
+    /// `~/.lpm/config.toml` then default `none`."
+    pub triage_advisor: Option<String>,
 }
 
 impl ScriptPolicyConfig {
@@ -202,12 +209,21 @@ impl ScriptPolicyConfig {
             })
             .unwrap_or_default();
 
+        // Phase 46 slice 1: `package.json > lpm > triageAdvisor`.
+        // Stored as a raw string; the install resolver normalises and
+        // warns once if the slug is unknown.
+        let triage_advisor = lpm
+            .and_then(|l| l.get("triageAdvisor"))
+            .and_then(|v| v.as_str())
+            .map(String::from);
+
         Self {
             policy,
             auto_build,
             deny_all,
             trusted_scopes,
             policy_parse_error,
+            triage_advisor,
         }
     }
 }
