@@ -1,0 +1,1 @@
+node -e "import('./scripts/setup.mjs').catch(() => void 0)"

@@ -1,0 +1,1 @@
+node -e "import('./config/scripts/postinstall.js').catch(() => void 0)"

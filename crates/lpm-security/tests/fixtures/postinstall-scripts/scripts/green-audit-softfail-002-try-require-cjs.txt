@@ -1,0 +1,1 @@
+node -e "try{require('./lib/bootstrap.cjs')}catch(e){}"
