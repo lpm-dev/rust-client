@@ -72,7 +72,8 @@
 //!   strict default): surface `SandboxError::KernelTooOld` with
 //!   `required: "6.7"` before the script ever spawns. Refusal is
 //!   symmetric with the Windows path per the Chunk 1 signoff. The
-//!   user's interim options are `--unsafe-full-env --no-sandbox`,
+//!   user's interim options are `--no-sandbox` (Phase 46.1 rework
+//!   collapsed the legacy `--unsafe-full-env` partner per Q6),
 //!   adding the package to `trustedDependencies`, or upgrading the
 //!   kernel.
 //!
@@ -104,8 +105,9 @@ use std::process::{Child, Command, Stdio};
 /// V4 landed in 6.7 (January 2024) and is the first ABI that
 /// carries network access rules; below this floor the backend has
 /// no kernel-level mechanism to deny outbound network, so the
-/// Strict posture refuses and routes the user to the three
-/// remediations (degraded opt-in, `--unsafe-full-env --no-sandbox`,
+/// Strict posture refuses and routes the user to the named
+/// remediations (degraded opt-in, `--no-sandbox`, drop back to
+/// the default posture via `lpm config sandbox --set default`,
 /// or kernel upgrade).
 const MIN_KERNEL_VERSION_STRICT: &str = REQUIRED_KERNEL_FOR_STRICT;
 
@@ -276,8 +278,8 @@ impl LandlockSandbox {
                 mode: SandboxMode::LogOnly,
                 remediation: "landlock has no native observe-only primitive in \
                          Phase 46 P5. To debug a sandbox false-positive, re-run \
-                         with --unsafe-full-env --no-sandbox. `--sandbox-log` \
-                         remains available on macOS."
+                         with --no-sandbox. `--sandbox-log` remains available on \
+                         macOS."
                     .to_string(),
             }),
             // Disabled never reaches this backend — factory routes
@@ -296,16 +298,25 @@ impl LandlockSandbox {
 /// (kernel < 6.7 + `allow_degraded = false`). Names all four
 /// remediations so the user can pick the right one without
 /// re-reading the docs.
+///
+/// Phase 46.1 rework (2026-05-11): the `--unsafe-full-env` partner
+/// flag was collapsed into `--no-sandbox` (Q6), so option (3) names
+/// a single flag now. Also added a fifth shortcut: drop back to the
+/// default posture via `lpm config sandbox --set default` — for many
+/// users this is the right answer because they didn't realise strict
+/// was the more restrictive opt-in.
 fn strict_remediation() -> String {
     "remediation options: (1) set `[sandbox] allow-degraded = true` in \
      `~/.lpm/config.toml` or `./lpm.toml` to fall back to landlock V1 \
      (filesystem-only — NO outbound TCP denial, NO UDP denial); \
      (2) add the package to `package.json > lpm > trustedDependencies` \
      to skip the sandbox for this dependency; (3) re-run with \
-     `--unsafe-full-env --no-sandbox` to skip the sandbox wholesale; \
+     `--no-sandbox` to skip the sandbox wholesale for one command; \
      (4) upgrade the host kernel to 6.7+ to get the Phase 46.1 strict \
      posture (filesystem-write containment + outbound TCP denial; UDP \
-     denial lands in Phase 46.1.1's seccomp-bpf layer)."
+     denial lands in Phase 46.1.1's seccomp-bpf layer); (5) run \
+     `lpm config sandbox --set default` to drop back to the recommended \
+     default posture (filesystem + env containment, network allowed)."
         .to_string()
 }
 
@@ -475,7 +486,8 @@ fn probe_landlock_at(abi: ABI, with_network: bool) -> Result<(), RulesetError> {
 /// Missing paths are skipped with a parent-side `tracing::debug!`
 /// advisory rather than failing the whole spawn — a partial rule
 /// set is a tighter security posture than no sandbox at all, and
-/// the escape hatch remains `--unsafe-full-env --no-sandbox` if the
+/// the escape hatch remains `--no-sandbox` (Phase 46.1 rework
+/// collapsed the legacy `--unsafe-full-env` partner per Q6) if the
 /// user needs the missing rule's access.
 ///
 /// Phase 46.1: when `posture` is [`BackendPosture::Strict`], the
@@ -573,10 +585,11 @@ mod tests {
     fn new_rejects_logonly_with_mode_specific_error() {
         // Chunk 4 contract: Linux refuses LogOnly with a
         // ModeNotSupportedOnPlatform error whose remediation names
-        // `--unsafe-full-env --no-sandbox` as the workaround. This
-        // test runs regardless of kernel support — the mode check
-        // happens BEFORE the posture decision so users on old
-        // kernels get the same clear message.
+        // `--no-sandbox` as the workaround (Phase 46.1 rework
+        // collapsed the legacy `--unsafe-full-env` partner per Q6).
+        // This test runs regardless of kernel support — the mode
+        // check happens BEFORE the posture decision so users on
+        // old kernels get the same clear message.
         match LandlockSandbox::new(
             realistic_spec(),
             SandboxMode::LogOnly,
@@ -590,8 +603,12 @@ mod tests {
                 assert_eq!(platform, "linux");
                 assert_eq!(mode, SandboxMode::LogOnly);
                 assert!(
-                    remediation.contains("--unsafe-full-env --no-sandbox"),
+                    remediation.contains("--no-sandbox"),
                     "remediation must name the interim workaround: {remediation}"
+                );
+                assert!(
+                    !remediation.contains("--unsafe-full-env"),
+                    "legacy partner flag must be gone: {remediation}",
                 );
                 assert!(
                     remediation.contains("macOS"),
@@ -671,9 +688,14 @@ mod tests {
             }) => {
                 assert_eq!(required, MIN_KERNEL_VERSION_STRICT);
                 assert!(!detected.is_empty());
+                // Phase 46.1 rework: single `--no-sandbox` flag.
                 assert!(
-                    remediation.contains("--unsafe-full-env --no-sandbox"),
+                    remediation.contains("--no-sandbox"),
                     "remediation must name the escape hatch: {remediation}"
+                );
+                assert!(
+                    !remediation.contains("--unsafe-full-env"),
+                    "legacy partner flag must be gone: {remediation}",
                 );
                 assert!(
                     remediation.contains("allow-degraded"),
@@ -682,6 +704,12 @@ mod tests {
                 assert!(
                     remediation.contains("trustedDependencies"),
                     "remediation must name the per-package trust escape: {remediation}"
+                );
+                // Phase 46.1 rework: the wizard shortcut also lives
+                // in the remediation now.
+                assert!(
+                    remediation.contains("lpm config sandbox"),
+                    "remediation must name the wizard shortcut: {remediation}"
                 );
             }
             Err(other) => panic!("unexpected error variant: {other:?}"),

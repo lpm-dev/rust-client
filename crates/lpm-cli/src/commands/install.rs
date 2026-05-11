@@ -3246,6 +3246,18 @@ pub async fn run_with_options(
     // into this policy (D16): drift and cooldown are orthogonal, so
     // their override flags stay separate.
     drift_ignore_policy: crate::provenance_fetch::DriftIgnorePolicy,
+    // Phase 46.1 rework (2026-05-11): CLI sandbox-mode overrides.
+    // `strict_sandbox=true` flips outbound network denial on for the
+    // auto-build call; `no_sandbox=true` drops all containment for
+    // that call. Clap-level mutex guarantees they never both arrive
+    // `true`. The full precedence chain — CLI > env > project >
+    // user > default — is resolved inside
+    // [`crate::sandbox_config::resolve_sandbox_mode_from_chain`] at
+    // the auto-build site; install-time pre-fetch does not engage
+    // the sandbox, so this flag only matters when `auto_build` is
+    // true.
+    strict_sandbox: bool,
+    no_sandbox: bool,
 ) -> Result<(), LpmError> {
     // Phase 64 Round 2: hold a shared lock on the store for the
     // entire install pipeline. Multiple concurrent installs share it
@@ -3279,6 +3291,8 @@ pub async fn run_with_options(
             advisor_override,
             min_release_age_override,
             drift_ignore_policy,
+            strict_sandbox,
+            no_sandbox,
         ),
     )
     .await
@@ -3308,6 +3322,11 @@ async fn run_with_options_under_store_lock(
     advisor_override: Option<String>,
     min_release_age_override: Option<u64>,
     drift_ignore_policy: crate::provenance_fetch::DriftIgnorePolicy,
+    // Phase 46.1 rework (2026-05-11) — see `run_with_options` for the
+    // contract. Threaded down so the auto-build call below honors the
+    // user's CLI sandbox-mode override.
+    strict_sandbox: bool,
+    no_sandbox: bool,
 ) -> Result<(), LpmError> {
     if !json_output {
         output::print_header();
@@ -6923,15 +6942,24 @@ async fn run_with_options_under_store_lock(
             false, // not --force
             None,  // default timeout
             json_output,
-            false, // not --unsafe-full-env
             false, // not --deny-all
-            // Phase 46 P5 Chunk 2: auto-build never bypasses the
-            // sandbox (no_sandbox=false) and never enters diagnostic
-            // mode (sandbox_log=false). If a user wants to opt out
-            // of containment, they need to run `lpm rebuild` explicitly
-            // with the partner flag pair. Silent sandbox bypass
-            // during autoBuild would violate D20.
-            false, // no_sandbox
+            // Phase 46.1 rework (2026-05-11): forward the user's CLI
+            // sandbox-mode choice to the auto-build rebuild call.
+            // When the user explicitly opts into strict, the
+            // auto-build greens run under strict too. When the user
+            // explicitly drops the sandbox (`--no-sandbox`), the
+            // auto-build greens skip containment too — consistent
+            // with the user's chosen capability boundary. The
+            // env / config / default precedence stays intact when
+            // both flags are false (the chain resolver inside
+            // `rebuild::run_under_store_lock` walks lpm.toml /
+            // `~/.lpm/config.toml` / `LPM_STRICT_SANDBOX` env).
+            //
+            // `sandbox_log` stays false: it's a diagnostic-only
+            // override the user must spell out explicitly on
+            // `lpm rebuild`, not a default that auto-build inherits.
+            no_sandbox,
+            strict_sandbox,
             false, // sandbox_log
             step10_effective_policy,
             advisor_session.as_ref().map(|s| s.approvals()),
@@ -10603,6 +10631,10 @@ pub async fn run_add_packages(
     // Phase 46 P4 Chunk 4: forwarded `--ignore-provenance-drift[-all]`
     // policy. Opaque pass-through — see [`run_with_options`].
     drift_ignore_policy: crate::provenance_fetch::DriftIgnorePolicy,
+    // Phase 46.1 rework (2026-05-11): forwarded CLI sandbox-mode
+    // overrides. Opaque pass-through — see [`run_with_options`].
+    strict_sandbox: bool,
+    no_sandbox: bool,
 ) -> Result<(), LpmError> {
     // First pass: check if any LPM packages are Swift ecosystem
     // Route Swift packages to SE-0292 registry mode
@@ -10718,6 +10750,8 @@ pub async fn run_add_packages(
         advisor_override,
         min_release_age_override,
         drift_ignore_policy,
+        strict_sandbox,
+        no_sandbox,
     )
     .await?;
 
@@ -10773,6 +10807,10 @@ pub async fn run_install_filtered_add(
     // Phase 46 P4 Chunk 4: forwarded `--ignore-provenance-drift[-all]`
     // policy. Opaque pass-through — see [`run_with_options`].
     drift_ignore_policy: crate::provenance_fetch::DriftIgnorePolicy,
+    // Phase 46.1 rework (2026-05-11): forwarded CLI sandbox-mode
+    // overrides. Opaque pass-through — see [`run_with_options`].
+    strict_sandbox: bool,
+    no_sandbox: bool,
 ) -> Result<(), LpmError> {
     // 1. Resolve CLI flags into a concrete target list.
     let targets = crate::commands::install_targets::resolve_install_targets(
@@ -11007,6 +11045,8 @@ pub async fn run_install_filtered_add(
             // Cloning an enum + HashSet of ignored names is cheap
             // relative to the per-iteration install pipeline itself.
             drift_ignore_policy.clone(),
+            strict_sandbox,
+            no_sandbox,
         )
         .await;
 
@@ -13306,6 +13346,8 @@ mod tests {
             None,                                                  // advisor_override
             None,                                                  // min_release_age_override
             crate::provenance_fetch::DriftIgnorePolicy::default(), // drift_ignore_policy
+            false,                                                 // strict_sandbox
+            false,                                                 // no_sandbox
         )
         .await;
 
@@ -13345,6 +13387,8 @@ mod tests {
             None,                                                  // advisor_override
             None,                                                  // min_release_age_override
             crate::provenance_fetch::DriftIgnorePolicy::default(), // drift_ignore_policy
+            false,                                                 // strict_sandbox
+            false,                                                 // no_sandbox
         )
         .await;
 

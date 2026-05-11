@@ -9,11 +9,12 @@ use std::io::IsTerminal;
 /// Stores config in ~/.lpm/config.toml (user/machine config).
 /// Project config lives in package.json under "lpm" key.
 ///
-/// Beyond `get`/`set`/`delete`/`list`, two focused wizards live here:
+/// Beyond `get`/`set`/`delete`/`list`, three focused wizards live here:
 /// - `lpm config scripts` owns `script-policy = deny | triage | allow`.
 /// - `lpm config triage` owns `triage-advisor = none | claude-cli | codex | ollama`.
+/// - `lpm config sandbox` owns `[sandbox] mode = default | strict | none`.
 ///
-/// Both default to interactive in a TTY; `--set <value>` is the
+/// All three default to interactive in a TTY; `--set <value>` is the
 /// non-interactive setter required for CI / scripted setup.
 pub async fn run(
     action: &str,
@@ -32,6 +33,9 @@ pub async fn run(
     }
     if action == "triage" {
         return run_triage_wizard(&config_path, set, json_output).await;
+    }
+    if action == "sandbox" {
+        return run_sandbox_wizard(&config_path, set, json_output).await;
     }
 
     match action {
@@ -530,6 +534,153 @@ fn print_triage_policy_followup(json_output: bool) {
     );
 }
 
+// ─────────────────────────────────────────────────────────────────────
+// `lpm config sandbox`  wizard  (Phase 46.1 rework, 2026-05-11)
+// ─────────────────────────────────────────────────────────────────────
+//
+// Persists `[sandbox] mode = "default" | "strict" | "none"` into
+// `~/.lpm/config.toml`. Mirror of `run_scripts_wizard` /
+// `run_triage_wizard`:
+//   - interactive (TTY): cliclack `select` with the current value
+//     pre-selected, plus an extra confirmation prompt when the user
+//     picks `none` (because that turns the install-time sandbox off
+//     wholesale).
+//   - `--set <value>`: non-interactive setter for CI / image bake
+//     dotfiles automation. Trusts the operator — no confirmation
+//     prompt even on `--set none`.
+//
+// The wizard ONLY touches `~/.lpm/config.toml`. The project-tier
+// `./lpm.toml > [sandbox] mode` is committed-by-the-team and intended
+// to be edited directly; the wizard's user-tier scope matches the
+// other two wizards.
+
+const SANDBOX_MODE_VALUES: &[&str] = &["default", "strict", "none"];
+
+async fn run_sandbox_wizard(
+    config_path: &std::path::Path,
+    set: Option<&str>,
+    json_output: bool,
+) -> Result<(), LpmError> {
+    if let Some(v) = set {
+        if !SANDBOX_MODE_VALUES.contains(&v) {
+            return Err(LpmError::Registry(format!(
+                "invalid sandbox mode '{v}'; must be one of: {}",
+                SANDBOX_MODE_VALUES.join(" | ")
+            )));
+        }
+        persist_sandbox_mode(config_path, v)?;
+        announce_sandbox_set(v, json_output);
+        return Ok(());
+    }
+
+    if !std::io::stdin().is_terminal() {
+        return Err(LpmError::Registry(
+            "lpm config sandbox requires a TTY; use `--set default|strict|none` instead"
+                .to_string(),
+        ));
+    }
+
+    let current = read_sandbox_mode(config_path)?.unwrap_or_else(|| "default".to_string());
+    println!();
+    println!("  current: {}", current.cyan());
+    let new_value: &str = cliclack::select("How strict should the install-time sandbox be?")
+        .item(
+            "default",
+            "default — filesystem + env containment, outbound network allowed",
+            "recommended",
+        )
+        .item(
+            "strict",
+            "strict  — + outbound network denied",
+            "paranoid / CI / enterprise",
+        )
+        .item(
+            "none",
+            "none    — sandbox off",
+            "NOT recommended — full host access for every script",
+        )
+        .initial_value(current.as_str())
+        .interact()
+        .map_err(prompt_err)?;
+
+    // Phase 46.1 DX redline: confirm when the user picks `none` in
+    // the interactive wizard. The `--set none` form trusts the
+    // operator (no TTY check); only the wizard prompts.
+    if new_value == "none" {
+        println!();
+        println!(
+            "  {}: setting sandbox mode to {} means every lifecycle script that runs \
+             gets full host access — filesystem open, full env (credentials), network. \
+             This is the npm-default shape; LPM does not recommend it as a persistent \
+             posture.",
+            "warning".yellow(),
+            "none".yellow().bold()
+        );
+        let confirmed = cliclack::confirm(
+            "Are you sure you want sandbox = none for every install on this machine?",
+        )
+        .initial_value(false)
+        .interact()
+        .map_err(prompt_err)?;
+        if !confirmed {
+            println!("  Aborted. No config change.");
+            return Ok(());
+        }
+    }
+
+    persist_sandbox_mode(config_path, new_value)?;
+    announce_sandbox_set(new_value, json_output);
+    Ok(())
+}
+
+/// Read the `[sandbox] mode` value from `~/.lpm/config.toml`. Returns
+/// `None` for missing file, missing section, or missing key.
+fn read_sandbox_mode(config_path: &std::path::Path) -> Result<Option<String>, LpmError> {
+    let cfg = read_config(config_path)?;
+    Ok(cfg
+        .get("sandbox")
+        .and_then(|v| v.as_table())
+        .and_then(|t| t.get("mode"))
+        .and_then(|v| v.as_str())
+        .map(String::from))
+}
+
+/// Persist the resolved sandbox mode into `[sandbox] mode` in the
+/// config file. Creates the `[sandbox]` table if absent; preserves
+/// any sibling keys (e.g. `allow-degraded`) untouched.
+fn persist_sandbox_mode(config_path: &std::path::Path, value: &str) -> Result<(), LpmError> {
+    let mut cfg = read_config(config_path)?;
+    let top = cfg.as_table_mut().ok_or_else(|| {
+        LpmError::Registry("config.toml must be a TOML table at the top level".into())
+    })?;
+    let sandbox_section = top
+        .entry("sandbox".to_string())
+        .or_insert_with(|| toml::Value::Table(toml::map::Map::new()));
+    let sandbox_table = sandbox_section.as_table_mut().ok_or_else(|| {
+        LpmError::Registry(format!(
+            "{}: `[sandbox]` is not a TOML table — refusing to clobber",
+            config_path.display(),
+        ))
+    })?;
+    sandbox_table.insert("mode".to_string(), toml::Value::String(value.to_string()));
+    write_config(config_path, &cfg)
+}
+
+fn announce_sandbox_set(value: &str, json_output: bool) {
+    if json_output {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "success": true,
+                "sandbox": { "mode": value },
+            }))
+            .unwrap()
+        );
+    } else {
+        output::success(&format!("Set [sandbox] mode = {}", value.bold()));
+    }
+}
+
 /// Disclosure printed after `triage-advisor = <value>` is persisted
 /// (via either `--set` or interactive). After slice 1 this describes
 /// the actual install-time contract:
@@ -638,6 +789,101 @@ mod wizard_tests {
         assert_eq!(
             table.get(SCRIPT_POLICY_KEY).and_then(|v| v.as_str()),
             Some("deny")
+        );
+    }
+
+    // ── sandbox wizard (Phase 46.1 rework) ─────────────────────────
+
+    #[tokio::test]
+    async fn sandbox_wizard_set_persists_each_valid_mode() {
+        for mode in &["default", "strict", "none"] {
+            let (_dir, path) = tmp_config();
+            run_sandbox_wizard(&path, Some(mode), true).await.unwrap();
+            let v = read_sandbox_mode(&path).unwrap();
+            assert_eq!(
+                v.as_deref(),
+                Some(*mode),
+                "sandbox mode '{mode}' must persist",
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn sandbox_wizard_set_rejects_unknown_mode() {
+        let (_dir, path) = tmp_config();
+        let err = run_sandbox_wizard(&path, Some("paranoid"), true)
+            .await
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("invalid sandbox mode 'paranoid'"),
+            "got: {msg}",
+        );
+        // No persistence on validation failure.
+        assert!(read_sandbox_mode(&path).unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn sandbox_wizard_preserves_sibling_keys() {
+        // The wizard writes `[sandbox] mode`; an existing
+        // `[sandbox] allow-degraded` must survive.
+        let (_dir, path) = tmp_config();
+        std::fs::write(
+            &path,
+            "unrelated = \"keep-me\"\n[sandbox]\nallow-degraded = true\n",
+        )
+        .unwrap();
+
+        run_sandbox_wizard(&path, Some("strict"), true)
+            .await
+            .unwrap();
+
+        let cfg = read_config(&path).unwrap();
+        let top = cfg.as_table().unwrap();
+        assert_eq!(
+            top.get("unrelated").and_then(|v| v.as_str()),
+            Some("keep-me"),
+            "top-level sibling must survive",
+        );
+        let sandbox = top.get("sandbox").and_then(|v| v.as_table()).unwrap();
+        assert_eq!(
+            sandbox.get("mode").and_then(|v| v.as_str()),
+            Some("strict"),
+            "mode must be written",
+        );
+        assert_eq!(
+            sandbox.get("allow-degraded").and_then(|v| v.as_bool()),
+            Some(true),
+            "sibling `allow-degraded` must survive — wizard must not clobber it",
+        );
+    }
+
+    #[tokio::test]
+    async fn sandbox_wizard_refuses_to_clobber_non_table_sandbox_key() {
+        // Defensive: if the user has somehow written `sandbox = "foo"` as
+        // a top-level string, refuse rather than clobbering it into a
+        // table. Honest error > silent migration on a typed config knob.
+        let (_dir, path) = tmp_config();
+        std::fs::write(&path, "sandbox = \"not-a-table\"\n").unwrap();
+        let err = run_sandbox_wizard(&path, Some("strict"), true)
+            .await
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("not a TOML table"), "got: {msg}");
+    }
+
+    #[tokio::test]
+    async fn sandbox_wizard_overwrites_existing_mode() {
+        let (_dir, path) = tmp_config();
+        run_sandbox_wizard(&path, Some("strict"), true)
+            .await
+            .unwrap();
+        run_sandbox_wizard(&path, Some("default"), true)
+            .await
+            .unwrap();
+        assert_eq!(
+            read_sandbox_mode(&path).unwrap().as_deref(),
+            Some("default")
         );
     }
 }

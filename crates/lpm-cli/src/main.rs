@@ -532,6 +532,47 @@ enum Commands {
         /// Example: `lpm install -g foo --alias serve=foo-serve,lint=foo-lint`
         #[arg(long = "alias", value_name = "ORIG=ALIAS")]
         alias: Vec<String>,
+
+        /// Phase 46.1 rework (2026-05-11): engage strict sandbox for
+        /// this install's lifecycle scripts — filesystem containment,
+        /// env scrubbing, and outbound network denial. Overrides any
+        /// persistent `[sandbox] mode` config for this command only.
+        /// Auto-build (`--auto-build` and the `package.json` key
+        /// `lpm.scripts.autoBuild`) honors the same strict mode.
+        ///
+        /// Mutually exclusive with `--no-sandbox` and `--paranoid`
+        /// (the alias).
+        #[arg(
+            long = "strict-sandbox",
+            id = "install_strict_sandbox",
+            conflicts_with_all = ["install_no_sandbox", "install_paranoid"],
+        )]
+        strict_sandbox: bool,
+
+        /// Phase 46.1 rework alias for `--strict-sandbox`. Same
+        /// behaviour; ergonomic spelling. Mutually exclusive with
+        /// `--no-sandbox` and `--strict-sandbox`.
+        #[arg(
+            long = "paranoid",
+            id = "install_paranoid",
+            conflicts_with_all = ["install_no_sandbox", "install_strict_sandbox"],
+        )]
+        paranoid: bool,
+
+        /// Phase 46.1 rework (2026-05-11): drop ALL containment for
+        /// this install's lifecycle scripts. Scripts run with full
+        /// host access — filesystem open, full env (credentials
+        /// included), outbound network allowed. Reserve for debugging
+        /// a sandbox false-positive. Persistent off-mode goes through
+        /// `lpm config sandbox --set none` instead.
+        ///
+        /// Mutually exclusive with `--strict-sandbox` and `--paranoid`.
+        #[arg(
+            long = "no-sandbox",
+            id = "install_no_sandbox",
+            conflicts_with_all = ["install_strict_sandbox", "install_paranoid"],
+        )]
+        no_sandbox: bool,
     },
 
     /// Remove packages from dependencies and node_modules.
@@ -797,16 +838,18 @@ enum Commands {
 
     /// Manage CLI configuration.
     Config {
-        /// Action: get, set, delete, list, scripts, triage.
+        /// Action: get, set, delete, list, scripts, triage, sandbox.
         action: String,
         /// Config key (for get/set/delete).
         key: Option<String>,
         /// Config value (for set).
         value: Option<String>,
-        /// Non-interactive value for the `scripts` / `triage` wizards.
-        /// Required when stdin is not a TTY. Examples:
+        /// Non-interactive value for the `scripts` / `triage` /
+        /// `sandbox` wizards. Required when stdin is not a TTY.
+        /// Examples:
         ///   `lpm config scripts --set triage`
         ///   `lpm config triage --set claude-cli`
+        ///   `lpm config sandbox --set strict`
         #[arg(long = "set", value_name = "VALUE")]
         set: Option<String>,
     },
@@ -966,10 +1009,12 @@ enum Commands {
     /// Other lifecycle names like `prepare` / `prepublishOnly` are recognized
     /// for detection and audit, but never executed by the install pipeline.
     ///
-    /// Scripts run inside a filesystem sandbox by default — Seatbelt on
-    /// macOS, landlock on Linux. The escape hatch is `--unsafe-full-env
-    /// --no-sandbox`; `--no-sandbox` alone is rejected so disabling
-    /// containment also requires acknowledging credential exposure.
+    /// Scripts run inside the Phase 46.1 default sandbox — filesystem-write
+    /// containment + env scrubbing, outbound network allowed. Strict mode
+    /// (network denial) is opt-in via `--strict-sandbox` / `--paranoid`,
+    /// `[sandbox] mode = "strict"` in `~/.lpm/config.toml` / `./lpm.toml`,
+    /// or `LPM_STRICT_SANDBOX=1`. The escape hatch is `--no-sandbox`, which
+    /// drops both containment AND env scrubbing in a single flag.
     ///
     /// Matches `npm rebuild` / `pnpm rebuild`.
     Rebuild {
@@ -991,14 +1036,6 @@ enum Commands {
         /// Timeout per script in seconds (default: 300 = 5 minutes).
         #[arg(long)]
         timeout: Option<u64>,
-
-        /// Pass full environment to scripts without stripping credentials.
-        /// WARNING: Exposes LPM_TOKEN, NPM_TOKEN, GITHUB_TOKEN, etc. to scripts.
-        ///
-        /// Also required to pair with `--no-sandbox` — disabling the
-        /// sandbox without this flag is rejected at parse time.
-        #[arg(long)]
-        unsafe_full_env: bool,
 
         /// Refuse to run ANY scripts, even trusted ones.
         #[arg(long)]
@@ -1045,14 +1082,44 @@ enum Commands {
         #[arg(long = "triage", id = "rebuild_triage_alias", conflicts_with_all = ["policy", "rebuild_yolo"])]
         triage_alias: bool,
 
-        /// Phase 46 P5: run lifecycle scripts WITHOUT filesystem
-        /// containment. Only reachable paired with `--unsafe-full-env`
-        /// — using this alone errors. Scripts get full host access;
-        /// reserve for debugging a sandbox false-positive that
-        /// `sandboxWriteDirs` can't express. Mutually exclusive with
-        /// `--sandbox-log`.
-        #[arg(long, requires = "unsafe_full_env", conflicts_with = "sandbox_log")]
+        /// Phase 46.1 rework (2026-05-11): drop ALL containment for
+        /// this command. Scripts run with full host access — filesystem
+        /// open, full env (credentials included), outbound network
+        /// allowed. Reserve for debugging a sandbox false-positive
+        /// that no other escape covers. Mutually exclusive with
+        /// `--strict-sandbox` / `--paranoid` (both forms of opting
+        /// INTO containment) and `--sandbox-log`.
+        ///
+        /// Persistent off-mode goes through `lpm config sandbox --set
+        /// none` instead; this flag is the per-command escape only.
+        #[arg(
+            long,
+            conflicts_with_all = ["sandbox_log", "rebuild_strict_sandbox", "rebuild_paranoid"]
+        )]
         no_sandbox: bool,
+
+        /// Phase 46.1 rework (2026-05-11): engage strict containment
+        /// for this command — filesystem-write containment + env
+        /// scrubbing + outbound network denial. Overrides any
+        /// persistent `[sandbox] mode` config. Mutually exclusive
+        /// with `--no-sandbox` and `--paranoid` (alias).
+        #[arg(
+            long = "strict-sandbox",
+            id = "rebuild_strict_sandbox",
+            conflicts_with_all = ["no_sandbox", "rebuild_paranoid"],
+        )]
+        strict_sandbox: bool,
+
+        /// Phase 46.1 rework alias for `--strict-sandbox`. Same
+        /// behaviour; ergonomic spelling for "I always want this
+        /// strict". Mutually exclusive with `--no-sandbox` and
+        /// `--strict-sandbox`.
+        #[arg(
+            long = "paranoid",
+            id = "rebuild_paranoid",
+            conflicts_with_all = ["no_sandbox", "rebuild_strict_sandbox"],
+        )]
+        paranoid: bool,
 
         /// Phase 46 P5 Chunk 4: run lifecycle scripts in diagnostic
         /// mode — rule triggers are logged via `sandboxd` but not
@@ -1067,8 +1134,8 @@ enum Commands {
         /// `(allow (with report) default)` fallback. Linux landlock
         /// has no native observe-only primitive, so `--sandbox-log`
         /// on Linux errors at sandbox init with a remediation
-        /// pointing at `--unsafe-full-env --no-sandbox`. Mutually
-        /// exclusive with `--no-sandbox`.
+        /// pointing at `--no-sandbox`. Mutually exclusive with
+        /// `--no-sandbox`.
         #[arg(long)]
         sandbox_log: bool,
 
@@ -2550,6 +2617,9 @@ async fn async_main() -> Result<()> {
             yolo,
             triage_alias,
             advisor,
+            strict_sandbox,
+            paranoid,
+            no_sandbox,
         } => {
             // Phase 37 M3.2: route `lpm install --global` / `-g` to
             // the persistent IsolatedInstall pipeline. M3.2 ships
@@ -2793,6 +2863,13 @@ async fn async_main() -> Result<()> {
                         advisor.clone(),
                         min_release_age_override,
                         drift_ignore_policy,
+                        // Phase 46.1 rework: collapse `--strict-sandbox`
+                        // and its `--paranoid` alias into a single bool
+                        // before the resolver (the chain inside
+                        // `rebuild::run` already accepts a single
+                        // `strict_sandbox` boolean).
+                        strict_sandbox || paranoid,
+                        no_sandbox,
                     )
                     .await
                 }
@@ -2815,6 +2892,8 @@ async fn async_main() -> Result<()> {
                     advisor.clone(),
                     min_release_age_override,
                     drift_ignore_policy,
+                    strict_sandbox || paranoid,
+                    no_sandbox,
                 )
                 .await
             } else {
@@ -2844,6 +2923,8 @@ async fn async_main() -> Result<()> {
                         advisor.clone(),
                         min_release_age_override,
                         drift_ignore_policy,
+                        strict_sandbox || paranoid,
+                        no_sandbox,
                     )
                     .await
                 } else {
@@ -2860,6 +2941,8 @@ async fn async_main() -> Result<()> {
                         advisor.clone(),
                         min_release_age_override,
                         drift_ignore_policy,
+                        strict_sandbox || paranoid,
+                        no_sandbox,
                     )
                     .await
                 }
@@ -3349,12 +3432,13 @@ async fn async_main() -> Result<()> {
             dry_run,
             force,
             timeout,
-            unsafe_full_env,
             deny_all,
             policy,
             yolo,
             triage_alias,
             no_sandbox,
+            strict_sandbox,
+            paranoid,
             sandbox_log,
             no_engine_strict,
         } => {
@@ -3408,9 +3492,12 @@ async fn async_main() -> Result<()> {
                 force,
                 timeout,
                 cli.json,
-                unsafe_full_env,
                 deny_all,
                 no_sandbox,
+                // Phase 46.1 rework: `--paranoid` is a clap alias for
+                // `--strict-sandbox`. Either form sets the strict flag
+                // before flowing into `resolve_sandbox_mode_from_chain`.
+                strict_sandbox || paranoid,
                 sandbox_log,
                 // Phase 46 P6 Chunk 1: pass the resolved effective
                 // policy through. Previously `effective` was computed
@@ -5401,36 +5488,132 @@ mod tests {
     }
 
     #[test]
-    fn rebuild_no_sandbox_requires_unsafe_full_env() {
-        // Disabling the sandbox alone must fail at parse time so the
-        // user can't silently drop containment without also opting into
-        // the highly-visible credential-exposure flag. Pairing is
-        // enforced via clap `requires = "unsafe_full_env"` at the
-        // `--no-sandbox` arg site; this test guards against accidental
-        // removal of that constraint.
-        let result = Cli::try_parse_from(["lpm", "rebuild", "--no-sandbox"]);
-        assert!(
-            result.is_err(),
-            "`--no-sandbox` must require `--unsafe-full-env`; standalone use should fail"
-        );
-
-        // The paired form parses cleanly.
-        let cli = Cli::try_parse_from(["lpm", "rebuild", "--unsafe-full-env", "--no-sandbox"])
-            .expect("paired flags should parse");
+    fn rebuild_no_sandbox_is_single_flag() {
+        // Phase 46.1 rework (2026-05-11): `--no-sandbox` collapsed the
+        // legacy `--unsafe-full-env` partner per Q6 — single flag drops
+        // BOTH containment AND env scrubbing. No deprecation alias per
+        // beta-cleanup policy.
+        let cli = Cli::try_parse_from(["lpm", "rebuild", "--no-sandbox"])
+            .expect("`--no-sandbox` should parse standalone after Phase 46.1 rework");
         match cli.command.expect("test parse missing subcommand") {
-            Commands::Rebuild {
-                no_sandbox,
-                unsafe_full_env,
-                ..
-            } => {
+            Commands::Rebuild { no_sandbox, .. } => {
                 assert!(no_sandbox, "--no-sandbox should set no_sandbox=true");
-                assert!(
-                    unsafe_full_env,
-                    "--unsafe-full-env should set unsafe_full_env=true"
-                );
             }
             _ => panic!("expected Rebuild command"),
         }
+
+        // `--unsafe-full-env` is fully removed — clap rejects it.
+        let result = Cli::try_parse_from(["lpm", "rebuild", "--unsafe-full-env"]);
+        assert!(
+            result.is_err(),
+            "`--unsafe-full-env` must be removed entirely (Phase 46.1 rework Q6)"
+        );
+    }
+
+    #[test]
+    fn rebuild_strict_sandbox_and_no_sandbox_are_mutually_exclusive() {
+        // Phase 46.1 rework: opting INTO containment (`--strict-sandbox`
+        // / `--paranoid`) and opting OUT entirely (`--no-sandbox`)
+        // cannot coexist on the same command.
+        let result = Cli::try_parse_from(["lpm", "rebuild", "--strict-sandbox", "--no-sandbox"]);
+        assert!(
+            result.is_err(),
+            "`--strict-sandbox` + `--no-sandbox` must conflict at parse"
+        );
+
+        let result = Cli::try_parse_from(["lpm", "rebuild", "--paranoid", "--no-sandbox"]);
+        assert!(
+            result.is_err(),
+            "`--paranoid` + `--no-sandbox` must conflict at parse"
+        );
+
+        let result = Cli::try_parse_from(["lpm", "rebuild", "--strict-sandbox", "--paranoid"]);
+        assert!(
+            result.is_err(),
+            "`--strict-sandbox` + `--paranoid` (same intent) must conflict at parse"
+        );
+    }
+
+    #[test]
+    fn rebuild_strict_sandbox_alias_paranoid_parses() {
+        let cli = Cli::try_parse_from(["lpm", "rebuild", "--strict-sandbox"])
+            .expect("--strict-sandbox should parse");
+        match cli.command.expect("test parse missing subcommand") {
+            Commands::Rebuild {
+                strict_sandbox,
+                paranoid,
+                ..
+            } => {
+                assert!(strict_sandbox);
+                assert!(!paranoid);
+            }
+            _ => panic!("expected Rebuild command"),
+        }
+
+        let cli = Cli::try_parse_from(["lpm", "rebuild", "--paranoid"])
+            .expect("--paranoid (alias) should parse");
+        match cli.command.expect("test parse missing subcommand") {
+            Commands::Rebuild {
+                strict_sandbox,
+                paranoid,
+                ..
+            } => {
+                assert!(!strict_sandbox);
+                assert!(paranoid);
+            }
+            _ => panic!("expected Rebuild command"),
+        }
+    }
+
+    #[test]
+    fn install_sandbox_mode_flags_parse() {
+        // Phase 46.1 rework: install gains the same trio. Strict and
+        // paranoid are aliases; both conflict with --no-sandbox.
+        let cli = Cli::try_parse_from(["lpm", "install", "--strict-sandbox"])
+            .expect("`lpm install --strict-sandbox` should parse");
+        match cli.command.expect("test parse missing subcommand") {
+            Commands::Install {
+                strict_sandbox,
+                paranoid,
+                no_sandbox,
+                ..
+            } => {
+                assert!(strict_sandbox);
+                assert!(!paranoid);
+                assert!(!no_sandbox);
+            }
+            _ => panic!("expected Install command"),
+        }
+
+        let cli = Cli::try_parse_from(["lpm", "install", "--paranoid"])
+            .expect("`lpm install --paranoid` should parse");
+        match cli.command.expect("test parse missing subcommand") {
+            Commands::Install {
+                strict_sandbox,
+                paranoid,
+                ..
+            } => {
+                assert!(!strict_sandbox);
+                assert!(paranoid);
+            }
+            _ => panic!("expected Install command"),
+        }
+
+        let cli = Cli::try_parse_from(["lpm", "install", "--no-sandbox"])
+            .expect("`lpm install --no-sandbox` should parse standalone");
+        match cli.command.expect("test parse missing subcommand") {
+            Commands::Install { no_sandbox, .. } => {
+                assert!(no_sandbox);
+            }
+            _ => panic!("expected Install command"),
+        }
+
+        // Conflicts at parse.
+        assert!(
+            Cli::try_parse_from(["lpm", "install", "--strict-sandbox", "--no-sandbox"]).is_err()
+        );
+        assert!(Cli::try_parse_from(["lpm", "install", "--paranoid", "--no-sandbox"]).is_err());
+        assert!(Cli::try_parse_from(["lpm", "install", "--strict-sandbox", "--paranoid"]).is_err());
     }
 
     #[test]

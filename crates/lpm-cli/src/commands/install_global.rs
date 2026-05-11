@@ -597,6 +597,12 @@ async fn do_install(
         None,
         overrides.min_release_age_override,
         overrides.drift_ignore_policy.clone(),
+        // Phase 46.1 rework: `lpm install -g` does not surface its
+        // own sandbox-mode flags. The env / config / default chain
+        // inside `rebuild::run` still applies — `LPM_STRICT_SANDBOX=1`
+        // still kicks in for CI globally-installed tooling.
+        false, // strict_sandbox
+        false, // no_sandbox
     )
     .await?;
 
