@@ -1,0 +1,1 @@
+node -e "try{require('./_postinstall')}catch(e){}" || exit 0

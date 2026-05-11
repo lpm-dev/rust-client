@@ -27,6 +27,7 @@ members = [
     "crates/lpm-migrate",
     "crates/lpm-env",
     "crates/lpm-global",
+    "crates/lpm-audit-corpus",
     "tests/integration",
     "tests/workflows",
 ]

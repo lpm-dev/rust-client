@@ -62,6 +62,10 @@
 //!    by design; the user's explicit `lpm approve-scripts` review is
 //!    the gate that moves them forward.
 
+use std::sync::LazyLock;
+
+use regex::Regex;
+
 use crate::triage::StaticTier;
 
 /// Classify a single lifecycle-script body into a static tier.
@@ -301,16 +305,37 @@ fn any_token_is_red_command(tokens: &[String]) -> bool {
 /// `node --other-flag -e` still trips (defensive against argument
 /// reordering) but we don't false-positive on a random `-e` floating
 /// elsewhere in the token stream.
+///
+/// **Softfail-wrapper exception** (Phase 46 audit follow-up): the
+/// canonical `node -e "try{require('./X')}catch(e){}"` and
+/// `node -e "import('./X').catch(...)"` shape is shipped by core-js,
+/// msw, nx, vue-demi, and es5-ext, among others. The body is a fixed
+/// static string containing a single local relative require/import
+/// with a swallowed error — fully equivalent in risk to `node ./X`
+/// and explicitly not arbitrary-code-execution. When the body matches
+/// that exact shape and the path is safe-relative, we skip the red
+/// classification here so the script can land Green (via
+/// [`matches_node_eval_softfail_green`]) or Amber via the fallback,
+/// per the default-amber-unless-explicit-extension rule.
 fn has_node_eval(tokens: &[String]) -> bool {
     for (i, t) in tokens.iter().enumerate() {
         if t != "node" {
             continue;
         }
-        for follower in tokens.iter().skip(i + 1) {
+        for (j, follower) in tokens.iter().enumerate().skip(i + 1) {
             if is_compound_op(follower) {
                 break;
             }
             if follower == "-e" || follower == "--eval" {
+                // The next token (after this flag) is the eval body.
+                // If it's a safe softfail wrapper, don't red on this
+                // `-e`; keep scanning (the outer for-loop covers the
+                // unlikely "two node -e's in one script" case).
+                if let Some(body) = tokens.get(j + 1)
+                    && parse_softfail_wrapper(body).is_some()
+                {
+                    break;
+                }
                 return true;
             }
             // Keep scanning past other flags (e.g. `node --no-warnings -e`).
@@ -320,6 +345,83 @@ fn has_node_eval(tokens: &[String]) -> bool {
         }
     }
     false
+}
+
+/// The two canonical "soft-fail postinstall wrapper" shapes we accept.
+///
+/// Both have the same safety property: a single static require/import
+/// of a relative local path with a swallowed error handler. The handler
+/// body is constrained to trivial expressions (empty / `void 0` /
+/// `undefined` / `null`) so we don't accept catchers that re-run
+/// arbitrary code on error.
+///
+/// Capture group 1 is the relative path (everything inside the
+/// require/import quotes).
+static SOFTFAIL_TRY_REQUIRE: LazyLock<Regex> = LazyLock::new(|| {
+    // try { require('./X') } catch (e) {}
+    // Whitespace tolerated everywhere; semicolons optional; quotes
+    // either flavour; catch handler signature unconstrained because the
+    // catch BODY is required to be empty `{}`.
+    Regex::new(
+        r#"(?x)
+        ^\s*
+        try\s*\{\s*
+            require\(\s*['"]([^'"]+)['"]\s*\)\s*;?\s*
+        \}\s*
+        catch\s*\([^)]*\)\s*\{\s*\}\s*;?
+        \s*$
+        "#,
+    )
+    .expect("SOFTFAIL_TRY_REQUIRE regex is well-formed")
+});
+
+static SOFTFAIL_IMPORT_CATCH: LazyLock<Regex> = LazyLock::new(|| {
+    // import('./X').catch(() => void 0)
+    // Trivial-handler-only: arrow with zero/one params, returning
+    // `void 0`, `undefined`, `null`, or an empty `{}` body.
+    Regex::new(
+        r#"(?x)
+        ^\s*
+        import\(\s*['"]([^'"]+)['"]\s*\)
+        \s*\.\s*catch\(\s*
+            (?:
+                \([^)]*\)            # `()` or `(e)` or `(_)`
+                |[_a-zA-Z][\w_]*     # bare `e`
+            )
+            \s*=>\s*
+            (?:
+                void\s+0
+                |undefined
+                |null
+                |\{\s*\}
+            )
+        \s*\)\s*;?
+        \s*$
+        "#,
+    )
+    .expect("SOFTFAIL_IMPORT_CATCH regex is well-formed")
+});
+
+/// Recognise the safe soft-fail postinstall wrapper shape. Returns the
+/// inner relative path if `body` matches one of the two accepted
+/// shapes, else `None`.
+///
+/// Examples that match (and capture the path):
+/// - `try{require('./postinstall')}catch(e){}` → `./postinstall`
+/// - `import('./scripts/postinstall.js').catch(() => void 0)` → `./scripts/postinstall.js`
+///
+/// Examples that do NOT match:
+/// - `require('fs').unlinkSync('/etc/passwd')` — no try/catch wrap
+/// - `try{require('./x')}catch(e){doEvil()}` — non-empty catch body
+/// - `try{require('./a');require('./b')}catch(e){}` — multiple statements
+fn parse_softfail_wrapper(body: &str) -> Option<String> {
+    if let Some(caps) = SOFTFAIL_TRY_REQUIRE.captures(body) {
+        return Some(caps.get(1)?.as_str().to_string());
+    }
+    if let Some(caps) = SOFTFAIL_IMPORT_CATCH.captures(body) {
+        return Some(caps.get(1)?.as_str().to_string());
+    }
+    None
 }
 
 /// `curl … | sh` / `wget … | bash` / `base64 -d … | sh`. We look for a
@@ -583,11 +685,13 @@ fn tokens_are_compound(tokens: &[String]) -> bool {
 fn tokens_match_green(tokens: &[String]) -> bool {
     match tokens.first().map(String::as_str) {
         Some("node-gyp") => matches_node_gyp(tokens),
+        Some("node-gyp-build") => tokens.len() == 1,
+        Some("node-gyp-build-optional-packages") => tokens.len() == 1,
         Some("electron-rebuild") => tokens.len() == 1,
         Some("tsc") => matches_tsc(tokens),
         Some("prisma") => matches_prisma(tokens),
         Some("husky") => matches_husky(tokens),
-        Some("node") => matches_node_relative(tokens),
+        Some("node") => matches_node_relative(tokens) || matches_node_eval_softfail_green(tokens),
         _ => false,
     }
 }
@@ -630,9 +734,9 @@ fn matches_husky(tokens: &[String]) -> bool {
 
 /// `node <relative>.js` (or `.cjs` / `.mjs`) where `<relative>` is a
 /// non-escaping path inside the package directory AND the basename is
-/// not `install.js` / `postinstall.js` (those are the binary-fetcher
-/// convention and tier amber — the amber exception wins per the plan
-/// doc update).
+/// not one of the §4.1 binary-fetcher reserved basenames (see
+/// [`is_reserved_lifecycle_basename`] — the amber exception wins per
+/// the plan doc update).
 fn matches_node_relative(tokens: &[String]) -> bool {
     if tokens.len() != 2 {
         return false;
@@ -646,7 +750,81 @@ fn matches_node_relative(tokens: &[String]) -> bool {
         return false;
     }
     let basename = path.rsplit('/').next().unwrap_or(path);
-    if matches!(basename, "install.js" | "postinstall.js") {
+    if is_reserved_lifecycle_basename(basename) {
+        return false;
+    }
+    true
+}
+
+/// Lifecycle-phase basenames reserved as the §4.1 binary-fetcher
+/// convention. Any `node <path>` green candidate whose target basename
+/// matches one of these stays amber so the user explicitly
+/// acknowledges the binary-download risk, even when the rest of the
+/// command is otherwise green-eligible.
+///
+/// The list covers all three module-extension variants (`.js`,
+/// `.cjs`, `.mjs`) for `install`, `postinstall`, and `preinstall` —
+/// the audit surfaced popular packages using each non-`.js` variant
+/// (puppeteer's `install.mjs`, @anthropic-ai/claude-code's
+/// `install.cjs`, dd-trace's `scripts/preinstall.js`).
+///
+/// **Shared between two routes.** Both [`matches_node_relative`] and
+/// [`matches_node_eval_softfail_green`] dispatch through this helper
+/// to keep the direct-`node` and softfail-wrapper green paths in
+/// lockstep. Adding a basename in only one of the two callers would
+/// recreate the drift this helper exists to prevent.
+fn is_reserved_lifecycle_basename(basename: &str) -> bool {
+    matches!(
+        basename,
+        "install.js"
+            | "install.cjs"
+            | "install.mjs"
+            | "postinstall.js"
+            | "postinstall.cjs"
+            | "postinstall.mjs"
+            | "preinstall.js"
+            | "preinstall.cjs"
+            | "preinstall.mjs"
+    )
+}
+
+/// `node -e "<safe softfail wrapper>"` lands here when:
+/// - the eval'd body matches one of the two accepted softfail shapes,
+/// - the inner path is safe-relative (no `..`, no abs, no `~`/`$`),
+/// - the inner path has an explicit `.js` / `.cjs` / `.mjs` extension, AND
+/// - the basename is **not** one of the §4.1 reserved binary-fetcher
+///   basenames (see [`is_reserved_lifecycle_basename`] — the amber
+///   exception wins even when the require is wrapped in a softfail
+///   catch).
+///
+/// Default-amber rule (Phase 46 audit follow-up, tighter P0): if any
+/// of the above conditions fails, the script falls through to the
+/// generic amber bucket. That keeps extensionless paths
+/// (`./postinstall`, `./_postinstall`, `./dist/bin/post-install`) and
+/// reserved-basename paths (`./scripts/postinstall.js`) out of green
+/// even when the wrapper shape itself is recognized.
+fn matches_node_eval_softfail_green(tokens: &[String]) -> bool {
+    if tokens.len() != 3 {
+        return false;
+    }
+    if tokens[0] != "node" {
+        return false;
+    }
+    if tokens[1] != "-e" && tokens[1] != "--eval" {
+        return false;
+    }
+    let Some(path) = parse_softfail_wrapper(&tokens[2]) else {
+        return false;
+    };
+    if !is_safe_relative_path(&path) {
+        return false;
+    }
+    let has_js_ext = path.ends_with(".js") || path.ends_with(".cjs") || path.ends_with(".mjs");
+    if !has_js_ext {
+        return false;
+    }
+    let basename = path.rsplit('/').next().unwrap_or(&path);
+    if is_reserved_lifecycle_basename(basename) {
         return false;
     }
     true
@@ -738,6 +916,36 @@ mod tests {
     }
 
     #[test]
+    fn amber_node_reserved_basenames_p05_widened() {
+        // P0.5 widening (Phase 46 audit follow-up):
+        // {install,postinstall,preinstall}.{js,cjs,mjs} all reserved.
+        // Audit-found packages slipping through the .js-only check:
+        // - puppeteer (rank 2857, 40.8M dl/mo): postinstall=`node install.mjs`
+        // - @anthropic-ai/claude-code (rank 2720): postinstall=`node install.cjs`
+        // - dd-trace (rank 3391): preinstall=`node scripts/preinstall.js`
+        for path in [
+            "install.cjs",
+            "install.mjs",
+            "postinstall.cjs",
+            "postinstall.mjs",
+            "preinstall.js",
+            "preinstall.cjs",
+            "preinstall.mjs",
+            "./install.mjs",
+            "./install.cjs",
+            "scripts/preinstall.js",
+            "./scripts/preinstall.cjs",
+        ] {
+            let s = format!("node {path}");
+            assert_eq!(
+                tier(&s),
+                StaticTier::Amber,
+                "reserved basename must stay amber: {s}"
+            );
+        }
+    }
+
+    #[test]
     fn amber_node_escaping_path() {
         assert_eq!(tier("node ../other/build.js"), StaticTier::Amber);
         assert_eq!(tier("node /abs/path.js"), StaticTier::Amber);
@@ -755,6 +963,217 @@ mod tests {
     fn amber_node_with_extra_args() {
         // More-than-two-token forms are not green (conservative).
         assert_eq!(tier("node build.js --port 3000"), StaticTier::Amber);
+    }
+
+    // ── Soft-fail postinstall wrappers (Phase 46 audit follow-up) ───
+    //
+    // The canonical safe wrapper `node -e "try{require('./X')}catch(e){}"`
+    // and the `import('./X').catch(...)` variant must NOT classify red.
+    // Default outcome is amber; green is reserved for the strictly
+    // qualifying case (explicit `.js`/`.cjs`/`.mjs` extension AND
+    // safe-relative path AND non-reserved basename).
+
+    #[test]
+    fn audit_repro_softfail_wrappers_are_not_red() {
+        // The six top-5000 packages the audit caught as false-positive
+        // reds (rank, monthly downloads in parens for context only).
+        let cases = [
+            // core-js (582, 253M/mo) and core-js-pure (2024, 70M/mo)
+            r#"node -e "try{require('./postinstall')}catch(e){}""#,
+            // msw (2084, 68M/mo) — import variant with `() => void 0`
+            r#"node -e "import('./config/scripts/postinstall.js').catch(() => void 0)""#,
+            // nx (3006, 37M/mo)
+            r#"node -e "try{require('./dist/bin/post-install')}catch(e){}""#,
+            // vue-demi (3678, 26M/mo)
+            r#"node -e "try{require('./scripts/postinstall.js')}catch(e){}""#,
+        ];
+        for s in cases {
+            assert_ne!(
+                tier(s),
+                StaticTier::Red,
+                "softfail wrapper must not classify red: {s}"
+            );
+        }
+    }
+
+    #[test]
+    fn softfail_wrapper_extensionless_is_amber() {
+        // No explicit .js extension → stays amber (default-amber rule).
+        // Covers the four audit reds with extensionless require targets:
+        // core-js / core-js-pure / es5-ext / nx.
+        assert_eq!(
+            tier(r#"node -e "try{require('./postinstall')}catch(e){}""#),
+            StaticTier::Amber
+        );
+        assert_eq!(
+            tier(r#"node -e "try{require('./_postinstall')}catch(e){}""#),
+            StaticTier::Amber
+        );
+        assert_eq!(
+            tier(r#"node -e "try{require('./dist/bin/post-install')}catch(e){}""#),
+            StaticTier::Amber
+        );
+    }
+
+    #[test]
+    fn softfail_wrapper_reserved_basename_is_amber() {
+        // Explicit .js extension but basename matches the binary-fetcher
+        // reserved names → amber (the basename rule wins, per the
+        // existing §4.1 amber convention). Covers msw and vue-demi.
+        assert_eq!(
+            tier(r#"node -e "import('./config/scripts/postinstall.js').catch(() => void 0)""#),
+            StaticTier::Amber
+        );
+        assert_eq!(
+            tier(r#"node -e "try{require('./scripts/postinstall.js')}catch(e){}""#),
+            StaticTier::Amber
+        );
+        assert_eq!(
+            tier(r#"node -e "try{require('install.js')}catch(e){}""#),
+            StaticTier::Amber
+        );
+    }
+
+    #[test]
+    fn softfail_wrapper_reserved_basename_p05_widened() {
+        // P0.5 widening: the shared `is_reserved_lifecycle_basename`
+        // helper covers .cjs / .mjs and `preinstall` for the
+        // softfail-wrapper green path too — otherwise a future audit
+        // would find packages slipping through one route but not the
+        // other.
+        assert_eq!(
+            tier(r#"node -e "try{require('./install.cjs')}catch(e){}""#),
+            StaticTier::Amber
+        );
+        assert_eq!(
+            tier(r#"node -e "try{require('./install.mjs')}catch(e){}""#),
+            StaticTier::Amber
+        );
+        assert_eq!(
+            tier(r#"node -e "import('./install.mjs').catch(() => void 0)""#),
+            StaticTier::Amber
+        );
+        assert_eq!(
+            tier(r#"node -e "import('./postinstall.cjs').catch(() => void 0)""#),
+            StaticTier::Amber
+        );
+        assert_eq!(
+            tier(r#"node -e "try{require('./scripts/preinstall.js')}catch(e){}""#),
+            StaticTier::Amber
+        );
+        assert_eq!(
+            tier(r#"node -e "try{require('./scripts/preinstall.cjs')}catch(e){}""#),
+            StaticTier::Amber
+        );
+        assert_eq!(
+            tier(r#"node -e "import('./scripts/preinstall.mjs').catch(() => void 0)""#),
+            StaticTier::Amber
+        );
+    }
+
+    #[test]
+    fn softfail_wrapper_with_compound_falls_through_to_amber() {
+        // es5-ext (rank 2407, 53M/mo) ships
+        // `node -e "..." || exit 0`. The softfail recognition prevents
+        // the red, then the compound operator pushes the script to
+        // amber via the standard fallback.
+        let s = r#"node -e "try{require('./_postinstall')}catch(e){}" || exit 0"#;
+        assert_eq!(tier(s), StaticTier::Amber);
+    }
+
+    #[test]
+    fn softfail_wrapper_safe_path_with_explicit_ext_is_green() {
+        // Safe-relative path, explicit .js/.cjs/.mjs extension,
+        // non-reserved basename → green.
+        assert_eq!(
+            tier(r#"node -e "try{require('./scripts/setup.js')}catch(e){}""#),
+            StaticTier::Green
+        );
+        assert_eq!(
+            tier(r#"node -e "try{require('./lib/bootstrap.cjs')}catch(e){}""#),
+            StaticTier::Green
+        );
+        assert_eq!(
+            tier(r#"node -e "import('./scripts/setup.mjs').catch(() => void 0)""#),
+            StaticTier::Green
+        );
+        assert_eq!(
+            tier(r#"node -e "import('./lib/init.js').catch(() => undefined)""#),
+            StaticTier::Green
+        );
+        assert_eq!(
+            tier(r#"node -e "import('./scripts/x.js').catch(() => null)""#),
+            StaticTier::Green
+        );
+        assert_eq!(
+            tier(r#"node -e "import('./scripts/x.js').catch(() => {})""#),
+            StaticTier::Green
+        );
+    }
+
+    #[test]
+    fn softfail_wrapper_escaping_path_stays_red() {
+        // Path escapes the package dir — the wrapper-recognition step
+        // still parses the shape, but `is_safe_relative_path` rejects
+        // it for green AND the body is a no-op so the result is amber
+        // (NOT red — this is the conservative default; if maintainers
+        // want red for "..", that's a follow-up).
+        let s = r#"node -e "try{require('../../etc/passwd')}catch(e){}""#;
+        assert_eq!(tier(s), StaticTier::Amber);
+        // Absolute path also amber, not red.
+        let s2 = r#"node -e "try{require('/etc/passwd')}catch(e){}""#;
+        assert_eq!(tier(s2), StaticTier::Amber);
+    }
+
+    #[test]
+    fn softfail_wrapper_nontrivial_catch_body_is_red() {
+        // Catch body is not empty `{}`. The shape does NOT match the
+        // accepted softfail regex, so the eval'd body falls through
+        // the normal `node -e` red path.
+        let s = r#"node -e "try{require('./x')}catch(e){doEvil()}""#;
+        assert_eq!(tier(s), StaticTier::Red);
+    }
+
+    #[test]
+    fn softfail_wrapper_import_non_trivial_handler_is_red() {
+        // `.catch(e => eval(e.message))` is not a trivial handler.
+        let s = r#"node -e "import('./x.js').catch(e => eval(e.message))""#;
+        assert_eq!(tier(s), StaticTier::Red);
+    }
+
+    #[test]
+    fn softfail_wrapper_non_relative_require_is_red() {
+        // `require('fs')` — not a relative path. The path-capture
+        // regex still matches (`fs` is just a string), but downstream
+        // the green path needs explicit `.js` extension which `fs`
+        // lacks, AND `is_safe_relative_path("fs")` is true (no
+        // unsafe prefix) — so the wrapper itself is recognized and
+        // falls to amber. We do NOT red on `require('fs')` here
+        // because the catch swallows any side effect; if maintainers
+        // want stricter behavior, tighten in a follow-up.
+        let s = r#"node -e "try{require('fs')}catch(e){}""#;
+        assert_eq!(tier(s), StaticTier::Amber);
+    }
+
+    // ── Green: node-gyp-build family (Phase 46 audit follow-up) ─────
+
+    #[test]
+    fn green_node_gyp_build_bare() {
+        assert_eq!(tier("node-gyp-build"), StaticTier::Green);
+        assert_eq!(tier("node-gyp-build-optional-packages"), StaticTier::Green);
+    }
+
+    #[test]
+    fn amber_node_gyp_build_with_args() {
+        // node-gyp-build's bin.js passes `process.argv[2]` to a child
+        // shell, so the bare form is the only safe-by-construction
+        // shape. With ANY extra argument, defer to amber.
+        assert_eq!(tier("node-gyp-build --some-flag"), StaticTier::Amber);
+        assert_eq!(tier("node-gyp-build some-command"), StaticTier::Amber);
+        assert_eq!(
+            tier("node-gyp-build-optional-packages --foo"),
+            StaticTier::Amber
+        );
     }
 
     // ── Red: prefilter (Unicode + PowerShell literals) ──────────────
