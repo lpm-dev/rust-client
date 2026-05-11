@@ -25,6 +25,17 @@ impl MockRegistry {
         MockRegistry { server }
     }
 
+    /// Adopt an already-started `MockServer`. Used by tests that
+    /// need control over the wiremock listener — e.g. binding
+    /// explicitly to `127.0.0.1` for the Phase 46.1 loopback-
+    /// network-denial test, where the IP-level bind interface is
+    /// part of the assertion contract. For the common case where
+    /// the listener can be auto-allocated, prefer
+    /// [`MockRegistry::start`] (one less moving part to set up).
+    pub fn from_server(server: MockServer) -> Self {
+        MockRegistry { server }
+    }
+
     /// The base URL of the mock server (e.g., `http://127.0.0.1:PORT`).
     pub fn url(&self) -> String {
         self.server.uri()

@@ -2350,8 +2350,18 @@ fn count_suspended_approvals_in_cwd() -> Option<usize> {
 /// Probe the sandbox backend for `SandboxMode::Enforce` on this
 /// platform. Runs in-memory (macOS) or via a single benign
 /// landlock ruleset-create syscall (Linux); no persistent I/O.
+///
+/// Phase 46.1: the probe loads the user's `[sandbox] allow-degraded`
+/// config (project lpm.toml + global ~/.lpm/config.toml — same
+/// chain the install pipeline uses) so the doctor surface reports
+/// the SAME posture the next `lpm install` will actually
+/// construct. Without that, a user who opted into degraded posture
+/// on a kernel < 6.7 would see "strict / fail" in doctor while
+/// their installs silently run under V1 (or vice-versa).
 fn probe_sandbox_backend() -> Check {
-    use lpm_sandbox::{SandboxError, SandboxMode, SandboxSpec, new_for_platform};
+    use lpm_sandbox::{
+        SandboxError, SandboxMode, SandboxPosture, SandboxSpec, new_for_platform_with_options,
+    };
 
     let tmpdir = std::env::temp_dir();
     let home = dirs::home_dir().unwrap_or_else(|| tmpdir.clone());
@@ -2370,15 +2380,104 @@ fn probe_sandbox_backend() -> Check {
         extra_write_dirs: Vec::new(),
     };
 
-    match new_for_platform(spec, SandboxMode::Enforce) {
-        Ok(sb) => Check::pass(
-            &doctor_catalog::SANDBOX_AVAILABLE,
-            &format!(
-                "{} available on {} — lifecycle scripts run under Enforce mode",
-                sb.backend_name(),
-                std::env::consts::OS,
-            ),
-        ),
+    // Phase 46.1: load the `[sandbox] allow-degraded` knob from
+    // `<cwd>/lpm.toml` + `~/.lpm/config.toml`. The project-side read
+    // uses the current working directory — that's what `lpm doctor`
+    // is reporting on, and matches the install pipeline's
+    // resolution against the same directory.
+    //
+    // A failed config load surfaces as `sandbox_probe_failed`
+    // EXPLICITLY rather than getting silently defaulted to strict.
+    // A broken `lpm.toml` / `~/.lpm/config.toml` makes the real
+    // install fail at config-load time; doctor's job is to surface
+    // that on the same machine, NOT to hide it behind a default-
+    // strict posture the install will never actually reach. Only
+    // `current_dir()` failing (no cwd resolvable, e.g. running
+    // from a deleted directory) falls back to the strict default —
+    // there's no config to parse in that case.
+    let sandbox_options = match std::env::current_dir() {
+        // Phase 46.1 rework: route through the precedence chain so
+        // `LPM_STRICT_SANDBOX=1` and `[sandbox] mode` flow through
+        // the doctor probe identically to the install pipeline.
+        Ok(cwd) => match crate::sandbox_config::resolve_sandbox_mode_from_chain(&cwd, false, false)
+            .map(|(opts, _)| opts)
+        {
+            Ok(opts) => opts,
+            Err(e) => {
+                return Check::fail(
+                    &doctor_catalog::SANDBOX_PROBE_FAILED,
+                    &format!(
+                        "could not load sandbox config: {e}. Doctor refuses to default \
+                         this to strict — the same broken config will fail your next \
+                         `lpm install`. Fix `lpm.toml` / `~/.lpm/config.toml` and re-run."
+                    ),
+                );
+            }
+        },
+        Err(_) => lpm_sandbox::SandboxOptions::default(),
+    };
+
+    match new_for_platform_with_options(spec, SandboxMode::Enforce, sandbox_options) {
+        Ok(sb) => {
+            let backend = sb.backend_name();
+            let os = std::env::consts::OS;
+            match sb.posture() {
+                SandboxPosture::Default => Check::pass(
+                    &doctor_catalog::SANDBOX_AVAILABLE,
+                    &format!(
+                        "{backend} available on {os} — default mode: filesystem-write \
+                         containment + env scrubbing, outbound network ALLOWED. Enable \
+                         strict mode (also denies outbound network) via \
+                         `lpm config sandbox --set strict`, `--strict-sandbox` per-command, \
+                         or `LPM_STRICT_SANDBOX=1` in env."
+                    ),
+                ),
+                SandboxPosture::Strict => {
+                    // Phase 46.1: network-denial coverage is
+                    // platform-asymmetric. macOS Seatbelt's
+                    // `(deny default)` covers every socket family
+                    // unconditionally; Linux landlock V4 only
+                    // handles BindTcp + ConnectTcp, so UDP / raw /
+                    // AF_PACKET / DNS-via-UDP are NOT denied until
+                    // Phase 46.1.1's seccomp-bpf layer lands.
+                    let net_coverage = if os == "macos" {
+                        "full outbound network denial (all socket families)"
+                    } else {
+                        "outbound TCP denial (BindTcp + ConnectTcp via landlock V4 — \
+                         UDP / raw / AF_PACKET / DNS-via-UDP NOT denied until Phase 46.1.1)"
+                    };
+                    Check::pass(
+                        &doctor_catalog::SANDBOX_AVAILABLE,
+                        &format!(
+                            "{backend} available on {os} — strict mode: enforces \
+                             filesystem-write containment + {net_coverage}"
+                        ),
+                    )
+                }
+                SandboxPosture::Degraded {
+                    kernel,
+                    abi,
+                    missing,
+                } => Check::warn(
+                    &doctor_catalog::SANDBOX_DEGRADED,
+                    &format!(
+                        "{backend} available on {os} — DEGRADED posture (kernel {kernel}, \
+                         landlock {abi}); user requested strict but kernel can't deliver \
+                         V4; enforces filesystem only, missing={missing}. Upgrade the \
+                         kernel to 6.7+ to restore strict containment, or switch to \
+                         `lpm config sandbox --set default` to drop the strict request \
+                         and silence this warning."
+                    ),
+                ),
+                SandboxPosture::Disabled => Check::warn(
+                    &doctor_catalog::SANDBOX_AVAILABLE,
+                    &format!(
+                        "{backend} returned Disabled posture on {os} — unexpected for \
+                         SandboxMode::Enforce. File an issue with `lpm doctor --json` output."
+                    ),
+                ),
+            }
+        }
         Err(SandboxError::UnsupportedPlatform {
             platform,
             remediation,
@@ -2458,10 +2557,13 @@ mod tests {
     fn sandbox_probe_emits_known_code() {
         // Pin the codes the sandbox probe is allowed to emit so the
         // automation contract for this check stays stable across
-        // platforms / refactors.
+        // platforms / refactors. Phase 46.1 adds `sandbox_degraded`
+        // for the V1-fallback path; the other four codes are
+        // pre-existing.
         let c = probe_sandbox_backend();
         let allowed = [
             "sandbox_available",
+            "sandbox_degraded",
             "sandbox_unsupported_platform",
             "sandbox_kernel_too_old",
             "sandbox_probe_failed",

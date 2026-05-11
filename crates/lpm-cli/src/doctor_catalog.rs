@@ -1165,10 +1165,28 @@ pub static SANDBOX_AVAILABLE: CheckEntry = CheckEntry {
     code: "sandbox_available",
     name: "Sandbox",
     category: Category::Sandbox,
-    description: "The OS sandbox backend used by lifecycle scripts is available.",
-    when_fires: "Seatbelt (macOS) or Landlock (Linux) is reachable on this host.",
+    description: "The OS sandbox backend used by lifecycle scripts is available with the Phase 46.1 strict posture: filesystem-write containment plus outbound network denial (full denial on macOS Seatbelt; TCP-only via landlock V4 on Linux until Phase 46.1.1's seccomp-bpf layer closes the UDP / raw / DNS gap).",
+    when_fires: "Seatbelt (macOS) or Landlock V4 (Linux 6.7+) is reachable on this host and Phase 46.1 outbound network denial is enforced for the available socket families.",
     remediation: "No action — informational pass.",
     possible_severities: &[Severity::Pass],
+    auto_fix: None,
+};
+
+/// Phase 46.1 doctor surface: the sandbox is available but running
+/// in the degraded posture (landlock V1 fallback, filesystem-only).
+/// Distinct catalog entry from [`SANDBOX_AVAILABLE`] so JSON
+/// consumers can detect "containment partially enforced" without
+/// parsing the detail prose. Severity is `Warn`: the user opted into
+/// degradation, so this is not a failure — but it IS a posture they
+/// should be aware of on every doctor run.
+pub static SANDBOX_DEGRADED: CheckEntry = CheckEntry {
+    code: "sandbox_degraded",
+    name: "Sandbox",
+    category: Category::Sandbox,
+    description: "The sandbox is running in the Phase 46.1 degraded posture (landlock V1 fallback). Filesystem containment is active, outbound network denial is NOT enforced.",
+    when_fires: "User has set `[sandbox] allow-degraded = true` AND the host kernel is below the landlock V4 floor (6.7).",
+    remediation: "Upgrade the host kernel to 6.7+ and unset `[sandbox] allow-degraded` to restore strict containment, or accept the degraded posture knowingly.",
+    possible_severities: &[Severity::Warn],
     auto_fix: None,
 };
 
@@ -1176,9 +1194,9 @@ pub static SANDBOX_KERNEL_TOO_OLD: CheckEntry = CheckEntry {
     code: "sandbox_kernel_too_old",
     name: "Sandbox",
     category: Category::Sandbox,
-    description: "Linux kernel is too old to support Landlock at the required ABI.",
-    when_fires: "Landlock probe failed because of an outdated kernel.",
-    remediation: "Upgrade the kernel, or accept that lifecycle scripts run unsandboxed.",
+    description: "Linux kernel is too old to support Landlock at the Phase 46.1 strict floor (V4 / kernel 6.7+).",
+    when_fires: "Landlock probe failed against the strict-default V4 floor. Phase 46.1 refuses to run lifecycle scripts on kernels below this floor unless the user has explicitly opted into the degraded posture.",
+    remediation: "Pick one: (1) `[sandbox] allow-degraded = true` in `~/.lpm/config.toml` or `./lpm.toml` for the V1 filesystem-only fallback (no outbound network containment); (2) add the package to `package.json > lpm > trustedDependencies` to skip the sandbox for that dependency; (3) `--unsafe-full-env --no-sandbox` to skip wholesale; (4) upgrade the host kernel to 6.7+.",
     possible_severities: &[Severity::Warn],
     auto_fix: None,
 };
@@ -1440,6 +1458,7 @@ pub static CLI_CATALOG: &[&CheckEntry] = &[
     &GLOBAL_INSTALL_ROOTS_UNHEALTHY,
     // Sandbox + script policy
     &SANDBOX_AVAILABLE,
+    &SANDBOX_DEGRADED,
     &SANDBOX_KERNEL_TOO_OLD,
     &SANDBOX_UNSUPPORTED_PLATFORM,
     &SANDBOX_PROBE_FAILED,
