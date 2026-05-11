@@ -248,16 +248,36 @@ async fn run_with_stdin(
         })?;
 
     // Write the prompt to stdin, then close so the child sees EOF.
+    // BOTH layers of the spawn-await are checked:
+    //   1. JoinError on the task itself (panics, runtime issues)
+    //   2. The actual I/O Result from `write_all` + `shutdown`
+    // Without checking layer 2, a provider that closes stdin early
+    // (auth rejection on first byte, broken pipe) would look like a
+    // successful prompt send — the advisor would then read zero
+    // input, produce nothing useful, and the parser might still find
+    // SOMETHING. Treat any stdin write failure as recoverable
+    // environment-not-ready so the install-time path degrades to
+    // advisor=none with a one-line warning rather than silently
+    // running a partial-prompt classification.
     if let Some(mut stdin) = child.stdin.take() {
         let to_write = stdin_input.to_string();
         let write_handle = tokio::spawn(async move {
             stdin.write_all(to_write.as_bytes()).await?;
             stdin.shutdown().await
         });
-        if let Err(e) = write_handle.await {
-            return Err(AdvisorFailure::IntegrationFailure(format!(
-                "stdin write task join: {e}"
-            )));
+        match write_handle.await {
+            Err(e) => {
+                return Err(AdvisorFailure::IntegrationFailure(format!(
+                    "stdin write task join: {e}"
+                )));
+            }
+            Ok(Err(e)) => {
+                return Err(AdvisorFailure::EnvironmentNotReady(format!(
+                    "stdin write to {cmd} failed: {e} \
+                     (provider may have closed stdin early — check auth / daemon state)"
+                )));
+            }
+            Ok(Ok(())) => {}
         }
     }
 
@@ -269,8 +289,16 @@ async fn run_with_stdin(
             )));
         }
         Err(_) => {
-            return Err(AdvisorFailure::EnvironmentNotReady(format!(
-                "{cmd} timed out after {}s",
+            // Timeouts are an INTEGRATION failure, not environment.
+            // The save-anyway path is reserved for recoverable setup
+            // problems (auth missing, model not pulled). A provider
+            // that hangs past the invocation timeout has a broken
+            // contract — persisting that config would mean every
+            // install run incurs the same wall-time hang. The wizard
+            // refuses to save; the operator must investigate.
+            return Err(AdvisorFailure::IntegrationFailure(format!(
+                "{cmd} timed out after {}s (no verdict produced; \
+                 hung or broken adapter — refusing to persist this advisor choice)",
                 timeout.as_secs()
             )));
         }

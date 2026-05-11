@@ -91,11 +91,58 @@ fn provider_binary_name(provider: Provider) -> &'static str {
 
 /// Standard `which`-style PATH walk. Skipped if PATH is unset (rare
 /// but real on minimal CI runners).
+///
+/// On Windows the file shipped on PATH is normally `<name>.exe` (or
+/// `.cmd`), not the bare `<name>` that `Command::new(name)` will
+/// resolve via the loader. This walker mirrors the loader: try the
+/// bare name first, then each `PATHEXT` extension. Without this, the
+/// wizard would hide all three advisors on Windows even though the
+/// install is fully functional via `Command::new("claude")`.
 fn binary_on_path(name: &str) -> bool {
-    let Some(path_var) = std::env::var_os("PATH") else {
-        return false;
-    };
-    std::env::split_paths(&path_var).any(|dir| is_executable_file(&dir.join(name)))
+    resolve_binary_inner(name).is_some()
+}
+
+/// Like `binary_on_path` but returns the resolved path. Shared by
+/// `resolve_binary` and the wizard's detection probe so PATH+PATHEXT
+/// resolution lives in exactly one place.
+fn resolve_binary_inner(name: &str) -> Option<PathBuf> {
+    let path_var = std::env::var_os("PATH")?;
+    let extensions = path_extensions();
+    for dir in std::env::split_paths(&path_var) {
+        // Bare name first — covers Unix and the rare Windows tool
+        // that ships without a PATHEXT-listed extension.
+        let bare = dir.join(name);
+        if is_executable_file(&bare) {
+            return Some(bare);
+        }
+        // Windows: try each PATHEXT extension. On Unix `extensions`
+        // is empty so this loop is a no-op (zero-cost).
+        for ext in &extensions {
+            let candidate = dir.join(format!("{name}{ext}"));
+            if is_executable_file(&candidate) {
+                return Some(candidate);
+            }
+        }
+    }
+    None
+}
+
+/// Extensions to append to a bare binary name when searching PATH.
+/// Empty on Unix (executables ship without an extension). On Windows,
+/// read from `PATHEXT` env var; falls back to the documented default
+/// set if unset.
+#[cfg(windows)]
+fn path_extensions() -> Vec<String> {
+    let raw = std::env::var("PATHEXT").unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD".to_string());
+    raw.split(';')
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
+        .collect()
+}
+
+#[cfg(not(windows))]
+fn path_extensions() -> Vec<String> {
+    Vec::new()
 }
 
 fn is_executable_file(path: &Path) -> bool {
@@ -112,10 +159,10 @@ fn is_executable_file(path: &Path) -> bool {
     }
     #[cfg(not(unix))]
     {
-        // Windows: we'd need to walk PATHEXT to be strict. For v1, a
-        // file existing at `<dir>/<name>` is good enough for the
-        // wizard to surface the option and let test_invoke decide.
-        let _ = path; // suppress unused-variable warning
+        // Windows: a file existing at a PATHEXT-resolved location is
+        // considered executable. The PATHEXT walk in
+        // `resolve_binary_inner` already filters to the platform's
+        // canonical executable extensions.
         true
     }
 }
@@ -140,15 +187,12 @@ async fn ollama_daemon_reachable() -> bool {
 
 /// Best-effort: locate the binary for a provider. Returns the
 /// absolute path of the first PATH entry that contains an executable
-/// file matching the provider's canonical name. Used by the audit
-/// metadata stamp so the report can record which `claude` (or
-/// `codex` / `ollama`) was actually invoked.
+/// file matching the provider's canonical name (or `<name>.<ext>` on
+/// Windows via PATHEXT). Used by the audit metadata stamp so the
+/// report can record which `claude` (or `codex` / `ollama`) was
+/// actually invoked.
 pub fn resolve_binary(provider: Provider) -> Option<PathBuf> {
-    let name = provider_binary_name(provider);
-    let path_var = std::env::var_os("PATH")?;
-    std::env::split_paths(&path_var)
-        .map(|dir| dir.join(name))
-        .find(|p| is_executable_file(p))
+    resolve_binary_inner(provider_binary_name(provider))
 }
 
 #[cfg(test)]
@@ -167,6 +211,104 @@ mod tests {
         assert!(!binary_on_path(
             "definitely-not-a-real-binary-name-12345abcdef"
         ));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn finds_executable_under_synthetic_path() {
+        // Build a temp dir, drop an executable file in it, prepend
+        // it to PATH, confirm detection finds it. Exercises the full
+        // PATH walk + is-executable check on the platform the test
+        // is running on (Unix here; Windows tests below).
+        let dir = tempfile::tempdir().unwrap();
+        let bin_path = dir.path().join("synthetic-tool-xyz");
+        std::fs::write(&bin_path, "#!/bin/sh\nexit 0\n").unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = std::fs::metadata(&bin_path).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&bin_path, perms).unwrap();
+
+        let prior = std::env::var_os("PATH");
+        let mut paths = vec![dir.path().to_path_buf()];
+        if let Some(p) = prior.as_ref() {
+            paths.extend(std::env::split_paths(p));
+        }
+        let joined = std::env::join_paths(paths).unwrap();
+        // SAFETY: tests in this binary are single-threaded with
+        // respect to PATH mutation; the env-var probe path doesn't
+        // race with any other test.
+        unsafe { std::env::set_var("PATH", &joined) };
+
+        assert!(binary_on_path("synthetic-tool-xyz"));
+        let resolved = resolve_binary_inner("synthetic-tool-xyz").unwrap();
+        assert_eq!(resolved, bin_path);
+
+        // Restore PATH.
+        unsafe {
+            match prior {
+                Some(p) => std::env::set_var("PATH", p),
+                None => std::env::remove_var("PATH"),
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_walks_pathext_extensions() {
+        // Drop a `synthetic.exe` in a temp dir, prepend to PATH, ask
+        // detection to find the bare name. Exercises the Windows
+        // PATHEXT walker — without it, `binary_on_path("synthetic")`
+        // would miss the `.exe`-suffixed file.
+        let dir = tempfile::tempdir().unwrap();
+        let bin_path = dir.path().join("synthetic.exe");
+        std::fs::write(&bin_path, b"MZ").unwrap();
+
+        let prior_path = std::env::var_os("PATH");
+        let prior_pathext = std::env::var_os("PATHEXT");
+        let mut paths = vec![dir.path().to_path_buf()];
+        if let Some(p) = prior_path.as_ref() {
+            paths.extend(std::env::split_paths(p));
+        }
+        let joined = std::env::join_paths(paths).unwrap();
+        unsafe {
+            std::env::set_var("PATH", &joined);
+            std::env::set_var("PATHEXT", ".COM;.EXE;.BAT;.CMD");
+        }
+
+        assert!(binary_on_path("synthetic"));
+        let resolved = resolve_binary_inner("synthetic").unwrap();
+        assert_eq!(resolved, bin_path);
+
+        unsafe {
+            match prior_path {
+                Some(p) => std::env::set_var("PATH", p),
+                None => std::env::remove_var("PATH"),
+            }
+            match prior_pathext {
+                Some(p) => std::env::set_var("PATHEXT", p),
+                None => std::env::remove_var("PATHEXT"),
+            }
+        }
+    }
+
+    #[test]
+    fn path_extensions_shape_per_platform() {
+        let exts = path_extensions();
+        #[cfg(windows)]
+        {
+            assert!(!exts.is_empty(), "Windows must surface PATHEXT entries");
+            assert!(
+                exts.iter().any(|e| e.eq_ignore_ascii_case(".exe")),
+                "PATHEXT must include .exe; got {exts:?}"
+            );
+        }
+        #[cfg(not(windows))]
+        {
+            assert!(
+                exts.is_empty(),
+                "non-Windows platforms must not iterate extensions: {exts:?}"
+            );
+        }
     }
 
     #[test]
