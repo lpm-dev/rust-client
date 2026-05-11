@@ -6728,6 +6728,7 @@ async fn run_with_options_under_store_lock(
         script_policy_override,
         &step10_script_policy_cfg,
     );
+
     // Phase 46 P1: include integrity so the auto-build predicate's
     // strict gate matches what `rebuild::run` will do. A drifted rich
     // binding previously satisfied this predicate via the lenient
@@ -6737,6 +6738,48 @@ async fn run_with_options_under_store_lock(
         .iter()
         .map(|p| (p.name.clone(), p.version.clone(), p.integrity.clone()))
         .collect();
+
+    // **Phase 46 slice 1 — install-time L4 advisor consumption.**
+    //
+    // Preflight the configured advisor ONCE per run. The session
+    // remains active only when:
+    // - `script-policy` resolved to `triage` (advisor is inert
+    //   under `deny` / `allow`),
+    // - `triage-advisor` is set to something other than `none`,
+    // - detect + test-invoke succeed.
+    //
+    // Any failure degrades to none with a single warning. Per-
+    // package classification failures later in this flow stay
+    // silent — preflight already warned (or didn't, if the user
+    // configured `none`).
+    let advisor_session = if step10_effective_policy
+        == crate::script_policy_config::ScriptPolicy::Triage
+    {
+        let triage_advisor_config = install_capability_cfg.get_str("triage-advisor");
+        let mut session = crate::triage_advisor_session::AdvisorSession::preflight(
+            None, // no `--advisor` CLI flag in slice 1
+            None, // package.json `lpm > triageAdvisor` reader is a follow-up
+            triage_advisor_config,
+            json_output,
+        )
+        .await;
+        // If the session is active, classify every amber package
+        // declared in the current install set. The advisor's
+        // `Approve` verdicts populate an in-memory approval set
+        // that's threaded into both `all_scripted_packages_trusted`
+        // (auto-build predicate) and `rebuild::run` (the actual
+        // script-execution path). The set never persists.
+        if session.is_active() {
+            let amber_requests = collect_amber_classification_requests(&store, &all_pkgs_for_build);
+            // `classify_amber` is async + serial. Slice 1 keeps it
+            // simple; a future parallel-fanout optimisation can
+            // ride on top without changing the contract.
+            session.classify_amber(&amber_requests).await;
+        }
+        Some(session)
+    } else {
+        None
+    };
     // **Phase 48 P0 slice 4 + sub-slice 6c.** Read the force-
     // security-floor kill-switch once, plus the project's requested
     // capability set and the user's configured bounds. Thread all
@@ -6764,6 +6807,7 @@ async fn run_with_options_under_store_lock(
         force_security_floor,
         &install_requested_capabilities,
         &install_user_bound,
+        advisor_session.as_ref().map(|s| s.approvals()),
     );
 
     // Phase 46 P6 Chunk 4: trace whether the auto-build actually ran
@@ -6821,6 +6865,7 @@ async fn run_with_options_under_store_lock(
             false, // no_sandbox
             false, // sandbox_log
             step10_effective_policy,
+            advisor_session.as_ref().map(|s| s.approvals()),
         )
         .await
         && !json_output
@@ -7735,6 +7780,57 @@ fn read_trusted_deps_from_manifest(
 /// the captured fields stay `None` — documented graceful
 /// degradation (see [`crate::build_state::BlockedSetMetadata`]).
 ///
+/// **Phase 46 slice 1 helper.** Walk the install set, classify every
+/// lifecycle script through Layer 1, and emit one
+/// [`crate::triage_advisor_session::AmberPackageRequest`] per
+/// package that has at least one amber phase. Green-only packages
+/// auto-run via the existing P6 GreenTierUnderTriage path and don't
+/// need an advisor call; red-only packages are hard-blocked
+/// regardless of the advisor; packages with no scripts have nothing
+/// to advise on.
+///
+/// Mirrors the worst-of reduction in
+/// [`crate::build_state::compute_blocked_packages_with_metadata`]
+/// and [`crate::commands::rebuild::evaluate_trust_unsuspended`] so
+/// the advisor pass agrees with both downstream consumers on which
+/// packages are amber-eligible.
+fn collect_amber_classification_requests(
+    store: &lpm_store::PackageStore,
+    packages: &[(String, String, Option<String>)],
+) -> Vec<crate::triage_advisor_session::AmberPackageRequest> {
+    use lpm_security::triage::StaticTier;
+    let mut out = Vec::new();
+    for (name, version, _integrity) in packages {
+        let pkg_dir = store.package_dir(name, version);
+        let bodies = crate::build_state::read_install_phase_bodies(&pkg_dir);
+        if bodies.is_empty() {
+            continue;
+        }
+        // Classify each phase independently; collect those that
+        // resolve to Amber/AmberLlm. The advisor needs the per-phase
+        // body to make a per-phase judgement; the session then
+        // worst-ofs across phases for the package-level outcome.
+        let amber_phases: Vec<(String, String)> = bodies
+            .into_iter()
+            .filter(|(_, body)| {
+                matches!(
+                    lpm_security::static_gate::classify(body),
+                    StaticTier::Amber | StaticTier::AmberLlm
+                )
+            })
+            .collect();
+        if amber_phases.is_empty() {
+            continue;
+        }
+        out.push(crate::triage_advisor_session::AmberPackageRequest {
+            name: name.clone(),
+            version: version.clone(),
+            amber_phases,
+        });
+    }
+    out
+}
+
 /// Never returns an error: metadata enrichment is best-effort and
 /// must not fail an otherwise-successful install. Any fetch error
 /// is recorded as "no entry for this package" and the install
