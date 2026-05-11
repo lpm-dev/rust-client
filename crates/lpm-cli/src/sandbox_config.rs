@@ -48,7 +48,7 @@
 //! design lever.
 
 use lpm_common::LpmError;
-use lpm_sandbox::SandboxOptions;
+use lpm_sandbox::{SandboxMode, SandboxOptions};
 use std::path::Path;
 
 /// Read the Phase 46.1 sandbox knobs from `<project_dir>/lpm.toml`
@@ -330,6 +330,67 @@ impl ResolvedSandboxMode {
             Self::None => "none",
         }
     }
+}
+
+/// Phase 46.1 rework runtime collapse: turn the resolved sandbox
+/// mode + per-command CLI overrides into the `(SandboxMode, env_scrub)`
+/// pair the install/rebuild pipelines actually consume.
+///
+/// Centralised because the previous version of `rebuild::run_under_store_lock`
+/// computed `SandboxMode` from `no_sandbox` alone and discarded the
+/// resolved mode — so persistent `[sandbox] mode = "none"` (config /
+/// wizard) silently fell back to the enforced default. This helper
+/// + its unit tests pin the contract so a regression rebuilds the bug.
+///
+/// Precedence (CLI > config / env):
+///
+/// 1. `no_sandbox_flag` (CLI `--no-sandbox`) → [`SandboxMode::Disabled`]
+///    plus `env_scrub = false`. The legacy `--unsafe-full-env`
+///    partner was collapsed per Q6 of the DX redline.
+/// 2. `sandbox_log_flag` (CLI `--sandbox-log`) → [`SandboxMode::LogOnly`]
+///    plus `env_scrub = true`. Diagnostic intent on the CLI wins
+///    over a persistent `mode = "none"` so the user can observe
+///    behaviour without changing their default posture.
+/// 3. Resolved [`ResolvedSandboxMode::None`] (from `[sandbox] mode = "none"`
+///    in `./lpm.toml` or `~/.lpm/config.toml`) → [`SandboxMode::Disabled`]
+///    plus `env_scrub = false`. Same shape as the CLI escape, just
+///    persistent — what `lpm config sandbox --set none` promises.
+/// 4. Resolved [`ResolvedSandboxMode::Default`] or
+///    [`ResolvedSandboxMode::Strict`] → [`SandboxMode::Enforce`]
+///    plus `env_scrub = true`. Strict is distinguished from default
+///    at the `SandboxOptions` layer (via `deny_outbound_network`),
+///    not here.
+///
+/// `env_scrub = true` means the install pipeline runs
+/// [`build_sanitized_env`](crate::commands::rebuild::build_sanitized_env)
+/// (strip credential env vars); `false` means pass the full
+/// `std::env::vars()` through.
+pub fn decide_runtime_sandbox_mode(
+    no_sandbox_flag: bool,
+    sandbox_log_flag: bool,
+    resolved: ResolvedSandboxMode,
+) -> (SandboxMode, bool) {
+    if no_sandbox_flag {
+        // CLI `--no-sandbox` is the per-command escape hatch.
+        // Single-flag drop of containment AND env scrubbing — the
+        // Phase 46.1 Q6 collapse.
+        return (SandboxMode::Disabled, false);
+    }
+    if sandbox_log_flag {
+        // Diagnostic-only override on the CLI. The clap layer
+        // rejects `--sandbox-log` paired with `--no-sandbox`, so
+        // this branch never co-occurs with the prior one.
+        return (SandboxMode::LogOnly, true);
+    }
+    if matches!(resolved, ResolvedSandboxMode::None) {
+        // Persistent `[sandbox] mode = "none"` — the wizard's
+        // off-mode shape. Same runtime behaviour as the CLI
+        // `--no-sandbox` escape so the contract is symmetric.
+        return (SandboxMode::Disabled, false);
+    }
+    // Default / Strict: containment is on. Strict's deny-outbound-
+    // network bit is carried separately on `SandboxOptions`.
+    (SandboxMode::Enforce, true)
 }
 
 /// Coerce a TOML value into a `bool` using the same string-alias rules
@@ -630,5 +691,117 @@ allow-degraded = "maybe"
         assert_eq!(SandboxModeKey::parse("paranoid"), None);
         assert_eq!(SandboxModeKey::parse(""), None);
         assert_eq!(SandboxModeKey::parse("Default"), None); // case-sensitive
+    }
+
+    // ── decide_runtime_sandbox_mode (Phase 46.1 rework follow-up) ──
+    //
+    // GPT-5 audit (2026-05-11) caught a real bug: the previous version
+    // of `rebuild::run_under_store_lock` computed `SandboxMode` from
+    // the CLI `no_sandbox` flag alone and discarded the resolved
+    // mode, so persistent `[sandbox] mode = "none"` from the wizard
+    // / config files silently fell back to the enforced default.
+    // These tests pin the contract a future regression would break.
+
+    #[test]
+    fn decide_runtime_no_flags_default_mode_yields_enforce_with_scrub() {
+        // The 90% case: user hasn't touched any sandbox knob, install
+        // runs under filesystem-write containment + env scrubbing.
+        let (mode, scrub) = decide_runtime_sandbox_mode(false, false, ResolvedSandboxMode::Default);
+        assert_eq!(mode, SandboxMode::Enforce);
+        assert!(scrub, "env scrubbing on under the default posture");
+    }
+
+    #[test]
+    fn decide_runtime_no_flags_strict_mode_yields_enforce_with_scrub() {
+        // Strict is distinguished at the SandboxOptions layer (the
+        // `deny_outbound_network` bit), not at `SandboxMode`. The
+        // runtime mode is the same Enforce as default; only the
+        // ruleset narrows.
+        let (mode, scrub) = decide_runtime_sandbox_mode(false, false, ResolvedSandboxMode::Strict);
+        assert_eq!(mode, SandboxMode::Enforce);
+        assert!(scrub, "env scrubbing on under strict posture");
+    }
+
+    #[test]
+    fn decide_runtime_no_flags_config_none_yields_disabled_no_scrub() {
+        // The bug GPT-5 caught: `[sandbox] mode = "none"` from
+        // config / the wizard MUST produce a fully-disabled runtime,
+        // not silently fall back to Enforce. Symmetric with the CLI
+        // `--no-sandbox` escape — same on-disk shape persisted via
+        // `lpm config sandbox --set none`.
+        let (mode, scrub) = decide_runtime_sandbox_mode(false, false, ResolvedSandboxMode::None);
+        assert_eq!(
+            mode,
+            SandboxMode::Disabled,
+            "config mode = 'none' MUST disable the sandbox (matches CLI --no-sandbox semantics)"
+        );
+        assert!(
+            !scrub,
+            "config mode = 'none' MUST drop env scrubbing (matches CLI --no-sandbox semantics)"
+        );
+    }
+
+    #[test]
+    fn decide_runtime_cli_no_sandbox_wins_over_strict_resolved() {
+        // CLI escape always trumps any persistent state. Even when
+        // config says strict, `--no-sandbox` for this command means
+        // both containment and env scrub drop.
+        let (mode, scrub) = decide_runtime_sandbox_mode(true, false, ResolvedSandboxMode::Strict);
+        assert_eq!(mode, SandboxMode::Disabled);
+        assert!(!scrub);
+    }
+
+    #[test]
+    fn decide_runtime_cli_no_sandbox_wins_over_default_resolved() {
+        let (mode, scrub) = decide_runtime_sandbox_mode(true, false, ResolvedSandboxMode::Default);
+        assert_eq!(mode, SandboxMode::Disabled);
+        assert!(!scrub);
+    }
+
+    #[test]
+    fn decide_runtime_cli_no_sandbox_with_config_none_is_idempotent() {
+        // Belt and braces: if the user passes `--no-sandbox` on top
+        // of a `mode = "none"` config (no-op but legal), the result
+        // is unchanged. Tests that no_sandbox + None doesn't
+        // accidentally double-flip anything.
+        let (mode, scrub) = decide_runtime_sandbox_mode(true, false, ResolvedSandboxMode::None);
+        assert_eq!(mode, SandboxMode::Disabled);
+        assert!(!scrub);
+    }
+
+    #[test]
+    fn decide_runtime_cli_sandbox_log_overrides_default_resolved() {
+        // `--sandbox-log` is the macOS Seatbelt diagnostic flag.
+        // When set on the CLI, even a `default` config gets LogOnly
+        // for this run.
+        let (mode, scrub) = decide_runtime_sandbox_mode(false, true, ResolvedSandboxMode::Default);
+        assert_eq!(mode, SandboxMode::LogOnly);
+        assert!(scrub, "LogOnly is sandbox-active, env scrub stays on");
+    }
+
+    #[test]
+    fn decide_runtime_cli_sandbox_log_overrides_config_none() {
+        // Edge case: user has `mode = "none"` in config but passes
+        // `--sandbox-log` for one run. The CLI diagnostic intent
+        // wins over the persistent off-mode — sandbox engages in
+        // LogOnly so the user can observe what would have been
+        // denied.
+        let (mode, scrub) = decide_runtime_sandbox_mode(false, true, ResolvedSandboxMode::None);
+        assert_eq!(
+            mode,
+            SandboxMode::LogOnly,
+            "CLI --sandbox-log (diagnostic intent) overrides persistent mode = 'none'"
+        );
+        assert!(scrub);
+    }
+
+    #[test]
+    fn decide_runtime_cli_no_sandbox_wins_over_sandbox_log() {
+        // Clap-layer mutex forbids this pair, but defense-in-depth:
+        // if both somehow arrive true, the hard escape wins. A
+        // `Disabled` sandbox can't usefully LogOnly anything.
+        let (mode, scrub) = decide_runtime_sandbox_mode(true, true, ResolvedSandboxMode::Default);
+        assert_eq!(mode, SandboxMode::Disabled);
+        assert!(!scrub);
     }
 }

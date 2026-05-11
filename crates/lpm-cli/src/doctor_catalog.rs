@@ -1191,6 +1191,27 @@ pub static SANDBOX_DEGRADED: CheckEntry = CheckEntry {
     auto_fix: None,
 };
 
+/// Phase 46.1 rework GPT-5 audit follow-up (2026-05-11): the user
+/// has persistently disabled the sandbox via
+/// `[sandbox] mode = "none"` in `~/.lpm/config.toml` / `./lpm.toml`
+/// (typically set by `lpm config sandbox --set none`). Distinct
+/// catalog entry from [`SANDBOX_AVAILABLE`] so JSON consumers can
+/// detect the disabled state without prose parsing, and distinct
+/// from [`SANDBOX_DEGRADED`] which reports a strict-but-fallen-back
+/// state. Severity is `Warn`: the user chose this knowingly, so
+/// it's not a failure — but it IS a posture they should see on
+/// every doctor run.
+pub static SANDBOX_DISABLED_BY_USER: CheckEntry = CheckEntry {
+    code: "sandbox_disabled_by_user",
+    name: "Sandbox",
+    category: Category::Sandbox,
+    description: "The sandbox is persistently disabled by user config — `[sandbox] mode = \"none\"` in `~/.lpm/config.toml` or `./lpm.toml`. Lifecycle scripts run with no filesystem / env / network containment.",
+    when_fires: "User has set `[sandbox] mode = \"none\"` (typically via `lpm config sandbox --set none`).",
+    remediation: "If this is unintended, restore the recommended default via `lpm config sandbox --set default` (or `--set strict` for paranoid mode). The disabled posture is the npm-default experience — every lifecycle script gets full host access, including credential env vars.",
+    possible_severities: &[Severity::Warn],
+    auto_fix: None,
+};
+
 pub static SANDBOX_KERNEL_TOO_OLD: CheckEntry = CheckEntry {
     code: "sandbox_kernel_too_old",
     name: "Sandbox",
@@ -1460,6 +1481,7 @@ pub static CLI_CATALOG: &[&CheckEntry] = &[
     // Sandbox + script policy
     &SANDBOX_AVAILABLE,
     &SANDBOX_DEGRADED,
+    &SANDBOX_DISABLED_BY_USER,
     &SANDBOX_KERNEL_TOO_OLD,
     &SANDBOX_UNSUPPORTED_PLATFORM,
     &SANDBOX_PROBE_FAILED,

@@ -688,44 +688,61 @@ async fn run_under_store_lock(
     // Execute scripts
     let mut successes = 0usize;
     let mut failures = 0usize;
-    // Phase 46.1 rework (2026-05-11): `--no-sandbox` is the single
-    // collapsed escape — it drops both containment AND env scrubbing
-    // in one flag (per Q6 of the DX redline). The legacy
-    // `--unsafe-full-env` partner has been removed in the beta-cleanup
-    // pass, so there is no longer a way to scrub env but drop the
-    // sandbox (or vice-versa). If a user wants the legacy "full env
-    // but sandboxed" debugging shape they can extend
-    // `sandboxWriteDirs` or use `--sandbox-log` (macOS only) without
-    // touching env policy.
-    let sanitized_env = if no_sandbox {
+
+    // Phase 46.1 rework (2026-05-11) + GPT-5 audit follow-up
+    // (2026-05-11): resolve the full sandbox-mode precedence chain
+    // ONCE up front so the env-scrub strategy AND the `SandboxMode`
+    // selection both consult the same resolved state.
+    //
+    // The previous version of this function computed `SandboxMode`
+    // from the `no_sandbox` CLI flag alone and discarded the
+    // resolved mode from the chain — so persistent
+    // `[sandbox] mode = "none"` (set via `lpm config sandbox --set none`
+    // or directly in `lpm.toml` / `~/.lpm/config.toml`) silently
+    // fell back to the enforced default. GPT-5's 2026-05-11 audit
+    // caught that gap; the test
+    // `sandbox_config::tests::decide_runtime_no_flags_config_none_yields_disabled_no_scrub`
+    // pins the corrected contract.
+    //
+    // Note `--no-sandbox` is still passed through the resolver as a
+    // CLI flag — that ensures the precedence ordering inside
+    // `resolve_sandbox_mode_from_chain` and `decide_runtime_sandbox_mode`
+    // is single-sourced and matches `lpm doctor`'s view.
+    let (sandbox_options, resolved_sandbox_mode) =
+        crate::sandbox_config::resolve_sandbox_mode_from_chain(
+            project_dir,
+            no_sandbox,
+            strict_sandbox,
+        )?;
+    let (sandbox_mode, scrub_env) = crate::sandbox_config::decide_runtime_sandbox_mode(
+        no_sandbox,
+        sandbox_log,
+        resolved_sandbox_mode,
+    );
+
+    // Phase 46.1 rework: `--no-sandbox` is the single collapsed
+    // escape — it drops both containment AND env scrubbing in one
+    // flag (per Q6 of the DX redline). The persistent `[sandbox]
+    // mode = "none"` shape has the same runtime semantics, just
+    // sourced from config / the wizard instead of a CLI flag.
+    // `scrub_env=false` covers BOTH paths so the contract is
+    // symmetric.
+    let sanitized_env = if scrub_env {
+        build_sanitized_env()
+    } else {
         if !json_output {
+            // Word the warning so it covers BOTH provenance paths
+            // (CLI escape OR persistent `mode = "none"`) without
+            // claiming the source. The `Source:` line on doctor /
+            // help is the right place for provenance; this is the
+            // "loud banner at the call site" the SandboxMode docs
+            // already promise.
             output::warn(
-                "--no-sandbox: credential env vars will NOT be stripped and scripts run \
+                "sandbox disabled: credential env vars will NOT be stripped and scripts run \
                  WITHOUT filesystem / network containment.",
             );
         }
         std::env::vars().collect::<HashMap<String, String>>()
-    } else {
-        build_sanitized_env()
-    };
-
-    // Phase 46 P5 Chunk 2 / Phase 46.1 rework (2026-05-11): resolve
-    // the effective sandbox mode and load the per-project writable-
-    // subpath extensions once before the loop. Clap-level mutual
-    // exclusion (`conflicts_with_all` on `--no-sandbox` ⊥
-    // `--strict-sandbox` / `--paranoid`, and `--no-sandbox` ⊥
-    // `--sandbox-log`) guarantees at most one mode flag arrives true.
-    // `strict_sandbox=true` does NOT set `SandboxMode::Enforce` to
-    // anything new — it goes through the chain resolver below to
-    // flip `deny_outbound_network` on the resolved `SandboxOptions`.
-    // §9.6 + Chunk 2 signoff: SandboxMode is computed at the build
-    // call site, NOT encoded in ScriptPolicyConfig.
-    let sandbox_mode = if no_sandbox {
-        SandboxMode::Disabled
-    } else if sandbox_log {
-        SandboxMode::LogOnly
-    } else {
-        SandboxMode::Enforce
     };
 
     let lpm_root = lpm_common::paths::LpmRoot::from_env()
@@ -795,27 +812,13 @@ async fn run_under_store_lock(
     lpm_sandbox::prepare_writable_dirs(&prepare_spec)
         .map_err(|e| LpmError::Registry(format!("{e}")))?;
 
-    // Phase 46.1: load the `[sandbox] allow-degraded` opt-in from
-    // <project>/lpm.toml + ~/.lpm/config.toml. Project wins; both
-    // fall through to strict (`allow_degraded = false`). The
-    // resolved options thread through both the pre-probe (next
-    // block) AND the per-package sandbox construction inside
-    // `execute_script` (further down the file), so the posture
-    // decision is made once and applied consistently.
-    //
-    // Phase 46.1 rework (2026-05-11): resolve the full sandbox-mode
-    // precedence chain — CLI flag > env > project lpm.toml > user
-    // config.toml > default. The `--no-sandbox` flag has its own
-    // [`SandboxMode::Disabled`] path above (and skips this constructor
-    // entirely via the `is_disabled` branch), so we never need to
-    // pass `no_sandbox_flag = true` here; that path is unreachable
-    // when `no_sandbox = true` because the `Disabled` mode short-
-    // circuits the probe block below.
-    let (sandbox_options, _resolved_mode) = crate::sandbox_config::resolve_sandbox_mode_from_chain(
-        project_dir,
-        false, // no_sandbox handled via SandboxMode::Disabled above
-        strict_sandbox,
-    )?;
+    // Phase 46.1 rework GPT-5 audit follow-up: `sandbox_options`
+    // (carrying `allow-degraded` and `deny_outbound_network`) is
+    // already in scope from the resolver call up top. Do NOT
+    // re-resolve here — the previous version did exactly that, but
+    // also threw away the resolved mode, which is the bug GPT-5
+    // caught. The pre-probe + per-package sandbox construction
+    // below consume the up-top `sandbox_options` directly.
 
     // Phase 46 P5 Chunk 4: pre-probe the sandbox factory with a
     // synthetic spec so unsupported-platform and mode-not-supported
