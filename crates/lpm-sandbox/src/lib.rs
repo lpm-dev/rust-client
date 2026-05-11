@@ -47,8 +47,10 @@
 //! | Windows  | [`SandboxError::UnsupportedPlatform`] — deferred to Phase 46.2 (Phase 46.1 left Windows out of scope; see design note) | [`SandboxError::UnsupportedPlatform`] | [`NoopSandbox`] |
 //!
 //! [`SandboxMode::Disabled`] always succeeds with a [`NoopSandbox`]:
-//! the `--unsafe-full-env --no-sandbox` escape hatch has to be
-//! reachable from every platform, including Windows.
+//! the `--no-sandbox` escape hatch (Phase 46.1 rework: single flag —
+//! the legacy `--unsafe-full-env` partner was collapsed per Q6 of the
+//! DX redline) has to be reachable from every platform, including
+//! Windows.
 //!
 //! ## Posture (Phase 46.1)
 //!
@@ -287,7 +289,8 @@ pub enum SandboxPosture {
         missing: &'static str,
     },
     /// No containment applied (e.g. [`NoopSandbox`] for the
-    /// `--unsafe-full-env --no-sandbox` escape hatch, or platforms
+    /// `--no-sandbox` escape hatch — Phase 46.1 rework collapsed
+    /// the legacy `--unsafe-full-env` partner per Q6 — or platforms
     /// without a backend). Posture-aware UI surfaces this as
     /// "containment off" rather than conflating with strict.
     Disabled,
@@ -333,9 +336,10 @@ pub enum SandboxMode {
     /// substitutes for [`Enforce`](Self::Enforce). Intended for
     /// compat debugging via `--sandbox-log`.
     LogOnly,
-    /// No containment. Used only by the `--unsafe-full-env
-    /// --no-sandbox` escape hatch. Emits a loud CLI banner at the
-    /// call site (not this crate's responsibility).
+    /// No containment. Used only by the `--no-sandbox` escape
+    /// hatch (Phase 46.1 rework: single flag, legacy
+    /// `--unsafe-full-env` partner collapsed per Q6). Emits a loud
+    /// CLI banner at the call site (not this crate's responsibility).
     Disabled,
 }
 
@@ -489,8 +493,9 @@ pub enum SandboxError {
         /// Linux.
         mode: SandboxMode,
         /// User-facing next-step. Names the interim workaround
-        /// (typically `--unsafe-full-env --no-sandbox`) so users
-        /// aren't stuck guessing.
+        /// (typically `--no-sandbox` — Phase 46.1 rework collapsed
+        /// the legacy `--unsafe-full-env` partner) so users aren't
+        /// stuck guessing.
         remediation: String,
     },
 
@@ -568,8 +573,8 @@ pub trait Sandbox: Send + Sync {
 /// compiling platform-specific code they don't have.
 ///
 /// [`SandboxMode::Disabled`] always succeeds with a [`NoopSandbox`]
-/// regardless of platform — the `--unsafe-full-env --no-sandbox`
-/// escape hatch must work everywhere, including Windows.
+/// regardless of platform — the `--no-sandbox` escape hatch (Phase
+/// 46.1 rework: single flag) must work everywhere, including Windows.
 ///
 /// Callers that need to thread the Phase 46.1
 /// `[sandbox] allow-degraded` knob through (install pipeline, doctor)
@@ -686,16 +691,20 @@ pub fn prepare_writable_dirs(spec: &SandboxSpec) -> Result<(), SandboxError> {
 ///
 /// Centralized so unsupported platforms share consistent wording and
 /// the CLI-side message test has a single source of truth.
+///
+/// Phase 46.1 rework (2026-05-11): the `--unsafe-full-env` partner
+/// flag was collapsed into `--no-sandbox` (Q6), so the remediation
+/// names a single flag now.
 pub fn unsupported_remediation(platform: &str) -> String {
     match platform {
         "windows" => "sandbox enforcement isn't supported on Windows yet. Re-run with \
-			 --unsafe-full-env --no-sandbox to execute scripts without \
-			 containment, or set script-policy = deny."
+			 --no-sandbox to execute scripts without containment, or set \
+			 script-policy = deny."
             .to_string(),
         _ => format!(
             "{platform} has no LPM sandbox backend. Re-run with \
-			 --unsafe-full-env --no-sandbox to execute scripts without \
-			 containment, or set script-policy = deny."
+			 --no-sandbox to execute scripts without containment, or set \
+			 script-policy = deny."
         ),
     }
 }
@@ -851,7 +860,13 @@ mod tests {
         let msg = format!("{e}");
         assert!(msg.contains("windows"), "got: {msg}");
         assert!(msg.contains("isn't supported"), "got: {msg}");
-        assert!(msg.contains("--unsafe-full-env --no-sandbox"), "got: {msg}");
+        // Phase 46.1 rework (2026-05-11): single `--no-sandbox` flag,
+        // legacy `--unsafe-full-env` partner removed per Q6.
+        assert!(msg.contains("--no-sandbox"), "got: {msg}");
+        assert!(
+            !msg.contains("--unsafe-full-env"),
+            "legacy partner flag must be gone: {msg}",
+        );
     }
 
     #[test]
@@ -859,7 +874,7 @@ mod tests {
         let e = SandboxError::KernelTooOld {
             detected: "5.10.0".into(),
             required: "5.13".into(),
-            remediation: "upgrade kernel or use --unsafe-full-env --no-sandbox".into(),
+            remediation: "upgrade kernel or use --no-sandbox".into(),
         };
         let msg = format!("{e}");
         assert!(msg.contains("5.10.0"));
@@ -896,15 +911,16 @@ mod tests {
         let e = SandboxError::ModeNotSupportedOnPlatform {
             platform: "linux".into(),
             mode: SandboxMode::LogOnly,
-            remediation: "landlock has no observe-only primitive. Use \
-                --unsafe-full-env --no-sandbox to debug a sandbox false-positive."
+            remediation: "landlock has no observe-only primitive. Use --no-sandbox to \
+                debug a sandbox false-positive."
                 .into(),
         };
         let msg = format!("{e}");
         assert!(msg.contains("linux"), "got: {msg}");
         assert!(msg.contains("LogOnly"), "got: {msg}");
+        // Phase 46.1 rework: single `--no-sandbox` flag.
         assert!(
-            msg.contains("--unsafe-full-env --no-sandbox"),
+            msg.contains("--no-sandbox"),
             "must point at the workaround: {msg}"
         );
     }
@@ -913,7 +929,12 @@ mod tests {
     fn unsupported_remediation_windows_says_not_supported_yet_and_names_escape_hatch() {
         let s = unsupported_remediation("windows");
         assert!(s.contains("isn't supported"));
-        assert!(s.contains("--unsafe-full-env --no-sandbox"));
+        // Phase 46.1 rework: single `--no-sandbox` flag.
+        assert!(s.contains("--no-sandbox"));
+        assert!(
+            !s.contains("--unsafe-full-env"),
+            "legacy partner flag must be gone: {s}",
+        );
         assert!(s.contains("script-policy = deny"));
     }
 
@@ -921,7 +942,12 @@ mod tests {
     fn unsupported_remediation_generic_unix_names_platform() {
         let s = unsupported_remediation("freebsd");
         assert!(s.contains("freebsd"));
-        assert!(s.contains("--unsafe-full-env --no-sandbox"));
+        // Phase 46.1 rework: single `--no-sandbox` flag.
+        assert!(s.contains("--no-sandbox"));
+        assert!(
+            !s.contains("--unsafe-full-env"),
+            "legacy partner flag must be gone: {s}",
+        );
     }
 
     #[test]
@@ -1039,7 +1065,12 @@ mod tests {
                 remediation,
             }) => {
                 assert_eq!(platform, std::env::consts::OS);
-                assert!(remediation.contains("--unsafe-full-env --no-sandbox"));
+                // Phase 46.1 rework: single `--no-sandbox` flag.
+                assert!(remediation.contains("--no-sandbox"));
+                assert!(
+                    !remediation.contains("--unsafe-full-env"),
+                    "legacy partner flag must be gone: {remediation}",
+                );
             }
             other => panic!("expected UnsupportedPlatform, got {other:?}"),
         }

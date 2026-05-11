@@ -1603,6 +1603,11 @@ async fn run_doctor_install(client: &RegistryClient, project_dir: &Path) -> Resu
         None, // advisor_override: `lpm doctor` does not expose `--advisor`
         None, // min_release_age_override: `lpm doctor` uses the package.json/global/default chain
         crate::provenance_fetch::DriftIgnorePolicy::default(), // drift-ignore: `lpm doctor` enforces drift like a normal install
+        // Phase 46.1 rework: doctor's auto-fix install does not
+        // surface its own sandbox-mode flags. Falls through the
+        // env / config / default chain.
+        false, // strict_sandbox
+        false, // no_sandbox
     )
     .await
 }
@@ -2237,9 +2242,10 @@ fn check_install_root_consistency(
 ///       `lpm rebuild` under every policy can contain lifecycle
 ///       scripts.
 ///     - **Windows** → `warn` with the §17.4 Phase 46.1 pointer.
-///       Scripts still run today (the `--unsafe-full-env
-///       --no-sandbox` escape hatch is the 46.0 interim), but
-///       without containment — the user needs to know that
+///       Scripts still run today (`--no-sandbox` is the 46.0
+///       interim — Phase 46.1 rework collapsed the legacy
+///       `--unsafe-full-env` partner per Q6), but without
+///       containment — the user needs to know that
 ///       `script-policy = "triage"` or `allow` is effectively
 ///       opting out of the sandbox floor on Windows until 46.1.
 ///     - **Linux with an old kernel** → `warn` with the landlock
@@ -2638,8 +2644,9 @@ mod tests {
     /// On Windows, the probe must Warn with the
     /// "sandbox enforcement isn't supported here yet" pointer. Users
     /// need to know that triage + sandbox containment is unavailable
-    /// on their platform and the interim is opt-out via
-    /// `--unsafe-full-env --no-sandbox`.
+    /// on their platform and the interim is opt-out via `--no-sandbox`
+    /// (Phase 46.1 rework collapsed the legacy `--unsafe-full-env`
+    /// partner per Q6).
     #[cfg(target_os = "windows")]
     #[test]
     fn sandbox_probe_on_windows_warns_when_unsupported() {

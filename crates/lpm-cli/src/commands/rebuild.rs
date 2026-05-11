@@ -134,17 +134,20 @@ pub async fn run(
     force: bool,
     timeout_secs: Option<u64>,
     json_output: bool,
-    unsafe_full_env: bool,
     deny_all: bool,
-    // Phase 46 P5 Chunk 2: sandbox flag pair. `no_sandbox` flips
-    // execution to [`SandboxMode::Disabled`] and is only reachable via
-    // `--unsafe-full-env --no-sandbox` at the CLI boundary (main.rs
-    // rejects `--no-sandbox` without the partner flag). `sandbox_log`
-    // flips to [`SandboxMode::LogOnly`] — strictly diagnostic, never
-    // a soft-enforcement substitute per Chunk 4 signoff. Both default
-    // to `false` so every code path that calls `rebuild::run` lands on
-    // [`SandboxMode::Enforce`] unless the user explicitly opts out.
+    // Phase 46 P5 Chunk 2 / Phase 46.1 rework (2026-05-11): sandbox
+    // flag trio. `no_sandbox` flips execution to
+    // [`SandboxMode::Disabled`] AND skips env scrubbing (Q6 collapse —
+    // the legacy `--unsafe-full-env` partner was removed in the
+    // beta-cleanup pass). `strict_sandbox` opts INTO outbound network
+    // denial via the [`crate::sandbox_config::resolve_sandbox_mode_from_chain`]
+    // precedence resolver. `sandbox_log` flips to
+    // [`SandboxMode::LogOnly`] — strictly diagnostic, never a
+    // soft-enforcement substitute per Chunk 4 signoff. `no_sandbox`
+    // and `strict_sandbox` are mutually exclusive at the clap layer
+    // (`conflicts_with_all`) so they never both arrive `true`.
     no_sandbox: bool,
+    strict_sandbox: bool,
     sandbox_log: bool,
     // Phase 46 P6 Chunk 1: already-resolved effective script policy.
     // The caller (main.rs for `lpm rebuild`, install.rs for autoBuild)
@@ -180,9 +183,9 @@ pub async fn run(
             force,
             timeout_secs,
             json_output,
-            unsafe_full_env,
             deny_all,
             no_sandbox,
+            strict_sandbox,
             sandbox_log,
             effective_policy,
             advisor_approvals,
@@ -200,25 +203,24 @@ async fn run_under_store_lock(
     force: bool,
     timeout_secs: Option<u64>,
     json_output: bool,
-    unsafe_full_env: bool,
     deny_all: bool,
     no_sandbox: bool,
+    strict_sandbox: bool,
     sandbox_log: bool,
     effective_policy: ScriptPolicy,
     // Phase 46 slice 1 — see `run` for the contract.
     advisor_approvals: Option<&std::collections::HashSet<(String, String, Option<String>)>>,
 ) -> Result<(), LpmError> {
     // Defense-in-depth on the sandbox flag pair. The CLI boundary
-    // (clap `requires = "unsafe_full_env"` on `--no-sandbox`) is the
-    // primary guard, but `rebuild::run` is also reachable from
-    // internal callers (autoBuild during `lpm install`). Asserting
-    // here catches a future caller that wires `no_sandbox=true` while
-    // forgetting `unsafe_full_env=true` — a combination users can
-    // never reach via the parser. Debug-only so release builds stay
-    // hot-path clean.
+    // (clap `conflicts_with_all` on `--no-sandbox` ⊥ `--strict-sandbox`
+    // / `--paranoid`) is the primary guard, but `rebuild::run` is also
+    // reachable from internal callers (autoBuild during `lpm install`).
+    // Asserting here catches a future caller that wires both true —
+    // a combination users can never reach via the parser. Debug-only
+    // so release builds stay hot-path clean.
     debug_assert!(
-        !no_sandbox || unsafe_full_env,
-        "`no_sandbox` requires `unsafe_full_env`; pair them at every call site"
+        !(no_sandbox && strict_sandbox),
+        "`no_sandbox` and `strict_sandbox` are mutually exclusive; never both true"
     );
 
     // Check deny-all: --deny-all flag or lpm.scripts.denyAll config.
@@ -686,24 +688,38 @@ async fn run_under_store_lock(
     // Execute scripts
     let mut successes = 0usize;
     let mut failures = 0usize;
-    let sanitized_env = if unsafe_full_env {
-        // Pass full environment without stripping — user explicitly opted in
+    // Phase 46.1 rework (2026-05-11): `--no-sandbox` is the single
+    // collapsed escape — it drops both containment AND env scrubbing
+    // in one flag (per Q6 of the DX redline). The legacy
+    // `--unsafe-full-env` partner has been removed in the beta-cleanup
+    // pass, so there is no longer a way to scrub env but drop the
+    // sandbox (or vice-versa). If a user wants the legacy "full env
+    // but sandboxed" debugging shape they can extend
+    // `sandboxWriteDirs` or use `--sandbox-log` (macOS only) without
+    // touching env policy.
+    let sanitized_env = if no_sandbox {
         if !json_output {
-            output::warn("Using --unsafe-full-env: credential env vars will NOT be stripped.");
+            output::warn(
+                "--no-sandbox: credential env vars will NOT be stripped and scripts run \
+                 WITHOUT filesystem / network containment.",
+            );
         }
         std::env::vars().collect::<HashMap<String, String>>()
     } else {
         build_sanitized_env()
     };
 
-    // Phase 46 P5 Chunk 2: resolve the effective sandbox mode and load
-    // the per-project writable-subpath extensions once before the
-    // loop. The flag pair was already validated at the CLI boundary —
-    // `--no-sandbox` never reaches here without `--unsafe-full-env`,
-    // and `--no-sandbox` + `--sandbox-log` are mutually exclusive —
-    // so this is pure mode selection. §9.6 + Chunk 2 signoff:
-    // SandboxMode is computed at the build call site, NOT encoded in
-    // ScriptPolicyConfig.
+    // Phase 46 P5 Chunk 2 / Phase 46.1 rework (2026-05-11): resolve
+    // the effective sandbox mode and load the per-project writable-
+    // subpath extensions once before the loop. Clap-level mutual
+    // exclusion (`conflicts_with_all` on `--no-sandbox` ⊥
+    // `--strict-sandbox` / `--paranoid`, and `--no-sandbox` ⊥
+    // `--sandbox-log`) guarantees at most one mode flag arrives true.
+    // `strict_sandbox=true` does NOT set `SandboxMode::Enforce` to
+    // anything new — it goes through the chain resolver below to
+    // flip `deny_outbound_network` on the resolved `SandboxOptions`.
+    // §9.6 + Chunk 2 signoff: SandboxMode is computed at the build
+    // call site, NOT encoded in ScriptPolicyConfig.
     let sandbox_mode = if no_sandbox {
         SandboxMode::Disabled
     } else if sandbox_log {
@@ -786,17 +802,20 @@ async fn run_under_store_lock(
     // block) AND the per-package sandbox construction inside
     // `execute_script` (further down the file), so the posture
     // decision is made once and applied consistently.
+    //
     // Phase 46.1 rework (2026-05-11): resolve the full sandbox-mode
     // precedence chain — CLI flag > env > project lpm.toml > user
-    // config.toml > default. The CLI flag bools are wired in a
-    // follow-up; for this rework we route env + config through.
-    // `--no-sandbox` still goes through the legacy
-    // `no_sandbox` / `unsafe_full_env` partner-pair path below, so
-    // we pass `no_sandbox_flag = false` here — the legacy path
-    // sets `SandboxMode::Disabled` and skips the constructor
-    // entirely.
-    let (sandbox_options, _resolved_mode) =
-        crate::sandbox_config::resolve_sandbox_mode_from_chain(project_dir, false, false)?;
+    // config.toml > default. The `--no-sandbox` flag has its own
+    // [`SandboxMode::Disabled`] path above (and skips this constructor
+    // entirely via the `is_disabled` branch), so we never need to
+    // pass `no_sandbox_flag = true` here; that path is unreachable
+    // when `no_sandbox = true` because the `Disabled` mode short-
+    // circuits the probe block below.
+    let (sandbox_options, _resolved_mode) = crate::sandbox_config::resolve_sandbox_mode_from_chain(
+        project_dir,
+        false, // no_sandbox handled via SandboxMode::Disabled above
+        strict_sandbox,
+    )?;
 
     // Phase 46 P5 Chunk 4: pre-probe the sandbox factory with a
     // synthetic spec so unsupported-platform and mode-not-supported
@@ -848,10 +867,16 @@ async fn run_under_store_lock(
     // probe above bailed with ModeNotSupportedOnPlatform, so this
     // banner's "logged but NOT enforced" promise never reaches a
     // user whose platform can't actually honor it.
-    if no_sandbox && !json_output {
+    //
+    // Phase 46.1 rework note: the `--no-sandbox` banner is emitted
+    // up at the `sanitized_env` selector — see the `if no_sandbox`
+    // branch in env construction — so users see "credentials NOT
+    // stripped + no containment" as one combined warning rather
+    // than two split announcements.
+    if strict_sandbox && !json_output {
         output::warn(
-            "--no-sandbox: lifecycle scripts will run WITHOUT filesystem containment. \
-             Scripts have full host access.",
+            "--strict-sandbox: outbound network will be denied for every lifecycle script in \
+             this run (filesystem + env containment also active).",
         );
     }
     if sandbox_log && !json_output {
@@ -1324,15 +1349,16 @@ fn prepare_live_package_dir(
 /// now routes through [`lpm_sandbox::new_for_platform`]: macOS uses
 /// Seatbelt, Linux uses landlock, Windows + other-unix return
 /// [`lpm_sandbox::SandboxError::UnsupportedPlatform`] which bubbles
-/// up as a clear "re-run with --unsafe-full-env --no-sandbox" string
-/// through the format! below. Old Linux kernels (<5.13) surface
+/// up as a clear "re-run with --no-sandbox" string through the
+/// format! below. Old Linux kernels (<5.13) surface
 /// [`lpm_sandbox::SandboxError::KernelTooOld`] symmetric with the
 /// Windows deferral per the Chunk 1 signoff.
 ///
 /// The [`SandboxMode::Disabled`] arm inside the factory hands back a
-/// [`lpm_sandbox::NoopSandbox`] on every platform, so
-/// `--unsafe-full-env --no-sandbox` remains reachable universally
-/// (including Windows) as the single escape hatch.
+/// [`lpm_sandbox::NoopSandbox`] on every platform, so `--no-sandbox`
+/// (Phase 46.1 rework collapsed the legacy `--unsafe-full-env`
+/// partner per Q6) remains reachable universally (including Windows)
+/// as the single escape hatch.
 #[allow(clippy::too_many_arguments)]
 fn spawn_lifecycle_child(
     cmd: &str,

@@ -737,6 +737,12 @@ pub async fn run(
         // trustedDependencies the project defined, so legitimately-
         // identical identities pass normally.
         crate::provenance_fetch::DriftIgnorePolicy::default(),
+        // Phase 46.1 rework: `lpm deploy` does not surface its own
+        // sandbox-mode flags. CI deployers can still flip strict
+        // via `LPM_STRICT_SANDBOX=1`; the env tier of the chain
+        // inside `rebuild::run` honors that.
+        false, // strict_sandbox
+        false, // no_sandbox
     )
     .await?;
 

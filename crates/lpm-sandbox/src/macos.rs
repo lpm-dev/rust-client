@@ -183,31 +183,49 @@ mod tests {
 
     #[test]
     fn new_renders_profile_successfully_for_realistic_spec() {
+        // Phase 46.1 rework (2026-05-11): default options gives the
+        // relaxed default — `(allow network*)` is emitted so
+        // legitimate post-approval downloaders (sharp, prisma,
+        // @lpm-registry/cli, …) keep working. The strict path
+        // (network denied) is exercised by the paired
+        // `new_strict_renders_no_allow_network_in_profile` test
+        // below.
         let rs = realistic_spec();
         let sb =
             SeatbeltSandbox::new(rs.spec, SandboxMode::Enforce, SandboxOptions::default()).unwrap();
         assert!(sb.profile.contains("(deny default)"));
-        // Phase 46.1: outbound network is denied; the rendered
-        // profile must not carry `(allow network*)` or any narrower
-        // `(allow network ...)` form. The Enforce-side and LogOnly-
-        // side unit tests in [`crate::seatbelt`] assert the same
-        // absence at profile-text level; this one repeats the
-        // assertion against the Seatbelt backend's stored profile
-        // so a regression on either side trips an obvious test
-        // rather than silently restoring outbound access.
-        //
-        // Seatbelt's deny-default covers EVERY socket family / type
-        // — TCP, UDP, raw, AF_PACKET, AF_NETLINK, DNS — once the
-        // `(allow network*)` opening is gone. This is the
+        assert!(
+            sb.profile.contains("(allow network*)"),
+            "Phase 46.1 rework default — `(allow network*)` must be present so the relaxed \
+             default lets post-approval downloads work: {}",
+            sb.profile,
+        );
+    }
+
+    #[test]
+    fn new_strict_renders_no_allow_network_in_profile() {
+        // Phase 46.1 strict path: when the user opts into strict
+        // mode (via `--strict-sandbox` / `--paranoid` /
+        // `[sandbox] mode = "strict"` / `LPM_STRICT_SANDBOX=1`),
+        // the Seatbelt profile drops the `(allow network*)` line.
+        // The `(deny default)` rule then covers every socket
+        // family — TCP, UDP, raw, AF_PACKET, AF_NETLINK, DNS — the
         // platform-asymmetric advantage macOS has over Linux's
-        // landlock V4 (which only covers TCP); see the module-
+        // landlock V4 (which only covers TCP). See the module-
         // level docs in [`crate::lib`] and the Phase 46.1.1
         // follow-up doc for the Linux UDP gap and its seccomp-bpf
         // remediation.
+        let rs = realistic_spec();
+        let options = SandboxOptions {
+            deny_outbound_network: true,
+            ..SandboxOptions::default()
+        };
+        let sb = SeatbeltSandbox::new(rs.spec, SandboxMode::Enforce, options).unwrap();
+        assert!(sb.profile.contains("(deny default)"));
         assert!(
             !sb.profile.contains("(allow network"),
-            "Phase 46.1 — outbound network must be denied; backend profile must not contain \
-             any `(allow network ...)` form: {}",
+            "Phase 46.1 strict — outbound network must be denied; backend profile must not \
+             contain any `(allow network ...)` form: {}",
             sb.profile,
         );
     }

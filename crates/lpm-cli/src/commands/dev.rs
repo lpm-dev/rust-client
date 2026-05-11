@@ -900,6 +900,11 @@ async fn auto_install_if_stale(
         None, // advisor_override: `lpm dev` does not expose `--advisor`
         None, // min_release_age_override: `lpm dev` uses the chain
         crate::provenance_fetch::DriftIgnorePolicy::default(), // drift-ignore: `lpm dev` enforces drift
+        // Phase 46.1 rework: `lpm dev` does not surface its own
+        // sandbox-mode flags. The env / config / default chain
+        // inside `rebuild::run` still applies.
+        false, // strict_sandbox
+        false, // no_sandbox
     )
     .await
     {
