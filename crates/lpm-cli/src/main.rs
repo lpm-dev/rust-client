@@ -33,6 +33,7 @@ mod provenance_fetch;
 mod quality;
 mod release_age_config;
 mod release_lookup;
+mod sandbox_config;
 mod save_config;
 mod save_spec;
 mod script_policy_config;

@@ -47,14 +47,34 @@
 //!
 //! # Kernel probe
 //!
-//! [`LandlockSandbox::new`] runs in the PARENT and tests whether the
-//! kernel supports landlock by building a
-//! [`landlock::CompatLevel::HardRequirement`] ruleset at ABI V1
-//! (kernel 5.13+). On success the probe is dropped (FD closes); on
-//! failure we surface [`SandboxError::KernelTooOld`] —
-//! refuse-to-run, symmetric with the Windows path per the Chunk 1
-//! signoff. The user's interim option is
-//! `--unsafe-full-env --no-sandbox`.
+//! [`LandlockSandbox::new`] runs in the PARENT and decides which
+//! posture to construct from the detected kernel version
+//! ([`crate::posture_decision::decide_posture`]) and the caller's
+//! [`SandboxOptions::allow_degraded`] opt-in:
+//!
+//! - **Strict** (default on kernels ≥ 6.7): probe landlock at ABI V4
+//!   with [`landlock::CompatLevel::HardRequirement`]. On success we
+//!   construct the strict backend, which installs filesystem rules
+//!   AND declares `AccessNet::from_all(V4)` (BindTcp + ConnectTcp)
+//!   with NO `NetPort` allow rules — landlock then default-denies
+//!   outbound TCP. **UDP / raw / AF_PACKET / DNS-via-UDP are NOT
+//!   denied by V4 alone** — that's the Phase 46.1.1 seccomp-bpf
+//!   layer's job. On V4 probe failure the kernel reported ≥ 6.7
+//!   but landlock itself isn't reachable (LSM disabled, etc.) —
+//!   we surface [`SandboxError::KernelTooOld`] with
+//!   `required: "6.7"`.
+//! - **Degraded** (kernel < 6.7 AND `allow_degraded = true`): probe
+//!   landlock at ABI V1 (filesystem-only). The construction-side
+//!   succeeds when V1 is reachable; the install pipeline emits the
+//!   per-install structured stderr warning via
+//!   [`crate::SandboxPosture::degraded_warning_line`].
+//! - **Refuse** (kernel < 6.7 AND `allow_degraded = false`, the
+//!   strict default): surface `SandboxError::KernelTooOld` with
+//!   `required: "6.7"` before the script ever spawns. Refusal is
+//!   symmetric with the Windows path per the Chunk 1 signoff. The
+//!   user's interim options are `--unsafe-full-env --no-sandbox`,
+//!   adding the package to `trustedDependencies`, or upgrading the
+//!   kernel.
 //!
 //! # Enforcement guard
 //!
@@ -68,37 +88,181 @@
 #![cfg(target_os = "linux")]
 
 use crate::landlock_rules::{RuleAccess, describe_rules};
-use crate::{Sandbox, SandboxError, SandboxMode, SandboxSpec, SandboxedCommand};
+use crate::posture_decision::{PostureDecision, REQUIRED_KERNEL_FOR_STRICT, decide_posture};
+use crate::{
+    Sandbox, SandboxError, SandboxMode, SandboxOptions, SandboxPosture, SandboxSpec,
+    SandboxedCommand,
+};
 use landlock::{
-    ABI, Access, AccessFs, CompatLevel, Compatible, PathBeneath, PathFd, Ruleset, RulesetAttr,
-    RulesetCreated, RulesetCreatedAttr, RulesetError, RulesetStatus,
+    ABI, Access, AccessFs, AccessNet, CompatLevel, Compatible, PathBeneath, PathFd, Ruleset,
+    RulesetAttr, RulesetCreated, RulesetCreatedAttr, RulesetError, RulesetStatus,
 };
 use std::os::unix::process::CommandExt;
 use std::process::{Child, Command, Stdio};
 
-/// Minimum kernel version this backend targets. The crate's
-/// [`ABI::V1`] maps to this release; lower kernels cause the
-/// hard-requirement probe in [`LandlockSandbox::new`] to error,
-/// which we surface as [`SandboxError::KernelTooOld`].
-const MIN_KERNEL_VERSION: &str = "5.13";
+/// Phase 46.1: minimum kernel version the strict posture targets.
+/// V4 landed in 6.7 (January 2024) and is the first ABI that
+/// carries network access rules; below this floor the backend has
+/// no kernel-level mechanism to deny outbound network, so the
+/// Strict posture refuses and routes the user to the three
+/// remediations (degraded opt-in, `--unsafe-full-env --no-sandbox`,
+/// or kernel upgrade).
+const MIN_KERNEL_VERSION_STRICT: &str = REQUIRED_KERNEL_FOR_STRICT;
 
-/// Landlock ABI version we program against. Pinned to V1 so the
-/// rule description + enforcement behavior is stable across distros
-/// — newer ABIs add capabilities (TruncateAllowed in V2, Refer in
-/// V3, network in V4+) that Phase 46 P5 doesn't use. Future work can
-/// bump this in the same module without changing the call site.
-const TARGET_ABI: ABI = ABI::V1;
+/// Phase 46.1 fallback floor: V1 landed in 5.13. Used by the
+/// degraded posture's V1 probe to give an honest error if even V1
+/// is unreachable (landlock LSM disabled entirely).
+const MIN_KERNEL_VERSION_FALLBACK: &str = "5.13";
+
+/// Phase 46.1 Strict ABI: V4 (kernel 6.7+). Adds network access
+/// rules on top of V1's filesystem set; an empty
+/// `AccessNet::from_all(V4)` handler with no `NetPort` allows
+/// yields default-deny for both `BindTcp` and `ConnectTcp`.
+const TARGET_ABI_STRICT: ABI = ABI::V4;
+
+/// Phase 46.1 Degraded ABI: V1 (kernel 5.13+). Filesystem-only —
+/// matches the Phase 46 P5 behaviour exactly. Used only when the
+/// user has set `[sandbox] allow-degraded = true` AND the detected
+/// kernel is below the V4 floor.
+const TARGET_ABI_FALLBACK: ABI = ABI::V1;
+
+/// Internal posture tag the backend constructs after the kernel
+/// version + landlock probe. Pinned at construction time and
+/// referenced by both `build_parent_side_ruleset` (which picks the
+/// ABI and decides whether to install the network handler) and the
+/// `Sandbox::posture` implementation (which surfaces the enforced
+/// dimensions for the install pipeline's warning + doctor surfaces).
+#[derive(Debug, Clone)]
+enum BackendPosture {
+    /// V1 with FS rules only, no AccessNet rules. Reached when the
+    /// user picked `[sandbox] mode = "default"` (or accepted the
+    /// default default). Matches the Phase 46 P5 baseline. Phase
+    /// 46.1 rework (2026-05-11): added so the doctor / posture
+    /// surfaces can distinguish "user chose default" from "user
+    /// chose strict but kernel forced fallback" (`Degraded`).
+    Default,
+    /// V4 with both FS rules and network handling installed. The
+    /// full Phase 46.1 strict contract. Reached when the user opts
+    /// into strict mode AND the kernel delivers landlock V4.
+    Strict,
+    /// V1 with FS rules only. Triggered when the user opts into
+    /// strict mode (`deny_outbound_network = true`) BUT the kernel
+    /// is below the V4 floor AND `[sandbox] allow-degraded = true`
+    /// is set. The `detected_kernel` field flows into the
+    /// per-install warning so users see the fallback explicitly.
+    Degraded { detected_kernel: String },
+}
+
+impl BackendPosture {
+    /// Landlock ABI level the parent-side ruleset builder uses.
+    fn abi(&self) -> ABI {
+        match self {
+            BackendPosture::Strict => TARGET_ABI_STRICT,
+            BackendPosture::Default | BackendPosture::Degraded { .. } => TARGET_ABI_FALLBACK,
+        }
+    }
+
+    /// `true` iff this posture installs landlock V4's TCP-deny
+    /// handler (`AccessNet::from_all(V4)` — BindTcp + ConnectTcp).
+    /// Only Strict does; `Default` and `Degraded` explicitly do
+    /// not.
+    ///
+    /// Naming: "enforces TCP" would be more precise than "enforces
+    /// network" — landlock V4 doesn't cover UDP / raw / AF_PACKET.
+    /// The full network-denial story on Linux is `enforces_tcp`
+    /// (this method) AND, after Phase 46.1.1 lands, the seccomp-bpf
+    /// filter that denies the non-TCP socket families. The method
+    /// name stays `enforces_network` because that matches the
+    /// landlock-side intent — the seccomp layer will be its own
+    /// predicate when it lands.
+    fn enforces_network(&self) -> bool {
+        matches!(self, BackendPosture::Strict)
+    }
+}
 
 pub(crate) struct LandlockSandbox {
     spec: SandboxSpec,
     mode: SandboxMode,
+    posture: BackendPosture,
 }
 
 impl LandlockSandbox {
-    pub(crate) fn new(spec: SandboxSpec, mode: SandboxMode) -> Result<Self, SandboxError> {
+    pub(crate) fn new(
+        spec: SandboxSpec,
+        mode: SandboxMode,
+        options: SandboxOptions,
+    ) -> Result<Self, SandboxError> {
         match mode {
             SandboxMode::Enforce => {
-                probe_kernel_support()?;
+                let posture = if options.deny_outbound_network {
+                    // Strict path — Phase 46.1's locked contract.
+                    // Two-step decision: (a) pure version-based
+                    // posture pick via [`decide_posture`]; (b) live
+                    // landlock probe at the chosen ABI to confirm
+                    // the kernel actually delivers it.
+                    let detected = detect_kernel_version();
+                    match decide_posture(&detected, options.allow_degraded) {
+                        PostureDecision::Strict => {
+                            probe_landlock_at(TARGET_ABI_STRICT, /* with_network */ true).map_err(
+                                |_| SandboxError::KernelTooOld {
+                                    detected: detected.clone(),
+                                    required: MIN_KERNEL_VERSION_STRICT.to_string(),
+                                    remediation: strict_remediation(),
+                                },
+                            )?;
+                            BackendPosture::Strict
+                        }
+                        PostureDecision::Degraded { detected_kernel } => {
+                            probe_landlock_at(TARGET_ABI_FALLBACK, /* with_network */ false)
+                                .map_err(|_| SandboxError::KernelTooOld {
+                                    detected: detected_kernel.clone(),
+                                    required: MIN_KERNEL_VERSION_FALLBACK.to_string(),
+                                    remediation: degraded_v1_probe_failed_remediation(),
+                                })?;
+                            BackendPosture::Degraded { detected_kernel }
+                        }
+                        PostureDecision::Refuse {
+                            detected_kernel,
+                            required_kernel,
+                        } => {
+                            return Err(SandboxError::KernelTooOld {
+                                detected: detected_kernel,
+                                required: required_kernel.to_string(),
+                                remediation: strict_remediation(),
+                            });
+                        }
+                    }
+                } else {
+                    // Default path — Phase 46.1 rework (2026-05-11).
+                    // The user picked the relaxed mode (or accepted
+                    // the default default). V1 floor is sufficient
+                    // (filesystem rules only, no AccessNet
+                    // declaration). `allow_degraded` is irrelevant
+                    // here — V1 is what we'd fall back to anyway,
+                    // and it's not a "degraded" state because the
+                    // user didn't ask for stricter coverage.
+                    //
+                    // Still probe to surface a meaningful error if
+                    // landlock is entirely absent (LSM disabled,
+                    // kernel < 5.13). Without this, a missing-LSM
+                    // host would silently produce a useless sandbox.
+                    probe_landlock_at(TARGET_ABI_FALLBACK, /* with_network */ false).map_err(
+                        |_| {
+                            let detected = detect_kernel_version();
+                            SandboxError::KernelTooOld {
+                                detected,
+                                required: MIN_KERNEL_VERSION_FALLBACK.to_string(),
+                                remediation: default_mode_probe_failed_remediation(),
+                            }
+                        },
+                    )?;
+                    BackendPosture::Default
+                };
+                Ok(Self {
+                    spec,
+                    mode,
+                    posture,
+                })
             }
             // Chunk 4: landlock has no native observe-only primitive
             // (RulesetStatus::NotEnforced / PartiallyEnforced /
@@ -107,30 +271,67 @@ impl LandlockSandbox {
             // reject LogOnly honestly rather than invent a pseudo-
             // mode that would pretend to observe while silently
             // doing nothing.
-            SandboxMode::LogOnly => {
-                return Err(SandboxError::ModeNotSupportedOnPlatform {
-                    platform: "linux".to_string(),
-                    mode: SandboxMode::LogOnly,
-                    remediation: "landlock has no native observe-only primitive in \
+            SandboxMode::LogOnly => Err(SandboxError::ModeNotSupportedOnPlatform {
+                platform: "linux".to_string(),
+                mode: SandboxMode::LogOnly,
+                remediation: "landlock has no native observe-only primitive in \
                          Phase 46 P5. To debug a sandbox false-positive, re-run \
                          with --unsafe-full-env --no-sandbox. `--sandbox-log` \
                          remains available on macOS."
-                        .to_string(),
-                });
-            }
+                    .to_string(),
+            }),
             // Disabled never reaches this backend — factory routes
             // it to NoopSandbox. Defensive error symmetric with
             // the macOS backend's guard.
-            SandboxMode::Disabled => {
-                return Err(SandboxError::InvalidSpec {
-                    reason: "SandboxMode::Disabled reached LandlockSandbox — should \
+            SandboxMode::Disabled => Err(SandboxError::InvalidSpec {
+                reason: "SandboxMode::Disabled reached LandlockSandbox — should \
                              have been routed to NoopSandbox by the factory"
-                        .to_string(),
-                });
-            }
+                    .to_string(),
+            }),
         }
-        Ok(Self { spec, mode })
     }
+}
+
+/// User-facing remediation string for the strict posture's refusal
+/// (kernel < 6.7 + `allow_degraded = false`). Names all four
+/// remediations so the user can pick the right one without
+/// re-reading the docs.
+fn strict_remediation() -> String {
+    "remediation options: (1) set `[sandbox] allow-degraded = true` in \
+     `~/.lpm/config.toml` or `./lpm.toml` to fall back to landlock V1 \
+     (filesystem-only — NO outbound TCP denial, NO UDP denial); \
+     (2) add the package to `package.json > lpm > trustedDependencies` \
+     to skip the sandbox for this dependency; (3) re-run with \
+     `--unsafe-full-env --no-sandbox` to skip the sandbox wholesale; \
+     (4) upgrade the host kernel to 6.7+ to get the Phase 46.1 strict \
+     posture (filesystem-write containment + outbound TCP denial; UDP \
+     denial lands in Phase 46.1.1's seccomp-bpf layer)."
+        .to_string()
+}
+
+/// Used when the user opted into degraded posture but even the V1
+/// fallback probe failed (landlock LSM disabled entirely). Points
+/// at the kernel upgrade or the wholesale escape hatch — the
+/// degraded opt-in can't help when V1 itself is unreachable.
+fn degraded_v1_probe_failed_remediation() -> String {
+    "even the V1 (filesystem-only) fallback failed — landlock appears to \
+     be disabled on this kernel. Re-run with `--no-sandbox`, add the \
+     package to `package.json > lpm > trustedDependencies`, or rebuild \
+     the kernel with CONFIG_SECURITY_LANDLOCK=y."
+        .to_string()
+}
+
+/// Used when the user is on the relaxed default mode but the V1
+/// probe fails (landlock LSM disabled entirely). Same recourses as
+/// the degraded path — the default mode can't deliver any sandbox
+/// either if V1 is unreachable.
+fn default_mode_probe_failed_remediation() -> String {
+    "landlock appears to be disabled on this kernel (even the V1 \
+     filesystem-only baseline failed to load). Re-run with \
+     `--no-sandbox`, add the package to `package.json > lpm > \
+     trustedDependencies`, or rebuild the kernel with \
+     CONFIG_SECURITY_LANDLOCK=y."
+        .to_string()
 }
 
 impl Sandbox for LandlockSandbox {
@@ -162,7 +363,7 @@ impl Sandbox for LandlockSandbox {
         // `landlock_add_rule` via Ruleset::add_rule) happens here in
         // normal multi-threaded context. The child's pre_exec body
         // only touches direct syscalls.
-        let ruleset = build_parent_side_ruleset(&self.spec).map_err(|e| {
+        let ruleset = build_parent_side_ruleset(&self.spec, &self.posture).map_err(|e| {
             SandboxError::ProfileRenderFailed {
                 reason: format!("landlock ruleset build failed: {e}"),
             }
@@ -227,30 +428,44 @@ impl Sandbox for LandlockSandbox {
     fn mode(&self) -> SandboxMode {
         self.mode
     }
+
+    fn posture(&self) -> SandboxPosture {
+        match &self.posture {
+            BackendPosture::Default => SandboxPosture::Default,
+            BackendPosture::Strict => SandboxPosture::Strict,
+            BackendPosture::Degraded { detected_kernel } => SandboxPosture::Degraded {
+                kernel: detected_kernel.clone(),
+                abi: "v1",
+                missing: "network-containment",
+            },
+        }
+    }
 }
 
-/// Parent-side kernel probe. Builds a HardRequirement ruleset at
-/// [`TARGET_ABI`]; any failure is treated as "this kernel doesn't
-/// support landlock" regardless of the specific error variant.
-/// Treating all probe errors as KernelTooOld keeps the denial
-/// message pointed at the same remediation — upgrade the kernel or
-/// use `--unsafe-full-env --no-sandbox`.
-fn probe_kernel_support() -> Result<(), SandboxError> {
-    let build = Ruleset::default()
+/// Parent-side landlock probe at a specific ABI. Builds a
+/// HardRequirement ruleset declaring the FS + (optionally) network
+/// access classes the constructed sandbox will install. Used by
+/// [`LandlockSandbox::new`] AFTER [`decide_posture`] picks which ABI
+/// to target — the probe confirms the kernel actually delivers
+/// landlock at that level (the version string can be spoofed or
+/// reported correctly while the LSM is disabled in the build).
+///
+/// On success the probe is dropped (FD closes). On failure the
+/// caller decides which `SandboxError::KernelTooOld { required: …}`
+/// minimum to surface based on which probe was tried.
+fn probe_landlock_at(abi: ABI, with_network: bool) -> Result<(), RulesetError> {
+    let mut builder = Ruleset::default()
         .set_compatibility(CompatLevel::HardRequirement)
-        .handle_access(AccessFs::from_all(TARGET_ABI))
-        .and_then(|r| r.create());
-    match build {
-        Ok(_ruleset_created) => Ok(()),
-        Err(_) => Err(SandboxError::KernelTooOld {
-            detected: detect_kernel_version(),
-            required: MIN_KERNEL_VERSION.to_string(),
-            remediation: "upgrade to Linux 5.13+ with landlock enabled, or re-run with \
-                 --unsafe-full-env --no-sandbox to execute scripts without \
-                 containment. `script-policy = deny` is the always-safe default."
-                .to_string(),
-        }),
+        .handle_access(AccessFs::from_all(abi))?;
+    if with_network {
+        // `AccessNet::from_all(V4)` is `BindTcp | ConnectTcp`. With
+        // HardRequirement set, calling handle_access on a kernel
+        // that doesn't expose the V4 network capabilities errors —
+        // exactly the signal we want from the probe.
+        builder = builder.handle_access(AccessNet::from_all(abi))?;
     }
+    let _ruleset = builder.create()?;
+    Ok(())
 }
 
 /// Build the full landlock ruleset on the PARENT process, before
@@ -262,10 +477,30 @@ fn probe_kernel_support() -> Result<(), SandboxError> {
 /// set is a tighter security posture than no sandbox at all, and
 /// the escape hatch remains `--unsafe-full-env --no-sandbox` if the
 /// user needs the missing rule's access.
-fn build_parent_side_ruleset(spec: &SandboxSpec) -> Result<RulesetCreated, RulesetError> {
-    let rw = AccessFs::from_all(TARGET_ABI);
-    let read = AccessFs::from_read(TARGET_ABI);
-    let mut ruleset = Ruleset::default().handle_access(rw)?.create()?;
+///
+/// Phase 46.1: when `posture` is [`BackendPosture::Strict`], the
+/// ruleset also declares `handle_access(AccessNet::from_all(V4))`
+/// (BindTcp + ConnectTcp) but installs no `NetPort` allow rules —
+/// landlock then default-denies every TCP bind / connect, which is
+/// the kernel-level outbound network denial Phase 46.1 ships.
+fn build_parent_side_ruleset(
+    spec: &SandboxSpec,
+    posture: &BackendPosture,
+) -> Result<RulesetCreated, RulesetError> {
+    let abi = posture.abi();
+    let rw = AccessFs::from_all(abi);
+    let read = AccessFs::from_read(abi);
+    let mut builder = Ruleset::default().handle_access(rw)?;
+    if posture.enforces_network() {
+        // Strict V4 only: declare the network access classes so
+        // they participate in the deny-default. We deliberately add
+        // NO `NetPort` rules — landlock's contract is that a class
+        // declared via `handle_access` with no per-rule allows is
+        // default-denied. That gives us the "no outbound, no
+        // loopback exemption" posture the design note Q1 locks.
+        builder = builder.handle_access(AccessNet::from_all(abi))?;
+    }
+    let mut ruleset = builder.create()?;
     for (path, access) in describe_rules(spec) {
         let fd = match PathFd::new(&path) {
             Ok(fd) => fd,
@@ -314,7 +549,7 @@ fn detect_kernel_version() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{SandboxMode, SandboxStdio, SandboxedCommand, new_for_platform};
+    use crate::{SandboxMode, SandboxOptions, SandboxStdio, SandboxedCommand, new_for_platform};
     use std::path::PathBuf;
 
     fn realistic_spec() -> SandboxSpec {
@@ -340,9 +575,13 @@ mod tests {
         // ModeNotSupportedOnPlatform error whose remediation names
         // `--unsafe-full-env --no-sandbox` as the workaround. This
         // test runs regardless of kernel support — the mode check
-        // happens BEFORE probe_kernel_support so users on old
+        // happens BEFORE the posture decision so users on old
         // kernels get the same clear message.
-        match LandlockSandbox::new(realistic_spec(), SandboxMode::LogOnly) {
+        match LandlockSandbox::new(
+            realistic_spec(),
+            SandboxMode::LogOnly,
+            SandboxOptions::default(),
+        ) {
             Err(SandboxError::ModeNotSupportedOnPlatform {
                 platform,
                 mode,
@@ -370,7 +609,11 @@ mod tests {
         // never route Disabled here; if it does, bail with a clear
         // error instead of silently installing an unnecessary
         // landlock ruleset.
-        match LandlockSandbox::new(realistic_spec(), SandboxMode::Disabled) {
+        match LandlockSandbox::new(
+            realistic_spec(),
+            SandboxMode::Disabled,
+            SandboxOptions::default(),
+        ) {
             Err(SandboxError::InvalidSpec { reason }) => {
                 assert!(reason.contains("Disabled"));
                 assert!(reason.contains("NoopSandbox"));
@@ -381,22 +624,104 @@ mod tests {
     }
 
     #[test]
-    fn new_either_succeeds_or_surfaces_kernel_too_old() {
-        match LandlockSandbox::new(realistic_spec(), SandboxMode::Enforce) {
+    fn new_default_options_returns_default_posture() {
+        // Phase 46.1 rework (2026-05-11): default options give the
+        // relaxed default — V1 baseline, no AccessNet rules. The
+        // kernel-version probe still runs (V1 floor) so this test
+        // can fail with `KernelTooOld { required: "5.13" }` only on
+        // hosts where landlock is entirely disabled.
+        match LandlockSandbox::new(
+            realistic_spec(),
+            SandboxMode::Enforce,
+            SandboxOptions::default(),
+        ) {
             Ok(sb) => {
                 assert_eq!(sb.backend_name(), "landlock");
+                assert_eq!(sb.posture(), SandboxPosture::Default);
+            }
+            Err(SandboxError::KernelTooOld { required, .. }) => {
+                // Landlock LSM disabled entirely; V1 probe failed.
+                assert_eq!(required, MIN_KERNEL_VERSION_FALLBACK);
+            }
+            Err(other) => panic!("unexpected error variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn new_strict_either_succeeds_or_surfaces_kernel_too_old() {
+        // Phase 46.1 strict path: `deny_outbound_network = true`
+        // engages V4 with AccessNet rules. On a host at or above
+        // kernel 6.7, construction succeeds with `Strict` posture.
+        // On a host below 6.7 (and `allow_degraded = false`), the
+        // backend surfaces `KernelTooOld { required: "6.7" }` with
+        // a remediation block naming the four named recourses.
+        let options = SandboxOptions {
+            deny_outbound_network: true,
+            ..SandboxOptions::default()
+        };
+        match LandlockSandbox::new(realistic_spec(), SandboxMode::Enforce, options) {
+            Ok(sb) => {
+                assert_eq!(sb.backend_name(), "landlock");
+                assert_eq!(sb.posture(), SandboxPosture::Strict);
             }
             Err(SandboxError::KernelTooOld {
                 detected,
                 required,
                 remediation,
             }) => {
-                assert_eq!(required, MIN_KERNEL_VERSION);
+                assert_eq!(required, MIN_KERNEL_VERSION_STRICT);
                 assert!(!detected.is_empty());
                 assert!(
                     remediation.contains("--unsafe-full-env --no-sandbox"),
                     "remediation must name the escape hatch: {remediation}"
                 );
+                assert!(
+                    remediation.contains("allow-degraded"),
+                    "remediation must name the degraded-posture opt-in: {remediation}"
+                );
+                assert!(
+                    remediation.contains("trustedDependencies"),
+                    "remediation must name the per-package trust escape: {remediation}"
+                );
+            }
+            Err(other) => panic!("unexpected error variant: {other:?}"),
+        }
+    }
+
+    /// Phase 46.1: on a Linux host below the 6.7 floor AND with
+    /// strict requested, the `allow_degraded = true` opt-in must
+    /// produce a V1 (filesystem-only) sandbox with
+    /// [`SandboxPosture::Degraded`]. On a host at or above 6.7 the
+    /// opt-in is a no-op — the backend still returns Strict.
+    #[test]
+    fn new_strict_with_allow_degraded_returns_degraded_on_old_kernels_strict_on_new() {
+        let options = SandboxOptions {
+            deny_outbound_network: true,
+            allow_degraded: true,
+        };
+        match LandlockSandbox::new(realistic_spec(), SandboxMode::Enforce, options) {
+            Ok(sb) => {
+                assert_eq!(sb.backend_name(), "landlock");
+                match sb.posture() {
+                    SandboxPosture::Strict => {
+                        // CI runner at 6.7+ — opt-in is a no-op.
+                    }
+                    SandboxPosture::Degraded {
+                        kernel,
+                        abi,
+                        missing,
+                    } => {
+                        assert!(!kernel.is_empty());
+                        assert_eq!(abi, "v1");
+                        assert_eq!(missing, "network-containment");
+                    }
+                    other => panic!("unexpected posture from landlock backend: {other:?}"),
+                }
+            }
+            Err(SandboxError::KernelTooOld { required, .. }) => {
+                // V1 fallback probe also failed — landlock LSM
+                // disabled entirely. Error names the 5.13 floor.
+                assert_eq!(required, MIN_KERNEL_VERSION_FALLBACK);
             }
             Err(other) => panic!("unexpected error variant: {other:?}"),
         }
@@ -418,22 +743,35 @@ mod tests {
         let mut spec = realistic_spec();
         spec.extra_write_dirs
             .push(PathBuf::from("/tmp/lpm-sandbox-chunk3-nonexistent-path"));
-        // If the kernel doesn't have landlock, probe_kernel_support
-        // handles that — but build_parent_side_ruleset is independent
-        // of that probe and can still be exercised.
-        match build_parent_side_ruleset(&spec) {
-            Ok(_) => {} // ruleset built, missing extra was skipped
-            Err(e) => {
-                // Only acceptable error: the kernel doesn't support
-                // landlock at all, which presents as a create()
-                // failure. Any other error is a regression.
-                let msg = format!("{e}");
-                assert!(
-                    msg.contains("create")
-                        || msg.contains("handle_access")
-                        || msg.contains("HandleAccesses"),
-                    "unexpected build_parent_side_ruleset error: {msg}"
-                );
+        // If the kernel doesn't have landlock at the strict V4 ABI,
+        // construction via the LandlockSandbox::new path would route
+        // through `decide_posture` + the probe layer first. The
+        // `build_parent_side_ruleset` test below exercises the
+        // post-decision rule-build path against both postures so we
+        // cover the Strict-V4 + network-handler shape AND the
+        // Degraded-V1 filesystem-only shape regardless of host
+        // kernel availability.
+        for posture in [
+            BackendPosture::Strict,
+            BackendPosture::Degraded {
+                detected_kernel: "5.15.0-test".to_string(),
+            },
+        ] {
+            match build_parent_side_ruleset(&spec, &posture) {
+                Ok(_) => {} // ruleset built, missing extra was skipped
+                Err(e) => {
+                    // Only acceptable error: the kernel doesn't support
+                    // landlock at this ABI, which presents as a
+                    // handle_access / create() failure. Any other
+                    // error is a regression.
+                    let msg = format!("{e}");
+                    assert!(
+                        msg.contains("create")
+                            || msg.contains("handle_access")
+                            || msg.contains("HandleAccesses"),
+                        "unexpected build_parent_side_ruleset error for posture {posture:?}: {msg}",
+                    );
+                }
             }
         }
     }

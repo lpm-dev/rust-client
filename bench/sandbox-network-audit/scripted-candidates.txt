@@ -1,0 +1,104 @@
+# Phase 46.1 sandbox-network-audit — curated candidate list.
+#
+# This file is the second seed for `build-input-list.sh`. It lists
+# packages we want this audit to keep covering as the ecosystem
+# moves, organised by the family-classifier buckets in `run.sh`.
+# The generator combines this with `../top-npm-audit/top-100.txt`,
+# de-duplicates, fetches `/latest` metadata for each, and keeps the
+# entries whose `.scripts` carry `preinstall` / `install` /
+# `postinstall`.
+#
+# Add a package here when:
+#   - it's a known scripted package the harness must cover (a new
+#     prebuild-downloader / native-bundler / etc.), or
+#   - a top-100 entry has moved its install-time work elsewhere
+#     (e.g. a `prepare`-script-only flow) and you want to track
+#     it separately.
+#
+# Lines starting with `#` and blank lines are ignored.
+
+# === prebuild-downloader family ===
+# Packages that download prebuilt native binaries during postinstall.
+esbuild
+sharp
+bcrypt
+node-sass
+sqlite3
+better-sqlite3
+canvas
+@biomejs/biome
+@swc/core
+@grpc/grpc-js
+@tensorflow/tfjs-node
+node-rdkafka
+serialport
+robotjs
+node-pty
+heapdump
+ws
+bufferutil
+utf-8-validate
+cpu-features
+keytar
+re2
+iconv
+farmhash
+node-forge
+level
+classic-level
+deasync
+mmmagic
+dtrace-provider
+epoll
+segfault-handler
+node-expat
+zeromq
+ssh2
+nodegit
+
+# === browser-fetcher family ===
+# Postinstall fetches a browser binary.
+puppeteer
+@puppeteer/browsers
+playwright
+playwright-core
+@playwright/test
+cypress
+electron
+@electron/rebuild
+
+# === native-bundler family ===
+# Postinstall builds against the host toolchain.
+prisma
+@prisma/client
+@prisma/engines
+tree-sitter
+tree-sitter-cli
+lightningcss
+@oxc-project/runtime
+node-gyp
+node-pre-gyp
+node-addon-api
+prebuild-install
+prebuildify
+bindings
+
+# === telemetry family ===
+# Postinstall pings a remote endpoint (analytics, error reporting).
+@sentry/cli
+@sentry/node
+posthog-node
+@segment/analytics-node
+opencollective-postinstall
+core-js  # postinstall runs `node -e \"... opencollective\"`
+nodemon  # postinstall ad notice (no network in modern versions)
+husky
+
+# === other family — known-scripted packages that don't fit above ===
+fsevents
+@parcel/watcher
+chokidar  # no script in modern versions; tracked to confirm
+gatsby-telemetry
+react-scripts
+@vercel/analytics
+@vercel/speed-insights

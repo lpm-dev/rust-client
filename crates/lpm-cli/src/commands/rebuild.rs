@@ -779,6 +779,25 @@ async fn run_under_store_lock(
     lpm_sandbox::prepare_writable_dirs(&prepare_spec)
         .map_err(|e| LpmError::Registry(format!("{e}")))?;
 
+    // Phase 46.1: load the `[sandbox] allow-degraded` opt-in from
+    // <project>/lpm.toml + ~/.lpm/config.toml. Project wins; both
+    // fall through to strict (`allow_degraded = false`). The
+    // resolved options thread through both the pre-probe (next
+    // block) AND the per-package sandbox construction inside
+    // `execute_script` (further down the file), so the posture
+    // decision is made once and applied consistently.
+    // Phase 46.1 rework (2026-05-11): resolve the full sandbox-mode
+    // precedence chain — CLI flag > env > project lpm.toml > user
+    // config.toml > default. The CLI flag bools are wired in a
+    // follow-up; for this rework we route env + config through.
+    // `--no-sandbox` still goes through the legacy
+    // `no_sandbox` / `unsafe_full_env` partner-pair path below, so
+    // we pass `no_sandbox_flag = false` here — the legacy path
+    // sets `SandboxMode::Disabled` and skips the constructor
+    // entirely.
+    let (sandbox_options, _resolved_mode) =
+        crate::sandbox_config::resolve_sandbox_mode_from_chain(project_dir, false, false)?;
+
     // Phase 46 P5 Chunk 4: pre-probe the sandbox factory with a
     // synthetic spec so unsupported-platform and mode-not-supported
     // errors surface BEFORE any banner or package loop starts.
@@ -786,6 +805,12 @@ async fn run_under_store_lock(
     // see the "rule triggers logged but NOT enforced" banner and
     // then get ModeNotSupportedOnPlatform — contradictory UX the
     // Chunk 4 review flagged.
+    //
+    // Phase 46.1 additionally uses the pre-probe to read the
+    // backend's effective [`SandboxPosture`] — if `allow-degraded`
+    // activated the V1 fallback, this is where we emit the
+    // structured per-install stderr warning (exactly once,
+    // regardless of how many scripted packages are about to build).
     //
     // Disabled is skipped: NoopSandbox is available on every
     // platform, so the probe would always succeed and we'd just
@@ -801,8 +826,22 @@ async fn run_under_store_lock(
             tmpdir: tmpdir.clone(),
             extra_write_dirs: Vec::new(),
         };
-        lpm_sandbox::new_for_platform(probe_spec, sandbox_mode)
-            .map_err(|e| LpmError::Registry(format!("sandbox unavailable: {e}")))?;
+        let probe_sandbox = lpm_sandbox::new_for_platform_with_options(
+            probe_spec,
+            sandbox_mode,
+            sandbox_options.clone(),
+        )
+        .map_err(|e| LpmError::Registry(format!("sandbox unavailable: {e}")))?;
+        // Phase 46.1 per-install warning: emitted once when the
+        // probe's effective posture is `Degraded`. The structured
+        // line names kernel + active ABI + missing dimension so log
+        // scrapers can detect the gap mechanically. JSON mode
+        // suppresses it on stderr — the doctor surface still
+        // reports the same posture for tooling consumers.
+        if !json_output && let Some(line) = probe_sandbox.posture().degraded_warning_line() {
+            output::warn(&line);
+        }
+        drop(probe_sandbox);
     }
 
     // Banners fire AFTER the probe succeeds. On Linux + LogOnly the
@@ -892,6 +931,7 @@ async fn run_under_store_lock(
                 &sanitized_env,
                 &timeout,
                 sandbox_mode,
+                &sandbox_options,
                 &extra_write_dirs,
                 &store_root,
                 &home_dir,
@@ -973,6 +1013,7 @@ fn execute_script(
     env: &HashMap<String, String>,
     timeout: &Duration,
     sandbox_mode: SandboxMode,
+    sandbox_options: &lpm_sandbox::SandboxOptions,
     extra_write_dirs: &[PathBuf],
     store_root: &Path,
     home_dir: &Path,
@@ -1007,6 +1048,7 @@ fn execute_script(
         project_dir,
         &envs,
         sandbox_mode,
+        sandbox_options,
         extra_write_dirs,
         store_root,
         home_dir,
@@ -1300,12 +1342,13 @@ fn spawn_lifecycle_child(
     project_dir: &Path,
     envs: &[(String, String)],
     sandbox_mode: SandboxMode,
+    sandbox_options: &lpm_sandbox::SandboxOptions,
     extra_write_dirs: &[PathBuf],
     store_root: &Path,
     home_dir: &Path,
     tmpdir: &Path,
 ) -> Result<std::process::Child, String> {
-    use lpm_sandbox::{SandboxSpec, SandboxStdio, SandboxedCommand, new_for_platform};
+    use lpm_sandbox::{SandboxSpec, SandboxStdio, SandboxedCommand, new_for_platform_with_options};
 
     let spec = SandboxSpec {
         package_dir: package_dir.to_path_buf(),
@@ -1317,8 +1360,15 @@ fn spawn_lifecycle_child(
         tmpdir: tmpdir.to_path_buf(),
         extra_write_dirs: extra_write_dirs.to_vec(),
     };
-    let sandbox =
-        new_for_platform(spec, sandbox_mode).map_err(|e| format!("sandbox init failed: {e}"))?;
+    // Phase 46.1: thread the resolved `[sandbox] allow-degraded`
+    // opt-in through so per-package sandbox construction picks the
+    // same posture the pre-probe used. Posture mismatches between
+    // pre-probe and per-package construction would surface as a
+    // visible behavior change midway through an install, which is
+    // exactly the inconsistency the shared `sandbox_options` value
+    // exists to prevent.
+    let sandbox = new_for_platform_with_options(spec, sandbox_mode, sandbox_options.clone())
+        .map_err(|e| format!("sandbox init failed: {e}"))?;
 
     let mut sbcmd = SandboxedCommand::new("sh")
         .arg("-c")
