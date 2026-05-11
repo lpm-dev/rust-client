@@ -776,12 +776,18 @@ enum Commands {
 
     /// Manage CLI configuration.
     Config {
-        /// Action: get, set, delete, list.
+        /// Action: get, set, delete, list, scripts, triage.
         action: String,
-        /// Config key.
+        /// Config key (for get/set/delete).
         key: Option<String>,
         /// Config value (for set).
         value: Option<String>,
+        /// Non-interactive value for the `scripts` / `triage` wizards.
+        /// Required when stdin is not a TTY. Examples:
+        ///   `lpm config scripts --set triage`
+        ///   `lpm config triage --set claude-cli`
+        #[arg(long = "set", value_name = "VALUE")]
+        set: Option<String>,
     },
 
     /// Manage ephemeral caches under ~/.lpm/cache/ (metadata, tasks, dlx)
@@ -3203,8 +3209,20 @@ async fn async_main() -> Result<()> {
             let cwd = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;
             commands::init::run(&client, &cwd, yes, cli.json).await
         }
-        Commands::Config { action, key, value } => {
-            commands::config::run(&action, key.as_deref(), value.as_deref(), cli.json).await
+        Commands::Config {
+            action,
+            key,
+            value,
+            set,
+        } => {
+            commands::config::run(
+                &action,
+                key.as_deref(),
+                value.as_deref(),
+                set.as_deref(),
+                cli.json,
+            )
+            .await
         }
         Commands::Cache {
             action,
