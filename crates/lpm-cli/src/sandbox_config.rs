@@ -404,15 +404,37 @@ pub fn decide_runtime_sandbox_mode(
 /// (`LPM_STRICT_SANDBOX=1`) users got the kernel-level network
 /// denial silently. The DX-doc walkthroughs W3 / W6 / W8 all show
 /// the same banner regardless of source, so the gating must be on
-/// the *resolved* mode, not on which tier supplied it.
+/// the resolved mode, not on which tier supplied it.
+///
+/// GPT-5 audit follow-up (same day, second pass): the banner must
+/// ALSO gate on the final [`SandboxMode`], not just the resolved
+/// tier. `--sandbox-log` (macOS Seatbelt diagnostic) wins over
+/// resolved Strict in [`decide_runtime_sandbox_mode`] and produces
+/// [`SandboxMode::LogOnly`] — observed-but-not-enforced. Emitting
+/// "outbound network will be denied" alongside the existing
+/// "logged but NOT enforced" sandbox-log banner is a lie about
+/// the runtime contract. Under LogOnly the rules are loaded but
+/// not enforced, so the strict banner must suppress itself.
+/// Similarly under [`SandboxMode::Disabled`] — containment is off,
+/// so claiming any enforcement is wrong (the disabled-sandbox
+/// banner at the env-scrub site already covers that case).
 ///
 /// Wording is intentionally neutral (no `--strict-sandbox` prefix)
 /// because the banner runs the same for config / env / CLI sources;
 /// claiming a source the install can't actually attribute would be
-/// the inverse of the bug GPT-5 just caught. The provenance ("which
-/// tier set strict") belongs on `lpm doctor`, which DOES have the
-/// resolver result available and a stable surface for it.
-pub fn strict_banner_for_resolved(resolved: ResolvedSandboxMode) -> Option<&'static str> {
+/// the inverse of the first bug GPT-5 caught. The provenance
+/// ("which tier set strict") belongs on `lpm doctor`, which DOES
+/// have the resolver result available and a stable surface for it.
+pub fn strict_banner_for_runtime(
+    sandbox_mode: SandboxMode,
+    resolved: ResolvedSandboxMode,
+) -> Option<&'static str> {
+    // Truthfulness gate: only announce "will be denied" when the
+    // runtime is actually going to enforce. LogOnly / Disabled
+    // produce contradictory UX without this.
+    if !matches!(sandbox_mode, SandboxMode::Enforce) {
+        return None;
+    }
     match resolved {
         ResolvedSandboxMode::Strict => Some(
             "strict-sandbox: outbound network will be denied for every lifecycle script in \
@@ -834,25 +856,36 @@ allow-degraded = "maybe"
         assert!(!scrub);
     }
 
-    // ── strict_banner_for_resolved (GPT-5 audit follow-up, 2026-05-11) ──
+    // ── strict_banner_for_runtime (GPT-5 audit follow-up, 2026-05-11) ──
     //
-    // GPT-5 audit caught a Low: the strict-mode runtime warning only
-    // fired for `--strict-sandbox` / `--paranoid` on the CLI. When
-    // strict came from `[sandbox] mode = "strict"` or
-    // `LPM_STRICT_SANDBOX=1`, the kernel-level network denial
-    // engaged silently — contradicting DX-doc walkthroughs W3 / W6 /
-    // W8 which all promise the same banner regardless of source.
+    // GPT-5 audit caught two related bugs here, both fixed by gating
+    // on the (final SandboxMode, resolved tier) pair:
+    //
+    // Round 1 (Low): the banner only fired for `--strict-sandbox` /
+    // `--paranoid` on the CLI. Config-set / env-set strict was
+    // silent, contradicting DX-doc walkthroughs W3 / W6 / W8.
+    //
+    // Round 2 (Medium): once the banner fired for all resolved-Strict
+    // sources, it ALSO fired when `--sandbox-log` was passed together
+    // with strict — but `decide_runtime_sandbox_mode` collapses to
+    // [`SandboxMode::LogOnly`] in that case, so the resulting UX was
+    // contradictory ("network will be denied" immediately followed
+    // by "logged but NOT enforced"). The clap layer doesn't reject
+    // `--strict-sandbox --sandbox-log` (and can't reject the
+    // env/config tier strict + CLI `--sandbox-log` combinations at
+    // all). The decision-layer gate must catch it.
+    //
     // These tests pin the corrected contract.
 
     #[test]
-    fn strict_banner_fires_for_resolved_strict() {
-        // The bug case: regardless of which tier supplied `Strict`
-        // (CLI flag / env / config), the runtime banner must
-        // announce that outbound network is being denied.
-        let banner = strict_banner_for_resolved(ResolvedSandboxMode::Strict);
+    fn strict_banner_fires_for_enforce_plus_resolved_strict() {
+        // The 90% strict-mode case: backend will Enforce + resolved
+        // is Strict. Banner announces outbound network will be
+        // denied, regardless of which tier supplied Strict.
+        let banner = strict_banner_for_runtime(SandboxMode::Enforce, ResolvedSandboxMode::Strict);
         let line = banner.expect(
-            "strict mode MUST emit a runtime banner — DX-doc walkthroughs W3 / W6 / W8 \
-             all require it regardless of source. This was the GPT-5 audit Low finding.",
+            "strict mode under Enforce MUST emit a runtime banner — DX-doc walkthroughs W3 / W6 / W8 \
+             all require it regardless of source. This was the GPT-5 audit Low finding (round 1).",
         );
         assert!(
             line.contains("outbound network"),
@@ -863,12 +896,10 @@ allow-degraded = "maybe"
             "banner must label itself as the strict-sandbox notice so users can grep for it. \
              got: {line}",
         );
-        // Negative assertion + regression pin: pre-fix the banner
-        // string included `--strict-sandbox:` (with the double-dash
-        // CLI-flag prefix), which claimed a source the install
-        // pipeline can no longer attribute correctly. If someone
-        // restores that prefix the banner will lie under config /
-        // env tier strict.
+        // Pre-fix regression pin: the banner used to start with
+        // `--strict-sandbox:` (double-dash CLI-flag prefix), which
+        // claimed a source the install pipeline can no longer
+        // attribute correctly under env/config-tier strict.
         assert!(
             !line.starts_with("--"),
             "banner must NOT prefix `--` — that would falsely claim CLI-flag source when \
@@ -878,19 +909,79 @@ allow-degraded = "maybe"
     }
 
     #[test]
-    fn strict_banner_does_not_fire_under_default_or_none() {
+    fn strict_banner_does_not_fire_under_default_or_none_resolved() {
         // Symmetric: no banner when there's nothing to announce.
         // Default is the relaxed posture (no network denial); None
         // is fully off and gets its own different banner up at the
         // env-scrub site.
         assert!(
-            strict_banner_for_resolved(ResolvedSandboxMode::Default).is_none(),
+            strict_banner_for_runtime(SandboxMode::Enforce, ResolvedSandboxMode::Default).is_none(),
             "no banner under the default posture — there's no behaviour change to announce",
         );
         assert!(
-            strict_banner_for_resolved(ResolvedSandboxMode::None).is_none(),
+            strict_banner_for_runtime(SandboxMode::Enforce, ResolvedSandboxMode::None).is_none(),
             "no strict banner under `mode = \"none\"` — the disabled-sandbox banner at the \
              env-scrub site already covers it",
+        );
+    }
+
+    #[test]
+    fn strict_banner_suppressed_under_logonly_runtime_even_when_resolved_strict() {
+        // GPT-5 audit round 2 (Medium): the failure mode.
+        //
+        // `lpm rebuild --strict-sandbox --sandbox-log` (or env/config
+        // strict + CLI `--sandbox-log`) collapses to LogOnly in
+        // `decide_runtime_sandbox_mode` — the user wants to OBSERVE,
+        // not enforce. Under LogOnly the rules are loaded but rule
+        // triggers are reported, not blocked — so "outbound network
+        // will be denied" is a lie.
+        //
+        // The existing `--sandbox-log: diagnostic mode only. Rule
+        // triggers are logged but NOT enforced…` banner downstream
+        // is the right surface for this run; the strict banner must
+        // suppress itself.
+        let banner = strict_banner_for_runtime(SandboxMode::LogOnly, ResolvedSandboxMode::Strict);
+        assert!(
+            banner.is_none(),
+            "strict banner MUST suppress itself under LogOnly — saying `outbound network \
+             will be denied` while the next line says `logged but NOT enforced` is \
+             contradictory UX. GPT-5 audit round 2 finding. got: {banner:?}",
+        );
+    }
+
+    #[test]
+    fn strict_banner_suppressed_under_disabled_runtime() {
+        // Defense-in-depth: SandboxMode::Disabled means containment
+        // is off entirely. Even if the resolved tier somehow holds
+        // Strict (it can't via the resolver — `no_sandbox=true`
+        // returns `(SandboxOptions::default(), None)` — but a future
+        // refactor could break that invariant), the banner must
+        // suppress itself because enforcement isn't happening.
+        // Under the current chain the disabled-sandbox banner at the
+        // env-scrub site already covers the user-visible message.
+        for resolved in [
+            ResolvedSandboxMode::Strict,
+            ResolvedSandboxMode::Default,
+            ResolvedSandboxMode::None,
+        ] {
+            assert!(
+                strict_banner_for_runtime(SandboxMode::Disabled, resolved).is_none(),
+                "no strict banner under Disabled regardless of resolved tier (resolved={resolved:?})",
+            );
+        }
+    }
+
+    #[test]
+    fn strict_banner_logonly_default_and_none_also_suppressed() {
+        // Symmetric: LogOnly with non-strict resolved doesn't fire
+        // the banner either. Pinned so a future refactor that
+        // changes the gate order doesn't accidentally widen the
+        // banner.
+        assert!(
+            strict_banner_for_runtime(SandboxMode::LogOnly, ResolvedSandboxMode::Default).is_none(),
+        );
+        assert!(
+            strict_banner_for_runtime(SandboxMode::LogOnly, ResolvedSandboxMode::None).is_none(),
         );
     }
 }

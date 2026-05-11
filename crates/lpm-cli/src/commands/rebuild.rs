@@ -877,16 +877,31 @@ async fn run_under_store_lock(
     // stripped + no containment" as one combined warning rather
     // than two split announcements.
     //
-    // GPT-5 audit (2026-05-11) Low: the strict banner now fires on
-    // the RESOLVED mode, not the CLI flag alone. Pre-fix users who
-    // engaged strict via `[sandbox] mode = "strict"` or
-    // `LPM_STRICT_SANDBOX=1` got the kernel-level network denial
-    // silently, contradicting DX-doc walkthroughs W3 / W6 / W8.
-    // `strict_banner_for_resolved` returns `None` for Default / None
-    // so a no-op resolved mode never accidentally triggers the
-    // banner.
+    // GPT-5 audit (2026-05-11) Low + Medium: the strict banner gate
+    // must consult BOTH the resolved tier and the final SandboxMode.
+    //
+    // Round 1: pre-fix the banner only fired for `--strict-sandbox`
+    // / `--paranoid` on the CLI. Config-set / env-set strict was
+    // silent, contradicting DX-doc walkthroughs W3 / W6 / W8.
+    //
+    // Round 2: once the banner fired for all resolved-Strict
+    // sources, it ALSO fired when `--sandbox-log` was passed with
+    // strict (clap allows that pair, and env/config strict + CLI
+    // `--sandbox-log` can't be clap-rejected at all). But
+    // `decide_runtime_sandbox_mode` collapses to LogOnly in that
+    // case, so the user saw "outbound network will be denied"
+    // immediately followed by "logged but NOT enforced" —
+    // contradictory UX.
+    //
+    // `strict_banner_for_runtime` gates on both axes: only emits
+    // when the final mode is Enforce AND the resolved tier is
+    // Strict. LogOnly / Disabled paths fall through silently —
+    // the existing `--sandbox-log` banner just below + the
+    // `no-sandbox` banner up at the env-scrub site cover those
+    // cases truthfully.
     if !json_output
-        && let Some(line) = crate::sandbox_config::strict_banner_for_resolved(resolved_sandbox_mode)
+        && let Some(line) =
+            crate::sandbox_config::strict_banner_for_runtime(sandbox_mode, resolved_sandbox_mode)
     {
         output::warn(line);
     }
