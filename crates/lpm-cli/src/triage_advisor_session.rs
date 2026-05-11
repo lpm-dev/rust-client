@@ -47,8 +47,12 @@
 //! - No `trustedDependencies` entry is written.
 //! - No new on-disk state is created (the build-state blocked set is
 //!   still computed by the existing capture path; advisor-approved
-//!   packages are simply *excluded* from it so the autoBuild path
-//!   can run their scripts).
+//!   packages are excluded from it ONLY when auto-build will actually
+//!   execute their scripts this run — see [`select_approvals_for_capture`]
+//!   in [`crate::commands::install`] for the conditional gate. When
+//!   auto-build is off, the persisted blocked set still surfaces
+//!   advisor-approved-but-not-run packages so they remain reachable
+//!   via `lpm approve-scripts` after the session drops).
 //! - A later `lpm rebuild` invocation has no `AdvisorSession` in
 //!   scope and therefore makes its trust decision purely from the
 //!   persistent `trustedDependencies` manifest.

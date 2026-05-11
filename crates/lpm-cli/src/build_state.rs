@@ -443,6 +443,13 @@ pub fn compute_blocked_packages_with_metadata(
     // them as still-blocked after the autoBuild path executed
     // their scripts via the AdvisorApprovedThisRun trust path.
     //
+    // Caller-side conditional: install passes `Some(view)` only
+    // when auto-build will actually execute approved scripts this
+    // run; when auto-build is skipped it passes `None` so approved-
+    // but-not-run packages remain in the persisted blocked set and
+    // stay reachable via `lpm approve-scripts`. See
+    // `select_approvals_for_capture` in `crate::commands::install`.
+    //
     // Standalone callers (no install context) pass `None` →
     // identical to the pre-slice-1 behavior.
     advisor_approvals: Option<&std::collections::HashSet<(String, String, Option<String>)>>,
@@ -672,11 +679,15 @@ pub fn capture_blocked_set_after_install_with_metadata(
     requested_capabilities: &crate::capability::CapabilitySet,
     user_bound: &crate::capability::UserBound,
     // Phase 46 slice 1 — see `compute_blocked_packages_with_metadata`.
-    // Advisor-approved triples are removed from the persisted
-    // blocked set before fingerprint + write, so post-install JSON
+    // When `Some`, matching triples are removed from the persisted
+    // blocked set before fingerprint + write so post-install JSON
     // + the "remain blocked after auto-build" pointer don't report
     // stale state for packages whose scripts already executed via
-    // the AdvisorApprovedThisRun trust path.
+    // the AdvisorApprovedThisRun trust path. The install caller
+    // gates this on `auto_build_attempted` (via
+    // `select_approvals_for_capture`); when auto-build won't fire,
+    // it passes `None` so approved-but-not-run packages remain
+    // visible to `lpm approve-scripts` after the session drops.
     advisor_approvals: Option<&std::collections::HashSet<(String, String, Option<String>)>>,
 ) -> Result<BlockedSetCapture, LpmError> {
     let blocked = compute_blocked_packages_with_metadata(

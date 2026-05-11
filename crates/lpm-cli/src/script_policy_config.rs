@@ -518,6 +518,94 @@ mod tests {
         );
     }
 
+    // ── triage_advisor reader (Phase 46 slice 1) ──────────────────
+    //
+    // The reader stores the value verbatim; resolution + slug
+    // validation happens later at the install-time call site
+    // (`triage_advisor_session::AdvisorSession::preflight`). These
+    // tests pin the read contract: correct key spelling, absence
+    // vs presence distinguishable, type-safety on non-strings.
+
+    #[test]
+    fn from_package_json_reads_triage_advisor_string() {
+        let dir = tempdir().unwrap();
+        write_pkg_json(dir.path(), r#"{"lpm": {"triageAdvisor": "claude-cli"}}"#);
+        let cfg = ScriptPolicyConfig::from_package_json(dir.path());
+        assert_eq!(cfg.triage_advisor.as_deref(), Some("claude-cli"));
+    }
+
+    #[test]
+    fn from_package_json_triage_advisor_absent_is_none() {
+        // No `triageAdvisor` key → `None` so the resolver falls
+        // through to `~/.lpm/config.toml` then default. Distinct
+        // from `Some("none")` which is an explicit per-project
+        // opt-out (the resolver short-circuits on it).
+        let dir = tempdir().unwrap();
+        write_pkg_json(dir.path(), r#"{"lpm": {}}"#);
+        let cfg = ScriptPolicyConfig::from_package_json(dir.path());
+        assert_eq!(cfg.triage_advisor, None);
+    }
+
+    #[test]
+    fn from_package_json_explicit_none_preserved_as_string() {
+        // `"triageAdvisor": "none"` is an explicit project-level
+        // opt-out the resolver must respect (it short-circuits in
+        // preflight rather than falling through to global config).
+        // Reader's job: round-trip the literal string; semantics
+        // belong to the resolver.
+        let dir = tempdir().unwrap();
+        write_pkg_json(dir.path(), r#"{"lpm": {"triageAdvisor": "none"}}"#);
+        let cfg = ScriptPolicyConfig::from_package_json(dir.path());
+        assert_eq!(cfg.triage_advisor.as_deref(), Some("none"));
+    }
+
+    #[test]
+    fn from_package_json_non_string_triage_advisor_is_none() {
+        // Defensive: a malformed value (array, number, bool, null,
+        // object) must not panic and must not be coerced. The
+        // reader treats it as "key absent" — the install path then
+        // falls through to `~/.lpm/config.toml`.
+        for raw in [
+            r#"{"lpm": {"triageAdvisor": ["claude-cli"]}}"#,
+            r#"{"lpm": {"triageAdvisor": 42}}"#,
+            r#"{"lpm": {"triageAdvisor": true}}"#,
+            r#"{"lpm": {"triageAdvisor": null}}"#,
+            r#"{"lpm": {"triageAdvisor": {"provider": "claude-cli"}}}"#,
+        ] {
+            let dir = tempdir().unwrap();
+            write_pkg_json(dir.path(), raw);
+            let cfg = ScriptPolicyConfig::from_package_json(dir.path());
+            assert_eq!(cfg.triage_advisor, None, "raw={raw}");
+        }
+    }
+
+    #[test]
+    fn from_package_json_triage_advisor_does_not_clobber_other_keys() {
+        // Single-pass reader: a populated `triageAdvisor` must NOT
+        // affect adjacent keys' parsing (scriptPolicy, autoBuild,
+        // trustedScopes). Catches an accidental mutually-exclusive
+        // branch if the parser ever moves to a match-tree shape.
+        let dir = tempdir().unwrap();
+        write_pkg_json(
+            dir.path(),
+            r#"{
+                "lpm": {
+                    "scriptPolicy": "triage",
+                    "triageAdvisor": "ollama",
+                    "scripts": {
+                        "autoBuild": true,
+                        "trustedScopes": ["@me/*"]
+                    }
+                }
+            }"#,
+        );
+        let cfg = ScriptPolicyConfig::from_package_json(dir.path());
+        assert_eq!(cfg.policy, Some(ScriptPolicy::Triage));
+        assert_eq!(cfg.triage_advisor.as_deref(), Some("ollama"));
+        assert!(cfg.auto_build);
+        assert_eq!(cfg.trusted_scopes, vec!["@me/*".to_string()]);
+    }
+
     // ── resolve_script_policy precedence ──────────────────────────
 
     #[test]

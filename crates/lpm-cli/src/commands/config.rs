@@ -1,7 +1,8 @@
 use crate::output;
+use crate::prompt::prompt_err;
 use lpm_common::LpmError;
 use owo_colors::OwoColorize;
-use std::io::{BufRead, IsTerminal, Write};
+use std::io::IsTerminal;
 
 /// CLI configuration management.
 ///
@@ -312,23 +313,26 @@ async fn run_scripts_wizard(
     let current =
         read_string_value(config_path, SCRIPT_POLICY_KEY)?.unwrap_or_else(|| "deny".to_string());
     println!();
-    println!(
-        "{}",
-        "How should lpm treat package lifecycle scripts?".bold()
-    );
     println!("  current: {}", current.cyan());
-    println!();
-    println!("  1) deny    — never auto-run lifecycle scripts (default; most restrictive)");
-    println!("  2) triage  — Layers 1-3 always; advisor only if explicitly configured");
-    println!("  3) allow   — run every script (npm-classic; least restrictive)");
-    println!();
-    let chosen = prompt_choice("Pick 1, 2, or 3", &["1", "2", "3"])?;
-    let new_value = match chosen.as_str() {
-        "1" => "deny",
-        "2" => "triage",
-        "3" => "allow",
-        _ => unreachable!(),
-    };
+    let new_value: &str = cliclack::select("How should lpm treat package lifecycle scripts?")
+        .item(
+            "deny",
+            "deny — never auto-run lifecycle scripts",
+            "default; most restrictive",
+        )
+        .item(
+            "triage",
+            "triage — Layers 1-3 always; advisor only if configured",
+            "recommended",
+        )
+        .item(
+            "allow",
+            "allow — run every script",
+            "npm-classic; least restrictive",
+        )
+        .initial_value(current.as_str())
+        .interact()
+        .map_err(prompt_err)?;
     persist_string(config_path, SCRIPT_POLICY_KEY, new_value)?;
     announce_set(SCRIPT_POLICY_KEY, new_value, json_output);
 
@@ -374,11 +378,11 @@ async fn run_triage_wizard(
             "note".cyan(),
             current_policy.yellow()
         );
-        let switch = prompt_choice(
-            "Switch script-policy to \"triage\" now? [y/N]",
-            &["y", "n", ""],
-        )?;
-        if matches!(switch.as_str(), "y" | "Y") {
+        let switch = cliclack::confirm(r#"Switch script-policy to "triage" now?"#)
+            .initial_value(false)
+            .interact()
+            .map_err(prompt_err)?;
+        if switch {
             persist_string(config_path, SCRIPT_POLICY_KEY, "triage")?;
             output::success(&format!("Set {} = {}", SCRIPT_POLICY_KEY.bold(), "triage"));
         } else {
@@ -397,41 +401,35 @@ async fn run_triage_wizard(
         reports.iter().filter(|r| r.is_available()).collect();
 
     println!();
-    println!("{}", "Pick a triage advisor for amber-tier scripts:".bold());
     println!("  {PRIVACY_LINE}");
-    println!();
     if detected.is_empty() {
+        println!();
         println!(
             "  {}: no advisors detected on this machine (`claude` / `codex` / `ollama` \
              not on PATH or ollama daemon not running). You can still pick \"none\".",
             "note".cyan()
         );
-        println!();
     }
+
     // Build menu: detected first, then "none". Unavailable providers
     // are deliberately not listed (t3code's pattern — don't show
     // options the user can't pick).
-    let mut options: Vec<&str> = Vec::new();
+    let mut sel = cliclack::select("Pick a triage advisor for amber-tier scripts:");
     for r in &detected {
-        let label = match r.provider {
-            lpm_triage_advisor::Provider::Ollama => "ollama (local, no cloud egress)",
-            lpm_triage_advisor::Provider::ClaudeCli => "claude-cli (cloud)",
-            lpm_triage_advisor::Provider::Codex => "codex (cloud)",
+        let (label, hint) = match r.provider {
+            lpm_triage_advisor::Provider::Ollama => ("ollama", "local, no cloud egress"),
+            lpm_triage_advisor::Provider::ClaudeCli => ("claude-cli", "cloud"),
+            lpm_triage_advisor::Provider::Codex => ("codex", "cloud"),
         };
-        let slug = r.provider.slug();
-        options.push(slug);
-        println!("  {}) {}", options.len(), label);
+        sel = sel.item(r.provider.slug(), label, hint);
     }
-    options.push("none");
-    println!(
-        "  {}) none — Layers 1-3 only (portable triage)",
-        options.len()
-    );
-    println!();
-    let choices: Vec<String> = (1..=options.len()).map(|i| i.to_string()).collect();
-    let choice_refs: Vec<&str> = choices.iter().map(String::as_str).collect();
-    let idx = prompt_choice("Pick a number", &choice_refs)?;
-    let chosen_slug = options[idx.parse::<usize>().unwrap() - 1];
+    sel = sel.item("none", "none", "Layers 1-3 only (portable triage)");
+    // Default to the first detected provider when available, else "none".
+    let initial = detected
+        .first()
+        .map(|r| r.provider.slug())
+        .unwrap_or("none");
+    let chosen_slug: &str = sel.initial_value(initial).interact().map_err(prompt_err)?;
 
     // Test-invoke when a real provider is chosen. Distinguish
     // EnvironmentNotReady (recoverable → save anyway) from
@@ -444,13 +442,15 @@ async fn run_triage_wizard(
                     "  {}: the advisor binary is present but didn't return a verdict ({msg})",
                     "environment not ready".yellow(),
                 );
-                let save = prompt_choice(
+                let save = cliclack::confirm(
                     "Save this choice anyway? `lpm install` will degrade to no-advisor \
                      for any run where this provider isn't ready and print one warning; \
-                     install never fails because the advisor failed. [y/N]",
-                    &["y", "n", "", "Y", "N"],
-                )?;
-                if !matches!(save.as_str(), "y" | "Y") {
+                     install never fails because the advisor failed.",
+                )
+                .initial_value(false)
+                .interact()
+                .map_err(prompt_err)?;
+                if !save {
                     println!("  Aborted. No config change.");
                     return Ok(());
                 }
@@ -479,28 +479,6 @@ async fn test_invoke_provider(
         lpm_triage_advisor::Provider::Ollama => Box::new(OllamaAdapter::default()),
     };
     adapter.test_invoke().await
-}
-
-/// Stdin-line prompt with a small allowed-answer set. Re-asks on
-/// invalid input. Empty string is treated as the default ("" must be
-/// in the allowed set to accept).
-fn prompt_choice(prompt: &str, allowed: &[&str]) -> Result<String, LpmError> {
-    loop {
-        print!("> {prompt}: ");
-        std::io::stdout()
-            .flush()
-            .map_err(|e| LpmError::Registry(format!("stdout flush: {e}")))?;
-        let mut line = String::new();
-        std::io::stdin()
-            .lock()
-            .read_line(&mut line)
-            .map_err(|e| LpmError::Registry(format!("stdin read: {e}")))?;
-        let trimmed = line.trim().to_string();
-        if allowed.contains(&trimmed.as_str()) {
-            return Ok(trimmed);
-        }
-        println!("  invalid; pick one of: {}", allowed.join(" / "));
-    }
 }
 
 fn read_string_value(config_path: &std::path::Path, key: &str) -> Result<Option<String>, LpmError> {
