@@ -1135,6 +1135,12 @@ async fn enrich_advisor_in_place(
                 let (verdict_label, advisor_outcome) =
                     classify_one_with_advisor(advisor_ref, &snapshot).await;
                 pb.inc(1);
+                // Non-TTY-friendly stderr milestone every 25 advisor
+                // calls. The L4 phase is slower per-item than fetch
+                // (each call is an LLM round-trip), so the milestone
+                // interval is tighter than fetch's 100 to keep the
+                // user informed during a long run.
+                emit_progress_milestone("L4 advise", &pb, 25);
                 (idx, verdict_label, advisor_outcome)
             }
         }))
@@ -1569,6 +1575,11 @@ async fn audit_one(
     }
 
     pb.inc(1);
+    // Emit a stderr milestone every 100 manifests so non-TTY runs
+    // (piped through `tee`, CI capture, etc.) have visibility into
+    // the fetch-phase progress that indicatif's visual bar silently
+    // suppresses without a TTY.
+    emit_progress_milestone("audit", &pb, 100);
     audit
 }
 
@@ -1730,7 +1741,7 @@ async fn fetch_l3_one(
     };
 
     pb.inc(1);
-    L3Outcome {
+    let outcome = L3Outcome {
         published_at,
         age_secs,
         cooldown_block,
@@ -1739,7 +1750,13 @@ async fn fetch_l3_one(
         // docs.
         provenance_drift: ProvenanceDriftSummary::NoDrift,
         l3_fetch_error,
-    }
+    };
+    // L3 enrichment has a smaller working set than the manifest
+    // fetch phase (only scripted packages need L3 enrichment, so
+    // ~5-15% of audited count). Milestone every 50 items balances
+    // signal against noise.
+    emit_progress_milestone("L3 enrich", &pb, 50);
+    outcome
 }
 
 async fn fetch_packument_with_retry(
@@ -1873,6 +1890,60 @@ fn progress_style(prefix: &str) -> ProgressStyle {
     ))
     .unwrap()
     .progress_chars("█▉▊▋▌▍▎▏ ")
+}
+
+/// Emit a milestone progress line to stderr every `every` items.
+///
+/// indicatif's `ProgressBar` auto-disables visual updates when
+/// stderr is not a TTY (e.g. when the audit is piped through
+/// `tee` for log capture or run from CI). Without this helper,
+/// a multi-thousand-package live audit appears completely silent
+/// for ~10-30 minutes between the "fetching top-N" line at the
+/// start and the "L1: green=… amber=… red=…" summary at the end.
+///
+/// The milestone line is a plain newline-terminated string so it
+/// survives `tee`, `grep --line-buffered`, and other pipe stages.
+/// Format: `<phase>: 1000/5000 (20.0%) elapsed=2m30s eta=8m12s`.
+/// One line every `every` steps + one at completion.
+fn emit_progress_milestone(phase: &str, pb: &ProgressBar, every: u64) {
+    let pos = pb.position();
+    let len = pb.length().unwrap_or(0);
+    if pos == 0 || (!pos.is_multiple_of(every) && pos != len) {
+        return;
+    }
+    let pct = if len > 0 {
+        (pos as f64 / len as f64) * 100.0
+    } else {
+        0.0
+    };
+    let elapsed = pb.elapsed();
+    let elapsed_s = elapsed.as_secs();
+    let eta_s = if pos > 0 && pos < len {
+        // Linear-projection ETA. ProgressBar has its own eta() but
+        // we want a stable string for log scrapers — `format_duration`
+        // here is a simple secs→m/s formatter that doesn't depend on
+        // indicatif's internal style strings.
+        let per_item_secs = elapsed_s as f64 / pos as f64;
+        let remaining = (len - pos) as f64 * per_item_secs;
+        remaining as u64
+    } else {
+        0
+    };
+    eprintln!(
+        "{phase}: {pos}/{len} ({pct:.1}%) elapsed={} eta={}",
+        format_short_duration(elapsed_s),
+        format_short_duration(eta_s),
+    );
+}
+
+fn format_short_duration(secs: u64) -> String {
+    if secs < 60 {
+        format!("{secs}s")
+    } else if secs < 3600 {
+        format!("{}m{}s", secs / 60, secs % 60)
+    } else {
+        format!("{}h{}m", secs / 3600, (secs % 3600) / 60)
+    }
 }
 
 #[derive(Debug, Default)]
