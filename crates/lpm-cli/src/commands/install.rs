@@ -3214,6 +3214,23 @@ pub async fn run_with_options(
     // execution semantics are changed — tier-aware auto-run is P6,
     // gated on the P5 sandbox per D20.
     script_policy_override: Option<crate::script_policy_config::ScriptPolicy>,
+    // Phase 46 slice 1 — CLI `--advisor` override. Resolves to the
+    // top of the [`AdvisorSession::preflight`] precedence chain
+    // (CLI → package.json → ~/.lpm/config.toml → `none`). Owned
+    // `String` rather than `&str` so the value crosses the
+    // store-lock async hop (the inner future is `'static`-bound)
+    // without a borrowed-lifetime gymnastic. Internal callers
+    // (`upgrade`, `add`, `dev`, `deploy`, `doctor`, `run`,
+    // `migrate`) pass `None` — they don't accept their own
+    // `--advisor` flag today and a future opt-in is a one-line
+    // change.
+    //
+    // The slug is validated at the clap layer (`parse_advisor_slug`
+    // in `main.rs`), so an `Some` value here is guaranteed to be
+    // `"none"` or a known provider slug. The session itself still
+    // warn-degrades on unavailable adapters at runtime — clap only
+    // catches typos, not "claude-cli configured but not on PATH."
+    advisor_override: Option<String>,
     // Phase 46 P3: already-parsed `--min-release-age=<dur>` override. `Some`
     // short-circuits the package.json / global / default chain in
     // [`crate::release_age_config::ReleaseAgeResolver::resolve`]; `None`
@@ -3259,6 +3276,7 @@ pub async fn run_with_options(
             target_set,
             direct_versions_out,
             script_policy_override,
+            advisor_override,
             min_release_age_override,
             drift_ignore_policy,
         ),
@@ -3286,6 +3304,8 @@ async fn run_with_options_under_store_lock(
     target_set: Option<&[String]>,
     direct_versions_out: Option<&mut HashMap<String, lpm_semver::Version>>,
     script_policy_override: Option<crate::script_policy_config::ScriptPolicy>,
+    // Phase 46 slice 1 — see `run_with_options` for the contract.
+    advisor_override: Option<String>,
     min_release_age_override: Option<u64>,
     drift_ignore_policy: crate::provenance_fetch::DriftIgnorePolicy,
 ) -> Result<(), LpmError> {
@@ -6341,7 +6361,9 @@ async fn run_with_options_under_store_lock(
     // already warned (or didn't, if the user configured `none`).
     //
     // Precedence chain for `triage-advisor` (highest first):
-    //   - CLI `--advisor` flag (reserved; not wired in slice 1)
+    //   - CLI `--advisor` flag (slug validated at the clap layer in
+    //     `main.rs::parse_advisor_slug`; `Some` here is guaranteed to
+    //     be `"none"` or a known provider).
     //   - `package.json > lpm > triageAdvisor`
     //   - `~/.lpm/config.toml` `triage-advisor` key
     //   - default `none`
@@ -6350,7 +6372,7 @@ async fn run_with_options_under_store_lock(
             let triage_advisor_pkg_json = step10_script_policy_cfg.triage_advisor.as_deref();
             let triage_advisor_global = install_capability_cfg.get_str("triage-advisor");
             let mut session = crate::triage_advisor_session::AdvisorSession::preflight(
-                None, // CLI flag reserved for a future slice
+                advisor_override.as_deref(),
                 triage_advisor_pkg_json,
                 triage_advisor_global,
                 json_output,
@@ -10571,6 +10593,10 @@ pub async fn run_add_packages(
     // [`run_with_options`] for the resolution precedence and the
     // current consumer (triage-mode install summary line).
     script_policy_override: Option<crate::script_policy_config::ScriptPolicy>,
+    // Phase 46 slice 1: forwarded `--advisor` override. Opaque
+    // pass-through to `run_with_options` — see that fn for the
+    // precedence chain and validation contract.
+    advisor_override: Option<String>,
     // Phase 46 P3: forwarded `--min-release-age=<dur>` override.
     // Opaque pass-through — see [`run_with_options`].
     min_release_age_override: Option<u64>,
@@ -10689,6 +10715,7 @@ pub async fn run_add_packages(
         None,  // target_set: legacy single-project path
         Some(&mut direct_versions),
         script_policy_override,
+        advisor_override,
         min_release_age_override,
         drift_ignore_policy,
     )
@@ -10736,6 +10763,10 @@ pub async fn run_install_filtered_add(
     save_flags: crate::save_spec::SaveFlags,
     // Phase 46 P2 Chunk 5: forwarded CLI-side policy override.
     script_policy_override: Option<crate::script_policy_config::ScriptPolicy>,
+    // Phase 46 slice 1: forwarded `--advisor` override. Opaque
+    // pass-through to `run_with_options` — see that fn for the
+    // precedence chain and validation contract.
+    advisor_override: Option<String>,
     // Phase 46 P3: forwarded `--min-release-age=<dur>` override.
     // Opaque pass-through — see [`run_with_options`].
     min_release_age_override: Option<u64>,
@@ -10964,6 +10995,11 @@ pub async fn run_install_filtered_add(
             Some(&target_paths),
             Some(&mut direct_versions),
             script_policy_override,
+            // Same per-iteration clone rationale as `drift_ignore_policy`
+            // below: each loop pass moves the override into
+            // `run_with_options`, so the multi-member loop has to clone.
+            // `Option<String>` is cheap to clone.
+            advisor_override.clone(),
             min_release_age_override,
             // Multi-member loop: `run_install_filtered_add` runs the
             // install pipeline once per targeted member. Each
@@ -13267,6 +13303,7 @@ mod tests {
             false,                // force
             crate::save_spec::SaveFlags::default(),
             None,                                                  // script_policy_override
+            None,                                                  // advisor_override
             None,                                                  // min_release_age_override
             crate::provenance_fetch::DriftIgnorePolicy::default(), // drift_ignore_policy
         )
@@ -13305,6 +13342,7 @@ mod tests {
             false,
             crate::save_spec::SaveFlags::default(),
             None,                                                  // script_policy_override
+            None,                                                  // advisor_override
             None,                                                  // min_release_age_override
             crate::provenance_fetch::DriftIgnorePolicy::default(), // drift_ignore_policy
         )

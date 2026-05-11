@@ -493,6 +493,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn precedence_cli_explicit_none_overrides_active_lower_layers() {
+        // **Locked CLI flag contract (Phase 46 slice 1 close-out).**
+        // `lpm install --advisor=none` is an explicit per-invocation
+        // opt-out that MUST win over any `package.json` /
+        // `~/.lpm/config.toml` value beneath it. Without this, a user
+        // trying to silence a misbehaving advisor for ONE run would
+        // also have to edit config files — defeating the entire
+        // point of the CLI override slot.
+        //
+        // Pairs with `precedence_cli_wins_over_package_json_and_global`
+        // (which uses bogus slugs to prove the CLI slot is *consulted*
+        // first) — this test additionally proves the CLI's explicit
+        // `"none"` value short-circuits even when both lower layers
+        // hold valid provider slugs that *would* have produced an
+        // active session if the CLI layer were missing.
+        let s = AdvisorSession::preflight(
+            Some("none"),       // CLI: explicit opt-out for THIS run
+            Some("claude-cli"), // package.json: team default
+            Some("ollama"),     // global config: per-user default
+            true,               // json_output: suppress warn lines in test output
+        )
+        .await;
+        assert!(
+            !s.is_active(),
+            "CLI --advisor=none MUST short-circuit before package.json / global config"
+        );
+        assert!(
+            s.provider_slug().is_none(),
+            "explicit none records no configured slug (matches the resolved-to-None contract)",
+        );
+    }
+
+    #[tokio::test]
     async fn classify_no_op_when_inactive() {
         let mut s = AdvisorSession::preflight(None, None, None, false).await;
         let req = AmberPackageRequest {

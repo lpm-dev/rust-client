@@ -421,6 +421,25 @@ enum Commands {
         #[arg(long = "triage", id = "triage_alias", conflicts_with_all = ["policy", "yolo"])]
         triage_alias: bool,
 
+        /// Phase 46 slice 1 — override the triage advisor for this run.
+        /// Valid values: `none` | `claude-cli` | `codex` | `ollama`.
+        ///
+        /// Precedence (highest first): this flag → `lpm.triageAdvisor`
+        /// in `package.json` → `triage-advisor` in `~/.lpm/config.toml`
+        /// → default `none`. Only consulted when the effective
+        /// script-policy is `triage`; under `deny` / `allow` the
+        /// advisor is never invoked.
+        ///
+        /// Unknown slugs are rejected at parse time (rather than
+        /// silently degrading) so a typo never produces a portable-only
+        /// run while the user thinks they configured an uplift.
+        #[arg(
+            long,
+            value_name = "none|claude-cli|codex|ollama",
+            value_parser = parse_advisor_slug,
+        )]
+        advisor: Option<String>,
+
         /// Phase 32 Phase 2: filter workspace members. Same grammar as
         /// `lpm run --filter`. Only meaningful when adding packages — bare
         /// `lpm install` (no packages) ignores this flag.
@@ -2046,6 +2065,24 @@ fn command_needs_global_state(cmd: &Commands) -> bool {
 /// Extracted to make the wiring unit-testable: a regression that drops
 /// any of the five overrides on the way to `install_global::run` is
 /// caught by the tests in this module.
+/// clap `value_parser` for `--advisor`. Rejects unknown slugs at parse
+/// time so a typo never produces a portable-only install while the
+/// user thinks they configured an uplift.
+///
+/// Accepts `none` plus every slug `Provider::from_slug` knows.
+/// `Provider::from_slug` is the source of truth for the live set; the
+/// error message hard-codes the v1 slugs for legibility but a future
+/// provider addition is a one-line touch (add the slug here).
+fn parse_advisor_slug(s: &str) -> Result<String, String> {
+    if s == "none" || lpm_triage_advisor::Provider::from_slug(s).is_some() {
+        Ok(s.to_string())
+    } else {
+        Err(format!(
+            "invalid --advisor '{s}'; must be one of: none, claude-cli, codex, ollama"
+        ))
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn build_install_global_overrides(
     allow_new: bool,
@@ -2511,6 +2548,7 @@ async fn async_main() -> Result<()> {
             policy,
             yolo,
             triage_alias,
+            advisor,
         } => {
             // Phase 37 M3.2: route `lpm install --global` / `-g` to
             // the persistent IsolatedInstall pipeline. M3.2 ships
@@ -2751,6 +2789,7 @@ async fn async_main() -> Result<()> {
                         None, // target_set: bare-install path is single-target
                         None, // direct_versions_out: bare install does not finalize a manifest
                         cli_script_policy_override,
+                        advisor.clone(),
                         min_release_age_override,
                         drift_ignore_policy,
                     )
@@ -2772,6 +2811,7 @@ async fn async_main() -> Result<()> {
                     force,
                     save_flags,
                     cli_script_policy_override,
+                    advisor.clone(),
                     min_release_age_override,
                     drift_ignore_policy,
                 )
@@ -2800,6 +2840,7 @@ async fn async_main() -> Result<()> {
                         force,
                         save_flags,
                         cli_script_policy_override,
+                        advisor.clone(),
                         min_release_age_override,
                         drift_ignore_policy,
                     )
@@ -2815,6 +2856,7 @@ async fn async_main() -> Result<()> {
                         force,
                         save_flags,
                         cli_script_policy_override,
+                        advisor.clone(),
                         min_release_age_override,
                         drift_ignore_policy,
                     )
@@ -4724,6 +4766,48 @@ mod tests {
 
     use crate::provenance_fetch::DriftIgnorePolicy;
     use crate::script_policy_config::ScriptPolicy;
+
+    // ── Phase 46 slice 1 close-out — `--advisor` clap validator ────
+    //
+    // Locks the parser contract for the CLI flag wired in this slice:
+    // every known provider slug + the explicit `"none"` opt-out are
+    // accepted; anything else fails before the install pipeline can
+    // touch state. The session-level precedence test lives next to
+    // the resolver (`triage_advisor_session::tests`); this pair pins
+    // the CLI surface itself.
+    #[test]
+    fn parse_advisor_slug_accepts_known_providers_and_none() {
+        for s in ["none", "claude-cli", "codex", "ollama"] {
+            assert_eq!(
+                parse_advisor_slug(s).as_deref(),
+                Ok(s),
+                "must accept known slug {s:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn parse_advisor_slug_rejects_unknown_with_actionable_message() {
+        let err = parse_advisor_slug("anthropic-api").unwrap_err();
+        assert!(
+            err.contains("anthropic-api"),
+            "error message must echo the offending input; got: {err}",
+        );
+        assert!(
+            err.contains("none") && err.contains("claude-cli"),
+            "error message must list the accepted set; got: {err}",
+        );
+    }
+
+    #[test]
+    fn parse_advisor_slug_rejects_empty_string() {
+        // `Option<String>` from clap distinguishes "flag absent"
+        // (`None`) from "flag with empty value" (`Some("")`). The
+        // empty form is a typo, not an opt-out — reject it so the
+        // user sees the actionable error rather than getting silent
+        // fall-through to package.json.
+        assert!(parse_advisor_slug("").is_err());
+    }
 
     #[test]
     fn build_install_global_overrides_threads_allow_new_and_auto_build_bools() {

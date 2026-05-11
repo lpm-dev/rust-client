@@ -469,6 +469,7 @@ pub async fn run(
         None,                                                  // target_set
         None,                                                  // direct_versions_out
         None, // script_policy_override: `lpm upgrade` does not expose policy flags
+        None, // advisor_override: `lpm upgrade` does not expose `--advisor`
         None, // min_release_age_override: `lpm upgrade` uses the chain
         crate::provenance_fetch::DriftIgnorePolicy::default(), // drift-ignore: `lpm upgrade` enforces drift
     )
