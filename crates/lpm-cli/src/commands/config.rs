@@ -445,9 +445,9 @@ async fn run_triage_wizard(
                     "environment not ready".yellow(),
                 );
                 let save = prompt_choice(
-                    "Save this choice anyway? `lpm install` does not yet read \
-                     `triage-advisor` (install-time invocation ships in a follow-up), \
-                     so this only persists the preference. [y/N]",
+                    "Save this choice anyway? `lpm install` will degrade to no-advisor \
+                     for any run where this provider isn't ready and print one warning; \
+                     install never fails because the advisor failed. [y/N]",
                     &["y", "n", "", "Y", "N"],
                 )?;
                 if !matches!(save.as_str(), "y" | "Y") {
@@ -532,38 +532,46 @@ fn announce_set(key: &str, value: &str, json_output: bool) {
 }
 
 /// Disclosure printed after `script-policy = triage` is persisted (via
-/// either `--set` or interactive). Tightens what the wizard implies:
-/// triage uses Layers 1-3 today, and the optional advisor preference
-/// (`lpm config triage`) is config-only — `lpm install` does not yet
-/// invoke an advisor at install time. The next slice ships that.
+/// either `--set` or interactive). After Phase 46 slice 1 the wizard
+/// now describes the actual install-time degrade-and-warn contract:
+/// triage uses Layers 1-3 always, an optional advisor uplift kicks
+/// in if configured + available, and a configured-but-unavailable
+/// advisor degrades cleanly with a one-line warning per install run.
 fn print_triage_policy_followup(json_output: bool) {
     if json_output {
         return;
     }
     println!();
     println!(
-        "  {}: triage uses Layers 1-3 today. Run `lpm config triage` to \
-         pick an optional advisor preference (claude-cli / codex / \
-         ollama). Note: install-time advisor invocation lands in a \
-         follow-up — for now `lpm install` ignores `triage-advisor`.",
+        "  {}: triage runs Layers 1-3 on every install. Run `lpm config \
+         triage` to pick an optional advisor (claude-cli / codex / \
+         ollama) that can promote some amber packages to auto-run \
+         this install. The advisor is consulted only for amber; \
+         green and hard-blocked paths are unchanged.",
         "tip".cyan()
     );
 }
 
 /// Disclosure printed after `triage-advisor = <value>` is persisted
-/// (via either `--set` or interactive). Closes the loop on the most
-/// common over-read of the wizard: "I picked claude-cli, so my
-/// installs now use it." They don't, yet — this PR ships only the
-/// config surface plus the audit-time measurement. Install-time
-/// consumption is the next slice.
+/// (via either `--set` or interactive). After slice 1 this describes
+/// the actual install-time contract:
+///   - `lpm install` preflights the advisor once per run.
+///   - If detect or test-invoke fails, the run degrades to
+///     `triage-advisor = "none"` semantics and prints one warning;
+///     the install never fails because the advisor failed.
+///   - The advisor only converts `Approve` verdicts into auto-run
+///     for amber packages this run; the approval is ephemeral and
+///     is NOT written to `trustedDependencies`.
 fn print_triage_advisor_followup(json_output: bool) {
     if json_output {
         return;
     }
     println!(
-        "  {}: install-time advisor invocation lands in a follow-up. \
-         `lpm install` does not yet read `triage-advisor`; your \
-         preference is saved and will take effect when that slice ships.",
+        "  {}: `lpm install` preflights the advisor once per run. If it's \
+         unavailable, the install degrades to no-advisor with one warning \
+         and never fails on the advisor. The advisor only promotes amber \
+         packages it returns Approve for, and the approval is ephemeral \
+         (no persistent trust entry).",
         "note".cyan()
     );
 }
