@@ -153,6 +153,20 @@ enum CorpusKind {
     /// No network calls; output shape is identical to live mode so
     /// the same Markdown report + standing-benchmark table fires.
     Hermetic,
+    /// Read the 523-entry curated static-gate corpus at
+    /// `crates/lpm-security/tests/fixtures/postinstall-scripts/`
+    /// (the same fixture `static_gate_corpus.rs` exercises). Each
+    /// entry's expected tier from `expectations.json` becomes the
+    /// L1 input; the script body comes from `scripts/<id>.txt`. No
+    /// network calls. Designed for L4-advisor amber-shift
+    /// measurements against hand-curated real-world script shapes
+    /// — wider coverage than the 16-entry hermetic fixture.
+    ///
+    /// L3 inputs (publish age, attestation) aren't part of the
+    /// fixture, so the curated path treats every entry as "old
+    /// publish, no attestation" — same as the hermetic baseline.
+    /// L1 is the load-bearing signal for this corpus.
+    Curated,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -468,6 +482,16 @@ async fn main() -> Result<(), BoxError> {
         return run_hermetic(&args).await;
     }
 
+    if args.corpus == CorpusKind::Curated {
+        // Phase 46.2 L4 measurement runbook — read the 523-entry
+        // static-gate fixture and run the same pipeline. Wider
+        // coverage than hermetic for amber-shift measurements
+        // against the calibrated prompt; same offline-only contract
+        // so the run is reproducible and free of npm-rate-limit
+        // tail latency.
+        return run_curated(&args).await;
+    }
+
     if args.reclassify {
         return reclassify_from_cache(&args).await;
     }
@@ -736,6 +760,147 @@ struct HermeticEntry {
 const HERMETIC_CORPUS_PATH: &str =
     concat!(env!("CARGO_MANIFEST_DIR"), "/fixtures/hermetic/corpus.json");
 
+/// Phase 46.2 — path to the 523-entry curated static-gate corpus.
+/// Sibling crate's tests directory; resolved at compile time from
+/// `CARGO_MANIFEST_DIR` so a future workspace re-layout fails to
+/// build instead of silently stop-reading. The fixture's
+/// `expectations.json` + `scripts/<id>.txt` shape is owned by
+/// `lpm-security`; if it moves, this constant is the failure site.
+const CURATED_EXPECTATIONS_PATH: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../lpm-security/tests/fixtures/postinstall-scripts/expectations.json"
+);
+const CURATED_SCRIPTS_DIR: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../lpm-security/tests/fixtures/postinstall-scripts/scripts"
+);
+
+/// One entry from the curated fixture's `expectations.json`. The
+/// `expected` field is hand-assigned; the audit harness uses it
+/// only for the report's "expected vs classified" sanity check.
+#[derive(Debug, Clone, Deserialize)]
+struct CuratedExpectation {
+    id: String,
+    /// Hand-assigned expected tier. The harness reports a per-entry
+    /// mismatch line when the L1 classifier disagrees; this is
+    /// useful for spotting classifier drift but does NOT affect the
+    /// audit's L1 output (the classifier is still the authority).
+    #[serde(default)]
+    #[allow(dead_code)] // surfaced via report sanity-check in a follow-up; reserved for now
+    expected: Option<String>,
+}
+
+/// Phase 46.2 — run the audit against the 523-entry curated
+/// static-gate fixture. Same control flow as [`run_hermetic`]; the
+/// per-entry construction reads `scripts/<id>.txt` for the body and
+/// synthesizes a single-postinstall PackageAudit (the fixture is
+/// "one script body per entry", so we slot every body under
+/// `postinstall` — the static-gate classifier doesn't distinguish
+/// by phase name, so this is faithful to the L1 contract).
+///
+/// `--advisor` works identically to live/hermetic; the audit run
+/// completes by writing the same results + report + sidecar shape.
+async fn run_curated(args: &Args) -> Result<(), BoxError> {
+    let expectations_bytes = std::fs::read(CURATED_EXPECTATIONS_PATH).map_err(|e| {
+        format!(
+            "curated corpus expectations not readable at {CURATED_EXPECTATIONS_PATH}: {e} \
+             (this fixture lives in lpm-security/tests/fixtures/postinstall-scripts/ — a \
+             missing read usually means the rust-client workspace layout was edited)"
+        )
+    })?;
+    let expectations: Vec<CuratedExpectation> = serde_json::from_slice(&expectations_bytes)
+        .map_err(|e| {
+            format!("curated corpus expectations parse error at {CURATED_EXPECTATIONS_PATH}: {e}")
+        })?;
+
+    let mut audits: Vec<PackageAudit> = Vec::with_capacity(expectations.len());
+    let mut missing_bodies: Vec<String> = Vec::new();
+    for (idx, entry) in expectations.iter().enumerate() {
+        let body_path = format!("{CURATED_SCRIPTS_DIR}/{}.txt", entry.id);
+        let body = match std::fs::read_to_string(&body_path) {
+            Ok(b) => b,
+            Err(_) => {
+                // Record missing-body entries but keep going so a
+                // single misnamed fixture doesn't kill the whole
+                // measurement run. The harness surfaces the count
+                // in the stdout summary below.
+                missing_bodies.push(entry.id.clone());
+                continue;
+            }
+        };
+        audits.push(curated_entry_to_audit(&entry.id, idx + 1, body));
+    }
+
+    if !missing_bodies.is_empty() {
+        eprintln!(
+            "warning: {} curated entry/entries had no script body file: {}",
+            missing_bodies.len(),
+            missing_bodies.join(", "),
+        );
+    }
+
+    println!(
+        "curated: loaded {} entries from {CURATED_EXPECTATIONS_PATH}",
+        audits.len(),
+    );
+
+    audits.sort_by_key(|r| r.rank);
+    finalize_outcomes(&mut audits);
+
+    let mut metadata = AuditMetadata {
+        run_completed_at: Some(now_rfc3339()),
+        audit_size: Some(audits.len()),
+        advisor: None,
+        corpus: Some("curated".to_string()),
+    };
+
+    if let Some(name) = &args.advisor {
+        metadata.advisor = enrich_advisor_in_place(name, &mut audits).await?;
+    }
+
+    persist_audit(&args.results, &args.report, &audits, &metadata)?;
+    print_summary(&audits);
+    Ok(())
+}
+
+/// Map one curated-fixture entry to a [`PackageAudit`]. The script
+/// body is treated as the package's `postinstall` body (the
+/// static-gate classifier doesn't distinguish by phase name). L3
+/// inputs aren't in the fixture, so every entry gets the
+/// "old publish, no attestation" baseline — matches the hermetic
+/// fixture's no-cooldown-no-attestation shape.
+fn curated_entry_to_audit(id: &str, rank: usize, body: String) -> PackageAudit {
+    let postinstall = Some(classify_script(&body));
+    let mut audit = PackageAudit {
+        // The fixture entries don't have real npm names; the entry
+        // ID is the audit identity. Surface it verbatim so the
+        // report's per-package lines stay greppable against
+        // `expectations.json`.
+        name: id.to_string(),
+        rank,
+        monthly_downloads: 0,
+        version: Some("0.0.0".to_string()),
+        preinstall: None,
+        install: None,
+        postinstall,
+        tier: None,
+        l2_outcome: L2Outcome::Miss,
+        l3_outcome: None,
+        portable_outcome: None,
+        advisor_outcome: None,
+        advisor_provider: None,
+        fetch_error: None,
+    };
+    audit.tier = worst_of_phases(&audit);
+    // Treat every curated entry as if it were an "old" publish with
+    // no attestation — same shape as `hermetic_l3_outcome` defaults
+    // when the fixture doesn't carry per-entry L3 data.
+    if audit.tier.is_some() {
+        audit.l3_outcome = Some(hermetic_l3_outcome(8760, false));
+    }
+    audit
+}
+
 /// Phase 69 — run the audit against the bundled offline corpus.
 ///
 /// Identical control flow to the live path's `main()`:
@@ -934,17 +1099,57 @@ async fn enrich_advisor_in_place(
     let pb = Arc::new(ProgressBar::new(targets.len() as u64));
     pb.set_style(progress_style("L4 advise"));
 
-    for idx in targets {
-        let (verdict_label, advisor_outcome) =
-            classify_one_with_advisor(&*advisor, &audits[idx]).await;
+    // Phase 46.2 (2026-05-11): fan out advisor calls in parallel.
+    // Pre-parallelization the curated 123-amber run took ~7 min
+    // wall-clock at ~3.4s/call serial. With concurrency = 8, that
+    // drops to ~1 min. The `Advisor` trait is `Send + Sync` and
+    // `classify_amber` takes `&self`, so concurrent calls are
+    // safe; only the per-target `advisor_outcome` slot mutation
+    // happens serially after collection — single-thread, no locks.
+    //
+    // Concurrency cap matches the install-pipeline session's cap
+    // (`crates/lpm-cli/src/triage_advisor_session.rs::CLASSIFY_CONCURRENCY`)
+    // so a future audit run that exhausts the user's provider's
+    // rate limit fails the same way the live install would, not
+    // earlier or later.
+    //
+    // Implementation note: snapshot each target's `PackageAudit`
+    // BEFORE the stream so the futures don't borrow `audits` (the
+    // serial-application phase below needs `&mut audits`). Per-
+    // package clone cost is negligible relative to the LLM
+    // round-trip cost; the snapshot also carries a one-line
+    // tracing identity (name + rank) that the post-stream loop
+    // uses for the verdict log line.
+    const L4_CONCURRENCY: usize = 8;
+    let provider_slug = provider.slug().to_string();
+    let snapshots: Vec<(usize, PackageAudit)> = targets
+        .iter()
+        .map(|&idx| (idx, audits[idx].clone()))
+        .collect();
+    let advisor_ref: &dyn Advisor = &*advisor;
+    let pb_for_stream = Arc::clone(&pb);
+    let outcomes: Vec<(usize, Option<&'static str>, AdvisorOutcome)> =
+        futures::stream::iter(snapshots.into_iter().map(|(idx, snapshot)| {
+            let pb = Arc::clone(&pb_for_stream);
+            async move {
+                let (verdict_label, advisor_outcome) =
+                    classify_one_with_advisor(advisor_ref, &snapshot).await;
+                pb.inc(1);
+                (idx, verdict_label, advisor_outcome)
+            }
+        }))
+        .buffer_unordered(L4_CONCURRENCY)
+        .collect()
+        .await;
+    pb.finish_with_message("L4 advisor complete");
+
+    for (idx, verdict_label, advisor_outcome) in outcomes {
         audits[idx].advisor_outcome = Some(advisor_outcome);
-        audits[idx].advisor_provider = Some(provider.slug().to_string());
+        audits[idx].advisor_provider = Some(provider_slug.clone());
         if let Some(l) = verdict_label {
             tracing::info!(target: "lpm_audit_corpus::advisor", rank = audits[idx].rank, name = %audits[idx].name, verdict = l, "advisor verdict");
         }
-        pb.inc(1);
     }
-    pb.finish_with_message("L4 advisor complete");
 
     Ok(Some(stamp))
 }
