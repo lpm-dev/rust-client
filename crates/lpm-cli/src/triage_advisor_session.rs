@@ -62,6 +62,7 @@
 
 use std::collections::HashSet;
 
+use futures::StreamExt;
 use lpm_security::triage::StaticTier;
 use lpm_triage_advisor::{
     Advisor, AdvisorFailure, AdvisorVerdict, AmberScript, ClaudeCliAdapter, CodexAdapter,
@@ -69,6 +70,26 @@ use lpm_triage_advisor::{
 };
 
 use crate::output;
+
+/// Max in-flight advisor classifications inside
+/// [`AdvisorSession::classify_amber`]. Phase 46.2 parallelization
+/// (2026-05-11): pre-parallelization, packages were classified one
+/// after another and a 10-amber install paid 10 × LLM round-trip.
+/// Post-parallelization, we cap at this many in-flight calls so:
+/// - local providers (Ollama) don't get queue-saturated (one
+///   inference task per call already saturates a single GPU; running
+///   more in parallel just stalls in the model server's queue),
+/// - cloud providers stay comfortably below typical per-IP rate
+///   limits (Claude / Codex / similar advisor endpoints all tolerate
+///   single-digit concurrent requests),
+/// - the install pipeline's progress UI keeps the wall-clock honest
+///   (the dominant amber count on real installs is 1-5, so 8 covers
+///   every workload-size we've seen without spinning extra futures).
+///
+/// Single-amber installs (the W5 case in the DX doc) are unchanged
+/// by this concurrency — there's only one task to drive. The win
+/// shows up at amber-count ≥ 2.
+const CLASSIFY_CONCURRENCY: usize = 8;
 
 /// Per-install advisor lifecycle. Constructed once at install start
 /// via [`AdvisorSession::preflight`]; consumed by per-package
@@ -230,41 +251,78 @@ impl AdvisorSession {
         let Some(adapter) = self.adapter.as_deref() else {
             return;
         };
-        for c in candidates {
-            // Per-package worst-of across all amber phases. Start at
-            // Approve and degrade. A single Manual/Abstain phase or
-            // a single failure flips the package out of the approval
-            // pool.
-            let mut package_verdict = PackageAdvisorOutcome::Approve;
-            for (phase, body) in &c.amber_phases {
-                let amber = AmberScript {
-                    package_name: &c.name,
-                    package_version: &c.version,
-                    phase: phase.as_str(),
-                    script_body: body.as_str(),
-                };
-                match adapter.classify_amber(&amber).await {
-                    Ok(AdvisorVerdict::Approve) => {}
-                    Ok(AdvisorVerdict::Manual) => {
-                        package_verdict = PackageAdvisorOutcome::Manual;
-                        break;
-                    }
-                    Ok(AdvisorVerdict::Abstain) => {
-                        package_verdict =
-                            package_verdict.degrade_to(PackageAdvisorOutcome::Abstain);
-                    }
-                    Err(_) => {
-                        // Silent per the locked contract; degrade
-                        // to "no approval" for this package and
-                        // keep scanning the remaining packages.
-                        package_verdict =
-                            package_verdict.degrade_to(PackageAdvisorOutcome::Abstain);
+
+        // Phase 46.2 parallelization (2026-05-11): fan out one task
+        // per candidate package across the advisor concurrently. The
+        // `Advisor` trait is `Send + Sync` and `classify_amber`
+        // takes `&self`, so concurrent calls are safe; only the
+        // per-package outcome accumulator mutates locals.
+        //
+        // Within a package, phases still iterate serially because
+        // the `Manual` short-circuit (worst-of with early exit) is a
+        // real win when phase 1 already disqualifies the package —
+        // no point spending an LLM round-trip on phase 2 just to
+        // discard the result. Phases per package are usually 1, so
+        // the within-package serialization is a non-issue.
+        //
+        // Bounded concurrency: cap at [`CLASSIFY_CONCURRENCY`] so
+        // local providers (Ollama) don't get queue-saturated and
+        // cloud providers stay below typical rate limits. The W5
+        // case (1 amber package) is unchanged; the win is on
+        // installs with several amber-tier deps. Pre-parallelization
+        // the cost was N × round-trip; post-parallelization it's
+        // ceil(N / CONCURRENCY) × round-trip.
+        //
+        // Outcomes flow back through the stream and the approval
+        // insertions happen serially after collection — that keeps
+        // `self.approvals` mutation single-threaded without locks.
+        let results: Vec<(String, String, Option<String>, PackageAdvisorOutcome, bool)> =
+            futures::stream::iter(candidates.iter().map(|c| async move {
+                let mut package_verdict = PackageAdvisorOutcome::Approve;
+                for (phase, body) in &c.amber_phases {
+                    let amber = AmberScript {
+                        package_name: &c.name,
+                        package_version: &c.version,
+                        phase: phase.as_str(),
+                        script_body: body.as_str(),
+                    };
+                    match adapter.classify_amber(&amber).await {
+                        Ok(AdvisorVerdict::Approve) => {}
+                        Ok(AdvisorVerdict::Manual) => {
+                            package_verdict = PackageAdvisorOutcome::Manual;
+                            break;
+                        }
+                        Ok(AdvisorVerdict::Abstain) => {
+                            package_verdict =
+                                package_verdict.degrade_to(PackageAdvisorOutcome::Abstain);
+                        }
+                        Err(_) => {
+                            // Silent per the locked contract; degrade
+                            // to "no approval" for this package and
+                            // keep scanning the remaining packages.
+                            package_verdict =
+                                package_verdict.degrade_to(PackageAdvisorOutcome::Abstain);
+                        }
                     }
                 }
-            }
-            if package_verdict == PackageAdvisorOutcome::Approve && !c.amber_phases.is_empty() {
-                self.approvals
-                    .insert((c.name.clone(), c.version.clone(), c.integrity.clone()));
+                (
+                    c.name.clone(),
+                    c.version.clone(),
+                    c.integrity.clone(),
+                    package_verdict,
+                    !c.amber_phases.is_empty(),
+                )
+            }))
+            .buffer_unordered(CLASSIFY_CONCURRENCY)
+            .collect()
+            .await;
+
+        // Serial application of approvals — single-thread mutation,
+        // no locks. Order doesn't matter because the approval set is
+        // a `HashSet` keyed by `(name, version, integrity)`.
+        for (name, version, integrity, outcome, has_phases) in results {
+            if outcome == PackageAdvisorOutcome::Approve && has_phases {
+                self.approvals.insert((name, version, integrity));
             }
         }
     }
@@ -702,5 +760,174 @@ mod tests {
         }
         assert_no_serde::<AdvisorSession>();
         assert_no_serde::<AmberPackageRequest>();
+    }
+
+    /// Synthetic slow advisor for the parallelism test. Holds for
+    /// `delay` on every `classify_amber` call so a serial-vs-parallel
+    /// wall-clock difference is detectable. Always returns
+    /// `Approve` so we don't need to coordinate a result queue
+    /// across concurrent callers.
+    struct SlowFakeAdvisor {
+        delay: std::time::Duration,
+        call_count: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl Advisor for SlowFakeAdvisor {
+        fn provider(&self) -> Provider {
+            Provider::ClaudeCli
+        }
+        async fn detect(&self) -> bool {
+            true
+        }
+        async fn test_invoke(&self) -> Result<AdvisorVerdict, AdvisorFailure> {
+            Ok(AdvisorVerdict::Approve)
+        }
+        async fn classify_amber(
+            &self,
+            _: &AmberScript<'_>,
+        ) -> Result<AdvisorVerdict, AdvisorFailure> {
+            self.call_count
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            tokio::time::sleep(self.delay).await;
+            Ok(AdvisorVerdict::Approve)
+        }
+    }
+
+    #[tokio::test]
+    async fn classify_amber_fans_out_in_parallel_across_packages() {
+        // Phase 46.2 parallelization (2026-05-11): pre-parallel the
+        // outer per-package loop awaited each LLM round-trip
+        // sequentially, so N amber packages cost N × round-trip wall
+        // clock. The DX-doc walkthrough W5 measured 2.1s on a single
+        // amber install, dominated by ONE round-trip; a five-amber
+        // install would have hit ~5–10s. Post-parallel, up to
+        // [`CLASSIFY_CONCURRENCY`] calls are in flight at once.
+        //
+        // This test pins the wall-clock property at the integration
+        // boundary. Using `tokio::time::sleep(50ms)` per call so the
+        // measurement is robust against scheduler jitter without
+        // making the test slow. With 6 packages and concurrency
+        // ≥ 8, all 6 fire concurrently and total wall-clock is
+        // ~50ms; the serial baseline would be 6 × 50 = 300ms. We
+        // assert under 200ms — comfortably below 300ms but above any
+        // realistic single-call overshoot from CI jitter.
+        //
+        // A future regression that re-introduces the serial loop
+        // would push this test toward 300ms+ and fail.
+        let call_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let fake = SlowFakeAdvisor {
+            delay: std::time::Duration::from_millis(50),
+            call_count: Arc::clone(&call_count),
+        };
+        let mut s = AdvisorSession {
+            adapter: Some(Box::new(fake)),
+            configured_slug: Some("slow-fake".into()),
+            approvals: HashSet::new(),
+            warned_about_unavailable: false,
+        };
+        let reqs: Vec<AmberPackageRequest> = (0..6)
+            .map(|i| AmberPackageRequest {
+                name: format!("pkg-{i}"),
+                version: "1.0.0".into(),
+                integrity: None,
+                amber_phases: vec![("postinstall".into(), "node install.js".into())],
+            })
+            .collect();
+
+        let start = std::time::Instant::now();
+        s.classify_amber(&reqs).await;
+        let elapsed = start.elapsed();
+
+        // All 6 calls fired (one per package, since each request has
+        // exactly one phase).
+        assert_eq!(
+            call_count.load(std::sync::atomic::Ordering::SeqCst),
+            6,
+            "every package's amber phase must reach the advisor",
+        );
+        // All 6 approvals landed (every package returned Approve).
+        assert_eq!(s.approvals().len(), 6);
+        // Parallelism gate: wall-clock must be well under the serial
+        // baseline of 6 × 50ms = 300ms. 200ms gives a generous
+        // margin for scheduler / single-call overshoot while still
+        // failing if the loop reverts to serial.
+        assert!(
+            elapsed < std::time::Duration::from_millis(200),
+            "classify_amber must fan out concurrently across packages — elapsed {elapsed:?} is \
+             close to or above the serial baseline (~300ms). A regression to the serial loop \
+             would trip this assertion. concurrency = {CLASSIFY_CONCURRENCY}",
+        );
+    }
+
+    #[tokio::test]
+    async fn classify_amber_concurrency_cap_bounds_inflight_calls() {
+        // Defense-in-depth: when the candidate set exceeds
+        // [`CLASSIFY_CONCURRENCY`], the stream must NOT spawn every
+        // task at once — that would defeat the rate-limit / queue-
+        // saturation safety we cap for. We exercise this by:
+        //   • Making each call sleep `delay` (50ms)
+        //   • Sending `CLASSIFY_CONCURRENCY * 2` requests
+        //   • Asserting wall-clock is ≥ delay × 2 (i.e., at least
+        //     two waves must serialize), but well under
+        //     `delay × CONCURRENCY * 2` (which would mean fully
+        //     serial)
+        //
+        // The window between those bounds is wide enough to be
+        // robust against jitter while still pinning that the cap
+        // actually applies.
+        let n = CLASSIFY_CONCURRENCY * 2;
+        let delay_ms = 50u64;
+        let call_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let fake = SlowFakeAdvisor {
+            delay: std::time::Duration::from_millis(delay_ms),
+            call_count: Arc::clone(&call_count),
+        };
+        let mut s = AdvisorSession {
+            adapter: Some(Box::new(fake)),
+            configured_slug: Some("slow-fake".into()),
+            approvals: HashSet::new(),
+            warned_about_unavailable: false,
+        };
+        let reqs: Vec<AmberPackageRequest> = (0..n)
+            .map(|i| AmberPackageRequest {
+                name: format!("pkg-{i}"),
+                version: "1.0.0".into(),
+                integrity: None,
+                amber_phases: vec![("postinstall".into(), "node install.js".into())],
+            })
+            .collect();
+
+        let start = std::time::Instant::now();
+        s.classify_amber(&reqs).await;
+        let elapsed = start.elapsed();
+
+        assert_eq!(
+            call_count.load(std::sync::atomic::Ordering::SeqCst),
+            n,
+            "every package must still reach the advisor — concurrency cap throttles, doesn't drop",
+        );
+        assert_eq!(s.approvals().len(), n);
+        // Lower bound: at least 2 waves of `delay` each because the
+        // cap forces serialization. Subtract a generous 20ms for
+        // sleep/scheduling slack so the lower bound never fires on
+        // hot machines.
+        let lower = std::time::Duration::from_millis(delay_ms * 2 - 20);
+        assert!(
+            elapsed >= lower,
+            "concurrency cap MUST throttle past `CLASSIFY_CONCURRENCY` requests — elapsed \
+             {elapsed:?} is below the two-wave lower bound {lower:?}. If parallelism is \
+             unbounded the cap is broken.",
+        );
+        // Upper bound: nowhere near fully serial. Serial would be
+        // n × delay = 16 × 50 = 800ms. Cap with 2 waves should be
+        // ~100ms. We allow up to 350ms — accommodates jitter while
+        // catching a regression to serial.
+        assert!(
+            elapsed < std::time::Duration::from_millis(350),
+            "concurrency cap parallelizes — elapsed {elapsed:?} is close to the serial \
+             baseline of ~{} ms. Did the fan-out break? concurrency = {CLASSIFY_CONCURRENCY}",
+            n as u64 * delay_ms,
+        );
     }
 }
