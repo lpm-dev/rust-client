@@ -323,6 +323,28 @@ async fn assert_network_denied(
         out.status,
     );
 
+    // ── Assertion 0.5: strict-mode banner fires under env-set strict. ──
+    //
+    // GPT-5 audit (2026-05-11) caught that the strict banner only
+    // fired for `--strict-sandbox` / `--paranoid` on the CLI —
+    // config-set and env-set strict users got the kernel-level
+    // network denial silently. This test runs with
+    // `LPM_STRICT_SANDBOX=1` (env tier), so the banner MUST appear
+    // in stderr. Pre-fix it didn't; post-fix it must.
+    //
+    // DX-doc walkthroughs W3 / W6 / W8 all require this announcement
+    // regardless of source. The unit tests in
+    // `crates/lpm-cli/src/sandbox_config.rs::tests::strict_banner_*`
+    // pin the decision logic; this end-to-end assertion proves the
+    // wiring from resolver → banner-emit site is intact.
+    assert!(
+        stderr.contains("strict-sandbox: outbound network"),
+        "[{case_label}] strict-mode banner must appear in stderr under env-set \
+         `LPM_STRICT_SANDBOX=1`. GPT-5 audit follow-up: the banner used to gate \
+         only on the CLI flag; if this assertion fires, that regression is back. \
+         stderr:\n{stderr}",
+    );
+
     // ── Assertion 1: install surfaces the failure truthfully. ──
     //
     // Two layers must each acknowledge the failure for the test
