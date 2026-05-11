@@ -42,6 +42,7 @@ mod swift_manifest;
 #[cfg(test)]
 mod test_env;
 mod tool_pin_validation;
+pub mod triage_advisor_session;
 mod trust_snapshot;
 mod tsc_status;
 mod update_check;
@@ -3375,6 +3376,12 @@ async fn async_main() -> Result<()> {
                 // so Chunk 2 can consult it for green-tier promotion
                 // without another signature change.
                 effective,
+                // Phase 46 slice 1: standalone `lpm rebuild` has no
+                // install-time advisor context — only the trust
+                // manifest authorises execution here. The ephemeral
+                // advisor approvals live exclusively on the install
+                // path.
+                None,
             )
             .await
         }
