@@ -2401,14 +2401,13 @@ fn probe_sandbox_backend() -> Check {
     // `current_dir()` failing (no cwd resolvable, e.g. running
     // from a deleted directory) falls back to the strict default —
     // there's no config to parse in that case.
-    let sandbox_options = match std::env::current_dir() {
+    let (sandbox_options, resolved_mode) = match std::env::current_dir() {
         // Phase 46.1 rework: route through the precedence chain so
         // `LPM_STRICT_SANDBOX=1` and `[sandbox] mode` flow through
         // the doctor probe identically to the install pipeline.
         Ok(cwd) => match crate::sandbox_config::resolve_sandbox_mode_from_chain(&cwd, false, false)
-            .map(|(opts, _)| opts)
         {
-            Ok(opts) => opts,
+            Ok(pair) => pair,
             Err(e) => {
                 return Check::fail(
                     &doctor_catalog::SANDBOX_PROBE_FAILED,
@@ -2420,8 +2419,39 @@ fn probe_sandbox_backend() -> Check {
                 );
             }
         },
-        Err(_) => lpm_sandbox::SandboxOptions::default(),
+        Err(_) => (
+            lpm_sandbox::SandboxOptions::default(),
+            crate::sandbox_config::ResolvedSandboxMode::Default,
+        ),
     };
+
+    // Phase 46.1 rework GPT-5 audit follow-up (2026-05-11): when the
+    // resolved mode is `None` (`[sandbox] mode = "none"` in
+    // `~/.lpm/config.toml` / `./lpm.toml`, persisted by
+    // `lpm config sandbox --set none`), the install pipeline runs
+    // [`SandboxMode::Disabled`] — so doctor must report that posture
+    // directly instead of probing `Enforce` and reporting whatever
+    // the host's backend happens to support. Pre-fix this branch
+    // was unreachable in normal use because doctor always probed
+    // Enforce; users would see "default mode: filesystem-write
+    // containment …" even after running `lpm config sandbox --set
+    // none`, which contradicts the install behaviour.
+    if matches!(
+        resolved_mode,
+        crate::sandbox_config::ResolvedSandboxMode::None
+    ) {
+        let os = std::env::consts::OS;
+        return Check::warn(
+            &doctor_catalog::SANDBOX_DISABLED_BY_USER,
+            &format!(
+                "sandbox DISABLED on {os} via `[sandbox] mode = \"none\"` (set by \
+                 `lpm config sandbox --set none` or directly in `~/.lpm/config.toml` / \
+                 `./lpm.toml`). Lifecycle scripts will run WITHOUT filesystem / env / \
+                 network containment. Re-enable the default posture via \
+                 `lpm config sandbox --set default`."
+            ),
+        );
+    }
 
     match new_for_platform_with_options(spec, SandboxMode::Enforce, sandbox_options) {
         Ok(sb) => {
@@ -2564,12 +2594,14 @@ mod tests {
         // Pin the codes the sandbox probe is allowed to emit so the
         // automation contract for this check stays stable across
         // platforms / refactors. Phase 46.1 adds `sandbox_degraded`
-        // for the V1-fallback path; the other four codes are
-        // pre-existing.
+        // for the V1-fallback path; the GPT-5 audit follow-up adds
+        // `sandbox_disabled_by_user` for the persistent `mode =
+        // "none"` path; the other four codes are pre-existing.
         let c = probe_sandbox_backend();
         let allowed = [
             "sandbox_available",
             "sandbox_degraded",
+            "sandbox_disabled_by_user",
             "sandbox_unsupported_platform",
             "sandbox_kernel_too_old",
             "sandbox_probe_failed",
@@ -2718,6 +2750,71 @@ commands = []
             "Sandbox",
             "sandbox probe must be the first entry so it renders \
              next to the other infrastructure checks"
+        );
+    }
+
+    /// GPT-5 audit follow-up (2026-05-11): when the user has set
+    /// `[sandbox] mode = "none"` in `~/.lpm/config.toml` (via
+    /// `lpm config sandbox --set none` or by hand), the doctor probe
+    /// MUST report the disabled posture instead of probing
+    /// `SandboxMode::Enforce` and reporting whatever the backend
+    /// happens to support. Pre-fix, doctor lied about that state —
+    /// it said "default mode: filesystem-write containment …" while
+    /// the install pipeline was running unsandboxed.
+    ///
+    /// Test isolates the global config by overriding `HOME` to a
+    /// tempdir and writing the wizard's on-disk shape directly. The
+    /// project tier is silent (no `lpm.toml` in cwd typically), so
+    /// the global tier wins.
+    #[test]
+    fn sandbox_probe_honors_persistent_mode_none_from_global_config() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path();
+        std::fs::create_dir_all(home.join(".lpm")).unwrap();
+        std::fs::write(
+            home.join(".lpm").join("config.toml"),
+            "[sandbox]\nmode = \"none\"\n",
+        )
+        .unwrap();
+        // Override HOME for the duration of the probe call. The
+        // resolver's `dirs::home_dir()` consults HOME on Unix; the
+        // ScopedEnv mutex serialises with other tests that touch
+        // process-wide env vars.
+        let _env = crate::test_env::ScopedEnv::set([("HOME", home.as_os_str().to_owned())]);
+
+        let c = probe_sandbox_backend();
+
+        assert_eq!(
+            c.code(),
+            "sandbox_disabled_by_user",
+            "doctor must emit the dedicated `sandbox_disabled_by_user` code so JSON \
+             consumers can tell the persistent-off-mode apart from `sandbox_available` \
+             / `sandbox_degraded`. got: code={} detail={}",
+            c.code(),
+            c.detail,
+        );
+        assert!(
+            matches!(c.severity, Severity::Warn),
+            "persistent `mode = \"none\"` is a chosen-state warning, not a pass. \
+             got severity={:?}, detail={}",
+            c.severity,
+            c.detail,
+        );
+        assert!(
+            c.detail.contains("DISABLED") || c.detail.contains("disabled"),
+            "detail must announce the disabled posture so the user sees their \
+             config decision is taking effect. got: {}",
+            c.detail,
+        );
+        // Negative assertion that doubles as the regression pin: the
+        // old buggy probe emitted "default mode: filesystem-write
+        // containment …". If that string ever resurfaces under
+        // `mode = "none"`, doctor is back to lying.
+        assert!(
+            !c.detail.contains("default mode:"),
+            "pre-fix detail leaked under `mode = \"none\"` — doctor must NOT \
+             claim default-mode containment when config asked for none. got: {}",
+            c.detail,
         );
     }
 
