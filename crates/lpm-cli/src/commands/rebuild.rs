@@ -876,11 +876,19 @@ async fn run_under_store_lock(
     // branch in env construction — so users see "credentials NOT
     // stripped + no containment" as one combined warning rather
     // than two split announcements.
-    if strict_sandbox && !json_output {
-        output::warn(
-            "--strict-sandbox: outbound network will be denied for every lifecycle script in \
-             this run (filesystem + env containment also active).",
-        );
+    //
+    // GPT-5 audit (2026-05-11) Low: the strict banner now fires on
+    // the RESOLVED mode, not the CLI flag alone. Pre-fix users who
+    // engaged strict via `[sandbox] mode = "strict"` or
+    // `LPM_STRICT_SANDBOX=1` got the kernel-level network denial
+    // silently, contradicting DX-doc walkthroughs W3 / W6 / W8.
+    // `strict_banner_for_resolved` returns `None` for Default / None
+    // so a no-op resolved mode never accidentally triggers the
+    // banner.
+    if !json_output
+        && let Some(line) = crate::sandbox_config::strict_banner_for_resolved(resolved_sandbox_mode)
+    {
+        output::warn(line);
     }
     if sandbox_log && !json_output {
         output::warn(

@@ -393,6 +393,35 @@ pub fn decide_runtime_sandbox_mode(
     (SandboxMode::Enforce, true)
 }
 
+/// The per-install stderr banner that announces strict mode is in
+/// effect, or `None` when no banner is needed. Returned as a static
+/// string so the install pipeline only has the decision to make,
+/// not the prose to template.
+///
+/// GPT-5 audit (2026-05-11) caught that the previous version only
+/// fired this banner when `--strict-sandbox` / `--paranoid` arrived
+/// on the CLI — config-set (`[sandbox] mode = "strict"`) and env-set
+/// (`LPM_STRICT_SANDBOX=1`) users got the kernel-level network
+/// denial silently. The DX-doc walkthroughs W3 / W6 / W8 all show
+/// the same banner regardless of source, so the gating must be on
+/// the *resolved* mode, not on which tier supplied it.
+///
+/// Wording is intentionally neutral (no `--strict-sandbox` prefix)
+/// because the banner runs the same for config / env / CLI sources;
+/// claiming a source the install can't actually attribute would be
+/// the inverse of the bug GPT-5 just caught. The provenance ("which
+/// tier set strict") belongs on `lpm doctor`, which DOES have the
+/// resolver result available and a stable surface for it.
+pub fn strict_banner_for_resolved(resolved: ResolvedSandboxMode) -> Option<&'static str> {
+    match resolved {
+        ResolvedSandboxMode::Strict => Some(
+            "strict-sandbox: outbound network will be denied for every lifecycle script in \
+             this run (filesystem + env containment also active).",
+        ),
+        ResolvedSandboxMode::Default | ResolvedSandboxMode::None => None,
+    }
+}
+
 /// Coerce a TOML value into a `bool` using the same string-alias rules
 /// that the global config reader uses for legacy string-coerced
 /// values. Native `Boolean(b)` is the preferred form; the string
@@ -803,5 +832,65 @@ allow-degraded = "maybe"
         let (mode, scrub) = decide_runtime_sandbox_mode(true, true, ResolvedSandboxMode::Default);
         assert_eq!(mode, SandboxMode::Disabled);
         assert!(!scrub);
+    }
+
+    // ── strict_banner_for_resolved (GPT-5 audit follow-up, 2026-05-11) ──
+    //
+    // GPT-5 audit caught a Low: the strict-mode runtime warning only
+    // fired for `--strict-sandbox` / `--paranoid` on the CLI. When
+    // strict came from `[sandbox] mode = "strict"` or
+    // `LPM_STRICT_SANDBOX=1`, the kernel-level network denial
+    // engaged silently — contradicting DX-doc walkthroughs W3 / W6 /
+    // W8 which all promise the same banner regardless of source.
+    // These tests pin the corrected contract.
+
+    #[test]
+    fn strict_banner_fires_for_resolved_strict() {
+        // The bug case: regardless of which tier supplied `Strict`
+        // (CLI flag / env / config), the runtime banner must
+        // announce that outbound network is being denied.
+        let banner = strict_banner_for_resolved(ResolvedSandboxMode::Strict);
+        let line = banner.expect(
+            "strict mode MUST emit a runtime banner — DX-doc walkthroughs W3 / W6 / W8 \
+             all require it regardless of source. This was the GPT-5 audit Low finding.",
+        );
+        assert!(
+            line.contains("outbound network"),
+            "banner must name what strict actually does — outbound network denial. got: {line}",
+        );
+        assert!(
+            line.contains("strict-sandbox"),
+            "banner must label itself as the strict-sandbox notice so users can grep for it. \
+             got: {line}",
+        );
+        // Negative assertion + regression pin: pre-fix the banner
+        // string included `--strict-sandbox:` (with the double-dash
+        // CLI-flag prefix), which claimed a source the install
+        // pipeline can no longer attribute correctly. If someone
+        // restores that prefix the banner will lie under config /
+        // env tier strict.
+        assert!(
+            !line.starts_with("--"),
+            "banner must NOT prefix `--` — that would falsely claim CLI-flag source when \
+             strict can also come from `[sandbox] mode = \"strict\"` or `LPM_STRICT_SANDBOX=1`. \
+             got: {line}",
+        );
+    }
+
+    #[test]
+    fn strict_banner_does_not_fire_under_default_or_none() {
+        // Symmetric: no banner when there's nothing to announce.
+        // Default is the relaxed posture (no network denial); None
+        // is fully off and gets its own different banner up at the
+        // env-scrub site.
+        assert!(
+            strict_banner_for_resolved(ResolvedSandboxMode::Default).is_none(),
+            "no banner under the default posture — there's no behaviour change to announce",
+        );
+        assert!(
+            strict_banner_for_resolved(ResolvedSandboxMode::None).is_none(),
+            "no strict banner under `mode = \"none\"` — the disabled-sandbox banner at the \
+             env-scrub site already covers it",
+        );
     }
 }
