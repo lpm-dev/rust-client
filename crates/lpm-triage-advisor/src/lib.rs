@@ -44,11 +44,13 @@ use thiserror::Error;
 
 mod adapters;
 mod detection;
+mod metadata;
 mod prompt;
 mod verdict;
 
 pub use adapters::{ClaudeCliAdapter, CodexAdapter, OllamaAdapter};
-pub use detection::{ProbeReport, detect};
+pub use detection::{ProbeReport, detect, probe_all};
+pub use metadata::{binary_path, prompt_template_hash, provider_version};
 pub use prompt::build_prompt;
 pub use verdict::parse_verdict;
 

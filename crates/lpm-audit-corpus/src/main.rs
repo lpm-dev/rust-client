@@ -39,7 +39,8 @@ use lpm_security::static_gate::classify;
 use lpm_security::triage::StaticTier;
 use lpm_triage_advisor::{
     Advisor, AdvisorFailure, AdvisorVerdict as TriageVerdict, AmberScript as TriageAmberScript,
-    ClaudeCliAdapter, CodexAdapter, OllamaAdapter, Provider as AdvisorProvider,
+    ClaudeCliAdapter, CodexAdapter, OllamaAdapter, Provider as AdvisorProvider, binary_path,
+    prompt_template_hash, provider_version,
 };
 use serde::{Deserialize, Serialize};
 
@@ -284,6 +285,56 @@ enum AdvisorOutcome {
     HardBlock,
 }
 
+/// Per-run metadata stamp. Persisted to a sidecar file alongside the
+/// audit results JSON so future comparative runs can attribute uplift
+/// drift to advisor identity (provider, binary path, version) vs
+/// prompt-template iteration (`prompt_template_hash`) vs everything
+/// else. Without this, +1 today vs +2 tomorrow is muddy.
+///
+/// Stored in a SIDECAR (`<results>.meta.json`) rather than wrapped
+/// into the records file so existing tooling that deserialises
+/// `Vec<PackageAudit>` doesn't break. Schema-wise it's append-only:
+/// all fields use `serde(default)` so older sidecars still parse.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct AuditMetadata {
+    /// Wall-clock timestamp the audit run finished (ISO 8601 UTC).
+    #[serde(default)]
+    run_completed_at: Option<String>,
+    /// `--size` value that produced the audited population.
+    #[serde(default)]
+    audit_size: Option<usize>,
+    /// L4 advisor stamp. `None` when the run had no `--advisor`.
+    #[serde(default)]
+    advisor: Option<AdvisorStamp>,
+}
+
+/// Identity of the advisor that ran on this audit. Lets future
+/// comparison runs explain "+1 vs +2 uplift" by showing whether the
+/// binary version, prompt template, or model changed.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct AdvisorStamp {
+    /// Provider slug (`claude-cli` / `codex` / `ollama`).
+    provider: String,
+    /// Absolute path of the binary that ran. `None` if the adapter
+    /// invokes via HTTP only (Ollama) and the CLI isn't on PATH.
+    #[serde(default)]
+    binary_path: Option<String>,
+    /// Output of `<binary> --version`. Best-effort: `None` if the
+    /// binary doesn't support `--version` or the probe failed.
+    #[serde(default)]
+    binary_version: Option<String>,
+    /// For Ollama only: the model name passed to `/api/generate`.
+    /// `None` for CLI providers.
+    #[serde(default)]
+    model: Option<String>,
+    /// SHA-256 of the canonical prompt rendering. Changes iff
+    /// [`lpm_triage_advisor::build_prompt`] changes.
+    prompt_template_hash: String,
+    /// Count of packages the advisor was invoked on (== number of
+    /// packages with `portable_outcome = Prompt` at invocation time).
+    invoked_count: usize,
+}
+
 /// Normalised shape bucket for reporting amber scripts. Replaces the
 /// lossy first-token grouping that lumped softfail-wrappers, binary
 /// fetchers, and helper scripts together under "node".
@@ -410,23 +461,70 @@ async fn main() -> Result<(), BoxError> {
     }
     finalize_outcomes(&mut audits);
 
+    let mut metadata = AuditMetadata {
+        run_completed_at: Some(now_rfc3339()),
+        audit_size: Some(args.size),
+        advisor: None,
+    };
+
     if let Some(name) = &args.advisor {
-        enrich_advisor_in_place(name, &mut audits).await?;
+        metadata.advisor = enrich_advisor_in_place(name, &mut audits).await?;
     }
 
-    std::fs::write(&args.results, serde_json::to_vec_pretty(&audits)?)?;
-    println!(
-        "wrote {} audit records → {}",
-        audits.len(),
-        args.results.display()
-    );
-
-    let report = build_report(&audits);
-    std::fs::write(&args.report, &report)?;
-    println!("wrote markdown report → {}", args.report.display());
-
+    persist_audit(&args.results, &args.report, &audits, &metadata)?;
     print_summary(&audits);
     Ok(())
+}
+
+/// Persist the records JSON, the sidecar metadata JSON, and the
+/// Markdown report in one go. All three are derived from the same
+/// in-memory state, so a single helper keeps them in lockstep across
+/// the audit / reclassify / enrich-l3-only paths.
+fn persist_audit(
+    results_path: &std::path::Path,
+    report_path: &std::path::Path,
+    audits: &[PackageAudit],
+    metadata: &AuditMetadata,
+) -> Result<(), BoxError> {
+    std::fs::write(results_path, serde_json::to_vec_pretty(audits)?)?;
+    let meta_path = sidecar_metadata_path(results_path);
+    std::fs::write(&meta_path, serde_json::to_vec_pretty(metadata)?)?;
+    let report = build_report(audits, metadata);
+    std::fs::write(report_path, &report)?;
+    println!(
+        "wrote {} audit records → {}\nwrote metadata → {}\nwrote markdown report → {}",
+        audits.len(),
+        results_path.display(),
+        meta_path.display(),
+        report_path.display()
+    );
+    Ok(())
+}
+
+/// Sidecar metadata path: `<results>.meta.json`. Picked rather than
+/// wrapping the records file so existing tooling that deserialises a
+/// bare `Vec<PackageAudit>` keeps working.
+fn sidecar_metadata_path(results_path: &std::path::Path) -> std::path::PathBuf {
+    let mut s = results_path.as_os_str().to_owned();
+    s.push(".meta.json");
+    std::path::PathBuf::from(s)
+}
+
+/// Load the metadata sidecar if it exists, else default. Used by the
+/// reclassify / enrich-l3-only paths so we preserve prior-run
+/// metadata when the new pass doesn't itself invoke the advisor.
+fn load_sidecar_metadata(results_path: &std::path::Path) -> AuditMetadata {
+    let path = sidecar_metadata_path(results_path);
+    match std::fs::read(&path) {
+        Ok(bytes) => serde_json::from_slice(&bytes).unwrap_or_default(),
+        Err(_) => AuditMetadata::default(),
+    }
+}
+
+fn now_rfc3339() -> String {
+    use time::format_description::well_known::Rfc3339;
+    let now = time::OffsetDateTime::now_utc();
+    now.format(&Rfc3339).unwrap_or_else(|_| String::new())
 }
 
 /// Enrich an audit set with L3 data (packument time + attestation
@@ -526,20 +624,20 @@ async fn enrich_l3_from_cache(client: &reqwest::Client, args: &Args) -> Result<(
     refresh_shapes(&mut audits);
     enrich_l3_in_place(client, &mut audits, args.concurrency).await;
     finalize_outcomes(&mut audits);
+
+    // Carry forward any prior metadata (cooldown of an earlier run is
+    // still meaningful even if we didn't run an advisor this time),
+    // but always refresh `run_completed_at` so the sidecar timestamp
+    // reflects when this pass actually ran.
+    let mut metadata = load_sidecar_metadata(&args.results);
+    metadata.run_completed_at = Some(now_rfc3339());
+    metadata.audit_size = metadata.audit_size.or(Some(args.size));
+
     if let Some(name) = &args.advisor {
-        enrich_advisor_in_place(name, &mut audits).await?;
+        metadata.advisor = enrich_advisor_in_place(name, &mut audits).await?;
     }
 
-    std::fs::write(&args.results, serde_json::to_vec_pretty(&audits)?)?;
-    let report = build_report(&audits);
-    std::fs::write(&args.report, &report)?;
-    println!(
-        "wrote {} audit records → {}\nwrote markdown report → {}",
-        audits.len(),
-        args.results.display(),
-        args.report.display()
-    );
-
+    persist_audit(&args.results, &args.report, &audits, &metadata)?;
     print_summary(&audits);
     Ok(())
 }
@@ -557,13 +655,20 @@ async fn enrich_l3_from_cache(client: &reqwest::Client, args: &Args) -> Result<(
 /// advisor outcome to whatever the portable outcome was (no uplift),
 /// but the audit continues. An `IntegrationFailure` is the same — the
 /// audit harness's job is to MEASURE, not to fix the advisor mid-run.
-async fn enrich_advisor_in_place(name: &str, audits: &mut [PackageAudit]) -> Result<(), BoxError> {
+async fn enrich_advisor_in_place(
+    name: &str,
+    audits: &mut [PackageAudit],
+) -> Result<Option<AdvisorStamp>, BoxError> {
     let provider = AdvisorProvider::from_slug(name)
         .ok_or_else(|| format!("unknown advisor '{name}'; valid: claude-cli / codex / ollama"))?;
-    let advisor: Box<dyn Advisor> = match provider {
-        AdvisorProvider::ClaudeCli => Box::new(ClaudeCliAdapter),
-        AdvisorProvider::Codex => Box::new(CodexAdapter),
-        AdvisorProvider::Ollama => Box::new(OllamaAdapter::default()),
+    let (advisor, model): (Box<dyn Advisor>, Option<String>) = match provider {
+        AdvisorProvider::ClaudeCli => (Box::new(ClaudeCliAdapter), None),
+        AdvisorProvider::Codex => (Box::new(CodexAdapter), None),
+        AdvisorProvider::Ollama => {
+            let a = OllamaAdapter::default();
+            let m = Some(a.model.clone());
+            (Box::new(a), m)
+        }
     };
 
     // Pre-flight: detect + test-invoke. If either fails we abort the
@@ -591,9 +696,22 @@ async fn enrich_advisor_in_place(name: &str, audits: &mut [PackageAudit]) -> Res
         .filter(|(_, a)| a.portable_outcome == Some(PortableOutcome::Prompt))
         .map(|(i, _)| i)
         .collect();
+
+    // Collect identity stamp regardless of how many prompted packages
+    // exist — so re-running on an audit set with zero ambers still
+    // captures "we tried, here's the advisor we'd use."
+    let stamp = AdvisorStamp {
+        provider: provider.slug().to_string(),
+        binary_path: binary_path(provider).map(|p| p.display().to_string()),
+        binary_version: provider_version(provider).await,
+        model,
+        prompt_template_hash: prompt_template_hash(),
+        invoked_count: targets.len(),
+    };
+
     if targets.is_empty() {
         println!("L4 advisor: no prompted packages — nothing to advise");
-        return Ok(());
+        return Ok(Some(stamp));
     }
     println!(
         "L4 advisor: classifying {} prompted package(s) via {name}",
@@ -615,7 +733,7 @@ async fn enrich_advisor_in_place(name: &str, audits: &mut [PackageAudit]) -> Res
     }
     pb.finish_with_message("L4 advisor complete");
 
-    Ok(())
+    Ok(Some(stamp))
 }
 
 /// Run the advisor on a single package's amber script(s). Worst-of
@@ -810,25 +928,23 @@ async fn reclassify_from_cache(args: &Args) -> Result<(), BoxError> {
 
     finalize_outcomes(&mut audits);
 
+    // Carry forward existing metadata; refresh timestamp; replace the
+    // advisor stamp iff this pass invokes one.
+    let mut metadata = load_sidecar_metadata(&args.results);
+    metadata.run_completed_at = Some(now_rfc3339());
+    metadata.audit_size = metadata.audit_size.or(Some(args.size));
+
     if let Some(name) = &args.advisor {
         // Clear stale advisor outcomes before re-running so a previous
         // run's verdicts don't bleed into this one's report.
         for a in &mut audits {
             a.advisor_outcome = None;
+            a.advisor_provider = None;
         }
-        enrich_advisor_in_place(name, &mut audits).await?;
+        metadata.advisor = enrich_advisor_in_place(name, &mut audits).await?;
     }
 
-    std::fs::write(&args.results, serde_json::to_vec_pretty(&audits)?)?;
-    let report = build_report(&audits);
-    std::fs::write(&args.report, &report)?;
-    println!(
-        "wrote {} audit records → {}\nwrote markdown report → {}",
-        audits.len(),
-        args.results.display(),
-        args.report.display()
-    );
-
+    persist_audit(&args.results, &args.report, &audits, &metadata)?;
     print_summary(&audits);
     Ok(())
 }
@@ -1458,11 +1574,12 @@ fn package_is_policy_permanent_amber(a: &PackageAudit) -> bool {
         .any(is_policy_permanent_amber_shape)
 }
 
-fn build_report(audits: &[PackageAudit]) -> String {
+fn build_report(audits: &[PackageAudit], metadata: &AuditMetadata) -> String {
     let mut out = String::new();
     out.push_str("# Phase 46 — Top-N audit (L1-3, portable)\n\n");
     out.push_str(&format!("Total packages audited: **{}**\n\n", audits.len()));
 
+    section_run_metadata(&mut out, metadata);
     section_standing_benchmark(&mut out, audits);
     section_l1_tier_distribution(&mut out, audits);
     section_portable_outcome(&mut out, audits);
@@ -1471,9 +1588,48 @@ fn build_report(audits: &[PackageAudit]) -> String {
     section_l3_detail(&mut out, audits);
     section_runtime_review_candidates(&mut out, audits);
     section_red_packages(&mut out, audits);
-    section_advisor_baseline_placeholder(&mut out, audits);
+    section_advisor_baseline_placeholder(&mut out, audits, metadata);
 
     out
+}
+
+/// Pin run identity at the top of the report. Without this stamp,
+/// "+1 today vs +2 tomorrow" is impossible to attribute — could be
+/// the advisor's non-determinism, a binary upgrade, or a prompt-template
+/// iteration. Surfacing all three lets future comparative studies say
+/// exactly what changed.
+fn section_run_metadata(out: &mut String, metadata: &AuditMetadata) {
+    out.push_str("## Run identity\n\n");
+    out.push_str("| Field | Value |\n|-------|-------|\n");
+    if let Some(t) = &metadata.run_completed_at {
+        out.push_str(&format!("| Run completed at | `{t}` |\n"));
+    }
+    if let Some(s) = metadata.audit_size {
+        out.push_str(&format!("| Audit size | {s} |\n"));
+    }
+    if let Some(a) = &metadata.advisor {
+        out.push_str(&format!("| Advisor provider | `{}` |\n", a.provider));
+        if let Some(path) = &a.binary_path {
+            out.push_str(&format!("| Advisor binary | `{path}` |\n"));
+        }
+        if let Some(v) = &a.binary_version {
+            out.push_str(&format!(
+                "| Advisor version | `{}` |\n",
+                v.replace('\n', " ").trim()
+            ));
+        }
+        if let Some(m) = &a.model {
+            out.push_str(&format!("| Advisor model | `{m}` |\n"));
+        }
+        out.push_str(&format!(
+            "| Prompt template hash | `{}` |\n",
+            a.prompt_template_hash
+        ));
+        out.push_str(&format!("| Advisor invocations | {} |\n", a.invoked_count));
+    } else {
+        out.push_str("| Advisor provider | _none — portable baseline only_ |\n");
+    }
+    out.push('\n');
 }
 
 /// Locked standing benchmark per the Phase 46 audit Part A closeout.
@@ -1919,7 +2075,11 @@ const RUNTIME_REVIEW_CANDIDATES: &[(&str, &str)] = &[
     ),
 ];
 
-fn section_advisor_baseline_placeholder(out: &mut String, audits: &[PackageAudit]) {
+fn section_advisor_baseline_placeholder(
+    out: &mut String,
+    audits: &[PackageAudit],
+    metadata: &AuditMetadata,
+) {
     let any_advisor = audits.iter().any(|a| a.advisor_outcome.is_some());
     out.push_str("## Advisor-enhanced baseline (L1-4)\n\n");
     if !any_advisor {
@@ -2021,8 +2181,15 @@ fn section_advisor_baseline_placeholder(out: &mut String, audits: &[PackageAudit
         0.0
     };
     let unresolved = advisor.prompt;
-    let provider_label =
-        advisor_provider_name(audits).unwrap_or_else(|| "configured advisor".to_string());
+    // Prefer the metadata stamp's provider — it's the most reliable
+    // source. Fall back to per-record provider tag if the stamp isn't
+    // present (older sidecars).
+    let provider_label = metadata
+        .advisor
+        .as_ref()
+        .map(|a| a.provider.clone())
+        .or_else(|| advisor_provider_name(audits))
+        .unwrap_or_else(|| "configured advisor".to_string());
     out.push_str(&format!(
         "**Conclusion.** Advisor-enhanced run with `{provider_label}` increased \
          auto-run by {uplift_packages} package(s) (+{uplift_pp:.1}pp over portable) \

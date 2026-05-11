@@ -66,7 +66,6 @@ pub async fn detect(provider: Provider) -> ProbeReport {
 
 /// Probe every supported provider in parallel and return the reports
 /// in canonical order. The wizard uses this to render its menu.
-#[allow(dead_code)] // Wizard surface — consumed once `lpm config triage` lands.
 pub async fn probe_all() -> Vec<ProbeReport> {
     let mut handles = Vec::new();
     for p in Provider::all() {
@@ -141,9 +140,9 @@ async fn ollama_daemon_reachable() -> bool {
 
 /// Best-effort: locate the binary for a provider. Returns the
 /// absolute path of the first PATH entry that contains an executable
-/// file matching the provider's canonical name. Used by adapters to
-/// invoke the provider without re-walking PATH every call.
-#[allow(dead_code)] // Reserved for a future optimisation (avoid PATH re-walk per call).
+/// file matching the provider's canonical name. Used by the audit
+/// metadata stamp so the report can record which `claude` (or
+/// `codex` / `ollama`) was actually invoked.
 pub fn resolve_binary(provider: Provider) -> Option<PathBuf> {
     let name = provider_binary_name(provider);
     let path_var = std::env::var_os("PATH")?;
