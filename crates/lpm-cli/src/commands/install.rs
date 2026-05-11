@@ -6376,6 +6376,58 @@ async fn run_with_options_under_store_lock(
             None
         };
 
+    // **Phase 46 slice 1 — second-pass review fix.** Compute the
+    // auto-build decision BEFORE the blocked-set capture so the
+    // capture can condition the advisor-approval exclusion on
+    // whether scripts will actually run this install.
+    //
+    // The bug we are closing: an advisor `Approve` verdict has two
+    // observable effects — (1) the package's scripts run via the
+    // AdvisorApprovedThisRun trust path during autoBuild, and
+    // (2) the package is omitted from the persisted blocked set
+    // (so post-install messaging + `lpm approve-scripts` don't
+    // report stale "still blocked" state). Effect (2) is only
+    // valid when (1) actually fires. In a mixed-triage install
+    // where the advisor approves A but leaves B blocked, with
+    // `--auto-build` off and `autoBuild: false`, `all_trusted` is
+    // false → autoBuild does not fire → A's scripts never run, AND
+    // A vanishes from `build-state.json` → unreachable via
+    // `approve-scripts` either. "Stranded: not executed, not
+    // reviewable."
+    //
+    // Fix: pass `advisor_approvals` to the capture iff
+    // `auto_build_attempted` is true. When auto-build won't fire,
+    // the persisted blocked set continues to surface the
+    // advisor-approved-but-not-run package, and the user can review
+    // it explicitly via `lpm approve-scripts` (the ephemeral
+    // approval is gone after this run — by design, since approvals
+    // never persist).
+    //
+    // `all_scripted_packages_trusted` ALWAYS receives the approvals
+    // — its purpose is to decide whether autoBuild should fire, and
+    // an advisor-approved amber correctly counts as trusted for
+    // that gate.
+    let force_security_floor = install_capability_cfg
+        .get_bool("force-security-floor")
+        .unwrap_or(false);
+    let all_trusted_for_auto_build = crate::commands::rebuild::all_scripted_packages_trusted(
+        &lpm_root,
+        &all_pkgs_for_build,
+        &policy,
+        project_dir,
+        step10_effective_policy,
+        force_security_floor,
+        &install_requested_capabilities,
+        &install_user_bound,
+        advisor_session.as_ref().map(|s| s.approvals()),
+    );
+    let auto_build_attempted = should_auto_build(
+        auto_build,
+        config_auto_build,
+        all_trusted_for_auto_build,
+        step10_effective_policy,
+    );
+
     let capture_start = std::time::Instant::now();
     let blocked_capture = crate::build_state::capture_blocked_set_after_install_with_metadata(
         project_dir,
@@ -6385,7 +6437,14 @@ async fn run_with_options_under_store_lock(
         &blocked_set_metadata,
         &install_requested_capabilities,
         &install_user_bound,
-        advisor_session.as_ref().map(|s| s.approvals()),
+        // Conditional: only exclude advisor-approved triples when
+        // autoBuild will actually execute their scripts this run.
+        // See `select_approvals_for_capture` for the rationale —
+        // closes the "stranded approval" bug.
+        select_approvals_for_capture(
+            auto_build_attempted,
+            advisor_session.as_ref().map(|s| s.approvals()),
+        ),
     )?;
     tracing::debug!(
         "perf.capture_blocked_set pkgs={} ms={}",
@@ -6807,53 +6866,14 @@ async fn run_with_options_under_store_lock(
     // they produce are still in scope here; only the autoBuild
     // predicate + the rebuild::run call read them. No duplication.
 
-    // **Phase 48 P0 slice 4 + sub-slice 6c.** Read the force-
-    // security-floor kill-switch once, plus the project's requested
-    // capability set and the user's configured bounds. Thread all
-    // three through the auto-build trust check. When the flag is
-    // set, approvals are suspended and the check returns false
-    // (kill-switch path). When the project widens beyond the user
-    // bound and no matching approval exists, the capability gate
-    // returns CapabilityNotApproved for that package, also driving
-    // the check to false. Either way, auto-build declines cleanly.
-    // Phase 48 P0: reuse the hoisted capability + user-bound
-    // values from the earlier `capture_blocked_set_after_install_with_metadata`
-    // call site so the install-time capture and the autoBuild
-    // trust check consult identical canonical objects. Only the
-    // kill-switch flag is re-read here (config.rs reads are
-    // cached; this is a cheap lookup).
-    let force_security_floor = install_capability_cfg
-        .get_bool("force-security-floor")
-        .unwrap_or(false);
-    let all_trusted = crate::commands::rebuild::all_scripted_packages_trusted(
-        &lpm_root,
-        &all_pkgs_for_build,
-        &policy,
-        project_dir,
-        step10_effective_policy,
-        force_security_floor,
-        &install_requested_capabilities,
-        &install_user_bound,
-        advisor_session.as_ref().map(|s| s.approvals()),
-    );
-
-    // Phase 46 P6 Chunk 4: trace whether the auto-build actually ran
-    // so the post-auto-build pointer below only fires when scripts
-    // had a chance to execute. Without this, a `script-policy = triage`
-    // install that falls through `should_auto_build` returning false
-    // (mixed amber without `autoBuild: true`) would print a "remain
-    // blocked after auto-build" pointer for a build that never started
-    // — honest-but-wrong UX. The pre-auto-build blocked-hint block
-    // upstream already surfaces the pre-auto-build state; the post-
-    // auto-build pointer is strictly a second notice AFTER scripts
-    // ran, for the specific case where greens completed but amber/red
-    // survive.
-    let auto_build_attempted = should_auto_build(
-        auto_build,
-        config_auto_build,
-        all_trusted,
-        step10_effective_policy,
-    );
+    // **Phase 48 P0 slice 4 + sub-slice 6c + Phase 46 slice 1
+    // review-fix.** `force_security_floor`, `all_trusted_for_auto_build`,
+    // and `auto_build_attempted` are now computed BEFORE the
+    // blocked-set capture (so the capture can condition the
+    // advisor-approval exclusion on whether autoBuild will fire).
+    // The original comment block describing the kill-switch + capability
+    // gate's interaction with this predicate still applies — see the
+    // pre-capture computation above for details.
     if auto_build_attempted {
         // Phase 46 P7: preflight version-diff cards for any green
         // about to auto-execute that has a prior-approved binding
@@ -7497,6 +7517,51 @@ fn should_auto_build(
         || config_auto_build
         || all_trusted
         || effective_policy == crate::script_policy_config::ScriptPolicy::Allow
+}
+
+/// **Phase 46 slice 1 — second-pass review fix.** Decide what advisor
+/// approval view (if any) should be forwarded to
+/// [`crate::build_state::capture_blocked_set_after_install_with_metadata`].
+///
+/// Why this is its own function rather than an inline ternary:
+///
+/// The advisor's `Approve` verdict has two coupled effects in an
+/// install — (1) the package's scripts execute via the
+/// `AdvisorApprovedThisRun` trust path during autoBuild, and (2) the
+/// package is omitted from the persisted blocked set so post-install
+/// messaging + `lpm approve-scripts` don't report stale "still
+/// blocked" state. Effect (2) is only correct when (1) actually
+/// fires.
+///
+/// In a mixed-triage install where the advisor approves package A
+/// but leaves package B blocked, with `--auto-build=false` and
+/// `lpm.scripts.autoBuild=false`, `all_trusted` is false →
+/// `auto_build_attempted` is false → no scripts run, AND A vanishes
+/// from `build-state.json` → no path back through
+/// `approve-scripts`. The user is left with "not executed, not
+/// reviewable" — a stranded approval. This helper closes that hole.
+///
+/// Returns the input view unchanged when autoBuild will actually
+/// execute approved scripts this run. Otherwise returns `None`, so
+/// approved-but-not-run packages stay in the blocked set and remain
+/// reviewable on a later `lpm approve-scripts` invocation. (The
+/// ephemeral approval set itself is discarded at end of run — by
+/// design.)
+///
+/// Takes the borrowed approvals view directly (rather than the full
+/// `AdvisorSession`) so the install caller can compose:
+/// `select_approvals_for_capture(auto_build_attempted,
+/// advisor_session.as_ref().map(|s| s.approvals()))`, and tests can
+/// pass a hand-built `HashSet` without constructing a real session.
+fn select_approvals_for_capture(
+    auto_build_attempted: bool,
+    approvals: Option<&std::collections::HashSet<(String, String, Option<String>)>>,
+) -> Option<&std::collections::HashSet<(String, String, Option<String>)>> {
+    if auto_build_attempted {
+        approvals
+    } else {
+        None
+    }
 }
 
 /// Phase 46 P6 Chunk 4 — decision half of the post-auto-build §5.3
@@ -11869,6 +11934,62 @@ mod tests {
         assert!(should_auto_build(true, false, false, ScriptPolicy::Triage));
         assert!(should_auto_build(false, true, false, ScriptPolicy::Triage));
         assert!(should_auto_build(false, false, true, ScriptPolicy::Triage));
+    }
+
+    // ── Phase 46 slice 1 second-pass review fix ──
+    //
+    // `select_approvals_for_capture` decides whether the blocked-set
+    // capture sees the advisor's approval view. The contract is:
+    //   1. autoBuild won't fire → ALWAYS `None`, regardless of whether
+    //      the session classified anything. Pre-fix this was an
+    //      unconditional pass-through; that stranded approved-but-
+    //      not-run packages: scripts never executed AND the package
+    //      vanished from `build-state.json` → unreachable via
+    //      `lpm approve-scripts` either.
+    //   2. autoBuild will fire → pass the view through verbatim,
+    //      including the absent-session case (`None` in → `None`
+    //      out — the autoBuild path just gets no exclusions).
+
+    #[test]
+    fn select_approvals_returns_none_when_auto_build_skipped() {
+        let mut approvals = std::collections::HashSet::new();
+        approvals.insert((
+            "amber-pkg".to_string(),
+            "1.0.0".to_string(),
+            Some("sha512-x".to_string()),
+        ));
+        assert!(
+            select_approvals_for_capture(false, Some(&approvals)).is_none(),
+            "autoBuild=false MUST suppress the approval view so approved-but-not-run \
+             packages remain in the blocked set and reviewable via approve-scripts"
+        );
+    }
+
+    #[test]
+    fn select_approvals_returns_view_when_auto_build_fires() {
+        let mut approvals = std::collections::HashSet::new();
+        approvals.insert((
+            "amber-pkg".to_string(),
+            "1.0.0".to_string(),
+            Some("sha512-x".to_string()),
+        ));
+        let view = select_approvals_for_capture(true, Some(&approvals))
+            .expect("autoBuild=true MUST forward the approval view");
+        assert_eq!(view.len(), 1);
+        assert!(view.contains(&(
+            "amber-pkg".to_string(),
+            "1.0.0".to_string(),
+            Some("sha512-x".to_string()),
+        )));
+    }
+
+    #[test]
+    fn select_approvals_returns_none_when_session_absent() {
+        // Triage-off / no-advisor path: nothing to pass through in
+        // either branch. Both `false` and `true` for
+        // `auto_build_attempted` MUST return `None`.
+        assert!(select_approvals_for_capture(false, None).is_none());
+        assert!(select_approvals_for_capture(true, None).is_none());
     }
 
     // Phase 46 P1: the two `read_auto_build_config_*` tests were
