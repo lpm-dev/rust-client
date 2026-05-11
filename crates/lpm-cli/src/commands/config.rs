@@ -297,6 +297,9 @@ async fn run_scripts_wizard(
         }
         persist_string(config_path, SCRIPT_POLICY_KEY, v)?;
         announce_set(SCRIPT_POLICY_KEY, v, json_output);
+        if v == "triage" {
+            print_triage_policy_followup(json_output);
+        }
         return Ok(());
     }
 
@@ -330,13 +333,7 @@ async fn run_scripts_wizard(
     announce_set(SCRIPT_POLICY_KEY, new_value, json_output);
 
     if new_value == "triage" {
-        println!();
-        println!(
-            "  {}: triage uses Layers 1-3 by default. To configure an \
-             optional advisor (claude-cli / codex / ollama) for amber \
-             cases, run `lpm config triage`.",
-            "tip".cyan()
-        );
+        print_triage_policy_followup(json_output);
     }
     Ok(())
 }
@@ -355,6 +352,7 @@ async fn run_triage_wizard(
         }
         persist_string(config_path, TRIAGE_ADVISOR_KEY, v)?;
         announce_set(TRIAGE_ADVISOR_KEY, v, json_output);
+        print_triage_advisor_followup(json_output);
         return Ok(());
     }
 
@@ -447,7 +445,9 @@ async fn run_triage_wizard(
                     "environment not ready".yellow(),
                 );
                 let save = prompt_choice(
-                    "Save this choice anyway? Install will degrade to advisor=none until the environment is fixed. [y/N]",
+                    "Save this choice anyway? `lpm install` does not yet read \
+                     `triage-advisor` (install-time invocation ships in a follow-up), \
+                     so this only persists the preference. [y/N]",
                     &["y", "n", "", "Y", "N"],
                 )?;
                 if !matches!(save.as_str(), "y" | "Y") {
@@ -465,6 +465,7 @@ async fn run_triage_wizard(
 
     persist_string(config_path, TRIAGE_ADVISOR_KEY, chosen_slug)?;
     announce_set(TRIAGE_ADVISOR_KEY, chosen_slug, json_output);
+    print_triage_advisor_followup(json_output);
     Ok(())
 }
 
@@ -528,6 +529,43 @@ fn announce_set(key: &str, value: &str, json_output: bool) {
     } else {
         output::success(&format!("Set {} = {}", key.bold(), value));
     }
+}
+
+/// Disclosure printed after `script-policy = triage` is persisted (via
+/// either `--set` or interactive). Tightens what the wizard implies:
+/// triage uses Layers 1-3 today, and the optional advisor preference
+/// (`lpm config triage`) is config-only — `lpm install` does not yet
+/// invoke an advisor at install time. The next slice ships that.
+fn print_triage_policy_followup(json_output: bool) {
+    if json_output {
+        return;
+    }
+    println!();
+    println!(
+        "  {}: triage uses Layers 1-3 today. Run `lpm config triage` to \
+         pick an optional advisor preference (claude-cli / codex / \
+         ollama). Note: install-time advisor invocation lands in a \
+         follow-up — for now `lpm install` ignores `triage-advisor`.",
+        "tip".cyan()
+    );
+}
+
+/// Disclosure printed after `triage-advisor = <value>` is persisted
+/// (via either `--set` or interactive). Closes the loop on the most
+/// common over-read of the wizard: "I picked claude-cli, so my
+/// installs now use it." They don't, yet — this PR ships only the
+/// config surface plus the audit-time measurement. Install-time
+/// consumption is the next slice.
+fn print_triage_advisor_followup(json_output: bool) {
+    if json_output {
+        return;
+    }
+    println!(
+        "  {}: install-time advisor invocation lands in a follow-up. \
+         `lpm install` does not yet read `triage-advisor`; your \
+         preference is saved and will take effect when that slice ships.",
+        "note".cyan()
+    );
 }
 
 #[cfg(test)]
