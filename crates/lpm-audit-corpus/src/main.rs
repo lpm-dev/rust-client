@@ -120,6 +120,39 @@ struct Args {
     /// `claude-cli` / `codex` / `ollama`.
     #[arg(long)]
     advisor: Option<String>,
+
+    /// Phase 69 — corpus selector. `live` (default) walks the npm
+    /// search API and fetches manifests over the network; `hermetic`
+    /// reads a frozen offline fixture set bundled with this crate
+    /// and runs the SAME classifier / L3 / advisor pipeline against
+    /// it without touching the network.
+    ///
+    /// Hermetic mode is for reproducible benchmark runs: classifier
+    /// regressions show up as a delta against the frozen fixture's
+    /// expected distribution. Live mode is for measuring the real
+    /// top-N today.
+    ///
+    /// When `hermetic` is selected, the following flags are ignored:
+    /// `--size`, `--top-n-cache`, `--refresh-top-n`, `--timeout-secs`,
+    /// `--concurrency`, `--resume`, `--enrich-l3-only`, `--skip-l3`,
+    /// `--reclassify`. `--advisor` still works (it's an opt-in
+    /// uplift, orthogonal to corpus origin).
+    #[arg(long, value_enum, default_value_t = CorpusKind::Live)]
+    corpus: CorpusKind,
+}
+
+/// Origin of the audit corpus. See [`Args::corpus`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+#[clap(rename_all = "kebab-case")]
+enum CorpusKind {
+    /// Walk the npm registry search API + fetch manifests over the
+    /// network. The default — preserves pre-Phase-69 behavior.
+    Live,
+    /// Read the bundled offline fixture set
+    /// (`crates/lpm-audit-corpus/fixtures/hermetic/corpus.json`).
+    /// No network calls; output shape is identical to live mode so
+    /// the same Markdown report + standing-benchmark table fires.
+    Hermetic,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -306,6 +339,15 @@ struct AuditMetadata {
     /// L4 advisor stamp. `None` when the run had no `--advisor`.
     #[serde(default)]
     advisor: Option<AdvisorStamp>,
+    /// Phase 69 — corpus origin: `"live"` for npm-walked, `"hermetic"`
+    /// for the frozen offline fixture. Stamped so the report writer
+    /// can pick the right interpretation for ambiguous metrics
+    /// (e.g. zero-FP-red is a §4.1 ship gate on live but expected
+    /// fixture coverage on hermetic). `None` on records written
+    /// before this field existed; readers default to the live
+    /// interpretation in that case.
+    #[serde(default)]
+    corpus: Option<String>,
 }
 
 /// Identity of the advisor that ran on this audit. Lets future
@@ -418,6 +460,14 @@ struct SearchDownloads {
 async fn main() -> Result<(), BoxError> {
     let args = Args::parse();
 
+    if args.corpus == CorpusKind::Hermetic {
+        // Phase 69 — offline mode. Skip every network code path, run
+        // L1+L3+advisor against the bundled fixture, write the same
+        // results + report + sidecar shape so downstream tooling
+        // (incl. the standing-benchmark table writer) is unchanged.
+        return run_hermetic(&args).await;
+    }
+
     if args.reclassify {
         return reclassify_from_cache(&args).await;
     }
@@ -465,6 +515,7 @@ async fn main() -> Result<(), BoxError> {
         run_completed_at: Some(now_rfc3339()),
         audit_size: Some(args.size),
         advisor: None,
+        corpus: Some("live".to_string()),
     };
 
     if let Some(name) = &args.advisor {
@@ -644,6 +695,168 @@ async fn enrich_l3_from_cache(client: &reqwest::Client, args: &Args) -> Result<(
 
 // ─────────────────────────────────────────────────────────────────────
 // Layer 4 enrichment: invoke an advisor over every prompted package.
+// ─────────────────────────────────────────────────────────────────────
+// Phase 69 — hermetic offline corpus mode
+// ─────────────────────────────────────────────────────────────────────
+
+/// One entry in `fixtures/hermetic/corpus.json`. A synthetic
+/// "package" — name + version + lifecycle scripts + L3 inputs —
+/// that the hermetic loader maps to a [`PackageAudit`] using the
+/// same classifier / outcome logic the live path uses.
+///
+/// Format choice rationale: deliberately NOT a serialised
+/// `PackageAudit`. The fixture's job is to lock the INPUTS (script
+/// bodies, publish-age window, attestation presence) and let the
+/// rest of the pipeline produce outputs the same way it would for a
+/// live npm package. That way the standing-benchmark table is a
+/// stable shape that re-runs with no network, and a classifier
+/// regression shows up as an output delta rather than as a
+/// fixture-edit conflict.
+#[derive(Debug, Clone, Deserialize)]
+struct HermeticEntry {
+    name: String,
+    rank: usize,
+    monthly_downloads: u64,
+    version: String,
+    /// `{ "preinstall" | "install" | "postinstall": <body> }`. Empty
+    /// map ⇒ no-script package (`PortableOutcome::NoScripts`).
+    #[serde(default)]
+    scripts: BTreeMap<String, String>,
+    /// Hours-before-now the synthetic "publish" happened. Loader
+    /// translates to a concrete ISO 8601 timestamp at run time so
+    /// the cooldown gate's `now - published_at < min_release_age`
+    /// math hits the same code path live uses. Values >> 24 are
+    /// "old" (cooldown-pass); values < 24 fire the cooldown block.
+    publish_age_hours: u64,
+    /// Whether the fixture declares this package as having Sigstore
+    /// attestations published. Plain bool — no fetch.
+    attestation_present: bool,
+}
+
+const HERMETIC_CORPUS_PATH: &str =
+    concat!(env!("CARGO_MANIFEST_DIR"), "/fixtures/hermetic/corpus.json");
+
+/// Phase 69 — run the audit against the bundled offline corpus.
+///
+/// Identical control flow to the live path's `main()`:
+/// `audit_top_n` equivalent → `enrich_l3_in_place` equivalent →
+/// `finalize_outcomes` → optional `--advisor` enrichment →
+/// `persist_audit` + `print_summary`. The only difference is that
+/// the per-package data comes from the fixture instead of from
+/// network calls.
+async fn run_hermetic(args: &Args) -> Result<(), BoxError> {
+    let bytes = std::fs::read(HERMETIC_CORPUS_PATH).map_err(|e| {
+        format!(
+            "hermetic corpus not readable at {HERMETIC_CORPUS_PATH}: {e} \
+             (this file ships with the crate; a missing read means a \
+             corrupted checkout or a stripped-down install — re-clone \
+             the rust-client repo)"
+        )
+    })?;
+    let entries: Vec<HermeticEntry> = serde_json::from_slice(&bytes)
+        .map_err(|e| format!("hermetic corpus parse error at {HERMETIC_CORPUS_PATH}: {e}"))?;
+    println!(
+        "hermetic: loaded {} synthetic packages from {HERMETIC_CORPUS_PATH}",
+        entries.len()
+    );
+
+    let mut audits: Vec<PackageAudit> = entries.into_iter().map(hermetic_entry_to_audit).collect();
+    audits.sort_by_key(|r| r.rank);
+    finalize_outcomes(&mut audits);
+
+    // Audit-size in the sidecar reflects the FIXTURE size in
+    // hermetic mode, not `--size` (which was ignored). Lets the
+    // sidecar carry a meaningful number for downstream tooling that
+    // expects `audit_size` to mean "how many records did we audit."
+    let mut metadata = AuditMetadata {
+        run_completed_at: Some(now_rfc3339()),
+        audit_size: Some(audits.len()),
+        advisor: None,
+        corpus: Some("hermetic".to_string()),
+    };
+
+    if let Some(name) = &args.advisor {
+        metadata.advisor = enrich_advisor_in_place(name, &mut audits).await?;
+    }
+
+    persist_audit(&args.results, &args.report, &audits, &metadata)?;
+    print_summary(&audits);
+    Ok(())
+}
+
+/// Map one fixture entry to a [`PackageAudit`]. Mirrors the
+/// post-fetch construction at `audit_one` + the L3 derivation at
+/// `fetch_l3_one`, but reads every field from the fixture instead of
+/// the network.
+fn hermetic_entry_to_audit(entry: HermeticEntry) -> PackageAudit {
+    let preinstall = entry.scripts.get("preinstall").map(|s| classify_script(s));
+    let install = entry.scripts.get("install").map(|s| classify_script(s));
+    let postinstall = entry.scripts.get("postinstall").map(|s| classify_script(s));
+
+    let mut audit = PackageAudit {
+        name: entry.name.clone(),
+        rank: entry.rank,
+        monthly_downloads: entry.monthly_downloads,
+        version: Some(entry.version.clone()),
+        preinstall,
+        install,
+        postinstall,
+        tier: None,
+        l2_outcome: L2Outcome::Miss,
+        l3_outcome: None,
+        portable_outcome: None,
+        advisor_outcome: None,
+        advisor_provider: None,
+        fetch_error: None,
+    };
+    audit.tier = worst_of_phases(&audit);
+
+    // L3 is only meaningful for scripted packages — same gate the
+    // live path applies inside `enrich_l3_in_place`.
+    if audit.tier.is_some() {
+        audit.l3_outcome = Some(hermetic_l3_outcome(
+            entry.publish_age_hours,
+            entry.attestation_present,
+        ));
+    }
+
+    audit
+}
+
+/// Derive a fully-populated [`L3Outcome`] from the fixture's
+/// `publish_age_hours` + `attestation_present`. Routes through the
+/// SAME `SecurityPolicy::check_release_age` the live path uses so
+/// the cooldown decision is byte-identical to what
+/// `enrich_l3_in_place` would emit for an equivalently-aged real
+/// package.
+fn hermetic_l3_outcome(publish_age_hours: u64, attestation_present: bool) -> L3Outcome {
+    use time::format_description::well_known::Rfc3339;
+    // `publish_age_hours` is unbounded in theory; in practice the
+    // fixture file only carries values in the [1, 8760] range
+    // (1 hour … 1 year). Saturating math keeps the arithmetic
+    // well-defined for any value a future fixture edit might
+    // introduce without sneaking a panic into the audit binary.
+    let age_secs = publish_age_hours.saturating_mul(3600);
+    let now = time::OffsetDateTime::now_utc();
+    let published_dt = now - time::Duration::seconds(age_secs as i64);
+    let published_at = published_dt.format(&Rfc3339).ok().map(|s| s.to_string());
+
+    let policy = SecurityPolicy::default_policy();
+    let cooldown_block = policy.check_release_age(published_at.as_deref()).is_some();
+
+    L3Outcome {
+        published_at,
+        age_secs: Some(age_secs),
+        cooldown_block,
+        attestation_present,
+        // First-install audit always lands here — matches the live
+        // path's invariant. A future audit that simulates prior
+        // approval state would populate this differently.
+        provenance_drift: ProvenanceDriftSummary::NoDrift,
+        l3_fetch_error: None,
+    }
+}
+
 // ─────────────────────────────────────────────────────────────────────
 
 /// Spawn the named advisor and invoke it on every `portable_outcome
@@ -1580,14 +1793,14 @@ fn build_report(audits: &[PackageAudit], metadata: &AuditMetadata) -> String {
     out.push_str(&format!("Total packages audited: **{}**\n\n", audits.len()));
 
     section_run_metadata(&mut out, metadata);
-    section_standing_benchmark(&mut out, audits);
+    section_standing_benchmark(&mut out, audits, metadata);
     section_l1_tier_distribution(&mut out, audits);
     section_portable_outcome(&mut out, audits);
     section_l1_to_portable_transition(&mut out, audits);
     section_prompt_shape_breakdown(&mut out, audits);
     section_l3_detail(&mut out, audits);
     section_runtime_review_candidates(&mut out, audits);
-    section_red_packages(&mut out, audits);
+    section_red_packages(&mut out, audits, metadata);
     section_advisor_baseline_placeholder(&mut out, audits, metadata);
 
     out
@@ -1635,7 +1848,14 @@ fn section_run_metadata(out: &mut String, metadata: &AuditMetadata) {
 /// Locked standing benchmark per the Phase 46 audit Part A closeout.
 /// These 7 numbers are the canonical comparison points for future
 /// audit iterations.
-fn section_standing_benchmark(out: &mut String, audits: &[PackageAudit]) {
+///
+/// `metadata.corpus` re-interprets one cell: on the live top-N
+/// corpus, `zero-FP-red` is a §4.1 ship gate that MUST stay 0
+/// because real npm is overwhelmingly benign; on the hermetic
+/// fixture, intentional reds exercise classifier shape coverage,
+/// so the "stay 0" framing is wrong and gets replaced with a
+/// fixture-expected-count framing.
+fn section_standing_benchmark(out: &mut String, audits: &[PackageAudit], metadata: &AuditMetadata) {
     let p = summarise_portable(audits);
     let pct_scripted = |n: usize| {
         if p.scripted_total == 0 {
@@ -1671,8 +1891,19 @@ fn section_standing_benchmark(out: &mut String, audits: &[PackageAudit]) {
         "| no-scripts | {} | Manifest had no lifecycle scripts |\n",
         p.no_scripts
     ));
+    // The zero-FP-red metric is named for its live-corpus role
+    // (§4.1 ship gate: any red on real top-N is a suspected
+    // false-positive). On the hermetic fixture the reds are
+    // intentional shape coverage, so the "MUST stay 0" framing is
+    // misleading — re-word that single cell.
+    let zero_fp_red_note = match metadata.corpus.as_deref() {
+        Some("hermetic") => {
+            "Hermetic fixture: count reflects intentional red shape coverage, not a ship-gate failure. Compare to the prior run's value; a change signals a classifier drift on the fixed corpus."
+        }
+        _ => "**§4.1 ship gate — MUST stay 0**",
+    };
     out.push_str(&format!(
-        "| **zero-FP-red** | **{}** | **§4.1 ship gate — MUST stay 0** |\n",
+        "| **zero-FP-red** | **{}** | {zero_fp_red_note} |\n",
         p.zero_fp_red_count
     ));
     out.push_str(&format!(
@@ -1988,15 +2219,24 @@ fn section_l3_detail(out: &mut String, audits: &[PackageAudit]) {
     }
 }
 
-fn section_red_packages(out: &mut String, audits: &[PackageAudit]) {
-    out.push_str("## Red-classified packages (zero-FP-red gate)\n\n");
+fn section_red_packages(out: &mut String, audits: &[PackageAudit], metadata: &AuditMetadata) {
+    let is_hermetic = matches!(metadata.corpus.as_deref(), Some("hermetic"));
+    if is_hermetic {
+        out.push_str("## Red-classified packages (hermetic fixture coverage)\n\n");
+    } else {
+        out.push_str("## Red-classified packages (zero-FP-red gate)\n\n");
+    }
     let mut reds: Vec<&PackageAudit> = audits
         .iter()
         .filter(|a| a.tier == Some(StaticTier::Red))
         .collect();
     reds.sort_by_key(|a| a.rank);
     if reds.is_empty() {
-        out.push_str("_None — zero-FP-red gate held on this run._\n\n");
+        if is_hermetic {
+            out.push_str("_None — no red shapes in the hermetic fixture this run._\n\n");
+        } else {
+            out.push_str("_None — zero-FP-red gate held on this run._\n\n");
+        }
         return;
     }
     out.push_str(&format!("Total: **{}**\n\n", reds.len()));
