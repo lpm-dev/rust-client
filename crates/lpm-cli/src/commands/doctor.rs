@@ -1600,8 +1600,14 @@ async fn run_doctor_install(client: &RegistryClient, project_dir: &Path) -> Resu
         None, // target_set: doctor is single-project
         None, // direct_versions_out: doctor does not finalize Phase 33 placeholders
         None, // script_policy_override: `lpm doctor` does not expose policy flags
+        None, // advisor_override: `lpm doctor` does not expose `--advisor`
         None, // min_release_age_override: `lpm doctor` uses the package.json/global/default chain
         crate::provenance_fetch::DriftIgnorePolicy::default(), // drift-ignore: `lpm doctor` enforces drift like a normal install
+        // Phase 46.1 rework: doctor's auto-fix install does not
+        // surface its own sandbox-mode flags. Falls through the
+        // env / config / default chain.
+        false, // strict_sandbox
+        false, // no_sandbox
     )
     .await
 }
@@ -2236,9 +2242,10 @@ fn check_install_root_consistency(
 ///       `lpm rebuild` under every policy can contain lifecycle
 ///       scripts.
 ///     - **Windows** → `warn` with the §17.4 Phase 46.1 pointer.
-///       Scripts still run today (the `--unsafe-full-env
-///       --no-sandbox` escape hatch is the 46.0 interim), but
-///       without containment — the user needs to know that
+///       Scripts still run today (`--no-sandbox` is the 46.0
+///       interim — Phase 46.1 rework collapsed the legacy
+///       `--unsafe-full-env` partner per Q6), but without
+///       containment — the user needs to know that
 ///       `script-policy = "triage"` or `allow` is effectively
 ///       opting out of the sandbox floor on Windows until 46.1.
 ///     - **Linux with an old kernel** → `warn` with the landlock
@@ -2349,8 +2356,18 @@ fn count_suspended_approvals_in_cwd() -> Option<usize> {
 /// Probe the sandbox backend for `SandboxMode::Enforce` on this
 /// platform. Runs in-memory (macOS) or via a single benign
 /// landlock ruleset-create syscall (Linux); no persistent I/O.
+///
+/// Phase 46.1: the probe loads the user's `[sandbox] allow-degraded`
+/// config (project lpm.toml + global ~/.lpm/config.toml — same
+/// chain the install pipeline uses) so the doctor surface reports
+/// the SAME posture the next `lpm install` will actually
+/// construct. Without that, a user who opted into degraded posture
+/// on a kernel < 6.7 would see "strict / fail" in doctor while
+/// their installs silently run under V1 (or vice-versa).
 fn probe_sandbox_backend() -> Check {
-    use lpm_sandbox::{SandboxError, SandboxMode, SandboxSpec, new_for_platform};
+    use lpm_sandbox::{
+        SandboxError, SandboxMode, SandboxPosture, SandboxSpec, new_for_platform_with_options,
+    };
 
     let tmpdir = std::env::temp_dir();
     let home = dirs::home_dir().unwrap_or_else(|| tmpdir.clone());
@@ -2369,15 +2386,134 @@ fn probe_sandbox_backend() -> Check {
         extra_write_dirs: Vec::new(),
     };
 
-    match new_for_platform(spec, SandboxMode::Enforce) {
-        Ok(sb) => Check::pass(
-            &doctor_catalog::SANDBOX_AVAILABLE,
-            &format!(
-                "{} available on {} — lifecycle scripts run under Enforce mode",
-                sb.backend_name(),
-                std::env::consts::OS,
-            ),
+    // Phase 46.1: load the `[sandbox] allow-degraded` knob from
+    // `<cwd>/lpm.toml` + `~/.lpm/config.toml`. The project-side read
+    // uses the current working directory — that's what `lpm doctor`
+    // is reporting on, and matches the install pipeline's
+    // resolution against the same directory.
+    //
+    // A failed config load surfaces as `sandbox_probe_failed`
+    // EXPLICITLY rather than getting silently defaulted to strict.
+    // A broken `lpm.toml` / `~/.lpm/config.toml` makes the real
+    // install fail at config-load time; doctor's job is to surface
+    // that on the same machine, NOT to hide it behind a default-
+    // strict posture the install will never actually reach. Only
+    // `current_dir()` failing (no cwd resolvable, e.g. running
+    // from a deleted directory) falls back to the strict default —
+    // there's no config to parse in that case.
+    let (sandbox_options, resolved_mode) = match std::env::current_dir() {
+        // Phase 46.1 rework: route through the precedence chain so
+        // `LPM_STRICT_SANDBOX=1` and `[sandbox] mode` flow through
+        // the doctor probe identically to the install pipeline.
+        Ok(cwd) => match crate::sandbox_config::resolve_sandbox_mode_from_chain(&cwd, false, false)
+        {
+            Ok(pair) => pair,
+            Err(e) => {
+                return Check::fail(
+                    &doctor_catalog::SANDBOX_PROBE_FAILED,
+                    &format!(
+                        "could not load sandbox config: {e}. Doctor refuses to default \
+                         this to strict — the same broken config will fail your next \
+                         `lpm install`. Fix `lpm.toml` / `~/.lpm/config.toml` and re-run."
+                    ),
+                );
+            }
+        },
+        Err(_) => (
+            lpm_sandbox::SandboxOptions::default(),
+            crate::sandbox_config::ResolvedSandboxMode::Default,
         ),
+    };
+
+    // Phase 46.1 rework GPT-5 audit follow-up (2026-05-11): when the
+    // resolved mode is `None` (`[sandbox] mode = "none"` in
+    // `~/.lpm/config.toml` / `./lpm.toml`, persisted by
+    // `lpm config sandbox --set none`), the install pipeline runs
+    // [`SandboxMode::Disabled`] — so doctor must report that posture
+    // directly instead of probing `Enforce` and reporting whatever
+    // the host's backend happens to support. Pre-fix this branch
+    // was unreachable in normal use because doctor always probed
+    // Enforce; users would see "default mode: filesystem-write
+    // containment …" even after running `lpm config sandbox --set
+    // none`, which contradicts the install behaviour.
+    if matches!(
+        resolved_mode,
+        crate::sandbox_config::ResolvedSandboxMode::None
+    ) {
+        let os = std::env::consts::OS;
+        return Check::warn(
+            &doctor_catalog::SANDBOX_DISABLED_BY_USER,
+            &format!(
+                "sandbox DISABLED on {os} via `[sandbox] mode = \"none\"` (set by \
+                 `lpm config sandbox --set none` or directly in `~/.lpm/config.toml` / \
+                 `./lpm.toml`). Lifecycle scripts will run WITHOUT filesystem / env / \
+                 network containment. Re-enable the default posture via \
+                 `lpm config sandbox --set default`."
+            ),
+        );
+    }
+
+    match new_for_platform_with_options(spec, SandboxMode::Enforce, sandbox_options) {
+        Ok(sb) => {
+            let backend = sb.backend_name();
+            let os = std::env::consts::OS;
+            match sb.posture() {
+                SandboxPosture::Default => Check::pass(
+                    &doctor_catalog::SANDBOX_AVAILABLE,
+                    &format!(
+                        "{backend} available on {os} — default mode: filesystem-write \
+                         containment + env scrubbing, outbound network ALLOWED. Enable \
+                         strict mode (also denies outbound network) via \
+                         `lpm config sandbox --set strict`, `--strict-sandbox` per-command, \
+                         or `LPM_STRICT_SANDBOX=1` in env."
+                    ),
+                ),
+                SandboxPosture::Strict => {
+                    // Phase 46.1: network-denial coverage is
+                    // platform-asymmetric. macOS Seatbelt's
+                    // `(deny default)` covers every socket family
+                    // unconditionally; Linux landlock V4 only
+                    // handles BindTcp + ConnectTcp, so UDP / raw /
+                    // AF_PACKET / DNS-via-UDP are NOT denied until
+                    // Phase 46.1.1's seccomp-bpf layer lands.
+                    let net_coverage = if os == "macos" {
+                        "full outbound network denial (all socket families)"
+                    } else {
+                        "outbound TCP denial (BindTcp + ConnectTcp via landlock V4 — \
+                         UDP / raw / AF_PACKET / DNS-via-UDP NOT denied until Phase 46.1.1)"
+                    };
+                    Check::pass(
+                        &doctor_catalog::SANDBOX_AVAILABLE,
+                        &format!(
+                            "{backend} available on {os} — strict mode: enforces \
+                             filesystem-write containment + {net_coverage}"
+                        ),
+                    )
+                }
+                SandboxPosture::Degraded {
+                    kernel,
+                    abi,
+                    missing,
+                } => Check::warn(
+                    &doctor_catalog::SANDBOX_DEGRADED,
+                    &format!(
+                        "{backend} available on {os} — DEGRADED posture (kernel {kernel}, \
+                         landlock {abi}); user requested strict but kernel can't deliver \
+                         V4; enforces filesystem only, missing={missing}. Upgrade the \
+                         kernel to 6.7+ to restore strict containment, or switch to \
+                         `lpm config sandbox --set default` to drop the strict request \
+                         and silence this warning."
+                    ),
+                ),
+                SandboxPosture::Disabled => Check::warn(
+                    &doctor_catalog::SANDBOX_AVAILABLE,
+                    &format!(
+                        "{backend} returned Disabled posture on {os} — unexpected for \
+                         SandboxMode::Enforce. File an issue with `lpm doctor --json` output."
+                    ),
+                ),
+            }
+        }
         Err(SandboxError::UnsupportedPlatform {
             platform,
             remediation,
@@ -2457,10 +2593,15 @@ mod tests {
     fn sandbox_probe_emits_known_code() {
         // Pin the codes the sandbox probe is allowed to emit so the
         // automation contract for this check stays stable across
-        // platforms / refactors.
+        // platforms / refactors. Phase 46.1 adds `sandbox_degraded`
+        // for the V1-fallback path; the GPT-5 audit follow-up adds
+        // `sandbox_disabled_by_user` for the persistent `mode =
+        // "none"` path; the other four codes are pre-existing.
         let c = probe_sandbox_backend();
         let allowed = [
             "sandbox_available",
+            "sandbox_degraded",
+            "sandbox_disabled_by_user",
             "sandbox_unsupported_platform",
             "sandbox_kernel_too_old",
             "sandbox_probe_failed",
@@ -2535,8 +2676,9 @@ mod tests {
     /// On Windows, the probe must Warn with the
     /// "sandbox enforcement isn't supported here yet" pointer. Users
     /// need to know that triage + sandbox containment is unavailable
-    /// on their platform and the interim is opt-out via
-    /// `--unsafe-full-env --no-sandbox`.
+    /// on their platform and the interim is opt-out via `--no-sandbox`
+    /// (Phase 46.1 rework collapsed the legacy `--unsafe-full-env`
+    /// partner per Q6).
     #[cfg(target_os = "windows")]
     #[test]
     fn sandbox_probe_on_windows_warns_when_unsupported() {
@@ -2608,6 +2750,71 @@ commands = []
             "Sandbox",
             "sandbox probe must be the first entry so it renders \
              next to the other infrastructure checks"
+        );
+    }
+
+    /// GPT-5 audit follow-up (2026-05-11): when the user has set
+    /// `[sandbox] mode = "none"` in `~/.lpm/config.toml` (via
+    /// `lpm config sandbox --set none` or by hand), the doctor probe
+    /// MUST report the disabled posture instead of probing
+    /// `SandboxMode::Enforce` and reporting whatever the backend
+    /// happens to support. Pre-fix, doctor lied about that state —
+    /// it said "default mode: filesystem-write containment …" while
+    /// the install pipeline was running unsandboxed.
+    ///
+    /// Test isolates the global config by overriding `HOME` to a
+    /// tempdir and writing the wizard's on-disk shape directly. The
+    /// project tier is silent (no `lpm.toml` in cwd typically), so
+    /// the global tier wins.
+    #[test]
+    fn sandbox_probe_honors_persistent_mode_none_from_global_config() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path();
+        std::fs::create_dir_all(home.join(".lpm")).unwrap();
+        std::fs::write(
+            home.join(".lpm").join("config.toml"),
+            "[sandbox]\nmode = \"none\"\n",
+        )
+        .unwrap();
+        // Override HOME for the duration of the probe call. The
+        // resolver's `dirs::home_dir()` consults HOME on Unix; the
+        // ScopedEnv mutex serialises with other tests that touch
+        // process-wide env vars.
+        let _env = crate::test_env::ScopedEnv::set([("HOME", home.as_os_str().to_owned())]);
+
+        let c = probe_sandbox_backend();
+
+        assert_eq!(
+            c.code(),
+            "sandbox_disabled_by_user",
+            "doctor must emit the dedicated `sandbox_disabled_by_user` code so JSON \
+             consumers can tell the persistent-off-mode apart from `sandbox_available` \
+             / `sandbox_degraded`. got: code={} detail={}",
+            c.code(),
+            c.detail,
+        );
+        assert!(
+            matches!(c.severity, Severity::Warn),
+            "persistent `mode = \"none\"` is a chosen-state warning, not a pass. \
+             got severity={:?}, detail={}",
+            c.severity,
+            c.detail,
+        );
+        assert!(
+            c.detail.contains("DISABLED") || c.detail.contains("disabled"),
+            "detail must announce the disabled posture so the user sees their \
+             config decision is taking effect. got: {}",
+            c.detail,
+        );
+        // Negative assertion that doubles as the regression pin: the
+        // old buggy probe emitted "default mode: filesystem-write
+        // containment …". If that string ever resurfaces under
+        // `mode = "none"`, doctor is back to lying.
+        assert!(
+            !c.detail.contains("default mode:"),
+            "pre-fix detail leaked under `mode = \"none\"` — doctor must NOT \
+             claim default-mode containment when config asked for none. got: {}",
+            c.detail,
         );
     }
 

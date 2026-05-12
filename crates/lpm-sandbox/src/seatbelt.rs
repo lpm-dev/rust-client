@@ -26,7 +26,10 @@ use std::path::Path;
 /// `file-read*` allow list, an explicit `file-write*` allow list,
 /// unrestricted network, process spawn, and the mach / sysctl
 /// primitives node-gyp needs.
-pub(crate) fn render_profile(spec: &SandboxSpec) -> Result<String, SandboxError> {
+pub(crate) fn render_profile(
+    spec: &SandboxSpec,
+    deny_outbound_network: bool,
+) -> Result<String, SandboxError> {
     // Canonicalize base paths so Seatbelt rules match against the
     // same form the kernel uses at enforcement time. macOS symlinks
     // `/var` -> `/private/var`, `/tmp` -> `/private/tmp`, and
@@ -173,8 +176,26 @@ pub(crate) fn render_profile(spec: &SandboxSpec) -> Result<String, SandboxError>
     out.push_str(")\n");
     out.push('\n');
 
-    // D3: network on by default. Paranoid mode is Phase 46.1.
-    out.push_str("(allow network*)\n");
+    // Phase 46.1 rework (2026-05-11): network denial is opt-in, not
+    // default. The Phase 46 P5 baseline (filesystem + env
+    // containment, network allowed) is restored as the default;
+    // strict mode (`deny_outbound_network = true`) drops the
+    // `(allow network*)` line so the profile's `(deny default)`
+    // opener covers every socket / bind / connect operation.
+    //
+    // The strict path has NO loopback exemption — see the Phase 46.1
+    // design note's Q1 decision (still locked under the strict path).
+    // Lifecycle scripts that legitimately need network when strict is
+    // active go through `--no-sandbox`, `trustedDependencies`, or by
+    // the user dropping back to `mode = "default"`.
+    //
+    // See
+    // `DOCS/new-features/37-rust-client-RUNNER-VISION-phase46-DX.md`
+    // for the full mode contract.
+    if !deny_outbound_network {
+        out.push_str("(allow network*)\n");
+    }
+
     // node-gyp + electron-rebuild fork helper processes + basic
     // process-info introspection the dynamic linker + libSystem
     // call into. `process*` covers fork, exec, info, codesigning-
@@ -275,10 +296,13 @@ fn scheme_quote(s: &str) -> String {
 /// Reports flow through the unified log. Users run
 /// `log show --last 5m --predicate 'senderImagePath CONTAINS "Sandbox"' | grep -w <pid>`
 /// to see what would-have-been-denied operations fired.
-pub(crate) fn render_logonly_profile(spec: &SandboxSpec) -> Result<String, SandboxError> {
+pub(crate) fn render_logonly_profile(
+    spec: &SandboxSpec,
+    deny_outbound_network: bool,
+) -> Result<String, SandboxError> {
     // Build the Enforce profile body first — these are the rules
     // that should remain SILENT under LogOnly.
-    let enforce_body = render_profile(spec)?;
+    let enforce_body = render_profile(spec, deny_outbound_network)?;
     // The enforce profile starts with `(version 1)\n(deny default)\n`.
     // Strip those two lines: LogOnly replaces `(deny default)` with
     // the permissive `(allow (with report) default)` fallback.
@@ -321,13 +345,13 @@ mod tests {
 
     #[test]
     fn profile_starts_with_deny_default() {
-        let p = render_profile(&spec()).unwrap();
+        let p = render_profile(&spec(), false).unwrap();
         assert!(p.starts_with("(version 1)\n(deny default)\n"));
     }
 
     #[test]
     fn profile_contains_package_dir_in_both_read_and_write() {
-        let p = render_profile(&spec()).unwrap();
+        let p = render_profile(&spec(), false).unwrap();
         // Appears once in file-read* block, once in file-write* block.
         assert_eq!(
             p.matches("/lpm-store/prisma@5.22.0").count(),
@@ -338,7 +362,7 @@ mod tests {
 
     #[test]
     fn profile_contains_project_subpaths_for_writable_greens() {
-        let p = render_profile(&spec()).unwrap();
+        let p = render_profile(&spec(), false).unwrap();
         assert!(
             p.contains("/home/u/proj/node_modules"),
             "node_modules must be writable for prisma generate: {p}"
@@ -355,7 +379,7 @@ mod tests {
 
     #[test]
     fn profile_contains_home_cache_paths() {
-        let p = render_profile(&spec()).unwrap();
+        let p = render_profile(&spec(), false).unwrap();
         assert!(p.contains("/home/u/.cache"));
         assert!(p.contains("/home/u/.node-gyp"));
         assert!(p.contains("/home/u/.npm"));
@@ -364,20 +388,50 @@ mod tests {
 
     #[test]
     fn profile_contains_temp_paths() {
-        let p = render_profile(&spec()).unwrap();
+        let p = render_profile(&spec(), false).unwrap();
         assert!(p.contains("/tmp"));
         assert!(p.contains("/var/folders/xx/T"));
     }
 
     #[test]
-    fn profile_allows_network_by_default() {
-        let p = render_profile(&spec()).unwrap();
-        assert!(p.contains("(allow network*)"), "D3 — network allowed: {p}");
+    fn profile_allows_network_under_default_mode() {
+        // Phase 46.1 rework (2026-05-11): network denial is opt-in.
+        // Default mode (`deny_outbound_network = false`) restores
+        // the Phase 46 P5 baseline — `(allow network*)` is emitted
+        // and the profile permits outbound network from the
+        // lifecycle script. A regression that drops the line under
+        // default mode would break sharp / prisma / puppeteer /
+        // `@lpm-registry/cli` and every other legitimate
+        // install-time downloader.
+        let p = render_profile(&spec(), false).unwrap();
+        assert!(
+            p.contains("(allow network*)"),
+            "default mode must emit `(allow network*)` so install-time \
+             downloads work — see phase46-DX: {p}"
+        );
+    }
+
+    #[test]
+    fn profile_denies_network_under_strict_mode() {
+        // Phase 46.1 strict path: `deny_outbound_network = true`
+        // drops the `(allow network*)` line so the opening
+        // `(deny default)` covers every socket / bind / connect.
+        // No loopback exemption (design note Q1 still locked under
+        // strict). A regression that re-adds `(allow network*)`
+        // when strict is engaged would silently break the strict
+        // contract; this test catches it.
+        let p = render_profile(&spec(), true).unwrap();
+        assert!(
+            !p.contains("(allow network"),
+            "strict mode (`deny_outbound_network=true`) must NOT \
+             contain any `(allow network*)` or narrower \
+             `(allow network ...)` form: {p}"
+        );
     }
 
     #[test]
     fn profile_allows_process_and_signal_primitives() {
-        let p = render_profile(&spec()).unwrap();
+        let p = render_profile(&spec(), false).unwrap();
         assert!(
             p.contains("(allow process*)"),
             "need process fork+exec+info: {p}"
@@ -390,7 +444,7 @@ mod tests {
 
     #[test]
     fn profile_does_not_allow_ssh_aws_or_keychains() {
-        let p = render_profile(&spec()).unwrap();
+        let p = render_profile(&spec(), false).unwrap();
         assert!(!p.contains("/.ssh"), "ssh must never be allowed: {p}");
         assert!(!p.contains("/.aws"), "aws must never be allowed: {p}");
         assert!(
@@ -414,7 +468,7 @@ mod tests {
             PathBuf::from("/home/u/proj/build-output"),
             PathBuf::from("/home/u/.cache/ms-playwright"),
         ];
-        let p = render_profile(&s).unwrap();
+        let p = render_profile(&s, false).unwrap();
         assert!(p.contains("/home/u/proj/build-output"));
         assert!(p.contains("/home/u/.cache/ms-playwright"));
     }
@@ -423,7 +477,7 @@ mod tests {
     fn profile_rejects_relative_extra_write_dirs_at_render_time() {
         let mut s = spec();
         s.extra_write_dirs = vec![PathBuf::from("relative/path")];
-        match render_profile(&s) {
+        match render_profile(&s, false) {
             Err(SandboxError::ProfileRenderFailed { reason }) => {
                 assert!(reason.contains("extra_write_dirs[0]"));
                 assert!(reason.contains("absolute"));
@@ -453,7 +507,7 @@ mod tests {
         // asserts the profile's structural shape — the integration
         // test under tests/seatbelt_integration.rs actually shells
         // out to sandbox-exec to confirm runtime behavior.
-        let p = render_profile(&spec()).unwrap();
+        let p = render_profile(&spec(), false).unwrap();
         assert!(p.contains("(deny default)"));
         assert!(!p.contains(".ssh"));
     }
@@ -464,7 +518,7 @@ mod tests {
         // operation matches as a baseline; Enforce rules later in the
         // profile override to silent allows where they apply. Pin the
         // ordering invariant since the semantic depends on it.
-        let p = render_logonly_profile(&spec()).unwrap();
+        let p = render_logonly_profile(&spec(), false).unwrap();
         assert!(
             p.starts_with("(version 1)\n(allow (with report) default)\n"),
             "LogOnly profile must open with the permissive+report fallback: {p}"
@@ -476,7 +530,7 @@ mod tests {
         // `(deny default)` would short-circuit the permissive
         // fallback — LogOnly would become Enforce. Ensure the
         // Enforce header is stripped.
-        let p = render_logonly_profile(&spec()).unwrap();
+        let p = render_logonly_profile(&spec(), false).unwrap();
         assert!(
             !p.contains("(deny default)"),
             "LogOnly profile must NOT contain (deny default): {p}"
@@ -485,23 +539,48 @@ mod tests {
 
     #[test]
     fn logonly_profile_preserves_enforce_allow_rules() {
-        // The Enforce allow lists (file-read*, file-write*, network*,
-        // process*, etc.) still appear. Under SBPL last-match-wins
+        // The Enforce allow lists (file-read*, file-write*, process*,
+        // mach-lookup, etc.) still appear. Under SBPL last-match-wins
         // semantics, these override the permissive fallback for their
         // covered paths — operations matching Enforce rules are silent
         // allows, identical to Enforce behavior.
-        let p = render_logonly_profile(&spec()).unwrap();
+        //
+        // Phase 46.1 rework: under default mode the Enforce profile
+        // emits `(allow network*)` (network allowed); the LogOnly
+        // profile inherits the same body, so the rule shows up here
+        // too. The mirror test below pins the strict-mode case.
+        let p = render_logonly_profile(&spec(), false).unwrap();
         assert!(p.contains("(allow file-read*"));
         assert!(p.contains("(allow file-write*"));
-        assert!(p.contains("(allow network*)"));
+        assert!(
+            p.contains("(allow network*)"),
+            "default mode — LogOnly inherits Enforce body which \
+             contains `(allow network*)`: {p}"
+        );
         assert!(p.contains("(allow process*)"));
         assert!(p.contains("(allow mach-lookup)"));
     }
 
     #[test]
+    fn logonly_profile_under_strict_mode_omits_network_allow() {
+        // Mirror of `profile_denies_network_under_strict_mode` for
+        // the LogOnly path. The Enforce body that LogOnly inherits
+        // drops `(allow network*)` when `deny_outbound_network =
+        // true`. A regression that re-adds it would silently break
+        // the strict contract on the diagnostic LogOnly mode.
+        let p = render_logonly_profile(&spec(), true).unwrap();
+        assert!(
+            !p.contains("(allow network"),
+            "strict mode LogOnly profile must NOT contain any \
+             `(allow network*)` or narrower `(allow network ...)` \
+             form: {p}"
+        );
+    }
+
+    #[test]
     fn logonly_profile_package_dir_and_writable_paths_match_enforce() {
-        let enforce = render_profile(&spec()).unwrap();
-        let logonly = render_logonly_profile(&spec()).unwrap();
+        let enforce = render_profile(&spec(), false).unwrap();
+        let logonly = render_logonly_profile(&spec(), false).unwrap();
         // Same path content — only the header differs.
         assert!(logonly.contains("/lpm-store/prisma@5.22.0"));
         assert!(logonly.contains("/home/u/proj/node_modules"));
@@ -525,7 +604,7 @@ mod tests {
         // Enforce would have surfaced.
         let mut s = spec();
         s.extra_write_dirs = vec![PathBuf::from("relative/path")];
-        match render_logonly_profile(&s) {
+        match render_logonly_profile(&s, false) {
             Err(SandboxError::ProfileRenderFailed { reason }) => {
                 assert!(reason.contains("extra_write_dirs[0]"));
             }

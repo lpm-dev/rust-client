@@ -1165,10 +1165,50 @@ pub static SANDBOX_AVAILABLE: CheckEntry = CheckEntry {
     code: "sandbox_available",
     name: "Sandbox",
     category: Category::Sandbox,
-    description: "The OS sandbox backend used by lifecycle scripts is available.",
-    when_fires: "Seatbelt (macOS) or Landlock (Linux) is reachable on this host.",
+    description: "The OS sandbox backend used by lifecycle scripts is available. Phase 46.1 rework (2026-05-11): the default posture is filesystem-write containment + env scrubbing; outbound network denial is the opt-in `strict` mode (full denial on macOS Seatbelt; TCP-only via landlock V4 on Linux until Phase 46.1.1's seccomp-bpf layer closes the UDP / raw / DNS gap).",
+    when_fires: "Seatbelt (macOS) or Landlock (Linux) is reachable on this host. Phase 46.1 strict-mode outbound network denial engages only when the user has opted in via `--strict-sandbox` / `--paranoid`, `[sandbox] mode = \"strict\"`, or `LPM_STRICT_SANDBOX=1`.",
     remediation: "No action — informational pass.",
     possible_severities: &[Severity::Pass],
+    auto_fix: None,
+};
+
+/// Phase 46.1 doctor surface: strict mode is engaged but the host
+/// kernel forced the V1 fallback (landlock V1, filesystem-only — no
+/// outbound network denial). Distinct catalog entry from
+/// [`SANDBOX_AVAILABLE`] so JSON consumers can detect "containment
+/// partially enforced" without parsing the detail prose. Severity is
+/// `Warn`: the user opted into strict AND opted into the degraded
+/// fallback, so this is a chosen state, not a failure — but it IS a
+/// posture they should be aware of on every doctor run.
+pub static SANDBOX_DEGRADED: CheckEntry = CheckEntry {
+    code: "sandbox_degraded",
+    name: "Sandbox",
+    category: Category::Sandbox,
+    description: "The sandbox is running in the Phase 46.1 degraded posture (landlock V1 fallback). Filesystem containment is active; the strict-mode outbound network denial the user opted into is NOT enforced because the host kernel is below the V4 floor.",
+    when_fires: "User has set `[sandbox] mode = \"strict\"` (or `--strict-sandbox` / `LPM_STRICT_SANDBOX=1`) AND `[sandbox] allow-degraded = true` AND the host kernel is below the landlock V4 floor (6.7).",
+    remediation: "Pick one: (a) upgrade the host kernel to 6.7+ and unset `[sandbox] allow-degraded` to get the strict posture you asked for; (b) drop back to the default posture via `lpm config sandbox --set default` (filesystem + env containment, no network denial — the recommended default).",
+    possible_severities: &[Severity::Warn],
+    auto_fix: None,
+};
+
+/// Phase 46.1 rework GPT-5 audit follow-up (2026-05-11): the user
+/// has persistently disabled the sandbox via
+/// `[sandbox] mode = "none"` in `~/.lpm/config.toml` / `./lpm.toml`
+/// (typically set by `lpm config sandbox --set none`). Distinct
+/// catalog entry from [`SANDBOX_AVAILABLE`] so JSON consumers can
+/// detect the disabled state without prose parsing, and distinct
+/// from [`SANDBOX_DEGRADED`] which reports a strict-but-fallen-back
+/// state. Severity is `Warn`: the user chose this knowingly, so
+/// it's not a failure — but it IS a posture they should see on
+/// every doctor run.
+pub static SANDBOX_DISABLED_BY_USER: CheckEntry = CheckEntry {
+    code: "sandbox_disabled_by_user",
+    name: "Sandbox",
+    category: Category::Sandbox,
+    description: "The sandbox is persistently disabled by user config — `[sandbox] mode = \"none\"` in `~/.lpm/config.toml` or `./lpm.toml`. Lifecycle scripts run with no filesystem / env / network containment.",
+    when_fires: "User has set `[sandbox] mode = \"none\"` (typically via `lpm config sandbox --set none`).",
+    remediation: "If this is unintended, restore the recommended default via `lpm config sandbox --set default` (or `--set strict` for paranoid mode). The disabled posture is the npm-default experience — every lifecycle script gets full host access, including credential env vars.",
+    possible_severities: &[Severity::Warn],
     auto_fix: None,
 };
 
@@ -1176,9 +1216,9 @@ pub static SANDBOX_KERNEL_TOO_OLD: CheckEntry = CheckEntry {
     code: "sandbox_kernel_too_old",
     name: "Sandbox",
     category: Category::Sandbox,
-    description: "Linux kernel is too old to support Landlock at the required ABI.",
-    when_fires: "Landlock probe failed because of an outdated kernel.",
-    remediation: "Upgrade the kernel, or accept that lifecycle scripts run unsandboxed.",
+    description: "Linux kernel is too old to support Landlock at the Phase 46.1 strict floor (V4 / kernel 6.7+).",
+    when_fires: "User has opted into strict mode (via `--strict-sandbox` / `--paranoid` / `[sandbox] mode = \"strict\"` / `LPM_STRICT_SANDBOX=1`) but the host kernel cannot support V4. Phase 46.1 refuses to run lifecycle scripts under strict on kernels below this floor unless the user has explicitly opted into the degraded posture.",
+    remediation: "Pick one: (1) `[sandbox] allow-degraded = true` in `~/.lpm/config.toml` or `./lpm.toml` for the V1 filesystem-only fallback (no outbound network containment); (2) `lpm config sandbox --set default` to drop back to the recommended default posture (filesystem + env containment, network allowed); (3) add the package to `package.json > lpm > trustedDependencies` to skip the sandbox for that dependency; (4) `lpm install --no-sandbox` for a one-shot escape (or `lpm config sandbox --set none` to persist); (5) upgrade the host kernel to 6.7+.",
     possible_severities: &[Severity::Warn],
     auto_fix: None,
 };
@@ -1440,6 +1480,8 @@ pub static CLI_CATALOG: &[&CheckEntry] = &[
     &GLOBAL_INSTALL_ROOTS_UNHEALTHY,
     // Sandbox + script policy
     &SANDBOX_AVAILABLE,
+    &SANDBOX_DEGRADED,
+    &SANDBOX_DISABLED_BY_USER,
     &SANDBOX_KERNEL_TOO_OLD,
     &SANDBOX_UNSUPPORTED_PLATFORM,
     &SANDBOX_PROBE_FAILED,

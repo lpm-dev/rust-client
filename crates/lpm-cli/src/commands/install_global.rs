@@ -589,8 +589,20 @@ async fn do_install(
         None,
         None,
         overrides.script_policy_override,
+        // Phase 46 slice 1: `lpm install -g` does not expose its own
+        // `--advisor` flag yet. The global install path stays portable-
+        // by-default; opt-in to an advisor uplift for the synthesized
+        // project install would belong with a future `-g`-specific
+        // override surface.
+        None,
         overrides.min_release_age_override,
         overrides.drift_ignore_policy.clone(),
+        // Phase 46.1 rework: `lpm install -g` does not surface its
+        // own sandbox-mode flags. The env / config / default chain
+        // inside `rebuild::run` still applies — `LPM_STRICT_SANDBOX=1`
+        // still kicks in for CI globally-installed tooling.
+        false, // strict_sandbox
+        false, // no_sandbox
     )
     .await?;
 

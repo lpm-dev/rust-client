@@ -29,20 +29,30 @@
 #![cfg(target_os = "macos")]
 
 use crate::seatbelt;
-use crate::{Sandbox, SandboxError, SandboxMode, SandboxSpec, SandboxedCommand};
+use crate::{Sandbox, SandboxError, SandboxMode, SandboxOptions, SandboxSpec, SandboxedCommand};
 
 pub(crate) struct SeatbeltSandbox {
     profile: String,
     mode: SandboxMode,
     #[allow(dead_code)] // Kept for structured diagnostics in Chunk 4
     spec: SandboxSpec,
+    /// Phase 46.1 rework: cached for [`Sandbox::posture`] so the
+    /// install pipeline / doctor can surface whether strict
+    /// (network-denial) is active on this backend instance without
+    /// re-parsing the profile string.
+    deny_outbound_network: bool,
 }
 
 impl SeatbeltSandbox {
-    pub(crate) fn new(spec: SandboxSpec, mode: SandboxMode) -> Result<Self, SandboxError> {
+    pub(crate) fn new(
+        spec: SandboxSpec,
+        mode: SandboxMode,
+        options: SandboxOptions,
+    ) -> Result<Self, SandboxError> {
+        let deny_outbound_network = options.deny_outbound_network;
         let profile = match mode {
-            SandboxMode::Enforce => seatbelt::render_profile(&spec)?,
-            SandboxMode::LogOnly => seatbelt::render_logonly_profile(&spec)?,
+            SandboxMode::Enforce => seatbelt::render_profile(&spec, deny_outbound_network)?,
+            SandboxMode::LogOnly => seatbelt::render_logonly_profile(&spec, deny_outbound_network)?,
             // Disabled never reaches this backend — the factory in
             // [`crate::new_for_platform`] short-circuits to
             // [`crate::NoopSandbox`] before dispatching. Defend with
@@ -60,6 +70,7 @@ impl SeatbeltSandbox {
             profile,
             mode,
             spec,
+            deny_outbound_network,
         })
     }
 }
@@ -112,6 +123,20 @@ impl Sandbox for SeatbeltSandbox {
     fn mode(&self) -> SandboxMode {
         self.mode
     }
+
+    fn posture(&self) -> crate::SandboxPosture {
+        // macOS Seatbelt has two postures: `Default` (the relaxed
+        // shape where `(allow network*)` is emitted into the
+        // profile — Phase 46 P5 baseline) and `Strict` (the
+        // relaxed line is dropped, the opening `(deny default)`
+        // covers every socket family). The `Degraded` variant is
+        // Linux-only — Seatbelt has no fallback ABI shape.
+        if self.deny_outbound_network {
+            crate::SandboxPosture::Strict
+        } else {
+            crate::SandboxPosture::Default
+        }
+    }
 }
 
 #[cfg(test)]
@@ -158,16 +183,58 @@ mod tests {
 
     #[test]
     fn new_renders_profile_successfully_for_realistic_spec() {
+        // Phase 46.1 rework (2026-05-11): default options gives the
+        // relaxed default — `(allow network*)` is emitted so
+        // legitimate post-approval downloaders (sharp, prisma,
+        // @lpm-registry/cli, …) keep working. The strict path
+        // (network denied) is exercised by the paired
+        // `new_strict_renders_no_allow_network_in_profile` test
+        // below.
         let rs = realistic_spec();
-        let sb = SeatbeltSandbox::new(rs.spec, SandboxMode::Enforce).unwrap();
+        let sb =
+            SeatbeltSandbox::new(rs.spec, SandboxMode::Enforce, SandboxOptions::default()).unwrap();
         assert!(sb.profile.contains("(deny default)"));
-        assert!(sb.profile.contains("(allow network*)"));
+        assert!(
+            sb.profile.contains("(allow network*)"),
+            "Phase 46.1 rework default — `(allow network*)` must be present so the relaxed \
+             default lets post-approval downloads work: {}",
+            sb.profile,
+        );
+    }
+
+    #[test]
+    fn new_strict_renders_no_allow_network_in_profile() {
+        // Phase 46.1 strict path: when the user opts into strict
+        // mode (via `--strict-sandbox` / `--paranoid` /
+        // `[sandbox] mode = "strict"` / `LPM_STRICT_SANDBOX=1`),
+        // the Seatbelt profile drops the `(allow network*)` line.
+        // The `(deny default)` rule then covers every socket
+        // family — TCP, UDP, raw, AF_PACKET, AF_NETLINK, DNS — the
+        // platform-asymmetric advantage macOS has over Linux's
+        // landlock V4 (which only covers TCP). See the module-
+        // level docs in [`crate::lib`] and the Phase 46.1.1
+        // follow-up doc for the Linux UDP gap and its seccomp-bpf
+        // remediation.
+        let rs = realistic_spec();
+        let options = SandboxOptions {
+            deny_outbound_network: true,
+            ..SandboxOptions::default()
+        };
+        let sb = SeatbeltSandbox::new(rs.spec, SandboxMode::Enforce, options).unwrap();
+        assert!(sb.profile.contains("(deny default)"));
+        assert!(
+            !sb.profile.contains("(allow network"),
+            "Phase 46.1 strict — outbound network must be denied; backend profile must not \
+             contain any `(allow network ...)` form: {}",
+            sb.profile,
+        );
     }
 
     #[test]
     fn backend_name_is_seatbelt() {
         let rs = realistic_spec();
-        let sb = SeatbeltSandbox::new(rs.spec, SandboxMode::Enforce).unwrap();
+        let sb =
+            SeatbeltSandbox::new(rs.spec, SandboxMode::Enforce, SandboxOptions::default()).unwrap();
         assert_eq!(sb.backend_name(), "seatbelt");
     }
 
@@ -175,7 +242,7 @@ mod tests {
     fn mode_round_trips() {
         for m in [SandboxMode::Enforce, SandboxMode::LogOnly] {
             let rs = realistic_spec();
-            let sb = SeatbeltSandbox::new(rs.spec, m).unwrap();
+            let sb = SeatbeltSandbox::new(rs.spec, m, SandboxOptions::default()).unwrap();
             assert_eq!(sb.mode(), m);
         }
     }
@@ -410,7 +477,8 @@ mod tests {
     #[test]
     fn mode_round_trips_for_logonly() {
         let rs = realistic_spec();
-        let sb = SeatbeltSandbox::new(rs.spec, SandboxMode::LogOnly).unwrap();
+        let sb =
+            SeatbeltSandbox::new(rs.spec, SandboxMode::LogOnly, SandboxOptions::default()).unwrap();
         assert_eq!(sb.mode(), SandboxMode::LogOnly);
         assert_eq!(sb.backend_name(), "seatbelt");
     }
@@ -421,7 +489,7 @@ mod tests {
         // to NoopSandbox. Defend against future factory bugs with
         // an explicit error rather than silently picking a variant.
         let rs = realistic_spec();
-        match SeatbeltSandbox::new(rs.spec, SandboxMode::Disabled) {
+        match SeatbeltSandbox::new(rs.spec, SandboxMode::Disabled, SandboxOptions::default()) {
             Err(SandboxError::InvalidSpec { reason }) => {
                 assert!(reason.contains("Disabled"));
                 assert!(reason.contains("NoopSandbox"));

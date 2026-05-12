@@ -15,6 +15,10 @@ AGENTS
 /bench/.pgo-work
 /bench/fixture-large
 /bench/audit-fixtures/results/
+/bench/realworld-audit/.cache/
+/bench/realworld-audit/results/
+/bench/sandbox-network-audit/.cache/
+/bench/sandbox-network-audit/results/
 
 /reproduction
 

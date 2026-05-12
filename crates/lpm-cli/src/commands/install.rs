@@ -3214,6 +3214,23 @@ pub async fn run_with_options(
     // execution semantics are changed — tier-aware auto-run is P6,
     // gated on the P5 sandbox per D20.
     script_policy_override: Option<crate::script_policy_config::ScriptPolicy>,
+    // Phase 46 slice 1 — CLI `--advisor` override. Resolves to the
+    // top of the [`AdvisorSession::preflight`] precedence chain
+    // (CLI → package.json → ~/.lpm/config.toml → `none`). Owned
+    // `String` rather than `&str` so the value crosses the
+    // store-lock async hop (the inner future is `'static`-bound)
+    // without a borrowed-lifetime gymnastic. Internal callers
+    // (`upgrade`, `add`, `dev`, `deploy`, `doctor`, `run`,
+    // `migrate`) pass `None` — they don't accept their own
+    // `--advisor` flag today and a future opt-in is a one-line
+    // change.
+    //
+    // The slug is validated at the clap layer (`parse_advisor_slug`
+    // in `main.rs`), so an `Some` value here is guaranteed to be
+    // `"none"` or a known provider slug. The session itself still
+    // warn-degrades on unavailable adapters at runtime — clap only
+    // catches typos, not "claude-cli configured but not on PATH."
+    advisor_override: Option<String>,
     // Phase 46 P3: already-parsed `--min-release-age=<dur>` override. `Some`
     // short-circuits the package.json / global / default chain in
     // [`crate::release_age_config::ReleaseAgeResolver::resolve`]; `None`
@@ -3229,6 +3246,18 @@ pub async fn run_with_options(
     // into this policy (D16): drift and cooldown are orthogonal, so
     // their override flags stay separate.
     drift_ignore_policy: crate::provenance_fetch::DriftIgnorePolicy,
+    // Phase 46.1 rework (2026-05-11): CLI sandbox-mode overrides.
+    // `strict_sandbox=true` flips outbound network denial on for the
+    // auto-build call; `no_sandbox=true` drops all containment for
+    // that call. Clap-level mutex guarantees they never both arrive
+    // `true`. The full precedence chain — CLI > env > project >
+    // user > default — is resolved inside
+    // [`crate::sandbox_config::resolve_sandbox_mode_from_chain`] at
+    // the auto-build site; install-time pre-fetch does not engage
+    // the sandbox, so this flag only matters when `auto_build` is
+    // true.
+    strict_sandbox: bool,
+    no_sandbox: bool,
 ) -> Result<(), LpmError> {
     // Phase 64 Round 2: hold a shared lock on the store for the
     // entire install pipeline. Multiple concurrent installs share it
@@ -3259,8 +3288,11 @@ pub async fn run_with_options(
             target_set,
             direct_versions_out,
             script_policy_override,
+            advisor_override,
             min_release_age_override,
             drift_ignore_policy,
+            strict_sandbox,
+            no_sandbox,
         ),
     )
     .await
@@ -3286,8 +3318,15 @@ async fn run_with_options_under_store_lock(
     target_set: Option<&[String]>,
     direct_versions_out: Option<&mut HashMap<String, lpm_semver::Version>>,
     script_policy_override: Option<crate::script_policy_config::ScriptPolicy>,
+    // Phase 46 slice 1 — see `run_with_options` for the contract.
+    advisor_override: Option<String>,
     min_release_age_override: Option<u64>,
     drift_ignore_policy: crate::provenance_fetch::DriftIgnorePolicy,
+    // Phase 46.1 rework (2026-05-11) — see `run_with_options` for the
+    // contract. Threaded down so the auto-build call below honors the
+    // user's CLI sandbox-mode override.
+    strict_sandbox: bool,
+    no_sandbox: bool,
 ) -> Result<(), LpmError> {
     if !json_output {
         output::print_header();
@@ -5209,36 +5248,60 @@ async fn run_with_options_under_store_lock(
         }
     }
 
-    // Enforce minimumReleaseAge: block recently published packages unless --allow-new.
-    // Only checked during fresh resolution (not lockfile fast path) because metadata
-    // was already fetched and cached by the resolver — re-fetching hits the 5-min TTL cache.
-    if !allow_new && !used_lockfile {
-        // Phase 46 P3: resolve the effective cooldown window through the
-        // full precedence chain (CLI `--min-release-age` > package.json >
-        // `~/.lpm/config.toml` > 24h default). A malformed global config
-        // surfaces a file-pathed error here — that's the one new fail mode
-        // P3 introduces relative to pre-P3 behaviour, and it's
-        // intentional: silent fall-through on a broken global file is
-        // exactly the bug the path-aware loader prevents.
-        let effective_min_age_secs = crate::release_age_config::ReleaseAgeResolver::resolve(
-            project_dir,
-            min_release_age_override,
-        )?;
-        let policy = lpm_security::SecurityPolicy::with_resolved_min_age(
-            &project_dir.join("package.json"),
-            effective_min_age_secs,
-        );
-        if policy.minimum_release_age_secs > 0 {
-            let mut too_new = Vec::new();
+    // Phase 46 P3: resolve the effective cooldown window through the
+    // full precedence chain (CLI `--min-release-age` > package.json >
+    // `~/.lpm/config.toml` > 24h default). A malformed global config
+    // surfaces a file-pathed error here — that's the one new fail mode
+    // P3 introduces relative to pre-P3 behaviour, and it's
+    // intentional: silent fall-through on a broken global file is
+    // exactly the bug the path-aware loader prevents.
+    //
+    // Phase 46b Option B: pulled out of the `if !allow_new` block so
+    // the resolved threshold is available for the L1 classifier's
+    // cooldown defense-in-depth even when the user opted out of the
+    // install-level cooldown halt via `--allow-new`. The two axes
+    // (cooldown halt + Lever #4 widening) need the same threshold
+    // input.
+    let effective_min_age_secs = crate::release_age_config::ReleaseAgeResolver::resolve(
+        project_dir,
+        min_release_age_override,
+    )?;
+    let cooldown_policy = lpm_security::SecurityPolicy::with_resolved_min_age(
+        &project_dir.join("package.json"),
+        effective_min_age_secs,
+    );
+
+    // Phase 46b Option B — build a `(name, version) → publish_age_secs`
+    // map ONCE per install. The map serves both:
+    //
+    // 1. The install-level cooldown halt (existing Phase 46 P3 gate,
+    //    gated on `!allow_new && !used_lockfile`).
+    // 2. The L1 classifier's cooldown defense-in-depth for Lever #4
+    //    (Phase 46b — refuse to widen `node install.js` + matching
+    //    identity when the publish age is below the configured
+    //    threshold, even when the install-level cooldown was
+    //    bypassed via `--allow-new`).
+    //
+    // Skipped (empty map) when:
+    // - `used_lockfile` — fast-path; no fresh metadata fetched. Lever
+    //   #4 will see `publish_age=None` and refuse to widen for
+    //   matching-identity shapes (conservative).
+    // - `cooldown_policy.minimum_release_age_secs == 0` — user
+    //   globally opted out of cooldown; Lever #4 fires unconditionally
+    //   via the `min_age=0` branch in `matches_delegating_identity_green`.
+    //
+    // Metadata fetches go via [`RouteTable`] so custom-registry
+    // packages stay routed; lpm-namespace packages use the lpm-client.
+    // Both paths typically hit the resolver's <5min TTL cache, so the
+    // map build is near-zero cost on fresh-resolution installs.
+    let publish_ages: std::collections::HashMap<(String, String), u64> =
+        if !used_lockfile && cooldown_policy.minimum_release_age_secs > 0 {
+            let mut map = std::collections::HashMap::with_capacity(packages.len());
             for p in &packages {
-                // Look up the publish timestamp from the metadata cache.
-                // During fresh resolution the resolver already fetched all metadata,
-                // so these calls hit the local cache (no extra network round-trips).
                 let publish_time = if p.is_lpm {
                     lpm_common::PackageName::parse(&p.name)
                         .ok()
                         .and_then(|pkg_name| {
-                            // This will hit the TTL cache (< 5 min since resolution)
                             tokio::task::block_in_place(|| {
                                 tokio::runtime::Handle::current()
                                     .block_on(arc_client.get_package_metadata(&pkg_name))
@@ -5260,46 +5323,76 @@ async fn run_with_options_under_store_lock(
                     .ok()
                     .and_then(|meta| meta.time.get(&p.version).cloned())
                 };
-
-                if let Some(warning) = policy.check_release_age(publish_time.as_deref()) {
-                    let remaining = warning.minimum.saturating_sub(warning.age_secs);
-                    let hours = remaining / 3600;
-                    let minutes = (remaining % 3600) / 60;
-                    too_new.push((p.name.clone(), p.version.clone(), hours, minutes));
+                if let Some(age) = lpm_security::publish_age_secs(publish_time.as_deref()) {
+                    map.insert((p.name.clone(), p.version.clone()), age);
                 }
             }
+            map
+        } else {
+            std::collections::HashMap::new()
+        };
 
-            if !too_new.is_empty() {
-                if !json_output {
-                    output::warn(&format!(
-                        "{} package(s) blocked by minimumReleaseAge ({}s):",
-                        too_new.len(),
-                        policy.minimum_release_age_secs,
-                    ));
-                    for (name, version, hours, minutes) in &too_new {
-                        eprintln!(
-                            "    {}@{} — {}h {}m remaining",
-                            name, version, hours, minutes
-                        );
-                    }
-                    // Phase 46 P3: three override paths, ordered narrowest
-                    // to broadest persistence:
-                    //   (1) --min-release-age=0   per-install, numeric
-                    //   (2) --allow-new           per-install, blanket bypass
-                    //   (3) package.json          persistent, repo-wide
+    // Enforce minimumReleaseAge: block recently published packages unless --allow-new.
+    // Only checked during fresh resolution (not lockfile fast path) because metadata
+    // was already fetched and cached by the resolver — re-fetching hits the 5-min TTL cache.
+    if !allow_new && !used_lockfile && cooldown_policy.minimum_release_age_secs > 0 {
+        let mut too_new = Vec::new();
+        for p in &packages {
+            let key = (p.name.clone(), p.version.clone());
+            let age_secs = publish_ages.get(&key).copied();
+            // Use the existing `check_release_age` semantics:
+            // `None` age = no timestamp available → no warning
+            // (matches pre-46b behaviour). Below-threshold age =
+            // warning carrying the time-remaining info. Match the
+            // existing ts-string-based API by re-running it; the
+            // `publish_ages` map only carries successful parses, so
+            // missing entries collapse to the `None` case here.
+            if age_secs.is_none() {
+                continue;
+            }
+            // Reconstruct a synthetic check by hand: if the age is
+            // below the threshold, build a warning with the same
+            // shape the helper would have returned. Keeps the
+            // user-visible message identical.
+            let age = age_secs.unwrap();
+            if age < cooldown_policy.minimum_release_age_secs {
+                let remaining = cooldown_policy.minimum_release_age_secs.saturating_sub(age);
+                let hours = remaining / 3600;
+                let minutes = (remaining % 3600) / 60;
+                too_new.push((p.name.clone(), p.version.clone(), hours, minutes));
+            }
+        }
+
+        if !too_new.is_empty() {
+            if !json_output {
+                output::warn(&format!(
+                    "{} package(s) blocked by minimumReleaseAge ({}s):",
+                    too_new.len(),
+                    cooldown_policy.minimum_release_age_secs,
+                ));
+                for (name, version, hours, minutes) in &too_new {
                     eprintln!(
-                        "  To override: {} or {} (this install), or set {} in package.json.",
-                        "--min-release-age=0".bold(),
-                        "--allow-new".bold(),
-                        "\"lpm\": { \"minimumReleaseAge\": 0 }".dimmed(),
+                        "    {}@{} — {}h {}m remaining",
+                        name, version, hours, minutes
                     );
                 }
-                return Err(LpmError::Registry(format!(
-                    "{} package(s) published too recently (minimumReleaseAge={}s). Use --allow-new or --min-release-age=<dur> to override.",
-                    too_new.len(),
-                    policy.minimum_release_age_secs,
-                )));
+                // Phase 46 P3: three override paths, ordered narrowest
+                // to broadest persistence:
+                //   (1) --min-release-age=0   per-install, numeric
+                //   (2) --allow-new           per-install, blanket bypass
+                //   (3) package.json          persistent, repo-wide
+                eprintln!(
+                    "  To override: {} or {} (this install), or set {} in package.json.",
+                    "--min-release-age=0".bold(),
+                    "--allow-new".bold(),
+                    "\"lpm\": { \"minimumReleaseAge\": 0 }".dimmed(),
+                );
             }
+            return Err(LpmError::Registry(format!(
+                "{} package(s) published too recently (minimumReleaseAge={}s). Use --allow-new or --min-release-age=<dur> to override.",
+                too_new.len(),
+                cooldown_policy.minimum_release_age_secs,
+            )));
         }
     }
 
@@ -6293,6 +6386,147 @@ async fn run_with_options_under_store_lock(
             .map_err(|e| LpmError::Registry(format!("{e}")))?;
     let install_user_bound =
         crate::capability::UserBound::from_global_config(&install_capability_cfg);
+
+    // **Phase 46 slice 1 — resolve script-policy + preflight advisor
+    // BEFORE the blocked-set capture.**
+    //
+    // The capture writes to `.lpm/build-state.json`. If the advisor
+    // approves an amber package this run, that package's scripts run
+    // via the AdvisorApprovedThisRun trust path during autoBuild; we
+    // therefore want it EXCLUDED from the persisted blocked set so
+    // post-install JSON + the "remain blocked after auto-build"
+    // pointer don't report stale state.
+    //
+    // Order:
+    //   1. Read project script-policy config (one disk read; reused
+    //      by the autoBuild branch later).
+    //   2. Resolve effective policy through the precedence chain.
+    //   3. Build the AdvisorSession (preflight + classify amber).
+    //   4. Pass `session.approvals()` into the capture call below.
+    let step10_script_policy_cfg =
+        crate::script_policy_config::ScriptPolicyConfig::from_package_json(project_dir);
+    let config_auto_build = step10_script_policy_cfg.auto_build;
+    let step10_effective_policy = crate::script_policy_config::resolve_script_policy(
+        script_policy_override,
+        &step10_script_policy_cfg,
+    );
+
+    // Phase 46 P1: include integrity so the auto-build predicate's
+    // strict gate matches what `rebuild::run` will do. Same data
+    // shape as `installed_with_integrity` above; named separately
+    // because it's consumed by `all_scripted_packages_trusted`
+    // later and historically lived next to that call.
+    let all_pkgs_for_build: Vec<(String, String, Option<String>)> = packages
+        .iter()
+        .map(|p| (p.name.clone(), p.version.clone(), p.integrity.clone()))
+        .collect();
+
+    // **Phase 46 slice 1 — install-time L4 advisor consumption.**
+    //
+    // Preflight the configured advisor ONCE per run. Session stays
+    // active only when:
+    // - script-policy resolved to `triage`,
+    // - `triage-advisor` is set to something other than `none`,
+    // - detect + test-invoke succeed.
+    //
+    // Any failure degrades to none with a single warning. Per-
+    // package classification failures later stay silent — preflight
+    // already warned (or didn't, if the user configured `none`).
+    //
+    // Precedence chain for `triage-advisor` (highest first):
+    //   - CLI `--advisor` flag (slug validated at the clap layer in
+    //     `main.rs::parse_advisor_slug`; `Some` here is guaranteed to
+    //     be `"none"` or a known provider).
+    //   - `package.json > lpm > triageAdvisor`
+    //   - `~/.lpm/config.toml` `triage-advisor` key
+    //   - default `none`
+    let advisor_session =
+        if step10_effective_policy == crate::script_policy_config::ScriptPolicy::Triage {
+            let triage_advisor_pkg_json = step10_script_policy_cfg.triage_advisor.as_deref();
+            let triage_advisor_global = install_capability_cfg.get_str("triage-advisor");
+            let mut session = crate::triage_advisor_session::AdvisorSession::preflight(
+                advisor_override.as_deref(),
+                triage_advisor_pkg_json,
+                triage_advisor_global,
+                json_output,
+            )
+            .await;
+            // If the session is active, classify every amber package
+            // declared in the current install set. The advisor's
+            // `Approve` verdicts populate an in-memory approval set
+            // that's threaded into the blocked-set capture (so
+            // approved packages are excluded from the persisted
+            // blocked set), the autoBuild predicate, AND
+            // `rebuild::run` (the actual script-execution path).
+            // The set never persists.
+            if session.is_active() {
+                let amber_requests = collect_amber_classification_requests(
+                    &store,
+                    &installed_with_integrity,
+                    &publish_ages,
+                    cooldown_policy.minimum_release_age_secs,
+                );
+                // `classify_amber` is async + serial. Slice 1 keeps
+                // it simple; future parallel-fanout can ride on top.
+                session.classify_amber(&amber_requests).await;
+            }
+            Some(session)
+        } else {
+            None
+        };
+
+    // **Phase 46 slice 1 — second-pass review fix.** Compute the
+    // auto-build decision BEFORE the blocked-set capture so the
+    // capture can condition the advisor-approval exclusion on
+    // whether scripts will actually run this install.
+    //
+    // The bug we are closing: an advisor `Approve` verdict has two
+    // observable effects — (1) the package's scripts run via the
+    // AdvisorApprovedThisRun trust path during autoBuild, and
+    // (2) the package is omitted from the persisted blocked set
+    // (so post-install messaging + `lpm approve-scripts` don't
+    // report stale "still blocked" state). Effect (2) is only
+    // valid when (1) actually fires. In a mixed-triage install
+    // where the advisor approves A but leaves B blocked, with
+    // `--auto-build` off and `autoBuild: false`, `all_trusted` is
+    // false → autoBuild does not fire → A's scripts never run, AND
+    // A vanishes from `build-state.json` → unreachable via
+    // `approve-scripts` either. "Stranded: not executed, not
+    // reviewable."
+    //
+    // Fix: pass `advisor_approvals` to the capture iff
+    // `auto_build_attempted` is true. When auto-build won't fire,
+    // the persisted blocked set continues to surface the
+    // advisor-approved-but-not-run package, and the user can review
+    // it explicitly via `lpm approve-scripts` (the ephemeral
+    // approval is gone after this run — by design, since approvals
+    // never persist).
+    //
+    // `all_scripted_packages_trusted` ALWAYS receives the approvals
+    // — its purpose is to decide whether autoBuild should fire, and
+    // an advisor-approved amber correctly counts as trusted for
+    // that gate.
+    let force_security_floor = install_capability_cfg
+        .get_bool("force-security-floor")
+        .unwrap_or(false);
+    let all_trusted_for_auto_build = crate::commands::rebuild::all_scripted_packages_trusted(
+        &lpm_root,
+        &all_pkgs_for_build,
+        &policy,
+        project_dir,
+        step10_effective_policy,
+        force_security_floor,
+        &install_requested_capabilities,
+        &install_user_bound,
+        advisor_session.as_ref().map(|s| s.approvals()),
+    );
+    let auto_build_attempted = should_auto_build(
+        auto_build,
+        config_auto_build,
+        all_trusted_for_auto_build,
+        step10_effective_policy,
+    );
+
     let capture_start = std::time::Instant::now();
     let blocked_capture = crate::build_state::capture_blocked_set_after_install_with_metadata(
         project_dir,
@@ -6302,6 +6536,14 @@ async fn run_with_options_under_store_lock(
         &blocked_set_metadata,
         &install_requested_capabilities,
         &install_user_bound,
+        // Conditional: only exclude advisor-approved triples when
+        // autoBuild will actually execute their scripts this run.
+        // See `select_approvals_for_capture` for the rationale —
+        // closes the "stranded approval" bug.
+        select_approvals_for_capture(
+            auto_build_attempted,
+            advisor_session.as_ref().map(|s| s.approvals()),
+        ),
     )?;
     tracing::debug!(
         "perf.capture_blocked_set pkgs={} ms={}",
@@ -6716,73 +6958,21 @@ async fn run_with_options_under_store_lock(
     // Phase 46 P1: consolidated into ScriptPolicyConfig so all four
     // script-related keys come from a single read.
     //
-    // Phase 46 P6 Chunk 1: resolve the effective script-policy here and
-    // thread it into both the auto-build predicate and `rebuild::run`.
-    // The value is not yet consulted by either callee (Chunks 2/3 wire
-    // the green-tier auto-trust through the shared helper); landing the
-    // plumbing first keeps that behavior diff small and reviewable.
-    let step10_script_policy_cfg =
-        crate::script_policy_config::ScriptPolicyConfig::from_package_json(project_dir);
-    let config_auto_build = step10_script_policy_cfg.auto_build;
-    let step10_effective_policy = crate::script_policy_config::resolve_script_policy(
-        script_policy_override,
-        &step10_script_policy_cfg,
-    );
-    // Phase 46 P1: include integrity so the auto-build predicate's
-    // strict gate matches what `rebuild::run` will do. A drifted rich
-    // binding previously satisfied this predicate via the lenient
-    // name-only gate and triggered auto-build for a package
-    // `rebuild::run` then skipped.
-    let all_pkgs_for_build: Vec<(String, String, Option<String>)> = packages
-        .iter()
-        .map(|p| (p.name.clone(), p.version.clone(), p.integrity.clone()))
-        .collect();
-    // **Phase 48 P0 slice 4 + sub-slice 6c.** Read the force-
-    // security-floor kill-switch once, plus the project's requested
-    // capability set and the user's configured bounds. Thread all
-    // three through the auto-build trust check. When the flag is
-    // set, approvals are suspended and the check returns false
-    // (kill-switch path). When the project widens beyond the user
-    // bound and no matching approval exists, the capability gate
-    // returns CapabilityNotApproved for that package, also driving
-    // the check to false. Either way, auto-build declines cleanly.
-    // Phase 48 P0: reuse the hoisted capability + user-bound
-    // values from the earlier `capture_blocked_set_after_install_with_metadata`
-    // call site so the install-time capture and the autoBuild
-    // trust check consult identical canonical objects. Only the
-    // kill-switch flag is re-read here (config.rs reads are
-    // cached; this is a cheap lookup).
-    let force_security_floor = install_capability_cfg
-        .get_bool("force-security-floor")
-        .unwrap_or(false);
-    let all_trusted = crate::commands::rebuild::all_scripted_packages_trusted(
-        &lpm_root,
-        &all_pkgs_for_build,
-        &policy,
-        project_dir,
-        step10_effective_policy,
-        force_security_floor,
-        &install_requested_capabilities,
-        &install_user_bound,
-    );
+    // Phase 46 slice 1 moved the script-policy resolution + advisor
+    // preflight UP to before the blocked-set capture (so approved
+    // packages can be excluded from the persisted set). The
+    // `step10_*` locals + `all_pkgs_for_build` + `advisor_session`
+    // they produce are still in scope here; only the autoBuild
+    // predicate + the rebuild::run call read them. No duplication.
 
-    // Phase 46 P6 Chunk 4: trace whether the auto-build actually ran
-    // so the post-auto-build pointer below only fires when scripts
-    // had a chance to execute. Without this, a `script-policy = triage`
-    // install that falls through `should_auto_build` returning false
-    // (mixed amber without `autoBuild: true`) would print a "remain
-    // blocked after auto-build" pointer for a build that never started
-    // — honest-but-wrong UX. The pre-auto-build blocked-hint block
-    // upstream already surfaces the pre-auto-build state; the post-
-    // auto-build pointer is strictly a second notice AFTER scripts
-    // ran, for the specific case where greens completed but amber/red
-    // survive.
-    let auto_build_attempted = should_auto_build(
-        auto_build,
-        config_auto_build,
-        all_trusted,
-        step10_effective_policy,
-    );
+    // **Phase 48 P0 slice 4 + sub-slice 6c + Phase 46 slice 1
+    // review-fix.** `force_security_floor`, `all_trusted_for_auto_build`,
+    // and `auto_build_attempted` are now computed BEFORE the
+    // blocked-set capture (so the capture can condition the
+    // advisor-approval exclusion on whether autoBuild will fire).
+    // The original comment block describing the kill-switch + capability
+    // gate's interaction with this predicate still applies — see the
+    // pre-capture computation above for details.
     if auto_build_attempted {
         // Phase 46 P7: preflight version-diff cards for any green
         // about to auto-execute that has a prior-approved binding
@@ -6810,17 +7000,27 @@ async fn run_with_options_under_store_lock(
             false, // not --force
             None,  // default timeout
             json_output,
-            false, // not --unsafe-full-env
             false, // not --deny-all
-            // Phase 46 P5 Chunk 2: auto-build never bypasses the
-            // sandbox (no_sandbox=false) and never enters diagnostic
-            // mode (sandbox_log=false). If a user wants to opt out
-            // of containment, they need to run `lpm rebuild` explicitly
-            // with the partner flag pair. Silent sandbox bypass
-            // during autoBuild would violate D20.
-            false, // no_sandbox
+            // Phase 46.1 rework (2026-05-11): forward the user's CLI
+            // sandbox-mode choice to the auto-build rebuild call.
+            // When the user explicitly opts into strict, the
+            // auto-build greens run under strict too. When the user
+            // explicitly drops the sandbox (`--no-sandbox`), the
+            // auto-build greens skip containment too — consistent
+            // with the user's chosen capability boundary. The
+            // env / config / default precedence stays intact when
+            // both flags are false (the chain resolver inside
+            // `rebuild::run_under_store_lock` walks lpm.toml /
+            // `~/.lpm/config.toml` / `LPM_STRICT_SANDBOX` env).
+            //
+            // `sandbox_log` stays false: it's a diagnostic-only
+            // override the user must spell out explicitly on
+            // `lpm rebuild`, not a default that auto-build inherits.
+            no_sandbox,
+            strict_sandbox,
             false, // sandbox_log
             step10_effective_policy,
+            advisor_session.as_ref().map(|s| s.approvals()),
         )
         .await
         && !json_output
@@ -7427,6 +7627,51 @@ fn should_auto_build(
         || effective_policy == crate::script_policy_config::ScriptPolicy::Allow
 }
 
+/// **Phase 46 slice 1 — second-pass review fix.** Decide what advisor
+/// approval view (if any) should be forwarded to
+/// [`crate::build_state::capture_blocked_set_after_install_with_metadata`].
+///
+/// Why this is its own function rather than an inline ternary:
+///
+/// The advisor's `Approve` verdict has two coupled effects in an
+/// install — (1) the package's scripts execute via the
+/// `AdvisorApprovedThisRun` trust path during autoBuild, and (2) the
+/// package is omitted from the persisted blocked set so post-install
+/// messaging + `lpm approve-scripts` don't report stale "still
+/// blocked" state. Effect (2) is only correct when (1) actually
+/// fires.
+///
+/// In a mixed-triage install where the advisor approves package A
+/// but leaves package B blocked, with `--auto-build=false` and
+/// `lpm.scripts.autoBuild=false`, `all_trusted` is false →
+/// `auto_build_attempted` is false → no scripts run, AND A vanishes
+/// from `build-state.json` → no path back through
+/// `approve-scripts`. The user is left with "not executed, not
+/// reviewable" — a stranded approval. This helper closes that hole.
+///
+/// Returns the input view unchanged when autoBuild will actually
+/// execute approved scripts this run. Otherwise returns `None`, so
+/// approved-but-not-run packages stay in the blocked set and remain
+/// reviewable on a later `lpm approve-scripts` invocation. (The
+/// ephemeral approval set itself is discarded at end of run — by
+/// design.)
+///
+/// Takes the borrowed approvals view directly (rather than the full
+/// `AdvisorSession`) so the install caller can compose:
+/// `select_approvals_for_capture(auto_build_attempted,
+/// advisor_session.as_ref().map(|s| s.approvals()))`, and tests can
+/// pass a hand-built `HashSet` without constructing a real session.
+fn select_approvals_for_capture(
+    auto_build_attempted: bool,
+    approvals: Option<&std::collections::HashSet<(String, String, Option<String>)>>,
+) -> Option<&std::collections::HashSet<(String, String, Option<String>)>> {
+    if auto_build_attempted {
+        approvals
+    } else {
+        None
+    }
+}
+
 /// Phase 46 P6 Chunk 4 — decision half of the post-auto-build §5.3
 /// canonical pointer. Pure — returns the message string to emit, or
 /// `None` when no pointer should fire. I/O lives in
@@ -7735,6 +7980,108 @@ fn read_trusted_deps_from_manifest(
 /// the captured fields stay `None` — documented graceful
 /// degradation (see [`crate::build_state::BlockedSetMetadata`]).
 ///
+/// **Phase 46 slice 1 helper.** Walk the install set, classify every
+/// lifecycle script through Layer 1, and emit one
+/// [`crate::triage_advisor_session::AmberPackageRequest`] per
+/// package that has at least one amber phase. Green-only packages
+/// auto-run via the existing P6 GreenTierUnderTriage path and don't
+/// need an advisor call; red-only packages are hard-blocked
+/// regardless of the advisor; packages with no scripts have nothing
+/// to advise on.
+///
+/// Mirrors the worst-of reduction in
+/// [`crate::build_state::compute_blocked_packages_with_metadata`]
+/// and [`crate::commands::rebuild::evaluate_trust_unsuspended`] so
+/// the advisor pass agrees with both downstream consumers on which
+/// packages are amber-eligible.
+fn collect_amber_classification_requests(
+    store: &lpm_store::PackageStore,
+    packages: &[(String, String, Option<String>)],
+    publish_ages: &std::collections::HashMap<(String, String), u64>,
+    min_release_age_secs: u64,
+) -> Vec<crate::triage_advisor_session::AmberPackageRequest> {
+    use lpm_security::static_gate::ManifestContext;
+    use lpm_security::triage::StaticTier;
+    let mut out = Vec::new();
+    for (name, version, integrity) in packages {
+        let pkg_dir = store.package_dir(name, version);
+        let bodies = crate::build_state::read_install_phase_bodies(&pkg_dir);
+        if bodies.is_empty() {
+            continue;
+        }
+        // Phase 46b Lever #1 / #4 — read the package's `repository`
+        // URL from the same store package.json. Used both for the L4
+        // advisor prompt (#1) and the L1 classifier widening (#4)
+        // that converts delegate-to-local-file + matching identity
+        // into Green.
+        //
+        // Phase 46b Option B — feed the package's publish age + the
+        // configured `minimum_release_age_secs` into the classifier
+        // context so Lever #4's identity-match widening can apply
+        // the cooldown defense-in-depth (refuses to widen recent
+        // publishes even when `--allow-new` bypassed the
+        // install-level halt).
+        let repository = crate::build_state::read_manifest_repository(&pkg_dir);
+        let publish_age = publish_ages.get(&(name.clone(), version.clone())).copied();
+        let ctx = ManifestContext {
+            package_name: name.as_str(),
+            repository: repository.as_deref(),
+            bin_names: &[],
+            publish_age_secs: publish_age,
+            min_release_age_secs,
+        };
+        // Classify each phase independently; collect those that
+        // resolve to Amber/AmberLlm. The advisor needs the per-phase
+        // body to make a per-phase judgement; the session then
+        // worst-ofs across phases for the package-level outcome.
+        let amber_phases: Vec<(String, String)> = bodies
+            .into_iter()
+            .filter(|(_, body)| {
+                matches!(
+                    lpm_security::static_gate::classify_with_context(body, Some(&ctx)),
+                    StaticTier::Amber | StaticTier::AmberLlm
+                )
+            })
+            .collect();
+        if amber_phases.is_empty() {
+            continue;
+        }
+        // The integrity slot carries source identity. Workspace /
+        // file / link sources are `None`; registry sources carry the
+        // resolved integrity hash. The same (name, version) from two
+        // different sources produces TWO distinct approval keys
+        // downstream — required so an approval on one source cannot
+        // leak to a sibling source in the same install.
+        //
+        // Phase 46b Lever #3 — scan each amber phase body for files
+        // it delegates to and read them with the runbook's caps
+        // (depth 1, ≤ 32 KB, safe-relative only, non-text rejected).
+        // Deduplicate by filename across phases so a body that says
+        // `node install.js` for both preinstall and postinstall
+        // doesn't emit the same content twice.
+        let mut seen = std::collections::BTreeSet::new();
+        let mut referenced_scripts: Vec<(String, String)> = Vec::new();
+        for (_phase, body) in &amber_phases {
+            for (filename, content) in
+                crate::build_state::collect_referenced_scripts(&pkg_dir, body)
+            {
+                if seen.insert(filename.clone()) {
+                    referenced_scripts.push((filename, content));
+                }
+            }
+        }
+        out.push(crate::triage_advisor_session::AmberPackageRequest {
+            name: name.clone(),
+            version: version.clone(),
+            integrity: integrity.clone(),
+            repository,
+            amber_phases,
+            referenced_scripts,
+        });
+    }
+    out
+}
+
 /// Never returns an error: metadata enrichment is best-effort and
 /// must not fail an otherwise-successful install. Any fetch error
 /// is recorded as "no entry for this package" and the install
@@ -8589,6 +8936,10 @@ async fn run_link_and_finish(
             .map_err(|e| LpmError::Registry(format!("{e}")))?;
     let offline_user_bound =
         crate::capability::UserBound::from_global_config(&offline_capability_cfg);
+    // Phase 46 slice 1 — the fast-path / offline install does NOT
+    // run the L4 advisor (scope was tightened to the online install
+    // path). `None` passes through `compute_blocked_packages_with_metadata`
+    // unchanged for this call.
     let blocked_capture = crate::build_state::capture_blocked_set_after_install_with_metadata(
         project_dir,
         &store,
@@ -8597,6 +8948,7 @@ async fn run_link_and_finish(
         &crate::build_state::BlockedSetMetadata::default(),
         &offline_requested_capabilities,
         &offline_user_bound,
+        None,
     )?;
 
     // Phase 46 P1: snapshot write on the fast path too — a warm
@@ -10371,12 +10723,20 @@ pub async fn run_add_packages(
     // [`run_with_options`] for the resolution precedence and the
     // current consumer (triage-mode install summary line).
     script_policy_override: Option<crate::script_policy_config::ScriptPolicy>,
+    // Phase 46 slice 1: forwarded `--advisor` override. Opaque
+    // pass-through to `run_with_options` — see that fn for the
+    // precedence chain and validation contract.
+    advisor_override: Option<String>,
     // Phase 46 P3: forwarded `--min-release-age=<dur>` override.
     // Opaque pass-through — see [`run_with_options`].
     min_release_age_override: Option<u64>,
     // Phase 46 P4 Chunk 4: forwarded `--ignore-provenance-drift[-all]`
     // policy. Opaque pass-through — see [`run_with_options`].
     drift_ignore_policy: crate::provenance_fetch::DriftIgnorePolicy,
+    // Phase 46.1 rework (2026-05-11): forwarded CLI sandbox-mode
+    // overrides. Opaque pass-through — see [`run_with_options`].
+    strict_sandbox: bool,
+    no_sandbox: bool,
 ) -> Result<(), LpmError> {
     // First pass: check if any LPM packages are Swift ecosystem
     // Route Swift packages to SE-0292 registry mode
@@ -10489,8 +10849,11 @@ pub async fn run_add_packages(
         None,  // target_set: legacy single-project path
         Some(&mut direct_versions),
         script_policy_override,
+        advisor_override,
         min_release_age_override,
         drift_ignore_policy,
+        strict_sandbox,
+        no_sandbox,
     )
     .await?;
 
@@ -10536,12 +10899,20 @@ pub async fn run_install_filtered_add(
     save_flags: crate::save_spec::SaveFlags,
     // Phase 46 P2 Chunk 5: forwarded CLI-side policy override.
     script_policy_override: Option<crate::script_policy_config::ScriptPolicy>,
+    // Phase 46 slice 1: forwarded `--advisor` override. Opaque
+    // pass-through to `run_with_options` — see that fn for the
+    // precedence chain and validation contract.
+    advisor_override: Option<String>,
     // Phase 46 P3: forwarded `--min-release-age=<dur>` override.
     // Opaque pass-through — see [`run_with_options`].
     min_release_age_override: Option<u64>,
     // Phase 46 P4 Chunk 4: forwarded `--ignore-provenance-drift[-all]`
     // policy. Opaque pass-through — see [`run_with_options`].
     drift_ignore_policy: crate::provenance_fetch::DriftIgnorePolicy,
+    // Phase 46.1 rework (2026-05-11): forwarded CLI sandbox-mode
+    // overrides. Opaque pass-through — see [`run_with_options`].
+    strict_sandbox: bool,
+    no_sandbox: bool,
 ) -> Result<(), LpmError> {
     // 1. Resolve CLI flags into a concrete target list.
     let targets = crate::commands::install_targets::resolve_install_targets(
@@ -10764,6 +11135,11 @@ pub async fn run_install_filtered_add(
             Some(&target_paths),
             Some(&mut direct_versions),
             script_policy_override,
+            // Same per-iteration clone rationale as `drift_ignore_policy`
+            // below: each loop pass moves the override into
+            // `run_with_options`, so the multi-member loop has to clone.
+            // `Option<String>` is cheap to clone.
+            advisor_override.clone(),
             min_release_age_override,
             // Multi-member loop: `run_install_filtered_add` runs the
             // install pipeline once per targeted member. Each
@@ -10771,6 +11147,8 @@ pub async fn run_install_filtered_add(
             // Cloning an enum + HashSet of ignored names is cheap
             // relative to the per-iteration install pipeline itself.
             drift_ignore_policy.clone(),
+            strict_sandbox,
+            no_sandbox,
         )
         .await;
 
@@ -11734,6 +12112,62 @@ mod tests {
         assert!(should_auto_build(true, false, false, ScriptPolicy::Triage));
         assert!(should_auto_build(false, true, false, ScriptPolicy::Triage));
         assert!(should_auto_build(false, false, true, ScriptPolicy::Triage));
+    }
+
+    // ── Phase 46 slice 1 second-pass review fix ──
+    //
+    // `select_approvals_for_capture` decides whether the blocked-set
+    // capture sees the advisor's approval view. The contract is:
+    //   1. autoBuild won't fire → ALWAYS `None`, regardless of whether
+    //      the session classified anything. Pre-fix this was an
+    //      unconditional pass-through; that stranded approved-but-
+    //      not-run packages: scripts never executed AND the package
+    //      vanished from `build-state.json` → unreachable via
+    //      `lpm approve-scripts` either.
+    //   2. autoBuild will fire → pass the view through verbatim,
+    //      including the absent-session case (`None` in → `None`
+    //      out — the autoBuild path just gets no exclusions).
+
+    #[test]
+    fn select_approvals_returns_none_when_auto_build_skipped() {
+        let mut approvals = std::collections::HashSet::new();
+        approvals.insert((
+            "amber-pkg".to_string(),
+            "1.0.0".to_string(),
+            Some("sha512-x".to_string()),
+        ));
+        assert!(
+            select_approvals_for_capture(false, Some(&approvals)).is_none(),
+            "autoBuild=false MUST suppress the approval view so approved-but-not-run \
+             packages remain in the blocked set and reviewable via approve-scripts"
+        );
+    }
+
+    #[test]
+    fn select_approvals_returns_view_when_auto_build_fires() {
+        let mut approvals = std::collections::HashSet::new();
+        approvals.insert((
+            "amber-pkg".to_string(),
+            "1.0.0".to_string(),
+            Some("sha512-x".to_string()),
+        ));
+        let view = select_approvals_for_capture(true, Some(&approvals))
+            .expect("autoBuild=true MUST forward the approval view");
+        assert_eq!(view.len(), 1);
+        assert!(view.contains(&(
+            "amber-pkg".to_string(),
+            "1.0.0".to_string(),
+            Some("sha512-x".to_string()),
+        )));
+    }
+
+    #[test]
+    fn select_approvals_returns_none_when_session_absent() {
+        // Triage-off / no-advisor path: nothing to pass through in
+        // either branch. Both `false` and `true` for
+        // `auto_build_attempted` MUST return `None`.
+        assert!(select_approvals_for_capture(false, None).is_none());
+        assert!(select_approvals_for_capture(true, None).is_none());
     }
 
     // Phase 46 P1: the two `read_auto_build_config_*` tests were
@@ -13011,8 +13445,11 @@ mod tests {
             false,                // force
             crate::save_spec::SaveFlags::default(),
             None,                                                  // script_policy_override
+            None,                                                  // advisor_override
             None,                                                  // min_release_age_override
             crate::provenance_fetch::DriftIgnorePolicy::default(), // drift_ignore_policy
+            false,                                                 // strict_sandbox
+            false,                                                 // no_sandbox
         )
         .await;
 
@@ -13049,8 +13486,11 @@ mod tests {
             false,
             crate::save_spec::SaveFlags::default(),
             None,                                                  // script_policy_override
+            None,                                                  // advisor_override
             None,                                                  // min_release_age_override
             crate::provenance_fetch::DriftIgnorePolicy::default(), // drift_ignore_policy
+            false,                                                 // strict_sandbox
+            false,                                                 // no_sandbox
         )
         .await;
 
