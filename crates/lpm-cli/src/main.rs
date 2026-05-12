@@ -2290,13 +2290,20 @@ fn spawn_background_update_check() {
     let _ = cmd.spawn(); // fire-and-forget
 }
 
-// Heap-allocation profiling. Gate behind feature so release builds pay zero cost.
-// Build: cargo build -p lpm-cli --features dhat-heap
-// Run:   cd bench/fixture-large && ../../target/debug/lpm-rs install
-// View:  open dhat-heap.json at https://nnethercote.github.io/dh_view/dh_view.html
+// dhat heap profiling overrides mimalloc so allocation counts reflect the raw
+// Rust alloc surface (not mimalloc's internal pools). Build:
+//   cargo build -p lpm-cli --features dhat-heap
 #[cfg(feature = "dhat-heap")]
 #[global_allocator]
 static ALLOC: dhat::Alloc = dhat::Alloc;
+
+// mimalloc replaces the system allocator in all non-profiling builds.
+// Typically 5-15% faster on alloc-heavy workloads (resolver BFS, lockfile
+// parse, linker path construction) vs the macOS/Linux system malloc.
+// Disable for comparison builds: cargo build --release --features no-mimalloc
+#[cfg(all(not(feature = "dhat-heap"), not(feature = "no-mimalloc")))]
+#[global_allocator]
+static ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 fn main() -> Result<()> {
     // dhat profiler must be the first live value — it instruments the
