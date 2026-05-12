@@ -76,6 +76,7 @@ use crate::{
 use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::os::windows::ffi::OsStrExt;
+use std::os::windows::fs::MetadataExt;
 use std::os::windows::io::AsRawHandle;
 use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
@@ -96,8 +97,9 @@ use windows_sys::Win32::Security::{
     TOKEN_QUERY, TokenIntegrityLevel,
 };
 use windows_sys::Win32::Storage::FileSystem::{
-    CreateFileW, FILE_FLAG_BACKUP_SEMANTICS, FILE_GENERIC_READ, FILE_ID_INFO, FILE_SHARE_DELETE,
-    FILE_SHARE_READ, FILE_SHARE_WRITE, FileIdInfo, GetFileInformationByHandleEx, OPEN_EXISTING,
+    CreateFileW, FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS, FILE_GENERIC_READ,
+    FILE_ID_INFO, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FileIdInfo,
+    GetFileInformationByHandleEx, OPEN_EXISTING,
 };
 use windows_sys::Win32::System::JobObjects::{
     AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
@@ -474,6 +476,71 @@ fn apply_low_il_label(path: &Path) -> Result<(), SandboxError> {
         return Ok(());
     }
 
+    // Phase 46.3 PR-1 finding S1: refuse reparse-point roots.
+    //
+    // `set_low_il_label_on` uses the name-form `SetNamedSecurityInfoW`
+    // which follows reparse points by default — labelling a junction
+    // root would apply Low IL writeability to its target, which may
+    // resolve outside the intended allow-set tree (including an
+    // attacker-controlled target if the user's profile dir was
+    // compromised before lpm ran). Phase 46.2 silently followed; that
+    // behaviour is now an explicit refusal.
+    //
+    // Remediation depends on which allow-set entry this path is. The
+    // built-in roots (`~/.cache`, `~/.node-gyp`, `~/.npm`, plus the
+    // four project-rooted entries) are appended unconditionally in
+    // `writable_allow_set`; `sandboxWriteDirs` does NOT displace them.
+    // On Windows `dirs::home_dir()` reads the profile from the
+    // registry, so `HOME`/`USERPROFILE` env tweaks don't help either.
+    // The error message below names the truthful per-class options.
+    match std::fs::symlink_metadata(path) {
+        Ok(meta) if is_reparse_point(&meta) => {
+            return Err(SandboxError::ProfileRenderFailed {
+                reason: format!(
+                    "allow-set root {p} is a reparse point (symlink / \
+                     junction / mount point). The sandbox refuses to follow \
+                     it because the kernel would apply Low IL writeability \
+                     to the reparse-point's target, which may resolve \
+                     outside the intended allow-set tree.\n\
+                     \n\
+                     Workarounds:\n\
+                     \n\
+                       * Replace the reparse point at {p} with a regular \
+                         directory (delete the link, recreate as a real \
+                         directory, restore contents). Works for every root \
+                         class.\n\
+                       * If {p} is your TEMP dir (Windows %TEMP%): set the \
+                         `TMP` and `TEMP` environment variables to a regular \
+                         directory before invoking lpm. `std::env::temp_dir()` \
+                         honors them and lpm will compute a different tmpdir \
+                         for the sandbox.\n\
+                       * If {p} is an entry you declared via \
+                         `sandboxWriteDirs` in `package.json`: edit the entry \
+                         to point at the canonical target directly instead of \
+                         through the reparse point.\n\
+                       * Re-run with `--no-sandbox` to skip sandbox \
+                         containment for one command (universal fallback).\n\
+                     \n\
+                     Note: `sandboxWriteDirs` cannot bypass this refusal for \
+                     built-in roots (`~/.cache`, `~/.node-gyp`, `~/.npm`, and \
+                     the project-rooted entries) — they are added to the \
+                     allow-set unconditionally regardless of `sandboxWriteDirs` \
+                     content.",
+                    p = path.display(),
+                ),
+            });
+        }
+        Ok(_) => {} // regular file or dir — proceed
+        Err(e) => {
+            // The `path.exists()` check above passed, so a symlink_metadata
+            // failure here is unexpected — surface it rather than silently
+            // proceeding into the slow path on potentially stale state.
+            return Err(SandboxError::ProfileRenderFailed {
+                reason: format!("symlink_metadata({}) failed: {e}", path.display()),
+            });
+        }
+    }
+
     // Fast-path: was this exact directory object labelled earlier
     // in this process? Two-axis identity check:
     //
@@ -762,6 +829,24 @@ fn set_low_il_label_on(path: &Path, sacl_ptr: *mut ACL) -> Result<(), SandboxErr
     Ok(())
 }
 
+/// True iff `metadata` describes a reparse point — symbolic links,
+/// NTFS directory junctions, mount points, OneDrive placeholders, and
+/// any other reparse-tagged objects.
+///
+/// **Why this and not `FileType::is_symlink()`.** On Windows
+/// `std::fs::FileType::is_symlink()` returns `true` only for
+/// `IO_REPARSE_TAG_SYMLINK`. Directory junctions
+/// (`IO_REPARSE_TAG_MOUNT_POINT`, created by `mklink /J`) are NOT
+/// flagged. Mount points and several other reparse tags are also
+/// missed. The Phase 46.2 walk used `is_symlink()` and recursed
+/// through junctions, which is the gap Phase 46.3 PR-1 (finding S1)
+/// closes by switching the check to the `FILE_ATTRIBUTE_REPARSE_POINT`
+/// bit — set by the filesystem for every reparse-tagged object
+/// regardless of the specific tag.
+fn is_reparse_point(metadata: &std::fs::Metadata) -> bool {
+    metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+}
+
 /// Iteratively label every existing descendant of `root`. Per-entry
 /// failures are logged at debug and swallowed because the root has
 /// already been labelled successfully — the goal here is to retrofit
@@ -773,10 +858,28 @@ fn set_low_il_label_on(path: &Path, sacl_ptr: *mut ACL) -> Result<(), SandboxErr
 /// trees (deeply nested `node_modules`, `.cache` with thousands of
 /// hashed subdirs) don't risk stack overflow.
 ///
-/// Symlinks are NOT followed — we label the link object itself but
-/// don't traverse into the target. This matches the macOS Seatbelt
-/// and Linux landlock posture: scripts are allow-set restricted by
-/// their canonicalized destination, not by aliasing.
+/// **Reparse-point skip (Phase 46.3 PR-1 finding S1).** Every entry
+/// whose `FILE_ATTRIBUTE_REPARSE_POINT` bit is set — symbolic links,
+/// NTFS directory junctions, mount points, OneDrive placeholders — is
+/// skipped with a `tracing::debug!` line and not descended into.
+/// Rationale:
+///
+/// - `SetNamedSecurityInfoW` follows reparse points by default, so
+///   labelling a symlink or junction inside the allow-set would apply
+///   Low IL writeability to its TARGET, potentially outside the
+///   allow-set tree.
+/// - Junction recursion via `read_dir` follows the reparse point;
+///   descending into a planted junction would walk + label arbitrary
+///   subtrees. Phase 46.2's `!ft.is_symlink()` recursion guard only
+///   caught `IO_REPARSE_TAG_SYMLINK` — junctions
+///   (`IO_REPARSE_TAG_MOUNT_POINT`) sailed through it.
+///
+/// Skipping reparse points entirely doesn't lose coverage in practice
+/// because the LPM linker's own junctions point INSIDE the allow-set
+/// (e.g. `<project>/node_modules/<pkg>` → `<project>/.lpm/wrappers/...`
+/// and both `node_modules` and `.lpm` are independently labelled
+/// allow-set roots), so the target subtree is reached via the regular
+/// path traversal of its own root.
 fn relabel_existing_descendants(root: &Path, sacl_ptr: *mut ACL) {
     let mut stack: Vec<PathBuf> = vec![root.to_path_buf()];
     while let Some(dir) = stack.pop() {
@@ -793,6 +896,34 @@ fn relabel_existing_descendants(root: &Path, sacl_ptr: *mut ACL) {
         };
         for entry in entries.flatten() {
             let path = entry.path();
+
+            // Pull metadata WITHOUT following symlinks. `DirEntry::metadata`
+            // on Windows uses `GetFileAttributesExW` with no traversal, so
+            // the result describes the entry itself, not any target it
+            // points at — exactly what the reparse-point check needs.
+            let meta = match entry.metadata() {
+                Ok(m) => m,
+                Err(e) => {
+                    tracing::debug!(
+                        target: "lpm_sandbox::windows",
+                        "skip relabel of {}: metadata failed: {e}",
+                        path.display(),
+                    );
+                    continue;
+                }
+            };
+
+            // S1: refuse to label or recurse through reparse points.
+            if is_reparse_point(&meta) {
+                tracing::debug!(
+                    target: "lpm_sandbox::windows",
+                    "skip reparse point {} during walk \
+                     (target not labelled to prevent escape outside allow-set)",
+                    path.display(),
+                );
+                continue;
+            }
+
             if let Err(e) = set_low_il_label_on(&path, sacl_ptr) {
                 tracing::debug!(
                     target: "lpm_sandbox::windows",
@@ -800,14 +931,7 @@ fn relabel_existing_descendants(root: &Path, sacl_ptr: *mut ACL) {
                     path.display(),
                 );
             }
-            // Recurse into directories only — skip symlinks so we
-            // don't escape the allow-set tree by walking through an
-            // attacker-planted link. `file_type()` reads the
-            // metadata without following symlinks.
-            if let Ok(ft) = entry.file_type()
-                && ft.is_dir()
-                && !ft.is_symlink()
-            {
+            if meta.is_dir() {
                 stack.push(path);
             }
         }
@@ -1858,6 +1982,522 @@ mod tests {
         assert!(
             pkg_dir.join("marker.txt").exists(),
             "Low IL-labelled package_dir must accept writes from the Low IL child"
+        );
+    }
+
+    // ── Phase 46.3 PR-1 (S1) — reparse-point hardening ───────────────
+
+    // Test-only windows-sys symbols. Kept inside `mod tests` so the
+    // lib build doesn't carry these as unused imports.
+    use windows_sys::Win32::Security::Authorization::GetNamedSecurityInfoW;
+    use windows_sys::Win32::Security::{ACE_HEADER, EqualSid, GetAce, SYSTEM_MANDATORY_LABEL_ACE};
+
+    /// `SYSTEM_MANDATORY_LABEL_ACE_TYPE` per winnt.h. Not exposed by
+    /// windows-sys 0.60; inlined the same way `SE_GROUP_INTEGRITY` is
+    /// at module scope.
+    const SYSTEM_MANDATORY_LABEL_ACE_TYPE: u8 = 0x11;
+
+    /// `SYSTEM_MANDATORY_LABEL_NO_WRITE_UP` per winnt.h — the mask
+    /// value the shipped SDDL writes (`NW` in `S:(ML;OICI;NW;;;LW)`).
+    const SYSTEM_MANDATORY_LABEL_NO_WRITE_UP: u32 = 0x01;
+
+    /// `OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE` as an `AceFlags`
+    /// byte (the `OICI` half of the shipped SDDL). The module-scope
+    /// constants in windows-sys are `ACE_FLAGS = u32`; `AceFlags` in
+    /// `ACE_HEADER` is `u8`, so we inline the byte value here.
+    const OICI_FLAGS_BYTE: u8 = 0x01 | 0x02;
+
+    /// Test-only oracle: returns `true` iff `path`'s
+    /// `LABEL_SECURITY_INFORMATION` SACL contains a
+    /// `SYSTEM_MANDATORY_LABEL_ACE` matching the EXACT shape the
+    /// production code writes — `S:(ML;OICI;NW;;;LW)`:
+    ///
+    /// - `AceType == SYSTEM_MANDATORY_LABEL_ACE_TYPE` (0x11)
+    /// - `AceFlags & (OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE) ==
+    ///   OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE`
+    /// - `Mask == SYSTEM_MANDATORY_LABEL_NO_WRITE_UP` (0x01)
+    /// - SID equals `S-1-16-4096` via `EqualSid`
+    ///
+    /// Strictly stronger than "any Low IL ACE" so a regression that
+    /// ships a different SACL shape (different inheritance, different
+    /// mask) fails the readback tests rather than silently passing.
+    ///
+    /// Independent of the production label path — this is a fresh
+    /// implementation written for tests so the new ACE parser isn't
+    /// self-certifying.
+    fn test_read_has_low_il_ace(path: &Path) -> bool {
+        let wide: Vec<u16> = path
+            .as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect();
+        let mut sd: PSECURITY_DESCRIPTOR = ptr::null_mut();
+        let mut sacl_ptr: *mut ACL = ptr::null_mut();
+
+        // SAFETY: documented call; on success `sd` is LocalAlloc'd and we
+        // free it via `LocalDescriptor`. `sacl_ptr` aliases into `sd`'s
+        // allocation and is valid for the lifetime of the descriptor.
+        let win = unsafe {
+            GetNamedSecurityInfoW(
+                wide.as_ptr(),
+                SE_FILE_OBJECT,
+                LABEL_SECURITY_INFORMATION,
+                ptr::null_mut(),
+                ptr::null_mut(),
+                ptr::null_mut(),
+                &mut sacl_ptr,
+                &mut sd,
+            )
+        };
+        if win != ERROR_SUCCESS {
+            return false;
+        }
+        let _sd_guard = LocalDescriptor(sd);
+
+        if sacl_ptr.is_null() {
+            return false;
+        }
+        // SAFETY: ACL points into `sd`; AceCount is the documented
+        // first read for ACE traversal.
+        let ace_count = unsafe { (*sacl_ptr).AceCount };
+
+        // Parse the Low IL SID once for the per-ACE EqualSid compare.
+        let low_il_str: Vec<u16> = OsStr::new("S-1-16-4096")
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect();
+        let mut low_il_sid: PSID = ptr::null_mut();
+        // SAFETY: documented call; on success the SID is LocalAlloc'd.
+        let ok = unsafe { ConvertStringSidToSidW(low_il_str.as_ptr(), &mut low_il_sid) };
+        if ok == 0 {
+            return false;
+        }
+        let _sid_guard = LocalSid(low_il_sid);
+
+        for i in 0..ace_count {
+            let mut ace_ptr: *mut core::ffi::c_void = ptr::null_mut();
+            // SAFETY: GetAce reads the ACE at index `i` from `sacl_ptr`;
+            // documented bounds-checked call.
+            let got = unsafe { GetAce(sacl_ptr, i as u32, &mut ace_ptr) };
+            if got == 0 || ace_ptr.is_null() {
+                continue;
+            }
+            // SAFETY: ACE_HEADER is the universal prefix every ACE
+            // starts with; reading it is safe regardless of the
+            // specific ACE type.
+            let header: &ACE_HEADER = unsafe { &*(ace_ptr as *const ACE_HEADER) };
+            if header.AceType != SYSTEM_MANDATORY_LABEL_ACE_TYPE {
+                continue;
+            }
+            if header.AceFlags & OICI_FLAGS_BYTE != OICI_FLAGS_BYTE {
+                continue;
+            }
+            // SAFETY: AceType matches, so the ACE is at least
+            // `sizeof(SYSTEM_MANDATORY_LABEL_ACE)` for the fixed prefix
+            // (the embedded SID is variable-length data past the
+            // struct boundary).
+            let ml_ace: &SYSTEM_MANDATORY_LABEL_ACE =
+                unsafe { &*(ace_ptr as *const SYSTEM_MANDATORY_LABEL_ACE) };
+            if ml_ace.Mask != SYSTEM_MANDATORY_LABEL_NO_WRITE_UP {
+                continue;
+            }
+            // The embedded SID's first byte is at the address of
+            // `SidStart` per winnt.h's variable-length-tail convention.
+            let sid_ptr: PSID = &ml_ace.SidStart as *const u32 as *mut core::ffi::c_void;
+            // SAFETY: `sid_ptr` is the embedded SID; `low_il_sid` is
+            // our LocalAlloc'd reference SID. Both are valid for the
+            // duration of EqualSid's read.
+            let equal = unsafe { EqualSid(sid_ptr, low_il_sid) };
+            if equal != 0 {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Test-only: override any inherited mandatory label on `path` by
+    /// writing an explicit Medium IL OICI ACE via `icacls /setintegritylevel`.
+    /// This is needed because some developer hosts (and CI hosts that
+    /// re-use disk state between jobs) carry a persistent Low IL OICI
+    /// label on `%TEMP%` from earlier Phase 46.2 dev iterations — see
+    /// [`private/46.2.md`](../../../../private/46.2.md) §13.3 for the
+    /// persistence hazard. Without overriding, every
+    /// `tempfile::tempdir()`-rooted test path inherits Low IL from
+    /// `%TEMP%`, which breaks negative assertions like "target must
+    /// not carry Low IL."
+    ///
+    /// **Why `icacls` and not `SetNamedSecurityInfoW` with
+    /// `PROTECTED_SACL_SECURITY_INFORMATION`.** The direct syscall
+    /// approach requires `SE_SECURITY_NAME` (admin) — observed
+    /// returning `ERROR_PRIVILEGE_NOT_HELD` (1314) under a normal
+    /// developer test run. `icacls /setintegritylevel medium` writes
+    /// an explicit Medium IL OICI ACE that takes precedence over the
+    /// inherited Low IL on the same path, and explicit ACEs flow to
+    /// children at create time instead of the original inherited Low
+    /// IL. Writing Medium IL requires no privilege because our test
+    /// process is itself Medium IL — equal-level labels are
+    /// unconditionally permitted.
+    ///
+    /// Call this on a tempdir root right after creation; descendants
+    /// created inside will inherit the explicit Medium IL ACE, which
+    /// the oracle returns `false` for.
+    fn test_strip_inherited_label(path: &Path) {
+        let output = std::process::Command::new("icacls")
+            .arg(path)
+            .arg("/setintegritylevel")
+            .arg("(OI)(CI)medium")
+            .output()
+            .expect("icacls must be available on Windows");
+        assert!(
+            output.status.success(),
+            "icacls /setintegritylevel failed on {}: stdout={} stderr={}",
+            path.display(),
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        // Verify the override actually neutralised any inherited Low IL.
+        assert!(
+            !test_read_has_low_il_ace(path),
+            "test_strip_inherited_label({}): path still carries Low IL after \
+             icacls /setintegritylevel medium — the host's inheritance state \
+             may be unusual",
+            path.display(),
+        );
+    }
+
+    /// Create an NTFS directory junction at `link` pointing at `target`.
+    /// Uses `cmd /c mklink /J` because there's no std primitive for
+    /// junctions. Junctions don't require admin privileges (unlike
+    /// symbolic links).
+    fn create_junction_for_test(link: &Path, target: &Path) -> std::io::Result<()> {
+        let output = std::process::Command::new("cmd")
+            .args(["/c", "mklink", "/J"])
+            .arg(link)
+            .arg(target)
+            .output()?;
+        if !output.status.success() {
+            return Err(std::io::Error::other(format!(
+                "mklink /J failed: stdout={} stderr={}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr),
+            )));
+        }
+        Ok(())
+    }
+
+    /// Try to create a directory symlink. Returns `None` if the host
+    /// lacks the `SeCreateSymbolicLinkPrivilege` (developer mode off,
+    /// not running elevated); tests that depend on a directory symlink
+    /// should soft-skip in that case.
+    fn try_create_dir_symlink_or_skip(target: &Path, link: &Path) -> Option<()> {
+        match std::os::windows::fs::symlink_dir(target, link) {
+            Ok(()) => Some(()),
+            // ERROR_PRIVILEGE_NOT_HELD = 1314
+            Err(e) if e.raw_os_error() == Some(1314) => {
+                eprintln!(
+                    "test skipped: dir symlink creation requires developer mode or \
+                     SeCreateSymbolicLinkPrivilege"
+                );
+                None
+            }
+            Err(e) => panic!("unexpected symlink_dir error: {e}"),
+        }
+    }
+
+    /// Try to create a file symlink. Same soft-skip contract as
+    /// [`try_create_dir_symlink_or_skip`].
+    fn try_create_file_symlink_or_skip(target: &Path, link: &Path) -> Option<()> {
+        match std::os::windows::fs::symlink_file(target, link) {
+            Ok(()) => Some(()),
+            Err(e) if e.raw_os_error() == Some(1314) => {
+                eprintln!(
+                    "test skipped: file symlink creation requires developer mode or \
+                     SeCreateSymbolicLinkPrivilege"
+                );
+                None
+            }
+            Err(e) => panic!("unexpected symlink_file error: {e}"),
+        }
+    }
+
+    // ── `is_reparse_point` helper tests ──────────────────────────────
+
+    #[test]
+    fn is_reparse_point_returns_false_for_regular_directory() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let plain = tmp.path().join("plain-dir");
+        std::fs::create_dir_all(&plain).unwrap();
+        let meta = std::fs::symlink_metadata(&plain).expect("symlink_metadata");
+        assert!(
+            !is_reparse_point(&meta),
+            "regular directory must not be flagged as a reparse point"
+        );
+    }
+
+    #[test]
+    fn is_reparse_point_detects_junction() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let target = tmp.path().join("target-dir");
+        let junction = tmp.path().join("junction-link");
+        std::fs::create_dir_all(&target).unwrap();
+        create_junction_for_test(&junction, &target).expect("mklink /J must succeed");
+
+        let meta = std::fs::symlink_metadata(&junction).expect("symlink_metadata of junction");
+        assert!(
+            is_reparse_point(&meta),
+            "is_reparse_point must catch NTFS directory junctions \
+             (IO_REPARSE_TAG_MOUNT_POINT) — the gap that Phase 46.2's \
+             `is_symlink()` check missed"
+        );
+    }
+
+    #[test]
+    fn is_reparse_point_detects_directory_symlink() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let target = tmp.path().join("real-dir");
+        let link = tmp.path().join("symlink");
+        std::fs::create_dir_all(&target).unwrap();
+        if try_create_dir_symlink_or_skip(&target, &link).is_none() {
+            return;
+        }
+
+        let meta = std::fs::symlink_metadata(&link).expect("symlink_metadata of link");
+        assert!(
+            is_reparse_point(&meta),
+            "is_reparse_point must catch directory symbolic links"
+        );
+    }
+
+    // ── Oracle tests ─────────────────────────────────────────────────
+
+    #[test]
+    fn test_read_has_low_il_ace_returns_false_on_unlabelled_path() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        // Sever any inherited Low IL from `%TEMP%` (some dev/CI hosts
+        // carry a persistent label there from prior Phase 46.2 work).
+        test_strip_inherited_label(tmp.path());
+        let plain = tmp.path().join("unlabelled");
+        std::fs::create_dir_all(&plain).unwrap();
+        assert!(
+            !test_read_has_low_il_ace(&plain),
+            "freshly-created directory must not carry a Low IL ACE"
+        );
+    }
+
+    #[test]
+    fn test_read_has_low_il_ace_returns_true_after_apply() {
+        reset_labelled_roots_cache_for_tests();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let target = tmp.path().join("apply-target");
+        std::fs::create_dir_all(&target).unwrap();
+        apply_low_il_label(&target).expect("apply must succeed on a regular dir");
+        assert!(
+            test_read_has_low_il_ace(&target),
+            "after apply_low_il_label, the on-disk SACL must carry the \
+             OICI+NW+LowIL ACE shape the oracle expects"
+        );
+    }
+
+    // ── Root-refusal contract (§2.2) ─────────────────────────────────
+
+    #[test]
+    fn apply_low_il_label_refuses_reparse_point_root_junction() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        test_strip_inherited_label(tmp.path());
+        let target = tmp.path().join("junction-target");
+        let junction = tmp.path().join("junction-root");
+        std::fs::create_dir_all(&target).unwrap();
+        create_junction_for_test(&junction, &target).expect("mklink /J");
+
+        match apply_low_il_label(&junction) {
+            Err(SandboxError::ProfileRenderFailed { reason }) => {
+                assert!(
+                    reason.contains("reparse point"),
+                    "error must name `reparse point`: {reason}"
+                );
+            }
+            Ok(()) => panic!(
+                "apply_low_il_label MUST refuse a junction root \
+                 (S1 contract); the silent-follow behaviour is the \
+                 Phase 46.2 gap this PR closes"
+            ),
+            Err(other) => panic!("expected ProfileRenderFailed, got {other:?}"),
+        }
+
+        // Independent assertion via the test oracle: the junction's
+        // target must NOT have been labelled. A regression that
+        // accidentally follows the junction would fail this.
+        assert!(
+            !test_read_has_low_il_ace(&target),
+            "junction target must NOT carry Low IL — the root refusal \
+             must reject BEFORE any SetNamedSecurityInfoW call"
+        );
+    }
+
+    #[test]
+    fn apply_low_il_label_refuses_reparse_point_root_symlink() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        test_strip_inherited_label(tmp.path());
+        let target = tmp.path().join("symlink-target");
+        let symlink = tmp.path().join("symlink-root");
+        std::fs::create_dir_all(&target).unwrap();
+        if try_create_dir_symlink_or_skip(&target, &symlink).is_none() {
+            return;
+        }
+
+        match apply_low_il_label(&symlink) {
+            Err(SandboxError::ProfileRenderFailed { reason }) => {
+                assert!(
+                    reason.contains("reparse point"),
+                    "error must name `reparse point`: {reason}"
+                );
+            }
+            Ok(()) => panic!("apply_low_il_label MUST refuse a symlink root"),
+            Err(other) => panic!("expected ProfileRenderFailed, got {other:?}"),
+        }
+
+        assert!(
+            !test_read_has_low_il_ace(&target),
+            "symlink target must NOT carry Low IL — root refusal precedes \
+             any label syscall"
+        );
+    }
+
+    #[test]
+    fn apply_low_il_label_root_refusal_message_is_truthful() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let target = tmp.path().join("truth-target");
+        let junction = tmp.path().join("truth-junction");
+        std::fs::create_dir_all(&target).unwrap();
+        create_junction_for_test(&junction, &target).expect("mklink /J");
+
+        let err = apply_low_il_label(&junction).expect_err("must refuse the junction root");
+        let reason = match err {
+            SandboxError::ProfileRenderFailed { reason } => reason,
+            other => panic!("expected ProfileRenderFailed, got {other:?}"),
+        };
+
+        // Path appears so users can identify which root is at fault.
+        assert!(
+            reason.contains(&junction.display().to_string()),
+            "error must name the offending path: {reason}"
+        );
+
+        // Truthful workaround #1: replace the reparse point.
+        assert!(
+            reason.contains("Replace the reparse point"),
+            "error must offer 'replace with regular directory' as the \
+             universal workaround: {reason}"
+        );
+
+        // Truthful workaround #2: TMP/TEMP for the tmpdir case.
+        assert!(
+            reason.contains("TMP") && reason.contains("TEMP"),
+            "error must name the TMP/TEMP env-var workaround for the \
+             tmpdir case: {reason}"
+        );
+
+        // Truthful workaround #3: --no-sandbox as universal fallback.
+        assert!(
+            reason.contains("--no-sandbox"),
+            "error must name --no-sandbox as the universal fallback: {reason}"
+        );
+
+        // Disclaimer: sandboxWriteDirs does NOT bypass for built-in roots.
+        // This is the assertion that pins the GPT-flagged misleading
+        // workaround from the original PR-1 plan — if a future regression
+        // re-introduces 'declare via sandboxWriteDirs' as the only fix,
+        // this assertion fails.
+        assert!(
+            reason.contains("sandboxWriteDirs cannot bypass")
+                || reason.contains("cannot bypass this refusal"),
+            "error must explicitly disclaim sandboxWriteDirs as a bypass \
+             for built-in roots: {reason}"
+        );
+    }
+
+    // ── Walk-skip contract (§2.3) ────────────────────────────────────
+
+    #[test]
+    fn relabel_walk_does_not_label_junction_target_contents() {
+        reset_labelled_roots_cache_for_tests();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        test_strip_inherited_label(tmp.path());
+
+        // The allow-set root we'll label.
+        let allow_root = tmp.path().join("allow-root");
+        std::fs::create_dir_all(&allow_root).unwrap();
+
+        // An "outside" subtree the test owns but that lives OUTSIDE the
+        // allow-set tree we'll label.
+        let outside = tmp.path().join("outside-tree");
+        let outside_subdir = outside.join("subdir");
+        let outside_file = outside.join("secret.txt");
+        std::fs::create_dir_all(&outside_subdir).unwrap();
+        std::fs::write(&outside_file, b"secret").unwrap();
+        std::fs::write(outside_subdir.join("nested.txt"), b"nested").unwrap();
+
+        // A junction INSIDE the allow-root pointing OUT to the
+        // outside subtree. This is the planted-attack shape S1
+        // addresses.
+        let junction_inside = allow_root.join("junction-escape");
+        create_junction_for_test(&junction_inside, &outside).expect("mklink /J");
+
+        // Run the label. Walks the allow-root tree, finds the junction
+        // inside, must SKIP it without descending or labelling.
+        apply_low_il_label(&allow_root).expect("label allow-root");
+
+        // Allow-root itself must be labelled.
+        assert!(
+            test_read_has_low_il_ace(&allow_root),
+            "allow-set root must carry Low IL after apply"
+        );
+
+        // The S1 contract: the junction's target tree must NOT be labelled.
+        assert!(
+            !test_read_has_low_il_ace(&outside),
+            "junction target must NOT be labelled — walking through the \
+             junction would escape the allow-set"
+        );
+        assert!(
+            !test_read_has_low_il_ace(&outside_subdir),
+            "junction-target subdir must NOT be labelled"
+        );
+        assert!(
+            !test_read_has_low_il_ace(&outside_file),
+            "junction-target file must NOT be labelled"
+        );
+    }
+
+    #[test]
+    fn relabel_walk_does_not_label_symlink_target() {
+        reset_labelled_roots_cache_for_tests();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        test_strip_inherited_label(tmp.path());
+        let allow_root = tmp.path().join("symlink-allow-root");
+        std::fs::create_dir_all(&allow_root).unwrap();
+
+        // Outside target file the symlink points at.
+        let outside_file = tmp.path().join("outside-secret.txt");
+        std::fs::write(&outside_file, b"secret").unwrap();
+
+        // File symlink inside the allow-set pointing OUT.
+        let symlink_inside = allow_root.join("symlink-escape");
+        if try_create_file_symlink_or_skip(&outside_file, &symlink_inside).is_none() {
+            return;
+        }
+
+        apply_low_il_label(&allow_root).expect("label allow-root");
+
+        assert!(
+            test_read_has_low_il_ace(&allow_root),
+            "allow-set root must carry Low IL"
+        );
+        assert!(
+            !test_read_has_low_il_ace(&outside_file),
+            "symlink target must NOT be labelled — labelling the symlink \
+             would cause SetNamedSecurityInfoW to follow it and apply \
+             Low IL to the target file outside the allow-set"
         );
     }
 }
