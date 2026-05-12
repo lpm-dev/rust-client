@@ -112,6 +112,17 @@ x509-parser = "0.16"
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
+[features]
+# Build with `--features dhat-heap` to instrument heap allocations.
+# Outputs dhat-heap.json on exit — view at https://nnethercote.github.io/dh_view/dh_view.html
+# Usage: cargo build -p lpm-cli --features dhat-heap
+#        cd bench/fixture-large && ../../target/debug/lpm-rs install
+dhat-heap = ["dep:dhat"]
+
+[dependencies.dhat]
+version = "0.3"
+optional = true
+
 [dev-dependencies]
 wiremock = "0.6"
 

@@ -2290,7 +2290,19 @@ fn spawn_background_update_check() {
     let _ = cmd.spawn(); // fire-and-forget
 }
 
+// Heap-allocation profiling. Gate behind feature so release builds pay zero cost.
+// Build: cargo build -p lpm-cli --features dhat-heap
+// Run:   cd bench/fixture-large && ../../target/debug/lpm-rs install
+// View:  open dhat-heap.json at https://nnethercote.github.io/dh_view/dh_view.html
+#[cfg(feature = "dhat-heap")]
+#[global_allocator]
+static ALLOC: dhat::Alloc = dhat::Alloc;
+
 fn main() -> Result<()> {
+    // dhat profiler must be the first live value — it instruments the
+    // allocator for the entire process lifetime and flushes on drop.
+    #[cfg(feature = "dhat-heap")]
+    let _dhat = dhat::Profiler::new_heap();
     if argv_requests_top_level_version(std::env::args_os()) {
         print_version_with_notice();
         return Ok(());
