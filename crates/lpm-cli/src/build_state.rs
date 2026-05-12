@@ -507,9 +507,27 @@ pub fn compute_blocked_packages_with_metadata(
             // worst-wins. Populated unconditionally (not gated on
             // `script-policy`) per plan §5.1 — the annotation is
             // user-visible UX in all three modes.
+            //
+            // Phase 46b Lever #4: pass identity context so a
+            // delegate-to-local-file + matching identity body
+            // surfaces as Green in the UI's blocked-set annotation
+            // (consistent with what the install pipeline's amber-
+            // filter at `collect_amber_classification_requests`
+            // sees). The two call sites MUST agree on the tier or a
+            // package can show "amber" in the blocked-set display
+            // while being silently excluded from the advisor's
+            // amber set.
+            let repository = read_manifest_repository(&pkg_dir);
+            let ctx = lpm_security::static_gate::ManifestContext {
+                package_name: name.as_str(),
+                repository: repository.as_deref(),
+                bin_names: &[],
+            };
             let static_tier: Option<lpm_security::triage::StaticTier> = phase_bodies
                 .iter()
-                .map(|(_, body)| lpm_security::static_gate::classify(body))
+                .map(|(_, body)| {
+                    lpm_security::static_gate::classify_with_context(body, Some(&ctx))
+                })
                 .reduce(lpm_security::triage::StaticTier::worse_of);
 
             // Strict gate query. Phase 4 binds approvals to

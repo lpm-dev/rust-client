@@ -7940,6 +7940,7 @@ fn collect_amber_classification_requests(
     store: &lpm_store::PackageStore,
     packages: &[(String, String, Option<String>)],
 ) -> Vec<crate::triage_advisor_session::AmberPackageRequest> {
+    use lpm_security::static_gate::ManifestContext;
     use lpm_security::triage::StaticTier;
     let mut out = Vec::new();
     for (name, version, integrity) in packages {
@@ -7948,6 +7949,17 @@ fn collect_amber_classification_requests(
         if bodies.is_empty() {
             continue;
         }
+        // Phase 46b Lever #1 / #4 — read the package's `repository`
+        // URL from the same store package.json. Used both for the L4
+        // advisor prompt (#1) and the L1 classifier widening (#4)
+        // that converts delegate-to-local-file + matching identity
+        // into Green.
+        let repository = crate::build_state::read_manifest_repository(&pkg_dir);
+        let ctx = ManifestContext {
+            package_name: name.as_str(),
+            repository: repository.as_deref(),
+            bin_names: &[],
+        };
         // Classify each phase independently; collect those that
         // resolve to Amber/AmberLlm. The advisor needs the per-phase
         // body to make a per-phase judgement; the session then
@@ -7956,7 +7968,7 @@ fn collect_amber_classification_requests(
             .into_iter()
             .filter(|(_, body)| {
                 matches!(
-                    lpm_security::static_gate::classify(body),
+                    lpm_security::static_gate::classify_with_context(body, Some(&ctx)),
                     StaticTier::Amber | StaticTier::AmberLlm
                 )
             })
@@ -7970,16 +7982,6 @@ fn collect_amber_classification_requests(
         // different sources produces TWO distinct approval keys
         // downstream — required so an approval on one source cannot
         // leak to a sibling source in the same install.
-        //
-        // Phase 46b Lever #1: read the package's `repository` URL
-        // from the same store package.json. The advisor uses this to
-        // pair the script body with the package's claimed identity
-        // (e.g. `node install.js` + `github.com/lovell/sharp` ↔
-        // sharp's known prebuilt-binary downloader). `None` when the
-        // manifest doesn't declare the field — the prompt renders
-        // `<none>` so the model knows the field is missing rather
-        // than redacted.
-        let repository = crate::build_state::read_manifest_repository(&pkg_dir);
         out.push(crate::triage_advisor_session::AmberPackageRequest {
             name: name.clone(),
             version: version.clone(),
