@@ -694,6 +694,20 @@ fn platform_backend(
 /// fresh project would fail without this helper — they'd try to
 /// create `.husky` themselves and hit the sandbox rule gap.
 ///
+/// Phase 46.2 (2026-05-12): also pre-creates every entry of
+/// `spec.extra_write_dirs`. Before this, a user-declared
+/// `sandboxWriteDirs: ["build-output"]` entry would be accepted by
+/// the validator and then silently denied at runtime — the Windows
+/// backend's `apply_low_il_label` skips nonexistent paths, the
+/// script would try to `mkdir build-output` against a Medium-IL
+/// `project_dir` it can't write to, and the install would fail. The
+/// Seatbelt + landlock backends had the same hazard but it was less
+/// visible because POSIX `mkdir` against a Medium-IL parent fails
+/// with a clearer message; on Windows the failure mode was an opaque
+/// ERROR_ACCESS_DENIED. Pre-creating means every `extra_write_dirs`
+/// entry exists when `apply_low_il_label` / landlock / Seatbelt sees
+/// it, so the label / rule actually lands and the script can write.
+///
 /// Callers (build.rs production path + compat-corpus test fixtures)
 /// invoke this once before spawning scripts. Paths that already
 /// exist are left alone.
@@ -702,7 +716,10 @@ fn platform_backend(
 /// reason so the caller can distinguish "sandbox couldn't prep the
 /// filesystem" from "the sandbox itself failed."
 pub fn prepare_writable_dirs(spec: &SandboxSpec) -> Result<(), SandboxError> {
-    let candidates = [
+    // Built-in writable subpaths first. These mirror the
+    // standard-allow-set entries every backend renders into its
+    // profile / ruleset / IL label.
+    let builtin = [
         spec.project_dir.join(".husky"),
         spec.project_dir.join(".lpm"),
         spec.project_dir.join("node_modules"),
@@ -710,19 +727,34 @@ pub fn prepare_writable_dirs(spec: &SandboxSpec) -> Result<(), SandboxError> {
         spec.home_dir.join(".node-gyp"),
         spec.home_dir.join(".npm"),
     ];
-    for p in &candidates {
-        if !p.exists()
-            && let Err(e) = std::fs::create_dir_all(p)
-        {
-            return Err(SandboxError::InvalidSpec {
-                reason: format!(
-                    "failed to prepare writable dir {}: {e}. The sandbox needs \
-                         this path to exist before scripts run — see \
-                         `prepare_writable_dirs` docs.",
-                    p.display()
-                ),
-            });
-        }
+    for p in &builtin {
+        ensure_writable_dir_exists(p)?;
+    }
+
+    // Then user-declared `sandboxWriteDirs`. These have already been
+    // validated by `load_sandbox_write_dirs` — joined-with-project
+    // for relative entries, dangerous-root + allowlist + traversal
+    // checked. Creating them here closes the
+    // "declared-but-not-yet-on-disk" gap that would otherwise
+    // surface as a runtime denial on Windows.
+    for p in &spec.extra_write_dirs {
+        ensure_writable_dir_exists(p)?;
+    }
+    Ok(())
+}
+
+fn ensure_writable_dir_exists(p: &std::path::Path) -> Result<(), SandboxError> {
+    if !p.exists()
+        && let Err(e) = std::fs::create_dir_all(p)
+    {
+        return Err(SandboxError::InvalidSpec {
+            reason: format!(
+                "failed to prepare writable dir {}: {e}. The sandbox needs \
+                     this path to exist before scripts run — see \
+                     `prepare_writable_dirs` docs.",
+                p.display()
+            ),
+        });
     }
     Ok(())
 }
@@ -1063,6 +1095,59 @@ mod tests {
             "legacy partner flag must be gone: {s}",
         );
         assert!(s.contains("script-policy = deny"));
+    }
+
+    /// Phase 46.2 follow-up: every entry of `spec.extra_write_dirs`
+    /// must exist on disk after `prepare_writable_dirs` returns.
+    /// Without this, a user-declared `sandboxWriteDirs: ["build-output"]`
+    /// would survive validation but be silently denied at runtime
+    /// (the Windows backend's `apply_low_il_label` skips nonexistent
+    /// paths, the script then tries `mkdir build-output` against a
+    /// Medium-IL `project_dir`, and fails with ERROR_ACCESS_DENIED).
+    #[test]
+    fn prepare_writable_dirs_creates_extra_write_dirs() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let project = tmp.path().join("proj");
+        let home = tmp.path().join("home");
+        let extra_a = project.join("build-output");
+        let extra_b = tmp.path().join("siblings").join("dist");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::create_dir_all(&home).unwrap();
+
+        let spec = SandboxSpec {
+            package_dir: tmp.path().join("pkg"),
+            project_dir: project.clone(),
+            package_name: "p".into(),
+            package_version: "1.0.0".into(),
+            store_root: tmp.path().join("store"),
+            home_dir: home.clone(),
+            tmpdir: tmp.path().join("tmpdir"),
+            extra_write_dirs: vec![extra_a.clone(), extra_b.clone()],
+        };
+        std::fs::create_dir_all(&spec.package_dir).unwrap();
+        std::fs::create_dir_all(&spec.tmpdir).unwrap();
+
+        prepare_writable_dirs(&spec).expect("prep must succeed");
+
+        // Builtins:
+        assert!(project.join(".husky").exists(), "missing .husky");
+        assert!(project.join(".lpm").exists(), "missing .lpm");
+        assert!(project.join("node_modules").exists(), "missing node_modules");
+        assert!(home.join(".cache").exists(), "missing .cache");
+        assert!(home.join(".node-gyp").exists(), "missing .node-gyp");
+        assert!(home.join(".npm").exists(), "missing .npm");
+
+        // The actual fix:
+        assert!(
+            extra_a.exists() && extra_a.is_dir(),
+            "extra_write_dirs[0] must be pre-created: {}",
+            extra_a.display()
+        );
+        assert!(
+            extra_b.exists() && extra_b.is_dir(),
+            "extra_write_dirs[1] must be pre-created even when its parent didn't exist: {}",
+            extra_b.display()
+        );
     }
 
     #[test]
