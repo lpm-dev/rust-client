@@ -1074,13 +1074,16 @@ fn execute_script(
     // from the sanitized set, strip INIT_CWD + PATH if the caller
     // pre-set them, then append our own INIT_CWD and PATH-with-
     // node_modules/.bin-prepended.
-    let path_value = format!(
-        "{}:{}",
-        project_dir.join("node_modules/.bin").display(),
-        env.get("PATH")
-            .map(|s| s.as_str())
-            .unwrap_or("/usr/bin:/bin"),
-    );
+    //
+    // Phase 46.2 (2026-05-12): the path string is platform-aware
+    // now. Pre-46.2 the helper hardcoded the POSIX `:` separator and
+    // the POSIX `/usr/bin:/bin` fallback, which produced a malformed
+    // PATH on Windows: the local `node_modules\.bin` shim got fused
+    // into the same entry as the inherited system PATH and neither
+    // resolved, so commands like `tsc`, `webpack`, or any sibling-
+    // package binary were invisible to lifecycle scripts even though
+    // the sandbox itself succeeded.
+    let path_value = build_lifecycle_path(project_dir, env.get("PATH").map(|s| s.as_str()));
     let mut envs: Vec<(String, String)> = env
         .iter()
         .filter(|(k, _)| k.as_str() != "PATH" && k.as_str() != "INIT_CWD")
@@ -1446,6 +1449,61 @@ fn spawn_lifecycle_child(
     sandbox
         .spawn(sbcmd)
         .map_err(|e| format!("failed to spawn: {e}"))
+}
+
+/// Compose the `PATH` env var passed to a lifecycle script. Prepends
+/// the project's `node_modules/.bin` so locally-installed binaries
+/// shadow system ones (matches npm/yarn/pnpm), then appends either
+/// the inherited PATH if the caller provided one or a minimal
+/// platform-appropriate fallback.
+///
+/// Platform-aware on both axes:
+/// - **Separator**: `:` on POSIX, `;` on Windows.
+/// - **`.bin` shape**: `node_modules/.bin` resolves identically on
+///   both platforms (Windows accepts forward slashes), but we render
+///   via `Path::join` + `Path::display` so the produced string uses
+///   the host's native separator.
+/// - **Fallback**: `/usr/bin:/bin` on POSIX is the long-standing
+///   minimum. Windows gets `C:\Windows\System32;C:\Windows;C:\Windows\System32\Wbem`
+///   — System32 for `cmd.exe` / `where.exe` / OS DLLs, the bare
+///   Windows dir for the small set of binaries that live one level
+///   up, and `Wbem` for `wmic` (rarely used but harmless to keep).
+///   Lifecycle scripts that need PowerShell or Git Bash should
+///   declare them via the existing PATH passthrough, not rely on
+///   this fallback.
+///
+/// Pre-Phase-46.2 this was inlined with hardcoded POSIX separators
+/// and fallback. The Windows sandbox spawn would then succeed but
+/// produce a malformed PATH (`node_modules\.bin:<parent-path>`),
+/// rendering local shims invisible to scripts even though the
+/// sandbox itself was working correctly.
+fn build_lifecycle_path(project_dir: &Path, parent_path: Option<&str>) -> String {
+    let bin_dir = project_dir.join("node_modules").join(".bin");
+    #[cfg(unix)]
+    {
+        format!(
+            "{}:{}",
+            bin_dir.display(),
+            parent_path.unwrap_or("/usr/bin:/bin"),
+        )
+    }
+    #[cfg(windows)]
+    {
+        format!(
+            "{};{}",
+            bin_dir.display(),
+            parent_path
+                .unwrap_or(r"C:\Windows\System32;C:\Windows;C:\Windows\System32\Wbem"),
+        )
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        format!(
+            "{}:{}",
+            bin_dir.display(),
+            parent_path.unwrap_or("/usr/bin:/bin"),
+        )
+    }
 }
 
 /// Pick the right shell program + argv to run a lifecycle script's
@@ -5559,6 +5617,61 @@ mod tests {
             args,
             vec!["-c".to_string(), "node install.js".to_string()],
             "POSIX hosts must run lifecycle scripts under sh -c"
+        );
+    }
+
+    /// Phase 46.2 follow-up: the lifecycle PATH must use the host's
+    /// native separator and a non-empty fallback for the case where
+    /// the caller didn't pass through a parent PATH. The pre-46.2
+    /// helper inlined POSIX `:` + `/usr/bin:/bin`, producing
+    /// `node_modules\.bin:<parent>` on Windows — a single malformed
+    /// entry that no PATH lookup would resolve.
+    #[cfg(windows)]
+    #[test]
+    fn build_lifecycle_path_uses_semicolon_and_system32_on_windows() {
+        let project = std::path::PathBuf::from(r"C:\proj");
+        // With an inherited parent PATH.
+        let with_parent =
+            build_lifecycle_path(&project, Some(r"C:\OtherTool\bin;C:\Windows\System32"));
+        assert!(
+            with_parent.starts_with(r"C:\proj\node_modules\.bin;"),
+            "node_modules\\.bin must lead the PATH with a `;` separator: {with_parent}"
+        );
+        assert!(
+            with_parent.contains(r"C:\OtherTool\bin"),
+            "inherited parent PATH must be appended: {with_parent}"
+        );
+
+        // Without an inherited parent PATH (fallback path).
+        let fallback = build_lifecycle_path(&project, None);
+        assert!(
+            fallback.starts_with(r"C:\proj\node_modules\.bin;"),
+            "fallback PATH must still lead with node_modules\\.bin: {fallback}"
+        );
+        assert!(
+            fallback.contains(r"C:\Windows\System32"),
+            "fallback must include System32 so cmd.exe / where.exe resolve: {fallback}"
+        );
+        assert!(
+            !fallback.contains("/usr/bin"),
+            "fallback must NOT leak POSIX defaults on Windows: {fallback}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn build_lifecycle_path_uses_colon_and_usr_bin_on_unix() {
+        let project = std::path::PathBuf::from("/proj");
+        let with_parent = build_lifecycle_path(&project, Some("/opt/tool/bin:/usr/local/bin"));
+        assert!(
+            with_parent.starts_with("/proj/node_modules/.bin:"),
+            "node_modules/.bin must lead with `:` separator: {with_parent}"
+        );
+
+        let fallback = build_lifecycle_path(&project, None);
+        assert!(
+            fallback.starts_with("/proj/node_modules/.bin:/usr/bin:/bin"),
+            "fallback must keep the historical POSIX shape: {fallback}"
         );
     }
 }

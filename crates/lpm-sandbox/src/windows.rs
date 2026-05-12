@@ -73,6 +73,7 @@ use crate::{
     Sandbox, SandboxError, SandboxMode, SandboxOptions, SandboxPosture, SandboxSpec,
     SandboxedCommand,
 };
+use std::collections::HashSet;
 use std::ffi::OsStr;
 use std::os::windows::ffi::OsStrExt;
 use std::os::windows::io::AsRawHandle;
@@ -432,8 +433,18 @@ fn writable_allow_set(spec: &SandboxSpec) -> Vec<PathBuf> {
 /// tree once per install fixes this at the cost of one
 /// `SetNamedSecurityInfoW` per existing descendant.
 ///
+/// **Per-process caching.** Every call consults [`LABELED_ROOTS`]
+/// before doing any kernel work. Once a path is labelled by this
+/// process it stays Low-IL until external action changes the SACL,
+/// so re-walking on every `Sandbox::spawn` would be pure waste — an
+/// install with N lifecycle scripts would do N full walks over
+/// `~/.cache`, `~/.npm`, `~/.node-gyp`, and tmpdir. New files created
+/// inside the dir between two spawns inherit Low IL automatically
+/// via OICI, so the second spawn doesn't need to re-touch them.
+///
 /// Idempotent: if `path` is already labelled Low IL, the second
-/// `SetNamedSecurityInfoW` call is a no-op.
+/// `SetNamedSecurityInfoW` call would also be a no-op, but skipping
+/// it entirely via the cache is faster.
 ///
 /// Errors on the root surface as [`SandboxError::ProfileRenderFailed`]
 /// with the path + Win32 last-error code so denial messages remain
@@ -446,15 +457,32 @@ fn writable_allow_set(spec: &SandboxSpec) -> Vec<PathBuf> {
 ///
 /// Paths that don't exist yet are silently skipped — the install
 /// pipeline calls [`crate::prepare_writable_dirs`] first, which
-/// creates the standard subset, and per-package `extra_write_dirs`
-/// that don't exist resolve to a no-op rather than a fatal error
-/// (matching landlock's "missing rule path = skip with a debug log"
-/// posture).
+/// creates the standard subset + `extra_write_dirs`. Any path that
+/// still doesn't exist at this point (rare) resolves to a no-op
+/// rather than a fatal error (matching landlock's "missing rule
+/// path = skip with a debug log" posture).
 fn apply_low_il_label(path: &Path) -> Result<(), SandboxError> {
     if !path.exists() {
         tracing::debug!(
             target: "lpm_sandbox::windows",
             "skip Low IL label on nonexistent path {}",
+            path.display(),
+        );
+        return Ok(());
+    }
+
+    // Fast-path: was this exact path labelled earlier in this
+    // process? Canonicalize first so a caller passing `C:\foo`,
+    // `C:\foo\`, and the same path with a `\\?\` extended prefix
+    // all hit the same cache entry. Canonicalization can fail
+    // (junctions, locked dirs); if it does we fall through and
+    // re-label, which is correct (idempotent at the kernel layer)
+    // just slower.
+    let cache_key = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    if labelled_cache_contains(&cache_key) {
+        tracing::debug!(
+            target: "lpm_sandbox::windows",
+            "skip Low IL label on already-labelled path {}",
             path.display(),
         );
         return Ok(());
@@ -478,7 +506,48 @@ fn apply_low_il_label(path: &Path) -> Result<(), SandboxError> {
         relabel_existing_descendants(path, sacl_ptr);
     }
 
+    // Cache the labelled root so subsequent spawns in the same lpm
+    // process skip the walk. New files created inside this dir by
+    // the lifecycle child inherit Low IL automatically (OICI), so
+    // the second spawn doesn't need to retouch them.
+    labelled_cache_insert(cache_key);
+
     Ok(())
+}
+
+/// Process-wide memo: which paths have already been Low-IL-labelled
+/// by this lpm process. See [`apply_low_il_label`] for the rationale.
+///
+/// Lifetime is the lpm process. Killing + restarting lpm clears the
+/// cache, which is correct: external actors (Windows updates,
+/// `icacls /reset`) could have stripped the label and we'd want to
+/// reapply it.
+///
+/// Stored as `Option<HashSet>` because `HashSet::new()` isn't `const`
+/// on stable Rust; we lazy-init on first access. A poisoned mutex
+/// (some other thread panicked while holding the lock) is recovered
+/// rather than propagated — losing the cache wastes work but
+/// shouldn't fail the install.
+static LABELED_ROOTS: Mutex<Option<HashSet<PathBuf>>> = Mutex::new(None);
+
+fn labelled_cache_contains(path: &Path) -> bool {
+    let cache = LABELED_ROOTS.lock().unwrap_or_else(|p| p.into_inner());
+    cache.as_ref().is_some_and(|s| s.contains(path))
+}
+
+fn labelled_cache_insert(path: PathBuf) {
+    let mut cache = LABELED_ROOTS.lock().unwrap_or_else(|p| p.into_inner());
+    cache.get_or_insert_with(HashSet::new).insert(path);
+}
+
+/// Test-only: drop every cached entry. Lets the per-test isolated
+/// specs (which build fresh tempdirs each test) actually exercise
+/// the full label path instead of hitting a poisoned cache from an
+/// earlier test in the same binary.
+#[cfg(test)]
+fn reset_labelled_roots_cache_for_tests() {
+    let mut cache = LABELED_ROOTS.lock().unwrap_or_else(|p| p.into_inner());
+    *cache = Some(HashSet::new());
 }
 
 /// Build the SDDL-derived security descriptor for the Low IL
@@ -1336,6 +1405,52 @@ mod tests {
         let nonexistent = PathBuf::from(r"C:\lpm-sandbox-test-nonexistent-46.2");
         assert!(!nonexistent.exists(), "guard: path must not exist");
         apply_low_il_label(&nonexistent).expect("nonexistent path must be a no-op skip, not error");
+    }
+
+    /// Phase 46.2 follow-up — re-labelling the same root twice in
+    /// the same process must hit the cache fast-path and skip the
+    /// recursive walk. Without the cache, installs with multiple
+    /// lifecycle scripts would re-walk every existing descendant of
+    /// `~/.cache`, `~/.npm`, `~/.node-gyp`, and tmpdir once per
+    /// script — a Windows-only performance regression that wouldn't
+    /// surface in single-script installs.
+    ///
+    /// We pin the cache behavior via the labelled_cache_contains
+    /// helper rather than timing because (a) the first label
+    /// already shouldn't be slow on a tiny tempdir and (b) timing
+    /// assertions are flaky under CI load.
+    #[test]
+    fn apply_low_il_label_is_cached_per_process() {
+        reset_labelled_roots_cache_for_tests();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let target = tmp.path().join("cache-pin");
+        std::fs::create_dir_all(&target).unwrap();
+        // Seed a file inside so the recursive walk has something
+        // non-trivial to do on the first call.
+        std::fs::write(target.join("seed.txt"), b"hello").unwrap();
+
+        let canonical = std::fs::canonicalize(&target).expect("canonicalize");
+        assert!(
+            !labelled_cache_contains(&canonical),
+            "cache must start empty after reset"
+        );
+
+        apply_low_il_label(&target).expect("first label must succeed");
+        assert!(
+            labelled_cache_contains(&canonical),
+            "first label must populate the cache so subsequent spawns skip the walk"
+        );
+
+        // Second call: hits the fast-path. The contract is "no
+        // error" + "still cached"; the actual short-circuit lives
+        // inside apply_low_il_label, observable through a
+        // tracing::debug! line in production but not visible from
+        // here. The cache-membership assertion is the durable pin.
+        apply_low_il_label(&target).expect("second label must be a cache hit, not an error");
+        assert!(
+            labelled_cache_contains(&canonical),
+            "cache entry must persist across spawns"
+        );
     }
 
     /// End-to-end Low IL spawn: launch `cmd.exe /c echo` under the
