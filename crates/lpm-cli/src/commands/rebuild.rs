@@ -134,17 +134,20 @@ pub async fn run(
     force: bool,
     timeout_secs: Option<u64>,
     json_output: bool,
-    unsafe_full_env: bool,
     deny_all: bool,
-    // Phase 46 P5 Chunk 2: sandbox flag pair. `no_sandbox` flips
-    // execution to [`SandboxMode::Disabled`] and is only reachable via
-    // `--unsafe-full-env --no-sandbox` at the CLI boundary (main.rs
-    // rejects `--no-sandbox` without the partner flag). `sandbox_log`
-    // flips to [`SandboxMode::LogOnly`] — strictly diagnostic, never
-    // a soft-enforcement substitute per Chunk 4 signoff. Both default
-    // to `false` so every code path that calls `rebuild::run` lands on
-    // [`SandboxMode::Enforce`] unless the user explicitly opts out.
+    // Phase 46 P5 Chunk 2 / Phase 46.1 rework (2026-05-11): sandbox
+    // flag trio. `no_sandbox` flips execution to
+    // [`SandboxMode::Disabled`] AND skips env scrubbing (Q6 collapse —
+    // the legacy `--unsafe-full-env` partner was removed in the
+    // beta-cleanup pass). `strict_sandbox` opts INTO outbound network
+    // denial via the [`crate::sandbox_config::resolve_sandbox_mode_from_chain`]
+    // precedence resolver. `sandbox_log` flips to
+    // [`SandboxMode::LogOnly`] — strictly diagnostic, never a
+    // soft-enforcement substitute per Chunk 4 signoff. `no_sandbox`
+    // and `strict_sandbox` are mutually exclusive at the clap layer
+    // (`conflicts_with_all`) so they never both arrive `true`.
     no_sandbox: bool,
+    strict_sandbox: bool,
     sandbox_log: bool,
     // Phase 46 P6 Chunk 1: already-resolved effective script policy.
     // The caller (main.rs for `lpm rebuild`, install.rs for autoBuild)
@@ -154,6 +157,15 @@ pub async fn run(
     // → unchanged); Chunk 2 adds tier-based auto-trust for greens
     // under [`ScriptPolicy::Triage`].
     effective_policy: ScriptPolicy,
+    // **Phase 46 slice 1.** In-memory advisor-approved
+    // `(name, version)` set from this install's
+    // [`crate::triage_advisor_session::AdvisorSession`]. Standalone
+    // `lpm rebuild` invocations pass `None` — the trust manifest is
+    // the only authority. The install path's autoBuild call passes
+    // `Some(session.approvals())` so amber packages the advisor
+    // approved this run can execute their scripts without a
+    // persistent `trustedDependencies` entry.
+    advisor_approvals: Option<&std::collections::HashSet<(String, String, Option<String>)>>,
 ) -> Result<(), LpmError> {
     // Phase 64 Round 2: hold the shared store lock across rebuild —
     // it traverses store package dirs to read package.json, compute
@@ -171,11 +183,12 @@ pub async fn run(
             force,
             timeout_secs,
             json_output,
-            unsafe_full_env,
             deny_all,
             no_sandbox,
+            strict_sandbox,
             sandbox_log,
             effective_policy,
+            advisor_approvals,
         ),
     )
     .await
@@ -190,23 +203,24 @@ async fn run_under_store_lock(
     force: bool,
     timeout_secs: Option<u64>,
     json_output: bool,
-    unsafe_full_env: bool,
     deny_all: bool,
     no_sandbox: bool,
+    strict_sandbox: bool,
     sandbox_log: bool,
     effective_policy: ScriptPolicy,
+    // Phase 46 slice 1 — see `run` for the contract.
+    advisor_approvals: Option<&std::collections::HashSet<(String, String, Option<String>)>>,
 ) -> Result<(), LpmError> {
     // Defense-in-depth on the sandbox flag pair. The CLI boundary
-    // (clap `requires = "unsafe_full_env"` on `--no-sandbox`) is the
-    // primary guard, but `rebuild::run` is also reachable from
-    // internal callers (autoBuild during `lpm install`). Asserting
-    // here catches a future caller that wires `no_sandbox=true` while
-    // forgetting `unsafe_full_env=true` — a combination users can
-    // never reach via the parser. Debug-only so release builds stay
-    // hot-path clean.
+    // (clap `conflicts_with_all` on `--no-sandbox` ⊥ `--strict-sandbox`
+    // / `--paranoid`) is the primary guard, but `rebuild::run` is also
+    // reachable from internal callers (autoBuild during `lpm install`).
+    // Asserting here catches a future caller that wires both true —
+    // a combination users can never reach via the parser. Debug-only
+    // so release builds stay hot-path clean.
     debug_assert!(
-        !no_sandbox || unsafe_full_env,
-        "`no_sandbox` requires `unsafe_full_env`; pair them at every call site"
+        !(no_sandbox && strict_sandbox),
+        "`no_sandbox` and `strict_sandbox` are mutually exclusive; never both true"
     );
 
     // Check deny-all: --deny-all flag or lpm.scripts.denyAll config.
@@ -327,6 +341,7 @@ async fn run_under_store_lock(
             force_security_floor,
             &requested_capabilities,
             &user_bound,
+            advisor_approvals,
         );
         let is_trusted = trust_reason.is_trusted();
 
@@ -673,30 +688,61 @@ async fn run_under_store_lock(
     // Execute scripts
     let mut successes = 0usize;
     let mut failures = 0usize;
-    let sanitized_env = if unsafe_full_env {
-        // Pass full environment without stripping — user explicitly opted in
+
+    // Phase 46.1 rework (2026-05-11) + GPT-5 audit follow-up
+    // (2026-05-11): resolve the full sandbox-mode precedence chain
+    // ONCE up front so the env-scrub strategy AND the `SandboxMode`
+    // selection both consult the same resolved state.
+    //
+    // The previous version of this function computed `SandboxMode`
+    // from the `no_sandbox` CLI flag alone and discarded the
+    // resolved mode from the chain — so persistent
+    // `[sandbox] mode = "none"` (set via `lpm config sandbox --set none`
+    // or directly in `lpm.toml` / `~/.lpm/config.toml`) silently
+    // fell back to the enforced default. GPT-5's 2026-05-11 audit
+    // caught that gap; the test
+    // `sandbox_config::tests::decide_runtime_no_flags_config_none_yields_disabled_no_scrub`
+    // pins the corrected contract.
+    //
+    // Note `--no-sandbox` is still passed through the resolver as a
+    // CLI flag — that ensures the precedence ordering inside
+    // `resolve_sandbox_mode_from_chain` and `decide_runtime_sandbox_mode`
+    // is single-sourced and matches `lpm doctor`'s view.
+    let (sandbox_options, resolved_sandbox_mode) =
+        crate::sandbox_config::resolve_sandbox_mode_from_chain(
+            project_dir,
+            no_sandbox,
+            strict_sandbox,
+        )?;
+    let (sandbox_mode, scrub_env) = crate::sandbox_config::decide_runtime_sandbox_mode(
+        no_sandbox,
+        sandbox_log,
+        resolved_sandbox_mode,
+    );
+
+    // Phase 46.1 rework: `--no-sandbox` is the single collapsed
+    // escape — it drops both containment AND env scrubbing in one
+    // flag (per Q6 of the DX redline). The persistent `[sandbox]
+    // mode = "none"` shape has the same runtime semantics, just
+    // sourced from config / the wizard instead of a CLI flag.
+    // `scrub_env=false` covers BOTH paths so the contract is
+    // symmetric.
+    let sanitized_env = if scrub_env {
+        build_sanitized_env()
+    } else {
         if !json_output {
-            output::warn("Using --unsafe-full-env: credential env vars will NOT be stripped.");
+            // Word the warning so it covers BOTH provenance paths
+            // (CLI escape OR persistent `mode = "none"`) without
+            // claiming the source. The `Source:` line on doctor /
+            // help is the right place for provenance; this is the
+            // "loud banner at the call site" the SandboxMode docs
+            // already promise.
+            output::warn(
+                "sandbox disabled: credential env vars will NOT be stripped and scripts run \
+                 WITHOUT filesystem / network containment.",
+            );
         }
         std::env::vars().collect::<HashMap<String, String>>()
-    } else {
-        build_sanitized_env()
-    };
-
-    // Phase 46 P5 Chunk 2: resolve the effective sandbox mode and load
-    // the per-project writable-subpath extensions once before the
-    // loop. The flag pair was already validated at the CLI boundary —
-    // `--no-sandbox` never reaches here without `--unsafe-full-env`,
-    // and `--no-sandbox` + `--sandbox-log` are mutually exclusive —
-    // so this is pure mode selection. §9.6 + Chunk 2 signoff:
-    // SandboxMode is computed at the build call site, NOT encoded in
-    // ScriptPolicyConfig.
-    let sandbox_mode = if no_sandbox {
-        SandboxMode::Disabled
-    } else if sandbox_log {
-        SandboxMode::LogOnly
-    } else {
-        SandboxMode::Enforce
     };
 
     let lpm_root = lpm_common::paths::LpmRoot::from_env()
@@ -766,6 +812,14 @@ async fn run_under_store_lock(
     lpm_sandbox::prepare_writable_dirs(&prepare_spec)
         .map_err(|e| LpmError::Registry(format!("{e}")))?;
 
+    // Phase 46.1 rework GPT-5 audit follow-up: `sandbox_options`
+    // (carrying `allow-degraded` and `deny_outbound_network`) is
+    // already in scope from the resolver call up top. Do NOT
+    // re-resolve here — the previous version did exactly that, but
+    // also threw away the resolved mode, which is the bug GPT-5
+    // caught. The pre-probe + per-package sandbox construction
+    // below consume the up-top `sandbox_options` directly.
+
     // Phase 46 P5 Chunk 4: pre-probe the sandbox factory with a
     // synthetic spec so unsupported-platform and mode-not-supported
     // errors surface BEFORE any banner or package loop starts.
@@ -773,6 +827,12 @@ async fn run_under_store_lock(
     // see the "rule triggers logged but NOT enforced" banner and
     // then get ModeNotSupportedOnPlatform — contradictory UX the
     // Chunk 4 review flagged.
+    //
+    // Phase 46.1 additionally uses the pre-probe to read the
+    // backend's effective [`SandboxPosture`] — if `allow-degraded`
+    // activated the V1 fallback, this is where we emit the
+    // structured per-install stderr warning (exactly once,
+    // regardless of how many scripted packages are about to build).
     //
     // Disabled is skipped: NoopSandbox is available on every
     // platform, so the probe would always succeed and we'd just
@@ -788,19 +848,62 @@ async fn run_under_store_lock(
             tmpdir: tmpdir.clone(),
             extra_write_dirs: Vec::new(),
         };
-        lpm_sandbox::new_for_platform(probe_spec, sandbox_mode)
-            .map_err(|e| LpmError::Registry(format!("sandbox unavailable: {e}")))?;
+        let probe_sandbox = lpm_sandbox::new_for_platform_with_options(
+            probe_spec,
+            sandbox_mode,
+            sandbox_options.clone(),
+        )
+        .map_err(|e| LpmError::Registry(format!("sandbox unavailable: {e}")))?;
+        // Phase 46.1 per-install warning: emitted once when the
+        // probe's effective posture is `Degraded`. The structured
+        // line names kernel + active ABI + missing dimension so log
+        // scrapers can detect the gap mechanically. JSON mode
+        // suppresses it on stderr — the doctor surface still
+        // reports the same posture for tooling consumers.
+        if !json_output && let Some(line) = probe_sandbox.posture().degraded_warning_line() {
+            output::warn(&line);
+        }
+        drop(probe_sandbox);
     }
 
     // Banners fire AFTER the probe succeeds. On Linux + LogOnly the
     // probe above bailed with ModeNotSupportedOnPlatform, so this
     // banner's "logged but NOT enforced" promise never reaches a
     // user whose platform can't actually honor it.
-    if no_sandbox && !json_output {
-        output::warn(
-            "--no-sandbox: lifecycle scripts will run WITHOUT filesystem containment. \
-             Scripts have full host access.",
-        );
+    //
+    // Phase 46.1 rework note: the `--no-sandbox` banner is emitted
+    // up at the `sanitized_env` selector — see the `if no_sandbox`
+    // branch in env construction — so users see "credentials NOT
+    // stripped + no containment" as one combined warning rather
+    // than two split announcements.
+    //
+    // GPT-5 audit (2026-05-11) Low + Medium: the strict banner gate
+    // must consult BOTH the resolved tier and the final SandboxMode.
+    //
+    // Round 1: pre-fix the banner only fired for `--strict-sandbox`
+    // / `--paranoid` on the CLI. Config-set / env-set strict was
+    // silent, contradicting DX-doc walkthroughs W3 / W6 / W8.
+    //
+    // Round 2: once the banner fired for all resolved-Strict
+    // sources, it ALSO fired when `--sandbox-log` was passed with
+    // strict (clap allows that pair, and env/config strict + CLI
+    // `--sandbox-log` can't be clap-rejected at all). But
+    // `decide_runtime_sandbox_mode` collapses to LogOnly in that
+    // case, so the user saw "outbound network will be denied"
+    // immediately followed by "logged but NOT enforced" —
+    // contradictory UX.
+    //
+    // `strict_banner_for_runtime` gates on both axes: only emits
+    // when the final mode is Enforce AND the resolved tier is
+    // Strict. LogOnly / Disabled paths fall through silently —
+    // the existing `--sandbox-log` banner just below + the
+    // `no-sandbox` banner up at the env-scrub site cover those
+    // cases truthfully.
+    if !json_output
+        && let Some(line) =
+            crate::sandbox_config::strict_banner_for_runtime(sandbox_mode, resolved_sandbox_mode)
+    {
+        output::warn(line);
     }
     if sandbox_log && !json_output {
         output::warn(
@@ -879,6 +982,7 @@ async fn run_under_store_lock(
                 &sanitized_env,
                 &timeout,
                 sandbox_mode,
+                &sandbox_options,
                 &extra_write_dirs,
                 &store_root,
                 &home_dir,
@@ -960,6 +1064,7 @@ fn execute_script(
     env: &HashMap<String, String>,
     timeout: &Duration,
     sandbox_mode: SandboxMode,
+    sandbox_options: &lpm_sandbox::SandboxOptions,
     extra_write_dirs: &[PathBuf],
     store_root: &Path,
     home_dir: &Path,
@@ -994,6 +1099,7 @@ fn execute_script(
         project_dir,
         &envs,
         sandbox_mode,
+        sandbox_options,
         extra_write_dirs,
         store_root,
         home_dir,
@@ -1269,15 +1375,16 @@ fn prepare_live_package_dir(
 /// now routes through [`lpm_sandbox::new_for_platform`]: macOS uses
 /// Seatbelt, Linux uses landlock, Windows + other-unix return
 /// [`lpm_sandbox::SandboxError::UnsupportedPlatform`] which bubbles
-/// up as a clear "re-run with --unsafe-full-env --no-sandbox" string
-/// through the format! below. Old Linux kernels (<5.13) surface
+/// up as a clear "re-run with --no-sandbox" string through the
+/// format! below. Old Linux kernels (<5.13) surface
 /// [`lpm_sandbox::SandboxError::KernelTooOld`] symmetric with the
 /// Windows deferral per the Chunk 1 signoff.
 ///
 /// The [`SandboxMode::Disabled`] arm inside the factory hands back a
-/// [`lpm_sandbox::NoopSandbox`] on every platform, so
-/// `--unsafe-full-env --no-sandbox` remains reachable universally
-/// (including Windows) as the single escape hatch.
+/// [`lpm_sandbox::NoopSandbox`] on every platform, so `--no-sandbox`
+/// (Phase 46.1 rework collapsed the legacy `--unsafe-full-env`
+/// partner per Q6) remains reachable universally (including Windows)
+/// as the single escape hatch.
 #[allow(clippy::too_many_arguments)]
 fn spawn_lifecycle_child(
     cmd: &str,
@@ -1287,12 +1394,13 @@ fn spawn_lifecycle_child(
     project_dir: &Path,
     envs: &[(String, String)],
     sandbox_mode: SandboxMode,
+    sandbox_options: &lpm_sandbox::SandboxOptions,
     extra_write_dirs: &[PathBuf],
     store_root: &Path,
     home_dir: &Path,
     tmpdir: &Path,
 ) -> Result<std::process::Child, String> {
-    use lpm_sandbox::{SandboxSpec, SandboxStdio, SandboxedCommand, new_for_platform};
+    use lpm_sandbox::{SandboxSpec, SandboxStdio, SandboxedCommand, new_for_platform_with_options};
 
     let spec = SandboxSpec {
         package_dir: package_dir.to_path_buf(),
@@ -1304,8 +1412,15 @@ fn spawn_lifecycle_child(
         tmpdir: tmpdir.to_path_buf(),
         extra_write_dirs: extra_write_dirs.to_vec(),
     };
-    let sandbox =
-        new_for_platform(spec, sandbox_mode).map_err(|e| format!("sandbox init failed: {e}"))?;
+    // Phase 46.1: thread the resolved `[sandbox] allow-degraded`
+    // opt-in through so per-package sandbox construction picks the
+    // same posture the pre-probe used. Posture mismatches between
+    // pre-probe and per-package construction would surface as a
+    // visible behavior change midway through an install, which is
+    // exactly the inconsistency the shared `sandbox_options` value
+    // exists to prevent.
+    let sandbox = new_for_platform_with_options(spec, sandbox_mode, sandbox_options.clone())
+        .map_err(|e| format!("sandbox init failed: {e}"))?;
 
     let mut sbcmd = SandboxedCommand::new("sh")
         .arg("-c")
@@ -1534,6 +1649,20 @@ pub(crate) enum TrustReason {
     /// `husky install`, `electron-rebuild`, relative-path `node`
     /// calls). Only reachable under [`ScriptPolicy::Triage`].
     GreenTierUnderTriage,
+    /// **Phase 46 slice 1 (post-Part-B install-time consumption).**
+    /// `script-policy = "triage"` + worst-wins classification is
+    /// Amber/AmberLlm + an in-memory [`crate::triage_advisor_session::AdvisorSession`]
+    /// returned `Approve` for this `(name, version)` during the
+    /// current install. The approval is **ephemeral**: it lives
+    /// only for the lifetime of the `AdvisorSession` (one install
+    /// run), is never written to `trustedDependencies`, and is
+    /// invisible to a later standalone `lpm rebuild` invocation
+    /// that doesn't carry its own session.
+    ///
+    /// Reachable only when [`evaluate_trust`] is given a non-empty
+    /// `advisor_approvals` set. Standalone `lpm rebuild` passes
+    /// `None`, so this variant never fires outside the install path.
+    AdvisorApprovedThisRun,
     /// Strict binding exists but its stored `scriptHash` no longer
     /// matches the on-disk body. Triage does NOT auto-recover this:
     /// the user previously approved a specific script and the script
@@ -1592,7 +1721,11 @@ impl TrustReason {
     pub(crate) fn is_trusted(self) -> bool {
         matches!(
             self,
-            Self::StrictBinding | Self::LegacyName | Self::ScopedGlob | Self::GreenTierUnderTriage,
+            Self::StrictBinding
+                | Self::LegacyName
+                | Self::ScopedGlob
+                | Self::GreenTierUnderTriage
+                | Self::AdvisorApprovedThisRun,
         )
     }
 }
@@ -1664,6 +1797,14 @@ pub(crate) fn evaluate_trust(
     // configured" — rlimit requests with no matching user ceiling
     // fail closed (trigger the approval gate).
     user_bound: &crate::capability::UserBound,
+    // **Phase 46 slice 1.** In-memory ephemeral approval set
+    // populated by the install path's
+    // [`crate::triage_advisor_session::AdvisorSession`]. A package
+    // whose `(name, version)` appears here AND classifies amber
+    // under triage yields [`TrustReason::AdvisorApprovedThisRun`].
+    // `None` (or empty) preserves portable L1-3 behaviour — the
+    // standalone `lpm rebuild` path passes `None`.
+    advisor_approvals: Option<&std::collections::HashSet<(String, String, Option<String>)>>,
 ) -> TrustReason {
     let candidate = evaluate_trust_unsuspended(
         package_dir,
@@ -1674,6 +1815,7 @@ pub(crate) fn evaluate_trust(
         policy,
         project_dir,
         effective_policy,
+        advisor_approvals,
     );
     let after_force = if force_security_floor && candidate.is_trusted() {
         TrustReason::SuspendedByForceFloor
@@ -1726,6 +1868,7 @@ fn evaluate_trust_unsuspended(
     policy: &SecurityPolicy,
     project_dir: &Path,
     effective_policy: ScriptPolicy,
+    advisor_approvals: Option<&std::collections::HashSet<(String, String, Option<String>)>>,
 ) -> TrustReason {
     let script_hash = compute_script_hash(package_dir);
     let strict = policy.can_run_scripts_strict(name, version, integrity, script_hash.as_deref());
@@ -1740,10 +1883,28 @@ fn evaluate_trust_unsuspended(
         return TrustReason::ScopedGlob;
     }
 
-    if effective_policy == ScriptPolicy::Triage
-        && classify_package_worst_tier(scripts) == Some(StaticTier::Green)
-    {
-        return TrustReason::GreenTierUnderTriage;
+    if effective_policy == ScriptPolicy::Triage {
+        let tier = classify_package_worst_tier(scripts);
+        if tier == Some(StaticTier::Green) {
+            return TrustReason::GreenTierUnderTriage;
+        }
+        // **Phase 46 slice 1.** Amber + advisor said Approve →
+        // ephemeral trust for this run. Confined to triage policy
+        // (deny / allow paths never reach here in a triage-meaningful
+        // way) and to a non-empty in-memory approval set. Standalone
+        // `lpm rebuild` passes `None`, so this short-circuit cannot
+        // bypass the persistent trust manifest outside an active
+        // install.
+        if matches!(tier, Some(StaticTier::Amber) | Some(StaticTier::AmberLlm))
+            && let Some(set) = advisor_approvals
+            && set.contains(&(
+                name.to_string(),
+                version.to_string(),
+                integrity.map(str::to_string),
+            ))
+        {
+            return TrustReason::AdvisorApprovedThisRun;
+        }
     }
 
     TrustReason::Untrusted
@@ -2128,6 +2289,13 @@ pub fn all_scripted_packages_trusted(
     // the user bound and no matching approval exists.
     requested_capabilities: &crate::capability::CapabilitySet,
     user_bound: &crate::capability::UserBound,
+    // **Phase 46 slice 1.** Threaded through to [`evaluate_trust`]
+    // so an install's autoBuild predicate sees the same ephemeral
+    // advisor approvals the script-execution path will see. Without
+    // this, a `Some(approvals)` install would still report "not all
+    // scripts trusted" and decline autoBuild entirely — defeating
+    // the whole point of advisor-enhanced triage.
+    advisor_approvals: Option<&std::collections::HashSet<(String, String, Option<String>)>>,
 ) -> bool {
     // **Phase 66 confidence-followup F2 + F1+F2 review.** Build the
     // v2 link-entry index ONCE before the per-package loop, scoped to
@@ -2177,6 +2345,7 @@ pub fn all_scripted_packages_trusted(
             force_security_floor,
             requested_capabilities,
             user_bound,
+            advisor_approvals,
         );
         if !reason.is_trusted() {
             return false; // at least one untrusted package
@@ -2925,6 +3094,7 @@ mod tests {
             false,
             &crate::capability::CapabilitySet::default(),
             &crate::capability::UserBound::default(),
+            None,
         );
 
         assert!(trusted);
@@ -2955,6 +3125,7 @@ mod tests {
             false,
             &crate::capability::CapabilitySet::default(),
             &crate::capability::UserBound::default(),
+            None,
         );
 
         assert!(!trusted);
@@ -2999,6 +3170,7 @@ mod tests {
             false,
             &crate::capability::CapabilitySet::default(),
             &crate::capability::UserBound::default(),
+            None,
         );
 
         assert!(
@@ -3114,6 +3286,7 @@ mod tests {
             false,
             &crate::capability::CapabilitySet::default(),
             &crate::capability::UserBound::default(),
+            None,
         );
         assert!(
             !trusted,
@@ -3661,6 +3834,7 @@ mod tests {
             false,
             &crate::capability::CapabilitySet::default(),
             &crate::capability::UserBound::default(),
+            None,
         );
         assert_eq!(reason, TrustReason::GreenTierUnderTriage);
         assert!(reason.is_trusted());
@@ -3690,6 +3864,7 @@ mod tests {
             false,
             &crate::capability::CapabilitySet::default(),
             &crate::capability::UserBound::default(),
+            None,
         );
         assert_eq!(reason, TrustReason::Untrusted);
         assert!(!reason.is_trusted());
@@ -3728,6 +3903,7 @@ mod tests {
             false,
             &crate::capability::CapabilitySet::default(),
             &crate::capability::UserBound::default(),
+            None,
         );
         assert_eq!(reason, TrustReason::Untrusted);
     }
@@ -3858,6 +4034,7 @@ mod tests {
             false,
             &crate::capability::CapabilitySet::default(),
             &crate::capability::UserBound::default(),
+            None,
         );
         assert_eq!(
             reason,
@@ -3881,6 +4058,7 @@ mod tests {
             false,
             &crate::capability::CapabilitySet::default(),
             &crate::capability::UserBound::default(),
+            None,
         );
         assert_eq!(
             reason,
@@ -3936,6 +4114,7 @@ mod tests {
             false,
             &crate::capability::CapabilitySet::default(),
             &crate::capability::UserBound::default(),
+            None,
         );
         assert_eq!(
             reason,
@@ -3986,6 +4165,7 @@ mod tests {
             false,
             &crate::capability::CapabilitySet::default(),
             &crate::capability::UserBound::default(),
+            None,
         );
         assert_eq!(
             reason,
@@ -4027,6 +4207,7 @@ mod tests {
             false,
             &crate::capability::CapabilitySet::default(),
             &crate::capability::UserBound::default(),
+            None,
         );
         assert_eq!(
             reason,
@@ -4046,8 +4227,340 @@ mod tests {
         assert!(TrustReason::LegacyName.is_trusted());
         assert!(TrustReason::ScopedGlob.is_trusted());
         assert!(TrustReason::GreenTierUnderTriage.is_trusted());
+        // Phase 46 slice 1: advisor-approved-this-run grants ephemeral
+        // trust. Required for the install-time autoBuild path to
+        // actually execute scripts the advisor approved.
+        assert!(TrustReason::AdvisorApprovedThisRun.is_trusted());
         assert!(!TrustReason::BindingDrift.is_trusted());
         assert!(!TrustReason::Untrusted.is_trusted());
+    }
+
+    // ── Phase 46 slice 1: AdvisorApprovedThisRun trust path ────────
+    //
+    // Locks the new amber-tier short-circuit in
+    // `evaluate_trust_unsuspended`. The test matrix below maps
+    // 1:1 to the six locked product cases:
+    //
+    //   1. triage-advisor = none → behavior identical to portable
+    //   2. (env-not-ready preflight failure handled in
+    //      triage_advisor_session::tests)
+    //   3. Approve upgrades only prompted packages → AdvisorApprovedThisRun
+    //   4. Manual/Abstain do not change outcome → still Untrusted
+    //   5. (multi-package warn-once covered in install-flow integration)
+    //   6. deny / allow ignore advisor_approvals (kept as Untrusted /
+    //      executed-via-other-path)
+
+    #[test]
+    fn slice1_advisor_approval_promotes_amber_under_triage() {
+        // The core slice-1 behavior: a package with an amber-tier
+        // postinstall (`node install.js` — binary-fetcher convention,
+        // amber by §4.1 P0.5), no trustedDependencies entry, no scope
+        // match — but its (name, version) appears in the advisor
+        // approval set. Under triage, must return
+        // AdvisorApprovedThisRun and pass `is_trusted()`.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("package.json"), r#"{"name":"proj"}"#).unwrap();
+        let store = PackageStore::at(dir.path().join("store"));
+        let _lpm_root = lpm_common::LpmRoot::from_dir(dir.path());
+        // `node install.js` classifies amber per the reserved-basename
+        // rule — perfect amber input for slice-1 promotion.
+        let pkg_dir = write_p6_pkg(&store, "amber-pkg", "1.0.0", "node install.js");
+        let scripts = read_lifecycle_scripts(&pkg_dir.join("package.json")).unwrap();
+        let policy = SecurityPolicy::from_package_json(&dir.path().join("package.json"));
+
+        let mut approvals = std::collections::HashSet::new();
+        approvals.insert(("amber-pkg".to_string(), "1.0.0".to_string(), None));
+
+        let reason = evaluate_trust(
+            &pkg_dir,
+            "amber-pkg",
+            "1.0.0",
+            None,
+            &scripts,
+            &policy,
+            dir.path(),
+            ScriptPolicy::Triage,
+            false,
+            &crate::capability::CapabilitySet::default(),
+            &crate::capability::UserBound::default(),
+            Some(&approvals),
+        );
+        assert_eq!(reason, TrustReason::AdvisorApprovedThisRun);
+        assert!(reason.is_trusted());
+    }
+
+    #[test]
+    fn slice1_none_approvals_yield_untrusted_for_amber() {
+        // Locked test-matrix case 1: `triage-advisor = none` (modeled
+        // by passing `None` as the approval set) must leave amber
+        // untrusted, identical to portable behavior.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("package.json"), r#"{"name":"proj"}"#).unwrap();
+        let store = PackageStore::at(dir.path().join("store"));
+        let pkg_dir = write_p6_pkg(&store, "amber-pkg", "1.0.0", "node install.js");
+        let scripts = read_lifecycle_scripts(&pkg_dir.join("package.json")).unwrap();
+        let policy = SecurityPolicy::from_package_json(&dir.path().join("package.json"));
+
+        let reason = evaluate_trust(
+            &pkg_dir,
+            "amber-pkg",
+            "1.0.0",
+            None,
+            &scripts,
+            &policy,
+            dir.path(),
+            ScriptPolicy::Triage,
+            false,
+            &crate::capability::CapabilitySet::default(),
+            &crate::capability::UserBound::default(),
+            None,
+        );
+        assert_eq!(reason, TrustReason::Untrusted);
+        assert!(!reason.is_trusted());
+    }
+
+    #[test]
+    fn slice1_empty_approvals_yield_untrusted_for_amber() {
+        // Adjacent to "advisor = none": user has an advisor configured
+        // but it approved nothing this run. Empty set → Untrusted.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("package.json"), r#"{"name":"proj"}"#).unwrap();
+        let store = PackageStore::at(dir.path().join("store"));
+        let pkg_dir = write_p6_pkg(&store, "amber-pkg", "1.0.0", "node install.js");
+        let scripts = read_lifecycle_scripts(&pkg_dir.join("package.json")).unwrap();
+        let policy = SecurityPolicy::from_package_json(&dir.path().join("package.json"));
+
+        let approvals: std::collections::HashSet<(String, String, Option<String>)> =
+            std::collections::HashSet::new();
+        let reason = evaluate_trust(
+            &pkg_dir,
+            "amber-pkg",
+            "1.0.0",
+            None,
+            &scripts,
+            &policy,
+            dir.path(),
+            ScriptPolicy::Triage,
+            false,
+            &crate::capability::CapabilitySet::default(),
+            &crate::capability::UserBound::default(),
+            Some(&approvals),
+        );
+        assert_eq!(reason, TrustReason::Untrusted);
+    }
+
+    #[test]
+    fn slice1_approval_for_other_package_does_not_promote_this_one() {
+        // Locked test-matrix case 3 corollary: approval is scoped to
+        // (name, version). A wrong-key approval must NOT promote.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("package.json"), r#"{"name":"proj"}"#).unwrap();
+        let store = PackageStore::at(dir.path().join("store"));
+        let pkg_dir = write_p6_pkg(&store, "amber-pkg", "1.0.0", "node install.js");
+        let scripts = read_lifecycle_scripts(&pkg_dir.join("package.json")).unwrap();
+        let policy = SecurityPolicy::from_package_json(&dir.path().join("package.json"));
+
+        let mut approvals = std::collections::HashSet::new();
+        approvals.insert(("OTHER-pkg".to_string(), "1.0.0".to_string(), None));
+        approvals.insert(("amber-pkg".to_string(), "2.0.0".to_string(), None)); // wrong version
+        let reason = evaluate_trust(
+            &pkg_dir,
+            "amber-pkg",
+            "1.0.0",
+            None,
+            &scripts,
+            &policy,
+            dir.path(),
+            ScriptPolicy::Triage,
+            false,
+            &crate::capability::CapabilitySet::default(),
+            &crate::capability::UserBound::default(),
+            Some(&approvals),
+        );
+        assert_eq!(reason, TrustReason::Untrusted);
+    }
+
+    #[test]
+    fn slice1_advisor_approval_does_not_apply_under_deny() {
+        // Locked test-matrix case 6: deny ignores advisor approvals.
+        // The advisor was preflighted only under triage; under deny
+        // the policy is "never auto-run". An approval set passed
+        // (defensively) must not flip the outcome.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("package.json"), r#"{"name":"proj"}"#).unwrap();
+        let store = PackageStore::at(dir.path().join("store"));
+        let pkg_dir = write_p6_pkg(&store, "amber-pkg", "1.0.0", "node install.js");
+        let scripts = read_lifecycle_scripts(&pkg_dir.join("package.json")).unwrap();
+        let policy = SecurityPolicy::from_package_json(&dir.path().join("package.json"));
+
+        let mut approvals = std::collections::HashSet::new();
+        approvals.insert(("amber-pkg".to_string(), "1.0.0".to_string(), None));
+        let reason = evaluate_trust(
+            &pkg_dir,
+            "amber-pkg",
+            "1.0.0",
+            None,
+            &scripts,
+            &policy,
+            dir.path(),
+            ScriptPolicy::Deny,
+            false,
+            &crate::capability::CapabilitySet::default(),
+            &crate::capability::UserBound::default(),
+            Some(&approvals),
+        );
+        // Deny short-circuits before the advisor check would fire.
+        assert_eq!(reason, TrustReason::Untrusted);
+    }
+
+    #[test]
+    fn slice1_advisor_approval_does_not_apply_under_allow() {
+        // Symmetric to the deny case: allow runs every script via
+        // the manifest-only path; the advisor surface isn't consulted.
+        // Approval set defensively passed has no effect on the trust
+        // reason returned.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("package.json"), r#"{"name":"proj"}"#).unwrap();
+        let store = PackageStore::at(dir.path().join("store"));
+        let pkg_dir = write_p6_pkg(&store, "amber-pkg", "1.0.0", "node install.js");
+        let scripts = read_lifecycle_scripts(&pkg_dir.join("package.json")).unwrap();
+        let policy = SecurityPolicy::from_package_json(&dir.path().join("package.json"));
+
+        let mut approvals = std::collections::HashSet::new();
+        approvals.insert(("amber-pkg".to_string(), "1.0.0".to_string(), None));
+        let reason = evaluate_trust(
+            &pkg_dir,
+            "amber-pkg",
+            "1.0.0",
+            None,
+            &scripts,
+            &policy,
+            dir.path(),
+            ScriptPolicy::Allow,
+            false,
+            &crate::capability::CapabilitySet::default(),
+            &crate::capability::UserBound::default(),
+            Some(&approvals),
+        );
+        // Under allow, the policy bypasses the trust-reason path
+        // entirely at execution time; here at the evaluator level
+        // the result mirrors Untrusted (no manifest binding) and
+        // the live executor doesn't gate on it.
+        assert_eq!(reason, TrustReason::Untrusted);
+    }
+
+    #[test]
+    fn slice1_approval_does_not_leak_across_sources_with_same_coord() {
+        // **Locked safety property (review finding High).** Two
+        // packages with the same name+version but different
+        // integrity hashes (e.g. one registry source, one
+        // workspace / file source) must be approved INDEPENDENTLY.
+        // Approving the registry source must NOT auto-run the
+        // workspace source's script in the same install.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("package.json"), r#"{"name":"proj"}"#).unwrap();
+        let store = PackageStore::at(dir.path().join("store"));
+        let _lpm_root = lpm_common::LpmRoot::from_dir(dir.path());
+        let pkg_dir = write_p6_pkg(&store, "amber-pkg", "1.0.0", "node install.js");
+        let scripts = read_lifecycle_scripts(&pkg_dir.join("package.json")).unwrap();
+        let policy = SecurityPolicy::from_package_json(&dir.path().join("package.json"));
+
+        // Approve ONLY the integrity-bearing variant.
+        let mut approvals = std::collections::HashSet::new();
+        approvals.insert((
+            "amber-pkg".to_string(),
+            "1.0.0".to_string(),
+            Some("sha512-registry-integrity".to_string()),
+        ));
+
+        // Querying for the SAME coord but a DIFFERENT integrity must
+        // not match — the trust evaluator returns Untrusted.
+        let reason_workspace = evaluate_trust(
+            &pkg_dir,
+            "amber-pkg",
+            "1.0.0",
+            None, // workspace-style: no integrity
+            &scripts,
+            &policy,
+            dir.path(),
+            ScriptPolicy::Triage,
+            false,
+            &crate::capability::CapabilitySet::default(),
+            &crate::capability::UserBound::default(),
+            Some(&approvals),
+        );
+        assert_eq!(reason_workspace, TrustReason::Untrusted);
+
+        // And for ANOTHER integrity (e.g. a file source with a
+        // different sha): also Untrusted.
+        let reason_other_integrity = evaluate_trust(
+            &pkg_dir,
+            "amber-pkg",
+            "1.0.0",
+            Some("sha512-file-source-integrity"),
+            &scripts,
+            &policy,
+            dir.path(),
+            ScriptPolicy::Triage,
+            false,
+            &crate::capability::CapabilitySet::default(),
+            &crate::capability::UserBound::default(),
+            Some(&approvals),
+        );
+        assert_eq!(reason_other_integrity, TrustReason::Untrusted);
+
+        // Sanity: the integrity that IS in the set DOES grant the
+        // ephemeral approval. Confirms the lookup isn't otherwise
+        // broken.
+        let reason_match = evaluate_trust(
+            &pkg_dir,
+            "amber-pkg",
+            "1.0.0",
+            Some("sha512-registry-integrity"),
+            &scripts,
+            &policy,
+            dir.path(),
+            ScriptPolicy::Triage,
+            false,
+            &crate::capability::CapabilitySet::default(),
+            &crate::capability::UserBound::default(),
+            Some(&approvals),
+        );
+        assert_eq!(reason_match, TrustReason::AdvisorApprovedThisRun);
+    }
+
+    #[test]
+    fn slice1_green_under_triage_still_wins_over_advisor() {
+        // Sanity: a green script doesn't go through the advisor at
+        // all — the existing GreenTierUnderTriage short-circuit
+        // wins. Approval set is irrelevant.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("package.json"), r#"{"name":"proj"}"#).unwrap();
+        let store = PackageStore::at(dir.path().join("store"));
+        let pkg_dir = write_p6_pkg(&store, "green-pkg", "1.0.0", "node-gyp rebuild");
+        let scripts = read_lifecycle_scripts(&pkg_dir.join("package.json")).unwrap();
+        let policy = SecurityPolicy::from_package_json(&dir.path().join("package.json"));
+
+        let mut approvals = std::collections::HashSet::new();
+        approvals.insert(("green-pkg".to_string(), "1.0.0".to_string(), None));
+        let reason = evaluate_trust(
+            &pkg_dir,
+            "green-pkg",
+            "1.0.0",
+            None,
+            &scripts,
+            &policy,
+            dir.path(),
+            ScriptPolicy::Triage,
+            false,
+            &crate::capability::CapabilitySet::default(),
+            &crate::capability::UserBound::default(),
+            Some(&approvals),
+        );
+        // GreenTierUnderTriage WINS — the advisor variant is reserved
+        // for amber. If this test starts returning AdvisorApprovedThisRun
+        // it means the green short-circuit broke.
+        assert_eq!(reason, TrustReason::GreenTierUnderTriage);
     }
 
     // ── Phase 46 P6 Chunk 3: all_scripted_packages_trusted triage ───
@@ -4095,6 +4608,7 @@ mod tests {
             false,
             &crate::capability::CapabilitySet::default(),
             &crate::capability::UserBound::default(),
+            None,
         );
         assert!(
             trusted,
@@ -4124,6 +4638,7 @@ mod tests {
             false,
             &crate::capability::CapabilitySet::default(),
             &crate::capability::UserBound::default(),
+            None,
         );
         assert!(
             !trusted,
@@ -4162,6 +4677,7 @@ mod tests {
             false,
             &crate::capability::CapabilitySet::default(),
             &crate::capability::UserBound::default(),
+            None,
         );
         assert!(
             !trusted,
@@ -4189,6 +4705,7 @@ mod tests {
             false,
             &crate::capability::CapabilitySet::default(),
             &crate::capability::UserBound::default(),
+            None,
         );
         assert!(!trusted);
     }
@@ -4225,6 +4742,7 @@ mod tests {
             false,
             &crate::capability::CapabilitySet::default(),
             &crate::capability::UserBound::default(),
+            None,
         );
         assert!(
             !trusted,
@@ -4263,6 +4781,7 @@ mod tests {
             false,
             &crate::capability::CapabilitySet::default(),
             &crate::capability::UserBound::default(),
+            None,
         );
         assert!(
             trusted,
@@ -4370,6 +4889,7 @@ mod tests {
             false, // force-security-floor OFF
             &crate::capability::CapabilitySet::default(),
             &crate::capability::UserBound::default(),
+            None,
         );
 
         assert_eq!(reason, TrustReason::StrictBinding);
@@ -4403,6 +4923,7 @@ mod tests {
             true, // force-security-floor ON
             &crate::capability::CapabilitySet::default(),
             &crate::capability::UserBound::default(),
+            None,
         );
 
         assert_eq!(reason, TrustReason::SuspendedByForceFloor);
@@ -4437,6 +4958,7 @@ mod tests {
             true,
             &crate::capability::CapabilitySet::default(),
             &crate::capability::UserBound::default(),
+            None,
         );
         assert_eq!(r_on, TrustReason::SuspendedByForceFloor);
 
@@ -4453,6 +4975,7 @@ mod tests {
             false,
             &crate::capability::CapabilitySet::default(),
             &crate::capability::UserBound::default(),
+            None,
         );
         assert_eq!(r_off, TrustReason::StrictBinding);
         assert!(r_off.is_trusted());
@@ -4488,6 +5011,7 @@ mod tests {
             true,
             &crate::capability::CapabilitySet::default(),
             &crate::capability::UserBound::default(),
+            None,
         );
         assert_eq!(
             with_flag,
@@ -4506,6 +5030,7 @@ mod tests {
             false,
             &crate::capability::CapabilitySet::default(),
             &crate::capability::UserBound::default(),
+            None,
         );
         assert_eq!(without_flag, TrustReason::Untrusted);
     }
@@ -4544,6 +5069,7 @@ mod tests {
             false,
             &crate::capability::CapabilitySet::default(),
             &crate::capability::UserBound::default(),
+            None,
         );
         assert_eq!(without_flag, TrustReason::ScopedGlob);
         assert!(without_flag.is_trusted());
@@ -4560,6 +5086,7 @@ mod tests {
             true,
             &crate::capability::CapabilitySet::default(),
             &crate::capability::UserBound::default(),
+            None,
         );
         assert_eq!(with_flag, TrustReason::SuspendedByForceFloor);
         assert!(!with_flag.is_trusted());
@@ -4611,6 +5138,7 @@ mod tests {
             true, // flag ON
             &crate::capability::CapabilitySet::default(),
             &crate::capability::UserBound::default(),
+            None,
         );
         // BindingDrift takes precedence — not suspended, because
         // it wasn't trusted to begin with.
@@ -4665,6 +5193,7 @@ mod tests {
             false,
             &baseline,
             &user,
+            None,
         );
         assert_eq!(reason, TrustReason::StrictBinding);
         assert!(reason.is_trusted());
@@ -4700,6 +5229,7 @@ mod tests {
             false,
             &request,
             &user,
+            None,
         );
         assert_eq!(reason, TrustReason::StrictBinding);
     }
@@ -4729,6 +5259,7 @@ mod tests {
             false,
             &request,
             &user,
+            None,
         );
         assert_eq!(reason, TrustReason::CapabilityNotApproved);
         assert!(!reason.is_trusted());
@@ -4786,6 +5317,7 @@ mod tests {
             false,
             &request,
             &user,
+            None,
         );
         assert_eq!(reason, TrustReason::StrictBinding);
         assert!(reason.is_trusted());
@@ -4843,6 +5375,7 @@ mod tests {
             false,
             &new_request,
             &user,
+            None,
         );
         assert_eq!(reason, TrustReason::CapabilityNotApproved);
     }
@@ -4879,6 +5412,7 @@ mod tests {
             false,
             &request,
             &user,
+            None,
         );
         assert_eq!(reason, TrustReason::Untrusted);
     }
@@ -4909,6 +5443,7 @@ mod tests {
             true, // force-security-floor ON
             &request,
             &user,
+            None,
         );
         // Trust was going to be granted (StrictBinding), force
         // flag intercepted before the capability gate could fire.

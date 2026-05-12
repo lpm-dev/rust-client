@@ -1,12 +1,39 @@
 //! Filesystem-scoped sandbox for LPM post-install script execution.
 //!
-//! Phase 46 P5. This crate owns the execution-time containment machinery;
+//! Phase 46 P5 shipped filesystem-write containment (Seatbelt on
+//! macOS, landlock V1 on Linux). Phase 46.1 adds outbound network
+//! denial on top — see the design note at
+//! [`DOCS/new-features/37-rust-client-RUNNER-VISION-phase46.1-sandbox-network-denial.md`](../../../../../../a-package-manager/DOCS/new-features/37-rust-client-RUNNER-VISION-phase46.1-sandbox-network-denial.md)
+//! for the locked Q1-Q3 decisions and contract specifics.
+//!
+//! ## Network-denial scope (Phase 46.1)
+//!
+//! There is a **platform asymmetry** to be honest about:
+//!
+//! - **macOS** — Seatbelt's `(deny default)` covers every socket
+//!   family / type. Dropping `(allow network*)` denies TCP, UDP,
+//!   raw sockets, AF_PACKET, AF_NETLINK, DNS — everything outbound.
+//!   Full outbound network denial.
+//! - **Linux landlock V4** — `AccessNet::from_all(V4)` only handles
+//!   `BindTcp` and `ConnectTcp`. UDP-based egress (raw `SOCK_DGRAM`,
+//!   DNS-via-UDP, AF_PACKET, AF_NETLINK) **is NOT denied** by V4
+//!   alone. The strict posture therefore enforces "filesystem +
+//!   outbound TCP denial" on Linux V4, not full network denial.
+//!
+//! Closing the Linux UDP / raw / DNS-via-UDP gap requires a
+//! second enforcement layer (seccomp-bpf), filed as **Phase 46.1.1**.
+//! [`SandboxPosture::Strict`] therefore documents this asymmetry
+//! at the trait-doc level, and `lpm doctor` reports it on every
+//! Linux run so users see the real coverage rather than the
+//! aspirational one.
+//!
 //! [`lpm-security`](../lpm_security/index.html) stays policy-only.
 //!
 //! The crate is intentionally narrow. Callers build a [`SandboxedCommand`]
 //! (a platform-neutral description of the process they want to run),
-//! obtain a [`Sandbox`] from [`new_for_platform`] for a given
-//! [`SandboxSpec`] paired with a [`SandboxMode`], then call
+//! obtain a [`Sandbox`] from [`new_for_platform`] (or
+//! [`new_for_platform_with_options`] when the caller wants to thread
+//! the Phase 46.1 `[sandbox] allow-degraded` knob through), then call
 //! [`Sandbox::spawn`]. The backend decides how to apply containment:
 //! macOS routes the spawn through `sandbox-exec`, and Linux installs a
 //! landlock ruleset via `pre_exec` in the forked child.
@@ -15,13 +42,25 @@
 //!
 //! | Platform | [`SandboxMode::Enforce`] | [`SandboxMode::LogOnly`] | [`SandboxMode::Disabled`] |
 //! |----------|--------------------------|---------------------------|----------------------------|
-//! | macOS    | Seatbelt (`sandbox-exec`) | Seatbelt w/ `(allow (with report) default)` fallback | [`NoopSandbox`] |
-//! | Linux    | landlock (5.13+)         | [`SandboxError::ModeNotSupportedOnPlatform`] — no native observe-only | [`NoopSandbox`] |
-//! | Windows  | [`SandboxError::UnsupportedPlatform`] — deferred to Phase 46.1 (D10) | [`SandboxError::UnsupportedPlatform`] | [`NoopSandbox`] |
+//! | macOS    | Seatbelt (`sandbox-exec`), `(deny default)` + narrow allows; **full outbound network denied** (Phase 46.1, no loopback exemption) — every socket family / type covered. | Seatbelt w/ `(allow (with report) default)` fallback | [`NoopSandbox`] |
+//! | Linux    | landlock V4 (kernel 6.7+) — filesystem + **outbound TCP** denial (BindTcp + ConnectTcp). UDP / raw / AF_PACKET / AF_NETLINK / DNS-via-UDP are NOT denied by V4 alone — closing that gap is Phase 46.1.1's seccomp-bpf layer. Kernels < 6.7 return [`SandboxError::KernelTooOld`] by default; explicit opt-in via `[sandbox] allow-degraded = true` falls back to V1 filesystem-only with a one-line stderr warning per install. | [`SandboxError::ModeNotSupportedOnPlatform`] — no native observe-only | [`NoopSandbox`] |
+//! | Windows  | [`SandboxError::UnsupportedPlatform`] — deferred to Phase 46.2 (Phase 46.1 left Windows out of scope; see design note) | [`SandboxError::UnsupportedPlatform`] | [`NoopSandbox`] |
 //!
 //! [`SandboxMode::Disabled`] always succeeds with a [`NoopSandbox`]:
-//! the `--unsafe-full-env --no-sandbox` escape hatch has to be
-//! reachable from every platform, including Windows.
+//! the `--no-sandbox` escape hatch (Phase 46.1 rework: single flag —
+//! the legacy `--unsafe-full-env` partner was collapsed per Q6 of the
+//! DX redline) has to be reachable from every platform, including
+//! Windows.
+//!
+//! ## Posture (Phase 46.1)
+//!
+//! [`Sandbox::posture`] reports whether the constructed backend
+//! enforces the full Phase 46.1 contract ([`SandboxPosture::Strict`])
+//! or has fallen back to filesystem-only on a kernel that can't
+//! support network denial ([`SandboxPosture::Degraded`]). The install
+//! pipeline uses this to emit the per-install structured stderr
+//! warning exactly once when the user has opted into the degraded
+//! posture via `[sandbox] allow-degraded = true`.
 
 #![deny(unsafe_op_in_unsafe_fn)]
 #![warn(missing_docs)]
@@ -47,6 +86,16 @@ mod linux;
 // cross-platform hygiene rule.
 #[cfg(any(target_os = "linux", test))]
 mod landlock_rules;
+
+// Phase 46.1 posture-decision helper. Pure (string in, decision out),
+// platform-neutral so the macOS-host unit tests exercise the same
+// table that the Linux backend uses in production. Compiles under
+// the same gate as `landlock_rules`: Linux production, plus any
+// `test` build so the strict-vs-degraded table is testable on every
+// developer's machine without spinning up a Linux VM. Non-Linux
+// production builds skip the module — they have no consumer.
+#[cfg(any(target_os = "linux", test))]
+mod posture_decision;
 
 pub mod config;
 pub use config::load_sandbox_write_dirs;
@@ -91,6 +140,191 @@ pub struct SandboxSpec {
     pub extra_write_dirs: Vec<PathBuf>,
 }
 
+/// Caller-tunable knobs the sandbox factory consumes alongside
+/// [`SandboxSpec`] and [`SandboxMode`]. Phase 46.1 introduces this
+/// struct so the install layer can thread the
+/// `[sandbox] allow-degraded` config knob through to the Linux
+/// backend without changing every call site that doesn't need it.
+///
+/// New fields land here with `Default` semantics matching the strict
+/// (most-secure) interpretation — callers who do not set them
+/// explicitly inherit the conservative posture.
+#[derive(Debug, Clone, Default)]
+pub struct SandboxOptions {
+    /// Phase 46.1: opt-in escape hatch for the Linux backend on
+    /// kernels older than 6.7 (the landlock V4 floor). When `false`
+    /// (the default), kernels < 6.7 surface
+    /// [`SandboxError::KernelTooOld`] with `required: "6.7"` and the
+    /// lifecycle script does not run. When `true`, the backend falls
+    /// back to landlock V1 (filesystem-only) and the install
+    /// pipeline emits a one-line structured stderr warning naming
+    /// the active ABI + missing dimension. macOS ignores the flag
+    /// (its backend has no degraded mode — Seatbelt enforces both
+    /// filesystem and network in the same profile).
+    ///
+    /// This knob is only consulted when `deny_outbound_network = true`
+    /// (strict mode). When network denial is off, the V1 floor is
+    /// always usable on any landlock-capable kernel and there is no
+    /// "degraded" state to fall back to — the backend just behaves
+    /// like Phase 46 P5 (filesystem + env containment).
+    pub allow_degraded: bool,
+
+    /// Phase 46.1 rework (2026-05-11): whether the constructed
+    /// sandbox should deny outbound network from inside the
+    /// lifecycle script.
+    ///
+    /// When `false` (the default), the sandbox enforces only the
+    /// Phase 46 P5 contract: filesystem-write containment + env
+    /// scrubbing. Outbound network is allowed. This is the shape
+    /// most real-world scripted packages need
+    /// (sharp/prisma/puppeteer/`@lpm-registry/cli`/etc. all download
+    /// prebuilts or browser engines during postinstall).
+    ///
+    /// When `true`, the sandbox additionally denies outbound
+    /// network — TCP `connect(2)` and `bind(2)` on Linux landlock
+    /// V4, all socket families via Seatbelt's `(deny default)` on
+    /// macOS. This is the "paranoid / CI / enterprise" path the
+    /// user opts into via `--strict-sandbox` (or its alias
+    /// `--paranoid`), `[sandbox] mode = "strict"` in
+    /// `~/.lpm/config.toml` / `./lpm.toml`, or
+    /// `LPM_STRICT_SANDBOX=1` in the env.
+    ///
+    /// See
+    /// `DOCS/new-features/37-rust-client-RUNNER-VISION-phase46-DX.md`
+    /// for the full scenario matrix and CLI / config / env
+    /// precedence chain.
+    pub deny_outbound_network: bool,
+}
+
+impl SandboxOptions {
+    /// Build a [`SandboxOptions`] with `allow_degraded` set to the
+    /// supplied value. Symmetric helper for call sites that read the
+    /// config knob and want a one-line constructor.
+    pub fn with_allow_degraded(allow_degraded: bool) -> Self {
+        Self {
+            allow_degraded,
+            ..Self::default()
+        }
+    }
+
+    /// Build a [`SandboxOptions`] with `deny_outbound_network` set
+    /// to the supplied value. Used by the install pipeline after
+    /// resolving the `--strict-sandbox` / `[sandbox] mode` /
+    /// `LPM_STRICT_SANDBOX` precedence chain.
+    pub fn with_deny_outbound_network(deny_outbound_network: bool) -> Self {
+        Self {
+            deny_outbound_network,
+            ..Self::default()
+        }
+    }
+}
+
+/// Which dimensions the constructed sandbox actually enforces.
+/// Returned from [`Sandbox::posture`] so the install pipeline + the
+/// `lpm doctor` surface can show the user's effective security
+/// shape and emit the per-install structured warning exactly when
+/// the user is on a fallback path.
+///
+/// Reworked 2026-05-11 (Phase 46.1 rework): added
+/// [`SandboxPosture::Default`] to distinguish "user picked the
+/// relaxed mode" from "user picked strict but kernel forced a
+/// fallback" ([`SandboxPosture::Degraded`]). Both have the same
+/// runtime semantics (filesystem-only); the distinction matters
+/// for doctor / warning text + telemetry classification.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SandboxPosture {
+    /// Phase 46.1 rework default: filesystem-write containment +
+    /// env scrubbing. Outbound network **allowed** — the user
+    /// picked the relaxed mode, either by accepting the default or
+    /// by explicit `[sandbox] mode = "default"`.
+    ///
+    /// Same on-host runtime as Phase 46 P5. No per-install warning
+    /// is emitted because this is a chosen state, not a fallback.
+    Default,
+    /// Phase 46.1 strict posture: filesystem-write containment +
+    /// outbound network denial. Reached when the user opts into
+    /// strict mode (`--strict-sandbox` / `--paranoid` /
+    /// `[sandbox] mode = "strict"` / `LPM_STRICT_SANDBOX=1`).
+    ///
+    /// **Network-denial coverage is platform-asymmetric.** Strict
+    /// means:
+    ///
+    /// - **macOS Seatbelt** — full outbound network denial. Every
+    ///   socket family / type (TCP, UDP, raw, AF_PACKET,
+    ///   AF_NETLINK, DNS) goes to the deny path under the
+    ///   `(deny default)` rule.
+    /// - **Linux landlock V4** — outbound **TCP** denial only.
+    ///   The V4 ABI's `AccessNet::from_all` covers `BindTcp` and
+    ///   `ConnectTcp`. UDP-based egress (`SOCK_DGRAM` for IPv4 +
+    ///   IPv6, raw sockets, AF_PACKET, AF_NETLINK, DNS-via-UDP)
+    ///   is NOT denied. Closing that gap is **Phase 46.1.1's
+    ///   seccomp-bpf layer**, tracked at
+    ///   `DOCS/new-features/37-rust-client-RUNNER-VISION-phase46.1.1-seccomp-udp-denial.md`.
+    ///
+    /// `lpm doctor` surfaces this asymmetry on every run so users
+    /// see the real platform coverage rather than the aspirational
+    /// one. The runtime gate
+    /// `tests/workflows/tests/sandbox_network_denial.rs` exercises
+    /// the TCP path on both platforms; the UDP / raw-socket path
+    /// gets its own workflow test alongside Phase 46.1.1.
+    Strict,
+    /// Filesystem containment is active, but network denial is not.
+    /// Linux landlock backend on kernels < 6.7 with the user's
+    /// opt-in to degraded posture. The `kernel` field carries the
+    /// detected kernel version for surfacing in the structured
+    /// per-install warning + `lpm doctor`; `missing` names the
+    /// dropped dimension (currently always `"network-containment"`
+    /// — the field is structured so future fallbacks can name
+    /// additional missing pieces without a wire-format break).
+    Degraded {
+        /// Detected kernel version string, e.g. `"5.15.0-1063-aws"`.
+        kernel: String,
+        /// Active landlock ABI level, e.g. `"v1"`. Lower-case so
+        /// the doctor / warning lines have a uniform spelling.
+        abi: &'static str,
+        /// Comma-separated names of the dimensions that are NOT
+        /// enforced in this posture. Currently only
+        /// `"network-containment"` — kept as a string for forward
+        /// compatibility.
+        missing: &'static str,
+    },
+    /// No containment applied (e.g. [`NoopSandbox`] for the
+    /// `--no-sandbox` escape hatch — Phase 46.1 rework collapsed
+    /// the legacy `--unsafe-full-env` partner per Q6 — or platforms
+    /// without a backend). Posture-aware UI surfaces this as
+    /// "containment off" rather than conflating with strict.
+    Disabled,
+}
+
+impl SandboxPosture {
+    /// Render the Phase 46.1 per-install structured stderr warning
+    /// line for this posture, or `None` if no warning is required.
+    ///
+    /// Returns `Some(...)` only for [`SandboxPosture::Degraded`] —
+    /// the strict posture is honest by default and needs no
+    /// per-install reminder, the disabled posture is already
+    /// surfaced by the `--no-sandbox` CLI banner.
+    ///
+    /// Format is grep-stable so log scrapers can parse it
+    /// mechanically:
+    ///
+    /// ```text
+    /// warning: sandbox.degraded: kernel=<kernel> abi=<abi> missing=<missing> policy=allow-degraded
+    /// ```
+    pub fn degraded_warning_line(&self) -> Option<String> {
+        match self {
+            SandboxPosture::Degraded {
+                kernel,
+                abi,
+                missing,
+            } => Some(format!(
+                "warning: sandbox.degraded: kernel={kernel} abi={abi} missing={missing} policy=allow-degraded"
+            )),
+            SandboxPosture::Default | SandboxPosture::Strict | SandboxPosture::Disabled => None,
+        }
+    }
+}
+
 /// How the sandbox applies containment for a given spawn.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum SandboxMode {
@@ -102,9 +336,10 @@ pub enum SandboxMode {
     /// substitutes for [`Enforce`](Self::Enforce). Intended for
     /// compat debugging via `--sandbox-log`.
     LogOnly,
-    /// No containment. Used only by the `--unsafe-full-env
-    /// --no-sandbox` escape hatch. Emits a loud CLI banner at the
-    /// call site (not this crate's responsibility).
+    /// No containment. Used only by the `--no-sandbox` escape
+    /// hatch (Phase 46.1 rework: single flag, legacy
+    /// `--unsafe-full-env` partner collapsed per Q6). Emits a loud
+    /// CLI banner at the call site (not this crate's responsibility).
     Disabled,
 }
 
@@ -258,8 +493,9 @@ pub enum SandboxError {
         /// Linux.
         mode: SandboxMode,
         /// User-facing next-step. Names the interim workaround
-        /// (typically `--unsafe-full-env --no-sandbox`) so users
-        /// aren't stuck guessing.
+        /// (typically `--no-sandbox` — Phase 46.1 rework collapsed
+        /// the legacy `--unsafe-full-env` partner) so users aren't
+        /// stuck guessing.
         remediation: String,
     },
 
@@ -311,9 +547,25 @@ pub trait Sandbox: Send + Sync {
     /// use this to gate diagnostic-mode-only UI (e.g. `--sandbox-log`
     /// banners) without reaching into backend-specific state.
     fn mode(&self) -> SandboxMode;
+
+    /// Which dimensions this instance actually enforces.
+    ///
+    /// Backends must override this — there is no meaningful default.
+    /// Seatbelt + landlock decide based on `deny_outbound_network`
+    /// (and on Linux, on the kernel-version probe result for
+    /// strict-with-fallback shapes). `NoopSandbox` returns
+    /// [`SandboxPosture::Disabled`].
+    ///
+    /// Install-pipeline callers query this once after the pre-probe
+    /// and emit [`SandboxPosture::degraded_warning_line`] when the
+    /// returned posture is `Degraded`. Posture is constant for the
+    /// lifetime of the sandbox instance — the probe runs once at
+    /// construction.
+    fn posture(&self) -> SandboxPosture;
 }
 
-/// Returns a sandbox for the current platform + mode.
+/// Returns a sandbox for the current platform + mode with the
+/// default [`SandboxOptions`] (`allow_degraded = false`).
 ///
 /// Dispatch is `cfg`-gated per CLAUDE.md hygiene rule: each platform
 /// arm pulls only its own backend module, and non-supported platforms
@@ -321,40 +573,69 @@ pub trait Sandbox: Send + Sync {
 /// compiling platform-specific code they don't have.
 ///
 /// [`SandboxMode::Disabled`] always succeeds with a [`NoopSandbox`]
-/// regardless of platform — the `--unsafe-full-env --no-sandbox`
-/// escape hatch must work everywhere, including Windows.
+/// regardless of platform — the `--no-sandbox` escape hatch (Phase
+/// 46.1 rework: single flag) must work everywhere, including Windows.
+///
+/// Callers that need to thread the Phase 46.1
+/// `[sandbox] allow-degraded` knob through (install pipeline, doctor)
+/// use [`new_for_platform_with_options`] instead.
 pub fn new_for_platform(
     spec: SandboxSpec,
     mode: SandboxMode,
+) -> Result<Box<dyn Sandbox>, SandboxError> {
+    new_for_platform_with_options(spec, mode, SandboxOptions::default())
+}
+
+/// Phase 46.1: as [`new_for_platform`] but accepts a
+/// [`SandboxOptions`] so callers can opt into the degraded posture
+/// on kernels that don't support landlock V4.
+///
+/// Production call sites that have read the user's
+/// `[sandbox] allow-degraded` config (install / rebuild) go through
+/// this entry point; backend tests and the doctor probe that don't
+/// need to opt into degradation keep using [`new_for_platform`].
+pub fn new_for_platform_with_options(
+    spec: SandboxSpec,
+    mode: SandboxMode,
+    options: SandboxOptions,
 ) -> Result<Box<dyn Sandbox>, SandboxError> {
     if matches!(mode, SandboxMode::Disabled) {
         return Ok(Box::new(NoopSandbox { spec, mode }));
     }
 
     validate_spec(&spec)?;
-    platform_backend(spec, mode)
+    platform_backend(spec, mode, options)
 }
 
 #[cfg(target_os = "macos")]
 fn platform_backend(
     spec: SandboxSpec,
     mode: SandboxMode,
+    options: SandboxOptions,
 ) -> Result<Box<dyn Sandbox>, SandboxError> {
-    Ok(Box::new(macos::SeatbeltSandbox::new(spec, mode)?))
+    // macOS Seatbelt has a single posture — when
+    // `deny_outbound_network` is set, the profile drops
+    // `(allow network*)` and the opening `(deny default)` covers
+    // every socket family unconditionally. `allow_degraded` is
+    // meaningless on macOS (Seatbelt is either fully active or
+    // off — no fallback ABI shape) and we deliberately ignore it.
+    Ok(Box::new(macos::SeatbeltSandbox::new(spec, mode, options)?))
 }
 
 #[cfg(target_os = "linux")]
 fn platform_backend(
     spec: SandboxSpec,
     mode: SandboxMode,
+    options: SandboxOptions,
 ) -> Result<Box<dyn Sandbox>, SandboxError> {
-    Ok(Box::new(linux::LandlockSandbox::new(spec, mode)?))
+    Ok(Box::new(linux::LandlockSandbox::new(spec, mode, options)?))
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
 fn platform_backend(
     _spec: SandboxSpec,
     _mode: SandboxMode,
+    _options: SandboxOptions,
 ) -> Result<Box<dyn Sandbox>, SandboxError> {
     Err(SandboxError::UnsupportedPlatform {
         platform: std::env::consts::OS.to_string(),
@@ -410,16 +691,20 @@ pub fn prepare_writable_dirs(spec: &SandboxSpec) -> Result<(), SandboxError> {
 ///
 /// Centralized so unsupported platforms share consistent wording and
 /// the CLI-side message test has a single source of truth.
+///
+/// Phase 46.1 rework (2026-05-11): the `--unsafe-full-env` partner
+/// flag was collapsed into `--no-sandbox` (Q6), so the remediation
+/// names a single flag now.
 pub fn unsupported_remediation(platform: &str) -> String {
     match platform {
         "windows" => "sandbox enforcement isn't supported on Windows yet. Re-run with \
-			 --unsafe-full-env --no-sandbox to execute scripts without \
-			 containment, or set script-policy = deny."
+			 --no-sandbox to execute scripts without containment, or set \
+			 script-policy = deny."
             .to_string(),
         _ => format!(
             "{platform} has no LPM sandbox backend. Re-run with \
-			 --unsafe-full-env --no-sandbox to execute scripts without \
-			 containment, or set script-policy = deny."
+			 --no-sandbox to execute scripts without containment, or set \
+			 script-policy = deny."
         ),
     }
 }
@@ -508,6 +793,10 @@ impl Sandbox for NoopSandbox {
     fn mode(&self) -> SandboxMode {
         self.mode
     }
+
+    fn posture(&self) -> SandboxPosture {
+        SandboxPosture::Disabled
+    }
 }
 
 #[cfg(test)]
@@ -571,7 +860,13 @@ mod tests {
         let msg = format!("{e}");
         assert!(msg.contains("windows"), "got: {msg}");
         assert!(msg.contains("isn't supported"), "got: {msg}");
-        assert!(msg.contains("--unsafe-full-env --no-sandbox"), "got: {msg}");
+        // Phase 46.1 rework (2026-05-11): single `--no-sandbox` flag,
+        // legacy `--unsafe-full-env` partner removed per Q6.
+        assert!(msg.contains("--no-sandbox"), "got: {msg}");
+        assert!(
+            !msg.contains("--unsafe-full-env"),
+            "legacy partner flag must be gone: {msg}",
+        );
     }
 
     #[test]
@@ -579,7 +874,7 @@ mod tests {
         let e = SandboxError::KernelTooOld {
             detected: "5.10.0".into(),
             required: "5.13".into(),
-            remediation: "upgrade kernel or use --unsafe-full-env --no-sandbox".into(),
+            remediation: "upgrade kernel or use --no-sandbox".into(),
         };
         let msg = format!("{e}");
         assert!(msg.contains("5.10.0"));
@@ -616,15 +911,16 @@ mod tests {
         let e = SandboxError::ModeNotSupportedOnPlatform {
             platform: "linux".into(),
             mode: SandboxMode::LogOnly,
-            remediation: "landlock has no observe-only primitive. Use \
-                --unsafe-full-env --no-sandbox to debug a sandbox false-positive."
+            remediation: "landlock has no observe-only primitive. Use --no-sandbox to \
+                debug a sandbox false-positive."
                 .into(),
         };
         let msg = format!("{e}");
         assert!(msg.contains("linux"), "got: {msg}");
         assert!(msg.contains("LogOnly"), "got: {msg}");
+        // Phase 46.1 rework: single `--no-sandbox` flag.
         assert!(
-            msg.contains("--unsafe-full-env --no-sandbox"),
+            msg.contains("--no-sandbox"),
             "must point at the workaround: {msg}"
         );
     }
@@ -633,7 +929,12 @@ mod tests {
     fn unsupported_remediation_windows_says_not_supported_yet_and_names_escape_hatch() {
         let s = unsupported_remediation("windows");
         assert!(s.contains("isn't supported"));
-        assert!(s.contains("--unsafe-full-env --no-sandbox"));
+        // Phase 46.1 rework: single `--no-sandbox` flag.
+        assert!(s.contains("--no-sandbox"));
+        assert!(
+            !s.contains("--unsafe-full-env"),
+            "legacy partner flag must be gone: {s}",
+        );
         assert!(s.contains("script-policy = deny"));
     }
 
@@ -641,7 +942,12 @@ mod tests {
     fn unsupported_remediation_generic_unix_names_platform() {
         let s = unsupported_remediation("freebsd");
         assert!(s.contains("freebsd"));
-        assert!(s.contains("--unsafe-full-env --no-sandbox"));
+        // Phase 46.1 rework: single `--no-sandbox` flag.
+        assert!(s.contains("--no-sandbox"));
+        assert!(
+            !s.contains("--unsafe-full-env"),
+            "legacy partner flag must be gone: {s}",
+        );
     }
 
     #[test]
@@ -759,7 +1065,12 @@ mod tests {
                 remediation,
             }) => {
                 assert_eq!(platform, std::env::consts::OS);
-                assert!(remediation.contains("--unsafe-full-env --no-sandbox"));
+                // Phase 46.1 rework: single `--no-sandbox` flag.
+                assert!(remediation.contains("--no-sandbox"));
+                assert!(
+                    !remediation.contains("--unsafe-full-env"),
+                    "legacy partner flag must be gone: {remediation}",
+                );
             }
             other => panic!("expected UnsupportedPlatform, got {other:?}"),
         }
@@ -781,19 +1092,76 @@ mod tests {
     #[test]
     fn factory_returns_landlock_backend_on_linux() {
         // Chunk 3: real landlock impl replaces the Chunk 1 stub.
-        // Construction either succeeds (kernel supports landlock)
-        // or fails cleanly with KernelTooOld. Behavior-level tests
-        // (real `restrict_self` + containment probes) live in the
-        // `linux` module's own tests.
+        // Phase 46.1 rework (2026-05-11): default options give
+        // `Default` posture (V1 baseline). Construction either
+        // succeeds (landlock V1 reachable — the bar is low) or
+        // surfaces `KernelTooOld { required: "5.13" }` on hosts
+        // where landlock is entirely disabled.
         match new_for_platform(sample_spec(), SandboxMode::Enforce) {
             Ok(sb) => {
                 assert_eq!(sb.backend_name(), "landlock");
                 assert_eq!(sb.mode(), SandboxMode::Enforce);
+                // Default-default path returns `Default` posture —
+                // V1 with filesystem rules only, no AccessNet.
+                assert_eq!(sb.posture(), SandboxPosture::Default);
             }
             Err(SandboxError::KernelTooOld { required, .. }) => {
+                // Landlock LSM disabled entirely; V1 probe failed.
                 assert_eq!(required, "5.13");
             }
             Err(other) => panic!("unexpected factory error: {other:?}"),
         }
+    }
+
+    /// Phase 46.1: every backend produced by the factory must
+    /// return a sensible posture. NoopSandbox is Disabled; the
+    /// real backends are Strict by default. The Degraded posture is
+    /// reachable only via [`new_for_platform_with_options`] +
+    /// `allow_degraded = true` on a Linux kernel < 6.7 — that path
+    /// is tested in [`crate::linux::tests`].
+    #[test]
+    fn noop_sandbox_reports_disabled_posture() {
+        let sb = new_for_platform(sample_spec(), SandboxMode::Disabled).unwrap();
+        assert_eq!(sb.posture(), SandboxPosture::Disabled);
+    }
+
+    #[test]
+    fn degraded_warning_line_format_is_grep_stable() {
+        // Pin the exact format the install pipeline emits + log
+        // scrapers parse. A whitespace / separator change here is
+        // a wire-format break.
+        let p = SandboxPosture::Degraded {
+            kernel: "5.15.0-1063-aws".to_string(),
+            abi: "v1",
+            missing: "network-containment",
+        };
+        let line = p.degraded_warning_line().expect("Degraded → Some");
+        assert_eq!(
+            line,
+            "warning: sandbox.degraded: kernel=5.15.0-1063-aws abi=v1 missing=network-containment policy=allow-degraded",
+        );
+    }
+
+    #[test]
+    fn degraded_warning_line_is_none_for_strict_and_disabled() {
+        assert_eq!(SandboxPosture::Strict.degraded_warning_line(), None);
+        assert_eq!(SandboxPosture::Disabled.degraded_warning_line(), None);
+    }
+
+    #[test]
+    fn sandbox_options_default_is_strict_posture() {
+        // The `Default` impl must reflect "don't accept degradation"
+        // — installs that don't go through the config loader (eg.
+        // unit tests) inherit the strict floor.
+        let opts = SandboxOptions::default();
+        assert!(!opts.allow_degraded);
+    }
+
+    #[test]
+    fn sandbox_options_with_allow_degraded_sets_flag() {
+        let opts = SandboxOptions::with_allow_degraded(true);
+        assert!(opts.allow_degraded);
+        let opts = SandboxOptions::with_allow_degraded(false);
+        assert!(!opts.allow_degraded);
     }
 }

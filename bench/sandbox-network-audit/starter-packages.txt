@@ -1,0 +1,43 @@
+# Smoke-test slice for Phase 46.1 sandbox-network-denial audit.
+#
+# ~10 well-known packages chosen to exercise each family the
+# classifier in `run.sh` recognises. Use this list to verify the
+# harness runs end-to-end before launching the curated impact
+# sample produced by `build-input-list.sh`.
+#
+# Family assignments here MUST match `run.sh` `FAMILY=` case arms
+# (or the stderr-signal reclassifier). Drift causes smoke results
+# to be miscategorised against the README's bucket explanations.
+#
+# Currency note: packages cited here must actually carry a
+# `preinstall` / `install` / `postinstall` on their latest tag.
+# When upstream moves their install-time work to `prepare` /
+# `pre-commit` / explicit `npx <pkg> install` flow, drop the
+# entry and pick another from the same family in
+# `scripted-candidates.txt`. `playwright` (moved to `npx
+# playwright install`) and `husky` v9 (moved to `prepare`) were
+# both removed for exactly this reason — they no longer fire
+# during install, so the smoke run reported them as
+# `No packages have lifecycle scripts` and didn't exercise the
+# family.
+#
+# Lines starting with `#` and blank lines are ignored.
+
+# prebuild-downloader family
+esbuild@0.24.0
+sharp@0.33.5
+@swc/core@1.10.7
+
+# browser-fetcher family
+puppeteer@23.10.4
+cypress@15.14.2
+
+# native-bundler family (postinstall builds against host toolchain)
+prisma@5.22.0
+
+# telemetry family (opencollective notice runs from postinstall)
+core-js@3.49.0
+
+# other family — no-op postinstall / non-network failure modes
+fsevents@2.3.3
+node-pre-gyp@0.17.0

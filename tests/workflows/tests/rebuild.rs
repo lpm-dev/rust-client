@@ -680,3 +680,84 @@ fn rebuild_triage_json_separates_streams() {
         "both fixture packages must appear in the JSON dry-run output; got: {parsed}"
     );
 }
+
+// ─── Phase 46.1 GPT-5 audit round 2 (2026-05-11): strict + sandbox-log ──
+//
+// `--strict-sandbox` and `--sandbox-log` are NOT clap-rejected (they
+// have orthogonal-looking intents: one wants enforcement, the other
+// wants observation). When both arrive, `decide_runtime_sandbox_mode`
+// collapses to `SandboxMode::LogOnly` (the user explicitly asked to
+// observe). Pre-fix the install pipeline then emitted BOTH banners:
+//
+//   ! strict-sandbox: outbound network will be denied for every lifecycle script ...
+//   ! --sandbox-log: diagnostic mode only. Rule triggers are logged but NOT enforced ...
+//
+// — a contradictory pair. The fix gates the strict banner on the final
+// `SandboxMode::Enforce`; under LogOnly only the sandbox-log banner
+// fires. This test exercises that wiring end-to-end and pins the
+// contract so a future change that re-broadens the strict banner
+// trips this assertion directly.
+//
+// macOS-only: Linux landlock has no native observe-only primitive,
+// so `--sandbox-log` errors at the pre-probe with
+// `ModeNotSupportedOnPlatform` BEFORE the banner code runs — there's
+// nothing to assert about banner truthfulness on Linux.
+#[cfg(target_os = "macos")]
+#[test]
+fn rebuild_strict_plus_sandbox_log_suppresses_strict_banner_under_logonly() {
+    if !node_available() {
+        // Skip: this test needs a real spawn (not dry-run) to reach
+        // the banner site. Mirrors the soft-pass pattern used by
+        // other rebuild tests that exercise lifecycle scripts.
+        eprintln!(
+            "skipping rebuild_strict_plus_sandbox_log_suppresses_strict_banner_under_logonly: node not on PATH"
+        );
+        return;
+    }
+    let project = TempProject::empty("");
+    write_policy_manifest(
+        &project,
+        "rebuild-strict-plus-sandbox-log",
+        None, // deny default — but we'll trust the package below
+        &["green-pkg"],
+    );
+    let store_pkg = seed_scripted_package(&project, "green-pkg", "1.0.0", GREEN_POSTINSTALL);
+    seed_wrapper(&project, &store_pkg, "green-pkg", "1.0.0");
+    write_lockfile_for_packages(&project, &[("green-pkg", "1.0.0")]);
+
+    let out = lpm(&project)
+        .args(["rebuild", "--strict-sandbox", "--sandbox-log"])
+        .output()
+        .expect("spawn lpm rebuild --strict-sandbox --sandbox-log");
+
+    let stderr = strip_ansi(&String::from_utf8_lossy(&out.stderr));
+    let stdout = strip_ansi(&String::from_utf8_lossy(&out.stdout));
+
+    // The pair must parse (clap deliberately allows both — the
+    // mutex would prevent legitimate env/config strict + CLI
+    // sandbox-log combinations from being expressible).
+    assert!(
+        out.status.success() || stderr.contains("rebuild"),
+        "rebuild --strict-sandbox --sandbox-log must reach the rebuild pipeline (success or \
+         normal rebuild output). exit={:?}\nstdout:\n{stdout}\nstderr:\n{stderr}",
+        out.status,
+    );
+
+    // The sandbox-log banner MUST appear — LogOnly is the actual
+    // runtime mode, and users need to know rules are observed not
+    // enforced.
+    assert!(
+        stderr.contains("--sandbox-log: diagnostic mode only"),
+        "sandbox-log banner must fire under --sandbox-log (LogOnly is the active mode). \
+         stderr:\n{stderr}",
+    );
+
+    // The strict-sandbox banner MUST NOT appear — saying "outbound \
+    // network will be denied" alongside the sandbox-log "logged but \
+    // NOT enforced" line is contradictory and the bug GPT-5 caught.
+    assert!(
+        !stderr.contains("strict-sandbox: outbound network will be denied"),
+        "strict-sandbox banner MUST suppress itself under LogOnly — pre-fix it lied about \
+         enforcement. GPT-5 audit round 2 finding. stderr:\n{stderr}",
+    );
+}

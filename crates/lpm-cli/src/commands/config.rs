@@ -1,18 +1,20 @@
 use crate::output;
+use crate::prompt::prompt_err;
 use lpm_common::LpmError;
 use owo_colors::OwoColorize;
-use std::io::{BufRead, IsTerminal, Write};
+use std::io::IsTerminal;
 
 /// CLI configuration management.
 ///
 /// Stores config in ~/.lpm/config.toml (user/machine config).
 /// Project config lives in package.json under "lpm" key.
 ///
-/// Beyond `get`/`set`/`delete`/`list`, two focused wizards live here:
+/// Beyond `get`/`set`/`delete`/`list`, three focused wizards live here:
 /// - `lpm config scripts` owns `script-policy = deny | triage | allow`.
 /// - `lpm config triage` owns `triage-advisor = none | claude-cli | codex | ollama`.
+/// - `lpm config sandbox` owns `[sandbox] mode = default | strict | none`.
 ///
-/// Both default to interactive in a TTY; `--set <value>` is the
+/// All three default to interactive in a TTY; `--set <value>` is the
 /// non-interactive setter required for CI / scripted setup.
 pub async fn run(
     action: &str,
@@ -31,6 +33,9 @@ pub async fn run(
     }
     if action == "triage" {
         return run_triage_wizard(&config_path, set, json_output).await;
+    }
+    if action == "sandbox" {
+        return run_sandbox_wizard(&config_path, set, json_output).await;
     }
 
     match action {
@@ -312,23 +317,26 @@ async fn run_scripts_wizard(
     let current =
         read_string_value(config_path, SCRIPT_POLICY_KEY)?.unwrap_or_else(|| "deny".to_string());
     println!();
-    println!(
-        "{}",
-        "How should lpm treat package lifecycle scripts?".bold()
-    );
     println!("  current: {}", current.cyan());
-    println!();
-    println!("  1) deny    — never auto-run lifecycle scripts (default; most restrictive)");
-    println!("  2) triage  — Layers 1-3 always; advisor only if explicitly configured");
-    println!("  3) allow   — run every script (npm-classic; least restrictive)");
-    println!();
-    let chosen = prompt_choice("Pick 1, 2, or 3", &["1", "2", "3"])?;
-    let new_value = match chosen.as_str() {
-        "1" => "deny",
-        "2" => "triage",
-        "3" => "allow",
-        _ => unreachable!(),
-    };
+    let new_value: &str = cliclack::select("How should lpm treat package lifecycle scripts?")
+        .item(
+            "deny",
+            "deny — never auto-run lifecycle scripts",
+            "default; most restrictive",
+        )
+        .item(
+            "triage",
+            "triage — Layers 1-3 always; advisor only if configured",
+            "recommended",
+        )
+        .item(
+            "allow",
+            "allow — run every script",
+            "npm-classic; least restrictive",
+        )
+        .initial_value(current.as_str())
+        .interact()
+        .map_err(prompt_err)?;
     persist_string(config_path, SCRIPT_POLICY_KEY, new_value)?;
     announce_set(SCRIPT_POLICY_KEY, new_value, json_output);
 
@@ -374,11 +382,11 @@ async fn run_triage_wizard(
             "note".cyan(),
             current_policy.yellow()
         );
-        let switch = prompt_choice(
-            "Switch script-policy to \"triage\" now? [y/N]",
-            &["y", "n", ""],
-        )?;
-        if matches!(switch.as_str(), "y" | "Y") {
+        let switch = cliclack::confirm(r#"Switch script-policy to "triage" now?"#)
+            .initial_value(false)
+            .interact()
+            .map_err(prompt_err)?;
+        if switch {
             persist_string(config_path, SCRIPT_POLICY_KEY, "triage")?;
             output::success(&format!("Set {} = {}", SCRIPT_POLICY_KEY.bold(), "triage"));
         } else {
@@ -397,41 +405,35 @@ async fn run_triage_wizard(
         reports.iter().filter(|r| r.is_available()).collect();
 
     println!();
-    println!("{}", "Pick a triage advisor for amber-tier scripts:".bold());
     println!("  {PRIVACY_LINE}");
-    println!();
     if detected.is_empty() {
+        println!();
         println!(
             "  {}: no advisors detected on this machine (`claude` / `codex` / `ollama` \
              not on PATH or ollama daemon not running). You can still pick \"none\".",
             "note".cyan()
         );
-        println!();
     }
+
     // Build menu: detected first, then "none". Unavailable providers
     // are deliberately not listed (t3code's pattern — don't show
     // options the user can't pick).
-    let mut options: Vec<&str> = Vec::new();
+    let mut sel = cliclack::select("Pick a triage advisor for amber-tier scripts:");
     for r in &detected {
-        let label = match r.provider {
-            lpm_triage_advisor::Provider::Ollama => "ollama (local, no cloud egress)",
-            lpm_triage_advisor::Provider::ClaudeCli => "claude-cli (cloud)",
-            lpm_triage_advisor::Provider::Codex => "codex (cloud)",
+        let (label, hint) = match r.provider {
+            lpm_triage_advisor::Provider::Ollama => ("ollama", "local, no cloud egress"),
+            lpm_triage_advisor::Provider::ClaudeCli => ("claude-cli", "cloud"),
+            lpm_triage_advisor::Provider::Codex => ("codex", "cloud"),
         };
-        let slug = r.provider.slug();
-        options.push(slug);
-        println!("  {}) {}", options.len(), label);
+        sel = sel.item(r.provider.slug(), label, hint);
     }
-    options.push("none");
-    println!(
-        "  {}) none — Layers 1-3 only (portable triage)",
-        options.len()
-    );
-    println!();
-    let choices: Vec<String> = (1..=options.len()).map(|i| i.to_string()).collect();
-    let choice_refs: Vec<&str> = choices.iter().map(String::as_str).collect();
-    let idx = prompt_choice("Pick a number", &choice_refs)?;
-    let chosen_slug = options[idx.parse::<usize>().unwrap() - 1];
+    sel = sel.item("none", "none", "Layers 1-3 only (portable triage)");
+    // Default to the first detected provider when available, else "none".
+    let initial = detected
+        .first()
+        .map(|r| r.provider.slug())
+        .unwrap_or("none");
+    let chosen_slug: &str = sel.initial_value(initial).interact().map_err(prompt_err)?;
 
     // Test-invoke when a real provider is chosen. Distinguish
     // EnvironmentNotReady (recoverable → save anyway) from
@@ -444,13 +446,15 @@ async fn run_triage_wizard(
                     "  {}: the advisor binary is present but didn't return a verdict ({msg})",
                     "environment not ready".yellow(),
                 );
-                let save = prompt_choice(
-                    "Save this choice anyway? `lpm install` does not yet read \
-                     `triage-advisor` (install-time invocation ships in a follow-up), \
-                     so this only persists the preference. [y/N]",
-                    &["y", "n", "", "Y", "N"],
-                )?;
-                if !matches!(save.as_str(), "y" | "Y") {
+                let save = cliclack::confirm(
+                    "Save this choice anyway? `lpm install` will degrade to no-advisor \
+                     for any run where this provider isn't ready and print one warning; \
+                     install never fails because the advisor failed.",
+                )
+                .initial_value(false)
+                .interact()
+                .map_err(prompt_err)?;
+                if !save {
                     println!("  Aborted. No config change.");
                     return Ok(());
                 }
@@ -479,28 +483,6 @@ async fn test_invoke_provider(
         lpm_triage_advisor::Provider::Ollama => Box::new(OllamaAdapter::default()),
     };
     adapter.test_invoke().await
-}
-
-/// Stdin-line prompt with a small allowed-answer set. Re-asks on
-/// invalid input. Empty string is treated as the default ("" must be
-/// in the allowed set to accept).
-fn prompt_choice(prompt: &str, allowed: &[&str]) -> Result<String, LpmError> {
-    loop {
-        print!("> {prompt}: ");
-        std::io::stdout()
-            .flush()
-            .map_err(|e| LpmError::Registry(format!("stdout flush: {e}")))?;
-        let mut line = String::new();
-        std::io::stdin()
-            .lock()
-            .read_line(&mut line)
-            .map_err(|e| LpmError::Registry(format!("stdin read: {e}")))?;
-        let trimmed = line.trim().to_string();
-        if allowed.contains(&trimmed.as_str()) {
-            return Ok(trimmed);
-        }
-        println!("  invalid; pick one of: {}", allowed.join(" / "));
-    }
 }
 
 fn read_string_value(config_path: &std::path::Path, key: &str) -> Result<Option<String>, LpmError> {
@@ -532,38 +514,193 @@ fn announce_set(key: &str, value: &str, json_output: bool) {
 }
 
 /// Disclosure printed after `script-policy = triage` is persisted (via
-/// either `--set` or interactive). Tightens what the wizard implies:
-/// triage uses Layers 1-3 today, and the optional advisor preference
-/// (`lpm config triage`) is config-only — `lpm install` does not yet
-/// invoke an advisor at install time. The next slice ships that.
+/// either `--set` or interactive). After Phase 46 slice 1 the wizard
+/// now describes the actual install-time degrade-and-warn contract:
+/// triage uses Layers 1-3 always, an optional advisor uplift kicks
+/// in if configured + available, and a configured-but-unavailable
+/// advisor degrades cleanly with a one-line warning per install run.
 fn print_triage_policy_followup(json_output: bool) {
     if json_output {
         return;
     }
     println!();
     println!(
-        "  {}: triage uses Layers 1-3 today. Run `lpm config triage` to \
-         pick an optional advisor preference (claude-cli / codex / \
-         ollama). Note: install-time advisor invocation lands in a \
-         follow-up — for now `lpm install` ignores `triage-advisor`.",
+        "  {}: triage runs Layers 1-3 on every install. Run `lpm config \
+         triage` to pick an optional advisor (claude-cli / codex / \
+         ollama) that can promote some amber packages to auto-run \
+         this install. The advisor is consulted only for amber; \
+         green and hard-blocked paths are unchanged.",
         "tip".cyan()
     );
 }
 
+// ─────────────────────────────────────────────────────────────────────
+// `lpm config sandbox`  wizard  (Phase 46.1 rework, 2026-05-11)
+// ─────────────────────────────────────────────────────────────────────
+//
+// Persists `[sandbox] mode = "default" | "strict" | "none"` into
+// `~/.lpm/config.toml`. Mirror of `run_scripts_wizard` /
+// `run_triage_wizard`:
+//   - interactive (TTY): cliclack `select` with the current value
+//     pre-selected, plus an extra confirmation prompt when the user
+//     picks `none` (because that turns the install-time sandbox off
+//     wholesale).
+//   - `--set <value>`: non-interactive setter for CI / image bake
+//     dotfiles automation. Trusts the operator — no confirmation
+//     prompt even on `--set none`.
+//
+// The wizard ONLY touches `~/.lpm/config.toml`. The project-tier
+// `./lpm.toml > [sandbox] mode` is committed-by-the-team and intended
+// to be edited directly; the wizard's user-tier scope matches the
+// other two wizards.
+
+const SANDBOX_MODE_VALUES: &[&str] = &["default", "strict", "none"];
+
+async fn run_sandbox_wizard(
+    config_path: &std::path::Path,
+    set: Option<&str>,
+    json_output: bool,
+) -> Result<(), LpmError> {
+    if let Some(v) = set {
+        if !SANDBOX_MODE_VALUES.contains(&v) {
+            return Err(LpmError::Registry(format!(
+                "invalid sandbox mode '{v}'; must be one of: {}",
+                SANDBOX_MODE_VALUES.join(" | ")
+            )));
+        }
+        persist_sandbox_mode(config_path, v)?;
+        announce_sandbox_set(v, json_output);
+        return Ok(());
+    }
+
+    if !std::io::stdin().is_terminal() {
+        return Err(LpmError::Registry(
+            "lpm config sandbox requires a TTY; use `--set default|strict|none` instead"
+                .to_string(),
+        ));
+    }
+
+    let current = read_sandbox_mode(config_path)?.unwrap_or_else(|| "default".to_string());
+    println!();
+    println!("  current: {}", current.cyan());
+    let new_value: &str = cliclack::select("How strict should the install-time sandbox be?")
+        .item(
+            "default",
+            "default — filesystem + env containment, outbound network allowed",
+            "recommended",
+        )
+        .item(
+            "strict",
+            "strict  — + outbound network denied",
+            "paranoid / CI / enterprise",
+        )
+        .item(
+            "none",
+            "none    — sandbox off",
+            "NOT recommended — full host access for every script",
+        )
+        .initial_value(current.as_str())
+        .interact()
+        .map_err(prompt_err)?;
+
+    // Phase 46.1 DX redline: confirm when the user picks `none` in
+    // the interactive wizard. The `--set none` form trusts the
+    // operator (no TTY check); only the wizard prompts.
+    if new_value == "none" {
+        println!();
+        println!(
+            "  {}: setting sandbox mode to {} means every lifecycle script that runs \
+             gets full host access — filesystem open, full env (credentials), network. \
+             This is the npm-default shape; LPM does not recommend it as a persistent \
+             posture.",
+            "warning".yellow(),
+            "none".yellow().bold()
+        );
+        let confirmed = cliclack::confirm(
+            "Are you sure you want sandbox = none for every install on this machine?",
+        )
+        .initial_value(false)
+        .interact()
+        .map_err(prompt_err)?;
+        if !confirmed {
+            println!("  Aborted. No config change.");
+            return Ok(());
+        }
+    }
+
+    persist_sandbox_mode(config_path, new_value)?;
+    announce_sandbox_set(new_value, json_output);
+    Ok(())
+}
+
+/// Read the `[sandbox] mode` value from `~/.lpm/config.toml`. Returns
+/// `None` for missing file, missing section, or missing key.
+fn read_sandbox_mode(config_path: &std::path::Path) -> Result<Option<String>, LpmError> {
+    let cfg = read_config(config_path)?;
+    Ok(cfg
+        .get("sandbox")
+        .and_then(|v| v.as_table())
+        .and_then(|t| t.get("mode"))
+        .and_then(|v| v.as_str())
+        .map(String::from))
+}
+
+/// Persist the resolved sandbox mode into `[sandbox] mode` in the
+/// config file. Creates the `[sandbox]` table if absent; preserves
+/// any sibling keys (e.g. `allow-degraded`) untouched.
+fn persist_sandbox_mode(config_path: &std::path::Path, value: &str) -> Result<(), LpmError> {
+    let mut cfg = read_config(config_path)?;
+    let top = cfg.as_table_mut().ok_or_else(|| {
+        LpmError::Registry("config.toml must be a TOML table at the top level".into())
+    })?;
+    let sandbox_section = top
+        .entry("sandbox".to_string())
+        .or_insert_with(|| toml::Value::Table(toml::map::Map::new()));
+    let sandbox_table = sandbox_section.as_table_mut().ok_or_else(|| {
+        LpmError::Registry(format!(
+            "{}: `[sandbox]` is not a TOML table — refusing to clobber",
+            config_path.display(),
+        ))
+    })?;
+    sandbox_table.insert("mode".to_string(), toml::Value::String(value.to_string()));
+    write_config(config_path, &cfg)
+}
+
+fn announce_sandbox_set(value: &str, json_output: bool) {
+    if json_output {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "success": true,
+                "sandbox": { "mode": value },
+            }))
+            .unwrap()
+        );
+    } else {
+        output::success(&format!("Set [sandbox] mode = {}", value.bold()));
+    }
+}
+
 /// Disclosure printed after `triage-advisor = <value>` is persisted
-/// (via either `--set` or interactive). Closes the loop on the most
-/// common over-read of the wizard: "I picked claude-cli, so my
-/// installs now use it." They don't, yet — this PR ships only the
-/// config surface plus the audit-time measurement. Install-time
-/// consumption is the next slice.
+/// (via either `--set` or interactive). After slice 1 this describes
+/// the actual install-time contract:
+///   - `lpm install` preflights the advisor once per run.
+///   - If detect or test-invoke fails, the run degrades to
+///     `triage-advisor = "none"` semantics and prints one warning;
+///     the install never fails because the advisor failed.
+///   - The advisor only converts `Approve` verdicts into auto-run
+///     for amber packages this run; the approval is ephemeral and
+///     is NOT written to `trustedDependencies`.
 fn print_triage_advisor_followup(json_output: bool) {
     if json_output {
         return;
     }
     println!(
-        "  {}: install-time advisor invocation lands in a follow-up. \
-         `lpm install` does not yet read `triage-advisor`; your \
-         preference is saved and will take effect when that slice ships.",
+        "  {}: `lpm install` preflights the advisor once per run. If it's \
+         unavailable, the install degrades to no-advisor with one warning \
+         and never fails on the advisor. The advisor only promotes amber \
+         packages it returns Approve for, and the approval is ephemeral \
+         (no persistent trust entry).",
         "note".cyan()
     );
 }
@@ -652,6 +789,101 @@ mod wizard_tests {
         assert_eq!(
             table.get(SCRIPT_POLICY_KEY).and_then(|v| v.as_str()),
             Some("deny")
+        );
+    }
+
+    // ── sandbox wizard (Phase 46.1 rework) ─────────────────────────
+
+    #[tokio::test]
+    async fn sandbox_wizard_set_persists_each_valid_mode() {
+        for mode in &["default", "strict", "none"] {
+            let (_dir, path) = tmp_config();
+            run_sandbox_wizard(&path, Some(mode), true).await.unwrap();
+            let v = read_sandbox_mode(&path).unwrap();
+            assert_eq!(
+                v.as_deref(),
+                Some(*mode),
+                "sandbox mode '{mode}' must persist",
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn sandbox_wizard_set_rejects_unknown_mode() {
+        let (_dir, path) = tmp_config();
+        let err = run_sandbox_wizard(&path, Some("paranoid"), true)
+            .await
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("invalid sandbox mode 'paranoid'"),
+            "got: {msg}",
+        );
+        // No persistence on validation failure.
+        assert!(read_sandbox_mode(&path).unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn sandbox_wizard_preserves_sibling_keys() {
+        // The wizard writes `[sandbox] mode`; an existing
+        // `[sandbox] allow-degraded` must survive.
+        let (_dir, path) = tmp_config();
+        std::fs::write(
+            &path,
+            "unrelated = \"keep-me\"\n[sandbox]\nallow-degraded = true\n",
+        )
+        .unwrap();
+
+        run_sandbox_wizard(&path, Some("strict"), true)
+            .await
+            .unwrap();
+
+        let cfg = read_config(&path).unwrap();
+        let top = cfg.as_table().unwrap();
+        assert_eq!(
+            top.get("unrelated").and_then(|v| v.as_str()),
+            Some("keep-me"),
+            "top-level sibling must survive",
+        );
+        let sandbox = top.get("sandbox").and_then(|v| v.as_table()).unwrap();
+        assert_eq!(
+            sandbox.get("mode").and_then(|v| v.as_str()),
+            Some("strict"),
+            "mode must be written",
+        );
+        assert_eq!(
+            sandbox.get("allow-degraded").and_then(|v| v.as_bool()),
+            Some(true),
+            "sibling `allow-degraded` must survive — wizard must not clobber it",
+        );
+    }
+
+    #[tokio::test]
+    async fn sandbox_wizard_refuses_to_clobber_non_table_sandbox_key() {
+        // Defensive: if the user has somehow written `sandbox = "foo"` as
+        // a top-level string, refuse rather than clobbering it into a
+        // table. Honest error > silent migration on a typed config knob.
+        let (_dir, path) = tmp_config();
+        std::fs::write(&path, "sandbox = \"not-a-table\"\n").unwrap();
+        let err = run_sandbox_wizard(&path, Some("strict"), true)
+            .await
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("not a TOML table"), "got: {msg}");
+    }
+
+    #[tokio::test]
+    async fn sandbox_wizard_overwrites_existing_mode() {
+        let (_dir, path) = tmp_config();
+        run_sandbox_wizard(&path, Some("strict"), true)
+            .await
+            .unwrap();
+        run_sandbox_wizard(&path, Some("default"), true)
+            .await
+            .unwrap();
+        assert_eq!(
+            read_sandbox_mode(&path).unwrap().as_deref(),
+            Some("default")
         );
     }
 }
