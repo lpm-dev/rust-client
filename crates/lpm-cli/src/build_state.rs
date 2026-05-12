@@ -513,15 +513,27 @@ pub fn compute_blocked_packages_with_metadata(
             // surfaces as Green in the UI's blocked-set annotation
             // (consistent with what the install pipeline's amber-
             // filter at `collect_amber_classification_requests`
-            // sees). The two call sites MUST agree on the tier or a
-            // package can show "amber" in the blocked-set display
-            // while being silently excluded from the advisor's
-            // amber set.
+            // sees).
+            //
+            // Phase 46b Option B: `publish_age_secs = None` +
+            // `min_release_age_secs = 0` means the L1 widening fires
+            // independently of cooldown. This is correct here because
+            // `compute_blocked_packages_with_metadata` produces a
+            // UI-annotation tier on the BLOCKED set. Auto-run
+            // packages (those Lever #4 widened in the install
+            // pipeline) are already excluded from the blocked set
+            // upstream — so the cooldown defense was already applied
+            // there. The annotation here only fires for packages
+            // already in the blocked set; widening them to Green at
+            // annotation time has no security impact (they'll still
+            // require `lpm approve-scripts` to run).
             let repository = read_manifest_repository(&pkg_dir);
             let ctx = lpm_security::static_gate::ManifestContext {
                 package_name: name.as_str(),
                 repository: repository.as_deref(),
                 bin_names: &[],
+                publish_age_secs: None,
+                min_release_age_secs: 0,
             };
             let static_tier: Option<lpm_security::triage::StaticTier> = phase_bodies
                 .iter()
