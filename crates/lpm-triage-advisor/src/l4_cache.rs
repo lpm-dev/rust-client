@@ -385,6 +385,15 @@ pub struct CacheKeyInputs<'a> {
     /// `Some("")` so the absent and empty-string cases stay
     /// distinguishable.
     pub repository: Option<&'a str>,
+    /// Phase 46b Lever #3 — files the script body delegates to,
+    /// each as `(filename, content)` in canonical order. Two
+    /// installs with the same body but different referenced-file
+    /// content can legitimately produce different verdicts (the
+    /// embedded content IS what the model judges), so the cache
+    /// key must distinguish them. Empty slice folds in as "no
+    /// referenced files," which differs from a slice containing
+    /// one empty `(filename, "")` pair.
+    pub referenced_scripts: &'a [(&'a str, &'a str)],
     pub prompt_template_hash: &'a str,
     pub provider_slug: &'a str,
     pub model_version: &'a str,
@@ -409,6 +418,11 @@ pub fn build_cache_key(inputs: &CacheKeyInputs<'_>) -> String {
     // bytes.
     const REPO_PRESENT: u8 = 0x01;
     const REPO_ABSENT: u8 = 0x02;
+    // Phase 46b Lever #3 — sentinel separating the referenced-files
+    // section from the rest of the key. Distinct from FIELD_SEP /
+    // RECORD_SEP so the section boundary is unambiguous in the
+    // hash input stream.
+    const REF_SECTION_SEP: u8 = 0x1f;
 
     let mut h = Sha256::new();
     h.update(inputs.package_name.as_bytes());
@@ -430,6 +444,13 @@ pub fn build_cache_key(inputs: &CacheKeyInputs<'_>) -> String {
         None => {
             h.update([REPO_ABSENT]);
         }
+    }
+    h.update([REF_SECTION_SEP]);
+    for (filename, content) in inputs.referenced_scripts {
+        h.update(filename.as_bytes());
+        h.update([FIELD_SEP]);
+        h.update(content.as_bytes());
+        h.update([RECORD_SEP]);
     }
     h.update([FIELD_SEP]);
     h.update(inputs.prompt_template_hash.as_bytes());
@@ -468,6 +489,7 @@ mod tests {
             package_version: version,
             amber_phases: phases,
             repository: None,
+            referenced_scripts: &[],
             prompt_template_hash: template_hash,
             provider_slug: provider,
             model_version: model,
@@ -488,6 +510,28 @@ mod tests {
             package_version: version,
             amber_phases: phases,
             repository,
+            referenced_scripts: &[],
+            prompt_template_hash: template_hash,
+            provider_slug: provider,
+            model_version: model,
+        })
+    }
+
+    fn key_for_with_refs(
+        name: &str,
+        version: &str,
+        phases: &[(&str, &str)],
+        referenced_scripts: &[(&str, &str)],
+        template_hash: &str,
+        provider: &str,
+        model: &str,
+    ) -> String {
+        build_cache_key(&CacheKeyInputs {
+            package_name: name,
+            package_version: version,
+            amber_phases: phases,
+            repository: None,
+            referenced_scripts,
             prompt_template_hash: template_hash,
             provider_slug: provider,
             model_version: model,
@@ -643,6 +687,44 @@ mod tests {
             none, empty,
             "None vs Some(\"\") must differ — the sentinel byte separates them"
         );
+    }
+
+    #[test]
+    fn cache_key_distinguishes_referenced_script_axes() {
+        // Phase 46b Lever #3 — referenced scripts are a verdict
+        // input; adding files or changing their content must
+        // produce a different cache key.
+        let empty = key_for_with_refs("p", "1.0.0", &[("install", "x")], &[], "h", "p", "m");
+        let with_one = key_for_with_refs(
+            "p",
+            "1.0.0",
+            &[("install", "x")],
+            &[("./install.js", "content a")],
+            "h",
+            "p",
+            "m",
+        );
+        let with_changed = key_for_with_refs(
+            "p",
+            "1.0.0",
+            &[("install", "x")],
+            &[("./install.js", "content b")],
+            "h",
+            "p",
+            "m",
+        );
+        let with_two = key_for_with_refs(
+            "p",
+            "1.0.0",
+            &[("install", "x")],
+            &[("./install.js", "content a"), ("./other.js", "")],
+            "h",
+            "p",
+            "m",
+        );
+        assert_ne!(empty, with_one, "empty vs one file must differ");
+        assert_ne!(with_one, with_changed, "changed file content must differ");
+        assert_ne!(with_one, with_two, "adding files must differ");
     }
 
     #[test]

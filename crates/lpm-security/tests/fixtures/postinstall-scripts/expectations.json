@@ -211,7 +211,13 @@
     "id": "amber-d18-013-sharp-install-js",
     "expected": "amber",
     "package_name": "sharp",
-    "repository": "git+https://github.com/lovell/sharp.git"
+    "repository": "git+https://github.com/lovell/sharp.git",
+    "referenced_scripts": [
+      {
+        "filename": "install.js",
+        "content": "// Excerpt of sharp/install.js — fetches libvips from the package's own GitHub Releases.\nconst https = require('https');\nconst fs = require('fs');\nconst path = require('path');\nconst pkg = require('./package.json');\nconst platform = `${process.platform}-${process.arch}`;\nconst tarball = `libvips-${pkg.config.libvips}-${platform}.tar.br`;\nconst url = `https://github.com/lovell/sharp-libvips/releases/download/v${pkg.config.libvips}/${tarball}`;\nconst dest = path.join(__dirname, 'vendor', tarball);\nfs.mkdirSync(path.dirname(dest), { recursive: true });\nhttps.get(url, (res) => res.pipe(fs.createWriteStream(dest)));\n"
+      }
+    ]
   },
   {
     "id": "amber-d18-014-napi-rs-install-js",

@@ -7982,12 +7982,31 @@ fn collect_amber_classification_requests(
         // different sources produces TWO distinct approval keys
         // downstream — required so an approval on one source cannot
         // leak to a sibling source in the same install.
+        //
+        // Phase 46b Lever #3 — scan each amber phase body for files
+        // it delegates to and read them with the runbook's caps
+        // (depth 1, ≤ 32 KB, safe-relative only, non-text rejected).
+        // Deduplicate by filename across phases so a body that says
+        // `node install.js` for both preinstall and postinstall
+        // doesn't emit the same content twice.
+        let mut seen = std::collections::BTreeSet::new();
+        let mut referenced_scripts: Vec<(String, String)> = Vec::new();
+        for (_phase, body) in &amber_phases {
+            for (filename, content) in
+                crate::build_state::collect_referenced_scripts(&pkg_dir, body)
+            {
+                if seen.insert(filename.clone()) {
+                    referenced_scripts.push((filename, content));
+                }
+            }
+        }
         out.push(crate::triage_advisor_session::AmberPackageRequest {
             name: name.clone(),
             version: version.clone(),
             integrity: integrity.clone(),
             repository,
             amber_phases,
+            referenced_scripts,
         });
     }
     out

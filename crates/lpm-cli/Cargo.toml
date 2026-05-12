@@ -46,6 +46,7 @@ tokio-util = { workspace = true }
 reqwest = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+shlex = { workspace = true }
 miette = { workspace = true }
 owo-colors = { workspace = true }
 indicatif = { workspace = true }

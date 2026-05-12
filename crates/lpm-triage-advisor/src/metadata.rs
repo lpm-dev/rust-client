@@ -33,6 +33,11 @@ const PROMPT_HASH_CANARY: AmberScript<'static> = AmberScript {
     // `Some(...)` per package; that path is exercised by the
     // prompt unit tests, not the hash canary.
     repository: None,
+    // Phase 46b Lever #3 — canary uses an empty referenced-scripts
+    // slice so the hash captures the "no embedded files" render
+    // path. Lever-#3-enabled calls supply non-empty slices per
+    // package; that path is exercised by the prompt unit tests.
+    referenced_scripts: &[],
 };
 
 const VERSION_PROBE_TIMEOUT: Duration = Duration::from_secs(5);

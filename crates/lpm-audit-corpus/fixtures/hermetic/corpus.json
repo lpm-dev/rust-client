@@ -43,7 +43,13 @@
     "scripts": { "postinstall": "node install.js" },
     "publish_age_hours": 8760,
     "attestation_present": false,
-    "repository": "git+https://github.com/hermetic-org/hermetic-amber-binary-fetcher.git"
+    "repository": "git+https://github.com/hermetic-org/hermetic-amber-binary-fetcher.git",
+    "referenced_scripts": [
+      {
+        "filename": "install.js",
+        "content": "const https = require('https');\nconst fs = require('fs');\nconst path = require('path');\nconst pkg = require('./package.json');\n\nconst platform = process.platform;\nconst arch = process.arch;\nconst url = `https://github.com/hermetic-org/hermetic-amber-binary-fetcher/releases/download/v${pkg.version}/binary-${platform}-${arch}.tar.gz`;\nconst dest = path.join(__dirname, 'bin', `binary-${platform}-${arch}.tar.gz`);\n\nfs.mkdirSync(path.dirname(dest), { recursive: true });\nhttps.get(url, (res) => {\n  res.pipe(fs.createWriteStream(dest));\n});\n"
+      }
+    ]
   },
   {
     "name": "hermetic-amber-binary-fetcher-recent",
@@ -140,7 +146,13 @@
     },
     "publish_age_hours": 8760,
     "attestation_present": false,
-    "repository": "git+https://github.com/hermetic-org/hermetic-multiphase-worst-of.git"
+    "repository": "git+https://github.com/hermetic-org/hermetic-multiphase-worst-of.git",
+    "referenced_scripts": [
+      {
+        "filename": "install.js",
+        "content": "const https = require('https');\nconst fs = require('fs');\nconst path = require('path');\n\n// Fetches a prebuilt native binding from the package's own GitHub Releases.\nconst pkg = require('./package.json');\nconst url = `https://github.com/hermetic-org/hermetic-multiphase-worst-of/releases/download/v${pkg.version}/binding-${process.platform}-${process.arch}.node`;\nconst dest = path.join(__dirname, 'build', 'Release', 'binding.node');\nfs.mkdirSync(path.dirname(dest), { recursive: true });\nhttps.get(url, (res) => res.pipe(fs.createWriteStream(dest)));\n"
+      }
+    ]
   },
   {
     "name": "hermetic-amber-llm-with-attestation",
