@@ -2186,35 +2186,67 @@ fn create_bin_links_hoisted(
     let bin_dir = node_modules.join(".bin");
     let mut count = 0;
 
+    // Reuse a single PathBuf across all package iterations — eliminates the
+    // `node_modules.join(name)` and `pkg_dir.join("package.json")` allocations
+    // that otherwise happen unconditionally for every package regardless of
+    // whether it has bins. For a 266-package fixture like bench/fixture-large,
+    // this saves ~532 PathBuf allocations in a single function call.
+    //
+    // Scoped packages (e.g., "@scope/pkg") push two path components, so we
+    // count components with `Path::new(name).components().count()` to know
+    // how many `pop()` calls restore the buffer to `node_modules/`.
+    let mut pkg_path = node_modules.to_owned();
+    pkg_path.reserve(128);
+
     for (name, &pkg_idx) in hoisted {
         let pkg = &packages[pkg_idx];
-        let pkg_dir = node_modules.join(name);
+        // Count path components so pop() calls correctly restore pkg_path.
+        // Unscoped ("react") = 1, scoped ("@scope/pkg") = 2.
+        let n = Path::new(name.as_str()).components().count();
+        pkg_path.push(name.as_str()); // pkg_path = node_modules/<name>
+        pkg_path.push("package.json"); // pkg_path = node_modules/<name>/package.json
 
-        let pkg_json_path = pkg_dir.join("package.json");
-        if !pkg_json_path.exists() {
+        if !pkg_path.exists() {
+            pkg_path.pop();
+            for _ in 0..n {
+                pkg_path.pop();
+            }
             continue;
         }
 
-        let pkg_json = match lpm_workspace::read_package_json(&pkg_json_path) {
+        let pkg_json = match lpm_workspace::read_package_json(&pkg_path) {
             Ok(p) => p,
             Err(e) => {
                 tracing::debug!(
                     "skipping bin links for {}: failed to parse package.json: {e}",
                     pkg.name
                 );
+                pkg_path.pop();
+                for _ in 0..n {
+                    pkg_path.pop();
+                }
                 continue;
             }
         };
+        pkg_path.pop(); // pkg_path = node_modules/<name>
 
         let bin_config = match &pkg_json.bin {
             Some(b) => b,
-            None => continue,
+            None => {
+                for _ in 0..n {
+                    pkg_path.pop();
+                }
+                continue;
+            }
         };
 
         let pkg_name = pkg_json.name.as_deref().unwrap_or(&pkg.name);
         let entries = bin_config.entries(pkg_name);
 
         if entries.is_empty() {
+            for _ in 0..n {
+                pkg_path.pop();
+            }
             continue;
         }
 
@@ -2227,8 +2259,9 @@ fn create_bin_links_hoisted(
                 continue;
             }
 
-            // Finding #1: validate bin target path (no traversal)
-            let target = match validate_bin_target(&pkg_dir, script_path) {
+            // Finding #1: validate bin target path (no traversal).
+            // pkg_path = node_modules/<name> here, same as the old &pkg_dir.
+            let target = match validate_bin_target(&pkg_path, script_path) {
                 Ok(t) => t,
                 Err(reason) => {
                     tracing::warn!("bin: rejecting {cmd_name} from {pkg_name}: {reason}");
@@ -2278,6 +2311,11 @@ fn create_bin_links_hoisted(
 
             tracing::debug!("bin: {cmd_name} -> {}", target.display());
             count += 1;
+        }
+
+        // Restore pkg_path to node_modules/ for the next iteration.
+        for _ in 0..n {
+            pkg_path.pop();
         }
     }
 
