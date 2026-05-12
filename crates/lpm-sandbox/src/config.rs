@@ -293,8 +293,44 @@ fn logical_normalize(path: &Path) -> PathBuf {
 /// Reason phrases are user-facing (rendered into the
 /// InvalidSpec message) and name which root matched so the user
 /// knows which protection fired.
+///
+/// Phase 46.2 (2026-05-12): the absolute denylist is now
+/// platform-aware. The POSIX entries (`/`, `/etc`, `/var/run`,
+/// `/run`) protect Linux + macOS hosts. The Windows entries
+/// (`C:\Windows`, `C:\Program Files`, `C:\Program Files (x86)`,
+/// `C:\ProgramData`, plus any bare drive root like `C:\`) protect
+/// the equivalent system surfaces — `sandboxWriteDirs:
+/// ["C:\\Windows\\System32"]` is exactly as dangerous as the POSIX
+/// `/etc` case and the validator should refuse both. Home-rooted
+/// entries (`.ssh`, `.aws`, `.lpm`) stay the same on both platforms
+/// — Git / AWS CLI / LPM use the same conventions everywhere.
 fn matches_dangerous_root(path: &Path, home_dir: Option<&Path>) -> Option<&'static str> {
-    // Absolute paths that are always dangerous.
+    // Bare drive roots on Windows (`C:\`, `D:\`, etc.) are
+    // "writes to the whole drive" — semantically identical to the
+    // POSIX `/` case. Match on Component shape rather than a
+    // literal because the drive letter varies per host.
+    #[cfg(windows)]
+    {
+        let mut comps = path.components();
+        if let (Some(prefix), Some(root), None) =
+            (comps.next(), comps.next(), comps.next())
+            && matches!(prefix, std::path::Component::Prefix(_))
+            && matches!(root, std::path::Component::RootDir)
+        {
+            return Some(
+                "is a drive root — writes would affect the whole drive's namespace",
+            );
+        }
+    }
+
+    // Platform-specific absolute denylist. The POSIX entries are
+    // never hit on Windows (these paths aren't absolute under
+    // Windows path resolution, so they take the relative-entry
+    // path through `load_sandbox_write_dirs` instead); the Windows
+    // entries are likewise inert on POSIX hosts. Keeping both
+    // tables compiled on every target keeps the code grep-able
+    // even when reading on the "wrong" platform.
+    #[cfg(not(windows))]
     let absolute_denylist: &[(&str, &str)] = &[
         (
             "/",
@@ -304,18 +340,42 @@ fn matches_dangerous_root(path: &Path, home_dir: Option<&Path>) -> Option<&'stat
         ("/var/run", "is inside /var/run — runtime state"),
         ("/run", "is inside /run — runtime state (systemd)"),
     ];
+
+    #[cfg(windows)]
+    let absolute_denylist: &[(&str, &str)] = &[
+        (
+            r"C:\Windows",
+            r"is inside C:\Windows — Windows OS install (System32, drivers, registry)",
+        ),
+        (
+            r"C:\Program Files",
+            r"is inside C:\Program Files — installed application binaries",
+        ),
+        (
+            r"C:\Program Files (x86)",
+            r"is inside C:\Program Files (x86) — installed 32-bit application binaries",
+        ),
+        (
+            r"C:\ProgramData",
+            r"is inside C:\ProgramData — system-wide application configuration",
+        ),
+    ];
+
     for (dangerous, reason) in absolute_denylist {
         let d = Path::new(dangerous);
         // Exact match OR descendant match. `/` is handled specially
         // because EVERY path descends from it — we only want to
         // reject the literal `/` and not arbitrary paths (the other
         // denylist entries + allowlist + traversal check handle the
-        // rest).
+        // rest). The Windows drive-root case is handled above.
+        #[cfg(not(windows))]
         if *dangerous == "/" {
             if path == d {
                 return Some(*reason);
             }
-        } else if path == d || path.starts_with(d) {
+            continue;
+        }
+        if path == d || path.starts_with(d) {
             return Some(*reason);
         }
     }
@@ -323,7 +383,9 @@ fn matches_dangerous_root(path: &Path, home_dir: Option<&Path>) -> Option<&'stat
     if let Some(home) = home_dir {
         // Paths under the user's home that hold credentials or LPM
         // state. $HOME-rooted so we match the user who's actually
-        // running lpm, not a hardcoded /home/user/....
+        // running lpm, not a hardcoded /home/user/.... Same set on
+        // every platform — Git / AWS CLI / LPM use the same
+        // conventions on Windows.
         let home_denylist: &[(&str, &str)] = &[
             (".ssh", "is inside $HOME/.ssh — SSH private keys and config"),
             (
@@ -386,6 +448,42 @@ mod tests {
         load_sandbox_write_dirs(&env.package_json, &env.project, &[], None)
     }
 
+    /// Maps a Unix-shaped path literal to a platform-absolute form
+    /// suitable for embedding in a sandboxWriteDirs JSON array.
+    /// `/opt/local/share` stays `/opt/local/share` on Unix; on
+    /// Windows it becomes `C:/opt/local/share` (forward slashes
+    /// because JSON-encoding `\` doubles every character and makes
+    /// the test corpus unreadable; Windows path resolution accepts
+    /// `/` interchangeably). The drive-letter prefix is what makes
+    /// `Path::is_absolute()` return `true` under Windows path
+    /// resolution — `/opt/local/share` alone is "current drive's
+    /// root + relative", which the validator correctly flags as an
+    /// escape attempt on Windows.
+    fn unix_abs_str(unix_form: &str) -> String {
+        #[cfg(not(target_os = "windows"))]
+        {
+            unix_form.to_string()
+        }
+        #[cfg(target_os = "windows")]
+        {
+            // Keep the Unix shape with forward slashes for
+            // readability — Windows accepts both. The `C:` prefix
+            // is what flips `is_absolute()` to true.
+            assert!(
+                unix_form.starts_with('/'),
+                "unix_abs_str expects a leading-slash literal: {unix_form}"
+            );
+            format!("C:{unix_form}")
+        }
+    }
+
+    /// Companion of `unix_abs_str` that returns a `PathBuf` matching
+    /// what `load_sandbox_write_dirs` will produce — used for
+    /// roundtrip-equality assertions in the back-compat tests.
+    fn unix_abs_pathbuf(unix_form: &str) -> PathBuf {
+        PathBuf::from(unix_abs_str(unix_form))
+    }
+
     // ── Pre-slice-5 tests (back-compat: empty allowlist, no
     //    home; none of these entries touches the dangerous denylist) ──
 
@@ -414,11 +512,13 @@ mod tests {
 
     #[test]
     fn absolute_entry_kept_verbatim() {
-        let e =
-            fixture(r#"{"lpm":{"scripts":{"sandboxWriteDirs":["/home/u/.cache/ms-playwright"]}}}"#);
+        let abs = unix_abs_str("/home/u/.cache/ms-playwright");
+        let e = fixture(&format!(
+            r#"{{"lpm":{{"scripts":{{"sandboxWriteDirs":["{abs}"]}}}}}}"#
+        ));
         let v = load_back_compat(&e).unwrap();
         assert_eq!(v.len(), 1);
-        assert_eq!(v[0], PathBuf::from("/home/u/.cache/ms-playwright"));
+        assert_eq!(v[0], unix_abs_pathbuf("/home/u/.cache/ms-playwright"));
     }
 
     #[test]
@@ -432,14 +532,16 @@ mod tests {
 
     #[test]
     fn multiple_entries_preserved_in_order() {
-        let e = fixture(
-            r#"{"lpm":{"scripts":{"sandboxWriteDirs":["/abs/one","rel-two","/abs/three"]}}}"#,
-        );
+        let one = unix_abs_str("/abs/one");
+        let three = unix_abs_str("/abs/three");
+        let e = fixture(&format!(
+            r#"{{"lpm":{{"scripts":{{"sandboxWriteDirs":["{one}","rel-two","{three}"]}}}}}}"#
+        ));
         let v = load_back_compat(&e).unwrap();
         assert_eq!(v.len(), 3);
-        assert_eq!(v[0], PathBuf::from("/abs/one"));
+        assert_eq!(v[0], unix_abs_pathbuf("/abs/one"));
         assert_eq!(v[1], e.project.join("rel-two"));
-        assert_eq!(v[2], PathBuf::from("/abs/three"));
+        assert_eq!(v[2], unix_abs_pathbuf("/abs/three"));
     }
 
     #[test]
@@ -500,21 +602,25 @@ mod tests {
         // Absolute path outside project_dir, outside dangerous
         // denylist, outside any allowlist → accepted when
         // allowlist is empty (= back-compat).
-        let e = fixture(r#"{"lpm":{"scripts":{"sandboxWriteDirs":["/opt/local/share"]}}}"#);
+        let abs = unix_abs_str("/opt/local/share");
+        let e = fixture(&format!(
+            r#"{{"lpm":{{"scripts":{{"sandboxWriteDirs":["{abs}"]}}}}}}"#
+        ));
         let v = load_sandbox_write_dirs(&e.package_json, &e.project, &[], None).unwrap();
-        assert_eq!(v, vec![PathBuf::from("/opt/local/share")]);
+        assert_eq!(v, vec![unix_abs_pathbuf("/opt/local/share")]);
     }
 
     /// Reviewer's acceptance #2: descendant path accepted when
     /// allowlist is non-empty.
     #[test]
     fn slice5_descendant_of_allowlist_root_accepted() {
-        let e = fixture(
-            r#"{"lpm":{"scripts":{"sandboxWriteDirs":["/Users/alice/src/build-output"]}}}"#,
-        );
-        let allowlist = [PathBuf::from("/Users/alice/src")];
+        let entry = unix_abs_str("/Users/alice/src/build-output");
+        let e = fixture(&format!(
+            r#"{{"lpm":{{"scripts":{{"sandboxWriteDirs":["{entry}"]}}}}}}"#
+        ));
+        let allowlist = [unix_abs_pathbuf("/Users/alice/src")];
         let v = load_sandbox_write_dirs(&e.package_json, &e.project, &allowlist, None).unwrap();
-        assert_eq!(v, vec![PathBuf::from("/Users/alice/src/build-output")]);
+        assert_eq!(v, vec![unix_abs_pathbuf("/Users/alice/src/build-output")]);
     }
 
     /// Reviewer's acceptance #3: non-descendant absolute path
@@ -523,12 +629,19 @@ mod tests {
     /// needs fixing.
     #[test]
     fn slice5_non_descendant_absolute_rejected_when_allowlist_set() {
-        let e = fixture(r#"{"lpm":{"scripts":{"sandboxWriteDirs":["/opt/other/path"]}}}"#);
-        let allowlist = [PathBuf::from("/Users/alice/src")];
+        let entry = unix_abs_str("/opt/other/path");
+        let e = fixture(&format!(
+            r#"{{"lpm":{{"scripts":{{"sandboxWriteDirs":["{entry}"]}}}}}}"#
+        ));
+        let allowlist = [unix_abs_pathbuf("/Users/alice/src")];
         match load_sandbox_write_dirs(&e.package_json, &e.project, &allowlist, None) {
             Err(SandboxError::InvalidSpec { reason }) => {
+                // Use a stable substring that survives the platform
+                // path-shape switch. On Unix it'll be "/opt/other/path";
+                // on Windows it'll be "C:/opt/other/path" — both
+                // contain the suffix.
                 assert!(
-                    reason.contains("/opt/other/path"),
+                    reason.contains("opt/other/path") || reason.contains("opt\\other\\path"),
                     "error names the rejected path: {reason}"
                 );
                 assert!(
@@ -578,17 +691,37 @@ mod tests {
     /// Reviewer's acceptance #5: dangerous roots rejected even
     /// when they would match the allowlist — the dangerous
     /// denylist has final veto.
+    ///
+    /// Phase 46.2 (2026-05-12): platform-aware now. The
+    /// dangerous-system-root literals differ between POSIX
+    /// (`/etc`) and Windows (`C:\Windows`), but the veto-over-
+    /// allowlist semantic is identical — both cases must reject
+    /// even when the allowlist explicitly names the dangerous
+    /// root.
     #[test]
     fn slice5_dangerous_root_vetoes_allowlist_match() {
-        let e = fixture(r#"{"lpm":{"scripts":{"sandboxWriteDirs":["/etc/foo"]}}}"#);
-        // Allowlist includes `/etc` explicitly — this should NOT
-        // override the dangerous-denylist rule for /etc.
-        let allowlist = [PathBuf::from("/etc")];
+        #[cfg(not(target_os = "windows"))]
+        let (entry, root, expected_substr) = ("/etc/foo", PathBuf::from("/etc"), "etc");
+        #[cfg(target_os = "windows")]
+        let (entry, root, expected_substr) = (
+            r"C:\Windows\System32",
+            PathBuf::from(r"C:\Windows"),
+            "Windows",
+        );
+
+        let body = format!(
+            r#"{{"lpm":{{"scripts":{{"sandboxWriteDirs":[{}]}}}}}}"#,
+            // JSON-encode the entry — Windows paths need backslash
+            // doubling, POSIX paths pass through.
+            json_encode_literal(entry)
+        );
+        let e = fixture(&body);
+        let allowlist = [root];
         match load_sandbox_write_dirs(&e.package_json, &e.project, &allowlist, None) {
             Err(SandboxError::InvalidSpec { reason }) => {
                 assert!(
-                    reason.contains("/etc"),
-                    "error names the dangerous root: {reason}"
+                    reason.contains(expected_substr),
+                    "error names the dangerous root ({expected_substr:?}): {reason}"
                 );
                 assert!(
                     reason.contains("veto")
@@ -603,30 +736,67 @@ mod tests {
 
     /// Every dangerous-root denylist member rejected in isolation.
     /// Pins the individual entries so a refactor that drops one
-    /// (say `/var/run`) can't quietly ship.
+    /// (say `/var/run` on POSIX or `C:\ProgramData` on Windows)
+    /// can't quietly ship.
+    ///
+    /// The cases list differs per platform — there's no value in
+    /// asserting that `/etc/passwd` is rejected on Windows because
+    /// the validator hits the "not absolute" path first and the
+    /// rejection has nothing to do with the dangerous-root logic.
+    /// The home-rooted entries (`.ssh`, `.aws`, `.lpm`) are shared
+    /// because Git / AWS CLI / LPM use the same conventions on
+    /// every platform.
     #[test]
     fn slice5_every_dangerous_root_is_rejected() {
-        // Fake home for the $HOME-rooted entries. We use `/Users/_t`
-        // which is short enough that the synthesized `.ssh` etc.
-        // subpaths are self-contained.
-        let fake_home = PathBuf::from("/Users/_t");
-        let cases: &[&str] = &[
-            "/",
-            "/etc",
-            "/etc/passwd",
-            "/var/run",
-            "/var/run/docker.sock",
-            "/run",
-            "/run/user/1000",
-            "/Users/_t/.ssh",
-            "/Users/_t/.ssh/id_rsa",
-            "/Users/_t/.aws",
-            "/Users/_t/.aws/credentials",
-            "/Users/_t/.lpm",
-            "/Users/_t/.lpm/config.toml",
-        ];
+        #[cfg(not(target_os = "windows"))]
+        let (fake_home, cases): (PathBuf, &[&str]) = (
+            PathBuf::from("/Users/_t"),
+            &[
+                "/",
+                "/etc",
+                "/etc/passwd",
+                "/var/run",
+                "/var/run/docker.sock",
+                "/run",
+                "/run/user/1000",
+                "/Users/_t/.ssh",
+                "/Users/_t/.ssh/id_rsa",
+                "/Users/_t/.aws",
+                "/Users/_t/.aws/credentials",
+                "/Users/_t/.lpm",
+                "/Users/_t/.lpm/config.toml",
+            ],
+        );
+
+        #[cfg(target_os = "windows")]
+        let (fake_home, cases): (PathBuf, &[&str]) = (
+            PathBuf::from(r"C:\Users\_t"),
+            &[
+                r"C:\",
+                r"D:\",
+                r"C:\Windows",
+                r"C:\Windows\System32",
+                r"C:\Windows\System32\drivers\etc\hosts",
+                r"C:\Program Files",
+                r"C:\Program Files\Some Vendor\app.exe",
+                r"C:\Program Files (x86)",
+                r"C:\Program Files (x86)\Some Vendor\app.exe",
+                r"C:\ProgramData",
+                r"C:\ProgramData\ssl\private",
+                r"C:\Users\_t\.ssh",
+                r"C:\Users\_t\.ssh\id_rsa",
+                r"C:\Users\_t\.aws",
+                r"C:\Users\_t\.aws\credentials",
+                r"C:\Users\_t\.lpm",
+                r"C:\Users\_t\.lpm\config.toml",
+            ],
+        );
+
         for case in cases {
-            let body = format!(r#"{{"lpm":{{"scripts":{{"sandboxWriteDirs":["{case}"]}}}}}}"#);
+            let body = format!(
+                r#"{{"lpm":{{"scripts":{{"sandboxWriteDirs":[{}]}}}}}}"#,
+                json_encode_literal(case)
+            );
             let e = fixture(&body);
             let result =
                 load_sandbox_write_dirs(&e.package_json, &e.project, &[], Some(&fake_home));
@@ -635,6 +805,24 @@ mod tests {
                 "expected {case:?} to be rejected, got {result:?}"
             );
         }
+    }
+
+    /// Minimal JSON-string encoder for path literals embedded into
+    /// the sandboxWriteDirs corpus. Handles the two characters that
+    /// matter for Windows paths (`\` → `\\`, `"` → `\"`); not a
+    /// general JSON encoder.
+    fn json_encode_literal(s: &str) -> String {
+        let mut out = String::with_capacity(s.len() + 2);
+        out.push('"');
+        for c in s.chars() {
+            match c {
+                '\\' => out.push_str(r"\\"),
+                '"' => out.push_str(r#"\""#),
+                _ => out.push(c),
+            }
+        }
+        out.push('"');
+        out
     }
 
     /// Acceptance #6: no behavior change when `sandboxWriteDirs`
@@ -699,8 +887,26 @@ mod tests {
     #[test]
     fn matches_dangerous_root_ignores_home_entries_when_home_is_none() {
         // Without a home dir, $HOME-rooted dangerous checks can't
-        // fire — but the absolute /etc check should still work.
+        // fire — but the absolute-system-root check should still
+        // work. The literal varies per platform (POSIX `/etc` vs
+        // Windows `C:\Windows`); the underlying contract — "even
+        // without a home_dir, fall through to the absolute denylist"
+        // — is identical.
         assert!(matches_dangerous_root(Path::new("/Users/alice/.ssh"), None).is_none());
-        assert!(matches_dangerous_root(Path::new("/etc"), None).is_some());
+        #[cfg(not(target_os = "windows"))]
+        {
+            assert!(matches_dangerous_root(Path::new("/etc"), None).is_some());
+        }
+        #[cfg(target_os = "windows")]
+        {
+            assert!(
+                matches_dangerous_root(Path::new(r"C:\Windows"), None).is_some(),
+                "C:\\Windows must hit the Windows absolute-system-root denylist"
+            );
+            assert!(
+                matches_dangerous_root(Path::new(r"C:\"), None).is_some(),
+                "a bare drive root must be flagged as 'whole-drive-namespace'"
+            );
+        }
     }
 }

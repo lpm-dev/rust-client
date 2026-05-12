@@ -22,6 +22,46 @@ serde_json = { workspace = true }
 landlock = "0.4"
 libc = "0.2"
 
+# Phase 46.2: Windows backend uses Mandatory Integrity Control (drop
+# child to Low IL) plus a Job Object for kill-tree parity with Unix's
+# process group. `windows-sys` is the Microsoft-published low-level
+# FFI crate already used by `lpm-common` for `GetDriveTypeW` — the
+# workspace is on 0.60. Each feature flag below is a separate code-
+# gen unit, so we only enable the namespaces this backend actually
+# touches:
+#   - Win32_Foundation                 HANDLE, BOOL, error codes
+#   - Win32_Security                   PSID / ACL / TOKEN_MANDATORY_LABEL,
+#                                      Get/SetTokenInformation, ConvertString*
+#   - Win32_Security_Authorization     SetNamedSecurityInfoW (mandatory
+#                                      label on allow-set dirs) +
+#                                      ConvertStringSidToSidW
+#   - Win32_Storage_FileSystem         FILE_GENERIC_* access masks (not
+#                                      strictly required for the IL path
+#                                      but kept available for the future
+#                                      AppContainer follow-up)
+#   - Win32_System_Threading           CREATE_SUSPENDED creation flag +
+#                                      OpenProcessToken (declared in this
+#                                      namespace by windows-sys)
+#   - Win32_System_JobObjects          CreateJobObjectW, SetInformationJobObject,
+#                                      AssignProcessToJobObject
+#
+# Note: NtResumeProcess (the function we use to resume the suspended
+# child after dropping its integrity level) is undocumented and not
+# in windows-sys. We declare its `extern "system"` signature inline
+# in `src/windows.rs` and link against `ntdll.dll` via a `#[link]`
+# attribute on the extern block — same pattern as Sysinternals tools
+# and the Chromium sandbox use. The function has been stable since
+# Windows XP.
+[target.'cfg(target_os = "windows")'.dependencies]
+windows-sys = { version = "0.60", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Threading",
+    "Win32_System_JobObjects",
+] }
+
 [dev-dependencies]
 tempfile = "3"
 dirs = { workspace = true }

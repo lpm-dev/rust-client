@@ -97,23 +97,44 @@ pub fn try_build_sandbox(spec: SandboxSpec, mode: SandboxMode) -> Option<Box<dyn
 
 /// True if the host has a working sandbox for the mode. Use as a
 /// test-skip guard at the top of each `#[test]`.
+///
+/// Phase 46.2: the integration corpora in this directory
+/// (`compat_greens.rs`, `escape_corpus.rs`) drive sandboxed children
+/// via POSIX shell scripts (`/bin/sh -c "mkdir -p ..; echo > ..."`).
+/// On Windows the WindowsSandbox backend works fine, but `/bin/sh`
+/// isn't on the platform — the corpora's `run_script` helper would
+/// fail at the spawn step rather than test the sandbox property. We
+/// short-circuit here so those tests soft-skip on Windows rather
+/// than hard-fail on a missing shell; the Windows-specific
+/// containment contract is exercised by the inline tests in
+/// `crates/lpm-sandbox/src/windows.rs` (`spawns_a_trivial_benign_command_under_enforce`,
+/// `write_into_package_dir_under_enforce_succeeds`) which use
+/// `cmd.exe` directly.
 pub fn sandbox_supported(mode: SandboxMode) -> bool {
-    // Cheap synthetic probe — matches the build.rs pre-probe shape.
-    let home = match dirs::home_dir() {
-        Some(h) => h,
-        None => return false,
-    };
-    let probe = SandboxSpec {
-        package_dir: home.clone(),
-        project_dir: home.clone(),
-        package_name: "__probe".into(),
-        package_version: "0.0.0".into(),
-        store_root: home.clone(),
-        home_dir: home.clone(),
-        tmpdir: PathBuf::from("/tmp"),
-        extra_write_dirs: Vec::new(),
-    };
-    new_for_platform(probe, mode).is_ok()
+    #[cfg(target_os = "windows")]
+    {
+        let _ = mode;
+        false
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        // Cheap synthetic probe — matches the build.rs pre-probe shape.
+        let home = match dirs::home_dir() {
+            Some(h) => h,
+            None => return false,
+        };
+        let probe = SandboxSpec {
+            package_dir: home.clone(),
+            project_dir: home.clone(),
+            package_name: "__probe".into(),
+            package_version: "0.0.0".into(),
+            store_root: home.clone(),
+            home_dir: home.clone(),
+            tmpdir: PathBuf::from("/tmp"),
+            extra_write_dirs: Vec::new(),
+        };
+        new_for_platform(probe, mode).is_ok()
+    }
 }
 
 /// Run `sh -c <script>` inside the sandbox with stdio suppressed.
