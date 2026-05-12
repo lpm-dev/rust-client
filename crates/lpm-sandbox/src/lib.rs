@@ -44,7 +44,7 @@
 //! |----------|--------------------------|---------------------------|----------------------------|
 //! | macOS    | Seatbelt (`sandbox-exec`), `(deny default)` + narrow allows; **full outbound network denied** (Phase 46.1, no loopback exemption) — every socket family / type covered. | Seatbelt w/ `(allow (with report) default)` fallback | [`NoopSandbox`] |
 //! | Linux    | landlock V4 (kernel 6.7+) — filesystem + **outbound TCP** denial (BindTcp + ConnectTcp). UDP / raw / AF_PACKET / AF_NETLINK / DNS-via-UDP are NOT denied by V4 alone — closing that gap is Phase 46.1.1's seccomp-bpf layer. Kernels < 6.7 return [`SandboxError::KernelTooOld`] by default; explicit opt-in via `[sandbox] allow-degraded = true` falls back to V1 filesystem-only with a one-line stderr warning per install. | [`SandboxError::ModeNotSupportedOnPlatform`] — no native observe-only | [`NoopSandbox`] |
-//! | Windows  | [`SandboxError::UnsupportedPlatform`] — deferred to Phase 46.2 (Phase 46.1 left Windows out of scope; see design note) | [`SandboxError::UnsupportedPlatform`] | [`NoopSandbox`] |
+//! | Windows  | Phase 46.2: Mandatory Integrity Control (drop child to Low IL) + Job Object for kill-tree. Filesystem-write containment only — outbound network denial is **not** implemented; under default mode the posture is [`SandboxPosture::Default`]. Strict mode (`deny_outbound_network = true`) refuses with [`SandboxError::UnsupportedPlatform`] unless `allow_degraded = true`, in which case the backend succeeds with [`SandboxPosture::Degraded`] (`missing = "network-containment"`). The Phase 46.3 WFP layer closes the gap. | [`SandboxError::ModeNotSupportedOnPlatform`] — Mandatory Integrity Control has no native observe-only either | [`NoopSandbox`] |
 //!
 //! [`SandboxMode::Disabled`] always succeeds with a [`NoopSandbox`]:
 //! the `--no-sandbox` escape hatch (Phase 46.1 rework: single flag —
@@ -77,6 +77,14 @@ mod seatbelt;
 #[cfg(target_os = "linux")]
 mod linux;
 
+// Phase 46.2: Windows backend via Mandatory Integrity Control (drop
+// child to Low IL) + Job Object for kill-tree parity with Unix's
+// process group. See [`windows`] module docs for the mechanism + the
+// platform-asymmetric posture mapping (Default OK; Strict needs
+// Phase 46.3's WFP layer).
+#[cfg(target_os = "windows")]
+mod windows;
+
 // Rule description is platform-neutral so macOS CI + developer-host
 // test runs exercise it without a Linux kernel. The module is gated
 // on `target_os = "linux"` for production builds (where `linux.rs`
@@ -84,7 +92,15 @@ mod linux;
 // tests run on the macOS developer host). Non-Linux production
 // builds don't compile this module at all, which matches CLAUDE.md's
 // cross-platform hygiene rule.
-#[cfg(any(target_os = "linux", test))]
+//
+// Phase 46.2 (2026-05-12): excluded from Windows test builds. The
+// rule fixtures use hard-coded POSIX paths (`/home/u/...`, `/tmp`,
+// `/dev/null`, …) that aren't absolute on Windows, so on a Windows
+// test host they'd surface as InvalidSpec rejections — pure noise
+// for a Linux-only consumer. The Windows backend has its own
+// allow-set rendering (`crate::windows::writable_allow_set`) and
+// its own tests.
+#[cfg(any(target_os = "linux", all(test, not(target_os = "windows"))))]
 mod landlock_rules;
 
 // Phase 46.1 posture-decision helper. Pure (string in, decision out),
@@ -94,7 +110,12 @@ mod landlock_rules;
 // `test` build so the strict-vs-degraded table is testable on every
 // developer's machine without spinning up a Linux VM. Non-Linux
 // production builds skip the module — they have no consumer.
-#[cfg(any(target_os = "linux", test))]
+//
+// Phase 46.2 (2026-05-12): the Windows backend has its own
+// `decide_posture` (`crate::windows::decide_posture`), so this
+// Linux-shaped one stays gated off on Windows builds. Same
+// rationale as `landlock_rules` above.
+#[cfg(any(target_os = "linux", all(test, not(target_os = "windows"))))]
 mod posture_decision;
 
 pub mod config;
@@ -631,7 +652,26 @@ fn platform_backend(
     Ok(Box::new(linux::LandlockSandbox::new(spec, mode, options)?))
 }
 
-#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+#[cfg(target_os = "windows")]
+fn platform_backend(
+    spec: SandboxSpec,
+    mode: SandboxMode,
+    options: SandboxOptions,
+) -> Result<Box<dyn Sandbox>, SandboxError> {
+    // Phase 46.2: Mandatory Integrity Control backend. Strict mode
+    // (`deny_outbound_network = true`) is intentionally a soft refuse
+    // — the backend's `decide_posture` surfaces
+    // [`SandboxError::UnsupportedPlatform`] with a remediation block
+    // naming the four interim recourses (`allow-degraded`,
+    // `trustedDependencies`, `--no-sandbox`, drop back to default).
+    // When `allow_degraded = true`, the backend succeeds with
+    // [`SandboxPosture::Degraded`] and the install pipeline emits
+    // the per-install warning via
+    // [`SandboxPosture::degraded_warning_line`].
+    Ok(Box::new(windows::WindowsSandbox::new(spec, mode, options)?))
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
 fn platform_backend(
     _spec: SandboxSpec,
     _mode: SandboxMode,
@@ -654,6 +694,20 @@ fn platform_backend(
 /// fresh project would fail without this helper — they'd try to
 /// create `.husky` themselves and hit the sandbox rule gap.
 ///
+/// Phase 46.2 (2026-05-12): also pre-creates every entry of
+/// `spec.extra_write_dirs`. Before this, a user-declared
+/// `sandboxWriteDirs: ["build-output"]` entry would be accepted by
+/// the validator and then silently denied at runtime — the Windows
+/// backend's `apply_low_il_label` skips nonexistent paths, the
+/// script would try to `mkdir build-output` against a Medium-IL
+/// `project_dir` it can't write to, and the install would fail. The
+/// Seatbelt + landlock backends had the same hazard but it was less
+/// visible because POSIX `mkdir` against a Medium-IL parent fails
+/// with a clearer message; on Windows the failure mode was an opaque
+/// ERROR_ACCESS_DENIED. Pre-creating means every `extra_write_dirs`
+/// entry exists when `apply_low_il_label` / landlock / Seatbelt sees
+/// it, so the label / rule actually lands and the script can write.
+///
 /// Callers (build.rs production path + compat-corpus test fixtures)
 /// invoke this once before spawning scripts. Paths that already
 /// exist are left alone.
@@ -662,7 +716,10 @@ fn platform_backend(
 /// reason so the caller can distinguish "sandbox couldn't prep the
 /// filesystem" from "the sandbox itself failed."
 pub fn prepare_writable_dirs(spec: &SandboxSpec) -> Result<(), SandboxError> {
-    let candidates = [
+    // Built-in writable subpaths first. These mirror the
+    // standard-allow-set entries every backend renders into its
+    // profile / ruleset / IL label.
+    let builtin = [
         spec.project_dir.join(".husky"),
         spec.project_dir.join(".lpm"),
         spec.project_dir.join("node_modules"),
@@ -670,21 +727,77 @@ pub fn prepare_writable_dirs(spec: &SandboxSpec) -> Result<(), SandboxError> {
         spec.home_dir.join(".node-gyp"),
         spec.home_dir.join(".npm"),
     ];
-    for p in &candidates {
-        if !p.exists()
-            && let Err(e) = std::fs::create_dir_all(p)
-        {
-            return Err(SandboxError::InvalidSpec {
-                reason: format!(
-                    "failed to prepare writable dir {}: {e}. The sandbox needs \
-                         this path to exist before scripts run — see \
-                         `prepare_writable_dirs` docs.",
-                    p.display()
-                ),
-            });
-        }
+    for p in &builtin {
+        ensure_writable_dir_exists(p)?;
+    }
+
+    // Then user-declared `sandboxWriteDirs`. These have already been
+    // validated by `load_sandbox_write_dirs` — joined-with-project
+    // for relative entries, dangerous-root + allowlist + traversal
+    // checked. Creating them here closes the
+    // "declared-but-not-yet-on-disk" gap that would otherwise
+    // surface as a runtime denial on Windows.
+    for p in &spec.extra_write_dirs {
+        ensure_writable_dir_exists(p)?;
     }
     Ok(())
+}
+
+fn ensure_writable_dir_exists(p: &std::path::Path) -> Result<(), SandboxError> {
+    if !p.exists()
+        && let Err(e) = std::fs::create_dir_all(p)
+    {
+        return Err(SandboxError::InvalidSpec {
+            reason: format!(
+                "failed to prepare writable dir {}: {e}. The sandbox needs \
+                     this path to exist before scripts run — see \
+                     `prepare_writable_dirs` docs.",
+                p.display()
+            ),
+        });
+    }
+    Ok(())
+}
+
+/// Tear down the entire process tree for a sandboxed child by PID.
+///
+/// On Unix this is a no-op: the install pipeline already kills the
+/// child's process group directly via `kill(-pid, SIGKILL)` because
+/// the [`Sandbox::spawn`] path puts the lifecycle child in its own
+/// group via `process_group(0)`.
+///
+/// On Windows the lifecycle child is attached to a Job Object with
+/// `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`, but the parent retains a
+/// handle to the Job (held inside the sandbox crate so descendants
+/// survive `Child::wait`). Calling `child.kill()` only terminates
+/// the root process; descendants survive until parent exit. Routing
+/// through this function instead calls `TerminateJobObject` which
+/// the kernel propagates to every member of the tree, then drops
+/// the cached handle so the kernel reclaims the Job.
+///
+/// Idempotent: PIDs without a tracked entry (Unix; Windows children
+/// that exited normally; PIDs from non-sandboxed spawns) are silent
+/// no-ops. Always pair with `Child::kill()` for belt-and-suspenders
+/// behavior on platforms where the tracker isn't populated.
+pub fn terminate_sandbox_tree(_pid: u32) {
+    #[cfg(target_os = "windows")]
+    windows::terminate_sandbox_tree(_pid);
+}
+
+/// Release the sandbox-tracker entry for a child that exited
+/// normally (no timeout, no panic). On Unix this is a no-op. On
+/// Windows it drops the cached Job-Object handle so the kernel can
+/// reclaim it — without this, the tracker accumulates one open
+/// HANDLE per successful lifecycle script for the parent's lifetime.
+///
+/// Production callers in the install pipeline invoke this after a
+/// `Child::wait` returns naturally; the timeout-kill path uses
+/// [`terminate_sandbox_tree`] instead which also handles release.
+///
+/// Idempotent: missing entries are silent no-ops.
+pub fn release_sandbox_tracker(_pid: u32) {
+    #[cfg(target_os = "windows")]
+    windows::release_sandbox_tracker_entry(_pid);
 }
 
 /// User-facing remediation string for [`SandboxError::UnsupportedPlatform`].
@@ -695,18 +808,20 @@ pub fn prepare_writable_dirs(spec: &SandboxSpec) -> Result<(), SandboxError> {
 /// Phase 46.1 rework (2026-05-11): the `--unsafe-full-env` partner
 /// flag was collapsed into `--no-sandbox` (Q6), so the remediation
 /// names a single flag now.
+///
+/// Phase 46.2 (2026-05-12): Windows now has a real backend
+/// (`windows::WindowsSandbox`), so the legacy "Windows isn't
+/// supported" special case is gone. The Windows strict-mode refusal
+/// path generates its OWN remediation via
+/// `windows::strict_not_yet_supported_remediation`; this generic
+/// helper only fires for unsupported platforms (FreeBSD, OpenBSD,
+/// illumos, etc.).
 pub fn unsupported_remediation(platform: &str) -> String {
-    match platform {
-        "windows" => "sandbox enforcement isn't supported on Windows yet. Re-run with \
-			 --no-sandbox to execute scripts without containment, or set \
-			 script-policy = deny."
-            .to_string(),
-        _ => format!(
-            "{platform} has no LPM sandbox backend. Re-run with \
-			 --no-sandbox to execute scripts without containment, or set \
-			 script-policy = deny."
-        ),
-    }
+    format!(
+        "{platform} has no LPM sandbox backend. Re-run with \
+		 --no-sandbox to execute scripts without containment, or set \
+		 script-policy = deny."
+    )
 }
 
 fn validate_spec(spec: &SandboxSpec) -> Result<(), SandboxError> {
@@ -804,15 +919,47 @@ mod tests {
     use super::*;
     use std::path::PathBuf;
 
+    /// Platform-aware fixture. `validate_spec` requires every path
+    /// to be absolute by the calling OS's definition — `/home/u/...`
+    /// is absolute on Unix but **NOT** on Windows (Windows requires a
+    /// drive letter prefix or UNC root). Phase 46.2 (2026-05-12)
+    /// surfaced this gap when wiring the Windows test build; pre-
+    /// 46.2 the workspace's test fixtures never ran on Windows
+    /// because the platform had no backend. The cfg block below
+    /// keeps the existing Unix paths verbatim and provides a
+    /// drive-letter equivalent for Windows so the same assertions
+    /// pass on both.
     fn sample_spec() -> SandboxSpec {
+        #[cfg(not(target_os = "windows"))]
+        const PKG_DIR: &str = "/home/u/.lpm/store/prisma@5.22.0";
+        #[cfg(not(target_os = "windows"))]
+        const PROJECT_DIR: &str = "/home/u/proj";
+        #[cfg(not(target_os = "windows"))]
+        const STORE_ROOT: &str = "/home/u/.lpm/store";
+        #[cfg(not(target_os = "windows"))]
+        const HOME_DIR: &str = "/home/u";
+        #[cfg(not(target_os = "windows"))]
+        const TMPDIR: &str = "/tmp";
+
+        #[cfg(target_os = "windows")]
+        const PKG_DIR: &str = r"C:\lpm-test\home\u\.lpm\store\prisma@5.22.0";
+        #[cfg(target_os = "windows")]
+        const PROJECT_DIR: &str = r"C:\lpm-test\home\u\proj";
+        #[cfg(target_os = "windows")]
+        const STORE_ROOT: &str = r"C:\lpm-test\home\u\.lpm\store";
+        #[cfg(target_os = "windows")]
+        const HOME_DIR: &str = r"C:\lpm-test\home\u";
+        #[cfg(target_os = "windows")]
+        const TMPDIR: &str = r"C:\lpm-test\tmp";
+
         SandboxSpec {
-            package_dir: PathBuf::from("/home/u/.lpm/store/prisma@5.22.0"),
-            project_dir: PathBuf::from("/home/u/proj"),
+            package_dir: PathBuf::from(PKG_DIR),
+            project_dir: PathBuf::from(PROJECT_DIR),
             package_name: "prisma".into(),
             package_version: "5.22.0".into(),
-            store_root: PathBuf::from("/home/u/.lpm/store"),
-            home_dir: PathBuf::from("/home/u"),
-            tmpdir: PathBuf::from("/tmp"),
+            store_root: PathBuf::from(STORE_ROOT),
+            home_dir: PathBuf::from(HOME_DIR),
+            tmpdir: PathBuf::from(TMPDIR),
             extra_write_dirs: Vec::new(),
         }
     }
@@ -853,13 +1000,19 @@ mod tests {
 
     #[test]
     fn error_display_unsupported_platform_mentions_platform_and_remediation() {
+        // Phase 46.2 (2026-05-12): Windows is no longer unsupported,
+        // so we exercise the generic-unsupported path here with a
+        // platform that genuinely has no backend (FreeBSD). The
+        // Windows-specific strict-not-yet-supported remediation is
+        // generated by the Windows backend itself and tested in
+        // [`windows::tests`].
         let e = SandboxError::UnsupportedPlatform {
-            platform: "windows".into(),
-            remediation: unsupported_remediation("windows"),
+            platform: "freebsd".into(),
+            remediation: unsupported_remediation("freebsd"),
         };
         let msg = format!("{e}");
-        assert!(msg.contains("windows"), "got: {msg}");
-        assert!(msg.contains("isn't supported"), "got: {msg}");
+        assert!(msg.contains("freebsd"), "got: {msg}");
+        assert!(msg.contains("has no LPM sandbox backend"), "got: {msg}");
         // Phase 46.1 rework (2026-05-11): single `--no-sandbox` flag,
         // legacy `--unsafe-full-env` partner removed per Q6.
         assert!(msg.contains("--no-sandbox"), "got: {msg}");
@@ -926,9 +1079,15 @@ mod tests {
     }
 
     #[test]
-    fn unsupported_remediation_windows_says_not_supported_yet_and_names_escape_hatch() {
-        let s = unsupported_remediation("windows");
-        assert!(s.contains("isn't supported"));
+    fn unsupported_remediation_generic_unix_names_platform() {
+        // Phase 46.2 (2026-05-12): Windows is no longer routed
+        // through this helper — its own backend generates a richer
+        // remediation when strict mode is requested without the
+        // degraded opt-in. The helper now produces a uniform
+        // message for every platform that genuinely has no backend
+        // (FreeBSD, OpenBSD, illumos, …).
+        let s = unsupported_remediation("freebsd");
+        assert!(s.contains("freebsd"));
         // Phase 46.1 rework: single `--no-sandbox` flag.
         assert!(s.contains("--no-sandbox"));
         assert!(
@@ -938,15 +1097,78 @@ mod tests {
         assert!(s.contains("script-policy = deny"));
     }
 
+    /// Phase 46.2 follow-up: every entry of `spec.extra_write_dirs`
+    /// must exist on disk after `prepare_writable_dirs` returns.
+    /// Without this, a user-declared `sandboxWriteDirs: ["build-output"]`
+    /// would survive validation but be silently denied at runtime
+    /// (the Windows backend's `apply_low_il_label` skips nonexistent
+    /// paths, the script then tries `mkdir build-output` against a
+    /// Medium-IL `project_dir`, and fails with ERROR_ACCESS_DENIED).
     #[test]
-    fn unsupported_remediation_generic_unix_names_platform() {
-        let s = unsupported_remediation("freebsd");
-        assert!(s.contains("freebsd"));
-        // Phase 46.1 rework: single `--no-sandbox` flag.
-        assert!(s.contains("--no-sandbox"));
+    fn prepare_writable_dirs_creates_extra_write_dirs() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let project = tmp.path().join("proj");
+        let home = tmp.path().join("home");
+        let extra_a = project.join("build-output");
+        let extra_b = tmp.path().join("siblings").join("dist");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::create_dir_all(&home).unwrap();
+
+        let spec = SandboxSpec {
+            package_dir: tmp.path().join("pkg"),
+            project_dir: project.clone(),
+            package_name: "p".into(),
+            package_version: "1.0.0".into(),
+            store_root: tmp.path().join("store"),
+            home_dir: home.clone(),
+            tmpdir: tmp.path().join("tmpdir"),
+            extra_write_dirs: vec![extra_a.clone(), extra_b.clone()],
+        };
+        std::fs::create_dir_all(&spec.package_dir).unwrap();
+        std::fs::create_dir_all(&spec.tmpdir).unwrap();
+
+        prepare_writable_dirs(&spec).expect("prep must succeed");
+
+        // Builtins:
+        assert!(project.join(".husky").exists(), "missing .husky");
+        assert!(project.join(".lpm").exists(), "missing .lpm");
         assert!(
-            !s.contains("--unsafe-full-env"),
-            "legacy partner flag must be gone: {s}",
+            project.join("node_modules").exists(),
+            "missing node_modules"
+        );
+        assert!(home.join(".cache").exists(), "missing .cache");
+        assert!(home.join(".node-gyp").exists(), "missing .node-gyp");
+        assert!(home.join(".npm").exists(), "missing .npm");
+
+        // The actual fix:
+        assert!(
+            extra_a.exists() && extra_a.is_dir(),
+            "extra_write_dirs[0] must be pre-created: {}",
+            extra_a.display()
+        );
+        assert!(
+            extra_b.exists() && extra_b.is_dir(),
+            "extra_write_dirs[1] must be pre-created even when its parent didn't exist: {}",
+            extra_b.display()
+        );
+    }
+
+    #[test]
+    fn unsupported_remediation_no_longer_specials_windows_post_phase_46_2() {
+        // Pin the removal of the legacy Windows special case so a
+        // future "let's add a Windows case back here" PR has to
+        // delete this test on the way through. Phase 46.2 ships a
+        // real Windows backend; the generic message is the right
+        // shape now that Windows reaches the same surface as the
+        // other supported OSes.
+        let s = unsupported_remediation("windows");
+        assert!(
+            s.contains("has no LPM sandbox backend"),
+            "Windows must use the generic shape post-46.2: {s}",
+        );
+        assert!(
+            !s.contains("isn't supported"),
+            "legacy Windows-special wording must be gone: {s}",
         );
     }
 
@@ -1015,20 +1237,71 @@ mod tests {
         assert_eq!(sb.mode(), SandboxMode::Disabled);
     }
 
+    /// Platform-portable "succeed immediately" command for noop /
+    /// sandbox smoke tests. POSIX hosts have `true` on PATH;
+    /// Windows ships `cmd.exe` in `%SYSTEMROOT%\System32` and we
+    /// pass it through `cmd.exe /c exit 0`. Returns the program +
+    /// args + minimum env passthrough required to actually run the
+    /// child (Windows cmd.exe needs SYSTEMROOT/COMSPEC/WINDIR to
+    /// resolve its own DLL load chain, per the §8 trap in the
+    /// Phase 46.2 handoff).
+    fn trivial_success_command() -> SandboxedCommand {
+        let pass = |k: &str| -> (String, OsString) {
+            (k.to_string(), std::env::var_os(k).unwrap_or_default())
+        };
+        #[cfg(unix)]
+        {
+            SandboxedCommand::new("true").envs_cleared([pass("PATH")])
+        }
+        #[cfg(windows)]
+        {
+            SandboxedCommand::new("cmd.exe")
+                .arg("/D")
+                .arg("/C")
+                .arg("exit 0")
+                .envs_cleared([
+                    pass("PATH"),
+                    pass("SYSTEMROOT"),
+                    pass("COMSPEC"),
+                    pass("WINDIR"),
+                ])
+        }
+    }
+
+    /// Platform-portable "definitely doesn't exist" program path
+    /// for the spawn-failure structural test. The Unix form uses a
+    /// POSIX-shaped sentinel; the Windows form uses a drive-rooted
+    /// path so the OS path resolver actually treats it as absolute
+    /// (a leading `/` on Windows resolves relative to the current
+    /// drive's root, which is non-deterministic across hosts).
+    fn nonexistent_program() -> &'static str {
+        #[cfg(unix)]
+        {
+            "/does/not/exist/lpm-sandbox-test-probe"
+        }
+        #[cfg(windows)]
+        {
+            r"C:\does\not\exist\lpm-sandbox-test-probe.exe"
+        }
+    }
+
     #[test]
     fn noop_sandbox_runs_a_trivial_command() {
         let sb = new_for_platform(sample_spec(), SandboxMode::Disabled).unwrap();
-        let cmd = SandboxedCommand::new("true")
-            .envs_cleared([("PATH", std::env::var_os("PATH").unwrap_or_default())]);
-        let mut child = sb.spawn(cmd).expect("noop spawn must succeed");
+        let mut child = sb
+            .spawn(trivial_success_command())
+            .expect("noop spawn must succeed");
         let status = child.wait().expect("wait");
-        assert!(status.success(), "true must exit 0, got {status:?}");
+        assert!(
+            status.success(),
+            "trivial success command must exit 0, got {status:?}"
+        );
     }
 
     #[test]
     fn noop_sandbox_reports_spawn_failure_structurally() {
         let sb = new_for_platform(sample_spec(), SandboxMode::Disabled).unwrap();
-        let cmd = SandboxedCommand::new("/does/not/exist/lpm-sandbox-test-probe");
+        let cmd = SandboxedCommand::new(nonexistent_program());
         match sb.spawn(cmd) {
             Err(SandboxError::SpawnFailed { reason }) => {
                 assert!(!reason.is_empty(), "reason must be populated");
@@ -1055,7 +1328,7 @@ mod tests {
         assert!(new_for_platform(s, SandboxMode::Disabled).is_ok());
     }
 
-    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
     #[test]
     fn factory_returns_unsupported_platform_on_unsupported_os() {
         let r = new_for_platform(sample_spec(), SandboxMode::Enforce);
@@ -1086,6 +1359,25 @@ mod tests {
             .expect("macOS factory must succeed");
         assert_eq!(sb.backend_name(), "seatbelt");
         assert_eq!(sb.mode(), SandboxMode::Enforce);
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn factory_returns_windows_backend_on_windows() {
+        // Phase 46.2 (2026-05-12): real backend via Mandatory
+        // Integrity Control + Job Object. Default options yield the
+        // relaxed default — filesystem-write containment only,
+        // network allowed. Construction has no kernel-version gate
+        // (MIC has been in every Windows release since Vista), so
+        // the only acceptable outcomes are `Ok` with backend name
+        // `windows-il`. A failure here means the FFI binding broke;
+        // surface it as a panic.
+        let sb = new_for_platform(sample_spec(), SandboxMode::Enforce).expect(
+            "Windows factory must succeed on a host that supports Mandatory Integrity Control",
+        );
+        assert_eq!(sb.backend_name(), "windows-il");
+        assert_eq!(sb.mode(), SandboxMode::Enforce);
+        assert_eq!(sb.posture(), SandboxPosture::Default);
     }
 
     #[cfg(target_os = "linux")]

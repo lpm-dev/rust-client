@@ -147,15 +147,27 @@ pub fn lpm(project: &TempProject) -> assert_cmd::Command {
     let mut cmd = assert_cmd::Command::cargo_bin("lpm-rs").expect("lpm-rs binary not found");
     cmd.current_dir(project.path());
 
-    // Isolate HOME so keyring, config, store, cache all land in temp dir
+    // Isolate HOME so keyring, config, store, cache all land in temp dir.
+    // POSIX hosts route through `$HOME` for `dirs::home_dir()`; Windows
+    // does NOT (it calls `SHGetKnownFolderPath(FOLDERID_Profile)`, which
+    // ignores every env var and returns the real user profile from the
+    // registry). The `LPM_HOME` override below is what actually isolates
+    // lpm-rs on Windows — `LpmRoot::from_env` consults it first, before
+    // any `dirs::home_dir()` fallback fires. Keep both: `HOME` keeps
+    // POSIX paths working without forcing every test to opt into
+    // `LPM_HOME`, and `LPM_HOME` is the cross-platform canonical knob.
     cmd.env("HOME", project.home());
+    let lpm_home = project.home().join(".lpm");
+    cmd.env("LPM_HOME", &lpm_home);
 
     // Isolate XDG dirs to prevent leaking desktop state
     cmd.env("XDG_CONFIG_HOME", project.home().join(".config"));
     cmd.env("XDG_DATA_HOME", project.home().join(".local/share"));
     cmd.env("XDG_CACHE_HOME", project.home().join(".cache"));
 
-    // Isolate LPM-specific paths
+    // Isolate LPM-specific paths. Note: production lpm-rs only reads
+    // `LPM_HOME` (above) — these two are kept for documentation / future
+    // override hooks but are currently dead env on the binary side.
     cmd.env("LPM_STORE_DIR", project.store_dir());
     cmd.env("LPM_CACHE_DIR", project.cache_dir());
 

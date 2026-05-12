@@ -788,9 +788,17 @@ async fn run_under_store_lock(
         Some(&home_dir),
     )
     .map_err(|e| LpmError::Registry(format!("{e}")))?;
-    let tmpdir = std::env::var_os("TMPDIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("/tmp"));
+    // Phase 46.2 round-5 (2026-05-12): `std::env::temp_dir()` resolves
+    // tmpdir portably — POSIX checks `TMPDIR` → falls back to `/tmp`;
+    // Windows checks `TMP` → `TEMP` → `USERPROFILE\AppData\Local\Temp`.
+    // Pre-46.2-round-5 the helper hardcoded `TMPDIR` + `/tmp` fallback,
+    // which on Windows produced a non-absolute path string (`/tmp` is
+    // relative under Windows path resolution — no drive letter, no UNC
+    // prefix). The sandbox spec validator then rejected the spec with
+    // `tmpdir must be absolute, got /tmp`, breaking every lifecycle
+    // spawn under triage / autoBuild on Windows. `std::env::temp_dir()`
+    // is what every other cross-platform tool uses for this resolution.
+    let tmpdir = std::env::temp_dir();
 
     // Phase 46 P5 Chunk 5: ensure the "standard" writable subpaths
     // exist on disk before spawning scripts. Sandbox rules allow
@@ -799,6 +807,17 @@ async fn run_under_store_lock(
     // `.husky` would need write on `{project}` which we don't
     // grant). Without this, a first-time `husky install` would
     // fail under Enforce.
+    //
+    // Phase 46.2 round-2 (2026-05-12): thread `extra_write_dirs`
+    // through too — user-declared `sandboxWriteDirs` entries had to
+    // be pre-created for the same reason the built-ins do (creating
+    // `<project>/build-output` requires write on `<project>`, which
+    // we deliberately don't grant). Pre-46.2-round-2 this Vec was
+    // hardcoded empty, so the lib.rs::prepare_writable_dirs fix that
+    // also iterates extras was unreachable in production. The
+    // clone is intentional: extra_write_dirs is consumed per-package
+    // in the loop below, so we hand a copy to the install-wide prep
+    // step and keep the original for the per-package SandboxSpecs.
     let prepare_spec = lpm_sandbox::SandboxSpec {
         package_dir: project_dir.to_path_buf(), // placeholder, unused by prepare
         project_dir: project_dir.to_path_buf(),
@@ -807,7 +826,7 @@ async fn run_under_store_lock(
         store_root: store_root.clone(),
         home_dir: home_dir.clone(),
         tmpdir: tmpdir.clone(),
-        extra_write_dirs: Vec::new(),
+        extra_write_dirs: extra_write_dirs.clone(),
     };
     lpm_sandbox::prepare_writable_dirs(&prepare_spec)
         .map_err(|e| LpmError::Registry(format!("{e}")))?;
@@ -1074,16 +1093,33 @@ fn execute_script(
     // from the sanitized set, strip INIT_CWD + PATH if the caller
     // pre-set them, then append our own INIT_CWD and PATH-with-
     // node_modules/.bin-prepended.
-    let path_value = format!(
-        "{}:{}",
-        project_dir.join("node_modules/.bin").display(),
-        env.get("PATH")
-            .map(|s| s.as_str())
-            .unwrap_or("/usr/bin:/bin"),
-    );
+    //
+    // Phase 46.2 (2026-05-12): the path string is platform-aware
+    // now. Pre-46.2 the helper hardcoded the POSIX `:` separator and
+    // the POSIX `/usr/bin:/bin` fallback, which produced a malformed
+    // PATH on Windows: the local `node_modules\.bin` shim got fused
+    // into the same entry as the inherited system PATH and neither
+    // resolved, so commands like `tsc`, `webpack`, or any sibling-
+    // package binary were invisible to lifecycle scripts even though
+    // the sandbox itself succeeded.
+    //
+    // Phase 46.2 round-5 (2026-05-12): PATH lookup + filter are now
+    // case-insensitive. Windows env vars are case-insensitive at the
+    // OS level — `std::env::vars()` yields the key with its original
+    // case (typically `"Path"` on Windows, `"PATH"` on POSIX). A
+    // case-sensitive `env.get("PATH")` returned `None` on Windows
+    // even when PATH was populated, so the child got the System32-
+    // only fallback and lifecycle scripts couldn't find `node`,
+    // `npm`, or any sibling-package binary on the inherited PATH.
+    // Same hazard for the filter — letting "Path" through unfiltered
+    // worked accidentally because `std::process::Command::env` on
+    // Windows does case-insensitive deduplication and our explicit
+    // `"PATH"` overrides won, but the LOOKUP path was still broken.
+    let parent_path = find_env_case_insensitive(env, "PATH");
+    let path_value = build_lifecycle_path(project_dir, parent_path);
     let mut envs: Vec<(String, String)> = env
         .iter()
-        .filter(|(k, _)| k.as_str() != "PATH" && k.as_str() != "INIT_CWD")
+        .filter(|(k, _)| !k.eq_ignore_ascii_case("PATH") && !k.eq_ignore_ascii_case("INIT_CWD"))
         .map(|(k, v)| (k.clone(), v.clone()))
         .collect();
     envs.push(("INIT_CWD".to_string(), project_dir.display().to_string()));
@@ -1373,18 +1409,27 @@ fn prepare_live_package_dir(
 /// Phase 46 P5 Chunk 3 removes the Chunk 2 cfg-fork between macOS
 /// (sandboxed) and non-macOS (legacy direct-Command). Every platform
 /// now routes through [`lpm_sandbox::new_for_platform`]: macOS uses
-/// Seatbelt, Linux uses landlock, Windows + other-unix return
+/// Seatbelt, Linux uses landlock, Windows uses the Phase 46.2
+/// Mandatory Integrity Control + Job Object backend. Old Linux
+/// kernels (<5.13) surface
+/// [`lpm_sandbox::SandboxError::KernelTooOld`]; non-{macOS, Linux,
+/// Windows} unix variants surface
 /// [`lpm_sandbox::SandboxError::UnsupportedPlatform`] which bubbles
 /// up as a clear "re-run with --no-sandbox" string through the
-/// format! below. Old Linux kernels (<5.13) surface
-/// [`lpm_sandbox::SandboxError::KernelTooOld`] symmetric with the
-/// Windows deferral per the Chunk 1 signoff.
+/// format! below.
 ///
 /// The [`SandboxMode::Disabled`] arm inside the factory hands back a
 /// [`lpm_sandbox::NoopSandbox`] on every platform, so `--no-sandbox`
 /// (Phase 46.1 rework collapsed the legacy `--unsafe-full-env`
-/// partner per Q6) remains reachable universally (including Windows)
-/// as the single escape hatch.
+/// partner per Q6) remains reachable universally as the single
+/// escape hatch.
+///
+/// Phase 46.2 (2026-05-12): the shell-string for the lifecycle
+/// script is dispatched through [`platform_shell_invocation`] so
+/// Windows hosts get `cmd.exe /D /C <cmd>` instead of `sh -c <cmd>`
+/// (sh isn't on the standard Windows PATH). Without this, the
+/// real-backend Windows install path would fail at spawn even though
+/// the sandbox itself succeeds.
 #[allow(clippy::too_many_arguments)]
 fn spawn_lifecycle_child(
     cmd: &str,
@@ -1422,9 +1467,12 @@ fn spawn_lifecycle_child(
     let sandbox = new_for_platform_with_options(spec, sandbox_mode, sandbox_options.clone())
         .map_err(|e| format!("sandbox init failed: {e}"))?;
 
-    let mut sbcmd = SandboxedCommand::new("sh")
-        .arg("-c")
-        .arg(cmd)
+    let (shell_program, shell_args) = platform_shell_invocation(cmd);
+    let mut sbcmd = SandboxedCommand::new(shell_program);
+    for arg in shell_args {
+        sbcmd = sbcmd.arg(arg);
+    }
+    sbcmd = sbcmd
         .current_dir(package_dir)
         .envs_cleared(envs.iter().map(|(k, v)| (k.clone(), v.clone())));
     sbcmd.stdout = SandboxStdio::Inherit;
@@ -1436,7 +1484,116 @@ fn spawn_lifecycle_child(
         .map_err(|e| format!("failed to spawn: {e}"))
 }
 
-/// Kill the entire process group on Unix, or just the child on other platforms.
+/// Case-insensitive env-var lookup against the sanitized env map.
+/// Returns the first value whose key matches `target` ignoring ASCII
+/// case. POSIX env keys are case-sensitive so this only ever changes
+/// behavior on Windows, where `std::env::vars()` yields `"Path"`
+/// (registry-preserved case) but the rest of the codebase looks up
+/// `"PATH"`. Without this helper, lifecycle scripts on Windows ran
+/// with the System32-only fallback PATH because the parent PATH
+/// pass-through was silently missed.
+fn find_env_case_insensitive<'a>(
+    env: &'a HashMap<String, String>,
+    target: &str,
+) -> Option<&'a str> {
+    env.iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case(target))
+        .map(|(_, v)| v.as_str())
+}
+
+/// Compose the `PATH` env var passed to a lifecycle script. Prepends
+/// the project's `node_modules/.bin` so locally-installed binaries
+/// shadow system ones (matches npm/yarn/pnpm), then appends either
+/// the inherited PATH if the caller provided one or a minimal
+/// platform-appropriate fallback.
+///
+/// Platform-aware on both axes:
+/// - **Separator**: `:` on POSIX, `;` on Windows.
+/// - **`.bin` shape**: `node_modules/.bin` resolves identically on
+///   both platforms (Windows accepts forward slashes), but we render
+///   via `Path::join` + `Path::display` so the produced string uses
+///   the host's native separator.
+/// - **Fallback**: `/usr/bin:/bin` on POSIX is the long-standing
+///   minimum. Windows gets `C:\Windows\System32;C:\Windows;C:\Windows\System32\Wbem`
+///   — System32 for `cmd.exe` / `where.exe` / OS DLLs, the bare
+///   Windows dir for the small set of binaries that live one level
+///   up, and `Wbem` for `wmic` (rarely used but harmless to keep).
+///   Lifecycle scripts that need PowerShell or Git Bash should
+///   declare them via the existing PATH passthrough, not rely on
+///   this fallback.
+///
+/// Pre-Phase-46.2 this was inlined with hardcoded POSIX separators
+/// and fallback. The Windows sandbox spawn would then succeed but
+/// produce a malformed PATH (`node_modules\.bin:<parent-path>`),
+/// rendering local shims invisible to scripts even though the
+/// sandbox itself was working correctly.
+fn build_lifecycle_path(project_dir: &Path, parent_path: Option<&str>) -> String {
+    let bin_dir = project_dir.join("node_modules").join(".bin");
+    #[cfg(unix)]
+    {
+        format!(
+            "{}:{}",
+            bin_dir.display(),
+            parent_path.unwrap_or("/usr/bin:/bin"),
+        )
+    }
+    #[cfg(windows)]
+    {
+        format!(
+            "{};{}",
+            bin_dir.display(),
+            parent_path.unwrap_or(r"C:\Windows\System32;C:\Windows;C:\Windows\System32\Wbem"),
+        )
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        format!(
+            "{}:{}",
+            bin_dir.display(),
+            parent_path.unwrap_or("/usr/bin:/bin"),
+        )
+    }
+}
+
+/// Pick the right shell program + argv to run a lifecycle script's
+/// shell-string verbatim. POSIX hosts get `sh -c <cmd>`, matching the
+/// way npm/yarn/pnpm spawn lifecycle scripts. Windows gets
+/// `cmd.exe /D /C <cmd>` — `/D` skips AutoRun (so the script doesn't
+/// inherit shell hooks from `HKCU\Software\Microsoft\Command Processor`),
+/// `/C` runs the command and terminates. Both shells are guaranteed
+/// to be on PATH on their respective platforms.
+///
+/// This was hardcoded to `sh -c` before Phase 46.2 because the
+/// pre-46.2 sandbox returned `UnsupportedPlatform` on Windows, so the
+/// lifecycle path never reached spawn there. With the real backend
+/// landed, dispatch has to be platform-aware to make end-to-end
+/// installs work on Windows.
+fn platform_shell_invocation(cmd: &str) -> (&'static str, Vec<String>) {
+    #[cfg(unix)]
+    {
+        ("sh", vec!["-c".to_string(), cmd.to_string()])
+    }
+    #[cfg(windows)]
+    {
+        (
+            "cmd.exe",
+            vec!["/D".to_string(), "/C".to_string(), cmd.to_string()],
+        )
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        ("sh", vec!["-c".to_string(), cmd.to_string()])
+    }
+}
+
+/// Kill the entire process group on Unix, or the Job Object tree on
+/// Windows. On Windows, `Child::kill()` alone only calls
+/// `TerminateProcess` against the root child — descendants spawned
+/// by the lifecycle script survive. The Windows sandbox attaches the
+/// child to a Job Object with `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`
+/// for exactly this reason; the kill-tree call routes through
+/// [`lpm_sandbox::terminate_sandbox_tree`] which calls
+/// `TerminateJobObject` and brings the whole tree down at once.
 fn kill_process_tree(child: &mut std::process::Child) {
     #[cfg(unix)]
     {
@@ -1451,23 +1608,41 @@ fn kill_process_tree(child: &mut std::process::Child) {
     }
     #[cfg(not(unix))]
     {
-        // On Windows, Child::kill() calls TerminateProcess which kills the tree.
+        // Tell the sandbox crate to terminate the Job Object tree
+        // associated with this PID. The tracker holds the Job
+        // handle, so without this call the kernel's
+        // KILL_ON_JOB_CLOSE policy never fires (the handle isn't
+        // closed until parent exit). Belt-and-suspenders:
+        // `child.kill()` after, so the root child is reaped even if
+        // the PID wasn't tracked (e.g. SandboxMode::Disabled +
+        // NoopSandbox routed through here).
+        lpm_sandbox::terminate_sandbox_tree(child.id());
         let _ = child.kill();
     }
 }
 
 /// Wait for a child process with a timeout.
-/// On timeout, kills the process group (Unix) or direct child (Windows).
+/// On timeout, kills the process group (Unix) or the Job Object
+/// tree (Windows) via [`kill_process_tree`]. On normal exit, releases
+/// the Windows Job-tracker entry so the kernel can reclaim the Job
+/// handle the sandbox stashed for kill-tree parity.
 fn wait_with_timeout(
     mut child: std::process::Child,
     timeout: &Duration,
 ) -> Result<std::process::ExitStatus, String> {
     let start = std::time::Instant::now();
     let poll_interval = Duration::from_millis(100);
+    let pid = child.id();
 
     loop {
         match child.try_wait() {
-            Ok(Some(status)) => return Ok(status),
+            Ok(Some(status)) => {
+                // Normal exit: free the Windows Job-tracker entry
+                // so we don't accumulate stale Job handles for the
+                // lifetime of the parent. No-op on Unix.
+                lpm_sandbox::release_sandbox_tracker(pid);
+                return Ok(status);
+            }
             Ok(None) => {
                 if start.elapsed() > *timeout {
                     kill_process_tree(&mut child);
@@ -5456,5 +5631,96 @@ mod tests {
     #[test]
     fn capability_not_approved_reports_not_trusted() {
         assert!(!TrustReason::CapabilityNotApproved.is_trusted());
+    }
+
+    /// Phase 46.2: the shell invocation for lifecycle scripts must
+    /// be platform-aware. Before Phase 46.2 the sandbox returned
+    /// `UnsupportedPlatform` on Windows so this code path never
+    /// fired there; with the real backend landed, `sh -c` would
+    /// fail at spawn because `sh.exe` isn't on the standard Windows
+    /// PATH. The helper picks `cmd.exe /D /C` instead so end-to-end
+    /// Windows installs actually work.
+    #[cfg(windows)]
+    #[test]
+    fn platform_shell_invocation_uses_cmd_exe_on_windows() {
+        let (prog, args) = platform_shell_invocation("node install.js");
+        assert_eq!(prog, "cmd.exe");
+        assert_eq!(
+            args,
+            vec![
+                "/D".to_string(),
+                "/C".to_string(),
+                "node install.js".to_string()
+            ],
+            "Windows lifecycle scripts must run under cmd.exe /D /C, \
+             /D suppresses AutoRun, /C runs-and-exits"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn platform_shell_invocation_uses_sh_on_unix() {
+        let (prog, args) = platform_shell_invocation("node install.js");
+        assert_eq!(prog, "sh");
+        assert_eq!(
+            args,
+            vec!["-c".to_string(), "node install.js".to_string()],
+            "POSIX hosts must run lifecycle scripts under sh -c"
+        );
+    }
+
+    /// Phase 46.2 follow-up: the lifecycle PATH must use the host's
+    /// native separator and a non-empty fallback for the case where
+    /// the caller didn't pass through a parent PATH. The pre-46.2
+    /// helper inlined POSIX `:` + `/usr/bin:/bin`, producing
+    /// `node_modules\.bin:<parent>` on Windows — a single malformed
+    /// entry that no PATH lookup would resolve.
+    #[cfg(windows)]
+    #[test]
+    fn build_lifecycle_path_uses_semicolon_and_system32_on_windows() {
+        let project = std::path::PathBuf::from(r"C:\proj");
+        // With an inherited parent PATH.
+        let with_parent =
+            build_lifecycle_path(&project, Some(r"C:\OtherTool\bin;C:\Windows\System32"));
+        assert!(
+            with_parent.starts_with(r"C:\proj\node_modules\.bin;"),
+            "node_modules\\.bin must lead the PATH with a `;` separator: {with_parent}"
+        );
+        assert!(
+            with_parent.contains(r"C:\OtherTool\bin"),
+            "inherited parent PATH must be appended: {with_parent}"
+        );
+
+        // Without an inherited parent PATH (fallback path).
+        let fallback = build_lifecycle_path(&project, None);
+        assert!(
+            fallback.starts_with(r"C:\proj\node_modules\.bin;"),
+            "fallback PATH must still lead with node_modules\\.bin: {fallback}"
+        );
+        assert!(
+            fallback.contains(r"C:\Windows\System32"),
+            "fallback must include System32 so cmd.exe / where.exe resolve: {fallback}"
+        );
+        assert!(
+            !fallback.contains("/usr/bin"),
+            "fallback must NOT leak POSIX defaults on Windows: {fallback}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn build_lifecycle_path_uses_colon_and_usr_bin_on_unix() {
+        let project = std::path::PathBuf::from("/proj");
+        let with_parent = build_lifecycle_path(&project, Some("/opt/tool/bin:/usr/local/bin"));
+        assert!(
+            with_parent.starts_with("/proj/node_modules/.bin:"),
+            "node_modules/.bin must lead with `:` separator: {with_parent}"
+        );
+
+        let fallback = build_lifecycle_path(&project, None);
+        assert!(
+            fallback.starts_with("/proj/node_modules/.bin:/usr/bin:/bin"),
+            "fallback must keep the historical POSIX shape: {fallback}"
+        );
     }
 }

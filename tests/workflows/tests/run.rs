@@ -286,11 +286,16 @@ fn run_loads_dotenv_file() {
         "name": "env-test",
         "version": "1.0.0",
         "scripts": {
-            "show-env": "echo $MY_TEST_VAR"
+            "show-env": "node show.js"
         }
     }"#,
     );
 
+    // Print the env var via a real .js file rather than `node -e` —
+    // sidesteps cmd.exe ↔ sh quoting differences for the inline JS
+    // source, which would otherwise need separate JSON literals per
+    // platform.
+    project.write_file("show.js", "console.log(process.env.MY_TEST_VAR || '')");
     // Create a .env file
     project.write_file(".env", "MY_TEST_VAR=hello-from-dotenv");
 
@@ -299,12 +304,15 @@ fn run_loads_dotenv_file() {
         .output()
         .expect("failed to run lpm");
 
-    assert!(output.status.success());
-
     let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "lpm run show-env must exit 0; stdout:\n{stdout}\nstderr:\n{stderr}"
+    );
     assert!(
         stdout.contains("hello-from-dotenv"),
-        "expected .env variable to be loaded, got:\n{stdout}"
+        "expected .env variable to be loaded, got stdout:\n{stdout}\nstderr:\n{stderr}"
     );
 }
 
@@ -315,11 +323,12 @@ fn run_loads_env_mode_file() {
         "name": "env-mode-test",
         "version": "1.0.0",
         "scripts": {
-            "show-env": "echo $STAGE_VAR"
+            "show-env": "node show.js"
         }
     }"#,
     );
 
+    project.write_file("show.js", "console.log(process.env.STAGE_VAR || '')");
     // Create .env.staging file
     project.write_file(".env.staging", "STAGE_VAR=staging-value");
 
@@ -328,12 +337,15 @@ fn run_loads_env_mode_file() {
         .output()
         .expect("failed to run lpm");
 
-    assert!(output.status.success());
-
     let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "lpm run show-env --env staging must exit 0; stdout:\n{stdout}\nstderr:\n{stderr}"
+    );
     assert!(
         stdout.contains("staging-value"),
-        "expected .env.staging variable to be loaded, got:\n{stdout}"
+        "expected .env.staging variable to be loaded, got stdout:\n{stdout}\nstderr:\n{stderr}"
     );
 }
 
