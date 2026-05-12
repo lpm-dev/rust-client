@@ -45,19 +45,40 @@ date
 echo "[top-npm] running ${#FIXTURES[@]} fixture(s) with parallelism $PARALLEL"
 echo
 
-# §1b: per-slot LPM_HOME so concurrent installs don't stomp on each
+# Per-process LPM_HOME so concurrent installs don't stomp on each
 # other's `~/.lpm/cache` / `~/.lpm/store` (run-audit.sh wipes those
 # between modes). LPM honors `LPM_HOME` as the root for cache + store.
+#
+# Pre-fix this used a mod-PARALLEL slot index baked into the fixture
+# line ("<idx> <fixture>", `idx = i % PARALLEL`) and assumed xargs
+# would tie slot → worker process. It doesn't: xargs -P N -L 1 just
+# spawns one process per line; line ordering is preserved, slot
+# ordering isn't. When fixture i+PARALLEL's bash invocation started
+# before fixture i's finished — easy whenever fixture i was slow
+# (large tarball, slow npm metadata) — both ran concurrently with the
+# same LPM_HOME, the late starter's `rm -rf "$slot_home"` wiped the
+# early starter's in-progress store, and the early starter exited
+# non-zero on the next store read. The collision manifests as
+# nondeterministic asymmetric outcomes (~15-20 per CI run, set
+# differs each run; same suite goes ASYMMETRIC: 0 under PARALLEL=1).
+#
+# Fix: drop the slot abstraction entirely and key the home off `$$`
+# (the per-invocation PID). Every concurrent `run_one` call lands in
+# a distinct directory by construction, regardless of how xargs
+# schedules the workers. An EXIT trap removes the home so /tmp
+# doesn't accumulate ~50 MB × N fixtures of store data across runs.
 run_one() {
     local fixture="$1"
-    local slot="$2"
-    local slot_home
-    slot_home="${LPM_AUDIT_WORK_BASE:-${RUNNER_TEMP:-/tmp}}/lpm-top-npm-home-$slot"
-    rm -rf "$slot_home"
-    mkdir -p "$slot_home"
+    local slot_home work_base
+    slot_home="${LPM_AUDIT_WORK_BASE:-${RUNNER_TEMP:-/tmp}}/lpm-top-npm-home-$$"
+    work_base="${LPM_AUDIT_WORK_BASE:-${RUNNER_TEMP:-/tmp}/lpm-top-npm-work-$$}"
+    rm -rf "$slot_home" "$work_base"
+    mkdir -p "$slot_home" "$work_base"
+    # shellcheck disable=SC2064  # expansion at trap-install time is intentional
+    trap "rm -rf '$slot_home' '$work_base'" EXIT
 
     LPM_HOME="$slot_home" \
-    LPM_AUDIT_WORK_BASE="${LPM_AUDIT_WORK_BASE:-${RUNNER_TEMP:-/tmp}/lpm-top-npm-work-$slot}" \
+    LPM_AUDIT_WORK_BASE="$work_base" \
     bash "$HERE/../audit-fixtures/run-audit.sh" "$fixture" \
         > "$slot_home/last.log" 2>&1 || true
 
@@ -76,13 +97,9 @@ run_one() {
 export -f run_one
 export HERE RESULTS_DIR
 
-# Round-robin slot index via xargs's -P + an awk-prefixed numbering
-# trick. Each line `<idx> <fixture>` becomes `run_one $fixture $idx`.
-i=0
-for f in "${FIXTURES[@]}"; do
-    echo "$i $f"
-    i=$(( (i + 1) % PARALLEL ))
-done | xargs -P "$PARALLEL" -L 1 bash -c 'run_one "$1" "$0"'
+# One xargs line per fixture. Each `bash -c` invocation gets its own
+# PID and therefore its own LPM_HOME / work base — see run_one.
+printf '%s\n' "${FIXTURES[@]}" | xargs -P "$PARALLEL" -L 1 bash -c 'run_one "$0"'
 
 echo
 echo
@@ -113,7 +130,7 @@ printf "PASS both: %d   ASYMMETRIC: %d   FAIL both: %d   unknown: %d   total: %d
 
 if [[ ${#asymmetric_list[@]} -gt 0 ]]; then
     echo
-    echo "Asymmetric outcomes (hoisted regressions vs isolated):"
+    echo "Asymmetric outcomes (isolated/hoisted, either direction is a regression):"
     for a in "${asymmetric_list[@]}"; do
         echo "  $a"
     done
