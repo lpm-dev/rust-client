@@ -788,9 +788,17 @@ async fn run_under_store_lock(
         Some(&home_dir),
     )
     .map_err(|e| LpmError::Registry(format!("{e}")))?;
-    let tmpdir = std::env::var_os("TMPDIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("/tmp"));
+    // Phase 46.2 round-5 (2026-05-12): `std::env::temp_dir()` resolves
+    // tmpdir portably — POSIX checks `TMPDIR` → falls back to `/tmp`;
+    // Windows checks `TMP` → `TEMP` → `USERPROFILE\AppData\Local\Temp`.
+    // Pre-46.2-round-5 the helper hardcoded `TMPDIR` + `/tmp` fallback,
+    // which on Windows produced a non-absolute path string (`/tmp` is
+    // relative under Windows path resolution — no drive letter, no UNC
+    // prefix). The sandbox spec validator then rejected the spec with
+    // `tmpdir must be absolute, got /tmp`, breaking every lifecycle
+    // spawn under triage / autoBuild on Windows. `std::env::temp_dir()`
+    // is what every other cross-platform tool uses for this resolution.
+    let tmpdir = std::env::temp_dir();
 
     // Phase 46 P5 Chunk 5: ensure the "standard" writable subpaths
     // exist on disk before spawning scripts. Sandbox rules allow
@@ -1094,10 +1102,24 @@ fn execute_script(
     // resolved, so commands like `tsc`, `webpack`, or any sibling-
     // package binary were invisible to lifecycle scripts even though
     // the sandbox itself succeeded.
-    let path_value = build_lifecycle_path(project_dir, env.get("PATH").map(|s| s.as_str()));
+    //
+    // Phase 46.2 round-5 (2026-05-12): PATH lookup + filter are now
+    // case-insensitive. Windows env vars are case-insensitive at the
+    // OS level — `std::env::vars()` yields the key with its original
+    // case (typically `"Path"` on Windows, `"PATH"` on POSIX). A
+    // case-sensitive `env.get("PATH")` returned `None` on Windows
+    // even when PATH was populated, so the child got the System32-
+    // only fallback and lifecycle scripts couldn't find `node`,
+    // `npm`, or any sibling-package binary on the inherited PATH.
+    // Same hazard for the filter — letting "Path" through unfiltered
+    // worked accidentally because `std::process::Command::env` on
+    // Windows does case-insensitive deduplication and our explicit
+    // `"PATH"` overrides won, but the LOOKUP path was still broken.
+    let parent_path = find_env_case_insensitive(env, "PATH");
+    let path_value = build_lifecycle_path(project_dir, parent_path);
     let mut envs: Vec<(String, String)> = env
         .iter()
-        .filter(|(k, _)| k.as_str() != "PATH" && k.as_str() != "INIT_CWD")
+        .filter(|(k, _)| !k.eq_ignore_ascii_case("PATH") && !k.eq_ignore_ascii_case("INIT_CWD"))
         .map(|(k, v)| (k.clone(), v.clone()))
         .collect();
     envs.push(("INIT_CWD".to_string(), project_dir.display().to_string()));
@@ -1460,6 +1482,23 @@ fn spawn_lifecycle_child(
     sandbox
         .spawn(sbcmd)
         .map_err(|e| format!("failed to spawn: {e}"))
+}
+
+/// Case-insensitive env-var lookup against the sanitized env map.
+/// Returns the first value whose key matches `target` ignoring ASCII
+/// case. POSIX env keys are case-sensitive so this only ever changes
+/// behavior on Windows, where `std::env::vars()` yields `"Path"`
+/// (registry-preserved case) but the rest of the codebase looks up
+/// `"PATH"`. Without this helper, lifecycle scripts on Windows ran
+/// with the System32-only fallback PATH because the parent PATH
+/// pass-through was silently missed.
+fn find_env_case_insensitive<'a>(
+    env: &'a HashMap<String, String>,
+    target: &str,
+) -> Option<&'a str> {
+    env.iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case(target))
+        .map(|(_, v)| v.as_str())
 }
 
 /// Compose the `PATH` env var passed to a lifecycle script. Prepends
