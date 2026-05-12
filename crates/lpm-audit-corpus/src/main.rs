@@ -35,7 +35,7 @@ use clap::Parser;
 use futures::stream::{FuturesUnordered, StreamExt};
 use indicatif::{ProgressBar, ProgressStyle};
 use lpm_security::SecurityPolicy;
-use lpm_security::static_gate::classify;
+use lpm_security::static_gate::{ManifestContext, classify_with_context};
 use lpm_security::triage::StaticTier;
 use lpm_triage_advisor::{
     Advisor, AdvisorFailure, AdvisorVerdict as TriageVerdict, AmberScript as TriageAmberScript,
@@ -871,6 +871,16 @@ struct CuratedExpectation {
     /// should carry a plausible URL pointing at a recognizable host.
     #[serde(default)]
     repository: Option<String>,
+    /// Phase 46b Lever #4 — optional simulated package name. The
+    /// entry `id` doubles as the audit identity by default, but the
+    /// L1 widening's identity match keys off the package's base
+    /// name. For fixture entries whose ID is a synthetic prefix
+    /// (`amber-d18-013-sharp-install-js`), supplying `package_name:
+    /// "sharp"` lets the lever see the same identity payload a real
+    /// `sharp` manifest would carry. When absent, the entry ID is
+    /// used (matches the pre-Lever-#4 behaviour).
+    #[serde(default)]
+    package_name: Option<String>,
 }
 
 /// Phase 46.2 — run the audit against the 523-entry curated
@@ -916,6 +926,7 @@ async fn run_curated(args: &Args) -> Result<(), BoxError> {
             idx + 1,
             body,
             entry.repository.clone(),
+            entry.package_name.as_deref(),
         ));
     }
 
@@ -962,8 +973,21 @@ fn curated_entry_to_audit(
     rank: usize,
     body: String,
     repository: Option<String>,
+    simulated_package_name: Option<&str>,
 ) -> PackageAudit {
-    let postinstall = Some(classify_script(&body));
+    // Phase 46b Lever #4 — pass identity context to the L1
+    // classifier. For most entries the fixture's entry ID doubles
+    // as the package name; for entries whose ID is a synthetic
+    // prefix (e.g. `amber-d18-013-sharp-install-js`), an explicit
+    // `package_name` (e.g. `"sharp"`) lets the lever match the
+    // identity payload a real manifest would carry.
+    let identity_name = simulated_package_name.unwrap_or(id);
+    let ctx = ManifestContext {
+        package_name: identity_name,
+        repository: repository.as_deref(),
+        bin_names: &[],
+    };
+    let postinstall = Some(classify_script_with_context(&body, Some(&ctx)));
     let mut audit = PackageAudit {
         // The fixture entries don't have real npm names; the entry
         // ID is the audit identity. Surface it verbatim so the
@@ -1052,9 +1076,26 @@ async fn run_hermetic(args: &Args) -> Result<(), BoxError> {
 /// `fetch_l3_one`, but reads every field from the fixture instead of
 /// the network.
 fn hermetic_entry_to_audit(entry: HermeticEntry) -> PackageAudit {
-    let preinstall = entry.scripts.get("preinstall").map(|s| classify_script(s));
-    let install = entry.scripts.get("install").map(|s| classify_script(s));
-    let postinstall = entry.scripts.get("postinstall").map(|s| classify_script(s));
+    // Phase 46b Lever #4 — thread identity into the L1 classifier so
+    // hermetic delegate-to-local-file shapes with matching repo
+    // names Green directly at L1 (no L4 round-trip).
+    let ctx = ManifestContext {
+        package_name: &entry.name,
+        repository: entry.repository.as_deref(),
+        bin_names: &[],
+    };
+    let preinstall = entry
+        .scripts
+        .get("preinstall")
+        .map(|s| classify_script_with_context(s, Some(&ctx)));
+    let install = entry
+        .scripts
+        .get("install")
+        .map(|s| classify_script_with_context(s, Some(&ctx)));
+    let postinstall = entry
+        .scripts
+        .get("postinstall")
+        .map(|s| classify_script_with_context(s, Some(&ctx)));
 
     let mut audit = PackageAudit {
         name: entry.name.clone(),
@@ -1599,14 +1640,24 @@ async fn reclassify_from_cache(args: &Args) -> Result<(), BoxError> {
     let mut changed = 0usize;
     for a in &mut audits {
         let prev_tier = a.tier;
+        // Phase 46b Lever #4 — `--reclassify` re-runs the L1
+        // classifier with the manifest context the prior fetch
+        // captured. `repository` is on the cached record; `bin`
+        // isn't (audit-corpus never fetched it for older audits),
+        // so passes through as empty.
+        let ctx = ManifestContext {
+            package_name: &a.name,
+            repository: a.repository.as_deref(),
+            bin_names: &[],
+        };
         for phase in [&mut a.preinstall, &mut a.install, &mut a.postinstall]
             .into_iter()
             .flatten()
         {
             // Re-classify and re-bucket the shape from the cached
-            // script body. `classify_script` recomputes both in one
-            // call.
-            *phase = classify_script(&phase.script);
+            // script body. `classify_script_with_context` recomputes
+            // both in one call.
+            *phase = classify_script_with_context(&phase.script, Some(&ctx));
         }
         a.tier = worst_of_phases(a);
         if a.tier != prev_tier {
@@ -1835,9 +1886,23 @@ async fn audit_one(
             // the registry manifest (string or object shape).
             audit.repository = manifest.repository.and_then(RepositoryField::into_url);
             let scripts = manifest.scripts.unwrap_or_default();
-            audit.preinstall = scripts.get("preinstall").map(|s| classify_script(s));
-            audit.install = scripts.get("install").map(|s| classify_script(s));
-            audit.postinstall = scripts.get("postinstall").map(|s| classify_script(s));
+            // Phase 46b Lever #4 — pass identity context so
+            // delegate-to-local-file shapes with matching repo
+            // identity Green at L1, skipping L4.
+            let ctx = ManifestContext {
+                package_name: &audit.name,
+                repository: audit.repository.as_deref(),
+                bin_names: &[],
+            };
+            audit.preinstall = scripts
+                .get("preinstall")
+                .map(|s| classify_script_with_context(s, Some(&ctx)));
+            audit.install = scripts
+                .get("install")
+                .map(|s| classify_script_with_context(s, Some(&ctx)));
+            audit.postinstall = scripts
+                .get("postinstall")
+                .map(|s| classify_script_with_context(s, Some(&ctx)));
             audit.tier = worst_of_phases(&audit);
         }
         Err(e) => audit.fetch_error = Some(e.to_string()),
@@ -1852,8 +1917,23 @@ async fn audit_one(
     audit
 }
 
+#[allow(dead_code)] // kept as the context-free shorthand; presently
+// all in-crate callers pass `Some(ctx)` via
+// `classify_script_with_context`, but downstream tooling
+// (e.g. ad-hoc binaries linking the crate) may still want the bare
+// form. Removing it would be a public-surface change.
 fn classify_script(script: &str) -> ScriptAudit {
-    let tier = classify(script);
+    classify_script_with_context(script, None)
+}
+
+/// Phase 46b Lever #4 — classify with optional manifest context for
+/// the `node install.js` + matching-identity widening. Callers that
+/// have the package name + repository / bin available should prefer
+/// this form so the L1 tier reflects the lever; legacy callers
+/// (e.g. `--reclassify` over cached records without identity data)
+/// fall back to context-free classification with `None`.
+fn classify_script_with_context(script: &str, ctx: Option<&ManifestContext<'_>>) -> ScriptAudit {
+    let tier = classify_with_context(script, ctx);
     let tokens = shlex::split(script).unwrap_or_default();
     let first_token = tokens.first().map(|s| {
         // strip leading `./` or absolute path prefix to make grouping

@@ -209,27 +209,39 @@
   },
   {
     "id": "amber-d18-013-sharp-install-js",
-    "expected": "amber"
+    "expected": "amber",
+    "package_name": "sharp",
+    "repository": "git+https://github.com/lovell/sharp.git"
   },
   {
     "id": "amber-d18-014-napi-rs-install-js",
-    "expected": "amber"
+    "expected": "amber",
+    "package_name": "napi-rs",
+    "repository": "git+https://github.com/napi-rs/napi-rs.git"
   },
   {
     "id": "amber-d18-015-esbuild-install-js",
-    "expected": "amber"
+    "expected": "amber",
+    "package_name": "esbuild",
+    "repository": "git+https://github.com/evanw/esbuild.git"
   },
   {
     "id": "amber-d18-016-swc-postinstall-js",
-    "expected": "amber"
+    "expected": "amber",
+    "package_name": "swc",
+    "repository": "git+https://github.com/swc-project/swc.git"
   },
   {
     "id": "amber-d18-017-rollup-install-js",
-    "expected": "amber"
+    "expected": "amber",
+    "package_name": "rollup",
+    "repository": "git+https://github.com/rollup/rollup.git"
   },
   {
     "id": "amber-d18-018-turbo-install-js",
-    "expected": "amber"
+    "expected": "amber",
+    "package_name": "turbo",
+    "repository": "git+https://github.com/vercel/turbo.git"
   },
   {
     "id": "amber-d18-019-playwright-with-deps-02",
@@ -2077,11 +2089,15 @@
   {
     "id": "amber-audit-reserved-001-puppeteer",
     "expected": "amber",
+    "package_name": "puppeteer",
+    "repository": "git+https://github.com/puppeteer/puppeteer.git",
     "notes": "puppeteer (rank 2857, 40.8M dl/mo) \u2014 postinstall=`node install.mjs` downloads Chromium"
   },
   {
     "id": "amber-audit-reserved-002-claude-code",
     "expected": "amber",
+    "package_name": "claude-code",
+    "repository": "git+https://github.com/anthropics/claude-code.git",
     "notes": "@anthropic-ai/claude-code (rank 2720) \u2014 postinstall=`node install.cjs` downloads platform binary"
   },
   {

