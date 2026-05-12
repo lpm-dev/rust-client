@@ -1132,7 +1132,10 @@ mod tests {
         // Builtins:
         assert!(project.join(".husky").exists(), "missing .husky");
         assert!(project.join(".lpm").exists(), "missing .lpm");
-        assert!(project.join("node_modules").exists(), "missing node_modules");
+        assert!(
+            project.join("node_modules").exists(),
+            "missing node_modules"
+        );
         assert!(home.join(".cache").exists(), "missing .cache");
         assert!(home.join(".node-gyp").exists(), "missing .node-gyp");
         assert!(home.join(".npm").exists(), "missing .npm");
@@ -1289,7 +1292,10 @@ mod tests {
             .spawn(trivial_success_command())
             .expect("noop spawn must succeed");
         let status = child.wait().expect("wait");
-        assert!(status.success(), "trivial success command must exit 0, got {status:?}");
+        assert!(
+            status.success(),
+            "trivial success command must exit 0, got {status:?}"
+        );
     }
 
     #[test]
@@ -1366,8 +1372,9 @@ mod tests {
         // the only acceptable outcomes are `Ok` with backend name
         // `windows-il`. A failure here means the FFI binding broke;
         // surface it as a panic.
-        let sb = new_for_platform(sample_spec(), SandboxMode::Enforce)
-            .expect("Windows factory must succeed on a host that supports Mandatory Integrity Control");
+        let sb = new_for_platform(sample_spec(), SandboxMode::Enforce).expect(
+            "Windows factory must succeed on a host that supports Mandatory Integrity Control",
+        );
         assert_eq!(sb.backend_name(), "windows-il");
         assert_eq!(sb.mode(), SandboxMode::Enforce);
         assert_eq!(sb.posture(), SandboxPosture::Default);
