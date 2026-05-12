@@ -70,6 +70,7 @@ use crate::resolve::{ResolveError, ResolveResult, ResolvedPackage, StageTiming};
 #[cfg(test)]
 use lpm_registry::RouteMode;
 use lpm_registry::{RegistryClient, RouteTable, UpstreamRoute};
+use ahash::{AHashMap, AHashSet};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
@@ -551,8 +552,8 @@ pub async fn resolve_greedy_fused(
     // resolver might track simultaneously" without threading a
     // dependency-count estimate through. Slight over-allocation is
     // strictly cheaper than rehashing.
-    let mut inflight: HashSet<CanonicalKey> = HashSet::with_capacity(npm_fanout);
-    let mut parked: HashMap<CanonicalKey, Vec<Edge>> = HashMap::with_capacity(npm_fanout);
+    let mut inflight: AHashSet<CanonicalKey> = AHashSet::with_capacity(npm_fanout);
+    let mut parked: AHashMap<CanonicalKey, Vec<Edge>> = AHashMap::with_capacity(npm_fanout);
     type FetchResult = Result<lpm_registry::PackageMetadata, ResolveError>;
     let mut metadata_jobs: tokio::task::JoinSet<(CanonicalKey, bool, FetchResult)> =
         tokio::task::JoinSet::new();
@@ -879,7 +880,7 @@ struct ResolveState {
     /// whose range satisfies; reuse if found, else allocate a new
     /// node and append. Per-canonical lists are tiny in practice
     /// (1-2 entries even on big trees), so the linear scan is cheap.
-    resolved: HashMap<CanonicalKey, Vec<(NpmVersion, NodeId)>>,
+    resolved: AHashMap<CanonicalKey, Vec<(NpmVersion, NodeId)>>,
     /// Resolved nodes in declaration order. `nodes[i].id == i`.
     nodes: Vec<ResolvedNodeBuilder>,
     /// Set of `(canonical, version)` pairs whose declared deps have
@@ -888,7 +889,7 @@ struct ResolveState {
     /// the existing node. Different versions of the same canonical
     /// each get their OWN entry here because their dep lists are
     /// version-specific.
-    children_enqueued: HashSet<(CanonicalKey, NpmVersion)>,
+    children_enqueued: AHashSet<(CanonicalKey, NpmVersion)>,
     /// Phase 40 P1 — count of optional deps skipped because no
     /// platform-compatible version satisfied the declared range. Surfaced
     /// in `ResolveResult.platform_skipped` for the install pipeline's
@@ -970,9 +971,9 @@ impl ResolveState {
         ResolveState {
             root_deps,
             task_queue: VecDeque::with_capacity(256),
-            resolved: HashMap::with_capacity(512),
+            resolved: AHashMap::with_capacity(512),
             nodes: Vec::with_capacity(512),
-            children_enqueued: HashSet::with_capacity(512),
+            children_enqueued: AHashSet::with_capacity(512),
             platform_skipped: 0,
             root_aliases: HashMap::new(),
             overrides,
@@ -1960,7 +1961,7 @@ fn group_satisfied_by_existing(
 fn pick_peer_prefetch_candidates(
     state: &ResolveState,
     cached_canonicals: &dashmap::DashMap<CanonicalKey, Arc<CachedPackageInfo>>,
-    inflight_canonicals: &HashSet<CanonicalKey>,
+    inflight_canonicals: &AHashSet<CanonicalKey>,
 ) -> Vec<CanonicalKey> {
     if state.peer_requirements.is_empty() {
         return Vec::new();
@@ -4274,8 +4275,8 @@ mod tests {
     fn empty_cache() -> dashmap::DashMap<CanonicalKey, Arc<CachedPackageInfo>> {
         dashmap::DashMap::new()
     }
-    fn empty_inflight() -> HashSet<CanonicalKey> {
-        HashSet::new()
+    fn empty_inflight() -> AHashSet<CanonicalKey> {
+        AHashSet::new()
     }
 
     #[test]
