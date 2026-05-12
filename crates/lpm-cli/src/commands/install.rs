@@ -5248,36 +5248,60 @@ async fn run_with_options_under_store_lock(
         }
     }
 
-    // Enforce minimumReleaseAge: block recently published packages unless --allow-new.
-    // Only checked during fresh resolution (not lockfile fast path) because metadata
-    // was already fetched and cached by the resolver — re-fetching hits the 5-min TTL cache.
-    if !allow_new && !used_lockfile {
-        // Phase 46 P3: resolve the effective cooldown window through the
-        // full precedence chain (CLI `--min-release-age` > package.json >
-        // `~/.lpm/config.toml` > 24h default). A malformed global config
-        // surfaces a file-pathed error here — that's the one new fail mode
-        // P3 introduces relative to pre-P3 behaviour, and it's
-        // intentional: silent fall-through on a broken global file is
-        // exactly the bug the path-aware loader prevents.
-        let effective_min_age_secs = crate::release_age_config::ReleaseAgeResolver::resolve(
-            project_dir,
-            min_release_age_override,
-        )?;
-        let policy = lpm_security::SecurityPolicy::with_resolved_min_age(
-            &project_dir.join("package.json"),
-            effective_min_age_secs,
-        );
-        if policy.minimum_release_age_secs > 0 {
-            let mut too_new = Vec::new();
+    // Phase 46 P3: resolve the effective cooldown window through the
+    // full precedence chain (CLI `--min-release-age` > package.json >
+    // `~/.lpm/config.toml` > 24h default). A malformed global config
+    // surfaces a file-pathed error here — that's the one new fail mode
+    // P3 introduces relative to pre-P3 behaviour, and it's
+    // intentional: silent fall-through on a broken global file is
+    // exactly the bug the path-aware loader prevents.
+    //
+    // Phase 46b Option B: pulled out of the `if !allow_new` block so
+    // the resolved threshold is available for the L1 classifier's
+    // cooldown defense-in-depth even when the user opted out of the
+    // install-level cooldown halt via `--allow-new`. The two axes
+    // (cooldown halt + Lever #4 widening) need the same threshold
+    // input.
+    let effective_min_age_secs = crate::release_age_config::ReleaseAgeResolver::resolve(
+        project_dir,
+        min_release_age_override,
+    )?;
+    let cooldown_policy = lpm_security::SecurityPolicy::with_resolved_min_age(
+        &project_dir.join("package.json"),
+        effective_min_age_secs,
+    );
+
+    // Phase 46b Option B — build a `(name, version) → publish_age_secs`
+    // map ONCE per install. The map serves both:
+    //
+    // 1. The install-level cooldown halt (existing Phase 46 P3 gate,
+    //    gated on `!allow_new && !used_lockfile`).
+    // 2. The L1 classifier's cooldown defense-in-depth for Lever #4
+    //    (Phase 46b — refuse to widen `node install.js` + matching
+    //    identity when the publish age is below the configured
+    //    threshold, even when the install-level cooldown was
+    //    bypassed via `--allow-new`).
+    //
+    // Skipped (empty map) when:
+    // - `used_lockfile` — fast-path; no fresh metadata fetched. Lever
+    //   #4 will see `publish_age=None` and refuse to widen for
+    //   matching-identity shapes (conservative).
+    // - `cooldown_policy.minimum_release_age_secs == 0` — user
+    //   globally opted out of cooldown; Lever #4 fires unconditionally
+    //   via the `min_age=0` branch in `matches_delegating_identity_green`.
+    //
+    // Metadata fetches go via [`RouteTable`] so custom-registry
+    // packages stay routed; lpm-namespace packages use the lpm-client.
+    // Both paths typically hit the resolver's <5min TTL cache, so the
+    // map build is near-zero cost on fresh-resolution installs.
+    let publish_ages: std::collections::HashMap<(String, String), u64> =
+        if !used_lockfile && cooldown_policy.minimum_release_age_secs > 0 {
+            let mut map = std::collections::HashMap::with_capacity(packages.len());
             for p in &packages {
-                // Look up the publish timestamp from the metadata cache.
-                // During fresh resolution the resolver already fetched all metadata,
-                // so these calls hit the local cache (no extra network round-trips).
                 let publish_time = if p.is_lpm {
                     lpm_common::PackageName::parse(&p.name)
                         .ok()
                         .and_then(|pkg_name| {
-                            // This will hit the TTL cache (< 5 min since resolution)
                             tokio::task::block_in_place(|| {
                                 tokio::runtime::Handle::current()
                                     .block_on(arc_client.get_package_metadata(&pkg_name))
@@ -5299,46 +5323,76 @@ async fn run_with_options_under_store_lock(
                     .ok()
                     .and_then(|meta| meta.time.get(&p.version).cloned())
                 };
-
-                if let Some(warning) = policy.check_release_age(publish_time.as_deref()) {
-                    let remaining = warning.minimum.saturating_sub(warning.age_secs);
-                    let hours = remaining / 3600;
-                    let minutes = (remaining % 3600) / 60;
-                    too_new.push((p.name.clone(), p.version.clone(), hours, minutes));
+                if let Some(age) = lpm_security::publish_age_secs(publish_time.as_deref()) {
+                    map.insert((p.name.clone(), p.version.clone()), age);
                 }
             }
+            map
+        } else {
+            std::collections::HashMap::new()
+        };
 
-            if !too_new.is_empty() {
-                if !json_output {
-                    output::warn(&format!(
-                        "{} package(s) blocked by minimumReleaseAge ({}s):",
-                        too_new.len(),
-                        policy.minimum_release_age_secs,
-                    ));
-                    for (name, version, hours, minutes) in &too_new {
-                        eprintln!(
-                            "    {}@{} — {}h {}m remaining",
-                            name, version, hours, minutes
-                        );
-                    }
-                    // Phase 46 P3: three override paths, ordered narrowest
-                    // to broadest persistence:
-                    //   (1) --min-release-age=0   per-install, numeric
-                    //   (2) --allow-new           per-install, blanket bypass
-                    //   (3) package.json          persistent, repo-wide
+    // Enforce minimumReleaseAge: block recently published packages unless --allow-new.
+    // Only checked during fresh resolution (not lockfile fast path) because metadata
+    // was already fetched and cached by the resolver — re-fetching hits the 5-min TTL cache.
+    if !allow_new && !used_lockfile && cooldown_policy.minimum_release_age_secs > 0 {
+        let mut too_new = Vec::new();
+        for p in &packages {
+            let key = (p.name.clone(), p.version.clone());
+            let age_secs = publish_ages.get(&key).copied();
+            // Use the existing `check_release_age` semantics:
+            // `None` age = no timestamp available → no warning
+            // (matches pre-46b behaviour). Below-threshold age =
+            // warning carrying the time-remaining info. Match the
+            // existing ts-string-based API by re-running it; the
+            // `publish_ages` map only carries successful parses, so
+            // missing entries collapse to the `None` case here.
+            if age_secs.is_none() {
+                continue;
+            }
+            // Reconstruct a synthetic check by hand: if the age is
+            // below the threshold, build a warning with the same
+            // shape the helper would have returned. Keeps the
+            // user-visible message identical.
+            let age = age_secs.unwrap();
+            if age < cooldown_policy.minimum_release_age_secs {
+                let remaining = cooldown_policy.minimum_release_age_secs.saturating_sub(age);
+                let hours = remaining / 3600;
+                let minutes = (remaining % 3600) / 60;
+                too_new.push((p.name.clone(), p.version.clone(), hours, minutes));
+            }
+        }
+
+        if !too_new.is_empty() {
+            if !json_output {
+                output::warn(&format!(
+                    "{} package(s) blocked by minimumReleaseAge ({}s):",
+                    too_new.len(),
+                    cooldown_policy.minimum_release_age_secs,
+                ));
+                for (name, version, hours, minutes) in &too_new {
                     eprintln!(
-                        "  To override: {} or {} (this install), or set {} in package.json.",
-                        "--min-release-age=0".bold(),
-                        "--allow-new".bold(),
-                        "\"lpm\": { \"minimumReleaseAge\": 0 }".dimmed(),
+                        "    {}@{} — {}h {}m remaining",
+                        name, version, hours, minutes
                     );
                 }
-                return Err(LpmError::Registry(format!(
-                    "{} package(s) published too recently (minimumReleaseAge={}s). Use --allow-new or --min-release-age=<dur> to override.",
-                    too_new.len(),
-                    policy.minimum_release_age_secs,
-                )));
+                // Phase 46 P3: three override paths, ordered narrowest
+                // to broadest persistence:
+                //   (1) --min-release-age=0   per-install, numeric
+                //   (2) --allow-new           per-install, blanket bypass
+                //   (3) package.json          persistent, repo-wide
+                eprintln!(
+                    "  To override: {} or {} (this install), or set {} in package.json.",
+                    "--min-release-age=0".bold(),
+                    "--allow-new".bold(),
+                    "\"lpm\": { \"minimumReleaseAge\": 0 }".dimmed(),
+                );
             }
+            return Err(LpmError::Registry(format!(
+                "{} package(s) published too recently (minimumReleaseAge={}s). Use --allow-new or --min-release-age=<dur> to override.",
+                too_new.len(),
+                cooldown_policy.minimum_release_age_secs,
+            )));
         }
     }
 
@@ -6406,8 +6460,12 @@ async fn run_with_options_under_store_lock(
             // `rebuild::run` (the actual script-execution path).
             // The set never persists.
             if session.is_active() {
-                let amber_requests =
-                    collect_amber_classification_requests(&store, &installed_with_integrity);
+                let amber_requests = collect_amber_classification_requests(
+                    &store,
+                    &installed_with_integrity,
+                    &publish_ages,
+                    cooldown_policy.minimum_release_age_secs,
+                );
                 // `classify_amber` is async + serial. Slice 1 keeps
                 // it simple; future parallel-fanout can ride on top.
                 session.classify_amber(&amber_requests).await;
@@ -7939,6 +7997,8 @@ fn read_trusted_deps_from_manifest(
 fn collect_amber_classification_requests(
     store: &lpm_store::PackageStore,
     packages: &[(String, String, Option<String>)],
+    publish_ages: &std::collections::HashMap<(String, String), u64>,
+    min_release_age_secs: u64,
 ) -> Vec<crate::triage_advisor_session::AmberPackageRequest> {
     use lpm_security::static_gate::ManifestContext;
     use lpm_security::triage::StaticTier;
@@ -7954,11 +8014,21 @@ fn collect_amber_classification_requests(
         // advisor prompt (#1) and the L1 classifier widening (#4)
         // that converts delegate-to-local-file + matching identity
         // into Green.
+        //
+        // Phase 46b Option B — feed the package's publish age + the
+        // configured `minimum_release_age_secs` into the classifier
+        // context so Lever #4's identity-match widening can apply
+        // the cooldown defense-in-depth (refuses to widen recent
+        // publishes even when `--allow-new` bypassed the
+        // install-level halt).
         let repository = crate::build_state::read_manifest_repository(&pkg_dir);
+        let publish_age = publish_ages.get(&(name.clone(), version.clone())).copied();
         let ctx = ManifestContext {
             package_name: name.as_str(),
             repository: repository.as_deref(),
             bin_names: &[],
+            publish_age_secs: publish_age,
+            min_release_age_secs,
         };
         // Classify each phase independently; collect those that
         // resolve to Amber/AmberLlm. The advisor needs the per-phase

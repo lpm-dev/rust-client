@@ -282,7 +282,33 @@ impl SecurityPolicy {
     pub fn is_blocked_script(script_name: &str) -> bool {
         BLOCKED_SCRIPTS.contains(&script_name)
     }
+}
 
+/// Phase 46b Option B — compute a package's publish age in seconds.
+///
+/// Parses the ISO 8601 timestamp and returns `now - published`. Used
+/// by the install pipeline to thread per-package publish ages into
+/// the L1 classifier's [`crate::static_gate::ManifestContext`] so
+/// Lever #4's identity-match widening can apply the cooldown
+/// defense-in-depth (refuse to widen recent publishes).
+///
+/// Returns `None` when:
+/// - `published_at` is `None` (no timestamp available), OR
+/// - the timestamp can't be parsed (the L1 classifier conservatively
+///   refuses to widen on unknown age when cooldown is configured).
+///
+/// **Fail-closed posture matches [`SecurityPolicy::check_release_age`]:**
+/// a garbage timestamp shouldn't silently grant the script-tier
+/// widening — better to surface a script-tier prompt than to widen
+/// based on unparseable metadata.
+pub fn publish_age_secs(published_at: Option<&str>) -> Option<u64> {
+    let ts_str = published_at?;
+    let published_epoch = parse_timestamp(ts_str)?;
+    let now = current_epoch_secs();
+    Some(now.saturating_sub(published_epoch))
+}
+
+impl SecurityPolicy {
     /// Scan a package's `package.json` for lifecycle scripts.
     /// Returns the names of scripts that would be blocked.
     /// Uses the typed `PackageJson` struct (single source of truth).

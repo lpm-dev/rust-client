@@ -1035,11 +1035,20 @@ fn curated_entry_to_audit(
     // prefix (e.g. `amber-d18-013-sharp-install-js`), an explicit
     // `package_name` (e.g. `"sharp"`) lets the lever match the
     // identity payload a real manifest would carry.
+    //
+    // Phase 46b Option B — curated entries default to "old publish"
+    // (8760h = 1 year, matching `hermetic_l3_outcome(8760, false)`
+    // below), under the standard 24h cooldown. Lever #4's cooldown
+    // defense-in-depth thus fires the widening normally on curated.
+    // A future curated entry that wants to exercise the recent-
+    // publish path would supply its own `publish_age_hours` field.
     let identity_name = simulated_package_name.unwrap_or(id);
     let ctx = ManifestContext {
         package_name: identity_name,
         repository: repository.as_deref(),
         bin_names: &[],
+        publish_age_secs: Some(365 * 24 * 60 * 60),
+        min_release_age_secs: 24 * 60 * 60,
     };
     let postinstall = Some(classify_script_with_context(&body, Some(&ctx)));
     let mut audit = PackageAudit {
@@ -1138,10 +1147,20 @@ fn hermetic_entry_to_audit(entry: HermeticEntry) -> PackageAudit {
     // Phase 46b Lever #4 — thread identity into the L1 classifier so
     // hermetic delegate-to-local-file shapes with matching repo
     // names Green directly at L1 (no L4 round-trip).
+    //
+    // Phase 46b Option B — use the fixture's `publish_age_hours` to
+    // exercise the cooldown defense-in-depth. The recent-publish
+    // hermetic entry (`hermetic-amber-binary-fetcher-recent` with
+    // `publish_age_hours: 1`) is the load-bearing test case: with
+    // Option B + 24h policy, that entry stays Amber even though its
+    // repository identity matches, because the publish age is below
+    // the cooldown threshold.
     let ctx = ManifestContext {
         package_name: &entry.name,
         repository: entry.repository.as_deref(),
         bin_names: &[],
+        publish_age_secs: Some(entry.publish_age_hours.saturating_mul(3600)),
+        min_release_age_secs: 24 * 60 * 60,
     };
     let preinstall = entry
         .scripts
@@ -1737,10 +1756,21 @@ async fn reclassify_from_cache(args: &Args) -> Result<(), BoxError> {
         // captured. `repository` is on the cached record; `bin`
         // isn't (audit-corpus never fetched it for older audits),
         // so passes through as empty.
+        //
+        // Phase 46b Option B — `--reclassify` doesn't have publish
+        // ages in the cached record (the audit-corpus's PackageAudit
+        // shape never persisted them). Pass `min_release_age_secs=0`
+        // so Lever #4 fires on identity match — matches the prior
+        // `--reclassify` behaviour for users iterating on
+        // `static_gate.rs` changes. Production install pipeline
+        // applies the proper cooldown defense; this is a measurement
+        // tool tradeoff.
         let ctx = ManifestContext {
             package_name: &a.name,
             repository: a.repository.as_deref(),
             bin_names: &[],
+            publish_age_secs: None,
+            min_release_age_secs: 0,
         };
         for phase in [&mut a.preinstall, &mut a.install, &mut a.postinstall]
             .into_iter()
@@ -1988,10 +2018,20 @@ async fn audit_one(
             // Phase 46b Lever #4 — pass identity context so
             // delegate-to-local-file shapes with matching repo
             // identity Green at L1, skipping L4.
+            //
+            // Phase 46b Option B — live audit doesn't compute publish
+            // ages here (the cooldown gate runs separately in
+            // `enrich_l3_in_place`). For audit-measurement purposes
+            // we pass `min_release_age_secs=0` so the L1 classifier
+            // reports the unconstrained tier; the report's L3
+            // section still surfaces cooldown blocks separately, so
+            // measurement fidelity is preserved.
             let ctx = ManifestContext {
                 package_name: &audit.name,
                 repository: audit.repository.as_deref(),
                 bin_names: &[],
+                publish_age_secs: None,
+                min_release_age_secs: 0,
             };
             audit.preinstall = scripts
                 .get("preinstall")
