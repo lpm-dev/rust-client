@@ -799,6 +799,17 @@ async fn run_under_store_lock(
     // `.husky` would need write on `{project}` which we don't
     // grant). Without this, a first-time `husky install` would
     // fail under Enforce.
+    //
+    // Phase 46.2 round-2 (2026-05-12): thread `extra_write_dirs`
+    // through too — user-declared `sandboxWriteDirs` entries had to
+    // be pre-created for the same reason the built-ins do (creating
+    // `<project>/build-output` requires write on `<project>`, which
+    // we deliberately don't grant). Pre-46.2-round-2 this Vec was
+    // hardcoded empty, so the lib.rs::prepare_writable_dirs fix that
+    // also iterates extras was unreachable in production. The
+    // clone is intentional: extra_write_dirs is consumed per-package
+    // in the loop below, so we hand a copy to the install-wide prep
+    // step and keep the original for the per-package SandboxSpecs.
     let prepare_spec = lpm_sandbox::SandboxSpec {
         package_dir: project_dir.to_path_buf(), // placeholder, unused by prepare
         project_dir: project_dir.to_path_buf(),
@@ -807,7 +818,7 @@ async fn run_under_store_lock(
         store_root: store_root.clone(),
         home_dir: home_dir.clone(),
         tmpdir: tmpdir.clone(),
-        extra_write_dirs: Vec::new(),
+        extra_write_dirs: extra_write_dirs.clone(),
     };
     lpm_sandbox::prepare_writable_dirs(&prepare_spec)
         .map_err(|e| LpmError::Registry(format!("{e}")))?;

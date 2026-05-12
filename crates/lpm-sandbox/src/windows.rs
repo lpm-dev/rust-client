@@ -73,7 +73,7 @@ use crate::{
     Sandbox, SandboxError, SandboxMode, SandboxOptions, SandboxPosture, SandboxSpec,
     SandboxedCommand,
 };
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::os::windows::ffi::OsStrExt;
 use std::os::windows::io::AsRawHandle;
@@ -84,7 +84,7 @@ use std::ptr;
 use std::sync::Mutex;
 
 use windows_sys::Win32::Foundation::{
-    CloseHandle, ERROR_SUCCESS, GetLastError, HANDLE, HLOCAL, LocalFree,
+    CloseHandle, ERROR_SUCCESS, GetLastError, HANDLE, HLOCAL, INVALID_HANDLE_VALUE, LocalFree,
 };
 use windows_sys::Win32::Security::Authorization::{
     ConvertStringSecurityDescriptorToSecurityDescriptorW, ConvertStringSidToSidW, SDDL_REVISION_1,
@@ -94,6 +94,11 @@ use windows_sys::Win32::Security::{
     ACL, GetSecurityDescriptorSacl, IsValidSid, LABEL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR,
     PSID, SID_AND_ATTRIBUTES, SetTokenInformation, TOKEN_ADJUST_DEFAULT, TOKEN_MANDATORY_LABEL,
     TOKEN_QUERY, TokenIntegrityLevel,
+};
+use windows_sys::Win32::Storage::FileSystem::{
+    CreateFileW, FILE_FLAG_BACKUP_SEMANTICS, FILE_GENERIC_READ, FILE_ID_INFO,
+    FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FileIdInfo,
+    GetFileInformationByHandleEx, OPEN_EXISTING,
 };
 use windows_sys::Win32::System::JobObjects::{
     AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
@@ -471,18 +476,39 @@ fn apply_low_il_label(path: &Path) -> Result<(), SandboxError> {
         return Ok(());
     }
 
-    // Fast-path: was this exact path labelled earlier in this
-    // process? Canonicalize first so a caller passing `C:\foo`,
-    // `C:\foo\`, and the same path with a `\\?\` extended prefix
-    // all hit the same cache entry. Canonicalization can fail
-    // (junctions, locked dirs); if it does we fall through and
-    // re-label, which is correct (idempotent at the kernel layer)
-    // just slower.
+    // Fast-path: was this exact directory object labelled earlier
+    // in this process? Two-axis identity check:
+    //
+    // 1. **Canonical path**: a caller passing `C:\foo`, `C:\foo\`,
+    //    and the same path with a `\\?\` extended prefix all hit
+    //    the same cache entry. Canonicalization can fail (junctions,
+    //    locked dirs); if it does we fall through and re-label,
+    //    which is correct (idempotent at the kernel layer) just
+    //    slower.
+    // 2. **NTFS file identity** (`FILE_ID_INFO` =
+    //    `(VolumeSerialNumber, FILE_ID_128)`): catches the case
+    //    where a lifecycle script deletes and recreates a writable
+    //    root between two spawns. The new directory object has the
+    //    same path but a different NTFS file ID, and it inherits
+    //    Medium IL from its parent rather than carrying our Low IL
+    //    label, so a path-only cache would incorrectly skip the
+    //    re-label and the next Low IL child would be denied writes.
+    //    The volume serial number guards against the (rare) case
+    //    where the same path resolves to different volumes across
+    //    spawn calls.
+    //
+    // Identity probing also fails gracefully — if we can't read the
+    // file ID for any reason (path was just deleted, locked, etc.)
+    // we fall through to the slow path rather than risk a stale
+    // hit.
     let cache_key = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
-    if labelled_cache_contains(&cache_key) {
+    let current_identity = fetch_directory_identity(path);
+    if let Some(current) = current_identity
+        && labelled_cache_lookup(&cache_key) == Some(current)
+    {
         tracing::debug!(
             target: "lpm_sandbox::windows",
-            "skip Low IL label on already-labelled path {}",
+            "skip Low IL label on already-labelled path {} (identity match)",
             path.display(),
         );
         return Ok(());
@@ -506,48 +532,127 @@ fn apply_low_il_label(path: &Path) -> Result<(), SandboxError> {
         relabel_existing_descendants(path, sacl_ptr);
     }
 
-    // Cache the labelled root so subsequent spawns in the same lpm
-    // process skip the walk. New files created inside this dir by
-    // the lifecycle child inherit Low IL automatically (OICI), so
-    // the second spawn doesn't need to retouch them.
-    labelled_cache_insert(cache_key);
+    // Cache the labelled root + its current NTFS identity so
+    // subsequent spawns in the same lpm process skip the walk. New
+    // files created inside this dir by the lifecycle child inherit
+    // Low IL automatically (OICI), so the second spawn doesn't need
+    // to retouch them. If identity probing failed at the start (it
+    // was None), don't poison the cache — a future spawn will probe
+    // again and either succeed or take the slow path.
+    if let Some(identity) = current_identity {
+        labelled_cache_insert(cache_key, identity);
+    }
 
     Ok(())
 }
 
-/// Process-wide memo: which paths have already been Low-IL-labelled
-/// by this lpm process. See [`apply_low_il_label`] for the rationale.
+/// NTFS file identity for a directory — `(volume_serial,
+/// file_id_128)`. The pair is globally unique per "object that
+/// currently lives at this path." Comparing identities at cache
+/// lookup time catches the delete-and-recreate case where the path
+/// is stable but the directory object underneath changed (and so
+/// has lost any inheritable Low IL label).
+type DirectoryIdentity = (u64, [u8; 16]);
+
+/// Open a read-only handle to a directory and pull its NTFS file
+/// identity via `GetFileInformationByHandleEx(FileIdInfo)`. Returns
+/// `None` on any failure (path doesn't exist, access denied, junction,
+/// non-NTFS volume that doesn't support FILE_ID_INFO, etc.) so the
+/// caller can decide whether to skip the cache or use a weaker check.
+///
+/// `FILE_FLAG_BACKUP_SEMANTICS` is required to open a directory
+/// handle on Windows — without it, `CreateFileW` returns
+/// `ERROR_ACCESS_DENIED` for directories. The handle has no write
+/// access, so opening a labelled root we don't have write perms on
+/// is still safe.
+///
+/// `FILE_SHARE_*` flags are all set so we don't block writes,
+/// renames, or deletes the lifecycle script might do concurrently
+/// — the probe is read-only and shouldn't introduce contention.
+fn fetch_directory_identity(path: &Path) -> Option<DirectoryIdentity> {
+    if !path.exists() {
+        return None;
+    }
+    let wide: Vec<u16> = path
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+
+    // SAFETY: `wide` is null-terminated. The four NULL/0 args take
+    // their documented "no security attributes / no template"
+    // meaning. The returned handle is owned by us; we Close it via
+    // the OwnedHandle RAII wrapper below.
+    let handle = unsafe {
+        CreateFileW(
+            wide.as_ptr(),
+            FILE_GENERIC_READ,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            ptr::null(),
+            OPEN_EXISTING,
+            FILE_FLAG_BACKUP_SEMANTICS,
+            ptr::null_mut(),
+        )
+    };
+    if handle == INVALID_HANDLE_VALUE || handle.is_null() {
+        return None;
+    }
+    let _h = OwnedHandle(handle);
+
+    // SAFETY: FILE_ID_INFO is plain old data (u64 +
+    // FILE_ID_128 which is `[u8; 16]`). All-zero is a valid bit
+    // pattern.
+    let mut info: FILE_ID_INFO = unsafe { std::mem::zeroed() };
+    let ok = unsafe {
+        GetFileInformationByHandleEx(
+            handle,
+            FileIdInfo,
+            &mut info as *mut _ as *mut _,
+            std::mem::size_of::<FILE_ID_INFO>() as u32,
+        )
+    };
+    if ok == 0 {
+        return None;
+    }
+    Some((info.VolumeSerialNumber, info.FileId.Identifier))
+}
+
+/// Process-wide memo: which directory objects have already been
+/// Low-IL-labelled by this lpm process. Keyed by canonicalized path,
+/// valued by the NTFS identity present at label time. A subsequent
+/// spawn hits the fast-path iff the path's current identity still
+/// matches the cached one.
 ///
 /// Lifetime is the lpm process. Killing + restarting lpm clears the
 /// cache, which is correct: external actors (Windows updates,
 /// `icacls /reset`) could have stripped the label and we'd want to
 /// reapply it.
 ///
-/// Stored as `Option<HashSet>` because `HashSet::new()` isn't `const`
+/// Stored as `Option<HashMap>` because `HashMap::new()` isn't `const`
 /// on stable Rust; we lazy-init on first access. A poisoned mutex
 /// (some other thread panicked while holding the lock) is recovered
 /// rather than propagated — losing the cache wastes work but
 /// shouldn't fail the install.
-static LABELED_ROOTS: Mutex<Option<HashSet<PathBuf>>> = Mutex::new(None);
+static LABELED_ROOTS: Mutex<Option<HashMap<PathBuf, DirectoryIdentity>>> = Mutex::new(None);
 
-fn labelled_cache_contains(path: &Path) -> bool {
+fn labelled_cache_lookup(path: &Path) -> Option<DirectoryIdentity> {
     let cache = LABELED_ROOTS.lock().unwrap_or_else(|p| p.into_inner());
-    cache.as_ref().is_some_and(|s| s.contains(path))
+    cache.as_ref().and_then(|m| m.get(path).copied())
 }
 
-fn labelled_cache_insert(path: PathBuf) {
+fn labelled_cache_insert(path: PathBuf, identity: DirectoryIdentity) {
     let mut cache = LABELED_ROOTS.lock().unwrap_or_else(|p| p.into_inner());
-    cache.get_or_insert_with(HashSet::new).insert(path);
+    cache.get_or_insert_with(HashMap::new).insert(path, identity);
 }
 
 /// Test-only: drop every cached entry. Lets the per-test isolated
 /// specs (which build fresh tempdirs each test) actually exercise
-/// the full label path instead of hitting a poisoned cache from an
+/// the full label path instead of hitting a stale cache from an
 /// earlier test in the same binary.
 #[cfg(test)]
 fn reset_labelled_roots_cache_for_tests() {
     let mut cache = LABELED_ROOTS.lock().unwrap_or_else(|p| p.into_inner());
-    *cache = Some(HashSet::new());
+    *cache = Some(HashMap::new());
 }
 
 /// Build the SDDL-derived security descriptor for the Low IL
@@ -1415,7 +1520,7 @@ mod tests {
     /// script — a Windows-only performance regression that wouldn't
     /// surface in single-script installs.
     ///
-    /// We pin the cache behavior via the labelled_cache_contains
+    /// We pin the cache behavior via the labelled_cache_lookup
     /// helper rather than timing because (a) the first label
     /// already shouldn't be slow on a tiny tempdir and (b) timing
     /// assertions are flaky under CI load.
@@ -1431,25 +1536,73 @@ mod tests {
 
         let canonical = std::fs::canonicalize(&target).expect("canonicalize");
         assert!(
-            !labelled_cache_contains(&canonical),
+            labelled_cache_lookup(&canonical).is_none(),
             "cache must start empty after reset"
         );
 
         apply_low_il_label(&target).expect("first label must succeed");
-        assert!(
-            labelled_cache_contains(&canonical),
-            "first label must populate the cache so subsequent spawns skip the walk"
-        );
+        let first_identity = labelled_cache_lookup(&canonical)
+            .expect("first label must populate the cache so subsequent spawns skip the walk");
 
-        // Second call: hits the fast-path. The contract is "no
-        // error" + "still cached"; the actual short-circuit lives
-        // inside apply_low_il_label, observable through a
-        // tracing::debug! line in production but not visible from
-        // here. The cache-membership assertion is the durable pin.
+        // Second call: must hit the fast-path. The cache entry's
+        // identity stays the same because the directory object
+        // hasn't been touched between the two calls.
         apply_low_il_label(&target).expect("second label must be a cache hit, not an error");
-        assert!(
-            labelled_cache_contains(&canonical),
-            "cache entry must persist across spawns"
+        let second_identity = labelled_cache_lookup(&canonical)
+            .expect("cache entry must persist across spawns");
+        assert_eq!(
+            first_identity, second_identity,
+            "cached NTFS identity must not change when the directory object is unchanged"
+        );
+    }
+
+    /// Phase 46.2 round-3 follow-up — delete-and-recreate
+    /// invalidation. If a lifecycle script removes one of the
+    /// allow-set dirs and recreates it (rare but legitimate — some
+    /// build steps wipe `dist/` or a cache root before re-populating),
+    /// the new directory object inherits Medium IL from its parent
+    /// rather than carrying our Low IL label. A path-only cache
+    /// would incorrectly short-circuit the next spawn's relabel and
+    /// the next Low IL child would be denied writes inside the
+    /// recreated dir.
+    ///
+    /// The fix keys the cache on `(canonical_path, NTFS file
+    /// identity)`. This test pins it: label, delete + recreate at
+    /// the same path (which produces a new NTFS file ID), call
+    /// `apply_low_il_label` again, and assert the cache's identity
+    /// entry actually changed — proving the function did the work
+    /// rather than blindly short-circuiting.
+    #[test]
+    fn apply_low_il_label_reinvalidates_when_directory_is_recreated() {
+        reset_labelled_roots_cache_for_tests();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let target = tmp.path().join("recreate-pin");
+        std::fs::create_dir_all(&target).unwrap();
+        std::fs::write(target.join("v1.txt"), b"first").unwrap();
+        let canonical = std::fs::canonicalize(&target).expect("canonicalize v1");
+
+        apply_low_il_label(&target).expect("first label");
+        let id_v1 = labelled_cache_lookup(&canonical).expect("v1 cached");
+
+        // Recreate at the same path with different contents. NTFS
+        // hands out a new FileId for the new object, so the
+        // identity-aware cache must invalidate and re-label.
+        std::fs::remove_dir_all(&target).unwrap();
+        std::fs::create_dir_all(&target).unwrap();
+        std::fs::write(target.join("v2.txt"), b"second").unwrap();
+        // Re-canonicalize to make sure the path shape is identical
+        // even after the recreate (it should be — same parent,
+        // same name).
+        let canonical_v2 = std::fs::canonicalize(&target).expect("canonicalize v2");
+        assert_eq!(canonical, canonical_v2, "same path must canonicalize to the same key");
+
+        apply_low_il_label(&target).expect("re-label after recreate");
+        let id_v2 = labelled_cache_lookup(&canonical).expect("v2 cached");
+        assert_ne!(
+            id_v1, id_v2,
+            "cache must rebind to the new NTFS identity after delete + recreate — \
+             a path-only cache would short-circuit here and leave the new dir \
+             Medium IL"
         );
     }
 
