@@ -4,11 +4,32 @@
 # instantiate the parser (`Cli::try_parse_from(...)`) don't crash with
 # SIGABRT on the first parse.
 #
-# Production binaries are unaffected — the main thread already gets
-# the platform default (8 MB on macOS / Linux), which is plenty.
-#
 # Setting `RUST_MIN_STACK` controls the initial stack size for threads
 # spawned by `std::thread::spawn`, which is what `cargo test` uses to
 # run each test in parallel.
 [env]
 RUST_MIN_STACK = "16777216"
+
+# Phase 46.2 round-4 (2026-05-12): the production binary's MAIN thread
+# stack on Windows is 1 MB by default (vs 8 MB on macOS / Linux), and
+# clap's command tree for lpm overflows it. Symptom: any subcommand —
+# including bare `--help` — crashes with `thread 'main' has overflowed
+# its stack` (NTSTATUS 0xC00000FD = STATUS_STACK_OVERFLOW). `lpm --version`
+# was the only invocation that survived because it bypasses clap via an
+# argv inspector earlier in `main()`.
+#
+# The pre-46.2-round-4 comment block above assumed "the main thread
+# already gets the platform default (8 MB on macOS / Linux), which is
+# plenty" — true on POSIX, but the Windows default is 8x smaller. Fix:
+# raise the PE header's stack reserve to match the POSIX default. The
+# OS doesn't actually allocate 8 MB upfront — it reserves the address
+# range and commits memory pages as the stack grows. So this is a
+# zero-runtime-cost change with no working-set impact for the common
+# case where clap parsing fits in the first 1 MB anyway.
+#
+# `/STACK:<reserve>` is the canonical MSVC linker syntax (clap itself,
+# rustup, and cargo all use the same trick for the same reason). 8 MB
+# matches `ulimit -s` on a typical Linux box and the macOS user-thread
+# default.
+[target.'cfg(windows)']
+rustflags = ["-C", "link-arg=/STACK:8388608"]

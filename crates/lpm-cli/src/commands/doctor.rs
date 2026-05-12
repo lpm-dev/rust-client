@@ -2494,17 +2494,38 @@ fn probe_sandbox_backend() -> Check {
                     kernel,
                     abi,
                     missing,
-                } => Check::warn(
-                    &doctor_catalog::SANDBOX_DEGRADED,
-                    &format!(
-                        "{backend} available on {os} — DEGRADED posture (kernel {kernel}, \
-                         landlock {abi}); user requested strict but kernel can't deliver \
-                         V4; enforces filesystem only, missing={missing}. Upgrade the \
-                         kernel to 6.7+ to restore strict containment, or switch to \
-                         `lpm config sandbox --set default` to drop the strict request \
-                         and silence this warning."
-                    ),
-                ),
+                } => {
+                    // Phase 46.2 (2026-05-12): both Linux (kernel <
+                    // 6.7 + allow-degraded) and Windows (any version
+                    // + allow-degraded — strict-mode WFP support is
+                    // the Phase 46.3 follow-up) reach this arm. The
+                    // `abi` field carries the discriminator
+                    // (`v1` = Linux landlock V1 fallback; `low-il` =
+                    // Windows Mandatory Integrity Control). Pick a
+                    // platform-honest message rather than a single
+                    // Linux-shaped string that would lie about the
+                    // remediation on Windows.
+                    let cause_and_fix = if abi == "low-il" {
+                        "user requested strict but Windows backend ships filesystem-write \
+                         containment only (Phase 46.2). Outbound-network denial is the \
+                         Phase 46.3 WFP follow-up. Switch to `lpm config sandbox --set \
+                         default` to drop the strict request and silence this warning, or \
+                         keep `allow-degraded = true` to keep filesystem-write containment \
+                         while accepting the network gap."
+                    } else {
+                        "user requested strict but kernel can't deliver V4; enforces \
+                         filesystem only. Upgrade the kernel to 6.7+ to restore strict \
+                         containment, or switch to `lpm config sandbox --set default` to \
+                         drop the strict request and silence this warning."
+                    };
+                    Check::warn(
+                        &doctor_catalog::SANDBOX_DEGRADED,
+                        &format!(
+                            "{backend} available on {os} — DEGRADED posture (kernel \
+                             {kernel}, abi {abi}); {cause_and_fix} missing={missing}."
+                        ),
+                    )
+                }
                 SandboxPosture::Disabled => Check::warn(
                     &doctor_catalog::SANDBOX_AVAILABLE,
                     &format!(
@@ -2673,26 +2694,53 @@ mod tests {
         );
     }
 
-    /// On Windows, the probe must Warn with the
-    /// "sandbox enforcement isn't supported here yet" pointer. Users
-    /// need to know that triage + sandbox containment is unavailable
-    /// on their platform and the interim is opt-out via `--no-sandbox`
-    /// (Phase 46.1 rework collapsed the legacy `--unsafe-full-env`
-    /// partner per Q6).
+    /// On Windows, Phase 46.2 ships a real backend (Mandatory
+    /// Integrity Control + Job Object). Under the relaxed default
+    /// mode the probe Passes naming `windows-il`. Under strict mode
+    /// the probe Warns (sandbox_degraded — when `allow_degraded =
+    /// true`) or Fails (sandbox_unsupported_platform — when strict
+    /// is requested without the degraded opt-in, surfaced through the
+    /// UnsupportedPlatform arm). Default-mode runs are the common
+    /// case for end-users and the only one we pin to a specific
+    /// outcome here; the strict + degraded combination is platform
+    /// state we don't control from this test.
+    ///
+    /// Phase 46.1 rework / Q6: the `--unsafe-full-env` partner flag
+    /// was collapsed into `--no-sandbox`. We keep that assertion in
+    /// case a future refactor accidentally resurrects the legacy
+    /// remediation string.
     #[cfg(target_os = "windows")]
     #[test]
-    fn sandbox_probe_on_windows_warns_when_unsupported() {
+    fn sandbox_probe_on_windows_passes_under_default_posture() {
         let c = probe_sandbox_backend();
+        // Acceptable outcomes:
+        // - Pass with `sandbox_available` (default mode, the common
+        //   case on a vanilla install) — the relaxed mode constructs
+        //   without consulting any kernel-version probe.
+        // - Warn with `sandbox_degraded` (user has strict + allow-
+        //   degraded persisted in config).
+        // - Warn with `sandbox_disabled_by_user` (user has
+        //   `[sandbox] mode = "none"` persisted).
+        //
+        // A Fail here is a regression — Mandatory Integrity Control
+        // has been in every Windows release since Vista and Phase
+        // 46.2's backend has no preconditions beyond that.
         assert!(
-            matches!(c.severity, Severity::Warn),
-            "Windows sandbox probe must Warn (UnsupportedPlatform). detail={}",
+            !matches!(c.severity, Severity::Fail),
+            "Windows sandbox probe must not Fail post-Phase-46.2. detail={}",
             c.detail
         );
+        if matches!(c.severity, Severity::Pass) {
+            assert!(
+                c.detail.contains("windows-il"),
+                "Pass message must name the new backend (`windows-il`). detail={}",
+                c.detail
+            );
+        }
+        // Phase 46.1 rework: legacy partner flag must never appear.
         assert!(
-            c.detail.contains("not supported")
-                || c.detail.contains("sandbox enforcement isn't supported"),
-            "Windows warn message must say sandbox enforcement isn't supported here \
-             yet. detail={}",
+            !c.detail.contains("--unsafe-full-env"),
+            "legacy partner flag must be gone from doctor output: {}",
             c.detail
         );
     }
