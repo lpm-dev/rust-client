@@ -312,14 +312,11 @@ fn matches_dangerous_root(path: &Path, home_dir: Option<&Path>) -> Option<&'stat
     #[cfg(windows)]
     {
         let mut comps = path.components();
-        if let (Some(prefix), Some(root), None) =
-            (comps.next(), comps.next(), comps.next())
+        if let (Some(prefix), Some(root), None) = (comps.next(), comps.next(), comps.next())
             && matches!(prefix, std::path::Component::Prefix(_))
             && matches!(root, std::path::Component::RootDir)
         {
-            return Some(
-                "is a drive root — writes would affect the whole drive's namespace",
-            );
+            return Some("is a drive root — writes would affect the whole drive's namespace");
         }
     }
 

@@ -295,10 +295,7 @@ fn run_loads_dotenv_file() {
     // sidesteps cmd.exe ↔ sh quoting differences for the inline JS
     // source, which would otherwise need separate JSON literals per
     // platform.
-    project.write_file(
-        "show.js",
-        "console.log(process.env.MY_TEST_VAR || '')",
-    );
+    project.write_file("show.js", "console.log(process.env.MY_TEST_VAR || '')");
     // Create a .env file
     project.write_file(".env", "MY_TEST_VAR=hello-from-dotenv");
 
@@ -331,10 +328,7 @@ fn run_loads_env_mode_file() {
     }"#,
     );
 
-    project.write_file(
-        "show.js",
-        "console.log(process.env.STAGE_VAR || '')",
-    );
+    project.write_file("show.js", "console.log(process.env.STAGE_VAR || '')");
     // Create .env.staging file
     project.write_file(".env.staging", "STAGE_VAR=staging-value");
 

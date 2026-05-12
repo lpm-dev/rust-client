@@ -96,18 +96,15 @@ use windows_sys::Win32::Security::{
     TOKEN_QUERY, TokenIntegrityLevel,
 };
 use windows_sys::Win32::Storage::FileSystem::{
-    CreateFileW, FILE_FLAG_BACKUP_SEMANTICS, FILE_GENERIC_READ, FILE_ID_INFO,
-    FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FileIdInfo,
-    GetFileInformationByHandleEx, OPEN_EXISTING,
+    CreateFileW, FILE_FLAG_BACKUP_SEMANTICS, FILE_GENERIC_READ, FILE_ID_INFO, FILE_SHARE_DELETE,
+    FILE_SHARE_READ, FILE_SHARE_WRITE, FileIdInfo, GetFileInformationByHandleEx, OPEN_EXISTING,
 };
 use windows_sys::Win32::System::JobObjects::{
     AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
     JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
     SetInformationJobObject, TerminateJobObject,
 };
-use windows_sys::Win32::System::Threading::{
-    CREATE_SUSPENDED, OpenProcessToken, TerminateProcess,
-};
+use windows_sys::Win32::System::Threading::{CREATE_SUSPENDED, OpenProcessToken, TerminateProcess};
 
 /// `SE_GROUP_INTEGRITY` is the well-known constant attribute bit for
 /// a SID-and-attributes entry that represents an integrity-level
@@ -168,7 +165,8 @@ impl WindowsSandbox {
     ) -> Result<Self, SandboxError> {
         match mode {
             SandboxMode::Enforce => {
-                let posture = decide_posture(options.deny_outbound_network, options.allow_degraded)?;
+                let posture =
+                    decide_posture(options.deny_outbound_network, options.allow_degraded)?;
                 Ok(Self {
                     spec,
                     mode,
@@ -642,7 +640,9 @@ fn labelled_cache_lookup(path: &Path) -> Option<DirectoryIdentity> {
 
 fn labelled_cache_insert(path: PathBuf, identity: DirectoryIdentity) {
     let mut cache = LABELED_ROOTS.lock().unwrap_or_else(|p| p.into_inner());
-    cache.get_or_insert_with(HashMap::new).insert(path, identity);
+    cache
+        .get_or_insert_with(HashMap::new)
+        .insert(path, identity);
 }
 
 /// Test-only: drop every cached entry. Lets the per-test isolated
@@ -701,10 +701,7 @@ fn build_low_il_security_descriptor(path: &Path) -> Result<LocalDescriptor, Sand
 /// Pull the SACL pointer out of a parsed security descriptor. The
 /// returned pointer is owned by `sd` — callers must keep the
 /// `LocalDescriptor` alive for the duration of the SACL's use.
-fn extract_sacl_pointer(
-    sd: PSECURITY_DESCRIPTOR,
-    path: &Path,
-) -> Result<*mut ACL, SandboxError> {
+fn extract_sacl_pointer(sd: PSECURITY_DESCRIPTOR, path: &Path) -> Result<*mut ACL, SandboxError> {
     let mut sacl_present: i32 = 0;
     let mut sacl_ptr: *mut ACL = ptr::null_mut();
     let mut sacl_defaulted: i32 = 0;
@@ -973,7 +970,9 @@ impl Drop for LocalSid {
 /// outlive the child — closing the handle terminates every member
 /// process, which is exactly what we want on the parent's drop /
 /// timeout-kill paths.
-fn create_kill_on_close_job_and_attach(process_handle: HANDLE) -> Result<OwnedHandle, SandboxError> {
+fn create_kill_on_close_job_and_attach(
+    process_handle: HANDLE,
+) -> Result<OwnedHandle, SandboxError> {
     // SAFETY: `CreateJobObjectW(NULL, NULL)` is the documented form
     // for an unnamed Job Object; we own the returned handle.
     let job = unsafe { CreateJobObjectW(ptr::null(), ptr::null()) };
@@ -1548,8 +1547,8 @@ mod tests {
         // identity stays the same because the directory object
         // hasn't been touched between the two calls.
         apply_low_il_label(&target).expect("second label must be a cache hit, not an error");
-        let second_identity = labelled_cache_lookup(&canonical)
-            .expect("cache entry must persist across spawns");
+        let second_identity =
+            labelled_cache_lookup(&canonical).expect("cache entry must persist across spawns");
         assert_eq!(
             first_identity, second_identity,
             "cached NTFS identity must not change when the directory object is unchanged"
@@ -1594,7 +1593,10 @@ mod tests {
         // even after the recreate (it should be — same parent,
         // same name).
         let canonical_v2 = std::fs::canonicalize(&target).expect("canonicalize v2");
-        assert_eq!(canonical, canonical_v2, "same path must canonicalize to the same key");
+        assert_eq!(
+            canonical, canonical_v2,
+            "same path must canonicalize to the same key"
+        );
 
         apply_low_il_label(&target).expect("re-label after recreate");
         let id_v2 = labelled_cache_lookup(&canonical).expect("v2 cached");
@@ -1769,7 +1771,12 @@ mod tests {
             .arg("/c")
             .arg("echo after > existing.txt")
             .current_dir(&pkg_dir)
-            .envs_cleared([pass("PATH"), pass("SYSTEMROOT"), pass("COMSPEC"), pass("WINDIR")]);
+            .envs_cleared([
+                pass("PATH"),
+                pass("SYSTEMROOT"),
+                pass("COMSPEC"),
+                pass("WINDIR"),
+            ]);
         cmd.stdout = crate::SandboxStdio::Null;
         cmd.stderr = crate::SandboxStdio::Piped;
         let mut child = sb.spawn(cmd).expect("spawn");
@@ -1824,7 +1831,12 @@ mod tests {
             .arg("/c")
             .arg("echo hi > marker.txt")
             .current_dir(&pkg_dir)
-            .envs_cleared([pass("PATH"), pass("SYSTEMROOT"), pass("COMSPEC"), pass("WINDIR")]);
+            .envs_cleared([
+                pass("PATH"),
+                pass("SYSTEMROOT"),
+                pass("COMSPEC"),
+                pass("WINDIR"),
+            ]);
         // Capture stderr so a future failure surfaces the actual
         // diagnosis (path quoting, IL denial, etc.) instead of an
         // opaque exit code.

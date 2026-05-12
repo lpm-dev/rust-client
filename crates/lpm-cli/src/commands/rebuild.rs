@@ -1542,8 +1542,7 @@ fn build_lifecycle_path(project_dir: &Path, parent_path: Option<&str>) -> String
         format!(
             "{};{}",
             bin_dir.display(),
-            parent_path
-                .unwrap_or(r"C:\Windows\System32;C:\Windows;C:\Windows\System32\Wbem"),
+            parent_path.unwrap_or(r"C:\Windows\System32;C:\Windows;C:\Windows\System32\Wbem"),
         )
     }
     #[cfg(not(any(unix, windows)))]
