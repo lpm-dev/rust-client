@@ -39,8 +39,9 @@ use lpm_security::static_gate::classify;
 use lpm_security::triage::StaticTier;
 use lpm_triage_advisor::{
     Advisor, AdvisorFailure, AdvisorVerdict as TriageVerdict, AmberScript as TriageAmberScript,
-    ClaudeCliAdapter, CodexAdapter, OllamaAdapter, Provider as AdvisorProvider, binary_path,
-    prompt_template_hash, provider_version,
+    CacheKeyInputs, ClaudeCliAdapter, CodexAdapter, L4Cache, OllamaAdapter,
+    Provider as AdvisorProvider, binary_path, build_cache_key, prompt_template_hash,
+    provider_version,
 };
 use serde::{Deserialize, Serialize};
 
@@ -120,6 +121,29 @@ struct Args {
     /// `claude-cli` / `codex` / `ollama`.
     #[arg(long)]
     advisor: Option<String>,
+
+    /// Phase 46b — opt-in to the L4 verdict cache for the L4 phase.
+    /// Off by default so a cold measurement run pays the full LLM
+    /// round-trip cost (the honest "first install" comparison
+    /// number). When set, the audit harness reads `~/.lpm/cache/
+    /// l4-verdicts.json` (or `$LPM_L4_CACHE_PATH` if set) and uses
+    /// the same cache the install pipeline does; a second run with
+    /// `--l4-cache` should be nearly silent (every prior verdict
+    /// served from cache, no LLM calls).
+    ///
+    /// The cache module's own `LPM_L4_CACHE=0` env-var disable still
+    /// applies — setting both flag-on + env-off keeps the cache
+    /// off (env wins). Useful for benchmark scripts that want one
+    /// flag-driven run to deliberately bypass a populated cache.
+    #[arg(long, default_value_t = false)]
+    l4_cache: bool,
+
+    /// Phase 46b — print one-line cache stats summary at the end
+    /// of the L4 phase (`hits / misses / entries`). Implied by
+    /// `--l4-cache`; the flag exists so a future cache-debugging
+    /// run can request the summary without enabling the cache itself.
+    #[arg(long, default_value_t = false)]
+    l4_cache_stats: bool,
 
     /// Phase 69 — corpus selector. `live` (default) walks the npm
     /// search API and fetches manifests over the network; `hermetic`
@@ -213,6 +237,14 @@ struct PackageAudit {
     /// its conclusion sentence without an out-of-band side channel.
     #[serde(default)]
     advisor_provider: Option<String>,
+    /// Phase 46b Lever #1 — `repository` URL pulled from the
+    /// manifest's `repository` field. Forwarded to the advisor at
+    /// classify time so the prompt can reason about package
+    /// identity. Persisted on each record so a `--reclassify` (or
+    /// future advisor re-run) doesn't need to re-fetch the manifest
+    /// to recover the field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    repository: Option<String>,
     /// Empty unless the manifest fetch errored.
     fetch_error: Option<String>,
 }
@@ -421,14 +453,50 @@ enum ScriptShape {
 }
 
 /// What we read from `https://registry.npmjs.org/{pkg}/latest`. We deserialise
-/// only the two fields we care about; everything else (deps, license, readme,
+/// only the fields we care about; everything else (deps, license, readme,
 /// etc.) is skipped so the binary doesn't pay for parsing the entire manifest.
+///
+/// Phase 46b Lever #1 — `repository` carries either the legacy
+/// shorthand string `"github.com/x/y"` or the modern object form
+/// `{ "type": "git", "url": "git+https://..." }`. Both shapes
+/// deserialize into the same `RepositoryField` enum, which the
+/// audit harness flattens to a single URL string on its way to the
+/// advisor.
 #[derive(Debug, Deserialize)]
 struct LatestManifest {
     #[serde(default)]
     version: Option<String>,
     #[serde(default)]
     scripts: Option<BTreeMap<String, String>>,
+    #[serde(default)]
+    repository: Option<RepositoryField>,
+}
+
+/// Repository declaration on a `package.json` — accepts both wire
+/// shapes the npm registry serves.
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum RepositoryField {
+    /// Shorthand: a bare URL string, e.g. `"github.com/lovell/sharp"`.
+    String(String),
+    /// Object form: `{ "type": "git", "url": "..." }`. Only the
+    /// `url` field is consulted; `type` is ignored.
+    Object {
+        #[serde(default)]
+        url: Option<String>,
+    },
+}
+
+impl RepositoryField {
+    /// Flatten to a single URL string. `None` when the object form
+    /// has no `url`, or the string form is empty.
+    fn into_url(self) -> Option<String> {
+        match self {
+            RepositoryField::String(s) if !s.is_empty() => Some(s),
+            RepositoryField::Object { url: Some(u) } if !u.is_empty() => Some(u),
+            _ => None,
+        }
+    }
 }
 
 /// Slice of the full registry packument we need for L3 enrichment.
@@ -543,7 +611,7 @@ async fn main() -> Result<(), BoxError> {
     };
 
     if let Some(name) = &args.advisor {
-        metadata.advisor = enrich_advisor_in_place(name, &mut audits).await?;
+        metadata.advisor = enrich_advisor_in_place(name, &mut audits, &args).await?;
     }
 
     persist_audit(&args.results, &args.report, &audits, &metadata)?;
@@ -709,7 +777,7 @@ async fn enrich_l3_from_cache(client: &reqwest::Client, args: &Args) -> Result<(
     metadata.audit_size = metadata.audit_size.or(Some(args.size));
 
     if let Some(name) = &args.advisor {
-        metadata.advisor = enrich_advisor_in_place(name, &mut audits).await?;
+        metadata.advisor = enrich_advisor_in_place(name, &mut audits, args).await?;
     }
 
     persist_audit(&args.results, &args.report, &audits, &metadata)?;
@@ -755,6 +823,14 @@ struct HermeticEntry {
     /// Whether the fixture declares this package as having Sigstore
     /// attestations published. Plain bool — no fetch.
     attestation_present: bool,
+    /// Phase 46b Lever #1 — optional repository URL surfaced to the
+    /// advisor prompt as the `Repository:` line. Defaults to `None`
+    /// for pre-Lever-#1 fixture entries so the field can be rolled
+    /// out incrementally; new amber entries (especially delegate-
+    /// to-local-file installers) should carry the URL so the L4
+    /// advisor can apply the matching-identity APPROVE rule.
+    #[serde(default)]
+    repository: Option<String>,
 }
 
 const HERMETIC_CORPUS_PATH: &str =
@@ -788,6 +864,13 @@ struct CuratedExpectation {
     #[serde(default)]
     #[allow(dead_code)] // surfaced via report sanity-check in a follow-up; reserved for now
     expected: Option<String>,
+    /// Phase 46b Lever #1 — optional repository URL the L4 advisor
+    /// will see in its prompt. Defaults to `None` so pre-Lever-#1
+    /// fixture entries don't need a rewrite; the delegate-to-local-
+    /// file entries (the ones where the lever moves the needle)
+    /// should carry a plausible URL pointing at a recognizable host.
+    #[serde(default)]
+    repository: Option<String>,
 }
 
 /// Phase 46.2 — run the audit against the 523-entry curated
@@ -828,7 +911,12 @@ async fn run_curated(args: &Args) -> Result<(), BoxError> {
                 continue;
             }
         };
-        audits.push(curated_entry_to_audit(&entry.id, idx + 1, body));
+        audits.push(curated_entry_to_audit(
+            &entry.id,
+            idx + 1,
+            body,
+            entry.repository.clone(),
+        ));
     }
 
     if !missing_bodies.is_empty() {
@@ -855,7 +943,7 @@ async fn run_curated(args: &Args) -> Result<(), BoxError> {
     };
 
     if let Some(name) = &args.advisor {
-        metadata.advisor = enrich_advisor_in_place(name, &mut audits).await?;
+        metadata.advisor = enrich_advisor_in_place(name, &mut audits, args).await?;
     }
 
     persist_audit(&args.results, &args.report, &audits, &metadata)?;
@@ -869,7 +957,12 @@ async fn run_curated(args: &Args) -> Result<(), BoxError> {
 /// inputs aren't in the fixture, so every entry gets the
 /// "old publish, no attestation" baseline — matches the hermetic
 /// fixture's no-cooldown-no-attestation shape.
-fn curated_entry_to_audit(id: &str, rank: usize, body: String) -> PackageAudit {
+fn curated_entry_to_audit(
+    id: &str,
+    rank: usize,
+    body: String,
+    repository: Option<String>,
+) -> PackageAudit {
     let postinstall = Some(classify_script(&body));
     let mut audit = PackageAudit {
         // The fixture entries don't have real npm names; the entry
@@ -889,6 +982,11 @@ fn curated_entry_to_audit(id: &str, rank: usize, body: String) -> PackageAudit {
         portable_outcome: None,
         advisor_outcome: None,
         advisor_provider: None,
+        // Phase 46b Lever #1 — curated entries may carry a
+        // repository URL on `expectations.json` so the L4 advisor
+        // can apply the delegate-to-local-file APPROVE rule. Older
+        // expectation entries without the field land as `None`.
+        repository,
         fetch_error: None,
     };
     audit.tier = worst_of_phases(&audit);
@@ -941,7 +1039,7 @@ async fn run_hermetic(args: &Args) -> Result<(), BoxError> {
     };
 
     if let Some(name) = &args.advisor {
-        metadata.advisor = enrich_advisor_in_place(name, &mut audits).await?;
+        metadata.advisor = enrich_advisor_in_place(name, &mut audits, args).await?;
     }
 
     persist_audit(&args.results, &args.report, &audits, &metadata)?;
@@ -972,6 +1070,12 @@ fn hermetic_entry_to_audit(entry: HermeticEntry) -> PackageAudit {
         portable_outcome: None,
         advisor_outcome: None,
         advisor_provider: None,
+        // Phase 46b Lever #1 — hermetic fixtures may declare a
+        // `repository` URL so the L4 advisor sees it in the prompt.
+        // Existing pre-Lever-#1 fixtures don't carry the field, so
+        // `serde(default)` lets them load as `None` without a
+        // fixture rewrite.
+        repository: entry.repository.clone(),
         fetch_error: None,
     };
     audit.tier = worst_of_phases(&audit);
@@ -1036,6 +1140,7 @@ fn hermetic_l3_outcome(publish_age_hours: u64, attestation_present: bool) -> L3O
 async fn enrich_advisor_in_place(
     name: &str,
     audits: &mut [PackageAudit],
+    args: &Args,
 ) -> Result<Option<AdvisorStamp>, BoxError> {
     let provider = AdvisorProvider::from_slug(name)
         .ok_or_else(|| format!("unknown advisor '{name}'; valid: claude-cli / codex / ollama"))?;
@@ -1096,6 +1201,49 @@ async fn enrich_advisor_in_place(
         targets.len()
     );
 
+    // Phase 46b — open the L4 cache when `--l4-cache` is set. Off by
+    // default so a measurement run pays the honest cold-cache LLM
+    // round-trip cost. The cache module's own `LPM_L4_CACHE=0`
+    // env-var disable still applies; if both flag-on + env-off, we
+    // surface that in a print line so a confused operator can spot
+    // the env-var override.
+    let cache: Option<Arc<L4Cache>> = if args.l4_cache {
+        match L4Cache::open_default() {
+            Ok(c) => {
+                if c.is_disabled() {
+                    println!(
+                        "L4 cache: enabled by --l4-cache but disabled via env (LPM_L4_CACHE != 1); \
+                         every advisor call will hit the LLM."
+                    );
+                } else {
+                    println!(
+                        "L4 cache: enabled, file = {} (existing entries: {})",
+                        c.path().display(),
+                        c.entry_count()
+                    );
+                }
+                Some(Arc::new(c))
+            }
+            Err(e) => {
+                eprintln!(
+                    "warning: --l4-cache requested but L4Cache::open_default failed ({e}); \
+                     running uncached"
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
+    let cache_template_hash = stamp.prompt_template_hash.clone();
+    let cache_model_version = stamp
+        .binary_version
+        .clone()
+        .unwrap_or_else(|| stamp.model.clone().unwrap_or_default());
+    let cache_provider_slug = stamp.provider.clone();
+    let cache_hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let cache_misses = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
     let pb = Arc::new(ProgressBar::new(targets.len() as u64));
     pb.set_style(progress_style("L4 advise"));
 
@@ -1131,9 +1279,24 @@ async fn enrich_advisor_in_place(
     let outcomes: Vec<(usize, Option<&'static str>, AdvisorOutcome)> =
         futures::stream::iter(snapshots.into_iter().map(|(idx, snapshot)| {
             let pb = Arc::clone(&pb_for_stream);
+            let cache = cache.clone();
+            let cache_template_hash = cache_template_hash.clone();
+            let cache_model_version = cache_model_version.clone();
+            let cache_provider_slug = cache_provider_slug.clone();
+            let cache_hits = Arc::clone(&cache_hits);
+            let cache_misses = Arc::clone(&cache_misses);
             async move {
-                let (verdict_label, advisor_outcome) =
-                    classify_one_with_advisor(advisor_ref, &snapshot).await;
+                let (verdict_label, advisor_outcome) = classify_one_with_advisor(
+                    advisor_ref,
+                    &snapshot,
+                    cache.as_deref(),
+                    &cache_provider_slug,
+                    &cache_model_version,
+                    &cache_template_hash,
+                    &cache_hits,
+                    &cache_misses,
+                )
+                .await;
                 pb.inc(1);
                 // Non-TTY-friendly stderr milestone every 25 advisor
                 // calls. The L4 phase is slower per-item than fetch
@@ -1157,15 +1320,60 @@ async fn enrich_advisor_in_place(
         }
     }
 
+    // Phase 46b — persist + summary. Persisting is best-effort
+    // (failure surfaces as a warning, never an error). Summary line
+    // fires when `--l4-cache` is set OR when `--l4-cache-stats` is
+    // (the latter is for a future "show stats without changing the
+    // cache" debug mode).
+    if let Some(cache) = cache.as_deref() {
+        match cache.persist() {
+            Ok(()) => {
+                let hits = cache_hits.load(std::sync::atomic::Ordering::Relaxed);
+                let misses = cache_misses.load(std::sync::atomic::Ordering::Relaxed);
+                println!(
+                    "L4 cache: hits={hits} misses={misses} entries={} (persisted to {})",
+                    cache.entry_count(),
+                    cache.path().display(),
+                );
+            }
+            Err(e) => {
+                eprintln!(
+                    "warning: L4 cache persist failed: {e} (in-memory entries lost; next \
+                     run starts cold)",
+                );
+            }
+        }
+    } else if args.l4_cache_stats {
+        println!(
+            "L4 cache: stats requested but cache is disabled (hits/misses both 0; \
+             pass --l4-cache to enable)"
+        );
+    }
+
     Ok(Some(stamp))
 }
 
 /// Run the advisor on a single package's amber script(s). Worst-of
 /// across phases (matches the L1 worst-of-phases logic). Returns
 /// `(verdict_label_for_logging, final_advisor_outcome)`.
+///
+/// Phase 46b — when `cache` is `Some`, look up the (name, version,
+/// amber-phase-bodies, prompt_template_hash, provider, model) key
+/// before invoking the advisor. On a hit, the LLM call is skipped
+/// entirely and the cached verdict is mapped straight back to an
+/// `AdvisorOutcome`. On a miss, the advisor classifies as usual and
+/// the resulting worst-of verdict is inserted into the cache so the
+/// next run hits.
+#[allow(clippy::too_many_arguments)]
 async fn classify_one_with_advisor(
     advisor: &dyn Advisor,
     pkg: &PackageAudit,
+    cache: Option<&L4Cache>,
+    cache_provider_slug: &str,
+    cache_model_version: &str,
+    cache_template_hash: &str,
+    cache_hits: &std::sync::atomic::AtomicUsize,
+    cache_misses: &std::sync::atomic::AtomicUsize,
 ) -> (Option<&'static str>, AdvisorOutcome) {
     let phases = scripted_phases(pkg);
     let amber_phases: Vec<(&'static str, &ScriptAudit)> = phases
@@ -1177,6 +1385,43 @@ async fn classify_one_with_advisor(
     }
 
     let version = pkg.version.as_deref().unwrap_or("unknown");
+
+    // Phase 46b — cache lookup. The cache key folds in every input
+    // axis that affects the verdict: package identity (name +
+    // version), every amber phase body, plus the advisor's prompt
+    // template hash + provider slug + model version. A cache hit
+    // means we've already classified an identical input and can
+    // skip the LLM round-trip.
+    let cache_phases: Vec<(&str, &str)> = amber_phases
+        .iter()
+        .map(|(phase, script)| (*phase, script.script.as_str()))
+        .collect();
+    let cache_key = build_cache_key(&CacheKeyInputs {
+        package_name: &pkg.name,
+        package_version: version,
+        amber_phases: &cache_phases,
+        repository: pkg.repository.as_deref(),
+        prompt_template_hash: cache_template_hash,
+        provider_slug: cache_provider_slug,
+        model_version: cache_model_version,
+    });
+    if let Some(cache) = cache
+        && let Some(cached_verdict) = cache.lookup(&cache_key)
+    {
+        cache_hits.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let outcome = match cached_verdict {
+            TriageVerdict::Approve => AdvisorOutcome::AutoRun,
+            TriageVerdict::Manual => AdvisorOutcome::Prompt,
+            TriageVerdict::Abstain => AdvisorOutcome::Prompt,
+        };
+        let label = match cached_verdict {
+            TriageVerdict::Approve => "approve",
+            TriageVerdict::Manual => "manual",
+            TriageVerdict::Abstain => "abstain",
+        };
+        return (Some(label), outcome);
+    }
+
     let mut worst = TriageVerdict::Approve;
     let mut saw_failure = false;
     for (phase_name, script) in &amber_phases {
@@ -1185,6 +1430,10 @@ async fn classify_one_with_advisor(
             package_version: version,
             phase: phase_name,
             script_body: &script.script,
+            // Phase 46b Lever #1 — forward the package's
+            // `repository` URL so the prompt's `Repository:` line
+            // pairs with the script body.
+            repository: pkg.repository.as_deref(),
         };
         match advisor.classify_amber(&amber).await {
             Ok(v) => worst = combine_verdict(worst, v),
@@ -1203,8 +1452,24 @@ async fn classify_one_with_advisor(
 
     if saw_failure {
         // Per the contract: degrade to portable outcome for this
-        // package, never block.
+        // package, never block. Don't cache failures — the next run
+        // may succeed.
         return (Some("failure"), AdvisorOutcome::Prompt);
+    }
+
+    // Phase 46b — insert the final verdict into the cache so the
+    // next run with the same inputs hits.
+    if cache.is_some() {
+        cache_misses.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+    if let Some(cache) = cache {
+        cache.insert(
+            cache_key,
+            worst,
+            cache_provider_slug,
+            cache_model_version,
+            cache_template_hash,
+        );
     }
 
     let outcome = match worst {
@@ -1365,7 +1630,7 @@ async fn reclassify_from_cache(args: &Args) -> Result<(), BoxError> {
             a.advisor_outcome = None;
             a.advisor_provider = None;
         }
-        metadata.advisor = enrich_advisor_in_place(name, &mut audits).await?;
+        metadata.advisor = enrich_advisor_in_place(name, &mut audits, args).await?;
     }
 
     persist_audit(&args.results, &args.report, &audits, &metadata)?;
@@ -1559,12 +1824,16 @@ async fn audit_one(
         portable_outcome: None,
         advisor_outcome: None,
         advisor_provider: None,
+        repository: None,
         fetch_error: None,
     };
 
     match result {
         Ok(manifest) => {
             audit.version = manifest.version;
+            // Phase 46b Lever #1 — pull the `repository` URL from
+            // the registry manifest (string or object shape).
+            audit.repository = manifest.repository.and_then(RepositoryField::into_url);
             let scripts = manifest.scripts.unwrap_or_default();
             audit.preinstall = scripts.get("preinstall").map(|s| classify_script(s));
             audit.install = scripts.get("install").map(|s| classify_script(s));

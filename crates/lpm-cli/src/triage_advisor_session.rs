@@ -61,12 +61,14 @@
 //! describes after Part B B3 ships and slice 1 lands.
 
 use std::collections::HashSet;
+use std::sync::Arc;
 
 use futures::StreamExt;
 use lpm_security::triage::StaticTier;
 use lpm_triage_advisor::{
-    Advisor, AdvisorFailure, AdvisorVerdict, AmberScript, ClaudeCliAdapter, CodexAdapter,
-    OllamaAdapter, Provider,
+    Advisor, AdvisorFailure, AdvisorVerdict, AmberScript, CacheKeyInputs, ClaudeCliAdapter,
+    CodexAdapter, L4Cache, OllamaAdapter, Provider, build_cache_key, prompt_template_hash,
+    provider_version,
 };
 
 use crate::output;
@@ -114,6 +116,24 @@ pub struct AdvisorSession {
     /// Set to `true` after the single degrade-warning fires. Guards
     /// against repeat warnings if a future caller does extra preflight.
     warned_about_unavailable: bool,
+    /// Phase 46b — L4 verdict cache. Shared across the parallel
+    /// classify tasks via [`Arc`]. `None` when the cache could not be
+    /// opened (e.g. no resolvable HOME) — the session falls back to
+    /// uncached classification with a one-line warning, never
+    /// failing the install over a cache problem. Disabled-via-env
+    /// shows up as `Some(cache_disabled)` rather than `None`; both
+    /// short-circuit lookup/insert to no-ops.
+    cache: Option<Arc<L4Cache>>,
+    /// Cached prompt-template hash (computed once at preflight).
+    /// Folded into every cache key so a template change auto-
+    /// invalidates the prior verdicts.
+    prompt_template_hash: String,
+    /// Cached provider-version string (probed once at preflight via
+    /// `provider_version`). Empty when the probe failed; the empty
+    /// string still folds into the cache key, so a future successful
+    /// probe with a real version will simply miss the prior entries
+    /// rather than collide.
+    model_version: String,
 }
 
 impl AdvisorSession {
@@ -169,12 +189,25 @@ impl AdvisorSession {
             return Self::degraded(slug.to_string());
         }
         match adapter.test_invoke().await {
-            Ok(_) => Self {
-                adapter: Some(adapter),
-                configured_slug: Some(slug.to_string()),
-                approvals: HashSet::new(),
-                warned_about_unavailable: false,
-            },
+            Ok(_) => {
+                // Phase 46b — open the L4 cache once at preflight.
+                // Probe provider_version + prompt_template_hash here
+                // so the per-package classify path doesn't repeat
+                // them. Cache-open failure is non-fatal: the install
+                // continues without a cache.
+                let cache = open_cache_or_warn(json_output);
+                let model_version = provider_version(provider).await.unwrap_or_default();
+                let template_hash = prompt_template_hash();
+                Self {
+                    adapter: Some(adapter),
+                    configured_slug: Some(slug.to_string()),
+                    approvals: HashSet::new(),
+                    warned_about_unavailable: false,
+                    cache,
+                    prompt_template_hash: template_hash,
+                    model_version,
+                }
+            }
             Err(AdvisorFailure::EnvironmentNotReady(msg)) => {
                 warn_once(
                     json_output,
@@ -204,6 +237,9 @@ impl AdvisorSession {
             configured_slug: slug,
             approvals: HashSet::new(),
             warned_about_unavailable: false,
+            cache: None,
+            prompt_template_hash: String::new(),
+            model_version: String::new(),
         }
     }
 
@@ -273,45 +309,121 @@ impl AdvisorSession {
         // the cost was N × round-trip; post-parallelization it's
         // ceil(N / CONCURRENCY) × round-trip.
         //
+        // Phase 46b L4 cache: lookup before the LLM call, insert
+        // after. Cached hits skip the round-trip entirely; misses
+        // pay the round-trip once and amortize on every later
+        // install. The cache is `Arc`-shared across the `buffer_
+        // unordered` tasks; lookup + insert hold the inner mutex
+        // for a tiny critical section (no LLM call while holding).
+        //
         // Outcomes flow back through the stream and the approval
         // insertions happen serially after collection — that keeps
         // `self.approvals` mutation single-threaded without locks.
+        let provider_slug = self.configured_slug.clone().unwrap_or_default();
+        let template_hash = self.prompt_template_hash.clone();
+        let model_version = self.model_version.clone();
+        let cache = self.cache.clone();
+
         let results: Vec<(String, String, Option<String>, PackageAdvisorOutcome, bool)> =
-            futures::stream::iter(candidates.iter().map(|c| async move {
-                let mut package_verdict = PackageAdvisorOutcome::Approve;
-                for (phase, body) in &c.amber_phases {
-                    let amber = AmberScript {
-                        package_name: &c.name,
-                        package_version: &c.version,
-                        phase: phase.as_str(),
-                        script_body: body.as_str(),
-                    };
-                    match adapter.classify_amber(&amber).await {
-                        Ok(AdvisorVerdict::Approve) => {}
-                        Ok(AdvisorVerdict::Manual) => {
-                            package_verdict = PackageAdvisorOutcome::Manual;
-                            break;
-                        }
-                        Ok(AdvisorVerdict::Abstain) => {
-                            package_verdict =
-                                package_verdict.degrade_to(PackageAdvisorOutcome::Abstain);
-                        }
-                        Err(_) => {
-                            // Silent per the locked contract; degrade
-                            // to "no approval" for this package and
-                            // keep scanning the remaining packages.
-                            package_verdict =
-                                package_verdict.degrade_to(PackageAdvisorOutcome::Abstain);
+            futures::stream::iter(candidates.iter().map(|c| {
+                let cache = cache.clone();
+                let provider_slug = provider_slug.clone();
+                let template_hash = template_hash.clone();
+                let model_version = model_version.clone();
+                async move {
+                    let cache_key = build_package_cache_key(
+                        c,
+                        &template_hash,
+                        &provider_slug,
+                        &model_version,
+                    );
+
+                    // Fast path: cache hit. Map a single cached
+                    // verdict to the package-level outcome and skip
+                    // the LLM round-trip.
+                    if let Some(cache) = cache.as_deref()
+                        && let Some(verdict) = cache.lookup(&cache_key)
+                    {
+                        let outcome = match verdict {
+                            AdvisorVerdict::Approve => PackageAdvisorOutcome::Approve,
+                            AdvisorVerdict::Manual => PackageAdvisorOutcome::Manual,
+                            AdvisorVerdict::Abstain => PackageAdvisorOutcome::Abstain,
+                        };
+                        return (
+                            c.name.clone(),
+                            c.version.clone(),
+                            c.integrity.clone(),
+                            outcome,
+                            !c.amber_phases.is_empty(),
+                        );
+                    }
+
+                    let mut package_verdict = PackageAdvisorOutcome::Approve;
+                    for (phase, body) in &c.amber_phases {
+                        let amber = AmberScript {
+                            package_name: &c.name,
+                            package_version: &c.version,
+                            phase: phase.as_str(),
+                            script_body: body.as_str(),
+                            repository: c.repository.as_deref(),
+                        };
+                        match adapter.classify_amber(&amber).await {
+                            Ok(AdvisorVerdict::Approve) => {}
+                            Ok(AdvisorVerdict::Manual) => {
+                                package_verdict = PackageAdvisorOutcome::Manual;
+                                break;
+                            }
+                            Ok(AdvisorVerdict::Abstain) => {
+                                package_verdict =
+                                    package_verdict.degrade_to(PackageAdvisorOutcome::Abstain);
+                            }
+                            Err(_) => {
+                                // Silent per the locked contract;
+                                // degrade to "no approval" for this
+                                // package and keep scanning the
+                                // remaining packages. Per-package
+                                // failures are NOT cached — a
+                                // future re-install may succeed.
+                                package_verdict =
+                                    package_verdict.degrade_to(PackageAdvisorOutcome::Abstain);
+                                return (
+                                    c.name.clone(),
+                                    c.version.clone(),
+                                    c.integrity.clone(),
+                                    package_verdict,
+                                    !c.amber_phases.is_empty(),
+                                );
+                            }
                         }
                     }
+
+                    // Persist this package's final verdict to the
+                    // cache (insert is cheap; persist happens once
+                    // at the end of the session). Map back to the
+                    // raw verdict for storage.
+                    if let Some(cache) = cache.as_deref() {
+                        let stored = match package_verdict {
+                            PackageAdvisorOutcome::Approve => AdvisorVerdict::Approve,
+                            PackageAdvisorOutcome::Manual => AdvisorVerdict::Manual,
+                            PackageAdvisorOutcome::Abstain => AdvisorVerdict::Abstain,
+                        };
+                        cache.insert(
+                            cache_key,
+                            stored,
+                            &provider_slug,
+                            &model_version,
+                            &template_hash,
+                        );
+                    }
+
+                    (
+                        c.name.clone(),
+                        c.version.clone(),
+                        c.integrity.clone(),
+                        package_verdict,
+                        !c.amber_phases.is_empty(),
+                    )
                 }
-                (
-                    c.name.clone(),
-                    c.version.clone(),
-                    c.integrity.clone(),
-                    package_verdict,
-                    !c.amber_phases.is_empty(),
-                )
             }))
             .buffer_unordered(CLASSIFY_CONCURRENCY)
             .collect()
@@ -324,6 +436,20 @@ impl AdvisorSession {
             if outcome == PackageAdvisorOutcome::Approve && has_phases {
                 self.approvals.insert((name, version, integrity));
             }
+        }
+
+        // Phase 46b — write the cache back to disk once per session.
+        // Failure to persist is non-fatal: in-memory cache is still
+        // populated, but next install starts cold.
+        if let Some(cache) = self.cache.as_deref()
+            && let Err(e) = cache.persist()
+        {
+            tracing::warn!(
+                target: "lpm_cli::triage_advisor_session::cache",
+                path = %cache.path().display(),
+                error = %e,
+                "could not persist l4 verdict cache; next install will start cold"
+            );
         }
     }
 
@@ -356,6 +482,16 @@ pub struct AmberPackageRequest {
     /// the request must carry the same identity the downstream
     /// trust-evaluation path will use.
     pub integrity: Option<String>,
+    /// Phase 46b Lever #1 — `repository` URL from the package
+    /// manifest (typically `package.json > repository.url` or the
+    /// legacy shorthand string). Forwarded to the advisor prompt as
+    /// the `Repository:` line; pairs with the "fetch IDENTITY"
+    /// rule so the model can approve delegate-to-local-file
+    /// installers when the repository host owns the package
+    /// identity. `None` when the manifest doesn't declare one — the
+    /// prompt renders `<none>` so the model knows the field is
+    /// missing, not stripped.
+    pub repository: Option<String>,
     /// `(phase_name, script_body)` for every amber phase. An empty
     /// list means the package has no amber phases and won't be
     /// approved (the empty-product case in the worst-of reduction
@@ -406,6 +542,55 @@ fn warn_once(json_output: bool, message: &str) {
         return;
     }
     output::warn(message);
+}
+
+/// Phase 46b — best-effort cache open for the install-pipeline
+/// session. A failure (no resolvable HOME, IO error) emits a
+/// one-line warning and degrades to "no cache" rather than failing
+/// the install. The cache module's `LPM_L4_CACHE=0` env var disables
+/// the cache via its own internal check — that path returns `Some`
+/// with a no-op cache so callers don't need an extra branch.
+fn open_cache_or_warn(json_output: bool) -> Option<Arc<L4Cache>> {
+    match L4Cache::open_default() {
+        Ok(cache) => Some(Arc::new(cache)),
+        Err(e) => {
+            warn_once(
+                json_output,
+                &format!(
+                    "could not open l4 verdict cache ({e}); install continues without \
+                     cache acceleration."
+                ),
+            );
+            None
+        }
+    }
+}
+
+/// Phase 46b — build the L4-cache key for one [`AmberPackageRequest`].
+/// Borrows the request's owned strings without copying. Folds in the
+/// repository URL (Lever #1) so a manifest that adds, removes, or
+/// changes the field produces a different cache slot — the verdict
+/// can legitimately differ on that axis.
+fn build_package_cache_key(
+    c: &AmberPackageRequest,
+    prompt_template_hash: &str,
+    provider_slug: &str,
+    model_version: &str,
+) -> String {
+    let phases: Vec<(&str, &str)> = c
+        .amber_phases
+        .iter()
+        .map(|(phase, body)| (phase.as_str(), body.as_str()))
+        .collect();
+    build_cache_key(&CacheKeyInputs {
+        package_name: &c.name,
+        package_version: &c.version,
+        amber_phases: &phases,
+        repository: c.repository.as_deref(),
+        prompt_template_hash,
+        provider_slug,
+        model_version,
+    })
 }
 
 #[cfg(test)]
@@ -468,6 +653,13 @@ mod tests {
             configured_slug: Some("test-fake".into()),
             approvals: HashSet::new(),
             warned_about_unavailable: false,
+            // Tests don't exercise the cache; pass `None` so lookups
+            // miss and inserts no-op. The cache-specific behavior is
+            // tested in `lpm-triage-advisor::l4_cache` and in the
+            // session-level cache tests below.
+            cache: None,
+            prompt_template_hash: String::new(),
+            model_version: String::new(),
         }
     }
 
@@ -590,6 +782,7 @@ mod tests {
             name: "p".into(),
             version: "1.0.0".into(),
             integrity: None,
+            repository: None,
             amber_phases: vec![("postinstall".into(), "tsc".into())],
         };
         s.classify_amber(&[req]).await;
@@ -622,30 +815,35 @@ mod tests {
                 name: "approve-me".into(),
                 version: "1.0.0".into(),
                 integrity: None,
+            repository: None,
                 amber_phases: one_phase(),
             },
             AmberPackageRequest {
                 name: "manual".into(),
                 version: "1.0.0".into(),
                 integrity: None,
+            repository: None,
                 amber_phases: one_phase(),
             },
             AmberPackageRequest {
                 name: "abstain".into(),
                 version: "1.0.0".into(),
                 integrity: None,
+            repository: None,
                 amber_phases: one_phase(),
             },
             AmberPackageRequest {
                 name: "env-fail".into(),
                 version: "1.0.0".into(),
                 integrity: None,
+            repository: None,
                 amber_phases: one_phase(),
             },
             AmberPackageRequest {
                 name: "int-fail".into(),
                 version: "1.0.0".into(),
                 integrity: None,
+            repository: None,
                 amber_phases: one_phase(),
             },
         ];
@@ -688,6 +886,7 @@ mod tests {
             name: "two-phase-trap".into(),
             version: "1.0.0".into(),
             integrity: None,
+            repository: None,
             amber_phases: vec![
                 ("preinstall".into(), "tsc".into()),
                 ("postinstall".into(), "node install.js".into()),
@@ -720,6 +919,7 @@ mod tests {
             name: "edge".into(),
             version: "1.0.0".into(),
             integrity: None,
+            repository: None,
             amber_phases: Vec::new(),
         };
         s.classify_amber(&[req]).await;
@@ -825,12 +1025,16 @@ mod tests {
             configured_slug: Some("slow-fake".into()),
             approvals: HashSet::new(),
             warned_about_unavailable: false,
+            cache: None,
+            prompt_template_hash: String::new(),
+            model_version: String::new(),
         };
         let reqs: Vec<AmberPackageRequest> = (0..6)
             .map(|i| AmberPackageRequest {
                 name: format!("pkg-{i}"),
                 version: "1.0.0".into(),
                 integrity: None,
+            repository: None,
                 amber_phases: vec![("postinstall".into(), "node install.js".into())],
             })
             .collect();
@@ -888,12 +1092,16 @@ mod tests {
             configured_slug: Some("slow-fake".into()),
             approvals: HashSet::new(),
             warned_about_unavailable: false,
+            cache: None,
+            prompt_template_hash: String::new(),
+            model_version: String::new(),
         };
         let reqs: Vec<AmberPackageRequest> = (0..n)
             .map(|i| AmberPackageRequest {
                 name: format!("pkg-{i}"),
                 version: "1.0.0".into(),
                 integrity: None,
+            repository: None,
                 amber_phases: vec![("postinstall".into(), "node install.js".into())],
             })
             .collect();
@@ -930,4 +1138,108 @@ mod tests {
             n as u64 * delay_ms,
         );
     }
+
+    // ─────────────────────────────────────────────────────────────
+    // Phase 46b — L4 cache behavioral contract
+    // ─────────────────────────────────────────────────────────────
+
+    fn session_with_cache(advisor: FakeAdvisor, cache: Arc<L4Cache>) -> AdvisorSession {
+        AdvisorSession {
+            adapter: Some(Box::new(advisor)),
+            configured_slug: Some("test-fake".into()),
+            approvals: HashSet::new(),
+            warned_about_unavailable: false,
+            cache: Some(cache),
+            // Synthetic non-empty stamp so the cache key is stable
+            // across the two phases of each test (the actual values
+            // don't matter as long as both runs use the same ones).
+            prompt_template_hash: "sha256-test-template".into(),
+            model_version: "test-model-v1".into(),
+        }
+    }
+
+    #[tokio::test]
+    async fn cache_hit_skips_adapter_classify_call() {
+        // First run: cache empty, advisor is called, verdict is
+        // inserted into the cache. Second run with the SAME inputs:
+        // adapter classify must NOT be called (cache fully covers
+        // every request).
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("l4.json");
+        unsafe {
+            // Test must run with the cache enabled regardless of
+            // the host env. Setting via env::set_var is unsafe in
+            // multi-threaded contexts, but the cache disable check
+            // only reads at open time and we control that here.
+            std::env::set_var("LPM_L4_CACHE", "1");
+            std::env::set_var("LPM_L4_CACHE_PATH", path.display().to_string());
+        }
+        let cache = Arc::new(L4Cache::open_at(path.clone(), DEFAULT_TTL_FOR_TEST).unwrap());
+
+        // Cold run: adapter returns Approve, cache should miss then
+        // insert.
+        let call_log_cold = Arc::new(Mutex::new(Vec::new()));
+        let fake_cold = FakeAdvisor {
+            provider: Provider::ClaudeCli,
+            detect_result: true,
+            test_invoke_result: Ok(AdvisorVerdict::Approve),
+            classify_results: Mutex::new(vec![Ok(AdvisorVerdict::Approve)]),
+            call_log: Arc::clone(&call_log_cold),
+        };
+        let mut s = session_with_cache(fake_cold, Arc::clone(&cache));
+        let req = AmberPackageRequest {
+            name: "sharp".into(),
+            version: "0.34.4".into(),
+            integrity: Some("sha512-abc".into()),
+            repository: None,
+            amber_phases: vec![("install".into(), "node install.js".into())],
+        };
+        s.classify_amber(&[req]).await;
+        assert_eq!(s.approvals().len(), 1, "cold run should approve via adapter");
+        let cold_log = call_log_cold.lock().await.clone();
+        assert!(
+            cold_log.iter().any(|l| l == "classify:sharp"),
+            "cold run must call adapter.classify_amber: {cold_log:?}"
+        );
+        assert_eq!(cache.entry_count(), 1, "verdict should be cached");
+
+        // Warm run with the SAME input. New fake whose classify_results
+        // is empty — if the cache is consulted, the adapter never
+        // fires. Otherwise the empty queue produces a Manual default
+        // and the test fails because the package wouldn't be approved.
+        let call_log_warm = Arc::new(Mutex::new(Vec::new()));
+        let fake_warm = FakeAdvisor {
+            provider: Provider::ClaudeCli,
+            detect_result: true,
+            test_invoke_result: Ok(AdvisorVerdict::Approve),
+            classify_results: Mutex::new(vec![]),
+            call_log: Arc::clone(&call_log_warm),
+        };
+        let mut s = session_with_cache(fake_warm, cache);
+        let req = AmberPackageRequest {
+            name: "sharp".into(),
+            version: "0.34.4".into(),
+            integrity: Some("sha512-abc".into()),
+            repository: None,
+            amber_phases: vec![("install".into(), "node install.js".into())],
+        };
+        s.classify_amber(&[req]).await;
+        assert_eq!(
+            s.approvals().len(),
+            1,
+            "warm run must approve via cache, not adapter"
+        );
+        let warm_log = call_log_warm.lock().await.clone();
+        assert!(
+            warm_log.iter().all(|l| l != "classify:sharp"),
+            "warm run must NOT call adapter.classify_amber (cache hit should skip): {warm_log:?}"
+        );
+    }
+
+    /// Same default TTL as the production cache. Tests use this so a
+    /// "freshly inserted" entry is always within the lookup window.
+    /// Bringing the constant into scope here keeps the test
+    /// self-contained even if the upstream default changes.
+    const DEFAULT_TTL_FOR_TEST: std::time::Duration =
+        std::time::Duration::from_secs(30 * 24 * 60 * 60);
 }

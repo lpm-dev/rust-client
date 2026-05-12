@@ -808,6 +808,33 @@ pub fn read_install_phase_bodies(pkg_dir: &Path) -> Vec<(String, String)> {
         .collect()
 }
 
+/// Phase 46b Lever #1 — extract the `repository` URL from a
+/// package's `package.json` at the given store directory.
+///
+/// Accepts both manifest shapes:
+/// - String form: `"repository": "github.com/lovell/sharp"`
+/// - Object form: `"repository": { "type": "git", "url": "git+https://github.com/lovell/sharp.git" }`
+///
+/// Returns the URL as-is when present and non-empty; the advisor's
+/// prompt does the host-recognition. Returns `None` if the manifest
+/// is missing, unparseable, or doesn't carry the field. **Pure**:
+/// reads disk but writes nothing.
+pub fn read_manifest_repository(pkg_dir: &Path) -> Option<String> {
+    let pkg_json_path = pkg_dir.join("package.json");
+    let content = std::fs::read_to_string(&pkg_json_path).ok()?;
+    let parsed: serde_json::Value = serde_json::from_str(&content).ok()?;
+    let repo = parsed.get("repository")?;
+    match repo {
+        serde_json::Value::String(s) if !s.is_empty() => Some(s.clone()),
+        serde_json::Value::Object(obj) => obj
+            .get("url")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string()),
+        _ => None,
+    }
+}
+
 /// Phase 46 P2 Chunk 5 — per-tier counts for a blocked set.
 ///
 /// Returns `(green, amber, red)` with these accounting rules:

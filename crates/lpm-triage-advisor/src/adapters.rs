@@ -38,6 +38,7 @@ const TEST_SCRIPT: AmberScript<'static> = AmberScript {
     package_version: "1.0.0",
     phase: "postinstall",
     script_body: "tsc",
+    repository: None,
 };
 
 // ─────────────────────────────────────────────────────────────────────

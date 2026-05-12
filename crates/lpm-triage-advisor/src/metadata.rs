@@ -28,6 +28,11 @@ const PROMPT_HASH_CANARY: AmberScript<'static> = AmberScript {
     package_version: "0.0.0",
     phase: "postinstall",
     script_body: "tsc",
+    // Phase 46b Lever #1 — canary uses `None` so the hash captures
+    // the "no repository" render path. Live calls supply
+    // `Some(...)` per package; that path is exercised by the
+    // prompt unit tests, not the hash canary.
+    repository: None,
 };
 
 const VERSION_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
