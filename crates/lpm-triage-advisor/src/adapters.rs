@@ -39,6 +39,7 @@ const TEST_SCRIPT: AmberScript<'static> = AmberScript {
     phase: "postinstall",
     script_body: "tsc",
     repository: None,
+    referenced_scripts: &[],
 };
 
 // ─────────────────────────────────────────────────────────────────────

@@ -331,12 +331,8 @@ impl AdvisorSession {
                 let template_hash = template_hash.clone();
                 let model_version = model_version.clone();
                 async move {
-                    let cache_key = build_package_cache_key(
-                        c,
-                        &template_hash,
-                        &provider_slug,
-                        &model_version,
-                    );
+                    let cache_key =
+                        build_package_cache_key(c, &template_hash, &provider_slug, &model_version);
 
                     // Fast path: cache hit. Map a single cached
                     // verdict to the package-level outcome and skip
@@ -358,6 +354,18 @@ impl AdvisorSession {
                         );
                     }
 
+                    // Phase 46b Lever #3 — borrow the referenced-
+                    // file content as a slice of `ReferencedScript`
+                    // so the prompt's "Referenced files" section
+                    // can render the embedded view.
+                    let referenced: Vec<lpm_triage_advisor::ReferencedScript<'_>> = c
+                        .referenced_scripts
+                        .iter()
+                        .map(|(filename, content)| lpm_triage_advisor::ReferencedScript {
+                            filename: filename.as_str(),
+                            content: content.as_str(),
+                        })
+                        .collect();
                     let mut package_verdict = PackageAdvisorOutcome::Approve;
                     for (phase, body) in &c.amber_phases {
                         let amber = AmberScript {
@@ -366,6 +374,7 @@ impl AdvisorSession {
                             phase: phase.as_str(),
                             script_body: body.as_str(),
                             repository: c.repository.as_deref(),
+                            referenced_scripts: &referenced,
                         };
                         match adapter.classify_amber(&amber).await {
                             Ok(AdvisorVerdict::Approve) => {}
@@ -498,6 +507,16 @@ pub struct AmberPackageRequest {
     /// would otherwise vacuously promote to Approve — guarded
     /// against in the consumer).
     pub amber_phases: Vec<(String, String)>,
+    /// Phase 46b Lever #3 — files the script body delegates to,
+    /// each as `(filename, content)`. The advisor prompt's
+    /// "Referenced files" section embeds these so the model can
+    /// evaluate the actual fetch / build / payload, not just the
+    /// delegating one-liner. Empty when the body doesn't delegate
+    /// or when caps (depth, size, binary detection, path safety)
+    /// reject every candidate file. See
+    /// `crate::build_state::collect_referenced_scripts` for the
+    /// caller-side caps.
+    pub referenced_scripts: Vec<(String, String)>,
 }
 
 /// Per-package worst-of accumulator state inside
@@ -568,9 +587,10 @@ fn open_cache_or_warn(json_output: bool) -> Option<Arc<L4Cache>> {
 
 /// Phase 46b — build the L4-cache key for one [`AmberPackageRequest`].
 /// Borrows the request's owned strings without copying. Folds in the
-/// repository URL (Lever #1) so a manifest that adds, removes, or
-/// changes the field produces a different cache slot — the verdict
-/// can legitimately differ on that axis.
+/// repository URL (Lever #1) and the referenced-scripts content
+/// (Lever #3) so a manifest that adds, removes, or changes any of
+/// those produces a different cache slot — the verdict can
+/// legitimately differ on those axes.
 fn build_package_cache_key(
     c: &AmberPackageRequest,
     prompt_template_hash: &str,
@@ -582,11 +602,17 @@ fn build_package_cache_key(
         .iter()
         .map(|(phase, body)| (phase.as_str(), body.as_str()))
         .collect();
+    let refs: Vec<(&str, &str)> = c
+        .referenced_scripts
+        .iter()
+        .map(|(filename, content)| (filename.as_str(), content.as_str()))
+        .collect();
     build_cache_key(&CacheKeyInputs {
         package_name: &c.name,
         package_version: &c.version,
         amber_phases: &phases,
         repository: c.repository.as_deref(),
+        referenced_scripts: &refs,
         prompt_template_hash,
         provider_slug,
         model_version,
@@ -783,6 +809,7 @@ mod tests {
             version: "1.0.0".into(),
             integrity: None,
             repository: None,
+            referenced_scripts: Vec::new(),
             amber_phases: vec![("postinstall".into(), "tsc".into())],
         };
         s.classify_amber(&[req]).await;
@@ -815,35 +842,40 @@ mod tests {
                 name: "approve-me".into(),
                 version: "1.0.0".into(),
                 integrity: None,
-            repository: None,
+                repository: None,
+                referenced_scripts: Vec::new(),
                 amber_phases: one_phase(),
             },
             AmberPackageRequest {
                 name: "manual".into(),
                 version: "1.0.0".into(),
                 integrity: None,
-            repository: None,
+                repository: None,
+                referenced_scripts: Vec::new(),
                 amber_phases: one_phase(),
             },
             AmberPackageRequest {
                 name: "abstain".into(),
                 version: "1.0.0".into(),
                 integrity: None,
-            repository: None,
+                repository: None,
+                referenced_scripts: Vec::new(),
                 amber_phases: one_phase(),
             },
             AmberPackageRequest {
                 name: "env-fail".into(),
                 version: "1.0.0".into(),
                 integrity: None,
-            repository: None,
+                repository: None,
+                referenced_scripts: Vec::new(),
                 amber_phases: one_phase(),
             },
             AmberPackageRequest {
                 name: "int-fail".into(),
                 version: "1.0.0".into(),
                 integrity: None,
-            repository: None,
+                repository: None,
+                referenced_scripts: Vec::new(),
                 amber_phases: one_phase(),
             },
         ];
@@ -887,6 +919,7 @@ mod tests {
             version: "1.0.0".into(),
             integrity: None,
             repository: None,
+            referenced_scripts: Vec::new(),
             amber_phases: vec![
                 ("preinstall".into(), "tsc".into()),
                 ("postinstall".into(), "node install.js".into()),
@@ -920,6 +953,7 @@ mod tests {
             version: "1.0.0".into(),
             integrity: None,
             repository: None,
+            referenced_scripts: Vec::new(),
             amber_phases: Vec::new(),
         };
         s.classify_amber(&[req]).await;
@@ -1034,7 +1068,8 @@ mod tests {
                 name: format!("pkg-{i}"),
                 version: "1.0.0".into(),
                 integrity: None,
-            repository: None,
+                repository: None,
+                referenced_scripts: Vec::new(),
                 amber_phases: vec![("postinstall".into(), "node install.js".into())],
             })
             .collect();
@@ -1101,7 +1136,8 @@ mod tests {
                 name: format!("pkg-{i}"),
                 version: "1.0.0".into(),
                 integrity: None,
-            repository: None,
+                repository: None,
+                referenced_scripts: Vec::new(),
                 amber_phases: vec![("postinstall".into(), "node install.js".into())],
             })
             .collect();
@@ -1192,10 +1228,15 @@ mod tests {
             version: "0.34.4".into(),
             integrity: Some("sha512-abc".into()),
             repository: None,
+            referenced_scripts: Vec::new(),
             amber_phases: vec![("install".into(), "node install.js".into())],
         };
         s.classify_amber(&[req]).await;
-        assert_eq!(s.approvals().len(), 1, "cold run should approve via adapter");
+        assert_eq!(
+            s.approvals().len(),
+            1,
+            "cold run should approve via adapter"
+        );
         let cold_log = call_log_cold.lock().await.clone();
         assert!(
             cold_log.iter().any(|l| l == "classify:sharp"),
@@ -1221,6 +1262,7 @@ mod tests {
             version: "0.34.4".into(),
             integrity: Some("sha512-abc".into()),
             repository: None,
+            referenced_scripts: Vec::new(),
             amber_phases: vec![("install".into(), "node install.js".into())],
         };
         s.classify_amber(&[req]).await;

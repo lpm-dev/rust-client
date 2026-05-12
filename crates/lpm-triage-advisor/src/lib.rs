@@ -114,7 +114,16 @@ impl Provider {
 
 /// Input handed to the advisor: one amber lifecycle-script body plus
 /// the surrounding package context the advisor needs to judge safety.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+///
+/// Borrowed slices on the input side keep the per-classify call
+/// allocation-free (the caller already owns the package's name,
+/// version, script bodies, and referenced-file content). The struct
+/// is **not** serializable — it's purely a transport for borrowed
+/// data into the prompt template. A future "audit-replay" path that
+/// wants to deserialize amber scripts would use a parallel owned
+/// shape; do not add serde derives back here, since `&[T]` cannot
+/// be deserialized borrowed-by-default.
+#[derive(Debug, Clone)]
 pub struct AmberScript<'a> {
     pub package_name: &'a str,
     pub package_version: &'a str,
@@ -125,12 +134,49 @@ pub struct AmberScript<'a> {
     /// legacy shorthand string form). When present, the prompt emits
     /// a `Repository:` line and the closing guidance pairs the
     /// repository identity with the "fetch IDENTITY" axis. When
-    /// `None`, the prompt renders `Repository: <none>` so the model
-    /// sees the absence verbatim instead of an empty placeholder
-    /// (which would mask whether the field was missing or just
-    /// not plumbed through).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// `None`, the prompt omits the line entirely (empirical
+    /// measurement on the curated corpus showed `<none>`
+    /// pushed verdicts toward MANUAL; absent-by-default is the
+    /// safer default for measurement and for real packages that
+    /// happen not to declare the field).
     pub repository: Option<&'a str>,
+    /// Phase 46b Lever #3 — contents of files the script body
+    /// delegates to (e.g. `install.js` when the body is `node
+    /// install.js`). The L4 advisor uses these to apply the
+    /// "fetch IDENTITY" rule one level deep — the script body
+    /// alone may not reveal what's fetched, but the file it
+    /// delegates to does.
+    ///
+    /// Each referenced script is emitted in its own nonced fence
+    /// (per-file random nonce) so an attacker who edits one file's
+    /// content can't break out of another file's data section.
+    /// Empty slice = no delegated content embedded; the prompt
+    /// omits the "Referenced files" section entirely.
+    ///
+    /// Caps (load-bearing, enforced by callers):
+    /// - depth = 1 (no recursive `require` following);
+    /// - size = ≤ 32 KB per file (truncated mid-line with explicit
+    ///   marker);
+    /// - paths = explicit safe-relative only (no `..`, no abs, no
+    ///   env-var expansion);
+    /// - non-text files are NOT embedded (they fall back to
+    ///   no-context Amber).
+    pub referenced_scripts: &'a [ReferencedScript<'a>],
+}
+
+/// Phase 46b Lever #3 — one file the script body delegates to,
+/// embedded in the advisor prompt for "fetch IDENTITY" evaluation
+/// one level deep.
+#[derive(Debug, Clone)]
+pub struct ReferencedScript<'a> {
+    /// Relative path inside the package root, as it appeared in the
+    /// script body (e.g. `./install.js`, `scripts/install.js`).
+    pub filename: &'a str,
+    /// File contents. May be truncated by the caller — if so the
+    /// caller appends the explicit `\n... [truncated for prompt
+    /// context]\n` marker so the model knows the embedded view
+    /// ends mid-stream.
+    pub content: &'a str,
 }
 
 /// The advisor's final verdict for one amber script. Only `Approve`

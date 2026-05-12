@@ -525,9 +525,7 @@ pub fn compute_blocked_packages_with_metadata(
             };
             let static_tier: Option<lpm_security::triage::StaticTier> = phase_bodies
                 .iter()
-                .map(|(_, body)| {
-                    lpm_security::static_gate::classify_with_context(body, Some(&ctx))
-                })
+                .map(|(_, body)| lpm_security::static_gate::classify_with_context(body, Some(&ctx)))
                 .reduce(lpm_security::triage::StaticTier::worse_of);
 
             // Strict gate query. Phase 4 binds approvals to
@@ -851,6 +849,144 @@ pub fn read_manifest_repository(pkg_dir: &Path) -> Option<String> {
             .map(|s| s.to_string()),
         _ => None,
     }
+}
+
+/// Phase 46b Lever #3 — maximum bytes of a referenced script's
+/// content embedded in the advisor prompt. 32 KB matches the runbook
+/// cap. Files larger than this are truncated mid-line and the
+/// embedded view ends with a `\n... [truncated for prompt context]\n`
+/// marker so the model knows the slice is partial.
+pub const REFERENCED_SCRIPT_MAX_BYTES: usize = 32 * 1024;
+
+/// Phase 46b Lever #3 — embeddable file content for the advisor
+/// prompt. The runbook caps depth at 1 (no recursive require
+/// following) and scope to explicit safe-relative paths.
+pub struct ReferencedScriptCap {
+    pub filename: String,
+    pub content: String,
+}
+
+/// Phase 46b Lever #3 — scan a script body for files it delegates
+/// to, then read each from the package's store directory with the
+/// caps the runbook prescribes:
+///
+/// - **Depth = 1.** Only the file the body names directly is
+///   embedded. A second-level `require` chain stays inside that
+///   file's content; if the advisor wants to see it, the user must
+///   approve manually.
+/// - **Size ≤ 32 KB per file.** Larger files are truncated mid-line
+///   with an explicit `... [truncated for prompt context]` marker.
+/// - **Path = explicit safe-relative only.** Paths that escape the
+///   package root (`..`, absolute, `~`, `$VAR`) are rejected — the
+///   script body's escape attempt is itself suspicious; let the
+///   advisor see the body without an unsafe embedded view.
+/// - **Non-text content rejected.** Binary files (detected by NUL
+///   bytes in the first 4 KB) are NOT embedded; the prompt's
+///   "delegate-to-binary" suspicion handling kicks in.
+///
+/// Returns the list of `(filename, content)` pairs for each
+/// successfully-read delegate. An empty result means the body
+/// doesn't delegate, OR every candidate file was rejected by a cap.
+/// Both cases route to the no-embedded-view advisor path.
+pub fn collect_referenced_scripts(pkg_dir: &Path, script_body: &str) -> Vec<(String, String)> {
+    let candidates = parse_delegated_paths(script_body);
+    let mut out = Vec::with_capacity(candidates.len());
+    for path in candidates {
+        let Some(content) = read_referenced_file(pkg_dir, &path) else {
+            continue;
+        };
+        out.push((path, content));
+    }
+    out
+}
+
+/// Extract relative paths the script body delegates to. Only matches
+/// the canonical `node <safe-relative-path>.{js,cjs,mjs}` shape — the
+/// SAME shape `lpm_security::static_gate::matches_node_relative` /
+/// `matches_delegating_identity_green` recognize. Anything fancier
+/// (env-var paths, compound bodies, dynamic paths) returns an empty
+/// list; the advisor sees the body without an embedded view.
+fn parse_delegated_paths(script_body: &str) -> Vec<String> {
+    let Some(tokens) = shlex::split(script_body) else {
+        return vec![];
+    };
+    if tokens.len() != 2 || tokens[0] != "node" {
+        return vec![];
+    }
+    let path = &tokens[1];
+    if !is_safe_relative_path(path) {
+        return vec![];
+    }
+    let has_js_ext = path.ends_with(".js") || path.ends_with(".cjs") || path.ends_with(".mjs");
+    if !has_js_ext {
+        return vec![];
+    }
+    vec![path.clone()]
+}
+
+/// Local mirror of `lpm_security::static_gate::is_safe_relative_path`
+/// — duplicating the small predicate avoids exposing the security
+/// crate's private helper just to read manifest scripts. Any rule
+/// change there should be mirrored here.
+fn is_safe_relative_path(p: &str) -> bool {
+    if p.is_empty()
+        || p.starts_with('/')
+        || p.starts_with('~')
+        || p.starts_with('$')
+        || p.contains('\\')
+    {
+        return false;
+    }
+    p.split('/').all(|seg| seg != "..")
+}
+
+/// Read one referenced file from the package directory with the
+/// Lever-#3 caps. Returns `None` for missing files, path-escape
+/// attempts (defense in depth — the safe-relative check above
+/// should catch these but a sym-linked package root could still
+/// surprise us), non-text files (detected by NUL bytes in the head),
+/// or read errors. Otherwise returns the file content, truncated at
+/// `REFERENCED_SCRIPT_MAX_BYTES` with the explicit marker.
+fn read_referenced_file(pkg_dir: &Path, rel_path: &str) -> Option<String> {
+    // Defense-in-depth canonical-prefix check: build the absolute
+    // path, canonicalize both ends, and confirm the resolved file
+    // sits inside `pkg_dir`. This catches sym-link traversals the
+    // raw-string `is_safe_relative_path` predicate doesn't see.
+    let candidate = pkg_dir.join(rel_path);
+    let canonical_root = std::fs::canonicalize(pkg_dir).ok()?;
+    let canonical_target = std::fs::canonicalize(&candidate).ok()?;
+    if !canonical_target.starts_with(&canonical_root) {
+        return None;
+    }
+
+    let bytes = std::fs::read(&canonical_target).ok()?;
+
+    // Binary detection: any NUL byte in the first 4 KB pushes the
+    // file out of the embed path. Most JavaScript / shell scripts
+    // are pure text; a NUL byte is either a compiled binary, a
+    // bundled binary blob, or an obfuscation attempt — none of
+    // which we want to dump verbatim into a prompt.
+    let head = &bytes[..bytes.len().min(4 * 1024)];
+    if head.contains(&0u8) {
+        return None;
+    }
+
+    // UTF-8 conversion is lossy on purpose: the advisor reads the
+    // body as untrusted text, so a stray non-UTF-8 byte gets
+    // replaced with U+FFFD rather than failing the embed entirely.
+    let mut content = String::from_utf8_lossy(&bytes).into_owned();
+    if content.len() > REFERENCED_SCRIPT_MAX_BYTES {
+        // Truncate at the cap. Walk backward to a char boundary so
+        // we don't split a multi-byte sequence (which would render
+        // as U+FFFD in the prompt).
+        let mut cut = REFERENCED_SCRIPT_MAX_BYTES;
+        while cut > 0 && !content.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        content.truncate(cut);
+        content.push_str("\n... [truncated for prompt context]\n");
+    }
+    Some(content)
 }
 
 /// Phase 46 P2 Chunk 5 — per-tier counts for a blocked set.
@@ -2572,5 +2708,112 @@ mod tests {
             blocked.is_empty(),
             "baseline request + strict match = not blocked"
         );
+    }
+
+    // ── Phase 46b Lever #3 — referenced-script file reader ────────
+
+    fn write_file(dir: &Path, rel: &str, content: &str) {
+        let path = dir.join(rel);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        std::fs::write(path, content).unwrap();
+    }
+
+    #[test]
+    fn collect_referenced_scripts_reads_simple_install_js() {
+        let dir = tempfile::tempdir().unwrap();
+        write_file(dir.path(), "install.js", "console.log('hi');\n");
+        let refs = collect_referenced_scripts(dir.path(), "node install.js");
+        assert_eq!(refs.len(), 1);
+        assert_eq!(refs[0].0, "install.js");
+        assert_eq!(refs[0].1, "console.log('hi');\n");
+    }
+
+    #[test]
+    fn collect_referenced_scripts_reads_nested_path() {
+        let dir = tempfile::tempdir().unwrap();
+        write_file(dir.path(), "scripts/install.js", "body");
+        let refs = collect_referenced_scripts(dir.path(), "node scripts/install.js");
+        assert_eq!(refs.len(), 1);
+        assert_eq!(refs[0].0, "scripts/install.js");
+        assert_eq!(refs[0].1, "body");
+    }
+
+    #[test]
+    fn collect_referenced_scripts_rejects_escaping_path() {
+        // The `..` segment is rejected by `is_safe_relative_path`
+        // before any file I/O happens.
+        let dir = tempfile::tempdir().unwrap();
+        let refs = collect_referenced_scripts(dir.path(), "node ../escape.js");
+        assert!(refs.is_empty(), "escaping path must not be read");
+    }
+
+    #[test]
+    fn collect_referenced_scripts_rejects_absolute_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let refs = collect_referenced_scripts(dir.path(), "node /etc/passwd");
+        assert!(refs.is_empty());
+    }
+
+    #[test]
+    fn collect_referenced_scripts_rejects_compound_body() {
+        // Only the bare two-token `node <path>` shape extracts a
+        // path; compound bodies fall through to no referenced
+        // scripts (the model sees the body alone).
+        let dir = tempfile::tempdir().unwrap();
+        write_file(dir.path(), "install.js", "ok");
+        let refs = collect_referenced_scripts(dir.path(), "node install.js && echo done");
+        assert!(refs.is_empty());
+    }
+
+    #[test]
+    fn collect_referenced_scripts_rejects_binary_file() {
+        // A NUL byte in the head pushes the file out of the embed
+        // path — most pure-JS install scripts are NUL-free; a NUL
+        // byte means a compiled binary or an obfuscation attempt.
+        let dir = tempfile::tempdir().unwrap();
+        write_file(dir.path(), "install.js", "before\x00after");
+        let refs = collect_referenced_scripts(dir.path(), "node install.js");
+        assert!(
+            refs.is_empty(),
+            "binary content must not be embedded in the prompt"
+        );
+    }
+
+    #[test]
+    fn collect_referenced_scripts_truncates_at_cap_with_marker() {
+        let dir = tempfile::tempdir().unwrap();
+        // Build a body 2x the cap, all ASCII so the boundary walk
+        // never matters.
+        let big = "a".repeat(REFERENCED_SCRIPT_MAX_BYTES * 2);
+        write_file(dir.path(), "install.js", &big);
+        let refs = collect_referenced_scripts(dir.path(), "node install.js");
+        assert_eq!(refs.len(), 1);
+        let content = &refs[0].1;
+        assert!(
+            content.len() <= REFERENCED_SCRIPT_MAX_BYTES + 64,
+            "truncated content must be within cap + marker length, got {}",
+            content.len()
+        );
+        assert!(
+            content.contains("[truncated for prompt context]"),
+            "truncation marker missing"
+        );
+    }
+
+    #[test]
+    fn collect_referenced_scripts_skips_missing_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let refs = collect_referenced_scripts(dir.path(), "node install.js");
+        assert!(refs.is_empty(), "missing file = no referenced scripts");
+    }
+
+    #[test]
+    fn collect_referenced_scripts_requires_js_extension() {
+        let dir = tempfile::tempdir().unwrap();
+        write_file(dir.path(), "install", "ok");
+        let refs = collect_referenced_scripts(dir.path(), "node install");
+        assert!(refs.is_empty(), "extensionless path must not be embedded");
     }
 }
