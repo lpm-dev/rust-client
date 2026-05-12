@@ -7970,10 +7970,21 @@ fn collect_amber_classification_requests(
         // different sources produces TWO distinct approval keys
         // downstream — required so an approval on one source cannot
         // leak to a sibling source in the same install.
+        //
+        // Phase 46b Lever #1: read the package's `repository` URL
+        // from the same store package.json. The advisor uses this to
+        // pair the script body with the package's claimed identity
+        // (e.g. `node install.js` + `github.com/lovell/sharp` ↔
+        // sharp's known prebuilt-binary downloader). `None` when the
+        // manifest doesn't declare the field — the prompt renders
+        // `<none>` so the model knows the field is missing rather
+        // than redacted.
+        let repository = crate::build_state::read_manifest_repository(&pkg_dir);
         out.push(crate::triage_advisor_session::AmberPackageRequest {
             name: name.clone(),
             version: version.clone(),
             integrity: integrity.clone(),
+            repository,
             amber_phases,
         });
     }

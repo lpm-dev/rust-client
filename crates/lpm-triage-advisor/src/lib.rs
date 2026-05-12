@@ -44,12 +44,14 @@ use thiserror::Error;
 
 mod adapters;
 mod detection;
+mod l4_cache;
 mod metadata;
 mod prompt;
 mod verdict;
 
 pub use adapters::{ClaudeCliAdapter, CodexAdapter, OllamaAdapter};
 pub use detection::{ProbeReport, detect, probe_all};
+pub use l4_cache::{CacheKeyInputs, DEFAULT_TTL as L4_CACHE_DEFAULT_TTL, L4Cache, build_cache_key};
 pub use metadata::{binary_path, prompt_template_hash, provider_version};
 pub use prompt::build_prompt;
 pub use verdict::parse_verdict;
@@ -118,6 +120,17 @@ pub struct AmberScript<'a> {
     pub package_version: &'a str,
     pub phase: &'a str,
     pub script_body: &'a str,
+    /// Phase 46b Lever #1 — `repository` field from the package
+    /// manifest (typically `package.json > repository.url` or the
+    /// legacy shorthand string form). When present, the prompt emits
+    /// a `Repository:` line and the closing guidance pairs the
+    /// repository identity with the "fetch IDENTITY" axis. When
+    /// `None`, the prompt renders `Repository: <none>` so the model
+    /// sees the absence verbatim instead of an empty placeholder
+    /// (which would mask whether the field was missing or just
+    /// not plumbed through).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repository: Option<&'a str>,
 }
 
 /// The advisor's final verdict for one amber script. Only `Approve`
