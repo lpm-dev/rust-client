@@ -56,7 +56,7 @@
 //! disambiguation that flows from each target's own `wrapper_id`.
 
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use lpm_common::LpmError;
@@ -422,13 +422,21 @@ fn ensure_peer_context(targets: &mut [V2Target], store: &Store) -> Result<(), Lp
             .or_insert_with(|| v2t.target.version.clone());
     }
 
+    // Trial 5 (2026-05-13) — scratch `PathBuf` reused across the
+    // per-package `package.json` paths. The inner `object_dir.join(
+    // "package.json")` allocated per iteration; sharing a single
+    // buffer (cleared and re-pushed) reuses the underlying capacity
+    // once it has grown past the longest store path.
+    let mut pkg_json_path = PathBuf::with_capacity(256);
     for v2t in targets.iter_mut() {
         if !v2t.target.peers.is_empty() {
             // Resolver-threaded — trust it.
             continue;
         }
         let object_dir = store.paths().object_dir(&v2t.source_sri)?;
-        let pkg_json_path = object_dir.join("package.json");
+        pkg_json_path.clear();
+        pkg_json_path.push(&object_dir);
+        pkg_json_path.push("package.json");
 
         // Read once; treat I/O failure as "no peer deps" (equivalent to the
         // old `exists()` check but saves one stat(2) syscall per package).
@@ -785,6 +793,13 @@ fn create_root_symlinks(
         ))
     })?;
 
+    // Trial 5 (2026-05-13) — scratch `PathBuf` reused across iterations.
+    // Without this, each inner-loop `nm.join(&root_name)` allocates a
+    // fresh `PathBuf`; with a single scratch buffer cleared between
+    // iterations, the underlying capacity is reused. For installs with
+    // ~50 packages × 1-2 root names each this saves on the order of
+    // 100 PathBuf allocations on the warm-link hot path.
+    let mut link_path = PathBuf::with_capacity(nm.as_os_str().len() + 64);
     let mut count = 0usize;
     for v2t in targets {
         let names = root_link_names(&v2t.target);
@@ -799,7 +814,9 @@ fn create_root_symlinks(
         })?;
         let target_path = store.paths().link_package_dir(key);
         for root_name in names {
-            let link_path = nm.join(&root_name);
+            link_path.clear();
+            link_path.push(&nm);
+            link_path.push(&root_name);
             // Scoped root names (`@scope/dep`) need their `@scope/`
             // parent directory created.
             if let Some(parent) = link_path.parent()
@@ -869,6 +886,16 @@ fn create_bin_links_v2(
 ) -> Result<usize, LpmError> {
     let bin_dir = project_dir.join("node_modules").join(".bin");
 
+    // Trial 5 (2026-05-13) — scratch `PathBuf`s reused across iterations.
+    // The four per-iteration paths (`pkg_json_path`, `bin_target`,
+    // `link_path`, `cmd_path`) are all built into reusable buffers
+    // rather than allocated fresh each loop turn. For an install with
+    // N direct deps × ~2 bin entries each, this saves on the order
+    // of 4 N PathBuf allocations on the warm-link hot path.
+    let mut pkg_json_path = PathBuf::with_capacity(256);
+    let mut bin_target = PathBuf::with_capacity(256);
+    let mut link_path = PathBuf::with_capacity(bin_dir.as_os_str().len() + 64);
+
     let mut count = 0usize;
     for v2t in targets {
         if !is_direct(&v2t.target) {
@@ -879,7 +906,9 @@ fn create_bin_links_v2(
             None => continue,
         };
         let pkg_dir = store.paths().link_package_dir(key);
-        let pkg_json_path = pkg_dir.join("package.json");
+        pkg_json_path.clear();
+        pkg_json_path.push(&pkg_dir);
+        pkg_json_path.push("package.json");
 
         // Read once; treat I/O failure as "no bin" (equivalent to the old
         // exists() check but saves one stat(2) syscall per direct dep).
@@ -924,7 +953,9 @@ fn create_bin_links_v2(
             // Strip the conventional `bin/` slash prefix on a sub-path
             // to keep the shim target as the actual file inside the
             // package dir. The v1 helper does the same.
-            let bin_target = pkg_dir.join(&bin_rel_path);
+            bin_target.clear();
+            bin_target.push(&pkg_dir);
+            bin_target.push(&bin_rel_path);
             if !bin_target.exists() {
                 tracing::debug!(
                     "v2 linker: bin script {} for {}/{} missing — skipping shim",
@@ -948,7 +979,9 @@ fn create_bin_links_v2(
                     }
                 }
             }
-            let link_path = bin_dir.join(&cmd_name);
+            link_path.clear();
+            link_path.push(&bin_dir);
+            link_path.push(&cmd_name);
             // Best-effort cleanup of a stale shim.
             if link_path.symlink_metadata().is_ok() {
                 let _ = std::fs::remove_file(&link_path);
