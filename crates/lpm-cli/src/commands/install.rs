@@ -5008,7 +5008,7 @@ async fn run_with_options_under_store_lock(
     let v2_plan: Option<std::sync::Arc<lpm_linker::v2::LinkPlanV2>> = if v2_event_driven {
         let plan = lpm_linker::v2::link_v2_prepare(
             project_dir,
-            &v2_cas_targets_pre,
+            v2_cas_targets_pre,
             store_v2_handle
                 .as_deref()
                 .expect("v2_event_driven implies v2 store"),
@@ -6222,7 +6222,7 @@ async fn run_with_options_under_store_lock(
         } else {
             lpm_linker::v2::link_packages_v2(
                 project_dir,
-                &v2_targets,
+                v2_targets,
                 store_v2,
                 linker_mode,
                 pkg.name.as_deref(),

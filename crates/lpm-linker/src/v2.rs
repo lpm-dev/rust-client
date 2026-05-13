@@ -168,7 +168,7 @@ fn target_declares_no_peers(_target: &LinkTarget) -> bool {
 /// - `materialized`: vector of [`MaterializedPackage`] entries.
 pub fn link_packages_v2(
     project_dir: &Path,
-    targets: &[V2Target],
+    targets: Vec<V2Target>,
     store: &Store,
     linker_mode: LinkerMode,
     self_package_name: Option<&str>,
@@ -274,12 +274,13 @@ pub fn link_packages_v2(
 /// and finalize phases.
 pub fn link_v2_prepare(
     project_dir: &Path,
-    targets: &[V2Target],
+    targets: Vec<V2Target>,
     store: &Store,
     linker_mode: LinkerMode,
 ) -> Result<LinkPlanV2, LpmError> {
     cleanup_v1_state(project_dir)?;
-    let augmented_targets = ensure_peer_context(targets, store)?;
+    let mut augmented_targets = targets;
+    ensure_peer_context(&mut augmented_targets, store)?;
     let platform = PlatformTuple::current();
     let linker_tag = match linker_mode {
         LinkerMode::Isolated => LinkerModeTag::Isolated,
@@ -398,21 +399,20 @@ pub fn link_v2_finalize(
 /// (post-symlink-resolve) reaches the peer's own siblings. The
 /// transitive closure is encoded in the per-target loop, not in
 /// per-target peer edges.
-fn ensure_peer_context(targets: &[V2Target], store: &Store) -> Result<Vec<V2Target>, LpmError> {
+fn ensure_peer_context(targets: &mut [V2Target], store: &Store) -> Result<(), LpmError> {
     // Build a name → version lookup so the fallback derivation can
     // intersect declared peers against the install set. The
     // single-version-per-name shape is correct for the audit-fixture
     // scope; multi-source-same-name disambiguation flows through
     // wrapper_id at the GraphKey level (see preplan §2.2).
     let mut by_name: HashMap<String, String> = HashMap::with_capacity(targets.len());
-    for v2t in targets {
+    for v2t in targets.iter() {
         by_name
             .entry(v2t.target.name.clone())
             .or_insert_with(|| v2t.target.version.clone());
     }
 
-    let mut out: Vec<V2Target> = targets.to_vec();
-    for v2t in out.iter_mut() {
+    for v2t in targets.iter_mut() {
         if !v2t.target.peers.is_empty() {
             // Resolver-threaded — trust it.
             continue;
@@ -462,7 +462,7 @@ fn ensure_peer_context(targets: &[V2Target], store: &Store) -> Result<Vec<V2Targ
         derived.sort_by(|a, b| a.0.cmp(&b.0));
         v2t.target.peers = derived;
     }
-    Ok(out)
+    Ok(())
 }
 
 /// Result handle for a single populated link entry — keeps the key
@@ -1045,7 +1045,7 @@ mod tests {
 
         let result = link_packages_v2(
             &project,
-            &[target("a", "1.0.0", &sri, true)],
+            vec![target("a", "1.0.0", &sri, true)],
             &store,
             LinkerMode::Isolated,
             None,
@@ -1095,7 +1095,7 @@ mod tests {
 
         let result = link_packages_v2(
             &project,
-            &[consumer, lib],
+            vec![consumer, lib],
             &store,
             LinkerMode::Isolated,
             None,
@@ -1159,7 +1159,7 @@ mod tests {
 
         link_packages_v2(
             &project,
-            &[target("x", "1.0.0", &sri, true)],
+            vec![target("x", "1.0.0", &sri, true)],
             &store,
             LinkerMode::Isolated,
             None,
@@ -1190,7 +1190,7 @@ mod tests {
 
         let mut t = target("a", "1.0.0", &sri, true);
         t.target.root_link_names = Some(vec![]);
-        let result = link_packages_v2(&project, &[t], &store, LinkerMode::Isolated, None).unwrap();
+        let result = link_packages_v2(&project, vec![t], &store, LinkerMode::Isolated, None).unwrap();
         assert_eq!(result.symlinked, 0);
         assert!(!project.join("node_modules").join("a").exists());
     }
@@ -1211,7 +1211,7 @@ mod tests {
 
         let result = link_packages_v2(
             &project,
-            &[target("d", "1.0.0", &sri, false)],
+            vec![target("d", "1.0.0", &sri, false)],
             &store,
             LinkerMode::Isolated,
             Some("self-pkg"),
@@ -1243,7 +1243,7 @@ mod tests {
         // Dep 'phantom@9.9.9' has no matching LinkTarget in the set.
         t.target.dependencies = vec![("phantom".into(), "9.9.9".into())];
 
-        let err = link_packages_v2(&project, &[t], &store, LinkerMode::Isolated, None).unwrap_err();
+        let err = link_packages_v2(&project, vec![t], &store, LinkerMode::Isolated, None).unwrap_err();
         let msg = format!("{err}");
         assert!(
             msg.contains("phantom@9.9.9"),
@@ -1302,7 +1302,7 @@ mod tests {
         std::fs::create_dir_all(&proj1).unwrap();
         let result_p1 = link_packages_v2(
             &proj1,
-            &[
+            vec![
                 target("c", "1.0.0", &c_sri, true),
                 target("react", "18.0.0", &r18_sri, false),
             ],
@@ -1317,7 +1317,7 @@ mod tests {
         std::fs::create_dir_all(&proj2).unwrap();
         let result_p2 = link_packages_v2(
             &proj2,
-            &[
+            vec![
                 target("c", "1.0.0", &c_sri, true),
                 target("react", "19.0.0", &r19_sri, false),
             ],
@@ -1405,7 +1405,7 @@ mod tests {
 
         let result_p1 = link_packages_v2(
             &proj1,
-            &[
+            vec![
                 target("c", "1.0.0", &c_sri, true),
                 target("react", "18.0.0", &r_sri, false),
             ],
@@ -1416,7 +1416,7 @@ mod tests {
         .unwrap();
         let result_p2 = link_packages_v2(
             &proj2,
-            &[
+            vec![
                 target("c", "1.0.0", &c_sri, true),
                 target("react", "18.0.0", &r_sri, false),
             ],
@@ -1480,7 +1480,7 @@ mod tests {
         b.target.wrapper_id = Some("t-bbbbbbbbbbbbbbbb".into());
 
         let err =
-            link_packages_v2(&project, &[a, b], &store, LinkerMode::Isolated, None).unwrap_err();
+            link_packages_v2(&project, vec![a, b], &store, LinkerMode::Isolated, None).unwrap_err();
         let msg = format!("{err}");
         assert!(
             msg.contains("multi-source") && msg.contains("x@1.0.0"),
@@ -1542,8 +1542,8 @@ mod tests {
         t_a.target.patch_fingerprint = Some("p-aaaaaaaaaaaaaaaa".into());
         let t_b = target("lodash", "1.0.0", &sri, true); // unpatched
 
-        let r_a = link_packages_v2(&proj_a, &[t_a], &store, LinkerMode::Isolated, None).unwrap();
-        let r_b = link_packages_v2(&proj_b, &[t_b], &store, LinkerMode::Isolated, None).unwrap();
+        let r_a = link_packages_v2(&proj_a, vec![t_a], &store, LinkerMode::Isolated, None).unwrap();
+        let r_b = link_packages_v2(&proj_b, vec![t_b], &store, LinkerMode::Isolated, None).unwrap();
 
         let dest_a = r_a
             .materialized
@@ -1613,8 +1613,8 @@ mod tests {
         let mut t_b = target("lodash", "1.0.0", &sri, true);
         t_b.target.patch_fingerprint = Some("p-1234567890abcdef".into());
 
-        let r_a = link_packages_v2(&proj_a, &[t_a], &store, LinkerMode::Isolated, None).unwrap();
-        let r_b = link_packages_v2(&proj_b, &[t_b], &store, LinkerMode::Isolated, None).unwrap();
+        let r_a = link_packages_v2(&proj_a, vec![t_a], &store, LinkerMode::Isolated, None).unwrap();
+        let r_b = link_packages_v2(&proj_b, vec![t_b], &store, LinkerMode::Isolated, None).unwrap();
 
         let dest_a = r_a
             .materialized
@@ -1662,7 +1662,7 @@ mod tests {
         }
 
         let result =
-            link_packages_v2(&project, &targets, &store, LinkerMode::Isolated, None).unwrap();
+            link_packages_v2(&project, targets, &store, LinkerMode::Isolated, None).unwrap();
 
         // Every package freshly populated: linked counter must match N.
         assert_eq!(
