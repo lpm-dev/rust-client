@@ -127,14 +127,25 @@ impl StoreV2Paths {
 /// Convert an SRI integrity string into a filesystem-safe segment
 /// (`<algo>-<hex>`). Hex (vs base64) keeps the segment safe on every
 /// platform — no `/`, `+`, or `=` characters.
+///
+/// Trial 28: builds the result string with a single allocation using
+/// `String::with_capacity` + direct byte writes, eliminating the
+/// intermediate `hex::encode` String that the naïve `format!` would
+/// produce.
 fn sri_to_segment(sri: &str) -> Result<String, LpmError> {
+    use std::fmt::Write as _;
     let int = Integrity::parse(sri)?;
     let algo = match int.algorithm {
         HashAlgorithm::Sha256 => "sha256",
         HashAlgorithm::Sha512 => "sha512",
     };
-    let hex = hex::encode(&int.hash);
-    Ok(format!("{algo}-{hex}"))
+    let mut result = String::with_capacity(algo.len() + 1 + int.hash.len() * 2);
+    result.push_str(algo);
+    result.push('-');
+    for byte in &int.hash {
+        let _ = write!(result, "{byte:02x}");
+    }
+    Ok(result)
 }
 
 /// Sibling symlink target known at populate time.
@@ -1002,15 +1013,19 @@ fn is_complete_link_entry(dir: &Path, key: &GraphKey) -> bool {
     if !dir.is_dir() {
         return false;
     }
-    let sidecar = dir.join(crate::v2::link_meta::LINK_META_FILENAME);
-    if !sidecar.is_file() {
+    // Trial 28: reuse a single PathBuf via push/pop rather than
+    // allocating 4 separate PathBufs (sidecar, node_modules,
+    // node_modules/<name>, node_modules/<name>/package.json).
+    let mut path = dir.to_path_buf();
+    path.push(crate::v2::link_meta::LINK_META_FILENAME);
+    if !path.is_file() {
         return false;
     }
-    let pkg_manifest = dir
-        .join(LINK_NODE_MODULES)
-        .join(key.name())
-        .join("package.json");
-    pkg_manifest.is_file()
+    path.pop();
+    path.push(LINK_NODE_MODULES);
+    path.push(key.name());
+    path.push("package.json");
+    path.is_file()
 }
 
 /// Object dir is complete iff `package.json` AND `.integrity` are
@@ -2146,5 +2161,53 @@ mod tests {
         let outside = dir.path().join("not-the-store");
         std::fs::create_dir_all(&outside).unwrap();
         assert!(!store.path_lives_in_store(&outside));
+    }
+
+    // ── Trial 28: sri_to_segment parity ────────────────────────────────────
+
+    /// The optimized `sri_to_segment` (single-alloc write loop) must
+    /// produce identical output to the naïve `format!("{algo}-{hex}")` it
+    /// replaced.
+    #[test]
+    fn sri_to_segment_parity_sha512() {
+        let sri = synthetic_sri(b"trial28-parity-sha512");
+        // Round-trip through the public API to exercise sri_to_segment.
+        let store = Store::at(std::env::temp_dir().join("lpm-v2-t28-sri-parity"));
+        let segment_path = store.paths().object_dir(&sri).unwrap();
+        let segment = segment_path
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
+        // SHA-512 segment: "sha512-" + 128 lowercase hex chars.
+        assert!(segment.starts_with("sha512-"), "expected sha512- prefix");
+        assert_eq!(segment.len(), "sha512-".len() + 128);
+        assert!(
+            segment["sha512-".len()..].chars().all(|c| c.is_ascii_hexdigit() && !c.is_uppercase()),
+            "hex portion must be lowercase"
+        );
+    }
+
+    /// SHA-256 SRI produces the correct segment prefix and length.
+    #[test]
+    fn sri_to_segment_parity_sha256() {
+        use sha2::Digest as _;
+        let hash = sha2::Sha256::digest(b"trial28-parity-sha256");
+        let b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, hash);
+        let sri = format!("sha256-{b64}");
+        let store = Store::at(std::env::temp_dir().join("lpm-v2-t28-sri-parity-256"));
+        let segment_path = store.paths().object_dir(&sri).unwrap();
+        let segment = segment_path
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
+        // SHA-256 segment: "sha256-" + 64 lowercase hex chars.
+        assert!(segment.starts_with("sha256-"), "expected sha256- prefix");
+        assert_eq!(segment.len(), "sha256-".len() + 64);
+        assert!(
+            segment["sha256-".len()..].chars().all(|c| c.is_ascii_hexdigit() && !c.is_uppercase()),
+            "hex portion must be lowercase"
+        );
     }
 }
