@@ -2474,16 +2474,14 @@ fn probe_sandbox_backend() -> Check {
             if os == "windows" && backend == "windows-il" {
                 return Check::warn(
                     &doctor_catalog::SANDBOX_HELPER_MISSING,
-                    &format!(
-                        "windows-il available on windows — falling back from AppContainer \
-                         because `lpm-sandbox-helper.exe` is not located next to \
-                         `lpm.exe`. The Phase 46.2 Low IL backend contains filesystem \
-                         writes but does NOT deny outbound network. Reinstall lpm \
-                         (`@lpm-registry/cli`) to restore the helper, or override the \
-                         helper location via `LPM_SANDBOX_HELPER=<path>`. With the helper \
-                         present, `lpm doctor` reports `windows-appcontainer` and \
-                         strict mode is available."
-                    ),
+                    "windows-il available on windows — falling back from AppContainer \
+                     because `lpm-sandbox-helper.exe` is not located next to \
+                     `lpm.exe`. The Phase 46.2 Low IL backend contains filesystem \
+                     writes but does NOT deny outbound network. Reinstall lpm \
+                     (`@lpm-registry/cli`) to restore the helper, or override the \
+                     helper location via `LPM_SANDBOX_HELPER=<path>`. With the helper \
+                     present, `lpm doctor` reports `windows-appcontainer` and \
+                     strict mode is available.",
                 );
             }
             match sb.posture() {
