@@ -1686,15 +1686,36 @@ fn build_sanitized_env() -> HashMap<String, String> {
 }
 
 /// Read lifecycle scripts from a package.json file.
+///
+/// Trial 31: uses a minimal typed struct so serde_json skips all fields
+/// other than "scripts" without allocating strings for dependencies,
+/// devDependencies, etc. Adds a byte pre-scan so the parse is skipped
+/// entirely for packages that don't declare a "scripts" key — the common
+/// case for library packages.
 fn read_lifecycle_scripts(pkg_json_path: &Path) -> Option<HashMap<String, String>> {
-    let content = std::fs::read_to_string(pkg_json_path).ok()?;
-    let parsed: serde_json::Value = serde_json::from_str(&content).ok()?;
-    let scripts_obj = parsed.get("scripts")?.as_object()?;
+    // Minimal struct: serde_json skips every field except "scripts" via
+    // IgnoredAny, allocating no strings for deps, devDeps, engines, etc.
+    #[derive(serde::Deserialize, Default)]
+    struct ScriptsOnly {
+        #[serde(default)]
+        scripts: HashMap<String, String>,
+    }
+
+    let content = std::fs::read(pkg_json_path).ok()?;
+
+    // Fast byte pre-scan: if "scripts" never appears as a JSON key, the
+    // result is always None — skip the full parse.
+    const SCRIPTS_KEY: &[u8] = b"\"scripts\"";
+    if !content.windows(SCRIPTS_KEY.len()).any(|w| w == SCRIPTS_KEY) {
+        return None;
+    }
+
+    let parsed: ScriptsOnly = serde_json::from_slice(&content).ok()?;
 
     let mut lifecycle = HashMap::new();
     for phase in EXECUTED_INSTALL_PHASES {
-        if let Some(cmd) = scripts_obj.get(*phase).and_then(|v| v.as_str()) {
-            lifecycle.insert(phase.to_string(), cmd.to_string());
+        if let Some(cmd) = parsed.scripts.get(*phase).filter(|s| !s.is_empty()) {
+            lifecycle.insert((*phase).to_string(), cmd.clone());
         }
     }
 
