@@ -499,7 +499,13 @@ impl GraphKey {
 /// Pre-compute the filesystem-safe directory name for a GraphKey once at
 /// construction. Called from `derive`, `derive_raw`, and `from_recorded`.
 fn compute_dir_name(name: &str, version: &str, digest: &[u8; 32]) -> String {
-    let safe_name = name.replace(['/', '\\'], "+");
+    // Avoid the replace() allocation for unscoped names (no '/' or '\').
+    // Scoped names like "@scope/pkg" need replacement; bare names like "react" don't.
+    let safe_name: Cow<str> = if name.contains(['/', '\\']) {
+        Cow::Owned(name.replace(['/', '\\'], "+"))
+    } else {
+        Cow::Borrowed(name)
+    };
     let short_hex = hex::encode(&digest[..GraphKey::SHORT_HEX_LEN / 2]);
     format!("{}@{}+{}", safe_name, version, short_hex)
 }
