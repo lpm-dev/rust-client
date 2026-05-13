@@ -1845,6 +1845,33 @@ pub fn read_package_json(path: &Path) -> Result<PackageJson, WorkspaceError> {
         .map_err(|e| WorkspaceError::Parse(format!("failed to parse {}: {e}", path.display())))
 }
 
+/// Pair of maps returned by [`read_peer_dependencies`].
+pub type PeerDepsResult = (HashMap<String, String>, HashMap<String, PeerDependencyMeta>);
+
+/// Read only `peerDependencies` and `peerDependenciesMeta` from a `package.json`.
+///
+/// Uses a minimal deserialization struct — serde_json skips all other fields
+/// (dependencies, devDependencies, name, version, scripts, …) without allocating
+/// strings for their keys or values. Saves ~30-40 allocs per package on warm
+/// installs where `ensure_peer_context` reads every store object's manifest.
+pub fn read_peer_dependencies(path: &Path) -> Result<PeerDepsResult, WorkspaceError> {
+    #[derive(serde::Deserialize, Default)]
+    struct PeerDepsOnly {
+        #[serde(default, rename = "peerDependencies")]
+        peer_dependencies: HashMap<String, String>,
+        #[serde(default, rename = "peerDependenciesMeta")]
+        peer_dependencies_meta: HashMap<String, PeerDependencyMeta>,
+    }
+
+    let content = std::fs::read(path)
+        .map_err(|e| WorkspaceError::Io(format!("failed to read {}: {e}", path.display())))?;
+
+    let parsed: PeerDepsOnly = serde_json::from_slice(&content)
+        .map_err(|e| WorkspaceError::Parse(format!("failed to parse {}: {e}", path.display())))?;
+
+    Ok((parsed.peer_dependencies, parsed.peer_dependencies_meta))
+}
+
 /// Read pnpm-workspace.yaml and extract package globs.
 fn read_pnpm_workspace(path: &Path) -> Result<Option<Vec<String>>, WorkspaceError> {
     let content = std::fs::read_to_string(path)
