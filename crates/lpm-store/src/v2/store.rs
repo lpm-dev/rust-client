@@ -56,7 +56,11 @@ impl StoreV2Paths {
         let root = lpm_root.store_root().join(STORE_V2_VERSION);
         let objects_root = root.join(OBJECTS_DIR);
         let links_root = root.join(LINKS_DIR);
-        Self { root, objects_root, links_root }
+        Self {
+            root,
+            objects_root,
+            links_root,
+        }
     }
 
     /// Build the path helper at an arbitrary base (test seam).
@@ -64,7 +68,11 @@ impl StoreV2Paths {
         let root = root.into();
         let objects_root = root.join(OBJECTS_DIR);
         let links_root = root.join(LINKS_DIR);
-        Self { root, objects_root, links_root }
+        Self {
+            root,
+            objects_root,
+            links_root,
+        }
     }
 
     /// `~/.lpm/store/v2/`
@@ -150,7 +158,7 @@ pub struct LinkEntryRequest {
     /// Order is irrelevant; symlinks are created independently.
     pub deps: Vec<DepLink>,
     /// Platform tuple to record in the sidecar.
-    pub platform: LinkMetaPlatform,
+    pub platform: Arc<LinkMetaPlatform>,
 }
 
 /// Single sibling-dep symlink to create inside
@@ -865,7 +873,7 @@ fn populate_into(
     deps: &[DepLink],
     source_sri: &str,
     sidecar_relpath: &str,
-    platform: &LinkMetaPlatform,
+    platform: &Arc<LinkMetaPlatform>,
 ) -> Result<LinkMeta, LpmError> {
     let node_modules = tmp_dir.join(LINK_NODE_MODULES);
     std::fs::create_dir_all(&node_modules).map_err(|e| {
@@ -908,7 +916,7 @@ fn populate_into(
         source_sri,
         sidecar_relpath,
         deps_meta,
-        platform.clone(),
+        Arc::clone(platform),
     );
     // `tmp_dir` is the unpublished staging dir; the outer rename in
     // `populate_link_entry` is the visibility boundary, so we can skip the
@@ -1306,7 +1314,7 @@ mod tests {
                 source_sri: sri.clone(),
                 object_dir,
                 deps: vec![],
-                platform: sample_meta_platform(),
+                platform: Arc::new(sample_meta_platform()),
             })
             .unwrap();
 
@@ -1343,7 +1351,7 @@ mod tests {
             source_sri: sri.clone(),
             object_dir: object_dir.clone(),
             deps: vec![],
-            platform: sample_meta_platform(),
+            platform: Arc::new(sample_meta_platform()),
         };
 
         let first = store.populate_link_entry(req()).unwrap();
@@ -1411,7 +1419,7 @@ mod tests {
                 source_sri: dep_sri.clone(),
                 object_dir: store.paths().object_dir(&dep_sri).unwrap(),
                 deps: vec![],
-                platform: sample_meta_platform(),
+                platform: Arc::new(sample_meta_platform()),
             })
             .unwrap();
 
@@ -1424,7 +1432,7 @@ mod tests {
                     local: "debug".into(),
                     target: dep_key.clone(),
                 }],
-                platform: sample_meta_platform(),
+                platform: Arc::new(sample_meta_platform()),
             })
             .unwrap();
 
@@ -1468,7 +1476,7 @@ mod tests {
                 source_sri: dep_sri.clone(),
                 object_dir: store.paths().object_dir(&dep_sri).unwrap(),
                 deps: vec![],
-                platform: sample_meta_platform(),
+                platform: Arc::new(sample_meta_platform()),
             })
             .unwrap();
 
@@ -1481,7 +1489,7 @@ mod tests {
                     local: "@types/node".into(),
                     target: dep_key.clone(),
                 }],
-                platform: sample_meta_platform(),
+                platform: Arc::new(sample_meta_platform()),
             })
             .unwrap();
 
@@ -1544,7 +1552,7 @@ mod tests {
                 source_sri: sri.clone(),
                 object_dir: nonexistent_object,
                 deps: vec![],
-                platform: sample_meta_platform(),
+                platform: Arc::new(sample_meta_platform()),
             })
             .unwrap_err();
         assert!(format!("{err}").contains("v2"));
@@ -1597,7 +1605,7 @@ mod tests {
             sri.clone(),
             store.paths().relative_object_path(&sri).unwrap(),
             vec![],
-            sample_meta_platform(),
+            Arc::new(sample_meta_platform()),
         );
         stub.write_to(&final_dir).unwrap();
 
@@ -1607,7 +1615,7 @@ mod tests {
                 source_sri: sri,
                 object_dir,
                 deps: vec![],
-                platform: sample_meta_platform(),
+                platform: Arc::new(sample_meta_platform()),
             })
             .unwrap();
 
@@ -1692,7 +1700,7 @@ mod tests {
                 source_sri: sri,
                 object_dir,
                 deps: vec![],
-                platform: sample_meta_platform(),
+                platform: Arc::new(sample_meta_platform()),
             })
             .unwrap();
 
@@ -1939,7 +1947,7 @@ mod tests {
                     .object_dir(&synthetic_sri(b"iter_link_entries/a"))
                     .unwrap(),
                 deps: vec![],
-                platform: sample_meta_platform(),
+                platform: Arc::new(sample_meta_platform()),
             })
             .unwrap();
         store
@@ -1951,7 +1959,7 @@ mod tests {
                     .object_dir(&synthetic_sri(b"iter_link_entries/b"))
                     .unwrap(),
                 deps: vec![],
-                platform: sample_meta_platform(),
+                platform: Arc::new(sample_meta_platform()),
             })
             .unwrap();
 
@@ -1997,7 +2005,7 @@ mod tests {
                 source_sri: sri,
                 object_dir,
                 deps: vec![],
-                platform: sample_meta_platform(),
+                platform: Arc::new(sample_meta_platform()),
             })
             .unwrap();
 
@@ -2120,7 +2128,7 @@ mod tests {
                 source_sri: sri,
                 object_dir,
                 deps: vec![],
-                platform: sample_meta_platform(),
+                platform: Arc::new(sample_meta_platform()),
             })
             .unwrap();
 

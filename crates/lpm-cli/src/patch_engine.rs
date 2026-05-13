@@ -1170,11 +1170,11 @@ mod tests {
             source_sri: "sha512-v2-baseline".to_string(),
             object_path: "objects/sha512-zzz".to_string(),
             deps: Vec::new(),
-            platform: LinkMetaPlatform {
+            platform: std::sync::Arc::new(LinkMetaPlatform {
                 os: "test".into(),
                 cpu: "test".into(),
                 libc: None,
-            },
+            }),
             created_at: Utc::now(),
             last_referenced_at: Utc::now(),
         };

@@ -2297,11 +2297,12 @@ fn spawn_background_update_check() {
 #[global_allocator]
 static ALLOC: dhat::Alloc = dhat::Alloc;
 
-// mimalloc replaces the system allocator in all non-profiling builds.
+// mimalloc replaces the system allocator on Unix non-profiling builds.
 // Typically 5-15% faster on alloc-heavy workloads (resolver BFS, lockfile
 // parse, linker path construction) vs the macOS/Linux system malloc.
 // Disable for comparison builds: cargo build --release --features no-mimalloc
-#[cfg(all(not(feature = "dhat-heap"), not(feature = "no-mimalloc")))]
+// Windows uses the system allocator (mimalloc is in cfg(unix) deps).
+#[cfg(all(unix, not(feature = "dhat-heap"), not(feature = "no-mimalloc")))]
 #[global_allocator]
 static ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
 

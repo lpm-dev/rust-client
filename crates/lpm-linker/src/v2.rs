@@ -107,6 +107,10 @@ pub struct LinkPlanV2 {
     pub key_map: KeyMap,
     /// Host platform tuple stamped into every sidecar.
     pub platform: PlatformTuple,
+    /// Pre-built `Arc<LinkMetaPlatform>` shared by every [`link_v2_one`]
+    /// call. Built once in [`link_v2_prepare`]; cloning is a single atomic
+    /// refcount bump instead of 3 string allocations per package.
+    pub meta_platform: Arc<LinkMetaPlatform>,
     /// Linker-mode tag — propagates into [`LinkerModeTag`] for
     /// per-target graph-key derivation in case any caller wants to
     /// re-derive a key after prepare (none today, but the plan is
@@ -287,10 +291,16 @@ pub fn link_v2_prepare(
         LinkerMode::Hoisted => LinkerModeTag::Hoisted,
     };
     let key_map = derive_graph_keys(&augmented_targets[..], &platform, linker_tag)?;
+    let meta_platform = Arc::new(LinkMetaPlatform {
+        os: platform.os.clone(),
+        cpu: platform.cpu.clone(),
+        libc: platform.libc.clone(),
+    });
     Ok(LinkPlanV2 {
         augmented_targets,
         key_map,
         platform,
+        meta_platform,
         linker_mode,
     })
 }
@@ -316,7 +326,7 @@ pub fn link_v2_one(
     target: &V2Target,
     store: &Store,
 ) -> Result<(MaterializedPackage, bool), LpmError> {
-    let entry = populate_one(target, store, &plan.key_map, &plan.platform)?;
+    let entry = populate_one(target, store, &plan.key_map, &plan.meta_platform)?;
     let mat = MaterializedPackage {
         name: target.target.name.clone(),
         version: target.target.version.clone(),
@@ -422,16 +432,17 @@ fn ensure_peer_context(targets: &mut [V2Target], store: &Store) -> Result<(), Lp
         if !pkg_json_path.exists() {
             continue;
         }
-        let (peer_deps, peer_deps_meta) = match lpm_workspace::read_peer_dependencies(&pkg_json_path) {
-            Ok(p) => p,
-            Err(e) => {
-                tracing::debug!(
-                    "v2 linker: failed to parse {}/package.json for peer derivation: {e}",
-                    object_dir.display()
-                );
-                continue;
-            }
-        };
+        let (peer_deps, peer_deps_meta) =
+            match lpm_workspace::read_peer_dependencies(&pkg_json_path) {
+                Ok(p) => p,
+                Err(e) => {
+                    tracing::debug!(
+                        "v2 linker: failed to parse {}/package.json for peer derivation: {e}",
+                        object_dir.display()
+                    );
+                    continue;
+                }
+            };
         if peer_deps.is_empty() {
             continue;
         }
@@ -476,7 +487,7 @@ fn populate_one(
     v2t: &V2Target,
     store: &Store,
     key_map: &KeyMap,
-    platform: &PlatformTuple,
+    meta_platform: &Arc<LinkMetaPlatform>,
 ) -> Result<PopulatedEntry, LpmError> {
     let key = key_map.get_for(&v2t.target).cloned().ok_or_else(|| {
         LpmError::Store(format!(
@@ -526,7 +537,8 @@ fn populate_one(
         let peer_extras: Vec<DepLink> = {
             let already_local: std::collections::HashSet<&str> =
                 deps.iter().map(|d| d.local.as_str()).collect();
-            v2t.target.peers
+            v2t.target
+                .peers
                 .iter()
                 .filter(|(peer_name, _)| !already_local.contains(peer_name.as_str()))
                 .filter_map(|(peer_name, peer_ver)| {
@@ -548,21 +560,13 @@ fn populate_one(
         source_sri: v2t.source_sri.clone(),
         object_dir,
         deps,
-        platform: link_meta_platform(platform),
+        platform: Arc::clone(meta_platform),
     };
     let entry = store.populate_link_entry(request)?;
     Ok(PopulatedEntry {
         key,
         freshly_populated: entry.freshly_populated,
     })
-}
-
-fn link_meta_platform(p: &PlatformTuple) -> LinkMetaPlatform {
-    LinkMetaPlatform {
-        os: p.os.clone(),
-        cpu: p.cpu.clone(),
-        libc: p.libc.clone(),
-    }
 }
 
 /// Per-install lookup table from `(name, version, wrapper_id)` to the
@@ -620,12 +624,17 @@ fn triple_key(name: &str, version: &str, wrapper_id: Option<&str>) -> String {
 
 impl KeyMap {
     fn get_for(&self, target: &LinkTarget) -> Option<&Arc<GraphKey>> {
-        self.by_triple
-            .get(&triple_key(&target.name, &target.version, target.wrapper_id.as_deref()))
+        self.by_triple.get(&triple_key(
+            &target.name,
+            &target.version,
+            target.wrapper_id.as_deref(),
+        ))
     }
 
     fn get_by_coords(&self, name: &str, version: &str) -> Option<&Arc<GraphKey>> {
-        self.by_coords.get(&coords_key(name, version)).map(|(gk, _)| gk)
+        self.by_coords
+            .get(&coords_key(name, version))
+            .map(|(gk, _)| gk)
     }
 }
 
@@ -698,7 +707,6 @@ fn derive_graph_keys(
         by_coords,
     })
 }
-
 
 /// Wipe v1-style project link state so the v2 install starts clean.
 fn cleanup_v1_state(project_dir: &Path) -> Result<(), LpmError> {
@@ -1194,7 +1202,8 @@ mod tests {
 
         let mut t = target("a", "1.0.0", &sri, true);
         t.target.root_link_names = Some(vec![]);
-        let result = link_packages_v2(&project, vec![t], &store, LinkerMode::Isolated, None).unwrap();
+        let result =
+            link_packages_v2(&project, vec![t], &store, LinkerMode::Isolated, None).unwrap();
         assert_eq!(result.symlinked, 0);
         assert!(!project.join("node_modules").join("a").exists());
     }
@@ -1247,7 +1256,8 @@ mod tests {
         // Dep 'phantom@9.9.9' has no matching LinkTarget in the set.
         t.target.dependencies = vec![("phantom".into(), "9.9.9".into())];
 
-        let err = link_packages_v2(&project, vec![t], &store, LinkerMode::Isolated, None).unwrap_err();
+        let err =
+            link_packages_v2(&project, vec![t], &store, LinkerMode::Isolated, None).unwrap_err();
         let msg = format!("{err}");
         assert!(
             msg.contains("phantom@9.9.9"),
