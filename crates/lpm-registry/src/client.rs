@@ -3303,11 +3303,18 @@ impl RegistryClient {
     ///
     /// Callers that need only a subset of fields (e.g., the blocked-set capture
     /// path) can pass a minimal struct so serde skips allocating unneeded fields.
-    /// Cache format, TTL, and magic-byte checks are identical to the full path.
+    ///
+    /// **Streaming deserialization**: uses `BufReader<File>` + `rmp_serde::decode::from_read`
+    /// instead of `fs::read` to avoid allocating a `Vec<u8>` for the full file
+    /// content (~68 KB × N packages on every blocked-set capture call). Old caches
+    /// in JSON or positional-array msgpack format trigger a cache miss here (returns
+    /// `None`) and are rewritten in named-format msgpack on the next fetch.
     fn read_metadata_cache_as<T: serde::de::DeserializeOwned>(
         &self,
         key: &str,
     ) -> Option<(T, Option<String>)> {
+        use std::io::{BufRead as _, Read as _};
+
         let path = self.cache_path(key)?;
         if !path.exists() {
             return None;
@@ -3320,18 +3327,32 @@ impl RegistryClient {
             return None;
         }
 
-        let content = std::fs::read(&path).ok()?;
-        let (etag_bytes, data) = parse_cached_metadata_blob(&content)?;
+        // Open with a buffered reader — avoids allocating the full file into
+        // a Vec<u8> before deserialization.
+        let file = std::fs::File::open(&path).ok()?;
+        let mut reader = std::io::BufReader::new(file);
 
-        // Deserialize: try MessagePack first, fall back to JSON for migration from older caches
-        let metadata: T = rmp_serde::from_slice(data)
-            .or_else(|_| serde_json::from_slice(data))
-            .ok()?;
+        // Validate magic prefix (METADATA_CACHE_MAGIC includes a trailing \n)
+        let mut magic = [0u8; METADATA_CACHE_MAGIC.len()];
+        reader.read_exact(&mut magic).ok()?;
+        if magic != *METADATA_CACHE_MAGIC {
+            return None;
+        }
 
-        let etag = std::str::from_utf8(etag_bytes)
-            .ok()
-            .filter(|s| !s.is_empty())
-            .map(|s| s.to_string());
+        // Read ETag line (terminated by \n; empty string means no ETag)
+        let mut etag_line = String::with_capacity(64);
+        reader.read_line(&mut etag_line).ok()?;
+        let etag_str = etag_line.trim_end_matches('\n');
+        let etag = if etag_str.is_empty() {
+            None
+        } else {
+            Some(etag_str.to_string())
+        };
+
+        // Stream-deserialize the named-format msgpack data.
+        // For old (positional-array or JSON) caches this returns Err → None,
+        // triggering a cache miss and a re-fetch that rewrites in named format.
+        let metadata: T = rmp_serde::decode::from_read(&mut reader).ok()?;
 
         Some((metadata, etag))
     }

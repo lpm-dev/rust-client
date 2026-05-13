@@ -1327,12 +1327,11 @@ impl V2BaselineIndex {
                 // Trial 32: avoid allocating an intermediate safe_name
                 // String for unscoped packages (the majority) by using
                 // Cow<str> — borrows as-is when no replacement is needed.
-                let safe_name: std::borrow::Cow<str> =
-                    if dep.target_name.contains(['/', '\\']) {
-                        std::borrow::Cow::Owned(dep.target_name.replace(['/', '\\'], "+"))
-                    } else {
-                        std::borrow::Cow::Borrowed(dep.target_name.as_str())
-                    };
+                let safe_name: std::borrow::Cow<str> = if dep.target_name.contains(['/', '\\']) {
+                    std::borrow::Cow::Owned(dep.target_name.replace(['/', '\\'], "+"))
+                } else {
+                    std::borrow::Cow::Borrowed(dep.target_name.as_str())
+                };
                 let mut dep_dir_name =
                     String::with_capacity(safe_name.len() + 1 + dep.target_version.len() + 17);
                 dep_dir_name.push_str(&safe_name);
