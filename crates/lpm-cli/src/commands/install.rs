@@ -8709,21 +8709,28 @@ fn resolved_to_install_packages(
         .iter()
         .map(|r| (r.package.canonical_name(), r.version.to_string()))
         .collect();
-    let mut root_link_map: HashMap<lpm_lockfile::PackageKey, Vec<String>> = HashMap::new();
+    // "name\x00version" compound key — avoids allocating a PackageKey
+    // (SHA-256 source_id + 2 String clones) per entry and per lookup.
+    // Safe because (name, version) is unique in the resolved set:
+    // resolved_target_meta maps one version per canonical name, and
+    // same-name-same-version cross-source packages collapse to one
+    // row via the dedup filter below.
+    let rlk = |name: &str, version: &str| -> String {
+        let mut k = String::with_capacity(name.len() + 1 + version.len());
+        k.push_str(name);
+        k.push('\x00');
+        k.push_str(version);
+        k
+    };
+    let mut root_link_map: HashMap<String, Vec<String>> = HashMap::new();
     for local in deps.keys() {
         let target = root_aliases
             .get(local)
             .cloned()
             .unwrap_or_else(|| local.clone());
         if let Some(version) = resolved_target_meta.get(&target) {
-            let registry_url = registry_source_url_for(&target, route_table);
-            let source_id = lpm_lockfile::Source::Registry { url: registry_url }.source_id();
             root_link_map
-                .entry(lpm_lockfile::PackageKey::new(
-                    target,
-                    version.clone(),
-                    source_id,
-                ))
+                .entry(rlk(&target, version))
                 .or_default()
                 .push(local.clone());
         }
@@ -8734,13 +8741,10 @@ fn resolved_to_install_packages(
     // for them — same key shape, separate provenance.
     for ambient in ambient_peer_installs {
         if let Some(version) = resolved_target_meta.get(ambient) {
-            let registry_url = registry_source_url_for(ambient, route_table);
-            let source_id = lpm_lockfile::Source::Registry { url: registry_url }.source_id();
-            let key = lpm_lockfile::PackageKey::new(ambient.clone(), version.clone(), source_id);
             // Avoid duplicate locals if the user ALSO listed the peer
             // in their `dependencies` (in which case `deps.keys()`
             // already covered it; we shouldn't double-link).
-            let entry = root_link_map.entry(key).or_default();
+            let entry = root_link_map.entry(rlk(ambient, version)).or_default();
             if !entry.iter().any(|l| l == ambient) {
                 entry.push(ambient.clone());
             }
@@ -8773,32 +8777,23 @@ fn resolved_to_install_packages(
     //
     // Preserving the resolver's input order keeps lockfile and JSON
     // output deterministic across runs.
-    let mut seen: std::collections::HashSet<(String, String)> =
+    let mut seen: std::collections::HashSet<String> =
         std::collections::HashSet::with_capacity(resolved.len());
     resolved
         .iter()
         .filter_map(|r| {
             let name = r.package.canonical_name();
             let version = r.version.to_string();
-            if !seen.insert((name.clone(), version.clone())) {
+            if !seen.insert(rlk(&name, &version)) {
                 return None;
             }
             let is_lpm = r.package.is_lpm();
-            // Phase 59.0 (post-review): derive both the wire-format
-            // source string and the PackageKey source_id from the
-            // active route table, so a `.npmrc`-mapped private
-            // mirror gets filed under its real URL rather than the
-            // hardcoded npmjs.org default. `@lpm.dev/*` is anchored
-            // by RouteTable's invariant to LPM Worker, so is_lpm
-            // and the route always agree there.
+            // Phase 59.0 (post-review): derive the wire-format source
+            // string from the active route table, so a `.npmrc`-mapped
+            // private mirror gets filed under its real URL.
             let registry_url = registry_source_url_for(&name, route_table);
             let source = format!("registry+{registry_url}");
-            let root_link_key = lpm_lockfile::PackageKey::new(
-                name.clone(),
-                version.clone(),
-                lpm_lockfile::Source::Registry { url: registry_url }.source_id(),
-            );
-            let root_link_names = root_link_map.get(&root_link_key).cloned();
+            let root_link_names = root_link_map.get(&rlk(&name, &version)).cloned();
 
             Some(InstallPackage {
                 name: name.clone(),
