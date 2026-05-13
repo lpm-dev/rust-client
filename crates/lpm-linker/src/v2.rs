@@ -282,6 +282,11 @@ pub fn link_v2_prepare(
     store: &Store,
     linker_mode: LinkerMode,
 ) -> Result<LinkPlanV2, LpmError> {
+    // Trial 4 (2026-05-13): top-level linker-stage span. Visible in
+    // Tracy (when built with `--features tracy`); filtered at INFO
+    // level under default settings so it's essentially free in regular
+    // builds. `target_count` is recorded for cross-run comparison.
+    let _span = tracing::info_span!("linker.prepare", target_count = targets.len(),).entered();
     cleanup_v1_state(project_dir)?;
     let mut augmented_targets = targets;
     ensure_peer_context(&mut augmented_targets, store)?;
@@ -326,6 +331,14 @@ pub fn link_v2_one(
     target: &V2Target,
     store: &Store,
 ) -> Result<(MaterializedPackage, bool), LpmError> {
+    // Trial 4 (2026-05-13): per-package span. Records name+version so
+    // Tracy can attribute time to specific slow packages.
+    let _span = tracing::info_span!(
+        "linker.one",
+        name = %target.target.name,
+        version = %target.target.version,
+    )
+    .entered();
     let entry = populate_one(target, store, &plan.key_map, &plan.meta_platform)?;
     let mat = MaterializedPackage {
         name: target.target.name.clone(),
@@ -366,9 +379,23 @@ pub fn link_v2_finalize(
     store: &Store,
     self_package_name: Option<&str>,
 ) -> Result<LinkV2FinalizeResult, LpmError> {
+    // Trial 4 (2026-05-13): finalize-stage span. Splits the root /
+    // bin / self-ref sub-stages into nested spans below so the Tracy
+    // breakdown shows which phase dominates for a given install.
+    let _span = tracing::info_span!(
+        "linker.finalize",
+        target_count = plan.augmented_targets.len(),
+    )
+    .entered();
     let augmented_slice = &plan.augmented_targets[..];
-    let symlinked = create_root_symlinks(project_dir, augmented_slice, store, &plan.key_map)?;
-    let bin_count = create_bin_links_v2(project_dir, augmented_slice, store, &plan.key_map)?;
+    let symlinked = {
+        let _s = tracing::info_span!("linker.finalize.root_symlinks").entered();
+        create_root_symlinks(project_dir, augmented_slice, store, &plan.key_map)?
+    };
+    let bin_count = {
+        let _s = tracing::info_span!("linker.finalize.bin_shims").entered();
+        create_bin_links_v2(project_dir, augmented_slice, store, &plan.key_map)?
+    };
     let self_referenced = if let Some(self_name) = self_package_name {
         create_self_ref(project_dir, self_name)?
     } else {
@@ -1026,6 +1053,9 @@ fn create_bin_links_v2(
     Ok(count)
 }
 
+// Trial 8 (2026-05-13): tiny helper called per-target in `create_bin_links_v2`
+// — `#[inline]` so the per-iteration call shrinks to a single branch.
+#[inline]
 fn is_direct(target: &LinkTarget) -> bool {
     if let Some(names) = &target.root_link_names {
         return !names.is_empty();

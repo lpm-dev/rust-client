@@ -190,6 +190,11 @@ where
     P: Fn(&Path, u64) -> bool,
     I: FnMut(EntryInfo<'_>),
 {
+    // Trial 4 (2026-05-13): top-level extractor span. Visible in
+    // Tracy under `--features tracy`; covers buffered read + libdeflate
+    // decompression + tar walk so the per-package fetch breakdown can
+    // attribute time to extraction vs other fetch sub-stages.
+    let _span = tracing::info_span!("extractor.extract").entered();
     // **Trial 1 (2026-05-13)**: switch from streaming `GzDecoder` to buffered
     // libdeflate decompression. libdeflate is ~2-3x faster than flate2/zlib-rs
     // on the npm-tarball size distribution; the cost is peak memory equal to
