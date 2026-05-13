@@ -111,16 +111,48 @@ impl StoreV2Paths {
     }
 
     /// `~/.lpm/store/v2/links/<graph-key>/node_modules/`.
+    ///
+    /// Trial 5 (2026-05-13) — single-allocation build. The naïve
+    /// `self.link_dir(key).join(LINK_NODE_MODULES)` chain produced
+    /// two intermediate `PathBuf`s (one allocated, one dropped). Now
+    /// pre-sizes a single buffer from known component lengths and
+    /// `push`es into it, avoiding the intermediate allocation.
     pub fn link_node_modules_dir(&self, key: &GraphKey) -> PathBuf {
-        self.link_dir(key).join(LINK_NODE_MODULES)
+        let dir_name = key.dir_name();
+        let cap =
+            self.links_root.as_os_str().len() + 1 + dir_name.len() + 1 + LINK_NODE_MODULES.len();
+        let mut p = PathBuf::with_capacity(cap);
+        p.push(&self.links_root);
+        p.push(dir_name);
+        p.push(LINK_NODE_MODULES);
+        p
     }
 
     /// `~/.lpm/store/v2/links/<graph-key>/node_modules/<pkg>/` —
     /// where the canonical bytes for THIS link entry live (clonefile
     /// of an [`Self::object_dir`]). Sibling deps live alongside as
     /// symlinks.
+    ///
+    /// Trial 5 (2026-05-13) — single-allocation build (see
+    /// [`Self::link_node_modules_dir`]). The chained-`.join()` shape
+    /// produced three intermediate `PathBuf`s per call; this version
+    /// produces one.
     pub fn link_package_dir(&self, key: &GraphKey) -> PathBuf {
-        self.link_node_modules_dir(key).join(key.name())
+        let dir_name = key.dir_name();
+        let pkg_name = key.name();
+        let cap = self.links_root.as_os_str().len()
+            + 1
+            + dir_name.len()
+            + 1
+            + LINK_NODE_MODULES.len()
+            + 1
+            + pkg_name.len();
+        let mut p = PathBuf::with_capacity(cap);
+        p.push(&self.links_root);
+        p.push(dir_name);
+        p.push(LINK_NODE_MODULES);
+        p.push(pkg_name);
+        p
     }
 }
 
