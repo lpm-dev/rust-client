@@ -2271,9 +2271,7 @@ mod tests {
             for token in line.split_whitespace() {
                 if let Some(idx) = token.rfind(':') {
                     let sid = &token[..idx];
-                    if sid.starts_with("S-1-15-2-")
-                        && !capability_sids.iter().any(|s| s == sid)
-                    {
+                    if sid.starts_with("S-1-15-2-") && !capability_sids.iter().any(|s| s == sid) {
                         capability_sids.push(sid.to_string());
                     }
                 }
