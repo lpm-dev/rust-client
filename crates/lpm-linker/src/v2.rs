@@ -61,8 +61,7 @@ use std::path::Path;
 use lpm_common::LpmError;
 use lpm_common::symlink::create_dir_symlink_or_junction;
 use lpm_store::v2::{
-    DepEdge, DepLink, GraphKey, GraphKeyInputs, LinkEntryRequest, LinkMetaPlatform, LinkerModeTag,
-    PeerEntry, PlatformTuple, Store,
+    DepLink, GraphKey, LinkEntryRequest, LinkMetaPlatform, LinkerModeTag, PlatformTuple, Store,
 };
 
 use crate::{LinkResult, LinkTarget, LinkerMode, MaterializedPackage};
@@ -639,8 +638,18 @@ fn derive_graph_keys(
         HashMap::with_capacity(targets.len());
 
     for v2t in targets {
-        let inputs = build_inputs(&v2t.target, platform, linker_tag);
-        let key = GraphKey::derive(&inputs);
+        let key = GraphKey::derive_raw(
+            &v2t.target.name,
+            &v2t.target.version,
+            platform,
+            linker_tag,
+            &v2t.target.dependencies,
+            &v2t.target.aliases,
+            &v2t.target.peers,
+            v2t.target.root_link_names.as_deref(),
+            v2t.target.wrapper_id.as_deref(),
+            v2t.target.patch_fingerprint.as_deref(),
+        );
 
         let tkey = triple_key(
             &v2t.target.name,
@@ -689,39 +698,6 @@ fn derive_graph_keys(
     })
 }
 
-fn build_inputs(
-    target: &LinkTarget,
-    platform: &PlatformTuple,
-    linker_tag: LinkerModeTag,
-) -> GraphKeyInputs {
-    let dep_edges = target.dependencies.iter().map(|(local, ver)| {
-        let canonical = target
-            .aliases
-            .get(local)
-            .cloned()
-            .unwrap_or_else(|| local.clone());
-        DepEdge {
-            local: local.clone(),
-            target_name: canonical,
-            target_version: ver.clone(),
-        }
-    });
-
-    let peer_entries = target.peers.iter().map(|(name, ver)| PeerEntry {
-        name: name.clone(),
-        version: ver.clone(),
-    });
-
-    let alias_iter = target.aliases.iter().map(|(k, v)| (k.clone(), v.clone()));
-
-    GraphKeyInputs::new(&target.name, &target.version, platform.clone(), linker_tag)
-        .with_peers(peer_entries)
-        .with_deps(dep_edges)
-        .with_aliases(alias_iter)
-        .with_root_link_names(target.root_link_names.clone())
-        .with_wrapper_id(target.wrapper_id.clone())
-        .with_patch_fingerprint(target.patch_fingerprint.clone())
-}
 
 /// Wipe v1-style project link state so the v2 install starts clean.
 fn cleanup_v1_state(project_dir: &Path) -> Result<(), LpmError> {
@@ -1283,9 +1259,7 @@ mod tests {
     /// The same consumer package + edge graph but a different
     /// resolved-peer version MUST produce distinct GraphKeys, so two
     /// projects that pin the same peer differently get separate
-    /// `links/<key>/` entries instead of silently sharing. Pre-Phase-66
-    /// this was the load-bearing gap behind the empty-peers
-    /// `with_peers(Vec::<PeerEntry>::new())` call in `build_inputs`.
+    /// `links/<key>/` entries instead of silently sharing.
     ///
     /// Setup: two installs, each with consumer `c@1.0.0` declaring
     /// peer `react`. Install 1 has `react@18.0.0` in its install set;
