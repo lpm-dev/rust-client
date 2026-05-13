@@ -6148,12 +6148,19 @@ async fn run_with_options_under_store_lock(
         // wrapper-based path for the audit-fixture scope (the local
         // source has no transitive deps, so Node's module resolution
         // doesn't need a wrapper boundary).
-        let sri_by_pkg: HashMap<(String, String), String> = packages
+        // Key: "name\x00version" — single String avoids 2-clone tuple on
+        // both construction and per-package lookup.
+        let sri_by_pkg: HashMap<String, String> = packages
             .iter()
             .filter_map(|p| {
-                p.integrity
-                    .clone()
-                    .map(|sri| ((p.name.clone(), p.version.clone()), sri))
+                p.integrity.clone().map(|sri| {
+                    let mut k =
+                        String::with_capacity(p.name.len() + 1 + p.version.len());
+                    k.push_str(&p.name);
+                    k.push('\x00');
+                    k.push_str(&p.version);
+                    (k, sri)
+                })
             })
             .collect();
 
@@ -6162,8 +6169,16 @@ async fn run_with_options_under_store_lock(
         for t in &link_targets {
             match t.materialization {
                 lpm_linker::Materialization::CasBacked => {
+                    let lookup_key = {
+                        let mut k =
+                            String::with_capacity(t.name.len() + 1 + t.version.len());
+                        k.push_str(&t.name);
+                        k.push('\x00');
+                        k.push_str(&t.version);
+                        k
+                    };
                     let sri = sri_by_pkg
-                        .get(&(t.name.clone(), t.version.clone()))
+                        .get(&lookup_key)
                         .cloned()
                         .ok_or_else(|| {
                             LpmError::Registry(format!(
