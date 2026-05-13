@@ -402,7 +402,13 @@ impl Sandbox for WindowsSandbox {
 ///
 /// Order is deterministic so tests can pin "first writable allow is
 /// package_dir" etc. without a sort step.
-fn writable_allow_set(spec: &SandboxSpec) -> Vec<PathBuf> {
+///
+/// `pub(crate)` so the Phase 46.3 PR-2 AppContainer backend
+/// ([`crate::windows_appcontainer`]) can reuse the same writable
+/// set when rendering its DACL grants. Both backends must agree on
+/// what counts as writable so the user-visible contract doesn't
+/// shift across backend swaps.
+pub(crate) fn writable_allow_set(spec: &SandboxSpec) -> Vec<PathBuf> {
     let mut out = Vec::with_capacity(8 + spec.extra_write_dirs.len());
     out.push(spec.package_dir.clone());
     out.push(spec.project_dir.join("node_modules"));

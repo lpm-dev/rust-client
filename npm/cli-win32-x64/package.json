@@ -14,7 +14,8 @@
     "x64"
   ],
   "files": [
-    "lpm.exe"
+    "lpm.exe",
+    "lpm-sandbox-helper.exe"
   ],
   "preferUnplugged": true
 }
