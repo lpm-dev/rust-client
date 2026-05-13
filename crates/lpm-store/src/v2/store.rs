@@ -42,19 +42,28 @@ const LINK_NODE_MODULES: &str = "node_modules";
 pub struct StoreV2Paths {
     /// `~/.lpm/store/v2/`
     root: PathBuf,
+    /// `~/.lpm/store/v2/objects/` — precomputed to avoid one PathBuf
+    /// allocation per `object_dir` call on hot install paths.
+    objects_root: PathBuf,
+    /// `~/.lpm/store/v2/links/` — precomputed for the same reason.
+    links_root: PathBuf,
 }
 
 impl StoreV2Paths {
     /// Build the path helper rooted at `<lpm_home>/store/v2/`.
     pub fn from_lpm_root(lpm_root: &LpmRoot) -> Self {
-        Self {
-            root: lpm_root.store_root().join(STORE_V2_VERSION),
-        }
+        let root = lpm_root.store_root().join(STORE_V2_VERSION);
+        let objects_root = root.join(OBJECTS_DIR);
+        let links_root = root.join(LINKS_DIR);
+        Self { root, objects_root, links_root }
     }
 
     /// Build the path helper at an arbitrary base (test seam).
     pub fn at(root: impl Into<PathBuf>) -> Self {
-        Self { root: root.into() }
+        let root = root.into();
+        let objects_root = root.join(OBJECTS_DIR);
+        let links_root = root.join(LINKS_DIR);
+        Self { root, objects_root, links_root }
     }
 
     /// `~/.lpm/store/v2/`
@@ -64,12 +73,12 @@ impl StoreV2Paths {
 
     /// `~/.lpm/store/v2/objects/`
     pub fn objects_root(&self) -> PathBuf {
-        self.root.join(OBJECTS_DIR)
+        self.objects_root.clone()
     }
 
     /// `~/.lpm/store/v2/links/`
     pub fn links_root(&self) -> PathBuf {
-        self.root.join(LINKS_DIR)
+        self.links_root.clone()
     }
 
     /// `~/.lpm/store/v2/objects/<algo>-<hex>/` for a given SRI.
@@ -77,7 +86,7 @@ impl StoreV2Paths {
     /// Returns [`LpmError::InvalidIntegrity`] if `sri` doesn't parse
     /// as a canonical SRI string.
     pub fn object_dir(&self, sri: &str) -> Result<PathBuf, LpmError> {
-        Ok(self.objects_root().join(sri_to_segment(sri)?))
+        Ok(self.objects_root.join(sri_to_segment(sri)?))
     }
 
     /// Path that the sidecar would record for `sri` — the same as
@@ -89,7 +98,7 @@ impl StoreV2Paths {
 
     /// `~/.lpm/store/v2/links/<graph-key>/` for a given key.
     pub fn link_dir(&self, key: &GraphKey) -> PathBuf {
-        self.links_root().join(key.dir_name())
+        self.links_root.join(key.dir_name())
     }
 
     /// `~/.lpm/store/v2/links/<graph-key>/node_modules/`.
