@@ -245,11 +245,30 @@ impl GraphKeyInputs {
 /// layout uses [`Self::dir_name`]; the sidecar [`crate::v2::link_meta::LinkMeta`]
 /// records [`Self::digest_hex`] so `lpm cache prune` can reconstruct
 /// identity without re-hashing.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone)]
 pub struct GraphKey {
     name: String,
     version: String,
     digest: [u8; 32],
+    /// Cached, pre-computed result of `<safe_name>@<version>+<short_hex>`.
+    /// Computed once at construction; returned as `&str` by `dir_name()`.
+    dir_name: String,
+}
+
+impl PartialEq for GraphKey {
+    fn eq(&self, other: &Self) -> bool {
+        self.name == other.name && self.version == other.version && self.digest == other.digest
+    }
+}
+
+impl Eq for GraphKey {}
+
+impl std::hash::Hash for GraphKey {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.name.hash(state);
+        self.version.hash(state);
+        self.digest.hash(state);
+    }
 }
 
 impl GraphKey {
@@ -259,7 +278,7 @@ impl GraphKey {
 
     /// Length of the directory-name suffix in hex chars (16 = 64 bits
     /// of the BLAKE3 digest, ~10⁻¹⁹ collision probability for 10⁹ keys).
-    const SHORT_HEX_LEN: usize = 16;
+    pub const SHORT_HEX_LEN: usize = 16;
 
     /// Compute the graph key from a complete [`GraphKeyInputs`] struct.
     ///
@@ -338,11 +357,13 @@ impl GraphKey {
         let patch_str = inputs.patch_fingerprint.as_deref().unwrap_or("");
         write_field(&mut hasher, b"patch_fingerprint", patch_str.as_bytes());
 
-        let digest = hasher.finalize();
+        let digest = *hasher.finalize().as_bytes();
+        let dir_name = compute_dir_name(&inputs.name, &inputs.version, &digest);
         Self {
             name: inputs.name.clone(),
             version: inputs.version.clone(),
-            digest: *digest.as_bytes(),
+            digest,
+            dir_name,
         }
     }
 
@@ -407,11 +428,13 @@ impl GraphKey {
         let patch_str = patch_fingerprint.unwrap_or("");
         write_field(&mut hasher, b"patch_fingerprint", patch_str.as_bytes());
 
-        let digest = hasher.finalize();
+        let digest = *hasher.finalize().as_bytes();
+        let dir_name = compute_dir_name(name, version, &digest);
         Self {
             name: name.to_owned(),
             version: version.to_owned(),
-            digest: *digest.as_bytes(),
+            digest,
+            dir_name,
         }
     }
 
@@ -424,10 +447,14 @@ impl GraphKey {
         version: impl Into<String>,
         digest: [u8; 32],
     ) -> Self {
+        let name = name.into();
+        let version = version.into();
+        let dir_name = compute_dir_name(&name, &version, &digest);
         Self {
-            name: name.into(),
-            version: version.into(),
+            name,
+            version,
             digest,
+            dir_name,
         }
     }
 
@@ -452,21 +479,29 @@ impl GraphKey {
         hex::encode(self.digest)
     }
 
-    /// First 16 hex chars of the digest — short enough for a directory
-    /// suffix while keeping ~64 bits of collision resistance.
+    /// First [`Self::SHORT_HEX_LEN`] hex chars of the digest — short enough
+    /// for a directory suffix while keeping ~64 bits of collision resistance.
     pub fn short_hex(&self) -> String {
-        let full = hex::encode(self.digest);
-        full[..Self::SHORT_HEX_LEN].to_string()
+        hex::encode(&self.digest[..Self::SHORT_HEX_LEN / 2])
     }
 
     /// Filesystem-safe directory name under
     /// `~/.lpm/store/v2/links/<dir>/`. Format: `<safe_name>@<version>+<short_hex>`.
     /// `safe_name` replaces `/` and `\` with `+` so scoped packages
     /// (`@scope/pkg`) become a flat directory name (`@scope+pkg@1.2.3+...`).
-    pub fn dir_name(&self) -> String {
-        let safe_name = self.name.replace(['/', '\\'], "+");
-        format!("{}@{}+{}", safe_name, self.version, self.short_hex())
+    ///
+    /// Returns a borrow of the pre-computed cached value — zero allocations.
+    pub fn dir_name(&self) -> &str {
+        &self.dir_name
     }
+}
+
+/// Pre-compute the filesystem-safe directory name for a GraphKey once at
+/// construction. Called from `derive`, `derive_raw`, and `from_recorded`.
+fn compute_dir_name(name: &str, version: &str, digest: &[u8; 32]) -> String {
+    let safe_name = name.replace(['/', '\\'], "+");
+    let short_hex = hex::encode(&digest[..GraphKey::SHORT_HEX_LEN / 2]);
+    format!("{}@{}+{}", safe_name, version, short_hex)
 }
 
 fn write_field(hasher: &mut blake3::Hasher, label: &[u8], value: &[u8]) {

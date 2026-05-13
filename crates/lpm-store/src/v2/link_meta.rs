@@ -125,7 +125,7 @@ impl LinkMeta {
         let now = Utc::now();
         Self {
             schema: LINK_META_SCHEMA_VERSION,
-            graph_key: graph_key.dir_name(),
+            graph_key: graph_key.dir_name().to_owned(),
             graph_key_digest_hex: graph_key.digest_hex(),
             name: graph_key.name().to_string(),
             version: graph_key.version().to_string(),
