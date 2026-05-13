@@ -881,11 +881,27 @@ fn create_bin_links_v2(
         };
         let pkg_dir = store.paths().link_package_dir(key);
         let pkg_json_path = pkg_dir.join("package.json");
-        if !pkg_json_path.exists() {
+
+        // Read once; treat I/O failure as "no bin" (equivalent to the old
+        // exists() check but saves one stat(2) syscall per direct dep).
+        let content = match std::fs::read(&pkg_json_path) {
+            Ok(c) => c,
+            Err(_) => continue,
+        };
+
+        // Trial 30: fast byte pre-scan to skip serde_json parse entirely
+        // for direct deps that declare no `bin`. The quoted key `"bin"`
+        // reliably identifies the JSON field; any false positives (a value
+        // containing the 5-byte sequence `"bin"`) are harmless — we just
+        // parse unnecessarily and get back None.
+        const BIN_KEY: &[u8] = b"\"bin\"";
+        if !content.windows(BIN_KEY.len()).any(|w| w == BIN_KEY) {
             continue;
         }
-        let pkg_json = match lpm_workspace::read_package_json(&pkg_json_path) {
-            Ok(p) => p,
+
+        let bin_config = match lpm_workspace::parse_bin_field(&content) {
+            Ok(Some(b)) => b,
+            Ok(None) => continue,
             Err(e) => {
                 tracing::debug!(
                     "v2 linker: skipping bin links for {}: failed to parse package.json: {e}",
@@ -893,10 +909,6 @@ fn create_bin_links_v2(
                 );
                 continue;
             }
-        };
-        let bin_config = match &pkg_json.bin {
-            Some(b) => b,
-            None => continue,
         };
         let entries = bin_config.entries(&v2t.target.name);
         if entries.is_empty() {
