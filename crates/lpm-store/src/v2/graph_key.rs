@@ -387,22 +387,16 @@ impl GraphKey {
         write_field(&mut hasher, b"name", name.as_bytes());
         write_field(&mut hasher, b"version", version.as_bytes());
 
-        let platform_str = format_platform(platform);
-        write_field(&mut hasher, b"platform", platform_str.as_bytes());
+        write_platform_direct(&mut hasher, platform);
         write_field(&mut hasher, b"linker", linker_tag.as_str().as_bytes());
 
         let effective_peers: &[(String, String)] = match linker_tag {
             LinkerModeTag::Isolated => peers,
             LinkerModeTag::Hoisted => &[],
         };
-        let peers_str = format_peers_raw(effective_peers);
-        write_field(&mut hasher, b"peers", peers_str.as_bytes());
-
-        let edges_str = format_deps_raw(raw_deps, aliases);
-        write_field(&mut hasher, b"edges", edges_str.as_bytes());
-
-        let aliases_str = format_aliases_raw(aliases);
-        write_field(&mut hasher, b"aliases", aliases_str.as_bytes());
+        write_peers_raw_direct(&mut hasher, effective_peers);
+        write_deps_raw_direct(&mut hasher, raw_deps, aliases);
+        write_aliases_raw_direct(&mut hasher, aliases);
 
         let root_names_str = format_root_link_names(root_link_names);
         write_field(&mut hasher, b"root_link_names", root_names_str.as_bytes());
@@ -543,52 +537,125 @@ fn format_root_link_names(names: Option<&[String]>) -> Cow<'static, str> {
     }
 }
 
-// ── Raw-input format helpers ─────────────────────────────────────────────────
-// Parallel to format_deps / format_peers / format_aliases but accept the
-// concrete types from LinkTarget directly so derive_raw can skip the
-// DepEdge / PeerEntry / BTreeMap intermediate allocations.
+// ── Direct-write helpers for derive_raw ─────────────────────────────────────
+// Stream bytes directly into the BLAKE3 hasher, eliminating the intermediate
+// String allocations of the old format_*_raw → write_field pattern.
+// Each function writes the full field (label + "=" + value + "\0").
+// Sort order is byte-identical to sorted-string approach — verified by the
+// derive_raw_matches_derive* parity tests.
 
-fn format_deps_raw(deps: &[(String, String)], aliases: &HashMap<String, String>) -> String {
-    if deps.is_empty() {
-        return String::new();
+fn write_platform_direct(hasher: &mut blake3::Hasher, p: &PlatformTuple) {
+    hasher.update(b"platform=");
+    hasher.update(p.os.as_bytes());
+    hasher.update(b"/");
+    hasher.update(p.cpu.as_bytes());
+    hasher.update(b"/");
+    if let Some(libc) = &p.libc {
+        hasher.update(libc.as_bytes());
     }
-    let mut sorted: Vec<String> = deps
-        .iter()
-        .map(|(local, ver)| {
-            let canonical = aliases.get(local).map(|s| s.as_str()).unwrap_or(local.as_str());
-            format!("{local}=>{canonical}@{ver}")
-        })
-        .collect();
-    sorted.sort();
-    sorted.join(",")
+    hasher.update(b"\0");
 }
 
-fn format_peers_raw(peers: &[(String, String)]) -> String {
-    if peers.is_empty() {
-        return String::new();
+fn write_peers_raw_direct(hasher: &mut blake3::Hasher, peers: &[(String, String)]) {
+    hasher.update(b"peers=");
+    if !peers.is_empty() {
+        let mut sorted: Vec<(&str, &str)> =
+            peers.iter().map(|(n, v)| (n.as_str(), v.as_str())).collect();
+        // Must sort by the byte sequence "name@ver", not by (name, ver) tuple.
+        // Tuple sort puts "react" before "react-dom" (prefix is shorter);
+        // string sort of "react@v" vs "react-dom@v" puts "react-dom" first
+        // because '-' (0x2D) < '@' (0x40) at position 5. The comparator below
+        // simulates string sort without allocating the formatted strings.
+        sorted.sort_unstable_by(|(a_name, a_ver), (b_name, b_ver)| {
+            a_name
+                .bytes()
+                .chain(std::iter::once(b'@'))
+                .chain(a_ver.bytes())
+                .cmp(
+                    b_name
+                        .bytes()
+                        .chain(std::iter::once(b'@'))
+                        .chain(b_ver.bytes()),
+                )
+        });
+        for (i, (name, ver)) in sorted.iter().enumerate() {
+            if i > 0 {
+                hasher.update(b",");
+            }
+            hasher.update(name.as_bytes());
+            hasher.update(b"@");
+            hasher.update(ver.as_bytes());
+        }
     }
-    let mut sorted: Vec<String> = peers
-        .iter()
-        .map(|(name, ver)| format!("{name}@{ver}"))
-        .collect();
-    sorted.sort();
-    sorted.join(",")
+    hasher.update(b"\0");
 }
 
-fn format_aliases_raw(aliases: &HashMap<String, String>) -> String {
-    if aliases.is_empty() {
-        return String::new();
+fn write_deps_raw_direct(
+    hasher: &mut blake3::Hasher,
+    deps: &[(String, String)],
+    aliases: &HashMap<String, String>,
+) {
+    hasher.update(b"edges=");
+    if !deps.is_empty() {
+        let mut sorted: Vec<(&str, &str, &str)> = deps
+            .iter()
+            .map(|(local, ver)| {
+                let canonical = aliases
+                    .get(local)
+                    .map(|s| s.as_str())
+                    .unwrap_or(local.as_str());
+                (local.as_str(), canonical, ver.as_str())
+            })
+            .collect();
+        // Sort by "local=>canonical@ver" byte sequence to match the old string sort.
+        sorted.sort_unstable_by(|(a_local, a_can, a_ver), (b_local, b_can, b_ver)| {
+            a_local
+                .bytes()
+                .chain(b"=>".iter().copied())
+                .chain(a_can.bytes())
+                .chain(std::iter::once(b'@'))
+                .chain(a_ver.bytes())
+                .cmp(
+                    b_local
+                        .bytes()
+                        .chain(b"=>".iter().copied())
+                        .chain(b_can.bytes())
+                        .chain(std::iter::once(b'@'))
+                        .chain(b_ver.bytes()),
+                )
+        });
+        for (i, (local, canonical, ver)) in sorted.iter().enumerate() {
+            if i > 0 {
+                hasher.update(b",");
+            }
+            hasher.update(local.as_bytes());
+            hasher.update(b"=>");
+            hasher.update(canonical.as_bytes());
+            hasher.update(b"@");
+            hasher.update(ver.as_bytes());
+        }
     }
-    let mut entries: Vec<(&str, &str)> = aliases
-        .iter()
-        .map(|(k, v)| (k.as_str(), v.as_str()))
-        .collect();
-    entries.sort_by_key(|(k, _)| *k);
-    entries
-        .iter()
-        .map(|(local, canonical)| format!("{local}=>{canonical}"))
-        .collect::<Vec<_>>()
-        .join(",")
+    hasher.update(b"\0");
+}
+
+fn write_aliases_raw_direct(hasher: &mut blake3::Hasher, aliases: &HashMap<String, String>) {
+    hasher.update(b"aliases=");
+    if !aliases.is_empty() {
+        let mut sorted: Vec<(&str, &str)> = aliases
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.as_str()))
+            .collect();
+        sorted.sort_unstable_by_key(|(k, _)| *k);
+        for (i, (local, canonical)) in sorted.iter().enumerate() {
+            if i > 0 {
+                hasher.update(b",");
+            }
+            hasher.update(local.as_bytes());
+            hasher.update(b"=>");
+            hasher.update(canonical.as_bytes());
+        }
+    }
+    hasher.update(b"\0");
 }
 
 #[cfg(test)]
@@ -933,7 +1000,10 @@ mod tests {
             None,
             None,
         );
-        assert_eq!(via_struct, via_raw, "derive_raw must match derive for zero-extra inputs");
+        assert_eq!(
+            via_struct, via_raw,
+            "derive_raw must match derive for zero-extra inputs"
+        );
     }
 
     #[test]
@@ -941,7 +1011,9 @@ mod tests {
         // Full inputs: deps (including aliased), peers, root_link_names,
         // wrapper_id, patch_fingerprint.
         let aliases: HashMap<String, String> =
-            [("strip-ansi-cjs".to_owned(), "strip-ansi".to_owned())].into_iter().collect();
+            [("strip-ansi-cjs".to_owned(), "strip-ansi".to_owned())]
+                .into_iter()
+                .collect();
         let platform = macos_arm64();
 
         // Build via GraphKeyInputs (existing API).
@@ -990,6 +1062,67 @@ mod tests {
         assert_eq!(
             via_struct, via_raw,
             "derive_raw must produce identical key to derive for full inputs"
+        );
+    }
+
+    #[test]
+    fn derive_raw_peer_sort_prefix_name_matches_string_sort() {
+        // "react-dom@v" sorts BEFORE "react@v" as a string ('-' 0x2D < '@' 0x40),
+        // but a naive tuple sort ("react","v") vs ("react-dom","v") puts "react"
+        // first because it's a shorter prefix.  write_peers_raw_direct MUST use
+        // string sort (the custom byte-streaming comparator) so it stays
+        // byte-identical to the format_peers / derive path.
+        let platform = macos_arm64();
+        let via_struct = GraphKey::derive(
+            &GraphKeyInputs::new("pkg", "1.0.0", platform.clone(), LinkerModeTag::Isolated)
+                .with_peers([
+                    PeerEntry {
+                        name: "react".into(),
+                        version: "18.3.0".into(),
+                    },
+                    PeerEntry {
+                        name: "react-dom".into(),
+                        version: "18.3.0".into(),
+                    },
+                ]),
+        );
+        let raw_forward = GraphKey::derive_raw(
+            "pkg",
+            "1.0.0",
+            &platform,
+            LinkerModeTag::Isolated,
+            &[],
+            &HashMap::new(),
+            &[
+                ("react".to_owned(), "18.3.0".to_owned()),
+                ("react-dom".to_owned(), "18.3.0".to_owned()),
+            ],
+            None,
+            None,
+            None,
+        );
+        let raw_reverse = GraphKey::derive_raw(
+            "pkg",
+            "1.0.0",
+            &platform,
+            LinkerModeTag::Isolated,
+            &[],
+            &HashMap::new(),
+            &[
+                ("react-dom".to_owned(), "18.3.0".to_owned()),
+                ("react".to_owned(), "18.3.0".to_owned()),
+            ],
+            None,
+            None,
+            None,
+        );
+        assert_eq!(
+            via_struct, raw_forward,
+            "derive and derive_raw (forward) must match for prefix-named peers"
+        );
+        assert_eq!(
+            raw_forward, raw_reverse,
+            "derive_raw must be order-independent for prefix-named peers (react vs react-dom)"
         );
     }
 }
