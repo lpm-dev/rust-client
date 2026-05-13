@@ -46,6 +46,7 @@
 //! the full 256-bit digest still uniquely identifies the inputs in the
 //! sidecar metadata (see [`crate::v2::link_meta::LinkMeta::graph_key_digest_hex`]).
 
+use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap};
 
 use crate::v2::platform::PlatformTuple;
@@ -523,18 +524,21 @@ fn format_aliases(aliases: &BTreeMap<String, String>) -> String {
         .join(",")
 }
 
-fn format_root_link_names(names: Option<&[String]>) -> String {
+fn format_root_link_names(names: Option<&[String]>) -> Cow<'static, str> {
     match names {
         // Distinguishable encoding: `None` (use linker default) vs
         // `Some(vec![])` (explicit empty) vs `Some(vec!["a","b"])`.
         // `None` hashes as the empty marker; `Some([])` hashes with
         // a sentinel prefix so the two states yield different keys.
-        None => String::new(),
-        Some([]) => "<explicit-empty>".to_string(),
+        //
+        // `Cow::Borrowed` for the constant cases avoids a heap allocation
+        // per package (~40-50 packages in a typical install have None here).
+        None => Cow::Borrowed(""),
+        Some([]) => Cow::Borrowed("<explicit-empty>"),
         Some(list) => {
-            let mut sorted: Vec<&String> = list.iter().collect();
-            sorted.sort();
-            sorted.into_iter().cloned().collect::<Vec<_>>().join(",")
+            let mut sorted: Vec<&str> = list.iter().map(String::as_str).collect();
+            sorted.sort_unstable();
+            Cow::Owned(sorted.join(","))
         }
     }
 }
