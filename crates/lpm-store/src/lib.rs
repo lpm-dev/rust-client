@@ -3123,7 +3123,7 @@ mod tests {
         );
         store
             .populate_link_entry(LinkEntryRequest {
-                graph_key: f2_sample_key("lodash", "4.17.21"),
+                graph_key: std::sync::Arc::new(f2_sample_key("lodash", "4.17.21")),
                 source_sri: sri.clone(),
                 object_dir: store.paths().object_dir(&sri).unwrap(),
                 deps: vec![],
@@ -3518,7 +3518,7 @@ mod tests {
                 b"{\"name\":\"react\",\"version\":\"18.0.0\"}",
             )],
         );
-        for key in [key_a, key_b] {
+        for key in [std::sync::Arc::new(key_a), std::sync::Arc::new(key_b)] {
             store
                 .populate_link_entry(LinkEntryRequest {
                     graph_key: key,

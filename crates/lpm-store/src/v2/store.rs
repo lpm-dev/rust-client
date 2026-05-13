@@ -10,6 +10,7 @@
 //! them yet. Phase 4b wires them in behind `LPM_STORE_VERSION=v2`.
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use lpm_common::integrity::{HashAlgorithm, Integrity};
 use lpm_common::{LpmError, LpmRoot};
@@ -135,7 +136,7 @@ pub struct LinkEntryRequest {
     /// `links/<graph-key>/node_modules/<name>/`. Always equals
     /// `graph_key.name()` — kept on the request struct for explicit
     /// readability at call sites.
-    pub graph_key: GraphKey,
+    pub graph_key: Arc<GraphKey>,
     /// SRI integrity string of the source tarball. Same value the
     /// install pipeline carries from the registry response.
     pub source_sri: String,
@@ -161,7 +162,9 @@ pub struct DepLink {
     pub local: String,
     /// Target's [`GraphKey`]. The symlink points at
     /// `../../<target.dir_name>/node_modules/<target.name>/`.
-    pub target: GraphKey,
+    /// Stored as `Arc` so the key can be shared across multiple consumers
+    /// that depend on the same target without cloning the name/version strings.
+    pub target: Arc<GraphKey>,
 }
 
 impl DepLink {
@@ -1224,6 +1227,10 @@ mod tests {
         GraphKey::derive(&inputs)
     }
 
+    fn arc_key(name: &str, version: &str) -> Arc<GraphKey> {
+        Arc::new(sample_key(name, version))
+    }
+
     /// Compute a real SHA-512 SRI string over `seed`. Tests need
     /// valid base64-padded SRIs because [`Integrity::parse`] enforces
     /// canonical encoding; hand-rolled placeholders fail at parse time.
@@ -1292,7 +1299,7 @@ mod tests {
             &[("package.json", b"{\"name\":\"a\"}"), ("index.js", b"//ok")],
         );
 
-        let key = sample_key("a", "1.0.0");
+        let key = arc_key("a", "1.0.0");
         let entry = store
             .populate_link_entry(LinkEntryRequest {
                 graph_key: key.clone(),
@@ -1330,7 +1337,7 @@ mod tests {
 
         let sri = synthetic_sri(b"populate_is_idempotent");
         let object_dir = write_object(&store, &sri, &[("package.json", b"{}")]);
-        let key = sample_key("b", "2.0.0");
+        let key = arc_key("b", "2.0.0");
         let req = || LinkEntryRequest {
             graph_key: key.clone(),
             source_sri: sri.clone(),
@@ -1392,8 +1399,8 @@ mod tests {
         let pkg_obj = write_object(&store, &pkg_sri, &[("package.json", b"{}")]);
         write_object(&store, &dep_sri, &[("package.json", b"{}")]);
 
-        let pkg_key = sample_key("express", "4.21.0");
-        let dep_key = sample_key("debug", "4.3.4");
+        let pkg_key = arc_key("express", "4.21.0");
+        let dep_key = arc_key("debug", "4.3.4");
 
         // Materialize the dep first so its link dir exists for the
         // symlink target. (Phase 4a doesn't enforce ordering — caller's
@@ -1452,8 +1459,8 @@ mod tests {
         let pkg_obj = write_object(&store, &pkg_sri, &[("package.json", b"{}")]);
         write_object(&store, &dep_sri, &[("package.json", b"{}")]);
 
-        let pkg_key = sample_key("consumer", "1.0.0");
-        let dep_key = sample_key("@types/node", "20.10.0");
+        let pkg_key = arc_key("consumer", "1.0.0");
+        let dep_key = arc_key("@types/node", "20.10.0");
 
         store
             .populate_link_entry(LinkEntryRequest {
@@ -1529,7 +1536,7 @@ mod tests {
         // Object dir doesn't exist → materialize_into fails → tmp cleanup.
         let sri = synthetic_sri(b"populate_failure_cleans_up_tmp_dir");
         let nonexistent_object = store.paths().object_dir(&sri).unwrap();
-        let key = sample_key("missing", "0.0.1");
+        let key = arc_key("missing", "0.0.1");
 
         let err = store
             .populate_link_entry(LinkEntryRequest {
@@ -1580,7 +1587,7 @@ mod tests {
 
         let sri = synthetic_sri(b"recover_partial_link_entry");
         let object_dir = write_object(&store, &sri, &[("package.json", b"{}")]);
-        let key = sample_key("c", "0.1.0");
+        let key = arc_key("c", "0.1.0");
         let final_dir = store.paths().link_dir(&key);
 
         // Create a partial entry: only the sidecar, no package dir.
@@ -1669,7 +1676,7 @@ mod tests {
 
         let sri = synthetic_sri(b"rename_overwrites_incomplete");
         let object_dir = write_object(&store, &sri, &[("package.json", b"{}")]);
-        let key = sample_key("d", "0.0.1");
+        let key = arc_key("d", "0.0.1");
         let final_dir = store.paths().link_dir(&key);
 
         // Pre-create an empty leftover. Because it's empty (no
@@ -1921,8 +1928,8 @@ mod tests {
             &[("package.json", b"{\"name\":\"b\",\"version\":\"2.0.0\"}")],
         );
 
-        let key_a = sample_key("a", "1.0.0");
-        let key_b = sample_key("b", "2.0.0");
+        let key_a = arc_key("a", "1.0.0");
+        let key_b = arc_key("b", "2.0.0");
         store
             .populate_link_entry(LinkEntryRequest {
                 graph_key: key_a,
@@ -1983,7 +1990,7 @@ mod tests {
             &sri,
             &[("package.json", b"{\"name\":\"c\",\"version\":\"3.1.4\"}")],
         );
-        let key = sample_key("c", "3.1.4");
+        let key = arc_key("c", "3.1.4");
         store
             .populate_link_entry(LinkEntryRequest {
                 graph_key: key.clone(),
@@ -2106,7 +2113,7 @@ mod tests {
             &sri,
             &[("package.json", b"{\"name\":\"d\",\"version\":\"1.0.0\"}")],
         );
-        let key = sample_key("d", "1.0.0");
+        let key = arc_key("d", "1.0.0");
         let entry = store
             .populate_link_entry(LinkEntryRequest {
                 graph_key: key.clone(),
