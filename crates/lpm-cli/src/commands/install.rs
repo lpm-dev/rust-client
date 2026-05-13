@@ -8430,7 +8430,20 @@ fn try_lockfile_fast_path(
     // entry falls back to fresh-resolve. Once `is_safe_source` is
     // taught about non-Registry sources (Phase 59.0.x or 59.1), the
     // PackageKey-based lookups in this loop are already correct.
-    let mut root_link_map: HashMap<lpm_lockfile::PackageKey, Vec<String>> = HashMap::new();
+    //
+    // Key is "name\x00version" (compound string) to avoid allocating a
+    // PackageKey (SHA-256 source_id + 2 String clones) on every build
+    // AND every lookup — the root symlink slot is unambiguous for
+    // (name, version) since the lockfile rejects same-name-same-version
+    // cross-source collisions during resolution.
+    let root_link_key = |name: &str, version: &str| -> String {
+        let mut k = String::with_capacity(name.len() + 1 + version.len());
+        k.push_str(name);
+        k.push('\x00');
+        k.push_str(version);
+        k
+    };
+    let mut root_link_map: HashMap<String, Vec<String>> = HashMap::new();
     for local in deps.keys() {
         let target = lockfile
             .root_aliases
@@ -8439,7 +8452,7 @@ fn try_lockfile_fast_path(
             .unwrap_or_else(|| local.clone());
         if let Some(lp) = lockfile.find_package(&target) {
             root_link_map
-                .entry(lp.package_key())
+                .entry(root_link_key(&lp.name, &lp.version))
                 .or_default()
                 .push(local.clone());
         }
@@ -8459,8 +8472,9 @@ fn try_lockfile_fast_path(
     // `dependencies`, we don't want a double-link entry.
     for ambient in &lockfile.ambient_peer_installs {
         if let Some(lp) = lockfile.find_package(ambient) {
-            let key = lp.package_key();
-            let entry = root_link_map.entry(key).or_default();
+            let entry = root_link_map
+                .entry(root_link_key(&lp.name, &lp.version))
+                .or_default();
             if !entry.iter().any(|l| l == ambient) {
                 entry.push(ambient.clone());
             }
@@ -8526,9 +8540,7 @@ fn try_lockfile_fast_path(
                 })
                 .collect();
 
-            // Phase 59.0 day-7: lookup by PackageKey to match the
-            // map's source-aware key shape.
-            let root_link_names = root_link_map.get(&lp.package_key()).cloned();
+            let root_link_names = root_link_map.get(&root_link_key(&lp.name, &lp.version)).cloned();
 
             InstallPackage {
                 name: lp.name.clone(),
