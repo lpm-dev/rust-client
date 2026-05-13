@@ -519,31 +519,28 @@ fn populate_one(
     // walk-up from the consumer's package dir never reaches the
     // peer (v2 link entries are absolute paths into the global
     // store, not the project tree).
-    let already_local: std::collections::HashSet<String> =
-        deps.iter().map(|d| d.local.clone()).collect();
-    for (peer_name, peer_ver) in &v2t.target.peers {
-        if already_local.contains(peer_name) {
-            // Peer is also declared as a regular dep — already
-            // covered by the dep-edge pass. Avoids a duplicate
-            // sibling symlink (which would conflict at the link
-            // entry's `node_modules/<peer>` slot).
-            continue;
-        }
-        let peer_key = match key_map.get_by_coords(peer_name, peer_ver) {
-            Some(k) => k.clone(),
-            None => {
-                // Peer not in install set. ensure_peer_context already
-                // distinguished optional from required and emitted
-                // the relevant trace; here we silently skip — a
-                // missing peer becomes a runtime require failure,
-                // mirroring v1's behavior under the same shape.
-                continue;
-            }
+    // Skip the HashSet construction entirely when there are no peers —
+    // the common case for most packages. For the peer case, build
+    // already_local as &str (no clone) then drop before mutating deps.
+    if !v2t.target.peers.is_empty() {
+        let peer_extras: Vec<DepLink> = {
+            let already_local: std::collections::HashSet<&str> =
+                deps.iter().map(|d| d.local.as_str()).collect();
+            v2t.target.peers
+                .iter()
+                .filter(|(peer_name, _)| !already_local.contains(peer_name.as_str()))
+                .filter_map(|(peer_name, peer_ver)| {
+                    let peer_key = key_map.get_by_coords(peer_name, peer_ver)?.clone();
+                    Some(DepLink {
+                        local: peer_name.clone(),
+                        target: peer_key,
+                    })
+                })
+                .collect()
+            // already_local (borrows from deps) is dropped here, before
+            // deps is mutated by extend below.
         };
-        deps.push(DepLink {
-            local: peer_name.clone(),
-            target: peer_key,
-        });
+        deps.extend(peer_extras);
     }
 
     let request = LinkEntryRequest {
