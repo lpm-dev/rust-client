@@ -1880,6 +1880,26 @@ pub fn parse_peer_dependencies(content: &[u8]) -> Result<PeerDepsResult, Workspa
     Ok((parsed.peer_dependencies, parsed.peer_dependencies_meta))
 }
 
+/// Parse only the `bin` field from already-read `package.json` bytes.
+///
+/// Uses a one-field deserialization struct so serde_json skips every other
+/// field (`dependencies`, `scripts`, `peerDependencies`, …) without
+/// allocating strings for their keys or values. Callers that additionally
+/// byte-scan for `b"\"bin\""` before calling this can skip the parse
+/// entirely for packages that declare no binary — the common case.
+///
+/// See `create_bin_links_v2` in `lpm-linker` for the canonical call site.
+pub fn parse_bin_field(content: &[u8]) -> Result<Option<BinConfig>, WorkspaceError> {
+    #[derive(serde::Deserialize, Default)]
+    struct BinOnly {
+        #[serde(default)]
+        bin: Option<BinConfig>,
+    }
+    let parsed: BinOnly = serde_json::from_slice(content)
+        .map_err(|e| WorkspaceError::Parse(format!("parse error: {e}")))?;
+    Ok(parsed.bin)
+}
+
 /// Read pnpm-workspace.yaml and extract package globs.
 fn read_pnpm_workspace(path: &Path) -> Result<Option<Vec<String>>, WorkspaceError> {
     let content = std::fs::read_to_string(path)
@@ -4514,5 +4534,91 @@ mod peer_deps_parse_tests {
         let json = br#"{"peerDependenciesMeta":{"react":{"optional":true}}}"#;
         const NEEDLE: &[u8] = b"peerDependencies";
         assert!(json.windows(NEEDLE.len()).any(|w| w == NEEDLE));
+    }
+
+    // ── Trial 30: parse_bin_field ─────────────────────────────────────────
+
+    #[test]
+    fn parse_bin_field_returns_none_for_no_bin() {
+        let json = br#"{"name":"lodash","version":"4.17.21","dependencies":{"some":"1.0.0"}}"#;
+        let result = parse_bin_field(json).unwrap();
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn parse_bin_field_returns_single_bin() {
+        let json = br#"{"name":"my-cli","version":"1.0.0","bin":"./cli.js","dependencies":{"dep":"1.0.0"}}"#;
+        let result = parse_bin_field(json).unwrap().unwrap();
+        match result {
+            BinConfig::Single(path) => assert_eq!(path, "./cli.js"),
+            other => panic!("expected Single, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_bin_field_returns_map_bin() {
+        let json = br#"{"name":"eslint","bin":{"eslint":"./bin/eslint.js"}}"#;
+        let result = parse_bin_field(json).unwrap().unwrap();
+        match result {
+            BinConfig::Map(map) => {
+                assert_eq!(map.get("eslint").map(|s| s.as_str()), Some("./bin/eslint.js"))
+            }
+            other => panic!("expected Map, got {other:?}"),
+        }
+    }
+
+    /// The `"bin"` byte-scan needle correctly identifies packages with a
+    /// bin field — no false negatives.
+    #[test]
+    fn bin_byte_scan_matches_when_bin_present() {
+        let json = br#"{"name":"eslint","bin":{"eslint":"./bin/eslint.js"},"dependencies":{}}"#;
+        const NEEDLE: &[u8] = b"\"bin\"";
+        assert!(json.windows(NEEDLE.len()).any(|w| w == NEEDLE));
+    }
+
+    /// The `"bin"` byte-scan needle correctly shows absence when there is
+    /// no bin field — no unnecessary parse passes.
+    #[test]
+    fn bin_byte_scan_absent_when_no_bin() {
+        let json = br#"{"name":"lodash","version":"4.17.21","dependencies":{},"scripts":{"test":"jest"}}"#;
+        const NEEDLE: &[u8] = b"\"bin\"";
+        assert!(!json.windows(NEEDLE.len()).any(|w| w == NEEDLE));
+    }
+
+    /// Packages without bin but whose other fields contain the word "bin"
+    /// in values (e.g., script paths) do NOT trigger a false-positive
+    /// match on the quoted-key needle `"\"bin\""`.
+    #[test]
+    fn bin_byte_scan_no_false_positive_from_bin_in_value() {
+        // The scripts values contain the word "bin" but the JSON key
+        // `"bin"` (with quotes) is absent.
+        let json =
+            br#"{"name":"tool","scripts":{"start":"node dist/bin/index.js"},"dependencies":{}}"#;
+        const NEEDLE: &[u8] = b"\"bin\"";
+        assert!(!json.windows(NEEDLE.len()).any(|w| w == NEEDLE));
+    }
+
+    /// parse_bin_field must return the same result as read_package_json
+    /// for the bin field — the minimal struct and the full struct produce
+    /// identical outputs.
+    #[test]
+    fn parse_bin_field_parity_with_read_package_json() {
+        let json = br#"{"name":"next","version":"14.0.0","bin":{"next":"./dist/bin/next"},"dependencies":{"react":"^18.0.0"}}"#;
+        let tmp = std::env::temp_dir().join(format!(
+            "lpm-t30-parity-{}-{:?}.json",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::write(&tmp, json).unwrap();
+
+        let from_full = read_package_json(&tmp).unwrap().bin;
+        let from_minimal = parse_bin_field(json).unwrap();
+
+        match (from_full, from_minimal) {
+            (Some(BinConfig::Map(a)), Some(BinConfig::Map(b))) => assert_eq!(a, b),
+            (None, None) => {}
+            (a, b) => panic!("mismatch: full={a:?}, minimal={b:?}"),
+        }
+        let _ = std::fs::remove_file(&tmp);
     }
 }
