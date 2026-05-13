@@ -589,7 +589,10 @@ fn link_meta_platform(p: &PlatformTuple) -> LinkMetaPlatform {
 /// instead of cloning each field separately (2–3 allocs per lookup).
 pub struct KeyMap {
     by_triple: HashMap<String, GraphKey>,
-    by_coords: HashMap<String, GraphKey>,
+    // Value is `(GraphKey, first_wrapper_id_seen)`. The wrapper_id component
+    // exists solely to surface helpful collision-error messages — it is
+    // stripped at lookup time so callers always receive `&GraphKey`.
+    by_coords: HashMap<String, (GraphKey, Option<String>)>,
 }
 
 /// Form the `by_coords` key: `"name\x00version"`.
@@ -622,7 +625,7 @@ impl KeyMap {
     }
 
     fn get_by_coords(&self, name: &str, version: &str) -> Option<&GraphKey> {
-        self.by_coords.get(&coords_key(name, version))
+        self.by_coords.get(&coords_key(name, version)).map(|(gk, _)| gk)
     }
 }
 
@@ -632,10 +635,8 @@ fn derive_graph_keys(
     linker_tag: LinkerModeTag,
 ) -> Result<KeyMap, LpmError> {
     let mut by_triple: HashMap<String, GraphKey> = HashMap::with_capacity(targets.len());
-    let mut by_coords: HashMap<String, GraphKey> = HashMap::with_capacity(targets.len());
-    // Tracks the first wrapper_id seen for each (name, version) pair so we
-    // can detect and reject multi-source collisions with a helpful error.
-    let mut coords_seen: HashMap<String, Option<String>> = HashMap::with_capacity(targets.len());
+    let mut by_coords: HashMap<String, (GraphKey, Option<String>)> =
+        HashMap::with_capacity(targets.len());
 
     for v2t in targets {
         let inputs = build_inputs(&v2t.target, platform, linker_tag);
@@ -653,11 +654,13 @@ fn derive_graph_keys(
             )));
         }
 
+        // `ckey` ownership moves into the entry key — no clone needed.
+        // The stored `Option<String>` is only used to produce a helpful
+        // collision error message; `get_by_coords` strips it at lookup time.
         let ckey = coords_key(&v2t.target.name, &v2t.target.version);
-        match coords_seen.entry(ckey.clone()) {
+        match by_coords.entry(ckey) {
             std::collections::hash_map::Entry::Vacant(e) => {
-                e.insert(v2t.target.wrapper_id.clone());
-                by_coords.insert(ckey, key);
+                e.insert((key, v2t.target.wrapper_id.clone()));
             }
             std::collections::hash_map::Entry::Occupied(existing) => {
                 // Multi-source-same-coords. Dep edges carry only
@@ -674,7 +677,7 @@ fn derive_graph_keys(
                      dep edges (Phase 4 follow-up).",
                     v2t.target.name,
                     v2t.target.version,
-                    existing.get(),
+                    existing.get().1,
                     v2t.target.wrapper_id,
                 )));
             }
