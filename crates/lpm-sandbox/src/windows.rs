@@ -1880,6 +1880,16 @@ mod tests {
     #[test]
     fn write_to_preexisting_file_in_package_dir_under_enforce_succeeds() {
         let tmp = tempfile::tempdir().expect("tempdir");
+        // Neutralise the post-KB5089549/KB5092762 Windows 26200 behavior
+        // where an inherited AppContainer Capability SID ACE blocks Low IL
+        // writes regardless of the rest of the descriptor. See
+        // [`test_strip_inherited_capability_sids`] for the full diagnosis.
+        // Strip at the tempdir-root level BEFORE creating child dirs so
+        // descendants inherit a clean DAC (no Capability SID) from the
+        // start. Stripping AFTER children exist leaves the relabel call
+        // unable to modify the SACL because the strip mutates the DACL
+        // shape that `SetNamedSecurityInfoW` validates against.
+        test_strip_inherited_capability_sids(tmp.path());
         let spec = isolated_spec(tmp.path());
         let pkg_dir = spec.package_dir.clone();
 
@@ -1934,6 +1944,13 @@ mod tests {
     #[test]
     fn write_into_package_dir_under_enforce_succeeds() {
         let tmp = tempfile::tempdir().expect("tempdir");
+        // See the matching call in
+        // `write_to_preexisting_file_in_package_dir_under_enforce_succeeds`
+        // and [`test_strip_inherited_capability_sids`] for the full
+        // diagnosis of the Windows 26200 + KB5089549/KB5092762 behavior
+        // change. Strip at the tempdir-root level BEFORE creating
+        // children so they inherit a clean DAC.
+        test_strip_inherited_capability_sids(tmp.path());
         let spec = isolated_spec(tmp.path());
         let pkg_dir = spec.package_dir.clone();
         let sb = WindowsSandbox::new(spec, SandboxMode::Enforce, SandboxOptions::default())
@@ -2169,6 +2186,119 @@ mod tests {
              may be unusual",
             path.display(),
         );
+    }
+
+    /// Strip every inherited AppContainer Capability SID ACE from `path`'s
+    /// DAC. Used by the Low-IL write-success tests to neutralise an
+    /// environmental contamination that breaks the test contract on hosts
+    /// whose `%TEMP%` carries an inherited Capability SID grant (e.g. from
+    /// prior AppContainer-using software — Edge, Windows Sandbox, the
+    /// Phase 46.3 PR-2 helper test fixtures).
+    ///
+    /// # Why this is needed
+    ///
+    /// Empirically, on Windows 11 26200 with KB5089549/KB5092762 installed,
+    /// a Low IL process is DENIED `FILE_ADD_FILE` on a Low-IL-labelled
+    /// directory if the directory's DAC contains an AppContainer Capability
+    /// SID grant (`S-1-15-2-*`) — even when the DAC also explicitly grants
+    /// the user `Full Control` AND the mandatory label policy is the
+    /// standard `(OI)(CI)(NW)`. The kernel treats the Capability SID
+    /// presence as a gate: Low IL subjects without a matching capability
+    /// in their token are refused write access regardless of the rest of
+    /// the descriptor.
+    ///
+    /// Production directories `apply_low_il_label` is asked to relabel
+    /// (`~/.lpm/store/<pkg>`, `<project>/node_modules`, `~/.cache`,
+    /// `~/.node-gyp`, `~/.npm`) live OUTSIDE `%TEMP%` and are not exposed
+    /// to this inheritance, so the production Low IL fallback is unaffected
+    /// on a typical layout. The contamination only matters for the
+    /// `tmpdir` allow-set entry AND for tests whose fixtures live under
+    /// `tempfile::tempdir()` (= `%TEMP%`).
+    ///
+    /// # What this helper does
+    ///
+    /// 1. Disable inheritance on `path` via `icacls /inheritance:d` —
+    ///    this severs inheritance from the parent AND copies every
+    ///    previously-inherited ACE as an explicit ACE on `path`, so the
+    ///    user/SYSTEM/Administrators grants survive the sever. Using
+    ///    `/inheritance:r` instead would REMOVE the inherited ACEs (the
+    ///    common icacls footgun — the `r`/`d` flag pair has opposite
+    ///    "remove" semantics from what the letter abbreviation suggests).
+    /// 2. Enumerate the resulting DAC via `icacls` output and extract
+    ///    every `S-1-15-2-*` SID literal.
+    /// 3. Remove each extracted SID with `icacls /remove`.
+    ///
+    /// Idempotent: a path without any Capability SIDs gets steps 1-3 with
+    /// step 3 a no-op. The user's, SYSTEM's, and Administrators' grants
+    /// survive untouched because step 1 copies them as explicit and step
+    /// 3's removal is keyed by the `S-1-15-2-` prefix.
+    ///
+    /// Callers must invoke this BEFORE `apply_low_il_label` because the
+    /// label call doesn't touch the DAC — once the Capability SID is in
+    /// the DAC, the kernel veto stands.
+    fn test_strip_inherited_capability_sids(path: &Path) {
+        // Step 1: disable inheritance AND copy currently-inherited ACEs
+        // as explicit. `/inheritance:d` is the "copy then sever" flag —
+        // `/inheritance:r` is the "drop then sever" flag and is the wrong
+        // one here: it would strip the user's inherited Full Control and
+        // leave the directory un-writable by the test process.
+        let out = std::process::Command::new("icacls")
+            .arg(path)
+            .arg("/inheritance:d")
+            .output()
+            .expect("icacls /inheritance:d");
+        assert!(
+            out.status.success(),
+            "icacls /inheritance:d failed on {}: stdout={} stderr={}",
+            path.display(),
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr),
+        );
+
+        // Step 2: enumerate Capability SIDs in the now-flat DAC.
+        let listing = std::process::Command::new("icacls")
+            .arg(path)
+            .output()
+            .expect("icacls list");
+        let stdout = String::from_utf8_lossy(&listing.stdout);
+        let mut capability_sids: Vec<String> = Vec::new();
+        for line in stdout.lines() {
+            // Each ACE is `<sid-or-name>:<rights>`. Capability SIDs render
+            // as their literal SID form (`S-1-15-2-...`) because icacls
+            // can't resolve them to a friendly name. Split on the trailing
+            // `:` to isolate the SID, then accept only those starting with
+            // the AppContainer-package prefix.
+            for token in line.split_whitespace() {
+                if let Some(idx) = token.rfind(':') {
+                    let sid = &token[..idx];
+                    if sid.starts_with("S-1-15-2-")
+                        && !capability_sids.iter().any(|s| s == sid)
+                    {
+                        capability_sids.push(sid.to_string());
+                    }
+                }
+            }
+        }
+
+        // Step 3: remove each Capability SID.
+        for sid in &capability_sids {
+            // `*` prefix tells icacls to interpret the literal as a SID
+            // rather than try to resolve it as a friendly name.
+            let starred = format!("*{sid}");
+            let rm = std::process::Command::new("icacls")
+                .arg(path)
+                .arg("/remove")
+                .arg(&starred)
+                .output()
+                .expect("icacls /remove");
+            assert!(
+                rm.status.success(),
+                "icacls /remove {starred} failed on {}: stdout={} stderr={}",
+                path.display(),
+                String::from_utf8_lossy(&rm.stdout),
+                String::from_utf8_lossy(&rm.stderr),
+            );
+        }
     }
 
     /// Create an NTFS directory junction at `link` pointing at `target`.
