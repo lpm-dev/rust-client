@@ -600,8 +600,10 @@ fn write_platform_direct(hasher: &mut blake3::Hasher, p: &PlatformTuple) {
 fn write_peers_raw_direct(hasher: &mut blake3::Hasher, peers: &[(String, String)]) {
     hasher.update(b"peers=");
     if !peers.is_empty() {
-        let mut sorted: Vec<(&str, &str)> =
-            peers.iter().map(|(n, v)| (n.as_str(), v.as_str())).collect();
+        let mut sorted: Vec<(&str, &str)> = peers
+            .iter()
+            .map(|(n, v)| (n.as_str(), v.as_str()))
+            .collect();
         // Must sort by the byte sequence "name@ver", not by (name, ver) tuple.
         // Tuple sort puts "react" before "react-dom" (prefix is shorter);
         // string sort of "react@v" vs "react-dom@v" puts "react-dom" first

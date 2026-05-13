@@ -4470,7 +4470,8 @@ mod peer_deps_parse_tests {
 
     #[test]
     fn parse_returns_empty_for_no_peer_deps() {
-        let json = br#"{"name":"react","version":"18.3.0","dependencies":{"loose-envify":"^1.1.0"}}"#;
+        let json =
+            br#"{"name":"react","version":"18.3.0","dependencies":{"loose-envify":"^1.1.0"}}"#;
         let (deps, meta) = parse_peer_dependencies(json).unwrap();
         assert!(deps.is_empty(), "expected no peerDependencies");
         assert!(meta.is_empty(), "expected no peerDependenciesMeta");
@@ -4561,7 +4562,10 @@ mod peer_deps_parse_tests {
         let result = parse_bin_field(json).unwrap().unwrap();
         match result {
             BinConfig::Map(map) => {
-                assert_eq!(map.get("eslint").map(|s| s.as_str()), Some("./bin/eslint.js"))
+                assert_eq!(
+                    map.get("eslint").map(|s| s.as_str()),
+                    Some("./bin/eslint.js")
+                )
             }
             other => panic!("expected Map, got {other:?}"),
         }
@@ -4580,7 +4584,8 @@ mod peer_deps_parse_tests {
     /// no bin field — no unnecessary parse passes.
     #[test]
     fn bin_byte_scan_absent_when_no_bin() {
-        let json = br#"{"name":"lodash","version":"4.17.21","dependencies":{},"scripts":{"test":"jest"}}"#;
+        let json =
+            br#"{"name":"lodash","version":"4.17.21","dependencies":{},"scripts":{"test":"jest"}}"#;
         const NEEDLE: &[u8] = b"\"bin\"";
         assert!(!json.windows(NEEDLE.len()).any(|w| w == NEEDLE));
     }

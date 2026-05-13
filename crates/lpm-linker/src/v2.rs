@@ -454,17 +454,16 @@ fn ensure_peer_context(targets: &mut [V2Target], store: &Store) -> Result<(), Lp
             continue;
         }
 
-        let (peer_deps, peer_deps_meta) =
-            match lpm_workspace::parse_peer_dependencies(&content) {
-                Ok(p) => p,
-                Err(e) => {
-                    tracing::debug!(
-                        "v2 linker: failed to parse {}/package.json for peer derivation: {e}",
-                        object_dir.display()
-                    );
-                    continue;
-                }
-            };
+        let (peer_deps, peer_deps_meta) = match lpm_workspace::parse_peer_dependencies(&content) {
+            Ok(p) => p,
+            Err(e) => {
+                tracing::debug!(
+                    "v2 linker: failed to parse {}/package.json for peer derivation: {e}",
+                    object_dir.display()
+                );
+                continue;
+            }
+        };
         if peer_deps.is_empty() {
             continue;
         }

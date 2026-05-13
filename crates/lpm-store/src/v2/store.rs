@@ -2183,7 +2183,9 @@ mod tests {
         assert!(segment.starts_with("sha512-"), "expected sha512- prefix");
         assert_eq!(segment.len(), "sha512-".len() + 128);
         assert!(
-            segment["sha512-".len()..].chars().all(|c| c.is_ascii_hexdigit() && !c.is_uppercase()),
+            segment["sha512-".len()..]
+                .chars()
+                .all(|c| c.is_ascii_hexdigit() && !c.is_uppercase()),
             "hex portion must be lowercase"
         );
     }
@@ -2206,7 +2208,9 @@ mod tests {
         assert!(segment.starts_with("sha256-"), "expected sha256- prefix");
         assert_eq!(segment.len(), "sha256-".len() + 64);
         assert!(
-            segment["sha256-".len()..].chars().all(|c| c.is_ascii_hexdigit() && !c.is_uppercase()),
+            segment["sha256-".len()..]
+                .chars()
+                .all(|c| c.is_ascii_hexdigit() && !c.is_uppercase()),
             "hex portion must be lowercase"
         );
     }
