@@ -459,16 +459,24 @@ impl GraphKey {
     }
 
     /// Canonical name component (matches the registry-canonical name).
+    //
+    // Trial 8 (2026-05-13): `#[inline]` so cross-crate callers (linker
+    // hot loops, store path helpers) skip the function-call indirection
+    // even when LTO heuristics would have left it as a regular call.
+    // Body is a single field projection — no code-size risk.
+    #[inline]
     pub fn name(&self) -> &str {
         &self.name
     }
 
     /// Exact version component.
+    #[inline]
     pub fn version(&self) -> &str {
         &self.version
     }
 
     /// Full BLAKE3 digest (256 bits / 32 bytes).
+    #[inline]
     pub fn digest(&self) -> &[u8; 32] {
         &self.digest
     }
@@ -491,6 +499,7 @@ impl GraphKey {
     /// (`@scope/pkg`) become a flat directory name (`@scope+pkg@1.2.3+...`).
     ///
     /// Returns a borrow of the pre-computed cached value — zero allocations.
+    #[inline]
     pub fn dir_name(&self) -> &str {
         &self.dir_name
     }

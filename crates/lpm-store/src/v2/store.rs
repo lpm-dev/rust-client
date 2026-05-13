@@ -76,16 +76,25 @@ impl StoreV2Paths {
     }
 
     /// `~/.lpm/store/v2/`
+    //
+    // Trial 8 (2026-05-13): `#[inline]` on the small accessors. They're
+    // pure field projections / single-method calls, called per-package
+    // from across crate boundaries (linker, install pipeline). LTO with
+    // `codegen-units = 1` usually inlines these anyway, but the hint
+    // makes the contract explicit and helps non-LTO builds (dev, tests).
+    #[inline]
     pub fn root(&self) -> &Path {
         &self.root
     }
 
     /// `~/.lpm/store/v2/objects/`
+    #[inline]
     pub fn objects_root(&self) -> PathBuf {
         self.objects_root.clone()
     }
 
     /// `~/.lpm/store/v2/links/`
+    #[inline]
     pub fn links_root(&self) -> PathBuf {
         self.links_root.clone()
     }
@@ -94,6 +103,7 @@ impl StoreV2Paths {
     ///
     /// Returns [`LpmError::InvalidIntegrity`] if `sri` doesn't parse
     /// as a canonical SRI string.
+    #[inline]
     pub fn object_dir(&self, sri: &str) -> Result<PathBuf, LpmError> {
         Ok(self.objects_root.join(sri_to_segment(sri)?))
     }
@@ -106,6 +116,7 @@ impl StoreV2Paths {
     }
 
     /// `~/.lpm/store/v2/links/<graph-key>/` for a given key.
+    #[inline]
     pub fn link_dir(&self, key: &GraphKey) -> PathBuf {
         self.links_root.join(key.dir_name())
     }

@@ -2442,14 +2442,34 @@ async fn async_main() -> Result<()> {
     } else {
         "lpm=warn"
     };
-    tracing_subscriber::fmt()
-        .with_writer(std::io::stderr)
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| filter.into()),
-        )
-        .with_target(false)
-        .without_time()
-        .init();
+    // **Trial 4 (2026-05-13):** when built with `--features tracy`, layer
+    // a `TracyLayer` alongside the stderr fmt layer so the install
+    // pipeline's `tracing::span!` instrumentation lands in the Tracy GUI.
+    // Layered subscribers preserve the existing stderr logging contract
+    // (D-impl-3) — Tracy is purely additive.
+    {
+        use tracing_subscriber::layer::SubscriberExt as _;
+        use tracing_subscriber::util::SubscriberInitExt as _;
+
+        let env_filter =
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| filter.into());
+        let fmt_layer = tracing_subscriber::fmt::layer()
+            .with_writer(std::io::stderr)
+            .with_target(false)
+            .without_time();
+
+        #[cfg(feature = "tracy")]
+        let registry = tracing_subscriber::registry()
+            .with(env_filter)
+            .with(fmt_layer)
+            .with(tracing_tracy::TracyLayer::default());
+        #[cfg(not(feature = "tracy"))]
+        let registry = tracing_subscriber::registry()
+            .with(env_filter)
+            .with(fmt_layer);
+
+        registry.init();
+    }
 
     let registry_url = cli
         .registry

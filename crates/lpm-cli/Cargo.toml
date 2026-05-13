@@ -123,9 +123,21 @@ dhat-heap = ["dep:dhat"]
 # Disable mimalloc for comparison builds (e.g. benchmarking allocator impact).
 # cargo build --release --features no-mimalloc
 no-mimalloc = []
+# Trial 4 (2026-05-13): wire `tracing` spans to a Tracy collector so the
+# install pipeline can be profiled per-function in the Tracy GUI. Off by
+# default — zero runtime cost in normal builds. Build with `--features tracy`
+# and run with the Tracy server attached on the default port.
+#   cargo build --release -p lpm-cli --features tracy
+#   tracy-capture -o profile.tracy &
+#   ./target/release/lpm-rs install
+tracy = ["dep:tracing-tracy"]
 
 [dependencies.dhat]
 version = "0.3"
+optional = true
+
+[dependencies.tracing-tracy]
+version = "0.11"
 optional = true
 
 [dev-dependencies]
