@@ -154,6 +154,9 @@ pub struct StageTimings {
 pub struct PackageStore {
     /// Root directory of the store (e.g., ~/.lpm/store).
     root: PathBuf,
+    /// `~/.lpm/store/v1/` — precomputed to avoid one PathBuf
+    /// allocation per `package_dir` call on hot install paths.
+    v1_root: PathBuf,
 }
 
 impl PackageStore {
@@ -170,14 +173,16 @@ impl PackageStore {
 
     /// Create a store rooted at the given [`LpmRoot`]'s `store/` directory.
     pub fn from_root(root: &LpmRoot) -> Self {
-        PackageStore {
-            root: root.store_root(),
-        }
+        let store_root = root.store_root();
+        let v1_root = store_root.join(STORE_VERSION);
+        PackageStore { root: store_root, v1_root }
     }
 
     /// Create a store at a specific path (for testing).
     pub fn at(root: impl Into<PathBuf>) -> Self {
-        PackageStore { root: root.into() }
+        let root = root.into();
+        let v1_root = root.join(STORE_VERSION);
+        PackageStore { root, v1_root }
     }
 
     /// Derive an [`lpm_common::LpmRoot`] from this store's root.
@@ -199,11 +204,14 @@ impl PackageStore {
     /// Get the store directory for a package version.
     /// e.g., `~/.lpm/store/v1/react@19.2.4/`
     pub fn package_dir(&self, name: &str, version: &str) -> PathBuf {
-        // Sanitize name for filesystem: replace @ and / with safe characters
-        let safe_name = name.replace(['/', '\\'], "+");
-        self.root
-            .join(STORE_VERSION)
-            .join(format!("{safe_name}@{version}"))
+        use std::borrow::Cow;
+        // Avoid heap alloc for the common case of unscoped packages.
+        let safe_name: Cow<'_, str> = if name.contains(['/', '\\']) {
+            Cow::Owned(name.replace(['/', '\\'], "+"))
+        } else {
+            Cow::Borrowed(name)
+        };
+        self.v1_root.join(format!("{safe_name}@{version}"))
     }
 
     /// **Phase 59.0 day-4 (F4)** — content-addressable store path
