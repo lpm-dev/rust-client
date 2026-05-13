@@ -8140,9 +8140,31 @@ async fn build_blocked_set_metadata(
         // `behavioral_tags_hash` + `behavioral_tags`). Errors are
         // swallowed per the graceful-degradation contract above.
         let meta_start = std::time::Instant::now();
-        let meta = if p.is_lpm {
+        // **Trial 33**: use minimal-deserialization path for blocked-set capture.
+        // `get_npm_blocked_set_meta` deserializes only `time` + `_behavioralTags`
+        // on cache hits, eliminating ~90% of the rmp_serde string allocations
+        // that the full `PackageMetadata` path produces.
+        let meta: Option<lpm_registry::types::BlockedSetPackageMeta> = if p.is_lpm {
             match lpm_common::PackageName::parse(&p.name) {
-                Ok(pkg_name) => client.get_package_metadata(&pkg_name).await.ok(),
+                Ok(pkg_name) => client
+                    .get_package_metadata(&pkg_name)
+                    .await
+                    .ok()
+                    .map(|full| lpm_registry::types::BlockedSetPackageMeta {
+                        time: full.time,
+                        versions: full
+                            .versions
+                            .into_iter()
+                            .map(|(k, v)| {
+                                (
+                                    k,
+                                    lpm_registry::types::BlockedSetVersionMeta {
+                                        behavioral_tags: v.behavioral_tags,
+                                    },
+                                )
+                            })
+                            .collect(),
+                    }),
                 Err(_) => None,
             }
         } else {
@@ -8150,7 +8172,7 @@ async fn build_blocked_set_metadata(
             // blocked-set metadata capture for custom-registry
             // packages doesn't fall through to public npm.
             let route = route_table.route_for_package(&p.name);
-            client.get_npm_metadata_routed(&p.name, route).await.ok()
+            client.get_npm_blocked_set_meta(&p.name, route).await
         };
         meta_ns_ref.fetch_add(
             meta_start.elapsed().as_nanos() as u64,

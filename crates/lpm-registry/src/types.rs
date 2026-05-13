@@ -994,6 +994,31 @@ where
     deserializer.deserialize_any(BundleVisitor)
 }
 
+// ─── Minimal types for install-time blocked-set capture ─────────────────────
+
+/// Package metadata deserialized from the registry cache using only the fields
+/// required for install-time blocked-set capture: `time` (for `published_at`)
+/// and `versions[v]._behavioralTags` (for the static tier fingerprint).
+///
+/// Using this instead of [`PackageMetadata`] on cache hits eliminates ~90% of
+/// the rmp_serde string allocations that arise from deserializing all version
+/// fields (deps, devDeps, readme, etc.) for packages that are already cached.
+#[derive(serde::Deserialize, Default)]
+pub struct BlockedSetPackageMeta {
+    #[serde(default)]
+    pub time: HashMap<String, String>,
+    #[serde(default)]
+    pub versions: HashMap<String, BlockedSetVersionMeta>,
+}
+
+/// Per-version slice of [`BlockedSetPackageMeta`] — only the behavioral-tags
+/// field. All other `VersionMetadata` fields are skipped during deserialization.
+#[derive(serde::Deserialize, Default)]
+pub struct BlockedSetVersionMeta {
+    #[serde(default, rename = "_behavioralTags")]
+    pub behavioral_tags: Option<BehavioralTags>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
