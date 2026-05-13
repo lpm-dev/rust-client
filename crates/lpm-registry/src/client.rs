@@ -319,6 +319,11 @@ pub struct RegistryClient {
     /// they keep using `self.token`. Step 4 layers on the posture-aware
     /// dispatch and the 401 → refresh → retry path.
     session: Option<Arc<SessionManager>>,
+    /// Precomputed ASCII-serialized origin of `base_url`.
+    /// Avoids re-parsing + re-allocating on every `is_configured_origin` call.
+    base_url_origin: String,
+    /// Precomputed ASCII-serialized origin of `npm_registry_url`.
+    npm_registry_url_origin: String,
 }
 
 // ============================================================================
@@ -738,6 +743,15 @@ fn contains_pem_certificate_block_inline(bytes: &[u8]) -> bool {
 }
 
 impl RegistryClient {
+    /// Compute the ASCII-serialized origin of a URL string.
+    /// Returns an empty string for malformed or opaque URLs so the
+    /// precomputed fields are always valid (but will never match).
+    fn url_origin(url: &str) -> String {
+        reqwest::Url::parse(url)
+            .map(|u| u.origin().ascii_serialization())
+            .unwrap_or_default()
+    }
+
     fn deserialize_cached_metadata(data: &[u8]) -> Option<PackageMetadata> {
         rmp_serde::from_slice(data)
             .or_else(|_| serde_json::from_slice(data))
@@ -908,6 +922,8 @@ impl RegistryClient {
             synchronous_cache_writes: false,
             allow_insecure: false,
             session: None,
+            base_url_origin: Self::url_origin(DEFAULT_REGISTRY_URL),
+            npm_registry_url_origin: Self::url_origin(NPM_REGISTRY_URL),
         }
     }
 
@@ -959,13 +975,7 @@ impl RegistryClient {
             return false;
         };
         let parsed_origin = parsed.origin().ascii_serialization();
-        [&self.base_url, &self.npm_registry_url]
-            .iter()
-            .any(|configured| {
-                reqwest::Url::parse(configured)
-                    .map(|u| u.origin().ascii_serialization() == parsed_origin)
-                    .unwrap_or(false)
-            })
+        parsed_origin == self.base_url_origin || parsed_origin == self.npm_registry_url_origin
     }
 
     /// Set the registry base URL.
@@ -974,6 +984,7 @@ impl RegistryClient {
     /// at request time unless `--insecure` is set via [`with_insecure`].
     pub fn with_base_url(mut self, url: impl Into<String>) -> Self {
         self.base_url = url.into();
+        self.base_url_origin = Self::url_origin(&self.base_url);
         self
     }
 
@@ -987,6 +998,7 @@ impl RegistryClient {
     /// setter visibility — promoting to `pub` is orthogonal.
     pub fn with_npm_registry_url(mut self, url: impl Into<String>) -> Self {
         self.npm_registry_url = url.into();
+        self.npm_registry_url_origin = Self::url_origin(&self.npm_registry_url);
         self
     }
 
@@ -1259,6 +1271,8 @@ impl RegistryClient {
             synchronous_cache_writes: self.synchronous_cache_writes,
             allow_insecure: self.allow_insecure,
             session: self.session.clone(),
+            base_url_origin: self.base_url_origin.clone(),
+            npm_registry_url_origin: self.npm_registry_url_origin.clone(),
         }
     }
 
