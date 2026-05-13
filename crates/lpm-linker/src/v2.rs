@@ -429,11 +429,33 @@ fn ensure_peer_context(targets: &mut [V2Target], store: &Store) -> Result<(), Lp
         }
         let object_dir = store.paths().object_dir(&v2t.source_sri)?;
         let pkg_json_path = object_dir.join("package.json");
-        if !pkg_json_path.exists() {
+
+        // Read once; treat I/O failure as "no peer deps" (equivalent to the
+        // old `exists()` check but saves one stat(2) syscall per package).
+        let content = match std::fs::read(&pkg_json_path) {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::debug!(
+                    "v2 linker: skipping peer derivation for {}@{}: {e}",
+                    v2t.target.name,
+                    v2t.target.version
+                );
+                continue;
+            }
+        };
+
+        // Trial 29: fast byte pre-scan to avoid serde_json parse (hundreds
+        // of allocs) for packages that declare no peer deps — the common
+        // case for most packages in any real install set.
+        // The needle "peerDependencies" matches both "peerDependencies"
+        // and "peerDependenciesMeta", so false negatives are impossible.
+        const PEER_KEY: &[u8] = b"peerDependencies";
+        if !content.windows(PEER_KEY.len()).any(|w| w == PEER_KEY) {
             continue;
         }
+
         let (peer_deps, peer_deps_meta) =
-            match lpm_workspace::read_peer_dependencies(&pkg_json_path) {
+            match lpm_workspace::parse_peer_dependencies(&content) {
                 Ok(p) => p,
                 Err(e) => {
                     tracing::debug!(

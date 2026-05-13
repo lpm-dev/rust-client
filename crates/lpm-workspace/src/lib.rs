@@ -1855,6 +1855,19 @@ pub type PeerDepsResult = (HashMap<String, String>, HashMap<String, PeerDependen
 /// strings for their keys or values. Saves ~30-40 allocs per package on warm
 /// installs where `ensure_peer_context` reads every store object's manifest.
 pub fn read_peer_dependencies(path: &Path) -> Result<PeerDepsResult, WorkspaceError> {
+    let content = std::fs::read(path)
+        .map_err(|e| WorkspaceError::Io(format!("failed to read {}: {e}", path.display())))?;
+    parse_peer_dependencies(&content)
+        .map_err(|e| WorkspaceError::Parse(format!("failed to parse {}: {e}", path.display())))
+}
+
+/// Parse peer-dependency info from already-read JSON bytes.
+///
+/// Callers that first byte-scan for `b"peerDependencies"` before calling
+/// this can skip the full `serde_json` parse for packages with no peer
+/// deps — the common case for the majority of packages in any install set.
+/// See `ensure_peer_context` in `lpm-linker` for the canonical call site.
+pub fn parse_peer_dependencies(content: &[u8]) -> Result<PeerDepsResult, WorkspaceError> {
     #[derive(serde::Deserialize, Default)]
     struct PeerDepsOnly {
         #[serde(default, rename = "peerDependencies")]
@@ -1862,13 +1875,8 @@ pub fn read_peer_dependencies(path: &Path) -> Result<PeerDepsResult, WorkspaceEr
         #[serde(default, rename = "peerDependenciesMeta")]
         peer_dependencies_meta: HashMap<String, PeerDependencyMeta>,
     }
-
-    let content = std::fs::read(path)
-        .map_err(|e| WorkspaceError::Io(format!("failed to read {}: {e}", path.display())))?;
-
-    let parsed: PeerDepsOnly = serde_json::from_slice(&content)
-        .map_err(|e| WorkspaceError::Parse(format!("failed to parse {}: {e}", path.display())))?;
-
+    let parsed: PeerDepsOnly = serde_json::from_slice(content)
+        .map_err(|e| WorkspaceError::Parse(format!("parse error: {e}")))?;
     Ok((parsed.peer_dependencies, parsed.peer_dependencies_meta))
 }
 
@@ -4431,5 +4439,80 @@ mod trusted_dependencies_tests {
     fn default_binding_has_no_capability_hash() {
         let b = TrustedDependencyBinding::default();
         assert_eq!(b.capability_hash, None);
+    }
+}
+
+// ── Trial 29: parse_peer_dependencies ────────────────────────────────────────
+
+#[cfg(test)]
+mod peer_deps_parse_tests {
+    use super::*;
+
+    #[test]
+    fn parse_returns_empty_for_no_peer_deps() {
+        let json = br#"{"name":"react","version":"18.3.0","dependencies":{"loose-envify":"^1.1.0"}}"#;
+        let (deps, meta) = parse_peer_dependencies(json).unwrap();
+        assert!(deps.is_empty(), "expected no peerDependencies");
+        assert!(meta.is_empty(), "expected no peerDependenciesMeta");
+    }
+
+    #[test]
+    fn parse_extracts_peer_deps_and_meta() {
+        let json = br#"{
+            "name": "react-dom",
+            "version": "18.3.0",
+            "peerDependencies": {
+                "react": "^18.3.0"
+            },
+            "peerDependenciesMeta": {
+                "react": { "optional": false }
+            }
+        }"#;
+        let (deps, meta) = parse_peer_dependencies(json).unwrap();
+        assert_eq!(deps.get("react").map(|s| s.as_str()), Some("^18.3.0"));
+        assert!(!meta.get("react").unwrap().optional);
+    }
+
+    #[test]
+    fn parse_marks_optional_peer() {
+        let json = br#"{
+            "name": "some-plugin",
+            "peerDependencies": {
+                "webpack": "^5.0.0"
+            },
+            "peerDependenciesMeta": {
+                "webpack": { "optional": true }
+            }
+        }"#;
+        let (deps, meta) = parse_peer_dependencies(json).unwrap();
+        assert_eq!(deps.get("webpack").map(|s| s.as_str()), Some("^5.0.0"));
+        assert!(meta.get("webpack").unwrap().optional);
+    }
+
+    /// Verify that the byte pre-scan needle "peerDependencies" correctly
+    /// matches packages with the key present — no false negatives.
+    #[test]
+    fn byte_scan_needle_is_present_when_peer_deps_exist() {
+        let json = br#"{"peerDependencies":{"react":"^18.0.0"}}"#;
+        const NEEDLE: &[u8] = b"peerDependencies";
+        assert!(json.windows(NEEDLE.len()).any(|w| w == NEEDLE));
+    }
+
+    /// Verify the byte pre-scan correctly shows absence when there are no
+    /// peer deps — no false negatives mean no unnecessary parses.
+    #[test]
+    fn byte_scan_needle_is_absent_when_no_peer_deps() {
+        let json = br#"{"name":"lodash","version":"4.17.21","dependencies":{}}"#;
+        const NEEDLE: &[u8] = b"peerDependencies";
+        assert!(!json.windows(NEEDLE.len()).any(|w| w == NEEDLE));
+    }
+
+    /// peerDependenciesMeta alone (without peerDependencies) still
+    /// triggers the scan — we don't miss any peer context.
+    #[test]
+    fn byte_scan_matches_peer_deps_meta_alone() {
+        let json = br#"{"peerDependenciesMeta":{"react":{"optional":true}}}"#;
+        const NEEDLE: &[u8] = b"peerDependencies";
+        assert!(json.windows(NEEDLE.len()).any(|w| w == NEEDLE));
     }
 }
