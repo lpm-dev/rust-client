@@ -422,7 +422,7 @@ fn ensure_peer_context(targets: &mut [V2Target], store: &Store) -> Result<(), Lp
         if !pkg_json_path.exists() {
             continue;
         }
-        let pkg_json = match lpm_workspace::read_package_json(&pkg_json_path) {
+        let (peer_deps, peer_deps_meta) = match lpm_workspace::read_peer_dependencies(&pkg_json_path) {
             Ok(p) => p,
             Err(e) => {
                 tracing::debug!(
@@ -432,13 +432,12 @@ fn ensure_peer_context(targets: &mut [V2Target], store: &Store) -> Result<(), Lp
                 continue;
             }
         };
-        if pkg_json.peer_dependencies.is_empty() {
+        if peer_deps.is_empty() {
             continue;
         }
         let mut derived: Vec<(String, String)> = Vec::new();
-        for peer_name in pkg_json.peer_dependencies.keys() {
-            let is_optional = pkg_json
-                .peer_dependencies_meta
+        for peer_name in peer_deps.keys() {
+            let is_optional = peer_deps_meta
                 .get(peer_name)
                 .map(|meta| meta.optional)
                 .unwrap_or(false);
