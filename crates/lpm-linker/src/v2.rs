@@ -57,6 +57,7 @@
 
 use std::collections::HashMap;
 use std::path::Path;
+use std::sync::Arc;
 
 use lpm_common::LpmError;
 use lpm_common::symlink::create_dir_symlink_or_junction;
@@ -467,7 +468,7 @@ fn ensure_peer_context(targets: &mut [V2Target], store: &Store) -> Result<(), Lp
 /// alongside `freshly_populated` so the caller doesn't have to
 /// re-derive it for `materialized` reporting.
 struct PopulatedEntry {
-    key: GraphKey,
+    key: Arc<GraphKey>,
     freshly_populated: bool,
 }
 
@@ -587,11 +588,11 @@ fn link_meta_platform(p: &PlatformTuple) -> LinkMetaPlatform {
 /// This lets lookups form the key with a single `format!` call (1 alloc)
 /// instead of cloning each field separately (2–3 allocs per lookup).
 pub struct KeyMap {
-    by_triple: HashMap<String, GraphKey>,
-    // Value is `(GraphKey, first_wrapper_id_seen)`. The wrapper_id component
-    // exists solely to surface helpful collision-error messages — it is
-    // stripped at lookup time so callers always receive `&GraphKey`.
-    by_coords: HashMap<String, (GraphKey, Option<String>)>,
+    by_triple: HashMap<String, Arc<GraphKey>>,
+    // Value is `(Arc<GraphKey>, first_wrapper_id_seen)`. The wrapper_id
+    // component exists solely to surface helpful collision-error messages —
+    // it is stripped at lookup time so callers always receive `&Arc<GraphKey>`.
+    by_coords: HashMap<String, (Arc<GraphKey>, Option<String>)>,
 }
 
 /// Form the `by_coords` key: `"name\x00version"`.
@@ -618,12 +619,12 @@ fn triple_key(name: &str, version: &str, wrapper_id: Option<&str>) -> String {
 }
 
 impl KeyMap {
-    fn get_for(&self, target: &LinkTarget) -> Option<&GraphKey> {
+    fn get_for(&self, target: &LinkTarget) -> Option<&Arc<GraphKey>> {
         self.by_triple
             .get(&triple_key(&target.name, &target.version, target.wrapper_id.as_deref()))
     }
 
-    fn get_by_coords(&self, name: &str, version: &str) -> Option<&GraphKey> {
+    fn get_by_coords(&self, name: &str, version: &str) -> Option<&Arc<GraphKey>> {
         self.by_coords.get(&coords_key(name, version)).map(|(gk, _)| gk)
     }
 }
@@ -633,12 +634,12 @@ fn derive_graph_keys(
     platform: &PlatformTuple,
     linker_tag: LinkerModeTag,
 ) -> Result<KeyMap, LpmError> {
-    let mut by_triple: HashMap<String, GraphKey> = HashMap::with_capacity(targets.len());
-    let mut by_coords: HashMap<String, (GraphKey, Option<String>)> =
+    let mut by_triple: HashMap<String, Arc<GraphKey>> = HashMap::with_capacity(targets.len());
+    let mut by_coords: HashMap<String, (Arc<GraphKey>, Option<String>)> =
         HashMap::with_capacity(targets.len());
 
     for v2t in targets {
-        let key = GraphKey::derive_raw(
+        let key = Arc::new(GraphKey::derive_raw(
             &v2t.target.name,
             &v2t.target.version,
             platform,
@@ -649,7 +650,7 @@ fn derive_graph_keys(
             v2t.target.root_link_names.as_deref(),
             v2t.target.wrapper_id.as_deref(),
             v2t.target.patch_fingerprint.as_deref(),
-        );
+        ));
 
         let tkey = triple_key(
             &v2t.target.name,

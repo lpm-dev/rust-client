@@ -2879,7 +2879,7 @@ mod tests {
         let key = lpm_store::v2::GraphKey::derive(&inputs);
         let entry = v2_store
             .populate_link_entry(LinkEntryRequest {
-                graph_key: key.clone(),
+                graph_key: std::sync::Arc::new(key),
                 source_sri: sri,
                 object_dir,
                 deps: vec![],

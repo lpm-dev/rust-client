@@ -699,6 +699,7 @@ mod tests {
         PlatformTuple,
     };
     use std::collections::HashMap;
+    use std::sync::Arc;
 
     fn synthetic_sri(seed: &[u8]) -> String {
         lpm_store::compute_sri_hash(seed)
@@ -723,19 +724,19 @@ mod tests {
         }
     }
 
-    fn key_for(name: &str, version: &str) -> GraphKey {
+    fn key_for(name: &str, version: &str) -> Arc<GraphKey> {
         let inputs = GraphKeyInputs::new(
             name,
             version,
             PlatformTuple::current(),
             LinkerModeTag::Isolated,
         );
-        GraphKey::derive(&inputs)
+        Arc::new(GraphKey::derive(&inputs))
     }
 
     /// Helper: synthesize a project whose `node_modules/<dep>` symlinks
     /// point at `links/<key>/node_modules/<dep>/` for each given key.
-    fn synthesize_project(project: &Path, store: &V2Store, keys: &[(&str, GraphKey)]) {
+    fn synthesize_project(project: &Path, store: &V2Store, keys: &[(&str, Arc<GraphKey>)]) {
         let nm = project.join("node_modules");
         std::fs::create_dir_all(&nm).unwrap();
         for (name, key) in keys {
