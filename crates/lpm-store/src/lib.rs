@@ -175,7 +175,10 @@ impl PackageStore {
     pub fn from_root(root: &LpmRoot) -> Self {
         let store_root = root.store_root();
         let v1_root = store_root.join(STORE_VERSION);
-        PackageStore { root: store_root, v1_root }
+        PackageStore {
+            root: store_root,
+            v1_root,
+        }
     }
 
     /// Create a store at a specific path (for testing).
@@ -3127,7 +3130,7 @@ mod tests {
                 source_sri: sri.clone(),
                 object_dir: store.paths().object_dir(&sri).unwrap(),
                 deps: vec![],
-                platform: f2_sample_meta_platform(),
+                platform: std::sync::Arc::new(f2_sample_meta_platform()),
             })
             .unwrap();
 
@@ -3235,11 +3238,11 @@ mod tests {
                 source_sri: format!("sha512-stub-{suffix}"),
                 object_path: format!("objects/sha512-stub-{suffix}"),
                 deps: vec![],
-                platform: LinkMetaPlatform {
+                platform: std::sync::Arc::new(LinkMetaPlatform {
                     os: "darwin".into(),
                     cpu: "arm64".into(),
                     libc: None,
-                },
+                }),
                 created_at: Utc::now(),
                 last_referenced_at: Utc::now(),
             };
@@ -3330,11 +3333,11 @@ mod tests {
             source_sri: "sha512-stub-tslib".into(),
             object_path: "objects/sha512-stub-tslib".into(),
             deps: vec![],
-            platform: LinkMetaPlatform {
+            platform: std::sync::Arc::new(LinkMetaPlatform {
                 os: "darwin".into(),
                 cpu: "arm64".into(),
                 libc: None,
-            },
+            }),
             created_at: Utc::now(),
             last_referenced_at: Utc::now(),
         };
@@ -3367,11 +3370,11 @@ mod tests {
                 target_name: "tslib".into(),
                 target_version: "2.0.0".into(),
             }],
-            platform: LinkMetaPlatform {
+            platform: std::sync::Arc::new(LinkMetaPlatform {
                 os: "darwin".into(),
                 cpu: "arm64".into(),
                 libc: None,
-            },
+            }),
             created_at: Utc::now(),
             last_referenced_at: Utc::now(),
         };
@@ -3440,11 +3443,11 @@ mod tests {
             source_sri: "sha512-stub-scoped".into(),
             object_path: "objects/sha512-stub-scoped".into(),
             deps: vec![],
-            platform: LinkMetaPlatform {
+            platform: std::sync::Arc::new(LinkMetaPlatform {
                 os: "darwin".into(),
                 cpu: "arm64".into(),
                 libc: None,
-            },
+            }),
             created_at: Utc::now(),
             last_referenced_at: Utc::now(),
         };
@@ -3525,7 +3528,7 @@ mod tests {
                     source_sri: sri.clone(),
                     object_dir: store.paths().object_dir(&sri).unwrap(),
                     deps: vec![],
-                    platform: f2_sample_meta_platform(),
+                    platform: std::sync::Arc::new(f2_sample_meta_platform()),
                 })
                 .unwrap();
         }

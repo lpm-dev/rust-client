@@ -807,11 +807,11 @@ mod tests {
             source_sri: "sha512-test-fake".to_string(),
             object_path: "objects/sha512-test-fake".to_string(),
             deps: vec![],
-            platform: lpm_store::v2::link_meta::LinkMetaPlatform {
+            platform: std::sync::Arc::new(lpm_store::v2::link_meta::LinkMetaPlatform {
                 os: "darwin".to_string(),
                 cpu: "arm64".to_string(),
                 libc: None,
-            },
+            }),
             created_at: chrono::Utc::now(),
             last_referenced_at: chrono::Utc::now(),
         };
@@ -889,11 +889,11 @@ mod tests {
             source_sri: "sha512-v2-test".to_string(),
             object_path: "objects/sha512-v2-test".to_string(),
             deps: vec![],
-            platform: lpm_store::v2::link_meta::LinkMetaPlatform {
+            platform: std::sync::Arc::new(lpm_store::v2::link_meta::LinkMetaPlatform {
                 os: "darwin".to_string(),
                 cpu: "arm64".to_string(),
                 libc: None,
-            },
+            }),
             created_at: chrono::Utc::now(),
             last_referenced_at: chrono::Utc::now(),
         };

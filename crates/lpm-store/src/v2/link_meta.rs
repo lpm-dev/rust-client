@@ -17,6 +17,7 @@
 //!   that resolves to this graph-key.
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
 use lpm_common::LpmError;
@@ -100,7 +101,7 @@ pub struct LinkMeta {
     /// Platform tuple frozen at materialization time. Lets prune detect
     /// "wrong-architecture leftovers" if a user's host changed (e.g.,
     /// re-imaged from arm64 → x64 with a shared `$HOME`).
-    pub platform: LinkMetaPlatform,
+    pub platform: Arc<LinkMetaPlatform>,
     /// First-write timestamp.
     pub created_at: DateTime<Utc>,
     /// Updated on every install that resolves to this graph-key.
@@ -119,7 +120,7 @@ impl LinkMeta {
         source_sri: impl Into<String>,
         object_path: impl Into<String>,
         deps: Vec<LinkMetaDep>,
-        platform: LinkMetaPlatform,
+        platform: Arc<LinkMetaPlatform>,
     ) -> Self {
         let now = Utc::now();
         Self {
@@ -334,11 +335,11 @@ mod tests {
                 target_name: "debug".into(),
                 target_version: "4.3.4".into(),
             }],
-            LinkMetaPlatform {
+            Arc::new(LinkMetaPlatform {
                 os: "darwin".into(),
                 cpu: "arm64".into(),
                 libc: None,
-            },
+            }),
         )
     }
 
@@ -447,11 +448,11 @@ mod tests {
             "sha512-x",
             "objects/sha512-x",
             vec![],
-            LinkMetaPlatform {
+            Arc::new(LinkMetaPlatform {
                 os: "darwin".into(),
                 cpu: "arm64".into(),
                 libc: None,
-            },
+            }),
         );
         // The recorded digest hex must match the GraphKey's own.
         assert_eq!(meta.graph_key_digest_hex, key.digest_hex());

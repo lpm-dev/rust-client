@@ -2883,11 +2883,11 @@ mod tests {
                 source_sri: sri,
                 object_dir,
                 deps: vec![],
-                platform: lpm_store::v2::LinkMetaPlatform {
+                platform: std::sync::Arc::new(lpm_store::v2::LinkMetaPlatform {
                     os: "darwin".into(),
                     cpu: "arm64".into(),
                     libc: None,
-                },
+                }),
             })
             .unwrap();
         let expected = entry.link_dir.join("node_modules").join("deeply-nested");

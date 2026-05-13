@@ -774,7 +774,7 @@ mod tests {
                 source_sri: used_sri.clone(),
                 object_dir: store.paths().object_dir(&used_sri).unwrap(),
                 deps: vec![],
-                platform: sample_meta_platform(),
+                platform: Arc::new(sample_meta_platform()),
             })
             .unwrap();
         store
@@ -783,7 +783,7 @@ mod tests {
                 source_sri: orphan_sri.clone(),
                 object_dir: store.paths().object_dir(&orphan_sri).unwrap(),
                 deps: vec![],
-                platform: sample_meta_platform(),
+                platform: Arc::new(sample_meta_platform()),
             })
             .unwrap();
 
@@ -843,7 +843,7 @@ mod tests {
                 source_sri: grand_sri.clone(),
                 object_dir: store.paths().object_dir(&grand_sri).unwrap(),
                 deps: vec![],
-                platform: sample_meta_platform(),
+                platform: Arc::new(sample_meta_platform()),
             })
             .unwrap();
         store
@@ -855,7 +855,7 @@ mod tests {
                     local: "grand".into(),
                     target: grand_key.clone(),
                 }],
-                platform: sample_meta_platform(),
+                platform: Arc::new(sample_meta_platform()),
             })
             .unwrap();
         store
@@ -867,7 +867,7 @@ mod tests {
                     local: "child".into(),
                     target: child_key.clone(),
                 }],
-                platform: sample_meta_platform(),
+                platform: Arc::new(sample_meta_platform()),
             })
             .unwrap();
 
@@ -903,7 +903,7 @@ mod tests {
                 source_sri: sri.clone(),
                 object_dir: store.paths().object_dir(&sri).unwrap(),
                 deps: vec![],
-                platform: sample_meta_platform(),
+                platform: Arc::new(sample_meta_platform()),
             })
             .unwrap();
 
@@ -958,7 +958,7 @@ mod tests {
                 source_sri: sri.clone(),
                 object_dir: store.paths().object_dir(&sri).unwrap(),
                 deps: vec![],
-                platform: sample_meta_platform(),
+                platform: Arc::new(sample_meta_platform()),
             })
             .unwrap();
 
