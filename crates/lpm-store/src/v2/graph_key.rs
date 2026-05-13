@@ -46,7 +46,7 @@
 //! the full 256-bit digest still uniquely identifies the inputs in the
 //! sidecar metadata (see [`crate::v2::link_meta::LinkMeta::graph_key_digest_hex`]).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 
 use crate::v2::platform::PlatformTuple;
 
@@ -345,6 +345,81 @@ impl GraphKey {
         }
     }
 
+    /// Same semantics as [`Self::derive`] but takes raw component types
+    /// directly — bypassing the [`GraphKeyInputs`] / [`DepEdge`] /
+    /// [`PeerEntry`] intermediate structs and their string-clone overhead.
+    ///
+    /// Produces a byte-identical BLAKE3 digest to [`Self::derive`] for
+    /// the same logical inputs (invariant enforced by the
+    /// `derive_raw_matches_derive` unit test). Prefer this over
+    /// `derive` in hot paths that already hold `&LinkTarget` data.
+    ///
+    /// `raw_deps` — `(local, resolved_version)` pairs from
+    ///   `LinkTarget::dependencies`. `aliases` maps each `local` to
+    ///   its canonical target name (identity if absent — no alias).
+    /// `peers`    — `(canonical_name, resolved_version)` pairs from
+    ///   `LinkTarget::peers`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn derive_raw(
+        name: &str,
+        version: &str,
+        platform: &PlatformTuple,
+        linker_tag: LinkerModeTag,
+        raw_deps: &[(String, String)],
+        aliases: &HashMap<String, String>,
+        peers: &[(String, String)],
+        root_link_names: Option<&[String]>,
+        wrapper_id: Option<&str>,
+        patch_fingerprint: Option<&str>,
+    ) -> Self {
+        debug_assert!(
+            !matches!(linker_tag, LinkerModeTag::Hoisted) || peers.is_empty(),
+            "GraphKey::derive_raw: hoisted graph keys must not carry peers \
+             (collapsing silently in release). Got {} peers for {name}@{version}.",
+            peers.len(),
+        );
+
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(Self::SCHEMA);
+        hasher.update(b"\0");
+
+        write_field(&mut hasher, b"name", name.as_bytes());
+        write_field(&mut hasher, b"version", version.as_bytes());
+
+        let platform_str = format_platform(platform);
+        write_field(&mut hasher, b"platform", platform_str.as_bytes());
+        write_field(&mut hasher, b"linker", linker_tag.as_str().as_bytes());
+
+        let effective_peers: &[(String, String)] = match linker_tag {
+            LinkerModeTag::Isolated => peers,
+            LinkerModeTag::Hoisted => &[],
+        };
+        let peers_str = format_peers_raw(effective_peers);
+        write_field(&mut hasher, b"peers", peers_str.as_bytes());
+
+        let edges_str = format_deps_raw(raw_deps, aliases);
+        write_field(&mut hasher, b"edges", edges_str.as_bytes());
+
+        let aliases_str = format_aliases_raw(aliases);
+        write_field(&mut hasher, b"aliases", aliases_str.as_bytes());
+
+        let root_names_str = format_root_link_names(root_link_names);
+        write_field(&mut hasher, b"root_link_names", root_names_str.as_bytes());
+
+        let wrapper_str = wrapper_id.unwrap_or("");
+        write_field(&mut hasher, b"wrapper_id", wrapper_str.as_bytes());
+
+        let patch_str = patch_fingerprint.unwrap_or("");
+        write_field(&mut hasher, b"patch_fingerprint", patch_str.as_bytes());
+
+        let digest = hasher.finalize();
+        Self {
+            name: name.to_owned(),
+            version: version.to_owned(),
+            digest: *digest.as_bytes(),
+        }
+    }
+
     /// Reconstruct a `GraphKey` from a previously-recorded digest. Used
     /// when reading a sidecar [`crate::v2::link_meta::LinkMeta`] back
     /// off disk: callers don't always have the original inputs but
@@ -462,6 +537,54 @@ fn format_root_link_names(names: Option<&[String]>) -> String {
             sorted.into_iter().cloned().collect::<Vec<_>>().join(",")
         }
     }
+}
+
+// ── Raw-input format helpers ─────────────────────────────────────────────────
+// Parallel to format_deps / format_peers / format_aliases but accept the
+// concrete types from LinkTarget directly so derive_raw can skip the
+// DepEdge / PeerEntry / BTreeMap intermediate allocations.
+
+fn format_deps_raw(deps: &[(String, String)], aliases: &HashMap<String, String>) -> String {
+    if deps.is_empty() {
+        return String::new();
+    }
+    let mut sorted: Vec<String> = deps
+        .iter()
+        .map(|(local, ver)| {
+            let canonical = aliases.get(local).map(|s| s.as_str()).unwrap_or(local.as_str());
+            format!("{local}=>{canonical}@{ver}")
+        })
+        .collect();
+    sorted.sort();
+    sorted.join(",")
+}
+
+fn format_peers_raw(peers: &[(String, String)]) -> String {
+    if peers.is_empty() {
+        return String::new();
+    }
+    let mut sorted: Vec<String> = peers
+        .iter()
+        .map(|(name, ver)| format!("{name}@{ver}"))
+        .collect();
+    sorted.sort();
+    sorted.join(",")
+}
+
+fn format_aliases_raw(aliases: &HashMap<String, String>) -> String {
+    if aliases.is_empty() {
+        return String::new();
+    }
+    let mut entries: Vec<(&str, &str)> = aliases
+        .iter()
+        .map(|(k, v)| (k.as_str(), v.as_str()))
+        .collect();
+    entries.sort_by_key(|(k, _)| *k);
+    entries
+        .iter()
+        .map(|(local, canonical)| format!("{local}=>{canonical}"))
+        .collect::<Vec<_>>()
+        .join(",")
 }
 
 #[cfg(test)]
@@ -784,6 +907,85 @@ mod tests {
             GraphKey::derive(&no_peers),
             GraphKey::derive(&one_peer),
             "empty-peer-set must differ from non-empty-peer-set"
+        );
+    }
+
+    // ── Parity: derive_raw must produce byte-identical keys to derive ─────────
+
+    #[test]
+    fn derive_raw_matches_derive_no_extras() {
+        // Minimal inputs (no deps, no peers, no aliases).
+        let inputs = base_inputs();
+        let via_struct = GraphKey::derive(&inputs);
+        let via_raw = GraphKey::derive_raw(
+            "react",
+            "18.3.0",
+            &macos_arm64(),
+            LinkerModeTag::Isolated,
+            &[],
+            &HashMap::new(),
+            &[],
+            None,
+            None,
+            None,
+        );
+        assert_eq!(via_struct, via_raw, "derive_raw must match derive for zero-extra inputs");
+    }
+
+    #[test]
+    fn derive_raw_matches_derive_with_deps_and_peers() {
+        // Full inputs: deps (including aliased), peers, root_link_names,
+        // wrapper_id, patch_fingerprint.
+        let aliases: HashMap<String, String> =
+            [("strip-ansi-cjs".to_owned(), "strip-ansi".to_owned())].into_iter().collect();
+        let platform = macos_arm64();
+
+        // Build via GraphKeyInputs (existing API).
+        let inputs = GraphKeyInputs::new("foo", "2.0.0", platform.clone(), LinkerModeTag::Isolated)
+            .with_deps([
+                DepEdge {
+                    local: "debug".into(),
+                    target_name: "debug".into(),
+                    target_version: "4.3.4".into(),
+                },
+                DepEdge {
+                    local: "strip-ansi-cjs".into(),
+                    target_name: "strip-ansi".into(),
+                    target_version: "6.0.1".into(),
+                },
+            ])
+            .with_aliases([("strip-ansi-cjs".to_owned(), "strip-ansi".to_owned())])
+            .with_peers([PeerEntry {
+                name: "react".into(),
+                version: "18.3.0".into(),
+            }])
+            .with_root_link_names(Some(vec!["foo".into()]))
+            .with_wrapper_id(Some("tarball+https://example.com/foo.tgz".into()))
+            .with_patch_fingerprint(Some("p-abc123".into()));
+        let via_struct = GraphKey::derive(&inputs);
+
+        // Build via derive_raw (optimised path).
+        let raw_deps = vec![
+            ("debug".to_owned(), "4.3.4".to_owned()),
+            ("strip-ansi-cjs".to_owned(), "6.0.1".to_owned()),
+        ];
+        let peers = vec![("react".to_owned(), "18.3.0".to_owned())];
+        let root_names = vec!["foo".to_owned()];
+        let via_raw = GraphKey::derive_raw(
+            "foo",
+            "2.0.0",
+            &platform,
+            LinkerModeTag::Isolated,
+            &raw_deps,
+            &aliases,
+            &peers,
+            Some(&root_names),
+            Some("tarball+https://example.com/foo.tgz"),
+            Some("p-abc123"),
+        );
+        assert_eq!(
+            via_struct, via_raw,
+            "derive_raw must produce identical key to derive for full inputs"
         );
     }
 }
