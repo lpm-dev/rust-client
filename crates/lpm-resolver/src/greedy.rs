@@ -67,10 +67,10 @@ use crate::provider::{
 };
 use crate::ranges::NpmRange;
 use crate::resolve::{ResolveError, ResolveResult, ResolvedPackage, StageTiming};
+use ahash::{AHashMap, AHashSet};
 #[cfg(test)]
 use lpm_registry::RouteMode;
 use lpm_registry::{RegistryClient, RouteTable, UpstreamRoute};
-use ahash::{AHashMap, AHashSet};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;

@@ -37,7 +37,7 @@ use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use dashmap::DashMap;
 use lpm_registry::{NpmrcConfig, RegistryClient, RouteMode, RouteTable};
 use lpm_resolver::{
-    CachedPackageInfo, CanonicalKey, NpmVersion, NotifyMap, OverrideSet, SharedCache,
+    CachedPackageInfo, CanonicalKey, NotifyMap, NpmVersion, OverrideSet, SharedCache,
     StreamingBfsMetrics, WalkerDone, resolve_with_shared_cache,
 };
 use std::collections::HashMap;
@@ -69,7 +69,10 @@ fn make_graph(n: usize) -> (SharedCache, HashMap<String, String>) {
         let canonical = CanonicalKey::Npm { name };
 
         // Versions descending: N_VERSIONS.0.0 → 1.0.0 (resolver picks highest-first)
-        let versions: Vec<NpmVersion> = (1..=N_VERSIONS).rev().map(|m| NpmVersion::new(m, 0, 0)).collect();
+        let versions: Vec<NpmVersion> = (1..=N_VERSIONS)
+            .rev()
+            .map(|m| NpmVersion::new(m, 0, 0))
+            .collect();
 
         let top = format!("{N_VERSIONS}.0.0");
 

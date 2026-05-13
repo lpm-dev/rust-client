@@ -5018,30 +5018,28 @@ async fn run_with_options_under_store_lock(
     } else {
         None
     };
-    let v2_target_by_key: std::collections::HashMap<
-        String,
-        lpm_linker::v2::V2Target,
-    > = if v2_event_driven {
-        packages
-            .iter()
-            .zip(link_targets.iter())
-            .filter_map(|(p, lt)| {
-                if !matches!(lt.materialization, lpm_linker::Materialization::CasBacked) {
-                    return None;
-                }
-                let sri = p.integrity.as_deref()?.to_string();
-                Some((
-                    install_pkg_key(p),
-                    lpm_linker::v2::V2Target {
-                        target: lt.clone(),
-                        source_sri: sri,
-                    },
-                ))
-            })
-            .collect()
-    } else {
-        std::collections::HashMap::new()
-    };
+    let v2_target_by_key: std::collections::HashMap<String, lpm_linker::v2::V2Target> =
+        if v2_event_driven {
+            packages
+                .iter()
+                .zip(link_targets.iter())
+                .filter_map(|(p, lt)| {
+                    if !matches!(lt.materialization, lpm_linker::Materialization::CasBacked) {
+                        return None;
+                    }
+                    let sri = p.integrity.as_deref()?.to_string();
+                    Some((
+                        install_pkg_key(p),
+                        lpm_linker::v2::V2Target {
+                            target: lt.clone(),
+                            source_sri: sri,
+                        },
+                    ))
+                })
+                .collect()
+        } else {
+            std::collections::HashMap::new()
+        };
 
     // Per-package v2 link handles populated by both the cache-hit
     // short-circuits below and the fetch tasks further down. Drained
@@ -6139,8 +6137,7 @@ async fn run_with_options_under_store_lock(
             .iter()
             .filter_map(|p| {
                 p.integrity.clone().map(|sri| {
-                    let mut k =
-                        String::with_capacity(p.name.len() + 1 + p.version.len());
+                    let mut k = String::with_capacity(p.name.len() + 1 + p.version.len());
                     k.push_str(&p.name);
                     k.push('\x00');
                     k.push_str(&p.version);
@@ -6155,22 +6152,18 @@ async fn run_with_options_under_store_lock(
             match t.materialization {
                 lpm_linker::Materialization::CasBacked => {
                     let lookup_key = {
-                        let mut k =
-                            String::with_capacity(t.name.len() + 1 + t.version.len());
+                        let mut k = String::with_capacity(t.name.len() + 1 + t.version.len());
                         k.push_str(&t.name);
                         k.push('\x00');
                         k.push_str(&t.version);
                         k
                     };
-                    let sri = sri_by_pkg
-                        .get(&lookup_key)
-                        .cloned()
-                        .ok_or_else(|| {
-                            LpmError::Registry(format!(
-                                "v2 install: missing source SRI for {}@{}",
-                                t.name, t.version
-                            ))
-                        })?;
+                    let sri = sri_by_pkg.get(&lookup_key).cloned().ok_or_else(|| {
+                        LpmError::Registry(format!(
+                            "v2 install: missing source SRI for {}@{}",
+                            t.name, t.version
+                        ))
+                    })?;
                     v2_targets.push(lpm_linker::v2::V2Target {
                         target: t.clone(),
                         source_sri: sri,
@@ -6917,9 +6910,8 @@ async fn run_with_options_under_store_lock(
                 // fresh_urls will be empty for those warm installs.
                 let src = lp.source.as_deref().unwrap_or("");
                 let lp_key = {
-                    let mut k = String::with_capacity(
-                        lp.name.len() + 1 + lp.version.len() + 1 + src.len(),
-                    );
+                    let mut k =
+                        String::with_capacity(lp.name.len() + 1 + lp.version.len() + 1 + src.len());
                     k.push_str(&lp.name);
                     k.push('\x00');
                     k.push_str(&lp.version);
@@ -8536,7 +8528,9 @@ fn try_lockfile_fast_path(
                 })
                 .collect();
 
-            let root_link_names = root_link_map.get(&root_link_key(&lp.name, &lp.version)).cloned();
+            let root_link_names = root_link_map
+                .get(&root_link_key(&lp.name, &lp.version))
+                .cloned();
 
             InstallPackage {
                 name: lp.name.clone(),
