@@ -584,22 +584,49 @@ fn link_meta_platform(p: &PlatformTuple) -> LinkMetaPlatform {
 ///   edges, which carry only `(name, version)` today. Multi-source
 ///   collisions are detected at construction time and surface a hard
 ///   error before any link entry materializes.
+///
+/// Keys are stored as a single `String` using a `\x00`-separated
+/// compound key: `"name\x00version"` for `by_coords` and
+/// `"name\x00version\x00wrapper_id"` for `by_triple`. Package names
+/// and versions never contain null bytes, so there is no collision risk.
+/// This lets lookups form the key with a single `format!` call (1 alloc)
+/// instead of cloning each field separately (2–3 allocs per lookup).
 pub struct KeyMap {
-    by_triple: HashMap<(String, String, Option<String>), GraphKey>,
-    by_coords: HashMap<(String, String), GraphKey>,
+    by_triple: HashMap<String, GraphKey>,
+    by_coords: HashMap<String, GraphKey>,
+}
+
+/// Form the `by_coords` key: `"name\x00version"`.
+#[inline]
+fn coords_key(name: &str, version: &str) -> String {
+    let mut key = String::with_capacity(name.len() + 1 + version.len());
+    key.push_str(name);
+    key.push('\x00');
+    key.push_str(version);
+    key
+}
+
+/// Form the `by_triple` key: `"name\x00version\x00wrapper_id"`.
+#[inline]
+fn triple_key(name: &str, version: &str, wrapper_id: Option<&str>) -> String {
+    let wid = wrapper_id.unwrap_or("");
+    let mut key = String::with_capacity(name.len() + 1 + version.len() + 1 + wid.len());
+    key.push_str(name);
+    key.push('\x00');
+    key.push_str(version);
+    key.push('\x00');
+    key.push_str(wid);
+    key
 }
 
 impl KeyMap {
     fn get_for(&self, target: &LinkTarget) -> Option<&GraphKey> {
-        self.by_triple.get(&(
-            target.name.clone(),
-            target.version.clone(),
-            target.wrapper_id.clone(),
-        ))
+        self.by_triple
+            .get(&triple_key(&target.name, &target.version, target.wrapper_id.as_deref()))
     }
 
     fn get_by_coords(&self, name: &str, version: &str) -> Option<&GraphKey> {
-        self.by_coords.get(&(name.to_string(), version.to_string()))
+        self.by_coords.get(&coords_key(name, version))
     }
 }
 
@@ -608,32 +635,33 @@ fn derive_graph_keys(
     platform: &PlatformTuple,
     linker_tag: LinkerModeTag,
 ) -> Result<KeyMap, LpmError> {
-    let mut by_triple: HashMap<(String, String, Option<String>), GraphKey> =
-        HashMap::with_capacity(targets.len());
-    let mut by_coords: HashMap<(String, String), GraphKey> = HashMap::with_capacity(targets.len());
-    let mut coords_seen: HashMap<(String, String), Option<String>> =
-        HashMap::with_capacity(targets.len());
+    let mut by_triple: HashMap<String, GraphKey> = HashMap::with_capacity(targets.len());
+    let mut by_coords: HashMap<String, GraphKey> = HashMap::with_capacity(targets.len());
+    // Tracks the first wrapper_id seen for each (name, version) pair so we
+    // can detect and reject multi-source collisions with a helpful error.
+    let mut coords_seen: HashMap<String, Option<String>> = HashMap::with_capacity(targets.len());
 
     for v2t in targets {
         let inputs = build_inputs(&v2t.target, platform, linker_tag);
         let key = GraphKey::derive(&inputs);
-        let triple = (
-            v2t.target.name.clone(),
-            v2t.target.version.clone(),
-            v2t.target.wrapper_id.clone(),
+
+        let tkey = triple_key(
+            &v2t.target.name,
+            &v2t.target.version,
+            v2t.target.wrapper_id.as_deref(),
         );
-        if by_triple.insert(triple.clone(), key.clone()).is_some() {
+        if by_triple.insert(tkey, key.clone()).is_some() {
             return Err(LpmError::Store(format!(
                 "v2 linker: duplicate LinkTarget for {}@{} wrapper_id={:?}",
                 v2t.target.name, v2t.target.version, v2t.target.wrapper_id
             )));
         }
 
-        let coords = (v2t.target.name.clone(), v2t.target.version.clone());
-        match coords_seen.entry(coords.clone()) {
+        let ckey = coords_key(&v2t.target.name, &v2t.target.version);
+        match coords_seen.entry(ckey.clone()) {
             std::collections::hash_map::Entry::Vacant(e) => {
                 e.insert(v2t.target.wrapper_id.clone());
-                by_coords.insert(coords, key);
+                by_coords.insert(ckey, key);
             }
             std::collections::hash_map::Entry::Occupied(existing) => {
                 // Multi-source-same-coords. Dep edges carry only
