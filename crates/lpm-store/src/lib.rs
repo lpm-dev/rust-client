@@ -1278,7 +1278,17 @@ impl V2BaselineIndex {
                     continue;
                 }
             };
-            let package_dir = link_dir.join("node_modules").join(&meta.name);
+            // Trial 32: destructure meta to move name/version/source_sri
+            // directly into the HashMap key + baseline without cloning.
+            let crate::v2::link_meta::LinkMeta {
+                name: meta_name,
+                version: meta_version,
+                source_sri: meta_sri,
+                deps: meta_deps,
+                ..
+            } = meta;
+
+            let package_dir = link_dir.join("node_modules").join(&meta_name);
             if !package_dir.exists() {
                 tracing::debug!(
                     "v2 project-scoped index: skipping {}: package dir missing",
@@ -1286,11 +1296,10 @@ impl V2BaselineIndex {
                 );
                 continue;
             }
-            let pristine_dir = match store_v2.paths().object_dir(&meta.source_sri) {
+            let pristine_dir = match store_v2.paths().object_dir(&meta_sri) {
                 Ok(p) if p.exists() => p,
                 _ => package_dir.clone(),
             };
-            let key = (meta.name.clone(), meta.version.clone());
             // Project-scoped: in a single project a (name, version) is
             // resolved by exactly one link entry, except the
             // multi-source-same-coords corner case (two distinct
@@ -1299,23 +1308,39 @@ impl V2BaselineIndex {
             // walk inserts before the BFS, and BFS itself is FIFO, so
             // the chosen entry is whichever is closer to the project
             // root in the symlink graph.
-            by_coords.entry(key).or_insert(InstalledPackageBaseline {
-                package_dir,
-                pristine_dir,
-                integrity: meta.source_sri.clone(),
-                layout: PackageBaselineLayout::V2,
-            });
-            for dep in &meta.deps {
+            by_coords
+                .entry((meta_name, meta_version))
+                .or_insert(InstalledPackageBaseline {
+                    package_dir,
+                    pristine_dir,
+                    integrity: meta_sri,
+                    layout: PackageBaselineLayout::V2,
+                });
+            for dep in &meta_deps {
                 // `LinkMeta.deps` carries the full 64-hex digest; the
                 // on-disk dir name uses the first 16 chars. See
                 // `crate::v2::GraphKey::dir_name` for the format.
                 if dep.target_graph_key.len() < 16 {
                     continue; // malformed sidecar
                 }
-                let safe_name = dep.target_name.replace(['/', '\\'], "+");
                 let short_hex = &dep.target_graph_key[..16];
-                let dep_dir_name = format!("{}@{}+{}", safe_name, dep.target_version, short_hex);
-                let dep_link_dir = links_root.join(dep_dir_name);
+                // Trial 32: avoid allocating an intermediate safe_name
+                // String for unscoped packages (the majority) by using
+                // Cow<str> — borrows as-is when no replacement is needed.
+                let safe_name: std::borrow::Cow<str> =
+                    if dep.target_name.contains(['/', '\\']) {
+                        std::borrow::Cow::Owned(dep.target_name.replace(['/', '\\'], "+"))
+                    } else {
+                        std::borrow::Cow::Borrowed(dep.target_name.as_str())
+                    };
+                let mut dep_dir_name =
+                    String::with_capacity(safe_name.len() + 1 + dep.target_version.len() + 17);
+                dep_dir_name.push_str(&safe_name);
+                dep_dir_name.push('@');
+                dep_dir_name.push_str(&dep.target_version);
+                dep_dir_name.push('+');
+                dep_dir_name.push_str(short_hex);
+                let dep_link_dir = links_root.join(&dep_dir_name);
                 if visited.insert(dep_link_dir.clone()) {
                     to_visit.push_back(dep_link_dir);
                 }
