@@ -63,7 +63,7 @@ async fn with_delayed_package(
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, ResponseTemplate};
 
-    let tarball_url = format!("{}/tarballs/{name}-{version}.tgz", mock.url());
+    let tarball_url = format!("{}/tarballs/{name}/-/{name}-{version}.tgz", mock.url());
     let integrity = compute_integrity(&tarball_bytes);
     let metadata = serde_json::json!({
         "name": name,
@@ -90,7 +90,7 @@ async fn with_delayed_package(
         .mount(mock.server())
         .await;
     Mock::given(method("GET"))
-        .and(path(format!("/tarballs/{name}-{version}.tgz")))
+        .and(path(format!("/tarballs/{name}/-/{name}-{version}.tgz")))
         .respond_with(
             ResponseTemplate::new(200)
                 .set_body_bytes(tarball_bytes)
@@ -1175,7 +1175,7 @@ async fn install_retries_tarball_5xx_until_success() {
     let mock = MockRegistry::start().await;
     let tarball = make_tarball("flaky-pkg", "1.0.0");
     let integrity = compute_integrity(&tarball);
-    let tarball_url = format!("{}/tarballs/flaky-pkg-1.0.0.tgz", mock.url());
+    let tarball_url = format!("{}/tarballs/flaky-pkg/-/flaky-pkg-1.0.0.tgz", mock.url());
     let metadata = serde_json::json!({
         "name": "flaky-pkg",
         "dist-tags": { "latest": "1.0.0" },
@@ -1220,7 +1220,7 @@ async fn install_retries_tarball_5xx_until_success() {
     }
     let count = Arc::new(AtomicUsize::new(0));
     Mock::given(method("GET"))
-        .and(path("/tarballs/flaky-pkg-1.0.0.tgz"))
+        .and(path("/tarballs/flaky-pkg/-/flaky-pkg-1.0.0.tgz"))
         .respond_with(FlakyTarball {
             count: Arc::clone(&count),
             body: tarball.clone(),
@@ -1304,7 +1304,7 @@ async fn tarball_503_exhausts_retries_fails_with_http_status() {
     let mock = MockRegistry::start().await;
     let tarball = make_tarball("doomed-pkg", "1.0.0");
     let integrity = compute_integrity(&tarball);
-    let tarball_url = format!("{}/tarballs/doomed-pkg-1.0.0.tgz", mock.url());
+    let tarball_url = format!("{}/tarballs/doomed-pkg/-/doomed-pkg-1.0.0.tgz", mock.url());
     let metadata = serde_json::json!({
         "name": "doomed-pkg",
         "dist-tags": { "latest": "1.0.0" },
@@ -1342,7 +1342,7 @@ async fn tarball_503_exhausts_retries_fails_with_http_status() {
     }
     let attempts = Arc::new(AtomicUsize::new(0));
     Mock::given(method("GET"))
-        .and(path("/tarballs/doomed-pkg-1.0.0.tgz"))
+        .and(path("/tarballs/doomed-pkg/-/doomed-pkg-1.0.0.tgz"))
         .respond_with(Always503 {
             count: Arc::clone(&attempts),
         })
@@ -1489,7 +1489,10 @@ async fn tarball_connection_dropped_mid_body_fails_or_retries() {
     );
 
     let integrity = compute_integrity(&full_tarball);
-    let tarball_url = format!("{}/tarballs/truncated-pkg-1.0.0.tgz", mock.url());
+    let tarball_url = format!(
+        "{}/tarballs/truncated-pkg/-/truncated-pkg-1.0.0.tgz",
+        mock.url()
+    );
     let metadata = serde_json::json!({
         "name": "truncated-pkg",
         "dist-tags": { "latest": "1.0.0" },
@@ -1537,7 +1540,7 @@ async fn tarball_connection_dropped_mid_body_fails_or_retries() {
 
     let attempts = Arc::new(AtomicUsize::new(0));
     Mock::given(method("GET"))
-        .and(path("/tarballs/truncated-pkg-1.0.0.tgz"))
+        .and(path("/tarballs/truncated-pkg/-/truncated-pkg-1.0.0.tgz"))
         .respond_with(TruncatedTarball {
             count: Arc::clone(&attempts),
             half_body: half_tarball,
@@ -1771,7 +1774,7 @@ async fn install_with_stale_install_hash_re_resolves_and_refetches() {
     let mock = MockRegistry::start().await;
     let tarball = make_tarball("stale-pkg", "1.0.0");
     let integrity = compute_integrity(&tarball);
-    let tarball_url = format!("{}/tarballs/stale-pkg-1.0.0.tgz", mock.url());
+    let tarball_url = format!("{}/tarballs/stale-pkg/-/stale-pkg-1.0.0.tgz", mock.url());
     let metadata = serde_json::json!({
         "name": "stale-pkg",
         "dist-tags": { "latest": "1.0.0" },
@@ -1811,7 +1814,7 @@ async fn install_with_stale_install_hash_re_resolves_and_refetches() {
     }
     let count = Arc::new(AtomicUsize::new(0));
     Mock::given(method("GET"))
-        .and(path("/tarballs/stale-pkg-1.0.0.tgz"))
+        .and(path("/tarballs/stale-pkg/-/stale-pkg-1.0.0.tgz"))
         .respond_with(CountingTarball {
             count: Arc::clone(&count),
             body: tarball,
@@ -2401,6 +2404,550 @@ async fn lpm_command_with_orphan_pending_tx_emits_recovery_banner() {
     );
 }
 
+// ─── Category G — Additional concurrency/recovery hardening (2026-05-14) ─
+
+/// **G.4 — `lpm cache clean` racing a slow in-flight install does not corrupt the install.**
+///
+/// **Architectural facts** (verified against source 2026-05-14):
+///
+/// - `lpm cache clean` removes ONLY `~/.lpm/cache/{metadata,tasks,dlx}`
+///   (see [crates/lpm-cli/src/commands/cache.rs:64](../../../crates/lpm-cli/src/commands/cache.rs#L64)).
+///   It NEVER touches `~/.lpm/store/`.
+/// - Tarball staging happens entirely inside `~/.lpm/store/` (temp dir
+///   → atomic-rename), so the "in-flight tarball bytes" phrasing from
+///   the original plan annotation is misleading: cache clean cannot
+///   delete those bytes by construction.
+/// - The real race is **metadata-cache reads/writes** during the
+///   install: the registry client at
+///   [crates/lpm-registry/src/client.rs:907-913](../../../crates/lpm-registry/src/client.rs#L907)
+///   reads/writes `~/.lpm/cache/metadata/` during resolution, and
+///   that's the directory `cache clean` wipes. The cache is documented
+///   as best-effort (graceful degradation to memory-only on I/O
+///   failure) — so the contract is: even when cache clean wipes the
+///   metadata directory mid-install, the install must still complete.
+/// - `cache_clean_lock` and `store_lock` are different paths
+///   ([crates/lpm-common/src/paths.rs:170, 139](../../../crates/lpm-common/src/paths.rs#L139)),
+///   so the two operations DON'T serialize against each other. They
+///   genuinely run concurrently.
+///
+/// Pinned contract:
+///
+/// - Both `lpm install` AND `lpm cache clean` exit non-zero-free.
+/// - The install actually exercised the slow-tarball window (elapsed
+///   >= the configured delay).
+/// - Cache clean fired DURING the install window (its end-time falls
+///   within the install's wall-clock range), proving the race window
+///   was real and not a sequential run.
+/// - Post-state: the `~/.lpm/store/v1/<pkg>@<ver>/` entry exists with
+///   `package.json` AND `.integrity` (the store-side artifacts cache
+///   clean cannot touch).
+/// - Post-state: `node_modules/<pkg>/` linked, `package.json` carries
+///   the dep, `.lpm/install-hash` written — the install's user-visible
+///   outputs all materialize.
+/// - No panic in either subprocess.
+///
+/// This catches a regression where cache clean ever deletes a path
+/// the install pipeline depends on AND where the install pipeline
+/// loses its "graceful degradation on cache failure" stance and
+/// hard-fails on a missing metadata directory mid-stream.
+#[tokio::test]
+async fn cache_clean_during_slow_tarball_install_does_not_corrupt_install() {
+    let mock = MockRegistry::start().await;
+    let tarball = make_tarball("slow-cc-pkg", "1.0.0");
+    // 1500ms tarball delay — same shape as A.3's serialization probe.
+    // Gives cache clean a wide window to fire mid-install.
+    let tarball_delay = Duration::from_millis(1500);
+    with_delayed_package(&mock, "slow-cc-pkg", "1.0.0", tarball, tarball_delay).await;
+    mock.with_batch_metadata(vec![single_version_batch_metadata(
+        "slow-cc-pkg",
+        "1.0.0",
+        &mock.url(),
+    )])
+    .await;
+
+    let project = TempProject::empty(r#"{"name":"cache-clean-race","version":"1.0.0"}"#);
+
+    let install_start = Instant::now();
+    let mut install_child = lpm_spawnable_with_registry(&project, &mock.url())
+        .args(install_args_with(&["slow-cc-pkg@1.0.0"]))
+        .spawn()
+        .expect("spawn install");
+
+    // Wait for the install to acquire the shared `store_lock` — proxy
+    // for "install is mid-pipeline, past metadata resolution, currently
+    // fetching/extracting the tarball". The lock-acquired moment is
+    // strictly AFTER metadata-cache writes have started, so cache
+    // clean has something to delete.
+    let store_lock_path = project.home().join(".lpm").join("store").join(".gc.lock");
+    assert!(
+        wait_until(Duration::from_secs(10), || {
+            if !store_lock_path.exists() {
+                return false;
+            }
+            matches!(
+                lpm_common::try_with_exclusive_lock(&store_lock_path, || Ok(())),
+                Ok(None)
+            )
+        }),
+        "install never acquired shared store_lock within 10s — \
+         the test couldn't establish the mid-install race window"
+    );
+
+    // Race a `cache clean`. Different lock path from store_lock, so
+    // it CAN run concurrently — that's the whole point.
+    let clean_start = Instant::now();
+    let clean_output = lpm(&project)
+        .args(["cache", "clean"])
+        .output()
+        .expect("run cache clean during install");
+    let clean_end = Instant::now();
+
+    // Now wait for the install to finish.
+    let install_status = wait_with_timeout(&mut install_child, Duration::from_secs(60));
+    let install_end = Instant::now();
+    let install_out = read_remaining_output(install_child);
+
+    eprintln!(
+        "[G.4] install_status={:?} clean_status={:?}\n\
+         install_elapsed={:?} clean_elapsed={:?}\n\
+         clean_start_offset_from_install_start={:?}\n\
+         clean_end_offset_from_install_start={:?}\n\
+         install stdout:\n{}\ninstall stderr:\n{}\n\
+         clean stdout:\n{}\nclean stderr:\n{}",
+        install_status,
+        clean_output.status,
+        install_end.duration_since(install_start),
+        clean_end.duration_since(clean_start),
+        clean_start.duration_since(install_start),
+        clean_end.duration_since(install_start),
+        install_out.stdout,
+        install_out.stderr,
+        String::from_utf8_lossy(&clean_output.stdout),
+        String::from_utf8_lossy(&clean_output.stderr),
+    );
+
+    // **LOAD-BEARING #1:** install must succeed despite the racing
+    // cache clean. If this fails, the install pipeline lost its
+    // graceful-degradation contract — a wiped metadata cache mid-
+    // install should not break anything.
+    assert!(
+        install_status.success(),
+        "install failed during racing cache clean — the graceful-degradation \
+         contract around metadata-cache failures is broken.\n\
+         stdout:\n{}\nstderr:\n{}",
+        install_out.stdout,
+        install_out.stderr
+    );
+    assert!(
+        clean_output.status.success(),
+        "cache clean failed during install:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&clean_output.stdout),
+        String::from_utf8_lossy(&clean_output.stderr)
+    );
+    assert!(
+        !install_out.stderr.contains("panicked at"),
+        "install panicked during racing cache clean:\nstderr:\n{}",
+        install_out.stderr
+    );
+    let clean_stderr = String::from_utf8_lossy(&clean_output.stderr);
+    assert!(
+        !clean_stderr.contains("panicked at"),
+        "cache clean panicked during racing install:\nstderr:\n{clean_stderr}"
+    );
+
+    // **LOAD-BEARING #2:** evidence the race window was real. If the
+    // install completed faster than the configured tarball delay, the
+    // test didn't exercise mid-install conditions and the assertions
+    // above are vacuous.
+    let install_elapsed = install_end.duration_since(install_start);
+    assert!(
+        install_elapsed >= tarball_delay,
+        "install completed in {install_elapsed:?}, faster than the \
+         configured tarball delay of {tarball_delay:?} — the slow-install \
+         window wasn't exercised, so the cache-clean race wasn't real"
+    );
+
+    // **LOAD-BEARING #3:** cache clean must have actually fired DURING
+    // the install window, not entirely before it (impossible — we
+    // waited for the shared store_lock first) or entirely after.
+    let clean_started_during_install = clean_start >= install_start && clean_start < install_end;
+    assert!(
+        clean_started_during_install,
+        "cache clean did not start during the install window — race \
+         conditions weren't exercised.\n\
+         install: {install_start:?}-{install_end:?}\n\
+         clean:   {clean_start:?}-{clean_end:?}"
+    );
+
+    // **LOAD-BEARING #4:** store entry survived. Cache clean must
+    // never touch the store, even when running concurrently with
+    // an install that's actively writing to it.
+    let store_entry = project.store_dir().join("v1").join("slow-cc-pkg@1.0.0");
+    assert!(
+        store_entry.exists(),
+        "store entry for slow-cc-pkg@1.0.0 missing after concurrent \
+         cache-clean — store/cache boundary violated. expected at: \
+         {store_entry:?}"
+    );
+    assert!(
+        store_entry.join("package.json").exists(),
+        "store entry's package.json is missing — partial extraction or \
+         cache clean reached into the store. checked: {:?}",
+        store_entry.join("package.json")
+    );
+    assert!(
+        store_entry.join(".integrity").exists(),
+        "store entry's .integrity marker is missing — the store-finalize \
+         step never completed AND/OR cache clean reached into the store. \
+         checked: {:?}",
+        store_entry.join(".integrity")
+    );
+
+    // **LOAD-BEARING #5:** install's user-visible outputs all landed.
+    // Project-side artifacts (linked tree, manifest update, install-
+    // hash) prove the install was end-to-end successful, not just
+    // "didn't crash mid-pipeline".
+    let nm_entry = project.path().join("node_modules/slow-cc-pkg");
+    assert!(
+        nm_entry.symlink_metadata().is_ok(),
+        "node_modules/slow-cc-pkg missing post-install — the linker \
+         either failed silently or skipped the package"
+    );
+    let pkg_json: serde_json::Value = serde_json::from_str(&project.read_file("package.json"))
+        .expect("post-install package.json must parse");
+    assert!(
+        pkg_json["dependencies"]["slow-cc-pkg"].as_str().is_some(),
+        "slow-cc-pkg dep missing from package.json after install — the \
+         manifest write didn't land. package.json: {pkg_json}"
+    );
+    assert!(
+        project.path().join(".lpm/install-hash").exists(),
+        "`.lpm/install-hash` missing after install — the post-install \
+         freshness hash write didn't land. This would force the next \
+         install onto the slow path."
+    );
+}
+
+/// **G.6 — malformed registry JSON fails without manifest or lockfile mutation.**
+///
+/// The install pipeline reads metadata from `GET /api/registry/{name}`
+/// (and the npm-direct mirror `GET /{name}`) plus
+/// `POST /api/registry/batch-metadata`. A registry that returns
+/// truncated or otherwise invalid JSON on those paths must fail the
+/// install cleanly — no panic, no backtrace, and ManifestTransaction
+/// rollback must restore the project to its pre-install state.
+///
+/// **Why this matters.** A misbehaving / under-attack / partially-
+/// migrated registry could ship a half-written response body. The
+/// install pipeline's contract:
+///
+/// - Resolver/registry-client returns a recoverable error (not a panic).
+/// - `?`-early-exit triggers `ManifestTransaction::Drop`, which
+///   restores `package.json` from the pre-install snapshot.
+/// - No fresh `lpm.lock` lands on disk (any partial write would be
+///   rolled back by the optional-snapshot branch).
+///
+/// Pinned contract:
+///
+/// - Process exits non-zero.
+/// - Stderr does NOT contain `"panicked at"` or `RUST_BACKTRACE`.
+/// - `package.json` bytes are EXACTLY the pre-install bytes (Drop
+///   restored the snapshot).
+/// - `lpm.lock` is absent (was absent pre-install; rollback's
+///   optional-snapshot branch must keep it absent).
+/// - `.lpm/install-hash` is absent (invalidate-on-rollback).
+///
+/// The test mounts truncated JSON on BOTH metadata endpoints
+/// (the single-package GET and the batch-metadata POST) so the
+/// failure reaches the install pipeline regardless of which path
+/// the client reads first.
+#[tokio::test]
+async fn malformed_registry_json_fails_without_manifest_or_lockfile_mutation() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, ResponseTemplate};
+
+    let mock = MockRegistry::start().await;
+    let pkg = "broken-json-pkg";
+
+    // Truncated JSON body — opens a `{` and a `"name":"` field, then
+    // cuts off mid-string-value. Both `serde_json::from_slice` and a
+    // streaming parser will error on EOF mid-token.
+    let bad_json = b"{\"name\":\"broken-json-pkg\",\"versions\":{\"1.0.";
+
+    // Mount the broken body on every metadata path the install
+    // pipeline might consult. wiremock matches mounts in declared
+    // order; these explicit mounts win over any later `with_package`
+    // would attempt (we deliberately DON'T call `with_package`).
+    Mock::given(method("GET"))
+        .and(path(format!("/api/registry/{pkg}")))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_bytes(bad_json.to_vec())
+                .insert_header("content-type", "application/json"),
+        )
+        .mount(mock.server())
+        .await;
+    Mock::given(method("GET"))
+        .and(path(format!("/{pkg}")))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_bytes(bad_json.to_vec())
+                .insert_header("content-type", "application/json"),
+        )
+        .mount(mock.server())
+        .await;
+    // batch-metadata is NDJSON; a non-NDJSON-shaped body causes the
+    // line parser to reject every line. Same exit path as the single-
+    // GET malformed case.
+    Mock::given(method("POST"))
+        .and(path("/api/registry/batch-metadata"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_bytes(bad_json.to_vec())
+                .insert_header("content-type", "application/x-ndjson"),
+        )
+        .mount(mock.server())
+        .await;
+
+    let pre_pkg_json = r#"{
+  "name": "malformed-json-test",
+  "version": "1.0.0"
+}"#;
+    let project = TempProject::empty(pre_pkg_json);
+
+    let pre_bytes = std::fs::read(project.path().join("package.json"))
+        .expect("test setup: package.json must exist");
+
+    let output = lpm_with_registry(&project, &mock.url())
+        .args(install_args_with(&[&format!("{pkg}@1.0.0")]))
+        .output()
+        .expect("run install against malformed-JSON registry");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    eprintln!(
+        "[G.6] status={:?}\nstdout:\n{stdout}\nstderr:\n{stderr}",
+        output.status
+    );
+
+    assert!(
+        !output.status.success(),
+        "install against malformed-JSON registry reported success — \
+         the resolver/registry-client accepted a half-body response.\n\
+         stderr:\n{stderr}"
+    );
+    assert!(
+        !stderr.contains("panicked at") && !stderr.contains("note: run with `RUST_BACKTRACE"),
+        "install panicked on malformed JSON — the resolver should \
+         return a recoverable error, not a panic.\nstderr:\n{stderr}"
+    );
+
+    // **LOAD-BEARING.** package.json must be byte-identical to
+    // pre-install state. If Drop didn't restore the snapshot — or if
+    // the staged `*` placeholder leaked because the pipeline bailed
+    // out without unwinding through ManifestTransaction's Drop —
+    // this trips.
+    let post_bytes = std::fs::read(project.path().join("package.json"))
+        .expect("package.json must still exist after malformed-JSON failure");
+    assert_eq!(
+        pre_bytes,
+        post_bytes,
+        "package.json was mutated by failed install against malformed \
+         registry. ManifestTransaction rollback contract broken.\n\
+         pre={}\npost={}",
+        String::from_utf8_lossy(&pre_bytes),
+        String::from_utf8_lossy(&post_bytes)
+    );
+
+    // Stricter shape: post-state JSON must parse AND must not contain
+    // the broken-json-pkg dep.
+    let post_json: serde_json::Value =
+        serde_json::from_slice(&post_bytes).expect("post-rollback package.json must parse as JSON");
+    let deps = post_json
+        .get("dependencies")
+        .and_then(|v| v.as_object())
+        .cloned()
+        .unwrap_or_default();
+    assert!(
+        !deps.contains_key(pkg),
+        "{pkg} appeared in dependencies after malformed-JSON failure — \
+         the staged placeholder leaked through the failure path. deps={:?}",
+        deps.keys().collect::<Vec<_>>()
+    );
+
+    // No lockfile artifacts should have landed.
+    assert!(
+        !project.path().join("lpm.lock").exists(),
+        "lpm.lock exists after malformed-JSON failure — partial \
+         lockfile write or optional-snapshot rollback regression"
+    );
+    assert!(
+        !project.path().join(".lpm/install-hash").exists(),
+        "`.lpm/install-hash` exists after malformed-JSON failure — \
+         the invalidate-on-rollback contract broke"
+    );
+
+    // Stderr should name SOMETHING actionable about the JSON / metadata
+    // failure so a user can diagnose the upstream issue. Broad word
+    // list to tolerate the registry-client's exact phrasing.
+    let stderr_l = stderr.to_lowercase();
+    let actionable = [
+        "json",
+        "parse",
+        "deserialize",
+        "metadata",
+        "registry",
+        "invalid",
+        "unexpected",
+        "decode",
+        "eof",
+        "malformed",
+    ]
+    .iter()
+    .any(|n| stderr_l.contains(n));
+    assert!(
+        actionable,
+        "malformed-JSON failure didn't surface an actionable noun. \
+         A user should be able to tell from stderr that the registry's \
+         response was malformed. stderr:\n{stderr}"
+    );
+}
+
+/// **G.5 — panic after install-hash write → rollback restores pre-stage state.**
+///
+/// Counterpart to B.4 (which exercises `after-stage`). The
+/// `after-install` stage of [`maybe_test_panic`](../../../crates/lpm-cli/src/commands/install.rs)
+/// fires AFTER `run_with_options` returns, which means the install
+/// pipeline has already invoked `write_post_install_v6_hash` —
+/// `.lpm/install-hash` is on disk at panic time. The contract being
+/// pinned here is that ManifestTransaction's Drop-based rollback
+/// correctly **invalidates** the freshly-written install-hash on its
+/// way out, AND restores `package.json` from the snapshot, even when
+/// the failure point is past the install-hash write site.
+///
+/// **Why this matters.** If Drop didn't invalidate the install-hash
+/// on rollback, a future `lpm install` would fast-path on the stale
+/// hash (which matches a `*`-placeholder manifest the user never
+/// wrote) and skip the resolve — a silent data-loss path.
+/// `.lpm/install-hash` lives in the transaction's invalidate-set
+/// (per [`manifest_tx.rs`](../../../crates/lpm-cli/src/manifest_tx.rs))
+/// precisely to foreclose this.
+///
+/// Note this is the **panic** variant of the row (`after-install`
+/// hook fires Drop). The SIGKILL variant — which would leave the
+/// install-hash on disk because Drop is bypassed — is intentionally
+/// not exercised here; that scenario is covered by E.2
+/// (`install_with_stale_install_hash_re_resolves_and_refetches`),
+/// which pins the recovery path with a planted stale hash.
+#[tokio::test]
+async fn install_panics_after_install_hash_write_rollback_invalidates_hash() {
+    let mock = MockRegistry::start().await;
+    let tarball = make_tarball("post-hash-rollback-pkg", "1.0.0");
+    mock.with_package("post-hash-rollback-pkg", "1.0.0", &tarball)
+        .await;
+    mock.with_batch_metadata(vec![single_version_batch_metadata(
+        "post-hash-rollback-pkg",
+        "1.0.0",
+        &mock.url(),
+    )])
+    .await;
+
+    let pre_pkg_json = r#"{
+  "name": "post-hash-rollback-test",
+  "version": "1.0.0"
+}"#;
+    let project = TempProject::empty(pre_pkg_json);
+
+    let pre_bytes = std::fs::read(project.path().join("package.json"))
+        .expect("test setup: package.json must exist");
+    assert!(
+        !pre_bytes.contains_subslice(b"post-hash-rollback-pkg"),
+        "test setup: pre-stage manifest already has the package — \
+         would mask the rollback assertion"
+    );
+
+    let output = lpm_with_registry(&project, &mock.url())
+        // Trigger panic AFTER run_with_options returns (i.e., after
+        // write_post_install_v6_hash already ran). Same hook as B.4
+        // but a different stage.
+        .env("LPM_TEST_PANIC_AT", "after-install")
+        .args(install_args_with(&["post-hash-rollback-pkg@1.0.0"]))
+        .output()
+        .expect("run install with panic after install-hash");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    eprintln!(
+        "[G.5] status={:?}\nstdout:\n{stdout}\nstderr:\n{stderr}",
+        output.status
+    );
+
+    assert!(
+        !output.status.success(),
+        "install with LPM_TEST_PANIC_AT=after-install reported success — \
+         the panic hook did NOT fire. stdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("panicked at"),
+        "panic hook did not surface a panic in stderr. The `after-install` \
+         stage is not wired or the env didn't pass through. stderr:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("LPM_TEST_PANIC_AT=after-install"),
+        "panic fired but the stage marker is missing — the hook's panic \
+         message contract changed. stderr:\n{stderr}"
+    );
+
+    // **LOAD-BEARING #1.** package.json must be byte-identical.
+    let post_bytes = std::fs::read(project.path().join("package.json"))
+        .expect("package.json must still exist after panic-after-install");
+    assert_eq!(
+        pre_bytes,
+        post_bytes,
+        "package.json was NOT restored after panic at `after-install`. \
+         The post-install-hash-write rollback contract is broken.\n\
+         pre={}\npost={}",
+        String::from_utf8_lossy(&pre_bytes),
+        String::from_utf8_lossy(&post_bytes)
+    );
+
+    let post_json: serde_json::Value =
+        serde_json::from_slice(&post_bytes).expect("post-rollback package.json must parse as JSON");
+    let deps = post_json
+        .get("dependencies")
+        .and_then(|v| v.as_object())
+        .cloned()
+        .unwrap_or_default();
+    assert!(
+        !deps.contains_key("post-hash-rollback-pkg"),
+        "post-hash-rollback-pkg is still in dependencies after panic-rollback \
+         — the `*` placeholder leaked. deps={:?}",
+        deps.keys().collect::<Vec<_>>()
+    );
+
+    // **LOAD-BEARING #2.** `.lpm/install-hash` was written by
+    // `write_post_install_v6_hash` BEFORE the `after-install` panic
+    // fired. Drop MUST have deleted it via the invalidate-set. If it
+    // survives, the next install would fast-path on a hash computed
+    // against state the user never committed (`*` placeholder) →
+    // silent data-loss path.
+    assert!(
+        !project.path().join(".lpm/install-hash").exists(),
+        "`.lpm/install-hash` survived panic-rollback after `after-install` — \
+         the invalidate-on-rollback contract is broken for the post-hash-write \
+         failure window. A subsequent `lpm install` would fast-path on a stale \
+         hash computed against the partially-staged manifest."
+    );
+
+    // Lockfile is optional in the transaction's snapshot. Pre-install
+    // it didn't exist; post-rollback must match.
+    assert!(
+        !project.path().join("lpm.lock").exists(),
+        "`lpm.lock` survived panic-rollback (snapshot captured `None` \
+         pre-install). The optional-snapshot rollback branch broke."
+    );
+}
+
 // ─── Shared mini-helpers ─────────────────────────────────────────────
 
 fn install_args_with<'a>(packages: &'a [&'a str]) -> Vec<&'a str> {
@@ -2423,7 +2970,7 @@ fn single_version_batch_metadata(name: &str, version: &str, mock_url: &str) -> s
                 "name": name,
                 "version": version,
                 "dist": {
-                    "tarball": format!("{mock_url}/tarballs/{name}-{version}.tgz"),
+                    "tarball": format!("{mock_url}/tarballs/{name}/-/{name}-{version}.tgz"),
                     "integrity": "sha512-placeholder",
                 },
                 "dependencies": {}

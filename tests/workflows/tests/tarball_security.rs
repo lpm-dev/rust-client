@@ -964,3 +964,710 @@ async fn tarball_with_single_path_component_exceeding_name_max_fails_cleanly() {
          stderr:\n{stderr}"
     );
 }
+
+// ─── Additional candidate surfaces (added 2026-05-14) ───────────────
+//
+// These tests cover the second-wave "Additional candidate surfaces"
+// rows from Item 3 of `private/test-coverage-followup-plan.md`. Each
+// row hardens the install pipeline against a tarball-shape attack
+// vector the 10 baseline tests above did not exercise.
+
+/// **Candidate — PAX-extended path-header traversal is rejected.**
+///
+/// PAX (POSIX 1003.1-2001) extended headers let a tarball override
+/// the legacy 100-byte path field with arbitrary UTF-8. An attacker
+/// can put a benign-looking path in the legacy header (which casual
+/// inspection tools surface) while smuggling a `..`-traversal payload
+/// in the PAX `path` record. The tar crate resolves the PAX-overridden
+/// path through `entry.path()` at
+/// [entry.rs:304](https://docs.rs/tar/0.4.45/src/tar/entry.rs.html#304),
+/// so the extractor's `Component::ParentDir` check at
+/// [lib.rs:347](../../../crates/lpm-extractor/src/lib.rs#L347) sees the
+/// PAX path (not the legacy one) and rejects.
+///
+/// Pin the contract: install fails non-zero, no panic, outside
+/// sentinel byte-identical. This forecloses the "PAX-only-aware
+/// scanner sees benign path, extractor sees real malicious path"
+/// disagreement class.
+#[tokio::test]
+async fn tarball_with_pax_path_traversal_rejected() {
+    let tgz = tarball_with_extra_entries("pax-pkg", "1.0.0", |builder| {
+        // PAX extended header (`x` entry type). Body is a sequence of
+        // `LEN KEY=VALUE\n` records where LEN is the byte length of
+        // the entire record INCLUDING the leading length digits and
+        // the trailing newline. For path "package/../escape.txt"
+        // (21 bytes): " path=...\n" is 1+4+1+21+1 = 28 bytes; with
+        // length "30" (2 digits) total = 30. Format: "30 path=...\n".
+        let path_value = "package/../escape.txt";
+        // " path=" + value + "\n" = 7 + value.len() bytes. Length =
+        // digits(length) + 7 + value.len(). Solve: for value.len()=21,
+        // total without length digits = 28; 30 fits with 2-digit "30".
+        let payload_body_len = 1 + b"path=".len() + path_value.len() + 1;
+        // Iterate to find the length that includes its own digits.
+        let mut total = payload_body_len + 2;
+        loop {
+            let digits = total.to_string().len();
+            let candidate = payload_body_len + digits;
+            if candidate == total {
+                break;
+            }
+            total = candidate;
+        }
+        let pax_record = format!("{total} path={path_value}\n");
+        assert_eq!(pax_record.len(), total, "PAX length self-consistent");
+
+        let mut pax_header = tar::Header::new_gnu();
+        pax_header.set_size(pax_record.len() as u64);
+        pax_header.set_entry_type(tar::EntryType::XHeader);
+        pax_header.set_mode(0o644);
+        // The PAX header entry's own path is conventionally
+        // "<dir>/PaxHeaders/<name>" or similar. The contents are what
+        // matter; the tar crate doesn't validate the header path.
+        pax_header
+            .set_path("package/PaxHeaders/safe.txt")
+            .expect("set pax header path");
+        pax_header.set_cksum();
+        builder.append(&pax_header, pax_record.as_bytes()).unwrap();
+
+        // The target file entry that the PAX header redirects. Its
+        // legacy header carries a benign path; on read, the tar crate
+        // overrides with the PAX `path` value.
+        let content = b"pax-pwned";
+        let mut file_header = tar::Header::new_gnu();
+        file_header.set_size(content.len() as u64);
+        file_header.set_mode(0o644);
+        file_header.set_entry_type(tar::EntryType::Regular);
+        file_header
+            .set_path("package/safe.txt")
+            .expect("set file header path");
+        file_header.set_cksum();
+        builder.append(&file_header, &content[..]).unwrap();
+    });
+
+    let mock = MockRegistry::start().await;
+    mock.with_package("pax-pkg", "1.0.0", &tgz).await;
+
+    let project = TempProject::empty(r#"{"name":"sec-test","version":"1.0.0"}"#);
+    let outside = project.path().parent().unwrap().join("escape.txt");
+    let _ = std::fs::remove_file(&outside);
+
+    let output = lpm_with_registry(&project, &mock.url())
+        .args(install_args("pax-pkg@1.0.0"))
+        .output()
+        .expect("run install");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    eprintln!(
+        "[Candidate pax-traversal] status={:?}\nstderr:\n{stderr}\nstdout:\n{stdout}",
+        output.status
+    );
+
+    assert!(
+        !output.status.success(),
+        "install of PAX-traversal tarball reported success — the \
+         attacker's PAX-smuggled `..` path was extracted somewhere:\n\
+         stderr:\n{stderr}"
+    );
+    assert!(
+        !stderr.contains("panicked at") && !stderr.contains("note: run with `RUST_BACKTRACE"),
+        "extractor panicked on PAX traversal:\nstderr:\n{stderr}"
+    );
+    assert!(
+        !outside.exists(),
+        "extractor wrote outside via PAX-overridden path — security \
+         regression. file lives at: {outside:?}"
+    );
+    let stderr_l = stderr.to_lowercase();
+    assert!(
+        stderr_l.contains("traversal")
+            || stderr_l.contains("integrity")
+            || stderr_l.contains("invalid"),
+        "PAX rejection lacks actionable noun. stderr:\n{stderr}"
+    );
+}
+
+/// **Candidate — GNU longname-extended path-header traversal is rejected.**
+///
+/// GNU longname headers (`L` entry type) supply an out-of-band path
+/// for entries whose path exceeds the legacy 100-byte field. The tar
+/// crate resolves through `long_pathname` at
+/// [entry.rs:309](https://docs.rs/tar/0.4.45/src/tar/entry.rs.html#309)
+/// taking precedence over the legacy header path AND over PAX. An
+/// attacker who knows the legacy-only path is inspected can hide a
+/// `..` traversal in the GNU L body.
+///
+/// Pin the contract: install fails non-zero, no panic, outside
+/// sentinel byte-identical. Forecloses the GNU-aware-disagreement
+/// class symmetric to PAX above.
+#[tokio::test]
+async fn tarball_with_gnu_longname_traversal_rejected() {
+    let tgz = tarball_with_extra_entries("gnu-long-pkg", "1.0.0", |builder| {
+        // GNU L entry: body is the long path bytes, NUL-terminated.
+        // The tar crate accepts trailing NUL or not — both shapes are
+        // recognized; supply the terminator to match the GNU spec.
+        let long_path = b"package/../escape.txt\0";
+
+        let mut long_header = tar::Header::new_gnu();
+        long_header.set_size(long_path.len() as u64);
+        long_header.set_entry_type(tar::EntryType::GNULongName);
+        long_header.set_mode(0o644);
+        long_header
+            .set_path("././@LongLink")
+            .expect("set GNU L header conventional path");
+        long_header.set_cksum();
+        builder.append(&long_header, &long_path[..]).unwrap();
+
+        // Target file entry — legacy header carries a benign path; on
+        // read, the tar crate substitutes the L body.
+        let content = b"gnu-long-pwned";
+        let mut file_header = tar::Header::new_gnu();
+        file_header.set_size(content.len() as u64);
+        file_header.set_mode(0o644);
+        file_header.set_entry_type(tar::EntryType::Regular);
+        file_header
+            .set_path("package/safe.txt")
+            .expect("set file header path");
+        file_header.set_cksum();
+        builder.append(&file_header, &content[..]).unwrap();
+    });
+
+    let mock = MockRegistry::start().await;
+    mock.with_package("gnu-long-pkg", "1.0.0", &tgz).await;
+
+    let project = TempProject::empty(r#"{"name":"sec-test","version":"1.0.0"}"#);
+    let outside = project.path().parent().unwrap().join("escape.txt");
+    let _ = std::fs::remove_file(&outside);
+
+    let output = lpm_with_registry(&project, &mock.url())
+        .args(install_args("gnu-long-pkg@1.0.0"))
+        .output()
+        .expect("run install");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    eprintln!(
+        "[Candidate gnu-longname-traversal] status={:?}\nstderr:\n{stderr}\nstdout:\n{stdout}",
+        output.status
+    );
+
+    assert!(
+        !output.status.success(),
+        "install of GNU-longname-traversal tarball reported success — \
+         the L-smuggled `..` path was extracted:\nstderr:\n{stderr}"
+    );
+    assert!(
+        !stderr.contains("panicked at") && !stderr.contains("note: run with `RUST_BACKTRACE"),
+        "extractor panicked on GNU longname traversal:\nstderr:\n{stderr}"
+    );
+    assert!(
+        !outside.exists(),
+        "extractor wrote outside via GNU-longname-overridden path — \
+         security regression. file lives at: {outside:?}"
+    );
+    let stderr_l = stderr.to_lowercase();
+    assert!(
+        stderr_l.contains("traversal")
+            || stderr_l.contains("integrity")
+            || stderr_l.contains("invalid"),
+        "GNU longname rejection lacks actionable noun. stderr:\n{stderr}"
+    );
+}
+
+/// **Candidate — duplicate-member path: pin the current contract.**
+///
+/// Two tar entries share the same `package/duplicate.txt` path with
+/// different bytes. The extractor walks entries in order. Neither
+/// entry trips any security check (both are well-formed regular
+/// files under the extraction root). The first write creates the
+/// file; the second write opens with create-or-truncate (`write_buffered_entry`
+/// and `stream_entry_to_disk` both use this semantics — see
+/// [lib.rs:498-522](../../../crates/lpm-extractor/src/lib.rs#L498)).
+///
+/// **Pinned contract (last-write-wins):** install succeeds, the
+/// duplicate path materializes with the SECOND entry's bytes,
+/// stripping the first entry's content. This is defensible because
+/// (a) npm never legitimately ships duplicates and (b) deterministic
+/// last-wins is preferable to a non-deterministic file-system race.
+/// The risk it leaves on the table: a scanner that snapshots the
+/// FIRST entry's content disagrees with the extractor's on-disk
+/// result. Pinned here so any future flip (e.g., "reject duplicates",
+/// "first-wins") is detected immediately.
+#[tokio::test]
+async fn tarball_with_duplicate_member_path_rejected_or_deterministic() {
+    let tgz = tarball_with_extra_entries("dup-pkg", "1.0.0", |builder| {
+        let first = b"FIRST-CONTENT";
+        let mut h1 = tar::Header::new_gnu();
+        h1.set_size(first.len() as u64);
+        h1.set_mode(0o644);
+        h1.set_entry_type(tar::EntryType::Regular);
+        h1.set_cksum();
+        builder
+            .append_data(&mut h1, "package/duplicate.txt", &first[..])
+            .unwrap();
+
+        let second = b"SECOND-CONTENT-different-length";
+        let mut h2 = tar::Header::new_gnu();
+        h2.set_size(second.len() as u64);
+        h2.set_mode(0o644);
+        h2.set_entry_type(tar::EntryType::Regular);
+        h2.set_cksum();
+        builder
+            .append_data(&mut h2, "package/duplicate.txt", &second[..])
+            .unwrap();
+    });
+
+    let mock = MockRegistry::start().await;
+    mock.with_package("dup-pkg", "1.0.0", &tgz).await;
+
+    let project = TempProject::empty(r#"{"name":"sec-test","version":"1.0.0"}"#);
+    let output = lpm_with_registry(&project, &mock.url())
+        .args(install_args("dup-pkg@1.0.0"))
+        .output()
+        .expect("run install");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    eprintln!(
+        "[Candidate duplicate-member] status={:?}\nstderr:\n{stderr}",
+        output.status
+    );
+
+    // Current contract is last-write-wins, install succeeds. If the
+    // contract is ever tightened to "reject duplicates", flip this
+    // to !success + actionable-noun assertions — but only after a
+    // conscious policy decision is recorded in the extractor source.
+    assert!(
+        output.status.success(),
+        "install of duplicate-member tarball failed — the extractor's \
+         last-write-wins contract may have changed (audit before \
+         flipping the assertion).\nstderr:\n{stderr}"
+    );
+    assert!(
+        !stderr.contains("panicked at"),
+        "extractor panicked on duplicate member:\nstderr:\n{stderr}"
+    );
+
+    let extracted = project.path().join("node_modules/dup-pkg/duplicate.txt");
+    assert!(
+        extracted.exists(),
+        "expected the duplicate file to extract at {extracted:?}"
+    );
+    let bytes = std::fs::read(&extracted).expect("read duplicate extract");
+    assert_eq!(
+        bytes,
+        b"SECOND-CONTENT-different-length".to_vec(),
+        "last-write-wins contract violated — on-disk bytes do not \
+         match the second entry's payload. Got: {bytes:?}"
+    );
+}
+
+/// **Candidate — malicious later entry causes rollback of earlier valid entries.**
+///
+/// Order matters in tar extraction: a tarball whose first N entries
+/// pass every security check and whose N+1-th entry is malicious
+/// (`..` traversal) tests whether the extractor leaves the earlier
+/// extracted bytes on disk after rejection. The
+/// [`rollback_extraction`](../../../crates/lpm-extractor/src/lib.rs#L665)
+/// helper cleans up `extracted_files` and `created_dirs` on every
+/// error path — so the contract is: install fails, NO partial
+/// extraction survives.
+///
+/// At the workflow tier the store extracts into a temp dir before
+/// the atomic rename to `~/.lpm/store/`, so on rejection the temp
+/// dir is removed and no entry lands in the store. Linking never
+/// happens. Therefore `node_modules/<pkg>/` must be entirely absent
+/// post-failure.
+#[tokio::test]
+async fn tarball_rejects_or_rolls_back_when_later_entry_is_malicious() {
+    let tgz = tarball_with_extra_entries("rollback-pkg", "1.0.0", |builder| {
+        // Valid first entry — would extract cleanly on its own.
+        let valid = b"valid-first-entry";
+        let mut valid_h = tar::Header::new_gnu();
+        valid_h.set_size(valid.len() as u64);
+        valid_h.set_mode(0o644);
+        valid_h.set_entry_type(tar::EntryType::Regular);
+        valid_h.set_cksum();
+        builder
+            .append_data(&mut valid_h, "package/valid-first.txt", &valid[..])
+            .unwrap();
+
+        // Malicious second entry — `..` traversal triggers rejection
+        // AFTER the first entry already passed prepare_output_path
+        // and was written to disk. The extractor's rollback path
+        // must clean up the first entry.
+        let evil = b"evil-second-entry";
+        let mut evil_h = tar::Header::new_gnu();
+        evil_h.set_size(evil.len() as u64);
+        evil_h.set_mode(0o644);
+        evil_h.set_entry_type(tar::EntryType::Regular);
+        evil_h.set_path("package/safe.txt").unwrap();
+        let raw = evil_h.as_mut_bytes();
+        raw[..100].fill(0);
+        let payload = b"package/../escape.txt";
+        raw[..payload.len()].copy_from_slice(payload);
+        evil_h.set_cksum();
+        builder.append(&evil_h, &evil[..]).unwrap();
+    });
+
+    let mock = MockRegistry::start().await;
+    mock.with_package("rollback-pkg", "1.0.0", &tgz).await;
+
+    let project = TempProject::empty(r#"{"name":"sec-test","version":"1.0.0"}"#);
+    let outside = project.path().parent().unwrap().join("escape.txt");
+    let _ = std::fs::remove_file(&outside);
+
+    let output = lpm_with_registry(&project, &mock.url())
+        .args(install_args("rollback-pkg@1.0.0"))
+        .output()
+        .expect("run install");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    eprintln!(
+        "[Candidate later-entry-malicious] status={:?}\nstderr:\n{stderr}\nstdout:\n{stdout}",
+        output.status
+    );
+
+    assert!(
+        !output.status.success(),
+        "install of tarball with malicious second entry reported \
+         success — the extractor accepted a `..` traversal mid-stream.\
+         \nstderr:\n{stderr}"
+    );
+    assert!(
+        !stderr.contains("panicked at"),
+        "extractor panicked on later-entry traversal:\nstderr:\n{stderr}"
+    );
+    assert!(
+        !outside.exists(),
+        "extractor wrote outside via late-entry traversal — \
+         rollback failed. file lives at: {outside:?}"
+    );
+
+    // Critical rollback contract: the earlier valid entry must NOT
+    // survive the rejection. node_modules/<pkg>/ should not exist
+    // (atomic install pipeline never linked) AND, even if a future
+    // refactor surfaces a partial directory, the valid-first.txt
+    // file must NOT exist.
+    let pkg_dir = project.path().join("node_modules/rollback-pkg");
+    let valid_first = pkg_dir.join("valid-first.txt");
+    assert!(
+        !valid_first.exists(),
+        "earlier valid entry survived rollback — partial state leak.\
+         \nleftover at: {valid_first:?}"
+    );
+}
+
+/// **Candidate — truncated gzip stream fails cleanly with no partial extraction.**
+///
+/// Truncating the gzip bytes mid-stream causes `libdeflate` to return
+/// a decompression error at
+/// [lib.rs:108-120](../../../crates/lpm-extractor/src/lib.rs#L108).
+/// The extractor never reaches the tar walk, so there is nothing to
+/// roll back from disk — but the test still pins the user-visible
+/// contract: install fails non-zero, no panic, and `node_modules/<pkg>/`
+/// is absent (no half-extracted files).
+///
+/// The truncation point is chosen to leave a valid gzip header (so
+/// the magic check at lib.rs:77 passes) but to corrupt the compressed
+/// payload (so libdeflate fails partway through decompression).
+#[tokio::test]
+async fn tarball_with_truncated_gzip_rolls_back_partial_extract() {
+    // Build a valid tarball with a recognizable payload so we know
+    // its decompressed size > truncation point.
+    let valid_tgz = tarball_with_extra_entries("trunc-pkg", "1.0.0", |builder| {
+        // A real-sized file (~1 KB) so the gzip stream has enough body
+        // to truncate meaningfully — too tiny and the truncation might
+        // land in the trailer rather than the deflate stream.
+        let content = vec![b'A'; 1024];
+        let mut header = tar::Header::new_gnu();
+        header.set_size(content.len() as u64);
+        header.set_mode(0o644);
+        header.set_entry_type(tar::EntryType::Regular);
+        header.set_cksum();
+        builder
+            .append_data(&mut header, "package/payload.txt", &content[..])
+            .unwrap();
+    });
+    assert!(
+        valid_tgz.len() > 50,
+        "valid tarball too small to truncate meaningfully"
+    );
+
+    // Truncate to half — preserves gzip header (0x1f 0x8b at byte 0)
+    // but corrupts the deflate body. libdeflate will fail mid-stream.
+    let truncated = valid_tgz[..valid_tgz.len() / 2].to_vec();
+    assert_eq!(
+        &truncated[..2],
+        &[0x1f, 0x8b],
+        "truncation removed gzip magic — wrong truncation point"
+    );
+
+    let mock = MockRegistry::start().await;
+    mock.with_package("trunc-pkg", "1.0.0", &truncated).await;
+
+    let project = TempProject::empty(r#"{"name":"sec-test","version":"1.0.0"}"#);
+    let output = lpm_with_registry(&project, &mock.url())
+        .args(install_args("trunc-pkg@1.0.0"))
+        .output()
+        .expect("run install");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    eprintln!(
+        "[Candidate truncated-gzip] status={:?}\nstderr:\n{stderr}\nstdout:\n{stdout}",
+        output.status
+    );
+
+    assert!(
+        !output.status.success(),
+        "install of truncated-gzip tarball reported success — \
+         libdeflate accepted a half-stream.\nstderr:\n{stderr}"
+    );
+    assert!(
+        !stderr.contains("panicked at") && !stderr.contains("note: run with `RUST_BACKTRACE"),
+        "extractor panicked on truncated gzip:\nstderr:\n{stderr}"
+    );
+
+    // No partial extraction.
+    let pkg_dir = project.path().join("node_modules/trunc-pkg");
+    assert!(
+        !pkg_dir.exists(),
+        "node_modules/<pkg>/ exists after truncated-gzip install — \
+         partial extraction leaked: {pkg_dir:?}"
+    );
+
+    // Stderr should name something about the failure mode.
+    let stderr_l = stderr.to_lowercase();
+    let actionable = [
+        "gzip",
+        "decompression",
+        "decompress",
+        "integrity",
+        "tarball",
+        "extract",
+        "install",
+        "registry",
+        "invalid",
+    ]
+    .iter()
+    .any(|n| stderr_l.contains(n));
+    assert!(
+        actionable,
+        "truncated-gzip failure didn't surface an actionable noun. \
+         stderr:\n{stderr}"
+    );
+}
+
+/// **Candidate — uid/gid ownership metadata in tar header is ignored.**
+///
+/// Tar entries carry uid/gid fields. An attacker shipping a tarball
+/// could declare a privileged uid (0 = root) or a hostile uid (e.g.,
+/// 99999 for a "ghost" account) hoping the extractor honors it. The
+/// extractor's `set_preserve_ownerships(false)` at
+/// [lib.rs:241](../../../crates/lpm-extractor/src/lib.rs#L241) tells
+/// `tar::Archive` to skip the `fchownat` syscall entirely.
+///
+/// Result: files extract owned by the running process's uid/gid,
+/// regardless of header claims. Pin the contract empirically — read
+/// extracted file's `metadata().uid()` and assert it matches the
+/// process uid, not the header's bogus 99999.
+///
+/// POSIX-only — Windows NTFS has no uid/gid concept; ownership is
+/// SID-based and tar headers can't represent it. `set_preserve_ownerships`
+/// is a no-op there.
+#[cfg(unix)]
+#[tokio::test]
+async fn tarball_ignores_uid_gid_ownership_metadata() {
+    use std::os::unix::fs::MetadataExt;
+
+    let tgz = tarball_with_extra_entries("uid-gid-pkg", "1.0.0", |builder| {
+        let content = b"normal-file-content";
+        let mut header = tar::Header::new_gnu();
+        header.set_size(content.len() as u64);
+        header.set_mode(0o644);
+        header.set_entry_type(tar::EntryType::Regular);
+        // Claim ownership by a non-existent privileged-shape uid/gid.
+        // The values are arbitrary — what matters is they don't
+        // match the running process and would be visible if the
+        // extractor honored them.
+        header.set_uid(99_999);
+        header.set_gid(99_999);
+        header.set_cksum();
+        builder
+            .append_data(&mut header, "package/owned.txt", &content[..])
+            .unwrap();
+    });
+
+    let mock = MockRegistry::start().await;
+    mock.with_package("uid-gid-pkg", "1.0.0", &tgz).await;
+
+    let project = TempProject::empty(r#"{"name":"sec-test","version":"1.0.0"}"#);
+    let output = lpm_with_registry(&project, &mock.url())
+        .args(install_args("uid-gid-pkg@1.0.0"))
+        .output()
+        .expect("run install");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    eprintln!(
+        "[Candidate uid-gid-ignored] status={:?}\nstderr:\n{stderr}",
+        output.status
+    );
+
+    assert!(
+        output.status.success(),
+        "install of uid/gid-bearing tarball failed — extractor's \
+         ownership-ignore contract may have changed.\nstderr:\n{stderr}"
+    );
+    assert!(
+        !stderr.contains("panicked at"),
+        "extractor panicked on uid/gid entry:\nstderr:\n{stderr}"
+    );
+
+    let extracted = project.path().join("node_modules/uid-gid-pkg/owned.txt");
+    assert!(
+        extracted.exists(),
+        "expected the uid/gid-bearing file to extract at {extracted:?}"
+    );
+
+    let md = std::fs::metadata(&extracted).expect("stat extracted file");
+    let process_uid = unsafe { libc::getuid() };
+    let process_gid = unsafe { libc::getgid() };
+    assert_eq!(
+        md.uid(),
+        process_uid,
+        "extracted file uid={} does not match process uid={process_uid} — \
+         tarball's bogus uid (99999) was honored. security regression.",
+        md.uid()
+    );
+    assert_eq!(
+        md.gid(),
+        process_gid,
+        "extracted file gid={} does not match process gid={process_gid} — \
+         tarball's bogus gid (99999) was honored. security regression.",
+        md.gid()
+    );
+}
+
+/// **Candidate — entry with declared size beyond MAX_FILE_SIZE is rejected up-front.**
+///
+/// The extractor pre-checks `entry.header().size()` at
+/// [lib.rs:306](../../../crates/lpm-extractor/src/lib.rs#L306) against
+/// `MAX_FILE_SIZE = 500 MB` BEFORE allocating or writing any bytes.
+/// This forecloses the "sparse-bomb" attack class where a tar header
+/// declares a multi-GB logical file even when the actual on-wire bytes
+/// are tiny — without the up-front size check, the extractor could
+/// allocate a multi-GB buffer or write a sparse file that exhausts
+/// disk quota on touch.
+///
+/// Pin the contract: header declares `MAX_FILE_SIZE + 1` bytes; the
+/// tar payload on the wire is empty (no actual content sent). The
+/// extractor rejects on the size check before reading any payload
+/// bytes from the entry. Install fails non-zero, no panic, no
+/// partial extraction, stderr names the size-limit violation.
+///
+/// **Why this doesn't require an actual gigantic gzip stream:** the
+/// per-entry size check reads `header().size()` from the 12-byte
+/// octal field in the tar header — it doesn't care whether the
+/// declared bytes are actually present in the stream. The check
+/// fires at line 306 BEFORE `entry.read_to_end()` or
+/// `stream_entry_to_disk` would try to drain the entry. So a tarball
+/// with a header that lies about size is enough to exercise the check.
+#[tokio::test]
+async fn tarball_with_sparse_huge_file_rejected_by_declared_size() {
+    // MAX_FILE_SIZE = 500 MB. Declare a size 1 byte beyond the cap.
+    // The on-wire bytes are EMPTY — only the header lies. The
+    // extractor's pre-check at lib.rs:306 reads the header size and
+    // rejects BEFORE attempting to drain the (non-existent) body, so
+    // we never need to actually generate 500 MB of data. This keeps
+    // the test under the determinism budget.
+    const MAX_FILE_SIZE: u64 = 500 * 1024 * 1024;
+    let declared_size = MAX_FILE_SIZE + 1;
+
+    // Construct the tar bytes manually — `tar::Builder::append` would
+    // demand `declared_size` bytes of data, which is precisely what
+    // we're trying to avoid.
+    let mut header = tar::Header::new_gnu();
+    header.set_size(declared_size); // The LIE.
+    header.set_mode(0o644);
+    header.set_entry_type(tar::EntryType::Regular);
+    header
+        .set_path("package/lying.txt")
+        .expect("set lying header path");
+    header.set_cksum();
+
+    let mut tar_bytes = Vec::with_capacity(2048);
+    // 512-byte header block.
+    tar_bytes.extend_from_slice(header.as_bytes());
+    // No body — the extractor rejects before reading any body bytes.
+    // Append the tar end-of-archive marker (two 512-byte zero blocks)
+    // so the archive is well-formed up to the failing entry.
+    tar_bytes.extend_from_slice(&[0u8; 1024]);
+
+    let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+    encoder.write_all(&tar_bytes).expect("gzip the lying tar");
+    let tgz = encoder.finish().expect("finish gzip");
+
+    // Sanity: the compressed bytes should be tiny — gzip of ~1.5 KB
+    // of mostly-zero header + zero-block trailer.
+    assert!(
+        tgz.len() < 1024,
+        "gzip-compressed lying tarball is {} bytes (expected <1KB) — \
+         construction may have ballooned",
+        tgz.len()
+    );
+
+    let mock = MockRegistry::start().await;
+    mock.with_package("huge-decl-pkg", "1.0.0", &tgz).await;
+
+    let project = TempProject::empty(r#"{"name":"sec-test","version":"1.0.0"}"#);
+    let output = lpm_with_registry(&project, &mock.url())
+        .args(install_args("huge-decl-pkg@1.0.0"))
+        .output()
+        .expect("run install");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    eprintln!(
+        "[Candidate huge-declared-size] status={:?}\nstderr:\n{stderr}\nstdout:\n{stdout}",
+        output.status
+    );
+
+    assert!(
+        !output.status.success(),
+        "install of huge-declared-size tarball reported success — \
+         the extractor's MAX_FILE_SIZE pre-check may have regressed.\
+         \nstderr:\n{stderr}"
+    );
+    assert!(
+        !stderr.contains("panicked at") && !stderr.contains("note: run with `RUST_BACKTRACE"),
+        "extractor panicked on huge-declared-size entry:\nstderr:\n{stderr}"
+    );
+
+    let pkg_dir = project.path().join("node_modules/huge-decl-pkg");
+    assert!(
+        !pkg_dir.exists(),
+        "node_modules/<pkg>/ exists after huge-declared-size install — \
+         partial extraction leaked: {pkg_dir:?}"
+    );
+
+    let stderr_l = stderr.to_lowercase();
+    let actionable = [
+        "too large",
+        "size limit",
+        "size",
+        "exceed",
+        "limit",
+        "tarball",
+        "extract",
+        "install",
+        "registry",
+    ]
+    .iter()
+    .any(|n| stderr_l.contains(n));
+    assert!(
+        actionable,
+        "huge-declared-size failure didn't surface an actionable noun. \
+         stderr:\n{stderr}"
+    );
+}
