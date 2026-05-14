@@ -1459,10 +1459,13 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         name: "`lpm self-update`",
         unit: true,
         integration: false,
-        workflow: false,
+        workflow: true,
         cli_binary: false,
-        json_contract: false,
-        references: &["crates/lpm-cli/src/commands/self_update.rs"],
+        json_contract: true,
+        references: &[
+            "crates/lpm-cli/src/commands/self_update.rs",
+            "tests/workflows/tests/self_update.rs",
+        ],
     },
     SurfaceBaseline {
         id: 127,
@@ -1492,10 +1495,13 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         name: "`lpm mcp setup / remove / status`",
         unit: true,
         integration: false,
-        workflow: false,
+        workflow: true,
         cli_binary: false,
-        json_contract: false,
-        references: &["crates/lpm-cli/src/commands/mcp.rs"],
+        json_contract: true,
+        references: &[
+            "crates/lpm-cli/src/commands/mcp.rs",
+            "tests/workflows/tests/mcp.rs",
+        ],
     },
     SurfaceBaseline {
         id: 130,
