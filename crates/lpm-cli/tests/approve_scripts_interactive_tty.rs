@@ -102,14 +102,16 @@ fn approve_scripts_interactive_walk_without_tty_fails_with_helpful_alternatives(
 /// "requires a TTY" one. The contract pinned here:
 ///
 /// 1. stdout contains a valid JSON envelope, with `success: false`
-///    and a populated `error` field, even though the process exits 0
-///    today (see finding #73 — exit code should match `success`).
-/// 2. The error message guides the user toward `--yes` / `--list` /
+///    and a populated `error` field.
+/// 2. Exit code is `1` — the envelope's `success` field and the
+///    process exit code must agree (finding #73 contract: dispatch
+///    error-paths mirror, all the way through).
+/// 3. The error message guides the user toward `--yes` / `--list` /
 ///    `<pkg>` (the non-interactive alternatives).
 ///
-/// When findings #73 and #74 are fixed, this test should tighten to
-/// assert non-zero exit AND match the "--json cannot be combined"
-/// message.
+/// Finding #74 (TTY guard ordering) is still open — when it lands
+/// this test should retarget the more-specific "--json cannot be
+/// combined" message.
 #[test]
 fn approve_scripts_interactive_with_json_emits_failure_envelope_on_stdout() {
     let (mut cmd, _project, _home) = lpm_isolated();
@@ -130,6 +132,14 @@ fn approve_scripts_interactive_with_json_emits_failure_envelope_on_stdout() {
         envelope["success"],
         serde_json::json!(false),
         "envelope must report success=false in this error path: {envelope}"
+    );
+
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "exit code must mirror envelope success=false → 1 \
+         (got code={:?}, envelope={envelope})",
+        output.status.code(),
     );
 
     let error_msg = envelope["error"]
