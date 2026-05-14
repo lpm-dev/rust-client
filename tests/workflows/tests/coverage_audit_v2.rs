@@ -33,9 +33,9 @@
 //!   backfill landed.** Drop a new surface? You owe it a v2 row.
 //! - `EXPECT_FULL_V2_FLOWS_BACKFILL` — true once every cross-command
 //!   flow has been implemented as an integration test and its row
-//!   marked `tested: true` with a `test_file` path. **Still false:**
-//!   the 10 enumerated flows are visible TODOs, not test failures.
-//!   Flip when the flows ship.
+//!   marked `tested: true` with a `test_file` path. **Locked in
+//!   2026-05-14** after all 10 flows landed as
+//!   `tests/workflows/tests/cross_command_flows.rs`.
 //!
 //! Both flags are independent on purpose. Surface backfill and
 //! cross-command-flow implementation move at different speeds and
@@ -64,10 +64,10 @@ const EXPECT_FULL_V2_SURFACES_BACKFILL: bool = true;
 
 /// Locks in the cross-command flow backfill. When `true`, the
 /// `cross_command_flows_inventory_report` test hard-fails if any
-/// enumerated flow still has `tested: false`. Stays `false` until
-/// each flow ships as an integration test and its row is updated
-/// with a `test_file` path.
-const EXPECT_FULL_V2_FLOWS_BACKFILL: bool = false;
+/// enumerated flow still has `tested: false`. Flipped to `true` on
+/// 2026-05-14 after all 10 flows shipped as
+/// `tests/workflows/tests/cross_command_flows.rs`.
+const EXPECT_FULL_V2_FLOWS_BACKFILL: bool = true;
 
 // ─── Schema integrity ─────────────────────────────────────────────────
 

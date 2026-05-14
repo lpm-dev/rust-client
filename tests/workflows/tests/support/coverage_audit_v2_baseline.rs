@@ -2404,8 +2404,8 @@ pub const CROSS_COMMAND_FLOWS: &[CrossCommandFlow] = &[
     CrossCommandFlow {
         name: "migrate → install → audit",
         commands: &["lpm migrate npm", "lpm install", "lpm audit"],
-        tested: false,
-        test_file: None,
+        tested: true,
+        test_file: Some("tests/workflows/tests/cross_command_flows.rs"),
         catches: "migration produces a lockfile that audit can read; behavioral analysis fires on \
                   installed packages, not on a synthesized lockfile-only inventory.",
     },
@@ -2417,8 +2417,8 @@ pub const CROSS_COMMAND_FLOWS: &[CrossCommandFlow] = &[
             "lpm patch-commit <dir>",
             "lpm install",
         ],
-        tested: false,
-        test_file: None,
+        tested: true,
+        test_file: Some("tests/workflows/tests/cross_command_flows.rs"),
         catches: "second install must re-apply the patch from disk + invalidate the original \
                   store integrity in favor of the patched binding.",
     },
@@ -2429,24 +2429,24 @@ pub const CROSS_COMMAND_FLOWS: &[CrossCommandFlow] = &[
             "lpm install",
             "lpm graph --filter member-a",
         ],
-        tested: false,
-        test_file: None,
+        tested: true,
+        test_file: Some("tests/workflows/tests/cross_command_flows.rs"),
         catches: "graph sees the freshly added dep without a manual lockfile refresh; \
                   filter resolves the just-added member correctly.",
     },
     CrossCommandFlow {
         name: "install → upgrade --major → audit (re-audit upgraded version)",
         commands: &["lpm install", "lpm upgrade --major", "lpm audit"],
-        tested: false,
-        test_file: None,
+        tested: true,
+        test_file: Some("tests/workflows/tests/cross_command_flows.rs"),
         catches: "audit refreshes vuln data against the new major version, not the cached \
                   pre-upgrade response.",
     },
     CrossCommandFlow {
         name: "token-rotate → publish (new token authenticates)",
         commands: &["lpm token-rotate", "lpm publish --dry-run --check"],
-        tested: false,
-        test_file: None,
+        tested: true,
+        test_file: Some("tests/workflows/tests/cross_command_flows.rs"),
         catches: "rotation invalidates the previously-stored bearer; the next publish call \
                   picks up the new token from the same storage path.",
     },
@@ -2458,8 +2458,8 @@ pub const CROSS_COMMAND_FLOWS: &[CrossCommandFlow] = &[
             "lpm approve-scripts --yes",
             "lpm rebuild",
         ],
-        tested: false,
-        test_file: None,
+        tested: true,
+        test_file: Some("tests/workflows/tests/cross_command_flows.rs"),
         catches: "first rebuild reports the blocked set; approve-scripts unblocks; second \
                   rebuild actually executes the previously-blocked scripts.",
     },
@@ -2472,8 +2472,8 @@ pub const CROSS_COMMAND_FLOWS: &[CrossCommandFlow] = &[
             "lpm env pull --env=staging",
             "lpm env get API_KEY --reveal",
         ],
-        tested: false,
-        test_file: None,
+        tested: true,
+        test_file: Some("tests/workflows/tests/cross_command_flows.rs"),
         catches: "round-trip encryption: the pulled value matches the pushed value byte-for-byte \
                   after device-key wrap/unwrap.",
     },
@@ -2484,24 +2484,24 @@ pub const CROSS_COMMAND_FLOWS: &[CrossCommandFlow] = &[
             "some-cli --version",
             "lpm uninstall -g some-cli",
         ],
-        tested: false,
-        test_file: None,
+        tested: true,
+        test_file: Some("tests/workflows/tests/cross_command_flows.rs"),
         catches: "shim repair + PATH integration end-to-end. The cli-binary survivor probes the \
                   shim creation; this flow probes the user-visible PATH consequence.",
     },
     CrossCommandFlow {
         name: "publish --dry-run --check → publish (real)",
         commands: &["lpm publish --dry-run --check", "lpm publish"],
-        tested: false,
-        test_file: None,
+        tested: true,
+        test_file: Some("tests/workflows/tests/cross_command_flows.rs"),
         catches: "every concern --check surfaces (quality, OIDC eligibility, registry routing) \
                   must match what the real publish actually does — no surprise on the second run.",
     },
     CrossCommandFlow {
         name: "doctor --fix → install (post-fix install succeeds)",
         commands: &["lpm doctor --fix --yes", "lpm install"],
-        tested: false,
-        test_file: None,
+        tested: true,
+        test_file: Some("tests/workflows/tests/cross_command_flows.rs"),
         catches: "the fixes doctor applied actually produce a healthy state for install; \
                   install does not re-trigger the same fixable issues.",
     },
