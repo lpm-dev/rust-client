@@ -382,6 +382,46 @@ fn publish_gitlab_dry_run_resolves_gitlab_target_in_json_envelope() {
 }
 
 #[test]
+fn publish_npm_dry_run_resolves_npm_target_in_json_envelope() {
+    let project = TempProject::empty(
+        r#"{
+        "name": "@my-org/npm-pkg",
+        "version": "1.0.0",
+        "description": "npm Packages dry-run target",
+        "main": "index.js",
+        "license": "MIT"
+    }"#,
+    );
+    project.write_file("index.js", "module.exports = {}");
+
+    let output = lpm(&project)
+        .args(["--json", "publish", "--dry-run", "--yes", "--npm"])
+        .output()
+        .expect("failed to run lpm publish --npm --dry-run");
+
+    assert!(
+        output.status.success(),
+        "publish --npm --dry-run --json must succeed\nstderr: {}",
+        String::from_utf8_lossy(&output.stderr),
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    let envelope: serde_json::Value = serde_json::from_str(&stdout)
+        .unwrap_or_else(|e| panic!("publish --json must be valid JSON: {e}\n---\n{stdout}"));
+
+    assert_eq!(envelope["dry_run"], serde_json::json!(true));
+    let targets = envelope["targets"]
+        .as_array()
+        .expect("targets must be an array");
+    assert!(
+        targets
+            .iter()
+            .any(|t| t["registry"] == serde_json::json!("npm")),
+        "--npm must surface a target with registry=npm, got: {targets:?}",
+    );
+}
+
+#[test]
 fn publish_github_and_gitlab_together_yields_two_targets() {
     let project = TempProject::empty(
         r#"{

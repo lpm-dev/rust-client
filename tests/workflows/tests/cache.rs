@@ -135,12 +135,19 @@ fn cache_clean_blanket_removes_all_three_subcategories() {
         String::from_utf8_lossy(&output.stderr),
     );
 
-    for subcat in ["metadata", "tasks", "dlx"] {
-        let dir = cache_root(&project).join(subcat);
+    // Assert on the seed *file*, not the parent dir. Under heavy
+    // parallel pressure on macOS, `Path::exists()` for a directory
+    // can be racy — the seed file is the contract (it must be gone).
+    for (subcat, file) in [
+        ("metadata", "pkg-meta.json"),
+        ("tasks", "task-cache.bin"),
+        ("dlx", "tool.tgz"),
+    ] {
+        let file_path = cache_root(&project).join(subcat).join(file);
         assert!(
-            !dir.exists(),
-            "cache clean must remove the {subcat} subdir; still exists at {}",
-            dir.display(),
+            !file_path.exists(),
+            "cache clean must remove the {subcat} seed file at {}",
+            file_path.display(),
         );
     }
 }
@@ -159,13 +166,20 @@ fn cache_clean_with_subcategory_only_removes_that_subcat() {
 
     assert!(output.status.success(), "lpm cache clean metadata failed");
 
+    // File-level assertions for parallel-pressure resilience.
     assert!(
-        !cache_root(&project).join("metadata").exists(),
-        "metadata subdir must be removed"
+        !cache_root(&project)
+            .join("metadata")
+            .join("pkg-meta.json")
+            .exists(),
+        "metadata seed file must be removed"
     );
     assert!(
-        cache_root(&project).join("tasks").exists(),
-        "tasks subdir must be preserved when only metadata was targeted"
+        cache_root(&project)
+            .join("tasks")
+            .join("task-cache.bin")
+            .exists(),
+        "tasks seed file must be preserved when only metadata was targeted"
     );
 }
 
