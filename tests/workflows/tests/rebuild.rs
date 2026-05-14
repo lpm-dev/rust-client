@@ -310,6 +310,41 @@ fn rebuild_allow_policy_widens_to_every_scripted_package() {
     );
 }
 
+/// Snapshot the `--policy=allow --json --dry-run` envelope so a future
+/// shape drift (renamed field, new top-level key) fails this test.
+/// Separate from the deny-policy snapshot above — same JSON schema,
+/// different selection semantics, but the envelope's keys must stay
+/// stable across both policy modes.
+#[test]
+fn rebuild_allow_policy_dry_run_json_envelope_matches_snapshot() {
+    let project = TempProject::empty("");
+    write_policy_manifest(&project, "rebuild-allow-snap", Some("allow"), &[]);
+    seed_scripted_package(&project, "green-native", "1.0.0", GREEN_POSTINSTALL);
+    seed_scripted_package(&project, "amber-playwright", "1.0.0", AMBER_POSTINSTALL);
+    write_lockfile_for_packages(
+        &project,
+        &[("green-native", "1.0.0"), ("amber-playwright", "1.0.0")],
+    );
+
+    let out = lpm(&project)
+        .args(["--json", "rebuild", "--dry-run"])
+        .output()
+        .expect("spawn lpm rebuild --json --dry-run --policy=allow");
+    assert!(out.status.success(), "rebuild --dry-run --json must exit 0");
+
+    let stdout = strip_ansi(&String::from_utf8_lossy(&out.stdout));
+    let envelope: serde_json::Value = serde_json::from_str(&stdout)
+        .unwrap_or_else(|e| panic!("rebuild --json must be valid JSON: {e}\n---\n{stdout}"));
+
+    insta::with_settings!({ filters => vec![
+        // Redact store dir + integrity hashes that vary across runs.
+        (r#""/[^"]+/store/[^"]+""#, r#""[STORE_DIR]""#),
+        (r#"sha512-[A-Za-z0-9+/=]+"#, "sha512-[REDACTED]"),
+    ]}, {
+        insta::assert_json_snapshot!("rebuild_allow_policy_dry_run_envelope", envelope);
+    });
+}
+
 /// Same widening behavior must reach the selection step from the CLI
 /// override path (`--policy=allow` AND its `--yolo` alias) — proves
 /// the resolved policy from main.rs's precedence chain reaches

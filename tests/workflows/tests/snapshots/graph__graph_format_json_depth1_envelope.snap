@@ -1,0 +1,28 @@
+---
+source: tests/workflows/tests/graph.rs
+expression: envelope
+---
+{
+  "success": true,
+  "root": "graph-test-project@1.0.0",
+  "packages": 0,
+  "lpm_packages": 0,
+  "npm_packages": 0,
+  "max_depth": 1,
+  "duplicates": [],
+  "nodes": [
+    {
+      "key": "graph-test-project@1.0.0",
+      "name": "graph-test-project",
+      "version": "1.0.0",
+      "registry": "unknown",
+      "depth": 0,
+      "is_direct": false,
+      "is_duplicate": false,
+      "is_root": true,
+      "dependency_count": 0,
+      "deps": []
+    }
+  ],
+  "edges": []
+}

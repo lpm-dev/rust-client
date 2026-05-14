@@ -820,3 +820,32 @@ fn graph_format_mermaid_emits_valid_mermaid_syntax_to_stdout() {
         "mermaid output must contain at least one edge (-->), got:\n{stdout}",
     );
 }
+
+// ─── --format json envelope snapshot ────────────────────────────────────
+
+#[test]
+fn graph_format_json_envelope_matches_snapshot() {
+    let project = graph_fixture();
+
+    // Use --depth 1 so the snapshot is small and the fixture's
+    // transitive shape doesn't bloat the diff.
+    let output = lpm(&project)
+        .args(["graph", "--format", "json", "--depth", "1"])
+        .output()
+        .expect("failed to run lpm graph --format json");
+
+    assert!(output.status.success(), "graph --format json must succeed");
+
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    let envelope: serde_json::Value = serde_json::from_str(stdout.trim())
+        .unwrap_or_else(|e| panic!("graph --format json must be valid JSON: {e}\n---\n{stdout}"));
+
+    insta::with_settings!({ filters => vec![
+        // Redact any numeric per-node metadata that may shift across
+        // platforms (file sizes, line counts, etc.) — depth/name
+        // structure is the stable contract.
+        (r#""size":\s*\d+"#, r#""size":[N]"#),
+    ]}, {
+        insta::assert_json_snapshot!("graph_format_json_depth1_envelope", envelope);
+    });
+}
