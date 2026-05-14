@@ -359,7 +359,7 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
     // ── id 12: lpm install (bare, lockfile fast-path) ──
     SurfaceV2 {
         id: 12,
-        scenarios: 50,
+        scenarios: 54,
         failure_modes_tested: &[
             "lockfile-missing (regenerate from package.json)",
             "save-policy (caret, exact, tilde)",
@@ -373,6 +373,10 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
             "registry returns valid metadata but missing tarball",
             "declared-integrity mismatch (Verdaccio tier)",
             "ghost-transitive fail-closed under --offline",
+            "workspace ghost-transitive fails closed with actionable error (non-offline path)",
+            "warns when LPM_RESOLVER=pubgrub + auto-install-peers under --json",
+            "silent when LPM_RESOLVER=pubgrub + auto-install-peers off",
+            "silent when default resolver + auto-install-peers on (no warning regression)",
         ],
         failure_modes_known: &[
             "concurrent install on same project (lock contention)",
@@ -393,7 +397,7 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
         ],
         json_contract_depth: JsonContractDepth::InstaSnapshot,
         scenarios_by_file: &[
-            ("tests/workflows/tests/install.rs", 17),
+            ("tests/workflows/tests/install.rs", 21),
             ("tests/workflows/tests/install_real_registry.rs", 14),
             ("tests/workflows/tests/install_overrides.rs", 7),
             ("tests/workflows/tests/install_patches.rs", 12),
@@ -403,7 +407,7 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
     // ── id 13: lpm install <pkg> (add-and-install) ──
     SurfaceV2 {
         id: 13,
-        scenarios: 9,
+        scenarios: 14,
         failure_modes_tested: &[
             "single-package install via mock registry",
             "caret-resolved range saved (not wildcard)",
@@ -414,6 +418,11 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
             "tilde range via project save-prefix=~",
             "wildcard save-prefix rejected",
             "contradictory save flags rejected",
+            "JSON envelope with one installed package matches snapshot",
+            "lockfile content matches snapshot after install <pkg>",
+            "JSON output contains installed package list",
+            "honors project lpm.toml save-prefix=~ when adding new dep",
+            "rejects project lpm.toml save-prefix=* (wildcard)",
         ],
         failure_modes_known: &[
             "registry 404 mid-install",
@@ -422,13 +431,13 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
             "save-prefix from CLI overriding malformed lpm.toml",
         ],
         json_contract_depth: JsonContractDepth::SemanticAsserts,
-        scenarios_by_file: &[("tests/workflows/tests/install.rs", 9)],
+        scenarios_by_file: &[("tests/workflows/tests/install.rs", 14)],
         last_audited_at: "2026-05-14",
     },
     // ── id 14: lpm install --offline ──
     SurfaceV2 {
         id: 14,
-        scenarios: 6,
+        scenarios: 10,
         failure_modes_tested: &[
             "offline with store succeeds",
             "offline empty-fingerprints emit null in envelope",
@@ -436,16 +445,19 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
             "offline reruns workspace member BFS expansion",
             "offline mixed-registry + file dep uses lockfile fast-path",
             "offline install capability round-trip end-to-end",
+            "offline handles F9-deduped workspace member",
+            "offline workspace ghost-transitive after manifest edit fails closed",
+            "offline refuses pre-r25 v1 lockfile under auto-install-peers",
+            "offline accepts pre-r25 v1 lockfile when auto-install-peers off",
         ],
         failure_modes_known: &[
             "store partially populated (missing tarball)",
             "cache corruption during offline read",
             "network drop interrupts offline reload",
-            "offline against pre-r25 v1 lockfile shape (cross-checked elsewhere)",
         ],
         json_contract_depth: JsonContractDepth::SemanticAsserts,
         scenarios_by_file: &[
-            ("tests/workflows/tests/install.rs", 5),
+            ("tests/workflows/tests/install.rs", 9),
             (
                 "tests/workflows/tests/install_offline_capability_roundtrip.rs",
                 1,
@@ -1559,7 +1571,10 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
             "approve-scripts on a project where the lockfile differs from the build-state.json",
         ],
         json_contract_depth: JsonContractDepth::SemanticAsserts,
-        scenarios_by_file: &[("tests/workflows/tests/approve_scripts.rs", 2)],
+        scenarios_by_file: &[(
+            "crates/lpm-cli/tests/approve_scripts_interactive_tty.rs",
+            2,
+        )],
         last_audited_at: "2026-05-14",
     },
     // ── id 72: lpm approve-scripts --list ──
