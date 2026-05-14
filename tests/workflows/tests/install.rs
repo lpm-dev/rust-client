@@ -505,7 +505,7 @@ async fn install_single_package_via_mock_registry() {
                 "name": "ms",
                 "version": "2.1.3",
                 "dist": {
-                    "tarball": format!("{}/tarballs/ms-2.1.3.tgz", mock.url()),
+                    "tarball": format!("{}/tarballs/ms/-/ms-2.1.3.tgz", mock.url()),
                     "integrity": format!("sha512-placeholder"),
                 },
                 "dependencies": {}
@@ -576,7 +576,7 @@ async fn install_json_envelope_with_one_package_matches_snapshot() {
                 "name": "ms",
                 "version": "2.1.3",
                 "dist": {
-                    "tarball": format!("{}/tarballs/ms-2.1.3.tgz", mock.url()),
+                    "tarball": format!("{}/tarballs/ms/-/ms-2.1.3.tgz", mock.url()),
                     "integrity": "sha512-placeholder",
                 },
                 "dependencies": {}
@@ -664,7 +664,7 @@ async fn install_lockfile_content_matches_snapshot() {
                 "name": "ms",
                 "version": "2.1.3",
                 "dist": {
-                    "tarball": format!("{}/tarballs/ms-2.1.3.tgz", mock.url()),
+                    "tarball": format!("{}/tarballs/ms/-/ms-2.1.3.tgz", mock.url()),
                     "integrity": "sha512-47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU=",
                 },
                 "dependencies": {}
@@ -722,7 +722,7 @@ async fn install_json_output_contains_package_list() {
                 "name": "ms",
                 "version": "2.1.3",
                 "dist": {
-                    "tarball": format!("{}/tarballs/ms-2.1.3.tgz", mock.url()),
+                    "tarball": format!("{}/tarballs/ms/-/ms-2.1.3.tgz", mock.url()),
                     "integrity": "sha512-placeholder",
                 },
                 "dependencies": {}
@@ -860,7 +860,7 @@ async fn install_lockfile_reuse_is_fast_path() {
                 "name": "ms",
                 "version": "2.1.3",
                 "dist": {
-                    "tarball": format!("{}/tarballs/ms-2.1.3.tgz", mock.url()),
+                    "tarball": format!("{}/tarballs/ms/-/ms-2.1.3.tgz", mock.url()),
                     "integrity": "sha512-placeholder",
                 },
                 "dependencies": {}
@@ -934,7 +934,7 @@ async fn install_up_to_date_json_includes_flag() {
                 "name": "ms",
                 "version": "2.1.3",
                 "dist": {
-                    "tarball": format!("{}/tarballs/ms-2.1.3.tgz", mock.url()),
+                    "tarball": format!("{}/tarballs/ms/-/ms-2.1.3.tgz", mock.url()),
                     "integrity": "sha512-placeholder",
                 },
                 "dependencies": {}
@@ -1001,7 +1001,7 @@ async fn install_offline_with_store_succeeds() {
                 "name": "ms",
                 "version": "2.1.3",
                 "dist": {
-                    "tarball": format!("{}/tarballs/ms-2.1.3.tgz", mock.url()),
+                    "tarball": format!("{}/tarballs/ms/-/ms-2.1.3.tgz", mock.url()),
                     "integrity": "sha512-placeholder",
                 },
                 "dependencies": {}
@@ -1186,7 +1186,7 @@ async fn mount_ms_2_1_3(mock: &MockRegistry) {
                 "name": "ms",
                 "version": "2.1.3",
                 "dist": {
-                    "tarball": format!("{}/tarballs/ms-2.1.3.tgz", mock.url()),
+                    "tarball": format!("{}/tarballs/ms/-/ms-2.1.3.tgz", mock.url()),
                     "integrity": "sha512-placeholder",
                 },
                 "dependencies": {}
@@ -1959,7 +1959,7 @@ async fn install_node_modules_package_json_has_correct_fields() {
                 "name": "ms",
                 "version": "2.1.3",
                 "dist": {
-                    "tarball": format!("{}/tarballs/ms-2.1.3.tgz", mock.url()),
+                    "tarball": format!("{}/tarballs/ms/-/ms-2.1.3.tgz", mock.url()),
                     "integrity": "sha512-47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU=",
                 },
                 "dependencies": {}
@@ -2041,7 +2041,7 @@ async fn install_creates_bin_symlink_for_binary_package() {
                 "version": "1.0.0",
                 "bin": { "my-cli": "./cli.js" },
                 "dist": {
-                    "tarball": format!("{}/tarballs/my-cli-1.0.0.tgz", mock.url()),
+                    "tarball": format!("{}/tarballs/my-cli/-/my-cli-1.0.0.tgz", mock.url()),
                     "integrity": "sha512-47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU=",
                 },
                 "dependencies": {}
@@ -2129,7 +2129,7 @@ async fn install_lockfile_is_deterministic_across_fresh_installs() {
                     "name": "ms",
                     "version": "2.1.3",
                     "dist": {
-                        "tarball": format!("{registry_url}/tarballs/ms-2.1.3.tgz"),
+                        "tarball": format!("{registry_url}/tarballs/ms/-/ms-2.1.3.tgz"),
                         "integrity": "sha512-47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU=",
                     },
                     "dependencies": {}
@@ -2330,7 +2330,7 @@ async fn install_hoisted_mode_places_transitive_dep_at_root() {
                     "name": "parent-pkg",
                     "version": "1.0.0",
                     "dist": {
-                        "tarball": format!("{}/tarballs/parent-pkg-1.0.0.tgz", mock.url()),
+                        "tarball": format!("{}/tarballs/parent-pkg/-/parent-pkg-1.0.0.tgz", mock.url()),
                         "integrity": compute_integrity(&parent_tarball),
                     },
                     "dependencies": { "middle-pkg": "^1.0.0" }
@@ -2346,7 +2346,7 @@ async fn install_hoisted_mode_places_transitive_dep_at_root() {
                     "name": "middle-pkg",
                     "version": "1.0.0",
                     "dist": {
-                        "tarball": format!("{}/tarballs/middle-pkg-1.0.0.tgz", mock.url()),
+                        "tarball": format!("{}/tarballs/middle-pkg/-/middle-pkg-1.0.0.tgz", mock.url()),
                         "integrity": compute_integrity(&middle_tarball),
                     },
                     "dependencies": { "leaf-pkg": "^1.0.0" }
@@ -2362,7 +2362,7 @@ async fn install_hoisted_mode_places_transitive_dep_at_root() {
                     "name": "leaf-pkg",
                     "version": "1.0.0",
                     "dist": {
-                        "tarball": format!("{}/tarballs/leaf-pkg-1.0.0.tgz", mock.url()),
+                        "tarball": format!("{}/tarballs/leaf-pkg/-/leaf-pkg-1.0.0.tgz", mock.url()),
                         "integrity": compute_integrity(&leaf_tarball),
                     },
                     "dependencies": {}
@@ -2425,7 +2425,7 @@ async fn install_does_not_auto_install_peer_dependencies() {
                 "name": "peer-host",
                 "version": "1.0.0",
                 "dist": {
-                    "tarball": format!("{}/tarballs/peer-host-1.0.0.tgz", mock.url()),
+                    "tarball": format!("{}/tarballs/peer-host/-/peer-host-1.0.0.tgz", mock.url()),
                     "integrity": compute_integrity(&host_tarball),
                 },
                 "dependencies": {},
@@ -2488,7 +2488,7 @@ async fn install_optional_dep_failure_does_not_abort_install() {
                     "name": "opt-host",
                     "version": "1.0.0",
                     "dist": {
-                        "tarball": format!("{}/tarballs/opt-host-1.0.0.tgz", mock.url()),
+                        "tarball": format!("{}/tarballs/opt-host/-/opt-host-1.0.0.tgz", mock.url()),
                         "integrity": compute_integrity(&host_tarball),
                     },
                     "dependencies": {},
@@ -2505,7 +2505,7 @@ async fn install_optional_dep_failure_does_not_abort_install() {
                     "name": "mandatory-pkg",
                     "version": "1.0.0",
                     "dist": {
-                        "tarball": format!("{}/tarballs/mandatory-pkg-1.0.0.tgz", mock.url()),
+                        "tarball": format!("{}/tarballs/mandatory-pkg/-/mandatory-pkg-1.0.0.tgz", mock.url()),
                         "integrity": compute_integrity(&mandatory_tarball),
                     },
                     "dependencies": {}
@@ -2566,7 +2566,7 @@ async fn install_lockfile_integrity_matches_stored_tarball_sha512() {
                 "name": "integrity-pkg",
                 "version": "1.0.0",
                 "dist": {
-                    "tarball": format!("{}/tarballs/integrity-pkg-1.0.0.tgz", mock.url()),
+                    "tarball": format!("{}/tarballs/integrity-pkg/-/integrity-pkg-1.0.0.tgz", mock.url()),
                     "integrity": expected_integrity.clone(),
                 },
                 "dependencies": {}
@@ -3225,7 +3225,7 @@ async fn offline_install_mixed_registry_and_file_dep_uses_lockfile_fast_path() {
                 "name": "is-number",
                 "version": "1.0.0",
                 "dist": {
-                    "tarball": format!("{}/tarballs/is-number-1.0.0.tgz", mock.url()),
+                    "tarball": format!("{}/tarballs/is-number/-/is-number-1.0.0.tgz", mock.url()),
                     "integrity": compute_integrity(&tarball),
                 },
                 "dependencies": {}
@@ -3608,7 +3608,7 @@ async fn mount_release_age_pkg(mock: &MockRegistry, published_at: &str) {
                 "version": RELEASE_AGE_VERSION,
                 "dist": {
                     "tarball": format!(
-                        "{}/tarballs/{RELEASE_AGE_PKG}-{RELEASE_AGE_VERSION}.tgz",
+                        "{}/tarballs/{RELEASE_AGE_PKG}/-/{RELEASE_AGE_PKG}-{RELEASE_AGE_VERSION}.tgz",
                         mock.url()
                     ),
                     "integrity": compute_integrity(&tarball),
@@ -3946,7 +3946,7 @@ async fn install_invalidates_freshness_cache_on_lpm_linker_flip() {
                 "name": "ms",
                 "version": "2.1.3",
                 "dist": {
-                    "tarball": format!("{}/tarballs/ms-2.1.3.tgz", mock.url()),
+                    "tarball": format!("{}/tarballs/ms/-/ms-2.1.3.tgz", mock.url()),
                     "integrity": format!("sha512-placeholder"),
                 },
                 "dependencies": {}
@@ -4074,7 +4074,7 @@ async fn install_invalid_lpm_linker_surfaces_through_sync_fast_lane() {
                 "name": "ms",
                 "version": "2.1.3",
                 "dist": {
-                    "tarball": format!("{}/tarballs/ms-2.1.3.tgz", mock.url()),
+                    "tarball": format!("{}/tarballs/ms/-/ms-2.1.3.tgz", mock.url()),
                     "integrity": format!("sha512-placeholder"),
                 },
                 "dependencies": {}

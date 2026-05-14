@@ -133,7 +133,7 @@ async fn lpm_add_with_mixed_registry_deps_installs_and_writes_resolved_specs() {
                     "name": "lucide-react",
                     "version": "0.400.0",
                     "dist": {
-                        "tarball": format!("{}/tarballs/lucide-react-0.400.0.tgz", mock.url()),
+                        "tarball": format!("{}/tarballs/lucide-react/-/lucide-react-0.400.0.tgz", mock.url()),
                         "integrity": "sha512-placeholder",
                     },
                     "dependencies": {}
@@ -149,7 +149,7 @@ async fn lpm_add_with_mixed_registry_deps_installs_and_writes_resolved_specs() {
                     "name": "lodash",
                     "version": "4.17.21",
                     "dist": {
-                        "tarball": format!("{}/tarballs/lodash-4.17.21.tgz", mock.url()),
+                        "tarball": format!("{}/tarballs/lodash/-/lodash-4.17.21.tgz", mock.url()),
                         "integrity": "sha512-placeholder",
                     },
                     "dependencies": {}
@@ -395,7 +395,7 @@ async fn lpm_add_rollback_restores_manifest_and_source_files_on_install_failure(
                 "name": "unfetchable",
                 "version": "1.0.0",
                 "dist": {
-                    "tarball": format!("{}/tarballs/unfetchable-1.0.0.tgz", mock.url()),
+                    "tarball": format!("{}/tarballs/unfetchable/-/unfetchable-1.0.0.tgz", mock.url()),
                     "integrity": "sha512-placeholder",
                 },
                 "dependencies": {}

@@ -722,6 +722,39 @@ where
     }
 }
 
+// ─── Project install lock ─────────────────────────────────────────────
+
+/// Path to the per-project `lpm install` exclusive lock at
+/// `<project_dir>/.lpm/.install.lock`.
+///
+/// Acquired exclusively (via [`with_exclusive_lock_async`]) by the
+/// `lpm install`, `lpm install <pkg>`, `lpm install --filter`, and
+/// `lpm add` entry points so two concurrent invocations on the same
+/// project serialize through the manifest snapshot → install →
+/// lockfile commit window. Without this lock, both processes would
+/// snapshot the same pre-edit `package.json`, both stage their own
+/// dep on top, and the second-to-commit silently overwrites the
+/// first's edits — see finding #77.
+///
+/// Lock scope is per-project: unrelated installs in different
+/// projects do not contend. Within a single project, the lock holds
+/// from `ManifestTransaction::snapshot_install_state` through
+/// `tx.commit()`, covering `package.json` + `lpm.lock` + `lpm.lockb`
+/// + `.lpm/install-hash` + `node_modules/` mutations.
+///
+/// **Advisory semantics.** External tools (manual edits to
+/// `package.json`, `rm -rf node_modules`) are not blocked. Defends
+/// only against concurrent `lpm` invocations that participate in
+/// the locking protocol.
+///
+/// **The lock file's parent (`<project_dir>/.lpm/`) is created on
+/// demand by [`open_lock_file`]** — callers do not need to mkdir
+/// first. The same `.lpm/` directory holds `install-hash` and is
+/// the canonical project-local LPM state directory.
+pub fn project_install_lock(project_dir: &Path) -> PathBuf {
+    project_dir.join(".lpm").join(".install.lock")
+}
+
 // ─── Windows long-path helper ─────────────────────────────────────────
 
 /// Return a path safe for filesystem APIs that would otherwise hit the

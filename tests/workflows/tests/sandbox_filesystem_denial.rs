@@ -148,7 +148,10 @@ fn project_manifest() -> String {
 /// sandbox enforcement, not cooldown side effects.
 async fn mount_fs_denial_dep(mock: &MockRegistry, tarball: &[u8]) {
     mock.with_package(DEP_NAME, DEP_VERSION, tarball).await;
-    let tarball_url = format!("{}/tarballs/{DEP_NAME}-{DEP_VERSION}.tgz", mock.url());
+    let tarball_url = format!(
+        "{}/tarballs/{DEP_NAME}/-/{DEP_NAME}-{DEP_VERSION}.tgz",
+        mock.url()
+    );
     let integrity = support::mock_registry::compute_integrity(tarball);
     let version_owned = DEP_VERSION.to_string();
     let mut versions = serde_json::Map::new();

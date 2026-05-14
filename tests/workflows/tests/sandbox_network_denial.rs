@@ -194,7 +194,10 @@ fn project_manifest(dep_name: &str) -> String {
 /// not cooldown side effects.
 async fn mount_net_denial_dep(mock: &MockRegistry, dep_name: &str, tarball: &[u8]) {
     mock.with_package(dep_name, DEP_VERSION, tarball).await;
-    let tarball_url = format!("{}/tarballs/{dep_name}-{DEP_VERSION}.tgz", mock.url());
+    let tarball_url = format!(
+        "{}/tarballs/{dep_name}/-/{dep_name}-{DEP_VERSION}.tgz",
+        mock.url()
+    );
     let integrity = support::mock_registry::compute_integrity(tarball);
     let version_owned = DEP_VERSION.to_string();
     let mut versions = serde_json::Map::new();
