@@ -49,12 +49,12 @@ fn coverage_audit_baseline_shape_matches_phase65_matrix() {
         .filter(|surface| !surface.has_any_coverage())
         .count();
     assert_eq!(
-        covered, 134,
-        "Phase 65 baseline should have 134 covered rows"
+        covered, 135,
+        "all command surfaces now have at least one tier of coverage (vault was the last uncovered row before the env+vault tranche)"
     );
     assert_eq!(
-        uncovered, 1,
-        "Phase 65 baseline should have 1 uncovered row"
+        uncovered, 0,
+        "no surface should be uncovered after the env+vault tranche"
     );
 }
 
