@@ -990,12 +990,13 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         name: "`lpm skills list/install/validate/clean`",
         unit: true,
         integration: true,
-        workflow: false,
+        workflow: true,
         cli_binary: false,
-        json_contract: false,
+        json_contract: true,
         references: &[
             "crates/lpm-cli/src/commands/skills.rs",
             "tests/integration/tests/output_parity.rs",
+            "tests/workflows/tests/skills.rs",
         ],
     },
     SurfaceBaseline {
