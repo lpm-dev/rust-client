@@ -39,6 +39,31 @@ mod non_macos {
     }
 
     #[test]
+    fn vault_open_on_non_macos_under_json_emits_error_envelope_on_stdout() {
+        let project = TempProject::empty(r#"{"name":"vault","version":"1.0.0"}"#);
+
+        let out = lpm(&project)
+            .args(["--json", "vault", "open"])
+            .output()
+            .expect("failed to run lpm vault open --json");
+
+        let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+        let envelope: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap_or_else(|e| {
+            panic!("vault --json error path must emit JSON: {e}\n---\n{stdout}")
+        });
+        assert_eq!(envelope["success"], serde_json::json!(false));
+        let combined = format!(
+            "{}{}",
+            envelope.to_string(),
+            String::from_utf8_lossy(&out.stderr),
+        );
+        assert!(
+            combined.contains("macOS only") || combined.contains("not yet supported"),
+            "envelope or stderr must explain the macOS-only restriction, got:\n{combined}",
+        );
+    }
+
+    #[test]
     fn vault_bare_defaults_to_open_action_and_fails_on_non_macos() {
         let project = TempProject::empty(r#"{"name":"vault","version":"1.0.0"}"#);
 
@@ -112,5 +137,21 @@ mod macos {
             stderr.contains("open") && stderr.contains("update") && stderr.contains("version"),
             "stderr must enumerate the available actions, got:\n{stderr}",
         );
+    }
+
+    #[test]
+    fn vault_unknown_action_under_json_emits_error_envelope_on_stdout() {
+        let project = TempProject::empty(r#"{"name":"vault","version":"1.0.0"}"#);
+
+        let out = lpm(&project)
+            .args(["--json", "vault", "not-a-real-action"])
+            .output()
+            .expect("failed to run lpm --json vault bogus");
+
+        let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+        let envelope: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap_or_else(|e| {
+            panic!("vault --json unknown-action must emit JSON: {e}\n---\n{stdout}")
+        });
+        assert_eq!(envelope["success"], serde_json::json!(false));
     }
 }

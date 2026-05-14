@@ -21,6 +21,35 @@ fn graph_fixture() -> TempProject {
     TempProject::from_fixture("graph-project")
 }
 
+// ─── bare `lpm graph` (tree default): --json error envelope ──────────
+
+/// `lpm --json graph` on a project without `lpm.lock` must surface the
+/// missing-lockfile error as a JSON envelope on stdout (not a free-form
+/// stderr message). The default `tree` format renderer doesn't emit a
+/// success envelope — that's `--format json` (a separate surface). The
+/// load-bearing claim on the bare-tree surface is the error path's
+/// envelope shape.
+#[test]
+fn graph_bare_under_json_without_lockfile_emits_error_envelope_on_stdout() {
+    let project = TempProject::empty(r#"{"name":"graph-bare","version":"1.0.0"}"#);
+
+    let output = lpm(&project)
+        .args(["--json", "graph"])
+        .output()
+        .expect("failed to run lpm --json graph");
+
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    let envelope: serde_json::Value = serde_json::from_str(stdout.trim())
+        .unwrap_or_else(|e| panic!("--json graph must emit JSON: {e}\n---\n{stdout}"));
+    assert_eq!(envelope["success"], serde_json::json!(false));
+    assert!(
+        envelope["error"]
+            .as_str()
+            .is_some_and(|s| s.contains("lpm.lock") || s.contains("lockfile")),
+        "error message must reference the missing lockfile, got: {envelope}",
+    );
+}
+
 // ─── --format html writes to .lpm/graph.html ────────────────────────
 
 #[test]

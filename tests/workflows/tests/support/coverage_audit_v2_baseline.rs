@@ -695,14 +695,17 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
     SurfaceV2 {
         id: 26,
         scenarios: 1,
-        failure_modes_tested: &["interactive + JSON hard error"],
+        failure_modes_tested: &[
+            "interactive + JSON hard error",
+            "JSON error envelope shape on -i+--json mutual-exclusion",
+        ],
         failure_modes_known: &[
             "interactive walk under TTY (PTY-driven)",
             "user CTRL-C mid-prompt",
             "terminal resize mid-render",
             "interactive in non-TTY environment falls back to batch",
         ],
-        json_contract_depth: JsonContractDepth::None,
+        json_contract_depth: JsonContractDepth::SemanticAsserts,
         scenarios_by_file: &[],
         last_audited_at: "2026-05-14",
     },
@@ -897,6 +900,7 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
         scenarios: 3,
         failure_modes_tested: &[
             "logout prevents startup session rehydration",
+            "logout --json envelope carries success=true",
             "logout skips browser-pairing revocation without refresh token",
             "logout clears recent token validation marker",
         ],
@@ -905,7 +909,7 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
             "partial logout on permission denied",
             "logout while a publish is mid-flight",
         ],
-        json_contract_depth: JsonContractDepth::None,
+        json_contract_depth: JsonContractDepth::SemanticAsserts,
         scenarios_by_file: &[],
         last_audited_at: "2026-05-14",
     },
@@ -916,6 +920,7 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
         failure_modes_tested: &[
             "refresh-only logout-all clears everything + does not rehydrate",
             "logout-all clears lpm + external registry state",
+            "logout-all --json envelope carries success=true",
             "logout-all normalizes malformed custom registry tracking + clears file-backed tokens",
             "logout-registry clears only targeted custom-registry state",
         ],
@@ -924,7 +929,7 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
             "all flag with selective removal ambiguity",
             "revoke during a CI-managed token rotation",
         ],
-        json_contract_depth: JsonContractDepth::None,
+        json_contract_depth: JsonContractDepth::SemanticAsserts,
         scenarios_by_file: &[],
         last_audited_at: "2026-05-14",
     },
@@ -996,14 +1001,17 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
     SurfaceV2 {
         id: 44,
         scenarios: 1,
-        failure_modes_tested: &["writes value into isolated home"],
+        failure_modes_tested: &[
+            "writes value into isolated home",
+            "--json envelope carries success + action + key + value",
+        ],
         failure_modes_known: &[
             "invalid JSON value rejected",
             "config file permission denied on write",
             "concurrent config writes (last-writer-wins vs lock)",
             "set on a key that violates a typed schema",
         ],
-        json_contract_depth: JsonContractDepth::None,
+        json_contract_depth: JsonContractDepth::SemanticAsserts,
         scenarios_by_file: &[],
         last_audited_at: "2026-05-14",
     },
@@ -1011,14 +1019,17 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
     SurfaceV2 {
         id: 45,
         scenarios: 1,
-        failure_modes_tested: &["removes existing key + preserves other entries"],
+        failure_modes_tested: &[
+            "removes existing key + preserves other entries",
+            "--json envelope carries success + action + key + existed",
+        ],
         failure_modes_known: &[
             "delete last key (file removed vs left empty)",
             "permission denied on file",
             "concurrent delete + set on same key",
             "delete of a nonexistent key (idempotent vs error)",
         ],
-        json_contract_depth: JsonContractDepth::None,
+        json_contract_depth: JsonContractDepth::SemanticAsserts,
         scenarios_by_file: &[],
         last_audited_at: "2026-05-14",
     },
@@ -1204,14 +1215,17 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
     // ── id 56: lpm global path <pkg> ──
     SurfaceV2 {
         id: 56,
-        scenarios: 1,
-        failure_modes_tested: &["unknown package fails with helpful message"],
+        scenarios: 2,
+        failure_modes_tested: &[
+            "unknown package fails with helpful message",
+            "unknown package under --json emits error envelope on stdout",
+        ],
         failure_modes_known: &[
             "package path symlink outside global dir (containment check)",
             "global store corrupted entry",
             "path of a package installed via cargo-install fallback",
         ],
-        json_contract_depth: JsonContractDepth::None,
+        json_contract_depth: JsonContractDepth::SemanticAsserts,
         scenarios_by_file: &[],
         last_audited_at: "2026-05-14",
     },
@@ -2008,16 +2022,19 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
     // ── id 96: lpm env init ──
     SurfaceV2 {
         id: 96,
-        scenarios: 1,
-        failure_modes_tested: &["vault initialization happens implicitly on first `env set`"],
+        scenarios: 2,
+        failure_modes_tested: &[
+            "vault initialization happens implicitly on first `env set`",
+            "explicit `env init --json` envelope carries environments[] + actions[]",
+        ],
         failure_modes_known: &[
             "concurrent env init from two CLIs",
             "storage quota exceeded on init",
             "init in an already-initialized vault (idempotent vs error)",
             "init under a HOME with restricted permissions",
         ],
-        json_contract_depth: JsonContractDepth::None,
-        scenarios_by_file: &[("tests/workflows/tests/env_local.rs", 1)],
+        json_contract_depth: JsonContractDepth::SemanticAsserts,
+        scenarios_by_file: &[("tests/workflows/tests/env_local.rs", 2)],
         last_audited_at: "2026-05-14",
     },
     // ── id 97: lpm env ls / list ──
@@ -2065,10 +2082,10 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
         id: 99,
         scenarios: 4,
         failure_modes_tested: &[
-            "import from dotenv populates vault",
-            "export writes dotenv with all keys",
+            "import from dotenv populates vault (envelope: success + imported count)",
+            "export writes dotenv with all keys (envelope: success + exported count)",
             "print streams keys to stdout",
-            "copy duplicates environment into target",
+            "copy duplicates environment into target (envelope: success)",
         ],
         failure_modes_known: &[
             "malformed import file (helpful diagnostics)",
@@ -2076,7 +2093,7 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
             "import overwrites existing without --force",
             "copy across two pair-bound vaults on the same machine",
         ],
-        json_contract_depth: JsonContractDepth::None,
+        json_contract_depth: JsonContractDepth::SemanticAsserts,
         scenarios_by_file: &[("tests/workflows/tests/env_local.rs", 4)],
         last_audited_at: "2026-05-14",
     },
@@ -2268,11 +2285,12 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
     // ── id 112: lpm graph (tree default) ──
     SurfaceV2 {
         id: 112,
-        scenarios: 3,
+        scenarios: 4,
         failure_modes_tested: &[
             "--depth truncates JSON format",
             "--depth truncates HTML stats summary",
             "stats max-depth matches flag input",
+            "bare graph --json without lockfile emits error envelope on stdout",
         ],
         failure_modes_known: &[
             "graph cycle detection in tree output",
@@ -2280,7 +2298,7 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
             "graph on a workspace with circular members",
             "graph against a fully hoisted vs isolated layout",
         ],
-        json_contract_depth: JsonContractDepth::None,
+        json_contract_depth: JsonContractDepth::SemanticAsserts,
         scenarios_by_file: &[],
         last_audited_at: "2026-05-14",
     },
@@ -2459,14 +2477,17 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
     SurfaceV2 {
         id: 122,
         scenarios: 1,
-        failure_modes_tested: &["rollback restores original"],
+        failure_modes_tested: &[
+            "rollback restores original",
+            "--json envelope carries success + rollback flag + restored_files[]",
+        ],
         failure_modes_known: &[
             "rollback without backup",
             "partial rollback recovery",
             "rollback after manual lockfile edits since the backup",
             "rollback under a workspace where some members migrated + others didn't",
         ],
-        json_contract_depth: JsonContractDepth::None,
+        json_contract_depth: JsonContractDepth::SemanticAsserts,
         scenarios_by_file: &[],
         last_audited_at: "2026-05-14",
     },
@@ -2494,6 +2515,7 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
         scenarios: 4,
         failure_modes_tested: &[
             "--ci generates workflow template file",
+            "--ci --json envelope carries success=true alongside file emission",
             "without --ci does not generate workflow file",
             "--no-npmrc skips npmrc creation",
             "default creates npmrc unless --no-npmrc",
@@ -2503,7 +2525,7 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
             "--no-npmrc cleanup on error mid-write",
             "--ci + --no-npmrc interaction matrix",
         ],
-        json_contract_depth: JsonContractDepth::None,
+        json_contract_depth: JsonContractDepth::SemanticAsserts,
         scenarios_by_file: &[],
         last_audited_at: "2026-05-14",
     },
@@ -2513,17 +2535,19 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
         scenarios: 5,
         failure_modes_tested: &[
             "open on non-macos fails with unsupported message",
+            "open on non-macos under --json emits error envelope on stdout",
             "bare defaults to open + fails on non-macos",
             "update on non-macos fails with unsupported message",
             "version on non-macos fails with unsupported message",
             "unknown action fails with helpful message",
+            "unknown action under --json emits error envelope on stdout",
         ],
         failure_modes_known: &[
             "macos-only happy paths (open / update / version, no test today)",
             "vault unlock race on macos",
             "vault under a HOME mounted from a network share",
         ],
-        json_contract_depth: JsonContractDepth::None,
+        json_contract_depth: JsonContractDepth::SemanticAsserts,
         scenarios_by_file: &[],
         last_audited_at: "2026-05-14",
     },

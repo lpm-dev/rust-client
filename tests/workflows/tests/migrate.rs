@@ -531,11 +531,31 @@ fn migrate_rollback_restores_original() {
         "migrate must create .gitattributes (records lpm.lockb as binary)"
     );
 
-    // Now rollback
-    lpm(&project)
-        .args(["migrate", "--rollback"])
-        .assert()
-        .success();
+    // Now rollback — read the --json envelope so the contract is pinned
+    // alongside the file-system effect assertions below.
+    let rollback_out = lpm(&project)
+        .args(["--json", "migrate", "--rollback"])
+        .output()
+        .expect("failed to run lpm migrate --rollback --json");
+    assert!(
+        rollback_out.status.success(),
+        "migrate --rollback failed:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&rollback_out.stdout),
+        String::from_utf8_lossy(&rollback_out.stderr),
+    );
+    let rollback_envelope: serde_json::Value = serde_json::from_slice(&rollback_out.stdout)
+        .unwrap_or_else(|e| {
+            panic!(
+                "migrate --rollback --json stdout must be valid JSON: {e}\n---\n{}",
+                String::from_utf8_lossy(&rollback_out.stdout)
+            )
+        });
+    assert_eq!(rollback_envelope["success"], serde_json::json!(true));
+    assert_eq!(rollback_envelope["rollback"], serde_json::json!(true));
+    assert!(
+        rollback_envelope["restored_files"].is_array(),
+        "envelope must carry a restored_files array"
+    );
 
     // After rollback, every file the migration created must be gone —
     // `lpm.lock` and `lpm.lockb` (the lockfile pair), plus
@@ -688,7 +708,7 @@ fn migrate_with_ci_flag_generates_workflow_template_file() {
         .expect("seed .github/workflows");
 
     let output = lpm(&project)
-        .args(["migrate", "--no-install", "--force", "--ci"])
+        .args(["--json", "migrate", "--no-install", "--force", "--ci"])
         .output()
         .expect("failed to run lpm migrate --ci");
 
@@ -698,6 +718,18 @@ fn migrate_with_ci_flag_generates_workflow_template_file() {
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr),
     );
+
+    // The --json envelope carries the migration summary even when the
+    // --ci side effect (workflow file emission) is the user-visible
+    // claim. Pin the envelope's `success` so the JSON contract is
+    // testable alongside the file-system effect.
+    let envelope: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap_or_else(|e| {
+        panic!(
+            "migrate --ci --json stdout must be valid JSON: {e}\n---\n{}",
+            String::from_utf8_lossy(&output.stdout)
+        )
+    });
+    assert_eq!(envelope["success"], serde_json::json!(true));
 
     // A new workflow file must exist under .github/workflows/ after --ci.
     let entries: Vec<_> = std::fs::read_dir(project.path().join(".github/workflows"))

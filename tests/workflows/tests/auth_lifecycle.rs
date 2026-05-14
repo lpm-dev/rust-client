@@ -925,7 +925,7 @@ async fn logout_prevents_startup_session_rehydration() {
     mark_recent_token_validation(project.home());
 
     let logout = lpm_with_registry(&project, &mock.url())
-        .args(["logout"])
+        .args(["--json", "logout"])
         .output()
         .expect("failed to run lpm logout");
 
@@ -935,6 +935,9 @@ async fn logout_prevents_startup_session_rehydration() {
         String::from_utf8_lossy(&logout.stdout),
         String::from_utf8_lossy(&logout.stderr),
     );
+
+    let logout_envelope = parse_json_output(&logout.stdout);
+    assert_eq!(logout_envelope["success"], serde_json::json!(true));
 
     assert!(
         !credentials_path(project.home()).exists(),
@@ -1011,7 +1014,7 @@ async fn logout_all_clears_lpm_and_external_registry_state() {
     mark_recent_token_validation(project.home());
 
     let logout = lpm_with_registry(&project, &mock.url())
-        .args(["logout", "--all"])
+        .args(["--json", "logout", "--all"])
         .output()
         .expect("failed to run lpm logout --all");
 
@@ -1021,6 +1024,9 @@ async fn logout_all_clears_lpm_and_external_registry_state() {
         String::from_utf8_lossy(&logout.stdout),
         String::from_utf8_lossy(&logout.stderr),
     );
+
+    let logout_envelope = parse_json_output(&logout.stdout);
+    assert_eq!(logout_envelope["success"], serde_json::json!(true));
 
     assert!(
         !credentials_path(project.home()).exists(),

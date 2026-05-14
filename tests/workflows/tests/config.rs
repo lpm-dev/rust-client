@@ -18,7 +18,13 @@ fn config_set_writes_value_into_isolated_home() {
     let project = TempProject::empty(r#"{"name":"config-test","version":"1.0.0"}"#);
 
     let output = lpm(&project)
-        .args(["config", "set", "registry", "https://registry.example.test"])
+        .args([
+            "--json",
+            "config",
+            "set",
+            "registry",
+            "https://registry.example.test",
+        ])
         .output()
         .expect("failed to run lpm config set");
 
@@ -28,6 +34,14 @@ fn config_set_writes_value_into_isolated_home() {
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr),
     );
+
+    let envelope: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap_or_else(|e| {
+        panic!(
+            "config set --json stdout must be valid JSON: {e}\n---\n{}",
+            String::from_utf8_lossy(&output.stdout)
+        )
+    });
+    assert_eq!(envelope["success"], serde_json::json!(true));
 
     let content = std::fs::read_to_string(config_path(&project))
         .expect("config set must create ~/.lpm/config.toml in the isolated HOME");
@@ -76,7 +90,7 @@ fn config_delete_removes_existing_key_and_preserves_other_entries() {
     );
 
     let output = lpm(&project)
-        .args(["config", "delete", "registry"])
+        .args(["--json", "config", "delete", "registry"])
         .output()
         .expect("failed to run lpm config delete");
 
@@ -86,6 +100,14 @@ fn config_delete_removes_existing_key_and_preserves_other_entries() {
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr),
     );
+
+    let envelope: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap_or_else(|e| {
+        panic!(
+            "config delete --json stdout must be valid JSON: {e}\n---\n{}",
+            String::from_utf8_lossy(&output.stdout)
+        )
+    });
+    assert_eq!(envelope["success"], serde_json::json!(true));
 
     let content =
         std::fs::read_to_string(config_path(&project)).expect("config file must still exist");
