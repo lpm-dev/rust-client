@@ -120,3 +120,96 @@ fn ci_setup_github_actions_uses_project_vault_id_and_requested_env_name() {
         "setup output must print the matching authorization command, got:\n{stdout}"
     );
 }
+
+// ─── ci setup gitlab ──────────────────────────────────────────────────
+
+#[test]
+fn ci_setup_gitlab_emits_id_tokens_block_and_authorization_command() {
+    let project = TempProject::empty(r#"{"name":"ci-gitlab","version":"1.0.0"}"#);
+
+    let output = lpm(&project)
+        .args(["ci", "setup", "gitlab"])
+        .output()
+        .expect("failed to run lpm ci setup gitlab");
+
+    assert!(
+        output.status.success(),
+        "lpm ci setup gitlab failed:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("GitLab CI OIDC Setup"),
+        "setup output must identify the GitLab CI snippet, got:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("LPM_OIDC_TOKEN") && stdout.contains("aud: https://lpm.dev"),
+        "setup snippet must declare the `LPM_OIDC_TOKEN` id_tokens block, got:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("lpm env oidc allow --provider=gitlab"),
+        "setup output must print the matching authorization command, got:\n{stdout}"
+    );
+}
+
+#[test]
+fn ci_setup_gitlab_with_env_flag_threads_the_env_name() {
+    let project = TempProject::empty(r#"{"name":"ci-gitlab","version":"1.0.0"}"#);
+
+    let output = lpm(&project)
+        .args(["ci", "setup", "gitlab", "--env=staging"])
+        .output()
+        .expect("failed to run lpm ci setup gitlab --env=staging");
+
+    assert!(output.status.success(), "ci setup gitlab --env failed");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("--env=staging"),
+        "setup output must thread the requested env name into the pull step + authorization command, got:\n{stdout}"
+    );
+}
+
+#[test]
+fn ci_setup_unknown_platform_fails_with_helpful_message() {
+    let project = TempProject::empty(r#"{"name":"ci","version":"1.0.0"}"#);
+
+    let output = lpm(&project)
+        .args(["ci", "setup", "bitbucket"])
+        .output()
+        .expect("failed to run lpm ci setup bitbucket");
+
+    assert!(
+        !output.status.success(),
+        "unknown CI platform must exit non-zero"
+    );
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("github-actions") && stderr.contains("gitlab"),
+        "stderr must list valid platforms, got:\n{stderr}",
+    );
+}
+
+#[test]
+fn ci_setup_without_platform_arg_fails_with_usage_message() {
+    let project = TempProject::empty(r#"{"name":"ci","version":"1.0.0"}"#);
+
+    let output = lpm(&project)
+        .args(["ci", "setup"])
+        .output()
+        .expect("failed to run lpm ci setup (no platform)");
+
+    assert!(
+        !output.status.success(),
+        "ci setup without platform must exit non-zero"
+    );
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("usage:") || stderr.contains("Available"),
+        "stderr must show usage, got:\n{stderr}",
+    );
+}
