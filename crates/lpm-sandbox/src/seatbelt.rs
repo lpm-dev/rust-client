@@ -16,7 +16,7 @@
 #![cfg(target_os = "macos")]
 
 use crate::{SandboxError, SandboxSpec};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// Render the Enforce-mode Seatbelt profile for the given
 /// [`SandboxSpec`]. The returned string is safe to pass to
@@ -42,10 +42,10 @@ pub(crate) fn render_profile(
     // host) — their subpaths are constructed from the canonical
     // bases below so `.husky`, `.cache`, etc. get the right prefix
     // whether or not those subpaths exist yet.
-    let canon_package_dir = canonicalize_best_effort(&spec.package_dir);
-    let canon_project_dir = canonicalize_best_effort(&spec.project_dir);
-    let canon_home_dir = canonicalize_best_effort(&spec.home_dir);
-    let canon_tmpdir = canonicalize_best_effort(&spec.tmpdir);
+    let canon_package_dir = canonicalize_or_passthrough(&spec.package_dir, "package_dir")?;
+    let canon_project_dir = canonicalize_or_passthrough(&spec.project_dir, "project_dir")?;
+    let canon_home_dir = canonicalize_or_passthrough(&spec.home_dir, "home_dir")?;
+    let canon_tmpdir = canonicalize_or_passthrough(&spec.tmpdir, "tmpdir")?;
 
     let package_dir = quoted_path(&canon_package_dir, "package_dir")?;
     let project_dir = quoted_path(&canon_project_dir, "project_dir")?;
@@ -87,8 +87,9 @@ pub(crate) fn render_profile(
                 ),
             });
         }
-        let canon = canonicalize_best_effort(p);
-        extras.push(quoted_path(&canon, &format!("extra_write_dirs[{i}]"))?);
+        let field = format!("extra_write_dirs[{i}]");
+        let canon = canonicalize_or_passthrough(p, &field)?;
+        extras.push(quoted_path(&canon, &field)?);
     }
 
     let mut out = String::with_capacity(1024 + 64 * extras.len());
@@ -236,18 +237,40 @@ fn quoted_path(p: &Path, field: &str) -> Result<String, SandboxError> {
 /// `/tmp` -> `/private/tmp`; rules spelled in the short form do
 /// NOT match enforcement-time requests against the long form.
 ///
-/// Best-effort: if the path doesn't exist (e.g. a synthetic spec
-/// in unit tests, or an `extra_write_dirs` entry the user hasn't
-/// created yet), we return the original path verbatim. At
-/// enforcement time the kernel's own symlink resolution still
-/// applies, so for paths with no symlinks in their component chain
-/// the rule will match regardless. Paths that DO traverse a
-/// symlink but don't exist on the host lose symlink resolution —
-/// but that's a caller bug (spec referencing a nonexistent path)
-/// that would surface as a runtime denial the first time a script
-/// tried to touch the path.
-fn canonicalize_best_effort(path: &Path) -> std::path::PathBuf {
-    std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+/// Behavior:
+/// - **Success**: return the canonical path.
+/// - **NotFound** (the path doesn't exist on the host — synthetic
+///   test spec, or `extra_write_dirs` entry the script will create
+///   on first run): passthrough the input unchanged. The kernel's
+///   own symlink resolution still applies at enforcement time, so
+///   paths with no symlinks in their component chain still match.
+///   Paths that *do* traverse a symlink but don't exist lose
+///   symlink resolution — that surfaces as a runtime denial the
+///   first time a script touches the path, which is the correct
+///   "user-visible failure" shape for a misconfigured spec.
+/// - **Any other I/O error** (EIO from a flaky NFS mount, EACCES
+///   on a parent component, ELOOP, etc.): fail loud as
+///   `ProfileRenderFailed`. The earlier `unwrap_or_else(|_| ...)`
+///   silently treated these as passthrough, which produced a rule
+///   spelled `/var/folders/...` while the kernel enforced against
+///   `/private/var/folders/...` — a hidden-state contract break
+///   that manifests as legitimate operations being denied.
+fn canonicalize_or_passthrough(path: &Path, field: &str) -> Result<PathBuf, SandboxError> {
+    match std::fs::canonicalize(path) {
+        Ok(p) => Ok(p),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(path.to_path_buf()),
+        Err(e) => Err(SandboxError::ProfileRenderFailed {
+            reason: format!(
+                "canonicalize {field} ({}) failed: {e} (kind: {:?}) — likely a \
+                 transient I/O error (NFS mount glitch, EACCES on a parent, \
+                 symlink loop). Refusing to render a profile with an \
+                 un-resolved base path; that would silently mis-match \
+                 enforcement-time symlink resolution on macOS.",
+                path.display(),
+                e.kind()
+            ),
+        }),
+    }
 }
 
 fn scheme_quote(s: &str) -> String {
@@ -594,6 +617,94 @@ mod tests {
             .strip_prefix("(version 1)\n(allow (with report) default)\n")
             .unwrap();
         assert_eq!(enforce_after_header, logonly_after_header);
+    }
+
+    #[test]
+    fn canonicalize_passes_through_nonexistent_paths() {
+        // Unit-test specs use synthetic paths (`/lpm-store/prisma@…`,
+        // `/home/u/proj`) that don't exist on the host. The canonical
+        // form falls back to the original path so render_profile() is
+        // testable without staging real dirs. Pin this so a future
+        // tightening of `canonicalize_or_passthrough` that fails on
+        // NotFound (rather than only on real I/O errors) is caught.
+        let p = render_profile(&spec(), false).unwrap();
+        assert!(p.contains("/lpm-store/prisma@5.22.0"));
+        assert!(p.contains("/home/u/proj"));
+    }
+
+    #[test]
+    fn canonicalize_resolves_symlink_in_base_path_to_enforcement_form() {
+        // Regression for the symlink-resolution contract: the
+        // rendered rule must match the form the kernel uses at
+        // enforcement time. We stage a real symlink (`link -> target`)
+        // inside a tempdir and pass `link` as `spec.tmpdir`; the
+        // rendered profile must contain the resolved `target`, NOT
+        // the `link` path. This is the same shape as the
+        // `/var/folders/…` → `/private/var/folders/…` resolution
+        // that the production code path relies on every install.
+        let tmp = tempfile::tempdir().unwrap();
+        let target = tmp.path().join("real-tmpdir");
+        std::fs::create_dir(&target).unwrap();
+        let link = tmp.path().join("link-tmpdir");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        // Canonicalize the target up front so we compare against the
+        // form `std::fs::canonicalize` actually produces (on macOS
+        // the tempdir itself lives under `/var/folders/...` which
+        // resolves to `/private/var/folders/...`).
+        let canonical_target = std::fs::canonicalize(&target).unwrap();
+
+        let mut s = spec();
+        s.tmpdir = link.clone();
+
+        let p = render_profile(&s, false).unwrap();
+        assert!(
+            p.contains(canonical_target.to_str().unwrap()),
+            "rendered profile must contain the resolved tmpdir target \
+             {canonical_target:?} — kernel enforces against the resolved \
+             form, so a rule spelled with the un-resolved symlink path \
+             would silently mis-match: {p}"
+        );
+        assert!(
+            !p.contains(link.to_str().unwrap()),
+            "rendered profile must NOT contain the un-resolved symlink \
+             path {link:?} — it would never match at enforcement time \
+             and produces silent denials: {p}"
+        );
+    }
+
+    #[test]
+    fn canonicalize_fails_loud_on_io_error_for_base_path() {
+        // A base path whose canonicalize fails with a *non-NotFound*
+        // error (EACCES on a parent component, EIO from a flaky NFS
+        // mount, ELOOP) must produce a `ProfileRenderFailed` error
+        // rather than silently passing through to a wrong-form rule.
+        //
+        // We stage this with a symlink loop: `loop_a -> loop_b ->
+        // loop_a`. `canonicalize` returns `ErrorKind::FilesystemLoop`
+        // (or `Other` on older stdlib), which is neither `Ok` nor
+        // `NotFound`. The earlier `unwrap_or_else(|_| ...)` would
+        // have silently returned the loop path and rendered a
+        // profile that the kernel can't match against; this test
+        // pins the fail-loud behavior.
+        let tmp = tempfile::tempdir().unwrap();
+        let loop_a = tmp.path().join("loop_a");
+        let loop_b = tmp.path().join("loop_b");
+        std::os::unix::fs::symlink(&loop_b, &loop_a).unwrap();
+        std::os::unix::fs::symlink(&loop_a, &loop_b).unwrap();
+
+        let mut s = spec();
+        s.tmpdir = loop_a;
+
+        match render_profile(&s, false) {
+            Err(SandboxError::ProfileRenderFailed { reason }) => {
+                assert!(
+                    reason.contains("canonicalize tmpdir"),
+                    "error must identify the failing field: {reason}"
+                );
+            }
+            other => panic!("expected ProfileRenderFailed on canonicalize loop, got {other:?}"),
+        }
     }
 
     #[test]
