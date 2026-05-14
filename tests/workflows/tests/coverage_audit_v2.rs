@@ -24,16 +24,22 @@
 //!
 //! ## How these tests behave today
 //!
-//! - **Reminder mode (current default).** The progress / gap reports
-//!   print to stderr via `eprintln!` so they show up in `cargo nextest
-//!   run -p lpm-workflows --test coverage_audit_v2` output, but the
-//!   tests themselves PASS so CI is not blocked during the v2 backfill
-//!   period.
-//! - **Once v2 is fully populated** (every workflow-covered or
-//!   cli-binary-covered surface has a row, every flow is either
-//!   `tested: true` or has an open ticket reference), flip the
-//!   `EXPECT_FULL_V2_BACKFILL` constant in this file to `true`. The
-//!   tests will then fail-loud on regressions.
+//! Two independent locking flags govern strictness:
+//!
+//! - `EXPECT_FULL_V2_SURFACES_BACKFILL` — true once every
+//!   workflow-covered or cli-binary-covered surface has a v2 row.
+//!   When true, the backfill-progress test hard-fails if any surface
+//!   loses its v2 row. **Locked in 2026-05-14 after the 133/133
+//!   backfill landed.** Drop a new surface? You owe it a v2 row.
+//! - `EXPECT_FULL_V2_FLOWS_BACKFILL` — true once every cross-command
+//!   flow has been implemented as an integration test and its row
+//!   marked `tested: true` with a `test_file` path. **Still false:**
+//!   the 10 enumerated flows are visible TODOs, not test failures.
+//!   Flip when the flows ship.
+//!
+//! Both flags are independent on purpose. Surface backfill and
+//! cross-command-flow implementation move at different speeds and
+//! gating them on the same flag would couple unrelated work items.
 
 // Re-import the v1 baseline via `#[path]`. v2 only consumes
 // `SURFACES` + `SurfaceBaseline::{id, name, workflow, cli_binary}`;
@@ -49,10 +55,19 @@ mod v2;
 use std::collections::HashSet;
 use v2::{CROSS_COMMAND_FLOWS, JsonContractDepth, SURFACES_V2};
 
-/// When the v2 backfill is complete, flip this to `true` and the
-/// reminder tests below tighten to hard asserts. Stays `false` while
-/// surfaces are being populated session-by-session.
-const EXPECT_FULL_V2_BACKFILL: bool = false;
+/// Locks in the surface backfill. When `true`, the
+/// `v2_backfill_progress_report_for_workflow_and_cli_binary_surfaces`
+/// test hard-fails if any v1-covered surface is missing its v2 row.
+/// Flipped to `true` on 2026-05-14 after every workflow-covered and
+/// cli-binary-covered surface gained a v2 entry.
+const EXPECT_FULL_V2_SURFACES_BACKFILL: bool = true;
+
+/// Locks in the cross-command flow backfill. When `true`, the
+/// `cross_command_flows_inventory_report` test hard-fails if any
+/// enumerated flow still has `tested: false`. Stays `false` until
+/// each flow ships as an integration test and its row is updated
+/// with a `test_file` path.
+const EXPECT_FULL_V2_FLOWS_BACKFILL: bool = false;
 
 // ─── Schema integrity ─────────────────────────────────────────────────
 
@@ -169,11 +184,12 @@ fn v2_backfill_progress_report_for_workflow_and_cli_binary_surfaces() {
     eprintln!("└─────────────────────────────────────────────────────────────");
     eprintln!();
 
-    if EXPECT_FULL_V2_BACKFILL {
+    if EXPECT_FULL_V2_SURFACES_BACKFILL {
         assert!(
             backlog.is_empty(),
-            "v2 backfill incomplete — flip EXPECT_FULL_V2_BACKFILL back to false until {} \
-             surfaces have v2 rows",
+            "v2 surface backfill regressed — {} v1-covered surface(s) no longer carry a v2 row. \
+             Either restore the missing row(s) or flip EXPECT_FULL_V2_SURFACES_BACKFILL back to \
+             false (and explain why in the commit).",
             backlog.len(),
         );
     }
@@ -307,11 +323,11 @@ fn cross_command_flows_inventory_report() {
     eprintln!("└─────────────────────────────────────────────────────────────");
     eprintln!();
 
-    if EXPECT_FULL_V2_BACKFILL {
+    if EXPECT_FULL_V2_FLOWS_BACKFILL {
         assert!(
             untested.is_empty(),
-            "{} cross-command flows are still untested — flip EXPECT_FULL_V2_BACKFILL back to \
-             false until they're either implemented or removed",
+            "{} cross-command flows are still untested — flip EXPECT_FULL_V2_FLOWS_BACKFILL back \
+             to false until they're either implemented or removed",
             untested.len(),
         );
     }
