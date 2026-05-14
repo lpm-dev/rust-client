@@ -252,13 +252,23 @@ fn validate_skills(project_dir: &Path, json_output: bool) -> Result<(), LpmError
         println!(
             "{}",
             serde_json::to_string_pretty(&serde_json::json!({
-                "success": true,
+                "success": errors.is_empty(),
                 "valid": valid,
                 "errors": errors,
                 "quality_impact": quality_impact,
             }))
             .unwrap()
         );
+        // Finding #72: a non-empty `errors` list must surface as a
+        // non-zero exit code so CI gates fail closed. The structured
+        // envelope above carries the per-skill error list; returning
+        // `LpmError::ExitCode(1)` exits non-zero while routing past
+        // the top-level `--json` envelope handler so we don't emit a
+        // second, less-informative envelope on top of the rich one.
+        if !errors.is_empty() {
+            return Err(LpmError::ExitCode(1));
+        }
+        return Ok(());
     } else if errors.is_empty() {
         output::success(&format!("{valid} skill(s) valid"));
         if valid > 0 {
@@ -279,6 +289,19 @@ fn validate_skills(project_dir: &Path, json_output: bool) -> Result<(), LpmError
                 errors.len()
             ));
         }
+    }
+
+    // Finding #72: human-mode path. Per-skill warnings have already
+    // been emitted above; return a concise summary error so the
+    // top-level miette handler renders an "Error: …" footer AND the
+    // process exits non-zero. Without this, CI gates that run
+    // `lpm skills validate` silently passed on broken skill files.
+    // Mirrors the contract of every other audit/lint-style command.
+    if !errors.is_empty() {
+        return Err(LpmError::Script(format!(
+            "{} skill validation error(s)",
+            errors.len()
+        )));
     }
 
     Ok(())
