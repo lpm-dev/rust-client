@@ -25,6 +25,33 @@ fn make_executable(path: &std::path::Path) {
     std::fs::set_permissions(path, perms).expect("failed to mark script executable");
 }
 
+/// `lpm --json dlx <malformed-spec>` surfaces the resolver error as a
+/// parseable JSON envelope on stdout. The malformed-range form (`@@@`)
+/// fails inside the resolver's range parser without making any network
+/// calls — fastest envelope-shape contract for `lpm dlx`. The
+/// happy-path cache-hit case (below) verifies execution; this test
+/// verifies the failure surface is machine-readable.
+#[test]
+fn dlx_malformed_spec_under_json_emits_error_envelope_on_stdout() {
+    let project = TempProject::empty(r#"{"name":"dlx-malformed","version":"1.0.0"}"#);
+
+    let output = lpm(&project)
+        .args(["--json", "dlx", "@@@"])
+        .output()
+        .expect("failed to run lpm --json dlx @@@");
+
+    // dlx prints a human-output banner ("Installing dependencies for
+    // ...") before the envelope; use parse_json_output's first-{ scan.
+    let envelope = support::assertions::parse_json_output(&output.stdout);
+    assert_eq!(envelope["success"], serde_json::json!(false));
+    assert!(
+        envelope["error"]
+            .as_str()
+            .is_some_and(|s| s.contains("range") || s.contains("invalid")),
+        "error must reference the malformed range, got: {envelope}",
+    );
+}
+
 #[test]
 fn dlx_cache_hit_executes_cached_binary_and_refreshes_ttl() {
     let project = TempProject::empty(r#"{"name":"dlx-test","version":"1.0.0"}"#);

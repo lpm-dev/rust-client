@@ -2661,6 +2661,14 @@ async fn async_main() -> Result<()> {
             paranoid,
             no_sandbox,
         } => {
+            // Wrap arm body in async block so every `?` early-exit
+            // (cwd, policy parse, manifest read/write, preflight
+            // validators) propagates to THIS block's `Result<(), LpmError>`
+            // and reaches the top-level `--json` envelope handler. Prior
+            // `.into_diagnostic()` calls inside the arm short-circuited
+            // to the outer miette Result, bypassing the envelope —
+            // converted below to plain LpmError returns/?. See finding #76.
+            async {
             // Phase 37 M3.2: route `lpm install --global` / `-g` to
             // the persistent IsolatedInstall pipeline. M3.2 ships
             // fresh-install only (no upgrade); upgrade lands in M3.4.
@@ -2674,8 +2682,7 @@ async fn async_main() -> Result<()> {
                         "`lpm install --global` requires a package spec (e.g. \
                          `lpm install -g eslint` or `lpm install -g typescript@^5`)"
                             .into(),
-                    ))
-                    .into_diagnostic();
+                    ));
                 }
                 if packages.len() > 1 {
                     return Err(lpm_common::LpmError::Script(format!(
@@ -2683,8 +2690,7 @@ async fn async_main() -> Result<()> {
                          in M3.2 (got {}). Run it once per package, or wait for the M3.4 \
                          multi-target update path.",
                         packages.len()
-                    )))
-                    .into_diagnostic();
+                    )));
                 }
                 // Reject any project-install-only flag that's
                 // meaningless for global. Keeps the surface honest.
@@ -2694,8 +2700,7 @@ async fn async_main() -> Result<()> {
                     workspace_root,
                     fail_if_no_match,
                     yes,
-                )
-                .into_diagnostic()?;
+                )?;
                 // Phase 37 M4: parse collision-resolution flags. Syntactic
                 // validation only (no lookup against marker commands —
                 // that happens at commit time with authoritative data).
@@ -2725,8 +2730,7 @@ async fn async_main() -> Result<()> {
                     min_release_age.as_deref(),
                     ignore_provenance_drift,
                     ignore_provenance_drift_all,
-                )
-                .into_diagnostic()?;
+                )?;
 
                 return commands::install_global::run(
                     &client,
@@ -2735,8 +2739,7 @@ async fn async_main() -> Result<()> {
                     cli.json,
                     overrides,
                 )
-                .await
-                .into_diagnostic();
+                .await;
             }
 
             // M4 audit Finding 2: reject collision-resolution flags on
@@ -2752,8 +2755,7 @@ async fn async_main() -> Result<()> {
                      installs (`-g`) only. Add `-g` to install globally, or drop the flags for \
                      a project install."
                         .into(),
-                ))
-                .into_diagnostic();
+                ));
             }
 
             // Token expiry warnings (Feature 42)
@@ -2987,6 +2989,8 @@ async fn async_main() -> Result<()> {
                     .await
                 }
             }
+            }
+            .await
         }
         Commands::Uninstall {
             packages,
@@ -3136,6 +3140,14 @@ async fn async_main() -> Result<()> {
             login_registry,
             token,
         } => {
+            // Wrap in async block so `?` early-exits (and the explicit
+            // `return Err(LpmError::...)` paths below) propagate to THIS
+            // block's `Result<(), LpmError>` — reaching the top-level
+            // `--json` envelope handler. The two prior `.into_diagnostic()`
+            // calls on the early returns dropped to the outer miette
+            // Result, bypassing the envelope; removed below as the
+            // returns now flow through the async block. See finding #76.
+            async {
             if npm || github || gitlab || login_registry.is_some() {
                 let (registry_display, token_hint) = if npm {
                     (
@@ -3169,8 +3181,7 @@ async fn async_main() -> Result<()> {
                 } else if cli.json {
                     return Err(lpm_common::LpmError::Registry(format!(
                         "--token <token> required in JSON mode. {token_hint}"
-                    )))
-                    .into_diagnostic();
+                    )));
                 } else {
                     // Interactive: prompt for token with masked input
                     eprintln!("  {}", token_hint.dimmed());
@@ -3184,8 +3195,7 @@ async fn async_main() -> Result<()> {
                 if auth_token.is_empty() {
                     return Err(lpm_common::LpmError::Registry(
                         "token cannot be empty".into(),
-                    ))
-                    .into_diagnostic();
+                    ));
                 }
 
                 // Interactive: ask for token expiry reminder
@@ -3276,6 +3286,8 @@ async fn async_main() -> Result<()> {
                     .unwrap_or(lpm_common::DEFAULT_REGISTRY_URL);
                 commands::login::run(registry, cli.json).await
             }
+            }
+            .await
         }
         Commands::Logout {
             revoke,
@@ -3571,24 +3583,32 @@ async fn async_main() -> Result<()> {
             commands::mcp::run(&action, name.as_deref(), cli.json).await
         }
         Commands::Use { spec, list, pin } => {
-            let cwd = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;
-            if list {
-                commands::r#use::run("list", spec.as_deref(), &cwd, cli.json).await
-            } else if pin {
-                let s = spec.as_deref().ok_or_else(|| {
-                    lpm_common::LpmError::Script(
-                        "missing version. Usage: lpm use --pin node@22.5.0".into(),
-                    )
-                })?;
-                commands::r#use::run("pin", Some(s), &cwd, cli.json).await
-            } else if let Some(s) = &spec {
-                // `lpm use node@20` = install + pin (one command does both)
-                commands::r#use::run("install", Some(s.as_str()), &cwd, cli.json).await?;
-                commands::r#use::run("pin", Some(s.as_str()), &cwd, cli.json).await
-            } else {
-                // No spec, no flags — show list
-                commands::r#use::run("list", None, &cwd, cli.json).await
+            // Wrap in async block so `?` early-exits (e.g., cwd resolution,
+            // missing-spec under `--pin`, install-step failure before pin)
+            // propagate to THIS block's `Result` and reach the top-level
+            // `--json` envelope handler. See finding #76 in
+            // `private/findings.md`.
+            async {
+                let cwd = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;
+                if list {
+                    commands::r#use::run("list", spec.as_deref(), &cwd, cli.json).await
+                } else if pin {
+                    let s = spec.as_deref().ok_or_else(|| {
+                        lpm_common::LpmError::Script(
+                            "missing version. Usage: lpm use --pin node@22.5.0".into(),
+                        )
+                    })?;
+                    commands::r#use::run("pin", Some(s), &cwd, cli.json).await
+                } else if let Some(s) = &spec {
+                    // `lpm use node@20` = install + pin (one command does both)
+                    commands::r#use::run("install", Some(s.as_str()), &cwd, cli.json).await?;
+                    commands::r#use::run("pin", Some(s.as_str()), &cwd, cli.json).await
+                } else {
+                    // No spec, no flags — show list
+                    commands::r#use::run("list", None, &cwd, cli.json).await
+                }
             }
+            .await
         }
         Commands::Env { extra: _ } => {
             // Subcommand args are re-parsed from raw argv inside run().
@@ -3674,8 +3694,14 @@ async fn async_main() -> Result<()> {
             refresh,
             args,
         } => {
-            let cwd = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;
-            commands::run::dlx(&client, &cwd, &package, &args, refresh).await
+            // Wrap in async block so the cwd-resolution `?` and any
+            // dlx-internal preflight errors propagate to the top-level
+            // `--json` envelope handler (finding #76).
+            async {
+                let cwd = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;
+                commands::run::dlx(&client, &cwd, &package, &args, refresh).await
+            }
+            .await
         }
         Commands::Filter {
             exprs,

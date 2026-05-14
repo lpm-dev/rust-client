@@ -12,7 +12,7 @@ use support::auth_state::{
     token_expiry_path, write_credentials_store,
 };
 use support::mock_registry::MockRegistry;
-use support::{TempProject, lpm_with_registry};
+use support::{TempProject, lpm, lpm_with_registry};
 
 const NPM_REGISTRY_URL: &str = "https://registry.npmjs.org";
 const GITHUB_REGISTRY_URL: &str = "https://npm.pkg.github.com";
@@ -1458,5 +1458,99 @@ async fn logout_registry_clears_only_targeted_custom_registry_state() {
         "primary LPM session should remain usable after targeted custom-registry logout:\nstdout: {}\nstderr: {}",
         String::from_utf8_lossy(&whoami.stdout),
         String::from_utf8_lossy(&whoami.stderr),
+    );
+}
+
+// ─── --json error envelope contracts for login --npm/--github/--gitlab/--login-registry ───
+//
+// The login dispatcher requires a `--token <token>` when invoked under
+// `--json` (interactive prompt is suppressed). Without one, every
+// registry-target variant surfaces the same shape on stdout. These
+// tests pin that contract — they're the cheapest envelope claim that
+// proves `lpm --json login --<target>` is machine-readable.
+
+#[test]
+fn login_npm_without_token_under_json_emits_error_envelope_on_stdout() {
+    let project = TempProject::empty(r#"{"name":"login-npm-noauth","version":"1.0.0"}"#);
+
+    let output = lpm(&project)
+        .args(["--json", "login", "--npm"])
+        .output()
+        .expect("failed to run lpm --json login --npm");
+
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    let envelope: serde_json::Value = serde_json::from_str(stdout.trim())
+        .unwrap_or_else(|e| panic!("--json login --npm must emit JSON: {e}\n---\n{stdout}"));
+    assert_eq!(envelope["success"], serde_json::json!(false));
+    let err = envelope["error"].as_str().unwrap_or_default();
+    assert!(
+        err.contains("--token") && err.contains("npmjs.com"),
+        "error must direct user to npmjs.com tokens page, got: {err}",
+    );
+}
+
+#[test]
+fn login_github_without_token_under_json_emits_error_envelope_on_stdout() {
+    let project = TempProject::empty(r#"{"name":"login-gh-noauth","version":"1.0.0"}"#);
+
+    let output = lpm(&project)
+        .args(["--json", "login", "--github"])
+        .output()
+        .expect("failed to run lpm --json login --github");
+
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    let envelope: serde_json::Value = serde_json::from_str(stdout.trim())
+        .unwrap_or_else(|e| panic!("--json login --github must emit JSON: {e}\n---\n{stdout}"));
+    assert_eq!(envelope["success"], serde_json::json!(false));
+    let err = envelope["error"].as_str().unwrap_or_default();
+    assert!(
+        err.contains("--token") && err.contains("github.com"),
+        "error must direct user to github.com tokens page, got: {err}",
+    );
+}
+
+#[test]
+fn login_gitlab_without_token_under_json_emits_error_envelope_on_stdout() {
+    let project = TempProject::empty(r#"{"name":"login-gl-noauth","version":"1.0.0"}"#);
+
+    let output = lpm(&project)
+        .args(["--json", "login", "--gitlab"])
+        .output()
+        .expect("failed to run lpm --json login --gitlab");
+
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    let envelope: serde_json::Value = serde_json::from_str(stdout.trim())
+        .unwrap_or_else(|e| panic!("--json login --gitlab must emit JSON: {e}\n---\n{stdout}"));
+    assert_eq!(envelope["success"], serde_json::json!(false));
+    let err = envelope["error"].as_str().unwrap_or_default();
+    assert!(
+        err.contains("--token") && err.contains("gitlab.com"),
+        "error must direct user to gitlab.com tokens page, got: {err}",
+    );
+}
+
+#[test]
+fn login_custom_registry_without_token_under_json_emits_error_envelope_on_stdout() {
+    let project = TempProject::empty(r#"{"name":"login-custom-noauth","version":"1.0.0"}"#);
+
+    let output = lpm(&project)
+        .args([
+            "--json",
+            "login",
+            "--login-registry",
+            "https://packages.example.invalid",
+        ])
+        .output()
+        .expect("failed to run lpm --json login --login-registry");
+
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    let envelope: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap_or_else(|e| {
+        panic!("--json login --login-registry must emit JSON: {e}\n---\n{stdout}")
+    });
+    assert_eq!(envelope["success"], serde_json::json!(false));
+    let err = envelope["error"].as_str().unwrap_or_default();
+    assert!(
+        err.contains("--token"),
+        "error must reference --token requirement, got: {err}",
     );
 }
