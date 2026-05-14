@@ -142,6 +142,7 @@ optional = true
 
 [dev-dependencies]
 wiremock = "0.6"
+assert_cmd = "2"
 
 # Phase 46 P4 Chunk 2: generate synthetic x509 certs with URI SANs in
 # unit tests so the SAN-extractor is exercised against deterministic
