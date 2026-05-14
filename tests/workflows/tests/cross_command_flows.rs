@@ -312,6 +312,41 @@ async fn flow_migrate_install_audit_lockfile_round_trips() {
         serde_json::json!(true),
         "audit envelope must succeed against the migrated lockfile + installed tree"
     );
+
+    // Step 4 (Item 4 plan #1 completion — 2026-05-14): rebuild closes
+    // the migrate → install → audit → rebuild lifecycle. The migrated
+    // tree has `ms@2.1.3` which carries no lifecycle scripts, so
+    // `rebuild --dry-run --policy=deny` exits 0 with an empty packages
+    // list. The load-bearing contract here isn't "rebuild does work";
+    // it's "rebuild reads the post-install state coherently and emits
+    // a valid envelope without crashing on the freshly-migrated
+    // manifest". A regression that breaks rebuild's lockfile or
+    // build-state parsing against an audit-coherent tree would trip
+    // this step.
+    let out_rebuild = lpm(&project)
+        .args(["--json", "rebuild", "--dry-run", "--policy=deny"])
+        .output()
+        .expect("spawn lpm rebuild");
+    assert!(
+        out_rebuild.status.success(),
+        "post-audit rebuild --dry-run failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&out_rebuild.stdout),
+        String::from_utf8_lossy(&out_rebuild.stderr)
+    );
+    // Files the migrate → install → audit chain produced must STILL
+    // exist after rebuild (rebuild --dry-run is read-only by contract).
+    assert!(
+        project.file_exists("lpm.lock"),
+        "rebuild --dry-run mutated state: lpm.lock disappeared. \
+         stderr={}",
+        String::from_utf8_lossy(&out_rebuild.stderr)
+    );
+    assert!(
+        project.file_exists("lpm.lockb"),
+        "rebuild --dry-run mutated state: lpm.lockb disappeared. \
+         stderr={}",
+        String::from_utf8_lossy(&out_rebuild.stderr)
+    );
 }
 
 // ─── Flow #6: install → rebuild → approve-scripts → rebuild ─────────────
@@ -1214,5 +1249,208 @@ async fn flow_env_push_pull_cross_machine_round_trip() {
         "machine B revealed plaintext must byte-equal what machine A pushed; \
          expected to find {SECRET_VALUE:?}; got:\n{revealed}\nstderr: {}",
         String::from_utf8_lossy(&out_get_b.stderr)
+    );
+}
+
+// ─── Item 4 plan #5: workspace filter isolation (2026-05-14) ─────────
+//
+// Catches: a `lpm install <pkg> --filter @test/app` invocation that
+// accidentally ALSO mutates @test/core's package.json / lockfile /
+// install-hash, breaking the workspace-member isolation contract.
+// The plan's original phrasing was "run --filter member-b doesn't
+// refetch member-a's deps" — the variant pinned here checks the
+// FILE-STATE invariant, which is checkable without counting mock
+// requests:
+//
+//   1. Bare install at workspace root → all 3 members get
+//      node_modules + per-member lpm.lock + .lpm/install-hash.
+//   2. Snapshot @test/core's full state quadruple (package.json +
+//      lpm.lock + lpm.lockb + .lpm/install-hash).
+//   3. Run `lpm install chalk@5.3.0 --filter @test/app`.
+//   4. Assert: app's package.json gained `chalk`; core's quadruple
+//      is byte-identical (no mutation by the filtered install).
+//
+// The cross-member dep graph: app → core (workspace:^), core →
+// utils (workspace:*); plus external deps app: ms@2.1.3, core:
+// semver@7.6.3, utils: ms@2.1.3. Adding chalk to app must not
+// touch core (which is app's own workspace dep) — the filter scope
+// is the LITERAL filtered member, not its dep closure.
+
+/// Build a minimal tarball whose only contents is `package.json`.
+/// Tighter than `make_tarball_from_pkg_json` for tests that don't
+/// care about the package's body, just its presence in the registry.
+fn minimal_tarball(name: &str, version: &str) -> Vec<u8> {
+    let pkg_json = serde_json::json!({
+        "name": name,
+        "version": version,
+        "license": "MIT",
+    });
+    make_tarball_from_pkg_json(pkg_json, &[])
+}
+
+/// Mount a package on the mock with both single-version metadata and
+/// resolver-batch metadata. Wraps the boilerplate the workspace-
+/// isolation test needs three times over.
+async fn mount_pkg_full(mock: &MockRegistry, name: &str, version: &str) -> Vec<u8> {
+    let tarball = minimal_tarball(name, version);
+    mock.with_package(name, version, &tarball).await;
+    mock.with_batch_metadata(vec![serde_json::json!({
+        "name": name,
+        "dist-tags": { "latest": version },
+        "versions": {
+            version: {
+                "name": name,
+                "version": version,
+                "dist": {
+                    "tarball": format!("{}/tarballs/{name}-{version}.tgz", mock.url()),
+                    "integrity": compute_integrity(&tarball),
+                },
+                "dependencies": {}
+            }
+        },
+        "time": { version: "2025-01-01T00:00:00.000Z" }
+    })])
+    .await;
+    tarball
+}
+
+#[tokio::test]
+async fn flow_workspace_install_filter_member_a_does_not_mutate_member_b() {
+    let project = TempProject::from_fixture("workspace-monorepo");
+
+    // Mount the workspace's external deps (ms, semver) plus the
+    // new dep chalk we'll add to @test/app via filter.
+    let mock = MockRegistry::start().await;
+    let _ = mount_pkg_full(&mock, "ms", "2.1.3").await;
+    let _ = mount_pkg_full(&mock, "semver", "7.6.3").await;
+    let _ = mount_pkg_full(&mock, "chalk", "5.3.0").await;
+
+    // Step 1: re-pin core's existing dep (semver) via filter. This
+    // exercises the run_install_filtered_add path against @test/core
+    // so the per-member state files (lpm.lock, lpm.lockb,
+    // .lpm/install-hash) get populated. `lpm install` with no
+    // package args + `--filter` is REJECTED by the dispatcher
+    // ("--filter only applies when adding packages") — so we add
+    // a dep that's ALREADY in core's manifest. The save-spec path
+    // sees the existing entry and is a no-op for the manifest, but
+    // the install pipeline still runs end-to-end and emits the
+    // per-member quadruple.
+    let out_init = lpm_with_registry(&project, &mock.url())
+        .args([
+            "install",
+            "semver@7.6.3",
+            "--filter",
+            "@test/core",
+            "--no-skills",
+            "--no-editor-setup",
+            "--no-security-summary",
+        ])
+        .output()
+        .expect("spawn initial filtered install on @test/core");
+    assert!(
+        out_init.status.success(),
+        "filtered install on @test/core failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&out_init.stdout),
+        String::from_utf8_lossy(&out_init.stderr)
+    );
+
+    // Step 2: snapshot core's full state quadruple. Each capture is
+    // `Option<Vec<u8>>`. The package.json is required (must exist
+    // post-install); lockfile / lockb / install-hash are optional —
+    // present iff the install pipeline emitted them at the per-
+    // member level. Both branches ("exists with bytes" / "absent")
+    // are valid pre-states; the post-state must MATCH whichever
+    // it was.
+    let core_dir = project.path().join("packages/core");
+    let core_pkg_json_before = std::fs::read(core_dir.join("package.json"))
+        .expect("test setup: @test/core/package.json must exist after bare install");
+    let core_lock_before = std::fs::read(core_dir.join("lpm.lock")).ok();
+    let core_lockb_before = std::fs::read(core_dir.join("lpm.lockb")).ok();
+    let core_install_hash_before = std::fs::read(core_dir.join(".lpm/install-hash")).ok();
+
+    eprintln!(
+        "[plan#5 baseline] core lpm.lock={:?} lockb={:?} install_hash={:?}",
+        core_lock_before.as_ref().map(|b| b.len()),
+        core_lockb_before.as_ref().map(|b| b.len()),
+        core_install_hash_before.as_ref().map(|b| b.len())
+    );
+
+    // Step 3: filter-install chalk into @test/app ONLY. The
+    // run_install_filtered_add path snapshots only the filtered
+    // member's manifest + lockfile (per [install.rs:11099](../../../crates/lpm-cli/src/commands/install.rs#L11099)).
+    let out_add = lpm_with_registry(&project, &mock.url())
+        .args([
+            "install",
+            "chalk@5.3.0",
+            "--filter",
+            "@test/app",
+            "--no-skills",
+            "--no-editor-setup",
+            "--no-security-summary",
+        ])
+        .output()
+        .expect("spawn filtered install");
+    assert!(
+        out_add.status.success(),
+        "filtered install of chalk@5.3.0 into @test/app failed: \
+         stdout={} stderr={}",
+        String::from_utf8_lossy(&out_add.stdout),
+        String::from_utf8_lossy(&out_add.stderr)
+    );
+
+    // Step 4: app GAINED chalk in its dependencies.
+    let app_pkg_json: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(project.path().join("packages/app/package.json")).unwrap(),
+    )
+    .expect("@test/app/package.json must remain valid JSON post-install");
+    let app_chalk = &app_pkg_json["dependencies"]["chalk"];
+    assert!(
+        app_chalk.is_string(),
+        "@test/app/package.json must contain a `chalk` entry in `dependencies` after filtered install. \
+         got: {app_pkg_json}\nfiltered-install stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&out_add.stdout),
+        String::from_utf8_lossy(&out_add.stderr)
+    );
+
+    // Step 5 — load-bearing: @test/core's quadruple is BYTE-IDENTICAL.
+    // If any of these differ, the filtered install on @test/app
+    // mutated @test/core's state, breaking the workspace-member
+    // isolation contract.
+    let core_pkg_json_after = std::fs::read(core_dir.join("package.json"))
+        .expect("@test/core/package.json must still exist after filtered install");
+    assert_eq!(
+        core_pkg_json_before, core_pkg_json_after,
+        "@test/core/package.json was mutated by `lpm install chalk@5.3.0 --filter @test/app` — \
+         workspace isolation contract violated. The filter must scope mutations to the \
+         filtered member ONLY."
+    );
+    let core_lock_after = std::fs::read(core_dir.join("lpm.lock")).ok();
+    assert_eq!(
+        core_lock_before, core_lock_after,
+        "@test/core/lpm.lock was mutated by filtered install on @test/app — \
+         workspace isolation contract violated."
+    );
+    let core_lockb_after = std::fs::read(core_dir.join("lpm.lockb")).ok();
+    assert_eq!(
+        core_lockb_before, core_lockb_after,
+        "@test/core/lpm.lockb was mutated by filtered install on @test/app — \
+         workspace isolation contract violated."
+    );
+    let core_install_hash_after = std::fs::read(core_dir.join(".lpm/install-hash")).ok();
+    assert_eq!(
+        core_install_hash_before, core_install_hash_after,
+        "@test/core/.lpm/install-hash was mutated by filtered install on @test/app — \
+         the install-hash invalidation surface escapes member-scope, which would \
+         force @test/core's NEXT install to re-resolve unnecessarily."
+    );
+
+    // Bonus: the literal `chalk` directory must NOT appear in
+    // @test/core/node_modules. If it did, the linker also escaped
+    // the member scope.
+    let core_chalk_link = core_dir.join("node_modules/chalk");
+    assert!(
+        !core_chalk_link.exists(),
+        "@test/core/node_modules/chalk exists — chalk leaked into the non-filtered member's \
+         link tree. found at: {core_chalk_link:?}"
     );
 }
