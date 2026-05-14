@@ -4039,47 +4039,58 @@ async fn async_main() -> Result<()> {
             inspect_port,
             args,
         } => {
-            let cwd = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;
-            // Phase 35: tunnel requires a session-backed login (same
-            // contract as `dev --tunnel` above). The session is
-            // attached to `client` from main.rs; ask it for a
-            // `SessionRequired` bearer.
-            let resolved_token = match client.session() {
-                Some(s) => Some(
-                    s.bearer_string_for(lpm_auth::AuthRequirement::SessionRequired)
-                        .await
-                        .map_err(|_| {
-                            lpm_common::LpmError::Tunnel(
-                                "tunnel requires a refresh-backed `lpm login` session.\n  \
-                                 `--token` / `LPM_TOKEN` / CI tokens are not accepted."
-                                    .into(),
-                            )
-                        })?,
-                ),
-                None => None,
-            };
-            // Determine if action is a port number or a named action
-            let (effective_action, effective_port) = if let Ok(p) = action.parse::<u16>() {
-                ("start", p)
-            } else {
-                (action.as_str(), 3000u16)
-            };
-            commands::tunnel::run(
-                &client,
-                effective_action,
-                resolved_token.as_deref(),
-                effective_port,
-                domain.as_deref(),
-                org.as_deref(),
-                cli.json,
-                &cwd,
-                &args,
-                tunnel_auth,
-                no_inspect,
-                inspect_port,
-                auto_ack,
-                session.as_deref(),
-            )
+            // Wrap the arm body in an async block so any `?` early-exit
+            // (e.g., missing session for the SessionRequired contract)
+            // propagates to THIS block's `Result`, which becomes the
+            // match arm's value, which becomes the outer `result`. The
+            // top-level `if cli.json && let Err(e) = &result` handler
+            // then emits a structured envelope on stdout instead of
+            // bare miette stderr — every command machine-readable
+            // under `--json`.
+            async {
+                let cwd = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;
+                // Phase 35: tunnel requires a session-backed login (same
+                // contract as `dev --tunnel` above). The session is
+                // attached to `client` from main.rs; ask it for a
+                // `SessionRequired` bearer.
+                let resolved_token = match client.session() {
+                    Some(s) => Some(
+                        s.bearer_string_for(lpm_auth::AuthRequirement::SessionRequired)
+                            .await
+                            .map_err(|_| {
+                                lpm_common::LpmError::Tunnel(
+                                    "tunnel requires a refresh-backed `lpm login` session.\n  \
+                                     `--token` / `LPM_TOKEN` / CI tokens are not accepted."
+                                        .into(),
+                                )
+                            })?,
+                    ),
+                    None => None,
+                };
+                // Determine if action is a port number or a named action
+                let (effective_action, effective_port) = if let Ok(p) = action.parse::<u16>() {
+                    ("start", p)
+                } else {
+                    (action.as_str(), 3000u16)
+                };
+                commands::tunnel::run(
+                    &client,
+                    effective_action,
+                    resolved_token.as_deref(),
+                    effective_port,
+                    domain.as_deref(),
+                    org.as_deref(),
+                    cli.json,
+                    &cwd,
+                    &args,
+                    tunnel_auth,
+                    no_inspect,
+                    inspect_port,
+                    auto_ack,
+                    session.as_deref(),
+                )
+                .await
+            }
             .await
         }
         Commands::Migrate {
