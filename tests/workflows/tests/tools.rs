@@ -678,3 +678,103 @@ fn test_no_double_dash_claims_all_as_workspace_flag() {
         "the runner must NOT execute when --all enters workspace mode, got stdout:\n{stdout}"
     );
 }
+
+// ─── fmt: workspace dispatch + JSON envelope ────────────────────────
+//
+// These tests cover the orchestrator's selection / failure-mode contract
+// without requiring biome to be installed. The empty-match path never
+// invokes the underlying formatter, and the `PATH=""` path forces a
+// spawn failure to exercise the failure-envelope shape.
+
+#[test]
+fn fmt_filter_typo_without_fail_flag_exits_zero() {
+    let project = TempProject::from_fixture("workspace-monorepo");
+
+    let output = lpm(&project)
+        .args(["fmt", "--filter", "this-package-does-not-exist"])
+        .output()
+        .expect("failed to run lpm fmt");
+
+    assert!(
+        output.status.success(),
+        "empty-match without --fail-if-no-match must exit 0, got: {}\nstderr:\n{}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr),
+    );
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("No packages matched"),
+        "expected 'No packages matched' in stderr, got:\n{stderr}"
+    );
+}
+
+#[test]
+fn fmt_filter_typo_with_fail_flag_exits_nonzero() {
+    let project = TempProject::from_fixture("workspace-monorepo");
+
+    let output = lpm(&project)
+        .args([
+            "fmt",
+            "--filter",
+            "this-package-does-not-exist",
+            "--fail-if-no-match",
+        ])
+        .output()
+        .expect("failed to run lpm fmt");
+
+    assert!(
+        !output.status.success(),
+        "empty-match with --fail-if-no-match must exit non-zero"
+    );
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("no workspace packages matched") || stderr.contains("--fail-if-no-match"),
+        "expected error message mentioning the empty-match condition, got:\n{stderr}"
+    );
+}
+
+#[test]
+fn fmt_filter_typo_json_emits_valid_envelope() {
+    let project = TempProject::from_fixture("workspace-monorepo");
+
+    let output = lpm(&project)
+        .args(["--json", "fmt", "--filter", "this-package-does-not-exist"])
+        .output()
+        .expect("failed to run lpm fmt --json");
+
+    assert!(output.status.success(), "fmt --json failed");
+
+    let json = parse_json_output(&output.stdout);
+    assert_eq!(json["success"], serde_json::json!(true));
+    assert_eq!(json["packages"], serde_json::json!(0));
+    assert_eq!(json["succeeded"], serde_json::json!(0));
+    assert_eq!(json["failed"], serde_json::json!(0));
+    assert_eq!(json["members"], serde_json::json!([]));
+    assert!(
+        json["duration_ms"].is_number(),
+        "duration_ms must be numeric"
+    );
+}
+
+#[test]
+fn fmt_check_flag_is_accepted_alongside_filter() {
+    // The mutually-exclusive group rule (clap `conflicts_with_all`)
+    // applies to the selection axes — `--all` / `--filter` / `--affected`.
+    // `--check` is orthogonal: it must compose with `--filter` without
+    // tripping the conflict rule.
+    let project = TempProject::from_fixture("workspace-monorepo");
+
+    let output = lpm(&project)
+        .args(["fmt", "--check", "--filter", "this-package-does-not-exist"])
+        .output()
+        .expect("failed to run lpm fmt --check --filter");
+
+    assert!(
+        output.status.success(),
+        "fmt --check --filter <typo> empty-match must exit 0, got: {}\nstderr:\n{}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr),
+    );
+}

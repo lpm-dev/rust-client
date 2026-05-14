@@ -1,0 +1,8 @@
+---
+source: tests/workflows/tests/cache.rs
+expression: envelope
+---
+{
+  "success": true,
+  "path": "[CACHE_TASKS_PATH]"
+}
