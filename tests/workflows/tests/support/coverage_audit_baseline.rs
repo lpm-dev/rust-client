@@ -896,13 +896,12 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         name: "`lpm approve-scripts` (interactive)",
         unit: true,
         integration: false,
-        workflow: true,
+        workflow: false,
         cli_binary: true,
         json_contract: true,
         references: &[
             "crates/lpm-cli/src/commands/approve_scripts.rs",
             "crates/lpm-cli/tests/approve_scripts_interactive_tty.rs",
-            "tests/workflows/tests/approve_scripts.rs",
         ],
     },
     SurfaceBaseline {
