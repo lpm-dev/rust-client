@@ -759,3 +759,64 @@ fn graph_why_includes_original_integrity_in_human_and_json() {
         "JSON output must include the full original_integrity hash"
     );
 }
+
+// ─── --format dot ──────────────────────────────────────────────────────
+
+#[test]
+fn graph_format_dot_emits_valid_dot_syntax_to_stdout() {
+    let project = graph_fixture();
+
+    let output = lpm(&project)
+        .args(["graph", "--format", "dot"])
+        .output()
+        .expect("failed to run lpm graph --format dot");
+
+    assert!(
+        output.status.success(),
+        "graph --format dot must succeed\nstderr: {}",
+        String::from_utf8_lossy(&output.stderr),
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    // Minimal DOT grammar check: must start with `digraph` (or `graph`)
+    // and contain at least one `->` edge (the fixture has a transitive
+    // tree, so there will be edges).
+    assert!(
+        stdout.contains("digraph") || stdout.contains("graph "),
+        "dot output must begin with a graph declaration, got:\n{stdout}",
+    );
+    assert!(
+        stdout.contains("->"),
+        "dot output must contain at least one edge (->), got:\n{stdout}",
+    );
+}
+
+// ─── --format mermaid ─────────────────────────────────────────────────
+
+#[test]
+fn graph_format_mermaid_emits_valid_mermaid_syntax_to_stdout() {
+    let project = graph_fixture();
+
+    let output = lpm(&project)
+        .args(["graph", "--format", "mermaid"])
+        .output()
+        .expect("failed to run lpm graph --format mermaid");
+
+    assert!(
+        output.status.success(),
+        "graph --format mermaid must succeed\nstderr: {}",
+        String::from_utf8_lossy(&output.stderr),
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    // Mermaid grammar: must declare a graph (`graph TD` / `graph LR` /
+    // `flowchart`) and use `-->` edges.
+    assert!(
+        stdout.contains("graph ") || stdout.contains("flowchart"),
+        "mermaid output must begin with a graph declaration, got:\n{stdout}",
+    );
+    assert!(
+        stdout.contains("-->"),
+        "mermaid output must contain at least one edge (-->), got:\n{stdout}",
+    );
+}
