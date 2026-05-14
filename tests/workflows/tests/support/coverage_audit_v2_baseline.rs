@@ -192,6 +192,7 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
         failure_modes_tested: &[
             "JSON envelope required fields",
             "session recovery from refresh token only",
+            "whoami envelope shape locked under refresh-only session (snapshot)",
             "refresh-only logout does not rehydrate",
             "invalid access token + valid refresh recovers + normalizes store",
             "malformed session expiry metadata triggers refresh",
@@ -204,7 +205,7 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
             "stale session marker after rotation",
             "whoami while another login is mid-flight",
         ],
-        json_contract_depth: JsonContractDepth::SemanticAsserts,
+        json_contract_depth: JsonContractDepth::InstaSnapshot,
         scenarios_by_file: &[
             ("tests/workflows/tests/json_output.rs", 1),
             ("tests/workflows/tests/auth_lifecycle.rs", 6),
@@ -1424,6 +1425,7 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
             "triage policy: greens auto-execute, ambers/reds block",
             "version-diff card surfaces on update",
             "trusted entries bypass scriptHash check",
+            "Rich-form trustedDependencies surfaces approved pkg as trusted (cross-flow #6)",
         ],
         failure_modes_known: &[
             "rebuild during a concurrent install",
@@ -1559,6 +1561,7 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
         scenarios: 3,
         failure_modes_tested: &[
             "named dry-run does not mutate package.json",
+            "<pkg> --json envelope carries dry_run + approved_count",
             "specific-pkg arg for already-approved emits friendly error",
             "first-time review emits null version-diff + no card",
         ],
@@ -1567,7 +1570,7 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
             "approval of source package",
             "approval of a package that has multiple installed versions",
         ],
-        json_contract_depth: JsonContractDepth::None,
+        json_contract_depth: JsonContractDepth::SemanticAsserts,
         scenarios_by_file: &[],
         last_audited_at: "2026-05-14",
     },
@@ -1742,6 +1745,8 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
     SurfaceV2 {
         id: 83,
         scenarios: 14,
+        // 14 single-script run tests in `run.rs`. `--filter / --all /
+        // --affected` cases live in id 84 — see partition there.
         failure_modes_tested: &[
             "executes script and succeeds",
             "script output reaches stdout",
@@ -1765,7 +1770,7 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
             "script that spawns a long-lived daemon (kill-tree behavior)",
         ],
         json_contract_depth: JsonContractDepth::SemanticAsserts,
-        scenarios_by_file: &[],
+        scenarios_by_file: &[("tests/workflows/tests/run.rs", 14)],
         last_audited_at: "2026-05-14",
     },
     // ── id 84: lpm run --filter / --all / --affected ──
@@ -1788,7 +1793,7 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
             "--affected base ref pointing at a missing commit",
         ],
         json_contract_depth: JsonContractDepth::SemanticAsserts,
-        scenarios_by_file: &[],
+        scenarios_by_file: &[("tests/workflows/tests/run.rs", 7)],
         last_audited_at: "2026-05-14",
     },
     // ── id 85: lpm exec <file> ──
@@ -1842,7 +1847,7 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
             "lint --all on a workspace where one member has a broken config",
         ],
         json_contract_depth: JsonContractDepth::SemanticAsserts,
-        scenarios_by_file: &[],
+        scenarios_by_file: &[("tests/workflows/tests/tools.rs", 5)],
         last_audited_at: "2026-05-14",
     },
     // ── id 88: lpm fmt (write) ──
@@ -1861,7 +1866,7 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
             "fmt on a file whose encoding is not UTF-8",
         ],
         json_contract_depth: JsonContractDepth::SemanticAsserts,
-        scenarios_by_file: &[],
+        scenarios_by_file: &[("tests/workflows/tests/tools.rs", 3)],
         last_audited_at: "2026-05-14",
     },
     // ── id 89: lpm fmt --check ──
@@ -1876,7 +1881,7 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
             "check on a file whose declared dialect mismatches biome's expectation",
         ],
         json_contract_depth: JsonContractDepth::SemanticAsserts,
-        scenarios_by_file: &[],
+        scenarios_by_file: &[("tests/workflows/tests/tools.rs", 1)],
         last_audited_at: "2026-05-14",
     },
     // ── id 90: lpm check ──
@@ -1926,7 +1931,7 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
             "test runner not installed in member's node_modules",
         ],
         json_contract_depth: JsonContractDepth::SemanticAsserts,
-        scenarios_by_file: &[],
+        scenarios_by_file: &[("tests/workflows/tests/tools.rs", 7)],
         last_audited_at: "2026-05-14",
     },
     // ── id 92: lpm bench ──
@@ -2012,21 +2017,24 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
             "init under a HOME with restricted permissions",
         ],
         json_contract_depth: JsonContractDepth::None,
-        scenarios_by_file: &[],
+        scenarios_by_file: &[("tests/workflows/tests/env_local.rs", 1)],
         last_audited_at: "2026-05-14",
     },
     // ── id 97: lpm env ls / list ──
     SurfaceV2 {
         id: 97,
         scenarios: 1,
-        failure_modes_tested: &["list JSON envelope carries keys"],
+        failure_modes_tested: &[
+            "list JSON envelope carries keys",
+            "list JSON envelope shape locked (snapshot)",
+        ],
         failure_modes_known: &[
             "symlink in env path",
             "permission denied on env file",
             "case-collision in key names on case-insensitive FS",
             "list under an env that was deleted by a concurrent CLI",
         ],
-        json_contract_depth: JsonContractDepth::SemanticAsserts,
+        json_contract_depth: JsonContractDepth::InstaSnapshot,
         scenarios_by_file: &[],
         last_audited_at: "2026-05-14",
     },
@@ -2049,7 +2057,7 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
             "set of a value larger than the vault's size cap",
         ],
         json_contract_depth: JsonContractDepth::SemanticAsserts,
-        scenarios_by_file: &[],
+        scenarios_by_file: &[("tests/workflows/tests/env_local.rs", 6)],
         last_audited_at: "2026-05-14",
     },
     // ── id 99: lpm env import / export / print / copy ──
@@ -2069,7 +2077,7 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
             "copy across two pair-bound vaults on the same machine",
         ],
         json_contract_depth: JsonContractDepth::None,
-        scenarios_by_file: &[],
+        scenarios_by_file: &[("tests/workflows/tests/env_local.rs", 4)],
         last_audited_at: "2026-05-14",
     },
     // ── id 100: lpm env diff / validate / check ──
@@ -2088,17 +2096,19 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
             "diff between local + remote (cloud-bound path)",
         ],
         json_contract_depth: JsonContractDepth::SemanticAsserts,
-        scenarios_by_file: &[],
+        scenarios_by_file: &[("tests/workflows/tests/env_local.rs", 4)],
         last_audited_at: "2026-05-14",
     },
     // ── id 101: lpm env push / pull (cloud) ──
     SurfaceV2 {
         id: 101,
-        scenarios: 9,
+        scenarios: 10,
         failure_modes_tested: &[
             "pull overwrites local state with remote environments",
+            "cross-machine push→pull plaintext byte-equality under shared wrapping key (flow #7)",
             "pull-oidc writes env file with sorted + quoted values",
             "pull-oidc uses LPM_OIDC_TOKEN canonical + ignores CI_JOB_JWT_V2",
+            "pull-oidc gitlab envelope shape locked (snapshot)",
             "pull-oidc uses github-actions runtime token",
             "pull-oidc partial github signal token-only falls through",
             "pull-oidc partial github signal url-only falls through",
@@ -2109,10 +2119,9 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
         failure_modes_known: &[
             "network failure mid-sync (partial-state recovery)",
             "concurrent push + pull on same env",
-            "round-trip encryption byte-equality across devices",
             "push to a vault whose org membership was revoked between auth + write",
         ],
-        json_contract_depth: JsonContractDepth::None,
+        json_contract_depth: JsonContractDepth::InstaSnapshot,
         scenarios_by_file: &[],
         last_audited_at: "2026-05-14",
     },

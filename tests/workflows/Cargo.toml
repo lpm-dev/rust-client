@@ -35,3 +35,4 @@ rand = { workspace = true }
 scrypt = { workspace = true }
 sha2 = "0.10"
 p256 = { workspace = true }
+hex = { workspace = true }

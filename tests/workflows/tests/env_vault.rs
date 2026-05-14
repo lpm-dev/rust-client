@@ -966,6 +966,22 @@ async fn env_pull_oidc_uses_lpm_oidc_token_canonical_and_ignores_ci_job_jwt_v2()
     assert_eq!(json["count"], 2);
     assert_eq!(json["vars"]["CI_PROVIDER"], "gitlab");
     assert_eq!(json["vars"]["SECRET_ONE"], "value-1");
+
+    insta::with_settings!({
+        sort_maps => true,
+        filters => vec![
+            (r#"/var/folders/[^"\s]+"#, "[TEMP]"),
+            (r#"/private/var/folders/[^"\s]+"#, "[TEMP]"),
+            (r#"/tmp/[^"\s]+"#, "[TEMP]"),
+            (r"http://127\.0\.0\.1:\d+", "[MOCK]"),
+        ],
+    }, {
+        insta::assert_json_snapshot!(
+            "env_pull_oidc_gitlab_two_vars_envelope",
+            json,
+            { ".duration_ms" => "[DURATION]" }
+        );
+    });
 }
 
 #[tokio::test]
