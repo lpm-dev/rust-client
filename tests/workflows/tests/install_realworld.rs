@@ -221,10 +221,10 @@ fn parse_peak_rss(time_output: &str) -> Option<u64> {
         // GNU `time -v`: `Maximum resident set size (kbytes): <kb>`
         #[cfg(target_os = "linux")]
         {
-            if let Some(rest) = trimmed.strip_prefix("Maximum resident set size (kbytes):") {
-                if let Ok(kb) = rest.trim().parse::<u64>() {
-                    return Some(kb.saturating_mul(1024));
-                }
+            if let Some(rest) = trimmed.strip_prefix("Maximum resident set size (kbytes):")
+                && let Ok(kb) = rest.trim().parse::<u64>()
+            {
+                return Some(kb.saturating_mul(1024));
             }
         }
 
