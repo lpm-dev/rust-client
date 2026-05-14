@@ -288,3 +288,144 @@ fn publish_custom_registry_dry_run_json_surfaces_registry_url_and_resolved_name(
     assert_eq!(targets[0]["registry"], serde_json::json!(registry_url));
     assert_eq!(targets[0]["name"], serde_json::json!("custom-publish-pkg"));
 }
+
+// ─── --github / --gitlab provider flags ───────────────────────────────
+//
+// The github/gitlab targets eventually hit GitHub Packages and GitLab
+// Packages. Workflow tests cover the dry-run plan envelope only (the
+// target enum is resolved without doing any network).
+
+#[test]
+fn publish_github_dry_run_resolves_github_target_in_json_envelope() {
+    let project = TempProject::empty(
+        r#"{
+        "name": "@my-org/gh-pkg",
+        "version": "1.0.0",
+        "description": "GitHub Packages dry-run target",
+        "main": "index.js",
+        "license": "MIT"
+    }"#,
+    );
+    project.write_file("index.js", "module.exports = {}");
+
+    let output = lpm(&project)
+        .args(["--json", "publish", "--dry-run", "--yes", "--github"])
+        .output()
+        .expect("failed to run lpm publish --github --dry-run");
+
+    assert!(
+        output.status.success(),
+        "publish --github --dry-run --json must succeed\nstderr: {}",
+        String::from_utf8_lossy(&output.stderr),
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    let envelope: serde_json::Value = serde_json::from_str(&stdout)
+        .unwrap_or_else(|e| panic!("publish --json must be valid JSON: {e}\n---\n{stdout}"));
+
+    assert_eq!(envelope["dry_run"], serde_json::json!(true));
+    let targets = envelope["targets"]
+        .as_array()
+        .expect("targets must be an array");
+    assert!(
+        targets
+            .iter()
+            .any(|t| t["registry"] == serde_json::json!("github")),
+        "--github must surface a target with registry=github, got: {targets:?}",
+    );
+}
+
+#[test]
+fn publish_gitlab_dry_run_resolves_gitlab_target_in_json_envelope() {
+    let project = TempProject::empty(
+        r#"{
+        "name": "@my-org/gl-pkg",
+        "version": "1.0.0",
+        "description": "GitLab Packages dry-run target",
+        "main": "index.js",
+        "license": "MIT"
+    }"#,
+    );
+    project.write_file("index.js", "module.exports = {}");
+    // GitLab Packages requires a numeric project ID in lpm.json so the
+    // upload URL can be constructed; without it, dry-run fails-fast with
+    // a clear configuration error.
+    project.write_file(
+        "lpm.json",
+        r#"{ "publish": { "gitlab": { "projectId": "12345" } } }"#,
+    );
+
+    let output = lpm(&project)
+        .args(["--json", "publish", "--dry-run", "--yes", "--gitlab"])
+        .output()
+        .expect("failed to run lpm publish --gitlab --dry-run");
+
+    assert!(
+        output.status.success(),
+        "publish --gitlab --dry-run --json must succeed\nstderr: {}",
+        String::from_utf8_lossy(&output.stderr),
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    let envelope: serde_json::Value = serde_json::from_str(&stdout)
+        .unwrap_or_else(|e| panic!("publish --json must be valid JSON: {e}\n---\n{stdout}"));
+
+    let targets = envelope["targets"]
+        .as_array()
+        .expect("targets must be an array");
+    assert!(
+        targets
+            .iter()
+            .any(|t| t["registry"] == serde_json::json!("gitlab")),
+        "--gitlab must surface a target with registry=gitlab, got: {targets:?}",
+    );
+}
+
+#[test]
+fn publish_github_and_gitlab_together_yields_two_targets() {
+    let project = TempProject::empty(
+        r#"{
+        "name": "@my-org/multi-pkg",
+        "version": "1.0.0",
+        "description": "Multi-provider dry-run",
+        "main": "index.js",
+        "license": "MIT"
+    }"#,
+    );
+    project.write_file("index.js", "module.exports = {}");
+    project.write_file(
+        "lpm.json",
+        r#"{ "publish": { "gitlab": { "projectId": "12345" } } }"#,
+    );
+
+    let output = lpm(&project)
+        .args([
+            "--json",
+            "publish",
+            "--dry-run",
+            "--yes",
+            "--github",
+            "--gitlab",
+        ])
+        .output()
+        .expect("failed to run lpm publish --github --gitlab --dry-run");
+
+    assert!(
+        output.status.success(),
+        "multi-provider dry-run must succeed"
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    let envelope: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+
+    let target_registries: Vec<&str> = envelope["targets"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|t| t["registry"].as_str())
+        .collect();
+    assert!(
+        target_registries.contains(&"github") && target_registries.contains(&"gitlab"),
+        "both providers must appear in the targets array, got: {target_registries:?}",
+    );
+}
