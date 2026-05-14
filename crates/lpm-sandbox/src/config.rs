@@ -7,35 +7,43 @@
 //! install and threads the resolved absolute paths into every
 //! per-package [`crate::SandboxSpec`].
 //!
-//! # Phase 48 P0 slice 5 — path validation
+//! # Path validation
 //!
 //! Reading the key unvalidated is a trust-boundary hole: a malicious
 //! repo can ship `package.json > lpm > scripts > sandboxWriteDirs =
 //! ["/"]` or `["/Users/foo/.ssh"]` and those absolute paths were
-//! accepted verbatim ([phase48 §2 row 4']). Slice 5 closes this by
-//! applying two unconditional checks + one allowlist intersection:
+//! accepted verbatim ([phase48 §2 row 4']). Three checks apply:
 //!
 //! 1. **Dangerous-root denylist** (unconditional): reject any entry
 //!    that resolves to `/`, `/etc`, `/var/run`, `/run`,
-//!    `$HOME/.ssh`, `$HOME/.aws`, or `$HOME/.lpm` (or any descendant
-//!    of those roots). The denylist has final veto over the
-//!    allowlist — an entry that IS in the user allowlist is still
-//!    rejected if it lands in a dangerous root.
+//!    `$HOME/.ssh`, `$HOME/.aws`, or `$HOME/.lpm` on POSIX, or
+//!    `C:\Windows`, `C:\Program Files`, `C:\Program Files (x86)`,
+//!    `C:\ProgramData`, or any bare drive root on Windows (plus the
+//!    same home-rooted suffixes). The denylist has final veto over
+//!    the allowlist — an entry that IS in the user allowlist is
+//!    still rejected if it lands in a dangerous root.
 //! 2. **Traversal-escape check** (unconditional, applies only to
 //!    authored-as-relative entries): after logical `..` collapse,
 //!    relative entries must stay inside `project_dir`. `"../etc"` is
 //!    rejected regardless of the user allowlist state.
-//! 3. **User-allowlist intersection** (when `user_allowlist` is
-//!    non-empty): every entry must descend from `project_dir` OR from
-//!    one of the allowlist roots. When the allowlist is empty
-//!    (absent user key = default), this check is skipped —
-//!    back-compat for users who haven't opted into the machine-
-//!    wide allowlist.
+//! 3. **Containment intersection** (unconditional): every entry must
+//!    descend from `project_dir` OR from one of the user-allowlist
+//!    roots (`~/.lpm/config.toml > max-sandbox-write-roots`).
 //!
-//! The phase48.md §6 row "Gap 4 sandboxWriteDirs policy" pins the
-//! empty-allowlist semantic: **empty means unset, never deny-all.**
-//! A future `sandbox-write-policy = "deny-all"` sentinel could layer
-//! on top, but is explicitly out of scope for Phase 48.
+//! # Phase 46.3 — empty-allowlist tightening
+//!
+//! Pre-Phase-46.3 the empty allowlist was treated as "no constraint"
+//! (phase48.md §6 "Gap 4 sandboxWriteDirs policy"), so a `package.json`
+//! authored as `sandboxWriteDirs: ["~/Documents"]` was accepted
+//! verbatim. Because install scripts come from untrusted dependencies,
+//! that meant a one-line `package.json` change could hand dependency
+//! install scripts write access to user data the dangerous-root
+//! denylist does not cover (`~/.bashrc`, `~/.config`, `~/Documents`,
+//! `~/.local/share`, …). Phase 46.3 flips the empty case to mean
+//! "no opt-in": absolute paths outside `project_dir` are rejected
+//! unless explicitly covered by `max-sandbox-write-roots`. Relative
+//! paths are unaffected (already constrained by Step 2 to stay
+//! inside `project_dir`).
 
 use crate::SandboxError;
 use std::path::{Component, Path, PathBuf};
@@ -51,10 +59,11 @@ use std::path::{Component, Path, PathBuf};
 /// - `project_dir`: project root; relative entries resolve against
 ///   this, and relative-entry traversal is checked against it.
 /// - `user_allowlist`: absolute paths from
-///   `~/.lpm/config.toml > max-sandbox-write-roots`. When non-empty,
-///   every entry must descend from `project_dir` or one of these
-///   paths. When empty, the allowlist check is skipped
-///   (back-compat default).
+///   `~/.lpm/config.toml > max-sandbox-write-roots`. Every entry
+///   must descend from `project_dir` or one of these paths.
+///   When the allowlist is empty, only paths under `project_dir`
+///   are accepted — see the module-level "Phase 46.3 —
+///   empty-allowlist tightening" note for the security rationale.
 /// - `home_dir`: the user's `$HOME`. Optional — if `None`, the
 ///   `$HOME/.ssh`, `$HOME/.aws`, `$HOME/.lpm` branches of the
 ///   dangerous-root denylist are skipped (the absolute-path
@@ -77,11 +86,11 @@ use std::path::{Component, Path, PathBuf};
 /// - Empty strings are rejected: they would resolve to `project_dir`
 ///   itself, which is already covered by the read allow-list and
 ///   would silently widen the write set to the entire project tree.
-/// - Entries that fail the Phase 48 P0 slice 5 validation
-///   (dangerous denylist, traversal escape, or allowlist intersection)
-///   surface as [`SandboxError::InvalidSpec`] with an error naming
-///   both the project file + the user config source, so the user
-///   can tell which side needs fixing.
+/// - Entries that fail validation (dangerous denylist, traversal
+///   escape, or containment intersection) surface as
+///   [`SandboxError::InvalidSpec`] with an error naming both the
+///   project file + the user config source, so the user can tell
+///   which side needs fixing.
 pub fn load_sandbox_write_dirs(
     package_json: &Path,
     project_dir: &Path,
@@ -176,9 +185,10 @@ pub fn load_sandbox_write_dirs(
 
 // ── Validation helpers ────────────────────────────────────────────
 
-/// Run the Phase 48 P0 slice 5 validation on a single resolved entry.
-/// Errors name both the project file and the offending path so the
-/// user knows which side to edit.
+/// Validate a single resolved entry against the dangerous-root
+/// denylist, the traversal-escape rule, and the containment
+/// intersection. Errors name both the project file and the offending
+/// path so the user knows which side to edit.
 #[allow(clippy::too_many_arguments)]
 fn validate_entry(
     authored: &str,
@@ -225,32 +235,48 @@ fn validate_entry(
         });
     }
 
-    // Step 3: user-allowlist intersection (applies only when the
-    // user has opted in by setting a non-empty
-    // max-sandbox-write-roots). Empty allowlist = unset = no
-    // constraint — pinned by the phase48.md §6 sandboxWriteDirs
-    // policy row.
-    if !user_allowlist_canon.is_empty() {
-        let inside_project = is_descendant_of(canonical, project_dir_canon);
-        let inside_user_root = user_allowlist_canon
-            .iter()
-            .any(|root| is_descendant_of(canonical, root));
-        if !inside_project && !inside_user_root {
-            return Err(SandboxError::InvalidSpec {
-                reason: format!(
-                    "{pj}: `lpm.scripts.sandboxWriteDirs[{i}]` = {authored:?} \
-                     resolves to {path} which is outside project_dir = {project} \
-                     AND outside every entry in \
-                     ~/.lpm/config.toml > max-sandbox-write-roots = {allowlist:?}. \
-                     Either add a matching root to the user allowlist, \
-                     or remove the entry from the project's package.json.",
-                    pj = package_json.display(),
-                    path = canonical.display(),
-                    project = project_dir_canon.display(),
-                    allowlist = user_allowlist_canon,
-                ),
-            });
-        }
+    // Step 3: containment intersection (unconditional). Every entry
+    // must descend from `project_dir` OR from a user-allowlist root.
+    //
+    // Phase 46.3: empty allowlist NO LONGER means "no constraint".
+    // Pre-Phase-46.3 the empty case skipped this check, which let
+    // a malicious or careless `package.json > sandboxWriteDirs` edit
+    // (e.g. `["~/Documents"]`, `["/var/log"]`) widen install-script
+    // write access to user data the dangerous-root denylist does
+    // not cover (`~/.bashrc`, `~/.config`, `~/.local/share`, …).
+    // Install scripts come from untrusted dependencies, so the
+    // union of `sandboxWriteDirs` paths IS the dependency attack
+    // surface — defaulting that union open made the attack a
+    // one-line PR. Empty allowlist now means "no opt-in" and
+    // absolute paths outside `project_dir` require an explicit
+    // covering entry in `~/.lpm/config.toml > max-sandbox-write-roots`.
+    //
+    // Relative entries are already covered by Step 2 (traversal
+    // escape) — they're guaranteed to stay inside `project_dir`, so
+    // this check is a no-op for them.
+    let inside_project = is_descendant_of(canonical, project_dir_canon);
+    let inside_user_root = user_allowlist_canon
+        .iter()
+        .any(|root| is_descendant_of(canonical, root));
+    if !inside_project && !inside_user_root {
+        return Err(SandboxError::InvalidSpec {
+            reason: format!(
+                "{pj}: `lpm.scripts.sandboxWriteDirs[{i}]` = {authored:?} \
+                 resolves to {path} which is outside project_dir = {project} \
+                 and not covered by ~/.lpm/config.toml > max-sandbox-write-roots {allowlist}. \
+                 To opt in, add a covering root to that user-config key; \
+                 to keep the entry project-local, change it to a relative \
+                 or project-internal absolute path.",
+                pj = package_json.display(),
+                path = canonical.display(),
+                project = project_dir_canon.display(),
+                allowlist = if user_allowlist_canon.is_empty() {
+                    "(empty — the key is unset)".to_string()
+                } else {
+                    format!("= {user_allowlist_canon:?}")
+                },
+            ),
+        });
     }
 
     Ok(())
@@ -437,11 +463,11 @@ mod tests {
         }
     }
 
-    /// Convenience wrapper matching the pre-slice-5 call shape so
-    /// existing tests stay readable: empty user allowlist, no home
-    /// dir. New validation tests call `load_sandbox_write_dirs`
-    /// directly to exercise the allowlist + home paths.
-    fn load_back_compat(env: &Env) -> Result<Vec<PathBuf>, SandboxError> {
+    /// Minimal call form — empty user allowlist, no home dir. Used
+    /// by tests whose assertions don't depend on the allowlist or
+    /// home-dir branches of the validator. Tests that exercise
+    /// those branches call `load_sandbox_write_dirs` directly.
+    fn load_minimal(env: &Env) -> Result<Vec<PathBuf>, SandboxError> {
         load_sandbox_write_dirs(&env.package_json, &env.project, &[], None)
     }
 
@@ -496,24 +522,30 @@ mod tests {
     #[test]
     fn package_json_without_lpm_section_returns_empty() {
         let e = fixture(r#"{"name":"x","version":"1.0.0"}"#);
-        let v = load_back_compat(&e).unwrap();
+        let v = load_minimal(&e).unwrap();
         assert!(v.is_empty());
     }
 
     #[test]
     fn package_json_without_sandbox_write_dirs_returns_empty() {
         let e = fixture(r#"{"lpm":{"scripts":{"autoBuild":true}}}"#);
-        let v = load_back_compat(&e).unwrap();
+        let v = load_minimal(&e).unwrap();
         assert!(v.is_empty());
     }
 
     #[test]
     fn absolute_entry_kept_verbatim() {
+        // Absolute path outside project_dir requires a covering
+        // allowlist root (Phase 46.3 tightening). Verbatim-preservation
+        // is what this test pins — the loader keeps the authored
+        // path as-is, not joining it onto project_dir or normalizing
+        // away segments.
         let abs = unix_abs_str("/home/u/.cache/ms-playwright");
         let e = fixture(&format!(
             r#"{{"lpm":{{"scripts":{{"sandboxWriteDirs":["{abs}"]}}}}}}"#
         ));
-        let v = load_back_compat(&e).unwrap();
+        let allowlist = [unix_abs_pathbuf("/home/u/.cache")];
+        let v = load_sandbox_write_dirs(&e.package_json, &e.project, &allowlist, None).unwrap();
         assert_eq!(v.len(), 1);
         assert_eq!(v[0], unix_abs_pathbuf("/home/u/.cache/ms-playwright"));
     }
@@ -521,7 +553,7 @@ mod tests {
     #[test]
     fn relative_entry_joined_to_project_dir() {
         let e = fixture(r#"{"lpm":{"scripts":{"sandboxWriteDirs":["build-output"]}}}"#);
-        let v = load_back_compat(&e).unwrap();
+        let v = load_minimal(&e).unwrap();
         assert_eq!(v.len(), 1);
         assert_eq!(v[0], e.project.join("build-output"));
         assert!(v[0].is_absolute());
@@ -534,7 +566,11 @@ mod tests {
         let e = fixture(&format!(
             r#"{{"lpm":{{"scripts":{{"sandboxWriteDirs":["{one}","rel-two","{three}"]}}}}}}"#
         ));
-        let v = load_back_compat(&e).unwrap();
+        // Phase 46.3: absolute entries outside project_dir need a
+        // covering allowlist; `/abs` covers both `/abs/one` and
+        // `/abs/three`.
+        let allowlist = [unix_abs_pathbuf("/abs")];
+        let v = load_sandbox_write_dirs(&e.package_json, &e.project, &allowlist, None).unwrap();
         assert_eq!(v.len(), 3);
         assert_eq!(v[0], unix_abs_pathbuf("/abs/one"));
         assert_eq!(v[1], e.project.join("rel-two"));
@@ -544,7 +580,7 @@ mod tests {
     #[test]
     fn non_array_value_errors_with_actionable_message() {
         let e = fixture(r#"{"lpm":{"scripts":{"sandboxWriteDirs":"not-an-array"}}}"#);
-        match load_back_compat(&e) {
+        match load_minimal(&e) {
             Err(SandboxError::InvalidSpec { reason }) => {
                 assert!(reason.contains("sandboxWriteDirs"));
                 assert!(reason.contains("array"));
@@ -556,7 +592,7 @@ mod tests {
     #[test]
     fn non_string_element_errors_with_index() {
         let e = fixture(r#"{"lpm":{"scripts":{"sandboxWriteDirs":["ok",42]}}}"#);
-        match load_back_compat(&e) {
+        match load_minimal(&e) {
             Err(SandboxError::InvalidSpec { reason }) => {
                 assert!(reason.contains("sandboxWriteDirs[1]"));
                 assert!(reason.contains("string"));
@@ -568,7 +604,7 @@ mod tests {
     #[test]
     fn empty_string_entry_rejected_because_it_widens_project_wide() {
         let e = fixture(r#"{"lpm":{"scripts":{"sandboxWriteDirs":[""]}}}"#);
-        match load_back_compat(&e) {
+        match load_minimal(&e) {
             Err(SandboxError::InvalidSpec { reason }) => {
                 assert!(reason.contains("empty"));
                 assert!(reason.contains("widen"));
@@ -580,7 +616,7 @@ mod tests {
     #[test]
     fn malformed_json_surfaces_as_invalid_spec() {
         let e = fixture(r#"{"lpm": INVALID"#);
-        match load_back_compat(&e) {
+        match load_minimal(&e) {
             Err(SandboxError::InvalidSpec { reason }) => {
                 assert!(reason.contains("not valid JSON"));
             }
@@ -588,23 +624,56 @@ mod tests {
         }
     }
 
-    // ── Phase 48 P0 slice 5 — new validation acceptance tests ──
+    // ── Phase 48 P0 slice 5 / Phase 46.3 — validation acceptance tests ──
 
-    /// Reviewer's acceptance #1: absent/empty `max-sandbox-write-roots`
-    /// keeps back-compat. Already covered by the pre-slice-5 tests
-    /// above (all of which use `&[]` allowlist and pass). This test
-    /// pins the intent explicitly.
+    /// Phase 46.3 (2026-05-13) tightening: an absolute path outside
+    /// `project_dir` is rejected when `max-sandbox-write-roots` is
+    /// empty. The dangerous-root denylist alone is not enough —
+    /// it does not cover user data dirs (`~/Documents`, `~/.config`,
+    /// `~/.local/share`, …). Replaces the pre-46.3
+    /// `slice5_empty_allowlist_behaves_like_no_constraint` test
+    /// that pinned the opposite (back-compat) semantic.
     #[test]
-    fn slice5_empty_allowlist_behaves_like_no_constraint() {
-        // Absolute path outside project_dir, outside dangerous
-        // denylist, outside any allowlist → accepted when
-        // allowlist is empty (= back-compat).
+    fn empty_allowlist_rejects_absolute_outside_project() {
         let abs = unix_abs_str("/opt/local/share");
         let e = fixture(&format!(
             r#"{{"lpm":{{"scripts":{{"sandboxWriteDirs":["{abs}"]}}}}}}"#
         ));
+        match load_sandbox_write_dirs(&e.package_json, &e.project, &[], None) {
+            Err(SandboxError::InvalidSpec { reason }) => {
+                assert!(
+                    reason.contains("opt/local/share") || reason.contains("opt\\local\\share"),
+                    "error names the rejected path: {reason}"
+                );
+                assert!(
+                    reason.contains("max-sandbox-write-roots"),
+                    "error tells the user how to opt in: {reason}"
+                );
+                assert!(
+                    reason.contains("empty") || reason.contains("unset"),
+                    "error names the empty-allowlist case explicitly: {reason}"
+                );
+            }
+            other => panic!("expected InvalidSpec, got {other:?}"),
+        }
+    }
+
+    /// Companion to the rejection test: an absolute path INSIDE
+    /// `project_dir` is accepted with an empty allowlist — the
+    /// entry descends from `project_dir`, which is always
+    /// implicitly trusted regardless of allowlist state.
+    #[test]
+    fn empty_allowlist_accepts_absolute_inside_project() {
+        let e = fixture(r#"{"lpm":{"scripts":{"sandboxWriteDirs":[]}}}"#);
+        let inside = e.project.join("build-output");
+        let body = format!(
+            r#"{{"lpm":{{"scripts":{{"sandboxWriteDirs":[{}]}}}}}}"#,
+            json_encode_literal(&inside.to_string_lossy())
+        );
+        fs::write(&e.package_json, body).expect("rewrite fixture");
         let v = load_sandbox_write_dirs(&e.package_json, &e.project, &[], None).unwrap();
-        assert_eq!(v, vec![unix_abs_pathbuf("/opt/local/share")]);
+        assert_eq!(v.len(), 1);
+        assert_eq!(v[0], inside);
     }
 
     /// Reviewer's acceptance #2: descendant path accepted when

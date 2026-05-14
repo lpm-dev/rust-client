@@ -85,6 +85,27 @@ mod linux;
 #[cfg(target_os = "windows")]
 mod windows;
 
+// Phase 46.3 PR-2: argv contract for the `lpm-sandbox-helper.exe`
+// helper. Cross-platform parser so the unit tests run on every CI
+// runner; the helper binary itself is Windows-only. The module gates
+// internally on `cfg(any(target_os = "windows", test))` — see its
+// crate-doc preamble.
+pub mod helper_protocol;
+
+// Phase 46.3 PR-2: AppContainer launcher invoked from
+// `lpm-sandbox-helper.exe` on Windows. The Win32 surface (SID,
+// DACL, STARTUPINFOEXW, Job Object) is reachable only on Windows;
+// the module gates internally on `cfg(target_os = "windows")`.
+#[cfg(target_os = "windows")]
+pub mod helper_appcontainer;
+
+// Phase 46.3 PR-2: parent-side AppContainer backend (lives in
+// `lpm.exe`, drives the helper binary). The factory below picks
+// this backend over [`windows::WindowsSandbox`] when
+// `locate_sandbox_helper` finds the helper.
+#[cfg(target_os = "windows")]
+mod windows_appcontainer;
+
 // Rule description is platform-neutral so macOS CI + developer-host
 // test runs exercise it without a Linux kernel. The module is gated
 // on `target_os = "linux"` for production builds (where `linux.rs`
@@ -658,16 +679,36 @@ fn platform_backend(
     mode: SandboxMode,
     options: SandboxOptions,
 ) -> Result<Box<dyn Sandbox>, SandboxError> {
-    // Phase 46.2: Mandatory Integrity Control backend. Strict mode
-    // (`deny_outbound_network = true`) is intentionally a soft refuse
-    // — the backend's `decide_posture` surfaces
-    // [`SandboxError::UnsupportedPlatform`] with a remediation block
-    // naming the four interim recourses (`allow-degraded`,
-    // `trustedDependencies`, `--no-sandbox`, drop back to default).
-    // When `allow_degraded = true`, the backend succeeds with
-    // [`SandboxPosture::Degraded`] and the install pipeline emits
-    // the per-install warning via
-    // [`SandboxPosture::degraded_warning_line`].
+    // Phase 46.3 PR-2: prefer the AppContainer backend when its
+    // helper binary is reachable. AppContainer delivers full
+    // strict (filesystem-write containment + outbound network
+    // denial); the Phase 46.2 Mandatory Integrity Control backend
+    // remains as the fallback path when the helper binary is
+    // missing (npm install corruption, manual binary fetch,
+    // dev-build that didn't bundle the helper).
+    //
+    // The two backends keep separate posture decisions
+    // ([`windows::decide_posture`] vs
+    // [`windows_appcontainer::decide_appcontainer_posture`]) so
+    // PR-2's AppContainer changes can't accidentally weaken the
+    // Low IL backend's strict-without-degraded refusal contract.
+    if let Some(helper_path) = windows_appcontainer::locate_sandbox_helper() {
+        return Ok(Box::new(windows_appcontainer::AppContainerSandbox::new(
+            spec,
+            mode,
+            options,
+            helper_path,
+        )?));
+    }
+    // Helper missing: log once at info-level so the active backend
+    // is observable, then fall back to the 46.2 Low IL path. The
+    // doctor surface ([`crate::Sandbox::backend_name`]) carries the
+    // same signal for users.
+    tracing::info!(
+        target: "lpm_sandbox::windows",
+        "lpm-sandbox-helper.exe not found next to lpm.exe; falling back to \
+         the Phase 46.2 Low IL backend (no outbound-network containment)",
+    );
     Ok(Box::new(windows::WindowsSandbox::new(spec, mode, options)?))
 }
 

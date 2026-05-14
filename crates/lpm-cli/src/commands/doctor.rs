@@ -2457,6 +2457,33 @@ fn probe_sandbox_backend() -> Check {
         Ok(sb) => {
             let backend = sb.backend_name();
             let os = std::env::consts::OS;
+            // Phase 46.3 PR-2 (2026-05-13): on Windows, the
+            // `windows-il` backend is now the FALLBACK path —
+            // the post-PR-2 happy path is `windows-appcontainer`,
+            // which delivers full strict (filesystem-write +
+            // outbound network) when the
+            // `lpm-sandbox-helper.exe` companion binary is sitting
+            // next to `lpm.exe`. If the user has fallen back to
+            // Low IL, they're missing the helper (npm install
+            // corruption, manual binary fetch that skipped the
+            // helper, or — in test contexts — `cargo run`/`cargo
+            // test` where the helper isn't placed sibling to the
+            // calling binary). Surface that as a Warn so the user
+            // knows strict mode is unreachable on this install
+            // until the helper comes back.
+            if os == "windows" && backend == "windows-il" {
+                return Check::warn(
+                    &doctor_catalog::SANDBOX_HELPER_MISSING,
+                    "windows-il available on windows — falling back from AppContainer \
+                     because `lpm-sandbox-helper.exe` is not located next to \
+                     `lpm.exe`. The Phase 46.2 Low IL backend contains filesystem \
+                     writes but does NOT deny outbound network. Reinstall lpm \
+                     (`@lpm-registry/cli`) to restore the helper, or override the \
+                     helper location via `LPM_SANDBOX_HELPER=<path>`. With the helper \
+                     present, `lpm doctor` reports `windows-appcontainer` and \
+                     strict mode is available.",
+                );
+            }
             match sb.posture() {
                 SandboxPosture::Default => Check::pass(
                     &doctor_catalog::SANDBOX_AVAILABLE,
@@ -2469,15 +2496,22 @@ fn probe_sandbox_backend() -> Check {
                     ),
                 ),
                 SandboxPosture::Strict => {
-                    // Phase 46.1: network-denial coverage is
-                    // platform-asymmetric. macOS Seatbelt's
-                    // `(deny default)` covers every socket family
-                    // unconditionally; Linux landlock V4 only
-                    // handles BindTcp + ConnectTcp, so UDP / raw /
-                    // AF_PACKET / DNS-via-UDP are NOT denied until
-                    // Phase 46.1.1's seccomp-bpf layer lands.
+                    // Network-denial coverage is platform-asymmetric:
+                    // - macOS Seatbelt's `(deny default)` covers every
+                    //   socket family unconditionally.
+                    // - Windows AppContainer (Phase 46.3 PR-2) denies
+                    //   every socket family via the WFP layer once the
+                    //   capability list is empty — same coverage shape
+                    //   as macOS Seatbelt.
+                    // - Linux landlock V4 only handles BindTcp +
+                    //   ConnectTcp, so UDP / raw / AF_PACKET / DNS-via-UDP
+                    //   are NOT denied until Phase 46.1.1's seccomp-bpf
+                    //   layer lands.
                     let net_coverage = if os == "macos" {
                         "full outbound network denial (all socket families)"
+                    } else if backend == "windows-appcontainer" {
+                        "full outbound network denial via AppContainer + WFP \
+                         (all socket families)"
                     } else {
                         "outbound TCP denial (BindTcp + ConnectTcp via landlock V4 — \
                          UDP / raw / AF_PACKET / DNS-via-UDP NOT denied until Phase 46.1.1)"
@@ -2495,23 +2529,34 @@ fn probe_sandbox_backend() -> Check {
                     abi,
                     missing,
                 } => {
-                    // Phase 46.2 (2026-05-12): both Linux (kernel <
-                    // 6.7 + allow-degraded) and Windows (any version
-                    // + allow-degraded — strict-mode WFP support is
-                    // the Phase 46.3 follow-up) reach this arm. The
-                    // `abi` field carries the discriminator
-                    // (`v1` = Linux landlock V1 fallback; `low-il` =
-                    // Windows Mandatory Integrity Control). Pick a
-                    // platform-honest message rather than a single
-                    // Linux-shaped string that would lie about the
-                    // remediation on Windows.
+                    // Phase 46.3 PR-2 (2026-05-13): both Linux
+                    // (kernel < 6.7 + allow-degraded) and Windows
+                    // (`windows-il` Low IL FALLBACK when the
+                    // `lpm-sandbox-helper.exe` AppContainer launcher
+                    // is missing + allow-degraded) reach this arm.
+                    // The `abi` field carries the discriminator
+                    // (`v1` = Linux landlock V1 fallback; `low-il`
+                    // = Windows Mandatory Integrity Control
+                    // fallback). Pick a platform-honest message —
+                    // a single Linux-shaped string would lie about
+                    // the remediation on Windows.
+                    //
+                    // On Windows the cause is no longer "Phase 46.3
+                    // is a follow-up" (PR-2 ships it). It's now
+                    // "the helper binary that delivers AppContainer
+                    // strict isn't sitting next to lpm.exe." That's
+                    // an npm-install corruption symptom — reinstall
+                    // is the fix.
                     let cause_and_fix = if abi == "low-il" {
-                        "user requested strict but Windows backend ships filesystem-write \
-                         containment only (Phase 46.2). Outbound-network denial is the \
-                         Phase 46.3 WFP follow-up. Switch to `lpm config sandbox --set \
-                         default` to drop the strict request and silence this warning, or \
-                         keep `allow-degraded = true` to keep filesystem-write containment \
-                         while accepting the network gap."
+                        "user requested strict but `lpm-sandbox-helper.exe` is not located \
+                         next to `lpm.exe`; the AppContainer backend (Phase 46.3 PR-2 — \
+                         filesystem + outbound-network containment) needs the helper to \
+                         deliver strict mode. Falling back to Phase 46.2 Low IL backend, \
+                         which contains filesystem writes but does NOT deny outbound \
+                         network. Reinstall lpm (`@lpm-registry/cli`) to restore the helper, \
+                         or override the helper location via `LPM_SANDBOX_HELPER=<path>`. \
+                         Switch to `lpm config sandbox --set default` to drop the strict \
+                         request and silence this warning."
                     } else {
                         "user requested strict but kernel can't deliver V4; enforces \
                          filesystem only. Upgrade the kernel to 6.7+ to restore strict \
@@ -2617,10 +2662,13 @@ mod tests {
         // platforms / refactors. Phase 46.1 adds `sandbox_degraded`
         // for the V1-fallback path; the GPT-5 audit follow-up adds
         // `sandbox_disabled_by_user` for the persistent `mode =
-        // "none"` path; the other four codes are pre-existing.
+        // "none"` path; Phase 46.3 PR-2 adds `sandbox_helper_missing`
+        // for the Windows AppContainer-helper-not-found fallback;
+        // the other four codes are pre-existing.
         let c = probe_sandbox_backend();
         let allowed = [
             "sandbox_available",
+            "sandbox_helper_missing",
             "sandbox_degraded",
             "sandbox_disabled_by_user",
             "sandbox_unsupported_platform",
@@ -2694,16 +2742,25 @@ mod tests {
         );
     }
 
-    /// On Windows, Phase 46.2 ships a real backend (Mandatory
-    /// Integrity Control + Job Object). Under the relaxed default
-    /// mode the probe Passes naming `windows-il`. Under strict mode
-    /// the probe Warns (sandbox_degraded — when `allow_degraded =
-    /// true`) or Fails (sandbox_unsupported_platform — when strict
-    /// is requested without the degraded opt-in, surfaced through the
-    /// UnsupportedPlatform arm). Default-mode runs are the common
-    /// case for end-users and the only one we pin to a specific
-    /// outcome here; the strict + degraded combination is platform
-    /// state we don't control from this test.
+    /// On Windows, the active backend is determined by helper-binary
+    /// presence:
+    ///
+    /// - **`windows-appcontainer` (Phase 46.3 PR-2)** when
+    ///   `lpm-sandbox-helper.exe` is reachable. Pass under default,
+    ///   Pass naming "AppContainer + WFP" under strict.
+    /// - **`windows-il` (Phase 46.2 fallback)** when the helper
+    ///   binary is missing. Warn surfaces the fallback explicitly
+    ///   with the reinstall remediation, even under default — the
+    ///   user has lost outbound-network containment in strict mode
+    ///   and should know that.
+    /// - **Warn `sandbox_disabled_by_user`** when the user has
+    ///   `[sandbox] mode = "none"` persisted.
+    ///
+    /// A Fail here is a regression — Mandatory Integrity Control
+    /// has been in every Windows release since Vista, and PR-2's
+    /// AppContainer backend has no preconditions beyond
+    /// "Win32_Security_Isolation surface is reachable" (Windows
+    /// 8+).
     ///
     /// Phase 46.1 rework / Q6: the `--unsafe-full-env` partner flag
     /// was collapsed into `--no-sandbox`. We keep that assertion in
@@ -2711,32 +2768,21 @@ mod tests {
     /// remediation string.
     #[cfg(target_os = "windows")]
     #[test]
-    fn sandbox_probe_on_windows_passes_under_default_posture() {
+    fn sandbox_probe_on_windows_passes_or_warns_with_known_backend_name() {
         let c = probe_sandbox_backend();
-        // Acceptable outcomes:
-        // - Pass with `sandbox_available` (default mode, the common
-        //   case on a vanilla install) — the relaxed mode constructs
-        //   without consulting any kernel-version probe.
-        // - Warn with `sandbox_degraded` (user has strict + allow-
-        //   degraded persisted in config).
-        // - Warn with `sandbox_disabled_by_user` (user has
-        //   `[sandbox] mode = "none"` persisted).
-        //
-        // A Fail here is a regression — Mandatory Integrity Control
-        // has been in every Windows release since Vista and Phase
-        // 46.2's backend has no preconditions beyond that.
         assert!(
             !matches!(c.severity, Severity::Fail),
-            "Windows sandbox probe must not Fail post-Phase-46.2. detail={}",
+            "Windows sandbox probe must not Fail post-PR-2 (AppContainer + Low IL fallback \
+             are both reachable on every supported Windows host). detail={}",
             c.detail
         );
-        if matches!(c.severity, Severity::Pass) {
-            assert!(
-                c.detail.contains("windows-il"),
-                "Pass message must name the new backend (`windows-il`). detail={}",
-                c.detail
-            );
-        }
+        // Whichever path fired, the detail names the active backend
+        // so users can route the right remediation.
+        assert!(
+            c.detail.contains("windows-il") || c.detail.contains("windows-appcontainer"),
+            "doctor detail must name the active backend; got: {}",
+            c.detail
+        );
         // Phase 46.1 rework: legacy partner flag must never appear.
         assert!(
             !c.detail.contains("--unsafe-full-env"),
@@ -2814,6 +2860,16 @@ commands = []
     /// tempdir and writing the wizard's on-disk shape directly. The
     /// project tier is silent (no `lpm.toml` in cwd typically), so
     /// the global tier wins.
+    ///
+    /// `cfg(unix)` because `dirs::home_dir()` only consults `HOME`
+    /// on Unix-not-redox; on Windows it uses the Win32
+    /// GetUserProfileDirectory call, so the `HOME=tempdir` override
+    /// here doesn't redirect `~/.lpm/config.toml` to the tempdir.
+    /// The persistent-mode-none behavior on Windows is covered
+    /// indirectly by the integration tests in
+    /// `tests/workflows/tests/sandbox_*` which exercise the
+    /// resolver against the real per-platform config home.
+    #[cfg(unix)]
     #[test]
     fn sandbox_probe_honors_persistent_mode_none_from_global_config() {
         let tmp = tempfile::tempdir().unwrap();

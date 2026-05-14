@@ -369,14 +369,21 @@ async fn assert_network_denied(
     //     OOM, etc. — test would give false confidence in
     //     sandbox containment.
     let combined = format!("{stderr}\n{stdout}");
+    // Phase 46.3 PR-2 (2026-05-13): Windows AppContainer / WFP
+    // surfaces denial as either WSAEACCES (10013, "operation not
+    // permitted" / "EACCES" in Node's terminology) or as a silent
+    // drop that Node surfaces as ETIMEDOUT after the syn-ack wait.
+    // Both shapes prove the kernel layer denied the connect.
     let signals_sandbox_denial = combined.contains("EPERM")
         || combined.contains("EACCES")
         || combined.contains("EHOSTUNREACH")
         || combined.contains("ENETUNREACH")
+        || combined.contains("ETIMEDOUT")
         || combined.contains("operation not permitted")
         || combined.contains("Operation not permitted")
         || combined.contains("permission denied")
-        || combined.contains("Permission denied");
+        || combined.contains("Permission denied")
+        || combined.contains("forbidden by its access permissions");
     assert!(
         signals_sandbox_denial,
         "[{case_label}] install output must contain the OS-level sandbox-denial signal \
@@ -555,4 +562,218 @@ async fn postinstall_loopback_connect_is_denied_no_loopback_exemption() {
 
     let target_url = format!("http://127.0.0.1:{}", listener_addr.port());
     assert_network_denied(&mock, &project, LOOPBACK_DEP_NAME, &target_url, "loopback").await;
+}
+
+// ─── Phase 46.3 PR-2: Windows AppContainer arm ───────────────────────
+//
+// The Unix tests above pin macOS Seatbelt + Linux landlock V4
+// denial. On Windows, the equivalent is AppContainer + WFP, which
+// PR-2 ships via the new `lpm-sandbox-helper.exe` companion binary.
+//
+// The Windows arm reuses the same wiremock-backed fixtures, the
+// same `INSTALL_JS_BODY` lifecycle script, and the same three
+// assertions:
+//   1. Denial signal in stderr — EACCES / ETIMEDOUT shape from the
+//      AppContainer/WFP boundary.
+//   2. `.lpm-built` marker absent (build pipeline observed the
+//      script failure).
+//   3. `mock.received_requests()` empty (the kernel denied the
+//      connect before the packet hit the wire).
+//
+// Gate: target_os = "windows" AND
+// `assert_cmd::Command::cargo_bin("lpm-sandbox-helper")` resolves
+// to an existing binary. Without the helper the install pipeline
+// falls back to the Phase 46.2 Low IL backend, which refuses
+// strict mode (without `allow_degraded`) and is covered separately.
+
+/// `true` when the test runner has explicitly opted into
+/// exercising the Windows AppContainer path via
+/// `LPM_TEST_REQUIRE_APPCONTAINER=1`. When set, the soft-skip
+/// branches below convert to `panic!` so a CI runner that
+/// _intended_ to gate the AppContainer install path can't silently
+/// produce a green result when its environment isn't actually
+/// configured for the test (helper not built, node under
+/// `C:\Program Files\…`, etc.).
+///
+/// Default-off: local `cargo test -p lpm-workflows` on a default
+/// developer host (system-installed node, no separately-built
+/// helper) keeps soft-skipping. CI hosts that provision the helper
+/// + AppContainer-accessible node should set the env var so the
+/// gate is observable.
+#[cfg(target_os = "windows")]
+fn require_appcontainer_coverage() -> bool {
+    std::env::var("LPM_TEST_REQUIRE_APPCONTAINER")
+        .map(|v| v == "1")
+        .unwrap_or(false)
+}
+
+/// `true` when `lpm-sandbox-helper.exe` is reachable via the same
+/// `target/<profile>/` probe `support::locate_test_sandbox_helper`
+/// uses internally. Workflow tests on Windows soft-skip when the
+/// helper isn't built so a `cargo test -p lpm-workflows` (without
+/// `cargo build --workspace` first) doesn't fail on the absent
+/// binary.
+#[cfg(target_os = "windows")]
+fn helper_available() -> bool {
+    let Ok(exe) = std::env::current_exe() else {
+        return false;
+    };
+    let Some(target_profile) = exe.parent().and_then(|p| p.parent()) else {
+        return false;
+    };
+    target_profile.join("lpm-sandbox-helper.exe").exists()
+}
+
+/// `true` when the `node` binary resolved via PATH lives in a
+/// directory the AppContainer SID can actually access. Stock
+/// Windows installs `node.exe` under `C:\Program Files\nodejs` —
+/// that dir is owned by SYSTEM / Administrators with no
+/// `ALL_APPLICATION_PACKAGES` ACE on the file, AND the lpm-rs
+/// process (running as a normal user) can't modify the dir's DACL
+/// to grant the AppContainer SID. Result: the AppContainer can't
+/// even LAUNCH node from the system install, so the lifecycle
+/// script never gets to attempt the outbound connect we're
+/// testing for.
+///
+/// Soft-skip when this is the case. The contract still holds (and
+/// the helper-tier integration tests pin AppContainer Strict TCP
+/// denial via PowerShell, which IS in System32 with the right ACE);
+/// this workflow test specifically pins the install-pipeline
+/// integration, which depends on node being AppContainer-readable.
+/// CI runners that need this gate green should install node via
+/// `nvm` (under `~/.nvm/versions/`, in the broad-read allow set)
+/// or place it in any user-owned directory.
+#[cfg(target_os = "windows")]
+fn node_appcontainer_accessible() -> bool {
+    let out = match std::process::Command::new("where").arg("node").output() {
+        Ok(o) if o.status.success() => o,
+        _ => return false,
+    };
+    let path = match String::from_utf8_lossy(&out.stdout).lines().next() {
+        Some(line) => line.trim().to_string(),
+        None => return false,
+    };
+    let lower = path.to_lowercase();
+    // Heuristic: dirs under `C:\Program Files\` (and the x86
+    // variant) are SYSTEM-owned and we can't DACL-modify them.
+    // Any other location (user profile, nvm, custom install) is
+    // user-owned and the explicit grant succeeds.
+    !lower.contains(r"\program files\") && !lower.contains(r"\program files (x86)\")
+}
+
+#[cfg(target_os = "windows")]
+#[tokio::test]
+async fn windows_postinstall_outbound_connect_is_denied_under_appcontainer_strict() {
+    if !node_available() {
+        let msg = "node not on PATH";
+        if require_appcontainer_coverage() {
+            panic!(
+                "LPM_TEST_REQUIRE_APPCONTAINER=1 is set, but {msg}. \
+                 The Windows AppContainer arm needs node to launch the lifecycle \
+                 script that attempts the outbound connect."
+            );
+        }
+        eprintln!("skipping: {msg}");
+        return;
+    }
+    if !helper_available() {
+        let msg = "lpm-sandbox-helper.exe not built — run `cargo build --workspace` \
+             or `cargo build -p lpm-sandbox --bin lpm-sandbox-helper` first. The Phase 46.2 \
+             Low IL fallback refuses strict mode without `allow_degraded`, so the AppContainer \
+             backend is the only path that delivers the contract this test pins.";
+        if require_appcontainer_coverage() {
+            panic!(
+                "LPM_TEST_REQUIRE_APPCONTAINER=1 is set, but {msg}. \
+                 The CI runner asked to gate AppContainer coverage but its environment \
+                 doesn't satisfy the preconditions.",
+            );
+        }
+        eprintln!("skipping: {msg}");
+        return;
+    }
+    if !node_appcontainer_accessible() {
+        let msg = "node.exe is under `C:\\Program Files\\…` and not granted \
+             `ALL_APPLICATION_PACKAGES`. The AppContainer can't launch it, so this test's \
+             lifecycle script can't even attempt the connect we're checking denial of. \
+             Install node via `nvm` (or in any user-owned directory) to run this gate locally.";
+        if require_appcontainer_coverage() {
+            panic!("LPM_TEST_REQUIRE_APPCONTAINER=1 is set, but {msg}",);
+        }
+        eprintln!("skipping: {msg}");
+        return;
+    }
+
+    let mock = MockRegistry::start().await;
+    let tarball = build_net_denial_tarball(PRIMARY_DEP_NAME);
+    mount_net_denial_dep(&mock, PRIMARY_DEP_NAME, &tarball).await;
+
+    let project = TempProject::empty(&project_manifest(PRIMARY_DEP_NAME));
+    let target_url = mock.url();
+    assert_network_denied(
+        &mock,
+        &project,
+        PRIMARY_DEP_NAME,
+        &target_url,
+        "windows-appcontainer-primary",
+    )
+    .await;
+}
+
+#[cfg(target_os = "windows")]
+#[tokio::test]
+async fn windows_postinstall_loopback_connect_is_denied_under_appcontainer_strict() {
+    if !node_available() {
+        let msg = "node not on PATH";
+        if require_appcontainer_coverage() {
+            panic!("LPM_TEST_REQUIRE_APPCONTAINER=1 is set, but {msg}");
+        }
+        eprintln!("skipping: {msg}");
+        return;
+    }
+    if !helper_available() {
+        let msg = "lpm-sandbox-helper.exe not built";
+        if require_appcontainer_coverage() {
+            panic!("LPM_TEST_REQUIRE_APPCONTAINER=1 is set, but {msg}");
+        }
+        eprintln!("skipping: {msg}");
+        return;
+    }
+    if !node_appcontainer_accessible() {
+        let msg = "node.exe under `C:\\Program Files\\…` is not AppContainer-accessible";
+        if require_appcontainer_coverage() {
+            panic!("LPM_TEST_REQUIRE_APPCONTAINER=1 is set, but {msg}");
+        }
+        eprintln!("skipping: {msg}");
+        return;
+    }
+
+    // Same loopback-explicit shape as the Unix case. AppContainer
+    // denies loopback even with the LAN cap; under Strict (no
+    // capabilities) every connect family is denied.
+    let listener = std::net::TcpListener::bind("127.0.0.1:0")
+        .expect("bind explicit loopback for the windows arm");
+    let listener_addr = listener.local_addr().expect("local_addr");
+    assert!(
+        listener_addr.ip().is_loopback(),
+        "test invariant: listener must be on loopback, got {listener_addr}",
+    );
+
+    let server = wiremock::MockServer::builder()
+        .listener(listener)
+        .start()
+        .await;
+    let mock = MockRegistry::from_server(server);
+    let tarball = build_net_denial_tarball(LOOPBACK_DEP_NAME);
+    mount_net_denial_dep(&mock, LOOPBACK_DEP_NAME, &tarball).await;
+
+    let project = TempProject::empty(&project_manifest(LOOPBACK_DEP_NAME));
+    let target_url = format!("http://127.0.0.1:{}", listener_addr.port());
+    assert_network_denied(
+        &mock,
+        &project,
+        LOOPBACK_DEP_NAME,
+        &target_url,
+        "windows-appcontainer-loopback",
+    )
+    .await;
 }

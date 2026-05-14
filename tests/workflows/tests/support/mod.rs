@@ -239,7 +239,40 @@ pub fn lpm(project: &TempProject) -> assert_cmd::Command {
     // override this env.
     cmd.env("LPM_NPM_ROUTE", "proxy");
 
+    // Phase 46.3 PR-2: on Windows, the install pipeline's sandbox
+    // factory probes `current_exe().parent()` for
+    // `lpm-sandbox-helper.exe`. `assert_cmd::cargo_bin("lpm-rs")`
+    // returns the binary from `target/<profile>/`, where cargo also
+    // places the helper bin — so the sibling probe would succeed on
+    // production-shaped distributions. On test runners the helper
+    // build may or may not have happened (e.g.
+    // `cargo test -p lpm-workflows` without a prior workspace build).
+    // Set `LPM_SANDBOX_HELPER` explicitly when the helper exists so
+    // workflow tests exercise the AppContainer backend whenever the
+    // binary is actually built; tests that intentionally want the
+    // Low IL fallback can override or unset.
+    #[cfg(target_os = "windows")]
+    if let Some(helper) = locate_test_sandbox_helper() {
+        cmd.env("LPM_SANDBOX_HELPER", helper);
+    }
+
     cmd
+}
+
+/// Resolve the absolute path of `lpm-sandbox-helper.exe` if cargo
+/// has placed it next to the workspace's other release/debug bins.
+/// `cargo_bin`'s discovery for non-owning crates falls back to
+/// `target/<profile>/<name>` derived from `current_exe()`'s
+/// grandparent — we use the same shape here.
+#[cfg(target_os = "windows")]
+fn locate_test_sandbox_helper() -> Option<PathBuf> {
+    let exe = std::env::current_exe().ok()?;
+    // current_exe = target/<profile>/deps/<test-binary>.exe
+    // parent      = target/<profile>/deps/
+    // grandparent = target/<profile>/
+    let target_profile = exe.parent()?.parent()?;
+    let candidate = target_profile.join("lpm-sandbox-helper.exe");
+    candidate.exists().then_some(candidate)
 }
 
 /// Build an `lpm` command pre-configured to use a mock registry.
