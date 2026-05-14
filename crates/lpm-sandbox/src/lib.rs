@@ -884,9 +884,27 @@ fn validate_spec(spec: &SandboxSpec) -> Result<(), SandboxError> {
         ("tmpdir", &spec.tmpdir),
     ] {
         if !path.is_absolute() {
-            return Err(SandboxError::InvalidSpec {
-                reason: format!("{field} must be absolute, got {}", path.display()),
-            });
+            // `tmpdir` is the one field that's commonly sourced from
+            // a user-controlled env var (`TMPDIR` on Unix, `TMP`/
+            // `TEMP` on Windows) rather than a path we constructed
+            // internally. A relative value usually means the env var
+            // itself is misconfigured — surface that hint in the
+            // error so the user can fix the root cause rather than
+            // chasing the call site. See `private/46.3.md` §4.3 for
+            // the rationale on rejecting (vs silently canonicalizing)
+            // a relative tmpdir.
+            let reason = if field == "tmpdir" {
+                format!(
+                    "tmpdir must be absolute, got {}. Common cause: \
+                     the TMPDIR (Unix) or TMP / TEMP (Windows) env var \
+                     is set to a relative path. Unset it, or set it to \
+                     an absolute path, before invoking lpm.",
+                    path.display()
+                )
+            } else {
+                format!("{field} must be absolute, got {}", path.display())
+            };
+            return Err(SandboxError::InvalidSpec { reason });
         }
     }
     for (i, p) in spec.extra_write_dirs.iter().enumerate() {
@@ -1263,6 +1281,39 @@ mod tests {
             validate_spec(&s),
             Err(SandboxError::InvalidSpec { reason }) if reason.contains("extra_write_dirs[0]")
         ));
+    }
+
+    #[test]
+    fn validate_spec_rejects_relative_tmpdir_with_env_var_hint() {
+        // Relative `tmpdir` almost always means the user's TMPDIR /
+        // TMP / TEMP env var is misconfigured. Pin both the
+        // rejection AND the env-var hint, so the actionable
+        // remediation text doesn't get lost in a future refactor.
+        // Phase 46.3 §4.3 rationale: we deliberately fail loud
+        // rather than silently canonicalizing a relative tmpdir,
+        // because silent canonicalization would paper over the
+        // upstream env-var bug.
+        let mut s = sample_spec();
+        s.tmpdir = PathBuf::from("relative/tmp");
+        let err = validate_spec(&s).expect_err("relative tmpdir must be rejected");
+        let SandboxError::InvalidSpec { reason } = err else {
+            panic!("expected InvalidSpec, got {err:?}");
+        };
+        assert!(
+            reason.contains("tmpdir"),
+            "reason must name the offending field: {reason}"
+        );
+        assert!(
+            reason.contains("absolute"),
+            "reason must say the path was non-absolute: {reason}"
+        );
+        // The actionable hint is the whole point of this variant:
+        // without it the user sees "tmpdir must be absolute" and
+        // doesn't know to look at their env vars.
+        assert!(
+            reason.contains("TMPDIR") || reason.contains("TMP") || reason.contains("TEMP"),
+            "reason must hint at the TMPDIR / TMP / TEMP env var: {reason}"
+        );
     }
 
     #[test]
