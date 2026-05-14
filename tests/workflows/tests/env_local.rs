@@ -232,6 +232,59 @@ fn env_init_under_json_emits_envelope_with_environments_and_results_arrays() {
     );
 }
 
+// ─── pair / unpair (auth-error envelope path only) ─────────────────────
+
+/// `lpm env pair` requires a session-backed login. On an isolated HOME
+/// with no credentials, the command fails before reaching the registry —
+/// under `--json` that failure must emit a parseable error envelope on
+/// stdout, not a free-form stderr message. Happy-path pairing requires
+/// a vault server mock (see `env_vault.rs`); this test pins only the
+/// auth-required error envelope shape, the cheapest contract that proves
+/// `lpm --json env pair` is machine-readable.
+#[test]
+fn env_pair_without_auth_under_json_emits_error_envelope_on_stdout() {
+    let project = TempProject::empty(r#"{"name":"env-pair-auth","version":"1.0.0"}"#);
+
+    let output = lpm(&project)
+        .args(["--json", "env", "pair", "ABC123"])
+        .output()
+        .expect("failed to run lpm --json env pair");
+
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    let envelope: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap_or_else(|e| {
+        panic!("--json env pair error path must emit JSON: {e}\n---\n{stdout}")
+    });
+    assert_eq!(envelope["success"], serde_json::json!(false));
+    let err = envelope["error"].as_str().unwrap_or_default();
+    assert!(
+        err.contains("login") || err.contains("session"),
+        "error must reference auth/login state, got: {err}"
+    );
+}
+
+/// `lpm env unpair` shares the auth-required contract with `pair`. Same
+/// envelope shape expected on the unauthenticated error path.
+#[test]
+fn env_unpair_without_auth_under_json_emits_error_envelope_on_stdout() {
+    let project = TempProject::empty(r#"{"name":"env-unpair-auth","version":"1.0.0"}"#);
+
+    let output = lpm(&project)
+        .args(["--json", "env", "unpair"])
+        .output()
+        .expect("failed to run lpm --json env unpair");
+
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    let envelope: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap_or_else(|e| {
+        panic!("--json env unpair error path must emit JSON: {e}\n---\n{stdout}")
+    });
+    assert_eq!(envelope["success"], serde_json::json!(false));
+    let err = envelope["error"].as_str().unwrap_or_default();
+    assert!(
+        err.contains("login") || err.contains("session"),
+        "error must reference auth/login state, got: {err}"
+    );
+}
+
 // ─── import / export ──────────────────────────────────────────────────
 
 #[test]

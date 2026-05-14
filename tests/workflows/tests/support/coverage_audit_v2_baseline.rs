@@ -2145,7 +2145,7 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
     // ── id 103: lpm env pair ──
     SurfaceV2 {
         id: 103,
-        scenarios: 6,
+        scenarios: 7,
         failure_modes_tested: &[
             "uppercases code + approves browser pairing",
             "refresh-only session pair then unpair reuses normalized session",
@@ -2153,6 +2153,7 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
             "surfaces expired-code error",
             "rejects non-pending session status",
             "rejects malformed browser key",
+            "pair without auth under --json emits error envelope on stdout",
         ],
         failure_modes_known: &[
             "pairing token expiry mid-flow",
@@ -2160,26 +2161,27 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
             "concurrent pair from two devices using same code",
             "pair after a logout-all on a refresh-backed session",
         ],
-        json_contract_depth: JsonContractDepth::None,
+        json_contract_depth: JsonContractDepth::SemanticAsserts,
         scenarios_by_file: &[],
         last_audited_at: "2026-05-14",
     },
     // ── id 104: lpm env unpair ──
     SurfaceV2 {
         id: 104,
-        scenarios: 4,
+        scenarios: 5,
         failure_modes_tested: &[
             "requires session-based login",
             "pair → unpair → logout on refresh-backed session keeps normalized state",
             "pair → unpair → logout-all on refresh-backed session clears auth state",
             "unpair blocks future vault commands",
+            "unpair without auth under --json emits error envelope on stdout",
         ],
         failure_modes_known: &[
             "concurrent unpair operations",
             "orphaned local state cleanup after unpair",
             "unpair while a push/pull is mid-flight",
         ],
-        json_contract_depth: JsonContractDepth::None,
+        json_contract_depth: JsonContractDepth::SemanticAsserts,
         scenarios_by_file: &[],
         last_audited_at: "2026-05-14",
     },
@@ -2399,45 +2401,55 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
     // ── id 118: lpm tunnel <port> (start) ──
     SurfaceV2 {
         id: 118,
-        scenarios: 1,
-        failure_modes_tested: &["tunnel help emits action summary"],
+        scenarios: 2,
+        failure_modes_tested: &[
+            "tunnel help emits action summary",
+            "tunnel <port> without auth under --json emits error envelope on stdout",
+        ],
         failure_modes_known: &[
             "tunnel service connection failure",
             "port already in use",
             "tunnel session expiry mid-stream",
             "tunnel under a HOME that has never been paired",
         ],
-        json_contract_depth: JsonContractDepth::None,
+        json_contract_depth: JsonContractDepth::SemanticAsserts,
         scenarios_by_file: &[],
         last_audited_at: "2026-05-14",
     },
     // ── id 119: lpm tunnel claim / unclaim / list / domains ──
     SurfaceV2 {
         id: 119,
-        scenarios: 1,
-        failure_modes_tested: &["claim without auth fails with clear message"],
+        scenarios: 3,
+        failure_modes_tested: &[
+            "claim without auth fails with clear message",
+            "claim without auth under --json emits error envelope on stdout",
+            "list without auth under --json emits error envelope on stdout",
+        ],
         failure_modes_known: &[
             "domain already claimed",
             "concurrent claim operations",
             "domain DNS propagation timing",
             "unclaim of a domain that was force-released server-side",
         ],
-        json_contract_depth: JsonContractDepth::None,
+        json_contract_depth: JsonContractDepth::SemanticAsserts,
         scenarios_by_file: &[],
         last_audited_at: "2026-05-14",
     },
     // ── id 120: lpm tunnel inspect / replay / log ──
     SurfaceV2 {
         id: 120,
-        scenarios: 1,
-        failure_modes_tested: &["action enumeration is reachable via tunnel help"],
+        scenarios: 2,
+        failure_modes_tested: &[
+            "action enumeration is reachable via tunnel help",
+            "inspect without auth under --json emits error envelope on stdout",
+        ],
         failure_modes_known: &[
             "tunnel session expired (inspect/replay error path)",
             "concurrent inspection access on same session",
             "log rotation behavior under long sessions",
             "replay against a request whose body bytes have been GC'd server-side",
         ],
-        json_contract_depth: JsonContractDepth::None,
+        json_contract_depth: JsonContractDepth::SemanticAsserts,
         scenarios_by_file: &[],
         last_audited_at: "2026-05-14",
     },

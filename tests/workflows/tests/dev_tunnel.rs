@@ -66,6 +66,106 @@ fn tunnel_help_emits_action_summary() {
 // ─── tunnel claim: requires auth ──────────────────────────────────────
 
 #[test]
+fn tunnel_start_without_auth_under_json_emits_error_envelope_on_stdout() {
+    let project = TempProject::empty(r#"{"name":"tunnel","version":"1.0.0"}"#);
+
+    // A numeric first arg routes to "start <port>" in the tunnel
+    // dispatcher. Like every other tunnel action it requires a
+    // session-backed bearer — fails before opening any socket.
+    let output = lpm(&project)
+        .args([
+            "--registry",
+            "http://127.0.0.1:1",
+            "--insecure",
+            "--json",
+            "tunnel",
+            "4567",
+        ])
+        .output()
+        .expect("failed to run lpm --json tunnel 4567");
+
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    let envelope: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap_or_else(|e| {
+        panic!("--json tunnel <port> error path must emit JSON: {e}\n---\n{stdout}")
+    });
+    assert_eq!(envelope["success"], serde_json::json!(false));
+    assert_eq!(envelope["error_code"], serde_json::json!("tunnel"));
+}
+
+#[test]
+fn tunnel_claim_without_auth_under_json_emits_error_envelope_on_stdout() {
+    let project = TempProject::empty(r#"{"name":"tunnel","version":"1.0.0"}"#);
+
+    let output = lpm(&project)
+        .args([
+            "--registry",
+            "http://127.0.0.1:1",
+            "--insecure",
+            "--json",
+            "tunnel",
+            "claim",
+            "test-tunnel.example.test",
+        ])
+        .output()
+        .expect("failed to run lpm --json tunnel claim");
+
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    let envelope: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap_or_else(|e| {
+        panic!("--json tunnel claim error path must emit JSON: {e}\n---\n{stdout}")
+    });
+    assert_eq!(envelope["success"], serde_json::json!(false));
+    assert_eq!(envelope["error_code"], serde_json::json!("tunnel"));
+}
+
+#[test]
+fn tunnel_list_without_auth_under_json_emits_error_envelope_on_stdout() {
+    let project = TempProject::empty(r#"{"name":"tunnel","version":"1.0.0"}"#);
+
+    let output = lpm(&project)
+        .args([
+            "--registry",
+            "http://127.0.0.1:1",
+            "--insecure",
+            "--json",
+            "tunnel",
+            "list",
+        ])
+        .output()
+        .expect("failed to run lpm --json tunnel list");
+
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    let envelope: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap_or_else(|e| {
+        panic!("--json tunnel list error path must emit JSON: {e}\n---\n{stdout}")
+    });
+    assert_eq!(envelope["success"], serde_json::json!(false));
+    assert_eq!(envelope["error_code"], serde_json::json!("tunnel"));
+}
+
+#[test]
+fn tunnel_inspect_without_auth_under_json_emits_error_envelope_on_stdout() {
+    let project = TempProject::empty(r#"{"name":"tunnel","version":"1.0.0"}"#);
+
+    let output = lpm(&project)
+        .args([
+            "--registry",
+            "http://127.0.0.1:1",
+            "--insecure",
+            "--json",
+            "tunnel",
+            "inspect",
+        ])
+        .output()
+        .expect("failed to run lpm --json tunnel inspect");
+
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    let envelope: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap_or_else(|e| {
+        panic!("--json tunnel inspect error path must emit JSON: {e}\n---\n{stdout}")
+    });
+    assert_eq!(envelope["success"], serde_json::json!(false));
+    assert_eq!(envelope["error_code"], serde_json::json!("tunnel"));
+}
+
+#[test]
 fn tunnel_claim_without_auth_fails_with_clear_message() {
     // `lpm tunnel claim <domain>` calls the registry to claim the
     // domain. On an isolated HOME (no token) the call must fail with
