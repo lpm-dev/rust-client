@@ -147,6 +147,40 @@ async fn install_policy_with_invalid_value_is_rejected() {
     );
 }
 
+/// `lpm --json install --policy=<invalid>` surfaces the same rejection
+/// as a JSON envelope on stdout. The invalid-value error is raised by
+/// `script_policy_config::collapse_policy_flags` inside the install
+/// arm — prior to the per-arm async wrap it short-circuited past the
+/// `--json` envelope handler (finding #76 in private/findings.md).
+/// This test pins that the wrap restored the contract.
+#[tokio::test]
+async fn install_policy_with_invalid_value_under_json_emits_error_envelope_on_stdout() {
+    let project = empty_project_with_dep("scripted-pkg");
+    let mock = MockRegistry::start().await;
+    mount_scripted_pkg(&mock, "scripted-pkg").await;
+
+    let output = lpm_with_registry(&project, &mock.url())
+        .args(["--json", "install", "--policy=nonsense-value"])
+        .output()
+        .expect("failed to run lpm --json install --policy=nonsense-value");
+
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    let envelope: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap_or_else(|e| {
+        panic!("--json install --policy=nonsense must emit JSON: {e}\n---\n{stdout}")
+    });
+    assert_eq!(envelope["success"], serde_json::json!(false));
+    let err = envelope["error"].as_str().unwrap_or_default();
+    assert!(
+        err.contains("policy") || err.contains("nonsense") || err.contains("invalid"),
+        "error must reference the invalid policy value, got: {err}",
+    );
+    // The error message lists the allowed values so users can self-correct.
+    assert!(
+        err.contains("deny") && err.contains("allow") && err.contains("triage"),
+        "error must enumerate valid policies, got: {err}",
+    );
+}
+
 // ─── default policy: deny is in effect ───────────────────────────────
 
 #[tokio::test]

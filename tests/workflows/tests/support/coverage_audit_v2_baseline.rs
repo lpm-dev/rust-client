@@ -493,12 +493,13 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
     // ── id 17: lpm install --policy / --yolo ──
     SurfaceV2 {
         id: 17,
-        scenarios: 7,
+        scenarios: 8,
         failure_modes_tested: &[
             "--policy + --yolo mutual exclusion at parse time",
             "--policy + --triage mutual exclusion at parse time",
             "--yolo + --triage mutual exclusion at parse time",
             "invalid --policy value rejected",
+            "invalid --policy value under --json emits error envelope on stdout",
             "default policy blocks postinstall scripts",
             "--policy=allow accepted at parse time",
             "--yolo accepted at parse time",
@@ -509,7 +510,7 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
             "--yolo + sandbox actually disables sandbox enforcement",
             "policy override via package.json > lpm > scriptPolicy",
         ],
-        json_contract_depth: JsonContractDepth::None,
+        json_contract_depth: JsonContractDepth::SemanticAsserts,
         scenarios_by_file: &[],
         last_audited_at: "2026-05-14",
     },
@@ -844,53 +845,57 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
     // ── id 35: lpm login --npm ──
     SurfaceV2 {
         id: 35,
-        scenarios: 2,
+        scenarios: 3,
         failure_modes_tested: &[
             "env token precedence over stored custom registry token",
             "authenticated install attaches bearer on every registry request",
+            "--json without --token emits error envelope (directs user to npmjs.com tokens)",
         ],
         failure_modes_known: &[
             "NPM 401 invalid credentials",
             ".npmrc merge strategy with existing entries",
             "npm OTP prompt under non-TTY",
         ],
-        json_contract_depth: JsonContractDepth::None,
+        json_contract_depth: JsonContractDepth::SemanticAsserts,
         scenarios_by_file: &[],
         last_audited_at: "2026-05-14",
     },
     // ── id 36: lpm login --github / --gitlab ──
     SurfaceV2 {
         id: 36,
-        scenarios: 4,
+        scenarios: 6,
         failure_modes_tested: &[
             "logout-github clears only github state",
             "logout-gitlab clears only gitlab state",
             "logout-npm-and-github clear both and preserve gitlab",
             "OIDC setup snippet contract (cli-binary)",
+            "login --github --json without --token emits error envelope (directs to github.com tokens)",
+            "login --gitlab --json without --token emits error envelope (directs to gitlab.com tokens)",
         ],
         failure_modes_known: &[
             "github device-flow timeout awaiting user approval",
             "gitlab PAT expiry warning",
             "OIDC issuer DNS failure mid-flow",
         ],
-        json_contract_depth: JsonContractDepth::None,
+        json_contract_depth: JsonContractDepth::SemanticAsserts,
         scenarios_by_file: &[],
         last_audited_at: "2026-05-14",
     },
     // ── id 37: lpm login --login-registry <URL> ──
     SurfaceV2 {
         id: 37,
-        scenarios: 2,
+        scenarios: 3,
         failure_modes_tested: &[
             "env token precedence over stored custom registry token (no tracking mutation)",
             "malformed custom registry entry does not break primary session",
+            "login --login-registry --json without --token emits error envelope",
         ],
         failure_modes_known: &[
             "custom registry challenges unsupported auth scheme",
             "token scope mismatch on custom registry",
             "multi-registry token storage cross-talk",
         ],
-        json_contract_depth: JsonContractDepth::None,
+        json_contract_depth: JsonContractDepth::SemanticAsserts,
         scenarios_by_file: &[],
         last_audited_at: "2026-05-14",
     },
@@ -1832,15 +1837,18 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
     // ── id 86: lpm dlx <pkg> ──
     SurfaceV2 {
         id: 86,
-        scenarios: 1,
-        failure_modes_tested: &["cache hit executes cached binary + refreshes TTL"],
+        scenarios: 2,
+        failure_modes_tested: &[
+            "cache hit executes cached binary + refreshes TTL",
+            "malformed spec under --json emits error envelope (resolver range parse error)",
+        ],
         failure_modes_known: &[
             "cache corruption recovery",
             "race condition cache evict mid-exec",
             "missing package in cache (cold path)",
             "dlx of a package whose entrypoint shells out",
         ],
-        json_contract_depth: JsonContractDepth::None,
+        json_contract_depth: JsonContractDepth::SemanticAsserts,
         scenarios_by_file: &[],
         last_audited_at: "2026-05-14",
     },
@@ -1969,6 +1977,18 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
         last_audited_at: "2026-05-14",
     },
     // ── id 93: lpm ci env ──
+    //
+    // KEEP_NONE rationale: `lpm ci env` is a shell-format surface by
+    // design. The happy path emits `export FOO=bar` (or
+    // `::add-mask::secret\necho 'FOO=bar' >> "$GITHUB_ENV"`) on stdout
+    // so the CI runner can `eval` or pipe it into the env file. A JSON
+    // envelope on the same surface would defeat the contract — there's
+    // no shell shape for `{"success": true, "vars": {...}}` that lets
+    // the runner pick up the values. Error paths upstream (unknown ci
+    // sub-action) DO route through the LpmError → envelope handler
+    // (see `lpm --json ci nonsense` and the ci-setup unknown-platform
+    // test under id 94/95), but the `ci env` surface itself stays
+    // shell-format-only. Not a gap.
     SurfaceV2 {
         id: 93,
         scenarios: 2,
@@ -2242,6 +2262,15 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
         last_audited_at: "2026-05-14",
     },
     // ── id 109: lpm dev ──
+    //
+    // KEEP_NONE rationale: `lpm dev` boots a long-running orchestrator
+    // (HTTPS server, tunnel, dashboard) and streams progress / logs to
+    // stdout for the developer. A single JSON envelope on the same
+    // surface would either be emitted at startup (before useful info
+    // exists) or held until shutdown (defeating the long-running
+    // contract). Parse-time errors (clap-level help) go through the
+    // human formatter intentionally — `lpm dev --help` is for humans
+    // reading at a terminal, not for machine consumers. Not a gap.
     SurfaceV2 {
         id: 109,
         scenarios: 1,
@@ -2257,6 +2286,13 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
         last_audited_at: "2026-05-14",
     },
     // ── id 110: lpm dev --tunnel / --https / --network ──
+    //
+    // KEEP_NONE rationale: same surface shape as id 109 — long-running
+    // orchestrator with streaming stdout, no envelope contract. The
+    // tunnel / https / network flags layer additional services into
+    // the same `lpm dev` process; their failure modes (tunnel session
+    // expiry, TLS cert generation failure, port-in-use) surface
+    // mid-stream and don't fit the single-envelope shape. Not a gap.
     SurfaceV2 {
         id: 110,
         scenarios: 1,
@@ -2590,6 +2626,15 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
         last_audited_at: "2026-05-14",
     },
     // ── id 127: lpm internal-update-check (hidden) ──
+    //
+    // KEEP_NONE rationale: this is a hidden, fire-and-forget background
+    // updater spawned by the parent `lpm` process. Its only side effect
+    // is refreshing `<HOME>/.lpm/.update-cache.json`; it is INTENTIONALLY
+    // silent on stdout/stderr so the parent's user-facing output isn't
+    // polluted by a background subprocess's chatter. Adding an envelope
+    // would either leak into the parent's piped output or require the
+    // parent to filter it out — both defeat the "silent background
+    // worker" contract. Not a gap.
     SurfaceV2 {
         id: 127,
         scenarios: 2,
@@ -2648,10 +2693,11 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
     // ── id 130: lpm use node@<v> ──
     SurfaceV2 {
         id: 130,
-        scenarios: 2,
+        scenarios: 3,
         failure_modes_tested: &[
             "install unsupported runtime fails before network call",
             "install without runtime prefix fails with usage",
+            "use --pin without spec under --json emits error envelope on stdout",
         ],
         failure_modes_known: &[
             "node download network failure",
@@ -2659,7 +2705,7 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
             "checksum mismatch on downloaded runtime",
             "use of a runtime version no longer hosted upstream",
         ],
-        json_contract_depth: JsonContractDepth::None,
+        json_contract_depth: JsonContractDepth::SemanticAsserts,
         scenarios_by_file: &[],
         last_audited_at: "2026-05-14",
     },
@@ -2683,6 +2729,17 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
         last_audited_at: "2026-05-14",
     },
     // ── id 132: lpm completions <shell> ──
+    //
+    // KEEP_NONE rationale: this surface emits a shell completion
+    // script (bash function, zsh _lpm definition, fish/PowerShell
+    // equivalents) on stdout, intended to be `eval`d or written to a
+    // completion-load path. A JSON envelope would defeat the contract
+    // — the user can't pipe `{"success": true, "script": "_lpm() {..."}`
+    // into `~/.zshrc`. Error paths (invalid shell value) are clap-level
+    // and rejected before main() runs; clap's `value_enum` rejection
+    // can't be intercepted by the LpmError → envelope handler without
+    // a much larger refactor. Not a gap. See finding #76 for the broader
+    // clap-vs-envelope routing story.
     SurfaceV2 {
         id: 132,
         scenarios: 3,

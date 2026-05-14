@@ -129,6 +129,32 @@ fn use_install_without_runtime_prefix_fails_with_usage() {
     }
 }
 
+/// `lpm --json use --pin` without a spec must surface the missing-spec
+/// error as a parseable JSON envelope on stdout. The bare `lpm use
+/// node@<v>` install path is out of scope for the workflow tier (real
+/// nodejs.org download), but the validation error path is the cheapest
+/// contract that proves the surface is machine-readable under --json.
+#[test]
+fn use_pin_without_spec_under_json_emits_error_envelope_on_stdout() {
+    let project = TempProject::empty(r#"{"name":"use-pin-no-spec","version":"1.0.0"}"#);
+
+    let output = lpm(&project)
+        .args(["--json", "use", "--pin"])
+        .output()
+        .expect("failed to run lpm --json use --pin");
+
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    let envelope: serde_json::Value = serde_json::from_str(stdout.trim())
+        .unwrap_or_else(|e| panic!("--json use --pin must emit JSON: {e}\n---\n{stdout}"));
+    assert_eq!(envelope["success"], serde_json::json!(false));
+    assert!(
+        envelope["error"]
+            .as_str()
+            .is_some_and(|s| s.contains("missing version") || s.contains("Usage")),
+        "error must reference the missing-version condition, got: {envelope}",
+    );
+}
+
 #[test]
 fn use_list_with_unsupported_runtime_filter_fails_cleanly() {
     let project = TempProject::empty(r#"{"name":"use-list","version":"1.0.0"}"#);
