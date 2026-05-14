@@ -1571,10 +1571,7 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
             "approve-scripts on a project where the lockfile differs from the build-state.json",
         ],
         json_contract_depth: JsonContractDepth::SemanticAsserts,
-        scenarios_by_file: &[(
-            "crates/lpm-cli/tests/approve_scripts_interactive_tty.rs",
-            2,
-        )],
+        scenarios_by_file: &[("crates/lpm-cli/tests/approve_scripts_interactive_tty.rs", 2)],
         last_audited_at: "2026-05-14",
     },
     // ── id 72: lpm approve-scripts --list ──

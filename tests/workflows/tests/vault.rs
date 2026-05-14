@@ -52,11 +52,7 @@ mod non_macos {
             panic!("vault --json error path must emit JSON: {e}\n---\n{stdout}")
         });
         assert_eq!(envelope["success"], serde_json::json!(false));
-        let combined = format!(
-            "{}{}",
-            envelope.to_string(),
-            String::from_utf8_lossy(&out.stderr),
-        );
+        let combined = format!("{}{}", envelope, String::from_utf8_lossy(&out.stderr));
         assert!(
             combined.contains("macOS only") || combined.contains("not yet supported"),
             "envelope or stderr must explain the macOS-only restriction, got:\n{combined}",
