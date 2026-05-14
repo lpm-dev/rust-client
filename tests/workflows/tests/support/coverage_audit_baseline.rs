@@ -21,7 +21,7 @@ impl SurfaceBaseline {
     }
 }
 
-pub const EXPECTED_SURFACE_COUNT: usize = 135;
+pub const EXPECTED_SURFACE_COUNT: usize = 137;
 
 pub const EXPECTED_COMMAND_VARIANTS: &[&str] = &[
     "Info",
@@ -1592,6 +1592,36 @@ pub const SURFACES: &[SurfaceBaseline] = &[
     SurfaceBaseline {
         id: 135,
         name: "`lpm strict-ssl warning` (cross-cmd installer warning)",
+        unit: false,
+        integration: false,
+        workflow: true,
+        cli_binary: false,
+        json_contract: true,
+        references: &["tests/workflows/tests/install.rs"],
+    },
+    // ── Phase-65 v2-taxonomy refinement: split install.rs orphan tests ──
+    //
+    // These two surfaces were carved out of `lpm install`'s catch-all
+    // umbrella during the 2026-05-14 v2 partition pass when install.rs
+    // had 27 unclaimed tests with no v2 surface home. They cover
+    // install-pipeline behavior that's orthogonal to lockfile fast-path
+    // (id 12), add-and-install (id 13), --offline (id 14), workspace
+    // (id 15), policy (id 17), strict-integrity (id 18), or strict-ssl
+    // (id 135), so a generic id-12 fold would have made id 12's
+    // failure_modes_tested list useless as a guide.
+    SurfaceBaseline {
+        id: 136,
+        name: "`lpm install` pnpm migration warnings (cross-cmd)",
+        unit: false,
+        integration: false,
+        workflow: true,
+        cli_binary: false,
+        json_contract: true,
+        references: &["tests/workflows/tests/install.rs"],
+    },
+    SurfaceBaseline {
+        id: 137,
+        name: "`lpm install` linker validation (LPM_LINKER env + CLI flag)",
         unit: false,
         integration: false,
         workflow: true,

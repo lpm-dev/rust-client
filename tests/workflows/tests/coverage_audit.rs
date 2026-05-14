@@ -1,7 +1,7 @@
 //! Coverage audit guard for the Phase 65 command-surface matrix.
 //!
 //! This is the lightweight 65.1 enforcement pass:
-//! - the corrected 136-row surface inventory is checked into the repo
+//! - the corrected 137-row surface inventory is checked into the repo
 //! - every top-level `Commands` variant is pinned against `main.rs`
 //! - every surface marked as covered must still point at live evidence files
 //!
@@ -49,8 +49,8 @@ fn coverage_audit_baseline_shape_matches_phase65_matrix() {
         .filter(|surface| !surface.has_any_coverage())
         .count();
     assert_eq!(
-        covered, 135,
-        "all command surfaces now have at least one tier of coverage (vault was the last uncovered row before the env+vault tranche)"
+        covered, 137,
+        "all command surfaces now have at least one tier of coverage (vault was the last uncovered row before the env+vault tranche; ids 136/137 carved out of install.rs orphan tests on 2026-05-14)"
     );
     assert_eq!(
         uncovered, 0,
