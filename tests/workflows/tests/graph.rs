@@ -50,6 +50,69 @@ fn graph_bare_under_json_without_lockfile_emits_error_envelope_on_stdout() {
     );
 }
 
+/// `lpm --json graph --format html --no-open` on a project without
+/// `lpm.lock` surfaces the missing-lockfile error as a JSON envelope.
+/// Pins the contract that `--format html`'s failure mode is
+/// machine-readable; the happy path (file emission) is covered by
+/// `graph_html_writes_*` below and is intentionally non-JSON (it
+/// writes an HTML file, not an envelope).
+#[test]
+fn graph_format_html_under_json_without_lockfile_emits_error_envelope_on_stdout() {
+    let project = TempProject::empty(r#"{"name":"graph-html","version":"1.0.0"}"#);
+
+    let output = lpm(&project)
+        .args(["--json", "graph", "--format", "html", "--no-open"])
+        .output()
+        .expect("failed to run lpm --json graph --format html");
+
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    let envelope: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap_or_else(|e| {
+        panic!("--json graph --format html must emit JSON on error: {e}\n---\n{stdout}")
+    });
+    assert_eq!(envelope["success"], serde_json::json!(false));
+    assert!(
+        envelope["error"]
+            .as_str()
+            .is_some_and(|s| s.contains("lpm.lock") || s.contains("lockfile")),
+        "error must reference the missing lockfile, got: {envelope}",
+    );
+}
+
+/// `--format dot`, `--format mermaid`, and `--format stats` share the
+/// same lockfile-read prelude as the rest of `lpm graph`. On a
+/// missing-lockfile project, all three surface the same error envelope
+/// on stdout under `--json`. One test covers the contract for the
+/// whole group — the per-format text rendering on the happy path is
+/// covered by the existing `graph_format_dot_emits_valid_dot_syntax_to_stdout`
+/// and friends below.
+#[test]
+fn graph_format_dot_mermaid_stats_under_json_without_lockfile_emit_error_envelope_on_stdout() {
+    let project = TempProject::empty(r#"{"name":"graph-fmt","version":"1.0.0"}"#);
+
+    for format in ["dot", "mermaid", "stats"] {
+        let output = lpm(&project)
+            .args(["--json", "graph", "--format", format])
+            .output()
+            .expect("failed to run lpm --json graph --format <fmt>");
+
+        let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+        let envelope: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap_or_else(|e| {
+            panic!("--json graph --format {format} must emit JSON: {e}\n---\n{stdout}")
+        });
+        assert_eq!(
+            envelope["success"],
+            serde_json::json!(false),
+            "graph --format {format} envelope must carry success: false"
+        );
+        assert!(
+            envelope["error"]
+                .as_str()
+                .is_some_and(|s| s.contains("lpm.lock") || s.contains("lockfile")),
+            "graph --format {format} error must reference the missing lockfile, got: {envelope}",
+        );
+    }
+}
+
 // ─── --format html writes to .lpm/graph.html ────────────────────────
 
 #[test]

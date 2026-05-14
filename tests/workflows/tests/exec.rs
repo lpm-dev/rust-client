@@ -53,3 +53,27 @@ fn exec_missing_file_fails_before_runtime_execution() {
         "missing-file error must mention the path lookup failure, got:\n{stderr}"
     );
 }
+
+#[test]
+fn exec_missing_file_under_json_emits_error_envelope_on_stdout() {
+    let project = TempProject::empty(r#"{"name":"exec-test","version":"1.0.0"}"#);
+
+    let output = lpm(&project)
+        .args(["--json", "exec", "scripts/missing.js"])
+        .output()
+        .expect("failed to run lpm --json exec on a missing file");
+
+    // `support::assertions::parse_json_output` finds the first `{` in
+    // stdout — tolerant of the human "● exec ..." banner that the
+    // exec command emits before the envelope. The envelope itself
+    // must be valid JSON with `success: false` and the missing-file
+    // error_code.
+    let envelope = support::assertions::parse_json_output(&output.stdout);
+    assert_eq!(envelope["success"], serde_json::json!(false));
+    assert!(
+        envelope["error"]
+            .as_str()
+            .is_some_and(|s| s.contains("file not found") || s.contains("missing.js")),
+        "error must reference the missing file path, got: {envelope}",
+    );
+}

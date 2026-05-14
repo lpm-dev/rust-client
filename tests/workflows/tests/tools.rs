@@ -461,6 +461,34 @@ fn bench_multi_member_watch_is_rejected_with_count() {
     );
 }
 
+/// `lpm --json bench --watch` outside a workspace (so the dispatcher
+/// falls through to the single-package path) and without vitest /
+/// `scripts.bench` defined emits the "no benchmark runner found"
+/// error envelope on stdout. The load-bearing claim is the envelope
+/// shape — actual bench runner detection is covered by the existing
+/// detect_bench_runner tests in tools.rs.
+#[test]
+fn bench_no_runner_under_json_emits_error_envelope_on_stdout() {
+    let project = TempProject::empty(r#"{"name":"bench-noop","version":"1.0.0"}"#);
+
+    let output = lpm(&project)
+        .args(["--json", "bench", "--watch"])
+        .output()
+        .expect("failed to run lpm --json bench --watch");
+
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    let envelope: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap_or_else(|e| {
+        panic!("--json bench --watch error path must emit JSON: {e}\n---\n{stdout}")
+    });
+    assert_eq!(envelope["success"], serde_json::json!(false));
+    assert!(
+        envelope["error"]
+            .as_str()
+            .is_some_and(|s| s.contains("benchmark runner") || s.contains("bench")),
+        "error must reference the missing-runner condition, got: {envelope}",
+    );
+}
+
 // ─── one-member watch IS allowed (hands off to single-package) ──
 //
 // The reviewer caught that the previous blanket reject contradicted the

@@ -193,6 +193,34 @@ fn ci_setup_unknown_platform_fails_with_helpful_message() {
     );
 }
 
+/// `lpm --json ci setup <unknown-platform>` surfaces the same
+/// validation error as a structured envelope. Pins the JSON contract
+/// shared by `ci setup github-actions` and `ci setup gitlab` (the
+/// happy paths emit shell-format on stdout, not envelopes — see the
+/// existing tests above — but the dispatcher's unknown-platform
+/// rejection is the cheapest envelope contract for both surfaces).
+#[test]
+fn ci_setup_unknown_platform_under_json_emits_error_envelope_on_stdout() {
+    let project = TempProject::empty(r#"{"name":"ci","version":"1.0.0"}"#);
+
+    let output = lpm(&project)
+        .args(["--json", "ci", "setup", "bitbucket"])
+        .output()
+        .expect("failed to run lpm --json ci setup bitbucket");
+
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    let envelope: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap_or_else(|e| {
+        panic!("--json ci setup unknown error path must emit JSON: {e}\n---\n{stdout}")
+    });
+    assert_eq!(envelope["success"], serde_json::json!(false));
+    assert!(
+        envelope["error"]
+            .as_str()
+            .is_some_and(|s| s.contains("github-actions") && s.contains("gitlab")),
+        "error must list valid platforms, got: {envelope}",
+    );
+}
+
 #[test]
 fn ci_setup_without_platform_arg_fails_with_usage_message() {
     let project = TempProject::empty(r#"{"name":"ci","version":"1.0.0"}"#);
