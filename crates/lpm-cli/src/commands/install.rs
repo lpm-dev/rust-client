@@ -19,6 +19,59 @@ use std::time::Instant;
 use tokio::sync::Mutex as AsyncMutex;
 use tokio::sync::Semaphore;
 
+/// Test-only deterministic-panic injection hook.
+///
+/// Reads `LPM_TEST_PANIC_AT`. If the env value matches the `stage`
+/// argument AND the build is `cfg!(debug_assertions)` OR
+/// `LPM_TEST_MODE=1`, panics with a recognizable message that
+/// includes the stage name. Production builds without
+/// `LPM_TEST_MODE=1` silently treat this as a no-op — the env is
+/// read but never honored.
+///
+/// **Why a panic, not an error.** The hook exists to drive workflow
+/// tests that pin the [`crate::manifest_tx::ManifestTransaction`]
+/// Drop-based rollback. Drop fires on `?` early-return AND on panic
+/// AND during normal scope exit. A `?`-early-return path can already
+/// be tested by injecting a recoverable error (e.g., an invalid
+/// `--policy=` flag); the panic path needed a separate hook because
+/// no recoverable error reliably triggers Drop after EVERY stage
+/// in the install pipeline. SIGKILL bypasses Drop entirely.
+///
+/// **Stages currently wired in [`run_add_packages`]:**
+///
+/// - `"after-snapshot"` — right after
+///   `snapshot_install_state` succeeds; the manifest is unchanged.
+///   Drop should be a no-op (snapshot bytes == on-disk bytes).
+/// - `"after-stage"` — right after
+///   `stage_packages_to_manifest` writes the `*` placeholder into
+///   `package.json`. Drop must restore the pre-stage bytes — this
+///   is the load-bearing test for the rollback contract.
+/// - `"after-install"` — right after
+///   `run_with_options` returns Ok. The lockfile is now fresh; the
+///   manifest still has `*` placeholders. Drop must restore both.
+/// - `"after-finalize"` — right after
+///   `finalize_packages_in_manifest` resolves the `*` to concrete
+///   versions. Drop runs ONE step before commit; the test asserts
+///   the manifest snaps back to its pre-stage shape rather than
+///   landing in a half-committed state.
+///
+/// Used by [B.4](../../../tests/workflows/tests/install_concurrency.rs)
+/// (`install_panics_mid_pipeline_rollback_restores_manifest`).
+fn maybe_test_panic(stage: &str) {
+    let allowed = cfg!(debug_assertions)
+        || std::env::var("LPM_TEST_MODE")
+            .ok()
+            .as_deref()
+            .map(|v| v == "1")
+            .unwrap_or(false);
+    if !allowed {
+        return;
+    }
+    if std::env::var("LPM_TEST_PANIC_AT").as_deref() == Ok(stage) {
+        panic!("LPM_TEST_PANIC_AT={stage} (test-only panic injection)");
+    }
+}
+
 /// Phase 39 P2: per-(name, version) fetch serialization.
 ///
 /// Before Phase 39, the main task `drain`ed all speculative tarball
@@ -10865,6 +10918,7 @@ pub async fn run_add_packages(
             &[&lockfile_path, &lockfile_bin_path],
             &[&install_hash_path],
         )?;
+        maybe_test_panic("after-snapshot");
 
         // 2. Stage the new entries. Explicit specs land verbatim; bare/dist-tag
         //    entries get a `*` placeholder that finalize will replace using the
@@ -10881,6 +10935,7 @@ pub async fn run_add_packages(
             save_flags,
             json_output,
         )?;
+        maybe_test_panic("after-stage");
 
         // 3. Remove lockfile so the resolver re-runs against the staged manifest.
         //    The transaction snapshot above already captured the original bytes,
@@ -10917,10 +10972,12 @@ pub async fn run_add_packages(
             no_sandbox,
         )
         .await?;
+        maybe_test_panic("after-install");
 
         // 5. Finalize the manifest using the resolved direct-dep versions
         //    from the resolver. No-op if stage produced no placeholders.
         finalize_packages_in_manifest(&staged, &direct_versions, save_flags, save_config)?;
+        maybe_test_panic("after-finalize");
 
         // 6. All steps succeeded — commit the transaction so the manifest
         //    edits persist.

@@ -909,6 +909,202 @@ fn assert_lockfile_well_formed_or_absent(project_dir: &std::path::Path, context:
     });
 }
 
+/// **B.4 — install panics mid-pipeline → ManifestTransaction Drop restores manifest.**
+///
+/// SIGKILL bypasses Drop entirely (unkillable rollback); panic does
+/// NOT — Rust's default `panic = "unwind"` runs every Drop on the
+/// stack during the unwind. The
+/// [`ManifestTransaction`](../../../crates/lpm-cli/src/manifest_tx.rs)
+/// guard at [install.rs:10863](../../../crates/lpm-cli/src/commands/install.rs#L10863)
+/// snapshots `package.json` + `lpm.lock` + `lpm.lockb` at construction
+/// and restores them in its `Drop` impl unless `tx.commit()` ran. A
+/// panic between snapshot and commit MUST trigger that rollback.
+///
+/// **Pre-test hook (added 2026-05-14).** This test was deferred in
+/// the original Item 2 tranche because there was no deterministic
+/// way to trigger a panic inside the install pipeline from a workflow
+/// test — recoverable errors fire `?`-rollback (already covered by
+/// E.1/E.2/E.3) but the panic-rollback path was unprovable. The
+/// `maybe_test_panic(stage)` hook at [install.rs](../../../crates/lpm-cli/src/commands/install.rs)
+/// reads `LPM_TEST_PANIC_AT` and panics deterministically when the
+/// stage matches, gated to debug builds OR `LPM_TEST_MODE=1` so
+/// production is immune. Wired stages: `after-snapshot`, `after-stage`,
+/// `after-install`, `after-finalize`.
+///
+/// **Stage chosen for the rollback proof: `after-stage`.** This is
+/// the load-bearing stage because:
+///
+/// - `after-snapshot`: rollback is a no-op (snapshot bytes ==
+///   on-disk bytes).
+/// - `after-stage`: `package.json` now contains the staged `*`
+///   placeholder. Without rollback, the user's manifest would
+///   permanently contain `"<pkg>": "*"` — the load-bearing
+///   data-loss surface the snapshot-tx was designed to prevent.
+/// - `after-install` / `after-finalize`: more interesting from a
+///   rollback-coverage perspective, but `after-stage` is the
+///   minimum failure mode that proves the contract.
+///
+/// Pinned contract:
+///
+/// - Process exits non-zero (panic propagates to the runtime).
+/// - Stderr contains `"panicked at"` + `"LPM_TEST_PANIC_AT="` (proves
+///   the hook fired AND the rollback happened during unwinding —
+///   if Drop didn't run, we'd still see the panic but the on-disk
+///   state would be wrong).
+/// - `package.json` bytes are EXACTLY the pre-stage bytes (no `*`
+///   placeholder, no garbage). The load-bearing assertion.
+/// - The new package is NOT in `dependencies` (the staged entry
+///   was rolled back).
+/// - `.lpm/install-hash` is absent (invalidate-on-rollback).
+/// - `lpm.lock` is absent OR byte-identical to pre-stage (the
+///   transaction snapshotted it as `optional`).
+///
+/// **What this test does NOT cover.** Workspace path
+/// (`run_install_filtered_add`) and `lpm add` have separate
+/// transaction sites; the hook is wired only in `run_add_packages`
+/// today. Phase-2 follow-up if needed — A.1's race surface used
+/// `run_add_packages` so this is the highest-value first wiring.
+#[tokio::test]
+async fn install_panics_mid_pipeline_rollback_restores_manifest() {
+    let mock = MockRegistry::start().await;
+    let tarball = make_tarball("rollback-pkg", "1.0.0");
+    mock.with_package("rollback-pkg", "1.0.0", &tarball).await;
+    mock.with_batch_metadata(vec![single_version_batch_metadata(
+        "rollback-pkg",
+        "1.0.0",
+        &mock.url(),
+    )])
+    .await;
+
+    let pre_stage_pkg_json = r#"{
+  "name": "panic-rollback-test",
+  "version": "1.0.0"
+}"#;
+    let project = TempProject::empty(pre_stage_pkg_json);
+
+    // Pre-flight: verify the snapshot will see this exact pre-stage
+    // content. If we ever change `TempProject::empty`'s formatting,
+    // the rollback assertion below would compare against the wrong
+    // baseline.
+    let pre_bytes = std::fs::read(project.path().join("package.json"))
+        .expect("test setup: package.json must exist");
+    assert!(
+        pre_bytes.contains_subslice(b"panic-rollback-test"),
+        "test setup: pre-stage manifest doesn't contain expected name"
+    );
+    assert!(
+        !pre_bytes.contains_subslice(b"\"rollback-pkg\""),
+        "test setup: pre-stage manifest already has rollback-pkg, \
+         which would mask the rollback assertion"
+    );
+
+    let output = lpm_with_registry(&project, &mock.url())
+        // Trigger the panic at the after-stage point. The hook is
+        // gated to debug builds OR LPM_TEST_MODE=1; debug is the
+        // default for `cargo nextest run`.
+        .env("LPM_TEST_PANIC_AT", "after-stage")
+        .args(install_args_with(&["rollback-pkg@1.0.0"]))
+        .output()
+        .expect("run install");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    eprintln!(
+        "[B.4] status={:?}\nstdout:\n{stdout}\nstderr:\n{stderr}",
+        output.status
+    );
+
+    // Process MUST have exited non-zero — panic propagates to runtime.
+    assert!(
+        !output.status.success(),
+        "install with LPM_TEST_PANIC_AT=after-stage reported success \
+         — the panic hook did NOT fire. The hook is gated to debug \
+         builds; verify the test binary is `cargo build` (not \
+         release) and the env passed through.\n\
+         stdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+
+    // Stderr must show the panic AND the stage name. If the panic
+    // hook is missing or silently no-op, both substrings would be
+    // absent.
+    assert!(
+        stderr.contains("panicked at"),
+        "panic hook didn't surface a panic in stderr. The hook may \
+         not be wired. stderr:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("LPM_TEST_PANIC_AT=after-stage"),
+        "panic hook fired but the stage marker is missing — the \
+         panic message contract changed. stderr:\n{stderr}"
+    );
+
+    // **LOAD-BEARING.** Manifest bytes must be byte-identical to the
+    // pre-stage state. Drop on panic should have restored the
+    // snapshot bytes verbatim.
+    let post_bytes = std::fs::read(project.path().join("package.json"))
+        .expect("package.json must still exist after panic-rollback");
+    assert_eq!(
+        pre_bytes,
+        post_bytes,
+        "package.json was NOT restored by the ManifestTransaction Drop. \
+         The panic-rollback contract is broken. Pre/post diff:\n\
+         pre={}\npost={}",
+        String::from_utf8_lossy(&pre_bytes),
+        String::from_utf8_lossy(&post_bytes)
+    );
+
+    // Belt-and-braces: parse the post-state JSON and assert
+    // `rollback-pkg` is NOT a dependency. A future regression that
+    // adds whitespace/formatting tweaks to the snapshot bytes would
+    // trip the byte-equality above; this stricter assertion pins
+    // the user-visible contract independently.
+    let post_json: serde_json::Value =
+        serde_json::from_slice(&post_bytes).expect("post-rollback package.json must parse as JSON");
+    let deps = post_json
+        .get("dependencies")
+        .and_then(|v| v.as_object())
+        .cloned()
+        .unwrap_or_default();
+    assert!(
+        !deps.contains_key("rollback-pkg"),
+        "rollback-pkg is still in dependencies after panic-rollback — \
+         the staged placeholder leaked. deps={:?}",
+        deps.keys().collect::<Vec<_>>()
+    );
+
+    // `.lpm/install-hash` is in the transaction's `invalidate` set —
+    // delete-on-rollback regardless of pre-state. Pre-stage on a
+    // fresh project, this file did not exist; post-rollback it
+    // STILL must not exist.
+    assert!(
+        !project.path().join(".lpm/install-hash").exists(),
+        "`.lpm/install-hash` should be absent after panic-rollback \
+         (it's in the invalidate set, not the snapshot set)."
+    );
+
+    // `lpm.lock` was optional in the snapshot; pre-stage it didn't
+    // exist (fresh project). Post-rollback it MUST also not exist —
+    // the optional snapshot's "absent → remove on rollback" branch.
+    assert!(
+        !project.path().join("lpm.lock").exists(),
+        "`lpm.lock` should be absent after panic-rollback (snapshot \
+         captured `None` pre-stage). If present, the optional-snapshot \
+         rollback branch is broken."
+    );
+}
+
+// Helper trait — workflow tests use this in a couple of places to
+// avoid repeating `.windows()` boilerplate. Tight scope: just for
+// substring check on byte slices.
+trait ContainsSubslice {
+    fn contains_subslice(&self, needle: &[u8]) -> bool;
+}
+impl ContainsSubslice for [u8] {
+    fn contains_subslice(&self, needle: &[u8]) -> bool {
+        self.windows(needle.len()).any(|w| w == needle)
+    }
+}
+
 // ─── Category C — Network faults ────────────────────────────────────
 
 /// **C.4 — metadata 404 fails immediately, no retry.**
