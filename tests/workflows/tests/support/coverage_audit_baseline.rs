@@ -182,6 +182,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         json_contract: true,
         references: &[
             "crates/lpm-cli/src/commands/doctor.rs",
+            "tests/workflows/tests/doctor_list.rs",
             "tests/workflows/tests/json_output.rs",
             "crates/lpm-cli/tests/global_install_state_mutation.rs",
         ],
@@ -217,6 +218,9 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         references: &[
             "crates/lpm-cli/src/commands/install.rs",
             "tests/workflows/tests/install.rs",
+            "tests/workflows/tests/install_overrides.rs",
+            "tests/workflows/tests/install_patches.rs",
+            "tests/workflows/tests/install_real_registry.rs",
         ],
     },
     SurfaceBaseline {
@@ -237,7 +241,10 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         workflow: true,
         cli_binary: false,
         json_contract: true,
-        references: &["tests/workflows/tests/install.rs"],
+        references: &[
+            "tests/workflows/tests/install.rs",
+            "tests/workflows/tests/install_offline_capability_roundtrip.rs",
+        ],
     },
     SurfaceBaseline {
         id: 15,
@@ -261,6 +268,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
             "crates/lpm-cli/src/commands/install_global.rs",
             "crates/lpm-cli/tests/global_install_state_mutation.rs",
             "tests/workflows/tests/global.rs",
+            "tests/workflows/tests/install_global_security.rs",
         ],
     },
     SurfaceBaseline {
@@ -847,7 +855,10 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         json_contract: true,
         references: &[
             "crates/lpm-cli/src/commands/rebuild.rs",
+            "tests/workflows/tests/approve_scripts.rs",
+            "tests/workflows/tests/cross_command_flows.rs",
             "tests/workflows/tests/rebuild.rs",
+            "tests/workflows/tests/triage_install_lifecycle.rs",
         ],
     },
     SurfaceBaseline {
@@ -885,12 +896,13 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         name: "`lpm approve-scripts` (interactive)",
         unit: true,
         integration: false,
-        workflow: false,
+        workflow: true,
         cli_binary: true,
         json_contract: true,
         references: &[
             "crates/lpm-cli/src/commands/approve_scripts.rs",
             "crates/lpm-cli/tests/approve_scripts_interactive_tty.rs",
+            "tests/workflows/tests/approve_scripts.rs",
         ],
     },
     SurfaceBaseline {
@@ -931,7 +943,10 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         workflow: true,
         cli_binary: false,
         json_contract: true,
-        references: &["tests/workflows/tests/approve_scripts.rs"],
+        references: &[
+            "tests/workflows/tests/approve_scripts.rs",
+            "tests/workflows/tests/install_global_security.rs",
+        ],
     },
     SurfaceBaseline {
         id: 76,
@@ -1038,7 +1053,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         workflow: true,
         cli_binary: false,
         json_contract: false,
-        references: &[],
+        references: &["tests/workflows/tests/run.rs"],
     },
     SurfaceBaseline {
         id: 85,
@@ -1101,7 +1116,10 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         workflow: true,
         cli_binary: false,
         json_contract: true,
-        references: &["tests/workflows/tests/tools.rs"],
+        references: &[
+            "tests/workflows/tests/check_typescript.rs",
+            "tests/workflows/tests/tools.rs",
+        ],
     },
     SurfaceBaseline {
         id: 91,
@@ -1217,7 +1235,10 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         workflow: true,
         cli_binary: false,
         json_contract: false,
-        references: &["tests/workflows/tests/env_vault.rs"],
+        references: &[
+            "tests/workflows/tests/cross_command_flows.rs",
+            "tests/workflows/tests/env_vault.rs",
+        ],
     },
     SurfaceBaseline {
         id: 102,
@@ -1247,7 +1268,10 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         workflow: true,
         cli_binary: false,
         json_contract: false,
-        references: &["tests/workflows/tests/env_vault.rs"],
+        references: &[
+            "tests/workflows/tests/env_local.rs",
+            "tests/workflows/tests/env_vault.rs",
+        ],
     },
     SurfaceBaseline {
         id: 105,
