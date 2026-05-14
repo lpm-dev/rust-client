@@ -2852,6 +2852,72 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
         scenarios_by_file: &[("tests/workflows/tests/install.rs", 3)],
         last_audited_at: "2026-05-14",
     },
+    // ── id 136: lpm install pnpm migration warnings ──
+    //
+    // Carved out of id 12 during the 2026-05-14 v2 partition pass.
+    // These tests exercise install's cross-tool-input behavior: when a
+    // project still carries pnpm-shaped `overrides` / `patches` blocks
+    // and `lpm migrate` either hasn't run, has partially translated,
+    // or has diverged from the lpm-section state, install should
+    // either warn loudly (with --json suppression) or stay silent when
+    // the lpm-side already covers the same keys/paths. Folding these
+    // under id 12 would have inflated id 12's failure_modes_tested
+    // list with cross-tool concerns that have no bearing on the
+    // lockfile fast-path.
+    SurfaceV2 {
+        id: 136,
+        scenarios: 8,
+        failure_modes_tested: &[
+            "warns when pnpm overrides dropped during migration",
+            "pnpm overrides warning silenced under --json",
+            "warns when pnpm and lpm override targets diverge",
+            "pnpm overrides warning silent when lpm side covers same keys",
+            "warns when pnpm patches dropped during migration",
+            "pnpm patches warning silent when lpm side covers same paths",
+            "warns when pnpm and lpm patch paths diverge",
+            "pnpm patches warning silenced under --json",
+        ],
+        failure_modes_known: &[
+            "warning when pnpm-lock.yaml is malformed mid-parse",
+            "warning interaction with --offline (no migration source)",
+            "warning suppression precedence (env var vs --json vs lpm.toml)",
+            "warning surface when both overrides AND patches diverge in same install",
+        ],
+        json_contract_depth: JsonContractDepth::SemanticAsserts,
+        scenarios_by_file: &[("tests/workflows/tests/install.rs", 8)],
+        last_audited_at: "2026-05-14",
+    },
+    // ── id 137: lpm install linker validation (LPM_LINKER) ──
+    //
+    // Carved out of id 12 during the 2026-05-14 v2 partition pass.
+    // These tests exercise install's config-validation contract for
+    // the LPM_LINKER env var + --linker CLI flag: unknown values are
+    // rejected loudly at the earliest practical surface (clap parse,
+    // env normalization, or sync fast-lane). Also covers the
+    // freshness-cache invalidation contract: flipping the linker
+    // value between runs must invalidate the install-hash so the next
+    // install actually re-links rather than skipping under up-to-date.
+    SurfaceV2 {
+        id: 137,
+        scenarios: 6,
+        failure_modes_tested: &[
+            "rejects unknown LPM_LINKER value with loud error",
+            "--linker CLI flag rejects unknown value at clap parse",
+            "migrate honors LPM_LINKER env when invoking install pipeline",
+            "install invalidates freshness cache on LPM_LINKER flip",
+            "invalid LPM_LINKER surfaces through sync fast-lane (not just slow path)",
+            "LPM_LINKER env rejects unknown value loudly at normalization",
+        ],
+        failure_modes_known: &[
+            "concurrent installs with different LPM_LINKER values racing on the cache",
+            "LPM_LINKER set to a future-only value (forward-compat error UX)",
+            "linker flip mid-install (SIGHUP between resolve and link)",
+            "LPM_LINKER honoring across workspace member install (per-member override)",
+        ],
+        json_contract_depth: JsonContractDepth::SemanticAsserts,
+        scenarios_by_file: &[("tests/workflows/tests/install.rs", 6)],
+        last_audited_at: "2026-05-14",
+    },
 ];
 
 // ─── Cross-command flow inventory ─────────────────────────────────────
