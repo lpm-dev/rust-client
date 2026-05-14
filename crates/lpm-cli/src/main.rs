@@ -2599,7 +2599,19 @@ async fn async_main() -> Result<()> {
     // sees the banner.
     let is_self_update_command = matches!(command, Commands::SelfUpdate { .. });
 
-    let result = match command {
+    // Finding #76: wrap the entire dispatch in an async block so every
+    // `?` inside a match arm body propagates to THIS block's
+    // `Result<(), LpmError>` — and from there into `result`, where the
+    // top-level `--json` envelope handler renders it. Pre-fix, a `?`
+    // inside an arm short-circuited `async_main` directly (the
+    // enclosing function), bypassing both the envelope and the
+    // exit-code mirroring at the bottom of this function. The per-arm
+    // `async { ... }.await` wraps applied during the v2 sweep
+    // (Install, Login, Dlx, Use, Tunnel) are now redundant under this
+    // outer wrap but were left in place to keep the fix focused —
+    // they can be flattened in a follow-up cleanup pass.
+    let result: Result<(), lpm_common::LpmError> = async {
+    match command {
         Commands::Info {
             package,
             package_version,
@@ -3762,8 +3774,7 @@ async fn async_main() -> Result<()> {
                     return Err(lpm_common::LpmError::Script(
                         "`--group` is a global-scope option; use it with `--global` or drop it."
                             .into(),
-                    ))
-                    .into_diagnostic();
+                    ));
                 }
                 let cwd = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;
                 commands::approve_scripts::run(
@@ -4175,7 +4186,9 @@ async fn async_main() -> Result<()> {
             let bin_hint = commands::run::ensure_runtime(&cwd).await;
             commands::run::run(&cwd, script_name, extra_args, None, false, &bin_hint).await
         }
-    };
+    }
+    }
+    .await;
 
     // Update check: show notice from previous check (instant, no network).
     //
