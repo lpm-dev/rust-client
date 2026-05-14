@@ -1439,10 +1439,10 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         name: "`lpm migrate --ci / --no-npmrc`",
         unit: true,
         integration: false,
-        workflow: false,
+        workflow: true,
         cli_binary: false,
         json_contract: false,
-        references: &[],
+        references: &["tests/workflows/tests/migrate.rs"],
     },
     SurfaceBaseline {
         id: 125,
