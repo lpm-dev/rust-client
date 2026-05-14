@@ -830,6 +830,18 @@ async fn upgrade_major_yes_jumps_to_latest_major_version() {
     assert_eq!(pkg["to"], serde_json::json!(UP7_MAJOR));
     assert_eq!(pkg["new_range"], serde_json::json!("^2.0.0"));
     assert_eq!(pkg["semver_class"], serde_json::json!("major"));
+
+    // Snapshot the full envelope so a future contract widening (new
+    // field added or shape rename) fails this test before users notice.
+    insta::with_settings!({ filters => vec![
+        // Redact the mock registry URL (port-bound) and the absolute
+        // manifest path inside `target_set` so the snapshot is portable.
+        (r"http://127\.0\.0\.1:\d+", "[MOCK_URL]"),
+        (r#""/[^"]+/package\.json""#, r#""[MANIFEST]""#),
+        (r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z", "[TIMESTAMP]"),
+    ]}, {
+        insta::assert_json_snapshot!("upgrade_major_dry_run_envelope", json);
+    });
 }
 
 /// `--json` envelope's `has_install_scripts: true` when the candidate

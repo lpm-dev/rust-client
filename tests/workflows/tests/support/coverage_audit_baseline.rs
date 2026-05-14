@@ -364,7 +364,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         integration: false,
         workflow: true,
         cli_binary: false,
-        json_contract: false,
+        json_contract: true,
         references: &["tests/workflows/tests/upgrade.rs"],
     },
     SurfaceBaseline {
