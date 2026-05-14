@@ -10839,76 +10839,95 @@ pub async fn run_add_packages(
     let lockfile_bin_path = lockfile_path.with_extension("lockb");
     let install_hash_path = project_dir.join(".lpm").join("install-hash");
 
-    // 1. Snapshot the install state surface. Manifest is required (must
-    //    exist by precondition); lockfile + binary lockfile are optional
-    //    (absent on a fresh project); install-hash is invalidate-only
-    //    (cache file, deleted on rollback regardless of pre-state).
-    let tx = crate::manifest_tx::ManifestTransaction::snapshot_install_state(
-        &[&pkg_json_path],
-        &[&lockfile_path, &lockfile_bin_path],
-        &[&install_hash_path],
-    )?;
-
-    // 2. Stage the new entries. Explicit specs land verbatim; bare/dist-tag
-    //    entries get a `*` placeholder that finalize will replace using the
-    //    Phase 33 save policy (resolved version + flags + config).
+    // **Finding #77 fix.** Wrap the entire snapshot → stage → install
+    // → finalize → commit window in a per-project exclusive lock so
+    // concurrent `lpm install <pkg>` invocations on the same project
+    // serialize. Pre-fix, both processes would snapshot the same
+    // pre-edit `package.json`, both stage their own dep on top, and
+    // the second-to-commit silently overwrote the first's edits
+    // (data-loss-grade). The lock is per-project (no cross-project
+    // contention) and held across all `?` early-exits via the async
+    // block's return.
     //
-    //    Phase 33 Step 6: load `./lpm.toml` (project) merged with
-    //    `~/.lpm/config.toml` (global) for the persistent save-policy
-    //    keys. CLI flags still beat config inside `decide_saved_dependency_spec`.
-    let save_config = crate::save_config::SaveConfigLoader::load_for_project(project_dir)?;
-    let staged = stage_packages_to_manifest(
-        &pkg_json_path,
-        &js_packages,
-        save_dev,
-        save_flags,
-        json_output,
-    )?;
+    // `run_with_options` (called below) does NOT acquire this lock
+    // itself — wrapping it would deadlock when called from inside
+    // this block. The lock surface is the OUTER transaction; the
+    // inner install pipeline runs under the assumption that the
+    // caller has serialized the snapshot+commit window.
+    let project_lock = lpm_common::project_install_lock(project_dir);
+    lpm_common::with_exclusive_lock_async(project_lock, async {
+        // 1. Snapshot the install state surface. Manifest is required (must
+        //    exist by precondition); lockfile + binary lockfile are optional
+        //    (absent on a fresh project); install-hash is invalidate-only
+        //    (cache file, deleted on rollback regardless of pre-state).
+        let tx = crate::manifest_tx::ManifestTransaction::snapshot_install_state(
+            &[&pkg_json_path],
+            &[&lockfile_path, &lockfile_bin_path],
+            &[&install_hash_path],
+        )?;
 
-    // 3. Remove lockfile so the resolver re-runs against the staged manifest.
-    //    The transaction snapshot above already captured the original bytes,
-    //    so this delete is rolled back if the install pipeline fails.
-    if lockfile_path.exists() {
-        std::fs::remove_file(&lockfile_path)?;
-    }
+        // 2. Stage the new entries. Explicit specs land verbatim; bare/dist-tag
+        //    entries get a `*` placeholder that finalize will replace using the
+        //    Phase 33 save policy (resolved version + flags + config).
+        //
+        //    Phase 33 Step 6: load `./lpm.toml` (project) merged with
+        //    `~/.lpm/config.toml` (global) for the persistent save-policy
+        //    keys. CLI flags still beat config inside `decide_saved_dependency_spec`.
+        let save_config = crate::save_config::SaveConfigLoader::load_for_project(project_dir)?;
+        let staged = stage_packages_to_manifest(
+            &pkg_json_path,
+            &js_packages,
+            save_dev,
+            save_flags,
+            json_output,
+        )?;
 
-    // 4. Run the full install pipeline, capturing the direct-dep version
-    //    map via the Phase 33 out-param. If anything fails, the `?`
-    //    returns early — `tx` drops without `commit()` and the manifest
-    //    snaps back to its pre-stage state. The placeholder never survives.
-    let mut direct_versions: HashMap<String, lpm_semver::Version> = HashMap::new();
-    run_with_options(
-        client,
-        project_dir,
-        json_output,
-        false, // offline
-        force,
-        allow_new,
-        false, // strict_integrity (Phase 59.0 F5) — internal call, no flag
-        None,  // linker_override
-        false, // no_skills
-        false, // no_editor_setup
-        false, // no_security_summary
-        false, // auto_build
-        None,  // target_set: legacy single-project path
-        Some(&mut direct_versions),
-        script_policy_override,
-        advisor_override,
-        min_release_age_override,
-        drift_ignore_policy,
-        strict_sandbox,
-        no_sandbox,
-    )
-    .await?;
+        // 3. Remove lockfile so the resolver re-runs against the staged manifest.
+        //    The transaction snapshot above already captured the original bytes,
+        //    so this delete is rolled back if the install pipeline fails.
+        if lockfile_path.exists() {
+            std::fs::remove_file(&lockfile_path)?;
+        }
 
-    // 5. Finalize the manifest using the resolved direct-dep versions
-    //    from the resolver. No-op if stage produced no placeholders.
-    finalize_packages_in_manifest(&staged, &direct_versions, save_flags, save_config)?;
+        // 4. Run the full install pipeline, capturing the direct-dep version
+        //    map via the Phase 33 out-param. If anything fails, the `?`
+        //    returns early — `tx` drops without `commit()` and the manifest
+        //    snaps back to its pre-stage state. The placeholder never survives.
+        let mut direct_versions: HashMap<String, lpm_semver::Version> = HashMap::new();
+        run_with_options(
+            client,
+            project_dir,
+            json_output,
+            false, // offline
+            force,
+            allow_new,
+            false, // strict_integrity (Phase 59.0 F5) — internal call, no flag
+            None,  // linker_override
+            false, // no_skills
+            false, // no_editor_setup
+            false, // no_security_summary
+            false, // auto_build
+            None,  // target_set: legacy single-project path
+            Some(&mut direct_versions),
+            script_policy_override,
+            advisor_override,
+            min_release_age_override,
+            drift_ignore_policy,
+            strict_sandbox,
+            no_sandbox,
+        )
+        .await?;
 
-    // 6. All steps succeeded — commit the transaction so the manifest
-    //    edits persist.
-    tx.commit();
-    Ok(())
+        // 5. Finalize the manifest using the resolved direct-dep versions
+        //    from the resolver. No-op if stage produced no placeholders.
+        finalize_packages_in_manifest(&staged, &direct_versions, save_flags, save_config)?;
+
+        // 6. All steps succeeded — commit the transaction so the manifest
+        //    edits persist.
+        tx.commit();
+        Ok(())
+    })
+    .await
 }
 
 /// Phase 32 Phase 2 M2: workspace-aware install entry point.
@@ -11091,12 +11110,6 @@ pub async fn run_install_filtered_add(
     }
     let invalidate_refs: Vec<&Path> = install_hash_paths.iter().map(|p| p.as_path()).collect();
 
-    let tx = crate::manifest_tx::ManifestTransaction::snapshot_install_state(
-        &required_refs,
-        &optional_refs,
-        &invalidate_refs,
-    )?;
-
     // Phase 33: per-command save flags from the CLI flow into stage and
     // finalize so multi-member installs honor `--exact`/`--tilde`/etc.
     // for every targeted member identically.
@@ -11125,105 +11138,125 @@ pub async fn run_install_filtered_add(
     let save_config =
         crate::save_config::SaveConfigLoader::load_for_project(&workspace_root_for_config)?;
 
-    let mut last_err: Option<LpmError> = None;
-    for (idx, manifest_path) in targets.member_manifests.iter().enumerate() {
-        // (a) Stage the target manifest. Explicit specs land verbatim;
-        //     bare/dist-tag entries get a `*` placeholder.
-        let staged = match stage_packages_to_manifest(
-            manifest_path,
-            packages,
-            save_dev,
-            save_flags,
-            json_output,
-        ) {
-            Ok(s) => s,
-            Err(e) => {
+    // **Finding #77 fix.** Wrap the workspace-install snapshot → loop
+    // → commit in an exclusive per-WORKSPACE lock. Two concurrent
+    // `lpm install --filter <member>` invocations on the same workspace
+    // serialize through this lock so the multi-member ManifestTransaction
+    // doesn't race with itself. Per-member locks would be more granular
+    // but require sorted-acquisition to avoid deadlock between two
+    // processes targeting overlapping member sets — the workspace-root
+    // lock is the simpler correct primitive for v1. Sibling lock to the
+    // single-project path's per-project lock; same `.install.lock`
+    // filename so a future refactor can unify them.
+    let workspace_lock = lpm_common::project_install_lock(&workspace_root_for_config);
+    lpm_common::with_exclusive_lock_async(workspace_lock, async {
+        let tx = crate::manifest_tx::ManifestTransaction::snapshot_install_state(
+            &required_refs,
+            &optional_refs,
+            &invalidate_refs,
+        )?;
+
+        let mut last_err: Option<LpmError> = None;
+        for (idx, manifest_path) in targets.member_manifests.iter().enumerate() {
+            // (a) Stage the target manifest. Explicit specs land verbatim;
+            //     bare/dist-tag entries get a `*` placeholder.
+            let staged = match stage_packages_to_manifest(
+                manifest_path,
+                packages,
+                save_dev,
+                save_flags,
+                json_output,
+            ) {
+                Ok(s) => s,
+                Err(e) => {
+                    last_err = Some(e);
+                    break;
+                }
+            };
+
+            // Use the precomputed install root + lockfile path so the
+            // transaction snapshot above and the loop below agree on the
+            // exact paths (no double-compute, no path drift).
+            let install_root = &member_install_roots[idx];
+            let lockfile_path = &lockfile_paths[idx];
+
+            // (b) Remove this member's lockfile so the resolver re-runs.
+            //     The transaction snapshot already captured the original
+            //     bytes; the delete is rolled back if install fails below.
+            if lockfile_path.exists()
+                && let Err(e) = std::fs::remove_file(lockfile_path)
+            {
+                last_err = Some(LpmError::Io(e));
+                break;
+            }
+
+            // (c) Run the install pipeline at THIS member's directory,
+            //     capturing the direct-dep map for finalize via Phase 33's
+            //     out-param.
+            let mut direct_versions: HashMap<String, lpm_semver::Version> = HashMap::new();
+            let result = run_with_options(
+                client,
+                install_root,
+                json_output,
+                false, // offline
+                force,
+                allow_new,
+                false, // strict_integrity (Phase 59.0 F5) — workspace-add path, no flag
+                None,  // linker_override
+                false, // no_skills
+                false, // no_editor_setup
+                false, // no_security_summary
+                false, // auto_build
+                Some(&target_paths),
+                Some(&mut direct_versions),
+                script_policy_override,
+                // Same per-iteration clone rationale as `drift_ignore_policy`
+                // below: each loop pass moves the override into
+                // `run_with_options`, so the multi-member loop has to clone.
+                // `Option<String>` is cheap to clone.
+                advisor_override.clone(),
+                min_release_age_override,
+                // Multi-member loop: `run_install_filtered_add` runs the
+                // install pipeline once per targeted member. Each
+                // iteration consumes the policy, so we clone per call.
+                // Cloning an enum + HashSet of ignored names is cheap
+                // relative to the per-iteration install pipeline itself.
+                drift_ignore_policy.clone(),
+                strict_sandbox,
+                no_sandbox,
+            )
+            .await;
+
+            if let Err(e) = result {
+                // Abort on first failure. Half-installed multi-member states
+                // are confusing and the user should fix the failure before
+                // retrying. The transaction guard restores ALL touched
+                // manifests when we drop without commit.
                 last_err = Some(e);
                 break;
             }
-        };
 
-        // Use the precomputed install root + lockfile path so the
-        // transaction snapshot above and the loop below agree on the
-        // exact paths (no double-compute, no path drift).
-        let install_root = &member_install_roots[idx];
-        let lockfile_path = &lockfile_paths[idx];
-
-        // (b) Remove this member's lockfile so the resolver re-runs.
-        //     The transaction snapshot already captured the original
-        //     bytes; the delete is rolled back if install fails below.
-        if lockfile_path.exists()
-            && let Err(e) = std::fs::remove_file(lockfile_path)
-        {
-            last_err = Some(LpmError::Io(e));
-            break;
+            // (d) Finalize this member's manifest using the direct-dep
+            //     versions from the resolver.
+            if let Err(e) =
+                finalize_packages_in_manifest(&staged, &direct_versions, save_flags, save_config)
+            {
+                last_err = Some(e);
+                break;
+            }
         }
 
-        // (c) Run the install pipeline at THIS member's directory,
-        //     capturing the direct-dep map for finalize via Phase 33's
-        //     out-param.
-        let mut direct_versions: HashMap<String, lpm_semver::Version> = HashMap::new();
-        let result = run_with_options(
-            client,
-            install_root,
-            json_output,
-            false, // offline
-            force,
-            allow_new,
-            false, // strict_integrity (Phase 59.0 F5) — workspace-add path, no flag
-            None,  // linker_override
-            false, // no_skills
-            false, // no_editor_setup
-            false, // no_security_summary
-            false, // auto_build
-            Some(&target_paths),
-            Some(&mut direct_versions),
-            script_policy_override,
-            // Same per-iteration clone rationale as `drift_ignore_policy`
-            // below: each loop pass moves the override into
-            // `run_with_options`, so the multi-member loop has to clone.
-            // `Option<String>` is cheap to clone.
-            advisor_override.clone(),
-            min_release_age_override,
-            // Multi-member loop: `run_install_filtered_add` runs the
-            // install pipeline once per targeted member. Each
-            // iteration consumes the policy, so we clone per call.
-            // Cloning an enum + HashSet of ignored names is cheap
-            // relative to the per-iteration install pipeline itself.
-            drift_ignore_policy.clone(),
-            strict_sandbox,
-            no_sandbox,
-        )
-        .await;
-
-        if let Err(e) = result {
-            // Abort on first failure. Half-installed multi-member states
-            // are confusing and the user should fix the failure before
-            // retrying. The transaction guard restores ALL touched
-            // manifests when we drop without commit.
-            last_err = Some(e);
-            break;
+        if let Some(e) = last_err {
+            // Drop `tx` here without committing → every snapshotted manifest
+            // is restored to its pre-stage bytes.
+            return Err(e);
         }
 
-        // (d) Finalize this member's manifest using the direct-dep
-        //     versions from the resolver.
-        if let Err(e) =
-            finalize_packages_in_manifest(&staged, &direct_versions, save_flags, save_config)
-        {
-            last_err = Some(e);
-            break;
-        }
-    }
-
-    if let Some(e) = last_err {
-        // Drop `tx` here without committing → every snapshotted manifest
-        // is restored to its pre-stage bytes.
-        return Err(e);
-    }
-
-    // All members succeeded — persist every staged + finalized manifest.
-    tx.commit();
-    Ok(())
+        // All members succeeded — persist every staged + finalized manifest.
+        tx.commit();
+        Ok(())
+    })
+    .await
 }
 
 /// Install a Swift package via SE-0292 registry: edit Package.swift + resolve.

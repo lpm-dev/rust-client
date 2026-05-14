@@ -256,22 +256,16 @@ async fn two_concurrent_installs_on_same_project_leave_well_formed_manifest() {
         });
     }
 
-    // POST-CONDITION 3 (diagnostic only — finding #77): manifest /
-    // node_modules coherence. The race produces THREE observed
-    // outcomes today:
-    //   (a) both succeed; last-writer-wins → one pkg in manifest,
-    //       one in node_modules.
-    //   (b) one succeeds, one fails with "failed to rename to
-    //       lpm.lock: No such file or directory" (the atomic-rename
-    //       race biting hard).
-    //   (c) both fail with the rename race (rare, observed under
-    //       heavy parallel load).
-    // None of these are correct behavior — they are all forms of
-    // finding #77's data-loss surface. The test pins the FLOOR:
-    // package.json must parse, lpm.lock must be well-formed UTF-8
-    // if present (post-conditions 1+2 above). Outcomes are surfaced
-    // via eprintln for diagnosability; once the project-install
-    // lock lands, this section tightens into equality assertions.
+    // POST-CONDITION 3 (load-bearing — finding #77 fix): both installs
+    // succeeded AND both packages landed in the manifest AND both are
+    // linked into `node_modules/`. Pre-fix this section was diagnostic-
+    // only because `lpm install` held only a shared `store_lock` and
+    // the per-process `ManifestTransaction` snapshots didn't coordinate
+    // across processes — last-writer-wins. The project-install lock
+    // (per-project `<project>/.lpm/.install.lock`, exclusive,
+    // `with_exclusive_lock_async`) added at install.rs/add.rs serializes
+    // the snapshot+install+commit window so both packages survive the
+    // race.
     let deps = pkg_json
         .get("dependencies")
         .and_then(|v| v.as_object())
@@ -282,34 +276,52 @@ async fn two_concurrent_installs_on_same_project_leave_well_formed_manifest() {
     let pkg_a_linked = project.path().join("node_modules/pkg-a").exists();
     let pkg_b_linked = project.path().join("node_modules/pkg-b").exists();
     eprintln!(
-        "[A.1 finding #77 signal] status_a={status_a:?} status_b={status_b:?} \
+        "[A.1 race-state] status_a={status_a:?} status_b={status_b:?} \
          manifest_has_pkg_a={pkg_a_in_deps} manifest_has_pkg_b={pkg_b_in_deps} \
-         node_modules_has_pkg_a={pkg_a_linked} node_modules_has_pkg_b={pkg_b_linked}"
+         node_modules_has_pkg_a={pkg_a_linked} node_modules_has_pkg_b={pkg_b_linked}\n\
+         stderr_a:\n{}\nstderr_b:\n{}",
+        out_a.stderr, out_b.stderr
     );
 
-    // POST-CONDITION 4: at least one of the two installs reported
-    // its OWN dep landing — i.e., the operation isn't a total loss.
-    // (Outcome (c) above would fail this; if we ever observe (c)
-    // consistently, the race has escalated to a worse class.) The
-    // race-rename failure (outcome (b)) still satisfies this since
-    // the OTHER process succeeded.
-    let some_progress = (status_a.success() && (pkg_a_in_deps || pkg_a_linked))
-        || (status_b.success() && (pkg_b_in_deps || pkg_b_linked));
     assert!(
-        some_progress,
-        "both concurrent installs produced no observable progress \
-         (neither pkg landed AND neither process reported success). \
-         This would be a worse class of failure than the known \
-         last-writer-wins race in finding #77.\n\
-         status_a={status_a:?} stderr_a:\n{}\n\
+        status_a.success(),
+        "install A failed under concurrent install — project-lock \
+         contract requires both invocations succeed. \
+         status_a={status_a:?} stderr_a:\n{}",
+        out_a.stderr
+    );
+    assert!(
+        status_b.success(),
+        "install B failed under concurrent install — project-lock \
+         contract requires both invocations succeed. \
          status_b={status_b:?} stderr_b:\n{}",
-        out_a.stderr, out_b.stderr,
+        out_b.stderr
     );
 
-    // TODO #77 — when the project-install lock lands, this section
-    // tightens to: BOTH installs MUST succeed, BOTH pkg-a AND pkg-b
-    // MUST be in dependencies, BOTH MUST be in node_modules. The
-    // diagnostic eprintln becomes assertions.
+    assert!(
+        pkg_a_in_deps,
+        "pkg-a missing from package.json dependencies after concurrent \
+         install — manifest race is still occurring (finding #77 has \
+         regressed). manifest deps: {:?}",
+        deps.keys().collect::<Vec<_>>()
+    );
+    assert!(
+        pkg_b_in_deps,
+        "pkg-b missing from package.json dependencies after concurrent \
+         install — manifest race is still occurring. manifest deps: {:?}",
+        deps.keys().collect::<Vec<_>>()
+    );
+    assert!(
+        pkg_a_linked,
+        "pkg-a missing from node_modules after concurrent install — \
+         node_modules race is occurring (one install's link phase \
+         was clobbered by the other)."
+    );
+    assert!(
+        pkg_b_linked,
+        "pkg-b missing from node_modules after concurrent install — \
+         node_modules race is occurring."
+    );
 }
 
 /// **A.3 — install (shared `store_lock`) + `store clean` (exclusive
