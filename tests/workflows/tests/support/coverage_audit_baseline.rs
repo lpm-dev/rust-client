@@ -267,10 +267,10 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         name: "`lpm install --policy / --yolo`",
         unit: true,
         integration: false,
-        workflow: false,
+        workflow: true,
         cli_binary: false,
         json_contract: false,
-        references: &[],
+        references: &["tests/workflows/tests/install_policy.rs"],
     },
     SurfaceBaseline {
         id: 18,
