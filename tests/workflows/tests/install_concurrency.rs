@@ -1066,6 +1066,163 @@ async fn install_retries_tarball_5xx_until_success() {
     );
 }
 
+/// **C.2 — tarball 503 exhausts retries → install fails with HTTP-status error.**
+///
+/// Mock returns 503 on EVERY tarball request — no recovery. The
+/// registry client's retry loop ([client.rs:71](../../../crates/lpm-registry/src/client.rs#L71))
+/// runs `MAX_RETRIES = 3` (4 attempts total per logical fetch),
+/// then surfaces the last failure as `LpmError::Http { status: 503, ... }`.
+/// Install fails non-zero with the 503 visible in stderr.
+///
+/// **Backoff knob (finding #78 fix).** The default exponential schedule
+/// (1+2+4+8 seconds, capped at 10s) makes retry-exhaustion tests
+/// take ~15s wall-clock per fetch site (~28s with the install
+/// pipeline's 2 distinct `download_tarball_*` call sites — see C.3
+/// docstring). To keep the test in the workflow-suite's <5s
+/// determinism budget, the test sets `LPM_RETRY_BACKOFF_MS_OVERRIDE=10`
+/// on the lpm subprocess. The override is honored by `backoff_delay`
+/// AND the 429 `Retry-After` sleep, gated to debug builds OR
+/// `LPM_TEST_MODE=1` so production retry policy is immune.
+///
+/// Pinned contract:
+///
+/// - Exit non-zero — install must NOT silently succeed against a
+///   fully-503 endpoint.
+/// - No panic in lpm-rs's stderr.
+/// - Stderr names the HTTP class (status / 503 / http / network /
+///   server / unavailable) — at least one actionable noun so a
+///   future regression that drops the status visibility trips this.
+/// - **Elapsed < 2s**. With the knob (10ms × 8 attempts × 2 fetch
+///   sites), worst case is ~160ms of sleep. 2s gives slack for
+///   resolver overhead. Without the knob, this assertion FAILS
+///   (~28s elapsed) — which is the whole point of finding #78.
+/// - Tarball attempts ≥ 4 — proves the retry loop ran the full
+///   schedule, not just one attempt.
+#[tokio::test]
+async fn tarball_503_exhausts_retries_fails_with_http_status() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, Request, Respond, ResponseTemplate};
+
+    let mock = MockRegistry::start().await;
+    let tarball = make_tarball("doomed-pkg", "1.0.0");
+    let integrity = compute_integrity(&tarball);
+    let tarball_url = format!("{}/tarballs/doomed-pkg-1.0.0.tgz", mock.url());
+    let metadata = serde_json::json!({
+        "name": "doomed-pkg",
+        "dist-tags": { "latest": "1.0.0" },
+        "versions": {
+            "1.0.0": {
+                "name": "doomed-pkg",
+                "version": "1.0.0",
+                "dist": { "tarball": tarball_url, "integrity": integrity },
+                "dependencies": {}
+            }
+        },
+        "time": { "1.0.0": "2025-01-01T00:00:00.000Z" }
+    });
+    Mock::given(method("GET"))
+        .and(path("/api/registry/doomed-pkg"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(metadata.clone()))
+        .mount(mock.server())
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/doomed-pkg"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(metadata))
+        .mount(mock.server())
+        .await;
+
+    /// Tarball: 503 on every attempt. Counts hits so the test can
+    /// prove the retry loop actually ran.
+    struct Always503 {
+        count: Arc<AtomicUsize>,
+    }
+    impl Respond for Always503 {
+        fn respond(&self, _req: &Request) -> ResponseTemplate {
+            self.count.fetch_add(1, Ordering::SeqCst);
+            ResponseTemplate::new(503).set_body_string("doomed: simulated transient")
+        }
+    }
+    let attempts = Arc::new(AtomicUsize::new(0));
+    Mock::given(method("GET"))
+        .and(path("/tarballs/doomed-pkg-1.0.0.tgz"))
+        .respond_with(Always503 {
+            count: Arc::clone(&attempts),
+        })
+        .mount(mock.server())
+        .await;
+    mock.with_batch_metadata(vec![single_version_batch_metadata(
+        "doomed-pkg",
+        "1.0.0",
+        &mock.url(),
+    )])
+    .await;
+
+    let project = TempProject::empty(r#"{"name":"doom-test","version":"1.0.0"}"#);
+    let start = Instant::now();
+    let output = lpm_with_registry(&project, &mock.url())
+        // Finding #78: shrink the retry-backoff schedule from
+        // exponential 1+2+4+8s → flat 10ms so retry exhaustion fits
+        // in the <5s test budget. Honored only in debug builds OR
+        // when LPM_TEST_MODE=1 — production retry policy unaffected.
+        .env("LPM_RETRY_BACKOFF_MS_OVERRIDE", "10")
+        .args(install_args_with(&["doomed-pkg@1.0.0"]))
+        .output()
+        .expect("run install");
+    let elapsed = start.elapsed();
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let attempt_count = attempts.load(Ordering::SeqCst);
+
+    eprintln!(
+        "[C.2] elapsed={elapsed:?} status={:?} tarball_attempts={attempt_count}\n\
+         stdout:\n{stdout}\nstderr:\n{stderr}",
+        output.status
+    );
+
+    assert!(
+        !output.status.success(),
+        "install of fully-503 tarball reported success — retry-exhaustion \
+         contract violated. attempts={attempt_count}\nstderr:\n{stderr}"
+    );
+    assert!(
+        !stderr.contains("panicked at") && !stderr.contains("note: run with `RUST_BACKTRACE"),
+        "install panicked on retry exhaustion:\nstderr:\n{stderr}"
+    );
+    // Load-bearing: prove the retry loop actually fired. With
+    // MAX_RETRIES=3 and 2 distinct download_tarball_* call sites,
+    // expect ≥ 4 attempts (one logical-fetch's full retry schedule).
+    assert!(
+        attempt_count >= 4,
+        "tarball was retried only {attempt_count} time(s) — full retry \
+         schedule should produce ≥4 attempts (MAX_RETRIES=3). The retry \
+         loop may have a regression."
+    );
+    // Load-bearing: with the knob, retry-exhaustion fits well under
+    // the suite's <5s determinism budget. Without the knob (finding
+    // #78 not yet fixed), this assertion fails at ~28s.
+    assert!(
+        elapsed < Duration::from_secs(2),
+        "retry exhaustion took {elapsed:?} — LPM_RETRY_BACKOFF_MS_OVERRIDE \
+         (finding #78) is not being honored, OR the retry budget grew. \
+         attempts={attempt_count}"
+    );
+    // Surface the HTTP class so users / CI can grep for the failure.
+    let stderr_l = stderr.to_lowercase();
+    assert!(
+        stderr_l.contains("503")
+            || stderr_l.contains("status")
+            || stderr_l.contains("http")
+            || stderr_l.contains("server")
+            || stderr_l.contains("unavailable")
+            || stderr_l.contains("network"),
+        "retry-exhaustion failure didn't surface an actionable noun \
+         naming the HTTP class. attempts={attempt_count}\nstderr:\n{stderr}"
+    );
+}
+
 /// **C.3 — tarball body that under-delivers vs declared `Content-Length` fails cleanly.**
 ///
 /// The mock claims `Content-Length: <full>` in its header but writes
