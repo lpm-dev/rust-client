@@ -1054,6 +1054,220 @@ async fn install_retries_tarball_5xx_until_success() {
     );
 }
 
+/// **C.3 — tarball body that under-delivers vs declared `Content-Length` fails cleanly.**
+///
+/// The mock claims `Content-Length: <full>` in its header but writes
+/// only half the bytes. The plan asked which branch fires:
+///
+/// 1. **reqwest detects mid-stream undercount** as a network-class
+///    error → the registry client's retry loop fires, install fails
+///    after retry exhaustion.
+/// 2. **reqwest delivers the truncated bytes** → the downstream
+///    gzip/tar decoder hits EOF and surfaces a non-retryable
+///    `LpmError::Integrity`-class error on the first attempt.
+///
+/// **Observed behavior on this stack (wiremock 0.6 / hyper 1.9 / reqwest 0.12, 2026-05-14):**
+/// the server-side hyper writer rejects the Content-Length lie with
+/// an internal panic before any bytes reach the wire (`payload claims
+/// content-length of N, custom content-length header claims 2N`). The
+/// connection drops; lpm-rs sees a transport error
+/// (`error sending request for url`); the registry client classifies
+/// it as retryable and runs the full retry schedule. Install fails
+/// after retry exhaustion in ~14s.
+///
+/// That's a valid surrogate for "broken upstream / broken CDN drops
+/// connection mid-body" — the same retry-then-fail path is exercised
+/// either way. Surfaced ~8 tarball GETs per install consistently
+/// across runs (3-of-3 reproducer); the registry client's retry
+/// budget is `MAX_RETRIES=3` (4 total attempts per logical call),
+/// so 8 = two distinct `download_tarball_*` call sites in the
+/// install pipeline ([install.rs:9732 streaming](../../../crates/lpm-cli/src/commands/install.rs#L9732)
+/// + [install.rs:9951 routed](../../../crates/lpm-cli/src/commands/install.rs#L9951))
+/// each running the full retry schedule. Likely intentional
+/// (probe + download), but worth noting for budget reasoning if a
+/// future test asserts on attempt counts.
+///
+/// The contract pinned here:
+///
+/// - Exit non-zero — install must NOT silently succeed with half a tar.
+/// - No panic in lpm-rs's stderr (wiremock-side panics are server
+///   internals captured in TEST stderr, not lpm-rs stderr — that
+///   distinction is load-bearing for this assertion).
+/// - Stderr names something actionable (network / integrity /
+///   connection / truncated / decode / etc).
+/// - Elapsed is bounded under 25s — full retry schedule is ~15s.
+///   Never hangs.
+///
+/// To test the "decoder catches truncated body" branch directly, a
+/// future test would need a raw `tokio::net::TcpListener` writing
+/// the truncated response itself (bypass wiremock's framing). Out
+/// of scope for this tranche; the retry-exhaustion path is the
+/// load-bearing user-visible contract today.
+#[tokio::test]
+async fn tarball_connection_dropped_mid_body_fails_or_retries() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, Request, Respond, ResponseTemplate};
+
+    let mock = MockRegistry::start().await;
+    // Build a complete tarball, then under-deliver half its bytes
+    // while declaring the full length in `Content-Length`. The
+    // declared length must be > delivered length so reqwest sees an
+    // undercount (or the tar decoder sees a truncated stream).
+    let full_tarball = make_tarball("truncated-pkg", "1.0.0");
+    let full_len = full_tarball.len();
+    let half_tarball: Vec<u8> = full_tarball.iter().take(full_len / 2).copied().collect();
+    assert!(
+        !half_tarball.is_empty() && half_tarball.len() < full_len,
+        "test setup: tarball must be larger than its half"
+    );
+
+    let integrity = compute_integrity(&full_tarball);
+    let tarball_url = format!("{}/tarballs/truncated-pkg-1.0.0.tgz", mock.url());
+    let metadata = serde_json::json!({
+        "name": "truncated-pkg",
+        "dist-tags": { "latest": "1.0.0" },
+        "versions": {
+            "1.0.0": {
+                "name": "truncated-pkg",
+                "version": "1.0.0",
+                "dist": { "tarball": tarball_url, "integrity": integrity },
+                "dependencies": {}
+            }
+        },
+        "time": { "1.0.0": "2025-01-01T00:00:00.000Z" }
+    });
+    Mock::given(method("GET"))
+        .and(path("/api/registry/truncated-pkg"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(metadata.clone()))
+        .mount(mock.server())
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/truncated-pkg"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(metadata))
+        .mount(mock.server())
+        .await;
+
+    /// Counts attempts and serves a half-body with a full Content-Length on every hit.
+    /// Retries (if any) should hit the same endpoint and observe the
+    /// same under-delivery.
+    struct TruncatedTarball {
+        count: Arc<AtomicUsize>,
+        half_body: Vec<u8>,
+        declared_len: usize,
+    }
+    impl Respond for TruncatedTarball {
+        fn respond(&self, _req: &Request) -> ResponseTemplate {
+            self.count.fetch_add(1, Ordering::SeqCst);
+            // `set_body_raw` writes the bytes verbatim with the named
+            // content-type. We then OVERRIDE `content-length` with the
+            // larger declared size so the wire-level handler claims
+            // more bytes than it delivers.
+            ResponseTemplate::new(200)
+                .set_body_raw(self.half_body.clone(), "application/octet-stream")
+                .insert_header("content-length", self.declared_len.to_string().as_str())
+        }
+    }
+
+    let attempts = Arc::new(AtomicUsize::new(0));
+    Mock::given(method("GET"))
+        .and(path("/tarballs/truncated-pkg-1.0.0.tgz"))
+        .respond_with(TruncatedTarball {
+            count: Arc::clone(&attempts),
+            half_body: half_tarball,
+            declared_len: full_len,
+        })
+        .mount(mock.server())
+        .await;
+
+    mock.with_batch_metadata(vec![single_version_batch_metadata(
+        "truncated-pkg",
+        "1.0.0",
+        &mock.url(),
+    )])
+    .await;
+
+    let project = TempProject::empty(r#"{"name":"trunc-test","version":"1.0.0"}"#);
+    let start = Instant::now();
+    let output = lpm_with_registry(&project, &mock.url())
+        .args(install_args_with(&["truncated-pkg@1.0.0"]))
+        .output()
+        .expect("run install");
+    let elapsed = start.elapsed();
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let attempt_count = attempts.load(Ordering::SeqCst);
+
+    // Always log the actual shape so later readers can see whether
+    // reqwest detected the undercount (multi-attempt) or the decoder
+    // caught it on the first byte stream (single attempt).
+    eprintln!(
+        "[C.3] elapsed={elapsed:?} status={:?} tarball_attempts={attempt_count}\n\
+         stdout:\n{stdout}\nstderr:\n{stderr}",
+        output.status
+    );
+
+    assert!(
+        !output.status.success(),
+        "install of truncated-body tarball reported success — \
+         decoder accepted half a .tgz. attempts={attempt_count}\n\
+         stdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(
+        !stderr.contains("panicked at") && !stderr.contains("note: run with `RUST_BACKTRACE"),
+        "install panicked on truncated body: stderr:\n{stderr}"
+    );
+    // Bounded wall-clock: 25s leaves headroom for the full retry
+    // schedule (~15s) on slow CI runners. A hang here is the bug.
+    assert!(
+        elapsed < Duration::from_secs(25),
+        "install of truncated body took {elapsed:?} — looks like a hang \
+         (3-retry budget is ~15s). attempts={attempt_count}"
+    );
+    // Some actionable noun must surface so users / CI can grep for
+    // the failure class. The word list is intentionally broad
+    // because the failure can either come from reqwest (network /
+    // connection / body / closed) or from the tar/gzip layer
+    // (integrity / checksum / decode / parse / corrupt / truncated).
+    let stderr_l = stderr.to_lowercase();
+    let actionable = [
+        "integrity",
+        "checksum",
+        "decode",
+        "decompress",
+        "parse",
+        "corrupt",
+        "truncated",
+        "network",
+        "connection",
+        "body",
+        "size",
+        "length",
+        "io error",
+        "incomplete",
+        "unexpected eof",
+        "premature",
+        "tarball",
+        "extract",
+    ]
+    .iter()
+    .any(|n| stderr_l.contains(n));
+    assert!(
+        actionable,
+        "truncated-body failure didn't surface an actionable noun. \
+         attempts={attempt_count}\nstderr:\n{stderr}"
+    );
+    // Either both branches of the plan: ≥1 attempt is acceptable;
+    // the diagnostic above tells the reader which branch fired.
+    assert!(
+        attempt_count >= 1,
+        "no tarball request observed — install failed before fetch. \
+         stderr:\n{stderr}"
+    );
+}
+
 // ─── Category D — Filesystem faults ─────────────────────────────────
 
 /// **D.1 — `lpm install` to a read-only project dir fails clearly.**
@@ -1637,6 +1851,188 @@ async fn lpm_command_skips_recovery_when_another_lpm_holds_global_tx_lock() {
         post_wal_size, 3,
         "after the lock-holder released, recovery still didn't run — \
          the dispatcher hook is broken in BOTH arms."
+    );
+}
+
+/// **F.3 — orphan pending tx triggers a `RolledBack` recovery outcome.**
+///
+/// Plants a fully-formed orphan transaction across both surfaces of
+/// global state:
+///
+/// 1. WAL: a single `WalRecord::Intent` for `tx-orphan-1` / `pkg-orphan`
+///    pointing at a non-existent install root path. No matching COMMIT
+///    or ABORT.
+/// 2. `manifest.toml`: a matching `[pending.pkg-orphan]` row, also
+///    pointing at the same non-existent install root.
+///
+/// On the next `lpm` invocation that needs global state, the dispatcher
+/// hook ([main.rs:2531](../../../crates/lpm-cli/src/main.rs)) fires
+/// `lpm_global::recover()`. Recovery's per-tx loop ([recover.rs:213](../../../crates/lpm-global/src/recover.rs))
+/// finds the uncompleted Intent, looks up the pending row, calls
+/// `validate_install_root` — which returns `Missing` because the
+/// install-root directory we named was never created. Recovery then
+/// rolls back: the pending row is dropped, an ABORT is appended to
+/// the WAL, the install-root tombstone (if any) is recorded.
+///
+/// User-visible signal: a `tracing::info!("global recovery: rolled
+/// back ... (tx ...)")` line ([main.rs:2543](../../../crates/lpm-cli/src/main.rs))
+/// on stderr. The default `lpm=warn` filter suppresses it, so this
+/// test sets `RUST_LOG=lpm=info` on the command to surface it. Real
+/// users see this when they invoke `lpm -v <cmd>` after a crash.
+///
+/// The test pins three invariants:
+///
+/// - `lpm global list` succeeds (recovery doesn't crash the command).
+/// - Stderr contains the recovery-banner phrase + the tx_id (so a
+///   future regression that drops the banner trips the test).
+/// - Post-state: the orphan `[pending.pkg-orphan]` row is gone from
+///   `manifest.toml` (proof recovery actually mutated state, not
+///   just emitted a banner).
+///
+/// **Why the dispatcher hook fires for `lpm global list`.** Per
+/// [`command_needs_global_state`](../../../crates/lpm-cli/src/main.rs)
+/// the global subcommands are gated for recovery — see F.1's
+/// docstring for the broader contract.
+#[tokio::test]
+async fn lpm_command_with_orphan_pending_tx_emits_recovery_banner() {
+    use chrono::Utc;
+    use lpm_common::LpmRoot;
+    use lpm_global::manifest::{
+        GlobalManifest, PackageSource, PendingEntry, write_for as write_manifest_for,
+    };
+    use lpm_global::wal::{IntentPayload, TxKind, WalRecord, WalWriter};
+
+    let project = TempProject::empty(r#"{"name":"orphan-test","version":"1.0.0"}"#);
+    // Mirror the dispatcher's view of the lpm root: it consults
+    // `LPM_HOME` first, which `apply_lpm_env` sets to `<HOME>/.lpm`.
+    let lpm_home = project.home().join(".lpm");
+    let root = LpmRoot::from_dir(&lpm_home);
+
+    // The install root path we name is intentionally NOT created.
+    // `validate_install_root` will return a non-`Ready` status, which
+    // routes recovery through `roll_back` → `RolledBack`.
+    let install_root = root.install_root_for("pkg-orphan", "1.0.0");
+    let relative_root = "installs/pkg-orphan@1.0.0";
+
+    // Plant the manifest's pending row first — `write_for` creates
+    // `~/.lpm/global/` as a side effect, which the WAL writer
+    // depends on. (The inverse order works too because
+    // `WalWriter::open` also mkdir's, but pinning the order keeps
+    // the test's intent obvious.)
+    let mut manifest = GlobalManifest::default();
+    manifest.pending.insert(
+        "pkg-orphan".into(),
+        PendingEntry {
+            saved_spec: "^1".into(),
+            resolved: "1.0.0".into(),
+            integrity: "sha512-x".into(),
+            source: PackageSource::LpmDev,
+            started_at: Utc::now(),
+            root: relative_root.into(),
+            commands: vec!["pkg-orphan".into()],
+            replaces_version: None,
+        },
+    );
+    write_manifest_for(&root, &manifest).expect("plant pending manifest row");
+
+    // Plant the matching INTENT in the WAL with no COMMIT/ABORT.
+    let intent = WalRecord::Intent(Box::new(IntentPayload {
+        tx_id: "tx-orphan-1".into(),
+        kind: TxKind::Install,
+        package: "pkg-orphan".into(),
+        new_root_path: install_root.clone(),
+        new_row_json: serde_json::json!({
+            "saved_spec": "^1",
+            "resolved": "1.0.0",
+            "integrity": "sha512-x",
+            "source": "lpm-dev",
+            "installed_at": "2026-04-15T00:00:00Z",
+            "root": relative_root,
+            "commands": ["pkg-orphan"],
+        }),
+        prior_active_row_json: None,
+        prior_command_ownership_json: serde_json::json!({}),
+        new_aliases_json: serde_json::json!({}),
+        ownership_delta: Vec::new(),
+    }));
+    let mut writer = WalWriter::open(root.global_wal()).expect("open WAL writer");
+    writer.append(&intent).expect("append orphan INTENT");
+    drop(writer); // explicit drop to release the file handle before lpm forks
+
+    // Sanity: confirm the orphan state is actually present.
+    assert!(
+        root.global_wal().exists(),
+        "test setup: WAL not present after planting orphan INTENT"
+    );
+    assert!(
+        root.global_manifest().exists(),
+        "test setup: manifest not present after planting pending row"
+    );
+
+    // Run a global subcommand that triggers the dispatcher's recovery
+    // hook. `RUST_LOG=lpm=info` lifts the default `lpm=warn` filter
+    // (see [main.rs:2440-2444](../../../crates/lpm-cli/src/main.rs))
+    // so the `tracing::info!("global recovery: rolled back …")` line
+    // surfaces on stderr.
+    let output = lpm(&project)
+        .env("RUST_LOG", "lpm=info")
+        .args(["global", "list"])
+        .output()
+        .expect("run global list");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    eprintln!(
+        "[F.3] status={:?}\nstdout:\n{stdout}\nstderr:\n{stderr}",
+        output.status
+    );
+
+    assert!(
+        output.status.success(),
+        "global list failed in the presence of an orphan tx — \
+         dispatcher recovery hook didn't reconcile cleanly:\n\
+         stdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(
+        !stderr.contains("panicked at") && !stderr.contains("note: run with `RUST_BACKTRACE"),
+        "recovery panicked while reconciling the orphan tx:\nstderr:\n{stderr}"
+    );
+
+    // The recovery banner must surface when RUST_LOG=lpm=info is set.
+    // Substring on the stable phrase + the tx_id we planted.
+    assert!(
+        stderr.contains("global recovery: rolled back"),
+        "expected the `RolledBack` banner from \
+         crates/lpm-cli/src/main.rs:2543. stderr:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("tx-orphan-1"),
+        "recovery banner did not name the planted tx_id `tx-orphan-1`. stderr:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("pkg-orphan"),
+        "recovery banner did not name the planted package `pkg-orphan`. stderr:\n{stderr}"
+    );
+
+    // Concrete proof recovery actually mutated state: the orphan
+    // pending row must be gone from the manifest.
+    let post_manifest =
+        lpm_global::manifest::read_for(&root).expect("re-read manifest post-recovery");
+    assert!(
+        !post_manifest.pending.contains_key("pkg-orphan"),
+        "[pending.pkg-orphan] still present after rollback — recovery emitted \
+         the banner but didn't actually clean up the manifest. \
+         post_manifest.pending={:?}",
+        post_manifest.pending.keys().collect::<Vec<_>>()
+    );
+    // No active row was ever committed (this was an orphan, not a
+    // partial install). Pin the absence so a future regression that
+    // mistakenly rolls FORWARD instead of back trips the test.
+    assert!(
+        !post_manifest.packages.contains_key("pkg-orphan"),
+        "[packages.pkg-orphan] appeared after rollback — recovery rolled \
+         forward instead of back. post_manifest.packages={:?}",
+        post_manifest.packages.keys().collect::<Vec<_>>()
     );
 }
 

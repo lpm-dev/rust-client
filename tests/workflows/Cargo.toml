@@ -27,6 +27,9 @@ lpm-runner = { path = "../../crates/lpm-runner" }
 lpm-vault = { path = "../../crates/lpm-vault" }
 lpm-lockfile = { path = "../../crates/lpm-lockfile" }
 lpm-security = { path = "../../crates/lpm-security" }
+# F.3 install-concurrency test plants a framed orphan WAL record via WalWriter +
+# a matching pending-row in manifest.toml so recovery's RolledBack arm fires.
+lpm-global = { path = "../../crates/lpm-global" }
 tar = { workspace = true }
 flate2 = { workspace = true }
 toml = { workspace = true }
