@@ -675,3 +675,98 @@ fn migrate_npm_lockfile_contains_packages() {
         &lockfile_content[..lockfile_content.len().min(500)]
     );
 }
+
+// ─── --ci flag (CI workflow template generation) ──────────────────────
+
+#[test]
+fn migrate_with_ci_flag_generates_workflow_template_file() {
+    let project = TempProject::from_fixture("migrate-npm");
+
+    // Seed a `.github/workflows/` parent so the GitHub Actions template
+    // is the deterministic detected target.
+    std::fs::create_dir_all(project.path().join(".github/workflows"))
+        .expect("seed .github/workflows");
+
+    let output = lpm(&project)
+        .args(["migrate", "--no-install", "--force", "--ci"])
+        .output()
+        .expect("failed to run lpm migrate --ci");
+
+    assert!(
+        output.status.success(),
+        "migrate --ci failed:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+
+    // A new workflow file must exist under .github/workflows/ after --ci.
+    let entries: Vec<_> = std::fs::read_dir(project.path().join(".github/workflows"))
+        .expect("read .github/workflows")
+        .filter_map(Result::ok)
+        .collect();
+    assert!(
+        !entries.is_empty(),
+        "migrate --ci must write at least one workflow file under .github/workflows/, got: {entries:?}",
+    );
+}
+
+#[test]
+fn migrate_without_ci_flag_does_not_generate_workflow_file() {
+    let project = TempProject::from_fixture("migrate-npm");
+    std::fs::create_dir_all(project.path().join(".github/workflows"))
+        .expect("seed .github/workflows");
+
+    lpm(&project)
+        .args(["migrate", "--no-install", "--force"])
+        .assert()
+        .success();
+
+    let entries: Vec<_> = std::fs::read_dir(project.path().join(".github/workflows"))
+        .expect("read .github/workflows")
+        .filter_map(Result::ok)
+        .collect();
+    assert!(
+        entries.is_empty(),
+        "migrate without --ci must NOT write any workflow file, got: {entries:?}",
+    );
+}
+
+// ─── --no-npmrc flag ──────────────────────────────────────────────────
+
+#[test]
+fn migrate_no_npmrc_skips_npmrc_creation() {
+    let project = TempProject::from_fixture("migrate-npm");
+
+    assert!(
+        !project.file_exists(".npmrc"),
+        "preconditions: fixture must not start with .npmrc"
+    );
+
+    lpm(&project)
+        .args(["migrate", "--no-install", "--force", "--no-npmrc"])
+        .assert()
+        .success();
+
+    assert!(
+        !project.file_exists(".npmrc"),
+        "migrate --no-npmrc must not create .npmrc"
+    );
+}
+
+#[test]
+fn migrate_default_creates_npmrc_unless_no_npmrc_passed() {
+    // Inverse of the --no-npmrc test: without the flag, migrate writes
+    // .npmrc. Locks the default behavior so a future flip would fail
+    // this test (and the --no-npmrc test) symmetrically.
+    let project = TempProject::from_fixture("migrate-npm");
+
+    lpm(&project)
+        .args(["migrate", "--no-install", "--force"])
+        .assert()
+        .success();
+
+    assert!(
+        project.file_exists(".npmrc"),
+        "migrate without --no-npmrc must write .npmrc by default"
+    );
+}
