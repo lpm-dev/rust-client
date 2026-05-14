@@ -550,3 +550,417 @@ async fn tarball_with_setuid_executable_extracts_with_setuid_bit_stripped() {
          on-disk mode: {mode:#o}. Expected exec bits preserved (0o755)."
     );
 }
+
+// ─── Phase 2 tests (added 2026-05-14) ───────────────────────────────
+
+/// **Plan #4 — Unicode-bearing entry path is taken as literal bytes, not normalized.**
+///
+/// The extractor's `Component::ParentDir` check at
+/// [lib.rs:347](../../../crates/lpm-extractor/src/lib.rs#L347) compares
+/// against `b".."` byte-exactly. A tarball entry with full-width
+/// dots `．．` (U+FF0E × 2, UTF-8 `\xef\xbc\x8e\xef\xbc\x8e`) does
+/// NOT match `ParentDir` and is treated as a normal `Component::Normal`
+/// directory name. Same shape for RTL override (U+202E, the
+/// `RIGHT-TO-LEFT OVERRIDE` codepoint — not literally embedded in
+/// this docstring because rustc rejects bidi codepoints in source
+/// even in comments), URL-encoded forms like `..%c0%af`, and any
+/// other Unicode
+/// representation that doesn't decode to the literal ASCII bytes
+/// `..` at the OS layer.
+///
+/// **Result:** install SUCCEEDS, the entry extracts at the literal
+/// Unicode-bearing path under `node_modules/<pkg>/`, no traversal
+/// triggers, and the outside sentinel is unchanged.
+///
+/// That posture is defensible: Rust's `Path::components()` is byte-
+/// based on POSIX (no NFC/NFKC normalization), so any non-ASCII
+/// representation of "parent dir" loses its semantic meaning at the
+/// path-component layer. The bytes become a normal filename. The
+/// only Unicode-trick that COULD escape would be one whose bytes
+/// are byte-identical to ASCII `..` at the OS layer — by
+/// construction, that's the regular `..` case (Plan #1), already
+/// pinned.
+///
+/// Pin the no-escape contract: outside sentinel byte-identical, the
+/// extracted file (if any) lives strictly under
+/// `node_modules/<pkg>/`.
+#[tokio::test]
+async fn tarball_with_unicode_lookalike_parent_dir_extracts_safely_as_literal_bytes() {
+    // Plant an outside sentinel — same shape as the symlink/hardlink
+    // tests so a writethrough is detectable.
+    let outside_dir = tempfile::tempdir().expect("outside tempdir");
+    let outside_target = outside_dir.path().join("escape.txt");
+    std::fs::write(&outside_target, b"original outside content").expect("plant sentinel");
+
+    let tgz = tarball_with_extra_entries("unicode-pkg", "1.0.0", |builder| {
+        let content = b"unicode-pwn-attempt";
+        let mut header = tar::Header::new_gnu();
+        header.set_size(content.len() as u64);
+        header.set_mode(0o644);
+        header.set_entry_type(tar::EntryType::Regular);
+        // Full-width dots — visually `..` but bytewise NOT the
+        // ASCII `..` that triggers `Component::ParentDir`.
+        header
+            .set_path("package/．．/escape.txt")
+            .expect("set unicode path");
+        header.set_cksum();
+        builder.append(&header, &content[..]).unwrap();
+    });
+
+    let mock = MockRegistry::start().await;
+    mock.with_package("unicode-pkg", "1.0.0", &tgz).await;
+
+    let project = TempProject::empty(r#"{"name":"sec-test","version":"1.0.0"}"#);
+    let output = lpm_with_registry(&project, &mock.url())
+        .args(install_args("unicode-pkg@1.0.0"))
+        .output()
+        .expect("run install");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    eprintln!(
+        "[Plan#4 unicode-literal] status={:?}\nstderr:\n{stderr}\nstdout:\n{stdout}",
+        output.status
+    );
+
+    assert!(
+        output.status.success(),
+        "install of Unicode-lookalike-traversal tarball failed — \
+         the extractor's literal-bytes contract may have changed.\n\
+         stderr:\n{stderr}"
+    );
+    assert!(
+        !stderr.contains("panicked at"),
+        "extractor panicked on Unicode-bearing path:\nstderr:\n{stderr}"
+    );
+
+    // **Critical** — outside sentinel must be byte-identical. If
+    // `．．` were ever interpreted as parent-dir traversal AND the
+    // extractor wrote through it, the outside file would be
+    // overwritten or supplemented.
+    let after = std::fs::read(&outside_target).expect("re-read outside sentinel");
+    assert_eq!(
+        after, b"original outside content",
+        "outside sentinel was modified — Unicode-lookalike path was \
+         interpreted as traversal somewhere in the pipeline. \
+         file: {outside_target:?}"
+    );
+    // Also pin: nothing landed at the project's parent dir as a
+    // sibling escape.txt (`node_modules/escape.txt` would also be
+    // a smell — the literal path should land deeper).
+    let project_parent_escape = project.path().parent().unwrap().join("escape.txt");
+    assert!(
+        !project_parent_escape.exists(),
+        "extractor wrote to project's parent — security regression. \
+         file lives at: {project_parent_escape:?}"
+    );
+
+    // Diagnostic only: surface the actual landing path so future
+    // readers can see where the extractor placed the literal-bytes
+    // entry. Not asserted because filesystem rules around non-ASCII
+    // dir names vary across macOS HFS+/APFS, ext4, NTFS-via-WSL.
+    let pkg_dir = project.path().join("node_modules/unicode-pkg");
+    let unicode_subdir = pkg_dir.join("．．");
+    eprintln!(
+        "[Plan#4 unicode-literal] unicode_subdir_exists={} pkg_dir_exists={} files_under_pkg={:?}",
+        unicode_subdir.exists(),
+        pkg_dir.exists(),
+        pkg_dir
+            .read_dir()
+            .ok()
+            .map(|rd| rd.flatten().map(|e| e.file_name()).collect::<Vec<_>>())
+    );
+}
+
+/// **Plan #6 — character-device entry is silently skipped (POSIX-only).**
+///
+/// Tarball entry type `EntryType::Char` (or `Block`) is not
+/// `is_file()`, so the extractor's regular-files-only branch at
+/// [lib.rs:398](../../../crates/lpm-extractor/src/lib.rs#L398)
+/// silently drops it. Same posture as the symlink/hardlink tests
+/// in phase 1.
+///
+/// Defensible: npm packages don't legitimately ship device files.
+/// Silent-skip avoids ever materializing a /dev/null-like entry
+/// that could confuse downstream tools (Node's `fs.readFileSync`
+/// on a character device would block forever or read zero bytes).
+///
+/// **Why Unix-only:** tar's `EntryType::Char` and `Block` map to
+/// POSIX `mknod()` semantics. Windows tar can't materialize them
+/// even if the silent-skip logic were bypassed; the path is moot
+/// there. The same `is_file()` predicate gates the skip cross-
+/// platform, but constructing the test fixture is POSIX-shaped.
+#[cfg(unix)]
+#[tokio::test]
+async fn tarball_with_character_device_entry_is_silently_skipped() {
+    let tgz = tarball_with_extra_entries("chardev-pkg", "1.0.0", |builder| {
+        let mut header = tar::Header::new_gnu();
+        header.set_entry_type(tar::EntryType::Char);
+        header.set_size(0);
+        header.set_mode(0o600);
+        // device_major/minor live in the tar header but the extractor
+        // never reads them (silent-skip happens before any device-
+        // creation code path). Set both to 0 — value is irrelevant.
+        header.set_device_major(1).expect("set major");
+        header.set_device_minor(3).expect("set minor"); // /dev/null-shape
+        header.set_cksum();
+        builder
+            .append_data(&mut header, "package/devnull-clone", std::io::empty())
+            .unwrap();
+    });
+
+    let mock = MockRegistry::start().await;
+    mock.with_package("chardev-pkg", "1.0.0", &tgz).await;
+
+    let project = TempProject::empty(r#"{"name":"sec-test","version":"1.0.0"}"#);
+    let output = lpm_with_registry(&project, &mock.url())
+        .args(install_args("chardev-pkg@1.0.0"))
+        .output()
+        .expect("run install");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    eprintln!(
+        "[Plan#6 chardev-skip] status={:?}\nstderr:\n{stderr}",
+        output.status
+    );
+
+    assert!(
+        output.status.success(),
+        "install of character-device-bearing tarball failed — \
+         silent-skip contract may have changed.\nstderr:\n{stderr}"
+    );
+    assert!(
+        !stderr.contains("panicked at"),
+        "extractor panicked on character-device entry:\nstderr:\n{stderr}"
+    );
+
+    let phantom = project
+        .path()
+        .join("node_modules/chardev-pkg/devnull-clone");
+    assert!(
+        !phantom.exists(),
+        "the silently-skipped character device should not appear at {phantom:?}"
+    );
+}
+
+/// **Plan #7 — FIFO entry is silently skipped (POSIX-only).**
+///
+/// Tarball entry type `EntryType::Fifo` is not `is_file()`. Same
+/// silent-skip posture as #6 (character device). Pinned for
+/// completeness so a future regression that flips the gate (e.g.,
+/// `EntryType::Fifo` accidentally treated as Regular) is detected
+/// here.
+///
+/// Defensible: npm packages don't ship named pipes. Materializing
+/// one would create a hang trap for any tool that opened the path
+/// for read.
+#[cfg(unix)]
+#[tokio::test]
+async fn tarball_with_fifo_entry_is_silently_skipped() {
+    let tgz = tarball_with_extra_entries("fifo-pkg", "1.0.0", |builder| {
+        let mut header = tar::Header::new_gnu();
+        header.set_entry_type(tar::EntryType::Fifo);
+        header.set_size(0);
+        header.set_mode(0o644);
+        header.set_cksum();
+        builder
+            .append_data(&mut header, "package/named-pipe", std::io::empty())
+            .unwrap();
+    });
+
+    let mock = MockRegistry::start().await;
+    mock.with_package("fifo-pkg", "1.0.0", &tgz).await;
+
+    let project = TempProject::empty(r#"{"name":"sec-test","version":"1.0.0"}"#);
+    let output = lpm_with_registry(&project, &mock.url())
+        .args(install_args("fifo-pkg@1.0.0"))
+        .output()
+        .expect("run install");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    eprintln!(
+        "[Plan#7 fifo-skip] status={:?}\nstderr:\n{stderr}",
+        output.status
+    );
+
+    assert!(
+        output.status.success(),
+        "install of FIFO-bearing tarball failed — silent-skip contract \
+         may have changed.\nstderr:\n{stderr}"
+    );
+    assert!(
+        !stderr.contains("panicked at"),
+        "extractor panicked on FIFO entry:\nstderr:\n{stderr}"
+    );
+
+    let phantom = project.path().join("node_modules/fifo-pkg/named-pipe");
+    assert!(
+        !phantom.exists(),
+        "the silently-skipped FIFO should not appear at {phantom:?}"
+    );
+}
+
+/// **Plan #9 — zero-byte regular file extracts as an empty file (sanity).**
+///
+/// Pure sanity check that the size-0 edge case isn't swallowed by
+/// the size-limit / hardening branches. Many npm packages ship
+/// empty files (build artifacts, `.gitkeep`, `LICENSE` placeholders),
+/// so a regression that drops them would break real installs while
+/// passing all the malicious-tarball tests above.
+///
+/// Pin: install succeeds, the empty file lands at the expected path
+/// inside `node_modules/<pkg>/`, on-disk size is 0.
+#[tokio::test]
+async fn tarball_with_zero_byte_regular_file_extracts_as_empty_file() {
+    let tgz = tarball_with_extra_entries("empty-pkg", "1.0.0", |builder| {
+        let mut header = tar::Header::new_gnu();
+        header.set_size(0);
+        header.set_mode(0o644);
+        header.set_entry_type(tar::EntryType::Regular);
+        header.set_cksum();
+        builder
+            .append_data(&mut header, "package/empty.txt", std::io::empty())
+            .unwrap();
+    });
+
+    let mock = MockRegistry::start().await;
+    mock.with_package("empty-pkg", "1.0.0", &tgz).await;
+
+    let project = TempProject::empty(r#"{"name":"sec-test","version":"1.0.0"}"#);
+    let output = lpm_with_registry(&project, &mock.url())
+        .args(install_args("empty-pkg@1.0.0"))
+        .output()
+        .expect("run install");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    eprintln!(
+        "[Plan#9 zero-byte] status={:?}\nstderr:\n{stderr}",
+        output.status
+    );
+
+    assert!(
+        output.status.success(),
+        "install of zero-byte-member tarball failed — extractor's \
+         empty-file handling may have regressed.\nstderr:\n{stderr}"
+    );
+    assert!(
+        !stderr.contains("panicked at"),
+        "extractor panicked on zero-byte entry:\nstderr:\n{stderr}"
+    );
+
+    let extracted = project.path().join("node_modules/empty-pkg/empty.txt");
+    assert!(
+        extracted.exists(),
+        "expected the zero-byte file to extract at {extracted:?}"
+    );
+    let on_disk_size = std::fs::metadata(&extracted)
+        .expect("stat extracted empty file")
+        .len();
+    assert_eq!(
+        on_disk_size, 0,
+        "extracted empty file is not zero bytes — the extractor wrote \
+         garbage. on-disk size: {on_disk_size}"
+    );
+}
+
+/// **Plan #10 — entry path with a single 300-byte component fails cleanly.**
+///
+/// POSIX `NAME_MAX` is 255 on most filesystems (ext4/APFS/HFS+);
+/// Windows `MAX_PATH` is 260 by default. A single 300-byte path
+/// component exceeds NAME_MAX everywhere, so `std::fs::create_dir`
+/// (or `OpenOptions::open` for the leaf) returns an OS error
+/// (`ENAMETOOLONG` on Linux/macOS, `ERROR_FILENAME_EXCED_RANGE` on
+/// Windows). The extractor wraps this as `LpmError::Io(error)` →
+/// install fails with the OS message visible.
+///
+/// Pin the contract:
+/// - Install fails non-zero (no silent extraction at a corrupted path).
+/// - No panic (the OS error is wrapped, not unwrapped).
+/// - Stderr contains the long-name nature OR the generic IO error
+///   noun (long / name / file / directory / io / extraction / install).
+///
+/// **Why 300, not 4096:** the goal is to trip the per-component
+/// `NAME_MAX` (~255) ceiling, which most filesystems enforce
+/// uniformly. Trying to trip the per-path `PATH_MAX` (4096 on Linux,
+/// 1024 on macOS) would require deep nesting AND a long leaf,
+/// adding shape complexity for the same security signal.
+#[tokio::test]
+async fn tarball_with_single_path_component_exceeding_name_max_fails_cleanly() {
+    // 300-byte component name. Most filesystems cap at NAME_MAX=255;
+    // 300 trips the ceiling reliably.
+    let long_name: String = "a".repeat(300);
+    let entry_path = format!("package/{long_name}");
+
+    let tgz = tarball_with_extra_entries("longname-pkg", "1.0.0", |builder| {
+        let content = b"will-fail-on-create";
+        let mut header = tar::Header::new_gnu();
+        header.set_size(content.len() as u64);
+        header.set_mode(0o644);
+        header.set_entry_type(tar::EntryType::Regular);
+        header.set_cksum();
+        // append_data uses GNU long-name extension for paths longer
+        // than 100 bytes — the tar wire format succeeds; only the
+        // FILESYSTEM rejects on extraction.
+        builder
+            .append_data(&mut header, &entry_path, &content[..])
+            .expect("append long-name entry");
+    });
+
+    let mock = MockRegistry::start().await;
+    mock.with_package("longname-pkg", "1.0.0", &tgz).await;
+
+    let project = TempProject::empty(r#"{"name":"sec-test","version":"1.0.0"}"#);
+    let output = lpm_with_registry(&project, &mock.url())
+        .args(install_args("longname-pkg@1.0.0"))
+        .output()
+        .expect("run install");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    eprintln!(
+        "[Plan#10 long-path] status={:?}\nstderr:\n{stderr}\nstdout:\n{stdout}",
+        output.status
+    );
+
+    assert!(
+        !output.status.success(),
+        "install of 300-byte-component tarball reported success — \
+         the filesystem accepted a path beyond NAME_MAX, OR the \
+         extractor silently dropped the entry. Either is a contract \
+         break.\nstderr:\n{stderr}"
+    );
+    assert!(
+        !stderr.contains("panicked at") && !stderr.contains("note: run with `RUST_BACKTRACE"),
+        "extractor panicked on long-path entry:\nstderr:\n{stderr}"
+    );
+
+    // Stderr should name SOMETHING actionable. The extractor wraps
+    // the OS error as `LpmError::Io` → miette renders it with the
+    // original system message ("File name too long" / "filename
+    // exceeds maximum length"). The word list is broad to tolerate
+    // platform variance.
+    let stderr_l = stderr.to_lowercase();
+    let actionable = [
+        "long",
+        "name",
+        "filename",
+        "file name",
+        "exceed",
+        "directory",
+        "io error",
+        "io ",
+        "io)",
+        "extraction",
+        "extract",
+        "tarball",
+        "installation",
+        "install",
+    ]
+    .iter()
+    .any(|n| stderr_l.contains(n));
+    assert!(
+        actionable,
+        "long-path failure didn't surface an actionable noun. \
+         stderr:\n{stderr}"
+    );
+}
