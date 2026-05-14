@@ -872,9 +872,12 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         unit: true,
         integration: false,
         workflow: false,
-        cli_binary: false,
-        json_contract: false,
-        references: &["crates/lpm-cli/src/commands/approve_scripts.rs"],
+        cli_binary: true,
+        json_contract: true,
+        references: &[
+            "crates/lpm-cli/src/commands/approve_scripts.rs",
+            "crates/lpm-cli/tests/approve_scripts_interactive_tty.rs",
+        ],
     },
     SurfaceBaseline {
         id: 72,
