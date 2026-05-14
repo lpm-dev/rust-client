@@ -762,9 +762,11 @@ async fn run_under_store_lock(
     //   dropped (callers don't get to cross the user-config trust
     //   boundary with relative paths; only explicit absolute roots
     //   are meaningful here).
-    // Empty / absent → empty `Vec` → the sandbox validator skips
-    // the allowlist intersection (back-compat semantic pinned in
-    // phase48.md §6 "Gap 4 `sandboxWriteDirs` policy").
+    // Empty / absent → empty `Vec`. Pre-Phase-46.3 the validator
+    // skipped the allowlist intersection in this case (back-compat
+    // semantic pinned in phase48.md §6); Phase 46.3 flipped that to
+    // "no opt-in" so absolute `sandboxWriteDirs` entries outside
+    // `project_dir` now require an explicit covering root here.
     let max_write_roots: Vec<PathBuf> = crate::commands::config::GlobalConfig::load()
         .get_str_array("max-sandbox-write-roots")
         .unwrap_or_default()

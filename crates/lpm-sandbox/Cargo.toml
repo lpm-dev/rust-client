@@ -35,13 +35,27 @@ libc = "0.2"
 #   - Win32_Security_Authorization     SetNamedSecurityInfoW (mandatory
 #                                      label on allow-set dirs) +
 #                                      ConvertStringSidToSidW
-#   - Win32_Storage_FileSystem         FILE_GENERIC_* access masks (not
-#                                      strictly required for the IL path
-#                                      but kept available for the future
-#                                      AppContainer follow-up)
+#   - Win32_Security_Isolation         Phase 46.3 PR-2: AppContainer surface —
+#                                      CreateAppContainerProfile +
+#                                      DeriveAppContainerSidFromAppContainerName.
+#   - Win32_Storage_FileSystem         FILE_GENERIC_* access masks (used by
+#                                      the AppContainer DACL grants in
+#                                      `windows_appcontainer.rs` /
+#                                      `lpm-sandbox-helper`)
+#   - Win32_System_Console             Phase 46.3 PR-2: GetStdHandle +
+#                                      STD_INPUT_HANDLE / STD_OUTPUT_HANDLE /
+#                                      STD_ERROR_HANDLE for forwarding the
+#                                      helper's stdio to the AppContainer
+#                                      child via STARTUPINFOW.hStd*.
 #   - Win32_System_Threading           CREATE_SUSPENDED creation flag +
 #                                      OpenProcessToken (declared in this
-#                                      namespace by windows-sys)
+#                                      namespace by windows-sys). Phase
+#                                      46.3 PR-2 also relies on
+#                                      InitializeProcThreadAttributeList +
+#                                      UpdateProcThreadAttribute +
+#                                      CreateProcessW / STARTUPINFOEXW from
+#                                      this namespace for the AppContainer
+#                                      spawn dance in the helper binary.
 #   - Win32_System_JobObjects          CreateJobObjectW, SetInformationJobObject,
 #                                      AssignProcessToJobObject
 #
@@ -51,13 +65,18 @@ libc = "0.2"
 # in `src/windows.rs` and link against `ntdll.dll` via a `#[link]`
 # attribute on the extern block — same pattern as Sysinternals tools
 # and the Chromium sandbox use. The function has been stable since
-# Windows XP.
+# Windows XP. Phase 46.3 PR-2's helper does NOT use NtResumeProcess —
+# the helper owns `PROCESS_INFORMATION.hThread` directly (it calls
+# `CreateProcessW` itself instead of going through `Command::spawn`)
+# so it can use the documented `ResumeThread` API.
 [target.'cfg(target_os = "windows")'.dependencies]
 windows-sys = { version = "0.60", features = [
     "Win32_Foundation",
     "Win32_Security",
     "Win32_Security_Authorization",
+    "Win32_Security_Isolation",
     "Win32_Storage_FileSystem",
+    "Win32_System_Console",
     "Win32_System_Threading",
     "Win32_System_JobObjects",
 ] }
@@ -66,6 +85,13 @@ windows-sys = { version = "0.60", features = [
 tempfile = "3"
 dirs = { workspace = true }
 criterion = "0.5"
+# Phase 46.3 PR-2: helper-binary integration tests spawn
+# `lpm-sandbox-helper` via `assert_cmd::Command::cargo_bin`, which
+# consults `CARGO_BIN_EXE_<name>` so the bin is located in cargo's
+# test environment. Plain `Command::new("lpm-sandbox-helper")` would
+# not find it. Matches the pattern `tests/workflows/tests/support/`
+# already uses for `lpm-rs`.
+assert_cmd = "2"
 
 # Phase 46 P5 Chunk 5: per-spawn sandbox overhead. Establishes the
 # baseline before Chunk 6+ auto-execution lands; regressions in

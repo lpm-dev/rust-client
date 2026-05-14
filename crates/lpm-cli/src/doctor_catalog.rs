@@ -1172,6 +1172,29 @@ pub static SANDBOX_AVAILABLE: CheckEntry = CheckEntry {
     auto_fix: None,
 };
 
+/// Phase 46.3 PR-2 doctor surface (2026-05-13): on Windows, the
+/// `lpm-sandbox-helper.exe` companion binary that delivers
+/// AppContainer strict-mode (filesystem-write + outbound-network
+/// containment via WFP) is not located next to `lpm.exe`. The
+/// sandbox is still active via the Phase 46.2 Low IL fallback —
+/// filesystem-write is contained — but **strict mode is
+/// unreachable until the helper is restored**. Distinct catalog
+/// entry from [`SANDBOX_AVAILABLE`] so JSON consumers can detect
+/// the helper-missing case without prose parsing. Severity is
+/// `Warn`: containment is still active for default mode, but the
+/// user has lost the strict-mode upgrade path; reinstalling lpm
+/// restores it.
+pub static SANDBOX_HELPER_MISSING: CheckEntry = CheckEntry {
+    code: "sandbox_helper_missing",
+    name: "Sandbox",
+    category: Category::Sandbox,
+    description: "On Windows, the `lpm-sandbox-helper.exe` companion binary that delivers Phase 46.3 PR-2 AppContainer strict-mode (filesystem-write + outbound-network containment) is not located next to `lpm.exe`. The sandbox falls back to the Phase 46.2 Low IL backend, which contains filesystem writes but does NOT deny outbound network — so `--strict-sandbox` / `[sandbox] mode = \"strict\"` cannot be honored on this install.",
+    when_fires: "Windows host running a PR-2+ build of `lpm.exe` but missing the companion `lpm-sandbox-helper.exe` in the same directory. Typical causes: corrupted npm install of `@lpm-registry/cli-win32-x64`, manual binary fetch that skipped the helper, or running a dev build that didn't bundle the helper alongside the test binary.",
+    remediation: "Reinstall `@lpm-registry/cli` via your package manager to restore the helper, or set `LPM_SANDBOX_HELPER=<absolute path>` if the helper lives elsewhere on the host. To drop the strict request and silence this warning without restoring the helper, run `lpm config sandbox --set default`.",
+    possible_severities: &[Severity::Warn],
+    auto_fix: None,
+};
+
 /// Phase 46.1 doctor surface: strict mode is engaged but the host
 /// kernel forced the V1 fallback (landlock V1, filesystem-only — no
 /// outbound network denial). Distinct catalog entry from
@@ -1480,6 +1503,7 @@ pub static CLI_CATALOG: &[&CheckEntry] = &[
     &GLOBAL_INSTALL_ROOTS_UNHEALTHY,
     // Sandbox + script policy
     &SANDBOX_AVAILABLE,
+    &SANDBOX_HELPER_MISSING,
     &SANDBOX_DEGRADED,
     &SANDBOX_DISABLED_BY_USER,
     &SANDBOX_KERNEL_TOO_OLD,

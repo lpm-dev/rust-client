@@ -58,21 +58,42 @@ jobs:
       - name: Build
         run: cargo build --release --target ${{ matrix.target }} -p lpm-cli
 
+      # Phase 46.3 PR-2: the Windows runtime ships an additional
+      # binary, `lpm-sandbox-helper.exe`, that delivers AppContainer
+      # strict-mode (filesystem + outbound-network containment) by
+      # doing the `STARTUPINFOEXW` dance the stable Rust
+      # `std::process::Command` API doesn't expose. The release
+      # job builds it alongside `lpm-rs.exe` so they ship together
+      # in `npm/cli-win32-x64`. macOS / Linux builds skip this step:
+      # the helper is a Windows-only sandbox backend.
+      - name: Build sandbox helper (Windows)
+        if: runner.os == 'Windows'
+        run: cargo build --release --target ${{ matrix.target }} -p lpm-sandbox --bin lpm-sandbox-helper
+
       - name: Rename binary (Unix)
         if: runner.os != 'Windows'
         run: |
           cp target/${{ matrix.target }}/release/lpm-rs ${{ matrix.binary }}
           chmod +x ${{ matrix.binary }}
 
-      - name: Rename binary (Windows)
+      - name: Stage binaries (Windows)
         if: runner.os == 'Windows'
-        run: cp target/${{ matrix.target }}/release/lpm-rs.exe ${{ matrix.binary }}
+        run: |
+          cp target/${{ matrix.target }}/release/lpm-rs.exe ${{ matrix.binary }}
+          cp target/${{ matrix.target }}/release/lpm-sandbox-helper.exe lpm-sandbox-helper-win32-x64.exe
 
       - name: Upload artifact
         uses: actions/upload-artifact@v5
         with:
           name: ${{ matrix.binary }}
           path: ${{ matrix.binary }}
+
+      - name: Upload helper artifact (Windows)
+        if: runner.os == 'Windows'
+        uses: actions/upload-artifact@v5
+        with:
+          name: lpm-sandbox-helper-win32-x64.exe
+          path: lpm-sandbox-helper-win32-x64.exe
 
   release:
     name: Create Release
@@ -146,10 +167,12 @@ jobs:
             cd ../..
           done
 
-          # Windows (different binary name)
+          # Windows (different binary name + bundled helper for
+          # Phase 46.3 PR-2 AppContainer strict-mode).
           echo "Publishing @lpm-registry/cli-win32-x64@${VERSION}..."
           cd npm/cli-win32-x64
           cp ../../binaries/lpm-win32-x64.exe ./lpm.exe
+          cp ../../binaries/lpm-sandbox-helper-win32-x64.exe ./lpm-sandbox-helper.exe
           npm version "$VERSION" --no-git-tag-version --allow-same-version
           publish_pkg
 
