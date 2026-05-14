@@ -742,6 +742,161 @@ async fn install_after_killed_install_converges_on_retry() {
     );
 }
 
+/// **B.3 — SIGKILL never leaves a torn `lpm.lock` on disk.**
+///
+/// The install pipeline removes the pre-existing `lpm.lock` at
+/// [install.rs:10871-10873](../../../crates/lpm-cli/src/commands/install.rs) before re-resolving, so SIGKILL during
+/// the fetch+link phase trivially leaves `lpm.lock` absent. The
+/// interesting case is the post-resolve / pre-commit window where
+/// the pipeline has written a freshly-resolved `lpm.lock` but the
+/// `ManifestTransaction` hasn't committed yet.
+///
+/// Reaching that window deterministically requires a slow link phase,
+/// which we can't induce from outside the binary. Instead, the test
+/// covers the WEAKER (but still load-bearing) contract: across many
+/// kill points, `lpm.lock` is never torn — it is either ABSENT or
+/// parses as TOML. We exercise the harness's two natural kill windows
+/// (fresh project + post-fetch project) and assert the contract in
+/// each.
+///
+/// Companion to B.1 (no install-hash) and B.2 (next install
+/// converges). All three together pin the SIGKILL recovery story.
+#[tokio::test]
+async fn install_killed_mid_pipeline_leaves_well_formed_or_absent_lockfile() {
+    let mock = MockRegistry::start().await;
+    let tarball = make_tarball("torn-lock-pkg", "1.0.0");
+    with_delayed_package(
+        &mock,
+        "torn-lock-pkg",
+        "1.0.0",
+        tarball,
+        Duration::from_millis(2000),
+    )
+    .await;
+    mock.with_batch_metadata(vec![single_version_batch_metadata(
+        "torn-lock-pkg",
+        "1.0.0",
+        &mock.url(),
+    )])
+    .await;
+
+    let project = TempProject::empty(r#"{"name":"torn-lock-test","version":"1.0.0"}"#);
+
+    // KILL WINDOW 1: fresh project (no pre-existing lpm.lock).
+    let mut first = lpm_spawnable_with_registry(&project, &mock.url())
+        .args(install_args_with(&["torn-lock-pkg@1.0.0"]))
+        .spawn()
+        .expect("spawn first install");
+    let store_lock_path = project.home().join(".lpm").join("store").join(".gc.lock");
+    assert!(
+        wait_until(Duration::from_secs(10), || {
+            store_lock_path.exists()
+                && matches!(
+                    lpm_common::try_with_exclusive_lock(&store_lock_path, || Ok(())),
+                    Ok(None)
+                )
+        }),
+        "first install never acquired shared store_lock"
+    );
+    std::thread::sleep(Duration::from_millis(200));
+    first.kill().expect("kill first install");
+    let _ = wait_with_timeout(&mut first, Duration::from_secs(5));
+    let _ = read_remaining_output(first);
+
+    assert_lockfile_well_formed_or_absent(project.path(), "after kill window 1 (fresh project)");
+
+    // KILL WINDOW 2: project with a committed lpm.lock from a prior
+    // successful install. Re-mount the same package without delay so
+    // the prior install completes cleanly, THEN race a new install
+    // that adds a different package.
+    mock.with_package(
+        "torn-lock-pkg",
+        "1.0.0",
+        &make_tarball("torn-lock-pkg", "1.0.0"),
+    )
+    .await;
+    let prep = lpm_with_registry(&project, &mock.url())
+        .args(install_args_with(&["torn-lock-pkg@1.0.0"]))
+        .output()
+        .expect("run prep install");
+    assert!(
+        prep.status.success(),
+        "kill-window-2 setup: prep install failed: {}",
+        String::from_utf8_lossy(&prep.stderr)
+    );
+    assert!(
+        project.path().join("lpm.lock").exists(),
+        "kill-window-2 setup: prep install didn't produce a lpm.lock"
+    );
+
+    let second_pkg = make_tarball_from_pkg_json(
+        serde_json::json!({"name":"torn-lock-pkg-2","version":"1.0.0"}),
+        &[],
+    );
+    with_delayed_package(
+        &mock,
+        "torn-lock-pkg-2",
+        "1.0.0",
+        second_pkg,
+        Duration::from_millis(2000),
+    )
+    .await;
+    mock.with_batch_metadata(vec![single_version_batch_metadata(
+        "torn-lock-pkg-2",
+        "1.0.0",
+        &mock.url(),
+    )])
+    .await;
+
+    let mut second = lpm_spawnable_with_registry(&project, &mock.url())
+        .args(install_args_with(&["torn-lock-pkg-2@1.0.0"]))
+        .spawn()
+        .expect("spawn second install");
+    assert!(
+        wait_until(Duration::from_secs(10), || {
+            store_lock_path.exists()
+                && matches!(
+                    lpm_common::try_with_exclusive_lock(&store_lock_path, || Ok(())),
+                    Ok(None)
+                )
+        }),
+        "second install never acquired shared store_lock"
+    );
+    std::thread::sleep(Duration::from_millis(200));
+    second.kill().expect("kill second install");
+    let _ = wait_with_timeout(&mut second, Duration::from_secs(5));
+    let _ = read_remaining_output(second);
+
+    assert_lockfile_well_formed_or_absent(
+        project.path(),
+        "after kill window 2 (project had committed lpm.lock)",
+    );
+}
+
+fn assert_lockfile_well_formed_or_absent(project_dir: &std::path::Path, context: &str) {
+    let lockfile = project_dir.join("lpm.lock");
+    if !lockfile.exists() {
+        return; // (a) absent — contract satisfied
+    }
+    let bytes = std::fs::read(&lockfile)
+        .unwrap_or_else(|e| panic!("{context}: failed to read existing lpm.lock: {e}"));
+    let text = std::str::from_utf8(&bytes).unwrap_or_else(|e| {
+        panic!(
+            "{context}: lpm.lock present but not valid UTF-8: {e}\n\
+             First 64 bytes hex: {:?}",
+            &bytes[..bytes.len().min(64)]
+        )
+    });
+    // (b) parses as TOML — contract satisfied
+    let _: toml::Value = toml::from_str(text).unwrap_or_else(|e| {
+        panic!(
+            "{context}: lpm.lock present but not parseable as TOML — \
+             SIGKILL left a torn lockfile on disk.\n\
+             Parse error: {e}\nFull contents:\n{text}"
+        )
+    });
+}
+
 // ─── Category C — Network faults ────────────────────────────────────
 
 /// **C.4 — metadata 404 fails immediately, no retry.**
@@ -1356,6 +1511,132 @@ async fn lpm_command_after_torn_wal_tail_recovers_silently() {
         !second_stderr.contains("global recovery: rolled")
             && !second_stderr.contains("global recovery: orphan"),
         "WAL still torn after recovery hook ran — recovery not idempotent:\n{second_stderr}"
+    );
+}
+
+/// **F.2 — dispatcher's recovery hook skips when another lpm holds `global_tx_lock`.**
+///
+/// Validates the `try_with_exclusive_lock` idempotent-skip path at
+/// [main.rs:2531](../../../crates/lpm-cli/src/main.rs). When recovery would otherwise fire
+/// (torn WAL present), but another `lpm` process is already inside a
+/// global transaction, the dispatcher must `Ok(None)` out of the
+/// non-blocking lock attempt and let the holder run its own recovery
+/// on commit/exit.
+///
+/// Test shape:
+///   1. Plant a torn WAL (3 garbage bytes, same shape as F.1).
+///   2. Hold `global_tx_lock` in a background thread via
+///      `lpm_common::with_exclusive_lock`.
+///   3. Run `lpm global list` — must succeed, WAL must STILL be 3
+///      bytes (proof: skip path fired, recovery did NOT run).
+///   4. Release the lock.
+///   5. Run `lpm global list` again — recovery now fires, WAL is
+///      truncated past the torn bytes.
+///
+/// Steps 3 and 5 together prove both branches of the
+/// `try_with_exclusive_lock` arm: the skip when contended, the run
+/// when free.
+#[tokio::test]
+async fn lpm_command_skips_recovery_when_another_lpm_holds_global_tx_lock() {
+    let project = TempProject::empty(r#"{"name":"skip-test","version":"1.0.0"}"#);
+
+    // Plant the torn WAL bytes.
+    let global_dir = project.home().join(".lpm/global");
+    std::fs::create_dir_all(&global_dir).expect("mkdir ~/.lpm/global");
+    let wal_path = global_dir.join("wal.jsonl");
+    std::fs::write(&wal_path, b"\x00\x00\x00").expect("seed torn WAL");
+
+    // Hold `global_tx_lock` in a background thread. The thread blocks
+    // on a channel until the test signals release, so the lock is held
+    // for the entire duration of the `lpm global list` invocation
+    // below.
+    let global_tx_lock_path = global_dir.join(".tx.lock");
+    let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+    let (acquired_tx, acquired_rx) = std::sync::mpsc::channel::<()>();
+    let lock_path_for_thread = global_tx_lock_path.clone();
+    let lock_thread = std::thread::spawn(move || {
+        lpm_common::with_exclusive_lock(&lock_path_for_thread, || {
+            // Signal "lock acquired" before parking on the release channel.
+            acquired_tx.send(()).ok();
+            // Block until the main thread releases.
+            release_rx.recv().ok();
+            Ok::<(), lpm_common::LpmError>(())
+        })
+    });
+
+    // Wait until the background thread confirms it holds the lock.
+    acquired_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("background thread never acquired global_tx_lock");
+
+    // Sanity: a non-blocking exclusive try MUST observe the lock held.
+    assert!(
+        matches!(
+            lpm_common::try_with_exclusive_lock(&global_tx_lock_path, || Ok(())),
+            Ok(None)
+        ),
+        "test setup: background thread reported lock acquired but \
+         try_with_exclusive_lock didn't see it as held"
+    );
+
+    let pre_wal_size = std::fs::metadata(&wal_path).unwrap().len();
+    assert_eq!(pre_wal_size, 3, "test setup: WAL should be 3 bytes pre-run");
+
+    // Run `lpm global list` — dispatcher's recovery hook should hit
+    // `WouldBlock` on its try_with_exclusive_lock and skip silently.
+    let output = lpm(&project)
+        .args(["global", "list"])
+        .output()
+        .expect("run global list");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success(),
+        "global list failed while another lpm held global_tx_lock:\n\
+         stdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(
+        !stderr.contains("global recovery: rolled") && !stderr.contains("global recovery: orphan"),
+        "recovery banner fired even though another lpm held \
+         global_tx_lock — dispatcher's try_with_exclusive_lock skip \
+         path is not being taken.\nstderr:\n{stderr}"
+    );
+
+    // Critical proof: the torn WAL bytes are STILL there. Recovery
+    // did not run. If they're gone, the dispatcher proceeded with
+    // recovery despite the lock being held — a correctness bug in
+    // the `try_with_exclusive_lock` arm.
+    let mid_wal_size = std::fs::metadata(&wal_path).map(|m| m.len()).unwrap_or(0);
+    assert_eq!(
+        mid_wal_size, 3,
+        "WAL was modified while another lpm held global_tx_lock — \
+         dispatcher's recovery hook ran the recovery code despite \
+         the lock contention skip arm. Pre={pre_wal_size} mid={mid_wal_size}."
+    );
+
+    // Release the background lock and let the thread finish.
+    release_tx.send(()).ok();
+    lock_thread
+        .join()
+        .expect("lock thread panicked")
+        .expect("lock thread reported error");
+
+    // Now run again — recovery should fire (lock is free) and the
+    // torn bytes should be cleaned up.
+    let after_release = lpm(&project)
+        .args(["global", "list"])
+        .output()
+        .expect("run global list after lock release");
+    assert!(
+        after_release.status.success(),
+        "post-release global list failed: stderr={}",
+        String::from_utf8_lossy(&after_release.stderr)
+    );
+    let post_wal_size = std::fs::metadata(&wal_path).map(|m| m.len()).unwrap_or(0);
+    assert_ne!(
+        post_wal_size, 3,
+        "after the lock-holder released, recovery still didn't run — \
+         the dispatcher hook is broken in BOTH arms."
     );
 }
 
