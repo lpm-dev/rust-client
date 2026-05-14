@@ -107,7 +107,7 @@ async fn offline_install_capability_round_trip_end_to_end() {
                 "name": "phase48-roundtrip",
                 "version": "1.0.0",
                 "dist": {
-                    "tarball": format!("{}/tarballs/phase48-roundtrip-1.0.0.tgz", mock.url()),
+                    "tarball": format!("{}/tarballs/phase48-roundtrip/-/phase48-roundtrip-1.0.0.tgz", mock.url()),
                     "integrity": "sha512-placeholder"
                 },
                 "scripts": { "postinstall": "tsc" },

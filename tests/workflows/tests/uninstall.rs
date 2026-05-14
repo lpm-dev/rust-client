@@ -207,7 +207,7 @@ async fn uninstall_after_real_install_removes_isolated_symlink() {
                 "name": "real-installed",
                 "version": "1.0.0",
                 "dist": {
-                    "tarball": format!("{}/tarballs/real-installed-1.0.0.tgz", mock.url()),
+                    "tarball": format!("{}/tarballs/real-installed/-/real-installed-1.0.0.tgz", mock.url()),
                     "integrity": support::mock_registry::compute_integrity(&tarball),
                 },
                 "dependencies": {}
@@ -270,7 +270,7 @@ async fn uninstall_after_real_install_removes_hoisted_directory() {
                 "name": "real-hoisted",
                 "version": "1.0.0",
                 "dist": {
-                    "tarball": format!("{}/tarballs/real-hoisted-1.0.0.tgz", mock.url()),
+                    "tarball": format!("{}/tarballs/real-hoisted/-/real-hoisted-1.0.0.tgz", mock.url()),
                     "integrity": support::mock_registry::compute_integrity(&tarball),
                 },
                 "dependencies": {}

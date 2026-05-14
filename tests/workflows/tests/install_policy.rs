@@ -43,7 +43,7 @@ async fn mount_scripted_pkg(mock: &MockRegistry, name: &str) {
                 "version": "1.0.0",
                 "scripts": { "postinstall": "node -e \"process.exit(0)\"" },
                 "dist": {
-                    "tarball": format!("{}/tarballs/{name}-1.0.0.tgz", mock.url()),
+                    "tarball": format!("{}/tarballs/{name}/-/{name}-1.0.0.tgz", mock.url()),
                     "integrity": compute_integrity(&tarball),
                 },
                 "dependencies": {}

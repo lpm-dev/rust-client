@@ -118,7 +118,7 @@ async fn install_one_with_pkg_json(
                 "name": pkg,
                 "version": "1.0.0",
                 "dist": {
-                    "tarball": format!("{}/tarballs/{pkg}-1.0.0.tgz", mock.url()),
+                    "tarball": format!("{}/tarballs/{pkg}/-/{pkg}-1.0.0.tgz", mock.url()),
                     "integrity": support::mock_registry::compute_integrity(&tarball),
                 },
                 "dependencies": {}

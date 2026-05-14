@@ -688,11 +688,54 @@ impl MockRegistry {
         self
     }
 
+    /// **Production-shaped tarball URL path for a given `name@version`.**
+    ///
+    /// Returns the path-only portion (leading `/`); callers prepend the
+    /// registry origin. **All mock-registry tarball mounts and metadata
+    /// `dist.tarball` URLs MUST use this shape.**
+    ///
+    /// Shape: `/tarballs/{name}/-/{name}-{version}.tgz` — keeps the
+    /// mock-specific `/tarballs/` routing prefix while inserting the
+    /// `/-/` segment that the registry-client's `evaluate_cached_url`
+    /// gate at [crates/lpm-registry/src/client.rs::evaluate_cached_url](../../../crates/lpm-registry/src/client.rs)
+    /// requires (`.tgz` suffix AND `/-/` substring). The gate blocks
+    /// the H1 auth-token leak: a tampered lockfile pointing at
+    /// `/api/admin/foo.tgz` (no `/-/`) would otherwise attach the
+    /// bearer to a non-registry endpoint.
+    ///
+    /// **Why this exists:** prior workflow tests used
+    /// `/tarballs/{name}-{version}.tgz` (no `/-/`). The gate rejected
+    /// every cached lockfile URL written by those tests and emitted
+    /// `WARN cached tarball URL for X@Y failed shape check; falling
+    /// back to on-demand lookup` on every offline-install test run.
+    /// In test environments the install converged anyway (the mock
+    /// happily served the on-demand re-lookup), but the WARN noise
+    /// polluted every install test's stderr AND the `shape_mismatch`
+    /// counter — documented as "BUG signal — the writer should never
+    /// emit a gate-rejectable URL" — fired on every test run, making
+    /// the counter useless for catching real bugs. See
+    /// `private/test-coverage-followup-plan.md` ("offline-install
+    /// observation, 2026-05-14") for the full investigation.
+    ///
+    /// **Future tests:** use this helper, or inline the same shape
+    /// (`/tarballs/{name}/-/{name}-{version}.tgz`). Do NOT re-introduce
+    /// the legacy `/tarballs/{name}-{version}.tgz` shape — it trips
+    /// the gate and degrades the workflow-tier signal-to-noise.
+    pub fn tarball_path(name: &str, version: &str) -> String {
+        format!("/tarballs/{name}/-/{name}-{version}.tgz")
+    }
+
+    /// Convenience: full tarball URL with the server origin prepended.
+    /// Equivalent to `format!("{}{}", mock.url(), MockRegistry::tarball_path(name, version))`.
+    pub fn tarball_url(&self, name: &str, version: &str) -> String {
+        format!("{}{}", self.server.uri(), Self::tarball_path(name, version))
+    }
+
     /// Mount a package metadata endpoint for a simple npm package (no deps).
     ///
     /// Mounts:
     /// - `GET /api/registry/{name}` — npm-compatible metadata with single version
-    /// - `GET /tarballs/{name}-{version}.tgz` — tarball download
+    /// - `GET /tarballs/{name}/-/{name}-{version}.tgz` — tarball download (production-shaped per [`tarball_path`](Self::tarball_path))
     ///
     /// Also mounts on the unscoped path variant that the resolver uses.
     pub async fn with_package(&self, name: &str, version: &str, tarball_bytes: &[u8]) -> &Self {
@@ -708,7 +751,7 @@ impl MockRegistry {
         tarball_bytes: &[u8],
         dependencies: serde_json::Value,
     ) -> &Self {
-        let tarball_url = format!("{}/tarballs/{name}-{version}.tgz", self.server.uri());
+        let tarball_url = self.tarball_url(name, version);
 
         // Compute real sha512 integrity for the tarball
         let integrity = compute_integrity(tarball_bytes);
@@ -753,7 +796,7 @@ impl MockRegistry {
             .await;
 
         // Mount tarball endpoint
-        let tarball_path = format!("/tarballs/{name}-{version}.tgz");
+        let tarball_path = Self::tarball_path(name, version);
         Mock::given(method("GET"))
             .and(path(&tarball_path))
             .respond_with(
@@ -782,7 +825,7 @@ impl MockRegistry {
         tarball_bytes: &[u8],
         published_at: &str,
     ) -> &Self {
-        let tarball_url = format!("{}/tarballs/{name}-{version}.tgz", self.server.uri());
+        let tarball_url = self.tarball_url(name, version);
         let integrity = compute_integrity(tarball_bytes);
 
         let metadata = serde_json::json!({
@@ -815,7 +858,7 @@ impl MockRegistry {
             .mount(&self.server)
             .await;
 
-        let tarball_path = format!("/tarballs/{name}-{version}.tgz");
+        let tarball_path = Self::tarball_path(name, version);
         Mock::given(method("GET"))
             .and(path(&tarball_path))
             .respond_with(
@@ -867,7 +910,7 @@ impl MockRegistry {
         let mut times_map = serde_json::Map::new();
 
         for (v, deps, bytes_opt) in versions {
-            let tarball_url = format!("{}/tarballs/{name}-{v}.tgz", self.server.uri());
+            let tarball_url = self.tarball_url(name, v);
             let integrity = match bytes_opt {
                 Some(bytes) => compute_integrity(bytes),
                 // Synthetic integrity for the missing-tarball case —
@@ -894,7 +937,7 @@ impl MockRegistry {
                 serde_json::Value::String("2025-01-01T00:00:00.000Z".into()),
             );
 
-            let tarball_path = format!("/tarballs/{name}-{v}.tgz");
+            let tarball_path = Self::tarball_path(name, v);
             let response = match bytes_opt {
                 Some(bytes) => ResponseTemplate::new(200)
                     .set_body_bytes(bytes.clone())

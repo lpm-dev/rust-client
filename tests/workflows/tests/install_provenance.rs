@@ -106,7 +106,7 @@ fn package_metadata(
     tarball: &[u8],
     attestations: Option<serde_json::Value>,
 ) -> serde_json::Value {
-    let tarball_url = format!("{registry_url}/tarballs/{PKG}-{version}.tgz");
+    let tarball_url = format!("{registry_url}/tarballs/{PKG}/-/{PKG}-{version}.tgz");
     let integrity = support::mock_registry::compute_integrity(tarball);
     let mut dist = serde_json::json!({ "tarball": tarball_url, "integrity": integrity });
     if let Some(att) = attestations {
@@ -183,7 +183,7 @@ async fn mount_package_version(mock: &MockRegistry, version: &str, shape: Attest
         .await;
 
     Mock::given(method("GET"))
-        .and(path(format!("/tarballs/{PKG}-{version}.tgz")))
+        .and(path(format!("/tarballs/{PKG}/-/{PKG}-{version}.tgz")))
         .respond_with(
             ResponseTemplate::new(200)
                 .set_body_bytes(tarball.clone())
