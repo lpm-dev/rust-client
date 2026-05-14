@@ -16,14 +16,28 @@
 //!    contract: exit code mirrors the envelope's `success` field on
 //!    every supported path.
 //!
-//! Repro uses `lpm --json approve-scripts --group` (without
-//! `--global`) — a representative early-error path that:
-//! - Lives in a match arm before the command's own JSON branch.
-//! - Hits a synchronous `return Err(LpmError::Script(...))` path that
-//!   pre-fix carried a `.into_diagnostic()` short-circuit to miette.
-//! - Requires no network, store state, or workspace seeding beyond a
-//!   bare `package.json` — so the envelope assertion is uncontaminated
-//!   by unrelated initialisation paths.
+//! The outer `async {}.await` fix is structurally universal (it covers
+//! every arm at once), but a future refactor that accidentally
+//! reintroduces a `.into_diagnostic()?` inside a single arm body would
+//! silently regress that arm only. To catch that shape, the matrix
+//! below exercises three distinct early-error paths covering three
+//! mutually-exclusive arms:
+//!
+//! - `approve-scripts --group` — `return Err(LpmError::Script(...))`
+//!   from an explicit early-return inside the ApproveScripts arm body.
+//! - `install --policy=invalid` — `?` early-exit through
+//!   `.map_err(LpmError::Script)?` from the policy-parse helper,
+//!   inside the Install arm body. Finding #76 named this as a known
+//!   pre-fix-failing path.
+//! - `use --pin` (without a spec) — explicit `return Err` via
+//!   `.ok_or_else(|| LpmError::Script(...))?` from inside the Use arm
+//!   body, which was flattened from a per-arm `async {}.await` wrap
+//!   to the outer wrap (finding A); this case proves the outer wrap
+//!   handles flattened arms correctly.
+//!
+//! All three need only a bare `package.json` and no network, so the
+//! envelope assertion is uncontaminated by unrelated initialisation
+//! paths.
 
 mod common;
 
@@ -46,92 +60,147 @@ fn isolated_project_with_package_json() -> (TempDir, TempDir) {
     (project, lpm_home)
 }
 
-/// **Finding #76 contract.** `lpm --json approve-scripts --group`
-/// (without `--global`) takes a `return Err(LpmError::Script(...))`
-/// branch inside the match arm body. Pre-fix, this propagated to
-/// `async_main`'s outer `Result<(), miette::Report>` and surfaced as a
-/// colored miette block on stderr, with no JSON on stdout. Post-fix,
-/// the entire dispatch sits inside an outer `async { ... }.await`
-/// returning `Result<(), LpmError>`, so the error becomes the value of
-/// `result` and the top-level `--json` envelope handler renders it.
-#[test]
-fn json_dispatch_early_error_emits_envelope_on_stdout() {
-    let (project, lpm_home) = isolated_project_with_package_json();
-    let (status, stdout, stderr) = run_lpm(
-        project.path(),
-        lpm_home.path(),
-        None,
-        &["--json", "approve-scripts", "--group"],
-    );
-
-    assert!(
-        !status.success(),
-        "early-error `--json` path must exit non-zero (got status={status:?}, stderr={stderr:?})",
-    );
-
-    let envelope = parse_json_stdout(&stdout);
-    assert_eq!(
-        envelope["success"],
-        serde_json::json!(false),
-        "envelope must carry success=false; full envelope={envelope}",
-    );
-    let error_msg = envelope["error"]
-        .as_str()
-        .expect("envelope must carry an `error` string field");
-    assert!(
-        error_msg.contains("--group") && error_msg.contains("--global"),
-        "envelope `error` must surface the actual validator message \
-         ({error_msg:?}) — pre-fix this was lost to miette stderr",
-    );
-    assert_eq!(
-        envelope["error_code"],
-        serde_json::json!("script"),
-        "envelope must carry the LpmError::Script error code so agents \
-         can branch on it; full envelope={envelope}",
-    );
+/// One row of the matrix below. Each row pins both contracts (#76
+/// envelope universality, #73 exit-code mirror) on one arm-body
+/// shape that the outer-wrap fix must handle uniformly.
+struct DispatchCase {
+    /// Stable identifier surfaced in assertion failure messages — the
+    /// arm under test, NOT the full argv. Reading `dispatch_case = Use`
+    /// in a CI log immediately points the next maintainer at the
+    /// flattened Use arm in `main.rs`.
+    arm: &'static str,
+    args: &'static [&'static str],
+    /// Substrings the envelope's `error` field MUST contain. We don't
+    /// pin the full message because output wording changes with locale
+    /// and helper-text updates; we pin the load-bearing tokens
+    /// (flag names, validator nouns) that name the actual failure mode.
+    expected_error_substrs: &'static [&'static str],
+    /// The `error_code` enum tag — `LpmError::error_code()` shape.
+    /// Every case below is `LpmError::Script`, so the tag is "script";
+    /// pinning it ensures the routing predicate in main.rs
+    /// (`matches!(e, ExitCode(_))`) doesn't accidentally swallow this
+    /// variant into a generic "internal" classification.
+    expected_error_code: &'static str,
 }
 
-/// **Finding #73 contract.** When stdout carries a
-/// `success: false` envelope, exit code MUST be `1`. Pre-fix, the
-/// `?`-early-exit paths that bypassed the envelope also bypassed the
-/// exit-code mirror at the bottom of `async_main` — leaving CI
-/// scripts that branch on `$?` after `lpm --json …` to silently miss
-/// the failure encoded inside the envelope. The contract pinned
-/// here is the precise direction of the mirror: not just
-/// "non-zero", but specifically `1`, because that's what every
-/// supported `LpmError` variant maps to under the top-level handler
-/// (the only exception is `LpmError::ExitCode(code)`, which skips
-/// the envelope path entirely so a command that already wrote its
-/// own structured doc can carry an arbitrary code through).
+const CASES: &[DispatchCase] = &[
+    // ApproveScripts arm: explicit `return Err(LpmError::Script(...))`
+    // path inside the arm body. Pre-finding-#76 this was lost to
+    // miette stderr.
+    DispatchCase {
+        arm: "ApproveScripts",
+        args: &["--json", "approve-scripts", "--group"],
+        expected_error_substrs: &["--group", "--global"],
+        expected_error_code: "script",
+    },
+    // Install arm: `?` early-exit through `.map_err(LpmError::Script)?`
+    // from `collapse_policy_flags`. Finding #76 named this as a
+    // verified pre-fix-failing path.
+    DispatchCase {
+        arm: "Install",
+        args: &["--json", "install", "--policy=invalid"],
+        expected_error_substrs: &["--policy", "invalid"],
+        expected_error_code: "script",
+    },
+    // Use arm: `return Err` via `.ok_or_else()?` from the `--pin
+    // (no-spec)` branch. Tests the flattened Use arm specifically —
+    // finding A removed its per-arm `async {}.await` wrap so the
+    // outer wrap is now the sole envelope route for this arm.
+    DispatchCase {
+        arm: "Use",
+        args: &["--json", "use", "--pin"],
+        expected_error_substrs: &["missing version", "lpm use --pin"],
+        expected_error_code: "script",
+    },
+];
+
+/// **Finding #76 contract.** Every `lpm --json <cmd>` whose arm body
+/// errors before reaching the command's own JSON-output branch must
+/// still emit a structured envelope on stdout. The matrix below
+/// exercises three distinct arm-body shapes (explicit `return Err`,
+/// `.map_err(...)?`, `.ok_or_else()?`) across three arms.
 ///
-/// The companion `json_dispatch_early_error_emits_envelope_on_stdout`
-/// test above asserts `!status.success()`. This one tightens the
-/// guarantee: it must be `Some(1)`, not just non-zero — so a future
-/// regression that accidentally exits 2 (clap's
-/// missing-arg semantics) or 101 (panic) on this path also fails the
-/// test.
+/// The outer `async { match command { ... } }.await` wrap covers all
+/// 38 arms by construction; running three rows here catches a
+/// regression where someone accidentally reintroduces a
+/// `.into_diagnostic()?` inside one arm's body — the wrap stays
+/// intact, but THAT arm silently bypasses the envelope handler.
+#[test]
+fn json_dispatch_early_error_emits_envelope_on_stdout() {
+    for case in CASES {
+        let (project, lpm_home) = isolated_project_with_package_json();
+        let (status, stdout, stderr) = run_lpm(project.path(), lpm_home.path(), None, case.args);
+
+        assert!(
+            !status.success(),
+            "case={}: early-error `--json` path must exit non-zero \
+             (got status={status:?}, stderr={stderr:?})",
+            case.arm,
+        );
+
+        let envelope = parse_json_stdout(&stdout);
+        assert_eq!(
+            envelope["success"],
+            serde_json::json!(false),
+            "case={}: envelope must carry success=false; full envelope={envelope}",
+            case.arm,
+        );
+
+        let error_msg = envelope["error"]
+            .as_str()
+            .unwrap_or_else(|| panic!("case={}: envelope must carry an `error` string", case.arm));
+        for needle in case.expected_error_substrs {
+            assert!(
+                error_msg.contains(needle),
+                "case={}: envelope `error` must surface the actual \
+                 validator message — needle {needle:?} not in {error_msg:?}",
+                case.arm,
+            );
+        }
+
+        assert_eq!(
+            envelope["error_code"],
+            serde_json::json!(case.expected_error_code),
+            "case={}: envelope must carry the expected error code; full envelope={envelope}",
+            case.arm,
+        );
+    }
+}
+
+/// **Finding #73 contract.** When stdout carries `success: false`,
+/// exit code MUST be `1` — not just non-zero. Pre-fix, the
+/// `?`-early-exit paths that bypassed the envelope also bypassed the
+/// exit-code mirror at the bottom of `async_main`. The contract
+/// pinned here is the precise direction of the mirror: every
+/// supported `LpmError` variant maps to 1 under the top-level handler
+/// (the only exception is `LpmError::ExitCode(code)`, which skips the
+/// envelope so a command that already wrote its own structured doc
+/// can carry an arbitrary code through).
+///
+/// Tightens the companion test above: code 2 (clap missing-arg) or
+/// 101 (panic) also fail this assertion, so a future regression that
+/// silently degrades the exit shape is caught.
 #[test]
 fn json_envelope_failure_exit_code_mirrors_success_field() {
-    let (project, lpm_home) = isolated_project_with_package_json();
-    let (status, stdout, stderr) = run_lpm(
-        project.path(),
-        lpm_home.path(),
-        None,
-        &["--json", "approve-scripts", "--group"],
-    );
+    for case in CASES {
+        let (project, lpm_home) = isolated_project_with_package_json();
+        let (status, stdout, stderr) = run_lpm(project.path(), lpm_home.path(), None, case.args);
 
-    let envelope = parse_json_stdout(&stdout);
-    assert_eq!(
-        envelope["success"],
-        serde_json::json!(false),
-        "precondition: envelope must report failure on this path \
-         (stderr={stderr:?})",
-    );
-    assert_eq!(
-        status.code(),
-        Some(1),
-        "envelope success=false must mirror to exit code 1 \
-         (got code={:?}, full envelope={envelope}, stderr={stderr:?})",
-        status.code(),
-    );
+        let envelope = parse_json_stdout(&stdout);
+        assert_eq!(
+            envelope["success"],
+            serde_json::json!(false),
+            "case={}: precondition: envelope must report failure on this path \
+             (stderr={stderr:?})",
+            case.arm,
+        );
+        assert_eq!(
+            status.code(),
+            Some(1),
+            "case={}: envelope success=false must mirror to exit code 1 \
+             (got code={:?}, full envelope={envelope}, stderr={stderr:?})",
+            case.arm,
+            status.code(),
+        );
+    }
 }

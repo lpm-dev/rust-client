@@ -34,6 +34,7 @@
 
 mod support;
 
+use support::build_state::seed_global_install_blocked_state_with_real_hash;
 use support::mock_registry::{MockRegistry, compute_integrity, make_tarball_from_pkg_json};
 use support::{TempProject, lpm, lpm_with_registry};
 
@@ -322,8 +323,12 @@ fn assert_global_install_json_success(
 }
 
 /// Seed a global manifest + per-install build-state so
-/// `approve-scripts --global --yes` has rows to act on.
-fn write_global_install_blocked_state(
+/// `approve-scripts --global --yes` has rows to act on. The
+/// build-state row's `script_hash` is the real
+/// `compute_script_hash`-derived value (finding D); the manifest is
+/// the minimal `lpm_global::write_for` shape inlined here because no
+/// shared helper exists for the manifest side.
+fn seed_global_manifest_and_blocked_state(
     project: &TempProject,
     top_level: &str,
     top_level_version: &str,
@@ -346,30 +351,13 @@ commands = []
 "#
     );
     std::fs::write(global_root.join("manifest.toml"), toml).unwrap();
-    let install_lpm = global_root
-        .join("installs")
-        .join(format!("{top_level}@{top_level_version}"))
-        .join(".lpm");
-    std::fs::create_dir_all(&install_lpm).unwrap();
-    let body = format!(
-        r#"{{
-    "state_version": 1,
-    "blocked_set_fingerprint": "sha256-fixture-stable",
-    "captured_at": "2026-04-22T00:00:00Z",
-    "blocked_packages": [
-        {{
-            "name": "{blocked_name}",
-            "version": "{blocked_version}",
-            "integrity": "sha512-fixture-skip-verify",
-            "script_hash": "sha256-fixture-script-hash",
-            "phases_present": ["postinstall"],
-            "binding_drift": false,
-            "static_tier": "green"
-        }}
-    ]
-}}"#
+    seed_global_install_blocked_state_with_real_hash(
+        project,
+        top_level,
+        top_level_version,
+        blocked_name,
+        blocked_version,
     );
-    std::fs::write(install_lpm.join("build-state.json"), body).unwrap();
 }
 
 /// Run the global install command surface with a flag combination
@@ -706,7 +694,7 @@ async fn install_global_policy_allow_runs_postinstall_end_to_end() {
 #[test]
 fn approve_scripts_global_yes_dry_run_json_omits_next_step() {
     let project = TempProject::empty(r#"{ "name": "phase68", "version": "0.0.0" }"#);
-    write_global_install_blocked_state(&project, "eslint", "9.24.0", "esbuild", "0.25.1");
+    seed_global_manifest_and_blocked_state(&project, "eslint", "9.24.0", "esbuild", "0.25.1");
 
     let out = lpm(&project)
         .args([
@@ -742,7 +730,7 @@ fn approve_scripts_global_yes_dry_run_json_omits_next_step() {
 #[test]
 fn approve_scripts_global_yes_live_json_carries_next_step_origins() {
     let project = TempProject::empty(r#"{ "name": "phase68", "version": "0.0.0" }"#);
-    write_global_install_blocked_state(&project, "eslint", "9.24.0", "esbuild", "0.25.1");
+    seed_global_manifest_and_blocked_state(&project, "eslint", "9.24.0", "esbuild", "0.25.1");
 
     let out = lpm(&project)
         .args(["--json", "approve-scripts", "--global", "--yes"])
