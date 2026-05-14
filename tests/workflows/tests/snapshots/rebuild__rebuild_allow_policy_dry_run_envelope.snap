@@ -1,0 +1,25 @@
+---
+source: tests/workflows/tests/rebuild.rs
+expression: envelope
+---
+{
+  "dry_run": true,
+  "packages": [
+    {
+      "name": "amber-playwright",
+      "version": "1.0.0",
+      "scripts": {
+        "postinstall": "playwright install"
+      },
+      "trusted": false
+    },
+    {
+      "name": "green-native",
+      "version": "1.0.0",
+      "scripts": {
+        "postinstall": "node build.js"
+      },
+      "trusted": false
+    }
+  ]
+}

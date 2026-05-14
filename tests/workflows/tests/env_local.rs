@@ -325,6 +325,133 @@ fn env_copy_duplicates_environment_into_target() {
 
 // ─── usage errors ──────────────────────────────────────────────────────
 
+// ─── diff (local vs local) ─────────────────────────────────────────────
+
+#[test]
+fn env_diff_local_vs_local_reports_added_removed_and_changed_keys() {
+    let project = TempProject::empty(
+        r#"{"name":"env-diff","version":"1.0.0","lpm":{"environments":{"a":{},"b":{}}}}"#,
+    );
+
+    // env A has FOO=1, COMMON=same
+    // env B has BAR=2, COMMON=same
+    // diff a b → A-only: FOO; B-only: BAR; unchanged: COMMON
+    lpm(&project)
+        .args(["env", "set", "--env=a", "FOO=1", "COMMON=same"])
+        .assert()
+        .success();
+    lpm(&project)
+        .args(["env", "set", "--env=b", "BAR=2", "COMMON=same"])
+        .assert()
+        .success();
+
+    let output = lpm(&project)
+        .args(["env", "diff", "a", "b"])
+        .output()
+        .expect("failed to run lpm env diff a b");
+
+    assert!(
+        output.status.success(),
+        "env diff local-vs-local must succeed\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    // Output must reference each side and the per-side keys.
+    assert!(
+        combined.contains("FOO") && combined.contains("BAR"),
+        "diff must mention both A-only and B-only keys, got:\n{combined}",
+    );
+}
+
+// ─── validate (vs .env.example) ────────────────────────────────────────
+
+#[test]
+fn env_validate_reports_missing_keys_against_dotenv_example() {
+    let project = TempProject::empty(r#"{"name":"env-validate","version":"1.0.0"}"#);
+
+    // .env.example declares two required keys; vault only has one.
+    write_dotenv(&project, ".env.example", "REQUIRED_ONE=\nREQUIRED_TWO=\n");
+    lpm(&project)
+        .args(["env", "set", "REQUIRED_ONE=value"])
+        .assert()
+        .success();
+
+    let output = lpm(&project)
+        .args(["--json", "env", "validate"])
+        .output()
+        .expect("failed to run lpm env validate --json");
+
+    assert!(output.status.success(), "env validate --json must succeed");
+
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    let envelope: serde_json::Value = serde_json::from_str(&stdout)
+        .unwrap_or_else(|e| panic!("env validate --json must be valid JSON: {e}\n---\n{stdout}"));
+
+    assert_eq!(envelope["required"], serde_json::json!(2));
+    let present = envelope["present"]
+        .as_array()
+        .expect("present must be array");
+    let missing = envelope["missing"]
+        .as_array()
+        .expect("missing must be array");
+    assert_eq!(present.len(), 1, "REQUIRED_ONE must be present: {envelope}");
+    assert_eq!(missing.len(), 1, "REQUIRED_TWO must be missing: {envelope}");
+    assert!(
+        missing.iter().any(|k| k.as_str() == Some("REQUIRED_TWO")),
+        "missing array must list REQUIRED_TWO: {envelope}"
+    );
+}
+
+#[test]
+fn env_validate_without_dotenv_example_fails_with_helpful_message() {
+    let project = TempProject::empty(r#"{"name":"env","version":"1.0.0"}"#);
+
+    let output = lpm(&project)
+        .args(["env", "validate"])
+        .output()
+        .expect("failed to run lpm env validate");
+
+    assert!(
+        !output.status.success(),
+        "validate without .env.example must exit non-zero"
+    );
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains(".env.example"),
+        "stderr must guide the user, got:\n{stderr}",
+    );
+}
+
+// ─── check (vs lpm.json envSchema) ─────────────────────────────────────
+
+#[test]
+fn env_check_without_lpm_json_env_schema_fails_with_helpful_message() {
+    let project = TempProject::empty(r#"{"name":"env","version":"1.0.0"}"#);
+
+    let output = lpm(&project)
+        .args(["env", "check"])
+        .output()
+        .expect("failed to run lpm env check");
+
+    assert!(
+        !output.status.success(),
+        "env check without envSchema must exit non-zero"
+    );
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("envSchema") || stderr.contains("lpm.json"),
+        "stderr must mention envSchema/lpm.json, got:\n{stderr}",
+    );
+}
+
 #[test]
 fn env_unknown_action_lists_available_subcommands() {
     let project = TempProject::empty(r#"{"name":"env","version":"1.0.0"}"#);
