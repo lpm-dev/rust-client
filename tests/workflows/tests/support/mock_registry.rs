@@ -7,8 +7,9 @@
 //! any external network calls.
 
 use std::io::Write;
+use std::sync::{Arc, Mutex};
 use wiremock::matchers::{body_string_contains, header, method, path, path_regex, query_param};
-use wiremock::{Mock, MockServer, ResponseTemplate};
+use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
 
 /// A mock LPM registry server.
 ///
@@ -534,6 +535,70 @@ impl MockRegistry {
         self
     }
 
+    /// Mount a STATEFUL personal-sync endpoint that retains POSTed
+    /// blobs in memory and serves them on subsequent GETs.
+    ///
+    /// `with_personal_pull` is static — both GET and POST return
+    /// fixed payloads. That makes single-machine round-trip tests
+    /// easy but cross-machine round-trip tests impossible: machine A
+    /// pushes a blob into the void, machine B's pull returns the
+    /// canned fixture, and the test can't compare what A pushed with
+    /// what B pulled.
+    ///
+    /// This helper mounts the same `/api/vaults/{vault_id}/sync`
+    /// endpoint but with shared `Arc<Mutex<...>>` state:
+    /// - POST: parses the body, extracts `encryptedBlob` + `wrappedKey`,
+    ///   stores them under the vault_id key, bumps the version, returns
+    ///   `{"status":"updated","version":N+1}` signed with the bearer.
+    /// - GET: looks up the stored blob; if present returns
+    ///   `{"vaultId", "encryptedBlob", "wrappedKey", "version"}` signed
+    ///   with the bearer. If absent (no prior POST), returns 404 — the
+    ///   natural "fresh machine pulls before anyone pushed" shape.
+    ///
+    /// **Same-bearer constraint.** This helper authorizes both methods
+    /// with the SAME bearer token — a deliberate simplification for the
+    /// pairing-already-completed case. Tests that want to model
+    /// pairing-failure semantics should keep using `with_personal_pull`.
+    ///
+    /// **Wrapping-key sharing is the caller's responsibility.** For
+    /// machine B's `env pull` to decrypt machine A's payload, both
+    /// HOMEs need the same wrapping key. Set `LPM_FORCE_FILE_VAULT=1`
+    /// on each `lpm` invocation and pre-write the same hex-encoded
+    /// 32-byte key to `<HOME>/.lpm/.vault-key` on both machines.
+    pub async fn with_stateful_personal_sync(&self, vault_id: &str, bearer_token: &str) -> &Self {
+        let state: Arc<Mutex<Option<StoredSyncBlob>>> = Arc::new(Mutex::new(None));
+        let vault_id_owned = vault_id.to_string();
+        let bearer_owned = bearer_token.to_string();
+
+        // GET responder — looks up state, returns blob if present.
+        let get_state = Arc::clone(&state);
+        let get_vault = vault_id_owned.clone();
+        let get_bearer = bearer_owned.clone();
+        Mock::given(method("GET"))
+            .and(path(format!("/api/vaults/{vault_id}/sync")))
+            .and(header("authorization", format!("Bearer {bearer_token}")))
+            .respond_with(StatefulSyncGetResponder {
+                state: get_state,
+                vault_id: get_vault,
+                bearer_token: get_bearer,
+            })
+            .mount(&self.server)
+            .await;
+
+        // POST responder — captures body, bumps version, stores.
+        Mock::given(method("POST"))
+            .and(path(format!("/api/vaults/{vault_id}/sync")))
+            .and(header("authorization", format!("Bearer {bearer_token}")))
+            .respond_with(StatefulSyncPostResponder {
+                state: Arc::clone(&state),
+                bearer_token: bearer_owned,
+            })
+            .mount(&self.server)
+            .await;
+
+        self
+    }
+
     /// Mount a successful OIDC policy creation endpoint.
     pub async fn with_oidc_policy_create(
         &self,
@@ -760,6 +825,113 @@ impl MockRegistry {
             )
             .mount(&self.server)
             .await;
+
+        self
+    }
+
+    /// Mount a package with multiple versions in its `versions` map and
+    /// expose BOTH the per-package GET (`/api/registry/{name}`,
+    /// `/{name}` for npm-direct routing) AND the batch-metadata POST.
+    ///
+    /// Required for surfaces that read the per-package GET endpoint —
+    /// notably `lpm upgrade`'s candidate selector, which calls
+    /// `GET /api/registry/{name}` to enumerate candidate versions.
+    /// `with_package` only registers a single-version metadata document
+    /// and `with_batch_metadata` only registers the POST endpoint, so
+    /// neither alone makes multi-version surfaces (upgrade, outdated)
+    /// observable to the workflow tier.
+    ///
+    /// Each `versions` entry is `(version, dependencies, Option<tarball_bytes>)`:
+    /// - `Some(bytes)` mounts the tarball at `/tarballs/{name}-{ver}.tgz` with the bytes.
+    /// - `None` mounts a 404 at the tarball endpoint — emulates the
+    ///   "version exists in metadata but tarball is gone" failure path
+    ///   used by upgrade's install-failure restore test.
+    ///
+    /// `latest_version` is what gets surfaced as `dist-tags.latest`.
+    ///
+    /// All version timestamps default to `2025-01-01T00:00:00.000Z`.
+    /// Tests that need cooldown-aware timestamps should use
+    /// `with_package_published_at` instead.
+    ///
+    /// Lifted from the formerly-private `mount_upgrade_package` helper
+    /// in `tests/workflows/tests/upgrade.rs` so cross-command flow
+    /// tests can drive upgrade's candidate-selector path without
+    /// reaching into another test's internals.
+    pub async fn with_full_package_metadata(
+        &self,
+        name: &str,
+        latest_version: &str,
+        versions: &[(&str, serde_json::Value, Option<Vec<u8>>)],
+    ) -> &Self {
+        let mut versions_map = serde_json::Map::new();
+        let mut times_map = serde_json::Map::new();
+
+        for (v, deps, bytes_opt) in versions {
+            let tarball_url = format!("{}/tarballs/{name}-{v}.tgz", self.server.uri());
+            let integrity = match bytes_opt {
+                Some(bytes) => compute_integrity(bytes),
+                // Synthetic integrity for the missing-tarball case —
+                // the metadata still has to advertise SOME integrity so
+                // the resolver's preflight doesn't reject the version
+                // record. The actual fetch will 404 before integrity is
+                // checked.
+                None => "sha512-missing".to_string(),
+            };
+            versions_map.insert(
+                (*v).to_string(),
+                serde_json::json!({
+                    "name": name,
+                    "version": v,
+                    "dist": {
+                        "tarball": tarball_url,
+                        "integrity": integrity,
+                    },
+                    "dependencies": deps,
+                }),
+            );
+            times_map.insert(
+                (*v).to_string(),
+                serde_json::Value::String("2025-01-01T00:00:00.000Z".into()),
+            );
+
+            let tarball_path = format!("/tarballs/{name}-{v}.tgz");
+            let response = match bytes_opt {
+                Some(bytes) => ResponseTemplate::new(200)
+                    .set_body_bytes(bytes.clone())
+                    .insert_header("content-type", "application/octet-stream"),
+                None => ResponseTemplate::new(404).set_body_string("missing tarball"),
+            };
+            Mock::given(method("GET"))
+                .and(path(&tarball_path))
+                .respond_with(response)
+                .mount(&self.server)
+                .await;
+        }
+
+        let metadata = serde_json::json!({
+            "name": name,
+            "dist-tags": { "latest": latest_version },
+            "versions": versions_map,
+            "time": times_map,
+        });
+
+        let metadata_path = format!("/api/registry/{name}");
+        Mock::given(method("GET"))
+            .and(path(&metadata_path))
+            .respond_with(ResponseTemplate::new(200).set_body_json(metadata.clone()))
+            .mount(&self.server)
+            .await;
+        let npm_direct_path = format!("/{name}");
+        Mock::given(method("GET"))
+            .and(path(&npm_direct_path))
+            .respond_with(ResponseTemplate::new(200).set_body_json(metadata.clone()))
+            .mount(&self.server)
+            .await;
+
+        // Mirror the same metadata onto the batch-metadata POST so the
+        // install pipeline's resolver-batch path resolves identically
+        // to the candidate selector's GET path.
+        self.with_batch_metadata(vec![metadata]).await;
 
         self
     }
@@ -1026,4 +1198,102 @@ pub fn make_tarball_with_files(
     let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
     encoder.write_all(&tar_bytes).unwrap();
     encoder.finish().unwrap()
+}
+
+// ─── Stateful personal-sync support ────────────────────────────────────
+
+#[derive(Clone)]
+struct StoredSyncBlob {
+    encrypted_blob: String,
+    wrapped_key: String,
+    version: i32,
+}
+
+struct StatefulSyncGetResponder {
+    state: Arc<Mutex<Option<StoredSyncBlob>>>,
+    vault_id: String,
+    bearer_token: String,
+}
+
+impl Respond for StatefulSyncGetResponder {
+    fn respond(&self, _request: &Request) -> ResponseTemplate {
+        let stored = self
+            .state
+            .lock()
+            .expect("StatefulSyncGetResponder mutex poisoned")
+            .clone();
+        let Some(blob) = stored else {
+            // No prior POST — represent as 404 so the CLI surfaces a
+            // "vault has no payload yet" error rather than silently
+            // succeeding with an empty body.
+            return ResponseTemplate::new(404)
+                .insert_header("Content-Type", "application/json")
+                .set_body_string(r#"{"error":"vault has no synced state"}"#);
+        };
+        let body = serde_json::to_string(&serde_json::json!({
+            "vaultId": self.vault_id,
+            "encryptedBlob": blob.encrypted_blob,
+            "wrappedKey": blob.wrapped_key,
+            "version": blob.version,
+        }))
+        .expect("stateful sync GET body must serialize");
+        let sig = lpm_vault::signature::sign_body(body.as_bytes(), &self.bearer_token);
+        ResponseTemplate::new(200)
+            .insert_header("Content-Type", "application/json")
+            .insert_header(lpm_vault::signature::SIGNATURE_HEADER, sig.as_str())
+            .set_body_string(body)
+    }
+}
+
+struct StatefulSyncPostResponder {
+    state: Arc<Mutex<Option<StoredSyncBlob>>>,
+    bearer_token: String,
+}
+
+impl Respond for StatefulSyncPostResponder {
+    fn respond(&self, request: &Request) -> ResponseTemplate {
+        let body_value: serde_json::Value = match serde_json::from_slice(&request.body) {
+            Ok(v) => v,
+            Err(_) => {
+                return ResponseTemplate::new(400)
+                    .set_body_string(r#"{"error":"stateful sync POST: body not valid JSON"}"#);
+            }
+        };
+        let encrypted_blob = body_value
+            .get("encryptedBlob")
+            .and_then(|v| v.as_str())
+            .map(str::to_string);
+        let wrapped_key = body_value
+            .get("wrappedKey")
+            .and_then(|v| v.as_str())
+            .map(str::to_string);
+        let (Some(encrypted_blob), Some(wrapped_key)) = (encrypted_blob, wrapped_key) else {
+            return ResponseTemplate::new(400).set_body_string(
+                r#"{"error":"stateful sync POST: missing encryptedBlob or wrappedKey"}"#,
+            );
+        };
+
+        let mut guard = self
+            .state
+            .lock()
+            .expect("StatefulSyncPostResponder mutex poisoned");
+        let new_version = guard.as_ref().map(|b| b.version + 1).unwrap_or(1);
+        *guard = Some(StoredSyncBlob {
+            encrypted_blob,
+            wrapped_key,
+            version: new_version,
+        });
+        drop(guard);
+
+        let body = serde_json::to_string(&serde_json::json!({
+            "status": "updated",
+            "version": new_version,
+        }))
+        .expect("stateful sync POST body must serialize");
+        let sig = lpm_vault::signature::sign_body(body.as_bytes(), &self.bearer_token);
+        ResponseTemplate::new(200)
+            .insert_header("Content-Type", "application/json")
+            .insert_header(lpm_vault::signature::SIGNATURE_HEADER, sig.as_str())
+            .set_body_string(body)
+    }
 }

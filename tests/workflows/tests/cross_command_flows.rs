@@ -321,16 +321,24 @@ async fn flow_migrate_install_audit_lockfile_round_trips() {
 
 /// The deny-policy lifecycle: rebuild #1 (with package untrusted)
 /// emits no packages; approve-scripts --yes mutates the manifest's
-/// trustedDependencies; rebuild #2 should see the change.
+/// trustedDependencies; rebuild #2 reads the new Rich-form entry
+/// and surfaces the package as trusted.
 ///
-/// **Discovered contract gap (Finding #75):** approve-scripts writes
-/// `trustedDependencies` as a v2 OBJECT (`{"<pkg>@<v>": {integrity,
-/// scriptHash, ...}}`), but `rebuild --policy=deny`'s selector only
-/// reads the legacy ARRAY form (`["<pkg>"]`). The two surfaces
-/// disagree on the post-Phase-46 schema, so this flow's "rebuild #2
-/// picks up the approval" claim cannot pass without fixing rebuild's
-/// reader. The flow test asserts what currently holds — the manifest
-/// mutation — and pins the rebuild step as a documented gap.
+/// **Finding #75 retraction.** An earlier revision of this flow
+/// asserted that `rebuild --policy=deny` ignores the v2 OBJECT form
+/// of `trustedDependencies`. That diagnosis was wrong:
+/// `TrustedDependencies::matches_strict` (in `lpm-workspace`) is
+/// `#[serde(untagged)]` over BOTH the Legacy `Vec<String>` form and
+/// the Rich `HashMap<String, Binding>` form, and `evaluate_trust` in
+/// `rebuild.rs` routes through that helper. The empty-`packages[]`
+/// the test originally observed came from `TrustMatch::BindingDrift`:
+/// the fixture's synthetic `script_hash: "sha256-flow-script-hash"`
+/// did not match the real `compute_script_hash(store_dir)` value that
+/// rebuild computes from disk. With the fixture now computing the
+/// real script_hash up-front and propagating it through
+/// build-state.json → approve-scripts → manifest, the strict gate
+/// matches and the package surfaces as trusted. Object-form support
+/// is not a gap — the bug was in the test's fixture drift.
 ///
 /// Follows the seeded-state fixture convention from `rebuild.rs` +
 /// `approve_scripts.rs` — no live `lpm install` step. The "install"
@@ -354,27 +362,44 @@ fn flow_install_rebuild_approve_scripts_rebuild_approval_lifecycle() {
          [[packages]]\nname = \"scripted-pkg\"\nversion = \"1.0.0\"\n",
     );
 
+    // Compute the REAL script_hash for the seeded store entry — the
+    // same function rebuild's trust gate runs. Past versions of this
+    // test wrote a synthetic `"sha256-flow-script-hash"` into
+    // build-state.json which approve-scripts faithfully propagated
+    // into `package.json > lpm > trustedDependencies`. Rebuild then
+    // recomputed the script_hash from disk, got a different value,
+    // and classified the entry as `BindingDrift` — i.e. "not trusted"
+    // — which made `packages[]` empty. That looked superficially
+    // like "rebuild ignores object-form trustedDependencies" but was
+    // really a fixture drift between approve-scripts (copies the
+    // build-state field verbatim) and rebuild (recomputes from
+    // store-dir contents).
+    let real_script_hash = lpm_security::script_hash::compute_script_hash(&store_dir)
+        .expect("postinstall script body is non-empty — compute_script_hash must return Some");
+
     // Step 1: synthesize the build-state.json that `lpm install`
     // would have written. approve-scripts reads from this file.
     project.write_file(
         ".lpm/build-state.json",
-        r#"{
-            "state_version": 1,
-            "blocked_set_fingerprint": "sha256-flow-fixture",
-            "captured_at": "2026-05-14T00:00:00Z",
-            "blocked_packages": [
-                {
-                    "name": "scripted-pkg",
-                    "version": "1.0.0",
-                    "integrity": "sha512-fixture-skip-verify",
-                    "script_hash": "sha256-flow-script-hash",
-                    "phases_present": ["postinstall"],
-                    "binding_drift": false,
-                    "static_tier": "green",
-                    "published_at": "2026-05-14T00:00:00Z"
-                }
-            ]
-        }"#,
+        &format!(
+            r#"{{
+                "state_version": 1,
+                "blocked_set_fingerprint": "sha256-flow-fixture",
+                "captured_at": "2026-05-14T00:00:00Z",
+                "blocked_packages": [
+                    {{
+                        "name": "scripted-pkg",
+                        "version": "1.0.0",
+                        "integrity": "sha512-fixture-skip-verify",
+                        "script_hash": "{real_script_hash}",
+                        "phases_present": ["postinstall"],
+                        "binding_drift": false,
+                        "static_tier": "green",
+                        "published_at": "2026-05-14T00:00:00Z"
+                    }}
+                ]
+            }}"#
+        ),
     );
 
     // Step 2: rebuild #1 under deny — scripted-pkg is NOT in
@@ -429,13 +454,13 @@ fn flow_install_rebuild_approve_scripts_rebuild_approval_lifecycle() {
         project.read_file("package.json")
     );
 
-    // Step 4: rebuild #2 — runs cleanly against the post-approval
-    // manifest. We assert status success + no scripted-pkg drift
-    // warning, NOT that packages[] contains scripted-pkg. The latter
-    // claim is blocked on Finding #75 (rebuild --policy=deny only
-    // reads the legacy array form of trustedDependencies; the
-    // object form approve-scripts writes is invisible to it). When
-    // #75 is fixed, tighten this to assert packages[].contains(scripted-pkg).
+    // Step 4: rebuild #2 against the post-approval manifest. With the
+    // real script_hash flowing from store-dir → build-state.json →
+    // approve-scripts → manifest, rebuild's strict trust gate matches
+    // the entry on `name@version` (Rich form), integrity, and
+    // script_hash. The package surfaces in `packages[]` as
+    // `trusted: true` — the load-bearing claim of the rebuild →
+    // approve-scripts → rebuild lifecycle.
     let out_r2 = lpm(&project)
         .args(["--json", "rebuild", "--dry-run", "--policy=deny"])
         .output()
@@ -446,12 +471,36 @@ fn flow_install_rebuild_approve_scripts_rebuild_approval_lifecycle() {
         String::from_utf8_lossy(&out_r2.stdout),
         String::from_utf8_lossy(&out_r2.stderr)
     );
-    // No drift-error stderr — approve-scripts' manifest write is well-formed.
     let r2_stderr = strip_ansi(&String::from_utf8_lossy(&out_r2.stderr));
     assert!(
         !r2_stderr.contains("drift") && !r2_stderr.contains("Error"),
         "rebuild#2 must not warn about manifest drift after a fresh approve-scripts; \
          stderr: {r2_stderr}"
+    );
+    let r2_envelope: serde_json::Value =
+        serde_json::from_slice(&out_r2.stdout).unwrap_or_else(|e| {
+            panic!(
+                "rebuild#2 --json stdout must be valid JSON: {e}\nstdout:\n{}",
+                String::from_utf8_lossy(&out_r2.stdout)
+            )
+        });
+    let packages = r2_envelope["packages"]
+        .as_array()
+        .expect("rebuild#2 envelope must carry a packages[] array");
+    let scripted_pkg_entry = packages
+        .iter()
+        .find(|p| p["name"] == "scripted-pkg" && p["version"] == "1.0.0")
+        .unwrap_or_else(|| {
+            panic!(
+                "rebuild#2 packages[] must contain scripted-pkg@1.0.0 after approve-scripts; \
+                 envelope:\n{}",
+                serde_json::to_string_pretty(&r2_envelope).unwrap_or_default()
+            )
+        });
+    assert_eq!(
+        scripted_pkg_entry["trusted"],
+        serde_json::json!(true),
+        "scripted-pkg@1.0.0 must be classified `trusted: true` post-approval; entry: {scripted_pkg_entry}"
     );
 }
 
@@ -664,43 +713,26 @@ async fn flow_install_upgrade_major_audit_picks_new_version() {
     let pkg_name = "@lpm.dev/acme.flow-up";
 
     // Mount three versions: 1.0.0 (installed), 1.1.0 (minor), 2.0.0
-    // (major target). Upgrade's resolver prefers the latest within
-    // each lane; major needs at least one intermediate version + the
-    // dist-tag set to the major to confidently classify "major".
-    let mut version_entries = serde_json::Map::new();
-    for v in ["1.0.0", "1.1.0", "2.0.0"] {
-        let pkg_json = serde_json::json!({
-            "name": pkg_name,
-            "version": v,
-            "license": "MIT",
-            "main": "index.js"
-        });
-        let tarball = make_tarball_from_pkg_json(pkg_json.clone(), &[]);
-        mock.with_package(pkg_name, v, &tarball).await;
-        version_entries.insert(
-            v.to_string(),
-            serde_json::json!({
+    // (major target). Upgrade's candidate selector reads
+    // `GET /api/registry/{name}` to enumerate candidates; the install
+    // pipeline reads `POST /api/registry/batch-metadata`. The shared
+    // `with_full_package_metadata` helper mounts both endpoints from a
+    // single metadata document so the two paths resolve identically.
+    let versions: Vec<(&str, serde_json::Value, Option<Vec<u8>>)> = ["1.0.0", "1.1.0", "2.0.0"]
+        .iter()
+        .map(|v| {
+            let pkg_json = serde_json::json!({
                 "name": pkg_name,
                 "version": v,
-                "dist": {
-                    "tarball": format!("{}/tarballs/{}-{v}.tgz", mock.url(), pkg_name.replace('/', "+")),
-                    "integrity": compute_integrity(&tarball),
-                },
-                "dependencies": {}
-            }),
-        );
-    }
-    mock.with_batch_metadata(vec![serde_json::json!({
-        "name": pkg_name,
-        "dist-tags": { "latest": "2.0.0" },
-        "versions": serde_json::Value::Object(version_entries),
-        "time": {
-            "1.0.0": "2025-01-01T00:00:00.000Z",
-            "1.1.0": "2025-03-01T00:00:00.000Z",
-            "2.0.0": "2025-06-01T00:00:00.000Z"
-        }
-    })])
-    .await;
+                "license": "MIT",
+                "main": "index.js"
+            });
+            let tarball = make_tarball_from_pkg_json(pkg_json, &[]);
+            (*v, serde_json::json!({}), Some(tarball))
+        })
+        .collect();
+    mock.with_full_package_metadata(pkg_name, "2.0.0", &versions)
+        .await;
     mock.with_osv_querybatch(vec![]).await;
     let osv_url = format!("{}/v1/querybatch", mock.url());
 
@@ -736,13 +768,6 @@ async fn flow_install_upgrade_major_audit_picks_new_version() {
         String::from_utf8_lossy(&out_upgrade.stderr)
     );
     let env_upgrade = parse_envelope_labeled(&out_upgrade.stdout, &out_upgrade.stderr, "upgrade");
-    // The envelope shape must be coherent. The workflow tier currently
-    // cannot drive upgrade's candidate-selection through the mock
-    // registry's GET /api/registry/{name} surface (mount missing in
-    // the shared MockRegistry helpers — exists only in upgrade.rs's
-    // private `mount_upgrade_package`). So we assert envelope shape,
-    // not that 2.0.0 surfaces as a candidate. Promote when the mock
-    // helper grows the per-package GET endpoint.
     assert_eq!(
         env_upgrade["success"],
         serde_json::json!(true),
@@ -752,6 +777,24 @@ async fn flow_install_upgrade_major_audit_picks_new_version() {
         env_upgrade["dry_run"],
         serde_json::json!(true),
         "upgrade --major --dry-run envelope must carry dry_run: true"
+    );
+    // With the lifted `with_full_package_metadata` helper, upgrade's
+    // candidate selector reaches the per-package GET endpoint and
+    // surfaces 2.0.0 as the major candidate. Pin that — this is the
+    // load-bearing claim of the install → upgrade --major handoff
+    // (upgrade reads the post-install lockfile + sees the major
+    // version path the mock registry advertised).
+    let candidates_str = serde_json::to_string(&env_upgrade).unwrap_or_default();
+    assert!(
+        candidates_str.contains("2.0.0"),
+        "upgrade --major --dry-run envelope must mention the major candidate 2.0.0; \
+         got:\n{}",
+        serde_json::to_string_pretty(&env_upgrade).unwrap_or_default(),
+    );
+    assert!(
+        candidates_str.contains(pkg_name),
+        "upgrade --major --dry-run envelope must reference {pkg_name}; got:\n{}",
+        serde_json::to_string_pretty(&env_upgrade).unwrap_or_default(),
     );
 
     // Step 3: audit reads the still-1.0.0 lockfile and produces a
@@ -1053,75 +1096,123 @@ async fn flow_install_g_run_uninstall_g_shim_lifecycle() {
 //
 // SCOPE NOTE: this flow simulates the cross-machine round-trip by using
 // two independent `TempProject` instances (each with its own HOME) and
-// sharing the mock vault server. A real-world flow involves separate
-// physical devices + key escrow; we test the encryption-state-transfer
-// portion which is the load-bearing correctness claim. Pairing token
-// exchange against a live server is out of scope for this tier.
+// pointing them at the same mocked vault server. A real-world flow
+// involves separate physical devices + a live pairing exchange that
+// transfers the wrapping key from A to B. The flow short-circuits
+// pairing by seeding identical `<HOME>/.lpm/.vault-key` files on both
+// machines — the cryptographic state that pairing produces. The
+// `lpm env pair` single-command test in `env_vault.rs` covers the
+// pairing exchange itself; this flow covers the post-pairing
+// push-then-pull round-trip that single-command tests cannot.
 
 /// Round-trip a secret through `env push` on machine A and `env pull`
-/// on machine B, where both machines share the same mocked vault. The
-/// pulled bytes must equal the pushed bytes (the only correctness
-/// claim the flow makes — pairing, key wrap, and transport are
-/// covered by single-command env_vault tests).
-#[test]
-fn flow_env_push_pull_cross_machine_round_trip() {
-    // Pairing + vault transport mocking lives in env_vault.rs and is
-    // tightly coupled to LPM_VAULT_URL + the auth-state shape. A
-    // proper cross-machine flow needs a vault-state-sharing test
-    // harness that doesn't exist as a reusable helper today.
-    //
-    // Rather than ship a brittle imitation here, this flow's
-    // implementation is gated behind a real cross-machine harness.
-    // The single-command tests in env_vault.rs already cover the
-    // load-bearing per-machine claims (pair → push, pair → pull,
-    // session normalization).
-    //
-    // When the cross-machine harness lands, expand this test to:
-    //   1. Machine A: lpm env pair + lpm env push API_KEY=secret-bytes
-    //   2. Machine B (fresh TempProject): lpm env pair (same session)
-    //                + lpm env pull
-    //                + lpm env get API_KEY --reveal
-    //   3. Assert pulled value byte-equals "secret-bytes".
-    //
-    // Until then, this test is intentionally minimal — it confirms
-    // the flow is enumerated and the test file is present so the v2
-    // gate can be flipped. The flow's `tested: true` reflects "the
-    // multi-command sequence has an integration entry point" rather
-    // than "every state-transfer detail is asserted." Promote when
-    // the harness lands.
+/// on machine B, where both machines share the same mocked vault and
+/// the same wrapping-key state. The pulled plaintext must byte-equal
+/// the pushed plaintext — the load-bearing correctness claim of the
+/// post-pairing sync protocol.
+#[tokio::test]
+async fn flow_env_push_pull_cross_machine_round_trip() {
+    use support::auth_state::{SessionSeed, seed_sessions};
+
+    const VAULT_ID: &str = "flow-vault-cross-machine";
+    const BEARER: &str = "flow-bearer-cross-machine";
+    const SECRET_VALUE: &str = "secret-from-machine-a-bytes";
+
     let machine_a = TempProject::empty(r#"{"name":"flow-env-machine-a","version":"0.0.0"}"#);
     let machine_b = TempProject::empty(r#"{"name":"flow-env-machine-b","version":"0.0.0"}"#);
 
-    // Smoke each machine's env CLI is wired (set/list on machine A
-    // works under file-backed vault; we don't yet round-trip B against A).
-    let out_set = lpm(&machine_a)
-        .args(["env", "set", "API_KEY=hello-from-a", "--json"])
+    let mock = MockRegistry::start().await;
+    mock.with_stateful_personal_sync(VAULT_ID, BEARER).await;
+
+    // Seed both machines with the same paired-session shape that
+    // `lpm env pair` would produce in real use — identical bearer
+    // against the mock origin.
+    for project in [&machine_a, &machine_b] {
+        seed_sessions(
+            project.home(),
+            &[SessionSeed {
+                registry_url: &mock.url(),
+                access_token: Some(BEARER),
+                refresh_token: None,
+                session_access_expires_at: Some("2099-01-01T00:00:00Z"),
+            }],
+        );
+        // Link the project to the shared vault id so `lpm env push`
+        // and `lpm env pull` agree on which sync endpoint to call.
+        project.write_file("lpm.json", &format!(r#"{{"vault":"{VAULT_ID}"}}"#));
+    }
+
+    // Identical wrapping-key state — the cryptographic outcome of
+    // pairing in real use. Both `lpm env push` (machine A) and
+    // `lpm env pull` (machine B) call `get_or_create_wrapping_key`
+    // which under `LPM_FORCE_FILE_VAULT=1` (set by `lpm()`) reads
+    // `<HOME>/.lpm/.vault-key` as hex-encoded 32 bytes.
+    let shared_wrapping_key = [0x7Au8; 32];
+    let shared_wrapping_key_hex = hex::encode(shared_wrapping_key);
+    for project in [&machine_a, &machine_b] {
+        let lpm_dir = project.home().join(".lpm");
+        std::fs::create_dir_all(&lpm_dir).expect("create ~/.lpm");
+        std::fs::write(lpm_dir.join(".vault-key"), &shared_wrapping_key_hex)
+            .expect("seed .vault-key");
+    }
+
+    // Step 1 — machine A: stage a secret + push.
+    let out_set_a = lpm(&machine_a)
+        .args(["env", "set", &format!("API_KEY={SECRET_VALUE}")])
         .output()
         .expect("spawn env set on machine A");
     assert!(
-        out_set.status.success(),
+        out_set_a.status.success(),
         "machine A env set failed: stdout={} stderr={}",
-        String::from_utf8_lossy(&out_set.stdout),
-        String::from_utf8_lossy(&out_set.stderr)
+        String::from_utf8_lossy(&out_set_a.stdout),
+        String::from_utf8_lossy(&out_set_a.stderr)
     );
 
-    let out_list = lpm(&machine_b)
-        .args(["env", "ls", "--json"])
+    let out_push_a = lpm(&machine_a)
+        .env("LPM_REGISTRY_URL", mock.url())
+        .args(["--json", "env", "push", "--yes"])
         .output()
-        .expect("spawn env ls on machine B");
+        .expect("spawn env push on machine A");
     assert!(
-        out_list.status.success(),
-        "machine B env ls failed: stdout={} stderr={}",
-        String::from_utf8_lossy(&out_list.stdout),
-        String::from_utf8_lossy(&out_list.stderr)
+        out_push_a.status.success(),
+        "machine A env push failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&out_push_a.stdout),
+        String::from_utf8_lossy(&out_push_a.stderr)
     );
 
-    // Each machine's HOME is isolated, so machine B should NOT see
-    // machine A's key — confirms the isolation primitive that the
-    // real cross-machine round-trip will need to break via the vault.
-    let b_list_text = String::from_utf8_lossy(&out_list.stdout);
+    // Step 2 — machine B: pull from the same vault id. The stateful
+    // mock now returns the blob machine A just POSTed.
+    let out_pull_b = lpm(&machine_b)
+        .env("LPM_REGISTRY_URL", mock.url())
+        .args(["--json", "env", "pull", "--yes"])
+        .output()
+        .expect("spawn env pull on machine B");
     assert!(
-        !b_list_text.contains("API_KEY") || b_list_text.contains("\"keys\":[]"),
-        "machine B with isolated HOME must not see machine A's local-only key; got: {b_list_text}"
+        out_pull_b.status.success(),
+        "machine B env pull failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&out_pull_b.stdout),
+        String::from_utf8_lossy(&out_pull_b.stderr)
+    );
+
+    // Step 3 — machine B reveals the value. The plaintext must
+    // byte-equal what machine A set. This is the load-bearing
+    // round-trip claim: A's encrypt → wire → B's decrypt must be
+    // lossless under identical wrapping-key state.
+    let out_get_b = lpm(&machine_b)
+        .args(["env", "get", "API_KEY", "--reveal"])
+        .output()
+        .expect("spawn env get --reveal on machine B");
+    assert!(
+        out_get_b.status.success(),
+        "machine B env get --reveal failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&out_get_b.stdout),
+        String::from_utf8_lossy(&out_get_b.stderr)
+    );
+    let revealed = String::from_utf8_lossy(&out_get_b.stdout);
+    assert!(
+        revealed.contains(SECRET_VALUE),
+        "machine B revealed plaintext must byte-equal what machine A pushed; \
+         expected to find {SECRET_VALUE:?}; got:\n{revealed}\nstderr: {}",
+        String::from_utf8_lossy(&out_get_b.stderr)
     );
 }

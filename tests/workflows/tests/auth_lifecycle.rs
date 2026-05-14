@@ -265,6 +265,22 @@ async fn whoami_recovers_session_from_refresh_token_only() {
         expiry[&mock.url()]["session_access_expires_at"],
         "2030-01-01T00:00:00Z"
     );
+
+    insta::with_settings!({
+        sort_maps => true,
+        filters => vec![
+            (r"http://127\.0\.0\.1:\d+", "[MOCK]"),
+            (r#"/var/folders/[^"\s]+"#, "[TEMP]"),
+            (r#"/private/var/folders/[^"\s]+"#, "[TEMP]"),
+            (r#"/tmp/[^"\s]+"#, "[TEMP]"),
+        ],
+    }, {
+        insta::assert_json_snapshot!(
+            "whoami_json_envelope_recovers_from_refresh_only",
+            json,
+            { ".duration_ms" => "[DURATION]" }
+        );
+    });
 }
 
 #[tokio::test]

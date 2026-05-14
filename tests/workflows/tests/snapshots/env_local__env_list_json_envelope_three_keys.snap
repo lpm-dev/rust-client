@@ -1,0 +1,10 @@
+---
+source: tests/workflows/tests/env_local.rs
+assertion_line: 139
+expression: envelope
+---
+{
+  "A": "••••••••",
+  "B": "••••••••",
+  "C": "••••••••"
+}

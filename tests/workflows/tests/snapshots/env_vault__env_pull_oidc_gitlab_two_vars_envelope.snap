@@ -1,0 +1,13 @@
+---
+source: tests/workflows/tests/env_vault.rs
+assertion_line: 979
+expression: json
+---
+{
+  "count": 2,
+  "env": "preview",
+  "vars": {
+    "CI_PROVIDER": "gitlab",
+    "SECRET_ONE": "value-1"
+  }
+}

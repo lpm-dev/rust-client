@@ -1,0 +1,28 @@
+---
+source: tests/workflows/tests/auth_lifecycle.rs
+assertion_line: 278
+expression: json
+---
+{
+  "email": "test@example.com",
+  "has_pool_access": true,
+  "limits": {
+    "private_packages": null,
+    "storage_bytes": null
+  },
+  "mfa_enabled": false,
+  "orgs": [],
+  "plan": "pro",
+  "registries": [
+    {
+      "name": "lpm.dev",
+      "status": "authenticated"
+    }
+  ],
+  "success": true,
+  "usage": {
+    "private_packages": 3,
+    "storage_bytes": 52428800
+  },
+  "username": "testuser"
+}

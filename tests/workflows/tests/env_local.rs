@@ -127,6 +127,17 @@ fn env_list_json_envelope_carries_keys() {
             "env list --json must mention key {key}, got:\n{envelope}",
         );
     }
+
+    insta::with_settings!({
+        sort_maps => true,
+        filters => vec![
+            (r#"/var/folders/[^"\s]+"#, "[TEMP]"),
+            (r#"/private/var/folders/[^"\s]+"#, "[TEMP]"),
+            (r#"/tmp/[^"\s]+"#, "[TEMP]"),
+        ],
+    }, {
+        insta::assert_json_snapshot!("env_list_json_envelope_three_keys", envelope);
+    });
 }
 
 // ─── set with usage error ─────────────────────────────────────────────
