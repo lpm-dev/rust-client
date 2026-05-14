@@ -90,3 +90,48 @@ fn json_dispatch_early_error_emits_envelope_on_stdout() {
          can branch on it; full envelope={envelope}",
     );
 }
+
+/// **Finding #73 contract.** When stdout carries a
+/// `success: false` envelope, exit code MUST be `1`. Pre-fix, the
+/// `?`-early-exit paths that bypassed the envelope also bypassed the
+/// exit-code mirror at the bottom of `async_main` — leaving CI
+/// scripts that branch on `$?` after `lpm --json …` to silently miss
+/// the failure encoded inside the envelope. The contract pinned
+/// here is the precise direction of the mirror: not just
+/// "non-zero", but specifically `1`, because that's what every
+/// supported `LpmError` variant maps to under the top-level handler
+/// (the only exception is `LpmError::ExitCode(code)`, which skips
+/// the envelope path entirely so a command that already wrote its
+/// own structured doc can carry an arbitrary code through).
+///
+/// The companion `json_dispatch_early_error_emits_envelope_on_stdout`
+/// test above asserts `!status.success()`. This one tightens the
+/// guarantee: it must be `Some(1)`, not just non-zero — so a future
+/// regression that accidentally exits 2 (clap's
+/// missing-arg semantics) or 101 (panic) on this path also fails the
+/// test.
+#[test]
+fn json_envelope_failure_exit_code_mirrors_success_field() {
+    let (project, lpm_home) = isolated_project_with_package_json();
+    let (status, stdout, stderr) = run_lpm(
+        project.path(),
+        lpm_home.path(),
+        None,
+        &["--json", "approve-scripts", "--group"],
+    );
+
+    let envelope = parse_json_stdout(&stdout);
+    assert_eq!(
+        envelope["success"],
+        serde_json::json!(false),
+        "precondition: envelope must report failure on this path \
+         (stderr={stderr:?})",
+    );
+    assert_eq!(
+        status.code(),
+        Some(1),
+        "envelope success=false must mirror to exit code 1 \
+         (got code={:?}, full envelope={envelope}, stderr={stderr:?})",
+        status.code(),
+    );
+}
