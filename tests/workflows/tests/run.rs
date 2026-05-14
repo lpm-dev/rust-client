@@ -537,3 +537,179 @@ fn run_parallel_executes_independent_tasks() {
         "check should have run in parallel, got:\n{combined}"
     );
 }
+
+// ─── Workspace dispatch: --filter / --all / --affected ─────────────
+//
+// Seeds each member's package.json with a unique script that writes a
+// sentinel file. The test then asserts which members ran the script
+// based on dispatch selection. Sentinels are cleaner than parsing
+// streamed task output across N members.
+
+fn seed_workspace_with_unique_scripts(project: &TempProject) {
+    for member in ["app", "core", "utils"] {
+        let pkg_path = format!("packages/{member}/package.json");
+        let pkg_content = project.read_file(&pkg_path);
+        let mut pkg: serde_json::Value =
+            serde_json::from_str(&pkg_content).expect("parse member package.json");
+        pkg["scripts"] = serde_json::json!({
+            "echo": format!("node -e \"require('fs').writeFileSync('ran-{member}.txt','ok')\""),
+        });
+        project.write_file(&pkg_path, &serde_json::to_string_pretty(&pkg).unwrap());
+    }
+}
+
+fn member_ran(project: &TempProject, member: &str) -> bool {
+    project.file_exists(&format!("packages/{member}/ran-{member}.txt"))
+}
+
+#[test]
+fn run_filter_executes_only_matched_members() {
+    let project = TempProject::from_fixture("workspace-monorepo");
+    seed_workspace_with_unique_scripts(&project);
+
+    let output = lpm(&project)
+        .args(["run", "echo", "--filter", "@test/utils"])
+        .output()
+        .expect("failed to run lpm run --filter");
+
+    assert!(
+        output.status.success(),
+        "run --filter must succeed\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+
+    assert!(
+        member_ran(&project, "utils"),
+        "utils must have executed echo"
+    );
+    assert!(
+        !member_ran(&project, "core"),
+        "core must NOT have executed echo (not in filter)"
+    );
+    assert!(
+        !member_ran(&project, "app"),
+        "app must NOT have executed echo (not in filter)"
+    );
+}
+
+#[test]
+fn run_all_executes_in_every_member() {
+    let project = TempProject::from_fixture("workspace-monorepo");
+    seed_workspace_with_unique_scripts(&project);
+
+    let output = lpm(&project)
+        .args(["run", "echo", "--all"])
+        .output()
+        .expect("failed to run lpm run --all");
+
+    assert!(
+        output.status.success(),
+        "run --all must succeed\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+
+    for member in ["app", "core", "utils"] {
+        assert!(
+            member_ran(&project, member),
+            "{member} must have executed echo under --all"
+        );
+    }
+}
+
+#[test]
+fn run_affected_with_no_changes_executes_in_zero_members() {
+    use std::process::Command;
+    let project = TempProject::from_fixture("workspace-monorepo");
+    seed_workspace_with_unique_scripts(&project);
+
+    // Seed a clean git history so --affected vs HEAD diff is empty.
+    Command::new("git")
+        .args(["init", "-q"])
+        .current_dir(project.path())
+        .status()
+        .expect("git init failed");
+    Command::new("git")
+        .args(["add", "-A"])
+        .current_dir(project.path())
+        .status()
+        .expect("git add failed");
+    Command::new("git")
+        .args([
+            "-c",
+            "user.email=t@t.t",
+            "-c",
+            "user.name=t",
+            "commit",
+            "-q",
+            "-m",
+            "init",
+        ])
+        .current_dir(project.path())
+        .status()
+        .expect("git commit failed");
+
+    let output = lpm(&project)
+        .args(["run", "echo", "--affected", "--base", "HEAD"])
+        .output()
+        .expect("failed to run lpm run --affected");
+
+    assert!(
+        output.status.success(),
+        "run --affected with no diff must exit 0"
+    );
+
+    for member in ["app", "core", "utils"] {
+        assert!(
+            !member_ran(&project, member),
+            "{member} must NOT execute when nothing changed since HEAD"
+        );
+    }
+}
+
+#[test]
+fn run_filter_typo_without_fail_flag_exits_zero() {
+    let project = TempProject::from_fixture("workspace-monorepo");
+    seed_workspace_with_unique_scripts(&project);
+
+    let output = lpm(&project)
+        .args(["run", "echo", "--filter", "this-does-not-exist"])
+        .output()
+        .expect("failed to run lpm run --filter");
+
+    assert!(
+        output.status.success(),
+        "empty-match without --fail-if-no-match must exit 0\nstderr: {}",
+        String::from_utf8_lossy(&output.stderr),
+    );
+
+    for member in ["app", "core", "utils"] {
+        assert!(
+            !member_ran(&project, member),
+            "{member} must NOT execute on empty-match filter"
+        );
+    }
+}
+
+#[test]
+fn run_filter_typo_with_fail_flag_exits_nonzero() {
+    let project = TempProject::from_fixture("workspace-monorepo");
+    seed_workspace_with_unique_scripts(&project);
+
+    let output = lpm(&project)
+        .args([
+            "run",
+            "echo",
+            "--filter",
+            "this-does-not-exist",
+            "--fail-if-no-match",
+        ])
+        .output()
+        .expect("failed to run lpm run --filter --fail-if-no-match");
+
+    assert!(
+        !output.status.success(),
+        "empty-match with --fail-if-no-match must exit non-zero"
+    );
+}
