@@ -14,7 +14,7 @@ async fn mount_lpm_package(mock: &MockRegistry, package: &str, version: &str) {
                 "name": package,
                 "version": version,
                 "dist": {
-                    "tarball": format!("{}/tarballs/{package}-{version}.tgz", mock.url()),
+                    "tarball": format!("{}/tarballs/{package}/-/{package}-{version}.tgz", mock.url()),
                     "integrity": compute_integrity(&tarball),
                 },
                 "dependencies": {}

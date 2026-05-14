@@ -189,7 +189,7 @@ async fn mount_batch_metadata(mock: &MockRegistry, packages: &[(&str, &str, &[u8
     let entries: Vec<serde_json::Value> = packages
         .iter()
         .map(|(name, version, tarball)| {
-            let tarball_url = format!("{}/tarballs/{name}-{version}.tgz", mock.url());
+            let tarball_url = format!("{}/tarballs/{name}/-/{name}-{version}.tgz", mock.url());
             let integrity = support::mock_registry::compute_integrity(tarball);
             let version_owned = (*version).to_string();
             let mut versions = serde_json::Map::new();

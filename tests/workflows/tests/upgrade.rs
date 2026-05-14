@@ -14,9 +14,11 @@ use support::mock_registry::{MockRegistry, compute_integrity, make_tarball};
 use support::{TempProject, lpm, lpm_with_registry};
 
 /// Mount `pkg` on the mock with `latest_version` exposed via metadata
-/// and a real tarball at `/tarballs/<name>-<version>.tgz`. Also wires
-/// the batch-metadata endpoint that the install pipeline calls when
-/// upgrade falls through to it.
+/// and a real tarball at the production-shaped path
+/// `/tarballs/<name>/-/<name>-<version>.tgz` (see
+/// [`MockRegistry::tarball_path`]). Also wires the batch-metadata
+/// endpoint that the install pipeline calls when upgrade falls
+/// through to it.
 async fn mount_lpm_pkg(mock: &MockRegistry, pkg: &str, latest_version: &str) {
     let tarball = make_tarball(pkg, latest_version);
     mock.with_package(pkg, latest_version, &tarball).await;
@@ -28,7 +30,7 @@ async fn mount_lpm_pkg(mock: &MockRegistry, pkg: &str, latest_version: &str) {
                 "name": pkg,
                 "version": latest_version,
                 "dist": {
-                    "tarball": format!("{}/tarballs/{pkg}-{latest_version}.tgz", mock.url()),
+                    "tarball": format!("{}/tarballs/{pkg}/-/{pkg}-{latest_version}.tgz", mock.url()),
                     "integrity": compute_integrity(&tarball),
                 },
                 "dependencies": {}
@@ -352,7 +354,7 @@ fn up7_tarball_path(name: &str, version: &str) -> String {
         .chars()
         .map(|ch| if ch.is_ascii_alphanumeric() { ch } else { '-' })
         .collect();
-    format!("/tarballs/{slug}-{version}.tgz")
+    format!("/tarballs/{slug}/-/{slug}-{version}.tgz")
 }
 
 fn up7_metadata(

@@ -48,6 +48,7 @@ pub mod mock_registry;
 pub mod verdaccio;
 pub mod verdaccio_proxy;
 
+use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use tempfile::TempDir;
 
@@ -139,15 +140,44 @@ impl TempProject {
     }
 }
 
-/// Build an `assert_cmd::Command` for the `lpm-rs` binary, pre-configured
-/// with full environment isolation pointing at the given `TempProject`.
+/// Common interface for `assert_cmd::Command` and `std::process::Command`
+/// so the workflow-tier env-isolation set can be applied uniformly to both.
 ///
-/// This ensures the binary never touches the developer's real HOME, store,
-/// auth tokens, or cache.
-pub fn lpm(project: &TempProject) -> assert_cmd::Command {
-    let mut cmd = assert_cmd::Command::cargo_bin("lpm-rs").expect("lpm-rs binary not found");
-    cmd.current_dir(project.path());
+/// Workflow tests default to `assert_cmd::Command` (via [`lpm`]) because
+/// it's wait-only and ergonomic. Concurrency tests in
+/// `install_concurrency.rs` need `Child::kill()`, which only
+/// `std::process::Command::spawn()` exposes — they use [`lpm_spawnable`]
+/// instead. Both helpers MUST apply identical env isolation; this trait
+/// is what enforces that.
+pub trait LpmEnvSink {
+    fn set_env(&mut self, key: &str, value: &OsStr);
+    fn remove_env(&mut self, key: &str);
+}
 
+impl LpmEnvSink for assert_cmd::Command {
+    fn set_env(&mut self, key: &str, value: &OsStr) {
+        self.env(key, value);
+    }
+    fn remove_env(&mut self, key: &str) {
+        self.env_remove(key);
+    }
+}
+
+impl LpmEnvSink for std::process::Command {
+    fn set_env(&mut self, key: &str, value: &OsStr) {
+        self.env(key, value);
+    }
+    fn remove_env(&mut self, key: &str) {
+        self.env_remove(key);
+    }
+}
+
+/// Apply the full workflow-tier env-isolation set to a command builder.
+///
+/// Shared by [`lpm`] and [`lpm_spawnable`] so the two helpers can't
+/// drift. Every env knob below was added to fix a specific test-isolation
+/// hole — keep the comments when editing this function.
+fn apply_lpm_env<S: LpmEnvSink>(cmd: &mut S, project: &TempProject) {
     // Isolate HOME so keyring, config, store, cache all land in temp dir.
     // POSIX hosts route through `$HOME` for `dirs::home_dir()`; Windows
     // does NOT (it calls `SHGetKnownFolderPath(FOLDERID_Profile)`, which
@@ -157,24 +187,30 @@ pub fn lpm(project: &TempProject) -> assert_cmd::Command {
     // any `dirs::home_dir()` fallback fires. Keep both: `HOME` keeps
     // POSIX paths working without forcing every test to opt into
     // `LPM_HOME`, and `LPM_HOME` is the cross-platform canonical knob.
-    cmd.env("HOME", project.home());
+    cmd.set_env("HOME", project.home().as_os_str());
     let lpm_home = project.home().join(".lpm");
-    cmd.env("LPM_HOME", &lpm_home);
+    cmd.set_env("LPM_HOME", lpm_home.as_os_str());
 
     // Isolate XDG dirs to prevent leaking desktop state
-    cmd.env("XDG_CONFIG_HOME", project.home().join(".config"));
-    cmd.env("XDG_DATA_HOME", project.home().join(".local/share"));
-    cmd.env("XDG_CACHE_HOME", project.home().join(".cache"));
+    cmd.set_env(
+        "XDG_CONFIG_HOME",
+        project.home().join(".config").as_os_str(),
+    );
+    cmd.set_env(
+        "XDG_DATA_HOME",
+        project.home().join(".local/share").as_os_str(),
+    );
+    cmd.set_env("XDG_CACHE_HOME", project.home().join(".cache").as_os_str());
 
     // Isolate LPM-specific paths. Note: production lpm-rs only reads
     // `LPM_HOME` (above) — these two are kept for documentation / future
     // override hooks but are currently dead env on the binary side.
-    cmd.env("LPM_STORE_DIR", project.store_dir());
-    cmd.env("LPM_CACHE_DIR", project.cache_dir());
+    cmd.set_env("LPM_STORE_DIR", project.store_dir().as_os_str());
+    cmd.set_env("LPM_CACHE_DIR", project.cache_dir().as_os_str());
 
     // Clear auth tokens to prevent accidental network calls with real creds
-    cmd.env_remove("LPM_TOKEN");
-    cmd.env_remove("NPM_TOKEN");
+    cmd.remove_env("LPM_TOKEN");
+    cmd.remove_env("NPM_TOKEN");
 
     // Clear CI-environment OIDC vars that GitHub Actions / GitLab inject
     // into every job. Without this, OIDC tests running ON GitHub Actions
@@ -190,25 +226,25 @@ pub fn lpm(project: &TempProject) -> assert_cmd::Command {
     // intentionally exercise a CI provider re-set the relevant vars
     // themselves on their command builder (later `cmd.env(...)` calls
     // override these `env_remove`s).
-    cmd.env_remove("GITHUB_ACTIONS");
-    cmd.env_remove("ACTIONS_ID_TOKEN_REQUEST_URL");
-    cmd.env_remove("ACTIONS_ID_TOKEN_REQUEST_TOKEN");
-    cmd.env_remove("GITLAB_CI");
-    cmd.env_remove("LPM_GITLAB_OIDC_TOKEN");
-    cmd.env_remove("CI_JOB_JWT");
-    cmd.env_remove("CI_JOB_JWT_V2");
+    cmd.remove_env("GITHUB_ACTIONS");
+    cmd.remove_env("ACTIONS_ID_TOKEN_REQUEST_URL");
+    cmd.remove_env("ACTIONS_ID_TOKEN_REQUEST_TOKEN");
+    cmd.remove_env("GITLAB_CI");
+    cmd.remove_env("LPM_GITLAB_OIDC_TOKEN");
+    cmd.remove_env("CI_JOB_JWT");
+    cmd.remove_env("CI_JOB_JWT_V2");
 
     // Force file-backed auth storage so workflow tests never touch the OS keychain.
-    cmd.env("LPM_FORCE_FILE_AUTH", "1");
-    cmd.env("LPM_TEST_FAST_SCRYPT", "1");
-    cmd.env("LPM_FORCE_FILE_VAULT", "1");
+    cmd.set_env("LPM_FORCE_FILE_AUTH", OsStr::new("1"));
+    cmd.set_env("LPM_TEST_FAST_SCRYPT", OsStr::new("1"));
+    cmd.set_env("LPM_FORCE_FILE_VAULT", OsStr::new("1"));
 
     // Clear `LPM_LINKER` so a developer's exported value (or a prior test
     // process) can't override the package.json + config.toml linker chain
     // we're trying to exercise. Tests that intentionally probe the env-var
     // surface re-set it on their own command builder.
-    cmd.env_remove("LPM_LINKER");
-    cmd.env_remove("LPM_CONCURRENT_DOWNLOADS");
+    cmd.remove_env("LPM_LINKER");
+    cmd.remove_env("LPM_CONCURRENT_DOWNLOADS");
 
     // Phase 66 Phase 4d — workflow tests assert on v1 layout shape
     // (e.g., `<project>/.lpm/wrappers/<seg>/`, hoisted-flat
@@ -223,13 +259,13 @@ pub fn lpm(project: &TempProject) -> assert_cmd::Command {
     // values and gates on no-asymmetric-outcomes. Tests that
     // intentionally exercise the v2 shape re-set this on their own
     // command builder.
-    cmd.env("LPM_STORE_VERSION", "v1");
+    cmd.set_env("LPM_STORE_VERSION", OsStr::new("v1"));
 
     // Disable color for deterministic output in assertions
-    cmd.env("NO_COLOR", "1");
+    cmd.set_env("NO_COLOR", OsStr::new("1"));
 
     // Disable update check (would make network calls)
-    cmd.env("LPM_NO_UPDATE_CHECK", "1");
+    cmd.set_env("LPM_NO_UPDATE_CHECK", OsStr::new("1"));
 
     // Phase 49: the shipped Direct route defaults hit `registry.npmjs.org`
     // for npm packages. Workflow tests use a single mock server at the
@@ -238,7 +274,7 @@ pub fn lpm(project: &TempProject) -> assert_cmd::Command {
     // so the mock's proxy-tier mounts serve all metadata fetches.
     // Individual tests that want to exercise Direct routing can
     // override this env.
-    cmd.env("LPM_NPM_ROUTE", "proxy");
+    cmd.set_env("LPM_NPM_ROUTE", OsStr::new("proxy"));
 
     // Phase 46.3 PR-2: on Windows, the install pipeline's sandbox
     // factory probes `current_exe().parent()` for
@@ -254,9 +290,41 @@ pub fn lpm(project: &TempProject) -> assert_cmd::Command {
     // Low IL fallback can override or unset.
     #[cfg(target_os = "windows")]
     if let Some(helper) = locate_test_sandbox_helper() {
-        cmd.env("LPM_SANDBOX_HELPER", helper);
+        cmd.set_env("LPM_SANDBOX_HELPER", helper.as_os_str());
     }
+}
 
+/// Build an `assert_cmd::Command` for the `lpm-rs` binary, pre-configured
+/// with full environment isolation pointing at the given `TempProject`.
+///
+/// This ensures the binary never touches the developer's real HOME, store,
+/// auth tokens, or cache.
+pub fn lpm(project: &TempProject) -> assert_cmd::Command {
+    let mut cmd = assert_cmd::Command::cargo_bin("lpm-rs").expect("lpm-rs binary not found");
+    cmd.current_dir(project.path());
+    apply_lpm_env(&mut cmd, project);
+    cmd
+}
+
+/// `std::process::Command` variant of [`lpm`] for tests that need
+/// `Child::kill()` or `Child::wait_with_output()` mid-pipeline —
+/// `assert_cmd::Command` is wait-only and can't be killed before it
+/// finishes.
+///
+/// Used by `install_concurrency.rs` for the SIGKILL-mid-install
+/// recovery tests and two-process race tests. Shares the env-isolation
+/// set with [`lpm`] via [`apply_lpm_env`] so the two helpers can't
+/// silently drift.
+///
+/// Defaults `stdout` and `stderr` to `Stdio::piped()` so callers can
+/// capture output after a `kill()` — `inherit` would lose it.
+pub fn lpm_spawnable(project: &TempProject) -> std::process::Command {
+    let bin = assert_cmd::cargo::cargo_bin("lpm-rs");
+    let mut cmd = std::process::Command::new(bin);
+    cmd.current_dir(project.path());
+    apply_lpm_env(&mut cmd, project);
+    cmd.stdout(std::process::Stdio::piped());
+    cmd.stderr(std::process::Stdio::piped());
     cmd
 }
 
@@ -279,6 +347,18 @@ fn locate_test_sandbox_helper() -> Option<PathBuf> {
 /// Build an `lpm` command pre-configured to use a mock registry.
 pub fn lpm_with_registry(project: &TempProject, registry_url: &str) -> assert_cmd::Command {
     let mut cmd = lpm(project);
+    cmd.args(["--registry", registry_url, "--insecure"]);
+    cmd
+}
+
+/// Spawnable variant of [`lpm_with_registry`] for tests that need
+/// `Child::kill()` or two-process races. Shares env isolation with
+/// [`lpm_with_registry`] via [`apply_lpm_env`].
+pub fn lpm_spawnable_with_registry(
+    project: &TempProject,
+    registry_url: &str,
+) -> std::process::Command {
+    let mut cmd = lpm_spawnable(project);
     cmd.args(["--registry", registry_url, "--insecure"]);
     cmd
 }

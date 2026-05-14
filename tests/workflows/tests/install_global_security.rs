@@ -129,7 +129,7 @@ async fn mount_global_tool_version(mock: &MockRegistry, version: &str, published
                 "version": version,
                 "dist": {
                     "tarball": format!(
-                        "{}/tarballs/{GLOBAL_E2E_PKG}-{version}.tgz",
+                        "{}/tarballs/{GLOBAL_E2E_PKG}/-/{GLOBAL_E2E_PKG}-{version}.tgz",
                         mock.url()
                     ),
                     "integrity": compute_integrity(&tarball),
@@ -162,7 +162,7 @@ async fn mount_global_scripted_tool_version(
                 "version": version,
                 "dist": {
                     "tarball": format!(
-                        "{}/tarballs/{GLOBAL_E2E_PKG}-{version}.tgz",
+                        "{}/tarballs/{GLOBAL_E2E_PKG}/-/{GLOBAL_E2E_PKG}-{version}.tgz",
                         mock.url()
                     ),
                     "integrity": compute_integrity(&tarball),

@@ -11,6 +11,7 @@ use std::process::Output;
 use support::verdaccio::VerdaccioRegistry;
 use support::verdaccio_proxy::{MetadataBehavior, TarballBehavior, VerdaccioProxyRegistry};
 use support::{TempProject, lpm};
+use tempfile::TempDir;
 
 fn run_install(project: &TempProject) -> Output {
     lpm(project)
@@ -708,4 +709,389 @@ async fn install_accepts_abbreviated_npm_install_v1_packument_from_proxy() {
         1,
         "abbreviated npm install-v1 metadata should still resolve one tarball fetch; got {received_paths:?}"
     );
+}
+
+/// Pin the contract that `lpm install <real-package>` produces a
+/// `node_modules/<pkg>/package.json` byte-equivalent to `npm install`'s
+/// output, modulo a documented allowlist of npm-only internal fields.
+///
+/// A regression that drops a load-bearing published field (e.g., `main`,
+/// `exports`, `bin`) from the extractor's output, or that starts mutating
+/// the package.json bytes after extraction, trips this test.
+///
+/// One shared Verdaccio process proxies `lodash@4.17.21` from the npmjs
+/// upstream so both clients consume the same tarball bytes. lpm runs first
+/// (system under test → cleaner failure diagnostic); npm reads from the
+/// already-warmed cache.
+///
+/// Skip-and-warn rather than fail when `npm` is missing — the Verdaccio
+/// harness already needs `npx`, so `npm` is almost always available too,
+/// but a CI runner with `npx` and no `npm` should still get a clean run.
+#[tokio::test]
+async fn flow_lpm_vs_npm_install_lodash_diff_within_documented_tolerance() {
+    if !npm_is_available() {
+        eprintln!(
+            "SKIP flow_lpm_vs_npm_install_lodash_diff_within_documented_tolerance: \
+             `npm --version` failed (npm not on PATH?)"
+        );
+        return;
+    }
+
+    let registry = VerdaccioRegistry::start().await;
+
+    let lpm_project = TempProject::empty(
+        r#"{
+            "name": "lpm-diff-probe",
+            "version": "1.0.0",
+            "dependencies": {
+                "lodash": "4.17.21"
+            }
+        }"#,
+    );
+    registry.write_project_npmrc(lpm_project.path());
+
+    let lpm_output = run_install(&lpm_project);
+    assert!(
+        lpm_output.status.success(),
+        "lpm install lodash through verdaccio failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&lpm_output.stdout),
+        String::from_utf8_lossy(&lpm_output.stderr),
+    );
+    let lpm_pkg_json_path = lpm_project
+        .path()
+        .join("node_modules")
+        .join("lodash")
+        .join("package.json");
+    assert!(
+        lpm_pkg_json_path.exists(),
+        "lpm install must materialize node_modules/lodash/package.json at {}",
+        lpm_pkg_json_path.display(),
+    );
+
+    let npm_project = TempProject::empty(
+        r#"{
+            "name": "npm-diff-probe",
+            "version": "1.0.0",
+            "dependencies": {
+                "lodash": "4.17.21"
+            }
+        }"#,
+    );
+    registry.write_project_npmrc(npm_project.path());
+    run_npm_install(&npm_project, registry.url());
+    let npm_pkg_json_path = npm_project
+        .path()
+        .join("node_modules")
+        .join("lodash")
+        .join("package.json");
+    assert!(
+        npm_pkg_json_path.exists(),
+        "npm install must materialize node_modules/lodash/package.json at {}",
+        npm_pkg_json_path.display(),
+    );
+
+    let mut lpm_pkg: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(&lpm_pkg_json_path).expect("read lpm lodash package.json"),
+    )
+    .expect("lpm-installed lodash package.json must parse as JSON");
+    let mut npm_pkg: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(&npm_pkg_json_path).expect("read npm lodash package.json"),
+    )
+    .expect("npm-installed lodash package.json must parse as JSON");
+
+    // Symmetric strip: lpm-rs is not expected to write any of these,
+    // but stripping both sides keeps the diff focused on the package's
+    // user-facing contract even when an older npm in CI injects them.
+    strip_npm_internal_fields(&mut lpm_pkg);
+    strip_npm_internal_fields(&mut npm_pkg);
+
+    assert_eq!(
+        lpm_pkg,
+        npm_pkg,
+        "lpm install lodash@4.17.21 produced a node_modules package.json that \
+         differs from npm install's output (after stripping documented npm-internal \
+         fields). If a NEW field diverges intentionally, extend \
+         strip_npm_internal_fields with a justification.\n\
+         --- lpm side ---\n{}\n--- npm side ---\n{}",
+        serde_json::to_string_pretty(&lpm_pkg).unwrap(),
+        serde_json::to_string_pretty(&npm_pkg).unwrap(),
+    );
+}
+
+fn npm_is_available() -> bool {
+    std::process::Command::new("npm")
+        .arg("--version")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+fn run_npm_install(project: &TempProject, registry_url: &str) {
+    let npm_home = TempDir::new().expect("failed to create npm HOME temp dir");
+    let output = std::process::Command::new("npm")
+        .arg("install")
+        .arg("--registry")
+        .arg(registry_url)
+        .arg("--no-audit")
+        .arg("--no-fund")
+        .arg("--no-update-notifier")
+        .arg("--loglevel=error")
+        .current_dir(project.path())
+        .env("HOME", npm_home.path())
+        // Force npm to read the test's project-local .npmrc as user config
+        // too, so the auth token + always-auth=true take effect even on hosts
+        // where a real ~/.npmrc exists.
+        .env("NPM_CONFIG_USERCONFIG", project.path().join(".npmrc"))
+        .env("NO_COLOR", "1")
+        .env_remove("NPM_TOKEN")
+        .output()
+        .expect("failed to spawn npm install");
+
+    assert!(
+        output.status.success(),
+        "npm install lodash through verdaccio failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+}
+
+/// Strip npm-internal metadata that historical npm versions injected into
+/// `node_modules/<pkg>/package.json` (vs. the published `package.json`).
+///
+/// npm@10 stopped writing these entirely, but older npm versions in CI
+/// runners still emit them; stripping keeps the diff focused on the
+/// package's user-facing contract (`name`, `version`, `main`, `exports`,
+/// `bin`, `dependencies`, `peerDependencies`, `license`, `engines`, ...).
+fn strip_npm_internal_fields(value: &mut serde_json::Value) {
+    if let Some(obj) = value.as_object_mut() {
+        // Every `_*` key is npm-internal (`_resolved`, `_integrity`,
+        // `_from`, `_id`, `_shasum`, `_npmVersion`, `_nodeVersion`,
+        // `_npmUser`, `_npmOperationalInternal`, `_hasShrinkwrap`,
+        // `_inBundle`, `_requested`, `_spec`, `_where`, `_args`,
+        // `_phantomChildren`, `_optional`, `_development`, ...). Strip
+        // by prefix so future npm-internal keys don't break the test.
+        obj.retain(|k, _| !k.starts_with('_'));
+
+        // Non-prefixed npm-internal fields that some npm versions inject:
+        //   * `dist` — registry-packument metadata (tarball URL, integrity)
+        //   * `gitHead` — publisher's git HEAD at publish time
+        //   * `readme` / `readmeFilename` — npm sometimes inlines README
+        for k in ["dist", "gitHead", "readme", "readmeFilename"] {
+            obj.remove(k);
+        }
+    }
+}
+
+/// Verdaccio-npm parity for a real package that ships a `bin` entry —
+/// pins the contract that `lpm install which@4.0.0` produces a
+/// `node_modules` layout congruent with `npm install`'s output across
+/// (a) the published `node_modules/<pkg>/package.json` (modulo the
+/// same npm-internal allowlist as the lodash diff test) AND (b) the
+/// `node_modules/.bin/<bin-name>` shim that links the executable.
+///
+/// **Why this complements the lodash test.** Lodash has no `bin`
+/// field, so `flow_lpm_vs_npm_install_lodash_diff_within_documented_tolerance`
+/// only exercises the metadata-equivalence half of the contract.
+/// `which@4.0.0` ships exactly one bin (`node-which → ./bin/which.js`),
+/// which makes it the smallest interesting target to compare:
+///
+/// - lpm's bin-shim writer ([crates/lpm-linker/src/v2.rs](../../../crates/lpm-linker/src/v2.rs)::`create_bin_links_v2`)
+///   creates `.bin/<name>` as a symlink (isolated linker) or a
+///   `cmd-shim` script (hoisted/cross-platform). npm produces a
+///   similar shape but with its own shebang convention.
+/// - The test pins the user-visible contract: `.bin/<name>` exists
+///   AND its resolution lands on the bin target inside `node_modules/<pkg>/`.
+///   The exact shim format (symlink vs. script body) is deliberately
+///   NOT pinned — those are manager-internal details and would lock
+///   us into npm-specific shim shapes we don't want to copy.
+///
+/// **Why `which@4.0.0` specifically:**
+/// - Published 2022-08, no foreseeable churn.
+/// - Single, named bin (`node-which`), easy to assert against.
+/// - Tiny package surface: 1 transitive dep (`isexe`) that we
+///   don't need to assert on but proves the install handled
+///   sub-resolution correctly.
+/// - The bin target path (`./bin/which.js`) is a relative path
+///   under the package dir, which is the common case the linker
+///   handles.
+///
+/// Skip-and-warn rather than fail when `npm` is missing — same posture
+/// as the lodash test, so a CI runner with `npx` but no `npm` produces
+/// a clean run.
+#[tokio::test]
+async fn verdaccio_npm_parity_for_bin_package_pins_metadata_and_shim_presence() {
+    if !npm_is_available() {
+        eprintln!(
+            "SKIP verdaccio_npm_parity_for_bin_package_pins_metadata_and_shim_presence: \
+             `npm --version` failed (npm not on PATH?)"
+        );
+        return;
+    }
+
+    let registry = VerdaccioRegistry::start().await;
+
+    let lpm_project = TempProject::empty(
+        r#"{
+            "name": "lpm-bin-diff-probe",
+            "version": "1.0.0",
+            "dependencies": {
+                "which": "4.0.0"
+            }
+        }"#,
+    );
+    registry.write_project_npmrc(lpm_project.path());
+
+    let lpm_output = run_install(&lpm_project);
+    assert!(
+        lpm_output.status.success(),
+        "lpm install which@4.0.0 through verdaccio failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&lpm_output.stdout),
+        String::from_utf8_lossy(&lpm_output.stderr),
+    );
+
+    let lpm_pkg_json_path = lpm_project
+        .path()
+        .join("node_modules")
+        .join("which")
+        .join("package.json");
+    assert!(
+        lpm_pkg_json_path.exists(),
+        "lpm install must materialize node_modules/which/package.json at {}",
+        lpm_pkg_json_path.display(),
+    );
+
+    let npm_project = TempProject::empty(
+        r#"{
+            "name": "npm-bin-diff-probe",
+            "version": "1.0.0",
+            "dependencies": {
+                "which": "4.0.0"
+            }
+        }"#,
+    );
+    registry.write_project_npmrc(npm_project.path());
+    run_npm_install(&npm_project, registry.url());
+
+    let npm_pkg_json_path = npm_project
+        .path()
+        .join("node_modules")
+        .join("which")
+        .join("package.json");
+    assert!(
+        npm_pkg_json_path.exists(),
+        "npm install must materialize node_modules/which/package.json at {}",
+        npm_pkg_json_path.display(),
+    );
+
+    // (a) Metadata parity — same allowlist as the lodash test, so the
+    // same npm-internal `_*` + `dist`/`gitHead`/`readme*` fields are
+    // stripped symmetrically before comparison.
+    let mut lpm_pkg: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(&lpm_pkg_json_path).expect("read lpm which package.json"),
+    )
+    .expect("lpm-installed which package.json must parse as JSON");
+    let mut npm_pkg: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(&npm_pkg_json_path).expect("read npm which package.json"),
+    )
+    .expect("npm-installed which package.json must parse as JSON");
+
+    strip_npm_internal_fields(&mut lpm_pkg);
+    strip_npm_internal_fields(&mut npm_pkg);
+
+    assert_eq!(
+        lpm_pkg,
+        npm_pkg,
+        "lpm install which@4.0.0 produced a node_modules package.json that \
+         differs from npm install's output (after stripping documented npm-internal \
+         fields). If a NEW field diverges intentionally, extend \
+         strip_npm_internal_fields with a justification.\n\
+         --- lpm side ---\n{}\n--- npm side ---\n{}",
+        serde_json::to_string_pretty(&lpm_pkg).unwrap(),
+        serde_json::to_string_pretty(&npm_pkg).unwrap(),
+    );
+
+    // Pre-flight on the published `bin` field — `which@4.0.0` ships
+    // `bin: { "node-which": "./bin/which.js" }`. If a future npm
+    // republish changes the bin shape, the lpm side would still match
+    // npm (the test pins parity, not absolute values), but the
+    // assertions below assume a specific bin name. Surface that
+    // assumption explicitly so a republish breakage gives a clear
+    // diagnostic rather than a confused symlink-target assertion.
+    let lpm_bin_decl = lpm_pkg
+        .get("bin")
+        .and_then(|v| v.as_object())
+        .and_then(|m| m.get("node-which"))
+        .and_then(|v| v.as_str());
+    assert_eq!(
+        lpm_bin_decl,
+        Some("./bin/which.js"),
+        "which@4.0.0's `bin.node-which` no longer points to `./bin/which.js` — \
+         the published package shape changed. Update this test's bin-target \
+         assertion to match. Current bin map: {:?}",
+        lpm_pkg.get("bin")
+    );
+
+    // (b) Shim presence + target resolution. The .bin/<name> entry
+    // must exist on BOTH sides and the target file must exist inside
+    // node_modules/which/.
+    let bin_name = "node-which";
+    let bin_target_rel = "node_modules/which/bin/which.js";
+
+    let lpm_shim = lpm_project.path().join("node_modules/.bin").join(bin_name);
+    let npm_shim = npm_project.path().join("node_modules/.bin").join(bin_name);
+
+    assert!(
+        lpm_shim.symlink_metadata().is_ok(),
+        "lpm install must create node_modules/.bin/{bin_name} for which@4.0.0; \
+         path checked: {lpm_shim:?}"
+    );
+    assert!(
+        npm_shim.symlink_metadata().is_ok(),
+        "npm install must create node_modules/.bin/{bin_name} for which@4.0.0; \
+         path checked: {npm_shim:?}"
+    );
+
+    // The bin target file inside node_modules/which/ must be present.
+    // This proves the linker materialized the actual executable, not
+    // just a dangling shim.
+    let lpm_target = lpm_project.path().join(bin_target_rel);
+    let npm_target = npm_project.path().join(bin_target_rel);
+    assert!(
+        lpm_target.exists(),
+        "lpm install must materialize the bin target at {lpm_target:?}"
+    );
+    assert!(
+        npm_target.exists(),
+        "npm install must materialize the bin target at {npm_target:?}"
+    );
+
+    // On Unix, also pin executability. NTFS dispatches bin scripts by
+    // extension instead of mode bits, so this assertion is POSIX-only.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let lpm_target_mode = std::fs::metadata(&lpm_target)
+            .expect("stat lpm bin target")
+            .permissions()
+            .mode()
+            & 0o111;
+        assert!(
+            lpm_target_mode != 0,
+            "lpm bin target {lpm_target:?} is not executable (no exec bits in mode); \
+             the linker dropped the published exec bits during extraction"
+        );
+        let npm_target_mode = std::fs::metadata(&npm_target)
+            .expect("stat npm bin target")
+            .permissions()
+            .mode()
+            & 0o111;
+        assert!(
+            npm_target_mode != 0,
+            "npm bin target {npm_target:?} is not executable — unexpected; \
+             this is npm-internal but the assertion symmetry catches a \
+             tooling regression on the npm side too"
+        );
+    }
 }

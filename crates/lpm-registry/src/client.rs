@@ -3788,7 +3788,14 @@ impl RegistryClient {
                                 retry_after_secs: retry_after,
                             });
                             if attempt < MAX_RETRIES {
-                                tokio::time::sleep(Duration::from_secs(retry_after)).await;
+                                // Finding #78: honor the test-only
+                                // backoff override here too so a
+                                // 429-flood retry-exhaustion test
+                                // doesn't hang on the server-supplied
+                                // Retry-After header.
+                                let delay = backoff_override()
+                                    .unwrap_or_else(|| Duration::from_secs(retry_after));
+                                tokio::time::sleep(delay).await;
                                 continue;
                             }
                         }
@@ -3885,7 +3892,12 @@ impl RegistryClient {
                                 retry_after_secs: retry_after,
                             });
                             if attempt < MAX_RETRIES {
-                                tokio::time::sleep(Duration::from_secs(retry_after)).await;
+                                // Finding #78: honor the test-only
+                                // backoff override here too — see the
+                                // sibling site in publish-path.
+                                let delay = backoff_override()
+                                    .unwrap_or_else(|| Duration::from_secs(retry_after));
+                                tokio::time::sleep(delay).await;
                                 continue;
                             }
                         }
@@ -4170,9 +4182,60 @@ fn flush_tarball_file(writer: &mut impl std::io::Write) -> Result<(), LpmError> 
 
 /// Exponential backoff with capped delay.
 /// attempt 0 → 1s, attempt 1 → 2s, attempt 2 → 4s, capped at 10s.
+///
+/// **Test-only override** ([`backoff_override`]): when
+/// `LPM_RETRY_BACKOFF_MS_OVERRIDE` is set AND we're in a debug build OR
+/// `LPM_TEST_MODE=1` is set, the override value (in ms) is returned
+/// instead of the exponential schedule. Production retry policy is
+/// immune — the env is silently ignored under release builds without
+/// the explicit `LPM_TEST_MODE=1` opt-in. See finding #78.
 fn backoff_delay(attempt: u32) -> Duration {
+    if let Some(d) = backoff_override() {
+        return d;
+    }
     let delay = RETRY_BASE_DELAY * 2u32.pow(attempt);
     delay.min(RETRY_MAX_DELAY)
+}
+
+/// Test-only retry-backoff override knob.
+///
+/// Returns `Some(Duration::from_millis(N))` when ALL three conditions
+/// hold:
+///
+/// 1. `LPM_RETRY_BACKOFF_MS_OVERRIDE` env var is set to a parseable u64.
+/// 2. The build is `debug_assertions` (i.e., `cargo build` /
+///    `cargo test` / `cargo nextest`) OR `LPM_TEST_MODE=1`.
+/// 3. The parsed value fits a `Duration::from_millis(...)` (always
+///    true for u64).
+///
+/// Returns `None` otherwise — production retry policy untouched.
+///
+/// Used by the workflow tier's retry-exhaustion tests
+/// ([install_concurrency.rs::tarball_503_exhausts_retries_fails_with_http_status](../../../tests/workflows/tests/install_concurrency.rs))
+/// to shrink the default 1+2+4+8s schedule into ~10ms so the test
+/// fits in the suite's <5s determinism budget. Without this knob,
+/// retry-exhaustion proof would take ~28s per test (4 attempts × 2
+/// distinct `download_tarball_*` call sites in the install
+/// pipeline), forcing every retry-exhaustion contract to be
+/// `#[ignore]`-gated. See finding #78 for the full rationale.
+///
+/// Also consulted by the 429 `Retry-After` sleep — without that, a
+/// 429-flood test would still hang on the server-supplied
+/// `Retry-After` header.
+fn backoff_override() -> Option<Duration> {
+    let allowed = cfg!(debug_assertions)
+        || std::env::var("LPM_TEST_MODE")
+            .ok()
+            .as_deref()
+            .map(|v| v == "1")
+            .unwrap_or(false);
+    if !allowed {
+        return None;
+    }
+    std::env::var("LPM_RETRY_BACKOFF_MS_OVERRIDE")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .map(Duration::from_millis)
 }
 
 /// Phase 53 W5.2 — parse a cached metadata blob.

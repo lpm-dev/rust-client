@@ -147,7 +147,7 @@ async fn mount_native_dep(mock: &MockRegistry, tarball: &[u8]) {
     mock.with_package(NATIVE_DEP_NAME, NATIVE_DEP_VERSION, tarball)
         .await;
     let tarball_url = format!(
-        "{}/tarballs/{NATIVE_DEP_NAME}-{NATIVE_DEP_VERSION}.tgz",
+        "{}/tarballs/{NATIVE_DEP_NAME}/-/{NATIVE_DEP_NAME}-{NATIVE_DEP_VERSION}.tgz",
         mock.url()
     );
     let integrity = support::mock_registry::compute_integrity(tarball);
