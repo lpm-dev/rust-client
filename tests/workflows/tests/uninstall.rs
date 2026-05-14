@@ -354,3 +354,182 @@ fn uninstall_json_envelope_with_one_removal_matches_snapshot() {
         insta::assert_json_snapshot!("uninstall_json_envelope_one_removal", envelope);
     });
 }
+
+// ─── Workspace dispatch: --filter / -w ─────────────────────────────────
+
+fn seed_workspace_with_shared_dep(project: &TempProject) {
+    // Add `lodash` to both app and utils so we can verify --filter
+    // mutates only the targeted member's package.json.
+    for member in ["app", "utils"] {
+        let pkg_path = format!("packages/{member}/package.json");
+        let pkg_content = project.read_file(&pkg_path);
+        let mut pkg: serde_json::Value =
+            serde_json::from_str(&pkg_content).expect("parse member package.json");
+        let deps = pkg["dependencies"]
+            .as_object_mut()
+            .expect("dependencies must be an object");
+        deps.insert("lodash".to_string(), serde_json::json!("4.17.21"));
+        project.write_file(&pkg_path, &serde_json::to_string_pretty(&pkg).unwrap());
+    }
+}
+
+fn read_member_deps(
+    project: &TempProject,
+    member: &str,
+) -> serde_json::Map<String, serde_json::Value> {
+    let content = project.read_file(&format!("packages/{member}/package.json"));
+    let pkg: serde_json::Value = serde_json::from_str(&content).expect("parse member package.json");
+    pkg["dependencies"].as_object().cloned().unwrap_or_default()
+}
+
+#[test]
+fn uninstall_filter_removes_only_from_targeted_member() {
+    let project = TempProject::from_fixture("workspace-monorepo");
+    seed_workspace_with_shared_dep(&project);
+
+    let output = lpm(&project)
+        .args(["uninstall", "lodash", "--filter", "@test/app", "--yes"])
+        .output()
+        .expect("failed to run lpm uninstall --filter");
+
+    assert!(
+        output.status.success(),
+        "uninstall --filter must succeed\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+
+    let app_deps = read_member_deps(&project, "app");
+    let utils_deps = read_member_deps(&project, "utils");
+
+    assert!(
+        !app_deps.contains_key("lodash"),
+        "lodash must be removed from @test/app, got: {app_deps:?}"
+    );
+    assert!(
+        utils_deps.contains_key("lodash"),
+        "lodash must remain in @test/utils (not in filter), got: {utils_deps:?}"
+    );
+}
+
+#[test]
+fn uninstall_workspace_root_removes_from_root_only() {
+    let project = TempProject::from_fixture("workspace-monorepo");
+    // Add lodash to the workspace root manifest.
+    let root_content = project.read_file("package.json");
+    let mut root_pkg: serde_json::Value =
+        serde_json::from_str(&root_content).expect("parse root package.json");
+    root_pkg["dependencies"] = serde_json::json!({ "lodash": "4.17.21" });
+    project.write_file(
+        "package.json",
+        &serde_json::to_string_pretty(&root_pkg).unwrap(),
+    );
+    seed_workspace_with_shared_dep(&project);
+
+    let output = lpm(&project)
+        .args(["uninstall", "lodash", "-w"])
+        .output()
+        .expect("failed to run lpm uninstall -w");
+
+    assert!(
+        output.status.success(),
+        "uninstall -w must succeed\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+
+    let root_content_after = project.read_file("package.json");
+    let root_after: serde_json::Value = serde_json::from_str(&root_content_after).unwrap();
+    let root_deps = root_after["dependencies"]
+        .as_object()
+        .cloned()
+        .unwrap_or_default();
+    assert!(
+        !root_deps.contains_key("lodash"),
+        "lodash must be removed from workspace root, got: {root_deps:?}"
+    );
+
+    // Members untouched
+    let app_deps = read_member_deps(&project, "app");
+    let utils_deps = read_member_deps(&project, "utils");
+    assert!(
+        app_deps.contains_key("lodash"),
+        "uninstall -w must not touch member manifests, got: {app_deps:?}"
+    );
+    assert!(
+        utils_deps.contains_key("lodash"),
+        "uninstall -w must not touch member manifests, got: {utils_deps:?}"
+    );
+}
+
+#[test]
+fn uninstall_filter_typo_without_fail_flag_exits_zero() {
+    let project = TempProject::from_fixture("workspace-monorepo");
+    seed_workspace_with_shared_dep(&project);
+
+    let output = lpm(&project)
+        .args([
+            "uninstall",
+            "lodash",
+            "--filter",
+            "this-package-does-not-exist",
+        ])
+        .output()
+        .expect("failed to run lpm uninstall --filter (typo)");
+
+    assert!(
+        output.status.success(),
+        "empty-match without --fail-if-no-match must exit 0"
+    );
+
+    // Nothing should have been removed.
+    let app_deps = read_member_deps(&project, "app");
+    assert!(
+        app_deps.contains_key("lodash"),
+        "no member must be mutated when filter matches nothing"
+    );
+}
+
+#[test]
+fn uninstall_filter_typo_with_fail_flag_exits_nonzero() {
+    let project = TempProject::from_fixture("workspace-monorepo");
+    seed_workspace_with_shared_dep(&project);
+
+    let output = lpm(&project)
+        .args([
+            "uninstall",
+            "lodash",
+            "--filter",
+            "this-package-does-not-exist",
+            "--fail-if-no-match",
+        ])
+        .output()
+        .expect("failed to run lpm uninstall --filter --fail-if-no-match");
+
+    assert!(
+        !output.status.success(),
+        "empty-match with --fail-if-no-match must exit non-zero"
+    );
+}
+
+#[test]
+fn uninstall_w_and_filter_together_is_rejected() {
+    let project = TempProject::from_fixture("workspace-monorepo");
+    seed_workspace_with_shared_dep(&project);
+
+    let output = lpm(&project)
+        .args(["uninstall", "lodash", "-w", "--filter", "@test/app"])
+        .output()
+        .expect("failed to run lpm uninstall -w --filter");
+
+    assert!(
+        !output.status.success(),
+        "-w + --filter together must be rejected (mutually exclusive)"
+    );
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("`-w`") || stderr.contains("`--filter`") || stderr.contains("filter"),
+        "stderr must explain the mutual-exclusion, got:\n{stderr}",
+    );
+}
