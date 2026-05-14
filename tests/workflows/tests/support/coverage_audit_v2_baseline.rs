@@ -1813,10 +1813,11 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
     // ── id 85: lpm exec <file> ──
     SurfaceV2 {
         id: 85,
-        scenarios: 2,
+        scenarios: 3,
         failure_modes_tested: &[
             "loads dotenv + forwards args",
             "missing file fails before runtime execution",
+            "missing file under --json emits error envelope on stdout",
         ],
         failure_modes_known: &[
             "file permission denied",
@@ -1824,7 +1825,7 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
             "exec under sandbox / strict-egress mode",
             "exec of a file with shebang resolving to an absent interpreter",
         ],
-        json_contract_depth: JsonContractDepth::None,
+        json_contract_depth: JsonContractDepth::SemanticAsserts,
         scenarios_by_file: &[],
         last_audited_at: "2026-05-14",
     },
@@ -1951,10 +1952,11 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
     // ── id 92: lpm bench ──
     SurfaceV2 {
         id: 92,
-        scenarios: 2,
+        scenarios: 3,
         failure_modes_tested: &[
             "multi-member watch rejected with count",
             "filter one-member with watch hands off to single-package",
+            "no-runner error envelope on stdout under --json",
         ],
         failure_modes_known: &[
             "benchmark timeout handling",
@@ -1962,8 +1964,8 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
             "cross-platform timing variance",
             "bench against a member with no bench script",
         ],
-        json_contract_depth: JsonContractDepth::None,
-        scenarios_by_file: &[("tests/workflows/tests/tools.rs", 2)],
+        json_contract_depth: JsonContractDepth::SemanticAsserts,
+        scenarios_by_file: &[("tests/workflows/tests/tools.rs", 3)],
         last_audited_at: "2026-05-14",
     },
     // ── id 93: lpm ci env ──
@@ -1987,15 +1989,18 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
     // ── id 94: lpm ci setup github-actions ──
     SurfaceV2 {
         id: 94,
-        scenarios: 1,
-        failure_modes_tested: &["uses project vault id + requested env name"],
+        scenarios: 2,
+        failure_modes_tested: &[
+            "uses project vault id + requested env name",
+            "unknown-platform error envelope on stdout under --json (shared dispatcher with id 95)",
+        ],
         failure_modes_known: &[
             "malformed vault config",
             "concurrent workflow setup",
             "token expiry mid-setup",
             "setup against a workflow file the user has hand-edited",
         ],
-        json_contract_depth: JsonContractDepth::None,
+        json_contract_depth: JsonContractDepth::SemanticAsserts,
         scenarios_by_file: &[],
         last_audited_at: "2026-05-14",
     },
@@ -2007,6 +2012,7 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
             "gitlab emits id-tokens block + authorization command",
             "gitlab with --env-flag threads the env name",
             "unknown platform fails with helpful message",
+            "unknown-platform error envelope on stdout under --json",
             "without platform arg fails with usage message",
         ],
         failure_modes_known: &[
@@ -2015,7 +2021,7 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
             "concurrent gitlab setup",
             "gitlab CI YAML already contains conflicting id_tokens stanza",
         ],
-        json_contract_depth: JsonContractDepth::None,
+        json_contract_depth: JsonContractDepth::SemanticAsserts,
         scenarios_by_file: &[],
         last_audited_at: "2026-05-14",
     },
@@ -2324,11 +2330,12 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
     // ── id 114: lpm graph --format html ──
     SurfaceV2 {
         id: 114,
-        scenarios: 3,
+        scenarios: 4,
         failure_modes_tested: &[
             "html writes to .lpm dir + respects --no-open",
             "--no-open without --html warns + prints to stdout",
             "--no-open warning suppressed under global --json flag",
+            "missing-lockfile under --json emits error envelope on stdout",
         ],
         failure_modes_known: &[
             "file write permission denied",
@@ -2336,25 +2343,26 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
             "HTML rendering for large graphs (>1000 nodes)",
             "HTML output written to a path that already exists as a directory",
         ],
-        json_contract_depth: JsonContractDepth::None,
+        json_contract_depth: JsonContractDepth::SemanticAsserts,
         scenarios_by_file: &[],
         last_audited_at: "2026-05-14",
     },
     // ── id 115: lpm graph --format dot / mermaid / stats ──
     SurfaceV2 {
         id: 115,
-        scenarios: 3,
+        scenarios: 4,
         failure_modes_tested: &[
             "--format dot emits valid dot syntax to stdout",
             "--format mermaid emits valid mermaid syntax to stdout",
             "stats max-depth matches flag input",
+            "missing-lockfile under --json emits error envelope on stdout (all 3 formats)",
         ],
         failure_modes_known: &[
             "unsupported --format value error path",
             "graph-too-large for mermaid (rendering fail under viewer)",
             "dot output piped through `graphviz -Tsvg` parity (extern tool)",
         ],
-        json_contract_depth: JsonContractDepth::None,
+        json_contract_depth: JsonContractDepth::SemanticAsserts,
         scenarios_by_file: &[],
         last_audited_at: "2026-05-14",
     },
