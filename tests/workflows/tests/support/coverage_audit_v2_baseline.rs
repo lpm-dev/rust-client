@@ -164,7 +164,7 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
             "search across paginated result sets",
         ],
         json_contract_depth: JsonContractDepth::InstaSnapshot,
-        scenarios_by_file: &[],
+        scenarios_by_file: &[("tests/workflows/tests/search.rs", 3)],
         last_audited_at: "2026-05-14",
     },
     // ── id 3: lpm quality <pkg> ──
@@ -182,7 +182,7 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
             "missing-package quality lookup",
         ],
         json_contract_depth: JsonContractDepth::InstaSnapshot,
-        scenarios_by_file: &[],
+        scenarios_by_file: &[("tests/workflows/tests/quality.rs", 2)],
         last_audited_at: "2026-05-14",
     },
     // ── id 4: lpm whoami ──
@@ -245,7 +245,7 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
             "registry follows untrusted same-origin redirect",
         ],
         json_contract_depth: JsonContractDepth::SemanticAsserts,
-        scenarios_by_file: &[],
+        scenarios_by_file: &[("tests/workflows/tests/download.rs", 1)],
         last_audited_at: "2026-05-14",
     },
     // ── id 7: lpm resolve <pkgs> ──
@@ -264,7 +264,7 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
             "mixed scoped + unscoped multi-package query",
         ],
         json_contract_depth: JsonContractDepth::InstaSnapshot,
-        scenarios_by_file: &[],
+        scenarios_by_file: &[("tests/workflows/tests/resolve.rs", 3)],
         last_audited_at: "2026-05-14",
     },
     // ── id 8: lpm outdated ──
@@ -287,7 +287,7 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
             "outdated against private registry under .npmrc routing",
         ],
         json_contract_depth: JsonContractDepth::InstaSnapshot,
-        scenarios_by_file: &[],
+        scenarios_by_file: &[("tests/workflows/tests/outdated.rs", 7)],
         last_audited_at: "2026-05-14",
     },
     // ── id 9: lpm doctor ──
@@ -335,7 +335,7 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
             "fix on a project whose package.json is intentionally exotic",
         ],
         json_contract_depth: JsonContractDepth::SemanticAsserts,
-        scenarios_by_file: &[],
+        scenarios_by_file: &[("tests/workflows/tests/doctor_fix.rs", 4)],
         last_audited_at: "2026-05-14",
     },
     // ── id 11: lpm init ──
@@ -353,7 +353,7 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
             "init under a directory whose parent is not a git repo",
         ],
         json_contract_depth: JsonContractDepth::InstaSnapshot,
-        scenarios_by_file: &[],
+        scenarios_by_file: &[("tests/workflows/tests/init.rs", 2)],
         last_audited_at: "2026-05-14",
     },
     // ── id 12: lpm install (bare, lockfile fast-path) ──
@@ -392,7 +392,12 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
             "user CTRL-C between download and link phase",
         ],
         json_contract_depth: JsonContractDepth::InstaSnapshot,
-        scenarios_by_file: &[],
+        scenarios_by_file: &[
+            ("tests/workflows/tests/install.rs", 17),
+            ("tests/workflows/tests/install_real_registry.rs", 14),
+            ("tests/workflows/tests/install_overrides.rs", 7),
+            ("tests/workflows/tests/install_patches.rs", 12),
+        ],
         last_audited_at: "2026-05-14",
     },
     // ── id 13: lpm install <pkg> (add-and-install) ──
@@ -417,7 +422,7 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
             "save-prefix from CLI overriding malformed lpm.toml",
         ],
         json_contract_depth: JsonContractDepth::SemanticAsserts,
-        scenarios_by_file: &[],
+        scenarios_by_file: &[("tests/workflows/tests/install.rs", 9)],
         last_audited_at: "2026-05-14",
     },
     // ── id 14: lpm install --offline ──
@@ -439,7 +444,13 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
             "offline against pre-r25 v1 lockfile shape (cross-checked elsewhere)",
         ],
         json_contract_depth: JsonContractDepth::SemanticAsserts,
-        scenarios_by_file: &[],
+        scenarios_by_file: &[
+            ("tests/workflows/tests/install.rs", 5),
+            (
+                "tests/workflows/tests/install_offline_capability_roundtrip.rs",
+                1,
+            ),
+        ],
         last_audited_at: "2026-05-14",
     },
     // ── id 15: lpm install --filter / -w (workspace) ──
@@ -462,7 +473,7 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
             "concurrent install --filter A and --filter B on same workspace",
         ],
         json_contract_depth: JsonContractDepth::SemanticAsserts,
-        scenarios_by_file: &[],
+        scenarios_by_file: &[("tests/workflows/tests/install.rs", 10)],
         last_audited_at: "2026-05-14",
     },
     // ── id 16: lpm install -g (global) ──
@@ -487,7 +498,7 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
             "shim repair after upstream binary rename",
         ],
         json_contract_depth: JsonContractDepth::SemanticAsserts,
-        scenarios_by_file: &[],
+        scenarios_by_file: &[("tests/workflows/tests/install_global_security.rs", 8)],
         last_audited_at: "2026-05-14",
     },
     // ── id 17: lpm install --policy / --yolo ──
@@ -511,7 +522,7 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
             "policy override via package.json > lpm > scriptPolicy",
         ],
         json_contract_depth: JsonContractDepth::SemanticAsserts,
-        scenarios_by_file: &[],
+        scenarios_by_file: &[("tests/workflows/tests/install_policy.rs", 8)],
         last_audited_at: "2026-05-14",
     },
     // ── id 18: lpm install --strict-integrity / provenance / cooldown ──
@@ -541,7 +552,10 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
             "cooldown override interaction with --offline path",
         ],
         json_contract_depth: JsonContractDepth::SemanticAsserts,
-        scenarios_by_file: &[],
+        scenarios_by_file: &[
+            ("tests/workflows/tests/install.rs", 6),
+            ("tests/workflows/tests/install_provenance.rs", 8),
+        ],
         last_audited_at: "2026-05-14",
     },
     // ── id 19: lpm uninstall <pkg> (project) ──
@@ -565,7 +579,7 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
             "uninstall while a postinstall script is still running",
         ],
         json_contract_depth: JsonContractDepth::InstaSnapshot,
-        scenarios_by_file: &[],
+        scenarios_by_file: &[("tests/workflows/tests/uninstall.rs", 8)],
         last_audited_at: "2026-05-14",
     },
     // ── id 20: lpm uninstall -g (global) ──
@@ -580,7 +594,7 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
             "uninstall -g of package still referenced by an open shell",
         ],
         json_contract_depth: JsonContractDepth::SemanticAsserts,
-        scenarios_by_file: &[],
+        scenarios_by_file: &[("tests/workflows/tests/global.rs", 1)],
         last_audited_at: "2026-05-14",
     },
     // ── id 21: lpm uninstall --filter / -w ──
@@ -600,7 +614,7 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
             "uninstall --filter on a member whose lockfile diverges from root",
         ],
         json_contract_depth: JsonContractDepth::InstaSnapshot,
-        scenarios_by_file: &[],
+        scenarios_by_file: &[("tests/workflows/tests/uninstall.rs", 5)],
         last_audited_at: "2026-05-14",
     },
     // ── id 22: lpm add (npm + source) ──
@@ -623,7 +637,7 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
             "overwriting existing files without --force prompts in non-TTY",
         ],
         json_contract_depth: JsonContractDepth::SemanticAsserts,
-        scenarios_by_file: &[],
+        scenarios_by_file: &[("tests/workflows/tests/add.rs", 12)],
         last_audited_at: "2026-05-14",
     },
     // ── id 23: lpm remove (alias rm, source pkg) ──
@@ -640,7 +654,7 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
             "remove of a source package while VSCode has the file open",
         ],
         json_contract_depth: JsonContractDepth::InstaSnapshot,
-        scenarios_by_file: &[],
+        scenarios_by_file: &[("tests/workflows/tests/remove.rs", 2)],
         last_audited_at: "2026-05-14",
     },
     // ── id 24: lpm upgrade (bare) ──
@@ -670,7 +684,7 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
             "upgrade across a deprecated → renamed package transition",
         ],
         json_contract_depth: JsonContractDepth::InstaSnapshot,
-        scenarios_by_file: &[],
+        scenarios_by_file: &[("tests/workflows/tests/upgrade.rs", 14)],
         last_audited_at: "2026-05-14",
     },
     // ── id 25: lpm upgrade --major ──
@@ -689,7 +703,7 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
             "major bump that drops a sub-dependency entirely",
         ],
         json_contract_depth: JsonContractDepth::InstaSnapshot,
-        scenarios_by_file: &[],
+        scenarios_by_file: &[("tests/workflows/tests/upgrade.rs", 4)],
         last_audited_at: "2026-05-14",
     },
     // ── id 26: lpm upgrade --interactive ──
@@ -707,7 +721,7 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
             "interactive in non-TTY environment falls back to batch",
         ],
         json_contract_depth: JsonContractDepth::SemanticAsserts,
-        scenarios_by_file: &[],
+        scenarios_by_file: &[("tests/workflows/tests/upgrade.rs", 1)],
         last_audited_at: "2026-05-14",
     },
     // ── id 27: lpm publish (LPM, default) ──
@@ -728,7 +742,7 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
             "publish while a freshly rotated token is propagating",
         ],
         json_contract_depth: JsonContractDepth::SemanticAsserts,
-        scenarios_by_file: &[],
+        scenarios_by_file: &[("tests/workflows/tests/publish.rs", 5)],
         last_audited_at: "2026-05-14",
     },
     // ── id 28: lpm publish --npm ──
@@ -742,7 +756,7 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
             "registry serves tarball instead of metadata",
         ],
         json_contract_depth: JsonContractDepth::SemanticAsserts,
-        scenarios_by_file: &[],
+        scenarios_by_file: &[("tests/workflows/tests/publish.rs", 1)],
         last_audited_at: "2026-05-14",
     },
     // ── id 29: lpm publish --github ──
@@ -757,7 +771,7 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
             "GHCR vs GitHub Packages routing mismatch",
         ],
         json_contract_depth: JsonContractDepth::SemanticAsserts,
-        scenarios_by_file: &[],
+        scenarios_by_file: &[("tests/workflows/tests/publish.rs", 1)],
         last_audited_at: "2026-05-14",
     },
     // ── id 30: lpm publish --gitlab ──
@@ -771,7 +785,7 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
             "concurrent publish to same project ID",
         ],
         json_contract_depth: JsonContractDepth::SemanticAsserts,
-        scenarios_by_file: &[],
+        scenarios_by_file: &[("tests/workflows/tests/publish.rs", 1)],
         last_audited_at: "2026-05-14",
     },
     // ── id 31: lpm publish --publish-registry <URL> ──
@@ -787,7 +801,7 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
             "custom registry requires unsupported auth scheme",
         ],
         json_contract_depth: JsonContractDepth::SemanticAsserts,
-        scenarios_by_file: &[],
+        scenarios_by_file: &[("tests/workflows/tests/publish.rs", 1)],
         last_audited_at: "2026-05-14",
     },
     // ── id 32: lpm publish --dry-run ──
@@ -806,7 +820,7 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
             "dry-run against a registry the user has never logged in to",
         ],
         json_contract_depth: JsonContractDepth::SemanticAsserts,
-        scenarios_by_file: &[],
+        scenarios_by_file: &[("tests/workflows/tests/publish.rs", 4)],
         last_audited_at: "2026-05-14",
     },
     // ── id 33: lpm publish --check ──
@@ -820,7 +834,7 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
             "check during a stale-token rotation window",
         ],
         json_contract_depth: JsonContractDepth::SemanticAsserts,
-        scenarios_by_file: &[],
+        scenarios_by_file: &[("tests/workflows/tests/publish.rs", 2)],
         last_audited_at: "2026-05-14",
     },
     // ── id 34: lpm login (LPM default) ──
@@ -839,7 +853,10 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
             "login on a host that has no keychain (Linux without libsecret)",
         ],
         json_contract_depth: JsonContractDepth::SemanticAsserts,
-        scenarios_by_file: &[],
+        scenarios_by_file: &[
+            ("tests/workflows/tests/auth_lifecycle.rs", 2),
+            ("tests/workflows/tests/json_output.rs", 1),
+        ],
         last_audited_at: "2026-05-14",
     },
     // ── id 35: lpm login --npm ──
@@ -857,7 +874,10 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
             "npm OTP prompt under non-TTY",
         ],
         json_contract_depth: JsonContractDepth::SemanticAsserts,
-        scenarios_by_file: &[],
+        scenarios_by_file: &[
+            ("tests/workflows/tests/auth_lifecycle.rs", 2),
+            ("tests/workflows/tests/npmrc.rs", 1),
+        ],
         last_audited_at: "2026-05-14",
     },
     // ── id 36: lpm login --github / --gitlab ──
@@ -878,7 +898,10 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
             "OIDC issuer DNS failure mid-flow",
         ],
         json_contract_depth: JsonContractDepth::SemanticAsserts,
-        scenarios_by_file: &[],
+        scenarios_by_file: &[
+            ("tests/workflows/tests/auth_lifecycle.rs", 5),
+            ("crates/lpm-cli/tests/oidc_setup_snippet_contract.rs", 1),
+        ],
         last_audited_at: "2026-05-14",
     },
     // ── id 37: lpm login --login-registry <URL> ──
@@ -896,7 +919,7 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
             "multi-registry token storage cross-talk",
         ],
         json_contract_depth: JsonContractDepth::SemanticAsserts,
-        scenarios_by_file: &[],
+        scenarios_by_file: &[("tests/workflows/tests/auth_lifecycle.rs", 3)],
         last_audited_at: "2026-05-14",
     },
     // ── id 38: lpm logout ──
@@ -915,7 +938,7 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
             "logout while a publish is mid-flight",
         ],
         json_contract_depth: JsonContractDepth::SemanticAsserts,
-        scenarios_by_file: &[],
+        scenarios_by_file: &[("tests/workflows/tests/auth_lifecycle.rs", 3)],
         last_audited_at: "2026-05-14",
     },
     // ── id 39: lpm logout --revoke / --all ──
@@ -935,7 +958,7 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
             "revoke during a CI-managed token rotation",
         ],
         json_contract_depth: JsonContractDepth::SemanticAsserts,
-        scenarios_by_file: &[],
+        scenarios_by_file: &[("tests/workflows/tests/auth_lifecycle.rs", 4)],
         last_audited_at: "2026-05-14",
     },
     // ── id 40: lpm token-rotate ──
@@ -950,7 +973,7 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
             "rotation against a registry that returns 5xx",
         ],
         json_contract_depth: JsonContractDepth::InstaSnapshot,
-        scenarios_by_file: &[],
+        scenarios_by_file: &[("tests/workflows/tests/token_rotate.rs", 1)],
         last_audited_at: "2026-05-14",
     },
     // ── id 41: lpm setup (.npmrc CI gen) ──
@@ -969,7 +992,7 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
             "setup against an .npmrc that already has conflicting scoped entries",
         ],
         json_contract_depth: JsonContractDepth::SemanticAsserts,
-        scenarios_by_file: &[],
+        scenarios_by_file: &[("tests/workflows/tests/setup.rs", 3)],
         last_audited_at: "2026-05-14",
     },
     // ── id 42: lpm setup-npmrc ──
@@ -984,7 +1007,7 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
             "setup-npmrc when project root is a git submodule",
         ],
         json_contract_depth: JsonContractDepth::InstaSnapshot,
-        scenarios_by_file: &[],
+        scenarios_by_file: &[("tests/workflows/tests/setup_npmrc.rs", 1)],
         last_audited_at: "2026-05-14",
     },
     // ── id 43: lpm config get ──
@@ -999,7 +1022,7 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
             "get of a key with embedded JSON-special characters",
         ],
         json_contract_depth: JsonContractDepth::InstaSnapshot,
-        scenarios_by_file: &[],
+        scenarios_by_file: &[("tests/workflows/tests/config.rs", 1)],
         last_audited_at: "2026-05-14",
     },
     // ── id 44: lpm config set ──
@@ -1017,7 +1040,7 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
             "set on a key that violates a typed schema",
         ],
         json_contract_depth: JsonContractDepth::SemanticAsserts,
-        scenarios_by_file: &[],
+        scenarios_by_file: &[("tests/workflows/tests/config.rs", 1)],
         last_audited_at: "2026-05-14",
     },
     // ── id 45: lpm config delete ──
@@ -1035,7 +1058,7 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
             "delete of a nonexistent key (idempotent vs error)",
         ],
         json_contract_depth: JsonContractDepth::SemanticAsserts,
-        scenarios_by_file: &[],
+        scenarios_by_file: &[("tests/workflows/tests/config.rs", 1)],
         last_audited_at: "2026-05-14",
     },
     // ── id 46: lpm config list ──
@@ -1049,7 +1072,7 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
             "list under a HOME that points to a non-writable mount",
         ],
         json_contract_depth: JsonContractDepth::InstaSnapshot,
-        scenarios_by_file: &[],
+        scenarios_by_file: &[("tests/workflows/tests/config.rs", 1)],
         last_audited_at: "2026-05-14",
     },
     // ── id 47: lpm cache clean [subcat] ──
@@ -1070,7 +1093,7 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
             "clean under a HOME whose cache dir is a bind-mount",
         ],
         json_contract_depth: JsonContractDepth::SemanticAsserts,
-        scenarios_by_file: &[],
+        scenarios_by_file: &[("tests/workflows/tests/cache.rs", 5)],
         last_audited_at: "2026-05-14",
     },
     // ── id 48: lpm cache path [subcat] ──
@@ -1089,7 +1112,7 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
             "cache root override via env var",
         ],
         json_contract_depth: JsonContractDepth::InstaSnapshot,
-        scenarios_by_file: &[],
+        scenarios_by_file: &[("tests/workflows/tests/cache.rs", 4)],
         last_audited_at: "2026-05-14",
     },
     // ── id 49: lpm store verify ──
@@ -1108,7 +1131,7 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
             "verify of v2 entries (when v2 layout ships)",
         ],
         json_contract_depth: JsonContractDepth::SemanticAsserts,
-        scenarios_by_file: &[],
+        scenarios_by_file: &[("tests/workflows/tests/store.rs", 3)],
         last_audited_at: "2026-05-14",
     },
     // ── id 50: lpm store path ──
@@ -1122,7 +1145,7 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
             "store root override via env var",
         ],
         json_contract_depth: JsonContractDepth::SemanticAsserts,
-        scenarios_by_file: &[],
+        scenarios_by_file: &[("tests/workflows/tests/store.rs", 2)],
         last_audited_at: "2026-05-14",
     },
     // ── id 51: lpm cache prune ──
@@ -1145,7 +1168,7 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
             "prune across a store dir whose backing FS is full",
         ],
         json_contract_depth: JsonContractDepth::SemanticAsserts,
-        scenarios_by_file: &[],
+        scenarios_by_file: &[("tests/workflows/tests/cache_prune.rs", 7)],
         last_audited_at: "2026-05-14",
     },
     // ── id 52: lpm store clean ──
@@ -1164,7 +1187,7 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
             "clean across mixed-permission entries",
         ],
         json_contract_depth: JsonContractDepth::SemanticAsserts,
-        scenarios_by_file: &[],
+        scenarios_by_file: &[("tests/workflows/tests/store.rs", 3)],
         last_audited_at: "2026-05-14",
     },
     // ── id 53: lpm global list ──
@@ -1182,7 +1205,7 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
             "list against a global dir on a network-mounted FS",
         ],
         json_contract_depth: JsonContractDepth::SemanticAsserts,
-        scenarios_by_file: &[],
+        scenarios_by_file: &[("tests/workflows/tests/global.rs", 2)],
         last_audited_at: "2026-05-14",
     },
     // ── id 54: lpm global list --outdated ──
@@ -1197,7 +1220,7 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
             "outdated against a global pin that no longer resolves",
         ],
         json_contract_depth: JsonContractDepth::SemanticAsserts,
-        scenarios_by_file: &[],
+        scenarios_by_file: &[("tests/workflows/tests/global.rs", 1)],
         last_audited_at: "2026-05-14",
     },
     // ── id 55: lpm global bin ──
@@ -1214,7 +1237,7 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
             "Windows: bin path with backslashes vs forward slashes",
         ],
         json_contract_depth: JsonContractDepth::SemanticAsserts,
-        scenarios_by_file: &[],
+        scenarios_by_file: &[("tests/workflows/tests/global.rs", 2)],
         last_audited_at: "2026-05-14",
     },
     // ── id 56: lpm global path <pkg> ──
@@ -1231,7 +1254,7 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
             "path of a package installed via cargo-install fallback",
         ],
         json_contract_depth: JsonContractDepth::SemanticAsserts,
-        scenarios_by_file: &[],
+        scenarios_by_file: &[("tests/workflows/tests/global.rs", 2)],
         last_audited_at: "2026-05-14",
     },
     // ── id 57: lpm global remove ──
@@ -1246,7 +1269,7 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
             "remove of a package whose shim was hand-edited",
         ],
         json_contract_depth: JsonContractDepth::SemanticAsserts,
-        scenarios_by_file: &[],
+        scenarios_by_file: &[("tests/workflows/tests/global.rs", 1)],
         last_audited_at: "2026-05-14",
     },
     // ── id 58: lpm global update ──
@@ -1264,7 +1287,7 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
             "update across a major-version jump (provenance drift)",
         ],
         json_contract_depth: JsonContractDepth::SemanticAsserts,
-        scenarios_by_file: &[],
+        scenarios_by_file: &[("tests/workflows/tests/global.rs", 2)],
         last_audited_at: "2026-05-14",
     },
     // ── id 59: lpm trust diff ──
@@ -1285,7 +1308,7 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
             "diff after a `lpm rebuild --policy=allow` widened the trust set",
         ],
         json_contract_depth: JsonContractDepth::SemanticAsserts,
-        scenarios_by_file: &[],
+        scenarios_by_file: &[("tests/workflows/tests/trust.rs", 5)],
         last_audited_at: "2026-05-14",
     },
     // ── id 60: lpm trust prune ──
@@ -1305,7 +1328,7 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
             "prune against a workspace where some members have stale + others fresh entries",
         ],
         json_contract_depth: JsonContractDepth::SemanticAsserts,
-        scenarios_by_file: &[],
+        scenarios_by_file: &[("tests/workflows/tests/trust.rs", 4)],
         last_audited_at: "2026-05-14",
     },
     // ── id 61: lpm pool ──
@@ -1322,7 +1345,7 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
             "pool stats for a project with zero pooled deps",
         ],
         json_contract_depth: JsonContractDepth::InstaSnapshot,
-        scenarios_by_file: &[],
+        scenarios_by_file: &[("tests/workflows/tests/pool.rs", 2)],
         last_audited_at: "2026-05-14",
     },
     // ── id 62: lpm audit (bare) ──
@@ -1345,7 +1368,7 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
             "audit when behavioral analysis cache is corrupt",
         ],
         json_contract_depth: JsonContractDepth::SemanticAsserts,
-        scenarios_by_file: &[],
+        scenarios_by_file: &[("tests/workflows/tests/audit.rs", 7)],
         last_audited_at: "2026-05-14",
     },
     // ── id 63: lpm audit --fail-on=<policy> ──
@@ -1368,7 +1391,7 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
             "audit reports a finding for a package no longer installed",
         ],
         json_contract_depth: JsonContractDepth::InstaSnapshot,
-        scenarios_by_file: &[],
+        scenarios_by_file: &[("tests/workflows/tests/audit.rs", 6)],
         last_audited_at: "2026-05-14",
     },
     // ── id 64: lpm audit --secrets ──
@@ -1391,7 +1414,7 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
             "scoped @org/pkg dir (test only covers unscoped)",
         ],
         json_contract_depth: JsonContractDepth::SemanticAsserts,
-        scenarios_by_file: &[],
+        scenarios_by_file: &[("tests/workflows/tests/audit.rs", 4)],
         last_audited_at: "2026-05-14",
     },
     // ── id 65: lpm query <selector> ──
@@ -1413,7 +1436,7 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
             "selector against a 1000+ package transitive tree (perf)",
         ],
         json_contract_depth: JsonContractDepth::SemanticAsserts,
-        scenarios_by_file: &[],
+        scenarios_by_file: &[("tests/workflows/tests/query.rs", 6)],
         last_audited_at: "2026-05-14",
     },
     // ── id 66: lpm query --count / --assert-none / --format mermaid ──
@@ -1431,7 +1454,7 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
             "count under a registry-only-lpm filter",
         ],
         json_contract_depth: JsonContractDepth::SemanticAsserts,
-        scenarios_by_file: &[],
+        scenarios_by_file: &[("tests/workflows/tests/query.rs", 3)],
         last_audited_at: "2026-05-14",
     },
     // ── id 67: lpm rebuild (bare, trusted-only) ──
@@ -1456,7 +1479,12 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
             "Windows AppContainer sandbox network denial (no test today)",
         ],
         json_contract_depth: JsonContractDepth::InstaSnapshot,
-        scenarios_by_file: &[],
+        scenarios_by_file: &[
+            ("tests/workflows/tests/rebuild.rs", 11),
+            ("tests/workflows/tests/triage_install_lifecycle.rs", 3),
+            ("tests/workflows/tests/cross_command_flows.rs", 1),
+            ("tests/workflows/tests/approve_scripts.rs", 5),
+        ],
         last_audited_at: "2026-05-14",
     },
     // ── id 68: lpm rebuild --all ──
@@ -1475,7 +1503,7 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
             "rebuild --all across a workspace where some members have script-policy overrides",
         ],
         json_contract_depth: JsonContractDepth::SemanticAsserts,
-        scenarios_by_file: &[],
+        scenarios_by_file: &[("tests/workflows/tests/rebuild.rs", 4)],
         last_audited_at: "2026-05-14",
     },
     // ── id 69: lpm rebuild --policy=allow / --yolo ──
@@ -1492,7 +1520,7 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
             "yolo + cross-platform sandbox parity (macOS vs Windows AppContainer)",
         ],
         json_contract_depth: JsonContractDepth::InstaSnapshot,
-        scenarios_by_file: &[],
+        scenarios_by_file: &[("tests/workflows/tests/rebuild.rs", 2)],
         last_audited_at: "2026-05-14",
     },
     // ── id 70: lpm rebuild --policy=triage / --triage ──
@@ -1512,7 +1540,7 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
             "triage without advisor + --auto-build keeps amber blocked",
         ],
         json_contract_depth: JsonContractDepth::SemanticAsserts,
-        scenarios_by_file: &[],
+        scenarios_by_file: &[("tests/workflows/tests/rebuild.rs", 5)],
         last_audited_at: "2026-05-14",
     },
     // ── id 71: lpm approve-scripts (interactive) ──
@@ -1531,7 +1559,7 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
             "approve-scripts on a project where the lockfile differs from the build-state.json",
         ],
         json_contract_depth: JsonContractDepth::SemanticAsserts,
-        scenarios_by_file: &[],
+        scenarios_by_file: &[("tests/workflows/tests/approve_scripts.rs", 2)],
         last_audited_at: "2026-05-14",
     },
     // ── id 72: lpm approve-scripts --list ──
@@ -1552,7 +1580,7 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
             "list across a workspace where each member has different pending sets",
         ],
         json_contract_depth: JsonContractDepth::SemanticAsserts,
-        scenarios_by_file: &[],
+        scenarios_by_file: &[("tests/workflows/tests/approve_scripts.rs", 6)],
         last_audited_at: "2026-05-14",
     },
     // ── id 73: lpm approve-scripts --yes ──
@@ -1571,7 +1599,7 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
             "yes on a workspace where members disagree on policy",
         ],
         json_contract_depth: JsonContractDepth::SemanticAsserts,
-        scenarios_by_file: &[],
+        scenarios_by_file: &[("tests/workflows/tests/approve_scripts.rs", 4)],
         last_audited_at: "2026-05-14",
     },
     // ── id 74: lpm approve-scripts <pkg> ──
@@ -1590,7 +1618,7 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
             "approval of a package that has multiple installed versions",
         ],
         json_contract_depth: JsonContractDepth::SemanticAsserts,
-        scenarios_by_file: &[],
+        scenarios_by_file: &[("tests/workflows/tests/approve_scripts.rs", 3)],
         last_audited_at: "2026-05-14",
     },
     // ── id 75: lpm approve-scripts --global ──
@@ -1610,7 +1638,10 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
             "global approval surviving an `lpm cache clean trust` (legacy state)",
         ],
         json_contract_depth: JsonContractDepth::SemanticAsserts,
-        scenarios_by_file: &[],
+        scenarios_by_file: &[
+            ("tests/workflows/tests/approve_scripts.rs", 3),
+            ("tests/workflows/tests/install_global_security.rs", 2),
+        ],
         last_audited_at: "2026-05-14",
     },
     // ── id 76: lpm approve-scripts --dry-run ──
@@ -1627,7 +1658,7 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
             "dry-run that would have promoted nothing (output shape)",
         ],
         json_contract_depth: JsonContractDepth::SemanticAsserts,
-        scenarios_by_file: &[],
+        scenarios_by_file: &[("tests/workflows/tests/approve_scripts.rs", 2)],
         last_audited_at: "2026-05-14",
     },
     // ── id 77: lpm patch <key> ──
@@ -1647,7 +1678,7 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
             "patch survives store gc / cache prune",
         ],
         json_contract_depth: JsonContractDepth::SemanticAsserts,
-        scenarios_by_file: &[],
+        scenarios_by_file: &[("tests/workflows/tests/patch.rs", 3)],
         last_audited_at: "2026-05-14",
     },
     // ── id 78: lpm patch-commit <dir> ──
@@ -1666,7 +1697,7 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
             "patch-commit when the source dir was moved between extract and commit",
         ],
         json_contract_depth: JsonContractDepth::SemanticAsserts,
-        scenarios_by_file: &[],
+        scenarios_by_file: &[("tests/workflows/tests/patch.rs", 3)],
         last_audited_at: "2026-05-14",
     },
     // ── id 79: lpm filter <expr> ──
@@ -1692,7 +1723,7 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
             "filter combining glob + dependency-of in the same expr",
         ],
         json_contract_depth: JsonContractDepth::SemanticAsserts,
-        scenarios_by_file: &[],
+        scenarios_by_file: &[("tests/workflows/tests/filter.rs", 11)],
         last_audited_at: "2026-05-14",
     },
     // ── id 80: lpm deploy <out> --filter ──
@@ -1715,7 +1746,7 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
             "deploy across a member with workspace:^ pointing outside the closure",
         ],
         json_contract_depth: JsonContractDepth::SemanticAsserts,
-        scenarios_by_file: &[],
+        scenarios_by_file: &[("tests/workflows/tests/deploy.rs", 7)],
         last_audited_at: "2026-05-14",
     },
     // ── id 81: lpm plugin list / update ──
@@ -1733,7 +1764,7 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
             "update under offline mode",
         ],
         json_contract_depth: JsonContractDepth::InstaSnapshot,
-        scenarios_by_file: &[],
+        scenarios_by_file: &[("tests/workflows/tests/plugin.rs", 2)],
         last_audited_at: "2026-05-14",
     },
     // ── id 82: lpm skills list/install/validate/clean ──
@@ -1757,7 +1788,7 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
             "concurrent skills clean + install",
         ],
         json_contract_depth: JsonContractDepth::SemanticAsserts,
-        scenarios_by_file: &[],
+        scenarios_by_file: &[("tests/workflows/tests/skills.rs", 9)],
         last_audited_at: "2026-05-14",
     },
     // ── id 83: lpm run <script> ──
@@ -1831,7 +1862,7 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
             "exec of a file with shebang resolving to an absent interpreter",
         ],
         json_contract_depth: JsonContractDepth::SemanticAsserts,
-        scenarios_by_file: &[],
+        scenarios_by_file: &[("tests/workflows/tests/exec.rs", 3)],
         last_audited_at: "2026-05-14",
     },
     // ── id 86: lpm dlx <pkg> ──
@@ -1849,7 +1880,7 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
             "dlx of a package whose entrypoint shells out",
         ],
         json_contract_depth: JsonContractDepth::SemanticAsserts,
-        scenarios_by_file: &[],
+        scenarios_by_file: &[("tests/workflows/tests/dlx.rs", 2)],
         last_audited_at: "2026-05-14",
     },
     // ── id 87: lpm lint ──
@@ -1931,7 +1962,10 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
             "tsc version mismatch between members",
         ],
         json_contract_depth: JsonContractDepth::SemanticAsserts,
-        scenarios_by_file: &[],
+        scenarios_by_file: &[
+            ("tests/workflows/tests/tools.rs", 1),
+            ("tests/workflows/tests/check_typescript.rs", 10),
+        ],
         last_audited_at: "2026-05-14",
     },
     // ── id 91: lpm test ──
@@ -2003,7 +2037,7 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
             "github-actions runner without GITHUB_ENV set (degraded path)",
         ],
         json_contract_depth: JsonContractDepth::None,
-        scenarios_by_file: &[],
+        scenarios_by_file: &[("tests/workflows/tests/ci.rs", 2)],
         last_audited_at: "2026-05-14",
     },
     // ── id 94: lpm ci setup github-actions ──
@@ -2021,7 +2055,7 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
             "setup against a workflow file the user has hand-edited",
         ],
         json_contract_depth: JsonContractDepth::SemanticAsserts,
-        scenarios_by_file: &[],
+        scenarios_by_file: &[("tests/workflows/tests/ci.rs", 2)],
         last_audited_at: "2026-05-14",
     },
     // ── id 95: lpm ci setup gitlab ──
@@ -2042,7 +2076,7 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
             "gitlab CI YAML already contains conflicting id_tokens stanza",
         ],
         json_contract_depth: JsonContractDepth::SemanticAsserts,
-        scenarios_by_file: &[],
+        scenarios_by_file: &[("tests/workflows/tests/ci.rs", 4)],
         last_audited_at: "2026-05-14",
     },
     // ── id 96: lpm env init ──
@@ -2078,7 +2112,7 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
             "list under an env that was deleted by a concurrent CLI",
         ],
         json_contract_depth: JsonContractDepth::InstaSnapshot,
-        scenarios_by_file: &[],
+        scenarios_by_file: &[("tests/workflows/tests/env_local.rs", 1)],
         last_audited_at: "2026-05-14",
     },
     // ── id 98: lpm env set / get / delete ──
@@ -2165,7 +2199,10 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
             "push to a vault whose org membership was revoked between auth + write",
         ],
         json_contract_depth: JsonContractDepth::InstaSnapshot,
-        scenarios_by_file: &[],
+        scenarios_by_file: &[
+            ("tests/workflows/tests/env_vault.rs", 9),
+            ("tests/workflows/tests/cross_command_flows.rs", 1),
+        ],
         last_audited_at: "2026-05-14",
     },
     // ── id 103: lpm env pair ──
@@ -2188,7 +2225,7 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
             "pair after a logout-all on a refresh-backed session",
         ],
         json_contract_depth: JsonContractDepth::SemanticAsserts,
-        scenarios_by_file: &[],
+        scenarios_by_file: &[("tests/workflows/tests/env_vault.rs", 7)],
         last_audited_at: "2026-05-14",
     },
     // ── id 104: lpm env unpair ──
@@ -2208,7 +2245,10 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
             "unpair while a push/pull is mid-flight",
         ],
         json_contract_depth: JsonContractDepth::SemanticAsserts,
-        scenarios_by_file: &[],
+        scenarios_by_file: &[
+            ("tests/workflows/tests/env_vault.rs", 4),
+            ("tests/workflows/tests/env_local.rs", 1),
+        ],
         last_audited_at: "2026-05-14",
     },
     // ── id 106: lpm env oidc allow ──
@@ -2230,7 +2270,7 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
             "allow against a vault the user lacks admin rights to",
         ],
         json_contract_depth: JsonContractDepth::SemanticAsserts,
-        scenarios_by_file: &[],
+        scenarios_by_file: &[("tests/workflows/tests/env_vault.rs", 7)],
         last_audited_at: "2026-05-14",
     },
     // ── id 107: lpm env oidc list ──
@@ -2244,7 +2284,7 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
             "list across a vault with 100+ allowed identities",
         ],
         json_contract_depth: JsonContractDepth::SemanticAsserts,
-        scenarios_by_file: &[],
+        scenarios_by_file: &[("tests/workflows/tests/env_vault.rs", 2)],
         last_audited_at: "2026-05-14",
     },
     // ── id 108: lpm env oidc pull ──
@@ -2258,7 +2298,7 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
             "exchange against an unsupported OIDC provider issuer",
         ],
         json_contract_depth: JsonContractDepth::SemanticAsserts,
-        scenarios_by_file: &[],
+        scenarios_by_file: &[("tests/workflows/tests/env_vault.rs", 1)],
         last_audited_at: "2026-05-14",
     },
     // ── id 109: lpm dev ──
@@ -2282,7 +2322,7 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
             "dev on a machine missing the bundled runtime binary",
         ],
         json_contract_depth: JsonContractDepth::None,
-        scenarios_by_file: &[],
+        scenarios_by_file: &[("tests/workflows/tests/dev_tunnel.rs", 1)],
         last_audited_at: "2026-05-14",
     },
     // ── id 110: lpm dev --tunnel / --https / --network ──
@@ -2304,7 +2344,7 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
             "tunnel + https together (interaction matrix)",
         ],
         json_contract_depth: JsonContractDepth::None,
-        scenarios_by_file: &[],
+        scenarios_by_file: &[("tests/workflows/tests/dev_tunnel.rs", 1)],
         last_audited_at: "2026-05-14",
     },
     // ── id 111: lpm cert status / trust / uninstall / generate ──
@@ -2323,7 +2363,7 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
             "certificate trust-chain validation on Windows + Linux stores",
         ],
         json_contract_depth: JsonContractDepth::InstaSnapshot,
-        scenarios_by_file: &[],
+        scenarios_by_file: &[("tests/workflows/tests/cert.rs", 4)],
         last_audited_at: "2026-05-14",
     },
     // ── id 112: lpm graph (tree default) ──
@@ -2343,7 +2383,7 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
             "graph against a fully hoisted vs isolated layout",
         ],
         json_contract_depth: JsonContractDepth::SemanticAsserts,
-        scenarios_by_file: &[],
+        scenarios_by_file: &[("tests/workflows/tests/graph.rs", 4)],
         last_audited_at: "2026-05-14",
     },
     // ── id 113: lpm graph --format json ──
@@ -2360,7 +2400,7 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
             "JSON output for a 1000+ package transitive tree (perf)",
         ],
         json_contract_depth: JsonContractDepth::InstaSnapshot,
-        scenarios_by_file: &[],
+        scenarios_by_file: &[("tests/workflows/tests/graph.rs", 2)],
         last_audited_at: "2026-05-14",
     },
     // ── id 114: lpm graph --format html ──
@@ -2380,7 +2420,7 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
             "HTML output written to a path that already exists as a directory",
         ],
         json_contract_depth: JsonContractDepth::SemanticAsserts,
-        scenarios_by_file: &[],
+        scenarios_by_file: &[("tests/workflows/tests/graph.rs", 4)],
         last_audited_at: "2026-05-14",
     },
     // ── id 115: lpm graph --format dot / mermaid / stats ──
@@ -2399,7 +2439,7 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
             "dot output piped through `graphviz -Tsvg` parity (extern tool)",
         ],
         json_contract_depth: JsonContractDepth::SemanticAsserts,
-        scenarios_by_file: &[],
+        scenarios_by_file: &[("tests/workflows/tests/graph.rs", 4)],
         last_audited_at: "2026-05-14",
     },
     // ── id 116: lpm graph --why <pkg> ──
@@ -2421,7 +2461,7 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
             "--why for a package present in multiple workspace members at different versions",
         ],
         json_contract_depth: JsonContractDepth::SemanticAsserts,
-        scenarios_by_file: &[],
+        scenarios_by_file: &[("tests/workflows/tests/graph.rs", 7)],
         last_audited_at: "2026-05-14",
     },
     // ── id 117: lpm ports list / kill / reset ──
@@ -2439,7 +2479,7 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
             "kill of a port held by a process the user lacks privilege to signal",
         ],
         json_contract_depth: JsonContractDepth::InstaSnapshot,
-        scenarios_by_file: &[],
+        scenarios_by_file: &[("tests/workflows/tests/ports.rs", 3)],
         last_audited_at: "2026-05-14",
     },
     // ── id 118: lpm tunnel <port> (start) ──
@@ -2457,7 +2497,7 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
             "tunnel under a HOME that has never been paired",
         ],
         json_contract_depth: JsonContractDepth::SemanticAsserts,
-        scenarios_by_file: &[],
+        scenarios_by_file: &[("tests/workflows/tests/dev_tunnel.rs", 2)],
         last_audited_at: "2026-05-14",
     },
     // ── id 119: lpm tunnel claim / unclaim / list / domains ──
@@ -2476,7 +2516,7 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
             "unclaim of a domain that was force-released server-side",
         ],
         json_contract_depth: JsonContractDepth::SemanticAsserts,
-        scenarios_by_file: &[],
+        scenarios_by_file: &[("tests/workflows/tests/dev_tunnel.rs", 3)],
         last_audited_at: "2026-05-14",
     },
     // ── id 120: lpm tunnel inspect / replay / log ──
@@ -2494,7 +2534,7 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
             "replay against a request whose body bytes have been GC'd server-side",
         ],
         json_contract_depth: JsonContractDepth::SemanticAsserts,
-        scenarios_by_file: &[],
+        scenarios_by_file: &[("tests/workflows/tests/dev_tunnel.rs", 2)],
         last_audited_at: "2026-05-14",
     },
     // ── id 121: lpm migrate (auto-detect npm/yarn/pnpm/bun) ──
@@ -2526,7 +2566,7 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
             "migrate from a lockfile format the toolchain does not understand",
         ],
         json_contract_depth: JsonContractDepth::SemanticAsserts,
-        scenarios_by_file: &[],
+        scenarios_by_file: &[("tests/workflows/tests/migrate.rs", 16)],
         last_audited_at: "2026-05-14",
     },
     // ── id 122: lpm migrate --rollback ──
@@ -2544,7 +2584,7 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
             "rollback under a workspace where some members migrated + others didn't",
         ],
         json_contract_depth: JsonContractDepth::SemanticAsserts,
-        scenarios_by_file: &[],
+        scenarios_by_file: &[("tests/workflows/tests/migrate.rs", 1)],
         last_audited_at: "2026-05-14",
     },
     // ── id 123: lpm migrate --dry-run ──
@@ -2562,7 +2602,10 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
             "dry-run against an already-migrated project (no-op shape)",
         ],
         json_contract_depth: JsonContractDepth::SemanticAsserts,
-        scenarios_by_file: &[],
+        scenarios_by_file: &[
+            ("tests/workflows/tests/migrate.rs", 2),
+            ("tests/workflows/tests/json_output.rs", 1),
+        ],
         last_audited_at: "2026-05-14",
     },
     // ── id 124: lpm migrate --ci / --no-npmrc ──
@@ -2582,7 +2625,7 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
             "--ci + --no-npmrc interaction matrix",
         ],
         json_contract_depth: JsonContractDepth::SemanticAsserts,
-        scenarios_by_file: &[],
+        scenarios_by_file: &[("tests/workflows/tests/migrate.rs", 4)],
         last_audited_at: "2026-05-14",
     },
     // ── id 125: lpm vault open / update / version ──
@@ -2604,7 +2647,7 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
             "vault under a HOME mounted from a network share",
         ],
         json_contract_depth: JsonContractDepth::SemanticAsserts,
-        scenarios_by_file: &[],
+        scenarios_by_file: &[("tests/workflows/tests/vault.rs", 5)],
         last_audited_at: "2026-05-14",
     },
     // ── id 126: lpm self-update ──
@@ -2622,7 +2665,7 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
             "self-update during an active install (binary held open)",
         ],
         json_contract_depth: JsonContractDepth::SemanticAsserts,
-        scenarios_by_file: &[],
+        scenarios_by_file: &[("tests/workflows/tests/self_update.rs", 2)],
         last_audited_at: "2026-05-14",
     },
     // ── id 127: lpm internal-update-check (hidden) ──
@@ -2648,7 +2691,7 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
             "internal-update-check fires during a slow `lpm install` (background race)",
         ],
         json_contract_depth: JsonContractDepth::None,
-        scenarios_by_file: &[],
+        scenarios_by_file: &[("tests/workflows/tests/dev_tunnel.rs", 2)],
         last_audited_at: "2026-05-14",
     },
     // ── id 128: lpm swift-registry ──
@@ -2667,7 +2710,7 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
             "swift-registry login on a machine without swift installed",
         ],
         json_contract_depth: JsonContractDepth::SemanticAsserts,
-        scenarios_by_file: &[],
+        scenarios_by_file: &[("tests/workflows/tests/swift.rs", 4)],
         last_audited_at: "2026-05-14",
     },
     // ── id 129: lpm mcp setup / remove / status ──
@@ -2687,7 +2730,7 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
             "setup against an editor that doesn't ship MCP support",
         ],
         json_contract_depth: JsonContractDepth::SemanticAsserts,
-        scenarios_by_file: &[],
+        scenarios_by_file: &[("tests/workflows/tests/mcp.rs", 4)],
         last_audited_at: "2026-05-14",
     },
     // ── id 130: lpm use node@<v> ──
@@ -2706,7 +2749,7 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
             "use of a runtime version no longer hosted upstream",
         ],
         json_contract_depth: JsonContractDepth::SemanticAsserts,
-        scenarios_by_file: &[],
+        scenarios_by_file: &[("tests/workflows/tests/use.rs", 3)],
         last_audited_at: "2026-05-14",
     },
     // ── id 131: lpm use --list ──
@@ -2725,7 +2768,7 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
             "list under a HOME whose runtime dir is corrupted",
         ],
         json_contract_depth: JsonContractDepth::SemanticAsserts,
-        scenarios_by_file: &[],
+        scenarios_by_file: &[("tests/workflows/tests/use.rs", 4)],
         last_audited_at: "2026-05-14",
     },
     // ── id 132: lpm completions <shell> ──
@@ -2754,7 +2797,7 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
             "completions for fish / powershell (not yet supported)",
         ],
         json_contract_depth: JsonContractDepth::None,
-        scenarios_by_file: &[],
+        scenarios_by_file: &[("tests/workflows/tests/completions.rs", 3)],
         last_audited_at: "2026-05-14",
     },
     // ── id 133: lpm schema lpm.json ──
@@ -2771,7 +2814,7 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
             "schema output for an unknown kind (helpful error)",
         ],
         json_contract_depth: JsonContractDepth::SemanticAsserts,
-        scenarios_by_file: &[],
+        scenarios_by_file: &[("tests/workflows/tests/schema.rs", 2)],
         last_audited_at: "2026-05-14",
     },
     // ── id 134: lpm schema lpm.config.json ──
@@ -2788,7 +2831,7 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
             "schema parity with the runtime parser for lpm.config.json",
         ],
         json_contract_depth: JsonContractDepth::SemanticAsserts,
-        scenarios_by_file: &[],
+        scenarios_by_file: &[("tests/workflows/tests/schema.rs", 2)],
         last_audited_at: "2026-05-14",
     },
     // ── id 135: lpm strict-ssl warning (cross-cmd installer warning) ──
@@ -2806,7 +2849,7 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
             "warning interaction with --offline + .npmrc routing",
         ],
         json_contract_depth: JsonContractDepth::SemanticAsserts,
-        scenarios_by_file: &[],
+        scenarios_by_file: &[("tests/workflows/tests/install.rs", 3)],
         last_audited_at: "2026-05-14",
     },
 ];
