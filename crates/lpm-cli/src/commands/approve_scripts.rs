@@ -615,17 +615,24 @@ async fn run_under_store_lock(
 
     // ── Default: interactive walk ───────────────────────────────────
 
-    if !is_tty() {
-        return Err(LpmError::Script(
-            "interactive review requires a TTY. \
-             Use `--yes` to approve everything, `--list` to inspect, or pass a `<pkg>` argument."
-                .into(),
-        ));
-    }
+    // Finding #74: check `--json` BEFORE the TTY gate. Every `--json`
+    // caller is by definition non-interactive (CI, scripted agent,
+    // MCP server), so with the old order they always hit the
+    // "requires a TTY" error — accurate but unhelpful: it doesn't
+    // name the flag pairs that actually pair with `--json`. The
+    // `--json`-specific error names them explicitly. Pure non-TTY
+    // (no `--json`) still falls through to the TTY error below.
     if json_output {
         return Err(LpmError::Script(
             "interactive review cannot be combined with `--json`. \
              Use `--list --json`, `--yes --json`, or `<pkg> --json` for structured output."
+                .into(),
+        ));
+    }
+    if !is_tty() {
+        return Err(LpmError::Script(
+            "interactive review requires a TTY. \
+             Use `--yes` to approve everything, `--list` to inspect, or pass a `<pkg>` argument."
                 .into(),
         ));
     }

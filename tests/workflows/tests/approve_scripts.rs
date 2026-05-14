@@ -20,6 +20,9 @@
 mod support;
 
 use std::path::PathBuf;
+use support::build_state::{
+    seed_blocked_build_state_with_real_hash, seed_global_install_blocked_state_with_real_hash,
+};
 use support::{TempProject, lpm};
 
 // ─── Project-mode fixture helpers ───────────────────────────────────────
@@ -39,31 +42,12 @@ fn write_project_no_trusted_deps(project: &TempProject) {
     );
 }
 
-/// Synthesize `<project>/.lpm/build-state.json` with one blocked entry.
-/// Matches the post-P7 shape so `approve-scripts` can drive its
-/// mutation path against this fixture.
-fn write_blocked_build_state(project: &TempProject, name: &str, version: &str) {
-    let body = format!(
-        r#"{{
-    "state_version": 1,
-    "blocked_set_fingerprint": "sha256-fixture-stable",
-    "captured_at": "2026-04-22T00:00:00Z",
-    "blocked_packages": [
-        {{
-            "name": "{name}",
-            "version": "{version}",
-            "integrity": "sha512-fixture-skip-verify",
-            "script_hash": "sha256-fixture-script-hash",
-            "phases_present": ["postinstall"],
-            "binding_drift": false,
-            "static_tier": "green",
-            "published_at": "2026-04-22T00:00:00Z"
-        }}
-    ]
-}}"#
-    );
-    project.write_file(".lpm/build-state.json", &body);
-}
+// Project-mode build-state.json seeding lives in
+// `support::build_state::seed_blocked_build_state_with_real_hash`
+// (finding D). The helper stages a real store entry and computes the
+// hash via `lpm_security::script_hash::compute_script_hash`, so a
+// future test that adds a `lpm rebuild` step doesn't trip the
+// finding #75 BindingDrift footgun.
 
 /// Synthesize an empty blocked-set build-state — exercises the
 /// short-circuit branch in `approve_scripts::run`.
@@ -103,44 +87,9 @@ commands = []
     std::fs::write(global_root.join("manifest.toml"), toml).unwrap();
 }
 
-/// Seed a per-install `build-state.json` under the global install
-/// root. The aggregator reads this to populate the global blocked set
-/// that `approve-scripts --global` iterates over.
-fn write_global_install_blocked_state(
-    project: &TempProject,
-    top_level: &str,
-    top_level_version: &str,
-    blocked_name: &str,
-    blocked_version: &str,
-) {
-    let install_lpm = project
-        .home()
-        .join(".lpm")
-        .join("global")
-        .join("installs")
-        .join(format!("{top_level}@{top_level_version}"))
-        .join(".lpm");
-    std::fs::create_dir_all(&install_lpm).unwrap();
-    let body = format!(
-        r#"{{
-    "state_version": 1,
-    "blocked_set_fingerprint": "sha256-fixture-stable",
-    "captured_at": "2026-04-22T00:00:00Z",
-    "blocked_packages": [
-        {{
-            "name": "{blocked_name}",
-            "version": "{blocked_version}",
-            "integrity": "sha512-fixture-skip-verify",
-            "script_hash": "sha256-fixture-script-hash",
-            "phases_present": ["postinstall"],
-            "binding_drift": false,
-            "static_tier": "green"
-        }}
-    ]
-}}"#
-    );
-    std::fs::write(install_lpm.join("build-state.json"), body).unwrap();
-}
+// Global-install build-state.json seeding lives in
+// `support::build_state::seed_global_install_blocked_state_with_real_hash`
+// (finding D — same rationale as the project-mode helper above).
 
 /// Path to the global trust file. Absence in the fresh-fixture state
 /// is the baseline; byte-equal assertion verifies it's still absent
@@ -162,7 +111,7 @@ fn global_trust_path(project: &TempProject) -> PathBuf {
 fn approve_scripts_yes_dry_run_does_not_mutate_package_json_and_json_carries_flag() {
     let project = TempProject::empty("");
     write_project_no_trusted_deps(&project);
-    write_blocked_build_state(&project, "some-blocked-pkg", "1.0.0");
+    seed_blocked_build_state_with_real_hash(&project, "some-blocked-pkg", "1.0.0");
 
     let pkg_json_path = project.path().join("package.json");
     let before = std::fs::read(&pkg_json_path).unwrap();
@@ -211,7 +160,7 @@ fn approve_scripts_yes_dry_run_does_not_mutate_package_json_and_json_carries_fla
 fn approve_scripts_named_dry_run_does_not_mutate_package_json() {
     let project = TempProject::empty("");
     write_project_no_trusted_deps(&project);
-    write_blocked_build_state(&project, "some-blocked-pkg", "1.0.0");
+    seed_blocked_build_state_with_real_hash(&project, "some-blocked-pkg", "1.0.0");
 
     let pkg_json_path = project.path().join("package.json");
     let before = std::fs::read(&pkg_json_path).unwrap();
@@ -242,7 +191,7 @@ fn approve_scripts_named_dry_run_does_not_mutate_package_json() {
 fn approve_scripts_list_dry_run_is_silent_no_op_with_uniform_dry_run_flag() {
     let project = TempProject::empty("");
     write_project_no_trusted_deps(&project);
-    write_blocked_build_state(&project, "some-blocked-pkg", "1.0.0");
+    seed_blocked_build_state_with_real_hash(&project, "some-blocked-pkg", "1.0.0");
 
     let pkg_json_path = project.path().join("package.json");
     let before = std::fs::read(&pkg_json_path).unwrap();
@@ -332,7 +281,7 @@ fn approve_scripts_empty_blocked_set_envelope_carries_dry_run_flag() {
 fn approve_scripts_global_yes_dry_run_does_not_mutate_trust_file_and_json_carries_flag() {
     let project = TempProject::empty("");
     write_global_manifest(&project, "some-top-level", "1.0.0");
-    write_global_install_blocked_state(
+    seed_global_install_blocked_state_with_real_hash(
         &project,
         "some-top-level",
         "1.0.0",
@@ -391,7 +340,7 @@ fn approve_scripts_global_yes_dry_run_does_not_mutate_trust_file_and_json_carrie
 fn approve_scripts_global_named_dry_run_does_not_mutate_trust_file() {
     let project = TempProject::empty("");
     write_global_manifest(&project, "some-top-level", "1.0.0");
-    write_global_install_blocked_state(
+    seed_global_install_blocked_state_with_real_hash(
         &project,
         "some-top-level",
         "1.0.0",
@@ -439,7 +388,7 @@ fn approve_scripts_global_named_dry_run_does_not_mutate_trust_file() {
 fn approve_scripts_global_named_dry_run_preserves_pre_seeded_trust_file_byte_equal() {
     let project = TempProject::empty("");
     write_global_manifest(&project, "some-top-level", "1.0.0");
-    write_global_install_blocked_state(
+    seed_global_install_blocked_state_with_real_hash(
         &project,
         "some-top-level",
         "1.0.0",
@@ -489,7 +438,7 @@ fn approve_scripts_global_named_dry_run_preserves_pre_seeded_trust_file_byte_equ
 fn approve_scripts_global_list_json_carries_dry_run_flag_on_both_axes() {
     let project = TempProject::empty("");
     write_global_manifest(&project, "some-top-level", "1.0.0");
-    write_global_install_blocked_state(
+    seed_global_install_blocked_state_with_real_hash(
         &project,
         "some-top-level",
         "1.0.0",

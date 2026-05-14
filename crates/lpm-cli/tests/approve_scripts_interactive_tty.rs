@@ -97,19 +97,19 @@ fn approve_scripts_interactive_walk_without_tty_fails_with_helpful_alternatives(
 }
 
 /// `lpm --json approve-scripts` in a non-TTY shell emits an error
-/// envelope on stdout. The TTY guard fires before the JSON+interactive
-/// guard (see finding #74), so the envelope's error message is the
-/// "requires a TTY" one. The contract pinned here:
+/// envelope on stdout. Per finding #74, the `--json`-specific guard
+/// fires BEFORE the TTY gate (since every `--json` caller is
+/// non-interactive by definition, the TTY message was always
+/// unhelpful for the CI/agent case). The contract pinned here:
 ///
 /// 1. stdout contains a valid JSON envelope, with `success: false`
-///    and a populated `error` field, even though the process exits 0
-///    today (see finding #73 — exit code should match `success`).
-/// 2. The error message guides the user toward `--yes` / `--list` /
-///    `<pkg>` (the non-interactive alternatives).
-///
-/// When findings #73 and #74 are fixed, this test should tighten to
-/// assert non-zero exit AND match the "--json cannot be combined"
-/// message.
+///    and a populated `error` field.
+/// 2. Exit code is `1` — the envelope's `success` field and the
+///    process exit code must agree (finding #73 contract).
+/// 3. The error message explicitly names the `--json`-compatible
+///    flag pairs (`--list --json`, `--yes --json`, `<pkg> --json`)
+///    so the user knows EXACTLY which fix to apply, instead of the
+///    pre-fix generic "requires a TTY" hint.
 #[test]
 fn approve_scripts_interactive_with_json_emits_failure_envelope_on_stdout() {
     let (mut cmd, _project, _home) = lpm_isolated();
@@ -132,11 +132,27 @@ fn approve_scripts_interactive_with_json_emits_failure_envelope_on_stdout() {
         "envelope must report success=false in this error path: {envelope}"
     );
 
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "exit code must mirror envelope success=false → 1 \
+         (got code={:?}, envelope={envelope})",
+        output.status.code(),
+    );
+
     let error_msg = envelope["error"]
         .as_str()
         .expect("envelope must carry an error string");
     assert!(
-        error_msg.contains("--yes") && error_msg.contains("--list"),
-        "error must guide the user to non-interactive alternatives, got: {error_msg:?}",
+        error_msg.contains("cannot be combined with `--json`"),
+        "error must surface the --json-specific guard message, not the \
+         generic TTY one (finding #74): got {error_msg:?}",
+    );
+    assert!(
+        error_msg.contains("--list --json")
+            && error_msg.contains("--yes --json")
+            && error_msg.contains("<pkg> --json"),
+        "error must name every `--json`-compatible flag pair so the \
+         user knows the exact fix, got: {error_msg:?}",
     );
 }

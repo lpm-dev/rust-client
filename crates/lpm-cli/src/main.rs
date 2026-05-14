@@ -2599,7 +2599,22 @@ async fn async_main() -> Result<()> {
     // sees the banner.
     let is_self_update_command = matches!(command, Commands::SelfUpdate { .. });
 
-    let result = match command {
+    // Finding #76: wrap the entire dispatch in an async block so every
+    // `?` inside a match arm body propagates to THIS block's
+    // `Result<(), LpmError>` — and from there into `result`, where the
+    // top-level `--json` envelope handler renders it. Pre-fix, a `?`
+    // inside an arm short-circuited `async_main` directly (the
+    // enclosing function), bypassing both the envelope and the
+    // exit-code mirroring at the bottom of this function.
+    //
+    // Do NOT remove this wrap without auditing every arm body for `?`
+    // operators and explicit `return Err(...)` paths — both rely on
+    // returning to *this* block, not to `async_main`'s outer
+    // `Result<(), miette::Report>`. The redundant per-arm wraps from
+    // the v2 sweep (Install, Login, Dlx, Use, Tunnel) were flattened
+    // alongside finding A — there is no remaining defense-in-depth.
+    let result: Result<(), lpm_common::LpmError> = async {
+    match command {
         Commands::Info {
             package,
             package_version,
@@ -2661,14 +2676,6 @@ async fn async_main() -> Result<()> {
             paranoid,
             no_sandbox,
         } => {
-            // Wrap arm body in async block so every `?` early-exit
-            // (cwd, policy parse, manifest read/write, preflight
-            // validators) propagates to THIS block's `Result<(), LpmError>`
-            // and reaches the top-level `--json` envelope handler. Prior
-            // `.into_diagnostic()` calls inside the arm short-circuited
-            // to the outer miette Result, bypassing the envelope —
-            // converted below to plain LpmError returns/?. See finding #76.
-            async {
             // Phase 37 M3.2: route `lpm install --global` / `-g` to
             // the persistent IsolatedInstall pipeline. M3.2 ships
             // fresh-install only (no upgrade); upgrade lands in M3.4.
@@ -2989,8 +2996,6 @@ async fn async_main() -> Result<()> {
                     .await
                 }
             }
-            }
-            .await
         }
         Commands::Uninstall {
             packages,
@@ -3140,14 +3145,6 @@ async fn async_main() -> Result<()> {
             login_registry,
             token,
         } => {
-            // Wrap in async block so `?` early-exits (and the explicit
-            // `return Err(LpmError::...)` paths below) propagate to THIS
-            // block's `Result<(), LpmError>` — reaching the top-level
-            // `--json` envelope handler. The two prior `.into_diagnostic()`
-            // calls on the early returns dropped to the outer miette
-            // Result, bypassing the envelope; removed below as the
-            // returns now flow through the async block. See finding #76.
-            async {
             if npm || github || gitlab || login_registry.is_some() {
                 let (registry_display, token_hint) = if npm {
                     (
@@ -3286,8 +3283,6 @@ async fn async_main() -> Result<()> {
                     .unwrap_or(lpm_common::DEFAULT_REGISTRY_URL);
                 commands::login::run(registry, cli.json).await
             }
-            }
-            .await
         }
         Commands::Logout {
             revoke,
@@ -3583,32 +3578,24 @@ async fn async_main() -> Result<()> {
             commands::mcp::run(&action, name.as_deref(), cli.json).await
         }
         Commands::Use { spec, list, pin } => {
-            // Wrap in async block so `?` early-exits (e.g., cwd resolution,
-            // missing-spec under `--pin`, install-step failure before pin)
-            // propagate to THIS block's `Result` and reach the top-level
-            // `--json` envelope handler. See finding #76 in
-            // `private/findings.md`.
-            async {
-                let cwd = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;
-                if list {
-                    commands::r#use::run("list", spec.as_deref(), &cwd, cli.json).await
-                } else if pin {
-                    let s = spec.as_deref().ok_or_else(|| {
-                        lpm_common::LpmError::Script(
-                            "missing version. Usage: lpm use --pin node@22.5.0".into(),
-                        )
-                    })?;
-                    commands::r#use::run("pin", Some(s), &cwd, cli.json).await
-                } else if let Some(s) = &spec {
-                    // `lpm use node@20` = install + pin (one command does both)
-                    commands::r#use::run("install", Some(s.as_str()), &cwd, cli.json).await?;
-                    commands::r#use::run("pin", Some(s.as_str()), &cwd, cli.json).await
-                } else {
-                    // No spec, no flags — show list
-                    commands::r#use::run("list", None, &cwd, cli.json).await
-                }
+            let cwd = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;
+            if list {
+                commands::r#use::run("list", spec.as_deref(), &cwd, cli.json).await
+            } else if pin {
+                let s = spec.as_deref().ok_or_else(|| {
+                    lpm_common::LpmError::Script(
+                        "missing version. Usage: lpm use --pin node@22.5.0".into(),
+                    )
+                })?;
+                commands::r#use::run("pin", Some(s), &cwd, cli.json).await
+            } else if let Some(s) = &spec {
+                // `lpm use node@20` = install + pin (one command does both)
+                commands::r#use::run("install", Some(s.as_str()), &cwd, cli.json).await?;
+                commands::r#use::run("pin", Some(s.as_str()), &cwd, cli.json).await
+            } else {
+                // No spec, no flags — show list
+                commands::r#use::run("list", None, &cwd, cli.json).await
             }
-            .await
         }
         Commands::Env { extra: _ } => {
             // Subcommand args are re-parsed from raw argv inside run().
@@ -3694,14 +3681,8 @@ async fn async_main() -> Result<()> {
             refresh,
             args,
         } => {
-            // Wrap in async block so the cwd-resolution `?` and any
-            // dlx-internal preflight errors propagate to the top-level
-            // `--json` envelope handler (finding #76).
-            async {
-                let cwd = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;
-                commands::run::dlx(&client, &cwd, &package, &args, refresh).await
-            }
-            .await
+            let cwd = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;
+            commands::run::dlx(&client, &cwd, &package, &args, refresh).await
         }
         Commands::Filter {
             exprs,
@@ -3762,8 +3743,7 @@ async fn async_main() -> Result<()> {
                     return Err(lpm_common::LpmError::Script(
                         "`--group` is a global-scope option; use it with `--global` or drop it."
                             .into(),
-                    ))
-                    .into_diagnostic();
+                    ));
                 }
                 let cwd = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;
                 commands::approve_scripts::run(
@@ -4065,58 +4045,47 @@ async fn async_main() -> Result<()> {
             inspect_port,
             args,
         } => {
-            // Wrap the arm body in an async block so any `?` early-exit
-            // (e.g., missing session for the SessionRequired contract)
-            // propagates to THIS block's `Result`, which becomes the
-            // match arm's value, which becomes the outer `result`. The
-            // top-level `if cli.json && let Err(e) = &result` handler
-            // then emits a structured envelope on stdout instead of
-            // bare miette stderr — every command machine-readable
-            // under `--json`.
-            async {
-                let cwd = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;
-                // Phase 35: tunnel requires a session-backed login (same
-                // contract as `dev --tunnel` above). The session is
-                // attached to `client` from main.rs; ask it for a
-                // `SessionRequired` bearer.
-                let resolved_token = match client.session() {
-                    Some(s) => Some(
-                        s.bearer_string_for(lpm_auth::AuthRequirement::SessionRequired)
-                            .await
-                            .map_err(|_| {
-                                lpm_common::LpmError::Tunnel(
-                                    "tunnel requires a refresh-backed `lpm login` session.\n  \
-                                     `--token` / `LPM_TOKEN` / CI tokens are not accepted."
-                                        .into(),
-                                )
-                            })?,
-                    ),
-                    None => None,
-                };
-                // Determine if action is a port number or a named action
-                let (effective_action, effective_port) = if let Ok(p) = action.parse::<u16>() {
-                    ("start", p)
-                } else {
-                    (action.as_str(), 3000u16)
-                };
-                commands::tunnel::run(
-                    &client,
-                    effective_action,
-                    resolved_token.as_deref(),
-                    effective_port,
-                    domain.as_deref(),
-                    org.as_deref(),
-                    cli.json,
-                    &cwd,
-                    &args,
-                    tunnel_auth,
-                    no_inspect,
-                    inspect_port,
-                    auto_ack,
-                    session.as_deref(),
-                )
-                .await
-            }
+            let cwd = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;
+            // Phase 35: tunnel requires a session-backed login (same
+            // contract as `dev --tunnel` above). The session is
+            // attached to `client` from main.rs; ask it for a
+            // `SessionRequired` bearer.
+            let resolved_token = match client.session() {
+                Some(s) => Some(
+                    s.bearer_string_for(lpm_auth::AuthRequirement::SessionRequired)
+                        .await
+                        .map_err(|_| {
+                            lpm_common::LpmError::Tunnel(
+                                "tunnel requires a refresh-backed `lpm login` session.\n  \
+                                 `--token` / `LPM_TOKEN` / CI tokens are not accepted."
+                                    .into(),
+                            )
+                        })?,
+                ),
+                None => None,
+            };
+            // Determine if action is a port number or a named action
+            let (effective_action, effective_port) = if let Ok(p) = action.parse::<u16>() {
+                ("start", p)
+            } else {
+                (action.as_str(), 3000u16)
+            };
+            commands::tunnel::run(
+                &client,
+                effective_action,
+                resolved_token.as_deref(),
+                effective_port,
+                domain.as_deref(),
+                org.as_deref(),
+                cli.json,
+                &cwd,
+                &args,
+                tunnel_auth,
+                no_inspect,
+                inspect_port,
+                auto_ack,
+                session.as_deref(),
+            )
             .await
         }
         Commands::Migrate {
@@ -4175,7 +4144,9 @@ async fn async_main() -> Result<()> {
             let bin_hint = commands::run::ensure_runtime(&cwd).await;
             commands::run::run(&cwd, script_name, extra_args, None, false, &bin_hint).await
         }
-    };
+    }
+    }
+    .await;
 
     // Update check: show notice from previous check (instant, no network).
     //
