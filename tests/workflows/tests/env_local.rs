@@ -199,6 +199,39 @@ fn env_set_with_env_flag_scopes_to_named_environment() {
     );
 }
 
+// ─── init (explicit `lpm env init` action) ─────────────────────────────
+
+#[test]
+fn env_init_under_json_emits_envelope_with_environments_and_results_arrays() {
+    let project = TempProject::empty(r#"{"name":"env-init-test","version":"1.0.0"}"#);
+
+    let out = lpm(&project)
+        .args(["--json", "env", "init"])
+        .output()
+        .expect("failed to run lpm env init --json");
+    assert!(
+        out.status.success(),
+        "env init --json failed:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+    let envelope: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap_or_else(|e| {
+        panic!(
+            "env init --json stdout must be valid JSON: {e}\n---\n{}",
+            String::from_utf8_lossy(&out.stdout)
+        )
+    });
+    assert_eq!(envelope["success"], serde_json::json!(true));
+    assert!(
+        envelope["environments"].is_array(),
+        "env init envelope must carry an environments[] array, got: {envelope}",
+    );
+    assert!(
+        envelope["actions"].is_array(),
+        "env init envelope must carry an actions[] array, got: {envelope}",
+    );
+}
+
 // ─── import / export ──────────────────────────────────────────────────
 
 #[test]
@@ -212,7 +245,7 @@ fn env_import_from_dotenv_file_populates_vault() {
     );
 
     let out = lpm(&project)
-        .args(["env", "import", ".env"])
+        .args(["--json", "env", "import", ".env"])
         .output()
         .expect("failed to run lpm env import");
     assert!(
@@ -221,6 +254,15 @@ fn env_import_from_dotenv_file_populates_vault() {
         String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr),
     );
+
+    let envelope: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap_or_else(|e| {
+        panic!(
+            "env import --json stdout must be valid JSON: {e}\n---\n{}",
+            String::from_utf8_lossy(&out.stdout)
+        )
+    });
+    assert_eq!(envelope["success"], serde_json::json!(true));
+    assert_eq!(envelope["imported"], serde_json::json!(2));
 
     let get = lpm(&project)
         .args(["env", "get", "DATABASE_URL", "--reveal"])
@@ -249,7 +291,7 @@ fn env_export_writes_dotenv_with_all_keys() {
 
     let export_path = project.path().join("exported.env");
     let out = lpm(&project)
-        .args(["env", "export", export_path.to_str().unwrap()])
+        .args(["--json", "env", "export", export_path.to_str().unwrap()])
         .output()
         .expect("failed to run lpm env export");
     assert!(
@@ -258,6 +300,15 @@ fn env_export_writes_dotenv_with_all_keys() {
         String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr),
     );
+
+    let envelope: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap_or_else(|e| {
+        panic!(
+            "env export --json stdout must be valid JSON: {e}\n---\n{}",
+            String::from_utf8_lossy(&out.stdout)
+        )
+    });
+    assert_eq!(envelope["success"], serde_json::json!(true));
+    assert_eq!(envelope["exported"], serde_json::json!(2));
 
     let content = std::fs::read_to_string(&export_path).expect("read exported.env");
     assert!(
@@ -312,7 +363,7 @@ fn env_copy_duplicates_environment_into_target() {
         .success();
 
     let out = lpm(&project)
-        .args(["env", "copy", "src", "dst"])
+        .args(["--json", "env", "copy", "src", "dst"])
         .output()
         .expect("failed to run lpm env copy");
     assert!(
@@ -321,6 +372,14 @@ fn env_copy_duplicates_environment_into_target() {
         String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr),
     );
+
+    let envelope: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap_or_else(|e| {
+        panic!(
+            "env copy --json stdout must be valid JSON: {e}\n---\n{}",
+            String::from_utf8_lossy(&out.stdout)
+        )
+    });
+    assert_eq!(envelope["success"], serde_json::json!(true));
 
     let get = lpm(&project)
         .args(["env", "get", "--env=dst", "K1", "--reveal"])

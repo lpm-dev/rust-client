@@ -734,22 +734,22 @@ fn upgrade_interactive_with_json_is_hard_error() {
     up7_write_manifest(&project, &up7_manifest_with_dependency("^1.2.0", false));
 
     let out = lpm(&project)
-        .args(["upgrade", "-i", "--json"])
+        .args(["--json", "upgrade", "-i"])
         .output()
-        .expect("spawn lpm upgrade -i --json");
+        .expect("spawn lpm --json upgrade -i");
     assert!(!out.status.success());
-    let combined = format!(
-        "{}{}",
-        String::from_utf8_lossy(&out.stdout),
-        String::from_utf8_lossy(&out.stderr)
+    let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+    let envelope: serde_json::Value = serde_json::from_str(stdout.trim())
+        .unwrap_or_else(|e| panic!("--json upgrade -i must emit JSON: {e}\n---\n{stdout}"));
+    assert_eq!(envelope["success"], serde_json::json!(false));
+    let err = envelope["error"].as_str().unwrap_or_default();
+    assert!(
+        err.contains("interactive") || err.contains("-i"),
+        "error must reference interactive mode: {err}"
     );
     assert!(
-        combined.contains("interactive"),
-        "error must name interactive: {combined}"
-    );
-    assert!(
-        combined.contains("json"),
-        "error must name json: {combined}"
+        err.contains("--json") || err.contains("json"),
+        "error must reference --json: {err}"
     );
 }
 

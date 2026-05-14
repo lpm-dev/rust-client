@@ -66,18 +66,36 @@ pub async fn run(
                 table.insert(key.to_string(), toml::Value::String(value.to_string()));
             }
             write_config(&config_path, &config)?;
-            if !json_output {
+            if json_output {
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "success": true,
+                        "action": "set",
+                        "key": key,
+                        "value": value,
+                    })
+                );
+            } else {
                 output::success(&format!("Set {} = {}", key.bold(), value));
             }
         }
         "delete" | "unset" => {
             let key = key.ok_or_else(|| LpmError::Registry("missing key".into()))?;
             let mut config = read_config(&config_path)?;
-            if let Some(table) = config.as_table_mut() {
-                table.remove(key);
-            }
+            let existed = config.as_table_mut().and_then(|t| t.remove(key)).is_some();
             write_config(&config_path, &config)?;
-            if !json_output {
+            if json_output {
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "success": true,
+                        "action": "delete",
+                        "key": key,
+                        "existed": existed,
+                    })
+                );
+            } else {
                 output::success(&format!("Deleted {}", key.bold()));
             }
         }

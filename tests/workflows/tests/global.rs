@@ -198,6 +198,31 @@ fn global_path_for_unknown_package_fails_with_helpful_message() {
     );
 }
 
+#[test]
+fn global_path_for_unknown_package_under_json_emits_error_envelope_on_stdout() {
+    let project = TempProject::empty(r#"{"name":"global","version":"1.0.0"}"#);
+
+    let output = lpm(&project)
+        .args(["--json", "global", "path", "not-installed-pkg"])
+        .output()
+        .expect("failed to run lpm global path <unknown> --json");
+
+    // Whether the process exits zero or non-zero is a separate
+    // contract (finding #73 in private/findings.md flags that
+    // `--json` paths uniformly exit 0). The load-bearing claim here
+    // is that the failure surfaces on stdout as a parsable envelope
+    // with `success: false`, not as a free-form stderr message.
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    let envelope: serde_json::Value = serde_json::from_str(stdout.trim())
+        .unwrap_or_else(|e| panic!("--json error path must emit JSON: {e}\n---\n{stdout}"));
+    assert_eq!(envelope["success"], serde_json::json!(false));
+    let combined = format!("{envelope}{}", String::from_utf8_lossy(&output.stderr));
+    assert!(
+        combined.contains("not-installed-pkg") || combined.contains("not installed"),
+        "envelope or stderr must mention the missing package, got:\n{combined}",
+    );
+}
+
 // ─── remove / uninstall -g (error path) ───────────────────────────────
 
 #[test]
