@@ -63,6 +63,24 @@ pub struct SurfaceV2 {
     /// in the surface's workflow file plus any in shared files
     /// (`json_output.rs`, etc.) that target this surface.
     pub scenarios: u32,
+    /// Optional per-file breakdown of the scenario count for shared
+    /// test files (`json_output.rs`, `tools.rs`, `auth_lifecycle.rs`,
+    /// `run.rs`, `env_local.rs`, etc.). Each tuple is
+    /// `(file_path_relative_to_repo_root, count_targeting_this_surface)`.
+    ///
+    /// When this is empty (`&[]`), the row is treated as "all
+    /// scenarios live in the surface's primary test file" — fine
+    /// for dedicated files like `cache.rs` or `audit.rs`. For
+    /// surfaces that share a file with other surfaces, populating
+    /// this lets the reminder reports check that
+    /// `sum(scenarios_by_file) == scenarios` — drift here means
+    /// the file got new tests that nobody attributed to a row.
+    ///
+    /// Schema integrity test:
+    /// `v2_scenarios_by_file_sum_matches_scenarios_when_populated`
+    /// enforces the sum invariant for rows that have populated the
+    /// breakdown.
+    pub scenarios_by_file: &'static [(&'static str, u32)],
     /// Failure modes the test suite actually exercises.
     pub failure_modes_tested: &'static [&'static str],
     /// Failure modes that are known to be relevant for this surface
@@ -71,6 +89,12 @@ pub struct SurfaceV2 {
     pub failure_modes_known: &'static [&'static str],
     /// How deeply is the `--json` envelope contract pinned?
     pub json_contract_depth: JsonContractDepth,
+    /// ISO-8601 date this row was last validated against the source.
+    /// Catches bit-rot: if a row hasn't been re-audited in a long
+    /// time and the test file has churned, the row's data is suspect.
+    /// The reminder report sorts by oldest so the next session knows
+    /// what to recheck. Format: `"YYYY-MM-DD"`.
+    pub last_audited_at: &'static str,
 }
 
 /// Cross-command flow: a named multi-command sequence that real users
@@ -120,6 +144,8 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
             "version range syntax fed to --version flag",
         ],
         json_contract_depth: JsonContractDepth::SemanticAsserts,
+        scenarios_by_file: &[("tests/workflows/tests/json_output.rs", 1)],
+        last_audited_at: "2026-05-14",
     },
     // ── id 2: lpm search <query> ──
     SurfaceV2 {
@@ -138,6 +164,8 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
             "search across paginated result sets",
         ],
         json_contract_depth: JsonContractDepth::InstaSnapshot,
+        scenarios_by_file: &[],
+        last_audited_at: "2026-05-14",
     },
     // ── id 3: lpm quality <pkg> ──
     SurfaceV2 {
@@ -154,6 +182,8 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
             "missing-package quality lookup",
         ],
         json_contract_depth: JsonContractDepth::InstaSnapshot,
+        scenarios_by_file: &[],
+        last_audited_at: "2026-05-14",
     },
     // ── id 4: lpm whoami ──
     SurfaceV2 {
@@ -175,6 +205,11 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
             "whoami while another login is mid-flight",
         ],
         json_contract_depth: JsonContractDepth::SemanticAsserts,
+        scenarios_by_file: &[
+            ("tests/workflows/tests/json_output.rs", 1),
+            ("tests/workflows/tests/auth_lifecycle.rs", 6),
+        ],
+        last_audited_at: "2026-05-14",
     },
     // ── id 5: lpm health ──
     SurfaceV2 {
@@ -190,19 +225,27 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
             "TLS handshake failure surfacing",
         ],
         json_contract_depth: JsonContractDepth::SemanticAsserts,
+        scenarios_by_file: &[("tests/workflows/tests/json_output.rs", 2)],
+        last_audited_at: "2026-05-14",
     },
     // ── id 6: lpm download <pkg> ──
     SurfaceV2 {
         id: 6,
         scenarios: 1,
-        failure_modes_tested: &["version flag canonicalization", "output dir resolution"],
+        failure_modes_tested: &[
+            "version flag canonicalization",
+            "output dir resolution (path traversal containment)",
+            "JSON envelope success + package + path fields",
+        ],
         failure_modes_known: &[
             "registry returns invalid tarball bytes",
             "concurrent download of same package",
             "disk full mid-extraction",
             "registry follows untrusted same-origin redirect",
         ],
-        json_contract_depth: JsonContractDepth::None,
+        json_contract_depth: JsonContractDepth::SemanticAsserts,
+        scenarios_by_file: &[],
+        last_audited_at: "2026-05-14",
     },
     // ── id 7: lpm resolve <pkgs> ──
     SurfaceV2 {
@@ -220,6 +263,8 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
             "mixed scoped + unscoped multi-package query",
         ],
         json_contract_depth: JsonContractDepth::InstaSnapshot,
+        scenarios_by_file: &[],
+        last_audited_at: "2026-05-14",
     },
     // ── id 8: lpm outdated ──
     SurfaceV2 {
@@ -241,6 +286,8 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
             "outdated against private registry under .npmrc routing",
         ],
         json_contract_depth: JsonContractDepth::InstaSnapshot,
+        scenarios_by_file: &[],
+        last_audited_at: "2026-05-14",
     },
     // ── id 9: lpm doctor ──
     SurfaceV2 {
@@ -264,6 +311,11 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
             "doctor against partial node_modules tree",
         ],
         json_contract_depth: JsonContractDepth::SemanticAsserts,
+        scenarios_by_file: &[
+            ("tests/workflows/tests/json_output.rs", 1),
+            ("tests/workflows/tests/doctor_list.rs", 8),
+        ],
+        last_audited_at: "2026-05-14",
     },
     // ── id 10: lpm doctor --fix ──
     SurfaceV2 {
@@ -282,6 +334,8 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
             "fix on a project whose package.json is intentionally exotic",
         ],
         json_contract_depth: JsonContractDepth::SemanticAsserts,
+        scenarios_by_file: &[],
+        last_audited_at: "2026-05-14",
     },
     // ── id 11: lpm init ──
     SurfaceV2 {
@@ -298,6 +352,8 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
             "init under a directory whose parent is not a git repo",
         ],
         json_contract_depth: JsonContractDepth::InstaSnapshot,
+        scenarios_by_file: &[],
+        last_audited_at: "2026-05-14",
     },
     // ── id 12: lpm install (bare, lockfile fast-path) ──
     SurfaceV2 {
@@ -335,6 +391,8 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
             "user CTRL-C between download and link phase",
         ],
         json_contract_depth: JsonContractDepth::InstaSnapshot,
+        scenarios_by_file: &[],
+        last_audited_at: "2026-05-14",
     },
     // ── id 13: lpm install <pkg> (add-and-install) ──
     SurfaceV2 {
@@ -358,6 +416,8 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
             "save-prefix from CLI overriding malformed lpm.toml",
         ],
         json_contract_depth: JsonContractDepth::SemanticAsserts,
+        scenarios_by_file: &[],
+        last_audited_at: "2026-05-14",
     },
     // ── id 14: lpm install --offline ──
     SurfaceV2 {
@@ -378,6 +438,8 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
             "offline against pre-r25 v1 lockfile shape (cross-checked elsewhere)",
         ],
         json_contract_depth: JsonContractDepth::SemanticAsserts,
+        scenarios_by_file: &[],
+        last_audited_at: "2026-05-14",
     },
     // ── id 15: lpm install --filter / -w (workspace) ──
     SurfaceV2 {
@@ -399,6 +461,8 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
             "concurrent install --filter A and --filter B on same workspace",
         ],
         json_contract_depth: JsonContractDepth::SemanticAsserts,
+        scenarios_by_file: &[],
+        last_audited_at: "2026-05-14",
     },
     // ── id 16: lpm install -g (global) ──
     SurfaceV2 {
@@ -422,6 +486,8 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
             "shim repair after upstream binary rename",
         ],
         json_contract_depth: JsonContractDepth::SemanticAsserts,
+        scenarios_by_file: &[],
+        last_audited_at: "2026-05-14",
     },
     // ── id 17: lpm install --policy / --yolo ──
     SurfaceV2 {
@@ -443,6 +509,8 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
             "policy override via package.json > lpm > scriptPolicy",
         ],
         json_contract_depth: JsonContractDepth::None,
+        scenarios_by_file: &[],
+        last_audited_at: "2026-05-14",
     },
     // ── id 18: lpm install --strict-integrity / provenance / cooldown ──
     SurfaceV2 {
@@ -471,6 +539,8 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
             "cooldown override interaction with --offline path",
         ],
         json_contract_depth: JsonContractDepth::SemanticAsserts,
+        scenarios_by_file: &[],
+        last_audited_at: "2026-05-14",
     },
     // ── id 19: lpm uninstall <pkg> (project) ──
     SurfaceV2 {
@@ -493,6 +563,8 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
             "uninstall while a postinstall script is still running",
         ],
         json_contract_depth: JsonContractDepth::InstaSnapshot,
+        scenarios_by_file: &[],
+        last_audited_at: "2026-05-14",
     },
     // ── id 20: lpm uninstall -g (global) ──
     SurfaceV2 {
@@ -506,6 +578,8 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
             "uninstall -g of package still referenced by an open shell",
         ],
         json_contract_depth: JsonContractDepth::SemanticAsserts,
+        scenarios_by_file: &[],
+        last_audited_at: "2026-05-14",
     },
     // ── id 21: lpm uninstall --filter / -w ──
     SurfaceV2 {
@@ -524,6 +598,8 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
             "uninstall --filter on a member whose lockfile diverges from root",
         ],
         json_contract_depth: JsonContractDepth::InstaSnapshot,
+        scenarios_by_file: &[],
+        last_audited_at: "2026-05-14",
     },
     // ── id 22: lpm add (npm + source) ──
     SurfaceV2 {
@@ -545,6 +621,8 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
             "overwriting existing files without --force prompts in non-TTY",
         ],
         json_contract_depth: JsonContractDepth::SemanticAsserts,
+        scenarios_by_file: &[],
+        last_audited_at: "2026-05-14",
     },
     // ── id 23: lpm remove (alias rm, source pkg) ──
     SurfaceV2 {
@@ -560,6 +638,8 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
             "remove of a source package while VSCode has the file open",
         ],
         json_contract_depth: JsonContractDepth::InstaSnapshot,
+        scenarios_by_file: &[],
+        last_audited_at: "2026-05-14",
     },
     // ── id 24: lpm upgrade (bare) ──
     SurfaceV2 {
@@ -580,13 +660,16 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
             "yes marks install-scripts in JSON",
             "yes marks peer violation in JSON",
             "yes install-failure restores manifest",
+            "dry-run JSON envelope (one candidate) snapshot",
         ],
         failure_modes_known: &[
             "registry version no longer published mid-upgrade",
             "concurrent upgrade on same project",
             "upgrade across a deprecated → renamed package transition",
         ],
-        json_contract_depth: JsonContractDepth::SemanticAsserts,
+        json_contract_depth: JsonContractDepth::InstaSnapshot,
+        scenarios_by_file: &[],
+        last_audited_at: "2026-05-14",
     },
     // ── id 25: lpm upgrade --major ──
     SurfaceV2 {
@@ -604,6 +687,8 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
             "major bump that drops a sub-dependency entirely",
         ],
         json_contract_depth: JsonContractDepth::InstaSnapshot,
+        scenarios_by_file: &[],
+        last_audited_at: "2026-05-14",
     },
     // ── id 26: lpm upgrade --interactive ──
     SurfaceV2 {
@@ -617,6 +702,8 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
             "interactive in non-TTY environment falls back to batch",
         ],
         json_contract_depth: JsonContractDepth::None,
+        scenarios_by_file: &[],
+        last_audited_at: "2026-05-14",
     },
     // ── id 27: lpm publish (LPM, default) ──
     SurfaceV2 {
@@ -636,6 +723,8 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
             "publish while a freshly rotated token is propagating",
         ],
         json_contract_depth: JsonContractDepth::SemanticAsserts,
+        scenarios_by_file: &[],
+        last_audited_at: "2026-05-14",
     },
     // ── id 28: lpm publish --npm ──
     SurfaceV2 {
@@ -648,6 +737,8 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
             "registry serves tarball instead of metadata",
         ],
         json_contract_depth: JsonContractDepth::SemanticAsserts,
+        scenarios_by_file: &[],
+        last_audited_at: "2026-05-14",
     },
     // ── id 29: lpm publish --github ──
     SurfaceV2 {
@@ -661,6 +752,8 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
             "GHCR vs GitHub Packages routing mismatch",
         ],
         json_contract_depth: JsonContractDepth::SemanticAsserts,
+        scenarios_by_file: &[],
+        last_audited_at: "2026-05-14",
     },
     // ── id 30: lpm publish --gitlab ──
     SurfaceV2 {
@@ -673,6 +766,8 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
             "concurrent publish to same project ID",
         ],
         json_contract_depth: JsonContractDepth::SemanticAsserts,
+        scenarios_by_file: &[],
+        last_audited_at: "2026-05-14",
     },
     // ── id 31: lpm publish --publish-registry <URL> ──
     SurfaceV2 {
@@ -687,6 +782,8 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
             "custom registry requires unsupported auth scheme",
         ],
         json_contract_depth: JsonContractDepth::SemanticAsserts,
+        scenarios_by_file: &[],
+        last_audited_at: "2026-05-14",
     },
     // ── id 32: lpm publish --dry-run ──
     SurfaceV2 {
@@ -704,6 +801,8 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
             "dry-run against a registry the user has never logged in to",
         ],
         json_contract_depth: JsonContractDepth::SemanticAsserts,
+        scenarios_by_file: &[],
+        last_audited_at: "2026-05-14",
     },
     // ── id 33: lpm publish --check ──
     SurfaceV2 {
@@ -716,6 +815,8 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
             "check during a stale-token rotation window",
         ],
         json_contract_depth: JsonContractDepth::SemanticAsserts,
+        scenarios_by_file: &[],
+        last_audited_at: "2026-05-14",
     },
     // ── id 34: lpm login (LPM default) ──
     SurfaceV2 {
@@ -733,6 +834,8 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
             "login on a host that has no keychain (Linux without libsecret)",
         ],
         json_contract_depth: JsonContractDepth::SemanticAsserts,
+        scenarios_by_file: &[],
+        last_audited_at: "2026-05-14",
     },
     // ── id 35: lpm login --npm ──
     SurfaceV2 {
@@ -748,6 +851,8 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
             "npm OTP prompt under non-TTY",
         ],
         json_contract_depth: JsonContractDepth::None,
+        scenarios_by_file: &[],
+        last_audited_at: "2026-05-14",
     },
     // ── id 36: lpm login --github / --gitlab ──
     SurfaceV2 {
@@ -765,6 +870,8 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
             "OIDC issuer DNS failure mid-flow",
         ],
         json_contract_depth: JsonContractDepth::None,
+        scenarios_by_file: &[],
+        last_audited_at: "2026-05-14",
     },
     // ── id 37: lpm login --login-registry <URL> ──
     SurfaceV2 {
@@ -780,6 +887,8 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
             "multi-registry token storage cross-talk",
         ],
         json_contract_depth: JsonContractDepth::None,
+        scenarios_by_file: &[],
+        last_audited_at: "2026-05-14",
     },
     // ── id 38: lpm logout ──
     SurfaceV2 {
@@ -796,6 +905,8 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
             "logout while a publish is mid-flight",
         ],
         json_contract_depth: JsonContractDepth::None,
+        scenarios_by_file: &[],
+        last_audited_at: "2026-05-14",
     },
     // ── id 39: lpm logout --revoke / --all ──
     SurfaceV2 {
@@ -813,6 +924,8 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
             "revoke during a CI-managed token rotation",
         ],
         json_contract_depth: JsonContractDepth::None,
+        scenarios_by_file: &[],
+        last_audited_at: "2026-05-14",
     },
     // ── id 40: lpm token-rotate ──
     SurfaceV2 {
@@ -826,6 +939,8 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
             "rotation against a registry that returns 5xx",
         ],
         json_contract_depth: JsonContractDepth::InstaSnapshot,
+        scenarios_by_file: &[],
+        last_audited_at: "2026-05-14",
     },
     // ── id 41: lpm setup (.npmrc CI gen) ──
     SurfaceV2 {
@@ -843,6 +958,8 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
             "setup against an .npmrc that already has conflicting scoped entries",
         ],
         json_contract_depth: JsonContractDepth::SemanticAsserts,
+        scenarios_by_file: &[],
+        last_audited_at: "2026-05-14",
     },
     // ── id 42: lpm setup-npmrc ──
     SurfaceV2 {
@@ -856,6 +973,8 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
             "setup-npmrc when project root is a git submodule",
         ],
         json_contract_depth: JsonContractDepth::InstaSnapshot,
+        scenarios_by_file: &[],
+        last_audited_at: "2026-05-14",
     },
     // ── id 43: lpm config get ──
     SurfaceV2 {
@@ -869,6 +988,8 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
             "get of a key with embedded JSON-special characters",
         ],
         json_contract_depth: JsonContractDepth::InstaSnapshot,
+        scenarios_by_file: &[],
+        last_audited_at: "2026-05-14",
     },
     // ── id 44: lpm config set ──
     SurfaceV2 {
@@ -882,6 +1003,8 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
             "set on a key that violates a typed schema",
         ],
         json_contract_depth: JsonContractDepth::None,
+        scenarios_by_file: &[],
+        last_audited_at: "2026-05-14",
     },
     // ── id 45: lpm config delete ──
     SurfaceV2 {
@@ -895,6 +1018,8 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
             "delete of a nonexistent key (idempotent vs error)",
         ],
         json_contract_depth: JsonContractDepth::None,
+        scenarios_by_file: &[],
+        last_audited_at: "2026-05-14",
     },
     // ── id 46: lpm config list ──
     SurfaceV2 {
@@ -907,6 +1032,8 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
             "list under a HOME that points to a non-writable mount",
         ],
         json_contract_depth: JsonContractDepth::InstaSnapshot,
+        scenarios_by_file: &[],
+        last_audited_at: "2026-05-14",
     },
     // ── id 47: lpm cache clean [subcat] ──
     SurfaceV2 {
@@ -926,6 +1053,8 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
             "clean under a HOME whose cache dir is a bind-mount",
         ],
         json_contract_depth: JsonContractDepth::SemanticAsserts,
+        scenarios_by_file: &[],
+        last_audited_at: "2026-05-14",
     },
     // ── id 48: lpm cache path [subcat] ──
     SurfaceV2 {
@@ -943,6 +1072,8 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
             "cache root override via env var",
         ],
         json_contract_depth: JsonContractDepth::InstaSnapshot,
+        scenarios_by_file: &[],
+        last_audited_at: "2026-05-14",
     },
     // ── id 49: lpm store verify ──
     SurfaceV2 {
@@ -960,6 +1091,8 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
             "verify of v2 entries (when v2 layout ships)",
         ],
         json_contract_depth: JsonContractDepth::SemanticAsserts,
+        scenarios_by_file: &[],
+        last_audited_at: "2026-05-14",
     },
     // ── id 50: lpm store path ──
     SurfaceV2 {
@@ -972,6 +1105,8 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
             "store root override via env var",
         ],
         json_contract_depth: JsonContractDepth::SemanticAsserts,
+        scenarios_by_file: &[],
+        last_audited_at: "2026-05-14",
     },
     // ── id 51: lpm cache prune ──
     SurfaceV2 {
@@ -993,6 +1128,8 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
             "prune across a store dir whose backing FS is full",
         ],
         json_contract_depth: JsonContractDepth::SemanticAsserts,
+        scenarios_by_file: &[],
+        last_audited_at: "2026-05-14",
     },
     // ── id 52: lpm store clean ──
     SurfaceV2 {
@@ -1010,6 +1147,8 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
             "clean across mixed-permission entries",
         ],
         json_contract_depth: JsonContractDepth::SemanticAsserts,
+        scenarios_by_file: &[],
+        last_audited_at: "2026-05-14",
     },
     // ── id 53: lpm global list ──
     SurfaceV2 {
@@ -1026,6 +1165,8 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
             "list against a global dir on a network-mounted FS",
         ],
         json_contract_depth: JsonContractDepth::SemanticAsserts,
+        scenarios_by_file: &[],
+        last_audited_at: "2026-05-14",
     },
     // ── id 54: lpm global list --outdated ──
     SurfaceV2 {
@@ -1039,6 +1180,8 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
             "outdated against a global pin that no longer resolves",
         ],
         json_contract_depth: JsonContractDepth::SemanticAsserts,
+        scenarios_by_file: &[],
+        last_audited_at: "2026-05-14",
     },
     // ── id 55: lpm global bin ──
     SurfaceV2 {
@@ -1054,6 +1197,8 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
             "Windows: bin path with backslashes vs forward slashes",
         ],
         json_contract_depth: JsonContractDepth::SemanticAsserts,
+        scenarios_by_file: &[],
+        last_audited_at: "2026-05-14",
     },
     // ── id 56: lpm global path <pkg> ──
     SurfaceV2 {
@@ -1066,6 +1211,8 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
             "path of a package installed via cargo-install fallback",
         ],
         json_contract_depth: JsonContractDepth::None,
+        scenarios_by_file: &[],
+        last_audited_at: "2026-05-14",
     },
     // ── id 57: lpm global remove ──
     SurfaceV2 {
@@ -1079,6 +1226,8 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
             "remove of a package whose shim was hand-edited",
         ],
         json_contract_depth: JsonContractDepth::SemanticAsserts,
+        scenarios_by_file: &[],
+        last_audited_at: "2026-05-14",
     },
     // ── id 58: lpm global update ──
     SurfaceV2 {
@@ -1095,6 +1244,8 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
             "update across a major-version jump (provenance drift)",
         ],
         json_contract_depth: JsonContractDepth::SemanticAsserts,
+        scenarios_by_file: &[],
+        last_audited_at: "2026-05-14",
     },
     // ── id 59: lpm trust diff ──
     SurfaceV2 {
@@ -1114,6 +1265,8 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
             "diff after a `lpm rebuild --policy=allow` widened the trust set",
         ],
         json_contract_depth: JsonContractDepth::SemanticAsserts,
+        scenarios_by_file: &[],
+        last_audited_at: "2026-05-14",
     },
     // ── id 60: lpm trust prune ──
     SurfaceV2 {
@@ -1132,6 +1285,8 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
             "prune against a workspace where some members have stale + others fresh entries",
         ],
         json_contract_depth: JsonContractDepth::SemanticAsserts,
+        scenarios_by_file: &[],
+        last_audited_at: "2026-05-14",
     },
     // ── id 61: lpm pool ──
     SurfaceV2 {
@@ -1147,6 +1302,8 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
             "pool stats for a project with zero pooled deps",
         ],
         json_contract_depth: JsonContractDepth::InstaSnapshot,
+        scenarios_by_file: &[],
+        last_audited_at: "2026-05-14",
     },
     // ── id 62: lpm audit (bare) ──
     SurfaceV2 {
@@ -1168,6 +1325,8 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
             "audit when behavioral analysis cache is corrupt",
         ],
         json_contract_depth: JsonContractDepth::SemanticAsserts,
+        scenarios_by_file: &[],
+        last_audited_at: "2026-05-14",
     },
     // ── id 63: lpm audit --fail-on=<policy> ──
     SurfaceV2 {
@@ -1189,6 +1348,8 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
             "audit reports a finding for a package no longer installed",
         ],
         json_contract_depth: JsonContractDepth::InstaSnapshot,
+        scenarios_by_file: &[],
+        last_audited_at: "2026-05-14",
     },
     // ── id 64: lpm audit --secrets ──
     SurfaceV2 {
@@ -1210,6 +1371,8 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
             "scoped @org/pkg dir (test only covers unscoped)",
         ],
         json_contract_depth: JsonContractDepth::SemanticAsserts,
+        scenarios_by_file: &[],
+        last_audited_at: "2026-05-14",
     },
     // ── id 65: lpm query <selector> ──
     SurfaceV2 {
@@ -1230,6 +1393,8 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
             "selector against a 1000+ package transitive tree (perf)",
         ],
         json_contract_depth: JsonContractDepth::SemanticAsserts,
+        scenarios_by_file: &[],
+        last_audited_at: "2026-05-14",
     },
     // ── id 66: lpm query --count / --assert-none / --format mermaid ──
     SurfaceV2 {
@@ -1246,6 +1411,8 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
             "count under a registry-only-lpm filter",
         ],
         json_contract_depth: JsonContractDepth::SemanticAsserts,
+        scenarios_by_file: &[],
+        last_audited_at: "2026-05-14",
     },
     // ── id 67: lpm rebuild (bare, trusted-only) ──
     SurfaceV2 {
@@ -1268,6 +1435,8 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
             "Windows AppContainer sandbox network denial (no test today)",
         ],
         json_contract_depth: JsonContractDepth::InstaSnapshot,
+        scenarios_by_file: &[],
+        last_audited_at: "2026-05-14",
     },
     // ── id 68: lpm rebuild --all ──
     SurfaceV2 {
@@ -1285,6 +1454,8 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
             "rebuild --all across a workspace where some members have script-policy overrides",
         ],
         json_contract_depth: JsonContractDepth::SemanticAsserts,
+        scenarios_by_file: &[],
+        last_audited_at: "2026-05-14",
     },
     // ── id 69: lpm rebuild --policy=allow / --yolo ──
     SurfaceV2 {
@@ -1300,6 +1471,8 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
             "yolo + cross-platform sandbox parity (macOS vs Windows AppContainer)",
         ],
         json_contract_depth: JsonContractDepth::InstaSnapshot,
+        scenarios_by_file: &[],
+        last_audited_at: "2026-05-14",
     },
     // ── id 70: lpm rebuild --policy=triage / --triage ──
     SurfaceV2 {
@@ -1318,6 +1491,8 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
             "triage without advisor + --auto-build keeps amber blocked",
         ],
         json_contract_depth: JsonContractDepth::SemanticAsserts,
+        scenarios_by_file: &[],
+        last_audited_at: "2026-05-14",
     },
     // ── id 71: lpm approve-scripts (interactive) ──
     SurfaceV2 {
@@ -1335,6 +1510,8 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
             "approve-scripts on a project where the lockfile differs from the build-state.json",
         ],
         json_contract_depth: JsonContractDepth::SemanticAsserts,
+        scenarios_by_file: &[],
+        last_audited_at: "2026-05-14",
     },
     // ── id 72: lpm approve-scripts --list ──
     SurfaceV2 {
@@ -1354,6 +1531,8 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
             "list across a workspace where each member has different pending sets",
         ],
         json_contract_depth: JsonContractDepth::SemanticAsserts,
+        scenarios_by_file: &[],
+        last_audited_at: "2026-05-14",
     },
     // ── id 73: lpm approve-scripts --yes ──
     SurfaceV2 {
@@ -1371,6 +1550,8 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
             "yes on a workspace where members disagree on policy",
         ],
         json_contract_depth: JsonContractDepth::SemanticAsserts,
+        scenarios_by_file: &[],
+        last_audited_at: "2026-05-14",
     },
     // ── id 74: lpm approve-scripts <pkg> ──
     SurfaceV2 {
@@ -1387,6 +1568,8 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
             "approval of a package that has multiple installed versions",
         ],
         json_contract_depth: JsonContractDepth::None,
+        scenarios_by_file: &[],
+        last_audited_at: "2026-05-14",
     },
     // ── id 75: lpm approve-scripts --global ──
     SurfaceV2 {
@@ -1405,6 +1588,8 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
             "global approval surviving an `lpm cache clean trust` (legacy state)",
         ],
         json_contract_depth: JsonContractDepth::SemanticAsserts,
+        scenarios_by_file: &[],
+        last_audited_at: "2026-05-14",
     },
     // ── id 76: lpm approve-scripts --dry-run ──
     SurfaceV2 {
@@ -1420,6 +1605,8 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
             "dry-run that would have promoted nothing (output shape)",
         ],
         json_contract_depth: JsonContractDepth::SemanticAsserts,
+        scenarios_by_file: &[],
+        last_audited_at: "2026-05-14",
     },
     // ── id 77: lpm patch <key> ──
     SurfaceV2 {
@@ -1438,6 +1625,8 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
             "patch survives store gc / cache prune",
         ],
         json_contract_depth: JsonContractDepth::SemanticAsserts,
+        scenarios_by_file: &[],
+        last_audited_at: "2026-05-14",
     },
     // ── id 78: lpm patch-commit <dir> ──
     SurfaceV2 {
@@ -1455,6 +1644,8 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
             "patch-commit when the source dir was moved between extract and commit",
         ],
         json_contract_depth: JsonContractDepth::SemanticAsserts,
+        scenarios_by_file: &[],
+        last_audited_at: "2026-05-14",
     },
     // ── id 79: lpm filter <expr> ──
     SurfaceV2 {
@@ -1479,6 +1670,8 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
             "filter combining glob + dependency-of in the same expr",
         ],
         json_contract_depth: JsonContractDepth::SemanticAsserts,
+        scenarios_by_file: &[],
+        last_audited_at: "2026-05-14",
     },
     // ── id 80: lpm deploy <out> --filter ──
     SurfaceV2 {
@@ -1500,6 +1693,8 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
             "deploy across a member with workspace:^ pointing outside the closure",
         ],
         json_contract_depth: JsonContractDepth::SemanticAsserts,
+        scenarios_by_file: &[],
+        last_audited_at: "2026-05-14",
     },
     // ── id 81: lpm plugin list / update ──
     SurfaceV2 {
@@ -1516,6 +1711,8 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
             "update under offline mode",
         ],
         json_contract_depth: JsonContractDepth::InstaSnapshot,
+        scenarios_by_file: &[],
+        last_audited_at: "2026-05-14",
     },
     // ── id 82: lpm skills list/install/validate/clean ──
     SurfaceV2 {
@@ -1538,6 +1735,8 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
             "concurrent skills clean + install",
         ],
         json_contract_depth: JsonContractDepth::SemanticAsserts,
+        scenarios_by_file: &[],
+        last_audited_at: "2026-05-14",
     },
     // ── id 83: lpm run <script> ──
     SurfaceV2 {
@@ -1566,6 +1765,8 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
             "script that spawns a long-lived daemon (kill-tree behavior)",
         ],
         json_contract_depth: JsonContractDepth::SemanticAsserts,
+        scenarios_by_file: &[],
+        last_audited_at: "2026-05-14",
     },
     // ── id 84: lpm run --filter / --all / --affected ──
     SurfaceV2 {
@@ -1587,6 +1788,8 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
             "--affected base ref pointing at a missing commit",
         ],
         json_contract_depth: JsonContractDepth::SemanticAsserts,
+        scenarios_by_file: &[],
+        last_audited_at: "2026-05-14",
     },
     // ── id 85: lpm exec <file> ──
     SurfaceV2 {
@@ -1603,6 +1806,8 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
             "exec of a file with shebang resolving to an absent interpreter",
         ],
         json_contract_depth: JsonContractDepth::None,
+        scenarios_by_file: &[],
+        last_audited_at: "2026-05-14",
     },
     // ── id 86: lpm dlx <pkg> ──
     SurfaceV2 {
@@ -1616,6 +1821,8 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
             "dlx of a package whose entrypoint shells out",
         ],
         json_contract_depth: JsonContractDepth::None,
+        scenarios_by_file: &[],
+        last_audited_at: "2026-05-14",
     },
     // ── id 87: lpm lint ──
     SurfaceV2 {
@@ -1635,6 +1842,8 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
             "lint --all on a workspace where one member has a broken config",
         ],
         json_contract_depth: JsonContractDepth::SemanticAsserts,
+        scenarios_by_file: &[],
+        last_audited_at: "2026-05-14",
     },
     // ── id 88: lpm fmt (write) ──
     SurfaceV2 {
@@ -1652,6 +1861,8 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
             "fmt on a file whose encoding is not UTF-8",
         ],
         json_contract_depth: JsonContractDepth::SemanticAsserts,
+        scenarios_by_file: &[],
+        last_audited_at: "2026-05-14",
     },
     // ── id 89: lpm fmt --check ──
     SurfaceV2 {
@@ -1665,6 +1876,8 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
             "check on a file whose declared dialect mismatches biome's expectation",
         ],
         json_contract_depth: JsonContractDepth::SemanticAsserts,
+        scenarios_by_file: &[],
+        last_audited_at: "2026-05-14",
     },
     // ── id 90: lpm check ──
     SurfaceV2 {
@@ -1690,6 +1903,8 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
             "tsc version mismatch between members",
         ],
         json_contract_depth: JsonContractDepth::SemanticAsserts,
+        scenarios_by_file: &[],
+        last_audited_at: "2026-05-14",
     },
     // ── id 91: lpm test ──
     SurfaceV2 {
@@ -1711,6 +1926,8 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
             "test runner not installed in member's node_modules",
         ],
         json_contract_depth: JsonContractDepth::SemanticAsserts,
+        scenarios_by_file: &[],
+        last_audited_at: "2026-05-14",
     },
     // ── id 92: lpm bench ──
     SurfaceV2 {
@@ -1727,6 +1944,8 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
             "bench against a member with no bench script",
         ],
         json_contract_depth: JsonContractDepth::None,
+        scenarios_by_file: &[("tests/workflows/tests/tools.rs", 2)],
+        last_audited_at: "2026-05-14",
     },
     // ── id 93: lpm ci env ──
     SurfaceV2 {
@@ -1743,6 +1962,8 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
             "github-actions runner without GITHUB_ENV set (degraded path)",
         ],
         json_contract_depth: JsonContractDepth::None,
+        scenarios_by_file: &[],
+        last_audited_at: "2026-05-14",
     },
     // ── id 94: lpm ci setup github-actions ──
     SurfaceV2 {
@@ -1756,6 +1977,8 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
             "setup against a workflow file the user has hand-edited",
         ],
         json_contract_depth: JsonContractDepth::None,
+        scenarios_by_file: &[],
+        last_audited_at: "2026-05-14",
     },
     // ── id 95: lpm ci setup gitlab ──
     SurfaceV2 {
@@ -1774,6 +1997,8 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
             "gitlab CI YAML already contains conflicting id_tokens stanza",
         ],
         json_contract_depth: JsonContractDepth::None,
+        scenarios_by_file: &[],
+        last_audited_at: "2026-05-14",
     },
     // ── id 96: lpm env init ──
     SurfaceV2 {
@@ -1787,6 +2012,8 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
             "init under a HOME with restricted permissions",
         ],
         json_contract_depth: JsonContractDepth::None,
+        scenarios_by_file: &[],
+        last_audited_at: "2026-05-14",
     },
     // ── id 97: lpm env ls / list ──
     SurfaceV2 {
@@ -1800,6 +2027,8 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
             "list under an env that was deleted by a concurrent CLI",
         ],
         json_contract_depth: JsonContractDepth::SemanticAsserts,
+        scenarios_by_file: &[],
+        last_audited_at: "2026-05-14",
     },
     // ── id 98: lpm env set / get / delete ──
     SurfaceV2 {
@@ -1820,6 +2049,8 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
             "set of a value larger than the vault's size cap",
         ],
         json_contract_depth: JsonContractDepth::SemanticAsserts,
+        scenarios_by_file: &[],
+        last_audited_at: "2026-05-14",
     },
     // ── id 99: lpm env import / export / print / copy ──
     SurfaceV2 {
@@ -1838,6 +2069,8 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
             "copy across two pair-bound vaults on the same machine",
         ],
         json_contract_depth: JsonContractDepth::None,
+        scenarios_by_file: &[],
+        last_audited_at: "2026-05-14",
     },
     // ── id 100: lpm env diff / validate / check ──
     SurfaceV2 {
@@ -1855,6 +2088,8 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
             "diff between local + remote (cloud-bound path)",
         ],
         json_contract_depth: JsonContractDepth::SemanticAsserts,
+        scenarios_by_file: &[],
+        last_audited_at: "2026-05-14",
     },
     // ── id 101: lpm env push / pull (cloud) ──
     SurfaceV2 {
@@ -1878,6 +2113,8 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
             "push to a vault whose org membership was revoked between auth + write",
         ],
         json_contract_depth: JsonContractDepth::None,
+        scenarios_by_file: &[],
+        last_audited_at: "2026-05-14",
     },
     // ── id 103: lpm env pair ──
     SurfaceV2 {
@@ -1898,6 +2135,8 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
             "pair after a logout-all on a refresh-backed session",
         ],
         json_contract_depth: JsonContractDepth::None,
+        scenarios_by_file: &[],
+        last_audited_at: "2026-05-14",
     },
     // ── id 104: lpm env unpair ──
     SurfaceV2 {
@@ -1915,6 +2154,8 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
             "unpair while a push/pull is mid-flight",
         ],
         json_contract_depth: JsonContractDepth::None,
+        scenarios_by_file: &[],
+        last_audited_at: "2026-05-14",
     },
     // ── id 106: lpm env oidc allow ──
     SurfaceV2 {
@@ -1935,6 +2176,8 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
             "allow against a vault the user lacks admin rights to",
         ],
         json_contract_depth: JsonContractDepth::SemanticAsserts,
+        scenarios_by_file: &[],
+        last_audited_at: "2026-05-14",
     },
     // ── id 107: lpm env oidc list ──
     SurfaceV2 {
@@ -1947,6 +2190,8 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
             "list across a vault with 100+ allowed identities",
         ],
         json_contract_depth: JsonContractDepth::SemanticAsserts,
+        scenarios_by_file: &[],
+        last_audited_at: "2026-05-14",
     },
     // ── id 108: lpm env oidc pull ──
     SurfaceV2 {
@@ -1959,6 +2204,8 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
             "exchange against an unsupported OIDC provider issuer",
         ],
         json_contract_depth: JsonContractDepth::SemanticAsserts,
+        scenarios_by_file: &[],
+        last_audited_at: "2026-05-14",
     },
     // ── id 109: lpm dev ──
     SurfaceV2 {
@@ -1972,6 +2219,8 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
             "dev on a machine missing the bundled runtime binary",
         ],
         json_contract_depth: JsonContractDepth::None,
+        scenarios_by_file: &[],
+        last_audited_at: "2026-05-14",
     },
     // ── id 110: lpm dev --tunnel / --https / --network ──
     SurfaceV2 {
@@ -1985,6 +2234,8 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
             "tunnel + https together (interaction matrix)",
         ],
         json_contract_depth: JsonContractDepth::None,
+        scenarios_by_file: &[],
+        last_audited_at: "2026-05-14",
     },
     // ── id 111: lpm cert status / trust / uninstall / generate ──
     SurfaceV2 {
@@ -2002,6 +2253,8 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
             "certificate trust-chain validation on Windows + Linux stores",
         ],
         json_contract_depth: JsonContractDepth::InstaSnapshot,
+        scenarios_by_file: &[],
+        last_audited_at: "2026-05-14",
     },
     // ── id 112: lpm graph (tree default) ──
     SurfaceV2 {
@@ -2019,6 +2272,8 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
             "graph against a fully hoisted vs isolated layout",
         ],
         json_contract_depth: JsonContractDepth::None,
+        scenarios_by_file: &[],
+        last_audited_at: "2026-05-14",
     },
     // ── id 113: lpm graph --format json ──
     SurfaceV2 {
@@ -2034,6 +2289,8 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
             "JSON output for a 1000+ package transitive tree (perf)",
         ],
         json_contract_depth: JsonContractDepth::InstaSnapshot,
+        scenarios_by_file: &[],
+        last_audited_at: "2026-05-14",
     },
     // ── id 114: lpm graph --format html ──
     SurfaceV2 {
@@ -2051,6 +2308,8 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
             "HTML output written to a path that already exists as a directory",
         ],
         json_contract_depth: JsonContractDepth::None,
+        scenarios_by_file: &[],
+        last_audited_at: "2026-05-14",
     },
     // ── id 115: lpm graph --format dot / mermaid / stats ──
     SurfaceV2 {
@@ -2067,6 +2326,8 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
             "dot output piped through `graphviz -Tsvg` parity (extern tool)",
         ],
         json_contract_depth: JsonContractDepth::None,
+        scenarios_by_file: &[],
+        last_audited_at: "2026-05-14",
     },
     // ── id 116: lpm graph --why <pkg> ──
     SurfaceV2 {
@@ -2087,6 +2348,8 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
             "--why for a package present in multiple workspace members at different versions",
         ],
         json_contract_depth: JsonContractDepth::SemanticAsserts,
+        scenarios_by_file: &[],
+        last_audited_at: "2026-05-14",
     },
     // ── id 117: lpm ports list / kill / reset ──
     SurfaceV2 {
@@ -2103,6 +2366,8 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
             "kill of a port held by a process the user lacks privilege to signal",
         ],
         json_contract_depth: JsonContractDepth::InstaSnapshot,
+        scenarios_by_file: &[],
+        last_audited_at: "2026-05-14",
     },
     // ── id 118: lpm tunnel <port> (start) ──
     SurfaceV2 {
@@ -2116,6 +2381,8 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
             "tunnel under a HOME that has never been paired",
         ],
         json_contract_depth: JsonContractDepth::None,
+        scenarios_by_file: &[],
+        last_audited_at: "2026-05-14",
     },
     // ── id 119: lpm tunnel claim / unclaim / list / domains ──
     SurfaceV2 {
@@ -2129,6 +2396,8 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
             "unclaim of a domain that was force-released server-side",
         ],
         json_contract_depth: JsonContractDepth::None,
+        scenarios_by_file: &[],
+        last_audited_at: "2026-05-14",
     },
     // ── id 120: lpm tunnel inspect / replay / log ──
     SurfaceV2 {
@@ -2142,6 +2411,8 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
             "replay against a request whose body bytes have been GC'd server-side",
         ],
         json_contract_depth: JsonContractDepth::None,
+        scenarios_by_file: &[],
+        last_audited_at: "2026-05-14",
     },
     // ── id 121: lpm migrate (auto-detect npm/yarn/pnpm/bun) ──
     SurfaceV2 {
@@ -2172,6 +2443,8 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
             "migrate from a lockfile format the toolchain does not understand",
         ],
         json_contract_depth: JsonContractDepth::SemanticAsserts,
+        scenarios_by_file: &[],
+        last_audited_at: "2026-05-14",
     },
     // ── id 122: lpm migrate --rollback ──
     SurfaceV2 {
@@ -2185,6 +2458,8 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
             "rollback under a workspace where some members migrated + others didn't",
         ],
         json_contract_depth: JsonContractDepth::None,
+        scenarios_by_file: &[],
+        last_audited_at: "2026-05-14",
     },
     // ── id 123: lpm migrate --dry-run ──
     SurfaceV2 {
@@ -2201,6 +2476,8 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
             "dry-run against an already-migrated project (no-op shape)",
         ],
         json_contract_depth: JsonContractDepth::SemanticAsserts,
+        scenarios_by_file: &[],
+        last_audited_at: "2026-05-14",
     },
     // ── id 124: lpm migrate --ci / --no-npmrc ──
     SurfaceV2 {
@@ -2218,6 +2495,8 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
             "--ci + --no-npmrc interaction matrix",
         ],
         json_contract_depth: JsonContractDepth::None,
+        scenarios_by_file: &[],
+        last_audited_at: "2026-05-14",
     },
     // ── id 125: lpm vault open / update / version ──
     SurfaceV2 {
@@ -2236,6 +2515,8 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
             "vault under a HOME mounted from a network share",
         ],
         json_contract_depth: JsonContractDepth::None,
+        scenarios_by_file: &[],
+        last_audited_at: "2026-05-14",
     },
     // ── id 126: lpm self-update ──
     SurfaceV2 {
@@ -2252,6 +2533,8 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
             "self-update during an active install (binary held open)",
         ],
         json_contract_depth: JsonContractDepth::SemanticAsserts,
+        scenarios_by_file: &[],
+        last_audited_at: "2026-05-14",
     },
     // ── id 127: lpm internal-update-check (hidden) ──
     SurfaceV2 {
@@ -2267,18 +2550,27 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
             "internal-update-check fires during a slow `lpm install` (background race)",
         ],
         json_contract_depth: JsonContractDepth::None,
+        scenarios_by_file: &[],
+        last_audited_at: "2026-05-14",
     },
     // ── id 128: lpm swift-registry ──
     SurfaceV2 {
         id: 128,
-        scenarios: 2,
-        failure_modes_tested: &["swift-registry help works", "--force flag accepted"],
+        scenarios: 4,
+        failure_modes_tested: &[
+            "swift-registry help works",
+            "--force flag accepted at parse time",
+            "setup-with-mock smoke",
+            "--json envelope carries success field",
+        ],
         failure_modes_known: &[
             "swift toolchain unavailable",
             "certificate trust failure in xcode integration",
             "swift-registry login on a machine without swift installed",
         ],
-        json_contract_depth: JsonContractDepth::None,
+        json_contract_depth: JsonContractDepth::SemanticAsserts,
+        scenarios_by_file: &[],
+        last_audited_at: "2026-05-14",
     },
     // ── id 129: lpm mcp setup / remove / status ──
     SurfaceV2 {
@@ -2297,6 +2589,8 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
             "setup against an editor that doesn't ship MCP support",
         ],
         json_contract_depth: JsonContractDepth::SemanticAsserts,
+        scenarios_by_file: &[],
+        last_audited_at: "2026-05-14",
     },
     // ── id 130: lpm use node@<v> ──
     SurfaceV2 {
@@ -2313,6 +2607,8 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
             "use of a runtime version no longer hosted upstream",
         ],
         json_contract_depth: JsonContractDepth::None,
+        scenarios_by_file: &[],
+        last_audited_at: "2026-05-14",
     },
     // ── id 131: lpm use --list ──
     SurfaceV2 {
@@ -2330,6 +2626,8 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
             "list under a HOME whose runtime dir is corrupted",
         ],
         json_contract_depth: JsonContractDepth::SemanticAsserts,
+        scenarios_by_file: &[],
+        last_audited_at: "2026-05-14",
     },
     // ── id 132: lpm completions <shell> ──
     SurfaceV2 {
@@ -2346,6 +2644,8 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
             "completions for fish / powershell (not yet supported)",
         ],
         json_contract_depth: JsonContractDepth::None,
+        scenarios_by_file: &[],
+        last_audited_at: "2026-05-14",
     },
     // ── id 133: lpm schema lpm.json ──
     SurfaceV2 {
@@ -2361,6 +2661,8 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
             "schema output for an unknown kind (helpful error)",
         ],
         json_contract_depth: JsonContractDepth::SemanticAsserts,
+        scenarios_by_file: &[],
+        last_audited_at: "2026-05-14",
     },
     // ── id 134: lpm schema lpm.config.json ──
     SurfaceV2 {
@@ -2376,6 +2678,8 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
             "schema parity with the runtime parser for lpm.config.json",
         ],
         json_contract_depth: JsonContractDepth::SemanticAsserts,
+        scenarios_by_file: &[],
+        last_audited_at: "2026-05-14",
     },
     // ── id 135: lpm strict-ssl warning (cross-cmd installer warning) ──
     SurfaceV2 {
@@ -2392,6 +2696,8 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
             "warning interaction with --offline + .npmrc routing",
         ],
         json_contract_depth: JsonContractDepth::SemanticAsserts,
+        scenarios_by_file: &[],
+        last_audited_at: "2026-05-14",
     },
 ];
 
