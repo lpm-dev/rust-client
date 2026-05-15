@@ -121,7 +121,9 @@ pub async fn run(
         }
         _ => {
             return Err(LpmError::Registry(format!(
-                "unknown config action: {action}. Use: get, set, delete, list"
+                "unknown config action: {action}. \
+                 Use: get, set, delete (alias: unset), list (alias: ls), \
+                 scripts, triage, sandbox"
             )));
         }
     }

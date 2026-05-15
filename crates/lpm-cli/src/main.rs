@@ -251,8 +251,8 @@ enum Commands {
         #[arg(long)]
         allow_new: bool,
 
-        /// fail on tarball-URL deps that have no
-        /// declared SRI integrity in the manifest. Without this flag,
+        /// Fail on tarball-URL deps that have no declared SRI integrity
+        /// in the manifest. Without this flag,
         /// trust-on-first-use lets the first `lpm install` of a new
         /// tarball-URL dep accept whatever the URL returns and record
         /// the computed SRI in the lockfile; subsequent installs
@@ -274,8 +274,8 @@ enum Commands {
         /// `package.json > lpm > minimumReleaseAge` /
         /// `~/.lpm/config.toml` key `minimum-release-age-secs`.
         ///
-        ///: the full precedence chain is
-        /// `--min-release-age` (this flag, highest) → package.json →
+        /// The full precedence chain is `--min-release-age` (this flag,
+        /// highest) → package.json →
         /// `~/.lpm/config.toml` → 24h default. `--allow-new` and this
         /// flag are independent escape hatches: `--allow-new` bypasses
         /// the check entirely; `--min-release-age=<dur>` adjusts the
@@ -288,8 +288,8 @@ enum Commands {
         /// on publisher identity changes between a prior approval
         /// and the candidate version; this flag opts out for a named
         /// package while keeping every other package's drift check
-        /// live. Per D16, this is orthogonal to `--allow-new` — the
-        /// cooldown and drift gates are independent.
+        /// live. Orthogonal to `--allow-new` — the cooldown and drift
+        /// gates are independent.
         ///
         /// Prefer re-approving via `lpm approve-scripts` over
         /// ignoring the drift: re-approval captures the new
@@ -309,8 +309,8 @@ enum Commands {
         #[arg(long)]
         ignore_provenance_drift_all: bool,
 
-        /// Linking mode: `hoisted` (default since 4f — npm v3+
-        /// flat layout) or `isolated` (pnpm-style strict isolation).
+        /// Linking mode: `hoisted` (default — npm v3+ flat layout) or
+        /// `isolated` (pnpm-style strict isolation).
         /// Both materialize as project `node_modules/<dep>` symlinks
         /// into the global virtual store at `~/.lpm/store/v2/links/`,
         /// so warm-install latency is identical between modes; the
@@ -337,10 +337,10 @@ enum Commands {
 
         /// Automatically run `lpm rebuild` for trusted packages after install.
         ///
-        /// redundant under `--policy=allow` / `--yolo` (auto-build
-        /// fires at install time when policy is allow, regardless of this
-        /// flag). Still useful under the default `deny` policy when you
-        /// have an established trust set and want to skip the explicit
+        /// Redundant under `--policy=allow` / `--yolo` (auto-build fires
+        /// at install time when policy is allow, regardless of this flag).
+        /// Still useful under the default `deny` policy when you have an
+        /// established trust set and want to skip the explicit
         /// `lpm rebuild` step.
         #[arg(long)]
         auto_build: bool,
@@ -369,9 +369,6 @@ enum Commands {
         /// `lpm install`, without the tier gate. Matches `npm install`
         /// / `pnpm install` / `bun install` default semantics. The
         /// trust check is bypassed because you opted in explicitly.
-        /// (Pre-this flag declared intent but required a
-        /// second `--auto-build` flag to actually fire scripts; that
-        /// two-step is now collapsed.)
         ///
         /// `triage`: four-layer tiered gate. Auto-runs when every
         /// unbuilt scripted package is trusted/green; if any amber or
@@ -382,8 +379,9 @@ enum Commands {
         /// installs (`-g`), only `--auto-build` applies — `-g` uses a
         /// synthesized package.json that does not project per-project
         /// script knobs. Greens auto-execute in the filesystem sandbox;
-        /// ambers and reds never auto-execute. The LLM triage layer
-        /// is not available yet.
+        /// ambers and reds never auto-execute. The portable layers run
+        /// every time; the LLM advisor is consulted only when configured
+        /// (see `--advisor`).
         ///
         /// Precedence: this flag > `package.json > lpm > scriptPolicy`
         /// > `~/.lpm/config.toml` key `script-policy` > default (deny).
@@ -405,9 +403,8 @@ enum Commands {
         policy: Option<String>,
 
         /// Alias for `--policy=allow`. Runs every lifecycle script
-        /// during `lpm install` without the tier gate (—
-        /// auto-build fires automatically; no separate `--auto-build`
-        /// flag needed).
+        /// during `lpm install` without the tier gate — auto-build
+        /// fires automatically; no separate `--auto-build` flag needed.
         ///
         /// See `--policy` for the global rerun caveat (`-g` blocked
         /// scripts require uninstall+reinstall after approval).
@@ -416,10 +413,9 @@ enum Commands {
         #[arg(long, conflicts_with_all = ["policy", "triage_alias"])]
         yolo: bool,
 
-        /// alias for `--policy=triage`. Enables the
-        /// tiered gate (P2–P6): greens auto-approve and
-        /// run in the sandbox; ambers and reds route to
-        /// `lpm approve-scripts` for manual review.
+        /// Alias for `--policy=triage`. Enables the tiered gate: greens
+        /// auto-approve and run in the sandbox; ambers and reds route
+        /// to `lpm approve-scripts` for manual review.
         ///
         /// See `--policy` for the global rerun caveat (`-g` blocked
         /// scripts require uninstall+reinstall after approval).
@@ -428,7 +424,7 @@ enum Commands {
         #[arg(long = "triage", id = "triage_alias", conflicts_with_all = ["policy", "yolo"])]
         triage_alias: bool,
 
-        /// slice 1 — override the triage advisor for this run.
+        /// Override the triage advisor for this run.
         /// Valid values: `none` | `claude-cli` | `codex` | `ollama`.
         ///
         /// Precedence (highest first): this flag → `lpm.triageAdvisor`
@@ -447,9 +443,9 @@ enum Commands {
         )]
         advisor: Option<String>,
 
-        /// filter workspace members. Same grammar as
-        /// `lpm run --filter`. Only meaningful when adding packages — bare
-        /// `lpm install` (no packages) ignores this flag.
+        /// Filter workspace members. Same grammar as `lpm run --filter`.
+        /// Only meaningful when adding packages — bare `lpm install`
+        /// (no packages) ignores this flag.
         ///
         /// Example: `lpm install react --filter web` adds react to
         /// `packages/web/package.json` and runs the install pipeline at
@@ -459,45 +455,45 @@ enum Commands {
         #[arg(long)]
         filter: Vec<String>,
 
-        /// target the workspace root `package.json` instead
-        /// of the current member. Mutually exclusive with `--filter`. Use
-        /// when adding tooling packages that belong at the root rather than
+        /// Target the workspace root `package.json` instead of the
+        /// current member. Mutually exclusive with `--filter`. Use when
+        /// adding tooling packages that belong at the root rather than
         /// in a specific member (e.g., shared dev dependencies).
         #[arg(short = 'w', long = "workspace-root")]
         workspace_root: bool,
 
-        /// exit non-zero if `--filter` matches no members.
-        /// Recommended in CI to catch typo'd filters.
+        /// Exit non-zero if `--filter` matches no members. Recommended
+        /// in CI to catch typo'd filters.
         #[arg(long)]
         fail_if_no_match: bool,
 
-        /// (): skip the interactive
-        /// confirmation prompt when a filtered install will mutate more
-        /// than one workspace member's `package.json`. Mirrors `lpm init`
-        /// and `lpm publish` — JSON mode and non-TTY stdin already skip
-        /// the prompt automatically; this flag covers the interactive-
-        /// terminal-but-no-manual-review case (scripts, agents).
+        /// Skip the interactive confirmation prompt when a filtered
+        /// install will mutate more than one workspace member's
+        /// `package.json`. Mirrors `lpm init` and `lpm publish` —
+        /// JSON mode and non-TTY stdin already skip the prompt
+        /// automatically; this flag covers the interactive-terminal-
+        /// but-no-manual-review case (scripts, agents).
         #[arg(long, short = 'y')]
         yes: bool,
 
-        /// save the exact resolved version to `package.json`
-        /// instead of the default `^resolvedVersion`. Mutually exclusive
-        /// with `--tilde` and `--save-prefix`.
+        /// Save the exact resolved version to `package.json` instead of
+        /// the default `^resolvedVersion`. Mutually exclusive with
+        /// `--tilde` and `--save-prefix`.
         ///
         /// Example: `lpm install zod --exact` saves `"zod": "4.3.6"`.
         #[arg(long, conflicts_with_all = ["tilde", "save_prefix"])]
         exact: bool,
 
-        /// save `~resolvedVersion` to `package.json` instead of
-        /// the default `^resolvedVersion`. Mutually exclusive with
-        /// `--exact` and `--save-prefix`.
+        /// Save `~resolvedVersion` to `package.json` instead of the
+        /// default `^resolvedVersion`. Mutually exclusive with `--exact`
+        /// and `--save-prefix`.
         ///
         /// Example: `lpm install zod --tilde` saves `"zod": "~4.3.6"`.
         #[arg(long, conflicts_with_all = ["exact", "save_prefix"])]
         tilde: bool,
 
-        /// override the manifest save prefix for this install.
-        /// Valid values: `^`, `~`, or `""` (empty for exact, no prefix).
+        /// Override the manifest save prefix for this install. Valid
+        /// values: `^`, `~`, or `""` (empty for exact, no prefix).
         /// `*` is not accepted — wildcards must be requested per-package
         /// via `pkg@*`. Mutually exclusive with `--exact` and `--tilde`.
         ///
@@ -505,21 +501,18 @@ enum Commands {
         #[arg(long, value_name = "PREFIX", conflicts_with_all = ["exact", "tilde"])]
         save_prefix: Option<String>,
 
-        /// install the package globally into `~/.lpm/global/`
-        /// instead of into a project's `node_modules/`. Exposes the
-        /// package's bin entries on PATH via `~/.lpm/bin/`.
-        ///
-        /// The persistent install pipeline lands in M3; this M2 release
-        /// only ships the flag surface so downstream work can wire to it.
+        /// Install the package globally into `~/.lpm/global/` instead of
+        /// into a project's `node_modules/`. Exposes the package's bin
+        /// entries on PATH via `~/.lpm/bin/`.
         ///
         /// Example: `lpm install --global eslint`, `lpm install -g typescript`
         #[arg(long, short = 'g')]
         global: bool,
 
-        /// M4: resolve a command-name collision by transferring
-        /// ownership of `<CMD>` to the package being installed. The
-        /// previous owner keeps their row but loses that command from
-        /// PATH; the new shim points at this install.
+        /// Resolve a command-name collision by transferring ownership of
+        /// `<CMD>` to the package being installed. The previous owner
+        /// keeps their row but loses that command from PATH; the new
+        /// shim points at this install.
         ///
         /// Repeatable. Only meaningful with `-g`.
         ///
@@ -527,10 +520,10 @@ enum Commands {
         #[arg(long = "replace-bin", value_name = "CMD")]
         replace_bin: Vec<String>,
 
-        /// M4: install a declared bin under a different PATH
-        /// name. Format: `<orig>=<alias>` — `<orig>` must be a bin the
-        /// package declares, `<alias>` is the PATH name. Multiple
-        /// mappings comma-separated or via repeated flags.
+        /// Install a declared bin under a different PATH name.
+        /// Format: `<orig>=<alias>` — `<orig>` must be a bin the package
+        /// declares, `<alias>` is the PATH name. Multiple mappings
+        /// comma-separated or via repeated flags.
         ///
         /// When set, the declared `<orig>` name is NOT emitted as a
         /// shim; only `<alias>` is. Only meaningful with `-g`.
@@ -539,12 +532,12 @@ enum Commands {
         #[arg(long = "alias", value_name = "ORIG=ALIAS")]
         alias: Vec<String>,
 
-        /// rework : engage strict sandbox for
-        /// this install's lifecycle scripts — filesystem containment,
-        /// env scrubbing, and outbound network denial. Overrides any
-        /// persistent `[sandbox] mode` config for this command only.
-        /// Auto-build (`--auto-build` and the `package.json` key
-        /// `lpm.scripts.autoBuild`) honors the same strict mode.
+        /// Engage strict sandbox for this install's lifecycle scripts —
+        /// filesystem containment, env scrubbing, and outbound network
+        /// denial. Overrides any persistent `[sandbox] mode` config for
+        /// this command only. Auto-build (`--auto-build` and the
+        /// `package.json` key `lpm.scripts.autoBuild`) honors the same
+        /// strict mode.
         ///
         /// Mutually exclusive with `--no-sandbox` and `--paranoid`
         /// (the alias).
@@ -555,9 +548,9 @@ enum Commands {
         )]
         strict_sandbox: bool,
 
-        /// rework alias for `--strict-sandbox`. Same
-        /// behaviour; ergonomic spelling. Mutually exclusive with
-        /// `--no-sandbox` and `--strict-sandbox`.
+        /// Alias for `--strict-sandbox`. Same behaviour; ergonomic
+        /// spelling. Mutually exclusive with `--no-sandbox` and
+        /// `--strict-sandbox`.
         #[arg(
             long = "paranoid",
             id = "install_paranoid",
@@ -565,12 +558,11 @@ enum Commands {
         )]
         paranoid: bool,
 
-        /// rework : drop ALL containment for
-        /// this install's lifecycle scripts. Scripts run with full
-        /// host access — filesystem open, full env (credentials
-        /// included), outbound network allowed. Reserve for debugging
-        /// a sandbox false-positive. Persistent off-mode goes through
-        /// `lpm config sandbox --set none` instead.
+        /// Drop ALL containment for this install's lifecycle scripts.
+        /// Scripts run with full host access — filesystem open, full
+        /// env (credentials included), outbound network allowed. Reserve
+        /// for debugging a sandbox false-positive. Persistent off-mode
+        /// goes through `lpm config sandbox --set none` instead.
         ///
         /// Mutually exclusive with `--strict-sandbox` and `--paranoid`.
         #[arg(
@@ -913,9 +905,9 @@ enum Commands {
 
     /// Manage globally-installed CLI packages under ~/.lpm/global/.
     ///
-    /// M2 ships read-only commands (`list`, `bin`, `path`). The full
-    /// install / uninstall / update surface lands in M3 alongside the
-    /// global install pipeline.
+    /// Subcommands: `list` (with `--outdated`/`--verbose`), `bin`,
+    /// `path <pkg>`, `remove <pkg>` (= `lpm uninstall -g <pkg>`),
+    /// `update [<pkg>[@<spec>]]` (with `--dry-run`).
     Global {
         #[command(subcommand)]
         action: commands::global::GlobalCmd,
@@ -1519,11 +1511,11 @@ enum Commands {
         fail_if_no_match: bool,
     },
 
-    /// Manage tool plugins (list installed, update to latest).
+    /// Manage tool plugins (list, update, remove).
     Plugin {
-        /// Action: list, update.
+        /// Action: `list` (alias `ls`), `update` (alias `upgrade`), `remove` (aliases `rm`, `uninstall`).
         action: String,
-        /// Plugin name (for update). Omit to update all.
+        /// Plugin name. Optional for `update` (omit to update all); required for `remove`.
         name: Option<String>,
     },
 
