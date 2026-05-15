@@ -2503,18 +2503,22 @@ fn probe_sandbox_backend() -> Check {
                     //   every socket family via the WFP layer once the
                     //   capability list is empty — same coverage shape
                     //   as macOS Seatbelt.
-                    // - Linux landlock V4 only handles BindTcp +
-                    //   ConnectTcp, so UDP / raw / AF_PACKET / DNS-via-UDP
-                    //   are NOT denied until Phase 46.1.1's seccomp-bpf
-                    //   layer lands.
+                    // - Linux landlock V4 + Phase 46.1.1 seccomp-bpf
+                    //   layered together: landlock denies BindTcp +
+                    //   ConnectTcp, seccomp denies direct
+                    //   socket(AF_INET|AF_INET6, SOCK_DGRAM|SOCK_RAW)
+                    //   + AF_PACKET + AF_NETLINK. AF_UNIX intentionally
+                    //   allowed (legitimate IPC); resolver-mediated DNS
+                    //   stays host-dependent.
                     let net_coverage = if os == "macos" {
                         "full outbound network denial (all socket families)"
                     } else if backend == "windows-appcontainer" {
                         "full outbound network denial via AppContainer + WFP \
                          (all socket families)"
                     } else {
-                        "outbound TCP denial (BindTcp + ConnectTcp via landlock V4 — \
-                         UDP / raw / AF_PACKET / DNS-via-UDP NOT denied until Phase 46.1.1)"
+                        "outbound TCP denial (landlock V4: BindTcp + ConnectTcp) + \
+                         direct UDP / raw / AF_PACKET / AF_NETLINK denial \
+                         (seccomp-bpf, Phase 46.1.1); AF_UNIX allowed for IPC"
                     };
                     Check::pass(
                         &doctor_catalog::SANDBOX_AVAILABLE,

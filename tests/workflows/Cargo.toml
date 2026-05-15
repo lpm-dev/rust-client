@@ -9,6 +9,18 @@ publish = false
 [features]
 swift-tests = []
 
+# Phase 46.1.1: the `[[bin]] socket-probe` declared at the
+# bottom of this file pulls its source from
+# `crates/lpm-sandbox/src/bin/socket-probe.rs`. That source uses
+# `libc::socket / libc::close / libc::EACCES` inside a
+# `#[cfg(target_os = "linux")]` block, so `libc` needs to be in
+# the bin's dependency graph on Linux. `dev-dependencies` aren't
+# visible to `[[bin]]` targets; a regular `[dependencies]` entry
+# is required. Gated to Linux so the bin's no-op probe path on
+# macOS / Windows doesn't pull libc unnecessarily.
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"
+
 [dev-dependencies]
 assert_cmd = "2"
 predicates = "3"
@@ -40,3 +52,24 @@ scrypt = { workspace = true }
 sha2 = "0.10"
 p256 = { workspace = true }
 hex = { workspace = true }
+
+# Phase 46.1.1: workflows-local copy of the `socket-probe` test
+# bin so `cargo test -p lpm-workflows` (and CI's `--workspace`
+# run) builds it as part of compiling this crate's tests. The
+# bin source lives in `lpm-sandbox` because that crate's own
+# integration test (`tests/seccomp_socket_deny.rs`) needs it
+# accessible via the same-crate `cargo_bin!` macro; declaring
+# `[[bin]]` here with `path = ...` shares the file between the
+# two crates (compiled twice — once per owning crate's target —
+# but the source is single-sourced).
+#
+# Without this `[[bin]]` entry, a focused
+# `cargo test -p lpm-workflows --test sandbox_udp_denial` build
+# does NOT build `socket-probe`: cargo's dev-dependency
+# resolution pulls in the dep crate's lib but not its bins. The
+# workflow test's runtime resolver
+# (`current_exe().parent().parent().join("socket-probe")`) then
+# fails the `probe.exists()` precondition.
+[[bin]]
+name = "socket-probe"
+path = "../../crates/lpm-sandbox/src/bin/socket-probe.rs"

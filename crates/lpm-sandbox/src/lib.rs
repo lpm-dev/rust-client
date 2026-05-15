@@ -14,18 +14,25 @@
 //!   family / type. Dropping `(allow network*)` denies TCP, UDP,
 //!   raw sockets, AF_PACKET, AF_NETLINK, DNS — everything outbound.
 //!   Full outbound network denial.
-//! - **Linux landlock V4** — `AccessNet::from_all(V4)` only handles
-//!   `BindTcp` and `ConnectTcp`. UDP-based egress (raw `SOCK_DGRAM`,
-//!   DNS-via-UDP, AF_PACKET, AF_NETLINK) **is NOT denied** by V4
-//!   alone. The strict posture therefore enforces "filesystem +
-//!   outbound TCP denial" on Linux V4, not full network denial.
+//! - **Linux landlock V4 + seccomp-bpf (Phase 46.1.1)** — two
+//!   layered kernel mechanisms. Landlock V4
+//!   (`AccessNet::from_all(V4)`) denies outbound TCP (`BindTcp` +
+//!   `ConnectTcp`). On top of that, a seccomp-bpf filter denies
+//!   direct `socket(AF_INET|AF_INET6, SOCK_DGRAM|SOCK_RAW)`,
+//!   `socket(AF_PACKET, …)`, and `socket(AF_NETLINK, …)` —
+//!   closing the UDP / raw / L2 / routing-probe gap landlock V4
+//!   leaves open. **AF_UNIX / AF_LOCAL stay allowed at the
+//!   seccomp layer** so legitimate install-time IPC (node-ipc,
+//!   husky's hook protocol, npm daemon communication) keeps
+//!   working — that's the honest carve-out from full macOS
+//!   parity. Resolver-mediated DNS remains host-dependent: glibc
+//!   NSS may route through AF_UNIX (allowed) or fall through to
+//!   TCP port 53 (caught by landlock, not seccomp).
 //!
-//! Closing the Linux UDP / raw / DNS-via-UDP gap requires a
-//! second enforcement layer (seccomp-bpf), filed as **Phase 46.1.1**.
-//! [`SandboxPosture::Strict`] therefore documents this asymmetry
-//! at the trait-doc level, and `lpm doctor` reports it on every
-//! Linux run so users see the real coverage rather than the
-//! aspirational one.
+//! [`SandboxPosture::Strict`] documents this asymmetry at the
+//! trait-doc level, and `lpm doctor` reports it on every Linux
+//! run so users see what's actually enforced rather than
+//! claiming full network denial.
 //!
 //! [`lpm-security`](../lpm_security/index.html) stays policy-only.
 //!
@@ -43,7 +50,7 @@
 //! | Platform | [`SandboxMode::Enforce`] | [`SandboxMode::LogOnly`] | [`SandboxMode::Disabled`] |
 //! |----------|--------------------------|---------------------------|----------------------------|
 //! | macOS    | Seatbelt (`sandbox-exec`), `(deny default)` + narrow allows; **full outbound network denied** (Phase 46.1, no loopback exemption) — every socket family / type covered. | Seatbelt w/ `(allow (with report) default)` fallback | [`NoopSandbox`] |
-//! | Linux    | landlock V4 (kernel 6.7+) — filesystem + **outbound TCP** denial (BindTcp + ConnectTcp). UDP / raw / AF_PACKET / AF_NETLINK / DNS-via-UDP are NOT denied by V4 alone — closing that gap is Phase 46.1.1's seccomp-bpf layer. Kernels < 6.7 return [`SandboxError::KernelTooOld`] by default; explicit opt-in via `[sandbox] allow-degraded = true` falls back to V1 filesystem-only with a one-line stderr warning per install. | [`SandboxError::ModeNotSupportedOnPlatform`] — no native observe-only | [`NoopSandbox`] |
+//! | Linux    | landlock V4 (kernel 6.7+) + Phase 46.1.1 seccomp-bpf layered together — filesystem + **outbound TCP** (landlock: BindTcp + ConnectTcp) + **direct UDP / raw / AF_PACKET / AF_NETLINK** (seccomp: `socket(2)` deny matrix). AF_UNIX intentionally allowed for legitimate IPC; resolver-mediated DNS remains host-dependent (NSS via AF_UNIX or TCP fallback). Kernels < 6.7 return [`SandboxError::KernelTooOld`] by default; explicit opt-in via `[sandbox] allow-degraded = true` falls back to V1 filesystem-only (no seccomp layer either) with a one-line stderr warning per install. | [`SandboxError::ModeNotSupportedOnPlatform`] — no native observe-only | [`NoopSandbox`] |
 //! | Windows  | Phase 46.2: Mandatory Integrity Control (drop child to Low IL) + Job Object for kill-tree. Filesystem-write containment only — outbound network denial is **not** implemented; under default mode the posture is [`SandboxPosture::Default`]. Strict mode (`deny_outbound_network = true`) refuses with [`SandboxError::UnsupportedPlatform`] unless `allow_degraded = true`, in which case the backend succeeds with [`SandboxPosture::Degraded`] (`missing = "network-containment"`). The Phase 46.3 WFP layer closes the gap. | [`SandboxError::ModeNotSupportedOnPlatform`] — Mandatory Integrity Control has no native observe-only either | [`NoopSandbox`] |
 //!
 //! [`SandboxMode::Disabled`] always succeeds with a [`NoopSandbox`]:
@@ -76,6 +83,15 @@ mod seatbelt;
 
 #[cfg(target_os = "linux")]
 mod linux;
+
+// Phase 46.1.1: seccomp-bpf filter for the socket(2) deny matrix
+// (UDP / raw / AF_PACKET / AF_NETLINK). Layered on top of the
+// landlock V4 ruleset in [`linux`]'s `pre_exec` closure when the
+// posture is Strict. Exercised by the `socket-probe` test bin
+// (`src/bin/socket-probe.rs`) and the `sandbox_udp_denial`
+// workflow test.
+#[cfg(target_os = "linux")]
+mod seccomp;
 
 // Phase 46.2: Windows backend via Mandatory Integrity Control (drop
 // child to Low IL) + Job Object for kill-tree parity with Unix's
@@ -293,22 +309,28 @@ pub enum SandboxPosture {
     ///
     /// - **macOS Seatbelt** — full outbound network denial. Every
     ///   socket family / type (TCP, UDP, raw, AF_PACKET,
-    ///   AF_NETLINK, DNS) goes to the deny path under the
-    ///   `(deny default)` rule.
-    /// - **Linux landlock V4** — outbound **TCP** denial only.
-    ///   The V4 ABI's `AccessNet::from_all` covers `BindTcp` and
-    ///   `ConnectTcp`. UDP-based egress (`SOCK_DGRAM` for IPv4 +
-    ///   IPv6, raw sockets, AF_PACKET, AF_NETLINK, DNS-via-UDP)
-    ///   is NOT denied. Closing that gap is **Phase 46.1.1's
-    ///   seccomp-bpf layer**, tracked at
-    ///   `DOCS/new-features/37-rust-client-RUNNER-VISION-phase46.1.1-seccomp-udp-denial.md`.
+    ///   AF_NETLINK, DNS, AF_UNIX) goes to the deny path under
+    ///   the `(deny default)` rule.
+    /// - **Linux landlock V4 + Phase 46.1.1 seccomp-bpf** — two
+    ///   layered kernel mechanisms. Landlock V4
+    ///   (`AccessNet::from_all`) denies TCP `BindTcp` /
+    ///   `ConnectTcp`. The pre_exec closure ALSO installs a
+    ///   seccomp filter that denies direct
+    ///   `socket(AF_INET|AF_INET6, SOCK_DGRAM|SOCK_RAW)`,
+    ///   `socket(AF_PACKET, ...)`, and
+    ///   `socket(AF_NETLINK, ...)`. **AF_UNIX is intentionally
+    ///   allowed at the seccomp layer** for legitimate IPC needs
+    ///   (node-ipc, husky hooks, npm daemon comms) — an honest
+    ///   carve-out from full macOS parity. Resolver-mediated DNS
+    ///   remains host-dependent (NSS via AF_UNIX or TCP
+    ///   fallback).
     ///
     /// `lpm doctor` surfaces this asymmetry on every run so users
     /// see the real platform coverage rather than the aspirational
-    /// one. The runtime gate
-    /// `tests/workflows/tests/sandbox_network_denial.rs` exercises
-    /// the TCP path on both platforms; the UDP / raw-socket path
-    /// gets its own workflow test alongside Phase 46.1.1.
+    /// one. The runtime gates
+    /// `tests/workflows/tests/sandbox_network_denial.rs` (TCP) and
+    /// `tests/workflows/tests/sandbox_udp_denial.rs` (UDP / raw /
+    /// AF_PACKET / AF_NETLINK) pin the contract.
     Strict,
     /// Filesystem containment is active, but network denial is not.
     /// Linux landlock backend on kernels < 6.7 with the user's

@@ -140,14 +140,18 @@ EXIT_CODE=$?
 # Detect the OS-level sandbox-denial signal in stdout/stderr.
 #
 # This regex matches the unambiguous kernel-emitted denial tokens
-# that Phase 46.1's landlock V4 `ConnectTcp` / `BindTcp` deny
-# surfaces to the lifecycle script: `connect(2)` / `bind(2)`
-# returning `EACCES` / `EPERM` (landlock's denial), or the
-# socket-layer fallout `EHOSTUNREACH` / `ENETUNREACH` /
-# "operation not permitted" / "permission denied". These are
-# load-bearing because Phase 46.1's contract is "outbound TCP
-# denied"; a script that called `connect(2)` and saw one of
-# these errors was deniedly the sandbox.
+# that Phase 46.1 + 46.1.1 strict-mode enforcement surfaces to
+# the lifecycle script. Phase 46.1's landlock V4 surfaces
+# `connect(2)` / `bind(2)` returning `EACCES` / `EPERM`, plus
+# the socket-layer fallout `EHOSTUNREACH` / `ENETUNREACH` /
+# "operation not permitted" / "permission denied". Phase 46.1.1's
+# seccomp-bpf layer surfaces `socket(2)` itself returning EACCES
+# for the UDP / raw / AF_PACKET / AF_NETLINK families — same
+# token set, just at the `socket()` syscall rather than at
+# `connect()`. The combined contract is "outbound TCP via
+# landlock + direct UDP / raw / AF_PACKET / AF_NETLINK via
+# seccomp"; a script that called any of those syscalls and saw
+# one of these errors was denied by the sandbox.
 COMBINED="$(cat "$STDERR_FILE" "$STDOUT_FILE" 2>/dev/null || true)"
 DENIAL_SIGNAL_SEEN="false"
 if echo "$COMBINED" | grep -qE 'EACCES|EPERM|EHOSTUNREACH|ENETUNREACH|operation not permitted|permission denied'; then
@@ -158,24 +162,27 @@ fi
 # heuristic — `dns_failure_seen` in the JSON output, NOT folded
 # into `denial_signal_seen`.
 #
-# Why this is a separate axis: Phase 46.1's shipped contract on
-# Linux is "outbound TCP denied" (see `lpm-sandbox/src/lib.rs`
-# module doc + Phase 46.1.1 follow-up doc). DNS-via-UDP is
-# explicitly OUT of scope for 46.1; Phase 46.1.1 will close it
-# via a seccomp-bpf layer. In practice, on some host configs
-# (glibc resolver falling back to TCP for AAAA / truncated UDP /
-# systemd-resolved over 127.0.0.53:53/TCP), DNS lookups DO fail
-# under Phase 46.1 alone — but the failure isn't guaranteed by
-# the contract and host-to-host variance is real (musl, network
-# namespace setups, alternative resolvers all behave differently).
+# Why this is a separate axis: Phase 46.1.1 narrows the variance
+# window for DNS failures, but doesn't close it. The seccomp
+# filter denies DIRECT UDP `socket(AF_INET, SOCK_DGRAM)`
+# deterministically, so a script that does its own raw DNS
+# packet construction trips `denial_signal_seen` cleanly. But
+# resolver-mediated DNS (libc `getaddrinfo` -> glibc NSS) can
+# route through AF_UNIX sockets (intentionally allowed by the
+# 46.1.1 seccomp filter — see the AF_UNIX carve-out) or fall
+# through to TCP port 53 (caught by landlock, not seccomp).
+# Both paths surface as `EAI_AGAIN` / `getaddrinfo` errors at
+# the libc layer, NOT as `EACCES` from `socket()`. Musl,
+# alternative resolvers, network namespaces, and host NSS
+# variations all behave differently.
 #
 # Treating these as the same axis as `denial_signal_seen` would:
-# (a) overstate the product contract by claiming Phase 46.1
-# already seals external DNS — it doesn't, that's 46.1.1's job;
-# (b) misbucket ordinary resolver failures (a flaky DNS server,
-# an unreachable nscd, a real network outage) as sandbox denials.
-# Keep them as a separate flag the PR write-up can re-classify
-# package-by-package.
+# (a) overstate the product contract by implying full DNS
+# denial — Phase 46.1.1 narrows DNS variance but doesn't seal
+# resolver-mediated lookups; (b) misbucket ordinary resolver
+# failures (a flaky DNS server, an unreachable nscd, a real
+# network outage) as sandbox denials. Keep them as a separate
+# flag the PR write-up can re-classify package-by-package.
 DNS_FAILURE_SEEN="false"
 if echo "$COMBINED" | grep -qE 'EAI_AGAIN|EAI_NODATA|EAI_NONAME|EAI_FAIL|getaddrinfo'; then
     DNS_FAILURE_SEEN="true"

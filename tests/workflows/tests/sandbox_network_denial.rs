@@ -14,11 +14,13 @@
 //!   test specifically pins.
 //! - **Linux landlock V4** — `AccessNet::from_all(V4)` declared
 //!   via `handle_access` with no `NetPort` allows. Landlock V4's
-//!   net-access surface is BindTcp + ConnectTcp ONLY; UDP /
-//!   `SOCK_DGRAM` / raw / AF_PACKET / DNS-via-UDP go through this
-//!   sandbox UNDENIED. Closing that gap is **Phase 46.1.1's
-//!   seccomp-bpf layer**; the UDP / raw-socket runtime test
-//!   ships alongside that phase.
+//!   net-access surface is BindTcp + ConnectTcp ONLY; the
+//!   complementary direct UDP / raw / AF_PACKET / AF_NETLINK
+//!   denial is Phase 46.1.1's seccomp-bpf layer, runtime-pinned
+//!   by the sibling [`sandbox_udp_denial.rs`] workflow test.
+//!   AF_UNIX intentionally remains allowed; resolver-mediated
+//!   DNS stays host-dependent (see audit-harness rationale at
+//!   `bench/sandbox-network-audit/run.sh`).
 //!
 //! Both platforms agree on the TCP shape: a TCP connect to any
 //! host — including the loopback adapter — goes to the deny path.

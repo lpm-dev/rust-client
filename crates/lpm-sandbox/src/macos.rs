@@ -209,12 +209,15 @@ mod tests {
         // `[sandbox] mode = "strict"` / `LPM_STRICT_SANDBOX=1`),
         // the Seatbelt profile drops the `(allow network*)` line.
         // The `(deny default)` rule then covers every socket
-        // family — TCP, UDP, raw, AF_PACKET, AF_NETLINK, DNS — the
-        // platform-asymmetric advantage macOS has over Linux's
-        // landlock V4 (which only covers TCP). See the module-
-        // level docs in [`crate::lib`] and the Phase 46.1.1
-        // follow-up doc for the Linux UDP gap and its seccomp-bpf
-        // remediation.
+        // family — TCP, UDP, raw, AF_PACKET, AF_NETLINK, DNS,
+        // AF_UNIX, and any other family Seatbelt's match grammar
+        // recognises. That coverage is asymmetric vs Linux: the
+        // layered landlock V4 (Phase 46.1) + seccomp-bpf (Phase
+        // 46.1.1) model closes TCP + direct UDP / raw /
+        // AF_PACKET / AF_NETLINK on Linux, but AF_UNIX stays
+        // allowed there (legitimate IPC needs). See the
+        // module-level docs in [`crate::lib`] and `linux.rs` for
+        // the full carve-out.
         let rs = realistic_spec();
         let options = SandboxOptions {
             deny_outbound_network: true,
