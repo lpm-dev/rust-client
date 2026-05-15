@@ -651,11 +651,16 @@ fn has_nul(bytes: &[u8]) -> bool {
 /// - `^diff --git ` always starts a new file section (git emits this
 ///   for every file, including rename-only sections that have no
 ///   `---`/`+++` headers).
-/// - `^--- ` starts a new file section only if the splitter is not
-///   already inside a git header block (between a `diff --git` line
-///   and the first `@@` hunk header that follows it). Inside a git
-///   header block, the `--- a/old` line is the file's old-side header
-///   for the already-open section.
+/// - `^--- ` starts a new file section, EXCEPT when the splitter is
+///   inside an open `diff --git` section AND the `---` line is the
+///   current section's own old-side header (i.e., the path matches
+///   either an absent `rename from` or the existing one — the
+///   rename+edit case).
+/// - The mixed-format case where a rename-only `diff --git` section
+///   is followed by a plain `---/+++` chunk for a DIFFERENT file: the
+///   `---` path mismatch against `rename from` is the signal that the
+///   prior section ended. Without this rule the two sections collapse
+///   into one chunk (GPT audit, 2026-05-15).
 ///
 /// Hunk content lines start with ` `, `+`, `-`, or `\` (single
 /// character + content), so a line beginning with `diff --git ` or
@@ -665,19 +670,49 @@ fn has_nul(bytes: &[u8]) -> bool {
 pub fn split_multi_file_patch(text: &str) -> Vec<&str> {
     let mut boundaries: Vec<usize> = Vec::new();
     let mut byte = 0usize;
-    // `in_git_header` is set by `diff --git ` and cleared by the first
-    // `@@` hunk header of that file. While set, a `--- ` line is the
-    // current file's old-side header, not a new file boundary.
+    // `in_git_header` is set by `diff --git ` and cleared once we've
+    // resolved whether the next `---` line is the section's own
+    // old-side header or a new section's boundary. `current_rename_from`
+    // captures the most recent `rename from <path>` header (None when
+    // no rename header has been seen in the current `diff --git`
+    // section) — used to decide whether a `---` inside a git header is
+    // the same file (rename+edit) or a new file (mixed git→plain).
     let mut in_git_header = false;
+    let mut current_rename_from: Option<&str> = None;
     for line in text.split_inclusive('\n') {
         if line.starts_with("diff --git ") {
             boundaries.push(byte);
             in_git_header = true;
+            current_rename_from = None;
+        } else if let Some(rest) = line.strip_prefix("rename from ") {
+            current_rename_from = Some(rest.trim_end_matches(['\r', '\n']));
         } else if line.starts_with("--- ") {
-            if !in_git_header {
+            // A `--- ` line is a new file boundary EXCEPT:
+            //   (a) we're inside an open `diff --git` section with no
+            //       rename headers — this is the section's own
+            //       old-side header.
+            //   (b) we're inside an open `diff --git` section WITH a
+            //       prior `rename from` and the `---` path matches it
+            //       — rename+edit's old-side header.
+            // The mismatch case under (b) is the mixed git→plain
+            // boundary the GPT audit flagged.
+            let emit_boundary = if !in_git_header {
+                true
+            } else if let Some(rf) = current_rename_from {
+                let path = line
+                    .trim_end_matches(['\r', '\n'])
+                    .strip_prefix("--- ")
+                    .unwrap_or("");
+                let stripped = path.strip_prefix("a/").unwrap_or(path);
+                stripped != rf
+            } else {
+                false
+            };
+            if emit_boundary {
                 boundaries.push(byte);
+                current_rename_from = None;
             }
-            // else: header for the already-open `diff --git` section.
+            in_git_header = false;
         } else if line.starts_with("@@") {
             in_git_header = false;
         }
@@ -1821,6 +1856,71 @@ mod tests {
         assert_eq!(chunks.len(), 1);
         assert!(chunks[0].starts_with("diff --git "));
         assert!(chunks[0].contains("--- a/x.js"));
+    }
+
+    /// **GPT audit regression (2026-05-15).** A mixed-format patch with
+    /// a git rename-only section followed by a plain `---`/`+++` chunk
+    /// for a DIFFERENT file must produce two chunks. Pre-fix the
+    /// state-machine kept `in_git_header` true after the rename-only
+    /// section (no `@@` to clear it), so the plain `--- a/x.js` got
+    /// suppressed as the rename-only section's "own" header and the
+    /// two sections collapsed into one chunk.
+    ///
+    /// The fix: track `rename from` and compare against the `---`
+    /// path. Path mismatch → emit boundary.
+    #[test]
+    fn split_multi_file_patch_mixed_rename_only_then_plain() {
+        let text = concat!(
+            "diff --git a/old.js b/new.js\n",
+            "similarity index 100%\n",
+            "rename from old.js\n",
+            "rename to new.js\n",
+            "--- a/x.js\n",
+            "+++ b/x.js\n",
+            "@@ -1 +1 @@\n",
+            "-old\n",
+            "+new\n",
+        );
+        let chunks = split_multi_file_patch(text);
+        assert_eq!(
+            chunks.len(),
+            2,
+            "rename-only section + plain chunk for a different file must produce 2 chunks; \
+             got chunks:\n{:?}",
+            chunks
+        );
+        assert!(chunks[0].starts_with("diff --git "));
+        assert!(chunks[0].contains("rename from old.js"));
+        assert!(chunks[0].contains("rename to new.js"));
+        assert!(
+            !chunks[0].contains("--- a/x.js"),
+            "first chunk must not bleed the plain section's old-side header"
+        );
+        assert!(chunks[1].starts_with("--- a/x.js"));
+        assert!(chunks[1].contains("@@ -1 +1 @@"));
+    }
+
+    /// Companion to the mixed-format test: a rename+edit chunk where
+    /// the `---` path DOES match `rename from` must stay as one chunk
+    /// (not be over-sliced by the new path-mismatch rule).
+    #[test]
+    fn split_multi_file_patch_rename_with_edit_path_matches_stays_one_chunk() {
+        let text = concat!(
+            "diff --git a/old.js b/new.js\n",
+            "similarity index 60%\n",
+            "rename from old.js\n",
+            "rename to new.js\n",
+            "--- a/old.js\n",
+            "+++ b/new.js\n",
+            "@@ -1 +1 @@\n",
+            "-old content\n",
+            "+new content\n",
+        );
+        let chunks = split_multi_file_patch(text);
+        assert_eq!(chunks.len(), 1, "rename+edit must remain a single chunk");
+        assert!(chunks[0].contains("rename from old.js"));
+        assert!(chunks[0].contains("--- a/old.js"));
+        assert!(chunks[0].contains("@@ -1 +1 @@"));
     }
 
     // ── classify_patch_op contracts ──────────────────────────────────
