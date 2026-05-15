@@ -938,7 +938,7 @@ mod tests {
 
     #[test]
     fn version_lookup_prefers_root_level_deterministic() {
-        // Finding #5: root-level entry should always win over nested
+        // Root-level entry should always win over nested
         let json = r#"{
             "lockfileVersion": 3,
             "packages": {

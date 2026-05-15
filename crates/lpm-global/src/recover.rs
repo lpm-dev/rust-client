@@ -1,4 +1,4 @@
-//! Phase 37 M3.1c — `lpm_global::recover()`: WAL replay + manifest
+//! `lpm_global::recover()`: WAL replay + manifest
 //! reconciliation at startup.
 //!
 //! Invoked exactly once per `lpm` invocation, **before** command
@@ -458,7 +458,7 @@ fn roll_forward(
     let bin_dir = root.bin_dir();
     let install_bin = intent.new_root_path.join("node_modules").join(".bin");
 
-    // 0. Replay `ownership_delta` (Phase 37 M4.2). Each OwnershipChange
+    // 0. Replay `ownership_delta`. Each OwnershipChange
     //    is a typed mutation the commit-time planner recorded; replay
     //    here re-applies the same mutations idempotently. The audit
     //    calls for `diff-derived` logic to be explicitly avoided —
@@ -779,7 +779,7 @@ fn roll_back_with_authoritative_commands(
         manifest.tombstones.push(pending.root.clone());
     }
 
-    // 1.5 Revert `ownership_delta` mutations (Phase 37 M4.2).
+    // 1.5 Revert `ownership_delta` mutations.
     //
     //    The crash could have happened AFTER commit_locked began its
     //    manifest mutation (dropping the displaced owner's command or
@@ -913,7 +913,7 @@ fn roll_back_with_authoritative_commands(
     })
 }
 
-/// Phase 37 M4.2: replay one OwnershipChange against the manifest
+/// Replay one OwnershipChange against the manifest
 /// during recovery roll-forward.
 ///
 /// Mirrors `install_global::apply_ownership_change_to_manifest` (kept
@@ -969,7 +969,7 @@ fn replay_ownership_change(
     }
 }
 
-/// Phase 37 M4.2: inverse of `replay_ownership_change`. Used by
+/// Inverse of `replay_ownership_change`. Used by
 /// `roll_back_with_authoritative_commands` to revert each delta entry,
 /// putting the manifest back into the pre-commit_locked state so the
 /// standard displaced-owner logic can run from a consistent baseline.
@@ -2463,7 +2463,7 @@ mod tests {
         assert!(report.torn_tail_truncated_at.is_some());
     }
 
-    // ─── Phase 37 M4.2: ownership_delta replay + revert ───────────────
+    // ─── ownership_delta replay + revert ─────────────────────────────
     //
     // The M4.2 audit calls out that replace-ownership and recovery are
     // not independently shippable — a crash between Intent and Commit
@@ -2551,7 +2551,7 @@ mod tests {
 
     /// revert_ownership_change(DirectTransfer) MUST restore the old
     /// owner's row from the snapshot. Roll-back path — critical for the
-    /// M4.2 audit Finding #1 case (crash between Intent and Commit
+    /// Case: crash between Intent and Commit
     /// without recovery extensions strands the displaced owner).
     #[test]
     fn revert_direct_transfer_restores_displaced_owner_from_snapshot() {
@@ -2588,7 +2588,7 @@ mod tests {
     }
 
     /// revert(AliasOwnerRemove) restores the alias row — keyed by the
-    /// EXPOSED name (alias key), per the audit Finding #3 tightening.
+    /// EXPOSED name (alias key).
     #[test]
     fn revert_alias_owner_remove_restores_alias_row_keyed_by_exposed_name() {
         let tmp = TempDir::new().unwrap();
@@ -2719,7 +2719,7 @@ mod tests {
         assert!(parsed.ownership_delta.is_empty());
     }
 
-    // ─── Phase 37 M4.5: compound-delta end-to-end ─────────────────────
+    // ─── compound-delta end-to-end ────────────────────────────────────
 
     /// Replay a compound delta with all three OwnershipChange variants
     /// in one Intent. Pins the interaction between variants — the

@@ -248,7 +248,7 @@ mod tests {
         assert!(detect_node_version(dir.path()).is_none());
     }
 
-    // Finding #11: .nvmrc parsing -- comments, v prefix, lts/*
+    // .nvmrc parsing -- comments, v prefix, lts/*
     #[test]
     fn parse_version_file_with_comments() {
         assert_eq!(parse_version_file("# comment\n22"), Some("22".into()));

@@ -177,8 +177,8 @@ fn parse_v5_key(key: &str) -> (String, String) {
 /// `"pkg@1.0.0(@scope/peer@2.0.0)"` → `"pkg@1.0.0"`
 /// `"pkg@1.0.0"` → `"pkg@1.0.0"` (no-op)
 ///
-/// Public so Phase 64 #35's `pnpm.patchedDependencies` translator can
-/// run user-authored keys through the same cleaner the lockfile parser
+/// Public so the `pnpm.patchedDependencies` translator can run
+/// user-authored keys through the same cleaner the lockfile parser
 /// uses, avoiding false-miss integrity lookups for v9-style keys that
 /// happen to carry peer-suffix metadata.
 pub fn clean_pnpm_key(key: &str) -> &str {
@@ -549,7 +549,7 @@ packages:
 
     #[test]
     fn clean_pnpm_key_strips_peer_dep_parentheses() {
-        // Finding #12: peer dep qualifiers in v9 keys
+        // Peer dep qualifiers in v9 keys
         assert_eq!(
             clean_pnpm_key("express@4.22.1(supports-color@9.4.0)"),
             "express@4.22.1"
