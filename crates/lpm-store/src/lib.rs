@@ -1101,12 +1101,11 @@ pub enum PackageBaselineLayout {
 /// Subsequent per-package lookups become O(1) hashmap reads instead
 /// of re-scanning every link entry + parsing every sidecar JSON.
 ///
-/// **Why this matters.** [`find_installed_package_baseline`] is O(N)
-/// + a sidecar parse per call. The rebuild pipeline calls it inside
-/// per-package loops over the lockfile — on a 1000-package lockfile
-/// against a 5000-link global store that's 5M sidecar reads per
-/// invocation, pure waste since the link-entry layout doesn't change
-/// mid-command.
+/// **Why this matters.** [`find_installed_package_baseline`] is O(N) with
+/// a sidecar parse per call. The rebuild pipeline calls it inside per-package
+/// loops over the lockfile — on a 1000-package lockfile against a 5000-link
+/// global store that's 5M sidecar reads per invocation, pure waste since the
+/// link-entry layout doesn't change mid-command.
 ///
 /// **First-match semantics preserved.** When the same
 /// `(name, version)` appears under multiple graph keys (multi-source-

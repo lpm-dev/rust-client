@@ -50,9 +50,9 @@ use std::fmt;
 /// Whether a knob is subject to back-compat precedence.
 ///
 /// [`PolicyKind::Legacy`] knobs (`scriptPolicy`, `sandboxWriteDirs`
-/// — the latter handled by a separate resolver) retain the /// project > user order when `force-security-floor = false`. The
-/// default flip for legacy knobs is scheduled for,
-
+/// — the latter handled by a separate resolver) retain the
+/// project > user order when `force-security-floor = false`. The
+/// default flip for legacy knobs is deferred to a future release.
 ///
 /// [`PolicyKind::New`] knobs (`network-policy`,
 /// `install-policy.strict-behavioral`) always use user-is-floor, with

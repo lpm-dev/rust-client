@@ -3849,14 +3849,6 @@ pub fn is_https_url(url: &str) -> bool {
         .unwrap_or(false)
 }
 
-/// Check if a URL uses the HTTP scheme.
-///
-/// Paired with [`is_https_url`] and [`is_localhost_url`] so the
-/// `--insecure` carve-out can specifically widen the scheme gate
-/// to plain HTTP — not to `file://`, `ftp://`, `data:`, or any
-/// other non-HTTPS scheme. See
-/// [`RegistryClient::check_tarball_url_scheme`] for the enforcement site.
-
 /// Pre-validate a PEM root before handing it to
 /// `reqwest::Certificate::from_pem`. Reqwest's rustls-tls `from_pem` is
 /// permissive (stores raw bytes; cryptographic validation happens at
@@ -3928,6 +3920,13 @@ fn validate_pem_root(pem_bytes: &[u8], source: &str, line: usize) -> Result<(), 
     Ok(())
 }
 
+/// Check if a URL uses the HTTP scheme.
+///
+/// Paired with [`is_https_url`] and [`is_localhost_url`] so the
+/// `--insecure` carve-out can specifically widen the scheme gate
+/// to plain HTTP — not to `file://`, `ftp://`, `data:`, or any
+/// other non-HTTPS scheme. See
+/// [`RegistryClient::check_tarball_url_scheme`] for the enforcement site.
 pub fn is_http_url(url: &str) -> bool {
     reqwest::Url::parse(url)
         .map(|parsed| parsed.scheme() == "http")

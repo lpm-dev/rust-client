@@ -2360,11 +2360,10 @@ fn check_install_root_consistency(
 /// 19. **Scope-boundary note.** The 46.0 script-policy surface
 ///     covers **project installs only**. Global installs
 ///     (`lpm install -g`) use a separate trust store at
-///     `~/.lpm/global/trusted-dependencies.json`; 46.0 does not
+///     `~/.lpm/global/trusted-dependencies.json`; this surface does not
 ///     apply the sandbox probe / tier classification / version
-///     diff to that path. closes the parity gap per
-///     + D19. The note only fires when the user has at least
-///     one global install (otherwise the scope limit is
+///     diff to that path. The note only fires when the user has at
+///     least one global install (otherwise the scope limit is
 ///     irrelevant to them and would be noise).
 ///
 /// Placed AFTER the global-installs block so the scope-boundary
