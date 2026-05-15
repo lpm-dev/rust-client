@@ -1,17 +1,13 @@
-//! Platform tuple for v2 graph keys.
+//! Platform tuple for v2 graph keys: `(os, cpu, libc)`.
 //!
-//! Per the Phase 66 preplan §2.2 audit lock-in, the platform component
-//! is `(os, cpu, libc)`. `libc` is `Some` only on Linux — sharp /
-//! esbuild and other native modules ship per-libc binaries on Linux
-//! (glibc vs musl), so collapsing the libc dimension would let an
-//! Alpine wrapper materialize a glibc-built native binary.
+//! `libc` is `Some` only on Linux — native modules (sharp, esbuild)
+//! ship distinct glibc vs musl binaries, so collapsing this dimension
+//! would let an Alpine wrapper materialize a glibc-built binary.
 //!
-//! `cfg!(target_env = "musl")` reflects how the lpm binary itself was
-//! built, not the host's libc — a glibc-built lpm running on Alpine
-//! would silently mis-detect. Linux detection therefore probes the host
-//! filesystem at runtime (`/lib/ld-musl-*` and friends) with cfg as the
-//! fallback. Result is cached in a `OnceLock` so the probe runs once
-//! per process.
+//! Linux libc detection probes the host filesystem (`/lib/ld-musl-*`)
+//! rather than `cfg!(target_env = "musl")`, which reflects how lpm
+//! itself was built — a glibc-built lpm on Alpine would mis-detect.
+//! The probe result is cached in a `OnceLock` per process.
 
 #[cfg(target_os = "linux")]
 use std::path::Path;

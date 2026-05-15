@@ -24,42 +24,36 @@ use lpm_common::{LpmError, LpmRoot};
 use sha2::{Digest, Sha512};
 use std::path::{Path, PathBuf};
 
-// Phase 66 Phase 4a: virtual-store v2 layout primitives. Currently
-// dead code — Phase 4b wires writes behind `LPM_STORE_VERSION=v2`,
-// Phase 4c teaches the read paths, Phase 4d flips the default. See
-// `src/v2/mod.rs` for the on-disk shape and identity model.
+// Virtual-store v2 layout primitives. See `src/v2/mod.rs` for the
+// on-disk shape and identity model.
 pub mod v2;
 
-/// Phase 66 store layout version selector.
+/// Store layout version selector.
 ///
-/// Threaded through the install pipeline so a single env-var probe
-/// at the top of `lpm install` decides whether the run materializes
-/// to v1 (`<HOME>/.lpm/store/v1/...` + `<project>/.lpm/wrappers/...`)
-/// or v2 (`<HOME>/.lpm/store/v2/{objects,links}/...` with project
+/// Threaded through the install pipeline so a single env-var probe at
+/// the top of `lpm install` decides whether the run materializes to
+/// v1 (`<HOME>/.lpm/store/v1/...` + `<project>/.lpm/wrappers/...`) or
+/// v2 (`<HOME>/.lpm/store/v2/{objects,links}/...` with project
 /// `node_modules/<dep>` symlinks pointing into `links/<graph-key>/`).
 ///
-/// **Default is v2 as of Phase 66 Phase 4d.** v1 stays available as
-/// an explicit downgrade via `LPM_STORE_VERSION=v1` for users who
-/// hit a v2 regression and need to roll back without redownloading
-/// lpm-rs. The pre-Phase-4d default was v1; Phase 4d wires the v1 →
-/// v2 migration sequence into the install pipeline so the flip is
-/// silent for upgrade-in-place users.
+/// **v2 is the default.** v1 stays available as an explicit downgrade
+/// via `LPM_STORE_VERSION=v1` for users who hit a v2 regression and
+/// need to roll back without redownloading lpm-rs.
 ///
 /// Read once per install via [`StoreVersion::from_env`] so a single
 /// invocation is internally consistent — flipping the env mid-install
 /// would otherwise produce a half-v1/half-v2 layout.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
 pub enum StoreVersion {
-    /// Pre-Phase-4d default — wrappers under `<project>/.lpm/wrappers/`,
+    /// Legacy layout — wrappers under `<project>/.lpm/wrappers/`,
     /// canonical bytes at `<HOME>/.lpm/store/v1/<pkg>/<version>/`.
-    /// Now selected only via explicit `LPM_STORE_VERSION=v1`
+    /// Selected only via explicit `LPM_STORE_VERSION=v1`
     /// (downgrade-rollback path).
     V1,
     /// Virtual-store layout — canonical bytes at
     /// `<HOME>/.lpm/store/v2/objects/<sri>/`, per-context wrappers at
-    /// `<HOME>/.lpm/store/v2/links/<graph-key>/`, project
-    /// `node_modules/<dep>` is a symlink into the link entry. **Default
-    /// from Phase 4d onward.**
+    /// `<HOME>/.lpm/store/v2/links/<graph-key>/`. Project
+    /// `node_modules/<dep>` is a symlink into the link entry. Default.
     #[default]
     V2,
 }
@@ -70,8 +64,7 @@ impl StoreVersion {
     pub const ENV_VAR: &'static str = "LPM_STORE_VERSION";
 
     /// Read the active store version from `LPM_STORE_VERSION`. Returns
-    /// `V2` (the Phase-4d default) when the var is unset; recognized
-    /// values otherwise.
+    /// `V2` (the default) when the var is unset.
     ///
     /// Recognized values:
     /// - Unset, empty, or `v2`/`2` → `V2` (default).
@@ -127,10 +120,10 @@ const STORE_VERSION: &str = "v1";
 
 /// Per-package timing breakdown for the store-side stages of an install.
 ///
-/// Emitted by [`PackageStore::store_package_from_file_timed`] so the caller
-/// can split fetch-stage cost into its actual sub-stages (extract vs
-/// security scan vs finalize). Used by Phase 38 P0 instrumentation to
-/// replace the lumpy `fetch_ms` number with a principled breakdown.
+/// Emitted by [`PackageStore::store_package_from_file_timed`] so the
+/// caller can split fetch-stage cost into its actual sub-stages
+/// (extract vs security scan vs finalize) instead of a lumpy
+/// `fetch_ms` number.
 ///
 /// All fields are wall-clock durations in whole milliseconds. A value of
 /// zero is legitimate for stages that short-circuited (e.g. `extract_ms`
@@ -217,24 +210,17 @@ impl PackageStore {
         self.v1_root.join(format!("{safe_name}@{version}"))
     }
 
-    /// **Phase 59.0 day-4 (F4)** — content-addressable store path
-    /// for a non-Registry tarball, keyed by SRI integrity hash.
+    /// Content-addressable store path for a remote `Source::Tarball`,
+    /// keyed by SRI integrity hash.
     ///
-    /// Layout: `~/.lpm/store/v1/tarball/{algo}-{hex}/`
+    /// Layout: `~/.lpm/store/v1/tarball/{algo}-{hex}/` where `{algo}`
+    /// is `sha256` or `sha512` and `{hex}` is lowercase hex of the
+    /// raw hash bytes. Hex keeps the directory filesystem-safe on
+    /// every platform (no `/`, `+`, or `=`).
     ///
-    /// - `{algo}` is `sha256` or `sha512` (matching the SRI input).
-    /// - `{hex}` is the lowercase hex of the raw hash bytes (64
-    ///   chars for SHA-256, 128 for SHA-512). Hex (vs base64) keeps
-    ///   the directory name filesystem-safe on every platform —
-    ///   no `/`, `+`, or `=` characters.
-    ///
-    /// This is the `Source::Tarball` arm of the store layout — the
-    /// Registry arm continues to use [`Self::package_dir`] keyed by
+    /// The Registry arm uses [`Self::package_dir`] keyed by
     /// `(name, version)`. Both arms share the `STORE_VERSION` root
     /// so a future schema bump moves them together.
-    ///
-    /// Day-4 is additive (no caller wired); day-5 routes
-    /// `Source::Tarball` resolutions through this path.
     ///
     /// Returns [`LpmError::InvalidIntegrity`] if `integrity_sri`
     /// can't be parsed as a canonical SRI string.
@@ -252,9 +238,9 @@ impl PackageStore {
             .join(format!("{algo}-{hex}")))
     }
 
-    /// Phase 59.0 day-4 — whether a `Source::Tarball` payload is
-    /// already extracted at its CAS path. Mirrors
-    /// [`Self::has_package`] for the Registry arm.
+    /// Whether a remote `Source::Tarball` payload is already extracted
+    /// at its CAS path. Mirrors [`Self::has_package`] for the Registry
+    /// arm.
     pub fn has_tarball(&self, integrity_sri: &str) -> bool {
         match self.tarball_store_path(integrity_sri) {
             Ok(dir) => is_complete_package_dir(&dir),
@@ -262,34 +248,20 @@ impl PackageStore {
         }
     }
 
-    /// **Phase 59.1 day-1 (F6)** — content-addressable store path
-    /// for a local-file tarball (`file:./foo.tgz`), keyed by the
-    /// SHA-256 of the tarball bytes.
+    /// Content-addressable store path for a local-file tarball
+    /// (`file:./foo.tgz`), keyed by the SHA-256 of the tarball bytes.
     ///
     /// Layout: `~/.lpm/store/v1/tarball-local/sha256-{hex}/`
     ///
-    /// Distinct from [`Self::tarball_store_path`] (the remote-tarball
-    /// arm under `v1/tarball/`) because identity differs:
-    /// - **Remote tarball** (`Source::Tarball { url: "https://..." }`):
-    ///   identity is the SRI declared in the manifest or computed on
-    ///   first fetch; the store key is `{algo}-{hex}` so a sha256-
-    ///   declared dep and a sha512-declared dep on the same content
-    ///   land in distinct slots.
-    /// - **Local tarball** (`Source::Tarball { url: "file:..." }`):
-    ///   identity is the **content** (URL has no integrity guarantees
-    ///   on the local filesystem). The hash is always SHA-256 of the
-    ///   tarball bytes; the store key is `sha256-{hex}` of those
-    ///   bytes. Two different `file:` paths to the same content
-    ///   dedupe to one CAS slot.
+    /// Distinct from [`Self::tarball_store_path`] because identity
+    /// differs. A remote tarball's identity is the SRI declared in
+    /// the manifest (or computed on first fetch); a local tarball
+    /// has no manifest-declared integrity so identity is always the
+    /// SHA-256 of the bytes. Two different `file:` paths to the same
+    /// content dedupe to one CAS slot here.
     ///
     /// `content_sha256_hex` MUST be exactly 64 lowercase hex
-    /// characters (the SHA-256 digest of the tarball bytes). Returns
-    /// [`LpmError::InvalidIntegrity`] otherwise — same error shape as
-    /// [`Self::tarball_store_path`] so callers can route both arms
-    /// through one error path.
-    ///
-    /// Both subtrees share `STORE_VERSION` so a future schema bump
-    /// moves them together (matching 59.0 day-5a's locked decision).
+    /// characters; returns [`LpmError::InvalidIntegrity`] otherwise.
     pub fn tarball_local_store_path(&self, content_sha256_hex: &str) -> Result<PathBuf, LpmError> {
         validate_sha256_hex(content_sha256_hex)?;
         Ok(self
@@ -299,9 +271,8 @@ impl PackageStore {
             .join(format!("sha256-{content_sha256_hex}")))
     }
 
-    /// **Phase 59.1 day-1 (F6)** — whether a local-file tarball
-    /// payload is already extracted at its CAS path. Mirrors
-    /// [`Self::has_tarball`] for the remote-tarball arm.
+    /// Whether a local-file tarball payload is already extracted at
+    /// its CAS path. Mirrors [`Self::has_tarball`] for the remote arm.
     pub fn has_local_tarball(&self, content_sha256_hex: &str) -> bool {
         match self.tarball_local_store_path(content_sha256_hex) {
             Ok(dir) => is_complete_package_dir(&dir),
@@ -334,23 +305,19 @@ impl PackageStore {
         self.store_at_dir(dir, &label, tarball_data)
     }
 
-    /// **Phase 59.0 day-5 (F4 install-side wiring)** — extract a
-    /// `Source::Tarball` payload into the content-addressable
-    /// tarball CAS path keyed by SRI integrity.
+    /// Extract a remote `Source::Tarball` payload into the
+    /// content-addressable tarball CAS path keyed by SRI integrity.
     ///
-    /// Mirrors [`Self::store_package`] semantically but uses
-    /// [`Self::tarball_store_path`] for the destination directory
-    /// instead of `(name, version)`. All TOCTOU + integrity +
-    /// behavioral-analysis machinery is shared with `store_package`
+    /// Mirrors [`Self::store_package`] but uses
+    /// [`Self::tarball_store_path`] instead of `(name, version)`. All
+    /// TOCTOU + integrity + behavioral-analysis machinery is shared
     /// via the private [`Self::store_at_dir`] helper.
     ///
     /// `integrity_sri` MUST be the SRI of `tarball_data` — usually
-    /// this is the value returned by
+    /// the value returned by
     /// [`lpm_registry::RegistryClient::download_tarball_with_integrity`].
-    /// Mismatching the two would route a tarball into the wrong CAS
-    /// slot. The caller is responsible for keeping them aligned;
-    /// this method does not re-verify (re-hashing on the install
-    /// hot path is wasteful given the download already did it).
+    /// The caller is responsible for keeping them aligned; this method
+    /// does not re-hash (the download already did).
     ///
     /// Returns [`LpmError::InvalidIntegrity`] if `integrity_sri`
     /// can't be parsed.
@@ -370,22 +337,18 @@ impl PackageStore {
         self.store_at_dir(dir, &label, tarball_data)
     }
 
-    /// **Phase 59.1 day-1 (F6 install-side wiring)** — extract a
-    /// local-file tarball into the content-addressable
+    /// Extract a local-file tarball into the content-addressable
     /// `tarball-local` CAS path keyed by content SHA-256.
     ///
     /// Mirrors [`Self::store_tarball_at_cas_path`] but routes through
-    /// [`Self::tarball_local_store_path`] for the destination
-    /// directory. All TOCTOU + integrity + behavioral-analysis
-    /// machinery is shared with the registry/remote-tarball arms via
-    /// the private [`Self::store_at_dir`] helper — `.integrity`
-    /// (SRI of the bytes) and `.lpm-security.json` are written in
-    /// the same atomic-rename window.
+    /// [`Self::tarball_local_store_path`]. All TOCTOU + integrity +
+    /// behavioral-analysis machinery is shared via [`Self::store_at_dir`]
+    /// — `.integrity` and `.lpm-security.json` are written in the same
+    /// atomic-rename window.
     ///
     /// `content_sha256_hex` MUST be the lowercase-hex SHA-256 of
-    /// `tarball_data` — the caller is responsible for keeping them
-    /// aligned. This method does not re-hash on the install hot path
-    /// (matching the contract on [`Self::store_tarball_at_cas_path`]).
+    /// `tarball_data` — caller's responsibility (same contract as
+    /// [`Self::store_tarball_at_cas_path`]).
     ///
     /// Returns [`LpmError::InvalidIntegrity`] if `content_sha256_hex`
     /// fails the validation in [`Self::tarball_local_store_path`].
@@ -519,8 +482,8 @@ impl PackageStore {
             .map(|(path, _)| path)
     }
 
-    /// Phase 38 P1 streaming path: hash + decompress + extract + scan +
-    /// rename, all in one pass, no temp file.
+    /// Streaming path: hash + decompress + extract + scan + rename,
+    /// all in one pass, no temp file.
     ///
     /// The caller pipes a tarball byte stream into `reader` (typically a
     /// [`tokio::io::SyncIoBridge`] over a [`tokio_util::io::StreamReader`]
@@ -618,14 +581,12 @@ impl PackageStore {
         let size_limited = SizeLimitedReader::new(reader, max_compressed_size);
         let mut hashing_reader = HashingReader::new(size_limited);
 
-        // Phase 38 P2: fused behavioral scan. `PackageAnalyzer::should_scan`
-        // is the buffer predicate — returns true for JS/TS/JSX/TSX sources
-        // outside `node_modules`/`__tests__`/`test`/hidden paths, which is
-        // exactly the set the pre-P2 `collect_source_files_recursive` filter
-        // produced. The inspector closure feeds those buffered bytes into
-        // the analyzer. Non-source files stream through `entry.unpack()`
-        // unchanged — zero extra memory for the long tail of package
-        // contents (images, fonts, .map files, etc).
+        // Fused behavioral scan. `PackageAnalyzer::should_scan` is the
+        // buffer predicate — true for JS/TS/JSX/TSX sources outside
+        // `node_modules`/`__tests__`/`test`/hidden paths. The inspector
+        // feeds those buffered bytes into the analyzer. Non-source
+        // files stream through `entry.unpack()` unchanged, so the long
+        // tail (images, fonts, .map files) adds zero extra memory.
         let analyzer = std::cell::RefCell::new(lpm_security::behavioral::PackageAnalyzer::new());
 
         // `&mut HashingReader` satisfies `impl Read` via the blanket impl
@@ -690,13 +651,12 @@ impl PackageStore {
             }
         }
 
-        // Phase 38 P2: security analysis was fused into the tar walk above.
-        // What remains is finalize — read `package.json` from the staging
-        // dir (one file open, always present in npm tarballs), run the
-        // manifest-level tag analysis, merge dedup'd URL domains, compute
-        // the package-level `trivial` tag, and serialize to
-        // `.lpm-security.json`. Per-source-file bytes are not re-read; the
-        // fused scan already consumed them.
+        // Security analysis was fused into the tar walk above. What
+        // remains is finalize — read `package.json` from staging (one
+        // file open, always present in npm tarballs), run manifest-
+        // level tag analysis, merge dedup'd URL domains, compute the
+        // package-level `trivial` tag, and serialize to
+        // `.lpm-security.json`. Per-source-file bytes are not re-read.
         let security_start = std::time::Instant::now();
         let analysis = analyzer.into_inner().finalize(&tmp_dir);
         if let Err(e) = lpm_security::behavioral::write_cached_analysis(&tmp_dir, &analysis) {
@@ -784,11 +744,10 @@ impl PackageStore {
         }
         timings.extract_ms = extract_start.elapsed().as_millis();
 
-        // Write pre-computed SRI hash (no second pass needed). This runs
-        // before the security scan to preserve the pre-Phase-38 execution
-        // order — Phase 38 P0 is instrumentation-only; behavior stays put.
-        // Counted under `finalize_ms` because it's cheap housekeeping, not
-        // a sub-stage we expect to optimize separately.
+        // Write pre-computed SRI hash (no second pass needed). Runs
+        // before the security scan to keep the original execution
+        // order. Counted under `finalize_ms` because it's cheap
+        // housekeeping, not a sub-stage we expect to optimize.
         let finalize_start = std::time::Instant::now();
         if let Err(e) = std::fs::write(tmp_dir.join(".integrity"), sri) {
             let _ = std::fs::remove_dir_all(&tmp_dir);
@@ -796,10 +755,11 @@ impl PackageStore {
         }
         let integrity_write_ms = finalize_start.elapsed().as_millis();
 
-        // Security analysis runs on the extracted tree before the atomic
-        // rename so the `.lpm-security.json` cache is visible atomically
-        // alongside the package. Measured separately from finalize so we
-        // can see the second-filesystem-pass cost that Phase 38 P2 targets.
+        // Security analysis runs on the extracted tree before the
+        // atomic rename so `.lpm-security.json` is visible atomically
+        // alongside the package. Measured separately from finalize to
+        // expose the second-filesystem-pass cost (the fused-scan path
+        // in `stream_and_store_package` eliminates it).
         let security_start = std::time::Instant::now();
         let analysis = lpm_security::behavioral::analyze_package(&tmp_dir);
         if let Err(e) = lpm_security::behavioral::write_cached_analysis(&tmp_dir, &analysis) {
@@ -1003,8 +963,7 @@ fn is_complete_package_dir(dir: &Path) -> bool {
     dir.is_dir() && dir.join("package.json").exists() && dir.join(".integrity").exists()
 }
 
-/// Phase 59.1 day-1 (F6) — strict validator for the local-tarball
-/// CAS key.
+/// Strict validator for the local-tarball CAS key.
 ///
 /// Local tarballs use raw lowercase-hex SHA-256 (not an SRI string)
 /// so the input can be sourced from `sha2::Sha256` digests directly
@@ -1097,25 +1056,23 @@ pub struct InstalledPackageBaseline {
     /// (the link's clonefile-materialized copy of the object-addressed
     /// bytes).
     pub package_dir: PathBuf,
-    /// **Phase 66 confidence-followup F1 (2026-05-09)** — absolute path
-    /// to a directory holding the **pristine, never-mutated** copy of
-    /// the published bytes for `(name, version)`.
+    /// Absolute path to a directory holding the **pristine,
+    /// never-mutated** copy of the published bytes for
+    /// `(name, version)`.
     ///
-    /// - Under v1, equals [`Self::package_dir`]. The v1 store dir IS
-    ///   pristine — patches mutate the project-private wrapper at
-    ///   `<project>/.lpm/<seg>/node_modules/<name>/`, not the store
-    ///   itself.
+    /// - Under v1, equals [`Self::package_dir`] — the v1 store dir is
+    ///   pristine because patches mutate the project-private wrapper
+    ///   at `<project>/.lpm/<seg>/node_modules/<name>/`, not the
+    ///   store itself.
     /// - Under v2, points at `<store>/v2/objects/<sri-segment>/`. The
-    ///   v2 link entry at `package_dir` IS the materialization
-    ///   destination — patches written via `apply_patch` mutate it in
-    ///   place. Reading patch baselines from `package_dir` under v2
-    ///   would re-feed already-patched bytes to a second
-    ///   `apply_patch` and break re-install idempotency.
+    ///   v2 link entry at `package_dir` is the patch destination —
+    ///   reading baselines from `package_dir` under v2 would re-feed
+    ///   already-patched bytes to a second `apply_patch` and break
+    ///   re-install idempotency.
     ///
-    /// Read-only baseline consumers (the patch engine's pre-image
-    /// reads, store-internal-file existence checks for ADD / DELETE
-    /// hunks) MUST consult this field rather than `package_dir` to
-    /// stay correct under both layouts.
+    /// Read-only baseline consumers (patch engine pre-image reads,
+    /// ADD/DELETE-hunk existence checks) MUST consult this field
+    /// rather than `package_dir` to stay correct under both layouts.
     pub pristine_dir: PathBuf,
     /// SRI string of the source tarball — `meta.source_sri` under v2,
     /// `<package_dir>/.integrity` under v1.
@@ -1135,61 +1092,51 @@ pub enum PackageBaselineLayout {
     V2,
 }
 
-/// **Phase 66 confidence-followup F2 (2026-05-09)** — invocation-local
-/// index over the v2 store's link entries, keyed by `(name, version)`.
+/// Invocation-local index over the v2 store's link entries, keyed by
+/// `(name, version)`.
 ///
 /// Built once per `lpm rebuild` / `lpm approve-scripts` /
-/// `all_scripted_packages_trusted` / `scriptable_package_rows`
-/// invocation from a SINGLE ordered walk of
-/// [`crate::v2::Store::iter_link_entries`]. Subsequent per-package
-/// lookups become O(1) hashmap reads instead of re-scanning every
-/// link entry + parsing every sidecar JSON for each package the
-/// caller asks about.
+/// `all_scripted_packages_trusted` / `scriptable_package_rows` from a
+/// single ordered walk of [`crate::v2::Store::iter_link_entries`].
+/// Subsequent per-package lookups become O(1) hashmap reads instead
+/// of re-scanning every link entry + parsing every sidecar JSON.
 ///
-/// **Why this matters.** [`find_installed_package_baseline`] does an
-/// O(N) scan + sidecar parse per call. The rebuild pipeline calls it
-/// inside per-package loops over the lockfile (rebuild.rs:268-278,
-/// rebuild.rs:1869, rebuild.rs:2069-2073). On a 1000-package lockfile
-/// against a 5000-link global store that's 5M sidecar JSON reads per
-/// invocation — pure waste, since the link-entry layout doesn't
-/// change between iterations of one command.
+/// **Why this matters.** [`find_installed_package_baseline`] is O(N)
+/// + a sidecar parse per call. The rebuild pipeline calls it inside
+/// per-package loops over the lockfile — on a 1000-package lockfile
+/// against a 5000-link global store that's 5M sidecar reads per
+/// invocation, pure waste since the link-entry layout doesn't change
+/// mid-command.
 ///
 /// **First-match semantics preserved.** When the same
 /// `(name, version)` appears under multiple graph keys (multi-source-
-/// same-coords or peer-divergent installs sharing coords), the
-/// **first** entry seen in `iter_link_entries()` directory order
-/// wins — exactly matching the legacy linear scan.
+/// same-coords or peer-divergent installs sharing coords), the first
+/// entry seen in `iter_link_entries()` directory order wins —
+/// matching the legacy linear scan's tie-breaking.
 ///
-/// Construction is best-effort: malformed or unreadable sidecars are
-/// silently skipped (same contract as `iter_link_entries`).
-/// Constructing an empty index is cheap and safe — callers on stores
-/// with no v2 entries (pure-v1 test fixtures, fresh installs pre-4b)
-/// get an empty map and pay the v1-fallback cost only.
+/// Construction is best-effort: malformed sidecars are silently
+/// skipped. An empty index is cheap and safe — callers on stores
+/// with no v2 entries get an empty map and pay only the v1 fallback.
 #[derive(Debug, Clone, Default)]
 pub struct V2BaselineIndex {
     by_coords: std::collections::HashMap<(String, String), InstalledPackageBaseline>,
 }
 
 impl V2BaselineIndex {
-    /// **Phase 66 confidence-followup F1+F2 review (2026-05-09)** —
-    /// build a project-scoped index by walking only the link entries
+    /// Build a project-scoped index by walking only the link entries
     /// the project's `<project>/node_modules/` tree actually points
     /// at, BFS'd through each entry's `LinkMeta.deps` to cover
     /// transitives.
     ///
     /// **Why this exists.** [`Self::build`] (the global walker) keys
     /// on `(name, version)` and keeps the first match in directory
-    /// iteration order. That tie-breaking was acceptable when v2
-    /// could only have ONE link entry per coords by construction
-    /// (the cross-project sharing invariant). After F1 a patched
-    /// install lands in a distinct link entry from any unpatched
-    /// install of the same coords, so two link entries for the
-    /// same `(name, version)` legitimately coexist on disk —
-    /// "first global match" is no longer a safe choice. The
-    /// rebuild pipeline could otherwise read scripts / trust
-    /// state / build-marker state from the wrong link entry,
-    /// and write the build marker into a sibling project's store
-    /// dir.
+    /// iteration order. Once patched and unpatched installs of the
+    /// same coords can legitimately coexist on disk (the patch
+    /// fingerprint splits them into distinct link entries),
+    /// "first global match" is no longer safe — the rebuild pipeline
+    /// could read scripts / trust / build-marker state from the wrong
+    /// link entry, and write its build marker into a sibling
+    /// project's store dir.
     ///
     /// **The walk.** Every entry under `<project>/node_modules/`
     /// that resolves to `<lpm_root>/store/v2/links/<key>/...` is a
@@ -1278,7 +1225,7 @@ impl V2BaselineIndex {
                     continue;
                 }
             };
-            // Trial 32: destructure meta to move name/version/source_sri
+            // Destructure meta to move name/version/source_sri
             // directly into the HashMap key + baseline without cloning.
             let crate::v2::link_meta::LinkMeta {
                 name: meta_name,
@@ -1324,9 +1271,9 @@ impl V2BaselineIndex {
                     continue; // malformed sidecar
                 }
                 let short_hex = &dep.target_graph_key[..16];
-                // Trial 32: avoid allocating an intermediate safe_name
-                // String for unscoped packages (the majority) by using
-                // Cow<str> — borrows as-is when no replacement is needed.
+                // Avoid allocating an intermediate `safe_name` for
+                // unscoped packages (the majority) by using `Cow<str>`
+                // — borrows as-is when no replacement is needed.
                 let safe_name: std::borrow::Cow<str> = if dep.target_name.contains(['/', '\\']) {
                     std::borrow::Cow::Owned(dep.target_name.replace(['/', '\\'], "+"))
                 } else {
@@ -1438,9 +1385,8 @@ fn seed_project_link_dir(
     }
 }
 
-/// **Phase 66 confidence-followup F1+F2 review** — given a path that a
-/// project-side symlink resolves to, reconstruct the v2 link entry
-/// directory that owns it.
+/// Given a path that a project-side symlink resolves to, reconstruct
+/// the v2 link entry directory that owns it.
 ///
 /// v2 plants the project's `<project>/node_modules/<dep>` symlink to
 /// point at `<links_root>/<key_dir>/node_modules/<dep>/`. Scoped deps
@@ -1514,56 +1460,52 @@ pub fn find_installed_package_baseline_indexed(
 }
 
 /// Resolve a package's installed source bytes + integrity in a
-/// store-version-agnostic way. **Prefers v2** (the active default
-/// since Phase 66 4b); falls back to v1 if no v2 link entry matches.
+/// store-version-agnostic way. **Prefers v2** (the active default);
+/// falls back to v1 if no v2 link entry matches.
 ///
 /// Designed for downstream commands that read package metadata or
 /// source files post-install — `lpm patch`, `lpm patch-commit`,
-/// `lpm rebuild`, `lpm approve-scripts --show-scripts`, etc. — which
-/// must not blindly call [`PackageStore::package_dir`] (v1-only)
-/// under v2 installs.
+/// `lpm rebuild`, `lpm approve-scripts --show-scripts` — which must
+/// not blindly call [`PackageStore::package_dir`] (v1-only) under v2
+/// installs.
 ///
-/// **Multi-source-same-coords:** under Phase 66 §2.2, two distinct
-/// sources can share the same `(name, version)` pair and produce
-/// different graph keys. This helper picks the first v2 link entry
-/// that matches in `iter_link_entries` directory order. That's
-/// non-deterministic for multi-source-same-coords + lifecycle
-/// scripts, but acceptable for the patch path (the user's patch is
-/// keyed on `<name>@<version>` and should apply equally to every
-/// graph-key sharing those coords). A future refinement is a full
-/// `(name, version, wrapper_id)` lookup once `wrapper_id` is
-/// threaded through the lockfile — same follow-up
-/// [`crate::v2::Store::find_link_package_dir`] documents.
+/// **Multi-source-same-coords:** when two distinct sources share
+/// `(name, version)` and produce different graph keys, this helper
+/// picks the first v2 link entry that matches in
+/// `iter_link_entries` directory order. Non-deterministic for
+/// multi-source-same-coords + lifecycle scripts, but acceptable for
+/// the patch path (a `<name>@<version>` patch should apply equally
+/// to every graph-key sharing those coords). A full
+/// `(name, version, wrapper_id)` lookup is the proper fix once
+/// `wrapper_id` is threaded through the lockfile.
 pub fn find_installed_package_baseline(
     lpm_root: &lpm_common::LpmRoot,
     name: &str,
     version: &str,
 ) -> Result<Option<InstalledPackageBaseline>, LpmError> {
-    // v2 first — that's the default since Phase 66 4b. Iterating link
-    // entries reads each sidecar `.lpm-link-meta.json`; the iterator
-    // gracefully skips malformed entries (per
-    // [`crate::v2::Store::iter_link_entries`]'s docs) so a corrupt
-    // sibling never blocks a valid match.
+    // v2 first — the active default. Iterating link entries reads
+    // each sidecar `.lpm-link-meta.json`; the iterator gracefully
+    // skips malformed entries so a corrupt sibling never blocks a
+    // valid match.
     let store_v2 = crate::v2::Store::from_lpm_root(lpm_root);
     for (link_dir, meta) in store_v2.iter_link_entries()? {
         if meta.name == name && meta.version == version {
             let package_dir = link_dir.join("node_modules").join(name);
             if package_dir.exists() {
-                // F1: derive the pristine object dir from the source SRI.
-                // Phase 66 4b populates link entries via clonefile from
+                // Derive the pristine object dir from the source SRI.
+                // v2 populates link entries via clonefile from
                 // `objects/<sri>/`, so for a well-formed install the
                 // object dir is always derivable AND present on disk.
                 //
-                // **Defensive aliasing.** If either `sri_to_segment`
-                // can't parse the SRI (synthetic test fixtures) or
-                // the resolved path is missing on disk (manual
-                // pruning, partial migration), fall back to aliasing
-                // `package_dir`. Patch consumers will then re-read
-                // the link entry directly — same shape as v1, where
+                // **Defensive aliasing.** If `sri_to_segment` can't
+                // parse the SRI (synthetic test fixtures) or the
+                // resolved path is missing (manual pruning, partial
+                // migration), fall back to aliasing `package_dir`.
+                // Patch consumers then re-read the link entry
+                // directly — same shape as v1, where
                 // `pristine_dir == package_dir` by construction. A
                 // genuinely-corrupt v2 install fails later with a
-                // patch-engine drift error rather than swallowing
-                // the lookup here, which keeps the user-facing
+                // patch-engine drift error, keeping the user-facing
                 // failure mode close to the cause.
                 let pristine_dir = match store_v2.paths().object_dir(&meta.source_sri) {
                     Ok(p) if p.exists() => p,
@@ -1603,9 +1545,9 @@ pub fn find_installed_package_baseline(
     Ok(None)
 }
 
-/// Phase 38 P1 helper: transparent `Read` wrapper that feeds every byte
-/// into a SHA-512 hasher as it flows through. Used to compute the tarball
-/// SRI inline with streaming extraction, no second pass, no temp file.
+/// Transparent `Read` wrapper that feeds every byte into a SHA-512
+/// hasher as it flows through. Computes the tarball SRI inline with
+/// streaming extraction — no second pass, no temp file.
 ///
 /// After the extractor finishes consuming the stream, call
 /// [`HashingReader::finalize`] to obtain `(sri_string, bytes_seen)`.
@@ -1648,11 +1590,11 @@ impl<R: std::io::Read> std::io::Read for HashingReader<R> {
     }
 }
 
-/// Phase 38 P1 helper: caps total bytes read to `limit`. Tripping the
-/// limit returns `ErrorKind::InvalidData` with a message mirroring the
-/// legacy `download_tarball_to_file` rejection, which then surfaces
-/// through the extractor as a regular `LpmError::Io`. No bytes past the
-/// cap are ever written to the staging directory.
+/// Caps total bytes read to `limit`. Tripping the limit returns
+/// `ErrorKind::InvalidData` with a message mirroring the
+/// `download_tarball_to_file` rejection, surfacing through the
+/// extractor as `LpmError::Io`. No bytes past the cap are ever
+/// written to the staging directory.
 struct SizeLimitedReader<R> {
     inner: R,
     bytes_read: u64,
@@ -2488,7 +2430,7 @@ mod tests {
         );
     }
 
-    // ── Phase 59.0 day-4 (F4): tarball CAS path ─────────────────────────────
+    // ── Remote tarball CAS path ─────────────────────────────────────────────
 
     fn sha512_sri(body: &[u8]) -> String {
         Integrity::from_bytes(HashAlgorithm::Sha512, body).to_string()
@@ -2612,7 +2554,7 @@ mod tests {
         assert!(!store.has_tarball("not-a-real-sri"));
     }
 
-    // ── Phase 59.0 day-5: store_tarball_at_cas_path ─────────────────────────
+    // ── store_tarball_at_cas_path ───────────────────────────────────────────
 
     #[test]
     fn store_tarball_at_cas_path_extracts_to_cas_path() {
@@ -2744,7 +2686,7 @@ mod tests {
         assert!(tarball_path.exists());
     }
 
-    // ── Phase 59.1 day-1 (F6): tarball-local CAS path ───────────────────────
+    // ── Local tarball CAS path ──────────────────────────────────────────────
 
     fn sha256_hex(body: &[u8]) -> String {
         use sha2::{Digest, Sha256};
@@ -2908,7 +2850,7 @@ mod tests {
         assert!(!store.has_local_tarball("not-a-real-hex"));
     }
 
-    // ── Phase 59.1 day-1 (F6): store_local_tarball_at_cas_path ──────────────
+    // ── store_local_tarball_at_cas_path ─────────────────────────────────────
 
     #[test]
     fn store_local_tarball_at_cas_path_extracts_to_cas_path() {
@@ -3014,24 +2956,20 @@ mod tests {
         assert_eq!(path_a, path_b);
     }
 
-    // ── Phase 66 Phase 4d — StoreVersion env-var parser ─────────
+    // ── StoreVersion env-var parser ────────────────────────────────────
 
     #[test]
     fn store_version_default_is_v2() {
-        // Phase 4d flipped the default from v1 → v2. Pre-flip the
-        // default was v1 (dev-only opt-in for v2).
         assert_eq!(StoreVersion::default(), StoreVersion::V2);
     }
 
     #[test]
     fn store_version_parse_unset_is_v2() {
-        // Unset env var yields the new v2 default.
         assert_eq!(StoreVersion::parse(None), StoreVersion::V2);
     }
 
     #[test]
     fn store_version_parse_recognizes_v2_aliases() {
-        // Empty string normalizes to v2 (the post-Phase-4d default).
         for s in ["", "v2", "V2", "2", "  V2  ", "v2\n"] {
             assert_eq!(
                 StoreVersion::parse(Some(s)),
@@ -3043,7 +2981,7 @@ mod tests {
 
     #[test]
     fn store_version_parse_recognizes_v1_downgrade_aliases() {
-        // Phase 4d retains v1 as an explicit downgrade-rollback path.
+        // v1 stays available as an explicit downgrade-rollback path.
         for s in ["v1", "V1", "1", "  v1  "] {
             assert_eq!(
                 StoreVersion::parse(Some(s)),
@@ -3055,9 +2993,8 @@ mod tests {
 
     #[test]
     fn store_version_parse_unknown_falls_back_to_v2() {
-        // Typos and stray values fall through to the default (v2),
-        // not v1 — pre-Phase-4d the fallback was v1 because v2 was
-        // dev-only opt-in. Post-flip the safe default is v2.
+        // Typos and stray values fall through to v2, not v1 — the
+        // safe default is the active layout.
         for s in ["v3", "v2x", "true", "yes", "on", "junk"] {
             assert_eq!(
                 StoreVersion::parse(Some(s)),
@@ -3208,22 +3145,19 @@ mod tests {
         );
     }
 
-    /// **Phase 66 confidence-followup F1+F2 review (2026-05-09)** —
-    /// when two link entries legitimately share the same
-    /// `(name, version)` (the post-F1 default for the patched-vs-
-    /// unpatched cross-project case, and the multi-source-same-coords
-    /// case), `V2BaselineIndex::for_project` MUST resolve to the
-    /// link entry the CURRENT project's tree points at — not the
-    /// first match in global directory order.
+    /// When two link entries legitimately share the same
+    /// `(name, version)` (the patched-vs-unpatched cross-project
+    /// case, or multi-source-same-coords), `V2BaselineIndex::for_project`
+    /// MUST resolve to the link entry the CURRENT project's tree
+    /// points at — not the first match in global directory order.
     ///
-    /// The test seeds two link entries for `lodash@1.0.0`, points
-    /// project A's `node_modules/lodash` symlink at the SECOND one,
-    /// and asserts the project-scoped index returns that one. The
-    /// global `V2BaselineIndex::build` would (under the unfixed
-    /// code) return whichever entry came first in directory order
+    /// Seeds two link entries for `lodash@1.0.0`, points project A's
+    /// `node_modules/lodash` symlink at the SECOND one, and asserts
+    /// the project-scoped index returns that one. The global walker
+    /// would return whichever entry comes first in directory order
     /// — wrong half the time for project A.
     ///
-    /// Without this fix `lpm rebuild` running in project A could
+    /// Without project-scoping, `lpm rebuild` in project A could
     /// read scripts / trust state from the WRONG link entry and
     /// stamp the build marker into a sibling project's store dir.
     #[test]

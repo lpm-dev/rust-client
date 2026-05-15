@@ -6,8 +6,7 @@
 //!   link-entry population (clonefile from objects + sibling symlinks
 //!   + atomic rename + sidecar write).
 //!
-//! Phase 4a ships these as **dead code**: no install pipeline calls
-//! them yet. Phase 4b wires them in behind `LPM_STORE_VERSION=v2`.
+//! v2 writes are gated behind `LPM_STORE_VERSION=v2`.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -76,12 +75,10 @@ impl StoreV2Paths {
     }
 
     /// `~/.lpm/store/v2/`
-    //
-    // Trial 8 (2026-05-13): `#[inline]` on the small accessors. They're
-    // pure field projections / single-method calls, called per-package
-    // from across crate boundaries (linker, install pipeline). LTO with
-    // `codegen-units = 1` usually inlines these anyway, but the hint
-    // makes the contract explicit and helps non-LTO builds (dev, tests).
+    ///
+    /// `#[inline]` on these small accessors so cross-crate hot-path
+    /// callers (linker, install pipeline) skip the call indirection
+    /// even without LTO.
     #[inline]
     pub fn root(&self) -> &Path {
         &self.root
@@ -123,11 +120,9 @@ impl StoreV2Paths {
 
     /// `~/.lpm/store/v2/links/<graph-key>/node_modules/`.
     ///
-    /// Trial 5 (2026-05-13) — single-allocation build. The naïve
-    /// `self.link_dir(key).join(LINK_NODE_MODULES)` chain produced
-    /// two intermediate `PathBuf`s (one allocated, one dropped). Now
-    /// pre-sizes a single buffer from known component lengths and
-    /// `push`es into it, avoiding the intermediate allocation.
+    /// Pre-sized single-allocation build. The naïve `self.link_dir(key)
+    /// .join(LINK_NODE_MODULES)` chain allocates two intermediate
+    /// `PathBuf`s; this builds one buffer of the known total length.
     pub fn link_node_modules_dir(&self, key: &GraphKey) -> PathBuf {
         let dir_name = key.dir_name();
         let cap =
@@ -144,10 +139,9 @@ impl StoreV2Paths {
     /// of an [`Self::object_dir`]). Sibling deps live alongside as
     /// symlinks.
     ///
-    /// Trial 5 (2026-05-13) — single-allocation build (see
-    /// [`Self::link_node_modules_dir`]). The chained-`.join()` shape
-    /// produced three intermediate `PathBuf`s per call; this version
-    /// produces one.
+    /// Pre-sized single-allocation build (see
+    /// [`Self::link_node_modules_dir`]). The chained `.join()` shape
+    /// allocates three intermediate `PathBuf`s per call.
     pub fn link_package_dir(&self, key: &GraphKey) -> PathBuf {
         let dir_name = key.dir_name();
         let pkg_name = key.name();
@@ -171,10 +165,9 @@ impl StoreV2Paths {
 /// (`<algo>-<hex>`). Hex (vs base64) keeps the segment safe on every
 /// platform — no `/`, `+`, or `=` characters.
 ///
-/// Trial 28: builds the result string with a single allocation using
-/// `String::with_capacity` + direct byte writes, eliminating the
-/// intermediate `hex::encode` String that the naïve `format!` would
-/// produce.
+/// Single-allocation build via `String::with_capacity` + direct byte
+/// writes, avoiding the intermediate `hex::encode` String a naïve
+/// `format!` would produce.
 fn sri_to_segment(sri: &str) -> Result<String, LpmError> {
     use std::fmt::Write as _;
     let int = Integrity::parse(sri)?;
@@ -250,12 +243,11 @@ pub struct LinkEntry {
     pub freshly_populated: bool,
     /// Sidecar payload.
     ///
-    /// `Some` only when [`Self::freshly_populated`] is `true` —
-    /// callers that need the sidecar after a cache hit should read
-    /// it lazily via [`crate::v2::LinkMeta::read_from`] from
-    /// [`Self::link_dir`]. Phase 66 followup #3 dropped the eager
-    /// read+parse on cache hits to save the JSON round-trip per
-    /// package on warm installs (256 packages × ~30 µs adds up).
+    /// `Some` only when [`Self::freshly_populated`] is `true`. On a
+    /// cache hit, callers that need the sidecar must read it lazily
+    /// via [`crate::v2::LinkMeta::read_from`] from [`Self::link_dir`]
+    /// — eager read+parse here would cost a JSON round-trip per
+    /// package on warm installs (~30 µs × 256 packages adds up).
     pub sidecar: Option<LinkMeta>,
 }
 
@@ -263,8 +255,8 @@ pub struct LinkEntry {
 ///
 /// Holds the [`StoreV2Paths`] and exposes the two write entry points:
 /// [`Self::extract_object`] (object population) and
-/// [`Self::populate_link_entry`] (link entry + sidecar). Read-side
-/// helpers will land in Phase 4c.
+/// [`Self::populate_link_entry`] (link entry + sidecar), plus the
+/// read-side helpers below.
 #[derive(Debug, Clone)]
 pub struct Store {
     paths: StoreV2Paths,
@@ -300,23 +292,18 @@ impl Store {
     /// staged inside the tmp dir before the rename, so the published
     /// entry is observable only with both files present.
     ///
-    /// **Phase 4b decision (2026-05-07):** behavioral security analysis
-    /// lives next to the OBJECT (matches v1's placement at
-    /// `<HOME>/.lpm/store/v1/<pkg>/<version>/.lpm-security.json`), not
-    /// next to each link entry. The analysis is a property of the
-    /// content bytes; link entries with the same `source_sri` share
-    /// the same analysis result, so duplicating it per link entry
-    /// would be redundant.
+    /// Behavioral security analysis lives next to the OBJECT, not next
+    /// to each link entry — the analysis is a property of the content
+    /// bytes, so link entries sharing a `source_sri` share the result.
+    /// This matches v1's placement at
+    /// `<HOME>/.lpm/store/v1/<pkg>/<version>/.lpm-security.json`.
     ///
-    /// **Perf note (Phase 66 followup #5, 2026-05-09):** uses the fused
-    /// extractor+analyzer path — `PackageAnalyzer::should_scan` filters
-    /// scannable source entries during the tar walk, and the inspector
-    /// closure feeds their bytes into the analyzer while still in the
-    /// extractor's write buffer. Eliminates the post-extract directory
-    /// walk (`collect_source_files_recursive`) and the per-source-file
-    /// disk re-read that the pre-followup non-streaming path incurred.
-    /// Mirrors v1's `stream_and_store_package` topology
-    /// ([lib.rs:594-618](super::super::stream_and_store_package)).
+    /// Uses the fused extractor+analyzer path:
+    /// `PackageAnalyzer::should_scan` filters scannable source entries
+    /// during the tar walk, and the inspector closure feeds their
+    /// bytes into the analyzer while still in the extractor's write
+    /// buffer. Eliminates the post-extract directory walk and the
+    /// per-source-file disk re-read of the unfused path.
     pub fn extract_object(&self, sri: &str, tarball_data: &[u8]) -> Result<PathBuf, LpmError> {
         Ok(self.extract_object_with_timings(sri, tarball_data)?.0)
     }
@@ -371,27 +358,16 @@ impl Store {
             let _ = std::fs::remove_dir_all(&tmp_dir);
         }
 
-        // Phase 66 followup #5 (post-flamegraph, 2026-05-09): fused
-        // extract + behavioral scan in a single pass. Mirrors v1's
-        // `stream_and_store_package` (lib.rs:594-618). The pre-followup
-        // path called `extract_tarball` then `analyze_package`, which
-        // walked the just-written tree a second time and re-`read()` every
-        // source file from disk — symbolicated samply attributed ~10 % of
-        // active CPU to that redundancy (`collect_source_files_recursive`
-        // 1.5 % + `analyze_single_file` re-reads 4.9 % +
-        // `analyze_package` 3.8 %).
+        // Fused extract + behavioral scan in a single pass: `should_scan`
+        // filters per entry inside the tar walk, and the inspector
+        // closure feeds matching entries' bytes into the analyzer while
+        // they're still in the extractor's write buffer. The
+        // post-extract `finalize` only reads `package.json` for
+        // manifest-level tags — no second tree walk, no re-`read()` of
+        // source files.
         //
-        // The fused topology: `should_scan` filters per entry inside the
-        // tar walk; the inspector closure feeds matching entries' bytes
-        // into the analyzer while still in the extractor's write buffer.
-        // The post-extract `finalize` only reads `package.json` (one
-        // open) for manifest-level tags — the per-source-file pass is
-        // gone.
-        //
-        // `tarball_data` is `&[u8]`; slices implement `Read` directly so
-        // we don't need to wrap in a `Cursor`. RefCell wraps the analyzer
-        // so the closure (`FnMut`) can mutate it without exclusive
-        // borrows escaping the call site.
+        // `RefCell` wraps the analyzer so the `FnMut` closure can mutate
+        // it without exclusive borrows escaping the call site.
         let extract_start = std::time::Instant::now();
         let analyzer = std::cell::RefCell::new(lpm_security::behavioral::PackageAnalyzer::new());
         let extract_result = lpm_extractor::extract_tarball_from_reader_with_inspector(
@@ -532,16 +508,13 @@ impl Store {
         // to hard-fail with ENOTEMPTY against a non-empty leftover.
         if final_dir.exists() {
             if is_complete_link_entry(&final_dir, &graph_key) {
-                // Phase 66 followup #3 — refresh the sidecar's "last
-                // referenced" via a single set_modified() call.
-                // Pre-followup we did read+touch+write+rename here on
-                // every cache hit; on a 256-package warm install
-                // that's 256 JSON parses + 256 atomic-rename
-                // syscall trios. `lpm cache prune --max-age` reads
-                // the effective time via
-                // `LinkMeta::effective_last_referenced_at`, which
-                // takes max(json_field, file_mtime) — schema-
-                // compatible with pre-followup sidecars.
+                // Refresh the sidecar's "last referenced" via a single
+                // set_modified() call instead of read+touch+write+rename.
+                // On a 256-package warm install that's 256 fewer JSON
+                // parses and rename syscall trios. `lpm cache prune
+                // --max-age` reads the effective time via
+                // `LinkMeta::effective_last_referenced_at`, which takes
+                // `max(json_field, file_mtime)`.
                 let sidecar_path = final_dir.join(LINK_META_FILENAME);
                 if let Err(e) = LinkMeta::touch_on_disk(&sidecar_path) {
                     // Non-fatal: a missed touch only widens prune's
@@ -661,7 +634,7 @@ impl Store {
         }
     }
 
-    // ── Phase 4c read API ────────────────────────────────────────────
+    // ── Read API ─────────────────────────────────────────────────────
 
     /// Iterate every link-entry directory under `links/` that has a
     /// readable `.lpm-link-meta.json` sidecar.
@@ -678,11 +651,10 @@ impl Store {
     ///   These get a debug trace; callers see them as absent rather
     ///   than failing the whole walk.
     ///
-    /// Used by [`Self::find_link_package_dir`] (Phase 4c rebuild's
-    /// transitive-package lookup) and by `lpm cache prune` (Phase 4e).
-    /// Walking the directory listing is cheap on every reasonable cache
-    /// size — a 10k-entry store is ~1 ms on macOS APFS — so neither
-    /// caller bothers caching results.
+    /// Used by [`Self::find_link_package_dir`] (rebuild's
+    /// transitive-package lookup) and by `lpm cache prune`. Walking
+    /// the directory listing is cheap at any reasonable cache size
+    /// (~1 ms for 10k entries on macOS APFS) so neither caller caches.
     pub fn iter_link_entries(
         &self,
     ) -> Result<impl Iterator<Item = (PathBuf, LinkMeta)> + '_, LpmError> {
@@ -726,18 +698,14 @@ impl Store {
     /// or `Ok(None)` if no link entry has this `(name, version)`.
     ///
     /// **Match shape.** A link entry matches when its sidecar's name
-    /// and version exactly equal the caller's. Multi-source-same-coords
-    /// per Phase 66 §2.2 means two distinct sources can share the
-    /// (name, version) pair and produce different graph keys; this
-    /// lookup picks the first match in directory-iteration order,
+    /// and version exactly equal the caller's. Two distinct sources
+    /// can share `(name, version)` and produce different graph keys;
+    /// this lookup picks the first match in directory-iteration order,
     /// which is non-deterministic on its own but acceptable for
-    /// `rebuild`'s lifecycle-script path. The audit-fixture scope
-    /// never exercises multi-source-same-coords with lifecycle
-    /// scripts.
-    ///
-    /// Phase 4 follow-up: a full `(name, version, wrapper_id)` lookup
-    /// once `wrapper_id` is threaded through dep edges and persisted
-    /// in the lockfile.
+    /// `rebuild`'s lifecycle-script path. A full
+    /// `(name, version, wrapper_id)` lookup is the proper fix once
+    /// `wrapper_id` is threaded through dep edges and persisted in
+    /// the lockfile.
     pub fn find_link_package_dir(
         &self,
         name: &str,
@@ -751,8 +719,8 @@ impl Store {
         Ok(None)
     }
 
-    /// **Phase 66 §4 — v1 → v2 cache-hit translation.** When the v1
-    /// store already has the extracted bytes for a `(name, version)`
+    /// **v1 → v2 cache-hit translation.** When the v1 store already
+    /// has the extracted bytes for a `(name, version)`
     /// at `<HOME>/.lpm/store/v1/<name>/<version>/`, populate the v2
     /// `objects/<sri>/` directly from those bytes instead of
     /// re-downloading the tarball.
@@ -1056,9 +1024,9 @@ fn is_complete_link_entry(dir: &Path, key: &GraphKey) -> bool {
     if !dir.is_dir() {
         return false;
     }
-    // Trial 28: reuse a single PathBuf via push/pop rather than
-    // allocating 4 separate PathBufs (sidecar, node_modules,
-    // node_modules/<name>, node_modules/<name>/package.json).
+    // Reuse a single PathBuf via push/pop rather than allocating four
+    // separate PathBufs (sidecar, node_modules, node_modules/<name>,
+    // node_modules/<name>/package.json).
     let mut path = dir.to_path_buf();
     path.push(crate::v2::link_meta::LINK_META_FILENAME);
     if !path.is_file() {
@@ -1072,11 +1040,11 @@ fn is_complete_link_entry(dir: &Path, key: &GraphKey) -> bool {
 }
 
 /// Object dir is complete iff `package.json` AND `.integrity` are
-/// both present — symmetric to v1's `is_complete_package_dir`
-/// (lib.rs:883). The tarball extractor writes `package.json` first
-/// (it's at the root of every npm tarball) and `extract_object`
-/// writes `.integrity` last; observing both means the staging closed
-/// out cleanly even on a crash mid-extract.
+/// both present — symmetric to v1's `is_complete_package_dir`. The
+/// tarball extractor writes `package.json` first (it's at the root of
+/// every npm tarball) and `extract_object` writes `.integrity` last;
+/// observing both means staging closed cleanly even on a crash
+/// mid-extract.
 fn is_complete_object_dir(dir: &Path) -> bool {
     dir.is_dir() && dir.join("package.json").exists() && dir.join(".integrity").exists()
 }
@@ -1087,8 +1055,8 @@ fn tmp_sibling(dir: &Path) -> PathBuf {
     dir.with_extension(format!("tmp.{pid}.{tid}"))
 }
 
-/// Recursively copy `src/` to `dst/`. Used by Phase 4d's v1 → v2
-/// cache-hit translation. `std::fs::copy` invokes the kernel's
+/// Recursively copy `src/` to `dst/`. Used by the v1 → v2 cache-hit
+/// translation. `std::fs::copy` invokes the kernel's
 /// `copy_file_range(2)` on Linux (CoW reflink on Btrfs/XFS) and
 /// `fcopyfile(2)` on macOS, so the copy is essentially free on
 /// reflink-capable filesystems and bounded by a single tar-extract's
@@ -1129,11 +1097,10 @@ fn copy_dir_recursively(src: &Path, dst: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
-// Phase 66 Phase 4a follow-up: shared with `lpm-linker` via
-// `lpm_common::symlink`. Centralizing here meant v2 inherits the
-// linker's Windows `mklink /J` junction fallback automatically — a
-// hand-written `symlink_dir`-only path would have regressed Windows
-// users without Developer Mode.
+// Centralized symlink helper so v2 inherits the linker's Windows
+// `mklink /J` junction fallback automatically — a hand-written
+// `symlink_dir`-only path would regress Windows users without
+// Developer Mode.
 use lpm_common::symlink::create_dir_symlink_or_junction as create_dir_symlink;
 
 /// Materialize `src/` into `dst/` using the fastest available primitive.
@@ -1141,9 +1108,7 @@ use lpm_common::symlink::create_dir_symlink_or_junction as create_dir_symlink;
 /// Order: macOS clonefile → hardlink fallback (file-by-file) → copy
 /// fallback. Mirrors `lpm-linker::link_dir_recursive`'s policy so the
 /// v2 store inherits the same CoW-on-APFS performance characteristics
-/// today's v1 wrappers already have. Lives here (rather than being
-/// shared via lpm-common) to keep Phase 4a's blast radius confined to
-/// lpm-store; later phases can dedupe.
+/// today's v1 wrappers already have.
 fn materialize_into(src: &Path, dst: &Path) -> Result<(), LpmError> {
     #[cfg(target_os = "macos")]
     {
@@ -1431,9 +1396,9 @@ mod tests {
         let second = store.populate_link_entry(req()).unwrap();
         assert!(!second.freshly_populated);
         assert_eq!(second.link_dir, first.link_dir);
-        // Phase 66 followup #3 — cache-hit returns no sidecar; the
-        // touch is observable via the sidecar file's mtime, and the
-        // effective last-referenced timestamp is max(json, mtime).
+        // Cache-hit returns no sidecar; the touch is observable via
+        // the sidecar file's mtime, and the effective last-referenced
+        // timestamp is max(json, mtime).
         assert!(second.sidecar.is_none(), "cache hit skips sidecar read");
         let mtime_after = std::fs::metadata(&sidecar_path)
             .unwrap()
@@ -1469,8 +1434,8 @@ mod tests {
         let dep_key = arc_key("debug", "4.3.4");
 
         // Materialize the dep first so its link dir exists for the
-        // symlink target. (Phase 4a doesn't enforce ordering — caller's
-        // responsibility — but we exercise the realistic path.)
+        // symlink target. The store doesn't enforce ordering (caller's
+        // responsibility) — we exercise the realistic path here.
         store
             .populate_link_entry(LinkEntryRequest {
                 graph_key: dep_key.clone(),
@@ -1638,16 +1603,13 @@ mod tests {
         assert!(matches!(err, LpmError::InvalidIntegrity(_)));
     }
 
-    // -------- Audit follow-ups (2026-05-07 GPT pass) ------------
+    // -------- Crash-recovery and integrity invariants ----------
 
     #[test]
     fn populate_recovers_from_partial_link_entry_with_sidecar_only() {
-        // Audit finding 3: a leftover `links/<graph-key>/` containing
-        // only the sidecar (no `node_modules/<pkg>/`) used to be
-        // accepted as a hit by the original `is_complete_link_entry`
-        // check. After the tightening, an entry without
-        // `node_modules/<name>/package.json` is detected as
-        // incomplete and re-populated.
+        // A leftover `links/<graph-key>/` with only the sidecar (no
+        // `node_modules/<pkg>/`) must be detected as incomplete and
+        // re-populated, not silently accepted as a cache hit.
         let dir = tempfile::tempdir().unwrap();
         let store = Store::at(dir.path());
 
@@ -1697,8 +1659,8 @@ mod tests {
         // Synthesizes an empty leftover dir, then exercises the
         // recovery short-circuit by re-running with a real object
         // populated via the `write_object` helper. Bypasses the
-        // tarball extractor (Phase 4a's tests don't exercise the
-        // gzip/tar pipeline directly).
+        // tarball extractor — these tests don't exercise the
+        // gzip/tar pipeline directly.
         let dir = tempfile::tempdir().unwrap();
         let store = Store::at(dir.path());
         let sri = synthetic_sri(b"recover_partial_object_dir");
@@ -1836,7 +1798,7 @@ mod tests {
     }
 
     /// Build a small gzip+tar tarball with `package/<path>` entries —
-    /// matches the npm-tarball convention. Used by the Phase 4b
+    /// matches the npm-tarball convention. Used by the
     /// extract-from-bytes tests below.
     fn build_test_tarball(files: &[(&str, &[u8])]) -> Vec<u8> {
         use flate2::Compression;
@@ -1864,10 +1826,10 @@ mod tests {
 
     #[test]
     fn extract_object_from_bytes_populates_object_dir() {
-        // Phase 4b: end-to-end round trip from raw bytes through SRI
+        // End-to-end round trip from raw bytes through SRI
         // computation, extraction, security analysis, and atomic
-        // rename. Confirms the install pipeline's v2 entry point
-        // produces a complete object dir (package.json + .integrity +
+        // rename. The install pipeline's v2 entry point must produce a
+        // complete object dir (package.json + .integrity +
         // .lpm-security.json all present).
         let dir = tempfile::tempdir().unwrap();
         let store = Store::at(dir.path());
@@ -1880,7 +1842,7 @@ mod tests {
         assert!(obj_dir.is_dir());
         assert!(obj_dir.join("package.json").is_file());
         assert!(obj_dir.join(".integrity").is_file());
-        // Phase 4b decision: security cache lives next to the object.
+        // Security cache lives next to the object.
         assert!(
             obj_dir.join(".lpm-security.json").is_file(),
             "v2 security analysis must run inside extract_object"
@@ -1972,7 +1934,7 @@ mod tests {
         assert_eq!(read, target);
     }
 
-    // ── Phase 4c read API tests ──────────────────────────────────────
+    // ── Read API tests ───────────────────────────────────────────────
 
     /// Populate two link entries, then iterate. Both must surface with
     /// readable sidecars, in some order.
@@ -2079,12 +2041,8 @@ mod tests {
         assert_eq!(store.find_link_package_dir("nope", "3.1.4").unwrap(), None);
     }
 
-    /// `path_lives_in_store` returns `true` iff the canonicalized path
-    /// is inside this store's `links/` root. Used by doctor / rebuild
-    /// to decide if a project-side symlink leads to a v2 install.
-    /// Phase 66 §4 v1 → v2 cache-hit translation:
     /// `populate_object_from_v1` copies an extracted v1 package dir
-    /// into a v2 object dir (atomic), preserving package contents
+    /// into a v2 object dir atomically, preserving package contents
     /// and `.lpm-security.json` if present.
     #[test]
     fn populate_object_from_v1_copies_extracted_package_dir() {
@@ -2206,7 +2164,7 @@ mod tests {
         assert!(!store.path_lives_in_store(&outside));
     }
 
-    // ── Trial 28: sri_to_segment parity ────────────────────────────────────
+    // ── sri_to_segment parity ──────────────────────────────────────────────
 
     /// The optimized `sri_to_segment` (single-alloc write loop) must
     /// produce identical output to the naïve `format!("{algo}-{hex}")` it
