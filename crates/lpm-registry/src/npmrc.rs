@@ -1,13 +1,5 @@
 //! Parse and route via `.npmrc`-style configuration files.
 //!
-//! Phase 58 — see
-//! `DOCS/new-features/37-rust-client-RUNNER-VISION-phase58-npmrc-walker-preplan.md`
-//! in the a-package-manager repo for the full design.
-//!
-//! This module is **parser-only** in day-1. The filesystem walker (day-2),
-//! `RouteTable` integration (day-3), and `RegistryClient::get_npm_metadata_from`
-//! (day-4) land in subsequent commits on this branch.
-//!
 //! ## What we parse
 //!
 //! - `registry=<url>` — default registry override.
@@ -22,7 +14,7 @@
 //!   populated; caller surfaces and exits before any network).
 //! - Comments (`;` and `#`), blank lines, CRLF, BOM, trailing whitespace.
 //!
-//! ## TLS settings (Phase 58.1 + 58.3)
+//! ## TLS settings
 //!
 //! Global keys:
 //! - `cafile=<path>` — PEM is read from disk at parse time
@@ -46,11 +38,11 @@
 //! Per-origin keys (`//host[:port]/:<key>=...`):
 //! - `:cafile=<path>` — additive trust root for that origin only.
 //!   Deferred-read: file IO happens at client-build time for the
-//!   matching origin, NOT at parse time. Δ1 scoping rule.
+//!   matching origin, NOT at parse time.
 //! - `:certfile=<path>` + `:keyfile=<path>` — per-origin mTLS
 //!   identity. Replaces the global identity for that origin. XOR
-//!   validation is build-time per origin (Δ2 scoping) — half-config
-//!   for an unreached origin doesn't abort unrelated installs.
+//!   validation is build-time per origin — half-config for an unreached
+//!   origin doesn't abort unrelated installs.
 //!
 //! ## What we don't parse (v1)
 //!
@@ -131,7 +123,6 @@ impl RegistryTarget {
 /// `source` / `line` plumb through `TlsOverrides::extra_roots` so when
 /// `reqwest::Certificate::from_pem` rejects bytes at builder time the
 /// error message can cite which `.npmrc` layer/line contributed them.
-/// Phase 58.1.
 #[derive(Clone, Debug)]
 pub struct TaggedRoot {
     /// Raw PEM bytes — one or more `-----BEGIN CERTIFICATE-----` blocks.
@@ -147,7 +138,7 @@ pub struct TaggedRoot {
 /// Bool-valued setting tagged with its contributing source. Used for
 /// `strict_ssl` so the install-start warning can cite where the setting
 /// came from (`"strict-ssl=false in /Users/me/.npmrc:3 — TLS verification
-/// disabled for this install"`). Phase 58.1.
+/// disabled for this install"`).
 #[derive(Clone, Debug)]
 pub struct TaggedBool {
     pub value: bool,
@@ -159,7 +150,7 @@ pub struct TaggedBool {
 /// `certfile=` / `keyfile=` (global and per-origin). Path is stored
 /// verbatim from `.npmrc`; the loader resolves and reads at client-
 /// build time so per-origin entries the install never reaches don't
-/// turn into ambient-config preconditions. Phase 58.3 (mTLS).
+/// turn into ambient-config preconditions.
 ///
 /// **Relative-path resolution.** When the user writes
 /// `certfile=corp-ca.pem` in `~/.npmrc`, they expect the file to be
@@ -186,8 +177,8 @@ impl TaggedPath {
     /// - Else return `path` (loader will resolve against `${PWD}`,
     ///   matching npm's behavior for paths whose source is unknown).
     ///
-    /// Phase 58.3 — addresses GPT pre-T3 finding "TLS paths from
-    /// `~/.npmrc` would otherwise resolve against the process cwd."
+    /// Resolves relative to the source file's directory so `certfile=corp.pem`
+    /// in `~/.npmrc` finds the cert next to `~/.npmrc`, not `${PWD}`.
     pub fn resolve(&self) -> PathBuf {
         if self.path.is_absolute() {
             return self.path.clone();
@@ -215,7 +206,7 @@ impl TaggedPath {
 /// or both absent. If only one is set, the loader emits a fatal
 /// error citing the present line — but only when this origin is
 /// actually built into a client (eager or lazy). Configured-but-
-/// unreached half-configs do not abort the install. Phase 58.3.
+/// unreached half-configs do not abort the install.
 #[derive(Default, Clone, Debug)]
 pub struct OriginTlsOverrides {
     /// Extra root certificates from `//host/:cafile=<path>`. Stored
@@ -231,9 +222,9 @@ pub struct OriginTlsOverrides {
 
 impl OriginTlsOverrides {
     /// Whether this origin has any TLS settings configured. Used by
-    /// the per-origin client builder (Phase 58.3 / T3) to skip
-    /// building a separate client for an origin whose entry exists
-    /// only because `merge_over` created it empty.
+    /// the per-origin client builder to skip building a separate client
+    /// for an origin whose entry exists only because `merge_over` created
+    /// it empty.
     pub fn is_empty(&self) -> bool {
         self.cafiles.is_empty() && self.certfile.is_none() && self.keyfile.is_none()
     }
@@ -266,10 +257,9 @@ impl OriginTlsOverrides {
 ///   for that specific origin, not globally — so an unrelated bad
 ///   entry in a shared `~/.npmrc` never breaks an unrelated install.
 ///
-/// The consumer is `RegistryClient::with_tls_overrides_for` (Phase
-/// 58.3), which builds the default client from the global surface
-/// and per-origin clients eagerly for the request set's reached
-/// origins (lazy for the rest).
+/// The consumer is `RegistryClient::with_tls_overrides_for`, which builds
+/// the default client from the global surface and per-origin clients eagerly
+/// for the request set's reached origins (lazy for the rest).
 #[derive(Default, Debug, Clone)]
 pub struct TlsOverrides {
     /// Extra root certificates from `cafile=<path>` and `ca=<pem>`.
@@ -347,8 +337,8 @@ impl OriginKey {
     /// Parse from a `//host[:port]/...` `.npmrc` auth-key fragment.
     ///
     /// Caller has already verified the leading `//`. We strip it,
-    /// lop everything from the first `/` onward (path is ignored in
-    /// v1 per pre-plan §2), then split host:port. An omitted port
+    /// lop everything from the first `/` onward (path is ignored in v1),
+    /// then split host:port. An omitted port
     /// yields `port: None` (matches any port for that host).
     fn from_npmrc_origin(after_double_slash: &str) -> Option<Self> {
         // Drop the path component, if any.
@@ -426,11 +416,10 @@ impl OriginKey {
 
 /// Auth credential to attach to a request.
 ///
-/// Each variant carries the [`OriginKey`] the credential is scoped to
-/// — Phase 58 day-3 defense-in-depth. `RegistryClient::
-/// get_npm_metadata_from` re-verifies that this origin is compatible
-/// with the destination URL via [`Self::matches_destination`] before
-/// sending the `Authorization` header, so a routing bug elsewhere
+/// Each variant carries the [`OriginKey`] the credential is scoped to.
+/// `RegistryClient::get_npm_metadata_from` re-verifies that this origin
+/// is compatible with the destination URL via [`Self::matches_destination`]
+/// before sending the `Authorization` header, so a routing bug elsewhere
 /// can't leak a token cross-origin.
 ///
 /// Secret material is wrapped in [`SecretString`]; hand-written `Debug`
@@ -551,7 +540,7 @@ impl TaggedValue {
 /// `NpmrcConfig::finalize` resolves them into a concrete
 /// `RegistryAuth`. Buffers persist across `merge_over` so subkeys set
 /// by different layers (e.g., system-wide `_username` + per-user
-/// `_password`) compose correctly — Gemini's Finding 1.
+/// `_password`) compose correctly.
 #[derive(Default, Clone, Debug)]
 struct AuthBuffer {
     auth_token: Option<TaggedValue>,
@@ -659,8 +648,8 @@ impl AuthBuffer {
 ///    malformed credentials.
 ///
 /// `parse` does both for the common single-file case so most call sites
-/// don't have to think about it. The walker (Phase 58 day 2) uses the
-/// layered API explicitly.
+/// don't have to think about it. The filesystem walker uses the layered
+/// API explicitly.
 #[derive(Default, Debug)]
 pub struct NpmrcConfig {
     /// Default registry, if any layer set `registry=<url>`.
@@ -670,7 +659,7 @@ pub struct NpmrcConfig {
     pub scope_registries: HashMap<String, RegistryTarget>,
     /// Origin → auth. Empty until `finalize()` is called. Populated from
     /// `auth_buffers` at finalize time so cross-layer credential merging
-    /// works (Gemini Finding 1).
+    /// works.
     pub origin_auth: HashMap<OriginKey, RegistryAuth>,
     /// Non-fatal parse messages: malformed lines, deferred-feature
     /// (mTLS / per-origin TLS) notices. Caller dumps via `output::warn`.
@@ -680,8 +669,7 @@ pub struct NpmrcConfig {
     /// network. npm errors here too, so we match.
     pub errors: Vec<String>,
     /// TLS overrides — `cafile=` / `ca=` extra roots and `strict-ssl=false`.
-    /// Phase 58.1. Wired by `RegistryClient::with_tls_overrides` at
-    /// install start.
+    /// Wired by `RegistryClient::with_tls_overrides` at install start.
     pub tls: TlsOverrides,
 
     /// Raw auth state across all merged layers, indexed by origin. Each
@@ -717,8 +705,8 @@ impl NpmrcConfig {
         Self::parse_layer_with_source_dir(content, source_label, None, env_lookup)
     }
 
-    /// Phase 58.3 — parse a single `.npmrc` layer and tag every TLS
-    /// path entry with the source directory.
+    /// Parse a single `.npmrc` layer and tag every TLS path entry with the
+    /// source directory.
     ///
     /// `source_dir` is the parent directory of the `.npmrc` file
     /// being parsed. Used by [`TaggedPath::resolve`] to compose
@@ -799,16 +787,15 @@ impl NpmrcConfig {
 
     /// Resolve all per-origin auth buffers into concrete `RegistryAuth`
     /// entries. Idempotent — calling twice is a no-op (the buffers are
-    /// drained on first call). Emits warnings for any partial /
-    /// malformed credentials, citing the source label of whichever
-    /// subkey contributed the partial state (Gemini Finding 3).
+    /// drained on first call). Emits warnings for any partial / malformed
+    /// credentials, citing the source label of whichever subkey contributed
+    /// the partial state.
     ///
-    /// **Phase 58.3** — also enforces the GLOBAL mTLS identity XOR
-    /// contract: `certfile=` and `keyfile=` at the top level must
-    /// both be set or both absent. A half-configured global identity
-    /// gets a fatal `cfg.errors` entry citing the present line and
-    /// naming the missing key. The same contract for per-origin
-    /// identities is enforced later, at client-build time, so a
+    /// Also enforces the GLOBAL mTLS identity XOR contract: `certfile=` and
+    /// `keyfile=` at the top level must both be set or both absent. A
+    /// half-configured global identity gets a fatal `cfg.errors` entry
+    /// citing the present line and naming the missing key. The same contract
+    /// for per-origin identities is enforced at client-build time, so a
     /// half-config for an unreached origin never aborts the install.
     pub fn finalize(&mut self) {
         if self.finalized {
@@ -820,9 +807,9 @@ impl NpmrcConfig {
                 self.origin_auth.insert(origin, auth);
             }
         }
-        // GLOBAL mTLS identity XOR check (Phase 58.3). Per-origin
-        // identities are validated at client-build time, not here —
-        // see Δ2 in the phase-67 plan doc for the scoping rationale.
+        // GLOBAL mTLS identity XOR check. Per-origin identities are validated
+        // at client-build time, not here — unreached half-configs must not
+        // abort unrelated installs.
         match (
             self.tls.identity_certfile.as_ref(),
             self.tls.identity_keyfile.as_ref(),
@@ -854,7 +841,6 @@ impl NpmrcConfig {
     /// Auth subkeys merge per-subkey: if `self` has `_username` for an
     /// origin and `other` has `_password` for the same origin, the
     /// finalized result is a Basic credential composed from both.
-    /// (Gemini Finding 1.)
     ///
     /// `merge_over` panics if either side has been finalized — finalize
     /// is the irreversible last step. Tests assert this contract.
@@ -873,7 +859,7 @@ impl NpmrcConfig {
                 .or_default()
                 .merge_over(other_buf);
         }
-        // TLS overrides (Phase 58.1).
+        // TLS overrides merge:
         // - `extra_roots`: concatenate, then deduplicate by `pem_bytes`
         //   keeping the FIRST source seen. Lower-precedence roots
         //   stay first in trust-chain order (reqwest treats all roots
@@ -902,26 +888,24 @@ impl NpmrcConfig {
         if other.tls.strict_ssl.is_some() {
             self.tls.strict_ssl = other.tls.strict_ssl;
         }
-        // Phase 58.3 — global mTLS identity. Same merge shape as
-        // `default_registry`: higher-explicit wins. The XOR-validation
-        // contract (both certfile + keyfile, or neither) is enforced
-        // at finalize time across all merged layers, so a user can
-        // legitimately set `certfile=` in `~/.npmrc` and `keyfile=`
-        // in a project `.npmrc` and have them compose.
+        // Global mTLS identity: higher-explicit wins. The XOR-validation
+        // contract (both certfile + keyfile, or neither) is enforced at
+        // finalize time across all merged layers, so a user can legitimately
+        // set `certfile=` in `~/.npmrc` and `keyfile=` in a project `.npmrc`
+        // and have them compose.
         if other.tls.identity_certfile.is_some() {
             self.tls.identity_certfile = other.tls.identity_certfile;
         }
         if other.tls.identity_keyfile.is_some() {
             self.tls.identity_keyfile = other.tls.identity_keyfile;
         }
-        // Phase 58.3 — per-origin TLS. Each origin's settings merge
-        // independently via `OriginTlsOverrides::merge_over`:
+        // Per-origin TLS: each origin's settings merge independently via
+        // `OriginTlsOverrides::merge_over`:
         // - `cafiles` accumulate (multiple roots stack);
         // - `certfile` / `keyfile` higher-explicit wins.
-        // The per-origin XOR-validation contract is NOT enforced
-        // here — it's deferred to client-build time so a half-config
-        // for an origin this invocation never reaches doesn't abort
-        // unrelated installs.
+        // The per-origin XOR-validation contract is NOT enforced here —
+        // it's deferred to client-build time so a half-config for an origin
+        // this invocation never reaches doesn't abort unrelated installs.
         for (origin, other_per_origin) in other.tls.per_origin {
             self.tls
                 .per_origin
@@ -938,7 +922,7 @@ impl NpmrcConfig {
     /// Resolution order:
     /// 1. `@scope/foo` and `scope_registries[@scope]` exists → that target.
     /// 2. `default_registry` is `Some` → that target.
-    /// 3. `None` — caller falls back to `RouteMode` defaults (Phase 49 behavior).
+    /// 3. `None` — caller falls back to `RouteMode` defaults.
     ///
     /// Both the stored scope keys (set in `classify_and_apply`) and the
     /// query scope are lowercased before comparison. Real-world npmrc
@@ -960,7 +944,7 @@ impl NpmrcConfig {
     /// per npm semantics: try the exact `(host, Some(port))` first; on
     /// miss, fall back to `(host, None)` so an npmrc entry without an
     /// explicit port covers any port for that host (scheme-agnostic for
-    /// http vs https — Gemini Finding 2).
+    /// http vs https).
     ///
     /// Returns `None` if `finalize()` hasn't been called — auth_for_url
     /// reads from `origin_auth`, which is empty pre-finalize. The
@@ -987,15 +971,14 @@ impl NpmrcConfig {
     /// [`Self::auth_for_url`]'s match rule: try `(host, Some(port))`
     /// first, fall back to `(host, None)` so an `.npmrc` entry
     /// without an explicit port covers any port for that host.
-    /// Phase 58.3 (mTLS).
     pub fn tls_for_url(&self, url: &str) -> Option<&OriginTlsOverrides> {
         let exact = OriginKey::from_request_url(url)?;
         self.tls_for_origin(&exact)
     }
 
     /// Look up per-origin TLS settings by `OriginKey`. Used by the
-    /// per-origin client builder (Phase 58.3) which already has the
-    /// resolved origin and doesn't need a URL parse round-trip.
+    /// per-origin client builder which already has the resolved origin
+    /// and doesn't need a URL parse round-trip.
     pub fn tls_for_origin(&self, origin: &OriginKey) -> Option<&OriginTlsOverrides> {
         if let Some(t) = self.tls.per_origin.get(origin) {
             return Some(t);
@@ -1007,7 +990,7 @@ impl NpmrcConfig {
         self.tls.per_origin.get(&any_port)
     }
 
-    // ---- Filesystem walker (Phase 58 day-2) ----
+    // ---- Filesystem walker ----
 
     /// Compute the four `.npmrc` paths in **lowest-to-highest precedence
     /// order**, ready to feed `load_from_paths`, plus any warnings raised
@@ -1032,8 +1015,8 @@ impl NpmrcConfig {
     /// Layers 1–3 are returned even if their files don't exist; the
     /// loader silently skips missing files. Layer 4 is **bounded** to
     /// the project — without a regular-file project marker on the path,
-    /// no project layer is included (Gemini day-2 Finding 1, plus the
-    /// non-regular-marker bypass discovered in day-2.5 review).
+    /// no project layer is included (a planted non-regular marker would
+    /// otherwise qualify any directory as a project root).
     pub fn discover_layer_paths(cwd: &Path, home: Option<&Path>) -> LayerDiscovery {
         let mut paths = Vec::with_capacity(4);
         let mut warnings = Vec::new();
@@ -1079,11 +1062,9 @@ impl NpmrcConfig {
             match std::fs::read_to_string(path) {
                 Ok(content) => {
                     let label = path.display().to_string();
-                    // Phase 58.3 — pass the file's parent dir so any
-                    // `certfile=` / `keyfile=` / per-origin `cafile=`
-                    // tagged paths resolve relative to *this* `.npmrc`
-                    // (not `${PWD}`), per GPT pre-T3 finding on path
-                    // resolution.
+                    // Pass the file's parent dir so `certfile=` / `keyfile=`
+                    // / per-origin `cafile=` tagged paths resolve relative
+                    // to *this* `.npmrc` (not `${PWD}`).
                     let source_dir = path.parent();
                     let layer = NpmrcConfig::parse_layer_with_source_dir(
                         &content, &label, source_dir, env_lookup,
@@ -1145,9 +1126,8 @@ const PROJECT_MARKERS: &[&str] = &["package.json"];
 /// Whether `dir` contains at least one **regular-file** project marker.
 /// `metadata().is_file()` follows symlinks (so a symlink to a real
 /// `package.json` still counts) but rejects directories and broken
-/// symlinks — closing the day-2.5 review's HIGH finding (a planted
-/// `mkdir /tmp/package.json` would otherwise have qualified `/tmp` as
-/// a project root).
+/// symlinks — `mkdir /tmp/package.json` must not qualify `/tmp` as a
+/// project root.
 fn dir_has_regular_marker(dir: &Path) -> bool {
     PROJECT_MARKERS.iter().any(|m| {
         std::fs::metadata(dir.join(m))
@@ -1173,7 +1153,7 @@ enum NpmrcEntry {
 /// Classify a single `.npmrc` candidate path. `symlink_metadata` first
 /// so broken symlinks register as entries (`metadata` alone would
 /// follow and return `NotFound`, which the caller would silently treat
-/// as Missing — that's the silent-escalation problem Gemini flagged).
+/// as Missing — that's a silent privilege escalation if left unguarded).
 fn inspect_npmrc_at(candidate: &Path) -> NpmrcEntry {
     let lstat = match std::fs::symlink_metadata(candidate) {
         Ok(m) => m,
@@ -1243,13 +1223,11 @@ enum ProjectNpmrcOutcome {
 ///      `.npmrc` we trust is the answer.
 ///    - `NotRegular` → return it as a warning; do NOT fall through.
 ///    - `Missing` → continue up. A higher ancestor might still have
-///      the workspace-root `.npmrc` (this is the monorepo-inheritance
-///      case Gemini day-2.5 Finding 2 cared about: nested member's
-///      `package.json` flips the flag, then we walk up to the repo
-///      root's `.npmrc`).
+///      the workspace-root `.npmrc` (nested member's `package.json`
+///      flips the flag, then we walk up to the repo root's `.npmrc`).
 /// 4. If not `seen_marker`: do not even look at `dir/.npmrc`. Without
 ///    a marker on the path, we can't tell a legitimate `.npmrc` from
-///    a planted one — Gemini day-2 Finding 1 / day-2.5 Finding 1.
+///    a planted one.
 ///
 /// Why "marker at-or-below" rather than "marker exact-here": npm-style
 /// monorepos put `package.json` in each member but `.npmrc` only at
@@ -1272,8 +1250,7 @@ fn walk_for_project_npmrc(cwd: &Path, home: Option<&Path>) -> ProjectNpmrcOutcom
                     return ProjectNpmrcOutcome::NotRegular { path, kind };
                 }
                 NpmrcEntry::Missing => {
-                    // Keep walking — repo root might have the workspace
-                    // .npmrc (Gemini day-2.5 Finding 2).
+                    // Keep walking — repo root might have the workspace .npmrc.
                 }
             }
         }
@@ -1339,10 +1316,10 @@ fn interpolate_env(
 /// subkeys are written into `cfg.auth_buffers` as `TaggedValue`s; they
 /// don't get resolved into `RegistryAuth` until `NpmrcConfig::finalize`.
 ///
-/// `source_dir` is the directory of the `.npmrc` file being parsed
-/// (Phase 58.3); when populated, every emitted [`TaggedPath`] carries
-/// it so [`TaggedPath::resolve`] can turn relative paths into
-/// absolute ones at load time. Test stubs pass `None`.
+/// `source_dir` is the directory of the `.npmrc` file being parsed;
+/// when populated, every emitted [`TaggedPath`] carries it so
+/// [`TaggedPath::resolve`] can turn relative paths into absolute ones
+/// at load time. Test stubs pass `None`.
 fn classify_and_apply(
     key: &str,
     value: &str,
@@ -1399,19 +1376,17 @@ fn classify_and_apply(
             // configures (auth token, mTLS identity, extra root, …)
             // will apply to ALL paths on that origin — broader than
             // what the user wrote. Loud warning so this can't surprise
-            // anyone. Phase 58.3: keep the wording neutral so it
-            // covers both auth and TLS attrs through the same branch.
+            // anyone. Kept neutral to cover both auth and TLS attrs.
             if origin_part.contains('/') {
                 cfg.warnings.push(format!(
                     "{source_label}:{lineno}: path-scoped npmrc key ('{key}') is parsed as origin-only in v1; \
-                     setting will apply to ALL paths on {origin} — see Phase 58 docs"
+                     setting will apply to ALL paths on {origin}"
                 ));
             }
             let tagged = TaggedValue::new(value.to_string(), source_label, lineno);
-            // Auth subkeys go into the per-origin auth buffer.
-            // TLS subkeys go into the per-origin TLS buffer (Phase 58.3).
-            // Two distinct entry maps share the same `OriginKey` so a
-            // matching-origin lookup at request time fetches both.
+            // Auth subkeys go into the per-origin auth buffer; TLS subkeys
+            // go into the per-origin TLS buffer. Two distinct entry maps share
+            // the same `OriginKey` so a matching-origin lookup fetches both.
             match attr {
                 "_authToken" => {
                     cfg.auth_buffers.entry(origin).or_default().auth_token = Some(tagged);
@@ -1426,19 +1401,18 @@ fn classify_and_apply(
                     cfg.auth_buffers.entry(origin).or_default().password_b64 = Some(tagged);
                 }
                 "always-auth" | "email" => {
-                    // Silently accepted at origin scope (Phase 58.1).
-                    // `always-auth` is vestigial — modern npm 7+ removed
+                    // Silently accepted at origin scope. `always-auth` is
+                    // vestigial — modern npm 7+ removed
                     // the per-registry distinction; lpm always sends
                     // matching-origin tokens. `email` is publish-flow
                     // metadata, irrelevant to install routing.
                 }
                 "cafile" => {
-                    // Phase 58.3 — per-origin extra root. DEFERRED-READ
-                    // by design: the PEM is read at client-build time
-                    // for the matching origin, NOT at parse time. This
-                    // keeps unrelated `.npmrc` entries (e.g., a stale
-                    // path on a shared `~/.npmrc`) from breaking
-                    // installs that never reach the configured origin.
+                    // Per-origin extra root. DEFERRED-READ by design: the PEM
+                    // is read at client-build time for the matching origin,
+                    // NOT at parse time. Unrelated `.npmrc` entries (e.g., a
+                    // stale path on a shared `~/.npmrc`) cannot break installs
+                    // that never reach the configured origin.
                     if value.is_empty() {
                         cfg.warnings.push(format!(
                             "{source_label}:{lineno}: empty per-origin cafile path; skipped"
@@ -1458,11 +1432,10 @@ fn classify_and_apply(
                         });
                 }
                 "certfile" => {
-                    // Phase 58.3 — per-origin mTLS client cert path.
-                    // Path-only at parse time; XOR-pair validation +
-                    // file read deferred to client-build time. See Δ2
-                    // in the phase-67 plan: configured-but-unreached
-                    // half-configs do not abort the install.
+                    // Per-origin mTLS client cert path. Path-only at parse
+                    // time; XOR-pair validation + file read deferred to
+                    // client-build time. Configured-but-unreached half-configs
+                    // do not abort the install.
                     if value.is_empty() {
                         cfg.warnings.push(format!(
                             "{source_label}:{lineno}: empty per-origin certfile path; skipped"
@@ -1477,7 +1450,7 @@ fn classify_and_apply(
                     });
                 }
                 "keyfile" => {
-                    // Phase 58.3 — per-origin mTLS private key path.
+                    // Per-origin mTLS private key path.
                     // Same deferred-read contract as `certfile`.
                     if value.is_empty() {
                         cfg.warnings.push(format!(
@@ -1506,7 +1479,7 @@ fn classify_and_apply(
         return;
     }
 
-    // Globally-scoped TLS settings — Phase 58.1.
+    // Globally-scoped TLS settings.
     if key == "cafile" {
         if value.is_empty() {
             cfg.warnings.push(format!(
@@ -1607,12 +1580,11 @@ fn classify_and_apply(
         return;
     }
     if key == "certfile" || key == "keyfile" {
-        // Phase 58.3 — global mTLS identity (cert chain + private key).
-        // Path-only at parse time; the actual cert/key file is read at
-        // client-build time. The XOR-pair contract (both set or both
-        // absent) is enforced at finalize() across all merged layers,
-        // so a `~/.npmrc certfile=` plus a project `.npmrc keyfile=`
-        // legitimately compose into a single global identity.
+        // Global mTLS identity (cert chain + private key). Path-only at parse
+        // time; the actual cert/key file is read at client-build time. The
+        // XOR-pair contract (both set or both absent) is enforced at
+        // finalize() across all merged layers, so `certfile=` in `~/.npmrc`
+        // plus `keyfile=` in a project `.npmrc` legitimately compose.
         if value.is_empty() {
             cfg.warnings.push(format!(
                 "{source_label}:{lineno}: empty {key} path; skipped"
@@ -1633,9 +1605,8 @@ fn classify_and_apply(
         return;
     }
     if key == "always-auth" {
-        // Silently accepted (Phase 58.1). lpm always sends a matching-origin
-        // token, which is what `always-auth=true` users want; `=false` is
-        // rare enough to document-as-no-op (see CLAUDE.md npmrc section).
+        // Silently accepted. lpm always sends a matching-origin token, which
+        // is what `always-auth=true` users want; `=false` is a no-op.
         // Modern npm 7+ removed the per-registry distinction.
     }
 
@@ -1882,7 +1853,7 @@ mod tests {
         assert!(cfg.errors.is_empty(), "errors: {:?}", cfg.errors);
     }
 
-    // ---- Phase 58.1 TLS overrides: cafile / ca / strict-ssl / always-auth ----
+    // ---- TLS overrides: cafile / ca / strict-ssl / always-auth ----
 
     /// Generate a self-signed test PEM (cert + key); only the cert PEM
     /// is used by these parser tests. Key is dropped. Used in lieu of a
@@ -2145,14 +2116,14 @@ mod tests {
         assert!(cfg.warnings.is_empty(), "warnings: {:?}", cfg.warnings);
     }
 
-    // ---- Phase 58.3: per-origin TLS / mTLS parsing ----
+    // ---- per-origin TLS / mTLS parsing ----
 
     #[test]
     fn global_certfile_xor_keyfile_is_fatal_with_cited_line() {
-        // Half-configured global identity at finalize time → fatal,
-        // citing the line of the present key and naming the missing
-        // one. Phase 58.3 Δ2: this is GLOBAL state — wrong here breaks
-        // every fetch, so install must abort before any network.
+        // Half-configured global identity at finalize time → fatal, citing
+        // the line of the present key and naming the missing one. This is
+        // GLOBAL state — wrong here breaks every fetch, so install must
+        // abort before any network.
         let cfg = NpmrcConfig::parse("certfile=/path/cert.pem\n", "test", &no_env);
         assert_eq!(cfg.errors.len(), 1, "errors: {:?}", cfg.errors);
         assert!(cfg.errors[0].contains("test:1"));
@@ -2210,10 +2181,9 @@ mod tests {
     #[test]
     fn per_origin_cafile_populates_per_origin_not_global_roots() {
         let cfg = NpmrcConfig::parse("//npm.internal/:cafile=/path/ca.pem\n", "test", &no_env);
-        // Phase 58.3: per-origin cafile is path-only at parse time
-        // (deferred-read), so a non-existent path here is NOT a
-        // parse-time error. Only loaded at client-build time for
-        // the matching origin, and only if this invocation reaches it.
+        // Per-origin cafile is path-only at parse time (deferred-read), so a
+        // non-existent path here is NOT a parse-time error. Only loaded at
+        // client-build time for the matching origin.
         assert!(cfg.errors.is_empty(), "errors: {:?}", cfg.errors);
         assert!(cfg.warnings.is_empty(), "warnings: {:?}", cfg.warnings);
         assert!(
@@ -2257,10 +2227,10 @@ mod tests {
 
     #[test]
     fn per_origin_half_configured_identity_does_not_abort_at_finalize() {
-        // Phase 58.3 Δ2: per-origin half-configs are NOT fatal at
-        // finalize. They become fatal only when that origin is
-        // actually built into a client (eager or lazy). Configured-
-        // but-unreached half-configs do not break unrelated installs.
+        // Per-origin half-configs are NOT fatal at finalize. They become fatal
+        // only when that origin is actually built into a client (eager or
+        // lazy). Configured-but-unreached half-configs do not break unrelated
+        // installs.
         let cfg = NpmrcConfig::parse(
             "//unused.internal/:certfile=/path/cert.pem\n",
             "test",
@@ -2306,10 +2276,10 @@ mod tests {
 
     #[test]
     fn parse_layer_with_source_dir_tags_certfile_for_resolve() {
-        // Phase 58.3 — when parse_layer_with_source_dir is given
-        // a directory, every TaggedPath in this layer (global +
-        // per-origin) must carry it so `TaggedPath::resolve()` can
-        // compose absolute paths from relative `.npmrc` values.
+        // When parse_layer_with_source_dir is given a directory, every
+        // TaggedPath in this layer (global + per-origin) must carry it so
+        // `TaggedPath::resolve()` can compose absolute paths from relative
+        // `.npmrc` values.
         let dir = std::path::Path::new("/etc/npm");
         let content = "certfile=corp-cert.pem\n\
                        keyfile=corp-key.pem\n\
@@ -2405,9 +2375,8 @@ mod tests {
 
     #[test]
     fn password_containing_colon_round_trips() {
-        // Phase 58.1 day-4 — defensive regression test against a
-        // hypothetical future "split on every `:`" refactor of the
-        // _username/_password join.
+        // Defensive regression test against a hypothetical future "split on
+        // every `:`" refactor of the _username/_password join.
         //
         // Per RFC 7617, the userid:password wire format reserves only
         // the FIRST `:` as the separator; the password may contain
@@ -2484,14 +2453,13 @@ mod tests {
         assert_eq!(acc.scope_registries.len(), 2);
     }
 
-    // ---- Gemini Finding 1: cross-layer credential merge ----
+    // ---- cross-layer credential merge ----
 
     #[test]
     fn cross_layer_username_password_merge() {
         // System-level file declares the username; user-level adds the
-        // password. Finalize must combine them into Basic auth, not
-        // emit two partial-credential warnings. Pre-fix this test
-        // failed both ways: zero auth entries + two "partial" warnings.
+        // password. Finalize must combine them into Basic auth, not emit two
+        // partial-credential warnings.
         let system =
             NpmrcConfig::parse_layer("//npm.internal/:_username=alice\n", "/etc/npmrc", &no_env);
         let user = NpmrcConfig::parse_layer(
@@ -2547,14 +2515,13 @@ mod tests {
         }
     }
 
-    // ---- Gemini Finding 2: scheme-agnostic implicit-port match ----
+    // ---- scheme-agnostic implicit-port match ----
 
     #[test]
     fn implicit_port_npmrc_matches_both_http_and_https() {
         // The user wrote `//host/:_authToken=X` with no explicit port.
-        // Stored as port=None — matches a request on either http or
-        // https (any port for that host). Pre-fix, this stored 443 and
-        // missed http requests.
+        // Stored as port=None — matches a request on either http or https
+        // (any port for that host).
         let content = "//npm.internal/:_authToken=AGNOSTIC\n";
         let cfg = NpmrcConfig::parse(content, "test", &no_env);
         let https_auth = cfg
@@ -2562,7 +2529,7 @@ mod tests {
             .expect("https should match");
         let http_auth = cfg
             .auth_for_url("http://npm.internal/foo")
-            .expect("http should match (Gemini Finding 2)");
+            .expect("http should match");
         match (https_auth, http_auth) {
             (RegistryAuth::Bearer { token: a, .. }, RegistryAuth::Bearer { token: b, .. }) => {
                 assert_eq!(a.expose_secret(), "AGNOSTIC");
@@ -2574,8 +2541,7 @@ mod tests {
 
     #[test]
     fn explicit_port_443_does_not_leak_to_http() {
-        // Defense for the Finding 2 fix: an explicit `:443` in the
-        // npmrc key means "this auth is for port 443 specifically",
+        // An explicit `:443` in the npmrc key means "this auth is for port 443 specifically",
         // so an http request (default port 80) must NOT pick it up.
         // This test exists to catch regressions where someone "fixes"
         // the implicit-port case by widening matching too aggressively.
@@ -2588,7 +2554,7 @@ mod tests {
         );
     }
 
-    // ---- Gemini Finding 3: source-label in finalize warnings ----
+    // ---- source-label in finalize warnings ----
 
     #[test]
     fn partial_credential_warning_cites_source() {
@@ -2737,7 +2703,7 @@ mod tests {
         }
     }
 
-    // ---- Walker tests (Phase 58 day-2) ----
+    // ---- Walker tests ----
 
     use std::fs;
     use std::path::PathBuf;
@@ -2838,10 +2804,9 @@ mod tests {
 
     #[test]
     fn walker_cross_layer_credential_merge_end_to_end() {
-        // Day-1.5 fix exercised through the walker: system layer sets
-        // _username, project layer sets _password, walker composes
-        // them via merge_over before finalize. Pre-fix: two partial
-        // warnings + zero auth. Post-fix: one Basic credential.
+        // System layer sets _username, project layer sets _password; walker
+        // composes them via merge_over before finalize — must produce one
+        // Basic credential with no partial-credential warnings.
         let system_dir = TempDir::new().unwrap();
         let proj_dir = TempDir::new().unwrap();
         write_npmrc(system_dir.path(), "//npm.internal/:_username=alice\n");
@@ -2926,12 +2891,9 @@ mod tests {
 
     #[test]
     fn walker_inherits_repo_root_npmrc_through_workspace_member() {
-        // Gemini day-2.5 Finding 2: monorepo layout. Workspace member
-        // `packages/app` has its OWN package.json but NO .npmrc. The
-        // workspace root has BOTH package.json and .npmrc. Running
-        // from `packages/app` must inherit the workspace-root .npmrc.
-        // Pre-fix: walker stopped at the first marker (app/), found
-        // no .npmrc there, returned None — repo-root .npmrc unreachable.
+        // Monorepo layout: workspace member `packages/app` has its own package.json
+        // but no .npmrc; workspace root has both. Running from `packages/app` must
+        // inherit the workspace-root .npmrc — walker must not stop at the first marker.
         let home = TempDir::new().unwrap();
         let repo = home.path().join("repo");
         let app = repo.join("packages").join("app");
@@ -2997,9 +2959,8 @@ mod tests {
 
     #[test]
     fn walker_rejects_directory_named_package_json_marker() {
-        // Gemini day-2.5 Finding 1: a directory named `package.json`
-        // must NOT qualify a directory as a project root, otherwise an
-        // attacker can `mkdir /tmp/package.json && touch /tmp/.npmrc`
+        // A directory named `package.json` must NOT qualify as a project-root
+        // marker — an attacker could `mkdir /tmp/package.json && touch /tmp/.npmrc`
         // to inject auth into any install run from /tmp/build/.
         let outer = TempDir::new().unwrap();
         let attacker_dir = outer.path().join("planted");
@@ -3015,8 +2976,8 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn walker_rejects_broken_symlink_named_package_json_marker() {
-        // Same Finding 1 class — a broken-symlink package.json must
-        // not qualify the dir as a project root.
+        // A broken-symlink package.json must not qualify the dir as a project root
+        // for the same reason as a directory marker: it's not a regular file.
         use std::os::unix::fs::symlink;
         let outer = TempDir::new().unwrap();
         let attacker_dir = outer.path().join("planted");
@@ -3052,8 +3013,8 @@ mod tests {
 
     #[test]
     fn discover_layer_paths_warns_on_directory_dot_npmrc() {
-        // Gemini Finding 2: project's .npmrc is a directory. Surface
-        // a warning; do NOT silently fall through to an ancestor.
+        // When the project's .npmrc is a directory, surface a warning;
+        // do NOT silently fall through to an ancestor.
         let proj = TempDir::new().unwrap();
         mark_as_project_root(proj.path());
         fs::create_dir(proj.path().join(".npmrc")).unwrap();
@@ -3076,10 +3037,9 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn discover_layer_paths_warns_on_broken_symlink() {
-        // Gemini Finding 2: a broken symlink must surface a warning,
-        // not silently fall through. Unix-only — Windows symlink
-        // semantics differ enough that we'd rather not maintain a
-        // parallel codepath for them in this test.
+        // A broken symlink must surface a warning, not silently fall through.
+        // Unix-only — Windows symlink semantics differ enough that a parallel
+        // codepath in this test isn't worth maintaining.
         use std::os::unix::fs::symlink;
         let proj = TempDir::new().unwrap();
         mark_as_project_root(proj.path());
