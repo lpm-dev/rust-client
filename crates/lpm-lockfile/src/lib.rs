@@ -22,24 +22,17 @@ use std::path::Path;
 pub use binary::{BINARY_LOCKFILE_NAME, BinaryLockfileReader};
 pub use source::{SafetyContext, Source, SourceParseError, SourceSafety, source_safety};
 
-/// Three-tuple package identity for cross-source collision avoidance
-/// (Phase 59.0 day-7, F1 finish-line).
+/// Three-tuple package identity for cross-source collision avoidance.
 ///
-/// The pre-Phase-59 install pipeline coordinated state on
-/// `(name, version)` keys (fetch locks, integrity map, fresh-URL
-/// writeback, root-link reconstruction, lockfile sort + lookup).
-/// That was correct under the registry-only invariant of "one
-/// registry per package name within a single graph". Once a
-/// `Source::Tarball` package can land in the same graph as a
-/// `Source::Registry` package with the same `(name, version)` —
-/// e.g. a forked tarball whose package.json claims an upstream
-/// name + version — the two-tuple key collapses identity and
-/// makes the install attach state to the wrong package.
-///
-/// Day-5.5 closed the most user-visible silent-substitution paths
-/// (cold-start existence check, store-path computation, link
-/// target). Day-7 closes the remaining bookkeeping sites flagged
-/// by the thorough audit's HIGH-2 follow-up.
+/// The legacy install pipeline coordinated state on `(name, version)`
+/// keys (fetch locks, integrity map, fresh-URL writeback, root-link
+/// reconstruction, lockfile sort + lookup). That was correct under
+/// the registry-only invariant of "one registry per package name
+/// within a single graph". Once a `Source::Tarball` package can land
+/// in the same graph as a `Source::Registry` package with the same
+/// `(name, version)` — e.g. a forked tarball whose package.json
+/// claims an upstream name + version — the two-tuple key collapses
+/// identity and makes the install attach state to the wrong package.
 ///
 /// `source_id` is [`Source::source_id`] for parsed sources, or
 /// the literal string `"unknown"` for malformed/missing sources
@@ -78,18 +71,17 @@ impl PackageKey {
 /// Current lockfile schema version.
 ///
 /// **Version history:**
-/// - **v1** (pre-R2.5): everything up through R2.4. May or may not
-///   contain `ambient-peer-installs` / per-package `peers` depending
-///   on whether the writer ran an R2.2-R2.4 build (which auto-
-///   installed peers but didn't persist either field) or an
-///   R2.5+ build. The `ambient-peer-installs` field defaults to
-///   empty when absent, which is INDISTINGUISHABLE from "auto-install
-///   was off and there were no ambient installs."
-/// - **v2** (R2.5+): explicit signal that the writer was R2.5-aware.
+/// - **v1**: everything up through the peer-unaware schema. May or may
+///   not contain `ambient-peer-installs` / per-package `peers`
+///   depending on when the lockfile was written. The
+///   `ambient-peer-installs` field defaults to empty when absent, which
+///   is INDISTINGUISHABLE from "auto-install was off and there were no
+///   ambient installs."
+/// - **v2**: explicit signal that the writer was peer-schema-aware.
 ///   `ambient-peer-installs` field is authoritative — empty means
 ///   "no ambient installs," NOT "field absent." Per-package `peers`
 ///   is also authoritative for v2 lockfiles, enabling deterministic
-///   v2 graph-key reproduction across cold-and-warm installs.
+///   graph-key reproduction across cold-and-warm installs.
 ///
 /// **Why this matters:** install.rs's lockfile fast path uses the
 /// version to decide whether the absence of `ambient-peer-installs`
@@ -109,21 +101,20 @@ pub struct Lockfile {
     /// Resolved packages, sorted by name for deterministic output.
     #[serde(default)]
     pub packages: Vec<LockedPackage>,
-    /// **Phase 40 P2** — root-level npm-alias edges preserved so warm
-    /// installs can match the original `node_modules/<local>/` layout
-    /// without re-resolving. Shape: `local_name → target_canonical_name`.
-    /// Empty when no root dep uses `npm:<target>@<range>` syntax;
-    /// skipped in serialized output when empty (backwards-compatible
-    /// with pre-P2 lockfiles).
+    /// Root-level npm-alias edges preserved so warm installs can match
+    /// the original `node_modules/<local>/` layout without re-resolving.
+    /// Shape: `local_name → target_canonical_name`. Empty when no root
+    /// dep uses `npm:<target>@<range>` syntax; skipped in serialized
+    /// output when empty (backwards-compatible with older lockfiles).
     #[serde(
         default,
         rename = "root-aliases",
         skip_serializing_if = "std::collections::BTreeMap::is_empty"
     )]
     pub root_aliases: std::collections::BTreeMap<String, String>,
-    /// **Phase 66 R2.5** — canonical names of packages the resolver
-    /// auto-installed at root scope to satisfy unmet `peerDependencies`
-    /// (eager peer auto-install, the bun-parity default since R2.2).
+    /// Canonical names of packages the resolver auto-installed at root
+    /// scope to satisfy unmet `peerDependencies` (eager peer
+    /// auto-install).
     /// Persisted so the lockfile fast path on warm installs reproduces
     /// the same top-level `node_modules/<peer>/` symlinks the
     /// fresh-resolve install produced.
@@ -174,25 +165,24 @@ pub struct LockedPackage {
     /// Direct dependencies of this package: `<local_name>@<version>`
     /// where `local_name` is what this package uses in its own
     /// `dependencies` map. For non-aliased deps the local name equals
-    /// the dep's canonical registry name; for Phase 40 P2 npm-alias
-    /// edges the local name diverges from the target and the target
-    /// is recorded in [`Self::alias_dependencies`] below.
+    /// the dep's canonical registry name; for npm-alias edges the
+    /// local name diverges from the target and the target is recorded
+    /// in [`Self::alias_dependencies`] below.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub dependencies: Vec<String>,
-    /// **Phase 40 P2** — npm-alias dep edges. Each entry is
-    /// `[local_name, target_canonical_name]`. The matching
-    /// `<local_name>@<version>` entry in `dependencies` keys the
-    /// resolved version; this map keys the alias TARGET for lookup
-    /// of the `.lpm/<target>@<version>/` store path. Empty and
-    /// skipped from serialization for the common non-aliased case —
-    /// keeps lockfiles of pre-P2 projects byte-identical.
+    /// Npm-alias dep edges. Each entry is `[local_name,
+    /// target_canonical_name]`. The matching `<local_name>@<version>`
+    /// entry in `dependencies` keys the resolved version; this map
+    /// keys the alias TARGET for lookup of the
+    /// `.lpm/<target>@<version>/` store path. Empty and skipped from
+    /// serialization for the common non-aliased case.
     #[serde(
         default,
         rename = "alias-dependencies",
         skip_serializing_if = "Vec::is_empty"
     )]
     pub alias_dependencies: Vec<[String; 2]>,
-    /// **Phase 66 R2.5** — resolved peer dependencies for this
+    /// Resolved peer dependencies for this
     /// package. Each entry is `<peer_name>@<resolved_version>` (same
     /// format as [`Self::dependencies`]) and represents one entry
     /// from the package's `peerDependencies` map intersected with the
@@ -213,29 +203,26 @@ pub struct LockedPackage {
     ///
     /// Sorted by peer name for deterministic lockfile output, then
     /// skipped from serialization for packages without peer
-    /// dependencies (the common case — keeps lockfiles of pre-R2.5
-    /// projects byte-identical).
+    /// dependencies (the common case — keeps older lockfiles
+    /// byte-identical).
     ///
     /// [`GraphKey`]: <internal v2 store identity type — see lpm-store crate>
     #[serde(default, rename = "peers", skip_serializing_if = "Vec::is_empty")]
     pub peers: Vec<String>,
-    /// **Phase 43** — tarball URL as returned by the registry at
-    /// resolve time (e.g.,
+    /// Tarball URL as returned by the registry at resolve time (e.g.,
     /// `https://registry.npmjs.org/lodash/-/lodash-4.17.21.tgz`).
     /// Populated by the writer from `InstallPackage.tarball_url`;
     /// consumed by `try_lockfile_fast_path` to skip the per-package
     /// metadata round-trip on warm installs (gated behind
     /// `evaluate_cached_url` for scheme/shape/origin safety).
-    /// `None` on old lockfiles written before Phase 43 — callers
-    /// fall back to on-demand lookup.
+    /// `None` on old lockfiles — callers fall back to on-demand lookup.
     ///
-    /// **Phase 59.0 (F4a) — disjointness with `Source::Tarball`:**
-    /// this field is a *dist-URL hint cache* valid only for
-    /// `Source::Registry` packages. For non-Registry sources
-    /// (`Source::Tarball`, `Source::Git`, etc.) the URL is part of
-    /// source identity (lives inside the source variant). Pairing
-    /// a non-Registry source with this hint is rejected by
-    /// [`Lockfile::from_toml`] — see
+    /// **Disjointness with `Source::Tarball`:** this field is a
+    /// *dist-URL hint cache* valid only for `Source::Registry`
+    /// packages. For non-Registry sources (`Source::Tarball`,
+    /// `Source::Git`, etc.) the URL is part of source identity (lives
+    /// inside the source variant). Pairing a non-Registry source with
+    /// this hint is rejected by [`Lockfile::from_toml`] — see
     /// [`LockedPackage::tarball_field_hint_is_consistent`] and
     /// [`LockfileError::InvalidTarballHint`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -243,8 +230,7 @@ pub struct LockedPackage {
 }
 
 impl LockedPackage {
-    /// Parse the [`Self::source`] string into a typed [`Source`]
-    /// (Phase 59.0 day-2, F1 cont.).
+    /// Parse the [`Self::source`] string into a typed [`Source`].
     ///
     /// Returns `None` when [`Self::source`] is `None`. Returns
     /// `Some(Err(_))` for malformed source strings — the legacy
@@ -257,8 +243,8 @@ impl LockedPackage {
         self.source.as_deref().map(Source::parse)
     }
 
-    /// **Phase 59.0 day-7 (F1 finish-line)** — three-tuple identity
-    /// for cross-source collision avoidance. See [`PackageKey`].
+    /// Three-tuple identity for cross-source collision avoidance.
+    /// See [`PackageKey`].
     ///
     /// The lockfile's bookkeeping (sort order, lookup, install
     /// pipeline coordination) keys on this triple to prevent a
@@ -272,8 +258,8 @@ impl LockedPackage {
         PackageKey::new(self.name.clone(), self.version.clone(), source_id)
     }
 
-    /// Whether the Phase 43 `tarball` field-hint is consistent with
-    /// the parsed source kind (Phase 59.0 day-2, F4a contract).
+    /// Whether the `tarball` field-hint is consistent with the parsed
+    /// source kind.
     ///
     /// The `tarball` field is a dist-URL hint populated when
     /// resolving a Registry package — it lets warm installs skip a
@@ -291,10 +277,9 @@ impl LockedPackage {
     /// Returns `false` only for the conflation case: a non-Registry
     /// source kind paired with a non-empty `tarball` hint.
     ///
-    /// Phase 59.0 day-2 ships this as a documented invariant; the
-    /// lockfile-load gate in day-3 integrates it into a hard reject
-    /// per OQ-4 (manifest-as-truth — invalid lockfile shapes drop
-    /// to error, not silent acceptance).
+    /// This is a documented invariant enforced at both writer and
+    /// reader: invalid lockfile shapes drop to error, not silent
+    /// acceptance (manifest-as-truth).
     pub fn tarball_field_hint_is_consistent(&self) -> bool {
         let Some(hint) = self.tarball.as_deref() else {
             return true;
@@ -311,30 +296,26 @@ impl LockedPackage {
 }
 
 /// Default resolver-name string baked into [`Lockfile::new`]. Matches
-/// the post-Phase-60 install default (greedy-fusion). Production write
-/// sites should pass an explicit name via [`Lockfile::new_with_resolver`]
-/// — this constant is the fallback for tests and library consumers that
+/// the current install default (greedy-fusion). Production write sites
+/// should pass an explicit name via [`Lockfile::new_with_resolver`] —
+/// this constant is the fallback for tests and library consumers that
 /// don't care which resolver "produced" the in-memory lockfile.
 pub const DEFAULT_RESOLVED_WITH: &str = "greedy-fusion";
 
 impl Lockfile {
-    /// Create a new empty lockfile, tagged with the post-Phase-60
-    /// default resolver name. Production install sites should call
+    /// Create a new empty lockfile, tagged with the default resolver
+    /// name. Production install sites should call
     /// [`Lockfile::new_with_resolver`] instead so the on-disk
     /// `resolved-with` field reflects which engine actually ran
-    /// (matters once `LPM_RESOLVER=pubgrub` or `LPM_GREEDY_FUSION=0`
-    /// flip the default off).
+    /// (matters with `LPM_RESOLVER=pubgrub` or `LPM_GREEDY_FUSION=0`).
     pub fn new() -> Self {
         Self::new_with_resolver(DEFAULT_RESOLVED_WITH)
     }
 
     /// Create a new empty lockfile that records `resolver` as the
-    /// engine that produced it. Pre-Phase-60 the field was hardcoded
-    /// to "pubgrub" everywhere it was written; once greedy-fusion
-    /// became the install default in v0.28.0 every default `lpm
-    /// install` started writing a lockfile that lied about its
-    /// origin. The dispatch at `install.rs` now hands the actually-
-    /// taken arm name through here.
+    /// engine that produced it. The dispatch at `install.rs` hands
+    /// the actually-taken resolver arm name through here so the
+    /// on-disk field reflects which engine ran.
     ///
     /// `resolver` is purely informational. Reading it has never been
     /// part of the lockfile contract — see CLAUDE.md "DON'T add code
@@ -347,7 +328,7 @@ impl Lockfile {
             },
             packages: Vec::new(),
             root_aliases: std::collections::BTreeMap::new(),
-            // R2.5 — populated by `install.rs` from
+            // Populated by `install.rs` from
             // `ResolveResult.ambient_peer_installs` on cold-resolve
             // lockfile writes; empty on warm/lockfile-fast-path
             // returns from `Lockfile::read_fast` until the writer
@@ -357,11 +338,9 @@ impl Lockfile {
     }
 
     /// Add a resolved package. Maintains sorted order by
-    /// `(name, version, source_id)` triple — Phase 59.0 day-7
-    /// (F1 finish-line) extension over the legacy name-only sort.
-    /// Two packages with the same name but different
-    /// `(version, source_id)` no longer race for the same slot,
-    /// which closes the cross-source collision the audit flagged.
+    /// `(name, version, source_id)` triple. Two packages with the
+    /// same name but different `(version, source_id)` no longer race
+    /// for the same slot, preventing cross-source collision.
     pub fn add_package(&mut self, pkg: LockedPackage) {
         let key = pkg.package_key();
         let pos = self
@@ -380,14 +359,13 @@ impl Lockfile {
 
     /// Serialize to TOML string.
     ///
-    /// **Phase 59.0 day-4.5 (F4a writer guard):** refuses to
-    /// serialize a Lockfile whose package shape would fail the
-    /// reader-side gate. Concretely, every package's
+    /// **Writer guard:** refuses to serialize a Lockfile whose package
+    /// shape would fail the reader-side gate. Every package's
     /// `tarball_field_hint_is_consistent()` must hold — pairing a
     /// non-Registry source with a `tarball` field-hint is rejected
     /// here so the conflation never reaches disk. Symmetric with
-    /// [`Lockfile::from_toml`]'s reader gate; together they make F4a
-    /// a bidirectional invariant rather than parser-only.
+    /// [`Lockfile::from_toml`]'s reader gate; together they make a
+    /// bidirectional invariant rather than parser-only.
     pub fn to_toml(&self) -> Result<String, LockfileError> {
         for pkg in &self.packages {
             if !pkg.tarball_field_hint_is_consistent() {
@@ -411,9 +389,9 @@ impl Lockfile {
             });
         }
 
-        // Phase 43 — reject empty-string optional fields at the TOML
-        // layer, matching the binary writer's rejection. Without this,
-        // a hand-edited or malformed `tarball = ""` / `source = ""` /
+        // Reject empty-string optional fields at the TOML layer,
+        // matching the binary writer's rejection. Without this, a
+        // hand-edited or malformed `tarball = ""` / `source = ""` /
         // `integrity = ""` would parse cleanly here and only fail
         // later in `write_all` when the binary writer's
         // `insert_optional` helper fires. Failing loud at the parse
@@ -450,10 +428,10 @@ impl Lockfile {
                 )));
             }
 
-            // Phase 59.0 day-3 (F4a wire-in) — `tarball` field-hint
-            // is valid only for Registry sources. Reject non-Registry
-            // shapes paired with a hint at the load boundary so the
-            // conflation never propagates into the install path.
+            // `tarball` field-hint is valid only for Registry sources.
+            // Reject non-Registry shapes paired with a hint at the
+            // load boundary so the conflation never propagates into
+            // the install path.
             if !pkg.tarball_field_hint_is_consistent() {
                 return Err(LockfileError::InvalidTarballHint {
                     package: pkg.name.clone(),
@@ -494,15 +472,14 @@ impl Lockfile {
     /// Write both TOML and binary lockfiles atomically.
     /// The binary file is written alongside the TOML file as `lpm.lockb`.
     ///
-    /// Phase 40 P2 — the v1 binary format has no section for
-    /// npm-alias metadata, so we gate the binary write on
-    /// [`binary::binary_format_supports`]. When the lockfile declares
-    /// any alias (root or transitive), the binary file is skipped —
-    /// and any stale binary file from a prior non-aliased install is
-    /// removed so `read_fast` doesn't silently pick it over the
-    /// authoritative TOML. A v2 binary format with an alias section
-    /// would remove the skip; until then, aliased projects take the
-    /// ~10ms TOML parse cost on warm install.
+    /// The v1 binary format has no section for npm-alias metadata,
+    /// so we gate the binary write on [`binary::binary_format_supports`].
+    /// When the lockfile declares any alias (root or transitive), the
+    /// binary file is skipped — and any stale binary file from a prior
+    /// non-aliased install is removed so `read_fast` doesn't silently
+    /// pick it over the authoritative TOML. Aliased projects take the
+    /// ~10ms TOML parse cost on warm install until binary v2 gains an
+    /// alias section.
     pub fn write_all(&self, toml_path: &Path) -> Result<(), LockfileError> {
         self.write_to_file(toml_path)?;
         let binary_path = toml_path.with_extension("lockb");
@@ -511,7 +488,7 @@ impl Lockfile {
         } else if binary_path.exists() {
             let _ = std::fs::remove_file(&binary_path);
             tracing::debug!(
-                "Phase 40 P2: removed stale binary lockfile ({}); project has npm-alias metadata not expressible in v1 binary format",
+                "removed stale binary lockfile ({}): project has npm-alias metadata not expressible in v1 binary format",
                 binary_path.display()
             );
         }
@@ -540,24 +517,22 @@ impl Lockfile {
                     Err(LockfileError::UnsupportedVersion { found, .. })
                         if found < binary::BINARY_VERSION =>
                     {
-                        // Phase 43 — stale binary from an OLDER client.
-                        // Best-effort delete so read-only commands
-                        // (`lpm outdated`, `lpm upgrade`) don't pay the
-                        // TOML-fallback cost on every invocation. Without
-                        // this, a project with a pre-Phase-43 `lpm.lockb`
-                        // would repeatedly open+reject the stale binary
-                        // until an install fires P43-2's writeback.
+                        // Stale binary from an OLDER client. Best-effort
+                        // delete so read-only commands (`lpm outdated`,
+                        // `lpm upgrade`) don't pay the TOML-fallback cost
+                        // on every invocation. Without this, old `lpm.lockb`
+                        // files would repeatedly open+reject until an
+                        // install fires its writeback.
                         //
-                        // We restrict deletion to `found < BINARY_VERSION`
-                        // (2nd-round GPT audit): a FUTURE-version binary
-                        // (found > BINARY_VERSION) means the user likely
-                        // has a newer LPM client on this machine that
-                        // wrote it. Deleting would force regeneration on
-                        // the next new-client install, churning the
-                        // cache. The newer format is unreadable to us;
-                        // falling through to TOML is correct either way,
-                        // but preserving the file keeps the newer
-                        // client's fast path intact.
+                        // Restricted to `found < BINARY_VERSION`: a
+                        // FUTURE-version binary (found > BINARY_VERSION)
+                        // means the user likely has a newer LPM client on
+                        // this machine that wrote it. Deleting would force
+                        // regeneration on the next new-client install,
+                        // churning the cache. The newer format is
+                        // unreadable to us; falling through to TOML is
+                        // correct either way, but preserving the file
+                        // keeps the newer client's fast path intact.
                         //
                         // Swallow any delete failure (read-only FS,
                         // permission denied) — correctness still holds
@@ -586,12 +561,11 @@ impl Lockfile {
     /// triple sort that's the lowest-source_id entry for the
     /// lowest-version with this name.
     ///
-    /// **Phase 59.0 day-7 (F1 finish-line):** prefer
-    /// [`Self::find_package_by_key`] for new code. This name-only
-    /// method is retained for back-compat with pre-Phase-59
-    /// callers (Phase 40 P2 alias resolution etc.) where the name
-    /// uniquely identifies a package; non-Registry source kinds
-    /// landing in the same lockfile may shadow such lookups.
+    /// Prefer [`Self::find_package_by_key`] for new code. This
+    /// name-only method is retained for back-compat with callers
+    /// (alias resolution etc.) where the name uniquely identifies a
+    /// package; non-Registry source kinds landing in the same lockfile
+    /// may shadow such lookups.
     pub fn find_package(&self, name: &str) -> Option<&LockedPackage> {
         self.packages
             .binary_search_by(|p| p.name.as_str().cmp(name))
@@ -599,8 +573,8 @@ impl Lockfile {
             .map(|idx| &self.packages[idx])
     }
 
-    /// **Phase 59.0 day-7 (F1 finish-line)** — source-aware lookup
-    /// keyed by the full `(name, version, source_id)` triple.
+    /// Source-aware lookup keyed by the full `(name, version,
+    /// source_id)` triple.
     /// Returns `Some(&LockedPackage)` only when the exact key
     /// matches; under cross-source collision (registry +
     /// tarball-URL with same `name@version`), returns the
@@ -698,22 +672,21 @@ pub enum LockfileError {
     #[error("IO error: {0}")]
     Io(String),
 
-    /// **Phase 59.0 day-3 (F4a wire-in)** — a non-Registry source
-    /// kind is paired with a `tarball` field-hint. The Phase 43
-    /// `tarball` field is a dist-URL cache valid only for Registry
-    /// sources; for `Source::Tarball`, `Source::Git`, etc. the URL
-    /// is part of source identity (lives inside the `source`
-    /// variant). The two slots must stay disjoint — conflation
-    /// would let `lpm update` silently swap a tarball-URL dep for
-    /// a registry package with the same dist URL.
+    /// A non-Registry source kind is paired with a `tarball`
+    /// field-hint. The `tarball` field is a dist-URL cache valid only
+    /// for Registry sources; for `Source::Tarball`, `Source::Git`,
+    /// etc. the URL is part of source identity (lives inside the
+    /// `source` variant). The two slots must stay disjoint —
+    /// conflation would let `lpm update` silently swap a tarball-URL
+    /// dep for a registry package with the same dist URL.
     ///
     /// Detected by [`LockedPackage::tarball_field_hint_is_consistent`]
-    /// at `from_toml` time — invalid lockfile shapes hard-reject
-    /// at the load boundary per OQ-4 (manifest-as-truth: invalid
-    /// shapes should never propagate).
+    /// at `from_toml` time — invalid lockfile shapes hard-reject at
+    /// the load boundary (manifest-as-truth: invalid shapes should
+    /// never propagate).
     #[error(
         "package {package:?} has a `tarball` field-hint paired with a non-Registry source — \
-         the hint is valid only for Registry sources (Phase 59.0 F4a)"
+         the hint is valid only for Registry sources"
     )]
     InvalidTarballHint { package: String },
 }
@@ -761,9 +734,8 @@ mod tests {
         let toml_str = lf.to_toml().unwrap();
 
         assert!(toml_str.contains("[metadata]"));
-        // R2.5 bumped LOCKFILE_VERSION to 2; the assertion follows
-        // the constant rather than pinning a literal so a future
-        // bump only updates `LOCKFILE_VERSION` in one place.
+        // Assert against the constant so a future version bump only
+        // requires one change.
         assert!(toml_str.contains(&format!("lockfile-version = {}", LOCKFILE_VERSION)));
         assert!(toml_str.contains("[[packages]]"));
         assert!(toml_str.contains("@lpm.dev/neo.highlight"));
@@ -864,14 +836,14 @@ mod tests {
     #[test]
     fn phase43_tarball_absent_keeps_old_lockfiles_byte_identical() {
         // `#[serde(skip_serializing_if = "Option::is_none")]` must
-        // keep pre-Phase-43 lockfiles byte-stable when no package has
-        // a tarball URL. This is the invariant that makes P43-0 a
-        // no-op for existing projects until they re-run `lpm install`.
+        // keep lockfiles byte-stable when no package has a tarball
+        // URL — existing projects must be unaffected until they
+        // re-run `lpm install`.
         let lf = sample_lockfile();
         let toml_str = lf.to_toml().unwrap();
         assert!(
             !toml_str.contains("tarball"),
-            "pre-Phase-43 lockfile must not emit a `tarball` field when all values are None, got:\n{toml_str}"
+            "lockfile with no tarball URLs must not emit a `tarball` field, got:\n{toml_str}"
         );
 
         let parsed = Lockfile::from_toml(&toml_str).unwrap();
@@ -923,11 +895,10 @@ mod tests {
 
     #[test]
     fn phase43_from_toml_rejects_empty_optional_strings() {
-        // Follow-up to the 2026-04-18 GPT audit (finding #3): the
-        // binary writer rejects empty optional strings at
-        // serialization time, but `from_toml` previously accepted
-        // them at parse time, producing an asymmetric late failure.
-        // Reject at the parse boundary for all three fields.
+        // The binary writer rejects empty optional strings at
+        // serialization time; `from_toml` must also reject at parse
+        // time to avoid asymmetric late failure. Reject at the parse
+        // boundary for all three fields.
         for (field, snippet) in [
             ("tarball", "tarball = \"\""),
             ("source", "source = \"\""),
@@ -957,8 +928,8 @@ version = "1.0.0"
 
     #[test]
     fn phase43_old_lockfile_without_tarball_field_parses() {
-        // Forward-compat: old lockfiles written before Phase 43 must
-        // parse cleanly under the new schema (tarball = None).
+        // Forward-compat: old lockfiles without a tarball field must
+        // parse cleanly (tarball = None).
         let toml_str = r#"
 [metadata]
 lockfile-version = 1
@@ -1133,8 +1104,8 @@ version = "1.0.0"
         assert!(!is_safe_source("file:///etc/passwd"));
     }
 
-    /// Phase 40 P2 — npm-alias metadata round-trips through the TOML
-    /// serializer. Both `root-aliases` (top-level) and per-package
+    /// npm-alias metadata round-trips through the TOML serializer.
+    /// Both `root-aliases` (top-level) and per-package
     /// `alias-dependencies` must survive `to_toml` → `from_toml` with
     /// byte-identical shape, so warm installs reconstruct the original
     /// `node_modules/<local>/` layout.
@@ -1181,12 +1152,12 @@ version = "1.0.0"
         );
     }
 
-    /// Phase 40 P2 — the v1 binary format cannot express alias
-    /// metadata; `binary::to_binary` rejects such lockfiles so callers
-    /// fall back to TOML-only. `write_all` goes further and
-    /// proactively removes any stale binary file from a prior
-    /// non-aliased install, so `read_fast` never silently picks a
-    /// binary that disagrees with the authoritative TOML.
+    /// The v1 binary format cannot express alias metadata;
+    /// `binary::to_binary` rejects such lockfiles so callers fall
+    /// back to TOML-only. `write_all` goes further and proactively
+    /// removes any stale binary file from a prior non-aliased install,
+    /// so `read_fast` never silently picks a binary that disagrees
+    /// with the authoritative TOML.
     #[test]
     fn write_all_skips_binary_when_root_aliases_present() {
         let dir = tempfile::tempdir().unwrap();
@@ -1321,11 +1292,11 @@ version = "1.0.0"
     #[test]
     fn phase43_read_fast_falls_back_to_toml_when_binary_is_v1() {
         // Client upgrade scenario: user has a v1 `lpm.lockb` on disk
-        // (written by a pre-Phase-43 client) plus the v2-compatible
-        // TOML lockfile. The new v2 reader must reject v1 and
-        // read_fast must fall through to TOML cleanly — otherwise
-        // the client would error out every install until something
-        // else triggered a lockfile rewrite.
+        // (written by an old client) plus the v2-compatible TOML
+        // lockfile. The v2 reader must reject v1 and read_fast must
+        // fall through to TOML cleanly — otherwise the client would
+        // error out every install until something else triggered a
+        // lockfile rewrite.
         let dir = tempfile::tempdir().unwrap();
         let toml_path = dir.path().join("lpm.lock");
         let binary_path = dir.path().join("lpm.lockb");
@@ -1363,11 +1334,10 @@ version = "1.0.0"
 
     #[test]
     fn phase43_read_fast_preserves_binary_on_future_version() {
-        // Second-round GPT audit open question: an `UnsupportedVersion`
-        // with `found > BINARY_VERSION` (a FUTURE binary format the
-        // user's newer LPM client wrote) must NOT be deleted — the
-        // newer client's fast path should stay intact. Deletion is
-        // scoped to `found < BINARY_VERSION` only.
+        // A future binary format (found > BINARY_VERSION, written by
+        // a newer LPM client) must NOT be deleted — the newer
+        // client's fast path should stay intact. Deletion is scoped
+        // to `found < BINARY_VERSION` only.
         let dir = tempfile::tempdir().unwrap();
         let toml_path = dir.path().join("lpm.lock");
         let binary_path = dir.path().join("lpm.lockb");
@@ -1461,7 +1431,7 @@ version = "1.0.0"
         assert_eq!(result, lf);
     }
 
-    // ── Phase 59.0 day-2: source_kind() typed accessor ──────────────────────
+    // ── source_kind() typed accessor ─────────────────────────────────────────
 
     fn pkg_with_source(name: &str, source: Option<&str>) -> LockedPackage {
         LockedPackage {
@@ -1549,7 +1519,7 @@ version = "1.0.0"
         ));
     }
 
-    // ── Phase 59.0 day-2 (F4a): tarball field-hint disjointness ─────────────
+    // ── tarball field-hint disjointness ──────────────────────────────────────
 
     fn pkg_with_source_and_tarball(source: Option<&str>, tarball: Option<&str>) -> LockedPackage {
         LockedPackage {
@@ -1581,7 +1551,7 @@ version = "1.0.0"
 
     #[test]
     fn tarball_hint_consistent_when_registry_source() {
-        // Registry + dist-URL hint is the *intended* shape post-Phase 43.
+        // Registry + dist-URL hint is the intended shape.
         let pkg = pkg_with_source_and_tarball(
             Some("registry+https://registry.npmjs.org"),
             Some("https://registry.npmjs.org/foo/-/foo-1.0.0.tgz"),
@@ -1591,7 +1561,7 @@ version = "1.0.0"
 
     #[test]
     fn tarball_hint_inconsistent_when_paired_with_tarball_source() {
-        // The conflation case F4a guards against. `Source::Tarball`'s
+        // The conflation case to guard against: `Source::Tarball`'s
         // URL is identity; a sibling `tarball` hint slot is ill-formed.
         let pkg = pkg_with_source_and_tarball(
             Some("tarball+https://e.com/foo.tgz"),
@@ -1674,13 +1644,13 @@ version = "1.0.0"
         }
     }
 
-    // ── Phase 59.1 day-7 (F16): non-registry source round-trip coverage ─────
+    // ── Non-registry source round-trip coverage ───────────────────────────────
 
     #[test]
     fn directory_source_round_trips_through_toml() {
         // `Source::Directory { path }` — file: directory dep.
         // Wire-format `directory+<rel-path>` survives serialize +
-        // parse; F4a disjointness invariant holds (no tarball hint).
+        // parse; disjointness invariant holds (no tarball hint).
         let mut lf = Lockfile::new();
         lf.add_package(pkg_with_source_and_tarball(
             Some("directory+./packages/foo"),
@@ -1722,10 +1692,9 @@ version = "1.0.0"
 
     #[test]
     fn tarball_local_source_round_trips_through_toml_with_sha256_integrity() {
-        // `Source::Tarball { url: "file:..." }` — Phase 59.1 F6
-        // local-file tarball. The wire format reuses `tarball+` for
-        // both remote and local; the URL prefix is what
-        // disambiguates downstream. Integrity is sha256 (computed
+        // `Source::Tarball { url: "file:..." }` — local-file tarball.
+        // The wire format reuses `tarball+` for both remote and local;
+        // the URL prefix is what disambiguates downstream. Integrity is sha256 (computed
         // from the bytes at install time), distinct from the sha512
         // SRI typically used for remote registry tarballs.
         let mut lf = Lockfile::new();
@@ -1742,7 +1711,7 @@ version = "1.0.0"
         let toml = lf.to_toml().expect("serialize");
         let parsed = Lockfile::from_toml(&toml).expect("parse");
         assert_eq!(parsed, lf);
-        // F4a: tarball field-hint stays None for non-Registry sources.
+        // tarball field-hint stays None for non-Registry sources.
         assert!(parsed.packages[0].tarball.is_none());
         assert!(parsed.packages[0].tarball_field_hint_is_consistent());
         // Integrity preserved exactly.
@@ -1832,10 +1801,10 @@ version = "1.0.0"
                 pkg.name,
                 pkg.source_kind(),
             );
-            // F4a disjointness holds across all sources.
+            // Disjointness invariant holds across all sources.
             assert!(
                 pkg.tarball_field_hint_is_consistent(),
-                "F4a violation for {}: {:?}",
+                "tarball-hint disjointness violation for {}: {:?}",
                 pkg.name,
                 pkg,
             );
@@ -1845,11 +1814,10 @@ version = "1.0.0"
 
     #[test]
     fn from_toml_rejects_directory_source_with_tarball_hint() {
-        // F4a wire-in: directory+ source + tarball field-hint is a
-        // hard reject at lockfile-load time. The hint is registry-
-        // specific (Phase 43 dist-URL cache); for non-Registry
-        // sources, conflation could let `lpm update` silently swap
-        // the dep.
+        // directory+ source + tarball field-hint is a hard reject at
+        // lockfile-load time. The hint is registry-specific (dist-URL
+        // cache); for non-Registry sources, conflation could let
+        // `lpm update` silently swap the dep.
         let toml = lockfile_with_bad_pair(
             "foo",
             "directory+./packages/foo",
@@ -1878,11 +1846,11 @@ version = "1.0.0"
         }
     }
 
-    // ── Phase 59.0 day-3 (F4a wire-in): lockfile-load hard reject ───────────
+    // ── Lockfile-load hard reject ─────────────────────────────────────────────
 
     /// Hand-craft a conflated lockfile TOML string. We can't go
-    /// through `to_toml` anymore — the day-4.5 writer guard
-    /// (F4a wire-in, write side) refuses to serialize this shape.
+    /// through `to_toml` anymore — the writer guard refuses to
+    /// serialize this shape.
     /// Tests that exercise the *reader* gate must produce the bytes
     /// directly, simulating a corrupt or hand-edited `lpm.lock`.
     fn lockfile_with_bad_pair(name: &str, source: &str, tarball: &str) -> String {
@@ -1950,8 +1918,8 @@ version = "1.0.0"
 
     #[test]
     fn from_toml_accepts_registry_source_with_hint() {
-        // The intended Phase 43 shape — registry source plus dist-URL
-        // hint — must still parse cleanly post-gate.
+        // The intended shape — registry source plus dist-URL hint —
+        // must still parse cleanly through the gate.
         let mut lf = Lockfile::new();
         lf.add_package(pkg_with_source_and_tarball(
             Some("registry+https://registry.npmjs.org"),
@@ -1963,8 +1931,8 @@ version = "1.0.0"
 
     #[test]
     fn from_toml_accepts_existing_lockfile_without_hint() {
-        // Regression for legacy lockfiles that pre-date the Phase 43
-        // hint — nothing here changed at the load boundary.
+        // Backward-compat: old lockfiles without a tarball hint must
+        // still parse cleanly.
         let lf = sample_lockfile();
         let toml = lf.to_toml().expect("serialize");
         let parsed = Lockfile::from_toml(&toml).expect("legacy lockfile must still parse");
@@ -1975,10 +1943,10 @@ version = "1.0.0"
     fn from_toml_gate_runs_per_package_and_names_first_offender() {
         // Two-package hand-crafted lockfile (writer guard prevents
         // round-tripping bad shapes; we simulate corruption directly):
-        // first package is the legitimate Phase 43 shape (Registry +
-        // hint), second has the conflation. Gate must fire on the
-        // second and name it correctly — not silently skip after
-        // seeing a valid first.
+        // first package is the legitimate shape (Registry + hint),
+        // second has the conflation. Gate must fire on the second and
+        // name it correctly — not silently skip after seeing a valid
+        // first.
         let toml = "[metadata]\n\
              lockfile-version = 1\n\
              resolved-with = \"pubgrub\"\n\
@@ -2002,7 +1970,7 @@ version = "1.0.0"
         }
     }
 
-    // ── Phase 59.0 day-4.5: F4a writer guard (post-audit) ───────────────────
+    // ── Writer guard ─────────────────────────────────────────────────────────
 
     #[test]
     fn to_toml_rejects_tarball_source_with_hint_conflation() {
@@ -2060,8 +2028,8 @@ version = "1.0.0"
 
     #[test]
     fn to_toml_accepts_registry_source_with_hint() {
-        // Phase 43 shape — Registry + dist-URL hint — must continue
-        // to serialize cleanly through the new guard.
+        // Registry + dist-URL hint must continue to serialize cleanly
+        // through the guard.
         let mut lf = Lockfile::new();
         lf.add_package(pkg_with_source_and_tarball(
             Some("registry+https://registry.npmjs.org"),
@@ -2143,7 +2111,7 @@ version = "1.0.0"
         );
     }
 
-    // ── Phase 59.0 day-7: cross-source identity (PackageKey) ────────────────
+    // ── Cross-source identity (PackageKey) ───────────────────────────────────
 
     #[test]
     fn package_key_distinguishes_cross_source_same_name_version() {
@@ -2292,11 +2260,11 @@ version = "1.0.0"
         assert_eq!(by_tar.integrity.as_deref(), Some("sha512-BBBBBBBBBB=="));
     }
 
-    // ── R2.5 — peers + ambient_peer_installs round-trip ──────────
+    // ── Peers + ambient_peer_installs round-trip ──────────────────
     //
-    // The lockfile schema acquired two new fields in R2.5:
+    // The lockfile schema has two peer-related fields:
     //   - `Lockfile.ambient_peer_installs` (canonical names of
-    //     auto-installed peers from R2.2's resolver-side synthesis).
+    //     auto-installed peers from the resolver).
     //   - `LockedPackage.peers` (per-package peer pinning: each
     //     entry is `<peer_name>@<version>`).
     //
@@ -2307,9 +2275,9 @@ version = "1.0.0"
     // peer-divergent link-entry isolation.
     //
     // These tests pin: (1) round-trip preservation through TOML
-    // serialization, (2) backward-compat with pre-R2.5 lockfiles
-    // that have neither field, (3) binary-fast-path fallback when
-    // either field is non-empty.
+    // serialization, (2) backward-compat with old lockfiles that
+    // have neither field, (3) binary-fast-path fallback when either
+    // field is non-empty.
 
     #[test]
     fn r25_lockfile_ambient_peers_round_trip_through_toml() {
@@ -2341,9 +2309,8 @@ version = "1.0.0"
     #[test]
     fn r25_lockfile_ambient_peers_empty_skipped_in_serialization() {
         // Backward-compat: a lockfile with NO ambient peers must
-        // serialize WITHOUT the `ambient-peer-installs` field. This
-        // keeps lockfiles of pre-R2.5 / non-auto-install projects
-        // byte-identical to what they were before R2.5.
+        // serialize WITHOUT the `ambient-peer-installs` field, keeping
+        // older lockfiles byte-identical.
         let lf = Lockfile::new();
         assert!(lf.ambient_peer_installs.is_empty());
 
@@ -2388,8 +2355,8 @@ version = "1.0.0"
     #[test]
     fn r25_locked_package_peers_empty_skipped_in_serialization() {
         // Backward-compat: a package WITHOUT peers must serialize
-        // WITHOUT the `peers = [...]` line. Keeps non-peer-declaring
-        // packages byte-identical pre/post-R2.5.
+        // WITHOUT the `peers = [...]` line, keeping older lockfiles
+        // byte-identical.
         let mut lf = Lockfile::new();
         lf.add_package(LockedPackage {
             name: "lodash".to_string(),
@@ -2411,10 +2378,9 @@ version = "1.0.0"
 
     #[test]
     fn r25_pre_r25_lockfile_parses_with_default_empty_fields() {
-        // A lockfile written before R2.5 has no `ambient-peer-installs`
-        // top-level field and no `peers = [...]` per-package field.
-        // serde defaults must populate both as empty Vec so old
-        // lockfiles parse cleanly under the new struct shape.
+        // A lockfile without `ambient-peer-installs` or `peers` fields
+        // must parse cleanly — serde defaults populate both as empty
+        // Vec.
         let pre_r25_toml = r#"
 [metadata]
 lockfile-version = 1
@@ -2427,7 +2393,7 @@ source = "registry+https://registry.npmjs.org"
 integrity = "sha512-pre-r25"
 dependencies = []
 "#;
-        let lf = Lockfile::from_toml(pre_r25_toml).expect("pre-R2.5 lockfile must parse");
+        let lf = Lockfile::from_toml(pre_r25_toml).expect("legacy lockfile must parse");
         assert!(lf.ambient_peer_installs.is_empty());
         assert_eq!(lf.packages.len(), 1);
         assert!(lf.packages[0].peers.is_empty());
@@ -2436,8 +2402,8 @@ dependencies = []
     #[test]
     fn r25_binary_format_falls_back_when_ambient_peers_present() {
         // The binary mmap format has fixed entry slots with no room
-        // for R2.5 metadata. `binary_format_supports` must return
-        // false when the lockfile carries ANY R2.5 state, so the
+        // for peer metadata. `binary_format_supports` must return
+        // false when the lockfile carries any peer state, so the
         // writer skips the binary path and the warm-install reader
         // falls back to TOML — preserving the auto-install state
         // that the binary roundtrip would silently drop.
@@ -2452,7 +2418,7 @@ dependencies = []
             peers: vec![],
             tarball: None,
         });
-        // Without R2.5 fields → binary format OK.
+        // Without peer metadata → binary format OK.
         assert!(crate::binary::binary_format_supports(&lf));
 
         // Now add an ambient install → binary format must reject.

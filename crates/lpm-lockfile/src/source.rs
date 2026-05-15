@@ -1,10 +1,10 @@
-//! Source discriminator for non-registry dependency sources (Phase 59.0).
+//! Source discriminator for non-registry dependency sources.
 //!
-//! Today's lockfile encodes source as a flat `Option<String>` on
+//! The lockfile encodes source as a flat `Option<String>` on
 //! [`crate::LockedPackage`] — e.g. `"registry+https://registry.npmjs.org"`.
-//! Phase 59.0 keeps the wire format flat (one string per package
-//! entry) but introduces a typed enum for parsed access. [`Source::parse`]
-//! and the `Display` impl are the only conversion boundaries.
+//! The wire format is flat (one string per package entry) but a typed
+//! enum provides parsed access. [`Source::parse`] and the `Display`
+//! impl are the only conversion boundaries.
 //!
 //! ## Wire format
 //!
@@ -20,11 +20,10 @@
 //! Each non-Registry variant carries only "where it came from".
 //! Sibling fields on [`crate::LockedPackage`] hold:
 //! - `integrity` — SRI hash (relevant for Registry + Tarball)
-//! - `tarball` — Phase 43 dist-URL field-hint, valid only when the
-//!   source kind is Registry. Phase 59.0 keeps this distinct from
-//!   `Source::Tarball`; conflation would let `lpm update` silently
-//!   swap a tarball-URL dep for a registry package with the same
-//!   dist URL.
+//! - `tarball` — dist-URL field-hint, valid only when the source kind
+//!   is Registry. Kept distinct from `Source::Tarball`; conflation
+//!   would let `lpm update` silently swap a tarball-URL dep for a
+//!   registry package with the same dist URL.
 //!
 //! Git's resolved commit SHA and the user-written refspec live as
 //! sibling fields on the package entry too — not inside the `Git`
@@ -42,8 +41,8 @@ pub enum Source {
     Registry { url: String },
     /// Remote HTTPS tarball or local file: tarball. The URL/path is
     /// the **identity** — distinct from the per-entry `tarball`
-    /// field-hint (Phase 43), which is a dist-URL cache valid only
-    /// for `Source::Registry`.
+    /// field-hint, which is a dist-URL cache valid only for
+    /// `Source::Registry`.
     Tarball { url: String },
     /// `file:` directory dep. Path is relative to the lockfile's
     /// directory; resolved at install time.
@@ -70,7 +69,7 @@ pub enum SourceParseError {
 }
 
 impl Source {
-    /// Short stable identifier for this source (Phase 59.0).
+    /// Short stable identifier for this source.
     ///
     /// Used to disambiguate two packages with the same `(name,
     /// version)` that come from different sources — needed in
@@ -85,15 +84,13 @@ impl Source {
     /// - `Source::Link`      → `"l-{16hex}"`
     /// - `Source::Git`       → `"g-{16hex}"`
     ///
-    /// Day-3 used a constant `"npm"` sentinel for Registry on the
-    /// assumption that npm semantics enforce one registry per
-    /// package name within a single graph. Day-4.5 audit (light
-    /// review) flagged real-world cases where that breaks:
-    /// private-mirror-with-overrides, same `name@version` resolved
-    /// from npm.org vs Verdaccio, mixed-scope monorepos with
-    /// per-subtree `.npmrc`, lockfile portability across teams on
-    /// different registry origins. Including the URL hash makes
-    /// `source_id` lossless across all of these.
+    /// A constant `"npm"` sentinel for Registry was considered, but
+    /// breaks with private-mirror-with-overrides, the same
+    /// `name@version` resolved from npm.org vs Verdaccio,
+    /// mixed-scope monorepos with per-subtree `.npmrc`, and lockfile
+    /// portability across teams on different registry origins.
+    /// Including the URL hash makes `source_id` lossless across all
+    /// of these.
     ///
     /// 16 hex chars (= 64 bits) is well below the birthday bound
     /// for any realistic graph size and keeps the suffix short
@@ -188,7 +185,7 @@ impl fmt::Display for Source {
     }
 }
 
-// ── Safety policy (Phase 59.0 day-2, F3) ────────────────────────────────────
+// ── Safety policy ────────────────────────────────────────────────────────────
 
 /// Per-scheme safety verdict for a parsed [`Source`].
 ///
@@ -197,14 +194,14 @@ impl fmt::Display for Source {
 /// existing call sites and produces the same answer for Registry
 /// sources; consumers migrate site-by-site.
 ///
-/// Per Phase 59 OQ-4: the threat model `is_safe_source` defends
-/// against is "tampered lockfile redirects fetches" — that's
-/// addressed by the manifest-as-truth invariant (every lockfile
-/// entry traces back to a manifest declaration), enforced
-/// elsewhere. `SourceSafety` is the per-scheme policy layer that
-/// rejects schemes we never want to fetch from (`data:`,
-/// `javascript:`, `ftp:`) and warns on weaker-but-not-rejected
-/// schemes (`git+ssh://`, `git+git://`, plain `git://`).
+/// The threat model `is_safe_source` defends against is "tampered
+/// lockfile redirects fetches" — addressed by the manifest-as-truth
+/// invariant (every lockfile entry traces back to a manifest
+/// declaration), enforced elsewhere. `SourceSafety` is the
+/// per-scheme policy layer that rejects schemes we never want to
+/// fetch from (`data:`, `javascript:`, `ftp:`) and warns on
+/// weaker-but-not-rejected schemes (`git+ssh://`, `git+git://`,
+/// plain `git://`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SourceSafety {
     /// Source is fine — no action needed.
@@ -227,7 +224,7 @@ pub struct SafetyContext {
 
 /// Decide the safety verdict for a parsed [`Source`].
 ///
-/// Per-scheme rules (locked in §7 OQ-4 of the pre-plan):
+/// Per-scheme rules:
 /// - `Source::Registry`: same as legacy [`crate::is_safe_source`] —
 ///   `https://` always allowed; `http://` only for localhost / 127.0.0.1
 ///   OR with `allow_insecure`; other schemes denied.
@@ -236,7 +233,7 @@ pub struct SafetyContext {
 ///   anything else denied.
 /// - `Source::Directory` / `Source::Link`: always allowed at this
 ///   layer. Path-shape concerns (absolute paths, portability,
-///   manifest-as-truth) are enforced elsewhere — see OQ-4.
+///   manifest-as-truth) are enforced elsewhere.
 /// - `Source::Git`: `git+https://` allowed; `git+ssh://`,
 ///   `git+git://`, plain `git+...` non-https warned;
 ///   `git+http://` only with `allow_insecure`; other schemes denied.
@@ -288,8 +285,7 @@ fn tarball_url_safety(url: &str, ctx: &SafetyContext) -> SourceSafety {
         // Relative paths (./foo.tgz, ../foo.tgz) — quietly allowed.
         // Absolute paths (/abs/foo.tgz) — allowed but flagged as a
         // portability concern: the lockfile becomes machine-specific.
-        // Day-4.5 audit (light review) closed this gap. (Pre-plan
-        // §7 OQ-4 framing — portability, not security.)
+        // Portability concern, not security.
         if url.starts_with('/') {
             return SourceSafety::AllowedWithWarning(format!(
                 "tarball uses absolute path {url:?} (lockfile is non-portable across machines)"
@@ -301,10 +297,9 @@ fn tarball_url_safety(url: &str, ctx: &SafetyContext) -> SourceSafety {
     SourceSafety::Denied(format!("tarball URL has unsupported scheme: {url:?}"))
 }
 
-/// Day-4.5 (post-audit): `directory:` and `link:` sources are
-/// scheme-safe by construction, but absolute paths break lockfile
-/// portability across machines. Warn-not-deny per pre-plan §7 OQ-4
-/// (portability concern, not security violation).
+/// `directory:` and `link:` sources are scheme-safe by construction,
+/// but absolute paths break lockfile portability across machines.
+/// Warn-not-deny (portability concern, not security violation).
 fn directory_path_safety(path: &str, kind: &str) -> SourceSafety {
     if path.starts_with('/') {
         return SourceSafety::AllowedWithWarning(format!(
@@ -654,7 +649,7 @@ mod tests {
         round_trip("git+git://github.com/foo/bar.git");
     }
 
-    // ── SourceSafety (Phase 59.0 day-2, F3) ──────────────────────────────────
+    // ── SourceSafety ──────────────────────────────────────────────────────────
 
     fn safety(s: &str, ctx: &SafetyContext) -> SourceSafety {
         let parsed = Source::parse(s).unwrap_or_else(|e| panic!("parse {s:?}: {e}"));
@@ -842,9 +837,8 @@ mod tests {
 
     #[test]
     fn safety_git_unauthenticated_git_protocol_denied() {
-        // Day-4.5 (post-audit) tightens the day-3 warn-and-allow to
-        // a hard deny. Plain git:// is unauthenticated, MITM-prone,
-        // and deprecated by GitHub since 2021.
+        // Plain git:// is unauthenticated, MITM-prone, and deprecated
+        // by GitHub since 2021.
         match safety("git+git://github.com/foo/bar.git", &strict()) {
             SourceSafety::Denied(msg) => {
                 assert!(
@@ -899,7 +893,7 @@ mod tests {
         }
     }
 
-    // ── Source::source_id (Phase 59.0 day-3, F1) ─────────────────────────────
+    // ── Source::source_id ─────────────────────────────────────────────────────
 
     #[test]
     fn source_id_registry_keyed_by_url() {
