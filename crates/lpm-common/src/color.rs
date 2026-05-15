@@ -7,8 +7,11 @@
 //!
 //! ## Precedence (resolved at init time)
 //!
-//! 1. `--color={always,auto,never}` CLI flag (the canonical override).
-//! 2. `FORCE_COLOR` env (any non-empty value) → forced on.
+//! 1. `--color={always,auto,never}` CLI flag (canonical override).
+//! 2. `FORCE_COLOR=0` / `FORCE_COLOR=false` → forced **off**. Any other
+//!    non-empty `FORCE_COLOR` value → forced **on**. The CLI uses
+//!    [`Option<bool>`] internally to keep "unset" distinct from
+//!    "explicitly off".
 //! 3. `NO_COLOR` env (any non-empty value, per <https://no-color.org>) →
 //!    forced off.
 //! 4. stdout `is_terminal()` → auto.
@@ -169,19 +172,32 @@ fn paint<T: std::fmt::Display + ?Sized>(value: &T, open: &str, close: &str) -> S
 /// Pure resolver: turn a `(cli, force, no_color, is_tty)` quartet into the
 /// resolved color-enabled state. Extracted so unit tests can exercise the
 /// precedence chain without touching the process environment.
-pub fn resolve(cli: Option<ColorChoice>, force: bool, no_color: bool, is_tty: bool) -> bool {
+///
+/// `force` is tri-state: [`Some(true)`] = `FORCE_COLOR=1|2|3|true|…`,
+/// [`Some(false)`] = `FORCE_COLOR=0|false`, [`None`] = unset / empty.
+/// `FORCE_COLOR=0` is the documented disable-override per Node and
+/// supports-color conventions; treating any non-empty value as truthy
+/// (the pre-fix behavior) silently broke environments that set
+/// `FORCE_COLOR=0` to opt out.
+pub fn resolve(
+    cli: Option<ColorChoice>,
+    force: Option<bool>,
+    no_color: bool,
+    is_tty: bool,
+) -> bool {
     match cli {
         Some(ColorChoice::Always) => true,
         Some(ColorChoice::Never) => false,
-        Some(ColorChoice::Auto) | None => {
-            if force {
-                true
-            } else if no_color {
-                false
-            } else {
-                is_tty
+        Some(ColorChoice::Auto) | None => match force {
+            Some(b) => b,
+            None => {
+                if no_color {
+                    false
+                } else {
+                    is_tty
+                }
             }
-        }
+        },
     }
 }
 
@@ -215,7 +231,7 @@ mod tests {
     fn cli_always_wins_over_no_color_env() {
         assert!(resolve(
             Some(ColorChoice::Always),
-            /*force*/ false,
+            /*force*/ None,
             /*no_color*/ true,
             /*is_tty*/ false
         ));
@@ -225,17 +241,17 @@ mod tests {
     fn cli_never_wins_over_force_color_env() {
         assert!(!resolve(
             Some(ColorChoice::Never),
-            /*force*/ true,
+            /*force*/ Some(true),
             /*no_color*/ false,
             /*is_tty*/ true
         ));
     }
 
     #[test]
-    fn cli_auto_yields_to_force_color() {
+    fn cli_auto_yields_to_force_color_on() {
         assert!(resolve(
             Some(ColorChoice::Auto),
-            /*force*/ true,
+            /*force*/ Some(true),
             /*no_color*/ false,
             /*is_tty*/ false
         ));
@@ -245,24 +261,51 @@ mod tests {
     fn cli_auto_yields_to_no_color() {
         assert!(!resolve(
             Some(ColorChoice::Auto),
-            /*force*/ false,
+            /*force*/ None,
             /*no_color*/ true,
             /*is_tty*/ true
         ));
     }
 
     #[test]
-    fn force_color_beats_no_color_when_both_set() {
-        // Precedence pins FORCE_COLOR above NO_COLOR — Node/npm convention.
+    fn force_color_on_beats_no_color_when_both_set() {
+        // `FORCE_COLOR=1` vs `NO_COLOR=1`: FORCE_COLOR wins.
         assert!(resolve(
-            None, /*force*/ true, /*no_color*/ true, false
+            None,
+            /*force*/ Some(true),
+            /*no_color*/ true,
+            /*is_tty*/ false
+        ));
+    }
+
+    #[test]
+    fn force_color_off_disables_even_with_tty_and_no_no_color() {
+        // `FORCE_COLOR=0` must explicitly disable. Pre-fix this was
+        // treated as truthy ("FORCE_COLOR is set, ergo force on"),
+        // which broke CI workflows that set `FORCE_COLOR=0` to opt out.
+        assert!(!resolve(
+            None,
+            /*force*/ Some(false),
+            /*no_color*/ false,
+            /*is_tty*/ true
+        ));
+    }
+
+    #[test]
+    fn force_color_off_and_no_color_agree_off() {
+        // Sanity: `FORCE_COLOR=0` + `NO_COLOR=1` both say "off" — agreement.
+        assert!(!resolve(
+            None,
+            /*force*/ Some(false),
+            /*no_color*/ true,
+            /*is_tty*/ true
         ));
     }
 
     #[test]
     fn defaults_to_is_tty_when_nothing_overrides() {
-        assert!(resolve(None, false, false, true));
-        assert!(!resolve(None, false, false, false));
+        assert!(resolve(None, None, false, true));
+        assert!(!resolve(None, None, false, false));
     }
 
     // ─── Painted — gated ANSI emission ────────────────────────────────

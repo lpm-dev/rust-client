@@ -2317,6 +2317,19 @@ fn main() -> Result<()> {
     // allocator for the entire process lifetime and flushes on drop.
     #[cfg(feature = "dhat-heap")]
     let _dhat = dhat::Profiler::new_heap();
+
+    // Color policy must initialize BEFORE any styled output, including
+    // the `--version` fast path (which prints an `update_check` notice)
+    // and the bare-`lpm install` fast lane below (which prints a header
+    // and a success line). Both run pre-clap, so we pre-scan argv for
+    // `--color=<v>` to honor the flag without waiting for `Cli::parse`.
+    // `clap` will validate the value later under its `value_enum`
+    // contract; an unknown value here just falls back to env + TTY
+    // detection until clap surfaces the typo.
+    color_policy::init(color_policy::peek_color_choice_from_argv(
+        std::env::args_os(),
+    ));
+
     if argv_requests_top_level_version(std::env::args_os()) {
         print_version_with_notice();
         return Ok(());
@@ -2411,10 +2424,11 @@ async fn async_main() -> Result<()> {
 
     let cli = Cli::parse();
 
-    // Color policy must initialize before anything emits styled output.
-    // Runs after Cli::parse so the `--color` flag is honored, and after
-    // the miette hook above because miette's renderer styling is decided
-    // when the diagnostic is rendered, not at hook-install time.
+    // Color policy is already initialized at the top of `fn main()` via
+    // the argv pre-scan. Re-run init here so any difference between the
+    // pre-scan's flag detection and clap's parsed value (e.g., the user
+    // wrote `--color always` and the pre-scan failed for an unrelated
+    // reason) is resolved in clap's favor. `set_enabled` is idempotent.
     color_policy::init(Some(cli.color));
 
     // Version flag short-circuit. Replaces clap's auto `-V` handler so we
