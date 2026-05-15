@@ -3163,7 +3163,7 @@ mod workspace_protocol_tests {
         assert_eq!(deps["utils"], "1.2.3"); // exact passthrough
     }
 
-    /// Finding #6: workspace: with arbitrary semver range is a passthrough (matches pnpm behavior).
+    /// `workspace:` with arbitrary semver range is a passthrough (matches pnpm behavior).
     /// e.g., "workspace:>=1.0.0" for a member with version "2.0.0" → resolves to ">=1.0.0".
     #[test]
     fn workspace_semver_range_passthrough() {
@@ -3982,7 +3982,7 @@ mod trusted_dependencies_tests {
     /// P4 happy path: an entry approved in a provenance-aware install
     /// captures the `ProvenanceSnapshot` and round-trips through
     /// serde without field drift. The `provenanceAtApproval` JSON
-    /// key name matches the plan doc's §6.2 wire spec.
+    /// key name matches the wire spec.
     #[test]
     fn trusted_binding_with_provenance_roundtrips() {
         let binding = TrustedDependencyBinding {
@@ -4181,7 +4181,7 @@ mod trusted_dependencies_tests {
     /// An approval flow that captures "no provenance present" (the
     /// approved version had no attestation in the first place) must
     /// still serialize the `present: false` snapshot. This matters
-    /// for the §7.2 drift rule's `(None, Some(_)) → block` branch,
+    /// for the drift rule's `(None, Some(_)) → block` branch,
     /// which distinguishes "approved version had provenance, this
     /// one doesn't" (block) from "neither side had provenance"
     /// (layers 1/2/4 decide).
