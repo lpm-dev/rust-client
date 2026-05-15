@@ -199,7 +199,7 @@ struct Target {
 }
 
 fn parse_target(spec: &str) -> Result<Target, LpmError> {
-    let (name, intent) = parse_user_save_intent(spec);
+    let (name, intent) = parse_user_save_intent(spec)?;
     let new_intent = if matches!(&intent, UserSaveIntent::Bare) {
         None
     } else {

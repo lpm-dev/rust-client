@@ -10597,7 +10597,7 @@ pub(crate) fn stage_packages_to_manifest(
     let mut doc_mutated = false;
 
     for spec in package_specs {
-        let (name, intent) = parse_user_save_intent(spec);
+        let (name, intent) = parse_user_save_intent(spec)?;
 
         // Tier 1: explicit user input → write verbatim, mark Final.
         let explicit_literal: Option<String> = match &intent {
@@ -10855,7 +10855,7 @@ pub async fn run_add_packages(
     let mut js_packages = Vec::new();
 
     for spec in packages {
-        let (name, intent) = crate::save_spec::parse_user_save_intent(spec);
+        let (name, intent) = crate::save_spec::parse_user_save_intent(spec)?;
         let range = intent_to_range_string(&intent);
 
         if name.starts_with("@lpm.dev/") {

@@ -82,6 +82,95 @@ fn install_suggests_file_for_filee_typo() {
     );
 }
 
+// ─── CLI argv path (GPT-audit follow-up) ─────────────────────────────────────
+//
+// Pre-fix the manifest-side parser guard didn't cover the explicit-token CLI
+// path: `lpm install foo@magic:bar` ran through `save_spec::classify_version_token`
+// which fell through to `UserSaveIntent::DistTag("magic:bar")`. The resolver
+// then silently installed `foo@latest` and rewrote `package.json` to
+// `"foo": "^1.0.0"` — silent corruption worse than the original confusing error.
+
+#[test]
+fn cli_install_argv_rejects_unknown_protocol_token() {
+    let project = TempProject::empty(r#"{"name":"cli-protocol-test","version":"1.0.0"}"#);
+
+    let output = lpm(&project)
+        .args(["install", "foo@magic:bar"])
+        .output()
+        .expect("failed to run lpm install foo@magic:bar");
+
+    assert!(
+        !output.status.success(),
+        "install must fail on argv token `foo@magic:bar`, not silently install with placeholder; \
+         stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    assert!(
+        combined.contains("magic:"),
+        "error must surface the offending prefix, got:\n{combined}"
+    );
+    assert!(
+        combined.contains("unknown package specifier protocol"),
+        "error must use the canonical phrasing, got:\n{combined}"
+    );
+
+    // Critical: package.json must NOT be mutated. Pre-fix this got
+    // rewritten to `"foo": "^1.0.0"` (silent corruption).
+    let pkg = project.read_file("package.json");
+    assert!(
+        !pkg.contains("\"foo\""),
+        "package.json must NOT add 'foo' on a rejected protocol input, got: {pkg}"
+    );
+}
+
+#[test]
+fn cli_install_argv_suggests_file_for_filee_typo() {
+    let project = TempProject::empty(r#"{"name":"cli-protocol-test","version":"1.0.0"}"#);
+
+    let output = lpm(&project)
+        .args(["install", "foo@filee:./pkg"])
+        .output()
+        .expect("failed to run lpm install foo@filee:./pkg");
+
+    assert!(
+        !output.status.success(),
+        "install must fail on `foo@filee:./pkg`"
+    );
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    assert!(
+        combined.contains("filee:"),
+        "error must surface the typo, got:\n{combined}"
+    );
+    assert!(
+        combined.contains("Did you mean 'file:'"),
+        "Levenshtein suggestion must point to `file:`, got:\n{combined}"
+    );
+    let pkg = project.read_file("package.json");
+    assert!(
+        !pkg.contains("\"foo\""),
+        "package.json must NOT add 'foo' on a rejected protocol typo, got: {pkg}"
+    );
+}
+
+// Regression guard for `foo@latest` / `foo@beta` / `foo@next` lives at
+// the unit-test layer:
+// * `Specifier::parse` test arms confirm `latest`/`beta`/`next` resolve
+//   to `SemverRange` (no `:` → protocol guard never fires).
+// * `parse_user_save_intent("zod@latest")` test arm pins the
+//   `DistTag` classification.
+// Re-asserting here from a workflow test would either hit the registry
+// or duplicate the unit coverage.
+
 #[test]
 fn install_rejects_windows_drive_letter_path_with_file_hint() {
     let project = TempProject::empty(&manifest_with_dep("badpath", r"C:\\path\\to\\dir"));

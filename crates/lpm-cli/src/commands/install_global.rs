@@ -301,7 +301,7 @@ struct ResolvedSpec {
 }
 
 async fn pre_resolve(registry: &RegistryClient, spec: &str) -> Result<ResolvedSpec, LpmError> {
-    let (name, intent) = parse_user_save_intent(spec);
+    let (name, intent) = parse_user_save_intent(spec)?;
     // Dispatch by name shape: `@lpm.dev/owner.tool` goes through the
     // first-party registry path (PackageName parser); everything else
     // (`eslint`, `@types/node`, `@scope/foo`) is fetched via the npm
