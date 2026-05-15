@@ -1,5 +1,6 @@
-//! Isolated decompression-speed benchmark comparing libdeflate (the
-//! install-hot-path decoder) against flate2 with the `zlib-rs` backend.
+//! Trial 1 (2026-05-13): isolated decompression-speed benchmark comparing
+//! libdeflate (the new install-hot-path decoder) against flate2 with the
+//! `zlib-rs` backend (the prior decoder).
 //!
 //! Three fixture sizes mirror the npm tarball size distribution:
 //!   - small  (~100 KB compressed) — typical leaf utility (lodash.get etc.)
