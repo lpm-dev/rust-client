@@ -150,6 +150,7 @@ pub fn list(
                     "code": r.code,
                     "check": r.name,
                     "category": r.category.as_str(),
+                    "tier": r.tier.as_str(),
                     "description": r.description,
                     "when_fires": r.when_fires,
                     "remediation": r.remediation,
@@ -191,9 +192,10 @@ pub fn list(
         }
         let severities = row.possible_severities.join(", ");
         println!(
-            "    {}  {}",
+            "    {}  {}  {}",
             row.code.bold(),
-            format!("[{severities}]").dimmed()
+            format!("[{severities}]").dimmed(),
+            format!("(tier: {})", row.tier).dimmed(),
         );
         println!("      {}: {}", "name".dimmed(), row.name);
         println!("      {}", row.description);
@@ -208,12 +210,34 @@ pub fn list(
     Ok(())
 }
 
-/// Enhanced health check: verify auth, registry, store, project state, runtime, tools, lpm.json.
+/// Health check pipeline.
+///
+/// Two execution tiers (orthogonal to category — see
+/// [`crate::doctor_catalog::Tier`]):
+///
+/// - **Fast (default `lpm doctor`):** local-only "why is this project
+///   broken right now?" pass. Zero network calls. Zero subprocess
+///   spawns except `node --version` (2s-bounded) for runtime detection.
+///   Covers global store accessibility, `package.json`, linker mode,
+///   `node_modules` layout, lockfile health, deps sync, local
+///   `file:` / `link:` source paths, `lpm.json` validity, Node
+///   runtime readiness, and workspace cycle detection.
+///
+/// - **Full sweep (`lpm doctor --all`):** every catalog row. Adds
+///   registry probe + `whoami`, tunnel ownership lookup, lint / fmt
+///   subprocesses, TypeScript reachability, plugin update fetch,
+///   global-install hygiene (manifest, PATH, shims, install roots),
+///   sandbox probe, full manifest-compat sweep, and project-hygiene
+///   rows (`.gitattributes` lockb marker, v2-store orphan stats).
+///
+/// `--fix` operates on whichever set actually emitted — fast-mode
+/// `--fix` cannot repair rows it didn't check.
 pub async fn run(
     client: &RegistryClient,
     registry_url: &str,
     project_dir: &Path,
     json_output: bool,
+    all: bool,
     fix: bool,
     _yes: bool,
 ) -> Result<(), LpmError> {
@@ -224,44 +248,53 @@ pub async fn run(
     let mut checks: Vec<Check> = Vec::new();
     let mut fixes_applied: Vec<String> = Vec::new();
 
-    // === Infrastructure (parallelized network calls) ===
+    // Shared between the registry/auth probe (Extended) and the
+    // tunnel block (Extended). Stays `false` on the fast path since
+    // both consumers are gated behind `if all`.
+    let mut token_exists = false;
 
-    let token_exists = auth::get_token(registry_url).is_some();
-    let (registry_result, auth_result) = tokio::join!(client.health_check(), async {
-        if token_exists {
-            client.whoami().await.is_ok()
+    // === Infrastructure: registry + auth (Extended) ===
+    //
+    // Both probes touch the network. Skipped on the fast path —
+    // default `lpm doctor` is local-only.
+    if all {
+        token_exists = auth::get_token(registry_url).is_some();
+        let (registry_result, auth_result) = tokio::join!(client.health_check(), async {
+            if token_exists {
+                client.whoami().await.is_ok()
+            } else {
+                false
+            }
+        });
+
+        // 1. Registry reachable?
+        let registry_ok = registry_result.unwrap_or(false);
+        if registry_ok {
+            checks.push(Check::pass(
+                &doctor_catalog::REGISTRY_REACHABLE,
+                registry_url,
+            ));
         } else {
-            false
+            checks.push(Check::fail(
+                &doctor_catalog::REGISTRY_UNREACHABLE,
+                &format!("{registry_url} — unreachable. Check your network or try again later"),
+            ));
         }
-    });
 
-    // 1. Registry reachable?
-    let registry_ok = registry_result.unwrap_or(false);
-    if registry_ok {
-        checks.push(Check::pass(
-            &doctor_catalog::REGISTRY_REACHABLE,
-            registry_url,
-        ));
-    } else {
-        checks.push(Check::fail(
-            &doctor_catalog::REGISTRY_UNREACHABLE,
-            &format!("{registry_url} — unreachable. Check your network or try again later"),
-        ));
-    }
-
-    // 2. Auth token valid?
-    if auth_result {
-        checks.push(Check::pass(&doctor_catalog::AUTH_VALID, "valid token"));
-    } else if token_exists {
-        checks.push(Check::fail(
-            &doctor_catalog::AUTH_INVALID,
-            "token exists but invalid — run: lpm login",
-        ));
-    } else {
-        checks.push(Check::fail(
-            &doctor_catalog::AUTH_MISSING,
-            "no token — run: lpm login",
-        ));
+        // 2. Auth token valid?
+        if auth_result {
+            checks.push(Check::pass(&doctor_catalog::AUTH_VALID, "valid token"));
+        } else if token_exists {
+            checks.push(Check::fail(
+                &doctor_catalog::AUTH_INVALID,
+                "token exists but invalid — run: lpm login",
+            ));
+        } else {
+            checks.push(Check::fail(
+                &doctor_catalog::AUTH_MISSING,
+                "no token — run: lpm login",
+            ));
+        }
     }
 
     // 3. Global store accessible?
@@ -401,12 +434,14 @@ pub async fn run(
         }
     }
 
-    // Phase 66 Phase 4e — v2 store orphan stats (preplan §4.5).
-    // Cheap: walks `~/.lpm/store/v2/links/<*>/.lpm-link-meta.json`
-    // sidecars + the registered-projects set, surfaces a count of
-    // orphans not reachable from any project. Pass when zero;
-    // warn-with-remediation when non-zero.
-    if let Ok(lpm_root) = lpm_common::LpmRoot::from_env() {
+    // === V2 store orphan stats (Extended) ===
+    //
+    // Phase 66 Phase 4e (preplan §4.5). Cheap but cross-project
+    // hygiene rather than core breakage — only surface under `--all`.
+    // Walks `~/.lpm/store/v2/links/<*>/.lpm-link-meta.json` sidecars
+    // + the registered-projects set, surfaces a count of orphans not
+    // reachable from any project.
+    if all && let Ok(lpm_root) = lpm_common::LpmRoot::from_env() {
         let v2_store = lpm_store::v2::Store::from_lpm_root(&lpm_root);
         let plan = crate::commands::cache_prune::compute_prune_plan(
             &lpm_root,
@@ -434,12 +469,15 @@ pub async fn run(
         }
     }
 
-    // 6. Lockfile?
+    // 6. Lockfile? (Fast — load-bearing for install)
     let lockfile = project_dir.join("lpm.lock");
     checks.extend(check_lockfile_state(project_dir));
 
-    // 6b. .gitattributes check
-    checks.extend(check_gitattributes_state(project_dir));
+    // 6b. .gitattributes hygiene (Extended) — git-side correctness for
+    // the binary lockfile, not a runtime-install gate.
+    if all {
+        checks.extend(check_gitattributes_state(project_dir));
+    }
 
     // 6c. Dependencies in sync? (lockfile vs package.json)
     if lockfile.exists()
@@ -464,20 +502,24 @@ pub async fn run(
         checks.push(lpm_json_check);
     }
 
-    // === Manifest compatibility (Phase 64 #61) ===
+    // === Manifest compatibility (Extended) ===
     //
-    // Surfaces every issue from
+    // Phase 64 #61. Surfaces every issue from
     // [`lpm_workspace::PackageJson::manifest_compat_issues`] as its own
     // `Check::warn` entry with the issue's stable code. This is the
     // structured surface automation pipelines pull instead of the
     // stderr warnings emitted by `engine_check::enforce` — the same
     // detector backs both, so the two views can never disagree.
     //
+    // Behind `--all`: the pnpm-drift / engines-ignored rows describe
+    // semantic gaps with adjacent package managers, not breakage of
+    // the current install — outside the default fast-mode scope.
+    //
     // Requires a parsed `package.json`; we already guarded above that
     // it exists. Re-uses the workspace discovery so member-dir
     // invocations gate against the workspace root manifest, matching
     // the engine-check semantics (root manifest is the gate).
-    if pkg_json_path.exists() {
+    if all && pkg_json_path.exists() {
         checks.extend(check_manifest_compat(project_dir));
     }
 
@@ -532,36 +574,44 @@ pub async fn run(
         }
     }
 
-    // === Tunnel (Phase 9) ===
-
-    // 8b. Tunnel domain config — format validation + ownership check
-    let tunnel_checks = check_tunnel_domain(project_dir, client, token_exists).await;
-    checks.extend(tunnel_checks);
-
-    // === Code Quality (Phase 4) ===
-
-    // 9. Lint check (if oxlint installed)
-    if let Some(lint_result) = run_lint_check(project_dir) {
-        checks.push(lint_result);
+    // === Tunnel (Extended, Phase 9) ===
+    //
+    // Touches network in the authenticated path (`tunnel_domain_lookup`
+    // + HTTP reachability probe). Skipped on fast path.
+    if all {
+        let tunnel_checks = check_tunnel_domain(project_dir, client, token_exists).await;
+        checks.extend(tunnel_checks);
     }
 
-    // 10. Format check (if biome installed)
-    if let Some(fmt_result) = run_fmt_check(project_dir) {
-        checks.push(fmt_result);
+    // === Code Quality + TypeScript + Plugins (Extended, Phase 4) ===
+    //
+    // Subprocess spawns (oxlint, biome) + network calls (plugin
+    // version fetch). All Extended-tier; default fast preset stays
+    // pure local file I/O. TypeScript readiness is a cheap file probe
+    // but lives next to the tooling cluster the user expects to see
+    // together — promoted under `--all` for output cohesion.
+    if all {
+        // Lint check (if oxlint installed)
+        if let Some(lint_result) = run_lint_check(project_dir) {
+            checks.push(lint_result);
+        }
+
+        // Format check (if biome installed)
+        if let Some(fmt_result) = run_fmt_check(project_dir) {
+            checks.push(fmt_result);
+        }
+
+        // TypeScript readiness — workspace-aware reachability check.
+        // Cheap local-bin lookup + dep-declaration check, no blocking
+        // `tsc --noEmit` invocation. The actual type-check belongs to
+        // `lpm check`; doctor only verifies the project is set up so
+        // that `lpm check` will work when the user runs it.
+        checks.extend(check_typescript_setup(project_dir));
+
+        // Plugin status — fetches latest plugin versions in parallel.
+        let plugin_checks = check_plugins().await;
+        checks.extend(plugin_checks);
     }
-
-    // 11. TypeScript readiness — workspace-aware reachability check.
-    //     Cheap local-bin lookup + dep-declaration check, no blocking
-    //     `tsc --noEmit` invocation. The actual type-check belongs to
-    //     `lpm check`; doctor only verifies the project is set up so
-    //     that `lpm check` will work when the user runs it.
-    checks.extend(check_typescript_setup(project_dir));
-
-    // === Plugins (Phase 4) ===
-
-    // 12. Plugin status
-    let plugin_checks = check_plugins().await;
-    checks.extend(plugin_checks);
 
     // === Workspace (Phase 3) ===
 
@@ -570,7 +620,7 @@ pub async fn run(
         checks.push(ws_check);
     }
 
-    // === Global installs (Phase 37 M6.2) ===
+    // === Global installs (Extended, Phase 37 M6.2) ===
     //
     // Four checks, all gated on the existence of `~/.lpm/global/`:
     //
@@ -579,21 +629,29 @@ pub async fn run(
     //   16. Orphaned bin shims — files in bin_dir without a manifest owner
     //   17. Install-root consistency — every manifest entry's install root
     //                                  exists AND carries a ready marker
-    for check in check_global_installs() {
-        checks.push(check);
+    //
+    // Behind `--all`: these describe global-install hygiene, not
+    // project breakage, and the per-platform PATH probe is host
+    // state rather than current-directory state.
+    if all {
+        for check in check_global_installs() {
+            checks.push(check);
+        }
     }
 
-    // === Phase 46 — Script policy + sandbox (Phase 46 close-out Chunk 4) ===
+    // === Phase 46 — Script policy + sandbox (Extended, Phase 46 close-out Chunk 4) ===
     //
     //   18. Sandbox availability — probe the per-platform backend.
     //   19. Script-policy scope boundary — project installs only in 46.0;
     //                                      globals ship with Phase 46.1.
     //
-    // Placed after the global-installs block so the scope-boundary note
-    // sits next to the global-installs rows it contextualizes. See the
-    // function doc for per-check classification rules.
-    for check in check_script_policy_surface() {
-        checks.push(check);
+    // Behind `--all`: sandbox + policy diagnostics report on host
+    // capabilities (kernel version, helper availability) rather than
+    // current-project breakage.
+    if all {
+        for check in check_script_policy_surface() {
+            checks.push(check);
+        }
     }
 
     // === Auto-fix (runs before output so JSON includes fixes_applied) ===
@@ -751,7 +809,27 @@ pub async fn run(
         }
     }
 
+    // Tier-leak tripwire: in fast mode, every emitted check MUST
+    // carry `Tier::Fast` — block-level gates above are the source of
+    // truth, and this catches a future refactor that emits an
+    // Extended-tagged row from a Fast block by mistake.
+    #[cfg(debug_assertions)]
+    if !all {
+        for c in &checks {
+            debug_assert!(
+                matches!(c.entry.tier, doctor_catalog::Tier::Fast),
+                "fast-mode emission leak: code `{}` (tier {:?}) escaped \
+                 from an Extended-tier block. Add the block's `if all` \
+                 gate or move the code to `Tier::Fast` in the catalog.",
+                c.code(),
+                c.entry.tier,
+            );
+        }
+    }
+
     // === Output (after fixes so JSON includes fixes_applied) ===
+
+    let mode_str = if all { "all" } else { "fast" };
 
     if json_output {
         let results: Vec<_> = checks
@@ -777,6 +855,7 @@ pub async fn run(
         let failed_count = checks.iter().filter(|c| !c.passed).count();
         let output = serde_json::to_string_pretty(&serde_json::json!({
             "success": true,
+            "mode": mode_str,
             "no_failures": no_failures,
             "clean": clean,
             "has_warnings": has_warnings,
@@ -789,8 +868,35 @@ pub async fn run(
         .map_err(|e| LpmError::Script(format!("failed to serialize doctor output: {e}")))?;
         println!("{output}");
     } else {
+        let failed = checks.iter().filter(|c| !c.passed).count();
+        let warned = checks
+            .iter()
+            .filter(|c| matches!(c.severity, Severity::Warn))
+            .count();
+        let total = checks.len();
+
+        // Fast-mode renderer shaping: ALWAYS suppress pass rows
+        // except `LINKER_MODE_RESOLVED`, whether or not the run is
+        // clean. On a broken project the user wants the fail / warn
+        // rows visible on top, not buried beneath a wall of healthy
+        // passes; on a clean project the short summary plus the
+        // linker-mode breadcrumb is all the context that matters.
+        // Linker mode survives the squelch because it explains
+        // "why is my install hoisted vs isolated?" — frequently the
+        // first thing users want to confirm. Position is preserved
+        // (emission order), so the linker-mode row sits near the top
+        // of the output as context BEFORE the broken rows below it.
+        // `--all` keeps today's "render every row in emission order"
+        // behavior — the full sweep already groups related rows
+        // (Infrastructure → Project → Runtime → Tunnel → ...).
         println!();
         for check in &checks {
+            if !all
+                && matches!(check.severity, Severity::Pass)
+                && check.code() != doctor_catalog::LINKER_MODE_RESOLVED.code
+            {
+                continue;
+            }
             let icon = match check.severity {
                 Severity::Pass => "✔".green().to_string(),
                 Severity::Fail => "✖".red().to_string(),
@@ -800,15 +906,15 @@ pub async fn run(
         }
         println!();
 
-        let failed = checks.iter().filter(|c| !c.passed).count();
-        let warned = checks
-            .iter()
-            .filter(|c| matches!(c.severity, Severity::Warn))
-            .count();
-        let total = checks.len();
-
         if failed == 0 && warned == 0 {
             output::success(&format!("All {total} checks passed"));
+            if !all {
+                println!(
+                    "\n  Run {} for registry, auth, tunnel, tooling, plugin, global,\n  \
+                     sandbox, and full manifest-compat diagnostics.",
+                    "lpm doctor --all".bold()
+                );
+            }
         } else if failed == 0 {
             output::success(&format!(
                 "{} checks passed, {} warning(s)",

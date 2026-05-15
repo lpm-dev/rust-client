@@ -1151,15 +1151,31 @@ enum Commands {
         no_engine_strict: bool,
     },
 
-    /// Health check: verify auth, registry, store, project state.
+    /// Health check: verify project state, runtime, store, and (with
+    /// `--all`) auth, registry, tunnel, tooling, plugins, globals,
+    /// sandbox, and full manifest-compat.
     ///
-    /// Without a subcommand, runs the full check set against the
-    /// current project. Subcommands target the inventory surface:
+    /// Default: a fast, local-only "why is this project broken right
+    /// now?" pass — no registry probe, no `whoami`, no tunnel lookup,
+    /// no lint / fmt subprocess, no plugin update fetch. Pass `--all`
+    /// for the full sweep across every catalog row.
+    ///
+    /// Subcommands target the inventory surface (always local):
     ///
     ///   lpm doctor list                — dump every code doctor can emit
     ///   lpm doctor list --code <code>  — show one entry
     ///   lpm doctor list --category Tunnel  — filter by category
     Doctor {
+        /// Run every catalog row, including registry/auth probes,
+        /// tunnel lookup, lint+fmt subprocesses, TypeScript +
+        /// plugin reachability, global-install hygiene, sandbox
+        /// probe, and the full manifest-compat sweep. Default
+        /// `lpm doctor` runs only the fast local-health preset.
+        ///
+        /// Ignored when a subcommand is provided.
+        #[arg(long)]
+        all: bool,
+
         /// Auto-fix issues (install missing Node, run lpm install, run lpm fmt).
         ///
         /// Ignored when a subcommand is provided.
@@ -3588,13 +3604,27 @@ async fn async_main() -> Result<()> {
             )
             .await
         }
-        Commands::Doctor { fix, yes, action } => match action {
+        Commands::Doctor {
+            all,
+            fix,
+            yes,
+            action,
+        } => match action {
             Some(DoctorAction::List { code, category }) => {
                 commands::doctor::list(cli.json, code.as_deref(), category.as_deref())
             }
             None => {
                 let cwd = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;
-                commands::doctor::run(&client, registry_url, &cwd, cli.json, fix || yes, yes).await
+                commands::doctor::run(
+                    &client,
+                    registry_url,
+                    &cwd,
+                    cli.json,
+                    all,
+                    fix || yes,
+                    yes,
+                )
+                .await
             }
         },
         Commands::SwiftRegistry { force } => {

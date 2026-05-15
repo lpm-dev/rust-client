@@ -82,6 +82,44 @@ impl fmt::Display for Severity {
     }
 }
 
+/// Doctor execution tier. Drives the `lpm doctor` vs `lpm doctor --all`
+/// split: fast-mode runs only `Tier::Fast` rows (zero network, zero
+/// subprocess except `node --version` for runtime detection), while
+/// `--all` runs the full catalog. Orthogonal to [`Category`] — any
+/// category can contain rows of either tier (e.g. `Infrastructure`
+/// holds `GLOBAL_STORE_*` in `Fast` and `REGISTRY_*` in `Extended`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Tier {
+    /// Core-health rows that explain "why is this project broken
+    /// right now?" — local-only, no network, no subprocess spawn
+    /// except `node --version` (2s-bounded) for runtime detection.
+    Fast,
+    /// Everything else: registry / auth probes, tunnel diagnostics,
+    /// lint / fmt subprocesses, TypeScript / plugin reachability,
+    /// global-install hygiene, sandbox probe, manifest-compat sweep,
+    /// project-maintenance rows (`.gitattributes` lockb hygiene,
+    /// v2 store orphan counts).
+    Extended,
+}
+
+impl Tier {
+    /// Stable string form for `--json` output and the `tier` field on
+    /// `lpm doctor list --json`. Match against this in downstream
+    /// tooling.
+    pub const fn as_str(&self) -> &'static str {
+        match self {
+            Tier::Fast => "fast",
+            Tier::Extended => "extended",
+        }
+    }
+}
+
+impl fmt::Display for Tier {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 /// Top-level grouping of checks. Drives section headings in the
 /// human-mode `lpm doctor list` output and the `category` field in
 /// `--json`.
@@ -140,6 +178,10 @@ pub struct CheckEntry {
     pub name: &'static str,
     /// Top-level grouping for inventory display.
     pub category: Category,
+    /// Execution tier — drives `lpm doctor` (fast) vs `lpm doctor
+    /// --all` (full). Orthogonal to [`Category`]: any category can
+    /// hold rows of either tier.
+    pub tier: Tier,
     /// Short description of what this code expresses. Typically one
     /// sentence; up to two for codes whose context needs a clarifier.
     pub description: &'static str,
@@ -175,6 +217,7 @@ pub static REGISTRY_REACHABLE: CheckEntry = CheckEntry {
     code: "registry_reachable",
     name: "Registry",
     category: Category::Infrastructure,
+    tier: Tier::Extended,
     description: "The configured registry responds to its health endpoint.",
     when_fires: "Registry health check returned 2xx within the timeout.",
     remediation: "No action — informational pass.",
@@ -186,6 +229,7 @@ pub static REGISTRY_UNREACHABLE: CheckEntry = CheckEntry {
     code: "registry_unreachable",
     name: "Registry",
     category: Category::Infrastructure,
+    tier: Tier::Extended,
     description: "The configured registry could not be reached.",
     when_fires: "Registry health endpoint timed out, returned non-2xx, or DNS failed.",
     remediation: "Check network connectivity, firewall rules, or the registry status page.",
@@ -197,6 +241,7 @@ pub static GLOBAL_STORE_ACCESSIBLE: CheckEntry = CheckEntry {
     code: "global_store_accessible",
     name: "Global store",
     category: Category::Infrastructure,
+    tier: Tier::Fast,
     description: "The shared content-addressable store at `~/.lpm/store/` resolves.",
     when_fires: "Default store location is readable.",
     remediation: "No action — informational pass.",
@@ -208,6 +253,7 @@ pub static GLOBAL_STORE_INACCESSIBLE: CheckEntry = CheckEntry {
     code: "global_store_inaccessible",
     name: "Global store",
     category: Category::Infrastructure,
+    tier: Tier::Fast,
     description: "The shared content-addressable store could not be located or read.",
     when_fires: "`PackageStore::default_location()` errored out (HOME unset, permissions, missing dir).",
     remediation: "Verify `$HOME` is set and that `~/.lpm/store/` is writable. Re-run `lpm install` to recreate.",
@@ -223,6 +269,7 @@ pub static AUTH_VALID: CheckEntry = CheckEntry {
     code: "auth_valid",
     name: "Authentication",
     category: Category::Auth,
+    tier: Tier::Extended,
     description: "A registry auth token is present and `whoami` succeeds.",
     when_fires: "Stored token authenticated against the registry within the timeout.",
     remediation: "No action — informational pass.",
@@ -234,6 +281,7 @@ pub static AUTH_INVALID: CheckEntry = CheckEntry {
     code: "auth_invalid",
     name: "Authentication",
     category: Category::Auth,
+    tier: Tier::Extended,
     description: "A token is stored but the registry rejected it.",
     when_fires: "`whoami` returned 401 / 403 against the stored token.",
     remediation: "Re-authenticate with `lpm login`.",
@@ -245,6 +293,7 @@ pub static AUTH_MISSING: CheckEntry = CheckEntry {
     code: "auth_missing",
     name: "Authentication",
     category: Category::Auth,
+    tier: Tier::Extended,
     description: "No registry auth token is configured.",
     when_fires: "No token in keychain / file backend for the configured registry origin.",
     remediation: "Run `lpm login`.",
@@ -260,6 +309,7 @@ pub static PACKAGE_JSON_PRESENT: CheckEntry = CheckEntry {
     code: "package_json_present",
     name: "package.json",
     category: Category::ProjectState,
+    tier: Tier::Fast,
     description: "A readable `package.json` exists in the project directory.",
     when_fires: "`<project>/package.json` is a regular file.",
     remediation: "No action — informational pass.",
@@ -271,6 +321,7 @@ pub static PACKAGE_JSON_MISSING: CheckEntry = CheckEntry {
     code: "package_json_missing",
     name: "package.json",
     category: Category::ProjectState,
+    tier: Tier::Fast,
     description: "No `package.json` exists in the project directory.",
     when_fires: "`<project>/package.json` is missing.",
     remediation: "Run `lpm init`, or `cd` into your project root before running doctor.",
@@ -282,6 +333,7 @@ pub static LINKER_MODE_RESOLVED: CheckEntry = CheckEntry {
     code: "linker_mode_resolved",
     name: "Linker mode",
     category: Category::ProjectState,
+    tier: Tier::Fast,
     description: "Reports the LinkerMode the install pipeline would resolve to plus which surface in the precedence chain produced it (CLI flag / global config / env var / package.json / workspace auto-detected / default).",
     when_fires: "Always — runs after `package.json` is read so the resolution chain reflects the manifest's `lpm.linker` setting.",
     remediation: "No action — informational. To change the result, set one of the higher-precedence surfaces (e.g. `--linker=isolated`, `LPM_LINKER`, `package.json > lpm > linker`).",
@@ -293,6 +345,7 @@ pub static NODE_MODULES_ISOLATED_HEALTHY: CheckEntry = CheckEntry {
     code: "node_modules_isolated_healthy",
     name: "node_modules",
     category: Category::ProjectState,
+    tier: Tier::Fast,
     description: "`node_modules/` exists and is backed by an isolated `.lpm/wrappers/` store.",
     when_fires: "Default linker layout is intact.",
     remediation: "No action — informational pass.",
@@ -304,6 +357,7 @@ pub static NODE_MODULES_HOISTED_HEALTHY: CheckEntry = CheckEntry {
     code: "node_modules_hoisted_healthy",
     name: "node_modules",
     category: Category::ProjectState,
+    tier: Tier::Fast,
     description: "`node_modules/` exists and uses the hoisted layout.",
     when_fires: "User opted into `--linker=hoisted` and the layout is intact.",
     remediation: "No action — informational pass.",
@@ -315,6 +369,7 @@ pub static NODE_MODULES_VIRTUAL_HEALTHY: CheckEntry = CheckEntry {
     code: "node_modules_virtual_healthy",
     name: "node_modules",
     category: Category::ProjectState,
+    tier: Tier::Fast,
     description: "`node_modules/` symlinks point into the virtual store at `~/.lpm/store/v2/links/`.",
     when_fires: "User opted into `LPM_STORE_VERSION=v2` (Phase 66 dev-only flag) and the virtual-store layout is intact.",
     remediation: "No action — informational pass.",
@@ -326,6 +381,7 @@ pub static V2_STORE_ORPHANS: CheckEntry = CheckEntry {
     code: "v2_store_orphans",
     name: "v2 virtual store",
     category: Category::ProjectState,
+    tier: Tier::Extended,
     description: "v2 store at `~/.lpm/store/v2/` has link entries or objects no longer reachable from any registered project.",
     when_fires: "After projects are deleted or move on disk; the v2 store grows monotonically across all projects on the machine until pruned.",
     remediation: "Run `lpm cache prune` for a dry-run preview, then `lpm cache prune --apply` to remove orphans.",
@@ -337,6 +393,7 @@ pub static NODE_MODULES_MIXED_LAYOUT: CheckEntry = CheckEntry {
     code: "node_modules_mixed_layout",
     name: "node_modules",
     category: Category::ProjectState,
+    tier: Tier::Fast,
     description: "Both isolated and hoisted layout state are present in `node_modules/`.",
     when_fires: "A linker mode switch left stale state behind.",
     remediation: "Re-run `lpm install` to converge on the configured linker layout.",
@@ -348,6 +405,7 @@ pub static NODE_MODULES_NO_STORE: CheckEntry = CheckEntry {
     code: "node_modules_no_store",
     name: "node_modules",
     category: Category::ProjectState,
+    tier: Tier::Fast,
     description: "`node_modules/` exists but no LPM-owned store is present.",
     when_fires: "A non-LPM tool wrote `node_modules/` (npm / pnpm / yarn / bun).",
     remediation: "Run `lpm install` to rebuild the layout under LPM ownership.",
@@ -359,6 +417,7 @@ pub static NODE_MODULES_LEGACY_LAYOUT: CheckEntry = CheckEntry {
     code: "node_modules_legacy_layout",
     name: "node_modules",
     category: Category::ProjectState,
+    tier: Tier::Fast,
     description: "An older LPM layout is on disk and a one-time migration is pending.",
     when_fires: "Legacy `node_modules/.lpm/` or `node_modules/.lpm-metadata.json` populated; the new `.lpm/wrappers/` is empty.",
     remediation: "Run `lpm install` to migrate to the current layout.",
@@ -370,6 +429,7 @@ pub static NODE_MODULES_MISSING: CheckEntry = CheckEntry {
     code: "node_modules_missing",
     name: "node_modules",
     category: Category::ProjectState,
+    tier: Tier::Fast,
     description: "`node_modules/` is missing — dependencies have not been installed.",
     when_fires: "The project has `package.json` but no `node_modules/`.",
     remediation: "Run `lpm install`.",
@@ -381,6 +441,7 @@ pub static LOCKFILE_PRESENT: CheckEntry = CheckEntry {
     code: "lockfile_present",
     name: "Lockfile",
     category: Category::ProjectState,
+    tier: Tier::Fast,
     description: "`lpm.lock` is present at the project root.",
     when_fires: "TOML lockfile is on disk.",
     remediation: "No action — informational pass.",
@@ -392,6 +453,7 @@ pub static LOCKFILE_MISSING: CheckEntry = CheckEntry {
     code: "lockfile_missing",
     name: "Lockfile",
     category: Category::ProjectState,
+    tier: Tier::Fast,
     description: "No `lpm.lock` was found at the project root.",
     when_fires: "Project has dependencies declared but no lockfile generated.",
     remediation: "Run `lpm install` — it generates the lockfile alongside `node_modules/`.",
@@ -403,6 +465,7 @@ pub static LOCKFILE_BINARY_VALID: CheckEntry = CheckEntry {
     code: "lockfile_binary_valid",
     name: "Binary lockfile",
     category: Category::ProjectState,
+    tier: Tier::Fast,
     description: "`lpm.lockb` matches `lpm.lock` and parses cleanly.",
     when_fires: "Both lockfiles agree.",
     remediation: "No action — informational pass.",
@@ -414,6 +477,7 @@ pub static LOCKFILE_BINARY_MISSING: CheckEntry = CheckEntry {
     code: "lockfile_binary_missing",
     name: "Binary lockfile",
     category: Category::ProjectState,
+    tier: Tier::Fast,
     description: "`lpm.lockb` is missing while `lpm.lock` is present.",
     when_fires: "Only the TOML lockfile is on disk.",
     remediation: "Run `lpm doctor --fix` to regenerate, or run `lpm install`.",
@@ -425,6 +489,7 @@ pub static LOCKFILE_BINARY_STALE: CheckEntry = CheckEntry {
     code: "lockfile_binary_stale",
     name: "Binary lockfile",
     category: Category::ProjectState,
+    tier: Tier::Fast,
     description: "`lpm.lockb` does not match the contents of `lpm.lock`.",
     when_fires: "TOML lockfile changed but the binary mirror was not regenerated.",
     remediation: "Run `lpm doctor --fix` to regenerate, or run `lpm install`.",
@@ -436,6 +501,7 @@ pub static LOCKFILE_BINARY_CORRUPT: CheckEntry = CheckEntry {
     code: "lockfile_binary_corrupt",
     name: "Binary lockfile",
     category: Category::ProjectState,
+    tier: Tier::Fast,
     description: "`lpm.lockb` does not parse as a valid binary lockfile.",
     when_fires: "Binary lockfile bytes are truncated, mis-versioned, or otherwise unreadable.",
     remediation: "Run `lpm doctor --fix` to regenerate from `lpm.lock`.",
@@ -447,6 +513,7 @@ pub static GITATTRIBUTES_LOCKB_MARKED: CheckEntry = CheckEntry {
     code: "gitattributes_lockb_marked",
     name: ".gitattributes",
     category: Category::ProjectState,
+    tier: Tier::Extended,
     description: "`.gitattributes` marks `lpm.lockb` as binary.",
     when_fires: "Repo has the recommended `lpm.lockb binary` rule.",
     remediation: "No action — informational pass.",
@@ -458,6 +525,7 @@ pub static GITATTRIBUTES_LOCKB_UNMARKED: CheckEntry = CheckEntry {
     code: "gitattributes_lockb_unmarked",
     name: ".gitattributes",
     category: Category::ProjectState,
+    tier: Tier::Extended,
     description: "`.gitattributes` exists but does not mark `lpm.lockb` as binary.",
     when_fires: "Repo has `.gitattributes` without the LPM lockb rule.",
     remediation: "Add `lpm.lockb binary` to `.gitattributes` so git diffs treat the file correctly.",
@@ -469,6 +537,7 @@ pub static GITATTRIBUTES_MISSING: CheckEntry = CheckEntry {
     code: "gitattributes_missing",
     name: ".gitattributes",
     category: Category::ProjectState,
+    tier: Tier::Extended,
     description: "No `.gitattributes` found — `lpm.lockb` may be diffed as text.",
     when_fires: "`<project>/.gitattributes` is missing.",
     remediation: "Run `lpm init` or add `lpm.lockb binary` to a new `.gitattributes`.",
@@ -480,6 +549,7 @@ pub static DEPS_SYNC_CLEAN: CheckEntry = CheckEntry {
     code: "deps_sync_clean",
     name: "Dependencies",
     category: Category::ProjectState,
+    tier: Tier::Fast,
     description: "`lpm.lock` and `package.json` agree on the declared dependency set.",
     when_fires: "No drift between manifest deps and lockfile entries.",
     remediation: "No action — informational pass.",
@@ -491,6 +561,7 @@ pub static DEPS_SYNC_DRIFT: CheckEntry = CheckEntry {
     code: "deps_sync_drift",
     name: "Dependencies",
     category: Category::ProjectState,
+    tier: Tier::Fast,
     description: "`lpm.lock` and `package.json` disagree — manifest changes have not been resolved.",
     when_fires: "Declared deps were added or removed without rerunning `lpm install`.",
     remediation: "Run `lpm install` to reconcile.",
@@ -502,6 +573,7 @@ pub static LOCAL_SOURCE_DIR_OK: CheckEntry = CheckEntry {
     code: "local_source_dir_ok",
     name: "Local sources",
     category: Category::ProjectState,
+    tier: Tier::Fast,
     description: "A `file:` / `link:` dependency points at a directory with a readable `package.json`.",
     when_fires: "All resolved local source paths are healthy directories.",
     remediation: "No action — informational pass.",
@@ -513,6 +585,7 @@ pub static LOCAL_SOURCE_TARBALL_OK: CheckEntry = CheckEntry {
     code: "local_source_tarball_ok",
     name: "Local sources",
     category: Category::ProjectState,
+    tier: Tier::Fast,
     description: "A `file:` dependency points at a readable tarball.",
     when_fires: "Tarball file exists and is readable.",
     remediation: "No action — informational pass.",
@@ -524,6 +597,7 @@ pub static LOCAL_SOURCE_DIR_NO_PKG: CheckEntry = CheckEntry {
     code: "local_source_dir_no_pkg",
     name: "Local sources",
     category: Category::ProjectState,
+    tier: Tier::Fast,
     description: "A `file:` / `link:` dependency points at a directory with no `package.json`.",
     when_fires: "Resolved local source path lacks the manifest LPM needs to install it.",
     remediation: "Add `package.json` to the local path or update the dep target.",
@@ -535,6 +609,7 @@ pub static LOCAL_SOURCE_INVALID_TYPE: CheckEntry = CheckEntry {
     code: "local_source_invalid_type",
     name: "Local sources",
     category: Category::ProjectState,
+    tier: Tier::Fast,
     description: "A `file:` / `link:` dependency points at an unexpected file type.",
     when_fires: "Resolved path is e.g. a socket or device — neither a tarball nor a directory.",
     remediation: "Re-target the dependency at a directory or a tarball file.",
@@ -546,6 +621,7 @@ pub static LOCAL_SOURCE_LINK_TO_FILE: CheckEntry = CheckEntry {
     code: "local_source_link_to_file",
     name: "Local sources",
     category: Category::ProjectState,
+    tier: Tier::Fast,
     description: "A `link:` dependency points at a regular file rather than a directory.",
     when_fires: "`link:` resolved to a non-directory target.",
     remediation: "`link:` must reference a project directory; switch to `file:` for tarballs.",
@@ -557,6 +633,7 @@ pub static LOCAL_SOURCE_UNREADABLE: CheckEntry = CheckEntry {
     code: "local_source_unreadable",
     name: "Local sources",
     category: Category::ProjectState,
+    tier: Tier::Fast,
     description: "A `file:` / `link:` dependency target could not be read.",
     when_fires: "Permission denied, broken symlink, or the path was deleted between resolution and probe.",
     remediation: "Restore the target path or fix permissions; rerun `lpm install`.",
@@ -572,6 +649,7 @@ pub static LPM_JSON_VALID: CheckEntry = CheckEntry {
     code: "lpm_json_valid",
     name: "lpm.json",
     category: Category::LpmJson,
+    tier: Tier::Fast,
     description: "`lpm.json` exists and parses against the strict schema.",
     when_fires: "Schema validation succeeded.",
     remediation: "No action — informational pass.",
@@ -583,6 +661,7 @@ pub static LPM_JSON_SCHEMA_WARNINGS: CheckEntry = CheckEntry {
     code: "lpm_json_schema_warnings",
     name: "lpm.json",
     category: Category::LpmJson,
+    tier: Tier::Fast,
     description: "`lpm.json` parsed but contained unknown or off-schema fields.",
     when_fires: "Validator surfaced warnings — typo, removed field, or undocumented key.",
     remediation: "Inspect the listed fields and align with the documented schema.",
@@ -594,6 +673,7 @@ pub static LPM_JSON_INVALID_SYNTAX: CheckEntry = CheckEntry {
     code: "lpm_json_invalid_syntax",
     name: "lpm.json",
     category: Category::LpmJson,
+    tier: Tier::Fast,
     description: "`lpm.json` is not valid JSON.",
     when_fires: "JSON parser raised a syntax error.",
     remediation: "Fix the JSON syntax error reported in `detail`.",
@@ -605,6 +685,7 @@ pub static LPM_JSON_NOT_OBJECT: CheckEntry = CheckEntry {
     code: "lpm_json_not_object",
     name: "lpm.json",
     category: Category::LpmJson,
+    tier: Tier::Fast,
     description: "`lpm.json`'s top-level value is not an object.",
     when_fires: "Top level is an array, scalar, or null.",
     remediation: "Replace with a JSON object literal `{ ... }`.",
@@ -616,6 +697,7 @@ pub static LPM_JSON_UNREADABLE: CheckEntry = CheckEntry {
     code: "lpm_json_unreadable",
     name: "lpm.json",
     category: Category::LpmJson,
+    tier: Tier::Fast,
     description: "`lpm.json` could not be read from disk.",
     when_fires: "Permission denied or unexpected I/O error.",
     remediation: "Fix file permissions; rerun doctor.",
@@ -631,6 +713,7 @@ pub static NODE_MANAGED_MATCH: CheckEntry = CheckEntry {
     code: "node_managed_match",
     name: "Node.js",
     category: Category::Runtime,
+    tier: Tier::Fast,
     description: "A managed Node install matches the pinned spec.",
     when_fires: "`lpm.json > runtime.node` (or `.nvmrc`, `engines.node`) resolves to an installed version.",
     remediation: "No action — informational pass.",
@@ -642,6 +725,7 @@ pub static NODE_PINNED_UNMET: CheckEntry = CheckEntry {
     code: "node_pinned_unmet",
     name: "Node.js",
     category: Category::Runtime,
+    tier: Tier::Fast,
     description: "Project pins a Node version but only a system Node satisfies (or none does).",
     when_fires: "Pin found, but no managed install matches; system Node may differ in patch / minor.",
     remediation: "Run `lpm use node@<version>` to install and pin the managed version.",
@@ -653,6 +737,7 @@ pub static NODE_MISSING_PINNED: CheckEntry = CheckEntry {
     code: "node_missing_pinned",
     name: "Node.js",
     category: Category::Runtime,
+    tier: Tier::Fast,
     description: "Project pins a Node version and no Node is reachable.",
     when_fires: "Pin found; no system or managed Node available.",
     remediation: "Run `lpm use node@<version>` to install the pinned version.",
@@ -664,6 +749,7 @@ pub static NODE_SYSTEM_UNPINNED: CheckEntry = CheckEntry {
     code: "node_system_unpinned",
     name: "Node.js",
     category: Category::Runtime,
+    tier: Tier::Fast,
     description: "No Node version is pinned; a system Node was found.",
     when_fires: "Project does not declare `runtime.node` / `engines.node` / `.nvmrc`.",
     remediation: "Optional: pin a Node version via `lpm.json > runtime.node` for reproducibility.",
@@ -675,6 +761,7 @@ pub static NODE_MISSING_UNPINNED: CheckEntry = CheckEntry {
     code: "node_missing_unpinned",
     name: "Node.js",
     category: Category::Runtime,
+    tier: Tier::Fast,
     description: "No Node version is pinned and no Node is reachable.",
     when_fires: "Neither a managed nor a system Node was found.",
     remediation: "Install Node via `lpm use node@22` (or your preferred version).",
@@ -690,6 +777,7 @@ pub static TUNNEL_ACTIVE: CheckEntry = CheckEntry {
     code: "tunnel_active",
     name: "Tunnel",
     category: Category::Tunnel,
+    tier: Tier::Extended,
     description: "A tunnel domain is configured and the registry confirms ownership.",
     when_fires: "User authenticated, claim verified.",
     remediation: "No action — informational pass.",
@@ -701,6 +789,7 @@ pub static TUNNEL_IDLE: CheckEntry = CheckEntry {
     code: "tunnel_idle",
     name: "Tunnel",
     category: Category::Tunnel,
+    tier: Tier::Extended,
     description: "No tunnel domain is configured for this project.",
     when_fires: "`lpm.json > tunnel.domain` is not set.",
     remediation: "No action — informational pass. Configure a domain to enable `lpm dev --tunnel`.",
@@ -712,6 +801,7 @@ pub static TUNNEL_UNAUTHENTICATED: CheckEntry = CheckEntry {
     code: "tunnel_unauthenticated",
     name: "Tunnel",
     category: Category::Tunnel,
+    tier: Tier::Extended,
     description: "A tunnel domain is configured but the user is not authenticated to verify ownership.",
     when_fires: "Tunnel domain set, no auth token available — informational only.",
     remediation: "Run `lpm login` to verify ownership.",
@@ -723,6 +813,7 @@ pub static TUNNEL_UNVERIFIED: CheckEntry = CheckEntry {
     code: "tunnel_unverified",
     name: "Tunnel",
     category: Category::Tunnel,
+    tier: Tier::Extended,
     description: "Ownership of the tunnel domain could not be verified due to a transient registry error.",
     when_fires: "Registry returned an unexpected status when checking the claim.",
     remediation: "Retry; check `lpm health`.",
@@ -734,6 +825,7 @@ pub static TUNNEL_NOT_CLAIMED: CheckEntry = CheckEntry {
     code: "tunnel_not_claimed",
     name: "Tunnel",
     category: Category::Tunnel,
+    tier: Tier::Extended,
     description: "The configured tunnel domain is not claimed by this account.",
     when_fires: "Registry reports no claim for the domain on this user.",
     remediation: "Run `lpm tunnel claim <domain>` (Pro/Org) or change the domain.",
@@ -745,6 +837,7 @@ pub static TUNNEL_OWNED_BY_OTHER: CheckEntry = CheckEntry {
     code: "tunnel_owned_by_other",
     name: "Tunnel",
     category: Category::Tunnel,
+    tier: Tier::Extended,
     description: "The configured tunnel domain is claimed by a different account.",
     when_fires: "Registry reports the domain belongs to another user.",
     remediation: "Choose a different domain; the current claim is held elsewhere.",
@@ -756,6 +849,7 @@ pub static TUNNEL_UNREACHABLE: CheckEntry = CheckEntry {
     code: "tunnel_unreachable",
     name: "Tunnel",
     category: Category::Tunnel,
+    tier: Tier::Extended,
     description: "The registry could not be reached to verify the tunnel claim.",
     when_fires: "Network timeout / DNS failure during claim probe.",
     remediation: "Check network; retry `lpm doctor`.",
@@ -767,6 +861,7 @@ pub static TUNNEL_UNKNOWN_BASE: CheckEntry = CheckEntry {
     code: "tunnel_unknown_base",
     name: "Tunnel",
     category: Category::Tunnel,
+    tier: Tier::Extended,
     description: "Configured tunnel domain uses a base domain LPM does not recognize.",
     when_fires: "`lpm.json > tunnel.domain` ends in a base other than `lpm.fyi` / `lpm.llc`.",
     remediation: "Use one of the supported base domains, or contact the LPM team to add a new one.",
@@ -778,6 +873,7 @@ pub static TUNNEL_DOMAIN_NO_DOT: CheckEntry = CheckEntry {
     code: "tunnel_domain_no_dot",
     name: "Tunnel",
     category: Category::Tunnel,
+    tier: Tier::Extended,
     description: "Configured tunnel domain has no dot separating subdomain from base.",
     when_fires: "Domain has no `.` (e.g. `myapp` instead of `myapp.lpm.fyi`).",
     remediation: "Set the full domain: `<subdomain>.lpm.fyi` or `<subdomain>.lpm.llc`.",
@@ -789,6 +885,7 @@ pub static TUNNEL_DOMAIN_EMPTY_LABEL: CheckEntry = CheckEntry {
     code: "tunnel_domain_empty_label",
     name: "Tunnel",
     category: Category::Tunnel,
+    tier: Tier::Extended,
     description: "Configured tunnel domain has an empty label (e.g., `..lpm.fyi`).",
     when_fires: "Adjacent dots in the configured domain.",
     remediation: "Remove the empty label.",
@@ -800,6 +897,7 @@ pub static TUNNEL_DOMAIN_LABEL_TOO_LONG: CheckEntry = CheckEntry {
     code: "tunnel_domain_label_too_long",
     name: "Tunnel",
     category: Category::Tunnel,
+    tier: Tier::Extended,
     description: "A label in the configured tunnel domain exceeds 63 characters (DNS limit).",
     when_fires: "DNS label too long.",
     remediation: "Shorten the offending label.",
@@ -811,6 +909,7 @@ pub static TUNNEL_DOMAIN_TOO_LONG: CheckEntry = CheckEntry {
     code: "tunnel_domain_too_long",
     name: "Tunnel",
     category: Category::Tunnel,
+    tier: Tier::Extended,
     description: "Total tunnel domain length exceeds the DNS limit.",
     when_fires: "Domain longer than 253 characters.",
     remediation: "Shorten the domain.",
@@ -822,6 +921,7 @@ pub static TUNNEL_SUBDOMAIN_LENGTH: CheckEntry = CheckEntry {
     code: "tunnel_subdomain_length",
     name: "Tunnel",
     category: Category::Tunnel,
+    tier: Tier::Extended,
     description: "Tunnel subdomain length is outside the allowed range.",
     when_fires: "Subdomain too short or too long for the LPM regex.",
     remediation: "Pick a subdomain between the documented bounds.",
@@ -833,6 +933,7 @@ pub static TUNNEL_SUBDOMAIN_CHARS: CheckEntry = CheckEntry {
     code: "tunnel_subdomain_chars",
     name: "Tunnel",
     category: Category::Tunnel,
+    tier: Tier::Extended,
     description: "Tunnel subdomain contains characters outside the allowed alphabet.",
     when_fires: "Non-`[a-z0-9-]` characters in the subdomain.",
     remediation: "Use only lowercase letters, digits, and hyphens.",
@@ -844,6 +945,7 @@ pub static TUNNEL_SUBDOMAIN_HYPHEN: CheckEntry = CheckEntry {
     code: "tunnel_subdomain_hyphen",
     name: "Tunnel",
     category: Category::Tunnel,
+    tier: Tier::Extended,
     description: "Tunnel subdomain starts or ends with a hyphen.",
     when_fires: "Leading or trailing `-` in the subdomain.",
     remediation: "Subdomains must start and end with an alphanumeric character.",
@@ -859,6 +961,7 @@ pub static LINT_CLEAN: CheckEntry = CheckEntry {
     code: "lint_clean",
     name: "Lint (oxlint)",
     category: Category::CodeQuality,
+    tier: Tier::Extended,
     description: "Oxlint reports no issues for the project.",
     when_fires: "Oxlint installed and exited with no errors or warnings.",
     remediation: "No action — informational pass.",
@@ -870,6 +973,7 @@ pub static LINT_WARNINGS: CheckEntry = CheckEntry {
     code: "lint_warnings",
     name: "Lint (oxlint)",
     category: Category::CodeQuality,
+    tier: Tier::Extended,
     description: "Oxlint reported warnings for the project.",
     when_fires: "Lint run produced warning-level findings.",
     remediation: "Run `lpm lint` to inspect, then address.",
@@ -881,6 +985,7 @@ pub static LINT_ERRORS: CheckEntry = CheckEntry {
     code: "lint_errors",
     name: "Lint (oxlint)",
     category: Category::CodeQuality,
+    tier: Tier::Extended,
     description: "Oxlint reported errors for the project.",
     when_fires: "Lint run produced error-level findings.",
     remediation: "Run `lpm lint` and fix the reported errors.",
@@ -892,6 +997,7 @@ pub static LINT_UNPARSEABLE: CheckEntry = CheckEntry {
     code: "lint_unparseable",
     name: "Lint (oxlint)",
     category: Category::CodeQuality,
+    tier: Tier::Extended,
     description: "Oxlint output could not be parsed by doctor.",
     when_fires: "Doctor's output parser failed on the lint result.",
     remediation: "Run `lpm lint` directly to see the raw output.",
@@ -903,6 +1009,7 @@ pub static FMT_CLEAN: CheckEntry = CheckEntry {
     code: "fmt_clean",
     name: "Format (biome)",
     category: Category::CodeQuality,
+    tier: Tier::Extended,
     description: "Biome reports the project formatting is clean.",
     when_fires: "`biome format --check` exited cleanly.",
     remediation: "No action — informational pass.",
@@ -914,6 +1021,7 @@ pub static FMT_UNFORMATTED: CheckEntry = CheckEntry {
     code: "fmt_unformatted",
     name: "Format (biome)",
     category: Category::CodeQuality,
+    tier: Tier::Extended,
     description: "Biome found files that need reformatting.",
     when_fires: "`biome format --check` exited non-zero with formatting issues.",
     remediation: "Run `lpm fmt` to apply formatting.",
@@ -925,6 +1033,7 @@ pub static FMT_OTHER_ISSUE: CheckEntry = CheckEntry {
     code: "fmt_other_issue",
     name: "Format (biome)",
     category: Category::CodeQuality,
+    tier: Tier::Extended,
     description: "Biome reported a non-format issue (parse error, config error, etc.).",
     when_fires: "Biome exited with an error not classified as plain unformatted code.",
     remediation: "Run `lpm fmt --check` to see the raw biome output.",
@@ -940,6 +1049,7 @@ pub static TYPESCRIPT_HEALTHY: CheckEntry = CheckEntry {
     code: "typescript_healthy",
     name: "TypeScript",
     category: Category::TypeScript,
+    tier: Tier::Extended,
     description: "Project-local `tsc` resolves through the `node_modules/.bin` chain.",
     when_fires: "A `tsconfig.json`-owning directory has the local typescript install reachable.",
     remediation: "No action — informational pass.",
@@ -951,6 +1061,7 @@ pub static TYPESCRIPT_MISSING_FOR_TSCONFIG: CheckEntry = CheckEntry {
     code: "typescript_missing_for_tsconfig",
     name: "TypeScript",
     category: Category::TypeScript,
+    tier: Tier::Extended,
     description: "`tsc` is reachable only via the system `PATH`; no project-local install.",
     when_fires: "A `tsconfig.json`-owning directory has no `node_modules/.bin/tsc` but the system `PATH` provides one.",
     remediation: "Run `lpm install -D typescript` so editor + CI use the same version.",
@@ -962,6 +1073,7 @@ pub static TYPESCRIPT_UNAVAILABLE: CheckEntry = CheckEntry {
     code: "typescript_unavailable",
     name: "TypeScript",
     category: Category::TypeScript,
+    tier: Tier::Extended,
     description: "`tsc` is not reachable for a `tsconfig.json`-owning directory.",
     when_fires: "Neither `node_modules/.bin/tsc` nor a system `tsc` is present.",
     remediation: "Run `lpm install -D typescript` (or `lpm install` if `typescript` is already declared).",
@@ -977,6 +1089,7 @@ pub static PLUGIN_UP_TO_DATE: CheckEntry = CheckEntry {
     code: "plugin_up_to_date",
     name: "Plugin",
     category: Category::Plugin,
+    tier: Tier::Extended,
     description: "An installed plugin is at the latest known version.",
     when_fires: "Latest probe matched the installed version.",
     remediation: "No action — informational pass.",
@@ -988,6 +1101,7 @@ pub static PLUGIN_UPDATE_AVAILABLE: CheckEntry = CheckEntry {
     code: "plugin_update_available",
     name: "Plugin",
     category: Category::Plugin,
+    tier: Tier::Extended,
     description: "A newer version of an installed plugin is available upstream.",
     when_fires: "Upstream probe returned a higher version than the installed one.",
     remediation: "Run `lpm plugin update <name>` to update.",
@@ -1003,6 +1117,7 @@ pub static WORKSPACE_ACYCLIC: CheckEntry = CheckEntry {
     code: "workspace_acyclic",
     name: "Workspace",
     category: Category::Workspace,
+    tier: Tier::Fast,
     description: "No dependency cycles among workspace members.",
     when_fires: "Topological order computed cleanly.",
     remediation: "No action — informational pass.",
@@ -1014,6 +1129,7 @@ pub static WORKSPACE_CYCLE: CheckEntry = CheckEntry {
     code: "workspace_cycle",
     name: "Workspace",
     category: Category::Workspace,
+    tier: Tier::Fast,
     description: "A dependency cycle exists among workspace members.",
     when_fires: "Topology computation detected a cycle.",
     remediation: "Break the cycle by removing or restructuring the offending workspace dep.",
@@ -1029,6 +1145,7 @@ pub static GLOBAL_MANIFEST_VALID: CheckEntry = CheckEntry {
     code: "global_manifest_valid",
     name: "Global manifest",
     category: Category::Globals,
+    tier: Tier::Extended,
     description: "`~/.lpm/global/manifest.json` parses and is structurally valid.",
     when_fires: "Manifest exists and is well-formed.",
     remediation: "No action — informational pass.",
@@ -1040,6 +1157,7 @@ pub static GLOBAL_MANIFEST_ABSENT: CheckEntry = CheckEntry {
     code: "global_manifest_absent",
     name: "Global manifest",
     category: Category::Globals,
+    tier: Tier::Extended,
     description: "No global install manifest is present (no global installs yet).",
     when_fires: "`~/.lpm/global/` is empty or missing.",
     remediation: "No action — informational pass.",
@@ -1051,6 +1169,7 @@ pub static GLOBAL_MANIFEST_CORRUPT: CheckEntry = CheckEntry {
     code: "global_manifest_corrupt",
     name: "Global manifest",
     category: Category::Globals,
+    tier: Tier::Extended,
     description: "`~/.lpm/global/manifest.json` is unreadable or malformed.",
     when_fires: "JSON parse error or schema mismatch.",
     remediation: "Inspect and repair, or reinstall affected globals.",
@@ -1062,6 +1181,7 @@ pub static GLOBAL_BIN_ON_PATH: CheckEntry = CheckEntry {
     code: "global_bin_on_path",
     name: "Global bin on PATH",
     category: Category::Globals,
+    tier: Tier::Extended,
     description: "`~/.lpm/bin` is on the user's `PATH`.",
     when_fires: "Shell `PATH` contains the global bin dir.",
     remediation: "No action — informational pass.",
@@ -1073,6 +1193,7 @@ pub static GLOBAL_BIN_OFF_PATH: CheckEntry = CheckEntry {
     code: "global_bin_off_path",
     name: "Global bin on PATH",
     category: Category::Globals,
+    tier: Tier::Extended,
     description: "`~/.lpm/bin` is not on the user's `PATH`.",
     when_fires: "Global installs exist but their shims won't be found.",
     remediation: "Add `~/.lpm/bin` to your shell PATH (see `lpm install --global` notes).",
@@ -1084,6 +1205,7 @@ pub static GLOBAL_SHIMS_CLEAN: CheckEntry = CheckEntry {
     code: "global_shims_clean",
     name: "Orphaned shims",
     category: Category::Globals,
+    tier: Tier::Extended,
     description: "Every shim in `~/.lpm/bin` belongs to a recorded global install.",
     when_fires: "No orphan shim files.",
     remediation: "No action — informational pass.",
@@ -1095,6 +1217,7 @@ pub static GLOBAL_SHIMS_NO_DIR: CheckEntry = CheckEntry {
     code: "global_shims_no_dir",
     name: "Orphaned shims",
     category: Category::Globals,
+    tier: Tier::Extended,
     description: "Global bin directory does not yet exist.",
     when_fires: "No globals installed.",
     remediation: "No action — informational pass.",
@@ -1106,6 +1229,7 @@ pub static GLOBAL_SHIMS_ORPHANS: CheckEntry = CheckEntry {
     code: "global_shims_orphans",
     name: "Orphaned shims",
     category: Category::Globals,
+    tier: Tier::Extended,
     description: "Files exist in `~/.lpm/bin` without a matching manifest entry.",
     when_fires: "Shim file present but no global install owns it.",
     remediation: "Remove the orphan files, or run `lpm install --global` to re-register.",
@@ -1117,6 +1241,7 @@ pub static GLOBAL_SHIMS_UNREADABLE: CheckEntry = CheckEntry {
     code: "global_shims_unreadable",
     name: "Orphaned shims",
     category: Category::Globals,
+    tier: Tier::Extended,
     description: "Global bin directory could not be enumerated.",
     when_fires: "Permission denied or filesystem error reading `~/.lpm/bin`.",
     remediation: "Fix permissions; rerun doctor.",
@@ -1128,6 +1253,7 @@ pub static GLOBAL_INSTALL_ROOTS_EMPTY: CheckEntry = CheckEntry {
     code: "global_install_roots_empty",
     name: "Global install roots",
     category: Category::Globals,
+    tier: Tier::Extended,
     description: "No global installs are recorded.",
     when_fires: "Manifest empty or missing.",
     remediation: "No action — informational pass.",
@@ -1139,6 +1265,7 @@ pub static GLOBAL_INSTALL_ROOTS_HEALTHY: CheckEntry = CheckEntry {
     code: "global_install_roots_healthy",
     name: "Global install roots",
     category: Category::Globals,
+    tier: Tier::Extended,
     description: "Every global install root exists and carries a ready marker.",
     when_fires: "All recorded global installs are intact.",
     remediation: "No action — informational pass.",
@@ -1150,6 +1277,7 @@ pub static GLOBAL_INSTALL_ROOTS_UNHEALTHY: CheckEntry = CheckEntry {
     code: "global_install_roots_unhealthy",
     name: "Global install roots",
     category: Category::Globals,
+    tier: Tier::Extended,
     description: "One or more global install roots are missing or incomplete.",
     when_fires: "Manifest entry references a path that does not exist or has no ready marker.",
     remediation: "Reinstall the affected globals (`lpm install --global <pkg>`).",
@@ -1165,6 +1293,7 @@ pub static SANDBOX_AVAILABLE: CheckEntry = CheckEntry {
     code: "sandbox_available",
     name: "Sandbox",
     category: Category::Sandbox,
+    tier: Tier::Extended,
     description: "The OS sandbox backend used by lifecycle scripts is available. Phase 46.1 rework (2026-05-11): the default posture is filesystem-write containment + env scrubbing; outbound network denial is the opt-in `strict` mode. Strict-mode coverage is platform-asymmetric: full denial on macOS Seatbelt (every socket family); on Linux, landlock V4 covers outbound TCP and the Phase 46.1.1 seccomp-bpf layer covers direct UDP / raw / AF_PACKET / AF_NETLINK socket() — AF_UNIX intentionally allowed for legitimate IPC.",
     when_fires: "Seatbelt (macOS) or Landlock (Linux) is reachable on this host. Phase 46.1 strict-mode outbound network denial engages only when the user has opted in via `--strict-sandbox` / `--paranoid`, `[sandbox] mode = \"strict\"`, or `LPM_STRICT_SANDBOX=1`.",
     remediation: "No action — informational pass.",
@@ -1188,6 +1317,7 @@ pub static SANDBOX_HELPER_MISSING: CheckEntry = CheckEntry {
     code: "sandbox_helper_missing",
     name: "Sandbox",
     category: Category::Sandbox,
+    tier: Tier::Extended,
     description: "On Windows, the `lpm-sandbox-helper.exe` companion binary that delivers Phase 46.3 PR-2 AppContainer strict-mode (filesystem-write + outbound-network containment) is not located next to `lpm.exe`. The sandbox falls back to the Phase 46.2 Low IL backend, which contains filesystem writes but does NOT deny outbound network — so `--strict-sandbox` / `[sandbox] mode = \"strict\"` cannot be honored on this install.",
     when_fires: "Windows host running a PR-2+ build of `lpm.exe` but missing the companion `lpm-sandbox-helper.exe` in the same directory. Typical causes: corrupted npm install of `@lpm-registry/cli-win32-x64`, manual binary fetch that skipped the helper, or running a dev build that didn't bundle the helper alongside the test binary.",
     remediation: "Reinstall `@lpm-registry/cli` via your package manager to restore the helper, or set `LPM_SANDBOX_HELPER=<absolute path>` if the helper lives elsewhere on the host. To drop the strict request and silence this warning without restoring the helper, run `lpm config sandbox --set default`.",
@@ -1207,6 +1337,7 @@ pub static SANDBOX_DEGRADED: CheckEntry = CheckEntry {
     code: "sandbox_degraded",
     name: "Sandbox",
     category: Category::Sandbox,
+    tier: Tier::Extended,
     description: "The sandbox is running in the Phase 46.1 degraded posture (landlock V1 fallback). Filesystem containment is active; the strict-mode outbound network denial the user opted into is NOT enforced because the host kernel is below the V4 floor.",
     when_fires: "User has set `[sandbox] mode = \"strict\"` (or `--strict-sandbox` / `LPM_STRICT_SANDBOX=1`) AND `[sandbox] allow-degraded = true` AND the host kernel is below the landlock V4 floor (6.7).",
     remediation: "Pick one: (a) upgrade the host kernel to 6.7+ and unset `[sandbox] allow-degraded` to get the strict posture you asked for; (b) drop back to the default posture via `lpm config sandbox --set default` (filesystem + env containment, no network denial — the recommended default).",
@@ -1228,6 +1359,7 @@ pub static SANDBOX_DISABLED_BY_USER: CheckEntry = CheckEntry {
     code: "sandbox_disabled_by_user",
     name: "Sandbox",
     category: Category::Sandbox,
+    tier: Tier::Extended,
     description: "The sandbox is persistently disabled by user config — `[sandbox] mode = \"none\"` in `~/.lpm/config.toml` or `./lpm.toml`. Lifecycle scripts run with no filesystem / env / network containment.",
     when_fires: "User has set `[sandbox] mode = \"none\"` (typically via `lpm config sandbox --set none`).",
     remediation: "If this is unintended, restore the recommended default via `lpm config sandbox --set default` (or `--set strict` for paranoid mode). The disabled posture is the npm-default experience — every lifecycle script gets full host access, including credential env vars.",
@@ -1239,6 +1371,7 @@ pub static SANDBOX_KERNEL_TOO_OLD: CheckEntry = CheckEntry {
     code: "sandbox_kernel_too_old",
     name: "Sandbox",
     category: Category::Sandbox,
+    tier: Tier::Extended,
     description: "Linux kernel is too old to support Landlock at the Phase 46.1 strict floor (V4 / kernel 6.7+).",
     when_fires: "User has opted into strict mode (via `--strict-sandbox` / `--paranoid` / `[sandbox] mode = \"strict\"` / `LPM_STRICT_SANDBOX=1`) but the host kernel cannot support V4. Phase 46.1 refuses to run lifecycle scripts under strict on kernels below this floor unless the user has explicitly opted into the degraded posture.",
     remediation: "Pick one: (1) `[sandbox] allow-degraded = true` in `~/.lpm/config.toml` or `./lpm.toml` for the V1 filesystem-only fallback (no outbound network containment); (2) `lpm config sandbox --set default` to drop back to the recommended default posture (filesystem + env containment, network allowed); (3) add the package to `package.json > lpm > trustedDependencies` to skip the sandbox for that dependency; (4) `lpm install --no-sandbox` for a one-shot escape (or `lpm config sandbox --set none` to persist); (5) upgrade the host kernel to 6.7+.",
@@ -1250,6 +1383,7 @@ pub static SANDBOX_UNSUPPORTED_PLATFORM: CheckEntry = CheckEntry {
     code: "sandbox_unsupported_platform",
     name: "Sandbox",
     category: Category::Sandbox,
+    tier: Tier::Extended,
     description: "No supported sandbox backend exists for this platform.",
     when_fires: "Running on a host where neither Seatbelt nor Landlock is available.",
     remediation: "Lifecycle scripts will not be sandboxed on this platform — review with `lpm approve-scripts`.",
@@ -1261,6 +1395,7 @@ pub static SANDBOX_PROBE_FAILED: CheckEntry = CheckEntry {
     code: "sandbox_probe_failed",
     name: "Sandbox",
     category: Category::Sandbox,
+    tier: Tier::Extended,
     description: "The sandbox probe errored unexpectedly.",
     when_fires: "Backend reported an error not covered by the more specific codes.",
     remediation: "File a bug with the `detail` text.",
@@ -1276,6 +1411,7 @@ pub static POLICY_FORCE_SECURITY_FLOOR: CheckEntry = CheckEntry {
     code: "policy_force_security_floor",
     name: "Script policy",
     category: Category::Sandbox,
+    tier: Tier::Extended,
     description: "An override is in effect that lowers the default script-policy floor.",
     when_fires: "User opted into a less-strict policy via flag, env, or config.",
     remediation: "Review the override and confirm it matches the project's threat model.",
@@ -1298,6 +1434,7 @@ pub static PNPM_OVERRIDES_DRIFT: CheckEntry = CheckEntry {
     code: lpm_workspace::PNPM_OVERRIDES_DRIFT_META.code,
     name: lpm_workspace::PNPM_OVERRIDES_DRIFT_META.name,
     category: Category::ManifestCompat,
+    tier: Tier::Extended,
     description: lpm_workspace::PNPM_OVERRIDES_DRIFT_META.description,
     when_fires: lpm_workspace::PNPM_OVERRIDES_DRIFT_META.when_fires,
     remediation: lpm_workspace::PNPM_OVERRIDES_DRIFT_META.remediation,
@@ -1309,6 +1446,7 @@ pub static PNPM_PATCHES_DRIFT: CheckEntry = CheckEntry {
     code: lpm_workspace::PNPM_PATCHES_DRIFT_META.code,
     name: lpm_workspace::PNPM_PATCHES_DRIFT_META.name,
     category: Category::ManifestCompat,
+    tier: Tier::Extended,
     description: lpm_workspace::PNPM_PATCHES_DRIFT_META.description,
     when_fires: lpm_workspace::PNPM_PATCHES_DRIFT_META.when_fires,
     remediation: lpm_workspace::PNPM_PATCHES_DRIFT_META.remediation,
@@ -1320,6 +1458,7 @@ pub static PNPM_PEER_RULES_DRIFT: CheckEntry = CheckEntry {
     code: lpm_workspace::PNPM_PEER_RULES_DRIFT_META.code,
     name: lpm_workspace::PNPM_PEER_RULES_DRIFT_META.name,
     category: Category::ManifestCompat,
+    tier: Tier::Extended,
     description: lpm_workspace::PNPM_PEER_RULES_DRIFT_META.description,
     when_fires: lpm_workspace::PNPM_PEER_RULES_DRIFT_META.when_fires,
     remediation: lpm_workspace::PNPM_PEER_RULES_DRIFT_META.remediation,
@@ -1331,6 +1470,7 @@ pub static ENGINES_NPM_IGNORED: CheckEntry = CheckEntry {
     code: lpm_workspace::ENGINES_NPM_IGNORED_META.code,
     name: lpm_workspace::ENGINES_NPM_IGNORED_META.name,
     category: Category::ManifestCompat,
+    tier: Tier::Extended,
     description: lpm_workspace::ENGINES_NPM_IGNORED_META.description,
     when_fires: lpm_workspace::ENGINES_NPM_IGNORED_META.when_fires,
     remediation: lpm_workspace::ENGINES_NPM_IGNORED_META.remediation,
@@ -1342,6 +1482,7 @@ pub static ENGINES_PNPM_IGNORED: CheckEntry = CheckEntry {
     code: lpm_workspace::ENGINES_PNPM_IGNORED_META.code,
     name: lpm_workspace::ENGINES_PNPM_IGNORED_META.name,
     category: Category::ManifestCompat,
+    tier: Tier::Extended,
     description: lpm_workspace::ENGINES_PNPM_IGNORED_META.description,
     when_fires: lpm_workspace::ENGINES_PNPM_IGNORED_META.when_fires,
     remediation: lpm_workspace::ENGINES_PNPM_IGNORED_META.remediation,
@@ -1353,6 +1494,7 @@ pub static ENGINES_YARN_IGNORED: CheckEntry = CheckEntry {
     code: lpm_workspace::ENGINES_YARN_IGNORED_META.code,
     name: lpm_workspace::ENGINES_YARN_IGNORED_META.name,
     category: Category::ManifestCompat,
+    tier: Tier::Extended,
     description: lpm_workspace::ENGINES_YARN_IGNORED_META.description,
     when_fires: lpm_workspace::ENGINES_YARN_IGNORED_META.when_fires,
     remediation: lpm_workspace::ENGINES_YARN_IGNORED_META.remediation,
@@ -1364,6 +1506,7 @@ pub static ENGINES_BUN_IGNORED: CheckEntry = CheckEntry {
     code: lpm_workspace::ENGINES_BUN_IGNORED_META.code,
     name: lpm_workspace::ENGINES_BUN_IGNORED_META.name,
     category: Category::ManifestCompat,
+    tier: Tier::Extended,
     description: lpm_workspace::ENGINES_BUN_IGNORED_META.description,
     when_fires: lpm_workspace::ENGINES_BUN_IGNORED_META.when_fires,
     remediation: lpm_workspace::ENGINES_BUN_IGNORED_META.remediation,
@@ -1522,6 +1665,7 @@ pub struct InventoryRow {
     pub code: &'static str,
     pub name: &'static str,
     pub category: Category,
+    pub tier: Tier,
     pub description: &'static str,
     pub when_fires: &'static str,
     pub remediation: &'static str,
@@ -1545,6 +1689,7 @@ impl InventoryRow {
             code: entry.code,
             name: entry.name,
             category: entry.category,
+            tier: entry.tier,
             description: entry.description,
             when_fires: entry.when_fires,
             remediation: entry.remediation,
@@ -1692,6 +1837,87 @@ mod tests {
                 entry.code
             );
         }
+    }
+
+    /// Tier drift-guard. Every `pub static <NAME>: CheckEntry`
+    /// declaration in this module MUST explicitly assign a `tier:`
+    /// field — leaving it to a struct-literal default is impossible
+    /// (the field has no default), but a copy-paste of an old entry
+    /// shape that pre-dates the tier field would fail to compile at
+    /// the field-init level. This test is the belt-and-braces:
+    /// every declaration has a `tier:` line between the opening `{`
+    /// and the closing `};`. Catches the case where someone reorders
+    /// fields or splits a declaration across helpers in a way that
+    /// confuses the compiler about which entry the tier belongs to.
+    ///
+    /// Also asserts the fast-tier population stays bounded — sharp
+    /// changes here are worth a second look, since the fast preset
+    /// is the user-visible default surface of `lpm doctor`.
+    #[test]
+    fn every_pub_static_check_entry_declares_a_tier() {
+        const SRC: &str = include_str!("doctor_catalog.rs");
+
+        let mut current_entry: Option<&str> = None;
+        let mut tier_seen_in_current = false;
+        let mut missing: Vec<&str> = Vec::new();
+
+        for line in SRC.lines() {
+            let trim = line.trim_start();
+            if let Some(rest) = trim.strip_prefix("pub static ")
+                && let Some(idx) = rest.find(": CheckEntry =")
+            {
+                // Close out the previous entry before opening the new one.
+                if let Some(name) = current_entry
+                    && !tier_seen_in_current
+                {
+                    missing.push(name);
+                }
+                current_entry = Some(&rest[..idx]);
+                tier_seen_in_current = false;
+                continue;
+            }
+            if current_entry.is_some() && trim.starts_with("tier:") {
+                tier_seen_in_current = true;
+            }
+            if current_entry.is_some() && trim == "};" {
+                if !tier_seen_in_current && let Some(name) = current_entry {
+                    missing.push(name);
+                }
+                current_entry = None;
+                tier_seen_in_current = false;
+            }
+        }
+        // Trailing entry, in case the file ends without a closing `};`
+        // line (shouldn't happen, but guard against scanner drift).
+        if let Some(name) = current_entry
+            && !tier_seen_in_current
+        {
+            missing.push(name);
+        }
+
+        assert!(
+            missing.is_empty(),
+            "catalog static(s) missing a `tier:` field — every \
+             `pub static <NAME>: CheckEntry = CheckEntry {{ ... }}` \
+             MUST assign a tier explicitly. Missing: {missing:?}"
+        );
+
+        // Population sanity floors: at least one entry in each tier.
+        // Catches the case where someone bulk-edits to a single tier.
+        let fast = CLI_CATALOG
+            .iter()
+            .chain(MANIFEST_COMPAT_ENTRIES.iter())
+            .filter(|e| matches!(e.tier, Tier::Fast))
+            .count();
+        let extended = CLI_CATALOG
+            .iter()
+            .chain(MANIFEST_COMPAT_ENTRIES.iter())
+            .filter(|e| matches!(e.tier, Tier::Extended))
+            .count();
+        assert!(
+            fast > 0 && extended > 0,
+            "both tiers must have at least one entry; got fast={fast} extended={extended}"
+        );
     }
 
     #[test]
