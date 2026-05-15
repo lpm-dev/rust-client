@@ -1814,6 +1814,21 @@ async fn pre_resolve_non_registry_deps(
     let mut file_kinds: HashMap<String, FileKindClassification> = HashMap::new();
     for (local_name, raw) in deps.iter() {
         match lpm_resolver::Specifier::parse(raw) {
+            // Defaults-fixes #2: surface UnknownProtocol /
+            // WindowsDriveLetterPath at the manifest preflight rather
+            // than swallowing the error and letting the resolver fail
+            // downstream with a confusing "no version found for tag
+            // 'magic:bar'" message. Other parse errors stay on the
+            // pre-fix swallow path to preserve behavior for malformed
+            // shapes that were previously tolerated upstream.
+            Err(
+                err @ (lpm_resolver::SpecifierParseError::UnknownProtocol { .. }
+                | lpm_resolver::SpecifierParseError::WindowsDriveLetterPath(_)),
+            ) => {
+                return Err(LpmError::Registry(format!(
+                    "dep '{local_name}' in package.json has invalid spec '{raw}': {err}"
+                )));
+            }
             Err(_)
             | Ok(lpm_resolver::Specifier::SemverRange(_))
             | Ok(lpm_resolver::Specifier::NpmAlias { .. })

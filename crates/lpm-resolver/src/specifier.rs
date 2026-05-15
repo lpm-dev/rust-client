@@ -96,6 +96,36 @@ pub enum SpecifierParseError {
     HostShorthandEmptyBody(String),
     #[error("host shorthand is not user/repo shape: {0:?}")]
     HostShorthandInvalidShape(String),
+    /// Defaults-fixes #2: input has a colon-shaped prefix that doesn't
+    /// match any known protocol. Pre-fix these fell through to
+    /// SemverRange and produced a confusing downstream node_semver
+    /// error; this surfaces the actual problem at the parser boundary
+    /// with the supported set + a close-match suggestion when one
+    /// exists (Levenshtein ≤ 2).
+    #[error(
+        "unknown package specifier protocol '{prefix}'. \
+         Supported: npm:, workspace:, file:, link:, catalog:, \
+         git+http(s)://, git+ssh://, git+file://, git://, github:, \
+         gitlab:, bitbucket:, gist:, http(s)://, or bare semver/dist-tag.\
+         {}",
+         match suggestion {
+             Some(s) => format!(" Did you mean '{s}:'?"),
+             None => String::new(),
+         }
+    )]
+    UnknownProtocol {
+        prefix: String,
+        suggestion: Option<String>,
+    },
+    /// Defaults-fixes #2: input looks like a Windows drive-letter path
+    /// (`C:\foo`, `c:/bar`). npm-style manifests express path
+    /// dependencies via the `file:` prefix even on Windows; raw drive
+    /// letters would otherwise hit the unknown-protocol path with
+    /// `C` / `c` as the prefix, which masks the actual fix.
+    #[error(
+        "Windows drive-letter path '{0}' — declare path dependencies via the `file:` prefix (e.g. `file:./relative` or `file:C:/absolute`)"
+    )]
+    WindowsDriveLetterPath(String),
 }
 
 impl Specifier {
@@ -193,6 +223,18 @@ impl Specifier {
             return expand_github_shorthand(s);
         }
 
+        // Defaults-fixes #2: catch colon-shaped protocol prefixes that
+        // none of the parser arms above matched. Pre-fix `magic:bar`
+        // and `filee:./foo` fell through to SemverRange and produced a
+        // confusing downstream node_semver parse error; the guard
+        // converts that into a clear `UnknownProtocol` at the parser
+        // boundary with a close-match suggestion. Known-but-malformed
+        // prefixes (e.g. `https:foo` without `//`) are left to fall
+        // through — different bug, not in scope for #2.
+        if let Some(err) = detect_unknown_protocol(s) {
+            return Err(err);
+        }
+
         // Everything else: assume semver range. Validation against
         // node_semver happens in NpmRange::parse downstream; we just
         // capture the string verbatim. Specifier::parse never claims
@@ -200,6 +242,131 @@ impl Specifier {
         // bucket.
         Ok(Specifier::SemverRange(s.to_string()))
     }
+}
+
+// ── Unknown-protocol detection (defaults-fixes #2) ──────────────────────────
+
+/// Known protocol prefix tokens (the part before `:` only — `git+http`
+/// etc. counts as one token here even though the parser dispatches on
+/// the `git+` prefix and accepts arbitrary URL tails after).
+///
+/// Used by [`detect_unknown_protocol`] for two things:
+/// 1. **Whitelist check** — if `prefix` matches one of these tokens
+///    exactly, the parser's arms upstream should have matched. Reaching
+///    the guard means a malformed-known-protocol shape (`https:foo` w/o
+///    `//`) — out of scope for #2, falls through to SemverRange.
+/// 2. **Suggestion source** — `closest_known_prefix` returns the
+///    Levenshtein-nearest entry within distance 2 for "did you mean".
+///
+/// Keep alphabetical so tie-breaking in `closest_known_prefix` is
+/// deterministic.
+const KNOWN_PROTOCOL_PREFIXES: &[&str] = &[
+    "bitbucket",
+    "catalog",
+    "file",
+    "gist",
+    "git",
+    "git+file",
+    "git+git",
+    "git+http",
+    "git+https",
+    "git+ssh",
+    "github",
+    "gitlab",
+    "http",
+    "https",
+    "link",
+    "npm",
+    "workspace",
+];
+
+fn detect_unknown_protocol(s: &str) -> Option<SpecifierParseError> {
+    let colon = s.find(':')?;
+    let prefix = &s[..colon];
+    if prefix.is_empty() {
+        return None;
+    }
+
+    // Windows drive-letter exemption — `C:\foo` / `c:/foo`.
+    // Empty drive content (`C:`) without a separator falls through to
+    // the protocol-shape check, which then rejects on the uppercase
+    // leading char.
+    if prefix.len() == 1
+        && prefix
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_alphabetic())
+        && let Some(rest) = s.get(colon + 1..)
+        && (rest.starts_with('\\') || rest.starts_with('/'))
+    {
+        return Some(SpecifierParseError::WindowsDriveLetterPath(s.to_string()));
+    }
+
+    // Protocol shape — `^[a-z][a-z0-9+-]*$`. Anything else is not a
+    // protocol prefix and the colon is incidental (e.g. a `:` inside a
+    // future grammar extension or an oddly-shaped dist-tag).
+    let first = prefix.chars().next()?;
+    if !first.is_ascii_lowercase() {
+        return None;
+    }
+    if !prefix
+        .chars()
+        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '+' || c == '-')
+    {
+        return None;
+    }
+
+    // Known-but-didn't-match — out of scope for #2, fall through.
+    if KNOWN_PROTOCOL_PREFIXES.contains(&prefix) {
+        return None;
+    }
+
+    Some(SpecifierParseError::UnknownProtocol {
+        prefix: format!("{prefix}:"),
+        suggestion: closest_known_prefix(prefix),
+    })
+}
+
+/// Levenshtein-nearest entry from [`KNOWN_PROTOCOL_PREFIXES`] within
+/// edit distance 2. Returns the alphabetically-first prefix when
+/// multiple share the minimum distance — array is kept sorted so the
+/// natural iteration order is deterministic.
+fn closest_known_prefix(input: &str) -> Option<String> {
+    KNOWN_PROTOCOL_PREFIXES
+        .iter()
+        .map(|p| (*p, levenshtein(input, p)))
+        .filter(|&(_, d)| d <= 2)
+        .min_by_key(|&(_, d)| d)
+        .map(|(p, _)| p.to_string())
+}
+
+/// Iterative Levenshtein edit distance with two rolling rows. Inputs are
+/// short ASCII protocol prefixes (≤9 chars each in the workspace), so
+/// the `Vec<char>` collect cost is negligible vs. handling UTF-8
+/// boundaries manually.
+fn levenshtein(a: &str, b: &str) -> usize {
+    let a: Vec<char> = a.chars().collect();
+    let b: Vec<char> = b.chars().collect();
+    if a.is_empty() {
+        return b.len();
+    }
+    if b.is_empty() {
+        return a.len();
+    }
+    let mut prev: Vec<usize> = (0..=b.len()).collect();
+    let mut curr = vec![0usize; b.len() + 1];
+    for i in 1..=a.len() {
+        curr[0] = i;
+        for j in 1..=b.len() {
+            let cost = if a[i - 1] == b[j - 1] { 0 } else { 1 };
+            curr[j] = std::cmp::min(
+                std::cmp::min(prev[j] + 1, curr[j - 1] + 1),
+                prev[j - 1] + cost,
+            );
+        }
+        std::mem::swap(&mut prev, &mut curr);
+    }
+    prev[b.len()]
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
@@ -1046,6 +1213,189 @@ mod tests {
             Specifier::parse("link:"),
             Err(SpecifierParseError::LinkEmptyPath)
         ));
+    }
+
+    // ── Unknown protocol guard (defaults-fixes #2) ───────────────────────────
+    //
+    // Pre-fix, any `magic:bar`-shaped input fell through to SemverRange and
+    // produced a confusing downstream parse error from node_semver
+    // ("expected version, found 'magic:bar'"). The user couldn't tell that
+    // their protocol was unrecognized vs. their version was malformed. The
+    // guard intercepts the colon-shaped prefix and emits a helpful error
+    // pointing at the supported set with a close-match suggestion.
+
+    #[test]
+    fn unknown_protocol_errors_with_no_suggestion() {
+        let err = Specifier::parse("magic:bar").unwrap_err();
+        match err {
+            SpecifierParseError::UnknownProtocol { prefix, suggestion } => {
+                assert_eq!(prefix, "magic:");
+                assert_eq!(suggestion, None);
+            }
+            other => panic!("expected UnknownProtocol, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn unknown_protocol_suggests_file_for_filee_typo() {
+        let err = Specifier::parse("filee:./bar").unwrap_err();
+        match err {
+            SpecifierParseError::UnknownProtocol { prefix, suggestion } => {
+                assert_eq!(prefix, "filee:");
+                assert_eq!(suggestion, Some("file".to_string()));
+            }
+            other => panic!("expected UnknownProtocol, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn unknown_protocol_suggests_npm_for_npmm_typo() {
+        let err = Specifier::parse("npmm:foo@1.0").unwrap_err();
+        match err {
+            SpecifierParseError::UnknownProtocol {
+                prefix: _,
+                suggestion,
+            } => assert_eq!(suggestion, Some("npm".to_string())),
+            other => panic!("expected UnknownProtocol, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn unknown_protocol_suggests_workspace_for_workspac_typo() {
+        let err = Specifier::parse("workspac:*").unwrap_err();
+        match err {
+            SpecifierParseError::UnknownProtocol {
+                prefix: _,
+                suggestion,
+            } => assert_eq!(suggestion, Some("workspace".to_string())),
+            other => panic!("expected UnknownProtocol, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn unknown_protocol_suggests_link_for_lik_typo() {
+        let err = Specifier::parse("lik:./foo").unwrap_err();
+        match err {
+            SpecifierParseError::UnknownProtocol {
+                prefix: _,
+                suggestion,
+            } => assert_eq!(suggestion, Some("link".to_string())),
+            other => panic!("expected UnknownProtocol, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn unknown_protocol_error_message_lists_supported_set() {
+        // The user-facing Display must enumerate the supported protocols
+        // and include the suggestion when present. Pin both so a doc /
+        // contract change here surfaces in code review.
+        let err = Specifier::parse("filee:./bar").unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("filee:"),
+            "must surface the offending prefix, got: {msg}"
+        );
+        for keyword in ["npm:", "workspace:", "file:", "link:", "git+", "http(s)"] {
+            assert!(
+                msg.contains(keyword),
+                "must list supported protocol '{keyword}', got: {msg}"
+            );
+        }
+        assert!(
+            msg.contains("Did you mean 'file:'"),
+            "must include suggestion 'file:', got: {msg}"
+        );
+    }
+
+    #[test]
+    fn unknown_protocol_no_suggestion_omits_did_you_mean() {
+        let err = Specifier::parse("magic:bar").unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            !msg.to_lowercase().contains("did you mean"),
+            "must omit 'did you mean' when no close match, got: {msg}"
+        );
+    }
+
+    // ── Windows drive-letter exemption ──────────────────────────────────────
+
+    #[test]
+    fn windows_drive_letter_backslash_errors_with_hint() {
+        let err = Specifier::parse(r"C:\path\to\dir").unwrap_err();
+        match err {
+            SpecifierParseError::WindowsDriveLetterPath(input) => {
+                assert_eq!(input, r"C:\path\to\dir");
+            }
+            other => panic!("expected WindowsDriveLetterPath, got {other:?}"),
+        }
+        let msg = SpecifierParseError::WindowsDriveLetterPath(r"C:\foo".to_string()).to_string();
+        assert!(
+            msg.contains("file:"),
+            "must hint at `file:` prefix, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn windows_drive_letter_forward_slash_errors_with_hint() {
+        let err = Specifier::parse("c:/foo").unwrap_err();
+        assert!(matches!(
+            err,
+            SpecifierParseError::WindowsDriveLetterPath(_)
+        ));
+    }
+
+    // ── Known-but-malformed and false-positive guards ───────────────────────
+
+    #[test]
+    fn known_prefix_with_bad_tail_still_falls_through_today() {
+        // `https:foo` (no `//`) is a malformed known protocol — out of
+        // scope for the unknown-protocol fix. Pre-fix behavior is to
+        // fall through to SemverRange; preserve that until a dedicated
+        // malformed-known-protocol error is added.
+        assert!(matches!(
+            Specifier::parse("https:foo"),
+            Ok(Specifier::SemverRange(_))
+        ));
+    }
+
+    #[test]
+    fn semver_with_no_colon_is_unaffected() {
+        // The guard only fires for colon-shaped prefixes; pure semver
+        // ranges (`^1.0`, `1.0.0`, ranges with `||`, dist-tags) never
+        // contain `:` and must pass through unchanged.
+        assert_eq!(parse("^1.0.0"), Specifier::SemverRange("^1.0.0".into()));
+        assert_eq!(
+            parse(">=1.0 <2.0"),
+            Specifier::SemverRange(">=1.0 <2.0".into())
+        );
+        assert_eq!(parse("next"), Specifier::SemverRange("next".into()));
+    }
+
+    #[test]
+    fn scoped_npm_name_has_no_colon_is_unaffected() {
+        // `@types/node` has `/` not `:` — the guard never fires.
+        assert_eq!(
+            parse("@types/node"),
+            Specifier::SemverRange("@types/node".into())
+        );
+    }
+
+    #[test]
+    fn leading_colon_is_not_a_protocol() {
+        // `:foo` has empty prefix → not a protocol shape, falls through.
+        assert_eq!(parse(":foo"), Specifier::SemverRange(":foo".into()));
+    }
+
+    #[test]
+    fn uppercase_first_char_is_not_a_protocol() {
+        // Protocol shape requires a lowercase ASCII leading char.
+        // `MAGIC:bar` (uppercase) falls through to SemverRange so future
+        // grammar changes that legitimately use uppercase identifiers
+        // don't get misclassified.
+        assert_eq!(
+            parse("MAGIC:bar"),
+            Specifier::SemverRange("MAGIC:bar".into())
+        );
     }
 
     // ── Display round-trip ───────────────────────────────────────────────────
