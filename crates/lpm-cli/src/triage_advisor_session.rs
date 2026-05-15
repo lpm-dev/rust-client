@@ -14,7 +14,7 @@
 //! - Default `none`.
 //!
 //! `./lpm.toml` is **not** in this chain by repo convention (see
-//! Phase 46 §5.2 in the plan doc) — that file is reserved for the
+//! in the plan doc) — that file is reserved for the
 //! save-policy reader today; a general project-config loader is a
 //! separate follow-up.
 //!
@@ -74,8 +74,8 @@ use lpm_triage_advisor::{
 use crate::output;
 
 /// Max in-flight advisor classifications inside
-/// [`AdvisorSession::classify_amber`]. Phase 46.2 parallelization
-/// (2026-05-11): pre-parallelization, packages were classified one
+/// [`AdvisorSession::classify_amber`]. parallelization
+/// : pre-parallelization, packages were classified one
 /// after another and a 10-amber install paid 10 × LLM round-trip.
 /// Post-parallelization, we cap at this many in-flight calls so:
 /// - local providers (Ollama) don't get queue-saturated (one
@@ -88,7 +88,7 @@ use crate::output;
 ///   (the dominant amber count on real installs is 1-5, so 8 covers
 ///   every workload-size we've seen without spinning extra futures).
 ///
-/// Single-amber installs (the W5 case in the DX doc) are unchanged
+/// Single-amber installs the DX benchmark are unchanged
 /// by this concurrency — there's only one task to drive. The win
 /// shows up at amber-count ≥ 2.
 const CLASSIFY_CONCURRENCY: usize = 8;
@@ -116,7 +116,7 @@ pub struct AdvisorSession {
     /// Set to `true` after the single degrade-warning fires. Guards
     /// against repeat warnings if a future caller does extra preflight.
     warned_about_unavailable: bool,
-    /// Phase 46b — L4 verdict cache. Shared across the parallel
+    /// — L4 verdict cache. Shared across the parallel
     /// classify tasks via [`Arc`]. `None` when the cache could not be
     /// opened (e.g. no resolvable HOME) — the session falls back to
     /// uncached classification with a one-line warning, never
@@ -190,7 +190,7 @@ impl AdvisorSession {
         }
         match adapter.test_invoke().await {
             Ok(_) => {
-                // Phase 46b — open the L4 cache once at preflight.
+                // — open the L4 cache once at preflight.
                 // Probe provider_version + prompt_template_hash here
                 // so the per-package classify path doesn't repeat
                 // them. Cache-open failure is non-fatal: the install
@@ -288,7 +288,7 @@ impl AdvisorSession {
             return;
         };
 
-        // Phase 46.2 parallelization (2026-05-11): fan out one task
+        // parallelization : fan out one task
         // per candidate package across the advisor concurrently. The
         // `Advisor` trait is `Send + Sync` and `classify_amber`
         // takes `&self`, so concurrent calls are safe; only the
@@ -303,13 +303,13 @@ impl AdvisorSession {
         //
         // Bounded concurrency: cap at [`CLASSIFY_CONCURRENCY`] so
         // local providers (Ollama) don't get queue-saturated and
-        // cloud providers stay below typical rate limits. The W5
+        // cloud providers stay below typical rate limits. The
         // case (1 amber package) is unchanged; the win is on
         // installs with several amber-tier deps. Pre-parallelization
         // the cost was N × round-trip; post-parallelization it's
         // ceil(N / CONCURRENCY) × round-trip.
         //
-        // Phase 46b L4 cache: lookup before the LLM call, insert
+        // L4 cache: lookup before the LLM call, insert
         // after. Cached hits skip the round-trip entirely; misses
         // pay the round-trip once and amortize on every later
         // install. The cache is `Arc`-shared across the `buffer_
@@ -354,7 +354,7 @@ impl AdvisorSession {
                         );
                     }
 
-                    // Phase 46b Lever #3 — borrow the referenced-
+                    // Lever #3 — borrow the referenced-
                     // file content as a slice of `ReferencedScript`
                     // so the prompt's "Referenced files" section
                     // can render the embedded view.
@@ -447,7 +447,7 @@ impl AdvisorSession {
             }
         }
 
-        // Phase 46b — write the cache back to disk once per session.
+        // — write the cache back to disk once per session.
         // Failure to persist is non-fatal: in-memory cache is still
         // populated, but next install starts cold.
         if let Some(cache) = self.cache.as_deref()
@@ -491,7 +491,7 @@ pub struct AmberPackageRequest {
     /// the request must carry the same identity the downstream
     /// trust-evaluation path will use.
     pub integrity: Option<String>,
-    /// Phase 46b Lever #1 — `repository` URL from the package
+    /// Lever #1 — `repository` URL from the package
     /// manifest (typically `package.json > repository.url` or the
     /// legacy shorthand string). Forwarded to the advisor prompt as
     /// the `Repository:` line; pairs with the "fetch IDENTITY"
@@ -507,7 +507,7 @@ pub struct AmberPackageRequest {
     /// would otherwise vacuously promote to Approve — guarded
     /// against in the consumer).
     pub amber_phases: Vec<(String, String)>,
-    /// Phase 46b Lever #3 — files the script body delegates to,
+    /// Lever #3 — files the script body delegates to,
     /// each as `(filename, content)`. The advisor prompt's
     /// "Referenced files" section embeds these so the model can
     /// evaluate the actual fetch / build / payload, not just the
@@ -563,7 +563,7 @@ fn warn_once(json_output: bool, message: &str) {
     output::warn(message);
 }
 
-/// Phase 46b — best-effort cache open for the install-pipeline
+/// — best-effort cache open for the install-pipeline
 /// session. A failure (no resolvable HOME, IO error) emits a
 /// one-line warning and degrades to "no cache" rather than failing
 /// the install. The cache module's `LPM_L4_CACHE=0` env var disables
@@ -585,7 +585,7 @@ fn open_cache_or_warn(json_output: bool) -> Option<Arc<L4Cache>> {
     }
 }
 
-/// Phase 46b — build the L4-cache key for one [`AmberPackageRequest`].
+/// — build the L4-cache key for one [`AmberPackageRequest`].
 /// Borrows the request's owned strings without copying. Folds in the
 /// repository URL (Lever #1) and the referenced-scripts content
 /// (Lever #3) so a manifest that adds, removes, or changes any of
@@ -770,7 +770,7 @@ mod tests {
 
     #[tokio::test]
     async fn precedence_cli_explicit_none_overrides_active_lower_layers() {
-        // **Locked CLI flag contract (Phase 46 slice 1 close-out).**
+        // **Locked CLI flag contract (slice 1 close-out).**
         // `lpm install --advisor=none` is an explicit per-invocation
         // opt-out that MUST win over any `package.json` /
         // `~/.lpm/config.toml` value beneath it. Without this, a user
@@ -1030,10 +1030,10 @@ mod tests {
 
     #[tokio::test]
     async fn classify_amber_fans_out_in_parallel_across_packages() {
-        // Phase 46.2 parallelization (2026-05-11): pre-parallel the
+        // parallelization : pre-parallel the
         // outer per-package loop awaited each LLM round-trip
         // sequentially, so N amber packages cost N × round-trip wall
-        // clock. The DX-doc walkthrough W5 measured 2.1s on a single
+        // clock. The DX-doc walkthrough measured 2.1s on a single
         // amber install, dominated by ONE round-trip; a five-amber
         // install would have hit ~5–10s. Post-parallel, up to
         // [`CLASSIFY_CONCURRENCY`] calls are in flight at once.
@@ -1176,7 +1176,7 @@ mod tests {
     }
 
     // ─────────────────────────────────────────────────────────────
-    // Phase 46b — L4 cache behavioral contract
+    // — L4 cache behavioral contract
     // ─────────────────────────────────────────────────────────────
 
     fn session_with_cache(advisor: FakeAdvisor, cache: Arc<L4Cache>) -> AdvisorSession {

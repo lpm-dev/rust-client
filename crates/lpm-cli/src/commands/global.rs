@@ -1,6 +1,6 @@
 //! `lpm global` — read-only commands against the global manifest.
 //!
-//! Phase 37 M2.5 ships `list`, `bin`, `path`. The full surface
+//! M2.5 ships `list`, `bin`, `path`. The full surface
 //! (`install`, `uninstall`, `update`, `remove`) lands in M3 once the
 //! install pipeline is wired through `IsolatedInstall::persistent`.
 //! Because reads do not need a lock, the M2 commands work straight off
@@ -57,13 +57,13 @@ pub enum GlobalCmd {
     ///
     /// With no argument: re-resolve every globally-installed package
     /// against its persisted `saved_spec` and upgrade any that have
-    /// a newer matching version available. Phase 33 precedence applies
+    /// a newer matching version available. precedence applies
     /// — preserved ranges, dist-tag re-pin, etc.
     ///
     /// With `<pkg>` (no version): same flow scoped to one package.
     ///
     /// With `<pkg>@<spec>` (M3.4 stretch): rewrite the saved_spec
-    /// using Phase 33's `decide_saved_dependency_spec`, then upgrade.
+    /// using the `decide_saved_dependency_spec`, then upgrade.
     /// Same precedence as `lpm install <pkg>@<spec>` in a project.
     ///
     /// Use `--dry-run` to print the upgrade plan without making any
@@ -132,7 +132,7 @@ fn run_list(
 
 // ─── M6.1: lpm global list --outdated ─────────────────────────────────
 
-/// Phase 37 M6.1: compare each globally-installed package's resolved
+/// M6.1: compare each globally-installed package's resolved
 /// version against the highest version the registry exposes under the
 /// package's persisted `saved_spec`. Report packages whose registry
 /// has something newer.
@@ -177,7 +177,7 @@ async fn run_list_outdated(
     }
 
     // Single batch call covers every globally-installed package.
-    // Phase 35 Step 6 fix: use the injected client (carries
+    // Step 6 fix: use the injected client (carries
     // `--registry` + SessionManager). The local `build_registry()`
     // helper is now unused.
     let names: Vec<String> = manifest.packages.keys().cloned().collect();
@@ -297,7 +297,7 @@ fn pick_latest_matching(
         .ok_or_else(|| format!("no version of '{}' satisfies '{}'", meta.name, saved_spec))
 }
 
-// Phase 35 Step 6 fix: removed `build_registry` — all callers now
+// Step 6 fix: removed `build_registry` — all callers now
 // receive the injected `&RegistryClient` from `main.rs` so the
 // `--registry` flag and the shared `SessionManager` are honored.
 
@@ -571,7 +571,7 @@ fn run_path(
 
 // ─── helpers ───────────────────────────────────────────────────────────
 
-/// Best-effort post-commit tombstone sweep (Phase 37 M3.5). Never fails
+/// Best-effort post-commit tombstone sweep. Never fails
 /// the caller and never surfaces visible output unless actual cleanup
 /// happened — a janitor, not a progress report.
 ///
@@ -672,7 +672,7 @@ mod tests {
         assert!(r.is_ok());
     }
 
-    /// Phase 37 M6.1: `--outdated` on an empty manifest prints an
+    /// M6.1: `--outdated` on an empty manifest prints an
     /// "all up-to-date" (or "no globals") result and short-circuits
     /// before any registry call.
     #[tokio::test]

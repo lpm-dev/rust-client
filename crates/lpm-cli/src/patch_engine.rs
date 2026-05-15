@@ -1,4 +1,4 @@
-//! **Phase 32 Phase 6 — `lpm patch` engine.**
+//! 
 //!
 //! Patches are unified diffs (GNU patch format) generated from the
 //! difference between a clean store copy of a package and a user-edited
@@ -461,7 +461,7 @@ pub struct GeneratedPatch {
     pub diff: String,
     /// Number of files with text diffs (modifications, additions, deletions).
     pub files_changed: usize,
-    /// Files where binary content differs. Phase 6 hard-errors on
+    /// Files where binary content differs. hard-errors on
     /// `patch-commit` if this is non-empty.
     pub binary_files_differ: Vec<String>,
     /// Total `+` lines across all hunks.
@@ -660,7 +660,7 @@ fn has_nul(bytes: &[u8]) -> bool {
 ///   is followed by a plain `---/+++` chunk for a DIFFERENT file: the
 ///   `---` path mismatch against `rename from` is the signal that the
 ///   prior section ended. Without this rule the two sections collapse
-///   into one chunk (GPT audit, 2026-05-15).
+///   into one chunk (GPT audit).
 ///
 /// Hunk content lines start with ` `, `+`, `-`, or `\` (single
 /// character + content), so a line beginning with `diff --git ` or
@@ -888,7 +888,7 @@ fn classify_patch_op(chunk: &str) -> Result<PatchOp<'_>, LpmError> {
 /// `originalIntegrity` recorded in `package.json`. Hard-errors on
 /// mismatch — this is the drift gate.
 ///
-/// **Phase 66 confidence-followup S2 (2026-05-08).** Resolves the
+/// Resolves the
 /// baseline via [`lpm_store::find_installed_package_baseline`], which
 /// prefers the v2 virtual store (link's `meta.source_sri`) and falls
 /// back to v1's per-package `.integrity` sentinel. Pre-fix this
@@ -927,7 +927,7 @@ pub fn verify_original_integrity(
 ///
 /// `locations` is the slice of [`MaterializedPackage`]s filtered to
 /// entries where `name == this_name && version == this_version`. The
-/// patch engine does NOT walk `node_modules/` — see Phase 6 status doc
+/// patch engine does NOT walk `node_modules/` — see status doc
 /// F-V4 for the rationale.
 ///
 /// Errors are hard install failures — never warnings.
@@ -1858,7 +1858,7 @@ mod tests {
         assert!(chunks[0].contains("--- a/x.js"));
     }
 
-    /// **GPT audit regression (2026-05-15).** A mixed-format patch with
+    /// **GPT audit regression .** A mixed-format patch with
     /// a git rename-only section followed by a plain `---`/`+++` chunk
     /// for a DIFFERENT file must produce two chunks. Pre-fix the
     /// state-machine kept `in_git_header` true after the rename-only
@@ -2088,7 +2088,7 @@ mod tests {
         assert!(msg.contains("sha512-DIFFERENT"));
     }
 
-    /// **Phase 66 confidence-followup S2.** A v2-only install — no v1
+    /// A v2-only install — no v1
     /// dir; package bytes at `<store>/v2/links/<key>/node_modules/<name>/`
     /// alongside a sidecar `.lpm-link-meta.json` — must satisfy the
     /// patch baseline lookup. Pre-fix the resolver only walked v1 and
@@ -2153,7 +2153,7 @@ mod tests {
 
     #[test]
     fn verify_integrity_fails_when_no_store_entry_resolvable() {
-        // Phase 66 confidence-followup S2: with the v2-aware lookup,
+        // confidence-followup S2: with the v2-aware lookup,
         // a v1 dir present but missing `.integrity` is treated as "no
         // resolvable baseline" — same outcome as v1+v2 both empty —
         // because `find_installed_package_baseline` only returns Some

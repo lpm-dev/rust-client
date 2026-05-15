@@ -371,7 +371,7 @@ pub static NODE_MODULES_VIRTUAL_HEALTHY: CheckEntry = CheckEntry {
     category: Category::ProjectState,
     tier: Tier::Fast,
     description: "`node_modules/` symlinks point into the virtual store at `~/.lpm/store/v2/links/`.",
-    when_fires: "User opted into `LPM_STORE_VERSION=v2` (Phase 66 dev-only flag) and the virtual-store layout is intact.",
+    when_fires: "User opted into `LPM_STORE_VERSION=v2` (dev-only flag) and the virtual-store layout is intact.",
     remediation: "No action — informational pass.",
     possible_severities: &[Severity::Pass],
     auto_fix: None,
@@ -1294,18 +1294,18 @@ pub static SANDBOX_AVAILABLE: CheckEntry = CheckEntry {
     name: "Sandbox",
     category: Category::Sandbox,
     tier: Tier::Extended,
-    description: "The OS sandbox backend used by lifecycle scripts is available. Phase 46.1 rework (2026-05-11): the default posture is filesystem-write containment + env scrubbing; outbound network denial is the opt-in `strict` mode. Strict-mode coverage is platform-asymmetric: full denial on macOS Seatbelt (every socket family); on Linux, landlock V4 covers outbound TCP and the Phase 46.1.1 seccomp-bpf layer covers direct UDP / raw / AF_PACKET / AF_NETLINK socket() — AF_UNIX intentionally allowed for legitimate IPC.",
-    when_fires: "Seatbelt (macOS) or Landlock (Linux) is reachable on this host. Phase 46.1 strict-mode outbound network denial engages only when the user has opted in via `--strict-sandbox` / `--paranoid`, `[sandbox] mode = \"strict\"`, or `LPM_STRICT_SANDBOX=1`.",
+    description: "The OS sandbox backend used by lifecycle scripts is available. rework : the default posture is filesystem-write containment + env scrubbing; outbound network denial is the opt-in `strict` mode. Strict-mode coverage is platform-asymmetric: full denial on macOS Seatbelt (every socket family); on Linux, landlock V4 covers outbound TCP and the seccomp-bpf layer covers direct UDP / raw / AF_PACKET / AF_NETLINK socket() — AF_UNIX intentionally allowed for legitimate IPC.",
+    when_fires: "Seatbelt (macOS) or Landlock (Linux) is reachable on this host. strict-mode outbound network denial engages only when the user has opted in via `--strict-sandbox` / `--paranoid`, `[sandbox] mode = \"strict\"`, or `LPM_STRICT_SANDBOX=1`.",
     remediation: "No action — informational pass.",
     possible_severities: &[Severity::Pass],
     auto_fix: None,
 };
 
-/// Phase 46.3 PR-2 doctor surface (2026-05-13): on Windows, the
+/// on Windows, the
 /// `lpm-sandbox-helper.exe` companion binary that delivers
 /// AppContainer strict-mode (filesystem-write + outbound-network
 /// containment via WFP) is not located next to `lpm.exe`. The
-/// sandbox is still active via the Phase 46.2 Low IL fallback —
+/// sandbox is still active via the Low IL fallback —
 /// filesystem-write is contained — but **strict mode is
 /// unreachable until the helper is restored**. Distinct catalog
 /// entry from [`SANDBOX_AVAILABLE`] so JSON consumers can detect
@@ -1318,14 +1318,14 @@ pub static SANDBOX_HELPER_MISSING: CheckEntry = CheckEntry {
     name: "Sandbox",
     category: Category::Sandbox,
     tier: Tier::Extended,
-    description: "On Windows, the `lpm-sandbox-helper.exe` companion binary that delivers Phase 46.3 PR-2 AppContainer strict-mode (filesystem-write + outbound-network containment) is not located next to `lpm.exe`. The sandbox falls back to the Phase 46.2 Low IL backend, which contains filesystem writes but does NOT deny outbound network — so `--strict-sandbox` / `[sandbox] mode = \"strict\"` cannot be honored on this install.",
-    when_fires: "Windows host running a PR-2+ build of `lpm.exe` but missing the companion `lpm-sandbox-helper.exe` in the same directory. Typical causes: corrupted npm install of `@lpm-registry/cli-win32-x64`, manual binary fetch that skipped the helper, or running a dev build that didn't bundle the helper alongside the test binary.",
+    description: "On Windows, the `lpm-sandbox-helper.exe` companion binary that delivers AppContainer strict-mode (filesystem-write + outbound-network containment) is not located next to `lpm.exe`. The sandbox falls back to the Low IL backend, which contains filesystem writes but does NOT deny outbound network — so `--strict-sandbox` / `[sandbox] mode = \"strict\"` cannot be honored on this install.",
+    when_fires: "Windows host running a  build of `lpm.exe` but missing the companion `lpm-sandbox-helper.exe` in the same directory. Typical causes: corrupted npm install of `@lpm-registry/cli-win32-x64`, manual binary fetch that skipped the helper, or running a dev build that didn't bundle the helper alongside the test binary.",
     remediation: "Reinstall `@lpm-registry/cli` via your package manager to restore the helper, or set `LPM_SANDBOX_HELPER=<absolute path>` if the helper lives elsewhere on the host. To drop the strict request and silence this warning without restoring the helper, run `lpm config sandbox --set default`.",
     possible_severities: &[Severity::Warn],
     auto_fix: None,
 };
 
-/// Phase 46.1 doctor surface: strict mode is engaged but the host
+/// doctor surface: strict mode is engaged but the host
 /// kernel forced the V1 fallback (landlock V1, filesystem-only — no
 /// outbound network denial). Distinct catalog entry from
 /// [`SANDBOX_AVAILABLE`] so JSON consumers can detect "containment
@@ -1338,14 +1338,14 @@ pub static SANDBOX_DEGRADED: CheckEntry = CheckEntry {
     name: "Sandbox",
     category: Category::Sandbox,
     tier: Tier::Extended,
-    description: "The sandbox is running in the Phase 46.1 degraded posture (landlock V1 fallback). Filesystem containment is active; the strict-mode outbound network denial the user opted into is NOT enforced because the host kernel is below the V4 floor.",
+    description: "The sandbox is running in the degraded posture (landlock V1 fallback). Filesystem containment is active; the strict-mode outbound network denial the user opted into is NOT enforced because the host kernel is below the V4 floor.",
     when_fires: "User has set `[sandbox] mode = \"strict\"` (or `--strict-sandbox` / `LPM_STRICT_SANDBOX=1`) AND `[sandbox] allow-degraded = true` AND the host kernel is below the landlock V4 floor (6.7).",
     remediation: "Pick one: (a) upgrade the host kernel to 6.7+ and unset `[sandbox] allow-degraded` to get the strict posture you asked for; (b) drop back to the default posture via `lpm config sandbox --set default` (filesystem + env containment, no network denial — the recommended default).",
     possible_severities: &[Severity::Warn],
     auto_fix: None,
 };
 
-/// Phase 46.1 rework GPT-5 audit follow-up (2026-05-11): the user
+/// rework GPT-5 audit follow-up : the user
 /// has persistently disabled the sandbox via
 /// `[sandbox] mode = "none"` in `~/.lpm/config.toml` / `./lpm.toml`
 /// (typically set by `lpm config sandbox --set none`). Distinct
@@ -1372,8 +1372,8 @@ pub static SANDBOX_KERNEL_TOO_OLD: CheckEntry = CheckEntry {
     name: "Sandbox",
     category: Category::Sandbox,
     tier: Tier::Extended,
-    description: "Linux kernel is too old to support Landlock at the Phase 46.1 strict floor (V4 / kernel 6.7+).",
-    when_fires: "User has opted into strict mode (via `--strict-sandbox` / `--paranoid` / `[sandbox] mode = \"strict\"` / `LPM_STRICT_SANDBOX=1`) but the host kernel cannot support V4. Phase 46.1 refuses to run lifecycle scripts under strict on kernels below this floor unless the user has explicitly opted into the degraded posture.",
+    description: "Linux kernel is too old to support Landlock at the strict floor (V4 / kernel 6.7+).",
+    when_fires: "User has opted into strict mode (via `--strict-sandbox` / `--paranoid` / `[sandbox] mode = \"strict\"` / `LPM_STRICT_SANDBOX=1`) but the host kernel cannot support V4. refuses to run lifecycle scripts under strict on kernels below this floor unless the user has explicitly opted into the degraded posture.",
     remediation: "Pick one: (1) `[sandbox] allow-degraded = true` in `~/.lpm/config.toml` or `./lpm.toml` for the V1 filesystem-only fallback (no outbound network containment); (2) `lpm config sandbox --set default` to drop back to the recommended default posture (filesystem + env containment, network allowed); (3) add the package to `package.json > lpm > trustedDependencies` to skip the sandbox for that dependency; (4) `lpm install --no-sandbox` for a one-shot escape (or `lpm config sandbox --set none` to persist); (5) upgrade the host kernel to 6.7+.",
     possible_severities: &[Severity::Warn],
     auto_fix: None,
@@ -1403,7 +1403,7 @@ pub static SANDBOX_PROBE_FAILED: CheckEntry = CheckEntry {
     auto_fix: None,
 };
 
-// Phase 68: `POLICY_SCOPE_PROJECT_ONLY` was removed — `lpm install -g`
+// `POLICY_SCOPE_PROJECT_ONLY` was removed — `lpm install -g`
 // now honors the same script-policy / sandbox / cooldown / drift gates
 // as project installs, so the boundary it described no longer exists.
 

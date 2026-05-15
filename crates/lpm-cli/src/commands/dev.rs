@@ -828,7 +828,7 @@ fn print_startup_banner(info: &StartupInfo, project_dir: &Path) {
 
 /// Check if dependencies are up to date by comparing install hash.
 ///
-/// Phase 34.1: delegates to the shared `install_state::check_install_state()`
+/// delegates to the shared `install_state::check_install_state()`
 /// which has the stronger semantics (lockfile required, mtime check).
 ///
 /// Returns `(needs_install, computed_hash)`. The hash is `None` only when
@@ -877,7 +877,7 @@ async fn auto_install_if_stale(
     // The install pipeline now writes the correct v6 hash on every
     // successful exit path; this branch just propagates success.
     //
-    // Phase 35 Step 6 fix: use the injected client. Pre-fix this
+    // Step 6 fix: use the injected client. Pre-fix this
     // built a fresh `RegistryClient::new()` with no token, so any
     // `@lpm.dev` package required by the dev project would have been
     // unauthenticated.
@@ -888,19 +888,19 @@ async fn auto_install_if_stale(
         false,                                                 // offline
         false,                                                 // force
         false,                                                 // allow_new
-        false,                                                 // strict_integrity (Phase 59.0 F5)
+        false,                                                 // strict_integrity
         None,                                                  // linker_override
         false,                                                 // no_skills
         false,                                                 // no_editor_setup
         true,                                                  // no_security_summary
         false,                                                 // auto_build
         None,                                                  // target_set: dev is single-project
-        None, // direct_versions_out: dev does not finalize Phase 33 placeholders
+        None, // direct_versions_out: dev does not finalize placeholders
         None, // script_policy_override: `lpm dev` does not expose policy flags
         None, // advisor_override: `lpm dev` does not expose `--advisor`
         None, // min_release_age_override: `lpm dev` uses the chain
         crate::provenance_fetch::DriftIgnorePolicy::default(), // drift-ignore: `lpm dev` enforces drift
-        // Phase 46.1 rework: `lpm dev` does not surface its own
+        // rework: `lpm dev` does not surface its own
         // sandbox-mode flags. The env / config / default chain
         // inside `rebuild::run` still applies.
         false, // strict_sandbox
@@ -1275,7 +1275,7 @@ mod tests {
 
     #[test]
     fn needs_install_missing_lockfile() {
-        // Phase 34.1: the unified predicate now requires lockfile existence
+        // the unified predicate now requires lockfile existence
         // (stronger semantics from install.rs). A missing lockfile means
         // deps aren't properly installed, so needs_install returns true.
         let dir = TempDir::new().unwrap();
@@ -1306,7 +1306,7 @@ mod tests {
         assert!(needs_install(dir.path()).0);
     }
 
-    // ── Finding #3: domain separator prevents ambiguous concatenation ──
+    // ── domain separator prevents ambiguous concatenation ──
 
     #[test]
     fn compute_install_hash_domain_separator() {
@@ -1319,7 +1319,7 @@ mod tests {
         );
     }
 
-    // ── Finding #5: needs_install returns hash ──
+    // ── needs_install returns hash ──
 
     #[test]
     fn needs_install_returns_hash() {
@@ -1426,7 +1426,7 @@ mod tests {
             "line 2 must be mtime, got {:?}",
             lines[1]
         );
-        // Phase 66 Phase 4f flipped `LinkerMode::default()` from
+        // flipped `LinkerMode::default()` from
         // Isolated to Hoisted. The hash file's third line reflects
         // whatever default `auto_install_if_stale` resolves through
         // the linker chain — when no override is set, that's the
@@ -1453,7 +1453,7 @@ mod tests {
         );
     }
 
-    // ── Finding #1: should_open_browser logic ──
+    // ── should_open_browser logic ──
 
     #[test]
     fn should_open_browser_ready_and_allowed() {
@@ -1659,7 +1659,7 @@ mod tests {
 
         let webhook = lpm_tunnel::webhook::CapturedWebhook {
             id: "wh-test".to_string(),
-            timestamp: "2026-04-04T12:00:00Z".to_string(),
+            timestamp: "T12:00:00Z".to_string(),
             method: "POST".to_string(),
             path: "/api/webhook".to_string(),
             request_headers: std::collections::HashMap::new(),

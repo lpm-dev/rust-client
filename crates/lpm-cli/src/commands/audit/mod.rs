@@ -201,7 +201,7 @@ pub async fn run(
         Some(s) => FailPolicy::parse(s)?,
         None => FailPolicy::All,
     };
-    // ── Phase 1: Discover packages from any lockfile ──────────────────────
+    // ── Discover packages from any lockfile ──────────────────────
     //
     // Discovery only reads the project's lockfile — no LPM-store
     // touch — so it runs unlocked. The store-touching slice is
@@ -235,7 +235,7 @@ pub async fn run(
     let mut results: Vec<AuditResult> = Vec::new();
     let mut checked_lpm = 0usize;
 
-    // ── Phase 2: LPM registry metadata (@lpm.dev packages only) ──────────
+    // ── LPM registry metadata (@lpm.dev packages only) ──────────
     if !lpm_packages.is_empty() {
         let names: Vec<String> = lpm_packages.iter().map(|(n, _)| n.clone()).collect();
         let metadata_map = client.batch_metadata(&names).await.unwrap_or_default();
@@ -272,7 +272,7 @@ pub async fn run(
         }
     }
 
-    // ── Phase 3: Client-side behavioral analysis (ALL packages) ──────────
+    // ── Client-side behavioral analysis (ALL packages) ──────────
     //
     // Only `RegistryAndStore` packages (i.e., LPM store-backed packages)
     // touch `~/.lpm/store/`. If none are present — pure npm / pnpm /
@@ -302,10 +302,10 @@ pub async fn run(
         run_behavioral_analysis(&discovery, &mut results, &lpm_packages, json_output, level)
     };
 
-    // ── Phase 4: OSV vulnerability scan (non-@lpm.dev packages) ──────────
+    // ── OSV vulnerability scan (non-@lpm.dev packages) ──────────
     let osv_vulns = run_osv_scan(&discovery.packages, json_output, level).await;
 
-    // ── Phase 5: Report ──────────────────────────────────────────────────
+    // ── Report ──────────────────────────────────────────────────
     if json_output {
         print_json_report(&results, &osv_vulns, &discovery, checked_lpm);
     } else {
@@ -390,7 +390,7 @@ pub async fn run(
     Ok(())
 }
 
-// ─── Phase 2: Registry issue collection ─────────────────────────────────────
+// ─── Registry issue collection ─────────────────────────────────────
 
 fn collect_registry_issues(ver_meta: &lpm_registry::VersionMetadata, issues: &mut Vec<AuditIssue>) {
     // AI security findings
@@ -549,7 +549,7 @@ fn collect_registry_issues(ver_meta: &lpm_registry::VersionMetadata, issues: &mu
     }
 }
 
-// ─── Phase 3: Client-side behavioral analysis ───────────────────────────────
+// ─── Client-side behavioral analysis ───────────────────────────────
 
 /// Behavioral summary stats returned for the final output.
 struct BehavioralSummary {
@@ -603,7 +603,7 @@ fn run_behavioral_analysis(
     let mut project_cache = ProjectAuditCache::read(&discovery.project_root);
 
     // S5c — v2-aware store lookup. `find_installed_package_baseline`
-    // prefers v2 (default since Phase 66 4b) and falls back to v1.
+    // prefers v2 (default since 4b) and falls back to v1.
     // Pre-fix this used the v1-only `PackageStore::package_dir` and
     // every v2-installed package fell through to the slower
     // project_cache path on every audit run. The clonefile that
@@ -863,7 +863,7 @@ fn analysis_to_issues(
     issues
 }
 
-// ─── Phase 4: OSV vulnerability scan ────────────────────────────────────────
+// ─── OSV vulnerability scan ────────────────────────────────────────
 
 /// Query OSV for all non-@lpm.dev packages, deduplicating by (name, version).
 async fn run_osv_scan(
@@ -929,7 +929,7 @@ async fn run_osv_scan(
     }
 }
 
-// ─── Phase 5: Report rendering ──────────────────────────────────────────────
+// ─── Report rendering ──────────────────────────────────────────────
 
 fn print_discovery_header(discovery: &DiscoveryResult, lpm_count: usize, npm_count: usize) {
     let total = discovery.packages.len();

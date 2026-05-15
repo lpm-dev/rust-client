@@ -879,7 +879,7 @@ pub fn render_why(
         ));
     }
 
-    // **Phase 32 Phase 5** — surface override hits that touched this
+    // surface override hits that touched this
     // package. We match by canonical name; multiple hits can be
     // recorded for the same name (e.g., one Path selector + one Name
     // fallback for a different parent), so iterate the full list.
@@ -907,10 +907,10 @@ pub fn render_why(
         }
     }
 
-    // **Phase 32 Phase 6** — surface patch hits that touched this
+    // surface patch hits that touched this
     // package. Same matching pattern as overrides above.
     //
-    // **Audit fix (2026-04-12):** the human render now surfaces the
+    // **Audit fix :** the human render now surfaces the
     // actual `original_integrity` SRI hash (truncated for display)
     // instead of the literal placeholder "originalIntegrity recorded".
     // The integrity comes from `AppliedPatchHit.original_integrity`,
@@ -956,7 +956,7 @@ pub fn render_why(
 /// Keeps the algorithm prefix + the first 16 base64 chars + ellipsis.
 /// Strings shorter than the threshold are returned as-is.
 ///
-/// **Phase 32 Phase 6 audit fix (2026-04-12):** introduced so
+/// introduced so
 /// `lpm graph --why` can display real integrity hashes inline without
 /// blowing out terminal width. Full hash is still available in JSON
 /// output via `applied_patches[i].original_integrity`.
@@ -1003,7 +1003,7 @@ pub fn render_why_json(
         })
         .collect();
 
-    // **Phase 32 Phase 5** — include override hits that touched this
+    // include override hits that touched this
     // package. Empty array when no state file exists or no hits
     // matched. The shape mirrors the install JSON output's
     // `applied_overrides` field so agents can deserialize both with
@@ -1027,12 +1027,12 @@ pub fn render_why_json(
         })
         .unwrap_or_default();
 
-    // **Phase 32 Phase 6** — include patch hits that touched this
+    // include patch hits that touched this
     // package. Same shape as the install JSON output's `applied_patches`
     // field, filtered to entries matching `target_name`. Empty array
     // when no state file exists or no hits matched.
     //
-    // **Audit fix (2026-04-12):** include `original_integrity` so
+    // **Audit fix :** include `original_integrity` so
     // agents can read the patch baseline directly from `lpm graph
     // --why --json` without re-reading `package.json`.
     let patch_hits: Vec<serde_json::Value> = patch_state
@@ -1523,7 +1523,7 @@ mod tests {
         assert!(graph.nodes.contains_key("test-app@1.0.0"));
     }
 
-    // ── Finding #1: XSS via unescaped __STATS__ in HTML ──────────────
+    // ── XSS via unescaped __STATS__ in HTML ──────────────
 
     #[test]
     fn html_escapes_xss_in_stats() {
@@ -1570,7 +1570,7 @@ mod tests {
         );
     }
 
-    // ── Finding #2: XSS via innerHTML in tooltip ─────────────────────
+    // ── XSS via innerHTML in tooltip ─────────────────────
 
     #[test]
     fn html_tooltip_uses_textcontent_not_innerhtml() {
@@ -1586,7 +1586,7 @@ mod tests {
         );
     }
 
-    // ── Finding #3: Exponential path blowup in dfs_paths ─────────────
+    // ── Exponential path blowup in dfs_paths ─────────────
 
     #[test]
     fn find_paths_limits_to_max_paths() {
@@ -1678,7 +1678,7 @@ mod tests {
         );
     }
 
-    // ── Finding #5: DOT unescaped quotes in node names ───────────────
+    // ── DOT unescaped quotes in node names ───────────────
 
     #[test]
     fn dot_escapes_quotes_in_names() {
@@ -1701,7 +1701,7 @@ mod tests {
         );
     }
 
-    // ── Finding #6: Mermaid unescaped quotes in labels ────────────────
+    // ── Mermaid unescaped quotes in labels ────────────────
 
     #[test]
     fn mermaid_escapes_quotes_and_brackets() {
@@ -1729,7 +1729,7 @@ mod tests {
         }
     }
 
-    // ── Finding #7: Incomplete </script> case escaping ────────────────
+    // ── Incomplete </script> case escaping ────────────────
 
     #[test]
     fn html_escapes_all_script_closing_tags() {
@@ -1756,7 +1756,7 @@ mod tests {
         );
     }
 
-    // ── Finding #8: --filter misses diamond-pattern matches ───────────
+    // ── --filter misses diamond-pattern matches ───────────
 
     #[test]
     fn filter_finds_match_through_both_diamond_branches() {
@@ -1813,7 +1813,7 @@ mod tests {
         );
     }
 
-    // ── Finding #10: Stats include synthetic root ─────────────────────
+    // ── Stats include synthetic root ─────────────────────
 
     #[test]
     fn stats_exclude_synthetic_root() {
@@ -1862,7 +1862,7 @@ mod tests {
         );
     }
 
-    // ── Finding #11: Color check on stdout, output to String ──────────
+    // ── Color check on stdout, output to String ──────────
 
     #[test]
     fn render_tree_no_ansi_when_color_disabled() {
@@ -1906,7 +1906,7 @@ mod tests {
         assert_eq!(mermaid_escape("a[b&c"), "a&#91;b&amp;c");
     }
 
-    // ── Phase 8 re-audit: depth off-by-one ──────────────────────────
+    // ── re-audit: depth off-by-one ──────────────────────────
 
     #[test]
     fn root_node_has_depth_zero() {
@@ -1938,7 +1938,7 @@ mod tests {
         assert_eq!(graph.nodes["ms@2.0.0"].depth, 3);
     }
 
-    // ── Phase 8 re-audit: render_why shows all paths for direct deps ─
+    // ── re-audit: render_why shows all paths for direct deps ─
 
     #[test]
     fn why_direct_dep_also_shows_path() {
@@ -1952,7 +1952,7 @@ mod tests {
         assert!(why.contains("→"), "should contain path arrows: {why}");
     }
 
-    // ── Phase 8 re-audit: JSON root field ────────────────────────────
+    // ── re-audit: JSON root field ────────────────────────────
 
     #[test]
     fn json_output_has_root_field() {
@@ -1966,7 +1966,7 @@ mod tests {
         );
     }
 
-    // ── Phase 8 re-audit: Mermaid sanitize whitelist ─────────────────
+    // ── re-audit: Mermaid sanitize whitelist ─────────────────
 
     #[test]
     fn mermaid_sanitize_replaces_special_chars() {
@@ -2032,7 +2032,7 @@ mod tests {
         }
     }
 
-    // ── Phase 8 re-audit: HTML template property names match JSON ────
+    // ── re-audit: HTML template property names match JSON ────
 
     #[test]
     fn html_uses_snake_case_properties() {
@@ -2057,7 +2057,7 @@ mod tests {
         );
     }
 
-    // ── Phase 8 re-audit: search debounce ────────────────────────────
+    // ── re-audit: search debounce ────────────────────────────
 
     #[test]
     fn html_search_has_debounce() {
@@ -2073,7 +2073,7 @@ mod tests {
         );
     }
 
-    // ── Phase 8 re-audit: Registry::Unknown handling ─────────────────
+    // ── re-audit: Registry::Unknown handling ─────────────────
 
     #[test]
     fn unknown_registry_handled() {
@@ -2109,7 +2109,7 @@ mod tests {
         let _html = render_html(&graph);
     }
 
-    // ── Phase 8 re-audit: why with multiple versions ─────────────────
+    // ── re-audit: why with multiple versions ─────────────────
 
     #[test]
     fn why_shows_multiple_version_note() {
@@ -2185,7 +2185,7 @@ mod tests {
         assert_eq!(parsed["path_count"].as_u64().unwrap(), 0);
     }
 
-    // ── **Phase 32 Phase 5** — `--why` decorates with override traces ─
+    // ── `--why` decorates with override traces ─
 
     /// Build a synthetic OverridesState containing a single hit. The
     /// helper avoids constructing through the resolver, since this test
@@ -2199,7 +2199,7 @@ mod tests {
         crate::overrides_state::OverridesState {
             state_version: crate::overrides_state::OVERRIDES_STATE_VERSION,
             fingerprint: "sha256-test".to_string(),
-            captured_at: "2026-04-11T00:00:00Z".to_string(),
+            captured_at: "T00:00:00Z".to_string(),
             parsed: vec![],
             applied: vec![lpm_resolver::OverrideHit {
                 raw_key: package.to_string(),
@@ -2274,14 +2274,14 @@ mod tests {
         assert!(arr.is_empty());
     }
 
-    // ── **Phase 32 Phase 6** — `--why` decorates with patch traces ───
+    // ── `--why` decorates with patch traces ───
 
     /// Build a synthetic PatchState containing a single hit.
     fn fake_patch_state(name: &str) -> crate::patch_state::PatchState {
         crate::patch_state::PatchState {
             state_version: crate::patch_state::PATCH_STATE_VERSION,
             fingerprint: "sha256-fake-patch".to_string(),
-            captured_at: "2026-04-12T00:00:00Z".to_string(),
+            captured_at: "T00:00:00Z".to_string(),
             parsed: vec![],
             applied: vec![crate::patch_state::AppliedPatchHit {
                 raw_key: format!("{name}@1.2.3"),
@@ -2318,7 +2318,7 @@ mod tests {
             why.contains("2 files"),
             "should report file count from the hit: {why}"
         );
-        // **Phase 32 Phase 6 audit fix (2026-04-12):** the actual
+        // the actual
         // integrity hash must appear (truncated to KEEP chars + ellipsis),
         // not the legacy placeholder "originalIntegrity recorded".
         assert!(
@@ -2345,7 +2345,7 @@ mod tests {
         let state = crate::patch_state::PatchState {
             state_version: crate::patch_state::PATCH_STATE_VERSION,
             fingerprint: "sha256-legacy".to_string(),
-            captured_at: "2026-04-12T00:00:00Z".to_string(),
+            captured_at: "T00:00:00Z".to_string(),
             parsed: vec![],
             applied: vec![crate::patch_state::AppliedPatchHit {
                 raw_key: "ms@1.2.3".to_string(),
@@ -2369,7 +2369,7 @@ mod tests {
 
     #[test]
     fn render_why_omits_zero_file_count_in_decoration() {
-        // **Phase 32 Phase 6 audit fix (2026-04-12):** when
+        // when
         // `files_modified + files_added + files_deleted == 0` (e.g.,
         // legacy entries with no recorded counts), the human render
         // should NOT print "0 files" — that's noise. The integrity
@@ -2378,7 +2378,7 @@ mod tests {
         let state = crate::patch_state::PatchState {
             state_version: crate::patch_state::PATCH_STATE_VERSION,
             fingerprint: "sha256-zero".to_string(),
-            captured_at: "2026-04-12T00:00:00Z".to_string(),
+            captured_at: "T00:00:00Z".to_string(),
             parsed: vec![],
             applied: vec![crate::patch_state::AppliedPatchHit {
                 raw_key: "ms@1.2.3".to_string(),
@@ -2427,7 +2427,7 @@ mod tests {
             "patches/ms@1.2.3.patch"
         );
         assert_eq!(arr[0]["files_modified"].as_u64().unwrap(), 2);
-        // **Phase 32 Phase 6 audit fix (2026-04-12):** the full
+        // the full
         // (untruncated) integrity hash must be present in JSON output
         // so agents can use it directly without re-reading
         // package.json.
@@ -2446,7 +2446,7 @@ mod tests {
         assert!(arr.is_empty());
     }
 
-    // ── Phase 8 re-audit: circular dependency handling ───────────────
+    // ── re-audit: circular dependency handling ───────────────
 
     #[test]
     fn tree_handles_circular_deps() {
@@ -2481,7 +2481,7 @@ mod tests {
         );
     }
 
-    // ── Phase 8 re-audit: no source field ────────────────────────────
+    // ── re-audit: no source field ────────────────────────────
 
     #[test]
     fn no_source_field_defaults_to_unknown() {
@@ -2500,7 +2500,7 @@ mod tests {
         assert_eq!(graph.nodes["local-pkg@0.1.0"].registry, Registry::Unknown);
     }
 
-    // ── Phase 8 second re-audit: graph-level filter ──────────────────
+    // ── second re-audit: graph-level filter ──────────────────
 
     #[test]
     fn filter_graph_removes_unmatched_subtrees() {

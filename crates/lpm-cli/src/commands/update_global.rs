@@ -17,7 +17,7 @@
 //! `lpm global update` (no arg) iterates every package and re-resolves
 //! against its persisted `saved_spec`. `lpm global update <pkg>` does
 //! the same scoped to one package. `lpm global update <pkg>@<spec>`
-//! rewrites the saved_spec via Phase 33's `decide_saved_dependency_spec`
+//! rewrites the saved_spec via the `decide_saved_dependency_spec`
 //! before resolving.
 //!
 //! `--dry-run` runs every step up to `prepare_locked` but releases
@@ -46,7 +46,7 @@ pub async fn run(
     json_output: bool,
 ) -> Result<(), LpmError> {
     let root = LpmRoot::from_env()?;
-    // Phase 35 Step 6 fix: use the injected client.
+    // Step 6 fix: use the injected client.
     let registry = client.clone_with_config();
 
     let targets = match package {
@@ -142,7 +142,7 @@ pub async fn run(
         }
     }
 
-    // Opportunistic tombstone sweep (Phase 37 M3.5). Each successful
+    // Opportunistic tombstone sweep. Each successful
     // upgrade pushed the prior install root onto `manifest.tombstones`;
     // run one non-blocking sweep after the bulk loop (rather than one
     // per package) so a 50-package bulk update doesn't serialise 50
@@ -191,7 +191,7 @@ pub async fn run(
 struct Target {
     /// Package name as keyed in `[packages.*]`.
     name: String,
-    /// `Some(intent)` when the user typed `pkg@spec` — Phase 33 decides
+    /// `Some(intent)` when the user typed `pkg@spec` — decides
     /// the new saved_spec from this. `None` means "re-resolve against
     /// the existing saved_spec," which is the bulk-update default and
     /// the `lpm global update <pkg>` (no version) shape.
@@ -320,7 +320,7 @@ async fn plan_upgrade(
         ))
     })?;
 
-    // Compute the new saved_spec via Phase 33 BEFORE the
+    // Compute the new saved_spec via BEFORE the
     // already-current check. Pre-fix this was computed only for the
     // upgrade branch, so a `pkg@^3` rewrite on an exact-pinned 3.8.3
     // install fell into AlreadyCurrent and the saved_spec stayed
@@ -612,7 +612,7 @@ fn prepare_upgrade_locked(root: &LpmRoot, prep: &UpgradePrep) -> Result<StagedUp
         install_root.file_name().unwrap().to_string_lossy()
     );
 
-    // Phase 37 M0 (rev 6): pre-install path-budget guard. Same rationale
+    // M0 (rev 6): pre-install path-budget guard. Same rationale
     // as install_global::prepare_locked — fail fast with an actionable
     // LPM_HOME hint rather than mid-extraction with cryptic platform
     // errors when the new install root would push us over the
@@ -683,7 +683,7 @@ async fn do_install_upgrade(
     // Same shape as install_global::do_install. Could share via a
     // helper crate later; duplicated for module independence right
     // now.
-    // Phase 37 M0 (rev 6): route Windows fs ops through the long-path
+    // M0 (rev 6): route Windows fs ops through the long-path
     // helper. No-op on POSIX.
     let install_root_ext = lpm_common::as_extended_path(&staged.install_root);
     std::fs::create_dir_all(&install_root_ext)?;
@@ -708,7 +708,7 @@ async fn do_install_upgrade(
         false, // offline
         false, // force
         false, // allow_new
-        false, // strict_integrity (Phase 59.0 F5)
+        false, // strict_integrity
         None,  // linker_override
         true,  // no_skills
         true,  // no_editor_setup
@@ -718,9 +718,9 @@ async fn do_install_upgrade(
         None,
         None, // script_policy_override: global update does not expose policy flags
         None, // advisor_override: global update does not expose `--advisor`
-        None, // min_release_age_override: D13/D19 — global scope is out of P3, cooldown uses the chain
-        crate::provenance_fetch::DriftIgnorePolicy::default(), // drift-ignore: D13/D19 — global scope is out of P4
-        // Phase 46.1 rework: global update does not surface its own
+        None, // min_release_age_override: D13/D19 — global scope is out of, cooldown uses the chain
+        crate::provenance_fetch::DriftIgnorePolicy::default(), // drift-ignore: D13/D19 — global scope is out of
+        // rework: global update does not surface its own
         // sandbox-mode flags. The env / config / default chain
         // inside `rebuild::run` still applies.
         false, // strict_sandbox
@@ -807,7 +807,7 @@ fn commit_upgrade_locked(
         )?;
     }
 
-    // Phase 37 M3 (audit follow-up): three-artifact invariant — confirm
+    // M3 (audit follow-up): three-artifact invariant — confirm
     // every command's shim triple is fully present after emission.
     // Same rationale as install_global::commit_locked: a partial triple
     // observable to other shells would diverge from the manifest commit
@@ -1202,7 +1202,7 @@ fn active_matches_planned_snapshot(
     Ok(())
 }
 
-// Phase 35 Step 6 fix: removed `build_registry` — `run` now receives
+// Step 6 fix: removed `build_registry` — `run` now receives
 // the injected `&RegistryClient`.
 
 fn mk_tx_id() -> String {
@@ -1352,7 +1352,7 @@ mod tests {
             "resolved": "9.24.0",
             "integrity": "sha512-x",
             "source": "upstream-npm",
-            "installed_at": "2026-04-15T00:00:00Z",
+            "installed_at": "T00:00:00Z",
             "root": "installs/eslint@9.24.0",
             "commands": ["DIFFERENT-COMMANDS-IGNORED"],
         });
@@ -1375,7 +1375,7 @@ mod tests {
             "resolved": "9.24.0",
             "integrity": "sha512-x",
             "source": "upstream-npm",
-            "installed_at": "2026-04-15T00:00:00Z",
+            "installed_at": "T00:00:00Z",
             "root": "installs/eslint@9.24.0",
             "commands": ["eslint"],
         });
@@ -1401,7 +1401,7 @@ mod tests {
             "resolved": "1.0.0",
             "integrity": "sha512-x",
             "source": "lpm-dev",
-            "installed_at": "2026-04-15T00:00:00Z",
+            "installed_at": "T00:00:00Z",
             "root": "installs/x@1.0.0",
             "commands": [],
         });

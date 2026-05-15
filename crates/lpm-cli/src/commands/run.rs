@@ -5,7 +5,7 @@ use lpm_runner::bin_path::ManagedRuntimeHint;
 use std::collections::HashSet;
 use std::path::Path;
 
-/// Maximum size for captured task output before truncation (Finding #2).
+/// Maximum size for captured task output before truncation ().
 /// Prevents unbounded memory usage from chatty tasks.
 const MAX_CAPTURED_OUTPUT: usize = 10 * 1024 * 1024; // 10MB
 
@@ -37,7 +37,7 @@ fn truncate_output(output: String) -> String {
 /// Returns a `ManagedRuntimeHint` so the downstream PATH builder
 /// (`lpm_runner::bin_path::build_path_with_bins_pre_resolved`) can skip the
 /// `detect_node_version` + `list_installed` re-check on every script execution
-/// (Phase 61 Tier 1 — saves ~5–12 ms per `lpm run` invocation).
+/// (Tier 1 — saves ~5–12 ms per `lpm run` invocation).
 pub async fn ensure_runtime(project_dir: &Path) -> ManagedRuntimeHint {
     match lpm_runtime::ensure_runtime(project_dir).await {
         lpm_runtime::RuntimeStatus::Ready {
@@ -95,12 +95,12 @@ pub async fn ensure_runtime(project_dir: &Path) -> ManagedRuntimeHint {
 /// - Pre/post script hooks (npm convention)
 /// - Task caching (when enabled in `lpm.json`)
 ///
-/// **Caller contract (Phase 61 Tier 1):** invoke [`ensure_runtime`] first and
+/// **Caller contract:** invoke [`ensure_runtime`] first and
 /// pass its return value as `bin_hint`. `ensure_runtime` is what surfaces the
 /// user-visible "Using node X" notice and triggers auto-install when the
 /// project pins a Node version that isn't installed yet — neither happens
 /// inside `run`. Passing `&Unknown` directly is supported
-/// (it falls back to the silent detect, same as before Phase 61) but bypasses
+/// (it falls back to the silent detect, same as) but bypasses
 /// the version notice / auto-install path, which is almost never what you want.
 pub async fn run(
     project_dir: &Path,
@@ -110,7 +110,7 @@ pub async fn run(
     no_cache: bool,
     bin_hint: &ManagedRuntimeHint,
 ) -> Result<(), LpmError> {
-    // Phase 61 Tier 1.4.2: read lpm.json once instead of twice on the simple-
+    // Tier 1.4.2: read lpm.json once instead of twice on the simple-
     // script path (cache-hit check + caching-enabled check both used to read).
     let lpm_config = lpm_runner::lpm_json::read_lpm_json(project_dir)
         .ok()
@@ -213,7 +213,7 @@ pub async fn run_multi(
     // `pkg_scripts` is kept separately (not just merged into `all_scripts`) so
     // `is_meta_task` can distinguish "task is a package.json script" from
     // "task is an lpm.json command" — the meta-task predicate only cares about
-    // the former. Phase 61 Tier 1 (L1): threaded down so `run_tasks_*` don't
+    // the former. Tier 1 (L1): threaded down so `run_tasks_*` don't
     // re-read `package.json` per task.
     let pkg_scripts: Option<std::collections::HashMap<String, String>> = {
         let pkg_json_path = project_dir.join("package.json");
@@ -239,7 +239,7 @@ pub async fn run_multi(
     }
 
     // Always build task graph — expand dependsOn for all scripts, even single ones.
-    // This is the core Phase 13 contract: `lpm run test` auto-runs `check` if
+    // This is the core contract: `lpm run test` auto-runs `check` if
     // test.dependsOn includes "check".
     let levels = lpm_runner::task_graph::task_levels(&all_scripts, &tasks, scripts)
         .map_err(LpmError::Script)?;
@@ -347,7 +347,7 @@ fn print_results_summary(results: &[TaskResult], total_elapsed: std::time::Durat
     let skipped = results.iter().filter(|r| r.skipped).count();
     let cached = results.iter().filter(|r| r.cached).count();
 
-    // Calculate sequential time — exclude skipped tasks (Finding #5: skipped
+    // Calculate sequential time — exclude skipped tasks (skipped
     // tasks have 0ms duration which deflates the "% faster" metric).
     let sequential_ms: u128 = results
         .iter()
@@ -368,7 +368,7 @@ fn print_results_summary(results: &[TaskResult], total_elapsed: std::time::Durat
         } else {
             String::new()
         };
-        // Finding #5: use ran count (excludes skipped) in summary
+        // use ran count (excludes skipped) in summary
         let ran_count = results.iter().filter(|r| !r.skipped).count();
         eprintln!(
             "  {} {} completed in {}{}",
@@ -378,7 +378,7 @@ fn print_results_summary(results: &[TaskResult], total_elapsed: std::time::Durat
             speedup.dimmed(),
         );
     } else {
-        // Finding #19: denominator excludes skipped tasks
+        // denominator excludes skipped tasks
         let ran = results.len() - skipped;
         let skip_note = if skipped > 0 {
             format!(" ({skipped} skipped)")
@@ -627,7 +627,7 @@ async fn run_tasks_parallel(
         );
     }
 
-    // Phase 61 Tier 1 (L2 + L1 follow-up): wrap shared per-call state in `Arc`
+    // Tier 1 (L2 + L1 follow-up): wrap shared per-call state in `Arc`
     // once, so each spawned thread does a cheap refcount bump instead of a
     // full clone. Worst case today (no Arc): N threads × {ManagedRuntimeHint
     // PathBuf clone, full HashMap<String, TaskConfig> clone, full
@@ -720,7 +720,7 @@ async fn run_tasks_parallel(
 
             output::info(&task_name.bold());
 
-            // Use captured execution when caching is enabled (Finding #5)
+            // Use captured execution when caching is enabled ()
             let caching_enabled = !no_cache && is_task_cached_with_config(task_name, lpm_config);
 
             if caching_enabled {
@@ -822,7 +822,7 @@ async fn run_tasks_parallel(
                         let name = task_name.clone();
                         let args = extra_args.to_vec();
                         let mode = env_mode.map(|s| s.to_string());
-                        // Phase 61 Tier 1: Arc::clone is a refcount bump, not a
+                        // Tier 1: Arc::clone is a refcount bump, not a
                         // deep copy of the underlying HashMap / config / hint.
                         let hint_clone = std::sync::Arc::clone(&hint_arc);
                         let tasks_clone = std::sync::Arc::clone(&tasks_arc);
@@ -1077,9 +1077,9 @@ async fn run_tasks_parallel(
 /// 2. Expand requested scripts into their full dependency chain
 /// 3. Execute the expanded task set (parallel or sequential based on flags)
 ///
-/// This delivers the Phase 13 "packages × tasks" execution matrix.
+/// This delivers the "packages × tasks" execution matrix.
 ///
-/// Phase 32 Phase 1: filter selection now goes through the shared
+/// filter selection now goes through the shared
 /// `lpm_task::filter::FilterEngine` (full pnpm-parity grammar). The legacy
 /// substring `--filter foo` matches are removed per design decision D2 —
 /// users must write explicit globs (`*foo*`, `foo-*`, etc.).
@@ -1099,7 +1099,7 @@ pub async fn run_workspace(
     stream: bool,
     json_output: bool,
 ) -> Result<(), LpmError> {
-    // Phase 61 Tier 1 (L3): capture the root hint so members without their
+    // Tier 1 (L3): capture the root hint so members without their
     // own version pin can inherit it. `run_workspace_package` does its own
     // per-member probe (cheap stat-based) and decides whether to reuse this
     // hint or fall back to silent detect. Wrapping in `Arc` avoids a
@@ -1128,9 +1128,9 @@ pub async fn run_workspace(
     )?;
 
     if target_set.is_empty() {
-        // Phase 32 D2 follow-through: surface the substring → glob migration
+        // D2 follow-through: surface the substring → glob migration
         // hint when any filter looks like a bare name that would have
-        // substring-matched pre-Phase-32.
+        // substring-matched by earlier filter behavior.
         let hint = crate::commands::filter::format_no_match_hint(filters);
 
         if fail_if_no_match {
@@ -1351,7 +1351,7 @@ fn run_workspace_package(
 
     let task_count: usize = task_levels.iter().map(|l| l.len()).sum();
 
-    // Phase 61 Tier 1 (L3): if the member has its own Node.js version pin
+    // Tier 1 (L3): if the member has its own Node.js version pin
     // (lpm.json runtime / engines.node / .nvmrc / .node-version), let the
     // silent detect resolve at the member level — we don't want to override
     // a member-level pin with the workspace-root resolution. If the member
@@ -1465,7 +1465,7 @@ pub fn run_watch(
     let mode = env_mode.map(|s| s.to_string());
     let dir = project_dir.to_path_buf();
     // Move the hint into the closure so each watch iteration reuses the
-    // initial-startup-resolved managed runtime bin (Phase 61 Tier 1).
+    // initial-startup-resolved managed runtime bin.
     let hint = bin_hint;
 
     lpm_task::watch::watch_and_run(
@@ -1510,7 +1510,7 @@ pub async fn exec(
     // user-visible runtime notice, but `lpm_runner::exec::exec_file` does its
     // own runtime probe (different shape — it needs the major/minor version
     // string for tsx vs --experimental-strip-types decisions, not just bin_dir).
-    // Threading exec.rs is queued as a Phase 61 follow-up.
+    // Threading exec.rs is queued as a follow-up.
     let _ = ensure_runtime(project_dir).await;
     output::info(&format!("exec {}", file_path.bold()));
     lpm_runner::exec::exec_file(project_dir, file_path, extra_args)
@@ -1527,7 +1527,7 @@ pub async fn dlx(
     extra_args: &[String],
     refresh: bool,
 ) -> Result<(), LpmError> {
-    // Phase 37 M2.3: route through the IsolatedInstall primitive.
+    // M2.3: route through the IsolatedInstall primitive.
     // Behavior is byte-for-byte identical to the pre-M2 dlx path —
     // primitive owns the policy decisions (freshness, manifest text,
     // restricted perms, touch semantics).
@@ -1560,7 +1560,7 @@ pub async fn dlx(
 
         output::info(&format!("installing {}...", package_spec.bold()));
 
-        // Phase 35 Step 6 fix: use the injected client. Pre-fix this
+        // Step 6 fix: use the injected client. Pre-fix this
         // built a fresh `RegistryClient::new()` so any `@lpm.dev` deps
         // pulled by `lpm dlx` would have been unauthenticated.
         crate::commands::install::run_with_options(
@@ -1570,19 +1570,19 @@ pub async fn dlx(
             false,                                                 // offline
             false,                                                 // force
             false,                                                 // allow_new
-            false, // strict_integrity (Phase 59.0 F5)
+            false, // strict_integrity
             None,  // linker_override
             false, // no_skills
             false, // no_editor_setup
             true,  // no_security_summary (dlx doesn't need it)
             false, // auto_build
             None,  // target_set: dlx is single-project
-            None,  // direct_versions_out: dlx does not finalize Phase 33 placeholders
+            None,  // direct_versions_out: dlx does not finalize placeholders
             None,  // script_policy_override: `lpm dlx` does not expose policy flags
             None,  // advisor_override: `lpm dlx` does not expose `--advisor`
             None,  // min_release_age_override: `lpm dlx` uses the chain
             crate::provenance_fetch::DriftIgnorePolicy::default(), // drift-ignore: `lpm dlx` enforces drift
-            // Phase 46.1 rework: dlx does not surface its own
+            // rework: dlx does not surface its own
             // sandbox-mode flags. The env / config / default chain
             // inside `rebuild::run` still applies.
             false, // strict_sandbox
@@ -1601,7 +1601,7 @@ pub async fn dlx(
 }
 
 // ---------------------------------------------------------------------------
-// Task execution helpers (Finding #4: support lpm.json commands + meta-tasks)
+// Task execution helpers (support lpm.json commands + meta-tasks)
 // ---------------------------------------------------------------------------
 
 /// Check if a task is a meta-task: has dependsOn but no command and no
@@ -1703,7 +1703,7 @@ fn is_task_cached_with_config(
         .unwrap_or(false)
 }
 
-/// Print a JSON summary of task results (Finding #7).
+/// Print a JSON summary of task results ().
 fn print_json_summary(results: &[TaskResult], elapsed: std::time::Duration) {
     let tasks: Vec<serde_json::Value> = results
         .iter()
@@ -1739,7 +1739,7 @@ fn print_json_summary(results: &[TaskResult], elapsed: std::time::Duration) {
 // --- Cache helpers ---
 
 /// Pre-computed cache context to avoid re-reading lpm.json and package.json
-/// multiple times per task (Finding #10).
+/// multiple times per task ().
 struct CacheContext {
     task_config: lpm_runner::lpm_json::TaskConfig,
     cache_key: String,
@@ -1748,7 +1748,7 @@ struct CacheContext {
 
 /// Build the cache context for a task: reads lpm.json (or uses provided config),
 /// resolves the command, and computes the cache key. Returns `None` if caching
-/// is not enabled or outputs are empty (Finding #20: shared helper eliminates
+/// is not enabled or outputs are empty (shared helper eliminates
 /// duplication between try_cache_store and try_cache_store_with_output).
 fn build_cache_context(
     project_dir: &Path,
@@ -1872,7 +1872,7 @@ mod tests {
     use lpm_runner::bin_path::ManagedRuntimeHint::Unknown;
     use std::collections::HashMap;
 
-    // --- Finding #1: transitive skip propagation ---
+    // --- transitive skip propagation ---
 
     /// Helper matching the skip-check logic in `run_tasks_parallel`.
     fn should_skip_task(
@@ -1951,7 +1951,7 @@ mod tests {
         // hint via format_no_match_hint, not just print "No packages matched".
         //
         // We verify the hint helper itself fires for the kind of input that
-        // would have substring-matched in the pre-Phase-32 matcher. The
+        // would have substring-matched in the pre-existing matcher. The
         // run_workspace path consumes the same helper, so a passing test
         // here proves the hint is wired into the no-match branch.
         let hint = crate::commands::filter::format_no_match_hint(&["pkg".to_string()]);
@@ -1971,7 +1971,7 @@ mod tests {
         );
     }
 
-    // --- Finding #2: output truncation ---
+    // --- output truncation ---
 
     #[test]
     fn truncate_output_small_passthrough() {
@@ -2004,7 +2004,7 @@ mod tests {
         assert!(before_ellipsis.ends_with('\n') || before_ellipsis.ends_with('a'));
     }
 
-    // --- Finding #5: skipped tasks excluded from sequential estimate ---
+    // --- skipped tasks excluded from sequential estimate ---
 
     #[test]
     fn sequential_excludes_skipped() {
@@ -2453,7 +2453,7 @@ mod tests {
         }
     }
 
-    // --- Remaining Finding #2: nested meta-task dependency resolution ---
+    // --- Remaining nested meta-task dependency resolution ---
 
     #[test]
     fn nested_meta_task_deps_expand_correctly() {
@@ -2491,7 +2491,7 @@ mod tests {
         assert_eq!(levels[2], vec!["release"]);
     }
 
-    // --- Remaining Finding #3: sequential failure uses aggregate exit code ---
+    // --- Remaining sequential failure uses aggregate exit code ---
 
     #[test]
     fn sequential_failure_exit_code_is_failure_count() {

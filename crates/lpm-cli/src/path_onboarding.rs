@@ -1,4 +1,4 @@
-//! PATH onboarding banner (Phase 37 M3.6).
+//! PATH onboarding banner.
 //!
 //! After a successful `lpm install -g`, the package's commands live as
 //! shims inside `~/.lpm/bin/`. Those shims are useless until that

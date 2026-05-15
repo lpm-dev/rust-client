@@ -13,14 +13,14 @@ use std::collections::HashSet;
 use std::path::Path;
 
 /// Compute the workspace target set from the CLI flags. Wraps the shared
-/// `FilterEngine` so every Phase 32 consumer sees identical filter semantics.
+/// `FilterEngine` so every consumer sees identical filter semantics.
 ///
 /// Composition rules:
 ///
 /// - **No filter, no `--affected`** (caller already verified workspace mode is
 ///   active via `--all`): every member.
 /// - **`--affected` only**: directly changed packages plus their transitive
-///   dependents via `find_affected`. This matches the pre-Phase-32 contract.
+///   dependents via `find_affected`. This matches the pre-existing contract.
 /// - **`--filter <expr>...`**: parsed and evaluated through `FilterEngine`.
 ///   Multi-filter unions are handled inside the engine.
 /// - **`--filter` AND `--affected`**: union of both target sets — `--affected`

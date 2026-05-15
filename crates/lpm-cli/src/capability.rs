@@ -1,8 +1,8 @@
-//! Phase 48 P0 slice 6 — per-package capability set + canonical hashing.
+//! slice 6 — per-package capability set + canonical hashing.
 //!
 //! Introduces the pure data model and canonical-hash primitive for the
 //! three per-package capability knobs defined in
-//! [phase48.md §6 "Per-package capability knobs"](../../../../../../a-package-manager/DOCS/new-features/37-rust-client-RUNNER-VISION-phase48.md):
+//! ["Per-package capability knobs"](../../../../../../a-package-manager/DOCS/new-features/37-rust-client-RUNNER-VISION-phase48.md):
 //!
 //! - `passEnv` — sorted, deduplicated set of env-var names a package
 //!   wants passed through to its lifecycle scripts.
@@ -143,7 +143,7 @@ impl std::error::Error for CapabilityParseError {}
 
 /// Per-package request for project-tree read access.
 ///
-/// The §6 single-semantic rule applies: `Narrow` matches the user
+/// The single-semantic rule applies: `Narrow` matches the user
 /// floor (no approval needed); `Full` is a loosening that requires
 /// an approval binding the [`CapabilitySet::canonical_hash`] of the
 /// request.
@@ -174,7 +174,7 @@ impl ReadProjectMode {
 
 // ── RlimitKey ─────────────────────────────────────────────────────
 
-/// The four rlimits Phase 48 P2 wires into the sandbox backend.
+/// The four rlimits wires into the sandbox backend.
 ///
 /// Ordering of variants defines the canonical sort order used by
 /// [`CapabilitySet::canonical_hash`]. Adding a new variant appends
@@ -210,12 +210,12 @@ impl RlimitKey {
 /// The user-level upper bounds that gate per-package capability
 /// requests at enforcement time.
 ///
-/// Phase 48 P0 sub-slice 6c wires this through [`evaluate_trust`].
+/// sub-slice 6c wires this through [`evaluate_trust`].
 /// Only the [`sandbox_limits`] field is user-configurable right now
 /// — `pass_env` and `read_project` have fixed floors (empty /
-/// `Narrow`) that aren't user-extensible in P0. A future sub-slice
+/// `Narrow`) that aren't user-extensible in. A future sub-slice
 /// could extend `UserBound` with `pass_env_allowlist` to match the
-/// phase48 §6 Gap-5 env-allowlist model if user-level passthrough
+/// phase48 Gap-5 env-allowlist model if user-level passthrough
 /// becomes desirable; the enforcement code already handles "empty
 /// allowlist = no widening allowed without approval" correctly.
 ///
@@ -304,7 +304,7 @@ fn extract_u64(v: &toml::Value) -> Option<u64> {
 
 // ── CapabilityDelta ───────────────────────────────────────────────
 
-/// **Phase 48 P0 sub-slice 6d.** Structured description of how a
+/// Structured description of how a
 /// [`CapabilitySet`] widens beyond a [`UserBound`].
 ///
 /// Produced by [`CapabilitySet::delta_vs_user_bound`]. Consumed by
@@ -316,7 +316,7 @@ fn extract_u64(v: &toml::Value) -> Option<u64> {
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct CapabilityDelta {
     /// Env-var names the package requests passthrough for. Since
-    /// the user floor is empty (Phase 48 §6), every entry here
+    /// the user floor is empty, every entry here
     /// is a widening.
     pub pass_env: BTreeSet<String>,
     /// True iff the package requests
@@ -395,7 +395,7 @@ impl CapabilityDelta {
 
 // ── CapabilitySet ─────────────────────────────────────────────────
 
-/// Per-package capability request: the three Phase 48 per-package
+/// Per-package capability request: the three per-package
 /// knobs the project can declare in `package.json > lpm > scripts`.
 ///
 /// Stores the canonical (sorted, deduplicated) form. Callers
@@ -440,7 +440,7 @@ impl CapabilitySet {
             && self.sandbox_limits.is_empty()
     }
 
-    /// **Phase 48 P0 sub-slice 6d.** Compute the human-readable
+    /// Compute the human-readable
     /// delta between this request and the user's bound.
     ///
     /// Returned [`CapabilityDelta`] enumerates ONLY the fields that
@@ -486,7 +486,7 @@ impl CapabilitySet {
     /// tighter than the user bound — in that case the request
     /// auto-applies without needing a capability-hash approval.
     ///
-    /// **Per-field rule (phase48.md §6 "Per-package capability
+    /// **Per-field rule ("Per-package capability
     /// knobs — single semantic"):**
     ///
     /// - `pass_env` — user floor is empty (no extras). Any
@@ -643,7 +643,7 @@ impl CapabilitySet {
         Ok(out)
     }
 
-    /// **Phase 48 P0 sub-slice 6d follow-up.** Returns `true` iff
+    /// Returns `true` iff
     /// this capability request requires user review *despite* the
     /// script-hash trust layer already matching.
     ///
@@ -652,7 +652,7 @@ impl CapabilitySet {
     /// at install time,
     /// [`crate::commands::approve_scripts::compute_effective_blocked_set`]
     /// at approval time). Those paths historically used only the
-    /// Phase 46 strict-tuple match (`TrustMatch::Strict` →
+    /// strict-tuple match (`TrustMatch::Strict` →
     /// "trusted, not blocked"), which correctly identified
     /// script-hash drift but did NOT catch capability drift that
     /// sub-slice 6c's `evaluate_trust` now rejects via
@@ -699,7 +699,7 @@ impl CapabilitySet {
     /// Returns `true` iff `binding` currently approves this
     /// capability set.
     ///
-    /// **Match rule (phase48.md §6 "Per-package capability knobs"):**
+    /// **Match rule:**
     ///
     /// - `binding.capability_hash == None` (legacy approval from
     ///   before sub-slice 6b, or a new approval whose granted set
@@ -710,7 +710,7 @@ impl CapabilitySet {
     ///   `stored_hash == self.canonical_hash()`. Any field change in
     ///   the requested set produces a different canonical hash and
     ///   the match fails — this is the drift-invalidates-approval
-    ///   rule from phase48.md §6.
+    ///   rule from 
     ///
     /// # Why this method lives on `CapabilitySet`, not on the binding
     ///
@@ -1050,7 +1050,7 @@ mod tests {
         }
     }
 
-    // ── Phase 48 P0 sub-slice 6b — is_approved_by match semantics ──
+    // ── sub-slice 6b — is_approved_by match semantics ──
     //
     // Reviewer's acceptance list for this sub-slice:
     //
@@ -1245,7 +1245,7 @@ mod tests {
         assert!(baseline.is_approved_by(&explicit_baseline_binding));
     }
 
-    // ── Phase 48 P0 sub-slice 6c — loosens_beyond ────────────────
+    // ── sub-slice 6c — loosens_beyond ────────────────
 
     fn ub_with(ceilings: &[(RlimitKey, u64)]) -> UserBound {
         UserBound {
@@ -1320,7 +1320,7 @@ mod tests {
     fn loosens_sandbox_limit_no_user_ceiling_is_widening() {
         // User hasn't configured RLIMIT_AS at all. Any request for
         // it triggers the approval gate — conservative fail-closed
-        // default per phase48.md §6.
+        // default per 
         let s = set_from(&[], ReadProjectMode::Narrow, &[(RlimitKey::As, 1024)]);
         assert!(s.loosens_beyond(&UserBound::default()));
         // Even with OTHER ceilings set — still widens for the
@@ -1370,7 +1370,7 @@ mod tests {
         assert!(s.loosens_beyond(&bound));
     }
 
-    // ── Phase 48 P0 sub-slice 6c — UserBound::from_global_config ──
+    // ── sub-slice 6c — UserBound::from_global_config ──
     //
     // End-to-end UserBound tests require either injecting a
     // GlobalConfig (whose `table` field is private) or a serial-
@@ -1460,7 +1460,7 @@ mod tests {
         assert!(s.loosens_beyond(&ub));
     }
 
-    // ── Phase 48 P0 sub-slice 6c — from_package_json parser ──
+    // ── sub-slice 6c — from_package_json parser ──
 
     fn pkg_json_fixture(body: &str) -> (tempfile::TempDir, std::path::PathBuf) {
         let tmp = tempfile::tempdir().unwrap();
@@ -1606,7 +1606,7 @@ mod tests {
         assert_eq!(parsed.canonical_hash(), manual.canonical_hash());
     }
 
-    // ── Phase 48 P0 sub-slice 6d — delta_vs_user_bound ────────────
+    // ── sub-slice 6d — delta_vs_user_bound ────────────
 
     #[test]
     fn delta_baseline_is_empty() {
@@ -1716,7 +1716,7 @@ mod tests {
         }
     }
 
-    // ── Phase 48 P0 sub-slice 6d — round-trip: written hash == enforced hash ──
+    // ── sub-slice 6d — round-trip: written hash == enforced hash ──
     //
     // The load-bearing invariant this slice ships: the hash
     // written by approve-scripts is byte-for-byte identical to

@@ -1,6 +1,6 @@
 //! `lpm rebuild` — Selective lifecycle script execution.
 //!
-//! Phase 2 of the two-phase install model:
+//! of the two-phase install model:
 //! - `lpm install` downloads, extracts, and links packages — NO scripts execute.
 //! - `lpm rebuild` selectively runs lifecycle scripts based on trust policy.
 //!
@@ -46,7 +46,7 @@ use lpm_store::PackageStore;
 
 /// Resolve a lockfile-package's source-of-truth dir for the post-
 /// install script pipeline (lifecycle scripts + script-body diff).
-/// Prefers the v2 store (default since Phase 66 4b) and falls back
+/// Prefers the v2 store (default since 4b) and falls back
 /// to v1; returns `None` for workspace/file/link sources that don't
 /// materialize into either store, OR for any registry-source package
 /// that's missing from BOTH stores (corrupt-install state — caller
@@ -63,7 +63,7 @@ use lpm_store::PackageStore;
 /// store-side reader that read-only inspections (script bodies,
 /// trust-gate hashing) consume.
 ///
-/// **Phase 66 confidence-followup F2 (2026-05-09).** Hot-loop variant.
+/// Hot-loop variant.
 /// Takes an invocation-local [`V2BaselineIndex`] and turns each
 /// lookup into an O(1) hashmap read. The three rebuild loops
 /// (`run_under_store_lock`, `scriptable_package_rows`,
@@ -106,21 +106,21 @@ const STRIPPED_ENV_PATTERNS: &[&str] = &[
 /// Env var suffix patterns — any var ending with these is stripped.
 const STRIPPED_ENV_SUFFIXES: &[&str] = &["_SECRET", "_PASSWORD", "_KEY", "_PRIVATE_KEY"];
 
-// **Phase 32 Phase 4 M1:** the per-file `SCRIPT_PHASES` const previously
+// the per-file `SCRIPT_PHASES` const previously
 // declared here was removed and consolidated into
 // `lpm_security::EXECUTED_INSTALL_PHASES` (imported above) so the install
 // pipeline, the build pipeline, and the script-hash function all read from
-// the same source of truth. See Phase 4 status doc §F3 for the rationale.
+// the same source of truth. See status doc §F3 for the rationale.
 
 /// Run the `lpm rebuild` command.
 ///
-/// **Phase 46 P6:** `effective_policy` is the already-resolved
+/// `effective_policy` is the already-resolved
 /// [`ScriptPolicy`] from the precedence chain (CLI override → project
 /// `package.json > lpm > scriptPolicy` → `~/.lpm/config.toml` →
-/// default). Chunk 1 threads the value through the signature and
+/// default). threads the value through the signature and
 /// rewrites the blocked-packages pointer for triage mode so users are
 /// told to run `lpm approve-scripts` rather than edit
-/// `trustedDependencies` by hand. Chunk 2 introduces the shared
+/// `trustedDependencies` by hand. introduces the shared
 /// trust helper that promotes green-tier classifications to trusted
 /// under [`ScriptPolicy::Triage`]; this signature change ships first
 /// so the policy value is in scope at every trust-check site before
@@ -135,29 +135,28 @@ pub async fn run(
     timeout_secs: Option<u64>,
     json_output: bool,
     deny_all: bool,
-    // Phase 46 P5 Chunk 2 / Phase 46.1 rework (2026-05-11): sandbox
+    // / rework : sandbox
     // flag trio. `no_sandbox` flips execution to
-    // [`SandboxMode::Disabled`] AND skips env scrubbing (Q6 collapse —
-    // the legacy `--unsafe-full-env` partner was removed in the
-    // beta-cleanup pass). `strict_sandbox` opts INTO outbound network
+    // [`SandboxMode::Disabled`] AND skips env scrubbing — the legacy
+    // `--unsafe-full-env` partner was removed in the beta-cleanup pass. `strict_sandbox` opts INTO outbound network
     // denial via the [`crate::sandbox_config::resolve_sandbox_mode_from_chain`]
     // precedence resolver. `sandbox_log` flips to
     // [`SandboxMode::LogOnly`] — strictly diagnostic, never a
-    // soft-enforcement substitute per Chunk 4 signoff. `no_sandbox`
+    // soft-enforcement substitute per signoff. `no_sandbox`
     // and `strict_sandbox` are mutually exclusive at the clap layer
     // (`conflicts_with_all`) so they never both arrive `true`.
     no_sandbox: bool,
     strict_sandbox: bool,
     sandbox_log: bool,
-    // Phase 46 P6 Chunk 1: already-resolved effective script policy.
+    // already-resolved effective script policy.
     // The caller (main.rs for `lpm rebuild`, install.rs for autoBuild)
     // runs the full precedence chain before calling and hands the
-    // final value here. Chunk 1 uses this only to pick the blocked-
+    // final value here. uses this only to pick the blocked-
     // packages messaging (triage → `lpm approve-scripts`, deny/allow
-    // → unchanged); Chunk 2 adds tier-based auto-trust for greens
+    // → unchanged); adds tier-based auto-trust for greens
     // under [`ScriptPolicy::Triage`].
     effective_policy: ScriptPolicy,
-    // **Phase 46 slice 1.** In-memory advisor-approved
+    // In-memory advisor-approved
     // `(name, version)` set from this install's
     // [`crate::triage_advisor_session::AdvisorSession`]. Standalone
     // `lpm rebuild` invocations pass `None` — the trust manifest is
@@ -167,7 +166,7 @@ pub async fn run(
     // persistent `trustedDependencies` entry.
     advisor_approvals: Option<&std::collections::HashSet<(String, String, Option<String>)>>,
 ) -> Result<(), LpmError> {
-    // Phase 64 Round 2: hold the shared store lock across rebuild —
+    // Round 2: hold the shared store lock across rebuild —
     // it traverses store package dirs to read package.json, compute
     // script hashes, and (for already-built check) inspect the
     // `.lpm-built` markers. A concurrent `lpm cache prune --apply` could
@@ -208,7 +207,7 @@ async fn run_under_store_lock(
     strict_sandbox: bool,
     sandbox_log: bool,
     effective_policy: ScriptPolicy,
-    // Phase 46 slice 1 — see `run` for the contract.
+    // slice 1 — see `run` for the contract.
     advisor_approvals: Option<&std::collections::HashSet<(String, String, Option<String>)>>,
 ) -> Result<(), LpmError> {
     // Defense-in-depth on the sandbox flag pair. The CLI boundary
@@ -224,7 +223,7 @@ async fn run_under_store_lock(
     );
 
     // Check deny-all: --deny-all flag or lpm.scripts.denyAll config.
-    // Phase 46 P1: consolidated into the ScriptPolicyConfig loader so
+    //: consolidated into the ScriptPolicyConfig loader so
     // the package.json read is a single pass across all four keys
     // (scriptPolicy, autoBuild, denyAll, trustedScopes).
     let config_deny_all =
@@ -238,9 +237,9 @@ async fn run_under_store_lock(
         return Ok(());
     }
 
-    // Phase 66 confidence-followup S5b — `find_installed_package_baseline`
+    // confidence-followup S5b — `find_installed_package_baseline`
     // (via [`package_baseline_dir`]) prefers the v2 store (default since
-    // Phase 66 4b) and falls back to v1, so the post-install pipeline
+    // 4b) and falls back to v1, so the post-install pipeline
     // doesn't blindly call the v1-only `PackageStore::package_dir`.
     // Without this, every v2-installed scripted package silently skipped
     // at the `pkg_json_path.exists()` check below — i.e., lifecycle
@@ -259,7 +258,7 @@ async fn run_under_store_lock(
     let lockfile = lpm_lockfile::Lockfile::read_fast(&lockfile_path)
         .map_err(|e| LpmError::Registry(format!("failed to read lockfile: {e}")))?;
 
-    // **Phase 48 P0 slice 4.** Read the force-security-floor
+    // Read the force-security-floor
     // kill-switch once per invocation and thread it through every
     // [`evaluate_trust`] call below. When set, approvals in
     // `package.json > lpm > trustedDependencies` are suspended (the
@@ -271,7 +270,7 @@ async fn run_under_store_lock(
         .get_bool("force-security-floor")
         .unwrap_or(false);
 
-    // **Phase 48 P0 sub-slice 6c.** Parse the project's capability
+    // Parse the project's capability
     // request and read the user's configured bounds. Both values
     // flow into every `evaluate_trust` call below; baseline
     // defaults short-circuit cleanly so projects that don't
@@ -282,7 +281,7 @@ async fn run_under_store_lock(
             .map_err(|e| LpmError::Registry(format!("{e}")))?;
     let user_bound = crate::capability::UserBound::from_global_config(&global_config);
 
-    // **Phase 66 confidence-followup F2 + F1+F2 review.** Build the
+    // Build the
     // v2 link-entry index ONCE before the per-package loop, scoped to
     // THIS project's tree. Pre-fix the loop body re-walked every link
     // entry on every iteration; F2 reduced that to a single global
@@ -296,7 +295,7 @@ async fn run_under_store_lock(
     let mut scriptable_packages: Vec<ScriptablePackage> = Vec::new();
 
     for lp in &lockfile.packages {
-        // Phase 66 confidence-followup S5b — v2-aware lookup, F2 —
+        // confidence-followup S5b — v2-aware lookup, F2 —
         // routed through the invocation-local index.
         // `live_package_dir` returns `None` when the package isn't in
         // either store (workspace/file/link sources, corrupt
@@ -321,13 +320,13 @@ async fn run_under_store_lock(
 
         let is_built = pkg_dir.join(BUILD_MARKER).exists();
 
-        // **Phase 32 Phase 4 M5 + Phase 46 P6 Chunk 2:** trust decision
+        // trust decision
         // now flows through the shared [`evaluate_trust`] helper so
         // `rebuild::run` and `all_scripted_packages_trusted` cannot
         // disagree. The helper composes the strict gate (same fn
         // `lpm install` uses to populate `build-state.json`) with the
-        // `is_scope_trusted` scope glob AND the P6 green-tier auto-
-        // trust path (Chunk 2 consumer — active only under
+        // `is_scope_trusted` scope glob AND the green-tier auto-
+        // trust path (*active only under
         // [`ScriptPolicy::Triage`]).
         let trust_reason = evaluate_trust(
             &pkg_dir,
@@ -372,7 +371,7 @@ async fn run_under_store_lock(
         // Registry sources (the common case) `wrapper_id` is `None`
         // and the segment is `<safe>@<version>`; for everything else
         // we pass through `Source::source_id()`. A malformed or
-        // missing `source` collapses to `None` (matches pre-Phase-61
+        // missing `source` collapses to `None` (matches pre-
         // behavior — old paths silently fell back to the store anyway).
         let wrapper_id = lp
             .source
@@ -395,7 +394,7 @@ async fn run_under_store_lock(
         });
     }
 
-    // **Phase 48 P0 slice 4.** If the kill-switch suspended any
+    // If the kill-switch suspended any
     // approvals, emit a single summary line so users don't get
     // one warning per affected package (potentially dozens). The
     // individual BindingDrift / LegacyName warnings above stay
@@ -469,7 +468,7 @@ async fn run_under_store_lock(
         if !json_output {
             let total = scriptable_packages.len();
             let built = scriptable_packages.iter().filter(|p| p.is_built).count();
-            // Phase 46 P6 Chunk 5 fix: distinguish "all built" from
+            // fix: distinguish "all built" from
             // "none trusted". The all-built success message was
             // firing under deny/triage when every scripted package
             // was untrusted, producing "All 0/N packages are
@@ -483,9 +482,9 @@ async fn run_under_store_lock(
             // gated on the same `!all && specific_packages.is_empty()`
             // guard it has below, so the deny and triage UX is
             // consistent whether the set is empty-because-built or
-            // empty-because-untrusted. Surfaced by the Chunk 5
+            // empty-because-untrusted. Surfaced by the 
             // subprocess fixture.
-            // Phase 46 close-out Chunk 2: mirrors the `!= Allow`
+            // close-out mirrors the `!= Allow`
             // guard on the non-empty-to_build warning site below —
             // "will be skipped" is false under allow because the
             // widening rule folds all scripted packages in. Under
@@ -554,7 +553,7 @@ async fn run_under_store_lock(
                 to_build.len()
             ));
             for pkg in &to_build {
-                // Phase 46 P6 Chunk 2: when a package is trusted via
+                // when a package is trusted via
                 // the green-tier auto-trust path (no manifest binding,
                 // no scope match — only the Layer 1 static-gate
                 // classifier + triage policy) surface that to the
@@ -590,7 +589,7 @@ async fn run_under_store_lock(
 
     // Warn if scripted packages are being skipped for lack of trust.
     //
-    // Phase 46 P6 Chunk 1: under `script-policy = "triage"` the canonical
+    // under `script-policy = "triage"` the canonical
     // next step for an untrusted blocked package is `lpm approve-scripts`
     // (which renders the tier, lets the user review diffs, and writes
     // strict bindings into `trustedDependencies`). Pointing triage users
@@ -608,27 +607,27 @@ async fn run_under_store_lock(
     // user — a pre-P6 dead-code bug that also silently buried the
     // "Add to trustedDependencies" hint. Counting from the
     // pre-trust-filter set restores the intended UX and is what the
-    // Chunk 1 messaging swap actually needs to be observable. The
+    // messaging swap actually needs to be observable. The
     // `!all && specific_packages.is_empty()` guard stays because
     // those two branches already run untrusted scripts directly (the
     // user has either opted in with `--all` or named packages
     // explicitly), so the skipped-packages framing is wrong there.
     //
-    // **Phase 46 P6 Chunk 5 fix:** the whole block is now gated on
+    // the whole block is now gated on
     // `!json_output`, and the continuation pointer uses `eprintln!`
     // (stderr) instead of `println!` (stdout). The pre-P6 code
     // used `println!` for the "Add them to trustedDependencies"
     // pointer and lacked a `!json_output` guard — a latent bug
-    // because the block was dead-code (Chunk 1 docs the counter
+    // because the block was dead-code (the counter
     // issue). With the counter now reaching users, the stdout /
     // JSON-mode bleed is real: `--json` consumers parse stdout and
     // any human-readable continuation text on stdout breaks
-    // `JSON.parse`. Surfaced by the Chunk 5 subprocess integration
+    // `JSON.parse`. Surfaced by the subprocess integration
     // fixture which routes stdout through `serde_json::from_str`.
     // The adjacent `output::warn` already emits on stderr via
     // cliclack; routing the continuation there too keeps the
     // two-line UX visually grouped on the same stream.
-    // Phase 46 close-out Chunk 2: the "will be skipped" warning is
+    // close-out the "will be skipped" warning is
     // *about* untrusted packages that fell out of the default-branch
     // filter. Under `ScriptPolicy::Allow` the filter doesn't exclude
     // them anymore (the widening happens in
@@ -665,7 +664,7 @@ async fn run_under_store_lock(
 
     if !json_output {
         output::info(&format!("Building {} package(s)...", to_build.len()));
-        // Phase 46 P6 Chunk 2: summary line for green-tier auto-
+        // summary line for green-tier auto-
         // approvals. Under `script-policy = "triage"`, the shared
         // [`evaluate_trust`] helper promotes packages whose lifecycle
         // scripts match the Layer 1 static-gate allowlist (P2) even
@@ -689,8 +688,8 @@ async fn run_under_store_lock(
     let mut successes = 0usize;
     let mut failures = 0usize;
 
-    // Phase 46.1 rework (2026-05-11) + GPT-5 audit follow-up
-    // (2026-05-11): resolve the full sandbox-mode precedence chain
+    // rework  + GPT-5 audit follow-up
+    // : resolve the full sandbox-mode precedence chain
     // ONCE up front so the env-scrub strategy AND the `SandboxMode`
     // selection both consult the same resolved state.
     //
@@ -699,7 +698,7 @@ async fn run_under_store_lock(
     // resolved mode from the chain — so persistent
     // `[sandbox] mode = "none"` (set via `lpm config sandbox --set none`
     // or directly in `lpm.toml` / `~/.lpm/config.toml`) silently
-    // fell back to the enforced default. GPT-5's 2026-05-11 audit
+    // fell back to the enforced default. GPT-5's audit
     // caught that gap; the test
     // `sandbox_config::tests::decide_runtime_no_flags_config_none_yields_disabled_no_scrub`
     // pins the corrected contract.
@@ -720,9 +719,9 @@ async fn run_under_store_lock(
         resolved_sandbox_mode,
     );
 
-    // Phase 46.1 rework: `--no-sandbox` is the single collapsed
+    // rework: `--no-sandbox` is the single collapsed
     // escape — it drops both containment AND env scrubbing in one
-    // flag (per Q6 of the DX redline). The persistent `[sandbox]
+    // flag (per of the DX redline). The persistent `[sandbox]
     // mode = "none"` shape has the same runtime semantics, just
     // sourced from config / the wizard instead of a CLI flag.
     // `scrub_env=false` covers BOTH paths so the contract is
@@ -755,16 +754,16 @@ async fn run_under_store_lock(
         )
     })?;
 
-    // **Phase 48 P0 slice 5.** Read the user-global allowlist for
+    // Read the user-global allowlist for
     // `sandboxWriteDirs` entries. Expansion rules:
     // - `~/...` entries are expanded to `$HOME/...`.
     // - Entries that aren't absolute after expansion are silently
     //   dropped (callers don't get to cross the user-config trust
     //   boundary with relative paths; only explicit absolute roots
     //   are meaningful here).
-    // Empty / absent → empty `Vec`. Pre-Phase-46.3 the validator
+    // Empty / absent → empty `Vec`. Pre-the validator
     // skipped the allowlist intersection in this case (back-compat
-    // semantic pinned in phase48.md §6); Phase 46.3 flipped that to
+    // semantic pinned in ); flipped that to
     // "no opt-in" so absolute `sandboxWriteDirs` entries outside
     // `project_dir` now require an explicit covering root here.
     let max_write_roots: Vec<PathBuf> = crate::commands::config::GlobalConfig::load()
@@ -790,7 +789,7 @@ async fn run_under_store_lock(
         Some(&home_dir),
     )
     .map_err(|e| LpmError::Registry(format!("{e}")))?;
-    // Phase 46.2 round-5 (2026-05-12): `std::env::temp_dir()` resolves
+    // round-5 : `std::env::temp_dir()` resolves
     // tmpdir portably — POSIX checks `TMPDIR` → falls back to `/tmp`;
     // Windows checks `TMP` → `TEMP` → `USERPROFILE\AppData\Local\Temp`.
     // Pre-46.2-round-5 the helper hardcoded `TMPDIR` + `/tmp` fallback,
@@ -802,7 +801,7 @@ async fn run_under_store_lock(
     // is what every other cross-platform tool uses for this resolution.
     let tmpdir = std::env::temp_dir();
 
-    // Phase 46 P5 Chunk 5: ensure the "standard" writable subpaths
+    // Ensure the "standard" writable subpaths
     // exist on disk before spawning scripts. Sandbox rules allow
     // writes INSIDE `.husky`, `.lpm`, `node_modules`, `~/.cache`,
     // `~/.node-gyp`, `~/.npm` but NOT their creation (creating
@@ -810,7 +809,7 @@ async fn run_under_store_lock(
     // grant). Without this, a first-time `husky install` would
     // fail under Enforce.
     //
-    // Phase 46.2 round-2 (2026-05-12): thread `extra_write_dirs`
+    // round-2 : thread `extra_write_dirs`
     // through too — user-declared `sandboxWriteDirs` entries had to
     // be pre-created for the same reason the built-ins do (creating
     // `<project>/build-output` requires write on `<project>`, which
@@ -833,7 +832,7 @@ async fn run_under_store_lock(
     lpm_sandbox::prepare_writable_dirs(&prepare_spec)
         .map_err(|e| LpmError::Registry(format!("{e}")))?;
 
-    // Phase 46.1 rework GPT-5 audit follow-up: `sandbox_options`
+    // rework GPT-5 audit follow-up: `sandbox_options`
     // (carrying `allow-degraded` and `deny_outbound_network`) is
     // already in scope from the resolver call up top. Do NOT
     // re-resolve here — the previous version did exactly that, but
@@ -841,15 +840,15 @@ async fn run_under_store_lock(
     // caught. The pre-probe + per-package sandbox construction
     // below consume the up-top `sandbox_options` directly.
 
-    // Phase 46 P5 Chunk 4: pre-probe the sandbox factory with a
+    // Pre-probe the sandbox factory with a
     // synthetic spec so unsupported-platform and mode-not-supported
     // errors surface BEFORE any banner or package loop starts.
     // Without this, a Linux user passing `--sandbox-log` would first
     // see the "rule triggers logged but NOT enforced" banner and
     // then get ModeNotSupportedOnPlatform — contradictory UX the
-    // Chunk 4 review flagged.
+    // review flagged.
     //
-    // Phase 46.1 additionally uses the pre-probe to read the
+    // additionally uses the pre-probe to read the
     // backend's effective [`SandboxPosture`] — if `allow-degraded`
     // activated the V1 fallback, this is where we emit the
     // structured per-install stderr warning (exactly once,
@@ -875,7 +874,7 @@ async fn run_under_store_lock(
             sandbox_options.clone(),
         )
         .map_err(|e| LpmError::Registry(format!("sandbox unavailable: {e}")))?;
-        // Phase 46.1 per-install warning: emitted once when the
+        // per-install warning: emitted once when the
         // probe's effective posture is `Degraded`. The structured
         // line names kernel + active ABI + missing dimension so log
         // scrapers can detect the gap mechanically. JSON mode
@@ -892,18 +891,18 @@ async fn run_under_store_lock(
     // banner's "logged but NOT enforced" promise never reaches a
     // user whose platform can't actually honor it.
     //
-    // Phase 46.1 rework note: the `--no-sandbox` banner is emitted
+    // rework note: the `--no-sandbox` banner is emitted
     // up at the `sanitized_env` selector — see the `if no_sandbox`
     // branch in env construction — so users see "credentials NOT
     // stripped + no containment" as one combined warning rather
     // than two split announcements.
     //
-    // GPT-5 audit (2026-05-11) Low + Medium: the strict banner gate
+    // GPT-5 audit  Low + Medium: the strict banner gate
     // must consult BOTH the resolved tier and the final SandboxMode.
     //
     // Round 1: pre-fix the banner only fired for `--strict-sandbox`
     // / `--paranoid` on the CLI. Config-set / env-set strict was
-    // silent, contradicting DX-doc walkthroughs W3 / W6 / W8.
+    // silent, contradicting DX-doc walkthroughs / /.
     //
     // Round 2: once the banner fired for all resolved-Strict
     // sources, it ALSO fired when `--sandbox-log` was passed with
@@ -946,7 +945,7 @@ async fn run_under_store_lock(
 
         let mut pkg_success = true;
 
-        // Phase 57 fix: lifecycle scripts must run from the LIVE
+        // fix: lifecycle scripts must run from the LIVE
         // per-package directory (where the symlinked sibling
         // node_modules/ exists), not the global content-addressable
         // store path. Pre-fix, scripts ran from `~/.lpm/store/v1/...`
@@ -955,7 +954,7 @@ async fn run_under_store_lock(
         // most visibly with `esbuild`'s install.js trying to find
         // its platform-specific binary subpackage.
         //
-        // Phase 57 follow-up: on Linux the linker hardlinks store
+        // follow-up: on Linux the linker hardlinks store
         // files into the live directory, so the live and store files
         // share an inode. Detach hardlinks before any script runs so
         // a script that mutates its own package files doesn't bleed
@@ -1063,7 +1062,7 @@ async fn run_under_store_lock(
 /// Execute a single lifecycle script with timeout, env sanitization,
 /// and filesystem-scoped containment.
 ///
-/// Phase 46 P5 Chunk 2 threads `sandbox_mode` + per-project
+/// This function threads `sandbox_mode` + per-project
 /// `extra_write_dirs` + host-derived `store_root`/`home_dir`/`tmpdir`
 /// through here so the backend can synthesize its profile for THIS
 /// package on THIS host.
@@ -1073,7 +1072,7 @@ async fn run_under_store_lock(
 /// `sandbox-exec`. On non-macOS (Linux, Windows, other Unix) it
 /// continues on the legacy direct-[`std::process::Command`] path
 /// because [`lpm_sandbox`]'s landlock backend (Linux) lands in
-/// Chunk 3 and Windows is deferred to Phase 46.1 (D10). Chunk 3
+/// and Windows is deferred to (D10). 
 /// deletes the non-macOS arm; the macOS arm becomes unconditional.
 #[allow(clippy::too_many_arguments)]
 fn execute_script(
@@ -1096,7 +1095,7 @@ fn execute_script(
     // pre-set them, then append our own INIT_CWD and PATH-with-
     // node_modules/.bin-prepended.
     //
-    // Phase 46.2 (2026-05-12): the path string is platform-aware
+    // : the path string is platform-aware
     // now. Pre-46.2 the helper hardcoded the POSIX `:` separator and
     // the POSIX `/usr/bin:/bin` fallback, which produced a malformed
     // PATH on Windows: the local `node_modules\.bin` shim got fused
@@ -1105,7 +1104,7 @@ fn execute_script(
     // package binary were invisible to lifecycle scripts even though
     // the sandbox itself succeeded.
     //
-    // Phase 46.2 round-5 (2026-05-12): PATH lookup + filter are now
+    // round-5 : PATH lookup + filter are now
     // case-insensitive. Windows env vars are case-insensitive at the
     // OS level — `std::env::vars()` yields the key with its original
     // case (typically `"Path"` on Windows, `"PATH"` on POSIX). A
@@ -1160,10 +1159,10 @@ fn execute_script(
     }
 }
 
-/// Phase 57 — resolve the live per-package directory where lifecycle
+/// — resolve the live per-package directory where lifecycle
 /// scripts should `current_dir` to.
 ///
-/// **Why this matters.** Pre-Phase-57, `execute_script` passed
+/// **Why this matters.** Previously, `execute_script` passed
 /// `pkg.store_path` (the global `~/.lpm/store/v1/<pkg>@<ver>/` location)
 /// as the script's working directory. Scripts that resolve sibling
 /// dependencies via `require.resolve()` failed because the global store
@@ -1178,7 +1177,7 @@ fn execute_script(
 ///
 /// **Two layouts to handle.** The default isolated linker places each
 /// package at `<project>/.lpm/wrappers/<safe_name>@<version>/node_modules/<name>/`
-/// (post-Phase-61) with sibling deps symlinked into the same wrapper's
+/// with sibling deps symlinked into the same wrapper's
 /// `node_modules/`. The opt-in hoisted linker (`LPM_LINKER=hoisted`)
 /// places packages at `<project>/node_modules/<name>/` with all deps
 /// hoisted to the root `node_modules/`; its incremental state lives
@@ -1193,7 +1192,7 @@ fn execute_script(
 /// `std::fs::hard_link`, which means the live file and store file
 /// share an inode — a lifecycle script that mutates files in its
 /// own package directory would mutate the store too. macOS uses
-/// `clonefile()` (CoW), so writes are isolated. The Phase 57
+/// `clonefile()` (CoW), so writes are isolated. The 
 /// follow-up addressed this by detaching hardlinks before scripts
 /// run; see [`prepare_live_package_dir`] and
 /// [`lpm_linker::detach_package_hardlinks`]. Callers that want both
@@ -1207,7 +1206,7 @@ fn live_package_dir(
     store_path: &Path,
     baseline_index: Option<&V2BaselineIndex>,
 ) -> std::path::PathBuf {
-    // Phase 66 §4 — production v2 store handle resolves once per
+    // — production v2 store handle resolves once per
     // call from the active `~/.lpm/`. Tests use the
     // [`live_package_dir_with_v2`] seam directly with a synthetic
     // store rooted in a tempdir, so the env-coupled wrapper here
@@ -1252,10 +1251,10 @@ fn live_package_dir_with_v2(
 
     // Isolated layout (default): `<wrapper-root>/<segment>/node_modules/<name>/`.
     //
-    // Phase 61.1 — wrapper root is `<project>/.lpm/wrappers/`, resolved
+    // — wrapper root is `<project>/.lpm/wrappers/`, resolved
     // through `LayoutPaths` so a future shape change is a single-file edit.
     //
-    // Phase 61.2 audit fix #4 — segment shape comes from
+    // audit fix #4 — segment shape comes from
     // [`LayoutPaths::wrapper_segment`], the same helper
     // [`lpm_linker::LinkTarget::wrapper_segment`] delegates to. For
     // Registry sources `wrapper_id` is `None` and the segment is
@@ -1277,7 +1276,7 @@ fn live_package_dir_with_v2(
     // version conflicts (a different version nested under a parent
     // would not be found by this probe), but covers the common case.
     //
-    // **Phase 66 §4 — virtual-store-aware via symlink-follow.** Under
+    // Under
     // v2 mode the project's `node_modules/<name>` is a symlink into
     // `~/.lpm/store/v2/links/<key>/node_modules/<name>/`. `is_dir()`
     // follows the symlink, so this branch returns the (symlink) path
@@ -1288,7 +1287,7 @@ fn live_package_dir_with_v2(
         return hoisted;
     }
 
-    // Phase 66 §4 — v2 store walk for transitive lifecycle scripts.
+    // — v2 store walk for transitive lifecycle scripts.
     // Direct deps under v2 are covered by the previous branch via the
     // project-side symlink; transitives have no project-root symlink,
     // so without a store walk they'd fall through to the pathological
@@ -1321,12 +1320,12 @@ fn live_package_dir_with_v2(
 
     // Pathological fallback: package isn't linked. Lifecycle scripts
     // shouldn't reach this code path (they're gated on linked + scripted
-    // upstream), but if they do, preserve pre-Phase-57 behavior so the
+    // upstream), but if they do, preserve pre-existing behavior so the
     // failure mode at least matches what users were already seeing.
     store_path.to_path_buf()
 }
 
-/// Phase 57 follow-up — resolve the live per-package directory AND
+/// follow-up — resolve the live per-package directory AND
 /// detach hardlinks so a lifecycle script's writes can't propagate
 /// to the global content-addressable store.
 ///
@@ -1347,7 +1346,7 @@ fn live_package_dir_with_v2(
 /// is shaped, because detaching files inside `~/.lpm/store/` is
 /// exactly what we're trying to prevent.
 ///
-/// **Phase 61.2 D8a — store-fallback hard-error.** Pre-Phase-61 this
+/// Pre-this
 /// function returned `Ok(store_path)` whenever the live probe fell
 /// through to the store. The caller then chdir'd into the store for
 /// the lifecycle script — which, on macOS (clonefile, CoW) was a
@@ -1357,7 +1356,7 @@ fn live_package_dir_with_v2(
 /// inodes. Either way, lifecycle scripts running inside the store
 /// is a soundness violation; the install pipeline already gates
 /// on "linked + scripted" so the fallback was unreachable in
-/// practice but still load-bearing as a safety net. Phase 61.2
+/// practice but still load-bearing as a safety net. 
 /// closes the hole: when the resolved path is inside the store, we
 /// return `Err(...)` instead of plowing forward. Callers already
 /// format `Err(String)` results so no caller surface change is
@@ -1386,7 +1385,7 @@ fn prepare_live_package_dir(
         baseline_index,
     );
 
-    // Phase 61.2 D8a — hard-error when the resolved live path lands
+    // D8a — hard-error when the resolved live path lands
     // in the store. Pre-fix this branch silently skipped detach AND
     // returned `Ok(store_path)`, letting the caller chdir into the
     // canonical bytes for a lifecycle script. See the function
@@ -1408,10 +1407,10 @@ fn prepare_live_package_dir(
 
 /// Spawn a lifecycle script through the sandbox backend.
 ///
-/// Phase 46 P5 Chunk 3 removes the Chunk 2 cfg-fork between macOS
+/// This removes the cfg-fork between macOS
 /// (sandboxed) and non-macOS (legacy direct-Command). Every platform
 /// now routes through [`lpm_sandbox::new_for_platform`]: macOS uses
-/// Seatbelt, Linux uses landlock, Windows uses the Phase 46.2
+/// Seatbelt, Linux uses landlock, Windows uses the 
 /// Mandatory Integrity Control + Job Object backend. Old Linux
 /// kernels (<5.13) surface
 /// [`lpm_sandbox::SandboxError::KernelTooOld`]; non-{macOS, Linux,
@@ -1422,11 +1421,11 @@ fn prepare_live_package_dir(
 ///
 /// The [`SandboxMode::Disabled`] arm inside the factory hands back a
 /// [`lpm_sandbox::NoopSandbox`] on every platform, so `--no-sandbox`
-/// (Phase 46.1 rework collapsed the legacy `--unsafe-full-env`
-/// partner per Q6) remains reachable universally as the single
+/// (rework collapsed the legacy `--unsafe-full-env`
+/// partner) remains reachable universally as the single
 /// escape hatch.
 ///
-/// Phase 46.2 (2026-05-12): the shell-string for the lifecycle
+/// : the shell-string for the lifecycle
 /// script is dispatched through [`platform_shell_invocation`] so
 /// Windows hosts get `cmd.exe /D /C <cmd>` instead of `sh -c <cmd>`
 /// (sh isn't on the standard Windows PATH). Without this, the
@@ -1459,7 +1458,7 @@ fn spawn_lifecycle_child(
         tmpdir: tmpdir.to_path_buf(),
         extra_write_dirs: extra_write_dirs.to_vec(),
     };
-    // Phase 46.1: thread the resolved `[sandbox] allow-degraded`
+    // thread the resolved `[sandbox] allow-degraded`
     // opt-in through so per-package sandbox construction picks the
     // same posture the pre-probe used. Posture mismatches between
     // pre-probe and per-package construction would surface as a
@@ -1524,7 +1523,7 @@ fn find_env_case_insensitive<'a>(
 ///   declare them via the existing PATH passthrough, not rely on
 ///   this fallback.
 ///
-/// Pre-Phase-46.2 this was inlined with hardcoded POSIX separators
+/// Pre-this was inlined with hardcoded POSIX separators
 /// and fallback. The Windows sandbox spawn would then succeed but
 /// produce a malformed PATH (`node_modules\.bin:<parent-path>`),
 /// rendering local shims invisible to scripts even though the
@@ -1565,7 +1564,7 @@ fn build_lifecycle_path(project_dir: &Path, parent_path: Option<&str>) -> String
 /// `/C` runs the command and terminates. Both shells are guaranteed
 /// to be on PATH on their respective platforms.
 ///
-/// This was hardcoded to `sh -c` before Phase 46.2 because the
+/// This was hardcoded to `sh -c` before because the
 /// pre-46.2 sandbox returned `UnsupportedPlatform` on Windows, so the
 /// lifecycle path never reached spawn there. With the real backend
 /// landed, dispatch has to be platform-aware to make end-to-end
@@ -1735,7 +1734,7 @@ fn read_lifecycle_scripts(pkg_json_path: &Path) -> Option<HashMap<String, String
 /// it fires at most once per package). Hot per-N callers (the install-
 /// time hint walk on potentially hundreds of packages) MUST use
 /// [`parse_trusted_scopes`] + [`name_matches_trusted_scope`] to read
-/// the manifest once and amortize the parse — see Phase 51 W2 for the
+/// the manifest once and amortize the parse — see for the
 /// 266-pkg N+1 motivation.
 fn is_scope_trusted(package_name: &str, project_dir: &Path) -> bool {
     let scopes = parse_trusted_scopes(project_dir);
@@ -1798,7 +1797,7 @@ struct ScriptablePackage {
     /// from [`lpm_lockfile::Source::source_id`] so the rebuild loop's
     /// per-package wrapper lookup matches the linker's segment exactly.
     ///
-    /// Phase 61.2 audit fix #4: pre-fix the rebuild loop hardcoded
+    /// audit fix #4: pre-fix the rebuild loop hardcoded
     /// `<safe>@<version>` for every package, silently falling back to
     /// the store path for any non-Registry dep with lifecycle scripts.
     /// Post-fix the lookup is correct for every source kind.
@@ -1807,7 +1806,7 @@ struct ScriptablePackage {
     scripts: HashMap<String, String>,
     is_built: bool,
     is_trusted: bool,
-    /// **Phase 46 P6 Chunk 2:** the specific basis on which
+    /// the specific basis on which
     /// `is_trusted` was decided. Preserved so the dry-run output and
     /// the pre-loop summary can surface WHY a script was trusted
     /// (strict binding vs. scope vs. green-tier auto-approval under
@@ -1823,16 +1822,16 @@ struct ScriptablePackage {
 ///
 /// The variants are ordered by evaluation priority inside
 /// [`evaluate_trust`]: strict-gate matches win over scope globs, which
-/// win over the P6 green-tier auto-trust. Drift is a terminal "no" —
+/// win over the green-tier auto-trust. Drift is a terminal "no" —
 /// a drifted rich binding never auto-recovers via triage even when
 /// the current on-disk script would classify green; the user must
 /// re-review via `lpm approve-scripts`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum TrustReason {
-    /// Rich strict binding (Phase 32 Phase 4): `{name, version,
+    /// Rich strict binding: `{name, version,
     /// integrity, scriptHash}` tuple matches an approved entry.
     StrictBinding,
-    /// Pre-Phase-4 legacy bare-name `trustedDependencies: ["name"]`
+    /// Pre-legacy bare-name `trustedDependencies: ["name"]`
     /// entry. Matched via `TrustMatch::LegacyNameOnly`. Callers
     /// still emit a soft deprecation warning so users migrate to
     /// the rich form.
@@ -1841,13 +1840,13 @@ pub(crate) enum TrustReason {
     ScopedGlob,
     /// `script-policy = "triage"` + worst-wins classification of
     /// the package's lifecycle phases is [`StaticTier::Green`]. This
-    /// is the P6 auto-trust path — the package carries no manifest
+    /// is the auto-trust path — the package carries no manifest
     /// binding, but its scripts match the hand-curated Layer 1
     /// allowlist (`node-gyp rebuild`, `tsc`, `prisma generate`,
     /// `husky install`, `electron-rebuild`, relative-path `node`
     /// calls). Only reachable under [`ScriptPolicy::Triage`].
     GreenTierUnderTriage,
-    /// **Phase 46 slice 1 (post-Part-B install-time consumption).**
+    /// 
     /// `script-policy = "triage"` + worst-wins classification is
     /// Amber/AmberLlm + an in-memory [`crate::triage_advisor_session::AdvisorSession`]
     /// returned `Approve` for this `(name, version)` during the
@@ -1867,7 +1866,7 @@ pub(crate) enum TrustReason {
     /// changed, so a re-review is required. Matches `rebuild::run`'s
     /// pre-P6 semantics exactly.
     BindingDrift,
-    /// **Phase 48 P0 slice 4.** The user set
+    /// The user set
     /// `force-security-floor = true` in `~/.lpm/config.toml`. What
     /// would otherwise be a trust-granting result (`StrictBinding`,
     /// `LegacyName`, `ScopedGlob`, or `GreenTierUnderTriage`) is
@@ -1882,7 +1881,7 @@ pub(crate) enum TrustReason {
     /// suspended approvals so users can see what the kill-switch is
     /// holding back.
     SuspendedByForceFloor,
-    /// **Phase 48 P0 sub-slice 6c.** The package's requested
+    /// The package's requested
     /// [`crate::capability::CapabilitySet`] widens beyond the
     /// user's [`crate::capability::UserBound`], AND no approval
     /// record in `package.json > lpm > trustedDependencies` has a
@@ -1928,12 +1927,12 @@ impl TrustReason {
     }
 }
 
-/// Phase 46 P6 Chunk 2 — shared trust decision.
+/// — shared trust decision.
 ///
 /// Single source of truth for "is this package trusted to execute
 /// lifecycle scripts under the current effective policy?" Consumed by
 /// both [`run`] (via its `scriptable_packages` loop) and
-/// [`all_scripted_packages_trusted`] (Chunk 3 migration) so the two
+/// [`all_scripted_packages_trusted`]  so the two
 /// paths cannot disagree on trust the first time one gets tweaked.
 ///
 /// Evaluation order — the first matching rule wins:
@@ -1945,7 +1944,7 @@ impl TrustReason {
 ///    overridden by later rules.
 /// 2. **Scope glob** (`lpm.scripts.trustedScopes`). Glob match yields
 ///    [`TrustReason::ScopedGlob`].
-/// 3. **Green-tier auto-trust** (NEW in P6). Only when
+/// 3. **Green-tier auto-trust** (NEW in). Only when
 ///    `effective_policy == Triage`: classify every present lifecycle
 ///    phase via [`lpm_security::static_gate::classify`], reduce
 ///    worst-wins (same precedence `build_state.rs` uses at install
@@ -1957,7 +1956,7 @@ impl TrustReason {
 /// back from `build-state.json`. That file is an install-time cache
 /// and a user-facing artifact; calling `lpm rebuild` standalone (no
 /// preceding install) must still yield the same decision. Matches the
-/// Chunk 2 signoff answer to ambiguity #4.
+/// signoff answer to ambiguity #4.
 ///
 /// Drift is never auto-recovered under triage. A drifted rich binding
 /// means the user previously approved a different script body; even
@@ -1975,7 +1974,7 @@ pub(crate) fn evaluate_trust(
     policy: &SecurityPolicy,
     project_dir: &Path,
     effective_policy: ScriptPolicy,
-    // **Phase 48 P0 slice 4.** When `true`, any result that would
+    // When `true`, any result that would
     // otherwise be trust-granting (`StrictBinding`, `LegacyName`,
     // `ScopedGlob`, `GreenTierUnderTriage`) is intercepted and
     // returned as [`TrustReason::SuspendedByForceFloor`]. Callers
@@ -1984,7 +1983,7 @@ pub(crate) fn evaluate_trust(
     // represents a "not trusted" terminal state. `Untrusted` is also
     // unaffected — there's nothing to suspend when nothing was trusted.
     force_security_floor: bool,
-    // **Phase 48 P0 sub-slice 6c.** The package's requested
+    // The package's requested
     // capability set, parsed from `package.json > lpm > scripts >
     // {passEnv, readProject, sandboxLimits}`. Baseline default means
     // "no extras requested" and passes straight through — most
@@ -1995,7 +1994,7 @@ pub(crate) fn evaluate_trust(
     // configured" — rlimit requests with no matching user ceiling
     // fail closed (trigger the approval gate).
     user_bound: &crate::capability::UserBound,
-    // **Phase 46 slice 1.** In-memory ephemeral approval set
+    // In-memory ephemeral approval set
     // populated by the install path's
     // [`crate::triage_advisor_session::AdvisorSession`]. A package
     // whose `(name, version)` appears here AND classifies amber
@@ -2051,7 +2050,7 @@ pub(crate) fn evaluate_trust(
     }
 }
 
-/// Phase 48 P0 slice 4 — the original `evaluate_trust` body, extracted
+/// slice 4 — the original `evaluate_trust` body, extracted
 /// so [`evaluate_trust`] can compose "raw match → suspension filter"
 /// without duplicating the match logic. Returns every variant
 /// [`TrustReason`] can take EXCEPT [`TrustReason::SuspendedByForceFloor`],
@@ -2086,7 +2085,7 @@ fn evaluate_trust_unsuspended(
         if tier == Some(StaticTier::Green) {
             return TrustReason::GreenTierUnderTriage;
         }
-        // **Phase 46 slice 1.** Amber + advisor said Approve →
+        // Amber + advisor said Approve →
         // ephemeral trust for this run. Confined to triage policy
         // (deny / allow paths never reach here in a triage-meaningful
         // way) and to a non-empty in-memory approval set. Standalone
@@ -2132,12 +2131,12 @@ fn classify_package_worst_tier(scripts: &HashMap<String, String>) -> Option<Stat
 /// user needs to resolve before scripts will run under the default
 /// command.
 ///
-/// **Phase 46 P6 Chunk 1:** extracted from the inline warning block
+/// extracted from the inline warning block
 /// so a pure-input regression test can guard the counting contract.
 /// The prior inline implementation counted from `to_build` — which in
 /// the default path is already filtered to trusted-only — so the
 /// count was structurally always zero and the warning (plus the
-/// Chunk 1 triage pointer wired through it) never reached users.
+/// triage pointer wired through it) never reached users.
 /// A purely source-level guard test catches marker-string deletions
 /// but cannot catch this class of regression; a pure-function test
 /// on a synthetic input set does.
@@ -2151,7 +2150,7 @@ fn count_untrusted_unbuilt(scriptable: &[ScriptablePackage], force: bool) -> usi
 
 /// Pure selection step for `lpm rebuild`'s default-branch `to_build` set.
 ///
-/// Extracted for **Phase 46 close-out Chunk 2** so the policy-aware
+/// Extracted for so the policy-aware
 /// widening rule lives outside `rebuild::run`'s I/O monolith and can
 /// be unit-tested in isolation — the complementary caller-side
 /// contract to the helper-level
@@ -2162,18 +2161,18 @@ fn count_untrusted_unbuilt(scriptable: &[ScriptablePackage], force: bool) -> usi
 /// ignores allow (its job is manifest-binding / scope / tier), and
 /// this helper honors it.
 ///
-/// Branching rules (§5.1 + pre-Phase-46 behavior):
+/// Branching rules (+ pre-existing behavior):
 ///
 /// - `all = true` → widen to every scriptable package regardless of
-///   trust or policy. `--all` is the pre-Phase-46 explicit escape
+///   trust or policy. `--all` is the pre-existing explicit escape
 ///   hatch and keeps that contract.
 /// - `effective_policy == ScriptPolicy::Allow` → widen to every
 ///   scriptable package regardless of `is_trusted`. Allow runs
-///   every lifecycle script without the triage gate (§5.1); the
+///   every lifecycle script without the triage gate; the
 ///   selection step is where that semantic lives.
 /// - Else (`Deny` or `Triage` without `--all`) → filter to
 ///   `is_trusted` only. Under `Triage`, `is_trusted` already
-///   reflects the P6 green-tier promotion — so triage widens
+///   reflects the green-tier promotion — so triage widens
 ///   to greens-plus-strict-plus-scope automatically via the
 ///   `is_trusted` computation, NOT via this helper. The
 ///   green-only widening stays gated at [`evaluate_trust`].
@@ -2198,7 +2197,7 @@ fn widen_to_build_by_policy(
 
 /// One scriptable-package row for the install-time build hint.
 ///
-/// Phase 46 P1 extracted this struct from the previous tuple-shaped
+/// extracted this struct from the previous tuple-shaped
 /// buffer so the hint's trust decision is independently testable.
 /// [`scriptable_package_rows`] is pure over (store state, manifest,
 /// project_dir); [`show_install_build_hint`] is the I/O wrapper that
@@ -2214,7 +2213,7 @@ pub(crate) struct ScriptableHintRow {
 
 /// Pure computation of the install-hint rows.
 ///
-/// **Phase 46 P1 migration:** trust decision switched from
+/// trust decision switched from
 /// [`SecurityPolicy::can_run_scripts`] (lenient, name-only) to
 /// [`SecurityPolicy::can_run_scripts_strict`], matching the exact
 /// semantic `rebuild::run` uses. Closes the pre-existing drift where a
@@ -2228,7 +2227,7 @@ pub(crate) struct ScriptableHintRow {
 /// strict gate still works, just with a weaker binding.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn scriptable_package_rows(
-    // Phase 66 confidence-followup S5b — switched `&PackageStore`
+    // confidence-followup S5b — switched `&PackageStore`
     // (v1-only) for `&LpmRoot` so per-package lookups can route
     // through `find_installed_package_baseline` and pick up v2-
     // installed packages. Without this, the install-time build hint
@@ -2239,7 +2238,7 @@ pub(crate) fn scriptable_package_rows(
     packages: &[(String, String, Option<String>)], // (name, version, integrity)
     policy: &SecurityPolicy,
     project_dir: &Path,
-    // **Phase 48 P0 sub-slice 6d follow-up.** Without these two
+    // Without these two
     // params, the install hint reports `trusted ✓` for packages
     // whose capability request the 6c gate will block at
     // `lpm rebuild` time. The hint is a user-facing contract about
@@ -2252,7 +2251,7 @@ pub(crate) fn scriptable_package_rows(
 ) -> Vec<ScriptableHintRow> {
     use rayon::prelude::*;
 
-    // **Phase 51 W2: hoist trustedScopes parse out of the per-package
+    // **W2: hoist trustedScopes parse out of the per-package
     // loop.** The previous implementation called `is_scope_trusted`
     // inside the loop, which re-read AND re-parsed
     // `project_dir/package.json` for every package. On the 266-pkg
@@ -2262,7 +2261,7 @@ pub(crate) fn scriptable_package_rows(
     // the per-package step into a pure in-memory glob match.
     let trusted_scopes = parse_trusted_scopes(project_dir);
 
-    // **Phase 66 confidence-followup F2 + F1+F2 review.** Build the
+    // Build the
     // v2 link-entry index ONCE before the rayon walk, scoped to this
     // project's tree. Per-package lookups become O(1) map reads;
     // the project scoping prevents the post-F1 ambiguity where a
@@ -2277,7 +2276,7 @@ pub(crate) fn scriptable_package_rows(
 
     let walk_start = std::time::Instant::now();
 
-    // **Phase 51 W2: parallelize the per-package walk via rayon.**
+    // 
     // Same pattern as `build_state::compute_blocked_packages_with_metadata`.
     // Each iteration is independent — pure CPU + read-only disk: one
     // package.json read, one `BUILD_MARKER` stat, one
@@ -2289,7 +2288,7 @@ pub(crate) fn scriptable_package_rows(
     // input order anyway under rayon's stable collect.
     let per_pkg = |(name, version, integrity): &(String, String, Option<String>)|
      -> Option<ScriptableHintRow> {
-        // Phase 66 confidence-followup S5b — v2-aware lookup, F2 —
+        // confidence-followup S5b — v2-aware lookup, F2 —
         // routed through the invocation-local index. See
         // [`package_baseline_dir`] for the silent-skip-vs-real-skip
         // semantic.
@@ -2321,7 +2320,7 @@ pub(crate) fn scriptable_package_rows(
         let scope_trust = name_matches_trusted_scope(name, &trusted_scopes);
         let base_trusted = strict_trust || scope_trust;
 
-        // **Phase 48 P0 sub-slice 6d follow-up.** If the script-
+        // If the script-
         // hash / scope layer would trust the package but the
         // capability gate rejects it, `lpm rebuild` will NOT run
         // the script. The hint must reflect that accurately.
@@ -2366,14 +2365,14 @@ pub(crate) fn scriptable_package_rows(
 /// decisions live in the pure helper.
 #[allow(clippy::too_many_arguments)]
 pub fn show_install_build_hint(
-    // Phase 66 confidence-followup S5b — see
+    // confidence-followup S5b — see
     // `scriptable_package_rows` for why this is `&LpmRoot` not
     // `&PackageStore`.
     lpm_root: &lpm_common::LpmRoot,
     packages: &[(String, String, Option<String>)], // (name, version, integrity)
     policy: &SecurityPolicy,
     project_dir: &Path,
-    // Phase 48 P0 sub-slice 6d follow-up — threaded to
+    // sub-slice 6d follow-up — threaded to
     // `scriptable_package_rows` so the hint reflects the
     // capability gate's effect on trust (see comment on that
     // function for the full rationale).
@@ -2437,24 +2436,24 @@ pub fn show_install_build_hint(
 /// Used by install.rs to decide whether to auto-build without explicit
 /// opt-in.
 ///
-/// **Phase 46 P1 migration:** same strict/tiered gate as
+/// same strict/tiered gate as
 /// `scriptable_package_rows` and `rebuild::run`. A drifted rich
 /// binding now correctly fails this predicate (previously `true` with
 /// the name-only gate, which would trigger auto-build for a package
 /// `rebuild::run` would then skip — confusing UX at best, silent trust
 /// bypass at worst).
 ///
-/// **Phase 46 P6 Chunk 1:** takes the already-resolved
+/// takes the already-resolved
 /// [`ScriptPolicy`] so the predicate and `rebuild::run` agree on which
 /// packages count as trusted.
 ///
-/// **Phase 46 P6 Chunk 3:** migrated onto the shared
+/// migrated onto the shared
 /// [`evaluate_trust`] helper so the install-time auto-build predicate
 /// and `rebuild::run`'s per-package trust decision are single-sourced.
 /// Under [`ScriptPolicy::Triage`], this means a package whose
 /// lifecycle scripts worst-wins classify as [`StaticTier::Green`]
 /// counts as trusted for auto-build-trigger purposes even without a
-/// `trustedDependencies` entry — the §11 P6 auto-execution contract.
+/// `trustedDependencies` entry — the auto-execution contract.
 /// Under `Deny` / `Allow`, behavior is unchanged from Chunks 1-2:
 /// only strict gate + scope glob matches count.
 ///
@@ -2464,7 +2463,7 @@ pub fn show_install_build_hint(
 /// pre-P6 semantics.
 #[allow(clippy::too_many_arguments)]
 pub fn all_scripted_packages_trusted(
-    // Phase 66 confidence-followup S5b — see
+    // confidence-followup S5b — see
     // `scriptable_package_rows` for why this is `&LpmRoot` not
     // `&PackageStore`. Without the v2-aware lookup, the predicate
     // returned `false` for every v2 install with unbuilt-but-trusted
@@ -2475,19 +2474,19 @@ pub fn all_scripted_packages_trusted(
     policy: &SecurityPolicy,
     project_dir: &Path,
     effective_policy: ScriptPolicy,
-    // **Phase 48 P0 slice 4.** Threaded through to
+    // Threaded through to
     // [`evaluate_trust`]. When `true`, every approval is suspended —
     // so if even one package has scripts, this function returns
     // `false`, correctly declining the auto-build path under the
     // kill-switch.
     force_security_floor: bool,
-    // **Phase 48 P0 sub-slice 6c.** Threaded through to
+    // Threaded through to
     // [`evaluate_trust`]'s capability gate. Auto-build declines
     // cleanly when the project's `lpm.scripts.*` widens beyond
     // the user bound and no matching approval exists.
     requested_capabilities: &crate::capability::CapabilitySet,
     user_bound: &crate::capability::UserBound,
-    // **Phase 46 slice 1.** Threaded through to [`evaluate_trust`]
+    // Threaded through to [`evaluate_trust`]
     // so an install's autoBuild predicate sees the same ephemeral
     // advisor approvals the script-execution path will see. Without
     // this, a `Some(approvals)` install would still report "not all
@@ -2495,7 +2494,7 @@ pub fn all_scripted_packages_trusted(
     // the whole point of advisor-enhanced triage.
     advisor_approvals: Option<&std::collections::HashSet<(String, String, Option<String>)>>,
 ) -> bool {
-    // **Phase 66 confidence-followup F2 + F1+F2 review.** Build the
+    // Build the
     // v2 link-entry index ONCE before the per-package loop, scoped to
     // this project's tree. Same rationale as `scriptable_package_rows`
     // — install-time auto-build predicate checks every lockfile entry,
@@ -2508,7 +2507,7 @@ pub fn all_scripted_packages_trusted(
     let mut has_any_unbuilt = false;
 
     for (name, version, integrity) in packages {
-        // Phase 66 confidence-followup S5b — v2-aware lookup, F2 —
+        // confidence-followup S5b — v2-aware lookup, F2 —
         // routed through the invocation-local index. Same
         // silent-skip semantics as the main loop; see
         // [`package_baseline_dir`] doc.
@@ -2644,7 +2643,7 @@ fn toposort_packages<'a>(
 
 /// Warn if any entries in `trustedDependencies` don't actually have lifecycle scripts.
 ///
-/// Phase 4 M2: `policy.trusted_dependencies` is now a `TrustedDependencies`
+/// M2: `policy.trusted_dependencies` is now a `TrustedDependencies`
 /// enum (Legacy | Rich). The iter() method yields `(name, optional binding)`
 /// tuples; we only care about the name for the staleness check.
 fn warn_stale_trusted_deps(policy: &SecurityPolicy, scriptable_packages: &[ScriptablePackage]) {
@@ -2674,7 +2673,7 @@ fn warn_stale_trusted_deps(policy: &SecurityPolicy, scriptable_packages: &[Scrip
     }
 }
 
-// Phase 46 P1: `read_deny_all_config` was removed as part of
+//: `read_deny_all_config` was removed as part of
 // consolidating script-config reads into
 // `crate::script_policy_config::ScriptPolicyConfig`. Callers now
 // access `.deny_all` on the loader's return value. The dedicated
@@ -2705,7 +2704,7 @@ mod tests {
         if built {
             std::fs::write(pkg_dir.join(BUILD_MARKER), "").unwrap();
         }
-        // Phase 66 confidence-followup S5b — `find_installed_package_baseline`'s
+        // confidence-followup S5b — `find_installed_package_baseline`'s
         // v1 fallback requires `.integrity` to be Some (sentinel for
         // "package was extracted by the install pipeline"). Without
         // this, the v1 fallback returns None and these tests' helper
@@ -2714,7 +2713,7 @@ mod tests {
         std::fs::write(pkg_dir.join(".integrity"), "sha512-test-fake").unwrap();
     }
 
-    // ── Phase 57: live_package_dir tests ─────────────────────────
+    // ── live_package_dir tests ─────────────────────────
     //
     // The fix for the esbuild postinstall failure: lifecycle scripts
     // must run from the live per-package node_modules directory, not
@@ -2726,7 +2725,7 @@ mod tests {
     #[test]
     fn live_package_dir_resolves_isolated_layout() {
         // Isolated layout (default `LPM_LINKER` value): packages live
-        // under the wrapper root (Phase 61.1: `<project>/.lpm/wrappers/`)
+        // under the wrapper root (`<project>/.lpm/wrappers/`)
         // at `<wrapper-root>/<safe_name>@<version>/node_modules/<name>/`,
         // with sibling deps symlinked at the parallel `node_modules/`
         // level. Path resolved through `LayoutPaths` so tests track
@@ -2806,11 +2805,11 @@ mod tests {
         // Pathological case: package isn't actually linked anywhere.
         // Lifecycle script gating upstream should prevent this from
         // running scripts in production, but if it does, fall back to
-        // the pre-Phase-57 behavior (store_path) so failures match what
+        // the pre-existing behavior (store_path) so failures match what
         // users were already seeing rather than introducing a new "no
         // working directory" error class.
         //
-        // Phase 66 §4 — use `live_package_dir_with_v2(None, None)` so the v2
+        // — use `live_package_dir_with_v2(None, None)` so the v2
         // store walk is fully disabled. The env-coupled
         // `live_package_dir` would otherwise probe the developer's
         // real `~/.lpm/store/v2/links/` and find a stale entry from
@@ -2832,7 +2831,7 @@ mod tests {
         assert_eq!(resolved, store_fallback);
     }
 
-    /// Phase 66 §4 — direct deps under v2: project's `node_modules/<name>`
+    /// — direct deps under v2: project's `node_modules/<name>`
     /// is a symlink into `~/.lpm/store/v2/links/<key>/.../<name>/`.
     /// The hoisted-probe branch's `is_dir()` follows the symlink and
     /// returns the project-side path, which Node resolves through at
@@ -2867,7 +2866,7 @@ mod tests {
         assert_eq!(resolved, nm.join("express"));
     }
 
-    /// Phase 66 §4 — transitive deps under v2: no project-side symlink
+    /// — transitive deps under v2: no project-side symlink
     /// exists, so `live_package_dir_with_v2` walks the v2 store via
     /// `find_link_package_dir` and returns the canonical link-entry
     /// package dir.
@@ -2956,7 +2955,7 @@ mod tests {
         assert_eq!(resolved, isolated);
     }
 
-    // ── Phase 57 follow-up — prepare_live_package_dir tests ──────
+    // ── follow-up — prepare_live_package_dir tests ──────
     //
     // These tests pin the integration: composing `live_package_dir`
     // with `lpm_linker::detach_package_hardlinks`, plus the
@@ -2994,8 +2993,8 @@ mod tests {
 
     #[test]
     fn prepare_live_package_dir_errors_when_unlinked() {
-        // Phase 61.2 D8a (audit fix #5): pathological "package not
-        // actually linked" case. Pre-Phase-61 `prepare_live_package_dir`
+        // D8a (audit fix #5): pathological "package not
+        // actually linked" case. Pre-`prepare_live_package_dir`
         // returned `Ok(store_path)` here, letting the caller chdir into
         // the canonical store bytes for the lifecycle script — silent
         // store corruption on macOS/clonefile, shared-inode write on
@@ -3278,7 +3277,7 @@ mod tests {
         // as `LegacyNameOnly`, which the strict gate treats as
         // trusted — same semantic `rebuild::run` uses.
         //
-        // Phase 46 P6 Chunk 1: the policy arg is threaded but not yet
+        // the policy arg is threaded but not yet
         // consulted; `ScriptPolicy::Deny` (the default) makes the
         // existing-behavior intent explicit. Chunks 2/3 add tier-
         // aware promotion; new tests covering triage + green land
@@ -3377,12 +3376,12 @@ mod tests {
         );
     }
 
-    // ─── Phase 46 P1: drifted-rich-binding regressions ─────────────
+    // ───: drifted-rich-binding regressions ─────────────
     //
     // These two tests pin the audit-prescribed behavior: a rich entry
     // whose stored `scriptHash` no longer matches what's on disk must
-    // NOT be treated as trusted by either the install hint (§7 of
-    // the Phase 46 plan) or the auto-build predicate. Pre-migration,
+    // NOT be treated as trusted by either the install hint (of
+    // the plan) or the auto-build predicate. Pre-migration,
     // both used the lenient `policy.can_run_scripts(name)` gate and
     // returned true for drifted entries, while `rebuild::run` itself
     // would skip them — producing a confusing UX where install said
@@ -3545,7 +3544,7 @@ mod tests {
         );
     }
 
-    /// **Phase 48 P0 sub-slice 6d follow-up — reviewer's Medium
+    /// **P0 sub-slice 6d follow-up — reviewer's Medium
     /// finding.** When the script-hash trust layer would grant
     /// trust but the capability gate rejects, the install hint
     /// must report `is_trusted = false`. Otherwise the hint lies
@@ -3607,9 +3606,9 @@ mod tests {
 
     #[test]
     fn stale_detection_finds_packages_without_scripts() {
-        // Phase 4 M2: trusted_dependencies is now TrustedDependencies::Legacy
+        // M2: trusted_dependencies is now TrustedDependencies::Legacy
         // (or Rich). Construct the Legacy variant directly to preserve the
-        // pre-Phase-4 test semantic.
+        // pre-existing test semantic.
         let policy = SecurityPolicy {
             trusted_dependencies: lpm_security::TrustedDependencies::Legacy(vec![
                 "sharp".into(),
@@ -3660,7 +3659,7 @@ mod tests {
         assert_eq!(stale, vec!["phantom".to_string()]);
     }
 
-    // ── Phase 32 Phase 4 M5: strict gate composition tests ──────────
+    // ── M5: strict gate composition tests ──────────
     //
     // These tests exercise the trust-decision logic in isolation: given a
     // SecurityPolicy and a (name, version, integrity, script_hash) tuple,
@@ -3746,7 +3745,7 @@ mod tests {
 
     #[test]
     fn build_strict_gate_different_version_blocks_script() {
-        // Phase 4 binds approvals to name@version. Approving 0.25.1 does
+        // binds approvals to name@version. Approving 0.25.1 does
         // NOT carry over to 0.25.2 — the user must re-approve at the new
         // version (or the resolver picks the same one).
         let policy = rich_policy_with("esbuild@0.25.1", Some("sha512-x"), Some("sha256-y"));
@@ -3755,7 +3754,7 @@ mod tests {
         assert_eq!(trust, TrustMatch::NotTrusted);
     }
 
-    /// **AUDIT FIX (Phase 4 D-impl-1, 2026-04-11):** the previous version of
+    /// **AUDIT FIX ():** the previous version of
     /// this test asserted that `<name>@*` preserve keys did NOT satisfy
     /// the strict gate, which broke backward compatibility — a manifest
     /// like `["esbuild"]` lost esbuild's approval on the first
@@ -3805,7 +3804,7 @@ mod tests {
         assert!(is_scope_trusted("@myorg/some-pkg", dir.path()));
     }
 
-    // ── Phase 46 P6 Chunk 1: triage-mode messaging swap ─────────────
+    // ── triage-mode messaging swap ─────────────
     //
     // These tests pin two distinct invariants. The source-level
     // guards catch marker-string deletion (cheap, zero-ceremony,
@@ -3815,8 +3814,8 @@ mod tests {
     // its counter is computed against an already-trust-filtered set
     // (the pre-P6 bug that silently buried both the old and new
     // pointers). A full `rebuild::run` integration test lands in
-    // Chunk 5's reference-fixture harness; the pure-function unit
-    // tests here close the Chunk 1 reviewability gap without the
+    // reference-fixture harness; the pure-function unit
+    // tests here close the reviewability gap without the
     // lockfile scaffolding.
 
     #[test]
@@ -3832,17 +3831,17 @@ mod tests {
         let triage_pos = src.find(TRIAGE_HEAD).unwrap_or_else(|| {
             panic!(
                 "triage-branch marker `{TRIAGE_HEAD}` disappeared from rebuild::run — \
-                 P6 Chunk 1 required this branch so triage users are pointed at \
+                 required this branch so triage users are pointed at \
                  `lpm approve-scripts` instead of editing trustedDependencies by hand. \
                  If the control flow was legitimately refactored, update this test \
                  with the new marker; if the triage branch was removed, that's a \
-                 P6 contract regression and needs explicit signoff."
+                 contract regression and needs explicit signoff."
             )
         });
         let approve_pos = src[triage_pos..].find(APPROVE_POINTER).unwrap_or_else(|| {
             panic!(
                 "`{APPROVE_POINTER}` pointer not found inside the triage branch — \
-                 P6 Chunk 1 wires this specific next-step message for triage \
+                 wires this specific next-step message for triage \
                  blocked-packages UX."
             )
         });
@@ -3851,7 +3850,7 @@ mod tests {
         let legacy_pos = src.find(LEGACY_POINTER).unwrap_or_else(|| {
             panic!(
                 "legacy `{LEGACY_POINTER}` pointer was removed — deny-mode messaging \
-                 must stay unchanged per P6 signoff (the pre-P6 pointer is still the \
+                 must stay unchanged per signoff (the pre-P6 pointer is still the \
                  honest next step under deny)."
             )
         });
@@ -3869,7 +3868,7 @@ mod tests {
     fn p6_chunk1_auto_build_call_site_threads_effective_policy() {
         // Pin the install → auto-build handoff: the `rebuild::run` call
         // in install.rs must carry the resolved effective policy into
-        // `rebuild::run`'s last arg. Without this invariant the Chunk 2
+        // `rebuild::run`'s last arg. Without this invariant the 
         // tier-promotion logic would never see triage at the auto-
         // build site (install.rs today resolves effective_policy for
         // the blocked-hint block only).
@@ -3894,8 +3893,8 @@ mod tests {
     /// fields are irrelevant but must be populated to satisfy the
     /// struct shape. `trust_reason` is derived from `is_trusted` so
     /// the field always stays internally consistent with the boolean
-    /// — Chunk 2 added it, and a test synthesizing a trusted package
-    /// with `TrustReason::Untrusted` would misrepresent the P6 data
+    /// — added it, and a test synthesizing a trusted package
+    /// with `TrustReason::Untrusted` would misrepresent the data
     /// model even though the counter wouldn't notice.
     fn synthetic_scriptable(name: &str, is_built: bool, is_trusted: bool) -> ScriptablePackage {
         ScriptablePackage {
@@ -3960,18 +3959,18 @@ mod tests {
         assert_eq!(count_untrusted_unbuilt(&pkgs, false), 0);
     }
 
-    // ── Phase 46 P6 Chunk 2: shared trust helper behavior ───────────
+    // ── shared trust helper behavior ───────────
     //
     // These tests pin `evaluate_trust` under each effective policy ×
     // static-tier combination that materially changes behavior. The
     // helper is the only place where "green-tier auto-trust" is
-    // decided — both `rebuild::run` and the Chunk 3 install-time
+    // decided — both `rebuild::run` and the install-time
     // `all_scripted_packages_trusted` migration route through here,
     // so single-point coverage is sufficient for the policy decision.
     // The composition of the decision with the surrounding control
     // flow (which packages get skipped, what message prints, what
     // gets sandboxed) is covered by `rebuild::run`'s integration tests
-    // in Chunk 5.
+    // in the integration tests.
     //
     // Every test writes a synthetic package into a temp store with
     // real lifecycle scripts so `compute_script_hash` and the static-
@@ -3997,7 +3996,7 @@ mod tests {
             ),
         )
         .unwrap();
-        // Phase 66 confidence-followup S5b — see `write_store_package`
+        // confidence-followup S5b — see `write_store_package`
         // for why `.integrity` is required for the v1 fallback in
         // `find_installed_package_baseline`.
         std::fs::write(pkg_dir.join(".integrity"), "sha512-test-fake").unwrap();
@@ -4006,7 +4005,7 @@ mod tests {
 
     #[test]
     fn p6_chunk2_triage_promotes_green_tier_without_manifest_binding() {
-        // The core P6 behavior: a package with a green-tier postinstall
+        // The core behavior: a package with a green-tier postinstall
         // (node-gyp rebuild — exact match in the Layer 1 allowlist),
         // no `trustedDependencies` entry, no scope match, lands on
         // `GreenTierUnderTriage` under Triage. This is the auto-trust
@@ -4071,7 +4070,7 @@ mod tests {
     #[test]
     fn p6_chunk2_allow_does_not_promote_green_tier_at_helper_level() {
         // `allow` semantics (build everything regardless of trust)
-        // are the caller's concern — `rebuild::run` / Chunk 4 fold the
+        // are the caller's concern — `rebuild::run` / fold the
         // allow policy into its filter at the selection step, NOT by
         // changing trust assignment per package. The helper's job is
         // to return the decision based on manifest bindings, scope,
@@ -4080,7 +4079,7 @@ mod tests {
         // whether scripts run is a separate layer. This keeps the
         // helper's contract single-purpose and prevents "allow"
         // semantics from leaking into the predicate
-        // `all_scripted_packages_trusted` relies on (Chunk 3).
+        // `all_scripted_packages_trusted` relies on .
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("package.json"), r#"{"name":"proj"}"#).unwrap();
         let store = PackageStore::at(dir.path().join("store"));
@@ -4106,7 +4105,7 @@ mod tests {
         assert_eq!(reason, TrustReason::Untrusted);
     }
 
-    /// Phase 46 close-out Chunk 2 — complementary caller-side
+    /// close-out — complementary caller-side
     /// contract to [`p6_chunk2_allow_does_not_promote_green_tier_at_helper_level`].
     ///
     /// The helper test above pins that `evaluate_trust` deliberately
@@ -4115,7 +4114,7 @@ mod tests {
     /// the split: the selection step at [`widen_to_build_by_policy`]
     /// must fold allow into its widening rule. Together they
     /// guarantee `is_trusted` computation stays single-purpose AND
-    /// the §5.1 allow contract is honored at the CLI boundary.
+    /// the allow contract is honored at the CLI boundary.
     #[test]
     fn p46_close_chunk2_widen_to_build_by_policy_includes_untrusted_under_allow() {
         let pkgs = vec![
@@ -4129,7 +4128,7 @@ mod tests {
             selected.len(),
             3,
             "allow must widen the default-branch selection to every \
-             scriptable package — §5.1 spec",
+             scriptable package — spec",
         );
         // Prove inclusion by name (not just count) so a future
         // refactor that accidentally filters then pads can't pass.
@@ -4139,10 +4138,10 @@ mod tests {
         assert!(names.contains(&"untrusted-c"));
     }
 
-    /// Control under Deny — Chunk 2's allow fix must not widen the
-    /// deny mode's selection. Deny keeps the pre-Phase-46 filter-
+    /// Control under Deny — allow fix must not widen the
+    /// deny mode's selection. Deny keeps the pre-existing filter-
     /// to-trusted-only contract, which is what `rebuild::run` relied
-    /// on before Chunk 2 extracted the helper.
+    /// on before extracted the helper.
     #[test]
     fn p46_close_chunk2_widen_to_build_by_policy_filters_to_trusted_under_deny() {
         let pkgs = vec![
@@ -4162,7 +4161,7 @@ mod tests {
     /// identically to deny at the selection step; the difference
     /// between them is earlier, at the trust computation.
     ///
-    /// This pins that Chunk 2's fix is allow-scoped and does NOT
+    /// This pins that fix is allow-scoped and does NOT
     /// widen triage beyond what `evaluate_trust` already promoted.
     /// Triage widening beyond greens would break D20 (no new
     /// execution authority without sandbox-verified triage).
@@ -4178,7 +4177,7 @@ mod tests {
         assert_eq!(selected[0].name, "green-auto-promoted");
     }
 
-    /// `--all` is the pre-Phase-46 explicit escape hatch: widen to
+    /// `--all` is the pre-existing explicit escape hatch: widen to
     /// every scriptable package regardless of trust. Locks that
     /// contract against regression when the policy-aware branch is
     /// added — the `all || policy == Allow` short-circuit must
@@ -4200,7 +4199,7 @@ mod tests {
             assert_eq!(
                 selected.len(),
                 3,
-                "--all must widen regardless of policy — pre-Phase-46 \
+                "--all must widen regardless of policy — pre-existing \
                  contract preserved. policy={policy:?}"
             );
         }
@@ -4272,7 +4271,7 @@ mod tests {
         // `GreenTierUnderTriage`, even when the script would also
         // classify green. This matters for the UX suffix (the user
         // added the binding deliberately; calling it "auto-approval"
-        // misrepresents their intent) and for Chunk 3's Chunk 5
+        // misrepresents their intent) and for 
         // integration test.
         let dir = tempfile::tempdir().unwrap();
         let store = PackageStore::at(dir.path().join("store"));
@@ -4418,14 +4417,14 @@ mod tests {
     #[test]
     fn p6_chunk2_trust_reason_is_trusted_covers_all_trusted_variants() {
         // Lock the `is_trusted()` set. If a new `TrustReason` lands
-        // later (e.g. Chunk 8 `AmberLlmApproval`), this test fails and
+        // later (e.g. `AmberLlmApproval`), this test fails and
         // forces an explicit decision about whether it counts as
         // trusted. Preferable to a silent default that ships wrong.
         assert!(TrustReason::StrictBinding.is_trusted());
         assert!(TrustReason::LegacyName.is_trusted());
         assert!(TrustReason::ScopedGlob.is_trusted());
         assert!(TrustReason::GreenTierUnderTriage.is_trusted());
-        // Phase 46 slice 1: advisor-approved-this-run grants ephemeral
+        // slice 1: advisor-approved-this-run grants ephemeral
         // trust. Required for the install-time autoBuild path to
         // actually execute scripts the advisor approved.
         assert!(TrustReason::AdvisorApprovedThisRun.is_trusted());
@@ -4433,7 +4432,7 @@ mod tests {
         assert!(!TrustReason::Untrusted.is_trusted());
     }
 
-    // ── Phase 46 slice 1: AdvisorApprovedThisRun trust path ────────
+    // ── slice 1: AdvisorApprovedThisRun trust path ────────
     //
     // Locks the new amber-tier short-circuit in
     // `evaluate_trust_unsuspended`. The test matrix below maps
@@ -4452,7 +4451,7 @@ mod tests {
     fn slice1_advisor_approval_promotes_amber_under_triage() {
         // The core slice-1 behavior: a package with an amber-tier
         // postinstall (`node install.js` — binary-fetcher convention,
-        // amber by §4.1 P0.5), no trustedDependencies entry, no scope
+        // amber by.5), no trustedDependencies entry, no scope
         // match — but its (name, version) appears in the advisor
         // approval set. Under triage, must return
         // AdvisorApprovedThisRun and pass `is_trusted()`.
@@ -4761,25 +4760,25 @@ mod tests {
         assert_eq!(reason, TrustReason::GreenTierUnderTriage);
     }
 
-    // ── Phase 46 P6 Chunk 3: all_scripted_packages_trusted triage ───
+    // ── all_scripted_packages_trusted triage ───
     //
     // These lock the install-time auto-build predicate's side of the
-    // P6 contract. The predicate and `rebuild::run` now both route
+    // contract. The predicate and `rebuild::run` now both route
     // through `evaluate_trust`, so any divergence between what gets
     // triggered (predicate=true → build::run runs) and what actually
-    // builds (build::run's per-package filter) would be a P6 bug the
-    // plan explicitly calls out in §11:
+    // builds (build::run's per-package filter) would be a bug the
+    // plan explicitly calls out in:
     //
     //   "under `"triage"`, a green-tier unbuilt package counts as
     //    trusted for auto-build-triggering purposes"
     //
-    // The Chunk 1 tests already cover the deny/drift/scope/strict
+    // The tests already cover the deny/drift/scope/strict
     // variants; the new cases below are specifically about the
     // triage-green-auto-trust path through the predicate.
 
     #[test]
     fn p6_chunk3_all_trusted_true_under_triage_green_without_binding() {
-        // The core Chunk 3 behavior: `lpm install` auto-build predicate
+        // The core behavior: `lpm install` auto-build predicate
         // returns `true` for a fresh green-only install under triage,
         // even though no `trustedDependencies` entry exists. Pre-P6
         // this returned `false` and auto-build never ran for installs
@@ -4811,7 +4810,7 @@ mod tests {
         assert!(
             trusted,
             "triage + all-green scripted packages must satisfy the auto-build \
-             predicate (Chunk 3 migration — without this the install → \
+             predicate (— without this the install → \
              auto-build handoff would never fire under triage)"
         );
     }
@@ -4851,7 +4850,7 @@ mod tests {
         // triage — auto-build would run greens and leave ambers in
         // `build-state.json` with a pointer, but the PREDICATE
         // (trigger-or-not) returns false so only manifest-bound or
-        // green-only installs skip review. Chunk 4 picks up the other
+        // green-only installs skip review. picks up the other
         // side (autoBuild=true override); this test pins the
         // unreviewed-ambers-block-predicate contract.
         let dir = tempfile::tempdir().unwrap();
@@ -4912,7 +4911,7 @@ mod tests {
     fn p6_chunk3_all_trusted_false_under_triage_drift() {
         // Drift still blocks — a drifted rich binding does not
         // auto-recover even when the current on-disk script would
-        // classify green. Mirrors the Chunk 2 helper contract; this
+        // classify green. Mirrors the helper contract; this
         // test pins it specifically at the predicate boundary.
         let dir = tempfile::tempdir().unwrap();
         let store = PackageStore::at(dir.path().join("store"));
@@ -5015,11 +5014,11 @@ mod tests {
         assert_eq!(classify_package_worst_tier(&empty), None);
     }
 
-    // ── Phase 48 P0 slice 4: force-security-floor approval suspension ──
+    // ── slice 4: force-security-floor approval suspension ──
     //
     // Acceptance criteria pinned here:
     // 1. `force-security-floor = false`: existing approvals run
-    //    normally (Phase 46 back-compat).
+    //    normally (back-compat).
     // 2. `force-security-floor = true`: the same approval is
     //    suspended — `is_trusted()` returns false, the script
     //    would not run under `lpm rebuild`.
@@ -5063,7 +5062,7 @@ mod tests {
 
     /// Acceptance #1 + #4: with `force-security-floor = false`, an
     /// existing StrictBinding approval is honored and returns
-    /// trusted. Pins Phase 46 back-compat.
+    /// trusted. Pins back-compat.
     #[test]
     fn force_floor_false_honors_existing_strict_approval() {
         let dir = tempfile::tempdir().unwrap();
@@ -5344,7 +5343,7 @@ mod tests {
         assert!(!reason.is_trusted());
     }
 
-    // ── Phase 48 P0 sub-slice 6c — capability gate in evaluate_trust ──
+    // ── sub-slice 6c — capability gate in evaluate_trust ──
 
     fn capability_test_fixture() -> (
         tempfile::TempDir,
@@ -5656,8 +5655,8 @@ mod tests {
         assert!(!TrustReason::CapabilityNotApproved.is_trusted());
     }
 
-    /// Phase 46.2: the shell invocation for lifecycle scripts must
-    /// be platform-aware. Before Phase 46.2 the sandbox returned
+    /// the shell invocation for lifecycle scripts must
+    /// be platform-aware. Before the sandbox returned
     /// `UnsupportedPlatform` on Windows so this code path never
     /// fired there; with the real backend landed, `sh -c` would
     /// fail at spawn because `sh.exe` isn't on the standard Windows
@@ -5692,7 +5691,7 @@ mod tests {
         );
     }
 
-    /// Phase 46.2 follow-up: the lifecycle PATH must use the host's
+    /// follow-up: the lifecycle PATH must use the host's
     /// native separator and a non-empty fallback for the case where
     /// the caller didn't pass through a parent PATH. The pre-46.2
     /// helper inlined POSIX `:` + `/usr/bin:/bin`, producing

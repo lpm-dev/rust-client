@@ -72,15 +72,15 @@ fn maybe_test_panic(stage: &str) {
     }
 }
 
-/// Phase 39 P2: per-(name, version) fetch serialization.
+///: per-(name, version) fetch serialization.
 ///
-/// Before Phase 39, the main task `drain`ed all speculative tarball
+/// Before, the main task `drain`ed all speculative tarball
 /// downloads before the real fetch loop could start (see the
-/// `speculation_join.drain` call at the old Phase 38 P3 overlap point).
+/// `speculation_join.drain` call at the old overlap point).
 /// That drain-wait guaranteed `store.has_package` visibility but
 /// serialized the tail of speculation behind resolver completion.
 ///
-/// Phase 39 P2 removes the drain and lets the real fetch loop run
+/// removes the drain and lets the real fetch loop run
 /// concurrently with straggling speculations. Without coordination,
 /// the real loop would see `has_package == false` for a mid-fetch
 /// package and dispatch a wasted duplicate download. This coordinator
@@ -93,7 +93,7 @@ fn maybe_test_panic(stage: &str) {
 /// in a given install run. ≤ tree_size entries; reclaimed when the
 /// coordinator is dropped at end of `run_with_options`.
 /// Per-key fetch lock — one `AsyncMutex` per
-/// `(name, version, source_id)` in-flight (Phase 59.0 day-7,
+/// `(name, version, source_id)` in-flight (day-7,
 /// F1 finish-line: keys on the source-aware triple so a registry
 /// `react@19.0.0` and a tarball-URL `react@19.0.0` don't serialize
 /// on the same lock).
@@ -133,7 +133,7 @@ fn install_pkg_key(p: &InstallPackage) -> String {
 /// Default concurrent-tarball-download pool size. Overridable per-invocation
 /// via `LPM_CONCURRENT_DOWNLOADS=N` for future network-condition A/B.
 ///
-/// Default bumped 16 → 24 on 2026-04-16 after the Phase 38 P3 concurrency
+/// Default bumped 16 → 24 on after the concurrency
 /// A/B matrix (P2/P3 × 16/24/32 permits, 11-run medians each). Key finding:
 /// root-only speculation + 16 permits forced transitive downloads to
 /// queue behind the speculation drain. 24 permits keeps the tail
@@ -231,17 +231,16 @@ struct TaskTimings {
     /// 24, overridable via `LPM_CONCURRENT_DOWNLOADS`) is the bottleneck —
     /// tasks are queued waiting for a slot rather than running I/O.
     queue_wait_ms: u128,
-    /// Phase 43 — time spent resolving the tarball URL (registry
+    /// — time spent resolving the tarball URL (registry
     /// metadata round-trip when the lockfile didn't have a usable
     /// cached URL; near-zero otherwise). Measured around the
     /// `resolve_tarball_url` call in BOTH legacy and streaming
-    /// fetch paths so the direct Phase 43 win is visible on either
+    /// fetch paths so the direct win is visible on either
     /// path. Carved out of `download_ms` (legacy) and previously
     /// untimed in streaming.
     url_lookup_ms: u128,
     /// Time in `client.download_tarball_to_file` — the HTTP GET +
-    /// on-disk temp spool + SHA-512 streaming hash. **Phase 43
-    /// note:** URL resolution is now carved out into
+    /// on-disk temp spool + SHA-512 streaming hash. **    /// note:** URL resolution is now carved out into
     /// `url_lookup_ms` on both paths; `download_ms` covers GET +
     /// temp-file write only (legacy path; streaming collapses
     /// into `extract_ms`).
@@ -255,7 +254,7 @@ struct TaskTimings {
     /// + write-to-staging). Mirrors [`lpm_store::StageTimings::extract_ms`].
     extract_ms: u128,
     /// Time in the behavioral security scan + `.lpm-security.json` cache
-    /// write. The second-filesystem-pass cost that Phase 38 P2 targets.
+    /// write. The second-filesystem-pass cost that targets.
     /// Mirrors [`lpm_store::StageTimings::security_ms`].
     security_ms: u128,
     /// Time in `.integrity` write + atomic rename into the store path.
@@ -281,8 +280,8 @@ struct FetchBreakdown {
     task_count: u64,
     queue_wait_sum_ms: u128,
     queue_wait_max_ms: u128,
-    /// Phase 43 — sum/max of per-task URL-lookup time. Primary
-    /// Phase 43 projection target: drops from ~15–25 s to near-0
+    /// — sum/max of per-task URL-lookup time. Primary
+    /// projection target: drops from ~15–25 s to near-0
     /// on fresh-CI installs once stored URLs are reused. Visible
     /// on both legacy and streaming paths by construction.
     url_lookup_sum_ms: u128,
@@ -299,9 +298,9 @@ struct FetchBreakdown {
     finalize_max_ms: u128,
 }
 
-/// Phase 38 P3 speculative-fetch counters.
+/// speculative-fetch counters.
 ///
-/// Populated by the Phase 49 walker+dispatcher orchestration. Zero
+/// Populated by the walker+dispatcher orchestration. Zero
 /// across the board on the lockfile-fast-path (walker never runs) or
 /// when every root is already in the store before the metadata RPC
 /// starts. Surfaced in `timing.fetch_breakdown.speculative` so
@@ -309,7 +308,7 @@ struct FetchBreakdown {
 /// outcomes.
 #[derive(Debug, Clone, Copy, Default)]
 struct SpeculativeStats {
-    /// Phase 49: wall-clock of the walker's metadata-producer window,
+    /// wall-clock of the walker's metadata-producer window,
     /// measured inside the walker task from `BfsWalker::run()` entry
     /// to its return (see `WalkerSummary::walker_wall_ms`). Reported
     /// here so pre/post-49 benches stay comparable at the contract
@@ -319,7 +318,7 @@ struct SpeculativeStats {
     /// with the real fetch loop and is reported in `fetch_ms`.
     streaming_batch_ms: u128,
     /// Total packages the dispatcher started a tarball download for.
-    /// Pre-Phase-39-P3 this capped at root count; now includes
+    /// Pre-this capped at root count; now includes
     /// transitives reachable via `dispatched_root → dep_range → matching
     /// version` expansion. Excludes store hits, unparseable ranges, and
     /// packages with no range-satisfying version in the arrived manifest.
@@ -332,21 +331,21 @@ struct SpeculativeStats {
     /// Cumulative wall-clock across all dispatched speculative tasks.
     /// Divide by `completed` for average per-task cost.
     task_ms_sum: u128,
-    /// **Phase 39 P3.** Subset of `dispatched` that came from transitive
+    /// Subset of `dispatched` that came from transitive
     /// expansion (i.e. a dep of an already-speculated package). Equal to
     /// `dispatched - roots_dispatched`; reported separately so benchmarks
     /// can confirm transitive reach on larger fixtures.
     transitive_dispatched: u64,
-    /// **Phase 39 P3.** Maximum depth reached during transitive expansion
+    /// Maximum depth reached during transitive expansion
     /// on this install. `1` for root-only installs; climbs with deeper
     /// trees. Capped at [`SPECULATION_MAX_DEPTH`].
     max_depth_reached: u64,
-    /// **Phase 39 P3.** Packages whose manifest arrived but whose range
+    /// Packages whose manifest arrived but whose range
     /// had no matching version — tracked separately from dispatched
     /// misses because a naive user might read the gap between
     /// `dispatched` and `resolve-output` as wastage.
     no_version_match: u64,
-    /// **Phase 39 P3.** Packages whose manifest never arrived during
+    /// Packages whose manifest never arrived during
     /// speculation (parked but the parent's deep-walk didn't cover
     /// them). Usually indicates the worker's deep-walk hit its own cap.
     unresolved_parked: u64,
@@ -367,7 +366,7 @@ impl SpeculativeStats {
     }
 }
 
-/// **Phase 39 P3.** Cap on transitive-speculation depth. Prevents
+/// Cap on transitive-speculation depth. Prevents
 /// unbounded fan-out on pathological trees (e.g. circular deps, or
 /// very deep single-chains). Matches the worker's own deep-walk cap so
 /// speculation doesn't ask for manifests the worker won't send.
@@ -408,7 +407,7 @@ impl FetchBreakdown {
     }
 }
 
-/// **Phase 43 gate counters.**
+/// 
 ///
 /// Shared across every fetch task (must be atomic because 24
 /// concurrent permit-holders may increment these). Surfaces on
@@ -467,7 +466,7 @@ impl GateStats {
 /// registry. Produced by [`extract_workspace_protocol_deps`] and consumed by
 /// [`link_workspace_members`].
 ///
-/// **Phase 32 Phase 2 audit fix #3** (workspace:^ resolver bug):
+/// (workspace:^ resolver bug):
 /// Pre-fix, [`lpm_workspace::resolve_workspace_protocol`] rewrote
 /// `"@scope/member": "workspace:^"` into `"@scope/member": "^1.5.0"` and left
 /// the entry in `deps`, which then went to the registry resolver and 404'd
@@ -502,9 +501,9 @@ struct WorkspaceMemberLink {
 /// when the user declines, so callers propagate via `?` and no manifest is
 /// touched. I/O errors on stdin fall through to abort for safety.
 ///
-/// **Phase 32 Phase 2 D-impl-5 (2026-04-16):** closes the gap between the
-/// original Phase 2 plan (which specified a prompt) and the initial ship
-/// (which was preview-only). See the phase 2 status doc's D-impl-5 entry.
+/// closes the gap between the
+/// original plan (which specified a prompt) and the initial ship
+/// (which was preview-only). See the phase 2 status doc's  entry.
 pub(crate) fn confirm_multi_member_mutation(
     verb: &str,
     package_count: usize,
@@ -579,7 +578,7 @@ pub(crate) fn confirm_multi_member_mutation(
 /// links. The resolver never sees these entries — they bypass the registry
 /// entirely and are linked from disk by [`link_workspace_members`].
 ///
-/// **Phase 32 Phase 2 audit fix #3:** this replaces the previous
+/// this replaces the previous
 /// "[`lpm_workspace::resolve_workspace_protocol`] rewrites in place, then the
 /// resolver fetches from the registry" pattern, which 404'd whenever a
 /// workspace member was unpublished (the common case in monorepos that
@@ -662,7 +661,7 @@ fn extract_workspace_protocol_deps(
     Ok(extracted)
 }
 
-/// **Phase 59.1 audit response (round 6) — F9 dedupe pre-pass.**
+/// 
 ///
 /// Walk root deps for `file:` / `link:` specs whose target realpaths
 /// to a workspace member. For each match: REMOVE the entry from
@@ -787,7 +786,7 @@ fn pre_extract_file_link_workspace_members(
     }
 }
 
-/// **Phase 59.1 audit response (round 5+6) — workspace-member transitive expansion.**
+/// 
 ///
 /// BFS over `workspace_member_deps` (the seed set: extracted top-
 /// level + any F9 / round-3 additions merged in by the caller),
@@ -933,7 +932,7 @@ fn expand_workspace_member_deps_with_transitives(
 /// linker. The post-link order also means the helper has to be idempotent
 /// across re-runs (it cleans any pre-existing entry at the link path).
 ///
-/// **Phase 32 Phase 6 audit fix (2026-04-12).** Convert one
+/// Convert one
 /// [`patch_engine::AppliedPatch`] into the persisted state-file shape,
 /// rewriting absolute paths to project-dir-relative for portability.
 /// Pulls `original_integrity` straight from the engine result so the
@@ -970,7 +969,7 @@ fn applied_patch_to_state_hit(
     }
 }
 
-/// **Phase 32 Phase 6 audit fix (2026-04-12).** Persist
+/// Persist
 /// `.lpm/patch-state.json` with the right `applied` trace for the
 /// install run. Three cases:
 ///
@@ -979,8 +978,7 @@ fn applied_patch_to_state_hit(
 /// 2. **No work happened this run** (idempotent rerun: every file
 ///    already had the expected post-patch bytes) AND a prior state
 ///    file exists → preserve the prior state's `applied` list so
-///    `lpm graph --why` doesn't go blind. Mirror of Phase 5
-///    `OverridesState::capture_preserving_applied`.
+///    `lpm graph --why` doesn't go blind. Mirror of ///    `OverridesState::capture_preserving_applied`.
 /// 3. **No work happened this run AND no prior state** (rare edge:
 ///    user pre-staged patched bytes manually) → record what we know
 ///    (the run results, even if all-zero — the next non-idempotent
@@ -1021,7 +1019,7 @@ fn persist_patch_state(
     }
 }
 
-/// **Phase 32 Phase 6 audit fix (2026-04-12).** Build the JSON
+/// Build the JSON
 /// `applied_patches` array shape from a slice of engine results.
 /// Filtering to `touched_anything()` is done by the caller — this
 /// helper formats whatever it's given.
@@ -1074,7 +1072,7 @@ fn fingerprint_json_value(count: usize, fingerprint: impl Into<String>) -> serde
     }
 }
 
-/// **Phase 32 Phase 6 — `lpm patch` apply pass.**
+/// 
 ///
 /// Run unconditionally after the linker (and the workspace-member
 /// linker pass). For each entry in `lpm.patchedDependencies`, find every
@@ -1082,7 +1080,7 @@ fn fingerprint_json_value(count: usize, fingerprint: impl Into<String>) -> serde
 /// and apply the patch there. Drift, fuzzy hunks, missing files, and
 /// internal-file modification attempts are all hard install errors.
 ///
-/// **Phase 66 confidence-followup F1 (2026-05-09)** — compute the
+/// compute the
 /// per-target patch fingerprint map that the link pipeline folds into
 /// each `LinkTarget.patch_fingerprint` (and downstream into v2's
 /// [`lpm_store::v2::GraphKeyInputs::patch_fingerprint`]).
@@ -1253,19 +1251,19 @@ struct InstallPackage {
     /// Dependencies: (dep_name_in_parent, dep_version). The name is the
     /// LOCAL label THIS package uses for the dep in its own `package.json`
     /// (what the linker will create as the `node_modules/<name>/` symlink);
-    /// for Phase 40 P2 npm-alias edges it diverges from the child's
+    /// for npm-alias edges it diverges from the child's
     /// canonical registry name, and the alias target is recorded in
     /// `aliases` below.
     dependencies: Vec<(String, String)>,
-    /// **Phase 40 P2** — per-package npm-alias edges:
+    /// — per-package npm-alias edges:
     /// `local_name → target_canonical_name`. Empty unless this package
     /// declares aliased deps. Only surface aliases whose edge survived
     /// resolution (not platform-skipped) so the linker's dep-walk and
     /// the lockfile writer see identical sets.
     aliases: HashMap<String, String>,
-    /// **Phase 40 P2** — explicit root-symlink filenames for this
+    /// — explicit root-symlink filenames for this
     /// package. `None` preserves the pre-P2 "use pkg.name if
-    /// is_direct" behavior. `Some(vec)` drives Phase 3 of the linker
+    /// is_direct" behavior. `Some(vec)` drives of the linker
     /// directly. Populated by `resolved_to_install_packages` from the
     /// resolver's `root_aliases` map so the linker can build
     /// `node_modules/<local>/` for aliased root deps (and the rare
@@ -1277,7 +1275,7 @@ struct InstallPackage {
     is_direct: bool,
     /// Whether this is an LPM package (for tarball fetching)
     is_lpm: bool,
-    /// **Phase 66 §2.5** — resolved peers in scope for THIS package's
+    /// resolved peers in scope for THIS package's
     /// instance in this install graph: `(peer_name, resolved_version)`.
     /// Sorted by peer_name for deterministic GraphKey hashing.
     ///
@@ -1287,7 +1285,7 @@ struct InstallPackage {
     /// link entry without re-reading package.json, and (b) fold the
     /// peer-context into [`lpm_store::v2::GraphKey`] so two projects
     /// with the same edge graph but different peer pinning produce
-    /// distinct keys (preplan §2.5 cross-project sharing
+    /// distinct keys (preplan cross-project sharing
     /// invariant). v1 ignores this field — its relative-symlink
     /// wrappers walk up to the project root for peers, so threading
     /// is informational under v1.
@@ -1299,7 +1297,7 @@ struct InstallPackage {
 }
 
 impl InstallPackage {
-    /// **Phase 59.0 day-5b (F4 install-side wiring)** — parse the
+    /// parse the
     /// `source` string into a typed [`lpm_lockfile::Source`]. Used
     /// by the fetch-dispatch site to route non-Registry sources
     /// (`Source::Tarball` etc.) through their dedicated install
@@ -1313,7 +1311,7 @@ impl InstallPackage {
         lpm_lockfile::Source::parse(&self.source)
     }
 
-    /// **Phase 59.0 day-5.5 audit response (HIGH-1 fix)** — source-
+    /// source-
     /// aware existence check. For `Source::Tarball` packages,
     /// checks the integrity-keyed CAS layout
     /// ([`PackageStore::has_tarball`]); everything else falls back
@@ -1338,7 +1336,7 @@ impl InstallPackage {
                 .is_some_and(|sri| store.has_tarball(sri)),
             Ok(lpm_lockfile::Source::Directory { path })
             | Ok(lpm_lockfile::Source::Link { path }) => {
-                // Phase 59.1 day-3 (F7) — directory and link deps live
+                // day-3 (F7) — directory and link deps live
                 // OUTSIDE the global store. "Has it" means: the source
                 // path resolves to a directory containing a
                 // `package.json` at install time. If the source dir was
@@ -1353,16 +1351,15 @@ impl InstallPackage {
         }
     }
 
-    /// **Phase 59.0 day-5.5 audit response (HIGH-1 fix)** + **Phase
-    /// 59.1 day-1 follow-up** — source-aware store path.
+    /// Source-aware store path.
     ///
     /// Three CAS subtrees today, one path-resolution function:
     /// - `Source::Registry` → `package_dir(name, version)` (the
     ///   legacy `v1/{name}@{version}/` subtree).
     /// - `Source::Tarball { url: "https://..." }` → integrity-keyed
-    ///   `v1/tarball/{algo}-{hex}/` (Phase 59.0 F4).
+    ///   `v1/tarball/{algo}-{hex}/`.
     /// - `Source::Tarball { url: "file:..." }` → content-hash-keyed
-    ///   `v1/tarball-local/sha256-{hex}/` (Phase 59.1 F6). The hex
+    ///   `v1/tarball-local/sha256-{hex}/`. The hex
     ///   is derived from the SAME SRI; only the subtree differs.
     ///
     /// URL-scheme dispatch (vs a separate `Source` variant for
@@ -1411,7 +1408,7 @@ impl InstallPackage {
                 .and_then(|sri| store.tarball_store_path(sri).ok()),
             Ok(lpm_lockfile::Source::Directory { path })
             | Ok(lpm_lockfile::Source::Link { path }) => {
-                // Phase 59.1 day-3 (F7) — directory + link deps live
+                // day-3 (F7) — directory + link deps live
                 // OUTSIDE the global store. The "store path" is the
                 // canonicalized source directory; the linker
                 // materializes per-file symlinks pointing at it.
@@ -1431,7 +1428,7 @@ impl InstallPackage {
         }
     }
 
-    /// **Phase 59.0 (post-review)** — typed-error variant of
+    /// typed-error variant of
     /// [`Self::store_path_source_aware`]. Returns a clear
     /// `LpmError::Registry` when a `Source::Tarball` package
     /// reaches a call site without an SRI in either the override
@@ -1454,7 +1451,7 @@ impl InstallPackage {
     ) -> Result<PathBuf, LpmError> {
         self.store_path_source_aware(store, project_dir, sri_override)
             .ok_or_else(|| {
-                // Phase 59.1 day-3: error message disambiguates the
+                // day-3: error message disambiguates the
                 // tarball-source SRI case from the directory-source
                 // missing-path case so users get an actionable hint.
                 let kind_note = match self.source_kind() {
@@ -1476,7 +1473,7 @@ impl InstallPackage {
             })
     }
 
-    /// **Phase 59.1 day-3 (F7) + audit response (post-day-7)** —
+    /// —
     /// wrapper identifier for the linker.
     ///
     /// Returns `Some` for every NON-Registry source — Directory,
@@ -1514,7 +1511,7 @@ impl InstallPackage {
         }
     }
 
-    /// **Phase 59.1 audit response (post-day-7)** — materialization
+    /// materialization
     /// strategy for the linker.
     ///
     /// Returns [`lpm_linker::Materialization::DirectorySource`] for
@@ -1544,7 +1541,7 @@ impl InstallPackage {
     }
 }
 
-/// **Phase 59.1 days 1+3 (F6 + F7)** — disambiguates a `file:` target
+/// disambiguates a `file:` target
 /// after the pre-flight stat. Cached in [`pre_resolve_non_registry_deps`]
 /// so the dispatch step doesn't re-stat.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1555,7 +1552,7 @@ enum FileKindClassification {
     Directory,
 }
 
-/// **Phase 59.1 day-5 (F7-transitive)** — the kind of a single
+/// the kind of a single
 /// transitive dep declared inside a local source's `package.json`.
 ///
 /// Used by [`pre_resolve_non_registry_deps`] to:
@@ -1578,7 +1575,7 @@ enum DepKind {
     Link,
 }
 
-/// **Phase 59.1 day-5 (F7-transitive)** — a single dep entry from a
+/// a single dep entry from a
 /// local source's `package.json`. Captured during pre-resolve so the
 /// post-resolve fix-up can populate the parent
 /// `InstallPackage.dependencies` field with resolved versions.
@@ -1600,13 +1597,13 @@ struct SourceDep {
     kind: DepKind,
 }
 
-/// **Phase 59.1 day-5 (F7-transitive)** — return shape for
+/// return shape for
 /// [`pre_resolve_non_registry_deps`].
 ///
 /// Carries the immediate non-registry InstallPackages PLUS a
 /// per-package side-band map of source-deps consumed by the
 /// post-resolve fix-up at install.rs:2663+ (resolver-agnostic per
-/// §6.4 of the plan doc).
+/// of the plan doc).
 ///
 /// The `source_deps` map is keyed by the InstallPackage's `source`
 /// field (e.g., `"directory+./packages/foo"`) — unique across the
@@ -1614,7 +1611,7 @@ struct SourceDep {
 /// `name@version`. Registry InstallPackages are not in the map
 /// (their dependencies are populated by the resolver).
 ///
-/// **Phase 59.1 audit response (round 5).** The
+/// The
 /// `additional_workspace_links` field carries every workspace member
 /// the pre_resolve pass discovered through F9 overlap detection
 /// (immediate file:/link: arms + transitive walker) OR through the
@@ -1654,10 +1651,10 @@ struct NonRegistryPreResolveResult {
     additional_workspace_links: Vec<WorkspaceMemberLink>,
 }
 
-/// **Phase 59.0 (post-review)** — derive the canonical registry URL
+/// derive the canonical registry URL
 /// for a package name from the active [`RouteTable`].
 ///
-/// Phase 59.0 day-4.5 motivated keying [`lpm_lockfile::Source::source_id`]
+/// day-4.5 motivated keying [`lpm_lockfile::Source::source_id`]
 /// by URL so the same `name@version` resolved from different
 /// registries (npmjs.org vs Verdaccio vs an `.npmrc`-overridden
 /// private mirror) gets distinct identity. Pre-this-fix, the install
@@ -1678,7 +1675,7 @@ fn registry_source_url_for(name: &str, route_table: &RouteTable) -> String {
     }
 }
 
-/// Phase 66 Phase 4d — `true` iff `project_dir` is on a legacy v1
+/// — `true` iff `project_dir` is on a legacy v1
 /// layout that must be wiped before a v2 install can run cleanly.
 ///
 /// Either signal is enough — a project running v1 isolated has
@@ -1696,7 +1693,7 @@ fn needs_v2_migration(project_dir: &Path) -> bool {
         || project_dir.join(".lpm").join("hoisted").exists()
 }
 
-/// Phase 66 Phase 4d migration sequence (preplan §3.2).
+/// migration sequence (preplan).
 ///
 /// Wipe order matters for the install-state freshness gate:
 /// 1. `<project>/.lpm/wrappers/` (legacy isolated wrapper root).
@@ -1734,20 +1731,19 @@ fn migrate_v1_to_v2(project_dir: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
-/// **Phase 59.0 day-6a (F4) + Phase 59.1 day-1 (F6)** — pre-resolve
+/// pre-resolve
 /// non-registry dependencies from the manifest before the PubGrub
 /// resolver runs.
 ///
 /// Two arms today, one set of explicit-error gates for what 59.1+
 /// will add:
-/// 1. **[`Specifier::Tarball`]** (remote HTTPS tarball URL — Phase
-///    59.0 F4): download the bytes (verifying integrity if declared
+/// 1. **[`Specifier::Tarball`]** (remote HTTPS tarball URL): download the bytes (verifying integrity if declared
 ///    via SRI), extract into the integrity-keyed CAS path (skips on
 ///    fast-path hit — `store_tarball_at_cas_path`), read the
 ///    `package.json` to learn `(name, version)`, build an
 ///    [`InstallPackage`] with `source = "tarball+<url>"`.
 /// 2. **[`Specifier::File`]** with `is_file()` target (local tarball
-///    — Phase 59.1 F6): read the bytes from disk (path resolved
+///    — F6): read the bytes from disk (path resolved
 ///    against `project_dir`), compute SHA-256, extract into the
 ///    content-keyed local-tarball CAS path (skips on fast-path hit
 ///    — `store_local_tarball_at_cas_path`), read the `package.json`
@@ -1757,7 +1753,7 @@ fn migrate_v1_to_v2(project_dir: &Path) -> std::io::Result<()> {
 /// In both arms the resulting entry is removed from `deps` so the
 /// resolver only sees registry-style specs.
 ///
-/// **Explicit-error arms** (Phase 59.x — pre-plan §3 deliverables):
+/// **Explicit-error arms** (— pre-plan deliverables):
 /// - [`Specifier::File`] with `is_dir()` target → directory dep,
 ///   lands later in 59.1 day 2-3 (F7).
 /// - [`Specifier::Link`] → linked directory dep, lands in 59.1 day-4
@@ -1784,7 +1780,7 @@ async fn pre_resolve_non_registry_deps(
     deps: &mut HashMap<String, String>,
     json_output: bool,
     strict_integrity: bool,
-    // **Phase 59.1 day-6 (F9 workspace overlap)** — slice of
+    // slice of
     // workspace members extracted by `extract_workspace_protocol_deps`
     // before pre_resolve runs. Each member's `source_dir` is
     // realpath-compared against every directory/link dep's source
@@ -1793,7 +1789,7 @@ async fn pre_resolve_non_registry_deps(
     // no-op.
     workspace_members: &[WorkspaceMemberLink],
 ) -> Result<NonRegistryPreResolveResult, LpmError> {
-    // Phase 59.0 (post-review) + Phase 59.1 days 1+3 — gate the
+    // (post-review) + days 1+3 — gate the
     // manifest boundary for non-registry specifiers.
     //
     // Supported in this commit:
@@ -1837,13 +1833,13 @@ async fn pre_resolve_non_registry_deps(
             Ok(lpm_resolver::Specifier::Git { url, .. }) => {
                 return Err(LpmError::Registry(format!(
                     "dep '{local_name}' uses git specifier '{url}', which is not \
-                     yet supported (Phase 59.2 — git deps land in a follow-up \
+                     yet supported (— git deps land in a follow-up \
                      sub-phase). Workaround: vendor the package or publish it \
                      to a registry."
                 )));
             }
             Ok(lpm_resolver::Specifier::File { path }) => {
-                // Phase 59.1 days 1+3 — disambiguate file: target via
+                // days 1+3 — disambiguate file: target via
                 // stat. Result is cached in `file_kinds` for the
                 // partition step below to avoid a second stat.
                 let abs_path = project_dir.join(&path);
@@ -1852,7 +1848,7 @@ async fn pre_resolve_non_registry_deps(
                         file_kinds.insert(local_name.clone(), FileKindClassification::Tarball);
                     }
                     Ok(meta) if meta.is_dir() => {
-                        // Phase 59.1 day-3 (F7) — directory dep is now
+                        // day-3 (F7) — directory dep is now
                         // SUPPORTED. Pass-through to the processing
                         // loop below.
                         file_kinds.insert(local_name.clone(), FileKindClassification::Directory);
@@ -1877,7 +1873,7 @@ async fn pre_resolve_non_registry_deps(
                 }
             }
             Ok(lpm_resolver::Specifier::Link { path }) => {
-                // Phase 59.1 day-4 (F8) — link: deps land here. Unlike
+                // day-4 (F8) — link: deps land here. Unlike
                 // file: (which can be tarball OR directory), link: is
                 // ALWAYS a directory. Verify via stat; non-directory
                 // targets surface an actionable manifest-boundary error.
@@ -1982,7 +1978,7 @@ async fn pre_resolve_non_registry_deps(
             + link_specs.len(),
     );
 
-    // **Phase 59.1 audit response (round 5)** — workspace members
+    // workspace members
     // discovered through F9 dedupe (immediate + transitive) and the
     // round-3 transitive `workspace:` arm. The caller merges this
     // into `workspace_member_deps` before passing to
@@ -1991,9 +1987,9 @@ async fn pre_resolve_non_registry_deps(
     // checks short-circuit on empty `workspace_members`).
     let mut additional_workspace_links: Vec<WorkspaceMemberLink> = Vec::new();
 
-    // ── Arm 1: Phase 59.0 F4 — remote tarball URLs ──────────────────────
+    // ── Arm 1: F4 — remote tarball URLs ──────────────────────
     for (local_name, url, declared_integrity) in tarball_url_specs {
-        // Phase 59.0 day-6b (F5) — strict-integrity gate. When set,
+        // day-6b (F5) — strict-integrity gate. When set,
         // a tarball-URL dep without a manifest-declared SRI is a
         // hard error rather than trust-on-first-use. Recommended
         // for CI to prevent supply-chain surprises on fresh installs.
@@ -2020,7 +2016,7 @@ async fn pre_resolve_non_registry_deps(
         let (real_name, real_version) =
             read_pkg_json_name_version(&cas_path, &format!("tarball at {url}"))?;
 
-        // Phase 59 dep-key vs fetched-name policy (pre-plan §7 OQ-4
+        // dep-key vs fetched-name policy (pre-plan
         // — locked as warn-not-reject). The manifest dep key
         // controls node_modules layout (via `root_link_names`); the
         // fetched-package name controls store identity. Surface the
@@ -2047,7 +2043,7 @@ async fn pre_resolve_non_registry_deps(
         });
     }
 
-    // ── Arm 2: Phase 59.1 day-1 F6 — local-file tarballs ────────────────
+    // ── Arm 2: day-1 F6 — local-file tarballs ────────────────
     //
     // No network. Path resolved against `project_dir`. Identity is
     // content-only (SHA-256 of bytes); the user-typed path lives in
@@ -2127,7 +2123,7 @@ async fn pre_resolve_non_registry_deps(
             is_lpm: false,
             peers: Vec::new(),
             integrity: Some(integrity_sri),
-            // tarball_url is Phase 43 fresh-URL writeback (registry-
+            // tarball_url is fresh-URL writeback (registry-
             // specific). Local tarballs have no remote URL, so leave
             // `None`. Documented day-1 caveat: warm-restart fast-path
             // doesn't fire for `Source::Tarball { file: }` lockfile
@@ -2137,7 +2133,7 @@ async fn pre_resolve_non_registry_deps(
         });
     }
 
-    // ── Phase 59.1 day-6 (F9a): node_modules-warn dedupe set ─────────
+    // ── day-6 (F9a): node_modules-warn dedupe set ─────────
     //
     // Tracks realpaths already warned-about in this install so the
     // SAME source doesn't warn multiple times when:
@@ -2151,7 +2147,7 @@ async fn pre_resolve_non_registry_deps(
     let mut node_modules_warned: std::collections::HashSet<PathBuf> =
         std::collections::HashSet::new();
 
-    // ── Arm 3: Phase 59.1 day-3 F7 — directory deps ─────────────────────
+    // ── Arm 3: day-3 F7 — directory deps ─────────────────────
     //
     // No network, no extraction. The source dir IS the package; the
     // linker materializes per-file symlinks pointing at it (day-2 work
@@ -2229,7 +2225,7 @@ async fn pre_resolve_non_registry_deps(
         );
 
         // Same dep-key vs fetched-name policy as the tarball arms
-        // (umbrella §7 OQ-4 — locked as warn-not-reject).
+        // (umbrella— locked as warn-not-reject).
         if local_name != real_name && !json_output {
             output::warn(&format!(
                 "dep '{local_name}' resolves to package '{real_name}' from local \
@@ -2265,13 +2261,13 @@ async fn pre_resolve_non_registry_deps(
         });
     }
 
-    // ── Arm 4: Phase 59.1 day-4 F8 — link: deps ─────────────────────────
+    // ── Arm 4: day-4 F8 — link: deps ─────────────────────────
     //
     // Structurally identical to the F7 directory arm with one
     // difference: source kind is `Source::Link` (wrapper_id picks up
     // the `l-` prefix via `Source::Link.source_id()`). The linker
     // materializes per-file symlinks the same way as F7 — pre-plan
-    // §6.2 says link: "always wrapper-routed; never the `--no-symlink`
+    // says link: "always wrapper-routed; never the `--no-symlink`
     // copy fallback that file: allows." Day-4 doesn't ship `--no-
     // symlink` for file: either, so this is a no-op contract today;
     // matters when 59.x adds the flag.
@@ -2364,7 +2360,7 @@ async fn pre_resolve_non_registry_deps(
         });
     }
 
-    // ── Phase 59.1 day-5 (F7-transitive) ────────────────────────────────
+    // ── day-5 (F7-transitive) ────────────────────────────────
     //
     // For each immediate directory/link InstallPackage, recursively
     // walk its source's package.json:
@@ -2429,7 +2425,7 @@ async fn pre_resolve_non_registry_deps(
             &mut source_deps_out,
             &mut visited_realpaths,
             1, // start at depth 1 — immediates are depth 0; we walk THEIR deps
-            3, // bound: depth 3 from consumer (matches F7a + umbrella §3 prepare-runner)
+            3, // bound: depth 3 from consumer (matches F7a + umbrella prepare-runner)
             workspace_members,
             json_output,
             &mut node_modules_warned,
@@ -2444,7 +2440,7 @@ async fn pre_resolve_non_registry_deps(
     })
 }
 
-/// Phase 59.1 day-1 follow-up — extract the lowercase-hex form of
+/// day-1 follow-up — extract the lowercase-hex form of
 /// a SHA-256 SRI's raw hash bytes.
 ///
 /// The local-tarball CAS keys by 64-char lowercase hex (the same
@@ -2533,7 +2529,7 @@ fn read_pkg_json_name_version(
     Ok((name, version))
 }
 
-/// **Phase 59.1 day-5 (F7-transitive)** — read a local source's
+/// read a local source's
 /// `package.json` and return its transitive deps with their kind
 /// classification.
 ///
@@ -2706,7 +2702,7 @@ fn classify_source_dep(base_dir: &Path, raw: &str, dep_name: &str) -> Result<Dep
     }
 }
 
-/// **Phase 59.1 day-6 (F9 workspace overlap)** — outcome of comparing
+/// outcome of comparing
 /// a directory/link source's realpath against every workspace member.
 ///
 /// Used by [`pre_resolve_non_registry_deps`] (and its recursive
@@ -2815,7 +2811,7 @@ fn path_equal_with_case_fold(a: &Path, b: &Path) -> bool {
     }
 }
 
-/// **Phase 59.1 day-6 (F9a finalization)** — emit a warn-once for a
+/// emit a warn-once for a
 /// local source whose top-level `node_modules/` will be ignored.
 ///
 /// The day-2 `materialize_directory_source` already excludes
@@ -2854,7 +2850,7 @@ fn maybe_warn_pkg_node_modules(
     ));
 }
 
-/// **Phase 59.1 day-5 (F7-transitive)** — recursively pre-resolve a
+/// recursively pre-resolve a
 /// directory/link source's transitive deps.
 ///
 /// For each immediate file:/link: dep produced by
@@ -2868,11 +2864,11 @@ fn maybe_warn_pkg_node_modules(
 ///   precedence (consumer's own declaration or earlier-walked
 ///   transitive wins). This is the simple/lossy approach: foo's
 ///   `lodash@^4` and consumer's `lodash@^5` collapse to a single
-///   resolved version (umbrella OQ-3 acceptable for v1).
+///   resolved version (umbrella).
 /// - **Recursively pre-resolves transitive `file:`/`link:` directory
 ///   deps** as new InstallPackages. Bounded at `max_depth` levels
 ///   from the consumer (default 3 — matches F7a's depth bound and
-///   umbrella §3 prepare-runner posture). Realpath cycle-detect via
+///   umbrella prepare-runner posture). Realpath cycle-detect via
 ///   `visited` so `A → B → A` doesn't infinite-loop.
 ///
 /// `current_depth` is the depth of the deps we're ABOUT TO process.
@@ -2889,13 +2885,13 @@ fn recurse_local_source_deps(
     visited: &mut std::collections::HashSet<PathBuf>,
     current_depth: u32,
     max_depth: u32,
-    // Phase 59.1 day-6 (F9 + F9a): workspace overlap detection +
+    // day-6 (F9 + F9a): workspace overlap detection +
     // node_modules-warn dedupe propagated from the immediate arms
     // so transitive directory/link deps get the same treatment.
     workspace_members: &[WorkspaceMemberLink],
     json_output: bool,
     node_modules_warned: &mut std::collections::HashSet<PathBuf>,
-    // Phase 59.1 round-5 audit response: F9 transitive dedupe + the
+    // round-5 audit response: F9 transitive dedupe + the
     // round-3 transitive `workspace:` arm push the matched member
     // here so the install-pipeline caller can merge it into the slice
     // that drives `link_workspace_members`. Pre-round-5 these branches
@@ -2913,7 +2909,7 @@ fn recurse_local_source_deps(
     for spec in specs {
         match spec.kind {
             DepKind::Registry => {
-                // **Phase 59.1 audit response (round 3) — workspace
+                // **audit response (round 3) — workspace
                 // transitives.** A `workspace:` spec inside a local
                 // source's manifest must NOT be appended to
                 // `consumer_deps_map`: the top-level
@@ -3014,7 +3010,7 @@ fn recurse_local_source_deps(
                     &realpath,
                     &format!("transitive local source at {}", realpath.display()),
                 )?;
-                // Phase 59.1 day-6 (F9): workspace overlap on
+                // day-6 (F9): workspace overlap on
                 // transitive deps too. Same dedupe-or-error logic
                 // as the immediate arms.
                 match detect_workspace_overlap(
@@ -3048,7 +3044,7 @@ fn recurse_local_source_deps(
                     }
                     WorkspaceOverlap::NoOverlap => {}
                 }
-                // Phase 59.1 day-6 (F9a): warn-once on top-level
+                // day-6 (F9a): warn-once on top-level
                 // node_modules/ for transitives too — the dedupe set
                 // is shared with the immediate arms above.
                 maybe_warn_pkg_node_modules(
@@ -3103,11 +3099,11 @@ fn recurse_local_source_deps(
     Ok(())
 }
 
-/// **Phase 59.1 day-5 (F7-transitive)** — post-resolve fix-up that
+/// post-resolve fix-up that
 /// populates each directory/link `InstallPackage.dependencies`
 /// field.
 ///
-/// **Resolver-agnostic** (per plan §6.4): runs after the merged
+/// **Resolver-agnostic** (per plan): runs after the merged
 /// `packages` vec is assembled (i.e., after both `resolved_to_install_packages`
 /// AND the non-registry merge), regardless of which resolver
 /// produced the registry portion.
@@ -3242,7 +3238,7 @@ pub async fn run_with_options(
     offline: bool,
     force: bool,
     allow_new: bool,
-    // Phase 59.0 (F5) — strict_integrity: when true, tarball-URL
+    // (F5) — strict_integrity: when true, tarball-URL
     // deps without a manifest-declared SRI fail rather than
     // trust-on-first-use. Lockfile-resident integrity is still
     // trusted; only the manifest-boundary trust-on-first-use is
@@ -3257,32 +3253,31 @@ pub async fn run_with_options(
     no_editor_setup: bool,
     no_security_summary: bool,
     auto_build: bool,
-    // Phase 32 Phase 2: when invoked from the workspace-aware install path,
+    // when invoked from the workspace-aware install path,
     // the list of `package.json` files that were modified before this call.
     // Surfaced in the JSON output as `target_set` so agents can see which
     // workspace members were touched. `None` for legacy/standalone callers.
     target_set: Option<&[String]>,
-    // Phase 33 audit Finding 1 fix: when `Some`, the install pipeline
+    // audit Finding 1 fix: when `Some`, the install pipeline
     // populates the map with `name → resolved_version` for every DIRECT
     // dependency. Used by `run_add_packages` and `run_install_filtered_add`
     // to feed `finalize_packages_in_manifest` without doing a flat scan
     // over the lockfile (which can't distinguish direct from transitive
-    // when the same name appears at different versions). Non-Phase-33
-    // callers pass `None`.
+    // when the same name appears at different versions). Non-    // callers pass `None`.
     direct_versions_out: Option<&mut HashMap<String, lpm_semver::Version>>,
-    // Phase 46 P2 Chunk 5: CLI-side `--policy` / `--yolo` / `--triage`
+    // CLI-side `--policy` / `--yolo` / `--triage`
     // override, already collapsed to at most one value by
     // [`crate::script_policy_config::collapse_policy_flags`]. `None`
     // means no CLI flag was passed on this invocation and the
     // resolver should fall through to the project config →
     // `~/.lpm/config.toml` → default-deny precedence chain.
     //
-    // Only consumed in P2 for the triage-mode install summary line
+    // Only consumed in for the triage-mode install summary line
     // (branches at the two `show_install_build_hint` call sites). No
-    // execution semantics are changed — tier-aware auto-run is P6,
-    // gated on the P5 sandbox per D20.
+    // execution semantics are changed — tier-aware auto-run is,
+    // gated on the sandbox.
     script_policy_override: Option<crate::script_policy_config::ScriptPolicy>,
-    // Phase 46 slice 1 — CLI `--advisor` override. Resolves to the
+    // slice 1 — CLI `--advisor` override. Resolves to the
     // top of the [`AdvisorSession::preflight`] precedence chain
     // (CLI → package.json → ~/.lpm/config.toml → `none`). Owned
     // `String` rather than `&str` so the value crosses the
@@ -3299,14 +3294,14 @@ pub async fn run_with_options(
     // warn-degrades on unavailable adapters at runtime — clap only
     // catches typos, not "claude-cli configured but not on PATH."
     advisor_override: Option<String>,
-    // Phase 46 P3: already-parsed `--min-release-age=<dur>` override. `Some`
+    //: already-parsed `--min-release-age=<dur>` override. `Some`
     // short-circuits the package.json / global / default chain in
     // [`crate::release_age_config::ReleaseAgeResolver::resolve`]; `None`
     // walks the chain normally. Clap parses the duration string via
     // [`crate::release_age_config::parse_duration`] before this fn runs, so
     // validation errors never make it this far.
     min_release_age_override: Option<u64>,
-    // Phase 46 P4 Chunk 4: canonicalized `--ignore-provenance-drift[-all]`
+    // canonicalized `--ignore-provenance-drift[-all]`
     // override (see [`crate::provenance_fetch::DriftIgnorePolicy`] for
     // the three variants). `EnforceAll` is the default; the drift gate
     // consults `.ignores_all()` for a short-circuit and
@@ -3314,7 +3309,7 @@ pub async fn run_with_options(
     // into this policy (D16): drift and cooldown are orthogonal, so
     // their override flags stay separate.
     drift_ignore_policy: crate::provenance_fetch::DriftIgnorePolicy,
-    // Phase 46.1 rework (2026-05-11): CLI sandbox-mode overrides.
+    // rework : CLI sandbox-mode overrides.
     // `strict_sandbox=true` flips outbound network denial on for the
     // auto-build call; `no_sandbox=true` drops all containment for
     // that call. Clap-level mutex guarantees they never both arrive
@@ -3327,7 +3322,7 @@ pub async fn run_with_options(
     strict_sandbox: bool,
     no_sandbox: bool,
 ) -> Result<(), LpmError> {
-    // Phase 64 Round 2: hold a shared lock on the store for the
+    // Round 2: hold a shared lock on the store for the
     // entire install pipeline. Multiple concurrent installs share it
     // freely; `lpm cache prune --apply` and `lpm store clean` (which take it
     // exclusively) wait until every in-flight install releases. This
@@ -3386,11 +3381,11 @@ async fn run_with_options_under_store_lock(
     target_set: Option<&[String]>,
     direct_versions_out: Option<&mut HashMap<String, lpm_semver::Version>>,
     script_policy_override: Option<crate::script_policy_config::ScriptPolicy>,
-    // Phase 46 slice 1 — see `run_with_options` for the contract.
+    // slice 1 — see `run_with_options` for the contract.
     advisor_override: Option<String>,
     min_release_age_override: Option<u64>,
     drift_ignore_policy: crate::provenance_fetch::DriftIgnorePolicy,
-    // Phase 46.1 rework (2026-05-11) — see `run_with_options` for the
+    // rework  — see `run_with_options` for the
     // contract. Threaded down so the auto-build call below honors the
     // user's CLI sandbox-mode override.
     strict_sandbox: bool,
@@ -3413,7 +3408,7 @@ async fn run_with_options_under_store_lock(
     let pkg = lpm_workspace::read_package_json(&pkg_json_path)
         .map_err(|e| LpmError::Registry(format!("failed to read package.json: {e}")))?;
 
-    // **R2.5 — pre-flight `auto_install_peers` resolution.** Hoisted
+    //  Hoisted
     // here (above the empty-deps short-circuit, the lockfile fast
     // path, and the freshness check) so the v1-lockfile gate AND
     // the pubgrub-mismatch warning fire regardless of which install
@@ -3430,7 +3425,7 @@ async fn run_with_options_under_store_lock(
         .unwrap_or(true);
     let pubgrub_opt_out = std::env::var("LPM_RESOLVER").as_deref() == Ok("pubgrub");
 
-    // **R2.5 fix-2 — pubgrub-mismatch warning.**
+    // pubgrub-mismatch warning.
     //
     // Pre-fix this warning was emitted only when `!json_output`,
     // which silenced it for any wrapper, CI, or tooling using
@@ -3525,11 +3520,11 @@ async fn run_with_options_under_store_lock(
                     "link_ms": 0u128,
                     "total_ms": total_ms,
                 },
-                // §1a — always-present empty array: up-to-date fast
+                //always-present empty array: up-to-date fast
                 // path runs no resolve, so no fresh conflict trace.
                 "peer_conflicts": [],
             });
-            // Phase 2: surface workspace target set for agents.
+            // surface workspace target set for agents.
             if let Some(targets) = target_set {
                 json["target_set"] = serde_json::Value::Array(
                     targets.iter().map(|s| serde_json::json!(s)).collect(),
@@ -3548,7 +3543,7 @@ async fn run_with_options_under_store_lock(
         output::info(&format!("Installing dependencies for {}", pkg_name.bold()));
     }
 
-    // Phase 61.3 + hoisted-symmetry — legacy linker-state migration.
+    // + hoisted-symmetry — legacy linker-state migration.
     // Detects upgrade-in-place users (binary upgraded but
     // `node_modules/` not wiped) and wipes any legacy state subtrees
     // — the pre-61.1 isolated wrapper root at `node_modules/.lpm/`
@@ -3562,7 +3557,7 @@ async fn run_with_options_under_store_lock(
     // legacy state is a no-op.
     migrate_legacy_wrapper_layout(project_dir, json_output);
 
-    // Phase 61.5 + hoisted-symmetry — ensure `.gitignore` contains
+    // + hoisted-symmetry — ensure `.gitignore` contains
     // BOTH `.lpm/wrappers/` (isolated) and `.lpm/hoisted/` so neither
     // mode's project-local state can accidentally land in commits.
     // Runtime "ensure once" pattern (matches the existing skills
@@ -3573,8 +3568,8 @@ async fn run_with_options_under_store_lock(
     ensure_lpm_wrappers_gitignore(project_dir);
     ensure_lpm_hoisted_gitignore(project_dir);
 
-    // Phase 46 P1: surface silent additions to `trustedDependencies`
-    // BEFORE the install pipeline does any work (§4.2 of the plan).
+    //: surface silent additions to `trustedDependencies`
+    // BEFORE the install pipeline does any work.
     // A "bump dep" PR that quietly grew the trust list would otherwise
     // slip past local review; this diff is the local-reviewer safety
     // net. Emission is suppressed in --json mode (no stable JSON
@@ -3594,7 +3589,7 @@ async fn run_with_options_under_store_lock(
         }
     }
 
-    // Phase 43 — shared gate counters. Populated by the lockfile
+    // — shared gate counters. Populated by the lockfile
     // fast path (Change 1) when a stored URL fails the scheme/shape/
     // origin gate, and (in follow-up commits) by the stale-URL retry
     // path. Surfaced on `timing.fetch_breakdown.tarball_url_gate`.
@@ -3603,7 +3598,7 @@ async fn run_with_options_under_store_lock(
     let mut deps = pkg.dependencies.clone();
 
     // `lpm install` resolves BOTH `dependencies` and `devDependencies`,
-    // matching npm/pnpm/yarn semantics. Pre-2026-04-16 only `dependencies`
+    // matching npm/pnpm/yarn semantics. Pre-only `dependencies`
     // flowed through the pipeline, which silently no-op'd `lpm install -D`
     // (the spec landed in the manifest but was never resolved or linked).
     //
@@ -3624,7 +3619,7 @@ async fn run_with_options_under_store_lock(
     // `deps` HashMap contains only real registry ranges by the time the
     // resolver sees it.
     //
-    // **Phase 32 Phase 2 audit fix #3 (workspace:^ resolver bug):** previously
+    // previously
     // we called `lpm_workspace::resolve_workspace_protocol` which rewrote
     // `"@scope/member": "workspace:^"` to `"@scope/member": "^1.5.0"` and
     // LEFT IT in `deps`. The resolver then tried to fetch
@@ -3695,7 +3690,7 @@ async fn run_with_options_under_store_lock(
         Vec::new()
     };
 
-    // **Phase 59.1 audit response (round 4) — full workspace membership.**
+    // 
     // `workspace_member_deps` above is the EXTRACTED top-level subset
     // (entries the consumer's manifest declared via `workspace:*`).
     // That set drives `link_workspace_members` (which plants root
@@ -3737,7 +3732,7 @@ async fn run_with_options_under_store_lock(
         })
         .unwrap_or_default();
 
-    // **Phase 59.1 audit response (round 6)** — F9 dedupe pre-pass.
+    // F9 dedupe pre-pass.
     // Replaces the F9 dedupe that lived only in the online path's
     // `pre_resolve_non_registry_deps`. By running BEFORE the
     // offline/online dispatch and BEFORE the lockfile fast-path,
@@ -3757,7 +3752,7 @@ async fn run_with_options_under_store_lock(
         json_output,
     );
 
-    // **Phase 32 Phase 5** — fully parse and validate the override set
+    // fully parse and validate the override set
     // up-front (fail-closed). This runs BEFORE the empty-deps
     // short-circuit so a malformed override is surfaced even when
     // the project has zero dependencies — otherwise users would only
@@ -3787,7 +3782,7 @@ async fn run_with_options_under_store_lock(
     // from `lpm doctor --json`, where every issue lands as a
     // `Check::warn` with a stable code.
 
-    // Phase 58.1 — build the RouteTable (npmrc) early and surface its
+    // — build the RouteTable (npmrc) early and surface its
     // warnings. The `strict-ssl=false` install-start warning must fire
     // regardless of whether deps actually need fetching: a user who
     // explicitly disabled TLS verification deserves the diagnostic, and
@@ -3838,7 +3833,7 @@ async fn run_with_options_under_store_lock(
     // No re-resolution here.
 
     if deps.is_empty() && workspace_member_deps.is_empty() {
-        // Phase 32 Phase 2 audit fix: emit a proper JSON object even on the
+        // audit fix: emit a proper JSON object even on the
         // empty-deps short-circuit so agents driving install always get a
         // parseable result. Pre-fix this branch returned silently in JSON
         // mode, which combined with the workspace-aware filtered install
@@ -3856,7 +3851,7 @@ async fn run_with_options_under_store_lock(
                     "link_ms": 0u128,
                     "total_ms": total_ms,
                 },
-                // §1a — always-present empty array: zero deps means
+                //always-present empty array: zero deps means
                 // zero peer requirements means zero conflicts.
                 "peer_conflicts": [],
             });
@@ -3869,7 +3864,7 @@ async fn run_with_options_under_store_lock(
         } else {
             output::success("No dependencies to install");
         }
-        // **Phase 32 Phase 5** — clean up stale overrides-state.json
+        // clean up stale overrides-state.json
         // when the user removes all overrides from a no-dep project.
         // We can't write a fresh state because there are no overrides,
         // and a stale state would cause `lpm graph --why` to surface
@@ -3894,7 +3889,7 @@ async fn run_with_options_under_store_lock(
         return Ok(());
     }
 
-    // **Phase 32 Phase 5** — read the persisted override state and
+    // read the persisted override state and
     // compute whether the override set has drifted since the last
     // recorded install. This MUST run BEFORE the `--offline` branch
     // so that:
@@ -3905,7 +3900,7 @@ async fn run_with_options_under_store_lock(
     //    re-resolve) and can write/delete the state file alongside
     //    the link step.
     //
-    // **Audit fix (2026-04-12, GPT-5.4 end-to-end audit).** Pre-fix,
+    // **Audit fix (, GPT-5.4 end-to-end audit).** Pre-fix,
     // these two lines lived AFTER the offline branch's `return`
     // statement, so the offline path silently shadowed override
     // edits, never wrote a state file, and never cleaned up stale
@@ -3924,8 +3919,8 @@ async fn run_with_options_under_store_lock(
         );
     }
 
-    // **Phase 32 Phase 6 — `lpm.patchedDependencies`.**
-    // Mirror of the Phase 5 overrides drift detection. Patches must be
+    // 
+    // Mirror of the overrides drift detection. Patches must be
     // checked BEFORE the offline branch so:
     //   1. Online mode can drop the lockfile fast path on drift and
     //      force a fresh resolve (the patches themselves don't affect
@@ -3954,14 +3949,14 @@ async fn run_with_options_under_store_lock(
     // Step 2: Try lockfile fast path, else resolve
     let lockfile_path = project_dir.join(lpm_lockfile::LOCKFILE_NAME);
 
-    // Phase 58.1 — apply `.npmrc`-derived TLS overrides to the cloned
+    // — apply `.npmrc`-derived TLS overrides to the cloned
     // client BEFORE any network use, then shadow the parameter so every
     // downstream callsite (including the `try_lockfile_fast_path` /
     // `download_tarball_streaming_routed` paths that take `client`
     // directly, not `arc_client`) sees the configured client. The
     // `route_table` itself was built earlier (above the empty-deps
     // short-circuit) so its warnings always surface.
-    // Phase 58.3 — request-aware eager-build (Δ1). Filter `deps` to
+    // — request-aware eager-build (Δ1). Filter `deps` to
     // entries that ACTUALLY route through a registry by package name;
     // local/file/link/tarball-URL/git/workspace specs don't, and
     // would either eager-build unrelated origins (causing failures
@@ -3996,7 +3991,7 @@ async fn run_with_options_under_store_lock(
         .clone_with_config()
         .with_tls_overrides_for(route_table.tls_overrides(), &eager_origins)?;
     let client = &owned_client;
-    // Phase 58.3 — emit a one-line summary of EFFECTIVE TLS overrides
+    // — emit a one-line summary of EFFECTIVE TLS overrides
     // (default surface + eager per-origin clients). `None` ⇒ nothing
     // active ⇒ no line. Suppressed under `--json` so structured stdout
     // stays clean; the strict-ssl=false security warning above remains
@@ -4009,7 +4004,7 @@ async fn run_with_options_under_store_lock(
 
     // Offline mode: require lockfile, no network
     if offline {
-        // **Phase 32 Phase 5 — audit fix #2 (2026-04-12).** Offline
+        // Offline
         // mode cannot re-resolve, so any fingerprint drift is
         // unsafe: the lockfile would silently shadow the user's
         // override edits. Refuse with a clear, actionable message
@@ -4034,7 +4029,7 @@ async fn run_with_options_under_store_lock(
             )));
         }
 
-        // **Phase 32 Phase 6** — same hard-error semantics for the
+        // same hard-error semantics for the
         // patch set. Offline mode can't re-resolve OR re-fetch a
         // possibly-changed store baseline, so any drift in the
         // declared patch set leaves the install in an unknown state.
@@ -4076,11 +4071,11 @@ async fn run_with_options_under_store_lock(
                         .into(),
                 )
             })?;
-        // **R2.5 fix-1 (offline arm).** Same repair-gate semantic as
+        //  Same repair-gate semantic as
         // the online path, but `--offline` can't re-resolve to
-        // re-derive the missing R2.5 state. The choice is between
-        // replaying a known-broken tree (pre-R2.5 v1 lockfiles
-        // produced by R2.2-R2.4 buggy writers were missing
+        // re-derive the missing. The choice is between
+        // replaying a known-broken tree (older lockfiles from builds
+        // with the peer-tracking bug were missing
         // `ambient-peer-installs` and per-package `peers`, so
         // `node_modules/<auto-installed-peer>/` is dropped on
         // replay and `require('react-redux')` hard-fails at runtime)
@@ -4091,9 +4086,9 @@ async fn run_with_options_under_store_lock(
         // `auto_install_peers` is on.
         if lockfile_needs_r25_repair(&fast.lockfile, auto_install_peers) {
             return Err(LpmError::Registry(
-                "--offline cannot use a pre-R2.5 lockfile under \
+                "--offline cannot use an older-format lockfile under \
                  `lpm.autoInstallPeers = true`: the lockfile may be missing \
-                 ambient-peer-install state from R2.2-R2.4 builds. Run \
+                 ambient-peer-install state. Run \
                  `lpm install` (online) once to re-derive and upgrade the \
                  lockfile to v2, then retry --offline. To bypass this check \
                  and accept warn-only peer semantics, set \
@@ -4117,7 +4112,7 @@ async fn run_with_options_under_store_lock(
         let store = PackageStore::default_location()?;
         let mut missing = Vec::new();
         for p in &locked {
-            // Phase 59.0 day-5.5 audit fix (HIGH-2 partial): source-
+            // day-5.5 audit fix (HIGH-2 partial): source-
             // aware existence check for the offline gate.
             // Source::Tarball lives in the integrity-keyed CAS, so
             // a `(name, version)`-keyed registry hit doesn't satisfy
@@ -4137,8 +4132,8 @@ async fn run_with_options_under_store_lock(
             )));
         }
 
-        // **Phase 32 Phase 5 — state file lifecycle in offline mode
-        // (2026-04-12).** Reaching this point means the fingerprint
+        // **— state file lifecycle in offline mode
+        // .** Reaching this point means the fingerprint
         // check above passed — i.e., the on-disk state file matches
         // the current parsed override set, OR both sides are empty.
         // Two sub-cases:
@@ -4161,7 +4156,7 @@ async fn run_with_options_under_store_lock(
         // `overrides_changed` branch above, returning a clear
         // "re-resolve online" error.
 
-        // **Phase 59.1 audit response (round 6) — offline path runs
+        // **audit response (round 6) — offline path runs
         // workspace-member BFS too.** Pre-round-6 the offline arm
         // passed the EXTRACTED top-level `workspace_member_deps`
         // slice straight to `run_link_and_finish` and missed
@@ -4182,7 +4177,7 @@ async fn run_with_options_under_store_lock(
         )?;
 
         // Go directly to link step (skip resolution and download).
-        // Phase 46 P2 Chunk 5: forward the already-resolved
+        // forward the already-resolved
         // script-policy override so the link-and-finish path shows
         // the same triage summary line the fresh-resolution path
         // would.
@@ -4205,15 +4200,15 @@ async fn run_with_options_under_store_lock(
         .await;
     }
 
-    // **R2.5** — `auto_install_peers` and `pubgrub_opt_out` are
+    // `auto_install_peers` and `pubgrub_opt_out` are
     // computed at the top of `run_with_options` (above the empty-deps
     // short-circuit) so the pubgrub-mismatch warning fires regardless
     // of which install codepath ultimately runs. The lockfile-repair
     // gate below reuses the same `auto_install_peers` value.
 
     // --force skips lockfile fast path to force fresh resolution from registry.
-    // --overrides-changed also skips it (Phase 32 Phase 5).
-    // --patches-changed also skips it (Phase 32 Phase 6) — re-applying a
+    // --overrides-changed also skips it.
+    // --patches-changed also skips it — re-applying a
     // patch that's been added or moved since the last install requires
     // a clean re-link from store before the patch engine runs, and the
     // lockfile fast path bypasses linker work.
@@ -4231,9 +4226,8 @@ async fn run_with_options_under_store_lock(
             Some(fast) if lockfile_needs_r25_repair(&fast.lockfile, auto_install_peers) => {
                 if !json_output {
                     output::info(
-                        "Lockfile is from a pre-R2.5 build; rebuilding to capture \
-                         eager peer auto-install state. Subsequent installs will \
-                         be fast.",
+                        "Lockfile is in an older format; rebuilding to capture \
+                         peer auto-install state. Subsequent installs will be fast.",
                     );
                 }
                 None
@@ -4241,13 +4235,13 @@ async fn run_with_options_under_store_lock(
             other => other,
         }
     };
-    // **Phase 32 Phase 5** — applied-override trace for the rest of the
+    // applied-override trace for the rest of the
     // install pipeline. Empty for the lockfile-fast-path branch (we
     // preserve the previously-recorded trace from disk in that case);
     // populated for fresh resolution from the resolver's apply log.
     let mut applied_overrides: Vec<OverrideHit> = Vec::new();
 
-    // **Phase 66 confidence-followup §1a** — best-effort peer-conflict
+    // best-effort peer-conflict
     // reports from the resolver. Each entry is one peer canonical
     // whose required consumer ranges were pairwise-incompatible: the
     // resolver picked the version satisfying the most consumers and
@@ -4262,7 +4256,7 @@ async fn run_with_options_under_store_lock(
     // tooling already depends on.
     let mut peer_conflicts: Vec<lpm_resolver::PeerConflictReport> = Vec::new();
 
-    // **R2.5** — ambient peer installs synthesized by the resolver,
+    // ambient peer installs synthesized by the resolver,
     // captured here so the cold-resolve lockfile-write site below
     // can persist them. Empty when the fast path takes over (we
     // already have the lockfile, no need to re-derive); populated by
@@ -4270,19 +4264,19 @@ async fn run_with_options_under_store_lock(
     // `resolve_result.ambient_peer_installs`.
     let mut ambient_peer_installs_for_lockfile: Vec<String> = Vec::new();
 
-    // Phase 38 P3: fetch semaphore hoisted out of the fetch loop so the
+    //: fetch semaphore hoisted out of the fetch loop so the
     // optional speculative dispatcher can share the 16-permit download
     // pool with the post-resolve real-fetch loop. Without sharing, a
     // spec dispatcher racing 16 downloads alongside the later real loop's
     // 16 would saturate the network for no wall-clock win. One pool,
     // used first by speculation, then drained by real fetch.
     let fetch_semaphore = Arc::new(Semaphore::new(max_concurrent_downloads()));
-    // Phase 38 P3: also hoist the `PackageStore` so the speculative
+    //: also hoist the `PackageStore` so the speculative
     // dispatcher can write tarballs into the real store during the
     // resolve phase. Post-resolve, the fetch loop rebinds to the same
     // handle (cheap Arc-style clone underneath).
     let store = PackageStore::default_location()?;
-    // Phase 66 confidence-followup S5b — `lpm_root` lifted to function
+    // confidence-followup S5b — `lpm_root` lifted to function
     // scope so post-install helpers (`show_install_build_hint`,
     // `all_scripted_packages_trusted`) can reach the v2 store via
     // `find_installed_package_baseline`. Pre-fix, those helpers took
@@ -4291,7 +4285,7 @@ async fn run_with_options_under_store_lock(
     // 0 packages even when prisma / esbuild / sharp were waiting.
     let lpm_root = lpm_common::LpmRoot::from_env()?;
 
-    // Phase 66 Phase 4b — read the store-version flag once per
+    // — read the store-version flag once per
     // install. `LPM_STORE_VERSION=v2` opts in to the virtual-store
     // pipeline; everything else (unset, "v1", typos) takes the v1
     // path that's been shipping.
@@ -4316,10 +4310,10 @@ async fn run_with_options_under_store_lock(
         );
     }
 
-    // Phase 66 Phase 4d — silent v1 → v2 layout migration on first
+    // — silent v1 → v2 layout migration on first
     // v2-mode install in this project.
     //
-    // Detection (preplan §3.1): the project is on v1 if either
+    // Detection (preplan): the project is on v1 if either
     // `<project>/.lpm/wrappers/` or `<project>/.lpm/hoisted/` exists.
     // Both are wiped during migration so the v2 install can populate
     // a clean slate. The store-side `~/.lpm/store/v1/` is NOT touched
@@ -4338,7 +4332,7 @@ async fn run_with_options_under_store_lock(
             .map_err(|e| LpmError::Registry(format!("v1→v2 migration failed: {e}")))?;
     }
 
-    // **Phase 59.0 day-6a (F4 manifest wiring)** — pre-resolve direct
+    // pre-resolve direct
     // tarball-URL deps from the manifest BEFORE the resolver runs.
     // Each tarball-URL dep is downloaded, extracted into the
     // integrity-keyed CAS, and turned into an InstallPackage with
@@ -4367,7 +4361,7 @@ async fn run_with_options_under_store_lock(
     )
     .await?;
 
-    // **Phase 59.1 audit response (round 5)** — merge the workspace
+    // merge the workspace
     // members `pre_resolve_non_registry_deps` discovered through F9
     // dedupe (immediate file:/link: + transitive walker) and the
     // round-3 transitive `workspace:` arm into the slice that drives
@@ -4414,28 +4408,28 @@ async fn run_with_options_under_store_lock(
         &all_workspace_members,
     )?;
 
-    // P3 stats — filled by the Phase 49 walker + dispatcher drain.
+    // stats — filled by the walker + dispatcher drain.
     let mut spec_stats = SpeculativeStats::default();
 
-    // Phase 39 P2: shared fetch coordinator — serializes per-key fetch
+    //: shared fetch coordinator — serializes per-key fetch
     // work across the speculative dispatcher and the real fetch loop
     // now that the drain-wait between them is gone.
     let fetch_coord: Arc<FetchCoordinator> = Arc::new(FetchCoordinator::default());
 
-    // Phase 49: walker + dispatcher join handles hoisted out of the
+    // walker + dispatcher join handles hoisted out of the
     // fresh-resolve arm so the main task drains them AFTER the real
-    // fetch loop — preserves the speculation overlap the Phase 39 P2
+    // fetch loop — preserves the speculation overlap the
     // hoist enabled. NOT awaited here: awaiting either handle early
     // consumes it and makes the post-fetch drain a no-op (preplan
-    // §5.3).
+    //).
     let mut walker_join: Option<WalkerJoin> = None;
-    // Phase 56 W2: when set, the fusion dispatcher ran instead of the
+    //: when set, the fusion dispatcher ran instead of the
     // walker. Read at the post-fetch drain site to suppress the no-op
     // walker stub's zeroed `streaming_bfs` summary in `--json` output
     // (the fusion arm reports null streaming_bfs because there's no
     // walker; substage detail lives under `timing.resolve.dispatcher.*`).
     let mut fusion_enabled = false;
-    // Post-Phase-60 lockfile metadata: which resolver actually ran.
+    // Post-lockfile metadata: which resolver actually ran.
     // Stamped into `lpm.lock`'s `resolved-with` field at the cold-
     // write site below. Defaults to the greedy-fusion install default
     // (matches `Lockfile::new()`) and is overridden inside the fresh-
@@ -4444,7 +4438,7 @@ async fn run_with_options_under_store_lock(
     // to "pubgrub" inside `Lockfile::new`, so every default install
     // post-v0.28.0 wrote a lie into the lockfile.
     let mut resolved_with: &'static str = "greedy-fusion";
-    // Phase 49 §6: streaming-BFS observability counters. Shared Arc
+    //: streaming-BFS observability counters. Shared Arc
     // between the resolver (incrementing inside `ensure_cached` +
     // `direct_fetch_and_cache`) and the JSON-output block that
     // snapshots the counts for `timing.resolve.streaming_bfs`.
@@ -4453,7 +4447,7 @@ async fn run_with_options_under_store_lock(
     // fast-path where the walker never runs.
     let streaming_metrics = lpm_resolver::StreamingBfsMetrics::new();
 
-    // Phase 40 P3a — substage breakdown of cold-resolve wall-clock.
+    //a — substage breakdown of cold-resolve wall-clock.
     // Captured here (outside the fresh/warm branch) so the JSON output
     // code path can surface a consistent shape whether the lockfile
     // fast path kicked in or not. Zeros on lockfile-fast-path;
@@ -4461,7 +4455,7 @@ async fn run_with_options_under_store_lock(
     let mut initial_batch_ms: u128 = 0;
     let mut resolver_stage_timing = lpm_resolver::StageTiming::default();
 
-    // Phase 43 — stash the parsed lockfile + `needs_binary_upgrade`
+    // — stash the parsed lockfile + `needs_binary_upgrade`
     // flag from the fast path so the writeback step at install-end
     // can patch + re-emit it. `None` on fresh-resolve branches (the
     // resolver builds its own lockfile via `resolved_to_install_packages`
@@ -4469,10 +4463,10 @@ async fn run_with_options_under_store_lock(
     let mut fast_path_lockfile: Option<lpm_lockfile::Lockfile> = None;
     let mut needs_binary_upgrade = false;
 
-    // `route_table` is built upstream of this fork (Phase 58 day-4.5
+    // `route_table` is built upstream of this fork (day-4.5
     // hoisted it above the lockfile-vs-resolve match so custom-
     // registry tarball auth + stale-tarball invalidation work on both
-    // arms; Phase 58.1 hoisted it further to above the empty-deps
+    // arms; hoisted it further to above the empty-deps
     // short-circuit so TLS overrides + `strict-ssl=false` security
     // warning surface for empty-deps installs too).
     let (mut packages, resolve_ms, used_lockfile, platform_skipped) = match lockfile_result {
@@ -4492,9 +4486,9 @@ async fn run_with_options_under_store_lock(
             let spinner = make_spinner("Resolving dependency tree...");
 
             // route_table is constructed above the lockfile match
-            // (Phase 58 day-4.5) — we just borrow/clone it here.
+            // (day-4.5) — we just borrow/clone it here.
 
-            // **Default flip (post-Phase-60).** Greedy-fusion is now the
+            // **Default flip .** Greedy-fusion is now the
             // global install default. The fused dispatcher
             // (`resolve_greedy_fused`) skips the walker spawn entirely
             // and IS the metadata fetch dispatcher.
@@ -4515,22 +4509,21 @@ async fn run_with_options_under_store_lock(
             //     Use only if you hit a greedy-fusion edge case in the
             //     wild and need a tested fallback while we land a fix.
             //   - `LPM_GREEDY_FUSION=0` — opt-out from the fused
-            //     dispatcher to the legacy walker arm (Phase 49
-            //     orchestration: walker + dispatcher +
+            //     dispatcher to the legacy walker arm (            //     orchestration: walker + dispatcher +
             //     resolver_with_shared_cache in parallel) while still
             //     using the greedy resolver. Useful for debugging
             //     dispatcher-specific issues with greedy-resolver
             //     behavior held constant.
             //
             // Reference n=20 bench (median, bench/fixture-large) from
-            // Phase 56 W4:
+            //:
             //   greedy-stream (walker)  4,521 ms total
             //   greedy-fusion           918 ms total — 1.10× bun
             //   bun reference           833 ms
             // -3,603 ms median delta, paired t = -23.27. The default-
             // flip preserves these numbers (now reachable without the
             // `LPM_RESOLVER=greedy` opt-in env var).
-            // **R2.5 hoist.** `pubgrub_opt_out` and `auto_install_peers`
+            //  `pubgrub_opt_out` and `auto_install_peers`
             // are computed at the top of `run_with_options` (above
             // the lockfile fast-path call) so the v1-lockfile gate
             // and the pubgrub-mismatch warning fire even on warm
@@ -4583,7 +4576,7 @@ async fn run_with_options_under_store_lock(
                     Ok::<_, lpm_resolver::WalkerError>(lpm_resolver::WalkerSummary::default())
                 });
 
-                // Metadata semaphore size. Pre-plan §3.7: 256 sits at
+                // Metadata semaphore size. Pre-plan: 256 sits at
                 // the H2 single-connection multiplex cap; lets the
                 // registry's flow control set the actual pace.
                 // `LPM_NPM_FANOUT` overrides for bench tuning, matches
@@ -4625,10 +4618,10 @@ async fn run_with_options_under_store_lock(
                 // `timing.resolve.dispatcher.*` (W1 plumbing).
                 (res, 0u128)
             } else {
-                // ── LEGACY PATH (Phase 49 walker + spec dispatcher) ──
+                // ── LEGACY PATH (walker + spec dispatcher) ──
                 let dep_names: Vec<String> = deps.keys().cloned().collect();
 
-                // Phase 49 orchestration (preplan §5.3): spawn walker +
+                // orchestration (preplan): spawn walker +
                 // dispatcher; resolve concurrently waiting on roots_ready.
                 // Walker is the manifest producer; the dispatcher is the
                 // pure consumer of the existing `(name, PackageMetadata)`
@@ -4639,13 +4632,13 @@ async fn run_with_options_under_store_lock(
                 // Critically: walker + dispatcher `JoinHandle`s are NOT
                 // awaited here. They're bundled into `WalkerJoin` below
                 // and drained at the existing post-fetch drain point —
-                // preserving the Phase 39 P2 speculation overlap and
-                // matching preplan §5.3's "tail drains post-fetch, not
+                // preserving the speculation overlap and
+                // matching preplan's "tail drains post-fetch, not
                 // aborted" invariant.
                 use lpm_resolver::{BfsWalker, NotifyMap, SharedCache, WalkerDone};
                 let shared_cache: SharedCache = Arc::new(dashmap::DashMap::new());
                 let notify_map: NotifyMap = Arc::new(dashmap::DashMap::new());
-                // Phase 49 wait-loop shutdown handshake: the walker stores
+                // wait-loop shutdown handshake: the walker stores
                 // `true` (Release) and broadcasts `notify_waiters()` across
                 // every notify_map entry at the end of its `run()`. The
                 // resolver's wait-loop in `ensure_cached` checks this flag
@@ -4700,7 +4693,7 @@ async fn run_with_options_under_store_lock(
 
                 // Resolver — awaits roots_ready then solves against the
                 // shared cache. `fetch_wait_timeout` = 5s is the preplan
-                // §5.1 default: the provider waits on the per-canonical
+                // default: the provider waits on the per-canonical
                 // Notify for up to 5s before falling through to its
                 // escape-hatch fetch.
                 let resolve_client = arc_client.clone();
@@ -4709,12 +4702,12 @@ async fn run_with_options_under_store_lock(
                 let shared_cache_for_resolve = shared_cache.clone();
                 let notify_map_for_resolve = notify_map.clone();
                 let walker_done_for_resolve = walker_done.clone();
-                // Phase 49 §6: clone the outer-scope metrics Arc for the
+                //: clone the outer-scope metrics Arc for the
                 // resolver's ownership; the outer `streaming_metrics`
                 // stays readable by the JSON-emit block via its own Arc
                 // handle.
                 let streaming_metrics_for_resolve = streaming_metrics.clone();
-                // Phase 49: `initial_batch_ms` captures the time from
+                // `initial_batch_ms` captures the time from
                 // orchestration start to the moment the resolver could
                 // begin solving — i.e. roots-ready fire. This is the
                 // new-shape analog of the pre-49 "batch prefetch done"
@@ -4770,7 +4763,7 @@ async fn run_with_options_under_store_lock(
 
             let resolve_result = resolve_res?;
 
-            // Phase 39 P2: drain-wait removed. `speculation_join` is
+            //: drain-wait removed. `speculation_join` is
             // preserved on the outer scope and drained AFTER the fetch
             // loop below, so speculative tarball downloads can overlap
             // the real fetch loop (straggling specs race with the real
@@ -4785,7 +4778,7 @@ async fn run_with_options_under_store_lock(
             // Post-resolution peer dependency check: warn about unmet peers
             // using each package's actual selected version (not a union).
             //
-            // Phase 64 #33: peer rules from `package.json > lpm.peerDependencyRules`
+            // #33: peer rules from `package.json > lpm.peerDependencyRules`
             // (translated from `pnpm.peerDependencyRules` by `lpm migrate`)
             // are compiled once and applied inside the warning loop.
             // `ignore_missing` suppresses missing-peer warnings,
@@ -4818,12 +4811,12 @@ async fn run_with_options_under_store_lock(
                 }
             }
 
-            // **Phase 32 Phase 5** — capture the override apply trace
+            // capture the override apply trace
             // from this fresh resolution. We surface it to the install
             // summary, the JSON output, and `.lpm/overrides-state.json`.
             applied_overrides = resolve_result.applied_overrides.clone();
 
-            // §1a — capture best-effort peer-conflict reports. Drained
+            //capture best-effort peer-conflict reports. Drained
             // alongside applied_overrides so the JSON envelope below
             // can serialize them whether or not the user is running
             // with `--json`. Cloned (not moved) because
@@ -4831,18 +4824,18 @@ async fn run_with_options_under_store_lock(
             // a few lines down.
             peer_conflicts = resolve_result.peer_conflicts.clone();
 
-            // **Phase 40 P1** — capture the platform-filtered optional
+            // — capture the platform-filtered optional
             // skip count. Surfaced as `timing.resolve.platform_skipped`
             // in `--json` output.
             let platform_skipped = resolve_result.platform_skipped;
 
-            // **Phase 40 P3a** — capture the resolver substage
+            // capture the resolver substage
             // breakdown. Combined with the `initial_batch_ms`
             // measurement above, these feed the cold-resolve
             // observability story in `timing.resolve.*`.
             resolver_stage_timing = resolve_result.stage_timing;
 
-            // **R2.5** — clone the ambient peer install set BEFORE we
+            // clone the ambient peer install set BEFORE we
             // hand `resolve_result` off to `resolved_to_install_packages`
             // (which only borrows it). Persisted to the lockfile far
             // below at the cold-resolve write site so warm reinstalls
@@ -4857,7 +4850,7 @@ async fn run_with_options_under_store_lock(
                 &route_table,
             );
 
-            // Phase 59.0 F4 + Phase 59.1 F6 (manifest wiring): merge
+            // F4 + F6 (manifest wiring): merge
             // in the non-registry InstallPackages produced by
             // `pre_resolve_non_registry_deps`. They were fetched +
             // extracted before the resolver ran (so the source-aware
@@ -4866,12 +4859,12 @@ async fn run_with_options_under_store_lock(
             // them here so the install loop sees the full set.
             packages.extend(tarball_url_install_pkgs.iter().cloned());
 
-            // Phase 59.1 day-5 (F7-transitive): post-resolve fix-up.
+            // day-5 (F7-transitive): post-resolve fix-up.
             // Now that BOTH the resolver output AND the non-registry
             // InstallPackages are in `packages`, populate each
             // directory/link InstallPackage's `dependencies` field
             // from its stashed source-deps. Resolver-agnostic per
-            // plan §6.4 — runs once after the merge regardless of
+            // plan — runs once after the merge regardless of
             // PubGrub vs fusion.
             apply_post_resolve_directory_link_fixup(&mut packages, &non_registry_source_deps);
 
@@ -4881,7 +4874,7 @@ async fn run_with_options_under_store_lock(
                     packages.len().to_string().bold(),
                     ms
                 ));
-                // §1a — surface best-effort peer-conflict reports as
+                //surface best-effort peer-conflict reports as
                 // warnings so the user knows which transitive
                 // consumers got a peer version outside their declared
                 // range. Mirrors npm v7+'s unconditional `npm WARN`
@@ -4910,32 +4903,32 @@ async fn run_with_options_under_store_lock(
         }
     };
 
-    // Step 3: Download & store (parallel). Phase 38 P3: `store` is
+    // Step 3: Download & store (parallel).: `store` is
     // already bound above — speculative dispatcher writes into it
     // during resolve, so by the time we reach here the store may hold
     // tarballs the `has_package` loop below picks up as cache hits.
     let fetch_start = Instant::now();
 
-    // Phase 43 — aggregation buffer for the generalized writeback.
+    // — aggregation buffer for the generalized writeback.
     // Populated inside the fetch block with every (name, version) →
     // final-URL pair (only when the final URL diverges from the
     // stored lockfile URL). Consumed at install-end to trigger a
     // lockfile rewrite. Hoisted out of the fetch block so the
     // writeback logic (below the block) can see it.
-    // Phase 59.0 day-7 (F1 finish-line) — keyed on PackageKey so
+    // day-7 (F1 finish-line) — keyed on PackageKey so
     // a registry react@19.0.0 and a tarball-URL react@19.0.0 don't
-    // clobber each other's writeback URL. Pre-Phase-59 used a
+    // clobber each other's writeback URL. Pre-used a
     // (name, version) tuple key.
     let mut fresh_urls: std::collections::HashMap<String, String> =
         std::collections::HashMap::new();
 
-    // **Phase 66 confidence-followup F1.** Pre-compute the per-target
+    // Pre-compute the per-target
     // patch fingerprint map so each `LinkTarget` carries its own
     // `Some("p-…")` when patched. v2's GraphKey folds it in, splitting
     // patched installs into project-isolated link entries.
     let patch_fingerprints = compute_patch_fingerprints(&current_patches, project_dir)?;
 
-    // Phase 39 P2b: build link_targets up front so the event-driven
+    //b: build link_targets up front so the event-driven
     // path can start per-package linking as each tarball lands.
     // `LinkTarget` fields don't depend on fetch completion — just on
     // resolver output — so building them here is safe. Reused by both
@@ -4943,7 +4936,7 @@ async fn run_with_options_under_store_lock(
     let link_targets: Vec<LinkTarget> = packages
         .iter()
         .map(|p| -> Result<LinkTarget, LpmError> {
-            // Phase 59.0 (post-review) + 59.1 day-3: typed-error path
+            // (post-review) + 59.1 day-3: typed-error path
             // for the source-aware store path.
             //   - Source::Tarball (https://) routes to the integrity-
             //     keyed CAS.
@@ -4971,9 +4964,9 @@ async fn run_with_options_under_store_lock(
         })
         .collect::<Result<_, _>>()?;
 
-    // Phase 39 P2b: event-driven link mode. Per-package Phase 1+2 work
+    //b: event-driven link mode. Per-packagea future release2 work
     // runs inside the fetch pipeline (parallel with tarball downloads
-    // of other packages). Phase 3+3.5+4 run as a final batch. Default
+    // of other packages).a future release3.5+4 run as a final batch. Default
     // on for the isolated linker; `LPM_SERIAL_LINK=1` reverts to the
     // single-shot `link_packages` path. Hoisted linker always uses
     // the serial path — it has a different layout model and isn't the
@@ -4981,7 +4974,7 @@ async fn run_with_options_under_store_lock(
     let serial_link = std::env::var("LPM_SERIAL_LINK")
         .map(|v| v == "1")
         .unwrap_or(false);
-    // Phase 66 Phase 4b — under v2 mode, link_packages_v2 needs the
+    // — under v2 mode, link_packages_v2 needs the
     // full LinkTarget set in one batch so the GraphKey pre-pass can
     // resolve cross-references. Per-package event-driven linking
     // (which v1's isolated path uses) doesn't fit the v2 dispatcher's
@@ -4990,7 +4983,7 @@ async fn run_with_options_under_store_lock(
     let event_driven_link =
         !serial_link && !v2_mode && matches!(linker_mode, lpm_linker::LinkerMode::Isolated);
 
-    // Phase 39 P2b: collection of per-package link handles. Cached
+    //b: collection of per-package link handles. Cached
     // packages push into this before the fetch loop; fetch tasks push
     // as each tarball materializes. Awaited during the link-finalize
     // step below (post-fetch).
@@ -5000,7 +4993,7 @@ async fn run_with_options_under_store_lock(
         >,
     > = Vec::new();
 
-    // Phase 66 followup #6b — event-driven v2 link dispatch.
+    // followup #6b — event-driven v2 link dispatch.
     //
     // Predicate: the v2 plan can be precomputed BEFORE fetch iff every
     // CAS-backed target arrives with both
@@ -5024,7 +5017,7 @@ async fn run_with_options_under_store_lock(
     // into graph-key derivation (Isolated vs Hoisted both produce
     // valid keys), and `link_v2_finalize` handles project-side
     // wiring identically across modes. So the gate does NOT require
-    // Isolated — the post-Phase-66-4f Hoisted default is fully
+    // Isolated — the post-Hoisted default is fully
     // supported.
     let v2_cas_targets_pre: Vec<lpm_linker::v2::V2Target> = if v2_mode && !serial_link {
         let mut acc: Vec<lpm_linker::v2::V2Target> = Vec::with_capacity(link_targets.len());
@@ -5115,11 +5108,11 @@ async fn run_with_options_under_store_lock(
     type V2LinkHandle = tokio::task::JoinHandle<Result<(MaterializedPackage, bool), LpmError>>;
     let mut v2_event_link_handles: Vec<V2LinkHandle> = Vec::new();
 
-    // Phase 39 P2b: stale-entry cleanup runs once, up front — must
+    //b: stale-entry cleanup runs once, up front — must
     // happen before any per-pkg link spawn touches `.lpm/` so the
     // `read_dir` scan sees a stable snapshot.
     //
-    // Phase 66 followup #6b: under v2_event_driven, `link_v2_prepare`
+    // followup #6b: under v2_event_driven, `link_v2_prepare`
     // above already ran `cleanup_v1_state` (the v2-side equivalent),
     // so this v1-shaped cleanup is skipped — running it would wipe
     // node_modules a second time with no benefit.
@@ -5135,7 +5128,7 @@ async fn run_with_options_under_store_lock(
         // even if the store already has it. The store's extract-to-temp + atomic
         // rename handles the case where the existing entry is valid.
         //
-        // Phase 59.0 day-5.5 audit fix (HIGH-1): use source-aware
+        // day-5.5 audit fix (HIGH-1): use source-aware
         // existence check. For Source::Tarball, this consults the
         // integrity-keyed CAS layout — a coincidentally-named
         // registry copy in the legacy `(name, version)` slot does
@@ -5143,10 +5136,10 @@ async fn run_with_options_under_store_lock(
         // substitution). Trust-on-first-use Source::Tarball
         // (no recorded integrity) returns false → fetch runs.
         //
-        // Phase 66 Phase 4b — under v2 mode, a hit in v1's
+        // — under v2 mode, a hit in v1's
         // `<HOME>/.lpm/store/v1/` does NOT mean v2's
         // `objects/<sri>/` is populated. Force a fetch so the v2
-        // path repopulates the object. (Phase 4 follow-up:
+        // path repopulates the object. (follow-up:
         // detect-and-translate v1 → v2 to skip re-download for
         // already-extracted bytes.)
         //
@@ -5164,7 +5157,7 @@ async fn run_with_options_under_store_lock(
             Ok(lpm_lockfile::Source::Directory { .. }) | Ok(lpm_lockfile::Source::Link { .. })
         );
 
-        // Phase 66 §4 — v2 native cache-hit short-circuit.
+        // — v2 native cache-hit short-circuit.
         //
         // When v2 mode is active AND the v2 object dir for this
         // package's SRI already exists (populated by a prior install
@@ -5174,7 +5167,7 @@ async fn run_with_options_under_store_lock(
         // is needed here — same shape as the v1 cache-hit gate
         // below.
         //
-        // Pre-Phase-4d this branch was missing because the v2 fetch
+        // Pre-this branch was missing because the v2 fetch
         // path is itself idempotent (`extract_object_from_bytes`
         // short-circuits on object hits), so a duplicate fetch was
         // "free" in correctness terms but wasted network on every
@@ -5191,7 +5184,7 @@ async fn run_with_options_under_store_lock(
             && object_dir.exists()
         {
             cached += 1;
-            // Phase 66 followup #6b — dispatch link_v2_one immediately.
+            // followup #6b — dispatch link_v2_one immediately.
             // The v2 object is already populated, so the link entry's
             // clonefile pass can run on the blocking pool in parallel
             // with sibling fetches. Awaited at the link stage below.
@@ -5212,7 +5205,7 @@ async fn run_with_options_under_store_lock(
             continue;
         }
 
-        // Phase 66 §4 — v1 → v2 cache-hit translation.
+        // — v1 → v2 cache-hit translation.
         //
         // When we're under v2 mode AND v1 already has the extracted
         // bytes for this package AND we know the SRI (lockfile-fast-
@@ -5231,8 +5224,7 @@ async fn run_with_options_under_store_lock(
         // is now populated.
         //
         // Falls through to the regular fetch path on any error — the
-        // re-download is the correct fallback and matches pre-Phase-66
-        // behavior under v2 mode.
+        // re-download is the correct fallback and matches pre-        // behavior under v2 mode.
         if !force
             && v2_mode
             && !is_local_source
@@ -5244,7 +5236,7 @@ async fn run_with_options_under_store_lock(
             match v2_store.populate_object_from_v1(&v1_pkg_dir, sri) {
                 Ok(_) => {
                     cached += 1;
-                    // Phase 66 followup #6b — see the v2 SRI-direct
+                    // followup #6b — see the v2 SRI-direct
                     // cache-hit branch above. Translation populated
                     // `objects/<sri>/`; dispatch link immediately.
                     if v2_event_driven
@@ -5276,9 +5268,8 @@ async fn run_with_options_under_store_lock(
         if !force && (is_local_source || !v2_mode) && p.store_has_source_aware(&store, project_dir)
         {
             cached += 1;
-            // Phase 39 P2b: spawn per-pkg link task immediately — this
-            // package is already materialized in the store, so Phase 1
-            // can run in parallel with the fetch loop below.
+            //b: spawn per-pkg link task immediately — this
+            // package is already materialized in the store, so             // can run in parallel with the fetch loop below.
             if event_driven_link {
                 // Source-aware store path keeps the linker pointed at
                 // the correct slot (tarball CAS for remote tarballs,
@@ -5314,15 +5305,15 @@ async fn run_with_options_under_store_lock(
         }
     }
 
-    // Phase 46 P3: resolve the effective cooldown window through the
+    //: resolve the effective cooldown window through the
     // full precedence chain (CLI `--min-release-age` > package.json >
     // `~/.lpm/config.toml` > 24h default). A malformed global config
     // surfaces a file-pathed error here — that's the one new fail mode
-    // P3 introduces relative to pre-P3 behaviour, and it's
+    // introduces relative to pre-P3 behaviour, and it's
     // intentional: silent fall-through on a broken global file is
     // exactly the bug the path-aware loader prevents.
     //
-    // Phase 46b Option B: pulled out of the `if !allow_new` block so
+    // Option B: pulled out of the `if !allow_new` block so
     // the resolved threshold is available for the L1 classifier's
     // cooldown defense-in-depth even when the user opted out of the
     // install-level cooldown halt via `--allow-new`. The two axes
@@ -5337,13 +5328,13 @@ async fn run_with_options_under_store_lock(
         effective_min_age_secs,
     );
 
-    // Phase 46b Option B — build a `(name, version) → publish_age_secs`
+    // Option B — build a `(name, version) → publish_age_secs`
     // map ONCE per install. The map serves both:
     //
-    // 1. The install-level cooldown halt (existing Phase 46 P3 gate,
+    // 1. The install-level cooldown halt (existing gate,
     //    gated on `!allow_new && !used_lockfile`).
     // 2. The L1 classifier's cooldown defense-in-depth for Lever #4
-    //    (Phase 46b — refuse to widen `node install.js` + matching
+    //    (— refuse to widen `node install.js` + matching
     //    identity when the publish age is below the configured
     //    threshold, even when the install-level cooldown was
     //    bypassed via `--allow-new`).
@@ -5376,7 +5367,7 @@ async fn run_with_options_under_store_lock(
                         })
                         .and_then(|meta| meta.time.get(&p.version).cloned())
                 } else {
-                    // Phase 58 day-4.5 follow-up: route via RouteTable so
+                    // day-4.5 follow-up: route via RouteTable so
                     // custom-registry packages don't leak names to public
                     // npm and don't pull metadata from the wrong source on
                     // name collisions. `get_npm_metadata_routed` honors
@@ -5442,7 +5433,7 @@ async fn run_with_options_under_store_lock(
                         name, version, hours, minutes
                     );
                 }
-                // Phase 46 P3: three override paths, ordered narrowest
+                //: three override paths, ordered narrowest
                 // to broadest persistence:
                 //   (1) --min-release-age=0   per-install, numeric
                 //   (2) --allow-new           per-install, blanket bypass
@@ -5462,7 +5453,7 @@ async fn run_with_options_under_store_lock(
         }
     }
 
-    // Phase 46 P4 Chunk 3: provenance-drift gate (§7.2).
+    // provenance-drift gate.
     //
     // For every resolved package with a prior approval that captured
     // `provenance_at_approval`, fetch the candidate version's
@@ -5475,7 +5466,7 @@ async fn run_with_options_under_store_lock(
     // attestation identity; a future phase may tighten). `--allow-new`
     // does NOT bypass this gate per D16 — provenance and cooldown
     // are orthogonal signals, and the cooldown override doesn't
-    // imply acknowledgement of publisher drift. Chunk 4 wires the
+    // imply acknowledgement of publisher drift. wires the
     // `--ignore-provenance-drift[-all]` override below.
     //
     // **Performance:** sequential fetches per package. The fetcher's
@@ -5484,7 +5475,7 @@ async fn run_with_options_under_store_lock(
     // later phase if sequential round-trips on first install prove
     // too costly in practice.
     //
-    // **P4 Chunk 4 override short-circuit:** `--ignore-provenance-drift-all`
+    // **P4 override short-circuit:** `--ignore-provenance-drift-all`
     // skips the entire gate (no trusted-dependencies read, no
     // per-package fetch). `--ignore-provenance-drift <pkg>` skips
     // the per-package fetch for the named entries. Both paths emit a
@@ -5567,7 +5558,7 @@ async fn run_with_options_under_store_lock(
                             })
                         })
                 } else {
-                    // Phase 58 day-4.5 follow-up: route via RouteTable so
+                    // day-4.5 follow-up: route via RouteTable so
                     // the provenance-drift gate doesn't fall through to
                     // public npm for a custom-registry package.
                     let route = route_table.route_for_package(&p.name);
@@ -5619,7 +5610,7 @@ async fn run_with_options_under_store_lock(
             }
 
             if !drifted.is_empty() {
-                // §7.3 UX. Chunk 4 extends the footer with the
+                // UX. extends the footer with the
                 // `--ignore-provenance-drift` override suggestion.
                 if !json_output {
                     output::warn(&format!(
@@ -5679,7 +5670,7 @@ async fn run_with_options_under_store_lock(
                     eprintln!(
                         "  This pattern was seen in the axios 1.14.1 compromise (March 2026).",
                     );
-                    // Phase 46 P4 Chunk 4: narrowest-to-broadest
+                    // narrowest-to-broadest
                     // recovery paths. Prefer re-approval (captures
                     // the new identity and tightens the subsequent
                     // gate). Per-package override for single-case
@@ -5702,14 +5693,14 @@ async fn run_with_options_under_store_lock(
     }
 
     let downloaded = to_download.len();
-    // Phase 38 P0: accumulate per-task timings across the parallel pool so we
+    //: accumulate per-task timings across the parallel pool so we
     // can emit a proper fetch-stage breakdown in `lpm install --json`. Empty
     // breakdown on the cached-everything path; filled in below when work runs.
     let mut fetch_breakdown = FetchBreakdown::default();
-    // Phase 38 P1: streaming fetch fast path — bytes flow from reqwest
+    //: streaming fetch fast path — bytes flow from reqwest
     // through a `StreamReader` + `SyncIoBridge` into a sync hash+extract
     // pipeline in `spawn_blocking`, no temp file. Default on since
-    // Phase 39 P0; set `LPM_STREAM_FETCH=0` to fall back to the legacy
+    //; set `LPM_STREAM_FETCH=0` to fall back to the legacy
     // temp-file spool (kept as an escape hatch for debugging fetch
     // regressions or non-sha512 integrity edge cases).
     let streaming_fetch = std::env::var("LPM_STREAM_FETCH")
@@ -5725,7 +5716,7 @@ async fn run_with_options_under_store_lock(
         );
         overall.enable_steady_tick(std::time::Duration::from_millis(80));
 
-        // Phase 38 P3: share the hoisted `fetch_semaphore` so speculative
+        //: share the hoisted `fetch_semaphore` so speculative
         // dispatches (pre-resolve) and real fetches (post-resolve) draw
         // from the same 24-permit pool.
         let semaphore = fetch_semaphore.clone();
@@ -5735,24 +5726,24 @@ async fn run_with_options_under_store_lock(
             let sem = semaphore.clone();
             let client = arc_client.clone();
             let store_ref = store.clone();
-            // Phase 66 Phase 4b — clone the Optional v2 handle into the
+            // — clone the Optional v2 handle into the
             // per-package spawn. `Option::clone` is a Some/None match
             // and `Arc::clone` is a refcount bump; cheap.
             let store_v2_ref = store_v2_handle.clone();
             let coord = fetch_coord.clone();
             let overall = overall.clone();
             let force_flag = force;
-            // Phase 39 P2b: per-task link scheduling captures.
+            //b: per-task link scheduling captures.
             let event_link = event_driven_link;
             let project_dir_buf = project_dir.to_path_buf();
-            // Phase 43 P43-2 — shared gate/retry counters for the
+            //3-2 — shared gate/retry counters for the
             // stale-URL recovery path in `fetch_and_store_*`.
             let gate_stats_c = gate_stats.clone();
-            // Phase 58 day-4.5 — `.npmrc`-derived routing carried into
+            // day-4.5 — `.npmrc`-derived routing carried into
             // the per-package fetch task. Cheap clone (Arc ref-bump
             // for the inner NpmrcConfig).
             let route_table_c = route_table.clone();
-            // Phase 66 followup #6b — per-task v2 event-driven link
+            // followup #6b — per-task v2 event-driven link
             // captures. `v2_plan_arc` is None on the !v2_event_driven
             // path; `v2_target_for_pkg` resolved here once so the
             // per-task closure doesn't carry the whole index map.
@@ -5762,7 +5753,7 @@ async fn run_with_options_under_store_lock(
             } else {
                 None
             };
-            // Phase 66 confidence-followup F1 — pre-resolve THIS
+            // confidence-followup F1 — pre-resolve THIS
             // package's patch fingerprint outside the move closure so
             // the closure doesn't carry the whole map. `None` for the
             // overwhelmingly common case (package has no
@@ -5775,7 +5766,7 @@ async fn run_with_options_under_store_lock(
                 type LinkHandle = tokio::task::JoinHandle<
                     Result<(MaterializedPackage, lpm_linker::OnePackageResult), LpmError>,
                 >;
-                // Phase 66 followup #6b — v2-shape link handle. Mutually
+                // followup #6b — v2-shape link handle. Mutually
                 // exclusive with `LinkHandle` at runtime: under v2_mode,
                 // `event_link` is false (so `LinkHandle` is always None);
                 // under !v2_mode, `v2_plan_arc` is None (so this is
@@ -5783,14 +5774,14 @@ async fn run_with_options_under_store_lock(
                 type V2LinkHandle =
                     tokio::task::JoinHandle<Result<(MaterializedPackage, bool), LpmError>>;
 
-                // P0 timing: spawn→key-lock→permit captures the full time this
-                // task sat queued. Phase 39 P2: now also covers the
+                // timing: spawn→key-lock→permit captures the full time this
+                // task sat queued.: now also covers the
                 // FetchCoordinator wait — if a speculation is mid-fetch for
                 // the same `(name, ver)`, we wait on the per-key lock and
                 // short-circuit via the store-hit check below.
                 let queue_start = std::time::Instant::now();
 
-                // Phase 39 P2: per-key fetch coordination. Acquired BEFORE
+                //: per-key fetch coordination. Acquired BEFORE
                 // the download permit — if a sibling (speculation) is
                 // already fetching this key, we wait here without consuming
                 // a permit. On wake, `has_package` is true and we skip the
@@ -5803,7 +5794,7 @@ async fn run_with_options_under_store_lock(
                 // fetch path — in either case the package is materialized
                 // by the time we call `link_one_package`.
                 //
-                // Phase 59.0 day-5.5 audit fix (HIGH-1): closure now
+                // day-5.5 audit fix (HIGH-1): closure now
                 // takes an optional sri_override so the post-fetch
                 // path can pass the freshly-computed SRI before it
                 // reaches `p.integrity`. Source-aware store_path
@@ -5815,7 +5806,7 @@ async fn run_with_options_under_store_lock(
                     if !event_link {
                         return Ok(None);
                     }
-                    // Phase 59.0 (post-review): store_path_or_err
+                    // (post-review): store_path_or_err
                     // surfaces the missing-SRI invariant violation
                     // as a typed error with full package context
                     // instead of panicking. Reachable only on a
@@ -5842,7 +5833,7 @@ async fn run_with_options_under_store_lock(
                     })))
                 };
 
-                // Phase 39 P2b: only honour the store-hit short-circuit when
+                //b: only honour the store-hit short-circuit when
                 // NOT in `--force` mode. `--force` is the "re-verify
                 // integrity against registry" path: the user explicitly
                 // wants every tarball re-downloaded and re-hashed, even if
@@ -5850,7 +5841,7 @@ async fn run_with_options_under_store_lock(
                 // sibling task (or a prior install) making the store hot
                 // would neuter `--force`.
                 //
-                // Phase 59.0 day-5.5 audit fix (HIGH-1): source-aware
+                // day-5.5 audit fix (HIGH-1): source-aware
                 // existence check — a registry-CAS hit must NOT
                 // satisfy a Source::Tarball pkg with the same
                 // (name, version).
@@ -5865,7 +5856,7 @@ async fn run_with_options_under_store_lock(
                     // key lock. Use the stored SRI for lockfile output;
                     // task_timings stays at defaults (no download work done
                     // on THIS task's critical path — the sibling's timings
-                    // covered it). Phase 43: `None` for `final_url` here
+                    // covered it). `None` for `final_url` here
                     // because THIS task didn't hit the registry — the
                     // sibling's task already reported the URL it used
                     // (via its own return value) and will be folded into
@@ -5874,7 +5865,7 @@ async fn run_with_options_under_store_lock(
                     // URL value.
                     let sri = lpm_store::read_stored_integrity(&existing_path).unwrap_or_default();
                     let link_h = spawn_link(&p, None)?;
-                    // Phase 66 followup #6b — sibling-skip path. The
+                    // followup #6b — sibling-skip path. The
                     // v2 object dir was populated by the sibling's
                     // fetch task (or the sibling is in the middle of
                     // populating it; the per-key fetch lock above
@@ -5920,7 +5911,7 @@ async fn run_with_options_under_store_lock(
                     ));
                 }
 
-                // Phase 53 W6a — `acquire_owned` so the permit can be
+                // W6a — `acquire_owned` so the permit can be
                 // *moved* into the fetch fn and dropped between
                 // download and extract. The fn drops it as soon as
                 // bytes are on the heap (streaming) or on temp disk
@@ -5935,7 +5926,7 @@ async fn run_with_options_under_store_lock(
 
                 overall.set_message(format!("{}@{}", p.name, p.version));
 
-                // Phase 59.0 day-5b — Source::Tarball install packages
+                // day-5b — Source::Tarball install packages
                 // bypass the registry-routed legacy/streaming paths
                 // entirely. The URL is the source identity; the
                 // store path is content-addressable by integrity.
@@ -5981,18 +5972,18 @@ async fn run_with_options_under_store_lock(
                 };
                 let package_key: String = install_pkg_key(&p);
 
-                // Phase 39 P2b: spawn per-pkg link immediately — pkg is
+                //b: spawn per-pkg link immediately — pkg is
                 // now materialized. Runs on the blocking pool in parallel
                 // with sibling fetch tasks still downloading.
                 //
-                // Phase 59.0 day-5.5 audit fix (HIGH-1): pass the
+                // day-5.5 audit fix (HIGH-1): pass the
                 // freshly-computed SRI as override so Source::Tarball
                 // packages link from the integrity-keyed CAS path
                 // (the freshly-stored content), not the legacy
                 // registry slot. Registry sources ignore the override.
                 let link_h = spawn_link(&p, Some(&computed_sri))?;
 
-                // Phase 66 followup #6b — dispatch v2 link entry
+                // followup #6b — dispatch v2 link entry
                 // materialization on the blocking pool now that the
                 // tarball is extracted into `objects/<sri>/`. Runs in
                 // parallel with sibling fetch tasks still downloading
@@ -6036,7 +6027,7 @@ async fn run_with_options_under_store_lock(
         }
 
         // Collect computed integrity hashes and fold per-task timings into
-        // the aggregate breakdown. Phase 43: `fresh_urls` aggregates
+        // the aggregate breakdown. `fresh_urls` aggregates
         // the URL that actually served bytes for each (name, version),
         // so the writeback step at install-end can detect divergence
         // from the stored lockfile URL (stale-URL recovery) or from
@@ -6053,7 +6044,7 @@ async fn run_with_options_under_store_lock(
             if let Some(lh) = link_h {
                 event_link_handles.push(lh);
             }
-            // Phase 66 followup #6b — funnel v2 link handles emitted
+            // followup #6b — funnel v2 link handles emitted
             // by the fetch tasks into the same drain queue the cache-
             // hit branches above feed.
             if let Some(lh) = v2_link_h {
@@ -6070,7 +6061,7 @@ async fn run_with_options_under_store_lock(
             if let Some(sri) = integrity_map.get(&key) {
                 p.integrity = Some(sri.clone());
             }
-            // Phase 43 — update `InstallPackage.tarball_url` to the
+            // — update `InstallPackage.tarball_url` to the
             // URL that actually served bytes so the fresh-resolve
             // writer (at install-end) persists it. For the fast-path
             // case, this flows into the generalized writeback (see
@@ -6085,7 +6076,7 @@ async fn run_with_options_under_store_lock(
 
     let fetch_ms = fetch_start.elapsed().as_millis();
 
-    // Phase 39 P2: drain speculation AFTER the real fetch loop, not
+    //: drain speculation AFTER the real fetch loop, not
     // before. Spec tarballs for correctly-predicted versions were
     // consumed by the fetch coord's per-key lock (real fetch waited on
     // them and short-circuited). What remains in-flight here is spec
@@ -6094,7 +6085,7 @@ async fn run_with_options_under_store_lock(
     // handle so its atomics can be read into `spec_stats` for --json,
     // but it happens outside both `fetch_ms` and `link_ms` so stage
     // times are not inflated by wasted speculation tails.
-    // Phase 49 §6: walker summary is folded into
+    //: walker summary is folded into
     // `timing.resolve.streaming_bfs` in the JSON-output block below.
     // `None` on warm lockfile-fast-path installs (walker never ran).
     let walker_summary_final: Option<lpm_resolver::WalkerSummary> = if let Some(join) =
@@ -6102,7 +6093,7 @@ async fn run_with_options_under_store_lock(
     {
         let summary = join.drain(&mut spec_stats).await;
         if fusion_enabled {
-            // Phase 56 W2: fusion arm uses a no-op walker stub purely
+            //: fusion arm uses a no-op walker stub purely
             // to keep `WalkerJoin` shape uniform for the spec-dispatcher
             // drain. Its summary is the all-zero default — surfacing it
             // in `streaming_bfs` would mislead readers into thinking a
@@ -6138,8 +6129,7 @@ async fn run_with_options_under_store_lock(
         }
     }
 
-    // Step 4: link_targets — already built before the fetch loop (Phase 39
-    // P2b) so the event-driven path could dispatch per-pkg link work
+    // Step 4: link_targets — already built before the fetch loop (    //b) so the event-driven path could dispatch per-pkg link work
     // during fetch. No-op here to keep the surrounding structure stable.
     let _ = &link_targets; // retained for downstream consumers below
 
@@ -6148,10 +6138,10 @@ async fn run_with_options_under_store_lock(
     let spinner = make_spinner("Linking node_modules...");
 
     let link_result = if event_driven_link {
-        // Phase 39 P2b: event-driven path. Per-pkg Phase 1+2 tasks were
+        //b: event-driven path. Per-pkga future release2 tasks were
         // spawned inside the fetch loop and for each cached package
         // before the loop; await them here, aggregate counters, then
-        // run Phase 3+3.5+4 via `link_finalize`. `link_ms` measures
+        // runa future release3.5+4 via `link_finalize`. `link_ms` measures
         // only the tail: any per-pkg link task still running past
         // `fetch_ms` plus the final finalize pass. Well-overlapped
         // installs show a near-zero link_ms.
@@ -6186,9 +6176,9 @@ async fn run_with_options_under_store_lock(
             materialized: materialized_all,
         }
     } else if let Some(store_v2) = store_v2_handle.as_deref() {
-        // Phase 66 Phase 4b — v2 path with per-source routing.
+        // — v2 path with per-source routing.
         //
-        // Per the v2 preplan (§9), CAS-backed sources (Registry,
+        // Per the v2 preplan, CAS-backed sources (Registry,
         // Tarball remote+local, Git) flow through the v2 store +
         // link-entry materialization. Local-source kinds
         // (`Source::Directory` = `file:`, `Source::Link` = `link:`)
@@ -6243,7 +6233,7 @@ async fn run_with_options_under_store_lock(
             }
         }
 
-        // Phase 66 followup #6b — event-driven v2 path.
+        // followup #6b — event-driven v2 path.
         //
         // When `v2_event_driven` was true, `link_v2_prepare` already
         // ran above and per-package `link_v2_one` tasks were spawned
@@ -6368,7 +6358,7 @@ async fn run_with_options_under_store_lock(
     let link_ms = link_start.elapsed().as_millis();
     spinner.stop(format!("Linked in {link_ms}ms"));
 
-    // Phase 32 Phase 2 audit fix #3: link workspace member dependencies AFTER
+    // audit fix #3: link workspace member dependencies AFTER
     // the regular linker run. The linker's stale-symlink cleanup pass at the
     // top of `link_packages` would otherwise wipe these symlinks on every
     // install (they're not in `direct_names` because workspace members were
@@ -6382,11 +6372,11 @@ async fn run_with_options_under_store_lock(
         ));
     }
 
-    // **Phase 32 Phase 6 — `lpm patch` apply pass.**
+    // 
     //
     // Run AFTER both the regular linker pass AND the workspace-member
     // linker pass, so every materialized destination is in place. Run
-    // BEFORE the build-state capture (Phase 4) so the patched bytes
+    // BEFORE the build-state capture so the patched bytes
     // are what `lpm rebuild` and `lpm approve-scripts` see.
     //
     // Apply is unconditional even on the lockfile fast path: see the
@@ -6402,7 +6392,7 @@ async fn run_with_options_under_store_lock(
     // Step 6: Lifecycle script security audit + trusted script execution
     let policy = lpm_security::SecurityPolicy::from_package_json(&project_dir.join("package.json"));
 
-    // **Phase 32 Phase 4 M3:** capture the install-time blocked set into
+    // capture the install-time blocked set into
     // `<project_dir>/.lpm/build-state.json` so that:
     //   1. `lpm approve-scripts` doesn't have to re-walk the store on startup
     //   2. The post-install warning is suppressed when the blocked set is
@@ -6413,7 +6403,7 @@ async fn run_with_options_under_store_lock(
         .iter()
         .map(|p| (p.name.clone(), p.version.clone(), p.integrity.clone()))
         .collect();
-    // **Phase 46 P1 metadata plumbing:** enrich the captured
+    // enrich the captured
     // blocked-set with `published_at` and `behavioral_tags_hash` per
     // package, drawing from the registry metadata the resolver
     // already fetched (5-min TTL cache). On fresh resolutions this is
@@ -6431,7 +6421,7 @@ async fn run_with_options_under_store_lock(
         packages.len(),
         blocked_metadata_start.elapsed().as_millis()
     );
-    // **Phase 48 P0 sub-slice 6d follow-up.** Parse the project
+    // Parse the project
     // capability request + user bound ONCE per install so the
     // install-time blocked-set capture, the autoBuild trust check
     // below, and approve-scripts later all see the same canonical
@@ -6448,7 +6438,7 @@ async fn run_with_options_under_store_lock(
     let install_user_bound =
         crate::capability::UserBound::from_global_config(&install_capability_cfg);
 
-    // **Phase 46 slice 1 — resolve script-policy + preflight advisor
+    // **slice 1 — resolve script-policy + preflight advisor
     // BEFORE the blocked-set capture.**
     //
     // The capture writes to `.lpm/build-state.json`. If the advisor
@@ -6472,7 +6462,7 @@ async fn run_with_options_under_store_lock(
         &step10_script_policy_cfg,
     );
 
-    // Phase 46 P1: include integrity so the auto-build predicate's
+    //: include integrity so the auto-build predicate's
     // strict gate matches what `rebuild::run` will do. Same data
     // shape as `installed_with_integrity` above; named separately
     // because it's consumed by `all_scripted_packages_trusted`
@@ -6482,7 +6472,7 @@ async fn run_with_options_under_store_lock(
         .map(|p| (p.name.clone(), p.version.clone(), p.integrity.clone()))
         .collect();
 
-    // **Phase 46 slice 1 — install-time L4 advisor consumption.**
+    // 
     //
     // Preflight the configured advisor ONCE per run. Session stays
     // active only when:
@@ -6536,7 +6526,7 @@ async fn run_with_options_under_store_lock(
             None
         };
 
-    // **Phase 46 slice 1 — second-pass review fix.** Compute the
+    // Compute the
     // auto-build decision BEFORE the blocked-set capture so the
     // capture can condition the advisor-approval exclusion on
     // whether scripts will actually run this install.
@@ -6612,8 +6602,8 @@ async fn run_with_options_under_store_lock(
         capture_start.elapsed().as_millis()
     );
 
-    // Phase 46 P1: persist the current `trustedDependencies` as a
-    // snapshot so the NEXT install's diff (§4.2) has a baseline. Write
+    //: persist the current `trustedDependencies` as a
+    // snapshot so the NEXT install's diff has a baseline. Write
     // failures are non-fatal — an install that reached this point has
     // already succeeded as far as the user cares, and the worst-case
     // of a missing snapshot is "the next install's diff notice
@@ -6635,12 +6625,12 @@ async fn run_with_options_under_store_lock(
         );
     }
 
-    // Show build hint for packages with lifecycle scripts (Phase 25: two-phase model).
+    // Show build hint for packages with lifecycle scripts (two-phase model).
     // Scripts are NEVER executed during install — use `lpm rebuild` instead.
-    // **Phase 32 Phase 4 M3:** the hint is now gated on the blocked-set
+    // the hint is now gated on the blocked-set
     // fingerprint changing — repeated installs of the same blocked set are silent.
     //
-    // Phase 46 P2 Chunk 5: under `script-policy = "triage"`, the
+    // under `script-policy = "triage"`, the
     // multi-line hint is replaced by a single summary line showing
     // the per-tier blocked-set breakdown. `deny` and `allow` keep
     // the existing multi-line hint unchanged.
@@ -6665,14 +6655,14 @@ async fn run_with_options_under_store_lock(
                     )
                 );
             } else if effective_policy == crate::script_policy_config::ScriptPolicy::Allow {
-                // Phase 57: under Allow the install-time hint and its
+                // under Allow the install-time hint and its
                 // "Run `lpm approve-scripts`" guidance would mislead —
                 // auto-build is about to fire and run every scripted
                 // package per `widen_to_build_by_policy`'s Allow branch.
                 // Skipping the hint keeps the post-install output focused
                 // on what actually happens next (the rebuild::run output).
             } else {
-                // Phase 46 P1: include integrity so the hint's strict gate
+                //: include integrity so the hint's strict gate
                 // matches what `rebuild::run` will do. Previously we passed
                 // only (name, version) and the lenient name-only gate
                 // could show drifted rich bindings as trusted ✓.
@@ -6685,7 +6675,7 @@ async fn run_with_options_under_store_lock(
                     &all_pkgs,
                     &policy,
                     project_dir,
-                    // Phase 48 P0 sub-slice 6d follow-up — reuse
+                    // sub-slice 6d follow-up — reuse
                     // the already-parsed capability inputs from the
                     // earlier capture call so the hint's trust label
                     // matches what rebuild::run will actually do.
@@ -6696,7 +6686,7 @@ async fn run_with_options_under_store_lock(
                     "Run `lpm approve-scripts` to review and approve their lifecycle scripts.",
                 );
             }
-            // Phase 46 P7: per-package terse version-diff hints for any
+            //: per-package terse version-diff hints for any
             // blocked entry that has a prior-approved binding under the
             // same package name. Surfaces drift visibility BEFORE the
             // user enters approve-scripts (where C3's TUI shows the
@@ -6706,7 +6696,7 @@ async fn run_with_options_under_store_lock(
         }
     }
 
-    // Step 7: LPM-Native Intelligence (Phase 5)
+    // Step 7: LPM-Native Intelligence
     // Read strictness from package.json "lpm" config
     let strict_deps = pkg
         .lpm
@@ -6802,7 +6792,7 @@ async fn run_with_options_under_store_lock(
                 .map(|_| 50u32) // warn if below 50 when any strictness is set
                 .unwrap_or(30); // default: only warn below 30
 
-            // Phase 35 Step 6 fix (empty-bearer regression #1).
+            // Step 6 fix (empty-bearer regression #1).
             // Pre-fix this site constructed a fresh RegistryClient and
             // attached `crate::auth::get_token(...).unwrap_or_default()`,
             // which sent literal `Authorization: Bearer ` (empty value)
@@ -6835,7 +6825,7 @@ async fn run_with_options_under_store_lock(
                     .iter()
                     .map(|p| (p.name.clone(), p.version.clone(), p.is_lpm))
                     .collect();
-                // Phase 35 Step 6 fix (empty-bearer regression #2).
+                // Step 6 fix (empty-bearer regression #2).
                 // Same defect as the intelligence::check_install_quality
                 // site above; resolved the same way — use the injected
                 // client.
@@ -6875,7 +6865,7 @@ async fn run_with_options_under_store_lock(
                 .map(|(dep_name, dep_ver)| format!("{dep_name}@{dep_ver}"))
                 .collect();
 
-            // Phase 40 P2 — persist npm-alias edges as `[local, target]`
+            // — persist npm-alias edges as `[local, target]`
             // pairs. The matching `<local>@<version>` entry is already
             // in `dep_strings`; this map keys the alias target so the
             // warm-install path can rebuild `InstallPackage.aliases`
@@ -6886,13 +6876,13 @@ async fn run_with_options_under_store_lock(
                 .map(|(local, target)| [local.clone(), target.clone()])
                 .collect();
 
-            // **R2.5** — persist resolved peers per package as
+            // persist resolved peers per package as
             // `<peer_name>@<version>` strings (same shape as
             // `dependencies`). Sorted upstream by `format_solution` /
             // `into_resolved_packages`; copied verbatim. Empty for
             // packages without peers — the serde
             // `skip_serializing_if = "Vec::is_empty"` keeps lockfiles
-            // of pre-R2.5 projects byte-identical.
+            // of older projects byte-identical.
             let peer_strings: Vec<String> = p
                 .peers
                 .iter()
@@ -6907,7 +6897,7 @@ async fn run_with_options_under_store_lock(
                 dependencies: dep_strings,
                 alias_dependencies: alias_pairs,
                 peers: peer_strings,
-                // Phase 43 — persist the tarball URL the registry
+                // — persist the tarball URL the registry
                 // returned at resolve time so warm installs can skip
                 // the per-package metadata round-trip. Consumed by
                 // `try_lockfile_fast_path` through `evaluate_cached_url`.
@@ -6915,14 +6905,14 @@ async fn run_with_options_under_store_lock(
             });
         }
 
-        // Phase 40 P2 — persist the root-level alias map so warm
+        // — persist the root-level alias map so warm
         // installs can rebuild `node_modules/<local>/` symlinks
         // without re-resolving. The HashMap → BTreeMap conversion
         // gives deterministic serialized order, matching the
         // sort-by-name policy on `packages`.
         lockfile.root_aliases = root_aliases_for_lockfile(&packages, &deps);
 
-        // **R2.5** — persist the resolver's `ambient_peer_installs`
+        // persist the resolver's `ambient_peer_installs`
         // set so the warm-install fast path knows which canonicals
         // to surface as top-level node_modules entries. Without this,
         // `rm -rf node_modules && lpm install` from the lockfile
@@ -6947,7 +6937,7 @@ async fn run_with_options_under_store_lock(
             ));
         }
     } else if let Some(mut lockfile) = fast_path_lockfile.take() {
-        // Phase 43 generalized writeback (P43-2 Change 3). When the
+        // generalized writeback (P43-2 Change 3). When the
         // fast path ran, we skip the fresh-resolve writer above. But
         // two signals can still require a rewrite:
         //
@@ -6974,7 +6964,7 @@ async fn run_with_options_under_store_lock(
                 // Build the same compound key used during insertion
                 // ("name\x00version\x00source"). LockedPackage.source
                 // matches InstallPackage.source for all packages written
-                // in Phase 59+; pre-59 lockfiles have source=None but
+                //+; pre-59 lockfiles have source=None but
                 // fresh_urls will be empty for those warm installs.
                 let src = lp.source.as_deref().unwrap_or("");
                 let lp_key = {
@@ -7023,20 +7013,20 @@ async fn run_with_options_under_store_lock(
     // Step 10: Auto-build trusted packages (after lockfile is written)
     // Triggers when: --auto-build flag, lpm.scripts.autoBuild config,
     // ALL scripted packages are individually trusted, OR the effective
-    // policy is Allow (Phase 57 — `--yolo` / `--policy=allow` runs
+    // policy is Allow (— `--yolo` / `--policy=allow` runs
     // scripts at install time, matching npm/pnpm/bun semantics).
     //
-    // Phase 46 P1: consolidated into ScriptPolicyConfig so all four
+    //: consolidated into ScriptPolicyConfig so all four
     // script-related keys come from a single read.
     //
-    // Phase 46 slice 1 moved the script-policy resolution + advisor
+    // slice 1 moved the script-policy resolution + advisor
     // preflight UP to before the blocked-set capture (so approved
     // packages can be excluded from the persisted set). The
     // `step10_*` locals + `all_pkgs_for_build` + `advisor_session`
     // they produce are still in scope here; only the autoBuild
     // predicate + the rebuild::run call read them. No duplication.
 
-    // **Phase 48 P0 slice 4 + sub-slice 6c + Phase 46 slice 1
+    // **P0 slice 4 + sub-slice 6c + slice 1
     // review-fix.** `force_security_floor`, `all_trusted_for_auto_build`,
     // and `auto_build_attempted` are now computed BEFORE the
     // blocked-set capture (so the capture can condition the
@@ -7045,12 +7035,12 @@ async fn run_with_options_under_store_lock(
     // gate's interaction with this predicate still applies — see the
     // pre-capture computation above for details.
     if auto_build_attempted {
-        // Phase 46 P7: preflight version-diff cards for any green
+        //: preflight version-diff cards for any green
         // about to auto-execute that has a prior-approved binding
         // for a strictly-lesser version. Renders BEFORE `rebuild::run`
         // so the user sees the unified script-body diff and the
         // behavioral-tag delta BEFORE any code runs — satisfies the
-        // §11 P7 ship criterion 1 ("the exact added line before any
+        // ship criterion 1 ("the exact added line before any
         // execution"). No-ops for non-triage policies and json mode
         // (gates inside the helper).
         maybe_emit_pre_autobuild_version_diff_cards(
@@ -7072,7 +7062,7 @@ async fn run_with_options_under_store_lock(
             None,  // default timeout
             json_output,
             false, // not --deny-all
-            // Phase 46.1 rework (2026-05-11): forward the user's CLI
+            // rework : forward the user's CLI
             // sandbox-mode choice to the auto-build rebuild call.
             // When the user explicitly opts into strict, the
             // auto-build greens run under strict too. When the user
@@ -7099,7 +7089,7 @@ async fn run_with_options_under_store_lock(
         output::warn(&format!("Auto-build failed: {e}"));
     }
 
-    // Phase 46 P6 Chunk 4: post-auto-build §5.3 canonical pointer.
+    // post-auto-build canonical pointer.
     //
     // Under `script-policy = "triage"` the helper at build::run will
     // have run greens (per Chunks 2+3 + the `should_auto_build`
@@ -7114,9 +7104,9 @@ async fn run_with_options_under_store_lock(
     // JSON mode: per-entry `static_tier` enrichment below in the
     // JSON output block gives agents the machine-readable shape; no
     // extra line here. Non-JSON: one concise warn line. Neither
-    // changes exit semantics — install stays Ok, matching the §5.3
+    // changes exit semantics — install stays Ok, matching the
     // table's "0 (warning)" expectation across all three
-    // environments (see §5.3 rationale re:
+    // environments (see rationale re:
     // `install.rs:2361-2377`'s `warn`-wrapped auto-build contract).
     maybe_emit_post_auto_build_triage_pointer(
         auto_build_attempted,
@@ -7127,7 +7117,7 @@ async fn run_with_options_under_store_lock(
 
     let elapsed = start.elapsed();
 
-    // **Phase 32 Phase 5** — persist `.lpm/overrides-state.json`. Three
+    // persist `.lpm/overrides-state.json`. Three
     // cases:
     // 1. Override set is non-empty → write the fresh state (or, on the
     //    lockfile fast path, preserve the previously-recorded apply
@@ -7159,8 +7149,8 @@ async fn run_with_options_under_store_lock(
         tracing::warn!("failed to delete stale overrides-state.json: {e}");
     }
 
-    // **Phase 32 Phase 6** — persist `.lpm/patch-state.json`.
-    // Audit fix (2026-04-12): preserve the prior `applied` trace on
+    // persist `.lpm/patch-state.json`.
+    // Audit fix : preserve the prior `applied` trace on
     // idempotent reruns so `lpm graph --why` doesn't lose provenance
     // when an install does no work. See `persist_patch_state`.
     persist_patch_state(
@@ -7198,18 +7188,18 @@ async fn run_with_options_under_store_lock(
                 "fetch_ms": fetch_ms,
                 "link_ms": link_ms,
                 "total_ms": elapsed.as_millis(),
-                // Phase 40 P1/P3a: nested resolver breakdown.
+                // Nested resolver breakdown:
                 //
-                // P1 seeded this object with `platform_skipped`.
-                // P3a grows it with the cold-resolve substage
+                // seeded this object with `platform_skipped`.
+                // grows with the cold-resolve substage
                 // breakdown so consumers can attribute `resolve_ms`
                 // to a specific contributor before work starts on
-                // P3b (deeper worker walk) / P3c (parallel follow-
-                // ups) / P3d (slim batch response).
+                // (deeper worker walk) / (parallel follow-
+                // ups) /d (slim batch response).
                 //
                 // Field shape:
                 //   platform_skipped   — optional deps filtered by os/cpu (P1)
-                //   initial_batch_ms   — Phase 49: wall-clock from
+                //   initial_batch_ms   — wall-clock from
                 //                        orchestration start to the
                 //                        moment the resolver could begin
                 //                        solving (walker's roots_ready
@@ -7222,7 +7212,7 @@ async fn run_with_options_under_store_lock(
                 //                        as `pubgrub_ms`).
                 //   followup_rpc_ms    — metadata RPCs fired by the
                 //                        resolver's PubGrub callbacks
-                //                        (the P3b/P3c lever).
+                //                        (theb/P3c lever).
                 //   followup_rpc_count — count of those follow-up RPCs.
                 //   parse_ndjson_ms    — serde_json CPU time for
                 //                        follow-up batches (P3d lever).
@@ -7238,20 +7228,20 @@ async fn run_with_options_under_store_lock(
                     "initial_batch_ms": initial_batch_ms,
                     "followup_rpc_ms": resolver_stage_timing.followup_rpc_ms,
                     "followup_rpc_count": resolver_stage_timing.followup_rpc_count,
-                    // Phase 53 A1 — split formerly-conflated count into
+                    // A1 — split formerly-conflated count into
                     // walker-driven and escape-hatch buckets so
                     // operators can tell whether the walker covered the
                     // tree or the resolver picked up slack via direct
                     // fetches. Sum of these two equals followup_rpc_count.
                     //
-                    // Phase 56: zero on the fused dispatcher arm
+                    // zero on the fused dispatcher arm
                     // (`LPM_GREEDY_FUSION=1`); see `dispatcher.*`
-                    // below. Retained for one release; removed in W5.
+                    // below. Retained for one release; removed in.
                     "walker_rpc_count": resolver_stage_timing.walker_rpc_count,
                     "escape_hatch_rpc_count": resolver_stage_timing.escape_hatch_rpc_count,
                     "parse_ndjson_ms": resolver_stage_timing.parse_ndjson_ms,
                     "pubgrub_ms": resolver_stage_timing.pubgrub_ms,
-                    // Phase 56 — fused-dispatcher counters. Zero on the
+                    // — fused-dispatcher counters. Zero on the
                     // walker arm; non-zero under `LPM_GREEDY_FUSION=1`.
                     // Field shape:
                     //   rpc_count             — total metadata RPCs the
@@ -7272,7 +7262,7 @@ async fn run_with_options_under_store_lock(
                     //                           dispatcher (parity with
                     //                           pre-fusion `speculative`
                     //                           on the walker arm).
-                    //   peer_prefetch_count   — Phase 66 R2.4: speculative
+                    //   peer_prefetch_count   — speculative
                     //                           peer-manifest fetches
                     //                           dispatched concurrent with
                     //                           the regular dep walk.
@@ -7289,8 +7279,8 @@ async fn run_with_options_under_store_lock(
                         "peer_prefetch_count":
                             resolver_stage_timing.peer_prefetch_count,
                     },
-                    // Phase 49 §6: streaming-BFS observability per
-                    // preplan §5.6. Null on warm lockfile-fast-path
+                    //: streaming-BFS observability per
+                    // preplan. Null on warm lockfile-fast-path
                     // installs (walker never ran). Field shape:
                     //   walk_ms              — walker's metadata-producer
                     //                          window (from
@@ -7318,7 +7308,7 @@ async fn run_with_options_under_store_lock(
                     //                          walker either inserting or
                     //                          flipping `walker_done`
                     //                          (pre-49 wait-loop shape, or
-                    //                          a regression of the §5.1
+                    //                          a regression of the
                     //                          shutdown handshake).
                     //   cache_wait_walker_done_shortcuts
                     //                        — provider-side: wait-loop
@@ -7326,7 +7316,7 @@ async fn run_with_options_under_store_lock(
                     //                          walker terminated without
                     //                          inserting this key. The
                     //                          healthy outcome of the
-                    //                          §5.1 shutdown handshake:
+                    //                          shutdown handshake:
                     //                          a transient walker gap
                     //                          (e.g. older-version dep
                     //                          missed by newest-only
@@ -7339,7 +7329,7 @@ async fn run_with_options_under_store_lock(
                     //                          Healthy 0 when walker attached
                     //                          and keeps ahead of PubGrub.
                     //                          Non-zero = walker gap OR no
-                    //                          walker (pre-§5 shape with
+                    //                          walker (pre-shape with
                     //                          fetch_wait_timeout == ZERO).
                     //                          Compare against
                     //                          `cache_wait_walker_done_shortcuts`
@@ -7350,13 +7340,13 @@ async fn run_with_options_under_store_lock(
                     //   spec_tx_send_wait_ms — walker time blocked on
                     //                          `spec_tx.send().await`
                     //                          (dispatcher backpressure
-                    //                          canary per preplan §5.6).
+                    //                          canary per preplan).
                     //   max_depth            — deepest BFS level the walker
                     //                          walked (0 = roots only).
                     "streaming_bfs": walker_summary_final.as_ref().map(|s| {
-                        // Phase 54 W1 — per-BFS-level three-phase wall
+                        // — per-BFS-level three-phase wall
                         // breakdown. `total_ms − fetch_ms` per level is the
-                        // inter-fetch dead time that Phase 54 W2's
+                        // inter-fetch dead time that's
                         // continuous-stream walker is designed to eliminate.
                         // Empty when the walker did zero levels (warm-cache
                         // full hit). Built outside the outer json! macro so
@@ -7391,19 +7381,19 @@ async fn run_with_options_under_store_lock(
                         })
                     }),
                 },
-                // Phase 38 P0: sub-stage breakdown of the fetch pool. Zeroed
+                //: sub-stage breakdown of the fetch pool. Zeroed
                 // when everything is already in the store (lockfile fast path
                 // with warm cache). Field shape is the `FetchBreakdown` JSON
                 // contract documented on that struct.
                 "fetch_breakdown": fetch_breakdown.to_json(),
-                // Phase 43 — lockfile-cached URL gate telemetry. All
+                // — lockfile-cached URL gate telemetry. All
                 // counters zero when every stored URL passed (common
                 // case in steady state). `origin_mismatch > 0` is
                 // expected after `LPM_REGISTRY_URL` switches;
                 // `shape_mismatch > 0` is a BUG signal — the writer
                 // should never emit a gate-rejectable URL.
                 "tarball_url_gate": gate_stats.to_json(),
-                // Phase 38 P3 speculative-fetch stats. Zero when every
+                // speculative-fetch stats. Zero when every
                 // root is already in the store before the metadata RPC
                 // starts, or on the lockfile-fast-path. Field shape
                 // documented on `SpeculativeStats`.
@@ -7412,13 +7402,13 @@ async fn run_with_options_under_store_lock(
             "warnings": [],
             "errors": [],
         });
-        // Phase 32 Phase 2: surface workspace target set for agents.
+        // surface workspace target set for agents.
         // None for legacy/standalone callers; Some(...) for the filtered path.
         if let Some(targets) = target_set {
             json["target_set"] =
                 serde_json::Value::Array(targets.iter().map(|s| serde_json::json!(s)).collect());
         }
-        // Phase 32 Phase 2 audit fix #3: surface workspace member deps that
+        // audit fix #3: surface workspace member deps that
         // were linked locally instead of going through the registry.
         if !workspace_member_deps.is_empty() {
             json["workspace_members"] = serde_json::Value::Array(
@@ -7434,7 +7424,7 @@ async fn run_with_options_under_store_lock(
                     .collect(),
             );
         }
-        // **Phase 32 Phase 5:** surface the override apply trace. Empty
+        // surface the override apply trace. Empty
         // when no overrides were declared OR when the lockfile fast
         // path was taken (in which case the persisted state file holds
         // the most recent trace from a fresh resolve).
@@ -7459,7 +7449,7 @@ async fn run_with_options_under_store_lock(
         json["overrides_fingerprint"] =
             fingerprint_json_value(override_set.len(), override_set.fingerprint());
 
-        // **Phase 66 confidence-followup §1a** — best-effort peer-
+        // best-effort peer-
         // conflict reports as an ALWAYS-PRESENT array. Empty when the
         // peer graph is clean OR on the lockfile fast path (no fresh
         // resolve produces no fresh conflict trace). Field is
@@ -7485,8 +7475,8 @@ async fn run_with_options_under_store_lock(
                 .collect(),
         );
 
-        // **Phase 32 Phase 6** — surface the patch apply trace + counts.
-        // Audit fix (2026-04-12): filter to entries that ACTUALLY did
+        // surface the patch apply trace + counts.
+        // Audit fix : filter to entries that ACTUALLY did
         // work this run via `touched_anything()`. A no-op idempotent
         // rerun where every file already had the expected post-patch
         // bytes will report an empty `applied_patches` array — that's
@@ -7503,7 +7493,7 @@ async fn run_with_options_under_store_lock(
         json["patches_fingerprint"] =
             fingerprint_json_value(current_patches.len(), current_patch_fingerprint);
 
-        // **Phase 32 Phase 4 M3:** surface the install-time blocked set so
+        // surface the install-time blocked set so
         // agents and CI can drive `lpm approve-scripts` without re-scanning.
         json["blocked_count"] = serde_json::json!(blocked_capture.state.blocked_packages.len());
         json["blocked_set_changed"] = serde_json::json!(blocked_capture.should_emit_warning);
@@ -7511,7 +7501,7 @@ async fn run_with_options_under_store_lock(
             blocked_capture.state.blocked_packages.len(),
             blocked_capture.state.blocked_set_fingerprint.clone(),
         );
-        // Phase 46 P6 Chunk 4 + P7 Chunk 4: per-entry shape now
+        // + per-entry shape now
         // includes `static_tier` (P6) and `version_diff` (P7) via
         // the shared `version_diff::blocked_to_json` helper, which
         // is also the source of truth for the approve-scripts JSON
@@ -7532,7 +7522,7 @@ async fn run_with_options_under_store_lock(
         );
         println!("{}", serde_json::to_string_pretty(&json).unwrap());
     } else {
-        // **Phase 32 Phase 5** — print the override apply summary BEFORE
+        // print the override apply summary BEFORE
         // the success line so it doesn't get lost at the bottom of the
         // output. Only emit on the fresh-resolution path; the lockfile
         // fast path already had the summary printed during the
@@ -7567,8 +7557,8 @@ async fn run_with_options_under_store_lock(
             }
         }
 
-        // **Phase 32 Phase 6** — summary of applied patches. Mirrors
-        // the override summary above. **Audit fix (2026-04-12):** filter
+        // summary of applied patches. Mirrors
+        // the override summary above. **Audit fix :** filter
         // to entries that ACTUALLY did work this run (`touched_anything`)
         // so a no-op idempotent rerun doesn't print "Applied 1 patch"
         // with zero files. The patches are still in effect on disk
@@ -7627,16 +7617,16 @@ async fn run_with_options_under_store_lock(
     }
 
     // Write install-hash so `lpm dev` knows deps are up to date.
-    // Phase 34.1: uses the shared compute_install_hash from install_state.
-    // Must re-read because Phase 33 save semantics may have modified both
+    // uses the shared compute_install_hash from install_state.
+    // Must re-read because save semantics may have modified both
     // package.json and lpm.lock during install (e.g., replacing "*" with "^4.3.6").
     //
-    // Phase 44: delegated to `write_install_hash`, which also captures
+    // delegated to `write_install_hash`, which also captures
     // manifest mtimes into the v2 file format so the next up-to-date
     // check can take the mtime fast path.
     write_post_install_v6_hash(project_dir, linker_mode);
 
-    // Phase 66 Phase 4e — register the project in the machine-global
+    // — register the project in the machine-global
     // known-projects registry. `lpm cache prune` walks this set to
     // determine which v2-store link entries are reachable. Errors are
     // logged + dropped: the registry is non-load-bearing (prune
@@ -7649,7 +7639,7 @@ async fn run_with_options_under_store_lock(
         tracing::debug!("phase 4e: failed to register project in known-projects registry: {e}");
     }
 
-    // Phase 33 audit Finding 1 fix: surface the direct-dep version map
+    // audit Finding 1 fix: surface the direct-dep version map
     // for callers (`run_add_packages`, `run_install_filtered_add`) that
     // need to finalize a placeholder-staged manifest entry. The map
     // contains ONLY entries where `is_direct == true`, so transitive
@@ -7670,11 +7660,11 @@ async fn run_with_options_under_store_lock(
 /// - All packages with unbuilt scripts are individually trusted (per
 ///   strict binding / scope trust / capability gate). Triage policy
 ///   green-tier promotion lands here via `evaluate_trust`.
-/// - **Phase 57:** `effective_policy == ScriptPolicy::Allow`. The user
+/// - `effective_policy == ScriptPolicy::Allow`. The user
 ///   explicitly opted into "run all lifecycle scripts" via `--yolo`,
 ///   `--policy=allow`, `package.json > lpm > scriptPolicy = "allow"`,
 ///   or `~/.lpm/config.toml > script-policy = "allow"`. Today's
-///   pre-Phase-57 behavior required a SECOND `--auto-build` flag to
+///   pre-existing behavior required a SECOND `--auto-build` flag to
 ///   actually run the scripts; that two-step was an apples-to-oranges
 ///   gap vs `npm`/`pnpm`/`bun` (which all run scripts during install
 ///   by default) AND was redundant ceremony given the user already
@@ -7685,7 +7675,7 @@ async fn run_with_options_under_store_lock(
 /// `--auto-build` or `lpm approve-scripts` review. That asymmetry is
 /// intentional — Triage's gate IS the safety mechanism, and "run
 /// greens automatically without an explicit second consent" is the
-/// existing semantic that Phase 46 ships.
+/// existing semantic that ships.
 fn should_auto_build(
     auto_build_flag: bool,
     config_auto_build: bool,
@@ -7698,7 +7688,7 @@ fn should_auto_build(
         || effective_policy == crate::script_policy_config::ScriptPolicy::Allow
 }
 
-/// **Phase 46 slice 1 — second-pass review fix.** Decide what advisor
+/// Decide what advisor
 /// approval view (if any) should be forwarded to
 /// [`crate::build_state::capture_blocked_set_after_install_with_metadata`].
 ///
@@ -7743,7 +7733,7 @@ fn select_approvals_for_capture(
     }
 }
 
-/// Phase 46 P6 Chunk 4 — decision half of the post-auto-build §5.3
+/// — decision half of the post-auto-build
 /// canonical pointer. Pure — returns the message string to emit, or
 /// `None` when no pointer should fire. I/O lives in
 /// [`maybe_emit_post_auto_build_triage_pointer`] below.
@@ -7794,7 +7784,7 @@ fn compute_post_auto_build_triage_pointer(
     ))
 }
 
-/// Phase 46 P6 Chunk 4 — I/O half. See
+/// — I/O half. See
 /// [`compute_post_auto_build_triage_pointer`] for the decision
 /// contract.
 fn maybe_emit_post_auto_build_triage_pointer(
@@ -7813,7 +7803,7 @@ fn maybe_emit_post_auto_build_triage_pointer(
     }
 }
 
-/// **Phase 46 P7 — pure.** Compute per-package terse version-diff
+/// Compute per-package terse version-diff
 /// hints for the post-install blocked-set warning.
 ///
 /// Iterates `blocked_capture.state.blocked_packages`; for each entry
@@ -7846,14 +7836,14 @@ fn compute_post_install_version_diff_hints(
     hints
 }
 
-/// **Phase 46 P7 — I/O half.** Emit the per-package version-diff
+/// Emit the per-package version-diff
 /// hints from [`compute_post_install_version_diff_hints`] to stderr
 /// beneath the existing post-install blocked-set warning.
 ///
 /// Suppressed under `json_output=true` (C4 will enrich the JSON
 /// shape with a structured `version_diff` object per entry; the
 /// human lines on stdout would break `JSON.parse` on the machine
-/// channel — same stream-separation discipline as P6 Chunk 5).
+/// channel — same stream-separation discipline as structured JSON output).
 ///
 /// Reads `trustedDependencies` from `<project_dir>/package.json`.
 /// Fails gracefully on I/O / parse error: the diff hints are a
@@ -7877,8 +7867,8 @@ fn maybe_emit_post_install_version_diff_hints(
     if hints.is_empty() {
         return;
     }
-    // Stream-separation: stderr for human output. Matches the P6
-    // Chunk 5 fix (`eprintln!`) so `--json` consumers never see the
+    // Stream-separation: stderr for human output. Matches the
+    // fix (`eprintln!`) so `--json` consumers never see the
     // hints interleaved with machine output.
     eprintln!();
     eprintln!("  Changes since prior approval:");
@@ -7887,7 +7877,7 @@ fn maybe_emit_post_install_version_diff_hints(
     }
 }
 
-/// **Phase 46 P7 — I/O, pre-auto-build hook.** For greens about to
+/// For greens about to
 /// auto-execute under `script-policy = "triage"` + `autoBuild: true`,
 /// emit a unified-diff preflight card before any script runs.
 ///
@@ -7906,7 +7896,7 @@ fn maybe_emit_post_install_version_diff_hints(
 /// Iterates `blocked_capture.state.blocked_packages` and renders a
 /// preflight card for each entry that (a) classifies as `Green` tier
 /// (under triage+autoBuild, greens are what `rebuild::run` auto-
-/// promotes and executes per P6), and (b) has a prior binding for a
+/// promotes and executes per), and (b) has a prior binding for a
 /// strictly-lesser version via `latest_binding_for_name`. Under (a)
 /// the script will auto-execute imminently; under (b) there's
 /// something to diff against.
@@ -7939,12 +7929,12 @@ fn maybe_emit_pre_autobuild_version_diff_cards(
 
     let mut cards: Vec<String> = Vec::new();
     for bp in &blocked_capture.state.blocked_packages {
-        // Only greens auto-execute under triage+autoBuild per P6; the
+        // Only greens auto-execute under triage+autoBuild per; the
         // preflight card is scoped to that execution path because
         // amber/red will route through approve-scripts (C3) where the
         // full card renders anyway. Entries with `static_tier = None`
         // are treated as non-green (same conservative bias as the
-        // P2 `--yes` refusal gate: unknown tier → don't claim the
+        // `--yes` refusal gate: unknown tier → don't claim the
         // auto-execute path).
         if !matches!(
             bp.static_tier,
@@ -8011,12 +8001,12 @@ fn maybe_emit_pre_autobuild_version_diff_cards(
     eprintln!();
 }
 
-/// **Phase 46 P7 support.** Read `trustedDependencies` from the
+/// Read `trustedDependencies` from the
 /// project manifest without failing the install on malformed input.
 ///
 /// Returns `None` on any failure (missing file, unreadable,
 /// malformed JSON, absent key). Callers treat `None` as "no prior
-/// approvals to diff against" — the P7 enrichment is UX, not a
+/// approvals to diff against" — the enrichment is UX, not a
 /// gate, so the install pipeline must be tolerant.
 ///
 /// Reuses the same parsing shape the `approve_builds` command uses
@@ -8038,7 +8028,7 @@ fn read_trusted_deps_from_manifest(
     serde_json::from_value::<lpm_workspace::TrustedDependencies>(raw.clone()).ok()
 }
 
-/// **Phase 46 P1 metadata plumbing** — build the metadata map that
+/// build the metadata map that
 /// enriches [`crate::build_state::BlockedPackage`] entries with
 /// `published_at` (RFC 3339) and `behavioral_tags_hash` (SHA-256 over
 /// the sorted set of active behavioral tags).
@@ -8051,11 +8041,11 @@ fn read_trusted_deps_from_manifest(
 /// the captured fields stay `None` — documented graceful
 /// degradation (see [`crate::build_state::BlockedSetMetadata`]).
 ///
-/// **Phase 46 slice 1 helper.** Walk the install set, classify every
+/// Walk the install set, classify every
 /// lifecycle script through Layer 1, and emit one
 /// [`crate::triage_advisor_session::AmberPackageRequest`] per
 /// package that has at least one amber phase. Green-only packages
-/// auto-run via the existing P6 GreenTierUnderTriage path and don't
+/// auto-run via the existing GreenTierUnderTriage path and don't
 /// need an advisor call; red-only packages are hard-blocked
 /// regardless of the advisor; packages with no scripts have nothing
 /// to advise on.
@@ -8080,13 +8070,13 @@ fn collect_amber_classification_requests(
         if bodies.is_empty() {
             continue;
         }
-        // Phase 46b Lever #1 / #4 — read the package's `repository`
+        // Lever #1 / #4 — read the package's `repository`
         // URL from the same store package.json. Used both for the L4
         // advisor prompt (#1) and the L1 classifier widening (#4)
         // that converts delegate-to-local-file + matching identity
         // into Green.
         //
-        // Phase 46b Option B — feed the package's publish age + the
+        // Option B — feed the package's publish age + the
         // configured `minimum_release_age_secs` into the classifier
         // context so Lever #4's identity-match widening can apply
         // the cooldown defense-in-depth (refuses to widen recent
@@ -8124,7 +8114,7 @@ fn collect_amber_classification_requests(
         // downstream — required so an approval on one source cannot
         // leak to a sibling source in the same install.
         //
-        // Phase 46b Lever #3 — scan each amber phase body for files
+        // Lever #3 — scan each amber phase body for files
         // it delegates to and read them with the runbook's caps
         // (depth 1, ≤ 32 KB, safe-relative only, non-text rejected).
         // Deduplicate by filename across phases so a body that says
@@ -8164,17 +8154,17 @@ async fn build_blocked_set_metadata(
 ) -> crate::build_state::BlockedSetMetadata {
     let mut out = crate::build_state::BlockedSetMetadata::default();
 
-    // Phase 52 W2 — provenance capture moved out of install.
+    // — provenance capture moved out of install.
     //
     // Pre-W2: this function fetched per-package attestation bundles in
     // parallel and persisted the parsed snapshot into
     // `BlockedSetMetadataEntry.provenance_at_capture`, which approve-
     // scripts later forwarded into `TrustedDependencyBinding.
-    // provenance_at_approval`. Phase 52 W1b's `perf.prov_ns_split`
+    // provenance_at_approval`. W1b's `perf.prov_ns_split`
     // measured 99.98 % of that cost as HTTP (12.7 s summed across 24
     // permits → ~550 ms cold wall on the 266-pkg fixture, 0.02 % parse).
     //
-    // The empirical W2 finding (Phase 52 unblocker investigation) is
+    // The empirical finding (unblocker investigation) is
     // that the only end-consumer of `provenance_at_capture` is
     // `approve-scripts` — install reads it back from `build-state.json`
     // and copies it into the binding. Since `approve-scripts` is a
@@ -8189,7 +8179,7 @@ async fn build_blocked_set_metadata(
     // The `provenance_at_capture` field on `BlockedSetMetadataEntry`
     // is retained as `Option<>` for schema compat with persisted
     // build-state.json files — install always writes `None` here from
-    // Phase 52 W2 onward; approve-scripts ignores any value the field
+    // onward; approve-scripts ignores any value the field
     // may carry. Future cleanup may remove the field entirely after a
     // transition window.
     //
@@ -8236,7 +8226,7 @@ async fn build_blocked_set_metadata(
                 Err(_) => None,
             }
         } else {
-            // Phase 58 day-4.5 follow-up: route via RouteTable so
+            // day-4.5 follow-up: route via RouteTable so
             // blocked-set metadata capture for custom-registry
             // packages doesn't fall through to public npm.
             let route = route_table.route_for_package(&p.name);
@@ -8255,10 +8245,10 @@ async fn build_blocked_set_metadata(
         // canonical form. `active_tag_names` returns sorted canonical
         // names; `hash_behavioral_tag_set` hashes them deterministically.
         //
-        // Phase 46 P7: also persist the raw name set alongside the hash.
+        //: also persist the raw name set alongside the hash.
         // The hash gives the version-diff fast equality / fingerprint;
         // the names enable rendering the *delta* (`gained network, eval`)
-        // without a registry re-fetch — required by §11 P7 ship
+        // without a registry re-fetch — required by ship
         // criterion 2 and lets the diff work offline. Both are computed
         // from the same `active_tag_names()` call so they cannot drift.
         let (behavioral_tags_hash, behavioral_tags) = meta
@@ -8284,7 +8274,7 @@ async fn build_blocked_set_metadata(
                     published_at,
                     behavioral_tags_hash,
                     behavioral_tags,
-                    // Phase 52 W2: install no longer captures
+                    //: install no longer captures
                     // provenance; approve-scripts fetches at approval
                     // time. Field retained for schema compat.
                     provenance_at_capture: None,
@@ -8307,7 +8297,7 @@ async fn build_blocked_set_metadata(
         out.insert(name, version, e);
     }
 
-    // Permanent perf diagnostic. Phase 52 W2 dropped the `prov_sum_ms`
+    // Permanent perf diagnostic. dropped the `prov_sum_ms`
     // dimension — install no longer fetches provenance, so the field
     // would always be `0` and adding noise to the line. The
     // `perf.prov_ns_split` line is correspondingly removed.
@@ -8319,7 +8309,7 @@ async fn build_blocked_set_metadata(
     out
 }
 
-// Phase 34.1: is_install_up_to_date() moved to crate::install_state::check_install_state()
+// is_install_up_to_date() moved to crate::install_state::check_install_state()
 
 /// Try to use the lockfile as a fast path.
 ///
@@ -8330,10 +8320,10 @@ async fn build_blocked_set_metadata(
 ///
 /// The parsed `Lockfile` is returned alongside the install packages so
 /// the install driver can patch `LockedPackage.tarball` and re-emit
-/// the lockfile on the generalized-writeback path (Phase 43 P43-2
+/// the lockfile on the generalized-writeback path (P43-2
 /// Change 3) without re-parsing. The `needs_binary_upgrade` flag
 /// tells the driver whether a rewrite is needed even when no URL
-/// diverged (e.g., pre-Phase-43 v1 `lpm.lockb` on disk, or missing
+/// diverged (e.g., pre-existing v1 `lpm.lockb` on disk, or missing
 /// entirely — migration completes on first fast-path install
 /// instead of being deferred to the next fresh resolve).
 /// Return type for [`try_lockfile_fast_path`]. Carries the parsed
@@ -8356,15 +8346,14 @@ struct LockfileFastPath {
     needs_binary_upgrade: bool,
 }
 
-/// **R2.5 fix-1** — gate that decides whether a fast-path lockfile
+/// gate that decides whether a fast-path lockfile
 /// candidate must be discarded in favor of a fresh resolve so the
-/// pre-R2.5 ambient-peer hole gets repaired.
+/// the ambient-peer hole gets repaired.
 ///
-/// **The hole.** R2.2 through R2.4 builds auto-installed missing
+/// The historical bug: auto-installed missing
 /// required peers but did not persist `ambient-peer-installs` or
-/// per-package `peers` to the lockfile (R2.5 added both fields).
-/// A user upgrading from one of those builds to R2.5+ has a v1
-/// lockfile that LOOKS legal under the new schema (the new fields
+/// per-package `peers` to the lockfile.
+/// A user upgrading from one of those builds to/// lockfile that LOOKS legal under the new schema (the new fields
 /// have `#[serde(default)]`) but is silently missing data the v2
 /// linker needs to reproduce the cold-install tree. Without this
 /// gate, `rm -rf node_modules && lpm install` would replay the v1
@@ -8391,13 +8380,13 @@ fn lockfile_needs_r25_repair(lockfile: &lpm_lockfile::Lockfile, auto_install_pee
 fn try_lockfile_fast_path(
     lockfile_path: &Path,
     deps: &HashMap<String, String>,
-    // Phase 43 — the URL-reuse gate needs the client to check
+    // — the URL-reuse gate needs the client to check
     // origin (`is_configured_origin`) and the shared `GateStats`
     // to bump mismatch counters. Both passed by ref; the fast
     // path runs synchronously so no Arc is needed here.
     client: &RegistryClient,
     gate_stats: &GateStats,
-    // **Phase 59.1 audit response (round 6)** — when `true`, the
+    // when `true`, the
     // `is_safe_source` check is downgraded from "skip fast path"
     // to "warn and accept" for non-registry sources. Online installs
     // MUST keep the safety gate strict because the fast-path bypasses
@@ -8415,7 +8404,7 @@ fn try_lockfile_fast_path(
         return None;
     }
 
-    // Phase 43 — probe the binary lockfile state so the driver can
+    // — probe the binary lockfile state so the driver can
     // decide whether to trigger a writeback for migration purposes
     // even when no URL diverged. `lpm.lockb` missing OR opened with
     // `UnsupportedVersion` → needs rewrite. Other errors (structural
@@ -8461,7 +8450,7 @@ fn try_lockfile_fast_path(
         }
     }
 
-    // Phase 40 P2 — verify every declared root dep has a lockfile
+    // — verify every declared root dep has a lockfile
     // entry. For aliased roots, check the ALIAS TARGET (looked up via
     // `lockfile.root_aliases`) rather than the alias key, since the
     // lockfile is keyed by canonical registry names.
@@ -8498,7 +8487,7 @@ fn try_lockfile_fast_path(
     // the warm-install layout matches the fresh-install layout
     // byte-for-byte.
     //
-    // **Phase 59.0 day-7 (F1 finish-line):** keyed by PackageKey
+    // keyed by PackageKey
     // (name, version, source_id) to match the fresh-resolve loop's
     // bookkeeping. In 59.0 this map is *defensively* future-proofed:
     // the warm-install path only fires when `is_safe_source` accepts
@@ -8506,7 +8495,7 @@ fn try_lockfile_fast_path(
     // sources today (see [`lpm_lockfile::is_safe_source`] + the
     // gate at ~line 4488), so any lockfile containing a tarball-URL
     // entry falls back to fresh-resolve. Once `is_safe_source` is
-    // taught about non-Registry sources (Phase 59.0.x or 59.1), the
+    // taught about non-Registry sources (or 59.1), the
     // PackageKey-based lookups in this loop are already correct.
     //
     // Key is "name\x00version" (compound string) to avoid allocating a
@@ -8535,10 +8524,10 @@ fn try_lockfile_fast_path(
                 .push(local.clone());
         }
     }
-    // **R2.5** — surface lockfile-recorded ambient peer installs
+    // surface lockfile-recorded ambient peer installs
     // (auto-installed peers from the cold resolve) at the project's
     // top-level `node_modules/<peer>/`. Without this, a warm install
-    // from a lockfile produced by an R2.2+ cold resolve would skip
+    // from an older lockfile without peer tracking would skip
     // the auto-installed peer entirely (it's not in
     // `pkg.dependencies` so `deps.keys()` above never visits it),
     // leaving react-redux unable to resolve its `react` peer at
@@ -8581,7 +8570,7 @@ fn try_lockfile_fast_path(
                 })
                 .collect();
 
-            // Phase 40 P2 — restore per-package alias map from the
+            // — restore per-package alias map from the
             // lockfile's `alias-dependencies` entries.
             let aliases: HashMap<String, String> = lp
                 .alias_dependencies
@@ -8589,7 +8578,7 @@ fn try_lockfile_fast_path(
                 .map(|pair| (pair[0].clone(), pair[1].clone()))
                 .collect();
 
-            // **R2.5** — restore per-package peer pinning from the
+            // restore per-package peer pinning from the
             // lockfile. Same string shape as `dependencies`:
             // `<peer_name>@<version>`. Empty for packages without
             // peer dependencies (most of the tree). Load-bearing for
@@ -8601,12 +8590,12 @@ fn try_lockfile_fast_path(
             // an entry with an unrelated project that happens to
             // have matching dep edges + empty peers).
             //
-            // Pre-R2.5 lockfiles have no `peers = [...]` field; serde
+            // Older lockfiles have no `peers = [...]` field; serde
             // defaults to empty Vec. The first warm install on such
             // a lockfile reconstructs with empty peers, which
             // happens to match what the v2 linker would have
             // produced under the empty-peer-context graph key — same
-            // wrong-but-self-consistent shape as before R2.5.
+            // wrong-but-self-consistent shape as before.
             // Re-running a fresh resolve writes the peers field and
             // upgrades the project to the correct shape.
             let peers: Vec<(String, String)> = lp
@@ -8640,7 +8629,7 @@ fn try_lockfile_fast_path(
                 is_lpm,
                 peers,
                 integrity: lp.integrity.clone(),
-                // Phase 43 — gate a stored URL against scheme/shape/
+                // — gate a stored URL against scheme/shape/
                 // origin before reusing it. Any rejection downgrades
                 // to `None`, which forces on-demand lookup against
                 // the current registry.
@@ -8702,7 +8691,7 @@ fn try_lockfile_fast_path(
     })
 }
 
-/// Phase 40 P2 — rebuild the root-level alias map from `packages`
+/// — rebuild the root-level alias map from `packages`
 /// for lockfile persistence. Walks each package's `root_link_names`;
 /// any local name that differs from the package's canonical name is
 /// an alias declaration (e.g., `strip-ansi-cjs` on a `strip-ansi`
@@ -8727,7 +8716,7 @@ fn root_aliases_for_lockfile(
 
 /// Convert resolver output to InstallPackage list.
 ///
-/// Phase 40 P2 — the `root_aliases` map (from the resolver's
+/// — the `root_aliases` map (from the resolver's
 /// `ResolveResult`) is used to (1) compute `is_direct` for aliased
 /// root deps whose canonical name does NOT appear in `deps.keys()`
 /// (the pre-P2 `deps.contains_key(&name)` missed these) and (2)
@@ -8736,7 +8725,7 @@ fn root_aliases_for_lockfile(
 /// filled in later in the install pipeline, since they require
 /// matching resolved versions against the root `deps` map.
 ///
-/// **Phase 66 R2.2** — `ambient_peer_installs` carries the canonical
+/// `ambient_peer_installs` carries the canonical
 /// names the resolver synthesized as ambient root-scoped installs to
 /// satisfy unmet required peers (auto-install). They are NOT in
 /// `deps` (the user's `package.json > dependencies`), but they MUST
@@ -8753,9 +8742,9 @@ fn resolved_to_install_packages(
     resolved: &[ResolvedPackage],
     deps: &HashMap<String, String>,
     root_aliases: &HashMap<String, String>,
-    // Phase 66 R2.2 — see doc above.
+    // (see function doc)
     ambient_peer_installs: &[String],
-    // Phase 59.0 (post-review) — supplied so the source string
+    // (post-review) — supplied so the source string
     // reflects the actual registry the package was fetched from
     // (`.npmrc`-mapped private mirrors, etc.) rather than a
     // hardcoded npmjs.org. Day-4.5 motivated source_id by URL for
@@ -8815,7 +8804,7 @@ fn resolved_to_install_packages(
                 .push(local.clone());
         }
     }
-    // **R2.2** — ambient peer installs also need top-level link
+    // Ambient peer installs also need top-level link
     // entries so `node_modules/<peer>/` resolves at runtime. Unioned
     // here rather than in `deps` so `is_direct` (above) stays false
     // for them — same key shape, separate provenance.
@@ -8836,15 +8825,13 @@ fn resolved_to_install_packages(
         locals.sort();
     }
 
-    // **Phase 41 dedup.** The resolver can emit multiple `ResolvedPackage`
-    // rows for the same `(canonical_name, version)` tuple when Phase 40
-    // P4 splits a subtree for multi-version peer-dep resolution: each
+    // The resolver can emit multiple `ResolvedPackage`
+    // rows for the same `(canonical_name, version)` tuple when     // splits a subtree for multi-version peer-dep resolution: each
     // split scope produces its own row differing only in
     // `ResolverPackage::context`. `canonical_name()` strips that context,
     // so every split collapses to the same `InstallPackage`. Without
     // this dedup, downstream stages receive N identical rows for one
-    // physical package, which in turn produced N concurrent Phase 3
-    // root-symlink creations in `link_finalize` and raced on
+    // physical package, which in turn produced N concurrent     // root-symlink creations in `link_finalize` and raced on
     // `std::os::unix::fs::symlink` — leaving whichever thread lost to
     // abort the install with `EEXIST`.
     //
@@ -8868,7 +8855,7 @@ fn resolved_to_install_packages(
                 return None;
             }
             let is_lpm = r.package.is_lpm();
-            // Phase 59.0 (post-review): derive the wire-format source
+            // (post-review): derive the wire-format source
             // string from the active route table, so a `.npmrc`-mapped
             // private mirror gets filed under its real URL.
             let registry_url = registry_source_url_for(&name, route_table);
@@ -8884,7 +8871,7 @@ fn resolved_to_install_packages(
                 root_link_names,
                 is_direct: direct_target_names.contains(&name),
                 is_lpm,
-                // Phase 66 §2.5 — peer-context threading. The resolver
+                // — peer-context threading. The resolver
                 // intersected this package's declared peers against
                 // the install set; carry the resulting
                 // `(peer_name, version)` list straight through.
@@ -8912,7 +8899,7 @@ async fn run_link_and_finish(
     linker_mode: lpm_linker::LinkerMode,
     force: bool,
     workspace_member_deps: &[WorkspaceMemberLink],
-    // Phase 46 P2 Chunk 5: same CLI-side policy override as
+    // same CLI-side policy override as
     // [`run_with_options`]. Reached via the lockfile fast path when
     // `run_with_options` short-circuits resolution; both paths must
     // render the same triage summary line when the effective policy
@@ -8920,11 +8907,11 @@ async fn run_link_and_finish(
     script_policy_override: Option<crate::script_policy_config::ScriptPolicy>,
 ) -> Result<(), LpmError> {
     let store = PackageStore::default_location()?;
-    // Phase 66 confidence-followup S5b — same hoist as `run_with_options`;
+    // confidence-followup S5b — same hoist as `run_with_options`;
     // post-install helpers route through `find_installed_package_baseline`.
     let lpm_root = lpm_common::LpmRoot::from_env()?;
 
-    // **Phase 66 confidence-followup F1.** Mirror of the online-arm
+    // Mirror of the online-arm
     // hoist: pre-resolve the per-target patch fingerprint map before
     // building LinkTargets so v2's GraphKey can fold patch identity
     // into the link-entry directory. The drift gate in
@@ -8942,7 +8929,7 @@ async fn run_link_and_finish(
     let link_targets: Vec<LinkTarget> = packages
         .iter()
         .map(|p| -> Result<LinkTarget, LpmError> {
-            // Phase 59.0 (post-review) + 59.1 day-3: typed-error path
+            // (post-review) + 59.1 day-3: typed-error path
             // for the source-aware store path. See `run_with_options`
             // for the same conversion in the cold-resolve link batch.
             Ok(LinkTarget {
@@ -8977,7 +8964,7 @@ async fn run_link_and_finish(
     };
     let link_ms = link_start.elapsed().as_millis();
 
-    // Phase 32 Phase 2 audit fix #3: link workspace member dependencies AFTER
+    // audit fix #3: link workspace member dependencies AFTER
     // the regular linker run. Same rationale as the online path — see
     // `run_with_options`. Offline mode does not write a lockfile entry for
     // workspace members because they're never resolved through the registry.
@@ -8989,7 +8976,7 @@ async fn run_link_and_finish(
         ));
     }
 
-    // **Phase 32 Phase 6 — apply patches in offline mode too.**
+    // 
     // Mirror of the online path. The drift gate already ran in
     // `run_with_options` BEFORE this function was reached, so any
     // declared patch is guaranteed to match the previously-recorded
@@ -9019,13 +9006,13 @@ async fn run_link_and_finish(
     // This matches the online install path exactly.
     let policy = lpm_security::SecurityPolicy::from_package_json(&project_dir.join("package.json"));
 
-    // **Phase 32 Phase 4 M3:** capture the install-time blocked set into
+    // capture the install-time blocked set into
     // build-state.json. Same wiring as the online path — see comment there.
     let installed_with_integrity: Vec<(String, String, Option<String>)> = packages
         .iter()
         .map(|p| (p.name.clone(), p.version.clone(), p.integrity.clone()))
         .collect();
-    // **Phase 48 P0 sub-slice 6d follow-up.** Parse the project
+    // Parse the project
     // capability request + user bound so the offline / lockfile-
     // fast-path install also catches capability-widening packages.
     // The online path above does the same at install.rs:2369;
@@ -9038,7 +9025,7 @@ async fn run_link_and_finish(
             .map_err(|e| LpmError::Registry(format!("{e}")))?;
     let offline_user_bound =
         crate::capability::UserBound::from_global_config(&offline_capability_cfg);
-    // Phase 46 slice 1 — the fast-path / offline install does NOT
+    // slice 1 — the fast-path / offline install does NOT
     // run the L4 advisor (scope was tightened to the online install
     // path). `None` passes through `compute_blocked_packages_with_metadata`
     // unchanged for this call.
@@ -9053,7 +9040,7 @@ async fn run_link_and_finish(
         None,
     )?;
 
-    // Phase 46 P1: snapshot write on the fast path too — a warm
+    //: snapshot write on the fast path too — a warm
     // install that only changed `trustedDependencies` (not deps)
     // would otherwise skip the update and leave the next install
     // comparing against stale state. Non-fatal on failure.
@@ -9074,7 +9061,7 @@ async fn run_link_and_finish(
         );
     }
 
-    // Phase 46 P2 Chunk 5: mirrors the `run_with_options`
+    // mirrors the `run_with_options`
     // branching — under triage, emit the single-line summary;
     // under deny/allow, show the legacy multi-line hint.
     if !json_output && blocked_capture.should_emit_warning {
@@ -9098,14 +9085,14 @@ async fn run_link_and_finish(
                     )
                 );
             } else if effective_policy == crate::script_policy_config::ScriptPolicy::Allow {
-                // Phase 57: under Allow the install-time hint and its
+                // under Allow the install-time hint and its
                 // "Run `lpm approve-scripts`" guidance would mislead —
                 // auto-build is about to fire and run every scripted
                 // package per `widen_to_build_by_policy`'s Allow branch.
                 // Skipping the hint keeps the post-install output focused
                 // on what actually happens next (the rebuild::run output).
             } else {
-                // Phase 46 P1: include integrity so the hint's strict gate
+                //: include integrity so the hint's strict gate
                 // matches what `rebuild::run` will do. Previously we passed
                 // only (name, version) and the lenient name-only gate
                 // could show drifted rich bindings as trusted ✓.
@@ -9118,7 +9105,7 @@ async fn run_link_and_finish(
                     &all_pkgs,
                     &policy,
                     project_dir,
-                    // Phase 48 P0 sub-slice 6d follow-up — reuse
+                    // sub-slice 6d follow-up — reuse
                     // the offline-path capability inputs parsed
                     // earlier at the capture call site.
                     &offline_requested_capabilities,
@@ -9128,7 +9115,7 @@ async fn run_link_and_finish(
                     "Run `lpm approve-scripts` to review and approve their lifecycle scripts.",
                 );
             }
-            // Phase 46 P7: terse version-diff hints per blocked entry
+            //: terse version-diff hints per blocked entry
             // with a prior binding. Mirrors the run_with_options
             // site; same stream-separation discipline.
             maybe_emit_post_install_version_diff_hints(project_dir, &blocked_capture, json_output);
@@ -9137,12 +9124,12 @@ async fn run_link_and_finish(
 
     let elapsed = start.elapsed();
 
-    // **Phase 32 Phase 6** — persist patch state in offline mode too.
+    // persist patch state in offline mode too.
     // The drift gate already ran in `run_with_options`, so reaching
     // this point means the on-disk state file (if any) matches the
     // current parsed map fingerprint, OR both sides are empty.
     //
-    // **Audit fix (2026-04-12):** re-read the prior state here so the
+    // **Audit fix :** re-read the prior state here so the
     // persist helper can preserve the prior `applied` trace on
     // idempotent reruns (the alternative — passing it down from
     // `run_with_options` — would require threading the value through
@@ -9192,7 +9179,7 @@ async fn run_link_and_finish(
             "warnings": [],
             "errors": [],
         });
-        // Phase 32 Phase 2 audit fix #3: surface workspace member deps that
+        // audit fix #3: surface workspace member deps that
         // were linked locally instead of going through the registry.
         if !workspace_member_deps.is_empty() {
             json["workspace_members"] = serde_json::Value::Array(
@@ -9208,8 +9195,8 @@ async fn run_link_and_finish(
                     .collect(),
             );
         }
-        // **Phase 32 Phase 6** — surface applied_patches in offline mode.
-        // Audit fix (2026-04-12): use the filtered summary so a no-op
+        // surface applied_patches in offline mode.
+        // Audit fix : use the filtered summary so a no-op
         // idempotent rerun reports an empty array.
         json["applied_patches"] = applied_patches_to_json(&applied_patches_summary, project_dir);
         json["patches_count"] = serde_json::json!(current_patches.len());
@@ -9217,7 +9204,7 @@ async fn run_link_and_finish(
             current_patches.len(),
             patch_state::compute_fingerprint(&current_patches),
         );
-        // **Phase 32 Phase 4 M3:** surface the install-time blocked set so
+        // surface the install-time blocked set so
         // agents and CI can drive `lpm approve-scripts` without re-scanning.
         // Mirrors the online path.
         json["blocked_count"] = serde_json::json!(blocked_capture.state.blocked_packages.len());
@@ -9226,7 +9213,7 @@ async fn run_link_and_finish(
             blocked_capture.state.blocked_packages.len(),
             blocked_capture.state.blocked_set_fingerprint.clone(),
         );
-        // Phase 46 P6 Chunk 4 + P7 Chunk 4: per-entry shape now
+        // + per-entry shape now
         // includes `static_tier` (P6) and `version_diff` (P7) via
         // the shared `version_diff::blocked_to_json` helper —
         // mirrors the run_with_options site above. See that site's
@@ -9242,8 +9229,8 @@ async fn run_link_and_finish(
         );
         println!("{}", serde_json::to_string_pretty(&json).unwrap());
     } else {
-        // **Phase 32 Phase 6** — patch summary in human mode.
-        // Audit fix (2026-04-12): use the filtered summary so a no-op
+        // patch summary in human mode.
+        // Audit fix : use the filtered summary so a no-op
         // idempotent rerun does NOT print "Applied 1 patch" with zero
         // files.
         if !applied_patches_summary.is_empty() {
@@ -9290,7 +9277,7 @@ async fn run_link_and_finish(
     Ok(())
 }
 
-/// Phase 38 P3: pick the highest version in a `PackageMetadata` that
+///: pick the highest version in a `PackageMetadata` that
 /// satisfies the given npm range string. Returns the concrete
 /// `(version, tarball_url, integrity)` tuple so the caller can dispatch
 /// a speculative download without waiting for PubGrub.
@@ -9341,7 +9328,7 @@ fn pick_speculative_version(
     Some((v_str.to_string(), url, integrity))
 }
 
-/// Phase 38 P3 / Phase 39 P3: stream metadata AND dispatch speculative
+/// /: stream metadata AND dispatch speculative
 /// downloads in parallel with NDJSON arrival. Returns the same complete
 /// metadata `HashMap` that `batch_metadata_deep` would — callers are
 /// semantically identical to the non-speculative path.
@@ -9352,21 +9339,21 @@ fn pick_speculative_version(
 /// version than our naive range-match) cost one wasted tarball each;
 /// the wrong version sits in the store until GC reclaims it.
 ///
-/// **Phase 39 P3 scope:** transitive speculation. Roots seed a
+/// transitive speculation. Roots seed a
 /// work queue; as each package's manifest arrives, its chosen version's
 /// dependencies are expanded onto the queue (capped at
 /// [`SPECULATION_MAX_DEPTH`]). Conflict-free trees (95%+ of real-world
 /// shape per npm data) see every downloaded package match what PubGrub
 /// ultimately picks. Pathological cases that mismatch still converge
 /// correctly via the real fetch loop.
-/// Phase 49 replacement for `SpeculativeJoin`. Bundles the still-live
+/// replacement for `SpeculativeJoin`. Bundles the still-live
 /// walker + dispatcher `JoinHandle`s plus the dispatcher's atomic
 /// counters so `drain` at the post-fetch point returns a
 /// `WalkerSummary` and folds speculation stats into the report shape.
 ///
 /// Invariant: both `walker` and `dispatcher` are UNAWAITED at construction.
 /// Awaiting either before `drain()` consumes the handle and makes the
-/// post-fetch drain a no-op — the very bug preplan §5.3 warns about.
+/// post-fetch drain a no-op — the very bug preplan warns about.
 struct WalkerJoin {
     walker: tokio::task::JoinHandle<Result<lpm_resolver::WalkerSummary, lpm_resolver::WalkerError>>,
     dispatcher: tokio::task::JoinHandle<()>,
@@ -9384,7 +9371,7 @@ impl WalkerJoin {
     /// into `stats`. Consumes `self` so the handles can only be
     /// drained once.
     ///
-    /// Phase 49: `stats.streaming_batch_ms` is read from the walker's
+    /// `stats.streaming_batch_ms` is read from the walker's
     /// own self-measured `walker_wall_ms` (captured inside the walker
     /// task from `run()` entry to its return). Using `started_at.elapsed()`
     /// at drain-call time measures "spawn → drain," which includes
@@ -9419,7 +9406,7 @@ impl WalkerJoin {
     }
 }
 
-/// Bundle of dispatcher atomic counters. Phase 49 split-out: the walker
+/// Bundle of dispatcher atomic counters. split-out: the walker
 /// owns roots-ready signalling; the dispatcher owns speculation counters.
 struct DispatcherCounters {
     dispatched: Arc<std::sync::atomic::AtomicU64>,
@@ -9431,12 +9418,12 @@ struct DispatcherCounters {
     unresolved_parked: Arc<std::sync::atomic::AtomicU64>,
 }
 
-/// Phase 49: spawn the speculation dispatcher as a standalone task.
+/// spawn the speculation dispatcher as a standalone task.
 /// Consumes `(name, PackageMetadata)` frames from `rx` (fed by the
 /// walker) and issues tarball prefetches against the work queue + root
 /// range set. Extraction is refactor-only vs pre-49
 /// `run_deep_batch_with_speculation` — the dispatcher body is
-/// unchanged except that the W2 `roots_ready_tx` logic is gone (walker
+/// unchanged except that the `roots_ready_tx` logic is gone (walker
 /// fires roots-ready now; the dispatcher is just a pure consumer).
 #[allow(clippy::too_many_arguments)] // design-level: dispatcher takes the full per-install state
 fn spawn_speculation_dispatcher(
@@ -9447,7 +9434,7 @@ fn spawn_speculation_dispatcher(
     semaphore: Arc<Semaphore>,
     coord: Arc<FetchCoordinator>,
     deps: HashMap<String, String>,
-    // Phase 66 §4 — under v2 mode the dispatcher routes downloaded
+    // — under v2 mode the dispatcher routes downloaded
     // bytes through `v2::Store::extract_object_from_bytes` instead of
     // v1's per-`(name, version)` slot. `None` keeps the legacy v1 path
     // for callers running with the env var unset (and for the migration-
@@ -9482,7 +9469,7 @@ fn spawn_speculation_dispatcher(
 
     let mut rx = rx;
     let handle = tokio::spawn(async move {
-        // Phase 66 Phase 4d — under v2 mode the dispatcher writes to
+        // — under v2 mode the dispatcher writes to
         // v2's `objects/<sri>/` via `extract_object_from_bytes`. The
         // store handle threads through `speculative_download_and_store`
         // below; when `store_v2_spec` is `Some`, the spec download
@@ -9490,7 +9477,7 @@ fn spawn_speculation_dispatcher(
         // hands them to the v2 store's idempotent extract. The legacy
         // v1 path runs when `store_v2_spec` is `None`.
         //
-        // Pre-Phase-4d this branch drained the channel as a no-op,
+        // Pre-this branch drained the channel as a no-op,
         // forcing the real fetch loop to do all download work — v2
         // installs paid full per-package fetch latency on the hot
         // path. With this wired, v2 cold installs match v1's
@@ -9651,7 +9638,7 @@ fn spawn_speculation_dispatcher(
             match rx.recv().await {
                 Some((name, meta)) => {
                     metadata.insert(name.clone(), meta);
-                    // Phase 49: the W2 roots-ready signal is owned by
+                    // the roots-ready signal is owned by
                     // the walker now — the dispatcher is a pure
                     // consumer of `(name, PackageMetadata)` frames.
                     if let Some(pending) = parked.remove(&name) {
@@ -9694,7 +9681,7 @@ fn spawn_speculation_dispatcher(
         futures::future::join_all(spec_tasks).await;
     });
 
-    // Phase 49: caller owns the tx side of the mpsc channel and the
+    // caller owns the tx side of the mpsc channel and the
     // walker task; we return the dispatcher's `JoinHandle` +
     // counters. The dispatcher's `rx.recv()` loop exits when the
     // walker drops its `tx` sender — same channel-close termination
@@ -9713,7 +9700,7 @@ fn spawn_speculation_dispatcher(
     )
 }
 
-/// Phase 38 P3: one speculative download — stream tarball → store,
+///: one speculative download — stream tarball → store,
 /// identical to `fetch_and_store_streaming` but without the
 /// `InstallPackage`-shaped plumbing or `TaskTimings` accounting. Errors
 /// are swallowed by the dispatcher (best-effort speculation); the real
@@ -9723,7 +9710,7 @@ async fn speculative_download_and_store(
     client: &Arc<RegistryClient>,
     route_table: &RouteTable,
     store: &PackageStore,
-    // Phase 66 §4 — when `Some`, route the downloaded bytes through
+    // — when `Some`, route the downloaded bytes through
     // v2's `extract_object_from_bytes` (idempotent on object hits)
     // instead of v1's `stream_and_store_package`. Each spec task
     // gets its own clone of the `Arc<Store>`.
@@ -9738,7 +9725,7 @@ async fn speculative_download_and_store(
     use futures::stream::TryStreamExt;
     use tokio_util::io::{StreamReader, SyncIoBridge};
 
-    // Phase 39 P2 + Phase 59.0 day-7 (F1 finish-line) — per-key
+    // + day-7 (F1 finish-line) — per-key
     // fetch lock keyed by `(name, version, source_id)`. Speculation
     // only fires for registry-source packages, so we derive the
     // registry URL through the same route table the install
@@ -9766,7 +9753,7 @@ async fn speculative_download_and_store(
     let key_lock = coord.lock_for(speculation_key).await;
     let _key_guard = key_lock.lock().await;
 
-    // Phase 66 §4 — store-hit short-circuit, layout-aware. Under v2
+    // — store-hit short-circuit, layout-aware. Under v2
     // mode the SRI determines the object dir; if the SRI is
     // unavailable (TOFU resolution path) we fall back to v1's
     // `(name, version)` check, which is harmless under v2 (it just
@@ -9793,7 +9780,7 @@ async fn speculative_download_and_store(
         .await
         .map_err(|_| LpmError::Registry("spec semaphore closed".into()))?;
 
-    // Phase 58 day-4.5 — speculative tarball downloads also route via
+    // day-4.5 — speculative tarball downloads also route via
     // the auth-aware path so custom-registry speculation succeeds
     // (and doesn't leak the LPM session bearer cross-origin).
     let response = client
@@ -9802,7 +9789,7 @@ async fn speculative_download_and_store(
 
     if let Some(v2) = store_v2 {
         // v2 path: collect bytes, extract via v2 store. Streaming-to-
-        // disk into v2 is a future optimization (Phase 4d/4f); for
+        // disk into v2 is a future optimization; for
         // speculation the in-memory shape is fine because spec sets
         // are bounded (a few hundred packages parallel, each typically
         // <500 KB compressed). The semaphore upstream caps the
@@ -9850,9 +9837,9 @@ async fn speculative_download_and_store(
 
 /// Resolve the tarball URL for a package, consulting registry metadata
 /// only when the resolver didn't already cache one. Shared by both the
-/// legacy (temp-file) and Phase 38 P1 (streaming) fetch paths.
+/// legacy (temp-file) and (streaming) fetch paths.
 ///
-/// **Phase 58 day-4.5:** the non-LPM branch now routes through
+/// the non-LPM branch now routes through
 /// [`RegistryClient::get_npm_metadata_routed`] using
 /// `route_table.route_for_package(name)`. Pre-fix this branch always
 /// hit the bare `get_npm_package_metadata` (Worker → npm.org fallback)
@@ -9916,7 +9903,7 @@ fn invalidate_metadata_routed(client: &Arc<RegistryClient>, route_table: &RouteT
 /// re-fetches from fresh metadata. Returns the user-facing error
 /// message the caller should surface.
 ///
-/// **Phase 43 P43-2 fix:** takes `project_dir` and resolves lockfile
+/// takes `project_dir` and resolves lockfile
 /// paths via `project_dir.join(...)` instead of `Path::new(...)`
 /// (which was CWD-relative). A programmatic caller running install
 /// from a nested directory previously left the actual project
@@ -9927,7 +9914,7 @@ fn handle_tarball_not_found(
     version: &str,
     project_dir: &Path,
 ) -> LpmError {
-    // Phase 58 day-4.5: name-only invalidation here is best-effort —
+    // day-4.5: name-only invalidation here is best-effort —
     // it nukes the npm.org / `@lpm.dev/` cache entries but cannot
     // reach `.npmrc`-declared custom-registry entries (those need
     // `invalidate_custom_metadata_cache(base_url, name, auth)`).
@@ -9952,15 +9939,14 @@ fn handle_tarball_not_found(
 
 /// Legacy fetch path — download to temp file, reopen, extract. Returns
 /// `(computed_sri, TaskTimings)`. Called from the per-task closure under
-/// a held download semaphore permit. Kept as the default while Phase 38
-/// P1's streaming path is validated.
+/// a held download semaphore permit. Kept as the default while ///'s streaming path is validated.
 ///
-/// **Phase 43 P43-2.** `project_dir` + `gate_stats` are threaded in
+/// `project_dir` + `gate_stats` are threaded in
 /// for the CWD-safe `handle_tarball_not_found` (which deletes
 /// lockfiles relative to the project root, not CWD) and the
 /// stale-URL same-run retry telemetry. See the design doc §P43-2
 /// Change 2 for the full retry semantics.
-// Phase 53 W6a — see the docs on `fetch_and_store_streaming` for why the
+// W6a — see the docs on `fetch_and_store_streaming` for why the
 // permit drop happens between download and extract. Same shape applies on
 // the legacy spool path.
 #[allow(clippy::too_many_arguments)] // design-level: install-fetch orchestration takes the full surface
@@ -9968,8 +9954,8 @@ async fn fetch_and_store_legacy(
     client: &Arc<RegistryClient>,
     route_table: &RouteTable,
     store: &PackageStore,
-    // Phase 66 Phase 4b — see [`fetch_and_store_streaming`] for the
-    // contract. None → v1 (default + every release through Phase 4d).
+    // — see [`fetch_and_store_streaming`] for the
+    // contract. None → v1 (default + every release).
     store_v2: Option<&lpm_store::v2::Store>,
     p: &InstallPackage,
     queue_wait_ms: u128,
@@ -9979,7 +9965,7 @@ async fn fetch_and_store_legacy(
 ) -> Result<(String, TaskTimings, String), LpmError> {
     use std::sync::atomic::Ordering;
 
-    // Phase 43 — explicit URL resolution + download so we can
+    // — explicit URL resolution + download so we can
     // distinguish a metadata 404 (truly unpublished, no retry) from
     // a download 404 on a stored URL (stale cached URL, try
     // recovery). Return tuple's final `String` is the URL that
@@ -10085,12 +10071,12 @@ async fn fetch_and_store_legacy(
         }
         Err(e) => return Err(e),
     };
-    // Phase 43 — `download_ms` measures just the GET + temp-file
+    // — `download_ms` measures just the GET + temp-file
     // write. URL-lookup costs (initial + optional retry) are
     // accumulated into `url_lookup_ms` above.
     let download_ms = download_start.elapsed().as_millis();
 
-    // Phase 53 W6a — drop the permit now that bytes are on disk.
+    // W6a — drop the permit now that bytes are on disk.
     // Integrity verification + extract that follow are CPU+I/O bound
     // and don't need the download throttle; sibling downloads can
     // proceed while this task finishes its post-download work.
@@ -10121,7 +10107,7 @@ async fn fetch_and_store_legacy(
     let integrity_ms = integrity_start.elapsed().as_millis();
 
     let stage = if let Some(store_v2) = store_v2 {
-        // Phase 66 Phase 4b — v2 path. Read the on-disk tarball into
+        // — v2 path. Read the on-disk tarball into
         // memory and route through `extract_object_from_bytes`. The
         // legacy fetch path's whole point is to spool the download
         // to a temp file (vs the streaming path's in-memory body), so
@@ -10162,7 +10148,7 @@ async fn fetch_and_store_legacy(
     ))
 }
 
-/// **Phase 59.0 day-5b (F4)** — fetch + store path for
+/// fetch + store path for
 /// `Source::Tarball` packages.
 ///
 /// Distinct from [`fetch_and_store_legacy`] / [`fetch_and_store_streaming`]
@@ -10188,8 +10174,8 @@ async fn fetch_and_store_legacy(
 async fn fetch_and_store_tarball_url(
     client: &Arc<RegistryClient>,
     store: &PackageStore,
-    // Phase 66 Phase 4b — see [`fetch_and_store_streaming`] for the
-    // contract. None → v1 (default + every release through Phase 4d).
+    // — see [`fetch_and_store_streaming`] for the
+    // contract. None → v1 (default + every release).
     store_v2: Option<&lpm_store::v2::Store>,
     p: &InstallPackage,
     queue_wait_ms: u128,
@@ -10221,7 +10207,7 @@ async fn fetch_and_store_tarball_url(
 
     let extract_start = std::time::Instant::now();
     let extract_ms = if let Some(store_v2) = store_v2 {
-        // Phase 66 Phase 4b — v2 path. The Source::Tarball case
+        // — v2 path. The Source::Tarball case
         // already has bytes + SRI in hand; route them straight into
         // `extract_object_from_bytes`. Re-verification through the
         // expected_integrity arg is a no-op (caller passes the same
@@ -10260,14 +10246,14 @@ async fn fetch_and_store_tarball_url(
     Ok((computed_sri, timings, url.to_string()))
 }
 
-/// Phase 38 P1 streaming fetch path — bytes flow from reqwest directly
+/// streaming fetch path — bytes flow from reqwest directly
 /// into the store's extractor via `StreamReader` + `SyncIoBridge`. No
 /// temp file spool, no re-read. Hash computed inline as bytes flow.
 ///
 /// Because download + decode + extract + hash happen in one interleaved
 /// pipeline, `download_ms` and `integrity_ms` collapse into
 /// `extract_ms` — the breakdown stays shape-compatible with the legacy
-/// path but pushes mass into one bucket. That's the whole point of P1:
+/// path but pushes mass into one bucket. That's the whole point of:
 /// eliminate the temp-file hop that today forces sequential download →
 /// reopen → extract.
 #[allow(clippy::too_many_arguments)] // design-level: install-fetch orchestration takes the full surface
@@ -10275,10 +10261,10 @@ async fn fetch_and_store_streaming(
     client: &Arc<RegistryClient>,
     route_table: &RouteTable,
     store: &PackageStore,
-    // Phase 66 Phase 4b — when `Some`, the install pipeline is running
+    // — when `Some`, the install pipeline is running
     // under `LPM_STORE_VERSION=v2`. Bytes flow into the v2
     // `objects/<sri>/` path instead of v1's `<name>@<version>/`. None
-    // → v1 path (today's default + every release through Phase 4d).
+    // → v1 path (today's default + every release).
     store_v2: Option<&lpm_store::v2::Store>,
     p: &InstallPackage,
     queue_wait_ms: u128,
@@ -10288,7 +10274,7 @@ async fn fetch_and_store_streaming(
 ) -> Result<(String, TaskTimings, String), LpmError> {
     use std::sync::atomic::Ordering;
 
-    // URL resolution — Phase 43 times this into `url_lookup_ms` and
+    // URL resolution — times this into `url_lookup_ms` and
     // distinguishes metadata 404 (truly unpublished, no retry) from
     // a download 404 on a stored URL (stale cache, try recovery).
     let url_lookup_start = std::time::Instant::now();
@@ -10385,7 +10371,7 @@ async fn fetch_and_store_streaming(
         Err(e) => return Err(e),
     };
 
-    // Phase 53 W6a — collect the entire compressed tarball into memory
+    // W6a — collect the entire compressed tarball into memory
     // BEFORE releasing the download permit, then release the permit
     // BEFORE the spawn_blocking extract. Pre-W6a the permit covered
     // download + extract end-to-end, which on `bench/fixture-large`
@@ -10411,7 +10397,7 @@ async fn fetch_and_store_streaming(
     let version = p.version.clone();
     let expected_integrity = p.integrity.clone();
     let store_owned = store.clone();
-    // Phase 66 Phase 4b — capture the Optional v2 handle into the
+    // — capture the Optional v2 handle into the
     // blocking task. Cloning an `Option<Store>` is cheap (the inner
     // `Store` derives Clone over a single PathBuf), and `None` keeps
     // the existing v1 path byte-for-byte.
@@ -10423,7 +10409,7 @@ async fn fetch_and_store_streaming(
     let (computed_sri, stage) = tokio::task::spawn_blocking(
         move || -> Result<(String, lpm_store::StageTimings), LpmError> {
             if let Some(store_v2) = store_v2_owned {
-                // Phase 66 Phase 4b — v2 path. Bytes flow through
+                // — v2 path. Bytes flow through
                 // `extract_object_from_bytes`: SHA-512 hash → integrity
                 // verify → extract into `objects/<sri>/` → security
                 // analysis → atomic rename. SizeLimit is enforced
@@ -10472,7 +10458,7 @@ async fn fetch_and_store_streaming(
     ))
 }
 
-/// Phase 33 placeholder spec written into the manifest by
+/// placeholder spec written into the manifest by
 /// [`stage_packages_to_manifest`] for entries whose final spec depends on
 /// the resolved version. The full install pipeline sees this as "any
 /// version", resolves it normally, and [`finalize_packages_in_manifest`]
@@ -10492,8 +10478,7 @@ pub(crate) enum StagedKind {
     /// with `decide_saved_dependency_spec(intent, resolved, flags, config)`.
     Placeholder,
     /// Stage left the manifest untouched because the dep already exists
-    /// and the bare reinstall came with no rewrite-forcing flag. Phase 33
-    /// "no churn" rule. Finalize is a no-op.
+    /// and the bare reinstall came with no rewrite-forcing flag.     /// "no churn" rule. Finalize is a no-op.
     Skipped,
 }
 
@@ -10525,7 +10510,7 @@ impl StagedManifest {
     }
 }
 
-/// **Phase 33 stage step.** Mutate `pkg_json_path` to reflect the user's
+/// Mutate `pkg_json_path` to reflect the user's
 /// install request as far as it can be determined without running the
 /// resolver, and return a [`StagedManifest`] describing what still needs
 /// to be patched after resolution.
@@ -10537,8 +10522,7 @@ impl StagedManifest {
 ///   [`UserSaveIntent::Workspace`]) — write the verbatim string. Finalize
 ///   skips these.
 /// - **Bare or dist-tag**, dep already in target dep table, no
-///   rewrite-forcing flag — leave the manifest entry alone (Phase 33
-///   "no-churn" rule). Finalize skips these.
+///   rewrite-forcing flag — leave the manifest entry alone (///   "no-churn" rule). Finalize skips these.
 /// - **Bare or dist-tag**, otherwise — write [`STAGE_PLACEHOLDER`] so the
 ///   resolver picks up the new dep. Finalize will replace it with the
 ///   final save spec once the resolved version is known.
@@ -10589,7 +10573,7 @@ pub(crate) fn stage_packages_to_manifest(
 
     let force_rewrite = flags.forces_rewrite();
     let mut entries: Vec<StagedEntry> = Vec::with_capacity(package_specs.len());
-    // Track whether `doc` has been mutated. Phase 33 no-churn rule: when
+    // Track whether `doc` has been mutated. no-churn rule: when
     // every spec hits the Skipped branch, we must NOT rewrite the file —
     // re-serializing through serde_json::to_string_pretty would normalize
     // indentation and add a trailing newline, which counts as a manifest
@@ -10628,7 +10612,7 @@ pub(crate) fn stage_packages_to_manifest(
         }
 
         // Tier 2: bare reinstall of an existing dep with no rewrite-forcing
-        // flag → skip (Phase 33 no-churn rule).
+        // flag → skip (no-churn rule).
         //
         // **Audit Finding 3:** dist-tag intents (`react@latest`, `@beta`,
         // `@next`) are NOT eligible for this skip even when the dep is
@@ -10696,9 +10680,8 @@ pub(crate) fn stage_packages_to_manifest(
     })
 }
 
-/// **Phase 33 audit Finding 1 fix.** Build a `name → Version` map for
-/// every direct dependency in the resolver's output. Used by Phase 33's
-/// finalize step to look up the resolved version of placeholder-staged
+/// Build a `name → Version` map for
+/// every direct dependency in the resolver's output. Used by  the /// finalize step to look up the resolved version of placeholder-staged
 /// deps without ambiguity.
 ///
 /// Why this lives next to the install pipeline (not next to the
@@ -10712,7 +10695,7 @@ pub(crate) fn stage_packages_to_manifest(
 ///
 /// This function trusts the resolver's `is_direct` and ignores every
 /// transitive entry. If the same name appears as direct more than once
-/// (which would be a resolver bug, not a Phase 33 bug), the LAST entry
+/// (which would be a resolver bug, not a bug), the LAST entry
 /// wins and we log a warning.
 ///
 /// Returns an empty map if `packages` is empty or has no direct entries.
@@ -10723,7 +10706,7 @@ fn collect_direct_versions(packages: &[InstallPackage]) -> HashMap<String, lpm_s
             Ok(v) => {
                 if map.insert(p.name.clone(), v).is_some() {
                     tracing::warn!(
-                        "Phase 33: package `{}` appears as a direct dep more than once \
+                        "package `{}` appears as a direct dep more than once \
                          in resolver output — last entry wins. This indicates a resolver bug.",
                         p.name
                     );
@@ -10731,7 +10714,7 @@ fn collect_direct_versions(packages: &[InstallPackage]) -> HashMap<String, lpm_s
             }
             Err(e) => {
                 tracing::warn!(
-                    "Phase 33: resolved version `{}` for direct dep `{}` did not parse \
+                    "resolved version `{}` for direct dep `{}` did not parse \
                      as semver: {e}. Finalize will surface a missing-version error.",
                     p.version,
                     p.name
@@ -10742,7 +10725,7 @@ fn collect_direct_versions(packages: &[InstallPackage]) -> HashMap<String, lpm_s
     map
 }
 
-/// **Phase 33 finalize step.** Replay the stage decisions against the
+/// Replay the stage decisions against the
 /// current manifest using the resolver's output, replacing any
 /// [`STAGE_PLACEHOLDER`] entries with the final save spec computed by
 /// [`crate::save_spec::decide_saved_dependency_spec`].
@@ -10787,7 +10770,7 @@ pub(crate) fn finalize_packages_in_manifest(
 
         let resolved = resolved_versions.get(&entry.name).ok_or_else(|| {
             LpmError::Registry(format!(
-                "Phase 33 finalize: resolver did not report a concrete version for `{}` \
+                "finalize: resolver did not report a concrete version for `{}` \
                  (staged with placeholder `{STAGE_PLACEHOLDER}`). Refusing to leave the \
                  placeholder in {}.",
                 entry.name,
@@ -10812,13 +10795,13 @@ pub(crate) fn finalize_packages_in_manifest(
 ///
 /// Handles specs like: `express`, `express@^4.0.0`, `@lpm.dev/neo.highlight@1.0.0`
 ///
-/// **Phase 32 Phase 2 M2:** this is the legacy path used when no `--filter`
+/// this is the legacy path used when no `--filter`
 /// or `-w` flag is set AND we're not inside a workspace member directory.
 /// New filtered paths go through `run_install_filtered_add` instead, which
 /// handles workspace-aware target resolution but rejects Swift packages
-/// (SE-0292 workspace support is deferred to Phase 12+).
+/// (SE-0292 workspace support is deferred toa future release).
 ///
-/// **Phase 33:** `save_flags` carries the per-command save-spec overrides
+/// `save_flags` carries the per-command save-spec overrides
 /// (`--exact`, `--tilde`, `--save-prefix`). They flow through stage and
 /// finalize so the manifest write reflects the user's explicit policy.
 #[allow(clippy::too_many_arguments)]
@@ -10831,21 +10814,21 @@ pub async fn run_add_packages(
     allow_new: bool,
     force: bool,
     save_flags: crate::save_spec::SaveFlags,
-    // Phase 46 P2 Chunk 5: forwarded CLI-side policy override. See
+    // forwarded CLI-side policy override. See
     // [`run_with_options`] for the resolution precedence and the
     // current consumer (triage-mode install summary line).
     script_policy_override: Option<crate::script_policy_config::ScriptPolicy>,
-    // Phase 46 slice 1: forwarded `--advisor` override. Opaque
+    // slice 1: forwarded `--advisor` override. Opaque
     // pass-through to `run_with_options` — see that fn for the
     // precedence chain and validation contract.
     advisor_override: Option<String>,
-    // Phase 46 P3: forwarded `--min-release-age=<dur>` override.
+    //: forwarded `--min-release-age=<dur>` override.
     // Opaque pass-through — see [`run_with_options`].
     min_release_age_override: Option<u64>,
-    // Phase 46 P4 Chunk 4: forwarded `--ignore-provenance-drift[-all]`
+    // forwarded `--ignore-provenance-drift[-all]`
     // policy. Opaque pass-through — see [`run_with_options`].
     drift_ignore_policy: crate::provenance_fetch::DriftIgnorePolicy,
-    // Phase 46.1 rework (2026-05-11): forwarded CLI sandbox-mode
+    // rework : forwarded CLI sandbox-mode
     // overrides. Opaque pass-through — see [`run_with_options`].
     strict_sandbox: bool,
     no_sandbox: bool,
@@ -10896,7 +10879,7 @@ pub async fn run_add_packages(
         return Ok(());
     }
 
-    // ── Phase 33: stage → install → finalize, wrapped in a transaction
+    // ── stage → install → finalize, wrapped in a transaction
     // that covers the FULL install state surface. Audit Finding 2 fix:
     // snapshot the manifest AND the lockfile so a failed install rolls
     // both back together, and invalidate `.lpm/install-hash` so the next
@@ -10907,7 +10890,7 @@ pub async fn run_add_packages(
     let lockfile_bin_path = lockfile_path.with_extension("lockb");
     let install_hash_path = project_dir.join(".lpm").join("install-hash");
 
-    // **Finding #77 fix.** Wrap the entire snapshot → stage → install
+    // ** fix.** Wrap the entire snapshot → stage → install
     // → finalize → commit window in a per-project exclusive lock so
     // concurrent `lpm install <pkg>` invocations on the same project
     // serialize. Pre-fix, both processes would snapshot the same
@@ -10937,9 +10920,9 @@ pub async fn run_add_packages(
 
         // 2. Stage the new entries. Explicit specs land verbatim; bare/dist-tag
         //    entries get a `*` placeholder that finalize will replace using the
-        //    Phase 33 save policy (resolved version + flags + config).
+        //    save policy (resolved version + flags + config).
         //
-        //    Phase 33 Step 6: load `./lpm.toml` (project) merged with
+        //    Step 6: load `./lpm.toml` (project) merged with
         //    `~/.lpm/config.toml` (global) for the persistent save-policy
         //    keys. CLI flags still beat config inside `decide_saved_dependency_spec`.
         let save_config = crate::save_config::SaveConfigLoader::load_for_project(project_dir)?;
@@ -10960,7 +10943,7 @@ pub async fn run_add_packages(
         }
 
         // 4. Run the full install pipeline, capturing the direct-dep version
-        //    map via the Phase 33 out-param. If anything fails, the `?`
+        //    map via the out-param. If anything fails, the `?`
         //    returns early — `tx` drops without `commit()` and the manifest
         //    snaps back to its pre-stage state. The placeholder never survives.
         let mut direct_versions: HashMap<String, lpm_semver::Version> = HashMap::new();
@@ -10971,7 +10954,7 @@ pub async fn run_add_packages(
             false, // offline
             force,
             allow_new,
-            false, // strict_integrity (Phase 59.0 F5) — internal call, no flag
+            false, // strict_integrity — internal call, no flag
             None,  // linker_override
             false, // no_skills
             false, // no_editor_setup
@@ -11002,7 +10985,7 @@ pub async fn run_add_packages(
     .await
 }
 
-/// Phase 32 Phase 2 M2: workspace-aware install entry point.
+/// M2: workspace-aware install entry point.
 ///
 /// Resolves CLI `--filter` / `-w` / cwd into a concrete set of
 /// `package.json` files via [`crate::commands::install_targets`], mutates
@@ -11013,10 +10996,10 @@ pub async fn run_add_packages(
 /// `ecosystem=swift` packages added through this path will be written into
 /// the target `package.json` files but the SE-0292 routing in
 /// `run_swift_install` will not fire. Workspace-aware Swift install is
-/// tracked under Phase 12+. For pure Swift workflows, use the legacy
+/// tracked undera future release. For pure Swift workflows, use the legacy
 /// path: `cd <project> && lpm install @scope/swift-pkg` (no `-w` / `--filter`).
 ///
-/// **Phase 33:** `save_flags` carries the per-command save-spec overrides
+/// `save_flags` carries the per-command save-spec overrides
 /// applied to every targeted member's manifest finalize step.
 #[allow(clippy::too_many_arguments)]
 pub async fn run_install_filtered_add(
@@ -11032,19 +11015,19 @@ pub async fn run_install_filtered_add(
     allow_new: bool,
     force: bool,
     save_flags: crate::save_spec::SaveFlags,
-    // Phase 46 P2 Chunk 5: forwarded CLI-side policy override.
+    // forwarded CLI-side policy override.
     script_policy_override: Option<crate::script_policy_config::ScriptPolicy>,
-    // Phase 46 slice 1: forwarded `--advisor` override. Opaque
+    // slice 1: forwarded `--advisor` override. Opaque
     // pass-through to `run_with_options` — see that fn for the
     // precedence chain and validation contract.
     advisor_override: Option<String>,
-    // Phase 46 P3: forwarded `--min-release-age=<dur>` override.
+    //: forwarded `--min-release-age=<dur>` override.
     // Opaque pass-through — see [`run_with_options`].
     min_release_age_override: Option<u64>,
-    // Phase 46 P4 Chunk 4: forwarded `--ignore-provenance-drift[-all]`
+    // forwarded `--ignore-provenance-drift[-all]`
     // policy. Opaque pass-through — see [`run_with_options`].
     drift_ignore_policy: crate::provenance_fetch::DriftIgnorePolicy,
-    // Phase 46.1 rework (2026-05-11): forwarded CLI sandbox-mode
+    // rework : forwarded CLI sandbox-mode
     // overrides. Opaque pass-through — see [`run_with_options`].
     strict_sandbox: bool,
     no_sandbox: bool,
@@ -11057,11 +11040,11 @@ pub async fn run_install_filtered_add(
         true, // has_packages — install_filtered_add is only called with non-empty packages
     )?;
 
-    // 2. Empty result handling (--fail-if-no-match mirrors Phase 1 D3).
+    // 2. Empty result handling (--fail-if-no-match mirrors D3).
     //
-    // Phase 2 audit follow-through: when the filter set returns empty AND
+    // audit follow-through: when the filter set returns empty AND
     // any filter looks like a bare name that would have substring-matched
-    // pre-Phase-32, surface the same D2 substring → glob migration hint
+    // Previously, surface the same D2 substring → glob migration hint
     // that `lpm run --filter` and `lpm filter` already emit. Otherwise
     // users coming from the legacy substring matcher get a generic "no
     // packages matched" with no recovery path.
@@ -11090,7 +11073,7 @@ pub async fn run_install_filtered_add(
 
     // 3. Multi-member confirmation prompt.
     //
-    // **D-impl-5 (2026-04-16)** — the original Phase 2 plan included an
+    // ** ** — the original plan included an
     // interactive y/N prompt gated on `multi_member && is_tty && !json_output`
     // and a `confirm_multi_member_mutation` helper. The implementation
     // initially shipped preview-only (no prompt); that gap is closed here.
@@ -11123,7 +11106,7 @@ pub async fn run_install_filtered_add(
     //       so this is the only place the new dependency will be installed
     //       and linked correctly.
     //
-    // This is the Phase 2 audit correction. The original Phase 2 design ran
+    // This is the audit correction. The original design ran
     // a single install pipeline at the workspace root, which silently
     // dropped member-targeted installs on workspaces with no root deps.
     //
@@ -11136,7 +11119,7 @@ pub async fn run_install_filtered_add(
         .map(|p| p.display().to_string())
         .collect();
 
-    // ── Phase 33: snapshot the FULL install state surface for every
+    // ── snapshot the FULL install state surface for every
     // targeted member in a single transaction. Audit Finding 2 fix:
     // each member contributes its own (manifest, lockfile, lockfile.b,
     // install-hash) quadruple. A failure halfway through a multi-member
@@ -11182,7 +11165,7 @@ pub async fn run_install_filtered_add(
     }
     let invalidate_refs: Vec<&Path> = install_hash_paths.iter().map(|p| p.as_path()).collect();
 
-    // Phase 33: per-command save flags from the CLI flow into stage and
+    // per-command save flags from the CLI flow into stage and
     // finalize so multi-member installs honor `--exact`/`--tilde`/etc.
     // for every targeted member identically.
     //
@@ -11210,7 +11193,7 @@ pub async fn run_install_filtered_add(
     let save_config =
         crate::save_config::SaveConfigLoader::load_for_project(&workspace_root_for_config)?;
 
-    // **Finding #77 fix.** Wrap the workspace-install snapshot → loop
+    // ** fix.** Wrap the workspace-install snapshot → loop
     // → commit in an exclusive per-WORKSPACE lock. Two concurrent
     // `lpm install --filter <member>` invocations on the same workspace
     // serialize through this lock so the multi-member ManifestTransaction
@@ -11263,8 +11246,7 @@ pub async fn run_install_filtered_add(
             }
 
             // (c) Run the install pipeline at THIS member's directory,
-            //     capturing the direct-dep map for finalize via Phase 33's
-            //     out-param.
+            //     capturing the direct-dep map for finalize via  the             //     out-param.
             let mut direct_versions: HashMap<String, lpm_semver::Version> = HashMap::new();
             let result = run_with_options(
                 client,
@@ -11273,7 +11255,7 @@ pub async fn run_install_filtered_add(
                 false, // offline
                 force,
                 allow_new,
-                false, // strict_integrity (Phase 59.0 F5) — workspace-add path, no flag
+                false, // strict_integrity — workspace-add path, no flag
                 None,  // linker_override
                 false, // no_skills
                 false, // no_editor_setup
@@ -11628,7 +11610,7 @@ async fn run_swift_install_xcode(
     Ok(())
 }
 
-// Phase 33: the legacy `parse_package_spec` was deleted. Its replacement
+// the legacy `parse_package_spec` was deleted. Its replacement
 // is `crate::save_spec::parse_user_save_intent`, which returns a strongly
 // typed `UserSaveIntent` instead of `(String, String)`. The Swift routing
 // site in `run_add_packages` calls `intent_to_range_string` directly to get
@@ -11783,14 +11765,14 @@ async fn install_skills_for_packages(
     }
 }
 
-/// Phase 61.3 D9 + hoisted-symmetry follow-up — wipe whichever
+/// D9 + hoisted-symmetry follow-up — wipe whichever
 /// legacy linker-state subtree the project still has under
 /// `node_modules/`.
 ///
 /// Two legacy layouts exist:
 ///
 /// - Pre-61.1 isolated wrapper root at `node_modules/.lpm/<seg>/`
-///   (Phase 61 moved this to `<project>/.lpm/wrappers/`).
+///   (moved this to `<project>/.lpm/wrappers/`).
 /// - Pre-symmetry hoisted state at `node_modules/.lpm-metadata.json`
 ///   plus `node_modules/.lpm/nested/` (hoisted-symmetry follow-up
 ///   moves these to `<project>/.lpm/hoisted/metadata.json` and
@@ -11882,7 +11864,7 @@ fn migrate_legacy_wrapper_layout(project_dir: &Path, json_output: bool) {
     }
 }
 
-/// Phase 61.5 D5 — ensure `.gitignore` contains an entry for
+/// D5 — ensure `.gitignore` contains an entry for
 /// `.lpm/wrappers/`.
 ///
 /// Mirrors [`ensure_skills_gitignore`] (and its siblings in
@@ -11986,7 +11968,7 @@ pub fn ensure_skills_gitignore(project_dir: &Path) {
     }
 }
 
-// Phase 46 P1: `read_auto_build_config` was removed as part of
+//: `read_auto_build_config` was removed as part of
 // consolidating script-config reads into
 // `crate::script_policy_config::ScriptPolicyConfig`. Callers now
 // access `.auto_build` on the loader's return value. Equivalent test
@@ -12002,7 +11984,7 @@ mod tests {
         LOCK.get_or_init(|| Mutex::new(())).lock().unwrap()
     }
 
-    // ── Phase 66 Phase 4d migration tests ───────────────────────────
+    // ── migration tests ───────────────────────────
 
     #[test]
     fn needs_v2_migration_detects_legacy_isolated_wrappers() {
@@ -12096,12 +12078,12 @@ mod tests {
         assert!(!project.join(".lpm/wrappers").exists());
     }
 
-    /// Phase 46 P5 Chunk 5 regression guard: the P4 drift gate MUST
+    /// regression guard: the drift gate MUST
     /// appear in `install::run` before the `rebuild::run` auto-build
     /// call site. If a future refactor moves the drift check past
     /// the build call, a drifted approval would first spawn scripts
     /// and only after reject — violating D20 ("no auto-execution
-    /// before containment is established") and the Chunk 1 signoff
+    /// before containment is established") and the signoff
     /// commitment that a resolution-time deny must short-circuit
     /// the execution path.
     ///
@@ -12121,7 +12103,7 @@ mod tests {
             env!("CARGO_MANIFEST_DIR"),
             "/src/commands/install.rs"
         ));
-        const DRIFT_MARKER: &str = "Phase 46 P4 Chunk 3: provenance-drift gate";
+        const DRIFT_MARKER: &str = "P4 provenance-drift gate";
         const BUILD_RUN_CALL: &str = "crate::commands::rebuild::run(";
 
         let drift_pos = src.find(DRIFT_MARKER).unwrap_or_else(|| {
@@ -12141,10 +12123,10 @@ mod tests {
         });
         assert!(
             drift_pos < build_run_pos,
-            "P4-before-P5 invariant broken: the P4 provenance-drift gate (byte {drift_pos}) \
+            "Order invariant broken: the provenance-drift gate (byte {drift_pos}) \
              MUST appear before the `rebuild::run` call site (byte {build_run_pos}) in \
              install.rs. Reordering them means a drifted approval could spawn scripts \
-             before the drift check fires — violating D20 and Chunk 1 signoff #5."
+             before the drift check fires — violating the approved execution order."
         );
     }
 
@@ -12231,7 +12213,7 @@ mod tests {
     #[test]
     fn auto_build_fires_under_allow_policy_alone() {
         use crate::script_policy_config::ScriptPolicy;
-        // Phase 57: --policy=allow / --yolo / package.json scriptPolicy:"allow"
+        // --policy=allow / --yolo / package.json scriptPolicy:"allow"
         // / config.toml script-policy="allow" all resolve to ScriptPolicy::Allow,
         // which auto-fires rebuild::run at install time without requiring an
         // additional --auto-build flag. This is the apples-to-apples fix vs
@@ -12250,7 +12232,7 @@ mod tests {
         // via evaluate_trust → ride the `all_trusted` path; ambers/reds
         // require explicit --auto-build OR `lpm approve-scripts`. Policy
         // alone must NOT auto-fire under Triage — that would defeat the
-        // tiered safety model. Phase 57 expands Allow only.
+        // tiered safety model. expands Allow only.
         assert!(!should_auto_build(
             false,
             false,
@@ -12263,7 +12245,7 @@ mod tests {
         assert!(should_auto_build(false, false, true, ScriptPolicy::Triage));
     }
 
-    // ── Phase 46 slice 1 second-pass review fix ──
+    // ── slice 1 second-pass review fix ──
     //
     // `select_approvals_for_capture` decides whether the blocked-set
     // capture sees the advisor's approval view. The contract is:
@@ -12319,7 +12301,7 @@ mod tests {
         assert!(select_approvals_for_capture(true, None).is_none());
     }
 
-    // Phase 46 P1: the two `read_auto_build_config_*` tests were
+    //: the two `read_auto_build_config_*` tests were
     // removed alongside the ad-hoc helper. Equivalent coverage lives
     // in `script_policy_config::tests::from_package_json_reads_all_four_keys`
     // and `::from_package_json_missing_file_returns_defaults` and
@@ -12377,7 +12359,7 @@ mod tests {
     // ── parse_package_spec ──────────────────────────────────────────
     //
     // The legacy `parse_package_spec` function and its tests were removed
-    // in Phase 33. The replacement parser is `save_spec::parse_user_save_intent`,
+    //. The replacement parser is `save_spec::parse_user_save_intent`,
     // which returns a strongly typed `UserSaveIntent` enum and is exhaustively
     // tested in `save_spec::tests::parse_*` (15 cases covering scoped,
     // unscoped, exact, range, dist-tag, wildcard, and workspace inputs).
@@ -12469,7 +12451,7 @@ mod tests {
         assert_eq!(count, 1, "should not duplicate entry");
     }
 
-    // ── Phase 61.5 — ensure_lpm_wrappers_gitignore ───────────────────
+    // ── — ensure_lpm_wrappers_gitignore ───────────────────
 
     #[test]
     fn ensure_lpm_wrappers_gitignore_appends_entry() {
@@ -12573,14 +12555,14 @@ mod tests {
         assert_eq!(content2.matches(".lpm/hoisted/").count(), 1);
     }
 
-    // ── Phase 61.3 — wrapper-layout migration ────────────────────────
+    // ── — wrapper-layout migration ────────────────────────
 
     #[test]
     fn migrate_legacy_wrapper_layout_wipes_legacy_state() {
         let dir = tempfile::tempdir().unwrap();
         let p = dir.path();
         let layout = lpm_linker::LayoutPaths::for_project(p);
-        // Populate legacy wrapper dir as if from a pre-Phase-61 install.
+        // Populate legacy wrapper dir as if from a pre-existing install.
         let legacy = layout.isolated_legacy_wrapper_root().join("express@4.22.1");
         std::fs::create_dir_all(&legacy).unwrap();
         std::fs::write(legacy.join("marker"), b"x").unwrap();
@@ -12767,7 +12749,7 @@ mod tests {
         assert!(!layout.hoisted_legacy_metadata_path().exists());
     }
 
-    // ── install state (Phase 34.1: delegated to crate::install_state) ──
+    // ── install state (delegated to crate::install_state) ──
 
     /// Set up a tempdir that looks like a post-install project:
     /// package.json, lpm.lock, node_modules/, .lpm/install-hash.
@@ -12941,10 +12923,10 @@ mod tests {
         // verify that the bypass target exists and returns true.
     }
 
-    // ── Phase 33: stage_packages_to_manifest behavior ─────────────────────
+    // ── stage_packages_to_manifest behavior ─────────────────────
     //
     // These tests cover the stage step in isolation (no install pipeline,
-    // no transaction guard). The Phase 33 contract for stage:
+    // no transaction guard). The contract for stage:
     //
     //   - Explicit Exact/Range/Wildcard/Workspace user input → write
     //     verbatim, mark `StagedKind::Final`.
@@ -13108,7 +13090,7 @@ mod tests {
         assert!(matches!(staged.entries[0].kind, StagedKind::Final));
     }
 
-    /// Phase 33 row 12 (no churn): bare reinstall of an existing dep, no
+    /// row 12 (no churn): bare reinstall of an existing dep, no
     /// rewrite-forcing flag → manifest is NOT touched, entry is Skipped.
     #[test]
     fn stage_bare_reinstall_of_existing_dep_is_skipped() {
@@ -13145,7 +13127,7 @@ mod tests {
         assert!(!staged.has_placeholders());
     }
 
-    /// **Phase 33 audit Finding 3 regression.** A dist-tag install
+    /// A dist-tag install
     /// against an existing dep is NOT a "bare reinstall" — the user typed
     /// `@latest`/`@beta`/`@next`, which is explicit input asking for the
     /// current value of that tag. Stage MUST stage a placeholder so
@@ -13189,7 +13171,7 @@ mod tests {
         );
     }
 
-    /// Phase 33: bare reinstall of an existing dep WITH a rewrite-forcing
+    /// bare reinstall of an existing dep WITH a rewrite-forcing
     /// flag → write a placeholder, finalize will replace with the new
     /// resolved-version-derived spec. This is the `--exact` opt-in path.
     #[test]
@@ -13278,7 +13260,7 @@ mod tests {
         assert!(raw.ends_with('\n'));
     }
 
-    // ── Phase 33: finalize_packages_in_manifest behavior ──────────────────
+    // ── finalize_packages_in_manifest behavior ──────────────────
 
     /// Helper: build a `name → Version` map from `(name, version_str)` pairs.
     fn make_resolved(pairs: &[(&str, &str)]) -> HashMap<String, lpm_semver::Version> {
@@ -13288,7 +13270,7 @@ mod tests {
             .collect()
     }
 
-    /// Phase 33 end-to-end (stage → finalize): bare install of a fresh dep
+    /// end-to-end (stage → finalize): bare install of a fresh dep
     /// gets a placeholder at stage, then `^<resolved>` after finalize.
     #[test]
     fn finalize_bare_replaces_placeholder_with_caret_resolved() {
@@ -13357,7 +13339,7 @@ mod tests {
         assert_eq!(pre, post);
     }
 
-    // ── Phase 33 audit Finding 1 regression ──────────────────────────────
+    // ── audit Finding 1 regression ──────────────────────────────
     //
     // `collect_direct_versions` is the audit-aligned replacement for the
     // pre-fix `collect_resolved_versions_from_lockfile`. The pre-fix code
@@ -13473,7 +13455,7 @@ mod tests {
         assert!(map.is_empty());
     }
 
-    /// All transitives → empty map. Used by Phase 33 finalize to detect
+    /// All transitives → empty map. Used by finalize to detect
     /// "the resolver dropped my staged dep" via the missing-version error.
     #[test]
     fn collect_direct_versions_all_transitive_returns_empty_map() {
@@ -13543,7 +13525,7 @@ mod tests {
         assert!(err.contains("placeholder"));
     }
 
-    // ── Phase 2 audit fix #1: D2 migration hint on filtered install no-match ──
+    // ── audit fix #1: D2 migration hint on filtered install no-match ──
 
     /// Helper: real on-disk workspace fixture so resolve_install_targets can
     /// actually discover it.
@@ -13573,7 +13555,7 @@ mod tests {
 
     #[tokio::test]
     async fn run_install_filtered_add_no_match_with_fail_flag_includes_d2_hint_for_bare_names() {
-        // Phase 2 audit regression: filtered install must surface the D2
+        // audit regression: filtered install must surface the D2
         // substring → glob migration hint when --fail-if-no-match fires AND
         // a filter looks like a bare name.
         let dir = tempfile::tempdir().unwrap();
@@ -13651,7 +13633,7 @@ mod tests {
         );
     }
 
-    // ── Phase 2 audit fix: install_root must be the member dir, not workspace ──
+    // ── audit fix: install_root must be the member dir, not workspace ──
 
     #[tokio::test]
     async fn run_install_filtered_add_mutates_targeted_member_manifest_on_fresh_workspace() {
@@ -13687,7 +13669,7 @@ mod tests {
 
         // Use the install_targets resolver directly — this avoids the
         // network-dependent run_with_options call and verifies the part
-        // of the workflow that Phase 2 owns.
+        // of the workflow that owns.
         let cwd = dir.path().join("packages").join("core");
         let targets = crate::commands::install_targets::resolve_install_targets(
             &cwd,
@@ -13714,7 +13696,7 @@ mod tests {
         );
 
         // Now mutate the manifest the way run_install_filtered_add would,
-        // and verify the result lands at packages/app. Phase 33: this is
+        // and verify the result lands at packages/app. this is
         // the explicit-Exact path, so stage writes the verbatim spec
         // and finalize is a no-op.
         stage_packages_to_manifest(
@@ -13740,7 +13722,7 @@ mod tests {
         assert!(root_after.get("dependencies").is_none());
     }
 
-    // ── Phase 2 audit fix #3 (workspace:^ resolver bug) — diagnostics + repro ──
+    // ── audit fix #3 (workspace:^ resolver bug) — diagnostics + repro ──
 
     /// DIAGNOSTIC: empirically confirm what the resolver sees when a member's
     /// `package.json` declares a cross-member dep via `workspace:^`. This is
@@ -14134,7 +14116,7 @@ mod tests {
     }
 
     // ────────────────────────────────────────────────────────────────────
-    // 2026-04-16: `lpm install` resolves devDependencies (bug fix audit).
+    // `lpm install` resolves devDependencies (bug fix audit).
     // Pre-fix, `run_with_options` only cloned `pkg.dependencies` — so
     // `lpm install -D vitest` landed vitest in the manifest but never
     // resolved or linked it. These tests pin the merge contract used
@@ -14205,7 +14187,7 @@ mod tests {
     fn install_merge_populates_deps_when_only_dev_dependencies_declared() {
         // `lpm install -D vitest` on a project with no regular deps must
         // still produce a non-empty resolver input — this is the exact
-        // case the pre-2026-04-16 bug silently no-op'd.
+        // case the pre-bug silently no-op'd.
         let mut deps: HashMap<String, String> = HashMap::new();
         let dev_deps: HashMap<String, String> =
             [("vitest".to_string(), "^1.0.0".to_string())].into();
@@ -14250,7 +14232,7 @@ mod tests {
     }
 
     // ────────────────────────────────────────────────────────────────────
-    // 2026-04-16 (D-impl-5): multi-member confirmation prompt.
+    // (): multi-member confirmation prompt.
     //
     // The bypass tests pin the CI/script-safe paths, and the PTY-backed
     // test below exercises the real interactive "decline → abort" branch
@@ -14349,15 +14331,14 @@ mod tests {
         }
     }
 
-    // ─── Phase 41: P4 split-context dedup ────────────────────────────
+    // ─── split-context dedup ────────────────────────────
     //
     // Bug: `resolved_to_install_packages` maps `ResolverPackage` → canonical
-    // name via `canonical_name()`, which strips the Phase 40 P4 split
+    // name via `canonical_name()`, which strips the split
     // `context` suffix. When the resolver emits multiple ResolvedPackage
     // rows for the same `(canonical_name, version)` — one per split scope
     // — the pre-fix implementation produced N identical `InstallPackage`
-    // rows. Downstream, `link_finalize` spawned N parallel Phase 3
-    // symlink-creation tasks for the same root path, which raced on
+    // rows. Downstream, `link_finalize` spawned N parallel     // symlink-creation tasks for the same root path, which raced on
     // `std::os::unix::fs::symlink` and returned `EEXIST` to whichever
     // thread lost, aborting the install with
     // "IO error: File exists (os error 17)".
@@ -14406,7 +14387,7 @@ mod tests {
             &resolved,
             &deps,
             &HashMap::new(),
-            &[], // R2.2: tests don't exercise ambient peer installs
+            &[], // tests don't exercise ambient peer installs
             &lpm_registry::RouteTable::from_mode_only(lpm_registry::RouteMode::Direct),
         );
 
@@ -14416,7 +14397,7 @@ mod tests {
             "P4 split contexts for the same (canonical_name, version) \
              MUST dedup to exactly one InstallPackage row — got {} rows. \
              Duplicates cascade into link_pairs and race link_finalize's \
-             Phase 3 root symlink creation.",
+             root symlink creation.",
             installed.len(),
         );
         assert_eq!(installed[0].name, "cross-spawn");
@@ -14433,7 +14414,7 @@ mod tests {
         );
     }
 
-    // ── R2.5 fix-1 — pre-R2.5 lockfile repair gate ─────────────────
+    // ──.5 lockfile repair gate ─────────────────
     //
     // The gate's contract:
     //   - v2+ lockfile (authoritative schema): trust empty
@@ -14453,7 +14434,7 @@ mod tests {
 
     #[test]
     fn r25_repair_gate_v2_lockfile_with_auto_install_takes_fast_path() {
-        // The post-R2.5 happy path: v2 lockfile, auto-install on,
+        // The current happy path: v2 lockfile, auto-install on,
         // schema is authoritative. Don't repair.
         let lf = make_lockfile_with_version(lpm_lockfile::LOCKFILE_VERSION);
         assert!(
@@ -14465,16 +14446,16 @@ mod tests {
 
     #[test]
     fn r25_repair_gate_v1_lockfile_with_auto_install_forces_repair() {
-        // The load-bearing test. A v1 lockfile (pre-R2.5) under
-        // `auto_install_peers = true` is suspect: it could be an
-        // R2.2-R2.4 buggy-writer artifact. Discard fast path so a
+        // The load-bearing test. A v1 lockfile under
+        // `auto_install_peers = true` is suspect: it may be missing
+        // peer-tracking state. Discard fast path so a
         // fresh resolve repopulates the new fields.
         let lf = make_lockfile_with_version(1);
         assert!(
             lockfile_needs_r25_repair(&lf, true),
             "v1 lockfile under auto_install_peers=true must force \
              fresh resolve — the silent ambient-peer-installs hole \
-             from R2.2-R2.4 cannot be repaired any other way"
+             that cannot be repaired any other way"
         );
     }
 
@@ -14502,8 +14483,7 @@ mod tests {
 
     #[test]
     fn r25_lockfile_version_is_2() {
-        // The schema-bump anchor. R2.5's writer side puts version=2
-        // on every fresh lockfile via `Lockfile::new`. If a future
+        // The schema-bump anchor.        // on every fresh lockfile via `Lockfile::new`. If a future
         // refactor drops this back to 1 without thinking through the
         // gate's truth table, this test fails first. Keep paired with
         // the gate tests above.
@@ -14527,7 +14507,7 @@ mod tests {
             &resolved,
             &deps,
             &HashMap::new(),
-            &[], // R2.2: tests don't exercise ambient peer installs
+            &[], // tests don't exercise ambient peer installs
             &lpm_registry::RouteTable::from_mode_only(lpm_registry::RouteMode::Direct),
         );
 
@@ -14554,7 +14534,7 @@ mod tests {
             &resolved,
             &deps,
             &HashMap::new(),
-            &[], // R2.2: tests don't exercise ambient peer installs
+            &[], // tests don't exercise ambient peer installs
             &lpm_registry::RouteTable::from_mode_only(lpm_registry::RouteMode::Direct),
         );
 
@@ -14562,7 +14542,7 @@ mod tests {
         assert_eq!(installed[0].version, "3.3.11");
     }
 
-    // ── Phase 59.0 (post-review): route-table-aware source URL ──────────────
+    // ── (post-review): route-table-aware source URL ──────────────
     // Confirms `resolved_to_install_packages` now produces source
     // strings that reflect the active RouteTable instead of a
     // hardcoded npmjs.org default. This realizes the day-4.5
@@ -14597,7 +14577,7 @@ mod tests {
             &resolved,
             &deps,
             &HashMap::new(),
-            &[], // R2.2: tests don't exercise ambient peer installs
+            &[], // tests don't exercise ambient peer installs
             &lpm_registry::RouteTable::from_mode_only(lpm_registry::RouteMode::Direct),
         );
 
@@ -14616,7 +14596,7 @@ mod tests {
             &resolved,
             &deps,
             &HashMap::new(),
-            &[], // R2.2: tests don't exercise ambient peer installs
+            &[], // tests don't exercise ambient peer installs
             &lpm_registry::RouteTable::from_mode_only(lpm_registry::RouteMode::Direct),
         );
 
@@ -14647,7 +14627,7 @@ mod tests {
             &resolved,
             &deps,
             &HashMap::new(),
-            &[], // R2.2: tests don't exercise ambient peer installs
+            &[], // tests don't exercise ambient peer installs
             &route_table,
         );
 
@@ -14674,11 +14654,11 @@ mod tests {
         );
     }
 
-    // ── Phase 43 P43-2 regression tests ─────────────────────────────────────
+    // ──3-2 regression tests ─────────────────────────────────────
 
-    /// Phase 43 P43-2 regression test #8 — `handle_tarball_not_found`
+    ///3-2 regression test #8 — `handle_tarball_not_found`
     /// must delete the project's own `lpm.lock` / `lpm.lockb`, not
-    /// CWD-relative files. Before the P43-2 fix, a programmatic
+    /// CWD-relative files. Before the3-2 fix, a programmatic
     /// install from a nested directory would leak stale state.
     #[test]
     fn phase43_handle_tarball_not_found_honors_project_dir() {
@@ -14707,7 +14687,7 @@ mod tests {
         assert!(matches!(err, LpmError::NotFound(ref msg) if msg.contains("some-pkg@1.0.0")));
     }
 
-    /// Phase 43 P43-2 regression test #9 — the fast-path writeback
+    ///3-2 regression test #9 — the fast-path writeback
     /// trigger fires on v1 → v2 binary migration even when no URL
     /// diverged. We can't easily test the full install here without
     /// a mock server, but we CAN test the trigger condition:
@@ -14774,7 +14754,7 @@ mod tests {
         assert_eq!(result.packages[0].name, "lodash");
     }
 
-    /// Phase 43 P43-2 regression test #9b — `try_lockfile_fast_path`
+    ///3-2 regression test #9b — `try_lockfile_fast_path`
     /// returns `needs_binary_upgrade = true` when `lpm.lockb` is
     /// missing entirely (no binary ever written). Same code path as
     /// the v1→v2 migration case but covers fresh projects that
@@ -14810,7 +14790,7 @@ mod tests {
         );
     }
 
-    /// Phase 43 P43-2 regression test — the writeback trigger skips
+    ///3-2 regression test — the writeback trigger skips
     /// when the binary is current AND no URL diverged (true happy
     /// path). `needs_binary_upgrade` is false when a v2 binary
     /// exists and opens cleanly.
@@ -14846,17 +14826,17 @@ mod tests {
         );
     }
 
-    /// Phase 43 P43-2 **failing-test-first retrofit** (2026-04-18).
+    ///3-2 **failing-test-first retrofit** .
     ///
-    /// Core Phase 43 contract: when the lockfile stores a tarball
+    /// Core contract: when the lockfile stores a tarball
     /// URL and the gate accepts it, `try_lockfile_fast_path` MUST
     /// populate `InstallPackage.tarball_url = Some(url)`. Without
     /// this, every warm install still pays the per-package metadata
-    /// round-trip — i.e., Phase 43 is a no-op.
+    /// round-trip — i.e., is a no-op.
     ///
     /// Pre-fix (the `tarball_url: None` stub at install.rs:~2908),
     /// this test fails — the field stays `None` regardless of
-    /// lockfile content. Empirically verified 2026-04-18 by
+    /// lockfile content. Empirically verified by
     /// surgically reverting the gate logic to the pre-fix stub:
     /// this test FAILED in that world (expected `Some(url)`, got
     /// `None`), passes with the gate in place. Retrofits the
@@ -14900,14 +14880,14 @@ mod tests {
         assert_eq!(gate_stats.scheme_mismatch.load(Ordering::Relaxed), 0);
     }
 
-    /// Phase 43 P43-2 **failing-test-first retrofit** (2026-04-18).
+    ///3-2 **failing-test-first retrofit** .
     ///
     /// Complement to the acceptance test: gate-REJECTED URLs must
     /// downgrade to `None` AND bump the matching mismatch counter.
     /// Three sub-cases: RejectedShape, RejectedOrigin, RejectedScheme.
     /// Under the pre-fix stub, counters stay at 0 — test fails on
     /// the counter assertions. Empirically verified FAILED under
-    /// the pre-fix stub (2026-04-18).
+    /// the pre-fix stub .
     #[test]
     fn phase43_gate_rejected_urls_downgrade_to_none_with_telemetry() {
         use std::sync::atomic::Ordering;
@@ -14967,9 +14947,9 @@ mod tests {
         assert_eq!(stats.scheme_mismatch.load(Ordering::Relaxed), 1);
     }
 
-    /// Phase 43 P43-2 **failing-test-first retrofit** (2026-04-18).
+    ///3-2 **failing-test-first retrofit** .
     ///
-    /// Pre-Phase-43 lockfile shape: `tarball = None`. Fast path
+    /// Pre-lockfile shape: `tarball = None`. Fast path
     /// must produce `InstallPackage.tarball_url = None` with no
     /// counters bumped. Boundary-case guard — passes in both pre-
     /// and post-fix states, but documents the contract explicitly.
@@ -14996,7 +14976,7 @@ mod tests {
         let client = RegistryClient::new();
         let gate_stats = GateStats::default();
         let result = try_lockfile_fast_path(&lockfile_path, &deps, &client, &gate_stats, false)
-            .expect("fast path should succeed on pre-Phase-43 lockfile");
+            .expect("fast path should succeed on pre-existing lockfile");
 
         assert_eq!(result.packages[0].tarball_url, None);
 
@@ -15006,13 +14986,13 @@ mod tests {
         assert_eq!(gate_stats.scheme_mismatch.load(Ordering::Relaxed), 0);
     }
 
-    // ── Phase 46 P6 Chunk 4: post-auto-build triage pointer ─────────
+    // ── post-auto-build triage pointer ─────────
     //
     // Tests exercise every gate of `compute_post_auto_build_triage_pointer`
     // independently, plus the all-four-gates-pass case. The I/O
     // half (`maybe_emit_post_auto_build_triage_pointer`) is a one-
     // line wrapper over `output::warn` and is exercised by the
-    // Chunk 5 integration fixture, not these unit tests — capturing
+    // integration fixture, not these unit tests — capturing
     // stdout here would add flake without buying coverage beyond
     // what the decision-function tests already provide.
 
@@ -15064,7 +15044,7 @@ mod tests {
 
     #[test]
     fn p6_chunk4_pointer_fires_under_triage_when_amber_remains() {
-        // The core Chunk 4 behavior: auto-build attempted, triage,
+        // The core behavior: auto-build attempted, triage,
         // non-JSON, and the capture had amber entries (reds would
         // trigger too). User sees a pointer telling them `lpm
         // approve-scripts` is next.
@@ -15077,7 +15057,7 @@ mod tests {
         );
         let msg = msg.expect("pointer must fire under triage when amber > 0");
         // Anchor the wire shape so CI scripts that grep this line stay
-        // stable across refactors. The shape is a P6 contract.
+        // stable across refactors. The shape is a contract.
         assert!(msg.contains("remain blocked after auto-build"));
         assert!(msg.contains("2 amber"));
         assert!(msg.contains("0 red"));
@@ -15088,7 +15068,7 @@ mod tests {
     fn p6_chunk4_pointer_fires_under_triage_when_red_remains() {
         // Red-only is the same contract as amber-only: the pointer
         // fires. A red blocked package cannot be auto-approved by
-        // any P6 path; the user must review.
+        // any path; the user must review.
         let bc = bc_with_tiers(3, 0, 1);
         let msg = compute_post_auto_build_triage_pointer(
             true,
@@ -15127,7 +15107,7 @@ mod tests {
         // + mixed tiers: auto-build never ran, so a "remain blocked
         // after auto-build" message would misrepresent what happened.
         // The pre-auto-build triage summary line covers this case;
-        // Chunk 4's pointer is strictly a follow-up.
+        // pointer is strictly a follow-up.
         let bc = bc_with_tiers(1, 1, 1);
         assert_eq!(
             compute_post_auto_build_triage_pointer(
@@ -15161,8 +15141,8 @@ mod tests {
     #[test]
     fn p6_chunk4_pointer_silent_under_allow() {
         // Allow semantics don't exercise the blocked-set flow in the
-        // canonical case; a pointer here would be confusing. P1-era
-        // allow-widening gap tracked for Chunk 6.
+        // canonical case; a pointer here would be confusing.
+        // (The allow-widening gap is a deferred optimization.)
         let bc = bc_with_tiers(0, 2, 1);
         assert_eq!(
             compute_post_auto_build_triage_pointer(
@@ -15178,7 +15158,7 @@ mod tests {
     #[test]
     fn p6_chunk4_pointer_silent_in_json_mode() {
         // JSON mode's channel is the per-entry `static_tier` in the
-        // `blocked_packages` array (also Chunk 4). Emitting a stdout
+        // `blocked_packages` array. Emitting a stdout
         // warn line here would muddle the JSON contract for agents.
         let bc = bc_with_tiers(0, 2, 1);
         assert_eq!(
@@ -15213,12 +15193,12 @@ mod tests {
         assert!(msg.ends_with("Run `lpm approve-scripts` to review."));
     }
 
-    // ─── Phase 46 P7 Chunk 2 — version-diff hint computation ──────
+    // ─── — version-diff hint computation ──────
     //
     // Pure-decision tests for `compute_post_install_version_diff_hints`.
     // The I/O wrapper (`maybe_emit_post_install_version_diff_hints`)
     // is exercised by the C5 reference fixture under a real
-    // subprocess + the existing P6 stream-separation pattern; unit-
+    // subprocess + the existing stream-separation pattern; unit-
     // testing it here would require capturing stderr (flaky) without
     // adding coverage beyond what the pure decision already gives.
 
@@ -15399,7 +15379,7 @@ mod tests {
         );
     }
 
-    // ── Phase 59.0 day-5b: fetch_and_store_tarball_url end-to-end ───────────
+    // ── day-5b: fetch_and_store_tarball_url end-to-end ───────────
 
     fn build_test_tarball() -> Vec<u8> {
         // Minimal valid npm tarball: package/package.json with a name+version,
@@ -15483,7 +15463,7 @@ mod tests {
         // Returned SRI matches an independent SHA-512 of the bytes.
         assert_eq!(computed_sri, expected_sri);
         // The URL we actually fetched is what we report back (no
-        // redirect rewriting — Phase 59 §6.1 contract).
+        // redirect rewriting — contract).
         assert_eq!(final_url, url);
         // Tarball is materialized at the CAS path keyed by integrity.
         assert!(store.has_tarball(&computed_sri));
@@ -15607,7 +15587,7 @@ mod tests {
         // doesn't itself dedupe (the store does), so the network
         // request count actually goes up to 2 here. The win is at
         // the *extract* layer: the second store_tarball_at_cas_path
-        // call is a fast-path return. (A future Phase 59.x might
+        // call is a fast-path return. (A future might
         // add a pre-fetch CAS-existence check; not in 5b's scope.)
         Mock::given(method("GET"))
             .and(path("/foo.tgz"))
@@ -15681,7 +15661,7 @@ mod tests {
         }
     }
 
-    // ── Phase 59.0 day-5.5 audit response: HIGH-1 silent substitution ───────
+    // ── day-5.5 audit response: HIGH-1 silent substitution ───────
     // Audit finding: a registry-CAS hit at (name, version) was being
     // accepted as fulfilling a Source::Tarball dep with the same
     // name+version, silently substituting registry content for the
@@ -15801,7 +15781,7 @@ mod tests {
 
     #[test]
     fn store_has_source_aware_local_tarball_uses_tarball_local_subtree() {
-        // Phase 59.1 day-1 follow-up: parallel coverage for the
+        // day-1 follow-up: parallel coverage for the
         // store_has_source_aware routing fix. A local-tarball
         // package with content stored in `tarball-local/` must
         // return true; a registry CAS hit at (name, version) for
@@ -15936,7 +15916,7 @@ mod tests {
 
     #[test]
     fn store_path_source_aware_routes_local_tarball_to_tarball_local_subtree() {
-        // Phase 59.1 day-1 follow-up: a `Source::Tarball` whose URL
+        // day-1 follow-up: a `Source::Tarball` whose URL
         // is `file:...` (local-file tarball — F6) must route to the
         // `tarball-local/` CAS subtree, NOT the remote-tarball
         // `tarball/` subtree. Without this, day-1's pre_resolve
@@ -16052,7 +16032,7 @@ mod tests {
         assert_eq!(path, store.package_dir("react", "19.0.0"));
     }
 
-    // ── Phase 59.0 (post-review): store_path_or_err typed-error path ────────
+    // ── (post-review): store_path_or_err typed-error path ────────
 
     #[test]
     fn store_path_or_err_returns_typed_error_for_tarball_without_sri() {
@@ -16131,7 +16111,7 @@ mod tests {
         assert_eq!(path, store.package_dir("react", "19.0.0"));
     }
 
-    // ── Phase 59.0 day-6a + 59.1 day-1: pre_resolve_non_registry_deps ──────
+    // ── day-6a + 59.1 day-1: pre_resolve_non_registry_deps ──────
     // End-to-end test of the manifest-side wiring: a manifest dep map
     // containing a tarball-URL spec is correctly extracted, downloaded,
     // and converted into an InstallPackage with the right source +
@@ -16288,7 +16268,7 @@ mod tests {
         assert_eq!(deps, original_deps);
     }
 
-    // ── Phase 59.0 day-6b (F5): --strict-integrity ──────────────────────────
+    // ── day-6b (F5): --strict-integrity ──────────────────────────
 
     #[tokio::test]
     async fn pre_resolve_strict_integrity_rejects_undeclared_sri() {
@@ -16378,7 +16358,7 @@ mod tests {
         assert_eq!(install_pkgs[0].integrity.as_deref(), Some(sri.as_str()));
     }
 
-    // ── Phase 59.0 (post-review): unsupported Specifier variants ────────────
+    // ── (post-review): unsupported Specifier variants ────────────
     // Git/File/Link specifiers parse cleanly but the install pipeline
     // doesn't support them in 59.0. Pre-resolve must surface a clear,
     // actionable error at the manifest boundary instead of letting the
@@ -16443,7 +16423,7 @@ mod tests {
         assert!(err.to_string().contains("forked"));
     }
 
-    // ── Phase 59.1 day-3 (F7): directory-dep happy paths ──────────────────
+    // ── day-3 (F7): directory-dep happy paths ──────────────────
 
     #[tokio::test]
     async fn pre_resolve_extracts_directory_dep_from_file_specifier() {
@@ -16502,7 +16482,7 @@ mod tests {
         // No integrity (mutable content) and no tarball_url.
         assert!(p.integrity.is_none());
         assert!(p.tarball_url.is_none());
-        // Dep KEY for root_link_names (umbrella §7 OQ-4 dep-key vs
+        // Dep KEY for root_link_names (umbrella
         // fetched-name policy).
         assert_eq!(
             p.root_link_names.as_deref(),
@@ -16595,7 +16575,7 @@ mod tests {
 
     #[tokio::test]
     async fn pre_resolve_directory_dep_renamed_via_dep_key() {
-        // umbrella §7 OQ-4: dep KEY controls node_modules layout;
+        // umbrella
         // package.json `name` controls store identity. A renamed dep
         // (`"my-alias": "file:./packages/foo"` where foo's
         // package.json says name "foo") still works.
@@ -16686,7 +16666,7 @@ mod tests {
         );
     }
 
-    /// **Phase 59.1 audit response (post-day-7)** — every non-Registry
+    /// every non-Registry
     /// source produces a non-None `wrapper_id`, and `materialization_for_source`
     /// picks `DirectorySource` only for `Source::Directory` / `Source::Link`.
     /// Pre-audit, `wrapper_id_for_source` returned `None` for tarballs,
@@ -16770,7 +16750,7 @@ mod tests {
         }
     }
 
-    /// **Phase 59.1 audit response (post-day-7)** — the principal
+    /// the principal
     /// known gap fix. Two tarball InstallPackages at the same
     /// `(name, version)` but with different URLs (one remote https,
     /// one local file:) must produce DISTINCT wrapper_ids. Pre-audit
@@ -16818,7 +16798,7 @@ mod tests {
         assert!(local_wid.starts_with("t-"));
     }
 
-    /// **Phase 59.1 audit response (round 2)** — `classify_source_dep`
+    /// `classify_source_dep`
     /// rejects tarball-URL, git, and file-tarball transitives at
     /// manifest-read time. Pre-audit, all three were classified as
     /// `DepKind::Registry` and silently appended to the consumer's
@@ -16873,7 +16853,7 @@ mod tests {
         }
     }
 
-    /// **Phase 59.1 audit response (round 2)** — the supported
+    /// the supported
     /// transitive shapes (registry semver / npm-alias / workspace,
     /// file: directory, link:) all classify correctly without error.
     /// Regression guard against an over-eager reject in the round-2
@@ -16919,7 +16899,7 @@ mod tests {
         }
     }
 
-    /// **Phase 59.1 audit response (round 2)** — when a local source's
+    /// when a local source's
     /// `package.json` declares an unsupported transitive dep, the
     /// error surfaces from `read_source_dep_specs` (the manifest-
     /// read boundary) with the dep name, raw spec, and source dir
@@ -16965,7 +16945,7 @@ mod tests {
         );
     }
 
-    /// **Phase 59.1 audit response (round 3)** — when a local source's
+    /// when a local source's
     /// `package.json` declares `"<name>": "workspace:*"` for a name
     /// that matches a workspace member, `recurse_local_source_deps`
     /// must SKIP appending the spec to the consumer deps map. Pre-
@@ -17041,7 +17021,7 @@ mod tests {
         assert_eq!(result.install_pkgs[0].name, "foo");
     }
 
-    /// **Phase 59.1 audit response (round 3)** — when a local source's
+    /// when a local source's
     /// `package.json` declares `"<name>": "workspace:*"` but no
     /// workspace member matches (e.g., the consumer's project is
     /// not a workspace, or the named package isn't a member),
@@ -17211,7 +17191,7 @@ mod tests {
         assert!(msg.contains("unreadable"), "got: {msg}");
     }
 
-    // ── Phase 59.1 day-1 (F6): local-tarball happy paths ───────────────────
+    // ── day-1 (F6): local-tarball happy paths ───────────────────
 
     #[tokio::test]
     async fn pre_resolve_extracts_local_tarball_from_file_specifier() {
@@ -17376,7 +17356,7 @@ mod tests {
     #[tokio::test]
     async fn pre_resolve_local_tarball_dep_key_warns_on_name_mismatch() {
         // Same dep-key vs fetched-name policy as the tarball-URL arm
-        // (pre-plan §7 OQ-4 — locked as warn-not-reject). Asserted
+        // (pre-plan— locked as warn-not-reject). Asserted
         // here by checking that the InstallPackage uses the dep KEY
         // for `root_link_names` even when the package's real name
         // differs.
@@ -17416,7 +17396,7 @@ mod tests {
         );
     }
 
-    // ── Phase 59.1 day-4 (F8): link: dep happy paths + boundaries ─────────
+    // ── day-4 (F8): link: dep happy paths + boundaries ─────────
 
     #[tokio::test]
     async fn pre_resolve_extracts_link_dep_from_link_specifier() {
@@ -17646,7 +17626,7 @@ mod tests {
     #[tokio::test]
     async fn pre_resolve_link_dep_dep_key_warns_on_name_mismatch() {
         // Same dep-key vs fetched-name policy as every other arm
-        // (umbrella §7 OQ-4 — locked as warn-not-reject).
+        // (umbrella— locked as warn-not-reject).
         let store_root = tempfile::tempdir().unwrap();
         let store = PackageStore::at(store_root.path());
         let client = Arc::new(RegistryClient::new());
@@ -17725,7 +17705,7 @@ mod tests {
         assert!(pkg.store_has_source_aware(&store, project_dir.path()));
     }
 
-    // ── Phase 59.1 day-5 (F7-transitive): recursive walk + post-resolve fix-up ─
+    // ── day-5 (F7-transitive): recursive walk + post-resolve fix-up ─
 
     fn make_local_pkg(parent: &Path, name: &str, version: &str, deps_json: &str) -> PathBuf {
         let dir = parent.join(name);
@@ -17847,7 +17827,7 @@ mod tests {
     async fn pre_resolve_consumer_decl_wins_over_transitive_registry_dep() {
         // First-come-first-serve merge: the consumer's own
         // declaration of `lodash@^5` wins over A's declaration of
-        // `lodash@^4`. Acceptable v1 (umbrella OQ-3 limitation).
+        // `lodash@^4`. Acceptable v1 (umbrella).
         let store_root = tempfile::tempdir().unwrap();
         let store = PackageStore::at(store_root.path());
         let client = Arc::new(RegistryClient::new());
@@ -18179,7 +18159,7 @@ mod tests {
         assert!(packages[0].dependencies.is_empty());
     }
 
-    // ── Phase 59.1 day-6 (F9 + F9a): workspace overlap + node_modules dedupe ─
+    // ── day-6 (F9 + F9a): workspace overlap + node_modules dedupe ─
 
     fn make_workspace_member(parent: &Path, name: &str, version: &str) -> WorkspaceMemberLink {
         let dir = parent.join(name);
@@ -18575,13 +18555,13 @@ mod tests {
         assert_eq!(deps.len(), 4, "all 4 supported deps must remain in the map");
     }
 
-    // ── Phase 59.0 day-6b: redirect handling ────────────────────────────────
-    // Per pre-plan §6.1: lockfile records the *declared* URL, not
+    // ── day-6b: redirect handling ────────────────────────────────
+    // Per pre-plan: lockfile records the *declared* URL, not
     // the final-redirect target. The integrity is computed from the
     // bytes that actually arrive (post-redirect), and that's what
     // gets recorded in the source identity.
 
-    // ── Phase 59.0 day-7: cross-source collision regression ────────────────
+    // ── day-7: cross-source collision regression ────────────────
     // The thorough audit's HIGH-1 follow-up: a Source::Tarball pkg
     // and a Source::Registry pkg with the same (name, version) must
     // produce distinct PackageKeys so the install-pipeline's
@@ -18711,7 +18691,7 @@ mod tests {
         // body (proves redirect was followed and content is right).
         assert_eq!(computed_sri, sri);
         // Identity preserves the DECLARED URL, not the redirect target.
-        // Pre-plan §6.1 contract: lockfile freezes content (via
+        // Pre-plan contract: lockfile freezes content (via
         // integrity) plus user-controlled URL, not the redirect path.
         assert_eq!(
             final_url, declared_url,

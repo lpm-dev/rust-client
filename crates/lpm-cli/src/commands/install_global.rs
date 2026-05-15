@@ -1,9 +1,9 @@
-//! `lpm install -g <pkg>` — phase 37 M3.2 persistent install pipeline.
+//! `lpm install -g <pkg>` — persistent global install pipeline.
 //!
-//! Three-phase transaction (plan §"Crash-safe transactions"):
+//! Three-phase crash-safe transaction:
 //!
 //! 1. Pre-resolve via registry (no lock) — pick a concrete version,
-//!    integrity, source. Phase 33 [`save_spec`] decides what
+//!    integrity, source. [`save_spec`] decides what
 //!    `saved_spec` to persist. Then **acquire `.tx.lock`**, write
 //!    INTENT to WAL, write `[pending.<pkg>]` to manifest with empty
 //!    `commands` (the install pipeline discovers commands at step 2),
@@ -43,7 +43,7 @@ use lpm_semver::{Version, VersionReq};
 use std::collections::{BTreeMap, HashSet};
 use std::path::PathBuf;
 
-/// Phase 37 M4: user-supplied resolutions for command-name collisions.
+/// M4: user-supplied resolutions for command-name collisions.
 ///
 /// Built from the `--replace-bin` and `--alias` Install flags at the
 /// CLI dispatch site ([`CollisionResolution::parse_from_flags`]).
@@ -167,7 +167,7 @@ impl CollisionResolution {
     }
 }
 
-/// Phase 68: per-invocation security overrides forwarded from `lpm install -g`.
+/// per-invocation security overrides forwarded from `lpm install -g`.
 /// Bundles the five flags the dispatcher used to silently drop so the
 /// `do_install` boundary is clear and adding/removing a knob doesn't
 /// touch every call site.
@@ -189,7 +189,7 @@ pub async fn run(
     overrides: InstallGlobalOverrides,
 ) -> Result<(), LpmError> {
     let root = LpmRoot::from_env()?;
-    // Phase 35 Step 6 fix: use the injected client (carries
+    // Step 6 fix: use the injected client (carries
     // `--registry` + SessionManager). The local `build_registry()`
     // helper is removed.
     let registry = client.clone_with_config();
@@ -345,7 +345,7 @@ async fn pre_resolve(registry: &RegistryClient, spec: &str) -> Result<ResolvedSp
         PackageSource::UpstreamNpm
     };
 
-    // Phase 33 save-spec decision. Global installs honor the same
+    // save-spec decision. Global installs honor the same
     // precedence as project installs (audit Medium #1 from M2.3 round).
     let decision = decide_saved_dependency_spec(
         &intent,
@@ -457,7 +457,7 @@ fn prepare_locked(root: &LpmRoot, resolved: &ResolvedSpec) -> Result<PrepResult,
         install_root.file_name().unwrap().to_string_lossy()
     );
 
-    // Phase 37 M0 (rev 6): pre-install path-budget guard. Reject the
+    // M0 (rev 6): pre-install path-budget guard. Reject the
     // install up front if the chosen install root would push us over the
     // 247-char budget — failing fast with an actionable LPM_HOME hint
     // beats failing mid-extraction with cryptic platform errors. No-op
@@ -538,20 +538,20 @@ async fn do_install(
     // linker logic — global install is a self-hosted install with a
     // specific synthetic project.
     //
-    // Phase 37 M5.2 addition: inject the global trusted-dependencies
+    // M5.2 addition: inject the global trusted-dependencies
     // into the synthesized `lpm.trustedDependencies` so the inner
     // install pipeline's strict-gate check honours user approvals
     // recorded via `lpm approve-scripts --global`. Without this, every
     // scripts-carrying transitive dep would block on every global
     // install even after the user approved it.
     //
-    // Phase 68: also threads the user's `--allow-new`,
+    // also threads the user's `--allow-new`,
     // `--min-release-age`, `--ignore-provenance-drift[-all]`,
     // `--policy`/`--triage`/`--yolo`, and `--auto-build` overrides
     // into the inner pipeline so all four security gates (cooldown,
     // drift, script-policy, sandbox auto-build) fire end-to-end on `-g`.
     //
-    // Phase 37 M0 (rev 6): route the install-root creation + synthetic
+    // M0 (rev 6): route the install-root creation + synthetic
     // package.json write through `as_extended_path` so a deeply-nested
     // `~/.lpm/global/installs/` path doesn't truncate at the legacy
     // 260-char Windows ceiling. No-op on POSIX.
@@ -576,11 +576,11 @@ async fn do_install(
         false, // offline
         false, // force
         overrides.allow_new,
-        false, // strict_integrity (Phase 59.0 F5) — global installs use lockfile path
+        false, // strict_integrity — global installs use lockfile path
         None,  // linker_override
         true,  // no_skills (global installs skip skill auto-install)
         true,  // no_editor_setup (global installs are not project-specific)
-        // Phase 68 §5d: keep the inner project-shape security summary
+        // keep the inner project-shape security summary
         // suppressed — the global wrapper banner at
         // `emit_post_install_blocked_warning` is the right surface and
         // routes users to `lpm approve-scripts --global`.
@@ -589,7 +589,7 @@ async fn do_install(
         None,
         None,
         overrides.script_policy_override,
-        // Phase 46 slice 1: `lpm install -g` does not expose its own
+        // slice 1: `lpm install -g` does not expose its own
         // `--advisor` flag yet. The global install path stays portable-
         // by-default; opt-in to an advisor uplift for the synthesized
         // project install would belong with a future `-g`-specific
@@ -597,7 +597,7 @@ async fn do_install(
         None,
         overrides.min_release_age_override,
         overrides.drift_ignore_policy.clone(),
-        // Phase 46.1 rework: `lpm install -g` does not surface its
+        // rework: `lpm install -g` does not surface its
         // own sandbox-mode flags. The env / config / default chain
         // inside `rebuild::run` still applies — `LPM_STRICT_SANDBOX=1`
         // still kicks in for CI globally-installed tooling.
@@ -887,7 +887,7 @@ fn commit_locked(
         )?;
     }
 
-    // Phase 37 M3 (audit follow-up): three-artifact invariant — on
+    // M3 (audit follow-up): three-artifact invariant — on
     // Windows a command is "owned" only when all three of its shim
     // artifacts (`.cmd`, `.ps1`, no-extension bash shim) are present.
     // emit_shim already writes the triple, but a partial failure
@@ -974,7 +974,7 @@ fn format_collisions(collisions: &[CommandCollision]) -> String {
         .join("\n")
 }
 
-/// Phase 37 M4.3: unresolved-collision error with a copy-pasteable
+/// M4.3: unresolved-collision error with a copy-pasteable
 /// remediation. Replaces the pre-M4 "wait for M4" wording. Output
 /// shape:
 ///
@@ -1722,7 +1722,7 @@ fn print_success(
 
 // ─── Helpers ─────────────────────────────────────────────────────────
 
-// Phase 35 Step 6 fix: removed `build_registry` — `run` now receives
+// Step 6 fix: removed `build_registry` — `run` now receives
 // the injected `&RegistryClient` so `--registry` and `SessionManager`
 // are honored.
 
@@ -1744,7 +1744,7 @@ fn sanitize_inner_name(name: &str) -> String {
     name.replace(['@', '/', '.'], "-")
 }
 
-/// Phase 37 M5.2: build the synthetic `package.json` body for the
+/// M5.2: build the synthetic `package.json` body for the
 /// install root. Extends the pre-M5 minimal shape with an
 /// `lpm.trustedDependencies` Rich-form map populated from
 /// `~/.lpm/global/trusted-dependencies.json`, so the inner project
@@ -1813,7 +1813,7 @@ fn synthesize_pkg_json(
     Ok(serde_json::Value::Object(obj))
 }
 
-/// Phase 37 M5.2: emit a post-install banner if the new install root's
+/// M5.2: emit a post-install banner if the new install root's
 /// per-install `build-state.json` surfaces packages not covered by the
 /// global trust list. Mirrors the project-level
 /// `install::run`'s post-install security summary (which is suppressed
@@ -1915,12 +1915,11 @@ mod tests {
                     ("HOME", home.as_os_str().to_owned()),
                     ("LPM_HOME", lpm_home.as_os_str().to_owned()),
                     ("LPM_REGISTRY_URL", registry_url.into()),
-                    // Phase 66 Phase 4d — install_global tests assert on
+                    // — install_global tests assert on
                     // v1 store-pipeline interactions (tarball fetch counts,
                     // wrapper layout, etc.). Pin to v1 since v2's
                     // regression coverage lives in the audit-fixture CI
-                    // matrix; install_global's v2 surface is a Phase 4
-                    // follow-up.
+                    // matrix; install_global's v2 surface is a                     // follow-up.
                     ("LPM_STORE_VERSION", "v1".into()),
                 ]),
             }
@@ -2189,7 +2188,7 @@ mod tests {
             ],
         );
 
-        // Phase 49: `install_global::run` drives the orchestration in
+        // `install_global::run` drives the orchestration in
         // `install.rs::run_with_options`, which builds a `BfsWalker` that
         // reads `RouteMode::from_env_or_default()`. Default in the
         // shipped binary is `Direct` — the walker hits `npm_registry_url`
@@ -2219,7 +2218,7 @@ mod tests {
                 .respond_with(ResponseTemplate::new(200).set_body_json(metadata))
                 .mount(&server)
                 .await;
-            // npm-direct path (Direct mode, the shipped §5 default).
+            // npm-direct path (Direct mode, the shipped default).
             Mock::given(method("GET"))
                 .and(match_path(format!("/{name}")))
                 .respond_with(ResponseTemplate::new(200).set_body_json(metadata))
@@ -2929,7 +2928,7 @@ mod tests {
                 alias_name,
                 entry_snapshot,
             } => {
-                // M4 audit Finding #3: alias-owner snapshots are keyed
+                // M4 audit alias-owner snapshots are keyed
                 // by the exposed name (the alias key), not the owner
                 // package. Pin that.
                 assert_eq!(alias_name, "serve");
