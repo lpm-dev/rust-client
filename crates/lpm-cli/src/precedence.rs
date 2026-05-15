@@ -1,21 +1,20 @@
-//! Generic precedence resolver for Phase 48 containment knobs.
+//! Generic precedence resolver for containment knobs.
 //!
-//! Implements the three-layer containment model from
-//! [Phase 48 §6](../../../../../../a-package-manager/DOCS/new-features/37-rust-client-RUNNER-VISION-phase48.md).
+//! Implements the three-layer containment model.
 //! The resolver is the single source of truth for "given these inputs,
 //! what's the effective policy, and what got rejected along the way."
 //!
-//! # Scope for Phase 48 P0
+//! # Scope
 //!
 //! This module ships the **pure-policy** side of the three-layer model
 //! first — the `resolve_pure_policy` function below handles
 //! `scriptPolicy` (legacy), `network-policy` (new), and
 //! `install-policy.strict-behavioral` (new) precedence. Per-package
 //! capability knobs (`passEnv`, `sandboxLimits`, `readProject`) land
-//! in a sibling resolver in subsequent P0 commits — their shape is
+//! in a sibling resolversubsequently — their shape is
 //! similar but the approval-tuple binding is a distinct concern.
 //!
-//! # Pure-policy rule (phase48.md §6 "Pure-policy knobs — single semantic")
+//! # Pure-policy rule ("Pure-policy knobs — single semantic")
 //!
 //! A project value that matches the user floor or tightens below it is
 //! honored. A project value that would loosen beyond the floor is
@@ -23,13 +22,13 @@
 //! approval path for pure-policy knobs; "loosen" strictly means
 //! "project declaration → drop, surface warning."
 //!
-//! Legacy Phase 46 knobs keep project > user precedence as long as
-//! `force-security-floor = false` — this is the Phase 46 back-compat
+//! Legacy knobs keep project > user precedence as long as
+//! `force-security-floor = false` — this is the back-compat
 //! contract. When `force-security-floor = true`, legacy and new knobs
 //! behave identically: user is floor for both, CLI loosening flags
 //! suppressed, project loosening rejected.
 //!
-//! # Force-security-floor interactions (§6 "Gap 4 kill-switch")
+//! # Force-security-floor interactions ("Gap 4 kill-switch")
 //!
 //! When the flag is set:
 //! - A CLI value that loosens the floor is dropped (`Rejection` with
@@ -48,23 +47,22 @@ use std::fmt;
 
 // ── Public types ──────────────────────────────────────────────────
 
-/// Whether a knob is subject to Phase 46 back-compat precedence.
+/// Whether a knob is subject to back-compat precedence.
 ///
 /// [`PolicyKind::Legacy`] knobs (`scriptPolicy`, `sandboxWriteDirs`
-/// — the latter handled by a separate resolver) retain the Phase 46
-/// project > user order when `force-security-floor = false`. The
-/// default flip for legacy knobs is scheduled for Phase 5 (Phase 49),
-/// not P0.
+/// — the latter handled by a separate resolver) retain the /// project > user order when `force-security-floor = false`. The
+/// default flip for legacy knobs is scheduled for,
+
 ///
 /// [`PolicyKind::New`] knobs (`network-policy`,
 /// `install-policy.strict-behavioral`) always use user-is-floor, with
 /// project values that loosen below the floor rejected at load time.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PolicyKind {
-    /// Shipped before Phase 48; project > user by default unless
+    /// Shipped; project > user by default unless
     /// `force-security-floor` is set.
     Legacy,
-    /// Introduced in Phase 48; user is always the floor.
+    /// Introduced; user is always the floor.
     New,
 }
 
@@ -99,7 +97,7 @@ impl fmt::Display for PolicyTier {
 /// Why a candidate value was rejected during resolution.
 ///
 /// These map 1:1 to the three distinct warning triggers listed in
-/// [Phase 48 P0's migration-path bullet](../../../../../../a-package-manager/DOCS/new-features/37-rust-client-RUNNER-VISION-phase48.md):
+/// the migration-path contract:
 /// callers choose wording per variant so users can tell which kind
 /// of containment action just happened.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -110,7 +108,7 @@ pub enum RejectionReason {
     /// `force-security-floor = true` rejected a project-config
     /// loosening value. Applies to both legacy and new knobs.
     ForceFlagRejectsProject,
-    /// New Phase 48 knob: project value rejected because it would
+    /// New knob: project value rejected because it would
     /// loosen below the user floor. Does NOT require the force flag
     /// — new-knob precedence is user-is-floor by default.
     NewKnobProjectLoosens,
@@ -168,7 +166,7 @@ pub trait PurePolicyKnob: Copy + PartialEq + Eq {
     /// Canonical name for user-facing messages (kebab-case).
     const NAME: &'static str;
 
-    /// Whether the knob follows Phase 46 legacy precedence or the
+    /// Whether the knob follows legacy precedence or the
     /// new-knob user-is-floor rule.
     const KIND: PolicyKind;
 
@@ -248,11 +246,10 @@ pub fn resolve_pure_policy<T: PurePolicyKnob>(inputs: PolicyInputs<T>) -> Resolu
 
     // ── Branch 2: no force flag, legacy knob ──
     //
-    // Phase 46 order preserved: CLI > project > user > default, no
-    // loosening checks. This is the Phase 46 back-compat contract
-    // documented in §6 "Gap 4 default for legacy knobs — honest
-    // framing"; the default flip for legacy knobs is Phase 5 (Phase
-    // 49), not P0.
+    // order preserved: CLI > project > user > default, no
+    // loosening checks. This is the back-compat contract
+    // documented in "Gap 4 default for legacy knobs — honest
+    // framing". The default flip for legacy knobs
     if matches!(T::KIND, PolicyKind::Legacy) {
         let (effective, effective_source) = if let Some(c) = inputs.cli {
             (c, PolicyTier::Cli)
@@ -272,7 +269,7 @@ pub fn resolve_pure_policy<T: PurePolicyKnob>(inputs: PolicyInputs<T>) -> Resolu
     //
     // User-is-floor default. CLI still wins if present (CLI is a
     // live user action); project is rejected if it would loosen the
-    // user floor. This is the rule that Phase 48 gets to apply
+    // user floor. This is the rule that gets to apply
     // without a back-compat carve-out because these knobs are new.
     let project_keep = match inputs.project {
         Some(p) if p.loosens(floor) => {
@@ -326,11 +323,11 @@ mod tests {
     use super::*;
     use crate::script_policy_config::ScriptPolicy;
 
-    /// Test-only stand-in for a Phase 48 new-knob policy.
+    /// Test-only stand-in for a new-knob policy.
     ///
-    /// Real `network-policy` lands in P3 with the backend wiring;
+    /// Real `network-policy` lands in with the backend wiring;
     /// the resolver only needs a representative enum to exercise
-    /// the [`PolicyKind::New`] code path under P0, so we ship this
+    /// the [`PolicyKind::New`] code path under, so we ship this
     /// as a local test type rather than publishing a half-built
     /// public API.
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -371,9 +368,9 @@ mod tests {
         assert!(!NetworkPolicy::Allow.loosens(NetworkPolicy::Allow));
     }
 
-    // ── Phase 48 P0 Exit Criterion #1: force flag rejects CLI + project loosening ──
+    // ── Exit Criterion #1: force flag rejects CLI + project loosening ──
 
-    /// §7 P0 exit criterion 1.
+    /// exit criterion 1.
     ///
     /// When `force-security-floor = true`, project
     /// `scriptPolicy = "allow"` and `--yolo` (CLI = `allow`) still
@@ -429,14 +426,14 @@ mod tests {
         );
     }
 
-    // ── Phase 48 P0 Exit Criterion #2: legacy back-compat preserved ──
+    // ── Exit Criterion #2: legacy back-compat preserved ──
 
-    /// §7 P0 exit criterion 2.
+    /// exit criterion 2.
     ///
     /// `force-security-floor = false` + project `scriptPolicy = "allow"`
-    /// (user unset) → effective is `allow`. Phase 46 project > user
+    /// (user unset) → effective is `allow`. project > user
     /// order preserved for the legacy knob; the default flip is
-    /// Phase 5's job, not P0's.
+    /// the job, not's.
     #[test]
     fn legacy_knob_without_force_flag_preserves_phase46_order() {
         let inputs = PolicyInputs::<ScriptPolicy> {
@@ -452,7 +449,7 @@ mod tests {
         assert_eq!(
             resolution.effective,
             ScriptPolicy::Allow,
-            "Phase 46 back-compat: project scriptPolicy wins without force flag"
+            "back-compat: project scriptPolicy wins without force flag"
         );
         assert_eq!(resolution.effective_source, PolicyTier::Project);
         assert!(
@@ -464,7 +461,7 @@ mod tests {
 
     /// Sibling to exit criterion 2: user-set value still loses to
     /// project under legacy back-compat. Pins the "no force flag
-    /// means Phase 46 order, period" contract.
+    /// means order, period" contract.
     #[test]
     fn legacy_knob_without_force_flag_project_beats_user_even_when_explicit() {
         let inputs = PolicyInputs::<ScriptPolicy> {
@@ -482,9 +479,9 @@ mod tests {
         assert!(resolution.rejections.is_empty());
     }
 
-    // ── Phase 48 P0 Exit Criterion #3: new-knob user-is-floor default ──
+    // ── Exit Criterion #3: new-knob user-is-floor default ──
 
-    /// §7 P0 exit criterion 3.
+    /// exit criterion 3.
     ///
     /// When `force-security-floor = false`, project
     /// `network-policy = "allow"` and user `network-policy = "fenced"`
@@ -530,7 +527,7 @@ mod tests {
     // ── Additional coverage: non-regression cases from the contract ──
 
     /// Force flag + project TIGHTENING → project value honored
-    /// (tighter-than-floor is always fine, see §6 "Gap 4 kill-switch").
+    /// (tighter-than-floor is always fine, see "Gap 4 kill-switch").
     #[test]
     fn force_flag_honors_project_tightening() {
         let inputs = PolicyInputs::<ScriptPolicy> {

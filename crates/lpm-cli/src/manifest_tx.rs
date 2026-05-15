@@ -1,6 +1,6 @@
 //! Snapshot-and-restore guard for the install state surface.
 //!
-//! Phase 33 introduces a "stage placeholder, run install, finalize manifest"
+//! introduces a "stage placeholder, run install, finalize manifest"
 //! flow. The placeholder must NEVER survive a failed install — any error
 //! between staging and finalize must restore the file bytes to their
 //! pre-staging state.
@@ -27,14 +27,14 @@
 //! Restore is **best-effort**: a write or delete failure during `Drop` is
 //! logged but does not panic, because panicking in `Drop` aborts the
 //! process. Even a partial restore is strictly better than today's
-//! pre-Phase-33 behavior of leaving `"*"` in the manifest, a stale lockfile
+//! pre-existing behavior of leaving `"*"` in the manifest, a stale lockfile
 //! on disk, or an incoherent `install-hash` cache after a failed install.
 //!
 //! ### Why `node_modules/` is not part of the boundary
 //!
 //! The install pipeline mutates `node_modules/` heavily (delete + re-link),
 //! and snapshotting it would mean copying potentially gigabytes of files
-//! per transaction. Phase 33's contract is that after a failed install,
+//! per transaction. the contract is that after a failed install,
 //! the on-disk state files (`package.json`, `lpm.lock`, `.lpm/install-hash`)
 //! are coherent with each other and with what the user typed. The
 //! `node_modules/` tree may temporarily diverge from the lockfile, but the
@@ -85,7 +85,7 @@ impl ManifestTransaction {
         Self::snapshot_install_state(paths, &[], &[])
     }
 
-    /// Snapshot the full install state surface for Phase 33's rollback
+    /// Snapshot the full install state surface for the rollback
     /// boundary. `required` paths must exist (typically the manifest);
     /// `optional` paths are recorded as `Some(bytes)` if present and
     /// `None` if missing (rollback will remove them); `invalidate` paths
@@ -224,7 +224,7 @@ mod tests {
 
         {
             let _tx = ManifestTransaction::snapshot(&[&path]).unwrap();
-            // Mutate the manifest the way Phase 33's stage step would.
+            // Mutate the manifest the way the stage step would.
             write(&path, br#"{"name":"original","dependencies":{"ms":"*"}}"#);
             // Drop here → rollback.
         }

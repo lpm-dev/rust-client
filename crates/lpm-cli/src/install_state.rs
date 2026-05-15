@@ -1,7 +1,7 @@
 //! Sync-safe install-state check shared by the top-of-main fast lane,
 //! `install.rs`, and `dev.rs`. Single source of truth — never duplicate.
 //!
-//! **Phase 34.1** — extracted from `install.rs::is_install_up_to_date()`
+//! extracted from `install.rs::is_install_up_to_date()`
 //! and `dev.rs::compute_install_hash()` / `dev.rs::needs_install()`.
 
 use sha2::{Digest, Sha256};
@@ -29,13 +29,13 @@ pub struct InstallState {
 ///
 /// History:
 /// - `v1`: original hash (pkg + lock).
-/// - `v2` (2026-04-16): `lpm install` now resolves `devDependencies` in
+/// - `v2` : `lpm install` now resolves `devDependencies` in
 ///   addition to `dependencies`. Projects whose previous install silently
 ///   dropped devDeps must be treated as stale so the next bare `lpm install`
 ///   runs the full pipeline and populates them. Without this bump, an
 ///   existing up-to-date install would skip the pipeline and leave devDeps
 ///   unresolved until the manifest changes for some other reason.
-/// - `v3` (Phase 59.1 day-3, F7a): the hash now folds in every file:/link:
+/// - `v3` (day-3, F7a): the hash now folds in every file:/link:
 ///   directory dep's `package.json` content (recursively, depth-3 + realpath
 ///   cycle-detect). Without this, edits to a local source's `package.json`
 ///   (e.g., adding a new `dependencies` entry, bumping the source's own
@@ -43,7 +43,7 @@ pub struct InstallState {
 ///   even though the install needs to be re-run. The schema bump invalidates
 ///   every v2 install-hash on disk on the first post-upgrade install — same
 ///   posture as the v1→v2 bump.
-// **Phase 59.1 audit response (round 6)** — bumped v4 → v5.
+// bumped v4 → v5.
 //
 // Round-5 (v3 → v4) invalidated caches because the SET of root
 // symlinks expanded; round-6 (v4 → v5) invalidates because the SET
@@ -73,7 +73,7 @@ const INSTALL_HASH_SCHEMA_TAG: &[u8] = b"lpm-install-hash-v6\x00";
 /// deterministic-hash unit tests where the linker is not under test.
 /// Production callers use [`compute_install_hash_v6`] directly.
 ///
-/// Phase 66 Phase 4f flipped [`LinkerMode::default`] from Isolated to
+/// flipped [`LinkerMode::default`] from Isolated to
 /// Hoisted; this shim follows the flip so callers expecting "the hash
 /// for a default install" get the post-4f shape.
 pub fn compute_install_hash(pkg_content: &str, lock_content: &str) -> String {
@@ -136,7 +136,7 @@ pub fn compute_install_hash_v6(
     format!("{:x}", hasher.finalize())
 }
 
-/// **Phase 59.1 day-3 (F7a)** — collect file:/link: directory dep
+/// collect file:/link: directory dep
 /// `package.json` bytes for the install-hash freshness signal.
 ///
 /// Walks the consumer's package.json `dependencies` /
@@ -165,7 +165,7 @@ pub fn compute_install_hash_v6(
 /// up-to-date check; the install pipeline downstream still surfaces
 /// the corruption with a typed error.
 ///
-/// Depth bound matches umbrella §3 prepare-runner posture: 3.
+/// Depth bound matches umbrella prepare-runner posture: 3.
 /// Realpath cycle-detect prevents `A → B → A` infinite loops.
 pub fn collect_file_link_manifest_bytes(
     project_dir: &std::path::Path,
@@ -176,7 +176,7 @@ pub fn collect_file_link_manifest_bytes(
     let mut buf: Vec<(std::path::PathBuf, Vec<u8>)> = Vec::new();
     walk_file_link_deps(project_dir, pkg_content, 0, 3, &mut visited, &mut buf);
 
-    // **Phase 59.1 audit response (round 6) — workspace member
+    // **audit response (round 6) — workspace member
     // manifests fold into the install-hash.** Round-5's workspace-
     // member BFS expands the root-symlink set based on each linked
     // member's `workspace:` transitives, but pre-round-6 the install-
@@ -308,7 +308,7 @@ fn walk_file_link_deps(
 ///
 /// Returns `InstallState` with the computed hash for downstream reuse.
 ///
-/// Phase 44 fast path: when the install-hash file contains an optional
+/// fast path: when the install-hash file contains an optional
 /// mtime line (written by [`write_install_hash`]) and the recorded
 /// mtimes of package.json + lpm.lock still match, skips the hash
 /// recomputation entirely — saving one file read of each manifest plus
@@ -406,7 +406,7 @@ pub fn check_install_state_with_linker(
     pkg_content: &str,
     linker_mode: lpm_linker::LinkerMode,
 ) -> InstallState {
-    // Phase 44 mtime short-circuit also applies here. The caller may have
+    // mtime short-circuit also applies here. The caller may have
     // already read pkg.json for an earlier check, but the fast path still
     // skips the read of lpm.lock + the SHA-256 pass.
     if let Some(state) = try_mtime_fast_path(project_dir, linker_mode) {
@@ -419,7 +419,7 @@ pub fn check_install_state_with_linker(
 
     // Read lockfile — empty string if missing (hash will mismatch → needs install)
     let lock_content = std::fs::read_to_string(&lock_path).unwrap_or_default();
-    // Phase 59.1 day-3 (F7a): fold file:/link: directory dep
+    // day-3 (F7a): fold file:/link: directory dep
     // package.json content into the install hash. Empty bytes for
     // projects without local-source deps — matches the v2 semantic
     // (modulo the schema-tag bump invalidating v2 caches once).
@@ -450,7 +450,7 @@ pub fn check_install_state_with_linker(
         };
     }
 
-    // Phase 61.3 D8c — layout-aware freshness gate. If the project is
+    // D8c — layout-aware freshness gate. If the project is
     // on the legacy `node_modules/.lpm/` wrapper layout but the new
     // `<project>/.lpm/wrappers/` root is empty, the install is NOT
     // fresh regardless of hash/mtime match. This is the upgrade-in-
@@ -466,14 +466,14 @@ pub fn check_install_state_with_linker(
         };
     }
 
-    // Phase 66 Phase 4d — v1 → v2 store-layout migration gate. After
-    // the Phase 4d default flip, an upgrade-in-place user (still with
+    // — v1 → v2 store-layout migration gate. After
+    // the default flip, an upgrade-in-place user (still with
     // v1's `<project>/.lpm/wrappers/` or `<project>/.lpm/hoisted/`
     // populated) needs the install pipeline to run the v1→v2 wipe-
     // and-rebuild sequence. Without this gate the sync fast lane in
     // `main.rs` short-circuits with "up to date" and the user's
     // project stays on the legacy layout indefinitely. The dual-gate
-    // shape mirrors Phase 61.3 D8c: legacy state populated + new
+    // shape mirrors D8c: legacy state populated + new
     // store version active = freshness reset.
     //
     // Detection mirrors the install-pipeline's
@@ -524,7 +524,7 @@ pub fn check_install_state_with_linker(
     }
 }
 
-/// Phase 44: mtime short-circuit for the up-to-date check.
+/// mtime short-circuit for the up-to-date check.
 ///
 /// Reads `.lpm/install-hash`; when it contains a v2 mtime line
 /// (`m:<pkg_ns>:<lock_ns>`) and the recorded mtimes still match the
@@ -539,7 +539,7 @@ pub fn check_install_state_with_linker(
 /// is deliberate mtime tampering (`touch -t ...`), which is also
 /// sufficient to defeat npm/pnpm/bun. Acceptable tradeoff.
 ///
-/// **Phase 59.1 day-3 (F7a)**: when `.lpm/has-local-sources` exists,
+/// when `.lpm/has-local-sources` exists,
 /// the project has file:/link: directory deps whose `package.json`
 /// content participates in the install hash. The mtime fast path
 /// only tracks the consumer's `package.json` + `lpm.lock` mtimes,
@@ -557,14 +557,14 @@ fn try_mtime_fast_path(
         return None;
     }
 
-    // Phase 59.1 day-3 (F7a) — sentinel for "this project has local-
+    // day-3 (F7a) — sentinel for "this project has local-
     // source deps; the fast path can't trust mtimes alone."
     let local_sources_sentinel = project_dir.join(".lpm").join("has-local-sources");
     if local_sources_sentinel.exists() {
         return None;
     }
 
-    // Phase 61.3 D8c — bail to the slow path when a layout migration
+    // D8c — bail to the slow path when a layout migration
     // is owed. The slow path's existence-check guard gates the same
     // predicate, but the mtime fast path skips that guard entirely
     // when manifest mtimes match. Returning `None` here forces the
@@ -575,7 +575,7 @@ fn try_mtime_fast_path(
         return None;
     }
 
-    // Phase 66 Phase 4d — v1 → v2 store migration gate. Must mirror
+    // — v1 → v2 store migration gate. Must mirror
     // the slow-path guard in `check_install_state_with_content`
     // because the mtime fast lane skips that function entirely on
     // mtime hits. Without this, an upgrade-in-place user whose
@@ -676,7 +676,7 @@ pub fn write_install_hash(
     let content = format!("{hash}\nm:{pkg_ns}:{lock_ns}\nl:{linker_str}\n");
     std::fs::write(hash_dir.join("install-hash"), content)?;
 
-    // Phase 59.1 day-3 (F7a) + round-6 audit response — manage the
+    // day-3 (F7a) + round-6 audit response — manage the
     // "needs-slow-path" sentinel.
     //
     // The mtime fast path checks ONLY root package.json + lpm.lock
@@ -820,7 +820,7 @@ pub fn is_likely_workspace_root(project_dir: &Path) -> bool {
 }
 
 /// Same as [`is_likely_workspace_root`] but takes pre-read content.
-/// Phase 44: lets the top-of-main fast lane amortize a single
+/// lets the top-of-main fast lane amortize a single
 /// `package.json` read across the workspace check and the install-state
 /// check.
 pub fn is_workspace_root_content(pkg_content: &str) -> bool {
@@ -980,7 +980,7 @@ mod tests {
         // at the time the schema was bumped to v6 (post-install linker
         // freshness fold).
         //
-        // Phase 66 Phase 4f note: `compute_install_hash` now defaults
+        // note: `compute_install_hash` now defaults
         // to `LinkerMode::default()` which flipped to Hoisted in 4f.
         // To keep this test schema-pinned (not coupled to whichever
         // linker is the default), call `compute_install_hash_v6`
@@ -1057,7 +1057,7 @@ mod tests {
         assert!(state.hash.is_some());
     }
 
-    // ── Phase 44: v2 mtime-fast-path tests ─────────────────────────
+    // ── v2 mtime-fast-path tests ─────────────────────────
 
     fn setup_up_to_date_project_v2() -> TempDir {
         // Like `setup_up_to_date_project` but writes the install-hash
@@ -1294,7 +1294,7 @@ mod tests {
         assert!(!is_workspace_root_content(r#"{"name":"leaf"}"#));
     }
 
-    // ── Phase 59.1 day-3 (F7a): file/link manifest folding ────────────
+    // ── day-3 (F7a): file/link manifest folding ────────────
 
     fn make_dir_dep(parent: &Path, name: &str, version: &str) -> std::path::PathBuf {
         let dir = parent.join(name);
@@ -1528,7 +1528,7 @@ mod tests {
         );
     }
 
-    // ── Phase 59.1 audit response (round 6) — workspace-member manifest folding ──
+    // ── audit response (round 6) — workspace-member manifest folding ──
 
     /// Round-6 contract: a workspace member's package.json is folded
     /// into the install-hash even when the root manifest doesn't
@@ -1620,7 +1620,7 @@ mod tests {
         );
     }
 
-    // ── Phase 61.3 D8c — layout-aware freshness gate ─────────────────
+    // ── D8c — layout-aware freshness gate ─────────────────
     //
     // These tests pin the contract that an upgrade-in-place user
     // (binary upgraded but `node_modules/` not wiped) does NOT
@@ -1704,17 +1704,17 @@ mod tests {
         assert!(state.up_to_date, "empty legacy dir must not gate install");
     }
 
-    /// Phase 61.3 D8c contract — historically asserted that "both
+    /// D8c contract — historically asserted that "both
     /// legacy + new isolated wrapper layouts populated → migration
-    /// complete → up-to-date". Phase 66 Phase 4d's default flip to
+    /// complete → up-to-date".  the default flip to
     /// v2 changes this: `<project>/.lpm/wrappers/` is now the
     /// LEGACY-V1 marker and triggers a v2 migration regardless of
     /// the legacy isolated-vs-new-isolated distinction. The 4d gate
     /// fires unconditionally on v1 wrappers when the active store
     /// version is v2, and `StoreVersion::default()` is v2 since the
-    /// flip — so this test now asserts the post-Phase-4d contract:
+    /// flip — so this test now asserts the post-contract:
     /// v1 wrappers populated → v2 migration owed → up-to-date is
-    /// false. The pre-Phase-4d "both isolated layouts populated →
+    /// false. The pre-"both isolated layouts populated →
     /// fresh" contract is intentionally retired.
     #[test]
     fn populated_v1_wrappers_force_v2_migration_on_default() {

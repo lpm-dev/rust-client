@@ -1,4 +1,4 @@
-//! Phase 33 save-policy config loader.
+//! save-policy config loader.
 //!
 //! Resolves the [`SaveConfig`] that flows into
 //! [`crate::save_spec::decide_saved_dependency_spec`] from two TOML files:
@@ -21,7 +21,7 @@
 //!
 //! ## File format
 //!
-//! Both files are TOML. Phase 33 uses two top-level keys:
+//! Both files are TOML. uses two top-level keys:
 //!
 //! ```toml
 //! save-prefix = "^"   # one of "^", "~", or "" (empty for exact)
@@ -31,11 +31,11 @@
 //! Invalid values (`save-prefix = "*"`, `save-prefix = ">="`, etc.) are
 //! rejected at load time with a clear error pointing at the offending
 //! file path. Unknown keys are accepted silently for forward
-//! compatibility — Phase 33 is intentionally only adding two keys.
+//! compatibility — is intentionally only adding two keys.
 //!
 //! ## Why not `package.json`?
 //!
-//! Phase 33 explicitly chose not to put save-policy keys under a `"lpm"`
+//! explicitly chose not to put save-policy keys under a `"lpm"`
 //! block in `package.json`. Save policy is **tool behavior**, not
 //! publishable package metadata. Mixing it into the manifest creates
 //! avoidable churn and ambiguity (the manifest gets a diff every time
@@ -47,7 +47,7 @@ use crate::save_spec::{SaveConfig, SavePrefix};
 use lpm_common::LpmError;
 use std::path::Path;
 
-/// Phase 33 save-policy config loader. Resolves the effective
+/// save-policy config loader. Resolves the effective
 /// [`SaveConfig`] for an install command from project + global TOML.
 ///
 /// Construct with [`Self::load_for_project`] just before invoking the
@@ -90,7 +90,7 @@ struct RawSaveKeys {
     save_exact: Option<bool>,
 }
 
-/// Read the Phase 33 save keys from a single TOML file. Missing file →
+/// Read the save keys from a single TOML file. Missing file →
 /// empty `RawSaveKeys`. Malformed file or invalid value → error with
 /// the file path baked in for diagnostics.
 fn read_save_keys_from_file(path: &Path) -> Result<RawSaveKeys, LpmError> {
@@ -140,7 +140,7 @@ fn read_save_keys_from_file(path: &Path) -> Result<RawSaveKeys, LpmError> {
         })?);
     }
 
-    // Phase 33 deliberately accepts unknown keys without warning. Other
+    // deliberately accepts unknown keys without warning. Other
     // commands write to the same `~/.lpm/config.toml` (linker, no_skills,
     // etc.) and we don't want this loader to fail on those keys.
 
@@ -154,7 +154,7 @@ fn read_save_keys_from_file(path: &Path) -> Result<RawSaveKeys, LpmError> {
 /// command (in `commands/config.rs`) writes every value as
 /// `toml::Value::String`, regardless of the key's intended type. So
 /// `lpm config set save-exact true` literally produces
-/// `save-exact = "true"` on disk. The Phase 33 loader MUST accept that
+/// `save-exact = "true"` on disk. The loader MUST accept that
 /// form, otherwise the documented persistent-config path is unusable.
 ///
 /// We deliberately match `GlobalConfig::get_bool`'s string set —
@@ -296,7 +296,7 @@ mod tests {
     /// **Audit Finding A regression.** `lpm config set save-exact true`
     /// writes `save-exact = "true"` (a TOML string, not a boolean) because
     /// the generic `lpm config set` command serializes every value as a
-    /// string. The Phase 33 loader MUST accept this form so the documented
+    /// string. The loader MUST accept this form so the documented
     /// persistent-config path actually works.
     #[test]
     fn save_exact_string_true_accepted_for_lpm_config_set_compat() {
@@ -323,7 +323,7 @@ mod tests {
     }
 
     /// `GlobalConfig::get_bool` accepts `"1"|"yes"|"0"|"no"` as bool aliases.
-    /// The Phase 33 loader matches that semantics so `lpm config set
+    /// The loader matches that semantics so `lpm config set
     /// save-exact yes` and `lpm config set save-exact 0` also work.
     #[test]
     fn save_exact_string_yes_no_one_zero_accepted() {
@@ -389,7 +389,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("lpm.toml");
         // Other commands (linker, noSkills, etc.) write to the same
-        // ~/.lpm/config.toml. Phase 33 must not error on those keys.
+        // ~/.lpm/config.toml. must not error on those keys.
         write_config(
             &path,
             r#"

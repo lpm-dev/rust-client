@@ -1,4 +1,4 @@
-//! Save-spec decision logic for `lpm install` (Phase 33).
+//! Save-spec decision logic for `lpm install`.
 //!
 //! When `lpm install <pkg>` mutates `package.json`, this module decides what
 //! string lands in the manifest. The decision is a pure function of:
@@ -10,7 +10,7 @@
 //!   against the registry and lockfile; we feed the resolved
 //!   [`lpm_semver::Version`] back into the helper after resolution so the
 //!   `^resolvedVersion` default has a real number to work with. This is
-//!   load-bearing for Phase 33's "no `*` default" rule.
+//!   load-bearing for the "no `*` default" rule.
 //! - **CLI flags.** `--exact`, `--tilde`, and `--save-prefix` override the
 //!   default for the current invocation. See [`SaveFlags`].
 //! - **User config.** `save-prefix` and `save-exact` from
@@ -26,7 +26,7 @@
 //! 2. **CLI flag override** (`--exact`, `--tilde`, `--save-prefix`).
 //! 3. **Prerelease-exact safety.** If the resolved version is a prerelease
 //!    and no CLI flag forced something else, save the exact resolved version.
-//!    Phase 33's "Prerelease Policy" — prereleases should not auto-widen
+//!    the "Prerelease Policy" — prereleases should not auto-widen
 //!    under a forgotten `save-prefix` config setting.
 //! 4. **Config.** `save-exact = true`, then `save-prefix = "^|~|"`.
 //! 5. **Default.** `^resolvedVersion`.
@@ -61,10 +61,10 @@ pub enum UserSaveIntent {
     /// (stable → caret default, prerelease → exact).
     DistTag(String),
     /// `lpm install zod@*` — explicit wildcard. Preserved as `*`.
-    /// Phase 33: `*` is **only** allowed when the user asked for it.
+    /// `*` is **only** allowed when the user asked for it.
     Wildcard,
     /// `workspace:*`, `workspace:^`, `workspace:~`, or `workspace:<range>`.
-    /// Always preserved verbatim. Phase 33 does not change workspace
+    /// Always preserved verbatim. does not change workspace
     /// protocol semantics.
     Workspace(String),
 }
@@ -85,7 +85,7 @@ impl SaveFlags {
     /// Whether any of the per-command flags is set. Used by the stage step
     /// to decide whether to rewrite an existing dep entry: bare reinstalls
     /// (no flags) leave existing entries alone, but explicit flag overrides
-    /// always force a rewrite per the Phase 33 "do rewrite when" rule.
+    /// always force a rewrite per the "do rewrite when" rule.
     pub fn forces_rewrite(&self) -> bool {
         self.exact || self.tilde || self.save_prefix.is_some()
     }
@@ -101,7 +101,7 @@ pub struct SaveConfig {
 
 /// The valid save prefixes — never `*`. `Empty` means "exact, no prefix".
 //
-// Phase 33: variants are constructed by `SavePrefix::parse` (called by the
+// variants are constructed by `SavePrefix::parse` (called by the
 // CLI flag parser in Step 5 and the config loader in Step 6). Until those
 // steps land, the helper is exercised only by tests, so the dead-code lint
 // flags the variants as unused. Safe to remove the allow once `--save-prefix`
@@ -318,7 +318,7 @@ pub fn decide_saved_dependency_spec(
 ) -> Result<SaveSpecDecision, LpmError> {
     // ── Tier 1: explicit user input wins everything. ─────────────
     // Wildcard, Workspace, Exact, and Range are all things the user
-    // concretely typed at the command line; per Phase 33's "preserve
+    // concretely typed at the command line; per the "preserve
     // explicit user intent" rule we never reinterpret them, regardless
     // of flags or config.
     match intent {
@@ -377,8 +377,7 @@ pub fn decide_saved_dependency_spec(
 
     // ── Tier 3: prerelease-exact safety. ─────────────────────────
     // Prereleases are inherently less stable; saving `^4.4.0-beta.2`
-    // invites surprise upgrades across unstable releases. Phase 33's
-    // "Prerelease Policy" makes this exact-by-default. Sits ABOVE
+    // invites surprise upgrades across unstable releases.  the     // "Prerelease Policy" makes this exact-by-default. Sits ABOVE
     // config so a forgotten `save-prefix = "^"` does not silently
     // widen prereleases.
     if resolved.is_prerelease() {
@@ -389,8 +388,7 @@ pub fn decide_saved_dependency_spec(
     }
 
     // ── Tier 4: persistent user config. ──────────────────────────
-    // `save-exact = true` wins over `save-prefix` per the Phase 33
-    // "Config interaction rule".
+    // `save-exact = true` wins over `save-prefix` per the     // "Config interaction rule".
     if config.save_exact {
         return Ok(SaveSpecDecision {
             spec_to_write: resolved.to_string(),
@@ -405,7 +403,7 @@ pub fn decide_saved_dependency_spec(
     }
 
     // ── Tier 5: built-in default. ────────────────────────────────
-    // `^resolvedVersion` — Phase 33's load-bearing change. Replaces
+    // `^resolvedVersion` — the load-bearing change. Replaces
     // the legacy `*` default.
     Ok(SaveSpecDecision {
         spec_to_write: format!("^{resolved}"),
@@ -794,7 +792,7 @@ mod tests {
     }
 
     /// Row 13: `0.x` bare install still gets a caret prefix.
-    /// Phase 33 explicitly does NOT diverge from the npm/pnpm convention here.
+    /// explicitly does NOT diverge from the npm/pnpm convention here.
     #[test]
     fn row13_zerox_bare_caret() {
         let decision = decide_saved_dependency_spec(

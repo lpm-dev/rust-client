@@ -1,7 +1,7 @@
-//! Authentication and secure token storage — Phase 35 re-export shim.
+//! Authentication and secure token storage — re-export shim.
 //!
 //! All token storage, refresh handling, and session metadata moved to
-//! the shared `lpm-auth` crate during Phase 35 Step 1 so that
+//! the shared `lpm-auth` crate during Step 1 so that
 //! `lpm-registry` can depend on the same primitives without a layering
 //! violation. This module is now a stable, narrow re-export surface for
 //! the rest of `lpm-cli`. Behavior is unchanged.

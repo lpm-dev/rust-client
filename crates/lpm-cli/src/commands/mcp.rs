@@ -497,7 +497,7 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
     }
 
-    // ── Phase 32 Phase 0.1 gap-filling additions ────────────────────────
+    // ── gap-filling additions ────────────────────────
 
     #[test]
     fn setup_editors_creates_parent_directories_for_nested_config_path() {

@@ -1,4 +1,4 @@
-//! Phase 48 P0 — migration warnings for the pure-policy resolver.
+//! — migration warnings for the pure-policy resolver.
 //!
 //! The [`crate::precedence`] module is pure (no I/O). When its
 //! [`resolve_pure_policy`] function drops a candidate value, it
@@ -12,7 +12,7 @@
 //!
 //! # Three distinct wordings
 //!
-//! Per phase48.md §7 P0 "Migration path," the three [`RejectionReason`]
+//! Per "Migration path," the three [`RejectionReason`]
 //! variants must have distinguishable user-facing strings. Each one
 //! corresponds to a different user action:
 //!
@@ -23,7 +23,7 @@
 //!   `package.json` requested a looser policy, the user-global force
 //!   flag rejected it at load time." Remediation: same as above.
 //! - [`RejectionReason::NewKnobProjectLoosens`] → "the project's
-//!   `package.json` requested a looser policy on a new Phase 48 knob,
+//!   `package.json` requested a looser policy on a new knob,
 //!   which the user-is-floor rule rejects even without the force
 //!   flag." Remediation: set a looser value in
 //!   `~/.lpm/config.toml` if intentional.
@@ -80,7 +80,7 @@ pub fn rejection_message<T: PurePolicyKnob>(r: &Rejection<T>) -> String {
             "warning: project `{name}` in package.json ignored — \
              would loosen below the user setting in \
              ~/.lpm/config.toml. Pure-policy knobs introduced in \
-             Phase 48 use user-is-floor by default (no force flag \
+             use user-is-floor by default (no force flag \
              required). Set `{name}` in ~/.lpm/config.toml to the \
              looser value if you want it globally.",
             name = T::NAME,

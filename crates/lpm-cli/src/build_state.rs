@@ -1,4 +1,4 @@
-//! Phase 32 Phase 4 — `<project_dir>/.lpm/build-state.json` persistence layer.
+//! — `<project_dir>/.lpm/build-state.json` persistence layer.
 //!
 //! This file is the spine of the `lpm approve-scripts` review flow. It captures
 //! the install-time blocked set (packages with lifecycle scripts that aren't
@@ -13,7 +13,7 @@
 //! ## Location
 //!
 //! `<project_dir>/.lpm/build-state.json` (NOT `node_modules/.lpm/build-state.json`).
-//! See **F7** in the Phase 4 status doc for the rationale: `.lpm/` next to
+//! See **F7** in the status doc for the rationale: `.lpm/` next to
 //! `package.json` survives `rm -rf node_modules`, matches the existing
 //! `install-hash` convention, and avoids colliding with the linker's
 //! pnpm-style internal store at `node_modules/.lpm/`.
@@ -51,9 +51,9 @@ use std::path::{Path, PathBuf};
 /// different ages without invalidating every existing
 /// `.lpm/build-state.json` in the wild.
 ///
-/// **Phase 46** adds several `Option<T>` fields to [`BlockedPackage`]
+/// adds several `Option<T>` fields to [`BlockedPackage`]
 /// (static tier, provenance snapshot, publish timestamp, behavioral-tags
-/// hash) without bumping this constant. See the plan §6 for the
+/// hash) without bumping this constant. See the plan for the
 /// rationale.
 ///
 /// Reader policy (see [`read_build_state`]): accept anything
@@ -78,8 +78,7 @@ pub struct BuildState {
     /// matches the previous run.
     pub blocked_set_fingerprint: String,
     /// RFC 3339 timestamp of when this state file was written. Used by
-    /// future stale-state detection (Phase 12+) but not by Phase 4's
-    /// suppression logic, which is purely fingerprint-based.
+    /// future stale-state detection but not by  the     /// suppression logic, which is purely fingerprint-based.
     pub captured_at: String,
     /// The packages whose lifecycle scripts were blocked at the time of
     /// the install that wrote this file. Sorted by `(name, version)` for
@@ -89,7 +88,7 @@ pub struct BuildState {
 
 /// One entry in [`BuildState::blocked_packages`].
 ///
-/// Phase 46 adds the `static_tier`, `provenance_at_capture`,
+/// adds the `static_tier`, `provenance_at_capture`,
 /// `published_at`, and `behavioral_tags_hash` fields as
 /// `Option<T>` with `skip_serializing_if = "Option::is_none"`. This
 /// extension is backward-compatible with v1-written state (defaults to
@@ -101,11 +100,11 @@ pub struct BuildState {
 pub struct BlockedPackage {
     pub name: String,
     pub version: String,
-    /// SRI integrity hash from the lockfile, if known. Phase 4 binds
+    /// SRI integrity hash from the lockfile, if known. binds
     /// approvals to this so a registry-side tarball swap re-opens review.
     pub integrity: Option<String>,
     /// Deterministic install-script hash from
-    /// `lpm_security::script_hash::compute_script_hash`. Phase 4 binds
+    /// `lpm_security::script_hash::compute_script_hash`. binds
     /// approvals to this so any change to the executed script bytes
     /// re-opens review. May be `None` for packages whose store directory
     /// is missing or unreadable at install time (the gate fails closed —
@@ -120,36 +119,36 @@ pub struct BlockedPackage {
     /// blocked" from "previously approved, now drifted, needs re-review".
     pub binding_drift: bool,
 
-    // ─── Phase 46 additions (all optional; see struct doc) ─────────
-    /// Static-gate classification from Phase 46 Layer 1 (P2). `None`
-    /// in P1-only state (the field exists but the classifier is not
+    // ─── additions (all optional; see struct doc) ─────────
+    /// Static-gate classification from Layer 1 (P2). `None`
+    /// in-only state (the field exists but the classifier is not
     /// wired yet) and for packages captured with `script-policy =
     /// "deny" | "allow"` where classification is not applied.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub static_tier: Option<StaticTier>,
-    /// Publisher-identity snapshot at capture time. Populated by P4
-    /// (provenance drift). `None` in P1/P2/P3 state, and for packages
+    /// Publisher-identity snapshot at capture time. Populated by
+    /// (provenance drift). `None` in/P2/P3 state, and for packages
     /// whose registry response contains no attestation bundle.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provenance_at_capture: Option<ProvenanceSnapshot>,
     /// RFC 3339 publish timestamp as returned by the registry's
-    /// metadata `time` map for this version. Populated by P1 from the
+    /// metadata `time` map for this version. Populated by from the
     /// TTL-cached metadata the install pipeline already fetches for
     /// the cooldown check. `None` for offline installs or packages
     /// whose metadata response omitted the timestamp.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub published_at: Option<String>,
     /// SHA-256 of the sorted set of behavioral tags that were `true`
-    /// on this version's server-computed analysis. Populated by P1
+    /// on this version's server-computed analysis. Populated by
     /// from the metadata the install pipeline already parses. Used by
-    /// P7's version-diff UI to surface "behavioral tags changed since
+    ///'s version-diff UI to surface "behavioral tags changed since
     /// last approval" without re-fetching metadata. `None` for
     /// packages without server-side behavioral analysis.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub behavioral_tags_hash: Option<String>,
-    /// **Phase 46 P7.** Sorted canonical names of the active behavioral
+    /// Sorted canonical names of the active behavioral
     /// tags whose hash is in `behavioral_tags_hash`. Persisted alongside
-    /// the hash so P7's version-diff UI can render the *delta* (e.g.
+    /// the hash so's version-diff UI can render the *delta* (e.g.
     /// `gained network, eval`), not just "tags changed". The hash is
     /// kept for fast equality / fingerprinting; the names enable
     /// human-readable rendering without a re-fetch.
@@ -294,11 +293,11 @@ pub fn compute_blocked_set_fingerprint(packages: &[BlockedPackage]) -> String {
     format!("sha256-{}", hex_lower(&hasher.finalize()))
 }
 
-/// Per-package metadata (Phase 46 P1) that enriches the captured
+/// Per-package metadata  that enriches the captured
 /// blocked-set beyond what's derivable from the store alone.
 ///
 /// The install pipeline already fetches registry metadata during the
-/// cooldown check for every resolved package; Phase 46 extends that
+/// cooldown check for every resolved package; extends that
 /// fetch to also forward `publishedAt` and a hash of the package's
 /// server-computed behavioral tags into `BlockedPackage`. Both fields
 /// are optional and missing entries degrade gracefully to `None` in
@@ -325,21 +324,21 @@ pub struct BlockedSetMetadataEntry {
     /// (see `lpm_security::triage::hash_behavioral_tag_set`). `None`
     /// for packages without server-side behavioral analysis.
     pub behavioral_tags_hash: Option<String>,
-    /// **Phase 46 P7.** Sorted canonical names of the active behavioral
+    /// Sorted canonical names of the active behavioral
     /// tags whose hash is `behavioral_tags_hash`. Forwarded into
-    /// [`BlockedPackage::behavioral_tags`] so P7's version-diff UI can
+    /// [`BlockedPackage::behavioral_tags`] so's version-diff UI can
     /// render the *delta* between the prior-approved binding and the
     /// candidate version without a registry re-fetch (which would break
     /// offline updates and add latency). `None` whenever
     /// `behavioral_tags_hash` is `None`.
     pub behavioral_tags: Option<Vec<String>>,
-    /// **Phase 46 P4 Chunk 3.** Provenance snapshot captured at
+    /// Provenance snapshot captured at
     /// install time from the registry's `dist.attestations` pointer
     /// (via `crate::provenance_fetch::fetch_provenance_snapshot`).
     /// Forwarded into [`BlockedPackage::provenance_at_capture`] by
     /// [`compute_blocked_packages_with_metadata`] so
     /// `lpm approve-scripts` can propagate it to the binding's
-    /// `provenance_at_approval` on approval — closing the P4
+    /// `provenance_at_approval` on approval — closing the
     /// write-path loop.
     ///
     /// `None` for:
@@ -380,7 +379,7 @@ impl BlockedSetMetadata {
 /// it directly to [`compute_blocked_set_fingerprint`].
 ///
 /// This wrapper calls [`compute_blocked_packages_with_metadata`] with
-/// an empty metadata map; the Phase-46 `published_at` and
+/// an empty metadata map; the `published_at` and
 /// `behavioral_tags_hash` fields on emitted `BlockedPackage` entries
 /// stay `None`. The production install path calls
 /// `compute_blocked_packages_with_metadata` directly with a populated
@@ -406,7 +405,7 @@ pub fn compute_blocked_packages(
     )
 }
 
-/// Phase 46 P1 metadata-aware variant of [`compute_blocked_packages`].
+/// metadata-aware variant of [`compute_blocked_packages`].
 ///
 /// Same logic but forwards per-package `published_at` and
 /// `behavioral_tags_hash` from `metadata` into each emitted
@@ -419,9 +418,8 @@ pub fn compute_blocked_packages_with_metadata(
     installed: &[(String, String, Option<String>)],
     policy: &SecurityPolicy,
     metadata: &BlockedSetMetadata,
-    // **Phase 48 P0 sub-slice 6d follow-up.** The project's
-    // capability request + user bound. Used to catch the Phase 48
-    // case: a package whose script-hash approval matches strict
+    // The project's
+    // capability request + user bound. Used to catch the     // case: a package whose script-hash approval matches strict
     // but whose capability request widens beyond the user's
     // bound without a matching capability-hash approval. Without
     // this check, such packages would sail past install-time
@@ -436,7 +434,7 @@ pub fn compute_blocked_packages_with_metadata(
     // short-circuit applies as before.
     requested_capabilities: &crate::capability::CapabilitySet,
     user_bound: &crate::capability::UserBound,
-    // **Phase 46 slice 1.** Ephemeral advisor approval set keyed
+    // Ephemeral advisor approval set keyed
     // by `(name, version, Option<integrity>)`. Packages whose
     // triple appears here are EXCLUDED from the blocked set so
     // post-install messaging + `lpm approve-scripts` don't report
@@ -471,7 +469,7 @@ pub fn compute_blocked_packages_with_metadata(
     // builds hit this path more heavily).
     let per_pkg =
         |(name, version, integrity): &(String, String, Option<String>)| -> Option<BlockedPackage> {
-            // **Phase 46 slice 1.** Advisor-approved packages are
+            // Advisor-approved packages are
             // EXCLUDED from the blocked set entirely. They executed
             // their scripts via the AdvisorApprovedThisRun trust path
             // during this install's autoBuild, so listing them as
@@ -491,7 +489,7 @@ pub fn compute_blocked_packages_with_metadata(
             let script_hash = compute_script_hash(&pkg_dir)?;
 
             // What phases are present (for human display in
-            // approve-scripts) AND their bodies (for the Phase 46 P2
+            // approve-scripts) AND their bodies (for the
             // static-gate classifier below)? One read/parse of
             // package.json feeds both.
             let phase_bodies = read_install_phase_bodies(&pkg_dir);
@@ -503,19 +501,19 @@ pub fn compute_blocked_packages_with_metadata(
             }
             let phases_present: Vec<String> = phase_bodies.iter().map(|(n, _)| n.clone()).collect();
 
-            // Phase 46 P2: classify each present phase and aggregate
+            //: classify each present phase and aggregate
             // worst-wins. Populated unconditionally (not gated on
-            // `script-policy`) per plan §5.1 — the annotation is
+            // `script-policy`) — the annotation is
             // user-visible UX in all three modes.
             //
-            // Phase 46b Lever #4: pass identity context so a
+            // Lever #4: pass identity context so a
             // delegate-to-local-file + matching identity body
             // surfaces as Green in the UI's blocked-set annotation
             // (consistent with what the install pipeline's amber-
             // filter at `collect_amber_classification_requests`
             // sees).
             //
-            // Phase 46b Option B: `publish_age_secs = None` +
+            // Option B: `publish_age_secs = None` +
             // `min_release_age_secs = 0` means the L1 widening fires
             // independently of cooldown. This is correct here because
             // `compute_blocked_packages_with_metadata` produces a
@@ -540,7 +538,7 @@ pub fn compute_blocked_packages_with_metadata(
                 .map(|(_, body)| lpm_security::static_gate::classify_with_context(body, Some(&ctx)))
                 .reduce(lpm_security::triage::StaticTier::worse_of);
 
-            // Strict gate query. Phase 4 binds approvals to
+            // Strict gate query. binds approvals to
             // (name, version, integrity, script_hash).
             let trust = policy.can_run_scripts_strict(
                 name,
@@ -551,7 +549,7 @@ pub fn compute_blocked_packages_with_metadata(
 
             let (is_blocked, binding_drift) = match trust {
                 // Strict approval covers this exact tuple — NOT blocked
-                // by the script-hash gate. **Phase 48 P0 sub-slice 6d
+                // by the script-hash gate. **P0 sub-slice 6d
                 // follow-up:** additionally consult the capability gate.
                 // A Strict-matched package with a widened capability
                 // request that the stored binding doesn't cover must
@@ -606,7 +604,7 @@ pub fn compute_blocked_packages_with_metadata(
                 return None;
             }
 
-            // Phase 46 P1 metadata forwarding. The caller (install.rs)
+            // metadata forwarding. The caller (install.rs)
             // populates `metadata` from the same registry responses
             // the cooldown check already fetched, so this is a
             // memory-only hash-map lookup per package.
@@ -618,10 +616,10 @@ pub fn compute_blocked_packages_with_metadata(
                 script_hash: Some(script_hash),
                 phases_present,
                 binding_drift,
-                // Phase 46 P2 populates `static_tier` from the
+                // populates `static_tier` from the
                 // worst-wins reduction above.
                 static_tier,
-                // Phase 46 P4 Chunk 3: forwarded from the install
+                // forwarded from the install
                 // pipeline's per-package provenance fetch. Populated
                 // for EVERY blocked package that went through the
                 // drift gate, not just those whose drift fired —
@@ -656,7 +654,7 @@ pub fn compute_blocked_packages_with_metadata(
 /// that supplies an empty metadata map + baseline capability
 /// defaults.
 ///
-/// **Post-Phase-48 P0 sub-slice 6d-follow-up:** all production
+/// **Post-P0 sub-slice 6d-follow-up:** all production
 /// install paths call `_with_metadata` directly with the project's
 /// real `CapabilitySet` + `UserBound` so capture + enforcement
 /// cannot diverge. This wrapper is retained solely as the stable
@@ -690,7 +688,7 @@ pub fn capture_blocked_set_after_install(
     )
 }
 
-/// Phase 46 P1 metadata-aware variant of
+/// metadata-aware variant of
 /// [`capture_blocked_set_after_install`]. Used by the install pipeline
 /// where per-package metadata is available; see [`BlockedSetMetadata`].
 #[allow(clippy::too_many_arguments)]
@@ -700,13 +698,13 @@ pub fn capture_blocked_set_after_install_with_metadata(
     installed: &[(String, String, Option<String>)],
     policy: &SecurityPolicy,
     metadata: &BlockedSetMetadata,
-    // Phase 48 P0 sub-slice 6d follow-up — threaded through to
+    // sub-slice 6d follow-up — threaded through to
     // `compute_blocked_packages_with_metadata` so install-time
     // capture catches capability-widened packages that strict-
     // match on script-hash.
     requested_capabilities: &crate::capability::CapabilitySet,
     user_bound: &crate::capability::UserBound,
-    // Phase 46 slice 1 — see `compute_blocked_packages_with_metadata`.
+    // slice 1 — see `compute_blocked_packages_with_metadata`.
     // When `Some`, matching triples are removed from the persisted
     // blocked set before fingerprint + write so post-install JSON
     // + the "remain blocked after auto-build" pointer don't report
@@ -790,7 +788,7 @@ pub fn build_state_path(project_dir: &Path) -> PathBuf {
 ///
 /// Replaces the earlier `read_present_install_phases` (names-only)
 /// variant. The one caller — [`compute_blocked_packages_with_metadata`]
-/// — needs the bodies in P2 to run the Phase 46 static-gate classifier
+/// — needs the bodies in to run the static-gate classifier
 /// alongside the existing `phases_present` derivation, and folding the
 /// two into one pass over the JSON avoids reading / re-parsing
 /// `package.json` twice per blocked candidate.
@@ -807,7 +805,7 @@ pub fn build_state_path(project_dir: &Path) -> PathBuf {
 /// the source JSON — matching the script-hash invariant so downstream
 /// aggregation is stable across re-serializations of `package.json`.
 ///
-/// **Phase 46 P7:** exposed as `pub` so the version-diff renderer can
+/// exposed as `pub` so the version-diff renderer can
 /// read both the prior and candidate phase bodies out of the store
 /// for unified-diff rendering. Callers outside this module must not
 /// assume a body is present in the store — the prior version may
@@ -836,7 +834,7 @@ pub fn read_install_phase_bodies(pkg_dir: &Path) -> Vec<(String, String)> {
         .collect()
 }
 
-/// Phase 46b Lever #1 — extract the `repository` URL from a
+/// Lever #1 — extract the `repository` URL from a
 /// package's `package.json` at the given store directory.
 ///
 /// Accepts both manifest shapes:
@@ -863,14 +861,14 @@ pub fn read_manifest_repository(pkg_dir: &Path) -> Option<String> {
     }
 }
 
-/// Phase 46b Lever #3 — maximum bytes of a referenced script's
+/// Lever #3 — maximum bytes of a referenced script's
 /// content embedded in the advisor prompt. 32 KB matches the runbook
 /// cap. Files larger than this are truncated mid-line and the
 /// embedded view ends with a `\n... [truncated for prompt context]\n`
 /// marker so the model knows the slice is partial.
 pub const REFERENCED_SCRIPT_MAX_BYTES: usize = 32 * 1024;
 
-/// Phase 46b Lever #3 — embeddable file content for the advisor
+/// Lever #3 — embeddable file content for the advisor
 /// prompt. The runbook caps depth at 1 (no recursive require
 /// following) and scope to explicit safe-relative paths.
 pub struct ReferencedScriptCap {
@@ -878,7 +876,7 @@ pub struct ReferencedScriptCap {
     pub content: String,
 }
 
-/// Phase 46b Lever #3 — scan a script body for files it delegates
+/// Lever #3 — scan a script body for files it delegates
 /// to, then read each from the package's store directory with the
 /// caps the runbook prescribes:
 ///
@@ -1001,7 +999,7 @@ fn read_referenced_file(pkg_dir: &Path, rel_path: &str) -> Option<String> {
     Some(content)
 }
 
-/// Phase 46 P2 Chunk 5 — per-tier counts for a blocked set.
+/// — per-tier counts for a blocked set.
 ///
 /// Returns `(green, amber, red)` with these accounting rules:
 /// - `Some(Green)` → green.
@@ -1010,7 +1008,7 @@ fn read_referenced_file(pkg_dir: &Path, rel_path: &str) -> Option<String> {
 ///   amber variants collapse because they're indistinguishable to
 ///   the user's "needs review" mental model — `AmberLlm` just means
 ///   an LLM weighed in (P8). `None` means persisted state predates
-///   P2; conservative: count unknowns as amber so the user's eye is
+///  ; conservative: count unknowns as amber so the user's eye is
 ///   drawn to them.
 ///
 /// Exposed so a future `--json` install shape and the human
@@ -1030,14 +1028,14 @@ pub fn count_blocked_by_tier(blocked: &[BlockedPackage]) -> (usize, usize, usize
     (green, amber, red)
 }
 
-/// Phase 46 P2 Chunk 5 — triage-mode install summary line.
+/// — triage-mode install summary line.
 ///
 /// Rendered ONLY when `script-policy = "triage"` is the effective
 /// policy. Replaces the multi-line
 /// [`crate::commands::rebuild::show_install_build_hint`] output under
 /// triage; `deny` / `allow` keep the existing hint untouched.
 ///
-/// **Format (stable P2-onward; snapshot-tested):**
+/// **Format (stable-onward; snapshot-tested):**
 /// ```text
 /// script-policy: triage (N green / M amber / K red → lpm approve-scripts)
 /// ```
@@ -1092,8 +1090,8 @@ mod tests {
             script_hash: script_hash.map(String::from),
             phases_present: vec!["postinstall".to_string()],
             binding_drift: false,
-            // Phase 46 fields — `None` by default in this helper so
-            // pre-Phase-46 tests behave unchanged. Dedicated tests
+            // fields — `None` by default in this helper so
+            // pre-existing tests behave unchanged. Dedicated tests
             // below exercise the populated path.
             static_tier: None,
             provenance_at_capture: None,
@@ -1108,7 +1106,7 @@ mod tests {
         BuildState {
             state_version: BUILD_STATE_VERSION,
             blocked_set_fingerprint: fingerprint,
-            captured_at: "2026-04-11T00:00:00Z".to_string(),
+            captured_at: "T00:00:00Z".to_string(),
             blocked_packages: packages,
         }
     }
@@ -1228,9 +1226,8 @@ mod tests {
             script_hash: Some("sha256-bar".into()),
             phases_present: vec!["preinstall".into(), "postinstall".into()],
             binding_drift: true,
-            // Phase 46 fields: left None in this pre-Phase-46 roundtrip
-            // test so the assertion stays byte-identical to Phase 4's
-            // original shape.
+            // fields: left None in this pre-existing roundtrip
+            // test so the assertion stays byte-identical to  the             // original shape.
             static_tier: None,
             provenance_at_capture: None,
             published_at: None,
@@ -1729,14 +1726,14 @@ mod tests {
         );
     }
 
-    // ─── Phase 46 schema compatibility ─────────────────────────────
+    // ─── schema compatibility ─────────────────────────────
     //
     // The no-version-bump strategy (see `BUILD_STATE_VERSION` doc)
     // requires BOTH directions of compat to hold:
     //
-    //   1. A Phase 46 reader on a v1-written file defaults the new
+    //   1. A reader on a v1-written file defaults the new
     //      fields to None via #[serde(default)] (backward compat).
-    //   2. A v1 reader on a Phase-46-written file silently drops the
+    //   2. A v1 reader on a file silently drops the
     //      new fields because the struct lacks deny_unknown_fields
     //      (forward compat).
     //
@@ -1744,12 +1741,12 @@ mod tests {
 
     #[test]
     fn phase46_reader_defaults_missing_fields_from_v1_json() {
-        // Hand-written JSON as a pre-Phase-46 writer would produce:
+        // Hand-written JSON as a pre-existing writer would produce:
         // only the v1 fields, no static_tier / provenance / etc.
         let v1_json = r#"{
             "state_version": 1,
             "blocked_set_fingerprint": "sha256-legacy",
-            "captured_at": "2026-03-01T00:00:00Z",
+            "captured_at": "T00:00:00Z",
             "blocked_packages": [
                 {
                     "name": "esbuild",
@@ -1767,7 +1764,7 @@ mod tests {
         assert_eq!(state.blocked_packages.len(), 1);
 
         let pkg = &state.blocked_packages[0];
-        // All Phase 46 additions must default to None without the
+        // All additions must default to None without the
         // JSON naming them explicitly.
         assert_eq!(pkg.static_tier, None);
         assert_eq!(pkg.provenance_at_capture, None);
@@ -1782,8 +1779,8 @@ mod tests {
     #[test]
     fn v1_reader_silently_drops_phase46_fields_on_read() {
         // Simulate a v1 reader by defining a struct that ONLY has the
-        // v1 fields. A Phase-46-written JSON must parse into it with
-        // all v1 fields intact; the unknown Phase 46 fields must be
+        // v1 fields. A JSON must parse into it with
+        // all v1 fields intact; the unknown fields must be
         // silently dropped because no `deny_unknown_fields` is in
         // effect.
         #[derive(Debug, Deserialize, PartialEq, Eq)]
@@ -1809,7 +1806,7 @@ mod tests {
                 publisher: Some("github:lovell/sharp".into()),
                 ..Default::default()
             }),
-            published_at: Some("2026-04-20T00:00:00Z".into()),
+            published_at: Some("T00:00:00Z".into()),
             behavioral_tags_hash: Some("sha256-ccc".into()),
             behavioral_tags: Some(vec!["network".into(), "shell".into()]),
         };
@@ -1841,7 +1838,7 @@ mod tests {
                 workflow_ref: Some("refs/tags/v22.0.0".into()),
                 attestation_cert_sha256: Some("sha256-cert".into()),
             }),
-            published_at: Some("2026-04-18T12:34:56Z".into()),
+            published_at: Some("T12:34:56Z".into()),
             behavioral_tags_hash: Some("sha256-tags".into()),
             behavioral_tags: Some(vec!["childProcess".into(), "network".into()]),
         };
@@ -1897,7 +1894,7 @@ mod tests {
         assert_eq!(read.unwrap().blocked_packages.len(), 1);
     }
 
-    // ─── Phase 46 P1: metadata plumbing ───────────────────────────
+    // ───: metadata plumbing ───────────────────────────
     //
     // The `_with_metadata` variants forward `published_at` and
     // `behavioral_tags_hash` onto captured `BlockedPackage` entries.
@@ -1911,11 +1908,11 @@ mod tests {
         BlockedSetMetadataEntry {
             published_at: published_at.map(String::from),
             behavioral_tags_hash: behavioral_tags_hash.map(String::from),
-            // P4 Chunk 3: the Phase-46-P1 tests don't stress
+            // the tests don't stress
             // provenance_at_capture; use `Default` so future fields
             // don't force every test-helper re-edit. Dedicated
             // provenance capture tests live in lpm-security and in
-            // the Chunk 5 E2E harness.
+            // the E2E harness.
             ..Default::default()
         }
     }
@@ -1934,7 +1931,7 @@ mod tests {
 
     #[test]
     fn compute_with_metadata_forwards_published_at_and_behavioral_tags_hash() {
-        // Core P1 contract: when the caller supplies metadata for a
+        // Core contract: when the caller supplies metadata for a
         // blockable package, both optional fields on the emitted
         // BlockedPackage are populated verbatim.
         let project = tempdir().unwrap();
@@ -1947,7 +1944,7 @@ mod tests {
         metadata.insert(
             "sharp".to_string(),
             "0.33.0".to_string(),
-            make_metadata(Some("2026-04-18T12:34:56Z"), Some("sha256-tag-hash-abc")),
+            make_metadata(Some("T12:34:56Z"), Some("sha256-tag-hash-abc")),
         );
 
         let blocked = compute_blocked_packages_with_metadata(
@@ -1964,7 +1961,7 @@ mod tests {
         assert_eq!(blocked[0].name, "sharp");
         assert_eq!(
             blocked[0].published_at.as_deref(),
-            Some("2026-04-18T12:34:56Z"),
+            Some("T12:34:56Z"),
             "published_at MUST be forwarded from metadata map to BlockedPackage"
         );
         assert_eq!(
@@ -1977,8 +1974,7 @@ mod tests {
     #[test]
     fn compute_with_metadata_missing_entry_leaves_fields_none() {
         // Graceful degradation: when the caller has NO metadata for a
-        // package (offline, fast-path, registry error), both Phase 46
-        // fields stay None on the emitted BlockedPackage.
+        // package (offline, fast-path, registry error), both         // fields stay None on the emitted BlockedPackage.
         let project = tempdir().unwrap();
         std::fs::create_dir_all(project.path().join(".lpm")).unwrap();
         let store = lpm_store::PackageStore::at(project.path().join("store"));
@@ -2024,7 +2020,7 @@ mod tests {
         metadata.insert(
             "some-npm-pkg".to_string(),
             "1.0.0".to_string(),
-            make_metadata(Some("2026-04-20T00:00:00Z"), None),
+            make_metadata(Some("T00:00:00Z"), None),
         );
 
         let blocked = compute_blocked_packages_with_metadata(
@@ -2040,7 +2036,7 @@ mod tests {
         assert_eq!(blocked.len(), 1);
         assert_eq!(
             blocked[0].published_at.as_deref(),
-            Some("2026-04-20T00:00:00Z"),
+            Some("T00:00:00Z"),
             "populated half forwards"
         );
         assert!(
@@ -2053,7 +2049,7 @@ mod tests {
     fn backward_compat_wrapper_captures_with_empty_metadata() {
         // `capture_blocked_set_after_install` (no-metadata variant)
         // remains a valid entry point; it just produces BlockedPackage
-        // entries with both P1 fields as None. Pins the wrapper
+        // entries with both fields as None. Pins the wrapper
         // contract for the ~30 test callers that use it.
         let project = tempdir().unwrap();
         std::fs::create_dir_all(project.path().join(".lpm")).unwrap();
@@ -2069,7 +2065,7 @@ mod tests {
         let pkg = &capture.state.blocked_packages[0];
         assert!(
             pkg.published_at.is_none() && pkg.behavioral_tags_hash.is_none(),
-            "no-metadata wrapper must leave both P1 fields None"
+            "no-metadata wrapper must leave both fields None"
         );
     }
 
@@ -2093,7 +2089,7 @@ mod tests {
             m.insert(
                 "sharp".to_string(),
                 "0.33.0".to_string(),
-                make_metadata(Some("2026-04-01T00:00:00Z"), Some("sha256-aaa")),
+                make_metadata(Some("T00:00:00Z"), Some("sha256-aaa")),
             );
             m
         };
@@ -2102,7 +2098,7 @@ mod tests {
             m.insert(
                 "sharp".to_string(),
                 "0.33.0".to_string(),
-                make_metadata(Some("2026-04-20T00:00:00Z"), Some("sha256-bbb")),
+                make_metadata(Some("T00:00:00Z"), Some("sha256-bbb")),
             );
             m
         };
@@ -2135,7 +2131,7 @@ mod tests {
         );
     }
 
-    // ── Phase 46 P2 Chunk 3 — read_install_phase_bodies + static_tier ─
+    // ── — read_install_phase_bodies + static_tier ─
 
     fn store_pkg_with_scripts(
         store: &lpm_store::PackageStore,
@@ -2328,7 +2324,7 @@ mod tests {
         );
     }
 
-    // ── Phase 46 slice 1 — advisor-approved packages are excluded
+    // ── slice 1 — advisor-approved packages are excluded
     //                       from the persisted blocked set ──────────
 
     #[test]
@@ -2525,7 +2521,7 @@ mod tests {
         }
     }
 
-    // ── Phase 46 P2 Chunk 5 — count_blocked_by_tier + format_triage_summary_line ─
+    // ── — count_blocked_by_tier + format_triage_summary_line ─
 
     fn tiered(name: &str, tier: lpm_security::triage::StaticTier) -> BlockedPackage {
         let mut b = make_blocked(name, "1.0.0", None, Some("sha256-x"));
@@ -2585,7 +2581,7 @@ mod tests {
             tiered("amber-a", StaticTier::Amber),
             tiered("red-a", StaticTier::Red),
         ];
-        // Snapshot — the anchor prefix and suffix are P2-stable
+        // Snapshot — the anchor prefix and suffix are-stable
         // agent-parseable contracts. Changing them is a breaking
         // output change for any CI script that greps this line.
         assert_eq!(
@@ -2618,7 +2614,7 @@ mod tests {
         );
     }
 
-    // ── Phase 48 P0 sub-slice 6d follow-up — capability widening
+    // ── sub-slice 6d follow-up — capability widening
     //    must land in the blocked set even under strict match ──
 
     /// Reviewer's High finding: a package whose script-hash
@@ -2722,7 +2718,7 @@ mod tests {
         );
     }
 
-    // ── Phase 46b Lever #3 — referenced-script file reader ────────
+    // ── Lever #3 — referenced-script file reader ────────
 
     fn write_file(dir: &Path, rel: &str, content: &str) {
         let path = dir.join(rel);

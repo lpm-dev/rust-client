@@ -58,10 +58,10 @@ pub async fn run(action: &str, deep: bool, fix: bool, json_output: bool) -> Resu
 /// `lpm cache prune --apply`, which is reference-aware and won't evict packages
 /// currently referenced by a project lockfile.
 ///
-/// **Phase 66 confidence-followup F1+F2 review (2026-05-09).**
+/// 
 /// Pre-fix this only wiped `v1/`, leaving `v2/links/` and
 /// `v2/objects/` intact. Under the v2-default install path that
-/// shipped in Phase 4b, that meant `lpm store clean` was a silent
+/// shippedb, that meant `lpm store clean` was a silent
 /// near-no-op for users running the default — the tarball CAS, link
 /// entries, and patched-bytes link variants survived. The verify
 /// command now speaks in merged v1+v2 terms (F4); `clean` mirrors
@@ -166,7 +166,7 @@ struct StoreVerifyEntry {
 /// and verifies that the directory name matches the declared name@version.
 /// Fix mode (`--fix`): auto-repair issues like stale security caches. Without `--fix`, verify is read-only.
 ///
-/// **Phase 66 confidence-followup S4** — extended to walk both the
+/// extended to walk both the
 /// v1 store (`<store>/v1/<safe>@<ver>/`) AND the v2 link entries
 /// (`<store>/v2/links/<key>/node_modules/<name>/`). Pre-fix, this
 /// command was a silent no-op under the v2-default install pipeline:
@@ -406,7 +406,7 @@ fn run_verify(
         verified += 1;
     }
 
-    // **Phase 66 confidence-followup F4 (2026-05-09).** Distinguish
+    // Distinguish
     // "store entries" (one per v1 dir + one per v2 link entry) from
     // "unique packages" (deduped on `(name, version)`). During v1↔v2
     // migration AND under multi-source-same-coords + cross-project
@@ -499,7 +499,7 @@ fn run_verify(
     Ok(())
 }
 
-/// **Phase 66 confidence-followup F4 (2026-05-09)** — derive the
+/// derive the
 /// `(unique_coords, duplicated_count)` pair from the merged v1+v2
 /// entry list. Pure compute over already-walked input, factored out
 /// for unit testability.
@@ -562,17 +562,17 @@ fn list_v1_verify_entries(store: &PackageStore) -> Result<Vec<StoreVerifyEntry>,
     Ok(packages)
 }
 
-/// **Phase 66 confidence-followup S4** — enumerate v2 link entries
+/// enumerate v2 link entries
 /// for `lpm store verify`. Each link's sidecar (`.lpm-link-meta.json`)
 /// supplies `(name, version, source_sri)` directly; the materialized
 /// package dir is `<link>/node_modules/<name>/`. Links missing a
 /// sidecar are silently skipped (graceful — matches
 /// [`Store::iter_link_entries`]'s contract). Multi-source-same-coords
-/// (Phase 66 §2.2) yields one entry per link, so two links sharing
+/// yields one entry per link, so two links sharing
 /// `(name, version)` get verified independently.
 ///
 /// Returns an empty vec for stores with no v2 links (the common case
-/// pre-Phase-66-4b and for v1-only test fixtures).
+/// pre-and for v1-only test fixtures).
 fn list_v2_verify_entries(lpm_root: &LpmRoot) -> Result<Vec<StoreVerifyEntry>, LpmError> {
     let store_v2 = lpm_store::v2::Store::from_lpm_root(lpm_root);
     let mut packages = Vec::new();
@@ -617,7 +617,7 @@ mod tests {
     fn make_test_analysis() -> lpm_security::behavioral::PackageAnalysis {
         lpm_security::behavioral::PackageAnalysis {
             version: 1,
-            analyzed_at: "2026-01-01T00:00:00Z".to_string(),
+            analyzed_at: "T00:00:00Z".to_string(),
             source: lpm_security::behavioral::source::SourceTags::default(),
             supply_chain: lpm_security::behavioral::supply_chain::SupplyChainTags::default(),
             manifest: lpm_security::behavioral::manifest::ManifestTags::default(),
@@ -644,7 +644,7 @@ mod tests {
     fn security_analysis_ignores_timestamp_differences() {
         let a = make_test_analysis();
         let mut b = a.clone();
-        b.analyzed_at = "2026-06-15T12:00:00Z".to_string();
+        b.analyzed_at = "T12:00:00Z".to_string();
         b.meta.files_scanned = 999;
         // Timestamps and meta are ignored — only tags matter
         assert!(security_analysis_matches(&a, &b));
@@ -754,7 +754,7 @@ mod tests {
         );
     }
 
-    /// **Phase 66 confidence-followup S4 — v2 verify branch.** Pre-fix,
+    /// Pre-fix,
     /// `run_verify` walked `<store>/v1/` only. Under v2 the v1 dir
     /// doesn't exist, so the command silently reported zero packages
     /// even when hundreds of links sat in `<store>/v2/links/`. This
@@ -843,7 +843,7 @@ mod tests {
             .expect("verify must complete cleanly with one v2 entry");
     }
 
-    /// **Phase 66 confidence-followup S4** — sanity-check that v1 and
+    /// sanity-check that v1 and
     /// v2 entries verify side-by-side without one shadowing the other.
     /// A user mid-migration (some packages installed under v1, others
     /// under v2) sees both walked.
@@ -980,7 +980,7 @@ mod tests {
         );
     }
 
-    /// **Phase 66 confidence-followup F1+F2 review (2026-05-09)** —
+    /// —
     /// `lpm store clean` MUST wipe BOTH `v1/` and `v2/`. Pre-fix it
     /// was a v1-only wipe; under the v2-default install path that
     /// meant the tarball CAS, link entries, and patched-bytes link
@@ -1023,7 +1023,7 @@ mod tests {
         run_clean(&root, true).expect("empty store must not error");
     }
 
-    /// Mixed: only v2 exists (the post-Phase-4b default install
+    /// Mixed: only v2 exists (the post-default install
     /// state). The v1-only `if !v1.exists()` early-return pre-fix
     /// would have hit the empty-store branch and printed "already
     /// empty" while leaving v2 intact. Post-fix: v2 gets wiped.

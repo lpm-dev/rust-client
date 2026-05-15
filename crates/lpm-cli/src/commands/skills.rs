@@ -259,7 +259,7 @@ fn validate_skills(project_dir: &Path, json_output: bool) -> Result<(), LpmError
             }))
             .unwrap()
         );
-        // Finding #72: a non-empty `errors` list must surface as a
+        // a non-empty `errors` list must surface as a
         // non-zero exit code so CI gates fail closed. The structured
         // envelope above carries the per-skill error list; returning
         // `LpmError::ExitCode(1)` exits non-zero while routing past
@@ -291,7 +291,7 @@ fn validate_skills(project_dir: &Path, json_output: bool) -> Result<(), LpmError
         }
     }
 
-    // Finding #72: human-mode path. Per-skill warnings have already
+    // human-mode path. Per-skill warnings have already
     // been emitted above; return a concise summary error so the
     // top-level miette handler renders an "Error: …" footer AND the
     // process exits non-zero. Without this, CI gates that run

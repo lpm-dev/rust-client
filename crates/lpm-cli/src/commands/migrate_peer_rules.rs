@@ -1,4 +1,4 @@
-//! Phase 64 #33 — translate `package.json > pnpm.peerDependencyRules`
+//! #33 — translate `package.json > pnpm.peerDependencyRules`
 //! into `package.json > lpm.peerDependencyRules`.
 //!
 //! Mirrors the layered shape used by [`super::migrate_overrides`] and
@@ -596,7 +596,7 @@ mod tests {
             ">react",
             "foo>",
             // Glob wildcards must reject in every selector position
-            // (Phase 64 #33 second-pass: `is_valid_dep_name` is too
+            // (#33 second-pass: `is_valid_dep_name` is too
             // permissive for the selector grammar — `*` slipped
             // through pre-fix).
             "*",
@@ -605,7 +605,7 @@ mod tests {
             "foo>*",
             "*>react",
             "@*/foo>react",
-            // Phase 64 #33 third-pass: malformed non-wildcard names
+            // #33 third-pass: malformed non-wildcard names
             // (spaces, uppercase, leading `.`/`_`, special chars)
             // also slipped through `is_valid_dep_name` and silently
             // no-op'd at runtime. The new strict npm-name predicate

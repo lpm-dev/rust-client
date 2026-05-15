@@ -2,7 +2,7 @@ use crate::output;
 use lpm_common::LpmError;
 use lpm_common::color::Painted;
 
-/// Phase 35: resolve a usable LPM bearer for Swift Package Manager
+/// resolve a usable LPM bearer for Swift Package Manager
 /// integration. SPM's login flow takes the token as a CLI arg, so a
 /// SecretString round-trip would just leak immediately — this helper
 /// returns `Option<String>` to preserve the existing "skip auth on
@@ -67,9 +67,9 @@ pub async fn run(registry_url: &str, json_output: bool, force: bool) -> Result<(
 
     args.push(swift_registry_url.clone());
 
-    // Finding #9: Use tokio::process::Command instead of std::process::Command
+    // Use tokio::process::Command instead of std::process::Command
     // to avoid blocking the async runtime thread.
-    // Finding #10: When json_output is true, suppress subprocess stdout/stderr
+    // When json_output is true, suppress subprocess stdout/stderr
     // to avoid interleaving with our JSON output.
     let step1_result = if json_output {
         tokio::process::Command::new("swift")
@@ -106,7 +106,7 @@ pub async fn run(registry_url: &str, json_output: bool, force: bool) -> Result<(
                 output::info("Configuring authentication...");
             }
 
-            // Finding #8: SPM's `swift package-registry login` does not support reading
+            // SPM's `swift package-registry login` does not support reading
             // the token from stdin — it requires `--token <value>` as a CLI argument.
             // This means the token is briefly visible in the process list (`ps aux`).
             // This is a known limitation of SPM's CLI design. We accept this trade-off
@@ -152,7 +152,7 @@ pub async fn run(registry_url: &str, json_output: bool, force: bool) -> Result<(
                 );
             }
         } else if !json_output {
-            // Finding #15: User-facing binary name is `lpm`, not `lpm-rs`
+            // User-facing binary name is `lpm`, not `lpm-rs`
             output::warn("No LPM token found — run `lpm login` first for authenticated access");
         }
     } else if !json_output {
@@ -622,7 +622,7 @@ mod tests {
         }
     }
 
-    // Finding #13: Cert idempotency should check file size, not just existence.
+    // Cert idempotency should check file size, not just existence.
     // An empty or very small file should NOT be considered a valid certificate.
 
     #[test]
@@ -667,7 +667,7 @@ mod tests {
         assert!(is_cert_valid(&path));
     }
 
-    // Finding #15: Binary name should be `lpm`, not `lpm-rs`.
+    // Binary name should be `lpm`, not `lpm-rs`.
     // This is a string literal test — we verify the warning message references the correct name.
     // The actual string is on the `output::warn` call in the `run` function.
     // We can't easily unit-test the full `run` function (it requires subprocess + network),

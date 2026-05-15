@@ -46,7 +46,7 @@ pub async fn run(package: &str, json_output: bool) -> Result<(), LpmError> {
     let root = LpmRoot::from_env()?;
     let result = with_exclusive_lock(root.global_tx_lock(), || run_under_lock(&root, package))?;
 
-    // Opportunistic tombstone sweep (Phase 37 M3.5). Uninstall commit
+    // Opportunistic tombstone sweep. Uninstall commit
     // just appended the install root to `manifest.tombstones`; a
     // non-blocking sweep here clears it in the common case (no file
     // locks held). If a Windows-locked file delays it, the next global
@@ -702,7 +702,7 @@ mod tests {
         );
     }
 
-    // ─── Phase 37 M4.5: uninstall invariant under the M4 manifest model ──
+    // ─── M4.5: uninstall invariant under the M4 manifest model ──
     //
     // After M4.2, `PackageEntry.commands` excludes aliased-away names
     // (the M4 manifest invariant). A package installed with

@@ -1,4 +1,4 @@
-//! Phase 37 M5 — aggregate blocked-set across globally-installed packages.
+//! M5 — aggregate blocked-set across globally-installed packages.
 //!
 //! Each globally-installed package is its own synthetic project (per
 //! M3.2's install pipeline routing). When `install_global::do_install`
@@ -282,9 +282,9 @@ mod tests {
             script_hash: script.map(String::from),
             phases_present: vec!["postinstall".into()],
             binding_drift: false,
-            // Phase 46 fields default to None in global-blocked-set
-            // test helpers. Global-scope triage is Phase 46.1 (see
-            // §17); until then these fields remain None through the
+            // fields default to None in global-blocked-set
+            // test helpers. Global-scope triage is (see
+            //); until then these fields remain None through the
             // global flow even when the project-scope flow populates
             // them.
             static_tier: None,

@@ -1,4 +1,4 @@
-//! **Phase 32 Phase 6 — `lpm patch` and `lpm patch-commit`.**
+//! 
 //!
 //! Two-step workflow:
 //!
@@ -83,9 +83,9 @@ fn read_lockfile_for_patch_selector(project_dir: &Path) -> Result<Lockfile, LpmE
 }
 
 async fn run_patch_inner(name: String, version: String, json_output: bool) -> Result<(), LpmError> {
-    // **Phase 66 confidence-followup S3 (2026-05-08).** Lookup goes
+    // Lookup goes
     // through `find_installed_package_baseline`, which prefers the
-    // v2 virtual store (default since Phase 4b) and falls back to v1.
+    // v2 virtual store (defaultb) and falls back to v1.
     // Pre-fix this called `store.has_package(...)` (v1-only), which
     // always returned false under v2 → "not in the global store".
     let lpm_root = lpm_common::LpmRoot::from_env()?;
@@ -96,7 +96,7 @@ async fn run_patch_inner(name: String, version: String, json_output: bool) -> Re
                  Run `lpm install {name}@{version}` first."
             ))
         })?;
-    // **Phase 66 confidence-followup F1.** Seed the staging copy from
+    // Seed the staging copy from
     // the PRISTINE bytes — `objects/<sri>/` under v2, or the v1 store
     // dir (which v1 patches never mutate). Reading `package_dir` on
     // an already-patched v2 link entry would seed the staging dir
@@ -214,7 +214,7 @@ async fn run_patch_commit_inner(
     // 2. Locate the store baseline. We re-read it from the live store
     // (not the breadcrumb's recorded path) so that store relocations
     // between `patch` and `patch-commit` don't break commit.
-    // **Phase 66 confidence-followup S3 (2026-05-08).** v2-aware via
+    // v2-aware via
     // `find_installed_package_baseline` — same shape as
     // `run_patch_inner` above; the integrity comes back in the same
     // call so we no longer need a separate `read_stored_integrity`
@@ -226,7 +226,7 @@ async fn run_patch_commit_inner(
                  cannot generate patch baseline"
         ))
     })?;
-    // **Phase 66 confidence-followup F1.** Diff against the PRISTINE
+    // Diff against the PRISTINE
     // bytes (`objects/<sri>/` under v2, the v1 store dir under v1) so
     // a re-run of `lpm patch` + edit + `lpm patch-commit` against an
     // already-patched install produces the correct delta-from-upstream

@@ -141,7 +141,7 @@ pub async fn run(
         graph_render::recompute_stats(&mut graph);
     }
 
-    // **Phase 32 Phase 5** — load the persisted override apply trace
+    // load the persisted override apply trace
     // (if any) so `--why` and the JSON output can decorate paths with
     // the override that touched the package. The state file lives at
     // `<project_dir>/.lpm/overrides-state.json` and is written by
@@ -149,7 +149,7 @@ pub async fn run(
     // (no overrides ever applied) is the silent default.
     let overrides_state = overrides_state::read_state(project_dir);
 
-    // **Phase 32 Phase 6** — same pattern for the patch apply trace.
+    // same pattern for the patch apply trace.
     // The state file lives at `<project_dir>/.lpm/patch-state.json`.
     let patch_state = crate::patch_state::read_state(project_dir);
 

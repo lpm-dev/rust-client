@@ -1,4 +1,4 @@
-//! Phase 64 #34 — translate `package.json > pnpm.overrides` into LPM's
+//! #34 — translate `package.json > pnpm.overrides` into LPM's
 //! native override location at migrate time.
 //!
 //! The plan is computed and validated before any file mutation: parse
@@ -14,7 +14,7 @@
 //!   `package.json > lpm.overrides`.
 //! - **Conflicts** (same raw key in both `pnpm.overrides` and
 //!   `lpm.overrides` with different targets) are blocking errors. The
-//!   raw key is the comparison unit — see Phase 64 audit FLAG A for
+//!   raw key is the comparison unit — see audit FLAG A for
 //!   the design rationale.
 //! - **Parse errors** (e.g. multi-segment paths, invalid version
 //!   ranges) are blocking errors. We surface the offending entry with
@@ -34,7 +34,7 @@
 //! ## Idempotence
 //!
 //! After a successful migrate, `pnpm.overrides` stays in `package.json`
-//! (we don't strip it — see Phase 64 audit FLAG F). On a second
+//! (we don't strip it — see audit FLAG F). On a second
 //! `lpm migrate`, every entry already lives in `lpm.overrides` with the
 //! same target — it's a no-op merge, not a conflict. The diff-aware
 //! install-time warning silences automatically.

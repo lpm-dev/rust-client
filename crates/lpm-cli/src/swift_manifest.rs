@@ -33,7 +33,7 @@ pub fn find_package_swift(dir: &Path) -> Option<PathBuf> {
 /// Get non-test target names from the current SPM package.
 /// Runs `swift package dump-package` and parses the JSON output.
 pub fn get_spm_targets(project_dir: &Path) -> Result<Vec<String>, LpmError> {
-    // Finding #16: pipe stderr so diagnostics are available in error messages
+    // pipe stderr so diagnostics are available in error messages
     let output = std::process::Command::new("swift")
         .args(["package", "dump-package"])
         .current_dir(project_dir)
@@ -99,7 +99,7 @@ pub fn add_registry_dependency(
     product_name: &str,
     target_name: &str,
 ) -> Result<ManifestEdit, LpmError> {
-    // Finding #6: validate inputs before interpolation
+    // validate inputs before interpolation
     validate_manifest_value(version, "version")?;
     validate_manifest_value(product_name, "product_name")?;
 
@@ -120,7 +120,7 @@ pub fn add_registry_dependency(
     );
 
     // Step 1: Insert package dependency into top-level dependencies array.
-    // Finding #1: pass Some("targets:") so we only find the top-level dependencies array,
+    // pass Some("targets:") so we only find the top-level dependencies array,
     // not a target-level dependencies array.
     let content = insert_into_dependencies_array(&content, &dep_entry, Some("targets:"))?;
 
@@ -197,7 +197,7 @@ fn insert_into_dependencies_array(
     // Check if array is empty (only whitespace between brackets)
     let inner = content[bracket_start + 1..close_pos].trim();
     if inner.is_empty() {
-        // Finding #11: derive closing bracket indent from the opening bracket's line
+        // derive closing bracket indent from the opening bracket's line
         let close_indent = get_line_indent(content, bracket_start);
         let new_content = format!(
             "{}\n{}{},\n{}{}",
@@ -270,7 +270,7 @@ fn insert_into_target_deps(
             ))
         })?;
 
-    // Finding #4: find the enclosing target call boundary using paren matching.
+    // find the enclosing target call boundary using paren matching.
     // Walk backwards from target_pos to find the opening `(` of `.target(` or `.executableTarget(`.
     let target_call_open = content[..target_pos].rfind('(').ok_or_else(|| {
         LpmError::Registry(format!(
@@ -342,7 +342,7 @@ fn insert_into_target_deps(
     let inner = content[bracket_start + 1..close_pos].trim();
 
     if inner.is_empty() {
-        // Finding #11: derive closing bracket indent from context
+        // derive closing bracket indent from context
         let close_indent = get_line_indent(content, bracket_start);
         let new_content = format!(
             "{}\n{}{},\n{}{}",
@@ -834,7 +834,7 @@ let package = Package(
         assert_eq!(&content[close..close + 1], "]");
     }
 
-    // === Finding #1: before_keyword — inserts dependencies array when missing ===
+    // === before_keyword — inserts dependencies array when missing ===
     #[test]
     fn test_finding1_inserts_dependencies_when_missing_before_targets() {
         // Package.swift where there's NO top-level `dependencies:` before `targets:`,
@@ -916,7 +916,7 @@ let package = Package(
         );
     }
 
-    // === Finding #2: escaped quotes break bracket matcher ===
+    // === escaped quotes break bracket matcher ===
     #[test]
     fn test_finding2_escaped_quotes_in_string() {
         let content = "dependencies: [\n    .package(url: \"test\\\"]\"),\n]";
@@ -936,7 +936,7 @@ let package = Package(
         );
     }
 
-    // === Finding #3: comments break bracket matcher ===
+    // === comments break bracket matcher ===
     #[test]
     fn test_finding3_comments_with_unmatched_brackets() {
         let content = "dependencies: [\n    // removed: ]\n    .package(url: \"https://example.com/repo.git\", from: \"1.0.0\"),\n]";
@@ -967,7 +967,7 @@ let package = Package(
         assert_eq!(close, content.rfind(']').unwrap());
     }
 
-    // === Finding #4: wrong target modified when target lacks dependencies ===
+    // === wrong target modified when target lacks dependencies ===
     #[test]
     fn test_finding4_target_without_deps_finds_next_targets_deps() {
         let input = r#"// swift-tools-version: 5.9
@@ -1027,7 +1027,7 @@ let package = Package(
         }
     }
 
-    // === Finding #6: no validation of version/product_name ===
+    // === no validation of version/product_name ===
     #[test]
     fn test_finding6_malicious_product_name() {
         let input = r#"// swift-tools-version: 5.9
@@ -1089,7 +1089,7 @@ let package = Package(
         assert!(result.is_err(), "Should reject version containing quotes");
     }
 
-    // === Finding #11: indent assumes 4-space ===
+    // === indent assumes 4-space ===
     #[test]
     fn test_finding11_two_space_indent_empty_array() {
         let input = "// swift-tools-version: 5.9\nimport PackageDescription\n\nlet package = Package(\n  name: \"MyApp\",\n  dependencies: [],\n  targets: [\n    .target(name: \"MyApp\", dependencies: []),\n  ]\n)\n";
@@ -1146,7 +1146,7 @@ let package = Package(
         );
     }
 
-    // === Finding #6: validate_manifest_value unit tests ===
+    // === validate_manifest_value unit tests ===
     #[test]
     fn test_validate_manifest_value_rejects_dangerous_chars() {
         assert!(validate_manifest_value("valid-name", "test").is_ok());
@@ -1160,7 +1160,7 @@ let package = Package(
         assert!(validate_manifest_value("has\\backslash", "test").is_err());
     }
 
-    // === Finding #4: verify insert creates deps array in target ===
+    // === verify insert creates deps array in target ===
     #[test]
     fn test_finding4_insert_deps_into_target_without_deps_array() {
         let input = r#"// swift-tools-version: 5.9

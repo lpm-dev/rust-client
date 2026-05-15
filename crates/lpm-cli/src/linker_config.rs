@@ -20,7 +20,7 @@
 //!    project dir or any ancestor, return `Isolated` — strict per-package
 //!    dep boundaries pay off in monorepos where phantom-dep regressions
 //!    are most expensive. Otherwise fall through.
-//! 6. Default [`LinkerMode::default`] = `Hoisted` (Phase 66 4f) —
+//! 6. Default [`LinkerMode::default`] = `Hoisted` —
 //!    single-package projects keep the npm-compat fast path.
 //!
 //! Unknown values from any non-CLI surface return an error pointing at the
@@ -58,7 +58,7 @@ pub(crate) enum LinkerModeSource {
     /// project dir or any ancestor.
     WorkspaceAutoDetected,
     /// No explicit override and not a workspace project — fell through
-    /// to [`LinkerMode::default`] (Hoisted, Phase 66 4f).
+    /// to [`LinkerMode::default`] (Hoisted, 4f).
     Default,
 }
 

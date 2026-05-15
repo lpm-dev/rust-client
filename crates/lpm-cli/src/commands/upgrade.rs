@@ -76,7 +76,7 @@ enum TargetKind {
     AbsoluteLatest,
 }
 
-/// Phase 7 enriched candidate — drives both the interactive multiselect
+/// enriched candidate — drives both the interactive multiselect
 /// and the JSON output.
 #[derive(Clone)]
 struct EnrichedCandidate {
@@ -97,7 +97,7 @@ struct EnrichedCandidate {
 
 /// Upgrade outdated LPM dependencies to their latest versions.
 ///
-/// Phase 32 Phase 7: TTY-aware interactive mode with enrichment.
+/// TTY-aware interactive mode with enrichment.
 #[allow(clippy::too_many_arguments)]
 pub async fn run(
     client: &RegistryClient,
@@ -460,7 +460,7 @@ pub async fn run(
         false,                                                 // offline
         false,                                                 // force
         false,                                                 // allow_new
-        false,                                                 // strict_integrity (Phase 59.0 F5)
+        false,                                                 // strict_integrity
         None,                                                  // linker_override
         false,                                                 // no_skills
         false,                                                 // no_editor_setup
@@ -472,7 +472,7 @@ pub async fn run(
         None, // advisor_override: `lpm upgrade` does not expose `--advisor`
         None, // min_release_age_override: `lpm upgrade` uses the chain
         crate::provenance_fetch::DriftIgnorePolicy::default(), // drift-ignore: `lpm upgrade` enforces drift
-        // Phase 46.1 rework (2026-05-11): `lpm upgrade` does not
+        // rework : `lpm upgrade` does not
         // surface its own sandbox-mode flags. The chain inside
         // `rebuild::run` still walks env / config / default, so
         // users who configured strict persistently still get it.
@@ -786,7 +786,7 @@ fn compute_upgrade(
 /// body doesn't look like a version (e.g., `"*"`), returns it as-is
 /// — the caller's `classify_semver_change` will return `Unknown`.
 ///
-/// **D-impl-1 audit fix:** when no lockfile exists, `installed_ver` is
+/// ** audit fix:** when no lockfile exists, `installed_ver` is
 /// `None` and the old code used `"?"` as the "from" version, which
 /// `classify_semver_change` can't parse → `Unknown` → patches/minors
 /// don't get pre-checked. This helper extracts a real version from
@@ -1121,7 +1121,7 @@ mod tests {
         assert!(!is_valid_version_string("$(whoami)"));
     }
 
-    // ── D-impl-1: no-lockfile classification regression ─────────────
+    // ── no-lockfile classification regression ─────────────
     // Bug: when no lockfile exists, `from` was "?" → classify returned
     // Unknown → patches/minors not pre-checked. Contract: the class
     // must be derived from the range body, not from "?".

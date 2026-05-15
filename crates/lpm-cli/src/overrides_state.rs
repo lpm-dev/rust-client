@@ -1,4 +1,4 @@
-//! **Phase 32 Phase 5 — `<project_dir>/.lpm/overrides-state.json` persistence layer.**
+//! 
 //!
 //! Mirrors the [`crate::build_state`] pattern for the override apply
 //! trace. The state file persists three things across installs:
@@ -291,10 +291,10 @@ fn format_rfc3339(epoch_secs: u64) -> String {
     format!("{y_civil:04}-{m_civil:02}-{d:02}T{h:02}:{m:02}:{s:02}Z")
 }
 
-#[allow(dead_code)] // referenced in doctests + future Phase 5.x compaction
+#[allow(dead_code)] // referenced in doctests + future compaction
 fn _force_use_of_npm_range_matcher(_: NpmRangeMatcher) {}
 
-#[allow(dead_code)] // referenced in doctests + future Phase 5.x compaction
+#[allow(dead_code)] // referenced in doctests + future compaction
 fn _force_use_of_override_target(_: OverrideTarget) {}
 
 #[cfg(test)]
@@ -360,7 +360,7 @@ mod tests {
         std::fs::create_dir_all(&lpm_dir).unwrap();
         std::fs::write(
             lpm_dir.join(OVERRIDES_STATE_FILENAME),
-            r#"{"state_version":999,"fingerprint":"sha256-x","captured_at":"2026-04-11T00:00:00Z","parsed":[],"applied":[]}"#,
+            r#"{"state_version":999,"fingerprint":"sha256-x","captured_at":"T00:00:00Z","parsed":[],"applied":[]}"#,
         )
         .unwrap();
         assert!(read_state(dir.path()).is_none());
@@ -384,7 +384,7 @@ mod tests {
         assert_eq!(format_rfc3339(0), "1970-01-01T00:00:00Z");
         // 2000-01-01T00:00:00Z = 946684800
         assert_eq!(format_rfc3339(946_684_800), "2000-01-01T00:00:00Z");
-        // 2026-04-11T12:34:56Z = 1775910896 (verified via macOS `date`)
-        assert_eq!(format_rfc3339(1_775_910_896), "2026-04-11T12:34:56Z");
+        //T12:34:56Z = 1775910896 (verified via macOS `date`)
+        assert_eq!(format_rfc3339(1_775_910_896), "T12:34:56Z");
     }
 }
