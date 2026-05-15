@@ -82,7 +82,7 @@ use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::ptr;
-use std::sync::Mutex;
+use std::sync::{LazyLock, Mutex};
 
 use windows_sys::Win32::Foundation::{
     CloseHandle, ERROR_SUCCESS, GetLastError, HANDLE, HLOCAL, INVALID_HANDLE_VALUE, LocalFree,
@@ -699,23 +699,24 @@ fn fetch_directory_identity(path: &Path) -> Option<DirectoryIdentity> {
 /// `icacls /reset`) could have stripped the label and we'd want to
 /// reapply it.
 ///
-/// Stored as `Option<HashMap>` because `HashMap::new()` isn't `const`
-/// on stable Rust; we lazy-init on first access. A poisoned mutex
-/// (some other thread panicked while holding the lock) is recovered
-/// rather than propagated — losing the cache wastes work but
-/// shouldn't fail the install.
-static LABELED_ROOTS: Mutex<Option<HashMap<PathBuf, DirectoryIdentity>>> = Mutex::new(None);
+/// Wrapped in `LazyLock` so the inner `HashMap` initializes on first
+/// access without the `Option` ceremony at every call site
+/// (`HashMap::new()` isn't `const` on stable, but `LazyLock` — stable
+/// since Rust 1.80, repo pinned to 1.94.0 — gives us the same lazy
+/// init for free). A poisoned mutex (some other thread panicked while
+/// holding the lock) is recovered rather than propagated — losing the
+/// cache wastes work but shouldn't fail the install.
+static LABELED_ROOTS: LazyLock<Mutex<HashMap<PathBuf, DirectoryIdentity>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
 
 fn labelled_cache_lookup(path: &Path) -> Option<DirectoryIdentity> {
     let cache = LABELED_ROOTS.lock().unwrap_or_else(|p| p.into_inner());
-    cache.as_ref().and_then(|m| m.get(path).copied())
+    cache.get(path).copied()
 }
 
 fn labelled_cache_insert(path: PathBuf, identity: DirectoryIdentity) {
     let mut cache = LABELED_ROOTS.lock().unwrap_or_else(|p| p.into_inner());
-    cache
-        .get_or_insert_with(HashMap::new)
-        .insert(path, identity);
+    cache.insert(path, identity);
 }
 
 /// Test-only: drop every cached entry. Lets the per-test isolated
@@ -725,7 +726,18 @@ fn labelled_cache_insert(path: PathBuf, identity: DirectoryIdentity) {
 #[cfg(test)]
 fn reset_labelled_roots_cache_for_tests() {
     let mut cache = LABELED_ROOTS.lock().unwrap_or_else(|p| p.into_inner());
-    *cache = Some(HashMap::new());
+    cache.clear();
+}
+
+/// Test-only: drop every tracker entry. Tests inspecting JOB_TRACKER
+/// state directly (e.g. idempotency pins for `release_sandbox_tracker_entry`
+/// / `terminate_sandbox_tree`) call this first so prior tests in the
+/// same binary can't bleed entries forward. Mirrors
+/// `reset_labelled_roots_cache_for_tests` above.
+#[cfg(test)]
+fn reset_job_tracker_for_tests() {
+    let mut table = JOB_TRACKER.lock().unwrap_or_else(|p| p.into_inner());
+    table.clear();
 }
 
 /// Build the SDDL-derived security descriptor for the Low IL
@@ -1206,17 +1218,46 @@ fn resume_process(process_handle: HANDLE) -> Result<(), SandboxError> {
 /// parent process exits and the OS reaps it. For Phase 46.2 the
 /// (b) cleanup is sufficient: lifecycle scripts complete in seconds,
 /// the parent (`lpm`) exits quickly, and the OS frees the handle.
-/// Phase 46.3 can layer an explicit reaper if memory pressure
-/// surfaces from long-running parents (the rebuild-watch loop, say).
+/// The sole production consumer (`wait_with_timeout` in
+/// `lpm-cli/src/commands/rebuild.rs`) explicitly calls
+/// `release_sandbox_tracker` on normal exit and `terminate_sandbox_tree`
+/// on the timeout-kill path, so no leak occurs in practice.
+///
+/// Layering an explicit reaper thread (Phase 46.3 §6.1) would require
+/// duplicating the child's process handle inside `Sandbox::spawn`
+/// before returning the `Child` (otherwise `OpenProcess(SYNCHRONIZE,
+/// pid)` inside the reaper races PID reuse) and extending tracker
+/// entries to carry both handles. That's the right shape if
+/// `--jobs=N≥2` or watch-mode ever ships; until then the OS-on-exit
+/// fallback is sufficient. See `private/46.3.md` §6.1 for the design
+/// rationale and effort estimate.
 fn register_job_for_child(pid: u32, job: OwnedHandle) {
-    let mut table = JOB_TRACKER.lock().expect("job tracker mutex");
-    table.push((pid, job));
+    let mut table = JOB_TRACKER.lock().unwrap_or_else(|p| p.into_inner());
+    // Insert under the child's PID. Duplicate-PID registration is
+    // unreachable in the current call graph (the kernel won't recycle
+    // a PID while the parent still holds a process handle, and the
+    // Job handle in the tracker keeps the kernel object alive until
+    // release/terminate fires). If a future caller ever does double-
+    // register, `insert` drops the prior `OwnedHandle`, which closes
+    // the old Job — KILL_ON_JOB_CLOSE then fires on an already-empty
+    // Job and is harmless. We deliberately do NOT pin overwrite vs
+    // reject as a contract; either is acceptable.
+    table.insert(pid, job);
 }
 
-/// Module-local tracker; intentionally tiny (Vec of pairs) — the
-/// number of in-flight sandboxed children at any moment in a real
-/// install is small (single-digit). A HashMap is overkill.
-static JOB_TRACKER: Mutex<Vec<(u32, OwnedHandle)>> = Mutex::new(Vec::new());
+/// Module-local tracker mapping a sandboxed child's PID to its Job
+/// Object handle. `HashMap` so `release_sandbox_tracker_entry` and
+/// `terminate_sandbox_tree` are O(1) instead of `Vec::position`'s
+/// O(n). At realistic single-digit concurrency the difference is
+/// invisible, but the shape is correct for the future `--jobs=N`
+/// path and aligns with the `LABELED_ROOTS` sibling cache above.
+///
+/// Wrapped in `LazyLock` rather than `Mutex<Option<HashMap>>` —
+/// `HashMap::new()` isn't `const` on stable, but `LazyLock` (stable
+/// since Rust 1.80, repo pinned to 1.94.0) provides the same lazy
+/// init without the `Option` ceremony at every call site.
+static JOB_TRACKER: LazyLock<Mutex<HashMap<u32, OwnedHandle>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
 
 // `OwnedHandle` needs `Send` to live inside a `Mutex<Vec<...>>`. The
 // underlying HANDLE is a kernel handle — kernel objects are
@@ -1246,18 +1287,16 @@ pub(crate) fn terminate_sandbox_tree(pid: u32) {
         // here is strictly worse than aborting the parent.
         Err(p) => p.into_inner(),
     };
-    if let Some(idx) = table.iter().position(|(p, _)| *p == pid) {
-        let job_handle = table[idx].1.0;
-        // SAFETY: `job_handle` is the kernel Job Object we created
+    if let Some(entry) = table.remove(&pid) {
+        // SAFETY: `entry.0` is the kernel Job Object we created
         // and exclusively own via the tracker entry; `TerminateJobObject`
-        // is documented as safe to call from any thread.
+        // is documented as safe to call from any thread. The
+        // `OwnedHandle` is dropped at end of scope below, closing
+        // the kernel handle — pure resource reclamation since the
+        // Job has already been terminated.
         unsafe {
-            TerminateJobObject(job_handle, 1);
+            TerminateJobObject(entry.0, 1);
         }
-        // Drop the entry — `OwnedHandle::Drop` closes the kernel
-        // handle. The Job has already been terminated, so closing
-        // is just resource reclamation at this point.
-        table.remove(idx);
     }
 }
 
@@ -1274,9 +1313,7 @@ pub(crate) fn release_sandbox_tracker_entry(pid: u32) {
         Ok(g) => g,
         Err(p) => p.into_inner(),
     };
-    if let Some(idx) = table.iter().position(|(p, _)| *p == pid) {
-        table.remove(idx);
-    }
+    table.remove(&pid);
 }
 
 // ── Windows version probe ───────────────────────────────────────────
@@ -2632,6 +2669,49 @@ mod tests {
             "symlink target must NOT be labelled — labelling the symlink \
              would cause SetNamedSecurityInfoW to follow it and apply \
              Low IL to the target file outside the allow-set"
+        );
+    }
+
+    // ── JOB_TRACKER idempotency pins ────────────────────────────────
+    //
+    // Both `release_sandbox_tracker_entry` and `terminate_sandbox_tree`
+    // document themselves as "Idempotent: missing entries are silent
+    // no-ops." These tests pin that contract — calling either on a
+    // PID that was never registered must not panic and must leave the
+    // tracker untouched. Both reset the tracker first so a prior
+    // test's residual entries can't bleed in (matches the
+    // `reset_labelled_roots_cache_for_tests` discipline). They
+    // deliberately do NOT pin behavior on duplicate-PID re-register —
+    // that case is unreachable in the current call graph (kernel
+    // PID-reuse is blocked while the parent holds a process handle),
+    // so locking it as a contract would over-specify.
+
+    #[test]
+    fn release_sandbox_tracker_entry_on_unknown_pid_is_noop() {
+        reset_job_tracker_for_tests();
+        // PID chosen so it cannot collide with a real Windows PID
+        // (kernel PIDs are multiples of 4 and the high bit is never
+        // set in user-mode space).
+        release_sandbox_tracker_entry(0xFFFF_FFFE);
+        let table = JOB_TRACKER.lock().unwrap_or_else(|p| p.into_inner());
+        assert!(
+            table.is_empty(),
+            "release on unknown PID must not insert an entry; tracker had {} entries",
+            table.len()
+        );
+    }
+
+    #[test]
+    fn terminate_sandbox_tree_on_unknown_pid_is_noop() {
+        reset_job_tracker_for_tests();
+        // No registration before this — the call must short-circuit
+        // before any TerminateJobObject syscall.
+        terminate_sandbox_tree(0xFFFF_FFFD);
+        let table = JOB_TRACKER.lock().unwrap_or_else(|p| p.into_inner());
+        assert!(
+            table.is_empty(),
+            "terminate on unknown PID must not insert an entry; tracker had {} entries",
+            table.len()
         );
     }
 }
