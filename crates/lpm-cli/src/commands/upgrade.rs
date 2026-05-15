@@ -3,10 +3,10 @@ use crate::prompt::prompt_err;
 #[cfg(test)]
 use crate::upgrade_engine::PeerViolation;
 use crate::upgrade_engine::{self, PatchInvalidation, PeerImpact, SemverClass};
+use lpm_common::color::Painted;
 use lpm_common::{LpmError, PackageName};
 use lpm_registry::RegistryClient;
 use lpm_semver::Version;
-use owo_colors::OwoColorize;
 use std::collections::HashMap;
 use std::io::IsTerminal;
 use std::path::Path;

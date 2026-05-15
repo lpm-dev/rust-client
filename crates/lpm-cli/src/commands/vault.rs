@@ -3,7 +3,7 @@ use lpm_common::LpmError;
 #[cfg(target_os = "macos")]
 use crate::output;
 #[cfg(target_os = "macos")]
-use owo_colors::OwoColorize;
+use lpm_common::color::Painted;
 #[cfg(target_os = "macos")]
 use std::path::PathBuf;
 

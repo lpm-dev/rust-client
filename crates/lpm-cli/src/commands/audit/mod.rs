@@ -8,8 +8,8 @@ use cache::ProjectAuditCache;
 use discovery::ManagerKind;
 use discovery::{DiscoveredPackage, DiscoveryResult, ScanMode};
 use lpm_common::LpmError;
+use lpm_common::color::Painted;
 use lpm_registry::RegistryClient;
-use owo_colors::OwoColorize;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
@@ -1366,11 +1366,11 @@ struct AuditIssue {
 /// Format a severity string with colored terminal output.
 fn format_severity(severity: &str) -> String {
     match severity.to_lowercase().as_str() {
-        "critical" => format!("{}", " CRITICAL ".on_red().white().bold()),
-        "high" => format!("{}", severity.red().bold()),
-        "moderate" | "medium" => format!("{}", severity.yellow()),
-        "low" => format!("{}", severity.blue()),
-        "info" => format!("{}", severity.dimmed()),
+        "critical" => " CRITICAL ".on_red().white().bold(),
+        "high" => severity.red().bold(),
+        "moderate" | "medium" => severity.yellow(),
+        "low" => severity.blue(),
+        "info" => severity.dimmed(),
         _ => severity.to_string(),
     }
 }

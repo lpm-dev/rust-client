@@ -1,8 +1,8 @@
 use crate::output;
 use lpm_common::LpmError;
+use lpm_common::color::Painted;
 use lpm_runner::lpm_json;
 use lpm_runner::ports;
-use owo_colors::OwoColorize;
 use std::path::Path;
 
 /// Run the `lpm ports` command.

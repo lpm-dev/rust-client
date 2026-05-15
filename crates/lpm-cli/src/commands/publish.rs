@@ -3,10 +3,10 @@ use crate::commands::publish_npm;
 use crate::{auth, oidc, output, provenance, quality, sigstore};
 use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
 use lpm_common::LpmError;
+use lpm_common::color::Painted;
 use lpm_registry::RegistryClient;
 use lpm_runner::lpm_json;
 use lpm_security::skill_security;
-use owo_colors::OwoColorize;
 use std::path::Path;
 
 /// Target registries for a publish operation.

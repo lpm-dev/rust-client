@@ -1,7 +1,7 @@
 use crate::output;
 use lpm_common::LpmError;
+use lpm_common::color::Painted;
 use lpm_registry::RegistryClient;
-use owo_colors::OwoColorize;
 
 /// Rotate the current token (create new, revoke old).
 pub async fn run_rotate(

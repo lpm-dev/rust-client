@@ -78,7 +78,7 @@ fn package_baseline_dir_indexed(
 ) -> Option<std::path::PathBuf> {
     find_installed_package_baseline_indexed(index, lpm_root, name, version).map(|b| b.package_dir)
 }
-use owo_colors::OwoColorize;
+use lpm_common::color::Painted;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::time::Duration;

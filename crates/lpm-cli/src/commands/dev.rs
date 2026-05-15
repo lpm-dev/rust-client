@@ -1,6 +1,6 @@
 use crate::output;
 use lpm_common::LpmError;
-use owo_colors::OwoColorize;
+use lpm_common::color::Painted;
 use std::path::Path;
 
 /// Run the `lpm dev` command with zero-config detection.

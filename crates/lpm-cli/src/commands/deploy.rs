@@ -34,8 +34,8 @@
 use crate::commands::install_targets::{install_root_for, resolve_install_targets};
 use crate::output;
 use lpm_common::LpmError;
+use lpm_common::color::Painted;
 use lpm_registry::RegistryClient;
-use owo_colors::OwoColorize;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::Instant;

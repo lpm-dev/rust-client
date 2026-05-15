@@ -1,7 +1,7 @@
 use crate::output;
 use lpm_common::LpmError;
+use lpm_common::color::Painted;
 use lpm_registry::RegistryClient;
-use owo_colors::OwoColorize;
 use std::path::Path;
 
 /// Skills management: list, install from a package, validate, clean.

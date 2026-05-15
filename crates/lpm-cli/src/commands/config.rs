@@ -1,7 +1,7 @@
 use crate::output;
 use crate::prompt::prompt_err;
 use lpm_common::LpmError;
-use owo_colors::OwoColorize;
+use lpm_common::color::Painted;
 use std::io::IsTerminal;
 
 /// CLI configuration management.

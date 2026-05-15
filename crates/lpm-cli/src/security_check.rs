@@ -13,10 +13,10 @@
 //! Uses batch metadata endpoint for @lpm.dev packages (1 request for all).
 
 use crate::output;
+use lpm_common::color::Painted;
 use lpm_registry::RegistryClient;
 use lpm_security::behavioral::{self, PackageAnalysis};
 use lpm_store::PackageStore;
-use owo_colors::OwoColorize;
 use std::collections::{HashMap, HashSet};
 
 /// Severity tier for the post-install summary.

@@ -1,7 +1,7 @@
 use crate::output;
+use lpm_common::color::Painted;
 use lpm_common::{LpmError, LpmRoot, format_bytes, with_exclusive_lock, with_shared_lock};
 use lpm_store::PackageStore;
-use owo_colors::OwoColorize;
 
 /// Manage the global content-addressable package store.
 ///

@@ -1,6 +1,6 @@
 use crate::output;
 use lpm_common::LpmError;
-use owo_colors::OwoColorize;
+use lpm_common::color::Painted;
 
 /// Handle `lpm use` subcommands: install, list, pin.
 ///
