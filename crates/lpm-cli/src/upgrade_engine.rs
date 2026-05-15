@@ -1,4 +1,4 @@
-//! 
+//!
 //!
 //! Everything in this module is an unbiased predicate or transformation
 //! over data already in scope at the call site. There are no I/O calls,

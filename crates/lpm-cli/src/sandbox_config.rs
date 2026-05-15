@@ -373,7 +373,7 @@ pub fn decide_runtime_sandbox_mode(
     if no_sandbox_flag {
         // CLI `--no-sandbox` is the per-command escape hatch.
         // Single-flag drop of containment AND env scrubbing — the
-        // 
+        //
         return (SandboxMode::Disabled, false);
     }
     if sandbox_log_flag {

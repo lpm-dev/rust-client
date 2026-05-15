@@ -1,4 +1,4 @@
-//! 
+//!
 //!
 //! Patches are unified diffs (GNU patch format) generated from the
 //! difference between a clean store copy of a package and a user-edited

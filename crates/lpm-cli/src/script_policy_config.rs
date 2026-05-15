@@ -35,7 +35,7 @@ use std::path::Path;
 /// Which gate to apply to lifecycle scripts during `lpm rebuild` /
 /// autoBuild flows.
 ///
-/// See 
+/// See
 /// for the user-facing description of each mode.
 ///
 /// Wire/config format is kebab-case: `"deny"` | `"allow"` | `"triage"`.

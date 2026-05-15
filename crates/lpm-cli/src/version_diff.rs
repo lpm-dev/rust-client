@@ -1,4 +1,4 @@
-//! 
+//!
 //!
 //! Computes the field-by-field diff between a prior-approved
 //! [`TrustedDependencyBinding`] and a candidate [`BlockedPackage`]
@@ -700,7 +700,7 @@ fn ensure_trailing_newline(s: &str) -> String {
 }
 
 // ═══════════════════════════════════════════════════════════════════
-//  JSON serialization 
+//  JSON serialization
 // ═══════════════════════════════════════════════════════════════════
 //
 // Shared wire shape consumed by `lpm approve-scripts --json`,

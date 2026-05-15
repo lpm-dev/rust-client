@@ -1485,7 +1485,8 @@ mod tests {
                     "remediation must name the wizard shortcut to drop back to default: {remediation}"
                 );
                 assert!(
-                    remediation.contains("Filtering Platform") || remediation.contains("network denial"),
+                    remediation.contains("Filtering Platform")
+                        || remediation.contains("network denial"),
                     "remediation must name the outbound-network gap: {remediation}"
                 );
             }

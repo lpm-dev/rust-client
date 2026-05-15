@@ -1,4 +1,4 @@
-//! 
+//!
 //!
 //! Mirrors the [`crate::overrides_state`] pattern for the
 //! `lpm patch` apply trace. The state file persists three things across

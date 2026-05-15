@@ -710,7 +710,7 @@ impl CapabilitySet {
     ///   `stored_hash == self.canonical_hash()`. Any field change in
     ///   the requested set produces a different canonical hash and
     ///   the match fails — this is the drift-invalidates-approval
-    ///   rule from 
+    ///   rule from the approval model.
     ///
     /// # Why this method lives on `CapabilitySet`, not on the binding
     ///
@@ -1320,7 +1320,7 @@ mod tests {
     fn loosens_sandbox_limit_no_user_ceiling_is_widening() {
         // User hasn't configured RLIMIT_AS at all. Any request for
         // it triggers the approval gate — conservative fail-closed
-        // default per 
+        // default per
         let s = set_from(&[], ReadProjectMode::Narrow, &[(RlimitKey::As, 1024)]);
         assert!(s.loosens_beyond(&UserBound::default()));
         // Even with OTHER ceilings set — still widens for the
