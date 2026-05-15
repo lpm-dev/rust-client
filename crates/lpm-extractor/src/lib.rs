@@ -162,18 +162,18 @@ pub struct EntryInfo<'a> {
     pub bytes: Option<&'a [u8]>,
 }
 
-/// Extract tarball AND invoke a caller-supplied inspector for every
-/// regular file entry. The inspector fires AFTER the entry is safely on
-/// disk, with the entry's bytes-in-memory if the `buffer_predicate`
-/// opted to buffer that entry.
+/// Phase 38 P2 entry point: extract tarball AND invoke a caller-supplied
+/// inspector for every regular file entry. The inspector fires AFTER the
+/// entry is safely on disk, with the entry's bytes-in-memory if the
+/// `buffer_predicate` opted to buffer that entry.
 ///
 /// Fused-scan use case: lpm-store's streaming path passes
 /// `PackageAnalyzer::should_scan` as the predicate (true for scannable
 /// JS/TS sources under the 2 MB per-file limit) and an inspector that
 /// feeds each buffered entry into a running `PackageAnalyzer`. The result
-/// is one filesystem pass instead of two — extract writes files while
-/// the scan reads the bytes it already has in hand, eliminating the
-/// `analyze_package` post-extract walk.
+/// is one filesystem pass instead of two — P1's extract writes files
+/// while P2's scan reads the bytes it already has in hand, eliminating
+/// the `analyze_package` post-extract walk.
 ///
 /// Unbuffered entries (all non-source files, `.d.ts`, `.map`, files over
 /// 2 MB, etc.) go through the original `entry.unpack()` streaming path.
@@ -190,14 +190,14 @@ where
     P: Fn(&Path, u64) -> bool,
     I: FnMut(EntryInfo<'_>),
 {
-    // Top-level extractor span. Visible in Tracy under `--features tracy`;
-    // covers buffered read + libdeflate decompression + tar walk so the
-    // per-package fetch breakdown can attribute time to extraction vs
-    // other fetch sub-stages.
+    // Trial 4 (2026-05-13): top-level extractor span. Visible in
+    // Tracy under `--features tracy`; covers buffered read + libdeflate
+    // decompression + tar walk so the per-package fetch breakdown can
+    // attribute time to extraction vs other fetch sub-stages.
     let _span = tracing::info_span!("extractor.extract").entered();
-    // Buffered libdeflate decompression instead of streaming `GzDecoder`:
-    // libdeflate is ~2-3x faster than flate2/zlib-rs on the npm-tarball
-    // size distribution; the cost is peak memory equal to
+    // **Trial 1 (2026-05-13)**: switch from streaming `GzDecoder` to buffered
+    // libdeflate decompression. libdeflate is ~2-3x faster than flate2/zlib-rs
+    // on the npm-tarball size distribution; the cost is peak memory equal to
     // (compressed_size + decompressed_size) rather than streaming's bounded
     // per-entry buffer. For npm packages (typically <2 MB compressed / <10 MB
     // decompressed) this is a clear win on cold install wall-clock.
@@ -219,17 +219,18 @@ where
     let decompressed = decompress_gzip_libdeflate(&compressed)?;
     drop(compressed);
     let mut archive = Archive::new(decompressed.as_slice());
-    // npm tarballs ship arbitrary uid/gid/mode/mtime that
+    // **Phase 66 perf followup #1 (samply-driven, 2026-05-08; extended 2026-05-09
+    // post-flamegraph).** npm tarballs ship arbitrary uid/gid/mode/mtime that
     // mean nothing to a downstream Node consumer. The tar crate's defaults call
     // `fchmodat` + `fchownat` + `filetime::set_file_handle_times` per regular
     // file. Disabling all three:
     // - `preserve_permissions(false)` — drops ownership-aware chmod policy.
     // - `preserve_ownerships(false)` — drops `fchownat`.
     // - `preserve_mtime(false)` — drops `set_file_handle_times` →
-    //   `fsetattrlist` on macOS (flamegraph attributed ~2 % of active
-    //   CPU to mtime preservation). mtime is meaningless for
-    //   content-addressable store bytes — `require()` doesn't read it;
-    //   `lpm doctor` doesn't use it.
+    //   `fsetattrlist` on macOS. Pre-fix flamegraph attributed 2.0 % of active
+    //   CPU (`fsetattrlist` 100 % from `extract_tarball`) directly to mtime
+    //   preservation. mtime is meaningless for content-addressable store
+    //   bytes — `require()` doesn't read it; `lpm doctor` doesn't use it.
     // Note: even with `preserve_permissions=false`, tar 0.4.45's `_set_perms`
     // still unconditionally calls `set_permissions` (the flag only controls
     // SUID-bit retention). Eliminating the residual ~1.7 % `__fchmod` cost
@@ -246,12 +247,15 @@ where
 
     std::fs::create_dir_all(target_dir)?;
     let extraction_root = target_dir.canonicalize().map_err(LpmError::Io)?;
+    // **Phase 66 perf followup #3 (samply-driven, 2026-05-08).**
     // Memoize parent dirs we've already verified-or-created so the
     // per-file `prepare_output_path` walk doesn't re-`symlink_metadata`
     // every component on every entry. For an npm tarball with ~80
-    // entries averaging 4 path components, the naive walk does
+    // entries averaging 4 path components, the pre-fix walk did
     // ~320 `symlink_metadata` syscalls; with the cache, ~84 (each
-    // unique dir prefix once).
+    // unique dir prefix once). Per fixture-large's samply hot-path
+    // self-time of ~4.4 % in `prepare_output_path`, expected savings
+    // ~30-50 ms cold-install wall.
     //
     // Capacity heuristic: number of components in the deepest
     // expected path × ~10 (most npm tarballs have ≤ 10 distinct
@@ -392,8 +396,9 @@ where
 
         // Only extract regular files (skip symlinks for security)
         if entry.header().entry_type().is_file() {
-            // Capture the tar entry's exec bits BEFORE any read; the
-            // header is parsed up-front by the tar crate. We honor whichever
+            // **Phase 66 confidence-followup S1 (2026-05-08).** Capture
+            // the tar entry's exec bits BEFORE any read; the header is
+            // parsed up-front by the tar crate. We honor whichever
             // execute bits the tarball declares (user / group / other)
             // and OR them onto the default 0644 mode after the write.
             // SUID / SGID / sticky bits are deliberately dropped — same
@@ -433,12 +438,15 @@ where
                 }
                 Some(buf)
             } else {
+                // **Phase 66 perf followup #4 (post-flamegraph, 2026-05-09).**
                 // Stream directly to disk via `io::copy` instead of
                 // `entry.unpack()`. Even with `set_preserve_permissions(false)`
                 // / `set_preserve_ownerships(false)` / `set_preserve_mtime(false)`
                 // the tar 0.4.45 unpack path unconditionally calls
                 // `_set_perms` (entry.rs:814) — the flag only controls SUID-bit
-                // retention. Bypassing it here drops the residual `__fchmod`.
+                // retention. Bypassing it here drops the residual `__fchmod`
+                // that the flamegraph attributed at 1.7 % of active CPU
+                // (100 % of `__fchmod` samples → `extract_tarball`).
                 //
                 // Same minimal write semantics as [`write_buffered_entry`]:
                 // create-or-truncate, default mode (`umask`-respecting), no
@@ -454,9 +462,10 @@ where
                 None
             };
 
-            // Restore the exec bits captured before the write. Skipped
-            // on Windows (NTFS doesn't have POSIX mode bits — bin
-            // scripts are dispatched by extension, not the X bit).
+            // **Phase 66 confidence-followup S1.** Restore the exec
+            // bits captured before the write. Skipped on Windows
+            // (NTFS doesn't have POSIX mode bits — bin scripts are
+            // dispatched by extension, not the X bit).
             #[cfg(unix)]
             if exec_bits != 0 {
                 use std::os::unix::fs::PermissionsExt;
@@ -500,7 +509,8 @@ fn write_buffered_entry(target_path: &Path, bytes: &[u8]) -> Result<(), LpmError
 
 /// Stream a tar entry's bytes directly to disk via `io::copy`, skipping
 /// the chmod/chown/utimes epilogue `tar::Entry::unpack` always emits.
-/// Used by the non-buffered branch of the extractor.
+/// Used by the non-buffered branch of the extractor — see Phase 66
+/// post-flamegraph followup #4.
 fn stream_entry_to_disk<R: std::io::Read>(
     entry: &mut tar::Entry<'_, R>,
     target_path: &Path,
@@ -561,9 +571,10 @@ fn prepare_output_path(
             break;
         }
 
-        // Skip the `symlink_metadata` syscall when we've already
-        // verified or created this exact intermediate dir on a prior
-        // entry in this extraction. Only applies to NON-leaf components.
+        // **Phase 66 perf followup #3.** Skip the `symlink_metadata`
+        // syscall when we've already verified or created this exact
+        // intermediate dir on a prior entry in this extraction. Only
+        // applies to NON-leaf components.
         if verified_parents.contains(&current) {
             continue;
         }
@@ -1214,11 +1225,14 @@ mod tests {
         );
     }
 
-    /// `create_leaf_file` uses `O_NOFOLLOW` on the file open instead of
-    /// an explicit per-leaf `symlink_metadata` pre-check. This test pins
-    /// the security guarantee: a pre-existing leaf symlink (e.g.,
-    /// orphaned from a crashed extraction) MUST NOT cause the extractor
-    /// to write through it.
+    /// **Phase 66 perf followup #C** — `create_leaf_file` replaced
+    /// the explicit per-leaf `symlink_metadata` pre-check with
+    /// `O_NOFOLLOW` on the file open. This test pins the security
+    /// guarantee: a pre-existing leaf symlink (e.g., orphaned from a
+    /// crashed extraction) MUST NOT cause the extractor to write
+    /// through it. The legacy explicit-stat path returned the same
+    /// error shape; this test asserts the post-#C path keeps that
+    /// invariant.
     #[cfg(unix)]
     #[test]
     fn extract_rejects_existing_leaf_symlink() {
@@ -1229,7 +1243,8 @@ mod tests {
         std::fs::write(&outside_target, b"original outside content").unwrap();
 
         // Pre-plant a leaf symlink at the path the tarball wants to
-        // write to. Caught by `O_NOFOLLOW` on the leaf open.
+        // write to. Pre-#C this was caught by `prepare_output_path`'s
+        // leaf stat; post-#C it's caught by `O_NOFOLLOW` on the open.
         std::os::unix::fs::symlink(&outside_target, dir.path().join("victim.txt")).unwrap();
 
         let result = extract_tarball(&tgz, dir.path());
@@ -1291,11 +1306,13 @@ mod tests {
         assert_eq!(files[0], PathBuf::from("lib.js"));
     }
 
-    /// Tar entries with execute bits set (typical for npm package bins,
-    /// mode 0755) must keep those bits after extraction. An earlier
-    /// extractor stripped them entirely (umask-respecting 0644), causing
+    /// **Phase 66 confidence-followup S1.** Tar entries with execute
+    /// bits set (typical for npm package bins, mode 0755) must keep
+    /// those bits after extraction. Pre-fix the v2 store extractor
+    /// stripped them entirely (umask-respecting 0644), causing
     /// `EACCES` when Node tried to spawn shell-script bins (esbuild,
-    /// tsc, etc.).
+    /// tsc, etc.). Caught by `bench/audit-fixtures/native/esbuild-prebuilt`
+    /// regressing PASS→FAIL between Phase 2.7 and Phase 4b.
     #[cfg(unix)]
     #[test]
     fn extract_preserves_executable_bit_for_bin_files() {
@@ -1369,10 +1386,11 @@ mod tests {
         );
     }
 
-    /// Lock down the 0o644-floor mode-normalization contract. The
-    /// extractor floors every regular file at 0o644 (`rw-r--r--`) and
-    /// OR's the tarball's exec bits on top, regardless of what
-    /// read/write permissions the tarball header declared.
+    /// **Phase 66 confidence-followup F3 (2026-05-09)** — lock down the
+    /// 0o644-floor mode-normalization contract. The extractor floors
+    /// every regular file at 0o644 (`rw-r--r--`) and OR's the
+    /// tarball's exec bits on top, regardless of what read/write
+    /// permissions the tarball header declared.
     ///
     /// **Why this matters.** A surprising number of npm tarballs ship
     /// files with weird modes (0o600 user-only, 0o400 read-only, etc.)
@@ -1381,6 +1399,14 @@ mod tests {
     /// running Node — `EACCES` on `require()`. Both npm and pnpm
     /// flatten to a world-readable floor; this test pins LPM to the
     /// same posture.
+    ///
+    /// **Why we re-affirm it.** Issue F3 in the Phase 66 confidence
+    /// audit flagged the floor as a possible widening (a tarball
+    /// declaring 0o600 ends up world-readable). Decision: leave alone
+    /// — it matches npm/pnpm — but pin the behavior with this test
+    /// so a future audit doesn't re-flag the line and a refactor
+    /// can't silently switch to the tar header's mode without
+    /// breaking this assertion.
     ///
     /// SUID / SGID / sticky bits are explicitly NOT carried through —
     /// see the block comment at the post-write `set_permissions` site
