@@ -18,9 +18,16 @@ serde_json = { workspace = true }
 # `pre_exec` closure (direct `write(2)` for stderr + raw errno
 # values) — std::io's stderr path takes a lock and isn't safe
 # post-fork in multi-threaded processes.
+#
+# Phase 46.1.1: `seccompiler` compiles BPF programs for the
+# socket(2) deny matrix (UDP / raw / AF_PACKET / AF_NETLINK).
+# Apache-2.0/MIT dual licensed, maintained by AWS for Firecracker.
+# `apply_filter` is a single `prctl(PR_SET_SECCOMP, ...)` syscall —
+# AS-safe in the child's pre_exec closure.
 [target.'cfg(target_os = "linux")'.dependencies]
 landlock = "0.4"
 libc = "0.2"
+seccompiler = "0.5"
 
 # Phase 46.2: Windows backend uses Mandatory Integrity Control (drop
 # child to Low IL) plus a Job Object for kill-tree parity with Unix's

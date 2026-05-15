@@ -27,14 +27,25 @@
 //!   in-memory state) is moved into the pre_exec closure.
 //!
 //! **Child side** (post-fork, pre-exec, AS-safe only):
-//! - [`Option::take`] to extract the `RulesetCreated` captured by
-//!   move.
+//! - [`Option::take`] to extract the captured `RulesetCreated`
+//!   and (Phase 46.1.1) `seccompiler::BpfProgram`.
+//! - [`seccompiler::apply_filter`] — audited call path: two
+//!   direct syscalls (`prctl(PR_SET_NO_NEW_PRIVS, 1, …)` to
+//!   satisfy the unprivileged-seccomp precondition, then
+//!   `syscall(SYS_seccomp, SECCOMP_SET_MODE_FILTER, …)`) plus
+//!   a stack-allocated `sock_fprog` pointing at the BpfProgram's
+//!   `Vec<sock_filter>` backing buffer. No heap allocation in
+//!   the syscall path; the kernel `copy_from_user`s the filter
+//!   so we don't need to keep ownership beyond the call.
 //! - [`RulesetCreated::restrict_self`] — audited call path: two
 //!   direct syscalls (`prctl(PR_SET_NO_NEW_PRIVS)` and
 //!   `landlock_restrict_self`) plus enum/integer field shuffles.
 //!   No heap allocation, no lock acquisition.
 //! - On failure, [`write_stderr_as_safe`] — raw `write(2)` to fd 2,
 //!   bypassing `std::io::Stderr::lock()` which is NOT safe here.
+//!   Prefixes are per-layer: `seccomp:` for the Phase 46.1.1
+//!   filter install, `landlock:` for the V4 ruleset install,
+//!   `lpm-sandbox:` for cross-layer / dispatch failures.
 //! - [`std::io::Error::from_raw_os_error`] to propagate errno —
 //!   wraps an integer, does not allocate (contrast with
 //!   `io::Error::new(kind, &str)` which goes through `Box<Custom>`
@@ -42,8 +53,9 @@
 //!
 //! Crucially we do NOT `eprintln!`, `format!`, `Box::new`, or call
 //! any trait method whose implementation is opaque from the
-//! child's perspective. The landlock library's `restrict_self` is
-//! the only exception, and we've audited its source.
+//! child's perspective. The landlock library's `restrict_self`
+//! and seccompiler's `apply_filter` are the only exceptions,
+//! and we've audited both source paths.
 //!
 //! # Kernel probe
 //!
@@ -57,12 +69,18 @@
 //!   construct the strict backend, which installs filesystem rules
 //!   AND declares `AccessNet::from_all(V4)` (BindTcp + ConnectTcp)
 //!   with NO `NetPort` allow rules — landlock then default-denies
-//!   outbound TCP. **UDP / raw / AF_PACKET / DNS-via-UDP are NOT
-//!   denied by V4 alone** — that's the Phase 46.1.1 seccomp-bpf
-//!   layer's job. On V4 probe failure the kernel reported ≥ 6.7
-//!   but landlock itself isn't reachable (LSM disabled, etc.) —
-//!   we surface [`SandboxError::KernelTooOld`] with
-//!   `required: "6.7"`.
+//!   outbound TCP. The pre_exec closure ALSO installs the Phase
+//!   46.1.1 seccomp-bpf filter that denies direct
+//!   `socket(AF_INET|AF_INET6, SOCK_DGRAM|SOCK_RAW)`,
+//!   `socket(AF_PACKET, …)`, and `socket(AF_NETLINK, …)` — closing
+//!   the UDP / raw / L2 / routing-probe gap landlock V4 leaves
+//!   open. **AF_UNIX is intentionally allowed** (legitimate IPC
+//!   needs: node-ipc, husky hooks, npm daemon comms); resolver-
+//!   mediated DNS remains host-dependent (NSS may route through
+//!   AF_UNIX or TCP fallback). On V4 probe failure the kernel
+//!   reported ≥ 6.7 but landlock itself isn't reachable (LSM
+//!   disabled, etc.) — we surface [`SandboxError::KernelTooOld`]
+//!   with `required: "6.7"`.
 //! - **Degraded** (kernel < 6.7 AND `allow_degraded = true`): probe
 //!   landlock at ABI V1 (filesystem-only). The construction-side
 //!   succeeds when V1 is reachable; the install pipeline emits the
@@ -169,15 +187,37 @@ impl BackendPosture {
     /// Only Strict does; `Default` and `Degraded` explicitly do
     /// not.
     ///
-    /// Naming: "enforces TCP" would be more precise than "enforces
-    /// network" — landlock V4 doesn't cover UDP / raw / AF_PACKET.
-    /// The full network-denial story on Linux is `enforces_tcp`
-    /// (this method) AND, after Phase 46.1.1 lands, the seccomp-bpf
-    /// filter that denies the non-TCP socket families. The method
-    /// name stays `enforces_network` because that matches the
-    /// landlock-side intent — the seccomp layer will be its own
-    /// predicate when it lands.
+    /// Naming: "enforces TCP" would be more precise — landlock V4
+    /// doesn't cover UDP / raw / AF_PACKET / AF_NETLINK. The
+    /// non-TCP coverage on Linux is layered on by the sibling
+    /// predicate [`Self::installs_seccomp_filter`], which gates
+    /// the Phase 46.1.1 seccomp-bpf install in the pre_exec
+    /// closure. The two predicates always agree (both `true` for
+    /// `Strict`, `false` otherwise) but live separately so the
+    /// landlock-side ruleset builder
+    /// ([`build_parent_side_ruleset`]) and the seccomp-side
+    /// install can each gate on their own concern.
     fn enforces_network(&self) -> bool {
+        matches!(self, BackendPosture::Strict)
+    }
+
+    /// `true` iff this posture installs the Phase 46.1.1
+    /// seccomp-bpf `socket(2)` deny filter on top of the
+    /// landlock ruleset. Covers direct UDP (AF_INET/AF_INET6 +
+    /// SOCK_DGRAM), raw sockets, AF_PACKET, and AF_NETLINK —
+    /// the families landlock V4 doesn't reach.
+    ///
+    /// Only `Strict` returns `true`. `Default` and `Degraded`
+    /// explicitly skip the seccomp layer: `Default` is the
+    /// relaxed posture by design, and `Degraded` only reaches
+    /// V1 (filesystem-only) — adding seccomp without landlock
+    /// V4 would create a Linux strict-posture variant the
+    /// upstream contract doesn't promise.
+    ///
+    /// The pre_exec closure consults this predicate to decide
+    /// whether to call [`seccompiler::apply_filter`] before
+    /// landlock's `restrict_self`.
+    fn installs_seccomp_filter(&self) -> bool {
         matches!(self, BackendPosture::Strict)
     }
 }
@@ -312,11 +352,13 @@ fn strict_remediation() -> String {
      (2) add the package to `package.json > lpm > trustedDependencies` \
      to skip the sandbox for this dependency; (3) re-run with \
      `--no-sandbox` to skip the sandbox wholesale for one command; \
-     (4) upgrade the host kernel to 6.7+ to get the Phase 46.1 strict \
-     posture (filesystem-write containment + outbound TCP denial; UDP \
-     denial lands in Phase 46.1.1's seccomp-bpf layer); (5) run \
-     `lpm config sandbox --set default` to drop back to the recommended \
-     default posture (filesystem + env containment, network allowed)."
+     (4) upgrade the host kernel to 6.7+ to get the strict posture \
+     (filesystem-write containment + outbound TCP denial via landlock \
+     V4 + direct UDP / raw / AF_PACKET / AF_NETLINK denial via the \
+     Phase 46.1.1 seccomp-bpf layer; AF_UNIX intentionally allowed); \
+     (5) run `lpm config sandbox --set default` to drop back to the \
+     recommended default posture (filesystem + env containment, \
+     network allowed)."
         .to_string()
 }
 
@@ -380,29 +422,132 @@ impl Sandbox for LandlockSandbox {
             }
         })?;
 
-        // Option wrapper lets a FnMut closure consume the ruleset
-        // once (via `take`) while satisfying the FnMut bound
+        // Phase 46.1.1: compile the seccomp socket(2) deny filter
+        // parent-side. Like the landlock ruleset, all the
+        // allocating work (building the BTreeMap of rules,
+        // emitting BPF instructions into a Vec<sock_filter>)
+        // happens here on the parent thread before fork; the
+        // child only issues the AS-safe `prctl(PR_SET_SECCOMP)`
+        // syscall via `seccompiler::apply_filter`.
+        //
+        // The filter is `None` when the posture doesn't install
+        // it (Default / Degraded). On compile failure we surface
+        // `ProfileRenderFailed` matching the landlock-side error
+        // path; the build is deterministic over a static rule
+        // set, so this branch should never fire in practice.
+        let seccomp_program = if self.posture.installs_seccomp_filter() {
+            Some(crate::seccomp::build_socket_deny_filter().map_err(|e| {
+                SandboxError::ProfileRenderFailed {
+                    reason: format!("seccomp filter build failed: {e}"),
+                }
+            })?)
+        } else {
+            None
+        };
+
+        // Option wrapper lets a FnMut closure consume each layer's
+        // input once (via `take`) while satisfying the FnMut bound
         // `Command::pre_exec` requires. In practice the kernel only
         // invokes pre_exec once per spawn; the `take().ok_or(...)`
         // path below catches the hypothetical double-invocation.
         let mut ruleset_opt = Some(ruleset);
+        let mut seccomp_opt = seccomp_program;
 
         // SAFETY: This closure runs post-fork, pre-exec in the
         // child. The body is AS-safe: no heap allocation, no lock
         // acquisition, no `format!` / `eprintln!`. All possible
         // operations inside are either (a) direct syscalls via
-        // `libc` or `landlock` crate, (b) integer / enum
-        // manipulation, or (c) `io::Error::from_raw_os_error` which
-        // wraps an integer without allocating. The captured
-        // `ruleset_opt` holds a `RulesetCreated` whose `Drop`
-        // closes the inherited FD via `close(2)` — also AS-safe.
-        // See the module doc for the full audit.
+        // `libc`, `landlock`, or `seccompiler`, (b) integer /
+        // enum manipulation, or (c) `io::Error::from_raw_os_error`
+        // which wraps an integer without allocating.
+        //
+        // Captured-state Drop audit (load-bearing — both captures
+        // need explicit handling, neither is trivially AS-safe):
+        //   - `ruleset_opt` holds an `Option<RulesetCreated>`. We
+        //     `take()` it inside the closure; `restrict_self`
+        //     consumes the `RulesetCreated` by value, so its
+        //     `Drop` (which closes the inherited FD via `close(2)`,
+        //     AS-safe) runs INSIDE `restrict_self`'s call frame —
+        //     not at our closure's scope exit. The post-`take()`
+        //     `None` left in `ruleset_opt` drops trivially.
+        //   - `seccomp_opt` holds an `Option<BpfProgram>` where
+        //     `BpfProgram = Vec<sock_filter>`. Vec's `Drop` frees
+        //     its heap allocation — `free()` is NOT AS-safe in
+        //     a multithreaded fork-child (it can deadlock against
+        //     an allocator mutex that another thread held when
+        //     `fork` fired). We `take()` the program out of the
+        //     Option, then immediately wrap it in `ManuallyDrop`
+        //     so its inner Vec is NEVER freed in the child. See
+        //     the inline rationale at the seccomp-install site
+        //     below. The post-`take()` `None` in `seccomp_opt`
+        //     drops trivially.
+        //
+        // Phase 46.1.1 install order:
+        //   1. seccompiler::apply_filter — installs the socket(2)
+        //      deny filter. apply_filter ITSELF issues
+        //      prctl(PR_SET_NO_NEW_PRIVS, 1, …) first (required
+        //      for unprivileged seccomp install), then the
+        //      seccomp(2) syscall. Both are direct, AS-safe.
+        //   2. landlock_ruleset.restrict_self — the canonical
+        //      lockdown call (also redundantly asserts
+        //      NO_NEW_PRIVS, a no-op since step 1 set it).
+        // Both layers fail-closed: any failure returns EPERM
+        // from the closure, the kernel skips execve, the
+        // lifecycle script never runs.
         unsafe {
             command.pre_exec(move || {
+                // ── Layer 1: seccomp (Phase 46.1.1) ──
+                // Take the BpfProgram out of the Option, then
+                // wrap it in `ManuallyDrop` so its inner
+                // `Vec<sock_filter>` is NOT freed in the child.
+                //
+                // Why ManuallyDrop matters: `BpfProgram` is a
+                // `Vec<sock_filter>`; on Drop, the Vec frees its
+                // heap allocation — and `free()` is NOT AS-safe.
+                // In a multithreaded parent, another thread may
+                // have held the allocator mutex when `fork`
+                // fired; calling free() in the child would
+                // deadlock against that mutex's now-orphan
+                // owner. `apply_filter` already `copy_from_user`s
+                // the program into the kernel, so we don't need
+                // userspace ownership after the call. The child
+                // either execve()s (full address-space replace —
+                // leak harmless) or _exits via the error path
+                // (no unwind — leak harmless).
+                //
+                // ManuallyDrop suppresses both Ok and Err paths
+                // uniformly: even if `apply_filter` returned Err
+                // and we returned EPERM below, the closure scope
+                // exit would otherwise have run `program.drop()`.
+                if let Some(program) = seccomp_opt.take() {
+                    let program = std::mem::ManuallyDrop::new(program);
+                    // `Err(_e)` discard is deliberate:
+                    // seccompiler::Error's Display body allocates
+                    // (format!-style), which is NOT AS-safe in
+                    // the child. The `seccomp:` prefix steers
+                    // users to parent-side tracing for the
+                    // underlying errno (typically EACCES if
+                    // NO_NEW_PRIVS failed, ENOSYS on kernels
+                    // without CONFIG_SECCOMP_FILTER). Use `match`
+                    // rather than `if let Err(..)` to avoid
+                    // clippy's `collapsible_if` flagging the
+                    // outer + inner condition pair.
+                    match seccompiler::apply_filter(&program) {
+                        Ok(()) => {}
+                        Err(_) => {
+                            write_stderr_as_safe(b"seccomp: apply_filter failed\n");
+                            return Err(std::io::Error::from_raw_os_error(libc::EPERM));
+                        }
+                    }
+                }
+
+                // ── Layer 2: landlock (Phase 46.1) ──
                 let rs = match ruleset_opt.take() {
                     Some(r) => r,
                     None => {
-                        write_stderr_as_safe(b"landlock: pre_exec invoked without ruleset\n");
+                        write_stderr_as_safe(
+                            b"lpm-sandbox: pre_exec invoked without landlock ruleset\n",
+                        );
                         return Err(std::io::Error::from_raw_os_error(libc::EINVAL));
                     }
                 };
@@ -428,7 +573,7 @@ impl Sandbox for LandlockSandbox {
         }
 
         command.spawn().map_err(|e| SandboxError::SpawnFailed {
-            reason: format!("landlock spawn failed: {e}"),
+            reason: format!("lpm-sandbox spawn failed: {e}"),
         })
     }
 
