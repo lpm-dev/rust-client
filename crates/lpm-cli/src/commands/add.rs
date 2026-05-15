@@ -839,7 +839,7 @@ pub async fn run(
         // below surfaces what the user should add themselves.
         0
     } else {
-        let count = count_dependencies(&lpm_config, &inline_config, temp_dir.path());
+        let count = count_dependencies(&lpm_config, &inline_config, temp_dir.path())?;
         if count > 0 && !json_output {
             output::info(&format!(
                 "Skipped {} dependencies (--no-install-deps)",
@@ -1469,7 +1469,7 @@ fn handle_dry_run(
     }
 
     // Count dependencies that would be installed
-    let dep_count = count_dependencies(lpm_config, inline_config, extract_dir);
+    let dep_count = count_dependencies(lpm_config, inline_config, extract_dir)?;
 
     if json_output {
         let files_json: Vec<serde_json::Value> = file_actions
@@ -1597,7 +1597,7 @@ fn collect_source_pkg_deps(
     lpm_config: &Option<serde_json::Value>,
     inline_config: &HashMap<String, String>,
     extract_dir: &Path,
-) -> Vec<(String, crate::save_spec::UserSaveIntent)> {
+) -> Result<Vec<(String, crate::save_spec::UserSaveIntent)>, LpmError> {
     // Authoring contract: declaring `dependencies` in `lpm.config.json` —
     // even with conditional branches that produce zero matches for a
     // given consumer config — opts out of the legacy `package.json`
@@ -1617,11 +1617,14 @@ fn collect_source_pkg_deps(
     // Phase 33's "explicit user input wins" rule, which here means the
     // first declaration the author wrote).
     let mut deps: Vec<(String, crate::save_spec::UserSaveIntent)> = Vec::new();
-    let push_if_new = |deps: &mut Vec<(String, crate::save_spec::UserSaveIntent)>, raw: &str| {
-        let (name, intent) = crate::save_spec::parse_user_save_intent(raw);
+    let push_if_new = |deps: &mut Vec<(String, crate::save_spec::UserSaveIntent)>,
+                       raw: &str|
+     -> Result<(), LpmError> {
+        let (name, intent) = crate::save_spec::parse_user_save_intent(raw)?;
         if !deps.iter().any(|(existing, _)| existing == &name) {
             deps.push((name, intent));
         }
+        Ok(())
     };
 
     // 1. Conditional deps from `lpm.config.json#dependencies`.
@@ -1647,7 +1650,7 @@ fn collect_source_pkg_deps(
                 if let Some(arr) = dep_map.get(*value).and_then(|d| d.as_array()) {
                     for dep in arr {
                         if let Some(raw) = dep.as_str() {
-                            push_if_new(&mut deps, raw);
+                            push_if_new(&mut deps, raw)?;
                         }
                     }
                 }
@@ -1677,14 +1680,14 @@ fn collect_source_pkg_deps(
                             Some(v) if !v.is_empty() => format!("{name}@{v}"),
                             _ => name.clone(),
                         };
-                        push_if_new(&mut deps, &raw);
+                        push_if_new(&mut deps, &raw)?;
                     }
                 }
             }
         }
     }
 
-    deps
+    Ok(deps)
 }
 
 /// Count how many dependencies would be installed without actually installing them.
@@ -1695,8 +1698,8 @@ fn count_dependencies(
     lpm_config: &Option<serde_json::Value>,
     inline_config: &HashMap<String, String>,
     extract_dir: &Path,
-) -> usize {
-    collect_source_pkg_deps(lpm_config, inline_config, extract_dir).len()
+) -> Result<usize, LpmError> {
+    Ok(collect_source_pkg_deps(lpm_config, inline_config, extract_dir)?.len())
 }
 
 /// Phase 64 #9.4 preflight: refuse to copy a deps-declaring source
@@ -1735,7 +1738,7 @@ fn preflight_no_manifest_with_deps(
     if project_dir.join("package.json").exists() {
         return Ok(());
     }
-    if collect_source_pkg_deps(lpm_config, inline_config, extract_dir).is_empty() {
+    if collect_source_pkg_deps(lpm_config, inline_config, extract_dir)?.is_empty() {
         return Ok(());
     }
 
@@ -2324,7 +2327,7 @@ async fn handle_dependencies(
     json_output: bool,
     effective_pm: &str,
 ) -> Result<usize, LpmError> {
-    let entries = collect_source_pkg_deps(lpm_config, inline_config, extract_dir);
+    let entries = collect_source_pkg_deps(lpm_config, inline_config, extract_dir)?;
 
     if entries.is_empty() {
         return Ok(0);
@@ -3499,7 +3502,7 @@ mod tests {
             });
             let inline = HashMap::from([("icons".to_string(), "lucide".to_string())]);
 
-            let deps = collect_source_pkg_deps(&Some(lpm_config), &inline, extract.path());
+            let deps = collect_source_pkg_deps(&Some(lpm_config), &inline, extract.path()).unwrap();
             let names = names(&deps);
 
             assert!(
@@ -3548,7 +3551,7 @@ mod tests {
             });
             let inline = HashMap::from([("icons".to_string(), "lucide".to_string())]);
 
-            let deps = collect_source_pkg_deps(&Some(lpm_config), &inline, extract.path());
+            let deps = collect_source_pkg_deps(&Some(lpm_config), &inline, extract.path()).unwrap();
             assert_eq!(deps.len(), 4, "{deps:?}");
 
             let by_name: HashMap<String, UserSaveIntent> = deps.into_iter().collect();
@@ -3584,7 +3587,7 @@ mod tests {
             });
             let inline = HashMap::from([("ui".to_string(), "minimal".to_string())]);
 
-            let deps = collect_source_pkg_deps(&Some(lpm_config), &inline, extract.path());
+            let deps = collect_source_pkg_deps(&Some(lpm_config), &inline, extract.path()).unwrap();
 
             assert_eq!(deps.len(), 1, "duplicates collapse: {deps:?}");
             assert_eq!(
@@ -3622,7 +3625,7 @@ mod tests {
                 }),
             );
 
-            let deps = collect_source_pkg_deps(&None, &HashMap::new(), extract.path());
+            let deps = collect_source_pkg_deps(&None, &HashMap::new(), extract.path()).unwrap();
             let by_name: HashMap<String, UserSaveIntent> = deps.iter().cloned().collect();
 
             assert_eq!(
@@ -3664,7 +3667,7 @@ mod tests {
             });
             let inline = HashMap::from([("icons".to_string(), "lucide".to_string())]);
 
-            let deps = collect_source_pkg_deps(&Some(lpm_config), &inline, extract.path());
+            let deps = collect_source_pkg_deps(&Some(lpm_config), &inline, extract.path()).unwrap();
 
             assert_eq!(names(&deps), vec!["lucide-react".to_string()]);
             assert!(
@@ -3705,7 +3708,7 @@ mod tests {
             // Consumer picks a value that doesn't match any inner key.
             let inline = HashMap::from([("icons".to_string(), "phosphor".to_string())]);
 
-            let deps = collect_source_pkg_deps(&Some(lpm_config), &inline, extract.path());
+            let deps = collect_source_pkg_deps(&Some(lpm_config), &inline, extract.path()).unwrap();
 
             assert!(
                 deps.is_empty(),
@@ -3730,7 +3733,7 @@ mod tests {
             );
 
             // Shape A: no lpm.config.json at all.
-            let deps_a = collect_source_pkg_deps(&None, &HashMap::new(), extract.path());
+            let deps_a = collect_source_pkg_deps(&None, &HashMap::new(), extract.path()).unwrap();
             assert_eq!(names(&deps_a), vec!["react".to_string()]);
             assert_eq!(deps_a[0].1, UserSaveIntent::Range("^18".to_string()));
 
@@ -3740,7 +3743,8 @@ mod tests {
                 "files": [{ "src": "src/**" }]
             });
             let deps_b =
-                collect_source_pkg_deps(&Some(lpm_config_no_deps), &HashMap::new(), extract.path());
+                collect_source_pkg_deps(&Some(lpm_config_no_deps), &HashMap::new(), extract.path())
+                    .unwrap();
             assert_eq!(names(&deps_b), vec!["react".to_string()]);
             assert_eq!(deps_b[0].1, UserSaveIntent::Range("^18".to_string()));
         }
@@ -3762,9 +3766,11 @@ mod tests {
                 }
             });
             let inline_a = HashMap::from([("icons".to_string(), "lucide".to_string())]);
-            let count_a = count_dependencies(&Some(lpm_config.clone()), &inline_a, extract.path());
-            let collect_a =
-                collect_source_pkg_deps(&Some(lpm_config), &inline_a, extract.path()).len();
+            let count_a =
+                count_dependencies(&Some(lpm_config.clone()), &inline_a, extract.path()).unwrap();
+            let collect_a = collect_source_pkg_deps(&Some(lpm_config), &inline_a, extract.path())
+                .unwrap()
+                .len();
             assert_eq!(count_a, collect_a, "count must agree with collect");
             assert_eq!(count_a, 2, "both @lpm.dev/* and npm names counted");
 
@@ -3776,8 +3782,10 @@ mod tests {
                     "dependencies": { "react": "*", "@lpm.dev/owner.runtime": "*" }
                 }),
             );
-            let count_b = count_dependencies(&None, &HashMap::new(), extract.path());
-            let collect_b = collect_source_pkg_deps(&None, &HashMap::new(), extract.path()).len();
+            let count_b = count_dependencies(&None, &HashMap::new(), extract.path()).unwrap();
+            let collect_b = collect_source_pkg_deps(&None, &HashMap::new(), extract.path())
+                .unwrap()
+                .len();
             assert_eq!(count_b, collect_b);
             assert_eq!(count_b, 2);
         }
@@ -3798,7 +3806,7 @@ mod tests {
             });
             let inline = HashMap::from([("icons".to_string(), "lucide,heroicons".to_string())]);
 
-            let deps = collect_source_pkg_deps(&Some(lpm_config), &inline, extract.path());
+            let deps = collect_source_pkg_deps(&Some(lpm_config), &inline, extract.path()).unwrap();
             let names = names(&deps);
 
             assert!(names.contains(&"lucide-react".to_string()));
