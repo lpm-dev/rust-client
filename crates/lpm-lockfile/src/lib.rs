@@ -1323,8 +1323,8 @@ version = "1.0.0"
         // commands (`lpm outdated`, `lpm upgrade`) would pay the
         // failed-open + TOML-parse cost on every invocation. After
         // deletion, subsequent read_fast calls skip the binary
-        // check entirely until P43-2's writeback creates the v2
-        // file.
+        // check entirely until the next install writeback creates
+        // the v2 file.
         assert!(
             !binary_path.exists(),
             "stale v1 lpm.lockb must be deleted at read time so the \

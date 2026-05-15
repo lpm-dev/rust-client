@@ -333,12 +333,11 @@ fn git_url_safety(url: &str, ctx: &SafetyContext) -> SourceSafety {
         ));
     }
     if inner.starts_with("git://") {
-        // Day-4.5 (post-audit): plain `git://` is unauthenticated and
-        // MITM-vulnerable; deprecated by GitHub since 2021. Day-3
-        // warned-and-allowed; Day-4.5 tightens to deny. Users with
-        // pinned commit SHAs in old lockfiles can switch to
-        // `git+https://` with the same refspec — the SHA is the
-        // identity, not the transport.
+        // Plain `git://` is unauthenticated and MITM-vulnerable;
+        // deprecated by GitHub since 2021. Users with pinned commit
+        // SHAs in old lockfiles can switch to `git+https://` with
+        // the same refspec — the SHA is the identity, not the
+        // transport.
         return SourceSafety::Denied(format!(
             "git source uses unauthenticated git:// transport ({url:?}) — deprecated since GitHub 2021; switch to git+https://"
         ));
@@ -744,9 +743,9 @@ mod tests {
 
     #[test]
     fn safety_tarball_absolute_path_warns_on_portability() {
-        // Day-4.5 (post-audit): absolute filesystem paths are legal
-        // but the lockfile becomes machine-specific. Warn for
-        // portability, don't deny — security is unaffected.
+        // Absolute filesystem paths are legal but the lockfile
+        // becomes machine-specific. Warn for portability, don't
+        // deny — security is unaffected.
         match safety("tarball+/abs/path/foo.tgz", &strict()) {
             SourceSafety::AllowedWithWarning(msg) => {
                 assert!(msg.contains("absolute"), "got {msg:?}");
@@ -897,10 +896,9 @@ mod tests {
 
     #[test]
     fn source_id_registry_keyed_by_url() {
-        // Day-4.5 (post-audit): Registry source IDs hash the
-        // registry URL so cross-registry coexistence of the same
-        // (name, version) doesn't collapse identity. Locked: same
-        // URL → same id; different URLs → different ids.
+        // Registry source IDs hash the registry URL so cross-registry
+        // coexistence of the same (name, version) doesn't collapse
+        // identity. Same URL → same id; different URLs → different ids.
         let npmjs = Source::Registry {
             url: "https://registry.npmjs.org".into(),
         }
