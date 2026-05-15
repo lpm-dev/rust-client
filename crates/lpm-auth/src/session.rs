@@ -5,9 +5,6 @@
 //! classifies the effective token by source and refreshes lazily, only
 //! when an auth-required operation actually needs it, and only for
 //! refresh-backed stored sessions.
-//!
-
-
 
 use lpm_common::LpmError;
 use secrecy::{ExposeSecret, SecretString};

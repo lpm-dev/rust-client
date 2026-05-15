@@ -58,7 +58,7 @@ pub async fn run(action: &str, deep: bool, fix: bool, json_output: bool) -> Resu
 /// `lpm cache prune --apply`, which is reference-aware and won't evict packages
 /// currently referenced by a project lockfile.
 ///
-/// 
+///
 /// Pre-fix this only wiped `v1/`, leaving `v2/links/` and
 /// `v2/objects/` intact. Under the v2-default install path that
 /// shippedb, that meant `lpm store clean` was a silent

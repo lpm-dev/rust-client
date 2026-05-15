@@ -134,7 +134,7 @@ impl AppContainerSandbox {
 /// Keeping the two backends' decisions separate (rather than
 /// editing the function in place) preserves the Low IL
 /// fallback's strict-without-degraded refusal contract — see plan
-/// 
+///
 pub(crate) fn decide_appcontainer_posture(
     deny_outbound_network: bool,
     _allow_degraded: bool,
@@ -461,7 +461,7 @@ pub fn locate_sandbox_helper() -> Option<PathBuf> {
 /// parent (Medium IL, full COM) asks Microsoft's own
 /// `vcvarsall.bat` to render the build env and we inject the
 /// resulting env vars into the AppContainer child via the helper's
-/// `--env` argv plumbing. 
+/// `--env` argv plumbing.
 /// off vs hand-rolled VS discovery (`vcvarsall.bat` is Microsoft's
 /// official setup entry point and rides their cross-version drift
 /// surface; hand-rolled discovery would be ~5-10× the ongoing

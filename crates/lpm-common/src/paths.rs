@@ -32,7 +32,7 @@
 //!     .tx.lock.pid                ← best-effort PID of current holder (unlinked on clean exit)
 //!     installs/
 //!       <name>@<ver>/             ← per-package isolated install root
-//!         .lpm-install-ready      ← durable completeness marker 
+//!         .lpm-install-ready      ← durable completeness marker
 //!         lpm.lock
 //!         node_modules/
 //!         .lpm/

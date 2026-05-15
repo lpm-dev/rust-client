@@ -499,7 +499,7 @@ impl SandboxedCommand {
 /// denial line.
 #[derive(Debug, thiserror::Error)]
 pub enum SandboxError {
-    /// The current platform has no sandbox backend. Windows 
+    /// The current platform has no sandbox backend. Windows
     /// and non-{macOS,Linux} unix variants hit this arm. [`remediation`]
     /// is the user-facing next-step string.
     ///

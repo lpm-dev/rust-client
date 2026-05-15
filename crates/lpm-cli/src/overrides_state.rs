@@ -1,4 +1,4 @@
-//! 
+//!
 //!
 //! Mirrors the [`crate::build_state`] pattern for the override apply
 //! trace. The state file persists three things across installs:

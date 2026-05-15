@@ -482,7 +482,7 @@ async fn run_under_store_lock(
             // gated on the same `!all && specific_packages.is_empty()`
             // guard it has below, so the deny and triage UX is
             // consistent whether the set is empty-because-built or
-            // empty-because-untrusted. Surfaced by the 
+            // empty-because-untrusted. Surfaced by the
             // subprocess fixture.
             // close-out mirrors the `!= Allow`
             // guard on the non-empty-to_build warning site below —
@@ -1072,7 +1072,7 @@ async fn run_under_store_lock(
 /// `sandbox-exec`. On non-macOS (Linux, Windows, other Unix) it
 /// continues on the legacy direct-[`std::process::Command`] path
 /// because [`lpm_sandbox`]'s landlock backend (Linux) lands in
-/// and Windows is deferred to (D10). 
+/// and Windows is deferred to (D10).
 /// deletes the non-macOS arm; the macOS arm becomes unconditional.
 #[allow(clippy::too_many_arguments)]
 fn execute_script(
@@ -1192,7 +1192,7 @@ fn execute_script(
 /// `std::fs::hard_link`, which means the live file and store file
 /// share an inode — a lifecycle script that mutates files in its
 /// own package directory would mutate the store too. macOS uses
-/// `clonefile()` (CoW), so writes are isolated. The 
+/// `clonefile()` (CoW), so writes are isolated. The
 /// follow-up addressed this by detaching hardlinks before scripts
 /// run; see [`prepare_live_package_dir`] and
 /// [`lpm_linker::detach_package_hardlinks`]. Callers that want both
@@ -1356,7 +1356,7 @@ fn live_package_dir_with_v2(
 /// inodes. Either way, lifecycle scripts running inside the store
 /// is a soundness violation; the install pipeline already gates
 /// on "linked + scripted" so the fallback was unreachable in
-/// practice but still load-bearing as a safety net. 
+/// practice but still load-bearing as a safety net.
 /// closes the hole: when the resolved path is inside the store, we
 /// return `Err(...)` instead of plowing forward. Callers already
 /// format `Err(String)` results so no caller surface change is
@@ -1410,7 +1410,7 @@ fn prepare_live_package_dir(
 /// This removes the cfg-fork between macOS
 /// (sandboxed) and non-macOS (legacy direct-Command). Every platform
 /// now routes through [`lpm_sandbox::new_for_platform`]: macOS uses
-/// Seatbelt, Linux uses landlock, Windows uses the 
+/// Seatbelt, Linux uses landlock, Windows uses the
 /// Mandatory Integrity Control + Job Object backend. Old Linux
 /// kernels (<5.13) surface
 /// [`lpm_sandbox::SandboxError::KernelTooOld`]; non-{macOS, Linux,
@@ -1846,7 +1846,7 @@ pub(crate) enum TrustReason {
     /// `husky install`, `electron-rebuild`, relative-path `node`
     /// calls). Only reachable under [`ScriptPolicy::Triage`].
     GreenTierUnderTriage,
-    /// 
+    ///
     /// `script-policy = "triage"` + worst-wins classification is
     /// Amber/AmberLlm + an in-memory [`crate::triage_advisor_session::AdvisorSession`]
     /// returned `Approve` for this `(name, version)` during the
@@ -2276,7 +2276,7 @@ pub(crate) fn scriptable_package_rows(
 
     let walk_start = std::time::Instant::now();
 
-    // 
+    //
     // Same pattern as `build_state::compute_blocked_packages_with_metadata`.
     // Each iteration is independent — pure CPU + read-only disk: one
     // package.json read, one `BUILD_MARKER` stat, one
@@ -3868,7 +3868,7 @@ mod tests {
     fn p6_chunk1_auto_build_call_site_threads_effective_policy() {
         // Pin the install → auto-build handoff: the `rebuild::run` call
         // in install.rs must carry the resolved effective policy into
-        // `rebuild::run`'s last arg. Without this invariant the 
+        // `rebuild::run`'s last arg. Without this invariant the
         // tier-promotion logic would never see triage at the auto-
         // build site (install.rs today resolves effective_policy for
         // the blocked-hint block only).
@@ -4271,7 +4271,7 @@ mod tests {
         // `GreenTierUnderTriage`, even when the script would also
         // classify green. This matters for the UX suffix (the user
         // added the binding deliberately; calling it "auto-approval"
-        // misrepresents their intent) and for 
+        // misrepresents their intent) and for
         // integration test.
         let dir = tempfile::tempdir().unwrap();
         let store = PackageStore::at(dir.path().join("store"));

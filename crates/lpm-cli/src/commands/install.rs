@@ -407,7 +407,7 @@ impl FetchBreakdown {
     }
 }
 
-/// 
+///
 ///
 /// Shared across every fetch task (must be atomic because 24
 /// concurrent permit-holders may increment these). Surfaces on
@@ -661,7 +661,7 @@ fn extract_workspace_protocol_deps(
     Ok(extracted)
 }
 
-/// 
+///
 ///
 /// Walk root deps for `file:` / `link:` specs whose target realpaths
 /// to a workspace member. For each match: REMOVE the entry from
@@ -786,7 +786,7 @@ fn pre_extract_file_link_workspace_members(
     }
 }
 
-/// 
+///
 ///
 /// BFS over `workspace_member_deps` (the seed set: extracted top-
 /// level + any F9 / round-3 additions merged in by the caller),
@@ -1072,7 +1072,7 @@ fn fingerprint_json_value(count: usize, fingerprint: impl Into<String>) -> serde
     }
 }
 
-/// 
+///
 ///
 /// Run unconditionally after the linker (and the workspace-member
 /// linker pass). For each entry in `lpm.patchedDependencies`, find every
@@ -3690,7 +3690,7 @@ async fn run_with_options_under_store_lock(
         Vec::new()
     };
 
-    // 
+    //
     // `workspace_member_deps` above is the EXTRACTED top-level subset
     // (entries the consumer's manifest declared via `workspace:*`).
     // That set drives `link_workspace_members` (which plants root
@@ -3919,7 +3919,7 @@ async fn run_with_options_under_store_lock(
         );
     }
 
-    // 
+    //
     // Mirror of the overrides drift detection. Patches must be
     // checked BEFORE the offline branch so:
     //   1. Online mode can drop the lockfile fast path on drift and
@@ -6372,7 +6372,7 @@ async fn run_with_options_under_store_lock(
         ));
     }
 
-    // 
+    //
     //
     // Run AFTER both the regular linker pass AND the workspace-member
     // linker pass, so every materialized destination is in place. Run
@@ -6472,7 +6472,7 @@ async fn run_with_options_under_store_lock(
         .map(|p| (p.name.clone(), p.version.clone(), p.integrity.clone()))
         .collect();
 
-    // 
+    //
     //
     // Preflight the configured advisor ONCE per run. Session stays
     // active only when:
@@ -8976,7 +8976,7 @@ async fn run_link_and_finish(
         ));
     }
 
-    // 
+    //
     // Mirror of the online path. The drift gate already ran in
     // `run_with_options` BEFORE this function was reached, so any
     // declared patch is guaranteed to match the previously-recorded

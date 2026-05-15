@@ -1164,7 +1164,7 @@ mod tests {
         );
     }
 
-    /// 
+    ///
     ///
     /// Before this test was added, `parse_sigstore_bundle` would fail
     /// on the v0.3 shape (`verificationMaterial.certificate.rawBytes`)
@@ -1194,7 +1194,7 @@ mod tests {
         assert_eq!(snap.workflow_ref.as_deref(), Some("refs/tags/1.11.20"));
     }
 
-    /// 
+    ///
     ///
     /// npm currently serves a 2-element list: index 0 is npm's own
     /// publish attestation (publicKey-only, no Fulcio cert), index 1
@@ -1235,7 +1235,7 @@ mod tests {
         );
     }
 
-    /// 
+    ///
     ///
     /// If npm ever ships only a publish attestation (no GitHub Actions
     /// provenance), the wrapper is a single publicKey-only entry. The
