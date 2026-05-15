@@ -435,7 +435,7 @@ fn ensure_peer_context(targets: &mut [V2Target], store: &Store) -> Result<(), Lp
     // intersect declared peers against the install set. The
     // single-version-per-name shape is correct for the audit-fixture
     // scope; multi-source-same-name disambiguation flows through
-    // wrapper_id at the GraphKey level (see preplan §2.2).
+    // wrapper_id at the GraphKey level.
     let mut by_name: HashMap<String, String> = HashMap::with_capacity(targets.len());
     for v2t in targets.iter() {
         by_name
@@ -781,9 +781,8 @@ fn cleanup_v1_state(project_dir: &Path) -> Result<(), LpmError> {
     // `<project>/node_modules/` — wipe completely. v2 always rebuilds
     // from scratch; under v1 the linker also wipes stale entries via
     // `cleanup_stale_entries`. Wiping the whole tree is simpler and
-    // matches the migration semantics in preplan §3.2 (".bin/ MUST
-    // be wiped — bin shims regenerate from the active install
-    // layout").
+    // `.bin/` must be wiped — bin shims regenerate from the active
+    // install layout.
     let nm = project_dir.join("node_modules");
     if nm.exists() {
         std::fs::remove_dir_all(&nm).map_err(|e| {
@@ -1349,7 +1348,7 @@ mod tests {
         );
     }
 
-    /// **Cross-project peer-divergence — preplan §2.5 invariant.**
+    /// **Cross-project peer-divergence invariant.**
     ///
     /// The same consumer package + edge graph but a different
     /// resolved-peer version MUST produce distinct GraphKeys, so two
@@ -1590,7 +1589,7 @@ mod tests {
     // are documented as repo-local (`crates/lpm-cli/src/commands/patch.rs:18`):
     // "Patches travel with the repo. The next `lpm install` automatically
     // re-applies them after linking." Under v2's cross-project link
-    // sharing (preplan §2.2), two projects with identical dep graphs
+    // sharing, two projects with identical dep graphs
     // resolve to the same `<store>/v2/links/<key>/...` directory by
     // design. Without F1's `patch_fingerprint` dimension, project A's
     // `apply_patch` mutation lands in the shared dir and project B's

@@ -195,7 +195,7 @@ use lpm_common::symlink::validate_cmd_path;
 /// `Hoisted` gives users:
 ///
 /// - Cold-install win — hoisted is ~497 ms faster than isolated
-///   on `bench/fixture-large` cold/full (active-roadmap §2.6).
+///   on `bench/fixture-large` cold/full.
 /// - Same warm-install (post-v2 — see above).
 /// - Phantom-dep accessibility for tooling that relied on
 ///   npm-style flat node_modules (most ecosystem projects).
@@ -419,11 +419,10 @@ pub struct LinkTarget {
     /// `wrapper_id.is_some()`.
     ///
     /// The `+` separator visually distinguishes wrapped sources from
-    /// unwrapped (Registry-only) deps in the `.lpm/` tree. Pre-plan
-    /// §6.2 specifies the directory-source contract: Node module
-    /// resolution from inside the wrapped package walks ancestors
-    /// that stay inside the consumer's `node_modules/` tree, so
-    /// transitive deps resolve correctly (which a direct
+    /// unwrapped (Registry-only) deps in the `.lpm/` tree. Node
+    /// module resolution from inside the wrapped package walks
+    /// ancestors that stay inside the consumer's `node_modules/`
+    /// tree, so transitive deps resolve correctly (which a direct
     /// `node_modules/<name>` symlink at the source realpath would
     /// NOT achieve).
     ///
@@ -465,7 +464,7 @@ pub struct LinkTarget {
     /// 2. Fold into [`lpm_store::v2::GraphKeyInputs::with_peers`] so
     ///    two projects with the same edge graph but different peer
     ///    pinning produce distinct graph keys (the cross-project
-    ///    sharing invariant from preplan §2.5).
+    ///    cross-project sharing invariant).
     ///
     /// **Ignored under v1** — v1's relative-symlink wrappers walk
     /// up to the project root for peers, so threading is
@@ -1494,9 +1493,8 @@ fn find_hoisted_anchor(
     let mut visited: std::collections::HashSet<usize> = std::collections::HashSet::new();
     while visited.insert(cur) {
         let pkg = &packages[cur];
-        // **R2.5 fix-1.5 — alias-aware anchor lookup.**
-        //
-        // Pre-fix this checked `hoisted.get(&pkg.name) == Some(&cur)`.
+        // Alias-aware anchor lookup: pre-fix this checked
+        // `hoisted.get(&pkg.name) == Some(&cur)`.
         // That breaks under aliases: an aliased direct dep with
         // `root_link_names = ["a-alias"]` and `pkg.name = "lodash"`
         // is hoisted at slot "a-alias", not "lodash" — the lookup
@@ -1718,9 +1716,8 @@ pub fn link_packages_hoisted(
     // step falls back to the conflict name itself in that case.
     let mut nested_pending: Vec<(usize, Option<usize>)> = Vec::new();
 
-    // **R2.5 fix-1.5 — npm-alias root-slot claiming.**
-    //
-    // Pre-fix Stage 1 claimed slots keyed strictly on `pkg.name` (the
+    // npm-alias root-slot claiming: pre-fix Stage 1 claimed slots
+    // keyed strictly on `pkg.name` (the
     // canonical/registry identity). For a `npm:<target>@<range>` alias
     // declared at root level, `resolved_to_install_packages` populates
     // `LinkTarget.root_link_names` with the LOCAL alias name(s) — which
@@ -2235,13 +2232,13 @@ fn create_bin_links_hoisted(
         std::fs::create_dir_all(&bin_dir)?;
 
         for (cmd_name, script_path) in &entries {
-            // Finding #2: validate bin name
+            // Validate bin name
             if let Err(reason) = validate_bin_name(cmd_name, pkg_name) {
                 tracing::warn!("bin: rejecting \"{cmd_name}\" from {pkg_name}: {reason}");
                 continue;
             }
 
-            // Finding #1: validate bin target path (no traversal).
+            // Validate bin target path (no traversal).
             // pkg_path = node_modules/<name> here, same as the old &pkg_dir.
             let target = match validate_bin_target(&pkg_path, script_path) {
                 Ok(t) => t,
@@ -2257,13 +2254,13 @@ fn create_bin_links_hoisted(
                 let _ = std::fs::remove_file(&bin_link);
             }
 
-            // Finding #13: use relative symlinks for portability
+            // Use relative symlinks for portability
             #[cfg(unix)]
             {
                 let rel_target = relative_symlink_target_from_parent(&target, &bin_dir);
                 std::os::unix::fs::symlink(&rel_target, &bin_link)?;
 
-                // Finding #6: add execute only (0o111), not full 0o755
+                // Add execute only (0o111), not full 0o755
                 use std::os::unix::fs::PermissionsExt;
                 if let Ok(meta) = std::fs::metadata(&target) {
                     let mode = meta.permissions().mode();
@@ -2279,7 +2276,7 @@ fn create_bin_links_hoisted(
             #[cfg(windows)]
             {
                 let target_str = target.to_string_lossy();
-                // Finding #3: validate target path before interpolating into .cmd
+                // Validate target path before interpolating into .cmd
                 if let Err(reason) = validate_cmd_path(&target_str) {
                     tracing::warn!("bin: skipping .cmd shim for {cmd_name}: {reason}");
                     continue;
@@ -2363,13 +2360,13 @@ pub fn create_bin_links(
         std::fs::create_dir_all(&bin_dir)?;
 
         for (cmd_name, script_path) in &entries {
-            // Finding #2: validate bin name
+            // Validate bin name
             if let Err(reason) = validate_bin_name(cmd_name, pkg_name) {
                 tracing::warn!("bin: rejecting \"{cmd_name}\" from {pkg_name}: {reason}");
                 continue;
             }
 
-            // Finding #1: validate bin target path (no traversal)
+            // Validate bin target path (no traversal)
             let target = match validate_bin_target(&pkg_dir, script_path) {
                 Ok(t) => t,
                 Err(reason) => {
@@ -2385,13 +2382,13 @@ pub fn create_bin_links(
                 let _ = std::fs::remove_file(&bin_link);
             }
 
-            // Finding #13: use relative symlinks for portability
+            // Use relative symlinks for portability
             #[cfg(unix)]
             {
                 let rel_target = relative_symlink_target_from_parent(&target, &bin_dir);
                 std::os::unix::fs::symlink(&rel_target, &bin_link)?;
 
-                // Finding #6: add execute only (0o111), not full 0o755
+                // Add execute only (0o111), not full 0o755
                 use std::os::unix::fs::PermissionsExt;
                 if let Ok(meta) = std::fs::metadata(&target) {
                     let mode = meta.permissions().mode();
@@ -2407,7 +2404,7 @@ pub fn create_bin_links(
             #[cfg(windows)]
             {
                 let target_str = target.to_string_lossy();
-                // Finding #3: validate target path before interpolating into .cmd
+                // Validate target path before interpolating into .cmd
                 if let Err(reason) = validate_cmd_path(&target_str) {
                     tracing::warn!("bin: skipping .cmd shim for {cmd_name}: {reason}");
                     continue;
@@ -2499,12 +2496,11 @@ pub struct MaterializedPackage {
 /// `require('lodash')` from inside the wrapped package would NOT
 /// find the consumer's `node_modules/lodash/`. Per-file symlinks
 /// keep the realpath inside the wrapper, where ancestor walks
-/// still land in the consumer's `node_modules/` (pre-plan §6.2).
+/// still land in the consumer's `node_modules/`.
 ///
 /// **Excludes** `node_modules/` and `.git/` at *any* depth.
 /// Source-tree `node_modules/` would let untracked host state
-/// silently change install output (pre-plan locked OQ-7 to ignore-
-/// and-warn for file: sources). `.git/` is huge and meaningless to
+/// silently change install output. `.git/` is huge and meaningless to
 /// expose. Other dotfiles/dotdirs are NOT excluded — they may
 /// carry intentional package metadata (`.npmrc`, `.npmignore`,
 /// dotted bin shims).
@@ -3536,7 +3532,7 @@ mod tests {
 
     #[test]
     fn hoisted_mode_creates_top_level_dir_per_alias_root_link_name() {
-        // **R2.5 fix-1.5 regression test.**
+        // Regression test: alias-aware root-slot claiming.
         //
         // Pre-fix `link_packages_hoisted` claimed root slots strictly
         // by `pkg.name` (canonical/registry identity). For an
@@ -3788,7 +3784,7 @@ mod tests {
 
     // ---- Security audit tests ----
 
-    // Finding #1: Path traversal in bin targets
+    // Path traversal in bin targets
     #[test]
     fn bin_target_path_traversal_rejected() {
         let store_dir = tempfile::tempdir().unwrap();
@@ -3840,7 +3836,7 @@ mod tests {
         );
     }
 
-    // Finding #2: Bin name validation
+    // Bin name validation
     #[test]
     fn bin_name_with_path_separator_rejected() {
         assert!(validate_bin_name("../escape", "pkg").is_err());
@@ -3872,7 +3868,7 @@ mod tests {
         assert!(validate_bin_name("bad\\name", "pkg").is_err());
     }
 
-    // Finding #3: Windows cmd shim injection
+    // Windows cmd shim injection
     #[test]
     #[cfg(windows)]
     fn cmd_path_with_metacharacters_rejected() {
@@ -3886,7 +3882,7 @@ mod tests {
         assert!(validate_cmd_path("path\ninjection").is_err());
     }
 
-    // Finding #5: Validate cmd paths for junction creation
+    // Validate cmd paths for junction creation
     #[test]
     #[cfg(windows)]
     fn validate_cmd_path_rejects_ampersand() {
@@ -3899,7 +3895,7 @@ mod tests {
         assert!(validate_cmd_path("C:\\Users\\foo\\node_modules").is_ok());
     }
 
-    // Finding #6: Permission bits
+    // Permission bits
     #[cfg(unix)]
     #[test]
     fn permission_bits_add_execute_only() {
@@ -3921,7 +3917,7 @@ mod tests {
         );
     }
 
-    // Finding #13: Relative symlinks
+    // Relative symlinks
     #[cfg(unix)]
     #[test]
     fn bin_links_use_relative_symlinks() {
@@ -4015,7 +4011,7 @@ mod tests {
         );
     }
 
-    // Finding #1 in hoisted mode
+    // Path traversal in hoisted mode
     #[test]
     fn bin_target_path_traversal_rejected_hoisted() {
         let store_dir = tempfile::tempdir().unwrap();
@@ -4136,7 +4132,7 @@ mod tests {
         );
     }
 
-    // Finding #2 integration: bin name ../escape should not create a link
+    // Bin name ../escape should not create a link
     #[test]
     fn bin_name_escape_not_linked() {
         let store_dir = tempfile::tempdir().unwrap();
@@ -6832,8 +6828,8 @@ mod tests {
     fn cleanup_stale_entries_recognizes_directory_wrapper_segments() {
         // `+`-shape wrappers must be recognized by cleanup as
         // expected entries when their LinkTarget is in the package
-        // set. Otherwise day-2's directory deps would get swept on
-        // the second `lpm install` run.
+        // set. Otherwise directory deps would get swept on the second
+        // `lpm install` run.
         //
         // Wrappers live at `<project>/.lpm/wrappers/`,
         // resolved through `LayoutPaths` so the test setup tracks
@@ -7231,8 +7227,8 @@ mod tests {
         let parent_store = create_fake_store_package(&store_dir, "parent");
 
         // Parent has a transitive dep with a `f-`-prefixed version
-        // — the day-5 `apply_post_resolve_directory_link_fixup`
-        // produces this shape for FileDir transitives.
+        // `apply_post_resolve_directory_link_fixup` produces this
+        // shape for FileDir transitives.
         let parent = LinkTarget {
             name: "parent".to_string(),
             version: "1.0.0".to_string(),

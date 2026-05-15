@@ -69,7 +69,6 @@ pub struct LinkMetaPlatform {
 
 /// Complete sidecar payload for one link entry.
 ///
-/// Preplan §2.4 schema v1.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LinkMeta {
     /// Schema version. Always [`LINK_META_SCHEMA_VERSION`] for files

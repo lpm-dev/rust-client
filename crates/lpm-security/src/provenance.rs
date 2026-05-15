@@ -66,14 +66,13 @@ pub enum DriftVerdict {
 /// - `workflow_ref` (e.g. `refs/tags/v1.14.0`) — changes every
 ///   release by design; comparing it would falsely flag every patch
 ///   bump as "identity changed" (this was the reviewer's critical
-///   Chunk 3 finding before the workflow field split).
+///   identity changed" before the workflow field split).
 /// - `attestation_cert_sha256` — Fulcio issues a fresh leaf cert per
 ///   signing invocation, so the cert SHA rotates per release even
 ///   when the GitHub Actions identity is unchanged. Retained in the
 ///   snapshot for audit / forensics, not for drift gating.
 ///
-/// Using `==` on the full struct (which is what Chunk 3 originally
-/// did) would have made `NoDrift` unreachable for any two distinct
+/// Using `==` on the full struct would make `NoDrift` unreachable for any two distinct
 /// releases from the same repo — the regression guard
 /// `no_drift_when_only_workflow_ref_differs_between_releases` below
 /// exercises exactly this scenario and must stay green.
