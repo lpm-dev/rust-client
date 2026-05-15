@@ -24,9 +24,15 @@
 //!   copies into `node_modules`. The patch engine never produces or
 //!   accepts patches that mention these — `copy_store_to_staging` and
 //!   `generate_patch` filter them out, and `apply_patch` defends in
-//!   depth by erroring on any patch chunk that names them.
-//! - **Renames.** Phase 6 doesn't support file renames. A patch chunk
-//!   whose `--- a/old` and `+++ b/new` headers disagree is rejected.
+//!   depth by erroring on any patch chunk that names them. Renames
+//!   reject sentinel paths at both endpoints.
+//! - **Renames.** Git-style `rename from`/`rename to` headers are
+//!   recognized in both rename-only and rename+edit chunks. Renames
+//!   bind to `originalIntegrity` via the whole-tree drift gate; no
+//!   per-file old/new hash binding is needed (the whole-tree SRI
+//!   trips on any divergence). LPM's own `generate_patch` still emits
+//!   add+delete pairs rather than rename headers; this matters only
+//!   when a git-aware tool (or hand-edited patch) is consumed.
 //!
 //! ## Why no fast-path skip
 //!
@@ -47,8 +53,9 @@
 use diffy::Patch;
 use lpm_common::LpmError;
 use lpm_linker::MaterializedPackage;
+use lpm_lockfile::{LockedPackage, Lockfile};
 use lpm_store::PackageStore;
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 
 /// Files written by LPM into the store directory itself, NOT part of
@@ -72,26 +79,51 @@ pub const STAGING_BREADCRUMB_FILE: &str = ".lpm-patch.json";
 // ── Key parsing ───────────────────────────────────────────────────────
 
 /// Parse a `lpm.patchedDependencies` key like `"lodash@4.17.21"` or
-/// `"@types/node@20.10.0"` into `(name, version)`. Only exact-version
-/// pins are accepted today; range support is a future addition.
+/// `"@types/node@20.10.0"` into `(name, version)`. **Persisted keys
+/// are always exact pins** — the `lpm patch` author-time selector
+/// resolves ranges and bare names to a concrete version BEFORE the
+/// key is written. This parser enforces that invariant on read paths
+/// (state file, install-time consumer, upgrade engine).
 ///
 /// **Errors:**
 /// - Empty input.
 /// - Missing `@` separator.
 /// - Empty name or version segment.
-/// - Range-style version (`4.x`, `^4.0.0`, `>=4`) — rejected with a
-///   clear "exact pins only" message.
+/// - Anything that isn't an exact `lpm_semver::Version` — range
+///   syntax (`^4.0.0`, `4.x`), dist-tags (`latest`), wildcards, etc.
+///   The author-time `parse_patch_selector` accepts those; this
+///   parser does not.
 pub fn parse_patch_key(key: &str) -> Result<(String, String), LpmError> {
     if key.is_empty() {
         return Err(LpmError::Script(
             "patch key is empty (expected `name@exact-version`)".into(),
         ));
     }
-    // Scoped names start with `@` and contain `/`. The version separator
-    // is the LAST `@` in the key.
+    let (name, version) = split_name_version(key)?;
+    // Persisted keys must be exact pins. The `lpm patch` author-time
+    // flow resolves any range / bare-name selector to an exact pin
+    // before writing — so a non-exact value here means the manifest
+    // was hand-edited or produced by an out-of-band tool.
+    if lpm_semver::Version::parse(&version).is_err() {
+        return Err(LpmError::Script(format!(
+            "patch key {key:?} version {version:?} is not an exact pin; \
+             `lpm.patchedDependencies` keys must be exact (e.g. `name@1.2.3`). \
+             Author with `lpm patch {name}@<exact-version>`."
+        )));
+    }
+    Ok((name, version))
+}
+
+/// Split `name@version` into `(name, version)`, validating both halves
+/// are non-empty. Used by both [`parse_patch_key`] (persisted keys,
+/// exact-pin only) and [`parse_patch_selector`] (CLI input, range or
+/// dist-tag allowed).
+fn split_name_version(key: &str) -> Result<(String, String), LpmError> {
+    // Scoped names start with `@` and contain `/`. The version
+    // separator is the LAST `@` in the key.
     let at = key.rfind('@').ok_or_else(|| {
         LpmError::Script(format!(
-            "patch key {key:?} missing version separator — expected `name@exact-version`"
+            "patch key {key:?} missing version separator — expected `name@version`"
         ))
     })?;
     if at == 0 {
@@ -106,41 +138,257 @@ pub fn parse_patch_key(key: &str) -> Result<(String, String), LpmError> {
             "patch key {key:?} has empty name or version segment"
         )));
     }
-    // Reject range-style versions. Exact pins look like `1.2.3`,
-    // `1.2.3-rc.1`, etc. Range markers we explicitly reject:
-    // `^`, `~`, `>`, `<`, `=`, `*`, ` || `, ` - `, `x`, `X`, `latest`.
-    if is_range_version(&version) {
-        return Err(LpmError::Script(format!(
-            "patch key {key:?} uses a range version ({version:?}); \
-             only exact pins like `name@1.2.3` are accepted. \
-             Range selectors are not supported yet."
-        )));
-    }
     Ok((name, version))
 }
 
-fn is_range_version(version: &str) -> bool {
-    if version.is_empty() {
+// ── Selector parsing (Slice A — CLI input) ────────────────────────────
+
+/// A `lpm patch <selector>` CLI input, parsed but not yet resolved. The
+/// author-time path accepts more shapes than the persisted-key parser
+/// — bare names and ranges resolve to an exact pin from the project
+/// lockfile, then the exact pin is written to `lpm.patchedDependencies`.
+///
+/// **What is NOT in scope:** dist-tags (`latest`, `next`, `beta`,
+/// `canary`, `rc`, any pure-alphabetic version token). The selector
+/// path never consults the registry; mapping `latest` to "any installed
+/// version" would silently overload a registry contract. Dist-tags are
+/// rejected at parse time.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PatchSelector {
+    /// Bare package name like `lodash` or `@types/node` — resolve from
+    /// the project lockfile.
+    BareName(String),
+    /// Exact pin like `lodash@4.17.21` — already final.
+    Exact { name: String, version: String },
+    /// Semver range like `lodash@^4.0.0` or `lodash@4.x` — resolve
+    /// against the lockfile.
+    Range { name: String, range: String },
+}
+
+impl PatchSelector {
+    pub fn name(&self) -> &str {
+        match self {
+            Self::BareName(name) => name,
+            Self::Exact { name, .. } | Self::Range { name, .. } => name,
+        }
+    }
+}
+
+/// Parse a `lpm patch <input>` CLI argument. Accepts:
+/// - Bare names: `lodash`, `@types/node` → [`PatchSelector::BareName`]
+/// - Exact pins: `lodash@4.17.21`, `@types/node@20.10.0` →
+///   [`PatchSelector::Exact`]
+/// - Semver ranges: `lodash@^4.0.0`, `lodash@4.x`, `lodash@1 - 2`,
+///   `lodash@1 || 2` → [`PatchSelector::Range`]
+///
+/// Rejects:
+/// - Empty input
+/// - Empty name or version segment
+/// - Dist-tags: `latest`, `next`, `beta`, etc. → see `is_dist_tag`
+///
+/// `parse_patch_key` (the persisted-key parser) stays strict and only
+/// accepts `Exact`-shape inputs.
+pub fn parse_patch_selector(input: &str) -> Result<PatchSelector, LpmError> {
+    if input.is_empty() {
+        return Err(LpmError::Script(
+            "patch selector is empty (expected `name`, `name@version`, or `name@range`)".into(),
+        ));
+    }
+    // Bare name: no `@` separator, or a single leading `@` (scoped
+    // name without version). We distinguish by checking whether
+    // `rfind('@')` returns 0 (leading-only) or None (no `@` at all).
+    let at = input.rfind('@');
+    let bare = match at {
+        None => true,
+        Some(0) => true, // scoped name like "@types/node" without version
+        Some(_) => false,
+    };
+    if bare {
+        // Reject input that starts with `@` but has no slash — that's
+        // a malformed scoped name.
+        if input.starts_with('@') && !input.contains('/') {
+            return Err(LpmError::Script(format!(
+                "patch selector {input:?} is a malformed scoped name (expected `@scope/name`)"
+            )));
+        }
+        return Ok(PatchSelector::BareName(input.to_string()));
+    }
+    let (name, version) = split_name_version(input)?;
+    // Exact pin.
+    if lpm_semver::Version::parse(&version).is_ok() {
+        return Ok(PatchSelector::Exact { name, version });
+    }
+    // Semver range. `VersionReq::parse` accepts everything node-semver
+    // accepts — including the syntaxes we list in the docstring.
+    if lpm_semver::VersionReq::parse(&version).is_ok() {
+        return Ok(PatchSelector::Range {
+            name,
+            range: version,
+        });
+    }
+    // Neither — likely a dist-tag or malformed input.
+    if is_dist_tag(&version) {
+        return Err(LpmError::Script(format!(
+            "patch selector {input:?} uses a dist-tag ({version:?}); \
+             `lpm patch` does not consult the registry. \
+             Use a version (`{name}@<version>`) or semver range (`{name}@^<version>`)."
+        )));
+    }
+    Err(LpmError::Script(format!(
+        "patch selector {input:?} has invalid version segment {version:?}; \
+         expected a version, semver range, or bare name"
+    )))
+}
+
+/// Is `v` a non-semver token like `latest`, `next`, `beta` that npm
+/// treats as a dist-tag? Used by `parse_patch_selector` to produce a
+/// clearer error than the generic "invalid version segment".
+///
+/// The well-known dist-tags from npm conventions plus a catch-all for
+/// any pure-alphabetic token (since semver parsing would reject those
+/// anyway).
+fn is_dist_tag(v: &str) -> bool {
+    if matches!(
+        v,
+        "latest" | "next" | "beta" | "canary" | "rc" | "alpha" | "dev" | "experimental"
+    ) {
         return true;
     }
-    // Common range prefixes
-    let starts_with_range = matches!(
-        version.chars().next(),
-        Some('^') | Some('~') | Some('>') | Some('<') | Some('=') | Some('*')
-    );
-    if starts_with_range {
-        return true;
+    !v.is_empty()
+        && v.chars()
+            .all(|c| c.is_ascii_alphabetic() || c == '-' || c == '_')
+}
+
+/// Resolve a [`PatchSelector`] against the project lockfile, producing
+/// the exact `(name, version)` that will be written as the persisted
+/// key. Pure function — no I/O, no lock, no registry access.
+///
+/// Disambiguation rules (modeled on Bun's
+/// `pkgInfoForNameAndVersion` but adapted for LPM's source-aware
+/// lockfile):
+///
+/// - **0 matches** → user-facing "not installed" error pointing at
+///   `lpm install <name>` as the next step.
+/// - **1 match** → return its `(name, version)`.
+/// - **N matches, all the same [`PackageKey`] triple** → the same
+///   physical package is referenced from multiple dep edges (e.g., a
+///   hoisted root + transitive duplicates). Return the shared version
+///   silently — this is the legitimate "transitive duplicate" case.
+/// - **N matches, distinct versions or distinct source_ids** →
+///   list-and-exit. Print every `name@version` (with source URL when
+///   it differs) and return an error pointing the user at a more
+///   precise selector.
+///
+/// **Cross-source collisions are unrecoverable here.** A
+/// `(name, version)` that appears under two distinct `source_id`s (e.g.
+/// registry + tarball-URL — see [`PackageKey`] regression coverage at
+/// `lpm-lockfile/src/lib.rs`'s
+/// `find_package_by_key_disambiguates_cross_source_collisions`) is a
+/// failure mode of the persisted-key shape (which is `name@version`
+/// only, no `source_id` — see "Explicitly out of scope" in
+/// `private/patch.md`). Rather than silently pick one side, refuse
+/// with an explicit "this codebase has multiple sources for X" error.
+///
+/// Range selectors filter the candidate set by `lpm_semver::VersionReq::matches`
+/// before disambiguation runs.
+pub fn resolve_patch_selector(
+    lockfile: &Lockfile,
+    selector: &PatchSelector,
+) -> Result<(String, String), LpmError> {
+    let name = selector.name();
+    let range_filter: Option<lpm_semver::VersionReq> = match selector {
+        PatchSelector::Range { range, .. } => Some(
+            lpm_semver::VersionReq::parse(range)
+                .map_err(|e| LpmError::Script(format!("range {range:?} failed to parse: {e}")))?,
+        ),
+        _ => None,
+    };
+
+    // Collect every locked package matching the name (and the range,
+    // if applicable). Preserve insertion order so the list-and-exit
+    // output is deterministic (the lockfile is already sorted).
+    let mut matches: Vec<&LockedPackage> = Vec::new();
+    for pkg in &lockfile.packages {
+        if pkg.name != name {
+            continue;
+        }
+        if let Some(req) = &range_filter {
+            let Ok(v) = lpm_semver::Version::parse(&pkg.version) else {
+                continue;
+            };
+            if !req.matches(&v) {
+                continue;
+            }
+        }
+        matches.push(pkg);
     }
-    // Wildcards anywhere
-    if version.contains('*') || version.contains(" - ") || version.contains("||") {
-        return true;
+
+    match matches.len() {
+        0 => {
+            let detail = match selector {
+                PatchSelector::Range { range, .. } => {
+                    format!("no installed version of {name} matches {range:?}")
+                }
+                _ => format!("{name} is not installed in this project"),
+            };
+            Err(LpmError::Script(format!(
+                "{detail}; run `lpm install {name}` first, or pass an exact pin"
+            )))
+        }
+        1 => Ok((matches[0].name.clone(), matches[0].version.clone())),
+        _ => {
+            // Bucket by the full (name, version, source_id) triple.
+            // If every match shares the SAME triple, this is the
+            // legitimate transitive-duplicate case (one physical
+            // package referenced from multiple dep edges).
+            let first_key = matches[0].package_key();
+            if matches.iter().all(|p| p.package_key() == first_key) {
+                return Ok((matches[0].name.clone(), matches[0].version.clone()));
+            }
+            // Bucket by version to detect the "multiple versions" vs
+            // "single version, multiple sources" failure modes.
+            let mut by_version: BTreeMap<String, Vec<&LockedPackage>> = BTreeMap::new();
+            for pkg in &matches {
+                by_version.entry(pkg.version.clone()).or_default().push(pkg);
+            }
+            let multiple_versions = by_version.len() > 1;
+            let mut listing = String::new();
+            for (version, pkgs) in &by_version {
+                if pkgs.len() == 1 {
+                    listing.push_str(&format!("  - {name}@{version}\n"));
+                } else {
+                    // Same version, multiple sources — list each source
+                    // explicitly so the user can act on it.
+                    listing.push_str(&format!("  - {name}@{version} (multiple sources):\n"));
+                    for pkg in pkgs {
+                        let src = pkg.source.as_deref().unwrap_or("<unknown>");
+                        listing.push_str(&format!("      {src}\n"));
+                    }
+                }
+            }
+            let hint = if multiple_versions {
+                format!(
+                    "specify a precise version: `lpm patch {name}@<version>` \
+                     (or narrow with `lpm patch {name}@^<version>`)"
+                )
+            } else {
+                // Single version under multiple sources — the persisted-
+                // key shape can't distinguish them. Refuse rather than
+                // silently pick one (see "Explicitly out of scope" in
+                // private/patch.md).
+                format!(
+                    "this project has multiple sources for `{name}@{}`. \
+                     `lpm.patchedDependencies` keys are `name@version` \
+                     only and cannot distinguish sources — pin to a \
+                     single source in your manifest, then retry",
+                    matches[0].version
+                )
+            };
+            Err(LpmError::Script(format!(
+                "patch selector matches multiple packages:\n{listing}{hint}"
+            )))
+        }
     }
-    // Trailing `.x` or `.X` (e.g., `4.x`, `4.17.x`)
-    if version.ends_with(".x") || version.ends_with(".X") {
-        return true;
-    }
-    // Magic strings
-    matches!(version, "latest" | "next" | "")
 }
 
 // ── Staging copy ──────────────────────────────────────────────────────
@@ -175,18 +423,10 @@ fn copy_dir_filtered(src: &Path, dst: &Path) -> Result<(), LpmError> {
         let name = entry.file_name();
         let name_str = name.to_string_lossy();
 
-        // Top-level filter: exclude store sentinels and the staging
-        // breadcrumb. We only filter at the package root because the
-        // sentinels are written there by the store extractor.
-        if src.parent().is_some()
-            && (STORE_INTERNAL_FILES.contains(&name_str.as_ref())
-                || name_str == STAGING_BREADCRUMB_FILE)
-        {
-            // The check above is overcautious — we always want to skip
-            // these regardless of depth, because we don't want them in
-            // the staging tree.
-            continue;
-        }
+        // Exclude store sentinels and the staging breadcrumb at every
+        // depth. The store extractor only writes them at the package
+        // root, but a global filter is cheap and prevents accidental
+        // inclusion if the layout ever changes.
         if STORE_INTERNAL_FILES.contains(&name_str.as_ref()) || name_str == STAGING_BREADCRUMB_FILE
         {
             continue;
@@ -401,37 +641,56 @@ fn has_nul(bytes: &[u8]) -> bool {
 // ── Multi-file patch splitter ─────────────────────────────────────────
 
 /// Split a multi-file unified diff into per-file `&str` slices. Each
-/// returned slice is parseable as a single `diffy::Patch<'_, str>`.
+/// returned slice is the full per-file section; modify / add / delete
+/// chunks are parseable as a single `diffy::Patch<'_, str>`, while
+/// rename-only chunks carry no `---`/`+++` lines and must be classified
+/// from their `rename from`/`rename to` headers directly (see
+/// `classify_patch_op`).
 ///
-/// The splitter scans for `^--- ` line starts (three dashes followed
-/// by a space). Hunk lines never start with that pattern: hunk lines
-/// start with ` `, `+`, `-`, or `\` (single character + content), and
-/// the `---` header always appears at file boundaries.
+/// Boundaries:
+/// - `^diff --git ` always starts a new file section (git emits this
+///   for every file, including rename-only sections that have no
+///   `---`/`+++` headers).
+/// - `^--- ` starts a new file section only if the splitter is not
+///   already inside a git header block (between a `diff --git` line
+///   and the first `@@` hunk header that follows it). Inside a git
+///   header block, the `--- a/old` line is the file's old-side header
+///   for the already-open section.
 ///
-/// Lines starting with `diff --git` (git's optional preamble) are
-/// folded into the chunk that follows them — the diffy parser skips
-/// preamble lines automatically.
+/// Hunk content lines start with ` `, `+`, `-`, or `\` (single
+/// character + content), so a line beginning with `diff --git ` or
+/// `--- ` cannot appear inside a hunk body — except for the historical
+/// edge case of a removed line whose original content begins with
+/// `-- ` (matches `^--- `); that ambiguity is pre-existing.
 pub fn split_multi_file_patch(text: &str) -> Vec<&str> {
-    // Find every byte offset where a line starts with "--- ".
-    let mut starts: Vec<usize> = Vec::new();
+    let mut boundaries: Vec<usize> = Vec::new();
     let mut byte = 0usize;
+    // `in_git_header` is set by `diff --git ` and cleared by the first
+    // `@@` hunk header of that file. While set, a `--- ` line is the
+    // current file's old-side header, not a new file boundary.
+    let mut in_git_header = false;
     for line in text.split_inclusive('\n') {
-        if line.starts_with("--- ") {
-            starts.push(byte);
+        if line.starts_with("diff --git ") {
+            boundaries.push(byte);
+            in_git_header = true;
+        } else if line.starts_with("--- ") {
+            if !in_git_header {
+                boundaries.push(byte);
+            }
+            // else: header for the already-open `diff --git` section.
+        } else if line.starts_with("@@") {
+            in_git_header = false;
         }
         byte += line.len();
     }
-    // Special-case the trailing line if it didn't end with `\n`.
-    // (split_inclusive handles that for us.)
 
-    if starts.is_empty() {
+    if boundaries.is_empty() {
         return Vec::new();
     }
 
-    // Slice from each start to the next start (or end of input).
-    let mut chunks = Vec::with_capacity(starts.len());
-    for (i, &start) in starts.iter().enumerate() {
-        let end = starts.get(i + 1).copied().unwrap_or(text.len());
+    let mut chunks = Vec::with_capacity(boundaries.len());
+    for (i, &start) in boundaries.iter().enumerate() {
+        let end = boundaries.get(i + 1).copied().unwrap_or(text.len());
         chunks.push(&text[start..end]);
     }
     chunks
@@ -470,29 +729,91 @@ impl AppliedPatch {
     }
 }
 
-/// Decoded operation kind for one patch chunk.
-#[derive(Debug, Clone)]
-enum PatchOp {
+/// Decoded operation kind for one patch chunk. Carries the parsed
+/// `diffy::Patch` for hunk-bearing variants; `Rename` is hunk-less and
+/// stores only the `from`/`to` paths.
+#[derive(Debug)]
+enum PatchOp<'a> {
     /// Read store baseline, apply hunks, write to destination.
-    Modify { rel_path: String },
+    Modify {
+        rel_path: String,
+        patch: Patch<'a, str>,
+    },
     /// Apply against empty input, write the result as a new file.
-    Add { rel_path: String },
+    Add {
+        rel_path: String,
+        patch: Patch<'a, str>,
+    },
     /// Unlink the destination file. Store baseline must still exist
-    /// (otherwise the drift gate would have already failed).
+    /// (otherwise the drift gate would have already failed). The
+    /// classifier discards the diffy `Patch` body after extracting the
+    /// path — there are no hunks to re-apply on the destination.
     Delete { rel_path: String },
+    /// Move the destination file from `from` to `to`. Bytes are read
+    /// from the store baseline at `from` (not from the existing
+    /// destination, which may already be mid-rename). No hunk apply.
+    Rename { from: String, to: String },
+    /// Move the destination file AND apply hunks to the moved bytes.
+    /// Single variant rather than a `Rename + Modify` two-pass so the
+    /// byte-comparison idempotency short-circuit can precede any write
+    /// (the contract from the module docs: every file write is preceded
+    /// by a content comparison; a two-pass decomposition would re-read
+    /// + re-write the destination on idempotent reruns).
+    RenameWithEdit {
+        from: String,
+        to: String,
+        hunks: Patch<'a, str>,
+    },
 }
 
-impl PatchOp {
-    fn rel_path(&self) -> &str {
-        match self {
-            Self::Modify { rel_path } | Self::Add { rel_path } | Self::Delete { rel_path } => {
-                rel_path
-            }
+fn classify_patch_op(chunk: &str) -> Result<PatchOp<'_>, LpmError> {
+    // Pre-scan for git rename-detection headers. These appear BEFORE
+    // any `---`/`+++`/`@@` lines, in the per-file header block that
+    // follows `diff --git`. Hunk content lines start with one of
+    // ` `, `+`, `-`, `\`, so a line beginning with literal
+    // `rename from ` or `rename to ` is unambiguously a header.
+    let mut rename_from: Option<String> = None;
+    let mut rename_to: Option<String> = None;
+    let mut has_hunks = false;
+    for line in chunk.lines() {
+        if let Some(rest) = line.strip_prefix("rename from ") {
+            rename_from = Some(rest.to_string());
+        } else if let Some(rest) = line.strip_prefix("rename to ") {
+            rename_to = Some(rest.to_string());
+        } else if line.starts_with("@@") {
+            has_hunks = true;
         }
     }
-}
 
-fn classify_patch_op(patch: &Patch<'_, str>) -> Result<PatchOp, LpmError> {
+    match (rename_from, rename_to) {
+        (Some(from), Some(to)) => {
+            if from == to {
+                return Err(LpmError::Script(format!(
+                    "patch chunk has identical `rename from`/`rename to` paths ({from}); \
+                     this is malformed — generators must omit no-op renames"
+                )));
+            }
+            if has_hunks {
+                let hunks = Patch::from_str(chunk).map_err(|e| {
+                    LpmError::Script(format!(
+                        "patch chunk has rename+edit headers but hunks failed to parse: {e}"
+                    ))
+                })?;
+                return Ok(PatchOp::RenameWithEdit { from, to, hunks });
+            }
+            return Ok(PatchOp::Rename { from, to });
+        }
+        (Some(_), None) | (None, Some(_)) => {
+            return Err(LpmError::Script(
+                "patch chunk has only one of `rename from`/`rename to` — both required".into(),
+            ));
+        }
+        (None, None) => {}
+    }
+
+    // No rename headers — must be a regular modify/add/delete chunk.
+    let patch = Patch::from_str(chunk)
+        .map_err(|e| LpmError::Script(format!("patch chunk parse error: {e}")))?;
     let original = patch.original();
     let modified = patch.modified();
     let strip = |s: &str| -> String {
@@ -509,6 +830,7 @@ fn classify_patch_op(patch: &Patch<'_, str>) -> Result<PatchOp, LpmError> {
         )),
         (true, false) => Ok(PatchOp::Add {
             rel_path: strip(modified.unwrap()),
+            patch,
         }),
         (false, true) => Ok(PatchOp::Delete {
             rel_path: strip(original.unwrap()),
@@ -518,10 +840,11 @@ fn classify_patch_op(patch: &Patch<'_, str>) -> Result<PatchOp, LpmError> {
             let m = strip(modified.unwrap());
             if o != m {
                 return Err(LpmError::Script(format!(
-                    "patch chunk renames {o} → {m}; renames are not supported yet"
+                    "patch chunk has filename mismatch ({o} → {m}) without \
+                     `rename from`/`rename to` headers; regenerate with a git-aware tool"
                 )));
             }
-            Ok(PatchOp::Modify { rel_path: m })
+            Ok(PatchOp::Modify { rel_path: m, patch })
         }
     }
 }
@@ -638,37 +961,46 @@ pub fn apply_patch(
     let store_dir = baseline.pristine_dir;
 
     for chunk in chunks {
-        let patch = Patch::from_str(chunk).map_err(|e| {
+        let op = classify_patch_op(chunk).map_err(|e| {
             LpmError::Script(format!(
                 "patch file {patch_file:?} parse error in chunk: {e}"
             ))
         })?;
-        let op = classify_patch_op(&patch)?;
 
-        // Defense in depth: never let a patch touch a store sentinel.
-        let rel = op.rel_path();
-        if STORE_INTERNAL_FILES.contains(&rel) {
-            return Err(LpmError::Script(format!(
-                "patch file {patch_file:?} attempts to modify LPM-internal \
-                 file {rel}; refusing to apply"
-            )));
-        }
-        // Reject path traversal attempts.
-        if rel.contains("..") || rel.starts_with('/') {
-            return Err(LpmError::Script(format!(
-                "patch file {patch_file:?} contains illegal path {rel}; \
-                 refusing to apply"
-            )));
+        // Defense in depth: never let a patch touch a store sentinel
+        // or escape the package root. Renames validate both endpoints.
+        let validate = |rel: &str| -> Result<(), LpmError> {
+            if STORE_INTERNAL_FILES.contains(&rel) {
+                return Err(LpmError::Script(format!(
+                    "patch file {patch_file:?} attempts to modify LPM-internal \
+                     file {rel}; refusing to apply"
+                )));
+            }
+            if rel.contains("..") || rel.starts_with('/') {
+                return Err(LpmError::Script(format!(
+                    "patch file {patch_file:?} contains illegal path {rel}; \
+                     refusing to apply"
+                )));
+            }
+            Ok(())
+        };
+        match &op {
+            PatchOp::Modify { rel_path, .. }
+            | PatchOp::Add { rel_path, .. }
+            | PatchOp::Delete { rel_path } => validate(rel_path)?,
+            PatchOp::Rename { from, to } | PatchOp::RenameWithEdit { from, to, .. } => {
+                validate(from)?;
+                validate(to)?;
+            }
         }
 
         for loc in locations {
-            let nm_file = loc.destination.join(rel);
-
             match &op {
-                PatchOp::Modify { rel_path } => {
+                PatchOp::Modify { rel_path, patch } => {
+                    let nm_file = loc.destination.join(rel_path);
                     let store_file = store_dir.join(rel_path);
                     let store_text = read_text_file(&store_file)?;
-                    let patched_text = diffy::apply(&store_text, &patch).map_err(|e| {
+                    let patched_text = diffy::apply(&store_text, patch).map_err(|e| {
                         LpmError::Script(format!(
                             "patch hunk failed for {name}@{version} {rel_path}: {e} — \
                              regenerate the patch or fix the upstream"
@@ -680,7 +1012,8 @@ pub fn apply_patch(
                     write_breaking_hardlink(&nm_file, patched_text.as_bytes())?;
                     files_modified += 1;
                 }
-                PatchOp::Add { rel_path } => {
+                PatchOp::Add { rel_path, patch } => {
+                    let nm_file = loc.destination.join(rel_path);
                     let store_file = store_dir.join(rel_path);
                     if store_file.exists() {
                         return Err(LpmError::Script(format!(
@@ -689,7 +1022,7 @@ pub fn apply_patch(
                              may be stale (regenerate with `lpm patch {name}@{version}`)"
                         )));
                     }
-                    let patched_text = diffy::apply("", &patch).map_err(|e| {
+                    let patched_text = diffy::apply("", patch).map_err(|e| {
                         LpmError::Script(format!(
                             "patch add hunk failed for {name}@{version} {rel_path}: {e}"
                         ))
@@ -704,6 +1037,7 @@ pub fn apply_patch(
                     files_added += 1;
                 }
                 PatchOp::Delete { rel_path } => {
+                    let nm_file = loc.destination.join(rel_path);
                     let store_file = store_dir.join(rel_path);
                     if !store_file.exists() {
                         return Err(LpmError::Script(format!(
@@ -717,6 +1051,82 @@ pub fn apply_patch(
                     }
                     std::fs::remove_file(&nm_file).map_err(LpmError::Io)?;
                     files_deleted += 1;
+                }
+                PatchOp::Rename { from, to } => {
+                    let nm_file_from = loc.destination.join(from);
+                    let nm_file_to = loc.destination.join(to);
+                    let store_file_from = store_dir.join(from);
+                    if !store_file_from.exists() {
+                        return Err(LpmError::Script(format!(
+                            "patch renames {from} → {to} but the store baseline \
+                             has no {from}; the patch may be stale \
+                             (regenerate with `lpm patch {name}@{version}`)"
+                        )));
+                    }
+                    let baseline_bytes = std::fs::read(&store_file_from).map_err(|e| {
+                        LpmError::Script(format!(
+                            "patch rename baseline {store_file_from:?} unreadable: {e}"
+                        ))
+                    })?;
+                    // Idempotency contract from the module docs: every
+                    // file write is preceded by a content comparison.
+                    // Full short-circuit only when BOTH endpoints are at
+                    // their final state — destination has target bytes
+                    // AND source is gone.
+                    let dest_ok = file_already_has_bytes(&nm_file_to, &baseline_bytes);
+                    let source_gone = !nm_file_from.exists();
+                    if dest_ok && source_gone {
+                        continue;
+                    }
+                    if !dest_ok {
+                        if let Some(parent) = nm_file_to.parent() {
+                            std::fs::create_dir_all(parent).map_err(LpmError::Io)?;
+                        }
+                        write_breaking_hardlink(&nm_file_to, &baseline_bytes)?;
+                        files_added += 1;
+                    }
+                    if !source_gone {
+                        std::fs::remove_file(&nm_file_from).map_err(LpmError::Io)?;
+                        files_deleted += 1;
+                    }
+                }
+                PatchOp::RenameWithEdit { from, to, hunks } => {
+                    let nm_file_from = loc.destination.join(from);
+                    let nm_file_to = loc.destination.join(to);
+                    let store_file_from = store_dir.join(from);
+                    if !store_file_from.exists() {
+                        return Err(LpmError::Script(format!(
+                            "patch renames {from} → {to} but the store baseline \
+                             has no {from}; the patch may be stale \
+                             (regenerate with `lpm patch {name}@{version}`)"
+                        )));
+                    }
+                    let baseline_text = read_text_file(&store_file_from)?;
+                    let patched_text = diffy::apply(&baseline_text, hunks).map_err(|e| {
+                        LpmError::Script(format!(
+                            "patch hunk failed for {name}@{version} rename {from} → {to}: \
+                             {e} — regenerate the patch or fix the upstream"
+                        ))
+                    })?;
+                    // Same idempotency rule as Rename: full short-circuit
+                    // only when destination has the post-edit bytes AND
+                    // the source path is gone.
+                    let dest_ok = file_already_has_bytes(&nm_file_to, patched_text.as_bytes());
+                    let source_gone = !nm_file_from.exists();
+                    if dest_ok && source_gone {
+                        continue;
+                    }
+                    if !dest_ok {
+                        if let Some(parent) = nm_file_to.parent() {
+                            std::fs::create_dir_all(parent).map_err(LpmError::Io)?;
+                        }
+                        write_breaking_hardlink(&nm_file_to, patched_text.as_bytes())?;
+                        files_added += 1;
+                    }
+                    if !source_gone {
+                        std::fs::remove_file(&nm_file_from).map_err(LpmError::Io)?;
+                        files_deleted += 1;
+                    }
                 }
             }
         }
@@ -810,21 +1220,34 @@ mod tests {
         );
     }
 
+    /// **Slice A contract.** `parse_patch_key` is the PERSISTED-key
+    /// parser — it accepts only exact pins. Range syntax in a
+    /// persisted key means the manifest was hand-edited (or produced
+    /// by an out-of-band tool); the author-time `lpm patch` flow
+    /// resolves ranges to exact pins before writing.
+    ///
+    /// The error wording deliberately points users at `lpm patch
+    /// <name>@<exact>` rather than the legacy "range support isn't
+    /// available yet" — because ranges ARE supported now, just as CLI
+    /// input, not as persisted keys.
     #[test]
     fn parse_key_rejects_caret_range() {
         let err = parse_patch_key("lodash@^4.17.0").unwrap_err();
         let msg = format!("{err}");
-        assert!(msg.contains("range version"));
         assert!(
-            msg.contains("not supported yet"),
-            "error must say range support isn't available yet; got: {msg}"
+            msg.contains("not an exact pin"),
+            "error must point user at exact-pin requirement; got: {msg}"
+        );
+        assert!(
+            msg.contains("lpm patch lodash@"),
+            "error must hint at the author-time fix; got: {msg}"
         );
     }
 
     #[test]
     fn parse_key_rejects_x_wildcard() {
         let err = parse_patch_key("lodash@4.x").unwrap_err();
-        assert!(format!("{err}").contains("range version"));
+        assert!(format!("{err}").contains("not an exact pin"));
     }
 
     #[test]
@@ -845,6 +1268,288 @@ mod tests {
     #[test]
     fn parse_key_rejects_latest_magic_string() {
         assert!(parse_patch_key("lodash@latest").is_err());
+    }
+
+    // ── parse_patch_selector contracts (Slice A — CLI input) ─────────
+
+    #[test]
+    fn parse_selector_bare_name() {
+        assert_eq!(
+            parse_patch_selector("lodash").unwrap(),
+            PatchSelector::BareName("lodash".to_string())
+        );
+    }
+
+    #[test]
+    fn parse_selector_bare_scoped_name() {
+        assert_eq!(
+            parse_patch_selector("@types/node").unwrap(),
+            PatchSelector::BareName("@types/node".to_string())
+        );
+    }
+
+    #[test]
+    fn parse_selector_exact() {
+        assert_eq!(
+            parse_patch_selector("lodash@4.17.21").unwrap(),
+            PatchSelector::Exact {
+                name: "lodash".to_string(),
+                version: "4.17.21".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn parse_selector_scoped_exact() {
+        assert_eq!(
+            parse_patch_selector("@types/node@20.10.0").unwrap(),
+            PatchSelector::Exact {
+                name: "@types/node".to_string(),
+                version: "20.10.0".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn parse_selector_prerelease_exact() {
+        assert_eq!(
+            parse_patch_selector("foo@1.0.0-rc.1").unwrap(),
+            PatchSelector::Exact {
+                name: "foo".to_string(),
+                version: "1.0.0-rc.1".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn parse_selector_caret_range() {
+        assert_eq!(
+            parse_patch_selector("lodash@^4.0.0").unwrap(),
+            PatchSelector::Range {
+                name: "lodash".to_string(),
+                range: "^4.0.0".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn parse_selector_tilde_range() {
+        assert_eq!(
+            parse_patch_selector("lodash@~4.17.0").unwrap(),
+            PatchSelector::Range {
+                name: "lodash".to_string(),
+                range: "~4.17.0".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn parse_selector_x_wildcard() {
+        match parse_patch_selector("lodash@4.x").unwrap() {
+            PatchSelector::Range { name, range } => {
+                assert_eq!(name, "lodash");
+                assert_eq!(range, "4.x");
+            }
+            other => panic!("expected Range for `4.x`, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_selector_or_range() {
+        match parse_patch_selector("lodash@1.0.0 || 2.0.0").unwrap() {
+            PatchSelector::Range { range, .. } => assert!(range.contains("||")),
+            other => panic!("expected Range for disjunction, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_selector_hyphen_range() {
+        match parse_patch_selector("lodash@1.0.0 - 2.0.0").unwrap() {
+            PatchSelector::Range { .. } => {}
+            other => panic!("expected Range for hyphen, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_selector_greater_than_range() {
+        match parse_patch_selector("lodash@>=4.17.0").unwrap() {
+            PatchSelector::Range { .. } => {}
+            other => panic!("expected Range, got {other:?}"),
+        }
+    }
+
+    /// `latest`, `next`, `beta` etc. are dist-tags; the selector path
+    /// never consults the registry. Reject with a clear message
+    /// pointing users at a version / range instead.
+    #[test]
+    fn parse_selector_rejects_latest() {
+        let err = parse_patch_selector("lodash@latest").unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("dist-tag"), "got: {msg}");
+        assert!(msg.contains("latest"), "got: {msg}");
+    }
+
+    #[test]
+    fn parse_selector_rejects_next() {
+        let err = parse_patch_selector("react@next").unwrap_err();
+        assert!(format!("{err}").contains("dist-tag"));
+    }
+
+    #[test]
+    fn parse_selector_rejects_beta_dist_tag() {
+        let err = parse_patch_selector("vue@beta").unwrap_err();
+        assert!(format!("{err}").contains("dist-tag"));
+    }
+
+    #[test]
+    fn parse_selector_rejects_empty() {
+        let err = parse_patch_selector("").unwrap_err();
+        assert!(format!("{err}").contains("empty"));
+    }
+
+    #[test]
+    fn parse_selector_rejects_empty_version_segment() {
+        let err = parse_patch_selector("lodash@").unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("empty"), "got: {msg}");
+    }
+
+    #[test]
+    fn parse_selector_rejects_malformed_scoped_name() {
+        // `@malformed` with no `/` is not a valid scoped name.
+        let err = parse_patch_selector("@malformed").unwrap_err();
+        assert!(format!("{err}").contains("malformed scoped name"));
+    }
+
+    // ── resolve_patch_selector contracts (Slice A — pure resolver) ───
+
+    /// Build a synthetic `LockedPackage` for resolver tests. `source`
+    /// is the source URL — defaults to a registry source.
+    fn lockfile_with(packages: &[(&str, &str, &str)]) -> Lockfile {
+        let mut lf = Lockfile::new_with_resolver("test");
+        for (name, version, source) in packages {
+            lf.add_package(LockedPackage {
+                name: name.to_string(),
+                version: version.to_string(),
+                source: Some(source.to_string()),
+                ..Default::default()
+            });
+        }
+        lf
+    }
+
+    const NPM: &str = "registry+https://registry.npmjs.org";
+    const LPM: &str = "registry+https://lpm.dev";
+
+    #[test]
+    fn resolve_selector_unique_match() {
+        let lf = lockfile_with(&[("lodash", "4.17.21", NPM)]);
+        let sel = PatchSelector::BareName("lodash".to_string());
+        let (name, version) = resolve_patch_selector(&lf, &sel).unwrap();
+        assert_eq!(name, "lodash");
+        assert_eq!(version, "4.17.21");
+    }
+
+    #[test]
+    fn resolve_selector_range_filters_to_unique() {
+        let lf = lockfile_with(&[
+            ("lodash", "3.10.0", NPM),
+            ("lodash", "4.17.21", NPM),
+            ("lodash", "5.0.0", NPM),
+        ]);
+        let sel = PatchSelector::Range {
+            name: "lodash".to_string(),
+            range: "^4.0.0".to_string(),
+        };
+        let (name, version) = resolve_patch_selector(&lf, &sel).unwrap();
+        assert_eq!(name, "lodash");
+        assert_eq!(version, "4.17.21");
+    }
+
+    /// Multiple lockfile entries with the SAME `PackageKey` triple
+    /// (single physical package referenced from multiple dep edges)
+    /// resolve silently to that shared version.
+    #[test]
+    fn resolve_selector_multi_same_packagekey_silent() {
+        // Two entries with the same name/version/source — represents
+        // the legitimate "hoisted root + transitive duplicate" case.
+        let lf = lockfile_with(&[("lodash", "4.17.21", NPM), ("lodash", "4.17.21", NPM)]);
+        let sel = PatchSelector::BareName("lodash".to_string());
+        let (name, version) = resolve_patch_selector(&lf, &sel).unwrap();
+        assert_eq!(name, "lodash");
+        assert_eq!(version, "4.17.21");
+    }
+
+    /// Multiple DISTINCT versions → list-and-exit with a precise-version
+    /// hint. Mirrors Bun's `Global.crash()` behavior.
+    #[test]
+    fn resolve_selector_multi_distinct_versions_errors_with_list() {
+        let lf = lockfile_with(&[("lodash", "3.10.0", NPM), ("lodash", "4.17.21", NPM)]);
+        let sel = PatchSelector::BareName("lodash".to_string());
+        let err = resolve_patch_selector(&lf, &sel).unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("multiple packages"), "got: {msg}");
+        assert!(msg.contains("lodash@3.10.0"), "got: {msg}");
+        assert!(msg.contains("lodash@4.17.21"), "got: {msg}");
+        assert!(msg.contains("specify a precise version"), "got: {msg}");
+    }
+
+    /// **Cross-source collision** — same `(name, version)` under two
+    /// distinct `source_id`s. The persisted-key shape can't
+    /// distinguish them, so the selector refuses rather than silently
+    /// picking one (see "Explicitly out of scope" in
+    /// `private/patch.md`).
+    ///
+    /// Mirrors the regression coverage at
+    /// `lpm-lockfile/src/lib.rs::find_package_by_key_disambiguates_cross_source_collisions`.
+    #[test]
+    fn resolve_selector_cross_source_collision_errors() {
+        let lf = lockfile_with(&[("react", "19.0.0", NPM), ("react", "19.0.0", LPM)]);
+        let sel = PatchSelector::Exact {
+            name: "react".to_string(),
+            version: "19.0.0".to_string(),
+        };
+        let err = resolve_patch_selector(&lf, &sel).unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("multiple sources"),
+            "error must surface the cross-source collision; got: {msg}"
+        );
+        assert!(
+            msg.contains(NPM),
+            "error must list each source URL; got: {msg}"
+        );
+        assert!(
+            msg.contains(LPM),
+            "error must list each source URL; got: {msg}"
+        );
+        assert!(
+            msg.contains("cannot distinguish sources"),
+            "error must explain why the resolver refuses; got: {msg}"
+        );
+    }
+
+    #[test]
+    fn resolve_selector_zero_matches_clear_error() {
+        let lf = lockfile_with(&[("other-pkg", "1.0.0", NPM)]);
+        let sel = PatchSelector::BareName("missing-pkg".to_string());
+        let err = resolve_patch_selector(&lf, &sel).unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("missing-pkg"), "got: {msg}");
+        assert!(msg.contains("lpm install"), "got: {msg}");
+    }
+
+    #[test]
+    fn resolve_selector_range_zero_matches_clear_error() {
+        let lf = lockfile_with(&[("lodash", "3.10.0", NPM)]);
+        let sel = PatchSelector::Range {
+            name: "lodash".to_string(),
+            range: "^5.0.0".to_string(),
+        };
+        let err = resolve_patch_selector(&lf, &sel).unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("matches"), "got: {msg}");
+        assert!(msg.contains("^5.0.0"), "got: {msg}");
     }
 
     // ── copy_store_to_staging contracts ──────────────────────────────
@@ -1055,47 +1760,193 @@ mod tests {
         assert_eq!(chunks.len(), 1);
     }
 
-    // ── classify_patch_op contracts (via Patch::from_str) ────────────
-
-    fn parse(text: &str) -> Patch<'_, str> {
-        Patch::from_str(text).unwrap()
+    /// Git rename-only chunks have no `---`/`+++` lines — only
+    /// `diff --git`, `similarity index`, `rename from`, `rename to`.
+    /// Pre-Slice-B these collapsed into the previous chunk because the
+    /// splitter only recognized `^--- ` as a boundary.
+    #[test]
+    fn split_multi_file_patch_recognizes_diff_git_boundary_for_rename_only() {
+        let text = "diff --git a/old.js b/new.js\n\
+                    similarity index 100%\n\
+                    rename from old.js\n\
+                    rename to new.js\n";
+        let chunks = split_multi_file_patch(text);
+        assert_eq!(chunks.len(), 1, "rename-only chunk must produce one slice");
+        assert!(chunks[0].starts_with("diff --git "));
+        assert!(chunks[0].contains("rename from old.js"));
+        assert!(chunks[0].contains("rename to new.js"));
     }
+
+    /// A multi-file git patch with one rename-only file followed by a
+    /// rename+edit file must produce two distinct slices.
+    #[test]
+    fn split_multi_file_patch_handles_mixed_rename_and_rename_edit_chunks() {
+        let text = "diff --git a/a.js b/aa.js\n\
+                    similarity index 100%\n\
+                    rename from a.js\n\
+                    rename to aa.js\n\
+                    diff --git a/b.js b/bb.js\n\
+                    similarity index 80%\n\
+                    rename from b.js\n\
+                    rename to bb.js\n\
+                    --- a/b.js\n\
+                    +++ b/bb.js\n\
+                    @@ -1 +1 @@\n\
+                    -old\n\
+                    +new\n";
+        let chunks = split_multi_file_patch(text);
+        assert_eq!(chunks.len(), 2);
+        assert!(chunks[0].contains("rename to aa.js"));
+        assert!(chunks[0].contains("rename from a.js"));
+        assert!(
+            !chunks[0].contains("aa.js\n@@"),
+            "chunk 0 must not bleed into chunk 1"
+        );
+        assert!(chunks[1].contains("rename to bb.js"));
+        assert!(chunks[1].contains("@@ -1 +1 @@"));
+    }
+
+    /// `--- a/X` immediately following a `diff --git` line is the file's
+    /// own old-side header, NOT a new file boundary. Without this rule,
+    /// every git-style patch would over-slice into duplicate chunks.
+    #[test]
+    fn split_multi_file_patch_keeps_dash_after_diff_git_in_same_chunk() {
+        let text = "diff --git a/x.js b/x.js\n\
+                    --- a/x.js\n\
+                    +++ b/x.js\n\
+                    @@ -1 +1 @@\n\
+                    -old\n\
+                    +new\n";
+        let chunks = split_multi_file_patch(text);
+        assert_eq!(chunks.len(), 1);
+        assert!(chunks[0].starts_with("diff --git "));
+        assert!(chunks[0].contains("--- a/x.js"));
+    }
+
+    // ── classify_patch_op contracts ──────────────────────────────────
 
     #[test]
     fn classify_modify() {
-        let p = parse("--- a/x.js\n+++ b/x.js\n@@ -1 +1 @@\n-old\n+new\n");
-        let op = classify_patch_op(&p).unwrap();
+        let op = classify_patch_op("--- a/x.js\n+++ b/x.js\n@@ -1 +1 @@\n-old\n+new\n").unwrap();
         match op {
-            PatchOp::Modify { rel_path } => assert_eq!(rel_path, "x.js"),
+            PatchOp::Modify { rel_path, .. } => assert_eq!(rel_path, "x.js"),
             other => panic!("expected Modify, got {other:?}"),
         }
     }
 
     #[test]
     fn classify_add() {
-        let p = parse("--- /dev/null\n+++ b/new.js\n@@ -0,0 +1 @@\n+brand new\n");
-        let op = classify_patch_op(&p).unwrap();
+        let op =
+            classify_patch_op("--- /dev/null\n+++ b/new.js\n@@ -0,0 +1 @@\n+brand new\n").unwrap();
         match op {
-            PatchOp::Add { rel_path } => assert_eq!(rel_path, "new.js"),
+            PatchOp::Add { rel_path, .. } => assert_eq!(rel_path, "new.js"),
             other => panic!("expected Add, got {other:?}"),
         }
     }
 
     #[test]
     fn classify_delete() {
-        let p = parse("--- a/doomed.js\n+++ /dev/null\n@@ -1 +0,0 @@\n-rip\n");
-        let op = classify_patch_op(&p).unwrap();
+        let op =
+            classify_patch_op("--- a/doomed.js\n+++ /dev/null\n@@ -1 +0,0 @@\n-rip\n").unwrap();
         match op {
             PatchOp::Delete { rel_path } => assert_eq!(rel_path, "doomed.js"),
             other => panic!("expected Delete, got {other:?}"),
         }
     }
 
+    /// Filename mismatch without `rename from`/`rename to` headers is
+    /// a malformed patch (git would have emitted rename headers for a
+    /// real rename). The classifier rejects it with a clear pointer at
+    /// a git-aware regenerate path.
     #[test]
-    fn classify_rename_is_rejected() {
-        let p = parse("--- a/old.js\n+++ b/new.js\n@@ -1 +1 @@\n-x\n+x\n");
-        let err = classify_patch_op(&p).unwrap_err();
-        assert!(format!("{err}").contains("rename"));
+    fn classify_filename_mismatch_without_rename_headers_is_rejected() {
+        let err =
+            classify_patch_op("--- a/old.js\n+++ b/new.js\n@@ -1 +1 @@\n-x\n+x\n").unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("filename mismatch"), "got: {msg}");
+        assert!(msg.contains("rename from"), "got: {msg}");
+    }
+
+    /// Rename-only chunk: both rename headers, no `@@` hunk. The
+    /// classifier returns `PatchOp::Rename` without parsing hunks via
+    /// `diffy::Patch::from_str` (which would fail on a header-less
+    /// chunk).
+    #[test]
+    fn classify_rename_only() {
+        let op = classify_patch_op(
+            "diff --git a/old.js b/new.js\n\
+             similarity index 100%\n\
+             rename from old.js\n\
+             rename to new.js\n",
+        )
+        .unwrap();
+        match op {
+            PatchOp::Rename { from, to } => {
+                assert_eq!(from, "old.js");
+                assert_eq!(to, "new.js");
+            }
+            other => panic!("expected Rename, got {other:?}"),
+        }
+    }
+
+    /// Rename + edit chunk: both rename headers AND `@@` hunks. The
+    /// classifier returns a single `PatchOp::RenameWithEdit` (not a
+    /// `Rename + Modify` two-pass — see classifier docs for why).
+    #[test]
+    fn classify_rename_with_edit() {
+        let chunk = concat!(
+            "diff --git a/old.js b/new.js\n",
+            "similarity index 60%\n",
+            "rename from old.js\n",
+            "rename to new.js\n",
+            "--- a/old.js\n",
+            "+++ b/new.js\n",
+            "@@ -1 +1 @@\n",
+            "-old\n",
+            "+new\n",
+        );
+        let op = classify_patch_op(chunk).unwrap();
+        match op {
+            PatchOp::RenameWithEdit { from, to, .. } => {
+                assert_eq!(from, "old.js");
+                assert_eq!(to, "new.js");
+            }
+            other => panic!("expected RenameWithEdit, got {other:?}"),
+        }
+    }
+
+    /// A `rename from`/`rename to` pair with identical paths is
+    /// malformed — generators never emit it. Rejecting at classify
+    /// time avoids the apply loop accidentally deleting the destination
+    /// after writing it (since `nm_file_from == nm_file_to`).
+    #[test]
+    fn classify_rejects_identical_rename_from_to() {
+        let err = classify_patch_op(
+            "diff --git a/x.js b/x.js\n\
+             similarity index 100%\n\
+             rename from x.js\n\
+             rename to x.js\n",
+        )
+        .unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("identical"), "got: {msg}");
+    }
+
+    /// Partial rename headers (only one of `rename from`/`rename to`)
+    /// is malformed. Generators emit both as a pair.
+    #[test]
+    fn classify_rejects_partial_rename_headers() {
+        let err = classify_patch_op(
+            "diff --git a/old.js b/new.js\n\
+             similarity index 100%\n\
+             rename from old.js\n",
+        )
+        .unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("rename from") || msg.contains("rename to"),
+            "got: {msg}"
+        );
     }
 
     // ── verify_original_integrity contracts ──────────────────────────
@@ -1443,6 +2294,277 @@ mod tests {
         let err =
             apply_patch(&[&m], patch.path(), &integrity, &store, "lodash", "4.17.21").unwrap_err();
         assert!(format!("{err}").contains("illegal path"));
+    }
+
+    // ── apply rename contracts ───────────────────────────────────────
+
+    /// A rename-only chunk moves the destination file from `from` to
+    /// `to`, with baseline bytes preserved at the new path.
+    #[test]
+    fn apply_rename_moves_file() {
+        let (_home, store, integrity) = fake_store_entry(
+            "pkg",
+            "1.0.0",
+            &[("src/old.js", b"contents\n"), ("keep.js", b"k\n")],
+        );
+        let (_dir, m) = fake_materialized(
+            "pkg",
+            "1.0.0",
+            &[("src/old.js", b"contents\n"), ("keep.js", b"k\n")],
+        );
+        let patch = write_patch(
+            "diff --git a/src/old.js b/src/new.js\n\
+             similarity index 100%\n\
+             rename from src/old.js\n\
+             rename to src/new.js\n",
+        );
+
+        let result = apply_patch(&[&m], patch.path(), &integrity, &store, "pkg", "1.0.0").unwrap();
+        assert_eq!(result.files_added, 1);
+        assert_eq!(result.files_deleted, 1);
+        assert!(!m.destination.join("src/old.js").exists());
+        assert_eq!(
+            std::fs::read_to_string(m.destination.join("src/new.js")).unwrap(),
+            "contents\n",
+            "destination must carry the baseline bytes"
+        );
+    }
+
+    /// A rename-only chunk creates the destination's parent directory
+    /// if it doesn't exist (the rename may target a new subdirectory).
+    #[test]
+    fn apply_rename_creates_destination_parent_dir() {
+        let (_home, store, integrity) =
+            fake_store_entry("pkg", "1.0.0", &[("old.js", b"contents\n")]);
+        let (_dir, m) = fake_materialized("pkg", "1.0.0", &[("old.js", b"contents\n")]);
+        let patch = write_patch(
+            "diff --git a/old.js b/lib/nested/new.js\n\
+             similarity index 100%\n\
+             rename from old.js\n\
+             rename to lib/nested/new.js\n",
+        );
+
+        apply_patch(&[&m], patch.path(), &integrity, &store, "pkg", "1.0.0").unwrap();
+        assert!(m.destination.join("lib/nested/new.js").exists());
+        assert!(!m.destination.join("old.js").exists());
+    }
+
+    /// A rename+edit chunk: destination ends up with HUNK-MODIFIED
+    /// bytes (not baseline). Hunk is applied to the baseline pre-image
+    /// from the store, NOT to whatever the destination currently holds.
+    #[test]
+    fn apply_rename_with_edit_writes_patched_bytes() {
+        let (_home, store, integrity) =
+            fake_store_entry("pkg", "1.0.0", &[("src/old.js", b"line1\nline2\n")]);
+        let (_dir, m) = fake_materialized("pkg", "1.0.0", &[("src/old.js", b"line1\nline2\n")]);
+        // Context lines in unified diff start with a literal space —
+        // Rust string-line-continuation strips leading whitespace, so
+        // use `concat!()` instead of `\<newline>` here.
+        let patch = write_patch(concat!(
+            "diff --git a/src/old.js b/src/new.js\n",
+            "similarity index 60%\n",
+            "rename from src/old.js\n",
+            "rename to src/new.js\n",
+            "--- a/src/old.js\n",
+            "+++ b/src/new.js\n",
+            "@@ -1,2 +1,2 @@\n",
+            " line1\n",
+            "-line2\n",
+            "+lineTWO\n",
+        ));
+
+        apply_patch(&[&m], patch.path(), &integrity, &store, "pkg", "1.0.0").unwrap();
+        assert!(!m.destination.join("src/old.js").exists());
+        assert_eq!(
+            std::fs::read_to_string(m.destination.join("src/new.js")).unwrap(),
+            "line1\nlineTWO\n"
+        );
+    }
+
+    /// Rename idempotency: second apply finds source gone and
+    /// destination already carrying target bytes → zero writes.
+    #[test]
+    fn apply_rename_is_idempotent() {
+        let (_home, store, integrity) =
+            fake_store_entry("pkg", "1.0.0", &[("old.js", b"contents\n")]);
+        let (_dir, m) = fake_materialized("pkg", "1.0.0", &[("old.js", b"contents\n")]);
+        let patch = write_patch(
+            "diff --git a/old.js b/new.js\n\
+             similarity index 100%\n\
+             rename from old.js\n\
+             rename to new.js\n",
+        );
+
+        let r1 = apply_patch(&[&m], patch.path(), &integrity, &store, "pkg", "1.0.0").unwrap();
+        assert!(r1.touched_anything(), "first apply must do work");
+
+        let r2 = apply_patch(&[&m], patch.path(), &integrity, &store, "pkg", "1.0.0").unwrap();
+        assert_eq!(r2.files_added, 0);
+        assert_eq!(r2.files_deleted, 0);
+        assert_eq!(r2.files_modified, 0);
+        assert!(
+            !r2.touched_anything(),
+            "rerun must be a structural no-op (idempotency contract)"
+        );
+    }
+
+    /// **Acceptance criterion.** Idempotency must hold for RenameWithEdit
+    /// as well — second run after rename+edit must short-circuit BEFORE
+    /// any write. The single-variant design (vs `Rename + Modify`
+    /// two-pass) makes this enforceable: byte-comparison precedes the
+    /// `write_breaking_hardlink` call.
+    ///
+    /// On Unix we also assert the destination's inode is unchanged
+    /// between runs — `write_breaking_hardlink` does `remove_file` then
+    /// `write`, which would mint a new inode, so a stable inode is a
+    /// strong "no write happened" signal.
+    #[test]
+    fn apply_rename_with_edit_is_idempotent() {
+        let (_home, store, integrity) =
+            fake_store_entry("pkg", "1.0.0", &[("src/old.js", b"line1\nline2\n")]);
+        let (_dir, m) = fake_materialized("pkg", "1.0.0", &[("src/old.js", b"line1\nline2\n")]);
+        let patch = write_patch(concat!(
+            "diff --git a/src/old.js b/src/new.js\n",
+            "similarity index 60%\n",
+            "rename from src/old.js\n",
+            "rename to src/new.js\n",
+            "--- a/src/old.js\n",
+            "+++ b/src/new.js\n",
+            "@@ -1,2 +1,2 @@\n",
+            " line1\n",
+            "-line2\n",
+            "+lineTWO\n",
+        ));
+
+        let r1 = apply_patch(&[&m], patch.path(), &integrity, &store, "pkg", "1.0.0").unwrap();
+        assert!(r1.touched_anything());
+
+        let dest = m.destination.join("src/new.js");
+        #[cfg(unix)]
+        let inode_before = {
+            use std::os::unix::fs::MetadataExt;
+            std::fs::metadata(&dest).unwrap().ino()
+        };
+
+        let r2 = apply_patch(&[&m], patch.path(), &integrity, &store, "pkg", "1.0.0").unwrap();
+        assert_eq!(
+            r2.files_added, 0,
+            "files_added must be 0 on idempotent rerun"
+        );
+        assert_eq!(
+            r2.files_deleted, 0,
+            "files_deleted must be 0 on idempotent rerun"
+        );
+        assert!(!r2.touched_anything(), "rerun must be a structural no-op");
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            let inode_after = std::fs::metadata(&dest).unwrap().ino();
+            assert_eq!(
+                inode_before, inode_after,
+                "destination inode changed — write_breaking_hardlink ran despite idempotency"
+            );
+        }
+
+        // Final post-edit bytes still at the destination.
+        assert_eq!(std::fs::read_to_string(&dest).unwrap(), "line1\nlineTWO\n");
+    }
+
+    /// Partial prior run: destination already has target bytes but the
+    /// source path is still in `node_modules`. The apply path completes
+    /// the rename by removing the source, without rewriting the
+    /// destination.
+    #[test]
+    fn apply_rename_cleans_up_orphan_source() {
+        let (_home, store, integrity) =
+            fake_store_entry("pkg", "1.0.0", &[("old.js", b"contents\n")]);
+        // Destination already carries the target bytes, but source
+        // wasn't cleaned up — simulate a partial prior run.
+        let (_dir, m) = fake_materialized(
+            "pkg",
+            "1.0.0",
+            &[("old.js", b"contents\n"), ("new.js", b"contents\n")],
+        );
+        let patch = write_patch(
+            "diff --git a/old.js b/new.js\n\
+             similarity index 100%\n\
+             rename from old.js\n\
+             rename to new.js\n",
+        );
+
+        let r = apply_patch(&[&m], patch.path(), &integrity, &store, "pkg", "1.0.0").unwrap();
+        assert_eq!(
+            r.files_added, 0,
+            "destination already had target bytes — no write"
+        );
+        assert_eq!(r.files_deleted, 1, "source still existed — must be removed");
+        assert!(!m.destination.join("old.js").exists());
+        assert!(m.destination.join("new.js").exists());
+    }
+
+    /// `rename to .integrity` would mutate an LPM-internal sentinel.
+    /// Refuse before touching the filesystem.
+    #[test]
+    fn apply_rename_rejects_sentinel_target() {
+        let (_home, store, integrity) = fake_store_entry("pkg", "1.0.0", &[("attack.js", b"x\n")]);
+        let (_dir, m) = fake_materialized("pkg", "1.0.0", &[("attack.js", b"x\n")]);
+        let patch = write_patch(
+            "diff --git a/attack.js b/.integrity\n\
+             similarity index 100%\n\
+             rename from attack.js\n\
+             rename to .integrity\n",
+        );
+
+        let err = apply_patch(&[&m], patch.path(), &integrity, &store, "pkg", "1.0.0").unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("LPM-internal"), "got: {msg}");
+    }
+
+    /// `rename to ../escape.js` would escape the package root. Refuse.
+    /// (Path-traversal also covers `rename from` paths, but the
+    /// destination is the more security-sensitive side because that's
+    /// where bytes are written.)
+    #[test]
+    fn apply_rename_rejects_path_traversal_target() {
+        let (_home, store, integrity) = fake_store_entry("pkg", "1.0.0", &[("x.js", b"x\n")]);
+        let (_dir, m) = fake_materialized("pkg", "1.0.0", &[("x.js", b"x\n")]);
+        let patch = write_patch(
+            "diff --git a/x.js b/../escape.js\n\
+             similarity index 100%\n\
+             rename from x.js\n\
+             rename to ../escape.js\n",
+        );
+
+        let err = apply_patch(&[&m], patch.path(), &integrity, &store, "pkg", "1.0.0").unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("illegal path"), "got: {msg}");
+    }
+
+    /// Source path absent from the pristine store baseline means the
+    /// patch was authored against a different version of the package.
+    /// Refuse with a regenerate hint — distinct from the whole-tree
+    /// `originalIntegrity` drift gate, this fires at chunk-apply time.
+    #[test]
+    fn apply_rename_fails_on_missing_baseline_source() {
+        // Store has the destination's pristine path but NOT the source.
+        let (_home, store, integrity) = fake_store_entry("pkg", "1.0.0", &[("other.js", b"x\n")]);
+        let (_dir, m) = fake_materialized("pkg", "1.0.0", &[("other.js", b"x\n")]);
+        let patch = write_patch(
+            "diff --git a/never-existed.js b/renamed.js\n\
+             similarity index 100%\n\
+             rename from never-existed.js\n\
+             rename to renamed.js\n",
+        );
+
+        let err = apply_patch(&[&m], patch.path(), &integrity, &store, "pkg", "1.0.0").unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("never-existed.js"), "got: {msg}");
+        assert!(
+            msg.contains("stale") || msg.contains("regenerate"),
+            "got: {msg}"
+        );
+        assert!(msg.contains("lpm patch pkg@1.0.0"), "got: {msg}");
     }
 
     #[test]
