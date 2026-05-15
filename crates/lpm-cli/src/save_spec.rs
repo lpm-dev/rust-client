@@ -286,13 +286,20 @@ fn classify_version_token(token: &str) -> Result<UserSaveIntent, LpmError> {
     // install. Other Specifier shapes (NpmAlias, Git, Tarball, File,
     // Link) are NOT promoted here — that's a wider CLI surface change
     // (npm-CLI-parity aliases on the install line) and out of scope.
+    //
+    // The error message stays surface-neutral: `parse_user_save_intent`
+    // is shared by `lpm install`, `lpm add`, `lpm global install`, and
+    // `lpm global update`, and the offending token is already in the
+    // message — the user knows which command they ran. Earlier commits
+    // hardcoded "on the install command line" here, which read wrong
+    // under `lpm global update foo@magic:bar` (GPT-audit follow-up).
     if let Err(
         err @ (SpecifierParseError::UnknownProtocol { .. }
         | SpecifierParseError::WindowsDriveLetterPath(_)),
     ) = Specifier::parse(token)
     {
         return Err(LpmError::Registry(format!(
-            "invalid version token '{token}' on the install command line: {err}"
+            "invalid version token '{token}': {err}"
         )));
     }
     Ok(UserSaveIntent::DistTag(token.to_string()))
