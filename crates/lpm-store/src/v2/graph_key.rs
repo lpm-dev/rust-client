@@ -108,7 +108,7 @@ pub struct GraphKeyInputs {
     pub platform: PlatformTuple,
     /// Linker mode under which this wrapper would materialize.
     pub linker_mode: LinkerModeTag,
-    /// Peer-context. Empty in hoisted mode (preplan §2.2 lock-in).
+    /// Peer-context. Empty in hoisted mode (not part of the graph key).
     pub peers: Vec<PeerEntry>,
     /// Dep edges declared in this package's manifest.
     pub deps: Vec<DepEdge>,
@@ -774,10 +774,10 @@ mod tests {
 
     #[test]
     fn alias_change_yields_different_key() {
-        // Preplan §2.2 lock-in: aliases are identity-bearing even when
-        // the dep edges are otherwise identical. A consumer that
-        // declares `"strip-ansi-cjs": "npm:strip-ansi@^6"` materializes
-        // a different wrapper than one that just declares `strip-ansi`.
+        // Aliases are identity-bearing even when the dep edges are
+        // otherwise identical. A consumer that declares
+        // `"strip-ansi-cjs": "npm:strip-ansi@^6"` materializes a
+        // different wrapper than one that just declares `strip-ansi`.
         let no_alias = base_inputs();
         let with_alias = base_inputs().with_aliases([("strip-ansi-cjs", "strip-ansi")]);
         assert_ne!(GraphKey::derive(&no_alias), GraphKey::derive(&with_alias));
@@ -928,8 +928,8 @@ mod tests {
     //
     // **Load-bearing for cross-project patch isolation.** Two projects
     // with identical dep edges + linker mode + platform + peers
-    // resolve to the same v2 link entry by design (preplan §2.2 — the
-    // sharing invariant unlocks the v2 install hot path). That sharing
+    // resolve to the same v2 link entry by design (the sharing
+    // invariant unlocks the v2 install hot path). That sharing
     // means project A's mutation of `<store>/v2/links/<key>/...`
     // would propagate to project B via shared materialization. The
     // F1 fix folds patch identity into the key so a patched install

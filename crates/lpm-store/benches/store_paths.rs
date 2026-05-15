@@ -1,4 +1,4 @@
-//! Trial 5 (2026-05-13) — store path-helper microbench.
+//! Store path-helper microbench.
 //!
 //! Measures the per-call allocation cost of `StoreV2Paths::object_dir`
 //! and `StoreV2Paths::link_package_dir`, the two paths the linker

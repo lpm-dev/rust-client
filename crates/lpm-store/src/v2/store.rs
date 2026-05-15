@@ -829,8 +829,7 @@ impl Store {
     /// order. `sri_segment` is the on-disk filename (e.g.
     /// `sha512-deadbeef.../`) and matches what `LinkMeta.object_path`
     /// records as its trailing component — `lpm cache prune` uses
-    /// this as the join key when computing object orphan reachability
-    /// per preplan §4.4.
+    /// this as the join key when computing object orphan reachability.
     ///
     /// Skips:
     /// - Non-directories at the `objects/` level.
@@ -922,7 +921,7 @@ fn populate_into(
 
     // Sibling-dep symlinks. Each lives next to the package (siblings
     // under the wrapper-level node_modules) — same shape as the
-    // existing isolated linker contract (preplan §2.3).
+    // existing isolated linker contract.
     for dep in deps {
         create_sibling_symlink(&node_modules, dep, graph_key)?;
     }
@@ -978,7 +977,7 @@ fn create_sibling_symlink(
     // to ascend two levels (out of `node_modules/`, then out of
     // `<self>/`) and then descend back down. Scoped locals
     // (`@scope/dep`) sit one level deeper, so add one `..` per `/`
-    // segment in the local name. Preplan §2.3 fixes this shape as
+    // segment in the local name. The shape is
     // `../../<dep.dir>/node_modules/<dep.name>` for non-scoped deps.
     let depth = depth_of_local(&dep.local);
     let mut target = PathBuf::new();
@@ -1730,8 +1729,8 @@ mod tests {
 
     #[test]
     fn hoisted_graph_key_collapses_peers_silently_in_release() {
-        // Audit finding 2: under hoisted, peers must not contribute
-        // to the graph key — preplan §2.2 lock-in. The primitive
+        // Under hoisted mode, peers must not contribute to the graph
+        // key. The primitive
         // enforces this regardless of caller normalization (silent
         // collapse + debug_assert; this test exercises only the
         // collapse part — the debug_assert path is exercised under
