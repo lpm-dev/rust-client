@@ -273,8 +273,9 @@ fn lint_all_happy_path_e2e_network_gated() {
 
     let output = lpm(&project)
         // Suppress the interactive "Plugin not installed. Downloading..." banner
-        // so stdout stays a clean JSON envelope.
-        .env("LPM_AUTO_DOWNLOAD", "1")
+        // so stdout stays a clean JSON envelope. The env var ONLY suppresses
+        // the banner — the download itself is unconditional on cache miss.
+        .env("LPM_PLUGIN_QUIET", "1")
         .args(["--json", "lint", "--all"])
         .output()
         .expect("failed to run lpm lint --all --json");
