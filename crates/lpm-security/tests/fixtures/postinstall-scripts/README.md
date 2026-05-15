@@ -1,7 +1,7 @@
 # Static-gate fixture corpus
 
-Phase 46 P2 — 500-script fixture set of lifecycle-script bodies with
-hand-assigned expected tiers, consumed by
+500-script fixture set of lifecycle-script bodies with hand-assigned
+expected tiers, consumed by
 `crates/lpm-security/tests/static_gate_corpus.rs`.
 
 ## Layout
@@ -41,11 +41,11 @@ related entries so diffs during tuning stay scoped:
 - `red-redirect-NNN-*` — redirects into user dotfiles or `/etc`.
 - `red-nc-NNN-*` — `nc` / `netcat` / `ncat` reverse-shell shapes.
 - `adversarial-NNN-*` — Unicode obfuscation, PowerShell literals,
-  no-space operator attacks (the §12.2 adversarial set).
+  no-space operator attacks.
 
-## Ship criteria (from the plan doc, §4.1)
+## Ship criteria
 
-All three are hard-asserted in the Chunk 2 harness as of Chunk 6:
+All three are hard-asserted in the harness:
 
 - **Zero false-positive reds.** The classifier MUST NOT flag any
   non-red expectation as red. Red rules never relax to chase the
@@ -55,8 +55,7 @@ All three are hard-asserted in the Chunk 2 harness as of Chunk 6:
   declared `expected` and actual tier fails the test with a full
   listing.
 - **≥60% green-rate** over the non-adversarial subset, measured as
-  `green / (green + amber)`. Denominator definition is pinned in
-  the plan §4.1. Current measured rate: see harness stats.
+  `green / (green + amber)`. Current measured rate: see harness stats.
 
 ## Regeneration
 

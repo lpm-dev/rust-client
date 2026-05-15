@@ -12,7 +12,7 @@
 //!
 //! All regex patterns use the `regex` crate which guarantees linear-time matching
 //! (Thompson NFA). NEVER use `fancy-regex` here — we scan untrusted input from
-//! arbitrary npm packages. See phase-25-todo.md §S1.
+//! arbitrary npm packages.
 //!
 //! ## Performance
 //!
@@ -142,8 +142,8 @@ pub fn analyze_package(package_dir: &Path) -> PackageAnalysis {
     }
 }
 
-/// Intermediate result from scanning a single file. Public so the Phase
-/// 38 P2 streaming path in lpm-store can feed per-entry bytes into
+/// Intermediate result from scanning a single file. Public so the
+/// streaming path in lpm-store can feed per-entry bytes into
 /// [`analyze_bytes`] and merge results without reopening [`PackageAnalyzer`].
 #[derive(Debug, Default)]
 pub struct FileAnalysisResult {
@@ -182,11 +182,11 @@ fn analyze_single_file(file_path: &std::path::PathBuf) -> Option<FileAnalysisRes
     Some(analyze_bytes(&filename, &raw_content))
 }
 
-/// **Phase 38 P2.** Core scan pass without the filesystem read — takes
-/// the file's name and raw bytes and returns the same `FileAnalysisResult`
-/// as [`analyze_single_file`]. The fused-scan path in `lpm-store` invokes
-/// this during tar extraction, using bytes the extractor already had in
-/// hand instead of re-reading the file a second time.
+/// Core scan pass without the filesystem read — takes the file's name and
+/// raw bytes and returns the same `FileAnalysisResult` as
+/// [`analyze_single_file`]. The fused-scan path in `lpm-store` invokes this
+/// during tar extraction, using bytes the extractor already had in hand
+/// instead of re-reading the file a second time.
 ///
 /// The caller is responsible for:
 /// - filtering by extension (`SOURCE_EXTENSIONS`), `.d.ts`/`.map`
@@ -464,7 +464,7 @@ fn parse_deps_map(value: Option<&serde_json::Value>) -> Option<HashMap<String, S
     Some(map)
 }
 
-/// **Phase 38 P2.** Streaming package analyzer for the fused-scan path.
+/// Streaming package analyzer for the fused-scan path.
 ///
 /// Fed one file at a time during tar extraction — callers pipe each
 /// scannable entry's `(relative_path, bytes)` through [`PackageAnalyzer::feed`]
