@@ -11,10 +11,10 @@
 //! 8. Print summary
 
 use lpm_common::LpmError;
+use lpm_common::color::Painted;
 use lpm_lockfile::LOCKFILE_NAME;
 use lpm_migrate::backup::{self, MigrationBackup};
 use lpm_registry::RegistryClient;
-use owo_colors::OwoColorize;
 use std::path::Path;
 
 #[allow(clippy::too_many_arguments)]

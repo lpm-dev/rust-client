@@ -23,8 +23,8 @@ use crate::patch_engine::{
     GeneratedPatch, STAGING_BREADCRUMB_FILE, copy_store_to_staging, generate_patch, parse_patch_key,
 };
 use lpm_common::LpmError;
+use lpm_common::color::Painted;
 use lpm_store::find_installed_package_baseline;
-use owo_colors::OwoColorize;
 use serde_json::json;
 use std::path::Path;
 

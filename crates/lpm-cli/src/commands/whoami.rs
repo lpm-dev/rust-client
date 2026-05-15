@@ -1,7 +1,7 @@
 use crate::{auth, output};
 use lpm_common::LpmError;
+use lpm_common::color::Painted;
 use lpm_registry::RegistryClient;
-use owo_colors::OwoColorize;
 
 pub async fn run(client: &RegistryClient, json_output: bool) -> Result<(), LpmError> {
     let user = client.whoami().await?;

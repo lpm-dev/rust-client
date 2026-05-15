@@ -33,8 +33,8 @@ use crate::output;
 use crate::trust_snapshot::{self, SnapshotEntry, TrustSnapshot};
 use clap::Subcommand;
 use lpm_common::LpmError;
+use lpm_common::color::Painted;
 use lpm_workspace::{TrustedDependencies, TrustedDependencyBinding};
-use owo_colors::OwoColorize;
 use std::collections::BTreeMap;
 use std::path::Path;
 

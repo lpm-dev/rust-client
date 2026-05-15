@@ -28,8 +28,8 @@
 use crate::build_state::{self, BlockedPackage, BuildState};
 use crate::output;
 use lpm_common::LpmError;
+use lpm_common::color::Painted;
 use lpm_workspace::{ApprovalMetadata, ProvenanceSnapshot, TrustMatch, TrustedDependencies};
-use owo_colors::OwoColorize;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 

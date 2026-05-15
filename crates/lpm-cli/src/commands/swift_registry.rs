@@ -1,6 +1,6 @@
 use crate::output;
 use lpm_common::LpmError;
-use owo_colors::OwoColorize;
+use lpm_common::color::Painted;
 
 /// Phase 35: resolve a usable LPM bearer for Swift Package Manager
 /// integration. SPM's login flow takes the token as a CLI arg, so a

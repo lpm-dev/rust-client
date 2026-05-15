@@ -1,11 +1,12 @@
 use clap::{ArgAction, Parser, Subcommand, ValueEnum};
 use clap_complete::Shell;
+use lpm_common::color::Painted;
 use miette::{IntoDiagnostic, Result};
-use owo_colors::OwoColorize;
 
 mod auth;
 pub mod build_state;
 pub mod capability;
+mod color_policy;
 mod commands;
 pub mod constraints;
 pub mod doctor_catalog;
@@ -106,6 +107,11 @@ struct Cli {
     /// Allow insecure HTTP connections to non-localhost registries.
     #[arg(long, global = true)]
     insecure: bool,
+
+    /// Color output mode. `auto` (default) honors `FORCE_COLOR`,
+    /// `NO_COLOR`, then falls back to stdout TTY detection.
+    #[arg(long, global = true, value_enum, default_value_t = color_policy::ColorChoice::Auto)]
+    color: color_policy::ColorChoice,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
@@ -2404,6 +2410,12 @@ async fn async_main() -> Result<()> {
     .ok();
 
     let cli = Cli::parse();
+
+    // Color policy must initialize before anything emits styled output.
+    // Runs after Cli::parse so the `--color` flag is honored, and after
+    // the miette hook above because miette's renderer styling is decided
+    // when the diagnostic is rendered, not at hook-install time.
+    color_policy::init(Some(cli.color));
 
     // Version flag short-circuit. Replaces clap's auto `-V` handler so we
     // can both (a) honour `-v` as an alias and (b) append the cached

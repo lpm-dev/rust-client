@@ -1,7 +1,7 @@
 use crate::output;
 use lpm_common::LpmError;
+use lpm_common::color::Painted;
 use lpm_runner::bin_path::ManagedRuntimeHint;
-use owo_colors::OwoColorize;
 use std::collections::HashSet;
 use std::path::Path;
 
@@ -136,7 +136,7 @@ pub async fn run(
         return Ok(());
     }
 
-    output::info(&format!("{}", script_name.bold()));
+    output::info(&script_name.bold());
 
     // Check if caching is enabled — if so, use tee capture
     let caching_enabled = !no_cache && is_task_cached_with_config(script_name, lpm_config.as_ref());
@@ -505,7 +505,7 @@ async fn run_tasks_sequential(
             continue;
         }
 
-        output::info(&format!("{}", script.bold()));
+        output::info(&script.bold());
 
         let caching_enabled = !no_cache && is_task_cached_with_config(script, lpm_config);
         let task_start = std::time::Instant::now();
@@ -718,7 +718,7 @@ async fn run_tasks_parallel(
                 continue;
             }
 
-            output::info(&format!("{}", task_name.bold()));
+            output::info(&task_name.bold());
 
             // Use captured execution when caching is enabled (Finding #5)
             let caching_enabled = !no_cache && is_task_cached_with_config(task_name, lpm_config);
@@ -1473,11 +1473,7 @@ pub fn run_watch(
         Box::new(move || {
             // Clear screen between runs
             print!("\x1B[2J\x1B[1;1H");
-            println!(
-                "{} running {} ...",
-                owo_colors::OwoColorize::dimmed(&"[watch]"),
-                script,
-            );
+            println!("{} running {} ...", "[watch]".dimmed(), script);
 
             let result =
                 lpm_runner::script::run_script(&dir, &script, &args, mode.as_deref(), &hint);
@@ -1486,12 +1482,12 @@ pub fn run_watch(
                 Ok(()) => {
                     println!(
                         "\n{} {} completed. Waiting for changes...",
-                        owo_colors::OwoColorize::green(&"✔"),
+                        "✔".green(),
                         script,
                     );
                 }
                 Err(e) => {
-                    eprintln!("\n{} {}: {}", owo_colors::OwoColorize::red(&"✖"), script, e,);
+                    eprintln!("\n{} {}: {}", "✖".red(), script, e,);
                     eprintln!("Waiting for changes...");
                 }
             }

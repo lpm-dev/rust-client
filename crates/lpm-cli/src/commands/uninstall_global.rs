@@ -34,12 +34,12 @@
 
 use crate::output;
 use chrono::Utc;
+use lpm_common::color::Painted;
 use lpm_common::{LpmError, LpmRoot, with_exclusive_lock};
 use lpm_global::{
     AliasEntry, IntentPayload, PackageEntry, Shim, TxKind, WalRecord, WalWriter, emit_shim,
     read_for, remove_shim, write_for,
 };
-use owo_colors::OwoColorize;
 use std::path::PathBuf;
 
 pub async fn run(package: &str, json_output: bool) -> Result<(), LpmError> {

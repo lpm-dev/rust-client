@@ -11,9 +11,9 @@
 
 use crate::output;
 use lpm_common::LpmError;
+use lpm_common::color::Painted;
 use lpm_task::filter::{FilterEngine, FilterExpr, MatchKind, TraceReason};
 use lpm_task::graph::WorkspaceGraph;
-use owo_colors::OwoColorize;
 use std::path::Path;
 
 /// Format the D2 substring → glob migration hint when a filter set returns

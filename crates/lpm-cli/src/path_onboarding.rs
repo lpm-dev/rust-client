@@ -40,7 +40,7 @@
 
 use crate::output;
 use lpm_common::LpmRoot;
-use owo_colors::OwoColorize;
+use lpm_common::color::Painted;
 use std::path::{Path, PathBuf};
 
 /// Per-platform PATH separator. Compile-time constant — `cfg`-gated

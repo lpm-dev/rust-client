@@ -30,6 +30,7 @@ use crate::save_spec::{
     SaveConfig, SaveFlags, UserSaveIntent, decide_saved_dependency_spec, parse_user_save_intent,
 };
 use chrono::Utc;
+use lpm_common::color::Painted;
 use lpm_common::{LpmError, LpmRoot, with_exclusive_lock};
 use lpm_global::{
     AliasEntry, CommandCollision, GlobalManifest, InstallReadyMarker, InstallRootStatus,
@@ -39,7 +40,6 @@ use lpm_global::{
 };
 use lpm_registry::RegistryClient;
 use lpm_semver::{Version, VersionReq};
-use owo_colors::OwoColorize;
 use std::collections::{BTreeMap, HashSet};
 use std::path::PathBuf;
 

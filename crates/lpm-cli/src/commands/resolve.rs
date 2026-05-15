@@ -1,8 +1,8 @@
 use crate::output;
 use lpm_common::LpmError;
+use lpm_common::color::Painted;
 use lpm_registry::RegistryClient;
 use lpm_resolver::resolve_dependencies;
-use owo_colors::OwoColorize;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;

@@ -19,12 +19,12 @@
 use crate::commands::audit::inventory::PackageInventory;
 use crate::output;
 use lpm_common::LpmError;
+use lpm_common::color::Painted;
 use lpm_registry::RegistryClient;
 use lpm_security::behavioral::PackageAnalysis;
 use lpm_security::query::{
     self, DepGraph, DepGraphEntry, PackageContext, Severity, count_all_tags, parse_selector,
 };
-use owo_colors::OwoColorize;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 

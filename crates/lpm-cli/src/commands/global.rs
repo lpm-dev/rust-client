@@ -8,9 +8,9 @@
 //! before any global install can be performed.
 
 use crate::output;
+use lpm_common::color::Painted;
 use lpm_common::{LpmError, LpmRoot, format_bytes};
 use lpm_global::{GlobalManifest, PackageEntry};
-use owo_colors::OwoColorize;
 use std::path::Path;
 
 /// Subcommands of `lpm global`. Defined here (not in `main.rs`) so the

@@ -4,6 +4,7 @@ use crate::patch_engine;
 use crate::patch_state;
 use indicatif::{ProgressBar, ProgressStyle}; // kept for concurrent download progress bar
 use lpm_common::LpmError;
+use lpm_common::color::Painted;
 use lpm_linker::{LinkResult, LinkTarget, MaterializedPackage};
 use lpm_registry::{GateDecision, RegistryClient, RouteTable, UpstreamRoute, evaluate_cached_url};
 use lpm_resolver::{
@@ -11,7 +12,6 @@ use lpm_resolver::{
 };
 use lpm_store::PackageStore;
 use lpm_workspace::PatchedDependencyEntry;
-use owo_colors::OwoColorize;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;

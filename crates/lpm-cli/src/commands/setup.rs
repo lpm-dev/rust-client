@@ -1,6 +1,6 @@
 use crate::{oidc, output};
 use lpm_common::LpmError;
-use owo_colors::OwoColorize;
+use lpm_common::color::Painted;
 use std::path::Path;
 
 /// Phase 35: resolve a usable LPM bearer for CI/CD `.npmrc` generation.

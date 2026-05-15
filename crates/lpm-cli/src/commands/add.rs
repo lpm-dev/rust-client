@@ -1,7 +1,7 @@
 use crate::output;
+use lpm_common::color::Painted;
 use lpm_common::{LpmError, PackageName};
 use lpm_registry::{RegistryClient, RouteTable};
-use owo_colors::OwoColorize;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 

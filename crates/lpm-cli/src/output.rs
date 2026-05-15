@@ -1,6 +1,6 @@
 //! Terminal output helpers using cliclack for consistent, styled output.
 
-use owo_colors::OwoColorize;
+use lpm_common::color::Painted;
 
 /// Suppress stdout for nested command execution when the outer command
 /// owns the machine-readable stdout contract.

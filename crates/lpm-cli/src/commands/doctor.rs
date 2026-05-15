@@ -1,9 +1,9 @@
 use crate::doctor_catalog::{self, CheckEntry, Severity};
 use crate::{auth, output};
 use lpm_common::LpmError;
+use lpm_common::color::Painted;
 use lpm_registry::RegistryClient;
 use lpm_store::PackageStore;
-use owo_colors::OwoColorize;
 use std::path::Path;
 use std::process::{Command, Stdio};
 use std::time::Duration;
