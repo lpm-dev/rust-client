@@ -83,7 +83,7 @@ fn migrate_pnpm_creates_lockfile() {
     assertions::assert_both_lockfiles_exist(project.path());
 }
 
-// ─── Phase 64 #34: pnpm.overrides translation ──────────────────
+// ─── pnpm.overrides translation ──────────────────
 
 /// Clean translation: `pnpm.overrides` populated, no existing
 /// `lpm.overrides`. Migration should write the converted block to
@@ -224,7 +224,7 @@ fn migrate_pnpm_overrides_dry_run_reports_translation_count() {
     );
 }
 
-// ─── Phase 64 #35: pnpm.patchedDependencies translation ──────────
+// ─── pnpm.patchedDependencies translation ──────────
 
 /// Clean translation: `pnpm.patchedDependencies` populated, source
 /// patch file present at the user's path, no existing

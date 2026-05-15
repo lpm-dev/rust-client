@@ -1,5 +1,5 @@
 #!/bin/bash
-# Real-world project audit harness — Phase 66 confidence-followup §1a.
+# Real-world project audit harness — confidence-followup 
 #
 # Clones a project pinned in projects.json, replaces its install with
 # `lpm install --linker <mode>` for both isolated and hoisted, and runs
@@ -233,7 +233,7 @@ run_mode() {
     fi
 
     # Smoke test. Wrapped in `run_with_timeout` so a hanging CLI
-    # (vitepress@1.5 `--version` did this in pre-§1a smoke) can't wedge
+    # (vitepress@1.5 `--version` did this in pre-smoke) can't wedge
     # the suite. Timeout fires `kill 9 -$$` to take down the whole
     # process group — important for `npx`/`node` sub-processes.
     local smoke_log="$work/.lpm-smoke.log"

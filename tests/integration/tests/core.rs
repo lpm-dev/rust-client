@@ -762,11 +762,11 @@ fn fixture_with_scripts_task_graph_integration() {
     );
 }
 
-// ─── Phase 19: Security Policy ─────────────────────────────────
+// ─── Security Policy ─────────────────────────────────
 
 #[test]
 fn release_age_blocks_recently_published() {
-    // Phase 19 Finding #2: release age enforcement is a blocking gate, not a warning.
+    // release age enforcement is a blocking gate, not a warning.
     // check_release_age returns Some(warning) which the install path converts to Err.
     let policy = lpm_security::SecurityPolicy {
         trusted_dependencies: lpm_security::TrustedDependencies::default(),
@@ -887,7 +887,7 @@ fn typosquatting_warns_on_misspelling() {
     );
 }
 
-// ─── Phase 19: Store Verify ────────────────────────────────────
+// ─── Store Verify ────────────────────────────────────
 
 #[test]
 fn store_list_packages_skips_missing_package_json() {
@@ -926,7 +926,7 @@ fn store_list_packages_includes_complete_package() {
     assert!(pkg_dir.join("package.json").exists());
 }
 
-// ── Phase 59.1 day-3 (F7) — end-to-end directory dep ─────────────────────
+// ── end-to-end directory dep ─────────────────────
 
 /// Full pipeline test for `Source::Directory` deps:
 /// 1. lpm-linker materializes a `+`-shape wrapper with per-file
@@ -1034,7 +1034,7 @@ fn linker_directory_dep_creates_plus_wrapper_with_live_symlinks() {
     );
 }
 
-// ── Phase 59.1 day-4 (F8) — end-to-end link: dep ─────────────────────────
+// ── end-to-end link: dep ─────────────────────────
 
 /// Full pipeline test for `Source::Link` deps. Structurally identical
 /// to `linker_directory_dep_creates_plus_wrapper_with_live_symlinks`
@@ -1137,7 +1137,7 @@ fn linker_link_dep_creates_l_prefix_wrapper_with_live_symlinks() {
     assert_eq!(after_edit, "module.exports = 'edited-link';");
 }
 
-// ── Phase 59.1 day-5 (F7-transitive) — wrapper sibling layout ───────────
+// ── wrapper sibling layout ───────────
 
 /// Day-5 integration test: a directory dep with TRANSITIVE local-source
 /// deps. Verifies the linker materializes the wrapper's
@@ -1264,12 +1264,12 @@ fn linker_directory_dep_with_transitive_directory_dep_creates_sibling_symlink() 
     );
 }
 
-// ── Phase 59.1 day-7 (F18) + audit response — cross-source identity coexistence ──
+// ── cross-source identity coexistence ──
 
 /// Day-7 + audit-response integration test: a single install pipeline
 /// where FIVE `foo@1.0.0` packages from every supported source kind
 /// coexist without colliding at the linker layer. Per umbrella R1
-/// risk register and pre-plan §6.2: the highest-risk collision case
+/// risk register: the highest-risk collision case
 /// is `react@19.1.0` from registry + a fork tarball + a git SHA in
 /// the same graph; this test exercises the analog (registry +
 /// remote tarball + local tarball + file-directory + link).
@@ -1294,11 +1294,11 @@ fn linker_directory_dep_with_transitive_directory_dep_creates_sibling_symlink() 
 /// both Tarball variants share `Materialization::CasBacked`
 /// (hardlink / clonefile from the global store); Directory + Link
 /// use `Materialization::DirectorySource` (per-file absolute
-/// symlinks from the source realpath). PackageKey (Phase 59.0
+/// symlinks from the source realpath). PackageKey
 /// day-7 finish-line) keeps lockfile-level identity distinct.
 ///
 /// **Pre-audit history.** Day-7 originally covered registry +
-/// file-directory + link only. The day-7 plan §10 flagged a
+/// file-directory + link only. This flagged a
 /// PRINCIPAL KNOWN GAP — registry and tarball (remote OR local)
 /// silently collided because `wrapper_id_for_source` returned
 /// `None` for `Source::Tarball` regardless of URL prefix, so all

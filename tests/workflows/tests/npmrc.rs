@@ -1,6 +1,6 @@
 //! Workflow test for `.npmrc`-driven authenticated install round-trips.
 //!
-//! Phase 58 day-5 regression: a custom-registry install configured via
+//! Regression: a custom-registry install configured via
 //! `.npmrc` (`registry=` + nerf-dart `_authToken=`) MUST attach the
 //! bearer token on every request that reaches the registry — including
 //! the post-resolve metadata helpers (cooldown gate's
@@ -34,7 +34,7 @@ use wiremock::matchers::{header, method, path};
 use wiremock::{Mock, ResponseTemplate};
 
 const TOKEN: &str = "PHASE58-WORKFLOW-SECRET-TOKEN";
-const PACKAGE_NAME: &str = "phase58-workflow-package";
+const PACKAGE_NAME: &str = "npmrc-workflow-package";
 const VERSION: &str = "1.0.0";
 
 // ─── Tarball + metadata builders (auth-gated; can't reuse MockRegistry's helpers) ──

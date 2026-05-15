@@ -1,11 +1,10 @@
 //! Real-world install-pipeline coverage at production scale.
 //!
-//! Item 5 §1 of `private/test-coverage-followup-plan.md`. Companion
-//! to `install_real_registry.rs` (which covers single-package smoke
-//! tests against Verdaccio). The tests here drive `lpm install`
-//! against the [`realworld-nextjs`](../../fixtures/realworld-nextjs/)
+//! Companion to `install_real_registry.rs` (which covers
+//! single-package smoke tests against Verdaccio). The tests here drive
+//! `lpm install` against the [`realworld-nextjs`](../../fixtures/realworld-nextjs/)
 //! fixture, whose `package.json` resolves to ~28 transitive packages
-//! (empirically measured 2026-05-14) covering Next.js 14, React 18,
+//! covering Next.js 14, React 18,
 //! TypeScript 5, and `@types/*` shapes — including platform-specific
 //! optional deps (`@next/swc-*`).
 //!
@@ -32,8 +31,8 @@
 //! - **Without the gate**, the assertions are skipped — the test
 //!   passes on any host that successfully runs the install.
 //!
-//! **Item 5 §2-§4 status (2026-05-14):** the §2 cold-wall-clock budget,
-//! §3 warm-wall-clock budget, and §4 memory budget are all wired below,
+//! **Budget status:** the cold-wall-clock budget, warm-wall-clock budget,
+//! and memory budget are all wired below,
 //! gated as described, and calibrated from N=6 dev-box runs (cold
 //! 13.8-16.6s, warm 8.5-8.8ms, peak RSS 749-884 MB). Numbers are
 //! intentionally specific to the calibrated host; ports to other
@@ -46,7 +45,7 @@
 //! assertion. Same `parse_peak_rss` shape can be lifted to
 //! `support/mod.rs` if a second test needs it.
 //!
-//! **Verdaccio-npm parity** (§3 of the original surface) is NOT
+//! **Verdaccio-npm parity** (warm-install surface) is NOT
 //! covered here — the bin-package and lodash diff tests in
 //! `install_real_registry.rs` already pin the manager-equivalence
 //! contract. Expanding to a 100+ package tree would multiply the
@@ -69,7 +68,7 @@ use support::{TempProject, lpm};
 
 // ─── Budget calibration ─────────────────────────────────────────────
 //
-// Numbers calibrated 2026-05-14 from N=6 dev-box runs on M-series
+// Numbers calibrated from N=6 dev-box runs on M-series
 // macOS against the realworld-nextjs fixture pinned at the versions
 // in `tests/fixtures/realworld-nextjs/package.json`. See the README
 // at that path for the derivation methodology.
@@ -236,7 +235,7 @@ fn parse_peak_rss(time_output: &str) -> Option<u64> {
     None
 }
 
-/// **Item 5 §1 — realworld Next.js install succeeds end-to-end via Verdaccio.**
+/// **realworld Next.js install succeeds end-to-end via Verdaccio.**
 ///
 /// The fixture's `package.json` pins exact versions of `next@14.2.13`,
 /// `react@18.3.1`, `react-dom@18.3.1`, `typescript@5.6.3`, and three
@@ -253,7 +252,7 @@ fn parse_peak_rss(time_output: &str) -> Option<u64> {
 /// direct deps materialize in `node_modules/`, and
 /// `.lpm/install-hash` lands.
 ///
-/// **What's asserted under `LPM_BUDGET_GATE=1` (Item 5 §2-§4):**
+/// **What's asserted under `LPM_BUDGET_GATE=1`:**
 ///   - Cold install ≤ `COLD_INSTALL_BUDGET` (25 s) — catches
 ///     resolver/fetch/extract regressions that double the wall-clock.
 ///   - Warm install ≤ `WARM_INSTALL_BUDGET` (25 ms) — catches a
@@ -357,7 +356,7 @@ async fn install_realworld_nextjs_fixture_succeeds_through_verdaccio() {
 
     // Tree-scale heuristic: the realworld fixture's RESOLVED tree
     // (= lockfile packages count) is empirically ~28 packages as of
-    // 2026-05-14 (Next.js 14.2.13 + React 18.3.1 + TypeScript 5.6.3 +
+    // (Next.js 14.2.13 + React 18.3.1 + TypeScript 5.6.3 +
     // @types/*). A regression that silently dropped transitive deps
     // would leave the lockfile with only the direct deps (≤7).
     //
@@ -392,7 +391,7 @@ async fn install_realworld_nextjs_fixture_succeeds_through_verdaccio() {
     // Secondary sanity: node_modules top-level entries. With the
     // isolated linker the count is smaller than the lockfile total
     // (rest live under `node_modules/.lpm/`). Empirically ~24 entries
-    // for this fixture on 2026-05-14. The 18-entry floor protects
+    // Counts for this fixture. The 18-entry floor protects
     // against a regression that dropped the LINKER half of the
     // pipeline (lockfile correct, link tree empty).
     let nm_count = std::fs::read_dir(project.path().join("node_modules"))

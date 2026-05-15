@@ -7,7 +7,7 @@
 //! `lpm()` (pre-configured `assert_cmd::Command` for the real binary),
 //! plus `MockRegistry` (wiremock-backed) under `mock_registry`.
 //!
-//! # Where new tests go (Phase 65 tier discipline)
+//! # Where new tests go (test tier discipline)
 //!
 //! - **Default — workflow tier** (`tests/workflows/tests/<feature>.rs`):
 //!   any test that exercises a multi-step user flow through the CLI.
@@ -246,7 +246,7 @@ fn apply_lpm_env<S: LpmEnvSink>(cmd: &mut S, project: &TempProject) {
     cmd.remove_env("LPM_LINKER");
     cmd.remove_env("LPM_CONCURRENT_DOWNLOADS");
 
-    // Phase 66 Phase 4d — workflow tests assert on v1 layout shape
+    // workflow tests assert on v1 layout shape
     // (e.g., `<project>/.lpm/wrappers/<seg>/`, hoisted-flat
     // `node_modules/<dep>` real dirs, hardlink-detach behavior). The
     // Phase-4d default flip to v2 changes these to symlinks-into-the-
@@ -267,7 +267,7 @@ fn apply_lpm_env<S: LpmEnvSink>(cmd: &mut S, project: &TempProject) {
     // Disable update check (would make network calls)
     cmd.set_env("LPM_NO_UPDATE_CHECK", OsStr::new("1"));
 
-    // Phase 49: the shipped Direct route defaults hit `registry.npmjs.org`
+    // The shipped Direct route defaults hit `registry.npmjs.org`
     // for npm packages. Workflow tests use a single mock server at the
     // `--registry` base URL that serves `/api/registry/{name}` (LPM
     // proxy path) and don't have a separate npm mock. Force Proxy mode
@@ -276,7 +276,7 @@ fn apply_lpm_env<S: LpmEnvSink>(cmd: &mut S, project: &TempProject) {
     // override this env.
     cmd.set_env("LPM_NPM_ROUTE", OsStr::new("proxy"));
 
-    // Phase 46.3 PR-2: on Windows, the install pipeline's sandbox
+    // on Windows, the install pipeline's sandbox
     // factory probes `current_exe().parent()` for
     // `lpm-sandbox-helper.exe`. `assert_cmd::cargo_bin("lpm-rs")`
     // returns the binary from `target/<profile>/`, where cargo also

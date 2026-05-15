@@ -1,6 +1,6 @@
 //! Workflow tests for `lpm rebuild` policy semantics.
 //!
-//! Phase 46 close-out: `script-policy` controls which scripted packages
+//! The `script-policy` controls which scripted packages
 //! enter the rebuild set.
 //!
 //! - **deny** (default): trusted packages only; untrusted scripted
@@ -84,7 +84,7 @@ fn seed_scripted_package(
 
 /// Materialize a per-package wrapper at
 /// `<project>/.lpm/wrappers/<safe>@<v>/node_modules/<name>/` by copying
-/// the store entry. Phase 61.2 D8a closed the silent store-fallback
+/// the store entry. A prior fix closed the silent store-fallback
 /// hole — lifecycle scripts run from the wrapper, never the store —
 /// so any test exercising real spawn (not just dry-run) needs the
 /// wrapper materialized to mirror a real post-install state.
@@ -477,7 +477,7 @@ fn rebuild_triage_policy_does_not_widen_beyond_greens() {
 
 // ─── triage policy: green auto-promotion + amber/red blocked ────────────
 //
-// Five tests covering the §11 P6 ship criteria for triage:
+// Five tests covering the triage ship criteria:
 //  1. default filter keeps only green-promoted packages in the dry-run
 //     set (proves the promotion survives `build::run`'s trust filter,
 //     not just the label renderer)
@@ -532,7 +532,7 @@ fn rebuild_triage_default_dryrun_filter_keeps_only_green_promoted() {
     );
     assert!(
         !stdout.contains("amber-playwright"),
-        "amber-playwright must NOT appear (Chunk 2 promotion is green-only); stdout:\n{stdout}"
+        "amber-playwright must NOT appear (Promotion from triage is green-only); stdout:\n{stdout}"
     );
     assert!(
         !stdout.contains("red-curlpipe"),
@@ -600,7 +600,7 @@ fn rebuild_triage_default_build_points_at_approve_scripts_for_blocked() {
     let green_dir = seed_scripted_package(&project, "green-native", "1.0.0", GREEN_POSTINSTALL);
     let amber_dir = seed_scripted_package(&project, "amber-playwright", "1.0.0", AMBER_POSTINSTALL);
     let red_dir = seed_scripted_package(&project, "red-curlpipe", "1.0.0", RED_POSTINSTALL);
-    // Phase 61.2 D8a: lifecycle scripts run from the wrapper, never
+    // lifecycle scripts run from the wrapper, never
     // the store — materialize wrappers to mirror real post-install.
     seed_wrapper(&project, &green_dir, "green-native", "1.0.0");
     seed_wrapper(&project, &amber_dir, "amber-playwright", "1.0.0");
@@ -633,7 +633,7 @@ fn rebuild_triage_default_build_points_at_approve_scripts_for_blocked() {
     // Pointer surfaces with the skipped count.
     assert!(
         stderr.contains("lpm approve-scripts"),
-        "Chunk 1 triage pointer must appear when amber/red remain; stderr:\n{stderr}"
+        "Triage pointer must appear when amber/red remain; stderr:\n{stderr}"
     );
     assert!(
         stderr.contains("2 package(s) are not in trustedDependencies"),
@@ -684,7 +684,7 @@ fn rebuild_deny_skips_all_packages_and_keeps_legacy_pointer() {
 }
 
 /// `--json` envelope is valid JSON on stdout; no human pointer text
-/// bleeds onto stdout (Chunk 4 stream-separation contract). A regression
+/// bleeds onto stdout (stream-separation contract). A regression
 /// that emitted the approve-scripts pointer to stdout under `--json`
 /// would break `JSON.parse` for every CI consumer.
 #[test]
@@ -716,7 +716,7 @@ fn rebuild_triage_json_separates_streams() {
     );
 }
 
-// ─── Phase 46.1 GPT-5 audit round 2 (2026-05-11): strict + sandbox-log ──
+// ─── strict + sandbox-log coverage ──────────────────────────────────────
 //
 // `--strict-sandbox` and `--sandbox-log` are NOT clap-rejected (they
 // have orthogonal-looking intents: one wants enforcement, the other

@@ -1,6 +1,6 @@
 //! Workflow tests for `lpm.overrides` resolution + offline-mode safety.
 //!
-//! Phase 32 Phase 5 acceptance criteria, end-to-end through the binary:
+//! Override-fail-closed acceptance criteria, end-to-end through the binary:
 //!
 //! 1. **Fail-closed parsing** — invalid overrides in `package.json` are
 //!    a hard error at install entry, not a silent no-op. The error

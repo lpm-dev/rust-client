@@ -1,4 +1,4 @@
-//! Coverage audit guard for the Phase 65 command-surface matrix.
+//! Coverage audit guard for the command-surface matrix.
 //!
 //! This is the lightweight 65.1 enforcement pass:
 //! - the corrected 137-row surface inventory is checked into the repo
@@ -19,11 +19,11 @@ use std::collections::BTreeSet;
 use std::path::PathBuf;
 
 #[test]
-fn coverage_audit_baseline_shape_matches_phase65_matrix() {
+fn coverage_audit_baseline_shape_matches_command_matrix() {
     assert_eq!(
         SURFACES.len(),
         EXPECTED_SURFACE_COUNT,
-        "baseline surface count drifted; regenerate the audit baseline after updating the Phase 65 matrix"
+        "baseline surface count drifted; regenerate the audit baseline after updating the command matrix"
     );
 
     let ids: Vec<u16> = SURFACES.iter().map(|surface| surface.id).collect();
@@ -118,7 +118,7 @@ fn commands_enum_variants_match_audit_baseline() {
 
     assert_eq!(
         actual, expected,
-        "top-level Commands variants drifted; update the Phase 65 matrix and regenerate coverage_audit_baseline.rs"
+        "top-level Commands variants drifted; update the command matrix and regenerate coverage_audit_baseline.rs"
     );
 }
 
@@ -140,7 +140,7 @@ fn supplemental_references(surface_id: u16) -> &'static [&'static str] {
     // IDs ≥ 50 shifted down by 1 after `lpm store list` (formerly id 50)
     // was removed from the audited surface; `lpm cache prune` took id 51
     // (formerly `lpm store gc` at id 52). Anything that was ≥ 50 in the
-    // original Phase 65 matrix has shifted down by one.
+    // original command matrix has shifted down by one.
     match surface_id {
         10 => &["crates/lpm-cli/src/commands/doctor.rs"],
         17 => &["crates/lpm-cli/src/commands/install.rs"],

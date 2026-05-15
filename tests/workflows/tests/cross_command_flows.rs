@@ -359,7 +359,7 @@ async fn flow_migrate_install_audit_lockfile_round_trips() {
 /// trustedDependencies; rebuild #2 reads the new Rich-form entry
 /// and surfaces the package as trusted.
 ///
-/// **Finding #75 retraction.** An earlier revision of this flow
+/// **Retraction.** An earlier revision of this flow
 /// asserted that `rebuild --policy=deny` ignores the v2 OBJECT form
 /// of `trustedDependencies`. That diagnosis was wrong:
 /// `TrustedDependencies::matches_strict` (in `lpm-workspace`) is

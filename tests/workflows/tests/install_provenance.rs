@@ -1,6 +1,6 @@
 //! Workflow tests for the install-time provenance-drift gate.
 //!
-//! Phase 46 P4 ship-criteria pinned end-to-end against a wiremock-backed
+//! Ship-criteria pinned end-to-end against a wiremock-backed
 //! mock registry that serves both the package metadata (carrying a
 //! `dist.attestations.url` pointer) and the attestation bundle itself.
 //! Eight properties pinned: drift block on dropped/changed attestations,
@@ -433,7 +433,7 @@ async fn setup_http500_attestation() -> (TempProject, MockRegistry) {
     (project, mock)
 }
 
-// ─── Tests: §11 P4 ship criteria ────────────────────────────────────────
+// ─── Tests: ship criteria ────────────────────────────────────────
 
 /// Approved v1 had attestation; candidate v2 has none — drift blocks
 /// install. The axios 1.14.1 scenario, end-to-end.

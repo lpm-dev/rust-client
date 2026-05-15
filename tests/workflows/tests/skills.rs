@@ -166,7 +166,7 @@ fn skills_validate_rejects_skill_exceeding_size_limit() {
         .output()
         .expect("failed to run lpm skills validate");
 
-    // Finding #72 contract: a non-empty error set must exit non-zero,
+    // Contract: a non-empty error set must exit non-zero,
     // so CI gates that run `lpm skills validate` fail closed. The
     // exit code AND the surfaced message are both load-bearing —
     // exit-only would let a future regression scrub the per-skill
