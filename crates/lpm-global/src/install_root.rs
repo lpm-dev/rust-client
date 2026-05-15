@@ -1,6 +1,6 @@
-//! Phase 37 M3.1b — install root completeness markers.
+//! Install root completeness markers.
 //!
-//! Per the plan §"Crash-safe transactions", a global install commits
+//! A global install commits
 //! in three phases. Step 2 (the slow lock-free extract / link / lockfile
 //! / bin-targets work) finishes by writing
 //! `<install_root>/.lpm-install-ready`. Recovery uses that marker plus
@@ -65,7 +65,7 @@ impl InstallReadyMarker {
 /// must NOT be written and recovery will (correctly) classify the
 /// install as needing rollback.
 pub fn write_marker(install_root: &Path, marker: &InstallReadyMarker) -> Result<(), LpmError> {
-    // Phase 37 M0 (rev 6): all global-install fs ops on Windows route
+    // All global-install fs ops on Windows route
     // through `as_extended_path` so deeply-nested install roots beyond
     // the legacy 260-char ceiling are addressable. No-op on POSIX.
     let parent = as_extended_path(install_root);

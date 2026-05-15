@@ -1,4 +1,4 @@
-//! Phase 37 M3.1a — bin shim emission for `~/.lpm/bin/`.
+//! Bin shim emission for `~/.lpm/bin/`.
 //!
 //! Both M3.2 (install --global) and the recovery roll-forward path
 //! produce shims through this module. M3.3 (uninstall) removes them
@@ -18,7 +18,7 @@
 //!   so the same `<command_name>` resolves correctly under cmd.exe,
 //!   PowerShell, and Git Bash / Cygwin / MSYS2 / WSL. The "three-
 //!   artifact invariant" is a product choice documented in the plan
-//!   §"Three-artifact invariant": a partial triple is treated as
+//!   A partial triple is treated as
 //!   uncommitted, and recovery re-emits the missing files.
 //!
 //! ## Atomicity
@@ -92,7 +92,7 @@ pub struct EmittedShim {
 // Retry-with-backoff steps for Windows shim swaps. AV scanners and
 // Explorer preview can briefly hold a handle on a `.cmd` / `.ps1`
 // right when we're trying to overwrite it; the schedule matches the
-// plan §"Windows" spec. Unused on Unix where rename is atomic and not
+// Unused on Unix where rename is atomic and not
 // subject to transient sharing violations.
 #[cfg(windows)]
 const MAX_BACKOFF_RETRIES: u32 = 5;
@@ -392,7 +392,7 @@ fn atomic_replace_file_windows(path: &Path, contents: &[u8]) -> Result<(), ShimE
     use std::os::windows::fs::OpenOptionsExt;
     use windows_sys::Win32::Foundation::{ERROR_ACCESS_DENIED, ERROR_SHARING_VIOLATION};
 
-    // Phase 37 M0 (rev 6): route every Windows fs op through the
+    // Route every Windows fs op through the
     // extended-length helper so a deeply-nested `~/.lpm/global/installs/`
     // hierarchy doesn't truncate at the legacy 260-char ceiling.
     let path_ext = as_extended_path(path);

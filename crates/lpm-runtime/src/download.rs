@@ -43,7 +43,7 @@ pub async fn install_node(
         });
     }
 
-    // Finding #3: Check Content-Length header for early rejection of oversized downloads
+    // Check Content-Length header for early rejection of oversized downloads
     if let Some(content_length) = resp.content_length() {
         validate_download_size(content_length as usize)?;
     }
@@ -54,12 +54,12 @@ pub async fn install_node(
         .await
         .map_err(|e| LpmError::Network(format!("failed to read node download: {e}")))?;
 
-    // Finding #3: Also validate actual size (Content-Length can lie or be absent)
+    // Also validate actual size (Content-Length can lie or be absent)
     validate_download_size(bytes.len())?;
 
     tracing::debug!("downloaded {} bytes (expected {})", bytes.len(), total_size);
 
-    // Finding #2: Verify SHA-256 checksum — hard failure on mismatch
+    // Verify SHA-256 checksum — hard failure on mismatch
     verify_checksum(client, release, platform, &bytes).await?;
 
     // Extract tarball
@@ -67,7 +67,7 @@ pub async fn install_node(
         .parent()
         .ok_or_else(|| LpmError::Script("invalid runtime path".into()))?;
 
-    // Finding #4: Create parent directory with restricted permissions
+    // Create parent directory with restricted permissions
     create_restricted_dir(parent)?;
 
     // Extract to a temp dir first, then rename (atomic)
@@ -77,7 +77,7 @@ pub async fn install_node(
     }
     create_restricted_dir(&temp_dir)?;
 
-    // Finding #14: Windows uses .zip, others use .tar.gz
+    // Windows uses .zip, others use .tar.gz
     if platform.os == "win" {
         extract_zip(&bytes, &temp_dir)?;
     } else {
@@ -88,7 +88,7 @@ pub async fn install_node(
     // We need to move its contents to the final location.
     let inner_dir = find_single_subdir(&temp_dir)?;
 
-    // Finding #6: Rename with TOCTOU race recovery
+    // Rename with TOCTOU race recovery
     rename_with_fallback(&inner_dir, &target_dir)?;
 
     // Clean up temp dir
@@ -288,7 +288,7 @@ pub(crate) fn write_restricted_file(path: &Path, data: &[u8]) -> Result<(), LpmE
 /// If the rename fails because the target already exists (another process
 /// installed the same version concurrently), this is treated as success.
 ///
-/// # Finding #22: Cross-filesystem rename
+/// Cross-filesystem rename
 ///
 /// `std::fs::rename()` fails with `EXDEV` across filesystem boundaries.
 /// This is currently safe because the temp dir is always a sibling of the
@@ -377,7 +377,7 @@ mod tests {
     use std::io::Write;
     use tempfile::TempDir;
 
-    // --- Finding #1: Tar path traversal (zip slip) ---
+    // --- Tar path traversal (zip slip) ---
 
     /// Helper: build a tar.gz in memory with the given entry paths.
     ///
@@ -511,7 +511,7 @@ mod tests {
         assert!(dest.path().join("mydir/sub/deep.txt").exists());
     }
 
-    // --- Finding #2: Checksum failure must be fatal ---
+    // --- Checksum failure must be fatal ---
 
     #[test]
     fn compare_checksum_matching() {
@@ -539,7 +539,7 @@ mod tests {
         }
     }
 
-    // --- Finding #3: Download size limit ---
+    // --- Download size limit ---
 
     #[test]
     fn validate_download_size_within_limit() {
@@ -556,7 +556,7 @@ mod tests {
         assert!(err_msg.contains("exceeds maximum"), "got: {err_msg}");
     }
 
-    // --- Finding #4: Directory and file permissions ---
+    // --- Directory and file permissions ---
 
     #[cfg(unix)]
     #[test]
@@ -580,7 +580,7 @@ mod tests {
         assert_eq!(mode, 0o600, "file should be 0o600, got {mode:o}");
     }
 
-    // --- Finding #6: TOCTOU race — recovery when target already exists ---
+    // --- TOCTOU race — recovery when target already exists ---
 
     #[test]
     fn rename_recovery_when_target_exists() {

@@ -1,4 +1,4 @@
-//! Phase 37 M5 — `~/.lpm/global/trusted-dependencies.json` storage.
+//! `~/.lpm/global/trusted-dependencies.json` storage.
 //!
 //! Parallels the project-level `package.json :: lpm.trustedDependencies`
 //! for globally-installed packages. Where a project's trust list lives
@@ -39,7 +39,7 @@
 //!
 //! ## Why keyed by `name@version` not `name`
 //!
-//! Phase 4's strict binding: trust is bound to a specific integrity +
+//! Trust is bound to a specific integrity +
 //! script-hash of a specific version. Approving `esbuild@0.20.2`
 //! doesn't automatically trust `esbuild@0.25.1` — the install pipeline
 //! blocks the new version on the expected "re-review" path. Matches
@@ -84,7 +84,7 @@ pub struct TrustedDependencyBinding {
     )]
     pub script_hash: Option<String>,
     /// Snapshot of the publisher identity tuple captured at the moment
-    /// this binding was approved (Phase 68 P4-parity addition). The
+    /// this binding was approved. The
     /// install-time drift gate compares this against the candidate
     /// version's freshly-fetched provenance to detect publisher drift
     /// across the approval boundary. `None` means the binding pre-dates
@@ -93,7 +93,7 @@ pub struct TrustedDependencyBinding {
     /// and the other strict-gate dimensions still fire on their own.
     ///
     /// Non-breaking via `#[serde(default, skip_serializing_if)]`:
-    /// pre-Phase-68 entries on disk round-trip unchanged.
+    /// Older entries on disk that pre-date this field round-trip unchanged.
     #[serde(
         default,
         rename = "provenanceAtApproval",
@@ -197,7 +197,7 @@ impl GlobalTrustedDependencies {
     /// user choice — the strict query degrades to drift-detection for
     /// any missing field pair.
     ///
-    /// **Phase 68:** kept as the legacy two-field shortcut for tests
+    /// Legacy two-field shortcut for tests
     /// and any caller that genuinely doesn't want to capture provenance.
     /// Production `--global` write paths should use [`Self::insert_binding`]
     /// to persist a richer binding (including `provenance_at_approval`).
@@ -256,7 +256,7 @@ pub fn read_for(root: &LpmRoot) -> Result<GlobalTrustedDependencies, LpmError> {
 /// recovery paths that read from a non-default location (e.g. a
 /// backup file during a migration).
 pub fn read_at(path: &Path) -> Result<GlobalTrustedDependencies, LpmError> {
-    // Phase 37 M0 (rev 6): Windows long-path support — no-op on POSIX.
+    // Windows long-path support — no-op on POSIX.
     let path = lpm_common::as_extended_path(path);
     let path = path.as_path();
     match fs::read(path) {
@@ -294,7 +294,7 @@ pub fn write_for(root: &LpmRoot, value: &GlobalTrustedDependencies) -> Result<()
 }
 
 pub fn write_at(path: &Path, value: &GlobalTrustedDependencies) -> Result<(), LpmError> {
-    // Phase 37 M0 (rev 6): Windows long-path support — no-op on POSIX.
+    // Windows long-path support — no-op on POSIX.
     let path = lpm_common::as_extended_path(path);
     let path = path.as_path();
     if let Some(parent) = path.parent() {
@@ -451,7 +451,7 @@ mod tests {
     }
 
     /// Version-specific trust: approving 0.25.1 does NOT implicitly
-    /// trust 0.25.2. Pins the Phase 4 version-bound trust model for
+    /// trust 0.25.2. Pins the version-bound trust model for
     /// the global analogue.
     #[test]
     fn matches_strict_version_bound_does_not_leak_across_versions() {
@@ -462,7 +462,7 @@ mod tests {
     }
 
     /// Missing stored integrity counts as drift against a queried
-    /// present value. The pre-Phase-4-schema-aware approval case: we
+    /// present value. The pre-schema-aware approval case: we
     /// had no SRI at approve time, but the install pipeline now has
     /// one. Surfaced as drift so the user can re-approve with the
     /// richer binding.
@@ -565,7 +565,7 @@ mod tests {
         assert_eq!(a, b);
     }
 
-    // ── Phase 68: provenance_at_approval round-trip + insert_binding ──
+    // ── provenance_at_approval round-trip + insert_binding ──
 
     /// A binding with a full provenance snapshot must round-trip
     /// through the on-disk JSON unchanged. Drives the drift gate via

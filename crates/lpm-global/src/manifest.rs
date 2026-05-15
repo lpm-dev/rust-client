@@ -1,7 +1,7 @@
 //! `~/.lpm/global/manifest.toml` — schema, atomic read/write.
 //!
 //! The manifest is the authoritative record of every globally-installed
-//! package on a host. Phase 37 introduces three top-level tables besides
+//! package on a host. Three top-level tables exist besides
 //! the schema version field:
 //!
 //! - `[packages.<name>]` — currently active installations. One row per
@@ -27,7 +27,7 @@
 //! file. POSIX rename is atomic on the same filesystem; on Windows the
 //! `MoveFileEx`-backed `std::fs::rename` is functionally equivalent for
 //! this size of file. **Callers are responsible for serialising
-//! manifest mutations through the global `.tx.lock`** (see plan §M3).
+//! manifest mutations through the global `.tx.lock`** (.tx.lock must serialize all mutations).
 //! `write_manifest` itself only guarantees that observers always see a
 //! complete manifest, never a half-written one.
 //!
@@ -94,7 +94,7 @@ impl Default for GlobalManifest {
 /// using exactly the same precedence as `lpm install` in a project.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PackageEntry {
-    /// Phase 33 `spec_to_write` output. Stored verbatim. Examples:
+    /// `spec_to_write` output. Stored verbatim. Examples:
     /// `"^9"`, `"~5.8"`, `"14.2.0"`, `"*"`.
     pub saved_spec: String,
     /// Resolved version installed at this row's creation time.
@@ -168,7 +168,7 @@ pub enum PackageSource {
 /// running an older `lpm` against a newer manifest should be told to
 /// upgrade rather than corrupt their state.
 pub fn read_manifest(path: &Path) -> Result<GlobalManifest, LpmError> {
-    // Phase 37 M0 (rev 6): Windows long-path support — no-op on POSIX.
+    // Windows long-path support — no-op on POSIX.
     let path = as_extended_path(path);
     let bytes = match std::fs::read(&path) {
         Ok(b) => b,
@@ -204,7 +204,7 @@ pub fn read_for(root: &LpmRoot) -> Result<GlobalManifest, LpmError> {
 /// function only guarantees that observers see either the old or new
 /// manifest, never a partial.
 pub fn write_manifest(path: &Path, manifest: &GlobalManifest) -> Result<(), LpmError> {
-    // Phase 37 M0 (rev 6): Windows long-path support — no-op on POSIX.
+    // Windows long-path support — no-op on POSIX.
     let path = as_extended_path(path);
     let parent = path
         .parent()

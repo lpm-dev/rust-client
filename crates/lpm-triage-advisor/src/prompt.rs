@@ -93,15 +93,14 @@ pub fn build_prompt(script: &AmberScript<'_>) -> String {
 pub(crate) fn build_prompt_with_nonce(script: &AmberScript<'_>, nonce: &str) -> String {
     let begin = format!("<<UNTRUSTED-SCRIPT-BEGIN-{nonce}>>");
     let end = format!("<<UNTRUSTED-SCRIPT-END-{nonce}>>");
-    // Phase 46b Lever #1 — `Repository:` is emitted ONLY when the
-    // manifest carries a non-empty repository URL. Omitting the
-    // line when the field is missing avoids artificially anchoring
-    // the model on absence; absent-by-default is the existing
-    // pre-Lever behaviour. The cache key still distinguishes
-    // Some vs None separately (see `l4_cache::build_cache_key`),
-    // so a future manifest that ADDS a repository field gets a
-    // fresh classification rather than the cached "no-repo"
-    // verdict.
+    // `Repository:` is emitted ONLY when the manifest carries a
+    // non-empty repository URL. Omitting the line when the field is
+    // missing avoids artificially anchoring the model on absence;
+    // absent-by-default is the safer default. The cache key still
+    // distinguishes Some vs None separately (see
+    // `l4_cache::build_cache_key`), so a future manifest that ADDS
+    // a repository field gets a fresh classification rather than the
+    // cached "no-repo" verdict.
     //
     // Repository identity is treated as UNTRUSTED — a malicious
     // maintainer can lie about it — but pairing it with the
@@ -113,11 +112,10 @@ pub(crate) fn build_prompt_with_nonce(script: &AmberScript<'_>, nonce: &str) -> 
         _ => String::new(),
     };
 
-    // Phase 46b Lever #3 — embed the contents of files the script
-    // body delegates to. Each file gets its OWN per-file random
-    // nonce so an attacker who edits one file's content can't
-    // break out of another file's data section (defense in depth
-    // over the top-level body's nonce).
+    // Embed the contents of files the script body delegates to.
+    // Each file gets its OWN per-file random nonce so an attacker
+    // who edits one file's content can't break out of another file's
+    // data section (defense in depth over the top-level body's nonce).
     let referenced_files_section = render_referenced_files_section(script.referenced_scripts);
     format!(
         "You are reviewing a single npm package lifecycle script for safety.\n\
@@ -254,12 +252,11 @@ pub(crate) fn build_prompt_with_nonce(script: &AmberScript<'_>, nonce: &str) -> 
     )
 }
 
-/// Phase 46b Lever #3 — render the "Referenced files" section. Each
-/// file gets its own per-file nonced fence so an attacker who edits
-/// one file's content cannot break out of another file's data
-/// section. Returns an empty string when the slice is empty (the
-/// prompt template's `{referenced_files_section}` slot is then a
-/// no-op).
+/// Render the "Referenced files" section. Each file gets its own
+/// per-file nonced fence so an attacker who edits one file's content
+/// cannot break out of another file's data section. Returns an empty
+/// string when the slice is empty (the prompt template's
+/// `{referenced_files_section}` slot is then a no-op).
 ///
 /// The trailing `\n         ` indent matches the surrounding prompt
 /// template's indentation so the rendered prompt reads cleanly
@@ -418,18 +415,11 @@ mod tests {
 
     #[test]
     fn prompt_describes_legitimate_downloader_patterns_for_approve() {
-        // Phase 46.2 prompt calibration (2026-05-11): the pre-
-        // calibration prompt put ANY network fetch in MANUAL, which
-        // pushed legitimate platform-binary downloaders (sharp
-        // pulling libvips, prisma pulling its query engine,
-        // browser-automation pulling chromium, ML libs pulling
-        // tensor backends, CLI wrappers pulling their compiled
-        // binary from their own GitHub Releases) to Manual on ~9/10
-        // amber calls. The calibrated prompt distinguishes
-        // legitimate-downloader patterns (fetch from infrastructure
-        // identifying the artifact as a release of THIS package)
-        // from malware-loader patterns (curl|sh, eval, nested
-        // pkg-install of arbitrary names, dynamic URL construction).
+        // The prompt distinguishes legitimate-downloader patterns
+        // (fetch from infrastructure identifying the artifact as a
+        // release of THIS package) from malware-loader patterns
+        // (curl|sh, eval, nested pkg-install of arbitrary names,
+        // dynamic URL construction).
         //
         // This test pins the load-bearing safety axis — "fetch
         // identity" — so a future prompt rewrite that drops it
@@ -594,7 +584,7 @@ mod tests {
         );
     }
 
-    // ── Phase 46b Lever #1 — repository URL plumbing ──────────────
+    // ── Repository URL plumbing ────────────────────────────────────
 
     #[test]
     fn prompt_emits_repository_line_when_some() {
@@ -703,7 +693,7 @@ mod tests {
         );
     }
 
-    // ── Phase 46b Lever #3 — referenced files embedding ──────────
+    // ── Referenced files embedding ─────────────────────────────────
 
     #[test]
     fn prompt_omits_referenced_files_section_when_empty() {

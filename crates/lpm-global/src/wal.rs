@@ -1,10 +1,10 @@
-//! Phase 37 — write-ahead log for global-install transactions.
+//! Write-ahead log for global-install transactions.
 //!
 //! The WAL records every state transition the install pipeline performs
 //! against `~/.lpm/global/` so a `kill -9` mid-install can recover
 //! deterministically on the next `lpm` invocation. M2 ships the
 //! framing/storage layer; M3 wires it into the actual transaction flow
-//! (see plan §"Crash-safe transactions").
+//! (the WAL + recovery layer enforces crash-safe transactions).
 //!
 //! ## Why framed records, not plain JSONL
 //!
@@ -137,7 +137,7 @@ pub struct IntentPayload {
     /// startup after upgrade.
     #[serde(default)]
     pub new_aliases_json: serde_json::Value,
-    /// Phase 37 M4.2: explicit, typed list of ownership mutations this
+    /// Explicit, typed list of ownership mutations this
     /// transaction will apply. Recovery replays this list directly
     /// rather than diff-deriving from pre/post manifest states — per
     /// the M4 audit, diff-based reconstruction is fragile and the
@@ -263,7 +263,7 @@ impl WalWriter {
     /// writes. Creates the parent directory if missing.
     pub fn open(path: impl Into<PathBuf>) -> Result<Self, WalError> {
         let path = path.into();
-        // Phase 37 M0 (rev 6): Windows long-path support. The WAL lives
+        // Windows long-path support. The WAL lives
         // under `~/.lpm/global/` which is shallow, but `$LPM_HOME` may
         // be deeply nested on hostile-prefix Windows installs, so route
         // through `as_extended_path` for consistency. No-op on POSIX.

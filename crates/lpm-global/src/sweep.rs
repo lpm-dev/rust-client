@@ -254,7 +254,7 @@ fn validated_tombstone_path(global_root: &Path, relative_path: &str) -> Result<P
         }
     }
 
-    // Phase 37 install-root tombstones are exactly `installs/<name>@<version>`.
+    // Tombstones are exactly `installs/<name>@<version>`.
     // Two segments. First is literally "installs". Second has an `@`.
     // ANYTHING else (single segment like "." or "installs", three+
     // segments like "installs/foo/extra", different prefix) is suspect.

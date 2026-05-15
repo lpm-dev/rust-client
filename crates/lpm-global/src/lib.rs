@@ -1,4 +1,4 @@
-//! Phase 37 — global install state for `~/.lpm/global/`.
+//! Global install state for `~/.lpm/global/`.
 //!
 //! This crate owns the on-disk shape of every machine-global file that
 //! the install -g / uninstall -g / approve-scripts --global / global *

@@ -537,7 +537,7 @@ mod tests {
         );
     }
 
-    // Finding #5: Version spec validation
+    // Version spec validation
     #[test]
     fn validate_version_spec_valid() {
         assert!(validate_version_spec("22").is_ok());
@@ -561,7 +561,7 @@ mod tests {
         assert!(validate_version_spec("22`id`").is_err());
     }
 
-    // Finding #7: find_matching_installed must return highest, not first
+    // find_matching_installed must return highest, not first
     #[test]
     fn find_matching_installed_returns_highest_not_first() {
         let installed = vec![
@@ -576,7 +576,7 @@ mod tests {
         );
     }
 
-    // Finding #15: compare_versions using lpm_semver
+    // compare_versions using lpm_semver
     #[test]
     fn compare_versions_correctness() {
         use std::cmp::Ordering;
