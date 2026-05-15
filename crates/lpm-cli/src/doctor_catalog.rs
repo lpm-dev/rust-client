@@ -1165,7 +1165,7 @@ pub static SANDBOX_AVAILABLE: CheckEntry = CheckEntry {
     code: "sandbox_available",
     name: "Sandbox",
     category: Category::Sandbox,
-    description: "The OS sandbox backend used by lifecycle scripts is available. Phase 46.1 rework (2026-05-11): the default posture is filesystem-write containment + env scrubbing; outbound network denial is the opt-in `strict` mode (full denial on macOS Seatbelt; TCP-only via landlock V4 on Linux until Phase 46.1.1's seccomp-bpf layer closes the UDP / raw / DNS gap).",
+    description: "The OS sandbox backend used by lifecycle scripts is available. Phase 46.1 rework (2026-05-11): the default posture is filesystem-write containment + env scrubbing; outbound network denial is the opt-in `strict` mode. Strict-mode coverage is platform-asymmetric: full denial on macOS Seatbelt (every socket family); on Linux, landlock V4 covers outbound TCP and the Phase 46.1.1 seccomp-bpf layer covers direct UDP / raw / AF_PACKET / AF_NETLINK socket() — AF_UNIX intentionally allowed for legitimate IPC.",
     when_fires: "Seatbelt (macOS) or Landlock (Linux) is reachable on this host. Phase 46.1 strict-mode outbound network denial engages only when the user has opted in via `--strict-sandbox` / `--paranoid`, `[sandbox] mode = \"strict\"`, or `LPM_STRICT_SANDBOX=1`.",
     remediation: "No action — informational pass.",
     possible_severities: &[Severity::Pass],

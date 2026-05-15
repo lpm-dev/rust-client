@@ -266,34 +266,37 @@ boolean (true when stderr contains `EAI_AGAIN` / `EAI_NODATA` /
 The summary aggregates this into a separate `dns_failure_observed`
 count, **deliberately not folded into `denied_in_sandbox`**.
 
-**Why it's a separate axis.** Phase 46.1's shipped contract on
-Linux is "outbound TCP denied" (see
+**Why it's a separate axis.** Phase 46.1 + 46.1.1's combined
+contract on Linux is "outbound TCP via landlock + direct UDP /
+raw / AF_PACKET / AF_NETLINK via seccomp" (see
 [`crates/lpm-sandbox/src/lib.rs`](../../crates/lpm-sandbox/src/lib.rs)
-module doc and the
-[Phase 46.1.1 follow-up](../../DOCS/new-features/37-rust-client-RUNNER-VISION-phase46.1.1-seccomp-udp-denial.md)
-that ships UDP / DNS-via-UDP denial via seccomp-bpf). DNS lookups
-in the Phase 46.1 sandbox may or may not fail, depending on the
-host resolver stack:
+module doc + [`crates/lpm-sandbox/src/seccomp.rs`](../../crates/lpm-sandbox/src/seccomp.rs)
+for the deny matrix). Phase 46.1.1's seccomp layer narrows the
+DNS-failure variance window — direct `socket(AF_INET,
+SOCK_DGRAM)` now fails deterministically — but doesn't close it
+for resolver-mediated lookups. DNS via `getaddrinfo` still has
+host-dependent behavior:
 
 - A glibc resolver that falls back to TCP-port-53 for AAAA records,
   truncated UDP responses, or DNSSEC validation will hit landlock
   V4's `ConnectTcp`-deny and surface `EAI_AGAIN`.
-- A glibc resolver that successfully uses UDP throughout (the
-  expected common case) will resolve DNS cleanly under Phase 46.1
-  alone; the subsequent TCP `connect(2)` is what gets denied.
+- A glibc resolver whose NSS modules route through AF_UNIX (which
+  the Phase 46.1.1 seccomp filter intentionally allows for
+  legitimate IPC) may succeed or fail depending on the NSS
+  back-end.
 - Musl, network-namespace setups, alternative resolvers (`unbound`,
   `dnsmasq`, etc.), and host-specific NSS configurations all behave
   differently.
 
 So **`dns_failure_seen` is a host-dependent observation, not a
 contract claim.** Treating it as the same axis as `denial_signal_seen`
-would (a) overstate the product contract by implying Phase 46.1
-already seals external DNS — it doesn't, that's 46.1.1's job; (b)
-misbucket ordinary resolver failures (a flaky DNS server, an
-unreachable nscd, a real network outage) as sandbox denials. The
-PR write-up should use `dns_failure_observed` to identify
-candidate packages for case-by-case re-classification, but should
-not claim the count as Phase 46.1's measured impact.
+would (a) overstate the contract by implying full DNS denial —
+Phase 46.1.1 narrows variance but doesn't seal resolver-mediated
+lookups; (b) misbucket ordinary resolver failures (a flaky DNS
+server, an unreachable nscd, a real network outage) as sandbox
+denials. The PR write-up should use `dns_failure_observed` to
+identify candidate packages for case-by-case re-classification,
+but should not claim the count as Phase 46.1.1's measured impact.
 
 ## Not committed to the repo
 
