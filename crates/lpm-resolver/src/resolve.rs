@@ -28,13 +28,13 @@ pub struct ResolvedPackage {
     /// `dep_name_in_parent` is the LOCAL name used in THIS package's
     /// `dependencies` / `optionalDependencies` map. For non-aliased
     /// deps this equals the child's canonical registry name; for
-    /// Phase 40 P2 npm-alias deps (e.g., `"strip-ansi-cjs": "npm:strip-ansi@^6"`)
+    /// npm-alias deps (e.g., `"strip-ansi-cjs": "npm:strip-ansi@^6"`)
     /// it is the alias key, and the `aliases` map below records the
     /// alias's canonical target name. Keeping the local name as the
     /// edge key means the linker can build `node_modules/<local>/`
     /// directly from the edge without a second lookup.
     pub dependencies: Vec<(String, String)>,
-    /// **Phase 40 P2** — npm-alias edges. Key = `dep_name_in_parent`
+    /// npm-alias edges. Key = `dep_name_in_parent`
     /// from the `dependencies` vec; value = target canonical package
     /// name (what to fetch from the registry + how the `.lpm/` store
     /// entry is keyed). Empty for packages that declare no aliased
@@ -53,11 +53,10 @@ pub struct ResolvedPackage {
     /// every declared peer is missing from the install set
     /// (`check_unmet_peers` surfaces those as `PeerWarning`s).
     ///
-    /// **Phase 66 §2.5** — the v2 GraphKey folds these in so two
-    /// projects sharing the same edge graph but different peer
-    /// pinning produce distinct keys. Without this field, v2's
-    /// `links/<key>/` entries silently shared across peer-divergent
-    /// installs.
+    /// The v2 GraphKey folds these in so two projects sharing the
+    /// same edge graph but different peer pinning produce distinct
+    /// keys. Without this field, v2's `links/<key>/` entries silently
+    /// shared across peer-divergent installs.
     pub peers: Vec<(String, String)>,
     /// Tarball download URL from registry metadata.
     /// Carried from resolution → download to avoid re-fetching metadata.
@@ -83,49 +82,45 @@ type PubGrubResult = Result<
 ///
 /// The cache is returned so callers can run post-resolution checks
 /// (e.g., `check_unmet_peers`) against the actual resolved tree. The
-/// `applied_overrides` vec is the Phase 32 Phase 5 apply trace — every
-/// override the resolver honored, in `(package, raw_key)` order.
+/// `applied_overrides` vec is the override apply trace — every override
+/// the resolver honored, in `(package, raw_key)` order.
 pub struct ResolveResult {
     /// Resolved packages with dependency edges.
     pub packages: Vec<ResolvedPackage>,
     /// Metadata cache from resolution. Contains peer_deps, platform info, etc.
     /// Used by `check_unmet_peers()` for post-resolution peer checking.
     ///
-    /// Phase 53 audit-flag A3 — values are `Arc<CachedPackageInfo>` so
-    /// the resolver's end-of-resolve materialization is an `Arc::clone`
-    /// per entry (refcount bump) rather than a deep-clone of seven
-    /// nested HashMaps. Pre-A3 fixture-large saw ~248 × ~30 KB = ~7.4
-    /// MB of allocator churn here, hidden inside `pubgrub_ms`.
-    /// Consumers that need an owned `CachedPackageInfo` can `(*arc).clone()`
-    /// at their use site; everything in the codebase today reads
-    /// fields through `&Arc<CachedPackageInfo>` (auto-deref) and never
-    /// needs the unwrap.
+    /// Values are `Arc<CachedPackageInfo>` so the resolver's
+    /// end-of-resolve materialization is an `Arc::clone` per entry
+    /// (refcount bump) rather than a deep-clone of seven nested
+    /// HashMaps. Consumers that need an owned `CachedPackageInfo` can
+    /// `(*arc).clone()` at their use site; everything in the codebase
+    /// today reads fields through `&Arc<CachedPackageInfo>` (auto-deref).
     pub cache: HashMap<CanonicalKey, std::sync::Arc<CachedPackageInfo>>,
-    /// **Phase 32 Phase 5** — override apply trace. Empty when no
+    /// Override apply trace. Empty when no
     /// `lpm.overrides` / `overrides` / `resolutions` were declared OR
     /// when none of them matched any resolved package. Sorted by
     /// `(package, raw_key)` for deterministic output.
     pub applied_overrides: Vec<OverrideHit>,
-    /// **Phase 40 P1** — count of optional deps skipped because no
-    /// platform-compatible version satisfies the declared range on the
-    /// current OS/CPU. Surfaced in install `--json` output as
-    /// `timing.resolve.platform_skipped` for observability (matches the
-    /// platform-skip shape bun reports via `--dry-run`). Taken from the
-    /// FINAL successful pass — retry passes share the same fixture so
-    /// the count is deterministic.
+    /// Count of optional deps skipped because no platform-compatible
+    /// version satisfies the declared range on the current OS/CPU.
+    /// Surfaced in install `--json` output as
+    /// `timing.resolve.platform_skipped` for observability. Taken from
+    /// the FINAL successful pass — retry passes share the same fixture
+    /// so the count is deterministic.
     pub platform_skipped: usize,
-    /// **Phase 40 P2** — root-level npm-alias edges the resolver saw on
+    /// Root-level npm-alias edges the resolver saw on
     /// the consumer's `package.json` deps. Shape:
     /// `local_name → target_canonical_name`. Empty when no root dep
     /// uses `npm:<target>@<range>` syntax. The install pipeline uses
     /// this to (a) drive root `node_modules/<local>/` symlinks and (b)
     /// persist aliases in the lockfile for deterministic re-install.
     pub root_aliases: HashMap<String, String>,
-    /// **Phase 66 R2.2** — ambient installs synthesized by the eager
-    /// peer-drain pass. Shape: each entry is the canonical name of a
-    /// package the resolver auto-installed because some consumer
-    /// declared it as a required peer that wasn't otherwise in the
-    /// resolved tree. Sorted alphabetically for deterministic output.
+    /// Ambient installs synthesized by the eager peer-drain pass.
+    /// Shape: each entry is the canonical name of a package the
+    /// resolver auto-installed because some consumer declared it as a
+    /// required peer that wasn't otherwise in the resolved tree.
+    /// Sorted alphabetically for deterministic output.
     ///
     /// Why this exists as a separate field: the install pipeline's
     /// `resolved_to_install_packages` derives "is this a top-level
@@ -134,26 +129,25 @@ pub struct ResolveResult {
     /// `package.json` — it was synthesized at resolve-time — so
     /// without this field the install pipeline would extract the
     /// package into the store but never surface it at
-    /// `node_modules/<name>/`, defeating the whole R2.2 contract.
-    /// Install-side merges this set with `pkg.dependencies` when
-    /// computing top-level link names + direct-dep flags.
+    /// `node_modules/<name>/`. Install-side merges this set with
+    /// `pkg.dependencies` when computing top-level link names +
+    /// direct-dep flags.
     ///
     /// Empty when no peers needed synthesis OR when
     /// `auto_install_peers` was false.
     pub ambient_peer_installs: Vec<String>,
-    /// **Phase 66 confidence-followup §1a** — best-effort peer-conflict
-    /// reports. Each entry is one peer canonical whose required
-    /// consumer ranges were pairwise-incompatible: lpm picked the
-    /// version satisfying the most consumers and recorded the
-    /// unsatisfied ones here. Mirrors npm v7+ / pnpm hoisted-mode
-    /// behavior — pick one peer top-level, warn the rest. The
-    /// install pipeline prints a single warning block per entry
-    /// after the install summary.
+    /// Best-effort peer-conflict reports. Each entry is one peer
+    /// canonical whose required consumer ranges were pairwise-
+    /// incompatible: lpm picked the version satisfying the most
+    /// consumers and recorded the unsatisfied ones here. Mirrors npm
+    /// v7+ / pnpm hoisted-mode behavior — pick one peer top-level,
+    /// warn the rest. The install pipeline prints a single warning
+    /// block per entry after the install summary.
     ///
     /// Sorted alphabetically by `canonical` for deterministic warning
     /// order. Empty when the resolved peer graph is clean.
     pub peer_conflicts: Vec<crate::greedy::PeerConflictReport>,
-    /// **Phase 40 P3a** — substage breakdown of cold-resolve wall-clock.
+    /// Substage breakdown of cold-resolve wall-clock.
     /// Observability-only; the fields and their overlap contract are
     /// documented on [`StageTiming`].
     pub stage_timing: StageTiming,
@@ -172,7 +166,7 @@ pub struct ResolveResult {
 /// Field contract:
 /// - `followup_rpc_ms` + `followup_rpc_count` are the follow-up
 ///   metadata fetches fired from inside the provider's callbacks
-///   (the Phase 40 P3b/P3c lever). On a fully-cached warm install
+///   (follow-up depth/fanout lever). On a fully-cached warm install
 ///   they're both zero; on a cold install with a shallow worker
 ///   deep-walk they dominate `resolve_ms`.
 /// - `parse_ndjson_ms` is serde_json CPU time for follow-up batches
@@ -192,12 +186,10 @@ pub struct StageTiming {
     pub followup_rpc_ms: u64,
     /// Total number of metadata RPCs that went to the network during
     /// this resolve pass. Equals
-    /// `walker_rpc_count + escape_hatch_rpc_count`. Pre-Phase-53 A1
-    /// this field conflated walker fetches and provider escape-hatch
-    /// fetches, making it impossible to tell whether a high count
-    /// meant "walker did its job" or "walker missed and escape-hatch
-    /// picked up the slack." Now the two are reported separately on
-    /// `walker_rpc_count` / `escape_hatch_rpc_count` below; this
+    /// `walker_rpc_count + escape_hatch_rpc_count`. Previously this
+    /// field conflated walker fetches and provider escape-hatch
+    /// fetches; now the two are reported separately on
+    /// `walker_rpc_count` / `escape_hatch_rpc_count` below. This
     /// total stays for backward compatibility with `--json` consumers.
     pub followup_rpc_count: u32,
     /// NDJSON deserialization CPU time for follow-up batches. Grows
@@ -211,29 +203,25 @@ pub struct StageTiming {
     /// the happy path (no retries) this equals the resolver's
     /// total work.
     pub pubgrub_ms: u64,
-    /// Phase 53 A1 — number of metadata RPCs the walker fired.
-    /// Each parallel-fetch per-package GET counts once; each
-    /// `batch_metadata` call counts once regardless of name count.
-    /// High walker_rpc + low escape_hatch = walker working well.
-    /// Low walker_rpc + high escape_hatch = walker depth/fanout
-    /// undersized; bump deep-walk depth (P3b) or fanout.
+    /// Number of metadata RPCs the walker fired. Each parallel-fetch
+    /// per-package GET counts once; each `batch_metadata` call counts
+    /// once regardless of name count. High walker_rpc + low
+    /// escape_hatch = walker working well. Low walker_rpc + high
+    /// escape_hatch = walker depth/fanout undersized.
     ///
-    /// **Phase 56:** Zero under the fused dispatcher
-    /// (`LPM_GREEDY_FUSION=1`) since the walker is bypassed entirely.
-    /// Use `dispatcher_rpc_count` instead for the fusion arm. Field is
-    /// retained for one release for backward compatibility with
-    /// `--json` consumers; removed in W5 alongside the walker.
+    /// Zero under the fused dispatcher (`LPM_GREEDY_FUSION=1`) since
+    /// the walker is bypassed entirely. Use `dispatcher_rpc_count`
+    /// instead for the fusion arm.
     pub walker_rpc_count: u32,
-    /// Phase 53 A1 — number of metadata RPCs the provider's escape
-    /// hatch fired (manifests not produced by the walker before
+    /// Number of metadata RPCs the provider's escape hatch fired
+    /// (manifests not produced by the walker before
     /// `fetch_wait_timeout` expired). The actionable signal — see
     /// `walker_rpc_count` for tuning levers.
     ///
-    /// **Phase 56:** Zero under the fused dispatcher — there is no
-    /// escape-hatch path because there is no walker to be missed.
-    /// Removed in W5.
+    /// Zero under the fused dispatcher — there is no escape-hatch
+    /// path because there is no walker to be missed.
     pub escape_hatch_rpc_count: u32,
-    /// Phase 56 — total metadata RPCs the fused dispatcher fired
+    /// Total metadata RPCs the fused dispatcher fired
     /// during this resolve pass. Replaces
     /// `walker_rpc_count + escape_hatch_rpc_count` under fusion: each
     /// per-canonical fetch counts once whether driven by a root edge
@@ -242,15 +230,15 @@ pub struct StageTiming {
     /// escape_hatch_rpc_count` (modulo arm) is a sanity check on the
     /// instrumentation.
     pub dispatcher_rpc_count: u64,
-    /// Phase 56 — peak `metadata_jobs.len()` observed at any
-    /// Phase A→C transition of the fused dispatcher loop. Confirms
-    /// the metadata semaphore (256) is the binding constraint when
+    /// Peak `metadata_jobs.len()` observed at any Phase A→C
+    /// transition of the fused dispatcher loop. Confirms the metadata
+    /// semaphore (256) is the binding constraint when
     /// this approaches its cap; if it sits well below, the binding
     /// constraint is something upstream (h2 single-connection flow
     /// control, h1-pool socket count, or a serialization in
     /// `process_edge`).
     pub dispatcher_inflight_high_water: u64,
-    /// Phase 56 — `max(parked.values().map(|v| v.len()))` over the
+    /// `max(parked.values().map(|v| v.len()))` over the
     /// life of the fused dispatcher loop. Catches pathological
     /// parking — e.g., every edge in the tree blocked on one slow
     /// canonical's manifest. Healthy values are O(distinct version
@@ -258,42 +246,36 @@ pub struct StageTiming {
     /// reading in the hundreds is a signal the registry is stalling
     /// on one specific package.
     pub parked_max_depth: u32,
-    /// Phase 56 — count of speculative tarball downloads dispatched
+    /// Count of speculative tarball downloads dispatched
     /// from inside `process_edge_with_tarball_dispatch`. Parity with
     /// the pre-fusion `SpeculativeStats.spawned` metric. Zero on the
     /// walker arm (where speculation runs through the separate
     /// `spawn_speculation_dispatcher` instead).
     pub tarball_dispatched_count: u64,
-    /// **Phase 66 R2.4** — count of speculative peer-manifest fetches
-    /// the fused dispatcher dispatched concurrent with the regular
-    /// dep walk. Each prefetch corresponds to one `peerDependencies`
-    /// requirement that (at the moment Phase A drained) was:
-    /// non-optional, not yet satisfied by the resolved tree, not yet
-    /// in the shared cache, and not yet in flight from a sibling
-    /// dispatch.
+    /// Count of speculative peer-manifest fetches the fused dispatcher
+    /// dispatched concurrent with the regular dep walk. Each prefetch
+    /// corresponds to one `peerDependencies` requirement that (at the
+    /// moment Phase A drained) was: non-optional, not yet satisfied
+    /// by the resolved tree, not yet in the shared cache, and not yet
+    /// in flight from a sibling dispatch.
     ///
     /// **What this counter means observability-wise:**
     /// - `0` — no required peers were missing at any point during the
-    ///   resolve, OR `auto_install_peers` was off. Either way, R2.4
-    ///   did no work and the resolver behaves identically to R2.2.
-    /// - `> 0` — peer fetches that R2.2 would have run SERIALLY in
-    ///   the post-loop drain pass instead ran concurrently with the
+    ///   resolve, OR `auto_install_peers` was off.
+    /// - `> 0` — peer fetches that would have run SERIALLY in the
+    ///   post-loop drain pass instead ran concurrently with the
     ///   regular dep dispatch. Each prefetch saves one network
-    ///   round-trip from the critical path; the wall-clock saving
-    ///   is approximately `count × (single-fetch RTT)` minus any
-    ///   overlap with regular deps.
+    ///   round-trip from the critical path.
     /// - The counter MAY be lower than `len(ambient_peer_installs)`:
     ///   a peer canonical that gets pulled in as a regular transitive
-    ///   AFTER the prefetch dispatched (sibling Phase A win) is still
-    ///   counted (we dispatched a fetch); but a peer canonical
-    ///   pulled in as a regular transitive BEFORE the prefetch even
-    ///   evaluated (cache hit at picker time) will NOT bump this
-    ///   counter (no prefetch dispatched, but the peer is still
-    ///   resolved). This is by design — the counter measures
-    ///   "prefetches we issued," not "peers that ultimately landed."
+    ///   AFTER the prefetch dispatched is still counted; but a peer
+    ///   canonical pulled in BEFORE the prefetch evaluated (cache hit
+    ///   at picker time) will NOT bump this counter. The counter
+    ///   measures "prefetches we issued," not "peers that ultimately
+    ///   landed."
     ///
-    /// Zero on the walker arm (R2.4 is fused-only by design — the
-    /// walker arm is the legacy opt-out and not a performance
+    /// Zero on the walker arm (speculative prefetch is fused-only —
+    /// the walker arm is the legacy opt-out and not a performance
     /// target).
     pub peer_prefetch_count: u64,
 }
@@ -311,20 +293,18 @@ pub async fn resolve_dependencies(
     client: Arc<RegistryClient>,
     dependencies: HashMap<String, String>,
 ) -> Result<ResolveResult, ResolveError> {
-    // Phase 66 R2.2 default: bun-parity eager peer auto-install ON.
-    // The convenience wrapper preserves the legacy two-arg signature;
-    // callers that need warn-only semantics use the lower-level
-    // `resolve_with_shared_cache` directly with `auto_install_peers =
-    // false`.
+    // Default: eager peer auto-install ON. Callers that need warn-only
+    // semantics use `resolve_with_shared_cache` directly with
+    // `auto_install_peers = false`.
     resolve_dependencies_with_overrides(client, dependencies, OverrideSet::empty()).await
 }
 
-/// Resolve with the Phase 32 Phase 5 fully-parsed [`OverrideSet`].
+/// Resolve with a fully-parsed [`OverrideSet`].
 ///
 /// **Path-selector wiring.** If the override set declares any path
 /// selectors, the canonical names of their targets are added to the
-/// resolver's split set BEFORE Phase 1 runs. This guarantees that path
-/// selectors work in flat resolution — the resolver doesn't have to
+/// resolver's split set before resolution starts. This guarantees that
+/// path selectors work in flat resolution — the resolver doesn't have to
 /// fall through to split-on-conflict retries for an override to take
 /// effect. Every retry inherits the same set so conflict-driven splits
 /// union with the override-driven ones.
@@ -333,11 +313,10 @@ pub async fn resolve_dependencies_with_overrides(
     dependencies: HashMap<String, String>,
     overrides: OverrideSet,
 ) -> Result<ResolveResult, ResolveError> {
-    // Phase 49: when no walker is wired, the caller gets a fresh empty
-    // shared cache + zero wait-timeout. Behavior matches the pre-49
-    // `resolve_with_prefetch(None)` shape — the provider's
-    // `ensure_cached` wait-loop short-circuits on ZERO timeout and
-    // goes straight to its escape-hatch fetch.
+    // When no walker is wired, the caller gets a fresh empty shared
+    // cache + zero wait-timeout. The provider's `ensure_cached`
+    // wait-loop short-circuits on ZERO timeout and goes straight to
+    // its escape-hatch fetch.
     use crate::provider::WalkerDone;
     use dashmap::DashMap;
     use std::sync::atomic::AtomicBool;
@@ -357,24 +336,22 @@ pub async fn resolve_dependencies_with_overrides(
         Duration::ZERO,
         RouteTable::from_mode_only(RouteMode::Proxy), // preserve pre-49 proxy behavior for callers that bypass install.rs
         StreamingBfsMetrics::new(),
-        true, // R2.2 default: bun-parity auto-install peers ON.
+        true, // default: auto-install peers ON.
     )
     .await
 }
 
-/// Phase 34.5: resolve with optional pre-fetched batch metadata.
-///
-/// Phase 49 entry point: resolve against a shared cache + notify map
-/// concurrently populated by the [`BfsWalker`](crate::BfsWalker). The
-/// provider's wait-loop in `ensure_cached` awaits on the per-canonical
-/// `Notify` for up to `fetch_wait_timeout`; on timeout, its
-/// escape-hatch fetch runs via `route_mode`.
+/// Resolve against a shared cache + notify map concurrently populated
+/// by the [`BfsWalker`](crate::BfsWalker). The provider's wait-loop in
+/// `ensure_cached` awaits on the per-canonical `Notify` for up to
+/// `fetch_wait_timeout`; on timeout, its escape-hatch fetch runs via
+/// `route_mode`.
 ///
 /// Replaces the old `resolve_with_prefetch(..., prefetched: Option<HashMap<..>>)`
 /// shape. `SharedCache` IS the prefetch now — whatever the walker (or
 /// anyone else) has inserted before this function is called is already
 /// visible, and anything still in flight comes in via `Notify`.
-#[allow(clippy::too_many_arguments)] // design-level: this is the Phase 49 entry point's orchestration surface
+#[allow(clippy::too_many_arguments)] // design-level: orchestration surface for the shared-cache resolver entry point
 pub async fn resolve_with_shared_cache(
     client: Arc<RegistryClient>,
     dependencies: HashMap<String, String>,
@@ -387,21 +364,16 @@ pub async fn resolve_with_shared_cache(
     metrics: StreamingBfsMetrics,
     auto_install_peers: bool,
 ) -> Result<ResolveResult, ResolveError> {
-    // **Default flip (post-Phase-60).** Greedy is the default; users
-    // opt out to the legacy PubGrub-with-split-retry resolver via
-    // `LPM_RESOLVER=pubgrub`. The flag dispatches at the public
-    // entry-point (this function) so every caller — install.rs, audit,
-    // tests — switches together.
+    // Greedy is the default; users opt out to the legacy
+    // PubGrub-with-split-retry resolver via `LPM_RESOLVER=pubgrub`.
+    // The flag dispatches at the public entry-point so every caller —
+    // install.rs, audit, tests — switches together.
     //
-    // Note: this function is the LEGACY WALKER ARM. install.rs now
+    // This function is the LEGACY WALKER ARM. install.rs now
     // short-circuits to `resolve_greedy_fused` (the fused dispatcher)
-    // unless `LPM_RESOLVER=pubgrub` or `LPM_GREEDY_FUSION=0` is set,
-    // so this branch is reached only when one of those escape hatches
-    // is engaged. See install.rs `fusion_enabled_local` for the
-    // resolver-dispatch matrix.
-    //
-    // Original intro lives in:
-    //   DOCS/new-features/37-rust-client-RUNNER-VISION-phase53-greedy-resolver-preplan.md
+    // unless `LPM_RESOLVER=pubgrub` or `LPM_GREEDY_FUSION=0` is set.
+    // See install.rs `fusion_enabled_local` for the resolver-dispatch
+    // matrix.
     if std::env::var("LPM_RESOLVER").as_deref() != Ok("pubgrub") {
         return crate::greedy::resolve_greedy(
             client,
@@ -421,17 +393,16 @@ pub async fn resolve_with_shared_cache(
     let _span = tracing::debug_span!("resolve", n_deps = dependencies.len()).entered();
     let rt = Handle::current();
 
-    // Phase 34.4: reset profiling accumulators once before resolution starts.
+    // Reset profiling accumulators once before resolution starts.
     // Counters accumulate across all retry passes so the final summary
     // reflects the total resolver work, not just the last pass.
     crate::profile::reset_all();
 
-    // Phase 40 P3a — reset the registry-side metadata/parse
-    // accumulators so `snapshot()` at the end of this call reports
-    // only work done since entry. Safe to call even when the caller
-    // already warmed the metadata cache via install.rs's initial
-    // batch — THAT phase's contribution is captured separately by
-    // the install-side timer.
+    // Reset the registry-side metadata/parse accumulators so
+    // `snapshot()` at the end of this call reports only work done
+    // since entry. Safe to call even when the caller already warmed
+    // the metadata cache via install.rs's initial batch — that
+    // contribution is captured separately by the install-side timer.
     lpm_registry::timing::reset();
 
     // Pre-compute the split set from path selectors. Empty when no
@@ -440,12 +411,10 @@ pub async fn resolve_with_shared_cache(
     let mut split_packages: HashSet<String> = overrides.split_targets().clone();
     let mut attempt = 0usize;
 
-    // Phase 40 P3a — accumulate pubgrub wall-clock across split-retry
-    // passes. The `spawn_blocking` hosting `pubgrub::resolve()` is
-    // the innermost correct boundary; anything outside (queueing,
-    // Tokio task switching) is background noise that shouldn't
-    // dominate on cold installs but could mislead the P3 breakdown
-    // if lumped in.
+    // Accumulate pubgrub wall-clock across split-retry passes. The
+    // `spawn_blocking` hosting `pubgrub::resolve()` is the innermost
+    // correct boundary; anything outside (queueing, Tokio task
+    // switching) is background noise that shouldn't be lumped in.
     let mut pubgrub_ms_total: u128 = 0;
 
     let final_result = loop {
@@ -455,19 +424,18 @@ pub async fn resolve_with_shared_cache(
         let overrides_for_pass = overrides.clone();
         let split_packages_for_pass = split_packages.clone();
         let route_table_for_pass = route_table.clone();
-        // Phase 49: same Arc shared across retry passes. The walker's
-        // Arc is the same Arc as the provider's Arc on every pass, so
-        // any metadata already fetched (by the walker or the previous
-        // pass's escape-hatch fetches) is immediately visible without
-        // a into_cache/with_cache round-trip.
+        // Same Arc shared across retry passes. The walker's Arc is the
+        // same Arc as the provider's Arc on every pass, so any
+        // metadata already fetched is immediately visible without a
+        // into_cache/with_cache round-trip.
         let shared_cache_for_pass = shared_cache.clone();
         let notify_map_for_pass = notify_map.clone();
-        // Phase 49: same Arc<AtomicBool> across all split-retry passes.
-        // Once the walker has flipped it on pass 1, every subsequent
-        // pass's wait-loop short-circuits the same way.
+        // Same Arc<AtomicBool> across all split-retry passes. Once
+        // the walker flips it, every subsequent pass's wait-loop
+        // short-circuits the same way.
         let walker_done_for_pass = walker_done.clone();
-        // Phase 49 §6: the metrics Arc is the same across passes so
-        // split-retry counts accumulate into the same counter set.
+        // Same metrics Arc across passes so split-retry counts
+        // accumulate into the same counter set.
         let metrics_for_pass = metrics.clone();
 
         let pass_start = std::time::Instant::now();
@@ -499,9 +467,9 @@ pub async fn resolve_with_shared_cache(
         })
         .await
         .map_err(|e| ResolveError::Internal(format!("resolver task panicked: {e}")))?;
-        // Phase 40 P3a — accumulate this pass's pubgrub wall-clock.
-        // Split-retry passes each add to the total, matching how
-        // `metadata_rpc_ms` accumulates at the registry layer.
+        // Accumulate this pass's pubgrub wall-clock. Split-retry
+        // passes each add to the total, matching how `metadata_rpc_ms`
+        // accumulates at the registry layer.
         pubgrub_ms_total = pubgrub_ms_total.saturating_add(pass_start.elapsed().as_millis());
 
         match result {
@@ -509,16 +477,15 @@ pub async fn resolve_with_shared_cache(
                 let (cache, applied_overrides, platform_skipped, root_aliases) =
                     provider.into_parts();
                 let packages = format_solution(solution, &cache);
-                // Phase 40 P3a — snapshot substage counters at the
-                // tail of the happy path. The registry-side atomics
-                // were reset at the top of this call, so they now
-                // reflect only follow-up RPCs (the walker's metadata-
-                // producer window is running concurrently and its own
-                // measurement is surfaced separately by install.rs).
+                // Snapshot substage counters at the tail of the happy
+                // path. The registry-side atomics were reset at the
+                // top of this call, so they now reflect only follow-up
+                // RPCs (the walker's measurement is surfaced separately
+                // by install.rs).
                 let snap = lpm_registry::timing::snapshot();
-                // Phase 56 dispatcher fields stay at default 0 on the
-                // PubGrub/walker path; they are populated only by the
-                // fused dispatcher in `resolve_greedy_fused` (W2).
+                // Dispatcher fields stay at default 0 on the
+                // PubGrub/walker path; populated only by the fused
+                // dispatcher in `resolve_greedy_fused`.
                 let stage_timing = StageTiming {
                     followup_rpc_ms: snap.metadata_rpc.as_millis() as u64,
                     followup_rpc_count: snap.metadata_rpc_count,
@@ -534,12 +501,10 @@ pub async fn resolve_with_shared_cache(
                     applied_overrides,
                     platform_skipped,
                     root_aliases,
-                    // R2.2 — pubgrub arm doesn't implement eager peer
-                    // auto-install today (it predates R2 entirely and
-                    // is a pure-correctness opt-out via
-                    // `LPM_RESOLVER=pubgrub`). Empty here matches
-                    // pre-R2 behavior; users who pin to pubgrub get
-                    // pre-R2 warn-only peer semantics, same as
+                    // The PubGrub/walker arm doesn't implement eager
+                    // peer auto-install (legacy correctness opt-out via
+                    // `LPM_RESOLVER=pubgrub`). Users who pin to pubgrub
+                    // get warn-only peer semantics, same as
                     // `auto_install_peers = false`.
                     ambient_peer_installs: Vec::new(),
                     peer_conflicts: Vec::new(),
@@ -569,11 +534,10 @@ pub async fn resolve_with_shared_cache(
 
                 new_splits.sort();
                 split_packages.extend(new_splits.iter().cloned());
-                // Phase 49: the shared cache persists across retry passes
-                // via the `Arc` held in `shared_cache_for_pass`. The
-                // previous pass's `provider` is dropped here without
-                // `into_cache()` — its `Arc<DashMap>` stays live because
-                // the next pass's provider re-clones the outer Arc.
+                // The shared cache persists across retry passes via the
+                // `Arc` held in `shared_cache_for_pass`. Drop provider
+                // without `into_cache()` — the `Arc<DashMap>` stays
+                // live because the next pass re-clones the outer Arc.
                 drop(provider);
                 attempt += 1;
 
@@ -600,7 +564,7 @@ pub async fn resolve_with_shared_cache(
         }
     };
 
-    // Phase 34.4: dump cumulative resolver profile AFTER all passes complete.
+    // Dump cumulative resolver profile after all passes complete.
     // Counters accumulate across all split-retry passes.
     tracing::debug!(
         "resolver profile (all passes):\n{}",
@@ -628,15 +592,15 @@ fn format_solution(
         .filter(|(pkg, _)| !pkg.is_root())
         .map(|(package, version)| {
             let ver_str = version.to_string();
-            // Phase 49: cache is canonical-keyed. Split-retry identities
-            // of the same canonical package share one entry, so every
-            // lookup canonicalizes.
+            // Cache is canonical-keyed. Split-retry identities of the
+            // same canonical package share one entry, so every lookup
+            // canonicalizes.
             let key = CanonicalKey::from(&package);
 
-            // Phase 40 P2 — pull the per-version alias map from the
-            // cache so we can (a) redirect edge-lookup to the aliased
-            // target's resolved version and (b) surface the alias map
-            // on the resolved package for the linker.
+            // Pull the per-version alias map from the cache so we can
+            // (a) redirect edge-lookup to the aliased target's resolved
+            // version and (b) surface the alias map on the resolved
+            // package for the linker.
             let cached_aliases: HashMap<String, String> = cache
                 .get(&key)
                 .and_then(|info| info.aliases.get(&ver_str))
@@ -686,13 +650,13 @@ fn format_solution(
                 .map(|d| (d.tarball_url.clone(), d.integrity.clone()))
                 .unwrap_or_default();
 
-            // Phase 66 §2.5 — surface resolved peers per package. The
-            // resolver already proved each peer's range was satisfied
-            // (or surfaced a `PeerWarning` for the gap); here we just
-            // intersect the declared peers against the install set's
-            // resolved-versions lookup. Missing peers (warnings)
-            // simply don't appear in the output Vec — the linker /
-            // GraphKey only cares about peers that ARE present.
+            // Surface resolved peers per package. The resolver already
+            // proved each peer's range was satisfied (or surfaced a
+            // `PeerWarning` for the gap); here we just intersect the
+            // declared peers against the install set's resolved-
+            // versions lookup. Missing peers simply don't appear in
+            // the output Vec — the linker / GraphKey only cares about
+            // peers that ARE present.
             let peers = compute_resolved_peers(&package, &ver_str, cache, &resolved_versions);
 
             ResolvedPackage {
@@ -731,7 +695,7 @@ fn format_solution(
 /// pessimistic (slightly over-binding) GraphKey is acceptable —
 /// worst case is fewer cross-project sharing hits, never an
 /// incorrect share. When split-aware resolution becomes load-bearing
-/// (post-Phase-66 cross-project benchmarks), this helper grows the
+/// (once cross-project benchmarks make it load-bearing), this helper grows the
 /// `unsplit_versions` parameter the same way `resolve_peer_version`
 /// already does.
 fn compute_resolved_peers(
@@ -1397,8 +1361,8 @@ pub fn check_unmet_peers(
         let canonical = resolved_pkg.package.canonical_name();
 
         // Look up this package's peer deps for its actual resolved
-        // version. Phase 49: canonicalize — split-retry variants share
-        // a single cache entry under the canonical key.
+        // version. Canonicalize — split-retry variants share a single
+        // cache entry under the canonical key.
         let key = CanonicalKey::from(&resolved_pkg.package);
         let info = cache.get(&key);
         let peer_deps = info.and_then(|i| i.peer_deps.get(&ver_str));
@@ -1407,7 +1371,7 @@ pub fn check_unmet_peers(
             continue;
         };
 
-        // R5 — set of peer names this version marked optional via
+        // Set of peer names this version marked optional via
         // `peerDependenciesMeta.optional`. Empty for the common case.
         // Used below to suppress the missing-peer warning ONLY — an
         // optional peer that's present but at the wrong version still
@@ -1469,12 +1433,12 @@ pub fn check_unmet_peers(
                     if peer_rules.ignore_missing_matches(peer_name) {
                         continue;
                     }
-                    // R5 — `peerDependenciesMeta.optional: true` is
-                    // the manifest author's explicit "this peer is
-                    // optional; no warning if it's missing." pnpm
-                    // and yarn both honor this; npm v7+ honors it.
-                    // Gate ONLY the missing-peer branch — version-
-                    // mismatch above still warrants a warning.
+                    // `peerDependenciesMeta.optional: true` is the
+                    // manifest author's explicit "this peer is
+                    // optional; no warning if it's missing." pnpm,
+                    // yarn, and npm v7+ all honor this. Gates ONLY
+                    // the missing-peer branch — version-mismatch
+                    // above still warrants a warning.
                     if optional_peers.is_some_and(|set| set.contains(peer_name)) {
                         continue;
                     }
@@ -1654,26 +1618,22 @@ pub enum ResolveError {
     #[error("internal error: {0}")]
     Internal(String),
 
-    /// **Phase 66 R2.2 — eager-peer auto-install.** Two or more
-    /// consumers in the install set declare `peerDependencies` for
-    /// `canonical` whose ranges have no version in common, AND at
-    /// least one of those consumers is non-optional. The auto-install
-    /// path can't pick a single version that satisfies every required
-    /// consumer's range, so we surface the conflict instead of
-    /// silently first-version-wins'ing one of them.
+    /// Two or more consumers in the install set declare
+    /// `peerDependencies` for `canonical` whose ranges have no version
+    /// in common, AND at least one of those consumers is non-optional.
+    /// The auto-install path can't pick a single version that satisfies
+    /// every required consumer's range.
     ///
     /// `requirements` lists every contributing consumer with its
     /// declared range so the user can act on the conflict (typically:
     /// pin a version of one of the consumers, or use
     /// `lpm.overrides` to force a peer version).
     ///
-    /// **Why this is an error and not a warning:** the alternative is
-    /// pre-R2 behavior (warn-only post-resolve), which leaves the
-    /// install in a half-broken state where one consumer silently
-    /// gets a peer that doesn't satisfy its declared range. Per the
-    /// R2 design, an unsatisfiable peer with at least one required
-    /// consumer is "the package set the user described cannot be
-    /// installed coherently"; that's the same shape as
+    /// **Why this is an error and not a warning:** the alternative
+    /// (warn-only post-resolve) leaves the install in a half-broken
+    /// state where one consumer silently gets a peer that doesn't
+    /// satisfy its declared range. An unsatisfiable peer with at least
+    /// one required consumer has the same shape as
     /// [`Self::NoSolution`] for regular deps.
     #[error(
         "peer dependency conflict for `{canonical}`: {} consumer(s) declare incompatible ranges. \
@@ -1720,11 +1680,11 @@ mod tests {
 
     /// Process-global env-mutation lock for tests in this module.
     ///
-    /// Phase 60.1 default-flip: `resolve_with_shared_cache` now defaults
-    /// to greedy unless `LPM_RESOLVER=pubgrub` is set. Tests that
-    /// exercise PubGrub-arm-specific features (split-retry, npm-alias
-    /// range parsing) must temporarily set the env var, which is
-    /// process-global. Serialise mutation across async tests.
+    /// `resolve_with_shared_cache` defaults to greedy unless
+    /// `LPM_RESOLVER=pubgrub` is set. Tests that exercise PubGrub-arm-
+    /// specific features (split-retry, npm-alias range parsing) must
+    /// temporarily set the env var, which is process-global. Serialise
+    /// mutation across async tests.
     ///
     /// Uses `tokio::sync::Mutex` (async-aware) because the resolver
     /// tests `.await` while holding the guard — `std::sync::Mutex`
@@ -1765,12 +1725,9 @@ mod tests {
         }
     }
 
-    /// Phase 49 test-only adapter: the resolver's external API is now
-    /// `resolve_with_shared_cache`, but the existing resolver tests were
-    /// written against the pre-49 `resolve_with_prefetch(..., Option<HashMap>)`
-    /// shape. This helper keeps those tests readable by converting a
-    /// raw `HashMap<String, PackageMetadata>` into a pre-seeded
-    /// `SharedCache` and delegating. Not exported — tests only.
+    /// Test-only adapter: converts a raw `HashMap<String, PackageMetadata>`
+    /// into a pre-seeded `SharedCache` and delegates to
+    /// `resolve_with_shared_cache`. Not exported — tests only.
     async fn resolve_with_prefetch(
         client: Arc<RegistryClient>,
         dependencies: HashMap<String, String>,
@@ -1800,8 +1757,8 @@ mod tests {
             Duration::ZERO,
             RouteTable::from_mode_only(RouteMode::Proxy),
             StreamingBfsMetrics::new(),
-            true, // R2.2: tests default to auto-install on; tests
-                  // exercising warn-only behavior pass false explicitly.
+            true, // tests default to auto-install on; tests exercising
+                  // warn-only behavior pass false explicitly.
         )
         .await
     }
@@ -2064,9 +2021,9 @@ these are incompatible
         );
     }
 
-    /// Phase 40 P3a — `StageTiming` contract: `resolve_with_prefetch`
-    /// populates the field on `ResolveResult` and the resolver flows
-    /// that value through the happy path to the caller.
+    /// `StageTiming` contract: `resolve_with_prefetch` populates the
+    /// field on `ResolveResult` and the resolver flows that value
+    /// through the happy path to the caller.
     ///
     /// NOTE: The underlying counters live in `lpm_registry::timing`
     /// as process-global atomics (see that module's docs for why
@@ -2141,13 +2098,13 @@ these are incompatible
         let _ = t.parse_ndjson_ms;
     }
 
-    /// Phase 40 P1 bug: a platform-gated optional dep has one old version with
-    /// an ERRONEOUS `os`/`cpu` declaration that makes it look platform-compatible,
-    /// but that version doesn't satisfy the declared range. The pre-P1 resolver
-    /// passed this version through `available_versions` (because the platform
-    /// filter matched), then produced an empty pubgrub `Ranges` (because the
-    /// version was outside the range), which surfaced as a hard `NoSolution`
-    /// error instead of an optional-dep skip.
+    /// Regression: a platform-gated optional dep has one old version with
+    /// an ERRONEOUS `os`/`cpu` declaration that makes it look
+    /// platform-compatible, but that version doesn't satisfy the declared
+    /// range. The resolver passed this version through `available_versions`
+    /// (because the platform filter matched), then produced an empty pubgrub
+    /// `Ranges` (because the version was outside the range), which surfaced
+    /// as a hard `NoSolution` error instead of an optional-dep skip.
     ///
     /// Real-world repro: `@next/swc-linux-x64-musl@12.0.0` ships with
     /// `os: ["darwin"]` (a Next.js packaging bug from 2021), but the declared
@@ -2257,7 +2214,7 @@ these are incompatible
         );
     }
 
-    /// Phase 40 P2 — npm-alias root dep: the consumer declares
+    /// npm-alias root dep: the consumer declares
     /// `"strip-ansi-cjs": "npm:strip-ansi@^6.0.1"`, and the resolver
     /// must (a) fetch `strip-ansi` metadata (not `strip-ansi-cjs`),
     /// (b) resolve the alias target's version against the inner range,
@@ -2323,8 +2280,8 @@ these are incompatible
         );
     }
 
-    /// Phase 40 P2 — npm-alias transitive dep: a parent package's
-    /// registry metadata declares
+    /// npm-alias transitive dep: a parent package's registry metadata
+    /// declares
     /// `"strip-ansi-cjs": "npm:strip-ansi@^6"` in its own
     /// `dependencies`. The resolver must treat the alias the same way
     /// at any depth — the parent's resolved edge list records the
@@ -2412,9 +2369,9 @@ these are incompatible
 
     /// Regression: a non-optional dep with no platform-compatible version
     /// still fails (doesn't silently skip). Protects against accidentally
-    /// extending Phase 40 P1's optional-skip to regular deps, which would
-    /// hide real bugs (e.g., a package that declared os: ["win32"] for a
-    /// regular dep on linux must still surface as a resolution failure).
+    /// extending the optional-skip to regular deps, which would hide real
+    /// bugs (e.g., a package that declared os: ["win32"] for a regular dep
+    /// on linux must still surface as a resolution failure).
     #[tokio::test]
     async fn resolve_regular_dep_with_no_platform_compatible_version_still_fails() {
         let platform = Platform::current();
@@ -2592,7 +2549,7 @@ these are incompatible
         );
     }
 
-    /// Phase 40 P4 — nested-scope propagation.
+    /// Nested-scope propagation.
     ///
     /// Minimal reproduction of the real-world eslint + ajv conflict:
     /// root depends on ajv@^8 + eslint@^9; eslint@9 transitively requires
@@ -2858,10 +2815,10 @@ these are incompatible
         assert_eq!(warnings[0].resolved_version.as_deref(), Some("17.0.2"));
     }
 
-    /// **Phase 66 confidence-followup R5** — `peerDependenciesMeta.optional`
-    /// suppresses the missing-peer warning. Real-world example:
-    /// `react-redux@9` declares optional peer for older React; users
-    /// who don't install those see noisy warnings without this gate.
+    /// `peerDependenciesMeta.optional` suppresses the missing-peer
+    /// warning. Real-world example: `react-redux@9` declares optional
+    /// peer for older React; users who don't install those see noisy
+    /// warnings without this gate.
     #[test]
     fn peer_check_optional_peer_missing_no_warning() {
         let pkg = ResolverPackage::npm("react-redux");
@@ -2898,10 +2855,10 @@ these are incompatible
         );
     }
 
-    /// R5 — optional peers that ARE present but at the wrong version
-    /// still produce a warning. Pin: an optional flag is opt-out for
-    /// the missing case only; if the user opted into having the peer,
-    /// the version-mismatch contract still applies.
+    /// Optional peers that ARE present but at the wrong version still
+    /// produce a warning. An optional flag is opt-out for the missing
+    /// case only; if the user opted into having the peer, the
+    /// version-mismatch contract still applies.
     #[test]
     fn peer_check_optional_peer_wrong_version_still_warns() {
         let pkg = ResolverPackage::npm("react-redux");
