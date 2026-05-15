@@ -1,11 +1,20 @@
 //! Workflow tests for `lpm patch` + `lpm patch-commit`.
 //!
-//! Phase 32 Phase 6 acceptance criteria for the patch authoring loop:
-//! - `lpm patch <key>` extracts a clean staging copy (filtering internal
-//!   sentinels), prints a breadcrumb, and surfaces the staging path.
-//! - `lpm patch-commit <dir>` writes `patches/<key>.patch`, updates
-//!   `package.json > lpm > patchedDependencies`, and cleans up staging.
-//! - Range version keys are rejected (only exact pins are supported today).
+//! Acceptance criteria for the patch authoring loop:
+//! - `lpm patch <selector>` extracts a clean staging copy (filtering
+//!   internal sentinels), prints a breadcrumb, and surfaces the staging
+//!   path. `<selector>` is a bare name, exact pin, or semver range —
+//!   bare-name / range resolve against the project lockfile to an
+//!   exact pin before staging.
+//! - `lpm patch-commit <dir>` writes `patches/<safe_key>.patch`,
+//!   updates `package.json > lpm > patchedDependencies`, and cleans up
+//!   staging. The persisted key is always the resolved exact pin; for
+//!   scoped names the `/` is replaced with `__` in the filename only
+//!   (the manifest key keeps the real package selector).
+//! - Range / bare-name selectors without a lockfile error with an
+//!   actionable hint pointing at `lpm install` or an exact pin.
+//! - Dist-tags (`latest`, `next`, `beta`) are rejected — the selector
+//!   path never consults the registry.
 //! - Binary-file changes are rejected (text-only patch contract).
 //! - "No changes" attempts hard-error with a clear diagnostic.
 //!
@@ -315,6 +324,156 @@ fn patch_commit_writes_patch_file_and_updates_manifest() {
     assert!(
         !staging.exists(),
         "patch-commit must clean up the staging dir"
+    );
+}
+
+/// **GPT audit follow-up (2026-05-15).** Scoped packages (both npm-
+/// style `@scope/name` and lpm.dev-style `@lpm.dev/owner.name`) flow
+/// through `patch-commit` correctly:
+///
+/// 1. The on-disk filename sanitizes `/` to `__`:
+///    `patches/@posthog__nextjs-config@4.17.21.patch`.
+/// 2. The `lpm.patchedDependencies` MANIFEST KEY keeps the real
+///    package selector shape with `/`:
+///    `"@posthog/nextjs-config@4.17.21"`.
+/// 3. The `path` field inside that entry points at the sanitized
+///    filename so the install pipeline can find it on disk.
+///
+/// `parse_patch_key` resolves the version by splitting on the LAST
+/// `@`, so the leading `@` of the scope is preserved as part of the
+/// name.
+#[test]
+fn patch_commit_handles_npm_scoped_package() {
+    let project = TempProject::empty(r#"{"name":"patch-scoped-npm","version":"0.0.0"}"#);
+    let integrity = seed_store_package(
+        &project,
+        "@posthog/nextjs-config",
+        "4.17.21",
+        &[("index.js", "module.exports = { posthog: true }\n")],
+    );
+
+    // Extract.
+    let out1 = lpm_with_registry(&project, "http://127.0.0.1:1")
+        .args(["--json", "patch", "@posthog/nextjs-config@4.17.21"])
+        .output()
+        .expect("spawn lpm patch");
+    assert!(
+        out1.status.success(),
+        "scoped-name extract failed: stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&out1.stdout),
+        String::from_utf8_lossy(&out1.stderr)
+    );
+    let parsed1: serde_json::Value =
+        serde_json::from_str(&strip_ansi(&String::from_utf8_lossy(&out1.stdout))).unwrap();
+    assert_eq!(parsed1["name"].as_str(), Some("@posthog/nextjs-config"));
+    assert_eq!(parsed1["version"].as_str(), Some("4.17.21"));
+    let staging = PathBuf::from(parsed1["staging_dir"].as_str().unwrap());
+
+    // Edit.
+    let edit_target = staging.join("node_modules/@posthog/nextjs-config/index.js");
+    std::fs::write(&edit_target, "module.exports = { posthog: 'PATCHED' }\n").unwrap();
+
+    // Commit.
+    let out2 = lpm_with_registry(&project, "http://127.0.0.1:1")
+        .args(["--json", "patch-commit", staging.to_str().unwrap()])
+        .output()
+        .expect("spawn lpm patch-commit");
+    assert!(
+        out2.status.success(),
+        "scoped patch-commit failed; stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&out2.stdout),
+        String::from_utf8_lossy(&out2.stderr)
+    );
+
+    // On-disk filename: `/` → `__`.
+    let patch_file = project
+        .path()
+        .join("patches/@posthog__nextjs-config@4.17.21.patch");
+    assert!(
+        patch_file.exists(),
+        "patch file must be at sanitized path; expected: {patch_file:?}"
+    );
+    // The legacy raw-slash path must NOT exist (would break the
+    // portability contract).
+    assert!(
+        !project
+            .path()
+            .join("patches/@posthog/nextjs-config@4.17.21.patch")
+            .exists(),
+        "raw-slash filename must not be created"
+    );
+
+    // Manifest key keeps the real package selector shape.
+    let pkg: serde_json::Value = serde_json::from_str(&project.read_file("package.json")).unwrap();
+    let entry = &pkg["lpm"]["patchedDependencies"]["@posthog/nextjs-config@4.17.21"];
+    assert_eq!(
+        entry["path"].as_str(),
+        Some("patches/@posthog__nextjs-config@4.17.21.patch"),
+        "manifest path field must point at the sanitized filename"
+    );
+    assert_eq!(
+        entry["originalIntegrity"].as_str(),
+        Some(integrity.as_str())
+    );
+}
+
+/// `@lpm.dev/owner.name` packages — the LPM canonical scoping convention
+/// (one dot in the name segment is normal here, unlike npm scopes which
+/// rarely have dots). Same contract as the npm-scoped test.
+#[test]
+fn patch_commit_handles_lpm_dev_scoped_package() {
+    let project = TempProject::empty(r#"{"name":"patch-scoped-lpm","version":"0.0.0"}"#);
+    let integrity = seed_store_package(
+        &project,
+        "@lpm.dev/user.package",
+        "1.2.3",
+        &[("lib.js", "module.exports = 'lpm-orig'\n")],
+    );
+
+    let out1 = lpm_with_registry(&project, "http://127.0.0.1:1")
+        .args(["--json", "patch", "@lpm.dev/user.package@1.2.3"])
+        .output()
+        .expect("spawn lpm patch");
+    assert!(
+        out1.status.success(),
+        "lpm.dev scoped extract failed: stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&out1.stdout),
+        String::from_utf8_lossy(&out1.stderr)
+    );
+    let parsed1: serde_json::Value =
+        serde_json::from_str(&strip_ansi(&String::from_utf8_lossy(&out1.stdout))).unwrap();
+    assert_eq!(parsed1["name"].as_str(), Some("@lpm.dev/user.package"));
+    assert_eq!(parsed1["version"].as_str(), Some("1.2.3"));
+    let staging = PathBuf::from(parsed1["staging_dir"].as_str().unwrap());
+
+    let edit_target = staging.join("node_modules/@lpm.dev/user.package/lib.js");
+    std::fs::write(&edit_target, "module.exports = 'lpm-PATCHED'\n").unwrap();
+
+    let out2 = lpm_with_registry(&project, "http://127.0.0.1:1")
+        .args(["--json", "patch-commit", staging.to_str().unwrap()])
+        .output()
+        .expect("spawn lpm patch-commit");
+    assert!(
+        out2.status.success(),
+        "lpm.dev patch-commit failed; stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&out2.stdout),
+        String::from_utf8_lossy(&out2.stderr)
+    );
+
+    let patch_file = project
+        .path()
+        .join("patches/@lpm.dev__user.package@1.2.3.patch");
+    assert!(patch_file.exists(), "expected: {patch_file:?}");
+
+    let pkg: serde_json::Value = serde_json::from_str(&project.read_file("package.json")).unwrap();
+    let entry = &pkg["lpm"]["patchedDependencies"]["@lpm.dev/user.package@1.2.3"];
+    assert_eq!(
+        entry["path"].as_str(),
+        Some("patches/@lpm.dev__user.package@1.2.3.patch")
+    );
+    assert_eq!(
+        entry["originalIntegrity"].as_str(),
+        Some(integrity.as_str())
     );
 }
 
