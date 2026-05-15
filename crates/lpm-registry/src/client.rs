@@ -3997,10 +3997,9 @@ pub fn evaluate_cached_url(url: &str, client: &RegistryClient) -> GateDecision {
     // Origin — must match one of the origins this client talks to.
     // After `LPM_REGISTRY_URL` is switched to a mirror, stored
     // `@lpm.dev/*` URLs naturally mismatch and fall through to
-    // on-demand lookup against the new origin. The generalized
-    // writeback trigger (P43-2 Change 3) picks up the fresh URLs
-    // and rewrites the lockfile so the second install short-
-    // circuits.
+    // on-demand lookup against the new origin. The writeback trigger
+    // picks up the fresh URLs and rewrites the lockfile so the second
+    // install short-circuits.
     if !client.is_configured_origin(url) {
         return GateDecision::RejectedOrigin;
     }

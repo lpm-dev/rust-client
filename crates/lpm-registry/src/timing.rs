@@ -1,14 +1,12 @@
-//! Phase 40 P3a — process-global timing accumulators for metadata RPC
-//! work.
+//! Process-global timing accumulators for metadata RPC work.
 //!
 //! The resolver needs to know how much of `resolve_ms` was spent on
-//! HTTP round-trips vs NDJSON parsing vs pubgrub's own backtracking
-//! before we can pick which lever to pull (P3b worker-walk depth, P3c
-//! parallel follow-up fetches, or P3d slimmer batch response). Process
-//! globals are the simplest way to let `lpm-registry` report numbers
-//! up to `lpm-resolver` without reshaping every `RegistryClient`
-//! signature — the resolver sits between install.rs and the client
-//! and is the only consumer, so contention is a non-issue in practice.
+//! HTTP round-trips vs NDJSON parsing vs pubgrub backtracking so the
+//! right optimization lever can be pulled. Process globals let
+//! `lpm-registry` report numbers up to `lpm-resolver` without reshaping
+//! every `RegistryClient` signature. Contention is a non-issue because
+//! the resolver is the only consumer and the cold-resolve path is
+//! effectively serial.
 //!
 //! Contract:
 //!   1. `reset()` at the start of each resolution pass (idempotent).
@@ -31,21 +29,17 @@ static METADATA_RPC_NS: AtomicU64 = AtomicU64::new(0);
 static METADATA_RPC_COUNT: AtomicU32 = AtomicU32::new(0);
 static PARSE_NDJSON_NS: AtomicU64 = AtomicU64::new(0);
 
-/// Phase 53 audit-flag A1 — split the formerly-conflated
-/// `metadata_rpc_count` into walker-driven and provider-escape-hatch
-/// buckets. Walker code paths post-call
-/// [`record_walker_rpcs`] with the count of manifests they fetched,
-/// while every metadata round-trip continues to bump
+/// Split `metadata_rpc_count` into walker-driven and provider-escape-hatch
+/// buckets. Walker code paths call [`record_walker_rpcs`] with the count
+/// of manifests they fetched; every metadata round-trip bumps
 /// `METADATA_RPC_COUNT` via [`record_rpc`]. The escape-hatch count is
 /// `METADATA_RPC_COUNT - WALKER_RPC_COUNT` at snapshot time.
 ///
-/// Why this shape: the walker calls into the same `RegistryClient`
-/// methods that escape-hatch uses, so the per-RPC instrumentation
-/// inside the client can't tell them apart from caller context.
-/// `task_local!` would work but adds an await-bound scope wrapper
-/// around every walker call site; post-counting the deltas at the
-/// walker's two known call sites (`parallel_fetch_npm_manifests` and
-/// `batch_metadata`) is cheaper and equivalent.
+/// The walker calls the same `RegistryClient` methods as the escape-hatch,
+/// so per-RPC instrumentation inside the client can't distinguish them.
+/// Post-counting deltas at the walker's two call sites
+/// (`parallel_fetch_npm_manifests` + `batch_metadata`) is cheaper than
+/// `task_local!` scoping and equivalent.
 static WALKER_RPC_COUNT: AtomicU32 = AtomicU32::new(0);
 
 /// Reset all counters to zero. Idempotent. Call once before resolution
@@ -80,11 +74,10 @@ pub fn record_parse(duration: Duration) {
     PARSE_NDJSON_NS.fetch_add(duration.as_nanos() as u64, Ordering::Relaxed);
 }
 
-/// Phase 53 A1 — record `n` RPCs as walker-driven. Called by the
-/// walker after each batch / parallel-fetch returns, so the walker
-/// vs escape-hatch split can be reported in `--json` without the
-/// client knowing its caller. `record_rpc` continues to bump the
-/// total; this just moves the bucketing.
+/// Record `n` RPCs as walker-driven. Called by the walker after each
+/// batch / parallel-fetch returns so the walker vs escape-hatch split
+/// can be reported in `--json` without the client knowing its caller.
+/// `record_rpc` continues to bump the total; this moves the bucketing.
 pub fn record_walker_rpcs(n: u32) {
     WALKER_RPC_COUNT.fetch_add(n, Ordering::Relaxed);
 }
@@ -104,8 +97,8 @@ pub fn snapshot() -> Snapshot {
     }
 }
 
-/// Snapshot of Phase 40 P3a + Phase 53 A1 substage timers. See the
-/// field docs for the exact contract each represents.
+/// Snapshot of metadata-RPC substage timers. See field docs for the
+/// exact contract each represents.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct Snapshot {
     /// Total wall-clock time spent in metadata HTTP calls since the
@@ -120,20 +113,17 @@ pub struct Snapshot {
     /// CPU time spent in the NDJSON serde_json deserializer. Subset
     /// of `metadata_rpc` by wall-clock (the parser runs while the
     /// network stream is still active), but reported separately so
-    /// the P3d "slim the batch response" lever can be evaluated on
+    /// the "slim the batch response" optimization can be evaluated on
     /// its own.
     pub parse_ndjson: Duration,
-    /// Phase 53 A1 — count of metadata HTTP calls fired by the
-    /// walker (`BfsWalker` / streaming walker). Each parallel-fetch
-    /// per-package GET counts as one; each batch_metadata call also
-    /// counts as one (regardless of how many packages it carries).
-    /// Walker post-records the delta after each batch / parallel
-    /// fetch returns.
+    /// Count of metadata HTTP calls fired by the walker (`BfsWalker` /
+    /// streaming walker). Each parallel-fetch GET counts as one; each
+    /// batch_metadata call also counts as one regardless of package count.
+    /// Walker post-records the delta after each batch / parallel fetch.
     pub walker_rpc_count: u32,
-    /// Phase 53 A1 — count of metadata HTTP calls fired by the
-    /// resolver provider's escape-hatch path (i.e., manifests the
-    /// walker didn't pre-fetch within `fetch_wait_timeout`). High
-    /// values indicate the walker's deep-walk depth or fanout is
-    /// undersized for this fixture. `escape_hatch_rpc_count + walker_rpc_count == metadata_rpc_count`.
+    /// Count of metadata HTTP calls fired by the resolver provider's
+    /// escape-hatch path (manifests the walker didn't pre-fetch within
+    /// `fetch_wait_timeout`). High values indicate the walker's depth or
+    /// fanout is undersized. `escape_hatch + walker == metadata_rpc_count`.
     pub escape_hatch_rpc_count: u32,
 }
