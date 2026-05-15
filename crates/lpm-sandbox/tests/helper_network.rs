@@ -1,4 +1,4 @@
-//! Phase 46.3 PR-2: outbound-network denial integration tests for
+//! Outbound-network denial integration tests for
 //! `lpm-sandbox-helper.exe` under Strict (no capabilities) and the
 //! per-cap variant.
 //!
@@ -16,8 +16,8 @@
 //!   respond after a period of time" — WFP silent-drop policy).
 //!   Both are produced by the same AppContainer/WFP boundary;
 //!   which one surfaces depends on the Windows kernel version and
-//!   the WFP filter configuration. The plan §9.2 named WSAEACCES
-//!   explicitly; observed behavior on Windows 11 26200 surfaces
+//!   the WFP filter configuration. WSAEACCES is the synchronous
+//!   refusal; observed behavior on Windows 11 26200 surfaces
 //!   WSAETIMEDOUT for loopback + TEST-NET targets. Both shapes
 //!   prove kernel-level denial — outside AppContainer, a
 //!   loopback-listener connect succeeds in <1ms, so any timeout
@@ -34,8 +34,9 @@
 //! both admin-only, and a non-loopback target is not hermetic on
 //! CI. The cross-platform workflow test handles that contract on
 //! macOS + Linux, and the manual smoke test at
+//! The manual smoke test at
 //! [`private/46.3-pr2-network-denial.md`](../../../../private/46.3-pr2-network-denial.md)
-//! §14 verifies it on Windows hosts with outbound connectivity.
+//! verifies it on Windows hosts with outbound connectivity.
 
 #![cfg(target_os = "windows")]
 
@@ -191,10 +192,9 @@ fn helper_strict_denies_outbound_tcp_to_routable_public_target() {
     // reachable public IP. Strict mode without InternetClient
     // denies the connect at the kernel before any packet hits the
     // wire. On hosts with internet access, the manual smoke test
-    // at the plan §14 sees WSAEACCES (synchronous denial) here;
+    // On hosts with internet access, WSAEACCES (synchronous denial)
     // on hosts without internet, WSAETIMEDOUT is the surface.
-    // Either signal proves denial; both are accepted via
-    // [`DENIAL_SIGNALS`].
+    // Either signal proves denial; both are accepted.
     let ps = ps_connect_script("1.1.1.1", 80);
     let (status, stdout, stderr) = run_helper_with_powershell(&minimal_argv(false), &ps);
     assert!(

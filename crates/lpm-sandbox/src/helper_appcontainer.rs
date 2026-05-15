@@ -1,8 +1,8 @@
 //! AppContainer launcher backend for `lpm-sandbox-helper.exe`.
 //!
-//! Phase 46.3 PR-2 — see
-//! [`private/46.3-pr2-network-denial.md`](../../../../private/46.3-pr2-network-denial.md)
-//! §3 for the design. The high-level flow:
+//! Design overview: see
+//! [`private/46.3-pr2-network-denial.md`](../../../../private/46.3-pr2-network-denial.md).
+//! The high-level flow:
 //!
 //! 1. **SID create-or-reuse.** Call
 //!    [`CreateAppContainerProfile`] for the stable
@@ -42,8 +42,7 @@
 //! guard ensures on every exit path. The lifecycle child cannot
 //! outlive the helper.
 //!
-//! The DACL ACEs we add **persist** past the install — same
-//! trade-off Phase 46.2 documented for the Low IL SACL: idempotent
+//! The DACL ACEs we add **persist** past the install — idempotent
 //! across runs, near-zero disk impact, simpler than tearing down
 //! grants on every exit (which would race with concurrent lpm
 //! invocations on the same host).
@@ -562,7 +561,7 @@ pub fn run_appcontainer_spawn(args: HelperArgs) -> Result<i32, AppContainerError
 /// expected steady-state return — the profile dir at
 /// `%USERPROFILE%\AppData\Local\Packages\<name>\` persists across
 /// reboots until explicitly deleted via `DeleteAppContainerProfile`,
-/// which we deliberately don't call (see plan §3.2).
+/// which we deliberately don't call (the profile persists until explicitly deleted).
 fn create_or_reuse_appcontainer_sid(name: &str) -> Result<SidGuard, AppContainerError> {
     let wide_name = str_to_wide_with_nul(name);
     // Display name + description show up in the per-user
@@ -1198,7 +1197,7 @@ fn build_environment_block(envs: &[OsString], env_clear: bool) -> Vec<u16> {
     // practice the first one wins for `getenv`, but other code
     // paths — including some node-gyp/python tooling — read the
     // raw env block and pick the last match). Either way, the
-    // override contract Phase 46.2 documented at
+    // override contract documented at
     // [`crate::commands::rebuild`]'s `find_env_case_insensitive`
     // helper is broken. Match that precedent here.
     //

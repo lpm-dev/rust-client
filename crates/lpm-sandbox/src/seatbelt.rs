@@ -1,10 +1,9 @@
 //! Seatbelt profile synthesis for the macOS `sandbox-exec` backend.
 //!
-//! Implements §9.3 of the Phase 46 plan: reads broad (project +
-//! toolchain), writes narrow (package store dir + `node_modules` +
-//! `.husky` + `.lpm` + known caches + temp), network allowed by
-//! default (D3), process-fork + exec allowed so `node-gyp` children
-//! work.
+//! Reads broad (project + toolchain), writes narrow (package store
+//! dir + `node_modules` + `.husky` + `.lpm` + known caches + temp),
+//! network allowed by default, process-fork + exec allowed so
+//! `node-gyp` children work.
 //!
 //! The profile is synthesized per-package — each invocation of a
 //! lifecycle script renders its own profile whose `(subpath "...")`
@@ -22,10 +21,10 @@ use std::path::{Path, PathBuf};
 /// [`SandboxSpec`]. The returned string is safe to pass to
 /// `sandbox-exec -p`.
 ///
-/// Profile layout matches §9.3: deny-by-default, then an explicit
-/// `file-read*` allow list, an explicit `file-write*` allow list,
-/// unrestricted network, process spawn, and the mach / sysctl
-/// primitives node-gyp needs.
+/// Profile layout: deny-by-default, then an explicit `file-read*`
+/// allow list, an explicit `file-write*` allow list, unrestricted
+/// network, process spawn, and the mach / sysctl primitives
+/// node-gyp needs.
 pub(crate) fn render_profile(
     spec: &SandboxSpec,
     deny_outbound_network: bool,
@@ -112,13 +111,12 @@ pub(crate) fn render_profile(
     out.push('\n');
 
     // file-read*: broad, because scripts legitimately read project +
-    // toolchain paths. §9.3 lists the project + system baseline;
-    // this implementation extends it with the paths every real macOS
-    // binary needs to load (dyld shared cache at /System/Volumes +
-    // /private/var/db/dyld, /bin + /sbin for shells and coreutils,
-    // /private/etc for locale + resolv.conf, /dev tty/random/zero
-    // for common libc initialization). Writes stay narrow; only
-    // reads are widened past the schematic §9.3 layout.
+    // toolchain paths. The project + system baseline is extended with
+    // the paths every real macOS binary needs to load (dyld shared
+    // cache at /System/Volumes + /private/var/db/dyld, /bin + /sbin
+    // for shells and coreutils, /private/etc for locale + resolv.conf,
+    // /dev tty/random/zero for common libc initialization). Writes
+    // stay narrow.
     out.push_str("(allow file-read*\n");
     // Stat-the-root is required by the dyld loader on macOS; without
     // this entry even `/usr/bin/true` fails to launch under a
@@ -152,8 +150,8 @@ pub(crate) fn render_profile(
     out.push('\n');
 
     // file-write*: narrow but covers the greens. Must contain the
-    // package's own store dir (Chunk 5's compat corpus tests write
-    // markers here), project `node_modules` (prisma generate),
+    // package's own store dir (the compat corpus tests write markers
+    // here), project `node_modules` (prisma generate),
     // `.husky` (husky install), `.lpm` (LPM's own state),
     // `~/.cache` + `~/.node-gyp` + `~/.npm` (tooling caches), and
     // `/tmp` + `$TMPDIR` — plus `/private/var/folders` since macOS's
@@ -177,18 +175,16 @@ pub(crate) fn render_profile(
     out.push_str(")\n");
     out.push('\n');
 
-    // Phase 46.1 rework (2026-05-11): network denial is opt-in, not
-    // default. The Phase 46 P5 baseline (filesystem + env
-    // containment, network allowed) is restored as the default;
+    // Network denial is opt-in, not default. The default posture
+    // (filesystem + env containment, network allowed) is the baseline;
     // strict mode (`deny_outbound_network = true`) drops the
     // `(allow network*)` line so the profile's `(deny default)`
     // opener covers every socket / bind / connect operation.
     //
-    // The strict path has NO loopback exemption — see the Phase 46.1
-    // design note's Q1 decision (still locked under the strict path).
-    // Lifecycle scripts that legitimately need network when strict is
-    // active go through `--no-sandbox`, `trustedDependencies`, or by
-    // the user dropping back to `mode = "default"`.
+    // The strict path has NO loopback exemption — lifecycle scripts
+    // that legitimately need network under strict go through
+    // `--no-sandbox`, `trustedDependencies`, or by dropping back to
+    // `mode = "default"`.
     //
     // See
     // `DOCS/new-features/37-rust-client-RUNNER-VISION-phase46-DX.md`
@@ -418,29 +414,26 @@ mod tests {
 
     #[test]
     fn profile_allows_network_under_default_mode() {
-        // Phase 46.1 rework (2026-05-11): network denial is opt-in.
-        // Default mode (`deny_outbound_network = false`) restores
-        // the Phase 46 P5 baseline — `(allow network*)` is emitted
-        // and the profile permits outbound network from the
-        // lifecycle script. A regression that drops the line under
-        // default mode would break sharp / prisma / puppeteer /
-        // `@lpm-registry/cli` and every other legitimate
-        // install-time downloader.
+        // Network denial is opt-in. Default mode
+        // (`deny_outbound_network = false`) emits `(allow network*)`
+        // and permits outbound network from the lifecycle script. A
+        // regression that drops the line under default mode would
+        // break sharp / prisma / puppeteer / `@lpm-registry/cli` and
+        // every other legitimate install-time downloader.
         let p = render_profile(&spec(), false).unwrap();
         assert!(
             p.contains("(allow network*)"),
             "default mode must emit `(allow network*)` so install-time \
-             downloads work — see phase46-DX: {p}"
+             downloads work: {p}"
         );
     }
 
     #[test]
     fn profile_denies_network_under_strict_mode() {
-        // Phase 46.1 strict path: `deny_outbound_network = true`
-        // drops the `(allow network*)` line so the opening
-        // `(deny default)` covers every socket / bind / connect.
-        // No loopback exemption (design note Q1 still locked under
-        // strict). A regression that re-adds `(allow network*)`
+        // Strict path: `deny_outbound_network = true` drops the
+        // `(allow network*)` line so the opening `(deny default)`
+        // covers every socket / bind / connect. No loopback
+        // exemption. A regression that re-adds `(allow network*)`
         // when strict is engaged would silently break the strict
         // contract; this test catches it.
         let p = render_profile(&spec(), true).unwrap();
@@ -524,10 +517,10 @@ mod tests {
 
     #[test]
     fn profile_forbidden_path_probe_is_denied_under_deny_default() {
-        // `cat ~/.ssh/id_rsa` (§11 P5 ship criterion #1): the path is
-        // never in the allow list, and the profile begins with
-        // (deny default), so Seatbelt blocks the read. This test
-        // asserts the profile's structural shape — the integration
+        // `cat ~/.ssh/id_rsa`: the path is never in the allow list,
+        // and the profile begins with (deny default), so Seatbelt
+        // blocks the read. This test asserts the profile's structural
+        // shape — the integration
         // test under tests/seatbelt_integration.rs actually shells
         // out to sandbox-exec to confirm runtime behavior.
         let p = render_profile(&spec(), false).unwrap();
@@ -568,10 +561,10 @@ mod tests {
         // covered paths — operations matching Enforce rules are silent
         // allows, identical to Enforce behavior.
         //
-        // Phase 46.1 rework: under default mode the Enforce profile
-        // emits `(allow network*)` (network allowed); the LogOnly
-        // profile inherits the same body, so the rule shows up here
-        // too. The mirror test below pins the strict-mode case.
+        // Under default mode the Enforce profile emits `(allow
+        // network*)` (network allowed); the LogOnly profile inherits
+        // the same body, so the rule shows up here too. The mirror
+        // test below pins the strict-mode case.
         let p = render_logonly_profile(&spec(), false).unwrap();
         assert!(p.contains("(allow file-read*"));
         assert!(p.contains("(allow file-write*"));

@@ -5,7 +5,7 @@
 //! The landlock-specific bits — ABI negotiation, `PathFd` open, rule
 //! install, `restrict_self` — live in [`crate::linux`].
 //!
-//! Rule layout mirrors §9.3 of the Phase 46 plan exactly:
+//! Rule layout:
 //! - Reads broad (project + toolchain + system).
 //! - Writes narrow (package store dir + `node_modules` + `.husky` +
 //!   `.lpm` + known caches + temp + extras from `sandboxWriteDirs`).
@@ -36,8 +36,8 @@ pub(crate) enum RuleAccess {
 
 /// Read-only system paths every reasonable Linux lifecycle script
 /// needs. Listed in a const so the rules-layer contract is visible
-/// from one place. Chunk 5's escape corpus asserts these stay
-/// narrow (e.g. no `/root`, no `/`).
+/// from one place. The escape corpus asserts these stay narrow
+/// (e.g. no `/root`, no `/`).
 pub(crate) const SYSTEM_READ_PATHS: &[&str] = &[
     // Binaries, libraries, and the dynamic linker. On usr-merged
     // distros `/bin` and `/sbin` are symlinks to `/usr/bin` and
@@ -79,31 +79,26 @@ pub(crate) fn describe_rules(spec: &SandboxSpec) -> Vec<(PathBuf, RuleAccess)> {
     }
 
     // Read-only project baseline. The package's own deps live under
-    // either the isolated wrapper tree (post-Phase-61:
-    // `{project}/.lpm/wrappers/`; pre-Phase-61:
-    // `{project}/node_modules/.lpm/`) or the hoisted layout
-    // (post-symmetry: `{project}/.lpm/hoisted/` + flat
-    // `node_modules/`; pre-symmetry: `{project}/node_modules/`
-    // + `node_modules/.lpm/`). All variants are reachable via this
-    // rule under LPM's default linker strategy (clonefile on macOS,
+    // either the isolated wrapper tree (`{project}/.lpm/wrappers/`)
+    // or the hoisted layout (`{project}/.lpm/hoisted/` + flat
+    // `node_modules/`). All variants are reachable via this rule
+    // under LPM's default linker strategy (clonefile on macOS,
     // hardlink on Linux — both place dep content inside the project
     // tree, so the rule matches path-locally). The rule grants the
     // entire `project_dir` subtree, which covers every active and
     // legacy variant uniformly. The fallback symlink path would
     // cross into `~/.lpm/store/` which this rule doesn't cover;
-    // per Phase 46 D23, that's an accepted corner — widening to
-    // `store_root` would expose every other package the user has
-    // installed. If the fallback path becomes common in practice,
-    // §9.7 documents the two remediations (switch to hardlink, or
-    // widen reads).
+    // widening to `store_root` would expose every other package
+    // the user has installed. Two remediations exist for that corner:
+    // switch to hardlink, or widen reads with an explicit store rule.
     rules.push((spec.project_dir.clone(), RuleAccess::Read));
-    // NVM-installed toolchain, per §9.3. Only added if the host has
-    // a matching dir — [`crate::linux::spawn`] filters missing paths
-    // at FD-open time; the description layer stays complete.
+    // NVM-installed toolchain. Only added if the host has a matching
+    // dir — [`crate::linux::spawn`] filters missing paths at FD-open
+    // time; the description layer stays complete.
     let nvm = spec.home_dir.join(".nvm").join("versions");
     rules.push((nvm, RuleAccess::Read));
 
-    // Read+write — the §9.3 narrow write list.
+    // Read+write — the narrow write list.
     rules.push((spec.package_dir.clone(), RuleAccess::ReadWrite));
     rules.push((spec.project_dir.join("node_modules"), RuleAccess::ReadWrite));
     rules.push((spec.project_dir.join(".husky"), RuleAccess::ReadWrite));
