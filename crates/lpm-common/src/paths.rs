@@ -1,4 +1,4 @@
-//! Phase 37 — centralized `~/.lpm` path layer.
+//! Centralized `~/.lpm` path layer.
 //!
 //! Before this module, every crate that needed a machine-global path computed
 //! it independently by reading `HOME` / `USERPROFILE` or calling
@@ -55,8 +55,7 @@ use std::path::{Path, PathBuf};
 /// `validate_install_root()` use to decide whether a partial install
 /// is bootable.
 ///
-/// See plan §"On rollback decision". Ephemeral (dlx) installs do NOT
-/// use this marker — they rely on the cheaper
+/// Ephemeral (dlx) installs do NOT use this marker — they rely on the cheaper
 /// `{package.json, node_modules/.bin}` pair plus mtime-based TTL.
 pub const INSTALL_READY_MARKER: &str = ".lpm-install-ready";
 
@@ -150,11 +149,10 @@ impl LpmRoot {
         self.cache_root().join("metadata")
     }
 
-    /// **Phase 46 P4.** Sigstore attestation snapshots captured per
-    /// `@name@version` during install-time provenance-drift checks.
-    /// Nested under `cache/metadata` deliberately so the existing
-    /// `lpm cache clean metadata` sweep already invalidates it — no
-    /// new cache category, no new command surface.
+    /// Sigstore attestation snapshots captured per `@name@version` during
+    /// install-time provenance-drift checks. Nested under `cache/metadata`
+    /// deliberately so the existing `lpm cache clean metadata` sweep already
+    /// invalidates it — no new cache category, no new command surface.
     pub fn cache_metadata_attestations(&self) -> PathBuf {
         self.cache_metadata().join("attestations")
     }
@@ -171,8 +169,8 @@ impl LpmRoot {
         self.cache_root().join(".clean.lock")
     }
 
-    /// Legacy pre-phase37 dlx cache location. Used only by the one-shot
-    /// migration; do not read or write through this path in new code.
+    /// Legacy dlx cache location. Used only by the one-shot migration; do not
+    /// read or write through this path in new code.
     pub fn legacy_dlx_cache(&self) -> PathBuf {
         self.home.join("dlx-cache")
     }
@@ -243,7 +241,7 @@ impl LpmRoot {
             .join(format!("{safe_name}@{version}"))
     }
 
-    // ─── Phase 66 Phase 4e — known-projects registry ────────────────
+    // ─── Known-projects registry ─────────────────────────────────────
 
     /// Machine-global registry of project directories that have ever
     /// completed an `lpm install`. Lives at
@@ -792,10 +790,10 @@ pub fn as_extended_path(path: &Path) -> PathBuf {
     }
 }
 
-/// Phase 37 M0 (rev 6): the absolute-path budget for a global install root
-/// before nested `node_modules/.bin/<cmd>.cmd` traversal would push us over
-/// the legacy Win32 MAX_PATH ceiling (260). Allows 13 chars of headroom for
-/// the deepest expected suffix; mirrors plan §line 595.
+/// Absolute-path budget for a global install root before nested
+/// `node_modules/.bin/<cmd>.cmd` traversal would push us over the legacy
+/// Win32 MAX_PATH ceiling (260). Allows 13 chars of headroom for the deepest
+/// expected suffix.
 pub const GLOBAL_INSTALL_PATH_BUDGET: usize = 247;
 
 /// Reject install-root paths that would overflow Windows' legacy MAX_PATH
@@ -1294,7 +1292,7 @@ mod tests {
     }
 
     /// Wait-hint callback fires AT MOST ONCE per acquisition, not on
-    /// every poll. Regression for GPT's flag.
+    /// every poll.
     #[test]
     fn wait_hint_fires_exactly_once() {
         let tmp = TempDir::new().unwrap();
