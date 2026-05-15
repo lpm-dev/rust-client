@@ -1,17 +1,9 @@
-//! Manifest specifier classifier (Phase 59.0).
+//! Manifest specifier classifier.
 //!
-//! Today's resolver classifies dependency specifiers ad-hoc — registry
-//! semver ranges and `npm:foo@^1.2.3` aliases go through
-//! [`crate::ranges::parse_npm_alias`] + [`crate::ranges::NpmRange`];
-//! `workspace:*` is handled by string-prefix checks in
-//! `lpm-workspace`; everything else is rejected at the alias parser
-//! ([crates/lpm-resolver/src/ranges.rs:323-325]).
-//!
-//! Phase 59.0 introduces a single classifier site so the resolver,
-//! manifest reader, and manifest writer all agree on what each
-//! specifier shape means. Centralization closes the back door
-//! where a new shape could land without going through the parser
-//! and silently slip through.
+//! Single classifier site so the resolver, manifest reader, and manifest
+//! writer all agree on what each specifier shape means. Centralization
+//! closes the back door where a new shape could land without going through
+//! the parser and silently slip through.
 //!
 //! ## Recognized shapes (priority order — first match wins)
 //!
@@ -49,8 +41,7 @@ pub enum Specifier {
     /// classification into a [`crate::ranges::NpmRange`] happens
     /// downstream.
     SemverRange(String),
-    /// `npm:<target>@<range>` — install `<target>` under a local
-    /// alias. Phase 40 P2 plumbing.
+    /// `npm:<target>@<range>` — install `<target>` under a local alias.
     NpmAlias { target: String, range: String },
     /// `workspace:<rest>` — `*`, `^`, `~`, or any explicit range.
     /// Resolution happens in `lpm-workspace`; the string after the
@@ -415,9 +406,7 @@ fn parse_host_shorthand(s: &str) -> Result<Option<Specifier>, SpecifierParseErro
             }
             let (path, refspec) = split_at_hash(body);
             // Symmetry with bare `user/repo`: prefixed forms must
-            // also be exactly `user/repo` shape, not multi-segment
-            // paths. (Phase 59.0 day-1.5 fix — the v0 of this
-            // function accepted any non-empty body.)
+            // also be exactly `user/repo` shape, not multi-segment paths.
             if !is_user_repo_shape(path) {
                 return Err(SpecifierParseError::HostShorthandInvalidShape(
                     s.to_string(),
@@ -455,13 +444,12 @@ fn parse_host_shorthand(s: &str) -> Result<Option<Specifier>, SpecifierParseErro
 /// matches GitHub/GitLab/Bitbucket repo-name rules: ASCII
 /// alphanumerics plus `-`, `_`, `.`.
 ///
-/// **Phase 59.0 (post-review):** rejects halves that look like a
-/// version literal — `1.0/2.0` would otherwise pass every char
-/// check (digits + `.`) and silently expand to a github URL.
-/// `looks_like_version_literal` rejects all-digits-and-dots strings
-/// so a typo like `1.0/2.0` falls through to the semver bucket and
-/// gets a parse error from node_semver downstream rather than a
-/// network fetch against `github.com/1.0/2.0.git`.
+/// Rejects halves that look like a version literal — `1.0/2.0` would
+/// otherwise pass every char check (digits + `.`) and silently expand
+/// to a github URL. `looks_like_version_literal` rejects all-digits-and-dots
+/// strings so a typo like `1.0/2.0` falls through to the semver bucket
+/// and gets a parse error downstream rather than a network fetch against
+/// `github.com/1.0/2.0.git`.
 fn is_user_repo_shape(s: &str) -> bool {
     let Some((lhs, rhs)) = s.split_once('/') else {
         return false;
@@ -1045,8 +1033,8 @@ mod tests {
     // ── Pure-version literals don't masquerade as repo handles ───────────────
     // A typo'd version range like `1.0/2.0` passes every char check
     // (digits + `.`) and would otherwise silently expand to a fake
-    // github URL. Phase 59.0 post-review fix rejects shapes where
-    // either half is composed entirely of digits and dots.
+    // github URL. Rejects shapes where either half is composed entirely
+    // of digits and dots.
 
     #[test]
     fn bare_version_literal_pair_is_not_repo_handle() {

@@ -21,26 +21,27 @@ use tokio::runtime::Handle;
 use tokio::sync::Notify;
 use version_ranges::Ranges;
 
-/// Shared metadata cache for the Phase 49 streaming BFS resolver.
+/// Shared metadata cache for the streaming BFS resolver.
 ///
 /// Keyed by [`CanonicalKey`] — split-retry identities of the same canonical
 /// package share a single entry. The walker inserts under canonical names;
 /// the provider canonicalizes at every read so split contexts hit the
-/// same cell. Changing this to a context-bearing key re-introduces the
-/// silent notify-miss bug documented in the Phase 49 preplan §4.2.
+/// same cell. Changing this to a context-bearing key re-introduces a
+/// silent notify-miss bug (split contexts silently miss walker-inserted
+/// entries and fall through to escape-hatch fetches).
 ///
-/// **Phase 55 W4:** values are wrapped in `Arc` so `.value().clone()`
-/// is a refcount bump, not a deep clone of 7 nested HashMaps. The
-/// greedy resolver's `ensure_manifest` was hitting ~5 sec of allocator
-/// churn cloning popular packuments per edge (lodash + react + eslint
-/// transitives have hundreds of versions × dozens of deps each); with
-/// Arc the per-edge cost drops to nanoseconds.
+/// Values are wrapped in `Arc` so `.value().clone()` is a refcount bump,
+/// not a deep clone of 7 nested HashMaps. The greedy resolver's
+/// `ensure_manifest` was hitting ~5 sec of allocator churn cloning
+/// popular packuments per edge (lodash + react + eslint transitives have
+/// hundreds of versions × dozens of deps each); with Arc the per-edge
+/// cost drops to nanoseconds.
 pub type SharedCache = Arc<DashMap<CanonicalKey, Arc<CachedPackageInfo>>>;
 
 /// Per-canonical-key waker map. The walker fires `notify_waiters()` after
 /// inserting each manifest; the provider's `ensure_cached` wait-loop
-/// awaits on the same handle. See preplan §5.1 for the granularity
-/// rationale (per-package vs. global `Notify`).
+/// awaits on the same handle. Per-package granularity (vs. a global
+/// `Notify`) avoids spurious wakes that would stall unrelated waiters.
 pub type NotifyMap = Arc<DashMap<CanonicalKey, Arc<Notify>>>;
 
 /// Walker-done flag, shared between [`crate::BfsWalker`] and the
@@ -56,12 +57,12 @@ pub type NotifyMap = Arc<DashMap<CanonicalKey, Arc<Notify>>>;
 /// after `Notified::enable()` and short-circuits to the escape-hatch
 /// fetch when set.
 ///
-/// Defaults to `Arc::new(AtomicBool::new(false))` for pre-49 callers
-/// (no walker attached, `fetch_wait_timeout == ZERO` so the wait-loop
-/// is skipped wholesale; the flag is consulted only when the loop runs).
+/// Defaults to `Arc::new(AtomicBool::new(false))` for callers with no
+/// walker attached — `fetch_wait_timeout == ZERO` skips the wait-loop
+/// wholesale, so the flag is consulted only when the loop runs.
 pub type WalkerDone = Arc<AtomicBool>;
 
-/// Phase 49 provider-side observability for `timing.resolve.streaming_bfs`.
+/// Provider-side observability for `timing.resolve.streaming_bfs`.
 ///
 /// Three atomic counters, share across split-retry passes via the
 /// inner `Arc<AtomicU64>`s. Install.rs creates a single instance,
@@ -87,17 +88,16 @@ pub type WalkerDone = Arc<AtomicBool>;
 ///   `direct_fetch_and_cache` call. Healthy 0 when the walker is
 ///   attached and keeps ahead of PubGrub. Non-zero signals either
 ///   (a) a walker gap (walker didn't reach a package PubGrub needed)
-///   or (b) no walker attached (pre-§5 provider shape with
-///   `fetch_wait_timeout == ZERO`, where every miss routes through
-///   the escape hatch).
+///   or (b) no walker attached (`fetch_wait_timeout == ZERO`, where
+///   every miss routes through the escape hatch).
 ///
 /// - `cache_wait_walker_done_shortcuts` — incremented when the wait-loop
 ///   exited early because the walker had already finished and the key
-///   was confirmed not cached. The healthy outcome of the
-///   walker-done broadcast (preplan §5.1 fix): missed transitives
-///   route to the escape-hatch in microseconds instead of burning
-///   the full `fetch_wait_timeout`. This counter + `escape_hatch_fetches`
-///   is the canary for "walker had a gap, but it was cheap to recover".
+///   was confirmed not cached. The healthy outcome of the walker-done
+///   broadcast: missed transitives route to the escape-hatch in
+///   microseconds instead of burning the full `fetch_wait_timeout`.
+///   This counter + `escape_hatch_fetches` is the canary for "walker
+///   had a gap, but it was cheap to recover".
 #[derive(Debug, Clone, Default)]
 pub struct StreamingBfsMetrics {
     cache_waits: Arc<AtomicU64>,
@@ -168,7 +168,7 @@ pub struct CachedPackageInfo {
     /// Optional dependency names (per version). Included in deps but resolution failure
     /// for these is non-fatal.
     pub optional_dep_names: HashMap<String, HashSet<String>>,
-    /// **Phase 66 confidence-followup R5** — `peerDependenciesMeta.optional`
+    /// `peerDependenciesMeta.optional`
     /// flags per version: `version_string → { peer_name }` for peers
     /// the manifest marked optional. Consumed by [`crate::check_unmet_peers`]
     /// to suppress the missing-peer warning (an opt-out the manifest
@@ -176,7 +176,7 @@ pub struct CachedPackageInfo {
     /// wrong version still produce a warning — the user opted into
     /// having a peer, just at an incompatible version.
     pub optional_peer_names: HashMap<String, HashSet<String>>,
-    /// **Phase 66 confidence-followup R4** — `bundleDependencies` /
+    /// `bundleDependencies` /
     /// `bundledDependencies` names per version. Per-version because
     /// the same package's bundling intent can change across releases
     /// (e.g., a maintainer drops bundling between major versions).
@@ -193,7 +193,7 @@ pub struct CachedPackageInfo {
     /// Distribution info per version: tarball URL and integrity hash.
     /// Carried through to the download phase to avoid re-fetching metadata.
     pub dist: HashMap<String, CachedDistInfo>,
-    /// **Phase 40 P2** — npm-alias dep edges per version. Shape:
+    /// npm-alias dep edges per version. Shape:
     /// `version_string → { local_name → target_canonical_name }`.
     /// Only populated for versions whose declared deps include the
     /// `npm:<target>@<range>` alias syntax. Used by the resolver to
@@ -217,83 +217,65 @@ pub struct PlatformMeta {
 pub struct LpmDependencyProvider {
     client: Arc<RegistryClient>,
     rt: Handle,
-    /// Phase 49: canonical-keyed, concurrent metadata cache. See
-    /// [`SharedCache`] for the invariant rationale. When a walker is
-    /// plumbed (Phase 49 §5), the same `Arc` is handed to the walker so
-    /// inserts become visible to the provider without a copy.
+    /// Canonical-keyed, concurrent metadata cache. When a walker is
+    /// attached, the same `Arc` is handed to the walker so inserts become
+    /// visible to the provider without a copy.
     cache: SharedCache,
-    /// Phase 49: per-canonical-key waker map. Populated on-demand by the
-    /// wait-loop inside `ensure_cached`; walker calls
-    /// `notify_waiters()` on the matching entry after insert.
+    /// Per-canonical-key waker map. Populated on-demand by the wait-loop
+    /// inside `ensure_cached`; walker calls `notify_waiters()` on the
+    /// matching entry after insert.
     notify_map: NotifyMap,
-    /// Phase 49: routing policy for escape-hatch fetches. Default
-    /// [`RouteMode::Direct`] per preplan §3. LPM packages still go via
+    /// Routing policy for escape-hatch fetches. LPM packages still go via
     /// the Worker regardless (see [`RouteTable::route_for_package`]).
-    /// Phase 58 day-4: now a [`RouteTable`] so `.npmrc`-declared
-    /// custom registries can produce [`UpstreamRoute::Custom`] in the
-    /// dispatcher below.
+    /// When `.npmrc` is parsed, this is a full [`RouteTable`] so
+    /// custom registries can produce [`UpstreamRoute::Custom`].
     route_table: RouteTable,
-    /// Phase 49: how long `ensure_cached`'s wait-loop is willing to
-    /// block on a walker insert before falling through to the direct
-    /// fetch escape hatch.
+    /// How long `ensure_cached`'s wait-loop is willing to block on a
+    /// walker insert before falling through to the direct fetch escape hatch.
     ///
-    /// Defaults to [`Duration::ZERO`] so the provider stays fetch-on-
-    /// miss (identical to today's behavior) when no walker is attached.
-    /// Phase 49 §5 will bump this to ~5s once `install.rs` shares the
-    /// walker-populated `SharedCache` with the provider, making the
-    /// wait-loop the hot path and the direct fetch the rare escape
-    /// hatch.
+    /// Defaults to [`Duration::ZERO`] so the provider stays fetch-on-miss
+    /// when no walker is attached.
     fetch_wait_timeout: Duration,
-    /// Phase 49 wait-loop early-exit signal. See [`WalkerDone`] for the
+    /// Wait-loop early-exit signal. See [`WalkerDone`] for the
     /// shutdown-handshake rationale. Default `Arc::new(AtomicBool::new(false))`
-    /// for pre-49 callers — the wait-loop never runs (`fetch_wait_timeout
-    /// == ZERO`), so the flag is unobserved. Install.rs's Phase 49 §5
-    /// orchestration shares the *same* Arc with the walker so the
+    /// for callers with no walker — the wait-loop never runs
+    /// (`fetch_wait_timeout == ZERO`), so the flag is unobserved. The
+    /// orchestration layer shares the *same* Arc with the walker so the
     /// walker's terminal store is visible here without a re-allocation.
     walker_done: WalkerDone,
-    /// Phase 49 §6: streaming-BFS observability counters. Shared Arc
-    /// across split-retry passes; install.rs reads the snapshot after
-    /// resolution for `timing.resolve.streaming_bfs` JSON output.
+    /// Streaming-BFS observability counters. Shared Arc across split-retry
+    /// passes; install.rs reads the snapshot after resolution for
+    /// `timing.resolve.streaming_bfs` JSON output.
     metrics: StreamingBfsMetrics,
     root_deps: HashMap<String, String>,
     /// Packages that should be split into per-parent identities.
     split_packages: HashSet<String>,
-    /// Phase 32 Phase 5 — fully-parsed override IR. Records every applied
-    /// override into its internal `RefCell<Vec<OverrideHit>>` so callers
-    /// can drain the trace after `pubgrub::resolve` returns. Always
-    /// present (defaults to `OverrideSet::empty()` when no overrides
-    /// are declared in `package.json`).
+    /// Fully-parsed override IR. Records every applied override into its
+    /// internal `RefCell<Vec<OverrideHit>>` so callers can drain the trace
+    /// after `pubgrub::resolve` returns. Always present (defaults to
+    /// `OverrideSet::empty()` when no overrides are declared).
     overrides: OverrideSet,
-    /// Phase 34.5: set after the first batch_metadata call fails (e.g., 401).
+    /// Set after the first batch_metadata call fails (e.g., 401).
     /// Prevents repeated guaranteed-failing batch requests during resolution.
     /// Individual ensure_cached calls still work as fallback.
     batch_disabled: RefCell<bool>,
-    /// Phase 40 P1 — count of optional deps skipped because no
-    /// platform-compatible version satisfies the declared range on the
-    /// current OS/CPU. Cumulative across all calls to `get_dependencies`
-    /// within a single provider instance. Drained via
-    /// [`Self::platform_skipped_count`] (or [`Self::into_parts`] bundled
-    /// with cache + override hits) after `pubgrub::resolve` returns so the
-    /// resolver can expose it in `ResolveResult.platform_skipped`, which
-    /// the install CLI surfaces as `timing.resolve.platform_skipped` in
-    /// `--json` output.
+    /// Count of optional deps skipped because no platform-compatible version
+    /// satisfies the declared range on the current OS/CPU. Cumulative across
+    /// all calls to `get_dependencies` within a single provider instance.
+    /// Drained via [`Self::platform_skipped_count`] after `pubgrub::resolve`
+    /// returns so the resolver can expose it in `ResolveResult.platform_skipped`.
     platform_skipped: RefCell<usize>,
-    /// **Phase 40 P2** — root-level npm-alias edges accumulated as
-    /// `get_dependencies(Root)` walks `self.root_deps`. Shape:
-    /// `local_name → target_canonical_name`. Surfaced via
-    /// `into_parts()` so `ResolveResult.root_aliases` carries the map
-    /// into the install pipeline, which feeds it to the linker so
-    /// `node_modules/<local>/` is created pointing at the aliased
-    /// target's `.lpm/<target>@<version>/` store entry.
+    /// Root-level npm-alias edges accumulated as `get_dependencies(Root)`
+    /// walks `self.root_deps`. Shape: `local_name → target_canonical_name`.
+    /// Surfaced via `into_parts()` so `ResolveResult.root_aliases` carries
+    /// the map into the install pipeline, which feeds it to the linker.
     root_aliases: RefCell<HashMap<String, String>>,
-    /// **Phase 42 P2** — memoize `(ResolverPackage, raw_range) →
-    /// Ranges<NpmVersion>` so repeated PubGrub `get_dependencies`
-    /// queries for the same edge skip the O(N-versions) conversion
-    /// inside `NpmRange::to_pubgrub_ranges`. Phase 41 measured this
-    /// uncached conversion at ~962 ms of `pubgrub_core_ms` when the
-    /// metadata cache grew by 9 packages; the uncached O(queries × N)
-    /// cost is what made the resolver look "sensitive to metadata
-    /// bloat."
+    /// Memoize `(ResolverPackage, raw_range) → Ranges<NpmVersion>` so
+    /// repeated PubGrub `get_dependencies` queries for the same edge skip
+    /// the O(N-versions) conversion inside `NpmRange::to_pubgrub_ranges`.
+    /// The uncached conversion measured at ~962 ms of `pubgrub_core_ms`
+    /// when the metadata cache grew by 9 packages; the uncached O(queries
+    /// × N) cost is what made the resolver look "sensitive to metadata bloat."
     ///
     /// Correctness. Safe to memoize for the lifetime of a single
     /// provider instance because `available_versions(pkg)` is fixed
@@ -305,8 +287,8 @@ pub struct LpmDependencyProvider {
     /// cache to reason about split equivalence, and safe by
     /// construction.
     ///
-    /// NOT transferred across provider instances. The Phase 49
-    /// `SharedCache` Arc carries metadata across split-retry passes;
+    /// NOT transferred across provider instances. The `SharedCache`
+    /// Arc carries metadata across split-retry passes;
     /// this range cache is re-built per pass. Keeps the invariant
     /// local: anything that changes how `available_versions` resolves
     /// (e.g. a future per-split platform override) can't accidentally
@@ -325,14 +307,9 @@ impl LpmDependencyProvider {
             rt,
             cache: Arc::new(DashMap::new()),
             notify_map: Arc::new(DashMap::new()),
-            // Phase 49 §3: keep provider's default at Proxy to preserve
-            // pre-49 three-tier npm fetch semantics for existing callers.
-            // `install.rs` in §5 explicitly switches via
-            // `with_route_table(RouteTable::from_env_and_filesystem(cwd)?)`
-            // once the walker is plumbed. Keeps §3 behavior-preserving.
-            // Phase 58 day-4: empty npmrc → no Custom routes; this
-            // preserves the pre-58 contract for callers that haven't
-            // yet been migrated.
+            // Default to Proxy; callers with a walker wire in the full
+            // RouteTable via `with_route_table`. Empty npmrc → no Custom
+            // routes, preserving fetch semantics for pre-npmrc callers.
             route_table: RouteTable::from_mode_only(RouteMode::Proxy),
             fetch_wait_timeout: Duration::ZERO,
             walker_done: Arc::new(AtomicBool::new(false)),
@@ -359,14 +336,9 @@ impl LpmDependencyProvider {
             rt,
             cache: Arc::new(DashMap::new()),
             notify_map: Arc::new(DashMap::new()),
-            // Phase 49 §3: keep provider's default at Proxy to preserve
-            // pre-49 three-tier npm fetch semantics for existing callers.
-            // `install.rs` in §5 explicitly switches via
-            // `with_route_table(RouteTable::from_env_and_filesystem(cwd)?)`
-            // once the walker is plumbed. Keeps §3 behavior-preserving.
-            // Phase 58 day-4: empty npmrc → no Custom routes; this
-            // preserves the pre-58 contract for callers that haven't
-            // yet been migrated.
+            // Default to Proxy; callers with a walker wire in the full
+            // RouteTable via `with_route_table`. Empty npmrc → no Custom
+            // routes, preserving fetch semantics for pre-npmrc callers.
             route_table: RouteTable::from_mode_only(RouteMode::Proxy),
             fetch_wait_timeout: Duration::ZERO,
             walker_done: Arc::new(AtomicBool::new(false)),
@@ -381,18 +353,12 @@ impl LpmDependencyProvider {
         }
     }
 
-    /// Phase 49: attach an externally-owned shared cache + notify map
-    /// (e.g. the one the BFS walker is populating concurrently). Also
-    /// sets the `fetch_wait_timeout` so `ensure_cached`'s wait-loop
-    /// actually waits instead of falling straight to the escape hatch,
-    /// and threads the [`WalkerDone`] flag so the wait-loop can
-    /// short-circuit on terminated-walker without burning the timeout.
-    ///
-    /// This constructor is intended for the Phase 49 §5 install.rs
-    /// orchestration where the walker + provider share state; pre-49
-    /// callers stick with [`Self::new`] / [`Self::new_with_splits`]
-    /// (which create their own Arcs with zero timeout).
-    #[allow(dead_code)] // wired by install.rs in §5
+    /// Attach an externally-owned shared cache + notify map (the one the
+    /// BFS walker is populating concurrently). Also sets `fetch_wait_timeout`
+    /// so `ensure_cached`'s wait-loop actually waits, and threads the
+    /// [`WalkerDone`] flag so the wait-loop can short-circuit on a
+    /// terminated walker without burning the timeout.
+    #[allow(dead_code)] // wired by install.rs orchestration
     pub fn with_shared_cache(
         mut self,
         cache: SharedCache,
@@ -407,38 +373,33 @@ impl LpmDependencyProvider {
         self
     }
 
-    /// Phase 49: set the escape-hatch route mode. Applies to both the
-    /// provider's own miss-path fetches AND any walker attached via
-    /// [`Self::with_shared_cache`] (the walker is constructed with the
-    /// same mode by the install.rs orchestration).
-    #[allow(dead_code)] // wired by install.rs in §5
+    /// Set the escape-hatch route mode. Applies to both the provider's
+    /// miss-path fetches AND any walker attached via [`Self::with_shared_cache`].
+    #[allow(dead_code)] // wired by install.rs orchestration
     pub fn with_route_mode(mut self, mode: RouteMode) -> Self {
         self.route_table = RouteTable::from_mode_only(mode);
         self
     }
 
-    /// Phase 58 day-4: install.rs's preferred setter — supplies the
-    /// full `RouteTable` so `.npmrc`-declared custom registries reach
-    /// the per-package fetch dispatcher.
+    /// Supply the full `RouteTable` so `.npmrc`-declared custom registries
+    /// reach the per-package fetch dispatcher.
     pub fn with_route_table(mut self, table: RouteTable) -> Self {
         self.route_table = table;
         self
     }
 
-    /// Phase 49 §6: attach an externally-owned metrics object so the
-    /// same counters accumulate across split-retry passes (each pass
-    /// creates a new provider instance; the shared `Arc<AtomicU64>`
-    /// inside `StreamingBfsMetrics` survives). Install.rs reads the
-    /// snapshot after resolution completes for JSON output.
+    /// Attach an externally-owned metrics object so the same counters
+    /// accumulate across split-retry passes (each pass creates a new
+    /// provider instance; the shared `Arc<AtomicU64>` inside
+    /// `StreamingBfsMetrics` survives).
     pub fn with_streaming_metrics(mut self, metrics: StreamingBfsMetrics) -> Self {
         self.metrics = metrics;
         self
     }
 
-    /// Phase 32 Phase 5 — install the fully-parsed override set. The set
-    /// is owned by the provider for the duration of resolution; the
-    /// resolver records every applied override into its internal hits
-    /// buffer.
+    /// Install the fully-parsed override set. The set is owned by the
+    /// provider for the duration of resolution; the resolver records every
+    /// applied override into its internal hits buffer.
     ///
     /// **Important**: any package targeted by a path-selector override
     /// MUST also be in the `split_packages` set so PubGrub creates the
@@ -454,17 +415,13 @@ impl LpmDependencyProvider {
 
     /// Ensure package metadata is cached. Fetches from registry on miss.
     ///
-    /// Phase 49 shape (preplan §5.1):
-    ///
     /// 1. **Canonicalize first.** `ResolverPackage` carries a `context`
-    ///    field in its `Hash + Eq` (split-retry identities); the cache
-    ///    is keyed by [`CanonicalKey`] which strips that context. Every
-    ///    cache interaction MUST go through canonicalization or split
-    ///    retries silently miss walker-inserted entries and fall through
-    ///    to escape-hatch fetches — a silent perf cliff rather than a
-    ///    correctness bug, but exactly the thing preplan §4.2 cautions
-    ///    against. Do not change the order of operations in this
-    ///    function without re-reading that section.
+    ///    field in its `Hash + Eq` (split-retry identities); the cache is
+    ///    keyed by [`CanonicalKey`] which strips that context. Every cache
+    ///    interaction MUST go through canonicalization or split retries
+    ///    silently miss walker-inserted entries and fall through to
+    ///    escape-hatch fetches — a silent perf cliff rather than a
+    ///    correctness bug. Do not change the order of operations here.
     ///
     /// 2. **Fast path:** cache hit → return immediately.
     ///
@@ -506,9 +463,8 @@ impl LpmDependencyProvider {
         // the loop's first iteration falls straight to step 4.
         if !self.fetch_wait_timeout.is_zero() {
             // Count every PubGrub callback that hit the wait-loop on a
-            // cache miss — the healthy Phase 49 cold-install shape has
-            // `cache_waits ≈ total_packages` (every miss served by the
-            // walker's insert, no fetches).
+            // cache miss — healthy cold-install has cache_waits ≈ total_packages
+            // (every miss served by the walker's insert, no fetches).
             self.metrics.incr_cache_wait();
             let notify = self
                 .notify_map
@@ -561,18 +517,16 @@ impl LpmDependencyProvider {
         self.direct_fetch_and_cache(package)
     }
 
-    /// Phase 49: synchronous fetch of a single package, keyed + cached
-    /// under its canonical form. Routing honors [`Self::route_mode`]:
-    /// LPM → Worker unconditionally; npm → per `RouteMode`.
+    /// Synchronous fetch of a single package, keyed + cached under its
+    /// canonical form. LPM → Worker unconditionally; npm → per `RouteMode`.
     ///
     /// Called by [`Self::ensure_cached`] as the escape-hatch when the
     /// walker either isn't attached or didn't reach this package within
     /// `fetch_wait_timeout`.
     fn direct_fetch_and_cache(&self, package: &ResolverPackage) -> Result<(), ProviderError> {
         let key = CanonicalKey::from(package);
-        // Phase 49 §6: count every fetch that falls through to the
-        // escape hatch. Root returns early without triggering a
-        // registry fetch, so it doesn't count against the metric.
+        // Count every fetch that falls through to the escape hatch.
+        // Root returns early without triggering a registry fetch.
         if !package.is_root() {
             self.metrics.incr_escape_hatch_fetch();
         }
@@ -587,19 +541,13 @@ impl LpmDependencyProvider {
                     .block_on(self.client.get_package_metadata(&pkg_name))
                     .map_err(classify_registry_error)?;
 
-                // Phase 34.5: use shared parser. Prereleases included
+                // Use shared parser. Prereleases included
                 // (range matcher handles npm prerelease semantics).
                 let info = parse_metadata_to_cache_info(&metadata);
                 self.insert_and_notify(key, info);
                 Ok(())
             }
             ResolverPackage::Npm { name, .. } => {
-                // Phase 49: npm fetches honor the route_mode. In Direct
-                // (shipped default) this skips the Worker hop entirely;
-                // in Proxy it goes through the Worker with npm fallback.
-                // @lpm.dev/* can't land here — it's handled by the Lpm
-                // arm above — but `route_for_package` still enforces the
-                // policy symmetrically for the walker's sake.
                 let route = self.route_table.route_for_package(name);
                 let metadata = match route {
                     UpstreamRoute::LpmWorker => {
@@ -609,10 +557,8 @@ impl LpmDependencyProvider {
                         self.rt.block_on(self.client.get_npm_metadata_direct(name))
                     }
                     UpstreamRoute::Custom { target, auth } => {
-                        // Phase 58 day-4: `.npmrc`-declared custom
-                        // registry. Auth (if any) is origin-scoped and
-                        // re-verified inside `get_npm_metadata_from`
-                        // before the Authorization header is attached.
+                        // Auth is origin-scoped and re-verified inside
+                        // `get_npm_metadata_from` before attaching the header.
                         self.rt.block_on(self.client.get_npm_metadata_from(
                             &target.base_url,
                             name,
@@ -622,8 +568,8 @@ impl LpmDependencyProvider {
                 }
                 .map_err(|e| ProviderError::Registry(format!("npm:{name}: {e}")))?;
 
-                // Phase 34.5: use shared parser. Prereleases are kept; the
-                // range matcher handles npm prerelease semantics.
+                // Use shared parser. Prereleases are kept; the range matcher
+                // handles npm prerelease semantics.
                 let info = parse_metadata_to_cache_info(&metadata);
                 tracing::debug!("npm package {name}: {} versions", info.versions.len());
                 self.insert_and_notify(key, info);
@@ -632,11 +578,10 @@ impl LpmDependencyProvider {
         }
     }
 
-    /// Phase 49: insert a freshly-parsed `CachedPackageInfo` and fire any
-    /// waiters on its canonical key. Ordering is load-bearing per preplan
-    /// §5.5: insert → notify. Do NOT reorder. A future refactor that
-    /// notifies before inserting would race the provider's re-check and
-    /// cause spurious wait-loop iterations.
+    /// Insert a freshly-parsed `CachedPackageInfo` and fire any waiters on
+    /// its canonical key. Ordering is load-bearing: insert → notify. Do NOT
+    /// reorder — notifying before inserting races the provider's re-check
+    /// and causes spurious wait-loop iterations.
     fn insert_and_notify(&self, key: CanonicalKey, info: CachedPackageInfo) {
         self.cache.insert(key.clone(), Arc::new(info));
         if let Some(n) = self.notify_map.get(&key) {
@@ -647,8 +592,8 @@ impl LpmDependencyProvider {
     /// Get the list of versions for a package that are available on the
     /// current platform.
     ///
-    /// Phase 49: canonicalizes before cache lookup — split-retry
-    /// identities of the same canonical package share one cache entry.
+    /// Canonicalizes before cache lookup — split-retry identities of the
+    /// same canonical package share one cache entry.
     fn available_versions(&self, package: &ResolverPackage) -> Vec<NpmVersion> {
         let _span = tracing::debug_span!("available_versions", pkg = %package).entered();
         let _prof = crate::profile::available_versions::start();
@@ -669,8 +614,8 @@ impl LpmDependencyProvider {
             .unwrap_or_default()
     }
 
-    /// **Phase 42 P2** — memoized wrapper around
-    /// [`NpmRange::to_pubgrub_ranges`]. First call for a given
+    /// Memoized wrapper around [`NpmRange::to_pubgrub_ranges`]. First call
+    /// for a given
     /// `(package, raw_range)` pair computes the O(N-versions)
     /// conversion and caches the result; subsequent calls return a
     /// clone of the cached `Ranges`. See the doc on
@@ -699,20 +644,12 @@ impl LpmDependencyProvider {
         computed
     }
 
-    /// Phase 32 Phase 5 — extract the override hits AND the metadata
-    /// cache in one shot. The two-stage `take_override_hits()` /
-    /// `into_cache()` API is also available for callers that need only
-    /// one of the two.
-    ///
-    /// Phase 40 P1 also surfaces the `platform_skipped` count so the
-    /// resolver can accumulate it across split-retry passes without a
-    /// separate borrow.
-    ///
-    /// Phase 40 P2 surfaces the `root_aliases` map so the install
-    /// pipeline knows which root node_modules entries need alias
-    /// symlinks instead of the default `<canonical_name> → store`
-    /// wiring.
-    // Phase 53 W5+W6: `Arc<CachedPackageInfo>` pushed the tuple over
+    /// Extract the override hits AND the metadata cache in one shot. The
+    /// two-stage `take_override_hits()` / `into_cache()` API is also
+    /// available for callers that need only one of the two. Surfaces
+    /// `platform_skipped` and `root_aliases` so the resolver can
+    /// accumulate them across split-retry passes without separate borrows.
+    // `Arc<CachedPackageInfo>` pushed the tuple over
     // clippy's type_complexity threshold (was `CachedPackageInfo` alone).
     // CLAUDE.md explicitly permits `#[allow(clippy::type_complexity)]`
     // for design-level lints where the fix would be a refactor; the
@@ -730,11 +667,10 @@ impl LpmDependencyProvider {
         let hits = self.overrides.take_hits();
         let platform_skipped = *self.platform_skipped.borrow();
         let root_aliases = self.root_aliases.into_inner();
-        // Phase 53 audit-flag A3: surface `Arc<CachedPackageInfo>` directly
-        // — pre-A3 we deep-cloned each entry's seven nested HashMaps to
-        // produce a `HashMap<_, CachedPackageInfo>`. Per-entry Arc::clone
-        // is a refcount bump; the deep-clone path moved ~7 MB per cold
-        // resolve on `bench/fixture-large` (hidden inside `pubgrub_ms`).
+        // Surface Arc<CachedPackageInfo> directly — deep-cloning each
+        // entry's seven nested HashMaps moved ~7 MB per cold resolve on
+        // `bench/fixture-large` (hidden inside `pubgrub_ms`). Arc::clone is
+        // a refcount bump.
         let cache: HashMap<CanonicalKey, Arc<CachedPackageInfo>> = match Arc::try_unwrap(self.cache)
         {
             Ok(dm) => dm.into_iter().collect(),
@@ -746,13 +682,13 @@ impl LpmDependencyProvider {
         (cache, hits, platform_skipped, root_aliases)
     }
 
-    /// Phase 32 Phase 5 — pick the version the resolver would choose
-    /// WITHOUT any override applied. Returns the newest version in the
-    /// consumer's declared range that is platform-compatible.
+    /// Pick the version the resolver would choose without any override applied.
+    /// Returns the newest version in the consumer's declared range that is
+    /// platform-compatible.
     ///
-    /// Factored out of [`Self::choose_version`] so the override path
-    /// can compute `from_version` for the apply trace AND fall back to
-    /// this same value when no override matches.
+    /// Factored out of [`Self::choose_version`] so the override path can
+    /// compute `from_version` for the apply trace AND fall back to this same
+    /// value when no override matches.
     fn pick_natural_version(
         &self,
         package: &ResolverPackage,
@@ -785,15 +721,14 @@ impl LpmDependencyProvider {
         None
     }
 
-    /// Phase 32 Phase 5 — apply an [`OverrideTarget`] against the
-    /// consumer's PubGrub `range` to produce a final forced version.
+    /// Apply an [`OverrideTarget`] against the consumer's PubGrub `range`
+    /// to produce a final forced version.
     ///
-    /// - `PinnedVersion` returns the pinned version verbatim, but ONLY
-    ///   if it satisfies the consumer's declared range. The Phase 5
-    ///   contract is that we never pick a version the consumer didn't
-    ///   ask for and silently pretend it works — out-of-range pinned
-    ///   targets return `None` so [`Self::choose_version`] surfaces
-    ///   them as a debug-level warning today.
+    /// - `PinnedVersion` returns the pinned version verbatim, but ONLY if it
+    ///   satisfies the consumer's declared range — never picking a version the
+    ///   consumer didn't ask for and silently pretending it works. Out-of-range
+    ///   pinned targets return `None` so [`Self::choose_version`] surfaces them
+    ///   as a debug-level warning.
     /// - `Range` intersects the override range with the consumer range
     ///   (via the cache's available versions list for THIS package)
     ///   and picks the newest match. The intersect-then-pick semantics
@@ -817,10 +752,10 @@ impl LpmDependencyProvider {
                 range: target_range,
                 ..
             } => {
-                // Walk THIS package's cached versions only. Phase 49:
-                // cache is canonical-keyed, so split-context variants
-                // of the same canonical package share one entry — the
-                // override check is over the canonical version list.
+                // Walk THIS package's cached versions only — cache is
+                // canonical-keyed, so split-context variants of the same
+                // canonical package share one entry — the override check
+                // is over the canonical version list.
                 let key = CanonicalKey::from(package);
                 let info = self.cache.get(&key)?;
                 for v in &info.versions {
@@ -845,25 +780,23 @@ impl LpmDependencyProvider {
     }
 }
 
-/// Phase 34.5: shared metadata → CachedPackageInfo parser.
+/// Shared metadata → CachedPackageInfo parser.
 ///
 /// Extracts versions, deps, peer_deps, optional_deps, platform, and dist
 /// from a `PackageMetadata` response. Shared by `ensure_cached` (provider
-/// escape-hatch fetches) and the Phase 49 walker (`BfsWalker::commit_manifest`).
+/// escape-hatch fetches) and the walker (`BfsWalker::commit_manifest`).
 ///
 /// **Prerelease handling.** All versions, including prereleases, are kept
 /// in the cache. The range matcher (`NpmRange::satisfies` in lpm-semver)
 /// implements correct npm prerelease semantics — prereleases only match
 /// ranges that explicitly include a prerelease on the same
 /// major.minor.patch tuple, so a non-prerelease range like `^1.0.0`
-/// correctly skips `1.0.0-beta.27` even when both are in the cache. The
-/// pre-2026-05-07 behavior unconditionally stripped prereleases for npm
-/// packages, which broke any dep that declared an explicit prerelease
-/// range (e.g. `@rolldown/pluginutils@^1.0.0-beta.27`,
-/// `gensync@^1.0.0-beta.2`) — the cache had zero candidates and the
-/// resolver returned `no version satisfies range (versions available:
-/// 1)`. See the Phase 2 hoisted-mode audit results for the
-/// reproduction (vite-react / nextjs-minimal / babel-presets fixtures).
+/// correctly skips `1.0.0-beta.27` even when both are in the cache.
+/// Previously, prereleases were unconditionally stripped for npm packages,
+/// which broke any dep that declared an explicit prerelease range (e.g.
+/// `@rolldown/pluginutils@^1.0.0-beta.27`, `gensync@^1.0.0-beta.2`) —
+/// the cache had zero candidates and the resolver returned
+/// `no version satisfies range (versions available: 1)`.
 pub(crate) fn parse_metadata_to_cache_info(
     metadata: &lpm_registry::PackageMetadata,
 ) -> CachedPackageInfo {
@@ -876,7 +809,7 @@ pub(crate) fn parse_metadata_to_cache_info(
     let mut bundled_dep_names: HashMap<String, HashSet<String>> = HashMap::new();
     let mut platform: HashMap<String, PlatformMeta> = HashMap::new();
     let mut dist_info: HashMap<String, CachedDistInfo> = HashMap::with_capacity(version_count);
-    // Phase 40 P2 — per-version alias map: local_name → target_canonical_name.
+    // Per-version alias map: local_name → target_canonical_name.
     // Only populated when the version declares at least one `npm:<target>@<range>`
     // dep. The `deps` map above stores local_name → INNER range (range after
     // the `npm:<target>@` prefix) so downstream range parsing is identical to
@@ -1119,15 +1052,15 @@ impl Platform {
     }
 }
 
-/// Phase 40 P3c — should the resolver's follow-up batch calls use
-/// the deep variant (worker recursively resolves transitives) rather
-/// than the shallow variant (just the named packages)?
+/// Should the resolver's follow-up batch calls use the deep variant
+/// (worker recursively resolves transitives) rather than the shallow
+/// variant (just the named packages)?
 ///
 /// Default ON. `LPM_DEEP_FOLLOWUP=0` (or any value starting with `0`)
 /// flips it off. Any other value — including empty — keeps it on, so
 /// `LPM_DEEP_FOLLOWUP=1`, `=true`, `=yes`, unset all behave the same.
 ///
-/// Measured win on cold installs (see commit for Phase 40 P3c):
+/// Measured win on cold installs:
 /// - 58-dep fixture: −24.4 s resolve_ms (−39 %)
 /// - 280-pkg fixture: −3.5 s resolve_ms (−28 %)
 ///
@@ -1238,13 +1171,12 @@ impl DependencyProvider for LpmDependencyProvider {
         // `from → to` (e.g. `foo 1.5.3 → 2.1.0`).
         let natural = self.pick_natural_version(package, range);
 
-        // Step 2 — Phase 32 Phase 5 override lookup. We need a natural
-        // version to evaluate the NameRange and Path range filters
-        // against. If there's no natural match (range satisfies nothing
-        // in the cache), the override can't apply — fall through to the
-        // unconstrained newest-in-range pass below for whatever the
-        // resolver wants to do (usually return None and surface a
-        // NoSolution).
+        // Step 2 — override lookup. We need a natural version to evaluate
+        // the NameRange and Path range filters against. If there's no
+        // natural match (range satisfies nothing in the cache), the
+        // override can't apply — fall through to the unconstrained
+        // newest-in-range pass below for whatever the resolver wants to
+        // do (usually return None and surface a NoSolution).
         if let Some(natural_ver) = natural.as_ref() {
             let parent_ctx = package.context();
             if let Some(entry) = self
@@ -1272,13 +1204,11 @@ impl DependencyProvider for LpmDependencyProvider {
                     return Ok(Some(forced));
                 } else {
                     // The override target didn't satisfy the consumer's
-                    // declared range. This is the "irreconcilable
-                    // override" case — we leave the consumer's natural
-                    // version in place and let any downstream peer/SAT
-                    // checks surface the situation. We do NOT silently
-                    // pretend the override applied (fail-loud at debug
-                    // level for now; future Phase 5.x will turn this
-                    // into a hard error gated on a flag).
+                    // declared range — "irreconcilable override" case.
+                    // Leave the consumer's natural version in place and
+                    // let any downstream peer/SAT checks surface the
+                    // situation. We do NOT silently pretend the override
+                    // applied.
                     tracing::warn!(
                         "override {} could not be satisfied: target {} is outside consumer range for {}",
                         entry.raw_key,
@@ -1308,19 +1238,18 @@ impl DependencyProvider for LpmDependencyProvider {
             // this only fires when there are genuine cache misses (e.g., initial
             // batch failed or was incomplete).
             //
-            // Phase 40 P2 — the prefetch list uses TARGET names for
-            // aliased root deps. Keeping the alias syntax here would
-            // turn into a failed metadata fetch for a bogus name.
-            // Phase 49 §13: when a walker is attached
-            // (`fetch_wait_timeout > 0`), it IS the metadata producer.
-            // Firing the deep batch follow-up from inside
-            // `get_dependencies` here races ahead of the walker and
-            // pays the full Worker RPC latency for manifests the
-            // walker is about to insert anyway. On a cold-cache
-            // express install this turned `pubgrub_ms` from 7 ms into
-            // 21 s. Keep the follow-up only for pre-49 callers (no
-            // walker, `fetch_wait_timeout == ZERO`) so they retain
-            // their pre-49 fast-path behavior.
+            // The prefetch list uses TARGET names for aliased root deps;
+            // keeping the alias syntax would cause a failed metadata
+            // fetch for a bogus name. When a walker is attached
+            // (`fetch_wait_timeout > 0`), it IS the metadata producer —
+            // firing the deep batch follow-up from inside
+            // `get_dependencies` races ahead of the walker and pays the
+            // full Worker RPC latency for manifests the walker is about
+            // to insert anyway. On a cold-cache express install this
+            // inflated `pubgrub_ms` from 7 ms to 21 s. Keep the
+            // follow-up only when there is no walker attached
+            // (`fetch_wait_timeout == ZERO`) so they retain their fast-
+            // path behavior.
             if self.fetch_wait_timeout.is_zero() {
                 let uncached: Vec<String> = self
                     .root_deps
@@ -1337,14 +1266,13 @@ impl DependencyProvider for LpmDependencyProvider {
                     .collect();
 
                 if uncached.len() > 1 && !*self.batch_disabled.borrow() {
-                    // Phase 40 P3c — root-level follow-up (only fires when
-                    // install.rs's pre-resolve batch was absent or
-                    // incomplete) also uses the deep variant so the
-                    // first pubgrub walk starts with a pre-populated
-                    // transitive cache instead of serially fetching
-                    // dep-of-deps inside the tree walk. Same
-                    // `LPM_DEEP_FOLLOWUP` escape hatch as the per-
-                    // package path below.
+                    // Root-level follow-up (only fires when the pre-resolve
+                    // batch was absent or incomplete) also uses the deep
+                    // variant so the first pubgrub walk starts with a
+                    // pre-populated transitive cache instead of serially
+                    // fetching dep-of-deps inside the tree walk. Same
+                    // `LPM_DEEP_FOLLOWUP` escape hatch as the per-package
+                    // path below.
                     let deep_followup = deep_followup_enabled();
                     let fetch = async {
                         if deep_followup {
@@ -1374,14 +1302,14 @@ impl DependencyProvider for LpmDependencyProvider {
 
             let mut constraints = pubgrub::Map::default();
             for (dep_name, dep_range_str) in &self.root_deps {
-                // Phase 40 P2 — root-level alias rewrite. If the
-                // consumer's package.json declares `"local": "npm:target@range"`,
-                // the resolver must key the PubGrub constraint on
-                // `target` (the real registry identity) while the
-                // install pipeline remembers `local → target` for the
-                // linker to build `node_modules/<local>/`. The alias
-                // is recorded in `self.root_aliases` (RefCell,
-                // accumulated as we walk each root dep).
+                // Root-level alias rewrite: if the consumer's package.json
+                // declares `"local": "npm:target@range"`, the resolver
+                // must key the PubGrub constraint on `target` (the real
+                // registry identity) while the install pipeline remembers
+                // `local → target` for the linker to build
+                // `node_modules/<local>/`. The alias is recorded in
+                // `self.root_aliases` (RefCell, accumulated as we walk
+                // each root dep).
                 let (target_name, range_str) = match crate::ranges::parse_npm_alias(dep_range_str) {
                     Some(alias) => {
                         self.root_aliases
@@ -1421,7 +1349,6 @@ impl DependencyProvider for LpmDependencyProvider {
                 let range = if available.is_empty() {
                     npm_range.to_pubgrub_ranges_heuristic()
                 } else {
-                    // Phase 42 P2 — memoized. See Self::range_cache doc.
                     self.to_pubgrub_ranges_cached(&pkg, &npm_range, &available)
                 };
 
@@ -1452,8 +1379,7 @@ impl DependencyProvider for LpmDependencyProvider {
                 .get(&ver_str)
                 .cloned()
                 .unwrap_or_default();
-            // Phase 40 P2 — local_name → target_name. Empty for most
-            // packages (bare-identity deps).
+            // local_name → target_name alias map. Empty for most packages (bare-identity deps).
             let aliases = info.aliases.get(&ver_str).cloned().unwrap_or_default();
             // R4 — collect bundled dep names for this version. Used
             // below to drop them from `deps` BEFORE the prefetch +
@@ -1485,16 +1411,15 @@ impl DependencyProvider for LpmDependencyProvider {
         };
         let _ = bundled_names; // currently consumed up front; kept for future use
 
-        // Phase 40 P4 — scope key for a child of a split parent must
-        // include the parent's OWN split context, not just its canonical
-        // name. Otherwise, grandchildren of two already-split parents
-        // (e.g. `ajv[<root>]@8` and `ajv[eslint]@6`, both children of
-        // different node_modules branches) collapse back into a single
-        // pubgrub identity when they each declare a dep on, say,
-        // `json-schema-traverse`. Using the parent's full Display form
-        // propagates the split downward: grandchildren get
-        // `[ajv[<root>]]` vs `[ajv[eslint]]` and resolve independently,
-        // matching the nested-node_modules shape npm / bun produce.
+        // Scope key for a child of a split parent must include the parent's
+        // OWN split context, not just its canonical name. Otherwise,
+        // grandchildren of two already-split parents (e.g. `ajv[<root>]@8`
+        // and `ajv[eslint]@6`, both children of different node_modules
+        // branches) collapse back into a single pubgrub identity when they
+        // each declare a dep on, say, `json-schema-traverse`. Using the
+        // parent's full Display form propagates the split downward:
+        // grandchildren get `[ajv[<root>]]` vs `[ajv[eslint]]` and resolve
+        // independently, matching the nested-node_modules shape npm/bun produce.
         let parent_name = package.to_string();
         let mut constraints = pubgrub::Map::default();
 
@@ -1503,26 +1428,22 @@ impl DependencyProvider for LpmDependencyProvider {
         // requests for packages the initial batch_metadata_deep already cached.
         // Only fires when 2+ deps are genuine network misses.
         //
-        // Phase 40 P3c — the follow-up batch is issued with `deep=true`
-        // so the worker recurses from each uncached name and returns
-        // its transitives in the same RPC. This is the client-side
-        // companion to P3b (server-side deep-walk depth): every parent
-        // in the walk that hits the follow-up path pre-populates the
-        // disk cache for its descendants, collapsing what would
-        // otherwise be N serial round-trips into 1. Gated by
-        // `LPM_DEEP_FOLLOWUP` (default on). Setting `=0` reverts to
-        // shallow `batch_metadata`, matching the pre-P3c behavior for
-        // comparison / bisection.
+        // The follow-up batch is issued with `deep=true` so the worker
+        // recurses from each uncached name and returns its transitives in
+        // the same RPC — every parent in the walk that hits the follow-up
+        // path pre-populates the disk cache for its descendants, collapsing
+        // what would otherwise be N serial round-trips into 1. Gated by
+        // `LPM_DEEP_FOLLOWUP` (default on). Setting `=0` reverts to shallow
+        // `batch_metadata` for bisection.
         //
-        // Phase 49 §13: when a walker is attached
-        // (`fetch_wait_timeout > 0`), it IS the metadata producer
-        // and the wait-loop in `ensure_cached` handles per-name
-        // misses cheaply via the `walker_done` shortcut. Firing this
-        // batch from inside `get_dependencies` races ahead of the
-        // walker and pays the full Worker RPC latency for manifests
-        // the walker is about to insert. On a cold-cache 60-dep
-        // express install this turned `pubgrub_ms` from 7 ms into
-        // 21 s. Skip wholesale when a walker is attached.
+        // When a walker is attached (`fetch_wait_timeout > 0`), it IS the
+        // metadata producer and the wait-loop in `ensure_cached` handles
+        // per-name misses cheaply via the `walker_done` shortcut. Firing
+        // this batch from inside `get_dependencies` races ahead of the walker
+        // and pays the full Worker RPC latency for manifests the walker is
+        // about to insert. On a cold-cache 60-dep install this inflated
+        // `pubgrub_ms` from 7 ms to 21 s. Skip wholesale when a walker is
+        // attached.
         let deep_followup = deep_followup_enabled();
         if self.fetch_wait_timeout.is_zero() {
             let uncached: Vec<String> = ver_deps
@@ -1586,17 +1507,15 @@ impl DependencyProvider for LpmDependencyProvider {
                 continue;
             }
 
-            // Phase 40 P2 — resolve alias edges under the TARGET identity.
-            //
-            // For non-aliased deps the local name == target name, so
-            // `target_name` is simply `dep_name`. For aliases declared as
-            // `"local": "npm:target@range"` (e.g., Radix UI's
-            // `strip-ansi-cjs → npm:strip-ansi@^6.0.1`), we key the
-            // ResolverPackage on `target_name` so PubGrub dedup + metadata
-            // fetch target the real registry identity. `dep_name` (the
-            // local) is still used everywhere that records "how did the
-            // parent refer to this dep" (split set, is_optional flag),
-            // and in `format_solution` it becomes the edge key on
+            // Resolve alias edges under the TARGET identity. For non-aliased
+            // deps the local name == target name, so `target_name` is simply
+            // `dep_name`. For aliases declared as `"local": "npm:target@range"`
+            // (e.g., Radix UI's `strip-ansi-cjs → npm:strip-ansi@^6.0.1`),
+            // we key the ResolverPackage on `target_name` so PubGrub dedup +
+            // metadata fetch target the real registry identity. `dep_name` (the
+            // local) is still used everywhere that records "how did the parent
+            // refer to this dep" (split set, is_optional flag), and in
+            // `format_solution` it becomes the edge key on
             // `ResolvedPackage.dependencies`.
             let target_name: &str = ver_aliases
                 .get(dep_name)
@@ -1619,12 +1538,11 @@ impl DependencyProvider for LpmDependencyProvider {
 
             // Ensure dep is cached — skip optional deps that fail to fetch.
             //
-            // Phase 35 §10.3: an optional `@lpm.dev` dep that hits an
-            // auth/entitlement error must surface as a user-visible
-            // warning, not a silent debug skip. Pre-fix this site
-            // swallowed the error via `tracing::debug!`, which made
-            // gated-dep omission indistinguishable from the legitimate
-            // "fsevents on linux" platform-skip pattern.
+            // An optional `@lpm.dev` dep that hits an auth/entitlement error
+            // must surface as a user-visible warning, not a silent debug skip.
+            // Without this distinction, gated-dep omission is
+            // indistinguishable from the legitimate "fsevents on linux"
+            // platform-skip pattern.
             //
             // Other failure shapes (network blips, npm registry 5xx,
             // platform-incompatible) keep the silent debug behavior —
@@ -1650,24 +1568,22 @@ impl DependencyProvider for LpmDependencyProvider {
             }
             let available = self.available_versions(&pkg);
 
-            // Phase 40 P1 — unified platform-gate for optional deps.
+            // Unified platform-gate for optional deps. The previous check was
+            // `is_optional && available.is_empty()`, which only covered
+            // packages where ALL versions are platform-incompatible. It missed
+            // the bug shape where one old version has an ERRONEOUS os/cpu
+            // declaration (e.g., `@next/swc-linux-x64-musl@12.0.0` ships with
+            // `os: ["darwin"]` — a Next.js packaging bug from 2021). In that
+            // case `available.is_empty()` was false, the range intersection was
+            // empty (12.0.0 doesn't satisfy ^15), and PubGrub surfaced a
+            // NoSolution that bun/npm never hit.
             //
-            // The PRE-P1 check was `is_optional && available.is_empty()`,
-            // which only covered packages where ALL versions are
-            // platform-incompatible. It missed the bug shape where one
-            // old version has an ERRONEOUS os/cpu declaration (e.g.,
-            // `@next/swc-linux-x64-musl@12.0.0` ships with
-            // `os: ["darwin"]` — a Next.js packaging bug from 2021).
-            // In that case `available.is_empty()` was false, the range
-            // intersection was empty (12.0.0 doesn't satisfy ^15), and
-            // PubGrub surfaced a NoSolution that bun/npm never hit.
-            //
-            // The fix: parse the range FIRST, then check whether any
-            // platform-compatible version actually satisfies it. If not,
-            // skip the optional dep and bump the `platform_skipped`
-            // counter for `--json` observability. Required deps still
-            // fall through to pubgrub with an empty `Ranges`, producing
-            // the same loud error as before (see
+            // Fix: parse the range first, then check whether any
+            // platform-compatible version actually satisfies it. If not, skip
+            // the optional dep and bump the `platform_skipped` counter for
+            // `--json` observability. Required deps still fall through to
+            // pubgrub with an empty `Ranges`, producing the same loud error as
+            // before (see
             // `resolve_regular_dep_with_no_platform_compatible_version_still_fails`
             // in resolve.rs tests).
             let npm_range = match NpmRange::parse(dep_range_str) {
@@ -1701,7 +1617,6 @@ impl DependencyProvider for LpmDependencyProvider {
             let range = if available.is_empty() {
                 npm_range.to_pubgrub_ranges_heuristic()
             } else {
-                // Phase 42 P2 — memoized. See Self::range_cache doc.
                 self.to_pubgrub_ranges_cached(&pkg, &npm_range, &available)
             };
             constraints.insert(pkg, range);
@@ -1747,10 +1662,9 @@ pub enum ProviderError {
     #[error("registry error: {0}")]
     Registry(String),
 
-    /// Phase 35 audit fix #3 + plan §10.3.
-    /// Carries auth/entitlement failures across the
-    /// `LpmError` → `ProviderError` boundary so the optional-dep skip
-    /// path can distinguish "auth needed" (user-visible warn) from
+    /// Carries auth/entitlement failures across the `LpmError` →
+    /// `ProviderError` boundary so the optional-dep skip path can
+    /// distinguish "auth needed" (user-visible warn) from
     /// "platform-incompatible" or "registry transient" (silent debug).
     #[error("auth required: {0}")]
     AuthRequired(String),
@@ -1759,8 +1673,7 @@ pub enum ProviderError {
     InvalidRange(String),
 }
 
-/// Phase 35 audit fix #3: classify a registry error as
-/// auth/entitlement vs everything else, preserving the message.
+/// Classify a registry error as auth/entitlement vs everything else, preserving the message.
 fn classify_registry_error(e: lpm_common::LpmError) -> ProviderError {
     match e {
         lpm_common::LpmError::AuthRequired
@@ -1774,7 +1687,7 @@ fn classify_registry_error(e: lpm_common::LpmError) -> ProviderError {
 mod tests {
     use super::*;
 
-    // === Finding #2: Validation tests ===
+    // === Validation tests ===
 
     #[test]
     fn valid_dep_names() {
@@ -1862,7 +1775,7 @@ mod tests {
         );
     }
 
-    // === Finding #7: Mixed include/exclude in os/cpu ===
+    // === Mixed include/exclude in os/cpu ===
 
     #[test]
     fn platform_filter_inclusion_only() {
@@ -1880,7 +1793,7 @@ mod tests {
         assert!(!check_platform_filter(&entries, "win32", "os"));
     }
 
-    /// Finding #7: Mixed include/exclude entries enter exclusion mode (npm behavior).
+    /// Mixed include/exclude entries enter exclusion mode (npm behavior).
     /// The positive "darwin" entry is IGNORED — only "!win32" matters.
     /// On macOS this is compatible because the current OS is not excluded by "!win32".
     #[test]
@@ -1916,7 +1829,7 @@ mod tests {
         assert!(is_platform_compatible(&meta));
     }
 
-    // === Finding #8: Platform struct returns known values ===
+    // === Platform struct returns known values ===
 
     #[test]
     fn platform_current_returns_known_values() {
@@ -1932,7 +1845,7 @@ mod tests {
         );
     }
 
-    // === Phase 40 P3c — deep follow-up env-var contract ===
+    // === Deep follow-up env-var contract ===
     //
     // These tests mutate `LPM_DEEP_FOLLOWUP` via `SafeScopedEnv`, a
     // tiny RAII guard that restores the original value on drop. We
@@ -2028,10 +1941,10 @@ mod tests {
         let client = Arc::new(RegistryClient::new());
         let rt = tokio::runtime::Runtime::new().unwrap();
         let provider = LpmDependencyProvider::new(client, rt.handle().clone(), root_deps);
-        // Phase 49: canonicalize at the test-helper boundary so existing
-        // tests keep working unchanged — they still pass `ResolverPackage`
-        // values (with or without context), we stash them under their
-        // canonical keys, which is what the provider now reads.
+        // Canonicalize at the test-helper boundary so existing tests keep
+        // working unchanged — they still pass `ResolverPackage` values (with
+        // or without context), we stash them under their canonical keys,
+        // which is what the provider reads.
         for (pkg, info) in cache_entries {
             provider
                 .cache
@@ -2230,7 +2143,7 @@ mod tests {
             "override 4.17.20 should be selected over newest 4.17.21"
         );
 
-        // **Phase 32 Phase 5** — verify the apply trace was recorded.
+        // Verify the apply trace was recorded.
         let hits = provider.overrides.take_hits();
         assert_eq!(hits.len(), 1, "exactly one override hit should be recorded");
         assert_eq!(hits[0].package, "lodash");
@@ -2274,8 +2187,8 @@ mod tests {
 
     #[test]
     fn choose_version_override_range_target_picks_newest_in_intersection() {
-        // **Phase 32 Phase 5** — `^2.0.0` override target should pick the
-        // newest 2.x in the consumer's range, not force a single version.
+        // `^2.0.0` override target should pick the newest 2.x in the
+        // consumer's range, not force a single version.
         let pkg = ResolverPackage::npm("foo");
         let info = make_info(
             &["2.5.0", "2.4.0", "2.0.0", "1.0.0"],
@@ -2339,11 +2252,11 @@ mod tests {
 
     #[test]
     fn choose_version_path_selector_only_applies_to_matching_parent() {
-        // **Phase 32 Phase 5** — path selector `baz>qar@1` should ONLY
-        // apply when `qar` is reached through `baz` AND the natural
-        // version satisfies `^1.0.0`. The split mechanism gives us
-        // per-parent identities (`qar[baz]` vs `qar[other]`), so the
-        // resolver looks up overrides with the right parent context.
+        // Path selector `baz>qar@1` should ONLY apply when `qar` is
+        // reached through `baz` AND the natural version satisfies `^1.0.0`.
+        // The split mechanism gives us per-parent identities (`qar[baz]` vs
+        // `qar[other]`), so the resolver looks up overrides with the right
+        // parent context.
         //
         // Available qar versions: 2.0.0, 1.2.0, 1.1.0.
         // Consumer range: `^1.0.0` → natural pick is 1.2.0 (newest 1.x).
@@ -2704,7 +2617,7 @@ mod tests {
         }
     }
 
-    // Phase 35 §10.3 / audit fix #3: classifier round-trip.
+    // Classifier round-trip.
     //
     // The optional-dep-skip path differentiates auth/entitlement
     // failures from everything else by matching on
@@ -2750,16 +2663,13 @@ mod tests {
         assert!(matches!(p, ProviderError::Registry(_)));
     }
 
-    // ─── Phase 42 P2: range memoization ──────────────────────────
+    // ─── Range memoization ───────────────────────────────────────
     //
     // `NpmRange::to_pubgrub_ranges(&available_versions)` is O(N) in the
     // version count for a given package. PubGrub backtracking calls
     // `get_dependencies` multiple times per package during a single
     // resolve pass, each call re-evaluating every declared dep's range
-    // against the same `available_versions` list. On the decision-gate
-    // fixture Phase 41 measured this uncached cost at ~962 ms of
-    // `pubgrub_core_ms` when 9 extra packages entered the metadata
-    // cache.
+    // against the same `available_versions` list.
     //
     // The contract: `(package, raw_range_str) → Ranges<NpmVersion>`
     // must produce identical output on repeated calls within a single
@@ -2860,19 +2770,19 @@ mod tests {
         );
     }
 
-    // ─── Phase 49 — canonical-keyed cache regressions ──────────────────
+    // ─── Canonical-keyed cache regressions ─────────────────────────────
 
-    /// Boundary test for preplan §4.2 / §8.1: when `ensure_cached` is
-    /// asked for a split-retry identity (`ajv[eslint]`), it MUST hit the
-    /// canonical cache entry (`ajv`) the walker inserted — not time out
-    /// and fall through to the escape-hatch fetch.
+    /// When `ensure_cached` is asked for a split-retry identity
+    /// (`ajv[eslint]`), it MUST hit the canonical cache entry (`ajv`) the
+    /// walker inserted — not time out and fall through to the escape-hatch
+    /// fetch.
     ///
-    /// Before Phase 49 the cache was keyed by `ResolverPackage` including
-    /// context, and the old `ensure_cached` had an explicit `is_split()`
-    /// branch that recursively fetched the canonical form and copied its
-    /// info into the split cell. Phase 49 replaces both mechanisms with
-    /// canonicalization at the cache boundary: one entry per canonical
-    /// name, reads canonicalize `ResolverPackage → CanonicalKey` first.
+    /// Previously the cache was keyed by `ResolverPackage` including context,
+    /// with an explicit `is_split()` branch that recursively fetched the
+    /// canonical form and copied its info into the split cell. The current
+    /// approach uses canonicalization at the cache boundary: one entry per
+    /// canonical name, reads canonicalize `ResolverPackage → CanonicalKey`
+    /// first.
     ///
     /// If anyone ever regresses this — e.g. re-introducing a context-
     /// bearing key on the cache or skipping canonicalization in
@@ -2951,12 +2861,10 @@ mod tests {
             .expect("canonical lookup must resolve via the split-inserted canonical key");
     }
 
-    // Phase 49 §6 — StreamingBfsMetrics counter behavior regression tests.
-    // Closes the testing gap the reviewer flagged on bcaaf4e: the new
-    // JSON sub-object has no direct assertions. These tests pin the
-    // provider-side counter semantics directly (walker-side fields
-    // are already covered by walker.rs tests), so the JSON shape +
-    // its healthy-vs-degraded narrative rest on verified foundations.
+    // StreamingBfsMetrics counter behavior regression tests. These tests
+    // pin the provider-side counter semantics directly (walker-side fields
+    // are already covered by walker.rs tests), so the JSON shape and its
+    // healthy-vs-degraded narrative rest on verified foundations.
 
     #[test]
     fn streaming_metrics_cache_hit_does_not_increment_waits() {
@@ -3052,12 +2960,11 @@ mod tests {
         assert_eq!(b.escape_hatch_fetches(), 2);
     }
 
-    // Phase 49 §8 — blocking-pool saturation smoke. Preplan §5.1
-    // softened the blocking-pool concern after verifying that PubGrub
-    // runs inside a single `spawn_blocking` task (not one per miss),
-    // but a tiny smoke test is still useful: if a future refactor
-    // accidentally moves an `rt.block_on` into a hot per-package
-    // call site, a 2-thread blocking pool would deadlock.
+    // Blocking-pool saturation smoke. PubGrub runs inside a single
+    // `spawn_blocking` task (not one per miss), so the pool concern is
+    // low — but a tiny smoke test is still useful: if a future refactor
+    // accidentally moves an `rt.block_on` into a hot per-package call site,
+    // a 2-thread blocking pool would deadlock.
     //
     // The test constructs a multi-thread tokio runtime with
     // `max_blocking_threads(2)`, pre-seeds the provider's shared

@@ -67,10 +67,9 @@ impl NpmRange {
         .entered();
         let _prof = crate::profile::to_pubgrub_ranges::start();
 
-        // Phase 34.5: collect matching versions and build Ranges from sorted
-        // singleton intervals in one pass. The old code did repeated
-        // `union(&singleton)` which is O(n²) — each union scans the
-        // accumulated interval list.
+        // Collect matching versions and build Ranges from sorted singleton
+        // intervals in one pass. The old code did repeated `union(&singleton)`
+        // which is O(n²) — each union scans the accumulated interval list.
         //
         // available_versions is sorted descending (newest first). We reverse
         // to ascending for sorted interval construction. `Ranges::from_iter`
@@ -111,7 +110,7 @@ impl NpmRange {
     }
 }
 
-/// Phase 40 P2 — parsed npm-alias declaration.
+/// Parsed npm-alias declaration.
 ///
 /// pnpm/yarn/npm allow `"local_name": "npm:<target_name>@<range>"` in
 /// `dependencies`. The local_name is the node_modules folder name the
@@ -279,7 +278,7 @@ mod tests {
         assert!(r.satisfies(&v("1.0.0")));
     }
 
-    // === Phase 40 P2 — npm alias parsing ===
+    // === npm alias parsing ===
 
     #[test]
     fn alias_plain_package() {
