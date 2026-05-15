@@ -1,6 +1,5 @@
 //! Loader for per-project sandbox configuration: the
-//! `package.json > lpm > scripts > sandboxWriteDirs` escape hatch
-//! (§9.6).
+//! `package.json > lpm > scripts > sandboxWriteDirs` escape hatch.
 //!
 //! This is the ONE place the shape of that key is read from disk.
 //! `execute_script` calls [`load_sandbox_write_dirs`] once per
@@ -12,7 +11,7 @@
 //! Reading the key unvalidated is a trust-boundary hole: a malicious
 //! repo can ship `package.json > lpm > scripts > sandboxWriteDirs =
 //! ["/"]` or `["/Users/foo/.ssh"]` and those absolute paths were
-//! accepted verbatim ([phase48 §2 row 4']). Three checks apply:
+//! accepted verbatim without validation. Three checks apply:
 //!
 //! 1. **Dangerous-root denylist** (unconditional): reject any entry
 //!    that resolves to `/`, `/etc`, `/var/run`, `/run`,
@@ -30,16 +29,15 @@
 //!    descend from `project_dir` OR from one of the user-allowlist
 //!    roots (`~/.lpm/config.toml > max-sandbox-write-roots`).
 //!
-//! # Phase 46.3 — empty-allowlist tightening
+//! # Empty-allowlist tightening
 //!
-//! Pre-Phase-46.3 the empty allowlist was treated as "no constraint"
-//! (phase48.md §6 "Gap 4 sandboxWriteDirs policy"), so a `package.json`
-//! authored as `sandboxWriteDirs: ["~/Documents"]` was accepted
-//! verbatim. Because install scripts come from untrusted dependencies,
-//! that meant a one-line `package.json` change could hand dependency
-//! install scripts write access to user data the dangerous-root
-//! denylist does not cover (`~/.bashrc`, `~/.config`, `~/Documents`,
-//! `~/.local/share`, …). Phase 46.3 flips the empty case to mean
+//! Previously the empty allowlist was treated as "no constraint": a
+//! `package.json` authored as `sandboxWriteDirs: ["~/Documents"]` was
+//! accepted verbatim. Because install scripts come from untrusted
+//! dependencies, that meant a one-line `package.json` change could
+//! hand dependency install scripts write access to user data the
+//! dangerous-root denylist does not cover (`~/.bashrc`, `~/.config`,
+//! `~/Documents`, `~/.local/share`, …). The empty case now means
 //! "no opt-in": absolute paths outside `project_dir` are rejected
 //! unless explicitly covered by `max-sandbox-write-roots`. Relative
 //! paths are unaffected (already constrained by Step 2 to stay
@@ -62,8 +60,8 @@ use std::path::{Component, Path, PathBuf};
 ///   `~/.lpm/config.toml > max-sandbox-write-roots`. Every entry
 ///   must descend from `project_dir` or one of these paths.
 ///   When the allowlist is empty, only paths under `project_dir`
-///   are accepted — see the module-level "Phase 46.3 —
-///   empty-allowlist tightening" note for the security rationale.
+///   are accepted — see the module-level "Empty-allowlist tightening"
+///   note for the security rationale.
 /// - `home_dir`: the user's `$HOME`. Optional — if `None`, the
 ///   `$HOME/.ssh`, `$HOME/.aws`, `$HOME/.lpm` branches of the
 ///   dangerous-root denylist are skipped (the absolute-path
@@ -238,18 +236,18 @@ fn validate_entry(
     // Step 3: containment intersection (unconditional). Every entry
     // must descend from `project_dir` OR from a user-allowlist root.
     //
-    // Phase 46.3: empty allowlist NO LONGER means "no constraint".
-    // Pre-Phase-46.3 the empty case skipped this check, which let
-    // a malicious or careless `package.json > sandboxWriteDirs` edit
+    // Empty allowlist means "no opt-in", not "no constraint".
+    // Previously the empty case skipped this check, which let a
+    // malicious or careless `package.json > sandboxWriteDirs` edit
     // (e.g. `["~/Documents"]`, `["/var/log"]`) widen install-script
     // write access to user data the dangerous-root denylist does
     // not cover (`~/.bashrc`, `~/.config`, `~/.local/share`, …).
     // Install scripts come from untrusted dependencies, so the
     // union of `sandboxWriteDirs` paths IS the dependency attack
     // surface — defaulting that union open made the attack a
-    // one-line PR. Empty allowlist now means "no opt-in" and
-    // absolute paths outside `project_dir` require an explicit
-    // covering entry in `~/.lpm/config.toml > max-sandbox-write-roots`.
+    // one-line PR. Absolute paths outside `project_dir` now require
+    // an explicit covering entry in
+    // `~/.lpm/config.toml > max-sandbox-write-roots`.
     //
     // Relative entries are already covered by Step 2 (traversal
     // escape) — they're guaranteed to stay inside `project_dir`, so
@@ -288,10 +286,9 @@ fn validate_entry(
 ///
 /// Symlink-based bypass is consistent with the sandbox's existing
 /// rule-rendering posture (see the seatbelt.rs canonicalization
-/// notes). A comprehensive symlink-resolving layer is out of scope
-/// for Phase 48 P0 slice 5; the dangerous-root denylist + traversal
-/// check already cover the high-frequency attack shapes (`..`
-/// escape, authored `/etc/foo`).
+/// notes). The dangerous-root denylist + traversal check already
+/// cover the high-frequency attack shapes (`..` escape, authored
+/// `/etc/foo`). A comprehensive symlink-resolving layer is deferred.
 fn logical_normalize(path: &Path) -> PathBuf {
     let mut out = PathBuf::new();
     for component in path.components() {
@@ -320,8 +317,8 @@ fn logical_normalize(path: &Path) -> PathBuf {
 /// InvalidSpec message) and name which root matched so the user
 /// knows which protection fired.
 ///
-/// Phase 46.2 (2026-05-12): the absolute denylist is now
-/// platform-aware. The POSIX entries (`/`, `/etc`, `/var/run`,
+/// The absolute denylist is platform-aware. The POSIX entries
+/// (`/`, `/etc`, `/var/run`,
 /// `/run`) protect Linux + macOS hosts. The Windows entries
 /// (`C:\Windows`, `C:\Program Files`, `C:\Program Files (x86)`,
 /// `C:\ProgramData`, plus any bare drive root like `C:\`) protect
@@ -536,8 +533,7 @@ mod tests {
     #[test]
     fn absolute_entry_kept_verbatim() {
         // Absolute path outside project_dir requires a covering
-        // allowlist root (Phase 46.3 tightening). Verbatim-preservation
-        // is what this test pins — the loader keeps the authored
+        // allowlist root. Verbatim-preservation is what this test pins — the loader keeps the authored
         // path as-is, not joining it onto project_dir or normalizing
         // away segments.
         let abs = unix_abs_str("/home/u/.cache/ms-playwright");
@@ -566,9 +562,8 @@ mod tests {
         let e = fixture(&format!(
             r#"{{"lpm":{{"scripts":{{"sandboxWriteDirs":["{one}","rel-two","{three}"]}}}}}}"#
         ));
-        // Phase 46.3: absolute entries outside project_dir need a
-        // covering allowlist; `/abs` covers both `/abs/one` and
-        // `/abs/three`.
+        // Absolute entries outside project_dir need a covering
+        // allowlist; `/abs` covers both `/abs/one` and `/abs/three`.
         let allowlist = [unix_abs_pathbuf("/abs")];
         let v = load_sandbox_write_dirs(&e.package_json, &e.project, &allowlist, None).unwrap();
         assert_eq!(v.len(), 3);
@@ -624,15 +619,12 @@ mod tests {
         }
     }
 
-    // ── Phase 48 P0 slice 5 / Phase 46.3 — validation acceptance tests ──
+    // ── Validation acceptance tests ──
 
-    /// Phase 46.3 (2026-05-13) tightening: an absolute path outside
-    /// `project_dir` is rejected when `max-sandbox-write-roots` is
-    /// empty. The dangerous-root denylist alone is not enough —
-    /// it does not cover user data dirs (`~/Documents`, `~/.config`,
-    /// `~/.local/share`, …). Replaces the pre-46.3
-    /// `slice5_empty_allowlist_behaves_like_no_constraint` test
-    /// that pinned the opposite (back-compat) semantic.
+    /// An absolute path outside `project_dir` is rejected when
+    /// `max-sandbox-write-roots` is empty. The dangerous-root
+    /// denylist alone is not enough — it does not cover user data
+    /// dirs (`~/Documents`, `~/.config`, `~/.local/share`, …).
     #[test]
     fn empty_allowlist_rejects_absolute_outside_project() {
         let abs = unix_abs_str("/opt/local/share");
@@ -758,8 +750,7 @@ mod tests {
     /// when they would match the allowlist — the dangerous
     /// denylist has final veto.
     ///
-    /// Phase 46.2 (2026-05-12): platform-aware now. The
-    /// dangerous-system-root literals differ between POSIX
+    /// The dangerous-system-root literals differ between POSIX
     /// (`/etc`) and Windows (`C:\Windows`), but the veto-over-
     /// allowlist semantic is identical — both cases must reject
     /// even when the allowlist explicitly names the dangerous

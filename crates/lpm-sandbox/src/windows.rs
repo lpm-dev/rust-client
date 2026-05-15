@@ -1,5 +1,5 @@
 //! Windows sandbox backend: Mandatory Integrity Control (Low IL) +
-//! Job Object. Phase 46.2.
+//! Job Object.
 //!
 //! # Mechanism
 //!
@@ -39,11 +39,11 @@
 //!   Low IL filesystem-write containment. Reads are NOT restricted —
 //!   Low IL processes can still read most user files (the brief's
 //!   requirement is filesystem-WRITE containment). Network is
-//!   allowed, matching the Phase 46.1-rework "relaxed default".
+//!   allowed, matching the "relaxed default".
 //! - [`SandboxPosture::Strict`] (`deny_outbound_network = true`):
 //!   Windows cannot deliver the strict contract today — closing the
 //!   network gap needs a Windows Filtering Platform (WFP) callout
-//!   filter, deferred to Phase 46.3. When the user requests strict
+//!   filter, deferred to a future phase. When the user requests strict
 //!   and `allow_degraded = false`, the backend surfaces
 //!   [`SandboxError::UnsupportedPlatform`] with the named
 //!   remediations (`--no-sandbox`, `trustedDependencies`, drop back
@@ -118,7 +118,7 @@ const SE_GROUP_INTEGRITY: u32 = 0x0000_0020;
 
 // ── Backend struct ───────────────────────────────────────────────────
 
-/// Phase 46.2 Windows backend. See module docs for the mechanism
+/// Windows backend. See module docs for the mechanism
 /// rationale. The struct is constructed by
 /// [`crate::new_for_platform_with_options`] once per package; it
 /// stashes the spec + decided posture so per-spawn calls render
@@ -150,7 +150,7 @@ enum BackendPosture {
     /// warning surfaces the network gap).
     LowIl {
         /// `true` when the user requested strict but accepted the
-        /// Phase 46.2 network-gap fallback. Drives the
+        /// network-gap fallback. Drives the
         /// `Sandbox::posture()` switch between `Default` and
         /// `Degraded`.
         degraded_from_strict: bool,
@@ -186,7 +186,7 @@ impl WindowsSandbox {
                 platform: "windows".to_string(),
                 mode: SandboxMode::LogOnly,
                 remediation: "Mandatory Integrity Control has no native observe-only \
-                              primitive in Phase 46.2. To debug a sandbox false-positive, \
+                              primitive in To debug a sandbox false-positive, \
                               re-run with --no-sandbox. `--sandbox-log` remains available \
                               on macOS."
                     .to_string(),
@@ -204,7 +204,7 @@ impl WindowsSandbox {
     }
 }
 
-/// Phase 46.2 posture decision. Pure (inputs in, outcome out), mirrors
+/// posture decision. Pure (inputs in, outcome out), mirrors
 /// the Linux `decide_posture` shape. Factored out so the unit tests
 /// pin the table without a Windows kernel.
 fn decide_posture(
@@ -217,8 +217,7 @@ fn decide_posture(
         });
     }
     // Strict requested. Windows can't deliver outbound network denial
-    // today — that's Phase 46.3's WFP work. Without the degraded
-    // opt-in we refuse, symmetric with Linux's kernel-too-old path.
+    // without the degraded opt-in we refuse, symmetric with Linux's kernel-too-old path.
     if !allow_degraded {
         return Err(SandboxError::UnsupportedPlatform {
             platform: "windows".to_string(),
@@ -236,8 +235,8 @@ fn decide_posture(
 /// `strict_remediation()` text shape — same options where they
 /// apply.
 fn strict_not_yet_supported_remediation() -> String {
-    "Phase 46.2 ships Windows filesystem-write containment but \
-     defers outbound-network denial to Phase 46.3 (the Windows \
+    "ships Windows filesystem-write containment but \
+     defers outbound-network denial to (the Windows \
      Filtering Platform layer). Remediation options: \
      (1) set `[sandbox] allow-degraded = true` in `~/.lpm/config.toml` \
      or `./lpm.toml` to fall back to filesystem-only containment \
@@ -403,7 +402,7 @@ impl Sandbox for WindowsSandbox {
 /// Order is deterministic so tests can pin "first writable allow is
 /// package_dir" etc. without a sort step.
 ///
-/// `pub(crate)` so the Phase 46.3 PR-2 AppContainer backend
+/// `pub(crate)` so the AppContainer backend
 /// ([`crate::windows_appcontainer`]) can reuse the same writable
 /// set when rendering its DACL grants. Both backends must agree on
 /// what counts as writable so the user-visible contract doesn't
@@ -482,14 +481,14 @@ fn apply_low_il_label(path: &Path) -> Result<(), SandboxError> {
         return Ok(());
     }
 
-    // Phase 46.3 PR-1 finding S1: refuse reparse-point roots.
+    // PR-1 finding S1: refuse reparse-point roots.
     //
     // `set_low_il_label_on` uses the name-form `SetNamedSecurityInfoW`
     // which follows reparse points by default — labelling a junction
     // root would apply Low IL writeability to its target, which may
     // resolve outside the intended allow-set tree (including an
     // attacker-controlled target if the user's profile dir was
-    // compromised before lpm ran). Phase 46.2 silently followed; that
+    // compromised before lpm ran). silently followed; that
     // behaviour is now an explicit refusal.
     //
     // Remediation depends on which allow-set entry this path is. The
@@ -856,8 +855,8 @@ fn set_low_il_label_on(path: &Path, sacl_ptr: *mut ACL) -> Result<(), SandboxErr
 /// `IO_REPARSE_TAG_SYMLINK`. Directory junctions
 /// (`IO_REPARSE_TAG_MOUNT_POINT`, created by `mklink /J`) are NOT
 /// flagged. Mount points and several other reparse tags are also
-/// missed. The Phase 46.2 walk used `is_symlink()` and recursed
-/// through junctions, which is the gap Phase 46.3 PR-1 (finding S1)
+/// missed. The walk used `is_symlink()` and recursed
+/// through junctions, which is the gap PR-1 (finding S1)
 /// closes by switching the check to the `FILE_ATTRIBUTE_REPARSE_POINT`
 /// bit — set by the filesystem for every reparse-tagged object
 /// regardless of the specific tag.
@@ -876,7 +875,7 @@ fn is_reparse_point(metadata: &std::fs::Metadata) -> bool {
 /// trees (deeply nested `node_modules`, `.cache` with thousands of
 /// hashed subdirs) don't risk stack overflow.
 ///
-/// **Reparse-point skip (Phase 46.3 PR-1 finding S1).** Every entry
+/// **Reparse-point skip (PR-1 finding S1).** Every entry
 /// whose `FILE_ATTRIBUTE_REPARSE_POINT` bit is set — symbolic links,
 /// NTFS directory junctions, mount points, OneDrive placeholders — is
 /// skipped with a `tracing::debug!` line and not descended into.
@@ -888,7 +887,7 @@ fn is_reparse_point(metadata: &std::fs::Metadata) -> bool {
 ///   allow-set tree.
 /// - Junction recursion via `read_dir` follows the reparse point;
 ///   descending into a planted junction would walk + label arbitrary
-///   subtrees. Phase 46.2's `!ft.is_symlink()` recursion guard only
+///   subtrees. The `!ft.is_symlink()` recursion guard only
 ///   caught `IO_REPARSE_TAG_SYMLINK` — junctions
 ///   (`IO_REPARSE_TAG_MOUNT_POINT`) sailed through it.
 ///
@@ -1215,7 +1214,7 @@ fn resume_process(process_handle: HANDLE) -> Result<(), SandboxError> {
 /// leave a zombie Job Object whose last handle release happens
 /// (a) when the user wires up a Drop-on-Child mechanism (we don't,
 /// because we can't extend std::process::Child), or (b) when the
-/// parent process exits and the OS reaps it. For Phase 46.2 the
+/// parent process exits and the OS reaps it. For the
 /// (b) cleanup is sufficient: lifecycle scripts complete in seconds,
 /// the parent (`lpm`) exits quickly, and the OS frees the handle.
 /// The sole production consumer (`wait_with_timeout` in
@@ -1223,14 +1222,13 @@ fn resume_process(process_handle: HANDLE) -> Result<(), SandboxError> {
 /// `release_sandbox_tracker` on normal exit and `terminate_sandbox_tree`
 /// on the timeout-kill path, so no leak occurs in practice.
 ///
-/// Layering an explicit reaper thread (Phase 46.3 §6.1) would require
-/// duplicating the child's process handle inside `Sandbox::spawn`
-/// before returning the `Child` (otherwise `OpenProcess(SYNCHRONIZE,
-/// pid)` inside the reaper races PID reuse) and extending tracker
-/// entries to carry both handles. That's the right shape if
-/// `--jobs=N≥2` or watch-mode ever ships; until then the OS-on-exit
-/// fallback is sufficient. See `private/46.3.md` §6.1 for the design
-/// rationale and effort estimate.
+/// Layering an explicit reaper thread would require duplicating the
+/// child's process handle inside `Sandbox::spawn` before returning
+/// the `Child` (otherwise `OpenProcess(SYNCHRONIZE, pid)` inside the
+/// reaper races PID reuse) and extending tracker entries to carry
+/// both handles. That's the right shape if `--jobs=N≥2` or
+/// watch-mode ever ships; until then the OS-on-exit fallback is
+/// sufficient.
 fn register_job_for_child(pid: u32, job: OwnedHandle) {
     let mut table = JOB_TRACKER.lock().unwrap_or_else(|p| p.into_inner());
     // Insert under the child's PID. Duplicate-PID registration is
@@ -1335,7 +1333,7 @@ fn detect_windows_version_string() -> String {
     // Note on Default: `[u16; 128]` (the `csd` field, holding the
     // service pack display string) doesn't have a `Default` impl on
     // stable Rust — derives don't work for arrays > 32 elements as
-    // of 2026-05. We zero-init the struct via `std::mem::zeroed()`
+    // `[u16; 128]` doesn't impl `Default` on stable. We zero-init via `std::mem::zeroed()`
     // instead, which is fine because every field is a plain integer
     // / array of integers (no Drop, no UB on the all-zero pattern).
     #[repr(C)]
@@ -1381,7 +1379,7 @@ mod tests {
     use super::*;
     use std::path::PathBuf;
 
-    /// Phase 46.2: a spec with non-existent fake paths. Safe for any
+    /// a spec with non-existent fake paths. Safe for any
     /// test that doesn't reach the `apply_low_il_label` syscall (pure
     /// decision-table tests, construction tests, allow-set ordering
     /// pins) because the fake paths never get touched.
@@ -1487,8 +1485,8 @@ mod tests {
                     "remediation must name the wizard shortcut to drop back to default: {remediation}"
                 );
                 assert!(
-                    remediation.contains("Phase 46.3"),
-                    "remediation must name the follow-up phase that closes the gap: {remediation}"
+                    remediation.contains("Filtering Platform") || remediation.contains("network denial"),
+                    "remediation must name the outbound-network gap: {remediation}"
                 );
             }
             other => panic!("expected UnsupportedPlatform, got {other:?}"),
@@ -1613,7 +1611,7 @@ mod tests {
 
     #[test]
     fn new_default_options_returns_default_posture() {
-        // Phase 46.2 default mode: filesystem-write containment only,
+        // default mode: filesystem-write containment only,
         // no network denial. Construction succeeds on any reachable
         // Windows host (no kernel-version gate — Mandatory Integrity
         // Control has been in every Windows release since Vista).
@@ -1622,14 +1620,14 @@ mod tests {
             SandboxMode::Enforce,
             SandboxOptions::default(),
         )
-        .expect("Phase 46.2 default mode must construct cleanly on any Windows host");
+        .expect("default mode must construct cleanly on any Windows host");
         assert_eq!(sb.backend_name(), "windows-il");
         assert_eq!(sb.posture(), SandboxPosture::Default);
     }
 
     #[test]
     fn new_strict_without_degraded_opt_in_surfaces_unsupported() {
-        // The strict path is the Phase 46.3 follow-up; without the
+        // The strict path is the follow-up; without the
         // degraded opt-in we refuse with a remediation block naming
         // every recourse.
         let opts = SandboxOptions {
@@ -1669,7 +1667,7 @@ mod tests {
 
     #[test]
     fn apply_low_il_label_on_nonexistent_path_is_a_noop() {
-        // Phase 46.2: missing paths in the allow set get skipped
+        // missing paths in the allow set get skipped
         // with a tracing::debug line, matching landlock's
         // `tracing::debug!("landlock: skip ...")` shape. A skip is
         // not an error.
@@ -1678,7 +1676,7 @@ mod tests {
         apply_low_il_label(&nonexistent).expect("nonexistent path must be a no-op skip, not error");
     }
 
-    /// Phase 46.2 follow-up — re-labelling the same root twice in
+    /// follow-up — re-labelling the same root twice in
     /// the same process must hit the cache fast-path and skip the
     /// recursive walk. Without the cache, installs with multiple
     /// lifecycle scripts would re-walk every existing descendant of
@@ -1722,7 +1720,7 @@ mod tests {
         );
     }
 
-    /// Phase 46.2 round-3 follow-up — delete-and-recreate
+    /// round-3 follow-up — delete-and-recreate
     /// invalidation. If a lifecycle script removes one of the
     /// allow-set dirs and recreates it (rare but legitimate — some
     /// build steps wipe `dist/` or a cache root before re-populating),
@@ -1820,7 +1818,7 @@ mod tests {
     }
 
     /// **Core sandbox contract** — a write to a path OUTSIDE the
-    /// allow-set must be denied. This is the Phase 46.2 brief's
+    /// allow-set must be denied. This is the brief's
     /// minimum: filesystem-write containment. Without this property
     /// holding, the backend wouldn't actually be a sandbox.
     ///
@@ -1901,7 +1899,7 @@ mod tests {
     /// `envs_cleared` call below explicitly preserves them so the
     /// test exercises the IL containment (the actual contract under
     /// test) rather than env-scrubbing.
-    /// Phase 46.2 follow-up — pre-existing files inside the allow-set
+    /// follow-up — pre-existing files inside the allow-set
     /// must be writable by the Low IL child. The kernel's OICI
     /// inheritance is not retroactive: only files created AFTER the
     /// label is applied pick it up via inheritance. Existing files
@@ -2045,7 +2043,7 @@ mod tests {
         );
     }
 
-    // ── Phase 46.3 PR-1 (S1) — reparse-point hardening ───────────────
+    // ── PR-1 (S1) — reparse-point hardening ───────────────
 
     // Test-only windows-sys symbols. Kept inside `mod tests` so the
     // lib build doesn't carry these as unused imports.
@@ -2179,9 +2177,8 @@ mod tests {
     /// writing an explicit Medium IL OICI ACE via `icacls /setintegritylevel`.
     /// This is needed because some developer hosts (and CI hosts that
     /// re-use disk state between jobs) carry a persistent Low IL OICI
-    /// label on `%TEMP%` from earlier Phase 46.2 dev iterations — see
-    /// [`private/46.2.md`](../../../../private/46.2.md) §13.3 for the
-    /// persistence hazard. Without overriding, every
+    /// label on `%TEMP%` from earlier dev iterations — the persistence
+    /// hazard. Without overriding, every
     /// `tempfile::tempdir()`-rooted test path inherits Low IL from
     /// `%TEMP%`, which breaks negative assertions like "target must
     /// not carry Low IL."
@@ -2230,7 +2227,7 @@ mod tests {
     /// environmental contamination that breaks the test contract on hosts
     /// whose `%TEMP%` carries an inherited Capability SID grant (e.g. from
     /// prior AppContainer-using software — Edge, Windows Sandbox, the
-    /// Phase 46.3 PR-2 helper test fixtures).
+    /// AppContainer helper test fixtures).
     ///
     /// # Why this is needed
     ///
@@ -2417,8 +2414,7 @@ mod tests {
         assert!(
             is_reparse_point(&meta),
             "is_reparse_point must catch NTFS directory junctions \
-             (IO_REPARSE_TAG_MOUNT_POINT) — the gap that Phase 46.2's \
-             `is_symlink()` check missed"
+             (IO_REPARSE_TAG_MOUNT_POINT) — the gap that `is_symlink()` misses"
         );
     }
 
@@ -2445,7 +2441,7 @@ mod tests {
     fn test_read_has_low_il_ace_returns_false_on_unlabelled_path() {
         let tmp = tempfile::tempdir().expect("tempdir");
         // Sever any inherited Low IL from `%TEMP%` (some dev/CI hosts
-        // carry a persistent label there from prior Phase 46.2 work).
+        // carry a persistent label there from prior work).
         test_strip_inherited_label(tmp.path());
         let plain = tmp.path().join("unlabelled");
         std::fs::create_dir_all(&plain).unwrap();
@@ -2469,7 +2465,7 @@ mod tests {
         );
     }
 
-    // ── Root-refusal contract (§2.2) ─────────────────────────────────
+    // ── Root-refusal contract ────────────────────────────────────────
 
     #[test]
     fn apply_low_il_label_refuses_reparse_point_root_junction() {
@@ -2490,7 +2486,7 @@ mod tests {
             Ok(()) => panic!(
                 "apply_low_il_label MUST refuse a junction root \
                  (S1 contract); the silent-follow behaviour is the \
-                 Phase 46.2 gap this PR closes"
+                 gap this PR closes"
             ),
             Err(other) => panic!("expected ProfileRenderFailed, got {other:?}"),
         }
@@ -2587,7 +2583,7 @@ mod tests {
         );
     }
 
-    // ── Walk-skip contract (§2.3) ────────────────────────────────────
+    // ── Walk-skip contract ──────────────────────────────────────────
 
     #[test]
     fn relabel_walk_does_not_label_junction_target_contents() {

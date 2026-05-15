@@ -4,60 +4,57 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Filesystem-scoped post-install script sandboxing for LPM (Phase 46 P5)"
+description = "Filesystem-scoped post-install script sandboxing for LPM"
 
 [dependencies]
 thiserror = { workspace = true }
 tracing = { workspace = true }
 serde_json = { workspace = true }
 
-# Phase 46 P5 Chunk 3: filesystem sandboxing via landlock on Linux
-# kernel 5.13+. Linux-target-gated so the macOS + Windows builds stay
-# unaffected. The crate is MIT-licensed, zero transitive C deps.
+# Filesystem sandboxing via landlock on Linux kernel 5.13+.
+# Linux-target-gated so the macOS + Windows builds stay unaffected.
+# The crate is MIT-licensed, zero transitive C deps.
 # `libc` is needed for async-signal-safe primitives in the child's
 # `pre_exec` closure (direct `write(2)` for stderr + raw errno
 # values) — std::io's stderr path takes a lock and isn't safe
 # post-fork in multi-threaded processes.
 #
-# Phase 46.1.1: `seccompiler` compiles BPF programs for the
-# socket(2) deny matrix (UDP / raw / AF_PACKET / AF_NETLINK).
-# Apache-2.0/MIT dual licensed, maintained by AWS for Firecracker.
-# `apply_filter` is a single `prctl(PR_SET_SECCOMP, ...)` syscall —
-# AS-safe in the child's pre_exec closure.
+# `seccompiler` compiles BPF programs for the socket(2) deny matrix
+# (UDP / raw / AF_PACKET / AF_NETLINK). Apache-2.0/MIT dual licensed,
+# maintained by AWS for Firecracker. `apply_filter` is a single
+# `prctl(PR_SET_SECCOMP, ...)` syscall — AS-safe in pre_exec.
 [target.'cfg(target_os = "linux")'.dependencies]
 landlock = "0.4"
 libc = "0.2"
 seccompiler = "0.5"
 
-# Phase 46.2: Windows backend uses Mandatory Integrity Control (drop
-# child to Low IL) plus a Job Object for kill-tree parity with Unix's
-# process group. `windows-sys` is the Microsoft-published low-level
-# FFI crate already used by `lpm-common` for `GetDriveTypeW` — the
-# workspace is on 0.60. Each feature flag below is a separate code-
-# gen unit, so we only enable the namespaces this backend actually
-# touches:
+# Windows backend uses Mandatory Integrity Control (drop child to Low
+# IL) plus a Job Object for kill-tree parity with Unix's process
+# group. `windows-sys` is the Microsoft-published low-level FFI crate
+# already used by `lpm-common` for `GetDriveTypeW` — the workspace
+# is on 0.60. Each feature flag below is a separate code-gen unit, so
+# we only enable the namespaces this backend actually touches:
 #   - Win32_Foundation                 HANDLE, BOOL, error codes
 #   - Win32_Security                   PSID / ACL / TOKEN_MANDATORY_LABEL,
 #                                      Get/SetTokenInformation, ConvertString*
 #   - Win32_Security_Authorization     SetNamedSecurityInfoW (mandatory
 #                                      label on allow-set dirs) +
 #                                      ConvertStringSidToSidW
-#   - Win32_Security_Isolation         Phase 46.3 PR-2: AppContainer surface —
+#   - Win32_Security_Isolation         AppContainer surface —
 #                                      CreateAppContainerProfile +
 #                                      DeriveAppContainerSidFromAppContainerName.
 #   - Win32_Storage_FileSystem         FILE_GENERIC_* access masks (used by
 #                                      the AppContainer DACL grants in
 #                                      `windows_appcontainer.rs` /
 #                                      `lpm-sandbox-helper`)
-#   - Win32_System_Console             Phase 46.3 PR-2: GetStdHandle +
-#                                      STD_INPUT_HANDLE / STD_OUTPUT_HANDLE /
-#                                      STD_ERROR_HANDLE for forwarding the
-#                                      helper's stdio to the AppContainer
-#                                      child via STARTUPINFOW.hStd*.
+#   - Win32_System_Console             GetStdHandle + STD_INPUT_HANDLE /
+#                                      STD_OUTPUT_HANDLE / STD_ERROR_HANDLE
+#                                      for forwarding the helper's stdio to
+#                                      the AppContainer child via
+#                                      STARTUPINFOW.hStd*.
 #   - Win32_System_Threading           CREATE_SUSPENDED creation flag +
 #                                      OpenProcessToken (declared in this
-#                                      namespace by windows-sys). Phase
-#                                      46.3 PR-2 also relies on
+#                                      namespace by windows-sys).
 #                                      InitializeProcThreadAttributeList +
 #                                      UpdateProcThreadAttribute +
 #                                      CreateProcessW / STARTUPINFOEXW from
@@ -72,7 +69,7 @@ seccompiler = "0.5"
 # in `src/windows.rs` and link against `ntdll.dll` via a `#[link]`
 # attribute on the extern block — same pattern as Sysinternals tools
 # and the Chromium sandbox use. The function has been stable since
-# Windows XP. Phase 46.3 PR-2's helper does NOT use NtResumeProcess —
+# Windows XP. The AppContainer helper does NOT use NtResumeProcess —
 # the helper owns `PROCESS_INFORMATION.hThread` directly (it calls
 # `CreateProcessW` itself instead of going through `Command::spawn`)
 # so it can use the documented `ResumeThread` API.
@@ -92,17 +89,16 @@ windows-sys = { version = "0.60", features = [
 tempfile = "3"
 dirs = { workspace = true }
 criterion = "0.5"
-# Phase 46.3 PR-2: helper-binary integration tests spawn
-# `lpm-sandbox-helper` via `assert_cmd::Command::cargo_bin`, which
-# consults `CARGO_BIN_EXE_<name>` so the bin is located in cargo's
-# test environment. Plain `Command::new("lpm-sandbox-helper")` would
-# not find it. Matches the pattern `tests/workflows/tests/support/`
+# Helper-binary integration tests spawn `lpm-sandbox-helper` via
+# `assert_cmd::Command::cargo_bin`, which consults
+# `CARGO_BIN_EXE_<name>` so the bin is located in cargo's test
+# environment. Plain `Command::new("lpm-sandbox-helper")` would not
+# find it. Matches the pattern `tests/workflows/tests/support/`
 # already uses for `lpm-rs`.
 assert_cmd = "2"
 
-# Phase 46 P5 Chunk 5: per-spawn sandbox overhead. Establishes the
-# baseline before Chunk 6+ auto-execution lands; regressions in
-# profile rendering or syscall overhead surface here.
+# Per-spawn sandbox overhead benchmark. Regressions in profile
+# rendering or syscall overhead surface here.
 [[bench]]
 name = "sandbox_spawn"
 harness = false

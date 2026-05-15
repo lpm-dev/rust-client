@@ -1,4 +1,4 @@
-//! Per-spawn sandbox overhead micro-bench. Phase 46 P5 Chunk 5.
+//! Per-spawn sandbox overhead micro-bench.
 //!
 //! Run: `cargo bench -p lpm-sandbox`
 //!
@@ -10,8 +10,7 @@
 //!   is the hot path every lifecycle script goes through.
 //! - `factory_cold_noop`: the escape-hatch baseline. Validates
 //!   [`SandboxMode::Disabled`] stays near-free so `--no-sandbox`
-//!   (Phase 46.1 rework collapsed the legacy `--unsafe-full-env`
-//!   partner per Q6) doesn't add meaningful overhead.
+//!   doesn't add meaningful overhead.
 //! - `end_to_end_spawn_true`: full construct + `Sandbox::spawn` of
 //!   `/usr/bin/true` + `wait`. Represents the actual per-script
 //!   cost a lifecycle-script loop pays. Depends on host `fork` +
@@ -25,9 +24,9 @@
 //! - `end_to_end_spawn_true`: < 10ms.
 //!
 //! If any of these blow their budget by >2x, investigate before
-//! shipping. Chunk 6's auto-execution loop amplifies per-spawn
-//! regressions — a 1ms-per-spawn regression across 100 packages
-//! is a 100ms install slowdown.
+//! shipping. The auto-execution loop amplifies per-spawn regressions
+//! — a 1ms-per-spawn regression across 100 packages is a 100ms
+//! install slowdown.
 
 use criterion::{Criterion, black_box, criterion_group, criterion_main};
 use lpm_sandbox::{SandboxMode, SandboxSpec, SandboxStdio, SandboxedCommand, new_for_platform};

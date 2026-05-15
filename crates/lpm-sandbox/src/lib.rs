@@ -1,12 +1,9 @@
 //! Filesystem-scoped sandbox for LPM post-install script execution.
 //!
-//! Phase 46 P5 shipped filesystem-write containment (Seatbelt on
-//! macOS, landlock V1 on Linux). Phase 46.1 adds outbound network
-//! denial on top — see the design note at
-//! [`DOCS/new-features/37-rust-client-RUNNER-VISION-phase46.1-sandbox-network-denial.md`](../../../../../../a-package-manager/DOCS/new-features/37-rust-client-RUNNER-VISION-phase46.1-sandbox-network-denial.md)
-//! for the locked Q1-Q3 decisions and contract specifics.
+//! Filesystem-write containment launched with Seatbelt on macOS and
+//! landlock V1 on Linux. Outbound network denial was added on top.
 //!
-//! ## Network-denial scope (Phase 46.1)
+//! ## Network-denial scope
 //!
 //! There is a **platform asymmetry** to be honest about:
 //!
@@ -14,8 +11,8 @@
 //!   family / type. Dropping `(allow network*)` denies TCP, UDP,
 //!   raw sockets, AF_PACKET, AF_NETLINK, DNS — everything outbound.
 //!   Full outbound network denial.
-//! - **Linux landlock V4 + seccomp-bpf (Phase 46.1.1)** — two
-//!   layered kernel mechanisms. Landlock V4
+//! - **Linux landlock V4 + seccomp-bpf** — two layered kernel
+//!   mechanisms. Landlock V4
 //!   (`AccessNet::from_all(V4)`) denies outbound TCP (`BindTcp` +
 //!   `ConnectTcp`). On top of that, a seccomp-bpf filter denies
 //!   direct `socket(AF_INET|AF_INET6, SOCK_DGRAM|SOCK_RAW)`,
@@ -40,7 +37,7 @@
 //! (a platform-neutral description of the process they want to run),
 //! obtain a [`Sandbox`] from [`new_for_platform`] (or
 //! [`new_for_platform_with_options`] when the caller wants to thread
-//! the Phase 46.1 `[sandbox] allow-degraded` knob through), then call
+//! the `[sandbox] allow-degraded` knob through), then call
 //! [`Sandbox::spawn`]. The backend decides how to apply containment:
 //! macOS routes the spawn through `sandbox-exec`, and Linux installs a
 //! landlock ruleset via `pre_exec` in the forked child.
@@ -49,20 +46,18 @@
 //!
 //! | Platform | [`SandboxMode::Enforce`] | [`SandboxMode::LogOnly`] | [`SandboxMode::Disabled`] |
 //! |----------|--------------------------|---------------------------|----------------------------|
-//! | macOS    | Seatbelt (`sandbox-exec`), `(deny default)` + narrow allows; **full outbound network denied** (Phase 46.1, no loopback exemption) — every socket family / type covered. | Seatbelt w/ `(allow (with report) default)` fallback | [`NoopSandbox`] |
-//! | Linux    | landlock V4 (kernel 6.7+) + Phase 46.1.1 seccomp-bpf layered together — filesystem + **outbound TCP** (landlock: BindTcp + ConnectTcp) + **direct UDP / raw / AF_PACKET / AF_NETLINK** (seccomp: `socket(2)` deny matrix). AF_UNIX intentionally allowed for legitimate IPC; resolver-mediated DNS remains host-dependent (NSS via AF_UNIX or TCP fallback). Kernels < 6.7 return [`SandboxError::KernelTooOld`] by default; explicit opt-in via `[sandbox] allow-degraded = true` falls back to V1 filesystem-only (no seccomp layer either) with a one-line stderr warning per install. | [`SandboxError::ModeNotSupportedOnPlatform`] — no native observe-only | [`NoopSandbox`] |
-//! | Windows  | Phase 46.2: Mandatory Integrity Control (drop child to Low IL) + Job Object for kill-tree. Filesystem-write containment only — outbound network denial is **not** implemented; under default mode the posture is [`SandboxPosture::Default`]. Strict mode (`deny_outbound_network = true`) refuses with [`SandboxError::UnsupportedPlatform`] unless `allow_degraded = true`, in which case the backend succeeds with [`SandboxPosture::Degraded`] (`missing = "network-containment"`). The Phase 46.3 WFP layer closes the gap. | [`SandboxError::ModeNotSupportedOnPlatform`] — Mandatory Integrity Control has no native observe-only either | [`NoopSandbox`] |
+//! | macOS    | Seatbelt (`sandbox-exec`), `(deny default)` + narrow allows; **full outbound network denied**, no loopback exemption — every socket family / type covered. | Seatbelt w/ `(allow (with report) default)` fallback | [`NoopSandbox`] |
+//! | Linux    | landlock V4 (kernel 6.7+) + seccomp-bpf layered together — filesystem + **outbound TCP** (landlock: BindTcp + ConnectTcp) + **direct UDP / raw / AF_PACKET / AF_NETLINK** (seccomp: `socket(2)` deny matrix). AF_UNIX intentionally allowed for legitimate IPC; resolver-mediated DNS remains host-dependent (NSS via AF_UNIX or TCP fallback). Kernels < 6.7 return [`SandboxError::KernelTooOld`] by default; explicit opt-in via `[sandbox] allow-degraded = true` falls back to V1 filesystem-only (no seccomp layer either) with a one-line stderr warning per install. | [`SandboxError::ModeNotSupportedOnPlatform`] — no native observe-only | [`NoopSandbox`] |
+//! | Windows  | Mandatory Integrity Control (drop child to Low IL) + Job Object for kill-tree. Filesystem-write containment only — outbound network denial is **not** implemented; under default mode the posture is [`SandboxPosture::Default`]. Strict mode (`deny_outbound_network = true`) refuses with [`SandboxError::UnsupportedPlatform`] unless `allow_degraded = true`, in which case the backend succeeds with [`SandboxPosture::Degraded`] (`missing = "network-containment"`). | [`SandboxError::ModeNotSupportedOnPlatform`] — Mandatory Integrity Control has no native observe-only either | [`NoopSandbox`] |
 //!
 //! [`SandboxMode::Disabled`] always succeeds with a [`NoopSandbox`]:
-//! the `--no-sandbox` escape hatch (Phase 46.1 rework: single flag —
-//! the legacy `--unsafe-full-env` partner was collapsed per Q6 of the
-//! DX redline) has to be reachable from every platform, including
-//! Windows.
+//! the `--no-sandbox` escape hatch must be reachable from every
+//! platform, including Windows.
 //!
-//! ## Posture (Phase 46.1)
+//! ## Posture
 //!
 //! [`Sandbox::posture`] reports whether the constructed backend
-//! enforces the full Phase 46.1 contract ([`SandboxPosture::Strict`])
+//! enforces the full contract ([`SandboxPosture::Strict`])
 //! or has fallen back to filesystem-only on a kernel that can't
 //! support network denial ([`SandboxPosture::Degraded`]). The install
 //! pipeline uses this to emit the per-install structured stderr
@@ -84,7 +79,7 @@ mod seatbelt;
 #[cfg(target_os = "linux")]
 mod linux;
 
-// Phase 46.1.1: seccomp-bpf filter for the socket(2) deny matrix
+// seccomp-bpf filter for the socket(2) deny matrix
 // (UDP / raw / AF_PACKET / AF_NETLINK). Layered on top of the
 // landlock V4 ruleset in [`linux`]'s `pre_exec` closure when the
 // posture is Strict. Exercised by the `socket-probe` test bin
@@ -93,29 +88,29 @@ mod linux;
 #[cfg(target_os = "linux")]
 mod seccomp;
 
-// Phase 46.2: Windows backend via Mandatory Integrity Control (drop
+// Windows backend via Mandatory Integrity Control (drop
 // child to Low IL) + Job Object for kill-tree parity with Unix's
 // process group. See [`windows`] module docs for the mechanism + the
 // platform-asymmetric posture mapping (Default OK; Strict needs
-// Phase 46.3's WFP layer).
+// WFP layer).
 #[cfg(target_os = "windows")]
 mod windows;
 
-// Phase 46.3 PR-2: argv contract for the `lpm-sandbox-helper.exe`
+// argv contract for the `lpm-sandbox-helper.exe`
 // helper. Cross-platform parser so the unit tests run on every CI
 // runner; the helper binary itself is Windows-only. The module gates
 // internally on `cfg(any(target_os = "windows", test))` — see its
 // crate-doc preamble.
 pub mod helper_protocol;
 
-// Phase 46.3 PR-2: AppContainer launcher invoked from
+// AppContainer launcher invoked from
 // `lpm-sandbox-helper.exe` on Windows. The Win32 surface (SID,
 // DACL, STARTUPINFOEXW, Job Object) is reachable only on Windows;
 // the module gates internally on `cfg(target_os = "windows")`.
 #[cfg(target_os = "windows")]
 pub mod helper_appcontainer;
 
-// Phase 46.3 PR-2: parent-side AppContainer backend (lives in
+// Parent-side AppContainer backend (lives in
 // `lpm.exe`, drives the helper binary). The factory below picks
 // this backend over [`windows::WindowsSandbox`] when
 // `locate_sandbox_helper` finds the helper.
@@ -130,7 +125,7 @@ mod windows_appcontainer;
 // builds don't compile this module at all, which matches CLAUDE.md's
 // cross-platform hygiene rule.
 //
-// Phase 46.2 (2026-05-12): excluded from Windows test builds. The
+// excluded from Windows test builds. The
 // rule fixtures use hard-coded POSIX paths (`/home/u/...`, `/tmp`,
 // `/dev/null`, …) that aren't absolute on Windows, so on a Windows
 // test host they'd surface as InvalidSpec rejections — pure noise
@@ -140,7 +135,7 @@ mod windows_appcontainer;
 #[cfg(any(target_os = "linux", all(test, not(target_os = "windows"))))]
 mod landlock_rules;
 
-// Phase 46.1 posture-decision helper. Pure (string in, decision out),
+// posture-decision helper. Pure (string in, decision out),
 // platform-neutral so the macOS-host unit tests exercise the same
 // table that the Linux backend uses in production. Compiles under
 // the same gate as `landlock_rules`: Linux production, plus any
@@ -148,7 +143,7 @@ mod landlock_rules;
 // developer's machine without spinning up a Linux VM. Non-Linux
 // production builds skip the module — they have no consumer.
 //
-// Phase 46.2 (2026-05-12): the Windows backend has its own
+// the Windows backend has its own
 // `decide_posture` (`crate::windows::decide_posture`), so this
 // Linux-shaped one stays gated off on Windows builds. Same
 // rationale as `landlock_rules` above.
@@ -170,7 +165,7 @@ pub use config::load_sandbox_write_dirs;
 #[derive(Debug, Clone)]
 pub struct SandboxSpec {
     /// `{store}/{pkg}@{version}` — the package's own content-addressable
-    /// store directory. The primary writable root per §9.3.
+    /// store directory. The primary writable root for lifecycle scripts.
     pub package_dir: PathBuf,
     /// Absolute path to the project root (the directory containing
     /// `package.json`). Readable broadly; writable under narrow subpaths
@@ -186,7 +181,7 @@ pub struct SandboxSpec {
     /// broadly so scripts can cross-reference their own hoisted deps.
     pub store_root: PathBuf,
     /// `$HOME`. Used to expand `$HOME/.cache`, `$HOME/.node-gyp`,
-    /// `$HOME/.npm` in the §9.3 writable set and `$HOME/.nvm/versions`
+    /// `$HOME/.npm` in the sandbox writable set and `$HOME/.nvm/versions`
     /// in the read set.
     pub home_dir: PathBuf,
     /// `$TMPDIR`. Per-user temp on macOS, typically `/tmp` on Linux.
@@ -199,7 +194,7 @@ pub struct SandboxSpec {
 }
 
 /// Caller-tunable knobs the sandbox factory consumes alongside
-/// [`SandboxSpec`] and [`SandboxMode`]. Phase 46.1 introduces this
+/// [`SandboxSpec`] and [`SandboxMode`]. introduces this
 /// struct so the install layer can thread the
 /// `[sandbox] allow-degraded` config knob through to the Linux
 /// backend without changing every call site that doesn't need it.
@@ -209,7 +204,7 @@ pub struct SandboxSpec {
 /// explicitly inherit the conservative posture.
 #[derive(Debug, Clone, Default)]
 pub struct SandboxOptions {
-    /// Phase 46.1: opt-in escape hatch for the Linux backend on
+    /// opt-in escape hatch for the Linux backend on
     /// kernels older than 6.7 (the landlock V4 floor). When `false`
     /// (the default), kernels < 6.7 surface
     /// [`SandboxError::KernelTooOld`] with `required: "6.7"` and the
@@ -224,16 +219,15 @@ pub struct SandboxOptions {
     /// (strict mode). When network denial is off, the V1 floor is
     /// always usable on any landlock-capable kernel and there is no
     /// "degraded" state to fall back to — the backend just behaves
-    /// like Phase 46 P5 (filesystem + env containment).
+    /// in filesystem-only mode (filesystem + env containment).
     pub allow_degraded: bool,
 
-    /// Phase 46.1 rework (2026-05-11): whether the constructed
-    /// sandbox should deny outbound network from inside the
-    /// lifecycle script.
+    /// Whether the constructed sandbox should deny outbound network
+    /// from inside the lifecycle script.
     ///
-    /// When `false` (the default), the sandbox enforces only the
-    /// Phase 46 P5 contract: filesystem-write containment + env
-    /// scrubbing. Outbound network is allowed. This is the shape
+    /// When `false` (the default), the sandbox enforces only
+    /// filesystem-write containment + env scrubbing. Outbound
+    /// network is allowed. This is the shape
     /// most real-world scripted packages need
     /// (sharp/prisma/puppeteer/`@lpm-registry/cli`/etc. all download
     /// prebuilts or browser engines during postinstall).
@@ -283,23 +277,22 @@ impl SandboxOptions {
 /// shape and emit the per-install structured warning exactly when
 /// the user is on a fallback path.
 ///
-/// Reworked 2026-05-11 (Phase 46.1 rework): added
-/// [`SandboxPosture::Default`] to distinguish "user picked the
+/// [`SandboxPosture::Default`] distinguishes "user picked the
 /// relaxed mode" from "user picked strict but kernel forced a
 /// fallback" ([`SandboxPosture::Degraded`]). Both have the same
 /// runtime semantics (filesystem-only); the distinction matters
 /// for doctor / warning text + telemetry classification.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SandboxPosture {
-    /// Phase 46.1 rework default: filesystem-write containment +
+    /// rework default: filesystem-write containment +
     /// env scrubbing. Outbound network **allowed** — the user
     /// picked the relaxed mode, either by accepting the default or
     /// by explicit `[sandbox] mode = "default"`.
     ///
-    /// Same on-host runtime as Phase 46 P5. No per-install warning
-    /// is emitted because this is a chosen state, not a fallback.
+    /// No per-install warning is emitted because this is a chosen
+    /// state, not a fallback.
     Default,
-    /// Phase 46.1 strict posture: filesystem-write containment +
+    /// strict posture: filesystem-write containment +
     /// outbound network denial. Reached when the user opts into
     /// strict mode (`--strict-sandbox` / `--paranoid` /
     /// `[sandbox] mode = "strict"` / `LPM_STRICT_SANDBOX=1`).
@@ -311,7 +304,7 @@ pub enum SandboxPosture {
     ///   socket family / type (TCP, UDP, raw, AF_PACKET,
     ///   AF_NETLINK, DNS, AF_UNIX) goes to the deny path under
     ///   the `(deny default)` rule.
-    /// - **Linux landlock V4 + Phase 46.1.1 seccomp-bpf** — two
+    /// - **Linux landlock V4 + seccomp-bpf** — two
     ///   layered kernel mechanisms. Landlock V4
     ///   (`AccessNet::from_all`) denies TCP `BindTcp` /
     ///   `ConnectTcp`. The pre_exec closure ALSO installs a
@@ -353,15 +346,14 @@ pub enum SandboxPosture {
         missing: &'static str,
     },
     /// No containment applied (e.g. [`NoopSandbox`] for the
-    /// `--no-sandbox` escape hatch — Phase 46.1 rework collapsed
-    /// the legacy `--unsafe-full-env` partner per Q6 — or platforms
-    /// without a backend). Posture-aware UI surfaces this as
-    /// "containment off" rather than conflating with strict.
+    /// `--no-sandbox` escape hatch, or platforms without a backend).
+    /// Posture-aware UI surfaces this as "containment off" rather
+    /// than conflating with strict.
     Disabled,
 }
 
 impl SandboxPosture {
-    /// Render the Phase 46.1 per-install structured stderr warning
+    /// Render the per-install structured stderr warning
     /// line for this posture, or `None` if no warning is required.
     ///
     /// Returns `Some(...)` only for [`SandboxPosture::Degraded`] —
@@ -400,10 +392,9 @@ pub enum SandboxMode {
     /// substitutes for [`Enforce`](Self::Enforce). Intended for
     /// compat debugging via `--sandbox-log`.
     LogOnly,
-    /// No containment. Used only by the `--no-sandbox` escape
-    /// hatch (Phase 46.1 rework: single flag, legacy
-    /// `--unsafe-full-env` partner collapsed per Q6). Emits a loud
-    /// CLI banner at the call site (not this crate's responsibility).
+    /// No containment. Used only by the `--no-sandbox` escape hatch.
+    /// Emits a loud CLI banner at the call site (not this crate's
+    /// responsibility).
     Disabled,
 }
 
@@ -505,10 +496,10 @@ impl SandboxedCommand {
 
 /// Structured reasons a sandbox operation can fail. Every variant
 /// carries enough information for the CLI to surface an actionable
-/// denial line (§9 + §12.5).
+/// denial line.
 #[derive(Debug, thiserror::Error)]
 pub enum SandboxError {
-    /// The current platform has no sandbox backend. Windows (Phase 46)
+    /// The current platform has no sandbox backend. Windows 
     /// and non-{macOS,Linux} unix variants hit this arm. [`remediation`]
     /// is the user-facing next-step string.
     ///
@@ -518,14 +509,14 @@ pub enum SandboxError {
         /// Lowercase platform identifier (`"windows"`, `"freebsd"`, …).
         platform: String,
         /// User-facing next-step. Directs to the escape hatch or the
-        /// Phase 46.1 deferral as appropriate.
+        /// deferral as appropriate.
         remediation: String,
     },
 
     /// Linux kernel is older than the landlock ABI level the sandbox
     /// needs. Emitted by the Linux backend; symmetric with
-    /// [`UnsupportedPlatform`](Self::UnsupportedPlatform) per the
-    /// refuse-to-run stance agreed in Chunk 1 signoff.
+    /// [`UnsupportedPlatform`](Self::UnsupportedPlatform) in its
+    /// refuse-to-run stance.
     #[error(
         "Linux kernel too old for landlock sandbox (detected {detected}, need {required}) — \
 		 {remediation}"
@@ -541,9 +532,9 @@ pub enum SandboxError {
 
     /// The backend for this platform exists, but the requested
     /// [`SandboxMode`] has no implementation on this platform.
-    /// Phase 46 P5 Chunk 4 introduces this for Linux LogOnly:
-    /// landlock has no native observe-only primitive, so the honest
-    /// answer is "reject the mode" rather than pseudo-mode it.
+    /// Linux LogOnly hits this — landlock has no native observe-only
+    /// primitive, so the honest answer is "reject the mode" rather
+    /// than pseudo-mode it.
     ///
     /// Distinct from [`UnsupportedPlatform`](Self::UnsupportedPlatform)
     /// (the whole platform lacks a backend) so callers + tests can
@@ -557,7 +548,7 @@ pub enum SandboxError {
         /// Linux.
         mode: SandboxMode,
         /// User-facing next-step. Names the interim workaround
-        /// (typically `--no-sandbox` — Phase 46.1 rework collapsed
+        /// (typically `--no-sandbox` — rework collapsed
         /// the legacy `--unsafe-full-env` partner) so users aren't
         /// stuck guessing.
         remediation: String,
@@ -637,12 +628,12 @@ pub trait Sandbox: Send + Sync {
 /// compiling platform-specific code they don't have.
 ///
 /// [`SandboxMode::Disabled`] always succeeds with a [`NoopSandbox`]
-/// regardless of platform — the `--no-sandbox` escape hatch (Phase
-/// 46.1 rework: single flag) must work everywhere, including Windows.
+/// regardless of platform — the `--no-sandbox` escape hatch must
+/// work everywhere, including Windows.
 ///
-/// Callers that need to thread the Phase 46.1
-/// `[sandbox] allow-degraded` knob through (install pipeline, doctor)
-/// use [`new_for_platform_with_options`] instead.
+/// Callers that need to thread the `[sandbox] allow-degraded` knob
+/// through (install pipeline, doctor) use
+/// [`new_for_platform_with_options`] instead.
 pub fn new_for_platform(
     spec: SandboxSpec,
     mode: SandboxMode,
@@ -650,7 +641,7 @@ pub fn new_for_platform(
     new_for_platform_with_options(spec, mode, SandboxOptions::default())
 }
 
-/// Phase 46.1: as [`new_for_platform`] but accepts a
+/// as [`new_for_platform`] but accepts a
 /// [`SandboxOptions`] so callers can opt into the degraded posture
 /// on kernels that don't support landlock V4.
 ///
@@ -701,18 +692,17 @@ fn platform_backend(
     mode: SandboxMode,
     options: SandboxOptions,
 ) -> Result<Box<dyn Sandbox>, SandboxError> {
-    // Phase 46.3 PR-2: prefer the AppContainer backend when its
-    // helper binary is reachable. AppContainer delivers full
-    // strict (filesystem-write containment + outbound network
-    // denial); the Phase 46.2 Mandatory Integrity Control backend
-    // remains as the fallback path when the helper binary is
-    // missing (npm install corruption, manual binary fetch,
+    // Prefer the AppContainer backend when its helper binary is
+    // reachable. AppContainer delivers full strict (filesystem-write
+    // containment + outbound network denial); the Mandatory Integrity
+    // Control backend remains as the fallback path when the helper
+    // binary is missing (npm install corruption, manual binary fetch,
     // dev-build that didn't bundle the helper).
     //
     // The two backends keep separate posture decisions
     // ([`windows::decide_posture`] vs
     // [`windows_appcontainer::decide_appcontainer_posture`]) so
-    // PR-2's AppContainer changes can't accidentally weaken the
+    // The AppContainer backend must not accidentally weaken the
     // Low IL backend's strict-without-degraded refusal contract.
     if let Some(helper_path) = windows_appcontainer::locate_sandbox_helper() {
         return Ok(Box::new(windows_appcontainer::AppContainerSandbox::new(
@@ -729,7 +719,7 @@ fn platform_backend(
     tracing::info!(
         target: "lpm_sandbox::windows",
         "lpm-sandbox-helper.exe not found next to lpm.exe; falling back to \
-         the Phase 46.2 Low IL backend (no outbound-network containment)",
+         the Low IL backend (no outbound-network containment)",
     );
     Ok(Box::new(windows::WindowsSandbox::new(spec, mode, options)?))
 }
@@ -749,15 +739,15 @@ fn platform_backend(
 /// Ensure the "standard" writable subpaths referenced by the sandbox
 /// profile actually exist on disk, creating any that don't.
 ///
-/// Phase 46 P5 Chunk 5: sandbox rules of the shape `(subpath
-/// "{project}/.husky")` allow writes INSIDE `.husky`, but creating
-/// `.husky` itself requires write on its parent (`{project}`) which
-/// we deliberately DON'T grant (scripts would gain write on the
-/// whole project tree). Scripts like `husky install` running on a
-/// fresh project would fail without this helper — they'd try to
-/// create `.husky` themselves and hit the sandbox rule gap.
+/// Sandbox rules of the shape `(subpath "{project}/.husky")` allow
+/// writes INSIDE `.husky`, but creating `.husky` itself requires
+/// write on its parent (`{project}`) which we deliberately DON'T
+/// grant (scripts would gain write on the whole project tree).
+/// Scripts like `husky install` running on a fresh project would
+/// fail without this helper — they'd try to create `.husky`
+/// themselves and hit the sandbox rule gap.
 ///
-/// Phase 46.2 (2026-05-12): also pre-creates every entry of
+/// also pre-creates every entry of
 /// `spec.extra_write_dirs`. Before this, a user-declared
 /// `sandboxWriteDirs: ["build-output"]` entry would be accepted by
 /// the validator and then silently denied at runtime — the Windows
@@ -868,13 +858,11 @@ pub fn release_sandbox_tracker(_pid: u32) {
 /// Centralized so unsupported platforms share consistent wording and
 /// the CLI-side message test has a single source of truth.
 ///
-/// Phase 46.1 rework (2026-05-11): the `--unsafe-full-env` partner
-/// flag was collapsed into `--no-sandbox` (Q6), so the remediation
-/// names a single flag now.
+/// The remediation names `--no-sandbox` as a single flag.
 ///
-/// Phase 46.2 (2026-05-12): Windows now has a real backend
-/// (`windows::WindowsSandbox`), so the legacy "Windows isn't
-/// supported" special case is gone. The Windows strict-mode refusal
+/// Windows has a real backend (`windows::WindowsSandbox`), so the
+/// legacy "Windows isn't supported" special case is gone. The
+/// Windows strict-mode refusal
 /// path generates its OWN remediation via
 /// `windows::strict_not_yet_supported_remediation`; this generic
 /// helper only fires for unsupported platforms (FreeBSD, OpenBSD,
@@ -912,9 +900,11 @@ fn validate_spec(spec: &SandboxSpec) -> Result<(), SandboxError> {
             // internally. A relative value usually means the env var
             // itself is misconfigured — surface that hint in the
             // error so the user can fix the root cause rather than
-            // chasing the call site. See `private/46.3.md` §4.3 for
-            // the rationale on rejecting (vs silently canonicalizing)
-            // a relative tmpdir.
+            // chasing the call site. The rationale for rejecting (vs
+            // silently canonicalizing) a relative tmpdir: any relative
+            // path is interpreted against the process cwd, which can
+            // differ from user intent and is not verifiable at sandbox
+            // construction time.
             let reason = if field == "tmpdir" {
                 format!(
                     "tmpdir must be absolute, got {}. Common cause: \
@@ -969,9 +959,9 @@ impl Sandbox for NoopSandbox {
         command.stdin(std::process::Stdio::from(cmd.stdin));
         // Put the child in its own process group so the caller's
         // timeout path can kill the whole tree with `kill(-pid, SIGKILL)`.
-        // Matches the pre-Phase-46 build.rs behavior and the other
-        // backends (Seatbelt, Landlock) — keeps `--no-sandbox` behaving
-        // like the legacy direct-spawn in every observable way.
+        // Matches the other backends (Seatbelt, Landlock) — keeps
+        // `--no-sandbox` behaving like the legacy direct-spawn in
+        // every observable way.
         #[cfg(unix)]
         {
             use std::os::unix::process::CommandExt;
@@ -1003,13 +993,9 @@ mod tests {
     /// Platform-aware fixture. `validate_spec` requires every path
     /// to be absolute by the calling OS's definition — `/home/u/...`
     /// is absolute on Unix but **NOT** on Windows (Windows requires a
-    /// drive letter prefix or UNC root). Phase 46.2 (2026-05-12)
-    /// surfaced this gap when wiring the Windows test build; pre-
-    /// 46.2 the workspace's test fixtures never ran on Windows
-    /// because the platform had no backend. The cfg block below
-    /// keeps the existing Unix paths verbatim and provides a
-    /// drive-letter equivalent for Windows so the same assertions
-    /// pass on both.
+    /// drive letter prefix or UNC root). The cfg block below keeps
+    /// the existing Unix paths verbatim and provides a drive-letter
+    /// equivalent for Windows so the same assertions pass on both.
     fn sample_spec() -> SandboxSpec {
         #[cfg(not(target_os = "windows"))]
         const PKG_DIR: &str = "/home/u/.lpm/store/prisma@5.22.0";
@@ -1081,7 +1067,7 @@ mod tests {
 
     #[test]
     fn error_display_unsupported_platform_mentions_platform_and_remediation() {
-        // Phase 46.2 (2026-05-12): Windows is no longer unsupported,
+        // Windows is no longer unsupported,
         // so we exercise the generic-unsupported path here with a
         // platform that genuinely has no backend (FreeBSD). The
         // Windows-specific strict-not-yet-supported remediation is
@@ -1094,8 +1080,6 @@ mod tests {
         let msg = format!("{e}");
         assert!(msg.contains("freebsd"), "got: {msg}");
         assert!(msg.contains("has no LPM sandbox backend"), "got: {msg}");
-        // Phase 46.1 rework (2026-05-11): single `--no-sandbox` flag,
-        // legacy `--unsafe-full-env` partner removed per Q6.
         assert!(msg.contains("--no-sandbox"), "got: {msg}");
         assert!(
             !msg.contains("--unsafe-full-env"),
@@ -1152,7 +1136,7 @@ mod tests {
         let msg = format!("{e}");
         assert!(msg.contains("linux"), "got: {msg}");
         assert!(msg.contains("LogOnly"), "got: {msg}");
-        // Phase 46.1 rework: single `--no-sandbox` flag.
+        // rework: single `--no-sandbox` flag.
         assert!(
             msg.contains("--no-sandbox"),
             "must point at the workaround: {msg}"
@@ -1161,7 +1145,7 @@ mod tests {
 
     #[test]
     fn unsupported_remediation_generic_unix_names_platform() {
-        // Phase 46.2 (2026-05-12): Windows is no longer routed
+        // Windows is no longer routed
         // through this helper — its own backend generates a richer
         // remediation when strict mode is requested without the
         // degraded opt-in. The helper now produces a uniform
@@ -1169,7 +1153,7 @@ mod tests {
         // (FreeBSD, OpenBSD, illumos, …).
         let s = unsupported_remediation("freebsd");
         assert!(s.contains("freebsd"));
-        // Phase 46.1 rework: single `--no-sandbox` flag.
+        // rework: single `--no-sandbox` flag.
         assert!(s.contains("--no-sandbox"));
         assert!(
             !s.contains("--unsafe-full-env"),
@@ -1178,7 +1162,7 @@ mod tests {
         assert!(s.contains("script-policy = deny"));
     }
 
-    /// Phase 46.2 follow-up: every entry of `spec.extra_write_dirs`
+    /// follow-up: every entry of `spec.extra_write_dirs`
     /// must exist on disk after `prepare_writable_dirs` returns.
     /// Without this, a user-declared `sandboxWriteDirs: ["build-output"]`
     /// would survive validation but be silently denied at runtime
@@ -1238,7 +1222,7 @@ mod tests {
     fn unsupported_remediation_no_longer_specials_windows_post_phase_46_2() {
         // Pin the removal of the legacy Windows special case so a
         // future "let's add a Windows case back here" PR has to
-        // delete this test on the way through. Phase 46.2 ships a
+        // delete this test on the way through. ships a
         // real Windows backend; the generic message is the right
         // shape now that Windows reaches the same surface as the
         // other supported OSes.
@@ -1311,10 +1295,9 @@ mod tests {
         // TMP / TEMP env var is misconfigured. Pin both the
         // rejection AND the env-var hint, so the actionable
         // remediation text doesn't get lost in a future refactor.
-        // Phase 46.3 §4.3 rationale: we deliberately fail loud
-        // rather than silently canonicalizing a relative tmpdir,
-        // because silent canonicalization would paper over the
-        // upstream env-var bug.
+        // We deliberately fail loud rather than silently
+        // canonicalizing a relative tmpdir, because silent
+        // canonicalization would paper over the upstream env-var bug.
         let mut s = sample_spec();
         s.tmpdir = PathBuf::from("relative/tmp");
         let err = validate_spec(&s).expect_err("relative tmpdir must be rejected");
@@ -1357,8 +1340,8 @@ mod tests {
     /// pass it through `cmd.exe /c exit 0`. Returns the program +
     /// args + minimum env passthrough required to actually run the
     /// child (Windows cmd.exe needs SYSTEMROOT/COMSPEC/WINDIR to
-    /// resolve its own DLL load chain, per the §8 trap in the
-    /// Phase 46.2 handoff).
+    /// resolve its own DLL load chain — these env vars must be passed
+    /// through or the process fails to start).
     fn trivial_success_command() -> SandboxedCommand {
         let pass = |k: &str| -> (String, OsString) {
             (k.to_string(), std::env::var_os(k).unwrap_or_default())
@@ -1452,7 +1435,7 @@ mod tests {
                 remediation,
             }) => {
                 assert_eq!(platform, std::env::consts::OS);
-                // Phase 46.1 rework: single `--no-sandbox` flag.
+                // rework: single `--no-sandbox` flag.
                 assert!(remediation.contains("--no-sandbox"));
                 assert!(
                     !remediation.contains("--unsafe-full-env"),
@@ -1466,9 +1449,8 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn factory_returns_seatbelt_backend_on_macos() {
-        // Chunk 2 landed the real Seatbelt impl. Behavior-level tests
-        // for spawn + containment live in the `macos` module's own
-        // tests; this one asserts the factory wiring only.
+        // Behavior-level tests for spawn + containment live in the
+        // `macos` module's own tests; this one asserts factory wiring.
         let sb = new_for_platform(sample_spec(), SandboxMode::Enforce)
             .expect("macOS factory must succeed");
         assert_eq!(sb.backend_name(), "seatbelt");
@@ -1478,7 +1460,7 @@ mod tests {
     #[cfg(target_os = "windows")]
     #[test]
     fn factory_returns_windows_backend_on_windows() {
-        // Phase 46.2 (2026-05-12): real backend via Mandatory
+        // real backend via Mandatory
         // Integrity Control + Job Object. Default options yield the
         // relaxed default — filesystem-write containment only,
         // network allowed. Construction has no kernel-version gate
@@ -1497,10 +1479,8 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn factory_returns_landlock_backend_on_linux() {
-        // Chunk 3: real landlock impl replaces the Chunk 1 stub.
-        // Phase 46.1 rework (2026-05-11): default options give
-        // `Default` posture (V1 baseline). Construction either
-        // succeeds (landlock V1 reachable — the bar is low) or
+        // Default options give `Default` posture (V1 baseline).
+        // Construction either succeeds (landlock V1 reachable) or
         // surfaces `KernelTooOld { required: "5.13" }` on hosts
         // where landlock is entirely disabled.
         match new_for_platform(sample_spec(), SandboxMode::Enforce) {
@@ -1519,9 +1499,9 @@ mod tests {
         }
     }
 
-    /// Phase 46.1: every backend produced by the factory must
-    /// return a sensible posture. NoopSandbox is Disabled; the
-    /// real backends are Strict by default. The Degraded posture is
+    /// Every backend produced by the factory must return a sensible
+    /// posture. NoopSandbox is Disabled; the real backends are Strict
+    /// by default. The Degraded posture is
     /// reachable only via [`new_for_platform_with_options`] +
     /// `allow_degraded = true` on a Linux kernel < 6.7 — that path
     /// is tested in [`crate::linux::tests`].

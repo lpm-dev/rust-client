@@ -1,7 +1,6 @@
-//! Phase 46.1.1 backend runtime gate: spawn the `socket-probe`
-//! test bin under a Strict-posture landlock sandbox and assert
-//! the seccomp filter denies the `socket(AF_INET, SOCK_DGRAM)`
-//! syscall.
+//! Backend runtime gate: spawn the `socket-probe` test bin under
+//! a Strict-posture landlock sandbox and assert the seccomp filter
+//! denies the `socket(AF_INET, SOCK_DGRAM)` syscall.
 //!
 //! Sibling of the lib-side `tests` mod inside
 //! [`crates/lpm-sandbox/src/linux.rs`], but lifted to the
@@ -12,7 +11,7 @@
 //! `helper_network.rs` tests use for `lpm-sandbox-helper`.
 //!
 //! Linux-only: macOS Seatbelt already denies UDP unconditionally
-//! via `(deny default)`. Phase 46.1.1 is the Linux follow-up.
+//! via `(deny default)`; this test gates the Linux seccomp layer.
 
 #![cfg(target_os = "linux")]
 
@@ -45,8 +44,8 @@ fn allowlisted_exec_dir() -> std::path::PathBuf {
 /// `path` has the `noexec` option. On hardened Linux hosts
 /// (some Docker images, security-hardened distros), the kernel
 /// denies `execve` on any file under such a mount regardless
-/// of file permissions or sandbox state. The Phase 46.1.1 test
-/// copies `socket-probe` into the allow-listed exec dir (see
+/// of file permissions or sandbox state. This test copies
+/// `socket-probe` into the allow-listed exec dir (see
 /// [`allowlisted_exec_dir`]) and then exec-spawns it; if the
 /// chosen dir is on a noexec mount, that exec fails with
 /// EACCES at the kernel-mount layer BEFORE the seccomp filter
@@ -186,7 +185,7 @@ fn denies_udp_socket_under_strict() {
     let status = child.wait().expect("wait socket-probe");
     assert!(
         status.success(),
-        "Phase 46.1.1 seccomp filter must deny socket(AF_INET, SOCK_DGRAM, 0): \
+        "seccomp filter must deny socket(AF_INET, SOCK_DGRAM, 0): \
          `socket-probe` exits 0 iff errno=EACCES, got {status:?}. A non-zero \
          exit means the filter is NOT installed (probe returned an fd, exit 1) \
          or the host returned a different errno (EAFNOSUPPORT / ENOSYS / etc., \
