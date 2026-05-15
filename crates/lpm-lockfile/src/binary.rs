@@ -1608,7 +1608,7 @@ mod tests {
     // ── Binary v2: tarball URL round-trip ─────────────────────────────────
 
     #[test]
-    fn phase43_entry_size_is_36_bytes() {
+    fn entry_size_is_36_bytes() {
         // Wire-format invariant: v2 entries are 36 bytes (v1 was 30).
         // Guards against accidentally mis-sizing the writer/reader.
         assert_eq!(ENTRY_SIZE, 36, "v2 entry size must be 36 bytes");
@@ -1616,7 +1616,7 @@ mod tests {
     }
 
     #[test]
-    fn phase43_tarball_roundtrips_through_binary() {
+    fn tarball_roundtrips_through_binary() {
         let mut lf = Lockfile::new();
         lf.add_package(LockedPackage {
             name: "lodash".to_string(),
@@ -1648,7 +1648,7 @@ mod tests {
     }
 
     #[test]
-    fn phase43_mixed_tarball_population_roundtrips() {
+    fn mixed_tarball_population_roundtrips() {
         // Rollout window — some entries have URL, some don't.
         // None must round-trip as None (null sentinel); Some must
         // preserve the exact bytes.
@@ -1687,7 +1687,7 @@ mod tests {
     }
 
     #[test]
-    fn phase43_writer_rejects_empty_tarball() {
+    fn writer_rejects_empty_tarball() {
         // M2 from 3rd-pass audit — `(off=0, len=0)` is the null
         // sentinel. An empty-string tarball inserted into an empty
         // StringTable would yield exactly `(0, 0)` and become
@@ -1713,7 +1713,7 @@ mod tests {
     }
 
     #[test]
-    fn phase43_writer_rejects_empty_source_and_integrity_too() {
+    fn writer_rejects_empty_source_and_integrity_too() {
         // Same sentinel collision applies to `source` / `integrity`.
         // Historically the writer silently accepted them (falling to
         // the `(0, 0)` null sentinel, confusing readers into seeing
@@ -1755,7 +1755,7 @@ mod tests {
     }
 
     #[test]
-    fn phase43_v2_reader_rejects_v1_binary_strict() {
+    fn v2_reader_rejects_v1_binary_strict() {
         // A v2 reader decoding v1 entries (30 bytes each) as v2
         // entries (36 bytes each) would read package N's `name_off`
         // as package N-1's (nonexistent) tarball pair and produce
@@ -1786,7 +1786,7 @@ mod tests {
     }
 
     #[test]
-    fn phase43_v2_reader_rejects_future_version_3() {
+    fn v2_reader_rejects_future_version_3() {
         // Forward-incompat — a hypothetical v3 file must be rejected
         // by today's v2 reader (strict match, not `<= max`).
         let mut binary = sample_binary();
@@ -1799,7 +1799,7 @@ mod tests {
     }
 
     #[test]
-    fn phase43_open_rejects_corrupt_tarball_pair_zero_length_nonzero_offset() {
+    fn open_rejects_corrupt_tarball_pair_zero_length_nonzero_offset() {
         // The range-overflow check passes `(off != 0, len == 0)`
         // trivially because `off + 0 > string_table_len` is false
         // for any in-bounds `off`. Combined with `tarball()`
@@ -1835,7 +1835,7 @@ mod tests {
     }
 
     #[test]
-    fn phase43_open_rejects_corrupt_tarball_pair() {
+    fn open_rejects_corrupt_tarball_pair() {
         // A corrupted tarball slot must force a TOML fallback at
         // `read_fast` time, NOT silently surface `Some("")` via the
         // `read_str` bounds-check degradation.
@@ -1876,7 +1876,7 @@ mod tests {
     }
 
     #[test]
-    fn phase43_null_tarball_sentinel_roundtrips() {
+    fn null_tarball_sentinel_roundtrips() {
         // A package with `tarball: None` must round-trip as None,
         // not accidentally as `Some("")`. Exercises the (0, 0) =
         // None path of `tarball()` and confirms the writer didn't
