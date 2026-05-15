@@ -252,13 +252,15 @@ fn doctor_list_includes_manifest_compat_codes() {
 fn every_runtime_emitted_code_is_in_the_catalog() {
     let catalog: HashSet<String> = read_catalog_codes();
 
-    // Fixture 1: empty project pointed at an unreachable registry.
-    // Surfaces infrastructure / auth / project-state codes.
+    // Both fixtures run `--all` so the union covers infrastructure +
+    // auth + manifest-compat codes. The default fast preset deliberately
+    // omits those tiers (zero network, zero subprocess); fixture
+    // coverage must opt into `--all` to assert their drift-guard.
     let proj_a = TempProject::empty(r#"{"name":"x","version":"1.0.0"}"#);
     let out_a = lpm_with_registry(&proj_a, "http://127.0.0.1:1")
-        .args(["doctor", "--json"])
+        .args(["doctor", "--all", "--json"])
         .output()
-        .expect("failed to run lpm doctor --json (fixture A)");
+        .expect("failed to run lpm doctor --all --json (fixture A)");
     let json_a = parse_json_output(&out_a.stdout);
 
     // Fixture 2: manifest with engines + pnpm fields → exercises the
@@ -276,9 +278,9 @@ fn every_runtime_emitted_code_is_in_the_catalog() {
         }"#,
     );
     let out_b = lpm_with_registry(&proj_b, "http://127.0.0.1:1")
-        .args(["doctor", "--json"])
+        .args(["doctor", "--all", "--json"])
         .output()
-        .expect("failed to run lpm doctor --json (fixture B)");
+        .expect("failed to run lpm doctor --all --json (fixture B)");
     let json_b = parse_json_output(&out_b.stdout);
 
     let mut emitted: HashSet<String> = HashSet::new();

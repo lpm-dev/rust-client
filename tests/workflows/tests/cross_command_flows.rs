@@ -582,11 +582,15 @@ fn flow_doctor_fix_install_post_fix_install_is_clean() {
     // version, etc.) fail, but the load-bearing claim is that the
     // *fixable* findings get fixed regardless. Assert the on-disk
     // side effect, not the exit code.
+    // `.gitattributes` is Extended-tier, so the default fast preset
+    // skips the check (and therefore the auto-fix). Pass `--all` so
+    // both the lockb regen (Fast-tier) and the .gitattributes write
+    // (Extended-tier) get exercised.
     let _out_fix = lpm_with_registry(&project, "http://127.0.0.1:1")
         .env("LPM_LINKER", "isolated")
-        .args(["doctor", "--fix", "--yes", "--json"])
+        .args(["doctor", "--all", "--fix", "--yes", "--json"])
         .output()
-        .expect("spawn doctor --fix");
+        .expect("spawn doctor --all --fix");
     assert!(
         project.file_exists(".gitattributes"),
         "doctor --fix must create .gitattributes regardless of unrelated check failures"
