@@ -172,12 +172,14 @@ fn patch_fails_when_package_not_in_store() {
     );
 }
 
-/// `lpm patch <name>@<range>` (caret/tilde/etc) is reserved for Phase
-/// 6.1. Pin the rejection so a future range-accepting impl doesn't
-/// silently change the contract for `lpm patch foo@^1`.
+/// Range selectors require a project lockfile to resolve against.
+/// Without one, the command errors before taking the global store
+/// lock with an actionable "run `lpm install`" hint. The exact-pin
+/// path is unaffected — it works on projects with no lockfile (see
+/// `patch_extracts_to_temp_dir_with_breadcrumb`).
 #[test]
-fn patch_rejects_range_keys() {
-    let project = TempProject::empty(r#"{"name":"patch-range-key","version":"0.0.0"}"#);
+fn patch_range_without_lockfile_errors_with_actionable_hint() {
+    let project = TempProject::empty(r#"{"name":"patch-range-no-lock","version":"0.0.0"}"#);
     seed_store_package(&project, "lodash", "4.17.21", &[("a.js", "x")]);
 
     let out = lpm_with_registry(&project, "http://127.0.0.1:1")
@@ -186,7 +188,7 @@ fn patch_rejects_range_keys() {
         .expect("spawn lpm patch");
     assert!(
         !out.status.success(),
-        "patch with caret range must fail; stdout:\n{}\nstderr:\n{}",
+        "range selector without lockfile must fail; stdout:\n{}\nstderr:\n{}",
         String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr)
     );
@@ -195,13 +197,36 @@ fn patch_rejects_range_keys() {
         String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr)
     ));
-    // miette may wrap the message across lines, so check the two halves
-    // independently rather than as a single substring.
     assert!(
-        combined.contains("range version")
-            && (combined.contains("not\n") || combined.contains("not "))
-            && combined.contains("supported yet"),
-        "error must say range version isn't supported yet; got:\n{combined}"
+        combined.contains("require") && combined.contains("lockfile"),
+        "error must explain lockfile requirement; got:\n{combined}"
+    );
+    assert!(
+        combined.contains("lpm install") || combined.contains("exact pin"),
+        "error must hint at the recovery paths; got:\n{combined}"
+    );
+}
+
+/// Dist-tags (`latest`, `next`, `beta`) are explicitly out of scope.
+/// The selector path never consults the registry.
+#[test]
+fn patch_rejects_dist_tag_selectors() {
+    let project = TempProject::empty(r#"{"name":"patch-dist-tag","version":"0.0.0"}"#);
+    seed_store_package(&project, "lodash", "4.17.21", &[("a.js", "x")]);
+
+    let out = lpm_with_registry(&project, "http://127.0.0.1:1")
+        .args(["patch", "lodash@latest"])
+        .output()
+        .expect("spawn lpm patch");
+    assert!(!out.status.success(), "dist-tag selector must fail");
+    let combined = strip_ansi(&format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    ));
+    assert!(
+        combined.contains("dist-tag"),
+        "error must mention dist-tag; got:\n{combined}"
     );
 }
 
@@ -376,4 +401,163 @@ fn patch_commit_fails_on_binary_change() {
         "error must mention 'binary'; got:\n{combined}"
     );
     let _ = std::fs::remove_dir_all(&staging);
+}
+
+// ─── Selector resolution (Slice A) ─────────────────────────────────────
+
+/// Write a synthetic `lpm.lock` listing `(name, version)` pairs. Used
+/// to set up selector-resolution fixtures. `source` defaults to npm.
+fn write_lockfile(project: &TempProject, entries: &[(&str, &str)]) {
+    let mut toml = String::from("[metadata]\nlockfile-version = 2\nresolved-with = \"test\"\n\n");
+    for (name, version) in entries {
+        toml.push_str(&format!(
+            "[[packages]]\nname = \"{name}\"\nversion = \"{version}\"\n\
+             source = \"registry+https://registry.npmjs.org\"\n\n",
+        ));
+    }
+    project.write_file("lpm.lock", &toml);
+}
+
+/// `lpm patch lodash@^4.0.0` against a project with `lodash@4.17.21`
+/// in the lockfile resolves the range to the exact pin BEFORE writing
+/// the staging breadcrumb. The breadcrumb's `key` field is the
+/// resolved exact pin, never the raw user input.
+#[test]
+fn patch_range_selector_resolves_to_exact_pin() {
+    let project = TempProject::empty(r#"{"name":"patch-range-resolve","version":"0.0.0"}"#);
+    seed_store_package(&project, "lodash", "4.17.21", &[("a.js", "x")]);
+    write_lockfile(&project, &[("lodash", "4.17.21")]);
+
+    let out = lpm_with_registry(&project, "http://127.0.0.1:1")
+        .args(["--json", "patch", "lodash@^4.0.0"])
+        .output()
+        .expect("spawn lpm patch");
+    assert!(
+        out.status.success(),
+        "range selector must resolve; stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let parsed: serde_json::Value =
+        serde_json::from_str(&strip_ansi(&String::from_utf8_lossy(&out.stdout))).unwrap();
+    assert_eq!(parsed["name"].as_str(), Some("lodash"));
+    assert_eq!(parsed["version"].as_str(), Some("4.17.21"));
+    assert_eq!(
+        parsed["key"].as_str(),
+        Some("lodash@4.17.21"),
+        "JSON envelope key must be the resolved exact pin, not the raw range"
+    );
+
+    let staging = PathBuf::from(parsed["staging_dir"].as_str().unwrap());
+    let breadcrumb: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(staging.join(".lpm-patch.json")).unwrap())
+            .unwrap();
+    assert_eq!(
+        breadcrumb["key"].as_str(),
+        Some("lodash@4.17.21"),
+        "breadcrumb key must be the resolved exact pin"
+    );
+    let _ = std::fs::remove_dir_all(&staging);
+}
+
+/// `lpm patch lodash` (bare name) against a project with a unique
+/// `lodash` entry resolves to that version. End-to-end including
+/// `lpm patch-commit` → the persisted-key invariant holds (the
+/// `patches/<key>.patch` filename and `lpm.patchedDependencies` entry
+/// both carry the resolved exact pin).
+#[test]
+fn patch_bare_name_selector_resolves_and_commits_exact_pin() {
+    let project = TempProject::empty(r#"{"name":"patch-bare-name","version":"0.0.0"}"#);
+    let integrity = seed_store_package(
+        &project,
+        "lodash",
+        "4.17.21",
+        &[("index.js", "module.exports = 'orig'\n")],
+    );
+    write_lockfile(&project, &[("lodash", "4.17.21")]);
+
+    // Step 1: extract via bare name.
+    let out1 = lpm_with_registry(&project, "http://127.0.0.1:1")
+        .args(["--json", "patch", "lodash"])
+        .output()
+        .expect("spawn lpm patch");
+    assert!(
+        out1.status.success(),
+        "bare-name selector must resolve; stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&out1.stdout),
+        String::from_utf8_lossy(&out1.stderr),
+    );
+    let parsed1: serde_json::Value =
+        serde_json::from_str(&strip_ansi(&String::from_utf8_lossy(&out1.stdout))).unwrap();
+    assert_eq!(parsed1["key"].as_str(), Some("lodash@4.17.21"));
+    let staging = PathBuf::from(parsed1["staging_dir"].as_str().unwrap());
+
+    // Step 2: edit a file.
+    std::fs::write(
+        staging.join("node_modules/lodash/index.js"),
+        "module.exports = 'PATCHED'\n",
+    )
+    .unwrap();
+
+    // Step 3: commit. Should produce `patches/lodash@4.17.21.patch` and
+    // a `lpm.patchedDependencies."lodash@4.17.21"` entry — NOT a raw-
+    // range filename or key.
+    let out2 = lpm_with_registry(&project, "http://127.0.0.1:1")
+        .args(["--json", "patch-commit", staging.to_str().unwrap()])
+        .output()
+        .expect("spawn lpm patch-commit");
+    assert!(
+        out2.status.success(),
+        "patch-commit must succeed; stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&out2.stdout),
+        String::from_utf8_lossy(&out2.stderr),
+    );
+
+    let patch_file = project.path().join("patches/lodash@4.17.21.patch");
+    assert!(
+        patch_file.exists(),
+        "patch file must use the resolved exact pin in its name"
+    );
+    let pkg: serde_json::Value = serde_json::from_str(&project.read_file("package.json")).unwrap();
+    assert_eq!(
+        pkg["lpm"]["patchedDependencies"]["lodash@4.17.21"]["path"].as_str(),
+        Some("patches/lodash@4.17.21.patch"),
+        "lpm.patchedDependencies key must be the resolved exact pin"
+    );
+    assert_eq!(
+        pkg["lpm"]["patchedDependencies"]["lodash@4.17.21"]["originalIntegrity"].as_str(),
+        Some(integrity.as_str())
+    );
+}
+
+/// Bare name on a project with multiple distinct versions of the
+/// package errors with a list-and-exit, no breadcrumb written.
+#[test]
+fn patch_bare_name_errors_with_list_on_multiple_versions() {
+    let project = TempProject::empty(r#"{"name":"patch-multi","version":"0.0.0"}"#);
+    seed_store_package(&project, "lodash", "3.10.0", &[("a.js", "x")]);
+    seed_store_package(&project, "lodash", "4.17.21", &[("a.js", "x")]);
+    write_lockfile(&project, &[("lodash", "3.10.0"), ("lodash", "4.17.21")]);
+
+    let out = lpm_with_registry(&project, "http://127.0.0.1:1")
+        .args(["patch", "lodash"])
+        .output()
+        .expect("spawn lpm patch");
+    assert!(
+        !out.status.success(),
+        "ambiguous bare-name must fail; stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let combined = strip_ansi(&format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    ));
+    assert!(combined.contains("lodash@3.10.0"), "got:\n{combined}");
+    assert!(combined.contains("lodash@4.17.21"), "got:\n{combined}");
+    assert!(
+        combined.contains("specify a precise version"),
+        "got:\n{combined}"
+    );
 }

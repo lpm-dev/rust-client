@@ -1473,8 +1473,10 @@ enum Commands {
     /// store integrity — drift on a future install is a hard error.
     #[command(name = "patch")]
     Patch {
-        /// Package selector (`name@exact-version`). Only exact pins are
-        /// accepted today; range selectors are not supported yet.
+        /// Package selector: bare name (`lodash`), exact pin
+        /// (`lodash@4.17.21`), or semver range (`lodash@^4.0.0`). The
+        /// resolved exact pin is persisted in `package.json`. Dist-tags
+        /// (`latest`, `next`) are not accepted.
         key: String,
     },
 
