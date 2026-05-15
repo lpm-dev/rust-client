@@ -1,34 +1,18 @@
 //! Single source of truth for filesystem paths owned by the linker.
 //!
-//! Phase 61 introduces this module as the central place every consumer
-//! (linker, rebuilder, doctor, install pipeline) consults to resolve
-//! per-project wrapper / metadata / health-check paths. The motivation
-//! is two-fold:
+//! Every consumer (linker, rebuilder, doctor, install pipeline)
+//! resolves per-project wrapper / metadata / health-check paths
+//! through this module. Both isolated and hoisted modes keep their
+//! state under `<project>/.lpm/` rather than inside `node_modules/`,
+//! so `rm -rf node_modules` doesn't orphan sibling metadata and the
+//! `Mixed` health surface has a coherent mode-switch story.
 //!
-//! 1. **Tier 2 relayout (61.1).** Phase 61 moves the isolated linker's
-//!    `.lpm/<wrapper>/` tree out of `node_modules/` to
-//!    `<project>/.lpm/wrappers/<wrapper>/`. Centralizing path
-//!    construction here means future shape changes are a one-line
-//!    edit rather than a workspace-wide grep hunt.
-//!
-//! 2. **Hoisted symmetry (Phase 61 follow-up).** This phase relocates
-//!    hoisted-mode state (`.lpm-metadata.json`, `.lpm/nested/`) out of
-//!    `node_modules/` and into a dedicated `<project>/.lpm/hoisted/`
-//!    namespace. The motivation is **architectural**, not perf: the
-//!    hoisted fast path still depends on `node_modules/<pkg>/`
-//!    surviving (see [`crate::link_packages_hoisted`]'s `dirs_intact`
-//!    check), so `rm -rf node_modules` always forces a full re-link
-//!    regardless of where the metadata sidecar lives. What this phase
-//!    buys is single source-of-truth path ownership, no orphan
-//!    `node_modules/.lpm/` after a hoisted install, and a coherent
-//!    mode-switch story for the `Mixed` health surface.
-//!
-//! ## Layout (post-hoisted-symmetry)
+//! ## Layout
 //!
 //! - `isolated_wrapper_root()` → `<project>/.lpm/wrappers/`
 //! - `isolated_legacy_wrapper_root()` → `<project>/node_modules/.lpm/`
 //!   (used by `needs_isolated_layout_migration` to detect
-//!   upgrade-in-place users still on the pre-61.1 layout)
+//!   upgrade-in-place users still on the legacy layout)
 //! - `hoisted_root()` → `<project>/.lpm/hoisted/`
 //! - `hoisted_metadata_path()` → `<project>/.lpm/hoisted/metadata.json`
 //! - `hoisted_nested_root()` → `<project>/.lpm/hoisted/nested/`
@@ -80,17 +64,17 @@ pub enum LinkerLayout {
     /// (post-symmetry); legacy variants are
     /// `node_modules/.lpm-metadata.json` + `node_modules/.lpm/nested/`.
     Hoisted,
-    /// **Phase 66 §4.** Virtual-store layout: project
-    /// `node_modules/<dep>` is a symlink into
-    /// `~/.lpm/store/v2/links/<graph-key>/node_modules/<dep>/`. Neither
-    /// `<project>/.lpm/wrappers/` nor `<project>/.lpm/hoisted/` is
-    /// populated — the canonical bytes live globally and the project
-    /// holds only the entry-point symlinks. Detected by [`LayoutPaths::is_v2_install`].
+    /// Virtual-store layout: project `node_modules/<dep>` is a
+    /// symlink into `~/.lpm/store/v2/links/<graph-key>/node_modules/<dep>/`.
+    /// Neither `<project>/.lpm/wrappers/` nor `<project>/.lpm/hoisted/`
+    /// is populated — the canonical bytes live globally and the
+    /// project holds only the entry-point symlinks. Detected by
+    /// [`LayoutPaths::is_v2_install`].
     Virtual,
     /// Both isolated and hoisted state is present on disk. The most
-    /// common cause is a half-completed `lpm install` during the 61.3
-    /// migration. `lpm install` is idempotent — re-running it converges
-    /// the tree to whichever layout is active.
+    /// common cause is a half-completed `lpm install` during a
+    /// layout migration. `lpm install` is idempotent — re-running
+    /// converges the tree to whichever layout is active.
     Mixed,
 }
 
@@ -119,49 +103,44 @@ impl<'a> LayoutPaths<'a> {
         Self { project_dir }
     }
 
-    // ── Isolated layout (post-61.1) ─────────────────────────────────
+    // ── Isolated layout ─────────────────────────────────────────────
 
     /// Root directory holding every per-package wrapper for this
     /// project. The linker creates this dir in
     /// [`crate::cleanup_stale_entries`]; consumers that need to
     /// enumerate wrappers (e.g., the migration check) read from here.
     ///
-    /// **Phase 61 layout (this commit, 61.1):** `<project>/.lpm/wrappers/`.
-    /// Sits as a project-root sibling of `.lpm/install-hash`,
-    /// `.lpm/build-state.json`, etc. Survives `rm -rf node_modules`
-    /// — the property that makes the warm-install bench (and the
+    /// Path: `<project>/.lpm/wrappers/`. Sits as a project-root
+    /// sibling of `.lpm/install-hash`, `.lpm/build-state.json`, etc.
+    /// Survives `rm -rf node_modules` — the property that lets the
     /// "wipe `node_modules` after a teammate's lockfile change" user
-    /// pattern surfaced in Phase 57.2) actually exercise the
-    /// incremental linker.
+    /// pattern actually exercise the incremental linker.
     pub fn isolated_wrapper_root(&self) -> PathBuf {
         self.project_dir.join(".lpm").join("wrappers")
     }
 
-    /// Pre-Phase-61 wrapper-root location: `<project>/node_modules/.lpm/`.
+    /// Legacy wrapper-root location: `<project>/node_modules/.lpm/`.
     /// Used by [`Self::needs_layout_migration`] to detect
     /// upgrade-in-place users whose `node_modules/` was not wiped
-    /// and is therefore still hosting the old layout.
-    ///
-    /// 61.3's migration code reads this path to wipe the legacy
-    /// wrapper subtree before letting the install rebuild from store
-    /// at the new location.
+    /// and is still hosting the old layout. The migration code reads
+    /// this path to wipe the legacy subtree before rebuilding from
+    /// store at the new location.
     pub fn isolated_legacy_wrapper_root(&self) -> PathBuf {
         self.project_dir.join("node_modules").join(".lpm")
     }
 
     /// Returns `true` iff [`Self::isolated_legacy_wrapper_root`] both
     /// exists AND contains at least one entry that looks like a
-    /// pre-61.1 wrapper segment — i.e., a non-dotfile entry whose
-    /// name is not literally `nested` (which is the hoisted-mode
-    /// fallback root, not isolated state).
+    /// legacy wrapper segment — a non-dotfile entry whose name is
+    /// not literally `nested` (which is the hoisted-mode fallback
+    /// root, not isolated state).
     ///
     /// Exposed publicly so the install pipeline's migration helper
     /// can decide whether to print the "migrating wrapper layout"
-    /// notice without re-implementing the per-mode predicate. Pre-fix,
-    /// the helper keyed off `legacy_root.exists()`, which fired for
-    /// hoisted-only legacy projects with transitive conflicts (their
+    /// notice. Keying off bare `legacy_root.exists()` would fire on
+    /// hoisted-only projects with transitive conflicts (their
     /// `node_modules/.lpm/nested/` makes the parent dir exist) and
-    /// emitted a spurious isolated-mode notice.
+    /// emit a spurious isolated-mode notice.
     pub fn legacy_isolated_root_has_wrapper_segments(&self) -> bool {
         legacy_isolated_has_wrapper_segments(&self.isolated_legacy_wrapper_root())
     }
@@ -266,12 +245,12 @@ impl<'a> LayoutPaths<'a> {
     /// `.lpm/wrappers/`, `.lpm/install-hash`, etc., so each linker
     /// mode owns its own subdirectory cleanly.
     ///
-    /// **Phase 61 follow-up.** Pre-symmetry, hoisted state lived under
-    /// `node_modules/.lpm-metadata.json` and `node_modules/.lpm/nested/`,
-    /// which made `node_modules/.lpm/` a dual-purpose directory shared
-    /// with the pre-61.1 isolated layout. After symmetry, hoisted owns
-    /// `<project>/.lpm/hoisted/` and isolated owns `<project>/.lpm/wrappers/`,
-    /// with no overlap.
+    /// Hoisted owns `<project>/.lpm/hoisted/` and isolated owns
+    /// `<project>/.lpm/wrappers/`, with no overlap. (The legacy
+    /// hoisted layout under `node_modules/.lpm-metadata.json` +
+    /// `node_modules/.lpm/nested/` shared `node_modules/.lpm/` with
+    /// the legacy isolated layout, which forced re-link on every
+    /// `rm -rf node_modules`.)
     pub fn hoisted_root(&self) -> PathBuf {
         self.project_dir.join(".lpm").join("hoisted")
     }
@@ -296,21 +275,19 @@ impl<'a> LayoutPaths<'a> {
         self.hoisted_root().join(".version")
     }
 
-    /// Pre-hoisted-symmetry hoisted metadata location:
+    /// Legacy hoisted metadata location:
     /// `<project>/node_modules/.lpm-metadata.json`. Used by
     /// [`Self::needs_hoisted_layout_migration`] to detect
-    /// upgrade-in-place hoisted users whose `node_modules/` was not
-    /// wiped and is therefore still hosting the old layout.
+    /// upgrade-in-place hoisted users still on the old layout.
     pub fn hoisted_legacy_metadata_path(&self) -> PathBuf {
         self.project_dir
             .join("node_modules")
             .join(".lpm-metadata.json")
     }
 
-    /// Pre-hoisted-symmetry hoisted nested fallback location:
+    /// Legacy hoisted nested-fallback location:
     /// `<project>/node_modules/.lpm/nested/`. Wiped alongside
-    /// [`Self::hoisted_legacy_metadata_path`] when the migration
-    /// helper runs.
+    /// [`Self::hoisted_legacy_metadata_path`] during migration.
     pub fn hoisted_legacy_nested_root(&self) -> PathBuf {
         self.project_dir
             .join("node_modules")
@@ -391,16 +368,12 @@ impl<'a> LayoutPaths<'a> {
     /// per-layout markers to decide whether the project looks like
     /// it has a working install.
     ///
-    /// Used by `lpm doctor` (61.4) and could be reused elsewhere if a
-    /// pre-flight check needs to fail-fast on a clearly-broken install.
+    /// Used by `lpm doctor` and reusable wherever a pre-flight check
+    /// needs to fail-fast on a clearly-broken install.
     ///
-    /// **Phase 66 §4 — v2 detection.** Pass `Some(v2_links_root)` to
-    /// teach the predicate about the virtual-store layout, where
-    /// neither `<project>/.lpm/wrappers/` nor
-    /// `<project>/.lpm/hoisted/metadata.json` is populated and the
-    /// project holds only entry-point symlinks into
-    /// `~/.lpm/store/v2/links/`. Pass `None` for the legacy probe
-    /// (returns `NodeModulesPresentButNoStore` for any v2 install).
+    /// For v2 detection use [`Self::install_appears_healthy_with_v2`]
+    /// and pass `Some(v2_links_root)` — this no-arg variant returns
+    /// `NodeModulesPresentButNoStore` for any v2 install.
     pub fn install_appears_healthy(&self) -> InstallHealth {
         self.install_appears_healthy_with_v2(None)
     }
@@ -660,8 +633,8 @@ mod tests {
 
     #[test]
     fn root_symlink_target_aliased_root_link() {
-        // Phase 40 P2: aliased root link uses the canonical target name
-        // for the wrapper-segment lookup but keeps the local link name.
+        // Aliased root link uses the canonical target name for the
+        // wrapper-segment lookup but keeps the local link name.
         // node_modules/strip-ansi-cjs → ../.lpm/wrappers/strip-ansi@6.0.1/node_modules/strip-ansi
         let dir = tmp_project();
         let layout = LayoutPaths::for_project(dir.path());
@@ -1105,9 +1078,9 @@ mod tests {
         );
     }
 
-    /// Phase 66 §4 — virtual-store layout detection. A project whose
+    /// Virtual-store layout detection. A project whose
     /// `node_modules/<dep>` symlinks resolve into the v2 links root
-    /// MUST register as `Healthy { Virtual }`, not the
+    /// must register as `Healthy { Virtual }`, not the
     /// `NodeModulesPresentButNoStore` fall-through.
     #[test]
     fn install_appears_healthy_virtual_store() {
