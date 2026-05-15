@@ -1,4 +1,4 @@
-//! Phase 37 — `IsolatedInstall`: per-spec install root for `lpm dlx`.
+//! `IsolatedInstall`: per-spec install root for `lpm dlx`.
 //!
 //! M2 introduced this primitive as the abstraction shared between
 //! `lpm dlx` and `lpm install -g`, with the ambition of "one engine,

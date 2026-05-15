@@ -61,7 +61,7 @@ fn is_workspace_root(dir: &Path) -> bool {
 /// to resolve) the project's managed Node.js runtime via `lpm_runtime::ensure_runtime`.
 ///
 /// The PATH builder uses this to skip the `detect_node_version` + `list_installed`
-/// I/O on the warm `lpm run` startup path. Phase 61 Tier 1.
+/// I/O on the warm `lpm run` startup path.
 ///
 /// Three states are required to honestly avoid redundant detection:
 ///
@@ -70,9 +70,8 @@ fn is_workspace_root(dir: &Path) -> bool {
 ///   managed runtime to use (no spec detected, or spec detected but no
 ///   matching install). The PATH builder skips the silent detect entirely.
 /// - `Unknown` — caller hasn't checked. The PATH builder falls back to the
-///   silent detect (current pre-Phase-61 behavior). Used by callers that
-///   don't go through `ensure_runtime` first (rebuild, dlx, hooks,
-///   `lpm test/bench/check`, doctor, orchestrator).
+///   silent detect. Used by callers that don't go through `ensure_runtime`
+///   first (rebuild, dlx, hooks, `lpm test/bench/check`, doctor, orchestrator).
 #[derive(Debug, Clone)]
 pub enum ManagedRuntimeHint {
     Bin(std::path::PathBuf),
@@ -81,10 +80,9 @@ pub enum ManagedRuntimeHint {
 }
 
 impl Default for ManagedRuntimeHint {
-    /// `Unknown` is the safe default: the PATH builder falls back to its
-    /// pre-Phase-61 silent-detect behavior. New callers that haven't been
-    /// taught to call `ensure_runtime` first get correct behavior, just not
-    /// the `lpm run` startup-time win.
+    /// `Unknown` is the safe default: the PATH builder falls back to silent
+    /// detect. New callers that haven't been taught to call `ensure_runtime`
+    /// first get correct behavior, just not the `lpm run` startup-time win.
     fn default() -> Self {
         Self::Unknown
     }
@@ -249,10 +247,10 @@ mod tests {
 
     #[test]
     fn build_path_with_bins_pre_resolved_uses_hinted_bin() {
-        // Phase 61 Tier 1 contract: when the caller hands the PATH builder a
-        // pre-resolved managed-runtime bin via `Bin(...)`, the produced PATH is
-        // exactly `[nm_bin, fake_runtime_bin, ...inherited]` — proves the hint
-        // is consumed verbatim with no re-stat / re-detect, *and* nothing else
+        // When the caller hands the PATH builder a pre-resolved managed-runtime
+        // bin via `Bin(...)`, the produced PATH must be exactly
+        // `[nm_bin, fake_runtime_bin, ...inherited]` — proves the hint is
+        // consumed verbatim with no re-stat / re-detect, and nothing else
         // gets prepended.
         let dir = tempfile::tempdir().unwrap();
         let nm_bin = dir.path().join("node_modules/.bin");
