@@ -1007,9 +1007,9 @@ fn read_referenced_file(pkg_dir: &Path, rel_path: &str) -> Option<String> {
 /// - `Some(Amber)` / `Some(AmberLlm)` / `None` → amber. The two
 ///   amber variants collapse because they're indistinguishable to
 ///   the user's "needs review" mental model — `AmberLlm` just means
-///   an LLM weighed in (P8). `None` means persisted state predates
-///  ; conservative: count unknowns as amber so the user's eye is
-///   drawn to them.
+///   an LLM weighed in. `None` means persisted state predates the
+///   triage gate; conservative: count unknowns as amber so the
+///   user's eye is drawn to them.
 ///
 /// Exposed so a future `--json` install shape and the human
 /// summary line share one counting function.
