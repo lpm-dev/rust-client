@@ -102,7 +102,7 @@ impl PackageBits {
 impl<'a> FilterEngine<'a> {
     /// Evaluate a list of parsed filter expressions against the workspace.
     ///
-    /// Composition rule (per design doc §8.1):
+    /// Composition rule:
     ///
     /// ```text
     /// result = (eval(positive_1) ∪ ... ∪ eval(positive_n))
@@ -1516,7 +1516,7 @@ mod tests {
     // Budgets are intentionally generous (5-10x the design doc release-mode
     // numbers) so they pass in debug mode where every test runs.
     //
-    // For tighter benchmarking, drive the bench/run.sh harness in Phase 0.2.
+    // For tighter benchmarking, drive the bench/run.sh harness.
     //
     // The fixture is a 200-member synthetic workspace with a 5-deep dependency
     // chain in the middle, so closure operators have non-trivial work.

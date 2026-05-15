@@ -220,7 +220,7 @@ mod tests {
         assert!(!should_fire, "should not fire again after debounce_fired");
     }
 
-    // -- Finding #7: watch filters by input globs --
+    // -- watch filters by input globs --
 
     #[test]
     fn glob_matching_filters_non_matching_files() {
@@ -241,7 +241,7 @@ mod tests {
         ));
     }
 
-    // -- Finding #8: shutdown mechanism --
+    // -- shutdown mechanism --
 
     #[test]
     fn watch_shuts_down_on_signal() {

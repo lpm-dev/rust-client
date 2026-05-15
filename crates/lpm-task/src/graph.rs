@@ -354,7 +354,7 @@ mod tests {
         assert!(pos_ui < pos_app);
     }
 
-    // ── Phase 32 Phase 1 M1: transitive_dependencies (forward closure) ────
+    // ── transitive_dependencies (forward closure) ─────────────────────────
 
     #[test]
     fn transitive_dependencies_in_linear_chain() {

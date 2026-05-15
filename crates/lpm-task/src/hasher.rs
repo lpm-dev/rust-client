@@ -300,7 +300,7 @@ mod tests {
         assert_ne!(key1, key2);
     }
 
-    // -- Finding #6: canonicalize_value sorts keys explicitly --
+    // -- canonicalize_value sorts keys explicitly --
 
     #[test]
     fn canonicalize_value_sorts_nested_keys() {
@@ -321,7 +321,7 @@ mod tests {
         assert_eq!(s, r#"[{"a":1,"b":2},{"c":3,"d":4}]"#);
     }
 
-    // -- Finding #12: streaming file hash --
+    // -- streaming file hash --
 
     #[test]
     fn sha256_hex_file_correct_hash() {
@@ -337,7 +337,7 @@ mod tests {
         );
     }
 
-    // -- Finding #16: hex encoding --
+    // -- hex encoding --
 
     #[test]
     fn hex_encode_correct() {
