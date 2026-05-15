@@ -1,14 +1,12 @@
 //! Shared TLS test scaffolding for `lpm-registry` integration tests.
 //!
 //! Lifted from the original inline copy in `cafile_strict_ssl.rs`
-//! when Phase 58.3 (mTLS / per-origin TLS) added a second consumer
-//! (`mtls.rs`). The pre-Phase-58.3 file header in `cafile_strict_ssl.rs`
-//! noted: *"One consumer = inline; two = refactor."* This is the lift.
+//! when a second consumer (`mtls.rs`) was added.
 //!
 //! ## Consumers
 //!
-//! - `tests/cafile_strict_ssl.rs` — Phase 58.1, server-only TLS.
-//! - `tests/mtls.rs` — Phase 58.3, mutual TLS (server requires client cert).
+//! - `tests/cafile_strict_ssl.rs` — server-only TLS.
+//! - `tests/mtls.rs` — mutual TLS (server requires client cert).
 //!
 //! Each consumer brings the module in via:
 //!
@@ -212,7 +210,7 @@ pub async fn spawn_tls_server(leaf: LeafCert, ca: &TestCa) -> (u16, JoinHandle<(
 }
 
 /// Spawn a TLS listener that REQUIRES client certs verified against
-/// `client_trust_ca`'s root. Phase 58.3 mTLS matrix uses this.
+/// `client_trust_ca`'s root.
 #[allow(dead_code)] // see ClientLeaf — per-test-crate visibility
 ///
 /// `server_ca` is the CA that signed the server leaf (presented in

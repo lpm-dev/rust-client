@@ -1,4 +1,4 @@
-//! Phase 58.3 — mTLS integration test matrix.
+//! mTLS integration test matrix.
 //!
 //! End-to-end TLS handshakes that exercise the full path from
 //! `.npmrc`-derived `certfile=` / `keyfile=` config → identity load
@@ -302,11 +302,10 @@ async fn mtls_per_origin_isolation() {
         .await
         .expect("no-mTLS listener must succeed via the default client");
 
-    // GPT post-T5 finding: prove dispatch actually picks DIFFERENT
-    // clients per URL. Without this, a regression that routed every
-    // URL to the per-origin client would silently still pass the
-    // probe checks above (server B's `with_no_client_auth` ignores
-    // unexpected client certs).
+    // Prove dispatch actually picks DIFFERENT clients per URL. Without
+    // this, a regression that routed every URL to the per-origin client
+    // would silently still pass the probe checks above (server B's
+    // `with_no_client_auth` ignores unexpected client certs).
     //
     // The contract is two-fold:
     // (1) **Stability** — `for_url_no_build(url_a)` returns the same
@@ -336,8 +335,7 @@ async fn mtls_per_origin_isolation() {
 /// encrypted-PKCS#8 test to guarantee `LPM_KEY_PASSPHRASE` is
 /// cleaned up even if the test panics — without it, a panic
 /// before manual `remove_var` would leak the env var into later
-/// tests in the same binary, making failure investigation order-
-/// dependent. GPT post-T5 LOW finding.
+/// tests in the same binary, making failure investigation order-dependent.
 struct EnvVarGuard {
     name: &'static str,
 }

@@ -75,23 +75,19 @@ pub struct VersionMetadata {
     #[serde(default, rename = "peerDependencies")]
     pub peer_dependencies: HashMap<String, String>,
 
-    /// **Phase 66 confidence-followup R5** — `peerDependenciesMeta`
-    /// flags from package.json. The npm spec defines a per-peer
-    /// metadata bag; today only the `optional: true` flag is read
-    /// (other future keys flow through verbatim). Empty when the
-    /// manifest declares no metadata, which is the common case.
+    /// `peerDependenciesMeta` flags from package.json. The npm spec
+    /// defines a per-peer metadata bag; only the `optional: true` flag
+    /// is read today. Empty when the manifest declares no metadata.
     /// Consumers gate the unmet-peer warning on
     /// `peer_dependencies_meta[name].optional`.
     #[serde(default, rename = "peerDependenciesMeta")]
     pub peer_dependencies_meta: HashMap<String, PeerDependencyMeta>,
 
-    /// **Phase 66 confidence-followup R4** — names this version
-    /// vendors inside its published tarball's `node_modules/` dir.
-    /// npm's spec accepts both `bundleDependencies` and
-    /// `bundledDependencies` spellings (former is canonical, latter
-    /// is npm's historical alias); both deserialize into this field.
-    /// Consumers (resolver) skip enqueuing these names as separate
-    /// installs — they're already provided by the parent's tarball.
+    /// Names this version vendors inside its published tarball's
+    /// `node_modules/` dir. npm's spec accepts both `bundleDependencies`
+    /// and `bundledDependencies` spellings; both deserialize into this
+    /// field. Consumers skip enqueuing these names as separate installs —
+    /// they're already provided by the parent's tarball.
     #[serde(
         default,
         rename = "bundleDependencies",
@@ -224,16 +220,14 @@ impl BehavioralTags {
     /// The canonical, camelCase tag name of every field that is
     /// currently `true`, sorted lexicographically.
     ///
-    /// **Phase 46 P1** — the ordered input for
-    /// `lpm_security::triage::hash_behavioral_tag_set`. Names use the
-    /// same spelling as the registry's wire protocol so the hash is
-    /// portable across any tooling that speaks the registry schema
-    /// (registry, CLI, dashboard).
+    /// Ordered input for `lpm_security::triage::hash_behavioral_tag_set`.
+    /// Names use the same spelling as the registry wire protocol so the
+    /// hash is portable across any tooling that speaks the registry schema.
     ///
-    /// Returning `Vec<&'static str>` (not `Vec<String>`) keeps the
-    /// caller's allocation cost at the small-Vec-of-pointers level;
-    /// the static strings mirror the `#[serde(rename)]` attributes
-    /// above and the server-side `behavioral-tags.js` definition.
+    /// Returns `Vec<&'static str>` (not `Vec<String>`) to keep allocation
+    /// cost at the small-Vec-of-pointers level. Static strings mirror the
+    /// `#[serde(rename)]` attributes above and the server-side
+    /// `behavioral-tags.js` definition.
     pub fn active_tag_names(&self) -> Vec<&'static str> {
         let mut active: Vec<&'static str> = Vec::new();
         // Source tags (10)
@@ -364,32 +358,25 @@ pub struct DistInfo {
     #[serde(default)]
     pub shasum: Option<String>,
 
-    /// **Phase 46 P4.** Per-key detached package signatures (npm's
-    /// package-signing surface). Empty/missing when the registry does
-    /// not sign packages — which is the current state for the LPM
-    /// registry and many niche npm-compatible hosts. Parsed loosely
-    /// here; Chunk 2 wires the CLI-side fetcher, Chunk 3 wires the
-    /// drift check. Registry servers that do not publish this field
-    /// continue to round-trip through serde-default.
+    /// Per-key detached package signatures (npm's package-signing surface).
+    /// Empty/missing when the registry does not sign packages. Registry
+    /// servers that do not publish this field continue to round-trip
+    /// through serde-default.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub signatures: Option<Vec<RegistrySignature>>,
 
-    /// **Phase 46 P4.** Sigstore attestation pointer. Present on
-    /// npm packages published via GitHub Actions with Trusted
-    /// Publishing. `None` indicates "no attestation" — which is the
-    /// exact axios-case signal when compared against a prior-approved
-    /// version that had one (§7.2 "provenance dropped" branch).
+    /// Sigstore attestation pointer. Present on npm packages published
+    /// via GitHub Actions with Trusted Publishing. `None` indicates
+    /// "no attestation" — a distinct signal when compared against a
+    /// prior-approved version that had one ("provenance dropped" branch).
     ///
-    /// The LPM registry does not expose this field today; the
-    /// coordinated server-side PR (§11 P4) adds it as a parallel
-    /// track.
+    /// The LPM registry does not expose this field today.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub attestations: Option<AttestationRef>,
 }
 
-/// **Phase 46 P4.** Per-key detached signature over the tarball
-/// integrity hash, as served by npm's package-metadata
-/// `dist.signatures` array.
+/// Per-key detached signature over the tarball integrity hash, as
+/// served by npm's package-metadata `dist.signatures` array.
 ///
 /// Fields are `Option<String>` for maximum serde tolerance: a partial
 /// signature payload (e.g., a registry that emits `keyid` without
@@ -406,16 +393,16 @@ pub struct RegistrySignature {
     pub sig: Option<String>,
 }
 
-/// **Phase 46 P4.** Pointer to a Sigstore attestation bundle for this
-/// version, plus the pre-parsed provenance summary that npm inlines
-/// in the metadata response.
+/// Pointer to a Sigstore attestation bundle for this version, plus
+/// the pre-parsed provenance summary that npm inlines in the metadata
+/// response.
 ///
-/// Chunk 1 models the wire shape loosely: `provenance` is kept as
-/// `serde_json::Value` because its schema (SLSA predicateType +
-/// subject array) is consumed only by the fetcher in Chunk 2, which
-/// can type-parse on demand. The `url` pointer is the actionable
-/// field for drift detection — the fetcher GETs it to retrieve the
-/// full attestation bundle and extract the cert SAN.
+/// `provenance` is kept as `serde_json::Value` because its schema
+/// (SLSA predicateType + subject array) is consumed only by the
+/// attestation fetcher, which can type-parse on demand. The `url`
+/// pointer is the actionable field for drift detection — the fetcher
+/// GETs it to retrieve the full attestation bundle and extract the
+/// cert SAN.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct AttestationRef {
     /// Registry-relative URL to the full attestation bundle
@@ -424,8 +411,8 @@ pub struct AttestationRef {
     pub url: Option<String>,
     /// Inline pre-parsed provenance summary. npm includes a JSON
     /// object with `predicateType` and (optionally) the raw SLSA
-    /// statement. Kept untyped in Chunk 1; Chunk 2 types the subset
-    /// the fetcher consumes.
+    /// statement. Kept untyped here; the attestation fetcher types
+    /// the subset it consumes on demand.
     #[serde(default)]
     pub provenance: Option<serde_json::Value>,
 }
@@ -467,11 +454,8 @@ impl PackageMetadata {
     /// 3. **Semver range** — parse `spec` as a `VersionReq` and return
     ///    the highest version in `versions` that satisfies it.
     ///
-    /// Phase 60 (D3): error shape mirrors the canonical pattern at
-    /// [`install_global.rs:368-405`](crate-internal) verbatim so the
-    /// Phase 60.1 migration of the four duplicate sites
-    /// (`install_global`, `install`, `update_global`, `global`) is a
-    /// true behavior-preserving refactor:
+    /// Error variants used by all call sites (behavior-preserving across
+    /// install, update, and global paths):
     ///
     /// - parse failure → `LpmError::Script("could not parse version token '{spec}': {e}")`
     /// - empty parseable set → `LpmError::Script("registry returned no parseable versions for '{name}'")`
@@ -1023,7 +1007,7 @@ pub struct BlockedSetVersionMeta {
 mod tests {
     use super::*;
 
-    // ── DistInfo round-trip with + without Phase 46 P4 fields ─────
+    // ── DistInfo round-trip with + without provenance fields ──────
 
     /// Legacy `DistInfo` response shape (registries that don't publish
     /// provenance, incl. LPM today) must round-trip unchanged when the
@@ -1048,8 +1032,7 @@ mod tests {
         assert!(parsed.attestations.is_none());
 
         // Re-serialize and assert the new fields do NOT leak in as
-        // `null` keys. Pre-P4 readers wouldn't trip on extra nullable
-        // fields but the wire is cleaner without them.
+        // `null` keys — the wire is cleaner without them.
         let reserialized = serde_json::to_string(&parsed).unwrap();
         assert!(
             !reserialized.contains("signatures"),
@@ -1097,7 +1080,7 @@ mod tests {
         assert_eq!(
             provenance.get("predicateType").and_then(|v| v.as_str()),
             Some("https://slsa.dev/provenance/v1"),
-            "inline provenance summary preserved as untyped JSON for Chunk 2 to type-parse on demand",
+            "inline provenance summary preserved as untyped JSON for the attestation fetcher to type-parse on demand",
         );
 
         // Full round-trip through serde.
@@ -1126,8 +1109,8 @@ mod tests {
 
     /// Partial signature payload — keyid without sig, or vice versa —
     /// must not fail deserialization. A registry could emit a stub
-    /// during a rollout; consumers (Chunk 2 fetcher) check both
-    /// fields are `Some` before trusting an entry.
+    /// during a rollout; consumers check both fields are `Some` before
+    /// trusting an entry.
     #[test]
     fn registry_signature_tolerates_partial_payload() {
         let keyid_only = r#"{"keyid": "SHA256:abc"}"#;
@@ -1141,10 +1124,10 @@ mod tests {
         assert_eq!(parsed.sig.as_deref(), Some("MEUCIAbc"));
     }
 
-    /// `AttestationRef.provenance` is kept untyped in Chunk 1 so an
-    /// unexpected schema extension (a new npm field, a custom
-    /// predicate type) doesn't trip deserialization. Chunk 2 will
-    /// type-parse the subset the CLI fetcher actually consumes.
+    /// `AttestationRef.provenance` is kept untyped so an unexpected
+    /// schema extension (a new npm field, a custom predicate type)
+    /// doesn't trip deserialization. The attestation fetcher
+    /// type-parses the subset it actually consumes.
     #[test]
     fn attestation_ref_provenance_accepts_unknown_fields() {
         let json = r#"{
@@ -1166,7 +1149,7 @@ mod tests {
         );
     }
 
-    // ── PackageMetadata::resolve_version_spec (Phase 60 D3) ─────────
+    // ── PackageMetadata::resolve_version_spec ──────────────────────
 
     fn metadata_for_resolver_tests() -> PackageMetadata {
         let json = r#"{
@@ -1230,9 +1213,8 @@ mod tests {
     fn resolve_version_spec_no_satisfying_version_errors_with_script_variant() {
         let m = metadata_for_resolver_tests();
         let err = m.resolve_version_spec("99.99.99").unwrap_err();
-        // D3: error variant is Script (not NotFound) so the future
-        // migration of install_global/install/update_global/global to
-        // call this helper is behavior-preserving.
+        // Error variant is Script (not NotFound) — all install paths use this
+        // helper so behavior is consistent across install/update/global.
         match &err {
             lpm_common::LpmError::Script(msg) => {
                 assert!(msg.contains("no version of 'fixture' satisfies '99.99.99'"));
