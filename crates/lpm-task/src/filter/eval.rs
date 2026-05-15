@@ -1556,8 +1556,8 @@ mod tests {
     /// was very sensitive to OS scheduling on GitHub Actions: one
     /// 500ms stall across a 500-iter loop adds 1ms to every per-op
     /// sample, which is 2× the 500µs debug budget — the glob
-    /// eval test flaked exactly this way on 2026-04-23 (CI run
-    /// 24830202402, Linux `ubuntu-latest`). Best-of-N captures
+    /// eval test flaked exactly this way on a Linux CI run
+    /// (`ubuntu-latest`). Best-of-N captures
     /// "when the scheduler cooperated, how fast can this code
     /// run?" — the question a ns/op budget is actually asking, and
     /// the one a regression in LPM's own code would answer with a

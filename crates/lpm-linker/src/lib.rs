@@ -4406,8 +4406,8 @@ mod tests {
     }
 
     /// Regression test for the conflict-nesting bug found in the
-    /// 2026-05-07 hoisted-mode compatibility audit (eslint-flat-config
-    /// fixture). Pre-fix, when two conflict-versioned packages had
+    /// hoisted-mode compatibility audit (eslint-flat-config fixture).
+    /// Pre-fix, when two conflict-versioned packages had
     /// different consumers that were themselves at different versions,
     /// the algorithm misplaced the deeper conflict under whichever
     /// hoisted package shared the consumer's name — which was the

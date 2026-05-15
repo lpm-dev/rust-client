@@ -650,7 +650,7 @@ pub async fn resolve_greedy_fused(
         if metadata_jobs.is_empty() && state.task_queue.is_empty() {
             debug_assert!(
                 parked.is_empty(),
-                "phase56-fusion: non-empty parked at termination — invariant violated \
+                "greedy-fusion: non-empty parked at termination — invariant violated \
                  (parked_keys={:?})",
                 parked.keys().collect::<Vec<_>>()
             );

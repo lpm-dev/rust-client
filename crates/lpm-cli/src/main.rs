@@ -1229,7 +1229,7 @@ enum Commands {
     /// `lpm use node@22` installs Node 22 and pins it in lpm.json.
     /// Scripts then auto-use the pinned version via PATH injection.
     Use {
-        /// Node.js version spec (e.g., node@22, node@lts, 22.5.0), or "vars" to manage project env vars.
+        /// Node.js version spec (e.g., node@22, node@lts, 22.5.0). For env vars and secrets, use `lpm env`.
         spec: Option<String>,
 
         /// List installed runtime versions.

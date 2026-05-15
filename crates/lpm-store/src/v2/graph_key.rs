@@ -852,28 +852,27 @@ mod tests {
         assert_eq!(GraphKey::derive(&a), GraphKey::derive(&b));
     }
 
-    // ── R2.3 — peer-divergent installs MUST produce distinct keys ──
+    // ── peer-divergent installs MUST produce distinct keys ──
     //
-    // **Load-bearing for R2.2.** If two projects (or the same project
-    // across reinstalls) have identical dep edges + linker mode +
-    // platform but differ in WHICH version of a peer they pinned,
-    // they are semantically different materializations: each
-    // consumer's runtime sees a different peer instance. The v2
-    // store's per-graph-key link entries MUST be distinct so the
-    // copies of the consumer's bytes don't share state across
-    // peer-divergent installs.
+    // If two projects (or the same project across reinstalls) have
+    // identical dep edges + linker mode + platform but differ in WHICH
+    // version of a peer they pinned, they are semantically different
+    // materializations: each consumer's runtime sees a different peer
+    // instance. The v2 store's per-graph-key link entries MUST be
+    // distinct so the copies of the consumer's bytes don't share state
+    // across peer-divergent installs.
     //
-    // Pre-R2.2 the resolver didn't auto-install peers, so the
+    // Previously the resolver didn't auto-install peers, so the
     // distinction rarely surfaced — most peer-declared packages
     // either errored out or relied on the user to install a peer
     // version manually, and the consumer's GraphKey-input `peers` was
-    // empty in either case. R2.2 makes auto-install the default, so
+    // empty in either case. Auto-install is now the default, so
     // the same consumer (e.g., react-redux) can land with react@18 in
     // project A and react@19 in project B from the same lockfile-fast-
     // path entry. The link-entry isolation has to work.
 
     #[test]
-    fn r23_different_peer_versions_yield_different_keys() {
+    fn different_peer_versions_yield_different_keys() {
         // Same consumer, same dep edges, same linker mode, same
         // platform. Only the peer pin differs. Keys must diverge so
         // the link entries can't share bytes across peer-divergent
@@ -897,7 +896,7 @@ mod tests {
     }
 
     #[test]
-    fn r23_different_peer_names_yield_different_keys() {
+    fn different_peer_names_yield_different_keys() {
         // Two consumers with same dep edges but different peer SETS
         // (not just versions). E.g., one peers `react` only; the
         // other peers both `react` and `react-dom`. The keys must
@@ -987,7 +986,7 @@ mod tests {
     }
 
     #[test]
-    fn r23_no_peers_vs_one_peer_yields_different_keys() {
+    fn no_peers_vs_one_peer_yields_different_keys() {
         // Empty peer set vs single-peer set must differ. Important
         // because a consumer with no peer requirements at all
         // (post-R5 optional-peer skip → empty peers field) must NOT

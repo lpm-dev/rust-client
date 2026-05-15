@@ -389,7 +389,7 @@ mod tests {
 
     #[test]
     fn local_websocket_request_includes_upgrade_headers() {
-        let request = build_local_websocket_request(3005, "/ws-phase28", &HashMap::new()).unwrap();
+        let request = build_local_websocket_request(3005, "/ws-test", &HashMap::new()).unwrap();
 
         assert!(
             request.headers().contains_key("sec-websocket-key"),
@@ -441,7 +441,7 @@ mod tests {
         });
 
         let request =
-            build_local_websocket_request(addr.port(), "/ws-phase28", &HashMap::new()).unwrap();
+            build_local_websocket_request(addr.port(), "/ws-test", &HashMap::new()).unwrap();
 
         let _ = tokio_tungstenite::connect_async(request).await;
 

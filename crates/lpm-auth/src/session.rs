@@ -6,8 +6,8 @@
 //! when an auth-required operation actually needs it, and only for
 //! refresh-backed stored sessions.
 //!
-//! See `DOCS/new-features/37-rust-client-RUNNER-VISION-phase35-claude.md`
-//! for the full design.
+
+
 
 use lpm_common::LpmError;
 use secrecy::{ExposeSecret, SecretString};
@@ -856,7 +856,7 @@ mod tests {
     /// LPM_FORCE_FILE_AUTH=1 causes `get_token` / `get_refresh_token`
     /// to skip the keychain, and an isolated HOME keeps file-auth
     /// writes off the host.
-    fn phase45_isolate() -> (tempfile::TempDir, crate::test_env::ScopedEnv) {
+    fn token_classify_isolate() -> (tempfile::TempDir, crate::test_env::ScopedEnv) {
         let tempdir = tempfile::tempdir().expect("create test home tempdir");
         let scoped = crate::test_env::ScopedEnv::set([
             ("HOME", tempdir.path().as_os_str().to_owned()),
@@ -867,8 +867,8 @@ mod tests {
     }
 
     #[test]
-    fn phase45_p2_bridge_peek_does_not_classify() {
-        let _env = phase45_isolate();
+    fn bridge_peek_does_not_classify() {
+        let _env = token_classify_isolate();
         let mgr = SessionManager::new("https://example.invalid", None);
         // Sanity: isolated env means no tokens anywhere, so the eager
         // classification returned None.
@@ -884,8 +884,8 @@ mod tests {
     }
 
     #[test]
-    fn phase45_p2_lazy_bearer_triggers_classification() {
-        let _env = phase45_isolate();
+    fn lazy_bearer_triggers_classification() {
+        let _env = token_classify_isolate();
         let mgr = SessionManager::new("https://example.invalid", None);
         assert!(!mgr.classified.load(Ordering::Acquire));
         // Calling the lazy variant must run ensure_classified once.
@@ -900,7 +900,7 @@ mod tests {
     }
 
     #[test]
-    fn phase45_p2_eager_env_token_classifies_immediately() {
+    fn eager_env_token_classifies_immediately() {
         // When LPM_TOKEN is set, eager classification should succeed
         // and `classified` should start as `true` — the keychain never
         // needs to be consulted.
@@ -919,8 +919,8 @@ mod tests {
     }
 
     #[test]
-    fn phase45_p2_explicit_flag_bypasses_keychain() {
-        let _env = phase45_isolate();
+    fn explicit_flag_bypasses_keychain() {
+        let _env = token_classify_isolate();
         let mgr = SessionManager::new(
             "https://example.invalid",
             Some("flag-token-value".to_string()),

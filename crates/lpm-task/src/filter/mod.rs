@@ -5,7 +5,7 @@
 //! crate, so it can compose directly with `WorkspaceGraph` and the
 //! existing `affected` git plumbing without circular dependencies.
 //!
-//! ## Architecture (see design doc 37-rust-client-RUNNER-VISION-phase32-filter-engine-design.md)
+//! ## Architecture
 //!
 //! 1. **Parser** (`parser.rs`) — string → `FilterExpr` AST
 //! 2. **AST** (`ast.rs`) — the shape the parser produces

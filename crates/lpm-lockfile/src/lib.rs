@@ -804,7 +804,7 @@ mod tests {
     }
 
     #[test]
-    fn phase43_tarball_roundtrips_when_present() {
+    fn tarball_roundtrips_when_present() {
         let mut lf = Lockfile::new();
         lf.add_package(LockedPackage {
             name: "lodash".to_string(),
@@ -834,7 +834,7 @@ mod tests {
     }
 
     #[test]
-    fn phase43_tarball_absent_keeps_old_lockfiles_byte_identical() {
+    fn tarball_absent_keeps_old_lockfiles_byte_identical() {
         // `#[serde(skip_serializing_if = "Option::is_none")]` must
         // keep lockfiles byte-stable when no package has a tarball
         // URL — existing projects must be unaffected until they
@@ -854,7 +854,7 @@ mod tests {
     }
 
     #[test]
-    fn phase43_tarball_mixed_population_roundtrips() {
+    fn tarball_mixed_population_roundtrips() {
         // Real-world rollout window: some entries have a tarball URL,
         // others don't. Per-package `None` must be preserved; `Some`
         // must round-trip with its value.
@@ -894,7 +894,7 @@ mod tests {
     }
 
     #[test]
-    fn phase43_from_toml_rejects_empty_optional_strings() {
+    fn from_toml_rejects_empty_optional_strings() {
         // The binary writer rejects empty optional strings at
         // serialization time; `from_toml` must also reject at parse
         // time to avoid asymmetric late failure. Reject at the parse
@@ -927,7 +927,7 @@ version = "1.0.0"
     }
 
     #[test]
-    fn phase43_old_lockfile_without_tarball_field_parses() {
+    fn old_lockfile_without_tarball_field_parses() {
         // Forward-compat: old lockfiles without a tarball field must
         // parse cleanly (tarball = None).
         let toml_str = r#"
@@ -1290,7 +1290,7 @@ version = "1.0.0"
     }
 
     #[test]
-    fn phase43_read_fast_falls_back_to_toml_when_binary_is_v1() {
+    fn read_fast_falls_back_to_toml_when_binary_is_v1() {
         // Client upgrade scenario: user has a v1 `lpm.lockb` on disk
         // (written by an old client) plus the v2-compatible TOML
         // lockfile. The v2 reader must reject v1 and read_fast must
@@ -1333,7 +1333,7 @@ version = "1.0.0"
     }
 
     #[test]
-    fn phase43_read_fast_preserves_binary_on_future_version() {
+    fn read_fast_preserves_binary_on_future_version() {
         // A future binary format (found > BINARY_VERSION, written by
         // a newer LPM client) must NOT be deleted — the newer
         // client's fast path should stay intact. Deletion is scoped
@@ -1366,7 +1366,7 @@ version = "1.0.0"
     }
 
     #[test]
-    fn phase43_read_fast_preserves_binary_on_non_version_errors() {
+    fn read_fast_preserves_binary_on_non_version_errors() {
         // Complement to the v1-delete behavior: only `UnsupportedVersion`
         // triggers deletion. Structural corruption (bad magic, truncated
         // body) leaves the file on disk in case the user wants to
