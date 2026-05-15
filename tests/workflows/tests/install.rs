@@ -189,7 +189,7 @@ fn empty_deps_second_install_is_up_to_date() {
     );
 }
 
-// ─── Phase 64 #34: install-time warning for `pnpm.overrides` ─────
+// ─── install-time warning for `pnpm.overrides` ─────
 
 /// A project with `pnpm.overrides` but no LPM-readable equivalent
 /// must produce a stderr warning suggesting `lpm migrate`. Diff-aware:
@@ -231,7 +231,7 @@ fn install_warns_when_pnpm_overrides_dropped() {
 }
 
 /// `--json` mode silences the warning to keep stdout JSON contract
-/// intact. Phase 64 finding #61 tracks giving automation a structured
+/// intact. Giving automation a structured
 /// surface for the same signal via `lpm doctor`.
 #[test]
 fn install_pnpm_overrides_warning_silenced_under_json() {
@@ -322,7 +322,7 @@ fn install_pnpm_overrides_warning_silent_when_lpm_side_covers_keys() {
     );
 }
 
-// ─── Phase 64 #35: install-time warning for `pnpm.patchedDependencies` ─
+// ─── install-time warning for `pnpm.patchedDependencies` ─
 
 /// `pnpm.patchedDependencies` declared without an LPM-readable
 /// equivalent must produce the diff-aware install warning. Same shape
@@ -590,7 +590,7 @@ async fn install_json_envelope_with_one_package_matches_snapshot() {
         r#"{"name":"snap-install","version":"1.0.0","dependencies":{"ms":"^2.1.3"}}"#,
     );
 
-    // Phase 66 Phase 4f: pin to `LPM_LINKER=isolated` so the JSON
+    // pin to `LPM_LINKER=isolated` so the JSON
     // envelope's `symlinked` count stays stable across the default
     // flip. The 4f flip moved `LinkerMode::default()` to Hoisted,
     // which produces 0 root-level symlinks (real dirs flat in
@@ -750,10 +750,10 @@ async fn install_json_output_contains_package_list() {
             "--no-skills",
             "--no-editor-setup",
         ])
-        // Phase 60.1 default-flip — fusion is now the global install
+        // greedy-fusion is now the global install
         // default. This test asserts the PubGrub-walker arm's
-        // `timing.resolve.streaming_bfs` telemetry contract (Phase 49
-        // §6/§7) including the `manifests_fetched > 0 ||
+        // `timing.resolve.streaming_bfs` telemetry contract
+        // ) including the `manifests_fetched > 0 ||
         // escape_hatch_fetches > 0` invariant. Greedy-walker doesn't
         // populate the same counters, and fusion bypasses the walker
         // entirely. Pin to PubGrub explicitly so this test keeps
@@ -791,7 +791,7 @@ async fn install_json_output_contains_package_list() {
         "packages array should contain 'ms', got: {packages:?}"
     );
 
-    // Phase 49 §6/§7 — `timing.resolve.streaming_bfs` contract.
+    //  — `timing.resolve.streaming_bfs` contract.
     // On a fresh-resolve install (not lockfile-fast-path) the walker
     // runs and the sub-object is emitted with the eight documented
     // fields. On lockfile-fast-path the field is `null`; that case is
@@ -840,7 +840,7 @@ async fn install_json_output_contains_package_list() {
     // routes through `batch_metadata` and the provider's wait-loop
     // may observe transient timeouts before falling through to the
     // escape-hatch fetch. The shape-present + produced-≥1 checks
-    // above cover the reviewer's Phase 49 §6 CLI-surface gap
+    // above cover the reviewer's  CLI-surface gap
     // without being sensitive to orchestration timing.
 }
 
@@ -1152,14 +1152,14 @@ fn install_offline_without_lockfile_fails() {
     );
 }
 
-// ─── Phase 33: dependency save semantics ─────────────────────────
+// ─── dependency save semantics ─────────────────────────
 //
 // These tests validate the manifest-write contract documented in
-// `DOCS/new-features/37-rust-client-RUNNER-VISION-phase33.md`. They are
+// Tests for the dependency save semantics. They are
 // load-bearing for the "no `*` default" rule and the
 // "placeholder-never-survives-failure" invariant added during plan review.
 //
-// All four are red until the Phase 33 implementation lands; bare installs
+// All four are red until the implementation lands; bare installs
 // currently write `"*"` to the manifest, so row 1 fails immediately, and the
 // failure-restore test fails because there is no transaction guard yet.
 
@@ -1197,7 +1197,7 @@ async fn mount_ms_2_1_3(mock: &MockRegistry) {
     mock.with_batch_metadata(vec![batch_meta]).await;
 }
 
-/// Phase 33 row 1 (smoke): a bare `lpm install ms` must write
+/// row 1 (smoke): a bare `lpm install ms` must write
 /// `"ms": "^2.1.3"` into `package.json`, NOT `"ms": "*"`.
 ///
 /// This is the load-bearing test for the entire phase.
@@ -1208,7 +1208,7 @@ async fn install_bare_writes_caret_resolved_not_wildcard() {
 
     let project = TempProject::empty(
         r#"{
-        "name": "phase33-row1",
+        "name": "save-semver-row1",
         "version": "1.0.0",
         "dependencies": {}
     }"#,
@@ -1240,12 +1240,12 @@ async fn install_bare_writes_caret_resolved_not_wildcard() {
 
     assert_eq!(
         ms_spec, "^2.1.3",
-        "Phase 33 default: bare `lpm install ms` must save `^<resolved>`, got `{ms_spec}`. \
+        "default: bare `lpm install ms` must save `^<resolved>`, got `{ms_spec}`. \
          If this is `\"*\"`, the placeholder is leaking into the final manifest."
     );
 }
 
-/// Phase 33 row 12: re-running `lpm install <pkg>` on a dep that already
+/// row 12: re-running `lpm install <pkg>` on a dep that already
 /// exists in the manifest must NOT rewrite the existing range, even if the
 /// resolved version differs from what would be the new default.
 ///
@@ -1260,7 +1260,7 @@ async fn install_existing_dep_bare_reinstall_no_churn() {
 
     let project = TempProject::empty(
         r#"{
-        "name": "phase33-row12",
+        "name": "save-semver-row12",
         "version": "1.0.0",
         "dependencies": {
             "ms": "~2.1.3"
@@ -1320,7 +1320,7 @@ async fn install_filtered_from_member_dir_reads_workspace_root_lpm_toml() {
     // Build a workspace with one member at packages/app/.
     let project = TempProject::empty(
         r#"{
-        "name": "phase33-finding-b-workspace",
+        "name": "save-semver-workspace",
         "version": "1.0.0",
         "private": true,
         "workspaces": ["packages/*"]
@@ -1377,7 +1377,7 @@ async fn install_filtered_from_member_dir_reads_workspace_root_lpm_toml() {
     );
 }
 
-/// **Phase 33 Step 6 end-to-end:** project-tier `./lpm.toml` with
+/// **Step 6 end-to-end:** project-tier `./lpm.toml` with
 /// `save-prefix = "~"` must affect a bare `lpm install ms` so the
 /// manifest gets `"ms": "~2.1.3"`. Validates that the loader is
 /// actually read by the install entry point and the resolved
@@ -1389,7 +1389,7 @@ async fn install_honors_project_lpm_toml_save_prefix_tilde() {
 
     let project = TempProject::empty(
         r#"{
-        "name": "phase33-project-config",
+        "name": "save-semver-project-config",
         "version": "1.0.0",
         "dependencies": {}
     }"#,
@@ -1423,7 +1423,7 @@ async fn install_honors_project_lpm_toml_save_prefix_tilde() {
     );
 }
 
-/// **Phase 33 Step 6:** invalid `lpm.toml` (e.g. `save-prefix = "*"`)
+/// **Step 6:** invalid `lpm.toml` (e.g. `save-prefix = "*"`)
 /// surfaces a clear error before the install pipeline runs. The
 /// transaction guard never opens because we error out at config-load
 /// time.
@@ -1434,7 +1434,7 @@ async fn install_rejects_lpm_toml_with_wildcard_save_prefix() {
 
     let project = TempProject::empty(
         r#"{
-        "name": "phase33-project-config-invalid",
+        "name": "save-semver-project-config-invalid",
         "version": "1.0.0",
         "dependencies": {}
     }"#,
@@ -1472,7 +1472,7 @@ async fn install_rejects_lpm_toml_with_wildcard_save_prefix() {
     );
 }
 
-/// **Phase 33 Step 6:** explicit user input still beats project config.
+/// **Step 6:** explicit user input still beats project config.
 /// `lpm install zod@^4.3.0` with `save-prefix = "~"` in lpm.toml saves
 /// `^4.3.0` (preserved verbatim), not `~4.3.6`.
 #[tokio::test]
@@ -1482,7 +1482,7 @@ async fn install_explicit_range_beats_project_config_save_prefix() {
 
     let project = TempProject::empty(
         r#"{
-        "name": "phase33-explicit-beats-config",
+        "name": "save-semver-explicit-beats-config",
         "version": "1.0.0",
         "dependencies": {}
     }"#,
@@ -1514,7 +1514,7 @@ async fn install_explicit_range_beats_project_config_save_prefix() {
     );
 }
 
-/// **Phase 33 row 7 / Step 5 end-to-end:** `lpm install ms --exact`
+/// **row 7 / Step 5 end-to-end:** `lpm install ms --exact`
 /// against the mock registry must save `"ms": "2.1.3"` (no prefix).
 #[tokio::test]
 async fn install_with_exact_flag_saves_pinned_version() {
@@ -1523,7 +1523,7 @@ async fn install_with_exact_flag_saves_pinned_version() {
 
     let project = TempProject::empty(
         r#"{
-        "name": "phase33-flag-exact",
+        "name": "save-semver-flag-exact",
         "version": "1.0.0",
         "dependencies": {}
     }"#,
@@ -1555,7 +1555,7 @@ async fn install_with_exact_flag_saves_pinned_version() {
     );
 }
 
-/// **Phase 33 row 8 / Step 5 end-to-end:** `lpm install ms --tilde`
+/// **row 8 / Step 5 end-to-end:** `lpm install ms --tilde`
 /// must save `"ms": "~2.1.3"`.
 #[tokio::test]
 async fn install_with_tilde_flag_saves_tilde_resolved() {
@@ -1564,7 +1564,7 @@ async fn install_with_tilde_flag_saves_tilde_resolved() {
 
     let project = TempProject::empty(
         r#"{
-        "name": "phase33-flag-tilde",
+        "name": "save-semver-flag-tilde",
         "version": "1.0.0",
         "dependencies": {}
     }"#,
@@ -1596,7 +1596,7 @@ async fn install_with_tilde_flag_saves_tilde_resolved() {
     );
 }
 
-/// **Phase 33 / Step 5 end-to-end:** `lpm install ms --save-prefix '~'`
+/// **/ Step 5 end-to-end:** `lpm install ms --save-prefix '~'`
 /// must save `"ms": "~2.1.3"` (same effect as `--tilde`, alternate syntax).
 #[tokio::test]
 async fn install_with_save_prefix_tilde_saves_tilde_resolved() {
@@ -1605,7 +1605,7 @@ async fn install_with_save_prefix_tilde_saves_tilde_resolved() {
 
     let project = TempProject::empty(
         r#"{
-        "name": "phase33-flag-save-prefix",
+        "name": "save-semver-flag-save-prefix",
         "version": "1.0.0",
         "dependencies": {}
     }"#,
@@ -1638,14 +1638,14 @@ async fn install_with_save_prefix_tilde_saves_tilde_resolved() {
     );
 }
 
-/// **Phase 33 / Step 5:** `--save-prefix '*'` is rejected with a clear
+/// **/ Step 5:** `--save-prefix '*'` is rejected with a clear
 /// error before the install pipeline runs. Wildcards must be requested
 /// per-package via `pkg@*`, never as a save policy.
 #[test]
 fn install_save_prefix_wildcard_rejected() {
     let project = TempProject::empty(
         r#"{
-        "name": "phase33-flag-save-prefix-wildcard",
+        "name": "save-semver-flag-save-prefix-wildcard",
         "version": "1.0.0",
         "dependencies": {}
     }"#,
@@ -1668,13 +1668,13 @@ fn install_save_prefix_wildcard_rejected() {
     );
 }
 
-/// Phase 33 row 15: contradictory save-flag combinations are rejected at
+/// row 15: contradictory save-flag combinations are rejected at
 /// the CLI layer with a clear error.
 #[test]
 fn install_contradictory_save_flags_fail() {
     let project = TempProject::empty(
         r#"{
-        "name": "phase33-row15",
+        "name": "save-semver-row15",
         "version": "1.0.0",
         "dependencies": {}
     }"#,
@@ -1697,7 +1697,7 @@ fn install_contradictory_save_flags_fail() {
     );
 }
 
-// **Phase 33 audit Finding 1 regression coverage lives in unit tests.**
+// **audit Finding 1 regression coverage lives in unit tests.**
 //
 // The audit flagged a defensive-correctness issue in
 // `collect_resolved_versions_from_lockfile`: a flat name-scan over
@@ -1720,7 +1720,7 @@ fn install_contradictory_save_flags_fail() {
 // fixtures that include both a direct and a transitive entry for the
 // same name.
 
-/// **Phase 33 audit Finding 2 regression.** When an `lpm install` against
+/// **audit Finding 2 regression.** When an `lpm install` against
 /// an already-installed project fails partway through, the rollback MUST
 /// cover the lockfile and the install-hash, not just the manifest. The
 /// pre-fix transaction guard only snapshotted `package.json`, so a failed
@@ -1751,7 +1751,7 @@ async fn install_failure_rolls_back_lockfile_and_invalidates_install_hash() {
 
     let project = TempProject::empty(
         r#"{
-        "name": "phase33-rollback-boundary",
+        "name": "save-semver-rollback-boundary",
         "version": "1.0.0",
         "dependencies": {
             "ms": "^2.1.3"
@@ -1812,7 +1812,7 @@ async fn install_failure_rolls_back_lockfile_and_invalidates_install_hash() {
         String::from_utf8_lossy(&output.stderr),
     );
 
-    // 3. Assert manifest is byte-identical (Phase 33 placeholder invariant).
+    // 3. Assert manifest is byte-identical (placeholder invariant).
     let post_manifest = std::fs::read(&manifest_path).unwrap();
     assert_eq!(
         post_manifest, pre_manifest,
@@ -1858,7 +1858,7 @@ async fn install_failure_rolls_back_lockfile_and_invalidates_install_hash() {
     );
 }
 
-/// Phase 33 placeholder-never-survives invariant (added during plan review).
+/// placeholder-never-survives invariant (added during plan review).
 ///
 /// When `lpm install <pkg>` stages a placeholder spec into `package.json`
 /// and the install pipeline subsequently fails, the manifest MUST be
@@ -1879,7 +1879,7 @@ async fn install_failure_restores_original_manifest_bytes() {
     let mock = MockRegistry::start().await;
 
     let original_manifest = r#"{
-    "name": "phase33-failure-restore",
+    "name": "save-semver-failure-restore",
     "version": "1.0.0",
     "dependencies": {
         "existing": "1.0.0"
@@ -1920,7 +1920,7 @@ async fn install_failure_restores_original_manifest_bytes() {
     assert_eq!(
         post_bytes,
         pre_bytes,
-        "Phase 33 invariant violated: failed install left the manifest \
+        "invariant violated: failed install left the manifest \
          in a modified state. The transaction guard must restore the \
          pre-staging bytes exactly. Post-install content:\n{}",
         String::from_utf8_lossy(&post_bytes)
@@ -2189,7 +2189,7 @@ async fn install_lockfile_is_deterministic_across_fresh_installs() {
     );
 }
 
-// ─── Phase 65 Step 3 — install hardening (workspace, peer, optional, integrity) ───
+// ─── install hardening (workspace, peer, optional, integrity) ───
 
 /// A workspace member referenced via `workspace:*` from the root manifest
 /// must be planted as a symlink at `node_modules/<member>` resolving back
@@ -2243,7 +2243,7 @@ fn install_workspace_star_dep_plants_root_symlink_to_member() {
 }
 
 /// `workspace:^` is a published-time hint — the member is still installed
-/// locally as a symlink. Pins the [Phase 32 Phase 2 audit fix](crates/lpm-cli/src/commands/install.rs#L3209)
+/// locally as a symlink. Pins the [audit fix](crates/lpm-cli/src/commands/install.rs#L3209)
 /// that previously rewrote `workspace:^` into a registry range and 404'd
 /// against the upstream proxy.
 #[test]
@@ -2623,7 +2623,7 @@ async fn install_lockfile_integrity_matches_stored_tarball_sha512() {
     );
 }
 
-// ─── Phase 65 Step 6.1a — pre-resolver rejection of transitive non-registry / workspace specs ───
+// ─── pre-resolver rejection of transitive non-registry / workspace specs ───
 //
 // File: deps from local sources can carry transitive specs that LPM cannot
 // resolve (tarball URLs, raw `workspace:` references against non-workspace
@@ -2812,7 +2812,7 @@ fn install_workspace_transitive_resolves_against_full_membership_set() {
     );
 }
 
-// ─── Phase 65 Step 6.1b — workspace member root-symlink discovery paths ───
+// ─── workspace member root-symlink discovery paths ───
 //
 // Three discovery paths plant `node_modules/<member>` symlinks: the
 // top-level `workspace:` extractor, the F9 immediate-file-dedupe path,
@@ -2994,7 +2994,7 @@ fn install_workspace_file_dedupe_then_transitive_chain_plants_all_root_symlinks(
     assert_root_symlink_resolves_to(&project, "baz", &baz_dir);
 }
 
-// ─── Phase 65 Step 6.1c — install-hash freshness, offline, ghost members ───
+// ─── install-hash freshness, offline, ghost members ───
 //
 // Six workspace-discovery edge cases plus one offline mixed-registry+file
 // test. Together they pin the install-hash member-manifest sensitivity
@@ -3456,7 +3456,7 @@ fn offline_install_workspace_ghost_transitive_after_manifest_edit_fails_closed()
     );
 }
 
-// ─── Phase 65 Step 6.2a — strict-ssl=false install-start security warning ───
+// ─── strict-ssl=false install-start security warning ───
 //
 // `strict-ssl=false` in `.npmrc` is advisory (it does NOT block install)
 // but the warning is a SECURITY signal that must reach CI / agent logs
@@ -3572,9 +3572,9 @@ fn install_no_strict_ssl_setting_emits_no_warning() {
     );
 }
 
-// ─── Phase 65 Step 6.2b — release-age cooldown gate ─────────────────────
+// ─── release-age cooldown gate ─────────────────────
 //
-// Phase 46 P3 ship criteria: the install-time cooldown gate that blocks
+// P3 ship criteria: the install-time cooldown gate that blocks
 // recently-published packages. Five behaviors pinned: (1) `--min-release-age`
 // CLI override fires, (2) `--allow-new` is an orthogonal bypass, (3)
 // `~/.lpm/config.toml` overrides the 24h default, (4) `package.json > lpm
@@ -3929,7 +3929,7 @@ fn migrate_honors_lpm_linker_env_in_install_pipeline() {
 /// install pipeline + mock registry: install once with the active
 /// default layout, then re-run with `LPM_LINKER` pointed at the OTHER
 /// layout and assert the command did NOT print "up to date". The
-/// invariant is direction-agnostic — pre-Phase-4f the default was
+/// invariant is direction-agnostic — previously the default was
 /// Isolated and the test flipped to Hoisted; post-4f the default is
 /// Hoisted and the test flips to Isolated. Either way the cache MUST
 /// invalidate.
@@ -4007,7 +4007,7 @@ async fn install_invalidates_freshness_cache_on_lpm_linker_flip() {
     // the env-driven layout flip has to invalidate the freshness cache
     // and trigger a real re-link. Use the opposite of the active
     // default so this test stays meaningful across future default
-    // flips (Phase 4f flipped Isolated → Hoisted; pre-4f the test
+    // The linker default flipped Isolated → Hoisted; previously the test
     // flipped to "hoisted").
     let opposite = match lpm_linker::LinkerMode::default() {
         lpm_linker::LinkerMode::Hoisted => "isolated",

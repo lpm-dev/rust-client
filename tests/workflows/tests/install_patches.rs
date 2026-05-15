@@ -1,12 +1,12 @@
 //! Workflow tests for `lpm install` + the patch-apply pipeline.
 //!
-//! Phase 32 Phase 6 acceptance criteria + 2026-04-12 audit fixes:
+//! Acceptance criteria and audit fixes for the patch feature:
 //! - Patches apply after the linker pass (canonical isolated location).
 //! - Idempotent reruns are no-ops (no double-apply, no zero-op summary
 //!   in JSON or human output).
 //! - Drift / missing patch / fuzzy hunk are HARD install errors.
 //! - `--offline` enforces patch-fingerprint integrity (mirror of the
-//!   Phase 5 overrides offline contract).
+//!   overrides offline contract).
 //! - State-file lifecycle: created on apply, deleted when patches
 //!   removed.
 //! - `--json` envelope's `applied_patches[]` reflects per-run work,
@@ -20,7 +20,7 @@ mod support;
 use std::path::PathBuf;
 use support::{TempProject, lpm_with_registry};
 
-/// Phase 66 Phase 4f — every test in this file asserts on the
+/// Every test in this file asserts on the
 /// `<project>/.lpm/wrappers/<seg>/...` path shape, which is v1
 /// isolated layout. The 4f default flip moved
 /// `LinkerMode::default()` to Hoisted, so a no-flag install would

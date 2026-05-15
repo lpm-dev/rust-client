@@ -1,6 +1,6 @@
 //! Workflow tests for `lpm approve-scripts`.
 //!
-//! Phase 46 close-out: `--dry-run` previews approval decisions without
+//! `--dry-run` previews approval decisions without
 //! mutating state. Project mode leaves `package.json` byte-equal;
 //! global mode leaves `~/.lpm/global/trusted-dependencies.json`
 //! byte-equal (or absent). JSON envelopes carry `"dry_run": true` so
@@ -483,9 +483,9 @@ fn approve_scripts_global_list_json_carries_dry_run_flag_on_both_axes() {
     );
 }
 
-// ─── Phase 65 Step 6.5d — version-diff rendering on `--list` ────────────
+// ─── version-diff rendering on `--list` ────────────
 //
-// Phase 46 P7 ship criteria:
+// Ship criteria for approve-scripts:
 //  1. Script-hash drift surfaces the EXACT added line in the unified
 //     diff (`+curl example.com | sh`) — human + JSON.
 //  2. Behavioral-tag delta surfaces gained tags (`+ network`, `+ eval`)
@@ -930,14 +930,14 @@ fn approve_scripts_first_time_review_emits_null_version_diff_and_no_card() {
     );
 }
 
-// ─── Phase 65 Step 6.5e — audit regression tests (Phase 4) ──────────────
+// ─── audit regression tests ─────────────────────────
 //
-// Three findings from the Phase 32 Phase 4 audit, end-to-end:
-//  - **D-impl-1**: legacy `["esbuild"]` upgrades to `esbuild@*` after
+// Three audit regression tests, end-to-end:
+//  - **Legacy bare-name upgrade:** legacy `["esbuild"]` upgrades to `esbuild@*` after
 //    `--yes` and stays trusted on the next install (no re-block).
-//  - **D-impl-2**: `--list` filters persisted state through CURRENT
+//  - **Filter by current install state:** `--list` filters persisted state through CURRENT
 //    trust — already-approved entries are not in the output.
-//  - **D-impl-3**: every `--json` invocation produces exactly ONE
+//  - **JSON stream purity:** every `--json` invocation produces exactly ONE
 //    valid JSON object on stdout (no tracing/WARN bleed).
 
 /// Read + parse `<project>/package.json` as a JSON value.
@@ -978,7 +978,7 @@ fn write_build_state_audit(project: &TempProject, entries: &[(&str, &str, &str, 
     );
 }
 
-/// **D-impl-1 regression.** Legacy bare-name `trustedDependencies`
+/// **Legacy bare-name upgrade regression.** Legacy bare-name `trustedDependencies`
 /// (`["esbuild"]`) upgrades to the rich `esbuild@*` sentinel when
 /// `--yes` runs against a state with `sharp` blocked. A subsequent
 /// install that captures `esbuild` in its build-state must NOT re-block
@@ -1053,7 +1053,7 @@ fn approve_scripts_legacy_array_upgrade_preserves_esbuild_after_subsequent_insta
     );
 }
 
-/// **D-impl-2 regression.** `approve-scripts --list` filters persisted
+/// **Filter-by-current-state regression.** `approve-scripts --list` filters persisted
 /// state through CURRENT trust — after `--yes` approves esbuild, the
 /// next `--list` call must NOT report it as blocked even if the state
 /// file still records it.
@@ -1098,7 +1098,7 @@ fn approve_scripts_list_filters_already_approved_packages_after_yes() {
     );
 }
 
-/// **D-impl-2 — explicit-name path.** When the user explicitly names
+/// **Filter-by-current-state — explicit-name path.** When the user explicitly names
 /// an already-approved package, the binary must error with "already
 /// approved" rather than silently re-approving.
 #[test]
@@ -1148,7 +1148,7 @@ fn approve_scripts_specific_pkg_arg_for_already_approved_emits_friendly_error() 
     );
 }
 
-/// **D-impl-3 regression — `--yes --json` stream purity.** This is the
+/// **Stream-purity regression — `--yes --json`.** This is the
 /// audit's most important regression: a WARN line bled onto stdout
 /// before the fix that routed tracing to stderr. Stdout under
 /// `--json` MUST be exactly one valid JSON object — no WARN, no
@@ -1206,7 +1206,7 @@ fn approve_scripts_yes_json_emits_exactly_one_valid_json_payload_on_stdout() {
     );
 }
 
-/// **D-impl-3 generalized — `--list --json` stream purity.** The
+/// **Stream-purity — `--list --json`.** The
 /// stream-separation contract holds for every `--json` invocation, not
 /// just `--yes --json`. This test exercises the path that emits no
 /// warnings at all — the subscriber-to-stdout bug would have shown up
@@ -1232,7 +1232,7 @@ fn approve_scripts_list_json_emits_exactly_one_valid_json_payload_on_stdout() {
     );
 }
 
-/// **D-impl-3 error path — `--yes --json` with no state file** still
+/// **Stream-purity error path — `--yes --json` with no state file** still
 /// emits clean JSON on stdout. Errors follow the same stream-separation
 /// contract.
 #[test]

@@ -1358,7 +1358,7 @@ async fn tarball_503_exhausts_retries_fails_with_http_status() {
     let project = TempProject::empty(r#"{"name":"doom-test","version":"1.0.0"}"#);
     let start = Instant::now();
     let output = lpm_with_registry(&project, &mock.url())
-        // Finding #78: shrink the retry-backoff schedule from
+        // shrink the retry-backoff schedule from
         // exponential 1+2+4+8s → flat 10ms so retry exhaustion fits
         // in the <5s test budget. Honored only in debug builds OR
         // when LPM_TEST_MODE=1 — production retry policy unaffected.

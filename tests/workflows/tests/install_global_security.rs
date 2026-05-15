@@ -1,6 +1,6 @@
-//! Workflow tests for Phase 68 — `lpm install -g` security parity.
+//! Workflow tests for `lpm install -g` security parity.
 //!
-//! Pins the user-facing CLI contracts that landed in Phase 68:
+//! Pins the user-facing CLI contracts for global install security:
 //!
 //! - The validator no longer rejects `--allow-new`, `--min-release-age`,
 //!   `--ignore-provenance-drift`, or `--ignore-provenance-drift-all`
@@ -46,7 +46,7 @@ const GLOBAL_E2E_PUBLISHER: &str = "github:acme/global-tool";
 const GLOBAL_E2E_WORKFLOW_PATH: &str = ".github/workflows/publish.yml";
 
 /// ISO-8601 UTC timestamp `n_secs` ago. Mirrors the release-age helper in
-/// `install.rs`; kept local so the Phase 68 workflow test is standalone.
+/// `install.rs`; kept local so this workflow test is standalone.
 fn iso8601_n_secs_ago(n_secs: i64) -> String {
     use chrono::SecondsFormat;
     let dt = chrono::Utc::now() - chrono::Duration::seconds(n_secs);
@@ -112,7 +112,7 @@ console.log('acme-global-tool');
     )
 }
 
-/// Mount metadata + tarball for the Phase 68 executable fixture with a caller-
+/// Mount metadata + tarball for the global install security fixture with a caller-
 /// supplied publication timestamp. No `dist.attestations` field is emitted;
 /// this lets the drift tests drive the "approved present -> candidate absent"
 /// path end-to-end without needing a separate attestation endpoint.
@@ -364,9 +364,9 @@ commands = []
 /// that previously hard-errored at the validator. The install will
 /// likely fail later (no real registry, no real package), but the
 /// validator's "not supported on `lpm install -g`" string must NOT
-/// appear in stderr — that's the bug Phase 68 fixed.
+/// appear in stderr — that was the bug this test pins.
 fn assert_validator_no_longer_rejects(args: &[&str]) {
-    let project = TempProject::empty(r#"{ "name": "phase68", "version": "0.0.0" }"#);
+    let project = TempProject::empty(r#"{ "name": "global-security-test", "version": "0.0.0" }"#);
     let out = lpm(&project)
         .args(args)
         .output()
@@ -383,12 +383,17 @@ fn assert_validator_no_longer_rejects(args: &[&str]) {
 
 #[test]
 fn install_global_validator_accepts_allow_new_flag() {
-    assert_validator_no_longer_rejects(&["install", "-g", "phase68-stub", "--allow-new"]);
+    assert_validator_no_longer_rejects(&["install", "-g", "global-security-stub", "--allow-new"]);
 }
 
 #[test]
 fn install_global_validator_accepts_min_release_age_flag() {
-    assert_validator_no_longer_rejects(&["install", "-g", "phase68-stub", "--min-release-age=72h"]);
+    assert_validator_no_longer_rejects(&[
+        "install",
+        "-g",
+        "global-security-stub",
+        "--min-release-age=72h",
+    ]);
 }
 
 #[test]
@@ -396,7 +401,7 @@ fn install_global_validator_accepts_ignore_provenance_drift_flag() {
     assert_validator_no_longer_rejects(&[
         "install",
         "-g",
-        "phase68-stub",
+        "global-security-stub",
         "--ignore-provenance-drift",
         "axios",
     ]);
@@ -407,14 +412,19 @@ fn install_global_validator_accepts_ignore_provenance_drift_all_flag() {
     assert_validator_no_longer_rejects(&[
         "install",
         "-g",
-        "phase68-stub",
+        "global-security-stub",
         "--ignore-provenance-drift-all",
     ]);
 }
 
 #[test]
 fn install_global_validator_accepts_policy_allow_flag() {
-    assert_validator_no_longer_rejects(&["install", "-g", "phase68-stub", "--policy=allow"]);
+    assert_validator_no_longer_rejects(&[
+        "install",
+        "-g",
+        "global-security-stub",
+        "--policy=allow",
+    ]);
 }
 
 #[test]
@@ -422,7 +432,7 @@ fn install_global_validator_accepts_triage_plus_auto_build() {
     assert_validator_no_longer_rejects(&[
         "install",
         "-g",
-        "phase68-stub",
+        "global-security-stub",
         "--triage",
         "--auto-build",
     ]);
@@ -430,16 +440,16 @@ fn install_global_validator_accepts_triage_plus_auto_build() {
 
 #[test]
 fn install_global_validator_accepts_yolo_flag() {
-    assert_validator_no_longer_rejects(&["install", "-g", "phase68-stub", "--yolo"]);
+    assert_validator_no_longer_rejects(&["install", "-g", "global-security-stub", "--yolo"]);
 }
 
 /// `-y` is genuinely project-scoped on `-g`. The validator must
 /// still reject it. Negative companion to the positive tests above.
 #[test]
 fn install_global_validator_still_rejects_yes_flag() {
-    let project = TempProject::empty(r#"{ "name": "phase68", "version": "0.0.0" }"#);
+    let project = TempProject::empty(r#"{ "name": "global-security-test", "version": "0.0.0" }"#);
     let out = lpm(&project)
-        .args(["install", "-g", "phase68-stub", "-y"])
+        .args(["install", "-g", "global-security-stub", "-y"])
         .output()
         .expect("spawn lpm install");
     let stderr = String::from_utf8_lossy(&out.stderr);
@@ -456,7 +466,7 @@ fn install_global_validator_still_rejects_yes_flag() {
 /// in real CLI strings, not just plan docs.
 #[test]
 fn install_help_mentions_global_rerun_caveat() {
-    let project = TempProject::empty(r#"{ "name": "phase68", "version": "0.0.0" }"#);
+    let project = TempProject::empty(r#"{ "name": "global-security-test", "version": "0.0.0" }"#);
     let out = lpm(&project)
         .args(["install", "--help"])
         .output()
@@ -481,7 +491,7 @@ fn install_help_mentions_global_rerun_caveat() {
 /// when the caller raises the cooldown to 72h.
 #[tokio::test]
 async fn install_global_min_release_age_cli_override_blocks_fresh_package() {
-    let project = TempProject::empty(r#"{ "name": "phase68", "version": "0.0.0" }"#);
+    let project = TempProject::empty(r#"{ "name": "global-security-test", "version": "0.0.0" }"#);
     let mock = MockRegistry::start().await;
     mount_global_tool_version(
         &mock,
@@ -511,7 +521,7 @@ async fn install_global_min_release_age_cli_override_blocks_fresh_package() {
 /// let the executable package fully commit into `~/.lpm/global`.
 #[tokio::test]
 async fn install_global_allow_new_bypasses_min_release_age_end_to_end() {
-    let project = TempProject::empty(r#"{ "name": "phase68", "version": "0.0.0" }"#);
+    let project = TempProject::empty(r#"{ "name": "global-security-test", "version": "0.0.0" }"#);
     let mock = MockRegistry::start().await;
     mount_global_tool_version(
         &mock,
@@ -542,7 +552,7 @@ async fn install_global_allow_new_bypasses_min_release_age_end_to_end() {
 /// path just like the project-scope workflow does.
 #[tokio::test]
 async fn install_global_drift_blocks_when_approved_attestation_dropped() {
-    let project = TempProject::empty(r#"{ "name": "phase68", "version": "0.0.0" }"#);
+    let project = TempProject::empty(r#"{ "name": "global-security-test", "version": "0.0.0" }"#);
     write_global_trust_with_approval(&project);
     let mock = MockRegistry::start().await;
     mount_global_tool_version(
@@ -574,7 +584,7 @@ async fn install_global_drift_blocks_when_approved_attestation_dropped() {
 /// listed in `--ignore-provenance-drift`.
 #[tokio::test]
 async fn install_global_ignore_provenance_drift_per_package_unblocks() {
-    let project = TempProject::empty(r#"{ "name": "phase68", "version": "0.0.0" }"#);
+    let project = TempProject::empty(r#"{ "name": "global-security-test", "version": "0.0.0" }"#);
     write_global_trust_with_approval(&project);
     let mock = MockRegistry::start().await;
     mount_global_tool_version(
@@ -610,7 +620,7 @@ async fn install_global_ignore_provenance_drift_per_package_unblocks() {
 /// blanket-waive advisory.
 #[tokio::test]
 async fn install_global_ignore_provenance_drift_all_unblocks() {
-    let project = TempProject::empty(r#"{ "name": "phase68", "version": "0.0.0" }"#);
+    let project = TempProject::empty(r#"{ "name": "global-security-test", "version": "0.0.0" }"#);
     write_global_trust_with_approval(&project);
     let mock = MockRegistry::start().await;
     mount_global_tool_version(
@@ -662,7 +672,7 @@ async fn install_global_policy_allow_runs_postinstall_end_to_end() {
         return;
     }
 
-    let project = TempProject::empty(r#"{ "name": "phase68", "version": "0.0.0" }"#);
+    let project = TempProject::empty(r#"{ "name": "global-security-test", "version": "0.0.0" }"#);
     let mock = MockRegistry::start().await;
     mount_global_scripted_tool_version(
         &mock,
@@ -693,7 +703,7 @@ async fn install_global_policy_allow_runs_postinstall_end_to_end() {
 /// emit that the round-3 audit flagged.
 #[test]
 fn approve_scripts_global_yes_dry_run_json_omits_next_step() {
-    let project = TempProject::empty(r#"{ "name": "phase68", "version": "0.0.0" }"#);
+    let project = TempProject::empty(r#"{ "name": "global-security-test", "version": "0.0.0" }"#);
     seed_global_manifest_and_blocked_state(&project, "eslint", "9.24.0", "esbuild", "0.25.1");
 
     let out = lpm(&project)
@@ -729,7 +739,7 @@ fn approve_scripts_global_yes_dry_run_json_omits_next_step() {
 /// globally-installed origins, not the approved row's own name.
 #[test]
 fn approve_scripts_global_yes_live_json_carries_next_step_origins() {
-    let project = TempProject::empty(r#"{ "name": "phase68", "version": "0.0.0" }"#);
+    let project = TempProject::empty(r#"{ "name": "global-security-test", "version": "0.0.0" }"#);
     seed_global_manifest_and_blocked_state(&project, "eslint", "9.24.0", "esbuild", "0.25.1");
 
     let out = lpm(&project)
@@ -761,7 +771,7 @@ fn approve_scripts_global_yes_live_json_carries_next_step_origins() {
         .expect("next_step.origins must be an array");
     let names: Vec<&str> = origins.iter().filter_map(|v| v.as_str()).collect();
     // The top-level global is `eslint` (NOT the blocked transitive
-    // `esbuild`). Phase 68 §banner contract: enumerate origins, not
+    // `esbuild`). Banner contract: enumerate origins, not
     // row names.
     assert!(
         names.contains(&"eslint"),

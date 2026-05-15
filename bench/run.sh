@@ -3,7 +3,7 @@ set -euo pipefail
 
 # ─── LPM Benchmark Suite ─────────────────────────────────────────────────────
 #
-# Phase 34.3: benchmarks are organized into three measurement classes:
+# benchmarks are organized into three measurement classes:
 #
 #   wall-clock    — command + shell + destructive setup. Includes rm -rf,
 #                   cache wipes, and process overhead. Represents real user-
@@ -20,14 +20,14 @@ set -euo pipefail
 #   ./bench/run.sh                     # Run all benchmarks
 #   ./bench/run.sh cold-install         # Full-round cold (wipes INSIDE timer)
 #   ./bench/run.sh cold-install-clean   # Equal-footing cold (wipes OUTSIDE)
-#   ./bench/run.sh cold-install-triage  # Phase 46 — triage vs deny delta
+#   ./bench/run.sh cold-install-triage  # — triage vs deny delta
 #   ./bench/run.sh warm-install
 #   ./bench/run.sh up-to-date
-#   ./bench/run.sh command-only        # Phase 34.3: command-only class
+#   ./bench/run.sh command-only        # command-only class
 #   ./bench/run.sh script-overhead
 #   ./bench/run.sh builtin-tools
 #   ./bench/run.sh lpm-stages          # Engine class
-#   ./bench/run.sh fetch-breakdown     # Phase 38 P0: cold-fetch sub-stages
+#   ./bench/run.sh fetch-breakdown     # cold-fetch sub-stages
 
 BENCH_DIR="$(cd "$(dirname "$0")" && pwd)"
 
@@ -114,11 +114,11 @@ median_ms_with_setup() {
 # iteration so neither gets a systematic CDN-warmth advantage. Returns
 # two medians "median_a median_b" over RUNS samples each.
 #
-# Phase 49 use case: compare `lpm install` in Direct route mode (the
+# use case: compare `lpm install` in Direct route mode (the
 # shipped default — npm fetches bypass the CF Worker) vs Proxy mode
 # (`LPM_NPM_ROUTE=proxy`, the escape hatch that routes through the
 # Worker) inside one bench invocation so CDN state can't confound the
-# delta. This is the A/B the §10 ship gate anchors on: Direct mode
+# delta. This is the A/B the  ship gate anchors on: Direct mode
 # must beat bun-competitive targets while Proxy mode proves the
 # Worker path still performs within the pre-49 baseline.
 median_ms_ab_with_setup() {
@@ -243,7 +243,7 @@ bench_cold_install() {
 # moves the wipe OUTSIDE the timed region. The result is a true
 # "install-command-only wall-clock" that is apples-to-apples across tools.
 #
-# Keep `cold-install` too — it's the full round-trip number Phase 32
+# Keep `cold-install` too — it's the full round-trip number
 # guardrails point at, and some users genuinely care about the
 # wipe+install loop (e.g. CI fresh-clone cold start).
 
@@ -289,13 +289,13 @@ bench_cold_install_clean() {
 
 	# --- lpm ---
 	#
-	# Phase 49: A/B Direct mode (shipped default, npm packages bypass
+	# A/B Direct mode (shipped default, npm packages bypass
 	# the CF Worker) vs Proxy mode (`LPM_NPM_ROUTE=proxy`, escape
 	# hatch). Alternating order per iteration balances CDN state.
 	# This A/B replaces the pre-49 default-vs-legacy comparison —
 	# `LPM_STREAM_FETCH` and `LPM_SPEC_FETCH` no longer control
-	# install behavior (the gated code paths were retired in §5 /
-	# §7), so the legacy variant would have been running the same
+	# install behavior (the gated code paths were retired in  /
+	# ), so the legacy variant would have been running the same
 	# code path twice and reporting a no-op delta.
 	if [[ -n "$LPM_BIN" ]]; then
 		read ms_default ms_proxy <<< "$(median_ms_ab_with_setup \
@@ -311,10 +311,10 @@ bench_cold_install_clean() {
 
 # ─── Cold Install (Triage) ────────────────────────────────────────────────────
 #
-# Phase 46 close-out Chunk 5 / §12.7 — measure the overhead introduced by
+# close-out /  — measure the overhead introduced by
 # `script-policy = "triage"` on the same 51-pkg fixture used by
 # `cold-install-clean`. Two axes, both against the deny baseline (deny is
-# the pre-Phase-46 default; the §18 zero-regression guarantee says deny
+# the previously default; the  zero-regression guarantee says deny
 # output + timing must stay steady as later phases land):
 #
 #   Axis 1 — classification-only overhead (autoBuild off)
@@ -346,17 +346,17 @@ bench_cold_install_clean() {
 #     True execution-path benchmarking requires a pinned fixture
 #     containing at least one green-classified `preinstall` /
 #     `install` / `postinstall` package, and is deferred.
-#     §0 v2.11 documents the Chunk 5 audit that caught this
-#     misclassification; the original v2.10 §12.7 "execution-path
+#      v2.11 documents the audit that caught this
+#     misclassification; the original v2.10  "execution-path
 #     overhead ≤15%" wording was unsound on the current fixture.
 #
-# v2.10 of the plan doc reframed §12.7 onto this same-fixture-two-axes
+# v2.10 of the plan doc reframed  onto this same-fixture-two-axes
 # shape because the original "no-scripts case vs scripts case" gate
 # required a second synthetic fixture whose signal would be vacuous
 # (no scripts → no P1–P7 code paths fire → delta is zero by
 # construction). v2.11 narrows Axis 2's claim to match reality.
 bench_cold_install_triage() {
-	header "Cold Install [wall-clock, script-policy=triage — Phase 46 close-out, 17 direct deps → 51 packages]"
+	header "Cold Install [wall-clock, script-policy=triage — close-out, 17 direct deps → 51 packages]"
 
 	if [[ -z "$LPM_BIN" ]]; then
 		printf "  ${yellow}⚠ lpm binary required, skipping${reset}\n"
@@ -511,7 +511,7 @@ bench_up_to_date() {
 
 	# --- lpm ---
 	#
-	# Phase 45 P0: the MEASURED command must be bare `lpm install` so the
+	# the MEASURED command must be bare `lpm install` so the
 	# top-of-main fast lane engages. `--allow-new` is in the fast-lane
 	# disqualifier list at
 	# [install_state.rs::argv_qualifies_for_fast_lane](../crates/lpm-cli/src/install_state.rs)
@@ -530,7 +530,7 @@ bench_up_to_date() {
 	rm -rf "$work"
 }
 
-# ─── Command-Only (Phase 34.3) ───────────────────────────────────────────────
+# ─── Command-Only  ───────────────────────────────────────────────
 #
 # Measures binary invocation on an ALREADY-PREPARED fixture. No destructive
 # cleanup inside the timed region. Isolates binary startup + install logic
@@ -676,7 +676,7 @@ JSEOF
 # parsing `lpm install --json` output. Useful for tracking per-stage
 # regressions inside LPM that wall-clock alone might hide.
 #
-# Phase 32 guardrail #3: install-path features must not regress these numbers.
+# guardrail #3: install-path features must not regress these numbers.
 
 # Run `lpm install --json` and extract timing.{resolve_ms,fetch_ms,link_ms,total_ms}.
 # Outputs four space-separated integers: "resolve fetch link total"
@@ -706,8 +706,8 @@ except (json.JSONDecodeError, AttributeError):
 #
 # Style note (2026-04-16): prefer `printf '%s\n' "${arr[@]}" | sort -n`
 # over the older `IFS=$'\n' s_r=($(sort -n <<< "${arr[*]}"))` pattern.
-# Phase 38 P0 initially claimed the older pattern didn't actually sort
-# — Phase 39's audit re-tested it in bash 3.2 + zsh 5.9 with the exact
+# P0 initially claimed the older pattern didn't actually sort
+# — a subsequent audit re-tested it in bash 3.2 + zsh 5.9 with the exact
 # input `(17 23 19 5 99)` and both patterns sort correctly. The new
 # pattern is kept anyway: `printf` + pipe is clearer about one-value-
 # per-line intent and doesn't rely on `IFS` prefixing rules that shift
@@ -793,10 +793,10 @@ bench_lpm_per_stage() {
 	rm -rf "$work"
 }
 
-# ─── LPM Fetch Breakdown (Phase 38 P0) ───────────────────────────────────────
+# ─── LPM Fetch Breakdown (P0) ───────────────────────────────────────
 #
 # Splits the lumpy `fetch_ms` number into six real sub-stages so follow-up
-# Phase 38 work has a principled ruler. Only meaningful COLD — warm/up-to-date
+# work has a principled ruler. Only meaningful COLD — warm/up-to-date
 # never enter the download pool, so the breakdown is zero everywhere.
 #
 # Fields (all whole milliseconds, per the `FetchBreakdown` contract in

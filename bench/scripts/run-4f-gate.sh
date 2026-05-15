@@ -1,10 +1,10 @@
 #!/bin/bash
-# Phase 66 Phase 4f dual-gate bench harness.
+# Linker-mode dual-gate bench harness.
 #
 # Pairs warm-install measurements for the two `LinkerMode` candidates
 # in the SAME outer iteration so the per-iter network/disk state is
 # identical between cells. The flip-or-hold decision per preplan
-# §Phase 4f rests on:
+# rests on:
 #
 #   GATE 1 (absolute UX):       hoisted warm-install median ≤ 200 ms.
 #   GATE 2 (no-everyday-regression): hoisted warm-install median is
@@ -16,7 +16,7 @@
 # to investigate v2 perf gaps further or accept the current shape as
 # the post-4f reality.
 #
-# ## Methodology (matches README footnote 3 + preplan §6.5)
+# ## Methodology (matches README footnote 3 + preplan )
 #
 #   - `rm -rf node_modules` only between iters.
 #   - lpm.lock + lpm.lockb + ~/.lpm/store + ~/.lpm/cache + <project>/.lpm
@@ -31,7 +31,7 @@
 #
 #   ./bench/scripts/run-4f-gate.sh <n_iters> [<tag>]
 #
-#   N defaults to 20 (matches preplan §6.5 acceptance n).
+#   N defaults to 20 (matches preplan acceptance n).
 #
 set -euo pipefail
 
@@ -53,7 +53,7 @@ WORK="/tmp/lpm-bench-4f-gate/work"
 rm -rf "$WORK" && mkdir -p "$WORK"
 cp "$FIXTURE/package.json" "$WORK/"
 
-echo "[bench] phase66 4f gate — n=${N} per cell"
+echo "[bench] linker-mode gate — n=${N} per cell"
 echo "[bench] fixture: $FIXTURE"
 echo "[bench] binary:  $BIN"
 date

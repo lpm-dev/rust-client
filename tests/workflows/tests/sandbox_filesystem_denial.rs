@@ -12,7 +12,7 @@
 //! Outbound-network denial is **not** in scope here. The current
 //! sandbox unconditionally allows network (Seatbelt:
 //! `(allow network*)`; landlock V1: no network rules at all —
-//! filesystem-only). Phase 46.1 will implement network denial and
+//! filesystem-only). Network denial is implemented separately, and
 //! ship its own end-to-end test as the locked deliverable. Naming
 //! this file `sandbox_filesystem_denial` instead of
 //! `sandbox_network_denial` keeps that gap visible.
@@ -124,7 +124,7 @@ fn build_fs_denial_tarball() -> Vec<u8> {
 /// `scriptPolicy` setting — the test passes `--policy=allow` on the
 /// CLI for the same effect with the additional guarantee that
 /// `auto_build_attempted` widens (the Allow policy alone fires
-/// auto-build per Phase 57). Picking the CLI flag rather than the
+/// auto-build). Picking the CLI flag rather than the
 /// manifest key is cosmetic — both routes converge at
 /// `ScriptPolicy::Allow` after `resolve_script_policy`.
 fn project_manifest() -> String {
@@ -245,8 +245,8 @@ fn node_available() -> bool {
 /// Unix-only for the same reason `triage_install_lifecycle.rs`
 /// guards `claude-cli` mock setup behind `#[cfg(unix)]`: the
 /// sandbox + lifecycle-script pipeline doesn't ship a Windows
-/// backend in Phase 46 P5 (see `lpm-sandbox/src/lib.rs:20` —
-/// Windows is deferred to Phase 46.1 D10). A Windows test would
+/// backend (see `lpm-sandbox/src/lib.rs:20` —
+/// Windows is deferred. A Windows test would
 /// be pinning a not-yet-implemented contract — exactly the
 /// failure mode this test file is named to avoid.
 #[cfg(unix)]
@@ -297,7 +297,7 @@ async fn postinstall_write_outside_allow_list_is_denied_marker_absent_file_absen
         // `--policy=allow` bypasses the triage gate so the amber
         // tier doesn't block execution — the test isolates SANDBOX
         // enforcement from TRIAGE gating. Allow also fires auto-
-        // build automatically (Phase 57), so we don't need
+        // build automatically, so we don't need
         // `--auto-build` to widen the rebuild path.
         .args(["install", "--policy=allow"])
         .env("LPM_TEST_FORBIDDEN_PATH", &forbidden_path)

@@ -348,7 +348,7 @@ fn graph_stats_max_depth_matches_flag_input() {
     );
 }
 
-// ─── Phase 65 Step 6.2d-ii — `lpm graph --why <pkg>` overrides trace ────
+// ─── `lpm graph --why <pkg>` overrides trace ────
 //
 // When `.lpm/overrides-state.json` records an applied override for a
 // package, `lpm graph --why <pkg>` decorates output (human + JSON) with
@@ -567,7 +567,7 @@ fn graph_why_json_output_returns_empty_overrides_when_no_state_file() {
     );
 }
 
-// ─── Phase 65 Step 6.4c — `lpm graph --why <pkg>` patch trace ───────────
+// ─── `lpm graph --why <pkg>` patch trace ───────────
 //
 // `lpm graph --why <pkg>` reads `.lpm/patch-state.json` and surfaces the
 // patch provenance: patch-path reference (human + JSON) and the

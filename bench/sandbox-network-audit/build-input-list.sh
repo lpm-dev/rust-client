@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Phase 46.1 sandbox-network-audit — input-list builder.
+# sandbox-network-audit — input-list builder.
 #
 # Replaces the broken "top-500 by downloads" recipe from earlier
 # drafts (npm no longer exposes a free per-package downloads
@@ -8,7 +8,7 @@
 #
 # Strategy:
 #   1. Seed from `../top-npm-audit/top-100.txt` (popularity-curated
-#      from Phase 66 §1b) PLUS `scripted-candidates.txt` (this
+#      from ) PLUS `scripted-candidates.txt` (this
 #      directory's family-by-family known-scripted list).
 #   2. De-duplicate.
 #   3. For each candidate, fetch

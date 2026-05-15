@@ -1,4 +1,4 @@
-//! Composed workflow tests for `lpm add` (Phase 64 #9.x chain).
+//! Composed workflow tests for `lpm add`.
 //!
 //! The unit tests in `crates/lpm-cli/src/commands/add.rs` cover the
 //! helper-level contracts (collector dedup, save-spec decision logic,
@@ -11,14 +11,14 @@
 //!
 //! 1. **Happy path** (#9 + #9.1): a config-driven source package
 //!    declaring a mix of bare names and `name@^range` specs ends with
-//!    each entry written to `package.json` per the Phase 33 save
+//!    each entry written to `package.json` per the save
 //!    policy — bare → `^resolvedLatest`, explicit range preserved
 //!    verbatim — and the source files copied into the project.
 //!
 //! 2. **Preflight** (#9.4): a deps-declaring source package against a
 //!    project with no `package.json` exits non-zero with a remediation
 //!    hint pointing at `lpm init` / `npm init -y`, and crucially does
-//!    NOT copy any source files (no Step 8 side effects on the
+//!    NOT copy any source files (no source-file copy side effects on the
 //!    failure path).
 //!
 //! 3. **Rollback** (#9.2 + #9.3): a deps-declaring source package
@@ -211,7 +211,7 @@ async fn lpm_add_with_mixed_registry_deps_installs_and_writes_resolved_specs() {
     );
 }
 
-// ─── Phase 65 Step 5: JSON envelope contract ────────────────────────
+// ─── JSON envelope contract ────────────────────────
 
 /// `lpm add --json` envelope shape locked via insta. Source-package add
 /// with no declared deps so the envelope stays minimal — sub-fields
@@ -335,7 +335,7 @@ async fn lpm_add_preflight_blocks_deps_source_with_no_consumer_manifest() {
     );
 
     // Critical: NO source-file copy happened. The preflight runs
-    // before Step 8, so a failed run leaves the project pristine.
+    // before source-file copies, so a failed run leaves the project pristine.
     assert!(
         !project.file_exists("components/Bar.tsx"),
         "preflight must run BEFORE source-file copy; the failure path \
@@ -359,7 +359,7 @@ async fn lpm_add_rollback_restores_manifest_and_source_files_on_install_failure(
     // resolution succeeds at the metadata layer; the trailing install
     // then 404s on the tarball download, fails, and the
     // ManifestTransaction Drops uncommitted — rolling back the
-    // package.json mutation AND the source-file copies from Step 8.
+    // package.json mutation AND the source-file copies.
     let mock = MockRegistry::start().await;
 
     let lpm_config = json!({
@@ -452,7 +452,7 @@ async fn lpm_add_rollback_restores_manifest_and_source_files_on_install_failure(
     );
 }
 
-// ─── Phase 65 Step 6.3 — security + non-interactive + npm-simple paths ───
+// ─── security + non-interactive + npm-simple paths ───
 //
 // Three behavior clusters migrated from cli/tests/:
 // 1. Path-traversal containment (`--path ..`, `--path /abs`)
@@ -619,7 +619,7 @@ fn assert_add_path_guard_error(out: &std::process::Output, scenario: &str) {
 /// no escape directory on disk.
 #[tokio::test]
 async fn add_rejects_relative_dotdot_dest_and_creates_no_external_directory() {
-    let pkg = "phase60-traversal-fixture-rel";
+    let pkg = "add-traversal-fixture-rel";
     let mock = MockRegistry::start().await;
     let tarball = make_traversal_tarball(pkg, "1.0.0", "../../escaped/evil.txt");
     mock.with_package(pkg, "1.0.0", &tarball).await;
@@ -685,9 +685,8 @@ async fn add_rejects_relative_dotdot_dest_and_creates_no_external_directory() {
 /// path verbatim — must be rejected before any `mkdir`.
 #[tokio::test]
 async fn add_rejects_absolute_dest_and_creates_no_external_directory() {
-    let pkg = "phase60-traversal-fixture-abs";
-    let elsewhere =
-        std::env::temp_dir().join(format!("lpm-phase65-abs-escape-{}", std::process::id()));
+    let pkg = "add-traversal-fixture-abs";
+    let elsewhere = std::env::temp_dir().join(format!("lpm-add-abs-escape-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&elsewhere);
     let evil_dest_str = elsewhere.join("evil.txt").to_string_lossy().into_owned();
 
@@ -744,7 +743,7 @@ async fn add_rejects_absolute_dest_and_creates_no_external_directory() {
 /// untouched (guard fires before any mutation).
 #[tokio::test]
 async fn add_simple_yes_without_path_errors_and_does_not_mutate_manifest() {
-    let pkg = "phase60-simple-no-path-yes";
+    let pkg = "add-simple-no-path-yes";
     let mock = MockRegistry::start().await;
     mock.with_package(pkg, "1.0.0", &make_simple_npm_tarball(pkg, "1.0.0"))
         .await;
@@ -774,7 +773,7 @@ async fn add_simple_yes_without_path_errors_and_does_not_mutate_manifest() {
 /// the same guard applies.
 #[tokio::test]
 async fn add_simple_json_without_path_errors_and_does_not_mutate_manifest() {
-    let pkg = "phase60-simple-no-path-json";
+    let pkg = "add-simple-no-path-json";
     let mock = MockRegistry::start().await;
     mock.with_package(pkg, "1.0.0", &make_simple_npm_tarball(pkg, "1.0.0"))
         .await;
@@ -801,7 +800,7 @@ async fn add_simple_json_without_path_errors_and_does_not_mutate_manifest() {
 /// `is_terminal()` returns false even when the runner inherits a TTY.
 #[tokio::test]
 async fn add_simple_no_tty_without_path_errors_and_does_not_mutate_manifest() {
-    let pkg = "phase60-simple-no-path-notty";
+    let pkg = "add-simple-no-path-notty";
     let mock = MockRegistry::start().await;
     mock.with_package(pkg, "1.0.0", &make_simple_npm_tarball(pkg, "1.0.0"))
         .await;
@@ -825,10 +824,10 @@ async fn add_simple_no_tty_without_path_errors_and_does_not_mutate_manifest() {
 
 /// Sanity check: `--yes --path` does NOT trip the guard. Source files
 /// land directly under the supplied path, with no auto-nest under a
-/// package-name subdirectory (Phase 60 simple-path contract).
+/// package-name subdirectory (simple-path contract).
 #[tokio::test]
 async fn add_simple_yes_with_path_succeeds_and_copies_files_directly() {
-    let pkg = "phase60-simple-with-path";
+    let pkg = "add-simple-with-path";
     let mock = MockRegistry::start().await;
     mock.with_package(pkg, "1.0.0", &make_simple_npm_tarball(pkg, "1.0.0"))
         .await;
@@ -865,7 +864,7 @@ async fn add_simple_yes_with_path_succeeds_and_copies_files_directly() {
 /// untouched, no `.lpm/skills/` for non-`@lpm.dev/*` packages.
 #[tokio::test]
 async fn add_simple_npm_pkg_copies_files_and_surfaces_bare_imports() {
-    let pkg = "phase60-npm-simple-e2e";
+    let pkg = "add-npm-simple-e2e";
     let mock = MockRegistry::start().await;
     mock.with_package(
         pkg,
@@ -935,11 +934,11 @@ async fn add_simple_npm_pkg_copies_files_and_surfaces_bare_imports() {
 /// `--json` envelope on the npm simple path includes `external_imports`
 /// (sorted bare specifiers, relative imports excluded), and
 /// `package.name` is the verbatim npm spec — NOT the @lpm.dev/-prefixed
-/// form (Phase 60.0.a regression check: pre-fix the JSON always used
+/// form (regression check: previously the JSON always used
 /// `name.scoped()`).
 #[tokio::test]
 async fn add_simple_npm_pkg_json_envelope_includes_external_imports_and_npm_name() {
-    let pkg = "phase60-npm-simple-json";
+    let pkg = "add-npm-simple-json";
     let mock = MockRegistry::start().await;
     mock.with_package(
         pkg,

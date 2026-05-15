@@ -1,20 +1,20 @@
 #!/bin/bash
-# Phase 56 W1 bench harness — 3 lpm arms + bun control on bench/fixture-large COLD.
+# 5-cell bench harness — 3 lpm arms + bun control on bench/fixture-large COLD.
 #
 # Cells (round-robin per outer iteration so each arm sees similar network state):
 #   - pubgrub-stream  — control:   PubGrub resolver + streaming walker (today's default)
-#   - greedy-stream   — baseline:  greedy resolver  + streaming walker (Phase 53 W2 ship)
+#   - greedy-stream   — baseline:  greedy resolver + streaming walker
 #   - greedy-fusion   — NEW:       greedy resolver  + fused dispatcher (LPM_GREEDY_FUSION=1)
 #
 # Bun control: separate cold installs (default n=10).
 #
-# At W1 HEAD (no fusion code yet) the LPM_GREEDY_FUSION env var is unread, so the
+# At HEAD (no fusion code yet) the LPM_GREEDY_FUSION env var is unread, so the
 # greedy-fusion arm collapses to "greedy with no walker env var" (default walker mode).
-# That is intentional — the W1 ship-or-drop measurement is "all 4 lpm cells produce
+# That is intentional — the ship-or-drop measurement is "all 4 lpm cells produce
 # stable medians within ±200 ms across runs" (harness-validation), not a fusion-vs-
-# walker delta. The fusion delta lands when W2 wires `resolve_greedy_fused`.
+# walker delta. The fusion delta lands when wires `resolve_greedy_fused`.
 #
-# Per Phase 56 pre-plan §5 the fixture path and clean targets match Phase 53 W5
+# Per pre-plan the fixture path and clean targets match
 # exactly so wall medians are directly comparable.
 #
 # Usage: $0 <n_iters> [<tag>]
@@ -25,9 +25,9 @@ N="${1:-20}"
 TAG="${2:-w1-validation}"
 N_BUN="${N_BUN:-10}"
 
-BIN="/tmp/lpm-rs-phase56-target/release/lpm-rs"
+BIN="/tmp/lpm-rs-bench-target/release/lpm-rs"
 FIXTURE="/Users/tolga/Documents/Projects/lpm-dev/rust-client/bench/fixture-large"
-RESULTS="/tmp/phase56-fusion-bench/${TAG}-results"
+RESULTS="/tmp/lpm-fusion-bench/${TAG}-results"
 mkdir -p "$RESULTS"
 
 if [[ ! -x "$BIN" ]]; then
@@ -48,7 +48,7 @@ clean_bun() {
 }
 cd "$FIXTURE"
 
-echo "[bench] phase56 ${TAG} — n=${N} per cell, n_bun=${N_BUN}"
+echo "[bench] fusion-bench ${TAG} — n=${N} per cell, n_bun=${N_BUN}"
 date
 
 for i in $(seq 1 "$N"); do
@@ -60,7 +60,7 @@ for i in $(seq 1 "$N"); do
                 export LPM_WALKER=stream
                 ;;
             greedy-stream)
-                # W4: fusion is the default under LPM_RESOLVER=greedy,
+                # fusion is the default under LPM_RESOLVER=greedy,
                 # so this cell pins to the legacy walker arm via
                 # `LPM_GREEDY_FUSION=0` — explicit opt-out. Pre-W4 this
                 # was unset; setting it to "0" preserves the cell's
@@ -70,7 +70,7 @@ for i in $(seq 1 "$N"); do
                 export LPM_GREEDY_FUSION=0
                 ;;
             greedy-fusion)
-                # W4: `LPM_GREEDY_FUSION=1` is now redundant (fusion is
+                # `LPM_GREEDY_FUSION=1` is now redundant (fusion is
                 # the default for LPM_RESOLVER=greedy), but kept here
                 # explicitly so the cell self-documents its intent and
                 # so the harness still works against pre-W4 HEADs for
@@ -108,4 +108,4 @@ done
 echo "[done] $RESULTS"
 date
 echo "=== summary ==="
-python3 /tmp/phase56-fusion-bench/summarize.py "$RESULTS"
+python3 /tmp/lpm-fusion-bench/summarize.py "$RESULTS"

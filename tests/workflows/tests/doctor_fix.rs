@@ -1,6 +1,6 @@
 //! Workflow tests for `lpm doctor --fix`.
 //!
-//! Phase 65's `doctor_list.rs` covers `lpm doctor list` (the catalog
+//! `doctor_list.rs` covers `lpm doctor list` (the catalog
 //! dump). This file covers the auto-fix dispatch path for issues that
 //! don't require network access:
 //!

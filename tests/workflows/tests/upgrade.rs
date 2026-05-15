@@ -317,7 +317,7 @@ async fn upgrade_dry_run_json_envelope_with_one_candidate_matches_snapshot() {
     insta::assert_json_snapshot!("upgrade_json_envelope_one_candidate_dry_run", envelope);
 }
 
-// ─── Phase 65 Step 6.7 — Phase 7 enriched-dry-run regressions ───────────
+// ─── enriched-dry-run regressions ───────────
 //
 // 15 tests covering the upgrade enrichment surface:
 //  - JSON envelope shape (legacy fields + per-package enrichment)
@@ -867,7 +867,7 @@ async fn upgrade_yes_marks_install_scripts_in_json() {
 }
 
 /// `peer_impact.ok: false` with the violating peer's name + have/want
-/// versions — pre-Phase-7 the field was missing entirely.
+/// versions — previously the field was missing entirely.
 #[tokio::test]
 async fn upgrade_yes_marks_peer_violation_in_json() {
     let project = TempProject::empty("");

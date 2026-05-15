@@ -1,5 +1,5 @@
 #!/bin/bash
-# Phase 57 measurement-sprint A — security-analyzer wall-cost on the
+# measurement-sprint A — security-analyzer wall-cost on the
 # fusion install hot path. Two cells, n=20 round-robin per outer iter.
 #
 #   fusion-baseline    — current default (security analyzer fused into extract)
@@ -8,7 +8,7 @@
 #
 # Wall delta = empirical cost of behavioral analysis on bench/fixture-large.
 # Compares against Gemini's "~300 ms wall-clock win from deferring the
-# analyzer" claim, which assumed a serial post-extract pass. Phase 38 P2
+# analyzer" claim, which assumed a serial post-extract pass. P2
 # already folded analysis INTO the extract pass, so the empirical answer
 # may differ substantially from the model.
 #
@@ -17,9 +17,9 @@ set -euo pipefail
 
 N="${1:-20}"
 TAG="${2:-security-cost}"
-BIN="/tmp/lpm-rs-phase56-target/release/lpm-rs"
+BIN="/tmp/lpm-rs-bench-target/release/lpm-rs"
 FIXTURE="/Users/tolga/Documents/Projects/lpm-dev/rust-client/bench/fixture-large"
-RESULTS="/tmp/phase56-fusion-bench/${TAG}-results"
+RESULTS="/tmp/lpm-fusion-bench/${TAG}-results"
 mkdir -p "$RESULTS"
 
 [[ -x "$BIN" ]] || { echo "ERROR: binary missing at $BIN"; exit 1; }
@@ -31,7 +31,7 @@ clean_lpm() {
 }
 cd "$FIXTURE"
 
-echo "[bench] phase57-${TAG} — n=${N} per cell"
+echo "[bench] security-bench-${TAG} — n=${N} per cell"
 date
 
 for i in $(seq 1 "$N"); do
@@ -39,7 +39,7 @@ for i in $(seq 1 "$N"); do
         clean_lpm
         unset LPM_SKIP_SECURITY
         export LPM_RESOLVER=greedy
-        export LPM_WALKER=stream  # explicit; redundant under W4 default-fusion
+        export LPM_WALKER=stream  # explicit; redundant under default-fusion
         case $arm in
             fusion-no-security)
                 export LPM_SKIP_SECURITY=1
