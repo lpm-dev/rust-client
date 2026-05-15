@@ -16,8 +16,8 @@ static DLX_LEGACY_MIGRATION: Once = Once::new();
 
 /// Get the dlx cache directory for a given package spec.
 ///
-/// Returns `~/.lpm/cache/dlx/{hash}/` (phase 37: moved from the pre-phase-37
-/// location `~/.lpm/dlx-cache/` so all caches live under `~/.lpm/cache/`).
+/// Returns `~/.lpm/cache/dlx/{hash}/`. Legacy location was `~/.lpm/dlx-cache/`;
+/// migrated to keep all caches under `~/.lpm/cache/`.
 ///
 /// The first call after an upgrade silently migrates the legacy location by
 /// renaming `~/.lpm/dlx-cache/` to `~/.lpm/cache/dlx/` when only the legacy
@@ -38,11 +38,10 @@ pub fn dlx_cache_dir(package_spec: &str) -> Result<PathBuf, LpmError> {
     });
 
     // Proactive sweep: before resolving the requested spec, drop any dlx
-    // entries older than the TTL. Phase 37 addresses the unbounded-growth
-    // concern — without this, a user who runs `lpm dlx cowsay` once and
-    // never again never triggers cleanup for that entry. The sweep is
-    // cheap: one `read_dir` + one `stat` per direct child, no registry
-    // traffic.
+    // entries older than the TTL. Without this, a user who runs `lpm dlx
+    // cowsay` once and never again never triggers cleanup for that entry.
+    // The sweep is cheap: one `read_dir` + one `stat` per direct child, no
+    // registry traffic.
     if let Err(e) = sweep_stale_dlx_entries(&root, CACHE_TTL_SECS) {
         tracing::debug!("dlx proactive sweep failed (non-fatal): {e}");
     }
@@ -156,8 +155,8 @@ fn dlx_entry_appears_complete(entry: &Path) -> bool {
 /// |                |                | then remove legacy dir                |
 ///
 /// The merge path is important for the rare case where a user installed
-/// both a pre-phase-37 build (populating legacy) and a post-phase-37 build
-/// (populating modern) before the migration ran — we must not lose either
+/// both builds (populating legacy and modern locations) before the migration
+/// ran — we must not lose either
 /// side's entries. Children are moved by rename; if a name collision
 /// occurs the modern entry wins (it's the freshest the process knows
 /// about) and the legacy child is removed.
@@ -717,7 +716,7 @@ mod tests {
         assert!(root.cache_dlx().join("x").exists());
     }
 
-    // --- Finding #7: Deterministic hash tests ---
+    // --- Deterministic hash tests ---
 
     #[test]
     fn deterministic_hash_stable() {
@@ -740,7 +739,7 @@ mod tests {
         assert_eq!(h, "cbf29ce484222325");
     }
 
-    // --- Finding #4: Command injection prevention tests ---
+    // --- Command injection prevention tests ---
 
     #[test]
     fn build_dlx_command_no_shell_injection() {
@@ -795,7 +794,7 @@ mod tests {
         assert!(args.is_empty(), "should have no args");
     }
 
-    // --- Finding #14: Cache directory permissions test ---
+    // --- Cache directory permissions test ---
 
     #[cfg(unix)]
     #[test]
@@ -815,7 +814,7 @@ mod tests {
         );
     }
 
-    // --- Finding #15: touch_cache efficiency test ---
+    // --- touch_cache efficiency test ---
 
     #[test]
     fn touch_cache_updates_mtime() {

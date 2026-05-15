@@ -628,7 +628,7 @@ mod tests {
         assert_eq!(t.local_deps(), vec!["lint"]);
     }
 
-    // Finding #17: bare "^" and double-prefix "^^build" edge cases
+    // bare "^" and double-prefix "^^build" edge cases
     #[test]
     fn upstream_tasks_filters_bare_caret_and_double_prefix() {
         let t = TaskConfig {
@@ -752,7 +752,7 @@ mod tests {
         assert_eq!(t.local_deps(), vec!["lint"]);
     }
 
-    // Finding #18: effective_inputs() should include config files
+    // effective_inputs() should include config files
     #[test]
     fn effective_inputs_includes_config_files() {
         let t = TaskConfig::default();
