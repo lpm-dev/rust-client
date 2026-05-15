@@ -1,4 +1,4 @@
-//! Phase 46 P2 — Layer 1 static-gate classifier.
+//! Layer 1 static-gate classifier.
 //!
 //! Pure, deterministic classification of lifecycle-script bodies into
 //! one of three tiers:
@@ -18,17 +18,14 @@
 //!   downloaders per D18, and novel patterns. Deferred to
 //!   layers 2/3/4.
 //!
-//! The classifier NEVER changes execution semantics. P2 populates
-//! `static_tier` on [`crate::triage::StaticTier`] call sites for UX
-//! annotation only; auto-execution of greens is gated on P5 (sandbox)
-//! and P6 (tier-aware auto-run) per the D20 ordering rule.
+//! The classifier NEVER changes execution semantics. `static_tier` is
+//! populated for UX annotation only; auto-execution of greens is gated
+//! on the sandbox and tier-aware auto-run layer.
 //!
 //! Only `Green | Amber | Red` are emitted here; `AmberLlm` is reserved
-//! for P8 and is set by the LLM triage harness, not by static
-//! classification.
+//! for the LLM triage harness, not static classification.
 //!
-//! ## Algorithm (per §4.1 of the Phase 46 plan, with the review-round
-//! ordering refinement)
+//! ## Algorithm
 //!
 //! 1. **Raw-string red prefilter** for markers that can survive or
 //!    evade tokenization — Unicode control characters (RTL overrides,
@@ -68,9 +65,8 @@ use regex::Regex;
 
 use crate::triage::StaticTier;
 
-/// Phase 46b Lever #4 — additional manifest context the classifier
-/// can consult to widen the green tier for safe-looking delegating
-/// scripts.
+/// Additional manifest context the classifier can consult to widen the
+/// green tier for safe-looking delegating scripts.
 ///
 /// The classifier's six-step pipeline is **context-free** by default
 /// (the script body is the only input). When a caller supplies a
@@ -80,9 +76,7 @@ use crate::triage::StaticTier;
 /// pairs with the delegate.
 ///
 /// Threat model: a malicious package can lie about its `repository`
-/// field. The identity widening is paired with the Phase 46b lever
-/// #3 install.js content-embedding plan; until that ships, the
-/// widening DOES rely on the manifest field being honest. The
+/// field. The widening relies on the manifest field being honest. The
 /// install pipeline counter-balance is that the local file's bytes
 /// are still in the store and `lpm approve-scripts` review remains
 /// available — the widening just changes the default from "always
@@ -100,14 +94,12 @@ pub struct ManifestContext<'a> {
     /// package exposes a binary named after itself, a `node install.js`
     /// fetching that binary aligns with the package's identity.
     pub bin_names: &'a [&'a str],
-    /// Phase 46b Option B — cooldown defense-in-depth for Lever #4.
-    ///
     /// The package's publish age in seconds (from now). When
     /// `min_release_age_secs > 0` AND this is below the threshold (or
-    /// `None`, meaning age unknown), Lever #4's identity-match
-    /// widening REFUSES to fire — the package stays Amber and is
-    /// subject to the script-tier review even when the install-level
-    /// cooldown gate was bypassed via `--allow-new`.
+    /// `None`, meaning age unknown), the identity-match widening REFUSES
+    /// to fire — the package stays Amber and is subject to the
+    /// script-tier review even when the install-level cooldown gate was
+    /// bypassed via `--allow-new`.
     ///
     /// This preserves the orthogonality of the two security axes:
     /// `--allow-new` opts out of cooldown only; the script-tier
@@ -117,11 +109,10 @@ pub struct ManifestContext<'a> {
     /// of cooldown universally, which then sets `min_release_age_secs`
     /// to 0 and disables the defense-in-depth check).
     pub publish_age_secs: Option<u64>,
-    /// Phase 46b Option B — the configured minimum release age in
-    /// seconds. Used to compare against `publish_age_secs`. The L1
-    /// widening's cooldown defense-in-depth fires when this is `> 0`;
-    /// when `0` the user has globally opted out of cooldown and
-    /// Lever #4 widens regardless of publish age.
+    /// The configured minimum release age in seconds. Used to compare
+    /// against `publish_age_secs`. The widening's cooldown defense-in-depth
+    /// fires when this is `> 0`; when `0` the user has globally opted out
+    /// of cooldown and the widening fires regardless of publish age.
     pub min_release_age_secs: u64,
 }
 
@@ -147,13 +138,13 @@ pub fn classify(script: &str) -> StaticTier {
     classify_with_context(script, None)
 }
 
-/// Phase 46b Lever #4 — context-aware classification.
+/// Context-aware classification.
 ///
 /// When `ctx` is `Some`, an additional green arm fires for
 /// "delegate-to-local-file" installers (`node install.js` and close
-/// variants) whose package identity matches the manifest's
-/// `repository` URL or a `bin` entry name. When `ctx` is `None`,
-/// behavior is identical to the pre-Lever-#4 classifier.
+/// variants) whose package identity matches the manifest's `repository`
+/// URL or a `bin` entry name. When `ctx` is `None`, behavior is
+/// identical to the context-free classifier.
 ///
 /// The widening is **purely additive** — it can only convert an
 /// otherwise-Amber tier into Green when identity matches. The
@@ -203,10 +194,9 @@ pub fn classify_with_context(script: &str, ctx: Option<&ManifestContext<'_>>) ->
         return StaticTier::Green;
     }
 
-    // Step 5b (Phase 46b Lever #4) — delegate-to-local-file
-    // installer with a matching identity signal. Only fires when
-    // the caller supplied manifest context; without it the
-    // classifier falls through to Amber (pre-Lever behaviour).
+    // Step 5b — delegate-to-local-file installer with a matching
+    // identity signal. Only fires when the caller supplied manifest
+    // context; without it the classifier falls through to Amber.
     if let Some(ctx) = ctx
         && matches_delegating_identity_green(&tokens, ctx)
     {
@@ -288,7 +278,7 @@ fn contains_powershell_red_literal(s: &str) -> bool {
 /// Everything else (including `{`, `}`, brace-expansion, and process
 /// substitution `<(…)`) is left untouched; this is a deliberately
 /// conservative list focused on the operators that gate the red
-/// patterns in §4.1 of the plan.
+/// patterns matched by the classifier.
 fn normalize_operators(s: &str) -> String {
     let mut out = String::with_capacity(s.len() * 2);
     let mut chars = s.chars().peekable();
@@ -395,7 +385,7 @@ fn any_token_is_red_command(tokens: &[String]) -> bool {
 /// reordering) but we don't false-positive on a random `-e` floating
 /// elsewhere in the token stream.
 ///
-/// **Softfail-wrapper exception** (Phase 46 audit follow-up): the
+/// **Softfail-wrapper exception**: the
 /// canonical `node -e "try{require('./X')}catch(e){}"` and
 /// `node -e "import('./X').catch(...)"` shape is shipped by core-js,
 /// msw, nx, vue-demi, and es5-ext, among others. The body is a fixed
@@ -880,9 +870,8 @@ fn matches_husky(tokens: &[String]) -> bool {
 
 /// `node <relative>.js` (or `.cjs` / `.mjs`) where `<relative>` is a
 /// non-escaping path inside the package directory AND the basename is
-/// not one of the §4.1 binary-fetcher reserved basenames (see
-/// [`is_reserved_lifecycle_basename`] — the amber exception wins per
-/// the plan doc update).
+/// not one of the reserved lifecycle basenames (see
+/// [`is_reserved_lifecycle_basename`] — the amber exception wins).
 fn matches_node_relative(tokens: &[String]) -> bool {
     if tokens.len() != 2 {
         return false;
@@ -902,8 +891,8 @@ fn matches_node_relative(tokens: &[String]) -> bool {
     true
 }
 
-/// Lifecycle-phase basenames reserved as the §4.1 binary-fetcher
-/// convention. Any `node <path>` green candidate whose target basename
+/// Lifecycle-phase basenames that trigger the reserved-basename
+/// amber rule. Any `node <path>` green candidate whose target basename
 /// matches one of these stays amber so the user explicitly
 /// acknowledges the binary-download risk, even when the rest of the
 /// command is otherwise green-eligible.
@@ -938,12 +927,11 @@ fn is_reserved_lifecycle_basename(basename: &str) -> bool {
 /// - the eval'd body matches one of the two accepted softfail shapes,
 /// - the inner path is safe-relative (no `..`, no abs, no `~`/`$`),
 /// - the inner path has an explicit `.js` / `.cjs` / `.mjs` extension, AND
-/// - the basename is **not** one of the §4.1 reserved binary-fetcher
-///   basenames (see [`is_reserved_lifecycle_basename`] — the amber
-///   exception wins even when the require is wrapped in a softfail
-///   catch).
+/// - the basename is **not** one of the reserved lifecycle basenames
+///   (see [`is_reserved_lifecycle_basename`] — the amber exception
+///   wins even when the require is wrapped in a softfail catch).
 ///
-/// Default-amber rule (Phase 46 audit follow-up, tighter P0): if any
+/// Default-amber rule: if any
 /// of the above conditions fails, the script falls through to the
 /// generic amber bucket. That keeps extensionless paths
 /// (`./postinstall`, `./_postinstall`, `./dist/bin/post-install`) and
@@ -992,7 +980,7 @@ fn is_safe_relative_path(p: &str) -> bool {
 }
 
 // ─────────────────────────────────────────────────────────────────────
-// Phase 46b Lever #4 — delegate-to-local-file with matching identity
+// Delegate-to-local-file with matching identity
 // ─────────────────────────────────────────────────────────────────────
 
 /// Step 5b: detect `node <path>.js` where `<path>` is a reserved
@@ -1025,12 +1013,11 @@ fn is_safe_relative_path(p: &str) -> bool {
 ///   widening just changes the default from "always prompt" to
 ///   "auto-run when shape + identity agree."
 /// - A malicious package CAN lie about its repository field. The
-///   counter is Phase 46b Lever #3 (embed install.js content in the
-///   advisor prompt): the lie is one step removed from the actual
-///   payload, which Lever #3 catches when the delegate's bytes show
-///   a malicious shape. Lever #4 alone trusts the field; the
-///   user-explicit `lpm approve-scripts` review remains the safety
-///   floor.
+///   counter-measure is that `lpm approve-scripts` embeds the
+///   delegate file's actual content in the review prompt — the lie
+///   is one step removed from the payload, which the reviewer sees
+///   directly. This check alone trusts the field; the user-explicit
+///   `lpm approve-scripts` review remains the safety floor.
 fn matches_delegating_identity_green(tokens: &[String], ctx: &ManifestContext<'_>) -> bool {
     // The body must be exactly `node <path>` (two tokens) — same
     // structural shape `matches_node_relative` requires.
@@ -1052,7 +1039,7 @@ fn matches_delegating_identity_green(tokens: &[String], ctx: &ManifestContext<'_
         return false;
     }
     let basename = path.rsplit('/').next().unwrap_or(path);
-    // Only fire on the §4.1 reserved-basename set — install.js /
+    // Only fire on the reserved-basename set — install.js /
     // postinstall.js / preinstall.js + .cjs/.mjs variants. Other
     // `node <name>.js` paths take the existing
     // [`matches_node_relative`] route and are already Green when
@@ -1061,15 +1048,15 @@ fn matches_delegating_identity_green(tokens: &[String], ctx: &ManifestContext<'_
         return false;
     }
 
-    // Phase 46b Option B — cooldown defense-in-depth. Refuse to
-    // widen when the configured `minimum_release_age_secs > 0` AND
+    // Cooldown defense-in-depth. Refuse to widen when the configured
+    // `minimum_release_age_secs > 0` AND
     // the package's publish age is below the threshold (or unknown).
     //
-    // Rationale: Lever #4 was designed for "old, established
-    // packages with matching identity." A maintainer-compromise
-    // scenario produces a recent publish with the SAME identity
-    // shape — exactly the case the install-level cooldown gate
-    // protects against. Without this check, `lpm install --allow-new`
+    // Rationale: this identity-match widening is designed for "old,
+    // established packages." A maintainer-compromise scenario
+    // produces a recent publish with the SAME identity shape —
+    // exactly the case the install-level cooldown gate protects
+    // against. Without this check, `lpm install --allow-new`
     // (which bypasses the install-level cooldown) would silently
     // ALSO bypass the script-tier review for matching-identity
     // packages, collapsing two orthogonal security axes into one.
@@ -1079,8 +1066,8 @@ fn matches_delegating_identity_green(tokens: &[String], ctx: &ManifestContext<'_
     //
     // When `min_release_age_secs == 0` the user has globally opted
     // out of cooldown protection (persistent config or
-    // `--min-release-age=0`); we honor that choice and let Lever #4
-    // fire regardless of publish age.
+    // `--min-release-age=0`); we honor that choice and widen
+    // regardless of publish age.
     if ctx.min_release_age_secs > 0 {
         match ctx.publish_age_secs {
             Some(age) if age >= ctx.min_release_age_secs => {
@@ -1225,7 +1212,7 @@ mod tests {
 
     #[test]
     fn amber_node_reserved_basenames_p05_widened() {
-        // P0.5 widening (Phase 46 audit follow-up):
+        // Extended to cover .cjs/.mjs and preinstall variants:
         // {install,postinstall,preinstall}.{js,cjs,mjs} all reserved.
         // Audit-found packages slipping through the .js-only check:
         // - puppeteer (rank 2857, 40.8M dl/mo): postinstall=`node install.mjs`
@@ -1273,7 +1260,7 @@ mod tests {
         assert_eq!(tier("node build.js --port 3000"), StaticTier::Amber);
     }
 
-    // ── Soft-fail postinstall wrappers (Phase 46 audit follow-up) ───
+    // ── Soft-fail postinstall wrappers ───────────────────────────────
     //
     // The canonical safe wrapper `node -e "try{require('./X')}catch(e){}"`
     // and the `import('./X').catch(...)` variant must NOT classify red.
@@ -1327,7 +1314,7 @@ mod tests {
     fn softfail_wrapper_reserved_basename_is_amber() {
         // Explicit .js extension but basename matches the binary-fetcher
         // reserved names → amber (the basename rule wins, per the
-        // existing §4.1 amber convention). Covers msw and vue-demi.
+        // existing amber convention). Covers msw and vue-demi.
         assert_eq!(
             tier(r#"node -e "import('./config/scripts/postinstall.js').catch(() => void 0)""#),
             StaticTier::Amber
@@ -1344,11 +1331,10 @@ mod tests {
 
     #[test]
     fn softfail_wrapper_reserved_basename_p05_widened() {
-        // P0.5 widening: the shared `is_reserved_lifecycle_basename`
-        // helper covers .cjs / .mjs and `preinstall` for the
-        // softfail-wrapper green path too — otherwise a future audit
-        // would find packages slipping through one route but not the
-        // other.
+        // The shared `is_reserved_lifecycle_basename` helper covers
+        // .cjs / .mjs and `preinstall` for the softfail-wrapper green
+        // path too — otherwise packages could slip through one route
+        // but not the other.
         assert_eq!(
             tier(r#"node -e "try{require('./install.cjs')}catch(e){}""#),
             StaticTier::Amber
@@ -1463,7 +1449,7 @@ mod tests {
         assert_eq!(tier(s), StaticTier::Amber);
     }
 
-    // ── Green: node-gyp-build family (Phase 46 audit follow-up) ─────
+    // ── Green: node-gyp-build family ─────────────────────────────────
 
     #[test]
     fn green_node_gyp_build_bare() {
@@ -1471,7 +1457,7 @@ mod tests {
         assert_eq!(tier("node-gyp-build-optional-packages"), StaticTier::Green);
     }
 
-    // ── Green: no-op shapes (Phase 46 audit follow-up Part A closeout) ─
+    // ── Green: no-op shapes ───────────────────────────────────────────
 
     #[test]
     fn green_exit_noop_variants() {
@@ -1940,14 +1926,14 @@ mod tests {
         }
     }
 
-    // ── Classifier never emits AmberLlm (reserved for P8) ───────────
+    // ── Classifier never emits AmberLlm ──────────────────────────────
 
     #[test]
     fn classify_never_emits_amber_llm() {
         // Broad coverage: iterate the full test-rule input set and
         // assert the returned tier is never AmberLlm. The classifier
         // owns Green | Amber | Red; AmberLlm comes from the LLM
-        // harness in P8.
+        // triage layer.
         let corpus = [
             "tsc",
             "node-gyp rebuild",
@@ -1982,14 +1968,14 @@ mod tests {
     }
 
     // ─────────────────────────────────────────────────────────────
-    // Phase 46b Lever #4 — `node install.js` + matching identity
+    // `node install.js` + matching identity
     // ─────────────────────────────────────────────────────────────
 
     /// Helper: build a [`ManifestContext`] for tests. Repo + bin
     /// borrow from caller-owned strings. Defaults to an "old" publish
     /// (1 year) under the standard 24h cooldown so the default test
-    /// path exercises Lever #4 firing without needing each test to
-    /// re-state cooldown defaults.
+    /// path exercises the identity-match widening without needing each
+    /// test to re-state cooldown defaults.
     fn ctx<'a>(name: &'a str, repo: Option<&'a str>, bin: &'a [&'a str]) -> ManifestContext<'a> {
         ManifestContext {
             package_name: name,
@@ -2001,7 +1987,7 @@ mod tests {
     }
 
     /// Helper: ManifestContext that explicitly exercises the
-    /// cooldown defense-in-depth (Option B). `age_secs` is the
+    /// cooldown defense-in-depth. `age_secs` is the
     /// package's publish age in seconds; `min_age_secs` is the
     /// configured `minimumReleaseAge`.
     fn ctx_with_age<'a>(
@@ -2027,8 +2013,8 @@ mod tests {
     #[test]
     fn lever4_no_context_is_pre_lever_behavior() {
         // Without manifest context, the classifier must produce the
-        // SAME tier as the bare `classify(...)` function. Lever #4
-        // is purely additive; passing `ctx = None` is a no-op.
+        // SAME tier as the bare `classify(...)` function. The
+        // identity check is purely additive; passing `ctx = None` is a no-op.
         for body in [
             "tsc",
             "node-gyp rebuild",
@@ -2167,8 +2153,8 @@ mod tests {
     fn lever4_non_reserved_basename_uses_existing_green_route() {
         // `node ./scripts/build.js` — non-reserved basename. The
         // existing `matches_node_relative` path already Greens it,
-        // independent of identity. Confirms Lever #4's reserved-
-        // basename guard doesn't accidentally narrow other Greens.
+        // independent of identity. Confirms the identity-match rule's
+        // reserved-basename guard doesn't accidentally narrow other Greens.
         let c = ctx("p", None, &[]);
         assert_eq!(
             tier_with_ctx("node ./scripts/build.js", &c),
@@ -2190,7 +2176,7 @@ mod tests {
     }
 
     // ─────────────────────────────────────────────────────────────
-    // Phase 46b Option B — cooldown defense-in-depth for Lever #4
+    // Cooldown defense-in-depth for identity-match widening
     // ─────────────────────────────────────────────────────────────
 
     const DAY_SECS: u64 = 24 * 60 * 60;
@@ -2198,9 +2184,9 @@ mod tests {
     #[test]
     fn lever4_recent_publish_stays_amber_under_default_cooldown() {
         // Default 24h cooldown + 1h-old publish + matching identity.
-        // Pre-Option-B: Lever #4 widened → Green → script auto-ran,
-        // collapsing the script-tier review for `--allow-new` users.
-        // Post-Option-B: stays Amber so the script-tier prompt fires.
+        // Without the cooldown check, identity-match widened → Green
+        // → script auto-ran, collapsing the script-tier review for
+        // `--allow-new` users. With it, stays Amber so prompt fires.
         let c = ctx_with_age(
             "sharp",
             Some("git+https://github.com/lovell/sharp.git"),
@@ -2215,7 +2201,7 @@ mod tests {
     fn lever4_publish_exactly_at_threshold_widens() {
         // Boundary case: publish age == cooldown threshold. The
         // comparison is `age >= min`, so an exactly-at-threshold
-        // publish is treated as old-enough → Lever #4 fires.
+        // publish is treated as old-enough → identity-match widens.
         let c = ctx_with_age(
             "sharp",
             Some("git+https://github.com/lovell/sharp.git"),
@@ -2229,7 +2215,7 @@ mod tests {
     #[test]
     fn lever4_old_publish_widens_under_default_cooldown() {
         // 1-year-old publish (well above 24h threshold) + matching
-        // identity → Lever #4 fires as designed.
+        // identity → identity-match widens as designed.
         let c = ctx_with_age(
             "sharp",
             Some("git+https://github.com/lovell/sharp.git"),
@@ -2260,10 +2246,10 @@ mod tests {
     #[test]
     fn lever4_min_release_age_zero_disables_cooldown_check() {
         // `minimumReleaseAge: 0` is the explicit "I don't want
-        // cooldown protection" config. Lever #4 honors that and
-        // fires regardless of publish age — even a 0-second-old
-        // publish widens when the user has globally opted out of
-        // the cooldown axis.
+        // cooldown protection" config. The identity-match check
+        // honors that and widens regardless of publish age — even a
+        // 0-second-old publish widens when the user has globally
+        // opted out of the cooldown axis.
         let c_recent = ctx_with_age(
             "sharp",
             Some("git+https://github.com/lovell/sharp.git"),
@@ -2321,7 +2307,7 @@ mod tests {
 
     #[test]
     fn lever4_cooldown_check_does_not_affect_compound_or_red_paths() {
-        // Cooldown defense is gated on Lever #4 firing. Compound
+        // Cooldown defense is gated on the identity-match rule. Compound
         // bodies stay Amber via step-4 fallback regardless of age;
         // Red bodies stay Red via step-3 regardless. The cooldown
         // check is only consulted on the otherwise-greenable

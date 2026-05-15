@@ -21,7 +21,7 @@ pub struct SupplyChainTags {
     pub url_strings: bool,
     pub trivial: bool,
     pub protestware: bool,
-    /// Obfuscation confidence score (0.0–1.0). Added in Phase 31.
+    /// Obfuscation confidence score (0.0–1.0).
     /// - < 0.3: not obfuscated
     /// - 0.3–0.7: possible obfuscation (likely compiled/minified output)
     /// - > 0.7: high-confidence deliberate obfuscation
