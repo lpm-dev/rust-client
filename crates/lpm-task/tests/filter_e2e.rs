@@ -1,4 +1,4 @@
-//! Phase 32 Phase 1 M9: end-to-end integration test for the filter engine.
+//! End-to-end integration test for the filter engine.
 //!
 //! Drives the full pipeline from on-disk workspace discovery through
 //! `WorkspaceGraph` construction, parsing, evaluation, and topological
@@ -6,9 +6,8 @@
 //! `Workspace` structs so the path canonicalization, member discovery, and
 //! workspace-protocol resolution all run for real.
 //!
-//! This is the canonical "did the whole thing work" check that lands at
-//! the end of Phase 1. If the engine ever drifts from `lpm run --filter`,
-//! one of these tests should catch it.
+//! If the engine ever drifts from `lpm run --filter`, one of these tests
+//! should catch it.
 
 use lpm_task::filter::FilterEngine;
 use lpm_task::graph::WorkspaceGraph;
@@ -240,8 +239,7 @@ fn e2e_explain_returns_full_trace_for_real_workspace() {
 
 #[test]
 fn e2e_d2_substring_break_yields_empty_for_partial_name() {
-    // D2 regression: pre-Phase-32, `core` would have substring-matched
-    // `auth-core`. Now it must return empty.
+    // `core` must NOT substring-match `auth-core` — exact name match only.
     let tmp = tempfile::tempdir().unwrap();
     write_workspace(
         tmp.path(),

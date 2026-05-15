@@ -1,4 +1,4 @@
-//! Phase 32 shared filter engine.
+//! Shared filter engine.
 //!
 //! Workspace package selection logic shared by every command that accepts
 //! `--filter`. Built as a module inside `lpm-task` rather than as a new
