@@ -1,4 +1,4 @@
-//! mTLS client identity loading. Phase 58.3.
+//! mTLS client identity loading.
 //!
 //! Translates `.npmrc`-derived `(certfile, keyfile)` paths into a
 //! [`reqwest::Identity`] that the per-origin client builder can attach
@@ -22,9 +22,9 @@
 //!
 //! ## What this module does NOT do
 //!
-//! - Build the per-origin client. That's [`crate::client`]'s job
-//!   (Phase 58.3 / T3); this module is the loader seam.
-//! - Validate per-origin XOR pairs. The caller in T3 checks
+//! - Build the per-origin client. That's [`crate::client`]'s job;
+//!   this module is the loader seam.
+//! - Validate per-origin XOR pairs. The caller checks
 //!   `cert.is_some() == key.is_some()` for the specific origin
 //!   being built; this module assumes both are present.
 //! - Cache identities. Identities are reusable but the loader is
@@ -45,7 +45,7 @@ use crate::npmrc::TaggedPath;
 /// Env var consulted before any TTY prompt for a keyfile passphrase.
 /// Single-value for v1 (one passphrase shared across all encrypted
 /// keys this invocation needs). Multi-key invocations with distinct
-/// passphrases are out of v1 scope — see Phase 58.3 plan doc.
+/// passphrases are out of v1 scope.
 pub const KEY_PASSPHRASE_ENV: &str = "LPM_KEY_PASSPHRASE";
 
 /// PEM marker for encrypted PKCS#8 keys. Matches what `openssl
@@ -211,13 +211,10 @@ impl PassphraseCache {
     /// blocks on the lock, then sees the freshly-cached value and
     /// returns it without re-computing.
     ///
-    /// Phase 58.3 — closes GPT's post-carry-forward finding that the
-    /// previous `get` then (unlocked) compute then `insert` shape
-    /// could double-prompt under concurrent T3 lazy builds for the
-    /// same encrypted keyfile. Holding the lock through `compute` is
-    /// fine for the prompt-or-env-read tier (TTY input is sequential
-    /// by nature; concurrent prompts on a single TTY are unusable
-    /// anyway).
+    /// Holds the lock through `compute` so concurrent callers for the
+    /// same encrypted keyfile cannot double-prompt. TTY input is
+    /// sequential by nature; concurrent prompts on a single TTY are
+    /// unusable anyway.
     ///
     /// Errors are NOT cached. A failed prompt (wrong passphrase
     /// typed, TTY EOF, etc.) leaves the slot empty so the next
@@ -248,8 +245,8 @@ impl PassphraseCache {
 /// the cert chain PEM bytes used to build it.
 ///
 /// The `cert_pem` field is exposed so callers can hash it for
-/// principal-aware cache fingerprinting (Phase 58.3 T3.5). Hashing
-/// here avoids re-reading the cert file on every cache-key
+/// principal-aware cache fingerprinting. Hashing here avoids
+/// re-reading the cert file on every cache-key
 /// composition. Private keys are deliberately NOT exposed —
 /// fingerprinting hashes the cert, not the key, since that's the
 /// public-facing identity and a key in a hash chain is one
@@ -279,10 +276,9 @@ pub fn load_identity(
     key: &TaggedPath,
     passphrase: &dyn PassphraseProvider,
 ) -> Result<LoadedIdentity, LpmError> {
-    // Phase 58.3 GPT pre-T3 finding — resolve relative paths against
-    // the source `.npmrc`'s parent dir, NOT `${PWD}`. `TaggedPath::resolve`
-    // returns the original path unchanged for absolute inputs and for
-    // tests whose source is a non-file label.
+    // Resolve relative paths against the source `.npmrc`'s parent dir, not
+    // `${PWD}`. `TaggedPath::resolve` returns the original path unchanged for
+    // absolute inputs and for tests whose source is a non-file label.
     let cert_path = cert.resolve();
     let key_path = key.resolve();
     let cert_bytes = std::fs::read(&cert_path).map_err(|e| {
@@ -557,11 +553,10 @@ mod tests {
         load_identity(&cert, &key, &pp).expect("identity ok");
     }
 
-    /// Phase 58.3 GPT pre-T3 finding: relative paths in `~/.npmrc`
-    /// must resolve against the `.npmrc`'s directory, not `${PWD}`.
-    /// Tagged paths plumbed via `parse_layer_with_source_dir` should
-    /// land at the right file regardless of where the install is run
-    /// from.
+    /// Relative paths in `~/.npmrc` must resolve against the `.npmrc`'s
+    /// directory, not `${PWD}`. Tagged paths plumbed via
+    /// `parse_layer_with_source_dir` must land at the right file
+    /// regardless of where the install is run from.
     #[test]
     fn relative_certfile_keyfile_resolve_against_source_dir() {
         let (cert_pem, key_pem) = gen_rsa_pair();
@@ -619,7 +614,6 @@ mod tests {
         load_identity(&cert, &key, &pp).expect("absolute paths win over source_dir");
     }
 
-    /// Phase 58.3 — provider-lifetime contract from GPT pre-T3 audit.
     /// One `EnvThenTtyPassphrase` instance shared across multiple
     /// `for_keyfile` calls must memoize via the inner cache. A fresh
     /// instance per call would defeat the cache and reprompt.
@@ -660,9 +654,8 @@ mod tests {
 
     #[test]
     fn pkcs12_certfile_returns_standalone_cited_error_with_recipe() {
-        // Finding 3 (GPT pre-T3 audit): when certfile is PKCS#12 but
-        // keyfile is PEM, the error must include the conversion
-        // recipe inline — referring the user to a "keyfile error"
+        // When certfile is PKCS#12 but keyfile is PEM, the error must include
+        // the conversion recipe inline — referring the user to a "keyfile error"
         // that doesn't exist is self-contradictory.
         let dir = TempDir::new().unwrap();
         let (_, key_pem) = gen_rsa_pair();
@@ -872,8 +865,8 @@ mod tests {
 
     #[test]
     fn passphrase_cache_get_or_compute_does_not_cache_errors() {
-        // Phase 58.3 — failed prompts (wrong passphrase, TTY EOF)
-        // must leave the slot empty so the next caller can retry.
+        // Failed prompts (wrong passphrase, TTY EOF) must leave the slot empty
+        // so the next caller can retry.
         let cache = PassphraseCache::default();
         let path = PathBuf::from("/tmp/transient-fail.pem");
         let first =
@@ -889,9 +882,6 @@ mod tests {
         assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 
-    /// Phase 58.3 — pin the single-flight contract that closes
-    /// GPT's post-carry-forward finding.
-    ///
     /// 16 concurrent threads racing on the same canonical key MUST
     /// see the compute closure run AT MOST ONCE. Without
     /// `get_or_compute` holding the cache lock through the closure,
@@ -955,10 +945,8 @@ mod tests {
     /// drafts had them as two separate `#[test]`s, but `cargo test` runs
     /// the file in parallel by default, and the `set_var` / `remove_var`
     /// operations on `LPM_KEY_PASSPHRASE` raced — one test would see the
-    /// other's mid-flight state and false-fail under a normal
-    /// `cargo test -p lpm-registry` (caught in GPT's pre-T3 audit).
-    /// Combining the assertions into one serially-executed test
-    /// removes the race entirely.
+    /// other's mid-flight state and false-fail. Combining the assertions
+    /// into one serially-executed test removes the race entirely.
     #[test]
     fn env_then_tty_provider_env_tiers() {
         // Hold the env guard for the full body — `cargo test` may have

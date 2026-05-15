@@ -1,11 +1,8 @@
 //! Registry HTTP client.
 //!
 //! Handles communication with the LPM registry at `lpm.dev`.
-//!
-//! Phase 4 features (publish, token, OIDC) — implemented in publish.rs, npmrc.rs, oidc.rs.
-//! Phase 18: ETag conditional requests + MessagePack binary cache (replacing JSON).
-//! Remaining: 2FA header injection, batched metadata.
-//! ETag/304 revalidation, MessagePack cache, HMAC-signed cache entries (constant-time verified).
+//! Publish, token, and OIDC operations are implemented in publish.rs, npmrc.rs, oidc.rs.
+//! Uses ETag conditional requests and MessagePack binary cache.
 
 use crate::npmrc::{OriginKey, OriginTlsOverrides, TaggedRoot, TlsOverrides};
 use crate::tls_identity::{EnvThenTtyPassphrase, PassphraseProvider, load_identity};
@@ -17,14 +14,12 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-/// Phase 35: per-request auth posture.
+/// Per-request auth posture.
 ///
 /// Every public request method on `RegistryClient` is annotated with
 /// one of these so the recovery layer (`execute_with_recovery`) can
 /// decide whether to attach a bearer at all and whether to attempt a
 /// silent refresh on 401.
-///
-/// The posture rules in §9 of the Phase 35 plan:
 ///
 /// - **AnonymousOnly**: never attach a bearer. Used for endpoints that
 ///   are universally public (npm fallback, health checks).
@@ -86,15 +81,10 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Maximum time between successful reads from the response body.
 ///
-/// **Phase 42.** Replaces the old wall-clock `.timeout(30s)` which used to
-/// kill entire requests even when bytes were still flowing. On the
-/// decision-gate fixture (~54 direct deps, 66 MB deep NDJSON response)
-/// the server legitimately takes 30 + seconds to stream the full body;
-/// the wall-clock timer fired mid-body at ~51 MB / 7 500 chunks and
-/// surfaced as `error decoding response body <- request or response
-/// body error <- operation timed out`, forcing the install to fall
-/// back to sequential resolution on every cold install above ~40
-/// roots.
+/// Replaces a wall-clock `.timeout(30s)` which killed entire requests
+/// even when bytes were still flowing. On large NDJSON responses the
+/// server can legitimately take 30+ seconds to stream the full body;
+/// a wall-clock timer fires mid-body and surfaces as a body-read error.
 ///
 /// `read_timeout` fires ONLY when no bytes arrive for the full window.
 /// Healthy streams reset the timer on each successful chunk, so a
@@ -105,35 +95,29 @@ const READ_TIMEOUT: Duration = Duration::from_secs(30);
 /// Metadata cache TTL (5 minutes).
 const METADATA_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(300);
 
-/// Phase 53 W5.2 — magic header for the manifest cache file format.
-/// Replaces the per-payload HMAC-SHA256 we used to compute on every
-/// write (~10% of `write_metadata_cache` CPU and a load-bearing tax on
-/// the runtime thread). The cache lives at `~/.lpm/cache/metadata/`
-/// inside the user's home; if an attacker can write there they own the
-/// install anyway, so signing the bytes adds no real security boundary.
-/// Bun's manifest cache uses the same trust-the-FS model
-/// (`bun-npm-manifest-cache-v0.0.7\n` magic, no HMAC) — see the
-/// Phase 53 close-out doc §5.6.
+/// Magic header for the manifest cache file format. Replaces the
+/// per-payload HMAC-SHA256 that used to run on every write. The cache
+/// lives at `~/.lpm/cache/metadata/` inside the user's home; if an
+/// attacker can write there they own the install anyway, so signing
+/// the bytes adds no real security boundary.
 ///
 /// On format change, bump the trailing version number — old cache
 /// entries fail the magic match and are silently treated as misses.
 ///
-/// **Phase 58 V2→V3 bump:** custom-registry support means a single
-/// package name can be served by multiple distinct registries (e.g.,
-/// `react` from `registry.npmjs.org` vs an internal mirror).
-/// `get_npm_metadata_from` keys per-host (`npm:<host>:<name>`); the
-/// magic bump invalidates pre-Phase-58 caches in one shot rather than
-/// letting two key formats co-exist with the same magic.
+/// V3 bump: custom-registry support means a single package name can
+/// be served by multiple distinct registries (e.g., `react` from
+/// `registry.npmjs.org` vs an internal mirror). `get_npm_metadata_from`
+/// keys per-host (`npm:<host>:<name>`); the magic bump invalidates
+/// pre-V3 caches in one shot rather than letting two key formats
+/// co-exist with the same magic.
 const METADATA_CACHE_MAGIC: &[u8] = b"LPM-MD-V3\n";
 
 /// Apply an `.npmrc`-derived credential to a request builder.
 ///
-/// Origin-match defense (Phase 58 S2): re-verifies that the auth's
-/// origin is compatible with the destination URL before attaching the
-/// `Authorization` header. A mismatch hard-fails with
-/// `LpmError::Registry` rather than silently dropping the auth or
-/// leaking the token cross-origin. Anonymous (`auth = None`) is a
-/// no-op.
+/// Re-verifies that the auth's origin is compatible with the destination
+/// URL before attaching the `Authorization` header. A mismatch hard-fails
+/// with `LpmError::Registry` rather than silently dropping the auth or
+/// leaking the token cross-origin. Anonymous (`auth = None`) is a no-op.
 ///
 /// Used by both metadata fetches (`get_npm_metadata_from`) and tarball
 /// downloads (`download_tarball_*_with_auth`) so the auth-scope
@@ -170,8 +154,7 @@ fn apply_npmrc_auth(
 }
 
 /// Compute a stable opaque fingerprint for a `RegistryAuth` credential
-/// PLUS the TLS client identity's cert PEM (Phase 58 day-3.5 + Phase
-/// 58.3 T3.5).
+/// PLUS the TLS client identity's cert PEM.
 ///
 /// **Combinatorics:** the cache namespace is `(auth, identity)`-pair
 /// scoped, not auth-only. Same URL + same auth + DIFFERENT identity
@@ -263,8 +246,8 @@ struct CacheContent {
 
 /// Observability for [`RegistryClient::parallel_fetch_npm_manifests`].
 ///
-/// Surfaced up to the Phase 49 BFS walker so `timing.resolve.streaming_bfs`
-/// can report adaptive-backoff events without the walker interpreting
+/// Surfaced to the BFS walker so `timing.resolve.streaming_bfs` can
+/// report adaptive-backoff events without the walker interpreting
 /// individual per-request errors.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct FanOutStats {
@@ -279,10 +262,10 @@ pub struct FanOutStats {
 
 /// Client for communicating with the LPM registry.
 pub struct RegistryClient {
-    /// Phase 58.3 — bundle of HTTP clients keyed by origin. Default
-    /// client + eager + lazy per-origin clients all live behind one
-    /// `Arc<HttpClients>` so cloning the registry client is one
-    /// ref-bump and the per-origin pool fragmentation is contained.
+    /// Bundle of HTTP clients keyed by origin. Default client + eager +
+    /// lazy per-origin clients all live behind one `Arc<HttpClients>` so
+    /// cloning the registry client is one ref-bump and per-origin pool
+    /// fragmentation is contained.
     http: Arc<HttpClients>,
     /// Base URL of the LPM registry (default: https://lpm.dev).
     base_url: String,
@@ -293,16 +276,16 @@ pub struct RegistryClient {
     token: Option<SecretString>,
     /// Path to the metadata cache directory. None disables caching.
     cache_dir: Option<std::path::PathBuf>,
-    /// Phase 53 W5.1 — handles for in-flight `spawn_blocking` cache
-    /// writes. Production callers never observe this (the writes are
-    /// fire-and-forget and the handles drop on `RegistryClient::drop`).
-    /// Tests call [`Self::flush_pending_cache_writes`] to deterministically
-    /// await all pending writes before reading the cache back. The push
-    /// is one `Mutex` acquire + `Vec` push per write — sub-µs vs the
-    /// ms-scale `std::fs::write` it tracks.
+    /// Handles for in-flight `spawn_blocking` cache writes. Production
+    /// callers never observe this (the writes are fire-and-forget and the
+    /// handles drop on `RegistryClient::drop`). Tests call
+    /// [`Self::flush_pending_cache_writes`] to deterministically await all
+    /// pending writes before reading the cache back. The push is one
+    /// `Mutex` acquire + `Vec` push per write — sub-µs vs the ms-scale
+    /// `std::fs::write` it tracks.
     pending_cache_writes: Arc<std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>>,
-    /// Phase 53 W5.1 — when set, `write_metadata_cache` runs the file
-    /// write inline on the calling thread instead of spawning it onto
+    /// When set, `write_metadata_cache` runs the file write inline on the
+    /// calling thread instead of spawning it onto
     /// `tokio::task::spawn_blocking`. Used by mock-server tests where
     /// "first fetch caches; second fetch is a hit" is the unit being
     /// verified — those tests would otherwise race the spawned write
@@ -310,14 +293,10 @@ pub struct RegistryClient {
     synchronous_cache_writes: bool,
     /// Allow insecure HTTP connections to non-localhost registries (--insecure flag).
     allow_insecure: bool,
-    /// Phase 35: shared `SessionManager` for lazy-refresh-aware request
-    /// auth. Stored here so that the per-method `AuthPosture` plumbing
-    /// in Phase 35 Step 4 can fetch the current token / trigger silent
-    /// refresh without the caller threading a session in.
-    ///
-    /// Step 3 wires this in but request methods do not consult it yet —
-    /// they keep using `self.token`. Step 4 layers on the posture-aware
-    /// dispatch and the 401 → refresh → retry path.
+    /// Shared `SessionManager` for lazy-refresh-aware request auth.
+    /// Stored here so that per-method `AuthPosture` plumbing can fetch
+    /// the current token / trigger silent refresh without the caller
+    /// threading a session in.
     session: Option<Arc<SessionManager>>,
     /// Precomputed ASCII-serialized origin of `base_url`.
     /// Avoids re-parsing + re-allocating on every `is_configured_origin` call.
@@ -327,11 +306,11 @@ pub struct RegistryClient {
 }
 
 // ============================================================================
-// Phase 58.3 — Per-origin HTTP client cache
+// Per-origin HTTP client cache
 // ============================================================================
 
 /// A cached HTTP client paired with an opaque fingerprint of the
-/// TLS identity it was built with (Phase 58.3 T3.5).
+/// TLS identity it was built with.
 ///
 /// `identity_fp` is `Some(<16-hex>)` when the client uses a client
 /// certificate (per-origin or global) and `None` for clients with no
@@ -381,27 +360,25 @@ pub struct HttpClients {
     /// builds (eager + lazy). The inner `PassphraseCache` memoizes
     /// across calls; a fresh provider per build would defeat it.
     passphrase: Arc<dyn PassphraseProvider>,
-    /// Phase 58.3 T3.5 fix — pre-computed identity fingerprints for
-    /// every origin that has per-origin TLS configured. Populated
-    /// at `with_tls_overrides_for` time by reading + hashing each
-    /// origin's certfile (or inheriting the global identity_fp when
-    /// the origin has per-origin cafile but no own identity).
+    /// Pre-computed identity fingerprints for every origin that has
+    /// per-origin TLS configured. Populated at `with_tls_overrides_for`
+    /// time by reading + hashing each origin's certfile (or inheriting
+    /// the global identity_fp when the origin has per-origin cafile but
+    /// no own identity).
     ///
-    /// **Why this exists.** Cache-key composition is sync and runs
-    /// BEFORE any actual dispatch. For lazy-target origins (those
-    /// configured in `tls.per_origin` but not in the eager set), the
-    /// lazy client hasn't been built yet — so consulting the lazy
-    /// map at cache-key-compose time misses, and the key would be
-    /// computed from the default client's identity_fp instead. That
-    /// means a rotated per-origin cert wouldn't change the cache
-    /// namespace, leaking entries across principals on lazy origins.
-    /// Pre-computation keeps `identity_fp_for_url` sync while
-    /// honoring the actual identity each origin will use at request
-    /// time.
+    /// Cache-key composition is sync and runs BEFORE any actual dispatch.
+    /// For lazy-target origins (those configured in `tls.per_origin` but
+    /// not in the eager set), the lazy client hasn't been built yet — so
+    /// consulting the lazy map at cache-key-compose time misses, and the
+    /// key would fall back to the default client's identity_fp. That means
+    /// a rotated per-origin cert wouldn't change the cache namespace,
+    /// leaking entries across principals on lazy origins. Pre-computation
+    /// keeps `identity_fp_for_url` sync while honoring the actual identity
+    /// each origin will use at request time.
     ///
-    /// Cert read failures here are non-fatal — the entry stays
-    /// absent and the lazy build will surface a cited error if/when
-    /// the origin is actually reached.
+    /// Cert read failures here are non-fatal — the entry stays absent and
+    /// the lazy build will surface a cited error if/when the origin is
+    /// actually reached.
     per_origin_identity_fps: HashMap<OriginKey, Arc<str>>,
 }
 
@@ -418,19 +395,19 @@ impl std::fmt::Debug for HttpClients {
 }
 
 impl HttpClients {
-    /// Phase 58.3 — render a one-line summary of TLS overrides
-    /// actually applied this invocation. Returns `None` when nothing
-    /// is in effect (default-only, no global identity, no eager
-    /// per-origin clients) so callers can suppress the line cleanly.
+    /// Render a one-line summary of TLS overrides actually applied this
+    /// invocation. Returns `None` when nothing is in effect (default-only,
+    /// no global identity, no eager per-origin clients) so callers can
+    /// suppress the line cleanly.
     ///
     /// **Effective-only.** Configured-but-unreached per-origin TLS
     /// (entries in `tls_overrides.per_origin` for origins NOT in the
-    /// eager set) is deliberately excluded — it might still fire
-    /// later via the lazy path, and reporting it eagerly would
-    /// imply a CI failure precondition that doesn't actually exist.
-    /// The `strict-ssl=false` security warning is rendered separately
-    /// by `install.rs` / `add.rs`; this summary covers extra roots,
-    /// mTLS identity, and per-origin TLS only.
+    /// eager set) is deliberately excluded — it might still fire later
+    /// via the lazy path, and reporting it eagerly would imply a failure
+    /// precondition that doesn't actually exist. The `strict-ssl=false`
+    /// security warning is rendered separately by `install.rs` / `add.rs`;
+    /// this summary covers extra roots, mTLS identity, and per-origin TLS
+    /// only.
     pub fn render_effective_tls_summary(&self) -> Option<String> {
         let global_roots = self.tls_overrides.extra_roots.len();
         let global_identity = self.tls_overrides.identity_certfile.is_some()
@@ -503,13 +480,13 @@ impl HttpClients {
         &self.cached_for_url_no_build(url).client
     }
 
-    /// Phase 58.3 T3.5 — identity fingerprint for the client that
-    /// would handle a request to `url`, consulting eager + the
-    /// pre-computed lazy-target map + default fallback.
+    /// Identity fingerprint for the client that would handle a request
+    /// to `url`, consulting eager + the pre-computed lazy-target map +
+    /// default fallback.
     ///
     /// Used by metadata cache-key composition: the fingerprint is
-    /// included in the namespace so a re-issued client cert
-    /// invalidates cached entries cleanly.
+    /// included in the namespace so a re-issued client cert invalidates
+    /// cached entries cleanly.
     ///
     /// Resolution order:
     /// 1. **Eager hit** (port-exact then port-none) — return that
@@ -517,15 +494,13 @@ impl HttpClients {
     /// 2. **Pre-computed lazy-target fp** (port-exact then port-none) —
     ///    same fallback rule. The map was populated at
     ///    `with_tls_overrides_for` time by hashing every configured
-    ///    per-origin certfile (deferred-read, like the rest of
-    ///    Phase 58.3, but the read-and-hash is non-fatal). Origins
-    ///    with per-origin cafile only (no own identity) inherit the
-    ///    global identity_fp at populate time.
+    ///    per-origin certfile (read-and-hash is non-fatal). Origins with
+    ///    per-origin cafile only (no own identity) inherit the global
+    ///    identity_fp at populate time.
     /// 3. **Default** — the global identity_fp on the default client.
     ///
-    /// Sync. The pre-computation step is what closes GPT's HIGH
-    /// finding from the post-T4 audit: lazy-only origins were
-    /// previously identity-blind because cache-key composition runs
+    /// Sync. Pre-computation keeps this sync-safe: lazy-only origins
+    /// were previously identity-blind because cache-key composition runs
     /// BEFORE the actual lazy dispatch.
     pub fn identity_fp_for_url(&self, url: &str) -> Option<&str> {
         let Some(origin) = OriginKey::from_request_url(url) else {
@@ -626,12 +601,11 @@ impl HttpClients {
 ///
 /// - **Trust roots**: global `extra_roots` PLUS this origin's
 ///   `cafiles` (additive — both are valid). Per-origin `cafile=` is
-///   read here (deferred-read per Phase 58.3 Δ1 scoping); IO failures
-///   surface with cited source/line.
+///   read here; IO failures surface with cited source/line.
 /// - **Identity**: per-origin `(certfile, keyfile)` REPLACES the
 ///   global identity for this origin. Per-origin XOR validation fires
-///   here (Δ2 scoping), so a half-configured per-origin identity
-///   only fails the install if THIS origin is built.
+///   here, so a half-configured per-origin identity only fails the
+///   install if THIS origin is actually built.
 /// - **strict-ssl**: global only. Per-origin strict-ssl is not
 ///   supported in v1; the parser warns if used per-origin.
 ///
@@ -644,7 +618,7 @@ fn build_per_origin_http_client(
     origin: &OriginKey,
     passphrase: &dyn PassphraseProvider,
 ) -> Result<CachedClient, LpmError> {
-    // Step 1 — compose extra roots: global + per-origin (additive).
+    // Compose extra roots: global + per-origin (additive).
     // Per-origin cafiles are deferred-read; do the IO here.
     let mut all_roots: Vec<TaggedRoot> = global.extra_roots.clone();
     for cafile in &per_origin.cafiles {
@@ -672,8 +646,8 @@ fn build_per_origin_http_client(
         });
     }
 
-    // Step 2 — resolve identity. Per-origin replaces global; per-origin
-    // XOR validation is Δ2-scoped (only fatal when this origin is built).
+    // Resolve identity. Per-origin replaces global; per-origin
+    // XOR validation fires here (only fatal when this origin is built).
     // The `LoadedIdentity` carries cert PEM bytes alongside the
     // `reqwest::Identity` so we can fingerprint without re-reading.
     let loaded: Option<crate::tls_identity::LoadedIdentity> = match (
@@ -706,12 +680,12 @@ fn build_per_origin_http_client(
         },
     };
 
-    // Hash the cert PEM once (Phase 58.3 T3.5) so cache-key composition
-    // doesn't re-read or re-hash on every request.
+    // Hash the cert PEM once so cache-key composition doesn't re-read
+    // or re-hash on every request.
     let identity_fp = loaded.as_ref().map(|l| cert_pem_fingerprint(&l.cert_pem));
     let identity = loaded.map(|l| l.identity);
 
-    // Step 3 — synthesize a per-origin TlsOverrides view: combined
+    // Synthesize a per-origin TlsOverrides view: combined
     // roots + global strict_ssl. Per-origin map cleared (this is a
     // single-origin client — no further dispatch lives below it).
     let synthetic = TlsOverrides {
@@ -758,44 +732,26 @@ impl RegistryClient {
             .ok()
     }
 
-    /// Build the underlying `reqwest::Client` with the Phase-42 timeout
-    /// configuration: connect-phase cap + per-read idle cap, no
-    /// whole-request wall-clock timeout.
+    /// Build the underlying `reqwest::Client` with the configured timeout:
+    /// connect-phase cap + per-read idle cap, no whole-request wall-clock
+    /// timeout.
     ///
     /// Factored out of `new()` so tests can construct clients with short
     /// timeouts against a local fake server, keeping prod defaults
     /// uniform and easy to update in one place.
     ///
-    /// **Phase 55 W1 — h1-pool transport probe (REFUTED).** When
-    /// `LPM_HTTP=h1-pool` is set, the client is built with
-    /// `http1_only()` + a 64-connection idle pool (matching bun's
-    /// `default_max_simultaneous_requests_for_bun_install`) + TCP
-    /// keepalive. The hypothesis was that bun's 64-socket-h1.1
-    /// architecture bypasses some per-h2-connection flow-control
-    /// throttle.
-    ///
-    /// **Empirical bench refuted this on `bench/fixture-large` (n=30
-    /// cold-equal-footing, stream-greedy):**
-    ///
-    ///   h2-default   median=4273 ms  stdev=254 ms  (b5056a1 baseline)
-    ///   h1-pool-64   median=4766 ms  stdev=430 ms  (-11.5 %, t=-4.57)
-    ///   h1-pool-256  median=4651 ms  stdev=405 ms  ( -8.9 %, t=-3.46)
-    ///
-    /// Both h1-pool variants are **statistically significantly slower
-    /// than h2-default**. The TLS handshake overhead per new
-    /// connection + TCP slow-start tax outweigh any per-connection
-    /// flow-control benefit at this scale. Default stays HTTP/2.
-    /// Bun's speed advantage is NOT in HTTP/1 vs HTTP/2 transport.
-    /// Kept as opt-in so future debugging on different network
-    /// regimes (CDN routing changes, server-side h2 throttle policy
-    /// changes) can A/B without rewriting this branch.
+    /// `LPM_HTTP=h1-pool` builds the client with `http1_only()` + a
+    /// 64-connection idle pool + TCP keepalive. Benchmarks showed this is
+    /// statistically significantly slower than HTTP/2 default (h1-pool-64:
+    /// −11.5%, h1-pool-256: −8.9% on n=30 cold installs). Kept as an
+    /// opt-in for network-regime debugging without rewriting this branch.
     fn build_http_client(connect_timeout: Duration, read_timeout: Duration) -> reqwest::Client {
         Self::build_http_client_with_tls(connect_timeout, read_timeout, &TlsOverrides::default())
             .expect("default TLS config never fails to build")
     }
 
-    /// Phase 58.1 — build the underlying `reqwest::Client` with optional
-    /// `.npmrc`-derived TLS overrides applied:
+    /// Build the underlying `reqwest::Client` with optional `.npmrc`-derived
+    /// TLS overrides applied:
     ///
     /// - `extra_roots` from `cafile=` / `ca=` are attached via
     ///   [`reqwest::ClientBuilder::add_root_certificate`]. They are
@@ -817,11 +773,11 @@ impl RegistryClient {
         read_timeout: Duration,
         tls: &TlsOverrides,
     ) -> Result<reqwest::Client, LpmError> {
-        // Resolve the global identity (Phase 58.3) inline so existing
-        // call sites that don't yet thread per-origin TLS through still
-        // pick up `certfile=`/`keyfile=` from `~/.npmrc` correctly.
-        // The XOR contract is enforced at `NpmrcConfig::finalize`, so
-        // by the time we get here, either both are present or neither.
+        // Resolve the global identity inline so call sites that don't
+        // thread per-origin TLS still pick up `certfile=`/`keyfile=` from
+        // `~/.npmrc` correctly. The XOR contract is enforced at
+        // `NpmrcConfig::finalize`, so by the time we get here, either both
+        // are present or neither.
         let global_identity = match (
             tls.identity_certfile.as_ref(),
             tls.identity_keyfile.as_ref(),
@@ -840,8 +796,8 @@ impl RegistryClient {
         )
     }
 
-    /// Phase 58.3 — variant of `build_http_client_with_tls` that takes
-    /// a pre-resolved [`reqwest::Identity`].
+    /// Variant of `build_http_client_with_tls` that takes a pre-resolved
+    /// [`reqwest::Identity`].
     ///
     /// Used by the per-origin client builder (`build_per_origin_http_client`)
     /// which resolves the effective identity for each origin (per-origin
@@ -933,39 +889,36 @@ impl RegistryClient {
     }
 
     /// Get the configured direct-npm registry URL (default
-    /// `https://registry.npmjs.org`). Phase 58.3 — exposed so
-    /// install/add can pass it to
-    /// [`crate::route::RouteTable::effective_registry_origins`]
-    /// when computing the request-aware eager set.
+    /// `https://registry.npmjs.org`). Exposed so install/add can pass it
+    /// to [`crate::route::RouteTable::effective_registry_origins`] when
+    /// computing the request-aware eager set.
     pub fn npm_registry_url(&self) -> &str {
         &self.npm_registry_url
     }
 
-    /// Phase 58.3 — render a one-line install-start summary of TLS
-    /// overrides actually applied this invocation. Delegates to
-    /// [`HttpClients::render_effective_tls_summary`]; see that
-    /// method's doc for the effective-only rationale.
+    /// Render a one-line install-start summary of TLS overrides actually
+    /// applied this invocation. Delegates to
+    /// [`HttpClients::render_effective_tls_summary`]; see that method's
+    /// doc for the effective-only rationale.
     pub fn render_effective_tls_summary(&self) -> Option<String> {
         self.http.render_effective_tls_summary()
     }
 
-    /// Phase 58.3 — read access to the underlying [`HttpClients`]
-    /// bundle. Exposed primarily for integration tests that need
-    /// pointer-identity assertions on the dispatch path
-    /// (`for_url_no_build`'s borrow). Production code should use
-    /// the higher-level request methods on [`RegistryClient`]; this
-    /// accessor is intentionally read-only.
+    /// Read access to the underlying [`HttpClients`] bundle. Exposed
+    /// primarily for integration tests that need pointer-identity
+    /// assertions on the dispatch path (`for_url_no_build`'s borrow).
+    /// Production code should use the higher-level request methods on
+    /// [`RegistryClient`]; this accessor is intentionally read-only.
     pub fn http(&self) -> &HttpClients {
         &self.http
     }
 
-    /// Phase 43 — returns true if the URL's origin matches one of
-    /// the origins this client is configured to talk to (the LPM
-    /// `base_url` or the npm `npm_registry_url`). Used by
-    /// [`evaluate_cached_url`] as the origin gate on lockfile-stored
-    /// tarball URLs: a rebased URL from an older `LPM_REGISTRY_URL`
-    /// mismatches and falls through to on-demand lookup against the
-    /// current mirror.
+    /// Returns true if the URL's origin matches one of the origins this
+    /// client is configured to talk to (the LPM `base_url` or the npm
+    /// `npm_registry_url`). Used by [`evaluate_cached_url`] as the origin
+    /// gate on lockfile-stored tarball URLs: a rebased URL from an older
+    /// `LPM_REGISTRY_URL` mismatches and falls through to on-demand lookup
+    /// against the current mirror.
     ///
     /// Opaque origins (`file://`, `data:`, etc.) never match because
     /// `base_url` / `npm_registry_url` are always tuple origins
@@ -990,12 +943,9 @@ impl RegistryClient {
 
     /// Override the npm registry URL (default: `https://registry.npmjs.org`).
     ///
-    /// Cross-crate test use + future custom-mirror support. Phase 49's
-    /// walker tests depend on this to point a mocked registry at the
-    /// walker via `UpstreamRoute::NpmDirect` without round-tripping the
-    /// real npmjs. The W4 memory flagged this setter as test-only, but
-    /// the concern there was lockfile multi-registry correctness, not
-    /// setter visibility — promoting to `pub` is orthogonal.
+    /// Used by cross-crate tests to point a mocked registry at the walker
+    /// via `UpstreamRoute::NpmDirect` without round-tripping the real
+    /// npmjs.
     pub fn with_npm_registry_url(mut self, url: impl Into<String>) -> Self {
         self.npm_registry_url = url.into();
         self.npm_registry_url_origin = Self::url_origin(&self.npm_registry_url);
@@ -1026,18 +976,17 @@ impl RegistryClient {
         self
     }
 
-    /// Phase 58.1 — apply `.npmrc`-derived TLS overrides to this client.
+    /// Apply `.npmrc`-derived TLS overrides to this client.
     ///
     /// Rebuilds the inner default `reqwest::Client` with `cafile`/`ca`
-    /// extra roots attached, `strict-ssl=false` honored, and (Phase
-    /// 58.3) global `certfile`/`keyfile` mTLS identity attached.
+    /// extra roots attached, `strict-ssl=false` honored, and global
+    /// `certfile`/`keyfile` mTLS identity attached.
     ///
-    /// Phase 58.3 layered: this builds only the DEFAULT client. To
-    /// also pre-build per-origin clients for the origins this
-    /// invocation provably reaches, use [`Self::with_tls_overrides_for`]
-    /// (the route-table-aware variant) instead. `install.rs` and
-    /// `add.rs` will call `_for` once T4 is wired; `with_tls_overrides`
-    /// remains for callers that don't need per-origin pre-building.
+    /// Builds only the DEFAULT client. To also pre-build per-origin clients
+    /// for the origins this invocation provably reaches, use
+    /// [`Self::with_tls_overrides_for`] (the route-table-aware variant)
+    /// instead. `with_tls_overrides` remains for callers that don't need
+    /// per-origin pre-building.
     ///
     /// Fast path: with `TlsOverrides::default()` (no `.npmrc`, or one
     /// that says nothing about TLS), this returns `self` unchanged.
@@ -1049,23 +998,21 @@ impl RegistryClient {
         self.with_tls_overrides_for(tls, &[])
     }
 
-    /// Phase 58.3 — apply `.npmrc`-derived TLS overrides AND eagerly
-    /// build per-origin clients for the supplied set of origins.
+    /// Apply `.npmrc`-derived TLS overrides AND eagerly build per-origin
+    /// clients for the supplied set of origins.
     ///
-    /// `eager_origins` is the request-aware effective-origin set
-    /// computed by T4 from the top-level package request + the route
-    /// table. Origins not in the set, but with per-origin TLS
-    /// configured, build lazily on first use via
-    /// [`HttpClients::for_url`].
+    /// `eager_origins` is the request-aware effective-origin set computed
+    /// from the top-level package request + the route table. Origins not
+    /// in the set, but with per-origin TLS configured, build lazily on
+    /// first use via [`HttpClients::for_url`].
     ///
-    /// **Eager-build failure semantics.** If any of the supplied
-    /// origins has per-origin TLS configured AND its identity load
-    /// (encrypted PKCS#8 decryption, file IO, etc.) fails, this
-    /// method returns `Err(LpmError::Cert(...))` with the cited
-    /// source/line. Origins NOT in `eager_origins` (transitive
-    /// scopes, tarball CDNs) are not touched here — half-configured
-    /// per-origin TLS for unreached origins does not abort the
-    /// install, per Phase 58.3 Δ2 scoping.
+    /// **Eager-build failure semantics.** If any of the supplied origins
+    /// has per-origin TLS configured AND its identity load (encrypted
+    /// PKCS#8 decryption, file IO, etc.) fails, this method returns
+    /// `Err(LpmError::Cert(...))` with the cited source/line. Origins NOT
+    /// in `eager_origins` (transitive scopes, tarball CDNs) are not touched
+    /// here — half-configured per-origin TLS for unreached origins does not
+    /// abort the install.
     pub fn with_tls_overrides_for(
         mut self,
         tls: &TlsOverrides,
@@ -1086,10 +1033,10 @@ impl RegistryClient {
 
         // Resolve the GLOBAL identity (if any) once here so we can
         // both attach it to the default client AND fingerprint the
-        // cert PEM for cache-key composition. Phase 58.3 T3.5: a
-        // default-routed URL still carries the global identity in its
-        // cache namespace, so re-issued global certs invalidate
-        // cleanly. Global XOR was enforced at finalize.
+        // cert PEM for cache-key composition. A default-routed URL
+        // carries the global identity in its cache namespace, so
+        // re-issued global certs invalidate cleanly. Global XOR was
+        // enforced at finalize.
         let global_loaded = match (
             tls.identity_certfile.as_ref(),
             tls.identity_keyfile.as_ref(),
@@ -1111,9 +1058,8 @@ impl RegistryClient {
             client: default_reqwest_client,
             identity_fp: default_identity_fp,
         };
-        // Eager per-origin builds — only for origins in the supplied
-        // set that ALSO have per-origin TLS configured. Δ1 narrows
-        // the set further at the data layer.
+        // Eager per-origin builds — only for origins in the supplied set
+        // that ALSO have per-origin TLS configured.
         let mut eager_map = HashMap::new();
         for origin in eager_origins {
             // Look up per-origin TLS using the same (host, Some(port))
@@ -1133,15 +1079,14 @@ impl RegistryClient {
                 build_per_origin_http_client(tls, per_origin_tls, origin, passphrase.as_ref())?;
             eager_map.insert(origin.clone(), cached);
         }
-        // Phase 58.3 T3.5 fix — pre-compute identity fingerprints
-        // for every configured per-origin TLS entry so cache-key
-        // composition (sync, runs BEFORE lazy dispatch) can answer
-        // correctly for lazy-target origins. Origins with their own
-        // certfile: hash that cert. Origins with per-origin cafile
-        // but no own identity: inherit the global identity_fp.
-        // Cert read failures here are non-fatal — the entry stays
-        // absent and the lazy build will surface a cited error if
-        // and when the origin is actually reached.
+        // Pre-compute identity fingerprints for every configured per-origin
+        // TLS entry so cache-key composition (sync, runs BEFORE lazy
+        // dispatch) can answer correctly for lazy-target origins. Origins
+        // with their own certfile: hash that cert. Origins with per-origin
+        // cafile but no own identity: inherit the global identity_fp.
+        // Cert read failures here are non-fatal — the entry stays absent
+        // and the lazy build will surface a cited error if and when the
+        // origin is actually reached.
         let mut per_origin_identity_fps: HashMap<OriginKey, Arc<str>> = HashMap::new();
         for (origin, per_origin) in &tls.per_origin {
             let fp = if let Some(cert) = &per_origin.certfile {
@@ -1215,8 +1160,8 @@ impl RegistryClient {
     ///
     /// Shared by all three tarball download paths so the scheme gate
     /// stays symmetric across in-memory, streaming, and file-spool
-    /// variants. The Phase 43 [`evaluate_cached_url`] gate mirrors
-    /// this same predicate set on the lockfile-read path.
+    /// variants. The [`evaluate_cached_url`] gate mirrors this same
+    /// predicate set on the lockfile-read path.
     fn check_tarball_url_scheme(&self, url: &str) -> Result<(), LpmError> {
         let allowed =
             is_https_url(url) || is_localhost_url(url) || (self.allow_insecure && is_http_url(url));
@@ -1238,19 +1183,17 @@ impl RegistryClient {
         self
     }
 
-    /// Phase 35: attach the shared `SessionManager` so request methods
-    /// can fetch a token / trigger silent refresh on demand. Idempotent
-    /// — subsequent calls replace the prior session reference. Step 3
-    /// only stores this; Step 4 makes request methods consult it.
+    /// Attach the shared `SessionManager` so request methods can fetch a
+    /// token / trigger silent refresh on demand. Idempotent — subsequent
+    /// calls replace the prior session reference.
     pub fn with_session(mut self, session: Arc<SessionManager>) -> Self {
         self.session = Some(session);
         self
     }
 
-    /// Phase 35: read access to the attached session (for callers that
-    /// need to consult source/posture without going through request
-    /// methods — e.g., the `tunnel` command checks this before
-    /// connecting).
+    /// Read access to the attached session (for callers that need to
+    /// consult source/posture without going through request methods —
+    /// e.g., the `tunnel` command checks this before connecting).
     pub fn session(&self) -> Option<&Arc<SessionManager>> {
         self.session.as_ref()
     }
@@ -1280,9 +1223,9 @@ impl RegistryClient {
     /// inline on the calling thread instead of spawning it onto
     /// `tokio::task::spawn_blocking`. See the field doc on
     /// `synchronous_cache_writes` for the test motivation. Production
-    /// MUST NOT call this — losing the spawn_blocking is the entire
-    /// W5.1 win. `#[cfg(test)]`-gated so the method (and the
-    /// otherwise-unused-in-prod field) doesn't trip dead-code warnings.
+    /// MUST NOT call this — losing the spawn_blocking is intentional.
+    /// `#[cfg(test)]`-gated so the method (and the otherwise-unused-in-prod
+    /// field) doesn't trip dead-code warnings.
     #[cfg(test)]
     pub(crate) fn with_synchronous_cache_writes(mut self, sync: bool) -> Self {
         self.synchronous_cache_writes = sync;
@@ -1326,11 +1269,10 @@ impl RegistryClient {
         let url = format!("{}/api/registry/batch-metadata", self.base_url);
         let body = serde_json::json!({ "packages": package_names, "deep": deep });
 
-        // Phase 40 P3a — wall-clock the entire RPC (request + parse).
-        // Metadata fetches dominate `resolve_ms` on cold installs; the
-        // timer feeds `crate::timing::record_rpc` so the resolver can
-        // surface the bound in `--json` as
-        // `timing.resolve.metadata_rpc_ms`.
+        // Wall-clock the entire RPC (request + parse). Metadata fetches
+        // dominate `resolve_ms` on cold installs; the timer feeds
+        // `crate::timing::record_rpc` so the resolver can surface the
+        // bound in `--json` as `timing.resolve.metadata_rpc_ms`.
         let rpc_start = std::time::Instant::now();
 
         // Posture: AuthRequired. Batch metadata may include `@lpm.dev`
@@ -1375,46 +1317,29 @@ impl RegistryClient {
 
     /// Parse an NDJSON batch response. Each line is:
     /// `{"name":"lodash","metadata":{...}}\n`. Returns the
-    /// fully-populated map. Phase 49: the old streaming-channel
-    /// emission path (`tx: Option<Sender>`) was retired along with
-    /// `batch_metadata_deep_streaming` — the walker's own
-    /// `spec_tx.send` feeds the speculation dispatcher now.
+    /// fully-populated map.
     async fn parse_ndjson_batch(
         &self,
         response: reqwest::Response,
     ) -> Result<std::collections::HashMap<String, PackageMetadata>, LpmError> {
         let mut map = std::collections::HashMap::new();
         let mut buffer = Vec::new();
-        // **Phase 42 fix — avoid quadratic `\n` scan.** Each time reqwest
-        // gives us a fresh chunk we append to `buffer` and then look for a
-        // newline to frame the next NDJSON line. The pre-fix code scanned
-        // the whole buffer from offset 0 on every chunk, so with ~30
-        // chunks per 200 KB line the scan cost per line grew triangularly
-        // (1×9 KB + 2×9 KB + … + 30×9 KB ≈ 4 MB per line). Across ~365
-        // lines in the decision-gate response that's ~1.5 GB of re-scan.
-        // At the measured ~74 MB/s `iter().position` throughput that alone
-        // burned ~21 s of the ~40 s `initial_batch_ms` — the "5× ingestion
-        // tax" versus raw reqwest drain (which completes in ~7 s).
-        //
-        // `scan_from` tracks the first byte we haven't inspected for a
-        // newline yet. After each chunk it resumes from there; after a
-        // drain (line consumed) the remaining buffer shifted to position
-        // 0 so `scan_from` resets to 0 too. Total scan work becomes
-        // O(total bytes) instead of O(chunks × buffer_size).
+        // Avoid quadratic `\n` scan. Each time reqwest gives us a fresh
+        // chunk we append to `buffer` and then look for a newline to frame
+        // the next NDJSON line. Scanning from offset 0 on every chunk
+        // grows triangularly; `scan_from` tracks the first unscanned byte
+        // so total scan work is O(total bytes) instead of
+        // O(chunks × buffer_size).
         let mut scan_from: usize = 0;
-        // Phase 34.4: measure NDJSON parse and cache write separately
         let mut json_parse_ns: u128 = 0;
         let mut cache_write_ns: u128 = 0;
 
         // Read chunks from the response body and parse complete lines.
         //
-        // **Phase 42 diagnostic.** `reqwest::Error`'s top-level Display is
-        // the kind only (e.g. "error decoding response body"). The actual
-        // fault — premature-EOF vs HTTP/2 RST_STREAM vs chunked-encoding
-        // malform — lives in the `source()` chain that bubbles from hyper.
-        // Walk the chain explicitly so the warn log is diagnostic,
-        // otherwise every failure surfaces as the same opaque string and
-        // we can't tell which layer reported it.
+        // `reqwest::Error`'s top-level Display is the kind only (e.g.
+        // "error decoding response body"). The actual fault lives in the
+        // `source()` chain from hyper. Walk the chain explicitly so the
+        // warn log is diagnostic and not just the opaque top-level string.
         let mut response = response;
         let mut bytes_read: u64 = 0;
         let mut chunks_read: u64 = 0;
@@ -1458,8 +1383,8 @@ impl RegistryClient {
                 let line = std::str::from_utf8(&buffer[..newline_pos])
                     .map_err(|e| LpmError::Registry(format!("NDJSON UTF-8 error: {e}")))?;
                 if !line.is_empty() {
-                    // Phase 34.5: parse directly into typed struct, avoiding
-                    // the intermediate Value + clone that doubled parse cost.
+                    // Parse directly into typed struct, avoiding the
+                    // intermediate Value + clone that doubled parse cost.
                     #[derive(serde::Deserialize)]
                     struct NdjsonEntry {
                         name: String,
@@ -1540,11 +1465,9 @@ impl RegistryClient {
             cache_write_ns as f64 / 1_000_000.0,
         );
 
-        // Phase 40 P3a — feed the locally-accumulated parse time into
-        // the resolver-visible `parse_ndjson_ms` counter. Cache-write
-        // is intentionally NOT reported here: it's disk I/O, not
-        // parse CPU, and mixing the two would make the P3d lever
-        // (slim the batch response) look less valuable than it is.
+        // Feed the locally-accumulated parse time into the resolver-visible
+        // `parse_ndjson_ms` counter. Cache-write is intentionally NOT
+        // reported here: it's disk I/O, not parse CPU.
         crate::timing::record_parse(std::time::Duration::from_nanos(json_parse_ns as u64));
 
         Ok(map)
@@ -1619,9 +1542,8 @@ impl RegistryClient {
         // /api/registry/@lpm.dev/owner.package (NOT percent-encoded)
         let url = format!("{}/api/registry/{}", self.base_url, name.scoped());
 
-        // Phase 40 P3a — time the network portion only. TTL cache
-        // hits above return before this point, so the RPC counter
-        // never double-counts them.
+        // Time the network portion only. TTL cache hits above return
+        // before this point, so the RPC counter never double-counts them.
         let rpc_start = std::time::Instant::now();
 
         // Posture: AuthRequired. `@lpm.dev` package metadata may be
@@ -1685,10 +1607,9 @@ impl RegistryClient {
             return Ok(cached);
         }
 
-        // Phase 40 P3a — past this point the call WILL hit a registry
-        // (proxy or upstream). `record_rpc` fires in each tier's exit
-        // path (success or error) so the counter captures real
-        // network time, not cache fast-paths.
+        // Past this point the call WILL hit a registry (proxy or upstream).
+        // `record_rpc` fires in each tier's exit path (success or error)
+        // so the counter captures real network time, not cache fast-paths.
         let rpc_start = std::time::Instant::now();
         // Macro closing over `rpc_start` so every exit path bumps the
         // counter exactly once before returning. Mirrors the existing
@@ -1756,9 +1677,9 @@ impl RegistryClient {
                 tracing::debug!("npm metadata miss via LPM upstream proxy: {name}");
             }
             Err(LpmError::AuthRequired) => {
-                // Phase 34.5: proxy returned 401/403 for a bare npm package.
-                // This is expected when the user isn't logged in — fall through
-                // to the public npm registry which doesn't need auth.
+                // Proxy returned 401/403 for a bare npm package — expected
+                // when the user isn't logged in. Fall through to the public
+                // npm registry which doesn't need auth.
                 tracing::debug!(
                     "npm proxy auth required for {name}, falling back to public registry"
                 );
@@ -1797,10 +1718,9 @@ impl RegistryClient {
     /// Fetch npm package metadata direct from `registry.npmjs.org`,
     /// skipping the LPM Worker proxy tier entirely.
     ///
-    /// Used by Phase 49's BFS walker when running in
-    /// [`RouteMode::Direct`](crate::RouteMode::Direct): bypassing the
-    /// Worker is the whole point, so we must NOT fall back to it on a
-    /// miss. Tier 1 (TTL + HMAC cache) is preserved so warm installs and
+    /// Used when running in [`RouteMode::Direct`](crate::RouteMode::Direct):
+    /// bypassing the Worker is the whole point, so we must NOT fall back
+    /// to it on a miss. The TTL cache is preserved so warm installs and
     /// previously-seen packages stay cache-fast.
     pub async fn get_npm_metadata_direct(&self, name: &str) -> Result<PackageMetadata, LpmError> {
         let cache_key = format!("npm:{name}");
@@ -1855,14 +1775,13 @@ impl RegistryClient {
     /// [`UpstreamRoute::LpmWorker`] → full three-tier chain via
     /// [`Self::get_npm_package_metadata`] (cache → proxy → direct
     /// fallback).
-    /// [`UpstreamRoute::NpmDirect`] → cache + direct npm only,
-    /// skipping the Worker hop (Phase 49 default for npm packages).
-    /// [`UpstreamRoute::Custom`] → fetch from a `.npmrc`-declared
-    /// registry via [`Self::get_npm_metadata_from`] (Phase 58).
+    /// [`UpstreamRoute::NpmDirect`] → cache + direct npm only, skipping
+    /// the Worker hop.
+    /// [`UpstreamRoute::Custom`] → fetch from a `.npmrc`-declared registry
+    /// via [`Self::get_npm_metadata_from`].
     ///
-    /// This is the single entry point the Phase 49 BFS walker and the
-    /// provider's escape-hatch path use, so routing policy lives in
-    /// one place.
+    /// Single entry point for the BFS walker and the provider's
+    /// escape-hatch path so routing policy lives in one place.
     pub async fn get_npm_metadata_routed(
         &self,
         name: &str,
@@ -1938,7 +1857,7 @@ impl RegistryClient {
     }
 
     /// Fetch npm-style abbreviated metadata from an arbitrary registry,
-    /// optionally attaching origin-scoped auth (Phase 58).
+    /// optionally attaching origin-scoped auth.
     ///
     /// Generalizes [`Self::get_npm_metadata_direct`] so `.npmrc`-
     /// declared private/internal registries are first-class fetch
@@ -1973,7 +1892,7 @@ impl RegistryClient {
     /// - HTTP→HTTPS upgrade or `--insecure` enforcement: the existing
     ///   `is_https_url` / `is_localhost_url` logic governs that
     ///   elsewhere; callers passing an `http://` URL must satisfy that
-    ///   gate themselves. Day-4 wires this into install.rs.
+    ///   gate themselves.
     /// - Tier 2 (Worker) fallback: custom registries are by definition
     ///   not the LPM Worker; falling back would leak a private package
     ///   name to a public registry. Cache miss → direct fetch only.
@@ -2017,10 +1936,8 @@ impl RegistryClient {
         // warm hits across calls. Different credentials → distinct
         // namespaces. `anon` is the canonical no-auth namespace.
         // The fingerprint is a SHA-256 truncation, so debug logs of
-        // the cache key never expose raw tokens.
-        // Phase 58.3 T3.5 — principal fingerprint = auth + identity
-        // hash. Re-issued client certs invalidate cache cleanly even
-        // when URL + auth are unchanged.
+        // the cache key never expose raw tokens. Re-issued client certs
+        // invalidate cache cleanly even when URL + auth are unchanged.
         let cache_key = format!(
             "npm:{}:{url}",
             principal_fingerprint(auth, self.http.identity_fp_for_url(&url))
@@ -2049,7 +1966,7 @@ impl RegistryClient {
             .get(&url)
             .header("Accept", "application/vnd.npm.install-v1+json");
         // `apply_npmrc_auth` does the origin-mismatch defensive check
-        // (Phase 58 S2) and attaches Bearer/Basic. Anonymous = no-op.
+        // and attaches Bearer/Basic. Anonymous = no-op.
         let req = apply_npmrc_auth(req, &url, auth)?;
 
         let response = match self.send_with_retry(req).await {
@@ -2073,8 +1990,7 @@ impl RegistryClient {
     ///
     /// Returned vector is in input order; each entry is a per-package
     /// `Result`. Per-package failures do NOT abort the batch — matches
-    /// bun/pnpm semantics and lets the Phase 49 walker log + continue
-    /// (preplan §7.1).
+    /// bun/pnpm semantics and lets the walker log + continue.
     ///
     /// ## Halve-on-429
     ///
@@ -2328,8 +2244,7 @@ impl RegistryClient {
             .await
     }
 
-    /// Download a tarball using an `.npmrc`-derived credential
-    /// (Phase 58 day-4.5 — Gemini find).
+    /// Download a tarball using an `.npmrc`-derived credential.
     ///
     /// Distinct from [`Self::download_tarball_to_file`] in two ways:
     /// 1. Attaches the supplied `auth` (origin-checked) instead of the
@@ -2337,15 +2252,12 @@ impl RegistryClient {
     ///    bearer is for `lpm.dev`; sending it to a `.npmrc`-declared
     ///    custom registry would leak the token cross-origin.
     /// 2. When `auth` is `None`, the request goes anonymous — no LPM
-    ///    bearer attached either. This is the right behavior for
-    ///    public npm.org tarballs even though that path doesn't yet
-    ///    flow through this method.
+    ///    bearer attached either.
     ///
     /// Same temp-file + SRI shape as `download_tarball_to_file`. The
     /// caller is responsible for routing to the correct method
-    /// (this one for npm-style tarballs; the legacy
-    /// `download_tarball_to_file` for LPM tarballs that need the
-    /// session bearer).
+    /// (this one for npm-style tarballs; `download_tarball_to_file`
+    /// for LPM tarballs that need the session bearer).
     pub async fn download_tarball_to_file_with_auth(
         &self,
         url: &str,
@@ -2529,7 +2441,7 @@ impl RegistryClient {
         })
     }
 
-    /// Streaming tarball download — Phase 38 P1 fast path.
+    /// Streaming tarball download — low-allocation fast path.
     ///
     /// Returns the validated [`reqwest::Response`] with its body left intact
     /// for the caller to drain via `.bytes_stream()`. No temp file spool,
@@ -2575,18 +2487,16 @@ impl RegistryClient {
 
     /// File-spool tarball download with `.npmrc` Custom-route auth.
     ///
-    /// Phase 60 (D2): promoted from a private helper in `install.rs` so
-    /// both `install` and `add` consume one canonical path. Custom-route
-    /// destinations (private/corp registries declared in `.npmrc`) ride
-    /// the auth-aware download so the npmrc credential reaches the
-    /// destination origin and the LPM session bearer is NOT leaked. All
-    /// other routes (LpmWorker, NpmDirect) use the no-auth method.
+    /// Custom-route destinations (private/corp registries declared in
+    /// `.npmrc`) ride the auth-aware download so the npmrc credential
+    /// reaches the destination origin and the LPM session bearer is NOT
+    /// leaked. All other routes (LpmWorker, NpmDirect) use the no-auth
+    /// method.
     ///
     /// File-spool variant — bounded memory via
-    /// [`MAX_COMPRESSED_TARBALL_SIZE`] (500 MB). Callers that need the
-    /// raw bytes after download should read the returned file path; the
-    /// streaming sibling [`Self::download_tarball_streaming_routed`]
-    /// is preferable when the consumer can stream-extract.
+    /// [`MAX_COMPRESSED_TARBALL_SIZE`] (500 MB). The streaming sibling
+    /// [`Self::download_tarball_streaming_routed`] is preferable when the
+    /// consumer can stream-extract.
     pub async fn download_tarball_routed(
         &self,
         route_table: &crate::route::RouteTable,
@@ -2606,8 +2516,6 @@ impl RegistryClient {
 
     /// Streaming variant of [`Self::download_tarball_routed`]. Same
     /// Custom-vs-non-Custom split.
-    ///
-    /// Phase 60 (D2): promoted from `install.rs`'s private helper.
     pub async fn download_tarball_streaming_routed(
         &self,
         route_table: &crate::route::RouteTable,
@@ -2644,31 +2552,25 @@ impl RegistryClient {
         Ok((data, downloaded.sri))
     }
 
-    /// **Phase 59.0 day-4 (F4)** — download a tarball from an
-    /// arbitrary URL and verify its content against an
-    /// optionally-supplied SRI integrity hash.
+    /// Download a tarball from an arbitrary URL and verify its content
+    /// against an optionally-supplied SRI integrity hash.
     ///
-    /// - `expected_integrity = Some("sha…-…")` — the downloaded
-    ///   tarball's content is verified against the declared hash.
-    ///   The verification is **algorithm-aware** (Phase 59.0
-    ///   day-5.5 audit response): the expected SRI is parsed for
-    ///   its algorithm prefix, the tarball is re-hashed with that
-    ///   algorithm if it differs from the streaming download's
-    ///   default sha512, and the raw hash bytes are compared.
-    ///   Both `sha256-…` and `sha512-…` work natively. Mismatch
-    ///   returns [`LpmError::IntegrityMismatch`] with `actual` in
-    ///   the same algorithm the caller declared, so the diagnostic
-    ///   is directly comparable.
-    /// - `expected_integrity = None` — trust-on-first-use. Returns
-    ///   the bytes plus the computed sha512 SRI; caller is
-    ///   responsible for recording it in the lockfile so
-    ///   subsequent installs verify.
+    /// - `expected_integrity = Some("sha…-…")` — the downloaded tarball's
+    ///   content is verified against the declared hash. The verification is
+    ///   algorithm-aware: the expected SRI is parsed for its algorithm
+    ///   prefix, the tarball is re-hashed with that algorithm if it differs
+    ///   from the streaming download's default sha512, and the raw hash
+    ///   bytes are compared. Both `sha256-…` and `sha512-…` work natively.
+    ///   Mismatch returns [`LpmError::IntegrityMismatch`] with `actual` in
+    ///   the same algorithm the caller declared.
+    /// - `expected_integrity = None` — trust-on-first-use. Returns the
+    ///   bytes plus the computed sha512 SRI; caller is responsible for
+    ///   recording it in the lockfile so subsequent installs verify.
     ///
     /// All scheme + auth + redirect handling is inherited from
-    /// [`Self::download_tarball_with_hash`] (which itself reuses
-    /// [`Self::download_tarball_to_file`]). This is the
-    /// non-registry-routed path: the URL points directly at the
-    /// tarball, NOT at a packument.
+    /// [`Self::download_tarball_with_hash`]. This is the non-registry-
+    /// routed path: the URL points directly at the tarball, NOT at a
+    /// packument.
     pub async fn download_tarball_with_integrity(
         &self,
         url: &str,
@@ -2683,11 +2585,10 @@ impl RegistryClient {
             return Ok((data, computed_sha512_sri));
         };
 
-        // Day-5.5 audit response: parse the declared SRI to learn
-        // its algorithm. Then re-hash (or reuse the existing sha512)
-        // as appropriate and compare raw hash bytes. Day-4 used
-        // string comparison which broke for sha256 declarations
-        // against the streaming sha512 hash.
+        // Parse the declared SRI to learn its algorithm. Then re-hash (or
+        // reuse the existing sha512) as appropriate and compare raw hash
+        // bytes. String comparison breaks for sha256 declarations against
+        // the streaming sha512 hash.
         let expected_int = Integrity::parse(expected)?;
         let actual_int = match expected_int.algorithm {
             HashAlgorithm::Sha512 => {
@@ -2720,7 +2621,7 @@ impl RegistryClient {
     /// Search packages.
     ///
     /// Posture: `AnonymousPreferred` — public discovery endpoint, no
-    /// bearer attached even when stored (plan §9.2).
+    /// bearer attached even when stored.
     ///
     /// Calls: GET /api/search/packages?q=...&limit=...&mode=semantic
     pub async fn search_packages(
@@ -2998,11 +2899,8 @@ impl RegistryClient {
 
     /// Get Pool revenue stats for the current user.
     ///
-    /// Posture: `AuthRequired` (account-scoped data). GPT audit fix
-    /// (post-Step-5): pre-fix this went through plain `get_json`,
-    /// which inherits `current_bearer` but does not refresh on 401.
-    /// A stored session with an expired access token would surface
-    /// `AuthRequired` instead of self-healing.
+    /// Posture: `AuthRequired` (account-scoped data). Wrapped in
+    /// `execute_with_recovery` so a stale stored session self-heals.
     ///
     /// Calls: GET /api/registry/pool/stats
     pub async fn get_pool_stats(&self) -> Result<PoolStatsResponse, LpmError> {
@@ -3014,7 +2912,7 @@ impl RegistryClient {
     /// Get Marketplace earnings for the current user.
     ///
     /// Posture: `AuthRequired` (account-scoped data). Same recovery
-    /// contract as `get_pool_stats` — GPT audit fix (post-Step-5).
+    /// contract as `get_pool_stats`.
     ///
     /// Calls: GET /api/registry/marketplace/earnings
     pub async fn get_marketplace_earnings(&self) -> Result<MarketplaceEarningsResponse, LpmError> {
@@ -3047,8 +2945,8 @@ impl RegistryClient {
     /// List claimed tunnel domains.
     ///
     /// Posture: `SessionRequired`. Wrapped in `execute_with_recovery`
-    /// so the post-Phase-35 stale-access-token case still self-heals
-    /// for refresh-backed sessions (audit fix #3).
+    /// so stale-access-token cases still self-heal for refresh-backed
+    /// sessions.
     ///
     /// Calls: GET /api/tunnel/domains or GET /api/tunnel/domains?org=slug
     pub async fn tunnel_list(&self, org_slug: Option<&str>) -> Result<serde_json::Value, LpmError> {
@@ -3178,10 +3076,8 @@ impl RegistryClient {
 
     // ─── Metadata Cache ──────────────────────────────────────────────
 
-    /// Cache key → filename hash. Uses a fast hash for flat file structure.
     fn cache_path(&self, key: &str) -> Option<std::path::PathBuf> {
         let dir = self.cache_dir.as_ref()?;
-        // Simple hash: use first 16 hex chars of SHA-256
         use sha2::{Digest, Sha256};
         let mut hasher = Sha256::new();
         hasher.update(key.as_bytes());
@@ -3196,13 +3092,12 @@ impl RegistryClient {
     /// likely references an unpublished version. Deleting the cache
     /// forces a fresh fetch on the next request.
     ///
-    /// **Limitation (Phase 58 day-3.5):** custom-registry metadata
-    /// (Phase 58, served by `get_npm_metadata_from`) is keyed by
+    /// **Limitation:** custom-registry metadata (served by
+    /// `get_npm_metadata_from`) is keyed by
     /// `npm:<auth_fingerprint>:<full_url>` — neither the URL nor the
     /// auth is recoverable from `package_name` alone, so this method
-    /// cannot invalidate those entries. Callers in the custom-
-    /// registry path (day-4 wiring) MUST use
-    /// [`Self::invalidate_custom_metadata_cache`] instead.
+    /// cannot invalidate those entries. Callers on the custom-registry
+    /// path MUST use [`Self::invalidate_custom_metadata_cache`] instead.
     pub fn invalidate_metadata_cache(&self, package_name: &str) {
         let cache_key = if package_name.starts_with("@lpm.dev/") {
             format!("lpm:{package_name}")
@@ -3217,20 +3112,13 @@ impl RegistryClient {
         }
     }
 
-    /// Invalidate a cached custom-registry metadata entry (Phase 58).
+    /// Invalidate a cached custom-registry metadata entry.
     ///
     /// `base_url` and `auth` MUST match exactly the values that were
     /// passed to [`Self::get_npm_metadata_from`] when the entry was
     /// written; the cache key is host- and path- and auth-fingerprint-
     /// derived, so a name-only call (like
-    /// [`Self::invalidate_metadata_cache`]) cannot reach these
-    /// entries.
-    ///
-    /// Day-4 install.rs wiring threads `(base_url, auth)` alongside
-    /// the package name through the tarball-stale retry path so it
-    /// can call this correctly; today's name-only callers in install.rs
-    /// only invalidate npm.org / `@lpm.dev/` entries (correct, because
-    /// custom registries aren't yet wired into the install flow).
+    /// [`Self::invalidate_metadata_cache`]) cannot reach these entries.
     pub fn invalidate_custom_metadata_cache(
         &self,
         base_url: &str,
@@ -3238,9 +3126,6 @@ impl RegistryClient {
         auth: Option<&crate::npmrc::RegistryAuth>,
     ) {
         let url = format!("{base_url}/{name}");
-        // Phase 58.3 T3.5 — principal fingerprint = auth + identity
-        // hash. Re-issued client certs invalidate cache cleanly even
-        // when URL + auth are unchanged.
         let cache_key = format!(
             "npm:{}:{url}",
             principal_fingerprint(auth, self.http.identity_fp_for_url(&url))
@@ -3285,12 +3170,12 @@ impl RegistryClient {
     /// Returns `(PackageMetadata, Option<etag>)`. The ETag (if present) can be
     /// sent as `If-None-Match` on the next request to enable 304 responses.
     ///
-    /// Cache format (v3, Phase 53 W5.2): `LPM-MD-V2\n{ETag}\n{binary_data}`
+    /// Cache format (v3): `LPM-MD-V3\n{ETag}\n{binary_data}`
     /// - Bytes 0..MAGIC.len(): magic header (ends in `\n`)
     /// - After magic, up to next `\n`: ETag string (empty if absent)
     /// - Remainder: MessagePack-serialized PackageMetadata (with JSON fallback for migration)
     ///
-    /// Old cache files written before W5.2 (HMAC\nETag\ndata) fail the
+    /// Old cache files written in the `HMAC\nETag\ndata` format fail the
     /// magic check and are silently treated as misses — the next fetch
     /// rewrites the entry in the new format.
     fn read_metadata_cache(&self, key: &str) -> Option<(PackageMetadata, Option<String>)> {
@@ -3389,20 +3274,11 @@ impl RegistryClient {
     /// Serializes to MessagePack (binary, ~40-60% smaller than JSON).
     /// Falls back to JSON if MessagePack serialization fails.
     ///
-    /// Phase 53 W5.1: serialization runs on the calling thread (CPU-fast),
-    /// but the blocking `std::fs::write` is dispatched onto tokio's
-    /// `spawn_blocking` pool so it never stalls a runtime worker. Cold
-    /// install on `bench/fixture-large` reproducibly serialized 248 such
-    /// writes through whichever async task fetched the manifest, blocking
-    /// the walker between fetches. Falls back to in-place sync write when
-    /// no tokio runtime is available (unit tests).
-    ///
-    /// Phase 53 W5.2: the file format dropped per-payload HMAC-SHA256 in
-    /// favor of a fixed magic-header check (`METADATA_CACHE_MAGIC`).
-    /// Saves ~10% of `write_metadata_cache` CPU (no SHA-256 round per
-    /// manifest) and removes the persistent signing-key plumbing. The
-    /// cache provides no security boundary — see `METADATA_CACHE_MAGIC`
-    /// docs.
+    /// Serialization runs on the calling thread (CPU-fast), but the
+    /// blocking `std::fs::write` is dispatched onto tokio's
+    /// `spawn_blocking` pool so it never stalls a runtime worker. Falls
+    /// back to in-place sync write when no tokio runtime is available
+    /// (unit tests).
     fn write_metadata_cache(&self, key: &str, metadata: &PackageMetadata, etag: Option<&str>) {
         let Some(path) = self.cache_path(key) else {
             return;
@@ -3500,13 +3376,12 @@ impl RegistryClient {
         self.send_with_retry(req).await
     }
 
-    /// Build a GET request with auth headers (legacy entry point —
-    /// defaults to `AuthRequired` posture, attaching the bearer when
-    /// available). Use `build_get_with_posture` for explicit control.
+    /// Build a GET request with auth headers (defaults to `AuthRequired`
+    /// posture). Use `build_get_with_posture` for explicit control.
     ///
-    /// Phase 58.3 — async + fallible because the underlying client
-    /// dispatch may lazy-build a per-origin client (and that build
-    /// can fail with a cited cert error).
+    /// Async + fallible because the underlying client dispatch may
+    /// lazy-build a per-origin client (and that build can fail with a
+    /// cited cert error).
     async fn build_get(&self, url: &str) -> Result<reqwest::RequestBuilder, LpmError> {
         self.build_get_with_posture(url, AuthPosture::AuthRequired)
             .await
@@ -3514,13 +3389,11 @@ impl RegistryClient {
 
     /// Build a GET request honoring the caller's auth posture.
     ///
-    /// GPT audit fix #3 (post-Step-5): the `AnonymousOnly` and
-    /// `AnonymousPreferred` postures must NOT attach the bearer even
-    /// when one is stored — see plan §9.2. `current_bearer` already
-    /// returns `None` for those postures, so this just wires the
-    /// caller's choice through.
+    /// `AnonymousOnly` and `AnonymousPreferred` postures must NOT attach
+    /// the bearer even when one is stored; `current_bearer` already returns
+    /// `None` for those postures.
     ///
-    /// Phase 58.3 — async + fallible (see [`Self::build_get`]).
+    /// Async + fallible (see [`Self::build_get`]).
     async fn build_get_with_posture(
         &self,
         url: &str,
@@ -3555,7 +3428,7 @@ impl RegistryClient {
             .map_err(|e| LpmError::Registry(format!("failed to parse response from {url}: {e}")))
     }
 
-    /// Phase 35: resolve the bearer to attach for a given posture.
+    /// Resolve the bearer to attach for a given posture.
     ///
     /// - `AnonymousOnly` / `AnonymousPreferred`: returns `None` even if a
     ///   token is stored. Anonymous endpoints stay anonymous.
@@ -3573,11 +3446,10 @@ impl RegistryClient {
         if !posture.attaches_bearer() {
             return None;
         }
-        // Phase 45 P2 — use the lazy variant here so keychain
-        // classification fires on the first actual network request,
-        // not at process startup. Warm / offline / fully-cached runs
-        // skip the ~50 ms macOS Keychain IPC entirely because this
-        // method is never reached.
+        // Use the lazy variant so keychain classification fires on the
+        // first actual network request, not at process startup. Warm /
+        // offline / fully-cached runs skip the ~50 ms macOS Keychain IPC
+        // entirely because this method is never reached.
         if let Some(session) = &self.session
             && let Some(b) = session.current_bearer_lazy()
             && !b.is_empty()
@@ -3590,8 +3462,8 @@ impl RegistryClient {
             .filter(|s| !s.is_empty())
     }
 
-    /// Phase 35: execute an HTTP-bearing operation, handling lazy
-    /// refresh on 401 for refresh-backed sessions.
+    /// Execute an HTTP-bearing operation, handling lazy refresh on 401
+    /// for refresh-backed sessions.
     ///
     /// Contract:
     /// 0. **Proactive pass.** If posture allows recovery AND the
@@ -3720,12 +3592,10 @@ impl RegistryClient {
                 LpmError::Network("request body cannot be retried (not cloneable)".into())
             })?;
 
-            // Phase 58.3 — route via the request's URL so a per-origin
-            // client (eager hit OR lazy build) handles its own TLS
-            // context. Lazy build fires for transitive registry / CDN
-            // origins that surface from resolved metadata after the
-            // eager set was computed; first retry attempt builds and
-            // caches, subsequent retries hit the cache.
+            // Route via the request's URL so a per-origin client (eager
+            // hit OR lazy build) handles its own TLS context. Lazy build
+            // fires for transitive registry / CDN origins that surface
+            // from resolved metadata after the eager set was computed.
             let client_for_req = self.http.for_url(req.url().as_str()).await?;
             match client_for_req.execute(req).await {
                 Ok(response) => {
@@ -3788,11 +3658,9 @@ impl RegistryClient {
                                 retry_after_secs: retry_after,
                             });
                             if attempt < MAX_RETRIES {
-                                // Finding #78: honor the test-only
-                                // backoff override here too so a
-                                // 429-flood retry-exhaustion test
-                                // doesn't hang on the server-supplied
-                                // Retry-After header.
+                                // Honor the test-only backoff override so
+                                // 429-flood retry-exhaustion tests don't
+                                // hang on the server-supplied Retry-After.
                                 let delay = backoff_override()
                                     .unwrap_or_else(|| Duration::from_secs(retry_after));
                                 tokio::time::sleep(delay).await;
@@ -3865,7 +3733,6 @@ impl RegistryClient {
                 LpmError::Network("request body cannot be retried (not cloneable)".into())
             })?;
 
-            // Phase 58.3 — same URL-aware routing as the publish path.
             let client_for_req = self.http.for_url(req.url().as_str()).await?;
             match client_for_req.execute(req).await {
                 Ok(response) => {
@@ -3892,9 +3759,8 @@ impl RegistryClient {
                                 retry_after_secs: retry_after,
                             });
                             if attempt < MAX_RETRIES {
-                                // Finding #78: honor the test-only
-                                // backoff override here too — see the
-                                // sibling site in publish-path.
+                                // Honor the test-only backoff override here
+                                // too — see the sibling site in publish-path.
                                 let delay = backoff_override()
                                     .unwrap_or_else(|| Duration::from_secs(retry_after));
                                 tokio::time::sleep(delay).await;
@@ -3950,9 +3816,8 @@ impl Default for RegistryClient {
 
 /// Check if a URL points to a localhost address.
 ///
-/// Phase 43 — promoted from private to `pub` so `evaluate_cached_url`
-/// (and anyone else composing URL-safety checks) can reuse the same
-/// predicate `download_tarball_to_file` enforces pre-flight.
+/// Used by `evaluate_cached_url` and tarball download guards to compose
+/// URL-safety checks.
 pub fn is_localhost_url(url: &str) -> bool {
     let Ok(parsed) = reqwest::Url::parse(url) else {
         return false;
@@ -3978,10 +3843,6 @@ pub fn is_localhost_url(url: &str) -> bool {
 }
 
 /// Check if a URL uses the HTTPS scheme.
-///
-/// Phase 43 — promoted from private to `pub` for the same reason
-/// as [`is_localhost_url`]: composable scheme-safety gate for
-/// lockfile-cached URLs.
 pub fn is_https_url(url: &str) -> bool {
     reqwest::Url::parse(url)
         .map(|parsed| parsed.scheme() == "https")
@@ -3994,9 +3855,9 @@ pub fn is_https_url(url: &str) -> bool {
 /// `--insecure` carve-out can specifically widen the scheme gate
 /// to plain HTTP — not to `file://`, `ftp://`, `data:`, or any
 /// other non-HTTPS scheme. See
-/// [`RegistryClient::check_tarball_url_scheme`] for the enforcement
-/// site.
-/// Phase 58.1 — pre-validate a PEM root before handing it to
+/// [`RegistryClient::check_tarball_url_scheme`] for the enforcement site.
+
+/// Pre-validate a PEM root before handing it to
 /// `reqwest::Certificate::from_pem`. Reqwest's rustls-tls `from_pem` is
 /// permissive (stores raw bytes; cryptographic validation happens at
 /// `.build()` time), and a `.build()` failure can't tell us WHICH root
@@ -4008,9 +3869,7 @@ pub fn is_https_url(url: &str) -> bool {
 /// **Multi-block bundles:** every `BEGIN..END` pair in the buffer is
 /// validated. Common shape: a corporate cafile with `[root, intermediate]`
 /// concatenated. If block 2 is malformed, we fail at validation rather
-/// than letting the build-time error swallow the source context. The
-/// 1-indexed block number is included in the error message so the user
-/// can find the problem cert in a multi-block bundle.
+/// than letting the build-time error swallow the source context.
 ///
 /// Returning `Ok(())` does NOT guarantee the certs are cryptographically
 /// valid (that's still a `.build()`-time concern). It only guarantees
@@ -4018,8 +3877,7 @@ pub fn is_https_url(url: &str) -> bool {
 ///
 /// Pairs with [`contains_pem_certificate_block`] in `npmrc.rs`, which
 /// performs the cheaper "any BEGIN marker present" parser-time check at
-/// config-load. Both layers stay because they fail at different stages
-/// (config-load vs install-start) with different ergonomics.
+/// config-load.
 fn validate_pem_root(pem_bytes: &[u8], source: &str, line: usize) -> Result<(), LpmError> {
     use base64::Engine as _;
     let text = std::str::from_utf8(pem_bytes).map_err(|e| {
@@ -4076,11 +3934,11 @@ pub fn is_http_url(url: &str) -> bool {
         .unwrap_or(false)
 }
 
-/// Outcome of [`evaluate_cached_url`] — Phase 43 gate on lockfile-
-/// stored tarball URLs before they're dispatched to the fetch
-/// pipeline. A dedicated variant per rejection reason so callers
-/// can emit targeted telemetry (`tarball_url_origin_mismatch_count`
-/// vs `_shape_mismatch_count`) without re-running the checks.
+/// Outcome of [`evaluate_cached_url`] — gate on lockfile-stored tarball
+/// URLs before they're dispatched to the fetch pipeline. A dedicated
+/// variant per rejection reason so callers can emit targeted telemetry
+/// (`tarball_url_origin_mismatch_count` vs `_shape_mismatch_count`)
+/// without re-running the checks.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GateDecision {
     /// URL passes scheme + shape + origin; safe to reuse.
@@ -4103,17 +3961,16 @@ pub enum GateDecision {
     RejectedOrigin,
 }
 
-/// Phase 43 — gate a lockfile-stored tarball URL before reusing it
-/// on the fetch path. Combines scheme, shape, and origin checks
-/// with a distinct `GateDecision` per rejection reason so callers
-/// can bump the right telemetry counter.
+/// Gate a lockfile-stored tarball URL before reusing it on the fetch
+/// path. Combines scheme, shape, and origin checks with a distinct
+/// `GateDecision` per rejection reason so callers can bump the right
+/// telemetry counter.
 ///
-/// The shape check requires both `.tgz` suffix AND a `/-/` path
-/// segment. Both LPM (`/api/registry/{scope}/{pkg}/-/...`) and
-/// npm (`/{pkg}/-/...`) emit URLs in this shape; attacker-crafted
-/// `.tgz`-suffixed admin paths like `/api/admin/foo.tgz` lack the
-/// `/-/` segment and are rejected before the bearer is attached.
-/// See phase-43 design doc §P43-2 for the full threat model.
+/// The shape check requires both `.tgz` suffix AND a `/-/` path segment.
+/// Both LPM (`/api/registry/{scope}/{pkg}/-/...`) and npm (`/{pkg}/-/...`)
+/// emit URLs in this shape; attacker-crafted `.tgz`-suffixed admin paths
+/// like `/api/admin/foo.tgz` lack the `/-/` segment and are rejected
+/// before the bearer is attached.
 pub fn evaluate_cached_url(url: &str, client: &RegistryClient) -> GateDecision {
     // Scheme — mirrors `RegistryClient::check_tarball_url_scheme` so
     // the lockfile-read gate stays symmetric with the tarball-download
@@ -4188,7 +4045,7 @@ fn flush_tarball_file(writer: &mut impl std::io::Write) -> Result<(), LpmError> 
 /// `LPM_TEST_MODE=1` is set, the override value (in ms) is returned
 /// instead of the exponential schedule. Production retry policy is
 /// immune — the env is silently ignored under release builds without
-/// the explicit `LPM_TEST_MODE=1` opt-in. See finding #78.
+/// the explicit `LPM_TEST_MODE=1` opt-in.
 fn backoff_delay(attempt: u32) -> Duration {
     if let Some(d) = backoff_override() {
         return d;
@@ -4210,14 +4067,9 @@ fn backoff_delay(attempt: u32) -> Duration {
 ///
 /// Returns `None` otherwise — production retry policy untouched.
 ///
-/// Used by the workflow tier's retry-exhaustion tests
-/// ([install_concurrency.rs::tarball_503_exhausts_retries_fails_with_http_status](../../../tests/workflows/tests/install_concurrency.rs))
-/// to shrink the default 1+2+4+8s schedule into ~10ms so the test
-/// fits in the suite's <5s determinism budget. Without this knob,
-/// retry-exhaustion proof would take ~28s per test (4 attempts × 2
-/// distinct `download_tarball_*` call sites in the install
-/// pipeline), forcing every retry-exhaustion contract to be
-/// `#[ignore]`-gated. See finding #78 for the full rationale.
+/// Used by retry-exhaustion tests to shrink the default 1+2+4+8s
+/// schedule into ~10ms so the test fits in the suite's <5s determinism
+/// budget.
 ///
 /// Also consulted by the 429 `Retry-After` sleep — without that, a
 /// 429-flood test would still hang on the server-supplied
@@ -4238,13 +4090,13 @@ fn backoff_override() -> Option<Duration> {
         .map(Duration::from_millis)
 }
 
-/// Phase 53 W5.2 — parse a cached metadata blob.
+/// Parse a cached metadata blob.
 ///
 /// Validates the magic header, then locates the ETag line terminator and
 /// returns `(etag_bytes, payload_bytes)` borrowed from the input. Returns
 /// `None` on any shape mismatch (wrong magic, missing ETag terminator,
-/// truncated payload). Old HMAC-format cache entries written before
-/// W5.2 fail the magic check here and are silently re-fetched.
+/// truncated payload). Old-format cache entries fail the magic check here
+/// and are silently re-fetched.
 fn parse_cached_metadata_blob(content: &[u8]) -> Option<(&[u8], &[u8])> {
     if content.len() < METADATA_CACHE_MAGIC.len() {
         return None;
@@ -4364,7 +4216,7 @@ mod tests {
         }
     }
 
-    // ── Phase 59.0 day-4 (F4): download_tarball_with_integrity ──────────────
+    // ── download_tarball_with_integrity ───────────────────────────────────────
     // Wiremock binds to 127.0.0.1 (a loopback host), so the existing
     // tarball scheme guard accepts plain `http://` per
     // download_tarball_allows_loopback_ipv4.
@@ -4426,10 +4278,9 @@ mod tests {
         assert_eq!(sri, expected_sri);
     }
 
-    // ── Phase 59.0 day-5.5: algorithm-aware SRI verification ────────────────
-    // Day-4 used string equality on the SRI, which broke for sha256
-    // declarations against the streaming sha512 hash. The audit
-    // (executable repro) caught this; the fix re-hashes with the
+    // ── algorithm-aware SRI verification ─────────────────────────────────────
+    // String equality on the SRI breaks when the declared algorithm differs
+    // from the streaming hasher's algorithm. The verifier re-hashes with the
     // declared algorithm before comparing raw bytes.
 
     #[tokio::test]
@@ -4457,7 +4308,7 @@ mod tests {
         let (data, sri) = client
             .download_tarball_with_integrity(&url, Some(&expected_sri))
             .await
-            .expect("sha256 match must succeed (day-5.5 audit fix)");
+            .expect("sha256 match must succeed");
 
         assert_eq!(data.as_slice(), body);
         // Returned SRI is in the algorithm the caller declared.
@@ -4515,12 +4366,9 @@ mod tests {
 
         let server = MockServer::start().await;
         let body = b"some content";
-        // Day-5.5 audit response: the algo-aware path parses the
-        // expected SRI before comparing, so use a valid sha512 SRI
-        // of *different* bytes — the realistic threat model
-        // (lockfile/manifest drifted, content changed). Day-4 used
-        // a malformed-base64 fixture which slipped through the
-        // string-compare path but now correctly errors at parse.
+        // The algo-aware path parses the expected SRI before comparing,
+        // so use a valid sha512 SRI of *different* bytes — the realistic
+        // threat model (lockfile/manifest drifted, content changed).
         let wrong_sri = Integrity::from_bytes(
             HashAlgorithm::Sha512,
             b"different content bytes; declared hash will not match",
@@ -4557,7 +4405,7 @@ mod tests {
         // Reusing download_tarball_with_hash → download_tarball_to_file
         // means the scheme guard fires for non-loopback http://.
         // This locks that inheritance — a regression that bypassed
-        // the guard would let phase-59 tarball deps fetch from
+        // the guard would let a tarball dep fetch from
         // `http://evil.com/...` silently.
         let client = RegistryClient::new();
         let result = client
@@ -4663,12 +4511,11 @@ mod tests {
         assert_eq!(read_etag.as_deref(), Some("\"restart-etag\""));
     }
 
-    /// Phase 53 W5.2 — pre-W5.2 caches were written in `HMAC\nETag\ndata`
-    /// shape. After we dropped HMAC the reader expects the
-    /// `LPM-MD-V2\n` magic header instead, so any leftover old-format
-    /// entry on disk fails the magic check and is treated as a cache
-    /// miss (forcing a fresh fetch that will rewrite the entry in the
-    /// new format). This test pins that behavior.
+    /// Pre-magic-header caches were written in `HMAC\nETag\ndata` shape.
+    /// After dropping HMAC the reader expects the `LPM-MD-V2\n` magic header
+    /// instead, so any leftover old-format entry on disk fails the magic check
+    /// and is treated as a cache miss (forcing a fresh fetch that rewrites the
+    /// entry in the new format). This test pins that behavior.
     #[test]
     fn old_format_cache_treated_as_miss() {
         let (client, _tmp) = client_with_temp_cache();
@@ -4687,14 +4534,13 @@ mod tests {
         let result = client.read_metadata_cache("old-format-key");
         assert!(
             result.is_none(),
-            "old HMAC-format cache must be treated as a miss after the W5.2 magic-header switch"
+            "old HMAC-format cache must be treated as a miss after the magic-header switch"
         );
     }
 
-    /// Phase 53 W5.2 — corrupt cache (bytes tampered, no valid magic).
-    /// Replaces the prior HMAC-tampering test: we no longer detect
-    /// arbitrary content tampering, but we DO reject anything that
-    /// doesn't begin with the magic header.
+    /// Corrupt cache (bytes tampered, no valid magic). We no longer detect
+    /// arbitrary content tampering, but we DO reject anything that doesn't
+    /// begin with the magic header.
     #[test]
     fn cache_miss_on_truncated_or_unmagic_content() {
         let (client, _tmp) = client_with_temp_cache();
@@ -4747,11 +4593,10 @@ mod tests {
         assert!(content.unwrap().etag.is_none());
     }
 
-    // Phase 53 W5.2 — `cache_miss_on_tampered_data` was removed when we
-    // dropped HMAC. We no longer detect arbitrary payload tampering;
-    // we only reject content that lacks the magic header. The
-    // `cache_miss_on_truncated_or_unmagic_content` test above pins the
-    // remaining contract.
+    // `cache_miss_on_tampered_data` was removed when HMAC was dropped. We no
+    // longer detect arbitrary payload tampering; we only reject content that
+    // lacks the magic header. The `cache_miss_on_truncated_or_unmagic_content`
+    // test above pins the remaining contract.
 
     #[test]
     fn cache_miss_on_nonexistent_key() {
@@ -4993,12 +4838,10 @@ mod tests {
 
     #[test]
     fn check_tarball_url_scheme_rejects_file_even_with_insecure() {
-        // Finding 1 regression guard: `--insecure` is HTTP-only by
-        // contract (see `--insecure` help text in lpm-cli and the
-        // doc comment on `check_tarball_url_scheme`). `file://` must
-        // remain rejected even with the flag set, or a tampered
-        // lockfile could steer the installer at arbitrary local
-        // files.
+        // `--insecure` is HTTP-only by contract (see `--insecure` help text in
+        // lpm-cli and the doc comment on `check_tarball_url_scheme`). `file://`
+        // must remain rejected even with the flag set, or a tampered lockfile
+        // could steer the installer at arbitrary local files.
         let client = RegistryClient::new().with_insecure(true);
         let result = client.check_tarball_url_scheme("file:///etc/passwd");
         assert!(
@@ -5058,12 +4901,12 @@ mod tests {
 
     /// Helper: create a RegistryClient pointed at a mock server with temp cache.
     ///
-    /// W5.1 — these mock-server tests verify "first fetch caches; second
-    /// fetch is a hit" round-trips, which depend on the cache write
-    /// landing before the next read. We flip `synchronous_cache_writes`
-    /// so the test doesn't race the spawn_blocking write against its
-    /// own next request. Production-shape behavior (spawn_blocking,
-    /// fire-and-forget) is exercised by the integration suite.
+    /// These mock-server tests verify "first fetch caches; second fetch is a
+    /// hit" round-trips, which depend on the cache write landing before the
+    /// next read. We flip `synchronous_cache_writes` so the test doesn't race
+    /// the spawn_blocking write against its own next request. Production-shape
+    /// behavior (spawn_blocking, fire-and-forget) is exercised by the
+    /// integration suite.
     fn client_with_mock_server(server_uri: &str) -> (RegistryClient, tempfile::TempDir) {
         let tmp = tempfile::tempdir().expect("failed to create temp dir");
         let mut client = RegistryClient::new()
@@ -5073,10 +4916,10 @@ mod tests {
         (client, tmp)
     }
 
-    // ── Phase 43: evaluate_cached_url gate ───────────────────────────────
+    // ── evaluate_cached_url gate ─────────────────────────────────────────────
 
     #[test]
-    fn phase43_gate_accepts_canonical_lpm_tarball_url() {
+    fn gate_accepts_canonical_lpm_tarball_url() {
         let client = RegistryClient::new().with_base_url("https://lpm.dev");
         // Canonical LPM tarball path: /api/registry/{scope}/{pkg}/-/...tgz
         let url = "https://lpm.dev/api/registry/@scope/pkg/-/pkg-1.0.0.tgz";
@@ -5084,7 +4927,7 @@ mod tests {
     }
 
     #[test]
-    fn phase43_gate_accepts_canonical_npm_tarball_url() {
+    fn gate_accepts_canonical_npm_tarball_url() {
         let client = RegistryClient::new();
         // Default `npm_registry_url` is `https://registry.npmjs.org`.
         let url = "https://registry.npmjs.org/lodash/-/lodash-4.17.21.tgz";
@@ -5092,7 +4935,7 @@ mod tests {
     }
 
     #[test]
-    fn phase43_gate_rejects_non_https_non_localhost_without_insecure() {
+    fn gate_rejects_non_https_non_localhost_without_insecure() {
         let client = RegistryClient::new().with_base_url("https://lpm.dev");
         // HTTP (non-localhost) — scheme check fires first.
         let url = "http://evil.com/pkg/-/pkg-1.0.0.tgz";
@@ -5103,7 +4946,7 @@ mod tests {
     }
 
     #[test]
-    fn phase43_gate_accepts_http_with_insecure() {
+    fn gate_accepts_http_with_insecure() {
         // `--insecure` widens the scheme carve-out so lockfile-cached
         // HTTP tarball URLs can be reused when the user explicitly
         // opted into insecure transport. Shape + origin gates still
@@ -5117,12 +4960,10 @@ mod tests {
     }
 
     #[test]
-    fn phase43_gate_rejects_file_scheme_even_with_insecure() {
-        // Finding 1 regression guard at the gate layer: `--insecure`
-        // is HTTP-only by contract, never `file://`. A tampered
-        // lockfile that stashed a `file:///etc/passwd` URL must be
-        // rejected regardless of the flag state, before the bearer
-        // token is attached.
+    fn gate_rejects_file_scheme_even_with_insecure() {
+        // `--insecure` is HTTP-only by contract, never `file://`. A tampered
+        // lockfile that stashed a `file:///etc/passwd` URL must be rejected
+        // regardless of the flag state, before the bearer token is attached.
         let client = RegistryClient::new()
             .with_base_url("https://lpm.dev")
             .with_insecure(true);
@@ -5133,7 +4974,7 @@ mod tests {
     }
 
     #[test]
-    fn phase43_gate_rejects_wrong_suffix() {
+    fn gate_rejects_wrong_suffix() {
         let client = RegistryClient::new().with_base_url("https://lpm.dev");
         // HTTPS + correct origin + `/-/` segment — but not `.tgz`.
         let url = "https://lpm.dev/api/registry/@scope/pkg/-/pkg-1.0.0.zip";
@@ -5144,7 +4985,7 @@ mod tests {
     }
 
     #[test]
-    fn phase43_gate_rejects_admin_style_path_without_dash_segment() {
+    fn gate_rejects_admin_style_path_without_dash_segment() {
         // H1 auth-token leak defense: `.tgz` suffix alone isn't enough
         // — the `/-/` segment requirement is what rules out attacker-
         // crafted `/api/admin/foo.tgz` paths.
@@ -5157,7 +4998,7 @@ mod tests {
     }
 
     #[test]
-    fn phase43_gate_rejects_origin_mismatch_after_registry_switch() {
+    fn gate_rejects_origin_mismatch_after_registry_switch() {
         // User switches `LPM_REGISTRY_URL` to a mirror. Stored
         // `@lpm.dev/*` URLs now mismatch the configured origin and
         // fall through to on-demand lookup.
@@ -5170,7 +5011,7 @@ mod tests {
     }
 
     #[test]
-    fn phase43_gate_allows_localhost_registry() {
+    fn gate_allows_localhost_registry() {
         // Dev workflow — HTTP to localhost is explicitly permitted
         // (same carve-out `download_tarball_to_file` has pre-flight).
         let client = RegistryClient::new().with_base_url("http://localhost:3000");
@@ -5179,7 +5020,7 @@ mod tests {
     }
 
     #[test]
-    fn phase43_gate_rejects_malformed_url() {
+    fn gate_rejects_malformed_url() {
         let client = RegistryClient::new();
         assert_eq!(
             evaluate_cached_url("not a url", &client),
@@ -5573,7 +5414,7 @@ mod tests {
         let cache_path = client
             .cache_path(&format!("lpm:{pkg_name}"))
             .expect("cache path should exist");
-        // W5.2: synthesize a magic-valid but undeserializable cache entry.
+        // Synthesize a magic-valid but undeserializable cache entry.
         // Magic passes → ETag extracted → payload fails msgpack/JSON decode
         // → caller drops the cached payload and refetches.
         let corrupted_data = b"not-valid-metadata";
@@ -5684,8 +5525,8 @@ mod tests {
         let cache_path = client
             .cache_path(&format!("npm:{npm_name}"))
             .expect("npm cache path should exist");
-        // W5.2: see the matching synthesizer above for the test on the
-        // proxy path — same shape (magic + ETag + undeserializable bytes).
+        // Same shape as the matching synthesizer above (magic + ETag +
+        // undeserializable bytes) applied to the npm proxy path.
         let corrupted_data = b"not-valid-npm-metadata";
         let mut corrupted_content = Vec::new();
         corrupted_content.extend_from_slice(METADATA_CACHE_MAGIC);
@@ -7046,12 +6887,10 @@ mod tests {
         ));
     }
 
-    // Phase 53 W5.2 — `constant_time_hmac_rejects_tampered_cache` was
-    // removed when we dropped HMAC. The replacement contract — reject
-    // entries that don't begin with `METADATA_CACHE_MAGIC` — is covered
-    // by `cache_miss_on_truncated_or_unmagic_content` in the metadata
-    // cache test block above. No security property remains to verify
-    // here.
+    // `constant_time_hmac_rejects_tampered_cache` was removed when HMAC was
+    // dropped. The replacement contract — reject entries that don't begin with
+    // `METADATA_CACHE_MAGIC` — is covered by
+    // `cache_miss_on_truncated_or_unmagic_content` above.
 
     // ─── Bounded-memory download tests ───────────────────────────────
 
@@ -7601,7 +7440,7 @@ mod tests {
         assert!(msg.contains("HTTPS"), "should mention HTTPS requirement");
     }
 
-    // ─── Phase 35 Step 4: AuthPosture + recovery contract ─────────────
+    // ─── AuthPosture + recovery contract ─────────────────────────────────────
 
     #[test]
     fn auth_posture_attaches_bearer_only_for_auth_or_session() {
@@ -7630,7 +7469,7 @@ mod tests {
             client
                 .current_bearer(AuthPosture::AnonymousPreferred)
                 .is_none(),
-            "AnonymousPreferred must never attach a bearer (Phase 35 §3.2 / §9.2)"
+            "AnonymousPreferred must never attach a bearer"
         );
     }
 
@@ -7650,9 +7489,7 @@ mod tests {
     #[test]
     fn current_bearer_filters_empty_token() {
         // Empty bearer must never be sent — `current_bearer` returns
-        // None even if `with_token("")` was called. This is the
-        // Phase 35 regression test for the `unwrap_or_default()`
-        // empty-bearer defect at install.rs:1494/:1530 (Step 6).
+        // None even if `with_token("")` was called.
         let client = RegistryClient::new().with_token("");
         assert!(client.current_bearer(AuthPosture::AuthRequired).is_none());
     }
@@ -7701,15 +7538,10 @@ mod tests {
         assert_eq!(count.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 
-    /// **Phase 35 Step 8 — wire-layer empty-bearer regression.**
-    ///
-    /// The plan §12.2 #5 mandates a regression that asserts no
-    /// request ever sends `Authorization: Bearer ` (empty value)
-    /// headers. Pre-Phase-35, `install.rs:1494/:1530` did
-    /// `with_token(get_token().unwrap_or_default())`, which produced
-    /// exactly that. This test pins the contract end-to-end —
-    /// `with_token("")` followed by an actual HTTP request must NOT
-    /// surface an Authorization header on the wire.
+    /// Wire-layer empty-bearer regression: no request must ever send
+    /// `Authorization: Bearer ` (empty value) headers. `with_token("")`
+    /// followed by an actual HTTP request must NOT surface an Authorization
+    /// header on the wire.
     #[tokio::test]
     async fn empty_bearer_never_appears_on_the_wire() {
         use wiremock::matchers::{method, path};
@@ -7748,35 +7580,20 @@ mod tests {
         );
     }
 
-    // ─── Phase 42: streaming NDJSON body timeout ──────────────────────
+    // ─── streaming NDJSON body timeout ────────────────────────────────────────
     //
-    // Pre-fix, `RegistryClient::new` configured `.timeout(30s)` on the
-    // reqwest client — a wall-clock cap covering the entire request +
-    // response cycle, including body read. On the decision-gate fixture
-    // (54 direct deps, ~66 MB deep NDJSON response) the server
-    // legitimately takes 30+ seconds to stream the body, so the timer
-    // fired mid-body at ~51 MB / 7 500 chunks and every cold install
-    // logged `WARN batch prefetch failed, falling back to sequential
-    // resolution (slower): registry error: NDJSON read error ...
-    // error decoding response body <- request or response body error
-    // <- operation timed out`, forcing the install pipeline to drop
-    // the Phase 38 streaming-speculation path on every fixture above
-    // ~40 roots.
-    //
-    // The fix replaces `.timeout()` with `.connect_timeout() +
-    // .read_timeout()`. `read_timeout` is a per-read idle timer that
-    // resets on each successful chunk, so a slow-but-progressing stream
-    // completes cleanly; a genuinely stalled server still gets
+    // `RegistryClient::new` uses `.connect_timeout() + .read_timeout()` rather
+    // than `.timeout()`. `.timeout()` is a wall-clock cap over the entire
+    // request+response cycle including body read, which fires mid-body on large
+    // NDJSON responses from slow servers. `.read_timeout()` is a per-read idle
+    // timer that resets on each successful chunk, so a slow-but-progressing
+    // stream completes cleanly; a genuinely stalled server still gets
     // interrupted.
     //
-    // This regression test drives a 3-second slow streaming mock
-    // server through a client configured with a 500 ms read_timeout +
-    // 500 ms connect_timeout. Each chunk arrives within ~300 ms so
-    // the read_timeout never fires; the aggregate response time
-    // exceeds both timeouts by 6×. Pre-fix (with `.timeout(500ms)`),
-    // this test would hang for 500 ms and abort with a reqwest
-    // timeout error. Post-fix it succeeds because the wall-clock cap
-    // is gone.
+    // The regression test below drives a slow streaming mock server through a
+    // client configured with a 500 ms read_timeout + 500 ms connect_timeout.
+    // Each chunk arrives within ~300 ms so the read_timeout never fires, but
+    // the aggregate response time exceeds both timeouts by 6×.
 
     /// Bind a localhost TCP listener, return `(url, join_handle)`. The
     /// spawned task accepts ONE connection, reads until end-of-headers,
@@ -7884,18 +7701,17 @@ mod tests {
 
         // Stream 4 NDJSON lines at 200 ms apart → 800 ms wall-clock
         // total. That's ~1.6× the 500 ms window a wall-clock
-        // `.timeout()` would have enforced. With the Phase-42
-        // `read_timeout`, the per-chunk window resets on each chunk
-        // so the full body arrives intact. Kept short so the test
-        // itself stays under 1 s.
+        // `.timeout()` would have enforced. With `read_timeout`, the
+        // per-chunk window resets on each chunk so the full body arrives
+        // intact. Kept short so the test itself stays under 1 s.
         let packages: Vec<String> = (0..4).map(|i| format!("slow-pkg-{i}")).collect();
         let (base_url, server_handle) =
             slow_streaming_ndjson_server(packages.clone(), std::time::Duration::from_millis(200))
                 .await;
 
         let mut client = RegistryClient::new().with_base_url(&base_url);
-        // Phase 58.3 — `http` is now `Arc<HttpClients>`. Wrap the
-        // short-timeout default client in a fresh HttpClients shell.
+        // `http` is `Arc<HttpClients>`. Wrap the short-timeout default
+        // client in a fresh HttpClients shell.
         client.http = HttpClients::from_default_client(http_default);
         client.cache_dir = Some(tmp.path().to_path_buf());
 
@@ -7927,18 +7743,15 @@ mod tests {
 
     #[tokio::test]
     async fn batch_metadata_deep_fails_under_old_wallclock_timeout() {
-        // This is the bug's regression fixture written in reverse: same
-        // slow streaming server the happy-path test uses, but the client
-        // is built with the PRE-Phase-42 configuration (`.timeout()` —
-        // a wall-clock cap). The stream takes ~3 s total, the wall-clock
-        // is 500 ms, so the request dies mid-body with a reqwest body
-        // decode error sourced from `operation timed out`. This test
-        // does NOT call `RegistryClient::build_http_client` — it
-        // deliberately invokes the reqwest builder directly with the
-        // old API shape so the wire-level failure mode stays visible
-        // as a regression guard: if someone re-introduces
-        // `.timeout(N)` on the prod builder, this test is the spec
-        // that says "that path fails for legitimately slow streams."
+        // Regression guard written in reverse: same slow streaming server the
+        // happy-path test uses, but the client is built with `.timeout()` — a
+        // wall-clock cap. The stream takes ~3 s total, the wall-clock is 500 ms,
+        // so the request dies mid-body with a reqwest body decode error sourced
+        // from `operation timed out`. This test deliberately invokes the reqwest
+        // builder directly with the old API shape so the wire-level failure mode
+        // stays visible: if someone re-introduces `.timeout(N)` on the prod
+        // builder, this test is the spec that says "that path fails for
+        // legitimately slow streams."
         let tmp = tempfile::tempdir().expect("temp dir");
         let old_style_http = reqwest::Client::builder()
             .timeout(std::time::Duration::from_millis(500))
@@ -7953,7 +7766,7 @@ mod tests {
                 .await;
 
         let mut client = RegistryClient::new().with_base_url(&base_url);
-        // Phase 58.3 — wrap the wall-clock-timeout client in HttpClients.
+        // Wrap the wall-clock-timeout client in HttpClients.
         client.http = HttpClients::from_default_client(old_style_http);
         client.cache_dir = Some(tmp.path().to_path_buf());
 
@@ -7968,7 +7781,7 @@ mod tests {
 
         match result {
             Ok(map) => panic!(
-                "pre-Phase-42 wall-clock timeout should abort mid-body; \
+                "wall-clock `.timeout()` should abort mid-body; \
                  instead got a successful map of {} entries. If this test \
                  now passes, either the reqwest API changed semantics \
                  (unlikely — `.timeout()` is still wall-clock in 0.12) \
@@ -7986,7 +7799,7 @@ mod tests {
         }
     }
 
-    // ─── Phase 49 — direct-tier fetch + parallel fan-out ─────────────────
+    // ─── direct-tier fetch + parallel fan-out ─────────────────────────────────
 
     #[tokio::test]
     async fn get_npm_metadata_direct_skips_proxy_tier_entirely() {
@@ -8146,8 +7959,8 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn halve_on_429_ratchets_even_under_full_saturation() {
-        // Regression test for the Phase 49 halve-on-429 ratchet bug
-        // flagged by review: if the implementation only forgets permits
+        // Regression test for the halve-on-429 ratchet bug: if the
+        // implementation only forgets permits
         // it can `try_acquire_owned` synchronously, a fully-saturated
         // pool registers a halve event without any actual reduction —
         // the pool stays at `initial_concurrency`.
@@ -8311,19 +8124,14 @@ mod tests {
         );
     }
 
-    /// Phase 53 W5.2 — pin the cross-client cache roundtrip on the
-    /// magic-header format. Two separate clients pointing at the same
-    /// directory must read each other's writes. (Pre-W5.2 this test
-    /// pinned the HMAC-signing-key sidecar; W5.2 dropped HMAC in favor
-    /// of `METADATA_CACHE_MAGIC` so no sidecar exists. The roundtrip
-    /// invariant — write with one client, read with another — still
-    /// applies and is the actual user-visible contract.)
+    /// Pin the cross-client cache roundtrip on the magic-header format. Two
+    /// separate clients pointing at the same directory must read each other's
+    /// writes — the invariant is the actual user-visible contract.
     ///
-    /// Synchronous `#[test]` (not `#[tokio::test]`): inside a
-    /// non-runtime context `write_metadata_cache` falls through to the
-    /// sync path, so the read on the next line sees the write
-    /// deterministically. The async-runtime path is exercised by the
-    /// integration suite.
+    /// Synchronous `#[test]` (not `#[tokio::test]`): inside a non-runtime
+    /// context `write_metadata_cache` falls through to the sync path, so the
+    /// read on the next line sees the write deterministically. The async-runtime
+    /// path is exercised by the integration suite.
     #[test]
     fn with_cache_dir_some_path_roundtrips_across_clients() {
         let tmp = tempfile::tempdir().expect("tmp");
@@ -8347,7 +8155,7 @@ mod tests {
         );
     }
 
-    // ── Phase 58 day-3: get_npm_metadata_from ──────────────────────────
+    // ── get_npm_metadata_from ──────────────────────────────────────────────────
 
     /// Helper: build a RegistryAuth::Bearer scoped to the wiremock
     /// server's origin. Encapsulates the URL parsing test code does
@@ -8491,7 +8299,7 @@ mod tests {
     #[tokio::test]
     async fn get_npm_metadata_from_uses_host_keyed_cache() {
         // Two distinct registries serving the same package name must
-        // not collide in the cache (Phase 58 day-3 cache-key change).
+        // not collide in the cache.
         use wiremock::matchers::{method, path};
         use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -8584,12 +8392,9 @@ mod tests {
 
     #[tokio::test]
     async fn cache_partitions_per_auth_principal() {
-        // Gemini day-3.5 Finding 1: pre-fix, the cache key was URL-only
-        // and a fetch under credential A would warm a cache entry that
-        // a later fetch under credential B (or anonymous) would read
-        // without proving its own access.
-        //
-        // After the fix, the cache key includes an auth fingerprint.
+        // The cache key includes an auth fingerprint so a fetch under
+        // credential A cannot warm a cache entry that credential B (or
+        // anonymous) would read without proving its own access.
         // Same URL + different tokens = distinct cache entries; each
         // principal's request hits the network even when another's
         // already populated the URL.
@@ -8701,11 +8506,10 @@ mod tests {
 
     #[tokio::test]
     async fn invalidate_custom_metadata_cache_removes_authed_entry() {
-        // Gemini day-3.5 Finding 2: the legacy `invalidate_metadata_cache(name)`
-        // can't reach custom-registry entries (their key includes URL
-        // and auth fingerprint). Day-4 install.rs wiring will use this
-        // new method instead. Test: write a custom-registry entry,
-        // invalidate via the new method, confirm next read misses.
+        // The legacy `invalidate_metadata_cache(name)` can't reach
+        // custom-registry entries whose key includes URL and auth fingerprint.
+        // Test: write a custom-registry entry, invalidate via the new method,
+        // confirm next read misses.
         use wiremock::matchers::{method, path};
         use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -8744,14 +8548,13 @@ mod tests {
             .unwrap();
     }
 
-    // ── Phase 58 day-4.5: tarball auth ─────────────────────────────────
+    // ── tarball auth ──────────────────────────────────────────────────────────
 
     #[tokio::test]
     async fn download_tarball_with_auth_attaches_bearer() {
-        // Pre-fix repro (Gemini): a custom-registry tarball download
-        // arrived without the `.npmrc` Authorization header and the
-        // registry rejected it. With the new method, the Bearer token
-        // rides the request.
+        // A custom-registry tarball download must carry the `.npmrc`
+        // Authorization header. The auth-aware download method attaches the
+        // Bearer token to the request.
         use wiremock::matchers::{header, method, path};
         use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -8860,7 +8663,7 @@ mod tests {
         .to_string()
     }
 
-    // ---- Phase 58.1: with_tls_overrides + build_http_client_with_tls ----
+    // ---- with_tls_overrides + build_http_client_with_tls ----
 
     use crate::npmrc::{TaggedBool, TaggedRoot};
 
@@ -9067,7 +8870,7 @@ mod tests {
         );
     }
 
-    // ---- Phase 58.3 — HttpClients dispatch ----
+    // ---- HttpClients dispatch ----
 
     /// Default + empty eager + empty lazy → every URL routes to default.
     #[test]
@@ -9376,17 +9179,14 @@ mod tests {
             .expect("unrelated lookup must not fail on unreached half-config");
     }
 
-    /// **GPT post-T3 finding (regression):** the lazy per-origin
-    /// dispatch path must actually fire from production request flows,
-    /// not only from explicit `for_url` calls in tests.
+    /// The lazy per-origin dispatch path must fire from production request
+    /// flows, not only from explicit `for_url` calls in tests.
     ///
-    /// Verifies that `download_tarball_to_file_with_auth` (a real
-    /// production entry point that now goes through `for_url(...).await?`)
-    /// triggers a lazy build for an origin that is configured in
-    /// `tls_overrides.per_origin` but NOT in the eager set. Pre-fix, the
-    /// path used `for_url_no_build` and silently fell through to the
-    /// default client, ignoring per-origin TLS for transitive scopes /
-    /// CDN origins.
+    /// Verifies that `download_tarball_to_file_with_auth` (a production entry
+    /// point going through `for_url(...).await?`) triggers a lazy build for an
+    /// origin that is configured in `tls_overrides.per_origin` but NOT in the
+    /// eager set. Without this, the path fell through to the default client,
+    /// ignoring per-origin TLS for transitive scopes / CDN origins.
     #[tokio::test]
     async fn production_tarball_path_triggers_lazy_build_for_per_origin_tls() {
         // Synthesize a per-origin TLS config for a host that's NOT in
@@ -9456,7 +9256,7 @@ mod tests {
         );
     }
 
-    // ---- Phase 58.3 T3.5 — principal_fingerprint (auth + identity) ----
+    // ---- principal_fingerprint (auth + identity) ----
 
     #[test]
     fn principal_fingerprint_anon_when_no_auth_no_identity() {
@@ -9466,9 +9266,8 @@ mod tests {
 
     #[test]
     fn principal_fingerprint_changes_with_identity_alone() {
-        // Same auth (none), different identity hash → different
-        // fingerprint. This is the core T3.5 contract: re-issued
-        // client cert invalidates cache cleanly.
+        // Same auth (none), different identity hash → different fingerprint.
+        // Re-issued client cert must invalidate cache cleanly.
         let fp_a = principal_fingerprint(None, Some("aaaaaaaaaaaaaaaa"));
         let fp_b = principal_fingerprint(None, Some("bbbbbbbbbbbbbbbb"));
         assert_ne!(fp_a, fp_b);
@@ -9530,21 +9329,17 @@ mod tests {
         assert_ne!(&*fp1, &*fp_other);
     }
 
-    /// **GPT post-T4 HIGH finding (regression):** lazy-target
-    /// per-origin TLS origins (those configured but NOT in the eager
-    /// set) must report a non-default identity_fp BEFORE the lazy
-    /// build fires. Pre-fix, `identity_fp_for_url` only consulted the
-    /// eager + default maps, so a rotated cert on a lazy origin
-    /// would reuse the old cache namespace. Post-fix,
-    /// `with_tls_overrides_for` pre-computes an identity_fp for every
-    /// configured per-origin TLS entry.
+    /// Lazy-target per-origin TLS origins (those configured but NOT in the
+    /// eager set) must report a non-default identity_fp BEFORE the lazy build
+    /// fires. Without this, `identity_fp_for_url` only consults the eager +
+    /// default maps, so a rotated cert on a lazy origin reuses the old cache
+    /// namespace. `with_tls_overrides_for` pre-computes an identity_fp for
+    /// every configured per-origin TLS entry.
     ///
-    /// Test shape: build a client with per-origin certfile configured
-    /// for `lazy.internal` BUT pass an empty eager set. Then call
-    /// `identity_fp_for_url("https://lazy.internal/...")` and verify
-    /// it returns a fingerprint, not None / not the default's fp.
-    /// Rotate the cert (write different PEM bytes), rebuild, and
-    /// verify the fp changes.
+    /// Test shape: build a client with per-origin certfile configured for
+    /// `lazy.internal` with an empty eager set. Verify `identity_fp_for_url`
+    /// returns a fingerprint (not None / not the default's fp). Rotate the cert
+    /// and verify the fp changes.
     #[test]
     fn lazy_target_origin_identity_fp_namespaces_cache_pre_dispatch() {
         let dir = tempfile::tempdir().unwrap();
@@ -9680,7 +9475,7 @@ mod tests {
         );
     }
 
-    // ---- Phase 58.3 — effective TLS summary line ----
+    // ---- effective TLS summary line ----
 
     #[test]
     fn render_effective_tls_summary_returns_none_when_default_only() {
