@@ -1,11 +1,9 @@
 //! Authentication and secure token storage for the LPM Rust client.
 //!
-//! # Phase 35 split
-//!
 //! This crate was extracted from `crates/lpm-cli/src/auth.rs` so that
 //! `lpm-registry` can share session/refresh state with `lpm-cli` without
-//! a layering violation. After Phase 35 Step 2, this crate also hosts
-//! `SessionManager` — the lazy session/refresh orchestrator.
+//! a layering violation. Also hosts `SessionManager` — the lazy
+//! session/refresh orchestrator.
 //!
 //! # Token taxonomy
 //!
@@ -114,9 +112,8 @@ pub fn clear_token(registry_url: &str) -> Result<(), String> {
 /// This removes the access token, refresh token, and any stored session-expiry
 /// metadata so startup cannot silently restore a session after logout.
 pub fn clear_login_state(registry_url: &str) -> Result<(), String> {
-    // Best-effort cleanup of the legacy 24h validation marker (Phase 35
-    // Step 3 retired the marker; this keeps logout idempotent on
-    // machines that still have the file from a pre-Phase-35 install).
+    // Best-effort cleanup of the legacy 24h validation marker file.
+    // Keeps logout idempotent on machines that still have the file.
     if let Some(marker) = dirs::home_dir().map(|h| h.join(".lpm").join(".token-check")) {
         let _ = std::fs::remove_file(marker);
     }
@@ -608,11 +605,11 @@ pub fn should_refresh_session_access_token(registry: &str) -> bool {
         .unwrap_or(true)
 }
 
-/// Phase 35: returns true if the local session-expiry metadata file
-/// exists on disk but is unparseable (corrupted, partial write,
-/// hand-edited, version mismatch). Used by `RegistryClient::execute_with_recovery`'s
-/// proactive pass to trigger a silent refresh — when we can't trust
-/// the cached access-token validity, we ask the server.
+/// Returns true if the local session-expiry metadata file exists on disk but
+/// is unparseable (corrupted, partial write, hand-edited, version mismatch).
+/// Used by `RegistryClient::execute_with_recovery`'s proactive pass to
+/// trigger a silent refresh — when we can't trust the cached access-token
+/// validity, we ask the server.
 ///
 /// Returns `false` when the file is missing or empty (fresh login
 /// optimism: don't refresh just because no metadata has been written
@@ -832,14 +829,11 @@ fn parse_npmrc_file(path: &std::path::Path) -> Option<String> {
     None
 }
 
-// Phase 35 Step 3: the 24h `should_revalidate_token` /
-// `mark_token_validated` / `clear_token_validation_marker` helpers were
-// retired. Their only consumer was the eager startup `whoami` block in
-// `lpm-cli/src/main.rs`, which was deleted in the same step. The
-// `~/.lpm/.token-check` marker file may still exist on user machines —
-// it is harmless and can be cleaned up by `lpm doctor` in a future
-// pass. Session health is now verified passively by real
-// authenticated work going through `SessionManager`.
+// The 24h `should_revalidate_token` / `mark_token_validated` /
+// `clear_token_validation_marker` helpers were retired. Session health is
+// now verified passively by authenticated work going through
+// `SessionManager`. The `~/.lpm/.token-check` marker file may still exist
+// on user machines — it is harmless and cleaned up by `clear_login_state`.
 
 // ─── Keychain ──────────────────────────────────────────────────────
 
@@ -1492,10 +1486,9 @@ mod tests {
         }
     }
 
-    // Phase 35 Step 3: `should_revalidate_when_marker_missing` and
+    // `should_revalidate_when_marker_missing` and
     // `mark_and_check_token_validated` were retired alongside the
-    // marker functions they exercised. The eager startup `whoami`
-    // block they supported is gone — session health is now passive.
+    // marker functions they exercised. Session health is now passive.
 
     #[test]
     fn scoped_account_deterministic() {
@@ -1591,10 +1584,9 @@ mod tests {
             set_token_in_file(registry, "access-token").unwrap();
             set_token_in_file(&format!("refresh:{registry}"), "refresh-token").unwrap();
             set_session_access_token_expiry(registry, "2026-04-10T00:00:00Z");
-            // Phase 35 Step 3 retired `mark_token_validated`. Simulate a
-            // pre-Phase-35 install by writing the legacy marker file
-            // directly so the backwards-compat cleanup branch in
-            // `clear_login_state` is exercised.
+            // Simulate a legacy install by writing the marker file directly
+            // so the backwards-compat cleanup branch in `clear_login_state`
+            // is exercised.
             let legacy_marker = home.join(".lpm").join(".token-check");
             std::fs::create_dir_all(legacy_marker.parent().unwrap()).unwrap();
             std::fs::write(&legacy_marker, "").unwrap();

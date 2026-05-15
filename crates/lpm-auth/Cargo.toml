@@ -4,7 +4,7 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Authentication, secure token storage, and (in Phase 35+) lazy session management for the LPM Rust client"
+description = "Authentication, secure token storage, and lazy session management for the LPM Rust client"
 
 [dependencies]
 # Shared error type
