@@ -24,6 +24,20 @@ pub enum HashAlgorithm {
     Sha512,
 }
 
+impl HashAlgorithm {
+    /// Required digest length in bytes — exactly 32 for SHA-256 and
+    /// 64 for SHA-512. Used by [`Integrity::parse`] to reject
+    /// structurally-malformed SRI before any caller treats parse
+    /// success as a complete invariant.
+    #[inline]
+    pub const fn digest_len(self) -> usize {
+        match self {
+            HashAlgorithm::Sha256 => 32,
+            HashAlgorithm::Sha512 => 64,
+        }
+    }
+}
+
 impl Integrity {
     /// Parse an SRI string like `sha512-abc123...`
     pub fn parse(input: &str) -> Result<Self, LpmError> {
@@ -44,6 +58,14 @@ impl Integrity {
         let hash = BASE64.decode(hash_b64).map_err(|e| {
             LpmError::InvalidIntegrity(format!("invalid base64 in integrity hash: {e}"))
         })?;
+
+        let expected = algorithm.digest_len();
+        if hash.len() != expected {
+            return Err(LpmError::InvalidIntegrity(format!(
+                "{algo_str} digest must be {expected} bytes, got {}",
+                hash.len()
+            )));
+        }
 
         Ok(Integrity { algorithm, hash })
     }
@@ -150,17 +172,21 @@ mod tests {
 
     #[test]
     fn parse_sha512_integrity() {
-        let sri = "sha512-YWJjMTIz"; // "abc123" in base64
+        // Real 64-byte SHA-512 digest (of empty input) base64-encoded.
+        let sri = "sha512-z4PhNX7vuL3xVChQ1m2AB9Yg5AULVxXcg/SpIdNs6c5H0NE8XYXysP+DGNKHfuwvY7kxvUdBeoGlODJ6+SfaPg==";
         let integrity = Integrity::parse(sri).unwrap();
         assert_eq!(integrity.algorithm, HashAlgorithm::Sha512);
+        assert_eq!(integrity.hash.len(), 64);
         assert_eq!(integrity.to_string(), sri);
     }
 
     #[test]
     fn parse_sha256_integrity() {
-        let sri = "sha256-YWJjMTIz";
+        // Real 32-byte SHA-256 digest (of empty input) base64-encoded.
+        let sri = "sha256-47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU=";
         let integrity = Integrity::parse(sri).unwrap();
         assert_eq!(integrity.algorithm, HashAlgorithm::Sha256);
+        assert_eq!(integrity.hash.len(), 32);
     }
 
     #[test]
@@ -170,12 +196,53 @@ mod tests {
 
     #[test]
     fn reject_unsupported_algorithm() {
+        // Length is irrelevant for the algorithm gate — sha1 fails first.
         assert!(Integrity::parse("sha1-YWJjMTIz").is_err());
     }
 
     #[test]
     fn reject_invalid_base64() {
         assert!(Integrity::parse("sha512-!!!notbase64!!!").is_err());
+    }
+
+    /// L27: structural digest-length validation. Pre-fix `sha256-YWJjMTIz`
+    /// (6-byte payload) parsed successfully and only failed at verify
+    /// time. Callers that treated parse success as a complete invariant
+    /// were silently accepting malformed lockfile / metadata SRI; the
+    /// parser now rejects up front.
+    #[test]
+    fn reject_sha256_with_wrong_digest_length() {
+        let err = Integrity::parse("sha256-YWJjMTIz")
+            .expect_err("6-byte SHA-256 digest must be rejected");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("sha256 digest must be 32 bytes"),
+            "expected length-mismatch message, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn reject_sha512_with_wrong_digest_length() {
+        let err = Integrity::parse("sha512-YWJjMTIz")
+            .expect_err("6-byte SHA-512 digest must be rejected");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("sha512 digest must be 64 bytes"),
+            "expected length-mismatch message, got: {msg}"
+        );
+    }
+
+    /// Computed digests round-trip through parse — same algorithm gives
+    /// the same length back. Pins that the strict-length gate doesn't
+    /// regress the legitimate from_bytes-then-display-then-parse path.
+    #[test]
+    fn computed_digest_roundtrips_under_strict_length() {
+        for algo in [HashAlgorithm::Sha256, HashAlgorithm::Sha512] {
+            let i = Integrity::from_bytes(algo, b"payload");
+            let parsed = Integrity::parse(&i.to_string()).expect("computed must roundtrip");
+            assert_eq!(parsed, i);
+            assert_eq!(parsed.hash.len(), algo.digest_len());
+        }
     }
 
     #[test]

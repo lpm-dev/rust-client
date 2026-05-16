@@ -4,6 +4,26 @@
 
 use std::collections::BTreeMap;
 
+/// POSIX env var name validation: first char `[A-Za-z_]`, rest
+/// `[A-Za-z0-9_]`, non-empty. The same shape NodeJS / dotenv parsers
+/// honour, and the one required for `eval $(lpm env print --format=shell)`
+/// to stay safe — a key like `A; touch /tmp/pwn #` would otherwise
+/// turn the documented eval flow into command execution.
+///
+/// Exported so vault / CLI / dotenv-import callers all reject the same
+/// shape and surface the same error message to operators.
+pub fn is_valid_env_var_name(name: &str) -> bool {
+    let mut chars = name.chars();
+    let first = match chars.next() {
+        Some(c) => c,
+        None => return false,
+    };
+    if !(first.is_ascii_alphabetic() || first == '_') {
+        return false;
+    }
+    chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
 /// Output formats for resolved environment variables.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PrintFormat {
@@ -42,13 +62,34 @@ impl PrintFormat {
 ///
 /// Variables are sorted alphabetically for deterministic output.
 /// Secret keys (from the `secrets` set) are masked in GitHub Actions format.
+///
+/// Keys that don't satisfy [`is_valid_env_var_name`] are dropped from
+/// every format. An emitted `eval`-able shell line for a key like
+/// `A; touch /tmp/pwn #` would otherwise execute arbitrary shell on
+/// `eval $(lpm env print --format=shell)`; the equivalent dotenv /
+/// Docker / GitHub Actions formats have analogous injection shapes.
 pub fn format_env(
     vars: &std::collections::HashMap<String, String>,
     format: PrintFormat,
     secrets: &std::collections::HashSet<String>,
 ) -> String {
-    // Sort for deterministic output
-    let sorted: BTreeMap<&str, &str> = vars.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+    // Sort for deterministic output; invalid keys are filtered here so
+    // every downstream `format_*` helper sees a sanitized map.
+    let sorted: BTreeMap<&str, &str> = vars
+        .iter()
+        .filter(|(k, _)| {
+            if is_valid_env_var_name(k) {
+                true
+            } else {
+                tracing::warn!(
+                    key = %k,
+                    "lpm env print: skipping variable with invalid name (must match [A-Za-z_][A-Za-z0-9_]*)"
+                );
+                false
+            }
+        })
+        .map(|(k, v)| (k.as_str(), v.as_str()))
+        .collect();
 
     match format {
         PrintFormat::Shell => format_shell(&sorted),
@@ -212,6 +253,61 @@ mod tests {
             .iter()
             .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
             .collect()
+    }
+
+    /// M44: env var names that don't match POSIX shape are dropped
+    /// from every emitted format. A pre-fix shell line for
+    /// `A; touch /tmp/pwn #` would `eval` into command execution.
+    #[test]
+    fn shell_format_drops_keys_with_shell_metacharacters() {
+        let vars = make_vars(&[
+            ("VALID_KEY", "ok"),
+            ("A; touch /tmp/pwn #", "evil"),
+            ("X=$(id)", "evil"),
+            ("WITH SPACE", "evil"),
+        ]);
+        let output = format_env(&vars, PrintFormat::Shell, &HashSet::new());
+        assert!(
+            output.contains("export VALID_KEY="),
+            "valid key must survive: {output}"
+        );
+        for bad in ["A; touch /tmp/pwn #", "X=$(id)", "WITH SPACE"] {
+            assert!(
+                !output.contains(bad),
+                "invalid key {bad:?} leaked into output: {output}"
+            );
+        }
+    }
+
+    #[test]
+    fn dotenv_format_drops_keys_with_newlines_or_specials() {
+        let vars = make_vars(&[("OK", "v"), ("BAD\nINJECT", "v"), ("1LEADING_DIGIT", "v")]);
+        let output = format_env(&vars, PrintFormat::Dotenv, &HashSet::new());
+        assert!(output.contains("OK=v"));
+        assert!(!output.contains("BAD"));
+        assert!(!output.contains("1LEADING_DIGIT"));
+    }
+
+    #[test]
+    fn json_format_drops_invalid_keys() {
+        let vars = make_vars(&[("OK", "v"), ("BAD KEY", "v")]);
+        let output = format_env(&vars, PrintFormat::Json, &HashSet::new());
+        assert!(output.contains("\"OK\""));
+        assert!(!output.contains("BAD KEY"));
+    }
+
+    #[test]
+    fn is_valid_env_var_name_canonical_shapes() {
+        assert!(is_valid_env_var_name("FOO"));
+        assert!(is_valid_env_var_name("foo"));
+        assert!(is_valid_env_var_name("_hidden"));
+        assert!(is_valid_env_var_name("API_KEY_2024"));
+        assert!(!is_valid_env_var_name(""));
+        assert!(!is_valid_env_var_name("1leading"));
+        assert!(!is_valid_env_var_name("with-dash"));
+        assert!(!is_valid_env_var_name("with space"));
+        assert!(!is_valid_env_var_name("A;evil"));
+        assert!(!is_valid_env_var_name("A\nB"));
     }
 
     #[test]
