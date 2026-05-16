@@ -271,11 +271,20 @@ impl WalWriter {
         if let Some(parent) = extended.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        let mut file = std::fs::OpenOptions::new()
-            .create(true)
-            .read(true)
-            .append(true)
-            .open(&extended)?;
+        let mut open_opts = std::fs::OpenOptions::new();
+        open_opts.create(true).read(true).append(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            // WAL records carry tx_id, install paths, and serialized
+            // package metadata. Not raw secrets, but on shared hosts
+            // they enumerate what tools are being installed and when
+            // — useful reconnaissance for an attacker planning a
+            // credential-theft pivot. 0o600 matches the broader
+            // credential-metadata posture.
+            open_opts.mode(0o600);
+        }
+        let mut file = open_opts.open(&extended)?;
         // Defensive: append mode positions writes at EOF on every write,
         // but seek so any caller introspecting `file.stream_position()`
         // sees a sensible value.

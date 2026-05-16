@@ -76,11 +76,20 @@ pub fn write_marker(install_root: &Path, marker: &InstallReadyMarker) -> Result<
     let serialized = serde_json::to_vec_pretty(marker)
         .map_err(|e| LpmError::Io(std::io::Error::other(format!("marker serialize: {e}"))))?;
     {
-        let mut f = std::fs::OpenOptions::new()
-            .create(true)
-            .write(true)
-            .truncate(true)
-            .open(&tmp)?;
+        let mut open_opts = std::fs::OpenOptions::new();
+        open_opts.create(true).write(true).truncate(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            // Marker carries install metadata (commands, paths,
+            // package list) — not raw secrets, but on shared hosts
+            // it lets other local uids enumerate what global tools
+            // a user has installed. 0o600 matches the broader
+            // credential-metadata posture established in the
+            // H4/L14 batch.
+            open_opts.mode(0o600);
+        }
+        let mut f = open_opts.open(&tmp)?;
         std::io::Write::write_all(&mut f, &serialized)?;
         f.sync_all()?;
     }
@@ -348,6 +357,22 @@ mod tests {
             })
             .collect();
         assert!(leaks.is_empty(), "tempfile leaked: {leaks:?}");
+    }
+
+    /// L9: the marker lists installed commands + package paths.
+    /// On shared hosts a default-umask 0o644 file lets other local
+    /// uids enumerate what global tools the user has installed.
+    /// 0o600 closes the recon channel.
+    #[cfg(unix)]
+    #[test]
+    fn write_marker_creates_file_with_0o600_perms() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = TempDir::new().unwrap();
+        let m = InstallReadyMarker::new(vec!["x".into()]);
+        write_marker(tmp.path(), &m).unwrap();
+        let path = tmp.path().join(INSTALL_READY_MARKER);
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "expected 0o600, got 0o{mode:o}");
     }
 
     // ─── validate_install_root tests ──────────────────────────────

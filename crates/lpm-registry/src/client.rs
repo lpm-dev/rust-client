@@ -677,19 +677,22 @@ fn build_per_origin_http_client(
     for cafile in &per_origin.cafiles {
         let resolved = cafile.resolve();
         let bytes = std::fs::read(&resolved).map_err(|e| {
+            tracing::debug!(
+                resolved_path = %resolved.display(),
+                source = %cafile.source,
+                line = cafile.line,
+                error = %e,
+                "per-origin cafile read failed",
+            );
             LpmError::Cert(format!(
-                "{}:{}: failed to read per-origin cafile for {origin} ({}): {e}",
-                cafile.source,
-                cafile.line,
-                resolved.display()
+                "{}:{}: failed to read per-origin cafile for {origin}: {e}",
+                cafile.source, cafile.line,
             ))
         })?;
         if !contains_pem_certificate_block_inline(&bytes) {
             return Err(LpmError::Cert(format!(
-                "{}:{}: per-origin cafile for {origin} ({}) contains no '-----BEGIN CERTIFICATE-----' block",
-                cafile.source,
-                cafile.line,
-                resolved.display()
+                "{}:{}: per-origin cafile for {origin} contains no '-----BEGIN CERTIFICATE-----' block",
+                cafile.source, cafile.line,
             )));
         }
         all_roots.push(TaggedRoot {
@@ -3916,8 +3919,22 @@ pub fn is_localhost_url(url: &str) -> bool {
     let normalized_host = host.trim_start_matches('[').trim_end_matches(']');
     normalized_host
         .parse::<std::net::IpAddr>()
-        .map(|ip| ip.is_loopback())
+        .map(is_loopback_ip)
         .unwrap_or(false)
+}
+
+/// Loopback check that handles both native loopback (`127.0.0.0/8`,
+/// `::1`) and the IPv4-mapped IPv6 shape (`::ffff:127.0.0.1`).
+/// Rust's `IpAddr::is_loopback` only flags the native forms, so an
+/// `http://[::ffff:127.0.0.1]/foo` URL would otherwise sneak past
+/// the localhost gate and through HTTPS-required code paths.
+fn is_loopback_ip(addr: std::net::IpAddr) -> bool {
+    match addr {
+        std::net::IpAddr::V4(v4) => v4.is_loopback(),
+        std::net::IpAddr::V6(v6) => {
+            v6.is_loopback() || v6.to_ipv4_mapped().is_some_and(|v4| v4.is_loopback())
+        }
+    }
 }
 
 /// Check if a URL uses the HTTPS scheme.
@@ -4971,6 +4988,37 @@ mod tests {
         assert!(!is_localhost_url("http://[::1].evil.com:3000"));
         assert!(!is_localhost_url("http://evil.com"));
         assert!(!is_localhost_url("https://lpm.dev"));
+    }
+
+    /// L5: IPv4-mapped IPv6 (`::ffff:127.0.0.1`) is loopback per the
+    /// human reading but Rust's `IpAddr::is_loopback` only flags the
+    /// native v4 (`127.0.0.0/8`) and v6 (`::1`) forms. Without the
+    /// mapped-v4 unwrap, an `http://[::ffff:127.0.0.1]/foo` URL would
+    /// sneak past the localhost gate. Pins the mapped-form handling.
+    #[test]
+    fn is_localhost_url_recognises_ipv4_mapped_ipv6_loopback() {
+        assert!(
+            is_localhost_url("http://[::ffff:127.0.0.1]:3000"),
+            "IPv4-mapped IPv6 loopback must be recognised",
+        );
+        assert!(
+            is_localhost_url("http://[::ffff:127.1.2.3]:3000"),
+            "any IPv4-mapped address in 127.0.0.0/8 is loopback",
+        );
+        // And the negative: a mapped non-loopback v4 is NOT loopback.
+        assert!(
+            !is_localhost_url("http://[::ffff:8.8.8.8]:3000"),
+            "mapped public IPv4 must not be treated as loopback",
+        );
+    }
+
+    /// Whole 127.0.0.0/8 block is loopback per the IPv4 spec; spot-
+    /// check a non-127.0.0.1 address inside the block to confirm the
+    /// gate doesn't accidentally pin only the canonical address.
+    #[test]
+    fn is_localhost_url_accepts_full_127_block() {
+        assert!(is_localhost_url("http://127.42.42.42:3000"));
+        assert!(is_localhost_url("http://127.255.255.254:3000"));
     }
 
     // ─── Mock HTTP Tests for ETag/304 Flow ───────────────────────────
