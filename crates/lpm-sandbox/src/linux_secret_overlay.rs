@@ -333,7 +333,7 @@ pub(crate) unsafe fn apply_secret_overlay_in_child(spec: &SecretOverlaySpec) {
     // for the namespace.
     const SETGROUPS_DENY: &[u8] = b"deny";
     const SETGROUPS_PATH: &[u8] = b"/proc/self/setgroups\0";
-    if !unsafe { write_proc_file_assafe(SETGROUPS_PATH.as_ptr() as *const i8, SETGROUPS_DENY) } {
+    if !unsafe { write_proc_file_assafe(SETGROUPS_PATH.as_ptr() as *const libc::c_char, SETGROUPS_DENY) } {
         return;
     }
 
@@ -342,10 +342,10 @@ pub(crate) unsafe fn apply_secret_overlay_in_child(spec: &SecretOverlaySpec) {
     // bytes were built parent-side.
     const UID_MAP_PATH: &[u8] = b"/proc/self/uid_map\0";
     const GID_MAP_PATH: &[u8] = b"/proc/self/gid_map\0";
-    if !unsafe { write_proc_file_assafe(UID_MAP_PATH.as_ptr() as *const i8, &spec.uid_map_bytes) } {
+    if !unsafe { write_proc_file_assafe(UID_MAP_PATH.as_ptr() as *const libc::c_char, &spec.uid_map_bytes) } {
         return;
     }
-    if !unsafe { write_proc_file_assafe(GID_MAP_PATH.as_ptr() as *const i8, &spec.gid_map_bytes) } {
+    if !unsafe { write_proc_file_assafe(GID_MAP_PATH.as_ptr() as *const libc::c_char, &spec.gid_map_bytes) } {
         return;
     }
 
@@ -357,9 +357,9 @@ pub(crate) unsafe fn apply_secret_overlay_in_child(spec: &SecretOverlaySpec) {
     for cs in &spec.paths {
         unsafe {
             libc::mount(
-                DEV_NULL_SRC.as_ptr() as *const i8,
+                DEV_NULL_SRC.as_ptr() as *const libc::c_char,
                 cs.as_ptr(),
-                FS_NONE.as_ptr() as *const i8,
+                FS_NONE.as_ptr() as *const libc::c_char,
                 libc::MS_BIND,
                 std::ptr::null(),
             );
@@ -375,7 +375,7 @@ pub(crate) unsafe fn apply_secret_overlay_in_child(spec: &SecretOverlaySpec) {
 /// `path` must point to a NUL-terminated absolute path. `bytes`
 /// must outlive the call. No allocations performed.
 #[cfg(target_os = "linux")]
-unsafe fn write_proc_file_assafe(path: *const i8, bytes: &[u8]) -> bool {
+unsafe fn write_proc_file_assafe(path: *const libc::c_char, bytes: &[u8]) -> bool {
     let fd = unsafe { libc::open(path, libc::O_WRONLY) };
     if fd < 0 {
         return false;

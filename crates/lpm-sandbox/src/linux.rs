@@ -532,9 +532,10 @@ impl Sandbox for LandlockSandbox {
                 // suppressed allocation is harmless.
                 if let Some(spec) = overlay_opt.take() {
                     let spec = std::mem::ManuallyDrop::new(spec);
-                    unsafe {
-                        crate::linux_secret_overlay::apply_secret_overlay_in_child(&spec);
-                    }
+                    // SAFETY: nested in the outer `unsafe` of the
+                    // pre_exec closure; clippy correctly flags an
+                    // explicit `unsafe { ... }` here as redundant.
+                    crate::linux_secret_overlay::apply_secret_overlay_in_child(&spec);
                 }
 
                 // ── Layer 1: seccomp ──
