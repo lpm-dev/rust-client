@@ -23,6 +23,22 @@ const FULCIO_URL: &str = "https://fulcio.sigstore.dev";
 /// Rekor public instance.
 const REKOR_URL: &str = "https://rekor.sigstore.dev";
 
+/// Sigstore service endpoints. Injected into the signing flow so tests
+/// can substitute wiremock servers without overriding global constants.
+pub struct SigstoreEndpoints {
+    pub fulcio: String,
+    pub rekor: String,
+}
+
+impl SigstoreEndpoints {
+    pub fn production() -> Self {
+        Self {
+            fulcio: FULCIO_URL.to_string(),
+            rekor: REKOR_URL.to_string(),
+        }
+    }
+}
+
 /// A complete Sigstore bundle ready to attach to a publish payload.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct SigstoreBundle {
@@ -128,16 +144,31 @@ fn pae(payload_type: &str, payload: &[u8]) -> Vec<u8> {
     pae
 }
 
-/// Run the complete Sigstore signing flow.
+/// Run the complete Sigstore signing flow against the public Fulcio /
+/// Rekor instances. Thin shim around [`sign_and_record_with_endpoints`].
+pub async fn sign_and_record(
+    oidc_token: &str,
+    slsa_statement_json: &[u8],
+) -> Result<SigstoreBundle, LpmError> {
+    sign_and_record_with_endpoints(
+        oidc_token,
+        slsa_statement_json,
+        &SigstoreEndpoints::production(),
+    )
+    .await
+}
+
+/// Run the complete Sigstore signing flow against caller-supplied endpoints.
 ///
 /// 1. Generate ephemeral keypair
 /// 2. Exchange OIDC token with Fulcio for a signing certificate
 /// 3. Sign the SLSA statement as a DSSE envelope
 /// 4. Upload to Rekor transparency log
 /// 5. Return the complete Sigstore bundle
-pub async fn sign_and_record(
+pub async fn sign_and_record_with_endpoints(
     oidc_token: &str,
     slsa_statement_json: &[u8],
+    endpoints: &SigstoreEndpoints,
 ) -> Result<SigstoreBundle, LpmError> {
     // Step 1: Generate ephemeral ECDSA P-256 keypair
     let signing_key = SigningKey::random(&mut rand::thread_rng());
@@ -157,7 +188,7 @@ pub async fn sign_and_record(
 
     // Step 3: Exchange OIDC token for Fulcio signing certificate (v2 API)
     let (cert_pem, cert_chain_der) =
-        fulcio_get_certificate(oidc_token, &public_key_pem, &proof_b64).await?;
+        fulcio_get_certificate(&endpoints.fulcio, oidc_token, &public_key_pem, &proof_b64).await?;
 
     // Step 4: Create DSSE envelope
     let payload_type = "application/vnd.in-toto+json";
@@ -180,7 +211,7 @@ pub async fn sign_and_record(
     };
 
     // Step 4: Upload to Rekor
-    let tlog_entry = rekor_upload(&dsse_envelope, &cert_pem).await?;
+    let tlog_entry = rekor_upload(&endpoints.rekor, &dsse_envelope, &cert_pem).await?;
 
     // Step 5: Build the bundle
     let verification_material = VerificationMaterial {
@@ -208,6 +239,7 @@ pub async fn sign_and_record(
 /// - PEM public key + proof-of-possession signature
 /// - Returns JSON with certificate chain
 async fn fulcio_get_certificate(
+    fulcio_url: &str,
     oidc_token: &str,
     public_key_pem: &str,
     proof_b64: &str,
@@ -228,7 +260,7 @@ async fn fulcio_get_certificate(
     });
 
     let response = client
-        .post(format!("{FULCIO_URL}/api/v2/signingCert"))
+        .post(format!("{fulcio_url}/api/v2/signingCert"))
         .header("Content-Type", "application/json")
         .json(&body)
         .send()
@@ -345,7 +377,11 @@ async fn fulcio_get_certificate(
 /// Upload a signed DSSE envelope to Rekor transparency log.
 ///
 /// POST https://rekor.sigstore.dev/api/v1/log/entries
-async fn rekor_upload(envelope: &DsseEnvelope, cert_pem: &str) -> Result<TlogEntry, LpmError> {
+async fn rekor_upload(
+    rekor_url: &str,
+    envelope: &DsseEnvelope,
+    cert_pem: &str,
+) -> Result<TlogEntry, LpmError> {
     let client = reqwest::Client::new();
 
     use sha2::{Digest, Sha256};
@@ -403,7 +439,7 @@ async fn rekor_upload(envelope: &DsseEnvelope, cert_pem: &str) -> Result<TlogEnt
     });
 
     let response = client
-        .post(format!("{REKOR_URL}/api/v1/log/entries"))
+        .post(format!("{rekor_url}/api/v1/log/entries"))
         .header("Content-Type", "application/json")
         .json(&body)
         .send()
@@ -544,6 +580,515 @@ mod tests {
         assert_eq!(json["payloadType"], "application/vnd.in-toto+json");
         assert_eq!(json["signatures"][0]["sig"], "c2lnbmF0dXJl");
     }
+
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    use wiremock::matchers::{method, path as match_path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    // ─── Fixture helpers ──────────────────────────────────────────
+
+    const PEM_CERT_LEAF: &str = "-----BEGIN CERTIFICATE-----\nYWJj\n-----END CERTIFICATE-----\n";
+    const PEM_CERT_INTERMEDIATE: &str =
+        "-----BEGIN CERTIFICATE-----\nZGVm\n-----END CERTIFICATE-----\n";
+    const PEM_CERT_ROOT: &str = "-----BEGIN CERTIFICATE-----\nZ2hp\n-----END CERTIFICATE-----\n";
+
+    fn make_jwt(payload_json: &str) -> String {
+        let header_b64 = URL_SAFE_NO_PAD.encode(br#"{"alg":"RS256","typ":"JWT"}"#);
+        let payload_b64 = URL_SAFE_NO_PAD.encode(payload_json.as_bytes());
+        let sig_b64 = URL_SAFE_NO_PAD.encode(b"fake-sig-not-verified");
+        format!("{header_b64}.{payload_b64}.{sig_b64}")
+    }
+
+    fn dsse_fixture() -> DsseEnvelope {
+        DsseEnvelope {
+            payload_type: "application/vnd.in-toto+json".into(),
+            payload: BASE64.encode(b"{}"),
+            signatures: vec![DsseSignature {
+                keyid: String::new(),
+                sig: BASE64.encode(b"sig-bytes"),
+            }],
+        }
+    }
+
+    // ─── Fulcio response parsing ──────────────────────────────────
+
+    #[tokio::test]
+    async fn fulcio_parses_pem_chain_single_cert() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(match_path("/api/v2/signingCert"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(
+                PEM_CERT_LEAF.as_bytes().to_vec(),
+                "application/pem-certificate-chain",
+            ))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let (pem, ders) = fulcio_get_certificate(&server.uri(), "tok", "key-pem", "proof")
+            .await
+            .expect("expected success");
+        assert_eq!(pem, PEM_CERT_LEAF);
+        assert_eq!(ders.len(), 1);
+        assert_eq!(ders[0], b"abc");
+    }
+
+    #[tokio::test]
+    async fn fulcio_parses_pem_chain_multi_cert() {
+        let server = MockServer::start().await;
+        let chain = format!("{PEM_CERT_LEAF}{PEM_CERT_INTERMEDIATE}{PEM_CERT_ROOT}");
+        Mock::given(method("POST"))
+            .and(match_path("/api/v2/signingCert"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_raw(chain.into_bytes(), "application/pem-certificate-chain"),
+            )
+            .mount(&server)
+            .await;
+
+        let (leaf_pem, ders) = fulcio_get_certificate(&server.uri(), "tok", "key", "proof")
+            .await
+            .expect("expected success");
+        assert_eq!(leaf_pem, PEM_CERT_LEAF);
+        assert_eq!(ders.len(), 3);
+        assert_eq!(ders[0], b"abc");
+        assert_eq!(ders[1], b"def");
+        assert_eq!(ders[2], b"ghi");
+    }
+
+    #[tokio::test]
+    async fn fulcio_parses_json_embedded_sct() {
+        let server = MockServer::start().await;
+        let body = serde_json::json!({
+            "signedCertificateEmbeddedSct": {
+                "chain": {
+                    "certificates": [PEM_CERT_LEAF, PEM_CERT_INTERMEDIATE]
+                }
+            }
+        });
+        Mock::given(method("POST"))
+            .and(match_path("/api/v2/signingCert"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "application/json")
+                    .set_body_json(body),
+            )
+            .mount(&server)
+            .await;
+
+        let (leaf_pem, ders) = fulcio_get_certificate(&server.uri(), "tok", "key", "proof")
+            .await
+            .expect("expected success");
+        assert_eq!(leaf_pem, PEM_CERT_LEAF);
+        assert_eq!(ders.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn fulcio_parses_json_detached_sct() {
+        let server = MockServer::start().await;
+        let body = serde_json::json!({
+            "signedCertificateDetachedSct": {
+                "chain": {
+                    "certificates": [PEM_CERT_LEAF]
+                }
+            }
+        });
+        Mock::given(method("POST"))
+            .and(match_path("/api/v2/signingCert"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "application/json")
+                    .set_body_json(body),
+            )
+            .mount(&server)
+            .await;
+
+        let (leaf_pem, ders) = fulcio_get_certificate(&server.uri(), "tok", "key", "proof")
+            .await
+            .expect("expected success");
+        assert_eq!(leaf_pem, PEM_CERT_LEAF);
+        assert_eq!(ders.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn fulcio_json_with_neither_chain_key_errors() {
+        let server = MockServer::start().await;
+        let body = serde_json::json!({"someOtherShape": {}});
+        Mock::given(method("POST"))
+            .and(match_path("/api/v2/signingCert"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "application/json")
+                    .set_body_json(body),
+            )
+            .mount(&server)
+            .await;
+
+        let err = fulcio_get_certificate(&server.uri(), "tok", "key", "proof")
+            .await
+            .expect_err("expected error");
+        let msg = format!("{err}");
+        assert!(msg.contains("missing certificate chain"), "got: {msg}");
+    }
+
+    #[tokio::test]
+    async fn fulcio_pem_empty_chain_errors() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(match_path("/api/v2/signingCert"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(
+                b"(no certs here)".to_vec(),
+                "application/pem-certificate-chain",
+            ))
+            .mount(&server)
+            .await;
+
+        let err = fulcio_get_certificate(&server.uri(), "tok", "key", "proof")
+            .await
+            .expect_err("expected error");
+        let msg = format!("{err}");
+        assert!(msg.contains("empty certificate chain"), "got: {msg}");
+    }
+
+    #[tokio::test]
+    async fn fulcio_http_500_errors_with_status() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(match_path("/api/v2/signingCert"))
+            .respond_with(ResponseTemplate::new(500).set_body_string("upstream broken"))
+            .mount(&server)
+            .await;
+
+        let err = fulcio_get_certificate(&server.uri(), "tok", "key", "proof")
+            .await
+            .expect_err("expected error");
+        let msg = format!("{err}");
+        assert!(msg.contains("500"), "expected status echoed, got: {msg}");
+        assert!(
+            msg.contains("upstream broken"),
+            "expected body echoed, got: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn fulcio_json_content_type_with_begin_certificate_body_picks_json_branch() {
+        // Regression guard for the comment at the content-type-check site:
+        // "Check content-type ONLY (not body text) to choose the parser,
+        //  because v2 JSON contains PEM strings that would falsely match
+        //  'BEGIN CERTIFICATE'." A JSON-typed response whose embedded
+        //  PEM string contains the marker must still parse as JSON.
+        let server = MockServer::start().await;
+        let body = serde_json::json!({
+            "signedCertificateEmbeddedSct": {
+                "chain": {
+                    "certificates": [PEM_CERT_LEAF]
+                }
+            }
+        });
+        Mock::given(method("POST"))
+            .and(match_path("/api/v2/signingCert"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "application/json")
+                    .set_body_json(body),
+            )
+            .mount(&server)
+            .await;
+
+        let (pem, ders) = fulcio_get_certificate(&server.uri(), "tok", "key", "proof")
+            .await
+            .expect("expected JSON-branch parse");
+        assert_eq!(pem, PEM_CERT_LEAF);
+        assert_eq!(ders.len(), 1);
+    }
+
+    // ─── Rekor response parsing ───────────────────────────────────
+
+    #[tokio::test]
+    async fn rekor_parses_full_entry() {
+        let server = MockServer::start().await;
+        let body = serde_json::json!({
+            "uuid-deadbeef": {
+                "logIndex": 42,
+                "integratedTime": 1700000000_i64,
+                "logID": "log-abc",
+                "body": "base64-body",
+                "verification": {"inclusionProof": {"checkpoint": "..."}}
+            }
+        });
+        Mock::given(method("POST"))
+            .and(match_path("/api/v1/log/entries"))
+            .respond_with(ResponseTemplate::new(201).set_body_json(body))
+            .mount(&server)
+            .await;
+
+        let envelope = dsse_fixture();
+        let entry = rekor_upload(&server.uri(), &envelope, "cert-pem")
+            .await
+            .expect("expected success");
+        assert_eq!(entry.log_index, "42");
+        assert_eq!(entry.integrated_time, "1700000000");
+        assert_eq!(entry.log_id.key_id, "log-abc");
+        assert_eq!(entry.canonicalized_body, "base64-body");
+        assert!(entry.inclusion_proof.is_some());
+    }
+
+    #[tokio::test]
+    async fn rekor_omits_inclusion_proof_when_verification_missing() {
+        let server = MockServer::start().await;
+        let body = serde_json::json!({
+            "uuid": {
+                "logIndex": 7,
+                "integratedTime": 1700000000_i64,
+                "logID": "log",
+                "body": "b"
+            }
+        });
+        Mock::given(method("POST"))
+            .and(match_path("/api/v1/log/entries"))
+            .respond_with(ResponseTemplate::new(201).set_body_json(body))
+            .mount(&server)
+            .await;
+
+        let envelope = dsse_fixture();
+        let entry = rekor_upload(&server.uri(), &envelope, "cert")
+            .await
+            .unwrap();
+        assert!(entry.inclusion_proof.is_none());
+    }
+
+    #[tokio::test]
+    async fn rekor_defaults_missing_log_index_to_zero() {
+        // Current behavior: when `logIndex` is absent the function falls
+        // back to "0" rather than erroring. This test pins that
+        // contract; if the function later starts rejecting absent
+        // fields, update the test to assert the new error shape.
+        let server = MockServer::start().await;
+        let body = serde_json::json!({
+            "uuid": {
+                "integratedTime": 1700000000_i64,
+                "logID": "log",
+                "body": "b"
+            }
+        });
+        Mock::given(method("POST"))
+            .and(match_path("/api/v1/log/entries"))
+            .respond_with(ResponseTemplate::new(201).set_body_json(body))
+            .mount(&server)
+            .await;
+
+        let entry = rekor_upload(&server.uri(), &dsse_fixture(), "cert")
+            .await
+            .unwrap();
+        assert_eq!(entry.log_index, "0");
+    }
+
+    #[tokio::test]
+    async fn rekor_empty_object_response_errors() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(match_path("/api/v1/log/entries"))
+            .respond_with(ResponseTemplate::new(201).set_body_json(serde_json::json!({})))
+            .mount(&server)
+            .await;
+
+        let err = rekor_upload(&server.uri(), &dsse_fixture(), "cert")
+            .await
+            .expect_err("expected error");
+        assert!(format!("{err}").contains("Rekor response empty"));
+    }
+
+    #[tokio::test]
+    async fn rekor_http_500_errors_with_status() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(match_path("/api/v1/log/entries"))
+            .respond_with(ResponseTemplate::new(500).set_body_string("rekor down"))
+            .mount(&server)
+            .await;
+
+        let err = rekor_upload(&server.uri(), &dsse_fixture(), "cert")
+            .await
+            .expect_err("expected error");
+        let msg = format!("{err}");
+        assert!(msg.contains("500"), "expected status, got: {msg}");
+        assert!(msg.contains("rekor down"), "expected body, got: {msg}");
+    }
+
+    // ─── JWT subject extraction ───────────────────────────────────
+
+    #[test]
+    fn jwt_subject_extracts_from_valid_token() {
+        let jwt = make_jwt(r#"{"sub":"user@example.com","iss":"https://oidc"}"#);
+        assert_eq!(extract_jwt_subject(&jwt).unwrap(), "user@example.com");
+    }
+
+    #[test]
+    fn jwt_subject_handles_base64url_chars() {
+        // Build a payload whose base64url encoding contains `-` and `_`.
+        // The byte sequence below was chosen so that standard base64
+        // would use `+` / `/`, forcing the URL-safe alphabet.
+        let payload = "{\"sub\":\"\u{00fb}\u{00fe}~\"}";
+        let jwt = make_jwt(payload);
+        // Confirm the test JWT actually contains url-safe chars
+        let middle = jwt.split('.').nth(1).unwrap();
+        assert!(
+            middle.contains('-') || middle.contains('_'),
+            "test fixture is meant to exercise base64url decoding; got: {middle}"
+        );
+        assert_eq!(extract_jwt_subject(&jwt).unwrap(), "\u{00fb}\u{00fe}~");
+    }
+
+    #[test]
+    fn jwt_subject_handles_all_padding_lengths() {
+        // The standard-base64 padding fixup in extract_jwt_subject covers
+        // four cases (mod 4 = 0, 1, 2, 3). The "% 4 == 1" branch is
+        // invalid base64 — only 0, 2, and 3 round-trip. Cover them.
+        for pad_target in [0usize, 2, 3] {
+            // Generate JSON payloads whose URL-safe encoding has the
+            // target padding-mod. Vary the `sub` value length until it
+            // matches.
+            let mut sub = String::new();
+            let jwt = loop {
+                sub.push('x');
+                let json = format!("{{\"sub\":\"{sub}\"}}");
+                let enc = URL_SAFE_NO_PAD.encode(json.as_bytes());
+                if enc.len() % 4 == pad_target {
+                    break make_jwt(&json);
+                }
+                if sub.len() > 64 {
+                    panic!("could not find input whose b64url length mod 4 = {pad_target}");
+                }
+            };
+            assert_eq!(
+                extract_jwt_subject(&jwt).unwrap(),
+                sub,
+                "padding case {pad_target}"
+            );
+        }
+    }
+
+    #[test]
+    fn jwt_subject_rejects_wrong_segment_count() {
+        assert!(extract_jwt_subject("only-one-segment").is_err());
+        assert!(extract_jwt_subject("two.segments").is_err());
+        assert!(extract_jwt_subject("a.b.c.d").is_err());
+    }
+
+    #[test]
+    fn jwt_subject_rejects_non_base64_payload() {
+        let jwt = "header.this-payload-has-====-invalid-padding-chars.sig";
+        let err = extract_jwt_subject(jwt).expect_err("expected error");
+        assert!(format!("{err}").contains("decode JWT payload"));
+    }
+
+    #[test]
+    fn jwt_subject_rejects_non_json_payload() {
+        let payload_b64 = URL_SAFE_NO_PAD.encode(b"this is not json");
+        let jwt = format!("header.{payload_b64}.sig");
+        let err = extract_jwt_subject(&jwt).expect_err("expected error");
+        assert!(format!("{err}").contains("parse JWT payload"));
+    }
+
+    #[test]
+    fn jwt_subject_rejects_missing_sub_claim() {
+        let jwt = make_jwt(r#"{"iss":"https://oidc","aud":"sigstore"}"#);
+        let err = extract_jwt_subject(&jwt).expect_err("expected error");
+        assert!(format!("{err}").contains("missing 'sub' claim"));
+    }
+
+    #[test]
+    fn jwt_subject_rejects_non_string_sub_claim() {
+        let jwt = make_jwt(r#"{"sub":42}"#);
+        let err = extract_jwt_subject(&jwt).expect_err("expected error");
+        // The current code path bails out via the same "missing 'sub'"
+        // arm because `.as_str()` returns None for non-string values.
+        // That's a documented contract: assert it explicitly.
+        assert!(format!("{err}").contains("missing 'sub' claim"));
+    }
+
+    // ─── sign_and_record_with_endpoints orchestration ─────────────
+
+    #[tokio::test]
+    async fn sign_and_record_with_endpoints_orchestrates_full_flow() {
+        let fulcio = MockServer::start().await;
+        let rekor = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(match_path("/api/v2/signingCert"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(
+                format!("{PEM_CERT_LEAF}{PEM_CERT_ROOT}").into_bytes(),
+                "application/pem-certificate-chain",
+            ))
+            .mount(&fulcio)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(match_path("/api/v1/log/entries"))
+            .respond_with(ResponseTemplate::new(201).set_body_json(serde_json::json!({
+                "uuid": {
+                    "logIndex": 99,
+                    "integratedTime": 1700000000_i64,
+                    "logID": "log",
+                    "body": "b"
+                }
+            })))
+            .mount(&rekor)
+            .await;
+
+        let endpoints = SigstoreEndpoints {
+            fulcio: fulcio.uri(),
+            rekor: rekor.uri(),
+        };
+        let jwt = make_jwt(r#"{"sub":"ci@example.com"}"#);
+
+        let bundle = sign_and_record_with_endpoints(&jwt, b"{\"_type\":\"in-toto\"}", &endpoints)
+            .await
+            .expect("expected success");
+
+        assert_eq!(
+            bundle.dsse_envelope.payload_type,
+            "application/vnd.in-toto+json"
+        );
+        assert_eq!(bundle.dsse_envelope.signatures.len(), 1);
+        assert_eq!(
+            bundle
+                .verification_material
+                .x509_certificate_chain
+                .certificates
+                .len(),
+            2
+        );
+        assert_eq!(bundle.verification_material.tlog_entries.len(), 1);
+        assert_eq!(bundle.verification_material.tlog_entries[0].log_index, "99");
+    }
+
+    #[tokio::test]
+    async fn sign_and_record_with_endpoints_propagates_fulcio_error() {
+        let fulcio = MockServer::start().await;
+        let rekor = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(match_path("/api/v2/signingCert"))
+            .respond_with(ResponseTemplate::new(503).set_body_string("fulcio down"))
+            .mount(&fulcio)
+            .await;
+        // Rekor mock not strictly required — the call must short-circuit
+        // before reaching it.
+
+        let endpoints = SigstoreEndpoints {
+            fulcio: fulcio.uri(),
+            rekor: rekor.uri(),
+        };
+        let jwt = make_jwt(r#"{"sub":"ci"}"#);
+
+        let err = sign_and_record_with_endpoints(&jwt, b"{}", &endpoints)
+            .await
+            .expect_err("expected fulcio error to surface");
+        assert!(format!("{err}").contains("503"));
+    }
+
+    // ─── Legacy serde-shape tests (kept; format ownership) ────────
 
     #[test]
     fn sigstore_bundle_serializes() {
