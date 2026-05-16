@@ -150,6 +150,16 @@ mod landlock_rules;
 #[cfg(any(target_os = "linux", all(test, not(target_os = "windows"))))]
 mod posture_decision;
 
+// Linux secret-file overlay (bind-mounts /dev/null over secret
+// paths under project_dir). Same gate shape as `landlock_rules`:
+// Linux production + every non-Windows test build, so macOS unit
+// tests exercise the enumerator + the seatbelt-symmetry pin. The
+// `apply_secret_overlay_in_child` AS-safe hook + the
+// `SecretOverlaySpec::build` constructor are `target_os = "linux"`-
+// gated inside the module.
+#[cfg(any(target_os = "linux", all(test, not(target_os = "windows"))))]
+mod linux_secret_overlay;
+
 pub mod config;
 pub use config::load_sandbox_write_dirs;
 

@@ -440,6 +440,26 @@ impl Sandbox for LandlockSandbox {
             None
         };
 
+        // Secret-file overlay: parent-side enumeration of secret
+        // paths under project_dir + pre-formatted uid_map bytes for
+        // the child's user-namespace setup. `None` when the project
+        // has no secrets to overlay (clean project, or every match
+        // is in the user's `secret_read_allow` opt-in list); the
+        // pre_exec closure skips the unshare dance entirely in
+        // that case. Failure to enumerate isn't fatal — overlay
+        // is best-effort containment, not a security floor.
+        let overlay_spec = crate::linux_secret_overlay::SecretOverlaySpec::build(
+            &self.spec.project_dir,
+            &self.spec.secret_read_allow,
+        );
+        if let Some(ref s) = overlay_spec {
+            tracing::debug!(
+                count = s.paths.len(),
+                "secret overlay: enumerated {} project secret files for bind-mount",
+                s.paths.len()
+            );
+        }
+
         // Option wrapper lets a FnMut closure consume each layer's
         // input once (via `take`) while satisfying the FnMut bound
         // `Command::pre_exec` requires. In practice the kernel only
@@ -447,6 +467,7 @@ impl Sandbox for LandlockSandbox {
         // path below catches the hypothetical double-invocation.
         let mut ruleset_opt = Some(ruleset);
         let mut seccomp_opt = seccomp_program;
+        let mut overlay_opt = overlay_spec;
 
         // SAFETY: This closure runs post-fork, pre-exec in the
         // child. The body is AS-safe: no heap allocation, no lock
@@ -491,6 +512,31 @@ impl Sandbox for LandlockSandbox {
         // lifecycle script never runs.
         unsafe {
             command.pre_exec(move || {
+                // ── Layer 0: secret-file bind-mount overlay ──
+                // Best-effort: enter a user+mount namespace and
+                // bind-mount /dev/null over every enumerated
+                // project secret file. AS-safe by construction (no
+                // alloc, direct syscalls only). Failure to unshare
+                // (hardened distro, kernel sysctl, AppArmor) silently
+                // no-ops — the macOS-equivalent containment is what
+                // we strive for; Linux falls back to "same as no
+                // overlay", which is the baseline before this layer.
+                //
+                // ManuallyDrop wrap mirrors the seccomp Vec handling
+                // below: `SecretOverlaySpec` owns a `Vec<CString>` +
+                // two `Vec<u8>` maps; Drop would call free() many
+                // times in the child, which is NOT AS-safe. The
+                // wrap suppresses Drop; the child either execve's
+                // (full address-space replace) or returns an Err
+                // before that (no unwind) — either way the
+                // suppressed allocation is harmless.
+                if let Some(spec) = overlay_opt.take() {
+                    let spec = std::mem::ManuallyDrop::new(spec);
+                    unsafe {
+                        crate::linux_secret_overlay::apply_secret_overlay_in_child(&spec);
+                    }
+                }
+
                 // ── Layer 1: seccomp ──
                 // Take the BpfProgram out of the Option, then
                 // wrap it in `ManuallyDrop` so its inner

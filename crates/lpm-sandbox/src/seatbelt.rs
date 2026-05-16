@@ -30,7 +30,7 @@ use std::path::{Path, PathBuf};
 /// from one place, and an exact `(literal ...)` rule cannot
 /// accidentally over-match a sibling file. Add new entries here as
 /// conventions emerge.
-const DENY_READ_LITERAL_PROJECT_PATHS: &[&str] = &[
+pub(crate) const DENY_READ_LITERAL_PROJECT_PATHS: &[&str] = &[
     // dotenv conventions (used by next.js, vite, dotenv-flow, etc.)
     ".env",
     ".env.local",
@@ -69,7 +69,7 @@ const DENY_READ_LITERAL_PROJECT_PATHS: &[&str] = &[
 
 /// Project-relative subdirs whose `file-read*` is denied wholesale.
 /// Same last-match-wins semantics as the literal list.
-const DENY_READ_SUBPATH_PROJECT_DIRS: &[&str] = &[
+pub(crate) const DENY_READ_SUBPATH_PROJECT_DIRS: &[&str] = &[
     ".ssh",
     ".aws",
     ".kube",
@@ -89,7 +89,7 @@ const DENY_READ_SUBPATH_PROJECT_DIRS: &[&str] = &[
 /// character (passed through to the regex engine), so `\.pem` in
 /// the source string reaches the engine unchanged. `^` and `$`
 /// anchor full-path match.
-const DENY_READ_REGEX_SUFFIXES: &[&str] = &[
+pub(crate) const DENY_READ_REGEX_SUFFIXES: &[&str] = &[
     r"/.*\.pem",
     r"/.*\.key",
     r"/.*\.pfx",
