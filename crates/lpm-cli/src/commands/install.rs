@@ -8480,6 +8480,32 @@ fn try_lockfile_fast_path(
 
     let lockfile = lpm_lockfile::Lockfile::read_fast(lockfile_path).ok()?;
 
+    // L19: scan the lockfile for entries with `http://` sources and
+    // emit a single aggregate warn so re-installs against a lockfile
+    // captured under `--insecure` don't proceed silently. The
+    // per-fetch source-safety check still fires later; this one is
+    // about pre-install audit visibility — operators using
+    // `lpm install` in CI without `--insecure` should see that the
+    // lockfile carries insecure entries before the install runs.
+    let insecure_count = lockfile
+        .packages
+        .iter()
+        .filter(|p| {
+            p.source
+                .as_deref()
+                .is_some_and(|s| s.contains("+http://") || s.starts_with("http://"))
+        })
+        .count();
+    if insecure_count > 0 {
+        tracing::warn!(
+            insecure_count,
+            "lpm.lock contains {insecure_count} package(s) with insecure http:// sources \
+             (recorded by an earlier `--insecure` install); re-installs honour these without \
+             re-prompting. Re-resolve the affected entries against an https:// mirror to \
+             remove the insecure source from the lockfile.",
+        );
+    }
+
     // Validate all package sources are safe (HTTPS registries or
     // localhost). **Round-6:** in offline mode (`accept_unsafe_sources
     // = true`) we trust the lockfile and admit non-registry sources —
@@ -15147,6 +15173,7 @@ mod tests {
                 captured_at: "unused-in-test".into(),
                 blocked_packages: packages,
                 blocked_set_fingerprint: "unused-in-test".into(),
+                drift_ignore_override: None,
             },
             previous_fingerprint: None,
             should_emit_warning: false,
@@ -15344,6 +15371,7 @@ mod tests {
                 captured_at: "unused-in-test".into(),
                 blocked_packages: packages,
                 blocked_set_fingerprint: "unused-in-test".into(),
+                drift_ignore_override: None,
             },
             previous_fingerprint: None,
             should_emit_warning: false,

@@ -1690,6 +1690,29 @@ fn build_sanitized_env() -> HashMap<String, String> {
         env.insert(key, value);
     }
 
+    // M22: lifecycle scripts run with CWD = the package's directory.
+    // Nested tools (`git`, `npm`, `python`) consult package-local
+    // dotfiles by default — `<pkg>/.gitconfig`, `<pkg>/.npmrc`,
+    // `<pkg>/.netrc` — so a malicious package can plant
+    // `script-shell=/tmp/evil` or `registry=…attacker…` in a
+    // dotfile and have nested tools honour it. Neutralise the
+    // discovery path by pointing HOME / GIT_CONFIG_GLOBAL /
+    // NPM_CONFIG_GLOBALCONFIG / etc. at /dev/null on Unix (or an
+    // empty temp dir on Windows where /dev/null doesn't exist).
+    // The package's OWN scripts still run; what we suppress is the
+    // implicit "tool reads ./dotfile" surface that the package
+    // never asked for and the user never consented to.
+    #[cfg(unix)]
+    {
+        env.insert("GIT_CONFIG_GLOBAL".to_string(), "/dev/null".to_string());
+        env.insert("GIT_CONFIG_SYSTEM".to_string(), "/dev/null".to_string());
+        env.insert(
+            "NPM_CONFIG_GLOBALCONFIG".to_string(),
+            "/dev/null".to_string(),
+        );
+        env.insert("NPM_CONFIG_USERCONFIG".to_string(), "/dev/null".to_string());
+    }
+
     env
 }
 

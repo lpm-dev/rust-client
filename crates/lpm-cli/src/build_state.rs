@@ -84,6 +84,30 @@ pub struct BuildState {
     /// the install that wrote this file. Sorted by `(name, version)` for
     /// deterministic fingerprinting.
     pub blocked_packages: Vec<BlockedPackage>,
+
+    /// M3: audit trail for `--ignore-provenance-drift[-all]`. Set to
+    /// `Some(...)` when the install that wrote this state file had a
+    /// drift override active. `None` means drift was enforced normally.
+    /// Skipped from on-disk JSON when None to keep the common-case
+    /// shape clean and forward-compatible with pre-fix readers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub drift_ignore_override: Option<DriftIgnoreAuditRecord>,
+}
+
+/// Persistent record of a `--ignore-provenance-drift[-all]` override
+/// honoured by the install that wrote `build-state.json`. Surfaces in
+/// `lpm doctor` and audit logs so a waiver can't hide indefinitely
+/// behind the per-install advisory printed at install time.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DriftIgnoreAuditRecord {
+    /// `"all"` (from `--ignore-provenance-drift-all`) or `"names"`
+    /// (from one or more `--ignore-provenance-drift <name>` flags).
+    pub mode: String,
+    /// Sorted list of package names waived. Empty for `mode = "all"`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub names: Vec<String>,
+    /// RFC 3339 timestamp of when the override was honoured.
+    pub honoured_at: String,
 }
 
 /// One entry in [`BuildState::blocked_packages`].
@@ -761,6 +785,7 @@ pub fn capture_blocked_set_after_install_with_metadata(
         blocked_set_fingerprint: fingerprint,
         captured_at: current_rfc3339(),
         blocked_packages: blocked,
+        drift_ignore_override: None,
     };
 
     write_build_state(project_dir, &state)?;
@@ -1105,7 +1130,35 @@ mod tests {
             blocked_set_fingerprint: fingerprint,
             captured_at: "T00:00:00Z".to_string(),
             blocked_packages: packages,
+            drift_ignore_override: None,
         }
+    }
+
+    /// M3: the drift_ignore_override field is omitted from on-disk
+    /// JSON when None (forward-compatible with pre-fix readers) and
+    /// round-trips faithfully when present.
+    #[test]
+    fn drift_ignore_override_round_trips_through_buildstate_json() {
+        let mut state = make_state(Vec::new());
+        state.drift_ignore_override = Some(DriftIgnoreAuditRecord {
+            mode: "names".into(),
+            names: vec!["axios".into(), "lodash".into()],
+            honoured_at: "2026-05-16T12:00:00Z".into(),
+        });
+        let json = serde_json::to_string(&state).unwrap();
+        assert!(json.contains("drift_ignore_override"));
+        let parsed: BuildState = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.drift_ignore_override, state.drift_ignore_override);
+    }
+
+    #[test]
+    fn drift_ignore_override_omitted_from_json_when_none() {
+        let state = make_state(Vec::new());
+        let json = serde_json::to_string(&state).unwrap();
+        assert!(
+            !json.contains("drift_ignore_override"),
+            "field must be skipped when None, got: {json}",
+        );
     }
 
     // ── BuildState round-trip ────────────────────────────────────────

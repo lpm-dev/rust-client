@@ -252,6 +252,7 @@ mod tests {
             blocked_set_fingerprint: compute_blocked_set_fingerprint(&blocked),
             captured_at: Utc::now().to_rfc3339(),
             blocked_packages: blocked,
+            drift_ignore_override: None,
         };
         crate::build_state::write_build_state(&install_root, &state).unwrap();
         rel_root

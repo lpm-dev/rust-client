@@ -73,15 +73,36 @@ pub async fn run(
     let npmrc_path = project_dir.join(".npmrc");
 
     if json_output {
+        // M37: stdout in JSON mode is frequently captured into CI
+        // logs, support bundles, and artifacts — places no operator
+        // expects to find a live bearer. Always emit the placeholder
+        // shape in JSON output so a real token never gets serialised
+        // there. The on-disk `.npmrc` still gets the real token
+        // (chmod 0o600, owner-only) — that's where the consumer
+        // actually needs to read it.
+        let safe_content = format!(
+            "//{}/:_authToken=${{LPM_TOKEN}}\n{}\n",
+            registry_host, registry_line
+        );
         let json = serde_json::json!({
             "success": true,
             "path": npmrc_path.display().to_string(),
-            "content": npmrc_content,
+            "content": safe_content,
             "uses_env_var": uses_env,
             "oidc": use_oidc,
             "proxy": proxy,
+            "note": if uses_env { "" } else { "JSON content uses ${LPM_TOKEN} placeholder; the on-disk .npmrc carries the actual token at 0o600." },
         });
         println!("{}", serde_json::to_string_pretty(&json).unwrap());
+        // Still write the on-disk file even under --json so the
+        // workflow that consumed the JSON envelope can read the
+        // .npmrc the way it expects.
+        std::fs::write(&npmrc_path, &npmrc_content)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&npmrc_path, std::fs::Permissions::from_mode(0o600));
+        }
     } else {
         std::fs::write(&npmrc_path, &npmrc_content)?;
 

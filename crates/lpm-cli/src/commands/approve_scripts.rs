@@ -382,6 +382,7 @@ async fn run_under_store_lock(
         blocked_set_fingerprint: state.blocked_set_fingerprint.clone(),
         captured_at: state.captured_at.clone(),
         blocked_packages: effective,
+        drift_ignore_override: None,
     };
 
     // ── — pre-fetch provenance for the effective set ────
@@ -2454,6 +2455,7 @@ mod tests {
             blocked_set_fingerprint: "sha256-test".to_string(),
             captured_at: "T00:00:00Z".to_string(),
             blocked_packages: blocked,
+            drift_ignore_override: None,
         };
         crate::build_state::write_build_state(project_dir, &state).unwrap();
     }
@@ -3566,6 +3568,7 @@ mod tests {
                 make_blocked("esbuild", "0.25.1"),
                 make_blocked("sharp", "0.33.0"),
             ],
+            drift_ignore_override: None,
         };
         // esbuild approved strictly, sharp not.
         let mut map = std::collections::HashMap::new();
@@ -3599,6 +3602,7 @@ mod tests {
             blocked_set_fingerprint: "sha256-test".into(),
             captured_at: "T00:00:00Z".into(),
             blocked_packages: vec![make_blocked("esbuild", "0.25.1")],
+            drift_ignore_override: None,
         };
         let trusted = TrustedDependencies::Legacy(vec!["esbuild".into()]);
 
@@ -3627,6 +3631,7 @@ mod tests {
             blocked_set_fingerprint: "sha256-test".into(),
             captured_at: "T00:00:00Z".into(),
             blocked_packages: vec![blocked],
+            drift_ignore_override: None,
         };
         let mut map = std::collections::HashMap::new();
         map.insert(
@@ -3661,6 +3666,7 @@ mod tests {
             blocked_set_fingerprint: "sha256-test".into(),
             captured_at: "T00:00:00Z".into(),
             blocked_packages: vec![make_blocked("esbuild", "0.25.1")],
+            drift_ignore_override: None,
         };
         let trusted = TrustedDependencies::default();
         let effective = compute_effective_blocked_set(
@@ -3683,6 +3689,7 @@ mod tests {
             blocked_set_fingerprint: "sha256-test".into(),
             captured_at: "T00:00:00Z".into(),
             blocked_packages: vec![make_blocked("esbuild", "0.25.1")],
+            drift_ignore_override: None,
         };
         // Simulate post-upgrade state: legacy esbuild → esbuild@*
         let mut td = TrustedDependencies::Legacy(vec!["esbuild".into()]);
@@ -4009,6 +4016,7 @@ mod tests {
             blocked_set_fingerprint: compute_blocked_set_fingerprint(&blocked_packages),
             captured_at: Utc::now().to_rfc3339(),
             blocked_packages,
+            drift_ignore_override: None,
         };
         crate::build_state::write_build_state(&install_root, &state).unwrap();
 
@@ -4335,6 +4343,7 @@ mod tests {
                 behavioral_tags_hash: None,
                 behavioral_tags: None,
             }],
+            drift_ignore_override: None,
         };
         // Strict match: script-hash approved with no capability_hash.
         let mut map = std::collections::HashMap::new();
@@ -4389,6 +4398,7 @@ mod tests {
                 behavioral_tags_hash: None,
                 behavioral_tags: None,
             }],
+            drift_ignore_override: None,
         };
         let mut map = std::collections::HashMap::new();
         map.insert(
