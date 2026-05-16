@@ -5,8 +5,8 @@
 //! **Read.** `triage-advisor` is resolved from this precedence chain
 //! (highest first):
 //!
-//! - `--advisor` CLI flag — reserved; not wired in slice 1, accepted
-//!   by [`AdvisorSession::preflight`] for forward-compat.
+//! - `--advisor` CLI flag — per-run override, accepted
+//!   by [`AdvisorSession::preflight`].
 //! - `package.json > lpm > triageAdvisor` — per-project, shared
 //!   across machines via the manifest.
 //! - `~/.lpm/config.toml` — per-user / per-machine, written by
@@ -57,8 +57,7 @@
 //!   scope and therefore makes its trust decision purely from the
 //!   persistent `trustedDependencies` manifest.
 //!
-//! This is the contract the wizard's "degrade-and-warn" copy
-//! describes after Part B B3 ships and slice 1 lands.
+//! This is the contract the wizard's "degrade-and-warn" copy describes.
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -141,8 +140,8 @@ impl AdvisorSession {
     /// precedence chain and preflighting the adapter.
     ///
     /// Reads:
-    /// - `cli_override`: value of any future `--advisor` CLI flag
-    ///   (slice 1 doesn't expose one; threaded for forward-compat).
+    /// - `cli_override`: value of the `--advisor` CLI flag
+    ///   (threaded for forward-compat; `None` when not provided).
     /// - `package_json_triage_advisor`: `package.json > lpm >
     ///   triageAdvisor` if present.
     /// - The global config (`~/.lpm/config.toml`) `triage-advisor`
@@ -738,8 +737,7 @@ mod tests {
     async fn precedence_package_json_wins_over_global() {
         // **Locked precedence (review finding Medium 2).** When no
         // CLI flag is given, `package.json > lpm > triageAdvisor`
-        // wins over `~/.lpm/config.toml`. This is the layer slice 1
-        // wires explicitly; previously the install callsite passed
+        // wins over `~/.lpm/config.toml`. Previously the install callsite passed
         // None for package.json, making the feature non-reproducible
         // across machines.
         let s = AdvisorSession::preflight(None, Some("pkgjson-bogus"), Some("global-bogus"), true)
@@ -770,7 +768,7 @@ mod tests {
 
     #[tokio::test]
     async fn precedence_cli_explicit_none_overrides_active_lower_layers() {
-        // **Locked CLI flag contract (slice 1 close-out).**
+        // **Locked CLI flag contract.**
         // `lpm install --advisor=none` is an explicit per-invocation
         // opt-out that MUST win over any `package.json` /
         // `~/.lpm/config.toml` value beneath it. Without this, a user

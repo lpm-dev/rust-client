@@ -1,5 +1,4 @@
-//! `lpm uninstall -g <pkg>` and `lpm global remove <pkg>` — phase 37
-//! M3.3 persistent uninstall pipeline.
+//! `lpm uninstall -g <pkg>` and `lpm global remove <pkg>` — persistent uninstall pipeline.
 //!
 //! Both surfaces dispatch here. The work is structured as a single
 //! `.tx.lock`-protected transaction (uninstall has no slow phase to
@@ -20,17 +19,16 @@
 //!    gone, the user's shell can no longer resolve the command.
 //! 4. Drop `[packages.<pkg>]` and every `[aliases.*]` row pointing at
 //!    this package. Push the install root to `manifest.tombstones`.
-//!    Persist manifest (BEFORE the WAL Commit append, per the M3.1
+//!    Persist manifest (BEFORE the WAL Commit append, per the
 //!    ordering invariant).
 //! 5. Best-effort delete the install root. On Windows this can fail
 //!    if a tool the user was running locked a file inside it; the
 //!    tombstone keeps the cleanup retry alive for `store gc`.
 //! 6. Append WAL Commit. Release lock.
 //!
-//! Note: M3.3 does not yet prune `build-state.json` /
-//! `trusted-dependencies.json` entries scoped to the package — those
-//! files don't exist until M5 (approve-scripts --global). When M5
-//! lands, this pipeline picks up the pruning step between 4 and 5.
+//! Note: `build-state.json` / `trusted-dependencies.json` entries scoped to
+//! the package are pruned as part of approve-scripts --global support,
+//! between steps 4 and 5 above.
 
 use crate::output;
 use chrono::Utc;
@@ -98,7 +96,7 @@ fn run_under_lock(root: &LpmRoot, package: &str) -> Result<UninstallOutcome, Lpm
     // `lpm-global::shim::remove_shim`). If anything still fails after
     // the retries, the package would end up "uninstalled per the
     // manifest but still resolvable via PATH" — silent inconsistency
-    // (audit Medium from M3.3 round). Track failures, restore any
+    // (audit Medium from the audit). Track failures, restore any
     // shims we already removed (point them back at the install root,
     // which still exists at this point), then write WAL Abort and
     // surface a clear error.
@@ -229,7 +227,7 @@ fn build_uninstall_intent(
     // state. `prior_active_row_json` carries enough to identify the
     // owned commands; `prior_command_ownership_json` carries the
     // alias rows we'll be removing so a future "undo this uninstall"
-    // (not in M3, but the WAL contract assumes the snapshot is
+    // (future "undo" support, but the WAL contract assumes the snapshot is
     // complete) could restore them.
     let prior_active_row = serde_json::json!({
         "saved_spec": active.saved_spec,
@@ -262,7 +260,7 @@ fn build_uninstall_intent(
         }),
         new_aliases_json: serde_json::Value::Null,
         // Uninstall never resolves collisions — it only removes state.
-        // M4.2's ownership_delta is reserved for install/upgrade.
+        // the ownership_delta is reserved for install/upgrade.
         ownership_delta: Vec::new(),
     }))
 }
@@ -328,8 +326,8 @@ fn print_success(out: &UninstallOutcome, json_output: bool) {
 /// `Err` as "shim wasn't touched" would skip restoration for a
 /// command that was actually left half-removed, leaving the user with
 /// "manifest says installed, PATH inconsistent" state — exactly what
-/// the M3.3 audit pass-2 fix set out to eliminate (audit Medium from
-/// the M3.3 fix round). The conservative restore (re-emit the whole
+/// the audit pass-2 fix set out to eliminate (audit Medium from
+/// the fix round). The conservative restore (re-emit the whole
 /// triple via `emit_shim`'s atomic replace) is harmless when the
 /// removal completed and repairs the partial-removal case. On Unix
 /// every shim is one symlink, so partial removal is impossible — but
@@ -540,7 +538,7 @@ mod tests {
         assert!(final_manifest.aliases.contains_key("u-alias"));
     }
 
-    /// Audit Medium (M3.3 fix round): the partial-Windows-triple bug.
+    /// Audit Medium: the partial-Windows-triple bug.
     /// `remove_shim` returns `Err` as soon as one artifact's removal
     /// fails, even if earlier artifacts in the same call already
     /// succeeded. The caller MUST treat `Err` as "this command may be
@@ -609,7 +607,7 @@ mod tests {
         assert_eq!(failures.len(), 1);
     }
 
-    /// Audit Medium (M3.3 round): when shim removal fails, uninstall
+    /// Audit Medium: when shim removal fails, uninstall
     /// must NOT commit. The manifest entry stays, partially-removed
     /// shims get restored, and the user sees a clear error. Without
     /// this fix, `uninstall -g` would happily report success while
@@ -702,10 +700,10 @@ mod tests {
         );
     }
 
-    // ─── M4.5: uninstall invariant under the M4 manifest model ──
+    // ─── uninstall invariant under the manifest model ──
     //
-    // After M4.2, `PackageEntry.commands` excludes aliased-away names
-    // (the M4 manifest invariant). A package installed with
+    // `PackageEntry.commands` excludes aliased-away names (manifest
+    // invariant). A package installed with
     // `--alias serve=foo-serve` ends up with:
     //
     //     [packages.foo]
@@ -722,11 +720,11 @@ mod tests {
     // so a future refactor can't regress.
 
     #[test]
-    fn uninstall_under_m4_invariant_removes_aliased_name_only_not_orig() {
+    fn uninstall_under_alias_invariant_removes_aliased_name_only_not_orig() {
         let tmp = TempDir::new().unwrap();
         let root = LpmRoot::from_dir(tmp.path());
 
-        // Seed a package installed with the M4 invariant: `foo`
+        // Seed a package installed with the invariant: `foo`
         // declares [serve, lint] but serve is exposed via alias.
         let install_root = seed_active_package(&root, "foo", &["lint"]);
 
@@ -742,7 +740,7 @@ mod tests {
         write_for(&root, &manifest).unwrap();
 
         // Emit the real shim artifacts: `lint` (direct) and `foo-serve`
-        // (alias). `serve` is intentionally NOT emitted — the M4
+        // (alias). `serve` is intentionally NOT emitted — the alias
         // invariant says it shouldn't be.
         let bin_dir = root.bin_dir();
         std::fs::create_dir_all(&bin_dir).unwrap();
@@ -770,7 +768,7 @@ mod tests {
         // Sanity: `serve` shim must not exist pre-uninstall.
         assert!(
             std::fs::symlink_metadata(bin_dir.join("serve")).is_err(),
-            "M4 invariant: direct `serve` shim must never have been emitted"
+            "invariant: direct `serve` shim must never have been emitted"
         );
 
         // Run the uninstall — must complete cleanly even though foo

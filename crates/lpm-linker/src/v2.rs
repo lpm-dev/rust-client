@@ -199,7 +199,7 @@ pub fn link_packages_v2(
     // **Threshold.** Rayon's global thread pool spin-up cost is
     // measurable (~3-5 ms first call); for small installs the
     // sequential loop is cheaper. 32 is the cross-over point on
-    // M5 macOS APFS — below that, the thread-pool overhead exceeds
+    // macOS APFS — below that, the thread-pool overhead exceeds
     // the parallelism gain.
     use rayon::prelude::*;
     use std::sync::atomic::{AtomicUsize, Ordering};

@@ -176,8 +176,8 @@ impl SecurityPolicy {
 
     /// Lenient name-only check: returns true if the package name appears
     /// in `trustedDependencies` regardless of version, integrity, or
-    /// script hash. Used by the existing `lpm rebuild` code path before
-    /// M5 swaps to [`Self::can_run_scripts_strict`].
+    /// script hash. Used by legacy callers; superseded by
+    /// [`Self::can_run_scripts_strict`].
     ///
     /// Callers should prefer [`Self::can_run_scripts_strict`] which binds
     /// to the full `{name, version, integrity, script_hash}` tuple. The

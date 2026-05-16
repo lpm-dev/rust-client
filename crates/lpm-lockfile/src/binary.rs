@@ -1688,7 +1688,7 @@ mod tests {
 
     #[test]
     fn writer_rejects_empty_tarball() {
-        // M2 from 3rd-pass audit — `(off=0, len=0)` is the null
+        // Third-pass audit: `(off=0, len=0)` is the null
         // sentinel. An empty-string tarball inserted into an empty
         // StringTable would yield exactly `(0, 0)` and become
         // indistinguishable from `None`. The writer must refuse.

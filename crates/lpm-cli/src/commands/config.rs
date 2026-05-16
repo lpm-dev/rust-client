@@ -225,7 +225,7 @@ impl GlobalConfig {
     ///   wants multiple values must write a native TOML array.
     /// - Any other shape (integer, bool, single string, etc.) returns
     ///   `None` — callers treat that as "key absent" per the
-    ///   slice 5 `max-sandbox-write-roots` contract where
+    ///   `max-sandbox-write-roots` contract where
     ///   empty/unset means "no constraint".
     ///
     /// Used by the `max-sandbox-write-roots` reader on the sandbox
@@ -534,8 +534,8 @@ fn announce_set(key: &str, value: &str, json_output: bool) {
 }
 
 /// Disclosure printed after `script-policy = triage` is persisted (via
-/// either `--set` or interactive). After slice 1 the wizard
-/// now describes the actual install-time degrade-and-warn contract:
+/// either `--set` or interactive). The wizard describes the
+/// actual install-time degrade-and-warn contract:
 /// triage uses Layers 1-3 always, an optional advisor uplift kicks
 /// in if configured + available, and a configured-but-unavailable
 /// advisor degrades cleanly with a one-line warning per install run.
@@ -702,8 +702,8 @@ fn announce_sandbox_set(value: &str, json_output: bool) {
 }
 
 /// Disclosure printed after `triage-advisor = <value>` is persisted
-/// (via either `--set` or interactive). After slice 1 this describes
-/// the actual install-time contract:
+/// (via either `--set` or interactive). This describes the
+/// actual install-time contract:
 ///   - `lpm install` preflights the advisor once per run.
 ///   - If detect or test-invoke fails, the run degrades to
 ///     `triage-advisor = "none"` semantics and prints one warning;

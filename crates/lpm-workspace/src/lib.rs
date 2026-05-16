@@ -1353,7 +1353,7 @@ impl TrustedDependencies {
     }
 
     /// Lenient name-only check. Used by the existing `lpm rebuild` code
-    /// path before M5 swaps to `matches_strict`, and by post-M5 logic that
+    /// path before `matches_strict` was introduced, and by logic that
     /// just wants to know "does this name appear at all?" (e.g., the
     /// stale-trustedDependencies warning).
     pub fn contains_name_lenient(&self, name: &str) -> bool {

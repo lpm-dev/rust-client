@@ -1,12 +1,10 @@
 //! `lpm approve-scripts` — review and approve packages whose install scripts
 //! were blocked by the post-existing default-deny security posture.
 //!
-//! ## M4
-//!
 //! This command pairs with the post-install warning emitted by `lpm install`
 //! when packages with lifecycle scripts are not yet covered by an existing
 //! strict approval. It reads the install-time blocked set from
-//! `<project_dir>/.lpm/build-state.json` (written by M3) and lets the user
+//! `<project_dir>/.lpm/build-state.json` and lets the user
 //! approve them via:
 //!
 //! - **Interactive TUI** (`lpm approve-scripts`) — walk the blocked set one
@@ -306,7 +304,7 @@ async fn run_under_store_lock(
 
     let mut trusted = extract_trusted_dependencies(&manifest);
 
-    // ── sub-slice 6d — capability request + hash ────────
+    // ── capability request + hash ────────
     //
     // Parse the project's per-package capability request ONCE and
     // reuse the same `CapabilitySet` object for both:
@@ -1416,7 +1414,7 @@ fn _build_state_path_for_tests(project_dir: &Path) -> PathBuf {
     build_state::build_state_path(project_dir)
 }
 
-// ─── M5.3: approve-scripts --global ────────────────────────────
+// ─── approve-scripts --global ────────────────────────────
 
 /// Threshold at which `--group` auto-enables for `--global` review.
 /// Reviewing N-at-once packages one-by-one past this size is typically
@@ -1876,9 +1874,9 @@ async fn run_global_named(
     dry_run: bool,
     json_output: bool,
 ) -> Result<(), LpmError> {
-    // M5 audit (GPT finding 1): bare-name lookup must refuse silently-
+    // Audit: (GPT finding 1): bare-name lookup must refuse silently-
     // picking-first when multiple rows match. Aggregate rows are deduped
-    // by `(name, version, integrity, script_hash)` per M5's dedup rule,
+    // by `(name, version, integrity, script_hash)` per the dedup rule,
     // so a single bare name can legitimately resolve to multiple rows
     // (same package at different versions, OR same name@version with
     // different tarball bindings across install roots). Silently
@@ -2014,7 +2012,7 @@ enum AggregateLookup<'a> {
 
 /// Resolve an arg to an `AggregateLookup`. Replaces the pre-audit
 /// `find_aggregate_by_arg` which silently took the first match on
-/// bare-name lookups — see M5 audit finding 1.
+/// bare-name lookups — see Audit finding 1.
 fn lookup_aggregate_by_arg<'a>(
     rows: &'a [crate::global_blocked_set::AggregateBlockedRow],
     arg: &str,
@@ -3025,18 +3023,18 @@ mod tests {
         );
     }
 
-    // ── M6: end-to-end state-machine tests ─────────
+    // ── end-to-end state-machine tests ─────────
     //
     // These exercise the full install → block → review → approve → build
-    // pipeline by composing M3 (build_state capture) with M4 (approve-scripts)
-    // and re-running M3 to verify the suppression rule honors the new
+    // pipeline by composing build_state capture with approve-scripts
+    // and re-running to verify the suppression rule honors the new
     // approval. The actual `lpm rebuild` script execution is out of scope
-    // for unit tests (it spawns child processes); the strict gate that
-    // M5 wires in is verified separately by the build.rs::tests::build_strict_gate_*
+    // for unit tests (it spawns child processes); the strict gate is
+    // verified separately by the build.rs::tests::build_strict_gate_*
     // tests.
     //
     // The state machine cells we lock in:
-    //   1. install ⇒ block (M3 alone)
+    //   1. install ⇒ block
     //   2. install ⇒ block ⇒ approve via --yes ⇒ install ⇒ silent
     //   3. install ⇒ block ⇒ approve specific pkg ⇒ install ⇒ silent
     //   4. install ⇒ block ⇒ approve ⇒ script body changes ⇒ install ⇒ re-blocked
@@ -3297,7 +3295,7 @@ mod tests {
 
         // Legacy bare-name approval is enough to NOT block — install
         // proceeds silently. The deprecation warning is emitted at
-        // `lpm rebuild` time (M5), not here.
+        // `lpm rebuild` time, not here.
         assert!(cap.state.blocked_packages.is_empty());
         assert!(!cap.should_emit_warning);
     }
@@ -3952,7 +3950,7 @@ mod tests {
         // CLI-level subprocess test verifies the stdout layer.
     }
 
-    // ─── M5.3: approve-scripts --global ───────────────────────────────
+    // ─── approve-scripts --global ───────────────────────────────
 
     use crate::build_state::compute_blocked_set_fingerprint;
     use crate::global_blocked_set::{AggregateBlockedRow, AggregateBlockedSet};
@@ -4062,7 +4060,7 @@ mod tests {
         ));
     }
 
-    /// M5 audit finding 1 (Medium): bare-name lookup against a rows set
+    /// Audit: finding 1 (Medium): bare-name lookup against a rows set
     /// where two versions exist for the same name MUST return Ambiguous,
     /// not silently take the first. Pre-fix `find_aggregate_by_arg` did
     /// the latter — a latent data-corruption bug where
@@ -4088,7 +4086,7 @@ mod tests {
     /// name@version CAN be ambiguous too: two install roots that contain
     /// the same `name@version` but with different (integrity, script_hash)
     /// bindings (e.g., tarball swap between installs) produce two
-    /// aggregate rows per M5's dedup rule. User MUST disambiguate; silent
+    /// aggregate rows per the dedup rule. User MUST disambiguate; silent
     /// first-match would approve the wrong binding.
     #[test]
     fn lookup_aggregate_by_arg_is_ambiguous_when_name_at_version_matches_multiple_bindings() {
@@ -4307,7 +4305,7 @@ mod tests {
         );
     }
 
-    // ── sub-slice 6d follow-up — capability-widening
+    // ── capability-widening
     //    must flow through `compute_effective_blocked_set` ──
 
     /// Reviewer's Medium finding: the discovery-side filter

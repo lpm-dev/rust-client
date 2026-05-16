@@ -209,7 +209,7 @@ impl ScriptPolicyConfig {
             })
             .unwrap_or_default();
 
-        // slice 1: `package.json > lpm > triageAdvisor`.
+        // `package.json > lpm > triageAdvisor`.
         // Stored as a raw string; the install resolver normalises and
         // warns once if the slug is unknown.
         let triage_advisor = lpm
@@ -517,7 +517,7 @@ mod tests {
         );
     }
 
-    // ── triage_advisor reader (slice 1) ──────────────────
+    // ── triage_advisor reader ──────────────────────────────
     //
     // The reader stores the value verbatim; resolution + slug
     // validation happens later at the install-time call site

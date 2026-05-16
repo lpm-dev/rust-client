@@ -3277,7 +3277,7 @@ pub async fn run_with_options(
     // execution semantics are changed — tier-aware auto-run is,
     // gated on the sandbox.
     script_policy_override: Option<crate::script_policy_config::ScriptPolicy>,
-    // slice 1 — CLI `--advisor` override. Resolves to the
+    // CLI `--advisor` override. Resolves to the
     // top of the [`AdvisorSession::preflight`] precedence chain
     // (CLI → package.json → ~/.lpm/config.toml → `none`). Owned
     // `String` rather than `&str` so the value crosses the
@@ -3309,7 +3309,7 @@ pub async fn run_with_options(
     // into this policy (D16): drift and cooldown are orthogonal, so
     // their override flags stay separate.
     drift_ignore_policy: crate::provenance_fetch::DriftIgnorePolicy,
-    // rework : CLI sandbox-mode overrides.
+    // CLI sandbox-mode overrides.
     // `strict_sandbox=true` flips outbound network denial on for the
     // auto-build call; `no_sandbox=true` drops all containment for
     // that call. Clap-level mutex guarantees they never both arrive
@@ -3381,7 +3381,7 @@ async fn run_with_options_under_store_lock(
     target_set: Option<&[String]>,
     direct_versions_out: Option<&mut HashMap<String, lpm_semver::Version>>,
     script_policy_override: Option<crate::script_policy_config::ScriptPolicy>,
-    // slice 1 — see `run_with_options` for the contract.
+    // see `run_with_options` for the contract.
     advisor_override: Option<String>,
     min_release_age_override: Option<u64>,
     drift_ignore_policy: crate::provenance_fetch::DriftIgnorePolicy,
@@ -6438,8 +6438,7 @@ async fn run_with_options_under_store_lock(
     let install_user_bound =
         crate::capability::UserBound::from_global_config(&install_capability_cfg);
 
-    // **slice 1 — resolve script-policy + preflight advisor
-    // BEFORE the blocked-set capture.**
+    // **Resolve script-policy + preflight advisor BEFORE the blocked-set capture.**
     //
     // The capture writes to `.lpm/build-state.json`. If the advisor
     // approves an amber package this run, that package's scripts run
@@ -6675,7 +6674,7 @@ async fn run_with_options_under_store_lock(
                     &all_pkgs,
                     &policy,
                     project_dir,
-                    // sub-slice 6d follow-up — reuse
+                    // reuse
                     // the already-parsed capability inputs from the
                     // earlier capture call so the hint's trust label
                     // matches what rebuild::run will actually do.
@@ -7019,15 +7018,14 @@ async fn run_with_options_under_store_lock(
     //: consolidated into ScriptPolicyConfig so all four
     // script-related keys come from a single read.
     //
-    // slice 1 moved the script-policy resolution + advisor
-    // preflight UP to before the blocked-set capture (so approved
-    // packages can be excluded from the persisted set). The
+    // Script-policy resolution + advisor preflight runs before the
+    // blocked-set capture (so approved packages can be excluded from the
+    // persisted set). The
     // `step10_*` locals + `all_pkgs_for_build` + `advisor_session`
     // they produce are still in scope here; only the autoBuild
     // predicate + the rebuild::run call read them. No duplication.
 
-    // **P0 slice 4 + sub-slice 6c + slice 1
-    // review-fix.** `force_security_floor`, `all_trusted_for_auto_build`,
+    // **Review fix.** `force_security_floor`, `all_trusted_for_auto_build`,
     // and `auto_build_attempted` are now computed BEFORE the
     // blocked-set capture (so the capture can condition the
     // advisor-approval exclusion on whether autoBuild will fire).
@@ -7062,7 +7060,7 @@ async fn run_with_options_under_store_lock(
             None,  // default timeout
             json_output,
             false, // not --deny-all
-            // rework : forward the user's CLI
+            // forward the user's CLI
             // sandbox-mode choice to the auto-build rebuild call.
             // When the user explicitly opts into strict, the
             // auto-build greens run under strict too. When the user
@@ -9025,7 +9023,7 @@ async fn run_link_and_finish(
             .map_err(|e| LpmError::Registry(format!("{e}")))?;
     let offline_user_bound =
         crate::capability::UserBound::from_global_config(&offline_capability_cfg);
-    // slice 1 — the fast-path / offline install does NOT
+    // the fast-path / offline install does NOT
     // run the L4 advisor (scope was tightened to the online install
     // path). `None` passes through `compute_blocked_packages_with_metadata`
     // unchanged for this call.
@@ -9105,7 +9103,7 @@ async fn run_link_and_finish(
                     &all_pkgs,
                     &policy,
                     project_dir,
-                    // sub-slice 6d follow-up — reuse
+                    // reuse
                     // the offline-path capability inputs parsed
                     // earlier at the capture call site.
                     &offline_requested_capabilities,
@@ -10818,7 +10816,7 @@ pub async fn run_add_packages(
     // [`run_with_options`] for the resolution precedence and the
     // current consumer (triage-mode install summary line).
     script_policy_override: Option<crate::script_policy_config::ScriptPolicy>,
-    // slice 1: forwarded `--advisor` override. Opaque
+    // forwarded `--advisor` override. Opaque
     // pass-through to `run_with_options` — see that fn for the
     // precedence chain and validation contract.
     advisor_override: Option<String>,
@@ -10828,7 +10826,7 @@ pub async fn run_add_packages(
     // forwarded `--ignore-provenance-drift[-all]`
     // policy. Opaque pass-through — see [`run_with_options`].
     drift_ignore_policy: crate::provenance_fetch::DriftIgnorePolicy,
-    // rework : forwarded CLI sandbox-mode
+    // forwarded CLI sandbox-mode
     // overrides. Opaque pass-through — see [`run_with_options`].
     strict_sandbox: bool,
     no_sandbox: bool,
@@ -10985,7 +10983,7 @@ pub async fn run_add_packages(
     .await
 }
 
-/// M2: workspace-aware install entry point.
+/// workspace-aware install entry point.
 ///
 /// Resolves CLI `--filter` / `-w` / cwd into a concrete set of
 /// `package.json` files via [`crate::commands::install_targets`], mutates
@@ -11017,7 +11015,7 @@ pub async fn run_install_filtered_add(
     save_flags: crate::save_spec::SaveFlags,
     // forwarded CLI-side policy override.
     script_policy_override: Option<crate::script_policy_config::ScriptPolicy>,
-    // slice 1: forwarded `--advisor` override. Opaque
+    // forwarded `--advisor` override. Opaque
     // pass-through to `run_with_options` — see that fn for the
     // precedence chain and validation contract.
     advisor_override: Option<String>,
@@ -11027,7 +11025,7 @@ pub async fn run_install_filtered_add(
     // forwarded `--ignore-provenance-drift[-all]`
     // policy. Opaque pass-through — see [`run_with_options`].
     drift_ignore_policy: crate::provenance_fetch::DriftIgnorePolicy,
-    // rework : forwarded CLI sandbox-mode
+    // forwarded CLI sandbox-mode
     // overrides. Opaque pass-through — see [`run_with_options`].
     strict_sandbox: bool,
     no_sandbox: bool,
@@ -12245,7 +12243,7 @@ mod tests {
         assert!(should_auto_build(false, false, true, ScriptPolicy::Triage));
     }
 
-    // ── slice 1 second-pass review fix ──
+    // ── Second-pass review fix ───────────────────────────
     //
     // `select_approvals_for_capture` decides whether the blocked-set
     // capture sees the advisor's approval view. The contract is:

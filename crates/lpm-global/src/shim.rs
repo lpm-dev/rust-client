@@ -1,8 +1,8 @@
 //! Bin shim emission for `~/.lpm/bin/`.
 //!
-//! Both M3.2 (install --global) and the recovery roll-forward path
-//! produce shims through this module. M3.3 (uninstall) removes them
-//! through it too. Single source of truth for what a shim looks like
+//! Both `lpm install -g` and the recovery roll-forward path produce shims
+//! through this module. `lpm uninstall -g` removes them through it too.
+//! Single source of truth for what a shim looks like
 //! on each platform, and how it's swapped atomically when a collision
 //! resolution / upgrade rewrites it.
 //!
@@ -74,7 +74,7 @@ pub struct Shim {
     pub command_name: String,
     /// Absolute path of the file the shim should invoke. Must live
     /// inside the install root the shim is associated with — but this
-    /// invariant is enforced by the M3 install pipeline, not by the
+    /// invariant is enforced by the install pipeline, not by the
     /// shim writer (which only does platform-correct file emission).
     pub target: PathBuf,
 }
@@ -221,7 +221,7 @@ pub fn emit_shim(bin_dir: &Path, shim: &Shim) -> Result<EmittedShim, ShimError> 
 /// scanners, Explorer preview), mirroring [`emit_shim`]'s atomic
 /// swap. Without retry, uninstall would commit even when a shim
 /// briefly couldn't be unlinked, leaving a stale command on PATH
-/// (audit Medium from M3.3 round).
+/// (audit Medium from the audit).
 pub fn remove_shim(bin_dir: &Path, command_name: &str) -> Result<Vec<PathBuf>, ShimError> {
     validate_command_name(command_name)?;
     let mut removed = Vec::new();
@@ -499,7 +499,7 @@ mod tests {
 
     #[test]
     fn validate_command_name_accepts_leading_dash() {
-        // Pre-M3.1-audit this was rejected as UX policy. Now matches
+        // Before the audit this was rejected as UX policy. Now matches
         // npm/pnpm/bun behavior: leading dashes are uncommon but valid
         // bin names. Audit Answer #3.
         assert!(validate_command_name("-rf").is_ok());

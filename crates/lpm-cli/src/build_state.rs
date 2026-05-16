@@ -549,8 +549,7 @@ pub fn compute_blocked_packages_with_metadata(
 
             let (is_blocked, binding_drift) = match trust {
                 // Strict approval covers this exact tuple — NOT blocked
-                // by the script-hash gate. **P0 sub-slice 6d
-                // follow-up:** additionally consult the capability gate.
+                // by the script-hash gate — but also consult the capability gate.
                 // A Strict-matched package with a widened capability
                 // request that the stored binding doesn't cover must
                 // still be blocked so approve-scripts can surface it.
@@ -576,8 +575,7 @@ pub fn compute_blocked_packages_with_metadata(
                 }
                 // Legacy bare-name entry covers it leniently — NOT blocked
                 // (the existing build pipeline will run the script with a
-                // deprecation warning per M5). **Sub-slice 6d follow-up:**
-                // Legacy entries have no binding to check the capability
+                // deprecation warning). Legacy entries have no binding to check the capability
                 // hash against; the helper returns true for any widening
                 // request against a Legacy match. That's correct — a
                 // bare-name approval cannot cover a widening capability
@@ -654,8 +652,7 @@ pub fn compute_blocked_packages_with_metadata(
 /// that supplies an empty metadata map + baseline capability
 /// defaults.
 ///
-/// **Post-P0 sub-slice 6d-follow-up:** all production
-/// install paths call `_with_metadata` directly with the project's
+/// All production install paths call `_with_metadata` directly with the project's
 /// real `CapabilitySet` + `UserBound` so capture + enforcement
 /// cannot diverge. This wrapper is retained solely as the stable
 /// test-facing signature; tests that don't exercise the capability
@@ -698,13 +695,13 @@ pub fn capture_blocked_set_after_install_with_metadata(
     installed: &[(String, String, Option<String>)],
     policy: &SecurityPolicy,
     metadata: &BlockedSetMetadata,
-    // sub-slice 6d follow-up — threaded through to
+    // threaded through to
     // `compute_blocked_packages_with_metadata` so install-time
     // capture catches capability-widened packages that strict-
     // match on script-hash.
     requested_capabilities: &crate::capability::CapabilitySet,
     user_bound: &crate::capability::UserBound,
-    // slice 1 — see `compute_blocked_packages_with_metadata`.
+    // see `compute_blocked_packages_with_metadata`.
     // When `Some`, matching triples are removed from the persisted
     // blocked set before fingerprint + write so post-install JSON
     // + the "remain blocked after auto-build" pointer don't report
@@ -1693,7 +1690,7 @@ mod tests {
         )
         .unwrap();
 
-        // Legacy approval is enough to NOT block (M5 will run the script
+        // Legacy approval is enough to NOT block (rebuild will run the script
         // with a deprecation warning). The blocked set is for things the
         // user must REVIEW.
         assert!(capture.state.blocked_packages.is_empty());
@@ -2324,7 +2321,7 @@ mod tests {
         );
     }
 
-    // ── slice 1 — advisor-approved packages are excluded
+    // ── advisor-approved packages are excluded
     //                       from the persisted blocked set ──────────
 
     #[test]
@@ -2614,7 +2611,7 @@ mod tests {
         );
     }
 
-    // ── sub-slice 6d follow-up — capability widening
+    // ── capability widening
     //    must land in the blocked set even under strict match ──
 
     /// Reviewer's High finding: a package whose script-hash

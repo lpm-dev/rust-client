@@ -620,7 +620,7 @@ pub async fn run(
         checks.push(ws_check);
     }
 
-    // === Global installs (Extended, M6.2) ===
+    // === Global installs (Extended) ===
     //
     // Four checks, all gated on the existence of `~/.lpm/global/`:
     //
@@ -1708,7 +1708,7 @@ async fn run_doctor_install(client: &RegistryClient, project_dir: &Path) -> Resu
         None, // advisor_override: `lpm doctor` does not expose `--advisor`
         None, // min_release_age_override: `lpm doctor` uses the package.json/global/default chain
         crate::provenance_fetch::DriftIgnorePolicy::default(), // drift-ignore: `lpm doctor` enforces drift like a normal install
-        // rework: doctor's auto-fix install does not
+        // doctor's auto-fix install does not
         // surface its own sandbox-mode flags. Falls through the
         // env / config / default chain.
         false, // strict_sandbox
@@ -2045,7 +2045,7 @@ fn check_manifest_compat(project_dir: &Path) -> Vec<Check> {
         .collect()
 }
 
-// ─── M6.2: global-installs health checks ─────────────────────
+// ─── global-installs health checks ─────────────────────
 
 /// Top-level entry for the global health checks. Returns an empty Vec
 /// if `~/.lpm/global/` doesn't exist (fresh machine / project-only
@@ -2240,7 +2240,7 @@ fn check_install_root_consistency(
             "no packages to check",
         );
     }
-    // M6 audit finding 2 (Medium): use `validate_install_root`, the
+    // Audit: finding 2 (Medium): use `validate_install_root`, the
     // authoritative predicate the install pipeline + recovery both
     // rely on. Pre-fix, Check 17 only checked `.lpm-install-ready`
     // presence — that's strictly weaker than what recovery would do.
@@ -2396,7 +2396,7 @@ fn check_script_policy_surface() -> Vec<Check> {
     out
 }
 
-/// slice 4 — report the force-security-floor kill-switch
+/// report the force-security-floor kill-switch
 /// state. Returns `None` when the flag is unset (the default), so
 /// clean output stays clean. Returns `Some(Check::warn(...))` when
 /// set, naming the count of suspended approvals if a project
@@ -2506,7 +2506,7 @@ fn probe_sandbox_backend() -> Check {
     // from a deleted directory) falls back to the strict default —
     // there's no config to parse in that case.
     let (sandbox_options, resolved_mode) = match std::env::current_dir() {
-        // rework: route through the precedence chain so
+        // route through the precedence chain so
         // `LPM_STRICT_SANDBOX=1` and `[sandbox] mode` flow through
         // the doctor probe identically to the install pipeline.
         Ok(cwd) => match crate::sandbox_config::resolve_sandbox_mode_from_chain(&cwd, false, false)
@@ -2890,7 +2890,7 @@ mod tests {
             "doctor detail must name the active backend; got: {}",
             c.detail
         );
-        // rework: legacy partner flag must never appear.
+        // legacy partner flag must never appear.
         assert!(
             !c.detail.contains("--unsafe-full-env"),
             "legacy partner flag must be gone from doctor output: {}",
@@ -3808,7 +3808,7 @@ commands = []
         );
     }
 
-    // ─── M6.2: global-installs health checks ─────────────────
+    // ─── global-installs health checks ─────────────────
 
     use chrono::Utc;
     use lpm_common::LpmRoot;
@@ -3965,7 +3965,7 @@ commands = []
         );
     }
 
-    /// M6 audit finding 2 (Medium): Check 17 must use the authoritative
+    /// Audit: finding 2 (Medium): Check 17 must use the authoritative
     /// `validate_install_root` predicate. Pre-fix, it only checked
     /// `.lpm-install-ready` presence, so a half-corrupted install with
     /// a marker but missing bin targets would have been reported
@@ -4053,7 +4053,7 @@ commands = []
         assert!(matches!(check.severity, Severity::Fail));
         assert!(
             check.detail.contains("not ready"),
-            "post-M6-audit Check 17 uses the authoritative predicate \
+            "post-audit Check 17 uses the authoritative predicate \
              and renders all sub-failures under the `not ready` category: {}",
             check.detail,
         );

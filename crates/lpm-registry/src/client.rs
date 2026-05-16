@@ -8806,7 +8806,7 @@ mod tests {
 
     #[test]
     fn validate_pem_root_catches_malformed_second_block_in_multi_cert_bundle() {
-        // M1 regression — pre-fix `validate_pem_root` only validated the
+        // Regression — pre-fix `validate_pem_root` only validated the
         // FIRST cert block in a PEM. A common cafile shape (root + intermediate
         // bundle, multi-CERT) where block 1 was valid but block 2 was malformed
         // would slip through validation and surface as a generic

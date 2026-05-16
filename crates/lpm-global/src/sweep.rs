@@ -125,7 +125,7 @@ fn sweep_under_lock(root: &LpmRoot) -> Result<SweepReport, LpmError> {
     let pending: Vec<String> = std::mem::take(&mut manifest.tombstones);
 
     for relative_path in pending {
-        // M3.5 audit Finding 1 (High): manifests are not necessarily
+        // Audit: Finding 1 (High): manifests are not necessarily
         // trustworthy. Recovery's `relative_install_root` already
         // refuses to *write* a tombstone path that escapes
         // `global_root`, but a corrupted, hand-edited, or
@@ -189,7 +189,7 @@ fn sweep_under_lock(root: &LpmRoot) -> Result<SweepReport, LpmError> {
 /// shape produced by `LpmRoot::install_root_for`.
 ///
 /// **Why such a strict shape and not "any relative path under the
-/// global root"?** The first audit pass (M3.5 audit Finding 1) only
+/// global root"?** The first audit pass (Audit Finding 1) only
 /// blocked `..` and absolute paths, with a final `starts_with(global_root)`
 /// guard. That closed the `../../etc` escape but still admitted poisoned
 /// entries like `"."` (resolves to `global_root` itself) or `"installs"`
@@ -243,7 +243,7 @@ fn validated_tombstone_path(global_root: &Path, relative_path: &str) -> Result<P
             }
             Component::CurDir => {
                 // Real writers never emit `./` prefixes; treating them as
-                // benign (the M3.5 first-pass audit's regression) admitted
+                // benign (the first-pass audit's regression) admitted
                 // shapes like `"./installs"` whose component count was
                 // misjudged downstream. Refuse outright.
                 return Err(format!(
@@ -526,7 +526,7 @@ mod tests {
         assert_eq!(report.swept.len(), 1);
     }
 
-    // ─── M3.5 audit Finding 1 (High): poisoned-tombstone validation ──
+    // ─── Audit Finding 1 (High): poisoned-tombstone validation ──
     //
     // Recovery's `relative_install_root` only writes tombstones that
     // strip cleanly under `global_root`. The sweep, however, reads
@@ -684,13 +684,13 @@ mod tests {
         assert!(validated_tombstone_path(global_root, "installs/eslint@9.24.0").is_ok());
         assert!(validated_tombstone_path(global_root, "installs/@scope+pkg@1.0.0").is_ok());
 
-        // Pre-existing M3.5 first-pass refusals.
+        // Pre-existing first-pass refusals.
         assert!(validated_tombstone_path(global_root, "").is_err());
         assert!(validated_tombstone_path(global_root, "../escape").is_err());
         assert!(validated_tombstone_path(global_root, "installs/../escape").is_err());
         assert!(validated_tombstone_path(global_root, "/etc/passwd").is_err());
 
-        // M3.5 second-pass audit Finding 1 (High) — these used to slip
+        // Audit Finding 1 (High) — these used to slip
         // through the "stays under global_root" check and let
         // remove_dir_all wipe the whole global state or every install root.
         // Either of two refusal axes (shape OR component-kind) is

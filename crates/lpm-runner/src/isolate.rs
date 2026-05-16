@@ -1,8 +1,8 @@
 //! `IsolatedInstall`: per-spec install root for `lpm dlx`.
 //!
-//! M2 introduced this primitive as the abstraction shared between
+//! This primitive was introduced as the abstraction shared between
 //! `lpm dlx` and `lpm install -g`, with the ambition of "one engine,
-//! two policies." In practice, M3 wired `lpm install -g` through
+//! two policies." In practice, `lpm install -g` is wired through
 //! `commands::install::run_with_options` directly (with a synthetic
 //! `package.json`) — the resolver / store / extractor sharing that
 //! the abstraction was meant to provide is achieved through the inner
@@ -91,7 +91,7 @@ impl IsolatedInstall {
     /// Generate the `package.json` text the install pipeline writes
     /// into the install root: single dependency on `spec`, marked
     /// private so npm/yarn/pnpm wouldn't try to publish it. Same
-    /// shape as the pre-M2 dlx writer at `commands::run::dlx`.
+    /// shape as the prior dlx writer at `commands::run::dlx`.
     pub fn manifest_text(&self) -> String {
         let (pkg_name, version_spec) = dlx::parse_package_spec(&self.spec);
         format!(r#"{{"private":true,"dependencies":{{"{pkg_name}":"{version_spec}"}}}}"#)

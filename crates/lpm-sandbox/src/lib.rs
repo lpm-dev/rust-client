@@ -1136,7 +1136,7 @@ mod tests {
         let msg = format!("{e}");
         assert!(msg.contains("linux"), "got: {msg}");
         assert!(msg.contains("LogOnly"), "got: {msg}");
-        // rework: single `--no-sandbox` flag.
+        // single `--no-sandbox` flag.
         assert!(
             msg.contains("--no-sandbox"),
             "must point at the workaround: {msg}"
@@ -1153,7 +1153,7 @@ mod tests {
         // (FreeBSD, OpenBSD, illumos, …).
         let s = unsupported_remediation("freebsd");
         assert!(s.contains("freebsd"));
-        // rework: single `--no-sandbox` flag.
+        // single `--no-sandbox` flag.
         assert!(s.contains("--no-sandbox"));
         assert!(
             !s.contains("--unsafe-full-env"),
@@ -1435,7 +1435,7 @@ mod tests {
                 remediation,
             }) => {
                 assert_eq!(platform, std::env::consts::OS);
-                // rework: single `--no-sandbox` flag.
+                // single `--no-sandbox` flag.
                 assert!(remediation.contains("--no-sandbox"));
                 assert!(
                     !remediation.contains("--unsafe-full-env"),
