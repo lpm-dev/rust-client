@@ -384,7 +384,7 @@ mod tests {
         assert_eq!(format_rfc3339(0), "1970-01-01T00:00:00Z");
         // 2000-01-01T00:00:00Z = 946684800
         assert_eq!(format_rfc3339(946_684_800), "2000-01-01T00:00:00Z");
-        //T12:34:56Z = 1775910896 (verified via macOS `date`)
-        assert_eq!(format_rfc3339(1_775_910_896), "T12:34:56Z");
+        // 2026-04-11T12:34:56Z = 1775910896 (verified via macOS `date`)
+        assert_eq!(format_rfc3339(1_775_910_896), "2026-04-11T12:34:56Z");
     }
 }

@@ -4086,7 +4086,7 @@ async fn run_with_options_under_store_lock(
         // `auto_install_peers` is on.
         if lockfile_needs_r25_repair(&fast.lockfile, auto_install_peers) {
             return Err(LpmError::Registry(
-                "--offline cannot use an older-format lockfile under \
+                "--offline cannot use a pre-R2.5 lockfile under \
                  `lpm.autoInstallPeers = true`: the lockfile may be missing \
                  ambient-peer-install state. Run \
                  `lpm install` (online) once to re-derive and upgrade the \
@@ -12101,7 +12101,7 @@ mod tests {
             env!("CARGO_MANIFEST_DIR"),
             "/src/commands/install.rs"
         ));
-        const DRIFT_MARKER: &str = "P4 provenance-drift gate";
+        const DRIFT_MARKER: &str = "provenance-drift gate";
         const BUILD_RUN_CALL: &str = "crate::commands::rebuild::run(";
 
         let drift_pos = src.find(DRIFT_MARKER).unwrap_or_else(|| {
