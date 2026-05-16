@@ -319,18 +319,16 @@ pub(crate) fn render_profile(
 /// present. A `.env` that the lifecycle script later creates
 /// (writing to a writable parent) and then re-reads is still
 /// denied because the path matches the literal rule.
-fn render_secret_denies(
-    out: &mut String,
-    canon_project_dir: &Path,
-) -> Result<(), SandboxError> {
-    let project_str = canon_project_dir
-        .to_str()
-        .ok_or_else(|| SandboxError::ProfileRenderFailed {
-            reason: format!(
-                "canon_project_dir is not valid UTF-8: {}",
-                canon_project_dir.display()
-            ),
-        })?;
+fn render_secret_denies(out: &mut String, canon_project_dir: &Path) -> Result<(), SandboxError> {
+    let project_str =
+        canon_project_dir
+            .to_str()
+            .ok_or_else(|| SandboxError::ProfileRenderFailed {
+                reason: format!(
+                    "canon_project_dir is not valid UTF-8: {}",
+                    canon_project_dir.display()
+                ),
+            })?;
     let project_re_escaped = regex_escape_literal_path(project_str);
 
     out.push_str("(deny file-read*\n");
@@ -407,8 +405,7 @@ fn regex_escape_literal_path(path: &str) -> String {
     let mut out = String::with_capacity(path.len() + 8);
     for c in path.chars() {
         match c {
-            '.' | '(' | ')' | '[' | ']' | '{' | '}' | '+' | '*' | '?' | '|' | '^' | '$'
-            | '\\' => {
+            '.' | '(' | ')' | '[' | ']' | '{' | '}' | '+' | '*' | '?' | '|' | '^' | '$' | '\\' => {
                 out.push('\\');
                 out.push(c);
             }
@@ -982,8 +979,12 @@ mod tests {
     #[test]
     fn secret_deny_block_comes_after_broad_file_read_allow() {
         let p = render_profile(&spec(), false).unwrap();
-        let allow_idx = p.find("(allow file-read*").expect("must contain file-read* allow");
-        let deny_idx = p.find("(deny file-read*").expect("must contain file-read* deny");
+        let allow_idx = p
+            .find("(allow file-read*")
+            .expect("must contain file-read* allow");
+        let deny_idx = p
+            .find("(deny file-read*")
+            .expect("must contain file-read* deny");
         assert!(
             deny_idx > allow_idx,
             "deny block must follow the broad allow for last-match-wins to fire:\n{p}"
@@ -1077,7 +1078,15 @@ mod tests {
     #[test]
     fn profile_denies_credential_subpath_dirs() {
         let p = render_profile(&spec(), false).unwrap();
-        for d in [".ssh", ".aws", ".kube", ".gcp", ".terraform", "secrets", "secret"] {
+        for d in [
+            ".ssh",
+            ".aws",
+            ".kube",
+            ".gcp",
+            ".terraform",
+            "secrets",
+            "secret",
+        ] {
             let sub = format!(r#"(subpath "/home/u/proj/{d}")"#);
             assert!(p.contains(&sub), "profile must deny {d} subpath: {p}");
         }

@@ -255,11 +255,7 @@ fn collect_files_recursive(
 /// Bounded walk from `root` that pushes any regular file whose
 /// basename ends with one of `SECRET_FILE_EXTENSIONS`. Prunes
 /// `WALK_PRUNED_DIRS` and caps depth at `WALK_MAX_DEPTH`.
-fn walk_for_extensions(
-    root: &Path,
-    out: &mut Vec<PathBuf>,
-    allow_set: &HashSet<&Path>,
-) {
+fn walk_for_extensions(root: &Path, out: &mut Vec<PathBuf>, allow_set: &HashSet<&Path>) {
     let mut stack: Vec<(PathBuf, usize)> = vec![(root.to_path_buf(), 0)];
     while let Some((dir, depth)) = stack.pop() {
         let Ok(entries) = std::fs::read_dir(&dir) else {
@@ -583,7 +579,10 @@ mod tests {
                 !s.contains("/node_modules/"),
                 "node_modules must be pruned: {s}"
             );
-            assert!(!s.contains("/.git/"), ".git must be pruned (except .git/config, .git/credentials handled by the LITERAL list): {s}");
+            assert!(
+                !s.contains("/.git/"),
+                ".git must be pruned (except .git/config, .git/credentials handled by the LITERAL list): {s}"
+            );
             assert!(!s.contains("/target/"), "target must be pruned: {s}");
         }
     }
@@ -614,8 +613,7 @@ mod tests {
             let outside = tempfile::tempdir().unwrap();
             fs::write(outside.path().join("real.env"), "secret").unwrap();
             // Symlink `.env` -> outside file.
-            std::os::unix::fs::symlink(outside.path().join("real.env"), root.join(".env"))
-                .unwrap();
+            std::os::unix::fs::symlink(outside.path().join("real.env"), root.join(".env")).unwrap();
             // Leak the outside tempdir so the symlink stays valid
             // for the test (the assertion runs before this fn
             // returns, but the symlink target's existence is
@@ -641,8 +639,14 @@ mod tests {
         });
         let allow = vec![tmp.path().join(".env")];
         let v = enumerate_project_secrets(tmp.path(), &allow);
-        assert!(!v.contains(&tmp.path().join(".env")), "allow-listed .env must be excluded");
-        assert!(v.contains(&tmp.path().join("cert.pem")), "non-allowlisted cert.pem still enumerated");
+        assert!(
+            !v.contains(&tmp.path().join(".env")),
+            "allow-listed .env must be excluded"
+        );
+        assert!(
+            v.contains(&tmp.path().join("cert.pem")),
+            "non-allowlisted cert.pem still enumerated"
+        );
     }
 
     /// Allow-list with a path NOT present in the project doesn't
@@ -736,8 +740,14 @@ mod tests {
     #[cfg(target_os = "macos")]
     fn const_tables_mirror_seatbelt_lists() {
         use crate::seatbelt;
-        assert_eq!(SECRET_LITERAL_PATHS, seatbelt::DENY_READ_LITERAL_PROJECT_PATHS);
-        assert_eq!(SECRET_SUBPATH_DIRS, seatbelt::DENY_READ_SUBPATH_PROJECT_DIRS);
+        assert_eq!(
+            SECRET_LITERAL_PATHS,
+            seatbelt::DENY_READ_LITERAL_PROJECT_PATHS
+        );
+        assert_eq!(
+            SECRET_SUBPATH_DIRS,
+            seatbelt::DENY_READ_SUBPATH_PROJECT_DIRS
+        );
         // Seatbelt's regex suffixes use regex syntax (`/.*\.pem`);
         // ours use plain suffix strings (`.pem`). Pin a manual
         // mapping check rather than direct equality so we catch

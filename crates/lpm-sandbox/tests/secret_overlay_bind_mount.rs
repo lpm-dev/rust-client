@@ -94,9 +94,7 @@ fn default_mode_bind_mounts_dotenv_to_empty() {
     cmd.stderr = SandboxStdio::Piped;
 
     let child = sandbox.spawn(cmd).expect("spawn /bin/cat under sandbox");
-    let output = child
-        .wait_with_output()
-        .expect("collect /bin/cat output");
+    let output = child.wait_with_output().expect("collect /bin/cat output");
 
     assert!(
         output.stdout.is_empty(),

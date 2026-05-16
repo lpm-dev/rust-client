@@ -1290,9 +1290,7 @@ mod tests {
     /// stays inside project_dir.
     #[test]
     fn read_allow_nested_project_path_accepted() {
-        let e = fixture(
-            r#"{"lpm":{"scripts":{"sandboxReadAllow":["services/api/.env"]}}}"#,
-        );
+        let e = fixture(r#"{"lpm":{"scripts":{"sandboxReadAllow":["services/api/.env"]}}}"#);
         let v = load_sandbox_read_allow(&e.package_json, &e.project, &[]).unwrap();
         assert_eq!(v, vec![e.project.join("services/api/.env")]);
     }
