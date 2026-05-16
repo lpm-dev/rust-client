@@ -192,6 +192,17 @@ enum Commands {
         /// Directory to extract into (default: current directory).
         #[arg(long, short)]
         output: Option<String>,
+
+        /// Proceed even when the registry returns no integrity hash
+        /// for the tarball. By default `lpm download` refuses to
+        /// extract an unverified tarball — the command is documented
+        /// for audit use, where silently accepting bytes without an
+        /// SRI defeats the purpose. Use this flag for sources
+        /// (legacy mirrors, GitHub release assets) that genuinely
+        /// don't ship integrity, accepting that you take on the
+        /// verification burden yourself.
+        #[arg(long = "allow-unverified")]
+        allow_unverified: bool,
     },
 
     /// Resolve dependency tree for packages.
@@ -2664,12 +2675,14 @@ async fn async_main() -> Result<()> {
             package,
             package_version,
             output,
+            allow_unverified,
         } => {
             commands::download::run(
                 &client,
                 &package,
                 package_version.as_deref(),
                 output.as_deref(),
+                allow_unverified,
                 cli.json,
             )
             .await
@@ -4409,11 +4422,31 @@ mod tests {
                 package,
                 package_version,
                 output,
+                allow_unverified,
             }) => {
                 assert_eq!(package, "react");
                 assert_eq!(package_version.as_deref(), Some("1.0.0"));
                 assert!(output.is_none());
+                assert!(
+                    !allow_unverified,
+                    "allow_unverified must default to false — refuse-by-default audit posture",
+                );
             }
+            _ => panic!("expected download command"),
+        }
+    }
+
+    /// `--allow-unverified` is opt-in and must be plumbed through the
+    /// parser so a user who explicitly accepts the risk of an
+    /// integrity-less tarball can do so without the parser swallowing
+    /// the flag.
+    #[test]
+    fn download_subcommand_parses_allow_unverified_flag() {
+        let cli = Cli::try_parse_from(["lpm", "download", "react", "--allow-unverified"]).unwrap();
+        match cli.command {
+            Some(Commands::Download {
+                allow_unverified, ..
+            }) => assert!(allow_unverified, "flag must surface as true"),
             _ => panic!("expected download command"),
         }
     }

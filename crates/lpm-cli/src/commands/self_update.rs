@@ -180,6 +180,17 @@ pub async fn run(json_output: bool, refresh: bool) -> Result<(), LpmError> {
         InstallMethod::Homebrew => run_shell_update("brew", &["upgrade", "lpm"])?,
         InstallMethod::Cargo => {
             let tag = format!("v{latest}");
+            // `--locked` forces resolution against the Cargo.lock
+            // shipped with the tag rather than re-solving the
+            // dependency graph at install time. Without it, an
+            // attacker who compromised any direct or transitive dep's
+            // registry entry between our release time and the user's
+            // install could inject a different transitive package
+            // version into the build — same supply-chain blast as the
+            // mutable-git-tag concern in the finding, just one hop
+            // further down. `--locked` was a behaviour change in
+            // recent cargo (now standard for reproducible installs);
+            // every modern cargo (≥1.74) supports it.
             run_shell_update(
                 "cargo",
                 &[
@@ -190,6 +201,7 @@ pub async fn run(json_output: bool, refresh: bool) -> Result<(), LpmError> {
                     &tag,
                     "lpm-cli",
                     "--force",
+                    "--locked",
                 ],
             )?;
         }
@@ -276,7 +288,7 @@ impl InstallMethod {
             InstallMethod::Npm => format!("npm install -g @lpm-registry/cli@{version}"),
             InstallMethod::Homebrew => "brew upgrade lpm".into(),
             InstallMethod::Cargo => format!(
-                "cargo install --git https://github.com/lpm-dev/rust-client --tag v{version} lpm-cli --force"
+                "cargo install --git https://github.com/lpm-dev/rust-client --tag v{version} lpm-cli --force --locked"
             ),
             InstallMethod::Standalone => standalone_command(version),
         }

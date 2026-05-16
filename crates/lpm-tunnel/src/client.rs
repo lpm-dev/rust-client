@@ -669,9 +669,19 @@ async fn try_connect(
 
     on_connected(&session);
 
-    // Create HTTP client for local proxying
+    // Create HTTP client for local proxying. `Policy::none()` disables
+    // redirect-following entirely — the local dev server should never
+    // 30x our tunnel forwarder anywhere meaningful, and an attacker-
+    // controlled `Location: http://169.254.169.254/...` from a buggy
+    // or compromised local server would otherwise let the forwarder
+    // probe cloud-metadata endpoints, AWS IMDS, or other localhost
+    // services on behalf of the relay. The relay only ever wants the
+    // dev server's direct response, never the response after a chain
+    // of redirects, so refusing them is both safer and more
+    // predictable.
     let http_client = reqwest::Client::builder()
         .no_proxy()
+        .redirect(reqwest::redirect::Policy::none())
         .build()
         .map_err(|e| LpmError::Tunnel(format!("failed to create HTTP client: {e}")))?;
 
