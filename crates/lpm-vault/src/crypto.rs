@@ -117,8 +117,33 @@ fn store_wrapping_key_in_keyring(key: &[u8; 32]) -> Result<(), String> {
 }
 
 /// Read the wrapping key from the file fallback.
+///
+/// On Unix, refuses to surface the key when the file's mode is more
+/// permissive than 0o600 — the write-side already sets 0o600, but a
+/// host that restored the file from a backup or a user who manually
+/// `chmod`-ed it could end up with the key world-readable. Refusing
+/// at read time forces the user to notice and re-chmod (or force a
+/// fresh key by removing the file), rather than silently using a
+/// key any local UID could exfiltrate.
 fn read_wrapping_key_from_file() -> Option<[u8; 32]> {
     let key_path = dirs::home_dir()?.join(".lpm").join(".vault-key");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if let Ok(meta) = std::fs::metadata(&key_path)
+            && (meta.permissions().mode() & 0o777) > 0o600
+        {
+            tracing::warn!(
+                ".vault-key at {} has permissive mode {:o} (>0o600); refusing to use \
+                 the file-fallback wrapping key. Run `chmod 600 {}` to restore the \
+                 source, or delete the file to force a fresh key on next write.",
+                key_path.display(),
+                meta.permissions().mode() & 0o777,
+                key_path.display(),
+            );
+            return None;
+        }
+    }
     let hex_key = std::fs::read_to_string(&key_path).ok()?;
     let bytes = hex::decode(hex_key.trim()).ok()?;
     if bytes.len() != 32 {

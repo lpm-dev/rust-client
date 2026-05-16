@@ -1191,8 +1191,16 @@ async fn flow_env_push_pull_cross_machine_round_trip() {
     for project in [&machine_a, &machine_b] {
         let lpm_dir = project.home().join(".lpm");
         std::fs::create_dir_all(&lpm_dir).expect("create ~/.lpm");
-        std::fs::write(lpm_dir.join(".vault-key"), &shared_wrapping_key_hex)
-            .expect("seed .vault-key");
+        let key_path = lpm_dir.join(".vault-key");
+        std::fs::write(&key_path, &shared_wrapping_key_hex).expect("seed .vault-key");
+        // `read_wrapping_key_from_file` refuses world-readable keys
+        // (M27). Match the production write-side which chmods 0o600.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o600))
+                .expect("chmod seeded .vault-key");
+        }
     }
 
     // Step 1 — machine A: stage a secret + push.

@@ -283,11 +283,31 @@ fn write_tofu_pin(host: &str, pin_hex: &str) -> Result<(), String> {
     let parent = path.parent().unwrap();
     std::fs::create_dir_all(parent)
         .map_err(|e| format!("failed to create {}: {e}", parent.display()))?;
-    std::fs::write(&path, pin_hex).map_err(|e| format!("failed to write relay pin: {e}"))?;
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+        // Open with O_CREAT|O_TRUNC|O_WRONLY and mode 0o600 so the
+        // file lands owner-only from creation rather than via a
+        // post-write chmod. Closes the race window where another
+        // process could observe the pin file between the umask-based
+        // create and the set_permissions call. The pin itself is not
+        // a secret (it's an SPKI hash), but locking it down at create
+        // time matches the broader credential-metadata posture and
+        // prevents tampering by other local UIDs.
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&path)
+            .map_err(|e| format!("failed to open relay pin for write: {e}"))?;
+        f.write_all(pin_hex.as_bytes())
+            .map_err(|e| format!("failed to write relay pin: {e}"))?;
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::write(&path, pin_hex).map_err(|e| format!("failed to write relay pin: {e}"))?;
     }
     Ok(())
 }

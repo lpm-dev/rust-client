@@ -57,6 +57,17 @@ fn sync_request_timeout(default: std::time::Duration) -> std::time::Duration {
     }
 }
 
+/// Build the lpm-vault HTTP client with an explicit redirect policy
+/// pinned. reqwest's `Policy::limited` strips `Authorization` on
+/// cross-origin redirects by default; pinning it here documents the
+/// contract so a future builder edit can't drop the strip implicitly.
+/// The bearer-leak shape — a malicious or misconfigured registry
+/// 30x'ing to `attacker.example` and having our bearer follow — is
+/// the L16 hazard this closes alongside the `bearer_auth` migration.
+fn sync_http_client_builder() -> reqwest::ClientBuilder {
+    reqwest::Client::builder().redirect(reqwest::redirect::Policy::limited(10))
+}
+
 /// Response from push endpoint.
 #[derive(Debug, serde::Deserialize)]
 pub struct PushResponse {
@@ -114,7 +125,9 @@ pub struct ListVaultsResponse {
 /// List all cloud vaults for the authenticated user.
 pub async fn list_remote(registry_url: &str, auth_token: &str) -> Result<Vec<RemoteVault>, String> {
     let url = format!("{registry_url}/api/vaults");
-    let client = reqwest::Client::new();
+    let client = sync_http_client_builder()
+        .build()
+        .map_err(|e| format!("failed to build http client: {e}"))?;
 
     let response = client
         .get(&url)
@@ -183,7 +196,9 @@ pub async fn push_raw(
 
     let (encrypted_blob, wrapped_key) = crypto::encrypt_vault_for_sync(&secrets_json)?;
 
-    let client = reqwest::Client::new();
+    let client = sync_http_client_builder()
+        .build()
+        .map_err(|e| format!("failed to build http client: {e}"))?;
     let url = format!("{registry_url}/api/vaults/{vault_id}/sync");
 
     let mut body = serde_json::json!({
@@ -207,7 +222,7 @@ pub async fn push_raw(
 
     let response = client
         .post(&url)
-        .header("Authorization", format!("Bearer {auth_token}"))
+        .bearer_auth(auth_token)
         .json(&body)
         .send()
         .await
@@ -241,7 +256,7 @@ pub async fn pull(
     auth_token: &str,
     vault_id: &str,
 ) -> Result<(HashMap<String, String>, i32), String> {
-    let client = reqwest::Client::builder()
+    let client = sync_http_client_builder()
         .timeout(sync_request_timeout(std::time::Duration::from_secs(30)))
         .build()
         .map_err(|e| format!("failed to build http client: {e}"))?;
@@ -249,7 +264,7 @@ pub async fn pull(
 
     let response = client
         .get(&url)
-        .header("Authorization", format!("Bearer {auth_token}"))
+        .bearer_auth(auth_token)
         .send()
         .await
         .map_err(|e| format!("network error: {e}"))?;
@@ -302,7 +317,7 @@ pub async fn pull_raw(
     auth_token: &str,
     vault_id: &str,
 ) -> Result<(String, i32), String> {
-    let client = reqwest::Client::builder()
+    let client = sync_http_client_builder()
         .timeout(sync_request_timeout(std::time::Duration::from_secs(30)))
         .build()
         .map_err(|e| format!("failed to build http client: {e}"))?;
@@ -310,7 +325,7 @@ pub async fn pull_raw(
 
     let response = client
         .get(&url)
-        .header("Authorization", format!("Bearer {auth_token}"))
+        .bearer_auth(auth_token)
         .send()
         .await
         .map_err(|e| format!("network error: {e}"))?;
@@ -377,7 +392,7 @@ async fn attempt_legacy_reencrypt_push(
         }
     };
 
-    let client = match reqwest::Client::builder()
+    let client = match sync_http_client_builder()
         .timeout(sync_request_timeout(std::time::Duration::from_secs(15)))
         .build()
     {
@@ -397,7 +412,7 @@ async fn attempt_legacy_reencrypt_push(
 
     match client
         .post(&url)
-        .header("Authorization", format!("Bearer {auth_token}"))
+        .bearer_auth(auth_token)
         .json(&body)
         .send()
         .await
@@ -461,7 +476,9 @@ pub async fn upload_public_key(
     auth_token: &str,
     public_key_b64: &str,
 ) -> Result<(), String> {
-    let client = reqwest::Client::new();
+    let client = sync_http_client_builder()
+        .build()
+        .map_err(|e| format!("failed to build http client: {e}"))?;
     let url = format!("{registry_url}/api/users/me/public-key");
     let body = serde_json::json!({"publicKey": public_key_b64});
 
@@ -487,7 +504,9 @@ pub async fn get_my_public_key(
     registry_url: &str,
     auth_token: &str,
 ) -> Result<Option<String>, String> {
-    let client = reqwest::Client::new();
+    let client = sync_http_client_builder()
+        .build()
+        .map_err(|e| format!("failed to build http client: {e}"))?;
     let url = format!("{registry_url}/api/users/me/public-key");
 
     let response = client
@@ -529,7 +548,9 @@ pub async fn get_org_member_keys(
     auth_token: &str,
     org_slug: &str,
 ) -> Result<Vec<MemberPublicKey>, String> {
-    let client = reqwest::Client::new();
+    let client = sync_http_client_builder()
+        .build()
+        .map_err(|e| format!("failed to build http client: {e}"))?;
     let url = format!("{registry_url}/api/orgs/{org_slug}/members/public-keys");
 
     let response = client
@@ -627,7 +648,9 @@ pub async fn list_org_vaults(
     auth_token: &str,
     org_slug: &str,
 ) -> Result<Vec<RemoteVault>, String> {
-    let client = reqwest::Client::new();
+    let client = sync_http_client_builder()
+        .build()
+        .map_err(|e| format!("failed to build http client: {e}"))?;
     let url = format!("{registry_url}/api/orgs/{org_slug}/vaults");
 
     let response = client
@@ -661,7 +684,9 @@ pub async fn pull_org(
     vault_id: &str,
     private_key: &[u8; 32],
 ) -> Result<(String, i32), String> {
-    let client = reqwest::Client::new();
+    let client = sync_http_client_builder()
+        .build()
+        .map_err(|e| format!("failed to build http client: {e}"))?;
     let url = format!("{registry_url}/api/orgs/{org_slug}/vaults/{vault_id}");
 
     let response = client
@@ -725,7 +750,9 @@ pub async fn push_org_with_keys(
     let wrapped_keys = wrap_keys_for_members(&aes_key, &members_with_keys)?;
 
     // 5. Push to server
-    let client = reqwest::Client::new();
+    let client = sync_http_client_builder()
+        .build()
+        .map_err(|e| format!("failed to build http client: {e}"))?;
     let url = format!("{registry_url}/api/orgs/{org_slug}/vaults/{vault_id}");
 
     let keys_json: Vec<serde_json::Value> = wrapped_keys
@@ -839,7 +866,9 @@ pub async fn push_org(
     let aes_key = crypto::generate_aes_key();
     let encrypted_blob = crypto::encrypt(&aes_key, secrets_json.as_bytes())?;
 
-    let client = reqwest::Client::new();
+    let client = sync_http_client_builder()
+        .build()
+        .map_err(|e| format!("failed to build http client: {e}"))?;
     let url = format!("{registry_url}/api/orgs/{org_slug}/vaults/{vault_id}");
 
     let keys: Vec<serde_json::Value> = wrapped_keys
@@ -854,7 +883,7 @@ pub async fn push_org(
 
     let response = client
         .post(&url)
-        .header("Authorization", format!("Bearer {auth_token}"))
+        .bearer_auth(auth_token)
         .json(&body)
         .send()
         .await
@@ -889,7 +918,9 @@ pub async fn get_pairing_session(
     auth_token: &str,
     code: &str,
 ) -> Result<PairingSession, String> {
-    let client = reqwest::Client::new();
+    let client = sync_http_client_builder()
+        .build()
+        .map_err(|e| format!("failed to build http client: {e}"))?;
     let url = format!("{registry_url}/api/vault/pair/{code}");
 
     let response = client
@@ -919,7 +950,9 @@ pub async fn approve_pairing(
     encrypted_wrapping_key: &str,
     ephemeral_public_key: &str,
 ) -> Result<(), String> {
-    let client = reqwest::Client::new();
+    let client = sync_http_client_builder()
+        .build()
+        .map_err(|e| format!("failed to build http client: {e}"))?;
     let url = format!("{registry_url}/api/vault/pair/{code}");
 
     let body = serde_json::json!({
@@ -946,7 +979,9 @@ pub async fn approve_pairing(
 
 /// Revoke all browser pairings for the authenticated user.
 pub async fn unpair_all(registry_url: &str, auth_token: &str) -> Result<(), String> {
-    let client = reqwest::Client::new();
+    let client = sync_http_client_builder()
+        .build()
+        .map_err(|e| format!("failed to build http client: {e}"))?;
     let url = format!("{registry_url}/api/vault/pair/revoke-all");
 
     let response = client
@@ -986,7 +1021,9 @@ pub async fn ci_pull(
     vault_id: &str,
     env: Option<&str>,
 ) -> Result<(HashMap<String, String>, String), String> {
-    let client = reqwest::Client::new();
+    let client = sync_http_client_builder()
+        .build()
+        .map_err(|e| format!("failed to build http client: {e}"))?;
     let mut url = format!("{registry_url}/api/vaults/{vault_id}/ci-pull");
     if let Some(e) = env {
         // Env names are alphanumeric/dashes — safe for query strings without encoding
@@ -1029,7 +1066,9 @@ pub async fn upload_escrow_key(
     vault_id: &str,
     wrapping_key_hex: &str,
 ) -> Result<(), String> {
-    let client = reqwest::Client::new();
+    let client = sync_http_client_builder()
+        .build()
+        .map_err(|e| format!("failed to build http client: {e}"))?;
     let url = format!("{registry_url}/api/vault/oidc/escrow");
 
     let body = serde_json::json!({
@@ -1067,7 +1106,9 @@ pub async fn get_audit_log(
     vault_id: &str,
     cursor: Option<&str>,
 ) -> Result<AuditResponse, String> {
-    let client = reqwest::Client::new();
+    let client = sync_http_client_builder()
+        .build()
+        .map_err(|e| format!("failed to build http client: {e}"))?;
     let mut url = format!("{registry_url}/api/vaults/{vault_id}/audit");
     if let Some(c) = cursor {
         url = format!("{url}?cursor={c}");
@@ -1075,7 +1116,7 @@ pub async fn get_audit_log(
 
     let response = client
         .get(&url)
-        .header("Authorization", format!("Bearer {auth_token}"))
+        .bearer_auth(auth_token)
         .send()
         .await
         .map_err(|e| format!("network error: {e}"))?;
