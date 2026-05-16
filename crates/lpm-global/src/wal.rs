@@ -55,6 +55,16 @@ use std::path::{Path, PathBuf};
 /// the next record.
 pub const RECORD_SENTINEL: u8 = 0x0A;
 
+/// Per-record payload cap (1 MiB). Real WAL records serialise to a
+/// few hundred bytes — install metadata + small `serde_json::Value`
+/// blobs. A corrupted or maliciously-crafted WAL claiming a multi-GB
+/// payload would otherwise wedge recovery on a buffer-bounds check
+/// for the length of the file itself; capping per-record keeps a
+/// stray large `len` prefix from hijacking the scanner into reading
+/// arbitrarily far past the legit tail. Mismatches are treated as
+/// torn-tail and break recovery cleanly.
+pub const MAX_RECORD_PAYLOAD_BYTES: usize = 1024 * 1024;
+
 /// Minimum bytes needed to even begin parsing a record: 4 (len) + 4
 /// (crc) + 0 (empty payload allowed) + 1 (sentinel).
 pub const MIN_RECORD_BYTES: usize = 4 + 4 + 1;
@@ -469,6 +479,16 @@ impl WalReader {
             let crc_bytes: [u8; 4] = buf[offset + 4..offset + 8].try_into().expect("4 bytes");
             let payload_len = u32::from_be_bytes(len_bytes) as usize;
             let stored_crc = u32::from_be_bytes(crc_bytes);
+
+            if payload_len > MAX_RECORD_PAYLOAD_BYTES {
+                tracing::debug!(
+                    "wal: record at offset {offset} claims payload_len {payload_len} > cap {MAX_RECORD_PAYLOAD_BYTES}",
+                );
+                stop = ScanStop::TornTail {
+                    offset: offset as u64,
+                };
+                break;
+            }
 
             let frame_end = offset
                 .checked_add(8)
@@ -974,5 +994,42 @@ mod tests {
         let path = tmp.path().join("wal.jsonl");
         let w = WalWriter::open(&path).unwrap();
         assert_eq!(w.path(), path);
+    }
+
+    /// L10: a corrupted WAL frame claiming an oversized payload must
+    /// be treated as a torn tail so the scanner bails cleanly rather
+    /// than attempting to interpret the (possibly hostile) length
+    /// field. Pin the cap value in the same place so a future bump
+    /// has to acknowledge the threat model.
+    #[test]
+    fn oversized_record_payload_len_breaks_scan_with_torn_tail() {
+        // Sanity that the cap constant is the value we expect.
+        assert_eq!(MAX_RECORD_PAYLOAD_BYTES, 1024 * 1024);
+
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("wal");
+        // Forge a frame: len=MAX+1, garbage CRC, no body. The header
+        // alone is enough — the cap check fires before frame_end is
+        // computed, so we don't need to extend the file.
+        let mut frame: Vec<u8> = Vec::new();
+        let oversized_len: u32 = (MAX_RECORD_PAYLOAD_BYTES as u32).saturating_add(1);
+        frame.extend_from_slice(&oversized_len.to_be_bytes());
+        frame.extend_from_slice(&0u32.to_be_bytes());
+        // Pad so the buffer is at least MIN_RECORD_BYTES so the
+        // earlier "torn tail because too small" branch doesn't fire.
+        while frame.len() < MIN_RECORD_BYTES {
+            frame.push(0);
+        }
+        std::fs::write(&path, &frame).unwrap();
+
+        let scan = WalReader::at(&path).scan().unwrap();
+        assert!(
+            scan.records.is_empty(),
+            "no records should parse from an oversized-len frame",
+        );
+        match scan.stop {
+            ScanStop::TornTail { offset } => assert_eq!(offset, 0),
+            other => panic!("expected TornTail at offset 0, got {other:?}"),
+        }
     }
 }

@@ -357,6 +357,8 @@ impl Store {
         if tmp_dir.exists() {
             let _ = std::fs::remove_dir_all(&tmp_dir);
         }
+        create_tmp_dir_locked(&tmp_dir)
+            .map_err(|e| LpmError::Store(format!("failed to create v2 tmp staging dir: {e}")))?;
 
         // Fused extract + behavioral scan in a single pass: `should_scan`
         // filters per entry inside the tar walk, and the inspector
@@ -549,6 +551,8 @@ impl Store {
         if tmp_dir.exists() {
             let _ = std::fs::remove_dir_all(&tmp_dir);
         }
+        create_tmp_dir_locked(&tmp_dir)
+            .map_err(|e| LpmError::Store(format!("failed to create v2 tmp staging dir: {e}")))?;
 
         // Run the atomic-staging body in a closure so a single error
         // path can clean up the tmp dir uniformly. Anything that
@@ -775,6 +779,8 @@ impl Store {
         if tmp_dir.exists() {
             let _ = std::fs::remove_dir_all(&tmp_dir);
         }
+        create_tmp_dir_locked(&tmp_dir)
+            .map_err(|e| LpmError::Store(format!("failed to create v2 tmp staging dir: {e}")))?;
 
         copy_dir_recursively(v1_pkg_dir, &tmp_dir).map_err(|e| {
             let _ = std::fs::remove_dir_all(&tmp_dir);
@@ -1049,9 +1055,35 @@ fn is_complete_object_dir(dir: &Path) -> bool {
 }
 
 fn tmp_sibling(dir: &Path) -> PathBuf {
-    let pid = std::process::id();
-    let tid = format!("{:?}", std::thread::current().id());
-    dir.with_extension(format!("tmp.{pid}.{tid}"))
+    // Random 64-bit suffix replaces the pid+tid pair so a same-UID
+    // attacker can't predict the tmp path and plant a symlink there
+    // before we create the dir. PID + thread::id() are both
+    // observable in /proc on Linux; the random suffix is uniformly
+    // unpredictable across all UIDs that can read the parent dir.
+    use rand::RngCore;
+    let suffix: u64 = rand::thread_rng().next_u64();
+    dir.with_extension(format!("tmp.{suffix:016x}"))
+}
+
+/// Pre-create a tmp staging dir at 0o700 on Unix so partial extracts
+/// can't be read by other UIDs on a shared host. The extractor will
+/// `create_dir_all` again on this same path — a no-op once the dir
+/// already exists at the restricted mode. On filesystems without
+/// POSIX modes the mode is silently ignored, which matches the
+/// broader credential-metadata posture.
+fn create_tmp_dir_locked(path: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        let mut b = std::fs::DirBuilder::new();
+        b.recursive(true);
+        b.mode(0o700);
+        b.create(path)
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::create_dir_all(path)
+    }
 }
 
 /// Recursively copy `src/` to `dst/`. Used by the v1 → v2 cache-hit
@@ -1072,21 +1104,22 @@ fn copy_dir_recursively(src: &Path, dst: &Path) -> std::io::Result<()> {
         if ft.is_dir() {
             copy_dir_recursively(&entry_src, &entry_dst)?;
         } else if ft.is_symlink() {
-            // Preserve symlinks verbatim — the v1 store already
-            // dereferences extracts on write, so a symlink in
-            // `<v1>/.../` is an explicitly-shipped tarball symlink
-            // (rare but legal in npm), not an internal link.
-            let target = std::fs::read_link(&entry_src)?;
-            #[cfg(unix)]
-            std::os::unix::fs::symlink(&target, &entry_dst)?;
-            #[cfg(windows)]
-            {
-                if target.is_dir() {
-                    std::os::windows::fs::symlink_dir(&target, &entry_dst)?;
-                } else {
-                    std::os::windows::fs::symlink_file(&target, &entry_dst)?;
-                }
-            }
+            // Refuse to migrate symlinks from a v1 store entry into the
+            // v2 object dir (L8). The v1 extractor's `is_file()` filter
+            // already prevents symlinks from being written into store
+            // entries under normal operation, so a symlink here is
+            // either (a) a manually-planted artefact by a local attacker
+            // or (b) a regression in the v1 extractor's filter. Both
+            // cases would faithfully reproduce the symlink target into
+            // every link entry that consumed the migrated object —
+            // i.e. a `/etc/passwd` symlink becomes readable through
+            // every consuming project's node_modules. Skip with a
+            // tracing::warn so the migration completes for the
+            // surrounding files but the unsafe link is dropped.
+            tracing::warn!(
+                src = %entry_src.display(),
+                "v1→v2 copy: skipping symlink (refused — v1 store entries should not contain symlinks)",
+            );
         } else if ft.is_file() {
             std::fs::copy(&entry_src, &entry_dst)?;
         }
@@ -2212,6 +2245,77 @@ mod tests {
                 .chars()
                 .all(|c| c.is_ascii_hexdigit() && !c.is_uppercase()),
             "hex portion must be lowercase"
+        );
+    }
+
+    /// M28: tmp_sibling now uses a random 64-bit suffix instead of
+    /// the predictable pid+thread::id pair. Two calls in quick
+    /// succession should produce distinct paths with overwhelming
+    /// probability — confirms the suffix is actually random and not
+    /// re-derived from a deterministic source.
+    #[test]
+    fn tmp_sibling_produces_unpredictable_suffix_across_calls() {
+        let base = std::path::PathBuf::from("/tmp/foo-object");
+        let a = tmp_sibling(&base);
+        let b = tmp_sibling(&base);
+        assert_ne!(
+            a, b,
+            "two tmp_sibling calls on the same path must produce different suffixes",
+        );
+        // Sanity: shape is `<base>.tmp.<16-hex>`.
+        let a_name = a.file_name().unwrap().to_string_lossy().into_owned();
+        assert!(
+            a_name.starts_with("foo-object.tmp."),
+            "expected `<name>.tmp.<suffix>` shape, got {a_name}",
+        );
+        let suffix = a_name.trim_start_matches("foo-object.tmp.");
+        assert_eq!(suffix.len(), 16, "suffix should be 16 hex chars: {suffix}");
+        assert!(
+            suffix.chars().all(|c| c.is_ascii_hexdigit()),
+            "suffix should be hex: {suffix}",
+        );
+    }
+
+    /// M28: pre-created tmp staging dirs land at 0o700 on Unix so a
+    /// partial extract cannot be read by other UIDs on a shared host.
+    #[cfg(unix)]
+    #[test]
+    fn create_tmp_dir_locked_sets_0o700() {
+        use std::os::unix::fs::PermissionsExt;
+        let parent = tempfile::tempdir().unwrap();
+        let target = parent.path().join("staging");
+        create_tmp_dir_locked(&target).unwrap();
+        let mode = std::fs::metadata(&target).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o700, "expected 0o700, got 0o{mode:o}");
+    }
+
+    /// L8: a stray symlink in a v1 store entry must NOT propagate
+    /// into the v2 object dir via the v1→v2 migration copy. A
+    /// regression or local-attacker plant would otherwise reproduce
+    /// the symlink target (e.g. `/etc/passwd`) into every consuming
+    /// link entry.
+    #[cfg(unix)]
+    #[test]
+    fn copy_dir_recursively_skips_symlinks_from_v1_source() {
+        let parent = tempfile::tempdir().unwrap();
+        let v1 = parent.path().join("v1");
+        let dst = parent.path().join("v2");
+        std::fs::create_dir_all(&v1).unwrap();
+        // Real file alongside the symlink — proves the migration
+        // completes for the surrounding files.
+        std::fs::write(v1.join("package.json"), b"{}").unwrap();
+        // Hostile symlink pointing outside the package dir.
+        std::os::unix::fs::symlink("/etc/passwd", v1.join("escape")).unwrap();
+
+        copy_dir_recursively(&v1, &dst).expect("copy should succeed");
+
+        assert!(
+            dst.join("package.json").is_file(),
+            "regular file must be copied",
+        );
+        assert!(
+            dst.join("escape").symlink_metadata().is_err(),
+            "symlink must be skipped — refusing to migrate v1→v2 symlinks",
         );
     }
 }
