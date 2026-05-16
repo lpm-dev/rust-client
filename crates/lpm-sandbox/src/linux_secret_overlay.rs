@@ -70,75 +70,9 @@
 //! `CString` allocation, `uid_map` formatting) happens in the
 //! parent before fork.
 
+use crate::secret_paths::{SECRET_FILE_EXTENSIONS, SECRET_LITERAL_PATHS, SECRET_SUBPATH_DIRS};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
-
-/// Project-relative literal paths to overlay. Mirror of
-/// `seatbelt::DENY_READ_LITERAL_PROJECT_PATHS`. Kept in sync by
-/// the regression test in this module.
-pub(crate) const SECRET_LITERAL_PATHS: &[&str] = &[
-    // dotenv conventions
-    ".env",
-    ".env.local",
-    ".env.development",
-    ".env.development.local",
-    ".env.production",
-    ".env.production.local",
-    ".env.staging",
-    ".env.staging.local",
-    ".env.test",
-    ".env.test.local",
-    ".envrc",
-    // package-manager auth files
-    ".npmrc",
-    ".yarnrc",
-    ".yarnrc.yml",
-    ".pypirc",
-    // shell / http auth files
-    ".netrc",
-    "_netrc",
-    ".git-credentials",
-    ".htpasswd",
-    // git config
-    ".git/config",
-    ".git/credentials",
-    // ssh keys at project root
-    "id_rsa",
-    "id_rsa.pub",
-    "id_ecdsa",
-    "id_ecdsa.pub",
-    "id_ed25519",
-    "id_ed25519.pub",
-    "id_dsa",
-    "id_dsa.pub",
-];
-
-/// Project-relative subdirs whose every regular file gets overlaid.
-/// Mirror of `seatbelt::DENY_READ_SUBPATH_PROJECT_DIRS`.
-pub(crate) const SECRET_SUBPATH_DIRS: &[&str] = &[
-    ".ssh",
-    ".aws",
-    ".kube",
-    ".gcp",
-    ".config/gcloud",
-    ".terraform",
-    "secrets",
-    "secret",
-];
-
-/// Filename suffixes to overlay anywhere in the project tree.
-/// Mirror of the `*.pem` / `*.key` / `*.tfstate` / `*.tfvars`
-/// patterns from `seatbelt::DENY_READ_REGEX_SUFFIXES`, expressed
-/// as suffix strings for the walker's `ends_with` check.
-pub(crate) const SECRET_FILE_EXTENSIONS: &[&str] = &[
-    ".pem",
-    ".key",
-    ".pfx",
-    ".p12",
-    ".tfstate",
-    ".tfvars",
-    ".tfvars.json",
-];
 
 /// Directory names to prune during the project walk. These hold
 /// large amounts of upstream code (`node_modules`, `target`, `.git`)
@@ -703,11 +637,20 @@ mod tests {
             fs::write(too_deep.join("at-depth.pem"), "").unwrap();
         });
         let v = enumerate_project_secrets(tmp.path(), &[]);
-        // Depths 1-4 enumerated.
+        // The walker enters directories at depths 1-3 (capped by
+        // `WALK_MAX_DEPTH = 4` via the `depth + 1 < WALK_MAX_DEPTH`
+        // push gate) and enumerates files inside them — so files
+        // up to path-component-depth 4 are reachable.
         assert!(v.contains(&tmp.path().join("a/at-depth.pem")));
         assert!(v.contains(&tmp.path().join("a/b/at-depth.pem")));
         assert!(v.contains(&tmp.path().join("a/b/c/at-depth.pem")));
-        // Depth 5 not enumerated.
+        // Asserting BOTH boundary-misses below pins the cap from
+        // both sides — a future `<=` off-by-one in the push gate
+        // would let `d/at-depth.pem` slip through; a future
+        // depth-bump (e.g. `WALK_MAX_DEPTH = 5`) would let
+        // `d/e/at-depth.pem` slip through. Either regression
+        // fails one of these assertions.
+        assert!(!v.contains(&tmp.path().join("a/b/c/d/at-depth.pem")));
         assert!(!v.contains(&tmp.path().join("a/b/c/d/e/at-depth.pem")));
     }
 
@@ -727,47 +670,6 @@ mod tests {
         let mut sorted = a.clone();
         sorted.sort();
         assert_eq!(a, sorted, "output must be pre-sorted");
-    }
-
-    /// Symmetry check: the const tables in this module must match
-    /// the ones in `seatbelt.rs`. Hard-coded mirror — if the
-    /// seatbelt list grows a new entry and this list doesn't, the
-    /// platforms drift apart. Pinned to catch the drift early.
-    /// This test runs on every platform (the seatbelt module is
-    /// macOS-gated but its const arrays are pub(crate)-visible
-    /// via this assertion's `cfg(target_os = "macos")` arm).
-    #[test]
-    #[cfg(target_os = "macos")]
-    fn const_tables_mirror_seatbelt_lists() {
-        use crate::seatbelt;
-        assert_eq!(
-            SECRET_LITERAL_PATHS,
-            seatbelt::DENY_READ_LITERAL_PROJECT_PATHS
-        );
-        assert_eq!(
-            SECRET_SUBPATH_DIRS,
-            seatbelt::DENY_READ_SUBPATH_PROJECT_DIRS
-        );
-        // Seatbelt's regex suffixes use regex syntax (`/.*\.pem`);
-        // ours use plain suffix strings (`.pem`). Pin a manual
-        // mapping check rather than direct equality so we catch
-        // adds in one list without the other.
-        for ext in SECRET_FILE_EXTENSIONS {
-            let regex_form = format!(r"/.*{}", ext.replace('.', r"\."));
-            assert!(
-                seatbelt::DENY_READ_REGEX_SUFFIXES.contains(&regex_form.as_str()),
-                "extension {ext} missing from seatbelt regex list"
-            );
-        }
-        for regex in seatbelt::DENY_READ_REGEX_SUFFIXES {
-            // Reverse direction: every seatbelt regex maps back to
-            // an extension in our list.
-            let unescaped = regex.replace(r"\.", ".").replace("/.*", "");
-            assert!(
-                SECRET_FILE_EXTENSIONS.contains(&unescaped.as_str()),
-                "seatbelt regex {regex} (= {unescaped}) has no matching extension"
-            );
-        }
     }
 
     /// SecretOverlaySpec::build returns None when no secrets exist.

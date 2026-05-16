@@ -568,9 +568,14 @@ pub fn load_sandbox_read_allow(
             });
         }
         // Dedup by canonical form so `.env` from project + user
-        // doesn't produce two entries in the spec.
+        // doesn't produce two entries in the spec. Push the
+        // canonical (`./.env` → `.env`, `secrets/../foo` →
+        // `foo`) so downstream consumers — Seatbelt's
+        // `(literal ...)` rule emitter, the Linux overlay
+        // enumerator — receive paths in the form the kernel sees
+        // at enforcement time.
         if seen.insert(canonical.clone()) {
-            resolved.push(joined);
+            resolved.push(canonical);
         }
     }
 

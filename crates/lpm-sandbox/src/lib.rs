@@ -150,13 +150,25 @@ mod landlock_rules;
 #[cfg(any(target_os = "linux", all(test, not(target_os = "windows"))))]
 mod posture_decision;
 
+// Shared secret-file path catalog consumed by the Seatbelt
+// (macOS) deny renderer AND the Linux bind-mount overlay
+// enumerator. Single source of truth — `mod secret_paths;` makes
+// drift a type-system error. Gated on macOS + Linux + non-Windows
+// tests (Windows currently has no overlay layer; the const lists
+// would be dead code there).
+#[cfg(any(
+    target_os = "macos",
+    target_os = "linux",
+    all(test, not(target_os = "windows"))
+))]
+mod secret_paths;
+
 // Linux secret-file overlay (bind-mounts /dev/null over secret
 // paths under project_dir). Same gate shape as `landlock_rules`:
 // Linux production + every non-Windows test build, so macOS unit
-// tests exercise the enumerator + the seatbelt-symmetry pin. The
-// `apply_secret_overlay_in_child` AS-safe hook + the
-// `SecretOverlaySpec::build` constructor are `target_os = "linux"`-
-// gated inside the module.
+// tests exercise the enumerator. The `apply_secret_overlay_in_child`
+// AS-safe hook + the `SecretOverlaySpec::build` constructor are
+// `target_os = "linux"`-gated inside the module.
 #[cfg(any(target_os = "linux", all(test, not(target_os = "windows"))))]
 mod linux_secret_overlay;
 

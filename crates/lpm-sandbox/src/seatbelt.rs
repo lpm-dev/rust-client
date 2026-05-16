@@ -14,90 +14,9 @@
 
 #![cfg(target_os = "macos")]
 
+use crate::secret_paths::{SECRET_FILE_EXTENSIONS, SECRET_LITERAL_PATHS, SECRET_SUBPATH_DIRS};
 use crate::{SandboxError, SandboxSpec};
 use std::path::{Path, PathBuf};
-
-/// Project-relative paths whose `file-read*` is denied even though
-/// they sit under the project root. These are well-known secret-file
-/// conventions lifecycle scripts have no legitimate need to read.
-/// SBPL last-match-wins: the deny block emitted by
-/// [`render_secret_denies`] comes after the broad
-/// `(allow file-read* (subpath {project_dir}))` rule and overrides
-/// it on hit.
-///
-/// `.env.<variant>` is enumerated rather than regex-matched because
-/// the common variants are well-known, the flat list is grep-able
-/// from one place, and an exact `(literal ...)` rule cannot
-/// accidentally over-match a sibling file. Add new entries here as
-/// conventions emerge.
-pub(crate) const DENY_READ_LITERAL_PROJECT_PATHS: &[&str] = &[
-    // dotenv conventions (used by next.js, vite, dotenv-flow, etc.)
-    ".env",
-    ".env.local",
-    ".env.development",
-    ".env.development.local",
-    ".env.production",
-    ".env.production.local",
-    ".env.staging",
-    ".env.staging.local",
-    ".env.test",
-    ".env.test.local",
-    ".envrc",
-    // package-manager auth files (npm/yarn/pnpm/pip)
-    ".npmrc",
-    ".yarnrc",
-    ".yarnrc.yml",
-    ".pypirc",
-    // shell / http auth files
-    ".netrc",
-    "_netrc",
-    ".git-credentials",
-    ".htpasswd",
-    // git config (can carry credential URLs)
-    ".git/config",
-    ".git/credentials",
-    // ssh keys conventionally committed at project root
-    "id_rsa",
-    "id_rsa.pub",
-    "id_ecdsa",
-    "id_ecdsa.pub",
-    "id_ed25519",
-    "id_ed25519.pub",
-    "id_dsa",
-    "id_dsa.pub",
-];
-
-/// Project-relative subdirs whose `file-read*` is denied wholesale.
-/// Same last-match-wins semantics as the literal list.
-pub(crate) const DENY_READ_SUBPATH_PROJECT_DIRS: &[&str] = &[
-    ".ssh",
-    ".aws",
-    ".kube",
-    ".gcp",
-    ".config/gcloud",
-    ".terraform",
-    "secrets",
-    "secret",
-];
-
-/// Regex suffixes anchored at the canonicalized project_dir prefix.
-/// Match any file under the project tree whose path ends in one of
-/// these patterns. Used for filetype-based denies that can land at
-/// any depth — `cert.pem`, `infra/prod.tfstate`, etc.
-///
-/// Apple SBPL `#"..."` regex literals treat `\` as a literal
-/// character (passed through to the regex engine), so `\.pem` in
-/// the source string reaches the engine unchanged. `^` and `$`
-/// anchor full-path match.
-pub(crate) const DENY_READ_REGEX_SUFFIXES: &[&str] = &[
-    r"/.*\.pem",
-    r"/.*\.key",
-    r"/.*\.pfx",
-    r"/.*\.p12",
-    r"/.*\.tfstate",
-    r"/.*\.tfvars",
-    r"/.*\.tfvars\.json",
-];
 
 /// Render the Enforce-mode Seatbelt profile for the given
 /// [`SandboxSpec`]. The returned string is safe to pass to
@@ -307,12 +226,20 @@ pub(crate) fn render_profile(
 }
 
 /// Emit the `(deny file-read* ...)` block for well-known secret
-/// conventions. Driven by the const tables
-/// [`DENY_READ_LITERAL_PROJECT_PATHS`],
-/// [`DENY_READ_SUBPATH_PROJECT_DIRS`], and
-/// [`DENY_READ_REGEX_SUFFIXES`]; all entries are rendered
-/// project-rooted at the canonicalized `project_dir` so the rule
-/// matches the form the kernel sees at enforcement time.
+/// conventions. Driven by the shared catalog in
+/// [`crate::secret_paths`]; all entries are rendered project-rooted
+/// at the canonicalized `project_dir` so the rule matches the form
+/// the kernel sees at enforcement time.
+///
+/// The regex suffix family is derived from
+/// [`SECRET_FILE_EXTENSIONS`] at render time: each extension
+/// (`.pem`, `.tfvars.json`, …) becomes an SBPL regex
+/// `^<escaped-project-dir>/.*<escaped-extension>$` anchored at the
+/// project root and the file-name end. Driving both backends off
+/// the same extension list (vs. one regex list + one suffix list)
+/// guarantees `seatbelt::render_secret_denies` and
+/// `linux_secret_overlay::enumerate_project_secrets` cover
+/// identical file sets.
 ///
 /// Path-existence is intentionally NOT checked — Seatbelt rules
 /// match on path shape, not on whether the file is currently
@@ -332,18 +259,21 @@ fn render_secret_denies(out: &mut String, canon_project_dir: &Path) -> Result<()
     let project_re_escaped = regex_escape_literal_path(project_str);
 
     out.push_str("(deny file-read*\n");
-    for rel in DENY_READ_LITERAL_PROJECT_PATHS {
+    for rel in SECRET_LITERAL_PATHS {
         let abs = canon_project_dir.join(rel);
         let q = quoted_path(&abs, "secret_deny_literal")?;
         out.push_str(&format!("  (literal {q})\n"));
     }
-    for rel in DENY_READ_SUBPATH_PROJECT_DIRS {
+    for rel in SECRET_SUBPATH_DIRS {
         let abs = canon_project_dir.join(rel);
         let q = quoted_path(&abs, "secret_deny_subpath")?;
         out.push_str(&format!("  (subpath {q})\n"));
     }
-    for suffix in DENY_READ_REGEX_SUFFIXES {
-        let pattern = format!("^{project_re_escaped}{suffix}$");
+    for ext in SECRET_FILE_EXTENSIONS {
+        // `.tfvars.json` → `\.tfvars\.json` — escape every dot in
+        // the extension before stitching into the anchored regex.
+        let escaped_ext = ext.replace('.', r"\.");
+        let pattern = format!("^{project_re_escaped}/.*{escaped_ext}$");
         out.push_str(&format!("  (regex {})\n", seatbelt_regex_literal(&pattern)));
     }
     out.push_str(")\n");
