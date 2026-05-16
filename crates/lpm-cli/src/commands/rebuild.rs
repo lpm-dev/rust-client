@@ -788,6 +788,26 @@ async fn run_under_store_lock(
         Some(&home_dir),
     )
     .map_err(|e| LpmError::Registry(format!("{e}")))?;
+
+    // Per-user `[sandbox] script-read-allow` opt-in — list of
+    // project-relative paths the user has chosen to exempt from
+    // the secret-file deny list across every project they run
+    // `lpm install` in. Per-project entries (in
+    // `package.json > lpm > scripts > sandboxReadAllow`) are
+    // unioned with this list by the loader.
+    //
+    // Empty / absent → empty list; the secret-deny block applies
+    // to every match without exception. This is the safe default.
+    let script_read_allow_user: Vec<String> = crate::commands::config::GlobalConfig::load()
+        .get_str_array("script-read-allow")
+        .unwrap_or_default();
+
+    let extra_secret_read_allow = lpm_sandbox::load_sandbox_read_allow(
+        &project_dir.join("package.json"),
+        project_dir,
+        &script_read_allow_user,
+    )
+    .map_err(|e| LpmError::Registry(format!("{e}")))?;
     // round-5 : `std::env::temp_dir()` resolves
     // tmpdir portably — POSIX checks `TMPDIR` → falls back to `/tmp`;
     // Windows checks `TMP` → `TEMP` → `USERPROFILE\AppData\Local\Temp`.
@@ -1013,6 +1033,7 @@ async fn run_under_store_lock(
                 sandbox_mode,
                 &sandbox_options,
                 &extra_write_dirs,
+                &extra_secret_read_allow,
                 &store_root,
                 &home_dir,
                 &tmpdir,
@@ -1095,6 +1116,7 @@ fn execute_script(
     sandbox_mode: SandboxMode,
     sandbox_options: &lpm_sandbox::SandboxOptions,
     extra_write_dirs: &[PathBuf],
+    extra_secret_read_allow: &[PathBuf],
     store_root: &Path,
     home_dir: &Path,
     tmpdir: &Path,
@@ -1147,6 +1169,7 @@ fn execute_script(
         sandbox_mode,
         sandbox_options,
         extra_write_dirs,
+        extra_secret_read_allow,
         store_root,
         home_dir,
         tmpdir,
@@ -1451,6 +1474,7 @@ fn spawn_lifecycle_child(
     sandbox_mode: SandboxMode,
     sandbox_options: &lpm_sandbox::SandboxOptions,
     extra_write_dirs: &[PathBuf],
+    extra_secret_read_allow: &[PathBuf],
     store_root: &Path,
     home_dir: &Path,
     tmpdir: &Path,
@@ -1465,7 +1489,7 @@ fn spawn_lifecycle_child(
         store_root: store_root.to_path_buf(),
         home_dir: home_dir.to_path_buf(),
         tmpdir: tmpdir.to_path_buf(),
-        secret_read_allow: Vec::new(),
+        secret_read_allow: extra_secret_read_allow.to_vec(),
         extra_write_dirs: extra_write_dirs.to_vec(),
     };
     // thread the resolved `[sandbox] allow-degraded`

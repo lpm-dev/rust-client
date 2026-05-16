@@ -161,7 +161,7 @@ mod posture_decision;
 mod linux_secret_overlay;
 
 pub mod config;
-pub use config::load_sandbox_write_dirs;
+pub use config::{load_sandbox_read_allow, load_sandbox_write_dirs};
 
 /// Inputs the sandbox backend needs to render its containment profile
 /// for a single post-install script invocation.
