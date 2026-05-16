@@ -303,11 +303,19 @@ pub async fn run(
     };
 
     // ── OSV vulnerability scan (non-@lpm.dev packages) ──────────
-    let osv_vulns = run_osv_scan(&discovery.packages, json_output, level).await;
+    let osv_outcome = run_osv_scan(&discovery.packages, json_output, level).await;
+    let osv_vulns = osv_outcome.vulns;
+    let osv_degraded_reason = osv_outcome.degraded_reason;
 
     // ── Report ──────────────────────────────────────────────────
     if json_output {
-        print_json_report(&results, &osv_vulns, &discovery, checked_lpm);
+        print_json_report(
+            &results,
+            &osv_vulns,
+            osv_degraded_reason.as_deref(),
+            &discovery,
+            checked_lpm,
+        );
     } else {
         // Human-readable output — three-tier separation
 
@@ -865,12 +873,26 @@ fn analysis_to_issues(
 
 // ─── OSV vulnerability scan ────────────────────────────────────────
 
+/// Outcome of an OSV scan.
+///
+/// `degraded_reason` is `Some(_)` when the OSV API returned a non-2xx
+/// status, refused the connection, or otherwise failed — semantics
+/// previously conflated with "scan completed successfully and found
+/// nothing." A green audit run that the user could not previously
+/// distinguish from a degraded one is the H8 hazard: a transient OSV
+/// outage (or an attacker who can sink the OSV connection) silently
+/// hid every CVE.
+pub(crate) struct OsvScanOutcome {
+    pub vulns: Vec<OsvVulnerability>,
+    pub degraded_reason: Option<String>,
+}
+
 /// Query OSV for all non-@lpm.dev packages, deduplicating by (name, version).
 async fn run_osv_scan(
     packages: &[DiscoveredPackage],
     json_output: bool,
     level: Option<&str>,
-) -> Vec<OsvVulnerability> {
+) -> OsvScanOutcome {
     // Collect non-@lpm.dev packages eligible for OSV
     let mut osv_queries: Vec<(String, String)> = Vec::new();
     let mut seen: HashSet<(String, String)> = HashSet::new();
@@ -895,7 +917,10 @@ async fn run_osv_scan(
     }
 
     if osv_queries.is_empty() {
-        return Vec::new();
+        return OsvScanOutcome {
+            vulns: Vec::new(),
+            degraded_reason: None,
+        };
     }
 
     if !json_output {
@@ -909,16 +934,30 @@ async fn run_osv_scan(
     let vulns = match query_osv_batch(&osv_queries).await {
         Ok(v) => v,
         Err(e) => {
-            tracing::debug!("OSV query failed: {e}");
+            let reason = e.to_string();
+            // Promote to `warn` (was `debug`) so a degraded audit
+            // never hides in default tracing output. Print to
+            // stderr-shaped human channel even in JSON mode so the
+            // operator sees it directly; the JSON envelope ALSO
+            // carries the structured `osv_degraded` field for
+            // machine consumption.
+            tracing::warn!("OSV query failed: {reason}");
             if !json_output {
-                println!("  {} OSV database unavailable, skipping", "⚠".yellow());
+                println!(
+                    "  {} OSV database unavailable; vulnerability scan is INCOMPLETE — \
+                     a green result does NOT mean no vulnerabilities exist.",
+                    "⚠".yellow()
+                );
+                println!("    reason: {reason}");
             }
-            return Vec::new();
+            return OsvScanOutcome {
+                vulns: Vec::new(),
+                degraded_reason: Some(reason),
+            };
         }
     };
 
-    // Filter by --level
-    if let Some(lvl) = level {
+    let filtered = if let Some(lvl) = level {
         let min_lvl = min_severity_level(lvl);
         vulns
             .into_iter()
@@ -926,6 +965,10 @@ async fn run_osv_scan(
             .collect()
     } else {
         vulns
+    };
+    OsvScanOutcome {
+        vulns: filtered,
+        degraded_reason: None,
     }
 }
 
@@ -1271,6 +1314,7 @@ fn print_summary(
 fn print_json_report(
     results: &[AuditResult],
     osv_vulns: &[OsvVulnerability],
+    osv_degraded_reason: Option<&str>,
     discovery: &DiscoveryResult,
     checked_lpm: usize,
 ) {
@@ -1306,6 +1350,14 @@ fn print_json_report(
         "success": true,
         "manager": discovery.manager.to_string(),
         "degraded": discovery.is_degraded,
+        // `osv_degraded` is true when the OSV advisory database was
+        // unreachable; `osv_vulnerabilities: 0` in that state is the
+        // best LPM could say, NOT a confirmation that no CVEs exist.
+        // CI gates that use this envelope must treat
+        // `osv_degraded == true` as a fail-on-pipeline-issue, not a
+        // clean scan.
+        "osv_degraded": osv_degraded_reason.is_some(),
+        "osv_degraded_reason": osv_degraded_reason,
         "scanned": discovery.packages.len(),
         "checked_lpm": checked_lpm,
         "packages_with_issues": results.iter().filter(|r| !r.issues.is_empty()).count(),
@@ -1405,7 +1457,8 @@ struct OsvSeverityEntry {
     score: String,
 }
 
-struct OsvVulnerability {
+#[derive(Debug)]
+pub(crate) struct OsvVulnerability {
     package: String,
     version: String,
     id: String,
@@ -1460,7 +1513,19 @@ async fn query_osv_batch(packages: &[(String, String)]) -> Result<Vec<OsvVulnera
         .map_err(|e| LpmError::Network(format!("OSV API error: {e}")))?;
 
     if !response.status().is_success() {
-        return Ok(Vec::new()); // Graceful fallback
+        // Surface the failure as an error rather than silently
+        // returning an empty result. The pre-fix `Ok(Vec::new())`
+        // was indistinguishable from "no vulnerabilities found" —
+        // an attacker who could downstream block / fail the OSV
+        // endpoint (env override, transient outage, MITM-stripped
+        // TLS) could make `lpm audit` falsely report a green
+        // result. The caller renders a "degraded mode" warning
+        // and exits with a distinct semantic so CI gates do not
+        // confuse "unreachable advisory DB" with "clean scan".
+        return Err(LpmError::Network(format!(
+            "OSV API returned HTTP {}; treat as degraded — vulnerability data not retrieved",
+            response.status().as_u16()
+        )));
     }
 
     let result: OsvBatchResponse = response
@@ -2388,5 +2453,41 @@ mod tests {
         // 1 security_finding + 3 active buckets (critical/dangerous/medium)
         // + 1 lifecycle_scripts + 1 vulnerability = 6 issues.
         assert_eq!(issues.len(), 6, "got: {issues:?}");
+    }
+
+    /// `query_osv_batch` now surfaces non-2xx responses as `Err`
+    /// rather than silently returning `Ok(Vec::new())` — the latter
+    /// was indistinguishable from "no vulnerabilities found", a green
+    /// state that a transient OSV outage or an attacker who can block
+    /// the OSV connection could fabricate. Locks the new error path
+    /// so a future refactor that re-introduces the silent fallback
+    /// fails this test first.
+    #[tokio::test]
+    async fn query_osv_batch_returns_err_on_non_success_http() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(500).set_body_string("osv down"))
+            .mount(&server)
+            .await;
+
+        // SAFETY: a `Mutex`-guarded env var would be ideal but this
+        // module doesn't have an env-isolation harness like
+        // `release_lookup`. The OSV URL env var is read inside the
+        // function under test, so the set→call→remove sequence is
+        // race-free within a single test. Other tests in this module
+        // do not set LPM_OSV_URL.
+        unsafe { std::env::set_var("LPM_OSV_URL", server.uri()) };
+        let result = query_osv_batch(&[("react".to_string(), "1.0.0".to_string())]).await;
+        unsafe { std::env::remove_var("LPM_OSV_URL") };
+
+        let err = result.expect_err("non-2xx OSV response must surface as Err");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("HTTP 500") && msg.contains("degraded"),
+            "error must label the failure mode: {msg}"
+        );
     }
 }
