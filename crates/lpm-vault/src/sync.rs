@@ -68,6 +68,18 @@ fn sync_http_client_builder() -> reqwest::ClientBuilder {
     reqwest::Client::builder().redirect(reqwest::redirect::Policy::limited(10))
 }
 
+/// Percent-encode a URL path segment.
+///
+/// M32: vault sync calls interpolate `vault_id`, `org_slug`, `code`
+/// directly into the request path. Raw `/`, `?`, `#`, `..`, `&` etc.
+/// in any of those would alter the route — e.g.,
+/// `/api/orgs/{org}/vaults/{vault}` with `vault = "foo/../bar"` would
+/// hit a different endpoint server-side. Routing all path components
+/// through this helper closes the request-confusion shape.
+fn url_path_segment(s: &str) -> String {
+    urlencoding::encode(s).into_owned()
+}
+
 /// Response from push endpoint.
 #[derive(Debug, serde::Deserialize)]
 pub struct PushResponse {
@@ -199,7 +211,10 @@ pub async fn push_raw(
     let client = sync_http_client_builder()
         .build()
         .map_err(|e| format!("failed to build http client: {e}"))?;
-    let url = format!("{registry_url}/api/vaults/{vault_id}/sync");
+    let url = format!(
+        "{registry_url}/api/vaults/{}/sync",
+        url_path_segment(vault_id)
+    );
 
     let mut body = serde_json::json!({
         "encryptedBlob": encrypted_blob,
@@ -260,7 +275,10 @@ pub async fn pull(
         .timeout(sync_request_timeout(std::time::Duration::from_secs(30)))
         .build()
         .map_err(|e| format!("failed to build http client: {e}"))?;
-    let url = format!("{registry_url}/api/vaults/{vault_id}/sync");
+    let url = format!(
+        "{registry_url}/api/vaults/{}/sync",
+        url_path_segment(vault_id)
+    );
 
     let response = client
         .get(&url)
@@ -321,7 +339,10 @@ pub async fn pull_raw(
         .timeout(sync_request_timeout(std::time::Duration::from_secs(30)))
         .build()
         .map_err(|e| format!("failed to build http client: {e}"))?;
-    let url = format!("{registry_url}/api/vaults/{vault_id}/sync");
+    let url = format!(
+        "{registry_url}/api/vaults/{}/sync",
+        url_path_segment(vault_id)
+    );
 
     let response = client
         .get(&url)
@@ -403,7 +424,10 @@ async fn attempt_legacy_reencrypt_push(
         }
     };
 
-    let url = format!("{registry_url}/api/vaults/{vault_id}/sync");
+    let url = format!(
+        "{registry_url}/api/vaults/{}/sync",
+        url_path_segment(vault_id)
+    );
     let body = serde_json::json!({
         "encryptedBlob": new_blob,
         "wrappedKey": new_wrapped,
@@ -551,7 +575,10 @@ pub async fn get_org_member_keys(
     let client = sync_http_client_builder()
         .build()
         .map_err(|e| format!("failed to build http client: {e}"))?;
-    let url = format!("{registry_url}/api/orgs/{org_slug}/members/public-keys");
+    let url = format!(
+        "{registry_url}/api/orgs/{}/members/public-keys",
+        url_path_segment(org_slug)
+    );
 
     let response = client
         .get(&url)
@@ -651,7 +678,10 @@ pub async fn list_org_vaults(
     let client = sync_http_client_builder()
         .build()
         .map_err(|e| format!("failed to build http client: {e}"))?;
-    let url = format!("{registry_url}/api/orgs/{org_slug}/vaults");
+    let url = format!(
+        "{registry_url}/api/orgs/{}/vaults",
+        url_path_segment(org_slug)
+    );
 
     let response = client
         .get(&url)
@@ -687,7 +717,11 @@ pub async fn pull_org(
     let client = sync_http_client_builder()
         .build()
         .map_err(|e| format!("failed to build http client: {e}"))?;
-    let url = format!("{registry_url}/api/orgs/{org_slug}/vaults/{vault_id}");
+    let url = format!(
+        "{registry_url}/api/orgs/{}/vaults/{}",
+        url_path_segment(org_slug),
+        url_path_segment(vault_id)
+    );
 
     let response = client
         .get(&url)
@@ -753,7 +787,11 @@ pub async fn push_org_with_keys(
     let client = sync_http_client_builder()
         .build()
         .map_err(|e| format!("failed to build http client: {e}"))?;
-    let url = format!("{registry_url}/api/orgs/{org_slug}/vaults/{vault_id}");
+    let url = format!(
+        "{registry_url}/api/orgs/{}/vaults/{}",
+        url_path_segment(org_slug),
+        url_path_segment(vault_id)
+    );
 
     let keys_json: Vec<serde_json::Value> = wrapped_keys
         .iter()
@@ -869,7 +907,11 @@ pub async fn push_org(
     let client = sync_http_client_builder()
         .build()
         .map_err(|e| format!("failed to build http client: {e}"))?;
-    let url = format!("{registry_url}/api/orgs/{org_slug}/vaults/{vault_id}");
+    let url = format!(
+        "{registry_url}/api/orgs/{}/vaults/{}",
+        url_path_segment(org_slug),
+        url_path_segment(vault_id)
+    );
 
     let keys: Vec<serde_json::Value> = wrapped_keys
         .iter()
@@ -921,7 +963,7 @@ pub async fn get_pairing_session(
     let client = sync_http_client_builder()
         .build()
         .map_err(|e| format!("failed to build http client: {e}"))?;
-    let url = format!("{registry_url}/api/vault/pair/{code}");
+    let url = format!("{registry_url}/api/vault/pair/{}", url_path_segment(code));
 
     let response = client
         .get(&url)
@@ -953,7 +995,7 @@ pub async fn approve_pairing(
     let client = sync_http_client_builder()
         .build()
         .map_err(|e| format!("failed to build http client: {e}"))?;
-    let url = format!("{registry_url}/api/vault/pair/{code}");
+    let url = format!("{registry_url}/api/vault/pair/{}", url_path_segment(code));
 
     let body = serde_json::json!({
         "encryptedWrappingKey": encrypted_wrapping_key,
@@ -1024,10 +1066,13 @@ pub async fn ci_pull(
     let client = sync_http_client_builder()
         .build()
         .map_err(|e| format!("failed to build http client: {e}"))?;
-    let mut url = format!("{registry_url}/api/vaults/{vault_id}/ci-pull");
+    let mut url = format!(
+        "{registry_url}/api/vaults/{}/ci-pull",
+        url_path_segment(vault_id)
+    );
     if let Some(e) = env {
         // Env names are alphanumeric/dashes — safe for query strings without encoding
-        url = format!("{url}?env={e}");
+        url = format!("{url}?env={}", url_path_segment(e));
     }
 
     let response = client
@@ -1109,9 +1154,12 @@ pub async fn get_audit_log(
     let client = sync_http_client_builder()
         .build()
         .map_err(|e| format!("failed to build http client: {e}"))?;
-    let mut url = format!("{registry_url}/api/vaults/{vault_id}/audit");
+    let mut url = format!(
+        "{registry_url}/api/vaults/{}/audit",
+        url_path_segment(vault_id)
+    );
     if let Some(c) = cursor {
-        url = format!("{url}?cursor={c}");
+        url = format!("{url}?cursor={}", url_path_segment(c));
     }
 
     let response = client
