@@ -288,6 +288,73 @@ pub fn import_env_file_to_env(
     Ok(imported)
 }
 
+/// Serialize a secret map into sorted dotenv lines, applying the
+/// same quoting rules both export paths share.
+fn format_env_file_content(secrets: &HashMap<String, String>) -> String {
+    let mut lines: Vec<String> = secrets
+        .iter()
+        .map(|(k, v)| {
+            if v.contains(' ') || v.contains('"') || v.contains('\'') || v.contains('\n') {
+                format!("{k}=\"{}\"", v.replace('\\', "\\\\").replace('"', "\\\""))
+            } else {
+                format!("{k}={v}")
+            }
+        })
+        .collect();
+    lines.sort();
+    lines.join("\n") + "\n"
+}
+
+/// Atomically write a dotenv export with owner-only permissions.
+///
+/// The output contains plaintext vault secrets. `std::fs::write`
+/// honours the inherited umask (typically `0o644`), which on shared
+/// hosts exposes credentials to any local uid. Other agents on the
+/// system may also race the write — atomic rename + 0o600 closes
+/// both the perms shape and the read-during-write window.
+fn write_env_file_owner_only(output_path: &Path, content: &[u8]) -> Result<(), String> {
+    let parent = output_path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| Path::new(".").to_path_buf());
+    let file_name = output_path
+        .file_name()
+        .ok_or_else(|| format!("export path has no file name: {}", output_path.display()))?;
+
+    let tmp_name = format!(
+        ".{}.tmp.{}",
+        file_name.to_string_lossy(),
+        std::process::id()
+    );
+    let tmp = parent.join(tmp_name);
+
+    let mut open_opts = std::fs::OpenOptions::new();
+    open_opts.create(true).write(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        open_opts.mode(0o600);
+    }
+
+    {
+        let mut f = open_opts
+            .open(&tmp)
+            .map_err(|e| format!("failed to open {}: {e}", tmp.display()))?;
+        use std::io::Write as _;
+        f.write_all(content)
+            .map_err(|e| format!("failed to write {}: {e}", tmp.display()))?;
+        f.sync_all()
+            .map_err(|e| format!("failed to sync {}: {e}", tmp.display()))?;
+    }
+
+    if let Err(e) = std::fs::rename(&tmp, output_path) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(format!("failed to write {}: {e}", output_path.display()));
+    }
+    Ok(())
+}
+
 /// Export secrets from a specific environment to a .env file.
 ///
 /// Returns the number of exported secrets.
@@ -301,21 +368,8 @@ pub fn export_env_file_from_env(
         return Ok(0);
     }
 
-    let mut lines: Vec<String> = secrets
-        .iter()
-        .map(|(k, v)| {
-            if v.contains(' ') || v.contains('"') || v.contains('\'') || v.contains('\n') {
-                format!("{k}=\"{}\"", v.replace('\\', "\\\\").replace('"', "\\\""))
-            } else {
-                format!("{k}={v}")
-            }
-        })
-        .collect();
-    lines.sort();
-
-    let content = lines.join("\n") + "\n";
-    std::fs::write(output_path, content)
-        .map_err(|e| format!("failed to write {}: {e}", output_path.display()))?;
+    let content = format_env_file_content(&secrets);
+    write_env_file_owner_only(output_path, content.as_bytes())?;
 
     add_to_gitignore(project_dir, output_path);
 
@@ -331,23 +385,9 @@ pub fn export_env_file(project_dir: &Path, output_path: &Path) -> Result<usize, 
         return Ok(0);
     }
 
-    let mut lines: Vec<String> = secrets
-        .iter()
-        .map(|(k, v)| {
-            if v.contains(' ') || v.contains('"') || v.contains('\'') || v.contains('\n') {
-                format!("{k}=\"{}\"", v.replace('\\', "\\\\").replace('"', "\\\""))
-            } else {
-                format!("{k}={v}")
-            }
-        })
-        .collect();
-    lines.sort();
+    let content = format_env_file_content(&secrets);
+    write_env_file_owner_only(output_path, content.as_bytes())?;
 
-    let content = lines.join("\n") + "\n";
-    std::fs::write(output_path, content)
-        .map_err(|e| format!("failed to write {}: {e}", output_path.display()))?;
-
-    // Auto-add the output file to .gitignore
     add_to_gitignore(project_dir, output_path);
 
     Ok(secrets.len())
@@ -864,6 +904,33 @@ KEY3=no-quotes"#;
             );
             assert_eq!(reparsed["PLAIN"], "value");
 
+            cleanup_vault(dir.path());
+        });
+    }
+
+    /// `export_env_file` materializes plaintext vault secrets to disk.
+    /// On Unix the file must be created at 0o600 — default-umask
+    /// writes (typically 0o644) would expose credentials to every
+    /// other local uid on shared hosts.
+    #[cfg(unix)]
+    #[test]
+    fn export_env_file_is_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        with_forced_file_vault_backend(|| {
+            let dir = tempfile::tempdir().unwrap();
+            set(dir.path(), &[("DB", "postgres://localhost/x")]).unwrap();
+            let export_file = dir.path().join(".env.export-perms");
+            export_env_file(dir.path(), &export_file).expect("export must succeed");
+            let mode = std::fs::metadata(&export_file)
+                .expect("export file must exist")
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(
+                mode, 0o600,
+                "exported dotenv must be 0o600, got {:#o}",
+                mode
+            );
             cleanup_vault(dir.path());
         });
     }

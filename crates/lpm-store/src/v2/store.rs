@@ -349,7 +349,7 @@ impl Store {
         }
 
         if let Some(parent) = object_dir.parent() {
-            std::fs::create_dir_all(parent)
+            ensure_store_tier_dir_locked(parent)
                 .map_err(|e| LpmError::Store(format!("failed to create v2 objects dir: {e}")))?;
         }
 
@@ -543,7 +543,7 @@ impl Store {
         }
 
         if let Some(parent) = final_dir.parent() {
-            std::fs::create_dir_all(parent)
+            ensure_store_tier_dir_locked(parent)
                 .map_err(|e| LpmError::Store(format!("failed to create v2 links dir: {e}")))?;
         }
 
@@ -1079,6 +1079,37 @@ fn create_tmp_dir_locked(path: &Path) -> std::io::Result<()> {
         b.recursive(true);
         b.mode(0o700);
         b.create(path)
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::create_dir_all(path)
+    }
+}
+
+/// Ensure a store-tier directory exists at 0o700. Idempotent — if the
+/// directory is already present, its perms are tightened in place.
+///
+/// `~/.lpm/store/v2/objects/` and `~/.lpm/store/v2/links/` carry
+/// extracted package bytes (including private `@org/*` packages).
+/// `create_dir_all`'s default-umask creation lets shared-host /
+/// shared-CI-runner / NFS-mounted layouts disclose those bytes to
+/// every other local uid. Stamping 0o700 on the store-tier dirs
+/// closes that shape without touching how each link entry stages —
+/// the per-entry tmp dir is also 0o700, and intra-tree perms are
+/// preserved via the atomic rename.
+///
+/// No-op on platforms without POSIX modes, where the perms knob does
+/// not apply.
+fn ensure_store_tier_dir_locked(path: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        use std::os::unix::fs::PermissionsExt;
+        let mut b = std::fs::DirBuilder::new();
+        b.recursive(true);
+        b.mode(0o700);
+        b.create(path)?;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
     }
     #[cfg(not(unix))]
     {
@@ -2287,6 +2318,43 @@ mod tests {
         create_tmp_dir_locked(&target).unwrap();
         let mode = std::fs::metadata(&target).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o700, "expected 0o700, got 0o{mode:o}");
+    }
+
+    /// `ensure_store_tier_dir_locked` creates the store-tier dir at
+    /// 0o700 on a fresh path. Closes the shared-host disclosure shape
+    /// where `create_dir_all`'s default-umask inheritance leaves
+    /// `objects/` and `links/` at 0o755.
+    #[cfg(unix)]
+    #[test]
+    fn ensure_store_tier_dir_locked_creates_at_0o700() {
+        use std::os::unix::fs::PermissionsExt;
+        let parent = tempfile::tempdir().unwrap();
+        let target = parent.path().join("v2").join("objects");
+        ensure_store_tier_dir_locked(&target).unwrap();
+        let mode = std::fs::metadata(&target).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            mode, 0o700,
+            "store-tier dir must be 0o700 on first create, got 0o{mode:o}"
+        );
+    }
+
+    /// Idempotency: a pre-existing 0o755 dir (e.g., one created by an
+    /// older lpm release that predated this fix) is tightened in
+    /// place on the next install touch.
+    #[cfg(unix)]
+    #[test]
+    fn ensure_store_tier_dir_locked_tightens_existing_world_readable_dir() {
+        use std::os::unix::fs::PermissionsExt;
+        let parent = tempfile::tempdir().unwrap();
+        let target = parent.path().join("v2").join("links");
+        std::fs::create_dir_all(&target).unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o755)).unwrap();
+        ensure_store_tier_dir_locked(&target).unwrap();
+        let mode = std::fs::metadata(&target).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            mode, 0o700,
+            "store-tier dir must be tightened to 0o700 on re-use, got 0o{mode:o}"
+        );
     }
 
     /// L8: a stray symlink in a v1 store entry must NOT propagate

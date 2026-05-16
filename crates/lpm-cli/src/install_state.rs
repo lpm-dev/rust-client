@@ -8,6 +8,54 @@ use sha2::{Digest, Sha256};
 use std::path::Path;
 use std::time::UNIX_EPOCH;
 
+/// Atomically write a small state file with owner-only perms (0o600 on Unix).
+///
+/// `install-hash` is the freshness short-circuit `lpm dev` and the
+/// install fast lane consult to decide whether to re-link. On shared
+/// hosts a default-umask (0o644) write lets any local uid forge or
+/// truncate the file and either trigger a re-install loop or coerce
+/// the fast lane to short-circuit a stale tree as fresh. Atomic
+/// rename + 0o600 closes both shapes; on non-Unix the rename is
+/// still atomic but the perms knob is a no-op.
+fn write_state_file_owner_only(path: &Path, content: &[u8]) -> std::io::Result<()> {
+    let parent = path.parent().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "state file has no parent directory",
+        )
+    })?;
+    let file_name = path.file_name().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "state file path has no file name",
+        )
+    })?;
+    let tmp_name = format!(
+        ".{}.tmp.{}",
+        file_name.to_string_lossy(),
+        std::process::id()
+    );
+    let tmp = parent.join(tmp_name);
+
+    let mut open_opts = std::fs::OpenOptions::new();
+    open_opts.create(true).write(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        open_opts.mode(0o600);
+    }
+    {
+        let mut f = open_opts.open(&tmp)?;
+        std::io::Write::write_all(&mut f, content)?;
+        f.sync_all()?;
+    }
+    if let Err(e) = std::fs::rename(&tmp, path) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
+    }
+    Ok(())
+}
+
 /// Result of checking install state.
 pub struct InstallState {
     /// Whether the project's install is up to date.
@@ -674,7 +722,7 @@ pub fn write_install_hash(
     std::fs::create_dir_all(&hash_dir)?;
     let linker_str = linker_mode.as_str();
     let content = format!("{hash}\nm:{pkg_ns}:{lock_ns}\nl:{linker_str}\n");
-    std::fs::write(hash_dir.join("install-hash"), content)?;
+    write_state_file_owner_only(&hash_dir.join("install-hash"), content.as_bytes())?;
 
     // day-3 (F7a) + round-6 audit response — manage the
     // "needs-slow-path" sentinel.
@@ -709,7 +757,7 @@ pub fn write_install_hash(
         .map(|s| s.contains("\"file:") || s.contains("\"link:") || s.contains("\"workspaces\""))
         .unwrap_or(false);
     if needs_slow_path {
-        std::fs::write(&sentinel, b"")?;
+        write_state_file_owner_only(&sentinel, b"")?;
     } else if sentinel.exists() {
         // Project transitioned away from a slow-path-required shape
         // (e.g., a `lpm uninstall` of the only file: dep, or removal
@@ -1178,6 +1226,53 @@ mod tests {
             linker_line, "l:hoisted",
             "expected linker line `l:hoisted`, got {linker_line:?}"
         );
+    }
+
+    /// `install-hash` is the freshness short-circuit `lpm dev` and the
+    /// install fast lane consult. On shared hosts a default-umask
+    /// (0o644) write lets any local uid forge or truncate it.
+    /// The Unix create path must land at 0o600.
+    #[cfg(unix)]
+    #[test]
+    fn install_hash_file_is_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = TempDir::new().unwrap();
+        let p = dir.path();
+        fs::write(p.join("package.json"), r#"{"dependencies":{}}"#).unwrap();
+        fs::write(p.join("lpm.lock"), "").unwrap();
+        write_install_hash(p, "abc123", lpm_linker::LinkerMode::Hoisted).unwrap();
+        let mode = fs::metadata(p.join(".lpm").join("install-hash"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(
+            mode, 0o600,
+            ".lpm/install-hash must be 0o600 on Unix, got {:#o}",
+            mode
+        );
+    }
+
+    /// Bug-fix idempotency: a second `write_install_hash` call must
+    /// also leave the file at 0o600 — even if a prior actor
+    /// (re-installed by another tool, manually edited) chmodded
+    /// the file to 0o644. Atomic rename of a freshly-opened 0o600
+    /// tmp file guarantees the destination perms regardless of the
+    /// prior state.
+    #[cfg(unix)]
+    #[test]
+    fn install_hash_rewrite_resets_perms_to_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = TempDir::new().unwrap();
+        let p = dir.path();
+        fs::write(p.join("package.json"), r#"{"dependencies":{}}"#).unwrap();
+        fs::write(p.join("lpm.lock"), "").unwrap();
+        write_install_hash(p, "first", lpm_linker::LinkerMode::Hoisted).unwrap();
+        let path = p.join(".lpm").join("install-hash");
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+        write_install_hash(p, "second", lpm_linker::LinkerMode::Hoisted).unwrap();
+        let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "rewrite must restore 0o600, got {:#o}", mode);
     }
 
     #[test]
