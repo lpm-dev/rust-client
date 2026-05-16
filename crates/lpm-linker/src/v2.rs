@@ -1,7 +1,7 @@
-//! Phase 66 Phase 4b — virtual-store-aware linker.
+//! Virtual-store-aware linker.
 //!
-//! Sits next to v1's [`crate::link_packages`] / [`crate::link_packages_hoisted`]
-//! and is selected at the install pipeline by
+//! Sits next to v1's [`crate::link_packages`] /
+//! [`crate::link_packages_hoisted`] and is selected via
 //! `LPM_STORE_VERSION=v2`. Instead of materializing per-project
 //! wrappers under `<project>/.lpm/wrappers/<segment>/node_modules/<pkg>/`,
 //! the v2 linker:
@@ -20,7 +20,7 @@
 //! 5. Generates `.bin/` shims by walking the project-side symlinks —
 //!    same shape as v1's, but resolving through v2 paths.
 //!
-//! # Peer-context (preplan §2.5)
+//! # Peer-context
 //!
 //! Each [`LinkTarget`] carries `peers: Vec<(String, String)>`
 //! threaded through from the resolver
@@ -46,7 +46,7 @@
 //! keeps cold-resolve and warm-fast-path producing the same
 //! GraphKeys for the same package.
 //!
-//! # Multi-source disambiguation (preplan §2.2)
+//! # Multi-source disambiguation
 //!
 //! The internal key map keys by `(name, version, wrapper_id)`, not
 //! `(name, version)`. Two `LinkTarget`s with the same `(name,
@@ -83,19 +83,15 @@ pub struct V2Target {
 /// Pre-computed plan handed across the three-phase v2 link API
 /// ([`link_v2_prepare`] → [`link_v2_one`] → [`link_v2_finalize`]).
 ///
-/// **Why three phases (Phase 66 followup #6, post-flamegraph 2026-05-09).**
-/// The pre-followup [`link_packages_v2`] entry took the entire `targets`
-/// slice and ran prepare → populate-loop → finalize sequentially after
-/// the fetch barrier. With the post-resolve plan precomputed once,
-/// per-package [`link_v2_one`] tasks can be spawned by the install
-/// pipeline as each object materializes — overlapping link wall-time
-/// with the fetch loop instead of accumulating it on the critical
-/// path.
+/// **Why three phases.** A single-entry linker would have to wait for
+/// the entire fetch barrier before starting any link work. With the
+/// plan precomputed once, per-package [`link_v2_one`] tasks can spawn
+/// as each object materializes — overlapping link wall-time with the
+/// fetch loop instead of accumulating it on the critical path.
 ///
-/// The pre-followup wrapper [`link_packages_v2`] now drives all three
-/// phases internally and stays as the contract for callers (tests,
-/// non-event-driven install paths) that don't want to thread per-pkg
-/// dispatch.
+/// [`link_packages_v2`] drives all three phases internally and stays
+/// as the contract for callers (tests, non-event-driven install paths)
+/// that don't want to thread per-pkg dispatch.
 pub struct LinkPlanV2 {
     /// Targets after [`ensure_peer_context`] resolved any missing
     /// peer-context (lockfile fast-path fallback). The same slice
@@ -191,20 +187,19 @@ pub fn link_packages_v2(
     let plan = link_v2_prepare(project_dir, targets, store, linker_mode)?;
     let augmented_slice = &plan.augmented_targets[..];
 
-    // **Phase 66 perf followup #5 (samply-driven, 2026-05-08).** Materialize
-    // link entries in parallel for installs above the threshold.
+    // Materialize link entries in parallel for installs above the
+    // threshold.
     //
-    // **Atomicity invariant** (preplan §2.4 + Phase 4a). The v2
-    // store's `populate_link_entry` already serializes concurrent
-    // writers via atomic-rename — two threads racing on the same
-    // graph_key both write into a tmp sibling and one's `rename` wins;
-    // the loser observes the completed final dir on its second probe
-    // and short-circuits. No external lock is needed.
+    // **Atomicity invariant.** `populate_link_entry` already serializes
+    // concurrent writers via atomic-rename — two threads racing on the
+    // same graph_key both write into a tmp sibling and one's `rename`
+    // wins; the loser observes the completed final dir on its second
+    // probe and short-circuits. No external lock needed.
     //
     // **Threshold.** Rayon's global thread pool spin-up cost is
     // measurable (~3-5 ms first call); for small installs the
     // sequential loop is cheaper. 32 is the cross-over point on
-    // M5 macOS APFS — below that, the thread-pool overhead exceeds
+    // macOS APFS — below that, the thread-pool overhead exceeds
     // the parallelism gain.
     use rayon::prelude::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -251,7 +246,7 @@ pub fn link_packages_v2(
     })
 }
 
-/// Phase 66 followup #6 — phase 1 of the event-driven v2 link API.
+/// Step 1 of the event-driven v2 link API.
 ///
 /// Runs the post-resolve, pre-fetch sync work that the install pipeline
 /// can complete without any object on disk:
@@ -282,10 +277,9 @@ pub fn link_v2_prepare(
     store: &Store,
     linker_mode: LinkerMode,
 ) -> Result<LinkPlanV2, LpmError> {
-    // Trial 4 (2026-05-13): top-level linker-stage span. Visible in
-    // Tracy (when built with `--features tracy`); filtered at INFO
-    // level under default settings so it's essentially free in regular
-    // builds. `target_count` is recorded for cross-run comparison.
+    // Top-level linker-stage span. Visible in Tracy with
+    // `--features tracy`; filtered at INFO level so it's essentially
+    // free in regular builds.
     let _span = tracing::info_span!("linker.prepare", target_count = targets.len(),).entered();
     cleanup_v1_state(project_dir)?;
     let mut augmented_targets = targets;
@@ -310,12 +304,12 @@ pub fn link_v2_prepare(
     })
 }
 
-/// Phase 66 followup #6 — phase 2 of the event-driven v2 link API.
+/// Step 2 of the event-driven v2 link API.
 ///
 /// Materializes a single link entry in `~/.lpm/store/v2/links/<key>/`
 /// from a precomputed [`LinkPlanV2`]. Idempotent — concurrent calls
-/// targeting the same graph key serialize through the v2 store's
-/// atomic-rename machinery (preplan §2.4).
+/// for the same graph key serialize through the v2 store's
+/// atomic-rename machinery.
 ///
 /// Returns `(MaterializedPackage, freshly_populated)` so the caller can
 /// distinguish cache hits from new materializations for telemetry.
@@ -331,8 +325,8 @@ pub fn link_v2_one(
     target: &V2Target,
     store: &Store,
 ) -> Result<(MaterializedPackage, bool), LpmError> {
-    // Trial 4 (2026-05-13): per-package span. Records name+version so
-    // Tracy can attribute time to specific slow packages.
+    // Per-package span. Records name+version so Tracy can attribute
+    // time to specific slow packages.
     let _span = tracing::info_span!(
         "linker.one",
         name = %target.target.name,
@@ -361,7 +355,7 @@ pub struct LinkV2FinalizeResult {
     pub self_referenced: bool,
 }
 
-/// Phase 66 followup #6 — phase 3 of the event-driven v2 link API.
+/// Step 3 of the event-driven v2 link API.
 ///
 /// Runs the post-fetch sequential project-side wiring:
 /// 1. Project root symlinks (one per `root_link_names` per direct dep).
@@ -379,9 +373,9 @@ pub fn link_v2_finalize(
     store: &Store,
     self_package_name: Option<&str>,
 ) -> Result<LinkV2FinalizeResult, LpmError> {
-    // Trial 4 (2026-05-13): finalize-stage span. Splits the root /
-    // bin / self-ref sub-stages into nested spans below so the Tracy
-    // breakdown shows which phase dominates for a given install.
+    // Finalize-stage span. Nested sub-stages below split root /
+    // bin / self-ref so the Tracy breakdown shows which phase
+    // dominates for a given install.
     let _span = tracing::info_span!(
         "linker.finalize",
         target_count = plan.augmented_targets.len(),
@@ -441,7 +435,7 @@ fn ensure_peer_context(targets: &mut [V2Target], store: &Store) -> Result<(), Lp
     // intersect declared peers against the install set. The
     // single-version-per-name shape is correct for the audit-fixture
     // scope; multi-source-same-name disambiguation flows through
-    // wrapper_id at the GraphKey level (see preplan §2.2).
+    // wrapper_id at the GraphKey level.
     let mut by_name: HashMap<String, String> = HashMap::with_capacity(targets.len());
     for v2t in targets.iter() {
         by_name
@@ -449,11 +443,10 @@ fn ensure_peer_context(targets: &mut [V2Target], store: &Store) -> Result<(), Lp
             .or_insert_with(|| v2t.target.version.clone());
     }
 
-    // Trial 5 (2026-05-13) — scratch `PathBuf` reused across the
-    // per-package `package.json` paths. The inner `object_dir.join(
-    // "package.json")` allocated per iteration; sharing a single
-    // buffer (cleared and re-pushed) reuses the underlying capacity
-    // once it has grown past the longest store path.
+    // Scratch `PathBuf` reused across per-package `package.json`
+    // paths — the naïve `object_dir.join("package.json")` allocates
+    // per iteration; sharing a single cleared+pushed buffer reuses
+    // the underlying capacity.
     let mut pkg_json_path = PathBuf::with_capacity(256);
     for v2t in targets.iter_mut() {
         if !v2t.target.peers.is_empty() {
@@ -479,11 +472,11 @@ fn ensure_peer_context(targets: &mut [V2Target], store: &Store) -> Result<(), Lp
             }
         };
 
-        // Trial 29: fast byte pre-scan to avoid serde_json parse (hundreds
-        // of allocs) for packages that declare no peer deps — the common
-        // case for most packages in any real install set.
-        // The needle "peerDependencies" matches both "peerDependencies"
-        // and "peerDependenciesMeta", so false negatives are impossible.
+        // Fast byte pre-scan to avoid serde_json parse (hundreds of
+        // allocs) for packages that declare no peer deps — the
+        // common case. The needle "peerDependencies" matches both
+        // "peerDependencies" and "peerDependenciesMeta", so false
+        // negatives are impossible.
         const PEER_KEY: &[u8] = b"peerDependencies";
         if !content.windows(PEER_KEY.len()).any(|w| w == PEER_KEY) {
             continue;
@@ -742,14 +735,13 @@ fn derive_graph_keys(
                 // `(name, version)`, so we can't disambiguate which
                 // GraphKey a `dep on foo@1.0.0` should point at. Hard
                 // error rather than silently aliasing one onto the
-                // other (the audit-fixture suite never exercises this
-                // shape today; threading wrapper_id through dep edges
-                // is a Phase 4 follow-up that lifts the constraint).
+                // other; full disambiguation requires wrapper_id-aware
+                // dep edges, which is a follow-up.
                 return Err(LpmError::Store(format!(
                     "v2 linker: multi-source LinkTarget collision for {}@{} \
                      (existing wrapper_id={:?}, new wrapper_id={:?}). \
                      Multi-source disambiguation requires wrapper_id-aware \
-                     dep edges (Phase 4 follow-up).",
+                     dep edges.",
                     v2t.target.name,
                     v2t.target.version,
                     existing.get().1,
@@ -776,7 +768,7 @@ fn cleanup_v1_state(project_dir: &Path) -> Result<(), LpmError> {
             ))
         })?;
     }
-    // `<project>/.lpm/hoisted/` — Phase 61.x hoisted layout sidecar.
+    // `<project>/.lpm/hoisted/` — hoisted layout sidecar.
     let hoisted = project_dir.join(".lpm").join("hoisted");
     if hoisted.exists() {
         std::fs::remove_dir_all(&hoisted).map_err(|e| {
@@ -789,9 +781,8 @@ fn cleanup_v1_state(project_dir: &Path) -> Result<(), LpmError> {
     // `<project>/node_modules/` — wipe completely. v2 always rebuilds
     // from scratch; under v1 the linker also wipes stale entries via
     // `cleanup_stale_entries`. Wiping the whole tree is simpler and
-    // matches the migration semantics in preplan §3.2 (".bin/ MUST
-    // be wiped — bin shims regenerate from the active install
-    // layout").
+    // `.bin/` must be wiped — bin shims regenerate from the active
+    // install layout.
     let nm = project_dir.join("node_modules");
     if nm.exists() {
         std::fs::remove_dir_all(&nm).map_err(|e| {
@@ -820,12 +811,10 @@ fn create_root_symlinks(
         ))
     })?;
 
-    // Trial 5 (2026-05-13) — scratch `PathBuf` reused across iterations.
-    // Without this, each inner-loop `nm.join(&root_name)` allocates a
-    // fresh `PathBuf`; with a single scratch buffer cleared between
-    // iterations, the underlying capacity is reused. For installs with
-    // ~50 packages × 1-2 root names each this saves on the order of
-    // 100 PathBuf allocations on the warm-link hot path.
+    // Scratch `PathBuf` reused across iterations. The naïve
+    // `nm.join(&root_name)` allocates a fresh `PathBuf` per
+    // root_name; with a single cleared+pushed buffer the underlying
+    // capacity is reused (~100 fewer allocations on a typical install).
     let mut link_path = PathBuf::with_capacity(nm.as_os_str().len() + 64);
     let mut count = 0usize;
     for v2t in targets {
@@ -913,12 +902,10 @@ fn create_bin_links_v2(
 ) -> Result<usize, LpmError> {
     let bin_dir = project_dir.join("node_modules").join(".bin");
 
-    // Trial 5 (2026-05-13) — scratch `PathBuf`s reused across iterations.
-    // The four per-iteration paths (`pkg_json_path`, `bin_target`,
-    // `link_path`, `cmd_path`) are all built into reusable buffers
-    // rather than allocated fresh each loop turn. For an install with
-    // N direct deps × ~2 bin entries each, this saves on the order
-    // of 4 N PathBuf allocations on the warm-link hot path.
+    // Scratch `PathBuf`s reused across iterations: the per-iteration
+    // paths build into reusable buffers rather than allocating fresh
+    // each loop turn (~4×N PathBuf allocations saved for an install
+    // with N direct deps × ~2 bin entries each).
     let mut pkg_json_path = PathBuf::with_capacity(256);
     let mut bin_target = PathBuf::with_capacity(256);
     let mut link_path = PathBuf::with_capacity(bin_dir.as_os_str().len() + 64);
@@ -944,11 +931,11 @@ fn create_bin_links_v2(
             Err(_) => continue,
         };
 
-        // Trial 30: fast byte pre-scan to skip serde_json parse entirely
-        // for direct deps that declare no `bin`. The quoted key `"bin"`
-        // reliably identifies the JSON field; any false positives (a value
-        // containing the 5-byte sequence `"bin"`) are harmless — we just
-        // parse unnecessarily and get back None.
+        // Fast byte pre-scan to skip serde_json parse entirely for
+        // direct deps that declare no `bin`. The quoted key `"bin"`
+        // reliably identifies the JSON field; any false positive (a
+        // value containing the 5-byte sequence) is harmless — we just
+        // parse and get back None.
         const BIN_KEY: &[u8] = b"\"bin\"";
         if !content.windows(BIN_KEY.len()).any(|w| w == BIN_KEY) {
             continue;
@@ -1053,8 +1040,8 @@ fn create_bin_links_v2(
     Ok(count)
 }
 
-// Trial 8 (2026-05-13): tiny helper called per-target in `create_bin_links_v2`
-// — `#[inline]` so the per-iteration call shrinks to a single branch.
+// Tiny helper called per-target — `#[inline]` so the per-iteration
+// call shrinks to a single branch.
 #[inline]
 fn is_direct(target: &LinkTarget) -> bool {
     if let Some(names) = &target.root_link_names {
@@ -1361,7 +1348,7 @@ mod tests {
         );
     }
 
-    /// **Cross-project peer-divergence — preplan §2.5 invariant.**
+    /// **Cross-project peer-divergence invariant.**
     ///
     /// The same consumer package + edge graph but a different
     /// resolved-peer version MUST produce distinct GraphKeys, so two
@@ -1450,7 +1437,7 @@ mod tests {
         assert_ne!(
             c_dest_p1, c_dest_p2,
             "peer-divergent installs must produce distinct link entries for c@1.0.0; \
-             pre-Phase-66 they shared a GraphKey because peers were always empty"
+             without peers in the GraphKey they would alias"
         );
 
         // And each project resolves its peer to the version IT
@@ -1602,7 +1589,7 @@ mod tests {
     // are documented as repo-local (`crates/lpm-cli/src/commands/patch.rs:18`):
     // "Patches travel with the repo. The next `lpm install` automatically
     // re-applies them after linking." Under v2's cross-project link
-    // sharing (preplan §2.2), two projects with identical dep graphs
+    // sharing, two projects with identical dep graphs
     // resolve to the same `<store>/v2/links/<key>/...` directory by
     // design. Without F1's `patch_fingerprint` dimension, project A's
     // `apply_patch` mutation lands in the shared dir and project B's
@@ -1743,13 +1730,12 @@ mod tests {
         );
     }
 
-    /// **Phase 66 perf followup #5.** Parallel materialization above
-    /// the `PARALLEL_THRESHOLD = 32` cross-over must produce the same
-    /// `LinkResult` shape as the sequential path: every input target
-    /// gets a populated link entry, materialized count matches the
-    /// input length, and `linked` (count of freshly-populated
-    /// entries) sums correctly across rayon worker threads via the
-    /// atomic counter.
+    /// Parallel materialization above `PARALLEL_THRESHOLD = 32` must
+    /// produce the same `LinkResult` shape as the sequential path:
+    /// every input target gets a populated link entry, materialized
+    /// count matches the input length, and `linked` (count of
+    /// freshly-populated entries) sums correctly across rayon worker
+    /// threads via the atomic counter.
     #[test]
     fn link_packages_v2_parallel_materialization_above_threshold() {
         let tmp = tempfile::tempdir().unwrap();

@@ -1,7 +1,7 @@
 //! Argv contract between the parent (`lpm.exe`) and the helper
 //! (`lpm-sandbox-helper.exe`).
 //!
-//! Phase 46.3 PR-2: Rust's stable `std::process::Command` builds the
+//! Rust's stable `std::process::Command` builds the
 //! child via `STARTUPINFOW`, not `STARTUPINFOEXW`. AppContainer's
 //! `SECURITY_CAPABILITIES` must be attached via
 //! `STARTUPINFOEX.lpAttributeList` carrying
@@ -39,14 +39,14 @@ use std::path::PathBuf;
 ///
 /// Bumping this constant requires coordinated work on both the
 /// parent serializer ([`crate`]-side `AppContainerSandbox::spawn`)
-/// and the helper-side parser; during PR-2 development the only
+/// and the helper-side parser; during development the only
 /// valid value is `1`.
 pub const PROTOCOL_VERSION: u32 = 1;
 
 /// Stable AppContainer profile name reused across every lpm install
 /// on the host. A single name → a single derived SID → idempotent
 /// DACL grants on the allow-set dirs. A per-project name would
-/// accumulate dead ACEs forever; see §3.2 of the PR-2 plan.
+/// accumulate dead ACEs forever.
 pub const APPCONTAINER_NAME: &str = "LpmSandboxLifecycleChild";
 
 /// How the helper should configure the lifecycle child's stdio

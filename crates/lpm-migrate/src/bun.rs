@@ -416,7 +416,7 @@ mod tests {
 
     #[test]
     fn deps_resolve_to_exact_versions_not_ranges() {
-        // Finding #1: deps should have exact versions, not semver ranges
+        // Deps should have exact versions, not semver ranges
         let json = r#"{
   "lockfileVersion": 0,
   "packages": {

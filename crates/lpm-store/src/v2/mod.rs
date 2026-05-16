@@ -1,12 +1,6 @@
-//! Phase 66 Phase 4a — v2 store layout primitives.
-//!
-//! This module ships the on-disk shape and identity helpers for the
-//! virtual-store rewrite ([Phase 66 preplan §2]). It is **dead code in
-//! Phase 4a**: no install or read pipeline references the types yet.
-//! Phase 4b wires writes behind `LPM_STORE_VERSION=v2`; Phase 4c teaches
-//! the read paths to honor v2; Phase 4d flips the default.
-//!
-//! [Phase 66 preplan §2]: ../../../../../tolgaergin/a-package-manager/DOCS/new-features/37-rust-client-RUNNER-VISION-phase66-preplan.md
+//! v2 store layout primitives — on-disk shape and identity helpers
+//! for the virtual-store rewrite. Writes are gated behind
+//! `LPM_STORE_VERSION=v2` until the default flip lands.
 //!
 //! # Layout
 //!
@@ -28,7 +22,7 @@
 //! - canonical name + exact version
 //! - platform tuple `(os, cpu, libc)` — libc is `Some` only on Linux
 //!   (sharp / esbuild ship per-libc binaries, so collapsing it would
-//!   produce incorrect cross-distro reuse — preplan §2.2 audit lock-in)
+//!   produce incorrect cross-distro reuse)
 //! - peer-context (empty in hoisted mode; sorted `name@version` list
 //!   in isolated mode)
 //! - dep edges `(local_name → target_name@version)` — preserves the

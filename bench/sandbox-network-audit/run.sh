@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# Phase 46.1 sandbox-network-denial audit — single-package runner.
+# sandbox-network-denial audit — single-package runner.
 #
-# Installs ONE package via `lpm-rs install` under the Phase 46.1
+# Installs ONE package via `lpm-rs install` under the
 # sandbox (script-policy = allow, so the triage gate is bypassed
 # and every scripted package's postinstall is given a chance to
 # run -- the audit then measures whether the sandbox denies its
@@ -118,7 +118,7 @@ else
     echo "warning: neither timeout(1) nor gtimeout(1) found; running without a timeout. Install GNU coreutils (\`brew install coreutils\` on macOS) before the full curated-sample run." >&2
 fi
 
-# Phase 46.1 rework (2026-05-11): strict sandbox (the dimension this
+# rework (2026-05-11): strict sandbox (the dimension this
 # audit measures) is opt-in, not the default. The harness exports
 # `LPM_STRICT_SANDBOX=1` so each spawned `lpm-rs install` exercises
 # the strict path — `denied_in_sandbox` counts what the strict
@@ -140,11 +140,11 @@ EXIT_CODE=$?
 # Detect the OS-level sandbox-denial signal in stdout/stderr.
 #
 # This regex matches the unambiguous kernel-emitted denial tokens
-# that Phase 46.1 + 46.1.1 strict-mode enforcement surfaces to
-# the lifecycle script. Phase 46.1's landlock V4 surfaces
+# that + 46.1.1 strict-mode enforcement surfaces to
+# the lifecycle script. The landlock V4 rule surfaces
 # `connect(2)` / `bind(2)` returning `EACCES` / `EPERM`, plus
 # the socket-layer fallout `EHOSTUNREACH` / `ENETUNREACH` /
-# "operation not permitted" / "permission denied". Phase 46.1.1's
+# "operation not permitted" / "permission denied". The seccomp layer
 # seccomp-bpf layer surfaces `socket(2)` itself returning EACCES
 # for the UDP / raw / AF_PACKET / AF_NETLINK families — same
 # token set, just at the `socket()` syscall rather than at
@@ -162,7 +162,7 @@ fi
 # heuristic — `dns_failure_seen` in the JSON output, NOT folded
 # into `denial_signal_seen`.
 #
-# Why this is a separate axis: Phase 46.1.1 narrows the variance
+# Why this is a separate axis: narrows the variance
 # window for DNS failures, but doesn't close it. The seccomp
 # filter denies DIRECT UDP `socket(AF_INET, SOCK_DGRAM)`
 # deterministically, so a script that does its own raw DNS
@@ -178,7 +178,7 @@ fi
 #
 # Treating these as the same axis as `denial_signal_seen` would:
 # (a) overstate the product contract by implying full DNS
-# denial — Phase 46.1.1 narrows DNS variance but doesn't seal
+# denial — narrows DNS variance but doesn't seal
 # resolver-mediated lookups; (b) misbucket ordinary resolver
 # failures (a flaky DNS server, an unreachable nscd, a real
 # network outage) as sandbox denials. Keep them as a separate
@@ -215,7 +215,7 @@ RESOLVED_VERSION="${INSTALLED_VERSION:-$VERSION}"
 # own node_modules dir inside the content-addressed store link.
 # The store layout differs between versions: v1 was
 # `$LPM_HOME/store/v1/<safe-name>@<version>/.lpm-built`; v2
-# (Phase 66 default) is
+# (default) is
 # `$LPM_HOME/store/v2/links/<safe-name>@<version>+<hash>/node_modules/<pkg>/.lpm-built`
 # with a per-link hash suffix the harness can't predict. The
 # project-level `node_modules/<pkg>` symlink the install pipeline

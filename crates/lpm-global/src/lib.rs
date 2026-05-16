@@ -1,4 +1,4 @@
-//! Phase 37 — global install state for `~/.lpm/global/`.
+//! Global install state for `~/.lpm/global/`.
 //!
 //! This crate owns the on-disk shape of every machine-global file that
 //! the install -g / uninstall -g / approve-scripts --global / global *
@@ -10,7 +10,7 @@
 //!   (length + CRC + sentinel framing — see `wal::format`).
 //!
 //! The install pipeline that *consumes* these primitives lives in
-//! `lpm-cli` (M3); this crate is deliberately storage-only so the schema
+//! `lpm-cli`; this crate is deliberately storage-only so the schema
 //! and persistence rules have a single source of truth, independent of
 //! the command-layer wiring.
 

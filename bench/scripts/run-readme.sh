@@ -2,7 +2,7 @@
 # README bench harness — npm / pnpm / bun / greedy-fusion lpm, round-robin
 # per outer iter.
 #
-# Round-robin matches the methodology of `run-5cell.sh` (Phase 56 W4): each
+# Round-robin matches the methodology of `run-5cell.sh` (W4): each
 # outer iter runs all four arms back-to-back, so adjacent samples see the
 # SAME network state. The per-arm sequential structure in `bench/run.sh`
 # favors whichever arm runs last (gets warmest DNS / TLS / CDN — npm goes
@@ -95,7 +95,7 @@ date
 #                  (cold) and position-2 (warm-after-other) equally
 #                  often, so both see the same mix of network state.
 #                  This is the apples-to-apples like-for-like
-#                  comparison the bench/scripts W4 baseline uses.
+#                  comparison the bench/scripts baseline uses.
 
 # Order matters. Running npm/pnpm BEFORE the lpm+bun round-robin
 # would warm not just the local OS state (DNS, TCP keep-alives) but

@@ -1,11 +1,11 @@
-//! Phase 58.1 day-4 — `cafile` / `ca` / `strict-ssl` integration matrix.
+//! `cafile` / `ca` / `strict-ssl` integration matrix.
 //!
 //! 12-cell test grid (3 server cert shapes × 4 client configs) that
 //! pins the user-visible contracts of [`RegistryClient::with_tls_overrides`].
-//! Per Gemini's day-4 design call, the matrix specifically proves that
-//! `strict-ssl=false` ignores ALL three classic cert defects (untrusted
-//! CA, hostname mismatch, expired) — not just the unknown-CA path that
-//! a naive trust-root extension would already cover.
+//! The matrix specifically proves that `strict-ssl=false` ignores ALL
+//! three classic cert defects (untrusted CA, hostname mismatch, expired)
+//! — not just the unknown-CA path that a naive trust-root extension would
+//! already cover.
 //!
 //! ## Cert chain shape (matches enterprise reality)
 //!
@@ -14,8 +14,8 @@
 //!   - `valid` — SAN: `localhost`, `127.0.0.1`. `notAfter`: ~1 year out.
 //!   - `mismatch` — SAN: `not-the-right-host.com`. `notAfter`: ~1 year out.
 //!   - `expired` — SAN: `localhost`, `127.0.0.1`. `notAfter`: 2 days ago.
-//! - Server presents `[leaf, root_ca]` chain (per Gemini's gotcha — some
-//!   rustls paths balk if the root isn't explicit in the chain).
+//! - Server presents `[leaf, root_ca]` chain — some rustls paths balk if
+//!   the root isn't explicit in the chain.
 //! - Tests load the **Root CA's PEM** via `cafile=` / `ca=`. This
 //!   matches how a corporate IT setup typically works (one CA in the
 //!   trust store; many short-lived leaves issued from it).
@@ -35,7 +35,7 @@
 //! ## Test server shape
 //!
 //! Hand-rolled `tokio::net::TcpListener` + `tokio_rustls::TlsAcceptor`,
-//! lifted to [`tls_server`] alongside the mTLS test server in Phase 58.3.
+//! shared with the mTLS test server via [`tls_server`].
 //! Returns a hard-coded HTTP/1.1 200 OK response after the handshake.
 //! Each test spawns its own listener on `127.0.0.1:0` (kernel-assigned
 //! port) and drops it on test exit — fully parallel-safe, no shared state.

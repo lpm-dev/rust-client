@@ -1,6 +1,6 @@
 //! Binary lockfile format (`lpm.lockb`) for zero-parse-cost reads.
 //!
-//! Layout (v2, Phase 43):
+//! Layout (v2):
 //! ```text
 //! [Header: 16 bytes]
 //!   magic:              [u8; 4]  = b"LPMB"
@@ -19,7 +19,7 @@
 //!   integrity_len:      u16 LE
 //!   deps_off:           u32 LE   — offset into deps table
 //!   deps_count:         u16 LE
-//!   tarball_off:        u32 LE   — 0 means None (Phase 43, v2+)
+//!   tarball_off:        u32 LE   — 0 means None (v2+)
 //!   tarball_len:        u16 LE
 //!
 //! [DepsEntry × total_deps: 6 bytes each]
@@ -41,9 +41,9 @@
 //! On rejection, `read_fast` falls back to parsing the TOML
 //! lockfile, and the next `write_all` rewrites `lpm.lockb` as the
 //! current version — so the migration completes transparently on
-//! any install that writes the lockfile (Phase 43 P43-2 adds a
-//! dedicated writeback trigger so fast-path installs also complete
-//! the migration).
+//! any install that writes the lockfile — fast-path installs that
+//! open `lpm.lockb` also trigger a rewrite on first run after
+//! an upgrade.
 //!
 //! ## Null vs empty strings for optional fields
 //!
@@ -59,8 +59,8 @@ use crate::{LockedPackage, Lockfile, LockfileError};
 use std::path::Path;
 
 const MAGIC: &[u8; 4] = b"LPMB";
-/// Binary lockfile wire-format version. Bumped 1 → 2 in Phase 43
-/// to append a `(tarball_off, tarball_len)` pair to every
+/// Binary lockfile wire-format version. Bumped 1 → 2 when the
+/// `(tarball_off, tarball_len)` pair was appended to every
 /// `PackageEntry` (see layout docstring above). `pub` so
 /// `read_fast` can distinguish older-version rejections (which
 /// trigger best-effort cleanup of stale binaries) from
@@ -80,8 +80,8 @@ pub const BINARY_LOCKFILE_NAME: &str = "lpm.lockb";
 
 /// Binary format capability check — does this lockfile fit the wire format?
 ///
-/// Phase 40 P2 — the binary format has no section for alias metadata
-/// (neither v1 nor v2; Phase 43's v2 bump only added the tarball
+/// Does this lockfile fit the binary wire format? The binary format
+/// has no section for alias metadata (neither v1 nor v2 has an alias
 /// slot). Projects with any npm-alias edges (root or transitive)
 /// would be written with their alias info SILENTLY DROPPED, producing
 /// a binary lockfile that disagrees with the TOML lockfile and a warm
@@ -96,16 +96,13 @@ pub fn binary_format_supports(lockfile: &Lockfile) -> bool {
     if !lockfile.root_aliases.is_empty() {
         return false;
     }
-    // **R2.5** — extending the same "skip binary fast path when the
-    // lockfile carries metadata the binary schema can't encode" gate.
+    // Extend the same "skip binary fast path when the lockfile carries
+    // metadata the binary schema can't encode" gate to peer fields.
     // Both `Lockfile.ambient_peer_installs` and per-package
-    // `LockedPackage.peers` are R2-era additions; the binary format's
-    // fixed entry shape (binary.rs:670-720) doesn't have slots for
-    // them. Falling back to TOML-only is the same conservative move
-    // we make for npm-aliases — projects without any auto-installed
-    // peers AND no per-package peer pinning still take the fast
-    // binary path. Most non-React projects fall through this filter
-    // unaffected.
+    // `LockedPackage.peers` lack binary-format slots. Falling back to
+    // TOML-only is the same conservative move we make for npm-aliases
+    // — projects without any auto-installed peers AND no per-package
+    // peer pinning still take the fast binary path.
     if !lockfile.ambient_peer_installs.is_empty() {
         return false;
     }
@@ -117,8 +114,8 @@ pub fn binary_format_supports(lockfile: &Lockfile) -> bool {
 
 /// Serialize a `Lockfile` into the binary format.
 ///
-/// Phase 40 P2 — returns `LockfileError::Serialize` when the
-/// lockfile contains alias metadata. Callers should gate on
+/// Returns `LockfileError::Serialize` when the lockfile contains
+/// alias or peer metadata. Callers should gate on
 /// [`binary_format_supports`] and fall back to TOML-only when the
 /// check fails.
 pub fn to_binary(lockfile: &Lockfile) -> Result<Vec<u8>, LockfileError> {
@@ -141,7 +138,7 @@ pub fn to_binary(lockfile: &Lockfile) -> Result<Vec<u8>, LockfileError> {
         integrity: (u32, u16),
         deps_off: u32,
         deps_count: u16,
-        /// Phase 43, v2+ — `(0, 0)` sentinel for None. Populated from
+        /// v2+ — `(0, 0)` sentinel for None. Populated from
         /// `LockedPackage.tarball` via `insert_optional`, which
         /// rejects empty strings to keep the sentinel unambiguous.
         tarball: (u32, u16),
@@ -227,7 +224,7 @@ pub fn to_binary(lockfile: &Lockfile) -> Result<Vec<u8>, LockfileError> {
         buf.extend_from_slice(&info.integrity.1.to_le_bytes());
         buf.extend_from_slice(&info.deps_off.to_le_bytes());
         buf.extend_from_slice(&info.deps_count.to_le_bytes());
-        // Phase 43, v2+ — tarball URL slot.
+        // v2+ — tarball URL slot.
         buf.extend_from_slice(&info.tarball.0.to_le_bytes());
         buf.extend_from_slice(&info.tarball.1.to_le_bytes());
     }
@@ -367,18 +364,17 @@ impl BinaryLockfileReader {
                 ));
             }
 
-            // Phase 43 — validate tarball pair eagerly so a corrupted
-            // slot forces TOML fallback instead of silently surfacing
+            // Validate the tarball pair eagerly so a corrupted slot
+            // forces TOML fallback instead of silently surfacing
             // `Some("")` (which `read_str` returns on out-of-bounds
             // or zero-length reads).
             //
             // Invariant: the ONLY legitimate zero-length slot is the
             // null sentinel `(off=0, len=0)`. A non-null pair must
             // have `len > 0` AND fit inside the string table. Reject:
-            //   - `len == 0 && off != 0` — orphan offset (2nd-round
-            //     GPT audit catch: this was missed by the first
-            //     follow-up because `len == 0` also makes
-            //     `off + len > string_table_len` trivially false).
+            //   - `len == 0 && off != 0` — orphan offset (this
+            //     case is not caught by `off + len > string_table_len`
+            //     because `len == 0` makes that check trivially false).
             //   - `off + len` overflows or exceeds the string table.
             let tarball_off =
                 u32::from_le_bytes(mmap[base + 30..base + 34].try_into().unwrap()) as usize;
@@ -461,9 +457,9 @@ impl BinaryLockfileReader {
             integrity_len: u16::from_le_bytes(b[22..24].try_into().unwrap()),
             deps_off: u32::from_le_bytes(b[24..28].try_into().unwrap()),
             deps_count: u16::from_le_bytes(b[28..30].try_into().unwrap()),
-            // Phase 43, v2+ — tarball slot at bytes [30..36]. Parses
-            // cleanly on every v2 file; the null sentinel (0, 0)
-            // decodes to `None` in `tarball()`.
+            // v2+ — tarball slot at bytes [30..36]. Parses cleanly on
+            // every v2 file; the null sentinel (0, 0) decodes to `None`
+            // in `tarball()`.
             tarball_off: u32::from_le_bytes(b[30..34].try_into().unwrap()),
             tarball_len: u16::from_le_bytes(b[34..36].try_into().unwrap()),
         })
@@ -471,16 +467,14 @@ impl BinaryLockfileReader {
 
     /// Binary search for a package by name. O(log n), zero-copy.
     ///
-    /// **Phase 59.0 (post-review):** name-only lookup. Under
-    /// cross-source collision (a registry package and a tarball-URL
-    /// package with the same `(name, version)` in one lockfile),
-    /// this returns whichever entry the binary search lands on —
-    /// effectively arbitrary. New code MUST prefer
-    /// [`Self::find_package_by_key`], which keys on the full
-    /// `(name, version, source_id)` triple. This name-only method
-    /// is retained for back-compat with pre-Phase-59 callers
-    /// (Phase 40 P2 alias resolution etc.) where the lockfile is
-    /// guaranteed registry-only and name uniquely identifies a
+    /// Name-only lookup. Under cross-source collision (a registry
+    /// package and a tarball-URL package with the same
+    /// `(name, version)` in one lockfile), this returns whichever
+    /// entry the binary search lands on — effectively arbitrary.
+    /// New code MUST prefer [`Self::find_package_by_key`], which
+    /// keys on the full `(name, version, source_id)` triple. This
+    /// name-only method is retained for callers where the lockfile
+    /// is guaranteed registry-only and name uniquely identifies a
     /// package.
     pub fn find_package(&self, name: &str) -> Option<PackageEntryView<'_>> {
         let count = self.pkg_count() as usize;
@@ -498,8 +492,8 @@ impl BinaryLockfileReader {
         None
     }
 
-    /// **Phase 59.0 (post-review)** — source-aware lookup keyed by
-    /// the full `(name, version, source_id)` triple. Mirrors
+    /// Source-aware lookup keyed by the full `(name, version,
+    /// source_id)` triple. Mirrors
     /// [`crate::Lockfile::find_package_by_key`] so the binary fast
     /// path has the same disambiguation guarantee as the TOML path.
     ///
@@ -562,11 +556,10 @@ impl BinaryLockfileReader {
             // correspond to an alias-free lockfile and this field is
             // always empty.
             root_aliases: std::collections::BTreeMap::new(),
-            // R2.5 — same reasoning as `root_aliases`: projects with
-            // ambient peer installs skip the binary write entirely,
-            // so any `to_lockfile()` we'd reach is for a binary-
-            // representable lockfile, which by construction has no
-            // ambient peers.
+            // Same reasoning as `root_aliases`: projects with ambient
+            // peer installs skip the binary write entirely, so any
+            // `to_lockfile()` we'd reach is for a binary-representable
+            // lockfile, which by construction has no ambient peers.
             ambient_peer_installs: Vec::new(),
         }
     }
@@ -596,7 +589,7 @@ pub struct PackageEntryView<'a> {
     integrity_len: u16,
     deps_off: u32,
     deps_count: u16,
-    /// Phase 43, v2+ — tarball URL slot. `(0, 0)` = None.
+    /// v2+ — tarball URL slot. `(0, 0)` = None.
     tarball_off: u32,
     tarball_len: u16,
 }
@@ -626,7 +619,7 @@ impl<'a> PackageEntryView<'a> {
         }
     }
 
-    /// Phase 43 — tarball URL as stored by the resolver. Used by
+    /// Tarball URL as stored by the resolver. Used by
     /// `try_lockfile_fast_path` to skip per-package metadata lookup
     /// on warm installs (gated by `evaluate_cached_url` for
     /// scheme/shape/origin safety).
@@ -671,8 +664,8 @@ impl<'a> PackageEntryView<'a> {
         deps
     }
 
-    /// **Phase 59.0 (post-review)** — three-tuple identity for this
-    /// binary entry, mirroring [`LockedPackage::package_key`].
+    /// Three-tuple identity for this binary entry, mirroring
+    /// [`LockedPackage::package_key`].
     ///
     /// Used by [`BinaryLockfileReader::find_package_by_key`] to
     /// disambiguate cross-source collisions without forcing a
@@ -702,16 +695,15 @@ impl<'a> PackageEntryView<'a> {
             // aliased projects makes the TOML fallback a reasonable
             // interim trade-off.
             alias_dependencies: Vec::new(),
-            // R2.5 — same gate as alias_dependencies: per-package
-            // peers are part of the R2.5 metadata the binary format
-            // doesn't encode. Projects with peers fail
-            // `binary_format_supports` and fall back to TOML, so any
-            // binary entry we round-trip here is by construction
+            // Same gate as alias_dependencies: per-package peers are
+            // metadata the binary format doesn't encode. Projects with
+            // peers fail `binary_format_supports` and fall back to TOML,
+            // so any binary entry we round-trip here is by construction
             // peer-free.
             peers: Vec::new(),
-            // Phase 43, v2+ — read the tarball URL directly from the
-            // mmap via the accessor; `None` when the slot is the
-            // `(0, 0)` null sentinel.
+            // v2+ — read the tarball URL directly from the mmap via
+            // the accessor; `None` when the slot is the `(0, 0)` null
+            // sentinel.
             tarball: self.tarball().map(|s| s.to_string()),
         }
     }
@@ -876,7 +868,7 @@ mod tests {
         assert!(reader.find_package("nonexistent").is_none());
     }
 
-    // ── Phase 59.0 (post-review): cross-source collision in binary lockfile ──
+    // ── Cross-source collision in binary lockfile ──
     // The binary lockfile fast path must offer the same source-aware
     // disambiguation guarantee as the TOML path. Without
     // `find_package_by_key`, a direct binary `find_package(name)`
@@ -1386,7 +1378,7 @@ mod tests {
         assert_eq!(toml1, toml2);
     }
 
-    // ── Finding #1: read_str lower-bound validation ──────────────────────
+    // ── read_str lower-bound validation ──────────────────────────────────
 
     #[test]
     fn read_str_offset_into_header_returns_empty() {
@@ -1481,7 +1473,7 @@ mod tests {
         assert!(reader.entry_at(1).is_some());
     }
 
-    // ── Finding #2: dependencies() checked arithmetic ────────────────────
+    // ── dependencies() checked arithmetic ────────────────────────────────
 
     #[test]
     fn deps_max_offset_no_panic() {
@@ -1507,7 +1499,7 @@ mod tests {
         );
     }
 
-    // ── Finding #3: dep overflow check ───────────────────────────────────
+    // ── dep overflow check ───────────────────────────────────────────────
 
     #[test]
     fn dep_overflow_check_accounts_for_pending_deps() {
@@ -1521,7 +1513,7 @@ mod tests {
         assert!(!would_overflow(0, u32::MAX as usize));
     }
 
-    // ── Finding #7: string deduplication ─────────────────────────────────
+    // ── String deduplication ──────────────────────────────────────────────
 
     #[test]
     fn string_dedup_reduces_size() {
@@ -1613,18 +1605,18 @@ mod tests {
         );
     }
 
-    // ── Phase 43: binary v2 — tarball URL round-trip ───────────────────────
+    // ── Binary v2: tarball URL round-trip ─────────────────────────────────
 
     #[test]
-    fn phase43_entry_size_is_36_bytes() {
+    fn entry_size_is_36_bytes() {
         // Wire-format invariant: v2 entries are 36 bytes (v1 was 30).
         // Guards against accidentally mis-sizing the writer/reader.
         assert_eq!(ENTRY_SIZE, 36, "v2 entry size must be 36 bytes");
-        assert_eq!(BINARY_VERSION, 2, "Phase 43 targets BINARY_VERSION = 2");
+        assert_eq!(BINARY_VERSION, 2, "current BINARY_VERSION must be 2");
     }
 
     #[test]
-    fn phase43_tarball_roundtrips_through_binary() {
+    fn tarball_roundtrips_through_binary() {
         let mut lf = Lockfile::new();
         lf.add_package(LockedPackage {
             name: "lodash".to_string(),
@@ -1656,7 +1648,7 @@ mod tests {
     }
 
     #[test]
-    fn phase43_mixed_tarball_population_roundtrips() {
+    fn mixed_tarball_population_roundtrips() {
         // Rollout window — some entries have URL, some don't.
         // None must round-trip as None (null sentinel); Some must
         // preserve the exact bytes.
@@ -1695,8 +1687,8 @@ mod tests {
     }
 
     #[test]
-    fn phase43_writer_rejects_empty_tarball() {
-        // M2 from 3rd-pass audit — `(off=0, len=0)` is the null
+    fn writer_rejects_empty_tarball() {
+        // Third-pass audit: `(off=0, len=0)` is the null
         // sentinel. An empty-string tarball inserted into an empty
         // StringTable would yield exactly `(0, 0)` and become
         // indistinguishable from `None`. The writer must refuse.
@@ -1721,12 +1713,12 @@ mod tests {
     }
 
     #[test]
-    fn phase43_writer_rejects_empty_source_and_integrity_too() {
+    fn writer_rejects_empty_source_and_integrity_too() {
         // Same sentinel collision applies to `source` / `integrity`.
         // Historically the writer silently accepted them (falling to
         // the `(0, 0)` null sentinel, confusing readers into seeing
-        // `None` where `Some("")` was intended). Phase 43 tightens
-        // this across all three optional fields for consistency.
+        // `None` where `Some("")` was intended). The writer rejects
+        // empty strings across all three optional fields for consistency.
         let mut lf_source = Lockfile::new();
         lf_source.add_package(LockedPackage {
             name: "pkg-with-empty-source".to_string(),
@@ -1763,7 +1755,7 @@ mod tests {
     }
 
     #[test]
-    fn phase43_v2_reader_rejects_v1_binary_strict() {
+    fn v2_reader_rejects_v1_binary_strict() {
         // A v2 reader decoding v1 entries (30 bytes each) as v2
         // entries (36 bytes each) would read package N's `name_off`
         // as package N-1's (nonexistent) tarball pair and produce
@@ -1794,7 +1786,7 @@ mod tests {
     }
 
     #[test]
-    fn phase43_v2_reader_rejects_future_version_3() {
+    fn v2_reader_rejects_future_version_3() {
         // Forward-incompat — a hypothetical v3 file must be rejected
         // by today's v2 reader (strict match, not `<= max`).
         let mut binary = sample_binary();
@@ -1807,12 +1799,11 @@ mod tests {
     }
 
     #[test]
-    fn phase43_open_rejects_corrupt_tarball_pair_zero_length_nonzero_offset() {
-        // Second-round GPT audit (2026-04-18): the first
-        // range-overflow check passed `(off != 0, len == 0)`
+    fn open_rejects_corrupt_tarball_pair_zero_length_nonzero_offset() {
+        // The range-overflow check passes `(off != 0, len == 0)`
         // trivially because `off + 0 > string_table_len` is false
         // for any in-bounds `off`. Combined with `tarball()`
-        // treating "not both zero" as Some, this surfaced `Some("")`
+        // treating "not both zero" as Some, this surfaces `Some("")`
         // on a corrupt pair. Explicit rejection closes the gap.
         let mut lf = Lockfile::new();
         lf.add_package(LockedPackage {
@@ -1844,9 +1835,8 @@ mod tests {
     }
 
     #[test]
-    fn phase43_open_rejects_corrupt_tarball_pair() {
-        // Follow-up to the 2026-04-18 GPT audit (finding #2): a
-        // corrupted tarball slot must force a TOML fallback at
+    fn open_rejects_corrupt_tarball_pair() {
+        // A corrupted tarball slot must force a TOML fallback at
         // `read_fast` time, NOT silently surface `Some("")` via the
         // `read_str` bounds-check degradation.
         //
@@ -1886,7 +1876,7 @@ mod tests {
     }
 
     #[test]
-    fn phase43_null_tarball_sentinel_roundtrips() {
+    fn null_tarball_sentinel_roundtrips() {
         // A package with `tarball: None` must round-trip as None,
         // not accidentally as `Some("")`. Exercises the (0, 0) =
         // None path of `tarball()` and confirms the writer didn't
@@ -1915,7 +1905,7 @@ mod tests {
         assert_eq!(entry.integrity(), None);
     }
 
-    // ── Phase 59.1 day-7 (F16): non-registry source binary round-trip ──────
+    // ── Non-registry source binary round-trip ─────────────────────────────
 
     #[test]
     fn directory_source_round_trips_through_binary() {
@@ -1975,9 +1965,9 @@ mod tests {
 
     #[test]
     fn tarball_local_source_round_trips_through_binary() {
-        // `Source::Tarball { url: "file:..." }` — Phase 59.1 F6
-        // local-file tarball. The wire format reuses `tarball+`;
-        // the URL prefix discriminates downstream.
+        // `Source::Tarball { url: "file:..." }` — local-file tarball.
+        // The wire format reuses `tarball+`; the URL prefix
+        // discriminates downstream.
         let mut lf = Lockfile::new();
         lf.add_package(LockedPackage {
             name: "local-bundle".to_string(),
@@ -2001,7 +1991,7 @@ mod tests {
             Some("tarball+file:./vendor/local-bundle.tgz"),
         );
         assert_eq!(entry.integrity(), Some("sha256-deadbeefcafebabe"));
-        // F4a: tarball field-hint is None for non-Registry sources.
+        // tarball field-hint is None for non-Registry sources.
         assert_eq!(entry.tarball(), None);
         let restored = reader.to_lockfile();
         assert_eq!(restored, lf);

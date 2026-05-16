@@ -1,7 +1,7 @@
 //! End-to-end contracts for the triage install path's
 //! advisor / auto-build / blocked-set interaction.
 //!
-//! Phase 69 follow-up: closes the loop on the close-out tranche by
+//! Closes the loop on the triage install lifecycle by
 //! exercising the FULL install pipeline (resolver + linker +
 //! blocked-set capture + auto-build + rebuild) instead of the
 //! unit-level pieces. Pre-fix the auto-build asymmetry, contract
@@ -65,7 +65,7 @@ use support::{TempProject, lpm_with_registry};
 
 const AMBER_DEP_NAME: &str = "synthetic-amber-dep";
 const AMBER_DEP_VERSION: &str = "1.0.0";
-/// Reserved-basename amber per §4.1: bare `node <reserved>` with a
+/// Reserved-basename amber: bare `node <reserved>` with a
 /// basename in the install/postinstall set. Stable across classifier
 /// iterations.
 const AMBER_POSTINSTALL_BODY: &str = "node install.js";
@@ -510,7 +510,7 @@ async fn triage_advisor_approve_without_auto_build_strands_neither_script_nor_re
     let path_var = prepend_to_path(&claude_bin_dir);
     let out = lpm_with_registry(&project, &mock.url())
         // Note: NO `--auto-build`. Triage policy alone does NOT fire
-        // auto-build (Phase 57 expanded Allow only). With the red
+        // auto-build (only Allow-policy packages build automatically). With the red
         // dep present, `all_trusted` resolves to false, so the
         // only remaining trigger is the missing `--auto-build`
         // flag — `auto_build_attempted = false`.

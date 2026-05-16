@@ -9,19 +9,19 @@ description = "Tarball download, verification, decompression, and extraction for
 [dependencies]
 lpm-common = { workspace = true }
 flate2 = { version = "1", features = ["zlib-rs"], default-features = false }
-# Trial 1 (2026-05-13): libdeflate for whole-buffer gzip decompression on the
-# in-memory + buffered streaming paths. ~2-3x faster than flate2/zlib-rs for
-# the npm tarball size distribution (50 KB – 2 MB compressed). flate2 is kept
-# for the test-only `decompress_gzip` helper and the gzip ENCODE side (test
-# fixtures + lpm pack — libdeflate compression bindings exist but we're not
-# touching the publish path in this trial).
+# libdeflate for whole-buffer gzip decompression on the in-memory +
+# buffered streaming paths. ~2-3x faster than flate2/zlib-rs for the
+# npm tarball size distribution (50 KB – 2 MB compressed). flate2 is
+# kept for the test-only `decompress_gzip` helper and the gzip ENCODE
+# side (test fixtures + lpm pack — libdeflate compression bindings exist
+# but are not used on the publish path).
 libdeflater = "1.25"
 tar = "0.4"
 thiserror = { workspace = true }
-# Trial 4 (2026-05-13): emit tracing spans so the extract step shows
-# up in Tracy when the CLI is built with `--features tracy`. Spans
-# compile to single-int level checks under default `RUST_LOG`, so
-# the cost in non-tracy builds is sub-100 ns per call.
+# Emit tracing spans so the extract step shows up in Tracy when the
+# CLI is built with `--features tracy`. Spans compile to single-int
+# level checks under default `RUST_LOG`, so the cost in non-tracy
+# builds is sub-100 ns per call.
 tracing = { workspace = true }
 
 [target.'cfg(unix)'.dependencies]

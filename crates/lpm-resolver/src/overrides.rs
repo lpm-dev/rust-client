@@ -1,6 +1,6 @@
-//! **Phase 32 Phase 5 — `lpm.overrides` IR + parser + apply trace.**
+//! `lpm.overrides` IR + parser + apply trace.
 //!
-//! Phase 5 wires `overrides` into the resolver as a first-class, fail-closed
+//! Wires `overrides` into the resolver as a first-class, fail-closed
 //! mechanism. The end-to-end shape is:
 //!
 //! ```text
@@ -39,8 +39,8 @@
 //! Multi-segment paths (`a>b>c`) are rejected at parse time as a hard error.
 //! The split mechanism today encodes a single immediate-parent context, so
 //! supporting `a>b>c` would require chained-context identity. That work is
-//! tracked separately; for Phase 5 the parser fails closed so users know
-//! the selector did not silently no-op.
+//! tracked separately; the parser fails closed so users know the selector
+//! did not silently no-op.
 //!
 //! ## Target grammar
 //!
@@ -72,7 +72,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub enum OverrideSource {
     /// `package.json :: lpm.overrides` — the LPM-native location and the
-    /// place the Phase 5 docs recommend. On conflict between sources this
+    /// preferred location. On conflict between sources this
     /// one wins because it's the most explicit.
     #[serde(rename = "lpm.overrides")]
     LpmOverrides,
@@ -96,10 +96,9 @@ impl OverrideSource {
         }
     }
 
-    /// Priority for conflict resolution: higher = wins. The Phase 5
-    /// design rule is "lpm.overrides wins over the legacy locations" so
-    /// users can override their `overrides` at the project level without
-    /// editing dependency manifests they don't own.
+    /// Priority for conflict resolution: higher = wins. `lpm.overrides`
+    /// wins over the legacy locations so users can override their `overrides`
+    /// at the project level without editing dependency manifests they don't own.
     fn priority(self) -> u8 {
         match self {
             OverrideSource::LpmOverrides => 3,
@@ -351,8 +350,8 @@ impl OverrideSet {
             (OverrideSource::Resolutions, resolutions),
         ];
 
-        // Step 1 — parse every (source, key, value) tuple. Collect into a
-        // BTreeMap keyed by `(source, raw_key)` for deterministic merge order.
+        // Parse every (source, key, value) tuple. Collect into a BTreeMap
+        // keyed by `(source, raw_key)` for deterministic merge order.
         let mut parsed: BTreeMap<(u8, OverrideSource, String), OverrideEntry> = BTreeMap::new();
 
         for (source, map) in sources {
@@ -373,7 +372,7 @@ impl OverrideSet {
             }
         }
 
-        // Step 2 — collapse cross-source duplicates by selector identity.
+        // Collapse cross-source duplicates by selector identity.
         // The BTreeMap order (descending by source priority) means the first
         // entry seen for a given selector is the highest-priority one.
         let mut by_selector: HashMap<String, OverrideEntry> = HashMap::new();
@@ -383,9 +382,9 @@ impl OverrideSet {
             by_selector.entry(selector_key).or_insert(entry);
         }
 
-        // Step 3 — validate within-source duplicate-with-conflict.
-        // (After Step 2, by_selector is keyed by selector identity, so
-        // any "same key, different target" within a single source has
+        // Validate within-source duplicate-with-conflict. After the collapse
+        // above, by_selector is keyed by selector identity, so any "same key,
+        // different target" within a single source has
         // already been collapsed to one winner. We re-check across all
         // entries for the same `(source, raw_key)` to detect a user error
         // where the same source has the same key written twice with
@@ -394,8 +393,7 @@ impl OverrideSet {
         // before deserialization. We surface it via target equality.)
         // Nothing to do — JSON deserialization can't produce dup keys.
 
-        // Step 4 — finalize: deterministic ordering, split-target set,
-        // canonical fingerprint.
+        // Finalize: deterministic ordering, split-target set, canonical fingerprint.
         let mut entries: Vec<OverrideEntry> = by_selector.into_values().collect();
         entries.sort_by(|a, b| {
             (a.source.priority(), &a.raw_key)
@@ -537,7 +535,7 @@ impl Clone for OverrideSet {
 }
 
 /// Errors emitted during override parsing. Every variant is a hard
-/// error in the install pipeline — Phase 5 has no warnings here.
+/// error in the install pipeline — parsing has no warnings.
 #[derive(Debug, thiserror::Error)]
 pub enum OverrideError {
     #[error("override key is empty")]
@@ -605,7 +603,7 @@ fn parse_one(
 /// We split on the LAST `@` (after the optional scope `@`) to find the
 /// range delimiter.
 fn parse_selector(key: &str) -> Result<OverrideSelector, OverrideError> {
-    // Step 1 — count `>` to detect path selectors and reject multi-segment.
+    // Count `>` to detect path selectors and reject multi-segment.
     let segments: Vec<&str> = key.split('>').collect();
     if segments.len() > 2 {
         return Err(OverrideError::MultiSegmentPath {
@@ -614,7 +612,7 @@ fn parse_selector(key: &str) -> Result<OverrideSelector, OverrideError> {
         });
     }
 
-    // Step 2 — split into (parent, leaf) or just leaf.
+    // Split into (parent, leaf) or just leaf.
     let (parent, leaf) = if segments.len() == 2 {
         let parent = segments[0].trim();
         let leaf = segments[1].trim();
@@ -630,7 +628,7 @@ fn parse_selector(key: &str) -> Result<OverrideSelector, OverrideError> {
         (None, key.trim())
     };
 
-    // Step 3 — split leaf into (name, optional range).
+    // Split leaf into (name, optional range).
     let (name, range) = split_name_at_range(leaf)?;
     validate_package_name(&name, key)?;
 
@@ -1084,7 +1082,6 @@ mod tests {
         assert_eq!(m.target.raw(), "5.0.0");
     }
 
-    /// **Phase 5 acceptance criterion #4: conflicting overrides.**
     /// Two PATH selectors targeting the same package via different
     /// parents must coexist — they're not conflicts because their
     /// match conditions are disjoint.
@@ -1106,7 +1103,6 @@ mod tests {
         assert!(set.find_match("qar", &v("1.0.0"), Some("c")).is_none());
     }
 
-    /// **Phase 5 acceptance criterion #4 / spec example.**
     /// `bar@<1.0.0` and `bar` (name-only) coexist as distinct
     /// selectors. The version-range selector only matches when the
     /// natural version is in the inner range; the name selector

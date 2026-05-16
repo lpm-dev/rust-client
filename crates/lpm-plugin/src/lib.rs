@@ -68,7 +68,7 @@ use std::path::{Path, PathBuf};
 pub async fn ensure_plugin(
     plugin_name: &str,
     pinned_version: Option<&str>,
-    auto_download: bool,
+    quiet: bool,
 ) -> Result<PathBuf, LpmError> {
     let def = registry::get_plugin(plugin_name)
         .ok_or_else(|| LpmError::Plugin(format!("unknown plugin: '{plugin_name}'")))?;
@@ -108,7 +108,7 @@ pub async fn ensure_plugin(
     // helper. Acquires the per-version install lock, re-validates the
     // cache (sibling installer may have populated it while we waited),
     // and only downloads if the second check still misses.
-    install_under_lock(def, &version, &platform, plugin_name, force, auto_download).await
+    install_under_lock(def, &version, &platform, plugin_name, force, quiet).await
 }
 
 /// Acquire the per-version install lock and run the install body. The
@@ -129,7 +129,7 @@ async fn install_under_lock(
     platform: &lpm_runtime::platform::Platform,
     plugin_name: &str,
     force: bool,
-    auto_download: bool,
+    quiet: bool,
 ) -> Result<PathBuf, LpmError> {
     let platform_str = platform.to_string();
     let bin_path = store::plugin_binary_path(def.name, version, &platform_str, def.binary_name)?;
@@ -145,7 +145,7 @@ async fn install_under_lock(
         &sidecar_path,
         plugin_name,
         force,
-        auto_download,
+        quiet,
     );
     lpm_common::with_exclusive_lock_async(lock_path, body).await
 }
@@ -164,7 +164,7 @@ async fn run_install_locked_body(
     sidecar_path: &Path,
     plugin_name: &str,
     force: bool,
-    auto_download: bool,
+    quiet: bool,
 ) -> Result<PathBuf, LpmError> {
     // Double-checked locking: another process may have completed the
     // install while we were waiting on the lock. Return the now-valid
@@ -191,11 +191,18 @@ async fn run_install_locked_body(
         let _ = std::fs::remove_file(sidecar_path);
     }
 
-    let env_auto = std::env::var("LPM_AUTO_DOWNLOAD")
+    // `quiet` (or the `LPM_PLUGIN_QUIET=1` env var) suppresses ONLY the
+    // user-facing "Plugin not installed. Downloading…" stderr banner —
+    // it does NOT gate the download itself. Plugins always download on
+    // cache miss; this knob exists so callers that own their own
+    // progress messaging (e.g. `lpm plugin update`, JSON-output flows)
+    // can avoid double-printing. CI / scripted callers that want a
+    // clean stderr capture also set the env var.
+    let env_quiet = std::env::var("LPM_PLUGIN_QUIET")
         .map(|v| v == "true" || v == "1")
         .unwrap_or(false);
 
-    if !auto_download && !env_auto {
+    if !quiet && !env_quiet {
         eprintln!(
             "  Plugin '{}' not installed. Downloading {} v{} ({})...",
             plugin_name, def.binary_name, version, platform_str,
@@ -274,7 +281,7 @@ async fn run_update_under_lock(def: &registry::PluginDef) -> Result<String, LpmE
     // would re-download wastefully (or, on Windows, fail outright on
     // the rename when the parallel installer has the binary open).
     //
-    // `auto_download = true` so the locked body's "Downloading..."
+    // `quiet = true` so the locked body's "Downloading..."
     // banner doesn't fire — `lpm plugin update` is an explicit
     // user-initiated install and the command's own surface owns the
     // user-facing progress text.

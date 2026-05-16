@@ -1,7 +1,7 @@
 use crate::output;
 use crate::prompt::prompt_err;
 use lpm_common::LpmError;
-use owo_colors::OwoColorize;
+use lpm_common::color::Painted;
 use std::io::IsTerminal;
 
 /// CLI configuration management.
@@ -121,7 +121,9 @@ pub async fn run(
         }
         _ => {
             return Err(LpmError::Registry(format!(
-                "unknown config action: {action}. Use: get, set, delete, list"
+                "unknown config action: {action}. \
+                 Use: get, set, delete (alias: unset), list (alias: ls), \
+                 scripts, triage, sandbox"
             )));
         }
     }
@@ -203,7 +205,7 @@ impl GlobalConfig {
     /// Get a top-level table value, returning a reference to the
     /// underlying `toml::Table` for nested-key walks.
     ///
-    /// Used by the Phase 48 `UserBound` reader to navigate into
+    /// Used by the `UserBound` reader to navigate into
     /// `[sandbox.limits]` without adding a bespoke per-section
     /// accessor to this struct. Callers chain through the returned
     /// table's own `get(...)` / `as_*` methods.
@@ -223,7 +225,7 @@ impl GlobalConfig {
     ///   wants multiple values must write a native TOML array.
     /// - Any other shape (integer, bool, single string, etc.) returns
     ///   `None` — callers treat that as "key absent" per the
-    ///   Phase 48 P0 slice 5 `max-sandbox-write-roots` contract where
+    ///   `max-sandbox-write-roots` contract where
     ///   empty/unset means "no constraint".
     ///
     /// Used by the `max-sandbox-write-roots` reader on the sandbox
@@ -278,7 +280,7 @@ impl GlobalConfig {
 }
 
 // ─────────────────────────────────────────────────────────────────────
-// `lpm config scripts`  /  `lpm config triage`  wizards (Phase 46 B3)
+// `lpm config scripts`  /  `lpm config triage`  wizards
 // ─────────────────────────────────────────────────────────────────────
 //
 // Two narrow product surfaces, deliberately split:
@@ -532,8 +534,8 @@ fn announce_set(key: &str, value: &str, json_output: bool) {
 }
 
 /// Disclosure printed after `script-policy = triage` is persisted (via
-/// either `--set` or interactive). After Phase 46 slice 1 the wizard
-/// now describes the actual install-time degrade-and-warn contract:
+/// either `--set` or interactive). The wizard describes the
+/// actual install-time degrade-and-warn contract:
 /// triage uses Layers 1-3 always, an optional advisor uplift kicks
 /// in if configured + available, and a configured-but-unavailable
 /// advisor degrades cleanly with a one-line warning per install run.
@@ -553,7 +555,7 @@ fn print_triage_policy_followup(json_output: bool) {
 }
 
 // ─────────────────────────────────────────────────────────────────────
-// `lpm config sandbox`  wizard  (Phase 46.1 rework, 2026-05-11)
+// `lpm config sandbox`  wizard  (rework)
 // ─────────────────────────────────────────────────────────────────────
 //
 // Persists `[sandbox] mode = "default" | "strict" | "none"` into
@@ -621,7 +623,7 @@ async fn run_sandbox_wizard(
         .interact()
         .map_err(prompt_err)?;
 
-    // Phase 46.1 DX redline: confirm when the user picks `none` in
+    // DX redline: confirm when the user picks `none` in
     // the interactive wizard. The `--set none` form trusts the
     // operator (no TTY check); only the wizard prompts.
     if new_value == "none" {
@@ -700,8 +702,8 @@ fn announce_sandbox_set(value: &str, json_output: bool) {
 }
 
 /// Disclosure printed after `triage-advisor = <value>` is persisted
-/// (via either `--set` or interactive). After slice 1 this describes
-/// the actual install-time contract:
+/// (via either `--set` or interactive). This describes the
+/// actual install-time contract:
 ///   - `lpm install` preflights the advisor once per run.
 ///   - If detect or test-invoke fails, the run degrades to
 ///     `triage-advisor = "none"` semantics and prints one warning;
@@ -810,7 +812,7 @@ mod wizard_tests {
         );
     }
 
-    // ── sandbox wizard (Phase 46.1 rework) ─────────────────────────
+    // ── sandbox wizard (rework) ─────────────────────────
 
     #[tokio::test]
     async fn sandbox_wizard_set_persists_each_valid_mode() {

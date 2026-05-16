@@ -551,7 +551,7 @@ async fn tarball_with_setuid_executable_extracts_with_setuid_bit_stripped() {
     );
 }
 
-// ─── Phase 2 tests (added 2026-05-14) ───────────────────────────────
+// ──────────────────────────────────────────────────────────────────────
 
 /// **Plan #4 — Unicode-bearing entry path is taken as literal bytes, not normalized.**
 ///

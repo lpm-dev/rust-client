@@ -129,23 +129,20 @@ pub struct AmberScript<'a> {
     pub package_version: &'a str,
     pub phase: &'a str,
     pub script_body: &'a str,
-    /// Phase 46b Lever #1 — `repository` field from the package
-    /// manifest (typically `package.json > repository.url` or the
-    /// legacy shorthand string form). When present, the prompt emits
-    /// a `Repository:` line and the closing guidance pairs the
-    /// repository identity with the "fetch IDENTITY" axis. When
-    /// `None`, the prompt omits the line entirely (empirical
-    /// measurement on the curated corpus showed `<none>`
-    /// pushed verdicts toward MANUAL; absent-by-default is the
-    /// safer default for measurement and for real packages that
-    /// happen not to declare the field).
+    /// `repository` field from the package manifest (typically
+    /// `package.json > repository.url` or the legacy shorthand string
+    /// form). When present, the prompt emits a `Repository:` line and
+    /// the closing guidance pairs the repository identity with the
+    /// "fetch IDENTITY" axis. When `None`, the prompt omits the line
+    /// entirely (empirical measurement on the curated corpus showed
+    /// `<none>` pushed verdicts toward MANUAL; absent-by-default is
+    /// safer for packages that happen not to declare the field).
     pub repository: Option<&'a str>,
-    /// Phase 46b Lever #3 — contents of files the script body
-    /// delegates to (e.g. `install.js` when the body is `node
-    /// install.js`). The L4 advisor uses these to apply the
-    /// "fetch IDENTITY" rule one level deep — the script body
-    /// alone may not reveal what's fetched, but the file it
-    /// delegates to does.
+    /// Contents of files the script body delegates to (e.g.
+    /// `install.js` when the body is `node install.js`). The L4
+    /// advisor uses these to apply the "fetch IDENTITY" rule one
+    /// level deep — the script body alone may not reveal what's
+    /// fetched, but the file it delegates to does.
     ///
     /// Each referenced script is emitted in its own nonced fence
     /// (per-file random nonce) so an attacker who edits one file's
@@ -164,9 +161,8 @@ pub struct AmberScript<'a> {
     pub referenced_scripts: &'a [ReferencedScript<'a>],
 }
 
-/// Phase 46b Lever #3 — one file the script body delegates to,
-/// embedded in the advisor prompt for "fetch IDENTITY" evaluation
-/// one level deep.
+/// One file the script body delegates to, embedded in the advisor
+/// prompt for "fetch IDENTITY" evaluation one level deep.
 #[derive(Debug, Clone)]
 pub struct ReferencedScript<'a> {
     /// Relative path inside the package root, as it appeared in the

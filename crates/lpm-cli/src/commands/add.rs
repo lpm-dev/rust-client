@@ -1,7 +1,7 @@
 use crate::output;
+use lpm_common::color::Painted;
 use lpm_common::{LpmError, PackageName};
 use lpm_registry::{RegistryClient, RouteTable};
-use owo_colors::OwoColorize;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
@@ -15,7 +15,7 @@ enum ConflictAction {
 
 /// What `lpm add` resolved the user's input to.
 ///
-/// Phase 60 (D-decoupling): `lpm add` is no longer LPM-only. The
+/// (D-decoupling): `lpm add` is no longer LPM-only. The
 /// `Lpm` variant flows through the lpm.dev metadata API and `PackageName`'s
 /// strict `owner.name` validation. The `Npm` variant flows through the
 /// npm metadata API (or `.npmrc`-declared registry per `RouteTable`)
@@ -72,8 +72,8 @@ type ResolvedAddInput = (AddTarget, Option<String>, HashMap<String, String>);
 /// Resolve a user-supplied `lpm add <spec>` argument to an `AddTarget`,
 /// stripping any `@version` suffix and `?key=val` query params.
 ///
-/// Phase 60 (D-naming-rule): bare/dotted/non-`@lpm.dev/` inputs flow to
-/// `AddTarget::Npm` verbatim. The pre-Phase-60 dotted-name auto-prepend
+/// (D-naming-rule): bare/dotted/non-`@lpm.dev/` inputs flow to
+/// `AddTarget::Npm` verbatim. The pre-existing dotted-name auto-prepend
 /// at `parse_package_ref` (`tolga.foo` → `@lpm.dev/tolga.foo`) is gone:
 /// it silently rewrote real npm packages like `lodash.merge`,
 /// `lodash.debounce`, `lodash.throttle` into the `@lpm.dev/` namespace
@@ -158,7 +158,7 @@ pub async fn run(
 ) -> Result<(), LpmError> {
     let is_tty = std::io::IsTerminal::is_terminal(&std::io::stdin());
 
-    // Step 1: Resolve package reference into AddTarget (Phase 60 D-decoupling).
+    // Step 1: Resolve package reference into AddTarget.
     // `@lpm.dev/owner.name` → AddTarget::Lpm(PackageName); everything else
     // → AddTarget::Npm { spec } verbatim. No dotted-name auto-prepend.
     let (target, version_spec, mut inline_config) = resolve_add_target(package_spec)?;
@@ -179,7 +179,7 @@ pub async fn run(
         output::info(&format!("Adding {}", target.display().bold()));
     }
 
-    // Step 2: `.npmrc` setup (Phase 60.0.c — mirrors install.rs:3295-3445).
+    // Step 2: `.npmrc` setup (— mirrors install.rs:3295-3445).
     //
     // Build the RouteTable BEFORE any network call so:
     // - fatal `${MISSING_VAR}` errors abort early (npm parity);
@@ -206,7 +206,7 @@ pub async fn run(
             tagged.source, tagged.line
         ));
     }
-    // Phase 58.3 — request-aware eager-build: `lpm add <spec>`'s
+    // — request-aware eager-build: `lpm add <spec>`'s
     // top-level request is exactly `{spec}`. The fetch site below
     // (`get_npm_metadata_routed(spec, …)`) and version resolution
     // (`resolve_version_spec(version_spec)`) both operate on the
@@ -227,13 +227,13 @@ pub async fn run(
         .clone_with_config()
         .with_tls_overrides_for(route_table.tls_overrides(), &eager_origins)?;
     let client = &owned_client;
-    // Phase 58.3 — install-start summary of effective TLS overrides
+    // — install-start summary of effective TLS overrides
     // (mirrors install.rs:3859 wiring).
     if !json_output && let Some(line) = client.render_effective_tls_summary() {
         output::info(&line);
     }
 
-    // Step 3: Routed metadata fetch (Phase 60.0.d).
+    // Step 3: Routed metadata fetch.
     // - AddTarget::Lpm → lpm.dev metadata API (LpmWorker route, forced
     //   by `@lpm.dev/` prefix in `RouteTable::route_for_package`).
     // - AddTarget::Npm → routed npm metadata via .npmrc / NpmDirect /
@@ -246,8 +246,8 @@ pub async fn run(
         }
     };
 
-    // Phase 60.0.e — version-spec resolution covers dist-tags + semver
-    // ranges (e.g., `react@beta`, `lodash@^4`). Pre-Phase-60 code did a
+    // — version-spec resolution covers dist-tags + semver
+    // ranges (e.g., `react@beta`, `lodash@^4`). Pre-code did a
     // pure HashMap lookup which fails for any non-literal spec.
     let version = if let Some(v) = &version_spec {
         metadata.resolve_version_spec(v)?
@@ -270,7 +270,7 @@ pub async fn run(
         ));
     }
 
-    // Step 3.1: File-spool tarball download (Phase 60.0.d, D1 + D2).
+    // Step 3.1: File-spool tarball download (D1 + D2).
     // Uses `download_tarball_routed` so:
     //   - LpmWorker / NpmDirect → no-auth file-spool;
     //   - Custom (`.npmrc`-declared private registry) → auth-attached
@@ -319,13 +319,13 @@ pub async fn run(
 
     // Step 3.4: Validate extracted paths for path traversal (extraction-
     // side check; the user-side write-time containment check happens
-    // below in Step 8 via `resolve_safe_dest` — see Phase 60.0.f).
+    // below in Step 8 via `resolve_safe_dest` — see f).
     validate_extracted_paths(&extracted_paths, temp_dir.path())?;
 
     // Step 4: Read lpm.config.json
     let lpm_config = read_lpm_config(temp_dir.path());
 
-    // Step 4.05: Non-interactive simple-path guard (Phase 60.1.5).
+    // Step 4.05: Non-interactive simple-path guard.
     //
     // The simple path (no `lpm.config.json`) is a download-manager flow:
     // copy source files into a user-chosen directory, no auto-deps. In
@@ -542,7 +542,7 @@ pub async fn run(
     }
 
     // Step 6.2: Preflight — refuse to copy a deps-declaring source
-    // package into a project with no `package.json` (Phase 64 #9.4).
+    // package into a project with no `package.json` (#9.4).
     //
     // Without a manifest, the dep entries the source declares have
     // nowhere to land; the user would end up with copied source
@@ -628,7 +628,7 @@ pub async fn run(
     let src_files: HashSet<String> = files.iter().map(|(s, _)| s.clone()).collect();
     let dest_files: HashSet<String> = files.iter().map(|(_, d)| d.clone()).collect();
 
-    // Step 7.5: Set up the rollback transaction (Phase 64 finding #9.3).
+    // Step 7.5: Set up the rollback transaction (finding #9.3).
     //
     // Open ONE `ManifestTransaction` covering Step 8's source-file
     // copies AND Step 9's dependency mutations + trailing install. The
@@ -638,7 +638,7 @@ pub async fn run(
     // owns its own tx; output: read-only; skills: best-effort,
     // non-fatal by contract).
     //
-    // Path discipline (Phase 64 #9.3 second-pass audit). Validation
+    // Path discipline (#9.3 second-pass audit). Validation
     // happens via [`resolve_safe_dest_validate`] (pure, no mkdir);
     // the mkdir + post-mkdir canonicalize step
     // ([`prepare_safe_dest_parent`]) runs immediately after,
@@ -734,11 +734,11 @@ pub async fn run(
     // plus invalidates `.lpm/install-hash` so the next install
     // re-derives state from a clean manifest.
     //
-    // Phase 60.0.f (D6) — destination-side path containment.
-    // Pre-Phase-60, the only path-traversal check ran at extraction
+    // (D6) — destination-side path containment.
+    // Previously, the only path-traversal check ran at extraction
     // against the temp dir; the user-side write at `target_dir.join(dest_rel)`
     // had no second containment check. For arbitrary npm tarballs (the
-    // whole point of Phase 60), that's the wrong threat model: a
+    // whole point), that's the wrong threat model: a
     // malicious or buggy `dest_rel` could escape `target_dir` after
     // following an existing user-side symlink. The validate +
     // prepare phases above canonicalize the parent of every write,
@@ -808,9 +808,9 @@ pub async fn run(
         ));
     }
 
-    // Step 9: Handle dependencies (Phase 60.1).
+    // Step 9: Handle dependencies.
     //
-    // Gate: only when `lpm.config.json` is present. Pre-Phase-60 the
+    // Gate: only when `lpm.config.json` is present. Pre-the
     // legacy fallback at `handle_dependencies` would read the package's
     // own `package.json#dependencies + peerDependencies` whenever
     // `lpm.config.json#dependencies` was absent — fine for source-shape
@@ -839,7 +839,7 @@ pub async fn run(
         // below surfaces what the user should add themselves.
         0
     } else {
-        let count = count_dependencies(&lpm_config, &inline_config, temp_dir.path());
+        let count = count_dependencies(&lpm_config, &inline_config, temp_dir.path())?;
         if count > 0 && !json_output {
             output::info(&format!(
                 "Skipped {} dependencies (--no-install-deps)",
@@ -849,7 +849,7 @@ pub async fn run(
         0
     };
 
-    // Step 9.1: Bare-imports notice — Phase 60.1 D4.
+    // Step 9.1: Bare-imports notice — D4.
     //
     // Simple path (no `lpm.config.json`) only: walk every JS/TS file we
     // just copied, collect external/bare specifiers, and surface them
@@ -885,7 +885,7 @@ pub async fn run(
         ));
     }
 
-    // Step 9.2: Commit the rollback transaction (Phase 64 finding #9.3).
+    // Step 9.2: Commit the rollback transaction (finding #9.3).
     //
     // Steps 8 + 9 + 9.1 (file copy, dep mutation, trailing install,
     // bare-imports read-only notice) all completed without error, so
@@ -983,7 +983,7 @@ pub async fn run(
     // attested. Arbitrary npm packages are not scanned, so we don't
     // extract their skills — opt-in npm-skills support would need an
     // explicit `--allow-skills` flag and an `lpm.config.json#skills`
-    // declaration (deferred per the Phase 60 non-goals).
+    // declaration (deferred per the non-goals).
     if !no_skills && let AddTarget::Lpm(pkg) = &target {
         let short_name = pkg.short();
         match client.get_skills(&short_name, None).await {
@@ -1061,7 +1061,7 @@ fn validate_extracted_paths(files: &[PathBuf], target_dir: &Path) -> Result<(), 
 /// Production callers (`run`'s Step 8) hold the two phases apart so a
 /// `ManifestTransaction` snapshot opens between validation and the
 /// mkdir-during-copy step. See `resolve_safe_dest_validate` for the
-/// threat model and Phase 60.0.f / D6 background.
+/// threat model and / D6 background.
 #[cfg(test)]
 fn resolve_safe_dest(
     target_root_canonical: &Path,
@@ -1082,7 +1082,7 @@ fn resolve_safe_dest(
 /// Validate a write destination under a canonical target root, without
 /// any filesystem side effects.
 ///
-/// Phase 60.0.f (D6) — destination-side containment for `lpm add`.
+/// (D6) — destination-side containment for `lpm add`.
 /// `validate_extracted_paths` above proves the tarball didn't escape
 /// extraction; this function proves the user-side write doesn't escape
 /// `target_dir` either, including via existing symlinks.
@@ -1469,7 +1469,7 @@ fn handle_dry_run(
     }
 
     // Count dependencies that would be installed
-    let dep_count = count_dependencies(lpm_config, inline_config, extract_dir);
+    let dep_count = count_dependencies(lpm_config, inline_config, extract_dir)?;
 
     if json_output {
         let files_json: Vec<serde_json::Value> = file_actions
@@ -1597,7 +1597,7 @@ fn collect_source_pkg_deps(
     lpm_config: &Option<serde_json::Value>,
     inline_config: &HashMap<String, String>,
     extract_dir: &Path,
-) -> Vec<(String, crate::save_spec::UserSaveIntent)> {
+) -> Result<Vec<(String, crate::save_spec::UserSaveIntent)>, LpmError> {
     // Authoring contract: declaring `dependencies` in `lpm.config.json` —
     // even with conditional branches that produce zero matches for a
     // given consumer config — opts out of the legacy `package.json`
@@ -1614,14 +1614,17 @@ fn collect_source_pkg_deps(
     // Each entry is parsed once into `(name, intent)`. Dedup is by parsed
     // `name`, not the raw entry string — so `["react", "react@^18"]` in
     // the same conditional collapses to a single entry (first-wins, per
-    // Phase 33's "explicit user input wins" rule, which here means the
+    // the "explicit user input wins" rule, which here means the
     // first declaration the author wrote).
     let mut deps: Vec<(String, crate::save_spec::UserSaveIntent)> = Vec::new();
-    let push_if_new = |deps: &mut Vec<(String, crate::save_spec::UserSaveIntent)>, raw: &str| {
-        let (name, intent) = crate::save_spec::parse_user_save_intent(raw);
+    let push_if_new = |deps: &mut Vec<(String, crate::save_spec::UserSaveIntent)>,
+                       raw: &str|
+     -> Result<(), LpmError> {
+        let (name, intent) = crate::save_spec::parse_user_save_intent(raw)?;
         if !deps.iter().any(|(existing, _)| existing == &name) {
             deps.push((name, intent));
         }
+        Ok(())
     };
 
     // 1. Conditional deps from `lpm.config.json#dependencies`.
@@ -1647,7 +1650,7 @@ fn collect_source_pkg_deps(
                 if let Some(arr) = dep_map.get(*value).and_then(|d| d.as_array()) {
                     for dep in arr {
                         if let Some(raw) = dep.as_str() {
-                            push_if_new(&mut deps, raw);
+                            push_if_new(&mut deps, raw)?;
                         }
                     }
                 }
@@ -1677,14 +1680,14 @@ fn collect_source_pkg_deps(
                             Some(v) if !v.is_empty() => format!("{name}@{v}"),
                             _ => name.clone(),
                         };
-                        push_if_new(&mut deps, &raw);
+                        push_if_new(&mut deps, &raw)?;
                     }
                 }
             }
         }
     }
 
-    deps
+    Ok(deps)
 }
 
 /// Count how many dependencies would be installed without actually installing them.
@@ -1695,11 +1698,11 @@ fn count_dependencies(
     lpm_config: &Option<serde_json::Value>,
     inline_config: &HashMap<String, String>,
     extract_dir: &Path,
-) -> usize {
-    collect_source_pkg_deps(lpm_config, inline_config, extract_dir).len()
+) -> Result<usize, LpmError> {
+    Ok(collect_source_pkg_deps(lpm_config, inline_config, extract_dir)?.len())
 }
 
-/// Phase 64 #9.4 preflight: refuse to copy a deps-declaring source
+/// #9.4 preflight: refuse to copy a deps-declaring source
 /// package into a project with no `package.json`.
 ///
 /// Without a manifest, the dep entries the source declares have
@@ -1735,7 +1738,7 @@ fn preflight_no_manifest_with_deps(
     if project_dir.join("package.json").exists() {
         return Ok(());
     }
-    if collect_source_pkg_deps(lpm_config, inline_config, extract_dir).is_empty() {
+    if collect_source_pkg_deps(lpm_config, inline_config, extract_dir)?.is_empty() {
         return Ok(());
     }
 
@@ -2295,7 +2298,7 @@ fn build_save_decisions(
 ///   `.npmrc`-declared private registries, the LPM Worker, and the
 ///   public npm registry all work for bare/dist-tag entries. Mirrors
 ///   the resolver walker's three-arm dispatch
-///   ([`lpm_resolver::walker`] Phase 58 day-4).
+///   ([`lpm_resolver::walker`] day-4).
 /// - Resolution **fails the whole call** before mutating
 ///   `package.json`. Without this fail-fast posture, a stuck resolve
 ///   would leave the manifest with stranded entries that the trailing
@@ -2324,7 +2327,7 @@ async fn handle_dependencies(
     json_output: bool,
     effective_pm: &str,
 ) -> Result<usize, LpmError> {
-    let entries = collect_source_pkg_deps(lpm_config, inline_config, extract_dir);
+    let entries = collect_source_pkg_deps(lpm_config, inline_config, extract_dir)?;
 
     if entries.is_empty() {
         return Ok(0);
@@ -2433,7 +2436,7 @@ async fn handle_dependencies(
 
         if let Some(deps) = deps {
             for (name, spec) in &decisions {
-                // Phase 33 "do not rewrite existing entries on bare
+                // "do not rewrite existing entries on bare
                 // reinstall" semantics: if the consumer already pinned
                 // a range for this dep, we keep theirs.
                 deps.entry(name.clone())
@@ -2456,7 +2459,7 @@ async fn handle_dependencies(
     // filling in.
     match effective_pm {
         "lpm" => {
-            // Phase 35 Step 6 fix: use the injected client. Pre-fix
+            // Step 6 fix: use the injected client. Pre-fix
             // this site built a fresh `RegistryClient::new()` with
             // no token attached, so any post-add `lpm install` for
             // an `@lpm.dev` package would have hit anonymous /
@@ -2469,19 +2472,19 @@ async fn handle_dependencies(
                 false,                                                 // offline
                 false,                                                 // force
                 false,                                                 // allow_new
-                false, // strict_integrity (Phase 59.0 F5)
+                false, // strict_integrity
                 None,  // linker_override
                 false, // no_skills
                 false, // no_editor_setup
                 true,  // no_security_summary
                 false, // auto_build
                 None,  // target_set: shadcn-style add never targets multiple workspace members
-                None, // direct_versions_out: shadcn-style add does not finalize Phase 33 placeholders
+                None, // direct_versions_out: shadcn-style add does not finalize placeholders
                 None, // script_policy_override: `lpm add` does not expose policy flags
                 None, // advisor_override: `lpm add` does not expose `--advisor`
                 None, // min_release_age_override: shadcn-style add uses the chain
                 crate::provenance_fetch::DriftIgnorePolicy::default(), // drift-ignore: `lpm add` does not expose drift-override flags
-                // Phase 46.1 rework: `lpm add` does not surface its
+                // `lpm add` does not surface its
                 // own sandbox-mode flags. The env / config / default
                 // chain inside `rebuild::run` still applies.
                 false, // strict_sandbox
@@ -2808,7 +2811,7 @@ mod tests {
         );
     }
 
-    // ── resolve_add_target — Phase 60.0.a + 60.0.b ──────────────────
+    // ── resolve_add_target — + 60.0.b ──────────────────
 
     #[test]
     fn resolve_add_target_lpm_full_scoped() {
@@ -2876,9 +2879,9 @@ mod tests {
         assert_eq!(version.as_deref(), Some("beta"));
     }
 
-    /// Phase 60.0.b regression — dotted bare names like `lodash.merge`,
+    /// regression — dotted bare names like `lodash.merge`,
     /// `lodash.debounce`, `lodash.throttle` are real npm packages and
-    /// MUST resolve to `AddTarget::Npm` verbatim. Pre-Phase-60 they
+    /// MUST resolve to `AddTarget::Npm` verbatim. Pre-they
     /// were silently rewritten to `@lpm.dev/lodash.merge` (which doesn't
     /// exist on lpm.dev) — see CLAUDE.md "Naming model (firm rule)".
     #[test]
@@ -2935,7 +2938,7 @@ mod tests {
         assert_eq!(target.display(), "lodash.merge");
     }
 
-    // ── resolve_safe_dest — Phase 60.0.f / D6 ───────────────────────
+    // ── resolve_safe_dest — / D6 ───────────────────────
 
     #[test]
     fn resolve_safe_dest_normal_path_succeeds() {
@@ -2949,7 +2952,7 @@ mod tests {
 
     #[test]
     fn resolve_safe_dest_dotdot_in_path_rejected_with_no_external_dir_created() {
-        // Phase 60 audit regression — the pre-fix implementation rejected
+        // audit regression — the pre-fix implementation rejected
         // the path with a containment error BUT left a stray
         // `target_dir/../escaped/` directory created on disk because
         // `create_dir_all(parent)` ran before the containment check.
@@ -2991,7 +2994,7 @@ mod tests {
 
     #[test]
     fn resolve_safe_dest_absolute_dest_rejected_with_no_external_dir_created() {
-        // Phase 60 audit regression — `target_dir.join(absolute)` returns
+        // audit regression — `target_dir.join(absolute)` returns
         // the absolute path verbatim (`Path::join` semantics), so an
         // absolute `dest_rel` would route the write to whatever path the
         // tarball asked for. Pre-fix, `create_dir_all` ran before the
@@ -3109,7 +3112,7 @@ mod tests {
         }
     }
 
-    // ── resolve_safe_dest_validate — pure validation (Phase 64 #9.3) ──
+    // ── resolve_safe_dest_validate — pure validation (#9.3) ──
     //
     // The validate phase is the half of `resolve_safe_dest` that has
     // NO directory side effects. `lpm add`'s rollback flow opens a
@@ -3182,7 +3185,7 @@ mod tests {
 
     #[test]
     fn step_8_write_path_pins_canonical_parent_through_intermediate_symlink() {
-        // Phase 64 #9.3 second-pass-audit regression: production
+        // #9.3 second-pass-audit regression: production
         // Step 8 used to call `prepare_safe_dest_parent` and discard
         // its return value, then write to the pre-canonicalize
         // `dest_path`. That re-opened the post-mkdir TOCTOU window
@@ -3453,7 +3456,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------
-    // Source-package dependency collection (Phase 64 finding #9)
+    // Source-package dependency collection (finding #9)
     //
     // Source packages can declare deps from any registry — npm, private,
     // or `@lpm.dev/*`. The collector must NOT pre-filter by name; auth
@@ -3499,7 +3502,7 @@ mod tests {
             });
             let inline = HashMap::from([("icons".to_string(), "lucide".to_string())]);
 
-            let deps = collect_source_pkg_deps(&Some(lpm_config), &inline, extract.path());
+            let deps = collect_source_pkg_deps(&Some(lpm_config), &inline, extract.path()).unwrap();
             let names = names(&deps);
 
             assert!(
@@ -3532,7 +3535,7 @@ mod tests {
         fn config_json_preserves_author_provided_version_ranges() {
             // Authors who pin a specific range get it preserved verbatim
             // through to package.json — no resolve, no caret default.
-            // Mirrors `lpm install zod@^4.3.0` semantics from Phase 33.
+            // Mirrors `lpm install zod@^4.3.0` semantics from.
             let extract = tempfile::tempdir().unwrap();
             let lpm_config = serde_json::json!({
                 "dependencies": {
@@ -3548,7 +3551,7 @@ mod tests {
             });
             let inline = HashMap::from([("icons".to_string(), "lucide".to_string())]);
 
-            let deps = collect_source_pkg_deps(&Some(lpm_config), &inline, extract.path());
+            let deps = collect_source_pkg_deps(&Some(lpm_config), &inline, extract.path()).unwrap();
             assert_eq!(deps.len(), 4, "{deps:?}");
 
             let by_name: HashMap<String, UserSaveIntent> = deps.into_iter().collect();
@@ -3584,7 +3587,7 @@ mod tests {
             });
             let inline = HashMap::from([("ui".to_string(), "minimal".to_string())]);
 
-            let deps = collect_source_pkg_deps(&Some(lpm_config), &inline, extract.path());
+            let deps = collect_source_pkg_deps(&Some(lpm_config), &inline, extract.path()).unwrap();
 
             assert_eq!(deps.len(), 1, "duplicates collapse: {deps:?}");
             assert_eq!(
@@ -3622,7 +3625,7 @@ mod tests {
                 }),
             );
 
-            let deps = collect_source_pkg_deps(&None, &HashMap::new(), extract.path());
+            let deps = collect_source_pkg_deps(&None, &HashMap::new(), extract.path()).unwrap();
             let by_name: HashMap<String, UserSaveIntent> = deps.iter().cloned().collect();
 
             assert_eq!(
@@ -3664,7 +3667,7 @@ mod tests {
             });
             let inline = HashMap::from([("icons".to_string(), "lucide".to_string())]);
 
-            let deps = collect_source_pkg_deps(&Some(lpm_config), &inline, extract.path());
+            let deps = collect_source_pkg_deps(&Some(lpm_config), &inline, extract.path()).unwrap();
 
             assert_eq!(names(&deps), vec!["lucide-react".to_string()]);
             assert!(
@@ -3705,7 +3708,7 @@ mod tests {
             // Consumer picks a value that doesn't match any inner key.
             let inline = HashMap::from([("icons".to_string(), "phosphor".to_string())]);
 
-            let deps = collect_source_pkg_deps(&Some(lpm_config), &inline, extract.path());
+            let deps = collect_source_pkg_deps(&Some(lpm_config), &inline, extract.path()).unwrap();
 
             assert!(
                 deps.is_empty(),
@@ -3730,7 +3733,7 @@ mod tests {
             );
 
             // Shape A: no lpm.config.json at all.
-            let deps_a = collect_source_pkg_deps(&None, &HashMap::new(), extract.path());
+            let deps_a = collect_source_pkg_deps(&None, &HashMap::new(), extract.path()).unwrap();
             assert_eq!(names(&deps_a), vec!["react".to_string()]);
             assert_eq!(deps_a[0].1, UserSaveIntent::Range("^18".to_string()));
 
@@ -3740,7 +3743,8 @@ mod tests {
                 "files": [{ "src": "src/**" }]
             });
             let deps_b =
-                collect_source_pkg_deps(&Some(lpm_config_no_deps), &HashMap::new(), extract.path());
+                collect_source_pkg_deps(&Some(lpm_config_no_deps), &HashMap::new(), extract.path())
+                    .unwrap();
             assert_eq!(names(&deps_b), vec!["react".to_string()]);
             assert_eq!(deps_b[0].1, UserSaveIntent::Range("^18".to_string()));
         }
@@ -3762,9 +3766,11 @@ mod tests {
                 }
             });
             let inline_a = HashMap::from([("icons".to_string(), "lucide".to_string())]);
-            let count_a = count_dependencies(&Some(lpm_config.clone()), &inline_a, extract.path());
-            let collect_a =
-                collect_source_pkg_deps(&Some(lpm_config), &inline_a, extract.path()).len();
+            let count_a =
+                count_dependencies(&Some(lpm_config.clone()), &inline_a, extract.path()).unwrap();
+            let collect_a = collect_source_pkg_deps(&Some(lpm_config), &inline_a, extract.path())
+                .unwrap()
+                .len();
             assert_eq!(count_a, collect_a, "count must agree with collect");
             assert_eq!(count_a, 2, "both @lpm.dev/* and npm names counted");
 
@@ -3776,8 +3782,10 @@ mod tests {
                     "dependencies": { "react": "*", "@lpm.dev/owner.runtime": "*" }
                 }),
             );
-            let count_b = count_dependencies(&None, &HashMap::new(), extract.path());
-            let collect_b = collect_source_pkg_deps(&None, &HashMap::new(), extract.path()).len();
+            let count_b = count_dependencies(&None, &HashMap::new(), extract.path()).unwrap();
+            let collect_b = collect_source_pkg_deps(&None, &HashMap::new(), extract.path())
+                .unwrap()
+                .len();
             assert_eq!(count_b, collect_b);
             assert_eq!(count_b, 2);
         }
@@ -3798,7 +3806,7 @@ mod tests {
             });
             let inline = HashMap::from([("icons".to_string(), "lucide,heroicons".to_string())]);
 
-            let deps = collect_source_pkg_deps(&Some(lpm_config), &inline, extract.path());
+            let deps = collect_source_pkg_deps(&Some(lpm_config), &inline, extract.path()).unwrap();
             let names = names(&deps);
 
             assert!(names.contains(&"lucide-react".to_string()));
@@ -3819,7 +3827,7 @@ mod tests {
 
         #[test]
         fn build_save_decisions_bare_name_gets_caret_resolved() {
-            // The Phase 33 default: a bare name resolves to the latest
+            // The default: a bare name resolves to the latest
             // version and writes back as `^x.y.z`. This is the
             // user-visible improvement over the pre-fix `*` write.
             let entries = vec![("react".to_string(), UserSaveIntent::Bare)];
@@ -3872,7 +3880,7 @@ mod tests {
         #[test]
         fn build_save_decisions_explicit_wildcard_preserved() {
             // The author asked for `*` — a deliberate "any version"
-            // signal. Phase 33 preserves user wildcards verbatim.
+            // signal. preserves user wildcards verbatim.
             let entries = vec![("any-thing".to_string(), UserSaveIntent::Wildcard)];
             let out = build_save_decisions(
                 &entries,
@@ -3889,7 +3897,7 @@ mod tests {
             // registry (the helper expects the caller to have already
             // followed the tag → version indirection). Stable resolved
             // versions get the caret default; prereleases pin exact for
-            // safety per Phase 33's Tier 3.
+            // safety per the Tier 3.
             let entries = vec![(
                 "react".to_string(),
                 UserSaveIntent::DistTag("latest".to_string()),
@@ -4013,7 +4021,7 @@ mod tests {
             );
         }
 
-        // ── preflight_no_manifest_with_deps (Phase 64 #9.4) ───────────
+        // ── preflight_no_manifest_with_deps (#9.4) ───────────
         //
         // Hard-error before any side effects when a deps-declaring
         // source package would land in a project with no manifest.

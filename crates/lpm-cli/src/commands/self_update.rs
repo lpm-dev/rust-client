@@ -4,7 +4,7 @@ use crate::release_lookup::{
     read_cache_at, write_cache_at,
 };
 use lpm_common::LpmError;
-use owo_colors::OwoColorize;
+use lpm_common::color::Painted;
 use std::process::Command;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 

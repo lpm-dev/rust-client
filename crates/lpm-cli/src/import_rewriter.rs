@@ -19,7 +19,7 @@ const EXTENSIONS: &[&str] = &[".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs"];
 
 /// Classification of an import specifier.
 ///
-/// Phase 60 D4 (anti-drift contract): both `rewrite_imports` and the
+/// D4 (anti-drift contract): both `rewrite_imports` and the
 /// sibling `collect_bare_specifiers` must agree on what counts as
 /// "bare" / "external." Encoding the decision in this enum + the
 /// `classify_specifier` function below means there's exactly ONE place
@@ -278,7 +278,7 @@ fn resolve_and_rewrite(
 
 /// Collect every bare/external import specifier from a source file.
 ///
-/// Phase 60 D4 — sibling to [`rewrite_imports`]. Used by `lpm add`'s
+/// D4 — sibling to [`rewrite_imports`]. Used by `lpm add`'s
 /// simple path (no `lpm.config.json`) to print "Source uses external
 /// imports: react, lodash, …\n  Make sure these are in your project's
 /// dependencies." Anti-drift: shares [`classify_specifier`] with the
@@ -329,7 +329,7 @@ pub fn collect_bare_specifiers(content: &str, author_alias: Option<&str>) -> Has
 /// quote style. Iterates ALL occurrences (so a line with two
 /// `require()` calls yields both). Used by [`collect_bare_specifiers`].
 ///
-/// The pre-Phase-60 rewriter has its own simpler scan in `try_rewrite_line`
+/// The pre-existing rewriter has its own simpler scan in `try_rewrite_line`
 /// that finds only the first occurrence per (keyword, quote) pair.
 /// That limitation is preserved for now to avoid a behavior change in
 /// the rewriter; the collector deliberately does NOT inherit it
@@ -631,7 +631,7 @@ import Link from "next/link"
         assert!(result.is_none());
     }
 
-    // ── classify_specifier (Phase 60 D4 anti-drift contract) ─────────
+    // ── classify_specifier (D4 anti-drift contract) ─────────
 
     #[test]
     fn classify_relative_imports() {

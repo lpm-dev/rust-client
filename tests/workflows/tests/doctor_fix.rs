@@ -1,6 +1,6 @@
 //! Workflow tests for `lpm doctor --fix`.
 //!
-//! Phase 65's `doctor_list.rs` covers `lpm doctor list` (the catalog
+//! `doctor_list.rs` covers `lpm doctor list` (the catalog
 //! dump). This file covers the auto-fix dispatch path for issues that
 //! don't require network access:
 //!
@@ -60,12 +60,16 @@ fn doctor_fix_creates_gitattributes_when_lockfile_exists_without_it() {
         "preconditions: .gitattributes must not exist before --fix"
     );
 
+    // `.gitattributes` hygiene is Extended-tier, so the default fast
+    // preset doesn't check it. Add `--all` so the warn fires and the
+    // auto-fix branch runs.
     let output = lpm_doctor_offline(&project)
         .arg("doctor")
+        .arg("--all")
         .arg("--fix")
         .arg("--yes")
         .output()
-        .expect("failed to run lpm doctor --fix");
+        .expect("failed to run lpm doctor --all --fix");
 
     // Doctor's exit code reflects whether any failing checks remain.
     // Registry/auth always fail in this offline harness, so non-zero
@@ -78,7 +82,7 @@ fn doctor_fix_creates_gitattributes_when_lockfile_exists_without_it() {
 
     assert!(
         project.file_exists(".gitattributes"),
-        "doctor --fix must create .gitattributes when lpm.lock is present and the file is missing\noutput:\n{combined}"
+        "doctor --all --fix must create .gitattributes when lpm.lock is present and the file is missing\noutput:\n{combined}"
     );
 
     let content = project.read_file(".gitattributes");

@@ -29,7 +29,7 @@ impl PackageBits {
     }
 
     /// Create a full bit-set with all `len` members set.
-    #[allow(dead_code)] // used by M4 evaluator
+    #[allow(dead_code)] // used by the triage evaluator
     pub fn full(len: usize) -> Self {
         PackageBits(vec![true; len])
     }
@@ -102,7 +102,7 @@ impl PackageBits {
 impl<'a> FilterEngine<'a> {
     /// Evaluate a list of parsed filter expressions against the workspace.
     ///
-    /// Composition rule (per design doc §8.1):
+    /// Composition rule:
     ///
     /// ```text
     /// result = (eval(positive_1) ∪ ... ∪ eval(positive_n))
@@ -1176,7 +1176,7 @@ mod tests {
         );
     }
 
-    // ── M5: Explain API tests ──────────────────────────────────────────────
+    // ── Explain API tests ──────────────────────────────────────────────
 
     #[test]
     fn explain_atom_produces_direct_match() {
@@ -1369,7 +1369,7 @@ mod tests {
         assert_eq!(format_expr(&expr), "...^[main]");
     }
 
-    // ── M6: Security tests ─────────────────────────────────────────────────
+    // ── Security tests ─────────────────────────────────────────────────
     //
     // Lock down the security boundary. The evaluator must reject path
     // escapes, glob escapes, and pass git-ref injection straight through to
@@ -1509,14 +1509,14 @@ mod tests {
         }
     }
 
-    // ── M8: Perf assertion benchmarks ──────────────────────────────────────
+    // ── Perf assertion benchmarks ──────────────────────────────────────
     //
     // These are NOT criterion benchmarks — they're #[test]-mode perf gates
     // intended to catch order-of-magnitude regressions in the filter engine.
     // Budgets are intentionally generous (5-10x the design doc release-mode
     // numbers) so they pass in debug mode where every test runs.
     //
-    // For tighter benchmarking, drive the bench/run.sh harness in Phase 0.2.
+    // For tighter benchmarking, drive the bench/run.sh harness.
     //
     // The fixture is a 200-member synthetic workspace with a 5-deep dependency
     // chain in the middle, so closure operators have non-trivial work.
@@ -1556,8 +1556,8 @@ mod tests {
     /// was very sensitive to OS scheduling on GitHub Actions: one
     /// 500ms stall across a 500-iter loop adds 1ms to every per-op
     /// sample, which is 2× the 500µs debug budget — the glob
-    /// eval test flaked exactly this way on 2026-04-23 (CI run
-    /// 24830202402, Linux `ubuntu-latest`). Best-of-N captures
+    /// eval test flaked exactly this way on a Linux CI run
+    /// (`ubuntu-latest`). Best-of-N captures
     /// "when the scheduler cooperated, how fast can this code
     /// run?" — the question a ns/op budget is actually asking, and
     /// the one a regression in LPM's own code would answer with a

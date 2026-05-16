@@ -7,14 +7,14 @@
 //! (which on APFS / Linux ext4 / hardlink-fallback paths gives no
 //! traversable reference back to the source).
 //!
-//! Mandatory in v1 scope per Phase 66 preplan §2.4 — required for:
-//! - **Object orphan detection** (clonefile/hardlink doesn't preserve a
-//!   reverse pointer; `source_sri` carries it explicitly).
-//! - **Link orphan detection** via BFS over `deps[].target_graph_key`.
-//! - **Migration recovery**: a partially-populated link entry that
+//! Required for:
+//! - **Object orphan detection** — clonefile/hardlink doesn't preserve
+//!   a reverse pointer; `source_sri` carries it explicitly.
+//! - **Link orphan detection** — BFS over `deps[].target_graph_key`.
+//! - **Migration recovery** — a partially-populated link entry that
 //!   crashed before metadata-write is detected by absent sidecar.
-//! - **`--max-age` prune**: `last_referenced_at` updated on each install
-//!   that resolves to this graph-key.
+//! - **`--max-age` prune** — `last_referenced_at` updated on each
+//!   install that resolves to this graph-key.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -69,7 +69,6 @@ pub struct LinkMetaPlatform {
 
 /// Complete sidecar payload for one link entry.
 ///
-/// Preplan §2.4 schema v1.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LinkMeta {
     /// Schema version. Always [`LINK_META_SCHEMA_VERSION`] for files
@@ -146,22 +145,18 @@ impl LinkMeta {
         self.last_referenced_at = Utc::now();
     }
 
-    /// Phase 66 followup #3 — refresh the sidecar's "last touched"
-    /// signal via a single [`std::fs::File::set_modified`] call (one
-    /// `utimes(2)` syscall) instead of read+modify+write+rename (three
-    /// syscalls plus serde JSON round-trip).
+    /// Refresh the sidecar's "last touched" signal via one
+    /// `utimes(2)` syscall, avoiding the read+modify+write+rename
+    /// round-trip.
     ///
-    /// The on-disk JSON's `last_referenced_at` field becomes a stale
-    /// snapshot from the initial population; prune reconciles it
-    /// against the file mtime via
-    /// [`Self::effective_last_referenced_at`]. Schema-compatible —
-    /// older sidecars predating this change still parse cleanly and
-    /// their `last_referenced_at` remains valid (just always ≤ mtime).
+    /// The JSON's `last_referenced_at` field becomes a stale snapshot
+    /// from initial population; prune reconciles it against file mtime
+    /// via [`Self::effective_last_referenced_at`]. Older sidecars where
+    /// the JSON field was rewritten on every touch still parse cleanly.
     ///
-    /// Idempotent. Errors from the underlying `set_modified` are
-    /// returned as `LpmError::Store`; callers may safely treat the
-    /// failure as non-fatal (a missed touch only widens prune's
-    /// view of cold entries by one install cycle).
+    /// Idempotent. A failed `set_modified` is non-fatal — a missed
+    /// touch only widens prune's view of cold entries by one install
+    /// cycle.
     pub fn touch_on_disk(sidecar_path: &Path) -> Result<(), LpmError> {
         let file = std::fs::File::options()
             .write(true)
@@ -182,16 +177,13 @@ impl LinkMeta {
         Ok(())
     }
 
-    /// Phase 66 followup #3 — the touch-time prune actually consults.
+    /// The touch-time signal prune actually consults.
     ///
     /// Returns `max(self.last_referenced_at, file_mtime(sidecar_path))`.
-    /// Under [`Self::touch_on_disk`] semantics, file mtime is the
-    /// authoritative "last referenced" signal post-population; the
-    /// JSON field is preserved only for backward-compat with
-    /// pre-followup-#3 sidecars (where `touch` rewrote the field).
-    /// Falling back to the JSON field when mtime is unreadable means
-    /// the prune contract degrades gracefully on permission/EIO
-    /// failures rather than over-aggressively expiring entries.
+    /// File mtime is authoritative post-population; the JSON field is
+    /// retained for compatibility with older sidecars and as a fallback
+    /// when mtime is unreadable (permission/EIO) — that keeps prune
+    /// from over-aggressively expiring entries.
     pub fn effective_last_referenced_at(&self, sidecar_path: &Path) -> DateTime<Utc> {
         match std::fs::metadata(sidecar_path).and_then(|m| m.modified()) {
             Ok(mtime) => {
@@ -290,9 +282,8 @@ impl LinkMeta {
     /// half-written sidecar — the outer rename is the visibility
     /// boundary, so the inner tmp+rename is dead syscalls.
     ///
-    /// Wins ~35 % of cold-install rename syscalls (one per link entry ×
-    /// hundreds of packages) per Phase 66 post-flamegraph audit
-    /// (2026-05-09).
+    /// Eliminates ~35 % of cold-install rename syscalls (one per link
+    /// entry × hundreds of packages).
     pub fn write_to_unpublished(&self, staging_dir: &Path) -> Result<PathBuf, LpmError> {
         let final_path = staging_dir.join(LINK_META_FILENAME);
         let bytes = serde_json::to_vec_pretty(self)

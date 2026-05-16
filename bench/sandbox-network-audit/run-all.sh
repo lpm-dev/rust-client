@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Phase 46.1 sandbox-network-denial audit — whole-list runner +
+# sandbox-network-denial audit — whole-list runner +
 # family classifier.
 #
 # Takes a newline-separated file of `name@version` entries and runs

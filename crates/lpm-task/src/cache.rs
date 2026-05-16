@@ -375,7 +375,7 @@ mod tests {
         let _ = fs::remove_dir_all(cache_entry_dir(&key).unwrap());
     }
 
-    // -- Finding #1: zip-slip prevention --
+    // -- zip-slip prevention --
 
     #[test]
     fn restore_archive_rejects_path_traversal() {
@@ -491,7 +491,7 @@ mod tests {
         );
     }
 
-    // -- Finding #4: glob pattern validation --
+    // -- glob pattern validation --
 
     #[test]
     fn validate_glob_rejects_parent_traversal() {
@@ -523,7 +523,7 @@ mod tests {
         assert!(validate_glob_pattern("package.json"));
     }
 
-    // -- Finding #5: cache directory permissions --
+    // -- cache directory permissions --
 
     #[cfg(unix)]
     #[test]
@@ -543,7 +543,7 @@ mod tests {
         );
     }
 
-    // -- Finding #13: cache key validation --
+    // -- cache key validation --
 
     #[test]
     fn cache_entry_dir_rejects_path_traversal_key() {

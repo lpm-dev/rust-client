@@ -53,8 +53,8 @@ pub fn wait_for_url(url: &str, timeout_secs: u64) -> Result<Duration, String> {
         ));
     }
 
-    // Finding #6: Reject non-localhost URLs to prevent SSRF attacks.
-    // A malicious lpm.json could use readyUrl to probe internal network services.
+    // Reject non-localhost URLs to prevent SSRF: a malicious lpm.json could
+    // use readyUrl to probe internal network services.
     if !is_localhost_url(url) {
         return Err(format!(
             "readyUrl must point to localhost for security. \
@@ -212,7 +212,7 @@ mod tests {
         );
     }
 
-    // ── SSRF protection tests (Finding #6) ──────────────────────────
+    // ── SSRF protection tests ────────────────────────────────────────
 
     #[test]
     fn is_localhost_url_accepts_localhost() {

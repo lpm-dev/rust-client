@@ -27,8 +27,8 @@ use std::path::Path;
 use time::OffsetDateTime;
 use time::format_description::well_known::Iso8601;
 
-// Re-export Phase 4 trust types so callers in lpm-cli can import them
-// from lpm-security alongside `SecurityPolicy`. The types are owned by
+// Re-export trust types so callers in lpm-cli can import them from
+// lpm-security alongside `SecurityPolicy`. The types are owned by
 // `lpm-workspace` (the schema crate) but used most heavily here.
 pub use lpm_workspace::{TrustMatch, TrustedDependencies, TrustedDependencyBinding};
 
@@ -53,12 +53,11 @@ const BLOCKED_SCRIPTS: &[&str] = &[
 /// Lifecycle script phases that the install-time `lpm rebuild` pipeline
 /// **actually runs**, in execution order.
 ///
-/// **Phase 32 Phase 4** (F3 in the Phase 4 status doc): the script_hash
-/// approval binding covers EXACTLY these phases. Editing a non-executed
-/// phase like `prepare` does NOT invalidate approvals because that script
-/// never runs at install time. Conversely, any change to one of these
-/// three phases DOES invalidate approvals because that's bytes the user
-/// previously trusted to execute.
+/// The `script_hash` approval binding covers EXACTLY these scripts.
+/// Editing a non-executed script like `prepare` does NOT invalidate
+/// approvals because that script never runs at install time. Conversely,
+/// any change to one of these three DOES invalidate approvals because
+/// that's bytes the user previously trusted to execute.
 ///
 /// This const is the SINGLE source of truth — `lpm-cli/src/commands/build.rs`
 /// imports it instead of defining its own `SCRIPT_PHASES` list, and
@@ -96,12 +95,12 @@ fn current_epoch_secs() -> u64 {
 pub struct SecurityPolicy {
     /// Packages explicitly trusted to run lifecycle scripts.
     ///
-    /// **Phase 32 Phase 4** (M2): the type changed from `HashSet<String>`
-    /// to [`TrustedDependencies`] so the strict gate
+    /// Packages trusted to run lifecycle scripts. The type is
+    /// [`TrustedDependencies`] so the strict gate
     /// ([`Self::can_run_scripts_strict`]) can bind to
     /// `{name, version, integrity, script_hash}`. The legacy
     /// [`Self::can_run_scripts`] method is preserved as a name-only
-    /// fallback for the existing `lpm rebuild` code path.
+    /// fallback for manifests with the legacy `Vec<String>` form.
     pub trusted_dependencies: TrustedDependencies,
     /// Minimum age in seconds before a release is installable (default: 86400 = 24h).
     /// Set to 0 to disable. Protects against compromised publish tokens being used
@@ -123,9 +122,8 @@ impl SecurityPolicy {
 
     /// Load policy from a project's package.json.
     ///
-    /// Reads `"lpm": { "trustedDependencies": ... }`. Accepts BOTH the
-    /// legacy array form and the Phase 4 rich-map form (per
-    /// [`TrustedDependencies`]).
+    /// Reads `"lpm": { "trustedDependencies": ... }`. Accepts both the
+    /// legacy array form and the rich-map form (per [`TrustedDependencies`]).
     pub fn from_package_json(pkg_json_path: &Path) -> Self {
         let pkg = match lpm_workspace::read_package_json(pkg_json_path) {
             Ok(p) => p,
@@ -147,8 +145,8 @@ impl SecurityPolicy {
         }
     }
 
-    /// **Phase 46 P3.** Build a policy whose `trusted_dependencies` are read
-    /// from `package.json` (same tolerance as [`Self::from_package_json`] —
+    /// Build a policy whose `trusted_dependencies` are read from
+    /// `package.json` (same tolerance as [`Self::from_package_json`] —
     /// missing/malformed manifest yields `TrustedDependencies::default()`)
     /// but whose `minimum_release_age_secs` is supplied by the caller.
     ///
@@ -178,23 +176,21 @@ impl SecurityPolicy {
 
     /// Lenient name-only check: returns true if the package name appears
     /// in `trustedDependencies` regardless of version, integrity, or
-    /// script hash. Used by the existing `lpm rebuild` code path before
-    /// M5 swaps to [`Self::can_run_scripts_strict`].
+    /// script hash. Used by legacy callers; superseded by
+    /// [`Self::can_run_scripts_strict`].
     ///
-    /// **Phase 4 deprecation note:** in the long term, callers should
-    /// migrate to [`Self::can_run_scripts_strict`] which binds to the
-    /// full `{name, version, integrity, script_hash}` tuple. The lenient
-    /// check is kept ONLY for backwards compatibility with manifests
+    /// Callers should prefer [`Self::can_run_scripts_strict`] which binds
+    /// to the full `{name, version, integrity, script_hash}` tuple. The
+    /// lenient check is kept only for backwards compatibility with manifests
     /// that still have the legacy `Vec<String>` form.
     pub fn can_run_scripts(&self, package_name: &str) -> bool {
         self.trusted_dependencies
             .contains_name_lenient(package_name)
     }
 
-    /// **Phase 32 Phase 4 strict gate.** Returns the full
-    /// [`TrustMatch`] result for a package against the project's
-    /// trustedDependencies, considering name + version + integrity +
-    /// script hash.
+    /// Strict gate: returns the full [`TrustMatch`] result for a package
+    /// against the project's trustedDependencies, considering name +
+    /// version + integrity + script hash.
     ///
     /// `lpm rebuild` should branch on the result:
     /// - [`TrustMatch::Strict`] → run the script
@@ -212,11 +208,10 @@ impl SecurityPolicy {
             .matches_strict(name, version, integrity, script_hash)
     }
 
-    /// **Phase 48 P0 sub-slice 6c.** Look up the rich binding for
-    /// a specific `name@version` so the capability-hash enforcement
-    /// path can inspect [`TrustedDependencyBinding::capability_hash`].
-    /// Returns `None` for legacy-bare-name approvals (no binding to
-    /// inspect) and for packages with no approval at all.
+    /// Look up the rich binding for a specific `name@version` so the
+    /// capability-hash enforcement path can inspect
+    /// [`TrustedDependencyBinding::capability_hash`]. Returns `None`
+    /// for legacy-bare-name approvals and for packages with no approval.
     pub fn get_binding(&self, name: &str, version: &str) -> Option<&TrustedDependencyBinding> {
         self.trusted_dependencies.get_binding(name, version)
     }
@@ -284,12 +279,12 @@ impl SecurityPolicy {
     }
 }
 
-/// Phase 46b Option B — compute a package's publish age in seconds.
+/// Compute a package's publish age in seconds.
 ///
 /// Parses the ISO 8601 timestamp and returns `now - published`. Used
 /// by the install pipeline to thread per-package publish ages into
 /// the L1 classifier's [`crate::static_gate::ManifestContext`] so
-/// Lever #4's identity-match widening can apply the cooldown
+/// the identity-match widening can apply the cooldown
 /// defense-in-depth (refuse to widen recent publishes).
 ///
 /// Returns `None` when:
@@ -339,7 +334,6 @@ mod tests {
 
     #[test]
     fn trusted_deps_can_run_scripts() {
-        // Phase 4 M2: trusted_dependencies is now a TrustedDependencies enum.
         // Construct a Legacy variant directly to preserve the original test
         // semantic (name-only trust), which can_run_scripts honors via
         // contains_name_lenient.

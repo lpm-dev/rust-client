@@ -91,14 +91,12 @@ pub fn to_lockfile(packages: Vec<MigratedPackage>) -> (Lockfile, Vec<SkippedPack
             source: Some(source),
             integrity: pkg.integrity,
             dependencies,
-            // Phase 40 P2 — the migrate path consumes lockfiles
-            // produced by other package managers and does not yet
-            // translate their alias encodings. Emit no aliases for
-            // now; a migrating project with alias deps will have them
-            // re-discovered on the next fresh resolve.
+            // The migrate path consumes lockfiles produced by other
+            // package managers and does not translate their alias
+            // encodings. A migrating project with alias deps will have
+            // them re-discovered on the next fresh resolve.
             alias_dependencies: Vec::new(),
-            // R2.5 — same shape as alias_dependencies above:
-            // migrated lockfiles don't carry per-package peer state
+            // Migrated lockfiles don't carry per-package peer state
             // from the source format. The next `lpm install`
             // re-derives peers through the resolver and writes them
             // into the lockfile.
@@ -117,11 +115,11 @@ pub fn to_lockfile(packages: Vec<MigratedPackage>) -> (Lockfile, Vec<SkippedPack
         },
         packages: locked_packages,
         root_aliases: std::collections::BTreeMap::new(),
-        // R2.5 — `lpm migrate` translates yarn/pnpm/npm lockfiles
-        // into the lpm shape; the source formats don't track
-        // synthesized ambient peers (those are an lpm-resolver
-        // semantic, not a generic lockfile concept). Migrated
-        // lockfiles thus start with no ambient peers; the next
+        // `lpm migrate` translates yarn/pnpm/npm lockfiles into the
+        // lpm shape; the source formats don't track synthesized ambient
+        // peers (those are an lpm-resolver semantic, not a generic
+        // lockfile concept). Migrated lockfiles start with no ambient
+        // peers; the next
         // `lpm install` re-derives them through the resolver if
         // `auto_install_peers` is on, and writes them into the next
         // lockfile.
@@ -446,7 +444,7 @@ mod tests {
 
     #[test]
     fn infer_source_unknown_registry_returns_default() {
-        // Finding #11: unknown registry URLs should still return npmjs default
+        // Unknown registry URLs should still return npmjs default
         let source = infer_source(&Some("https://private.corp/pkg.tgz".to_string()));
         assert_eq!(source, "registry+https://registry.npmjs.org");
     }

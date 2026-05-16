@@ -1,15 +1,15 @@
-//! §12.5 green-tier compat corpus — each test runs a minimal
-//! fixture script that writes to the same shape of paths a real
-//! green-tier postinstall (node-gyp rebuild, electron-rebuild, tsc,
-//! prisma generate, husky install) would, and asserts the sandbox
-//! ALLOWS the writes under [`SandboxMode::Enforce`].
+//! Green-tier compat corpus — each test runs a minimal fixture script
+//! that writes to the same shape of paths a real green-tier
+//! postinstall (node-gyp rebuild, electron-rebuild, tsc, prisma
+//! generate, husky install) would, and asserts the sandbox ALLOWS
+//! the writes under [`SandboxMode::Enforce`].
 //!
-//! These are MINIMAL fixtures (per Chunk 5 hybrid approach signoff):
-//! the CI lane exercises the real write shapes without depending on
-//! npm / node-gyp / python / build toolchains being installed. A
-//! narrow `#[ignore]`-gated real-install lane (Chunk 5b) runs true
-//! package installs before rule changes or release work; it's the
-//! developer-opt-in safety net, not the default CI matrix.
+//! These are MINIMAL fixtures: the CI lane exercises the real write
+//! shapes without depending on npm / node-gyp / python / build
+//! toolchains being installed. A narrow `#[ignore]`-gated real-install
+//! lane runs true package installs before rule changes or release
+//! work; it's the developer-opt-in safety net, not the default CI
+//! matrix.
 //!
 //! | Fixture            | Real green                | Write shape                                      |
 //! |--------------------|---------------------------|--------------------------------------------------|
@@ -19,10 +19,9 @@
 //! | `prisma_generate`  | prisma generate           | `{project}/node_modules/.prisma/client/*.js`     |
 //! | `husky_install`    | husky install             | `{project}/.husky/<hook>`                        |
 //!
-//! If any of these tests fail after a §9.3 rule change, the rule
-//! change broke a real green pattern — either tighten the fixture
-//! to the narrower real behavior or demote the pattern to amber
-//! per §9.4's failure-mode table.
+//! If any of these tests fail after a sandbox allow-list rule change,
+//! the rule change broke a real green pattern — either tighten the
+//! fixture to the narrower real behavior or demote the pattern to amber.
 
 mod common;
 
@@ -41,7 +40,7 @@ fn node_gyp_rebuild_shape_succeeds() {
     // - {pkg_dir}/build/Makefile, config.gypi (generated)
     // - $HOME/.node-gyp/<node-version>/include/ (during rebuild)
     // The first two are under the package's own writable root; the
-    // third is under $HOME/.node-gyp, which §9.3 explicitly allows.
+    // third is under $HOME/.node-gyp, which the sandbox explicitly allows.
     let script = "\
         mkdir -p build/Release && \
         echo fake-binary > build/Release/binding.node && \
@@ -117,7 +116,7 @@ fn prisma_generate_shape_succeeds() {
     let sb = try_build_sandbox(fx.spec.clone(), SandboxMode::Enforce).unwrap();
     // prisma generate writes to {project}/node_modules/.prisma/
     // client/index.js. The path is NOT inside the package's own
-    // store dir — it's inside the project's node_modules. §9.3
+    // store dir — it's inside the project's node_modules. The sandbox
     // explicitly allows writes to `{project}/node_modules`.
     let client_dir = fx.project_dir.join("node_modules/.prisma/client");
     let script = format!(
@@ -142,7 +141,7 @@ fn husky_install_shape_succeeds() {
     }
     let fx = SandboxFixture::new("husky", "9.0.0");
     let sb = try_build_sandbox(fx.spec.clone(), SandboxMode::Enforce).unwrap();
-    // husky install writes to {project}/.husky/<hook>. §9.3
+    // husky install writes to {project}/.husky/<hook>. The sandbox
     // explicitly allows `{project}/.husky`.
     let husky = fx.project_dir.join(".husky");
     let script = format!(
@@ -167,8 +166,8 @@ fn lpm_state_write_shape_succeeds() {
     // writes (under {project}/.lpm) go through the same sandbox
     // profile and must be permitted. If this breaks, build-state.json
     // writes from inside scripts (which is uncommon but not
-    // impossible) would silently fail. §9.3 lists `{project}/.lpm`
-    // in the writable set.
+    // impossible) would silently fail. `{project}/.lpm` is in the
+    // sandbox writable set.
     if !sandbox_supported(SandboxMode::Enforce) {
         return;
     }

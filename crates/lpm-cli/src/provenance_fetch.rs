@@ -1,5 +1,5 @@
-//! Phase 46 P4 Chunk 2 — Sigstore attestation fetch + cache + cert
-//! SAN extraction for the CLI's provenance-drift check (§7.1).
+//! — Sigstore attestation fetch + cache + cert
+//! SAN extraction for the CLI's provenance-drift check.
 //!
 //! Pipeline:
 //!
@@ -16,20 +16,19 @@
 //!    its SAN extension for the GitHub Actions OIDC URI, and return
 //!    a populated [`ProvenanceSnapshot`].
 //!
-//! **Fetch-failure semantics** (plan §11 P4):
+//! **Fetch-failure semantics**:
 //! - `Ok(Some(snapshot))` — a definitive answer (either
 //!   `present: true` with identity extracted, or `present: false`
 //!   meaning the registry has no attestation for this version).
 //! - `Ok(None)` — **degraded / unknown** (network error, malformed
-//!   bundle, etc.). The Chunk 3 drift rule interprets this as
+//!   bundle, etc.). The drift rule interprets this as
 //!   "pass, don't drift" per the plan's offline/degrade guarantee.
 //!   Never cached, so the next install retries.
 //! - `Err(_)` — reserved for genuinely fatal conditions (cache
 //!   directory unwritable, I/O errors the caller must surface).
 //!
 //! **Scope (plan D5):** identity extraction only. No Sigstore
-//! signature verification, no Fulcio trust-root checks. Phase 46.1
-//! lands full cryptographic verification.
+//! signature verification, no Fulcio trust-root checks. //! lands full cryptographic verification.
 //!
 //! The install-time call site lives in
 //! [`crate::commands::install::run_with_options`]'s drift gate,
@@ -48,10 +47,10 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
-/// **Phase 46 P4 Chunk 4.** Canonicalized policy for the
+/// Canonicalized policy for the
 /// `--ignore-provenance-drift[-all]` override flags on `lpm install`.
 ///
-/// The two clap args compose per Q2 of the P4 kickoff discussion:
+/// The two clap args compose per Q2 of the kickoff discussion:
 /// `--ignore-provenance-drift-all` supersedes the per-package list,
 /// so passing `-all` alongside specific `--ignore-provenance-drift X`
 /// is not an error — it just collapses to `IgnoreAll`. This avoids a
@@ -59,7 +58,7 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 /// that forward both from an orchestrator.
 #[derive(Debug, Clone, Default)]
 pub enum DriftIgnorePolicy {
-    /// No override: enforce §7.2 drift normally.
+    /// No override: enforce drift normally.
     #[default]
     EnforceAll,
     /// Opt out of drift enforcement for these specific package names.
@@ -106,7 +105,7 @@ impl DriftIgnorePolicy {
     }
 }
 
-/// 7-day TTL per the Phase 46 plan (§11 P4).
+/// 7-day TTL per the plan.
 const CACHE_TTL_SECS: u64 = 7 * 24 * 60 * 60;
 
 /// Schema version for the on-disk cache entries. Bump if the parsed
@@ -126,7 +125,7 @@ const MAX_BUNDLE_BYTES: usize = 1024 * 1024;
 /// degrade to "unknown" quickly rather than stall the install.
 const FETCH_TIMEOUT_SECS: u64 = 15;
 
-/// **Phase 52 W1b** — perf decomposition of [`fetch_provenance_snapshot`].
+/// perf decomposition of [`fetch_provenance_snapshot`].
 ///
 /// Each atomic accumulates time spent in one stage across many
 /// concurrent calls. Caller (e.g. `build_blocked_set_metadata`) creates
@@ -266,14 +265,14 @@ pub async fn fetch_provenance_snapshot(
 /// Batch-fetch attestation snapshots for many `(name, version)` pairs
 /// in parallel. Single source of truth for both the project-level
 /// `lpm approve-scripts` write path and the global-scope
-/// `lpm approve-scripts --global` write path (Phase 68 P4 parity).
+/// `lpm approve-scripts --global` write path (P4 parity).
 ///
 /// Returns one entry per input pair. Missing entries (no `LpmRoot`,
 /// registry didn't return metadata, no attestation URL, network
 /// failure) map to `None`. Callers degrade gracefully: a `None` value
 /// persists as `provenance_at_approval = None`, which the next
 /// install's drift gate treats as "first observation, no drift" —
-/// same behavior as the pre-Phase-52 path when the install-time
+/// same behavior as the pre-existing path when the install-time
 /// fetcher degraded.
 ///
 /// The lpm-vs-npm metadata-fetch dispatch by `@lpm.dev/` name prefix
@@ -288,7 +287,7 @@ pub async fn fetch_provenance_for_pkgs(
     let cache_root = match lpm_common::paths::LpmRoot::from_env() {
         Ok(root) => root.cache_metadata_attestations(),
         Err(_) => {
-            // Degraded — no cache root. Match the pre-Phase-52 install
+            // Degraded — no cache root. Match the pre-existing install
             // behavior: every package gets `None`.
             return pkgs.iter().map(|p| (p.clone(), None)).collect();
         }
@@ -449,7 +448,7 @@ fn write_cache(
 /// that to `Ok(None)` (unknown) so the install proceeds without
 /// falsely claiming drift.
 ///
-/// **Body-size defense (reviewer finding, Chunk 2 revision):** the
+/// **Body-size defense (reviewer finding, revision):** the
 /// original implementation called `response.bytes().await` first and
 /// only then compared the buffered length against `MAX_BUNDLE_BYTES`
 /// — which meant the 1 MiB "hostile registry" guard was theoretical:
@@ -474,7 +473,7 @@ fn write_cache(
 /// tracing (`send`, `status`, `content_length_cap`, `chunk`,
 /// `stream_cap`) lives here.
 ///
-/// Split out from [`fetch_and_parse`] in Phase 52 W1b so the
+/// Split out from [`fetch_and_parse`] in W1b so the
 /// production path can time HTTP separately from parse. Tests still
 /// go through the [`fetch_and_parse`] wrapper.
 async fn fetch_bundle_bytes(http: &reqwest::Client, url: &str) -> Result<Vec<u8>, ()> {
@@ -486,7 +485,7 @@ async fn fetch_bundle_bytes(http: &reqwest::Client, url: &str) -> Result<Vec<u8>
         .send()
         .await
         .map_err(|e| {
-            // Phase 51 W1c: surface the failure mode so operators can
+            // W1c: surface the failure mode so operators can
             // tell a transient network blip apart from a deterministic
             // bug (URL stale, bundle shape drift, etc.). Caller maps
             // this to Ok(None) and drift-checks proceed in degraded
@@ -576,7 +575,7 @@ async fn fetch_bundle_bytes(http: &reqwest::Client, url: &str) -> Result<Vec<u8>
 /// failure-point tracing (`json_parse`, `cert_lookup`, `base64_decode`)
 /// lives in [`parse_sigstore_bundle`].
 ///
-/// Split out from [`fetch_and_parse`] in Phase 52 W1b so the
+/// Split out from [`fetch_and_parse`] in W1b so the
 /// production path can time parse separately from HTTP.
 fn parse_bundle_or_log(body: &[u8], url: &str) -> Result<ProvenanceSnapshot, ()> {
     parse_sigstore_bundle(body).map_err(|()| {
@@ -594,7 +593,7 @@ fn parse_bundle_or_log(body: &[u8], url: &str) -> Result<ProvenanceSnapshot, ()>
     })
 }
 
-/// Pre-Phase-52 fused wrapper. Production calls
+/// Pre-fused wrapper. Production calls
 /// [`fetch_bundle_bytes`] + [`parse_bundle_or_log`] directly so HTTP
 /// and parse can be timed independently; this wrapper exists so unit
 /// tests can keep their original one-call shape and is gated to
@@ -682,8 +681,7 @@ fn parse_sigstore_bundle(body: &[u8]) -> Result<ProvenanceSnapshot, ()> {
 ///    chain only ever held one cert. **This is what npm's
 ///    attestations endpoint serves today** for every Fulcio-issued
 ///    GitHub Actions provenance attestation, and the absence of
-///    this branch in the original parser is what caused the Phase
-///    50 close-out's "warm install never caches ~18 packages" bug
+///    this branch in the original parser is what caused the "warm install never caches ~18 packages" bug
 ///    — every attested URL parsed past the cert-lookup stage and
 ///    degraded to `Ok(None)`, which is never written to disk.
 /// 3. **npm attestations-list wrapper** —
@@ -748,7 +746,7 @@ fn find_leaf_cert_rawbytes(v: &serde_json::Value) -> Option<String> {
 /// Motivation: without the split, a legitimate v1.14.0 → v1.14.1
 /// release (same repo, same workflow file, necessarily different ref)
 /// would register as "identity changed" and block. See the reviewer's
-/// 2026-04-22 drift-comparator finding for the full trace.
+/// drift-comparator finding for the full trace.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct SanIdentity {
     /// `github:<org>/<repo>` — stable across releases. Part of the
@@ -845,7 +843,7 @@ fn parse_github_actions_uri(uri: &str) -> Option<SanIdentity> {
     // the `.github/workflows/` segment so `workflow_path` is
     // self-describing (`publish.yml` alone could refer to anything;
     // `.github/workflows/publish.yml` is unambiguous and matches the
-    // plan's §6.1 wire spec).
+    // plan's wire spec).
     let workflow_path = format!(".github/workflows/{workflow_path_tail}");
 
     Some(SanIdentity {
@@ -897,7 +895,7 @@ mod tests {
         assert!(policy.ignores_name("package"));
     }
 
-    /// Key behaviour from Q2 of the P4 kickoff: passing both flags is
+    /// Key behaviour from Q2 of the kickoff: passing both flags is
     /// NOT an error — `-all` supersedes the per-package list. No clap
     /// mutex needed; the combination is unambiguous and the shorter-
     /// text flag wins by the simpler of the two.
@@ -1166,7 +1164,7 @@ mod tests {
         );
     }
 
-    /// **Phase 51 regression — Sigstore Bundle v0.3 single-cert shape.**
+    ///
     ///
     /// Before this test was added, `parse_sigstore_bundle` would fail
     /// on the v0.3 shape (`verificationMaterial.certificate.rawBytes`)
@@ -1196,7 +1194,7 @@ mod tests {
         assert_eq!(snap.workflow_ref.as_deref(), Some("refs/tags/1.11.20"));
     }
 
-    /// **Phase 51 regression — real-world npm attestations wrapper.**
+    ///
     ///
     /// npm currently serves a 2-element list: index 0 is npm's own
     /// publish attestation (publicKey-only, no Fulcio cert), index 1
@@ -1204,7 +1202,7 @@ mod tests {
     /// cert). The parser must walk past the publicKey-only entry and
     /// pick up the cert-bearing one. This test encodes the actual
     /// production shape verified by curling
-    /// `registry.npmjs.org/-/npm/v1/attestations/<pkg>` on 2026-04-25.
+    /// `registry.npmjs.org/-/npm/v1/attestations/<pkg>` on.
     #[test]
     fn parse_bundle_npm_real_world_skips_publickey_falls_through_to_v3_cert() {
         let der = cert_der_with_san_uri(
@@ -1237,7 +1235,7 @@ mod tests {
         );
     }
 
-    /// **Phase 51 regression — npm wrapper with no cert anywhere.**
+    ///
     ///
     /// If npm ever ships only a publish attestation (no GitHub Actions
     /// provenance), the wrapper is a single publicKey-only entry. The
@@ -1260,7 +1258,7 @@ mod tests {
         );
     }
 
-    /// **Phase 51 regression — v0.3 cert wins over v0.2 chain when both
+    /// **regression — v0.3 cert wins over v0.2 chain when both
     /// are present.**
     ///
     /// Defensive: ensure the parser doesn't hash a stale v0.2 chain
@@ -1546,7 +1544,7 @@ mod tests {
                 .unwrap();
         assert_eq!(
             result, None,
-            "network failure must degrade to unknown (Ok(None)) per §11 P4"
+            "network failure must degrade to unknown (Ok(None)) per"
         );
 
         // Most importantly: the failure must not have written a
@@ -1673,7 +1671,7 @@ mod tests {
     /// header alone — we drop the response before reading any body
     /// byte.
     ///
-    /// **Reviewer finding (2026-04-22):** an earlier version of this
+    /// **Reviewer finding :** an earlier version of this
     /// test used wiremock with an overridden `Content-Length` header
     /// and a small real body. That triggered a hyper framing panic
     /// in the mock-server's response thread ("payload claims

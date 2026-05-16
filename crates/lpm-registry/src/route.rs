@@ -6,7 +6,7 @@
 //! `LPM_NPM_ROUTE` env var stays as an internal debug knob; it is not
 //! a user-facing setting.
 //!
-//! ## Phase 58 — Custom registries via `.npmrc`
+//! ## Custom registries via `.npmrc`
 //!
 //! [`RouteTable`] wraps `RouteMode` plus a parsed [`crate::NpmrcConfig`]
 //! so `.npmrc`-declared private/internal registries become first-class
@@ -15,10 +15,6 @@
 //! npmjs.org, [`RouteTable::route_for_package`] emits
 //! [`UpstreamRoute::Custom`] carrying the destination URL plus any
 //! origin-scoped auth.
-//!
-//! Day-3 plumbing: types + RouteTable + lpm-registry-side dispatch.
-//! Day-4 wiring: lpm-resolver (walker, greedy) + lpm-cli (install,
-//! install_global) consume `RouteTable` instead of `RouteMode`.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -60,8 +56,8 @@ pub enum UpstreamRoute {
     /// Fetch direct from `registry.npmjs.org` (no Worker hop).
     NpmDirect,
 
-    /// Fetch from a custom npm-compatible registry declared in
-    /// `.npmrc` (Phase 58). `target.base_url` is the canonicalized
+    /// Fetch from a custom npm-compatible registry declared in `.npmrc`.
+    /// `target.base_url` is the canonicalized
     /// registry root; `auth` is the origin-scoped credential to attach,
     /// if any. The dispatcher MUST verify auth's origin matches the
     /// destination URL's host before sending — defense-in-depth against
@@ -108,10 +104,6 @@ impl RouteMode {
 /// Composite routing decision: env-driven [`RouteMode`] plus the
 /// disk-discovered [`NpmrcConfig`].
 ///
-/// Phase 58 day-3: this is the type the resolver/CLI threads through
-/// dispatch instead of `RouteMode`. Day-3 ships the data layer +
-/// `lpm-registry`-side dispatch only; day-4 wires the rest.
-///
 /// `npmrc` is `Arc`-shared so cloning a `RouteTable` (e.g., one per
 /// dispatcher task) is one ref-bump, not a HashMap clone.
 #[derive(Debug, Clone)]
@@ -126,8 +118,8 @@ impl RouteTable {
     /// Returns `Err(NpmrcLoadErrors)` if `npmrc` has any **fatal**
     /// errors (currently: missing env vars referenced via `${VAR}`).
     /// This is the type-system enforcement of the "no install proceeds
-    /// with broken `.npmrc`" contract — Gemini day-3 review Finding 2.
-    /// A side-channel `npmrc_errors()` accessor on a constructed
+    /// with broken `.npmrc`" contract. A side-channel `npmrc_errors()`
+    /// accessor on a constructed
     /// `RouteTable` would still leave the check up to "remember to
     /// look"; making this `Result`-typed makes the contract impossible
     /// to silently bypass.
@@ -172,7 +164,7 @@ impl RouteTable {
 
     /// Pick the upstream for a specific package name.
     ///
-    /// Resolution order (preplan §3.4):
+    /// Resolution order:
     /// 1. `@lpm.dev/*` → `LpmWorker` (unchanged invariant; LPM packages
     ///    always go through the Worker for auth + batch + attribution).
     /// 2. `@scope/foo` and `npmrc.scope_registries[@scope]` exists →
@@ -207,8 +199,8 @@ impl RouteTable {
         &self.npmrc.warnings
     }
 
-    /// Phase 58.1 — TLS overrides parsed from `.npmrc` (`cafile=` / `ca=`
-    /// extra roots and `strict-ssl=false`). Callers thread this into
+    /// TLS overrides parsed from `.npmrc` (`cafile=` / `ca=` extra roots
+    /// and `strict-ssl=false`). Callers thread this into
     /// [`RegistryClient::with_tls_overrides`](crate::client::RegistryClient::with_tls_overrides)
     /// once at install start, before any network is touched.
     ///
@@ -224,8 +216,8 @@ impl RouteTable {
     ///
     /// Used by tarball-download call sites in install.rs to pair the
     /// destination URL with the correct credential before calling
-    /// `RegistryClient::download_tarball_to_file_with_auth` (Phase 58
-    /// day-4.5 fix). The metadata path goes through
+    /// `RegistryClient::download_tarball_to_file_with_auth`. The metadata
+    /// path goes through
     /// `RouteTable::route_for_package` which embeds the auth in the
     /// `Custom` arm; tarball URLs come from resolved metadata and so
     /// need this lookup separately.
@@ -239,7 +231,7 @@ impl RouteTable {
         self.mode
     }
 
-    /// Phase 58.3 — the **request-aware effective-origin set** for
+    /// The **request-aware effective-origin set** for
     /// `with_tls_overrides_for`'s eager-build pass.
     ///
     /// Walks `top_level_specs` and emits the origin each spec would
@@ -252,11 +244,10 @@ impl RouteTable {
     /// **Why request-aware (not config-union):** if `~/.npmrc` declares
     /// per-origin TLS for `//legacy.artifactory/` and the current
     /// invocation never touches that origin, we MUST NOT eager-build
-    /// for it. A bad `certfile=` path / missing passphrase / wrong
-    /// passphrase for a configured-but-unreached origin would otherwise
-    /// abort an unrelated install. Transitive scopes / tarball CDNs
-    /// surfacing later go through the lazy path. See Phase 58.3 Δ1
-    /// in the plan doc.
+    /// for it. A bad `certfile=` / missing passphrase / wrong passphrase
+    /// for a configured-but-unreached origin would otherwise abort an
+    /// unrelated install. Transitive scopes / tarball CDNs surfacing
+    /// later go through the lazy path.
     ///
     /// **Sources of origins:**
     /// 1. [`UpstreamRoute::LpmWorker`] specs → `lpm_worker_url`'s origin.
@@ -402,7 +393,7 @@ mod tests {
         assert_eq!(RouteMode::from_env_or_default(), RouteMode::default());
     }
 
-    // ---- RouteTable tests (Phase 58 day-3) ----
+    // ---- RouteTable tests ----
 
     fn no_env(_name: &str) -> Option<String> {
         None
@@ -411,9 +402,8 @@ mod tests {
     #[test]
     fn route_table_lpm_packages_always_route_to_worker() {
         // Even with a default-registry override in npmrc, @lpm.dev/*
-        // bypasses everything and goes straight to the Worker. This
-        // is the load-bearing invariant from Phase 49 — LPM packages
-        // require auth + batched attribution that npm-compatible
+        // bypasses everything and goes straight to the Worker — LPM
+        // packages require auth + batched attribution that npm-compatible
         // registries don't provide.
         let npmrc = NpmrcConfig::parse("registry=https://npm.internal/\n", "test", &no_env);
         let table = RouteTable::new(RouteMode::Direct, npmrc).expect("npmrc has no errors");
@@ -517,10 +507,9 @@ mod tests {
 
     #[test]
     fn route_table_new_fails_fast_on_fatal_npmrc_error() {
-        // Gemini day-3 review Finding 2: a `.npmrc` with `${MISSING}`
-        // env interpolation must NOT yield a usable RouteTable. The
-        // type system enforces this — `new` returns `Err` so a caller
-        // CAN'T forget to check for errors.
+        // A `.npmrc` with `${MISSING}` env interpolation must NOT yield
+        // a usable RouteTable. The type system enforces this — `new`
+        // returns `Err` so a caller CAN'T forget to check for errors.
         let content = "//host/:_authToken=${MISSING}\n";
         let npmrc = NpmrcConfig::parse(content, "test", &no_env);
         let err = RouteTable::new(RouteMode::Direct, npmrc)
@@ -557,12 +546,11 @@ mod tests {
         // advisory — they do NOT block construction. Only fatal
         // errors do.
         //
-        // Phase 58.3: per-origin cafile/certfile/keyfile no longer
-        // emit "not supported yet" warnings (they populate per-origin
-        // TLS state instead). Use a path-scoped auth-token line as the
-        // deterministic warning trigger — that warning is independent
-        // of TLS feature gating and stays warning-level (path-scoped
-        // auth keys parse as origin-only in v1).
+        // Per-origin cafile/certfile/keyfile populate per-origin TLS state
+        // rather than emitting warnings. Use a path-scoped auth-token line
+        // as the deterministic warning trigger here — that warning is
+        // independent of TLS feature gating (path-scoped auth keys parse
+        // as origin-only).
         let content = "//npm.internal/some/path/:_authToken=t\n";
         let npmrc = NpmrcConfig::parse(content, "test", &no_env);
         let table = RouteTable::new(RouteMode::Direct, npmrc).expect("warnings don't block");
@@ -570,7 +558,7 @@ mod tests {
         assert!(table.npmrc_warnings()[0].contains("path-scoped"));
     }
 
-    // ---- Phase 58.3 — effective_registry_origins (Δ1: request-aware) ----
+    // ---- effective_registry_origins (request-aware) ----
 
     fn make_table(npmrc_content: &str, mode: RouteMode) -> RouteTable {
         let npmrc = NpmrcConfig::parse(npmrc_content, "test", &no_env);
@@ -733,9 +721,9 @@ mod tests {
         assert_eq!(got[0].host_lower, "registry.npmjs.org");
     }
 
-    /// **GPT post-T4 MEDIUM finding contract:** the eager set must
-    /// reflect the actual top-level network request surface, not
-    /// just the dep map keys. The CLI is responsible for filtering
+    /// The eager set must reflect the actual top-level network request
+    /// surface, not just the dep map keys. The CLI is responsible for
+    /// filtering
     /// `deps` to network-routing entries (skipping `file:`, `link:`,
     /// `tarball:` URL, `git:`, `workspace:` specs) and for unwrapping
     /// `npm:<target>` aliases to their underlying target name BEFORE

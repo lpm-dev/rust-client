@@ -1,4 +1,4 @@
-//! Phase 32 Phase 2 — shared target resolution for `lpm install` and
+//! — shared target resolution for `lpm install` and
 //! `lpm uninstall`.
 //!
 //! Both commands need to answer the same question: **which `package.json`
@@ -17,7 +17,7 @@
 //!
 //! ## Per-target install root
 //!
-//! **Phase 2 audit correction (2026-04):** the install pipeline runs **once
+//! the install pipeline runs **once
 //! per target manifest, at that manifest's parent directory**. This was
 //! initially designed as "one install at the workspace root" but that was
 //! incorrect — LPM uses per-directory lockfiles and per-directory
@@ -90,7 +90,7 @@ pub fn install_root_for(manifest: &Path) -> &Path {
 /// **Empty filter result:** if `--filter` is supplied but the engine returns
 /// no matches, this function returns an `InstallTargets` with an empty
 /// `member_manifests` Vec. The caller decides how to surface that — typically
-/// via a `--fail-if-no-match` flag mirroring Phase 1.
+/// via a `--fail-if-no-match` flag mirroring.
 pub fn resolve_install_targets(
     cwd: &Path,
     filters: &[String],
@@ -128,7 +128,7 @@ pub fn resolve_install_targets(
             ));
         }
         // Standalone project: use cwd's package.json. This is the
-        // pre-Phase-2 behavior, unchanged.
+        // pre-existing behavior, unchanged.
         let manifest = cwd.join("package.json");
         return Ok(InstallTargets {
             member_manifests: vec![manifest],
@@ -428,7 +428,7 @@ mod tests {
     #[test]
     fn workspace_with_filter_no_match_returns_empty_targets_not_error() {
         // The "no match" path returns `Ok` with an empty Vec — caller decides
-        // whether to escalate via --fail-if-no-match. Mirrors Phase 1 D3.
+        // whether to escalate via --fail-if-no-match. Mirrors D3.
         let tmp = tempfile::tempdir().unwrap();
         write_workspace(tmp.path(), &[("foo", "packages/foo")]);
 
@@ -467,7 +467,7 @@ mod tests {
 
         assert_eq!(targets.member_manifests.len(), 1);
         assert!(targets.member_manifests[0].ends_with("packages/foo/package.json"));
-        // Phase 2 audit correction: install root is the MEMBER dir, not the
+        // audit correction: install root is the MEMBER dir, not the
         // workspace root. LPM uses per-directory lockfiles + node_modules,
         // so member-targeted installs must run their pipeline at the member.
         let expected = tmp.path().join("packages").join("foo");
@@ -583,12 +583,12 @@ mod tests {
         assert!(targets.member_manifests[0].ends_with("packages/bar/package.json"));
     }
 
-    // ── Phase 2 audit fix: per-target install root invariant ──────────────
+    // ── audit fix: per-target install root invariant ──────────────
 
     #[test]
     fn install_root_for_returns_manifest_parent_directory() {
         // The install root for any target manifest is its parent directory.
-        // This is the architectural correction from the Phase 2 audit:
+        // This is the architectural correction from the audit:
         // LPM uses per-directory lockfiles + node_modules, so the install
         // pipeline runs at the manifest's parent, not at some shared root.
         use std::path::PathBuf;
@@ -607,9 +607,9 @@ mod tests {
 
     #[test]
     fn workspace_filter_install_root_is_member_dir_not_workspace_root() {
-        // CRITICAL Phase 2 audit regression: when --filter targets a member,
+        // CRITICAL audit regression: when --filter targets a member,
         // the install root for that target is the member's dir, NOT the
-        // workspace root. The old (incorrect) Phase 2 implementation set
+        // workspace root. The old (incorrect) implementation set
         // install_root to workspace_root and tripped the empty-deps
         // early-return on workspaces with no root dependencies.
         let tmp = tempfile::tempdir().unwrap();

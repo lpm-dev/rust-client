@@ -641,7 +641,10 @@ async fn cli_doctor_json_flags_broken_global_state_with_machine_readable_checks(
         &lpm_home,
         Some(&server.uri()),
         &[("LPM_TOKEN", "test-token")],
-        &["--json", "doctor"],
+        // Globals diagnostics are Extended-tier; the default fast
+        // preset doesn't probe `~/.lpm/global/`. Pass `--all` so the
+        // crafted broken install root surfaces in the check set.
+        &["--json", "doctor", "--all"],
     );
     assert_eq!(
         status.code(),

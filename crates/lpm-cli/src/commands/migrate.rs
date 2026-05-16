@@ -11,10 +11,10 @@
 //! 8. Print summary
 
 use lpm_common::LpmError;
+use lpm_common::color::Painted;
 use lpm_lockfile::LOCKFILE_NAME;
 use lpm_migrate::backup::{self, MigrationBackup};
 use lpm_registry::RegistryClient;
-use owo_colors::OwoColorize;
 use std::path::Path;
 
 #[allow(clippy::too_many_arguments)]
@@ -118,7 +118,7 @@ pub async fn run(
         }
     }
 
-    // Phase 64 #34 / #35 — plan the `pnpm.overrides` and
+    // #34 / #35 — plan the `pnpm.overrides` and
     // `pnpm.patchedDependencies` translations BEFORE any file mutation
     // so parse errors / shape errors / containment violations / merge
     // conflicts / missing-integrity bindings surface up-front. Read
@@ -259,7 +259,7 @@ pub async fn run(
     let gitattributes_path = cwd.join(".gitattributes");
     migration_backup.backup_file(&gitattributes_path)?;
 
-    // Phase 64 #34 / #35 — back up package.json IFF EITHER plan is
+    // #34 / #35 — back up package.json IFF EITHER plan is
     // about to write to it. Skipping when there's nothing to apply
     // keeps the backup surface narrow and avoids littering the
     // project with stray `.backup` files for migrations that didn't
@@ -268,7 +268,7 @@ pub async fn run(
         migration_backup.backup_file(&pkg_json_path)?;
     }
 
-    // Phase 64 #35 — for each non-self-copy patch entry whose
+    // #35 — for each non-self-copy patch entry whose
     // destination ALREADY exists pre-migration (rare: user mid-manual-
     // port), back up the destination so a rollback restores its prior
     // content. Self-copy entries don't write to the destination, so
@@ -314,7 +314,7 @@ pub async fn run(
         eprintln!(" {}", "done".green());
     }
 
-    // Phase 64 #34 — apply the validated `pnpm.overrides` translation
+    // #34 — apply the validated `pnpm.overrides` translation
     // to `package.json > lpm.overrides`. The plan was already checked
     // for blocking errors before any disk mutation; reaching here means
     // every entry in `to_apply` is parsable and non-conflicting.
@@ -349,7 +349,7 @@ pub async fn run(
         }
     }
 
-    // Phase 64 #35 — apply the validated `pnpm.patchedDependencies`
+    // #35 — apply the validated `pnpm.patchedDependencies`
     // translation. Per-entry: copy the source patch file into LPM's
     // canonical `patches/<safe_key>.patch` location (skipped for
     // self-copy entries), then write the matching
@@ -399,7 +399,7 @@ pub async fn run(
         }
     }
 
-    // Phase 64 #33 — apply the validated `pnpm.peerDependencyRules`
+    // #33 — apply the validated `pnpm.peerDependencyRules`
     // translation to `lpm.peerDependencyRules`. Three sub-fields are
     // appended/merged independently. Same rollback contract: any
     // failure triggers `migration_backup.rollback()` which restores
@@ -457,19 +457,19 @@ pub async fn run(
             false, // not offline — need to download tarballs
             false, // force
             false, // allow_new
-            false, // strict_integrity (Phase 59.0 F5)
+            false, // strict_integrity
             None,  // linker_override
             true,  // no_skills — skip skill setup during migration
             true,  // no_editor_setup — skip editor setup during migration
             true,  // no_security_summary — migration already showed warnings
             false, // auto_build
             None,  // target_set: migrate is single-project
-            None,  // direct_versions_out: migrate does not finalize Phase 33 placeholders
+            None,  // direct_versions_out: migrate does not finalize placeholders
             None,  // script_policy_override: `lpm migrate` does not expose policy flags
             None,  // advisor_override: `lpm migrate` does not expose `--advisor`
             None,  // min_release_age_override: `lpm migrate` uses the chain
             crate::provenance_fetch::DriftIgnorePolicy::default(), // drift-ignore: `lpm migrate` enforces drift
-            // Phase 46.1 rework: `lpm migrate` does not surface its
+            // `lpm migrate` does not surface its
             // own sandbox-mode flags. The env / config / default
             // chain inside `rebuild::run` still applies.
             false, // strict_sandbox

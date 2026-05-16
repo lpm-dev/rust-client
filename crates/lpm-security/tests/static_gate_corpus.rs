@@ -1,5 +1,4 @@
-//! Phase 46 P2 Chunk 2 — integration-test harness for the static-gate
-//! fixture corpus.
+//! Integration-test harness for the static-gate fixture corpus.
 //!
 //! Reads `tests/fixtures/postinstall-scripts/expectations.json` and
 //! the sibling `scripts/<id>.txt` files, classifies each entry via
@@ -11,19 +10,17 @@
 //! 2. **Zero false-positive reds** — any entry whose expectation is
 //!    NOT `red` but whose classifier output IS `red` fails separately
 //!    (redundant with #1, but listed explicitly so the ship-criterion
-//!    invariant from §4.1 has its own named failure).
+//!    invariant has its own named failure).
 //!
 //! Prints per-run stats: total count, per-tier counts, and the
 //! green-rate (green / (green + amber)) over non-adversarial
 //! entries.
 //!
-//! **Chunk 6 hard gate (2026-04-21):** the corpus has grown past
-//! 250 entries and the `≥60%` green-rate threshold is now asserted
-//! — a regression below 60% hard-fails the test. The ship-criterion
-//! denominator is pinned in the plan doc §4.1 (`green / (green +
-//! amber)` over non-adversarial entries, reds excluded, AmberLlm
-//! collapses into amber). Keep these two numbers in lockstep: the
-//! plan is the contract, the harness enforces it.
+//! The corpus has grown past 250 entries and the `≥60%` green-rate
+//! threshold is now asserted — a regression below 60% hard-fails the
+//! test. The denominator is `green / (green + amber)` over
+//! non-adversarial entries (reds excluded, AmberLlm collapses into
+//! amber). Keep `MIN_GREEN_RATE_PERCENT` in lockstep with the corpus.
 //!
 //! The harness is deliberately minimal: one test, one read of
 //! fixtures, no retries. Fast (<100ms on a warm build) so it runs on
@@ -79,7 +76,7 @@ fn is_adversarial(id: &str) -> bool {
 /// every manifest entry has a `scripts/*.txt` file. Both directions
 /// must match; an orphan in either direction is a hard-fail.
 ///
-/// Added in Chunk 6 after an audit found the earlier harness only
+/// Added after an audit found the earlier harness only
 /// loaded the manifest (silently ignoring orphan script files) and
 /// only opened `scripts/<id>.txt` for manifest-listed ids (silently
 /// ignoring stale manifest entries whose script file was deleted).
@@ -133,15 +130,14 @@ fn assert_manifest_matches_filesystem(entries: &[CorpusEntry]) {
     }
 }
 
-/// Phase 46 P2 §18 ship contract — the locked fixture corpus must
-/// carry at least this many entries. Introduced in Chunk 6 to
-/// mechanically enforce what the plan doc has been claiming: that
-/// "the top-500 postinstall fixture corpus is locked." A regression
-/// below this floor (fixture accidentally deleted, manifest reset,
-/// etc.) MUST fail CI, not silently pass with smaller coverage.
+/// Minimum number of fixture corpus entries. Mechanically enforces
+/// the invariant that "the top-500 postinstall fixture corpus is
+/// locked." A regression below this floor (fixture accidentally
+/// deleted, manifest reset, etc.) MUST fail CI, not silently pass
+/// with smaller coverage.
 ///
 /// This floor grows with the corpus. Raising it is expected; lowering
-/// it without a plan-doc update is a ship-contract regression.
+/// it without updating `CORPUS_MIN_ENTRIES` is a regression.
 const CORPUS_MIN_ENTRIES: usize = 500;
 
 #[test]
@@ -151,9 +147,9 @@ fn corpus_matches_expectations_and_has_no_fp_reds() {
     // Ship contract floor. See `CORPUS_MIN_ENTRIES`.
     assert!(
         entries.len() >= CORPUS_MIN_ENTRIES,
-        "corpus shrank below the §18 ship contract: got {} entries, \
+        "corpus shrank below the minimum floor: got {} entries, \
          expected ≥{CORPUS_MIN_ENTRIES}. Either restore the missing \
-         fixtures or, if this is intentional, update the plan doc and \
+         fixtures or, if this is intentional, update \
          `CORPUS_MIN_ENTRIES` in lockstep.",
         entries.len(),
     );
@@ -217,8 +213,8 @@ fn corpus_matches_expectations_and_has_no_fp_reds() {
                 }
             }
             StaticTier::AmberLlm => {
-                // The P2 classifier is contracted to emit only
-                // Green | Amber | Red (AmberLlm is reserved for P8).
+                // The static classifier must emit only
+                // Green | Amber | Red (AmberLlm belongs to the LLM layer).
                 // Any AmberLlm here is a classifier-contract bug,
                 // not a corpus issue.
                 amber_llm_unexpected += 1;
@@ -234,11 +230,9 @@ fn corpus_matches_expectations_and_has_no_fp_reds() {
         0
     };
 
-    /// Phase 46 P2 §4.1 ship criterion — green-rate floor over the
-    /// non-adversarial subset. Flipped from printed telemetry to a
-    /// hard assertion in Chunk 6 once the corpus grew past 250
-    /// entries and real-world distribution stabilized above the
-    /// plan's 60% target.
+    /// Green-rate floor over the non-adversarial subset. Flipped from
+    /// printed telemetry to a hard assertion once the corpus grew past
+    /// 250 entries and real-world distribution stabilized above 60%.
     const MIN_GREEN_RATE_PERCENT: usize = 60;
 
     // Stats block — printed on every run (pass or fail) so tuning
@@ -248,22 +242,22 @@ fn corpus_matches_expectations_and_has_no_fp_reds() {
     eprintln!("  green : {green:>3}   amber : {amber:>3}   red : {red:>3}");
     eprintln!(
         "  green-rate (real-corpus subset, excl. adversarial): \
-         {green_rate_real}%  (hard-gated ≥{MIN_GREEN_RATE_PERCENT}% per §4.1)"
+         {green_rate_real}%  (hard-gated ≥{MIN_GREEN_RATE_PERCENT}%)"
     );
     eprintln!("────────────────────────────────────────");
 
     assert_eq!(
         amber_llm_unexpected, 0,
         "classifier emitted AmberLlm for {amber_llm_unexpected} \
-         entries — static classifier is contracted to emit only \
-         Green | Amber | Red (AmberLlm is owned by P8)",
+         entries — static classifier must emit only \
+         Green | Amber | Red (AmberLlm belongs to the LLM layer)",
     );
 
     if !fp_reds.is_empty() {
         panic!(
             "FALSE-POSITIVE REDS — classifier flagged {} entry(ies) as \
-             red that were NOT expected-red. Ship criterion from §4.1 \
-             is zero FP reds.\n  {}",
+             red that were NOT expected-red. Ship criterion: \
+             zero FP reds.\n  {}",
             fp_reds.len(),
             fp_reds.join("\n  "),
         );
@@ -282,13 +276,12 @@ fn corpus_matches_expectations_and_has_no_fp_reds() {
         );
     }
 
-    // Hard gate — flipped from telemetry to assertion in Chunk 6.
-    // Regressions below 60% must surface before they reach CI.
+    // Hard gate — regressions below 60% must surface before reaching CI.
     assert!(
         green_rate_real >= MIN_GREEN_RATE_PERCENT,
-        "green-rate {green_rate_real}% fell below the §4.1 ship criterion of \
+        "green-rate {green_rate_real}% fell below the ship criterion of \
          ≥{MIN_GREEN_RATE_PERCENT}% over the non-adversarial subset \
          ({green_real} green / {amber_real} amber). Do not chase this threshold \
-         by weakening red rules — see plan §4.1 tuning order.",
+         by weakening red rules — widen green rules instead.",
     );
 }

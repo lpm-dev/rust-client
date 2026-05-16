@@ -1,13 +1,10 @@
-//! `SessionManager` — Phase 35 lazy auth orchestrator.
+//! `SessionManager` — lazy auth orchestrator.
 //!
 //! `SessionManager` is constructed once at CLI startup with **no
 //! network calls** (only local keychain / encrypted file reads). It
 //! classifies the effective token by source and refreshes lazily, only
 //! when an auth-required operation actually needs it, and only for
 //! refresh-backed stored sessions.
-//!
-//! See `DOCS/new-features/37-rust-client-RUNNER-VISION-phase35-claude.md`
-//! for the full design.
 
 use lpm_common::LpmError;
 use secrecy::{ExposeSecret, SecretString};
@@ -36,9 +33,9 @@ pub enum TokenSource {
     /// Loaded from local storage with a refresh token alongside it.
     /// This is the only source eligible for silent refresh.
     StoredSession,
-    /// Loaded from local storage without a refresh token (pre-Phase-35
-    /// login, or a session whose refresh token was cleared). Cannot be
-    /// silently refreshed.
+    /// Loaded from local storage without a refresh token (older login, or
+    /// a session whose refresh token was cleared). Cannot be silently
+    /// refreshed.
     StoredLegacy,
     /// Issued by a CI / OIDC token exchange. Never refreshed.
     CiToken,
@@ -107,7 +104,7 @@ pub struct SessionManager {
     /// Effective token + its source. `RwLock` so concurrent readers
     /// don't block on the (rare) refresh path.
     cached: RwLock<Option<CachedToken>>,
-    /// Phase 45 P2 — `true` once the keychain has been consulted (or
+    /// `true` once the keychain has been consulted (or
     /// skipped because env/flag already produced a token). Until this
     /// flips, reads that depend on the full classification must call
     /// [`Self::ensure_classified`] first. The full classification
@@ -158,12 +155,12 @@ impl SessionManager {
     /// be classified correctly.
     pub fn new(registry_url: impl Into<String>, explicit_flag_token: Option<String>) -> Self {
         let registry_url = registry_url.into();
-        // Phase 45 P2 — eager classification is limited to env/flag.
-        // Keychain reads are deferred to `ensure_classified`, called on
-        // the first method that actually needs the cached value. On
-        // macOS the keychain IPC costs ~50 ms; skipping it on commands
-        // that never touch the network (warm `lpm install` from cache,
-        // offline lookups, read-only queries) is pure win.
+        // Eager classification is limited to env/flag. Keychain reads are
+        // deferred to `ensure_classified`, called on the first method that
+        // actually needs the cached value. On macOS the keychain IPC costs
+        // ~50 ms; skipping it on commands that never touch the network
+        // (warm `lpm install` from cache, offline lookups, read-only
+        // queries) is pure win.
         let eager = classify_eager_sources(explicit_flag_token);
         let classified = AtomicBool::new(eager.is_some());
         Self {
@@ -177,14 +174,13 @@ impl SessionManager {
         }
     }
 
-    /// Phase 45 P2 — resolve the keychain portion of the classification
-    /// if it hasn't run yet. Idempotent; all but the first call are
-    /// atomic-load-only. Safe to call from either blocking or async
-    /// contexts: the keychain IPC itself is synchronous blocking on
-    /// macOS (subprocess to `/usr/bin/security` in the fallback path)
-    /// which is the cost we're amortizing away from startup — running
-    /// it here instead of at `new()` ensures it fires at most once, and
-    /// only when a read actually depends on the answer.
+    /// Resolve the keychain portion of the classification if it hasn't run
+    /// yet. Idempotent; all but the first call are atomic-load-only. Safe to
+    /// call from either blocking or async contexts: the keychain IPC itself is
+    /// synchronous blocking on macOS (subprocess to `/usr/bin/security` in
+    /// the fallback path) which is the cost we're amortizing away from
+    /// startup — running it here instead of at `new()` ensures it fires at
+    /// most once, and only when a read actually depends on the answer.
     fn ensure_classified(&self) {
         if self.classified.load(Ordering::Acquire) {
             return;
@@ -212,9 +208,9 @@ impl SessionManager {
     /// Useful for diagnostics and dispatch logic that needs to know
     /// e.g. whether to allow `tunnel start`.
     ///
-    /// Phase 45 P2 — triggers lazy keychain classification on first
-    /// call. Callers that specifically want "cached-only, no work"
-    /// semantics should use [`Self::current_source_peek`].
+    /// Triggers lazy keychain classification on first call. Callers that
+    /// specifically want "cached-only, no work" semantics should use
+    /// [`Self::current_source_peek`].
     pub fn current_source(&self) -> Option<TokenSource> {
         self.ensure_classified();
         self.cached
@@ -223,10 +219,10 @@ impl SessionManager {
             .and_then(|g| g.as_ref().map(|c| c.source))
     }
 
-    /// Phase 45 P2 — cached-only variant of [`Self::current_source`].
-    /// Returns whatever the eager classification produced without
-    /// triggering the keychain IPC. Suitable for diagnostics or
-    /// fast-lane checks where "not yet known" is an acceptable answer.
+    /// Cached-only variant of [`Self::current_source`]. Returns whatever
+    /// the eager classification produced without triggering the keychain
+    /// IPC. Suitable for diagnostics or fast-lane checks where "not yet
+    /// known" is an acceptable answer.
     pub fn current_source_peek(&self) -> Option<TokenSource> {
         self.cached
             .read()
@@ -258,29 +254,17 @@ impl SessionManager {
     ) -> Result<String, LpmError> {
         // Fast path: cache hit + token still locally believed valid.
         //
-        // GPT audit fix #1 (post-Step-5): pre-fix this path returned
-        // any non-empty cached bearer immediately, including ones
-        // we already knew were expired from local metadata. Command
-        // sites that build their own HTTP client (env sync, swift
-        // registry, tunnel handshake) do not get
+        // If the source is refresh-eligible AND the local expiry metadata
+        // says the token is already past its TTL, fall through to the
+        // refresh path before returning — callers that build their own HTTP
+        // client (env sync, swift registry, tunnel handshake) do not get
         // `RegistryClient::execute_with_recovery`'s 401-retry, so a
-        // known-stale bearer would surface as a hard auth failure
-        // on the first call — exactly the regression Phase 35 was
-        // supposed to avoid for stored sessions.
+        // known-stale bearer would surface as a hard auth failure.
         //
-        // Now: if the source is refresh-eligible AND
-        // `is_session_access_token_expired` reports the local expiry
-        // metadata says the token is already past its TTL, fall
-        // through to the refresh path before returning.
-        //
-        // No-metadata case stays optimistic — the metadata is only
-        // populated after a refresh, so a fresh login has no expiry
-        // record and we trust the cache. The first 401 in that path
-        // is handled by `execute_with_recovery` for `RegistryClient`
-        // callers, and will surface as `AuthRequired` for the
-        // self-built HTTP clients (which Phase 35 accepts as the
-        // tail-case cost — the first stale-token call after the
-        // expiry metadata gets recorded does the right thing).
+        // No-metadata case stays optimistic — the metadata is only populated
+        // after a refresh, so a fresh login has no expiry record and we trust
+        // the cache. The first 401 in that path is handled by
+        // `execute_with_recovery` for `RegistryClient` callers.
         if let Ok(Some(secret)) = self.token_for(requirement).await {
             let needs_proactive_refresh = self
                 .current_source()
@@ -319,13 +303,12 @@ impl SessionManager {
     /// `AuthPosture`-aware request methods, at which point this method
     /// is removed.
     ///
-    /// Phase 45 P2 — cached-only semantics: NEVER triggers keychain
-    /// classification. When the eager path finds an env/flag token,
-    /// this returns it; when it doesn't, this returns `None` and the
-    /// caller leaves the legacy `with_token` bridge empty. The
-    /// session-aware request path
-    /// ([`Self::current_bearer_lazy`]) is the one that actually
-    /// resolves the keychain at request time.
+    /// Cached-only semantics: NEVER triggers keychain classification. When
+    /// the eager path finds an env/flag token, this returns it; when it
+    /// doesn't, this returns `None` and the caller leaves the legacy
+    /// `with_token` bridge empty. The session-aware request path
+    /// ([`Self::current_bearer_lazy`]) is the one that actually resolves
+    /// the keychain at request time.
     pub fn current_bearer_for_bridge(&self) -> Option<String> {
         self.cached
             .read()
@@ -334,12 +317,11 @@ impl SessionManager {
             .filter(|s| !s.is_empty())
     }
 
-    /// Phase 45 P2 — resolve the bearer at actual request time,
-    /// triggering the keychain IPC on first call if necessary.
-    ///
-    /// Used by `RegistryClient::current_bearer` to get the live
-    /// bearer without paying keychain cost at startup. Returns `None`
-    /// if no token source is available (env, flag, or keychain).
+    /// Resolve the bearer at actual request time, triggering the keychain
+    /// IPC on first call if necessary. Used by
+    /// `RegistryClient::current_bearer` to get the live bearer without
+    /// paying keychain cost at startup. Returns `None` if no token source
+    /// is available (env, flag, or keychain).
     pub fn current_bearer_lazy(&self) -> Option<String> {
         self.ensure_classified();
         self.cached
@@ -351,9 +333,9 @@ impl SessionManager {
 
     /// Whether a non-empty token is currently cached.
     ///
-    /// Phase 45 P2 — triggers lazy keychain classification. Callers
-    /// that need the "is it available right now, without touching
-    /// the keychain" answer should use [`Self::has_token_peek`].
+    /// Triggers lazy keychain classification. Callers that need the "is it
+    /// available right now, without touching the keychain" answer should use
+    /// [`Self::has_token_peek`].
     pub fn has_token(&self) -> bool {
         self.ensure_classified();
         self.cached
@@ -363,9 +345,9 @@ impl SessionManager {
             .unwrap_or(false)
     }
 
-    /// Phase 45 P2 — cached-only variant of [`Self::has_token`].
-    /// Returns whether a non-empty token is in the cache *right now*
-    /// without triggering keychain classification.
+    /// Cached-only variant of [`Self::has_token`]. Returns whether a
+    /// non-empty token is in the cache *right now* without triggering
+    /// keychain classification.
     pub fn has_token_peek(&self) -> bool {
         self.cached
             .read()
@@ -384,10 +366,10 @@ impl SessionManager {
         &self,
         requirement: AuthRequirement,
     ) -> Result<Option<SecretString>, LpmError> {
-        // Phase 45 P2 — token_for is the canonical "I need a bearer
-        // to make a request" entry point, so this is where deferred
-        // keychain classification fires. First call pays the macOS
-        // Keychain IPC; subsequent calls are cache hits.
+        // `token_for` is the canonical "I need a bearer to make a request"
+        // entry point, so this is where deferred keychain classification
+        // fires. First call pays the macOS Keychain IPC; subsequent calls
+        // are cache hits.
         self.ensure_classified();
         let cached = self.cached.read().ok().and_then(|g| g.clone());
 
@@ -498,8 +480,6 @@ impl SessionManager {
 
         if !resp.status().is_success() {
             tracing::debug!("silent refresh failed: {}", resp.status());
-            // Phase 35 audit fix #2.
-            //
             // 401 = refresh token authoritatively rejected
             // (revoked / replay-killed / 90-day inactivity cleanup).
             // We must wipe ALL local session state — access token,
@@ -508,9 +488,8 @@ impl SessionManager {
             // and every subsequent command keeps replaying it,
             // each one re-entering this same failure loop.
             //
-            // Pre-fix the code only cleared the refresh token, so a
-            // user with a revoked session would keep sending the
-            // dead bearer until manual `lpm logout`.
+            // Without this wipe, a user with a revoked session would keep
+            // sending the dead bearer until manual `lpm logout`.
             //
             // 5xx and network errors are transient — keep state
             // intact so the next attempt can recover.
@@ -541,10 +520,10 @@ impl SessionManager {
     }
 }
 
-/// Phase 45 P2 — eager classification: env var + explicit `--token`
-/// flag only. These sources are free (memory reads), so there's no
-/// reason to defer them. Keychain reads live in
-/// [`classify_keychain_sources`] behind the lazy gate.
+/// Eager classification: env var + explicit `--token` flag only. These
+/// sources are free (memory reads), so there's no reason to defer them.
+/// Keychain reads live in [`classify_keychain_sources`] behind the lazy
+/// gate.
 ///
 /// Returns `Some(...)` iff one of the eager sources is populated.
 fn classify_eager_sources(explicit_flag_token: Option<String>) -> Option<CachedToken> {
@@ -572,8 +551,8 @@ fn classify_eager_sources(explicit_flag_token: Option<String>) -> Option<CachedT
     None
 }
 
-/// Phase 45 P2 — deferred keychain classification. Runs at most once
-/// per `SessionManager`, gated by `classified` + `classify_lock` in
+/// Deferred keychain classification. Runs at most once per
+/// `SessionManager`, gated by `classified` + `classify_lock` in
 /// `ensure_classified`. Performs the macOS Keychain IPC (or its
 /// equivalent on Linux / Windows) which is the ~50 ms per-command
 /// tax we're amortizing away from startup.
@@ -596,19 +575,13 @@ fn classify_keychain_sources(registry_url: &str) -> Option<CachedToken> {
         });
     }
 
-    // Phase 35 audit fix #1: refresh-token-only recovery.
+    // Refresh-token-only recovery: if the access token was wiped (keychain
+    // reset, store corruption, manual edit) but the refresh token survives,
+    // seed an empty `StoredSession` placeholder so `refresh_now` can
+    // recover on the next auth-required request. Without this, a user in
+    // that state gets a hard `SessionExpired` instead of a silent exchange.
     //
-    // Pre-Phase-35, `main.rs` had an explicit branch that called
-    // `try_silent_refresh` when the access token was missing but a
-    // refresh token was present, so a still-valid stored session
-    // could self-heal. Without this branch, a user whose access
-    // token was wiped (keychain reset, store corruption, manual
-    // edit) but whose refresh token survives would be unable to
-    // recover — `current_source()` would be `None` and `refresh_now`
-    // would short-circuit to `SessionExpired`.
-    //
-    // Restore that path lazily: if there's a refresh token, seed the
-    // cache with an *empty* `StoredSession` placeholder. The first
+    // Seed the cache with an *empty* `StoredSession` placeholder. The first
     // auth-required request hits 401 (no bearer attached because
     // `current_bearer` filters empty), `execute_with_recovery` sees
     // an `IfRefreshable` source and calls `refresh_now`, which reads
@@ -710,8 +683,8 @@ mod tests {
     /// that don't want to touch the keychain or env. Bypasses
     /// `classify_initial_token` so each test can pick its source.
     fn manager_with(source: TokenSource, token: &str) -> SessionManager {
-        // Phase 45 P2 — tests set classified=true so ensure_classified
-        // short-circuits and the pre-seeded `cached` value stands.
+        // Set classified=true so ensure_classified short-circuits and the
+        // pre-seeded `cached` value stands.
         SessionManager {
             registry_url: "https://example.invalid".into(),
             cached: RwLock::new(Some(CachedToken {
@@ -867,21 +840,20 @@ mod tests {
         assert!(!manager_empty().has_token());
     }
 
-    /// Phase 45 P2 — lazy keychain classification.
+    /// Lazy keychain classification helper.
     ///
     /// When `SessionManager::new` is called with no explicit token and
     /// no `LPM_TOKEN` env var, the eager path returns `None` and the
     /// classification bit stays `false`. `current_bearer_for_bridge`
-    /// (the startup-only peek) must NOT trigger keychain
-    /// classification; callers that need the answer for an actual
-    /// request (e.g. `current_bearer_lazy`, `has_token`, `token_for`)
-    /// must.
+    /// (the startup-only peek) must NOT trigger keychain classification;
+    /// callers that need the answer for an actual request (e.g.
+    /// `current_bearer_lazy`, `has_token`, `token_for`) must.
+    ///
     /// Build a scoped env that makes the keychain path a safe no-op:
     /// LPM_FORCE_FILE_AUTH=1 causes `get_token` / `get_refresh_token`
     /// to skip the keychain, and an isolated HOME keeps file-auth
-    /// writes off the host. Mirrors `refresh_http_tests::isolate_test_env`
-    /// but lives in this module for use by the Phase 45 P2 tests.
-    fn phase45_isolate() -> (tempfile::TempDir, crate::test_env::ScopedEnv) {
+    /// writes off the host.
+    fn token_classify_isolate() -> (tempfile::TempDir, crate::test_env::ScopedEnv) {
         let tempdir = tempfile::tempdir().expect("create test home tempdir");
         let scoped = crate::test_env::ScopedEnv::set([
             ("HOME", tempdir.path().as_os_str().to_owned()),
@@ -892,8 +864,8 @@ mod tests {
     }
 
     #[test]
-    fn phase45_p2_bridge_peek_does_not_classify() {
-        let _env = phase45_isolate();
+    fn bridge_peek_does_not_classify() {
+        let _env = token_classify_isolate();
         let mgr = SessionManager::new("https://example.invalid", None);
         // Sanity: isolated env means no tokens anywhere, so the eager
         // classification returned None.
@@ -909,8 +881,8 @@ mod tests {
     }
 
     #[test]
-    fn phase45_p2_lazy_bearer_triggers_classification() {
-        let _env = phase45_isolate();
+    fn lazy_bearer_triggers_classification() {
+        let _env = token_classify_isolate();
         let mgr = SessionManager::new("https://example.invalid", None);
         assert!(!mgr.classified.load(Ordering::Acquire));
         // Calling the lazy variant must run ensure_classified once.
@@ -925,7 +897,7 @@ mod tests {
     }
 
     #[test]
-    fn phase45_p2_eager_env_token_classifies_immediately() {
+    fn eager_env_token_classifies_immediately() {
         // When LPM_TOKEN is set, eager classification should succeed
         // and `classified` should start as `true` — the keychain never
         // needs to be consulted.
@@ -944,8 +916,8 @@ mod tests {
     }
 
     #[test]
-    fn phase45_p2_explicit_flag_bypasses_keychain() {
-        let _env = phase45_isolate();
+    fn explicit_flag_bypasses_keychain() {
+        let _env = token_classify_isolate();
         let mgr = SessionManager::new(
             "https://example.invalid",
             Some("flag-token-value".to_string()),
@@ -962,8 +934,6 @@ mod tests {
         );
     }
 
-    /// Phase 35 audit fix #1: refresh-only-state recovery.
-    ///
     /// When the access token is missing but the refresh token is
     /// still present, the manager must classify as `StoredSession`
     /// with an empty placeholder secret so `current_source()`
@@ -1007,13 +977,7 @@ mod refresh_http_tests {
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
-    /// **GPT audit fix #4 (post-Step-5).** Per-test isolation guard.
-    ///
-    /// Pre-fix, `manager_for` wrote refresh tokens directly to the
-    /// real OS keychain, which (a) prompted the user for keychain
-    /// access on macOS during `cargo test`, (b) cross-contaminated
-    /// state between parallel test runs, and (c) made the suite fail
-    /// without `--test-threads=1`. Now each test gets:
+    /// Per-test isolation guard. Each test gets:
     ///
     /// - A unique `HOME` pointing at a fresh tempdir, so the
     ///   encrypted-file fallback path lands in its own directory.
@@ -1055,10 +1019,10 @@ mod refresh_http_tests {
     fn manager_for(server_url: &str) -> SessionManager {
         crate::set_refresh_token(server_url, "rt-original");
 
-        // Phase 45 P2 — classified=true so the pre-seeded `cached`
-        // StoredSession value is authoritative without triggering
-        // `classify_keychain_sources` (which would overwrite from
-        // the keychain the test doesn't want to touch).
+        // classified=true so the pre-seeded `cached` StoredSession value is
+        // authoritative without triggering `classify_keychain_sources`
+        // (which would overwrite from the keychain the test doesn't want
+        // to touch).
         SessionManager {
             registry_url: server_url.to_string(),
             cached: RwLock::new(Some(CachedToken {
@@ -1095,11 +1059,10 @@ mod refresh_http_tests {
         assert_eq!(cached.unwrap().expose_secret(), "at-rotated");
     }
 
-    /// Phase 35 audit fix #2: a 401 from `/api/cli/refresh` must wipe
-    /// **both** the refresh token AND the cached access token, so
-    /// subsequent commands don't keep replaying a dead bearer.
-    /// Pre-fix the access token survived, causing a permanent
-    /// auth-loop until the user ran `lpm logout` manually.
+    /// A 401 from `/api/cli/refresh` must wipe **both** the refresh token
+    /// AND the cached access token, so subsequent commands don't keep
+    /// replaying a dead bearer (which causes a permanent auth-loop until
+    /// the user runs `lpm logout` manually).
     #[tokio::test]
     async fn refresh_401_clears_refresh_token_and_returns_session_expired() {
         let server = MockServer::start().await;
@@ -1197,17 +1160,14 @@ mod refresh_http_tests {
         // Mock's `.expect(1)` is verified on drop of `server`.
     }
 
-    /// **GPT audit fix #1 (post-Step-5).** When the cached access
-    /// token is non-empty but the local expiry metadata says it's
-    /// past its TTL, `bearer_string_for` must do the silent refresh
-    /// rather than return a known-stale bearer.
+    /// When the cached access token is non-empty but the local expiry
+    /// metadata says it's past its TTL, `bearer_string_for` must do the
+    /// silent refresh rather than return a known-stale bearer.
     ///
-    /// This is the critical regression path for env / swift-registry /
-    /// setup callers that build their own HTTP client and so don't
-    /// get `RegistryClient::execute_with_recovery` for free. Pre-fix,
-    /// they would have surfaced "auth required" on the first call
-    /// after the access token expired locally — exactly the
-    /// re-login friction Phase 35 was designed to eliminate.
+    /// Critical for env / swift-registry / setup callers that build their
+    /// own HTTP client and don't get `RegistryClient::execute_with_recovery`
+    /// for free — they would surface "auth required" on the first call
+    /// after the access token expired locally.
     #[tokio::test]
     async fn bearer_string_for_proactively_refreshes_when_local_metadata_says_expired() {
         let server = MockServer::start().await;
@@ -1239,9 +1199,9 @@ mod refresh_http_tests {
         // Mock's `.expect(1)` verifies the refresh happened.
     }
 
-    /// Counterpart: when no expiry metadata is recorded (fresh login,
-    /// pre-Phase-35 install), the cached bearer is trusted — we
-    /// don't refresh proactively without evidence.
+    /// Counterpart: when no expiry metadata is recorded (fresh login, no
+    /// expiry record yet), the cached bearer is trusted — we don't refresh
+    /// proactively without evidence.
     #[tokio::test]
     async fn bearer_string_for_does_not_refresh_when_no_expiry_metadata() {
         let server = MockServer::start().await;

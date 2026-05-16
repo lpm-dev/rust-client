@@ -129,7 +129,7 @@ async fn doctor_json_envelope_has_required_fields() {
     // any network — doctor's infrastructure checks will Fail-Fast and
     // the rest of the run still produces a fully-shaped JSON object.
     let output = lpm_with_registry(&project, "http://127.0.0.1:1")
-        .args(["doctor", "--json"])
+        .args(["doctor", "--all", "--json"])
         .output()
         .expect("failed to run lpm doctor --json");
 
@@ -164,7 +164,7 @@ async fn doctor_json_envelope_has_required_fields() {
 async fn doctor_json_each_check_has_stable_code_and_known_severity() {
     let project = TempProject::empty(r#"{"name": "test", "version": "1.0.0"}"#);
     let output = lpm_with_registry(&project, "http://127.0.0.1:1")
-        .args(["doctor", "--json"])
+        .args(["doctor", "--all", "--json"])
         .output()
         .expect("failed to run lpm doctor --json");
 
@@ -253,7 +253,7 @@ async fn doctor_json_surfaces_manifest_compat_issues_with_stable_codes() {
     );
 
     let output = lpm_with_registry(&project, "http://127.0.0.1:1")
-        .args(["doctor", "--json"])
+        .args(["doctor", "--all", "--json"])
         .output()
         .expect("failed to run lpm doctor --json");
 
@@ -310,7 +310,7 @@ async fn doctor_json_surfaces_manifest_compat_issues_with_stable_codes() {
 async fn doctor_json_pins_well_known_codes() {
     let project = TempProject::empty(r#"{"name": "test", "version": "1.0.0"}"#);
     let output = lpm_with_registry(&project, "http://127.0.0.1:1")
-        .args(["doctor", "--json"])
+        .args(["doctor", "--all", "--json"])
         .output()
         .expect("failed to run lpm doctor --json");
 

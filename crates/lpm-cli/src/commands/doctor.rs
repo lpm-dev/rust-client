@@ -1,9 +1,9 @@
 use crate::doctor_catalog::{self, CheckEntry, Severity};
 use crate::{auth, output};
 use lpm_common::LpmError;
+use lpm_common::color::Painted;
 use lpm_registry::RegistryClient;
 use lpm_store::PackageStore;
-use owo_colors::OwoColorize;
 use std::path::Path;
 use std::process::{Command, Stdio};
 use std::time::Duration;
@@ -150,6 +150,7 @@ pub fn list(
                     "code": r.code,
                     "check": r.name,
                     "category": r.category.as_str(),
+                    "tier": r.tier.as_str(),
                     "description": r.description,
                     "when_fires": r.when_fires,
                     "remediation": r.remediation,
@@ -191,9 +192,10 @@ pub fn list(
         }
         let severities = row.possible_severities.join(", ");
         println!(
-            "    {}  {}",
+            "    {}  {}  {}",
             row.code.bold(),
-            format!("[{severities}]").dimmed()
+            format!("[{severities}]").dimmed(),
+            format!("(tier: {})", row.tier).dimmed(),
         );
         println!("      {}: {}", "name".dimmed(), row.name);
         println!("      {}", row.description);
@@ -208,12 +210,34 @@ pub fn list(
     Ok(())
 }
 
-/// Enhanced health check: verify auth, registry, store, project state, runtime, tools, lpm.json.
+/// Health check pipeline.
+///
+/// Two execution tiers (orthogonal to category — see
+/// [`crate::doctor_catalog::Tier`]):
+///
+/// - **Fast (default `lpm doctor`):** local-only "why is this project
+///   broken right now?" pass. Zero network calls. Zero subprocess
+///   spawns except `node --version` (2s-bounded) for runtime detection.
+///   Covers global store accessibility, `package.json`, linker mode,
+///   `node_modules` layout, lockfile health, deps sync, local
+///   `file:` / `link:` source paths, `lpm.json` validity, Node
+///   runtime readiness, and workspace cycle detection.
+///
+/// - **Full sweep (`lpm doctor --all`):** every catalog row. Adds
+///   registry probe + `whoami`, tunnel ownership lookup, lint / fmt
+///   subprocesses, TypeScript reachability, plugin update fetch,
+///   global-install hygiene (manifest, PATH, shims, install roots),
+///   sandbox probe, full manifest-compat sweep, and project-hygiene
+///   rows (`.gitattributes` lockb marker, v2-store orphan stats).
+///
+/// `--fix` operates on whichever set actually emitted — fast-mode
+/// `--fix` cannot repair rows it didn't check.
 pub async fn run(
     client: &RegistryClient,
     registry_url: &str,
     project_dir: &Path,
     json_output: bool,
+    all: bool,
     fix: bool,
     _yes: bool,
 ) -> Result<(), LpmError> {
@@ -224,44 +248,53 @@ pub async fn run(
     let mut checks: Vec<Check> = Vec::new();
     let mut fixes_applied: Vec<String> = Vec::new();
 
-    // === Infrastructure (parallelized network calls) ===
+    // Shared between the registry/auth probe (Extended) and the
+    // tunnel block (Extended). Stays `false` on the fast path since
+    // both consumers are gated behind `if all`.
+    let mut token_exists = false;
 
-    let token_exists = auth::get_token(registry_url).is_some();
-    let (registry_result, auth_result) = tokio::join!(client.health_check(), async {
-        if token_exists {
-            client.whoami().await.is_ok()
+    // === Infrastructure: registry + auth (Extended) ===
+    //
+    // Both probes touch the network. Skipped on the fast path —
+    // default `lpm doctor` is local-only.
+    if all {
+        token_exists = auth::get_token(registry_url).is_some();
+        let (registry_result, auth_result) = tokio::join!(client.health_check(), async {
+            if token_exists {
+                client.whoami().await.is_ok()
+            } else {
+                false
+            }
+        });
+
+        // 1. Registry reachable?
+        let registry_ok = registry_result.unwrap_or(false);
+        if registry_ok {
+            checks.push(Check::pass(
+                &doctor_catalog::REGISTRY_REACHABLE,
+                registry_url,
+            ));
         } else {
-            false
+            checks.push(Check::fail(
+                &doctor_catalog::REGISTRY_UNREACHABLE,
+                &format!("{registry_url} — unreachable. Check your network or try again later"),
+            ));
         }
-    });
 
-    // 1. Registry reachable?
-    let registry_ok = registry_result.unwrap_or(false);
-    if registry_ok {
-        checks.push(Check::pass(
-            &doctor_catalog::REGISTRY_REACHABLE,
-            registry_url,
-        ));
-    } else {
-        checks.push(Check::fail(
-            &doctor_catalog::REGISTRY_UNREACHABLE,
-            &format!("{registry_url} — unreachable. Check your network or try again later"),
-        ));
-    }
-
-    // 2. Auth token valid?
-    if auth_result {
-        checks.push(Check::pass(&doctor_catalog::AUTH_VALID, "valid token"));
-    } else if token_exists {
-        checks.push(Check::fail(
-            &doctor_catalog::AUTH_INVALID,
-            "token exists but invalid — run: lpm login",
-        ));
-    } else {
-        checks.push(Check::fail(
-            &doctor_catalog::AUTH_MISSING,
-            "no token — run: lpm login",
-        ));
+        // 2. Auth token valid?
+        if auth_result {
+            checks.push(Check::pass(&doctor_catalog::AUTH_VALID, "valid token"));
+        } else if token_exists {
+            checks.push(Check::fail(
+                &doctor_catalog::AUTH_INVALID,
+                "token exists but invalid — run: lpm login",
+            ));
+        } else {
+            checks.push(Check::fail(
+                &doctor_catalog::AUTH_MISSING,
+                "no token — run: lpm login",
+            ));
+        }
     }
 
     // 3. Global store accessible?
@@ -326,7 +359,7 @@ pub async fn run(
 
     // 5. node_modules intact?
     //
-    // Phase 61.4 + hoisted-symmetry: predicate is layout-aware via
+    // + hoisted-symmetry: predicate is layout-aware via
     // `LayoutPaths::install_appears_healthy()`. The variant in the
     // message tells the user which linker mode produced their tree
     // (isolated under `<project>/.lpm/wrappers/`, hoisted under
@@ -341,7 +374,7 @@ pub async fn run(
     // covers both legacy layouts; we surface this as a warn so it
     // doesn't read as healthy.
     let layout = lpm_linker::LayoutPaths::for_project(project_dir);
-    // Phase 66 §4 — pass the v2 links root so the health probe can
+    // — pass the v2 links root so the health probe can
     // recognize a virtual-store install (no `.lpm/wrappers/` and no
     // `.lpm/hoisted/metadata.json`, but project-side `node_modules/`
     // symlinks pointing into `~/.lpm/store/v2/links/`). On a system
@@ -401,12 +434,14 @@ pub async fn run(
         }
     }
 
-    // Phase 66 Phase 4e — v2 store orphan stats (preplan §4.5).
-    // Cheap: walks `~/.lpm/store/v2/links/<*>/.lpm-link-meta.json`
-    // sidecars + the registered-projects set, surfaces a count of
-    // orphans not reachable from any project. Pass when zero;
-    // warn-with-remediation when non-zero.
-    if let Ok(lpm_root) = lpm_common::LpmRoot::from_env() {
+    // === V2 store orphan stats (Extended) ===
+    //
+    // (preplan). Cheap but cross-project
+    // hygiene rather than core breakage — only surface under `--all`.
+    // Walks `~/.lpm/store/v2/links/<*>/.lpm-link-meta.json` sidecars
+    // + the registered-projects set, surfaces a count of orphans not
+    // reachable from any project.
+    if all && let Ok(lpm_root) = lpm_common::LpmRoot::from_env() {
         let v2_store = lpm_store::v2::Store::from_lpm_root(&lpm_root);
         let plan = crate::commands::cache_prune::compute_prune_plan(
             &lpm_root,
@@ -434,12 +469,15 @@ pub async fn run(
         }
     }
 
-    // 6. Lockfile?
+    // 6. Lockfile? (Fast — load-bearing for install)
     let lockfile = project_dir.join("lpm.lock");
     checks.extend(check_lockfile_state(project_dir));
 
-    // 6b. .gitattributes check
-    checks.extend(check_gitattributes_state(project_dir));
+    // 6b. .gitattributes hygiene (Extended) — git-side correctness for
+    // the binary lockfile, not a runtime-install gate.
+    if all {
+        checks.extend(check_gitattributes_state(project_dir));
+    }
 
     // 6c. Dependencies in sync? (lockfile vs package.json)
     if lockfile.exists()
@@ -449,7 +487,7 @@ pub async fn run(
         checks.push(sync_check);
     }
 
-    // 6d. Phase 59.1 day-7 (F17): file:/link: source health.
+    // 6d. day-7 (F17): file:/link: source health.
     // Reports broken paths, missing package.json, exotic file types
     // — anything that would cause a runtime install error users
     // could pre-detect.
@@ -464,24 +502,28 @@ pub async fn run(
         checks.push(lpm_json_check);
     }
 
-    // === Manifest compatibility (Phase 64 #61) ===
+    // === Manifest compatibility (Extended) ===
     //
-    // Surfaces every issue from
+    // #61. Surfaces every issue from
     // [`lpm_workspace::PackageJson::manifest_compat_issues`] as its own
     // `Check::warn` entry with the issue's stable code. This is the
     // structured surface automation pipelines pull instead of the
     // stderr warnings emitted by `engine_check::enforce` — the same
     // detector backs both, so the two views can never disagree.
     //
+    // Behind `--all`: the pnpm-drift / engines-ignored rows describe
+    // semantic gaps with adjacent package managers, not breakage of
+    // the current install — outside the default fast-mode scope.
+    //
     // Requires a parsed `package.json`; we already guarded above that
     // it exists. Re-uses the workspace discovery so member-dir
     // invocations gate against the workspace root manifest, matching
     // the engine-check semantics (root manifest is the gate).
-    if pkg_json_path.exists() {
+    if all && pkg_json_path.exists() {
         checks.extend(check_manifest_compat(project_dir));
     }
 
-    // === Runtime (Phase 2) ===
+    // === Runtime ===
 
     // 8. Node.js version
     let detected = lpm_runtime::detect::detect_node_version(project_dir);
@@ -532,45 +574,53 @@ pub async fn run(
         }
     }
 
-    // === Tunnel (Phase 9) ===
-
-    // 8b. Tunnel domain config — format validation + ownership check
-    let tunnel_checks = check_tunnel_domain(project_dir, client, token_exists).await;
-    checks.extend(tunnel_checks);
-
-    // === Code Quality (Phase 4) ===
-
-    // 9. Lint check (if oxlint installed)
-    if let Some(lint_result) = run_lint_check(project_dir) {
-        checks.push(lint_result);
+    // === Tunnel  ===
+    //
+    // Touches network in the authenticated path (`tunnel_domain_lookup`
+    // + HTTP reachability probe). Skipped on fast path.
+    if all {
+        let tunnel_checks = check_tunnel_domain(project_dir, client, token_exists).await;
+        checks.extend(tunnel_checks);
     }
 
-    // 10. Format check (if biome installed)
-    if let Some(fmt_result) = run_fmt_check(project_dir) {
-        checks.push(fmt_result);
+    // === Code Quality + TypeScript + Plugins  ===
+    //
+    // Subprocess spawns (oxlint, biome) + network calls (plugin
+    // version fetch). All Extended-tier; default fast preset stays
+    // pure local file I/O. TypeScript readiness is a cheap file probe
+    // but lives next to the tooling cluster the user expects to see
+    // together — promoted under `--all` for output cohesion.
+    if all {
+        // Lint check (if oxlint installed)
+        if let Some(lint_result) = run_lint_check(project_dir) {
+            checks.push(lint_result);
+        }
+
+        // Format check (if biome installed)
+        if let Some(fmt_result) = run_fmt_check(project_dir) {
+            checks.push(fmt_result);
+        }
+
+        // TypeScript readiness — workspace-aware reachability check.
+        // Cheap local-bin lookup + dep-declaration check, no blocking
+        // `tsc --noEmit` invocation. The actual type-check belongs to
+        // `lpm check`; doctor only verifies the project is set up so
+        // that `lpm check` will work when the user runs it.
+        checks.extend(check_typescript_setup(project_dir));
+
+        // Plugin status — fetches latest plugin versions in parallel.
+        let plugin_checks = check_plugins().await;
+        checks.extend(plugin_checks);
     }
 
-    // 11. TypeScript readiness — workspace-aware reachability check.
-    //     Cheap local-bin lookup + dep-declaration check, no blocking
-    //     `tsc --noEmit` invocation. The actual type-check belongs to
-    //     `lpm check`; doctor only verifies the project is set up so
-    //     that `lpm check` will work when the user runs it.
-    checks.extend(check_typescript_setup(project_dir));
-
-    // === Plugins (Phase 4) ===
-
-    // 12. Plugin status
-    let plugin_checks = check_plugins().await;
-    checks.extend(plugin_checks);
-
-    // === Workspace (Phase 3) ===
+    // === Workspace ===
 
     // 13. Workspace health
     if let Some(ws_check) = check_workspace(project_dir) {
         checks.push(ws_check);
     }
 
-    // === Global installs (Phase 37 M6.2) ===
+    // === Global installs (Extended) ===
     //
     // Four checks, all gated on the existence of `~/.lpm/global/`:
     //
@@ -579,21 +629,28 @@ pub async fn run(
     //   16. Orphaned bin shims — files in bin_dir without a manifest owner
     //   17. Install-root consistency — every manifest entry's install root
     //                                  exists AND carries a ready marker
-    for check in check_global_installs() {
-        checks.push(check);
+    //
+    // Behind `--all`: these describe global-install hygiene, not
+    // project breakage, and the per-platform PATH probe is host
+    // state rather than current-directory state.
+    if all {
+        for check in check_global_installs() {
+            checks.push(check);
+        }
     }
 
-    // === Phase 46 — Script policy + sandbox (Phase 46 close-out Chunk 4) ===
+    // === — Script policy + sandbox (Extended) ===
     //
     //   18. Sandbox availability — probe the per-platform backend.
     //   19. Script-policy scope boundary — project installs only in 46.0;
-    //                                      globals ship with Phase 46.1.
-    //
-    // Placed after the global-installs block so the scope-boundary note
-    // sits next to the global-installs rows it contextualizes. See the
-    // function doc for per-check classification rules.
-    for check in check_script_policy_surface() {
-        checks.push(check);
+    //                                      globals ship with     //
+    // Behind `--all`: sandbox + policy diagnostics report on host
+    // capabilities (kernel version, helper availability) rather than
+    // current-project breakage.
+    if all {
+        for check in check_script_policy_surface() {
+            checks.push(check);
+        }
     }
 
     // === Auto-fix (runs before output so JSON includes fixes_applied) ===
@@ -751,7 +808,27 @@ pub async fn run(
         }
     }
 
+    // Tier-leak tripwire: in fast mode, every emitted check MUST
+    // carry `Tier::Fast` — block-level gates above are the source of
+    // truth, and this catches a future refactor that emits an
+    // Extended-tagged row from a Fast block by mistake.
+    #[cfg(debug_assertions)]
+    if !all {
+        for c in &checks {
+            debug_assert!(
+                matches!(c.entry.tier, doctor_catalog::Tier::Fast),
+                "fast-mode emission leak: code `{}` (tier {:?}) escaped \
+                 from an Extended-tier block. Add the block's `if all` \
+                 gate or move the code to `Tier::Fast` in the catalog.",
+                c.code(),
+                c.entry.tier,
+            );
+        }
+    }
+
     // === Output (after fixes so JSON includes fixes_applied) ===
+
+    let mode_str = if all { "all" } else { "fast" };
 
     if json_output {
         let results: Vec<_> = checks
@@ -777,6 +854,7 @@ pub async fn run(
         let failed_count = checks.iter().filter(|c| !c.passed).count();
         let output = serde_json::to_string_pretty(&serde_json::json!({
             "success": true,
+            "mode": mode_str,
             "no_failures": no_failures,
             "clean": clean,
             "has_warnings": has_warnings,
@@ -789,8 +867,35 @@ pub async fn run(
         .map_err(|e| LpmError::Script(format!("failed to serialize doctor output: {e}")))?;
         println!("{output}");
     } else {
+        let failed = checks.iter().filter(|c| !c.passed).count();
+        let warned = checks
+            .iter()
+            .filter(|c| matches!(c.severity, Severity::Warn))
+            .count();
+        let total = checks.len();
+
+        // Fast-mode renderer shaping: ALWAYS suppress pass rows
+        // except `LINKER_MODE_RESOLVED`, whether or not the run is
+        // clean. On a broken project the user wants the fail / warn
+        // rows visible on top, not buried beneath a wall of healthy
+        // passes; on a clean project the short summary plus the
+        // linker-mode breadcrumb is all the context that matters.
+        // Linker mode survives the squelch because it explains
+        // "why is my install hoisted vs isolated?" — frequently the
+        // first thing users want to confirm. Position is preserved
+        // (emission order), so the linker-mode row sits near the top
+        // of the output as context BEFORE the broken rows below it.
+        // `--all` keeps today's "render every row in emission order"
+        // behavior — the full sweep already groups related rows
+        // (Infrastructure → Project → Runtime → Tunnel → ...).
         println!();
         for check in &checks {
+            if !all
+                && matches!(check.severity, Severity::Pass)
+                && check.code() != doctor_catalog::LINKER_MODE_RESOLVED.code
+            {
+                continue;
+            }
             let icon = match check.severity {
                 Severity::Pass => "✔".green().to_string(),
                 Severity::Fail => "✖".red().to_string(),
@@ -800,15 +905,15 @@ pub async fn run(
         }
         println!();
 
-        let failed = checks.iter().filter(|c| !c.passed).count();
-        let warned = checks
-            .iter()
-            .filter(|c| matches!(c.severity, Severity::Warn))
-            .count();
-        let total = checks.len();
-
         if failed == 0 && warned == 0 {
             output::success(&format!("All {total} checks passed"));
+            if !all {
+                println!(
+                    "\n  Run {} for registry, auth, tunnel, tooling, plugin, global,\n  \
+                     sandbox, and full manifest-compat diagnostics.",
+                    "lpm doctor --all".bold()
+                );
+            }
         } else if failed == 0 {
             output::success(&format!(
                 "{} checks passed, {} warning(s)",
@@ -1378,7 +1483,7 @@ async fn check_tunnel_reachability(domain: &str) -> TunnelReachability {
 }
 
 /// Check lockfile (lpm.lock + lpm.lockb) state: exists, in sync, valid.
-/// **Phase 59.1 day-7 (F17)** — verify every `file:` and `link:`
+/// verify every `file:` and `link:`
 /// dep in package.json points at a usable local source.
 ///
 /// What's reported:
@@ -1591,19 +1696,19 @@ async fn run_doctor_install(client: &RegistryClient, project_dir: &Path) -> Resu
         false,                                                 // offline
         false,                                                 // force
         false,                                                 // allow_new
-        false,                                                 // strict_integrity (Phase 59.0 F5)
+        false,                                                 // strict_integrity
         None,                                                  // linker_override
         false,                                                 // no_skills
         false,                                                 // no_editor_setup
         true,                                                  // no_security_summary
         false,                                                 // auto_build
         None, // target_set: doctor is single-project
-        None, // direct_versions_out: doctor does not finalize Phase 33 placeholders
+        None, // direct_versions_out: doctor does not finalize placeholders
         None, // script_policy_override: `lpm doctor` does not expose policy flags
         None, // advisor_override: `lpm doctor` does not expose `--advisor`
         None, // min_release_age_override: `lpm doctor` uses the package.json/global/default chain
         crate::provenance_fetch::DriftIgnorePolicy::default(), // drift-ignore: `lpm doctor` enforces drift like a normal install
-        // Phase 46.1 rework: doctor's auto-fix install does not
+        // doctor's auto-fix install does not
         // surface its own sandbox-mode flags. Falls through the
         // env / config / default chain.
         false, // strict_sandbox
@@ -1940,7 +2045,7 @@ fn check_manifest_compat(project_dir: &Path) -> Vec<Check> {
         .collect()
 }
 
-// ─── Phase 37 M6.2: global-installs health checks ─────────────────────
+// ─── global-installs health checks ─────────────────────
 
 /// Top-level entry for the global health checks. Returns an empty Vec
 /// if `~/.lpm/global/` doesn't exist (fresh machine / project-only
@@ -2135,7 +2240,7 @@ fn check_install_root_consistency(
             "no packages to check",
         );
     }
-    // M6 audit finding 2 (Medium): use `validate_install_root`, the
+    // Audit: finding 2 (Medium): use `validate_install_root`, the
     // authoritative predicate the install pipeline + recovery both
     // rely on. Pre-fix, Check 17 only checked `.lpm-install-ready`
     // presence — that's strictly weaker than what recovery would do.
@@ -2227,7 +2332,7 @@ fn check_install_root_consistency(
     )
 }
 
-/// Phase 46 close-out Chunk 4: lifecycle-script policy + sandbox
+/// close-out lifecycle-script policy + sandbox
 /// surface checks.
 ///
 /// Entries:
@@ -2241,10 +2346,10 @@ fn check_install_root_consistency(
 ///       or landlock is available; triage auto-execution and
 ///       `lpm rebuild` under every policy can contain lifecycle
 ///       scripts.
-///     - **Windows** → `warn` with the §17.4 Phase 46.1 pointer.
+///     - **Windows** → `warn` with the pointer.
 ///       Scripts still run today (`--no-sandbox` is the 46.0
-///       interim — Phase 46.1 rework collapsed the legacy
-///       `--unsafe-full-env` partner per Q6), but without
+///       interim — rework collapsed the legacy
+///       `--unsafe-full-env` partner), but without
 ///       containment — the user needs to know that
 ///       `script-policy = "triage"` or `allow` is effectively
 ///       opting out of the sandbox floor on Windows until 46.1.
@@ -2254,31 +2359,30 @@ fn check_install_root_consistency(
 ///
 /// 19. **Scope-boundary note.** The 46.0 script-policy surface
 ///     covers **project installs only**. Global installs
-///     (`lpm install -g`) use a separate Phase 37 trust store at
-///     `~/.lpm/global/trusted-dependencies.json`; 46.0 does not
+///     (`lpm install -g`) use a separate trust store at
+///     `~/.lpm/global/trusted-dependencies.json`; this surface does not
 ///     apply the sandbox probe / tier classification / version
-///     diff to that path. Phase 46.1 closes the parity gap per
-///     §17 + D19. The note only fires when the user has at least
-///     one global install (otherwise the scope limit is
+///     diff to that path. The note only fires when the user has at
+///     least one global install (otherwise the scope limit is
 ///     irrelevant to them and would be noise).
 ///
 /// Placed AFTER the global-installs block so the scope-boundary
 /// note has the same firing condition (`~/.lpm/global/` exists
-/// with content) as the related Phase 37 checks it contextualizes.
+/// with content) as the related checks it contextualizes.
 fn check_script_policy_surface() -> Vec<Check> {
     let mut out = Vec::new();
 
     // 18. Sandbox availability.
     out.push(probe_sandbox_backend());
 
-    // Phase 68: the scope-boundary note that previously fired here
+    // the scope-boundary note that previously fired here
     // when globals were present is gone — `lpm install -g` now honors
     // the same script-policy / sandbox / cooldown / drift gates as
     // project installs, so the boundary it described no longer exists.
     // The matching `POLICY_SCOPE_PROJECT_ONLY` doctor-catalog entry was
     // also removed.
 
-    // **Phase 48 P0 slice 4.** 20. Force-security-floor kill-switch
+    // 20. Force-security-floor kill-switch
     // status. Only surfaces when the flag is set — unset is the
     // default for every user who hasn't explicitly opted into the
     // kill-switch, and we don't clutter clean output with it. When
@@ -2292,7 +2396,7 @@ fn check_script_policy_surface() -> Vec<Check> {
     out
 }
 
-/// Phase 48 P0 slice 4 — report the force-security-floor kill-switch
+/// report the force-security-floor kill-switch
 /// state. Returns `None` when the flag is unset (the default), so
 /// clean output stays clean. Returns `Some(Check::warn(...))` when
 /// set, naming the count of suspended approvals if a project
@@ -2357,7 +2461,7 @@ fn count_suspended_approvals_in_cwd() -> Option<usize> {
 /// platform. Runs in-memory (macOS) or via a single benign
 /// landlock ruleset-create syscall (Linux); no persistent I/O.
 ///
-/// Phase 46.1: the probe loads the user's `[sandbox] allow-degraded`
+/// the probe loads the user's `[sandbox] allow-degraded`
 /// config (project lpm.toml + global ~/.lpm/config.toml — same
 /// chain the install pipeline uses) so the doctor surface reports
 /// the SAME posture the next `lpm install` will actually
@@ -2386,7 +2490,7 @@ fn probe_sandbox_backend() -> Check {
         extra_write_dirs: Vec::new(),
     };
 
-    // Phase 46.1: load the `[sandbox] allow-degraded` knob from
+    // load the `[sandbox] allow-degraded` knob from
     // `<cwd>/lpm.toml` + `~/.lpm/config.toml`. The project-side read
     // uses the current working directory — that's what `lpm doctor`
     // is reporting on, and matches the install pipeline's
@@ -2402,7 +2506,7 @@ fn probe_sandbox_backend() -> Check {
     // from a deleted directory) falls back to the strict default —
     // there's no config to parse in that case.
     let (sandbox_options, resolved_mode) = match std::env::current_dir() {
-        // Phase 46.1 rework: route through the precedence chain so
+        // route through the precedence chain so
         // `LPM_STRICT_SANDBOX=1` and `[sandbox] mode` flow through
         // the doctor probe identically to the install pipeline.
         Ok(cwd) => match crate::sandbox_config::resolve_sandbox_mode_from_chain(&cwd, false, false)
@@ -2425,7 +2529,7 @@ fn probe_sandbox_backend() -> Check {
         ),
     };
 
-    // Phase 46.1 rework GPT-5 audit follow-up (2026-05-11): when the
+    // rework GPT-5 audit follow-up : when the
     // resolved mode is `None` (`[sandbox] mode = "none"` in
     // `~/.lpm/config.toml` / `./lpm.toml`, persisted by
     // `lpm config sandbox --set none`), the install pipeline runs
@@ -2457,9 +2561,9 @@ fn probe_sandbox_backend() -> Check {
         Ok(sb) => {
             let backend = sb.backend_name();
             let os = std::env::consts::OS;
-            // Phase 46.3 PR-2 (2026-05-13): on Windows, the
+            // on Windows, the
             // `windows-il` backend is now the FALLBACK path —
-            // the post-PR-2 happy path is `windows-appcontainer`,
+            // the post-rework happy path is `windows-appcontainer`,
             // which delivers full strict (filesystem-write +
             // outbound network) when the
             // `lpm-sandbox-helper.exe` companion binary is sitting
@@ -2476,7 +2580,7 @@ fn probe_sandbox_backend() -> Check {
                     &doctor_catalog::SANDBOX_HELPER_MISSING,
                     "windows-il available on windows — falling back from AppContainer \
                      because `lpm-sandbox-helper.exe` is not located next to \
-                     `lpm.exe`. The Phase 46.2 Low IL backend contains filesystem \
+                     `lpm.exe`. The Low IL backend contains filesystem \
                      writes but does NOT deny outbound network. Reinstall lpm \
                      (`@lpm-registry/cli`) to restore the helper, or override the \
                      helper location via `LPM_SANDBOX_HELPER=<path>`. With the helper \
@@ -2499,11 +2603,11 @@ fn probe_sandbox_backend() -> Check {
                     // Network-denial coverage is platform-asymmetric:
                     // - macOS Seatbelt's `(deny default)` covers every
                     //   socket family unconditionally.
-                    // - Windows AppContainer (Phase 46.3 PR-2) denies
+                    // - Windows AppContainer denies
                     //   every socket family via the WFP layer once the
                     //   capability list is empty — same coverage shape
                     //   as macOS Seatbelt.
-                    // - Linux landlock V4 + Phase 46.1.1 seccomp-bpf
+                    // - Linux landlock V4 + seccomp-bpf
                     //   layered together: landlock denies BindTcp +
                     //   ConnectTcp, seccomp denies direct
                     //   socket(AF_INET|AF_INET6, SOCK_DGRAM|SOCK_RAW)
@@ -2518,7 +2622,7 @@ fn probe_sandbox_backend() -> Check {
                     } else {
                         "outbound TCP denial (landlock V4: BindTcp + ConnectTcp) + \
                          direct UDP / raw / AF_PACKET / AF_NETLINK denial \
-                         (seccomp-bpf, Phase 46.1.1); AF_UNIX allowed for IPC"
+                         (seccomp-bpf, 1); AF_UNIX allowed for IPC"
                     };
                     Check::pass(
                         &doctor_catalog::SANDBOX_AVAILABLE,
@@ -2533,7 +2637,7 @@ fn probe_sandbox_backend() -> Check {
                     abi,
                     missing,
                 } => {
-                    // Phase 46.3 PR-2 (2026-05-13): both Linux
+                    // both Linux
                     // (kernel < 6.7 + allow-degraded) and Windows
                     // (`windows-il` Low IL FALLBACK when the
                     // `lpm-sandbox-helper.exe` AppContainer launcher
@@ -2545,17 +2649,16 @@ fn probe_sandbox_backend() -> Check {
                     // a single Linux-shaped string would lie about
                     // the remediation on Windows.
                     //
-                    // On Windows the cause is no longer "Phase 46.3
-                    // is a follow-up" (PR-2 ships it). It's now
+                    // On Windows the strict-mode cause is now
                     // "the helper binary that delivers AppContainer
                     // strict isn't sitting next to lpm.exe." That's
                     // an npm-install corruption symptom — reinstall
                     // is the fix.
                     let cause_and_fix = if abi == "low-il" {
                         "user requested strict but `lpm-sandbox-helper.exe` is not located \
-                         next to `lpm.exe`; the AppContainer backend (Phase 46.3 PR-2 — \
-                         filesystem + outbound-network containment) needs the helper to \
-                         deliver strict mode. Falling back to Phase 46.2 Low IL backend, \
+                         next to `lpm.exe`; the AppContainer backend (filesystem + \
+                         outbound-network containment) needs the helper to \
+                         deliver strict mode. Falling back to Low IL backend, \
                          which contains filesystem writes but does NOT deny outbound \
                          network. Reinstall lpm (`@lpm-registry/cli`) to restore the helper, \
                          or override the helper location via `LPM_SANDBOX_HELPER=<path>`. \
@@ -2663,10 +2766,10 @@ mod tests {
     fn sandbox_probe_emits_known_code() {
         // Pin the codes the sandbox probe is allowed to emit so the
         // automation contract for this check stays stable across
-        // platforms / refactors. Phase 46.1 adds `sandbox_degraded`
+        // platforms / refactors. adds `sandbox_degraded`
         // for the V1-fallback path; the GPT-5 audit follow-up adds
         // `sandbox_disabled_by_user` for the persistent `mode =
-        // "none"` path; Phase 46.3 PR-2 adds `sandbox_helper_missing`
+        // "none"` path; It adds `sandbox_helper_missing`
         // for the Windows AppContainer-helper-not-found fallback;
         // the other four codes are pre-existing.
         let c = probe_sandbox_backend();
@@ -2687,7 +2790,7 @@ mod tests {
         );
     }
 
-    // ── Phase 46 close-out Chunk 4: sandbox probe + scope-boundary ──
+    // ── close-out sandbox probe + scope-boundary ──
 
     /// Universal smoke test: the sandbox probe must always return a
     /// `Check` on every platform the CI matrix + local dev runs on
@@ -2749,10 +2852,10 @@ mod tests {
     /// On Windows, the active backend is determined by helper-binary
     /// presence:
     ///
-    /// - **`windows-appcontainer` (Phase 46.3 PR-2)** when
+    /// - **`windows-appcontainer`** when
     ///   `lpm-sandbox-helper.exe` is reachable. Pass under default,
     ///   Pass naming "AppContainer + WFP" under strict.
-    /// - **`windows-il` (Phase 46.2 fallback)** when the helper
+    /// - **`windows-il` (fallback)** when the helper
     ///   binary is missing. Warn surfaces the fallback explicitly
     ///   with the reinstall remediation, even under default — the
     ///   user has lost outbound-network containment in strict mode
@@ -2761,12 +2864,12 @@ mod tests {
     ///   `[sandbox] mode = "none"` persisted.
     ///
     /// A Fail here is a regression — Mandatory Integrity Control
-    /// has been in every Windows release since Vista, and PR-2's
+    /// has been in every Windows release since Vista, and the AppContainer backend's
     /// AppContainer backend has no preconditions beyond
     /// "Win32_Security_Isolation surface is reachable" (Windows
     /// 8+).
     ///
-    /// Phase 46.1 rework / Q6: the `--unsafe-full-env` partner flag
+    /// rework /  the `--unsafe-full-env` partner flag
     /// was collapsed into `--no-sandbox`. We keep that assertion in
     /// case a future refactor accidentally resurrects the legacy
     /// remediation string.
@@ -2776,7 +2879,7 @@ mod tests {
         let c = probe_sandbox_backend();
         assert!(
             !matches!(c.severity, Severity::Fail),
-            "Windows sandbox probe must not Fail post-PR-2 (AppContainer + Low IL fallback \
+            "Windows sandbox probe must not Fail post-rework (AppContainer + Low IL fallback \
              are both reachable on every supported Windows host). detail={}",
             c.detail
         );
@@ -2787,7 +2890,7 @@ mod tests {
             "doctor detail must name the active backend; got: {}",
             c.detail
         );
-        // Phase 46.1 rework: legacy partner flag must never appear.
+        // legacy partner flag must never appear.
         assert!(
             !c.detail.contains("--unsafe-full-env"),
             "legacy partner flag must be gone from doctor output: {}",
@@ -2797,7 +2900,7 @@ mod tests {
 
     /// Scope-boundary note: NOT emitted when the global manifest
     /// has no active installs (fresh machine / never used
-    /// Phase 68: the scope-boundary note has been removed because
+    /// the scope-boundary note has been removed because
     /// `lpm install -g` now honors the same script-policy / sandbox /
     /// cooldown / drift gates as project installs. Doctor must NOT
     /// emit a `policy_scope_project_only` check anymore even when
@@ -2817,7 +2920,7 @@ saved_spec = "^1"
 resolved = "1.0.0"
 integrity = "sha512-fixture"
 source = "upstream-npm"
-installed_at = "2026-04-22T00:00:00Z"
+installed_at = "T00:00:00Z"
 root = "installs/some-pkg@1.0.0"
 commands = []
 "#,
@@ -2830,7 +2933,7 @@ commands = []
             assert_ne!(
                 c.code(),
                 "policy_scope_project_only",
-                "scope-boundary check must no longer fire after Phase 68",
+                "scope-boundary check must no longer fire",
             );
         }
     }
@@ -2851,7 +2954,7 @@ commands = []
         );
     }
 
-    /// GPT-5 audit follow-up (2026-05-11): when the user has set
+    /// GPT-5 audit follow-up : when the user has set
     /// `[sandbox] mode = "none"` in `~/.lpm/config.toml` (via
     /// `lpm config sandbox --set none` or by hand), the doctor probe
     /// MUST report the disabled posture instead of probing
@@ -3493,7 +3596,7 @@ commands = []
 
     #[test]
     fn validate_lpm_json_publish_field_accepted() {
-        // Regression test for Finding #1: publish is a valid LpmJsonConfig field
+        // Regression test for publish is a valid LpmJsonConfig field
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(
             dir.path().join("lpm.json"),
@@ -3511,7 +3614,7 @@ commands = []
 
     #[test]
     fn validate_lpm_json_https_field_accepted() {
-        // Regression test for Finding #1: https is a valid LpmJsonConfig field
+        // Regression test for https is a valid LpmJsonConfig field
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("lpm.json"), r#"{ "https": true }"#).unwrap();
         let result = validate_lpm_json(dir.path());
@@ -3705,7 +3808,7 @@ commands = []
         );
     }
 
-    // ─── Phase 37 M6.2: global-installs health checks ─────────────────
+    // ─── global-installs health checks ─────────────────
 
     use chrono::Utc;
     use lpm_common::LpmRoot;
@@ -3862,7 +3965,7 @@ commands = []
         );
     }
 
-    /// M6 audit finding 2 (Medium): Check 17 must use the authoritative
+    /// Audit: finding 2 (Medium): Check 17 must use the authoritative
     /// `validate_install_root` predicate. Pre-fix, it only checked
     /// `.lpm-install-ready` presence, so a half-corrupted install with
     /// a marker but missing bin targets would have been reported
@@ -3950,14 +4053,14 @@ commands = []
         assert!(matches!(check.severity, Severity::Fail));
         assert!(
             check.detail.contains("not ready"),
-            "post-M6-audit Check 17 uses the authoritative predicate \
+            "post-audit Check 17 uses the authoritative predicate \
              and renders all sub-failures under the `not ready` category: {}",
             check.detail,
         );
         assert!(check.detail.contains("MissingMarker"));
     }
 
-    // ── Phase 59.1 day-7 (F17): check_local_source_paths ───────────────────
+    // ── day-7 (F17): check_local_source_paths ───────────────────
 
     fn write_pkg_json(dir: &Path, content: &str) {
         std::fs::write(dir.join("package.json"), content).unwrap();

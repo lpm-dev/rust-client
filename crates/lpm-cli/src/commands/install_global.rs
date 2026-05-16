@@ -1,9 +1,9 @@
-//! `lpm install -g <pkg>` — phase 37 M3.2 persistent install pipeline.
+//! `lpm install -g <pkg>` — persistent global install pipeline.
 //!
-//! Three-phase transaction (plan §"Crash-safe transactions"):
+//! Three-phase crash-safe transaction:
 //!
 //! 1. Pre-resolve via registry (no lock) — pick a concrete version,
-//!    integrity, source. Phase 33 [`save_spec`] decides what
+//!    integrity, source. [`save_spec`] decides what
 //!    `saved_spec` to persist. Then **acquire `.tx.lock`**, write
 //!    INTENT to WAL, write `[pending.<pkg>]` to manifest with empty
 //!    `commands` (the install pipeline discovers commands at step 2),
@@ -21,15 +21,15 @@
 //!    `[packages.<pkg>]` with the marker's commands. Append COMMIT to
 //!    WAL. Release lock.
 //!
-//! M3.2 ships fresh-install only. Upgrade (replacing an existing
-//! `[packages.<pkg>]` via `[pending.<pkg>]`) lands in M3.4. Collision
-//! resolution lands in M4. Approve-builds capture lands in M5.
+//! Fresh-install, upgrade, collision resolution, and approve-scripts
+//! capture are all supported (WAL-backed, crash-safe).
 
 use crate::output;
 use crate::save_spec::{
     SaveConfig, SaveFlags, UserSaveIntent, decide_saved_dependency_spec, parse_user_save_intent,
 };
 use chrono::Utc;
+use lpm_common::color::Painted;
 use lpm_common::{LpmError, LpmRoot, with_exclusive_lock};
 use lpm_global::{
     AliasEntry, CommandCollision, GlobalManifest, InstallReadyMarker, InstallRootStatus,
@@ -39,17 +39,16 @@ use lpm_global::{
 };
 use lpm_registry::RegistryClient;
 use lpm_semver::{Version, VersionReq};
-use owo_colors::OwoColorize;
 use std::collections::{BTreeMap, HashSet};
 use std::path::PathBuf;
 
-/// Phase 37 M4: user-supplied resolutions for command-name collisions.
+/// user-supplied resolutions for command-name collisions.
 ///
 /// Built from the `--replace-bin` and `--alias` Install flags at the
 /// CLI dispatch site ([`CollisionResolution::parse_from_flags`]).
 /// Passed through to the install pipeline; semantic application + the
-/// "does this command actually exist in the package" check land in M4.2
-/// under the commit-time lock, where `marker_commands` is authoritative.
+/// "does this command actually exist in the package" check happen under
+/// the commit-time lock, where `marker_commands` is authoritative.
 ///
 /// Wraps a `HashSet<String>` for `--replace-bin` (set semantics — listing
 /// the same command twice is legal, just redundant) and a `BTreeMap`
@@ -67,9 +66,9 @@ pub struct CollisionResolution {
 }
 
 impl CollisionResolution {
-    /// True when the user supplied no flags — the pre-M4 "abort on
-    /// collision" path is still the right behaviour for this case.
-    /// M4.2 consumes this to decide between flag-driven resolution
+    /// True when the user supplied no flags — the "abort on collision"
+    /// path is still the right behaviour for this case.
+    /// consumes this to decide between flag-driven resolution
     /// and the TTY-prompt / error paths.
     #[allow(dead_code)]
     pub fn is_empty(&self) -> bool {
@@ -77,8 +76,8 @@ impl CollisionResolution {
     }
 
     /// Parse and locally-validate the CLI flag vectors. Returns an
-    /// `Err(String)` with a user-facing message on any of the M4.1
-    /// syntactic / local-consistency failures:
+    /// `Err(String)` with a user-facing message on any syntactic /
+    /// local-consistency failure:
     ///
     /// - `--alias` mapping that doesn't match `<orig>=<alias>` shape.
     /// - Empty `<orig>` or `<alias>` after splitting on `=`.
@@ -90,8 +89,8 @@ impl CollisionResolution {
     ///   keys — mutually exclusive intents for the same collision.
     ///
     /// Explicitly does NOT check "is this a real command of the
-    /// package" — that requires marker discovery and happens in M4.2
-    /// under the commit lock. The `package_name` parameter is only
+    /// package" — that requires marker discovery and happens under
+    /// the commit lock. The `package_name` parameter is only
     /// used to produce useful validator warnings via
     /// `validate_bin_name` (it logs shadowing warnings with the pkg
     /// name attached).
@@ -167,7 +166,7 @@ impl CollisionResolution {
     }
 }
 
-/// Phase 68: per-invocation security overrides forwarded from `lpm install -g`.
+/// per-invocation security overrides forwarded from `lpm install -g`.
 /// Bundles the five flags the dispatcher used to silently drop so the
 /// `do_install` boundary is clear and adding/removing a knob doesn't
 /// touch every call site.
@@ -189,7 +188,7 @@ pub async fn run(
     overrides: InstallGlobalOverrides,
 ) -> Result<(), LpmError> {
     let root = LpmRoot::from_env()?;
-    // Phase 35 Step 6 fix: use the injected client (carries
+    // Step 6 fix: use the injected client (carries
     // `--registry` + SessionManager). The local `build_registry()`
     // helper is removed.
     let registry = client.clone_with_config();
@@ -229,7 +228,7 @@ pub async fn run(
     let marker = InstallReadyMarker::new(commands.clone());
     write_marker(&prep.install_root, &marker)?;
 
-    // ─── Step 3a: TTY interactive prompt (M4.4) ───────────────────
+    // ─── Step 3a: TTY interactive prompt ───────────────────
     //
     // Runs BEFORE the commit lock. No-ops when the user already
     // supplied `--replace-bin` / `--alias` flags, when JSON mode is
@@ -248,15 +247,15 @@ pub async fn run(
     // ─── Step 3b: validate + commit under .tx.lock ──────────────────
     //
     // `resolution` threads through to commit_locked so collision
-    // resolution uses marker_commands as the authority. Per the M4.2
-    // design, the resolution is validated AGAINST marker_commands
-    // inside the lock (not earlier), since only the marker is the
+    // resolution uses marker_commands as the authority. The resolution
+    // is validated AGAINST marker_commands inside the lock (not
+    // earlier), since only the marker is the
     // authoritative post-extract command set.
     let active = with_exclusive_lock(root.global_tx_lock(), || {
         commit_locked(&root, &prep, &resolution)
     })?;
 
-    // ─── Step 4: opportunistic tombstone sweep (M3.5) ─────────────
+    // ─── Step 4: opportunistic tombstone sweep ─────────────
     // Fresh installs rarely tombstone (the rollback branch does),
     // but running a sweep post-commit means any leftover tombstones
     // from a prior failed tx get cleared as part of the happy path —
@@ -268,7 +267,7 @@ pub async fn run(
     // next run.
     crate::commands::global::run_opportunistic_sweep(&root);
 
-    // ─── Step 5: PATH onboarding hint (M3.6) ──────────────────────
+    // ─── Step 5: PATH onboarding hint ──────────────────────
     // Idempotent: at most one banner per host. The helper handles
     // marker stickiness and JSON-mode silence internally; we just
     // call it post-success and pass the report into print_success
@@ -278,7 +277,7 @@ pub async fn run(
     // ─── Output ────────────────────────────────────────────────────
     print_success(&active, &hint, json_output);
 
-    // ─── Step 6: post-install blocked-scripts warning (M5.2) ──────
+    // ─── Step 6: post-install blocked-scripts warning ──────
     // Mirrors the project-level post-install security summary
     // (suppressed inside the inner pipeline via `no_security_summary:
     // true`). Emits AFTER print_success so the happy-path "Installed
@@ -301,7 +300,7 @@ struct ResolvedSpec {
 }
 
 async fn pre_resolve(registry: &RegistryClient, spec: &str) -> Result<ResolvedSpec, LpmError> {
-    let (name, intent) = parse_user_save_intent(spec);
+    let (name, intent) = parse_user_save_intent(spec)?;
     // Dispatch by name shape: `@lpm.dev/owner.tool` goes through the
     // first-party registry path (PackageName parser); everything else
     // (`eslint`, `@types/node`, `@scope/foo`) is fetched via the npm
@@ -345,8 +344,8 @@ async fn pre_resolve(registry: &RegistryClient, spec: &str) -> Result<ResolvedSp
         PackageSource::UpstreamNpm
     };
 
-    // Phase 33 save-spec decision. Global installs honor the same
-    // precedence as project installs (audit Medium #1 from M2.3 round).
+    // save-spec decision. Global installs honor the same
+    // precedence as project installs (audit Medium #1 from the audit).
     let decision = decide_saved_dependency_spec(
         &intent,
         &version,
@@ -439,7 +438,7 @@ fn prepare_locked(root: &LpmRoot, resolved: &ResolvedSpec) -> Result<PrepResult,
     if manifest.packages.contains_key(&resolved.name) {
         return Err(LpmError::Script(format!(
             "'{}' is already installed globally. Use `lpm global update {}` to upgrade or \
-             `lpm uninstall -g {}` first. (Upgrade in-place lands in M3.4.)",
+             `lpm uninstall -g {}` first. (Use `lpm global update` to upgrade in-place.)",
             resolved.name, resolved.name, resolved.name
         )));
     }
@@ -457,7 +456,7 @@ fn prepare_locked(root: &LpmRoot, resolved: &ResolvedSpec) -> Result<PrepResult,
         install_root.file_name().unwrap().to_string_lossy()
     );
 
-    // Phase 37 M0 (rev 6): pre-install path-budget guard. Reject the
+    // pre-install path-budget guard. Reject the
     // install up front if the chosen install root would push us over the
     // 247-char budget — failing fast with an actionable LPM_HOME hint
     // beats failing mid-extraction with cryptic platform errors. No-op
@@ -491,7 +490,7 @@ fn prepare_locked(root: &LpmRoot, resolved: &ResolvedSpec) -> Result<PrepResult,
         prior_command_ownership_json: serde_json::json!({}),
         new_aliases_json: serde_json::json!({}),
         // Populated at commit-time if the user resolved collisions via
-        // flags (M4.2). prepare_locked runs before marker discovery, so
+        // flags. prepare_locked runs before marker discovery, so
         // no collisions are known yet — empty delta here is correct.
         ownership_delta: Vec::new(),
     })))?;
@@ -538,20 +537,20 @@ async fn do_install(
     // linker logic — global install is a self-hosted install with a
     // specific synthetic project.
     //
-    // Phase 37 M5.2 addition: inject the global trusted-dependencies
+    // Inject the global trusted-dependencies
     // into the synthesized `lpm.trustedDependencies` so the inner
     // install pipeline's strict-gate check honours user approvals
     // recorded via `lpm approve-scripts --global`. Without this, every
     // scripts-carrying transitive dep would block on every global
     // install even after the user approved it.
     //
-    // Phase 68: also threads the user's `--allow-new`,
+    // also threads the user's `--allow-new`,
     // `--min-release-age`, `--ignore-provenance-drift[-all]`,
     // `--policy`/`--triage`/`--yolo`, and `--auto-build` overrides
     // into the inner pipeline so all four security gates (cooldown,
     // drift, script-policy, sandbox auto-build) fire end-to-end on `-g`.
     //
-    // Phase 37 M0 (rev 6): route the install-root creation + synthetic
+    // route the install-root creation + synthetic
     // package.json write through `as_extended_path` so a deeply-nested
     // `~/.lpm/global/installs/` path doesn't truncate at the legacy
     // 260-char Windows ceiling. No-op on POSIX.
@@ -576,11 +575,11 @@ async fn do_install(
         false, // offline
         false, // force
         overrides.allow_new,
-        false, // strict_integrity (Phase 59.0 F5) — global installs use lockfile path
+        false, // strict_integrity — global installs use lockfile path
         None,  // linker_override
         true,  // no_skills (global installs skip skill auto-install)
         true,  // no_editor_setup (global installs are not project-specific)
-        // Phase 68 §5d: keep the inner project-shape security summary
+        // keep the inner project-shape security summary
         // suppressed — the global wrapper banner at
         // `emit_post_install_blocked_warning` is the right surface and
         // routes users to `lpm approve-scripts --global`.
@@ -589,7 +588,7 @@ async fn do_install(
         None,
         None,
         overrides.script_policy_override,
-        // Phase 46 slice 1: `lpm install -g` does not expose its own
+        // `lpm install -g` does not expose its own
         // `--advisor` flag yet. The global install path stays portable-
         // by-default; opt-in to an advisor uplift for the synthesized
         // project install would belong with a future `-g`-specific
@@ -597,7 +596,7 @@ async fn do_install(
         None,
         overrides.min_release_age_override,
         overrides.drift_ignore_policy.clone(),
-        // Phase 46.1 rework: `lpm install -g` does not surface its
+        // `lpm install -g` does not surface its
         // own sandbox-mode flags. The env / config / default chain
         // inside `rebuild::run` still applies — `LPM_STRICT_SANDBOX=1`
         // still kicks in for CI globally-installed tooling.
@@ -698,7 +697,7 @@ fn commit_locked(
     let mut manifest = read_for(root)?;
 
     // Validate the install root using the marker's commands as the
-    // authority. Pre-M3.2 we'd have passed pending.commands; with the
+    // authority. Previously we'd have passed pending.commands; with the
     // marker-as-authority refactor the install pipeline can ship empty
     // pending.commands and let `validate_install_root(None)` discover
     // them.
@@ -714,12 +713,12 @@ fn commit_locked(
         }
     };
 
-    // ─── Collision resolution (M4.2) ───────────────────────────────
+    // ─── Collision resolution ───────────────────────────────
     //
     // Three paths from here:
     //
     //   1. No collisions at all → zero work, zero delta, proceed to
-    //      the existing happy path. Shortest path; same shape as M3.2.
+    //      the existing happy path. Shortest path.
     //   2. Collisions AND the user supplied `--replace-bin`/`--alias`
     //      → run the resolution planner. If the plan covers every
     //      collision (and introduces no new alias-target collisions),
@@ -727,11 +726,8 @@ fn commit_locked(
     //      set. If the plan fails, roll back inline and surface the
     //      planner's specific error (unknown command / residual /
     //      alias-target conflict).
-    //   3. Collisions AND no user resolution → same inline rollback
-    //      as pre-M4, with the pre-M4 error message. M4.3 will
-    //      upgrade the message to name the two flag forms + a tailored
-    //      example; for now we keep the "wait for M4" wording so the
-    //      commit path stays narrow.
+    //   3. Collisions AND no user resolution → inline rollback + error
+    //      with the --replace-bin / --alias remediation hint.
     let observed = find_command_collisions(&manifest, &prep.name, &marker_commands);
     let plan = if observed.is_empty() {
         // Shortest path: no collisions → empty plan with marker_commands
@@ -744,9 +740,8 @@ fn commit_locked(
             shim_removals: Vec::new(),
         }
     } else if resolution.is_empty() {
-        // Collisions exist but the user supplied no resolution. Keep
-        // pre-M4 behaviour: roll back inline + error out. (M4.3 will
-        // upgrade the error copy to name the flag forms.)
+        // Collisions exist but the user supplied no resolution.
+        // Roll back inline + error out with the remediation hint.
         rollback_aborted_commit(root, &mut manifest, prep, &format_collisions(&observed))?;
         return Err(collision_error(&prep.name, &observed));
     } else {
@@ -782,12 +777,12 @@ fn commit_locked(
     //   2. Emit direct-bin shims for every command in `final_commands`.
     //      `final_commands = marker_commands - aliased-away origs`, so
     //      origs that are aliased to a different PATH name do NOT get
-    //      a shim under their original name (per the M4 invariant).
+    //      a shim under their original name (per the invariant).
     //   3. Emit alias shims: one per new alias row, pointing at the
     //      declared bin inside the new install root.
     // ─── Append the finalized Intent with populated delta FIRST ──
     //
-    // **M4 audit Finding 1 (High):** the second Intent MUST be
+    // **Audit Finding 1 (High):** the second Intent MUST be
     // durably on disk BEFORE any shim mutation starts. The recovery
     // scanner's BTreeMap overwrites on same tx_id, so the latest
     // Intent wins; if we crash between shim swap and this append,
@@ -798,7 +793,7 @@ fn commit_locked(
     // restoration. The user's chosen collision resolution is lost
     // AND the on-disk state silently disagrees with the manifest.
     //
-    // Ordering rule for M4.2 tx:
+    // Transaction ordering rule:
     //   1. Apply delta to in-memory manifest (pure)
     //   2. Append second Intent with populated delta   [DURABLE]
     //   3. Shim mutations (OS-visible)
@@ -841,10 +836,9 @@ fn commit_locked(
         new_root_path: prep.install_root.clone(),
         new_row_json,
         prior_active_row_json: None,
-        // Prior-ownership snapshots: for M4.2 these live inside
-        // `ownership_delta` (each variant carries its own snapshot).
-        // The legacy `prior_command_ownership_json` stays empty for
-        // fresh installs.
+        // Prior-ownership snapshots live inside `ownership_delta`
+        // (each variant carries its own snapshot). The legacy
+        // `prior_command_ownership_json` stays empty for fresh installs.
         prior_command_ownership_json: serde_json::json!({}),
         new_aliases_json,
         ownership_delta: plan.ownership_delta.clone(),
@@ -858,8 +852,8 @@ fn commit_locked(
     // Order within this block:
     //   - shim_removals (currently empty; kept for future variants)
     //   - direct-bin shims for every command in `final_commands`
-    //     (= marker_commands minus aliased-away origs, per the M4
-    //      invariant)
+    //     (= marker_commands minus aliased-away origs, per the
+    //      alias-exclusion invariant)
     //   - alias shims: one per new alias row
     let bin_dir = root.bin_dir();
     let install_bin = prep.install_root.join("node_modules").join(".bin");
@@ -887,7 +881,7 @@ fn commit_locked(
         )?;
     }
 
-    // Phase 37 M3 (audit follow-up): three-artifact invariant — on
+    // Audit follow-up: three-artifact invariant — on
     // Windows a command is "owned" only when all three of its shim
     // artifacts (`.cmd`, `.ps1`, no-extension bash shim) are present.
     // emit_shim already writes the triple, but a partial failure
@@ -935,7 +929,7 @@ fn commit_locked(
     manifest.packages.insert(prep.name.clone(), active);
     manifest.pending.remove(&prep.name);
 
-    // Per-tx ordering invariant from the M3.1 audit: persist manifest
+    // Per-tx ordering invariant from the audit: persist manifest
     // BEFORE WAL COMMIT. A crash between manifest persist and WAL
     // append is the "Already Committed" case recovery handles
     // explicitly.
@@ -974,8 +968,7 @@ fn format_collisions(collisions: &[CommandCollision]) -> String {
         .join("\n")
 }
 
-/// Phase 37 M4.3: unresolved-collision error with a copy-pasteable
-/// remediation. Replaces the pre-M4 "wait for M4" wording. Output
+/// Unresolved-collision error with a copy-pasteable remediation. Output
 /// shape:
 ///
 ///   'foo' would expose command(s) already taken on this host:
@@ -1025,12 +1018,12 @@ fn collision_error(installing_pkg: &str, collisions: &[CommandCollision]) -> Lpm
          colliding command:\n\n    lpm install -g {installing_pkg} {replace_flags}\n    \
          lpm install -g {installing_pkg} {alias_flags}\n\n--replace-bin transfers ownership to \
          '{installing_pkg}'; --alias installs the declared bin under a different PATH name. \
-         Mix both as needed. (Interactive resolution lands in M4.4.)",
+         Mix both as needed.",
         format_collisions(collisions),
     ))
 }
 
-// ─── M4.4: TTY interactive prompt ────────────────────────────────────
+// ─── TTY interactive prompt ────────────────────────────────────
 
 /// Per-collision choice from the TTY prompt. Folds into a
 /// `CollisionResolution` by the caller.
@@ -1051,7 +1044,7 @@ enum CollisionChoice {
 /// Otherwise passes the resolution through unchanged — `commit_locked`
 /// will either find no collisions (fine), find collisions with flags
 /// (planner takes over), or find collisions with no flags (emits the
-/// M4.3 error).
+/// error).
 ///
 /// The manifest read here is UNLOCKED. Drift between this read and
 /// commit_locked's lock acquisition is acceptable: the planner inside
@@ -1072,7 +1065,7 @@ fn maybe_prompt_for_collisions(
     if json_output {
         return Ok(resolution);
     }
-    // M4 audit Finding 3: require BOTH stdin AND stdout to be a TTY.
+    // Audit: Finding 3: require BOTH stdin AND stdout to be a TTY.
     // Checking only stdin would let `lpm install -g foo | cat` enter
     // the cliclack prompt with no visible UI (output goes to the
     // pipe), stranding the user with an unresponsive terminal.
@@ -1241,7 +1234,7 @@ fn prompt_one_collision(
     }
 }
 
-// ─── M4.2: Resolution planner ────────────────────────────────────────
+// ─── Resolution planner ────────────────────────────────────────
 
 /// Output of the resolution planner. Feeds directly into `commit_locked`'s
 /// manifest mutation + WAL + shim emission. Pure data — every field is
@@ -1255,7 +1248,7 @@ pub(crate) struct ResolutionPlan {
     pub ownership_delta: Vec<OwnershipChange>,
     /// The `PackageEntry.commands` value to write for the installing
     /// package. Equals `marker_commands` minus any command that is
-    /// aliased away (per the M4 invariant: `commands` holds only names
+    /// aliased away (per the invariant: `commands` holds only names
     /// with a direct shim owned by this package).
     pub final_commands: Vec<String>,
     /// New `[aliases]` rows to write, keyed by alias name. Mirrors the
@@ -1375,8 +1368,8 @@ pub(crate) fn plan_resolution(
     let mut aliases_to_remove: Vec<String> = Vec::new();
     // Populated only when a future variant needs pre-removal before the
     // new shim lands. Alias-owner replace today rewrites via emit_shim's
-    // atomic rename-over, so this stays empty for M4.2 but is kept as
-    // part of the plan shape for future use.
+    // atomic rename-over, so this is currently always empty but is kept
+    // as part of the plan shape for future use.
     let shim_removals: Vec<String> = Vec::new();
     let mut residual: Vec<CommandCollision> = Vec::new();
 
@@ -1634,7 +1627,7 @@ pub(crate) fn apply_ownership_change_to_manifest(
 /// roll_back semantics from the user-facing call site so the on-disk
 /// state stays clean and the next recovery has nothing to reconcile.
 ///
-/// Order of operations (per the M3.1 audit's manifest-before-WAL
+/// Order of operations (per the audit's manifest-before-WAL
 /// invariant):
 ///   1. Drop the install root (or tombstone if locked).
 ///   2. Remove `[pending.<pkg>]` row.
@@ -1675,7 +1668,7 @@ fn print_success(
     json_output: bool,
 ) {
     if json_output {
-        // M3.6: surface the PATH hint as structured data in JSON
+        // surface the PATH hint as structured data in JSON
         // mode so agents can detect "shims installed but not on
         // PATH" without scraping stderr/stdout. The four fields
         // mirror PathHintReport so consumers can treat it as a
@@ -1722,7 +1715,7 @@ fn print_success(
 
 // ─── Helpers ─────────────────────────────────────────────────────────
 
-// Phase 35 Step 6 fix: removed `build_registry` — `run` now receives
+// Step 6 fix: removed `build_registry` — `run` now receives
 // the injected `&RegistryClient` so `--registry` and `SessionManager`
 // are honored.
 
@@ -1744,8 +1737,8 @@ fn sanitize_inner_name(name: &str) -> String {
     name.replace(['@', '/', '.'], "-")
 }
 
-/// Phase 37 M5.2: build the synthetic `package.json` body for the
-/// install root. Extends the pre-M5 minimal shape with an
+/// build the synthetic `package.json` body for the
+/// install root. Extends the prior minimal shape with an
 /// `lpm.trustedDependencies` Rich-form map populated from
 /// `~/.lpm/global/trusted-dependencies.json`, so the inner project
 /// install pipeline's strict-gate check sees the user's global
@@ -1771,9 +1764,9 @@ fn sanitize_inner_name(name: &str) -> String {
 /// ```
 ///
 /// Omits the `lpm` block when the global trust file is empty so the
-/// on-disk file remains minimal (matches pre-M5.2 byte-for-byte when
-/// no packages have been approved). This keeps the "fresh machine"
-/// path identical to the pre-M5 surface — the `lpm` block only
+/// on-disk file remains minimal (matches the no-trust shape byte-for-byte
+/// when no packages have been approved). This keeps the "fresh machine"
+/// path identical to the baseline — the `lpm` block only
 /// appears once the user has approved something.
 fn synthesize_pkg_json(
     root: &LpmRoot,
@@ -1813,15 +1806,14 @@ fn synthesize_pkg_json(
     Ok(serde_json::Value::Object(obj))
 }
 
-/// Phase 37 M5.2: emit a post-install banner if the new install root's
+/// emit a post-install banner if the new install root's
 /// per-install `build-state.json` surfaces packages not covered by the
 /// global trust list. Mirrors the project-level
 /// `install::run`'s post-install security summary (which is suppressed
 /// for globals via `no_security_summary: true`).
 ///
 /// Silent in JSON mode — JSON consumers already see `path_hint` in
-/// `print_success`'s structured output; surfacing the same data there
-/// is an M5.3 / M6 polish item. For now, JSON stays quiet.
+/// `print_success`'s structured output, so JSON stays quiet.
 ///
 /// Errors reading the build-state or trust file are non-fatal: the
 /// install already committed. A missing build-state just means no
@@ -1915,12 +1907,11 @@ mod tests {
                     ("HOME", home.as_os_str().to_owned()),
                     ("LPM_HOME", lpm_home.as_os_str().to_owned()),
                     ("LPM_REGISTRY_URL", registry_url.into()),
-                    // Phase 66 Phase 4d — install_global tests assert on
+                    // — install_global tests assert on
                     // v1 store-pipeline interactions (tarball fetch counts,
                     // wrapper layout, etc.). Pin to v1 since v2's
                     // regression coverage lives in the audit-fixture CI
-                    // matrix; install_global's v2 surface is a Phase 4
-                    // follow-up.
+                    // matrix; install_global's v2 surface is a                     // follow-up.
                     ("LPM_STORE_VERSION", "v1".into()),
                 ]),
             }
@@ -2189,7 +2180,7 @@ mod tests {
             ],
         );
 
-        // Phase 49: `install_global::run` drives the orchestration in
+        // `install_global::run` drives the orchestration in
         // `install.rs::run_with_options`, which builds a `BfsWalker` that
         // reads `RouteMode::from_env_or_default()`. Default in the
         // shipped binary is `Direct` — the walker hits `npm_registry_url`
@@ -2219,7 +2210,7 @@ mod tests {
                 .respond_with(ResponseTemplate::new(200).set_body_json(metadata))
                 .mount(&server)
                 .await;
-            // npm-direct path (Direct mode, the shipped §5 default).
+            // npm-direct path (Direct mode, the shipped default).
             Mock::given(method("GET"))
                 .and(match_path(format!("/{name}")))
                 .respond_with(ResponseTemplate::new(200).set_body_json(metadata))
@@ -2429,7 +2420,7 @@ mod tests {
         assert_eq!(sanitize_inner_name("eslint"), "eslint");
     }
 
-    /// Audit Medium (M3.2 round) + audit High (M3.2 fix round): the
+    /// Audit Medium + audit High: the
     /// detection helper itself moved to `lpm_global::find_command_collisions`
     /// (and is exercised by the lpm-global test suite). Here we verify
     /// the user-facing formatting helpers and the inline-rollback
@@ -2457,11 +2448,10 @@ mod tests {
 
     #[test]
     fn collision_error_message_includes_workaround_hint() {
-        // M4.3 replaced the pre-M4 "uninstall -g ..." workaround hint
-        // with concrete --replace-bin / --alias examples. This test
-        // now pins the baseline shape (owner naming + remediation
-        // surface present); the M4.3-specific sections below pin the
-        // exact flag forms.
+        // The collision error now uses concrete --replace-bin / --alias
+        // examples rather than a generic workaround hint. This test
+        // pins the baseline shape (owner naming + remediation present);
+        // the sections below pin the exact flag forms.
         let collisions = vec![CommandCollision {
             command: "eslint".into(),
             current_owner: "eslint".into(),
@@ -2496,7 +2486,7 @@ mod tests {
         assert!(format!("{}", collision_error("c", &two)).contains("commands that are"));
     }
 
-    /// Audit High (M3.2 fix round): rollback_aborted_commit must leave
+    /// Audit High: rollback_aborted_commit must leave
     /// the manifest with no pending row, the install root removed (or
     /// tombstoned), and a WAL Abort appended. Without this, the next
     /// recovery would silently commit the rejected install on the next
@@ -2566,10 +2556,10 @@ mod tests {
         assert!(a.ends_with(&pid));
     }
 
-    // ─── M5.2: synthesize_pkg_json ───────────────────────────────────
+    // ─── synthesize_pkg_json ───────────────────────────────────
 
     /// Empty global trust file: the synthesized package.json has NO
-    /// `lpm` block so the on-disk shape is byte-identical to pre-M5
+    /// `lpm` block so the on-disk shape matches the no-trust baseline
     /// (prevents a no-op diff across every global install).
     #[test]
     fn synthesize_pkg_json_omits_lpm_block_when_global_trust_is_empty() {
@@ -2650,7 +2640,7 @@ mod tests {
         );
     }
 
-    // ─── M4.1: CollisionResolution flag parsing ──────────────────────
+    // ─── CollisionResolution flag parsing ──────────────────────
 
     fn parse(replace: &[&str], alias: &[&str]) -> Result<CollisionResolution, String> {
         let r: Vec<String> = replace.iter().map(|s| (*s).to_string()).collect();
@@ -2787,21 +2777,21 @@ mod tests {
         assert_eq!(r.alias.get("serve"), Some(&"foo-serve".to_string()));
     }
 
-    /// M4.1 explicitly does NOT know about the package's actual command
+    /// explicitly does NOT know about the package's actual command
     /// set — marker discovery runs later in the pipeline. Commands
     /// named in flags that don't exist on the package are accepted
-    /// here and will be rejected in M4.2's commit-time semantic check.
+    /// here and will be rejected in the commit-time semantic check.
     /// Pins the boundary so a future refactor doesn't accidentally pull
     /// that check upstream without wiring marker_commands access.
     #[test]
     fn collision_resolution_does_not_validate_against_package_commands_yet() {
-        // "nonexistent" looks like any other command name to M4.1.
+        // "nonexistent" looks like any other command name at flag-parse time.
         let r = parse(&["nonexistent"], &["another=x"]).unwrap();
         assert!(r.replace.contains("nonexistent"));
         assert!(r.alias.contains_key("another"));
     }
 
-    // ─── M4.2: plan_resolution unit tests ────────────────────────────
+    // ─── plan_resolution unit tests ────────────────────────────
 
     /// Seed a manifest with a single globally-installed package that
     /// directly owns `owned_commands`. Helper for plan tests below.
@@ -2929,7 +2919,7 @@ mod tests {
                 alias_name,
                 entry_snapshot,
             } => {
-                // M4 audit Finding #3: alias-owner snapshots are keyed
+                // Audit: alias-owner snapshots are keyed
                 // by the exposed name (the alias key), not the owner
                 // package. Pin that.
                 assert_eq!(alias_name, "serve");
@@ -2950,7 +2940,7 @@ mod tests {
     #[test]
     fn plan_resolution_alias_install_excludes_orig_from_final_commands() {
         // User aliases `serve` to `foo-serve`. `serve` must NOT appear
-        // in final_commands (M4 manifest invariant: direct commands
+        // in final_commands (alias-exclusion invariant: direct commands
         // exclude aliased-away names).
         let m = GlobalManifest::default();
         let mut alias = BTreeMap::new();
@@ -3070,7 +3060,7 @@ mod tests {
         }
     }
 
-    // ─── M4.2: apply_ownership_change_to_manifest behavior ───────────
+    // ─── apply_ownership_change_to_manifest behavior ───────────
 
     #[test]
     fn apply_ownership_change_direct_transfer_drops_command_from_old_owner() {
@@ -3131,7 +3121,7 @@ mod tests {
         assert!(m.packages["old"].commands.is_empty());
     }
 
-    // ─── M4 audit pass 1 Finding 1 (High): WAL durability ordering ──
+    // ─── audit pass 1 Finding 1 (High): WAL durability ordering ──
     //
     // The second Intent with populated ownership_delta MUST be durably
     // on disk BEFORE any shim mutation starts. Pre-fix, shim writes
@@ -3425,7 +3415,7 @@ mod tests {
         assert_eq!(plan.final_commands, vec!["taken", "safe"]);
     }
 
-    // ─── M4.3: collision_error message content ───────────────────────
+    // ─── collision_error message content ───────────────────────
 
     fn single_collision(cmd: &str, owner: &str) -> CommandCollision {
         CommandCollision {
@@ -3435,9 +3425,8 @@ mod tests {
         }
     }
 
-    /// Pre-M4 wording is gone. Error must name both flag forms so a
-    /// user with no prior LPM context can recover. Pins the contract
-    /// the audit called out.
+    /// Error must name both flag forms so a user with no prior LPM
+    /// context can recover. Pins the remediation contract.
     #[test]
     fn collision_error_mentions_both_override_flags() {
         let e = collision_error("foo", &[single_collision("serve", "http-server")]);
@@ -3500,15 +3489,14 @@ mod tests {
         );
     }
 
-    /// No references to the pre-M4 "wait for M4" wording — that's the
-    /// whole point of M4.3.
+    /// Error must not reference the old placeholder "wait for M4" wording.
     #[test]
-    fn collision_error_does_not_reference_pre_m4_wording() {
+    fn collision_error_does_not_reference_old_placeholder_wording() {
         let e = collision_error("foo", &[single_collision("serve", "x")]);
         let msg = e.to_string();
         assert!(
             !msg.contains("wait for M4"),
-            "pre-M4 placeholder wording must be gone: {msg}"
+            "old placeholder wording must be gone: {msg}"
         );
         assert!(
             !msg.to_lowercase().contains("until then"),
@@ -3516,7 +3504,7 @@ mod tests {
         );
     }
 
-    // ─── M4.4: TTY prompt fold logic ─────────────────────────────────
+    // ─── TTY prompt fold logic ─────────────────────────────────
     //
     // The actual cliclack interaction can't be unit-tested without a
     // PTY. The fold function `fold_choices_into_resolution` is the
@@ -3582,7 +3570,7 @@ mod tests {
     #[test]
     fn fold_cancel_after_valid_choices_still_aborts_everything() {
         // Cancel on the SECOND collision (first was resolved) must still
-        // abort — partial-resolution installs violate the M4 invariant.
+        // abort — partial-resolution installs violate the invariant.
         let err = fold_choices_into_resolution(&[
             (col("serve", "x"), CollisionChoice::Replace),
             (col("lint", "y"), CollisionChoice::Cancel),

@@ -3,7 +3,7 @@
 //! Hand-written recursive descent. No external parser generator. The grammar
 //! is small and the error messages are better when written by hand.
 //!
-//! ## Grammar (informal EBNF, design doc §6)
+//! ## Grammar (informal EBNF)
 //!
 //! ```text
 //! filter      := exclusion | directional

@@ -1,12 +1,10 @@
 //! Deterministic SHA-256 hash of a package's install-time lifecycle scripts.
 //!
-//! **Phase 32 Phase 4** — the `script_hash` side of the
-//! `{name, version, integrity, script_hash}` approval binding (see Phase 4
-//! status doc §"Trust persistence"). The hash covers EXACTLY the phases the
-//! build pipeline actually runs (per F3 in the Phase 4 status doc) so an
-//! edit to a non-executed phase like `prepare` does NOT invalidate
-//! approvals. The hash is deterministic across machines: same package
-//! contents → same hash.
+//! The `script_hash` side of the `{name, version, integrity, script_hash}`
+//! approval binding. The hash covers EXACTLY the scripts the build pipeline
+//! actually runs so an edit to a non-executed script like `prepare` does NOT
+//! invalidate approvals. The hash is deterministic across machines: same
+//! package contents → same hash.
 //!
 //! ## Hash format
 //!
@@ -34,10 +32,9 @@
 //!
 //! The package.json read is from `<store>/<safe_name>@<version>/package.json`
 //! (the GLOBAL STORE), NOT from a project-local `node_modules/` symlink.
-//! This matches what the build pipeline actually executes per F10 in the
-//! Phase 4 status doc, and forecloses an attack where a project-local
-//! symlink edit (e.g., to a workspace member's manifest) drifts the
-//! observed hash from the executed bytes.
+//! This matches what the build pipeline actually executes, and forecloses
+//! an attack where a project-local symlink edit (e.g., to a workspace
+//! member's manifest) drifts the observed hash from the executed bytes.
 
 use sha2::{Digest, Sha256};
 use std::path::Path;

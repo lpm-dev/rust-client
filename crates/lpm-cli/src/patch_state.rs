@@ -1,6 +1,6 @@
-//! **Phase 32 Phase 6 — `<project_dir>/.lpm/patch-state.json` persistence layer.**
 //!
-//! Mirrors the [`crate::overrides_state`] pattern (Phase 5) for the
+//!
+//! Mirrors the [`crate::overrides_state`] pattern for the
 //! `lpm patch` apply trace. The state file persists three things across
 //! installs:
 //!
@@ -111,7 +111,7 @@ pub struct AppliedPatchHit {
     ///
     /// **Backward compat:** declared as `Option<String>` with serde
     /// default so state files written before the audit fix
-    /// (2026-04-12) — which lacked this field — still parse cleanly.
+    ///  — which lacked this field — still parse cleanly.
     /// Readers that find `None` should treat the integrity as "not
     /// recorded" rather than degrading the user experience.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -146,8 +146,8 @@ impl PatchState {
 /// Parse the raw `lpm.patchedDependencies` map into a sorted, validated
 /// list of [`ParsedPatchEntry`]. Sorting is by `raw_key` so the on-disk
 /// representation is deterministic regardless of HashMap iteration
-/// order. Phase 6 accepts only `name@exact-version` keys; range
-/// selectors are deferred to Phase 6.1 — see
+/// order. accepts only `name@exact-version` keys; range
+/// selectors are deferred to — see
 /// [`crate::patch_engine::parse_patch_key`] for the canonical parser
 /// (this function tolerates invalid keys by skipping them so the state
 /// file never blocks introspection of an otherwise-malformed manifest).
@@ -491,7 +491,7 @@ mod tests {
         std::fs::create_dir_all(&lpm_dir).unwrap();
         std::fs::write(
             lpm_dir.join(PATCH_STATE_FILENAME),
-            r#"{"state_version":999,"fingerprint":"sha256-x","captured_at":"2026-04-12T00:00:00Z","parsed":[],"applied":[]}"#,
+            r#"{"state_version":999,"fingerprint":"sha256-x","captured_at":"T00:00:00Z","parsed":[],"applied":[]}"#,
         )
         .unwrap();
         assert!(

@@ -5,7 +5,7 @@
 //! ```text
 //! <project>/
 //!   .lpm/
-//!     wrappers/                                ← internal store (Phase 61.1)
+//!     wrappers/                                ← internal store
 //!       express@4.22.1/
 //!         .linked                              ← stamp marker (incremental cache)
 //!         node_modules/
@@ -28,7 +28,7 @@
 //! - All wrappers live in `<project>/.lpm/wrappers/` (a project-root sibling)
 //! - Strict isolation: phantom dependencies are not importable
 //!
-//! Phase 61.1 relocation: wrappers used to live under `node_modules/.lpm/`,
+//! Relocation: wrappers used to live under `node_modules/.lpm/`,
 //! which meant `rm -rf node_modules` wiped the entire incremental cache.
 //! Moving them out of `node_modules` makes the warm-install path actually
 //! incremental.
@@ -47,33 +47,33 @@ use std::path::{Component, Path, PathBuf};
 pub mod layout;
 pub use layout::{InstallHealth, LayoutPaths, LinkerLayout};
 
-// Phase 66 Phase 4b — virtual-store-aware linker. Selected when
+// Virtual-store-aware linker. Selected when
 // `LPM_STORE_VERSION=v2`; sits next to the v1 isolated/hoisted code
 // paths in this crate. See `src/v2.rs` for the design doc.
 pub mod v2;
 
-/// Phase 39 P2b per-package link outcome — exposes Phase 1 action + Phase 2
+/// Per-package link outcome — exposes Stage 1 action + Stage 2
 /// symlink count to the event-driven caller so totals match the
 /// single-shot [`link_packages`] path.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct OnePackageResult {
-    /// `true` if Phase 1 freshly linked the package; `false` if the
+    /// `true` if Stage 1 freshly linked the package; `false` if the
     /// incremental `.linked` marker caused a skip.
     pub linked: bool,
-    /// Phase 2 internal-symlink count for this package (one per entry in
+    /// Stage 2 internal-symlink count for this package (one per entry in
     /// the package's `dependencies` that wasn't already symlinked).
     pub symlinks_created: usize,
 }
 
-/// Phase 39 P2b final-stage result — Phase 3 root symlinks + Phase 3.5
-/// self-reference + Phase 4 `.bin` creation, aggregated into the tail
+/// Final-stage result — Stage 3 root symlinks + Stage 3.5
+/// self-reference + Stage 4 `.bin` creation, aggregated into the tail
 /// end of the `LinkResult` that [`link_packages`] returns.
 #[derive(Debug, Default)]
 pub struct FinalizeResult {
-    /// Phase 3 + 3.5 symlink count (direct-dep root symlinks + optional
+    /// Stage 3 + 3.5 symlink count (direct-dep root symlinks + optional
     /// self-reference).
     pub symlinks_created: usize,
-    /// Phase 4 `.bin` entries created.
+    /// Stage 4 `.bin` entries created.
     pub bin_count: usize,
     /// `true` iff the self-reference symlink at `node_modules/<self>`
     /// was created on this call.
@@ -101,10 +101,10 @@ const SHADOWED_BINARIES: &[&str] = &[
 /// `Err(reason)` if it must be rejected entirely.
 /// Logs a warning (but does not reject) for names that shadow common system binaries.
 ///
-/// Public so Phase 37 M4 (collision UX) can reuse the same safety bar
-/// for user-supplied alias names (`--alias orig=alias`) — every path on
-/// PATH should meet the same sanity check regardless of whether it came
-/// from `package.json` or a CLI flag.
+/// Public so user-supplied alias names (`--alias orig=alias`) can
+/// reuse the same safety bar — every path on PATH should meet the
+/// same sanity check regardless of whether it came from
+/// `package.json` or a CLI flag.
 pub fn validate_bin_name(name: &str, pkg_name: &str) -> Result<(), String> {
     if name.is_empty() {
         return Err("bin name is empty".to_string());
@@ -168,7 +168,7 @@ fn relative_symlink_target_from_parent(target: &Path, link_parent: &Path) -> Pat
     pathdiff::diff_paths(target, &link_parent_canonical).unwrap_or_else(|| target.to_path_buf())
 }
 
-// Phase 66 Phase 4a follow-up: cmd-path validation moved to
+// Follow-up: cmd-path validation moved to
 // `lpm_common::symlink` so lpm-store v2 shares the same security check
 // (was duplicated). Re-imported under the legacy local name to keep
 // the surrounding call sites untouched.
@@ -177,8 +177,8 @@ use lpm_common::symlink::validate_cmd_path;
 
 /// Linking strategy for node_modules.
 ///
-/// **Default flipped to [`Hoisted`] in Phase 66 Phase 4f**
-/// (post-virtual-store-ship). Pre-Phase-4f the default was
+/// **Default flipped to [`Hoisted`] in **
+/// (post-virtual-store-ship). pre- the default was
 /// [`Isolated`] — the strict pnpm-style layout — but its everyday
 /// dev workflow (`rm -rf node_modules` → `lpm install`) under v1
 /// required clonefiling all bytes back from `~/.lpm/store/v1/`,
@@ -186,16 +186,16 @@ use lpm_common::symlink::validate_cmd_path;
 /// and would have made the flip user-hostile despite hoisted's
 /// 1.3× cold-install win.
 ///
-/// Phase 66's virtual store ([`lpm_store::v2`]) restructured both
+/// 's virtual store ([`lpm_store::v2`]) restructured both
 /// modes to symlink project `node_modules/<dep>` into a global
 /// `~/.lpm/store/v2/links/<graph-key>/` materialization. After 4d
 /// the default `LPM_STORE_VERSION=v2` made warm-install identical
-/// between modes (Phase 4f bench: isolated median 110 ms, hoisted
+/// between modes (Stage 4 (post-flip) bench: isolated median 110 ms, hoisted
 /// median 110 ms, paired delta +0 ms). Flipping the default to
 /// `Hoisted` gives users:
 ///
 /// - Cold-install win — hoisted is ~497 ms faster than isolated
-///   on `bench/fixture-large` cold/full (active-roadmap §2.6).
+///   on `bench/fixture-large` cold/full.
 /// - Same warm-install (post-v2 — see above).
 /// - Phantom-dep accessibility for tooling that relied on
 ///   npm-style flat node_modules (most ecosystem projects).
@@ -211,8 +211,7 @@ pub enum LinkerMode {
     /// Available via explicit `--linker isolated` /
     /// `LPM_LINKER=isolated` / `package.json > lpm > linker`.
     Isolated,
-    /// npm v3+ style hoisted layout. Flat, phantom deps accessible.
-    /// **Default since Phase 66 Phase 4f.**
+    /// npm v3+ style hoisted layout. Flat, phantom deps accessible. Default.
     #[default]
     Hoisted,
 }
@@ -306,7 +305,7 @@ mod linker_mode_tests {
 /// Junctions require absolute paths, so we resolve relative targets before creating.
 /// Falls back to `symlink_dir` if junction creation fails.
 ///
-// Phase 66 Phase 4a follow-up: directory-link creation moved to
+// Follow-up: directory-link creation moved to
 // `lpm_common::symlink::create_dir_symlink_or_junction` so lpm-store
 // v2 shares the same Windows symlink-then-junction fallback (`mklink
 // /J`) — duplicating it would have left v2 regressing on Windows
@@ -314,18 +313,14 @@ mod linker_mode_tests {
 // name to keep call sites untouched.
 use lpm_common::symlink::create_dir_symlink_or_junction as create_symlink_or_junction;
 
-/// **Phase 59.1 audit response (post-day-7)** — drives the Phase-1
-/// materialization branch in [`link_one_package`].
+/// Drives the materialization branch in [`link_one_package`].
 ///
-/// Decoupled from [`LinkTarget::wrapper_id`] so tarball-source
-/// LinkTargets can carry a wrapper_id (for collision-free
-/// `.lpm/<safe>+<wrapper_id>/` segments) WITHOUT inheriting the
-/// directory-source per-file-symlink materialization. Pre-audit the
-/// linker used `wrapper_id.is_some()` as a proxy for "this is a
-/// directory source" — true for Directory/Link, false for everything
-/// else. Once Tarball started using `wrapper_id` (to avoid cross-source
-/// wrapper collisions with Registry), the proxy was no longer
-/// load-bearing and the two concerns had to be separated.
+/// Decoupled from [`LinkTarget::wrapper_id`] so tarball sources can
+/// carry a wrapper_id (for collision-free `.lpm/<safe>+<wrapper_id>/`
+/// segments) WITHOUT inheriting the directory-source per-file-symlink
+/// materialization. Using `wrapper_id.is_some()` as the proxy stopped
+/// working once Tarball started using it for cross-source collision
+/// avoidance — these two concerns need separate fields.
 ///
 /// The default ([`Materialization::CasBacked`]) matches the legacy
 /// behavior for every CAS-backed source (Registry, Tarball remote,
@@ -364,12 +359,12 @@ pub struct LinkTarget {
     /// The local name is what appears as `node_modules/<local>/` inside
     /// THIS package's `.lpm/<self>@<ver>/node_modules/`. For regular
     /// deps the local name equals the child's canonical registry name.
-    /// For Phase 40 P2 npm-alias edges, it is the alias key from this
+    /// For npm-alias edges, it is the alias key from this
     /// package's `package.json` (e.g., `strip-ansi-cjs`), and
     /// [`Self::aliases`] records the canonical registry name so the
     /// linker can resolve the symlink target to `<target>@<ver>`.
     pub dependencies: Vec<(String, String)>,
-    /// **Phase 40 P2** — npm-alias edges: `local_name → target_canonical_name`.
+    /// npm-alias edges: `local_name → target_canonical_name`.
     /// Populated only for local names that refer to a different
     /// registry-canonical target than themselves (the common case is
     /// empty). Lookup rule: `aliases.get(local).unwrap_or(local)`
@@ -378,18 +373,18 @@ pub struct LinkTarget {
     /// Whether this is a direct dependency of the root project.
     ///
     /// Used for lifecycle-script filtering and display purposes. For
-    /// Phase 3 root-symlink creation, the linker consults
+    /// Stage 3 root-symlink creation, the linker consults
     /// [`Self::root_link_names`] instead — that field expresses the
     /// alias-aware "what filenames do I get at the project root"
     /// contract, including the (rare) case of a single package
     /// referenced by its canonical name AND by one or more aliases at
     /// the same version.
     pub is_direct: bool,
-    /// **Phase 40 P2** — explicit list of `node_modules/<entry>/`
+    /// Explicit list of `node_modules/<entry>/`
     /// symlinks to create at the project root for this package.
     ///
     /// Callers may leave this `None` to get the default pre-P2
-    /// behavior: Phase 3 creates a single `node_modules/<name>/`
+    /// behavior: Stage 3 creates a single `node_modules/<name>/`
     /// symlink when `is_direct` is true, nothing otherwise. Callers
     /// that have alias info from the resolver set this to
     /// `Some(vec![...])`:
@@ -398,7 +393,7 @@ pub struct LinkTarget {
     ///   default, but explicit).
     /// - `Some([local])` where `local != pkg.name`: aliased root dep —
     ///   the consumer declared `"local": "npm:<pkg.name>@<range>"`.
-    ///   Phase 3 creates `node_modules/<local>/` with the target set to
+    ///   Stage 3 creates `node_modules/<local>/` with the target set to
     ///   `.lpm/<pkg.name>@<version>/node_modules/<pkg.name>/`.
     /// - `Some([name, alias1, ...])`: the same resolved `(name,
     ///   version)` is referenced from the root under multiple names
@@ -406,32 +401,28 @@ pub struct LinkTarget {
     /// - `Some([])`: never a root dep, no root symlink. Distinguishes
     ///   "explicitly zero" from "use the default."
     ///
-    /// When `Some`, the `is_direct` flag is ignored for Phase 3
+    /// When `Some`, the `is_direct` flag is ignored for Stage 3
     /// purposes; `is_direct` is still consulted elsewhere (lifecycle
-    /// filtering, display). When `None`, Phase 3 falls back to the
+    /// filtering, display). When `None`, Stage 3 falls back to the
     /// `is_direct ? [name] : []` default.
     pub root_link_names: Option<Vec<String>>,
-    /// **Phase 59.1 day-2 (F7) + audit response** — when `Some`, the
-    /// `.lpm/` wrapper segment is `<safe_name>+<wrapper_id>` instead
-    /// of the legacy `<safe_name>@<version>`. Used for any source
-    /// whose `(name, version)` could collide with another source kind
-    /// — i.e., every NON-Registry source.
+    /// When `Some`, the `.lpm/` wrapper segment is
+    /// `<safe_name>+<wrapper_id>` instead of `<safe_name>@<version>`.
+    /// Used for any source whose `(name, version)` could collide
+    /// with another source kind — every NON-Registry source.
+    /// Required so `Source::Registry { foo@1.0.0 }` and
+    /// `Source::Tarball { foo@1.0.0 from custom URL }` stay distinct
+    /// in the wrapper tree.
     ///
-    /// Day-2 introduced this field as a proxy for "is this a local-
-    /// source directory dep?" (Directory + Link only). The audit
-    /// response (post-day-7) extended `wrapper_id` to Tarball sources
-    /// too (remote + local) because registry `foo@1.0.0` and tarball
-    /// `foo@1.0.0` were silently colliding under the same wrapper
-    /// segment. Materialization strategy is now controlled by the
-    /// orthogonal [`LinkTarget::materialization`] field, NOT
+    /// Materialization strategy is controlled by the orthogonal
+    /// [`LinkTarget::materialization`] field, NOT
     /// `wrapper_id.is_some()`.
     ///
     /// The `+` separator visually distinguishes wrapped sources from
-    /// unwrapped (Registry-only) deps in the `.lpm/` tree. Pre-plan
-    /// §6.2 specifies the directory-source contract: Node module
-    /// resolution from inside the wrapped package walks ancestors
-    /// that stay inside the consumer's `node_modules/` tree, so
-    /// transitive deps resolve correctly (which a direct
+    /// unwrapped (Registry-only) deps in the `.lpm/` tree. Node
+    /// module resolution from inside the wrapped package walks
+    /// ancestors that stay inside the consumer's `node_modules/`
+    /// tree, so transitive deps resolve correctly (which a direct
     /// `node_modules/<name>` symlink at the source realpath would
     /// NOT achieve).
     ///
@@ -447,16 +438,15 @@ pub struct LinkTarget {
     /// correctness depends on the caller producing a stable,
     /// collision-free identifier per `(name, version)` group.
     pub wrapper_id: Option<String>,
-    /// **Phase 59.1 audit response (post-day-7)** — drives the Phase-1
-    /// materialization branch. See [`Materialization`] for the full
-    /// contract.
+    /// Drives the materialization branch in [`link_one_package`].
+    /// See [`Materialization`] for the full contract.
     ///
     /// Defaults to [`Materialization::CasBacked`] — every source kind
     /// EXCEPT `Source::Directory` and `Source::Link` materializes
     /// from the global CAS store via [`link_dir_recursive`].
     pub materialization: Materialization,
-    /// **Phase 66 §2.5** — resolved peers in scope for this package's
-    /// instance in the install graph.
+    /// Resolved peers in scope for this package's instance in the
+    /// install graph.
     ///
     /// Shape: `(peer_name, resolved_version)`, sorted by peer_name.
     /// Empty under any of:
@@ -474,7 +464,7 @@ pub struct LinkTarget {
     /// 2. Fold into [`lpm_store::v2::GraphKeyInputs::with_peers`] so
     ///    two projects with the same edge graph but different peer
     ///    pinning produce distinct graph keys (the cross-project
-    ///    sharing invariant from preplan §2.5).
+    ///    cross-project sharing invariant).
     ///
     /// **Ignored under v1** — v1's relative-symlink wrappers walk
     /// up to the project root for peers, so threading is
@@ -482,8 +472,8 @@ pub struct LinkTarget {
     /// hoisted-mode v1 wanting to share wrappers across projects
     /// can fold it in.
     pub peers: Vec<(String, String)>,
-    /// **Phase 66 confidence-followup F1 (2026-05-09)** — patch
-    /// identity, plumbed through to v2's [`GraphKeyInputs::patch_fingerprint`].
+    /// Patch identity, plumbed through to v2's
+    /// [`GraphKeyInputs::patch_fingerprint`].
     ///
     /// `Some("p-<16hex>")` when the install pipeline detected a
     /// `lpm.patchedDependencies` entry covering this `(name, version)`,
@@ -502,11 +492,11 @@ pub struct LinkTarget {
 }
 
 impl LinkTarget {
-    /// Phase 59.1 day-2 (F7) — the `.lpm/<segment>/` directory name
+    /// The `.lpm/<segment>/` directory name
     /// for this target.
     ///
-    /// - `<safe_name>+<wrapper_id>` for local-source deps (Phase 59.1
-    ///   F7/F8). Visually distinct from the CAS shape so `lpm doctor`
+    /// - `<safe_name>+<wrapper_id>` for non-Registry deps. Visually
+    ///   distinct from the CAS shape so `lpm doctor`
     ///   / `lpm why` output is parseable at a glance.
     /// - `<safe_name>@<version>` for CAS-backed deps (the legacy
     ///   shape — Registry + Tarball remote + Tarball local all use
@@ -540,14 +530,14 @@ pub fn link_packages(
     force: bool,
     self_package_name: Option<&str>,
 ) -> Result<LinkResult, LpmError> {
-    // Phase 39 P2b: `link_packages` is now a thin composition over three
+    // `link_packages` is now a thin composition over three
     // smaller helpers so the event-driven install path can run them
     // independently (stale cleanup up front, per-pkg link as each tarball
     // lands, finalize once everything is materialized). The single-shot
     // path still calls them serially so existing callers are unaffected.
     cleanup_stale_entries(project_dir, packages)?;
 
-    // Phase 1 + Phase 2 per package, in a parallel pass. `link_one_package`
+    // Stage 1 + Stage 2 per package, in a parallel pass. `link_one_package`
     // is the same helper the event-driven path invokes on each fetch
     // completion — byte-identical work, just scheduled differently.
     let per_pkg: Vec<(MaterializedPackage, OnePackageResult)> = packages
@@ -582,37 +572,27 @@ pub fn link_packages(
     })
 }
 
-/// **Phase 59.1 audit response (round 3) — link stamp; round 5 — schema v2.**
+/// Identity stamp written to the wrapper's `.linked` marker.
 ///
-/// The `.linked` marker file inside a wrapper records the IDENTITY of
-/// the [`LinkTarget`] that materialized it. On subsequent installs,
-/// [`link_one_package`] reads the stamp and compares it against the
-/// new target — if they don't match (or the marker is empty / from
-/// a pre-stamp build), the wrapper is treated as stale and re-
-/// materialized.
+/// On subsequent installs, [`link_one_package`] reads the stamp and
+/// compares it against the new target — if they don't match (or the
+/// marker is empty / from a pre-stamp build), the wrapper is treated
+/// as stale and re-materialized.
 ///
-/// **Why round 3.** Pre-round-3, the marker was an empty sentinel
-/// that only signaled "a previous install completed Phase 1 here."
-/// Combined with `cleanup_stale_entries` keeping any wrapper whose
-/// segment remains in the new package set, this allowed a pre-round-1
-/// tarball wrapper at `.lpm/foo@1.0.0/` (where tarballs shared the
-/// same segment as registry deps) to survive a post-round-1 install
-/// of registry `foo@1.0.0` — the registry target's wrapper segment
-/// is also `foo@1.0.0`, cleanup preserves it, and the marker fast-
-/// path skips relinking. Stale tarball bytes masquerade as the
-/// registry package until the user forces a relink. The auditor
-/// flagged this in round 3.
-///
-/// **Why round 5 schema bump.** Round 3's v1 stamp encoded only
-/// `(wrapper_id, materialization, store_path)`. The auditor's round-5
-/// MEDIUM finding showed that two installs with the SAME store_path
-/// but DIFFERENT `target.dependencies` produce identical v1 stamps,
-/// so the fast path skips relinking and Phase 2's "skip if exists"
-/// dep loop preserves stale sibling symlinks. The v2 schema folds in
-/// `target.dependencies` and `target.aliases` so any change to the
-/// wrapper's internal edge set forces a relink. Round-4's "wipe full
-/// pkg_entry_dir on stamp mismatch" then cleans the stale edges
-/// alongside the stale package bytes.
+/// **Why the stamp encodes dep edges.** An empty marker — "a
+/// previous install completed here" — lets a stale tarball wrapper
+/// at `.lpm/foo@1.0.0/` survive a subsequent install of registry
+/// `foo@1.0.0` (same segment, cleanup preserves it, fast path
+/// skips relinking, stale tarball bytes masquerade as the registry
+/// package). Stamping `wrapper_id` + `materialization` +
+/// `store_path` alone is also insufficient: two installs with the
+/// same `store_path` but different `target.dependencies` produce
+/// identical stamps, so the "skip if exists" dep loop preserves
+/// stale sibling symlinks. Folding `dependencies` and `aliases`
+/// into the stamp means any change to the wrapper's internal edge
+/// set forces a relink; the stamp-mismatch path then wipes the
+/// wrapper's `pkg_entry_dir` before re-materializing, cleaning
+/// stale edges alongside the stale package bytes.
 ///
 /// **Format v2** (newline-separated header + key=value lines):
 /// ```text
@@ -625,9 +605,8 @@ pub fn link_packages(
 /// ```
 ///
 /// Header version is bumped if the schema changes; readers MUST
-/// reject unknown versions and force a relink (safer than silently
-/// trusting an unrecognized stamp). Empty / unparseable / v1 / legacy
-/// markers are treated identically to a mismatch (force relink).
+/// reject unknown versions and force a relink. Empty, unparseable,
+/// or older-schema markers are treated identically to a mismatch.
 fn compute_link_stamp(target: &LinkTarget) -> String {
     let materialization = match target.materialization {
         Materialization::CasBacked => "cas",
@@ -678,17 +657,17 @@ fn link_stamp_matches(marker_path: &Path, target: &LinkTarget) -> bool {
     on_disk == compute_link_stamp(target)
 }
 
-/// Phase 39 P2b: stale-entry cleanup — removes `.lpm/<pkg>@<ver>`
+/// Stale-entry cleanup — removes `.lpm/<pkg>@<ver>`
 /// directories and root `node_modules/<pkg>` symlinks that are no longer
 /// in the resolver's output. Must run BEFORE any per-package linking so
 /// its `read_dir` scans see a stable snapshot; calling it more than once
 /// per install is safe but wasteful.
 ///
 /// Also creates the wrapper root if it doesn't exist (the path is
-/// resolved through [`LayoutPaths`] so 61.1's relayout flips the
-/// location automatically).
+/// resolved through [`LayoutPaths`] so a future relayout flips
+/// the location automatically).
 ///
-/// Phase 61.1 D6: writes `<wrapper-root>/.version` recording the
+/// Writes `<wrapper-root>/.version` recording the
 /// layout schema version (`1`). A future shape change can detect
 /// old wrappers via this file and trigger a clean wipe-and-rebuild
 /// without ambiguity.
@@ -697,10 +676,10 @@ pub fn cleanup_stale_entries(project_dir: &Path, packages: &[LinkTarget]) -> Res
     let node_modules = project_dir.join("node_modules");
     let lpm_dir = layout.isolated_wrapper_root();
 
-    // Phase 61.1: pre-Phase-61 a single `create_dir_all` covered both
+    // Pre- a single `create_dir_all` covered both
     // `node_modules/` and the wrapper root (the wrapper root WAS
     // `node_modules/.lpm/`, so creating it implied creating its
-    // parent). After 61.1 they're disjoint paths, so each gets its
+    // parent). They're now disjoint paths, so each gets its
     // own create.
     std::fs::create_dir_all(&node_modules)?;
     std::fs::create_dir_all(&lpm_dir)?;
@@ -719,7 +698,7 @@ pub fn cleanup_stale_entries(project_dir: &Path, packages: &[LinkTarget]) -> Res
 
     // Incremental: collect expected entries so we can clean up stale ones.
     //
-    // Phase 59.1 day-2 (F7): the wrapper-segment shape is centralized
+    // The wrapper-segment shape is centralized
     // in [`LinkTarget::wrapper_segment`] so this set covers both
     // `<safe>@<version>` (CAS-backed) and `<safe>+<wrapper_id>`
     // (local-source) shapes uniformly.
@@ -728,7 +707,7 @@ pub fn cleanup_stale_entries(project_dir: &Path, packages: &[LinkTarget]) -> Res
 
     // Clean up stale wrapper entries that are no longer in the resolution.
     //
-    // Phase 61.1: skip the `.version` schema-tag file at the wrapper-
+    // Skip the `.version` schema-tag file at the wrapper-
     // root — it's a sibling of the per-package wrapper directories,
     // not a stale wrapper. Any entry starting with `.` is a sibling
     // metadata file and gets the same skip; the wrapper-segment
@@ -748,24 +727,24 @@ pub fn cleanup_stale_entries(project_dir: &Path, packages: &[LinkTarget]) -> Res
 
     // Also clean up stale root symlinks
     //
-    // Phase 40 P2 — the "expected root link names" come from
+    // The "expected root link names" come from
     // `root_link_names` on each package, not `is_direct + pkg.name`.
     // That set already includes every alias the resolver decided to
     // plant at the root (e.g. `strip-ansi-cjs` as an alias for
     // `strip-ansi@6.0.1`), so aliased root entries survive the stale
     // sweep.
     //
-    // Phase 61.1 audit fix — also retarget legacy-shape root symlinks.
+    // Audit fix — also retarget legacy-shape root symlinks.
     // Pre-fix, an upgrade-in-place install whose 61.3 migration
     // wiped `node_modules/.lpm/` left dangling root symlinks at
     // `node_modules/<pkg>` whose targets pointed at the wiped legacy
-    // location. Phase 3's `if root_link.exists()` guard then skipped
+    // location. Stage 3's `if root_link.exists` guard then skipped
     // recreation, so the user's `node_modules/<pkg>` stayed broken
     // (or — if the legacy tree was somehow restored — silently used
     // the wrong target). The fix: a symlink whose target points at
     // the legacy wrapper-root shape (`.lpm/<seg>/...` without the
     // `wrappers/` segment) is removed regardless of `direct_names`
-    // membership, and Phase 3 recreates it with the correct new
+    // membership, and Stage 3 recreates it with the correct new
     // target. Self-refs (target = `..`) and workspace-member
     // symlinks (target outside `.lpm/`) are unaffected — the
     // predicate requires `.lpm/` to be present.
@@ -846,7 +825,7 @@ pub fn cleanup_stale_entries(project_dir: &Path, packages: &[LinkTarget]) -> Res
     // The existing root-symlink sweep above only operates on
     // entries that ARE symlinks, so a `node_modules/<pkg>/` real
     // directory left behind by a previous hoisted install is invisible
-    // to it. Phase 3's `if root_link.exists()` guard then refuses to
+    // to it. Stage 3's `if root_link.exists` guard then refuses to
     // create the isolated root symlink, leaving direct dependencies
     // resolving through the stale hoisted bytes — a silent
     // mode-switch failure.
@@ -913,7 +892,7 @@ pub fn cleanup_stale_entries(project_dir: &Path, packages: &[LinkTarget]) -> Res
 }
 
 /// Return `true` iff the given path is a symlink whose target points
-/// at the pre-Phase-61.1 wrapper-root shape (`.lpm/<seg>/...` without
+/// at the pre- wrapper-root shape (`.lpm/<seg>/...` without
 /// the `wrappers/` segment).
 ///
 /// Used by [`cleanup_stale_entries`] to retarget root symlinks left
@@ -949,12 +928,12 @@ fn is_legacy_wrapper_symlink_target(link: &Path) -> bool {
     found_lpm && !found_wrappers_after_lpm
 }
 
-/// Phase 39 P2b: per-package link. Does Phase 1 (materialize
-/// `.lpm/<pkg>/node_modules/<pkg>` from the store) + Phase 2 (internal
+/// Per-package link. Does Stage 1 (materialize
+/// `.lpm/<pkg>/node_modules/<pkg>` from the store) + Stage 2 (internal
 /// symlinks for this package's dependencies).
 ///
 /// Safe to call concurrently for different packages — each call writes
-/// to a unique `.lpm/<safe_name>@<version>` subtree. Phase 2 symlinks
+/// to a unique `.lpm/<safe_name>@<version>` subtree. Stage 2 symlinks
 /// target relative strings that don't require the destination package
 /// to be materialized yet, so callers can pipeline per-package work
 /// into the fetch pipeline.
@@ -975,7 +954,7 @@ pub fn link_one_package(
     let marker_path = layout.isolated_marker_path(&wrapper_segment);
     let pkg_nm = pkg_entry_dir.join("node_modules").join(&target.name);
 
-    // **Phase 32 Phase 6.** Always record the canonical destination,
+    // **.** Always record the canonical destination,
     // even on the marker-skip fast path — the package IS materialized
     // there from a prior install run, just not freshly relinked.
     let materialized = MaterializedPackage {
@@ -1049,7 +1028,7 @@ pub fn link_one_package(
     // The pre-round-4 code removed only `pkg_nm`
     // (`.lpm/<segment>/node_modules/<name>/`), leaving the SIBLING
     // `.lpm/<segment>/node_modules/<other>` symlinks (the wrapper's
-    // dep edges) in place. The Phase-2 dep loop below skips any
+    // dep edges) in place. The Stage 2 dep loop below skips any
     // `dep_link.exists()` entry to avoid clobbering valid symlinks,
     // so a stale dep edge from the previous LinkTarget would survive
     // a relink even when the new target's `dependencies` no longer
@@ -1071,7 +1050,7 @@ pub fn link_one_package(
         let _ = std::fs::remove_dir_all(&pkg_entry_dir);
     } else if interrupted_link_recovery {
         // The package dir was created but the marker never landed.
-        // Wipe the full wrapper (round-4) because Phase 2 may have
+        // Wipe the full wrapper (round-4) because Stage 2 may have
         // planted partial sibling symlinks.
         tracing::debug!("cleaning up interrupted link for {safe_name}");
         let _ = std::fs::remove_dir_all(&pkg_entry_dir);
@@ -1081,7 +1060,7 @@ pub fn link_one_package(
         if let Some(parent) = pkg_nm.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        // Phase 59.1 day-2 (F7) + audit response: materialization
+        // + audit response: materialization
         // strategy is dispatched by the explicit `materialization`
         // field, NOT by `wrapper_id.is_some()`. Day-2 used the
         // `wrapper_id`-presence proxy because only Directory/Link
@@ -1107,10 +1086,10 @@ pub fn link_one_package(
         }
     }
 
-    // Phase 2: internal symlinks from this package's node_modules/ to
+    // Stage 2: internal symlinks from this package's node_modules/ to
     // each dependency's `.lpm/<dep>@<ver>/node_modules/<dep>` entry.
     //
-    // Phase 40 P2 — local-name / target-name split. The symlink
+    // Local-name / target-name split. The symlink
     // FILENAME uses the local name (what the parent's source code
     // expects via `require(dep_local)`). The symlink TARGET's
     // directory names use the TARGET canonical name (how the store
@@ -1123,16 +1102,16 @@ pub fn link_one_package(
     let pkg_nm_dir = pkg_entry_dir.join("node_modules");
     let mut symlinks_created = 0;
 
-    // Phase 57.2: pre-create the small set of unique scope dirs
+    // Pre-create the small set of unique scope dirs
     // (`@types/`, `@scope/`, …) needed by scoped deps in ONE pass,
     // outside the per-dep loop. The flat `pkg_nm_dir` itself is already
     // materialized by the line-521 `create_dir_all` + `link_dir_recursive`
     // for the package, so non-scoped deps need no parent mkdir at all.
-    // Pre-Phase-57.2 the loop did `create_dir_all(dep_link.parent())` per
+    // pre- the loop did `create_dir_all(dep_link.parent)` per
     // dep — for a webpack-style install that's ~1500–2500 redundant
     // stat-heavy syscall sequences (one per dep edge across 255 pkgs).
     // The samply warm-relink flamegraph shows mkdir at 20.5% of CPU; this
-    // dedup is one of the levers identified in the Phase 57.2 close-out.
+    // dedup is one of the levers identified in the close-out.
     let mut scope_dirs_created: std::collections::HashSet<&str> = std::collections::HashSet::new();
     for (dep_local, _) in &target.dependencies {
         if let Some((scope, _)) = dep_local.split_once('/')
@@ -1169,13 +1148,12 @@ pub fn link_one_package(
         for _ in 0..depth {
             sym_target.push("..");
         }
-        // **Phase 59.1 day-5 (F7-transitive) + audit response** —
-        // wrapper-segment shape branch. Targets whose `wrapper_id` is
-        // non-None use `<safe>+<wrapper_id>` instead of the legacy
+        // Wrapper-segment shape branch. Targets whose `wrapper_id` is
+        // non-None use `<safe>+<wrapper_id>` instead of
         // `<safe>@<version>`. The `dep_version` slot carries the
         // resolved SemVer for Registry targets, and the source-id
         // (`f-{16hex}` / `l-{16hex}` / `t-{16hex}`) for every other
-        // source kind. The audit response added the `t-` arm so
+        // source kind. The `t-` arm exists so
         // transitive Tarball deps (when they're tracked in a future
         // phase) route to the same `<safe>+t-{16hex}` wrapper that
         // immediate Tarball deps already use.
@@ -1226,11 +1204,11 @@ pub fn link_one_package(
     ))
 }
 
-/// Phase 39 P2b: link finalization — Phase 3 root symlinks for direct
-/// deps, Phase 3.5 self-reference, Phase 4 `.bin` creation.
+/// Link finalization — Stage 3 root symlinks for direct
+/// deps, Stage 3.5 self-reference, Stage 4 `.bin` creation.
 ///
 /// Must run AFTER [`link_one_package`] has completed for every package
-/// in `packages`. Phase 4 reads `package.json#bin` from each
+/// in `packages`. Stage 4 reads `package.json#bin` from each
 /// materialized package.
 pub fn link_finalize(
     project_dir: &Path,
@@ -1241,10 +1219,10 @@ pub fn link_finalize(
     let node_modules = project_dir.join("node_modules");
     let lpm_dir = layout.isolated_wrapper_root();
 
-    // Phase 3: root symlinks — parallel, one iteration per (pkg, link_name)
+    // Stage 3: root symlinks — parallel, one iteration per (pkg, link_name)
     // pair. A package with no root link names contributes nothing
     // (transitive deps); one entry is the common case (pkg.name);
-    // multiple entries support the Phase 40 P2 scenario where the
+    // multiple entries support the scenario where the
     // same resolved `(name, version)` is referenced from the root
     // under multiple local names (canonical + one or more aliases).
     //
@@ -1270,12 +1248,12 @@ pub fn link_finalize(
         })
         .collect();
 
-    // Phase 57.2: pre-create the small set of unique `@scope/` dirs at
+    // Pre-create the small set of unique `@scope/` dirs at
     // `node_modules/` ONCE, before the parallel root-link loop. For
     // non-scoped link names the parent is `node_modules/` itself, which
     // is already materialized by `cleanup_stale_entries` (it does
     // `create_dir_all(node_modules/.lpm)` which recursively creates
-    // `node_modules/`). The pre-Phase-57.2 loop did
+    // `node_modules/`). The pre- loop did
     // `create_dir_all(root_link.parent())` per pair — most calls were
     // redundant stat sequences against an already-existing dir. For a
     // webpack-style install with ~370 root link pairs that's ~370
@@ -1301,13 +1279,12 @@ pub fn link_finalize(
                 return Ok(0);
             }
 
-            // Phase 59.1 day-2 (F7): wrapper segment shape is
-            // centralized in `LinkTarget::wrapper_segment` so this
-            // path computation handles both `<safe>@<version>` (CAS-
-            // backed) and `<safe>+<wrapper_id>` (local-source) deps
-            // uniformly.
+            // Wrapper-segment shape is centralized in
+            // `LinkTarget::wrapper_segment` so this path computation
+            // handles both `<safe>@<version>` (CAS-backed) and
+            // `<safe>+<wrapper_id>` (non-Registry) deps uniformly.
             //
-            // Phase 61.1: the relative-path computation (depth + `..`
+            // The relative-path computation (depth + `..`
             // count, leading wrapper-root segments) is centralized in
             // [`LayoutPaths::root_symlink_target`] so the wrapper-root
             // relayout (now `<project>/.lpm/wrappers/`) is reflected
@@ -1318,14 +1295,14 @@ pub fn link_finalize(
             // documented on [`LinkTarget::root_link_names`].
             let target = layout.root_symlink_target(link_name, &pkg.wrapper_segment(), &pkg.name);
 
-            // **Phase 41 race tolerance.** `link_pairs` is iterated in
+            // **race tolerance.** `link_pairs` is iterated in
             // parallel via rayon; the check at the top of this closure
             // (`root_link.exists()`) is a TOCTOU check — two threads
             // targeting the same `link_name` can both read "doesn't
             // exist" and both try to create the symlink. Only one wins;
             // the loser returns `AlreadyExists`. Historically this
             // surfaced when `resolved_to_install_packages` produced
-            // duplicate `(canonical_name, version)` rows for Phase 40 P4
+            // duplicate `(canonical_name, version)` rows for
             // split contexts. The upstream fix dedups at the source,
             // but we keep this tolerance as a race-safe belt-and-braces:
             // a benign concurrent create should never abort an install.
@@ -1337,7 +1314,7 @@ pub fn link_finalize(
         })
         .try_reduce(|| 0usize, |a, b| Ok(a + b))?;
 
-    // Phase 3.5: self-reference — package can require("itself").
+    // Stage 3.5: self-reference — package can require("itself").
     let mut self_referenced = false;
     let mut self_ref_count = 0;
     if let Some(self_name) = self_package_name {
@@ -1370,14 +1347,14 @@ pub fn link_finalize(
         }
     }
 
-    // Phase 4: node_modules/.bin/ entries.
+    // Stage 4: node_modules/.bin/ entries.
     let bin_count = create_bin_links(&node_modules, &lpm_dir, packages)?;
 
     // Hoisted-symmetry — deferred inactive-mode state prune.
     //
     // We only prune `<project>/.lpm/hoisted/` once isolated linking
-    // has completed every fallible step (Phase 3 root symlinks +
-    // Phase 3.5 self-ref + Phase 4 bin links). If anything above
+    // has completed every fallible step (Stage 3 root symlinks +
+    // Stage 3.5 self-ref + Stage 4 bin links). If anything above
     // returned `Err`, the user keeps both layouts' state on disk and
     // can recover by re-running install. Best-effort wipe.
     let stale_hoisted = layout.hoisted_root();
@@ -1399,7 +1376,7 @@ pub fn link_finalize(
 /// Create a `node_modules/<package_name>` symlink that points at a workspace
 /// member's source directory.
 ///
-/// **Phase 32 Phase 2 audit fix #3** (workspace:^ resolver bug). The install
+/// **audit fix #3** (workspace:^ resolver bug). The install
 /// pipeline strips workspace member dependencies from the resolver input
 /// before resolution and links them locally with this helper after the
 /// regular linking pass has finished. The function is idempotent — if a stale
@@ -1516,9 +1493,8 @@ fn find_hoisted_anchor(
     let mut visited: std::collections::HashSet<usize> = std::collections::HashSet::new();
     while visited.insert(cur) {
         let pkg = &packages[cur];
-        // **R2.5 fix-1.5 — alias-aware anchor lookup.**
-        //
-        // Pre-fix this checked `hoisted.get(&pkg.name) == Some(&cur)`.
+        // Alias-aware anchor lookup: pre-fix this checked
+        // `hoisted.get(&pkg.name) == Some(&cur)`.
         // That breaks under aliases: an aliased direct dep with
         // `root_link_names = ["a-alias"]` and `pkg.name = "lodash"`
         // is hoisted at slot "a-alias", not "lodash" — the lookup
@@ -1605,7 +1581,7 @@ pub fn link_packages_hoisted(
 
     // Hoisted-symmetry: bootstrap the project-local hoisted state
     // directory so the metadata write at the bottom of this function
-    // (and any nested-fallback materialization in Phase 3) doesn't
+    // (and any nested-fallback materialization in Stage 3) doesn't
     // have to call `create_dir_all` per write. Idempotent by
     // construction.
     std::fs::create_dir_all(layout.hoisted_root())?;
@@ -1627,7 +1603,7 @@ pub fn link_packages_hoisted(
     // hoisted link loop calls `link_dir_recursive` which starts with
     // `std::fs::create_dir_all(dst)` — when `dst` is an intact
     // symlink that resolves to a directory, the call is a silent
-    // no-op and Phase 3 falls through `if target_dir.exists()`
+    // no-op and Stage 3 falls through `if target_dir.exists`
     // skipping materialization (the user keeps their stale isolated
     // shape). When `dst` is a broken symlink (e.g., we already
     // pruned the wrapper root), `create_dir_all` fails on macOS.
@@ -1637,7 +1613,7 @@ pub fn link_packages_hoisted(
     // remove every symlink. Recreations downstream:
     //   * Hoisted package symlinks: not used in hoisted mode (full
     //     copies via `link_dir_recursive`).
-    //   * Self-reference symlink: recreated by Phase 3.5 below.
+    //   * Self-reference symlink: recreated by Stage 3.5 below.
     //   * Workspace-member symlinks: recreated by `link_workspace_members`
     //     in the install pipeline after this function returns.
     //   * `.bin` shims: still real files inside `node_modules/.bin/`,
@@ -1691,7 +1667,7 @@ pub fn link_packages_hoisted(
     // with neither layout's state present. See the post-link prune
     // before the function's `Ok(LinkResult)` return.
 
-    // Phase 1: Determine hoisting layout.
+    // Stage 1: Determine hoisting layout.
     //
     // Build a dependency graph so we can figure out which package "depends on"
     // which conflicting version. The algorithm:
@@ -1732,17 +1708,16 @@ pub fn link_packages_hoisted(
         }
     }
 
-    // (package_index_to_nest, consumer_index_or_None) — Phase 1
-    // records this; Phase 1.5 resolves each consumer_index to a
+    // (package_index_to_nest, consumer_index_or_None) — Stage 1
+    // records this; Stage 1.5 resolves each consumer_index to a
     // hoisted-ancestor name via `find_hoisted_anchor`. None means
     // "no consumer found in the graph for this conflict version,"
     // which can happen for orphan-nested entries; the resolution
     // step falls back to the conflict name itself in that case.
     let mut nested_pending: Vec<(usize, Option<usize>)> = Vec::new();
 
-    // **R2.5 fix-1.5 — npm-alias root-slot claiming.**
-    //
-    // Pre-fix Phase 1 claimed slots keyed strictly on `pkg.name` (the
+    // npm-alias root-slot claiming: pre-fix Stage 1 claimed slots
+    // keyed strictly on `pkg.name` (the
     // canonical/registry identity). For a `npm:<target>@<range>` alias
     // declared at root level, `resolved_to_install_packages` populates
     // `LinkTarget.root_link_names` with the LOCAL alias name(s) — which
@@ -1809,7 +1784,7 @@ pub fn link_packages_hoisted(
         }
     }
 
-    // Phase 1.5: resolve each pending nested entry's anchor.
+    // Stage 1.5: resolve each pending nested entry's anchor.
     //
     // For a conflict-versioned package P@v that won't be hoisted,
     // find a "hoisted ancestor" by walking from one of its consumers
@@ -1823,7 +1798,7 @@ pub fn link_packages_hoisted(
     //
     // If no hoisted ancestor exists in the chain (orphan, cycle, or
     // graph error), fall back to the conflict's own name — same as
-    // the pre-fix behavior, which Phase 3's `hoisted.contains_key`
+    // the pre-fix behavior, which Stage 3's `hoisted.contains_key`
     // gate handles correctly via `hoisted_nested_root()`.
     for (idx, consumer_idx) in nested_pending {
         let parent = consumer_idx
@@ -1840,7 +1815,7 @@ pub fn link_packages_hoisted(
         desired_hoisted.insert(name.clone(), pkg.version.clone());
     }
 
-    // nested entries: "parent/name" → version (parent prefix makes them unique)
+    // Nested entries: "parent/name" → version (parent prefix makes them unique)
     let mut desired_nested: BTreeMap<String, String> = BTreeMap::new();
     for (pkg_idx, parent_name) in &nested {
         let pkg = &packages[*pkg_idx];
@@ -1848,7 +1823,7 @@ pub fn link_packages_hoisted(
         desired_nested.insert(key, pkg.version.clone());
     }
 
-    // Phase 1.5: Incremental check — read saved metadata and compare.
+    // Stage 1.5: Incremental check — read saved metadata and compare.
     // If the desired layout is identical to what we wrote last time, and
     // every expected directory still exists on disk, skip the expensive I/O.
     let metadata_path = layout.hoisted_metadata_path();
@@ -1882,7 +1857,7 @@ pub fn link_packages_hoisted(
 
     let mut linked_count = 0;
     let mut self_referenced = false;
-    // **Phase 32 Phase 6 — `lpm patch`.** Track materialized destinations.
+    // **`lpm patch`.** Track materialized destinations.
     // Hoisted mode has up to three shapes per package:
     //   - hoisted root:                 node_modules/<name>/
     //   - nested under hoisted parent:  node_modules/<parent>/node_modules/<name>/
@@ -1931,12 +1906,12 @@ pub fn link_packages_hoisted(
             }
         }
 
-        // Phase 2: Link hoisted packages directly into root node_modules/
+        // Stage 2: Link hoisted packages directly into root node_modules/
         for (name, &pkg_idx) in &hoisted {
             let pkg = &packages[pkg_idx];
             let target_dir = node_modules.join(name);
 
-            // Phase 32 Phase 6: record materialized destination BEFORE
+            // Record materialized destination BEFORE
             // the early-continue so the patch pass sees both freshly-
             // linked and already-existing entries.
             materialized.push(MaterializedPackage {
@@ -1960,7 +1935,7 @@ pub fn link_packages_hoisted(
             linked_count += 1;
         }
 
-        // Phase 3: Link nested (conflicting) packages under their parent's node_modules/
+        // Stage 3: Link nested (conflicting) packages under their parent's node_modules/
         for (pkg_idx, parent_name) in &nested {
             let pkg = &packages[*pkg_idx];
 
@@ -1972,7 +1947,7 @@ pub fn link_packages_hoisted(
 
             let nested_dir = parent_nm.join(&pkg.name);
 
-            // Phase 32 Phase 6: record materialized destination BEFORE
+            // Record materialized destination BEFORE
             // the early-continue. Both nested-shape branches (under
             // hoisted parent AND under .lpm/nested) flow through here.
             materialized.push(MaterializedPackage {
@@ -2008,7 +1983,7 @@ pub fn link_packages_hoisted(
         skipped_count = desired_hoisted.len() + desired_nested.len();
         // Self-reference handled at the join point below.
 
-        // **Phase 32 Phase 6.** Even on the metadata-skip fast path,
+        // **.** Even on the metadata-skip fast path,
         // the patch-apply pass needs the materialized location list.
         // Re-derive it from the same `packages` slice + `hoisted` /
         // `nested` decision tables we already built above. The
@@ -2036,7 +2011,7 @@ pub fn link_packages_hoisted(
         }
     }
 
-    // Phase 3.5 (post-symmetry placement): self-reference — package
+    // Stage 3.5 (post-symmetry placement): self-reference — package
     // can require("itself"). Runs unconditionally on BOTH the full
     // re-link branch AND the metadata-skip fast path, because the
     // isolated→hoisted convergence sweep above deleted the
@@ -2090,7 +2065,7 @@ pub fn link_packages_hoisted(
         }
     }
 
-    // Phase 4: Binary links for hoisted packages (always runs — cheap idempotent check).
+    // Stage 4: Binary links for hoisted packages (always runs — cheap idempotent check).
     let bin_count = create_bin_links_hoisted(&node_modules, packages, &hoisted)?;
 
     // Hoisted-symmetry — deferred inactive-mode state prune.
@@ -2257,13 +2232,13 @@ fn create_bin_links_hoisted(
         std::fs::create_dir_all(&bin_dir)?;
 
         for (cmd_name, script_path) in &entries {
-            // Finding #2: validate bin name
+            // Validate bin name
             if let Err(reason) = validate_bin_name(cmd_name, pkg_name) {
                 tracing::warn!("bin: rejecting \"{cmd_name}\" from {pkg_name}: {reason}");
                 continue;
             }
 
-            // Finding #1: validate bin target path (no traversal).
+            // Validate bin target path (no traversal).
             // pkg_path = node_modules/<name> here, same as the old &pkg_dir.
             let target = match validate_bin_target(&pkg_path, script_path) {
                 Ok(t) => t,
@@ -2279,13 +2254,13 @@ fn create_bin_links_hoisted(
                 let _ = std::fs::remove_file(&bin_link);
             }
 
-            // Finding #13: use relative symlinks for portability
+            // Use relative symlinks for portability
             #[cfg(unix)]
             {
                 let rel_target = relative_symlink_target_from_parent(&target, &bin_dir);
                 std::os::unix::fs::symlink(&rel_target, &bin_link)?;
 
-                // Finding #6: add execute only (0o111), not full 0o755
+                // Add execute only (0o111), not full 0o755
                 use std::os::unix::fs::PermissionsExt;
                 if let Ok(meta) = std::fs::metadata(&target) {
                     let mode = meta.permissions().mode();
@@ -2301,7 +2276,7 @@ fn create_bin_links_hoisted(
             #[cfg(windows)]
             {
                 let target_str = target.to_string_lossy();
-                // Finding #3: validate target path before interpolating into .cmd
+                // Validate target path before interpolating into .cmd
                 if let Err(reason) = validate_cmd_path(&target_str) {
                     tracing::warn!("bin: skipping .cmd shim for {cmd_name}: {reason}");
                     continue;
@@ -2339,7 +2314,7 @@ pub fn create_bin_links(
     let mut count = 0;
 
     for pkg in packages {
-        // Phase 61.1 audit fix #3: route the wrapper-segment shape
+        // Audit fix #3: route the wrapper-segment shape
         // through [`LinkTarget::wrapper_segment`] so local-source deps
         // (Directory/Link, with `wrapper_id = Some(_)`, segment shape
         // `<safe>+<wrapper_id>`) resolve correctly. The pre-fix code
@@ -2385,13 +2360,13 @@ pub fn create_bin_links(
         std::fs::create_dir_all(&bin_dir)?;
 
         for (cmd_name, script_path) in &entries {
-            // Finding #2: validate bin name
+            // Validate bin name
             if let Err(reason) = validate_bin_name(cmd_name, pkg_name) {
                 tracing::warn!("bin: rejecting \"{cmd_name}\" from {pkg_name}: {reason}");
                 continue;
             }
 
-            // Finding #1: validate bin target path (no traversal)
+            // Validate bin target path (no traversal)
             let target = match validate_bin_target(&pkg_dir, script_path) {
                 Ok(t) => t,
                 Err(reason) => {
@@ -2407,13 +2382,13 @@ pub fn create_bin_links(
                 let _ = std::fs::remove_file(&bin_link);
             }
 
-            // Finding #13: use relative symlinks for portability
+            // Use relative symlinks for portability
             #[cfg(unix)]
             {
                 let rel_target = relative_symlink_target_from_parent(&target, &bin_dir);
                 std::os::unix::fs::symlink(&rel_target, &bin_link)?;
 
-                // Finding #6: add execute only (0o111), not full 0o755
+                // Add execute only (0o111), not full 0o755
                 use std::os::unix::fs::PermissionsExt;
                 if let Ok(meta) = std::fs::metadata(&target) {
                     let mode = meta.permissions().mode();
@@ -2429,7 +2404,7 @@ pub fn create_bin_links(
             #[cfg(windows)]
             {
                 let target_str = target.to_string_lossy();
-                // Finding #3: validate target path before interpolating into .cmd
+                // Validate target path before interpolating into .cmd
                 if let Err(reason) = validate_cmd_path(&target_str) {
                     tracing::warn!("bin: skipping .cmd shim for {cmd_name}: {reason}");
                     continue;
@@ -2462,7 +2437,7 @@ pub struct LinkResult {
     pub skipped: usize,
     /// Whether a self-referencing symlink was created for the project package.
     pub self_referenced: bool,
-    /// **Phase 32 Phase 6 — `lpm patch`.** Every physical destination
+    /// **`lpm patch`.** Every physical destination
     /// where a package was materialized in this run. The patch-apply
     /// pass consumes this slice directly so it never has to
     /// reverse-engineer the linker's destination shapes from
@@ -2484,7 +2459,7 @@ pub struct LinkResult {
     pub materialized: Vec<MaterializedPackage>,
 }
 
-/// One physical destination of a linked package. Phase 32 Phase 6.
+/// One physical destination of a linked package. .
 ///
 /// Returned in [`LinkResult::materialized`] so the patch-apply pass
 /// always operates on the linker's authoritative location list and
@@ -2502,7 +2477,7 @@ pub struct MaterializedPackage {
     pub destination: PathBuf,
 }
 
-/// **Phase 59.1 day-2 (F7)** — materialize a `Source::Directory`
+/// Materialize a `Source::Directory`
 /// (file: directory dep) into the consumer's `.lpm/<wrapper>/...`
 /// tree via per-file symlinks pointing at the source realpath.
 ///
@@ -2521,12 +2496,11 @@ pub struct MaterializedPackage {
 /// `require('lodash')` from inside the wrapped package would NOT
 /// find the consumer's `node_modules/lodash/`. Per-file symlinks
 /// keep the realpath inside the wrapper, where ancestor walks
-/// still land in the consumer's `node_modules/` (pre-plan §6.2).
+/// still land in the consumer's `node_modules/`.
 ///
 /// **Excludes** `node_modules/` and `.git/` at *any* depth.
 /// Source-tree `node_modules/` would let untracked host state
-/// silently change install output (pre-plan locked OQ-7 to ignore-
-/// and-warn for file: sources). `.git/` is huge and meaningless to
+/// silently change install output. `.git/` is huge and meaningless to
 /// expose. Other dotfiles/dotdirs are NOT excluded — they may
 /// carry intentional package metadata (`.npmrc`, `.npmignore`,
 /// dotted bin shims).
@@ -2707,7 +2681,7 @@ fn try_clonefile(src: &Path, dst: &Path) -> bool {
         Err(_) => return false,
     };
 
-    // clonefile(src, dst, flags) — flag 0 = no special flags
+    // Clonefile(src, dst, flags) — flag 0 = no special flags
     // Returns 0 on success, -1 on failure
     let result = unsafe { libc::clonefile(src_c.as_ptr(), dst_c.as_ptr(), 0) };
 
@@ -2731,7 +2705,7 @@ mod libc {
     }
 }
 
-/// Phase 57 follow-up — break shared inodes inside a live per-package
+/// Follow-up — break shared inodes inside a live per-package
 /// directory so subsequent writes don't propagate into the global
 /// content-addressable store at `~/.lpm/store/v1/`.
 ///
@@ -2854,7 +2828,7 @@ fn detach_hardlinks_recursive(dir: &Path) -> Result<usize, LpmError> {
         let temp_name = format!("{DETACH_TMP_PREFIX}{}", metadata.ino());
         let temp_path = path.with_file_name(temp_name);
 
-        // copy → rename. `fs::copy` creates a new inode populated
+        // Copy → rename. `fs::copy` creates a new inode populated
         // with the source bytes (using `copy_file_range` on Linux),
         // and `fs::rename` is atomic when src + dst are on the same
         // filesystem (which they are, both under `dir`). After this
@@ -2954,7 +2928,7 @@ mod tests {
 
         let result = link_packages(project_dir.path(), &packages, false, None).unwrap();
 
-        // express is accessible from root
+        // Express is accessible from root
         assert!(
             project_dir
                 .path()
@@ -2963,7 +2937,7 @@ mod tests {
                 .is_ok()
         );
 
-        // debug is NOT in root (it's transitive)
+        // Debug is NOT in root (it's transitive)
         assert!(
             project_dir
                 .path()
@@ -2972,7 +2946,7 @@ mod tests {
                 .is_err()
         );
 
-        // debug IS accessible from express's node_modules
+        // Debug IS accessible from express's node_modules
         let express_debug = project_dir
             .path()
             .join(".lpm/wrappers/express@4.22.1/node_modules/debug");
@@ -3008,7 +2982,7 @@ mod tests {
         )
         .unwrap();
 
-        // Phase 61.1: wrapper root is now a project-root sibling.
+        // Wrapper root is now a project-root sibling.
         assert!(project_dir.path().join(".lpm/wrappers").is_dir());
     }
 
@@ -3558,7 +3532,7 @@ mod tests {
 
     #[test]
     fn hoisted_mode_creates_top_level_dir_per_alias_root_link_name() {
-        // **R2.5 fix-1.5 regression test.**
+        // Regression test: alias-aware root-slot claiming.
         //
         // Pre-fix `link_packages_hoisted` claimed root slots strictly
         // by `pkg.name` (canonical/registry identity). For an
@@ -3792,7 +3766,7 @@ mod tests {
 
         let result = link_packages_hoisted(project_dir.path(), &packages, false, None).unwrap();
 
-        // debug at root should exist
+        // Debug at root should exist
         assert!(project_dir.path().join("node_modules/debug").exists());
 
         // The direct dep (3.0.0) should have won root position.
@@ -3810,7 +3784,7 @@ mod tests {
 
     // ---- Security audit tests ----
 
-    // Finding #1: Path traversal in bin targets
+    // Path traversal in bin targets
     #[test]
     fn bin_target_path_traversal_rejected() {
         let store_dir = tempfile::tempdir().unwrap();
@@ -3862,7 +3836,7 @@ mod tests {
         );
     }
 
-    // Finding #2: Bin name validation
+    // Bin name validation
     #[test]
     fn bin_name_with_path_separator_rejected() {
         assert!(validate_bin_name("../escape", "pkg").is_err());
@@ -3894,7 +3868,7 @@ mod tests {
         assert!(validate_bin_name("bad\\name", "pkg").is_err());
     }
 
-    // Finding #3: Windows cmd shim injection
+    // Windows cmd shim injection
     #[test]
     #[cfg(windows)]
     fn cmd_path_with_metacharacters_rejected() {
@@ -3908,7 +3882,7 @@ mod tests {
         assert!(validate_cmd_path("path\ninjection").is_err());
     }
 
-    // Finding #5: Validate cmd paths for junction creation
+    // Validate cmd paths for junction creation
     #[test]
     #[cfg(windows)]
     fn validate_cmd_path_rejects_ampersand() {
@@ -3921,11 +3895,11 @@ mod tests {
         assert!(validate_cmd_path("C:\\Users\\foo\\node_modules").is_ok());
     }
 
-    // Finding #6: Permission bits
+    // Permission bits
     #[cfg(unix)]
     #[test]
     fn permission_bits_add_execute_only() {
-        // mode | 0o111 should add execute without adding write for group/other
+        // Mode | 0o111 should add execute without adding write for group/other
         let original_mode: u32 = 0o644;
         let fixed = original_mode | 0o111;
         assert_eq!(fixed, 0o755, "644 | 111 should be 755");
@@ -3943,7 +3917,7 @@ mod tests {
         );
     }
 
-    // Finding #13: Relative symlinks
+    // Relative symlinks
     #[cfg(unix)]
     #[test]
     fn bin_links_use_relative_symlinks() {
@@ -4037,7 +4011,7 @@ mod tests {
         );
     }
 
-    // Finding #1 in hoisted mode
+    // Path traversal in hoisted mode
     #[test]
     fn bin_target_path_traversal_rejected_hoisted() {
         let store_dir = tempfile::tempdir().unwrap();
@@ -4158,7 +4132,7 @@ mod tests {
         );
     }
 
-    // Finding #2 integration: bin name ../escape should not create a link
+    // Bin name ../escape should not create a link
     #[test]
     fn bin_name_escape_not_linked() {
         let store_dir = tempfile::tempdir().unwrap();
@@ -4432,8 +4406,8 @@ mod tests {
     }
 
     /// Regression test for the conflict-nesting bug found in the
-    /// 2026-05-07 hoisted-mode compatibility audit (eslint-flat-config
-    /// fixture). Pre-fix, when two conflict-versioned packages had
+    /// hoisted-mode compatibility audit (eslint-flat-config fixture).
+    /// Pre-fix, when two conflict-versioned packages had
     /// different consumers that were themselves at different versions,
     /// the algorithm misplaced the deeper conflict under whichever
     /// hoisted package shared the consumer's name — which was the
@@ -4465,7 +4439,7 @@ mod tests {
         let dep_v5_store = create_fake_store_package(store_dir.path(), "dep-v5");
 
         let packages = vec![
-            // anchor (direct) → consumer@10
+            // Anchor (direct) → consumer@10
             LinkTarget {
                 name: "anchor".to_string(),
                 version: "1.0.0".to_string(),
@@ -4479,7 +4453,7 @@ mod tests {
                 peers: Vec::new(),
                 patch_fingerprint: None,
             },
-            // consumer@3 (transitive, encountered first → hoisted) → dep@1
+            // Consumer@3 (transitive, encountered first → hoisted) → dep@1
             LinkTarget {
                 name: "consumer".to_string(),
                 version: "3.0.0".to_string(),
@@ -4493,7 +4467,7 @@ mod tests {
                 peers: Vec::new(),
                 patch_fingerprint: None,
             },
-            // dep@1 (transitive, hoisted)
+            // Dep@1 (transitive, hoisted)
             LinkTarget {
                 name: "dep".to_string(),
                 version: "1.0.0".to_string(),
@@ -4507,7 +4481,7 @@ mod tests {
                 peers: Vec::new(),
                 patch_fingerprint: None,
             },
-            // some-other-direct (forces consumer@3 to come before consumer@10
+            // Some-other-direct (forces consumer@3 to come before consumer@10
             // in declaration order — this test would be vacuous without
             // ordering control). Actually we rely on packages-vec order.
             LinkTarget {
@@ -4523,7 +4497,7 @@ mod tests {
                 peers: Vec::new(),
                 patch_fingerprint: None,
             },
-            // dep@5 (transitive, must nest under anchor)
+            // Dep@5 (transitive, must nest under anchor)
             LinkTarget {
                 name: "dep".to_string(),
                 version: "5.0.0".to_string(),
@@ -4546,7 +4520,7 @@ mod tests {
         assert!(project_dir.path().join("node_modules/consumer").exists());
         assert!(project_dir.path().join("node_modules/dep").exists());
 
-        // consumer@10 nests under anchor (its consumer is anchor, hoisted).
+        // Consumer@10 nests under anchor (its consumer is anchor, hoisted).
         assert!(
             project_dir
                 .path()
@@ -4589,7 +4563,7 @@ mod tests {
         let store_path = create_fake_store_package(store_dir.path(), "partial");
 
         // Simulate an interrupted link: create the pkg_nm directory but NOT the .linked marker.
-        // Phase 61.1: wrapper root is `.lpm/wrappers/`, not `node_modules/.lpm/`.
+        // wrapper root is `.lpm/wrappers/`, not `node_modules/.lpm/`.
         let lpm_dir = project_dir.path().join(".lpm/wrappers");
         let pkg_entry_dir = lpm_dir.join("partial@1.0.0");
         let pkg_nm = pkg_entry_dir.join("node_modules").join("partial");
@@ -4941,9 +4915,9 @@ mod tests {
 
         let _r2 = link_packages_hoisted(project_dir.path(), &packages_v2, false, None).unwrap();
 
-        // pkg-a should still be there (already existed, no re-link needed)
+        // Pkg-a should still be there (already existed, no re-link needed)
         assert!(project_dir.path().join("node_modules/pkg-a").exists());
-        // pkg-b should be cleaned up
+        // Pkg-b should be cleaned up
         assert!(
             !project_dir.path().join("node_modules/pkg-b").exists(),
             "stale pkg-b should be removed"
@@ -4981,7 +4955,7 @@ mod tests {
 
         // Force re-link — should not skip even though metadata matches
         let r2 = link_packages_hoisted(project_dir.path(), &packages, true, None).unwrap();
-        // force=true cleans then re-copies, so linked should be > 0
+        // Force=true cleans then re-copies, so linked should be > 0
         assert_eq!(r2.linked, 1, "force should re-link everything");
         assert_eq!(r2.skipped, 0);
     }
@@ -5331,14 +5305,14 @@ mod tests {
         );
     }
 
-    // ── Phase 32 Phase 6 — `LinkResult.materialized` population ──────
+    // ── `LinkResult.materialized` population ─────────────────────────
     //
     // The patch engine consumes `LinkResult.materialized` directly so it
     // never has to reverse-engineer linker shapes. These tests pin the
     // contract that the linker reports every physical destination it
     // wrote — including the `<project>/.lpm/hoisted/nested/<name>/`
     // shape (post-symmetry; pre-symmetry: `node_modules/.lpm/nested/`)
-    // that the first draft of Phase 6 missed (D-design-1).
+    // that the first draft of missed (D-design-1).
 
     #[test]
     fn isolated_mode_records_canonical_destination() {
@@ -5470,7 +5444,7 @@ mod tests {
         // Two competing versions of `debug`, neither parent is hoisted —
         // the loser-of-conflict should land at the hoisted-nested
         // fallback root (post-symmetry: `<project>/.lpm/hoisted/nested/debug`).
-        // This is the F-V4 third shape that the first Phase 6 design draft
+        // This is the F-V4 third shape that the first design draft
         // missed.
         let store_dir = tempfile::tempdir().unwrap();
         let project_dir = tempfile::tempdir().unwrap();
@@ -5651,7 +5625,7 @@ mod tests {
         }
     }
 
-    // ── Phase 57 follow-up — detach_package_hardlinks ─────────────
+    // ── detach_package_hardlinks ─────────────────────────────────────
     //
     // Cross-platform invariants of the public function (returns 0 on
     // non-Linux, leaves files alone on every platform when nlink == 1,
@@ -5867,7 +5841,7 @@ mod tests {
         assert_eq!(std::fs::read(dir.path().join("file.txt")).unwrap(), b"x");
     }
 
-    // ── Phase 59.1 day-2 (F7): wrapper segment + materialize_directory_source ─
+    // ── wrapper_segment + materialize_directory_source ───────────────
 
     fn make_local_source_dir(root: &Path, name: &str) -> PathBuf {
         let pkg = root.join(name);
@@ -6127,7 +6101,7 @@ mod tests {
         );
     }
 
-    /// **Phase 59.1 audit response (round 7) — symlink escape.** A
+    /// **symlink escape.** A
     /// symlink in the source tree that resolves OUTSIDE the source's
     /// own realpath still materializes successfully (matches Node's
     /// resolution from the source itself), but the wrapper symlink
@@ -6175,7 +6149,7 @@ mod tests {
         );
     }
 
-    /// **Phase 59.1 audit response (round 7) — depth bound.** Pre-
+    /// **depth bound.** Pre-
     /// round-7 `walk_directory_source` was unbounded; a maliciously-
     /// or accidentally-deep source tree could blow the stack. This
     /// test verifies that depth beyond [`MAX_DIRECTORY_SOURCE_DEPTH`]
@@ -6224,7 +6198,7 @@ mod tests {
         let project_dir = root.path().join("project");
         let src = make_local_source_dir(root.path(), "local-foo");
 
-        // cleanup_stale_entries creates node_modules/.lpm; we mimic
+        // Cleanup_stale_entries creates node_modules/.lpm; we mimic
         // its precondition by calling link_packages() directly.
         let target = LinkTarget {
             name: "local-foo".to_string(),
@@ -6314,11 +6288,9 @@ mod tests {
         );
     }
 
-    /// **Phase 59.1 audit response (round 3) — link stamp.** The
-    /// `.linked` marker now carries a stamp encoding the LinkTarget's
+    /// The `.linked` marker carries a stamp encoding the LinkTarget's
     /// identity. After a successful materialization the marker file
-    /// must contain the stamp text, NOT the empty bytes the pre-
-    /// round-3 marker used.
+    /// must contain the stamp text, not empty bytes.
     #[test]
     fn link_one_package_writes_stamped_marker() {
         let root = tempfile::tempdir().unwrap();
@@ -6359,7 +6331,7 @@ mod tests {
         );
     }
 
-    /// **Phase 59.1 audit response (round 3) — stamp mismatch.** The
+    /// **stamp mismatch.** The
     /// auditor's MEDIUM scenario: a wrapper materialized from one
     /// LinkTarget (e.g., a pre-round-1 tarball at `.lpm/foo@1.0.0/`)
     /// must not be reused by a subsequent install of a DIFFERENT
@@ -6447,11 +6419,9 @@ mod tests {
         );
     }
 
-    /// **Phase 59.1 audit response (round 3) — backward compat.**
-    /// Markers written by pre-round-3 builds are empty sentinels
-    /// (`fs::write(marker, "")`). The new stamp-aware code must
-    /// treat empty markers as a mismatch and force re-materialize,
-    /// not silently trust the wrapper's contents.
+    /// Legacy empty `.linked` markers (`fs::write(marker, "")`) must
+    /// be treated as a stamp mismatch and force re-materialization,
+    /// not silently trusted as "wrapper is valid".
     #[test]
     fn link_one_package_relinks_when_legacy_empty_marker_present() {
         let root = tempfile::tempdir().unwrap();
@@ -6515,11 +6485,11 @@ mod tests {
         );
     }
 
-    /// **Phase 59.1 audit response (round 4) — stale dep edges.** The
+    /// **stale dep edges.** The
     /// auditor's MEDIUM finding for round 4: round-3's stamp check
     /// removed only `pkg_nm` on relink, leaving the SIBLING
     /// `.lpm/<segment>/node_modules/<other>` symlinks (the wrapper's
-    /// dep edges) in place. Phase 2's "skip if dep_link.exists()"
+    /// dep edges) in place. Stage 2's "skip if dep_link.exists"
     /// guard then preserved any stale dep edge from the previous
     /// LinkTarget. The auditor reproduced this with a small harness:
     /// target A creates a `leftpad` symlink, target B reuses the same
@@ -6532,7 +6502,7 @@ mod tests {
         let store_dir = root.path().join("store");
         let project_dir = root.path().join("project");
 
-        // Sibling dep target (so the Phase-2 dep loop has somewhere
+        // Sibling dep target (so the Stage 2 dep loop has somewhere
         // to point its symlink). Doesn't need a wrapper id; CAS-shape
         // segment lands at `.lpm/leftpad@1.0.0/`.
         let leftpad_store = create_fake_store_package(&store_dir, "leftpad");
@@ -6634,16 +6604,12 @@ mod tests {
         assert_eq!(after["_marker"].as_str(), Some("b"));
     }
 
-    /// **Phase 59.1 audit response (round 5) — stamp covers dep edges.**
-    /// The auditor's round-5 MEDIUM finding: round-3's v1 stamp encoded
-    /// only `(wrapper_id, materialization, store_path)`. Two installs
-    /// with the SAME store_path but DIFFERENT `target.dependencies`
-    /// (e.g., child resolved version went `leftpad@1.0.0` → `leftpad@2.0.0`)
-    /// produced identical v1 stamps, so the fast path skipped relinking
-    /// and Phase 2's "skip if exists" dep loop kept the stale dep
-    /// symlink pointing at the OLD child wrapper. Round-5 fix bumps the
-    /// stamp schema to v2 and folds in `target.dependencies` so any
-    /// change to the wrapper's internal edge set forces a relink.
+    /// The stamp must encode dep edges. Without them, two installs
+    /// with the SAME `store_path` but DIFFERENT `target.dependencies`
+    /// (e.g., child resolved version went `leftpad@1.0.0` →
+    /// `leftpad@2.0.0`) produce identical stamps. The fast path then
+    /// skips relinking and Stage 2's "skip if exists" dep loop keeps
+    /// the stale dep symlink pointing at the OLD child wrapper.
     #[test]
     fn link_one_package_relinks_when_only_dep_edges_change_v2_stamp() {
         let root = tempfile::tempdir().unwrap();
@@ -6862,10 +6828,10 @@ mod tests {
     fn cleanup_stale_entries_recognizes_directory_wrapper_segments() {
         // `+`-shape wrappers must be recognized by cleanup as
         // expected entries when their LinkTarget is in the package
-        // set. Otherwise day-2's directory deps would get swept on
-        // the second `lpm install` run.
+        // set. Otherwise directory deps would get swept on the second
+        // `lpm install` run.
         //
-        // Phase 61.1: wrappers live at `<project>/.lpm/wrappers/`,
+        // Wrappers live at `<project>/.lpm/wrappers/`,
         // resolved through `LayoutPaths` so the test setup tracks
         // production semantics automatically.
         let root = tempfile::tempdir().unwrap();
@@ -6903,7 +6869,7 @@ mod tests {
 
     #[test]
     fn link_finalize_directory_root_symlink_targets_plus_wrapper() {
-        // Phase 3 root-symlink target path uses `wrapper_segment()`
+        // Stage 3 root-symlink target path uses `wrapper_segment`
         // so the `+`-shape lookup is honored.
         let root = tempfile::tempdir().unwrap();
         let project_dir = root.path().join("project");
@@ -6927,7 +6893,7 @@ mod tests {
 
         let root_link = project_dir.join("node_modules/local-bar");
         let symlink_target = std::fs::read_link(&root_link).unwrap();
-        // Phase 61.1 relative shape:
+        // Relative shape:
         // `node_modules/local-bar` → `../.lpm/wrappers/local-bar+f-.../node_modules/local-bar`
         let expected = PathBuf::from("..")
             .join(".lpm")
@@ -6938,17 +6904,17 @@ mod tests {
         assert_eq!(symlink_target, expected);
     }
 
-    // ── Phase 61.1 audit fix: legacy root-symlink retarget ────────────
+    // ── Legacy root-symlink retarget ─────────────────────────────────
     //
-    // Pre-fix bug: the 61.3 migration wipes `node_modules/.lpm/` but
+    // Pre-fix bug: the layout migration wipes `node_modules/.lpm/` but
     // does NOT touch root symlinks at `node_modules/<pkg>` whose
     // targets point into the legacy wrapper-root shape (`.lpm/<seg>/...`,
-    // no `wrappers/` segment). Phase 3 root-symlink creation skips
+    // no `wrappers/` segment). Stage 3 root-symlink creation skips
     // any `root_link.exists()` entry, so the legacy symlink survives,
     // its target points at a wiped location → broken `node_modules/<pkg>`.
     //
     // Post-fix: `cleanup_stale_entries` removes any root symlink whose
-    // target string identifies it as the legacy shape. Phase 3 then
+    // target string identifies it as the legacy shape. Stage 3 then
     // recreates with the correct new target.
 
     #[test]
@@ -6959,7 +6925,7 @@ mod tests {
         std::fs::create_dir_all(&nm).unwrap();
 
         // Plant a legacy-shape root symlink — `.lpm/<seg>/node_modules/<pkg>`
-        // (the pre-Phase-61.1 target shape), no `wrappers/` segment.
+        // (the pre- target shape), no `wrappers/` segment.
         let legacy_target = PathBuf::from(".lpm")
             .join("express@4.22.1")
             .join("node_modules")
@@ -6973,7 +6939,7 @@ mod tests {
         // Sanity: the legacy link IS present pre-cleanup.
         assert!(root_link.symlink_metadata().is_ok());
 
-        // express IS in the resolution set (a direct dep we're keeping).
+        // Express IS in the resolution set (a direct dep we're keeping).
         let express = LinkTarget {
             name: "express".to_string(),
             version: "4.22.1".to_string(),
@@ -6990,11 +6956,11 @@ mod tests {
 
         cleanup_stale_entries(&project_dir, &[express]).unwrap();
 
-        // The legacy-shape symlink must be removed so Phase 3 can
+        // The legacy-shape symlink must be removed so Stage 3 can
         // create a fresh one with the new target shape.
         assert!(
             root_link.symlink_metadata().is_err(),
-            "cleanup must remove legacy-shape root symlink so Phase 3 retargets it"
+            "cleanup must remove legacy-shape root symlink so Stage 3 retargets it"
         );
     }
 
@@ -7012,7 +6978,7 @@ mod tests {
         let nm = project_dir.join("node_modules");
         std::fs::create_dir_all(nm.join("@types")).unwrap();
 
-        // Pre-Phase-61.1 scoped target shape: `../.lpm/<seg>/node_modules/<scope>/<name>`
+        // Pre- scoped target shape: `../.lpm/<seg>/node_modules/<scope>/<name>`
         // (one extra `..` for the scope dir, no `wrappers/` segment).
         let legacy_target = PathBuf::from("..")
             .join(".lpm")
@@ -7043,7 +7009,7 @@ mod tests {
 
         cleanup_stale_entries(&project_dir, &[types_node]).unwrap();
 
-        // Legacy-shape scoped symlink must be removed so Phase 3
+        // Legacy-shape scoped symlink must be removed so Stage 3
         // can recreate it pointing at `../../.lpm/wrappers/<seg>/...`.
         assert!(
             scoped_link.symlink_metadata().is_err(),
@@ -7054,7 +7020,7 @@ mod tests {
     #[test]
     fn cleanup_stale_entries_preserves_new_shape_root_symlink() {
         // Counterpoint: a NEW-shape root symlink (target contains
-        // `.lpm/wrappers/`) must NOT be removed. Phase 3's "skip if
+        // `.lpm/wrappers/`) must NOT be removed. Stage 3's "skip if
         // exists" guard then keeps the install fast on the warm path.
         let root = tempfile::tempdir().unwrap();
         let project_dir = root.path().join("project");
@@ -7114,7 +7080,7 @@ mod tests {
         #[cfg(windows)]
         let _ = std::os::windows::fs::symlink_dir(&workspace_target, &root_link);
 
-        // foo is a direct dep so the existing stale-name sweep keeps it.
+        // Foo is a direct dep so the existing stale-name sweep keeps it.
         let foo = LinkTarget {
             name: "foo".to_string(),
             version: "0.0.0".to_string(),
@@ -7151,7 +7117,7 @@ mod tests {
         #[cfg(windows)]
         let _ = std::os::windows::fs::symlink_dir(PathBuf::from(".."), &self_link);
 
-        // self-pkg is in the package set so the stale-name sweep keeps it.
+        // Self-pkg is in the package set so the stale-name sweep keeps it.
         let self_pkg = LinkTarget {
             name: "self-pkg".to_string(),
             version: "0.0.0".to_string(),
@@ -7243,7 +7209,7 @@ mod tests {
         );
     }
 
-    // ── Phase 59.1 day-5 (F7-transitive): dep-target wrapper-segment branch ─
+    // ── dep-target wrapper-segment branch ────────────────────────────
 
     #[test]
     fn link_one_package_dep_target_uses_plus_shape_for_f_prefix_dep_version() {
@@ -7261,8 +7227,8 @@ mod tests {
         let parent_store = create_fake_store_package(&store_dir, "parent");
 
         // Parent has a transitive dep with a `f-`-prefixed version
-        // — the day-5 `apply_post_resolve_directory_link_fixup`
-        // produces this shape for FileDir transitives.
+        // `apply_post_resolve_directory_link_fixup` produces this
+        // shape for FileDir transitives.
         let parent = LinkTarget {
             name: "parent".to_string(),
             version: "1.0.0".to_string(),

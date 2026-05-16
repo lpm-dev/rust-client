@@ -1,4 +1,4 @@
-//! Phase 34.4: lightweight profiling accumulators for resolver internals.
+//! Lightweight profiling accumulators for resolver internals.
 //!
 //! Uses `AtomicU64` for cross-thread accumulation — the resolver runs
 //! inside `spawn_blocking` on a different thread than the caller, so

@@ -1,7 +1,7 @@
 use crate::output;
 use lpm_common::LpmError;
+use lpm_common::color::Painted;
 use lpm_registry::RegistryClient;
-use owo_colors::OwoColorize;
 
 /// Show pool revenue stats.
 pub async fn run(client: &RegistryClient, json_output: bool) -> Result<(), LpmError> {

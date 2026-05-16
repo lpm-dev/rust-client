@@ -48,7 +48,11 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 shlex = { workspace = true }
 miette = { workspace = true }
-owo-colors = { workspace = true }
+# `supports-colors` feature exposes `owo_colors::set_override` — the global
+# gate for the `if_supports_color` API that the color policy uses to keep
+# any future call site aligned with the explicit `--color` flag / NO_COLOR
+# / FORCE_COLOR resolution.
+owo-colors = { workspace = true, features = ["supports-colors"] }
 indicatif = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
@@ -62,6 +66,11 @@ dirs = { workspace = true }
 
 # Interactive prompts & terminal UI
 cliclack = { workspace = true }
+# `console` is cliclack's styling primitive — `cliclack::Theme` returns
+# `console::Style` from its color hooks, so the no-color theme override
+# needs a direct dep to construct an unstyled `Style::new()`. Pinned to the
+# same 0.15.x line cliclack 0.3.x uses so the two `Style` types unify.
+console = "0.15"
 gag = "1"
 
 # Browser open

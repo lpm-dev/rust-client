@@ -49,8 +49,8 @@ pub fn kill_port_owner(port: u16) -> Result<(), String> {
     let (pid, name) = find_port_owner(port);
     match pid {
         Some(pid) => {
-            // Finding #10: Mitigate PID reuse TOCTOU by re-querying which PID
-            // owns the *specific port* (not just checking if the PID exists).
+            // Mitigate PID reuse TOCTOU by re-querying which PID owns the
+            // *specific port* (not just checking if the PID exists).
             // `find_port_owner` runs `lsof -ti :{port}` which verifies the PID
             // is still bound to this exact port, not merely alive.
             std::thread::sleep(std::time::Duration::from_millis(50));

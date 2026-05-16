@@ -1,4 +1,4 @@
-//! Phase 46b — L4 verdict cache.
+//! L4 verdict cache.
 //!
 //! Persists `{cache-key → (verdict, cached_at)}` mappings so the second
 //! and subsequent installs of any amber-classified package on a given
@@ -376,23 +376,21 @@ pub struct CacheKeyInputs<'a> {
     /// before passing — green/red phases never reach L4 and would
     /// pollute the key.
     pub amber_phases: &'a [(&'a str, &'a str)],
-    /// Phase 46b Lever #1 — the package's `repository` URL when
-    /// present. The advisor's prompt embeds this and bases its
-    /// "fetch IDENTITY" judgment on it; two installs of the same
-    /// `(name, version, body)` triple with different repository URLs
-    /// can legitimately receive different verdicts, so the cache key
-    /// must distinguish them. `None` folds in differently from
-    /// `Some("")` so the absent and empty-string cases stay
-    /// distinguishable.
+    /// The package's `repository` URL when present. The advisor's
+    /// prompt embeds this and bases its "fetch IDENTITY" judgment
+    /// on it; two installs of the same `(name, version, body)` triple
+    /// with different repository URLs can legitimately receive different
+    /// verdicts, so the cache key must distinguish them. `None` folds
+    /// in differently from `Some("")` so the absent and empty-string
+    /// cases stay distinguishable.
     pub repository: Option<&'a str>,
-    /// Phase 46b Lever #3 — files the script body delegates to,
-    /// each as `(filename, content)` in canonical order. Two
-    /// installs with the same body but different referenced-file
-    /// content can legitimately produce different verdicts (the
-    /// embedded content IS what the model judges), so the cache
-    /// key must distinguish them. Empty slice folds in as "no
-    /// referenced files," which differs from a slice containing
-    /// one empty `(filename, "")` pair.
+    /// Files the script body delegates to, each as `(filename,
+    /// content)` in canonical order. Two installs with the same body
+    /// but different referenced-file content can legitimately produce
+    /// different verdicts (the embedded content IS what the model
+    /// judges), so the cache key must distinguish them. Empty slice
+    /// folds in as "no referenced files," which differs from a slice
+    /// containing one empty `(filename, "")` pair.
     pub referenced_scripts: &'a [(&'a str, &'a str)],
     pub prompt_template_hash: &'a str,
     pub provider_slug: &'a str,
@@ -411,17 +409,15 @@ pub struct CacheKeyInputs<'a> {
 pub fn build_cache_key(inputs: &CacheKeyInputs<'_>) -> String {
     const FIELD_SEP: u8 = 0x00;
     const RECORD_SEP: u8 = 0x1e;
-    // Phase 46b Lever #1 — distinct absent / present sentinels for
-    // the optional repository field. `Some("github.com/x/y")` and
-    // `None` must hash differently. We also distinguish from
-    // `Some("")` by emitting the sentinel byte before any payload
-    // bytes.
+    // Distinct absent / present sentinels for the optional repository
+    // field. `Some("github.com/x/y")` and `None` must hash differently.
+    // We also distinguish from `Some("")` by emitting the sentinel
+    // byte before any payload bytes.
     const REPO_PRESENT: u8 = 0x01;
     const REPO_ABSENT: u8 = 0x02;
-    // Phase 46b Lever #3 — sentinel separating the referenced-files
-    // section from the rest of the key. Distinct from FIELD_SEP /
-    // RECORD_SEP so the section boundary is unambiguous in the
-    // hash input stream.
+    // Sentinel separating the referenced-files section from the rest
+    // of the key. Distinct from FIELD_SEP / RECORD_SEP so the section
+    // boundary is unambiguous in the hash input stream.
     const REF_SECTION_SEP: u8 = 0x1f;
 
     let mut h = Sha256::new();
@@ -658,9 +654,9 @@ mod tests {
 
     #[test]
     fn cache_key_distinguishes_repository_axes() {
-        // Phase 46b Lever #1 — `repository` is a verdict input;
-        // adding or changing it must produce a different cache key
-        // so a re-fetched verdict respects the prompt change.
+        // `repository` is a verdict input; adding or changing it
+        // must produce a different cache key so a re-fetched verdict
+        // respects the prompt change.
         let none = key_for_with_repo("p", "1.0.0", &[("install", "x")], None, "h", "p", "m");
         let some_a = key_for_with_repo(
             "p",
@@ -691,9 +687,8 @@ mod tests {
 
     #[test]
     fn cache_key_distinguishes_referenced_script_axes() {
-        // Phase 46b Lever #3 — referenced scripts are a verdict
-        // input; adding files or changing their content must
-        // produce a different cache key.
+        // Referenced scripts are a verdict input; adding files or
+        // changing their content must produce a different cache key.
         let empty = key_for_with_refs("p", "1.0.0", &[("install", "x")], &[], "h", "p", "m");
         let with_one = key_for_with_refs(
             "p",

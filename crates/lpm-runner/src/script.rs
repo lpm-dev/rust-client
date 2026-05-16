@@ -15,8 +15,8 @@ use crate::hooks;
 use crate::lpm_json;
 use crate::shell::{self, ShellCommand};
 use lpm_common::LpmError;
+use lpm_common::color::Painted;
 use lpm_workspace::read_package_json;
-use owo_colors::OwoColorize;
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -43,7 +43,7 @@ pub(crate) fn should_skip_env_validation() -> bool {
 /// * `extra_args` — additional arguments appended to the script command
 /// * `env_mode` — optional env mode from `--env` flag (e.g., "staging")
 /// * `bin_hint` — pre-resolved managed-runtime bin from `lpm_runtime::ensure_runtime`,
-///   or `Unknown` to fall back to silent detect (Phase 61 Tier 1).
+///   or `Unknown` to fall back to silent detect.
 pub fn run_script(
     project_dir: &Path,
     script_name: &str,

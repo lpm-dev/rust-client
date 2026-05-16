@@ -4,7 +4,7 @@
 //! - `lpm ci setup github-actions` — generate OIDC workflow YAML
 
 use lpm_common::LpmError;
-use owo_colors::OwoColorize;
+use lpm_common::color::Painted;
 use std::path::Path;
 
 /// Entry point for `lpm ci <action>`.

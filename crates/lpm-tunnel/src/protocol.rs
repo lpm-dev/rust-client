@@ -252,7 +252,7 @@ mod tests {
         }
     }
 
-    // ── Finding #2: domain field uses "subdomain" on the wire ──
+    // ── domain field uses "subdomain" on the wire ──
 
     #[test]
     fn client_hello_domain_serializes_as_subdomain() {

@@ -5,9 +5,6 @@
 //! match are interchangeable — they can share the same on-disk wrapper
 //! at `~/.lpm/store/v2/links/<graph-key>/`.
 //!
-//! See the Phase 66 preplan §2.2 for the design rationale and the
-//! audit history that locked which fields are identity-bearing.
-//!
 //! # Inputs hashed (stable order)
 //!
 //! 1. Schema version tag (`v=2`)
@@ -16,22 +13,18 @@
 //! 4. Platform tuple `(os, cpu, libc)` — libc empty on non-Linux
 //! 5. Linker mode tag (`isolated` | `hoisted`)
 //! 6. Sorted peer-context: `peer_name@peer_version` joined by `,`
-//!    (always empty in hoisted mode — preplan §2.2)
+//!    (always empty in hoisted mode)
 //! 7. Sorted dep edges: `local => target_name@target_version`
 //!    joined by `,`
 //! 8. Sorted aliases: `local => canonical_target_name`
 //!    joined by `,`
 //! 9. Sorted root-link names joined by `,`
 //! 10. Source-identity disambiguator (`wrapper_id`)
-//! 11. Patch fingerprint (Phase 66 confidence-followup F1) — `Some("p-…")`
-//!     for any package that carries a `lpm.patchedDependencies` entry,
-//!     `None` otherwise. Folded in so a project applying a patch gets a
-//!     distinct link entry from any other project's unpatched (or
-//!     differently-patched) install of the same coords. Without this,
-//!     v2's cross-project sharing of `<store>/v2/links/<key>/...`
-//!     dirs would let project A's patched bytes leak into project B
-//!     via shared materialization (the `links/` dir is the on-disk
-//!     destination, not a project-private wrapper).
+//! 11. Patch fingerprint — `Some("p-…")` for any package carrying a
+//!     `lpm.patchedDependencies` entry, `None` otherwise. Folded in so
+//!     a project applying a patch gets a distinct link entry: without
+//!     it, v2's cross-project sharing of `<store>/v2/links/<key>/...`
+//!     dirs would let project A's patched bytes leak into project B.
 //!
 //! Each component is preceded by a labeled NUL-delimited prefix
 //! (e.g. `name=\0...\0`) so cross-component byte boundaries are
@@ -115,7 +108,7 @@ pub struct GraphKeyInputs {
     pub platform: PlatformTuple,
     /// Linker mode under which this wrapper would materialize.
     pub linker_mode: LinkerModeTag,
-    /// Peer-context. Empty in hoisted mode (preplan §2.2 lock-in).
+    /// Peer-context. Empty in hoisted mode (not part of the graph key).
     pub peers: Vec<PeerEntry>,
     /// Dep edges declared in this package's manifest.
     pub deps: Vec<DepEdge>,
@@ -135,33 +128,23 @@ pub struct GraphKeyInputs {
     ///
     /// [`LinkTarget::root_link_names`]: ../../../lpm-linker/src/lib.rs
     pub root_link_names: Option<Vec<String>>,
-    /// **Phase 66 §2.2 / preplan day-7 audit response** — source-identity
-    /// disambiguator. Mirrors `LinkTarget.wrapper_id`:
-    /// - `None` for `Source::Registry` (registry is the only source
-    ///   that doesn't share `(name, version)` namespace with other
-    ///   source kinds, so no disambiguation needed).
-    /// - `Some(<source-id>)` for non-Registry sources (Tarball
-    ///   remote/local, Directory, Link, Git).
+    /// Source-identity disambiguator. Mirrors `LinkTarget.wrapper_id`:
+    /// - `None` for `Source::Registry` — registry is the only source
+    ///   that doesn't share `(name, version)` namespace with others.
+    /// - `Some(<source-id>)` for non-Registry sources (Tarball,
+    ///   Directory, Link, Git).
     ///
-    /// Folded into the GraphKey so `Source::Registry { foo@1.0.0 }`
-    /// and `Source::Tarball { foo@1.0.0 from a custom URL }` produce
-    /// distinct keys — the link entries materialize independently and
-    /// the `links/<key>/` namespace stays collision-free under
-    /// multi-source installs. Empty / `None` means "no source-identity
-    /// constraint", matching the legacy registry-only shape so a
-    /// pre-Phase-66 GraphKey for a registry package doesn't suddenly
-    /// invalidate.
+    /// Folded in so `Source::Registry { foo@1.0.0 }` and
+    /// `Source::Tarball { foo@1.0.0 from a custom URL }` produce
+    /// distinct keys and never share `links/<key>/` materializations.
     pub wrapper_id: Option<String>,
-    /// **Phase 66 confidence-followup F1 (2026-05-09)** — patch identity.
-    /// When the install pipeline detects a `lpm.patchedDependencies`
-    /// entry for `(name, version)`, the caller computes
-    /// `sha256(patch_bytes || originalIntegrity)` (truncated to 16 hex
-    /// chars, prefixed `p-`) and threads it here. Folded into the
-    /// GraphKey so a patched install lands in its own
-    /// `<store>/v2/links/<key>+<short-hash>/` directory and never
-    /// shares bytes with an unpatched install of the same coords in
-    /// another project. `None` for unpatched packages — preserves the
-    /// pre-F1 hash so existing v2 link entries don't get invalidated.
+    /// Patch identity. When the install pipeline detects a
+    /// `lpm.patchedDependencies` entry for `(name, version)`, the
+    /// caller threads `sha256(patch_bytes || originalIntegrity)`
+    /// (truncated to 16 hex chars, prefixed `p-`) through here.
+    /// Folded in so a patched install gets its own link directory
+    /// and never shares bytes with an unpatched install of the same
+    /// coords. `None` for unpatched packages.
     pub patch_fingerprint: Option<String>,
 }
 
@@ -188,17 +171,16 @@ impl GraphKeyInputs {
         }
     }
 
-    /// Replace the source-identity disambiguator. `None` is the
-    /// pre-Phase-66 shape (registry-only); `Some(...)` is the
-    /// non-Registry-source case.
+    /// Replace the source-identity disambiguator. `None` for registry
+    /// packages; `Some(...)` for non-Registry sources.
     pub fn with_wrapper_id(mut self, wrapper_id: Option<String>) -> Self {
         self.wrapper_id = wrapper_id;
         self
     }
 
-    /// Replace the patch fingerprint. `None` is the unpatched shape
-    /// (preserves the pre-F1 hash); `Some("p-…")` indicates a
-    /// `lpm.patchedDependencies` entry covers this `(name, version)`.
+    /// Replace the patch fingerprint. `None` for unpatched packages;
+    /// `Some("p-…")` when a `lpm.patchedDependencies` entry covers
+    /// this `(name, version)`.
     pub fn with_patch_fingerprint(mut self, patch_fingerprint: Option<String>) -> Self {
         self.patch_fingerprint = patch_fingerprint;
         self
@@ -283,13 +265,11 @@ impl GraphKey {
     /// Compute the graph key from a complete [`GraphKeyInputs`] struct.
     ///
     /// **Hoisted peer-collapse is enforced here, not at the caller.**
-    /// Preplan §2.2 locks "peers are empty in hoisted mode" as the
-    /// invariant that lets cross-project hoisted wrappers share. If
-    /// the primitive trusted callers to normalize, a single missed
-    /// site in Phase 4b would silently fragment the cache (one wrapper
-    /// per peer-context instead of one per name+edge-set), throwing
-    /// away the hoisted-side win this whole rewrite is supposed to
-    /// unlock. We collapse `inputs.peers` to empty when
+    /// "Peers are empty in hoisted mode" is the invariant that lets
+    /// cross-project hoisted wrappers share — if the primitive trusted
+    /// callers, a single missed normalization site would silently
+    /// fragment the cache (one wrapper per peer-context instead of one
+    /// per name+edge-set). We collapse `inputs.peers` to empty when
     /// `linker_mode == Hoisted` and `debug_assert!` to surface the
     /// caller's mistake during dev/test builds.
     pub fn derive(inputs: &GraphKeyInputs) -> Self {
@@ -338,22 +318,16 @@ impl GraphKey {
         let root_names_str = format_root_link_names(inputs.root_link_names.as_deref());
         write_field(&mut hasher, b"root_link_names", root_names_str.as_bytes());
 
-        // Phase 66 §2.2 — source-identity disambiguation. Empty when
-        // wrapper_id is None (registry default), preserving the
-        // pre-Phase-66 hash for registry packages so existing v2
-        // store entries don't get invalidated by this addition.
+        // Source-identity disambiguation. Empty for registry packages
+        // (the default) so their hash matches the pre-wrapper_id shape.
         let wrapper_str = inputs.wrapper_id.as_deref().unwrap_or("");
         write_field(&mut hasher, b"wrapper_id", wrapper_str.as_bytes());
 
-        // Phase 66 confidence-followup F1 — patch identity. Empty when
-        // unpatched, preserving the pre-F1 hash so unpatched v2 link
-        // entries don't get invalidated by this addition. Non-empty
-        // for any `(name, version)` covered by a
-        // `lpm.patchedDependencies` entry; the caller derives the
-        // value from `sha256(patch_bytes || originalIntegrity)` so two
-        // semantically identical patches collide on the same hash and
-        // share a link entry, while edits to the patch (or to the
-        // pinned baseline integrity) split into a fresh entry.
+        // Patch identity. Empty when unpatched. Non-empty entries
+        // carry `sha256(patch_bytes || originalIntegrity)` so two
+        // semantically identical patches share one link entry, while
+        // edits to the patch or the pinned baseline split into a fresh
+        // entry.
         let patch_str = inputs.patch_fingerprint.as_deref().unwrap_or("");
         write_field(&mut hasher, b"patch_fingerprint", patch_str.as_bytes());
 
@@ -459,11 +433,9 @@ impl GraphKey {
     }
 
     /// Canonical name component (matches the registry-canonical name).
-    //
-    // Trial 8 (2026-05-13): `#[inline]` so cross-crate callers (linker
-    // hot loops, store path helpers) skip the function-call indirection
-    // even when LTO heuristics would have left it as a regular call.
-    // Body is a single field projection — no code-size risk.
+    ///
+    /// `#[inline]` so cross-crate hot-loop callers (linker, store-path
+    /// helpers) skip the call indirection even without LTO.
     #[inline]
     pub fn name(&self) -> &str {
         &self.name
@@ -802,10 +774,10 @@ mod tests {
 
     #[test]
     fn alias_change_yields_different_key() {
-        // Preplan §2.2 lock-in: aliases are identity-bearing even when
-        // the dep edges are otherwise identical. A consumer that
-        // declares `"strip-ansi-cjs": "npm:strip-ansi@^6"` materializes
-        // a different wrapper than one that just declares `strip-ansi`.
+        // Aliases are identity-bearing even when the dep edges are
+        // otherwise identical. A consumer that declares
+        // `"strip-ansi-cjs": "npm:strip-ansi@^6"` materializes a
+        // different wrapper than one that just declares `strip-ansi`.
         let no_alias = base_inputs();
         let with_alias = base_inputs().with_aliases([("strip-ansi-cjs", "strip-ansi")]);
         assert_ne!(GraphKey::derive(&no_alias), GraphKey::derive(&with_alias));
@@ -880,28 +852,27 @@ mod tests {
         assert_eq!(GraphKey::derive(&a), GraphKey::derive(&b));
     }
 
-    // ── R2.3 — peer-divergent installs MUST produce distinct keys ──
+    // ── peer-divergent installs MUST produce distinct keys ──
     //
-    // **Load-bearing for R2.2.** If two projects (or the same project
-    // across reinstalls) have identical dep edges + linker mode +
-    // platform but differ in WHICH version of a peer they pinned,
-    // they are semantically different materializations: each
-    // consumer's runtime sees a different peer instance. The v2
-    // store's per-graph-key link entries MUST be distinct so the
-    // copies of the consumer's bytes don't share state across
-    // peer-divergent installs.
+    // If two projects (or the same project across reinstalls) have
+    // identical dep edges + linker mode + platform but differ in WHICH
+    // version of a peer they pinned, they are semantically different
+    // materializations: each consumer's runtime sees a different peer
+    // instance. The v2 store's per-graph-key link entries MUST be
+    // distinct so the copies of the consumer's bytes don't share state
+    // across peer-divergent installs.
     //
-    // Pre-R2.2 the resolver didn't auto-install peers, so the
+    // Previously the resolver didn't auto-install peers, so the
     // distinction rarely surfaced — most peer-declared packages
     // either errored out or relied on the user to install a peer
     // version manually, and the consumer's GraphKey-input `peers` was
-    // empty in either case. R2.2 makes auto-install the default, so
+    // empty in either case. Auto-install is now the default, so
     // the same consumer (e.g., react-redux) can land with react@18 in
     // project A and react@19 in project B from the same lockfile-fast-
     // path entry. The link-entry isolation has to work.
 
     #[test]
-    fn r23_different_peer_versions_yield_different_keys() {
+    fn different_peer_versions_yield_different_keys() {
         // Same consumer, same dep edges, same linker mode, same
         // platform. Only the peer pin differs. Keys must diverge so
         // the link entries can't share bytes across peer-divergent
@@ -925,7 +896,7 @@ mod tests {
     }
 
     #[test]
-    fn r23_different_peer_names_yield_different_keys() {
+    fn different_peer_names_yield_different_keys() {
         // Two consumers with same dep edges but different peer SETS
         // (not just versions). E.g., one peers `react` only; the
         // other peers both `react` and `react-dom`. The keys must
@@ -956,8 +927,8 @@ mod tests {
     //
     // **Load-bearing for cross-project patch isolation.** Two projects
     // with identical dep edges + linker mode + platform + peers
-    // resolve to the same v2 link entry by design (preplan §2.2 — the
-    // sharing invariant unlocks the v2 install hot path). That sharing
+    // resolve to the same v2 link entry by design (the sharing
+    // invariant unlocks the v2 install hot path). That sharing
     // means project A's mutation of `<store>/v2/links/<key>/...`
     // would propagate to project B via shared materialization. The
     // F1 fix folds patch identity into the key so a patched install
@@ -1015,7 +986,7 @@ mod tests {
     }
 
     #[test]
-    fn r23_no_peers_vs_one_peer_yields_different_keys() {
+    fn no_peers_vs_one_peer_yields_different_keys() {
         // Empty peer set vs single-peer set must differ. Important
         // because a consumer with no peer requirements at all
         // (post-R5 optional-peer skip → empty peers field) must NOT

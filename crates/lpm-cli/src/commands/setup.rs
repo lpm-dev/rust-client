@@ -1,9 +1,9 @@
 use crate::{oidc, output};
 use lpm_common::LpmError;
-use owo_colors::OwoColorize;
+use lpm_common::color::Painted;
 use std::path::Path;
 
-/// Phase 35: resolve a usable LPM bearer for CI/CD `.npmrc` generation.
+/// resolve a usable LPM bearer for CI/CD `.npmrc` generation.
 /// `setup` is best-effort — when no token is available it falls back
 /// to the `${LPM_TOKEN}` placeholder so CI can interpolate at runtime.
 async fn resolve_lpm_bearer_optional(registry_url: &str) -> Option<String> {
@@ -33,7 +33,7 @@ pub async fn run(
     proxy: bool,
 ) -> Result<(), LpmError> {
     // Resolve token: OIDC exchange > stored token > env var > placeholder.
-    // Phase 35: SessionManager handles `LPM_TOKEN` fallback internally,
+    // SessionManager handles `LPM_TOKEN` fallback internally,
     // so the explicit `or_else(LPM_TOKEN)` step is no longer needed
     // here — `bearer_string_for` returns it as `EnvVar` source.
     let token: Option<String> = if use_oidc {

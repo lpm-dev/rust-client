@@ -1,4 +1,4 @@
-//! Phase 46.1: pure posture-decision helper for the Linux backend.
+//! pure posture-decision helper for the Linux backend.
 //!
 //! Given a kernel version string (as produced by
 //! `/proc/sys/kernel/osrelease` or `uname -r`) and the user's
@@ -21,9 +21,9 @@
 //! `allow_degraded` bool) so the unit tests in this module can
 //! exercise the full table on the macOS developer host without
 //! spinning up a Linux VM, per the Q3 locked methodology in
-//! [the Phase 46.1 design note].
+//! [the design note].
 //!
-//! [the Phase 46.1 design note]: ../../../../../../../a-package-manager/DOCS/new-features/37-rust-client-RUNNER-VISION-phase46.1-sandbox-network-denial.md
+//! [the design note]: ../../../../../../../a-package-manager/DOCS/new-features/37-rust-client-RUNNER-VISION-phase46.1-sandbox-network-denial.md
 
 /// Effective posture the Linux backend should construct, per the
 /// kernel-version probe + user opt-in. See module doc for the table.
@@ -42,12 +42,12 @@ pub(crate) enum PostureDecision {
     Refuse {
         /// Detected kernel version string for the error message.
         detected_kernel: String,
-        /// Minimum kernel version the Phase 46.1 contract requires.
+        /// Minimum kernel version the contract requires.
         required_kernel: &'static str,
     },
 }
 
-/// Phase 46.1 kernel-version floor. Bumped from 5.13 (V1) to 6.7 (V4)
+/// kernel-version floor. Bumped from 5.13 (V1) to 6.7 (V4)
 /// because V4 is the first landlock ABI that adds network access
 /// rules — without it, the backend has no way to deny outbound
 /// network at the kernel level.

@@ -1,4 +1,4 @@
-//! Phase 49 client-side streaming BFS walker.
+//! Client-side streaming BFS walker.
 //!
 //! The walker discovers transitive dependencies breadth-first from a root
 //! set, fetches metadata for each canonical package name, populates the
@@ -9,11 +9,11 @@
 //! `run_deep_batch_with_speculation`) consumes. The walker is the
 //! metadata producer for both the resolver (via `SharedCache` insert)
 //! and the dispatcher (via the mpsc channel), keeping the dispatcher
-//! body itself untouched (preplan §5.5).
+//! body itself untouched.
 //!
 //! # Location rationale
 //!
-//! Preplan §5.5 initially placed the walker in `lpm-registry`, but that
+//! The walker was initially considered for `lpm-registry`, but that
 //! would require moving [`crate::CanonicalKey`], [`crate::provider::SharedCache`]
 //! and [`crate::provider::NotifyMap`] to `lpm-common` or duplicating them —
 //! neither is a good fit. The walker lives here instead; the circular
@@ -21,7 +21,7 @@
 //! (for `RegistryClient`, `PackageMetadata`, `RouteMode`, etc.) and
 //! nothing in `lpm-registry` needs to know the walker exists.
 //!
-//! # Ordering invariant (preplan §5.5)
+//! # Ordering invariant
 //!
 //! Per manifest, steps MUST run in this order (do not permute):
 //!   1. `shared_cache.insert(canonical_key, cached_info)`
@@ -32,7 +32,7 @@
 //!
 //! Step 4 is last so resolver visibility is never gated on dispatcher
 //! throughput. A refactor that moves the send earlier would silently
-//! reintroduce the very bottleneck W4 previously hit; the comment block
+//! reintroduce the send-before-notify bottleneck; the comment block
 //! above the per-manifest helper enforces the invariant at code-read
 //! time.
 
@@ -51,9 +51,7 @@ use std::sync::atomic::Ordering;
 use std::time::Instant;
 use tokio::sync::{mpsc, oneshot};
 
-/// Server-side deep walk cap in the Worker's old BFS endpoint; we
-/// mirror it client-side to prevent runaway walks on malformed
-/// manifests. Preplan §5.5.
+/// Deep walk cap to prevent runaway walks on malformed manifests.
 const MAX_WALK_DEPTH: u32 = 16;
 
 /// Default npm fan-out for [`RegistryClient::parallel_fetch_npm_manifests`]
@@ -61,27 +59,23 @@ const MAX_WALK_DEPTH: u32 = 16;
 /// walker). Callers can override via [`BfsWalker::with_npm_fanout`] or the
 /// `LPM_NPM_FANOUT` env var (read in [`BfsWalker::run`]).
 ///
-/// **Phase 54 W3 Option C empirical bump (was 50):** n=10 cold-equal-
-/// footing on `bench/fixture-large`, stream walker + greedy resolver:
+/// Default npm fan-out. Empirically set via n=10 cold bench on
+/// `bench/fixture-large` (stream walker + greedy resolver):
 ///
 ///   fanout= 50  median=4816 ms  stdev= 972 ms  ← prior default
 ///   fanout=128  median=4403 ms  stdev=1578 ms  (noisy, t=0.59 not sig.)
 ///   fanout=256  median=4124 ms  stdev= 253 ms  (t=3.49 SIGNIFICANT)
 ///
-/// Bumping to 256 on the same single HTTP/2 connection saves ~700 ms
-/// median wall (-14.4 %) AND collapses stdev by ~74 % (972 → 253). No
-/// server-side rejection at 256 streams on a single npmjs.org h2
-/// connection — the registry doesn't enforce the "most CDNs cap at
-/// 100" limit some hypotheses warned about.
+/// 256 on a single HTTP/2 connection saves ~700 ms median wall (−14.4 %)
+/// AND collapses stdev by ~74 % (972 → 253). The registry doesn't enforce
+/// the "most CDNs cap at 100" limit some hypotheses warned about.
 ///
-/// The remaining 4-sec gap to bun's 765 ms is per-connection flow
-/// control on the single h2 multiplex socket; bun uses 64 separate
-/// HTTP/1.1 sockets to bypass that. Pursued in Phase 55 Option B
-/// (h1-pool transport).
+/// The remaining 4-sec gap to bun is per-connection h2 flow control;
+/// bun uses separate HTTP/1.1 sockets to bypass that.
 pub const DEFAULT_NPM_FANOUT: usize = 256;
 
 /// Per-walk statistics, folded into the `timing.resolve.streaming_bfs`
-/// JSON sub-object by the install.rs orchestration (preplan §5.6).
+/// JSON sub-object by the install.rs orchestration.
 #[derive(Debug, Clone, Default)]
 pub struct WalkerSummary {
     /// Number of manifests the walker inserted into `shared_cache`.
@@ -92,8 +86,8 @@ pub struct WalkerSummary {
     /// Deepest BFS level reached (0 = roots).
     pub max_depth: u32,
     /// Cumulative wall-clock the walker spent blocked on
-    /// `spec_tx.send().await`. The canary for dispatcher backpressure
-    /// per preplan §5.6 — healthy value is 0/near-zero on F1/F2.
+    /// `spec_tx.send().await`. Healthy value is 0/near-zero; high values
+    /// indicate dispatcher backpressure.
     pub spec_tx_send_wait_ms: u128,
     /// Wall-clock of the walker's entire `run()` lifetime — from entry
     /// to the point it returns the summary. The metadata-producer
@@ -103,23 +97,21 @@ pub struct WalkerSummary {
     /// dispatcher/fetch-overlap tail that continues after the walker
     /// drops `spec_tx`.
     pub walker_wall_ms: u128,
-    /// **Phase 54 W1** — per-BFS-level timing breakdown. One entry per
-    /// level the walker iterates (level 0 = roots, level N = N-th
-    /// transitive expansion). Each entry attributes that level's wall
-    /// to its three phases — `setup` (partition + cache-hit handling),
-    /// `fetch` (`tokio::join!` of the npm + lpm halves), `commit`
-    /// (the per-result `commit_manifest` + `expand_deps_from_info`
-    /// loop). Sum of `total_ms` across levels approximates
-    /// `walker_wall_ms`; the gap (if any) is pre/post-loop overhead.
-    /// Surfaced through `timing.resolve.streaming_bfs.levels` in
-    /// `--json` output so Phase 54 W3's bench can quantify per-level
-    /// dead time across the BFS.
+    /// Per-BFS-level timing breakdown. One entry per level the walker
+    /// iterates (level 0 = roots, level N = N-th transitive expansion).
+    /// Each entry attributes that level's wall to its three phases —
+    /// `setup` (partition + cache-hit handling), `fetch` (`tokio::join!`
+    /// of the npm + lpm halves), `commit` (the per-result
+    /// `commit_manifest` + `expand_deps_from_info` loop). Sum of
+    /// `total_ms` across levels approximates `walker_wall_ms`; the gap
+    /// (if any) is pre/post-loop overhead. Surfaced through
+    /// `timing.resolve.streaming_bfs.levels` in `--json` output.
     pub levels: Vec<LevelTiming>,
 }
 
-/// **Phase 54 W1** — one BFS level's three-phase wall breakdown.
+/// One BFS level's three-phase wall breakdown.
 ///
-/// The level loop in [`BfsWalker::run`] does, in order:
+/// The level loop does, in order:
 ///   1. **Setup**: drain `current_level`, partition by route, look up
 ///      cached entries, expand cache hits' deps into `next_level`.
 ///   2. **Fetch**: `tokio::join!(npm_fut, lpm_fut)` — concurrent
@@ -129,8 +121,8 @@ pub struct WalkerSummary {
 ///      `expand_deps_from_info` (seed `next_level` with declared deps).
 ///
 /// `total_ms` is the wall of the whole iteration (start of setup to
-/// end of commit). `total_ms − fetch_ms` is the **inter-fetch dead
-/// time** that Phase 54 W2's continuous-stream walker eliminates.
+/// end of commit). `total_ms − fetch_ms` is the inter-fetch dead time
+/// the continuous-stream walker eliminates.
 #[derive(Debug, Clone, Default)]
 pub struct LevelTiming {
     /// Zero-indexed BFS depth. Level 0 = root deps from `package.json`.
@@ -164,11 +156,11 @@ pub struct LevelTiming {
 }
 
 /// Walker errors. Per-package fetch errors are logged at debug and do
-/// not surface here (preplan §7.1); only wholesale shutdowns do.
+/// not surface here; only wholesale shutdowns do.
 #[derive(Debug, thiserror::Error)]
 pub enum WalkerError {
     /// A network or infrastructure failure the walker can't recover from.
-    /// Install.rs orchestration (§5) surfaces this via `WalkerJoin::drain`.
+    /// Surfaced via `WalkerJoin::drain` in the orchestration layer.
     #[error("walker failed: {0}")]
     Fatal(String),
 }
@@ -220,7 +212,7 @@ pub struct BfsWalker {
     client: Arc<RegistryClient>,
     shared_cache: SharedCache,
     notify_map: NotifyMap,
-    /// Phase 49 wait-loop early-exit signal. Set to `true` (Release) at
+    /// Wait-loop early-exit signal. Set to `true` (Release) at
     /// the very end of [`Self::run`], immediately before broadcasting
     /// `notify_waiters()` across every entry in `notify_map`. The
     /// provider's wait-loop in `ensure_cached` checks this flag after
@@ -239,7 +231,7 @@ pub struct BfsWalker {
 }
 
 impl BfsWalker {
-    #[allow(clippy::too_many_arguments)] // design-level: orchestration constructor for the Phase 49 streaming walker
+    #[allow(clippy::too_many_arguments)] // design-level: orchestration constructor for the streaming walker
     pub fn new(
         client: Arc<RegistryClient>,
         shared_cache: SharedCache,
@@ -273,24 +265,13 @@ impl BfsWalker {
     /// normal exit; [`WalkerError::Fatal`] on unrecoverable errors.
     ///
     /// Per-package fetch failures are logged at debug and the walk
-    /// continues — matches bun/pnpm semantics (preplan §7.1). The
-    /// provider's escape-hatch path will handle any package the walker
-    /// skipped.
+    /// continues — matches bun/pnpm semantics. The provider's escape-hatch
+    /// path will handle any package the walker skipped.
     ///
-    /// **Phase 54 dispatch:** the env var `LPM_WALKER` picks between
-    /// the level-step BFS implementation and the continuous-stream
-    /// implementation introduced in Phase 54 W2. Default is BFS until
-    /// W3's bench validates the stream walker; users opting into
-    /// `LPM_WALKER=stream` get the continuous-stream path. See
-    /// `DOCS/new-features/37-rust-client-RUNNER-VISION-phase54-continuous-stream-walker-preplan.md`.
+    /// `LPM_WALKER=stream` selects the continuous-stream walker;
+    /// default is the level-step BFS walker.
     pub async fn run(mut self) -> Result<WalkerSummary, WalkerError> {
-        // **Phase 54 W3 follow-up — Option C probe:** allow overriding
-        // the npm fan-out at runtime via `LPM_NPM_FANOUT`. Default stays
-        // [`DEFAULT_NPM_FANOUT`] (50). Empirically tests whether the
-        // registry server's `max_concurrent_streams` setting is the cap
-        // (most CDNs hard-cap HTTP/2 streams at 100); if bumping past
-        // the default doesn't move the wall, the bottleneck is per-
-        // connection flow control, not stream concurrency.
+        // Allow overriding the npm fan-out at runtime via `LPM_NPM_FANOUT`.
         if let Ok(s) = std::env::var("LPM_NPM_FANOUT")
             && let Ok(n) = s.parse::<usize>()
             && n > 0
@@ -304,12 +285,10 @@ impl BfsWalker {
         }
     }
 
-    /// Phase 49 level-step BFS walker (the original implementation).
-    /// Each level partitions names by route, fetches the two halves
-    /// concurrently via `tokio::join!`, then expands each landed
-    /// manifest into the next level's seeds — a stop-the-world
-    /// barrier per level. Phase 54 W1 instrumentation in this body
-    /// quantifies the per-level wall breakdown.
+    /// Level-step BFS walker. Each level partitions names by route,
+    /// fetches the two halves concurrently via `tokio::join!`, then
+    /// expands each landed manifest into the next level's seeds — a
+    /// stop-the-world barrier per level.
     async fn run_bfs(mut self) -> Result<WalkerSummary, WalkerError> {
         // Capture the walker's own wall-clock. Measured INSIDE the
         // walker task so `summary.walker_wall_ms` reflects the exact
@@ -321,16 +300,14 @@ impl BfsWalker {
         // contract.
         let run_start = Instant::now();
 
-        // Phase 49 wait-loop shutdown handshake (preplan §5.1 fix).
         // Held for the lifetime of `run()`; fires `notify_waiters()`
-        // across every `notify_map` entry on drop. Whether `run()`
-        // exits normally, returns an error, or panics mid-walk, every
-        // waiter sleeping on a key the walker decided not to fetch
-        // gets woken — and the provider's wait-loop sees
-        // `walker_done == true` on its post-wake re-check, breaking
-        // to the escape-hatch fetch in microseconds. Without this
-        // backstop a walker panic stranded sleepers for the full
-        // `fetch_wait_timeout` (the 5s × N misses pathology).
+        // across every `notify_map` entry on drop. Whether `run()` exits
+        // normally, returns an error, or panics mid-walk, every waiter
+        // sleeping on a key the walker decided not to fetch gets woken —
+        // and the provider's wait-loop sees `walker_done == true` on its
+        // post-wake re-check, breaking to the escape-hatch fetch in
+        // microseconds. Without this backstop a walker panic would strand
+        // sleepers for the full `fetch_wait_timeout`.
         let _shutdown_guard = WalkerShutdownGuard {
             walker_done: self.walker_done.clone(),
             notify_map: self.notify_map.clone(),
@@ -358,7 +335,7 @@ impl BfsWalker {
         while !current_level.is_empty() && depth < MAX_WALK_DEPTH {
             summary.max_depth = depth;
 
-            // Phase 54 W1 — per-level timing capture.
+            // Per-level timing capture.
             let level_start = Instant::now();
             let setup_start = level_start;
             let seeded_count = current_level.len();
@@ -370,8 +347,8 @@ impl BfsWalker {
             // newest-version deps and enqueue them. Skipping transitive
             // expansion on cache hits (the pre-fix behavior) truncated
             // the walk exactly at pre-seeded / previously-fetched roots
-            // — the reviewer caught this on the shared-cache seam §5
-            // is about to wire into.
+            // — skipping transitive expansion on cache hits truncated
+            // the walk at pre-seeded roots.
             //
             // Cached entries do NOT re-emit on `spec_tx`: the manifest
             // was already produced by whoever seeded the cache, and the
@@ -380,12 +357,11 @@ impl BfsWalker {
             let mut next_level: Vec<String> = Vec::new();
             let mut npm_names: Vec<String> = Vec::new();
             let mut lpm_names: Vec<String> = Vec::new();
-            // Phase 58 day-4 — third bucket for `.npmrc`-declared
-            // custom registries. Each entry carries the destination
-            // target + origin-scoped auth so the fetch task can call
-            // `get_npm_metadata_from` directly. Custom registries are
-            // npm-compatible but have no batch endpoint, so they're
-            // fetched per-package via a `FuturesUnordered` fan-out.
+            // Third bucket for `.npmrc`-declared custom registries. Each
+            // entry carries the destination target + origin-scoped auth so
+            // the fetch task can call `get_npm_metadata_from` directly.
+            // Custom registries have no batch endpoint, so they're fetched
+            // per-package via a `FuturesUnordered` fan-out.
             let mut custom_jobs: Vec<(String, RegistryTarget, Option<RegistryAuth>)> = Vec::new();
             for name in current_level.drain(..) {
                 let key = CanonicalKey::from_dep_name(&name);
@@ -414,9 +390,8 @@ impl BfsWalker {
                 }
             }
 
-            // Phase 54 W1 — capture partition counts before the futures
-            // move the buckets, and snapshot setup wall. Phase 58 day-4
-            // adds the custom count.
+            // Capture partition counts before the futures move the buckets,
+            // and snapshot setup wall.
             let npm_fetch_count = npm_names.len();
             let lpm_fetch_count = lpm_names.len();
             let custom_fetch_count = custom_jobs.len();
@@ -435,10 +410,8 @@ impl BfsWalker {
                     let (results, _stats) = client_npm
                         .parallel_fetch_npm_manifests(&npm_names, npm_fanout)
                         .await;
-                    // Phase 53 A1 — `parallel_fetch_npm_manifests` fans
-                    // out one HTTP call per name; tag them as walker-
-                    // driven so the resolver's `walker_rpc_count`
-                    // snapshot matches.
+                    // Tag as walker-driven: `parallel_fetch_npm_manifests`
+                    // fans out one HTTP call per name.
                     lpm_registry::timing::record_walker_rpcs(n);
                     results
                 }
@@ -447,7 +420,7 @@ impl BfsWalker {
                 if lpm_names.is_empty() {
                     Vec::new()
                 } else {
-                    // Phase 53 A1 — one batch RPC fired regardless of names.len().
+                    // One batch RPC fired regardless of names.len().
                     lpm_registry::timing::record_walker_rpcs(1);
                     match client_lpm.batch_metadata(&lpm_names).await {
                         Ok(map) => map.into_iter().map(|(n, m)| (n, Ok(m))).collect(),
@@ -460,12 +433,8 @@ impl BfsWalker {
                     }
                 }
             };
-            // Phase 58 day-4 — custom registries have no batch endpoint,
-            // so each name is its own HTTP call. Concurrency bounded by
-            // `npm_fanout` (same ceiling as the npm fan-out — the
-            // metadata semaphore higher up enforces a global cap, this
-            // local one prevents a single registry from getting hit too
-            // hard).
+            // Custom registries have no batch endpoint, so each name is its
+            // own HTTP call. Concurrency bounded by `npm_fanout`.
             let custom_fut = async move {
                 if custom_jobs.is_empty() {
                     Vec::new()
@@ -496,7 +465,7 @@ impl BfsWalker {
                     results
                 }
             };
-            // Phase 54 W1 — fetch wall is the wall of `tokio::join!` itself.
+            // Fetch wall is the wall of `tokio::join!` itself.
             let fetch_start = Instant::now();
             let (npm_results, lpm_results, custom_results) =
                 tokio::join!(npm_fut, lpm_fut, custom_fut);
@@ -504,7 +473,7 @@ impl BfsWalker {
             let _ = custom_fetch_count; // counted via record_walker_rpcs
 
             // Merge. Each entry is `(name, Result<PackageMetadata, LpmError>)`.
-            // Phase 54 W1 — commit wall is the per-result loop time.
+            // Commit wall is the per-result loop time.
             let commit_start = Instant::now();
             for (name, res) in npm_results
                 .into_iter()
@@ -539,7 +508,7 @@ impl BfsWalker {
             }
             let commit_ms = commit_start.elapsed().as_millis();
 
-            // Phase 54 W1 — record this level's three-phase wall + counts.
+            // Record this level's three-phase wall + counts.
             let total_ms = level_start.elapsed().as_millis();
             tracing::info!(
                 target: "lpm_resolver::walker",
@@ -591,20 +560,16 @@ impl BfsWalker {
         Ok(summary)
     }
 
-    /// **Phase 54 W2** — continuous-stream walker. Bun-style "fetch on
-    /// manifest parse": no level barrier; the moment a parent's
-    /// manifest body lands and reveals its `dependencies` map, each
-    /// child is enqueued for fetching independently. Concurrency is
-    /// bounded by a single `Semaphore(npm_fanout)` instead of per-level
-    /// batching, so the throughput cap is global, not per-level.
+    /// Continuous-stream walker. Bun-style "fetch on manifest parse":
+    /// no level barrier; the moment a parent's manifest body lands and
+    /// reveals its `dependencies` map, each child is enqueued for fetching
+    /// independently. Concurrency is bounded by a single
+    /// `Semaphore(npm_fanout)` instead of per-level batching, so the
+    /// throughput cap is global, not per-level.
     ///
     /// Mirrors the same SharedCache + NotifyMap + spec_tx contract as
-    /// `run_bfs` (preplan §5.5 ordering: insert → notify → roots_ready →
-    /// spec_tx send), so callers see no behavioral change beyond
-    /// timing. Both PubGrub's `LpmDependencyProvider::ensure_cached`
-    /// wait-loop and the greedy resolver's `ensure_manifest` continue
-    /// to work unchanged because the cache + notify state shape is
-    /// identical.
+    /// `run_bfs` (ordering: insert → notify → roots_ready → spec_tx send),
+    /// so callers see no behavioral change beyond timing.
     ///
     /// **Termination:** the loop owns the only `tx` for the dependency
     /// channel. When `in_flight` is empty AND `rx` is empty, no more
@@ -778,9 +743,8 @@ impl BfsWalker {
                                 }
                             }
                             UpstreamRoute::Custom { target, auth } => {
-                                // Phase 58 day-4: `.npmrc`-declared
-                                // custom registry, fetched via the
-                                // origin-verified path with auth
+                                // `.npmrc`-declared custom registry, fetched
+                                // via the origin-verified path with auth
                                 // re-checked at the request site.
                                 client
                                     .get_npm_metadata_from(
@@ -791,13 +755,11 @@ impl BfsWalker {
                                     .await
                             }
                         };
-                        // Phase 53 A1 — count this fetch as walker-driven
-                        // regardless of success/error. The Phase 49 stream
-                        // walker fans out one HTTP call per package (no
-                        // batch_metadata path here, unlike `run_bfs`), so
-                        // each completion is exactly one RPC. TTL cache
-                        // hits inside the client short-circuit before
-                        // `record_rpc` fires, so they correctly do NOT
+                        // Count as walker-driven regardless of success/error.
+                        // The stream walker fans out one HTTP call per package
+                        // (no batch_metadata path, unlike `run_bfs`), so each
+                        // completion is exactly one RPC. TTL cache hits short-
+                        // circuit before `record_rpc` fires, so they don't
                         // contribute to either bucket.
                         lpm_registry::timing::record_walker_rpcs(1);
                         (name_owned, depth, result)
@@ -817,7 +779,7 @@ impl BfsWalker {
         Ok(summary)
     }
 
-    /// Per-manifest commit. Enforces the preplan §5.5 ordering invariant:
+    /// Per-manifest commit. Enforces the ordering invariant:
     /// (1) shared_cache insert, (2) notify_waiters, (3) roots_ready
     /// signal if applicable, (4) spec_tx.send — the only awaiting step.
     /// Do NOT permute. See module-level doc for rationale.
@@ -837,9 +799,8 @@ impl BfsWalker {
         // the entry back out of the DashMap.
         let info = parse_metadata_to_cache_info(meta);
         let _ = is_npm; // 2026-05-07: prerelease filter removed; param retained on caller for future use
-        // Phase 55 W4: cache stores Arc<CachedPackageInfo> so per-edge
-        // resolver lookups are refcount bumps. The clone here happens
-        // once per fetch (this function), not per edge.
+        // Cache stores Arc<CachedPackageInfo> so per-edge resolver lookups
+        // are refcount bumps. The clone here happens once per fetch, not per edge.
         self.shared_cache
             .insert(key.clone(), Arc::new(info.clone()));
 
@@ -858,7 +819,7 @@ impl BfsWalker {
 
         // (4) Speculation hint. May block on dispatcher backpressure;
         // we measure the wait so `timing.resolve.streaming_bfs.spec_tx_send_wait_ms`
-        // surfaces the cost if it ever matters (preplan §5.6 canary).
+        // surfaces the cost.
         let send_start = Instant::now();
         let _ = self.spec_tx.send((name.to_string(), meta.clone())).await;
         summary.spec_tx_send_wait_ms += send_start.elapsed().as_millis();
@@ -893,40 +854,37 @@ impl BfsWalker {
 ///
 /// Two earlier strategies were measured and abandoned:
 ///
-/// 1. **Full union (§11):** walk every version's dep set. Caused
-///    recursive over-fetch — each package's full-history dep set
-///    pulls in historical packages whose own histories pull in more,
-///    exploding through the BFS. Express with `^4.18.0` measured at
-///    7,146 manifests / 31.8 s walker wall-clock vs the install's
-///    actual 60-package footprint.
+/// 1. **Full union:** walk every version's dep set. Caused recursive
+///    over-fetch — each package's full-history dep set pulls in historical
+///    packages whose own histories pull in more, exploding through the BFS.
+///    Express with `^4.18.0` measured at 7,146 manifests / 31.8 s walker
+///    wall-clock vs the install's actual 60-package footprint.
 ///
 /// 2. **Bounded union by major (top-K=4 buckets):** still amplifies.
 ///    Express: 845 manifests / 7.6 s walker, then pubgrub spent 11 s
 ///    chewing through the inflated cache. The cap helps in isolation
-///    but the chain of older transitives still compounds through BFS
-///    levels.
+///    but the chain of older transitives still compounds through BFS levels.
 ///
 /// Newest-only on the same fixture: 68 manifests / 72 ms walker,
-/// 6 escape-hatch fetches in microseconds (covered by the §12
-/// `walker_done` broadcast) — total resolve <1 s. The escape-hatch
-/// being cheap is the load-bearing change: when a name the walker
-/// missed comes up in the solve, [`super::LpmDependencyProvider::ensure_cached`]
-/// short-circuits via `walker_done` in microseconds and a single
-/// direct fetch (nearly always disk-cache-warm) lands the manifest.
-/// Walking proactively to avoid those fetches is a net loss.
+/// 6 escape-hatch fetches in microseconds (via the `walker_done` broadcast)
+/// — total resolve <1 s. The escape-hatch being cheap is the load-bearing
+/// change: when a name the walker missed comes up in the solve,
+/// [`super::LpmDependencyProvider::ensure_cached`] short-circuits via
+/// `walker_done` in microseconds and a single direct fetch (nearly always
+/// disk-cache-warm) lands the manifest. Walking proactively to avoid those
+/// fetches is a net loss.
 ///
 /// # The older-version-pick case
 ///
-/// PubGrub may still pick a non-semver-newest version (e.g. a
-/// consumer pinned to `^1.0.0` while the package's tip is 4.x). The
-/// walker won't have that version's transitives in cache, so
-/// `get_dependencies` will call `ensure_cached` on names the walker
-/// never enqueued. After §12 those calls short-circuit through the
-/// `walker_done` broadcast and complete in microseconds via
-/// `direct_fetch_and_cache`. The
-/// `cache_wait_walker_done_shortcuts` JSON counter measures exactly
-/// these recoveries; on healthy installs it should track the count
-/// of older-version picks (typically <10 even on big trees).
+/// PubGrub may still pick a non-semver-newest version (e.g. a consumer
+/// pinned to `^1.0.0` while the package's tip is 4.x). The walker won't
+/// have that version's transitives in cache, so `get_dependencies` will call
+/// `ensure_cached` on names the walker never enqueued. Those calls
+/// short-circuit through the `walker_done` broadcast and complete in
+/// microseconds via `direct_fetch_and_cache`. The
+/// `cache_wait_walker_done_shortcuts` JSON counter measures exactly these
+/// recoveries; on healthy installs it tracks the count of older-version
+/// picks (typically <10 even on big trees).
 ///
 /// Caller dedupes via the `seen` set keyed by `CanonicalKey`, so a
 /// dep name only enqueues once.
@@ -1053,8 +1011,7 @@ mod tests {
     }
 
     /// Build one entry of an npm packument's `versions` map.
-    /// Convenience for multi-version fixtures (`§13` bounded-union
-    /// tests) so the test body stays readable.
+    /// Convenience for multi-version fixtures so the test body stays readable.
     fn dist_with_deps(name: &str, version: &str, deps: &[(&str, &str)]) -> serde_json::Value {
         let deps_obj: serde_json::Map<String, serde_json::Value> = deps
             .iter()
@@ -1257,11 +1214,10 @@ mod tests {
         assert_eq!(summary.max_depth, MAX_WALK_DEPTH - 1);
     }
 
-    /// Regression for reviewer finding 1: a pre-seeded (cache-hit) root
-    /// MUST still seed the next BFS level via its cached deps. Before
-    /// the fix, the cache-hit branch `continue`d without reading the
-    /// cached manifest back, truncating the walk exactly at any
-    /// already-seeded node — exactly the shape §5 depends on.
+    /// A pre-seeded (cache-hit) root MUST still seed the next BFS level
+    /// via its cached deps. Before the fix, the cache-hit branch
+    /// `continue`d without reading the cached manifest back, truncating
+    /// the walk at any already-seeded node.
     ///
     /// Setup: pre-seed `root-cached` in the shared cache with a dep on
     /// `leaf-x` (not mocked in the walker's fetch path, but retrievable
@@ -1330,19 +1286,12 @@ mod tests {
         assert_eq!(frames, vec!["leaf-x".to_string()]);
     }
 
-    /// Phase 49 §8 — walker completion timing must not change the
-    /// final shared-cache state. Runs the same walker twice against
-    /// the same tree but with artificially asymmetric per-manifest
-    /// latencies: pass A has slow roots + fast leaves, pass B is
-    /// inverted. Both runs must produce the same set of
-    /// `CanonicalKey`s in the shared cache and the same summary
-    /// shape (modulo wall-clock counters).
-    ///
-    /// Preplan §8.1 lists "order-independence: same final solve
-    /// result regardless of walker speed" as a walker test. The
-    /// walker itself doesn't solve, but asserting its completion
-    /// state is independent of fetch-order timing is the same
-    /// invariant at the metadata-production layer.
+    /// Walker completion timing must not change the final shared-cache
+    /// state. Runs the same walker twice against the same tree but with
+    /// artificially asymmetric per-manifest latencies: pass A has slow
+    /// roots + fast leaves, pass B is inverted. Both runs must produce
+    /// the same set of `CanonicalKey`s in the shared cache and the same
+    /// summary shape (modulo wall-clock counters).
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn walker_result_independent_of_per_manifest_timing() {
         // Package names are namespaced with `ord-` so this test's
@@ -1430,28 +1379,26 @@ mod tests {
         assert_eq!(keys_a.len(), 6, "all 6 packages must be in the cache");
     }
 
-    /// §13 walker contract: discovery walks **only the semver-newest
-    /// version's** deps. Older-version deps are not pre-fetched by
-    /// the walker — they reach the shared cache via the §12
-    /// `walker_done` broadcast + escape-hatch path on the (rare) call
-    /// where PubGrub picks a non-newest version.
+    /// Discovery walks **only the semver-newest version's** deps.
+    /// Older-version deps are not pre-fetched by the walker — they reach
+    /// the shared cache via the `walker_done` broadcast + escape-hatch
+    /// path on the (rare) call where PubGrub picks a non-newest version.
     ///
-    /// This test pins both halves of the §13 contract on a fixture
-    /// with two majors carrying disjoint dep names:
+    /// This test pins the contract on a fixture with two majors carrying
+    /// disjoint dep names:
     ///
     ///   `multi-ver` v1.0.0 → `old-dep`
     ///   `multi-ver` v2.0.0 → `new-dep`
     ///
     /// Walker run alone (no resolver, no escape-hatch consumer):
-    /// `new-dep` MUST be cached, `old-dep` MUST NOT — proving the
-    /// walker stays disciplined on newest-only and doesn't regress
-    /// to the §11 full-union shape that turned a 60-dep `express`
-    /// install into 7,146 manifests / 31.8 s walker wall-clock.
+    /// `new-dep` MUST be cached, `old-dep` MUST NOT — proving the walker
+    /// stays disciplined on newest-only and doesn't regress to the
+    /// full-union shape that turned a 60-dep `express` install into
+    /// 7,146 manifests / 31.8 s walker wall-clock.
     ///
-    /// Coverage of the older-version pick at the resolver level is
-    /// covered by [`walker_done_broadcast_wakes_sleepers_for_unfetched_keys`]
-    /// (provider-side) and the express integration bench (end-to-end:
-    /// `cache_wait_walker_done_shortcuts > 0` while wall-clock <1 s).
+    /// Coverage of the older-version pick at the resolver level is in
+    /// [`walker_done_broadcast_wakes_sleepers_for_unfetched_keys`]
+    /// (provider-side) and the express integration bench (end-to-end).
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn walker_expands_only_newest_version_deps() {
         let server = MockServer::start().await;
@@ -1496,18 +1443,17 @@ mod tests {
         assert!(
             !shared_cache.contains_key(&CanonicalKey::npm("old-dep")),
             "walker must NOT pre-fetch older versions' deps — \
-             over-fetching them caused the §11 full-union 7,146-manifest \
-             explosion. PubGrub's older-version pick is covered cheaply \
-             by the §12 walker_done broadcast + escape-hatch path."
+             over-fetching caused the full-union 7,146-manifest explosion. \
+             PubGrub's older-version pick is covered cheaply by the \
+             walker_done broadcast + escape-hatch path."
         );
     }
 
-    /// §11 (post-ship-gate bench fix): walker must resolve
-    /// `npm:<target>@<range>` alias declarations to the TARGET name
-    /// before enqueueing. The local label isn't a registry identity
-    /// and would 404; pre-fix, the walker enqueued the local label,
-    /// emitted a debug-level fetch failure, and the aliased target
-    /// was silently missing from the shared cache.
+    /// Walker must resolve `npm:<target>@<range>` alias declarations to
+    /// the TARGET name before enqueueing. The local label isn't a registry
+    /// identity and would 404; the walker enqueued the local label in the
+    /// pre-fix form, emitting a debug-level fetch failure while the aliased
+    /// target was silently missing from the shared cache.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn walker_resolves_npm_aliases_to_target_name() {
         let server = MockServer::start().await;
@@ -1549,12 +1495,11 @@ mod tests {
         );
     }
 
-    /// Regression test for the wait-loop shutdown handshake (preplan
-    /// §5.1 fix). Reproduces the original symptom — a 60-dep `express`
-    /// install spending 30s of pure wall-clock in 6 × 5s wait-loop
-    /// timeouts because the walker terminated without inserting keys
-    /// PubGrub later asked for, and the wait-loop had no way to learn
-    /// the walker had given up.
+    /// Regression test for the wait-loop shutdown handshake. Reproduces
+    /// the original symptom — a 60-dep `express` install spending 30s
+    /// of pure wall-clock in 6 × 5s wait-loop timeouts because the
+    /// walker terminated without inserting keys PubGrub later asked for,
+    /// and the wait-loop had no way to learn the walker had given up.
     ///
     /// Setup: walker fetches `present-pkg` only. A pre-installed
     /// per-canonical Notify entry stands in for a sleeper subscribed to

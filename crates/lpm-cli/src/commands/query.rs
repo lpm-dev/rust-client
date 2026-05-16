@@ -19,12 +19,12 @@
 use crate::commands::audit::inventory::PackageInventory;
 use crate::output;
 use lpm_common::LpmError;
+use lpm_common::color::Painted;
 use lpm_registry::RegistryClient;
 use lpm_security::behavioral::PackageAnalysis;
 use lpm_security::query::{
     self, DepGraph, DepGraphEntry, PackageContext, Severity, count_all_tags, parse_selector,
 };
-use owo_colors::OwoColorize;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
@@ -753,7 +753,7 @@ mod tests {
     fn make_analysis(source: SourceTags) -> PackageAnalysis {
         PackageAnalysis {
             version: lpm_security::behavioral::SCHEMA_VERSION,
-            analyzed_at: "2026-04-04T00:00:00Z".into(),
+            analyzed_at: "T00:00:00Z".into(),
             source,
             supply_chain: SupplyChainTags::default(),
             manifest: ManifestTags::default(),

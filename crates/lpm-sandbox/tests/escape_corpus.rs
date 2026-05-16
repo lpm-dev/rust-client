@@ -1,5 +1,5 @@
-//! §12.5 escape corpus — each test attempts a forbidden operation
-//! and asserts the SANDBOX (specifically) blocked it.
+//! Escape corpus — each test attempts a forbidden operation and
+//! asserts the SANDBOX (specifically) blocked it.
 //!
 //! # Discrimination via positive control
 //!
@@ -13,8 +13,7 @@
 //! that's already blocked by the OS cannot be used to demonstrate
 //! sandbox effectiveness.
 //!
-//! This pattern directly addresses the Chunk 5 review finding:
-//! earlier versions of this file used `/etc/hosts`,
+//! Earlier versions of this file used `/etc/hosts`,
 //! `/Library/Keychains`, and `/System/Library` as targets — all
 //! blocked by SIP / unix perms / TCC for unprivileged processes
 //! regardless of the sandbox. `!status.success()` on those was a
@@ -268,7 +267,7 @@ fn block_write_to_user_launchagents_macos() {
     // `$HOME/Library/LaunchAgents/` directory instead. Users can
     // write there normally (it's how launchd persistence works);
     // the sandbox should block it because `$HOME/Library/
-    // LaunchAgents` is NOT in the §9.3 allow list.
+    // LaunchAgents` is NOT in the sandbox allow list.
     if !sandbox_supported(SandboxMode::Enforce) {
         return;
     }
@@ -294,7 +293,7 @@ fn block_write_to_user_preferences_macos() {
     // Target the USER's `$HOME/Library/Preferences/` directory.
     // Users write there constantly (it's where user-level apps
     // store preferences); the sandbox should block writes because
-    // the subpath isn't in the §9.3 allow list. Threat: tampering
+    // the subpath isn't in the sandbox allow list. Threat: tampering
     // with another app's preferences.
     //
     // `Preferences` has no spaces (unlike `Application Support`)

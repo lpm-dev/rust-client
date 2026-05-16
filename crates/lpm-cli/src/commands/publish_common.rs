@@ -4,7 +4,7 @@
 //! computation. Used by both `publish.rs` (LPM) and `publish_npm.rs` (npm).
 
 use lpm_common::LpmError;
-use owo_colors::OwoColorize;
+use lpm_common::color::Painted;
 use std::path::Path;
 
 /// A file entry in the tarball.

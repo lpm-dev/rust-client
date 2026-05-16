@@ -1,6 +1,6 @@
 //! `lpm cache` — manage ephemeral caches under `~/.lpm/cache/`.
 //!
-//! Phase 37 semantic flip: before this change, `lpm cache` operated on the
+//! semantic flip: before this change, `lpm cache` operated on the
 //! content-addressable package *store* (`~/.lpm/store/v1/`) despite the
 //! name, while `~/.lpm/cache/metadata/`, `~/.lpm/cache/tasks/`, and
 //! `~/.lpm/dlx-cache/` (now `~/.lpm/cache/dlx/`) were untouched. That is

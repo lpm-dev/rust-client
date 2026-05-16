@@ -22,7 +22,7 @@
 //!     --report /tmp/lpm-audit-report.md
 //!
 //! This crate is a tool, not a library. It is `publish = false` and is
-//! intended for Phase 46 calibration runs (and future re-runs after
+//! intended for calibration runs (and future re-runs after
 //! green-allowlist iterations).
 
 use std::collections::BTreeMap;
@@ -122,7 +122,7 @@ struct Args {
     #[arg(long)]
     advisor: Option<String>,
 
-    /// Phase 46b — opt-in to the L4 verdict cache for the L4 phase.
+    /// Opt-in to the L4 verdict cache.
     /// Off by default so a cold measurement run pays the full LLM
     /// round-trip cost (the honest "first install" comparison
     /// number). When set, the audit harness reads `~/.lpm/cache/
@@ -138,14 +138,14 @@ struct Args {
     #[arg(long, default_value_t = false)]
     l4_cache: bool,
 
-    /// Phase 46b — print one-line cache stats summary at the end
+    /// Print one-line cache stats summary at the end
     /// of the L4 phase (`hits / misses / entries`). Implied by
     /// `--l4-cache`; the flag exists so a future cache-debugging
     /// run can request the summary without enabling the cache itself.
     #[arg(long, default_value_t = false)]
     l4_cache_stats: bool,
 
-    /// Phase 69 — corpus selector. `live` (default) walks the npm
+    /// Corpus selector. `live` (default) walks the npm
     /// search API and fetches manifests over the network; `hermetic`
     /// reads a frozen offline fixture set bundled with this crate
     /// and runs the SAME classifier / L3 / advisor pipeline against
@@ -170,7 +170,7 @@ struct Args {
 #[clap(rename_all = "kebab-case")]
 enum CorpusKind {
     /// Walk the npm registry search API + fetch manifests over the
-    /// network. The default — preserves pre-Phase-69 behavior.
+    /// network. The default — preserves legacy behavior.
     Live,
     /// Read the bundled offline fixture set
     /// (`crates/lpm-audit-corpus/fixtures/hermetic/corpus.json`).
@@ -237,7 +237,7 @@ struct PackageAudit {
     /// its conclusion sentence without an out-of-band side channel.
     #[serde(default)]
     advisor_provider: Option<String>,
-    /// Phase 46b Lever #1 — `repository` URL pulled from the
+    /// `repository` URL pulled from the
     /// manifest's `repository` field. Forwarded to the advisor at
     /// classify time so the prompt can reason about package
     /// identity. Persisted on each record so a `--reclassify` (or
@@ -245,7 +245,7 @@ struct PackageAudit {
     /// to recover the field.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     repository: Option<String>,
-    /// Phase 46b Lever #3 — files the script body delegates to,
+    /// files the script body delegates to,
     /// each as `(filename, content)`. The advisor prompt embeds
     /// these so the model can see one level deeper than the
     /// delegating one-liner. Hermetic / curated fixtures supply
@@ -259,7 +259,7 @@ struct PackageAudit {
     fetch_error: Option<String>,
 }
 
-/// Phase 46b Lever #3 — one referenced file persisted on a
+/// one referenced file persisted on a
 /// `PackageAudit` record. Storing the `(filename, content)` pair
 /// inline lets `--reclassify` and `--advisor` re-runs use the
 /// embedded view without re-fetching the tarball.
@@ -405,10 +405,10 @@ struct AuditMetadata {
     /// L4 advisor stamp. `None` when the run had no `--advisor`.
     #[serde(default)]
     advisor: Option<AdvisorStamp>,
-    /// Phase 69 — corpus origin: `"live"` for npm-walked, `"hermetic"`
+    /// Corpus origin: `"live"` for npm-walked, `"hermetic"`
     /// for the frozen offline fixture. Stamped so the report writer
     /// can pick the right interpretation for ambiguous metrics
-    /// (e.g. zero-FP-red is a §4.1 ship gate on live but expected
+    /// (e.g. zero-FP-red is a ship gate on live but expected
     /// fixture coverage on hermetic). `None` on records written
     /// before this field existed; readers default to the live
     /// interpretation in that case.
@@ -476,7 +476,7 @@ enum ScriptShape {
 /// only the fields we care about; everything else (deps, license, readme,
 /// etc.) is skipped so the binary doesn't pay for parsing the entire manifest.
 ///
-/// Phase 46b Lever #1 — `repository` carries either the legacy
+/// `repository` carries either the legacy
 /// shorthand string `"github.com/x/y"` or the modern object form
 /// `{ "type": "git", "url": "git+https://..." }`. Both shapes
 /// deserialize into the same `RepositoryField` enum, which the
@@ -563,7 +563,7 @@ async fn main() -> Result<(), BoxError> {
     let args = Args::parse();
 
     if args.corpus == CorpusKind::Hermetic {
-        // Phase 69 — offline mode. Skip every network code path, run
+        // Offline mode. Skip every network code path, run
         // L1+L3+advisor against the bundled fixture, write the same
         // results + report + sidecar shape so downstream tooling
         // (incl. the standing-benchmark table writer) is unchanged.
@@ -571,7 +571,7 @@ async fn main() -> Result<(), BoxError> {
     }
 
     if args.corpus == CorpusKind::Curated {
-        // Phase 46.2 L4 measurement runbook — read the 523-entry
+        // Read the 523-entry
         // static-gate fixture and run the same pipeline. Wider
         // coverage than hermetic for amber-shift measurements
         // against the calibrated prompt; same offline-only contract
@@ -808,7 +808,7 @@ async fn enrich_l3_from_cache(client: &reqwest::Client, args: &Args) -> Result<(
 // ─────────────────────────────────────────────────────────────────────
 // Layer 4 enrichment: invoke an advisor over every prompted package.
 // ─────────────────────────────────────────────────────────────────────
-// Phase 69 — hermetic offline corpus mode
+// Hermetic offline corpus mode
 // ─────────────────────────────────────────────────────────────────────
 
 /// One entry in `fixtures/hermetic/corpus.json`. A synthetic
@@ -843,7 +843,7 @@ struct HermeticEntry {
     /// Whether the fixture declares this package as having Sigstore
     /// attestations published. Plain bool — no fetch.
     attestation_present: bool,
-    /// Phase 46b Lever #1 — optional repository URL surfaced to the
+    /// optional repository URL surfaced to the
     /// advisor prompt as the `Repository:` line. Defaults to `None`
     /// for pre-Lever-#1 fixture entries so the field can be rolled
     /// out incrementally; new amber entries (especially delegate-
@@ -851,7 +851,7 @@ struct HermeticEntry {
     /// advisor can apply the matching-identity APPROVE rule.
     #[serde(default)]
     repository: Option<String>,
-    /// Phase 46b Lever #3 — referenced file contents to embed in
+    /// referenced file contents to embed in
     /// the advisor prompt's "Referenced files" section. Each entry
     /// is `{ "filename": "<rel path>", "content": "<inline body>" }`.
     /// Defaults to empty so existing fixtures don't need a rewrite.
@@ -861,7 +861,7 @@ struct HermeticEntry {
     referenced_scripts: Vec<HermeticReferencedScript>,
 }
 
-/// Phase 46b Lever #3 — one referenced file in a hermetic fixture
+/// one referenced file in a hermetic fixture
 /// entry. Mirrors the prompt's `ReferencedScript` shape so the
 /// fixture format is easy to author by hand.
 #[derive(Debug, Clone, Deserialize)]
@@ -873,7 +873,7 @@ struct HermeticReferencedScript {
 const HERMETIC_CORPUS_PATH: &str =
     concat!(env!("CARGO_MANIFEST_DIR"), "/fixtures/hermetic/corpus.json");
 
-/// Phase 46.2 — path to the 523-entry curated static-gate corpus.
+/// Path to the curated static-gate corpus.
 /// Sibling crate's tests directory; resolved at compile time from
 /// `CARGO_MANIFEST_DIR` so a future workspace re-layout fails to
 /// build instead of silently stop-reading. The fixture's
@@ -901,14 +901,14 @@ struct CuratedExpectation {
     #[serde(default)]
     #[allow(dead_code)] // surfaced via report sanity-check in a follow-up; reserved for now
     expected: Option<String>,
-    /// Phase 46b Lever #1 — optional repository URL the L4 advisor
+    /// optional repository URL the L4 advisor
     /// will see in its prompt. Defaults to `None` so pre-Lever-#1
     /// fixture entries don't need a rewrite; the delegate-to-local-
     /// file entries (the ones where the lever moves the needle)
     /// should carry a plausible URL pointing at a recognizable host.
     #[serde(default)]
     repository: Option<String>,
-    /// Phase 46b Lever #4 — optional simulated package name. The
+    /// optional simulated package name. The
     /// entry `id` doubles as the audit identity by default, but the
     /// L1 widening's identity match keys off the package's base
     /// name. For fixture entries whose ID is a synthetic prefix
@@ -918,7 +918,7 @@ struct CuratedExpectation {
     /// used (matches the pre-Lever-#4 behaviour).
     #[serde(default)]
     package_name: Option<String>,
-    /// Phase 46b Lever #3 — referenced file contents to embed in
+    /// referenced file contents to embed in
     /// the advisor prompt. Same shape as `HermeticEntry::
     /// referenced_scripts` — `{ "filename": "...", "content": "..." }`
     /// entries. Defaults to empty so existing fixtures don't need a
@@ -927,7 +927,7 @@ struct CuratedExpectation {
     referenced_scripts: Vec<HermeticReferencedScript>,
 }
 
-/// Phase 46.2 — run the audit against the 523-entry curated
+/// Run the audit against the curated
 /// static-gate fixture. Same control flow as [`run_hermetic`]; the
 /// per-entry construction reads `scripts/<id>.txt` for the body and
 /// synthesizes a single-postinstall PackageAudit (the fixture is
@@ -1029,16 +1029,16 @@ fn curated_entry_to_audit(
     simulated_package_name: Option<&str>,
     referenced_scripts: Vec<ReferencedScriptEntry>,
 ) -> PackageAudit {
-    // Phase 46b Lever #4 — pass identity context to the L1
+    // pass identity context to the L1
     // classifier. For most entries the fixture's entry ID doubles
     // as the package name; for entries whose ID is a synthetic
     // prefix (e.g. `amber-d18-013-sharp-install-js`), an explicit
     // `package_name` (e.g. `"sharp"`) lets the lever match the
     // identity payload a real manifest would carry.
     //
-    // Phase 46b Option B — curated entries default to "old publish"
+    // curated entries default to "old publish"
     // (8760h = 1 year, matching `hermetic_l3_outcome(8760, false)`
-    // below), under the standard 24h cooldown. Lever #4's cooldown
+    // below), under the standard 24h cooldown.
     // defense-in-depth thus fires the widening normally on curated.
     // A future curated entry that wants to exercise the recent-
     // publish path would supply its own `publish_age_hours` field.
@@ -1069,12 +1069,12 @@ fn curated_entry_to_audit(
         portable_outcome: None,
         advisor_outcome: None,
         advisor_provider: None,
-        // Phase 46b Lever #1 — curated entries may carry a
+        // curated entries may carry a
         // repository URL on `expectations.json` so the L4 advisor
         // can apply the delegate-to-local-file APPROVE rule. Older
         // expectation entries without the field land as `None`.
         repository,
-        // Phase 46b Lever #3 — curated entries may carry an
+        // curated entries may carry an
         // embedded view of their delegated file so the L4 advisor
         // can apply the fetch-IDENTITY rule one level deep without
         // a tarball fetch.
@@ -1091,7 +1091,7 @@ fn curated_entry_to_audit(
     audit
 }
 
-/// Phase 69 — run the audit against the bundled offline corpus.
+/// Run the audit against the bundled offline corpus.
 ///
 /// Identical control flow to the live path's `main()`:
 /// `audit_top_n` equivalent → `enrich_l3_in_place` equivalent →
@@ -1144,15 +1144,15 @@ async fn run_hermetic(args: &Args) -> Result<(), BoxError> {
 /// `fetch_l3_one`, but reads every field from the fixture instead of
 /// the network.
 fn hermetic_entry_to_audit(entry: HermeticEntry) -> PackageAudit {
-    // Phase 46b Lever #4 — thread identity into the L1 classifier so
+    // thread identity into the L1 classifier so
     // hermetic delegate-to-local-file shapes with matching repo
     // names Green directly at L1 (no L4 round-trip).
     //
-    // Phase 46b Option B — use the fixture's `publish_age_hours` to
+    // use the fixture's `publish_age_hours` to
     // exercise the cooldown defense-in-depth. The recent-publish
     // hermetic entry (`hermetic-amber-binary-fetcher-recent` with
     // `publish_age_hours: 1`) is the load-bearing test case: with
-    // Option B + 24h policy, that entry stays Amber even though its
+    // Under the 24h cooldown policy, that entry stays Amber even though its
     // repository identity matches, because the publish age is below
     // the cooldown threshold.
     let ctx = ManifestContext {
@@ -1189,13 +1189,13 @@ fn hermetic_entry_to_audit(entry: HermeticEntry) -> PackageAudit {
         portable_outcome: None,
         advisor_outcome: None,
         advisor_provider: None,
-        // Phase 46b Lever #1 — hermetic fixtures may declare a
+        // hermetic fixtures may declare a
         // `repository` URL so the L4 advisor sees it in the prompt.
         // Existing pre-Lever-#1 fixtures don't carry the field, so
         // `serde(default)` lets them load as `None` without a
         // fixture rewrite.
         repository: entry.repository.clone(),
-        // Phase 46b Lever #3 — hermetic fixtures may declare
+        // hermetic fixtures may declare
         // referenced file content so the L4 advisor sees it
         // embedded in the prompt. `serde(default)` keeps existing
         // fixtures load-clean as an empty list.
@@ -1332,7 +1332,7 @@ async fn enrich_advisor_in_place(
         targets.len()
     );
 
-    // Phase 46b — open the L4 cache when `--l4-cache` is set. Off by
+    // Open the L4 cache when `--l4-cache` is set. Off by
     // default so a measurement run pays the honest cold-cache LLM
     // round-trip cost. The cache module's own `LPM_L4_CACHE=0`
     // env-var disable still applies; if both flag-on + env-off, we
@@ -1378,7 +1378,7 @@ async fn enrich_advisor_in_place(
     let pb = Arc::new(ProgressBar::new(targets.len() as u64));
     pb.set_style(progress_style("L4 advise"));
 
-    // Phase 46.2 (2026-05-11): fan out advisor calls in parallel.
+    // Fan out advisor calls in parallel.
     // Pre-parallelization the curated 123-amber run took ~7 min
     // wall-clock at ~3.4s/call serial. With concurrency = 8, that
     // drops to ~1 min. The `Advisor` trait is `Send + Sync` and
@@ -1451,7 +1451,7 @@ async fn enrich_advisor_in_place(
         }
     }
 
-    // Phase 46b — persist + summary. Persisting is best-effort
+    // Persist + summary. Persisting is best-effort
     // (failure surfaces as a warning, never an error). Summary line
     // fires when `--l4-cache` is set OR when `--l4-cache-stats` is
     // (the latter is for a future "show stats without changing the
@@ -1488,7 +1488,7 @@ async fn enrich_advisor_in_place(
 /// across phases (matches the L1 worst-of-phases logic). Returns
 /// `(verdict_label_for_logging, final_advisor_outcome)`.
 ///
-/// Phase 46b — when `cache` is `Some`, look up the (name, version,
+/// When `cache` is `Some`, look up the (name, version,
 /// amber-phase-bodies, prompt_template_hash, provider, model) key
 /// before invoking the advisor. On a hit, the LLM call is skipped
 /// entirely and the cached verdict is mapped straight back to an
@@ -1517,7 +1517,7 @@ async fn classify_one_with_advisor(
 
     let version = pkg.version.as_deref().unwrap_or("unknown");
 
-    // Phase 46b — cache lookup. The cache key folds in every input
+    // Cache lookup. The cache key folds in every input
     // axis that affects the verdict: package identity (name +
     // version), every amber phase body, plus the advisor's prompt
     // template hash + provider slug + model version. A cache hit
@@ -1559,7 +1559,7 @@ async fn classify_one_with_advisor(
         return (Some(label), outcome);
     }
 
-    // Phase 46b Lever #3 — borrow the referenced files as a slice
+    // borrow the referenced files as a slice
     // of `ReferencedScript` so the prompt's "Referenced files"
     // section can render the embedded view.
     let amber_refs: Vec<lpm_triage_advisor::ReferencedScript<'_>> = pkg
@@ -1578,11 +1578,11 @@ async fn classify_one_with_advisor(
             package_version: version,
             phase: phase_name,
             script_body: &script.script,
-            // Phase 46b Lever #1 — forward the package's
+            // forward the package's
             // `repository` URL so the prompt's `Repository:` line
             // pairs with the script body.
             repository: pkg.repository.as_deref(),
-            // Phase 46b Lever #3 — forward the embedded view of
+            // forward the embedded view of
             // referenced files so the prompt can apply the
             // fetch-IDENTITY rule one level deep.
             referenced_scripts: &amber_refs,
@@ -1609,7 +1609,7 @@ async fn classify_one_with_advisor(
         return (Some("failure"), AdvisorOutcome::Prompt);
     }
 
-    // Phase 46b — insert the final verdict into the cache so the
+    // Insert the final verdict into the cache so the
     // next run with the same inputs hits.
     if cache.is_some() {
         cache_misses.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -1751,16 +1751,16 @@ async fn reclassify_from_cache(args: &Args) -> Result<(), BoxError> {
     let mut changed = 0usize;
     for a in &mut audits {
         let prev_tier = a.tier;
-        // Phase 46b Lever #4 — `--reclassify` re-runs the L1
+        // `--reclassify` re-runs the L1
         // classifier with the manifest context the prior fetch
         // captured. `repository` is on the cached record; `bin`
         // isn't (audit-corpus never fetched it for older audits),
         // so passes through as empty.
         //
-        // Phase 46b Option B — `--reclassify` doesn't have publish
+        // `--reclassify` doesn't have publish
         // ages in the cached record (the audit-corpus's PackageAudit
         // shape never persisted them). Pass `min_release_age_secs=0`
-        // so Lever #4 fires on identity match — matches the prior
+        // so the identity check fires on identity match — matches the prior
         // `--reclassify` behaviour for users iterating on
         // `static_gate.rs` changes. Production install pipeline
         // applies the proper cooldown defense; this is a measurement
@@ -1998,7 +1998,7 @@ async fn audit_one(
         advisor_outcome: None,
         advisor_provider: None,
         repository: None,
-        // Phase 46b Lever #3 — live audit path does NOT fetch
+        // live audit path does NOT fetch
         // tarballs (heavy + npm-rate-limit-sensitive). Referenced
         // scripts stay empty for live runs; fixture-based runs
         // populate them from the corpus / expectations. A future
@@ -2011,15 +2011,15 @@ async fn audit_one(
     match result {
         Ok(manifest) => {
             audit.version = manifest.version;
-            // Phase 46b Lever #1 — pull the `repository` URL from
+            // pull the `repository` URL from
             // the registry manifest (string or object shape).
             audit.repository = manifest.repository.and_then(RepositoryField::into_url);
             let scripts = manifest.scripts.unwrap_or_default();
-            // Phase 46b Lever #4 — pass identity context so
+            // pass identity context so
             // delegate-to-local-file shapes with matching repo
             // identity Green at L1, skipping L4.
             //
-            // Phase 46b Option B — live audit doesn't compute publish
+            // live audit doesn't compute publish
             // ages here (the cooldown gate runs separately in
             // `enrich_l3_in_place`). For audit-measurement purposes
             // we pass `min_release_age_secs=0` so the L1 classifier
@@ -2065,7 +2065,7 @@ fn classify_script(script: &str) -> ScriptAudit {
     classify_script_with_context(script, None)
 }
 
-/// Phase 46b Lever #4 — classify with optional manifest context for
+/// classify with optional manifest context for
 /// the `node install.js` + matching-identity widening. Callers that
 /// have the package name + repository / bin available should prefer
 /// this form so the L1 tier reflects the lever; legacy callers
@@ -2131,7 +2131,7 @@ fn classify_shape(script: &str, tokens: &[String], tier: StaticTier) -> ScriptSh
     }
 
     // `node <relative>` family — split by whether basename is in the
-    // §4.1 reserved binary-fetcher set (mirrors the classifier's
+    // Binary-fetcher set (mirrors the classifier's
     // `is_reserved_lifecycle_basename`, kept in sync here for
     // reporting only — the classifier remains the source of truth).
     if bare == "node" && tokens.len() >= 2 {
@@ -2476,7 +2476,7 @@ fn summarise(audits: &[PackageAudit]) -> Summary {
 
 /// Distribution over [`PortableOutcome`] — the decision-grade view.
 /// `prompt_tuneable` is `prompt` minus packages whose dominant
-/// amber-script shape is policy-permanent — i.e. amber by §4.1
+/// amber-script shape is policy-permanent — i.e. amber by design
 /// design (binary-fetcher / prebuild-fallback). The tuneable count is
 /// the standing "how much classifier headroom is left" number.
 #[derive(Debug, Default)]
@@ -2488,7 +2488,7 @@ struct PortableSummary {
     prompt_tuneable: usize,
     hard_block: usize,
     no_scripts: usize,
-    /// Hard ship-gate number — must always be 0 per §4.1.
+    /// Hard ship-gate number — must always be 0 for real-corpus runs.
     zero_fp_red_count: usize,
     /// L3 cooldown blocks broken out separately so the standing table
     /// can distinguish "blocked because L1 red" from "blocked because
@@ -2553,7 +2553,7 @@ fn package_is_policy_permanent_amber(a: &PackageAudit) -> bool {
 
 fn build_report(audits: &[PackageAudit], metadata: &AuditMetadata) -> String {
     let mut out = String::new();
-    out.push_str("# Phase 46 — Top-N audit (L1-3, portable)\n\n");
+    out.push_str("# Top-N audit (L1-3, portable)\n\n");
     out.push_str(&format!("Total packages audited: **{}**\n\n", audits.len()));
 
     section_run_metadata(&mut out, metadata);
@@ -2609,12 +2609,12 @@ fn section_run_metadata(out: &mut String, metadata: &AuditMetadata) {
     out.push('\n');
 }
 
-/// Locked standing benchmark per the Phase 46 audit Part A closeout.
-/// These 7 numbers are the canonical comparison points for future
-/// audit iterations.
+/// Locked standing benchmark. These numbers are the canonical comparison
+/// points for future
+/// iterations.
 ///
 /// `metadata.corpus` re-interprets one cell: on the live top-N
-/// corpus, `zero-FP-red` is a §4.1 ship gate that MUST stay 0
+/// corpus, `zero-FP-red` is a ship gate that MUST stay 0
 /// because real npm is overwhelmingly benign; on the hermetic
 /// fixture, intentional reds exercise classifier shape coverage,
 /// so the "stay 0" framing is wrong and gets replaced with a
@@ -2656,7 +2656,7 @@ fn section_standing_benchmark(out: &mut String, audits: &[PackageAudit], metadat
         p.no_scripts
     ));
     // The zero-FP-red metric is named for its live-corpus role
-    // (§4.1 ship gate: any red on real top-N is a suspected
+    // (Ship gate: any red on real top-N is a suspected
     // false-positive). On the hermetic fixture the reds are
     // intentional shape coverage, so the "MUST stay 0" framing is
     // misleading — re-word that single cell.
@@ -2664,7 +2664,7 @@ fn section_standing_benchmark(out: &mut String, audits: &[PackageAudit], metadat
         Some("hermetic") => {
             "Hermetic fixture: count reflects intentional red shape coverage, not a ship-gate failure. Compare to the prior run's value; a change signals a classifier drift on the fixed corpus."
         }
-        _ => "**§4.1 ship gate — MUST stay 0**",
+        _ => "**Ship gate — MUST stay 0**",
     };
     out.push_str(&format!(
         "| **zero-FP-red** | **{}** | {zero_fp_red_note} |\n",
@@ -2704,7 +2704,7 @@ fn section_prompt_shape_breakdown(out: &mut String, audits: &[PackageAudit]) {
     out.push_str("## Prompt-shape breakdown\n\n");
     out.push_str(
         "Each prompted script categorised by normalised shape. The \
-         `policy-permanent?` flag marks shapes that are amber by §4.1 \
+         `policy-permanent?` flag marks shapes that are amber by design \
          design (binary-fetcher / prebuild-fallback) — they should \
          NOT be treated as classifier-tuning candidates in future \
          iterations.\n\n",
@@ -2713,7 +2713,7 @@ fn section_prompt_shape_breakdown(out: &mut String, audits: &[PackageAudit]) {
     out.push_str("|-------|------:|:------------------|----|\n");
     for (shape, bucket) in sorted {
         let perm = if is_policy_permanent_amber_shape(shape) {
-            "**yes — §4.1 D18**"
+            "**yes — D18 binary-fetcher**"
         } else {
             "no"
         };
@@ -2827,7 +2827,7 @@ fn section_l1_tier_distribution(out: &mut String, audits: &[PackageAudit]) {
         pct_audited(summary.fetch_failed)
     ));
     out.push_str(&format!(
-        "L1 green / (green + amber) over scripted = **{:.2}%** (§4.1 corpus floor: ≥60% on the curated 500-entry corpus; live distribution is not gated by that floor).\n\n",
+        "L1 green / (green + amber) over scripted = **{:.2}%** (corpus floor: ≥60% on the curated 500-entry corpus; live distribution is not gated by that floor).\n\n",
         summary.green_share_pct(),
     ));
 }
@@ -3035,7 +3035,7 @@ fn shape_label(s: ScriptShape) -> &'static str {
 }
 
 /// Whether a shape is **policy-permanent amber** — amber by explicit
-/// §4.1 design (binary-fetcher / prebuild-fallback are D18 downloader
+/// design (binary-fetcher / prebuild-fallback are D18 downloader
 /// classes; widening them would erode the user-acknowledges-binary-
 /// download contract). Used to compute `prompt-tuneable`: the subset
 /// of prompts that classifier work could still plausibly reduce.

@@ -1,14 +1,13 @@
-//! Phase 46 P4 Chunk 3 — provenance-drift comparator.
+//! Provenance-drift comparator.
 //!
 //! Pure comparison logic consumed by the install-time drift gate in
 //! `lpm-cli/src/commands/install.rs`. Given an approved
 //! [`ProvenanceSnapshot`] (captured into a
 //! [`TrustedDependencyBinding.provenance_at_approval`] at approval
 //! time) and a freshly-fetched snapshot for the candidate version,
-//! decide whether the identity has drifted enough to block the
-//! install.
+//! decide whether the identity has drifted enough to block the install.
 //!
-//! Maps to §7.2 of the Phase 46 plan:
+//! Five-branch comparison table:
 //!
 //! ```text
 //! (now, approved)
@@ -21,11 +20,11 @@
 //!
 //! **Where `None` comes from** — outer `Option<&ProvenanceSnapshot>`
 //! is distinct from the snapshot's inner `present: bool`:
-//! - Outer `None` (approved side): no approval record has a captured
-//!   snapshot — legacy binding, or approval pre-dated P4.
-//! - Outer `None` (now side): the fetcher couldn't produce a
-//!   definitive answer (network error, malformed bundle). Per §11 P4,
-//!   fetch failures degrade to pass, NOT drift.
+//! - Outer `None` (approved side): legacy binding pre-dating provenance
+//!   capture.
+//! - Outer `None` (now side): the fetcher couldn't produce a definitive
+//!   answer (network error, malformed bundle). Fetch failures degrade to
+//!   pass, NOT drift.
 //! - Inner `present: false`: the registry **confirms** it has no
 //!   attestation for this version — that's the axios signal when the
 //!   approved side was `present: true`.
@@ -67,14 +66,13 @@ pub enum DriftVerdict {
 /// - `workflow_ref` (e.g. `refs/tags/v1.14.0`) — changes every
 ///   release by design; comparing it would falsely flag every patch
 ///   bump as "identity changed" (this was the reviewer's critical
-///   Chunk 3 finding before the workflow field split).
+///   identity changed" before the workflow field split).
 /// - `attestation_cert_sha256` — Fulcio issues a fresh leaf cert per
 ///   signing invocation, so the cert SHA rotates per release even
 ///   when the GitHub Actions identity is unchanged. Retained in the
 ///   snapshot for audit / forensics, not for drift gating.
 ///
-/// Using `==` on the full struct (which is what Chunk 3 originally
-/// did) would have made `NoDrift` unreachable for any two distinct
+/// Using `==` on the full struct would make `NoDrift` unreachable for any two distinct
 /// releases from the same repo — the regression guard
 /// `no_drift_when_only_workflow_ref_differs_between_releases` below
 /// exercises exactly this scenario and must stay green.
@@ -82,22 +80,20 @@ fn identity_equal(a: &ProvenanceSnapshot, n: &ProvenanceSnapshot) -> bool {
     a.present == n.present && a.publisher == n.publisher && a.workflow_path == n.workflow_path
 }
 
-/// Compare the approved-side and fresh-side provenance snapshots per
-/// the §7.2 drift rule.
+/// Compare the approved-side and fresh-side provenance snapshots.
 ///
 /// Returns [`DriftVerdict::NoDrift`] whenever the comparison cannot
-/// claim drift with confidence — this is the plan's "pass, don't
-/// drift" contract for degraded-fetch and missing-approval cases.
-/// Callers should still surface drift visually (e.g., the UX in §7.3)
-/// only when the verdict is not `NoDrift`.
+/// claim drift with confidence — the "pass, don't drift" contract for
+/// degraded-fetch and missing-approval cases. Callers should still
+/// surface drift visually only when the verdict is not `NoDrift`.
 pub fn check_provenance_drift(
     approved: Option<&ProvenanceSnapshot>,
     now: Option<&ProvenanceSnapshot>,
 ) -> DriftVerdict {
     match (approved, now) {
         // No approval reference: can't detect drift. Either a legacy
-        // `trustedDependencies` entry with no P4 state, or the binding
-        // was written before P4 captured provenance. Layers 1/2/4
+        // `trustedDependencies` entry with no provenance state, or a
+        // binding written before provenance capture. Layers 1/2/4
         // (static gate, cooldown, etc.) decide.
         (None, _) => DriftVerdict::NoDrift,
 
@@ -158,7 +154,7 @@ mod tests {
         }
     }
 
-    // ── §7.2 five-branch match table ──────────────────────────────
+    // ── Five-branch drift match table ────────────────────────────
 
     // Canonical stable-fields identity used as the base for drift
     // tests. `axios_v114_0` vs `axios_v114_1` cover the "same repo,
@@ -330,8 +326,8 @@ mod tests {
 
     #[test]
     fn no_drift_when_now_side_is_none() {
-        // Fetcher returned None (degraded). Per §11 P4, don't block
-        // the install over transient network conditions.
+        // Fetcher returned None (degraded). Don't block the install
+        // over transient network conditions.
         let a = axios_v114_0();
         assert_eq!(
             check_provenance_drift(Some(&a), None),
