@@ -11,7 +11,56 @@
 //! returned unverified for the caller to format.
 
 use crate::{crypto, signature};
+use futures::StreamExt;
 use std::collections::HashMap;
+
+/// Hard cap on a single vault-sync response body. Encrypted envelopes
+/// are small (kilobytes); a multi-MB cap leaves multiple orders of
+/// magnitude of headroom while stopping a malicious / compromised
+/// platform endpoint from OOM-ing the CLI on the signed-read path
+/// that runs before any signature verification.
+const MAX_VAULT_RESPONSE_BYTES: usize = 10 * 1024 * 1024;
+
+/// Drain a response body with the vault size cap applied in two stages.
+///
+/// Stage 1 (pre-stream): refuse when the server's declared
+/// `Content-Length` exceeds `MAX_VAULT_RESPONSE_BYTES`. Stage 2
+/// (mid-stream): accumulate `bytes_stream()` chunks and abort the
+/// moment another chunk would cross the cap. Closing the response
+/// at that point drops the underlying connection.
+async fn read_capped_body(response: reqwest::Response) -> Result<Vec<u8>, String> {
+    if let Some(declared) = response.content_length()
+        && declared as usize > MAX_VAULT_RESPONSE_BYTES
+    {
+        return Err(format!(
+            "response too large: declared length {declared} exceeds cap {MAX_VAULT_RESPONSE_BYTES}"
+        ));
+    }
+
+    let mut buf: Vec<u8> = Vec::with_capacity(16 * 1024);
+    let mut stream = response.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|e| format!("response read error: {e}"))?;
+        if buf.len().saturating_add(chunk.len()) > MAX_VAULT_RESPONSE_BYTES {
+            return Err(format!(
+                "response too large: streamed body exceeded cap {MAX_VAULT_RESPONSE_BYTES}"
+            ));
+        }
+        buf.extend_from_slice(&chunk);
+    }
+    Ok(buf)
+}
+
+/// Read a (typically error) response body as UTF-8 text under the
+/// vault cap. Mirrors the previous `response.text().await.unwrap_or_default()`
+/// shape — failures become empty strings so error formatting still
+/// produces a usable message — but the buffer is now bounded.
+async fn read_capped_error_text(response: reqwest::Response) -> String {
+    match read_capped_body(response).await {
+        Ok(buf) => String::from_utf8_lossy(&buf).into_owned(),
+        Err(_) => String::new(),
+    }
+}
 
 /// Read a vault sync response and verify its `X-LPM-Signature` header
 /// against the body. Only 2xx responses are signed by the server, so
@@ -25,7 +74,7 @@ async fn read_verified_response(
     auth_token: &str,
 ) -> Result<(reqwest::StatusCode, Vec<u8>), String> {
     let status = response.status();
-    // Snapshot the signature header first — `response.bytes()` consumes
+    // Snapshot the signature header first — body-drain consumes
     // `self`, so we cannot read headers afterwards.
     let signature_header = response
         .headers()
@@ -33,11 +82,7 @@ async fn read_verified_response(
         .and_then(|v| v.to_str().ok())
         .map(str::to_owned);
 
-    let body = response
-        .bytes()
-        .await
-        .map_err(|e| format!("response read error: {e}"))?
-        .to_vec();
+    let body = read_capped_body(response).await?;
 
     if status.is_success() {
         signature::verify_response_body(&body, auth_token, signature_header.as_deref())
@@ -150,7 +195,7 @@ pub async fn list_remote(registry_url: &str, auth_token: &str) -> Result<Vec<Rem
         .map_err(|e| format!("network error: {e}"))?;
 
     if !response.status().is_success() {
-        let body = response.text().await.unwrap_or_default();
+        let body = read_capped_error_text(response).await;
         return Err(format!("server error: {body}"));
     }
 
@@ -516,7 +561,7 @@ pub async fn upload_public_key(
         .map_err(|e| format!("network error: {e}"))?;
 
     if !response.status().is_success() {
-        let body = response.text().await.unwrap_or_default();
+        let body = read_capped_error_text(response).await;
         return Err(format!("failed to upload public key: {body}"));
     }
 
@@ -589,7 +634,7 @@ pub async fn get_org_member_keys(
         .map_err(|e| format!("network error: {e}"))?;
 
     if !response.status().is_success() {
-        let body = response.text().await.unwrap_or_default();
+        let body = read_capped_error_text(response).await;
         return Err(format!("failed to fetch member keys: {body}"));
     }
 
@@ -692,7 +737,7 @@ pub async fn list_org_vaults(
         .map_err(|e| format!("network error: {e}"))?;
 
     if !response.status().is_success() {
-        let body = response.text().await.unwrap_or_default();
+        let body = read_capped_error_text(response).await;
         return Err(format!("server error: {body}"));
     }
 
@@ -974,7 +1019,7 @@ pub async fn get_pairing_session(
         .map_err(|e| format!("network error: {e}"))?;
 
     if !response.status().is_success() {
-        let body = response.text().await.unwrap_or_default();
+        let body = read_capped_error_text(response).await;
         return Err(format!("pairing error: {body}"));
     }
 
@@ -1012,7 +1057,7 @@ pub async fn approve_pairing(
         .map_err(|e| format!("network error: {e}"))?;
 
     if !response.status().is_success() {
-        let body = response.text().await.unwrap_or_default();
+        let body = read_capped_error_text(response).await;
         return Err(format!("approval failed: {body}"));
     }
 
@@ -1037,7 +1082,7 @@ pub async fn unpair_all(registry_url: &str, auth_token: &str) -> Result<(), Stri
         .map_err(|e| format!("network error: {e}"))?;
 
     if !response.status().is_success() {
-        let body = response.text().await.unwrap_or_default();
+        let body = read_capped_error_text(response).await;
         return Err(format!("unpair failed: {body}"));
     }
 
@@ -1131,7 +1176,7 @@ pub async fn upload_escrow_key(
         .map_err(|e| format!("network error: {e}"))?;
 
     if !response.status().is_success() {
-        let body = response.text().await.unwrap_or_default();
+        let body = read_capped_error_text(response).await;
         // Try to extract error message from JSON
         if let Ok(json) = serde_json::from_str::<serde_json::Value>(&body)
             && let Some(err) = json["error"].as_str()
@@ -1258,6 +1303,48 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// `read_capped_body` rejects pre-stream when the server declares a
+    /// `Content-Length` over the vault cap. A malicious / compromised
+    /// platform endpoint must not be able to coerce
+    /// `read_verified_response` into allocating a multi-GB buffer
+    /// before any signature check runs.
+    #[tokio::test]
+    async fn read_capped_body_rejects_oversized_declared_length() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let declared = MAX_VAULT_RESPONSE_BYTES + 1;
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        tokio::spawn(async move {
+            if let Ok((mut socket, _)) = listener.accept().await {
+                let mut buf = [0u8; 1024];
+                let _ = socket.read(&mut buf).await;
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\n\
+                     Content-Length: {declared}\r\n\
+                     Content-Type: application/json\r\n\
+                     Connection: close\r\n\
+                     \r\n",
+                );
+                let _ = socket.write_all(resp.as_bytes()).await;
+                let _ = socket.shutdown().await;
+            }
+        });
+
+        let response = reqwest::get(format!("http://{addr}/"))
+            .await
+            .expect("connect");
+        let err = read_capped_body(response)
+            .await
+            .expect_err("oversized declared length must reject pre-stream");
+        assert!(
+            err.contains("declared length"),
+            "expected pre-stream rejection, got: {err}"
+        );
     }
 
     #[tokio::test]

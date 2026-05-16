@@ -33,6 +33,7 @@ hex = { workspace = true }
 
 # HTTP (for sync)
 reqwest = { workspace = true }
+futures = { workspace = true }
 urlencoding = "2"
 
 [dev-dependencies]

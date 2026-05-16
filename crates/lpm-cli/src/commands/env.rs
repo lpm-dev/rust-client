@@ -1,8 +1,62 @@
 use crate::output;
+use futures::StreamExt;
 use lpm_common::LpmError;
 use lpm_common::color::Painted;
 use lpm_registry::RegistryClient;
 use std::collections::HashMap;
+
+/// Hard cap on platform-API response bodies (env / vault / OIDC
+/// endpoints called from this module). Real payloads are kilobytes;
+/// 10 MB leaves several orders of magnitude of headroom and prevents
+/// a malicious / compromised platform endpoint from OOM-ing the CLI
+/// on the `.json()` path.
+const MAX_PLATFORM_RESPONSE_BYTES: usize = 10 * 1024 * 1024;
+
+/// Drain a response body with a two-stage cap. Stage 1 refuses
+/// pre-stream when `Content-Length` exceeds the cap; stage 2 aborts
+/// mid-stream the moment another chunk would cross it.
+async fn read_capped_platform_body(response: reqwest::Response) -> Result<Vec<u8>, LpmError> {
+    if let Some(declared) = response.content_length()
+        && declared as usize > MAX_PLATFORM_RESPONSE_BYTES
+    {
+        return Err(LpmError::Script(format!(
+            "platform response too large: declared length {declared} exceeds cap {MAX_PLATFORM_RESPONSE_BYTES}"
+        )));
+    }
+    let mut buf: Vec<u8> = Vec::with_capacity(16 * 1024);
+    let mut stream = response.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|e| LpmError::Script(format!("response read error: {e}")))?;
+        if buf.len().saturating_add(chunk.len()) > MAX_PLATFORM_RESPONSE_BYTES {
+            return Err(LpmError::Script(format!(
+                "platform response too large: streamed body exceeded cap {MAX_PLATFORM_RESPONSE_BYTES}"
+            )));
+        }
+        buf.extend_from_slice(&chunk);
+    }
+    Ok(buf)
+}
+
+/// Parse a capped platform response as JSON. Used in success-path
+/// reads where the caller wants typed parse errors back.
+async fn parse_capped_platform_json<T: serde::de::DeserializeOwned>(
+    response: reqwest::Response,
+) -> Result<T, LpmError> {
+    let buf = read_capped_platform_body(response).await?;
+    serde_json::from_slice(&buf).map_err(|e| LpmError::Script(format!("parse error: {e}")))
+}
+
+/// Parse a capped platform response as JSON, falling back to a stub
+/// `{"error": "unknown error"}` value on read / cap / parse failure.
+/// Used on error-path reads where the caller only needs an `error`
+/// field to display.
+async fn parse_capped_platform_json_or_unknown(response: reqwest::Response) -> serde_json::Value {
+    match read_capped_platform_body(response).await {
+        Ok(buf) => serde_json::from_slice::<serde_json::Value>(&buf)
+            .unwrap_or_else(|_| serde_json::json!({"error": "unknown error"})),
+        Err(_) => serde_json::json!({"error": "unknown error"}),
+    }
+}
 
 fn build_sync_environments(
     all_envs: &HashMap<String, HashMap<String, String>>,
@@ -1914,10 +1968,7 @@ async fn vars_connect(
         .map_err(|e| LpmError::Network(format!("failed to connect: {e}")))?;
 
     if !response.status().is_success() {
-        let body: serde_json::Value = response
-            .json()
-            .await
-            .unwrap_or(serde_json::json!({"error": "unknown error"}));
+        let body: serde_json::Value = parse_capped_platform_json_or_unknown(response).await;
         return Err(LpmError::Script(
             body["error"]
                 .as_str()
@@ -1926,10 +1977,7 @@ async fn vars_connect(
         ));
     }
 
-    let result: serde_json::Value = response
-        .json()
-        .await
-        .map_err(|e| LpmError::Script(format!("parse error: {e}")))?;
+    let result: serde_json::Value = parse_capped_platform_json(response).await?;
 
     if json_output {
         println!(
@@ -2036,19 +2084,13 @@ async fn vars_platform_push(
         .map_err(|e| LpmError::Network(format!("failed to reach server: {e}")))?;
 
     if !dry_run_response.status().is_success() {
-        let body: serde_json::Value = dry_run_response
-            .json()
-            .await
-            .unwrap_or(serde_json::json!({"error": "unknown error"}));
+        let body: serde_json::Value = parse_capped_platform_json_or_unknown(dry_run_response).await;
         return Err(LpmError::Script(
             body["error"].as_str().unwrap_or("push failed").to_string(),
         ));
     }
 
-    let diff: serde_json::Value = dry_run_response
-        .json()
-        .await
-        .map_err(|e| LpmError::Script(format!("parse error: {e}")))?;
+    let diff: serde_json::Value = parse_capped_platform_json(dry_run_response).await?;
 
     let added = diff["added"].as_array().map(|a| a.len()).unwrap_or(0);
     let changed = diff["changed"].as_array().map(|a| a.len()).unwrap_or(0);
@@ -2160,19 +2202,13 @@ async fn vars_platform_push(
         .map_err(|e| LpmError::Network(format!("push failed: {e}")))?;
 
     if !push_response.status().is_success() {
-        let body: serde_json::Value = push_response
-            .json()
-            .await
-            .unwrap_or(serde_json::json!({"error": "unknown error"}));
+        let body: serde_json::Value = parse_capped_platform_json_or_unknown(push_response).await;
         return Err(LpmError::Script(
             body["error"].as_str().unwrap_or("push failed").to_string(),
         ));
     }
 
-    let result: serde_json::Value = push_response
-        .json()
-        .await
-        .map_err(|e| LpmError::Script(format!("parse error: {e}")))?;
+    let result: serde_json::Value = parse_capped_platform_json(push_response).await?;
 
     if json_output {
         println!(
@@ -2268,10 +2304,7 @@ async fn vars_platform_status(
         .map_err(|e| LpmError::Network(format!("failed to reach server: {e}")))?;
 
     if !response.status().is_success() {
-        let body: serde_json::Value = response
-            .json()
-            .await
-            .unwrap_or(serde_json::json!({"error": "unknown error"}));
+        let body: serde_json::Value = parse_capped_platform_json_or_unknown(response).await;
         return Err(LpmError::Script(
             body["error"]
                 .as_str()
@@ -2280,10 +2313,7 @@ async fn vars_platform_status(
         ));
     }
 
-    let result: serde_json::Value = response
-        .json()
-        .await
-        .map_err(|e| LpmError::Script(format!("parse error: {e}")))?;
+    let result: serde_json::Value = parse_capped_platform_json(response).await?;
 
     if json_output {
         println!(
@@ -2498,19 +2528,13 @@ async fn vars_oidc_allow(
         .map_err(|e| LpmError::Network(format!("failed to reach server: {e}")))?;
 
     if !response.status().is_success() {
-        let body: serde_json::Value = response
-            .json()
-            .await
-            .unwrap_or(serde_json::json!({"error": "unknown error"}));
+        let body: serde_json::Value = parse_capped_platform_json_or_unknown(response).await;
         return Err(LpmError::Script(
             body["error"].as_str().unwrap_or("failed").to_string(),
         ));
     }
 
-    let result: serde_json::Value = response
-        .json()
-        .await
-        .map_err(|e| LpmError::Script(format!("parse error: {e}")))?;
+    let result: serde_json::Value = parse_capped_platform_json(response).await?;
 
     if !json_output {
         output::success(&format!(
@@ -2593,19 +2617,13 @@ async fn vars_oidc_list(project_dir: &std::path::Path, json_output: bool) -> Res
         .map_err(|e| LpmError::Network(format!("failed to reach server: {e}")))?;
 
     if !response.status().is_success() {
-        let body: serde_json::Value = response
-            .json()
-            .await
-            .unwrap_or(serde_json::json!({"error": "unknown error"}));
+        let body: serde_json::Value = parse_capped_platform_json_or_unknown(response).await;
         return Err(LpmError::Script(
             body["error"].as_str().unwrap_or("failed").to_string(),
         ));
     }
 
-    let result: serde_json::Value = response
-        .json()
-        .await
-        .map_err(|e| LpmError::Script(format!("parse error: {e}")))?;
+    let result: serde_json::Value = parse_capped_platform_json(response).await?;
 
     if json_output {
         println!(
@@ -2710,10 +2728,8 @@ async fn vars_oidc_pull(
         .map_err(|e| LpmError::Network(format!("OIDC exchange failed: {e}")))?;
 
     if !exchange_response.status().is_success() {
-        let body: serde_json::Value = exchange_response
-            .json()
-            .await
-            .unwrap_or(serde_json::json!({"error": "unknown error"}));
+        let body: serde_json::Value =
+            parse_capped_platform_json_or_unknown(exchange_response).await;
         let error = body["error"].as_str().unwrap_or("OIDC exchange failed");
         let hint = body["hint"].as_str().unwrap_or("");
         let msg = if hint.is_empty() {
@@ -2724,10 +2740,7 @@ async fn vars_oidc_pull(
         return Err(LpmError::Script(msg));
     }
 
-    let exchange_result: serde_json::Value = exchange_response
-        .json()
-        .await
-        .map_err(|e| LpmError::Script(format!("parse error: {e}")))?;
+    let exchange_result: serde_json::Value = parse_capped_platform_json(exchange_response).await?;
 
     let lpm_token = exchange_result["token"]
         .as_str()
@@ -2871,19 +2884,13 @@ async fn vars_platform_pull(
         .map_err(|e| LpmError::Network(format!("failed to reach server: {e}")))?;
 
     if !response.status().is_success() {
-        let body: serde_json::Value = response
-            .json()
-            .await
-            .unwrap_or(serde_json::json!({"error": "unknown error"}));
+        let body: serde_json::Value = parse_capped_platform_json_or_unknown(response).await;
         return Err(LpmError::Script(
             body["error"].as_str().unwrap_or("pull failed").to_string(),
         ));
     }
 
-    let result: serde_json::Value = response
-        .json()
-        .await
-        .map_err(|e| LpmError::Script(format!("parse error: {e}")))?;
+    let result: serde_json::Value = parse_capped_platform_json(response).await?;
 
     let vars = result["vars"]
         .as_object()

@@ -235,48 +235,93 @@ pub const MAX_COMPRESSED_TARBALL_SIZE: u64 = 500 * 1024 * 1024;
 /// memory-exhaustion attack from a compromised mirror or MITM.
 const MAX_METADATA_BYTES: usize = 100 * 1024 * 1024;
 
-/// Read a metadata-shaped JSON response with a two-stage size cap.
+/// Hard cap for non-metadata API responses (whoami, token check,
+/// quality/skills, tunnel domain ops, publish ack, error bodies).
+/// These payloads are kilobytes in practice; 10 MB gives several
+/// orders of magnitude of headroom over the legitimate envelope and
+/// stops a hostile / compromised mirror from OOM-ing the CLI on a
+/// path that never needed metadata-sized buffers.
+const MAX_API_RESPONSE_BYTES: usize = 10 * 1024 * 1024;
+
+/// Drain a response body with a two-stage size cap.
 ///
-/// Stage 1 (pre-stream): reject when the server's declared
-/// `Content-Length` exceeds the cap — saves us from allocating any
-/// body bytes at all on hostile-declared-length responses.
+/// Stage 1 (pre-stream): refuse when the server's declared
+/// `Content-Length` exceeds `cap` — no bytes are allocated for a
+/// hostile-declared-length response.
 ///
 /// Stage 2 (mid-stream): for chunked / undeclared-length responses,
 /// accumulate `bytes_stream()` chunks into a bounded `Vec` and abort
-/// the moment the next chunk would cross the cap. Closing the response
+/// the moment another chunk would cross `cap`. Closing the response
 /// at that point drops the underlying connection.
-///
-/// Together: no metadata fetch can OOM the install path regardless
-/// of how the server frames the body.
-async fn parse_capped_metadata<T: serde::de::DeserializeOwned>(
+async fn read_capped_body(
     response: reqwest::Response,
+    cap: usize,
     context: &str,
-) -> Result<T, LpmError> {
+) -> Result<Vec<u8>, LpmError> {
     use futures::StreamExt;
 
     if let Some(declared) = response.content_length()
-        && declared as usize > MAX_METADATA_BYTES
+        && declared as usize > cap
     {
         return Err(LpmError::Registry(format!(
-            "{context}: declared body length {declared} exceeds metadata cap {MAX_METADATA_BYTES}"
+            "{context}: declared body length {declared} exceeds cap {cap}"
         )));
     }
 
-    let mut buf: Vec<u8> = Vec::with_capacity(64 * 1024);
+    let mut buf: Vec<u8> = Vec::with_capacity(std::cmp::min(64 * 1024, cap));
     let mut stream = response.bytes_stream();
     while let Some(chunk) = stream.next().await {
         let chunk =
             chunk.map_err(|e| LpmError::Registry(format!("{context}: body read error: {e}")))?;
-        if buf.len().saturating_add(chunk.len()) > MAX_METADATA_BYTES {
+        if buf.len().saturating_add(chunk.len()) > cap {
             return Err(LpmError::Registry(format!(
-                "{context}: streamed body exceeded metadata cap {MAX_METADATA_BYTES}"
+                "{context}: streamed body exceeded cap {cap}"
             )));
         }
         buf.extend_from_slice(&chunk);
     }
+    Ok(buf)
+}
 
+/// Read a metadata-shaped JSON response with the metadata cap.
+///
+/// Wraps [`read_capped_body`] with the metadata-tier ceiling and
+/// `serde_json::from_slice`. Lets the metadata path share one
+/// streaming-cap implementation with the smaller-tier API path.
+async fn parse_capped_metadata<T: serde::de::DeserializeOwned>(
+    response: reqwest::Response,
+    context: &str,
+) -> Result<T, LpmError> {
+    let buf = read_capped_body(response, MAX_METADATA_BYTES, context).await?;
     serde_json::from_slice(&buf)
         .map_err(|e| LpmError::Registry(format!("{context}: failed to parse JSON: {e}")))
+}
+
+/// Read a non-metadata JSON response (whoami, token check, etc.) with
+/// the smaller API-tier cap. Exposed for callers outside this module
+/// (e.g., the `token` command, the `dlx` resolver) that operate on a
+/// raw `reqwest::Response` returned by [`RegistryClient::post_json_raw`]
+/// and would otherwise reach for `.json()` directly.
+pub async fn parse_capped_api_json<T: serde::de::DeserializeOwned>(
+    response: reqwest::Response,
+    context: &str,
+) -> Result<T, LpmError> {
+    let buf = read_capped_body(response, MAX_API_RESPONSE_BYTES, context).await?;
+    serde_json::from_slice(&buf)
+        .map_err(|e| LpmError::Registry(format!("{context}: failed to parse JSON: {e}")))
+}
+
+/// Read an error-body response as UTF-8 text under the API-tier cap.
+///
+/// Returns the empty string on cap-overflow or read errors so the
+/// caller can still construct a typed error variant — the previous
+/// `response.text().await.unwrap_or_default()` shape is preserved
+/// but the buffer is now bounded.
+async fn read_capped_error_text(response: reqwest::Response) -> String {
+    match read_capped_body(response, MAX_API_RESPONSE_BYTES, "error body").await {
+        Ok(buf) => String::from_utf8_lossy(&buf).into_owned(),
+        Err(_) => String::new(),
+    }
 }
 
 /// Result of a verified tarball download. The tarball is spooled to a temp file
@@ -1574,10 +1619,7 @@ impl RegistryClient {
         &self,
         response: reqwest::Response,
     ) -> Result<std::collections::HashMap<String, PackageMetadata>, LpmError> {
-        let result: serde_json::Value = response
-            .json()
-            .await
-            .map_err(|e| LpmError::Registry(format!("batch metadata parse error: {e}")))?;
+        let result: serde_json::Value = parse_capped_metadata(response, "batch metadata").await?;
 
         let packages_obj = result
             .get("packages")
@@ -2893,9 +2935,8 @@ impl RegistryClient {
             // S4: Publish-safe send — no retry on 500, only on gateway errors
             let response = self.send_publish_safe(req, encoded_name).await?;
             let status = response.status();
-            let body: serde_json::Value = response.json().await.map_err(|e| {
-                LpmError::Registry(format!("failed to parse publish response: {e}"))
-            })?;
+            let body: serde_json::Value =
+                parse_capped_api_json(response, "publish response").await?;
 
             if status.is_success() {
                 Ok(body)
@@ -3092,10 +3133,8 @@ impl RegistryClient {
         self.execute_with_recovery(AuthPosture::SessionRequired, || async {
             let response = self.post_json_raw(&url, &body).await?;
             let status = response.status();
-            let data: serde_json::Value = response
-                .json()
-                .await
-                .map_err(|e| LpmError::Registry(format!("failed to parse response: {e}")))?;
+            let data: serde_json::Value =
+                parse_capped_api_json(response, "tunnel claim response").await?;
 
             if !status.is_success() {
                 let error = data["error"].as_str().unwrap_or("Unknown error");
@@ -3139,10 +3178,8 @@ impl RegistryClient {
             }
             let response = self.send_with_retry(req).await?;
             let status = response.status();
-            let data: serde_json::Value = response
-                .json()
-                .await
-                .map_err(|e| LpmError::Registry(format!("failed to parse response: {e}")))?;
+            let data: serde_json::Value =
+                parse_capped_api_json(response, "tunnel unclaim response").await?;
 
             if !status.is_success() {
                 let error = data["error"].as_str().unwrap_or("Unknown error");
@@ -3531,10 +3568,7 @@ impl RegistryClient {
         let response = self
             .send_with_retry(self.build_get_with_posture(url, posture).await?)
             .await?;
-        response
-            .json()
-            .await
-            .map_err(|e| LpmError::Registry(format!("failed to parse response from {url}: {e}")))
+        parse_capped_api_json(response, &format!("response from {url}")).await
     }
 
     /// Resolve the bearer to attach for a given posture.
@@ -3671,10 +3705,7 @@ impl RegistryClient {
     /// Generic GET → deserialize JSON helper (with auth).
     async fn get_json<T: serde::de::DeserializeOwned>(&self, url: &str) -> Result<T, LpmError> {
         let response = self.send_with_retry(self.build_get(url).await?).await?;
-        response
-            .json()
-            .await
-            .map_err(|e| LpmError::Registry(format!("failed to parse response from {url}: {e}")))
+        parse_capped_api_json(response, &format!("response from {url}")).await
     }
 
     /// Send a publish request with safe retry logic (S4).
@@ -3716,18 +3747,18 @@ impl RegistryClient {
                         // Non-retryable client errors — fail immediately
                         401 => return Err(LpmError::AuthRequired),
                         403 => {
-                            let body = response.text().await.unwrap_or_default();
+                            let body = read_capped_error_text(response).await;
                             return Err(LpmError::Forbidden(body));
                         }
                         404 => {
-                            let body = response.text().await.unwrap_or_default();
+                            let body = read_capped_error_text(response).await;
                             return Err(LpmError::NotFound(body));
                         }
 
                         // S4: 500 — do NOT retry. Server may have stored the version.
                         // Check if the version now exists on the registry.
                         500 => {
-                            let body_text = response.text().await.unwrap_or_default();
+                            let body_text = read_capped_error_text(response).await;
                             tracing::warn!("publish got HTTP 500 — checking if version was stored");
 
                             // Check if the version exists by GETting the package
@@ -3779,7 +3810,7 @@ impl RegistryClient {
 
                         // Retryable gateway errors only (NOT 500)
                         502..=504 => {
-                            let body = response.text().await.unwrap_or_default();
+                            let body = read_capped_error_text(response).await;
                             last_error = Some(LpmError::Http {
                                 status,
                                 message: body,
@@ -3793,7 +3824,7 @@ impl RegistryClient {
 
                         // Other errors — fail immediately
                         _ => {
-                            let body = response.text().await.unwrap_or_default();
+                            let body = read_capped_error_text(response).await;
                             return Err(LpmError::Http {
                                 status,
                                 message: body,
@@ -3853,11 +3884,11 @@ impl RegistryClient {
                         // Non-retryable errors — fail immediately
                         401 => return Err(LpmError::AuthRequired),
                         403 => {
-                            let body = response.text().await.unwrap_or_default();
+                            let body = read_capped_error_text(response).await;
                             return Err(LpmError::Forbidden(body));
                         }
                         404 => {
-                            let body = response.text().await.unwrap_or_default();
+                            let body = read_capped_error_text(response).await;
                             return Err(LpmError::NotFound(body));
                         }
 
@@ -3879,7 +3910,7 @@ impl RegistryClient {
 
                         // Retryable: server errors and timeouts
                         408 | 500 | 502 | 503 | 504 => {
-                            let body = response.text().await.unwrap_or_default();
+                            let body = read_capped_error_text(response).await;
                             last_error = Some(LpmError::Http {
                                 status,
                                 message: body,
@@ -3893,7 +3924,7 @@ impl RegistryClient {
 
                         // Other errors — fail immediately
                         _ => {
-                            let body = response.text().await.unwrap_or_default();
+                            let body = read_capped_error_text(response).await;
                             return Err(LpmError::Http {
                                 status,
                                 message: body,
@@ -6316,7 +6347,7 @@ mod tests {
 
         let result = client.whoami().await;
         assert!(
-            matches!(result, Err(LpmError::Registry(message)) if message.contains("failed to parse response"))
+            matches!(result, Err(LpmError::Registry(message)) if message.contains("failed to parse JSON"))
         );
     }
 
@@ -6483,7 +6514,7 @@ mod tests {
         assert!(matches!(
             result,
             Err(LpmError::Registry(message))
-                if message.contains("failed to parse response from")
+                if message.contains("failed to parse JSON")
                     && message.contains("/api/registry/check-name?name=owner.package-name")
         ));
     }
@@ -7035,7 +7066,7 @@ mod tests {
 
         assert!(matches!(
             result,
-            Err(LpmError::Registry(message)) if message.contains("batch metadata parse error")
+            Err(LpmError::Registry(message)) if message.contains("batch metadata") && message.contains("failed to parse JSON")
         ));
     }
 
@@ -9907,6 +9938,88 @@ mod tests {
             .await
             .expect("under-cap response must parse");
         assert_eq!(parsed["name"], "@scope/p");
+    }
+
+    /// Non-metadata API responses share the streaming-cap helper with
+    /// metadata reads but cap at `MAX_API_RESPONSE_BYTES` (10 MB), one
+    /// order of magnitude below the metadata tier. A whoami / token /
+    /// publish-ack response that declares more than that must reject
+    /// before any body bytes are buffered.
+    #[tokio::test]
+    async fn parse_capped_api_json_rejects_oversized_declared_length() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let declared = MAX_API_RESPONSE_BYTES + 1;
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        tokio::spawn(async move {
+            if let Ok((mut socket, _)) = listener.accept().await {
+                let mut buf = [0u8; 1024];
+                let _ = socket.read(&mut buf).await;
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\n\
+                     Content-Length: {declared}\r\n\
+                     Content-Type: application/json\r\n\
+                     Connection: close\r\n\
+                     \r\n",
+                );
+                let _ = socket.write_all(resp.as_bytes()).await;
+                let _ = socket.shutdown().await;
+            }
+        });
+
+        let response = reqwest::get(format!("http://{addr}/"))
+            .await
+            .expect("connect");
+        let result: Result<serde_json::Value, _> =
+            parse_capped_api_json(response, "api-cap-test").await;
+        let err = result.expect_err("oversized Content-Length must reject pre-stream");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("declared body length"),
+            "expected pre-stream rejection, got: {msg}"
+        );
+    }
+
+    /// Error-body reader has the same cap. A bogus 4xx with a hostile
+    /// Content-Length must not exhaust CLI memory. The reader returns
+    /// the empty string on cap-overflow so the typed error variant
+    /// the caller wraps still gets a usable message.
+    #[tokio::test]
+    async fn read_capped_error_text_rejects_oversized_declared_length() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let declared = MAX_API_RESPONSE_BYTES + 1;
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        tokio::spawn(async move {
+            if let Ok((mut socket, _)) = listener.accept().await {
+                let mut buf = [0u8; 1024];
+                let _ = socket.read(&mut buf).await;
+                let resp = format!(
+                    "HTTP/1.1 503 Service Unavailable\r\n\
+                     Content-Length: {declared}\r\n\
+                     Content-Type: text/plain\r\n\
+                     Connection: close\r\n\
+                     \r\n",
+                );
+                let _ = socket.write_all(resp.as_bytes()).await;
+                let _ = socket.shutdown().await;
+            }
+        });
+
+        let response = reqwest::get(format!("http://{addr}/"))
+            .await
+            .expect("connect");
+        let body = read_capped_error_text(response).await;
+        assert_eq!(
+            body, "",
+            "cap-overflow on the error body must collapse to empty string, got {body:?}"
+        );
     }
 
     /// reqwest's `Policy::limited` (the policy we pin on every
