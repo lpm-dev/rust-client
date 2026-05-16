@@ -69,8 +69,24 @@ fn format_shell(vars: &BTreeMap<&str, &str>) -> String {
 fn format_dotenv(vars: &BTreeMap<&str, &str>) -> String {
     vars.iter()
         .map(|(k, v)| {
-            if v.contains(' ') || v.contains('"') || v.contains('\'') || v.contains('#') {
-                format!("{k}=\"{}\"", v.replace('\\', "\\\\").replace('"', "\\\""))
+            // M39: newline injection — a vault value containing
+            // `\n` would, pre-fix, emit multiple physical dotenv
+            // lines, letting an attacker who controls one env var
+            // value set additional keys. Quote-and-escape `\n` /
+            // `\r` so the value stays a single dotenv assignment.
+            let needs_quote = v.contains(' ')
+                || v.contains('"')
+                || v.contains('\'')
+                || v.contains('#')
+                || v.contains('\n')
+                || v.contains('\r');
+            if needs_quote {
+                let escaped = v
+                    .replace('\\', "\\\\")
+                    .replace('"', "\\\"")
+                    .replace('\n', "\\n")
+                    .replace('\r', "\\r");
+                format!("{k}=\"{escaped}\"")
             } else {
                 format!("{k}={v}")
             }
@@ -93,8 +109,23 @@ fn format_json(vars: &BTreeMap<&str, &str>) -> String {
 }
 
 fn format_docker(vars: &BTreeMap<&str, &str>) -> String {
+    // M39: Docker --env-file format does NOT support escaped newlines
+    // or multiline values. Refuse to emit values that contain `\n`/`\r`
+    // so an attacker who controls a vault value cannot smuggle extra
+    // KEY=value assignments into a downstream `docker run --env-file`.
+    // Refusing (with an empty assignment) is safer than silent
+    // truncation — the consuming pipeline sees the value go missing
+    // and fails loudly rather than silently honouring injected vars.
     vars.iter()
-        .map(|(k, v)| format!("{k}={v}"))
+        .map(|(k, v)| {
+            if v.contains('\n') || v.contains('\r') {
+                format!(
+                    "# {k}: value contains newline — refused (would inject extra env-file lines)"
+                )
+            } else {
+                format!("{k}={v}")
+            }
+        })
         .collect::<Vec<_>>()
         .join("\n")
 }
@@ -105,19 +136,51 @@ fn format_github_actions(
 ) -> String {
     let mut lines = Vec::new();
 
-    // First: mask all secrets
+    // M39: multiline values must use the GHA `<<EOF` env-file form,
+    // not `echo "KEY=value"` which would emit multiple physical lines
+    // and let an attacker who controls a value set additional env
+    // vars. `::add-mask::` similarly does NOT support newlines —
+    // refuse to mask multiline secrets (the unmasked value would leak
+    // in logs, which is worse than refusing the secret entirely).
     for (k, v) in vars {
         if secrets.contains(*k) {
-            lines.push(format!("::add-mask::{v}"));
+            if v.contains('\n') || v.contains('\r') {
+                lines.push(format!(
+                    "# {k}: multiline secret — refused (::add-mask:: does not support newlines)"
+                ));
+            } else {
+                lines.push(format!("::add-mask::{v}"));
+            }
         }
     }
 
-    // Then: set all env vars
     for (k, v) in vars {
-        lines.push(format!(
-            "echo {} >> \"$GITHUB_ENV\"",
-            shell_quote(&format!("{k}={v}"))
-        ));
+        if v.contains('\n') || v.contains('\r') {
+            // GHA multiline assignment shape:
+            //   {KEY}<<__LPM_EOF__
+            //   value-with-newlines
+            //   __LPM_EOF__
+            // The delimiter must not appear in the value; we use a
+            // long random-ish constant rather than user input so a
+            // crafted value can't terminate the heredoc early.
+            const DELIM: &str = "__LPM_GHA_EOF__";
+            if v.contains(DELIM) {
+                lines.push(format!(
+                    "# {k}: value contains internal delimiter — refused (would close the heredoc early)"
+                ));
+            } else {
+                lines.push(format!(
+                    "{{ echo {key_delim}; echo {value}; echo '{DELIM}'; }} >> \"$GITHUB_ENV\"",
+                    key_delim = shell_quote(&format!("{k}<<{DELIM}")),
+                    value = shell_quote(v),
+                ));
+            }
+        } else {
+            lines.push(format!(
+                "echo {} >> \"$GITHUB_ENV\"",
+                shell_quote(&format!("{k}={v}"))
+            ));
+        }
     }
 
     lines.join("\n")
@@ -266,5 +329,62 @@ mod tests {
         assert_eq!(shell_quote("it's"), "'it'\\''s'");
         assert_eq!(shell_quote(""), "''");
         assert_eq!(shell_quote("a/b:c@d"), "a/b:c@d");
+    }
+
+    /// M39: a vault value containing `\n` must not split into
+    /// multiple dotenv assignments. Quoting + escape keeps it on
+    /// one physical line.
+    #[test]
+    fn dotenv_escapes_newline_in_value() {
+        let vars = make_vars(&[("KEY", "line1\nEVIL=injected")]);
+        let output = format_env(&vars, PrintFormat::Dotenv, &HashSet::new());
+        assert!(
+            output.contains("KEY=\"line1\\nEVIL=injected\""),
+            "newline must be escaped, got: {output}",
+        );
+        // And there must be exactly one assignment line — no
+        // physical newline in the body.
+        assert_eq!(output.lines().count(), 1);
+    }
+
+    /// Docker env-file format does NOT support escaped newlines.
+    /// Refuse-with-comment is safer than letting the attacker
+    /// inject extra env-file lines.
+    #[test]
+    fn docker_refuses_newline_value() {
+        let vars = make_vars(&[("KEY", "line1\nEVIL=injected")]);
+        let output = format_env(&vars, PrintFormat::Docker, &HashSet::new());
+        assert!(output.contains("# KEY: value contains newline"));
+        assert!(
+            !output.contains("EVIL="),
+            "must not emit the injected assignment, got: {output}",
+        );
+    }
+
+    /// GitHub Actions newline values use the heredoc `<<EOF`
+    /// envelope shape (not the unsafe `echo "KEY=value"` form),
+    /// and `::add-mask::` for multiline secrets is refused entirely
+    /// — masking newlines doesn't work and unmasked secrets would
+    /// leak in logs.
+    #[test]
+    fn github_actions_uses_heredoc_for_multiline_value() {
+        let vars = make_vars(&[("KEY", "line1\nline2")]);
+        let output = format_env(&vars, PrintFormat::GithubActions, &HashSet::new());
+        assert!(
+            output.contains("KEY<<__LPM_GHA_EOF__") && output.contains("__LPM_GHA_EOF__"),
+            "expected heredoc form, got: {output}",
+        );
+    }
+
+    #[test]
+    fn github_actions_refuses_multiline_secret_mask() {
+        let vars = make_vars(&[("SECRET", "line1\nline2")]);
+        let mut secrets = HashSet::new();
+        secrets.insert("SECRET".to_string());
+        let output = format_env(&vars, PrintFormat::GithubActions, &secrets);
+        assert!(
+            output.contains("# SECRET: multiline secret — refused"),
+            "expected refusal comment for multiline secret, got: {output}",
+        );
     }
 }

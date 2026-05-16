@@ -1380,13 +1380,29 @@ fn classify_and_apply(
                 ));
                 return;
             };
-            // V1 limitation: warn if the user wrote a path-prefixed key.
-            // We're matching by origin only, so whatever the key
-            // configures (auth token, mTLS identity, extra root, …)
-            // will apply to ALL paths on that origin — broader than
-            // what the user wrote. Loud warning so this can't surprise
-            // anyone. Kept neutral to cover both auth and TLS attrs.
+            // M40: pre-fix we WARN and then materialize the credential
+            // anyway, broadening a narrow path-scoped token to the
+            // entire origin. For shared-host registries (GitLab,
+            // Artifactory) this is a real over-disclosure: a token
+            // scoped to `/api/v4/projects/123/packages/npm/` shouldn't
+            // get sent to `/api/v4/projects/999/packages/npm/`.
+            // Refuse-with-warning for credential attrs specifically;
+            // TLS attrs (certfile/keyfile/cafile) are still
+            // materialized because they're not credentials per se and
+            // legitimate per-path TLS overrides are uncommon enough
+            // that the override-with-warning path is the right UX.
+            let is_credential_attr =
+                matches!(attr, "_authToken" | "_auth" | "_password" | "_username");
             if origin_part.contains('/') {
+                if is_credential_attr {
+                    cfg.warnings.push(format!(
+                        "{source_label}:{lineno}: path-scoped npmrc credential key ('{key}') would \
+                         be widened to ALL paths on {origin} (v1 matches by origin only); \
+                         refusing to materialize — narrow the host config OR rewrite the key as \
+                         `//{origin}/:{attr}` to opt into origin-wide reach."
+                    ));
+                    return;
+                }
                 cfg.warnings.push(format!(
                     "{source_label}:{lineno}: path-scoped npmrc key ('{key}') is parsed as origin-only in v1; \
                      setting will apply to ALL paths on {origin}"
@@ -2743,27 +2759,44 @@ mod tests {
         );
     }
 
+    /// M40: pre-fix, a path-scoped `_authToken` key was widened to
+    /// the entire origin (with a warning). Post-fix the credential
+    /// is REFUSED and the warning explains how to opt in. Closes the
+    /// shared-host over-disclosure window where a narrow GitLab
+    /// project-scoped token was sent to unrelated projects on the
+    /// same host.
     #[test]
-    fn path_prefixed_auth_key_warns_loudly() {
-        // V1 limitation: we match by origin only. Path-prefix keys are
-        // accepted but produce a warning so the user knows the scope is
-        // wider than what they wrote.
+    fn path_prefixed_auth_key_is_refused_with_explanatory_warning() {
         let content = "//gitlab.com/api/v4/projects/123/packages/npm/:_authToken=glpat-x\n";
         let cfg = NpmrcConfig::parse(content, "test", &no_env);
-        let auth = cfg
-            .auth_for_url("https://gitlab.com/api/v4/projects/123/packages/npm/foo")
-            .expect("origin-only match should hit");
-        match auth {
-            RegistryAuth::Bearer { token: s, .. } => assert_eq!(s.expose_secret(), "glpat-x"),
-            _ => panic!("expected Bearer"),
-        }
+        assert!(
+            cfg.auth_for_url("https://gitlab.com/api/v4/projects/123/packages/npm/foo")
+                .is_none(),
+            "path-scoped credential must NOT be materialized after the fix",
+        );
         assert!(
             cfg.warnings
                 .iter()
-                .any(|w| w.contains("path-scoped npmrc key")),
-            "path-prefix warning required; got {:?}",
+                .any(|w| w.contains("refusing to materialize")
+                    && w.contains("path-scoped npmrc credential")),
+            "explanatory warning required; got {:?}",
             cfg.warnings
         );
+    }
+
+    /// Origin-scoped (no path) credentials still work — the M40 fix
+    /// only refuses path-scoped credential keys.
+    #[test]
+    fn origin_scoped_auth_key_still_materialized_after_m40() {
+        let content = "//gitlab.com/:_authToken=glpat-y\n";
+        let cfg = NpmrcConfig::parse(content, "test", &no_env);
+        let auth = cfg
+            .auth_for_url("https://gitlab.com/api/v4/projects/123/packages/npm/foo")
+            .expect("origin-only key should hit");
+        match auth {
+            RegistryAuth::Bearer { token, .. } => assert_eq!(token.expose_secret(), "glpat-y"),
+            _ => panic!("expected Bearer"),
+        }
     }
 
     #[test]
