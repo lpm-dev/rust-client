@@ -171,8 +171,16 @@ pub fn write_vault_env(
 }
 
 /// Delete a vault from the Keychain and remove from index.
+///
+/// If the Keychain delete fails (e.g. locked keychain, permission
+/// denied, system framework error) we keep the index entry intact and
+/// surface the error to the caller — half-deleting (keychain entry
+/// alive but index claims gone) would leave a usable secret that
+/// `list_vaults` no longer surfaces and the user can no longer wipe
+/// through the normal path. `NotFound` is treated as success so
+/// `lpm logout` / second-time `delete_vault` is idempotent.
 pub fn delete_vault(vault_id: &str) -> Result<(), String> {
-    delete_keychain_password(SERVICE, vault_id);
+    delete_keychain_password(SERVICE, vault_id)?;
 
     let mut index = read_index();
     index.retain(|e| e.id != vault_id);
@@ -293,45 +301,119 @@ fn write_keychain_password(service: &str, account: &str, password: &str) -> Resu
             .stderr(std::process::Stdio::null())
             .status();
 
-        let mut args = vec!["add-generic-password"];
-        if is_shared {
-            args.push("-A"); // Allow access from Swift LPMVault app
+        let extra: &[&str] = if is_shared { &["-A"] } else { &[] };
+        match macos_security_add_generic_password(service, account, password, extra) {
+            Ok(()) => return Ok(()),
+            Err(msg) => {
+                // Exit 45 = errSecDuplicateItem — another process added the
+                // entry between our delete and add. Retry once.
+                if attempt == 0 && msg.contains("exit 45") {
+                    continue;
+                }
+                return Err(msg);
+            }
         }
-        args.extend(["-s", service, "-a", account, "-w", password]);
-
-        let output = std::process::Command::new("security")
-            .args(&args)
-            .stdout(std::process::Stdio::null())
-            .output()
-            .map_err(|e| format!("keychain write error: {e}"))?;
-
-        if output.status.success() {
-            return Ok(());
-        }
-
-        // Exit 45 = errSecDuplicateItem — another process added the entry
-        // between our delete and add. Retry once.
-        if output.status.code() == Some(45) && attempt == 0 {
-            continue;
-        }
-
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(format!(
-            "security add-generic-password failed (exit {}): {}",
-            output.status.code().unwrap_or(-1),
-            stderr.trim()
-        ));
     }
 
     unreachable!("loop always returns")
 }
 
-fn delete_keychain_password(service: &str, account: &str) {
-    let _ = std::process::Command::new("security")
+/// Spawn `security add-generic-password` with the password piped via
+/// stdin rather than passed as `-w <value>` argv. See the matching
+/// helper in `lpm-auth` for the threat-model rationale (`ps` leak).
+/// `extra_args` carries the optional `-A` flag for shared-service
+/// items.
+fn macos_security_add_generic_password(
+    service: &str,
+    account: &str,
+    password: &str,
+    extra_args: &[&str],
+) -> Result<(), String> {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+
+    let mut args: Vec<&str> = vec!["add-generic-password"];
+    args.extend_from_slice(extra_args);
+    args.extend(["-s", service, "-a", account, "-w"]);
+
+    let mut child = Command::new("security")
+        .args(&args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("keychain spawn error: {e}"))?;
+
+    {
+        // `security` calls readpassphrase() twice (initial entry +
+        // retype verification). Feed the password on both lines and
+        // close stdin so the CLI proceeds to write the item.
+        let stdin = child
+            .stdin
+            .as_mut()
+            .ok_or_else(|| "keychain stdin not piped".to_string())?;
+        stdin
+            .write_all(password.as_bytes())
+            .and_then(|_| stdin.write_all(b"\n"))
+            .and_then(|_| stdin.write_all(password.as_bytes()))
+            .and_then(|_| stdin.write_all(b"\n"))
+            .map_err(|e| format!("keychain stdin write error: {e}"))?;
+    }
+    drop(child.stdin.take());
+
+    let output = child
+        .wait_with_output()
+        .map_err(|e| format!("keychain wait error: {e}"))?;
+    if output.status.success() {
+        return Ok(());
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    Err(format!(
+        "security add-generic-password failed (exit {}): {}",
+        output.status.code().unwrap_or(-1),
+        stderr.trim()
+    ))
+}
+
+/// Outcome of a keychain delete. Distinguishes "the item didn't
+/// exist" (a normal idempotent outcome for `lpm logout` etc.) from
+/// "the delete actually failed" (which should surface to the user so
+/// they don't believe their token was wiped when it wasn't).
+///
+/// macOS `security delete-generic-password` returns exit 44 for
+/// `errSecItemNotFound`; any other non-zero exit is a real failure.
+#[derive(Debug)]
+pub(crate) enum KeychainDeleteOutcome {
+    /// Item was present and is now gone.
+    Deleted,
+    /// Item was already absent — no-op. Treated as success by every
+    /// caller that just wants the slot empty afterwards.
+    NotFound,
+}
+
+fn delete_keychain_password(service: &str, account: &str) -> Result<KeychainDeleteOutcome, String> {
+    let output = std::process::Command::new("security")
         .args(["delete-generic-password", "-s", service, "-a", account])
         .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status();
+        .stderr(std::process::Stdio::piped())
+        .output()
+        .map_err(|e| format!("keychain delete spawn error: {e}"))?;
+
+    if output.status.success() {
+        return Ok(KeychainDeleteOutcome::Deleted);
+    }
+    // Exit 44 = errSecItemNotFound. Already-absent is success for our
+    // idempotent delete semantics — don't surface to the caller as an
+    // error.
+    if output.status.code() == Some(44) {
+        return Ok(KeychainDeleteOutcome::NotFound);
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    Err(format!(
+        "security delete-generic-password failed (exit {}): {}",
+        output.status.code().unwrap_or(-1),
+        stderr.trim()
+    ))
 }
 
 #[cfg(test)]
@@ -411,5 +493,43 @@ mod tests {
     fn defer_cleanup(_svc: &str, _account: &str) {
         // Marker function — cleanup_item is called explicitly.
         // Using defer pattern would require a Drop impl, but explicit cleanup is fine for tests.
+    }
+
+    /// `delete_keychain_password` distinguishes "already absent"
+    /// (idempotent success) from "real failure" (locked keychain,
+    /// permission denied, framework error). Pre-fix the function
+    /// returned `()` and swallowed every outcome, so `lpm logout`
+    /// could claim success while leaving the entry in place.
+    #[test]
+    fn delete_keychain_password_returns_not_found_when_item_absent() {
+        let svc = test_service();
+        // Cleanup just in case a prior failed test left an entry behind.
+        cleanup_item(&svc, "never-written");
+
+        match delete_keychain_password(&svc, "never-written") {
+            Ok(KeychainDeleteOutcome::NotFound) => {}
+            other => panic!("expected NotFound for absent item, got {other:?}"),
+        }
+    }
+
+    /// And the post-write call returns `Deleted` — exercising the
+    /// success path that `delete_vault` now propagates instead of
+    /// silently ignoring.
+    #[test]
+    fn delete_keychain_password_returns_deleted_when_item_present() {
+        let svc = test_service();
+        let account = "test-deleted";
+        write_keychain_password(&svc, account, "to-be-deleted").unwrap();
+
+        match delete_keychain_password(&svc, account) {
+            Ok(KeychainDeleteOutcome::Deleted) => {}
+            other => panic!("expected Deleted, got {other:?}"),
+        }
+
+        // Sanity: second delete is NotFound (idempotent).
+        match delete_keychain_password(&svc, account) {
+            Ok(KeychainDeleteOutcome::NotFound) => {}
+            other => panic!("second delete should report NotFound, got {other:?}"),
+        }
     }
 }

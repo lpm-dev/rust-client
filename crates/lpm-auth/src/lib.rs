@@ -31,7 +31,7 @@ use aes_gcm::{
 };
 use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
 use rand::RngCore;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 mod session;
 pub use session::{AuthRequirement, RefreshPolicy, SessionManager, TokenSource};
@@ -98,11 +98,26 @@ pub fn set_token(registry_url: &str, token: &str) -> Result<(), String> {
 
 /// Remove the stored token for a given registry URL.
 pub fn clear_token(registry_url: &str) -> Result<(), String> {
-    // Clear from keychain
-    let _ = clear_token_from_keychain(registry_url);
+    // Surface real keychain/file errors via tracing so an operator can
+    // see when `lpm logout` claimed success but a credential was left
+    // behind (locked keychain, permission denied, framework error).
+    // The underlying helpers treat "already absent" as Ok(()), so a
+    // warn here means a genuine failure.
+    if let Err(e) = clear_token_from_keychain(registry_url) {
+        tracing::warn!(
+            registry = %registry_url,
+            error = %e,
+            "clear_token: keychain delete failed; token may still be present",
+        );
+    }
 
-    // Clear from encrypted file
-    let _ = clear_token_from_file(registry_url);
+    if let Err(e) = clear_token_from_file(registry_url) {
+        tracing::warn!(
+            registry = %registry_url,
+            error = %e,
+            "clear_token: file delete failed; encrypted token may still be present",
+        );
+    }
 
     Ok(())
 }
@@ -321,6 +336,34 @@ fn custom_registries_path() -> Option<PathBuf> {
     dirs::home_dir().map(|h| h.join(".lpm").join(".custom-registries.json"))
 }
 
+/// Apply 0o600 to a credential-adjacent file on Unix, best-effort.
+///
+/// On non-Unix filesystems (network mounts, exFAT, some Docker
+/// volumes) `set_permissions` can silently no-op. We can't make
+/// non-Unix targets honor the mode bits, but we can ensure every
+/// Unix write site that touches credential metadata gets the
+/// restrictive mode applied uniformly, and surface failures via
+/// `tracing::warn` instead of `let _ = …` silence. Information in
+/// `.custom-registries.json` (registry URLs) and `.token-expiry.json`
+/// (expiry timestamps, OTP-required flag) is not raw secret material
+/// but does enumerate which third-party registries the user has
+/// tokens for — useful reconnaissance for an attacker planning
+/// credential theft on a shared host.
+#[cfg(unix)]
+fn restrict_credential_metadata_perms(path: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    if let Err(e) = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)) {
+        tracing::warn!(
+            path = %path.display(),
+            error = %e,
+            "failed to set 0o600 on credential metadata file",
+        );
+    }
+}
+
+#[cfg(not(unix))]
+fn restrict_credential_metadata_perms(_path: &Path) {}
+
 fn is_builtin_registry_url(registry_url: &str) -> bool {
     matches!(
         registry_url,
@@ -405,10 +448,14 @@ fn track_custom_registry(registry_url: &str) {
             if let Some(parent) = path.parent() {
                 let _ = std::fs::create_dir_all(parent);
             }
-            let _ = std::fs::write(
+            if std::fs::write(
                 &path,
                 serde_json::to_string(&registries).unwrap_or_default(),
-            );
+            )
+            .is_ok()
+            {
+                restrict_credential_metadata_perms(&path);
+            }
         }
     }
 }
@@ -420,11 +467,13 @@ fn untrack_custom_registry(registry_url: &str) {
     if let Some(path) = custom_registries_path() {
         if registries.is_empty() {
             let _ = std::fs::remove_file(&path);
-        } else {
-            let _ = std::fs::write(
-                &path,
-                serde_json::to_string(&registries).unwrap_or_default(),
-            );
+        } else if std::fs::write(
+            &path,
+            serde_json::to_string(&registries).unwrap_or_default(),
+        )
+        .is_ok()
+        {
+            restrict_credential_metadata_perms(&path);
         }
     }
 }
@@ -450,8 +499,10 @@ pub fn clear_all_custom_registries() -> Vec<(String, Result<(), String>)> {
     if let Some(path) = custom_registries_path() {
         if remaining.is_empty() {
             let _ = std::fs::remove_file(&path);
-        } else {
-            let _ = std::fs::write(&path, serde_json::to_string(&remaining).unwrap_or_default());
+        } else if std::fs::write(&path, serde_json::to_string(&remaining).unwrap_or_default())
+            .is_ok()
+        {
+            restrict_credential_metadata_perms(&path);
         }
     }
 
@@ -552,8 +603,10 @@ pub fn set_token_expiry(registry: &str, expires: &str) {
         if let Some(parent) = path.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
-        if let Ok(json) = serde_json::to_string_pretty(&expiries) {
-            let _ = std::fs::write(&path, json);
+        if let Ok(json) = serde_json::to_string_pretty(&expiries)
+            && std::fs::write(&path, json).is_ok()
+        {
+            restrict_credential_metadata_perms(&path);
         }
     }
 }
@@ -572,8 +625,10 @@ pub fn set_session_access_token_expiry(registry: &str, expires_at: &str) {
         if let Some(parent) = path.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
-        if let Ok(json) = serde_json::to_string_pretty(&expiries) {
-            let _ = std::fs::write(&path, json);
+        if let Ok(json) = serde_json::to_string_pretty(&expiries)
+            && std::fs::write(&path, json).is_ok()
+        {
+            restrict_credential_metadata_perms(&path);
         }
     }
 }
@@ -764,10 +819,23 @@ pub fn has_refresh_token(registry: &str) -> bool {
 pub fn clear_refresh_token(registry: &str) {
     let account = scoped_refresh_account(registry);
 
-    let _ = clear_password_from_keychain_account(&account);
+    // See [`clear_token`] — surface real failures via tracing so a
+    // silent post-logout token never goes unnoticed.
+    if let Err(e) = clear_password_from_keychain_account(&account) {
+        tracing::warn!(
+            registry = %registry,
+            error = %e,
+            "clear_refresh_token: keychain delete failed; refresh token may still be present",
+        );
+    }
 
-    // Clear from encrypted file
-    let _ = clear_token_from_file(&format!("refresh:{registry}"));
+    if let Err(e) = clear_token_from_file(&format!("refresh:{registry}")) {
+        tracing::warn!(
+            registry = %registry,
+            error = %e,
+            "clear_refresh_token: file delete failed; encrypted refresh token may still be present",
+        );
+    }
 }
 
 /// Parse the npm auth token from `.npmrc` files.
@@ -888,24 +956,7 @@ fn set_password_in_keychain_account(account: &str, token: &str) -> Result<(), St
             .stderr(std::process::Stdio::null())
             .status();
 
-        let status = std::process::Command::new("security")
-            .args([
-                "add-generic-password",
-                "-s",
-                KEYCHAIN_SERVICE,
-                "-a",
-                account,
-                "-w",
-                token,
-            ])
-            .status()
-            .map_err(|e| format!("keychain write error: {e}"))?;
-
-        if status.success() {
-            return Ok(());
-        }
-
-        Err("security add-generic-password failed".to_string())
+        macos_security_add_generic_password(KEYCHAIN_SERVICE, account, token, &[])
     }
 
     #[cfg(not(target_os = "macos"))]
@@ -918,6 +969,68 @@ fn set_password_in_keychain_account(account: &str, token: &str) -> Result<(), St
     }
 }
 
+/// Spawn `security add-generic-password` with the password piped via
+/// stdin rather than passed as `-w <value>` argv.
+///
+/// The argv form (`-w <password>`) leaves the secret visible in `ps`
+/// for the lifetime of the subprocess — every local user on the
+/// machine can sniff a `lpm login`. `security` prompts for the
+/// password twice (initial + retype confirmation); we feed it both
+/// times via stdin and let the CLI run to completion. The argv now
+/// contains only `add-generic-password [-A] -s <svc> -a <acct> -w`.
+#[cfg(target_os = "macos")]
+fn macos_security_add_generic_password(
+    service: &str,
+    account: &str,
+    password: &str,
+    extra_args: &[&str],
+) -> Result<(), String> {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+
+    let mut args: Vec<&str> = vec!["add-generic-password"];
+    args.extend_from_slice(extra_args);
+    args.extend(["-s", service, "-a", account, "-w"]);
+
+    let mut child = Command::new("security")
+        .args(&args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("keychain spawn error: {e}"))?;
+
+    {
+        // `security` calls readpassphrase() twice (initial entry + retype
+        // verification). Feed the password on both lines and close stdin
+        // so the CLI proceeds to write the item.
+        let stdin = child
+            .stdin
+            .as_mut()
+            .ok_or_else(|| "keychain stdin not piped".to_string())?;
+        stdin
+            .write_all(password.as_bytes())
+            .and_then(|_| stdin.write_all(b"\n"))
+            .and_then(|_| stdin.write_all(password.as_bytes()))
+            .and_then(|_| stdin.write_all(b"\n"))
+            .map_err(|e| format!("keychain stdin write error: {e}"))?;
+    }
+    drop(child.stdin.take());
+
+    let output = child
+        .wait_with_output()
+        .map_err(|e| format!("keychain wait error: {e}"))?;
+    if output.status.success() {
+        return Ok(());
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    Err(format!(
+        "security add-generic-password failed (exit {}): {}",
+        output.status.code().unwrap_or(-1),
+        stderr.trim()
+    ))
+}
+
 fn clear_password_from_keychain_account(account: &str) -> Result<(), String> {
     if force_file_auth() {
         return Ok(());
@@ -925,6 +1038,12 @@ fn clear_password_from_keychain_account(account: &str) -> Result<(), String> {
 
     #[cfg(target_os = "macos")]
     {
+        // Capture stderr so we can include it in error messages; previously
+        // every non-zero exit was reported as "keychain entry not found",
+        // conflating idempotent "already absent" with real failures
+        // (locked keychain, permission denied, framework error). The
+        // distinction matters because callers like `lpm logout` need to
+        // know whether the user's token was actually wiped.
         let output = std::process::Command::new("security")
             .args([
                 "delete-generic-password",
@@ -934,24 +1053,35 @@ fn clear_password_from_keychain_account(account: &str) -> Result<(), String> {
                 account,
             ])
             .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
+            .stderr(std::process::Stdio::piped())
+            .output()
             .map_err(|e| format!("keychain delete error: {e}"))?;
 
-        if output.success() {
+        if output.status.success() {
             return Ok(());
         }
-
-        Err("keychain entry not found".to_string())
+        // Exit 44 = errSecItemNotFound. Already-absent is success for our
+        // idempotent delete semantics — don't surface to the caller.
+        if output.status.code() == Some(44) {
+            return Ok(());
+        }
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        Err(format!(
+            "security delete-generic-password failed (exit {}): {}",
+            output.status.code().unwrap_or(-1),
+            stderr.trim()
+        ))
     }
 
     #[cfg(not(target_os = "macos"))]
     {
         let entry = keyring::Entry::new(KEYCHAIN_SERVICE, account)
             .map_err(|e| format!("keychain error: {e}"))?;
-        entry
-            .delete_credential()
-            .map_err(|e| format!("keychain delete error: {e}"))
+        match entry.delete_credential() {
+            Ok(()) => Ok(()),
+            Err(keyring::Error::NoEntry) => Ok(()),
+            Err(e) => Err(format!("keychain delete error: {e}")),
+        }
     }
 }
 
@@ -2019,5 +2149,82 @@ mod tests {
                 "tracking file should be removed once malformed custom-registry state is normalized"
             );
         });
+    }
+
+    /// Defensive perms on every credential-adjacent file: `restrict_credential_metadata_perms`
+    /// applies 0o600 so a shared host can't read which third-party
+    /// registries the user has tokens for.
+    #[cfg(unix)]
+    #[test]
+    fn restrict_credential_metadata_perms_applies_0o600() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("creds.json");
+        std::fs::write(&path, b"{}").unwrap();
+        // Start with permissive perms to prove the helper tightens them.
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        restrict_credential_metadata_perms(&path);
+
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "expected 0o600, got 0o{mode:o}");
+    }
+
+    /// End-to-end: `track_custom_registry` writes the tracking file
+    /// with 0o600 directly — proves the perm helper is wired through
+    /// the public write path, not just available as a utility.
+    #[cfg(unix)]
+    #[test]
+    fn track_custom_registry_writes_tracking_file_with_0o600() {
+        use std::os::unix::fs::PermissionsExt;
+
+        with_temp_home(|home| {
+            track_custom_registry("https://registry.example.com");
+            let path = home.join(".lpm").join(".custom-registries.json");
+            assert!(path.exists(), "tracking file should be written");
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "expected 0o600, got 0o{mode:o}");
+        });
+    }
+
+    /// End-to-end: `set_token_expiry` writes `.token-expiry.json`
+    /// with 0o600.
+    #[cfg(unix)]
+    #[test]
+    fn set_token_expiry_writes_file_with_0o600() {
+        use std::os::unix::fs::PermissionsExt;
+
+        with_temp_home(|home| {
+            set_token_expiry("https://registry.example.com", "2099-01-01T00:00:00Z");
+            let path = home.join(".lpm").join(".token-expiry.json");
+            assert!(path.exists(), "expiry file should be written");
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "expected 0o600, got 0o{mode:o}");
+        });
+    }
+
+    /// `clear_password_from_keychain_account` is now Ok-on-absent
+    /// rather than conflating "already gone" with "real failure"
+    /// (which previously produced a misleading "keychain entry not
+    /// found" error and made callers either silently swallow or
+    /// surface a confusing message to the user).
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn clear_password_from_keychain_account_treats_absent_as_ok() {
+        let account = format!(
+            "lpm-test-absent-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
+        );
+        // No prior write — the account is guaranteed absent.
+        let result = clear_password_from_keychain_account(&account);
+        assert!(
+            result.is_ok(),
+            "clearing an absent account must be Ok (idempotent), got {result:?}",
+        );
     }
 }
