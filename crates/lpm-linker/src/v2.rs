@@ -852,17 +852,37 @@ fn create_root_symlinks(
             // slot, remove before re-creating. Should be a no-op after
             // `cleanup_v1_state` already wiped node_modules — defensive
             // guard for direct callers.
-            if link_path.symlink_metadata().is_ok() {
-                let _ = std::fs::remove_file(&link_path);
-                let _ = std::fs::remove_dir_all(&link_path);
+            //
+            // L24: between the cleanup remove and the create, a
+            // concurrent install racing on the same project can
+            // re-populate the slot, causing create to fail with
+            // `AlreadyExists`. Tolerate one retry after a second
+            // cleanup pass; if it still fails, escalate. Two
+            // concurrent installs on the same project is rare but
+            // possible (e.g., editor "watch" mode + CLI run); the
+            // retry keeps neither caller from being arbitrarily
+            // unlucky.
+            for attempt in 0..2u8 {
+                if link_path.symlink_metadata().is_ok() {
+                    let _ = std::fs::remove_file(&link_path);
+                    let _ = std::fs::remove_dir_all(&link_path);
+                }
+                match create_dir_symlink_or_junction(&target_path, &link_path) {
+                    Ok(()) => break,
+                    Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists && attempt == 0 => {
+                        // A racing installer re-populated the slot
+                        // between our remove and create. Loop once.
+                        continue;
+                    }
+                    Err(e) => {
+                        return Err(LpmError::Store(format!(
+                            "v2 linker: failed to create root symlink {} → {}: {e}",
+                            link_path.display(),
+                            target_path.display()
+                        )));
+                    }
+                }
             }
-            create_dir_symlink_or_junction(&target_path, &link_path).map_err(|e| {
-                LpmError::Store(format!(
-                    "v2 linker: failed to create root symlink {} → {}: {e}",
-                    link_path.display(),
-                    target_path.display()
-                ))
-            })?;
             count += 1;
         }
     }

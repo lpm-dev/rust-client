@@ -920,6 +920,34 @@ impl RegistryClient {
 
     /// Create a new registry client with default settings.
     pub fn new() -> Self {
+        // L25: reqwest honours HTTPS_PROXY / HTTP_PROXY / ALL_PROXY by
+        // default. A compromised CI runner or shell rc that exports
+        // these can silently route every registry request — including
+        // the bearer-bearing publish/auth flows — through an
+        // attacker proxy. We don't disable the env-proxy support
+        // (legitimate corporate proxies depend on it) but we DO log
+        // a one-shot warn so operators can spot unexpected proxy
+        // contamination. Logged at warn level so default tracing
+        // surfaces it; fires once per process per construction.
+        for var in [
+            "HTTPS_PROXY",
+            "https_proxy",
+            "HTTP_PROXY",
+            "http_proxy",
+            "ALL_PROXY",
+        ] {
+            if let Ok(val) = std::env::var(var)
+                && !val.trim().is_empty()
+            {
+                tracing::warn!(
+                    env_var = var,
+                    proxy = %val,
+                    "registry HTTP client will route through proxy from env; \
+                     confirm this is expected (the LPM bearer goes via this proxy)",
+                );
+                break;
+            }
+        }
         let default_client = Self::build_http_client(CONNECT_TIMEOUT, READ_TIMEOUT);
         let http = HttpClients::from_default_client(default_client);
 
