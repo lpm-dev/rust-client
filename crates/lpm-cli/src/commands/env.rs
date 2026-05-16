@@ -2762,6 +2762,27 @@ async fn vars_oidc_pull(
         std::fs::write(file, &content)
             .map_err(|e| LpmError::Script(format!("failed to write {file}: {e}")))?;
 
+        // Restrict to owner-only on Unix. The default umask leaves
+        // dotenv files at 0o644 on most distros, which means any
+        // concurrent CI build step running as a different uid
+        // (sidecar containers, sibling daemons, shared runners) can
+        // read the plaintext secrets escrowed here. Best-effort: on
+        // filesystems without POSIX modes the chmod is a no-op, but
+        // the call is still cheap and the failure path is just a
+        // tracing::warn — never blocks the user's pipeline.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let perms = std::fs::Permissions::from_mode(0o600);
+            if let Err(e) = std::fs::set_permissions(file, perms) {
+                tracing::warn!(
+                    path = %file,
+                    error = %e,
+                    "failed to set 0o600 on env-pull dotenv file; secret may be readable by other local uids",
+                );
+            }
+        }
+
         if !json_output {
             output::success(&format!(
                 "wrote {} secret{} to {} (env: {})",

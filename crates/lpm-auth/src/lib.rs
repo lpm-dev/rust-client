@@ -861,22 +861,32 @@ fn parse_npmrc_token() -> Option<String> {
 }
 
 /// Parse a single .npmrc file for the npm registry auth token.
+///
+/// On Unix, refuses to surface the token when the file's mode is more
+/// permissive than `0o600` — a world-readable `.npmrc` in a cloned
+/// repo could otherwise steer npm auth toward a token chosen by the
+/// repo's author (the M6 hazard). The previous pre-fix behaviour
+/// only emitted a `tracing::warn` and still returned the token, which
+/// hid the risk in default-quiet logs.
 fn parse_npmrc_file(path: &std::path::Path) -> Option<String> {
     let content = std::fs::read_to_string(path).ok()?;
 
-    // Check file permissions on Unix (S6)
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        if let Ok(meta) = std::fs::metadata(path) {
-            let mode = meta.permissions().mode() & 0o777;
-            if mode > 0o600 {
-                tracing::warn!(
-                    ".npmrc at {} has permissive mode {:o} (should be 0600)",
-                    path.display(),
-                    mode
-                );
-            }
+        if let Ok(meta) = std::fs::metadata(path)
+            && (meta.permissions().mode() & 0o777) > 0o600
+        {
+            tracing::warn!(
+                ".npmrc at {} has permissive mode {:o} (>0o600); \
+                 refusing to use its auth token to defeat hostile-repo \
+                 attacks. Run `chmod 600 {}` to restore the token \
+                 source.",
+                path.display(),
+                meta.permissions().mode() & 0o777,
+                path.display(),
+            );
+            return None;
         }
     }
 
@@ -1633,15 +1643,30 @@ mod tests {
         );
     }
 
+    /// Write a `.npmrc` test fixture with 0o600 perms so the
+    /// hostile-clone permissive-perms guard added in M6 doesn't
+    /// refuse the token. Test fixtures are functionally equivalent
+    /// to a legitimately-locked dev `.npmrc` — the guard is for
+    /// hostile *clones* with default-umask perms, not for properly-
+    /// owned files.
+    fn write_test_npmrc(path: &std::path::Path, content: &str) {
+        std::fs::write(path, content).unwrap_or_else(|e| panic!("write {}: {e}", path.display()));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+                .unwrap_or_else(|e| panic!("chmod {}: {e}", path.display()));
+        }
+    }
+
     #[test]
     fn parse_npmrc_extracts_token() {
         let dir = tempfile::tempdir().unwrap();
         let npmrc_path = dir.path().join(".npmrc");
-        std::fs::write(
-			&npmrc_path,
-			"//registry.npmjs.org/:_authToken=npm_ABCDEF123456\nregistry=https://registry.npmjs.org/\n",
-		)
-		.unwrap();
+        write_test_npmrc(
+            &npmrc_path,
+            "//registry.npmjs.org/:_authToken=npm_ABCDEF123456\nregistry=https://registry.npmjs.org/\n",
+        );
 
         let token = parse_npmrc_file(&npmrc_path);
         assert_eq!(token, Some("npm_ABCDEF123456".to_string()));
@@ -1767,11 +1792,10 @@ mod tests {
                 ("GITHUB_TOKEN", None),
             ]);
 
-            std::fs::write(
-                home.join(".npmrc"),
+            write_test_npmrc(
+                &home.join(".npmrc"),
                 "//registry.npmjs.org/:_authToken=npmrc-fallback-token\n",
-            )
-            .expect("failed to write home .npmrc");
+            );
 
             std::fs::write(
                 credentials_path().expect("credentials path should resolve"),
@@ -1802,11 +1826,10 @@ mod tests {
                 ("CI_JOB_TOKEN", None),
             ]);
 
-            std::fs::write(
-                home.join(".npmrc"),
+            write_test_npmrc(
+                &home.join(".npmrc"),
                 "//registry.npmjs.org/:_authToken=npmrc-fallback-token\n",
-            )
-            .expect("failed to write home .npmrc");
+            );
 
             std::fs::write(
                 credentials_path().expect("credentials path should resolve"),
@@ -1849,11 +1872,10 @@ mod tests {
                 ("CI_JOB_TOKEN", None),
             ]);
 
-            std::fs::write(
-                home.join(".npmrc"),
+            write_test_npmrc(
+                &home.join(".npmrc"),
                 "//registry.npmjs.org/:_authToken=npmrc-fallback-token\n",
-            )
-            .expect("failed to write home .npmrc");
+            );
 
             std::fs::write(
                 credentials_path().expect("credentials path should resolve"),
@@ -1908,11 +1930,10 @@ mod tests {
                 ("CI_JOB_TOKEN", None),
             ]);
 
-            std::fs::write(
-                home.join(".npmrc"),
+            write_test_npmrc(
+                &home.join(".npmrc"),
                 "//registry.npmjs.org/:_authToken=npmrc-fallback-token\n",
-            )
-            .expect("failed to write home .npmrc");
+            );
 
             std::fs::write(
                 credentials_path().expect("credentials path should resolve"),
@@ -2225,6 +2246,47 @@ mod tests {
         assert!(
             result.is_ok(),
             "clearing an absent account must be Ok (idempotent), got {result:?}",
+        );
+    }
+
+    /// Hostile-clone scenario (M6): a repo ships a world-readable
+    /// `.npmrc` carrying an attacker-controlled `_authToken`. The
+    /// pre-fix parser warned about the perms but still surfaced the
+    /// token. Post-fix, permissive perms refuse the read so npm auth
+    /// cannot be silently steered by a clone.
+    #[cfg(unix)]
+    #[test]
+    fn parse_npmrc_file_refuses_token_on_world_readable_perms() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(".npmrc");
+        std::fs::write(&path, "//registry.npmjs.org/:_authToken=attacker_token\n").unwrap();
+        // 0o644 — world-readable, fail the gate.
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        assert!(
+            parse_npmrc_file(&path).is_none(),
+            "permissive perms must skip the token surface",
+        );
+    }
+
+    /// Positive baseline: a properly-locked `.npmrc` still surfaces
+    /// its token — proves the gate doesn't over-reject.
+    #[cfg(unix)]
+    #[test]
+    fn parse_npmrc_file_accepts_token_on_0o600_perms() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(".npmrc");
+        std::fs::write(&path, "//registry.npmjs.org/:_authToken=legit_token\n").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+        assert_eq!(
+            parse_npmrc_file(&path).as_deref(),
+            Some("legit_token"),
+            "0o600 perms must allow the token surface",
         );
     }
 }
