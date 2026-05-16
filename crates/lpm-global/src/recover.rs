@@ -3,7 +3,7 @@
 //!
 //! Invoked exactly once per `lpm` invocation, **before** command
 //! dispatch, when the parsed command is in `command_needs_global_state`
-//! (M3.1d). Recovery is idempotent — running it twice produces the
+//!. Recovery is idempotent — running it twice produces the
 //! same state as running it once.
 //!
 //! ## Algorithm
@@ -78,7 +78,7 @@ pub enum ReconciliationOutcome {
     /// COMMIT or ABORT was written, recovery will retry on the next
     /// `lpm` invocation. Recovery does NOT propagate this as an error
     /// because doing so would wedge every subsequent global-state
-    /// command (audit Medium from M3.3 round).
+    /// command (audit Medium from the audit).
     Deferred {
         reason: String,
     },
@@ -107,7 +107,7 @@ pub struct RecoveryReport {
 
 /// Error returned when recovery cannot proceed because the WAL was
 /// written by a newer `lpm`. Rendered as a user-facing diagnostic by
-/// the M3.1d main.rs hook so users get an actionable upgrade prompt.
+/// the main.rs hook so users get an actionable upgrade prompt.
 #[derive(Debug)]
 pub struct UnknownOpError {
     pub op: String,
@@ -205,7 +205,7 @@ fn run_recovery_locked(root: &LpmRoot) -> Result<RecoveryReport, LpmError> {
     // Per-tx ordering matters: the manifest write MUST hit disk before
     // the WAL COMMIT/ABORT record gets appended. If we crashed after
     // the WAL append but before the manifest persist (the inverse of
-    // the High finding from the M3.1 audit), the next recovery would
+    // the High finding from the audit), the next recovery would
     // see no uncompleted INTENT (resolved), skip recovery, and
     // permanently lose the reconciliation result. Per-tx persistence
     // closes that window: at any crash point the WAL never says "done"
@@ -235,7 +235,7 @@ fn run_recovery_locked(root: &LpmRoot) -> Result<RecoveryReport, LpmError> {
 /// Reconcile one uncompleted INTENT. Persists manifest changes
 /// **before** appending the WAL COMMIT/ABORT so a crash mid-step never
 /// leaves the WAL claiming a transaction is done while the manifest
-/// still has the pending row (the High finding from the M3.1 audit).
+/// still has the pending row (the High finding from the audit).
 fn reconcile_one(
     root: &LpmRoot,
     manifest: &mut GlobalManifest,
@@ -325,9 +325,9 @@ fn reconcile_one(
     }
 
     let pending = manifest.pending.get(&intent.package).cloned().unwrap();
-    // Validate against the pending row's commands when it has any. M3.2
-    // ships fresh-install with `pending.commands == []` (commands are
-    // discovered during step 2 and recorded in the marker), so we pass
+    // Validate against the pending row's commands when it has any. Fresh
+    // installs have `pending.commands == []` (commands are discovered
+    // during step 2 and recorded in the marker), so we pass
     // `None` to make the marker authoritative — the install commit
     // step uses the same idiom.
     let expected = if pending.commands.is_empty() {
@@ -342,7 +342,7 @@ fn reconcile_one(
     };
 
     // Defense in depth: recovery-side collision check (audit High from
-    // the M3.2 fix round). The user-facing commit_locked already
+    // the fix round). The user-facing commit_locked already
     // performs this check + inline-rollback, so a well-behaved install
     // should never leave a pending row that would collide. But if
     // state ever does leak (older binary that lacked the commit-side
@@ -353,7 +353,7 @@ fn reconcile_one(
     // Use the marker-aware roll-back so leaked shims (an older binary
     // could have emitted shims pointing at the new install before
     // crashing) get cleaned up AND the displaced original owner's
-    // shim gets restored. M3.2's pending.commands is empty, so the
+    // shim gets restored. the pending.commands is empty, so the
     // default roll_back path can't see those shims.
     let collisions = crate::find_command_collisions(manifest, &intent.package, &marker_commands);
     if !collisions.is_empty() {
@@ -383,17 +383,16 @@ fn reconcile_one(
 /// `commands` is compared with **subset semantics**: every command in
 /// the Intent's `new_row_json.commands` must appear in the active
 /// row's `commands` list, but the active row is allowed to declare
-/// MORE commands than the Intent did. This handles M3.2's pipeline
+/// MORE commands than the Intent did. This handles the pipeline
 /// where the Intent ships with `commands == []` (a vacuous subset)
 /// because bin entries are discovered post-extract from the marker.
 /// Pre-fix this comparison was strict and a manifest-written-but-
-/// WAL-COMMIT-missing crash for an M3.2 install would have failed
-/// Case A, fallen into Case C, and deleted the live install root
-/// (audit High #1 from M3.2 round).
+/// WAL-COMMIT-missing crash would have failed Case A, fallen into
+/// Case C, and deleted the live install root (audit High #1).
 ///
 /// `installed_at` is excluded because recovery may set a different
 /// timestamp than the original install. `source` is compared
-/// strictly (audit Medium #1 from the second M3.1 round): two installs
+/// strictly (audit Medium #1): two installs
 /// of the "same" package from `lpm-dev` vs `upstream-npm` differ in
 /// future `lpm global update` resolution behavior.
 fn active_matches_intent(manifest: &GlobalManifest, intent: &IntentPayload) -> bool {
@@ -451,7 +450,7 @@ fn roll_forward(
     pending: PendingEntry,
     // Authoritative command list from the install-ready marker. Used
     // for shim emission AND for the active row's commands field —
-    // pending.commands may be empty when M3.2's install pipeline did
+    // pending.commands may be empty when the install pipeline did
     // not pre-resolve bin entries.
     marker_commands: Vec<String>,
 ) -> Result<ReconciliationOutcome, LpmError> {
@@ -497,16 +496,16 @@ fn roll_forward(
 
     // 2. Emit shims for every command this install owns per the
     //    authoritative marker, EXCEPT those that were aliased away
-    //    (M4.2 invariant: declared bins that are exposed under an
+    //    (invariant: declared bins that are exposed under an
     //    alias MUST NOT also appear as direct shims). We compute the
     //    aliased-away set from `ownership_delta`'s AliasInstall
     //    entries: each `bin` field names a declared bin that is
     //    exposed under an alias.
     //
     //    Marker over pending.commands: the marker was written by the
-    //    install pipeline AFTER linking the bin shims (M3.1b's
-    //    contract). Pre-M3.2, recovery iterated pending.commands; now
-    //    M3.2's pipeline writes pending with empty commands and lets
+    //    install pipeline AFTER linking the bin shims (marker contract).
+    //    Previously, recovery iterated pending.commands; now
+    //    the pipeline writes pending with empty commands and lets
     //    the marker be authoritative.
     let aliased_origs: HashSet<String> = intent
         .ownership_delta
@@ -573,8 +572,8 @@ fn roll_forward(
         source: pending.source,
         installed_at: Utc::now(),
         root: pending.root,
-        // M4.2: use `final_commands` (marker minus aliased-away origs),
-        // not marker_commands. The M4 invariant says
+        // use `final_commands` (marker minus aliased-away origs),
+        // not marker_commands. The invariant says
         // `PackageEntry.commands` holds ONLY directly-exposed names;
         // aliased-away bins live only in `[aliases]`.
         commands: final_commands,
@@ -602,7 +601,7 @@ fn alias_in_snapshot(snapshot: &serde_json::Value, alias_name: &str) -> bool {
     matches!(snapshot, serde_json::Value::Object(m) if m.contains_key(alias_name))
 }
 
-/// Recovery branch for `TxKind::Uninstall` (M3.3).
+/// Recovery branch for `TxKind::Uninstall`.
 ///
 /// Idempotent re-run of the uninstall pipeline: every step is a no-op
 /// when its target state is already in place. Recovery can be invoked
@@ -630,7 +629,7 @@ fn roll_forward_uninstall(
     //    can't safely commit the uninstall yet. Defer the transaction
     //    so it's retried on the next `lpm` invocation, but don't
     //    propagate as an error (would wedge every subsequent
-    //    global-state command). Audit Medium from the M3.3 round.
+    //    global-state command). Audit Medium from the round.
     let prior_commands: Vec<String> = intent
         .prior_active_row_json
         .as_ref()
@@ -692,7 +691,7 @@ fn roll_forward_uninstall(
         manifest.tombstones.push(rel);
     }
 
-    // 5. Persist manifest BEFORE WAL Commit (M3.1 ordering invariant).
+    // 5. Persist manifest BEFORE WAL Commit (manifest-before-commit ordering invariant).
     write_for(root, manifest)?;
 
     // 6. Best-effort install-root cleanup. If this fails the tombstone
@@ -721,8 +720,8 @@ fn roll_back(
 ) -> Result<ReconciliationOutcome, LpmError> {
     // Default cleanup commands = pending.commands. The collision
     // branch in reconcile_one calls `roll_back_with_authoritative_commands`
-    // instead so it can pass the marker-derived list (M3.2 has empty
-    // pending.commands; collision-leaked shims would otherwise survive
+    // instead so it can pass the marker-derived list (fresh installs have
+    // empty pending.commands; collision-leaked shims would otherwise survive
     // rollback).
     roll_back_with_authoritative_commands(
         root,
@@ -739,9 +738,9 @@ fn roll_back(
 /// up rather than reading from `pending.commands`.
 ///
 /// **Why this matters: leaked-shim cleanup.** If an older binary
-/// emitted shims for the install before crashing (the pre-M3.2-fix
+/// emitted shims for the install before crashing (the pre-fix
 /// collision-then-crash scenario), `pending.commands` is empty for
-/// M3.2 fresh installs. The leaked shims would survive rollback and
+/// fresh installs. The leaked shims would survive rollback and
 /// keep shadowing the original command owner. By passing the
 /// marker-derived commands list (the same list `commit_locked` would
 /// have iterated to emit shims), we cover the leaked state.
@@ -805,9 +804,8 @@ fn roll_back_with_authoritative_commands(
     let mut to_restore: Vec<(String, String, String)> = Vec::new(); // (cmd, owner_pkg, owner_root)
     for cmd in cleanup_commands {
         // Skip commands the recovering package itself currently owns
-        // (won't happen on M3.2 fresh install — the pending row hasn't
-        // been promoted to packages yet — but a future M3.4 upgrade
-        // could land here).
+        // (won't happen on a fresh install — the pending row hasn't been
+        // promoted to packages yet — but an upgrade could land here).
         if let Some(owner) = manifest.owner_of_command(cmd)
             && owner.package != intent.package
             && let Some(owner_root) = manifest.packages.get(owner.package).map(|e| e.root.clone())
@@ -1438,7 +1436,7 @@ mod tests {
         assert!(bytes_after > 0);
     }
 
-    // ─── M3.1 audit regressions ────────────────────────────────────
+    // ─── audit regressions ────────────────────────────────────
 
     /// Helper: construct an INTENT with a pre-built `new_row_json` so the
     /// "active matches new_row" check has structured fields to compare.
@@ -1525,12 +1523,12 @@ mod tests {
         assert!(final_manifest.packages.contains_key("pkg"));
     }
 
-    /// Audit High (M3.2 round): `active_matches_intent` must accept
-    /// the M3.2-shaped flow where the Intent records `commands == []`
-    /// (commands are discovered from the marker post-extract) but the
-    /// committed active row carries the marker-derived list. Pre-fix
-    /// this comparison was strict and would have failed Case A on every
-    /// successful M3.2 install whose WAL COMMIT didn't make it to disk.
+    /// Audit High: `active_matches_intent` must accept the flow where the
+    /// Intent records `commands == []` (commands are discovered from the
+    /// marker post-extract) but the committed active row carries the
+    /// marker-derived list. Pre-fix this comparison was strict and would
+    /// have failed Case A on every successful install whose WAL COMMIT
+    /// didn't make it to disk.
     /// Subset semantics: Intent's commands must be a SUBSET of the
     /// active row's commands.
     #[test]
@@ -1540,7 +1538,7 @@ mod tests {
 
         // Stage the post-commit state: install root complete, manifest
         // has the active row with marker-derived commands, no pending
-        // row. Simulates the M3.2 "manifest persisted, WAL append
+        // row. Simulates the "manifest persisted, WAL append
         // crashed" window.
         let install_root = root.install_root_for("chalk-cli", "6.0.0");
         std::fs::create_dir_all(&install_root).unwrap();
@@ -1561,8 +1559,8 @@ mod tests {
         );
         write_for(&root, &manifest).unwrap();
 
-        // Intent records commands=[] (M3.2 pipeline shape: bin entries
-        // are unknown until post-extract).
+        // Intent records commands=[] (bin entries are unknown until
+        // post-extract from the marker).
         let intent = WalRecord::Intent(Box::new(IntentPayload {
             tx_id: "tx1".into(),
             kind: TxKind::Install,
@@ -1589,7 +1587,7 @@ mod tests {
         assert_eq!(
             report.reconciled[0].outcome,
             ReconciliationOutcome::AlreadyCommitted,
-            "M3.2 commands-discovered-from-marker pattern must be Case A, NOT Case C"
+            "commands-discovered-from-marker pattern must be Case A, NOT Case C"
         );
         assert!(
             install_root.exists(),
@@ -1721,7 +1719,7 @@ mod tests {
         );
     }
 
-    /// Audit High (M3.2 fix round) — defense in depth: recovery must
+    /// Audit High — defense in depth: recovery must
     /// NOT silently roll forward a pending install whose marker
     /// commands would collide with an existing package's commands.
     /// The commit-side fix in `install_global::commit_locked` should
@@ -1784,7 +1782,7 @@ mod tests {
         assert!(!final_manifest.pending.contains_key("alt-eslint"));
     }
 
-    // ─── M3.3 uninstall recovery ──────────────────────────────────
+    // ─── uninstall recovery ──────────────────────────────────
 
     fn intent_uninstall(
         tx_id: &str,
@@ -1961,7 +1959,7 @@ mod tests {
         assert!(!final_manifest.aliases.contains_key("srv"));
     }
 
-    /// Audit Medium (M3.3 round): recovery-side defense. When a shim
+    /// Audit Medium: recovery-side defense. When a shim
     /// can't be removed (Windows AV lock simulated as Unix EACCES on
     /// bin_dir), recovery must NOT propagate as an error — that
     /// would wedge every subsequent global-state command. Instead it
@@ -2067,9 +2065,9 @@ mod tests {
         assert!(m.packages.is_empty());
     }
 
-    /// Audit Medium (M3.2 audit pass-3): the previous fix made
-    /// recovery refuse to roll forward a colliding install, but the
-    /// roll-back path used `pending.commands` (empty for M3.2) so any
+    /// Audit Medium: the previous fix made recovery refuse to roll forward
+    /// a colliding install, but the roll-back path used `pending.commands`
+    /// (empty for fresh installs) so any
     /// shim a pre-fix binary had already emitted before crashing
     /// survived rollback. This test stages exactly that
     /// "old-binary-leaked-shim" state and verifies recovery cleans
@@ -2465,7 +2463,7 @@ mod tests {
 
     // ─── ownership_delta replay + revert ─────────────────────────────
     //
-    // The M4.2 audit calls out that replace-ownership and recovery are
+    // Replace-ownership and recovery are
     // not independently shippable — a crash between Intent and Commit
     // without recovery extensions strands the displaced owner. These
     // tests pin the crash-window behavior on both axes.
@@ -2699,7 +2697,7 @@ mod tests {
         assert_eq!(parsed, payload);
     }
 
-    /// Pre-M4.2 WAL entries (without `ownership_delta`) must still
+    /// Older WAL entries (without `ownership_delta`) must still
     /// deserialize cleanly. `#[serde(default)]` on the field guarantees
     /// this; pin it so a future refactor doesn't drop the attribute.
     #[test]

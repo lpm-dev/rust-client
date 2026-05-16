@@ -135,7 +135,7 @@ pub enum InstallRootStatus {
     /// forward / commit. Carries the marker's command list — that is
     /// the authoritative "what commands does this install own"
     /// because the install pipeline writes it AFTER linking the bin
-    /// shims (M3.1b's marker contract). Recovery and the install
+    /// shims (the marker contract). Recovery and the install
     /// commit step both consume this list to drive shim emission and
     /// the [packages.<pkg>] row's commands field.
     Ready { commands: Vec<String> },
@@ -280,7 +280,7 @@ mod tests {
     use tempfile::TempDir;
 
     /// Build a "complete" install root: marker + lockfile + .bin shims.
-    /// Mirrors what the M3.2 install pipeline will produce.
+    /// Mirrors what the install pipeline will produce.
     fn make_complete_root(commands: &[&str]) -> TempDir {
         let tmp = TempDir::new().unwrap();
         let bin = tmp.path().join("node_modules").join(".bin");
@@ -372,7 +372,7 @@ mod tests {
     fn ready_with_no_expected_commands_uses_marker_as_authority() {
         // Install commit path: the install pipeline didn't pre-resolve
         // commands, so it passes None and trusts whatever the marker
-        // declares. Marker is the source of truth (M3.2 design).
+        // declares. Marker is the source of truth.
         let tmp = make_complete_root(&["eslint", "tsc"]);
         let status = validate_install_root(tmp.path(), None).unwrap();
         match status {

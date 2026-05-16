@@ -163,7 +163,7 @@ async fn offline_install_capability_round_trip_end_to_end() {
     //
     // Reviewer high-finding scenario:
     // strict script-hash trust would pass, but the capability
-    // gate (added in sub-slice 6c) should still block. The
+    // gate should still block. The
     // pre-fix offline path would have silently dropped this row
     // from build-state.json.
     let rewritten_pkg = serde_json::json!({
@@ -261,10 +261,9 @@ async fn offline_install_capability_round_trip_end_to_end() {
     )
     .unwrap();
     let binding = &pkg_json["lpm"]["trustedDependencies"]["offline-capability-pkg@1.0.0"];
-    let cap_hash = binding["capabilityHash"].as_str().expect(
-        "approve-scripts MUST persist capabilityHash for a widening approval \
-         (sub-slice 6d write-path contract)",
-    );
+    let cap_hash = binding["capabilityHash"]
+        .as_str()
+        .expect("approve-scripts MUST persist capabilityHash for a widening approval");
     assert!(
         cap_hash.starts_with("sha256-"),
         "capabilityHash must be sha256-<hex> SRI form; got {cap_hash:?}"

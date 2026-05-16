@@ -135,8 +135,7 @@ pub async fn run(
     timeout_secs: Option<u64>,
     json_output: bool,
     deny_all: bool,
-    // / rework : sandbox
-    // flag trio. `no_sandbox` flips execution to
+    // Sandbox flag trio. `no_sandbox` flips execution to
     // [`SandboxMode::Disabled`] AND skips env scrubbing — the legacy
     // `--unsafe-full-env` partner was removed in the beta-cleanup pass. `strict_sandbox` opts INTO outbound network
     // denial via the [`crate::sandbox_config::resolve_sandbox_mode_from_chain`]
@@ -207,7 +206,7 @@ async fn run_under_store_lock(
     strict_sandbox: bool,
     sandbox_log: bool,
     effective_policy: ScriptPolicy,
-    // slice 1 — see `run` for the contract.
+    // see `run` for the contract.
     advisor_approvals: Option<&std::collections::HashSet<(String, String, Option<String>)>>,
 ) -> Result<(), LpmError> {
     // Defense-in-depth on the sandbox flag pair. The CLI boundary
@@ -719,7 +718,7 @@ async fn run_under_store_lock(
         resolved_sandbox_mode,
     );
 
-    // rework: `--no-sandbox` is the single collapsed
+    // `--no-sandbox` is the single collapsed
     // escape — it drops both containment AND env scrubbing in one
     // flag (per of the DX redline). The persistent `[sandbox]
     // mode = "none"` shape has the same runtime semantics, just
@@ -1893,15 +1892,13 @@ pub(crate) enum TrustReason {
     ///   match the current request — approval is for a different
     ///   capability surface than what's being asked for now.
     /// - The package has an approval whose `capability_hash` was
-    ///   never set (sub-slice 6d hasn't shipped yet at the time
-    ///   the approval was created) — so until 6d lands, any
+    ///   never set (approval predates capability hashing) — any
     ///   package that widens via the capability model falls into
     ///   this state even if the user ran `lpm approve-scripts`.
-    ///   That's the "intermediate branch commit" the reviewer
-    ///   called out as acceptable: widening becomes enforceable
-    ///   before it becomes grantable through normal UX.
+    ///   Widening becomes enforceable before it becomes grantable
+    ///   through normal UX.
     ///
-    /// Not trusted — the script doesn't run. 6d's UX
+    /// Not trusted — the script doesn't run. UX
     /// distinguishes this from `StrictBinding` /
     /// `SuspendedByForceFloor` via the approve-scripts delta
     /// display, but at the enforcement layer this is just "no."
@@ -2050,7 +2047,7 @@ pub(crate) fn evaluate_trust(
     }
 }
 
-/// slice 4 — the original `evaluate_trust` body, extracted
+/// the original `evaluate_trust` body, extracted
 /// so [`evaluate_trust`] can compose "raw match → suspension filter"
 /// without duplicating the match logic. Returns every variant
 /// [`TrustReason`] can take EXCEPT [`TrustReason::SuspendedByForceFloor`],
@@ -2372,7 +2369,7 @@ pub fn show_install_build_hint(
     packages: &[(String, String, Option<String>)], // (name, version, integrity)
     policy: &SecurityPolicy,
     project_dir: &Path,
-    // sub-slice 6d follow-up — threaded to
+    // threaded to
     // `scriptable_package_rows` so the hint reflects the
     // capability gate's effect on trust (see comment on that
     // function for the full rationale).
@@ -2643,7 +2640,7 @@ fn toposort_packages<'a>(
 
 /// Warn if any entries in `trustedDependencies` don't actually have lifecycle scripts.
 ///
-/// M2: `policy.trusted_dependencies` is now a `TrustedDependencies`
+/// `policy.trusted_dependencies` is now a `TrustedDependencies`
 /// enum (Legacy | Rich). The iter() method yields `(name, optional binding)`
 /// tuples; we only care about the name for the staleness check.
 fn warn_stale_trusted_deps(policy: &SecurityPolicy, scriptable_packages: &[ScriptablePackage]) {
@@ -3544,8 +3541,7 @@ mod tests {
         );
     }
 
-    /// **P0 sub-slice 6d follow-up — reviewer's Medium
-    /// finding.** When the script-hash trust layer would grant
+    /// **Reviewer finding:** when the script-hash trust layer would grant
     /// trust but the capability gate rejects, the install hint
     /// must report `is_trusted = false`. Otherwise the hint lies
     /// to the user about what `lpm rebuild` will actually do and
@@ -3606,7 +3602,7 @@ mod tests {
 
     #[test]
     fn stale_detection_finds_packages_without_scripts() {
-        // M2: trusted_dependencies is now TrustedDependencies::Legacy
+        // trusted_dependencies is now TrustedDependencies::Legacy
         // (or Rich). Construct the Legacy variant directly to preserve the
         // pre-existing test semantic.
         let policy = SecurityPolicy {
@@ -3659,7 +3655,7 @@ mod tests {
         assert_eq!(stale, vec!["phantom".to_string()]);
     }
 
-    // ── M5: strict gate composition tests ──────────
+    // ── strict gate composition tests ──────────
     //
     // These tests exercise the trust-decision logic in isolation: given a
     // SecurityPolicy and a (name, version, integrity, script_hash) tuple,
@@ -3668,7 +3664,7 @@ mod tests {
     //
     // The full pipeline (lockfile + store + script execution) needs network
     // and a real fixture, which is out of scope for in-module unit tests.
-    // M6 covers the full pipeline via integration-style tests.
+    // The full pipeline is covered via integration-style tests.
 
     use lpm_security::{TrustMatch, TrustedDependencies, TrustedDependencyBinding};
     use std::collections::HashMap as StdHashMap;
@@ -3779,10 +3775,10 @@ mod tests {
         );
     }
 
-    /// REGRESSION: composing M5 with the existing `is_scope_trusted` glob
-    /// path. A package matched by a `lpm.scripts.trustedScopes` glob is
-    /// trusted regardless of the strict-gate result. This is the OR
-    /// composition documented in M5 scope.
+    /// REGRESSION: the strict gate must compose correctly with the existing
+    /// `is_scope_trusted` glob path. A package matched by a
+    /// `lpm.scripts.trustedScopes` glob is trusted regardless of the
+    /// strict-gate result.
     #[test]
     fn build_strict_gate_or_scope_trusted_runs_script_via_scope() {
         let dir = tempfile::tempdir().unwrap();
@@ -4424,7 +4420,7 @@ mod tests {
         assert!(TrustReason::LegacyName.is_trusted());
         assert!(TrustReason::ScopedGlob.is_trusted());
         assert!(TrustReason::GreenTierUnderTriage.is_trusted());
-        // slice 1: advisor-approved-this-run grants ephemeral
+        // advisor-approved-this-run grants ephemeral
         // trust. Required for the install-time autoBuild path to
         // actually execute scripts the advisor approved.
         assert!(TrustReason::AdvisorApprovedThisRun.is_trusted());
@@ -4432,7 +4428,7 @@ mod tests {
         assert!(!TrustReason::Untrusted.is_trusted());
     }
 
-    // ── slice 1: AdvisorApprovedThisRun trust path ────────
+    // ── AdvisorApprovedThisRun trust path ────────
     //
     // Locks the new amber-tier short-circuit in
     // `evaluate_trust_unsuspended`. The test matrix below maps
@@ -5014,7 +5010,7 @@ mod tests {
         assert_eq!(classify_package_worst_tier(&empty), None);
     }
 
-    // ── slice 4: force-security-floor approval suspension ──
+    // ── force-security-floor approval suspension ──
     //
     // Acceptance criteria pinned here:
     // 1. `force-security-floor = false`: existing approvals run
@@ -5343,7 +5339,7 @@ mod tests {
         assert!(!reason.is_trusted());
     }
 
-    // ── sub-slice 6c — capability gate in evaluate_trust ──
+    // ── capability gate in evaluate_trust ──
 
     fn capability_test_fixture() -> (
         tempfile::TempDir,
@@ -5465,8 +5461,7 @@ mod tests {
     /// Widening request + binding with matching capability hash →
     /// trust granted (the user reviewed the exact widening).
     /// Setup uses a helper that writes a capability-hash into the
-    /// binding directly — sub-slice 6d's approve-scripts write
-    /// path isn't in this commit.
+    /// binding directly (the approve-scripts write path is tested separately).
     #[test]
     fn capability_widening_with_matching_hash_is_approved() {
         let dir = tempfile::tempdir().unwrap();

@@ -29,7 +29,7 @@ impl PackageBits {
     }
 
     /// Create a full bit-set with all `len` members set.
-    #[allow(dead_code)] // used by M4 evaluator
+    #[allow(dead_code)] // used by the triage evaluator
     pub fn full(len: usize) -> Self {
         PackageBits(vec![true; len])
     }
@@ -1176,7 +1176,7 @@ mod tests {
         );
     }
 
-    // ── M5: Explain API tests ──────────────────────────────────────────────
+    // ── Explain API tests ──────────────────────────────────────────────
 
     #[test]
     fn explain_atom_produces_direct_match() {
@@ -1369,7 +1369,7 @@ mod tests {
         assert_eq!(format_expr(&expr), "...^[main]");
     }
 
-    // ── M6: Security tests ─────────────────────────────────────────────────
+    // ── Security tests ─────────────────────────────────────────────────
     //
     // Lock down the security boundary. The evaluator must reject path
     // escapes, glob escapes, and pass git-ref injection straight through to
@@ -1509,7 +1509,7 @@ mod tests {
         }
     }
 
-    // ── M8: Perf assertion benchmarks ──────────────────────────────────────
+    // ── Perf assertion benchmarks ──────────────────────────────────────
     //
     // These are NOT criterion benchmarks — they're #[test]-mode perf gates
     // intended to catch order-of-magnitude regressions in the filter engine.

@@ -73,7 +73,7 @@ fn cleanup_removed_packages(project_dir: &Path, removed: &[String]) -> Result<()
     Ok(())
 }
 
-/// M3: per-manifest uninstall helper.
+/// per-manifest uninstall helper.
 ///
 /// Reads `pkg_json_path`, removes the requested package entries from
 /// `dependencies`/`devDependencies`, and writes the manifest back atomically.
@@ -142,7 +142,7 @@ pub async fn run(
         ));
     }
 
-    // M3: route through the shared target resolver, which
+    // route through the shared target resolver, which
     // handles all 8 cells of the install/uninstall decision matrix
     // (standalone, workspace member dir, -w, --filter, etc.).
     let targets = crate::commands::install_targets::resolve_install_targets(
@@ -152,7 +152,7 @@ pub async fn run(
         true, // has_packages
     )?;
 
-    // Empty result from --filter (mirrors D3 / install M2 semantics).
+    // Empty result from --filter (mirrors D3 / workspace install semantics).
     //
     // audit follow-through: surface the D2 substring → glob migration
     // hint when any filter looks like a bare name that would have
@@ -659,7 +659,7 @@ mod tests {
         write_package_json(dir.path(), &json!({"name": "demo"}));
         let client = lpm_registry::RegistryClient::new();
 
-        // M3: signature gained filters/-w/fail_if_no_match params.
+        // signature gained filters/-w/fail_if_no_match params.
         let result = run(&client, dir.path(), &[], &[], false, false, false, true).await;
 
         assert!(result.is_err());
@@ -670,7 +670,7 @@ mod tests {
         );
     }
 
-    // ── M3: workspace-aware uninstall behavior ────────────
+    // ── workspace-aware uninstall behavior ────────────
 
     #[tokio::test]
     async fn run_uninstall_in_standalone_project_targets_cwd_manifest() {

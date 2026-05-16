@@ -1,7 +1,7 @@
-//! M5 — aggregate blocked-set across globally-installed packages.
+//! Aggregate blocked-set across globally-installed packages.
 //!
 //! Each globally-installed package is its own synthetic project (per
-//! M3.2's install pipeline routing). When `install_global::do_install`
+//! the install pipeline routing). When `install_global::do_install`
 //! calls `install::run_with_options`, the inner project install writes
 //! `<install_root>/.lpm/build-state.json` the same way any other
 //! project install would — just scoped to the global install root.
@@ -75,8 +75,8 @@ pub struct AggregateBlockedSet {
     pub rows: Vec<AggregateBlockedRow>,
     /// Global-manifest entries whose per-install build-state file was
     /// missing or unreadable. Reported so the caller can surface a
-    /// soft warning — these installs may be pre-M5 (no build-state
-    /// ever written) or may have a corrupted `.lpm/` dir. Not a fatal
+    /// soft warning — these installs may predate build-state tracking (no
+    /// build-state ever written) or may have a corrupted `.lpm/` dir. Not a fatal
     /// condition for approve-scripts.
     pub unreadable_origins: Vec<String>,
 }
@@ -224,7 +224,7 @@ impl DedupKey {
 
 /// Quiet assertion for consumers that want to know where a specific
 /// install's build-state lives — currently only used by tests but
-/// exposed for M6 doctor integration where reading the file directly
+/// exposed for doctor integration where reading the file directly
 /// is useful for diagnostics.
 #[allow(dead_code)]
 pub fn build_state_path_for_install(install_root: &std::path::Path) -> PathBuf {

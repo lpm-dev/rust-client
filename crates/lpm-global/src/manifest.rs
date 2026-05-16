@@ -35,7 +35,7 @@
 //!
 //! `schema_version` is a `u32`. Readers tolerate unknown fields (serde
 //! default) so additive changes don't break older binaries; bumps are
-//! reserved for breaking changes. M2 ships v1.
+//! reserved for breaking changes. Current format is v1.
 
 use chrono::{DateTime, Utc};
 use lpm_common::{LpmError, LpmRoot, as_extended_path};
@@ -339,13 +339,13 @@ pub struct CommandCollision {
 /// `manifest`. Self-collisions (the candidate package re-asserting its
 /// own already-owned commands) are intentionally excluded — the
 /// "package is already installed" check is a separate concern handled
-/// at the install entry point. M3.4's upgrade path will also use this
+/// at the install entry point. the upgrade path will also use this
 /// helper without false-positive on its own pre-existing rows.
 ///
 /// Used by both `commands::install_global::commit_locked` (commit
 /// path) and the recovery `reconcile_one` (replay path) so the
 /// invariant is enforced at every commit point — not just the
-/// happy-path one. M3.2 audit High: pre-fix the recovery side could
+/// happy-path one. Audit High: pre-fix the recovery side could
 /// silently commit a previously-rejected install on the next `lpm`
 /// invocation.
 pub fn find_command_collisions(
@@ -588,7 +588,7 @@ mystery_field = 42
     fn find_command_collisions_excludes_self_owned_commands() {
         let m = sample_manifest();
         // eslint package re-claiming its own `eslint` command is NOT
-        // a collision with itself. M3.4 upgrades will use this.
+        // a collision with itself. Upgrades use this path too.
         let collisions = find_command_collisions(&m, "eslint", &["eslint".to_string()]);
         assert!(collisions.is_empty());
     }

@@ -779,7 +779,7 @@ mod tests {
 
     #[test]
     fn new_default_options_returns_default_posture() {
-        // rework: default options give the
+        // default options give the
         // relaxed default — V1 baseline, no AccessNet rules. The
         // kernel-version probe still runs (V1 floor) so this test
         // can fail with `KernelTooOld { required: "5.13" }` only on
@@ -825,7 +825,7 @@ mod tests {
             }) => {
                 assert_eq!(required, MIN_KERNEL_VERSION_STRICT);
                 assert!(!detected.is_empty());
-                // rework: single `--no-sandbox` flag.
+                // single `--no-sandbox` flag.
                 assert!(
                     remediation.contains("--no-sandbox"),
                     "remediation must name the escape hatch: {remediation}"
@@ -842,7 +842,7 @@ mod tests {
                     remediation.contains("trustedDependencies"),
                     "remediation must name the per-package trust escape: {remediation}"
                 );
-                // rework: the wizard shortcut also lives
+                // the wizard shortcut also lives
                 // in the remediation now.
                 assert!(
                     remediation.contains("lpm config sandbox"),

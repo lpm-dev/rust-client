@@ -2000,7 +2000,7 @@ mod tests {
 
     #[test]
     fn merge_over_dedupes_identical_extra_roots_preserving_first_source() {
-        // M2 regression — if two layers contribute the same PEM bytes
+        // Regression — if two layers contribute the same PEM bytes
         // (common in shops where `~/.npmrc` and a project `.npmrc`
         // both set `cafile=/etc/ssl/corp-ca.pem`), the merged
         // `extra_roots` should NOT duplicate the cert. Rustls handles

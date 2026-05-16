@@ -1,8 +1,7 @@
-//! slice 6 — per-package capability set + canonical hashing.
+//! Per-package capability set + canonical hashing.
 //!
-//! Introduces the pure data model and canonical-hash primitive for the
-//! three per-package capability knobs defined in
-//! ["Per-package capability knobs"](../../../../../../a-package-manager/DOCS/new-features/37-rust-client-RUNNER-VISION-phase48.md):
+//! Defines the pure data model and canonical-hash primitive for the
+//! three per-package capability knobs:
 //!
 //! - `passEnv` — sorted, deduplicated set of env-var names a package
 //!   wants passed through to its lifecycle scripts.
@@ -11,26 +10,18 @@
 //! - `sandboxLimits` — per-limit numeric ceilings a package is asking
 //!   the user to allow above the user-global ceiling.
 //!
-//! # Scope of this slice
+//! # Scope
 //!
-//! **Pure, heavily tested** per reviewer guidance. No I/O, no approval-
-//! record wiring, no enforcement-path integration. The next slices
-//! in this lane will:
-//!
-//! - (sub-slice 6b, this commit) extends the approval record
-//!   ([`lpm_workspace::TrustedDependencyBinding::capability_hash`]) to
-//!   carry the `canonical_hash` of the approved
-//!   [`CapabilitySet`]; adds the match method
-//!   [`CapabilitySet::is_approved_by`] with the single invariant
-//!   "legacy approval approves baseline only; new approval
-//!   requires exact hash equality."
-//! - Wire [`CapabilitySet::is_at_baseline`] and a to-be-added
-//!   `loosens_beyond` helper into [`evaluate_trust`] so tighter-than-
-//!   user-bound requests auto-apply, looser-than-bound requests
-//!   require approval, and drift on the approval-hash invalidates.
-//! - Surface capability deltas in `lpm approve-scripts` so the user
-//!   sees *which* env vars / rlimits / read mode they're granting
-//!   and the exact granted hash is persisted.
+//! **Pure, heavily tested.** No I/O. The approval record
+//! ([`lpm_workspace::TrustedDependencyBinding::capability_hash`]) carries
+//! the `canonical_hash` of the approved [`CapabilitySet`];
+//! [`CapabilitySet::is_approved_by`] enforces "legacy approval approves
+//! baseline only; new approval requires exact hash equality."
+//! [`evaluate_trust`] uses [`CapabilitySet::is_at_baseline`] and
+//! `loosens_beyond` so tighter-than-bound requests auto-apply and
+//! looser-than-bound requests require explicit approval. `lpm
+//! approve-scripts` surfaces capability deltas so the user sees which
+//! env vars / rlimits / read mode they're granting.
 //!
 //! # Canonicalization contract
 //!
@@ -210,7 +201,7 @@ impl RlimitKey {
 /// The user-level upper bounds that gate per-package capability
 /// requests at enforcement time.
 ///
-/// sub-slice 6c wires this through [`evaluate_trust`].
+/// Wired through [`evaluate_trust`].
 /// Only the [`sandbox_limits`] field is user-configurable right now
 /// — `pass_env` and `read_project` have fixed floors (empty /
 /// `Narrow`) that aren't user-extensible in. A future sub-slice
@@ -655,14 +646,14 @@ impl CapabilitySet {
     /// strict-tuple match (`TrustMatch::Strict` →
     /// "trusted, not blocked"), which correctly identified
     /// script-hash drift but did NOT catch capability drift that
-    /// sub-slice 6c's `evaluate_trust` now rejects via
+    /// `evaluate_trust` now rejects via
     /// `CapabilityNotApproved`. Without this helper, a package
     /// with script-hash approval but widened capability request
     /// would sail past install-time capture and approve-scripts
     /// discovery, only to silently skip when `lpm rebuild` runs —
     /// with no path for the user to resolve.
     ///
-    /// The helper folds the 6c enforcement decision into a single
+    /// The helper folds the enforcement decision into a single
     /// yes/no so the two filter sites can consult it without
     /// duplicating the "loosens beyond → check binding" logic
     /// from `evaluate_trust`.
@@ -702,8 +693,8 @@ impl CapabilitySet {
     /// **Match rule:**
     ///
     /// - `binding.capability_hash == None` (legacy approval from
-    ///   before sub-slice 6b, or a new approval whose granted set
-    ///   was baseline): matches iff `self.is_at_baseline()` —
+    ///   before capability hashing was added, or a new approval whose
+    ///   granted set was baseline): matches iff `self.is_at_baseline()` —
     ///   nothing beyond baseline was ever reviewed, so nothing
     ///   beyond baseline is approved.
     /// - `binding.capability_hash == Some(stored_hash)`: matches iff
@@ -1050,7 +1041,7 @@ mod tests {
         }
     }
 
-    // ── sub-slice 6b — is_approved_by match semantics ──
+    // ── is_approved_by match semantics ──
     //
     // Reviewer's acceptance list for this sub-slice:
     //
@@ -1129,11 +1120,10 @@ mod tests {
     fn legacy_binding_rejects_non_empty_sandbox_limits() {
         // Reviewer acceptance #3c: any sandboxLimits entry
         // (regardless of value) is a loosening request not
-        // covered by a legacy approval. Enforcement-time logic in
-        // sub-slice 6c will further distinguish at-or-below-
-        // ceiling from above-ceiling; for the storage-level match
-        // in 6b, ANY non-baseline capability invalidates a
-        // legacy approval.
+        // covered by a legacy approval. Enforcement-time logic
+        // further distinguishes at-or-below-ceiling from above-ceiling;
+        // at the storage-level match, ANY non-baseline capability
+        // invalidates a legacy approval.
         let widened = set_from(
             &[],
             ReadProjectMode::Narrow,
@@ -1162,7 +1152,7 @@ mod tests {
         // from a legacy-None approval. Both reject the request,
         // but the diagnostic reason differs (the former is "drift,"
         // the latter is "legacy approval doesn't cover extras").
-        // Sub-slice 6c will surface the difference to users.
+        // The enforcement layer surfaces the difference to users.
         let requested = set_from(&["FOO"], ReadProjectMode::Narrow, &[]);
         let binding = binding_with_hash("sha256-some-other-hash");
         assert!(!requested.is_approved_by(&binding));
@@ -1245,7 +1235,7 @@ mod tests {
         assert!(baseline.is_approved_by(&explicit_baseline_binding));
     }
 
-    // ── sub-slice 6c — loosens_beyond ────────────────
+    // ── loosens_beyond ────────────────
 
     fn ub_with(ceilings: &[(RlimitKey, u64)]) -> UserBound {
         UserBound {
@@ -1370,7 +1360,7 @@ mod tests {
         assert!(s.loosens_beyond(&bound));
     }
 
-    // ── sub-slice 6c — UserBound::from_global_config ──
+    // ── UserBound::from_global_config ──
     //
     // End-to-end UserBound tests require either injecting a
     // GlobalConfig (whose `table` field is private) or a serial-
@@ -1460,7 +1450,7 @@ mod tests {
         assert!(s.loosens_beyond(&ub));
     }
 
-    // ── sub-slice 6c — from_package_json parser ──
+    // ── from_package_json parser ──
 
     fn pkg_json_fixture(body: &str) -> (tempfile::TempDir, std::path::PathBuf) {
         let tmp = tempfile::tempdir().unwrap();
@@ -1606,7 +1596,7 @@ mod tests {
         assert_eq!(parsed.canonical_hash(), manual.canonical_hash());
     }
 
-    // ── sub-slice 6d — delta_vs_user_bound ────────────
+    // ── delta_vs_user_bound ────────────
 
     #[test]
     fn delta_baseline_is_empty() {
@@ -1716,7 +1706,7 @@ mod tests {
         }
     }
 
-    // ── sub-slice 6d — round-trip: written hash == enforced hash ──
+    // ── round-trip: written hash == enforced hash ──
     //
     // The load-bearing invariant this slice ships: the hash
     // written by approve-scripts is byte-for-byte identical to

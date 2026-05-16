@@ -603,14 +603,14 @@ enum Commands {
         #[arg(long, short = 'y')]
         yes: bool,
 
-        /// M3.3: remove a globally-installed package.
+        /// remove a globally-installed package.
         /// Mutually exclusive with `--filter` / `-w` / `--fail-if-no-match`
         /// (those are project-scoped).
         ///
         /// Example: `lpm uninstall -g eslint`
         ///
         /// Equivalent to `lpm global remove <pkg>` — both invocations
-        /// route through the same M3.3 implementation.
+        /// route through the same `uninstall_global` implementation.
         #[arg(long, short = 'g')]
         global: bool,
     },
@@ -1080,7 +1080,7 @@ enum Commands {
         #[arg(long = "triage", id = "rebuild_triage_alias", conflicts_with_all = ["policy", "rebuild_yolo"])]
         triage_alias: bool,
 
-        /// rework : drop ALL containment for
+        /// drop ALL containment for
         /// this command. Scripts run with full host access — filesystem
         /// open, full env (credentials included), outbound network
         /// allowed. Reserve for debugging a sandbox false-positive
@@ -1096,7 +1096,7 @@ enum Commands {
         )]
         no_sandbox: bool,
 
-        /// rework : engage strict containment
+        /// engage strict containment
         /// for this command — filesystem-write containment + env
         /// scrubbing + outbound network denial. Overrides any
         /// persistent `[sandbox] mode` config. Mutually exclusive
@@ -1439,7 +1439,7 @@ enum Commands {
         #[arg(long)]
         dry_run: bool,
 
-        /// M5: operate on the global blocked set (aggregated
+        /// operate on the global blocked set (aggregated
         /// across every `lpm install -g` install root) instead of the
         /// current project. Approvals write to
         /// `~/.lpm/global/trusted-dependencies.json` rather than the
@@ -1447,7 +1447,7 @@ enum Commands {
         #[arg(long)]
         global: bool,
 
-        /// M5: when used with `--global`, group blocked rows by
+        /// when used with `--global`, group blocked rows by
         /// top-level globally-installed package during list and interactive
         /// review. Auto-enabled when the blocked set exceeds 10 entries.
         /// Persisted approvals still remain per dependency binding row.
@@ -2014,7 +2014,7 @@ enum DoctorAction {
 // `GlobalCmd` lives in `commands::global` so the subcommand type is in
 // the same module as the run() handler. Imported via the dispatch site.
 
-/// M3.1d: predicate that gates `lpm_global::recover()` at
+/// predicate that gates `lpm_global::recover()` at
 /// startup. Returns `true` for any command that reads or writes
 /// `~/.lpm/global/` state — recovery must run first so the manifest
 /// is settled before the command sees it. Returns `false` for everything
@@ -2024,7 +2024,7 @@ enum DoctorAction {
 /// The set is deliberately conservative: better to occasionally pay
 /// for an empty-WAL scan than to skip recovery and let a destructive
 /// command run against half-committed state.
-/// M0 (rev 6): emit a one-time warning if `$LPM_HOME` lives on a
+/// emit a one-time warning if `$LPM_HOME` lives on a
 /// known-unreliable network filesystem (NFS/SMB/CIFS/AFP). Marker file
 /// `~/.lpm/.network-fs-notice-shown` suppresses subsequent invocations so
 /// CI / enterprise users in known-okay setups aren't nagged repeatedly.
@@ -2092,12 +2092,12 @@ where
 
 fn command_needs_global_state(cmd: &Commands) -> bool {
     match cmd {
-        // `install -g` (the actual install pipeline lands in M3.2 — for
-        // now the dispatcher errors loudly, but recovery still runs so
+        // `install -g` (the actual install pipeline is wired; the
+        // dispatcher errors loudly for multi-package invocations, but recovery still runs so
         // a prior crashed install gets reconciled before the user
         // retries).
         Commands::Install { global: true, .. } => true,
-        // `uninstall -g` (M3.3): same reasoning as `install -g` —
+        // `uninstall -g`: same reasoning as `install -g` —
         // recovery must run first so an orphaned `[pending.<pkg>]` from
         // a crashed install gets cleaned up before uninstall sees it
         // and bails with the in-flight-install error message.
@@ -2121,7 +2121,7 @@ fn command_needs_global_state(cmd: &Commands) -> bool {
         // `doctor` reports on global state and may surface mid-tx
         // anomalies that recovery would have already cleaned up.
         Commands::Doctor { .. } => true,
-        // M5: `approve-scripts --global` reads the global
+        // `approve-scripts --global` reads the global
         // manifest + aggregates per-install build-state files, both
         // of which need recovery to settle first.
         Commands::ApproveScripts { global: true, .. } => true,
@@ -2547,7 +2547,7 @@ async fn async_main() -> Result<()> {
         client = client.with_token(bearer);
     }
 
-    // M3.1d: run global recovery before any command that reads
+    // run global recovery before any command that reads
     // or writes ~/.lpm/global/ state. Skipped for read-only commands
     // (`--help`, `--version`, plain project install) so path
     // construction stays side-effect-free for the common case. Idempotent
@@ -2555,7 +2555,7 @@ async fn async_main() -> Result<()> {
     if command_needs_global_state(&command)
         && let Ok(root) = lpm_common::LpmRoot::from_env()
     {
-        // M0 (rev 6): one-time warning when $LPM_HOME sits on
+        // one-time warning when $LPM_HOME sits on
         // NFS/SMB/CIFS — advisory locks on those filesystems are
         // famously unreliable and the install transaction's atomicity
         // guarantees degrade. Suppressed by a marker file after the
@@ -2586,7 +2586,7 @@ async fn async_main() -> Result<()> {
                             lpm_global::ReconciliationOutcome::AlreadyCommitted => {
                                 // Manifest was at the committed state
                                 // but the WAL never got the COMMIT
-                                // record (Case A from the M3.1 audit).
+                                // record (Case A from the audit).
                                 // We just emitted the missing COMMIT —
                                 // nothing user-visible changed.
                                 tracing::debug!(
@@ -2606,7 +2606,7 @@ async fn async_main() -> Result<()> {
                                 // user — they're typically transient
                                 // (Windows AV holding a file) but the
                                 // user should know there's pending
-                                // cleanup. Audit Medium from M3.3.
+                                // cleanup. Audit Medium.
                                 output::warn(&format!(
                                     "global recovery deferred tx for '{}': {}",
                                     tx.package, reason
@@ -2711,11 +2711,10 @@ async fn async_main() -> Result<()> {
             paranoid,
             no_sandbox,
         } => {
-            // M3.2: route `lpm install --global` / `-g` to
-            // the persistent IsolatedInstall pipeline. M3.2 ships
-            // fresh-install only (no upgrade); upgrade lands in M3.4.
-            // Collision resolution lands in M4. The pipeline takes
-            // care of the three-phase tx (Intent + slow install +
+            // Route `lpm install --global` / `-g` to the persistent
+            // IsolatedInstall pipeline. Supports fresh install, upgrade,
+            // and collision resolution. The pipeline takes care of the
+            // three-phase tx (Intent + slow install +
             // commit) and the recovery hook above already handled
             // any prior crashed install for this command's package.
             if global {
@@ -2729,8 +2728,8 @@ async fn async_main() -> Result<()> {
                 if packages.len() > 1 {
                     return Err(lpm_common::LpmError::Script(format!(
                         "`lpm install --global` accepts a single package per invocation \
-                         in M3.2 (got {}). Run it once per package, or wait for the M3.4 \
-                         multi-target update path.",
+                         (got {}). Run it once per package, or use \
+                         `lpm global update` for multi-package upgrades.",
                         packages.len()
                     )));
                 }
@@ -2743,7 +2742,7 @@ async fn async_main() -> Result<()> {
                     fail_if_no_match,
                     yes,
                 )?;
-                // M4: parse collision-resolution flags. Syntactic
+                // parse collision-resolution flags. Syntactic
                 // validation only (no lookup against marker commands —
                 // that happens at commit time with authoritative data).
                 let resolution = commands::install_global::CollisionResolution::parse_from_flags(
@@ -2761,7 +2760,7 @@ async fn async_main() -> Result<()> {
                     exact,
                     tilde,
                     save_prefix,
-                ); // M3.2 honors none of these yet; M3.4 will wire selected flags.
+                ); // not wired for global install; ignored for now.
 
                 let overrides = build_install_global_overrides(
                     allow_new,
@@ -2784,7 +2783,7 @@ async fn async_main() -> Result<()> {
                 .await;
             }
 
-            // M4 audit Finding 2: reject collision-resolution flags on
+            // Audit: Finding 2: reject collision-resolution flags on
             // the non-global install path. These flags only make sense
             // for `-g` installs (the global command-shim system is the
             // ONLY surface that can collide — project installs write
@@ -2947,7 +2946,7 @@ async fn async_main() -> Result<()> {
                         advisor.clone(),
                         min_release_age_override,
                         drift_ignore_policy,
-                        // rework: collapse `--strict-sandbox`
+                        // collapse `--strict-sandbox`
                         // and its `--paranoid` alias into a single bool
                         // before the resolver (the chain inside
                         // `rebuild::run` already accepts a single
@@ -3039,7 +3038,7 @@ async fn async_main() -> Result<()> {
             yes,
             global,
         } => {
-            // M3.3: `lpm uninstall -g <pkg>` routes to the
+            // `lpm uninstall -g <pkg>` routes to the
             // global uninstall pipeline. Project flags are mutually
             // exclusive with -g — no `--filter` / `-w` /
             // `--fail-if-no-match` for global ops since there's no
@@ -3055,7 +3054,7 @@ async fn async_main() -> Result<()> {
                 } else if packages.len() > 1 {
                     Err(lpm_common::LpmError::Script(format!(
                         "`lpm uninstall --global` accepts a single package per invocation \
-                         in M3.3 (got {}). Run it once per package.",
+                         (got {}). Run it once per package.",
                         packages.len()
                     )))
                 } else if let Err(error) = validate_global_uninstall_project_scoped_flags(
@@ -3575,7 +3574,7 @@ async fn async_main() -> Result<()> {
                 cli.json,
                 deny_all,
                 no_sandbox,
-                // rework: `--paranoid` is a clap alias for
+                // `--paranoid` is a clap alias for
                 // `--strict-sandbox`. Either form sets the strict flag
                 // before flowing into `resolve_sandbox_mode_from_chain`.
                 strict_sandbox || paranoid,
@@ -3587,7 +3586,7 @@ async fn async_main() -> Result<()> {
                 // so can consult it for green-tier promotion
                 // without another signature change.
                 effective,
-                // slice 1: standalone `lpm rebuild` has no
+                // standalone `lpm rebuild` has no
                 // install-time advisor context — only the trust
                 // manifest authorises execution here. The ephemeral
                 // advisor approvals live exclusively on the install
@@ -3768,7 +3767,7 @@ async fn async_main() -> Result<()> {
             dry_run,
         } => {
             if global {
-                // M5: global-scoped approve-scripts reads the
+                // global-scoped approve-scripts reads the
                 // aggregate across every `lpm install -g` install root
                 // and writes approvals to
                 // `~/.lpm/global/trusted-dependencies.json`. `--group`
@@ -4429,7 +4428,7 @@ mod tests {
         print_version_with_notice();
     }
 
-    // ─── M3.1d: command_needs_global_state predicate ─────
+    // ─── command_needs_global_state predicate ─────
 
     fn parse(args: &[&str]) -> Commands {
         Cli::try_parse_from(args)
@@ -4634,7 +4633,7 @@ mod tests {
         }
     }
 
-    // ── M7: --filter as Vec<String> + --fail-if-no-match ──
+    // ── --filter as Vec<String> + --fail-if-no-match ──
 
     #[test]
     fn run_filter_flag_collects_into_vec() {
@@ -4686,7 +4685,7 @@ mod tests {
         assert!(result.is_err(), "--all and --affected must conflict");
     }
 
-    // ── M7: lpm filter subcommand ────────────────────────
+    // ── lpm filter subcommand ────────────────────────
 
     #[test]
     fn filter_command_parses_positional_exprs() {
@@ -4744,7 +4743,7 @@ mod tests {
         assert!(result.is_err(), "empty exprs must be rejected");
     }
 
-    // ── M2: install --filter / -w / --fail-if-no-match ──
+    // ── install --filter / -w / --fail-if-no-match ──
 
     #[test]
     fn install_filter_flag_collects_into_vec() {
@@ -4950,7 +4949,7 @@ mod tests {
     use crate::provenance_fetch::DriftIgnorePolicy;
     use crate::script_policy_config::ScriptPolicy;
 
-    // ── slice 1 close-out — `--advisor` clap validator ────
+    // ── `--advisor` clap validator ────
     //
     // Locks the parser contract for the CLI flag wired in this slice:
     // every known provider slug + the explicit `"none"` opt-out are
@@ -5203,7 +5202,7 @@ mod tests {
         );
     }
 
-    // ── M3: uninstall --filter / -w / --fail-if-no-match ──
+    // ── uninstall --filter / -w / --fail-if-no-match ──
 
     #[test]
     fn uninstall_filter_flag_collects_into_vec() {
@@ -5342,7 +5341,7 @@ mod tests {
         }
     }
 
-    // ── M1: lpm deploy ────────────────────────────────────
+    // ── lpm deploy ────────────────────────────────────
 
     #[test]
     fn deploy_command_parses_required_output_and_filter() {
@@ -5423,7 +5422,7 @@ mod tests {
     fn deploy_command_filter_can_be_passed_multiple_times() {
         // Even though deploy will hard-error at runtime if more than one
         // member matches, the CLI parser must accept multiple --filter
-        // flags. The single-member assertion happens in M2, not at parse time.
+        // flags. The single-member assertion happens in `resolve_deploy_target`, not at parse time.
         let cli = Cli::try_parse_from([
             "lpm",
             "deploy",
@@ -5584,7 +5583,7 @@ mod tests {
 
     #[test]
     fn rebuild_no_sandbox_is_single_flag() {
-        // rework : `--no-sandbox` collapsed the
+        // `--no-sandbox` collapsed the
         // legacy `--unsafe-full-env` partner — single flag drops
         // BOTH containment AND env scrubbing. No deprecation alias per
         // beta-cleanup policy.
@@ -5607,7 +5606,7 @@ mod tests {
 
     #[test]
     fn rebuild_strict_sandbox_and_no_sandbox_are_mutually_exclusive() {
-        // rework: opting INTO containment (`--strict-sandbox`
+        // opting INTO containment (`--strict-sandbox`
         // / `--paranoid`) and opting OUT entirely (`--no-sandbox`)
         // cannot coexist on the same command.
         let result = Cli::try_parse_from(["lpm", "rebuild", "--strict-sandbox", "--no-sandbox"]);
@@ -5662,7 +5661,7 @@ mod tests {
 
     #[test]
     fn install_sandbox_mode_flags_parse() {
-        // rework: install gains the same trio. Strict and
+        // install gains the same trio. Strict and
         // paranoid are aliases; both conflict with --no-sandbox.
         let cli = Cli::try_parse_from(["lpm", "install", "--strict-sandbox"])
             .expect("`lpm install --strict-sandbox` should parse");
@@ -6016,7 +6015,7 @@ mod tests {
         }
     }
 
-    // ── M4.1: install -g collision-resolution flags ───────────
+    // ── install -g collision-resolution flags ───────────
 
     #[test]
     fn install_global_replace_bin_flag_collects_to_vec() {
@@ -6108,7 +6107,7 @@ mod tests {
         }
     }
 
-    /// M4 audit pass 1 Finding 2: clap must still ACCEPT the flags on
+    /// Audit: pass 1 Finding 2: clap must still ACCEPT the flags on
     /// the non-global path (we reject them at dispatch, not at parse).
     /// This pins the parse-layer surface so a future change to clap's
     /// constraints doesn't accidentally reject at parse time (which

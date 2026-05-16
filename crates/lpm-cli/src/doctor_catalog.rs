@@ -1294,7 +1294,7 @@ pub static SANDBOX_AVAILABLE: CheckEntry = CheckEntry {
     name: "Sandbox",
     category: Category::Sandbox,
     tier: Tier::Extended,
-    description: "The OS sandbox backend used by lifecycle scripts is available. rework : the default posture is filesystem-write containment + env scrubbing; outbound network denial is the opt-in `strict` mode. Strict-mode coverage is platform-asymmetric: full denial on macOS Seatbelt (every socket family); on Linux, landlock V4 covers outbound TCP and the seccomp-bpf layer covers direct UDP / raw / AF_PACKET / AF_NETLINK socket() — AF_UNIX intentionally allowed for legitimate IPC.",
+    description: "The OS sandbox backend used by lifecycle scripts is available. The default posture is filesystem-write containment + env scrubbing; outbound network denial is the opt-in `strict` mode. Strict-mode coverage is platform-asymmetric: full denial on macOS Seatbelt (every socket family); on Linux, landlock V4 covers outbound TCP and the seccomp-bpf layer covers direct UDP / raw / AF_PACKET / AF_NETLINK socket() — AF_UNIX intentionally allowed for legitimate IPC.",
     when_fires: "Seatbelt (macOS) or Landlock (Linux) is reachable on this host. strict-mode outbound network denial engages only when the user has opted in via `--strict-sandbox` / `--paranoid`, `[sandbox] mode = \"strict\"`, or `LPM_STRICT_SANDBOX=1`.",
     remediation: "No action — informational pass.",
     possible_severities: &[Severity::Pass],

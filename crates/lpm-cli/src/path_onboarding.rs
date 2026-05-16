@@ -5,7 +5,7 @@
 //! directory is on the user's `$PATH`. Without proactive guidance the
 //! user types `eslint`, gets "command not found," and has no idea why.
 //!
-//! M3.6 adds a one-time banner that:
+//! Adds a one-time banner that:
 //!
 //! 1. Detects whether `bin_dir` is already on `$PATH`.
 //! 2. If on PATH: silently writes the marker so we never nag again,
@@ -100,7 +100,7 @@ impl ShellKind {
     /// PowerShell is cross-platform — `$Env:PATH` uses `:` on
     /// Unix-like hosts and `;` on Windows. We use the platform PATH
     /// separator constant so a Unix user running `pwsh` gets a
-    /// command they can actually paste (M3.6 audit Finding 2). For
+    /// command they can actually paste (Audit Finding 2). For
     /// `Cmd` we hardcode `;` because `cmd.exe` only runs on Windows.
     fn export_line(self, bin_dir: &Path) -> String {
         let p = bin_dir.display();
@@ -131,7 +131,7 @@ pub fn detect_shell_kind_from_env(shell_env: Option<&str>) -> ShellKind {
 ///    interactive shell of record on Unix-likes (and on Windows/WSL).
 /// 2. `$PSModulePath` set → PowerShell. Set by `pwsh` on every
 ///    platform whenever a session is running, including native
-///    Windows where `$SHELL` is typically unset (M3.6 audit Finding 1).
+///    Windows where `$SHELL` is typically unset (Audit Finding 1).
 /// 3. `$ComSpec` ends in `cmd.exe` → Cmd. Default on Windows when
 ///    not running from PowerShell.
 /// 4. Nothing else matched → `Unknown`. The banner falls back to a
@@ -373,7 +373,7 @@ mod tests {
         );
     }
 
-    // ─── M3.6 audit Finding 1: Windows fallback ──────────────────────
+    // ─── Audit Finding 1: Windows fallback ──────────────────────
     //
     // Pre-fix, `detect_shell_kind` only consulted `$SHELL`. On a
     // default Windows host `$SHELL` is typically unset, so detection
@@ -493,7 +493,7 @@ mod tests {
         assert!(unknown.contains("/home/user/.lpm/bin"));
     }
 
-    /// M3.6 audit Finding 2: pwsh is cross-platform, so its export line
+    /// Audit: Finding 2: pwsh is cross-platform, so its export line
     /// MUST use the platform's actual PATH separator, not a hardcoded
     /// `;`. On Unix-like hosts a Unix-running pwsh user copy-pasted a
     /// command with `;` instead of `:` and got a broken `$Env:PATH`.

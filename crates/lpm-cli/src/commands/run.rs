@@ -1527,8 +1527,8 @@ pub async fn dlx(
     extra_args: &[String],
     refresh: bool,
 ) -> Result<(), LpmError> {
-    // M2.3: route through the IsolatedInstall primitive.
-    // Behavior is byte-for-byte identical to the pre-M2 dlx path —
+    // route through the IsolatedInstall primitive.
+    // Behavior is byte-for-byte identical to the prior dlx path —
     // primitive owns the policy decisions (freshness, manifest text,
     // restricted perms, touch semantics).
     let cache_dir = lpm_runner::dlx::dlx_cache_dir(package_spec)?;
@@ -1543,7 +1543,7 @@ pub async fn dlx(
     if !refresh && was_ready {
         // Hit path: nothing to log, falls through to touch+exec.
     } else if !refresh && !install.root().join("node_modules/.bin").is_dir() {
-        // First install or evicted entry — silent install (matches pre-M2).
+        // First install or evicted entry — silent install (matches prior dlx behavior).
     } else if !refresh {
         // Markers present but TTL expired — be loud about the reinstall.
         output::info(&format!(
@@ -1582,7 +1582,7 @@ pub async fn dlx(
             None,  // advisor_override: `lpm dlx` does not expose `--advisor`
             None,  // min_release_age_override: `lpm dlx` uses the chain
             crate::provenance_fetch::DriftIgnorePolicy::default(), // drift-ignore: `lpm dlx` enforces drift
-            // rework: dlx does not surface its own
+            // dlx does not surface its own
             // sandbox-mode flags. The env / config / default chain
             // inside `rebuild::run` still applies.
             false, // strict_sandbox

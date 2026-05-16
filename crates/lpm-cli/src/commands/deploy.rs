@@ -216,12 +216,12 @@ fn copy_member_source_recursive(
 }
 
 /// Resolved deploy plan: which member to deploy and where it lives on disk.
-/// Returned by [`resolve_deploy_target`] and consumed by the M3-M5 pipeline.
+/// Returned by [`resolve_deploy_target`] and consumed by the deploy pipeline.
 #[derive(Debug, Clone)]
 pub(crate) struct DeployPlan {
-    /// Path to the source member's `package.json`. Read by M4 (manifest
-    /// rewrite) — currently `#[allow(dead_code)]` until M4 lands.
-    #[allow(dead_code)] // wired in M4
+    /// Path to the source member's `package.json`. Read during manifest
+    /// rewrite.
+    #[allow(dead_code)]
     pub member_manifest: PathBuf,
     /// Path to the source member's directory (`member_manifest.parent()`).
     pub member_dir: PathBuf,
@@ -232,7 +232,7 @@ pub(crate) struct DeployPlan {
 /// Resolve the deploy target from CLI flags and validate the output directory.
 ///
 /// Returns a [`DeployPlan`] on success, or an actionable [`LpmError::Script`]
-/// describing what's wrong. Validation rules (per status doc §M2):
+/// describing what's wrong. Validation rules:
 ///
 /// - `--filter` must be non-empty
 /// - `--filter` must match exactly one workspace member
@@ -432,8 +432,8 @@ fn rewrite_workspace_protocol_in_deploy_manifest(
     source_cwd: &Path,
 ) -> Result<usize, LpmError> {
     // Discover the source workspace from the original cwd. The deploy
-    // output dir is intentionally outside the workspace tree (M2 enforces
-    // this), so we can't discover from there.
+    // output dir is intentionally outside the workspace tree (enforced
+    // at target resolution), so we can't discover from there.
     let workspace = lpm_workspace::discover_workspace(source_cwd)
         .map_err(|e| LpmError::Script(format!("workspace discovery failed: {e}")))?
         .ok_or_else(|| {
@@ -491,7 +491,7 @@ fn rewrite_workspace_protocol_in_deploy_manifest(
     // read-only-on-source invariant, we must `remove_file` first to
     // unlink the path from the shared inode, then write a fresh file.
     // This guarantees the source manifest is byte-identical even if the
-    // M3 copy used a hardlink fast path.
+    // file copy used a hardlink fast path.
     if total_rewritten > 0 {
         let updated = serde_json::to_string_pretty(&doc)
             .map_err(|e| LpmError::Script(format!("failed to serialize deploy manifest: {e}")))?;
@@ -593,7 +593,7 @@ fn read_member_name(manifest_path: &Path) -> String {
 
 /// Run the `lpm deploy` command.
 ///
-/// **M5 status:** all four steps wired — target resolution, source file
+/// All four steps are wired — target resolution, source file
 /// copy, manifest rewrite, and install pipeline at the deploy output dir.
 ///
 /// In `--json` mode the deploy command produces a deploy-specific summary
@@ -736,7 +736,7 @@ pub async fn run(
         // trustedDependencies the project defined, so legitimately-
         // identical identities pass normally.
         crate::provenance_fetch::DriftIgnorePolicy::default(),
-        // rework: `lpm deploy` does not surface its own
+        // `lpm deploy` does not surface its own
         // sandbox-mode flags. CI deployers can still flip strict
         // via `LPM_STRICT_SANDBOX=1`; the env tier of the chain
         // inside `rebuild::run` honors that.
@@ -836,7 +836,7 @@ mod tests {
         }
     }
 
-    // ── M1 entry-point guard tests ─────────────────────────────────────────
+    // ── entry-point guard tests ─────────────────────────────────────────
 
     #[tokio::test]
     async fn run_returns_error_when_filters_empty() {
@@ -860,7 +860,7 @@ mod tests {
         );
     }
 
-    // ── M2 target resolution tests ─────────────────────────────────────────
+    // ── target resolution tests ─────────────────────────────────────────
 
     #[test]
     fn resolve_deploy_target_with_filter_matching_one_member_succeeds() {
@@ -1142,7 +1142,7 @@ mod tests {
         );
     }
 
-    // ── M2 dry-run tests ───────────────────────────────────────────────────
+    // ── dry-run tests ───────────────────────────────────────────────────
 
     #[tokio::test]
     async fn run_dry_run_succeeds_after_target_resolution() {
@@ -1195,12 +1195,12 @@ mod tests {
         assert!(result.unwrap_err().to_string().contains("matched no"));
     }
 
-    // ── M5 end-to-end (no-deps fixture) ────────────────────────────────────
+    // ── end-to-end (no-deps fixture) ────────────────────────────────────
     //
     // The install pipeline at the deploy output dir runs for real. We test
     // it against fixtures that have empty `dependencies` so the resolver
     // hits the no-deps short-circuit and returns success without any
-    // network calls. The M3-fix to the empty-deps early return makes this
+    // network calls. The fix to the empty-deps early return makes this
     // path emit a clean JSON success object.
 
     #[tokio::test]
@@ -1535,7 +1535,7 @@ mod tests {
         assert_eq!(name, "@scope/api");
     }
 
-    // ── M6 end-to-end integration: deny list + rewrite together ────────────
+    // ── end-to-end integration: deny list + rewrite together ────────────
 
     #[tokio::test]
     async fn run_e2e_combines_deny_list_and_manifest_rewrite() {
@@ -1583,7 +1583,7 @@ mod tests {
             std::fs::read(workspace_root.join("packages/api/package.json")).unwrap();
 
         // Run deploy. This will fail at the install pipeline step because
-        // @scope/auth isn't in the registry, but the M3+M4 work runs first.
+        // @scope/auth isn't in the registry, but the copy + rewrite steps run first.
         let output_parent = tempfile::tempdir().unwrap();
         let output = output_parent.path().join("prod-api");
         let _ = run(
@@ -1648,7 +1648,7 @@ mod tests {
         );
     }
 
-    // ── M4 manifest rewrite tests ──────────────────────────────────────────
+    // ── manifest rewrite tests ──────────────────────────────────────────
 
     /// Helper: build a fixture workspace with two members where one depends
     /// on the other via workspace:*. Returns the workspace root path.
@@ -1861,7 +1861,7 @@ mod tests {
 
     #[test]
     fn rewrite_workspace_protocol_breaks_hardlinks_to_protect_source() {
-        // CRITICAL BUG REGRESSION (M5 audit during initial development):
+        // CRITICAL BUG REGRESSION (found during initial development):
         //
         // copy_member_source uses hardlinks for performance. A hardlinked
         // package.json in the deploy output dir SHARES THE SAME INODE as
@@ -2030,7 +2030,7 @@ mod tests {
         assert!(err.to_string().contains("read deploy manifest"));
     }
 
-    // ── M3 source file copier tests ────────────────────────────────────────
+    // ── source file copier tests ────────────────────────────────────────
     //
     // These tests focus on the security boundary (the deny list) and the
     // happy paths. The negative assertions are the load-bearing ones —

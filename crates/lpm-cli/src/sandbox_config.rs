@@ -93,7 +93,7 @@ pub fn load_sandbox_options_with_mode(
     Ok(merge(project, global))
 }
 
-/// rework: resolve the FULL precedence chain into a
+/// resolve the FULL precedence chain into a
 /// concrete sandbox mode. Highest priority first:
 ///
 /// 1. CLI flag (`no_sandbox_flag` / `strict_sandbox_flag`). Caller
@@ -165,7 +165,7 @@ fn env_strict_sandbox_set() -> bool {
 #[derive(Debug, Default, PartialEq, Eq, Clone)]
 struct RawSandboxKeys {
     allow_degraded: Option<bool>,
-    /// rework: `[sandbox] mode = "default" | "strict" |
+    /// `[sandbox] mode = "default" | "strict" |
     /// "none"`. The wizard (`lpm config sandbox`) writes this key;
     /// the install pipeline reads it and resolves the precedence
     /// chain (CLI flag > env > project lpm.toml > user
@@ -248,7 +248,7 @@ fn read_sandbox_keys_from_file(path: &Path) -> Result<RawSandboxKeys, LpmError> 
             })?);
         }
 
-        // rework: `[sandbox] mode = "default" | "strict"
+        // `[sandbox] mode = "default" | "strict"
         // | "none"`. Reject unknown strings explicitly — silently
         // ignoring would mask a typo and the user would never
         // know why strict mode wasn't engaging.
@@ -276,7 +276,7 @@ fn read_sandbox_keys_from_file(path: &Path) -> Result<RawSandboxKeys, LpmError> 
 /// Merge project + global raw keys into the final [`SandboxOptions`].
 /// Project values win over global; both fall through to defaults.
 ///
-/// rework: emits `(SandboxOptions, ResolvedSandboxMode)`
+/// emits `(SandboxOptions, ResolvedSandboxMode)`
 /// so the install pipeline knows BOTH the `deny_outbound_network`
 /// the constructor consumes AND whether the user picked `none`
 /// (in which case the caller switches `SandboxMode` to `Disabled`
@@ -302,7 +302,7 @@ fn merge(project: RawSandboxKeys, global: RawSandboxKeys) -> (SandboxOptions, Re
     (options, resolved)
 }
 
-/// rework: the user-facing sandbox mode resolved from the
+/// the user-facing sandbox mode resolved from the
 /// precedence chain. The CLI surface speaks this enum; the
 /// constructor accepts the `(SandboxMode, SandboxOptions)` pair.
 ///
@@ -611,7 +611,7 @@ allow-degraded = "maybe"
 
     #[test]
     fn merge_default_is_default_when_both_tiers_absent() {
-        // rework: when neither tier sets a value, the
+        // when neither tier sets a value, the
         // user is on the relaxed default — sandbox active, network
         // allowed.
         let (options, mode) = merge(RawSandboxKeys::default(), RawSandboxKeys::default());
