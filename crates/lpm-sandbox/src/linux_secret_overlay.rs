@@ -333,7 +333,12 @@ pub(crate) unsafe fn apply_secret_overlay_in_child(spec: &SecretOverlaySpec) {
     // for the namespace.
     const SETGROUPS_DENY: &[u8] = b"deny";
     const SETGROUPS_PATH: &[u8] = b"/proc/self/setgroups\0";
-    if !unsafe { write_proc_file_assafe(SETGROUPS_PATH.as_ptr() as *const libc::c_char, SETGROUPS_DENY) } {
+    if !unsafe {
+        write_proc_file_assafe(
+            SETGROUPS_PATH.as_ptr() as *const libc::c_char,
+            SETGROUPS_DENY,
+        )
+    } {
         return;
     }
 
@@ -342,10 +347,20 @@ pub(crate) unsafe fn apply_secret_overlay_in_child(spec: &SecretOverlaySpec) {
     // bytes were built parent-side.
     const UID_MAP_PATH: &[u8] = b"/proc/self/uid_map\0";
     const GID_MAP_PATH: &[u8] = b"/proc/self/gid_map\0";
-    if !unsafe { write_proc_file_assafe(UID_MAP_PATH.as_ptr() as *const libc::c_char, &spec.uid_map_bytes) } {
+    if !unsafe {
+        write_proc_file_assafe(
+            UID_MAP_PATH.as_ptr() as *const libc::c_char,
+            &spec.uid_map_bytes,
+        )
+    } {
         return;
     }
-    if !unsafe { write_proc_file_assafe(GID_MAP_PATH.as_ptr() as *const libc::c_char, &spec.gid_map_bytes) } {
+    if !unsafe {
+        write_proc_file_assafe(
+            GID_MAP_PATH.as_ptr() as *const libc::c_char,
+            &spec.gid_map_bytes,
+        )
+    } {
         return;
     }
 

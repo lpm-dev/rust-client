@@ -945,6 +945,21 @@ pub async fn run(
                             let gitlab_host = gl_cfg
                                 .and_then(|c| c.registry.as_deref())
                                 .unwrap_or("https://gitlab.com");
+                            // H18: a project lpm.json can override the
+                            // gitlab host while still naming `gitlab`
+                            // as a publish target; the GITLAB_TOKEN
+                            // then flows to the overridden host. Warn
+                            // loudly when the resolved host is not
+                            // the default; the operator sees the
+                            // redirect target in logs before the
+                            // bearer is sent.
+                            if gitlab_host.trim_end_matches('/') != "https://gitlab.com" {
+                                tracing::warn!(
+                                    target_url = %gitlab_host,
+                                    "publish.gitlab.registry overridden — GitLab token will be sent to a non-default host; \
+                                     confirm this is intentional",
+                                );
+                            }
                             let url = format!(
                                 "{}/api/v4/projects/{}/packages/npm",
                                 gitlab_host.trim_end_matches('/'),

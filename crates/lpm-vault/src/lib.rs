@@ -34,6 +34,12 @@ use std::collections::HashMap;
 use std::path::Path;
 
 fn force_file_vault_backend() -> bool {
+    // Release builds always use the OS keychain — env contamination
+    // must not be able to redirect vault writes into a plain-file
+    // fallback that's then brute-forceable under fast-scrypt.
+    if !cfg!(debug_assertions) {
+        return false;
+    }
     matches!(
         std::env::var("LPM_FORCE_FILE_VAULT").as_deref(),
         Ok("1") | Ok("true") | Ok("TRUE") | Ok("yes") | Ok("YES")

@@ -1832,9 +1832,18 @@ fn parse_trusted_scopes(project_dir: &Path) -> Vec<String> {
 /// existing tests is preserved.
 fn name_matches_trusted_scope(package_name: &str, scopes: &[String]) -> bool {
     for pattern in scopes {
-        // Simple glob matching: "@myorg/*" matches "@myorg/anything"
+        // Simple glob matching: `@myorg/*` matches `@myorg/anything`.
+        //
+        // H15: pre-fix used `starts_with(prefix)` which also matched
+        // `@myorg-evil/pkg` against `@myorg` — a lookalike-scope
+        // bypass of the lifecycle approval gate. Require the prefix
+        // to be followed by exactly `/` so only members of `@myorg`
+        // itself qualify, never a `@myorg<suffix>` scope.
         if let Some(prefix) = pattern.strip_suffix("/*") {
-            if package_name.starts_with(prefix) && package_name.len() > prefix.len() + 1 {
+            if let Some(rest) = package_name.strip_prefix(prefix)
+                && let Some(after_sep) = rest.strip_prefix('/')
+                && !after_sep.is_empty()
+            {
                 return true;
             }
         } else if pattern == package_name {
@@ -5797,5 +5806,41 @@ mod tests {
             fallback.starts_with("/proj/node_modules/.bin:/usr/bin:/bin"),
             "fallback must keep the historical POSIX shape: {fallback}"
         );
+    }
+
+    /// H15: `@myorg/*` glob must match exactly the `@myorg` scope —
+    /// `@myorg-evil/pkg` is a different scope and must NOT inherit
+    /// the trust. Pre-fix the `starts_with("@myorg")` check let a
+    /// lookalike scope bypass the lifecycle approval gate.
+    #[test]
+    fn trusted_scope_glob_requires_exact_scope_boundary() {
+        let scopes = vec!["@myorg/*".to_string()];
+
+        // Real members of the trusted scope.
+        assert!(name_matches_trusted_scope("@myorg/build-helper", &scopes));
+        assert!(name_matches_trusted_scope("@myorg/x", &scopes));
+
+        // Lookalike scopes that previously matched via starts_with —
+        // must NOT match after the fix.
+        assert!(
+            !name_matches_trusted_scope("@myorg-evil/pkg", &scopes),
+            "@myorg-evil is a distinct scope and must not inherit @myorg trust",
+        );
+        assert!(
+            !name_matches_trusted_scope("@myorganization/pkg", &scopes),
+            "@myorganization is a distinct scope and must not inherit @myorg trust",
+        );
+        assert!(
+            !name_matches_trusted_scope("@myorg", &scopes),
+            "bare `@myorg` (no member) must not match `@myorg/*`",
+        );
+    }
+
+    #[test]
+    fn trusted_scope_exact_pattern_still_matches() {
+        let scopes = vec!["exact-pkg".to_string()];
+        assert!(name_matches_trusted_scope("exact-pkg", &scopes));
+        assert!(!name_matches_trusted_scope("exact-pkg-evil", &scopes));
+        assert!(!name_matches_trusted_scope("other-pkg", &scopes));
     }
 }

@@ -43,6 +43,12 @@ const KEYCHAIN_SERVICE: &str = "lpm-cli";
 const KEYCHAIN_ACCOUNT_PREFIX: &str = "auth-token";
 
 fn force_file_auth() -> bool {
+    // Release binaries always use the OS keychain — env contamination
+    // (`.envrc`, CI vars, wrapper script) must not be able to coerce
+    // a shipped lpm into the file-backed auth path.
+    if !cfg!(debug_assertions) {
+        return false;
+    }
     matches!(
         std::env::var("LPM_FORCE_FILE_AUTH").ok().as_deref(),
         Some("1") | Some("true") | Some("TRUE")
@@ -50,6 +56,12 @@ fn force_file_auth() -> bool {
 }
 
 fn use_fast_test_scrypt() -> bool {
+    // Release binaries must never drop the scrypt N=2^20 KDF cost.
+    // If env contamination flipped this on, the on-disk credential
+    // blob becomes brute-forceable in seconds after the next re-encrypt.
+    if !cfg!(debug_assertions) {
+        return false;
+    }
     matches!(
         std::env::var("LPM_TEST_FAST_SCRYPT").ok().as_deref(),
         Some("1") | Some("true") | Some("TRUE")
