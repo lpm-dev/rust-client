@@ -876,14 +876,69 @@ fn create_root_symlinks(
 /// - `Some([…])` — explicit list of root names.
 /// - `None` + direct dep — single root symlink at `[name]`.
 /// - `None` + transitive — empty.
+///
+/// Filters out any name that contains a path separator or `..`
+/// component — a resolver bug (or, worst case, attacker-influenced
+/// `root_link_names` data on a future code path) could otherwise
+/// land symlink slots outside `<project>/node_modules/`. The root-
+/// symlink writer at the call site does `remove_dir_all` on the
+/// computed `link_path` before creating the symlink, so a traversal
+/// here would `remove_dir_all` an arbitrary path. Refuse-and-warn is
+/// the same posture used by the v1 bin emitter and v2's bin loop
+/// (see [`crate::validate_bin_name`]).
 fn root_link_names(target: &LinkTarget) -> Vec<String> {
-    if let Some(names) = &target.root_link_names {
+    let raw: Vec<String> = if let Some(names) = &target.root_link_names {
         names.clone()
     } else if target.is_direct {
         vec![target.name.clone()]
     } else {
         Vec::new()
+    };
+    raw.into_iter()
+        .filter(|name| {
+            if is_safe_root_link_name(name) {
+                true
+            } else {
+                tracing::warn!(
+                    "v2 linker: rejecting unsafe root_link_name {name:?} for {}@{} \
+                     — contains path separator, traversal, or null byte",
+                    target.name,
+                    target.version
+                );
+                false
+            }
+        })
+        .collect()
+}
+
+/// Reject root-symlink names whose components could escape the
+/// project's `node_modules/` directory: empty, `..`, anything with a
+/// `/`/`\\` separator or null byte. Scoped names like `@scope/pkg`
+/// are intentionally accepted — the writer handles their
+/// `@scope/` parent dir creation explicitly.
+fn is_safe_root_link_name(name: &str) -> bool {
+    if name.is_empty() || name.contains('\0') {
+        return false;
     }
+    // Scoped names are exactly `@<scope>/<pkg>`; only `/`-counts >1
+    // or backslashes (any) signal escape.
+    if name.contains('\\') {
+        return false;
+    }
+    let slash_count = name.matches('/').count();
+    if slash_count > 1 {
+        return false;
+    }
+    if slash_count == 1 && !name.starts_with('@') {
+        return false;
+    }
+    // Reject path components that are exactly `..` (anywhere in the name).
+    for component in name.split('/') {
+        if component == ".." || component == "." || component.is_empty() {
+            return false;
+        }
+    }
+    true
 }
 
 /// `.bin/` shim creation for the v2 layout. Walks each direct dep's
@@ -1944,5 +1999,87 @@ mod tests {
                 "shim must be a symlink",
             );
         }
+    }
+
+    /// M16: the root-symlink writer does `remove_dir_all(&link_path)`
+    /// before creating the symlink, where `link_path` is
+    /// `<project>/node_modules/<root_link_name>`. A `..` in the
+    /// name would escape `node_modules/` and delete arbitrary
+    /// content. `root_link_names` now filters such names with a
+    /// warn-and-continue posture.
+    #[test]
+    fn root_link_names_rejects_path_traversal_components() {
+        let bad = [
+            "..",
+            "../escape",
+            "scope/../escape",
+            "deep/../../escape",
+            "with\\backslash",
+            "with\0null",
+            "",
+        ];
+        for name in bad {
+            assert!(
+                !is_safe_root_link_name(name),
+                "name {name:?} must be rejected as unsafe",
+            );
+        }
+    }
+
+    /// Positive baseline: legitimate names (plain + scoped) are
+    /// accepted so the filter doesn't over-reject.
+    #[test]
+    fn root_link_names_accepts_plain_and_scoped_names() {
+        for name in ["react", "lodash", "@scope/foo", "@a/b", "a-package_name"] {
+            assert!(
+                is_safe_root_link_name(name),
+                "name {name:?} must be accepted",
+            );
+        }
+    }
+
+    /// End-to-end through link_packages_v2: a target whose
+    /// `root_link_names` contains `..` MUST NOT create a symlink
+    /// outside `<project>/node_modules/`. Pre-fix this would have
+    /// landed a `remove_dir_all` against the escaped path.
+    #[test]
+    fn link_packages_v2_skips_root_symlink_when_name_contains_traversal() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = V2Store::at(tmp.path().join("store"));
+        let project = tmp.path().join("project");
+        std::fs::create_dir_all(&project).unwrap();
+
+        let sri = synthetic_sri(b"v2/root_link_traversal");
+        write_object(
+            &store,
+            &sri,
+            &[("package.json", b"{\"name\":\"safe\",\"version\":\"1.0.0\"}")],
+        );
+
+        let mut t = target("safe", "1.0.0", &sri, true);
+        t.target.root_link_names = Some(vec!["../escape".into(), "safe".into()]);
+
+        let result =
+            link_packages_v2(&project, vec![t], &store, LinkerMode::Isolated, None).unwrap();
+
+        // Only the safe `safe` symlink should land — the `../escape`
+        // entry filtered out by root_link_names.
+        assert_eq!(
+            result.symlinked, 1,
+            "exactly one (safe) root symlink should land",
+        );
+        assert!(
+            project
+                .join("node_modules")
+                .join("safe")
+                .symlink_metadata()
+                .is_ok(),
+            "safe root symlink must exist",
+        );
+        // The escape path must not have been touched.
+        assert!(
+            !project.join("escape").exists(),
+            "no `escape` entry should be created outside node_modules",
+        );
     }
 }

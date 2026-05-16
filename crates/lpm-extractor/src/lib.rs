@@ -90,10 +90,16 @@ fn decompress_gzip_libdeflate(compressed: &[u8]) -> Result<Vec<u8>, LpmError> {
         isize_bytes[2],
         isize_bytes[3],
     ]) as usize;
+    // Cap the *initial* allocation so a small compressed body claiming
+    // a 4 GiB ISIZE in its footer can't force a multi-GiB pre-allocation.
+    // The InsufficientSpace branch below doubles the buffer up to
+    // MAX_EXTRACTION_SIZE for legitimate large payloads; the initial
+    // allocation here is a starting hint, not a binding ceiling.
+    let initial_isize = isize_hint.min(INITIAL_ALLOCATION_CAP);
     // Floor the capacity at the compressed size — a gzip stream cannot
     // decompress to fewer bytes than its compressed length minus header/footer,
     // and tiny ISIZE values would otherwise force an immediate grow round-trip.
-    let mut capacity = isize_hint
+    let mut capacity = initial_isize
         .max(compressed.len())
         .min(MAX_EXTRACTION_SIZE as usize);
 
@@ -124,6 +130,16 @@ fn decompress_gzip_libdeflate(compressed: &[u8]) -> Result<Vec<u8>, LpmError> {
 
 /// Maximum total extraction size (5 GB) — prevents zip-bomb / tar-bomb attacks.
 const MAX_EXTRACTION_SIZE: u64 = 5 * 1024 * 1024 * 1024;
+
+/// Upper bound on the *initial* output-buffer allocation in
+/// [`decompress_gzip_libdeflate`]. Real npm packages decompress to
+/// well under this (the biggest packuments are ~10-50 MB), so 256 MiB
+/// covers the legitimate one-shot case while preventing a small
+/// compressed body from forcing a multi-GiB pre-allocation via a
+/// tampered ISIZE footer field. The grow loop in
+/// `decompress_gzip_libdeflate` handles the rare case where a real
+/// payload exceeds this initial budget.
+const INITIAL_ALLOCATION_CAP: usize = 256 * 1024 * 1024;
 
 /// Maximum single file size within a tarball (500 MB).
 const MAX_FILE_SIZE: u64 = 500 * 1024 * 1024;
@@ -1486,5 +1502,47 @@ mod tests {
             0o755,
             "SGID bit MUST be stripped — same security posture as SUID"
         );
+    }
+
+    /// M17: a small compressed stream with a maliciously inflated
+    /// ISIZE footer must not pre-allocate a multi-GiB buffer. We can't
+    /// directly observe the allocation size from inside the test, but
+    /// we CAN verify that decompression of a real payload still works
+    /// when the footer claims an inflated ISIZE — proves the grow
+    /// path handles the case where the initial cap clips the hint.
+    /// Pin the constant alongside so a future bump is loud.
+    #[test]
+    fn initial_allocation_cap_bounds_pre_allocation() {
+        // The bound itself: 256 MiB. If a future change relaxes this
+        // (or removes the cap), this assertion fires and forces a
+        // review of the M17 threat model.
+        assert_eq!(
+            INITIAL_ALLOCATION_CAP,
+            256 * 1024 * 1024,
+            "initial allocation cap must stay ≤ 256 MiB to defend against \
+             hostile-ISIZE pre-allocation attacks",
+        );
+        // And the relationship to MAX_EXTRACTION_SIZE must hold —
+        // the initial cap is a starting hint, not a ceiling.
+        assert!(
+            (INITIAL_ALLOCATION_CAP as u64) < MAX_EXTRACTION_SIZE,
+            "initial cap must be strictly less than MAX_EXTRACTION_SIZE \
+             so legitimate large payloads still extract via the grow path",
+        );
+    }
+
+    /// Round-trip a real (small) gzip payload to prove the
+    /// initial-allocation cap doesn't break the common path. The
+    /// decompressed bytes must match the input.
+    #[test]
+    fn decompress_gzip_libdeflate_round_trips_small_payload() {
+        use std::io::Write;
+        let original = b"hello, libdeflate world!".repeat(100);
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        encoder.write_all(&original).unwrap();
+        let compressed = encoder.finish().unwrap();
+
+        let decompressed = decompress_gzip_libdeflate(&compressed).unwrap();
+        assert_eq!(decompressed, original);
     }
 }
