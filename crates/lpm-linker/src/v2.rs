@@ -65,7 +65,9 @@ use lpm_store::v2::{
     DepLink, GraphKey, LinkEntryRequest, LinkMetaPlatform, LinkerModeTag, PlatformTuple, Store,
 };
 
-use crate::{LinkResult, LinkTarget, LinkerMode, MaterializedPackage};
+use crate::{
+    LinkResult, LinkTarget, LinkerMode, MaterializedPackage, validate_bin_name, validate_bin_target,
+};
 
 /// One LinkTarget plus the source SRI needed to resolve its v2 object
 /// directory. The install pipeline carries the SRI via
@@ -964,21 +966,43 @@ fn create_bin_links_v2(
         })?;
 
         for (cmd_name, bin_rel_path) in entries {
-            // Strip the conventional `bin/` slash prefix on a sub-path
-            // to keep the shim target as the actual file inside the
-            // package dir. The v1 helper does the same.
-            bin_target.clear();
-            bin_target.push(&pkg_dir);
-            bin_target.push(&bin_rel_path);
-            if !bin_target.exists() {
-                tracing::debug!(
-                    "v2 linker: bin script {} for {}/{} missing — skipping shim",
-                    bin_target.display(),
-                    v2t.target.name,
-                    cmd_name
+            // Reject bin entries whose key would write outside `.bin/`
+            // or shadow path components — same bar as v1's hoisted
+            // emitter (lib.rs). Warn-and-skip rather than fail-install
+            // so one malformed entry doesn't abort the whole link.
+            if let Err(reason) = validate_bin_name(&cmd_name, &v2t.target.name) {
+                tracing::warn!(
+                    "v2 linker: rejecting bin \"{cmd_name}\" from {}: {reason}",
+                    v2t.target.name
                 );
                 continue;
             }
+
+            // Use validate_bin_target as a *guard only* — the canonical
+            // return value is discarded. Downstream `pathdiff::diff_paths`
+            // expects bin_target and bin_dir in the same canonical
+            // (or same non-canonical) form, and v2's bin_dir is built
+            // from the raw project_dir. Mixing forms (canonical target,
+            // raw bin_dir) produces malformed symlinks on macOS, where
+            // `/var/folders/...` and `/private/var/folders/...` share no
+            // prefix until both are canonicalised.
+            //
+            // The guard call still enforces:
+            // - rejection of `..` components in script_path
+            // - rejection of bin_rel_path whose canonical resolve
+            //   escapes the package dir (e.g. via an in-package symlink
+            //   pointing outside)
+            // - rejection of missing files (canonicalize fails)
+            if let Err(reason) = validate_bin_target(&pkg_dir, &bin_rel_path) {
+                tracing::warn!(
+                    "v2 linker: rejecting bin {cmd_name} from {}: {reason}",
+                    v2t.target.name
+                );
+                continue;
+            }
+            bin_target.clear();
+            bin_target.push(&pkg_dir);
+            bin_target.push(&bin_rel_path);
             // Make the bin file executable (npm tarballs sometimes
             // ship without the +x bit). Same fix as v1.
             #[cfg(unix)]
@@ -1788,6 +1812,137 @@ mod tests {
                 "project-side root symlink for {name} must exist after parallel materialization"
             );
             assert!(link.join("package.json").is_file());
+        }
+    }
+
+    /// A package whose `bin` map keys a shim with a path-traversal
+    /// name must be skipped. v1's hoisted emitter has enforced this
+    /// since the validators were introduced; v2 (the default store
+    /// version) was the gap a malicious package could exploit to
+    /// shadow `/usr/bin` entries via `node_modules/.bin/`.
+    #[test]
+    fn v2_skips_bin_shim_when_bin_name_contains_path_traversal() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = V2Store::at(tmp.path().join("store"));
+        let project = tmp.path().join("project");
+        std::fs::create_dir_all(&project).unwrap();
+
+        let sri = synthetic_sri(b"v2/bin_name_traversal");
+        write_object(
+            &store,
+            &sri,
+            &[
+                (
+                    "package.json",
+                    br#"{"name":"a","version":"1.0.0","bin":{"../escape":"index.js"}}"#,
+                ),
+                ("index.js", b"console.log('a');"),
+            ],
+        );
+
+        let result = link_packages_v2(
+            &project,
+            vec![target("a", "1.0.0", &sri, true)],
+            &store,
+            LinkerMode::Isolated,
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(
+            result.bin_linked, 0,
+            "bin name with `..` must be rejected by validate_bin_name",
+        );
+        let bin_dir = project.join("node_modules").join(".bin");
+        if bin_dir.exists() {
+            assert!(
+                std::fs::read_dir(&bin_dir).unwrap().next().is_none(),
+                ".bin/ must stay empty when the only entry was rejected",
+            );
+        }
+    }
+
+    /// A package whose `bin` value points outside its own dir (the
+    /// classic `"bin": {"x": "../../bin/sh"}` shape) must be skipped.
+    /// `validate_bin_target` catches the `..` component in the joined
+    /// path before any symlink is created.
+    #[test]
+    fn v2_skips_bin_shim_when_bin_target_escapes_package_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = V2Store::at(tmp.path().join("store"));
+        let project = tmp.path().join("project");
+        std::fs::create_dir_all(&project).unwrap();
+
+        let sri = synthetic_sri(b"v2/bin_target_traversal");
+        write_object(
+            &store,
+            &sri,
+            &[(
+                "package.json",
+                br#"{"name":"a","version":"1.0.0","bin":{"x":"../../../bin/sh"}}"#,
+            )],
+        );
+
+        let result = link_packages_v2(
+            &project,
+            vec![target("a", "1.0.0", &sri, true)],
+            &store,
+            LinkerMode::Isolated,
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(
+            result.bin_linked, 0,
+            "bin target with `..` components must be rejected by validate_bin_target",
+        );
+        let shim = project.join("node_modules").join(".bin").join("x");
+        assert!(
+            shim.symlink_metadata().is_err(),
+            "no shim should be created for an escaping bin target",
+        );
+    }
+
+    /// Benign shape still works — proves the new validators don't
+    /// over-reject. A well-formed bin entry pointing at an in-package
+    /// file produces a `.bin/` symlink.
+    #[test]
+    fn v2_creates_bin_shim_for_well_formed_entry() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = V2Store::at(tmp.path().join("store"));
+        let project = tmp.path().join("project");
+        std::fs::create_dir_all(&project).unwrap();
+
+        let sri = synthetic_sri(b"v2/bin_ok");
+        write_object(
+            &store,
+            &sri,
+            &[
+                (
+                    "package.json",
+                    br#"{"name":"a","version":"1.0.0","bin":{"a":"cli.js"}}"#,
+                ),
+                ("cli.js", b"#!/usr/bin/env node\nconsole.log('hi');\n"),
+            ],
+        );
+
+        let result = link_packages_v2(
+            &project,
+            vec![target("a", "1.0.0", &sri, true)],
+            &store,
+            LinkerMode::Isolated,
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(result.bin_linked, 1, "well-formed bin entry must be linked");
+        #[cfg(unix)]
+        {
+            let shim = project.join("node_modules").join(".bin").join("a");
+            assert!(
+                shim.symlink_metadata().unwrap().file_type().is_symlink(),
+                "shim must be a symlink",
+            );
         }
     }
 }

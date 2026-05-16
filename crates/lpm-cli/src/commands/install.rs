@@ -13,7 +13,7 @@ use lpm_resolver::{
 use lpm_store::PackageStore;
 use lpm_workspace::PatchedDependencyEntry;
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::Mutex as AsyncMutex;
@@ -2052,6 +2052,18 @@ async fn pre_resolve_non_registry_deps(
     // same bytes dedupe. Strict-integrity has no effect here — the
     // content hash IS the integrity, computed every time.
     for (local_name, raw_path) in file_tarball_specs {
+        // Reject relative paths that escape the project root via `..`
+        // components. The lockfile parser allows the `tarball+file:`
+        // shape with `../`, so a tampered manifest could otherwise
+        // read e.g. `/etc/passwd.tgz` into the LPM CAS. Absolute paths
+        // are still accepted because they are an explicit user choice
+        // (shared CI cache, etc.) and don't constitute traversal
+        // surprise.
+        if let Err(reason) = validate_local_tarball_raw_path(&raw_path) {
+            return Err(LpmError::Registry(format!(
+                "dep '{local_name}' has invalid file: path '{raw_path}': {reason}"
+            )));
+        }
         let abs_path = project_dir.join(&raw_path);
 
         // Cap reads at lpm-extractor's hard ceiling (500 MB). A
@@ -2464,6 +2476,32 @@ fn sri_to_sha256_hex(sri: &str) -> Option<String> {
         return None;
     }
     Some(int.hash.iter().map(|b| format!("{b:02x}")).collect())
+}
+
+/// Reject a `tarball+file:<raw_path>` manifest entry whose raw path
+/// contains `..` traversal components. The lockfile parser accepts
+/// the `./` / `../` / `/` shape on this scheme; without this check a
+/// tampered manifest entry like `tarball+file:../../etc/passwd.tgz`
+/// would be read into the LPM CAS as a "package", surfacing arbitrary
+/// host-filesystem content under the store's content-addressable
+/// layout. Absolute paths are still accepted (legitimate shared-cache
+/// pattern) — they're an explicit user choice, not a traversal
+/// surprise.
+fn validate_local_tarball_raw_path(raw_path: &str) -> Result<(), String> {
+    let p = Path::new(raw_path);
+    if p.is_absolute() {
+        return Ok(());
+    }
+    for component in p.components() {
+        if component == Component::ParentDir {
+            return Err(
+                "relative file: path contains `..` component, which is not permitted; \
+                 use an absolute path if the tarball lives outside the project root"
+                    .to_string(),
+            );
+        }
+    }
+    Ok(())
 }
 
 /// Read a local file with a hard byte ceiling, returning the bytes.
@@ -11980,6 +12018,58 @@ mod tests {
     fn confirm_prompt_test_lock() -> std::sync::MutexGuard<'static, ()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
         LOCK.get_or_init(|| Mutex::new(())).lock().unwrap()
+    }
+
+    // ── local-tarball path traversal ─────────────
+
+    /// The classic exploit shape: a manifest entry like
+    /// `"foo": "file:../../../etc/passwd.tgz"` would, pre-fix, resolve
+    /// against `project_dir` and read whatever lives at the resolved
+    /// path into the LPM CAS. Rejecting `..` components at the
+    /// manifest boundary closes that door without touching the legit
+    /// `file:./local.tgz` / `file:/abs/path.tgz` shapes.
+    #[test]
+    fn validate_local_tarball_raw_path_rejects_parent_dir_components() {
+        for path in [
+            "../escape.tgz",
+            "../../escape.tgz",
+            "subdir/../../../escape.tgz",
+            "./../escape.tgz",
+        ] {
+            let err = validate_local_tarball_raw_path(path)
+                .err()
+                .unwrap_or_else(|| panic!("expected reject for {path}"));
+            assert!(err.contains("`..`"), "path {path:?} got: {err}");
+        }
+    }
+
+    #[test]
+    fn validate_local_tarball_raw_path_accepts_relative_within_project() {
+        for path in [
+            "local.tgz",
+            "./local.tgz",
+            "subdir/local.tgz",
+            "./subdir/nested/local.tgz",
+        ] {
+            assert!(
+                validate_local_tarball_raw_path(path).is_ok(),
+                "path {path:?} must be accepted"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_local_tarball_raw_path_accepts_absolute_paths() {
+        // Absolute paths are an explicit user choice (shared CI cache,
+        // CI artifact dir, etc.). The traversal-surprise risk only
+        // applies when the manifest *appears* to stay relative but
+        // sneaks out via `..`.
+        for path in ["/tmp/local.tgz", "/var/cache/lpm/foo.tgz"] {
+            assert!(
+                validate_local_tarball_raw_path(path).is_ok(),
+                "absolute path {path:?} must be accepted"
+            );
+        }
     }
 
     // ── migration tests ───────────────────────────
