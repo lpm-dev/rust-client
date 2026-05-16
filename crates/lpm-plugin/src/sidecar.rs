@@ -167,11 +167,11 @@ pub fn validate_for_reuse(
         });
     }
 
-    if matches!(
+    let unverified_override = matches!(
         sidecar.verification_source,
         VerificationSource::UnverifiedOverride
-    ) && !allow_unverified_override
-    {
+    );
+    if unverified_override && !allow_unverified_override {
         return ReuseDecision::Miss(MissReason::UnverifiedOverrideRequired);
     }
 
@@ -188,6 +188,22 @@ pub fn validate_for_reuse(
             recorded: sidecar.binary_sha256,
             observed,
         });
+    }
+
+    // L12: a sidecar tagged UnverifiedOverride was honoured. Each
+    // honoured reuse fires this warn so persistent env contamination
+    // (`LPM_ALLOW_UNVERIFIED_PLUGINS=1` left in a shell rc) shows
+    // up in trace logs every time it grants free pass, rather than
+    // being silently respected forever after the initial install.
+    if unverified_override {
+        tracing::warn!(
+            plugin = %sidecar.plugin_name,
+            version = %sidecar.version,
+            sidecar = %sidecar_path.display(),
+            "honouring unverified-override plugin sidecar (LPM_ALLOW_UNVERIFIED_PLUGINS env); \
+             confirm this is expected — a persistent env may be granting silent reuse of \
+             a binary installed without signature verification",
+        );
     }
 
     ReuseDecision::Hit

@@ -1422,7 +1422,31 @@ impl InstallPackage {
                 // `Option`-returning variant signals "not yet
                 // available" to the offline gate.
                 let abs = project_dir.join(&path);
-                abs.canonicalize().ok()
+                let canonical = abs.canonicalize().ok()?;
+                // L18: warn when the canonical resolution escapes the
+                // project tree. A `link:./packages/foo` whose target
+                // is a symlink pointing at `/etc/secret-pkg` is
+                // technically valid (the lockfile allows it) but the
+                // pattern is surprising enough — and load-bearing for
+                // any "the workspace only references content within
+                // the project tree" assumption — that it deserves a
+                // visible audit signal. Best-effort: only emit when
+                // `project_dir.canonicalize()` succeeds (it usually
+                // does; failures fall through silently).
+                if let Ok(project_canonical) = project_dir.canonicalize()
+                    && !canonical.starts_with(&project_canonical)
+                {
+                    tracing::warn!(
+                        name = %self.name,
+                        version = %self.version,
+                        link_path = %path,
+                        canonical = %canonical.display(),
+                        project_root = %project_canonical.display(),
+                        "link/directory dep resolves to a path outside the project tree \
+                         (likely via a symlink) — confirm this is intentional",
+                    );
+                }
+                Some(canonical)
             }
             _ => Some(store.package_dir(&self.name, &self.version)),
         }

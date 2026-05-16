@@ -45,6 +45,23 @@ pub fn exec_file(
     let ext = resolved.extension().and_then(|e| e.to_str()).unwrap_or("");
 
     let runtime_info = detect_runtime(ext, project_dir)?;
+    // M21: warn loudly when we're about to fetch `tsx` (and its
+    // install scripts) from npm on first use. The user invoked
+    // `lpm exec foo.ts` and got consent for the file they typed,
+    // but not for downloading and running an arbitrary npm package
+    // as a side-effect. npx — not LPM — handles the fetch, so the
+    // triage gate doesn't fire. Surface the implicit-download to
+    // stderr so an attacker who poisoned the npm-registry view of
+    // `tsx` doesn't get free RCE just because someone ran an
+    // unrelated TypeScript file.
+    if runtime_info.binary == "npx" && runtime_info.flags.first().is_some_and(|f| f == "tsx") {
+        eprintln!(
+            "warning: no managed Node >=22.6 and no local tsx — falling back to \
+             `npx tsx`, which will download tsx from npm on first use. Install a \
+             managed Node (lpm use node@22.6+) or add tsx to your project to \
+             avoid the implicit npm fetch."
+        );
+    }
     let path = bin_path::build_path_with_bins(project_dir);
     let env_vars = dotenv::load_project_env(project_dir, None)?;
 
