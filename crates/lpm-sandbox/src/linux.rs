@@ -716,6 +716,7 @@ mod tests {
             store_root: home.join(".lpm/store"),
             home_dir: home,
             tmpdir: tmp,
+            secret_read_allow: Vec::new(),
             extra_write_dirs: Vec::new(),
         }
     }
@@ -1017,6 +1018,7 @@ mod tests {
             store_root: td.path().join("store"),
             home_dir: home,
             tmpdir: PathBuf::from("/tmp"),
+            secret_read_allow: Vec::new(),
             extra_write_dirs: Vec::new(),
         };
         let sb = match new_for_platform(spec, SandboxMode::Enforce) {
@@ -1069,6 +1071,7 @@ mod tests {
             store_root: td.path().join("store"),
             home_dir: home,
             tmpdir: PathBuf::from("/tmp"),
+            secret_read_allow: Vec::new(),
             extra_write_dirs: Vec::new(),
         };
         let sb = match new_for_platform(spec, SandboxMode::Enforce) {

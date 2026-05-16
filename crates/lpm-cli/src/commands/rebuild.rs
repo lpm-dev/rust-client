@@ -826,6 +826,7 @@ async fn run_under_store_lock(
         store_root: store_root.clone(),
         home_dir: home_dir.clone(),
         tmpdir: tmpdir.clone(),
+        secret_read_allow: Vec::new(),
         extra_write_dirs: extra_write_dirs.clone(),
     };
     lpm_sandbox::prepare_writable_dirs(&prepare_spec)
@@ -865,6 +866,7 @@ async fn run_under_store_lock(
             store_root: store_root.clone(),
             home_dir: home_dir.clone(),
             tmpdir: tmpdir.clone(),
+            secret_read_allow: Vec::new(),
             extra_write_dirs: Vec::new(),
         };
         let probe_sandbox = lpm_sandbox::new_for_platform_with_options(
@@ -1463,6 +1465,7 @@ fn spawn_lifecycle_child(
         store_root: store_root.to_path_buf(),
         home_dir: home_dir.to_path_buf(),
         tmpdir: tmpdir.to_path_buf(),
+        secret_read_allow: Vec::new(),
         extra_write_dirs: extra_write_dirs.to_vec(),
     };
     // thread the resolved `[sandbox] allow-degraded`

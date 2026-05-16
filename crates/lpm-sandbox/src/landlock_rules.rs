@@ -139,6 +139,7 @@ mod tests {
             store_root: PathBuf::from("/lpm-store"),
             home_dir: PathBuf::from("/home/u"),
             tmpdir: PathBuf::from("/tmp"),
+            secret_read_allow: Vec::new(),
             extra_write_dirs: Vec::new(),
         }
     }

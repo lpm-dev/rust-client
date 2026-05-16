@@ -2487,6 +2487,7 @@ fn probe_sandbox_backend() -> Check {
         store_root: home.join(".lpm").join("store"),
         home_dir: home.clone(),
         tmpdir: tmpdir.clone(),
+        secret_read_allow: Vec::new(),
         extra_write_dirs: Vec::new(),
     };
 

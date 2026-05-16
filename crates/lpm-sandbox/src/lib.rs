@@ -191,6 +191,20 @@ pub struct SandboxSpec {
     /// sandboxWriteDirs`. Loader resolves relative paths against
     /// [`project_dir`](Self::project_dir) before constructing the spec.
     pub extra_write_dirs: Vec<PathBuf>,
+    /// Project-relative paths the user has explicitly opted in for
+    /// lifecycle-script reads despite matching the built-in secret-file
+    /// deny list (e.g. `.env`, `*.pem`, `.aws/`). Resolved to absolute
+    /// project-rooted paths by the loader. The sandbox backends omit
+    /// the deny rule / bind-mount for any path in this list.
+    ///
+    /// Empty by default. Populated from `package.json > lpm > scripts >
+    /// sandboxReadAllow` (per-project) and `~/.lpm/config.toml >
+    /// [sandbox] script-read-allow` (per-user). Same precedence and
+    /// validation shape as [`extra_write_dirs`](Self::extra_write_dirs):
+    /// every entry must canonicalize inside `project_dir`, traversal
+    /// (`..`) and absolute paths outside the project are rejected by
+    /// the loader.
+    pub secret_read_allow: Vec<PathBuf>,
 }
 
 /// Caller-tunable knobs the sandbox factory consumes alongside
@@ -1027,6 +1041,7 @@ mod tests {
             store_root: PathBuf::from(STORE_ROOT),
             home_dir: PathBuf::from(HOME_DIR),
             tmpdir: PathBuf::from(TMPDIR),
+            secret_read_allow: Vec::new(),
             extra_write_dirs: Vec::new(),
         }
     }
@@ -1187,6 +1202,7 @@ mod tests {
             store_root: tmp.path().join("store"),
             home_dir: home.clone(),
             tmpdir: tmp.path().join("tmpdir"),
+            secret_read_allow: Vec::new(),
             extra_write_dirs: vec![extra_a.clone(), extra_b.clone()],
         };
         std::fs::create_dir_all(&spec.package_dir).unwrap();
