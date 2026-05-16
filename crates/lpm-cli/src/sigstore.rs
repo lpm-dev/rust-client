@@ -23,20 +23,91 @@ const FULCIO_URL: &str = "https://fulcio.sigstore.dev";
 /// Rekor public instance.
 const REKOR_URL: &str = "https://rekor.sigstore.dev";
 
-/// Sigstore service endpoints. Injected into the signing flow so tests
-/// can substitute wiremock servers without overriding global constants.
+/// Wall-clock budget for any single Fulcio or Rekor request, including
+/// connection, TLS handshake, and the entire response body. A hostile
+/// or unreachable endpoint must surface as an error rather than wedge
+/// `lpm publish` indefinitely.
+const SIGSTORE_HTTP_TIMEOUT_SECS: u64 = 30;
+
+/// Maximum response body bytes we will buffer from Fulcio or Rekor.
+/// Real responses are kilobyte-sized; the cap exists to prevent a
+/// compromised endpoint from streaming GiB of data into our heap. Matches
+/// the cap in [`crate::provenance_fetch`] for consistency.
+const SIGSTORE_RESPONSE_CAP_BYTES: usize = 1024 * 1024;
+
+/// Sigstore service endpoints.
+///
+/// Fields are intentionally private. Only [`Self::production`] (the
+/// pinned public instance) is wired into the publish path. A future
+/// override mechanism — e.g. an `SIGSTORE_FULCIO_URL` env var — must
+/// add a new public constructor that is visible in code review,
+/// which is the gate that prevents attestation traffic from being
+/// silently redirected to an attacker-controlled host.
 pub struct SigstoreEndpoints {
-    pub fulcio: String,
-    pub rekor: String,
+    fulcio: String,
+    rekor: String,
 }
 
 impl SigstoreEndpoints {
+    /// Pinned public Sigstore instance.
     pub fn production() -> Self {
         Self {
             fulcio: FULCIO_URL.to_string(),
             rekor: REKOR_URL.to_string(),
         }
     }
+
+    /// Test-only constructor for wiremock-driven scenarios.
+    #[cfg(test)]
+    fn for_test(fulcio: String, rekor: String) -> Self {
+        Self { fulcio, rekor }
+    }
+}
+
+/// Build the HTTP client used for every Fulcio / Rekor exchange.
+/// Centralised so the wall-clock timeout cannot be omitted at any
+/// call site.
+fn sigstore_http_client() -> Result<reqwest::Client, LpmError> {
+    reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(SIGSTORE_HTTP_TIMEOUT_SECS))
+        .build()
+        .map_err(|e| LpmError::Registry(format!("failed to build Sigstore HTTP client: {e}")))
+}
+
+/// Read a response body with a two-stage size cap: reject pre-stream
+/// when `Content-Length` declares an oversized body, then reject mid-
+/// stream when accumulating chunks would cross the cap. The label
+/// (e.g. `"Fulcio"`) appears in error messages so a failure points at
+/// the right hop.
+async fn read_response_body_capped(
+    response: reqwest::Response,
+    label: &str,
+) -> Result<String, LpmError> {
+    use futures::StreamExt;
+
+    if let Some(declared) = response.content_length()
+        && declared as usize > SIGSTORE_RESPONSE_CAP_BYTES
+    {
+        return Err(LpmError::Registry(format!(
+            "{label} response declared body length {declared} exceeds cap {SIGSTORE_RESPONSE_CAP_BYTES}"
+        )));
+    }
+
+    let mut buf: Vec<u8> = Vec::with_capacity(8 * 1024);
+    let mut stream = response.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk
+            .map_err(|e| LpmError::Registry(format!("{label} response body read error: {e}")))?;
+        if buf.len().saturating_add(chunk.len()) > SIGSTORE_RESPONSE_CAP_BYTES {
+            return Err(LpmError::Registry(format!(
+                "{label} response streamed body exceeded cap {SIGSTORE_RESPONSE_CAP_BYTES}"
+            )));
+        }
+        buf.extend_from_slice(&chunk);
+    }
+
+    String::from_utf8(buf)
+        .map_err(|e| LpmError::Registry(format!("{label} response was not valid UTF-8: {e}")))
 }
 
 /// A complete Sigstore bundle ready to attach to a publish payload.
@@ -244,7 +315,7 @@ async fn fulcio_get_certificate(
     public_key_pem: &str,
     proof_b64: &str,
 ) -> Result<(String, Vec<Vec<u8>>), LpmError> {
-    let client = reqwest::Client::new();
+    let client = sigstore_http_client()?;
 
     let body = serde_json::json!({
         "credentials": {
@@ -269,7 +340,9 @@ async fn fulcio_get_certificate(
 
     if !response.status().is_success() {
         let status = response.status();
-        let text = response.text().await.unwrap_or_default();
+        let text = read_response_body_capped(response, "Fulcio")
+            .await
+            .unwrap_or_default();
         return Err(LpmError::Registry(format!(
             "Fulcio certificate exchange failed ({status}): {text}"
         )));
@@ -285,10 +358,7 @@ async fn fulcio_get_certificate(
         .unwrap_or("")
         .to_string();
 
-    let response_text = response
-        .text()
-        .await
-        .map_err(|e| LpmError::Registry(format!("Fulcio response read error: {e}")))?;
+    let response_text = read_response_body_capped(response, "Fulcio").await?;
 
     tracing::debug!("Fulcio response content-type: {content_type}");
     tracing::debug!(
@@ -301,34 +371,12 @@ async fn fulcio_get_certificate(
     // contains PEM strings that would falsely match "BEGIN CERTIFICATE".
     let (cert_pem, cert_chain_der) =
         if content_type.contains("pem") && !content_type.contains("json") {
-            // PEM chain format — split into individual certificates
-            let mut certs_pem = Vec::new();
-            let mut current = String::new();
-            let mut in_cert = false;
-
-            for line in response_text.lines() {
-                if line.contains("BEGIN CERTIFICATE") {
-                    in_cert = true;
-                    current.clear();
-                    current.push_str(line);
-                    current.push('\n');
-                } else if line.contains("END CERTIFICATE") {
-                    current.push_str(line);
-                    current.push('\n');
-                    certs_pem.push(current.clone());
-                    in_cert = false;
-                } else if in_cert {
-                    current.push_str(line);
-                    current.push('\n');
-                }
-            }
-
+            let certs_pem = split_pem_chain(&response_text)?;
             if certs_pem.is_empty() {
                 return Err(LpmError::Registry(
                     "Fulcio returned empty certificate chain".into(),
                 ));
             }
-
             let first_pem = certs_pem[0].clone();
             let ders: Result<Vec<Vec<u8>>, _> = certs_pem.iter().map(|p| pem_to_der(p)).collect();
             (first_pem, ders?)
@@ -382,7 +430,7 @@ async fn rekor_upload(
     envelope: &DsseEnvelope,
     cert_pem: &str,
 ) -> Result<TlogEntry, LpmError> {
-    let client = reqwest::Client::new();
+    let client = sigstore_http_client()?;
 
     use sha2::{Digest, Sha256};
 
@@ -448,15 +496,16 @@ async fn rekor_upload(
 
     if !response.status().is_success() {
         let status = response.status();
-        let text = response.text().await.unwrap_or_default();
+        let text = read_response_body_capped(response, "Rekor")
+            .await
+            .unwrap_or_default();
         return Err(LpmError::Registry(format!(
             "Rekor transparency log upload failed ({status}): {text}"
         )));
     }
 
-    let result: serde_json::Value = response
-        .json()
-        .await
+    let response_text = read_response_body_capped(response, "Rekor").await?;
+    let result: serde_json::Value = serde_json::from_str(&response_text)
         .map_err(|e| LpmError::Registry(format!("Rekor response parse error: {e}")))?;
 
     // Rekor returns { "uuid": { ...entry } } — one entry
@@ -535,16 +584,126 @@ fn extract_jwt_subject(jwt: &str) -> Result<String, LpmError> {
         .ok_or_else(|| LpmError::Registry("JWT missing 'sub' claim".into()))
 }
 
-/// Decode a PEM-encoded certificate to DER bytes.
+/// Decode a single PEM-encoded `CERTIFICATE` block to DER bytes.
+///
+/// Strict parser: rejects PEMs whose label is anything other than
+/// `CERTIFICATE` (so a `PRIVATE KEY` or `SIGNATURE` block can't sneak
+/// past as a cert), refuses any non-blank content between the END
+/// marker and EOF, and refuses any other `-----LABEL-----` line inside
+/// the body. The previous implementation simply stripped every line
+/// starting with `-----` and base64-decoded the rest, which let a
+/// hostile Fulcio response smuggle bytes into the DER by interleaving
+/// extra labels or trailing content.
 fn pem_to_der(pem: &str) -> Result<Vec<u8>, LpmError> {
-    let content: String = pem
-        .lines()
-        .filter(|line| !line.starts_with("-----"))
-        .collect();
+    const BEGIN: &str = "-----BEGIN CERTIFICATE-----";
+    const END: &str = "-----END CERTIFICATE-----";
+
+    let mut lines = pem.lines();
+
+    let begin = lines
+        .by_ref()
+        .map(str::trim_end)
+        .find(|l| !l.is_empty())
+        .ok_or_else(|| LpmError::Registry("PEM input is empty".into()))?;
+    if begin != BEGIN {
+        return Err(LpmError::Registry(format!(
+            "expected `{BEGIN}`, got `{begin}`"
+        )));
+    }
+
+    let mut body = String::new();
+    let mut saw_end = false;
+    for line in lines.by_ref() {
+        let trimmed = line.trim_end();
+        if trimmed == END {
+            saw_end = true;
+            break;
+        }
+        if trimmed.is_empty() {
+            continue;
+        }
+        if trimmed.starts_with("-----") {
+            return Err(LpmError::Registry(format!(
+                "unexpected PEM marker inside CERTIFICATE body: `{trimmed}`"
+            )));
+        }
+        body.push_str(trimmed);
+    }
+    if !saw_end {
+        return Err(LpmError::Registry(format!("missing `{END}` marker")));
+    }
+
+    for line in lines {
+        if !line.trim().is_empty() {
+            return Err(LpmError::Registry(format!(
+                "unexpected content after `{END}`: `{}`",
+                line.trim_end()
+            )));
+        }
+    }
 
     BASE64
-        .decode(content.as_bytes())
-        .map_err(|e| LpmError::Registry(format!("invalid PEM certificate: {e}")))
+        .decode(body.as_bytes())
+        .map_err(|e| LpmError::Registry(format!("invalid PEM certificate base64: {e}")))
+}
+
+/// Split a PEM chain (multiple `CERTIFICATE` blocks concatenated) into
+/// individual PEM strings, each still terminated by its `-----END
+/// CERTIFICATE-----` marker so it parses cleanly through [`pem_to_der`].
+///
+/// Strict parser: requires the BEGIN / END markers to appear on their
+/// own line (no substring match), refuses any non-blank content between
+/// blocks, and refuses a nested BEGIN or stray END marker. The previous
+/// implementation accepted lines that merely *contained* the marker
+/// substring, allowing a hostile Fulcio response to interleave content
+/// into the chain.
+fn split_pem_chain(text: &str) -> Result<Vec<String>, LpmError> {
+    const BEGIN: &str = "-----BEGIN CERTIFICATE-----";
+    const END: &str = "-----END CERTIFICATE-----";
+
+    let mut certs = Vec::new();
+    let mut current = String::new();
+    let mut in_cert = false;
+
+    for line in text.lines() {
+        let trimmed = line.trim_end();
+        if trimmed == BEGIN {
+            if in_cert {
+                return Err(LpmError::Registry(
+                    "nested `-----BEGIN CERTIFICATE-----` in PEM chain".into(),
+                ));
+            }
+            in_cert = true;
+            current.clear();
+            current.push_str(line);
+            current.push('\n');
+        } else if trimmed == END {
+            if !in_cert {
+                return Err(LpmError::Registry(
+                    "stray `-----END CERTIFICATE-----` in PEM chain".into(),
+                ));
+            }
+            current.push_str(line);
+            current.push('\n');
+            certs.push(std::mem::take(&mut current));
+            in_cert = false;
+        } else if in_cert {
+            current.push_str(line);
+            current.push('\n');
+        } else if !trimmed.is_empty() {
+            return Err(LpmError::Registry(format!(
+                "unexpected content outside PEM block in chain: `{trimmed}`"
+            )));
+        }
+    }
+
+    if in_cert {
+        return Err(LpmError::Registry(
+            "unterminated `-----BEGIN CERTIFICATE-----` in PEM chain".into(),
+        ));
+    }
+
+    Ok(certs)
 }
 
 #[cfg(test)]
@@ -563,6 +722,122 @@ mod tests {
         let pem = "-----BEGIN CERTIFICATE-----\nYWJj\n-----END CERTIFICATE-----";
         let der = pem_to_der(pem).unwrap();
         assert_eq!(der, b"abc");
+    }
+
+    #[test]
+    fn pem_to_der_rejects_private_key_label() {
+        let pem = "-----BEGIN PRIVATE KEY-----\nYWJj\n-----END PRIVATE KEY-----";
+        let err = pem_to_der(pem).expect_err("non-CERTIFICATE label must be rejected");
+        assert!(
+            format!("{err}").contains("expected `-----BEGIN CERTIFICATE-----`"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn pem_to_der_rejects_unexpected_marker_inside_body() {
+        let pem = "-----BEGIN CERTIFICATE-----\nYWJj\n-----BEGIN SIGNATURE-----\nZGVm\n-----END CERTIFICATE-----";
+        let err = pem_to_der(pem).expect_err("nested marker must be rejected");
+        assert!(
+            format!("{err}").contains("unexpected PEM marker inside CERTIFICATE body"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn pem_to_der_rejects_trailing_content_after_end_marker() {
+        let pem = "-----BEGIN CERTIFICATE-----\nYWJj\n-----END CERTIFICATE-----\nZGVm";
+        let err = pem_to_der(pem).expect_err("trailing content must be rejected");
+        assert!(
+            format!("{err}").contains("unexpected content after"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn pem_to_der_rejects_missing_end_marker() {
+        let pem = "-----BEGIN CERTIFICATE-----\nYWJj\n";
+        let err = pem_to_der(pem).expect_err("missing END must be rejected");
+        assert!(format!("{err}").contains("missing"), "got: {err}");
+    }
+
+    #[test]
+    fn pem_to_der_rejects_empty_input() {
+        let err = pem_to_der("").expect_err("empty input must be rejected");
+        assert!(
+            format!("{err}").contains("PEM input is empty"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn pem_to_der_ignores_leading_blank_lines() {
+        let pem = "\n\n-----BEGIN CERTIFICATE-----\nYWJj\n-----END CERTIFICATE-----\n";
+        assert_eq!(pem_to_der(pem).unwrap(), b"abc");
+    }
+
+    #[test]
+    fn split_pem_chain_handles_concatenated_blocks() {
+        let chain = format!("{PEM_CERT_LEAF}{PEM_CERT_INTERMEDIATE}{PEM_CERT_ROOT}");
+        let certs = split_pem_chain(&chain).unwrap();
+        assert_eq!(certs.len(), 3);
+        assert_eq!(pem_to_der(&certs[0]).unwrap(), b"abc");
+        assert_eq!(pem_to_der(&certs[1]).unwrap(), b"def");
+        assert_eq!(pem_to_der(&certs[2]).unwrap(), b"ghi");
+    }
+
+    #[test]
+    fn split_pem_chain_rejects_content_between_blocks() {
+        // Hostile-server smuggling case: extra base64 between an END
+        // and the next BEGIN that the lax parser would have silently
+        // ignored. Strict parser refuses.
+        let chain = format!("{PEM_CERT_LEAF}smuggled-line\n{PEM_CERT_INTERMEDIATE}");
+        let err = split_pem_chain(&chain).expect_err("inter-block content must be rejected");
+        assert!(
+            format!("{err}").contains("unexpected content outside PEM block"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn split_pem_chain_rejects_stray_end_marker() {
+        let chain = "-----END CERTIFICATE-----\n";
+        let err = split_pem_chain(chain).expect_err("stray END must be rejected");
+        assert!(format!("{err}").contains("stray"), "got: {err}");
+    }
+
+    #[test]
+    fn split_pem_chain_rejects_nested_begin_marker() {
+        let chain = "-----BEGIN CERTIFICATE-----\nYWJj\n-----BEGIN CERTIFICATE-----\nZGVm\n-----END CERTIFICATE-----\n";
+        let err = split_pem_chain(chain).expect_err("nested BEGIN must be rejected");
+        assert!(format!("{err}").contains("nested"), "got: {err}");
+    }
+
+    #[test]
+    fn split_pem_chain_rejects_unterminated_block() {
+        let chain = "-----BEGIN CERTIFICATE-----\nYWJj\n";
+        let err = split_pem_chain(chain).expect_err("missing END must be rejected");
+        assert!(format!("{err}").contains("unterminated"), "got: {err}");
+    }
+
+    #[test]
+    fn split_pem_chain_rejects_substring_marker_match() {
+        // Old parser used `line.contains("BEGIN CERTIFICATE")`, which
+        // would treat `# BEGIN CERTIFICATE comment` as a block opener.
+        // Strict parser only matches the exact marker line.
+        let chain = "# BEGIN CERTIFICATE — this is a comment\n";
+        let err =
+            split_pem_chain(chain).expect_err("substring match must be rejected as out-of-block");
+        assert!(
+            format!("{err}").contains("unexpected content outside PEM block"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn split_pem_chain_empty_input_yields_no_certs() {
+        let certs = split_pem_chain("").unwrap();
+        assert!(certs.is_empty());
     }
 
     #[test]
@@ -747,7 +1022,14 @@ mod tests {
             .await
             .expect_err("expected error");
         let msg = format!("{err}");
-        assert!(msg.contains("empty certificate chain"), "got: {msg}");
+        // Strict parser rejects the stray `(no certs here)` line as
+        // out-of-block content rather than reaching the "empty chain"
+        // arm below it. Either rejection is the right outcome; the
+        // assertion pins the stricter one.
+        assert!(
+            msg.contains("unexpected content outside PEM block"),
+            "got: {msg}"
+        );
     }
 
     #[tokio::test]
@@ -1036,10 +1318,7 @@ mod tests {
             .mount(&rekor)
             .await;
 
-        let endpoints = SigstoreEndpoints {
-            fulcio: fulcio.uri(),
-            rekor: rekor.uri(),
-        };
+        let endpoints = SigstoreEndpoints::for_test(fulcio.uri(), rekor.uri());
         let jwt = make_jwt(r#"{"sub":"ci@example.com"}"#);
 
         let bundle = sign_and_record_with_endpoints(&jwt, b"{\"_type\":\"in-toto\"}", &endpoints)
@@ -1076,16 +1355,89 @@ mod tests {
         // Rekor mock not strictly required — the call must short-circuit
         // before reaching it.
 
-        let endpoints = SigstoreEndpoints {
-            fulcio: fulcio.uri(),
-            rekor: rekor.uri(),
-        };
+        let endpoints = SigstoreEndpoints::for_test(fulcio.uri(), rekor.uri());
         let jwt = make_jwt(r#"{"sub":"ci"}"#);
 
         let err = sign_and_record_with_endpoints(&jwt, b"{}", &endpoints)
             .await
             .expect_err("expected fulcio error to surface");
         assert!(format!("{err}").contains("503"));
+    }
+
+    // ─── Body-size cap on Fulcio / Rekor responses ────────────────
+
+    #[tokio::test]
+    async fn read_response_body_capped_accepts_payload_under_cap() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(match_path("/x"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(vec![b'a'; 1024]))
+            .mount(&server)
+            .await;
+
+        let resp = reqwest::get(format!("{}/x", server.uri())).await.unwrap();
+        let body = read_response_body_capped(resp, "Test").await.unwrap();
+        assert_eq!(body.len(), 1024);
+    }
+
+    #[tokio::test]
+    async fn read_response_body_capped_rejects_oversized_stream() {
+        let server = MockServer::start().await;
+        let oversized = vec![b'a'; SIGSTORE_RESPONSE_CAP_BYTES + 1024];
+        Mock::given(method("GET"))
+            .and(match_path("/x"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(oversized))
+            .mount(&server)
+            .await;
+
+        let resp = reqwest::get(format!("{}/x", server.uri())).await.unwrap();
+        let err = read_response_body_capped(resp, "Test")
+            .await
+            .expect_err("oversized body must be rejected");
+        let msg = format!("{err}");
+        // Either the pre-stream `Content-Length` check or the
+        // mid-stream accumulator check must reject. Both error
+        // messages contain "exceed".
+        assert!(msg.contains("exceed"), "got: {msg}");
+    }
+
+    #[tokio::test]
+    async fn read_response_body_capped_rejects_declared_oversized_content_length() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        // Bypass hyper to dodge its declared-vs-actual framing panic
+        // when the response body doesn't match the declared length.
+        // Send headers with a huge Content-Length and close — the
+        // pre-stream cap rejects before reading any body.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let declared = SIGSTORE_RESPONSE_CAP_BYTES + 1;
+
+        tokio::spawn(async move {
+            if let Ok((mut socket, _)) = listener.accept().await {
+                let mut buf = [0u8; 1024];
+                let _ = socket.read(&mut buf).await;
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\n\
+                     Content-Length: {declared}\r\n\
+                     Content-Type: application/octet-stream\r\n\
+                     Connection: close\r\n\
+                     \r\n",
+                );
+                let _ = socket.write_all(resp.as_bytes()).await;
+                let _ = socket.shutdown().await;
+            }
+        });
+
+        let resp = reqwest::get(format!("http://{addr}/")).await.unwrap();
+        let err = read_response_body_capped(resp, "Test")
+            .await
+            .expect_err("declared oversized length must be rejected pre-stream");
+        assert!(
+            format!("{err}").contains("declared body length"),
+            "got: {err}"
+        );
     }
 
     // ─── Legacy serde-shape tests (kept; format ownership) ────────
