@@ -876,11 +876,19 @@ async fn run_under_store_lock(
         // per-install warning: emitted once when the
         // probe's effective posture is `Degraded`. The structured
         // line names kernel + active ABI + missing dimension so log
-        // scrapers can detect the gap mechanically. JSON mode
-        // suppresses it on stderr — the doctor surface still
-        // reports the same posture for tooling consumers.
-        if !json_output && let Some(line) = probe_sandbox.posture().degraded_warning_line() {
-            output::warn(&line);
+        // scrapers can detect the gap mechanically. Human mode
+        // formats via `output::warn`; JSON mode emits the same line
+        // via `tracing::warn` so consumers running with `RUST_LOG=warn`
+        // see the degraded posture without parsing stderr — the JSON
+        // envelope on stdout stays well-formed. Previously suppressed
+        // entirely under `--json`, which hid the degradation from
+        // CI gates that consume only the JSON envelope.
+        if let Some(line) = probe_sandbox.posture().degraded_warning_line() {
+            if json_output {
+                tracing::warn!(target: "lpm_cli::sandbox", "{line}");
+            } else {
+                output::warn(&line);
+            }
         }
         drop(probe_sandbox);
     }
