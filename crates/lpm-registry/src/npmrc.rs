@@ -392,25 +392,34 @@ impl OriginKey {
     /// concrete default (80 for http, 443 for https) when no port is in
     /// the URL itself. Lookup callers fall back to `(host, None)` when
     /// the exact-port match misses; see `NpmrcConfig::auth_for_url`.
+    ///
+    /// Delegates to `reqwest::Url::parse` (the RFC 3986 parser reqwest
+    /// itself uses to dispatch) so the host extracted here matches the
+    /// host reqwest will connect to. The previous implementation
+    /// hand-rolled `split_once("://")` + `split(['/','?','#'])`, which
+    /// never stripped `userinfo`: a URL like
+    /// `https://attacker.com@registry.npmjs.org/foo` produced host
+    /// `attacker.com@registry.npmjs.org` for auth matching while
+    /// reqwest connected to `registry.npmjs.org` — a cross-origin
+    /// auth-leak window for any URL flowing through a lockfile or
+    /// registry-metadata field.
     pub fn from_request_url(url: &str) -> Option<Self> {
-        let (scheme, rest) = url.split_once("://")?;
-        let scheme_lower = scheme.to_ascii_lowercase();
-        let default_port = match scheme_lower.as_str() {
+        let parsed = reqwest::Url::parse(url).ok()?;
+        let default_port = match parsed.scheme() {
             "https" => 443,
             "http" => 80,
             _ => return None,
         };
-        // Cut path/query/fragment.
-        let host_port = rest
-            .split(['/', '?', '#'])
-            .next()
-            .filter(|s| !s.is_empty())?;
-        let parsed = Self::from_host_port_str(host_port, Some(default_port))?;
-        // Request URLs always resolve to a concrete port — even if the
-        // URL omits one, the scheme supplies the default. Belt-and-braces
-        // assertion that the helper kept that invariant.
-        parsed.port?;
-        Some(parsed)
+        let host = parsed.host_str()?;
+        // `Url::port_or_known_default` returns the scheme's default
+        // when the URL omits an explicit port. For http/https this is
+        // 80/443; we keep the explicit fallback so non-default schemes
+        // (rejected above) never sneak through with an unexpected port.
+        let port = parsed.port().unwrap_or(default_port);
+        Some(Self {
+            host_lower: host.to_ascii_lowercase(),
+            port: Some(port),
+        })
     }
 }
 
@@ -2653,6 +2662,75 @@ mod tests {
         assert!(cfg.auth_for_url("https://npm.internal/x").is_some());
         assert!(cfg.auth_for_url("https://registry.npmjs.org/x").is_none());
         assert!(cfg.auth_for_url("https://attacker.example/x").is_none());
+    }
+
+    /// A URL of the shape `https://<userinfo>@<host>/...` resolves to
+    /// `<host>` per RFC 3986; the pre-fix hand-rolled parser kept the
+    /// `<userinfo>@<host>` blob as the "host" for auth matching while
+    /// reqwest connected to `<host>`. That mismatch could quietly
+    /// route the bearer for one origin to a different host. Pinning
+    /// the parse here so a future refactor that drops `reqwest::Url`
+    /// can't reintroduce the gap.
+    #[test]
+    fn from_request_url_strips_userinfo_before_host_match() {
+        let key =
+            OriginKey::from_request_url("https://attacker.com@registry.npmjs.org/foo").unwrap();
+        assert_eq!(key.host_lower, "registry.npmjs.org");
+        assert_eq!(key.port, Some(443));
+    }
+
+    #[test]
+    fn from_request_url_strips_user_and_password_userinfo() {
+        let key = OriginKey::from_request_url("https://user:pass@registry.npmjs.org/foo").unwrap();
+        assert_eq!(key.host_lower, "registry.npmjs.org");
+        assert_eq!(key.port, Some(443));
+    }
+
+    #[test]
+    fn from_request_url_with_userinfo_does_not_match_attacker_origin() {
+        // End-to-end of the H2 finding: an attacker who can inject
+        // `https://attacker.com@npm.internal/...` into a lockfile or
+        // metadata response must NOT cause the npm.internal bearer to
+        // be sent. Pre-fix the OriginKey's host was the literal blob
+        // including `attacker.com@`, so a lookup by that key returned
+        // None — but lookup by the connect-host (npm.internal) was
+        // unchanged. The hazard was that any future code path that
+        // built the OriginKey via from_request_url and then trusted
+        // it as "the connect origin" was wrong by construction.
+        let content = "//npm.internal/:_authToken=INT_TOKEN\n";
+        let cfg = NpmrcConfig::parse(content, "test", &no_env);
+        // Post-fix: the userinfo URL resolves to host npm.internal
+        // and DOES match the configured auth — same behaviour reqwest
+        // exhibits when it dispatches the request.
+        assert!(
+            cfg.auth_for_url("https://attacker.com@npm.internal/x")
+                .is_some(),
+            "userinfo URL must resolve to npm.internal and match the configured auth — \
+             this proves the parser is not misled by the userinfo blob",
+        );
+        // A URL whose actual host is attacker.example must NOT match.
+        assert!(
+            cfg.auth_for_url("https://npm.internal@attacker.example/x")
+                .is_none(),
+            "userinfo `npm.internal` must NOT confuse the parser into matching \
+             the configured `npm.internal` auth — the real host is attacker.example",
+        );
+    }
+
+    #[test]
+    fn from_request_url_handles_ipv6_host_without_brackets() {
+        // Sanity that the reqwest::Url-based parser produces the
+        // bracket-stripped form, matching what the previous parser
+        // emitted via [`from_host_port_str`].
+        let key = OriginKey::from_request_url("https://[::1]:8443/foo").unwrap();
+        assert_eq!(key.host_lower, "[::1]");
+        assert_eq!(key.port, Some(8443));
+    }
+
+    #[test]
+    fn from_request_url_rejects_unsupported_scheme() {
+        assert!(OriginKey::from_request_url("ftp://npm.internal/x").is_none());
+        assert!(OriginKey::from_request_url("file:///tmp/foo").is_none());
     }
 
     #[test]

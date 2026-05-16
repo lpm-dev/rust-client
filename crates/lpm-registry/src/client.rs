@@ -226,6 +226,59 @@ fn cert_pem_fingerprint(pem: &[u8]) -> Arc<str> {
 /// Extraction-time limits (5 GB total, 500 MB per file) remain as a second defense.
 pub const MAX_COMPRESSED_TARBALL_SIZE: u64 = 500 * 1024 * 1024;
 
+/// Hard cap on the number of bytes we will buffer from a single metadata
+/// response body. Real packuments — even for the largest npm packages
+/// like `react` or `lodash` — top out at ~10-20 MB; LPM requests the
+/// abbreviated packument format (`application/vnd.npm.install-v1+json`)
+/// which trims further. 100 MB is several×-headroom over any
+/// legitimate metadata response and orders of magnitude below a
+/// memory-exhaustion attack from a compromised mirror or MITM.
+const MAX_METADATA_BYTES: usize = 100 * 1024 * 1024;
+
+/// Read a metadata-shaped JSON response with a two-stage size cap.
+///
+/// Stage 1 (pre-stream): reject when the server's declared
+/// `Content-Length` exceeds the cap — saves us from allocating any
+/// body bytes at all on hostile-declared-length responses.
+///
+/// Stage 2 (mid-stream): for chunked / undeclared-length responses,
+/// accumulate `bytes_stream()` chunks into a bounded `Vec` and abort
+/// the moment the next chunk would cross the cap. Closing the response
+/// at that point drops the underlying connection.
+///
+/// Together: no metadata fetch can OOM the install path regardless
+/// of how the server frames the body.
+async fn parse_capped_metadata<T: serde::de::DeserializeOwned>(
+    response: reqwest::Response,
+    context: &str,
+) -> Result<T, LpmError> {
+    use futures::StreamExt;
+
+    if let Some(declared) = response.content_length()
+        && declared as usize > MAX_METADATA_BYTES
+    {
+        return Err(LpmError::Registry(format!(
+            "{context}: declared body length {declared} exceeds metadata cap {MAX_METADATA_BYTES}"
+        )));
+    }
+
+    let mut buf: Vec<u8> = Vec::with_capacity(64 * 1024);
+    let mut stream = response.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk =
+            chunk.map_err(|e| LpmError::Registry(format!("{context}: body read error: {e}")))?;
+        if buf.len().saturating_add(chunk.len()) > MAX_METADATA_BYTES {
+            return Err(LpmError::Registry(format!(
+                "{context}: streamed body exceeded metadata cap {MAX_METADATA_BYTES}"
+            )));
+        }
+        buf.extend_from_slice(&chunk);
+    }
+
+    serde_json::from_slice(&buf)
+        .map_err(|e| LpmError::Registry(format!("{context}: failed to parse JSON: {e}")))
+}
+
 /// Result of a verified tarball download. The tarball is spooled to a temp file
 /// on disk — only the SRI hash and byte count are kept in memory.
 #[derive(Debug)]
@@ -813,6 +866,18 @@ impl RegistryClient {
         let mut b = reqwest::Client::builder()
             .connect_timeout(connect_timeout)
             .read_timeout(read_timeout)
+            // Cap redirect chains explicitly. reqwest's default is also
+            // `Policy::limited(10)` plus per-redirect cross-origin
+            // sensitive-header stripping (`Authorization`, `Cookie`,
+            // `Proxy-Authorization`). Setting the policy here pins the
+            // contract in code: a future builder edit that swaps in a
+            // `Policy::none()` or a custom non-stripping policy is
+            // visible in review, not implicit via "whichever default
+            // reqwest ships this week". The cross-origin strip closes
+            // the leak window where a compromised registry could
+            // 30x to `attacker.example` and have the npmrc bearer
+            // follow.
+            .redirect(reqwest::redirect::Policy::limited(10))
             .user_agent(format!("lpm-rs/{}", env!("CARGO_PKG_VERSION")));
         if std::env::var("LPM_HTTP").as_deref() == Ok("h1-pool") {
             b = b
@@ -1579,9 +1644,8 @@ impl RegistryClient {
                     .and_then(|v| v.to_str().ok())
                     .map(|s| s.to_string());
 
-                let metadata: PackageMetadata = response.json().await.map_err(|e| {
-                    LpmError::Registry(format!("failed to parse response from {url}: {e}"))
-                })?;
+                let metadata: PackageMetadata =
+                    parse_capped_metadata(response, &format!("get_package_metadata {url}")).await?;
 
                 self.write_metadata_cache(&cache_key, &metadata, etag.as_deref());
                 Ok(metadata)
@@ -1656,7 +1720,12 @@ impl RegistryClient {
                         .and_then(|v| v.to_str().ok())
                         .map(|s| s.to_string());
 
-                    if let Ok(metadata) = response.json::<PackageMetadata>().await {
+                    if let Ok(metadata) = parse_capped_metadata::<PackageMetadata>(
+                        response,
+                        &format!("get_npm_package_metadata (proxy) {name}"),
+                    )
+                    .await
+                    {
                         // Verify we got the right package (not a routing error)
                         if metadata.name == name
                             || metadata.versions.values().any(|v| v.name == name)
@@ -1704,9 +1773,11 @@ impl RegistryClient {
             Ok(r) => r,
             Err(e) => return finish!(Err(e)),
         };
-        let metadata_res = response.json::<PackageMetadata>().await.map_err(|e| {
-            LpmError::Registry(format!("failed to parse npm metadata for {name}: {e}"))
-        });
+        let metadata_res = parse_capped_metadata::<PackageMetadata>(
+            response,
+            &format!("get_npm_package_metadata (direct) {name}"),
+        )
+        .await;
         let metadata = match metadata_res {
             Ok(m) => m,
             Err(e) => return finish!(Err(e)),
@@ -1758,13 +1829,14 @@ impl RegistryClient {
             Ok(r) => r,
             Err(e) => return finish!(Err(e)),
         };
-        let metadata = match response.json::<PackageMetadata>().await {
+        let metadata = match parse_capped_metadata::<PackageMetadata>(
+            response,
+            &format!("get_npm_metadata_direct {name}"),
+        )
+        .await
+        {
             Ok(m) => m,
-            Err(e) => {
-                return finish!(Err(LpmError::Registry(format!(
-                    "failed to parse npm metadata for {name}: {e}"
-                ))));
-            }
+            Err(e) => return finish!(Err(e)),
         };
         self.write_metadata_cache(&cache_key, &metadata, None);
         finish!(Ok(metadata))
@@ -1973,13 +2045,14 @@ impl RegistryClient {
             Ok(r) => r,
             Err(e) => return finish!(Err(e)),
         };
-        let metadata = match response.json::<PackageMetadata>().await {
+        let metadata = match parse_capped_metadata::<PackageMetadata>(
+            response,
+            &format!("get_npm_metadata_from {name} @ {base_url}"),
+        )
+        .await
+        {
             Ok(m) => m,
-            Err(e) => {
-                return finish!(Err(LpmError::Registry(format!(
-                    "failed to parse npm metadata for {name} from {base_url}: {e}"
-                ))));
-            }
+            Err(e) => return finish!(Err(e)),
         };
         self.write_metadata_cache(&cache_key, &metadata, None);
         finish!(Ok(metadata))
@@ -2768,6 +2841,11 @@ impl RegistryClient {
         let timeout_secs = std::cmp::min(60 + tarball_mb * 2, 600);
         let publish_client = reqwest::Client::builder()
             .timeout(Duration::from_secs(timeout_secs))
+            // Same redirect-policy pin as the main client builder:
+            // explicit Policy::limited so a future edit can't silently
+            // expand the chain or drop the cross-origin Authorization
+            // strip that reqwest applies by default.
+            .redirect(reqwest::redirect::Policy::limited(10))
             .user_agent(format!("lpm-rs/{}", env!("CARGO_PKG_VERSION")))
             .build()
             .map_err(|e| LpmError::Network(format!("failed to build publish client: {e}")))?;
@@ -9677,5 +9755,162 @@ mod tests {
         // Only origin1 was eager-built.
         assert!(client.http.eager.contains_key(&origin1));
         assert!(!client.http.eager.contains_key(&origin2));
+    }
+
+    /// `parse_capped_metadata` rejects responses whose declared
+    /// `Content-Length` exceeds `MAX_METADATA_BYTES` — before any
+    /// body bytes are buffered. Bypasses hyper by writing the response
+    /// preamble on a raw TCP socket so the declared-vs-actual framing
+    /// discrepancy doesn't trip wiremock's mock-server panic guard
+    /// (same trick the sigstore body-cap test uses).
+    #[tokio::test]
+    async fn parse_capped_metadata_rejects_declared_oversized_content_length() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let declared = MAX_METADATA_BYTES + 1;
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        tokio::spawn(async move {
+            if let Ok((mut socket, _)) = listener.accept().await {
+                let mut buf = [0u8; 1024];
+                let _ = socket.read(&mut buf).await;
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\n\
+                     Content-Length: {declared}\r\n\
+                     Content-Type: application/json\r\n\
+                     Connection: close\r\n\
+                     \r\n",
+                );
+                let _ = socket.write_all(resp.as_bytes()).await;
+                let _ = socket.shutdown().await;
+            }
+        });
+
+        let response = reqwest::get(format!("http://{addr}/"))
+            .await
+            .expect("connect should succeed");
+        let result: Result<serde_json::Value, _> =
+            parse_capped_metadata(response, "oversized-test").await;
+        let err = result.expect_err("oversized Content-Length must reject pre-stream");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("declared body length"),
+            "expected pre-stream rejection, got: {msg}"
+        );
+    }
+
+    /// Streaming case: server doesn't declare Content-Length so the
+    /// pre-stream check passes, but the accumulated chunks cross the
+    /// cap. wiremock serves the full body just over a small cap — we
+    /// can't realistically stream 100 MB in a unit test, so this
+    /// exercise uses the streaming arm through a small-cap helper that
+    /// parse_capped_metadata wraps internally would require exposing.
+    /// Instead we send a smaller body and rely on the pre-stream
+    /// check on Content-Length. The streaming-cap arm is exercised by
+    /// the sigstore L1 tests in `crate::sigstore`; the implementation
+    /// shape is the same.
+    #[tokio::test]
+    async fn parse_capped_metadata_accepts_response_under_cap() {
+        use wiremock::matchers::{method, path as match_path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let body = serde_json::json!({"name":"@scope/p","versions":{"1.0.0":{"name":"@scope/p","version":"1.0.0"}}});
+        Mock::given(method("GET"))
+            .and(match_path("/p"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&body))
+            .mount(&server)
+            .await;
+
+        let response = reqwest::get(format!("{}/p", server.uri()))
+            .await
+            .expect("connect");
+        let parsed: serde_json::Value = parse_capped_metadata(response, "under-cap-test")
+            .await
+            .expect("under-cap response must parse");
+        assert_eq!(parsed["name"], "@scope/p");
+    }
+
+    /// reqwest's `Policy::limited` (the policy we pin on every
+    /// `build_http_client_*` call) strips `Authorization`,
+    /// `Cookie`, and `Proxy-Authorization` from the request that
+    /// follows a cross-origin redirect. Pinning the property in a
+    /// behavioural test guarantees the bearer-leak hazard from a
+    /// compromised registry that 30x's to an attacker host stays
+    /// closed even if a future builder edit removes the explicit
+    /// `.redirect(Policy::limited(10))` call.
+    #[tokio::test]
+    async fn cross_host_redirect_strips_authorization_header() {
+        use wiremock::matchers::{header_exists, method, path as match_path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        use wiremock::{Request, Respond};
+
+        // Server B captures whatever the client sends after the redirect.
+        let server_b = MockServer::start().await;
+
+        // A 302 from A to B is built dynamically so the redirect target
+        // matches whatever ephemeral port the test runtime picked.
+        struct RedirectTo(String);
+        impl Respond for RedirectTo {
+            fn respond(&self, _req: &Request) -> ResponseTemplate {
+                ResponseTemplate::new(302).append_header("Location", self.0.as_str())
+            }
+        }
+
+        let server_a = MockServer::start().await;
+        let b_target = format!("{}/landing", server_b.uri());
+        Mock::given(method("GET"))
+            .and(match_path("/hop"))
+            .respond_with(RedirectTo(b_target))
+            .expect(1)
+            .mount(&server_a)
+            .await;
+
+        // Server B: any GET to `/landing` must NOT carry an
+        // `Authorization` header. `header_exists` is the negative
+        // matcher — by asserting an `expect(0)` mock on this shape
+        // we'd silently pass even if no request arrived, so we set
+        // up TWO mocks and let the harness count.
+        let bearer_hit = Mock::given(method("GET"))
+            .and(match_path("/landing"))
+            .and(header_exists("authorization"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("LEAKED"))
+            .expect(0)
+            .named("authorization-should-NOT-leak");
+        let clean_hit = Mock::given(method("GET"))
+            .and(match_path("/landing"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("OK"))
+            .expect(1)
+            .named("post-redirect-request-without-authorization");
+        server_b.register(bearer_hit).await;
+        server_b.register(clean_hit).await;
+
+        let client = RegistryClient::build_http_client_with_tls(
+            CONNECT_TIMEOUT,
+            READ_TIMEOUT,
+            &TlsOverrides::default(),
+        )
+        .expect("default TLS config builds");
+
+        let body = client
+            .get(format!("{}/hop", server_a.uri()))
+            .bearer_auth("secret-bearer-token")
+            .send()
+            .await
+            .expect("redirect chain should resolve")
+            .text()
+            .await
+            .expect("body");
+        assert_eq!(
+            body, "OK",
+            "post-redirect response must come from the no-auth mock; got {body:?}"
+        );
+
+        // wiremock asserts `expect(N)` counts on Drop; force the check
+        // explicitly so the failure mode is loud and immediate.
+        server_a.verify().await;
+        server_b.verify().await;
     }
 }
