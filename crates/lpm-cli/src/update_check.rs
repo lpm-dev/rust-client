@@ -10,7 +10,7 @@ use crate::release_lookup::{
     default_cache_path, is_newer_semver, is_stale as base_is_stale, probe_release, read_cache_at,
     write_cache_at,
 };
-use owo_colors::OwoColorize;
+use lpm_common::color::Painted;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 /// Don't probe more than once a day on the success path.

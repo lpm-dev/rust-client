@@ -1,15 +1,15 @@
-//! **Phase 46 P7 — pure version-diff core.**
+//!
 //!
 //! Computes the field-by-field diff between a prior-approved
 //! [`TrustedDependencyBinding`] and a candidate [`BlockedPackage`]
-//! across the three dimensions [§11 P7] calls out: script hash,
+//! across the three dimensions [P7] calls out: script hash,
 //! behavioral-tag set, and provenance identity tuple.
 //!
 //! ## Shape
 //!
 //! Pure functions over [`TrustedDependencyBinding`] and
 //! [`BlockedPackage`]. No I/O, no registry calls, no stdout writes.
-//! The [`VersionDiff`] + [`VersionDiffReason`] types mirror P6's
+//! The [`VersionDiff`] + [`VersionDiffReason`] types mirror's
 //! `TrustReason` split — decision is lifted out of the rendering
 //! layer so unit tests can assert the classification without
 //! capturing stdout, and the JSON output path (C4) can serialize
@@ -24,7 +24,7 @@
 //! 2. **Behavioral tags.** `TrustedDependencyBinding.behavioral_tags_hash`
 //!    compared fast; if the hashes differ, `.behavioral_tags` is
 //!    compared as a set to produce the `gained / lost` delta the
-//!    rendering layer surfaces (§11 P7 ship criterion 2).
+//!    rendering layer surfaces.
 //! 3. **Provenance identity.** Uses the SAME identity tuple
 //!    (`present + publisher + workflow_path`) as
 //!    `lpm_security::provenance::check_provenance_drift`, so the
@@ -36,13 +36,13 @@
 //! This module DOES NOT resolve the prior version — callers pass the
 //! `(prior_version, binding)` tuple obtained from
 //! [`TrustedDependencies::latest_binding_for_name`]. The selector
-//! discipline lives in `lpm-workspace` so P4's drift gate and P7's
+//! discipline lives in `lpm-workspace` so's drift gate and's
 //! diff can never select a different "prior approval."
 //!
 //! [`TrustedDependencyBinding`]: lpm_workspace::TrustedDependencyBinding
 //! [`BlockedPackage`]: crate::build_state::BlockedPackage
 //! [`TrustedDependencies::latest_binding_for_name`]: lpm_workspace::TrustedDependencies::latest_binding_for_name
-//! [§11 P7]: https://github.com/anthropics/claude-code — see plan-doc §11 P7
+//! [P7]: https://github.com/anthropics/claude-code — see plan-doc
 
 use crate::build_state::BlockedPackage;
 use lpm_workspace::{ProvenanceSnapshot, TrustedDependencyBinding};
@@ -119,7 +119,7 @@ pub struct TagShift {
 /// say "this version NEWLY has provenance" vs. "this version DROPPED
 /// provenance" explicitly. The drift gate collapses
 /// `Some(!present) + Some(present)` to `NoDrift` because present →
-/// better; P7's UI still surfaces it as informational context.
+/// better;'s UI still surfaces it as informational context.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProvenanceDriftKind {
     /// Approved side had provenance with identity `X`; candidate has
@@ -227,7 +227,7 @@ fn classify_provenance(
 
         // Approved something, candidate none — the fetcher degraded
         // for the current install. Downgrade to no-signal per the
-        // §7.2 "(Some, None) → OK" rule: we can't claim drift on a
+        // "(Some, None) → OK" rule: we can't claim drift on a
         // transient fetch failure.
         (Some(_), None) => None,
 
@@ -409,7 +409,7 @@ pub fn compute_version_diff(
 // get back an `Option<String>` to emit however they route output
 // (stderr vs stdout, `output::warn` vs `println!`, JSON vs human).
 //
-// Split into two entry points matching §11 P7's two render sites:
+// Split into two entry points matching's two render sites:
 //   * [`render_terse_hint`]   — 1–2 line summary for the install
 //     blocked-set warning. Omits unified diffs. Agents and humans
 //     should both read this as "there's drift, run approve-scripts
@@ -700,7 +700,7 @@ fn ensure_trailing_newline(s: &str) -> String {
 }
 
 // ═══════════════════════════════════════════════════════════════════
-//  JSON serialization (Phase 46 P7 Chunk 4)
+//  JSON serialization
 // ═══════════════════════════════════════════════════════════════════
 //
 // Shared wire shape consumed by `lpm approve-scripts --json`,
@@ -803,7 +803,7 @@ pub fn version_diff_to_json(diff: &VersionDiff) -> serde_json::Value {
 /// shared by `lpm approve-scripts --json` and the install pipeline's
 /// `--json` output.
 ///
-/// **Phase 46 P7 Chunk 4** consolidates what were previously two
+/// consolidates what were previously two
 /// inline `serde_json::json!{...}` literals (one in `approve_builds`,
 /// two in `install.rs`) into a single source of truth. The added
 /// `version_diff` field requires `&trusted` so the helper can call
@@ -1190,7 +1190,7 @@ mod tests {
 
     #[test]
     fn missing_script_hash_on_either_side_is_no_signal() {
-        // Binding lacks script_hash (legacy / pre-Phase-4 upgrade).
+        // Binding lacks script_hash (legacy / pre-existing upgrade).
         let binding = TrustedDependencyBinding {
             script_hash: None,
             ..Default::default()
@@ -1274,7 +1274,7 @@ mod tests {
     }
 
     // ─── latest_binding_for_name (workspace-side helper, exercised
-    //     here via the full P7 integration surface) ────────────────
+    //     here via the full integration surface) ────────────────
 
     #[test]
     fn latest_binding_selects_strictly_less_than_candidate() {
@@ -1597,7 +1597,7 @@ mod tests {
         assert_eq!(map.len(), 2);
     }
 
-    // ─── JSON serialization (Phase 46 P7 Chunk 4) ─────────────────
+    // ─── JSON serialization  ─────────────────
 
     #[test]
     fn version_diff_reason_wire_strings_are_kebab_case() {

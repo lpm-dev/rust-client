@@ -1,12 +1,10 @@
 //! `lpm approve-scripts` — review and approve packages whose install scripts
-//! were blocked by the post-Phase-4 default-deny security posture.
-//!
-//! ## Phase 32 Phase 4 M4
+//! were blocked by the post-existing default-deny security posture.
 //!
 //! This command pairs with the post-install warning emitted by `lpm install`
 //! when packages with lifecycle scripts are not yet covered by an existing
 //! strict approval. It reads the install-time blocked set from
-//! `<project_dir>/.lpm/build-state.json` (written by M3) and lets the user
+//! `<project_dir>/.lpm/build-state.json` and lets the user
 //! approve them via:
 //!
 //! - **Interactive TUI** (`lpm approve-scripts`) — walk the blocked set one
@@ -17,7 +15,7 @@
 //! - **Read-only listing** (`--list`) — print the blocked set, NO mutations
 //!
 //! All approvals are bound to `{name, version, integrity, script_hash}`
-//! per the Phase 4 trust binding contract (see [`lpm_workspace::TrustedDependencies`]).
+//! per the trust binding contract (see [`lpm_workspace::TrustedDependencies`]).
 //!
 //! ## Output
 //!
@@ -28,21 +26,21 @@
 use crate::build_state::{self, BlockedPackage, BuildState};
 use crate::output;
 use lpm_common::LpmError;
+use lpm_common::color::Painted;
 use lpm_workspace::{ApprovalMetadata, ProvenanceSnapshot, TrustMatch, TrustedDependencies};
-use owo_colors::OwoColorize;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-/// **Phase 46 P7.** Project the install-time-captured fields off a
+/// Project the install-time-captured fields off a
 /// [`BlockedPackage`] into the [`ApprovalMetadata`] bundle that
 /// [`TrustedDependencies::approve_with_metadata`] persists.
 ///
 /// Centralized so each future approval-time field addition only edits
 /// one site instead of every `--yes` / direct / interactive call.
-/// Closes the P7 round-trip: `BlockedPackage.behavioral_tags{,_hash}`
+/// Closes the round-trip: `BlockedPackage.behavioral_tags{,_hash}`
 /// flows into the binding's `behavioral_tags{,_hash}`.
 ///
-/// **Phase 48 P0 sub-slice 6d.** Additionally threads the project-
+/// Additionally threads the project-
 /// level capability hash through. `capability_hash` is a single
 /// value for the entire invocation — the user approved ONE project
 /// capability request, which binds every package approved in this
@@ -55,9 +53,9 @@ use std::path::{Path, PathBuf};
 /// to re-parse or recompute here, the diff will call attention to
 /// the trust-boundary slip.
 ///
-/// **Phase 52 W2.** `provenance_at_approval` was previously read off
+/// `provenance_at_approval` was previously read off
 /// `BlockedPackage.provenance_at_capture` (install-time persisted
-/// snapshot). Phase 52 moves the capture from install to approval
+/// snapshot). moves the capture from install to approval
 /// time — the caller pre-fetches snapshots for the effective blocked
 /// set in parallel via [`fetch_provenance_for_effective_set`] and
 /// passes the looked-up value here. Same downstream semantics: the
@@ -78,7 +76,7 @@ fn approval_metadata_from_blocked(
     }
 }
 
-/// **Phase 52 W2.** Fetch attestation snapshots for an effective
+/// Fetch attestation snapshots for an effective
 /// blocked set at approval time.
 ///
 /// Pre-W2: `lpm install` fetched provenance for every resolved
@@ -99,11 +97,11 @@ fn approval_metadata_from_blocked(
 /// `provenance_at_approval` (the value this function feeds into the
 /// binding) as its reference.
 ///
-/// **Phase 68:** delegates to
+/// delegates to
 /// [`crate::provenance_fetch::fetch_provenance_for_pkgs`], the
 /// single source of truth shared with the global-scope approve path
 /// (`lpm approve-scripts --global`). This wrapper keeps the
-/// `BlockedPackage` shape callers used pre-Phase-68 working unchanged.
+/// `BlockedPackage` shape callers used pre-existing working unchanged.
 async fn fetch_provenance_for_effective_set(
     packages: &[BlockedPackage],
 ) -> HashMap<(String, String), Option<ProvenanceSnapshot>> {
@@ -118,15 +116,15 @@ async fn fetch_provenance_for_effective_set(
 /// change to the JSON shape so agents can branch on it.
 ///
 /// Version history:
-/// - **v1** (Phase 32 Phase 4): initial schema — blocked entries carry
+/// - **v1**: initial schema — blocked entries carry
 ///   `name`, `version`, `integrity`, `script_hash`, `phases_present`,
 ///   `binding_drift`.
-/// - **v2** (Phase 46 P2, Chunk 3): adds `static_tier` on each
+/// - **v2** : adds `static_tier` on each
 ///   blocked entry. Value is one of `"green" | "amber" | "amber-llm"
 ///   | "red"` when classification ran, or `null` when the persisted
-///   state predates P2 (readers should tolerate `null` to stay
+///   state predates (readers should tolerate `null` to stay
 ///   forward-compatible with v1 state that predates a re-install).
-/// - **v3** (Phase 46 P7, Chunk 4): adds `version_diff` on each
+/// - **v3** : adds `version_diff` on each
 ///   blocked entry. `null` when no prior approved binding exists for
 ///   this package name (first-time review); otherwise the structured
 ///   object documented on
@@ -141,7 +139,7 @@ pub const SCHEMA_VERSION: u32 = 3;
 /// `trustedDependencies` and return only the entries that are STILL
 /// blocked.
 ///
-/// **Phase 4 audit fix (D-impl-2, 2026-04-11):** the persisted
+/// the persisted
 /// `build-state.json` is only refreshed by `lpm install`. Without this
 /// filter step, `lpm approve-scripts` would re-render or re-approve
 /// packages the user has already approved (until the next install
@@ -162,7 +160,7 @@ pub const SCHEMA_VERSION: u32 = 3;
 ///   from the persisted state or from a fresh check.
 /// - [`TrustMatch::NotTrusted`] → KEEP. The default-deny case.
 ///
-/// **Phase 48 P0 sub-slice 6d follow-up:** the filter now also
+/// the filter now also
 /// consults the capability gate. A persisted blocked entry whose
 /// strict match succeeds BUT whose current capability request
 /// widens beyond the user bound without a matching capability-
@@ -223,7 +221,7 @@ pub async fn run(
     dry_run: bool,
     json_output: bool,
 ) -> Result<(), LpmError> {
-    // Phase 64 Round 2: hold the shared store lock — the approval
+    // Round 2: hold the shared store lock — the approval
     // flow reads store package dirs to inspect prior installs and
     // diff scripts. A concurrent `lpm cache prune --apply` could remove an
     // entry mid-walk without this gate.
@@ -240,7 +238,7 @@ async fn run_under_store_lock(
     package: Option<&str>,
     yes: bool,
     list: bool,
-    // Phase 46 close-out Chunk 3: when true, the review flow runs
+    // close-out when true, the review flow runs
     // end-to-end (card rendering, interactive prompts, diff surfaces,
     // outcome accounting) but NO persisted state mutates —
     // [`write_back`] short-circuits at each of its three call sites
@@ -293,7 +291,7 @@ async fn run_under_store_lock(
         }
     };
 
-    // ── Load current trustedDependencies (Phase 4 D-impl-2) ─────────
+    // ── Load current trustedDependencies () ─────────
     //
     // Loading the manifest BEFORE the early-return on empty state is the
     // audit fix for Finding 2: the persisted state is filtered through
@@ -306,7 +304,7 @@ async fn run_under_store_lock(
 
     let mut trusted = extract_trusted_dependencies(&manifest);
 
-    // ── Phase 48 P0 sub-slice 6d — capability request + hash ────────
+    // ── capability request + hash ────────
     //
     // Parse the project's per-package capability request ONCE and
     // reuse the same `CapabilitySet` object for both:
@@ -316,7 +314,7 @@ async fn run_under_store_lock(
     //   2. Computing the `capability_hash` that gets persisted into
     //      every binding written in this invocation.
     //
-    // Critical reviewer constraint (phase48.md §6 UX notes): the
+    // Critical reviewer constraint: the
     // persisted hash MUST come from the same canonical object the
     // runtime enforces against. Re-parsing in either direction
     // (prompt-time vs. write-time, or approve-time vs. enforce-
@@ -386,7 +384,7 @@ async fn run_under_store_lock(
         blocked_packages: effective,
     };
 
-    // ── Phase 52 W2 — pre-fetch provenance for the effective set ────
+    // ── — pre-fetch provenance for the effective set ────
     //
     // Pre-W2: install fetched provenance for every resolved package
     // and persisted it into `build-state.json`. Post-W2: install no
@@ -414,7 +412,7 @@ async fn run_under_store_lock(
     // The generic "nothing to approve" success path would be confusing
     // because the user is asking about ONE package.
     //
-    // Phase 4 D-impl-2: this branch must run BEFORE the empty-effective
+    // this branch must run BEFORE the empty-effective
     // check so the user-friendly errors are reachable.
     if let Some(arg) = package {
         // Track outcomes for the summary
@@ -445,7 +443,7 @@ async fn run_under_store_lock(
             true
         } else {
             print_package_card(target);
-            // Phase 46 P7 Chunk 3: surface the version diff card
+            // surface the version diff card
             // alongside the regular card when this is an UPDATE
             // (prior binding under same name exists). No-op for
             // first-time review.
@@ -464,10 +462,9 @@ async fn run_under_store_lock(
         };
 
         if confirmed {
-            // Phase 46 P4/P7 write-path: carry install-time
-            // provenance + behavioral-tag captures into the binding so
-            // subsequent installs can compare against them
-            // (§7.2 drift rule + §11 P7 version diff).
+            // write-path: carry install-time provenance + behavioral-tag captures
+            // into the binding so subsequent installs can compare against them
+            // (drift rule + version diff).
             trusted.approve_with_metadata(
                 &target.name,
                 &target.version,
@@ -481,7 +478,7 @@ async fn run_under_store_lock(
                 ),
             );
             approved.push(target);
-            // Phase 46 close-out Chunk 3: short-circuit the write
+            // close-out short-circuit the write
             // under `--dry-run`; the approval intent is still
             // recorded in `approved` for the summary so the user
             // sees "would approve X" with the same JSON envelope
@@ -518,7 +515,7 @@ async fn run_under_store_lock(
 
     if effective_state.blocked_packages.is_empty() {
         if json_output {
-            // Phase 46 close-out Chunk 3: `dry_run` carried through
+            // close-out `dry_run` carried through
             // so agents can uniformly read `envelope.dry_run`
             // regardless of which branch produced the envelope. On
             // an empty set, the flag is semantically a no-op (no
@@ -557,7 +554,7 @@ async fn run_under_store_lock(
     // ── --yes (bulk approve) ────────────────────────────────────────
 
     if yes {
-        // Phase 46 P2 Chunk 4 — refuse bulk approval when any
+        // — refuse bulk approval when any
         // effective-blocked entry is classified outside the green
         // tier. Gate runs BEFORE `emit_yes_warning_banner` so we
         // don't emit success-shaped human + tracing output and then
@@ -567,19 +564,18 @@ async fn run_under_store_lock(
         // Refusal is restricted to EXPLICIT non-green tiers:
         // - Some(Amber) / Some(AmberLlm) / Some(Red) → refuse.
         // - Some(Green) → allowed in bulk (still requires explicit
-        //   --yes; auto-execution is P6, gated on the P5 sandbox).
+        //   --yes; auto-execution is, gated on the sandbox).
         // - None → pass-through to today's behavior. `None` means
         //   the persisted blocked state was written by a pre-P2 LPM
         //   that never classified the package; breaking those
         //   existing `--yes` flows before the next install
-        //   recaptures the state would be a silent P1→P2 upgrade
+        //   recaptures the state would be a silent→P2 upgrade
         //   regression.
         enforce_tiered_yes_gate(&effective_state.blocked_packages)?;
 
         emit_yes_warning_banner(effective_state.blocked_packages.len(), json_output);
         for blocked in &effective_state.blocked_packages {
-            // Phase 46 P4/P7 write-path — see the direct-approve
-            // branch above for the rationale.
+            // write-path — see the direct-approve branch above for the rationale.
             trusted.approve_with_metadata(
                 &blocked.name,
                 &blocked.version,
@@ -594,7 +590,7 @@ async fn run_under_store_lock(
             );
             approved.push(blocked);
         }
-        // Phase 46 close-out Chunk 3: short-circuit under `--dry-run`.
+        // close-out short-circuit under `--dry-run`.
         if !dry_run {
             write_back(&pkg_json_path, &mut manifest, &trusted)?;
         }
@@ -611,11 +607,11 @@ async fn run_under_store_lock(
     }
 
     // (The `<pkg>` branch is handled at the top of `run` BEFORE the
-    // empty-effective short-circuit — see the Phase 4 D-impl-2 comment.)
+    // empty-effective short-circuit — see the  comment.)
 
     // ── Default: interactive walk ───────────────────────────────────
 
-    // Finding #74: check `--json` BEFORE the TTY gate. Every `--json`
+    // check `--json` BEFORE the TTY gate. Every `--json`
     // caller is by definition non-interactive (CI, scripted agent,
     // MCP server), so with the old order they always hit the
     // "requires a TTY" error — accurate but unhelpful: it doesn't
@@ -639,7 +635,7 @@ async fn run_under_store_lock(
 
     // Walk one at a time. Quit aborts WITHOUT writing in-progress entries
     // (atomic). The accumulator only gets flushed to disk after the loop.
-    // Phase 4 D-impl-2: walk the EFFECTIVE blocked set, not the persisted
+    // walk the EFFECTIVE blocked set, not the persisted
     // state — already-approved packages are skipped.
     output::info(&format!(
         "{} package(s) blocked. Walking one at a time — Quit aborts without writing.",
@@ -650,12 +646,12 @@ async fn run_under_store_lock(
     let mut quit_early = false;
     for blocked in &effective_state.blocked_packages {
         print_package_card(blocked);
-        // Phase 46 P7 Chunk 3: render the version-diff card for
+        // render the version-diff card for
         // updates (no-op when no prior binding exists for the same
         // package name).
         print_version_diff_card_for_blocked(blocked, &trusted);
 
-        // Phase 46 P7 Chunk 3: branch the Select on whether this is
+        // branch the Select on whether this is
         // a first-time review or an update. The two branches share
         // back-end semantics via `InteractiveChoice::decision()`;
         // the difference is the labels users see — `Approve` /
@@ -699,7 +695,7 @@ async fn run_under_store_lock(
                     .interact()
                     .map_err(|e| LpmError::Script(format!("prompt failed: {e}")))?
             } else {
-                // First-time review: original Phase 4 labels.
+                // First-time review: original labels.
                 cliclack::select(prompt)
                     .item(InteractiveChoice::Approve, "Approve", "")
                     .item(InteractiveChoice::Skip, "Skip", "")
@@ -756,8 +752,7 @@ async fn run_under_store_lock(
 
     // Apply approvals (atomic single write)
     for blocked in &approved {
-        // Phase 46 P4/P7 write-path — see the direct-approve branch
-        // earlier for the rationale.
+        // write-path — see the direct-approve branch earlier for the rationale.
         trusted.approve_with_metadata(
             &blocked.name,
             &blocked.version,
@@ -771,7 +766,7 @@ async fn run_under_store_lock(
             ),
         );
     }
-    // Phase 46 close-out Chunk 3: under `--dry-run`, skip the atomic
+    // close-out under `--dry-run`, skip the atomic
     // write; `approved` / `skipped` still fed into `print_summary`
     // so the agent sees the would-approve count.
     if !approved.is_empty() && !dry_run {
@@ -790,12 +785,12 @@ async fn run_under_store_lock(
     )
 }
 
-/// **Phase 46 P7 Chunk 3.** The interactive walk's per-package
+/// The interactive walk's per-package
 /// choice space.
 ///
-/// `Approve` and `Skip` are the original Phase 4 actions used when
+/// `Approve` and `Skip` are the original actions used when
 /// no prior approval exists for a different version of the same
-/// package. P7 adds [`AcceptNew`] and [`KeepOld`] — the same two
+/// package. adds [`AcceptNew`] and [`KeepOld`] — the same two
 /// actions wearing labels that name the *update* the user is
 /// reviewing, used when [`TrustedDependencies::latest_binding_for_name`]
 /// returns a prior binding. Both pairs collapse to the same
@@ -842,7 +837,7 @@ impl InteractiveChoice {
     }
 }
 
-/// **Phase 46 P7 Chunk 3.** Print the version-diff card for a
+/// Print the version-diff card for a
 /// blocked entry — the fuller "changes since v<prior>" view that
 /// renders alongside the package's existing card during the
 /// interactive walk, the direct `<pkg>` approve, and the `--list`
@@ -873,7 +868,7 @@ fn print_version_diff_card_for_blocked(blocked: &BlockedPackage, trusted: &Trust
     if !diff.is_drift() {
         return;
     }
-    // Phase 66 confidence-followup S5a — v2-aware lookup. Pre-fix, the
+    // confidence-followup S5a — v2-aware lookup. Pre-fix, the
     // PackageStore::package_dir paths below were v1-only — under the
     // v2-default install pipeline, both `prior` and `candidate`
     // resolved to non-existent paths, so `read_install_phase_bodies`
@@ -1022,12 +1017,12 @@ fn emit_yes_warning_banner(count: usize, json_output: bool) {
          Approvals are bound to script hashes captured at install time. \
          This bypasses LPM's default-deny security posture."
     );
-    // Triple-emission per Phase 4 status doc §"Security requirements":
+    // Triple-emission per status doc §"Security requirements":
     // human stdout (only in non-JSON mode), JSON warning field (set by
     // print_summary), and tracing log so any log aggregator catches the
     // bypass.
     //
-    // **Phase 4 audit fix (D-impl-3, 2026-04-11):** the tracing emission
+    // the tracing emission
     // is safe in JSON mode because the global tracing subscriber in
     // `main.rs` is pinned to stderr — see the matching audit comment
     // there. Pre-fix the subscriber wrote to stdout and corrupted the
@@ -1065,9 +1060,9 @@ fn print_package_card(blocked: &BlockedPackage) {
             blocked.phases_present.join(", "),
         );
     }
-    // Phase 46 P2 Chunk 3 — static-gate tier annotation for the
+    // — static-gate tier annotation for the
     // interactive card. Absent (None) means the blocked-state row
-    // predates P2; don't print a line rather than showing a
+    // predates; don't print a line rather than showing a
     // misleading "unknown".
     if let Some(tier) = blocked.static_tier {
         println!(
@@ -1086,7 +1081,7 @@ fn print_package_card(blocked: &BlockedPackage) {
     println!();
 }
 
-/// Phase 46 P2 Chunk 4 — enforce the `--yes` refusal contract.
+/// — enforce the `--yes` refusal contract.
 ///
 /// Given the **effective** blocked-set that `--yes` would approve,
 /// return `Err` if any entry carries an explicit non-green static
@@ -1118,7 +1113,7 @@ fn enforce_tiered_yes_gate(blocked: &[BlockedPackage]) -> Result<(), LpmError> {
     // Actionable error shape: count → per-package lines with tier
     // label → clear redirect to the interactive / single-pkg path.
     // Agents parsing the error_code=script error can substring-match
-    // the `"--yes refuses"` prefix, which is stable P2-onward.
+    // the `"--yes refuses"` prefix, which is stable-onward.
     let detail = refusals
         .iter()
         .map(|bp| {
@@ -1182,7 +1177,7 @@ fn truncate_for_display(s: &str, max: usize) -> String {
 /// match what the build pipeline executes — same source-of-truth as the
 /// script-hash function.
 fn print_full_script(_project_dir: &Path, blocked: &BlockedPackage) {
-    // Phase 66 confidence-followup S5a — `find_installed_package_baseline`
+    // confidence-followup S5a — `find_installed_package_baseline`
     // (v2-first, v1-fallback) replaces the v1-only `PackageStore::package_dir`
     // call. Pre-fix, "View full script" emitted "could not read
     // package.json from store" for every v2-installed package because
@@ -1254,7 +1249,7 @@ fn print_full_script(_project_dir: &Path, blocked: &BlockedPackage) {
 fn print_listing(
     state: &BuildState,
     trusted: &TrustedDependencies,
-    // Phase 46 close-out Chunk 3: list is structurally read-only
+    // close-out list is structurally read-only
     // so dry-run is semantically a no-op here, but the envelope
     // still surfaces the flag for uniform agent parsing — agents
     // read `envelope.dry_run` without branching on mode.
@@ -1284,7 +1279,7 @@ fn print_listing(
     ));
     for blocked in &state.blocked_packages {
         print_package_card(blocked);
-        // Phase 46 P7 Chunk 3: surface the version diff card
+        // surface the version diff card
         // alongside each entry's regular card. No-op for entries
         // without a prior binding under the same name (first-time
         // review — nothing to diff against).
@@ -1297,7 +1292,7 @@ fn print_listing(
     Ok(())
 }
 
-/// **Phase 46 P7 Chunk 4 thin wrapper.** Delegates to the shared
+/// Delegates to the shared
 /// canonical helper [`crate::version_diff::blocked_to_json`] so the
 /// approve-scripts JSON paths and the install-pipeline JSON paths
 /// emit byte-identical entry shapes. Pre-Chunk-4 this was an inline
@@ -1308,8 +1303,8 @@ fn blocked_to_json(blocked: &BlockedPackage, trusted: &TrustedDependencies) -> s
 }
 
 // clippy::too_many_arguments: print_summary has grown with each
-// Phase 46 phase (P6 tier annotations, P7 version diff, close-out
-// Chunk 3 dry-run). A wrapper struct would hurt readability more
+// phase (P6 tier annotations, version diff, close-out
+// dry-run). A wrapper struct would hurt readability more
 // than the arg count — every caller inside `run` constructs the
 // same set of fields inline, and there's no reuse across commands.
 // Fold into a struct only if a second command-level surface starts
@@ -1322,7 +1317,7 @@ fn print_summary(
     trusted: &TrustedDependencies,
     initial_was_legacy: bool,
     yes_flag: bool,
-    // Phase 46 close-out Chunk 3: when true, JSON envelope carries
+    // close-out when true, JSON envelope carries
     // `"dry_run": true` so agents can distinguish preview from live
     // runs at parse time; human output reframes "X approved" as
     // "would approve X — no changes written" and drops the
@@ -1367,7 +1362,7 @@ fn print_summary(
             "blocked_count": state.blocked_packages.len(),
             "approved_count": approved.len(),
             "skipped_count": skipped.len(),
-            // Phase 46 P7 Chunk 4: per-entry `version_diff` flows
+            // per-entry `version_diff` flows
             // through `blocked_to_json`. Note: when this fires
             // post-write-back (the --yes and interactive paths),
             // `trusted` includes the just-written binding for
@@ -1419,7 +1414,7 @@ fn _build_state_path_for_tests(project_dir: &Path) -> PathBuf {
     build_state::build_state_path(project_dir)
 }
 
-// ─── Phase 37 M5.3: approve-scripts --global ────────────────────────────
+// ─── approve-scripts --global ────────────────────────────
 
 /// Threshold at which `--group` auto-enables for `--global` review.
 /// Reviewing N-at-once packages one-by-one past this size is typically
@@ -1466,7 +1461,7 @@ async fn run_global_under_store_lock(
     yes: bool,
     list: bool,
     group: bool,
-    // Phase 46 close-out Chunk 3: dry-run mirror of [`run`]'s flag,
+    // close-out dry-run mirror of [`run`]'s flag,
     // for the global surface. When true, each mutating write into
     // `~/.lpm/global/trusted-dependencies.json` — across
     // [`run_global_bulk_yes`], [`run_global_named`], and the three
@@ -1512,7 +1507,7 @@ async fn run_global_under_store_lock(
     // ── Empty set short-circuit (same as project-scoped run) ────
     if aggregate.rows.is_empty() {
         if json_output {
-            // Phase 46 close-out Chunk 3: `dry_run` echoed for
+            // close-out `dry_run` echoed for
             // schema-level uniformity — see the matching comment
             // on the project-side empty-set branch. No mutation
             // happens here regardless of the flag.
@@ -1577,7 +1572,7 @@ async fn run_global_under_store_lock(
 fn print_global_list(
     aggregate: &crate::global_blocked_set::AggregateBlockedSet,
     group: bool,
-    // Phase 46 close-out Chunk 3: see the project-side
+    // close-out see the project-side
     // [`print_listing`] comment — read-only path, flag surfaced for
     // schema uniformity.
     dry_run: bool,
@@ -1688,7 +1683,7 @@ fn print_global_list(
     Ok(())
 }
 
-// ─── Phase 68: rerun-hint helpers (origin-aware) ─────────────────────
+// ─── rerun-hint helpers (origin-aware) ─────────────────────
 //
 // After `lpm approve-scripts --global` writes a binding, the user must
 // reinstall the affected globals to actually re-execute the lifecycle
@@ -1879,9 +1874,9 @@ async fn run_global_named(
     dry_run: bool,
     json_output: bool,
 ) -> Result<(), LpmError> {
-    // M5 audit (GPT finding 1): bare-name lookup must refuse silently-
+    // Audit: (GPT finding 1): bare-name lookup must refuse silently-
     // picking-first when multiple rows match. Aggregate rows are deduped
-    // by `(name, version, integrity, script_hash)` per M5's dedup rule,
+    // by `(name, version, integrity, script_hash)` per the dedup rule,
     // so a single bare name can legitimately resolve to multiple rows
     // (same package at different versions, OR same name@version with
     // different tarball bindings across install roots). Silently
@@ -1914,7 +1909,7 @@ async fn run_global_named(
         }
     };
 
-    // Phase 68: fetch provenance OUTSIDE the tx lock so a slow
+    // fetch provenance OUTSIDE the tx lock so a slow
     // network response doesn't block parallel `--global` invocations.
     let pairs = vec![(row.name.clone(), row.version.clone())];
     let provenance = crate::provenance_fetch::fetch_provenance_for_pkgs(&pairs).await;
@@ -2017,7 +2012,7 @@ enum AggregateLookup<'a> {
 
 /// Resolve an arg to an `AggregateLookup`. Replaces the pre-audit
 /// `find_aggregate_by_arg` which silently took the first match on
-/// bare-name lookups — see M5 audit finding 1.
+/// bare-name lookups — see Audit finding 1.
 fn lookup_aggregate_by_arg<'a>(
     rows: &'a [crate::global_blocked_set::AggregateBlockedRow],
     arg: &str,
@@ -2162,7 +2157,7 @@ async fn commit_global_approval(
 /// Grouped mode prompts by top-level global first, but still records
 /// approvals as individual dependency binding rows.
 ///
-/// Phase 68: provenance is pre-fetched for the full aggregate before
+/// provenance is pre-fetched for the full aggregate before
 /// the prompt loop so per-decision writes don't pay HTTP latency
 /// while the lock is held. The per-decision writes go through
 /// [`commit_global_approval`], which takes `global_tx_lock` so each
@@ -2176,7 +2171,7 @@ async fn run_global_interactive(
 ) -> Result<(), LpmError> {
     use crate::prompt::prompt_err;
 
-    // Phase 68: pre-fetch provenance for every aggregate row in one
+    // pre-fetch provenance for every aggregate row in one
     // parallel batch BEFORE the prompt loop. Cheap (~5–10 packages
     // typical) and the on-disk attestation cache absorbs repeats. Keeps
     // the per-decision tx-lock window bounded to a read-modify-write.
@@ -2338,7 +2333,7 @@ async fn run_global_interactive(
                 let snap = provenance
                     .get(&(row.name.clone(), row.version.clone()))
                     .and_then(|s| s.clone());
-                // Phase 68: per-row write goes through `commit_global_approval`,
+                // per-row write goes through `commit_global_approval`,
                 // which acquires the global tx lock and re-reads trust
                 // from disk so the commit is race-safe against parallel
                 // `approve-scripts --global` invocations. Ctrl+C mid-walk
@@ -2430,8 +2425,8 @@ mod tests {
             script_hash: Some(format!("sha256-{name}-hash")),
             phases_present: vec!["postinstall".to_string()],
             binding_drift: false,
-            // Phase 46 fields default to None for these approve-scripts
-            // tests; dedicated tier-aware tests land in P2+.
+            // fields default to None for these approve-scripts
+            // tests; dedicated tier-aware tests land in+.
             static_tier: None,
             provenance_at_capture: None,
             published_at: None,
@@ -2440,9 +2435,9 @@ mod tests {
         }
     }
 
-    /// Phase 46 P2 Chunk 4 helper: `make_blocked` + explicit tier.
+    /// helper: `make_blocked` + explicit tier.
     /// Used by the `--yes` refusal tests below to construct state
-    /// that would be produced by a fresh P2 install pipeline.
+    /// that would be produced by a fresh install pipeline.
     fn make_blocked_tiered(
         name: &str,
         version: &str,
@@ -2457,7 +2452,7 @@ mod tests {
         let state = BuildState {
             state_version: BUILD_STATE_VERSION,
             blocked_set_fingerprint: "sha256-test".to_string(),
-            captured_at: "2026-04-11T00:00:00Z".to_string(),
+            captured_at: "T00:00:00Z".to_string(),
             blocked_packages: blocked,
         };
         crate::build_state::write_build_state(project_dir, &state).unwrap();
@@ -2768,7 +2763,7 @@ mod tests {
 
     #[test]
     fn schema_version_bumped_for_static_tier() {
-        // Phase 46 P2 Chunk 3: bumped to 2 when `static_tier` was
+        // bumped to 2 when `static_tier` was
         // added to the blocked-entry JSON shape. If this test fails
         // because the version dropped, either a revert or a second
         // migration is needed — don't just bump the assertion.
@@ -2777,14 +2772,14 @@ mod tests {
 
     #[test]
     fn schema_version_bumped_for_version_diff() {
-        // Phase 46 P7 Chunk 4: bumped to 3 when `version_diff` was
+        // bumped to 3 when `version_diff` was
         // added to the blocked-entry JSON shape. If this test fails
         // because the version dropped, either a revert or a second
         // migration is needed — don't just bump the assertion.
         const _: () = assert!(SCHEMA_VERSION >= 3);
     }
 
-    // ── Phase 46 P2 Chunk 3 — blocked_to_json + tier labels ─────────
+    // ── — blocked_to_json + tier labels ─────────
 
     #[test]
     fn blocked_to_json_emits_static_tier_green() {
@@ -2894,7 +2889,7 @@ mod tests {
         }
     }
 
-    // ── Phase 46 P2 Chunk 4 — enforce_tiered_yes_gate ───────────────
+    // ── — enforce_tiered_yes_gate ───────────────
     //
     // Pure tests for the refusal helper. End-to-end `--yes` tests
     // live in the `run()` suite below (same test file, later
@@ -2926,7 +2921,7 @@ mod tests {
     fn yes_gate_allows_none_tiered_legacy_state() {
         // Pre-P2 persisted state carries static_tier = None. The
         // gate must pass `None` through to preserve existing --yes
-        // muscle memory during a P1 → P2 upgrade; the next install
+        // muscle memory during a → upgrade; the next install
         // will recapture the state with real tiers.
         let blocked = vec![make_blocked("esbuild", "0.25.1")];
         assert!(blocked[0].static_tier.is_none());
@@ -3028,18 +3023,18 @@ mod tests {
         );
     }
 
-    // ── Phase 32 Phase 4 M6: end-to-end state-machine tests ─────────
+    // ── end-to-end state-machine tests ─────────
     //
     // These exercise the full install → block → review → approve → build
-    // pipeline by composing M3 (build_state capture) with M4 (approve-scripts)
-    // and re-running M3 to verify the suppression rule honors the new
+    // pipeline by composing build_state capture with approve-scripts
+    // and re-running to verify the suppression rule honors the new
     // approval. The actual `lpm rebuild` script execution is out of scope
-    // for unit tests (it spawns child processes); the strict gate that
-    // M5 wires in is verified separately by the build.rs::tests::build_strict_gate_*
+    // for unit tests (it spawns child processes); the strict gate is
+    // verified separately by the build.rs::tests::build_strict_gate_*
     // tests.
     //
     // The state machine cells we lock in:
-    //   1. install ⇒ block (M3 alone)
+    //   1. install ⇒ block
     //   2. install ⇒ block ⇒ approve via --yes ⇒ install ⇒ silent
     //   3. install ⇒ block ⇒ approve specific pkg ⇒ install ⇒ silent
     //   4. install ⇒ block ⇒ approve ⇒ script body changes ⇒ install ⇒ re-blocked
@@ -3262,7 +3257,7 @@ mod tests {
 
     #[tokio::test]
     async fn e2e_install_with_legacy_array_form_does_not_break_install() {
-        // Backwards-compat: a project with the pre-Phase-4 legacy array
+        // Backwards-compat: a project with the pre-existing legacy array
         // form must still install. The strict gate sees LegacyNameOnly
         // for the listed package and treats it as approved (with a
         // deprecation warning at build time, but install is fine).
@@ -3300,7 +3295,7 @@ mod tests {
 
         // Legacy bare-name approval is enough to NOT block — install
         // proceeds silently. The deprecation warning is emitted at
-        // `lpm rebuild` time (M5), not here.
+        // `lpm rebuild` time, not here.
         assert!(cap.state.blocked_packages.is_empty());
         assert!(!cap.should_emit_warning);
     }
@@ -3375,7 +3370,7 @@ mod tests {
         assert!(policy_after.can_run_scripts("sharp"));
     }
 
-    // ── Phase 46 P2 Chunk 4 — --yes refusal e2e via run() ──────────
+    // ── — --yes refusal e2e via run() ──────────
 
     #[tokio::test]
     async fn e2e_yes_refuses_when_any_entry_is_amber_and_manifest_stays_unchanged() {
@@ -3494,7 +3489,7 @@ mod tests {
     #[tokio::test]
     async fn e2e_yes_passes_through_when_static_tier_is_none_legacy_state() {
         // Pre-P2 upgrade path: if the persisted BuildState predates
-        // P2 (static_tier = None on every entry), --yes must still
+        // (static_tier = None on every entry), --yes must still
         // work so upgrading LPM doesn't silently break existing
         // agent/CI flows. The next fresh install will recapture
         // tiers and from then on the gate applies.
@@ -3544,7 +3539,7 @@ mod tests {
         assert!(build_state::read_build_state(project.path()).is_some());
     }
 
-    // ── Phase 4 audit Finding 2 — filter persisted state through current trust ──
+    // ── audit Finding 2 — filter persisted state through current trust ──
     //
     // The persisted build-state.json is only refreshed by `lpm install`. If
     // the user approves a package via `lpm approve-scripts` and then runs
@@ -3553,20 +3548,20 @@ mod tests {
     // against the stale state file. Pre-fix the state was treated as
     // authoritative and already-approved packages re-appeared in --list.
 
-    // ── Effective blocked set helper (Phase 4 D-impl-2 surgical primitive) ──
+    // ── Effective blocked set helper ( surgical primitive) ──
     //
     // The pure helper that filters the persisted state through the current
     // trust. Tested directly because reaching it through the `run` function
     // pollutes stdout with TUI / JSON formatting and makes assertions noisy.
 
-    /// **AUDIT REGRESSION (Phase 4 D-impl-2):** filter must REMOVE entries
+    /// **AUDIT REGRESSION ():** filter must REMOVE entries
     /// covered by a Strict match in the current trustedDependencies.
     #[test]
     fn compute_effective_blocked_set_removes_strict_matches() {
         let state = BuildState {
             state_version: BUILD_STATE_VERSION,
             blocked_set_fingerprint: "sha256-test".into(),
-            captured_at: "2026-04-11T00:00:00Z".into(),
+            captured_at: "T00:00:00Z".into(),
             blocked_packages: vec![
                 make_blocked("esbuild", "0.25.1"),
                 make_blocked("sharp", "0.33.0"),
@@ -3594,7 +3589,7 @@ mod tests {
         assert_eq!(effective[0].name, "sharp");
     }
 
-    /// **AUDIT REGRESSION (Phase 4 D-impl-2):** filter must REMOVE entries
+    /// **AUDIT REGRESSION ():** filter must REMOVE entries
     /// covered by a LegacyNameOnly match (the legacy bare-name approval is
     /// honored at install time, so it's not "blocked").
     #[test]
@@ -3602,7 +3597,7 @@ mod tests {
         let state = BuildState {
             state_version: BUILD_STATE_VERSION,
             blocked_set_fingerprint: "sha256-test".into(),
-            captured_at: "2026-04-11T00:00:00Z".into(),
+            captured_at: "T00:00:00Z".into(),
             blocked_packages: vec![make_blocked("esbuild", "0.25.1")],
         };
         let trusted = TrustedDependencies::Legacy(vec!["esbuild".into()]);
@@ -3619,7 +3614,7 @@ mod tests {
         );
     }
 
-    /// **AUDIT REGRESSION (Phase 4 D-impl-2):** drifted entries must
+    /// **AUDIT REGRESSION ():** drifted entries must
     /// REMAIN in the effective blocked set even when the manifest has
     /// an entry for the same `name@version`. Drift is the whole reason
     /// we re-review.
@@ -3630,7 +3625,7 @@ mod tests {
         let state = BuildState {
             state_version: BUILD_STATE_VERSION,
             blocked_set_fingerprint: "sha256-test".into(),
-            captured_at: "2026-04-11T00:00:00Z".into(),
+            captured_at: "T00:00:00Z".into(),
             blocked_packages: vec![blocked],
         };
         let mut map = std::collections::HashMap::new();
@@ -3657,14 +3652,14 @@ mod tests {
         );
     }
 
-    /// **AUDIT REGRESSION (Phase 4 D-impl-2):** unrelated entries are
+    /// **AUDIT REGRESSION ():** unrelated entries are
     /// untouched (NotTrusted entries always stay blocked).
     #[test]
     fn compute_effective_blocked_set_keeps_not_trusted_entries() {
         let state = BuildState {
             state_version: BUILD_STATE_VERSION,
             blocked_set_fingerprint: "sha256-test".into(),
-            captured_at: "2026-04-11T00:00:00Z".into(),
+            captured_at: "T00:00:00Z".into(),
             blocked_packages: vec![make_blocked("esbuild", "0.25.1")],
         };
         let trusted = TrustedDependencies::default();
@@ -3677,7 +3672,7 @@ mod tests {
         assert_eq!(effective.len(), 1);
     }
 
-    /// **AUDIT REGRESSION (Phase 4 D-impl-1 + D-impl-2 interaction):**
+    /// **AUDIT REGRESSION ( +  interaction):**
     /// after a legacy upgrade, an `<name>@*` preserve key must be
     /// honored by the effective-blocked-set filter. This is the
     /// composition test for both fixes.
@@ -3686,7 +3681,7 @@ mod tests {
         let state = BuildState {
             state_version: BUILD_STATE_VERSION,
             blocked_set_fingerprint: "sha256-test".into(),
-            captured_at: "2026-04-11T00:00:00Z".into(),
+            captured_at: "T00:00:00Z".into(),
             blocked_packages: vec![make_blocked("esbuild", "0.25.1")],
         };
         // Simulate post-upgrade state: legacy esbuild → esbuild@*
@@ -3705,7 +3700,7 @@ mod tests {
         );
     }
 
-    /// **AUDIT REGRESSION (Phase 4 D-impl-2):** `--list` must NOT include
+    /// **AUDIT REGRESSION ():** `--list` must NOT include
     /// any package that the current `package.json::lpm.trustedDependencies`
     /// already covers strictly.
     #[tokio::test]
@@ -3744,7 +3739,7 @@ mod tests {
         // The fix is in the rendering, not in the state file.
     }
 
-    /// **AUDIT REGRESSION (Phase 4 D-impl-2):** `--yes` must skip already-approved
+    /// **AUDIT REGRESSION ():** `--yes` must skip already-approved
     /// packages and not re-write them.
     #[tokio::test]
     async fn approve_scripts_yes_skips_packages_already_strict_approved_in_manifest() {
@@ -3793,7 +3788,7 @@ mod tests {
         );
     }
 
-    /// **AUDIT REGRESSION (Phase 4 D-impl-2):** `<pkg>` must reject a package
+    /// **AUDIT REGRESSION ():** `<pkg>` must reject a package
     /// argument that points at an already-approved entry, with a clear
     /// "already approved" message rather than a useless re-approval.
     #[tokio::test]
@@ -3828,7 +3823,7 @@ mod tests {
         );
     }
 
-    /// **AUDIT REGRESSION (Phase 4 D-impl-2):** if EVERY package in the
+    /// **AUDIT REGRESSION ():** if EVERY package in the
     /// persisted state is already approved, `--list` should report nothing
     /// to approve (empty effective blocked set), not the stale entries.
     #[tokio::test]
@@ -3877,7 +3872,7 @@ mod tests {
         );
     }
 
-    /// **AUDIT REGRESSION (Phase 4 D-impl-2):** drift overrides "already approved".
+    /// **AUDIT REGRESSION ():** drift overrides "already approved".
     /// If the persisted state shows a script_hash that drifts from the
     /// stored binding, the package MUST appear in the effective blocked
     /// set (this is the whole point of script-hash binding).
@@ -3921,7 +3916,7 @@ mod tests {
         );
     }
 
-    // ── Phase 4 audit Finding 3 — --json mode emits exactly one JSON payload ──
+    // ── audit Finding 3 — --json mode emits exactly one JSON payload ──
     //
     // The bug: emit_yes_warning_banner unconditionally calls tracing::warn!,
     // and the tracing subscriber in main.rs writes to stdout (no
@@ -3955,7 +3950,7 @@ mod tests {
         // CLI-level subprocess test verifies the stdout layer.
     }
 
-    // ─── M5.3: approve-scripts --global ───────────────────────────────
+    // ─── approve-scripts --global ───────────────────────────────
 
     use crate::build_state::compute_blocked_set_fingerprint;
     use crate::global_blocked_set::{AggregateBlockedRow, AggregateBlockedSet};
@@ -3997,7 +3992,7 @@ mod tests {
                 script_hash: row.script_hash,
                 phases_present: row.phases_present,
                 binding_drift: row.binding_drift,
-                // Phase 46 fields default to None when constructing
+                // fields default to None when constructing
                 // from the `ApproveRow` test helper. The row type
                 // doesn't carry tier/provenance/etc. yet; when later
                 // phases need them, extend `ApproveRow` in lockstep.
@@ -4065,7 +4060,7 @@ mod tests {
         ));
     }
 
-    /// M5 audit finding 1 (Medium): bare-name lookup against a rows set
+    /// Audit: finding 1 (Medium): bare-name lookup against a rows set
     /// where two versions exist for the same name MUST return Ambiguous,
     /// not silently take the first. Pre-fix `find_aggregate_by_arg` did
     /// the latter — a latent data-corruption bug where
@@ -4091,7 +4086,7 @@ mod tests {
     /// name@version CAN be ambiguous too: two install roots that contain
     /// the same `name@version` but with different (integrity, script_hash)
     /// bindings (e.g., tarball swap between installs) produce two
-    /// aggregate rows per M5's dedup rule. User MUST disambiguate; silent
+    /// aggregate rows per the dedup rule. User MUST disambiguate; silent
     /// first-match would approve the wrong binding.
     #[test]
     fn lookup_aggregate_by_arg_is_ambiguous_when_name_at_version_matches_multiple_bindings() {
@@ -4271,7 +4266,7 @@ mod tests {
         assert_eq!(GROUP_AUTO_THRESHOLD, 10);
     }
 
-    // ─── Phase 46 P7 Chunk 3 — interactive choice mapping ─────────
+    // ─── — interactive choice mapping ─────────
     //
     // The Select itself can't be unit-tested without driving cliclack
     // (which expects a TTY); these tests pin the pure decision
@@ -4310,12 +4305,12 @@ mod tests {
         );
     }
 
-    // ── Phase 48 P0 sub-slice 6d follow-up — capability-widening
+    // ── capability-widening
     //    must flow through `compute_effective_blocked_set` ──
 
     /// Reviewer's Medium finding: the discovery-side filter
     /// drops strict-matched rows, which silently omits the
-    /// Phase 48 capability-drift case. Fix: the filter consults
+    /// capability-drift case. Fix: the filter consults
     /// the capability gate, so a strict-matched package whose
     /// current capability request widens stays in the effective
     /// blocked set for `lpm approve-scripts` to surface.
@@ -4326,7 +4321,7 @@ mod tests {
         let state = BuildState {
             state_version: build_state::BUILD_STATE_VERSION,
             blocked_set_fingerprint: "fp".into(),
-            captured_at: "2026-04-23T00:00:00Z".into(),
+            captured_at: "T00:00:00Z".into(),
             blocked_packages: vec![BlockedPackage {
                 name: "esbuild".into(),
                 version: "0.25.1".into(),
@@ -4380,7 +4375,7 @@ mod tests {
         let state = BuildState {
             state_version: build_state::BUILD_STATE_VERSION,
             blocked_set_fingerprint: "fp".into(),
-            captured_at: "2026-04-23T00:00:00Z".into(),
+            captured_at: "T00:00:00Z".into(),
             blocked_packages: vec![BlockedPackage {
                 name: "esbuild".into(),
                 version: "0.25.1".into(),
@@ -4417,7 +4412,7 @@ mod tests {
         );
     }
 
-    // ─── Phase 68: provenance + tx-lock + origin-aware banner ────────
+    // ─── provenance + tx-lock + origin-aware banner ────────
 
     // End-to-end provenance persistence (cache hit → binding has
     // populated `provenance_at_approval`) lives in the workflow tests

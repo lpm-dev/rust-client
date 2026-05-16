@@ -1,4 +1,4 @@
-//! Phase 46 P3 release-age cooldown config loader.
+//! release-age cooldown config loader.
 //!
 //! Resolves the effective `minimumReleaseAge` (in seconds) for a project
 //! install by walking, highest precedence first:
@@ -9,16 +9,15 @@
 //!    via [`lpm_workspace::read_package_json`]; tolerant of missing /
 //!    malformed manifest (matches [`lpm_security::SecurityPolicy::from_package_json`]).
 //! 3. **Global**: `~/.lpm/config.toml` key `minimum-release-age-secs`.
-//!    Read with a path-aware fallible loader (mirrors Phase 33's
-//!    [`crate::save_config::SaveConfigLoader`] — malformed TOML or a
+//!    Read with a path-aware fallible loader (mirrors  the //!    [`crate::save_config::SaveConfigLoader`] — malformed TOML or a
 //!    garbage value surfaces a file-pathed error rather than being
 //!    silently ignored as [`crate::commands::config::GlobalConfig::load`]
 //!    would do).
-//! 4. **Default**: 86400 (24h). Matches pnpm v10 and the Phase 46 plan §8.1.
+//! 4. **Default**: 86400 (24h). Matches pnpm v10 and the plan.
 //!
 //! `./lpm.toml` is deliberately NOT in this chain: per D14 the project-
 //! local TOML is scoped to save-policy keys, and the general project-
-//! config loader is a separate follow-up (§16).
+//! config loader is a separate follow-up.
 //!
 //! The resolver returns `Result<u64, LpmError>`. Only the global-TOML
 //! layer can raise (file read, parse, or value-shape errors). The CLI
@@ -210,7 +209,7 @@ fn read_package_json_min_age(pkg_json_path: &Path) -> Option<u64> {
 /// Missing file → `Ok(None)`. Malformed TOML, non-table top level, or a
 /// `minimum-release-age-secs` value that isn't a non-negative integer
 /// (native or string-coerced) → `Err` with the file path baked in,
-/// mirroring Phase 33's save-config loader error style.
+/// mirroring the save-config loader error style.
 ///
 /// String coercion accepts values like `"86400"` because the generic
 /// `lpm config set <key> <value>` command writes every value as a TOML
@@ -475,7 +474,7 @@ mod tests {
         );
     }
 
-    /// Reviewer finding (Chunk 1): `u64::from_str("+5")` returns `Ok(5)`,
+    /// Reviewer finding : `u64::from_str("+5")` returns `Ok(5)`,
     /// so without an explicit sign-prefix rejection the global-TOML
     /// string path would silently accept `"+259200"` even though the
     /// CLI flag rejects `+5h`. Both string-coercion sites now route

@@ -645,7 +645,7 @@ mod tests {
         assert!(!backup_path.exists());
     }
 
-    // Finding #2: extensionless dotfiles backup path
+    // Extensionless dotfiles backup path
     #[test]
     fn backup_path_dotfile_without_extension() {
         let dir = tempfile::tempdir().unwrap();
@@ -691,7 +691,7 @@ mod tests {
         assert_eq!(fs::read_to_string(&npmrc).unwrap(), "original");
     }
 
-    // Finding #3: backup permissions
+    // Backup permissions
     #[cfg(unix)]
     #[test]
     fn backup_file_permissions_restricted() {
@@ -715,7 +715,7 @@ mod tests {
         );
     }
 
-    // Finding #7: manifest-based rollback
+    // Manifest-based rollback
     #[test]
     fn rollback_from_backups_only_restores_manifested_files() {
         let dir = tempfile::tempdir().unwrap();
@@ -939,9 +939,8 @@ mod tests {
 
     #[test]
     fn v2_rollback_restores_nested_existing_file() {
-        // The Phase 65 #35 scenario: a patch file under patches/ existed
-        // before migration, was modified by migrate, and must be restored
-        // to its original content on rollback.
+        // A patch file under patches/ that existed before migration, was
+        // modified by migrate, and must be restored on rollback.
         let dir = tempfile::tempdir().unwrap();
         fs::create_dir_all(dir.path().join("patches")).unwrap();
         let nested = dir.path().join("patches").join("react@18.0.0.patch");

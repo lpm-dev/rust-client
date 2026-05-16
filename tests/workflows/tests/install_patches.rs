@@ -1,12 +1,12 @@
 //! Workflow tests for `lpm install` + the patch-apply pipeline.
 //!
-//! Phase 32 Phase 6 acceptance criteria + 2026-04-12 audit fixes:
+//! Acceptance criteria and audit fixes for the patch feature:
 //! - Patches apply after the linker pass (canonical isolated location).
 //! - Idempotent reruns are no-ops (no double-apply, no zero-op summary
 //!   in JSON or human output).
 //! - Drift / missing patch / fuzzy hunk are HARD install errors.
 //! - `--offline` enforces patch-fingerprint integrity (mirror of the
-//!   Phase 5 overrides offline contract).
+//!   overrides offline contract).
 //! - State-file lifecycle: created on apply, deleted when patches
 //!   removed.
 //! - `--json` envelope's `applied_patches[]` reflects per-run work,
@@ -20,7 +20,7 @@ mod support;
 use std::path::PathBuf;
 use support::{TempProject, lpm_with_registry};
 
-/// Phase 66 Phase 4f — every test in this file asserts on the
+/// Every test in this file asserts on the
 /// `<project>/.lpm/wrappers/<seg>/...` path shape, which is v1
 /// isolated layout. The 4f default flip moved
 /// `LinkerMode::default()` to Hoisted, so a no-flag install would
@@ -309,6 +309,71 @@ fn install_patches_idempotent_across_repeated_installs() {
         .path()
         .join(".lpm/wrappers/lodash@4.17.21/node_modules/lodash/index.js");
     assert_eq!(std::fs::read_to_string(&nm_file).unwrap(), patched);
+}
+
+/// **Slice B install-path coverage.** A git-produced rename+edit patch
+/// (the kind users get from `git diff` after editing+moving a file)
+/// must flow through the install pipeline end-to-end: the
+/// `(name, version)` filter in `apply_patches_for_install`, the
+/// `apply_patch` rename arms, and the resulting `node_modules` state.
+///
+/// This complements the unit tests (which prove `apply_patch` works on
+/// synthetic `MaterializedPackage` fixtures) by exercising the actual
+/// install seam.
+#[test]
+fn install_patches_applies_git_rename_with_edit() {
+    let project = TempProject::empty("");
+    let patch_text = concat!(
+        "diff --git a/src/old.js b/src/new.js\n",
+        "similarity index 60%\n",
+        "rename from src/old.js\n",
+        "rename to src/new.js\n",
+        "--- a/src/old.js\n",
+        "+++ b/src/new.js\n",
+        "@@ -1,2 +1,2 @@\n",
+        " keep this line\n",
+        "-this changes\n",
+        "+THIS CHANGED\n",
+    );
+    build_patch_install_fixture(
+        &project,
+        "install-rename-edit",
+        "lodash",
+        "4.17.21",
+        &[("src/old.js", "keep this line\nthis changes\n")],
+        patch_text,
+    );
+
+    lpm_isolated(&project, "http://127.0.0.1:1")
+        .args(["install", "--offline"])
+        .assert()
+        .success();
+
+    let nm_root = project
+        .path()
+        .join(".lpm/wrappers/lodash@4.17.21/node_modules/lodash");
+    assert!(
+        !nm_root.join("src/old.js").exists(),
+        "rename source must be gone after apply"
+    );
+    let renamed = nm_root.join("src/new.js");
+    assert!(renamed.exists(), "rename destination must exist");
+    assert_eq!(
+        std::fs::read_to_string(&renamed).unwrap(),
+        "keep this line\nTHIS CHANGED\n",
+        "rename destination must carry the post-edit bytes"
+    );
+
+    // Idempotency: a second install leaves the file state unchanged.
+    lpm_isolated(&project, "http://127.0.0.1:1")
+        .args(["install", "--offline"])
+        .assert()
+        .success();
+    assert!(!nm_root.join("src/old.js").exists());
+    assert_eq!(
+        std::fs::read_to_string(&renamed).unwrap(),
+        "keep this line\nTHIS CHANGED\n"
+    );
 }
 
 /// Drift in the store's `.integrity` between apply-time and recorded

@@ -1,4 +1,4 @@
-//! Phase 46.2 — curated corpus mode end-to-end smoke test.
+//! Curated corpus mode end-to-end smoke test.
 //!
 //! Runs `lpm-audit-corpus --corpus=curated` against the 523-entry
 //! static-gate fixture (the same fixture

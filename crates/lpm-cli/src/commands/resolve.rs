@@ -1,8 +1,8 @@
 use crate::output;
 use lpm_common::LpmError;
+use lpm_common::color::Painted;
 use lpm_registry::RegistryClient;
 use lpm_resolver::resolve_dependencies;
-use owo_colors::OwoColorize;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
@@ -39,12 +39,12 @@ pub async fn run(
         deps.len().to_string().bold()
     ));
 
-    // Phase 35 Step 6 fix: use the injected client. Pre-fix this site
+    // Step 6 fix: use the injected client. Pre-fix this site
     // hardcoded `https://lpm.dev` and only honored `LPM_TOKEN`,
     // ignoring `--registry` and the stored session entirely. The
     // injected client carries both the user's `--registry` URL and
     // the shared `SessionManager`, so this respects every layer of
-    // the Phase 35 auth model with zero local construction.
+    // the auth model with zero local construction.
     let arc_client = Arc::new(client.clone_with_config());
 
     match resolve_dependencies(arc_client, deps).await {

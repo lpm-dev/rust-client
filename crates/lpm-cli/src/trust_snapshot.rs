@@ -1,4 +1,4 @@
-//! Phase 46 P1 — `.lpm/trust-snapshot.json` persistence and diff.
+//! — `.lpm/trust-snapshot.json` persistence and diff.
 //!
 //! Every successful `lpm install` writes a snapshot of the current
 //! `package.json > lpm > trustedDependencies` into
@@ -6,7 +6,7 @@
 //! install, the diff against this snapshot surfaces **new trust
 //! bindings** — entries that appeared in the manifest since the last
 //! install but were not personally approved on this machine (see plan
-//! §4.2 for the motivating scenario: a "bump dep" PR that silently
+//! for the motivating scenario: a "bump dep" PR that silently
 //! adds a `trustedDependencies` entry gets flagged instead of slipping
 //! past code review).
 //!
@@ -27,7 +27,7 @@
 //! Same policy as `build-state.json` (see `BUILD_STATE_VERSION`
 //! comment): bump only on breaking changes. Optional field additions
 //! default to `None` and silently pass through older readers, so
-//! `SCHEMA_VERSION = 1` should suffice for all of Phase 46.
+//! `SCHEMA_VERSION = 1` should suffice for all of.
 
 use lpm_common::LpmError;
 use lpm_workspace::TrustedDependencies;
@@ -50,7 +50,7 @@ pub const FILENAME: &str = "trust-snapshot.json";
 /// One binding captured in the snapshot.
 ///
 /// Minimal 2-field projection of `TrustedDependencyBinding`. We do
-/// NOT capture Phase 46 audit fields (`approved_by`,
+/// NOT capture audit fields (`approved_by`,
 /// `approved_by_model_exact`, etc.) here — those belong to the
 /// manifest's audit trail, not to the "did-the-set-change" diff.
 /// Keeping the snapshot payload lean also means reader / writer
@@ -140,7 +140,7 @@ impl TrustSnapshot {
     ///
     /// Note: we deliberately do NOT flag removals or binding changes
     /// here. The diff exists to catch silent *additions* from a
-    /// poisoned PR (plan §4.2); removals are user-initiated via
+    /// poisoned PR; removals are user-initiated via
     /// `lpm trust prune` (chunk C) and binding changes are already
     /// handled by the `BindingDrift` path in the install pipeline.
     pub fn diff_additions(&self, previous: Option<&TrustSnapshot>) -> Vec<String> {
@@ -214,7 +214,7 @@ pub fn write_snapshot(project_dir: &Path, snap: &TrustSnapshot) -> Result<(), Lp
     Ok(())
 }
 
-/// Format the new-bindings notice per plan §4.2.
+/// Format the new-bindings notice
 ///
 /// Empty input returns `None` so the caller can skip printing. When
 /// non-empty, the returned string is ready to pass to

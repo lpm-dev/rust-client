@@ -1,3 +1,4 @@
+pub mod color;
 pub mod error;
 pub mod integrity;
 pub mod known_projects;

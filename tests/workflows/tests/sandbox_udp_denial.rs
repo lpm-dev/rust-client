@@ -1,8 +1,8 @@
-//! Phase 46.1.1 sandbox UDP / raw / AF_PACKET / AF_NETLINK
+//! Sandbox UDP / raw / AF_PACKET / AF_NETLINK
 //! denial — workflow gate.
 //!
-//! Sibling of [`sandbox_network_denial.rs`] (Phase 46.1's TCP
-//! gate) and [`sandbox_filesystem_denial.rs`] (Phase 46 P5). The
+//! Sibling of [`sandbox_network_denial.rs`] (the TCP
+//! gate) and [`sandbox_filesystem_denial.rs`] (P5). The
 //! TCP test pins outbound-TCP denial via landlock V4; this test
 //! pins the second enforcement layer: a seccomp-bpf filter that
 //! denies the `socket(2)` variants landlock V4 doesn't reach.
@@ -15,7 +15,7 @@
 //! 1. **UDP case** — synthetic postinstall calls
 //!    `dgram.createSocket('udp4').send(...)`. Node's `dgram`
 //!    binding maps to `socket(AF_INET, SOCK_DGRAM)` inside
-//!    libuv; the Phase 46.1.1 seccomp filter must return
+//!    libuv; the seccomp filter must return
 //!    `EACCES` from that syscall, so the send callback fires
 //!    with an error and the script exits non-zero. Two
 //!    assertions: (a) sandbox-denial token in stderr, (b) the
@@ -46,10 +46,10 @@
 //!
 //! ## Linux-only
 //!
-//! Phase 46.1.1 is the Linux follow-up to Phase 46.1; the
+//! The UDP/raw seccomp filter is the Linux follow-up to TCP denial; the
 //! seccomp filter only installs in the linux backend. macOS
 //! Seatbelt already covers every socket family
-//! unconditionally (Phase 46.1 / `(deny default)`), so this
+//! unconditionally (`(deny default)`), so this
 //! test would be redundant there.
 
 #![cfg(target_os = "linux")]
@@ -106,7 +106,7 @@ setTimeout(() => {
     process.exit(1);
 }, 1000);
 
-sock.send(Buffer.from('phase46.1.1-probe'), port, '127.0.0.1', (err) => {
+sock.send(Buffer.from('udp-probe'), port, '127.0.0.1', (err) => {
     if (err) {
         console.error('udp-send-failed: code=' + (err.code || '') + ' message=' + (err.message || ''));
         try { sock.close(); } catch (_) {}
@@ -329,7 +329,7 @@ fn signals_sandbox_denial(combined: &str) -> bool {
 
 // ─── Tests ─────────────────────────────────────────────────────────────
 
-/// UDP case (Phase 46.1.1 load-bearing). Synthetic postinstall
+/// UDP case (load-bearing). Synthetic postinstall
 /// opens a `dgram` socket and `send`s a probe payload to a
 /// tokio-bound UDP listener at `127.0.0.1:<port>`. The seccomp
 /// filter MUST return EACCES from the underlying `socket(AF_INET,
@@ -337,7 +337,7 @@ fn signals_sandbox_denial(combined: &str) -> bool {
 /// recv ever sees the payload.
 ///
 /// Linux-only: macOS Seatbelt already denies UDP unconditionally;
-/// Phase 46.1.1 is the Linux-side parity push for the families
+/// This is the Linux-side parity push for the families
 /// landlock V4 leaves open.
 #[cfg(target_os = "linux")]
 #[tokio::test]
@@ -397,7 +397,7 @@ async fn postinstall_udp_send_is_denied_listener_silent() {
     let combined = format!("{stderr}\n{stdout}");
     assert!(
         signals_sandbox_denial(&combined),
-        "Phase 46.1.1 seccomp denial signal absent from install output. \
+        "seccomp denial signal absent from install output. \
          Without EPERM / EACCES / 'operation not permitted' / 'permission denied' \
          in stderr, the script failure could have any cause; the test asserts \
          SANDBOX enforcement of UDP socket() specifically.\n\
@@ -441,7 +441,7 @@ async fn postinstall_udp_send_is_denied_listener_silent() {
             // Timeout: nothing arrived — the contract we want.
         }
         Ok(Ok(n)) => panic!(
-            "Phase 46.1.1 seccomp filter let a UDP packet through. Listener \
+            "seccomp filter let a UDP packet through. Listener \
              received {n} bytes: {:?}\nstderr:\n{stderr}",
             &buf[..n.min(buf.len())],
         ),
@@ -569,7 +569,7 @@ async fn postinstall_raw_packet_netlink_sockets_are_denied() {
         // one family slipped through. Surface the full output
         // so the test author can see WHICH family failed.
         panic!(
-            "Phase 46.1.1 seccomp filter let at least one of raw / AF_PACKET / \
+            "seccomp filter let at least one of raw / AF_PACKET / \
              AF_NETLINK socket() through. Expected 'all socket families denied' \
              in stdout. signals_sandbox_denial={}\n\
              stderr:\n{stderr}\nstdout:\n{stdout}",

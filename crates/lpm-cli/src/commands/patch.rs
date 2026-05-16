@@ -1,4 +1,4 @@
-//! **Phase 32 Phase 6 — `lpm patch` and `lpm patch-commit`.**
+//!
 //!
 //! Two-step workflow:
 //!
@@ -20,28 +20,72 @@
 
 use crate::output;
 use crate::patch_engine::{
-    GeneratedPatch, STAGING_BREADCRUMB_FILE, copy_store_to_staging, generate_patch, parse_patch_key,
+    GeneratedPatch, PatchSelector, STAGING_BREADCRUMB_FILE, copy_store_to_staging, generate_patch,
+    parse_patch_selector, resolve_patch_selector,
 };
 use lpm_common::LpmError;
+use lpm_common::color::Painted;
+use lpm_lockfile::Lockfile;
 use lpm_store::find_installed_package_baseline;
-use owo_colors::OwoColorize;
 use serde_json::json;
 use std::path::Path;
 
 // ── lpm patch ────────────────────────────────────────────────────────
 
-/// `lpm patch <name>@<version>` — extract a store copy to a staging dir.
-pub async fn run_patch(_project_dir: &Path, key: &str, json_output: bool) -> Result<(), LpmError> {
+/// `lpm patch <selector>` — extract a store copy to a staging dir.
+///
+/// `<selector>` accepts a bare name (`lodash`), an exact pin
+/// (`lodash@4.17.21`), or a semver range (`lodash@^4.0.0`). Bare names
+/// and ranges resolve to an exact pin against the project lockfile
+/// BEFORE entering the store lock scope; the persisted-key path that
+/// runs under the lock always sees an exact `(name, version)`.
+///
+/// **Why selector resolution runs outside the lock:** the lockfile
+/// read is project-scoped and unrelated to the global store. Holding
+/// the store lock during a "your selector matches three packages"
+/// error print would block other `lpm patch` / `lpm install`
+/// invocations for no reason. The structural seam — parse and
+/// resolve happen in this function, lock and staging happen in
+/// `run_patch_inner` — is the contract the unit tests exercise.
+pub async fn run_patch(project_dir: &Path, input: &str, json_output: bool) -> Result<(), LpmError> {
+    let selector = parse_patch_selector(input)?;
+    let (name, version) = match selector {
+        PatchSelector::Exact { name, version } => (name, version),
+        PatchSelector::BareName(_) | PatchSelector::Range { .. } => {
+            let lockfile = read_lockfile_for_patch_selector(project_dir)?;
+            resolve_patch_selector(&lockfile, &selector)?
+        }
+    };
     let lock_path = lpm_common::LpmRoot::from_env()?.store_lock();
-    lpm_common::with_shared_lock_async(lock_path, run_patch_inner(key, json_output)).await
+    lpm_common::with_shared_lock_async(lock_path, run_patch_inner(name, version, json_output)).await
 }
 
-async fn run_patch_inner(key: &str, json_output: bool) -> Result<(), LpmError> {
-    let (name, version) = parse_patch_key(key)?;
+/// Read the project lockfile, or surface an actionable error if the
+/// project hasn't been installed yet. Bare-name / range selectors
+/// REQUIRE a lockfile — exact pins do not (the legacy workflow tests
+/// exercise `lpm patch <name>@<exact>` on projects with no lockfile,
+/// and that capability must be preserved).
+fn read_lockfile_for_patch_selector(project_dir: &Path) -> Result<Lockfile, LpmError> {
+    let lock_path = project_dir.join(lpm_lockfile::LOCKFILE_NAME);
+    if !Lockfile::exists(&lock_path) {
+        return Err(LpmError::Script(
+            "bare-name and semver-range selectors require a project lockfile. \
+             Run `lpm install` first, or pass an exact pin like \
+             `lpm patch <name>@<version>`."
+                .into(),
+        ));
+    }
+    Lockfile::read_from_file(&lock_path).map_err(|e| {
+        LpmError::Script(format!(
+            "failed to read project lockfile at {lock_path:?}: {e}"
+        ))
+    })
+}
 
-    // **Phase 66 confidence-followup S3 (2026-05-08).** Lookup goes
+async fn run_patch_inner(name: String, version: String, json_output: bool) -> Result<(), LpmError> {
+    // Lookup goes
     // through `find_installed_package_baseline`, which prefers the
-    // v2 virtual store (default since Phase 4b) and falls back to v1.
+    // v2 virtual store (defaultb) and falls back to v1.
     // Pre-fix this called `store.has_package(...)` (v1-only), which
     // always returned false under v2 → "not in the global store".
     let lpm_root = lpm_common::LpmRoot::from_env()?;
@@ -52,7 +96,7 @@ async fn run_patch_inner(key: &str, json_output: bool) -> Result<(), LpmError> {
                  Run `lpm install {name}@{version}` first."
             ))
         })?;
-    // **Phase 66 confidence-followup F1.** Seed the staging copy from
+    // Seed the staging copy from
     // the PRISTINE bytes — `objects/<sri>/` under v2, or the v1 store
     // dir (which v1 patches never mutate). Reading `package_dir` on
     // an already-patched v2 link entry would seed the staging dir
@@ -73,11 +117,16 @@ async fn run_patch_inner(key: &str, json_output: bool) -> Result<(), LpmError> {
     copy_store_to_staging(&store_path, &dest)?;
 
     // Write the breadcrumb. patch-commit reads this to recover the
-    // identity without re-parsing the staging path.
+    // identity without re-parsing the staging path. **The `key` field
+    // is always the resolved exact pin**, never the raw user input —
+    // so a user who typed `lpm patch lodash@^4.0.0` still produces a
+    // breadcrumb with `key: "lodash@4.17.21"` and `lpm patch-commit`
+    // writes `patches/lodash@4.17.21.patch`.
+    let resolved_key = format!("{name}@{version}");
     let breadcrumb = json!({
         "name": name,
         "version": version,
-        "key": key,
+        "key": resolved_key,
         "store_path": store_path.display().to_string(),
     });
     std::fs::write(
@@ -91,7 +140,7 @@ async fn run_patch_inner(key: &str, json_output: bool) -> Result<(), LpmError> {
             "success": true,
             "name": name,
             "version": version,
-            "key": key,
+            "key": resolved_key,
             "staging_dir": staging_path.display().to_string(),
             "package_dir": dest.display().to_string(),
             "next_steps": [
@@ -165,7 +214,7 @@ async fn run_patch_commit_inner(
     // 2. Locate the store baseline. We re-read it from the live store
     // (not the breadcrumb's recorded path) so that store relocations
     // between `patch` and `patch-commit` don't break commit.
-    // **Phase 66 confidence-followup S3 (2026-05-08).** v2-aware via
+    // v2-aware via
     // `find_installed_package_baseline` — same shape as
     // `run_patch_inner` above; the integrity comes back in the same
     // call so we no longer need a separate `read_stored_integrity`
@@ -177,7 +226,7 @@ async fn run_patch_commit_inner(
                  cannot generate patch baseline"
         ))
     })?;
-    // **Phase 66 confidence-followup F1.** Diff against the PRISTINE
+    // Diff against the PRISTINE
     // bytes (`objects/<sri>/` under v2, the v1 store dir under v1) so
     // a re-run of `lpm patch` + edit + `lpm patch-commit` against an
     // already-patched install produces the correct delta-from-upstream
@@ -499,5 +548,45 @@ mod tests {
         )
         .unwrap_err();
         assert!(format!("{err}").contains("malformed"));
+    }
+
+    /// **Slice A structural contract.** `read_lockfile_for_patch_selector`
+    /// is the pre-lock branch point for bare-name / range selectors:
+    /// it MUST error out before `run_patch` reaches
+    /// `with_shared_lock_async`. The test verifies that a project
+    /// without an `lpm.lock` produces an actionable error here — which,
+    /// because of Rust's `?` control flow, propagates back through
+    /// `run_patch` BEFORE the store lock is even acquired.
+    ///
+    /// This is the structural proof for the "no global store lock held
+    /// during selector failure" guarantee. We do NOT spin up a second
+    /// process to time-race a second `lpm patch` (flaky on slow CI
+    /// runners); the lock-scope contract is enforced by the code's
+    /// branch order, which this test exercises directly.
+    #[test]
+    fn read_lockfile_for_patch_selector_errors_with_actionable_hint_when_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let err = read_lockfile_for_patch_selector(dir.path()).unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("lockfile"), "got: {msg}");
+        assert!(msg.contains("lpm install"), "got: {msg}");
+        assert!(msg.contains("exact pin"), "got: {msg}");
+    }
+
+    /// Companion to the above: a well-formed `lpm.lock` is read cleanly.
+    #[test]
+    fn read_lockfile_for_patch_selector_loads_valid_lockfile() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("lpm.lock"),
+            "[metadata]\nlockfile-version = 2\nresolved-with = \"test\"\n\n\
+             [[packages]]\nname = \"lodash\"\nversion = \"4.17.21\"\n\
+             source = \"registry+https://registry.npmjs.org\"\n",
+        )
+        .unwrap();
+        let lf = read_lockfile_for_patch_selector(dir.path()).unwrap();
+        assert_eq!(lf.packages.len(), 1);
+        assert_eq!(lf.packages[0].name, "lodash");
+        assert_eq!(lf.packages[0].version, "4.17.21");
     }
 }

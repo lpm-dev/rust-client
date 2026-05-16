@@ -1,7 +1,7 @@
 use crate::output;
+use lpm_common::color::Painted;
 use lpm_common::{LpmError, PackageName};
 use lpm_registry::RegistryClient;
-use owo_colors::OwoColorize;
 use std::path::Path;
 
 /// Check for newer versions of installed dependencies.

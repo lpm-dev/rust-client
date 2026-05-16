@@ -17,8 +17,7 @@ use std::process::Command;
 /// **Does NOT include transitive dependents.** For the legacy "directly
 /// changed plus dependents" behavior, use [`find_affected`].
 ///
-/// This is consumed by the Phase 32 filter engine's `[git-ref]` atom (per
-/// design decision D1: the filter grammar is orthogonal — closure operators
+/// Consumed by the filter engine's `[git-ref]` atom (closure operators
 /// like `...[main]` add the dependents step explicitly).
 pub fn find_affected_direct_only(
     graph: &WorkspaceGraph,
@@ -84,8 +83,8 @@ pub fn find_affected_direct_only(
 /// Find workspace members affected by changes since a base ref.
 ///
 /// Returns indices into the workspace graph of directly changed packages
-/// **plus their transitive dependents**. This is the legacy `--affected`
-/// CLI flag's behavior and is unchanged from the pre-Phase-32 contract.
+/// **plus their transitive dependents**. This is the `--affected`
+/// CLI flag's behavior.
 ///
 /// For the directly-changed-only set without dependents expansion, use
 /// [`find_affected_direct_only`].
@@ -298,7 +297,7 @@ mod tests {
         }
     }
 
-    // -- Finding #2: git flag injection --
+    // -- git flag injection --
 
     #[test]
     fn git_diff_rejects_empty_base_ref() {
@@ -422,7 +421,7 @@ mod tests {
         );
     }
 
-    // -- Finding #14: root change short-circuit --
+    // -- root change short-circuit --
 
     #[test]
     fn root_change_returns_all_members_directly() {
@@ -448,7 +447,7 @@ mod tests {
         }
     }
 
-    // ── Phase 32 Phase 1 M1: find_affected_direct_only ────────────────────
+    // ── find_affected_direct_only ─────────────────────────────────────────
 
     /// Set up a real git repo with a workspace and a feature branch.
     /// Returns the temp dir handle (must outlive the assertions to keep

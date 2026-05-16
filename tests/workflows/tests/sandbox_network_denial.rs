@@ -3,7 +3,7 @@
 //! failure truthfully.
 //!
 //! Scope (explicit): **outbound TCP denial only.** This test
-//! exercises what Phase 46.1's locked mechanism actually delivers
+//! exercises what the locked sandbox mechanism actually delivers
 //! across platforms:
 //!
 //! - **macOS Seatbelt** — `(deny default)` covers all socket
@@ -16,7 +16,7 @@
 //!   via `handle_access` with no `NetPort` allows. Landlock V4's
 //!   net-access surface is BindTcp + ConnectTcp ONLY; the
 //!   complementary direct UDP / raw / AF_PACKET / AF_NETLINK
-//!   denial is Phase 46.1.1's seccomp-bpf layer, runtime-pinned
+//!   denial is the seccomp-bpf layer, runtime-pinned
 //!   by the sibling [`sandbox_udp_denial.rs`] workflow test.
 //!   AF_UNIX intentionally remains allowed; resolver-mediated
 //!   DNS stays host-dependent (see audit-harness rationale at
@@ -34,7 +34,7 @@
 //!
 //! ## What this proves
 //!
-//! Per the locked Phase 46.1 deliverable #2 (in the design note),
+//! Per the locked sandbox deliverable (network denial — see the design note),
 //! two end-to-end cases pinned in the same file (shared fixture):
 //!
 //! 1. **Primary case** — synthetic package's `postinstall: "node
@@ -174,7 +174,7 @@ fn build_net_denial_tarball(dep_name: &str) -> Vec<u8> {
 /// `scriptPolicy` setting — the test passes `--policy=allow` on the
 /// CLI for the same effect with the additional guarantee that
 /// `auto_build_attempted` widens (the Allow policy alone fires
-/// auto-build per Phase 57).
+/// auto-build).
 fn project_manifest(dep_name: &str) -> String {
     format!(
         r#"{{
@@ -277,7 +277,7 @@ fn node_available() -> bool {
         .unwrap_or(false)
 }
 
-/// Shared assertions block. Phase 46.1 deliverable #2 pins three
+/// Shared assertions block. Pins three
 /// assertions per case, plus the soft-fail contract; collected
 /// here so the primary and loopback-target cases stay in lock-
 /// step. A regression that diverges them would be a contract bug.
@@ -292,11 +292,11 @@ async fn assert_network_denied(
         // `--policy=allow` bypasses the triage gate so the amber
         // tier doesn't block execution — the test isolates SANDBOX
         // enforcement from TRIAGE gating. Allow also fires auto-
-        // build automatically (Phase 57), so we don't need
+        // build automatically, so we don't need
         // `--auto-build` to widen the rebuild path.
         .args(["install", "--policy=allow"])
-        // Phase 46.1 rework (2026-05-11): network denial is opt-in
-        // (see `phase46-DX.md` and the matrix's strict-sandbox row).
+        // network denial is opt-in
+        // (strict-sandbox row).
         // This test asserts the STRICT path works, so it must opt
         // in explicitly. Without the env var, the install would use
         // `mode = "default"` and the assertion that the mock
@@ -374,7 +374,7 @@ async fn assert_network_denied(
     //     OOM, etc. — test would give false confidence in
     //     sandbox containment.
     let combined = format!("{stderr}\n{stdout}");
-    // Phase 46.3 PR-2 (2026-05-13): Windows AppContainer / WFP
+    // Windows AppContainer / WFP
     // surfaces denial as either WSAEACCES (10013, "operation not
     // permitted" / "EACCES" in Node's terminology) or as a silent
     // drop that Node surfaces as ETIMEDOUT after the syn-ack wait.
@@ -488,7 +488,7 @@ async fn assert_network_denied(
 /// Unix-only for the same reason `triage_install_lifecycle.rs`
 /// and `sandbox_filesystem_denial.rs` guard their mock setup
 /// behind `#[cfg(unix)]`: the sandbox + lifecycle-script pipeline
-/// doesn't ship a Windows backend in Phase 46.1 (Windows is
+/// Windows is
 /// deferred to a follow-up phase per the design note).
 #[cfg(unix)]
 #[tokio::test]
@@ -569,11 +569,11 @@ async fn postinstall_loopback_connect_is_denied_no_loopback_exemption() {
     assert_network_denied(&mock, &project, LOOPBACK_DEP_NAME, &target_url, "loopback").await;
 }
 
-// ─── Phase 46.3 PR-2: Windows AppContainer arm ───────────────────────
+// ─── Windows AppContainer arm ───────────────────────
 //
 // The Unix tests above pin macOS Seatbelt + Linux landlock V4
 // denial. On Windows, the equivalent is AppContainer + WFP, which
-// PR-2 ships via the new `lpm-sandbox-helper.exe` companion binary.
+// Implemented via the `lpm-sandbox-helper.exe` companion binary.
 //
 // The Windows arm reuses the same wiremock-backed fixtures, the
 // same `INSTALL_JS_BODY` lifecycle script, and the same three
@@ -588,7 +588,7 @@ async fn postinstall_loopback_connect_is_denied_no_loopback_exemption() {
 // Gate: target_os = "windows" AND
 // `assert_cmd::Command::cargo_bin("lpm-sandbox-helper")` resolves
 // to an existing binary. Without the helper the install pipeline
-// falls back to the Phase 46.2 Low IL backend, which refuses
+// falls back to the Low IL backend, which refuses
 // strict mode (without `allow_degraded`) and is covered separately.
 
 /// `true` when the test runner has explicitly opted into
@@ -683,7 +683,7 @@ async fn windows_postinstall_outbound_connect_is_denied_under_appcontainer_stric
     }
     if !helper_available() {
         let msg = "lpm-sandbox-helper.exe not built — run `cargo build --workspace` \
-             or `cargo build -p lpm-sandbox --bin lpm-sandbox-helper` first. The Phase 46.2 \
+             or `cargo build -p lpm-sandbox --bin lpm-sandbox-helper` first. The AppContainer backend 
              Low IL fallback refuses strict mode without `allow_degraded`, so the AppContainer \
              backend is the only path that delivers the contract this test pins.";
         if require_appcontainer_coverage() {

@@ -1,4 +1,4 @@
-//! Phase 46.1 sandbox-config loader.
+//! sandbox-config loader.
 //!
 //! Resolves the [`lpm_sandbox::SandboxOptions`] the install / rebuild
 //! pipelines pass through to [`lpm_sandbox::new_for_platform_with_options`].
@@ -51,7 +51,7 @@ use lpm_common::LpmError;
 use lpm_sandbox::{SandboxMode, SandboxOptions};
 use std::path::Path;
 
-/// Read the Phase 46.1 sandbox knobs from `<project_dir>/lpm.toml`
+/// Read the sandbox knobs from `<project_dir>/lpm.toml`
 /// + `~/.lpm/config.toml` and resolve them to a [`SandboxOptions`].
 ///
 /// Missing files / missing keys fall through to defaults.
@@ -61,7 +61,7 @@ use std::path::Path;
 /// unknown `mode` string). The error names the offending file
 /// path so the user sees which side needs editing.
 ///
-/// **Phase 46.1 rework note:** this loader reports the
+/// rework this loader reports the
 /// CONFIG-ONLY view (project lpm.toml + user config.toml). CLI
 /// flags (`--strict-sandbox` / `--paranoid` / `--no-sandbox`) and
 /// the `LPM_STRICT_SANDBOX` env var sit at HIGHER priority and are
@@ -93,7 +93,7 @@ pub fn load_sandbox_options_with_mode(
     Ok(merge(project, global))
 }
 
-/// Phase 46.1 rework: resolve the FULL precedence chain into a
+/// resolve the FULL precedence chain into a
 /// concrete sandbox mode. Highest priority first:
 ///
 /// 1. CLI flag (`no_sandbox_flag` / `strict_sandbox_flag`). Caller
@@ -165,7 +165,7 @@ fn env_strict_sandbox_set() -> bool {
 #[derive(Debug, Default, PartialEq, Eq, Clone)]
 struct RawSandboxKeys {
     allow_degraded: Option<bool>,
-    /// Phase 46.1 rework: `[sandbox] mode = "default" | "strict" |
+    /// `[sandbox] mode = "default" | "strict" |
     /// "none"`. The wizard (`lpm config sandbox`) writes this key;
     /// the install pipeline reads it and resolves the precedence
     /// chain (CLI flag > env > project lpm.toml > user
@@ -199,7 +199,7 @@ impl SandboxModeKey {
     }
 }
 
-/// Read the Phase 46.1 sandbox keys from a single TOML file. Missing
+/// Read the sandbox keys from a single TOML file. Missing
 /// file → empty `RawSandboxKeys`. Malformed file or invalid value →
 /// error with the file path baked in for diagnostics.
 fn read_sandbox_keys_from_file(path: &Path) -> Result<RawSandboxKeys, LpmError> {
@@ -225,7 +225,7 @@ fn read_sandbox_keys_from_file(path: &Path) -> Result<RawSandboxKeys, LpmError> 
 
     let mut keys = RawSandboxKeys::default();
 
-    // The Phase 46.1 surface lives under `[sandbox]`. A bare
+    // The surface lives under `[sandbox]`. A bare
     // top-level `allow-degraded = …` is NOT honored — pinning the
     // namespace prevents accidental key-name collisions with other
     // top-level config keys (e.g. `save-prefix`, `script-policy`).
@@ -248,7 +248,7 @@ fn read_sandbox_keys_from_file(path: &Path) -> Result<RawSandboxKeys, LpmError> 
             })?);
         }
 
-        // Phase 46.1 rework: `[sandbox] mode = "default" | "strict"
+        // `[sandbox] mode = "default" | "strict"
         // | "none"`. Reject unknown strings explicitly — silently
         // ignoring would mask a typo and the user would never
         // know why strict mode wasn't engaging.
@@ -276,7 +276,7 @@ fn read_sandbox_keys_from_file(path: &Path) -> Result<RawSandboxKeys, LpmError> 
 /// Merge project + global raw keys into the final [`SandboxOptions`].
 /// Project values win over global; both fall through to defaults.
 ///
-/// Phase 46.1 rework: emits `(SandboxOptions, ResolvedSandboxMode)`
+/// emits `(SandboxOptions, ResolvedSandboxMode)`
 /// so the install pipeline knows BOTH the `deny_outbound_network`
 /// the constructor consumes AND whether the user picked `none`
 /// (in which case the caller switches `SandboxMode` to `Disabled`
@@ -302,15 +302,15 @@ fn merge(project: RawSandboxKeys, global: RawSandboxKeys) -> (SandboxOptions, Re
     (options, resolved)
 }
 
-/// Phase 46.1 rework: the user-facing sandbox mode resolved from the
+/// the user-facing sandbox mode resolved from the
 /// precedence chain. The CLI surface speaks this enum; the
 /// constructor accepts the `(SandboxMode, SandboxOptions)` pair.
 ///
 /// - `Default` → `SandboxMode::Enforce` + `deny_outbound_network = false`.
 /// - `Strict`  → `SandboxMode::Enforce` + `deny_outbound_network = true`.
 /// - `None`    → `SandboxMode::Disabled` (caller short-circuits to
-///   `NoopSandbox` and skips env scrubbing too — Phase 46.1 rework
-///   collapsed `--unsafe-full-env` into `--no-sandbox` per Q6 of
+///   `NoopSandbox` and skips env scrubbing too — rework
+///   collapsed `--unsafe-full-env` into `--no-sandbox` of
 ///   the DX redline).
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 pub enum ResolvedSandboxMode {
@@ -332,7 +332,7 @@ impl ResolvedSandboxMode {
     }
 }
 
-/// Phase 46.1 rework runtime collapse: turn the resolved sandbox
+/// rework runtime collapse: turn the resolved sandbox
 /// mode + per-command CLI overrides into the `(SandboxMode, env_scrub)`
 /// pair the install/rebuild pipelines actually consume.
 ///
@@ -346,7 +346,7 @@ impl ResolvedSandboxMode {
 ///
 /// 1. `no_sandbox_flag` (CLI `--no-sandbox`) → [`SandboxMode::Disabled`]
 ///    plus `env_scrub = false`. The legacy `--unsafe-full-env`
-///    partner was collapsed per Q6 of the DX redline.
+///    partner was collapsed.
 /// 2. `sandbox_log_flag` (CLI `--sandbox-log`) → [`SandboxMode::LogOnly`]
 ///    plus `env_scrub = true`. Diagnostic intent on the CLI wins
 ///    over a persistent `mode = "none"` so the user can observe
@@ -373,7 +373,7 @@ pub fn decide_runtime_sandbox_mode(
     if no_sandbox_flag {
         // CLI `--no-sandbox` is the per-command escape hatch.
         // Single-flag drop of containment AND env scrubbing — the
-        // Phase 46.1 Q6 collapse.
+        //
         return (SandboxMode::Disabled, false);
     }
     if sandbox_log_flag {
@@ -398,11 +398,11 @@ pub fn decide_runtime_sandbox_mode(
 /// string so the install pipeline only has the decision to make,
 /// not the prose to template.
 ///
-/// GPT-5 audit (2026-05-11) caught that the previous version only
+/// GPT-5 audit  caught that the previous version only
 /// fired this banner when `--strict-sandbox` / `--paranoid` arrived
 /// on the CLI — config-set (`[sandbox] mode = "strict"`) and env-set
 /// (`LPM_STRICT_SANDBOX=1`) users got the kernel-level network
-/// denial silently. The DX-doc walkthroughs W3 / W6 / W8 all show
+/// denial silently. The DX-doc walkthroughs / / all show
 /// the same banner regardless of source, so the gating must be on
 /// the resolved mode, not on which tier supplied it.
 ///
@@ -611,7 +611,7 @@ allow-degraded = "maybe"
 
     #[test]
     fn merge_default_is_default_when_both_tiers_absent() {
-        // Phase 46.1 rework: when neither tier sets a value, the
+        // when neither tier sets a value, the
         // user is on the relaxed default — sandbox active, network
         // allowed.
         let (options, mode) = merge(RawSandboxKeys::default(), RawSandboxKeys::default());
@@ -744,9 +744,9 @@ allow-degraded = "maybe"
         assert_eq!(SandboxModeKey::parse("Default"), None); // case-sensitive
     }
 
-    // ── decide_runtime_sandbox_mode (Phase 46.1 rework follow-up) ──
+    // ── decide_runtime_sandbox_mode  ──
     //
-    // GPT-5 audit (2026-05-11) caught a real bug: the previous version
+    // GPT-5 audit  caught a real bug: the previous version
     // of `rebuild::run_under_store_lock` computed `SandboxMode` from
     // the CLI `no_sandbox` flag alone and discarded the resolved
     // mode, so persistent `[sandbox] mode = "none"` from the wizard
@@ -856,14 +856,14 @@ allow-degraded = "maybe"
         assert!(!scrub);
     }
 
-    // ── strict_banner_for_runtime (GPT-5 audit follow-up, 2026-05-11) ──
+    // ── strict_banner_for_runtime (GPT-5 audit follow-up) ──
     //
     // GPT-5 audit caught two related bugs here, both fixed by gating
     // on the (final SandboxMode, resolved tier) pair:
     //
     // Round 1 (Low): the banner only fired for `--strict-sandbox` /
     // `--paranoid` on the CLI. Config-set / env-set strict was
-    // silent, contradicting DX-doc walkthroughs W3 / W6 / W8.
+    // silent, contradicting DX-doc walkthroughs / /.
     //
     // Round 2 (Medium): once the banner fired for all resolved-Strict
     // sources, it ALSO fired when `--sandbox-log` was passed together
@@ -884,7 +884,7 @@ allow-degraded = "maybe"
         // denied, regardless of which tier supplied Strict.
         let banner = strict_banner_for_runtime(SandboxMode::Enforce, ResolvedSandboxMode::Strict);
         let line = banner.expect(
-            "strict mode under Enforce MUST emit a runtime banner — DX-doc walkthroughs W3 / W6 / W8 \
+            "strict mode under Enforce MUST emit a runtime banner — DX-doc walkthroughs / / \
              all require it regardless of source. This was the GPT-5 audit Low finding (round 1).",
         );
         assert!(

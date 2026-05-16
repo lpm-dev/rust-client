@@ -1,8 +1,8 @@
-//! Phase 64 #35 — translate `package.json > pnpm.patchedDependencies`
+//! #35 — translate `package.json > pnpm.patchedDependencies`
 //! into LPM's native `patches/` directory + `lpm.patchedDependencies`
 //! manifest entries at migrate time.
 //!
-//! Mirrors the Phase 64 #34 design (see [`super::migrate_overrides`])
+//! Mirrors the #34 design (see [`super::migrate_overrides`])
 //! with two extra concerns specific to patches:
 //!
 //! 1. **Integrity binding** — LPM's `lpm.patchedDependencies[k]` carries

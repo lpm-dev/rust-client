@@ -1,9 +1,7 @@
-//! `lpm-sandbox-helper.exe` — Phase 46.3 PR-2 AppContainer launcher.
+//! `lpm-sandbox-helper.exe` — AppContainer launcher.
 //!
 //! See [`crates/lpm-sandbox/src/helper_protocol.rs`](../helper_protocol.rs)
-//! for the argv contract; see
-//! [`private/46.3-pr2-network-denial.md`](../../../../private/46.3-pr2-network-denial.md)
-//! §3 for the design rationale.
+//! for the argv contract and design rationale.
 //!
 //! ## Why a separate binary
 //!

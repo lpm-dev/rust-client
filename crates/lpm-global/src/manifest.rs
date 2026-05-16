@@ -1,7 +1,7 @@
 //! `~/.lpm/global/manifest.toml` — schema, atomic read/write.
 //!
 //! The manifest is the authoritative record of every globally-installed
-//! package on a host. Phase 37 introduces three top-level tables besides
+//! package on a host. Three top-level tables exist besides
 //! the schema version field:
 //!
 //! - `[packages.<name>]` — currently active installations. One row per
@@ -27,7 +27,7 @@
 //! file. POSIX rename is atomic on the same filesystem; on Windows the
 //! `MoveFileEx`-backed `std::fs::rename` is functionally equivalent for
 //! this size of file. **Callers are responsible for serialising
-//! manifest mutations through the global `.tx.lock`** (see plan §M3).
+//! manifest mutations through the global `.tx.lock`** (.tx.lock must serialize all mutations).
 //! `write_manifest` itself only guarantees that observers always see a
 //! complete manifest, never a half-written one.
 //!
@@ -35,7 +35,7 @@
 //!
 //! `schema_version` is a `u32`. Readers tolerate unknown fields (serde
 //! default) so additive changes don't break older binaries; bumps are
-//! reserved for breaking changes. M2 ships v1.
+//! reserved for breaking changes. Current format is v1.
 
 use chrono::{DateTime, Utc};
 use lpm_common::{LpmError, LpmRoot, as_extended_path};
@@ -94,7 +94,7 @@ impl Default for GlobalManifest {
 /// using exactly the same precedence as `lpm install` in a project.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PackageEntry {
-    /// Phase 33 `spec_to_write` output. Stored verbatim. Examples:
+    /// `spec_to_write` output. Stored verbatim. Examples:
     /// `"^9"`, `"~5.8"`, `"14.2.0"`, `"*"`.
     pub saved_spec: String,
     /// Resolved version installed at this row's creation time.
@@ -168,7 +168,7 @@ pub enum PackageSource {
 /// running an older `lpm` against a newer manifest should be told to
 /// upgrade rather than corrupt their state.
 pub fn read_manifest(path: &Path) -> Result<GlobalManifest, LpmError> {
-    // Phase 37 M0 (rev 6): Windows long-path support — no-op on POSIX.
+    // Windows long-path support — no-op on POSIX.
     let path = as_extended_path(path);
     let bytes = match std::fs::read(&path) {
         Ok(b) => b,
@@ -204,7 +204,7 @@ pub fn read_for(root: &LpmRoot) -> Result<GlobalManifest, LpmError> {
 /// function only guarantees that observers see either the old or new
 /// manifest, never a partial.
 pub fn write_manifest(path: &Path, manifest: &GlobalManifest) -> Result<(), LpmError> {
-    // Phase 37 M0 (rev 6): Windows long-path support — no-op on POSIX.
+    // Windows long-path support — no-op on POSIX.
     let path = as_extended_path(path);
     let parent = path
         .parent()
@@ -339,13 +339,13 @@ pub struct CommandCollision {
 /// `manifest`. Self-collisions (the candidate package re-asserting its
 /// own already-owned commands) are intentionally excluded — the
 /// "package is already installed" check is a separate concern handled
-/// at the install entry point. M3.4's upgrade path will also use this
+/// at the install entry point. the upgrade path will also use this
 /// helper without false-positive on its own pre-existing rows.
 ///
 /// Used by both `commands::install_global::commit_locked` (commit
 /// path) and the recovery `reconcile_one` (replay path) so the
 /// invariant is enforced at every commit point — not just the
-/// happy-path one. M3.2 audit High: pre-fix the recovery side could
+/// happy-path one. Audit High: pre-fix the recovery side could
 /// silently commit a previously-rejected install on the next `lpm`
 /// invocation.
 pub fn find_command_collisions(
@@ -588,7 +588,7 @@ mystery_field = 42
     fn find_command_collisions_excludes_self_owned_commands() {
         let m = sample_manifest();
         // eslint package re-claiming its own `eslint` command is NOT
-        // a collision with itself. M3.4 upgrades will use this.
+        // a collision with itself. Upgrades use this path too.
         let collisions = find_command_collisions(&m, "eslint", &["eslint".to_string()]);
         assert!(collisions.is_empty());
     }

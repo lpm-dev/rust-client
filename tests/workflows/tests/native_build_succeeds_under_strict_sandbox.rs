@@ -1,7 +1,6 @@
-//! Phase 46.3 PR-2: native-rebuild positive control under
-//! Strict-sandbox.
+//! Native-rebuild positive control under Strict-sandbox.
 //!
-//! Pins the §2.5 vcvarsall capture fix at the workflow tier. A
+//! Pins the vcvarsall capture fix at the workflow tier. A
 //! regression that drops the MSVC env injection or breaks the
 //! vcvarsall parse fails this test deterministically (the
 //! AppContainer'd `node-gyp rebuild` can't reach `cl.exe` /
@@ -9,7 +8,7 @@
 //!
 //! ## File naming
 //!
-//! The plan §9.3 named this test
+//! This test was originally named
 //! `install_native_package_succeeds_under_strict_sandbox`; we
 //! dropped the leading `install_` to side-step Windows's Installer
 //! Detection Technology heuristic, which auto-elevates any
@@ -42,7 +41,7 @@
 //! 3. The synthetic `binding.gyp` build produces a
 //!    `build/Release/*.node` output.
 //!
-//! Without the §2.5 fix, the build fails at "cl.exe not found"
+//! Without the vcvarsall capture fix, the build fails at "cl.exe not found"
 //! and the marker assertion below trips.
 
 #![cfg(target_os = "windows")]
@@ -232,7 +231,7 @@ async fn native_rebuild_succeeds_under_appcontainer_strict_with_vcvarsall_captur
         // postinstall runs unconditionally.
         .args(["install", "--policy=allow"])
         // Pin Strict mode so the AppContainer Default-deny posture
-        // fires; the §2.5 capture is the only way the child sees
+        // fires; the vcvarsall capture is the only way the child sees
         // an MSVC env under that posture (`vswhere`/COM is denied
         // inside the AppContainer).
         .env("LPM_STRICT_SANDBOX", "1")
@@ -252,7 +251,7 @@ async fn native_rebuild_succeeds_under_appcontainer_strict_with_vcvarsall_captur
         marker.exists(),
         "`.lpm-built` marker must be present after a successful native rebuild — \
          absence means `node-gyp rebuild` failed inside the AppContainer. \
-         A common failure mode is missing MSVC env (regression in the §2.5 \
+         A common failure mode is missing MSVC env (regression in the vcvarsall capture: 
          vcvarsall capture). Marker path: {}\nstderr:\n{stderr}",
         marker.display(),
     );

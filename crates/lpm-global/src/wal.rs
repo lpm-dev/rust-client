@@ -1,10 +1,10 @@
-//! Phase 37 — write-ahead log for global-install transactions.
+//! Write-ahead log for global-install transactions.
 //!
 //! The WAL records every state transition the install pipeline performs
 //! against `~/.lpm/global/` so a `kill -9` mid-install can recover
-//! deterministically on the next `lpm` invocation. M2 ships the
-//! framing/storage layer; M3 wires it into the actual transaction flow
-//! (see plan §"Crash-safe transactions").
+//! deterministically on the next `lpm` invocation. The framing/storage
+//! layer and actual transaction flow are both active (the WAL + recovery
+//! layer enforces crash-safe transactions).
 //!
 //! ## Why framed records, not plain JSONL
 //!
@@ -34,7 +34,7 @@
 //!   rather than silently misaligning the next record.
 //! - `payload` is UTF-8 JSON. The structure of the JSON is the
 //!   `WalRecord` type below; readers tolerant of unknown variants are
-//!   the responsibility of the M3 reconciliation logic.
+//!   the responsibility of the reconciliation logic.
 //!
 //! ## Recovery semantics
 //!
@@ -137,10 +137,10 @@ pub struct IntentPayload {
     /// startup after upgrade.
     #[serde(default)]
     pub new_aliases_json: serde_json::Value,
-    /// Phase 37 M4.2: explicit, typed list of ownership mutations this
+    /// Explicit, typed list of ownership mutations this
     /// transaction will apply. Recovery replays this list directly
     /// rather than diff-deriving from pre/post manifest states — per
-    /// the M4 audit, diff-based reconstruction is fragile and the
+    /// the audit, diff-based reconstruction is fragile and the
     /// intent should be the source of truth.
     ///
     /// Populated by `commit_locked` when the user resolved one or more
@@ -148,14 +148,14 @@ pub struct IntentPayload {
     /// TTY prompt. Empty for installs with no collisions. Each entry
     /// is independently applicable; recovery iterates in order.
     ///
-    /// `#[serde(default)]` so pre-M4.2 WAL files (empty by definition)
+    /// `#[serde(default)]` so older WAL files (empty by definition)
     /// deserialize cleanly.
     #[serde(default)]
     pub ownership_delta: Vec<OwnershipChange>,
 }
 
 /// One ownership mutation applied during commit and replayed during
-/// recovery. See the M4 section of the phase-37 plan for the full
+/// recovery. See the section of the phase-37 plan for the full
 /// model. Each variant carries everything needed to (a) apply the
 /// mutation idempotently in roll-forward and (b) undo it in roll-back.
 ///
@@ -198,7 +198,7 @@ pub enum OwnershipChange {
     /// package. Roll-forward: write `[aliases.<alias_name>]` with the
     /// given `package` + `bin`. The `bin` field names the declared
     /// bin that is exposed via the alias and MUST be excluded from the
-    /// new package's `commands` list (per the M4 manifest invariant:
+    /// new package's `commands` list (per the manifest invariant:
     /// `commands` = directly-exposed names, aliased-away bins are
     /// tracked only via `[aliases]`). Roll-back: drop the alias row
     /// (no prior state to restore; it's a fresh install).
@@ -263,7 +263,7 @@ impl WalWriter {
     /// writes. Creates the parent directory if missing.
     pub fn open(path: impl Into<PathBuf>) -> Result<Self, WalError> {
         let path = path.into();
-        // Phase 37 M0 (rev 6): Windows long-path support. The WAL lives
+        // Windows long-path support. The WAL lives
         // under `~/.lpm/global/` which is shallow, but `$LPM_HOME` may
         // be deeply nested on hostile-prefix Windows installs, so route
         // through `as_extended_path` for consistency. No-op on POSIX.
@@ -437,7 +437,7 @@ impl WalReader {
         }
 
         // Read the whole file into memory. WALs are bounded in size by
-        // the M3 rotation policy (default 10MB cap, see plan open Q13).
+        // the rotation policy (default 10MB cap, see plan open Q13).
         let mut buf = Vec::with_capacity(file_len as usize);
         file.read_to_end(&mut buf)?;
 
@@ -934,7 +934,7 @@ mod tests {
 
     #[test]
     fn old_intent_payload_without_new_aliases_field_still_deserializes() {
-        // Before phase 37 M2 audit fix, IntentPayload had no
+        // Before the audit fix, IntentPayload had no
         // `new_aliases_json`. `#[serde(default)]` must let those
         // older payloads still parse during the first recovery on
         // a host upgrading across the field addition.

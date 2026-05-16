@@ -1,10 +1,10 @@
-//! Phase 46.1.1: seccomp-bpf filter that denies the `socket(2)`
+//! seccomp-bpf filter that denies the `socket(2)`
 //! variants landlock V4 can't cover. Layered on top of the
 //! landlock V4 ruleset in the strict posture's pre_exec closure.
 //!
 //! # What this layer adds
 //!
-//! Phase 46.1's landlock V4 ruleset denies `BindTcp` /
+//! The landlock V4 ruleset denies `BindTcp` /
 //! `ConnectTcp` only. UDP-based egress, raw sockets, AF_PACKET,
 //! and AF_NETLINK pass through landlock untouched. The seccomp
 //! filter built here intercepts `socket(2)` and returns
@@ -67,7 +67,7 @@ const TARGET_ARCH: TargetArch = TargetArch::x86_64;
 const TARGET_ARCH: TargetArch = TargetArch::aarch64;
 #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
 compile_error!(
-    "Phase 46.1.1: seccomp socket() deny filter only supports linux-x86_64 and \
+    "seccomp socket() deny filter only supports linux-x86_64 and \
      linux-aarch64. Other architectures (linux-i386 / linux-arm32 / linux-riscv64) \
      need their own audit of the socket(2) calling convention before being added."
 );
@@ -83,7 +83,7 @@ compile_error!(
 /// rule would miss.
 const TYPE_MASK: u64 = !((libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC) as u64);
 
-/// Build the Phase 46.1.1 socket() deny filter. Called on the
+/// Build the socket() deny filter. Called on the
 /// parent process before fork; the resulting [`BpfProgram`] is
 /// moved into the spawn's `pre_exec` closure and installed via
 /// [`seccompiler::apply_filter`].

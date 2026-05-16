@@ -69,7 +69,7 @@ static PLUGINS: &[PluginDef] = &[
         is_archive: true,
         // SHA-256 checksums for the hardcoded latest_version archives.
         // These MUST be updated whenever latest_version is bumped.
-        // Computed from GitHub Release assets on 2026-04-05.
+        // Computed from GitHub Release assets.
         checksums: &[
             (
                 "darwin-arm64",
@@ -111,7 +111,7 @@ static PLUGINS: &[PluginDef] = &[
         is_archive: false,
         // SHA-256 checksums for the hardcoded latest_version binaries.
         // These MUST be updated whenever latest_version is bumped.
-        // Computed from GitHub Release assets on 2026-04-05.
+        // Computed from GitHub Release assets.
         checksums: &[
             (
                 "darwin-arm64",

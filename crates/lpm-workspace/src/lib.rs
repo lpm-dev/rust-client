@@ -6,8 +6,8 @@
 //!
 //! Discovers member packages and reads their package.json for dependencies.
 //!
-//! Protocols: `workspace:*` (Phase 17), `catalog:` / `catalog:{name}` (Phase 20).
-//! `--filter` and workspace-aware `run` implemented (Phase 13).
+//! Protocols: `workspace:*`, `catalog:`, and `catalog:{name}`.
+//! `--filter` and workspace-aware `run` are supported.
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -179,10 +179,10 @@ pub struct PnpmRaw {
     #[serde(default)]
     pub overrides: serde_json::Value,
 
-    /// `pnpm.patchedDependencies` — Phase 64 #35 wires this up at
-    /// migrate time. Field is captured here today so the install-time
-    /// detection helper can already tell the user "you have pnpm
-    /// patches that LPM isn't honoring."
+    /// `pnpm.patchedDependencies` — captured raw so the install-time
+    /// detection helper can warn "you have pnpm patches that LPM isn't
+    /// honoring." The migrate translator reads this field to produce
+    /// `lpm.patchedDependencies` entries.
     #[serde(default, rename = "patchedDependencies")]
     pub patched_dependencies: serde_json::Value,
 
@@ -538,7 +538,7 @@ fn detect_pnpm_patches_drift(pkg: &PackageJson) -> Option<ManifestCompatIssue> {
 /// Detector: `pnpm.peerDependencyRules` has entries not mirrored in
 /// `lpm.peerDependencyRules`.
 ///
-/// Phase 64 #33. Each of the three sub-keys is checked independently;
+/// Each of the three sub-keys is checked independently;
 /// the issue lists every drifting entry across all three. Coverage
 /// requires verbatim equality (same name in both ignoreMissing /
 /// allowAny lists; same name + same range in allowedVersions). Same
@@ -799,11 +799,10 @@ pub struct LpmConfig {
 
     /// Packages trusted to run lifecycle scripts (postinstall, etc).
     ///
-    /// **Phase 32 Phase 4** schema migration: this field accepts BOTH the
-    /// legacy `Vec<String>` form (`["esbuild", "sharp"]`) AND the new rich
-    /// map form (`{"esbuild@0.25.1": {"integrity": "...", "scriptHash": "..."}}`).
-    /// See [`TrustedDependencies`] for the discriminant rules and
-    /// migration semantics.
+    /// Schema migration: this field accepts BOTH the legacy `Vec<String>` form
+    /// (`["esbuild", "sharp"]`) AND the rich map form
+    /// (`{"esbuild@0.25.1": {"integrity": "...", "scriptHash": "..."}}`).
+    /// See [`TrustedDependencies`] for the discriminant rules and migration semantics.
     #[serde(default, rename = "trustedDependencies")]
     pub trusted_dependencies: TrustedDependencies,
 
@@ -822,10 +821,9 @@ pub struct LpmConfig {
     #[serde(default, rename = "engineStrict")]
     pub engine_strict: Option<bool>,
 
-    /// **Phase 32 Phase 5** — LPM-native overrides location. Mirrors
-    /// pnpm's `pnpm.overrides` and npm's top-level `overrides`, but
-    /// declared inside the `"lpm"` section so package authors can
-    /// keep all LPM-aware config grouped together.
+    /// LPM-native overrides location. Mirrors pnpm's `pnpm.overrides` and
+    /// npm's top-level `overrides`, but declared inside the `"lpm"` section
+    /// so package authors can keep all LPM-aware config grouped together.
     ///
     /// Map of selector → target version/range. Selectors support:
     /// - `"foo"` — every instance of `foo`
@@ -857,9 +855,9 @@ pub struct LpmConfig {
     #[serde(default, rename = "patchedDependencies")]
     pub patched_dependencies: HashMap<String, PatchedDependencyEntry>,
 
-    /// **Phase 64 #33** — peer-dependency rules for the resolver.
-    /// Mirrors pnpm's `pnpm.peerDependencyRules` shape verbatim so a
-    /// `lpm migrate` can move pnpm authors over without surgery.
+    /// Peer-dependency rules for the resolver. Mirrors pnpm's
+    /// `pnpm.peerDependencyRules` shape verbatim so `lpm migrate` can
+    /// move pnpm authors over without surgery.
     ///
     /// Three independent sub-keys; each addresses a distinct
     /// peer-dependency complaint:
@@ -895,7 +893,7 @@ pub struct LpmConfig {
     #[serde(default, rename = "peerDependencyRules")]
     pub peer_dependency_rules: PeerDependencyRules,
 
-    /// **Phase 66 R2.2** — eager peer auto-install opt-out.
+    /// Eager peer auto-install opt-out.
     ///
     /// When `true` (or unset), missing non-optional peer dependencies
     /// are automatically promoted to ambient root-scoped installs by
@@ -995,9 +993,9 @@ impl PeerDependencyRules {
 
 /// `package.json :: lpm.patchedDependencies` map value.
 ///
-/// **Phase 32 Phase 6.** Records the patch file path (relative to the
-/// `package.json` directory) and the integrity binding to the store
-/// baseline the patch was generated against.
+/// Records the patch file path (relative to the `package.json` directory)
+/// and the integrity binding to the store baseline the patch was generated
+/// against.
 ///
 /// On disk:
 ///
@@ -1035,17 +1033,17 @@ pub struct PatchedDependencyEntry {
 }
 
 /// `package.json :: lpm.trustedDependencies` — accepts BOTH the legacy
-/// `Vec<String>` form and the Phase 32 Phase 4 rich-map form.
+/// bare-name array form and the rich version-bound map form.
 ///
 /// ## Forms
 ///
-/// **Legacy** (pre-Phase-4):
+/// **Legacy** (bare-name array):
 ///
 /// ```json
 /// "trustedDependencies": ["esbuild", "sharp"]
 /// ```
 ///
-/// **Rich** (Phase 4+):
+/// **Rich** (version-bound map):
 ///
 /// ```json
 /// "trustedDependencies": {
@@ -1061,49 +1059,40 @@ pub struct PatchedDependencyEntry {
 /// - **Read:** both forms deserialize cleanly via `serde(untagged)`. Order
 ///   matters — the array form is tried first because it's strictly more
 ///   restrictive (an array can never be confused for a map).
-/// - **Write:** Phase 4's `lpm approve-scripts` command upgrades any Legacy
-///   variant to Rich on the first new approval. The `lpm rebuild` strict
-///   gate accepts both forms; legacy bare-name entries match by name only
-///   and produce a deprecation warning.
+/// - **Write:** `lpm approve-scripts` upgrades any Legacy variant to Rich on
+///   the first new approval. The `lpm rebuild` strict gate accepts both forms;
+///   legacy bare-name entries match by name only and produce a deprecation warning.
 /// - **Coexistence:** a manifest stays in the Legacy form until the first
 ///   approval is made through `lpm approve-scripts`, at which point it
-///   migrates to the Rich form and stays there. There is no downgrade
-///   path. Existing entries in a Legacy array are preserved during the
-///   upgrade — they become Rich entries with `binding: None` (i.e., name
-///   only, no integrity, no script hash).
+///   migrates to the Rich form and stays there. There is no downgrade path.
+///   Existing entries in a Legacy array are preserved during the upgrade —
+///   they become Rich entries with `binding: None` (name only, no integrity,
+///   no script hash).
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(untagged)]
 pub enum TrustedDependencies {
-    /// Pre-Phase-4 form: `["esbuild", "sharp"]`. Bare package names with
-    /// no version, integrity, or script hash binding. Phase 4's strict
-    /// gate accepts these as `LegacyNameOnly` matches with a deprecation
-    /// warning.
+    /// Legacy form: `["esbuild", "sharp"]`. Bare package names with no
+    /// version, integrity, or script hash binding. The strict gate accepts
+    /// these as `LegacyNameOnly` matches with a deprecation warning.
     Legacy(Vec<String>),
-    /// Phase 4+ form: `{"esbuild@0.25.1": {integrity, scriptHash}}`. The
-    /// key is `name@version` (the Phase 4 trust binding key); the value
-    /// is the integrity + scriptHash binding metadata.
+    /// Rich form: `{"esbuild@0.25.1": {integrity, scriptHash}}`. The key
+    /// is `name@version`; the value is the integrity + scriptHash binding
+    /// metadata.
     Rich(HashMap<String, TrustedDependencyBinding>),
 }
 
-// `ProvenanceSnapshot` was relocated to `lpm-common` in Phase 68 so the
-// global trust binding (`lpm-global`, which deliberately does not depend
-// on `lpm-workspace`) can share one canonical serde shape with the
-// project-level `TrustedDependencyBinding.provenance_at_approval` field.
-// Existing call sites (`lpm-security`, `lpm-cli`, this crate) continue to
-// import `lpm_workspace::ProvenanceSnapshot` via the re-export below; new
-// callers in `lpm-global` import directly from `lpm_common`.
+// `ProvenanceSnapshot` lives in `lpm-common` so `lpm-global` (which
+// deliberately does not depend on `lpm-workspace`) can share the canonical
+// serde shape with project-level `TrustedDependencyBinding`. Callers that
+// already import from `lpm_workspace` continue to work via this re-export.
 pub use lpm_common::ProvenanceSnapshot;
 
 /// Binding metadata for one entry in a Rich `trustedDependencies` map.
 ///
-/// Both fields are `Option<String>` because:
-/// - `integrity` may be unknown if the package was approved before Phase 4
-///   schema awareness reached the resolver path (legacy upgrade case)
-/// - `script_hash` may be unknown for the same reason
-///
-/// In the post-Phase-4 happy path, both fields are populated by the
-/// `lpm approve-scripts` command from the install-time blocked-set captured
-/// in `<project_dir>/.lpm/build-state.json`.
+/// Both fields are `Option<String>` because approvals from the legacy upgrade
+/// path carry no integrity or script hash (the user approved by name only).
+/// When `lpm approve-scripts` writes a new approval, both fields are populated
+/// from the install-time blocked-set in `<project_dir>/.lpm/build-state.json`.
 #[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
 pub struct TrustedDependencyBinding {
     /// SRI integrity hash from the lockfile (e.g., `"sha512-..."`).
@@ -1118,113 +1107,84 @@ pub struct TrustedDependencyBinding {
         skip_serializing_if = "Option::is_none"
     )]
     pub script_hash: Option<String>,
-    /// **Phase 46 P4 §6.2 field ownership.** Snapshot of the publisher
-    /// identity tuple captured at the moment this binding was
-    /// approved. Used by the install-time drift check (§7.2) to detect
-    /// publisher-identity drift between the approved version and a
-    /// candidate version of the same package.
+    /// Snapshot of the publisher identity tuple captured at approval time.
+    /// Used by the install-time drift check to detect publisher-identity
+    /// drift between the approved version and a candidate version.
     ///
-    /// `None` means the binding pre-dates provenance capture (legacy
-    /// upgrade path) OR the approved version had no provenance
-    /// attestation in the first place. Both cases degrade to "cannot
-    /// detect drift" — the other three §7.2 branches still fire on
-    /// their own (cooldown, script hash, integrity).
+    /// `None` means the binding predates provenance capture (legacy upgrade
+    /// path) OR the approved version had no provenance attestation. Both
+    /// cases degrade to "cannot detect drift" — the script-hash and
+    /// integrity checks still fire independently.
     ///
     /// Non-breaking: `#[serde(default, skip_serializing_if)]` keeps
-    /// pre-P4 `trustedDependencies` entries round-tripping unchanged.
+    /// older `trustedDependencies` entries round-tripping unchanged.
     #[serde(
         default,
         rename = "provenanceAtApproval",
         skip_serializing_if = "Option::is_none"
     )]
     pub provenance_at_approval: Option<ProvenanceSnapshot>,
-    /// **Phase 46 P7 §6.2 field ownership.** SHA-256 over the sorted
-    /// canonical names of the active behavioral tags (per
-    /// `lpm_security::triage::hash_behavioral_tag_set`) at the moment
-    /// this binding was approved. Stored alongside the candidate-side
-    /// hash on `BlockedPackage` so the version-diff UI can detect
-    /// behavioral-tag drift across approval boundaries with a single
-    /// equality check, without re-fetching prior-version metadata.
+    /// SHA-256 over the sorted canonical names of the active behavioral
+    /// tags (per `lpm_security::triage::hash_behavioral_tag_set`) at
+    /// approval time. Stored alongside the candidate-side hash on
+    /// `BlockedPackage` so the version-diff UI can detect behavioral-tag
+    /// drift with a single equality check, without re-fetching metadata.
     ///
-    /// `None` for bindings approved before P7 reached this struct,
-    /// for offline approvals that couldn't fetch the metadata, or for
-    /// packages whose registry response carried no behavioral
-    /// analysis. Equality of two `None`s is treated as "no signal,
-    /// don't claim drift" by `compute_version_diff`.
+    /// `None` for approvals without behavioral analysis (offline, registry
+    /// fetch error, or the registry carried no analysis). Two `None`s are
+    /// treated as "no signal, don't claim drift" by `compute_version_diff`.
     ///
-    /// Non-breaking: `#[serde(default, skip_serializing_if)]` keeps
-    /// pre-P7 `trustedDependencies` entries round-tripping unchanged.
+    /// Non-breaking: `#[serde(default, skip_serializing_if)]`.
     #[serde(
         default,
         rename = "behavioralTagsHash",
         skip_serializing_if = "Option::is_none"
     )]
     pub behavioral_tags_hash: Option<String>,
-    /// **Phase 46 P7 §6.2 field ownership.** Sorted canonical names of
-    /// the active behavioral tags whose hash is `behavioral_tags_hash`.
-    /// Persisted alongside the hash so the version-diff UI can render
-    /// the *delta* (e.g. `gained network, eval` between v1 and v2),
-    /// not just "tags changed".
+    /// Sorted canonical names of the active behavioral tags whose hash is
+    /// `behavioral_tags_hash`. Persisted so the version-diff UI can render
+    /// the delta ("gained network, eval") rather than just "tags changed".
     ///
-    /// Hashes give fast equality and a stable fingerprint; the names
-    /// give human-readable rendering without a registry re-fetch
-    /// (which would break offline updates and add latency for the
-    /// common cache-miss case). Both fields are populated together
-    /// from one `active_tag_names()` call so the hash and the names
-    /// cannot drift apart.
+    /// Both fields are populated from one `active_tag_names()` call so the
+    /// hash and the names cannot drift apart. `None` whenever
+    /// `behavioral_tags_hash` is `None`; `Some(vec![])` when the version
+    /// had analysis but every tag was false.
     ///
-    /// `None` whenever `behavioral_tags_hash` is `None`;
-    /// `Some(vec![])` when the version had analysis but every tag was
-    /// false. Non-breaking: `#[serde(default, skip_serializing_if)]`.
+    /// Non-breaking: `#[serde(default, skip_serializing_if)]`.
     #[serde(
         default,
         rename = "behavioralTags",
         skip_serializing_if = "Option::is_none"
     )]
     pub behavioral_tags: Option<Vec<String>>,
-    /// **Phase 48 P0 sub-slice 6b.** SHA-256 (in `sha256-<hex>` SRI
-    /// form) over the canonical serialization of the
-    /// [per-package capability set](../../../../../lpm-cli/src/capability.rs)
-    /// that the user granted when they approved this package.
-    /// Canonicalization rules + hash format are owned by
-    /// `lpm_cli::capability::CapabilitySet::canonical_hash`; this
-    /// field only *stores* the result.
+    /// SHA-256 (`sha256-<hex>` SRI form) over the canonical serialization
+    /// of the per-package capability set the user granted at approval time.
+    /// Canonicalization is owned by `lpm_cli::capability::CapabilitySet::
+    /// canonical_hash`; this field only stores the result.
     ///
     /// # Semantic when `None`
     ///
-    /// `None` means "this is a pre-Phase-48 legacy approval." Per
-    /// [phase48.md §6 "Per-package capability knobs"](../../../../../../a-package-manager/DOCS/new-features/37-rust-client-RUNNER-VISION-phase48.md),
-    /// such approvals grant the baseline capability set ONLY:
-    /// empty `passEnv`, `readProject = Narrow`, no `sandboxLimits`
-    /// bumps. A request that loosens any of the three fields MUST
-    /// NOT be satisfied by a legacy approval — the user never
-    /// reviewed the widened request.
+    /// `None` means a legacy approval — the user never reviewed a specific
+    /// capability request. Such approvals grant the baseline capability set
+    /// only: empty `passEnv`, `readProject = Narrow`, no `sandboxLimits`
+    /// bumps. A request that loosens any of those MUST NOT be satisfied by
+    /// a legacy approval.
     ///
     /// The match decision lives in
     /// [`lpm_cli::capability::CapabilitySet::is_approved_by`]
-    /// (this crate intentionally does not import the capability
-    /// types to keep the dep graph acyclic). Callers must route
-    /// through that method; do NOT compare this field directly
-    /// against a hash string in enforcement code.
+    /// (this crate intentionally does not import the capability types to keep
+    /// the dep graph acyclic). Callers must route through that method; do NOT
+    /// compare this field directly against a hash string in enforcement code.
     ///
     /// # Semantic when `Some(hash)`
     ///
-    /// `Some(hash)` binds the approval to the **exact** capability
-    /// set whose `canonical_hash()` equals `hash`. Any drift
-    /// (adding, removing, or changing any field of the capability
-    /// set) produces a different canonical hash and the match
-    /// fails — invalidating the approval and forcing a re-review
-    /// before the widened request takes effect.
+    /// Binds the approval to the **exact** capability set whose
+    /// `canonical_hash()` equals `hash`. Any drift produces a different hash
+    /// and invalidates the approval — forcing a re-review before the widened
+    /// request takes effect.
     ///
-    /// # Backward compatibility
-    ///
-    /// Non-breaking via `#[serde(default, skip_serializing_if)]`:
-    /// pre-6b records deserialize with `None`; new records whose
-    /// capability set happens to be baseline serialize with the
-    /// field absent (since `None` is the default and identical
-    /// to "legacy approval" for match purposes). Old records never
-    /// silently widen — "approved baseline only" is the only
-    /// sound interpretation of a missing field.
+    /// Non-breaking via `#[serde(default, skip_serializing_if)]`: old records
+    /// deserialize with `None` and never silently widen.
     #[serde(
         default,
         rename = "capabilityHash",
@@ -1235,28 +1195,23 @@ pub struct TrustedDependencyBinding {
 
 impl Default for TrustedDependencies {
     fn default() -> Self {
-        // Default to the LEGACY form so a missing field deserializes
-        // identically to the pre-Phase-4 default. This matters for
-        // existing manifests with no `trustedDependencies` key at all
-        // — they keep round-tripping as `Vec::new()` and never accidentally
-        // get migrated to the Rich form on a no-op read.
+        // Default to the LEGACY form so a missing field deserializes as an
+        // empty approval list. Existing manifests with no `trustedDependencies`
+        // key round-trip as `Vec::new()` and are never accidentally migrated
+        // to the Rich form on a no-op read.
         TrustedDependencies::Legacy(Vec::new())
     }
 }
 
-/// **Phase 46 P7.** Bundle of install-time-captured metadata that
-/// `lpm approve-scripts` persists onto a [`TrustedDependencyBinding`]
-/// at approval time via [`TrustedDependencies::approve_with_metadata`].
+/// Bundle of install-time-captured metadata that `lpm approve-scripts`
+/// persists onto a [`TrustedDependencyBinding`] via
+/// [`TrustedDependencies::approve_with_metadata`].
 ///
-/// Replaces a previously-growing argument list (P4 added one param,
-/// P7 added two more, P8's LLM-approver identity would have added two
-/// more again — this struct caps that growth). All fields are `Option`
-/// because each one independently degrades to "not captured" under
-/// offline / pre-feature-shipping / fetch-error conditions; the
-/// downstream gates treat `None` as "no signal, don't claim drift."
+/// All fields are `Option` because each degrades independently to "not
+/// captured" under offline or fetch-error conditions; downstream gates
+/// treat `None` as "no signal, don't claim drift."
 ///
-/// All fields are sourced from the matching candidate `BlockedPackage`
-/// — see the `lpm approve-scripts` write paths.
+/// All fields are sourced from the matching candidate `BlockedPackage`.
 #[derive(Debug, Clone, Default)]
 pub struct ApprovalMetadata {
     /// SRI integrity hash from the lockfile.
@@ -1264,46 +1219,30 @@ pub struct ApprovalMetadata {
     /// Deterministic script hash from
     /// `lpm_security::script_hash::compute_script_hash`.
     pub script_hash: Option<String>,
-    /// Publisher-identity snapshot from the registry's Sigstore
-    /// attestation bundle (P4).
+    /// Publisher-identity snapshot from the registry's Sigstore attestation.
     pub provenance_at_approval: Option<ProvenanceSnapshot>,
-    /// SHA-256 over the sorted active behavioral-tag names (P7).
+    /// SHA-256 over the sorted active behavioral-tag names.
     pub behavioral_tags_hash: Option<String>,
-    /// Sorted active behavioral-tag names — the rendering input for
-    /// the version-diff `gained / lost` delta (P7).
+    /// Sorted active behavioral-tag names — the rendering input for the
+    /// version-diff "gained / lost" delta.
     pub behavioral_tags: Option<Vec<String>>,
-    /// **Phase 48 P0 sub-slice 6d.** Canonical hash of the
-    /// per-package [`CapabilitySet`](../../../lpm-cli/src/capability.rs)
-    /// that the user granted at approval time.
+    /// Canonical hash of the per-package `CapabilitySet` the user granted
+    /// at approval time. Persists into [`TrustedDependencyBinding::capability_hash`];
+    /// enforcement consults it via `CapabilitySet::is_approved_by`.
     ///
-    /// Persists into [`TrustedDependencyBinding::capability_hash`];
-    /// enforcement (6c) consults that stored hash via
-    /// `CapabilitySet::is_approved_by` to decide whether the
-    /// package's current capability request is still covered.
+    /// `None` means the package requested no extras (baseline) OR the approval
+    /// was written by a legacy path. Both degrade to "approved with no extra
+    /// capabilities" — they cannot silently widen.
     ///
-    /// `None` (the default) means the approval flow did not
-    /// materialize a capability hash — either because the package
-    /// requested no extras (baseline) OR because the approval was
-    /// created via a legacy write path (pre-6d). Both cases
-    /// degrade to "approved with no extra capabilities" at
-    /// enforcement time via the 6b single-semantic rule — they
-    /// cannot silently widen.
-    ///
-    /// **Critical UX constraint** (phase48.md §6 reviewer notes
-    /// for this sub-slice): the hash written here MUST come from
-    /// the same canonical `CapabilitySet` object the runtime will
-    /// later enforce against. If the approval flow were to re-
-    /// parse `package.json` and recompute the hash in a different
-    /// way than `evaluate_trust` does, drift-at-approval-time
-    /// could ship silently. Production callers must parse the
-    /// capability set once per `approve-scripts` invocation and
-    /// thread the object — not a re-parsed variant — through to
-    /// both the prompt renderer and this hash field.
+    /// The hash MUST come from the same `CapabilitySet` object the runtime
+    /// will later enforce against. Callers must parse the capability set once
+    /// per `approve-scripts` invocation and thread the same object through to
+    /// both the prompt renderer and this field.
     pub capability_hash: Option<String>,
 }
 
 /// The result of looking up a package in `trustedDependencies`.
-/// Phase 4 strict-gate query type — see [`TrustedDependencies::matches_strict`].
+/// See [`TrustedDependencies::matches_strict`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TrustMatch {
     /// Rich entry with all four fields equal to the queried values.
@@ -1318,16 +1257,9 @@ pub enum TrustMatch {
     /// `lpm rebuild` SKIPS the script and surfaces the drift to the user.
     BindingDrift {
         /// The binding currently stored in `package.json` (so callers
-        /// can show a diff).
-        ///
-        /// **Phase 48 P0 sub-slice 6b:** boxed. [`TrustedDependencyBinding`]
-        /// grew past clippy's `large_enum_variant` threshold when
-        /// `capability_hash` was added; boxing the drift variant keeps
-        /// the sibling variants (which carry no data) cheap. Callers
-        /// using `match TrustMatch::BindingDrift { stored }` get
-        /// `Box<TrustedDependencyBinding>` auto-deref on field access
-        /// (`stored.script_hash`), so most existing match arms work
-        /// unchanged. Constructors must `Box::new(binding)` explicitly.
+        /// can show a diff). Boxed because `TrustedDependencyBinding` grew
+        /// past clippy's `large_enum_variant` threshold; boxing the drift
+        /// variant keeps the no-data sibling variants cheap.
         stored: Box<TrustedDependencyBinding>,
     },
     /// No matching entry in either form.
@@ -1342,37 +1274,30 @@ impl TrustedDependencies {
         format!("{name}@{version}")
     }
 
-    /// Strict trust query — the Phase 4 default gate.
+    /// Strict trust query — the default gate for `lpm rebuild`.
     ///
     /// Returns:
     /// - [`TrustMatch::Strict`] if the Rich variant has a `name@version`
     ///   entry whose stored `integrity` and `script_hash` BOTH equal the
-    ///   queried values. `None` integrity/script_hash on either side
-    ///   counts as "no constraint" (matches anything) for that field —
-    ///   this is intentional for the legacy-upgrade path where a Rich
-    ///   entry was inserted before the binding fields were known.
+    ///   queried values. `None` on either side counts as "no constraint" —
+    ///   intentional for the legacy-upgrade path where a Rich entry was
+    ///   inserted before the binding fields were known.
     /// - [`TrustMatch::BindingDrift`] if a Rich entry exists for the
-    ///   `name@version` key but at least one binding field is set on
-    ///   BOTH sides and they differ.
-    /// - [`TrustMatch::LegacyNameOnly`] if the Legacy variant contains
-    ///   the bare `name` string, OR if the Rich variant contains a
-    ///   `<name>@*` preserve key (the migration sentinel from
-    ///   [`Self::upgrade_to_rich`]). Caller should warn about deprecation.
+    ///   `name@version` key but at least one binding field is set on BOTH
+    ///   sides and they differ.
+    /// - [`TrustMatch::LegacyNameOnly`] if the Legacy variant contains the
+    ///   bare `name` string, OR if the Rich variant contains a `<name>@*`
+    ///   preserve key (the migration sentinel from [`Self::upgrade_to_rich`]).
+    ///   Caller should warn about deprecation.
     /// - [`TrustMatch::NotTrusted`] otherwise.
     ///
-    /// **Phase 4 audit fix (D-impl-1, 2026-04-11):** the `<name>@*`
-    /// preserve key path was missing pre-fix. Without it, a manifest like
-    /// `["esbuild"]` would lose esbuild's approval on the first
-    /// `lpm approve-scripts --yes` upgrade because the upgrade rewrote it
-    /// to `esbuild@*` and `matches_strict` only matched concrete keys.
-    /// The audit reproduced the regression end-to-end. The fix preserves
-    /// the legacy semantic AND keeps the deprecation signal.
+    /// The `<name>@*` preserve-key path is essential: without it, a manifest
+    /// like `["esbuild"]` would lose esbuild's approval on the first
+    /// `lpm approve-scripts --yes` upgrade (which rewrites it to `esbuild@*`)
+    /// because the strict gate would only match concrete version keys.
     ///
-    /// **Lookup precedence:** the concrete `name@version` key is preferred
-    /// over the `name@*` preserve key when both exist for the same name.
-    /// This protects the case where a user explicitly approved
-    /// `esbuild@0.25.1` AND there's a leftover legacy `esbuild@*` — the
-    /// strict binding wins (and produces drift correctly if it diverges).
+    /// **Lookup precedence:** the concrete `name@version` key wins over the
+    /// `name@*` preserve key when both exist for the same name.
     pub fn matches_strict(
         &self,
         name: &str,
@@ -1412,12 +1337,11 @@ impl TrustedDependencies {
                     return TrustMatch::Strict;
                 }
 
-                // Step 2 (Phase 4 D-impl-1 audit fix): fall back to the
-                // `<name>@*` preserve key if no concrete entry was found.
-                // This is the legacy-upgrade migration path. The bindings
-                // on these entries are intentionally None — they encode
-                // "trust this name only" without integrity/script_hash
-                // constraints, so they MUST NOT be checked for drift.
+                // Step 2: fall back to the `<name>@*` preserve key. This is
+                // the legacy-upgrade migration path. The bindings on these
+                // entries are intentionally None — they encode "trust this
+                // name only" without integrity/script_hash constraints, so
+                // they MUST NOT be checked for drift.
                 let star_key = format!("{name}@*");
                 if map.contains_key(&star_key) {
                     return TrustMatch::LegacyNameOnly;
@@ -1429,7 +1353,7 @@ impl TrustedDependencies {
     }
 
     /// Lenient name-only check. Used by the existing `lpm rebuild` code
-    /// path before M5 swaps to `matches_strict`, and by post-M5 logic that
+    /// path before `matches_strict` was introduced, and by logic that
     /// just wants to know "does this name appear at all?" (e.g., the
     /// stale-trustedDependencies warning).
     pub fn contains_name_lenient(&self, name: &str) -> bool {
@@ -1447,21 +1371,17 @@ impl TrustedDependencies {
 
     /// Look up the rich binding for a specific `name@version`.
     ///
-    /// **Phase 48 P0 sub-slice 6c.** Used by the capability-hash
-    /// enforcement path to obtain the [`TrustedDependencyBinding`]
-    /// whose [`TrustedDependencyBinding::capability_hash`] the
-    /// caller can feed to
+    /// Used by the capability-hash enforcement path to obtain the
+    /// [`TrustedDependencyBinding`] whose
+    /// [`TrustedDependencyBinding::capability_hash`] the caller feeds to
     /// `lpm_cli::capability::CapabilitySet::is_approved_by`.
     ///
     /// Lookup precedence mirrors [`Self::matches_strict`]:
     /// - Rich entries: concrete `{name}@{version}` key wins; the
     ///   `{name}@*` preserve-key fallback is the secondary match.
-    /// - Legacy entries: returns `None` because the legacy form
-    ///   has no binding to return. Callers must treat a `None`
-    ///   result as "approval was Phase 46 / legacy-name-only; no
-    ///   capability hash is stored," which collapses via
-    ///   `is_approved_by(None = self.is_at_baseline)` to the
-    ///   correct semantic.
+    /// - Legacy entries: returns `None` — the legacy form has no binding.
+    ///   Callers treat `None` as "legacy approval, no capability hash stored,"
+    ///   which collapses via `is_approved_by` to the baseline-only semantic.
     pub fn get_binding(&self, name: &str, version: &str) -> Option<&TrustedDependencyBinding> {
         match self {
             TrustedDependencies::Legacy(_) => None,
@@ -1540,11 +1460,8 @@ impl TrustedDependencies {
                     provenance_at_approval: None,
                     behavioral_tags_hash: None,
                     behavioral_tags: None,
-                    // Phase 48 P0 sub-slice 6b: the legacy `<name>@*`
-                    // migration sentinel carries no capability grant.
-                    // None = "legacy approval, baseline only"; matches
-                    // the Phase 46 upgrade intent (trust the package by
-                    // name, no extra capabilities).
+                    // The `<name>@*` migration sentinel carries no capability
+                    // grant: None = "legacy approval, baseline only".
                     capability_hash: None,
                 },
             );
@@ -1583,28 +1500,16 @@ impl TrustedDependencies {
         )
     }
 
-    /// **Phase 46 §6.2 write-path.** Insert / overwrite an approval
-    /// entry with the install-time-captured approval metadata bundle.
-    /// Equivalent to [`Self::approve`] but carries the P4 + P7 fields
-    /// (`provenance_at_approval`, `behavioral_tags_hash`,
-    /// `behavioral_tags`) through to the binding so subsequent
-    /// installs can compare against them.
+    /// Insert / overwrite an approval entry with the install-time-captured
+    /// metadata bundle. Equivalent to [`Self::approve`] but carries provenance,
+    /// behavioral-tag hash, and capability-hash fields through to the binding so
+    /// subsequent installs can compare against them.
     ///
-    /// **History:** P4 added `provenance_at_approval` (function was
-    /// originally named `approve_with_provenance`); P7 renamed to
-    /// `approve_with_metadata` and added the behavioral-tag fields
-    /// alongside, since "provenance" no longer captured what the
-    /// function persists. Future phases (P8 LLM approver identity)
-    /// extend the same metadata bundle, not the call signature.
+    /// The caller (`lpm approve-scripts`) reads the metadata from the
+    /// install-time `BlockedPackage`. This closes the round-trip: capture →
+    /// `BlockedPackage` → binding → next install's drift / version-diff check.
     ///
-    /// The caller — `lpm approve-scripts` — reads the metadata from the
-    /// install-time `BlockedPackage` (which was populated from
-    /// `lpm-cli`'s registry-metadata + provenance fetchers). This
-    /// closes the round-trip: install-time capture → BlockedPackage →
-    /// binding → next install's drift / version-diff check.
-    ///
-    /// Passing all-`None` metadata fields is identical to
-    /// [`Self::approve`] (legacy / degraded-fetch paths).
+    /// Passing all-`None` metadata is identical to [`Self::approve`].
     pub fn approve_with_metadata(
         &mut self,
         name: &str,
@@ -1624,58 +1529,37 @@ impl TrustedDependencies {
                 provenance_at_approval: meta.provenance_at_approval,
                 behavioral_tags_hash: meta.behavioral_tags_hash,
                 behavioral_tags: meta.behavioral_tags,
-                // **Phase 48 P0 sub-slice 6d.** Plumbed from the
-                // approval write path. `None` is still valid
-                // (baseline approval with no extras requested) —
-                // the 6b match rule interprets `None` as
-                // "approved baseline only," which is correct for
-                // the common case.
+                // `None` is valid: baseline approval with no extras requested.
+                // The match rule interprets `None` as "approved baseline only."
                 capability_hash: meta.capability_hash,
             },
         )
         .is_some()
     }
 
-    /// **Phase 46 P4 Chunk 3.** Find the provenance-bearing approval
-    /// entry for this package name whose version sorts highest, and
-    /// return `(version, binding)` as the reference point for the
-    /// install-time drift check.
+    /// Find the provenance-bearing approval entry for this package name whose
+    /// version sorts highest. Returns `(version, binding)` as the reference
+    /// point for the install-time drift check.
     ///
-    /// The drift gate prefers provenance-bearing approvals over
-    /// provenance-less ones: if a user has `axios@1.14.0` approved
-    /// WITH provenance AND `axios@1.13.5` approved WITHOUT provenance,
-    /// comparing `axios@1.14.1` against the 1.13.5 binding
-    /// (`provenance_at_approval = None`) would short-circuit to
-    /// `NoDrift` and mask the axios signal. Filtering to
-    /// provenance-bearing entries only is the safer default.
+    /// Filtering to provenance-bearing entries only is the safer default:
+    /// if `axios@1.14.0` was approved WITH provenance and `axios@1.13.5`
+    /// WITHOUT, comparing a candidate against the 1.13.5 binding would
+    /// short-circuit to `NoDrift` and mask the signal.
     ///
-    /// The returned version string is the part after the LAST `@`
-    /// in the rich-map key, so scoped names like `@scope/pkg@1.0.0`
-    /// correctly split into `@scope/pkg` + `1.0.0`. Used by the
-    /// drift gate's §7.3 UX to render "last approved: v<VERSION>".
+    /// The returned version string is the part after the LAST `@` in the
+    /// rich-map key, so scoped names like `@scope/pkg@1.0.0` correctly
+    /// split into `@scope/pkg` + `1.0.0`.
     ///
-    /// ## Determinism (reviewer finding — Finding 2)
+    /// ## Determinism
     ///
-    /// `TrustedDependencies::Rich` wraps a [`HashMap`], whose
-    /// iteration order is non-deterministic per `HashMap`'s
-    /// contract. The original Chunk 3 implementation picked "the
-    /// first match from `map.iter()`" which meant:
-    /// - the UX line "last approved: v<VERSION>" could show a
-    ///   different version across runs of the same install;
-    /// - when multiple provenance-bearing approvals for the same
-    ///   package carry **different** identities (legitimate
-    ///   publisher migration, or prior attack + cleanup), the drift
-    ///   verdict itself could flip across runs.
-    ///
-    /// Fixed here by selecting the entry with the lexicographically-
-    /// maximum version string. That's deterministic and a decent
-    /// proxy for "latest" in the common case of consistent-digit-
-    /// width version components; it IS wrong for e.g. `1.10.0` vs
-    /// `1.9.0` (lex picks `1.9.0` as max). A future phase can
-    /// tighten to proper semver ordering — that's a scope decision,
-    /// not a soundness one; what matters here is **determinism
-    /// first**. The lex-max choice is documented so the follow-up
-    /// phase knows exactly what semantics it's replacing.
+    /// `HashMap` iteration order is non-deterministic. Selecting "the first
+    /// match" would make the drift verdict flip across runs when multiple
+    /// provenance-bearing approvals for the same package carry different
+    /// identities. Instead, this selects the entry with the lexicographically-
+    /// maximum version string — deterministic and correct for consistent-digit-
+    /// width versions; wrong for `1.10.0` vs `1.9.0` (lex picks `1.9.0`).
+    /// Proper semver ordering can replace this later; determinism is the
+    /// load-bearing property here.
     pub fn provenance_reference_for_name(
         &self,
         name: &str,
@@ -1695,34 +1579,21 @@ impl TrustedDependencies {
             .max_by(|(v1, _), (v2, _)| v1.cmp(v2))
     }
 
-    /// **Phase 46 P7.** Find the approved binding for this package name
-    /// whose version is the lexicographic-max STRICTLY LESS THAN the
-    /// given candidate version, and return `(version, binding)` as the
-    /// reference point for the version-diff UI.
+    /// Find the approved binding for this package name whose version is the
+    /// lexicographic-max STRICTLY LESS THAN the given candidate version.
+    /// Returns `(version, binding)` as the reference point for the version-diff UI.
     ///
     /// Differences from [`Self::provenance_reference_for_name`]:
-    /// - Not filtered by provenance presence. Script-hash and
-    ///   behavioral-tag drift can be rendered even when the binding
-    ///   had no provenance captured (degraded fetch, pre-P4 binding).
-    /// - Strictly less than `candidate_version`: on re-install of the
-    ///   same version (candidate equals an approved version) there is
-    ///   nothing to diff, so we return `None` rather than pointing at
-    ///   the same version.
-    /// - Skips `@*` legacy preserve-key entries (they're the
-    ///   migration sentinels from [`Self::upgrade_to_rich`], not
-    ///   concrete prior approvals with binding metadata to diff).
+    /// - Not filtered by provenance presence — script-hash and behavioral-tag
+    ///   drift can be rendered even without a provenance capture.
+    /// - Strictly less than `candidate_version`: on re-install of the same
+    ///   version there is nothing to diff, so returns `None`.
+    /// - Skips `@*` legacy preserve-key entries — they're migration sentinels,
+    ///   not concrete prior approvals with binding metadata to diff.
     ///
-    /// ## Determinism + ordering caveat
-    ///
-    /// Shares the P4 lex-max discipline (reviewer finding — Finding 2,
-    /// see [`Self::provenance_reference_for_name`]): `HashMap`
-    /// iteration is non-deterministic, so the selector must be an
-    /// associative reduction. Lex-max is deterministic and correct for
-    /// consistent-digit-width version numbers; it's wrong for e.g.
-    /// `1.10.0` vs `1.9.0` (lex picks `1.9.0`). A future phase can
-    /// tighten to proper semver ordering — P7 deliberately mirrors
-    /// P4's selector so the UX and the drift gate never disagree on
-    /// which version is the "prior approval."
+    /// Lex-max selection (same as [`Self::provenance_reference_for_name`])
+    /// keeps the diff UI and the drift gate in sync on which version is the
+    /// "prior approval."
     pub fn latest_binding_for_name(
         &self,
         name: &str,
@@ -2159,9 +2030,8 @@ mod tests {
         fs::write(dir.join("package.json"), content).unwrap();
     }
 
-    /// Regression test for the rollup-plugins audit fixture (2026-05-07
-    /// hoisted-mode compat audit). rollup's `package.json` ships
-    /// `overrides` with a nested-object value
+    /// Regression test for the rollup-plugins audit fixture. rollup's
+    /// `package.json` ships `overrides` with a nested-object value
     /// (`"path-scurry": {"lru-cache": "^11.3.5"}`) — valid npm syntax for
     /// "only override `lru-cache` when `path-scurry` is in scope." The
     /// pre-fix `HashMap<String, String>` deserializer errored on this
@@ -2373,9 +2243,9 @@ mod tests {
         assert_eq!(lpm.linker.as_deref(), Some("symlink"));
     }
 
-    /// **Phase 32 Phase 5** — `lpm.overrides` field deserializes as a
-    /// `HashMap<String, String>`. The downstream parser
-    /// (`lpm_resolver::OverrideSet::parse`) does the validation.
+    /// `lpm.overrides` deserializes as a `HashMap<String, String>`.
+    /// The downstream parser (`lpm_resolver::OverrideSet::parse`) does
+    /// the validation.
     #[test]
     fn read_package_json_with_lpm_overrides() {
         let dir = tempfile::tempdir().unwrap();
@@ -2401,8 +2271,7 @@ mod tests {
         assert_eq!(lpm.overrides.get("baz>qar@1").unwrap(), "2.0.0");
     }
 
-    /// **Phase 32 Phase 5** — `lpm.overrides` defaults to an empty
-    /// map when absent. Round-trips to a default `LpmConfig` correctly.
+    /// `lpm.overrides` defaults to an empty map when absent.
     #[test]
     fn read_package_json_with_lpm_no_overrides() {
         let dir = tempfile::tempdir().unwrap();
@@ -2421,7 +2290,7 @@ mod tests {
         assert!(lpm.overrides.is_empty());
     }
 
-    // ── Phase 64 #34: pnpm-compat detection ─────────────────────────────
+    // ── pnpm-compat detection ────────────────────────────────────────────
 
     /// `pnpm.overrides` deserializes successfully even when LPM has no
     /// equivalent fields. The struct stays tolerant — we don't reject
@@ -3294,7 +3163,7 @@ mod workspace_protocol_tests {
         assert_eq!(deps["utils"], "1.2.3"); // exact passthrough
     }
 
-    /// Finding #6: workspace: with arbitrary semver range is a passthrough (matches pnpm behavior).
+    /// `workspace:` with arbitrary semver range is a passthrough (matches pnpm behavior).
     /// e.g., "workspace:>=1.0.0" for a member with version "2.0.0" → resolves to ">=1.0.0".
     #[test]
     fn workspace_semver_range_passthrough() {
@@ -3556,9 +3425,8 @@ mod package_json_field_tests {
 
     #[test]
     fn test_trusted_dependencies() {
-        // Phase 4 M2: trusted_dependencies is now a TrustedDependencies enum.
         // The legacy array form must still deserialize cleanly into the
-        // Legacy variant (this is the backwards-compat contract).
+        // Legacy variant (backwards-compat contract).
         let json = r#"{"lpm": {"trustedDependencies": ["pkg-a"]}}"#;
         let pkg: PackageJson = serde_json::from_str(json).unwrap();
         let lpm = pkg.lpm.unwrap();
@@ -3579,14 +3447,10 @@ mod package_json_field_tests {
     }
 }
 
-// ── Phase 32 Phase 4 M2: TrustedDependencies schema migration tests ──
-//
-// These tests live in their own module so they don't get lost in the
-// workspace_protocol/catalog_protocol/bin_config noise above. The
-// invariant being locked: the deserializer accepts BOTH the legacy array
-// form AND the rich map form, and the helper methods (matches_strict,
-// contains_name_lenient, upgrade_to_rich, approve, revoke) compose into
-// the M4 / M5 flows correctly.
+// TrustedDependencies schema migration tests — the deserializer accepts
+// BOTH the legacy array form AND the rich map form, and the helper methods
+// (matches_strict, contains_name_lenient, upgrade_to_rich, approve, revoke)
+// compose into the install-gate flows correctly.
 
 #[cfg(test)]
 mod trusted_dependencies_tests {
@@ -3891,15 +3755,11 @@ mod trusted_dependencies_tests {
         assert_eq!(binding.script_hash.as_deref(), Some("sha256-new"));
     }
 
-    /// **AUDIT REGRESSION (Phase 4 D-impl-1):** the previous version of this
-    /// test codified the WRONG invariant — it asserted that legacy `@*`
-    /// preserve keys did NOT satisfy the strict gate. That meant a manifest
-    /// like `["esbuild"]` would silently re-block esbuild on the next install
-    /// after any unrelated `lpm approve-scripts --yes` upgrade. The audit
-    /// reproduced this end-to-end. The fix is to make `matches_strict`
-    /// honor `<name>@*` keys as wildcard version matches that produce
-    /// `LegacyNameOnly` (which the build pipeline accepts as trusted, with
-    /// a deprecation warning). This test now locks in the FIXED behavior.
+    /// Regression guard: legacy `@*` preserve keys MUST satisfy the strict gate.
+    /// Without this, a manifest like `["esbuild"]` would silently re-block
+    /// esbuild on the next install after any unrelated `lpm approve-scripts
+    /// --yes` upgrade (which rewrites it to `esbuild@*`). `matches_strict`
+    /// honors `<name>@*` as a wildcard version match producing `LegacyNameOnly`.
     #[test]
     fn approve_legacy_then_approve_new_preserves_legacy_via_starkey() {
         let mut td = TrustedDependencies::Legacy(vec!["sharp".to_string()]);
@@ -3926,15 +3786,14 @@ mod trusted_dependencies_tests {
             td.matches_strict("sharp", "0.33.0", Some("sha512-z"), Some("sha256-z")),
             TrustMatch::LegacyNameOnly,
             "legacy `@*` preserve keys MUST satisfy the strict gate as \
-             LegacyNameOnly so users keep their pre-Phase-4 approvals \
-             through the upgrade. The build pipeline emits a deprecation \
-             warning so users still get nudged to upgrade to a strict binding."
+             LegacyNameOnly so users keep their legacy approvals through \
+             the upgrade. The build pipeline emits a deprecation warning so \
+             users still get nudged to upgrade to a strict binding."
         );
     }
 
-    /// **AUDIT REGRESSION (Phase 4 D-impl-1) — direct.** A `<name>@*`
-    /// preserve key in a Rich variant must match ANY version of the named
-    /// package as `LegacyNameOnly`. Tests the matcher in isolation.
+    /// A `<name>@*` preserve key in a Rich variant must match ANY version of
+    /// the named package as `LegacyNameOnly`. Tests the matcher in isolation.
     #[test]
     fn matches_strict_handles_at_star_preserve_key_as_legacy_wildcard() {
         // Construct a Rich variant directly with a `@*` preserve key
@@ -3966,9 +3825,9 @@ mod trusted_dependencies_tests {
         );
     }
 
-    /// **AUDIT REGRESSION (Phase 4 D-impl-1).** A scoped package preserved
-    /// as `@scope/pkg@*` must also be matched as `LegacyNameOnly`. The
-    /// `@*` parser must split on the LAST `@`, not the first.
+    /// A scoped package preserved as `@scope/pkg@*` must be matched as
+    /// `LegacyNameOnly`. The `@*` parser must split on the LAST `@`, not
+    /// the first.
     #[test]
     fn matches_strict_at_star_preserve_key_handles_scoped_package_names() {
         let mut map = HashMap::new();
@@ -3983,11 +3842,8 @@ mod trusted_dependencies_tests {
         );
     }
 
-    /// **AUDIT REGRESSION (Phase 4 D-impl-1).** A concrete `name@version`
-    /// rich entry must be preferred over a `name@*` legacy preserve key
-    /// if both exist for the same name. This protects the case where the
-    /// user approved esbuild@0.25.1 specifically AND there's a leftover
-    /// legacy `esbuild@*` entry — the strict binding wins.
+    /// A concrete `name@version` rich entry must be preferred over a `name@*`
+    /// legacy preserve key when both exist: the strict binding wins.
     #[test]
     fn matches_strict_prefers_concrete_version_key_over_at_star_for_same_name() {
         let mut map = HashMap::new();
@@ -4094,10 +3950,10 @@ mod trusted_dependencies_tests {
         );
     }
 
-    // ── ProvenanceSnapshot tests moved to crates/lpm-common/src/provenance.rs
-    //    in Phase 68 alongside the type itself; see the re-export above.
+    // ── ProvenanceSnapshot tests live in crates/lpm-common/src/provenance.rs;
+    //    see the re-export above.
 
-    // ── TrustedDependencyBinding.provenance_at_approval (P4 §6.2) ──
+    // ── TrustedDependencyBinding.provenance_at_approval ─────────────
 
     /// Pre-P4 `trustedDependencies` entries — with only `integrity`
     /// and `scriptHash` — must keep round-tripping through serde
@@ -4126,7 +3982,7 @@ mod trusted_dependencies_tests {
     /// P4 happy path: an entry approved in a provenance-aware install
     /// captures the `ProvenanceSnapshot` and round-trips through
     /// serde without field drift. The `provenanceAtApproval` JSON
-    /// key name matches the plan doc's §6.2 wire spec.
+    /// key name matches the wire spec.
     #[test]
     fn trusted_binding_with_provenance_roundtrips() {
         let binding = TrustedDependencyBinding {
@@ -4151,15 +4007,11 @@ mod trusted_dependencies_tests {
         assert_eq!(binding, back);
     }
 
-    // ── provenance_reference_for_name (P4 Chunk 3 selector) ───────
+    // ── provenance_reference_for_name ─────────────────────────────
     //
-    // Reviewer finding — Finding 2: the drift gate's reference
-    // selector must be deterministic across runs. HashMap iteration
-    // order isn't, so a `map.iter().find(...)` shape would pick
-    // different entries on different runs when multiple matches
-    // exist. Deterministic selection policy: lexicographic-max on
-    // the version string. Documented simplification; semver-correct
-    // ordering deferred to a later phase.
+    // The selector must be deterministic: HashMap iteration order isn't,
+    // so `map.iter().find(...)` would pick different entries across runs
+    // when multiple matches exist. Policy: lexicographic-max on version.
 
     fn trusted_dep_binding_with_provenance(publisher: &str) -> TrustedDependencyBinding {
         TrustedDependencyBinding {
@@ -4329,7 +4181,7 @@ mod trusted_dependencies_tests {
     /// An approval flow that captures "no provenance present" (the
     /// approved version had no attestation in the first place) must
     /// still serialize the `present: false` snapshot. This matters
-    /// for the §7.2 drift rule's `(None, Some(_)) → block` branch,
+    /// for the drift rule's `(None, Some(_)) → block` branch,
     /// which distinguishes "approved version had provenance, this
     /// one doesn't" (block) from "neither side had provenance"
     /// (layers 1/2/4 decide).
@@ -4350,20 +4202,15 @@ mod trusted_dependencies_tests {
         assert!(!back.provenance_at_approval.as_ref().unwrap().present);
     }
 
-    // ── Phase 48 P0 sub-slice 6b — capabilityHash serde ───────────
+    // ── capabilityHash serde ─────────────────────────────────────
 
-    /// Old binding records (pre-6b, no `capabilityHash` field)
-    /// deserialize successfully with `capability_hash = None`.
-    /// This is the load-bearing "backward-compat" case: every
-    /// approval in every user's existing `package.json >
-    /// trustedDependencies` predates sub-slice 6b and must round-
-    /// trip through the new struct unchanged.
+    /// Old binding records (without `capabilityHash`) deserialize with
+    /// `capability_hash = None`. Every existing approval in every user's
+    /// `package.json > trustedDependencies` must round-trip unchanged.
     #[test]
     fn binding_without_capability_hash_loads_as_legacy_approval() {
-        // Exact shape of a Phase 46 / P7 binding — no
-        // capabilityHash key. Three plausible forms: bare legacy
-        // (only integrity/scriptHash), full P7 (plus provenance
-        // + behavioral tags), and empty-object.
+        // Three plausible forms: bare legacy (only integrity/scriptHash),
+        // full binding (plus provenance + behavioral tags), and empty-object.
         let cases = [
             r#"{}"#,
             r#"{"integrity":"sha512-xyz","scriptHash":"sha256-abc"}"#,
@@ -4462,7 +4309,7 @@ mod trusted_dependencies_tests {
     }
 }
 
-// ── Trial 29: parse_peer_dependencies ────────────────────────────────────────
+// ── parse_peer_dependencies ───────────────────────────────────────────────────
 
 #[cfg(test)]
 mod peer_deps_parse_tests {
@@ -4537,7 +4384,7 @@ mod peer_deps_parse_tests {
         assert!(json.windows(NEEDLE.len()).any(|w| w == NEEDLE));
     }
 
-    // ── Trial 30: parse_bin_field ─────────────────────────────────────────
+    // ── parse_bin_field ───────────────────────────────────────────────────
 
     #[test]
     fn parse_bin_field_returns_none_for_no_bin() {

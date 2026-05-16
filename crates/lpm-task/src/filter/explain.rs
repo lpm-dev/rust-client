@@ -1,7 +1,7 @@
 //! Explain API: structured "why is this package in the result set" traces.
 //!
-//! Used by `lpm filter --explain` and the future MCP `lpm_filter_preview` tool
-//! (Phase 9). Empty selections still return a `FilterExplain` with a diagnostic
+//! Used by `lpm filter --explain` and the MCP `lpm_filter_preview` tool.
+//! Empty selections still return a `FilterExplain` with a diagnostic
 //! trace — they are NOT errors. Per design decision D3, only the explicit
 //! `--fail-if-no-match` flag escalates an empty result to a hard error.
 

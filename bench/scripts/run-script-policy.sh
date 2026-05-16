@@ -1,6 +1,6 @@
 #!/bin/bash
-# Phase 57 measurement-sprint B — script-policy benchmark methodology.
-# Today's "lpm install" never runs scripts (Phase 46 two-phase model);
+# Script-policy benchmark methodology.
+# "lpm install" never runs scripts (two-phase model);
 # `bun install` runs scripts by default. Headline "1.17× bun" therefore
 # compares different workloads. This bench measures the delta both ways.
 #
@@ -19,9 +19,9 @@ set -euo pipefail
 
 N="${1:-10}"
 TAG="${2:-script-policy}"
-BIN="/tmp/lpm-rs-phase56-target/release/lpm-rs"
+BIN="/tmp/lpm-rs-bench-target/release/lpm-rs"
 FIXTURE="/Users/tolga/Documents/Projects/lpm-dev/rust-client/bench/fixture-large"
-RESULTS="/tmp/phase56-fusion-bench/${TAG}-results"
+RESULTS="/tmp/lpm-fusion-bench/${TAG}-results"
 mkdir -p "$RESULTS"
 
 [[ -x "$BIN" ]] || { echo "ERROR: binary missing at $BIN"; exit 1; }
@@ -38,7 +38,7 @@ clean_bun() {
 }
 cd "$FIXTURE"
 
-echo "[bench] phase57-${TAG} — n=${N} per cell"
+echo "[bench] script-policy-bench-${TAG} — n=${N} per cell"
 date
 
 for i in $(seq 1 "$N"); do

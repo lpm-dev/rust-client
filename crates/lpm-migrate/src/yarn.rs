@@ -535,7 +535,7 @@ pkg@^1.0.0:
 
     #[test]
     fn mark_dev_optional_from_package_json() {
-        // Finding #6: yarn v1 doesn't encode dev/optional at entry level
+        // yarn v1 doesn't encode dev/optional at entry level
         let input = r#"# yarn lockfile v1
 
 

@@ -273,8 +273,9 @@ fn lint_all_happy_path_e2e_network_gated() {
 
     let output = lpm(&project)
         // Suppress the interactive "Plugin not installed. Downloading..." banner
-        // so stdout stays a clean JSON envelope.
-        .env("LPM_AUTO_DOWNLOAD", "1")
+        // so stdout stays a clean JSON envelope. The env var ONLY suppresses
+        // the banner — the download itself is unconditional on cache miss.
+        .env("LPM_PLUGIN_QUIET", "1")
         .args(["--json", "lint", "--all"])
         .output()
         .expect("failed to run lpm lint --all --json");
@@ -351,7 +352,7 @@ fn lint_all_happy_path_e2e_network_gated() {
 // positional args don't get claimed by `--filter` falls out of clap's grammar
 // (`--filter` is `Vec<String>` requiring the explicit flag).
 
-// ─── Phase 2: Test/Bench workspace surface ──────────────────────
+// ─── Test/Bench workspace surface ──────────────────────
 
 #[test]
 fn test_filter_typo_with_fail_flag_exits_nonzero() {
@@ -624,10 +625,10 @@ fn test_workspace_json_emits_valid_envelope_per_member() {
     }
 }
 
-// ─── Phase 2: compat-seam end-to-end ────────────────────────────
+// ─── compat-seam end-to-end ────────────────────────────
 //
 // The reviewer's load-bearing test: prove that `lpm test -- --all` still
-// forwards `--all` to the underlying runner after Phase 2 claims `--all`
+// forwards `--all` to the underlying runner after it claims `--all`
 // as an LPM workspace flag. We use a `scripts.test` fallback that simply
 // echoes a literal sentinel (no shell-positional `$@` — the runner path
 // builds a single command string with args appended, not passed as `$@`).

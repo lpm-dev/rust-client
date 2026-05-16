@@ -1,4 +1,4 @@
-//! Phase 48 P0 end-to-end round-trip: offline install honors the
+//! End-to-end offline capability round-trip: offline install honors the
 //! capability gate + approve-scripts persists a capability_hash
 //! that subsequent enforcement accepts.
 //!
@@ -95,19 +95,19 @@ fn make_scripted_tarball(name: &str, version: &str) -> Vec<u8> {
 async fn offline_install_capability_round_trip_end_to_end() {
     // ── Mock registry with a scripted package ──
     let mock = MockRegistry::start().await;
-    let tarball = make_scripted_tarball("phase48-roundtrip", "1.0.0");
-    mock.with_package("phase48-roundtrip", "1.0.0", &tarball)
+    let tarball = make_scripted_tarball("offline-capability-pkg", "1.0.0");
+    mock.with_package("offline-capability-pkg", "1.0.0", &tarball)
         .await;
 
     let batch_meta = serde_json::json!({
-        "name": "phase48-roundtrip",
+        "name": "offline-capability-pkg",
         "dist-tags": { "latest": "1.0.0" },
         "versions": {
             "1.0.0": {
-                "name": "phase48-roundtrip",
+                "name": "offline-capability-pkg",
                 "version": "1.0.0",
                 "dist": {
-                    "tarball": format!("{}/tarballs/phase48-roundtrip/-/phase48-roundtrip-1.0.0.tgz", mock.url()),
+                    "tarball": format!("{}/tarballs/offline-capability-pkg/-/offline-capability-pkg-1.0.0.tgz", mock.url()),
                     "integrity": "sha512-placeholder"
                 },
                 "scripts": { "postinstall": "tsc" },
@@ -122,7 +122,7 @@ async fn offline_install_capability_round_trip_end_to_end() {
         r#"{
             "name": "offline-cap-roundtrip",
             "version": "1.0.0",
-            "dependencies": { "phase48-roundtrip": "^1.0.0" }
+            "dependencies": { "offline-capability-pkg": "^1.0.0" }
         }"#,
     );
 
@@ -161,18 +161,18 @@ async fn offline_install_capability_round_trip_end_to_end() {
     // ── Author a rich strict approval (no capabilityHash) + a
     //    widening `passEnv` declaration ──
     //
-    // This is the Phase 48 P0 reviewer's High-finding scenario:
+    // Reviewer high-finding scenario:
     // strict script-hash trust would pass, but the capability
-    // gate (added in sub-slice 6c) should still block. The
+    // gate should still block. The
     // pre-fix offline path would have silently dropped this row
     // from build-state.json.
     let rewritten_pkg = serde_json::json!({
         "name": "offline-cap-roundtrip",
         "version": "1.0.0",
-        "dependencies": { "phase48-roundtrip": "^1.0.0" },
+        "dependencies": { "offline-capability-pkg": "^1.0.0" },
         "lpm": {
             "trustedDependencies": {
-                "phase48-roundtrip@1.0.0": { "scriptHash": script_hash }
+                "offline-capability-pkg@1.0.0": { "scriptHash": script_hash }
             },
             "scripts": { "passEnv": ["SSH_AUTH_SOCK"] }
         }
@@ -218,7 +218,7 @@ async fn offline_install_capability_round_trip_end_to_end() {
          hardcoded baseline capability defaults and the row was silently dropped. \
          Full build-state: {bs:#}"
     );
-    assert_eq!(blocked[0]["name"], "phase48-roundtrip");
+    assert_eq!(blocked[0]["name"], "offline-capability-pkg");
     assert_eq!(
         blocked[0]["binding_drift"], true,
         "capture flags this as drift so approve-scripts renders 'previously approved, please re-review'"
@@ -245,7 +245,7 @@ async fn offline_install_capability_round_trip_end_to_end() {
         .as_array()
         .expect("`blocked` array in --list --json output");
     assert!(
-        listed.iter().any(|p| p["name"] == "phase48-roundtrip"),
+        listed.iter().any(|p| p["name"] == "offline-capability-pkg"),
         "approve-scripts --list must surface the capability-widened package — \
          reviewer's Medium finding (the discovery filter needed to consult \
          the capability gate, not just the strict match). Full listing: {listing:#}"
@@ -260,11 +260,10 @@ async fn offline_install_capability_round_trip_end_to_end() {
         &std::fs::read_to_string(project.path().join("package.json")).unwrap(),
     )
     .unwrap();
-    let binding = &pkg_json["lpm"]["trustedDependencies"]["phase48-roundtrip@1.0.0"];
-    let cap_hash = binding["capabilityHash"].as_str().expect(
-        "approve-scripts MUST persist capabilityHash for a widening approval \
-         (sub-slice 6d write-path contract)",
-    );
+    let binding = &pkg_json["lpm"]["trustedDependencies"]["offline-capability-pkg@1.0.0"];
+    let cap_hash = binding["capabilityHash"]
+        .as_str()
+        .expect("approve-scripts MUST persist capabilityHash for a widening approval");
     assert!(
         cap_hash.starts_with("sha256-"),
         "capabilityHash must be sha256-<hex> SRI form; got {cap_hash:?}"

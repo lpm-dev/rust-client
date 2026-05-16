@@ -1,5 +1,5 @@
 #!/bin/bash
-# Phase 66 R2.2 — eager peer auto-install smoke.
+# R2.2 — eager peer auto-install smoke.
 #
 # Contract: declaring `react-redux` (which has a required peer on
 # `react@^18 || ^19`) without listing react in `dependencies` MUST

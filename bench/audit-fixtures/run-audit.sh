@@ -15,7 +15,7 @@ REPO_ROOT="$(cd "$HERE/../.." && pwd)"
 FIXTURE_DIR="$HERE/$FIXTURE_REL"
 RESULTS_DIR="$HERE/results"
 
-# Phase 66 confidence-followup §3b — Windows portability.
+# confidence-followup — Windows portability.
 # On Git Bash (Windows-latest runner), the binary lands at
 # `target/release/lpm-rs.exe` and `/tmp` resolves to the host's MSYS
 # tmp dir (per-user, not shared) which is fine. Auto-append `.exe` and
@@ -120,7 +120,7 @@ run_mode() {
     # Pre-fix this only wiped `$HOME/.lpm`, so callers that set
     # LPM_HOME (top-npm-audit's per-slot homes) leaked state across
     # modes — hoisted reused the populated store from the prior
-    # isolated pass, weakening §1b's cold-state signal.
+    # isolated pass, weakening 's cold-state signal.
     local lpm_root="${LPM_HOME:-$HOME/.lpm}"
     rm -rf "$work" "$lpm_root/cache" "$lpm_root/store"
     mkdir -p "$work"

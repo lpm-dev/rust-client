@@ -1,4 +1,4 @@
-//! **Phase 32 Phase 7 — pure-function helpers for the interactive upgrade flow.**
+//!
 //!
 //! Everything in this module is an unbiased predicate or transformation
 //! over data already in scope at the call site. There are no I/O calls,
@@ -66,7 +66,7 @@ pub fn classify_semver_change(from: &str, to: &str) -> SemverClass {
 /// non-empty `EXECUTED_INSTALL_PHASES` lifecycle script.
 ///
 /// Reads from `VersionMetadata::lifecycle_scripts` (the LPM-extended
-/// `_lifecycleScripts` field). Phase 7's `[!]` marker is gated on this
+/// `_lifecycleScripts` field). the `[!]` marker is gated on this
 /// predicate — see design doc F-V8 for the rationale.
 pub fn target_has_install_scripts(meta: &VersionMetadata) -> bool {
     let Some(scripts) = meta.lifecycle_scripts.as_ref() else {
@@ -82,12 +82,12 @@ pub fn target_has_install_scripts(meta: &VersionMetadata) -> bool {
 /// **D-design-1 audit fix (MEDIUM):** the `basis` field explicitly marks
 /// that the analysis is against the CURRENT lockfile, not a projected
 /// post-upgrade state. Recomputing against the proposed selection set is
-/// deferred to Phase 7.x.
+/// deferred to a future release.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct PeerImpact {
     /// True iff all target peers are satisfied in the lockfile.
     pub ok: bool,
-    /// Always `"current_lockfile"` in Phase 7.
+    /// Always `"current_lockfile"` in.
     pub basis: String,
     /// Peer dependencies not present in the lockfile at all.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -173,7 +173,7 @@ fn range_satisfies(range_str: &str, version_str: &str) -> bool {
 
 /// Patch-invalidation analysis for an upgrade candidate.
 ///
-/// Phase 7 ships the **selector-orphan** check only — see design doc
+/// ships the **selector-orphan** check only — see design doc
 /// F-V10 for why the stronger integrity-rotation check is deferred.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct PatchInvalidation {
@@ -531,7 +531,7 @@ mod tests {
             &ok_impact,
             None
         ));
-        // Install scripts don't affect default check in Phase 7
+        // Install scripts don't affect default check
         assert!(default_pre_check(
             SemverClass::Patch,
             true,

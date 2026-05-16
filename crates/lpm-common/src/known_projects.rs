@@ -1,4 +1,4 @@
-//! Phase 66 Phase 4e — machine-global registry of project directories
+//! Machine-global registry of project directories
 //! that have completed an `lpm install`.
 //!
 //! Lives at `~/.lpm/known-projects.json` (resolved through
@@ -257,8 +257,8 @@ pub fn register(path: &Path, project_dir: &Path) -> Result<Entry, LpmError> {
 
 /// Drop entries whose `path` no longer exists on disk. Returns the
 /// number of dropped entries. Used by `lpm cache prune` during the
-/// registry-sweep step (preplan §4.3 step 2: "If the path doesn't
-/// exist on disk, silently drop the entry from the registry").
+/// registry-sweep step: if the path doesn't exist on disk, silently
+/// drop the entry from the registry.
 ///
 /// Atomically rewrites the registry on disk if any entries were
 /// dropped; if none were dropped, the disk file is untouched.

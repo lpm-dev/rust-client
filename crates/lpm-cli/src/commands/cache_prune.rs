@@ -1,4 +1,4 @@
-//! `lpm cache prune` — Phase 66 Phase 4e implementation.
+//! `lpm cache prune` — implementation.
 //!
 //! Walks the v2 virtual store at `~/.lpm/store/v2/{links,objects}/` and
 //! removes entries no longer reachable from any registered project's
@@ -29,7 +29,7 @@
 //!   prior `lpm uninstall -g` runs that couldn't delete inline).
 //!   Default is dry-run.
 //!
-//! ## Safety rails (preplan §4.3)
+//! ## Safety rails (preplan)
 //!
 //! - Canonicalized paths in the registry — symlink-cwd quirks don't
 //!   accumulate aliased entries.
@@ -375,7 +375,7 @@ pub fn compute_prune_plan(
             continue;
         }
         if let Some(max_age) = max_age {
-            // Phase 66 followup #3 — the JSON `last_referenced_at`
+            // followup #3 — the JSON `last_referenced_at`
             // field is set at first population and never rewritten
             // post-followup; cache-hit installs refresh the sidecar
             // file's mtime instead. `effective_last_referenced_at`
@@ -396,7 +396,7 @@ pub fn compute_prune_plan(
         link_entries_orphaned.push(dir.clone());
     }
 
-    // ── Step 5: Object orphan detection (preplan §4.4). An object is
+    // ── Step 5: Object orphan detection (preplan). An object is
     //         reachable iff a SURVIVING (non-orphan) link entry's
     //         sidecar lists it as `object_path`. Iterating ALL link
     //         entries — including orphans — would mark every object

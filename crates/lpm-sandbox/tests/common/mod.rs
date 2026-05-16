@@ -1,6 +1,6 @@
-//! Shared test harness for the Chunk 5 corpora — escape, compat
-//! greens, (Chunk 5b: compat ambers). Keeps the per-test files
-//! focused on WHAT they assert, not on fixture plumbing.
+//! Shared test harness for the escape, compat-greens, and compat-amber
+//! corpora. Keeps the per-test files focused on WHAT they assert, not
+//! on fixture plumbing.
 //!
 //! Every helper is platform-aware: callers can check
 //! [`sandbox_supported`] up front and skip (rather than fail) when
@@ -98,7 +98,7 @@ pub fn try_build_sandbox(spec: SandboxSpec, mode: SandboxMode) -> Option<Box<dyn
 /// True if the host has a working sandbox for the mode. Use as a
 /// test-skip guard at the top of each `#[test]`.
 ///
-/// Phase 46.2: the integration corpora in this directory
+/// The integration corpora in this directory
 /// (`compat_greens.rs`, `escape_corpus.rs`) drive sandboxed children
 /// via POSIX shell scripts (`/bin/sh -c "mkdir -p ..; echo > ..."`).
 /// On Windows the WindowsSandbox backend works fine, but `/bin/sh`

@@ -83,7 +83,7 @@ mod tests {
 
     #[test]
     fn current_platform_succeeds_on_known_os() {
-        // Finding #12: Platform::current() returns Result and succeeds on supported platforms
+        // Platform::current() returns Result and succeeds on supported platforms
         let p = Platform::current();
         assert!(
             p.is_ok(),

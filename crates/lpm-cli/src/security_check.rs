@@ -13,10 +13,10 @@
 //! Uses batch metadata endpoint for @lpm.dev packages (1 request for all).
 
 use crate::output;
+use lpm_common::color::Painted;
 use lpm_registry::RegistryClient;
 use lpm_security::behavioral::{self, PackageAnalysis};
 use lpm_store::PackageStore;
-use owo_colors::OwoColorize;
 use std::collections::{HashMap, HashSet};
 
 /// Severity tier for the post-install summary.
@@ -51,7 +51,7 @@ pub async fn post_install_security_summary(
         return;
     }
 
-    // ── Phase 1: Client-side analysis (all packages) ──────────
+    // ── Client-side analysis (all packages) ──────────
 
     let show_progress = !json_output && packages.len() > 50;
     let spinner = if show_progress {
@@ -87,7 +87,7 @@ pub async fn post_install_security_summary(
         s.stop(format!("Analyzed {} packages", packages.len()));
     }
 
-    // ── Phase 2: Registry-side enrichment (@lpm.dev only) ─────
+    // ── Registry-side enrichment (@lpm.dev only) ─────
 
     let lpm_packages: HashMap<String, String> = packages
         .iter()
@@ -619,7 +619,7 @@ mod tests {
     ) -> PackageAnalysis {
         PackageAnalysis {
             version: lpm_security::behavioral::SCHEMA_VERSION,
-            analyzed_at: "2026-04-04T00:00:00Z".into(),
+            analyzed_at: "T00:00:00Z".into(),
             source,
             supply_chain,
             manifest,

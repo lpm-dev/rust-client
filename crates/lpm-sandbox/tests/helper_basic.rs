@@ -1,4 +1,4 @@
-//! Phase 46.3 PR-2: argv-contract integration tests for
+//! Argv-contract integration tests for
 //! `lpm-sandbox-helper.exe`.
 //!
 //! Tier: cli-binary (integration) — covers the argv → exit-code

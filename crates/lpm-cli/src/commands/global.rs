@@ -1,16 +1,14 @@
 //! `lpm global` — read-only commands against the global manifest.
 //!
-//! Phase 37 M2.5 ships `list`, `bin`, `path`. The full surface
-//! (`install`, `uninstall`, `update`, `remove`) lands in M3 once the
-//! install pipeline is wired through `IsolatedInstall::persistent`.
-//! Because reads do not need a lock, the M2 commands work straight off
-//! the manifest file — they're a useful smoke test of the schema even
-//! before any global install can be performed.
+//! Subcommands: `list` (with `--outdated`/`--verbose`), `bin`,
+//! `path <pkg>`, `remove <pkg>` (= `lpm uninstall -g <pkg>`),
+//! `update [<pkg>[@<spec>]]` (with `--dry-run`).
+//! Read-only commands (`list`, `bin`, `path`) do not acquire a lock.
 
 use crate::output;
+use lpm_common::color::Painted;
 use lpm_common::{LpmError, LpmRoot, format_bytes};
 use lpm_global::{GlobalManifest, PackageEntry};
-use owo_colors::OwoColorize;
 use std::path::Path;
 
 /// Subcommands of `lpm global`. Defined here (not in `main.rs`) so the
@@ -47,7 +45,7 @@ pub enum GlobalCmd {
     /// Remove a globally-installed package.
     ///
     /// Equivalent to `lpm uninstall -g <pkg>` — both invocations route
-    /// through the same M3.3 implementation.
+    /// through the same `uninstall_global` implementation.
     Remove {
         /// Package name (e.g. `eslint`, `@lpm.dev/owner.tool`).
         package: String,
@@ -57,13 +55,13 @@ pub enum GlobalCmd {
     ///
     /// With no argument: re-resolve every globally-installed package
     /// against its persisted `saved_spec` and upgrade any that have
-    /// a newer matching version available. Phase 33 precedence applies
+    /// a newer matching version available. precedence applies
     /// — preserved ranges, dist-tag re-pin, etc.
     ///
     /// With `<pkg>` (no version): same flow scoped to one package.
     ///
-    /// With `<pkg>@<spec>` (M3.4 stretch): rewrite the saved_spec
-    /// using Phase 33's `decide_saved_dependency_spec`, then upgrade.
+    /// With `<pkg>@<spec>`: rewrite the saved_spec
+    /// using the `decide_saved_dependency_spec`, then upgrade.
     /// Same precedence as `lpm install <pkg>@<spec>` in a project.
     ///
     /// Use `--dry-run` to print the upgrade plan without making any
@@ -99,7 +97,7 @@ pub async fn run(
         GlobalCmd::Bin => run_bin(&root, json_output),
         GlobalCmd::Path { package } => run_path(&root, &manifest, &package, json_output),
         // `lpm global remove` and `lpm uninstall -g` are two surfaces
-        // for the same operation. Both route through the M3.3
+        // for the same operation. Both route through the
         // `uninstall_global` pipeline.
         GlobalCmd::Remove { package } => {
             crate::commands::uninstall_global::run(&package, json_output).await
@@ -130,9 +128,9 @@ fn run_list(
     Ok(())
 }
 
-// ─── M6.1: lpm global list --outdated ─────────────────────────────────
+// ─── lpm global list --outdated ─────────────────────────────────
 
-/// Phase 37 M6.1: compare each globally-installed package's resolved
+/// compare each globally-installed package's resolved
 /// version against the highest version the registry exposes under the
 /// package's persisted `saved_spec`. Report packages whose registry
 /// has something newer.
@@ -177,7 +175,7 @@ async fn run_list_outdated(
     }
 
     // Single batch call covers every globally-installed package.
-    // Phase 35 Step 6 fix: use the injected client (carries
+    // Step 6 fix: use the injected client (carries
     // `--registry` + SessionManager). The local `build_registry()`
     // helper is now unused.
     let names: Vec<String> = manifest.packages.keys().cloned().collect();
@@ -255,7 +253,7 @@ struct UnresolvedRow {
 
 /// Pick the highest registry version that satisfies `saved_spec`.
 /// Same resolver-precedence as `update_global::pick_version` but
-/// inlined here to keep M6.1 independent of M3.4's internals.
+/// inlined here to keep `lpm global list --outdated` independent of `update_global` internals.
 fn pick_latest_matching(
     meta: &lpm_registry::PackageMetadata,
     saved_spec: &str,
@@ -297,7 +295,7 @@ fn pick_latest_matching(
         .ok_or_else(|| format!("no version of '{}' satisfies '{}'", meta.name, saved_spec))
 }
 
-// Phase 35 Step 6 fix: removed `build_registry` — all callers now
+// Step 6 fix: removed `build_registry` — all callers now
 // receive the injected `&RegistryClient` from `main.rs` so the
 // `--registry` flag and the shared `SessionManager` are honored.
 
@@ -571,7 +569,7 @@ fn run_path(
 
 // ─── helpers ───────────────────────────────────────────────────────────
 
-/// Best-effort post-commit tombstone sweep (Phase 37 M3.5). Never fails
+/// Best-effort post-commit tombstone sweep. Never fails
 /// the caller and never surfaces visible output unless actual cleanup
 /// happened — a janitor, not a progress report.
 ///
@@ -672,7 +670,7 @@ mod tests {
         assert!(r.is_ok());
     }
 
-    /// Phase 37 M6.1: `--outdated` on an empty manifest prints an
+    /// `--outdated` on an empty manifest prints an
     /// "all up-to-date" (or "no globals") result and short-circuits
     /// before any registry call.
     #[tokio::test]
@@ -783,7 +781,7 @@ mod tests {
         assert!(cmds.iter().any(|c| c.contains("y (alias of x)")));
     }
 
-    // ─── M6.1: pick_latest_matching ──────────────────────────────────
+    // ─── pick_latest_matching ──────────────────────────────────
 
     use lpm_registry::PackageMetadata;
 

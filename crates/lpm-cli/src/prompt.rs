@@ -1,6 +1,6 @@
 //! Shared prompt helpers for interactive CLI commands.
 //!
-//! Lifted from `commands::add` during Phase 32 Phase 7 so both `add.rs`
+//! Lifted from `commands::add` so both `add.rs`
 //! and `upgrade.rs` (and any future interactive command) share the same
 //! Ctrl+C / cancellation handling.
 

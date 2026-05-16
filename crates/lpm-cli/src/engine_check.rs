@@ -35,9 +35,9 @@
 use crate::engine_strict_config;
 use crate::output;
 use lpm_common::LpmError;
+use lpm_common::color::Painted;
 use lpm_runtime::effective::resolve_effective_node_version_with_engines;
 use lpm_workspace::{PackageJson, discover_workspace, read_package_json};
-use owo_colors::OwoColorize;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 

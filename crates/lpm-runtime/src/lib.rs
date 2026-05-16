@@ -64,7 +64,7 @@ pub async fn ensure_runtime(project_dir: &std::path::Path) -> RuntimeStatus {
     let source = detected.source.to_string();
     let spec = &detected.spec;
 
-    // Validate the version spec before processing (Finding #5)
+    // Validate the version spec before processing
     if let Err(e) = node::validate_version_spec(spec) {
         tracing::warn!("invalid version spec from {source}: {e}");
         return RuntimeStatus::NotInstalled {
@@ -112,7 +112,7 @@ pub async fn ensure_runtime(project_dir: &std::path::Path) -> RuntimeStatus {
     {
         Ok(c) => c,
         Err(e) => {
-            // Finding #13: Log error details instead of swallowing
+            // Log error details instead of swallowing
             tracing::warn!("failed to create HTTP client for runtime install: {e}");
             return RuntimeStatus::NotInstalled {
                 spec: clean_spec.to_string(),
@@ -124,7 +124,7 @@ pub async fn ensure_runtime(project_dir: &std::path::Path) -> RuntimeStatus {
     let platform = match platform::Platform::current() {
         Ok(p) => p,
         Err(e) => {
-            // Finding #13: Log error details instead of swallowing
+            // Log error details instead of swallowing
             tracing::warn!("unsupported platform for runtime install: {e}");
             return RuntimeStatus::NotInstalled {
                 spec: clean_spec.to_string(),
@@ -136,7 +136,7 @@ pub async fn ensure_runtime(project_dir: &std::path::Path) -> RuntimeStatus {
     let releases = match node::fetch_index(&http_client).await {
         Ok(r) => r,
         Err(e) => {
-            // Finding #13: Log error details instead of swallowing
+            // Log error details instead of swallowing
             tracing::warn!("failed to fetch node.js release index: {e}");
             return RuntimeStatus::NotInstalled {
                 spec: clean_spec.to_string(),
@@ -171,7 +171,7 @@ pub async fn ensure_runtime(project_dir: &std::path::Path) -> RuntimeStatus {
             },
         },
         Err(e) => {
-            // Finding #13: Log error details instead of swallowing
+            // Log error details instead of swallowing
             tracing::warn!(
                 "failed to auto-install node {}: {e}",
                 release.version_bare()

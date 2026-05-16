@@ -1,7 +1,7 @@
 use crate::output;
 use lpm_common::LpmError;
+use lpm_common::color::Painted;
 use lpm_registry::RegistryClient;
-use owo_colors::OwoColorize;
 use serde_json::Value;
 use std::path::Path;
 
@@ -73,7 +73,7 @@ fn cleanup_removed_packages(project_dir: &Path, removed: &[String]) -> Result<()
     Ok(())
 }
 
-/// Phase 32 Phase 2 M3: per-manifest uninstall helper.
+/// per-manifest uninstall helper.
 ///
 /// Reads `pkg_json_path`, removes the requested package entries from
 /// `dependencies`/`devDependencies`, and writes the manifest back atomically.
@@ -109,7 +109,7 @@ fn uninstall_from_manifest(
 /// Legacy single-project uninstall — thin wrapper around
 /// [`uninstall_from_manifest`] + [`cleanup_removed_packages`]. Production
 /// callers go through [`run`] which uses the per-target helpers directly.
-/// Kept as a stable internal helper that the existing pre-Phase-2 test
+/// Kept as a stable internal helper that the existing pre-existing test
 /// suite exercises end-to-end.
 #[allow(dead_code)] // used by tests; production callers use the per-target helpers
 fn uninstall_from_project(
@@ -142,7 +142,7 @@ pub async fn run(
         ));
     }
 
-    // Phase 32 Phase 2 M3: route through the shared target resolver, which
+    // route through the shared target resolver, which
     // handles all 8 cells of the install/uninstall decision matrix
     // (standalone, workspace member dir, -w, --filter, etc.).
     let targets = crate::commands::install_targets::resolve_install_targets(
@@ -152,11 +152,11 @@ pub async fn run(
         true, // has_packages
     )?;
 
-    // Empty result from --filter (mirrors Phase 1 D3 / install M2 semantics).
+    // Empty result from --filter (mirrors D3 / workspace install semantics).
     //
-    // Phase 2 audit follow-through: surface the D2 substring → glob migration
+    // audit follow-through: surface the D2 substring → glob migration
     // hint when any filter looks like a bare name that would have
-    // substring-matched pre-Phase-32. Same behavior as `lpm install --filter`
+    // substring-matched pre-Same behavior as `lpm install --filter`
     // and `lpm run --filter`.
     if targets.member_manifests.is_empty() {
         let hint = crate::commands::filter::format_no_match_hint(filters);
@@ -183,7 +183,7 @@ pub async fn run(
 
     // Multi-member confirmation prompt — mirror of the install-side
     // `confirm_multi_member_mutation` call. See its docstring and the
-    // phase 2 status doc's D-impl-5 entry for the full contract.
+    // phase 2 status doc's  entry for the full contract.
     if targets.multi_member {
         crate::commands::install::confirm_multi_member_mutation(
             "Removing",
@@ -197,7 +197,7 @@ pub async fn run(
     // Run uninstall against every target manifest. Aggregate results so we
     // can report a single deduped (removed, not_found) summary at the end.
     //
-    // Phase 2 audit correction: lockfile + node_modules cleanup happens
+    // audit correction: lockfile + node_modules cleanup happens
     // PER TARGET at the member's own dir. LPM uses per-directory lockfiles
     // and per-directory node_modules, so a multi-member uninstall must
     // clean each member's own state — not the workspace root's.
@@ -382,7 +382,7 @@ mod tests {
         );
     }
 
-    // ── Phase 32 Phase 0.1 gap-filling additions ────────────────────────
+    // ── gap-filling additions ────────────────────────
 
     #[test]
     fn remove_from_manifest_handles_scoped_package_names() {
@@ -659,7 +659,7 @@ mod tests {
         write_package_json(dir.path(), &json!({"name": "demo"}));
         let client = lpm_registry::RegistryClient::new();
 
-        // Phase 2 M3: signature gained filters/-w/fail_if_no_match params.
+        // signature gained filters/-w/fail_if_no_match params.
         let result = run(&client, dir.path(), &[], &[], false, false, false, true).await;
 
         assert!(result.is_err());
@@ -670,11 +670,11 @@ mod tests {
         );
     }
 
-    // ── Phase 32 Phase 2 M3: workspace-aware uninstall behavior ────────────
+    // ── workspace-aware uninstall behavior ────────────
 
     #[tokio::test]
     async fn run_uninstall_in_standalone_project_targets_cwd_manifest() {
-        // Standalone project (no workspace) — Phase 2 dispatch falls through
+        // Standalone project (no workspace) — dispatch falls through
         // to the legacy single-target path via resolve_install_targets.
         let dir = tempfile::tempdir().unwrap();
         write_package_json(
@@ -693,7 +693,7 @@ mod tests {
             &[],
             false,
             false,
-            false, // yes — D-impl-5 prompt is TTY-only; tests bypass via non-TTY
+            false, // yes —  prompt is TTY-only; tests bypass via non-TTY
             true,
         )
         .await;
@@ -720,7 +720,7 @@ mod tests {
             &[],
             true,
             false,
-            false, // yes — D-impl-5 prompt is TTY-only; tests bypass via non-TTY
+            false, // yes —  prompt is TTY-only; tests bypass via non-TTY
             true,
         )
         .await;
@@ -741,7 +741,7 @@ mod tests {
             &["web".to_string()],
             false,
             false,
-            false, // yes — D-impl-5 prompt is TTY-only; tests bypass via non-TTY
+            false, // yes —  prompt is TTY-only; tests bypass via non-TTY
             true,
         )
         .await;
@@ -806,7 +806,7 @@ mod tests {
             &["web".to_string()],
             false,
             false,
-            false, // yes — D-impl-5 prompt is TTY-only; tests bypass via non-TTY
+            false, // yes —  prompt is TTY-only; tests bypass via non-TTY
             true,
         )
         .await;
@@ -848,7 +848,7 @@ mod tests {
             &["ui-*".to_string()],
             false,
             false,
-            false, // yes — D-impl-5 prompt is TTY-only; tests bypass via non-TTY
+            false, // yes —  prompt is TTY-only; tests bypass via non-TTY
             true,
         )
         .await;
@@ -899,7 +899,7 @@ mod tests {
             &[],
             true, // -w
             false,
-            false, // yes — D-impl-5 prompt is TTY-only; tests bypass via non-TTY
+            false, // yes —  prompt is TTY-only; tests bypass via non-TTY
             true,
         )
         .await;
@@ -930,7 +930,7 @@ mod tests {
             &["foo".to_string()],
             true, // -w + --filter together
             false,
-            false, // yes — D-impl-5 prompt is TTY-only; tests bypass via non-TTY
+            false, // yes —  prompt is TTY-only; tests bypass via non-TTY
             true,
         )
         .await;
@@ -953,7 +953,7 @@ mod tests {
             &[],
             false,
             false,
-            false, // yes — D-impl-5 prompt is TTY-only; tests bypass via non-TTY
+            false, // yes —  prompt is TTY-only; tests bypass via non-TTY
             true,
         )
         .await;
@@ -981,7 +981,7 @@ mod tests {
             &[],
             false,
             false,
-            false, // yes — D-impl-5 prompt is TTY-only; tests bypass via non-TTY
+            false, // yes —  prompt is TTY-only; tests bypass via non-TTY
             true,
         )
         .await;
@@ -1014,7 +1014,7 @@ mod tests {
             &["does-not-exist".to_string()],
             false,
             true,  // fail_if_no_match
-            false, // yes — D-impl-5 prompt is TTY-only; tests bypass via non-TTY
+            false, // yes —  prompt is TTY-only; tests bypass via non-TTY
             true,
         )
         .await;
@@ -1036,7 +1036,7 @@ mod tests {
             &["does-not-exist".to_string()],
             false,
             false,
-            false, // yes — D-impl-5 prompt is TTY-only; tests bypass via non-TTY
+            false, // yes —  prompt is TTY-only; tests bypass via non-TTY
             true,
         )
         .await;
@@ -1055,9 +1055,9 @@ mod tests {
 
     #[tokio::test]
     async fn run_uninstall_filter_no_match_with_fail_flag_includes_d2_hint_for_bare_names() {
-        // Phase 2 audit regression: when --fail-if-no-match fires AND the
+        // audit regression: when --fail-if-no-match fires AND the
         // filter list contains bare names that would have substring-matched
-        // pre-Phase-32, the error message must surface the D2 migration hint.
+        // Previously, the error message must surface the D2 migration hint.
         let dir = tempfile::tempdir().unwrap();
         write_workspace_fixture(dir.path(), &[("foo", "packages/foo", &[("bar", "1.0.0")])]);
         let client = lpm_registry::RegistryClient::new();
@@ -1071,7 +1071,7 @@ mod tests {
             &["core".to_string()],
             false,
             true,  // fail_if_no_match
-            false, // yes — D-impl-5 prompt is TTY-only; tests bypass via non-TTY
+            false, // yes —  prompt is TTY-only; tests bypass via non-TTY
             true,
         )
         .await;
@@ -1103,7 +1103,7 @@ mod tests {
             &["nonexistent-*".to_string()], // glob that matches nothing
             false,
             true,
-            false, // yes — D-impl-5 prompt is TTY-only; tests bypass via non-TTY
+            false, // yes —  prompt is TTY-only; tests bypass via non-TTY
             true,
         )
         .await;
@@ -1117,12 +1117,12 @@ mod tests {
 
     #[tokio::test]
     async fn run_uninstall_lockfile_cleanup_happens_per_member_not_at_workspace_root() {
-        // Phase 2 audit correction: LPM uses per-directory lockfiles. A
+        // audit correction: LPM uses per-directory lockfiles. A
         // multi-member uninstall must clean each TARGETED member's own
         // lockfile — and must NOT touch the workspace root lockfile (or any
         // unrelated member's lockfile).
         //
-        // The original Phase 2 implementation set install_root = workspace_root
+        // The original implementation set install_root = workspace_root
         // and removed only the workspace root lockfile. That was wrong:
         // member node_modules/lockfiles were left stale, and the workspace
         // root lockfile (if any) might not even be related to the members.
@@ -1171,7 +1171,7 @@ mod tests {
             &["ui-*".to_string()], // matches ui-a and ui-b only
             false,
             false,
-            false, // yes — D-impl-5 prompt is TTY-only; tests bypass via non-TTY
+            false, // yes —  prompt is TTY-only; tests bypass via non-TTY
             true,
         )
         .await;
@@ -1200,7 +1200,7 @@ mod tests {
         );
     }
 
-    // ── Phase 2 audit fix: install pipeline runs at member dir for filtered installs ──
+    // ── audit fix: install pipeline runs at member dir for filtered installs ──
 
     #[tokio::test]
     async fn run_uninstall_targets_member_dir_lockfile_for_in_member_dir_default() {
@@ -1224,7 +1224,7 @@ mod tests {
             &[],
             false,
             false,
-            false, // yes — D-impl-5 prompt is TTY-only; tests bypass via non-TTY
+            false, // yes —  prompt is TTY-only; tests bypass via non-TTY
             true,
         )
         .await;

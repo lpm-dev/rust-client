@@ -1,6 +1,5 @@
 //! macOS Seatbelt backend: routes `Sandbox::spawn` through
-//! `sandbox-exec -p <profile> <program> <args...>`. Phase 46 P5
-//! Chunk 2.
+//! `sandbox-exec -p <profile> <program> <args...>`.
 //!
 //! One `sandbox-exec` invocation per script. The profile is
 //! synthesized at [`SeatbeltSandbox::new`] so profile-render errors
@@ -8,9 +7,9 @@
 //! just process startup (not string building).
 //!
 //! **Mode coverage:**
-//! - [`SandboxMode::Enforce`] (Chunk 2): standard sandbox-exec
-//!   deny-default profile from [`seatbelt::render_profile`].
-//! - [`SandboxMode::LogOnly`] (Chunk 4): permissive profile from
+//! - [`SandboxMode::Enforce`]: standard sandbox-exec deny-default
+//!   profile from [`seatbelt::render_profile`].
+//! - [`SandboxMode::LogOnly`]: permissive profile from
 //!   [`seatbelt::render_logonly_profile`]. Opens with
 //!   `(allow (with report) default)`, then layers the Enforce allow
 //!   list after it — under SBPL last-match-wins, Enforce-covered
@@ -34,12 +33,11 @@ use crate::{Sandbox, SandboxError, SandboxMode, SandboxOptions, SandboxSpec, San
 pub(crate) struct SeatbeltSandbox {
     profile: String,
     mode: SandboxMode,
-    #[allow(dead_code)] // Kept for structured diagnostics in Chunk 4
+    #[allow(dead_code)] // Kept for structured diagnostics in log-only mode
     spec: SandboxSpec,
-    /// Phase 46.1 rework: cached for [`Sandbox::posture`] so the
-    /// install pipeline / doctor can surface whether strict
-    /// (network-denial) is active on this backend instance without
-    /// re-parsing the profile string.
+    /// Cached for [`Sandbox::posture`] so the install pipeline /
+    /// doctor can surface whether strict (network-denial) is active
+    /// on this backend instance without re-parsing the profile string.
     deny_outbound_network: bool,
 }
 
@@ -104,8 +102,7 @@ impl Sandbox for SeatbeltSandbox {
 
         // Put the sandbox-exec process (and its descendants) in their
         // own process group so the caller's timeout path can kill
-        // the whole tree with `kill(-pid, SIGKILL)`. Matches the
-        // pre-Phase-46 build.rs behavior.
+        // the whole tree with `kill(-pid, SIGKILL)`.
         {
             use std::os::unix::process::CommandExt;
             command.process_group(0);
@@ -127,8 +124,8 @@ impl Sandbox for SeatbeltSandbox {
     fn posture(&self) -> crate::SandboxPosture {
         // macOS Seatbelt has two postures: `Default` (the relaxed
         // shape where `(allow network*)` is emitted into the
-        // profile — Phase 46 P5 baseline) and `Strict` (the
-        // relaxed line is dropped, the opening `(deny default)`
+        // profile) and `Strict` (the relaxed line is dropped, the
+        // opening `(deny default)`
         // covers every socket family). The `Degraded` variant is
         // Linux-only — Seatbelt has no fallback ABI shape.
         if self.deny_outbound_network {
@@ -152,12 +149,9 @@ mod tests {
         _tmp: tempfile::TempDir,
     }
 
-    /// Build a realistic spec backed by live tempdirs. Chunk 5
-    /// changed [`seatbelt::render_profile`] to canonicalize base
-    /// paths, so every path referenced by the profile must exist
-    /// on the host. Earlier inline specs used
-    /// `home.join(".lpm/store/testpkg@0.1.0")` which failed
-    /// canonicalize after the Chunk 5 change.
+    /// Build a realistic spec backed by live tempdirs.
+    /// [`seatbelt::render_profile`] canonicalizes base paths, so every
+    /// path referenced by the profile must exist on the host.
     fn realistic_spec() -> RealisticSpec {
         let tmp = tempfile::tempdir().expect("tempdir");
         let pkg_dir = tmp.path().join("store").join("testpkg@0.1.0");
@@ -183,8 +177,7 @@ mod tests {
 
     #[test]
     fn new_renders_profile_successfully_for_realistic_spec() {
-        // Phase 46.1 rework (2026-05-11): default options gives the
-        // relaxed default — `(allow network*)` is emitted so
+        // Default options gives the relaxed default — `(allow network*)` is emitted so
         // legitimate post-approval downloaders (sharp, prisma,
         // @lpm-registry/cli, …) keep working. The strict path
         // (network denied) is exercised by the paired
@@ -196,7 +189,7 @@ mod tests {
         assert!(sb.profile.contains("(deny default)"));
         assert!(
             sb.profile.contains("(allow network*)"),
-            "Phase 46.1 rework default — `(allow network*)` must be present so the relaxed \
+            "default mode — `(allow network*)` must be present so the relaxed \
              default lets post-approval downloads work: {}",
             sb.profile,
         );
@@ -204,20 +197,19 @@ mod tests {
 
     #[test]
     fn new_strict_renders_no_allow_network_in_profile() {
-        // Phase 46.1 strict path: when the user opts into strict
-        // mode (via `--strict-sandbox` / `--paranoid` /
+        // Strict path: when the user opts into strict mode (via
+        // `--strict-sandbox` / `--paranoid` /
         // `[sandbox] mode = "strict"` / `LPM_STRICT_SANDBOX=1`),
         // the Seatbelt profile drops the `(allow network*)` line.
         // The `(deny default)` rule then covers every socket
         // family — TCP, UDP, raw, AF_PACKET, AF_NETLINK, DNS,
         // AF_UNIX, and any other family Seatbelt's match grammar
         // recognises. That coverage is asymmetric vs Linux: the
-        // layered landlock V4 (Phase 46.1) + seccomp-bpf (Phase
-        // 46.1.1) model closes TCP + direct UDP / raw /
-        // AF_PACKET / AF_NETLINK on Linux, but AF_UNIX stays
-        // allowed there (legitimate IPC needs). See the
-        // module-level docs in [`crate::lib`] and `linux.rs` for
-        // the full carve-out.
+        // layered landlock V4 + seccomp-bpf model closes TCP +
+        // direct UDP / raw / AF_PACKET / AF_NETLINK on Linux, but
+        // AF_UNIX stays allowed there (legitimate IPC needs). See the
+        // module-level docs in [`crate::lib`] and `linux.rs` for the
+        // full carve-out.
         let rs = realistic_spec();
         let options = SandboxOptions {
             deny_outbound_network: true,
@@ -227,7 +219,7 @@ mod tests {
         assert!(sb.profile.contains("(deny default)"));
         assert!(
             !sb.profile.contains("(allow network"),
-            "Phase 46.1 strict — outbound network must be denied; backend profile must not \
+            "strict mode — outbound network must be denied; backend profile must not \
              contain any `(allow network ...)` form: {}",
             sb.profile,
         );
@@ -265,11 +257,10 @@ mod tests {
 
     #[test]
     fn enforces_deny_default_for_forbidden_read() {
-        // §11 P5 ship criterion #1 (partial — full corpus is in
-        // Chunk 5). Creates a real file inside a tempdir that is NOT
-        // in the sandbox's allow list, then attempts to `cat` it.
-        // Seatbelt must deny the read — the deny-default + allow-
-        // list combination from §9.3 leaves that path unreferenced.
+        // Creates a real file inside a tempdir that is NOT in the
+        // sandbox's allow list, then attempts to `cat` it. Seatbelt
+        // must deny the read — the deny-default + allow-list
+        // combination leaves that path unreferenced.
         let td = tempfile::tempdir().unwrap();
         let secret = td.path().join("secret.txt");
         std::fs::write(&secret, b"TOP SECRET").unwrap();

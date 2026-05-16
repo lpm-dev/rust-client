@@ -24,7 +24,7 @@ pub enum ScanMode {
 
 /// A package discovered during the inventory phase.
 #[derive(Debug, Clone)]
-#[allow(dead_code)] // is_dev and is_optional used by Phase 31 --fail-on policy
+#[allow(dead_code)] // is_dev and is_optional used by --fail-on policy
 pub struct DiscoveredPackage {
     /// Package name (e.g., "react", "@scope/name", "@lpm.dev/owner.pkg").
     pub name: String,
@@ -823,7 +823,7 @@ version = "6.14.0"
         let mut cache = super::super::cache::ProjectAuditCache::new("npm");
         let analysis = lpm_security::behavioral::PackageAnalysis {
             version: lpm_security::behavioral::SCHEMA_VERSION,
-            analyzed_at: "2026-04-08T00:00:00Z".to_string(),
+            analyzed_at: "T00:00:00Z".to_string(),
             source: Default::default(),
             supply_chain: Default::default(),
             manifest: Default::default(),

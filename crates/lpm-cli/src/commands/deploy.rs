@@ -1,7 +1,7 @@
 //! `lpm deploy` — materialize a workspace member's production closure into
 //! a self-contained directory ready for Docker / `COPY --from=pruned`.
 //!
-//! Phase 32 Phase 3. See [37-rust-client-RUNNER-VISION-phase32-phase3-status.md]
+//! See [37-rust-client-RUNNER-VISION-phase32-phase3-status.md]
 //! for the milestone breakdown and the verified architectural facts that
 //! shape this design.
 //!
@@ -25,17 +25,17 @@
 //!   under the workspace root.
 //! - **`--dry-run` writes nothing.** Hard rule: zero filesystem writes when
 //!   `dry_run == true`.
-//! - **Deploy targets exactly one member.** Multi-member deploy is Phase 12+.
+//! - **Deploy targets exactly one member.** Multi-member deploy isa future release.
 //! - **Workspace members must be PUBLISHED** for cross-member deps. The
 //!   resolver has no local-package handling; an unpublished workspace member
 //!   referenced via `workspace:*` will fail at the resolver step. This is
-//!   documented as a Phase 3 limitation.
+//!   documented as a limitation.
 
 use crate::commands::install_targets::{install_root_for, resolve_install_targets};
 use crate::output;
 use lpm_common::LpmError;
+use lpm_common::color::Painted;
 use lpm_registry::RegistryClient;
-use owo_colors::OwoColorize;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
@@ -53,7 +53,7 @@ const REWRITE_DEP_SECTIONS: &[&str] = &[
 /// Files and directories that are NEVER copied to the deploy output.
 ///
 /// Match by EXACT basename. The list is intentionally small and conservative
-/// — Phase 12+ may add a user-configurable extension via `package.json` or
+/// —a future release may add a user-configurable extension via `package.json` or
 /// a `--exclude <glob>` flag.
 ///
 /// Categories:
@@ -115,7 +115,7 @@ pub(crate) struct CopyStats {
 /// - The function only writes inside `dst_dir`. It does not modify `src_dir`.
 /// - Symlinks pointing outside `src_dir` are NOT followed; they are copied
 ///   as-is (preserving the link, which the user may have intentionally
-///   created — Phase 3 doesn't second-guess this).
+///   created — doesn't second-guess this).
 pub(crate) fn copy_member_source(src_dir: &Path, dst_dir: &Path) -> Result<CopyStats, LpmError> {
     let mut stats = CopyStats::default();
 
@@ -183,7 +183,7 @@ fn copy_member_source_recursive(
             }
             #[cfg(windows)]
             {
-                // Windows symlink handling is more complex. For Phase 3,
+                // Windows symlink handling is more complex. For,
                 // copy the symlink target's contents instead. A future
                 // phase can handle Windows junctions properly.
                 if let Ok(target_meta) = std::fs::metadata(&src_path) {
@@ -216,12 +216,12 @@ fn copy_member_source_recursive(
 }
 
 /// Resolved deploy plan: which member to deploy and where it lives on disk.
-/// Returned by [`resolve_deploy_target`] and consumed by the M3-M5 pipeline.
+/// Returned by [`resolve_deploy_target`] and consumed by the deploy pipeline.
 #[derive(Debug, Clone)]
 pub(crate) struct DeployPlan {
-    /// Path to the source member's `package.json`. Read by M4 (manifest
-    /// rewrite) — currently `#[allow(dead_code)]` until M4 lands.
-    #[allow(dead_code)] // wired in M4
+    /// Path to the source member's `package.json`. Read during manifest
+    /// rewrite.
+    #[allow(dead_code)]
     pub member_manifest: PathBuf,
     /// Path to the source member's directory (`member_manifest.parent()`).
     pub member_dir: PathBuf,
@@ -232,7 +232,7 @@ pub(crate) struct DeployPlan {
 /// Resolve the deploy target from CLI flags and validate the output directory.
 ///
 /// Returns a [`DeployPlan`] on success, or an actionable [`LpmError::Script`]
-/// describing what's wrong. Validation rules (per Phase 3 status doc §M2):
+/// describing what's wrong. Validation rules:
 ///
 /// - `--filter` must be non-empty
 /// - `--filter` must match exactly one workspace member
@@ -293,7 +293,7 @@ pub(crate) fn resolve_deploy_target(
 /// Returns the validated, normalized path. Does NOT create the directory
 /// or clean it for `--force` — those are the caller's responsibility.
 ///
-/// **Phase 3 audit fix (2026-04-11):** the self-loop guard now canonicalizes
+/// the self-loop guard now canonicalizes
 /// BOTH the workspace root AND the output path through `canonicalize_or_partial`
 /// before comparing. The old implementation mixed canonical and lexical paths
 /// in the same comparison, which silently passed on macOS when the workspace
@@ -307,8 +307,7 @@ fn validate_output_dir(cwd: &Path, output_dir: &Path, force: bool) -> Result<Pat
     if let Ok(Some(workspace)) = lpm_workspace::discover_workspace(cwd) {
         // Resolve BOTH paths through the same normalization function so the
         // comparison is meaningful regardless of which form (canonical vs
-        // lexical-with-symlinks) the inputs arrive in. This is the Phase 3
-        // audit fix: the old code compared a mix of forms and missed the
+        // lexical-with-symlinks) the inputs arrive in. This is the         // audit fix: the old code compared a mix of forms and missed the
         // macOS `/tmp → /private/tmp` symlink case.
         let workspace_canonical = canonicalize_or_partial(&workspace.root);
         let output_canonical = canonicalize_or_partial(&normalized);
@@ -331,7 +330,7 @@ fn validate_output_dir(cwd: &Path, output_dir: &Path, force: bool) -> Result<Pat
     // validation succeeds. That ordering matters: validate_output_dir is
     // the safety gate that confirms the output is OUTSIDE the workspace,
     // and we deliberately never remove anything until the gate has passed.
-    // Phase 3 audit fix Medium (2026-04-11) wired the cleanup in `run`.
+    // audit fix Medium  wired the cleanup in `run`.
     if normalized.exists() {
         let is_empty = std::fs::read_dir(&normalized)
             .map(|mut iter| iter.next().is_none())
@@ -356,7 +355,7 @@ fn validate_output_dir(cwd: &Path, output_dir: &Path, force: bool) -> Result<Pat
 /// path that is comparable with other canonicalized paths under the same
 /// symlink-resolved root.
 ///
-/// **Phase 3 audit fix (2026-04-11):** added to fix the macOS self-loop
+/// added to fix the macOS self-loop
 /// guard bypass. The old implementation tried direct `canonicalize` and
 /// fell back to the raw lexical form on failure. That fallback meant
 /// non-existent output paths under `/tmp/...` were compared in lexical
@@ -419,7 +418,7 @@ fn lexical_normalize(path: &Path) -> PathBuf {
 ///
 /// Iterates `dependencies`, `devDependencies`, `peerDependencies`, and
 /// `optionalDependencies`. Even though LPM's install pipeline only resolves
-/// `dependencies` (verified via F1 in the Phase 3 design doc), the deploy
+/// `dependencies` (verified via F1 in the design doc), the deploy
 /// output should be a clean, lookup-able package.json — so we rewrite all
 /// four sections defensively.
 ///
@@ -433,8 +432,8 @@ fn rewrite_workspace_protocol_in_deploy_manifest(
     source_cwd: &Path,
 ) -> Result<usize, LpmError> {
     // Discover the source workspace from the original cwd. The deploy
-    // output dir is intentionally outside the workspace tree (M2 enforces
-    // this), so we can't discover from there.
+    // output dir is intentionally outside the workspace tree (enforced
+    // at target resolution), so we can't discover from there.
     let workspace = lpm_workspace::discover_workspace(source_cwd)
         .map_err(|e| LpmError::Script(format!("workspace discovery failed: {e}")))?
         .ok_or_else(|| {
@@ -492,7 +491,7 @@ fn rewrite_workspace_protocol_in_deploy_manifest(
     // read-only-on-source invariant, we must `remove_file` first to
     // unlink the path from the shared inode, then write a fresh file.
     // This guarantees the source manifest is byte-identical even if the
-    // M3 copy used a hardlink fast path.
+    // file copy used a hardlink fast path.
     if total_rewritten > 0 {
         let updated = serde_json::to_string_pretty(&doc)
             .map_err(|e| LpmError::Script(format!("failed to serialize deploy manifest: {e}")))?;
@@ -509,7 +508,7 @@ fn rewrite_workspace_protocol_in_deploy_manifest(
 
 /// Strip `devDependencies` from the deploy output's `package.json`.
 ///
-/// Deploy produces a **production closure**. After 2026-04-16 `lpm install`
+/// Deploy produces a **production closure**. After `lpm install`
 /// resolves both `dependencies` and `devDependencies` (matching pnpm / npm
 /// semantics), so if we left `devDependencies` in the copied manifest the
 /// install pipeline inside the output dir would drag dev-only packages
@@ -525,7 +524,7 @@ fn rewrite_workspace_protocol_in_deploy_manifest(
 /// **Hardlink safety.** [`copy_member_source`] uses `hard_link` as a
 /// performance fast path, so the output's `package.json` can share an
 /// inode with the source workspace's `package.json`. A naive `write`
-/// would mutate the source — the same trap documented in D-impl-1. We
+/// would mutate the source — the same trap documented in . We
 /// use the same `remove_file` + fresh `write` dance as
 /// [`rewrite_workspace_protocol_in_deploy_manifest`] to break the
 /// potential hardlink.
@@ -561,7 +560,7 @@ fn strip_dev_dependencies_from_deploy_manifest(output_dir: &Path) -> Result<usiz
         .map_err(|e| LpmError::Script(format!("failed to serialize deploy manifest: {e}")))?;
 
     // Break any potential hardlink to the source manifest, then write a
-    // fresh inode at the path. See D-impl-1 rationale in the Phase 3 doc.
+    // fresh inode at the path. See  rationale in the doc.
     let _ = std::fs::remove_file(&manifest_path);
     std::fs::write(&manifest_path, format!("{updated}\n"))
         .map_err(|e| LpmError::Script(format!("failed to write deploy manifest: {e}")))?;
@@ -594,13 +593,13 @@ fn read_member_name(manifest_path: &Path) -> String {
 
 /// Run the `lpm deploy` command.
 ///
-/// **M5 status:** all four steps wired — target resolution, source file
+/// All four steps are wired — target resolution, source file
 /// copy, manifest rewrite, and install pipeline at the deploy output dir.
 ///
 /// In `--json` mode the deploy command produces a deploy-specific summary
 /// JSON object on stdout AFTER the install pipeline's own JSON output.
 /// Together they form a JSON-Lines stream (two objects, one per line).
-/// This is the same multi-object pattern Phase 2 uses for multi-target
+/// This is the same multi-object pattern uses for multi-target
 /// installs and is documented as the deploy JSON contract.
 #[allow(clippy::too_many_arguments)] // matches the install/uninstall surface for consistency
 pub async fn run(
@@ -651,7 +650,7 @@ pub async fn run(
         ));
     }
 
-    // Phase 3 audit Medium fix (2026-04-11): `--force` now ACTUALLY cleans
+    // audit Medium fix : `--force` now ACTUALLY cleans
     // the output directory. Pre-fix it only suppressed the non-empty-directory
     // error in `validate_output_dir`, then ran `copy_member_source` over the
     // existing tree in place — which left orphaned files (source files that
@@ -686,7 +685,7 @@ pub async fn run(
     // by copy_member_source if it doesn't exist yet.
     let copy_stats = copy_member_source(&plan.member_dir, &plan.output_dir)?;
 
-    // Step 3b (2026-04-16): strip `devDependencies` from the output
+    // Step 3b : strip `devDependencies` from the output
     // manifest. `lpm install` now resolves devDeps (matching pnpm/npm),
     // so without this step the install pipeline inside the output dir
     // would pull dev-only tooling into the production closure. Deploy
@@ -703,7 +702,7 @@ pub async fn run(
     // and links them into <output_dir>/node_modules/. The output is then
     // self-contained.
     //
-    // Phase 35 Step 6 fix: use the injected client (carries
+    // Step 6 fix: use the injected client (carries
     // `--registry` and the shared SessionManager). Pre-fix this site
     // built a fresh `RegistryClient::new()` with no token, so any
     // `@lpm.dev` deps in the deploy output would have been
@@ -719,14 +718,14 @@ pub async fn run(
         false, // offline
         false, // force — don't force re-link, the output dir is fresh
         true,  // allow_new — deploy bypasses minimumReleaseAge
-        false, // strict_integrity (Phase 59.0 F5) — deploy uses lockfile, integrity is recorded
+        false, // strict_integrity — deploy uses lockfile, integrity is recorded
         None,  // linker_override
         true,  // no_skills — deploy outputs are typically Docker images
         true,  // no_editor_setup — same reason
         false, // no_security_summary — keep findings visible in CI
         false, // auto_build — build is a separate concern
         Some(&target_set),
-        None, // direct_versions_out: deploy does not finalize Phase 33 placeholders
+        None, // direct_versions_out: deploy does not finalize placeholders
         None, // script_policy_override: `lpm deploy` does not expose policy flags
         None, // advisor_override: `lpm deploy` does not expose `--advisor`
         None, // min_release_age_override: deploy already bypasses via allow_new=true above
@@ -737,7 +736,7 @@ pub async fn run(
         // trustedDependencies the project defined, so legitimately-
         // identical identities pass normally.
         crate::provenance_fetch::DriftIgnorePolicy::default(),
-        // Phase 46.1 rework: `lpm deploy` does not surface its own
+        // `lpm deploy` does not surface its own
         // sandbox-mode flags. CI deployers can still flip strict
         // via `LPM_STRICT_SANDBOX=1`; the env tier of the chain
         // inside `rebuild::run` honors that.
@@ -837,7 +836,7 @@ mod tests {
         }
     }
 
-    // ── M1 entry-point guard tests ─────────────────────────────────────────
+    // ── entry-point guard tests ─────────────────────────────────────────
 
     #[tokio::test]
     async fn run_returns_error_when_filters_empty() {
@@ -861,7 +860,7 @@ mod tests {
         );
     }
 
-    // ── M2 target resolution tests ─────────────────────────────────────────
+    // ── target resolution tests ─────────────────────────────────────────
 
     #[test]
     fn resolve_deploy_target_with_filter_matching_one_member_succeeds() {
@@ -1026,7 +1025,7 @@ mod tests {
         assert!(err.to_string().contains("inside the workspace"));
     }
 
-    // ── Phase 3 GPT-5.4 audit regression (High): self-loop guard bypass ────
+    // ── GPT-5.4 audit regression (High): self-loop guard bypass ────
 
     #[cfg(unix)]
     #[test]
@@ -1143,7 +1142,7 @@ mod tests {
         );
     }
 
-    // ── M2 dry-run tests ───────────────────────────────────────────────────
+    // ── dry-run tests ───────────────────────────────────────────────────
 
     #[tokio::test]
     async fn run_dry_run_succeeds_after_target_resolution() {
@@ -1196,12 +1195,12 @@ mod tests {
         assert!(result.unwrap_err().to_string().contains("matched no"));
     }
 
-    // ── M5 end-to-end (no-deps fixture) ────────────────────────────────────
+    // ── end-to-end (no-deps fixture) ────────────────────────────────────
     //
     // The install pipeline at the deploy output dir runs for real. We test
     // it against fixtures that have empty `dependencies` so the resolver
     // hits the no-deps short-circuit and returns success without any
-    // network calls. The M3-fix to the empty-deps early return makes this
+    // network calls. The fix to the empty-deps early return makes this
     // path emit a clean JSON success object.
 
     #[tokio::test]
@@ -1536,7 +1535,7 @@ mod tests {
         assert_eq!(name, "@scope/api");
     }
 
-    // ── M6 end-to-end integration: deny list + rewrite together ────────────
+    // ── end-to-end integration: deny list + rewrite together ────────────
 
     #[tokio::test]
     async fn run_e2e_combines_deny_list_and_manifest_rewrite() {
@@ -1584,7 +1583,7 @@ mod tests {
             std::fs::read(workspace_root.join("packages/api/package.json")).unwrap();
 
         // Run deploy. This will fail at the install pipeline step because
-        // @scope/auth isn't in the registry, but the M3+M4 work runs first.
+        // @scope/auth isn't in the registry, but the copy + rewrite steps run first.
         let output_parent = tempfile::tempdir().unwrap();
         let output = output_parent.path().join("prod-api");
         let _ = run(
@@ -1649,7 +1648,7 @@ mod tests {
         );
     }
 
-    // ── M4 manifest rewrite tests ──────────────────────────────────────────
+    // ── manifest rewrite tests ──────────────────────────────────────────
 
     /// Helper: build a fixture workspace with two members where one depends
     /// on the other via workspace:*. Returns the workspace root path.
@@ -1862,7 +1861,7 @@ mod tests {
 
     #[test]
     fn rewrite_workspace_protocol_breaks_hardlinks_to_protect_source() {
-        // CRITICAL BUG REGRESSION (M5 audit during initial development):
+        // CRITICAL BUG REGRESSION (found during initial development):
         //
         // copy_member_source uses hardlinks for performance. A hardlinked
         // package.json in the deploy output dir SHARES THE SAME INODE as
@@ -2031,7 +2030,7 @@ mod tests {
         assert!(err.to_string().contains("read deploy manifest"));
     }
 
-    // ── M3 source file copier tests ────────────────────────────────────────
+    // ── source file copier tests ────────────────────────────────────────
     //
     // These tests focus on the security boundary (the deny list) and the
     // happy paths. The negative assertions are the load-bearing ones —
@@ -2384,7 +2383,7 @@ mod tests {
     }
 
     // ────────────────────────────────────────────────────────────────────
-    // 2026-04-16: deploy stays prod-only after `lpm install` learned to
+    // deploy stays prod-only after `lpm install` learned to
     // resolve devDependencies. `strip_dev_dependencies_from_deploy_manifest`
     // is the load-bearing step that keeps dev-only packages (vitest, tsup,
     // eslint, etc.) out of the deploy closure.
@@ -2470,7 +2469,7 @@ mod tests {
 
     #[test]
     fn strip_dev_dependencies_breaks_hardlink_to_protect_source() {
-        // Mirror of the D-impl-1 regression pattern: copy_member_source may
+        // Mirror of the  regression pattern: copy_member_source may
         // hardlink the output's package.json to the source workspace's. A
         // naive write inside strip would mutate the source. This test sets
         // up an explicit hardlink, runs strip, and asserts the source is

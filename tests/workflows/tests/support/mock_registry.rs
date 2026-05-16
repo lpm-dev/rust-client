@@ -28,7 +28,7 @@ impl MockRegistry {
 
     /// Adopt an already-started `MockServer`. Used by tests that
     /// need control over the wiremock listener — e.g. binding
-    /// explicitly to `127.0.0.1` for the Phase 46.1 loopback-
+    /// explicitly to `127.0.0.1` for the loopback-
     /// network-denial test, where the IP-level bind interface is
     /// part of the assertion contract. For the common case where
     /// the listener can be auto-allocated, prefer
@@ -779,7 +779,7 @@ impl MockRegistry {
 
         // Mount on /api/registry/{name} (the LPM proxy path — Proxy
         // mode) AND on /{name} (npm-direct path — Direct mode, the
-        // Phase 49 shipped default). Serving both keeps tests mode-
+        // Serving both keeps tests mode-
         // agnostic so a route-mode flip in the client doesn't
         // retroactively break workflow fixtures.
         let metadata_path = format!("/api/registry/{name}");

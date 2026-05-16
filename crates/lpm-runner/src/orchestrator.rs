@@ -395,7 +395,7 @@ pub fn run_services(
 
     // Shutdown state: 0 = running, 1 = graceful shutdown (SIGTERM), 2+ = force kill (SIGKILL)
     let shutdown_state = Arc::new(AtomicU8::new(0));
-    // Finding #12: Vec<(String, Child)> with linear scan is fine for typical dev setups
+    // Vec<(String, Child)> with linear scan is fine for typical dev setups
     // (<20 services). HashMap would be cleaner but Child doesn't implement Debug and
     // the vec allows ordered iteration useful for shutdown. O(n) cost negligible at this scale.
     let children: Arc<Mutex<Vec<(String, Child)>>> = Arc::new(Mutex::new(Vec::new()));
@@ -658,7 +658,7 @@ pub fn run_services(
             }
         }
 
-        // Finding #1: Stop transitive dependents of crashed (non-restarting) services
+        // Stop transitive dependents of crashed (non-restarting) services
         for crashed_name in &crashed_no_restart {
             let dependents = service_graph::transitive_dependents(crashed_name, &active_services);
             if !dependents.is_empty() {
@@ -701,7 +701,7 @@ pub fn run_services(
             *attempts += 1;
             *last_crash = std::time::Instant::now();
 
-            // Finding #3: Max restart attempts
+            // Max restart attempts
             if *attempts > MAX_RESTART_ATTEMPTS {
                 let color = color_map.get(name.as_str()).unwrap_or(&RESET);
                 eprintln!(
@@ -744,7 +744,7 @@ pub fn run_services(
                 continue;
             }
 
-            // Finding #5: Non-blocking backoff — schedule restart for later instead of sleeping
+            // Non-blocking backoff — schedule restart for later instead of sleeping
             let delay_secs = std::cmp::min(1u64 << (*attempts - 1), 30);
             let color = color_map.get(name.as_str()).unwrap_or(&RESET);
             eprintln!(
@@ -829,10 +829,10 @@ pub fn run_services(
                         drop(locked);
 
                         // Spawn output readers for the restarted process.
-                        // Finding #11: The old reader threads are safe — their stdout/stderr
-                        // streams are EOF'd when the old process exits, causing the BufReader
-                        // iterator to return None and the thread to exit naturally. There is
-                        // a brief overlap window but no data corruption or resource leak.
+                        // The old reader threads are safe — their stdout/stderr streams are
+                        // EOF'd when the old process exits, causing the BufReader iterator to
+                        // return None and the thread to exit naturally. There is a brief overlap
+                        // window but no data corruption or resource leak.
                         let service_index =
                             service_names.iter().position(|n| n == &name).unwrap_or(0);
                         spawn_output_readers(
@@ -1134,9 +1134,9 @@ fn force_kill_children(children: &Arc<Mutex<Vec<(String, Child)>>>) {
 
 /// Gracefully stop all child processes: SIGTERM first, wait, then SIGKILL.
 ///
-/// Finding #4: Shuts down in reverse topological order so that dependents
-/// (e.g., API servers) stop before their dependencies (e.g., databases),
-/// giving services time to flush connections and finish in-flight requests.
+/// Shuts down in reverse topological order so that dependents (e.g., API
+/// servers) stop before their dependencies (e.g., databases), giving services
+/// time to flush connections and finish in-flight requests.
 ///
 /// If `force` is true, skips SIGTERM and goes straight to SIGKILL (used when
 /// the user double-pressed Ctrl+C).
@@ -1462,7 +1462,7 @@ mod tests {
         );
     }
 
-    // ── Finding #3: Max restart attempts ─────────────────────────────
+    // ── Max restart attempts ──────────────────────────────────────────
 
     #[test]
     fn max_restart_attempts_constant() {
@@ -1472,7 +1472,7 @@ mod tests {
         );
     }
 
-    // ── Finding #4: Reverse topological shutdown ─────────────────────
+    // ── Reverse topological shutdown ─────────────────────────────────
 
     #[test]
     fn shutdown_ordered_reverses_groups() {
@@ -1500,7 +1500,7 @@ mod tests {
         );
     }
 
-    // ── Finding #1: Crash propagation to dependents ──────────────────
+    // ── Crash propagation to dependents ──────────────────────────────
 
     #[test]
     fn transitive_dependents_for_crash_propagation() {
@@ -1519,7 +1519,7 @@ mod tests {
         );
     }
 
-    // ── Finding #2: empty string in dependsOn ──
+    // ── empty string in dependsOn ──
 
     #[test]
     fn validates_empty_dependency_string() {
@@ -1660,7 +1660,7 @@ mod tests {
         );
     }
 
-    // ── Finding #5: self-reference in dependsOn ──
+    // ── self-reference in dependsOn ──
 
     #[test]
     fn validates_self_dependency() {

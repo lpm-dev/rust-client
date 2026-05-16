@@ -1,26 +1,20 @@
-//! Phase 46 triage types — static-tier classification.
+//! Triage types for the static-tier script classification.
 //!
 //! These types live here so `lpm-cli`'s `build_state.rs` can persist
-//! them on `BlockedPackage`. All persisted occurrences are
-//! `Option<T>` so Phase 46 additions are mutually compatible with
-//! pre-46 on-disk state (see the schema comment in `build_state.rs`
-//! and Phase 46 plan §6 for the no-version-bump rationale).
+//! them on `BlockedPackage`. All persisted fields are `Option<T>` so
+//! schema additions are forward-compatible with old on-disk state (see
+//! the schema comment in `build_state.rs`).
 //!
-//! **P4 relocation (2026-04-21):** `ProvenanceSnapshot` moved to
-//! `lpm-workspace` so that `TrustedDependencyBinding.provenance_at_approval`
-//! can reference it without inducing a
-//! `lpm-workspace → lpm-security` dependency cycle. See the struct's
-//! doc comment in `lpm-workspace/src/lib.rs` for the full rationale.
-//!
-//! Ownership of populating these fields is split across phases — see
-//! the plan's §11 field-ownership table. P1 defines the types and
-//! wires them into the persisted structs; later phases populate them.
+//! `ProvenanceSnapshot` was moved to `lpm-workspace` so that
+//! `TrustedDependencyBinding.provenance_at_approval` can reference it
+//! without inducing a `lpm-workspace → lpm-security` dependency cycle.
+//! See the struct's doc comment in `lpm-workspace/src/lib.rs`.
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-/// Classification produced by the Phase 46 static-gate matcher (Layer 1
-/// of the four-layer tiered gate).
+/// Classification produced by the static-gate matcher (Layer 1 of the
+/// four-layer tiered gate).
 ///
 /// Four tiers, ordered by decreasing trust:
 ///
@@ -28,16 +22,15 @@ use sha2::{Digest, Sha256};
 ///   allowlist of pure local build steps (`node-gyp rebuild`, `tsc`,
 ///   `prisma generate`, `husky install`, etc.). Under
 ///   `script-policy = "triage"`, greens are eligible for auto-execution
-///   in the sandbox. Classification is populated in P2; auto-execution
-///   lands in P6 (hard-gated on the sandbox in P5).
+///   in the sandbox. Auto-execution requires sandbox availability.
 /// - [`StaticTier::Amber`] — script did not fit a green pattern and
 ///   did not match a red pattern. Deferred to layers 2/3/4 (trust
 ///   manifest, provenance + cooldown, LLM triage). Network binary
 ///   downloaders (`puppeteer`, `playwright install`, `cypress install`,
 ///   `electron-builder install-app-deps`) land here by design (D18).
 /// - [`StaticTier::AmberLlm`] — an amber that was approved by an LLM
-///   advisor (P8). Persisted with the approver identity so teammates
-///   on a different model family re-review (D17).
+///   advisor. Persisted with the approver identity so teammates on a
+///   different model family can re-review.
 /// - [`StaticTier::Red`] — script matches the hand-curated blocklist
 ///   (pipe-to-shell, base64 decode to execution, nested
 ///   package-manager installs, etc.). Blocks unconditionally; never
@@ -70,7 +63,7 @@ impl StaticTier {
     /// The precedence is deliberately defined here (not at the
     /// classifier call site) so the same rule applies to every
     /// downstream aggregation, including future places that compose
-    /// a static-gate result with an `AmberLlm` verdict from P8.
+    /// a static-gate result with an `AmberLlm` verdict from the LLM layer.
     pub fn worse_of(self, other: Self) -> Self {
         use StaticTier::{Amber, AmberLlm, Green, Red};
         match (self, other) {
@@ -85,12 +78,11 @@ impl StaticTier {
 /// Deterministic hash of the sorted set of `true` behavioral-analysis
 /// tag names for a package version.
 ///
-/// Phase 46 P1 populates this on `BlockedPackage` so the version-diff
-/// UI (P7) can detect "behavioral tags gained `network` / `eval`
-/// since last approval" without re-fetching metadata. The input is
-/// expected to be sorted lexicographically — the caller (the
-/// `BehavioralTags::active_tag_names` extraction in `lpm-registry`)
-/// guarantees that invariant, so we do not re-sort here.
+/// Populated on `BlockedPackage` so the version-diff UI can detect
+/// "behavioral tags gained `network` / `eval` since last approval"
+/// without re-fetching metadata. The input is expected to be sorted
+/// lexicographically — the caller (the `BehavioralTags::active_tag_names`
+/// extraction in `lpm-registry`) guarantees that invariant.
 ///
 /// Format: `sha256-<hex>`, matching the convention used by
 /// [`crate::script_hash::compute_script_hash`] and the SRI-style
@@ -267,13 +259,10 @@ mod tests {
         assert_eq!(empty.into_iter().reduce(StaticTier::worse_of), None);
     }
 
-    // ── ProvenanceSnapshot moved to lpm-workspace in Phase 46 P4 ────
-    //
-    // The struct + its tests now live in `lpm-workspace/src/lib.rs`
+    // ProvenanceSnapshot tests live in `lpm-workspace/src/lib.rs`
     // because `TrustedDependencyBinding.provenance_at_approval` needs
     // to reference it, and `lpm-security` already depends on
-    // `lpm-workspace` (reverse edge would cycle). See the struct's
-    // doc comment in lpm-workspace for the full rationale.
+    // `lpm-workspace` (reverse edge would cycle).
 
     // ── hash_behavioral_tag_set ───────────────────────────────────
 

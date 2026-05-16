@@ -1,5 +1,5 @@
-// Generated from the corrected Phase 65 coverage matrix in
-// `a-package-manager/DOCS/new-features/37-rust-client-RUNNER-VISION-phase65-testings.md`.
+// Generated from the coverage matrix. See the audit doc at
+
 // Update the phase doc first, then re-generate this file when the audited
 // command-surface baseline changes.
 

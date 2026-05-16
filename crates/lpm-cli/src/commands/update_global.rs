@@ -1,6 +1,6 @@
-//! `lpm global update [pkg|pkg@spec]` — phase 37 M3.4.
+//! `lpm global update [pkg|pkg@spec]`.
 //!
-//! Three-phase upgrade tx, structurally similar to M3.2's install
+//! Three-phase upgrade tx, structurally similar to the install
 //! pipeline but with three differences:
 //!
 //! 1. **Existing-row required.** prepare errors if `[packages.<pkg>]`
@@ -17,7 +17,7 @@
 //! `lpm global update` (no arg) iterates every package and re-resolves
 //! against its persisted `saved_spec`. `lpm global update <pkg>` does
 //! the same scoped to one package. `lpm global update <pkg>@<spec>`
-//! rewrites the saved_spec via Phase 33's `decide_saved_dependency_spec`
+//! rewrites the saved_spec via the `decide_saved_dependency_spec`
 //! before resolving.
 //!
 //! `--dry-run` runs every step up to `prepare_locked` but releases
@@ -28,6 +28,7 @@ use crate::save_spec::{
     SaveConfig, SaveFlags, UserSaveIntent, decide_saved_dependency_spec, parse_user_save_intent,
 };
 use chrono::Utc;
+use lpm_common::color::Painted;
 use lpm_common::{LpmError, LpmRoot, with_exclusive_lock};
 use lpm_global::{
     CommandCollision, InstallReadyMarker, InstallRootStatus, IntentPayload, PackageEntry,
@@ -36,7 +37,6 @@ use lpm_global::{
 };
 use lpm_registry::RegistryClient;
 use lpm_semver::{Version, VersionReq};
-use owo_colors::OwoColorize;
 use std::path::PathBuf;
 
 pub async fn run(
@@ -46,7 +46,7 @@ pub async fn run(
     json_output: bool,
 ) -> Result<(), LpmError> {
     let root = LpmRoot::from_env()?;
-    // Phase 35 Step 6 fix: use the injected client.
+    // Step 6 fix: use the injected client.
     let registry = client.clone_with_config();
 
     let targets = match package {
@@ -142,7 +142,7 @@ pub async fn run(
         }
     }
 
-    // Opportunistic tombstone sweep (Phase 37 M3.5). Each successful
+    // Opportunistic tombstone sweep. Each successful
     // upgrade pushed the prior install root onto `manifest.tombstones`;
     // run one non-blocking sweep after the bulk loop (rather than one
     // per package) so a 50-package bulk update doesn't serialise 50
@@ -152,7 +152,7 @@ pub async fn run(
 
     emit_results(&results, json_output);
 
-    // Audit Medium (M3.4 round): exit non-zero on any failure so shell
+    // Audit Medium: exit non-zero on any failure so shell
     // automation can detect partial / total bulk-update failures.
     // Single-target update failure also surfaces here. A future
     // `--continue-on-error` flag could opt out for users who want
@@ -191,7 +191,7 @@ pub async fn run(
 struct Target {
     /// Package name as keyed in `[packages.*]`.
     name: String,
-    /// `Some(intent)` when the user typed `pkg@spec` — Phase 33 decides
+    /// `Some(intent)` when the user typed `pkg@spec` — decides
     /// the new saved_spec from this. `None` means "re-resolve against
     /// the existing saved_spec," which is the bulk-update default and
     /// the `lpm global update <pkg>` (no version) shape.
@@ -199,7 +199,7 @@ struct Target {
 }
 
 fn parse_target(spec: &str) -> Result<Target, LpmError> {
-    let (name, intent) = parse_user_save_intent(spec);
+    let (name, intent) = parse_user_save_intent(spec)?;
     let new_intent = if matches!(&intent, UserSaveIntent::Bare) {
         None
     } else {
@@ -229,7 +229,7 @@ enum UpgradePlan {
     /// Resolved version is unchanged but the user typed a `<pkg>@<spec>`
     /// that produces a different `saved_spec` — manifest-only mutation
     /// that retunes the bulk-update tracking policy without touching
-    /// the install root. Audit Medium from the M3.4 round: previously
+    /// the install root. Audit Medium from the round: previously
     /// `update pkg@^3` on an exact-pinned 3.8.3 install was reported
     /// as "already current," locking the user out of relaxing the pin
     /// without a version bump.
@@ -239,7 +239,7 @@ enum UpgradePlan {
     /// re-validates the WHOLE row under the lock — not just
     /// `saved_spec` — so a concurrent upgrade that landed between
     /// planning and rewrite can't "retune" the new active row with a
-    /// stale plan (audit Medium from M3.4 audit pass-2). Example the
+    /// stale plan (audit Medium from audit pass-2). Example the
     /// audit caught: plan rewrite ^3 → 3.8.3 on 3.8.3, concurrent
     /// upgrade to 3.8.4 (still ^3), pre-fix the rewrite would have
     /// pinned the now-3.8.4 install to "3.8.3."
@@ -320,12 +320,12 @@ async fn plan_upgrade(
         ))
     })?;
 
-    // Compute the new saved_spec via Phase 33 BEFORE the
+    // Compute the new saved_spec via BEFORE the
     // already-current check. Pre-fix this was computed only for the
     // upgrade branch, so a `pkg@^3` rewrite on an exact-pinned 3.8.3
     // install fell into AlreadyCurrent and the saved_spec stayed
     // "3.8.3" — locking the user out of relaxing the pin without a
-    // version bump (audit Medium from M3.4 round). We need this value
+    // version bump (audit Medium from the audit). We need this value
     // either way: full upgrade uses it for the pending row, save-spec
     // rewrite uses it as the manifest-only mutation target.
     let new_saved_spec = decide_saved_dependency_spec(
@@ -440,8 +440,8 @@ fn pick_version(
     intent: &UserSaveIntent,
 ) -> Result<String, LpmError> {
     // Same as install_global::pick_version. Duplicated rather than
-    // shared to keep the install/update modules independent during
-    // M3.4 development; we can extract a shared helper later.
+    // shared to keep the install/update modules independent;
+    // we can extract a shared helper later.
     let token = match intent {
         UserSaveIntent::Bare => "latest".to_string(),
         UserSaveIntent::Exact(s) => return Ok(s.clone()),
@@ -589,7 +589,7 @@ fn prepare_upgrade_locked(root: &LpmRoot, prep: &UpgradePrep) -> Result<StagedUp
             prep.name
         )));
     }
-    // **Lost-update guard (audit High from the M3.4 round).** The plan
+    // **Lost-update guard (audit High from the round).** The plan
     // we built outside the lock captured a snapshot of the active row
     // (`prep.prior_active_row_json`). Between then and now another
     // process may have committed its own upgrade of the same package.
@@ -612,7 +612,7 @@ fn prepare_upgrade_locked(root: &LpmRoot, prep: &UpgradePrep) -> Result<StagedUp
         install_root.file_name().unwrap().to_string_lossy()
     );
 
-    // Phase 37 M0 (rev 6): pre-install path-budget guard. Same rationale
+    // pre-install path-budget guard. Same rationale
     // as install_global::prepare_locked — fail fast with an actionable
     // LPM_HOME hint rather than mid-extraction with cryptic platform
     // errors when the new install root would push us over the
@@ -631,7 +631,7 @@ fn prepare_upgrade_locked(root: &LpmRoot, prep: &UpgradePrep) -> Result<StagedUp
         "source": serde_json::to_value(prep.source).unwrap(),
         "started_at": Utc::now().to_rfc3339(),
         "root": install_root_relative,
-        // commands: discovered post-extract (M3.2 marker-as-authority).
+        // commands: discovered post-extract (marker-as-authority).
         "commands": Vec::<String>::new(),
         "replaces_version": prep.current_version,
     });
@@ -646,8 +646,8 @@ fn prepare_upgrade_locked(root: &LpmRoot, prep: &UpgradePrep) -> Result<StagedUp
             "aliases": prep.prior_aliases_json,
         }),
         new_aliases_json: serde_json::json!({}),
-        // M3.4 upgrade path doesn't resolve collisions (M4.2 scope).
-        // Upgrades keep the same package owning the same commands, so
+        // Upgrades don't resolve collisions — they keep the same package
+        // owning the same commands, so
         // `find_command_collisions` never triggers non-self hits.
         ownership_delta: Vec::new(),
     })))?;
@@ -683,7 +683,7 @@ async fn do_install_upgrade(
     // Same shape as install_global::do_install. Could share via a
     // helper crate later; duplicated for module independence right
     // now.
-    // Phase 37 M0 (rev 6): route Windows fs ops through the long-path
+    // route Windows fs ops through the long-path
     // helper. No-op on POSIX.
     let install_root_ext = lpm_common::as_extended_path(&staged.install_root);
     std::fs::create_dir_all(&install_root_ext)?;
@@ -708,7 +708,7 @@ async fn do_install_upgrade(
         false, // offline
         false, // force
         false, // allow_new
-        false, // strict_integrity (Phase 59.0 F5)
+        false, // strict_integrity
         None,  // linker_override
         true,  // no_skills
         true,  // no_editor_setup
@@ -718,9 +718,9 @@ async fn do_install_upgrade(
         None,
         None, // script_policy_override: global update does not expose policy flags
         None, // advisor_override: global update does not expose `--advisor`
-        None, // min_release_age_override: D13/D19 — global scope is out of P3, cooldown uses the chain
-        crate::provenance_fetch::DriftIgnorePolicy::default(), // drift-ignore: D13/D19 — global scope is out of P4
-        // Phase 46.1 rework: global update does not surface its own
+        None, // min_release_age_override: D13/D19 — global scope is out of, cooldown uses the chain
+        crate::provenance_fetch::DriftIgnorePolicy::default(), // drift-ignore: D13/D19 — global scope is out of
+        // global update does not surface its own
         // sandbox-mode flags. The env / config / default chain
         // inside `rebuild::run` still applies.
         false, // strict_sandbox
@@ -755,8 +755,8 @@ fn commit_upgrade_locked(
     // Collision guard. Self-collisions are EXPECTED for upgrades —
     // the new install owns the same command names as the prior one.
     // `find_command_collisions` excludes self-collisions for exactly
-    // this case (M3.2 audit pass 2 added that exclusion explicitly
-    // for "future M3.4 upgrades"). So a real conflict here means
+    // this case (the exclusion was added explicitly to handle upgrades
+    // correctly). So a real conflict here means
     // ANOTHER package owns one of the new commands.
     let collisions: Vec<CommandCollision> =
         find_command_collisions(&manifest, &prep.name, &marker_commands);
@@ -781,7 +781,7 @@ fn commit_upgrade_locked(
         return Err(LpmError::Script(format!(
             "upgrade of '{}' would conflict with another globally-installed package's \
              commands: {}. The pre-upgrade install is unchanged. Resolve the conflict (uninstall \
-             the other package or wait for M4 alias support) and retry.",
+             the other package or use --alias to remap the command name) and retry.",
             prep.name,
             collisions
                 .iter()
@@ -807,7 +807,7 @@ fn commit_upgrade_locked(
         )?;
     }
 
-    // Phase 37 M3 (audit follow-up): three-artifact invariant — confirm
+    // Audit follow-up: three-artifact invariant — confirm
     // every command's shim triple is fully present after emission.
     // Same rationale as install_global::commit_locked: a partial triple
     // observable to other shells would diverge from the manifest commit
@@ -851,7 +851,7 @@ fn commit_upgrade_locked(
     manifest.packages.insert(prep.name.clone(), active);
     manifest.pending.remove(&prep.name);
 
-    // Persist BEFORE WAL Commit (M3.1 ordering invariant).
+    // Persist BEFORE WAL Commit (manifest-before-commit ordering invariant).
     write_for(root, &manifest)?;
 
     let mut wal = WalWriter::open(root.global_wal())?;
@@ -876,7 +876,7 @@ fn rollback_aborted_upgrade(
     package: &str,
     reason: &str,
 ) -> Result<(), LpmError> {
-    // Per the M3.1 audit's tombstone pattern: don't try to remove
+    // Tombstone pattern: don't try to remove
     // the install root inline (could be locked on Windows by a tool
     // the user is running). Tombstone it for `store gc`.
     let install_root_ext = lpm_common::as_extended_path(&staged.install_root);
@@ -1099,7 +1099,7 @@ fn emit_results(results: &[UpgradeResult], json_output: bool) {
 ///
 /// Atomic via the manifest writer's tempfile + rename. Re-validates
 /// the WHOLE active row against the planned snapshot under the lock
-/// (audit Medium from M3.4 audit pass-2). Pre-fix only saved_spec
+/// (audit Medium from audit pass-2). Pre-fix only saved_spec
 /// was compared, which let a concurrent upgrade slide through:
 /// plan rewrite ^3 → 3.8.3 on 3.8.3, concurrent upgrade to 3.8.4
 /// (still ^3), the rewrite would have pinned the now-3.8.4 install
@@ -1202,7 +1202,7 @@ fn active_matches_planned_snapshot(
     Ok(())
 }
 
-// Phase 35 Step 6 fix: removed `build_registry` — `run` now receives
+// Step 6 fix: removed `build_registry` — `run` now receives
 // the injected `&RegistryClient`.
 
 fn mk_tx_id() -> String {
@@ -1331,7 +1331,7 @@ mod tests {
         assert_eq!(short_name("eslint"), "eslint");
     }
 
-    /// Audit High (M3.4 round): the lost-update guard. Snapshot match
+    /// Audit High: the lost-update guard. Snapshot match
     /// must be strict on the load-bearing fields, with a clear diff
     /// message on mismatch so the user can see what changed under them.
     #[test]
@@ -1352,7 +1352,7 @@ mod tests {
             "resolved": "9.24.0",
             "integrity": "sha512-x",
             "source": "upstream-npm",
-            "installed_at": "2026-04-15T00:00:00Z",
+            "installed_at": "T00:00:00Z",
             "root": "installs/eslint@9.24.0",
             "commands": ["DIFFERENT-COMMANDS-IGNORED"],
         });
@@ -1375,7 +1375,7 @@ mod tests {
             "resolved": "9.24.0",
             "integrity": "sha512-x",
             "source": "upstream-npm",
-            "installed_at": "2026-04-15T00:00:00Z",
+            "installed_at": "T00:00:00Z",
             "root": "installs/eslint@9.24.0",
             "commands": ["eslint"],
         });
@@ -1401,7 +1401,7 @@ mod tests {
             "resolved": "1.0.0",
             "integrity": "sha512-x",
             "source": "lpm-dev",
-            "installed_at": "2026-04-15T00:00:00Z",
+            "installed_at": "T00:00:00Z",
             "root": "installs/x@1.0.0",
             "commands": [],
         });
@@ -1424,7 +1424,7 @@ mod tests {
         })
     }
 
-    /// Audit Medium (M3.4 round): saved_spec rewrite must succeed even
+    /// Audit Medium: saved_spec rewrite must succeed even
     /// when the resolved version is unchanged. Pre-fix, planning
     /// returned AlreadyCurrent before computing new_saved_spec, so the
     /// user could not relax an exact pin without a version bump.
@@ -1500,7 +1500,7 @@ mod tests {
         assert!(format!("{err}").contains("saved_spec changed"));
     }
 
-    /// Audit Medium (M3.4 audit pass-2): the SaveSpecRewrite prior_snapshot
+    /// Audit Medium (audit pass-2): the SaveSpecRewrite prior_snapshot
     /// must guard the WHOLE row, not just saved_spec. Pre-fix the rewrite
     /// only checked that saved_spec equalled `old_saved_spec`. If another
     /// process committed an upgrade between plan and rewrite that happened
@@ -1576,7 +1576,7 @@ mod tests {
         assert!(format!("{err}").contains("no longer installed"));
     }
 
-    /// Audit Medium (M3.4 audit pass-2): in --json mode the failure path
+    /// Audit Medium (audit pass-2): in --json mode the failure path
     /// must return `LpmError::ExitCode(_)` rather than `LpmError::Script(_)`.
     /// `emit_results` has already written a structured failure JSON
     /// document to stdout; `LpmError::Script` causes main.rs to emit a

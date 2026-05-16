@@ -1,11 +1,11 @@
-//! Phase 32 shared filter engine.
+//! Shared filter engine.
 //!
 //! Workspace package selection logic shared by every command that accepts
 //! `--filter`. Built as a module inside `lpm-task` rather than as a new
 //! crate, so it can compose directly with `WorkspaceGraph` and the
 //! existing `affected` git plumbing without circular dependencies.
 //!
-//! ## Architecture (see design doc 37-rust-client-RUNNER-VISION-phase32-filter-engine-design.md)
+//! ## Architecture
 //!
 //! 1. **Parser** (`parser.rs`) — string → `FilterExpr` AST
 //! 2. **AST** (`ast.rs`) — the shape the parser produces

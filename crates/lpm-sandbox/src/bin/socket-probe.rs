@@ -3,9 +3,9 @@
 //! stderr. Used by:
 //!
 //! - The `denies_udp_socket_under_strict` unit test in
-//!   `crates/lpm-sandbox/src/linux.rs::tests` (Phase 46.1.1).
+//!   `crates/lpm-sandbox/src/linux.rs::tests` .
 //! - The `sandbox_udp_denial` workflow test in
-//!   `tests/workflows/tests/sandbox_udp_denial.rs` (Phase 46.1.1).
+//!   `tests/workflows/tests/sandbox_udp_denial.rs` .
 //!
 //! Cross-platform: any non-Linux build emits an `unsupported`
 //! line and exits non-zero so a misdirected invocation surfaces
@@ -91,7 +91,7 @@ fn probe(family: i32, sock_type: i32, proto: i32) {
         std::process::exit(1);
     }
     if errno == libc::EACCES {
-        // The exact outcome the Phase 46.1.1 seccomp filter
+        // The exact outcome the seccomp filter
         // produces — exit 0 so the unit / workflow test asserts
         // `status.success()`.
         std::process::exit(0);
@@ -107,7 +107,7 @@ fn probe(family: i32, sock_type: i32, proto: i32) {
 fn probe(_family: i32, _sock_type: i32, _proto: i32) {
     eprintln!(
         "socket-probe: unsupported on non-Linux targets — \
-         this binary exists only to validate the Phase 46.1.1 \
+         this binary exists only to validate the \
          seccomp filter, which is Linux-only."
     );
     std::process::exit(2);

@@ -63,12 +63,19 @@ fn skills_list_groups_by_package_and_counts_files() {
             && stdout.contains("deploy"),
         "list must show each skill name, got:\n{stdout}"
     );
-    // `3 skill` may carry ANSI bold codes between the digit and the word
-    // (owo_colors emits `\x1b[1m3\x1b[0m skill(s)` even with NO_COLOR=1).
-    // Assert on a non-overlapping substring that's color-stable.
+    // Total summary must render with the count adjacent to the unit text,
+    // not split by ANSI escapes — the harness sets `NO_COLOR=1` (see
+    // `support/mod.rs`), so the color policy disables every styling
+    // method. Pre-fix, `owo_colors::OwoColorize::bold` ignored NO_COLOR
+    // and emitted `\x1b[1m3\x1b[22m skill(s)…`; the Painted trait now
+    // returns plain text when disabled.
     assert!(
-        stdout.contains("skill(s) across 2 package(s)"),
-        "list must report total summary, got:\n{stdout}"
+        stdout.contains("3 skill(s) across 2 package(s)"),
+        "summary must include the count contiguous with the unit text under NO_COLOR=1, got:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains('\x1b'),
+        "stdout must contain no ANSI escape under NO_COLOR=1, got:\n{stdout:?}"
     );
 }
 
@@ -159,7 +166,7 @@ fn skills_validate_rejects_skill_exceeding_size_limit() {
         .output()
         .expect("failed to run lpm skills validate");
 
-    // Finding #72 contract: a non-empty error set must exit non-zero,
+    // Contract: a non-empty error set must exit non-zero,
     // so CI gates that run `lpm skills validate` fail closed. The
     // exit code AND the surfaced message are both load-bearing —
     // exit-only would let a future regression scrub the per-skill

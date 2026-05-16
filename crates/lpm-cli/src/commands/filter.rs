@@ -6,25 +6,25 @@
 //! a filter before committing to a mutating command, and by AI agents
 //! through the `--json` output to plan workspace operations.
 //!
-//! Phase 32 Phase 1 deliverable. Future phases will expose this through the
+//! deliverable. Future phases will expose this through the
 //! MCP `lpm_filter_preview` tool sharing the same engine.
 
 use crate::output;
 use lpm_common::LpmError;
+use lpm_common::color::Painted;
 use lpm_task::filter::{FilterEngine, FilterExpr, MatchKind, TraceReason};
 use lpm_task::graph::WorkspaceGraph;
-use owo_colors::OwoColorize;
 use std::path::Path;
 
 /// Format the D2 substring → glob migration hint when a filter set returns
 /// no matches and at least one filter looks like a bare name that would
-/// have matched in the pre-Phase-32 substring matcher.
+/// have matched in the pre-existing substring matcher.
 ///
 /// Returns `None` when no filters look like substring-style names (e.g., the
 /// user passed only globs, paths, or git-refs — they're already on the new
 /// model and don't need the hint).
 ///
-/// Per design decision D2 / Phase 1 release notes follow-through.
+/// Per design decision D2 / release notes follow-through.
 pub(crate) fn format_no_match_hint(raw_filters: &[String]) -> Option<String> {
     let suggestions: Vec<String> = raw_filters
         .iter()
@@ -44,7 +44,7 @@ pub(crate) fn format_no_match_hint(raw_filters: &[String]) -> Option<String> {
     }
 
     Some(format!(
-        "Phase 32 removed the legacy substring matcher (design decision D2).\n\
+        "removed the legacy substring matcher (design decision D2).\n\
          Bare names are now strict exact matches. To recover the old behavior:\n\n\
          {}\n\n\
          See `lpm filter --help` for the full grammar reference.",
@@ -107,7 +107,7 @@ pub async fn run(
     if json_output {
         // Stable JSON shape for agents. Always includes the full trace
         // because JSON is structured output — `--explain` only affects
-        // human rendering. Phase 9 (`--report-json`) will formalize the
+        // human rendering. (`--report-json`) will formalize the
         // schema version field.
         let traces: Vec<serde_json::Value> = explain
             .traces

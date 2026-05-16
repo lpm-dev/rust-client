@@ -1,6 +1,6 @@
 use crate::output;
 use lpm_common::LpmError;
-use owo_colors::OwoColorize;
+use lpm_common::color::Painted;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
@@ -493,7 +493,7 @@ fn detect_test_runner(project_dir: &Path) -> Result<(String, String), LpmError> 
 /// mode.
 ///
 /// **Selection inputs:**
-/// - `filters`: Phase 32 filter expressions. Empty + `affected_base.is_none()`
+/// - `filters`: filter expressions. Empty + `affected_base.is_none()`
 ///   means "every member" (caller already verified workspace mode is active).
 /// - `affected_base`: `Some(base_ref)` enables `--affected` semantics — direct
 ///   changes plus their transitive dependents — unioned with `filters`.
@@ -542,7 +542,7 @@ pub async fn tool_workspace(
         // base ref" case — keep its own message so it doesn't read like a
         // filter typo. With explicit `--filter` (with or without `--affected`)
         // we fall into the filter-miss path so the D2 hint can fire on bare
-        // names that would have substring-matched pre-Phase-32.
+        // names that would have substring-matched in earlier filter behavior.
         let affected_only = filters.is_empty() && affected_base.is_some();
 
         if fail_if_no_match {
@@ -1783,7 +1783,7 @@ mod tests {
         assert!(result.is_err(), "--all and --filter must conflict");
     }
 
-    // --- Phase 2: Test/Bench workspace surface ---
+    // --- Test/Bench workspace surface ---
 
     #[test]
     fn test_filter_parses_with_grammar() {

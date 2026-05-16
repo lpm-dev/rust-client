@@ -1,6 +1,5 @@
 //! Linux landlock backend: restricts the child process's filesystem
-//! access via a ruleset installed through the landlock LSM. Phase 46
-//! P5 Chunk 3.
+//! access via a ruleset installed through the landlock LSM.
 //!
 //! # Async-signal safety
 //!
@@ -28,7 +27,7 @@
 //!
 //! **Child side** (post-fork, pre-exec, AS-safe only):
 //! - [`Option::take`] to extract the captured `RulesetCreated`
-//!   and (Phase 46.1.1) `seccompiler::BpfProgram`.
+//!   and `seccompiler::BpfProgram`.
 //! - [`seccompiler::apply_filter`] — audited call path: two
 //!   direct syscalls (`prctl(PR_SET_NO_NEW_PRIVS, 1, …)` to
 //!   satisfy the unprivileged-seccomp precondition, then
@@ -43,7 +42,7 @@
 //!   No heap allocation, no lock acquisition.
 //! - On failure, [`write_stderr_as_safe`] — raw `write(2)` to fd 2,
 //!   bypassing `std::io::Stderr::lock()` which is NOT safe here.
-//!   Prefixes are per-layer: `seccomp:` for the Phase 46.1.1
+//!   Prefixes are per-layer: `seccomp:` for the seccomp
 //!   filter install, `landlock:` for the V4 ruleset install,
 //!   `lpm-sandbox:` for cross-layer / dispatch failures.
 //! - [`std::io::Error::from_raw_os_error`] to propagate errno —
@@ -69,8 +68,8 @@
 //!   construct the strict backend, which installs filesystem rules
 //!   AND declares `AccessNet::from_all(V4)` (BindTcp + ConnectTcp)
 //!   with NO `NetPort` allow rules — landlock then default-denies
-//!   outbound TCP. The pre_exec closure ALSO installs the Phase
-//!   46.1.1 seccomp-bpf filter that denies direct
+//!   outbound TCP. The pre_exec closure ALSO installs the
+//!   seccomp-bpf filter that denies direct
 //!   `socket(AF_INET|AF_INET6, SOCK_DGRAM|SOCK_RAW)`,
 //!   `socket(AF_PACKET, …)`, and `socket(AF_NETLINK, …)` — closing
 //!   the UDP / raw / L2 / routing-probe gap landlock V4 leaves
@@ -89,11 +88,9 @@
 //! - **Refuse** (kernel < 6.7 AND `allow_degraded = false`, the
 //!   strict default): surface `SandboxError::KernelTooOld` with
 //!   `required: "6.7"` before the script ever spawns. Refusal is
-//!   symmetric with the Windows path per the Chunk 1 signoff. The
-//!   user's interim options are `--no-sandbox` (Phase 46.1 rework
-//!   collapsed the legacy `--unsafe-full-env` partner per Q6),
-//!   adding the package to `trustedDependencies`, or upgrading the
-//!   kernel.
+//!   symmetric with the Windows path. The user's interim options are
+//!   `--no-sandbox`, adding the package to `trustedDependencies`, or
+//!   upgrading the kernel.
 //!
 //! # Enforcement guard
 //!
@@ -119,7 +116,7 @@ use landlock::{
 use std::os::unix::process::CommandExt;
 use std::process::{Child, Command, Stdio};
 
-/// Phase 46.1: minimum kernel version the strict posture targets.
+/// minimum kernel version the strict posture targets.
 /// V4 landed in 6.7 (January 2024) and is the first ABI that
 /// carries network access rules; below this floor the backend has
 /// no kernel-level mechanism to deny outbound network, so the
@@ -129,21 +126,21 @@ use std::process::{Child, Command, Stdio};
 /// or kernel upgrade).
 const MIN_KERNEL_VERSION_STRICT: &str = REQUIRED_KERNEL_FOR_STRICT;
 
-/// Phase 46.1 fallback floor: V1 landed in 5.13. Used by the
+/// fallback floor: V1 landed in 5.13. Used by the
 /// degraded posture's V1 probe to give an honest error if even V1
 /// is unreachable (landlock LSM disabled entirely).
 const MIN_KERNEL_VERSION_FALLBACK: &str = "5.13";
 
-/// Phase 46.1 Strict ABI: V4 (kernel 6.7+). Adds network access
+/// Strict ABI: V4 (kernel 6.7+). Adds network access
 /// rules on top of V1's filesystem set; an empty
 /// `AccessNet::from_all(V4)` handler with no `NetPort` allows
 /// yields default-deny for both `BindTcp` and `ConnectTcp`.
 const TARGET_ABI_STRICT: ABI = ABI::V4;
 
-/// Phase 46.1 Degraded ABI: V1 (kernel 5.13+). Filesystem-only —
-/// matches the Phase 46 P5 behaviour exactly. Used only when the
-/// user has set `[sandbox] allow-degraded = true` AND the detected
-/// kernel is below the V4 floor.
+/// Degraded ABI: V1 (kernel 5.13+). Filesystem-only — no network
+/// containment. Used only when the user has set
+/// `[sandbox] allow-degraded = true` AND the detected kernel is
+/// below the V4 floor.
 const TARGET_ABI_FALLBACK: ABI = ABI::V1;
 
 /// Internal posture tag the backend constructs after the kernel
@@ -156,13 +153,13 @@ const TARGET_ABI_FALLBACK: ABI = ABI::V1;
 enum BackendPosture {
     /// V1 with FS rules only, no AccessNet rules. Reached when the
     /// user picked `[sandbox] mode = "default"` (or accepted the
-    /// default default). Matches the Phase 46 P5 baseline. Phase
-    /// 46.1 rework (2026-05-11): added so the doctor / posture
-    /// surfaces can distinguish "user chose default" from "user
-    /// chose strict but kernel forced fallback" (`Degraded`).
+    /// default default). FS-only, no network containment. Added so
+    /// the doctor / posture surfaces can distinguish "user chose
+    /// default" from "user chose strict but kernel forced fallback"
+    /// (`Degraded`).
     Default,
     /// V4 with both FS rules and network handling installed. The
-    /// full Phase 46.1 strict contract. Reached when the user opts
+    /// full strict contract. Reached when the user opts
     /// into strict mode AND the kernel delivers landlock V4.
     Strict,
     /// V1 with FS rules only. Triggered when the user opts into
@@ -191,7 +188,7 @@ impl BackendPosture {
     /// doesn't cover UDP / raw / AF_PACKET / AF_NETLINK. The
     /// non-TCP coverage on Linux is layered on by the sibling
     /// predicate [`Self::installs_seccomp_filter`], which gates
-    /// the Phase 46.1.1 seccomp-bpf install in the pre_exec
+    /// the seccomp-bpf install in the pre_exec
     /// closure. The two predicates always agree (both `true` for
     /// `Strict`, `false` otherwise) but live separately so the
     /// landlock-side ruleset builder
@@ -201,7 +198,7 @@ impl BackendPosture {
         matches!(self, BackendPosture::Strict)
     }
 
-    /// `true` iff this posture installs the Phase 46.1.1
+    /// `true` iff this posture installs the seccomp-bpf
     /// seccomp-bpf `socket(2)` deny filter on top of the
     /// landlock ruleset. Covers direct UDP (AF_INET/AF_INET6 +
     /// SOCK_DGRAM), raw sockets, AF_PACKET, and AF_NETLINK —
@@ -237,7 +234,7 @@ impl LandlockSandbox {
         match mode {
             SandboxMode::Enforce => {
                 let posture = if options.deny_outbound_network {
-                    // Strict path — Phase 46.1's locked contract.
+                    // Strict path — the locked contract.
                     // Two-step decision: (a) pure version-based
                     // posture pick via [`decide_posture`]; (b) live
                     // landlock probe at the chosen ABI to confirm
@@ -275,7 +272,7 @@ impl LandlockSandbox {
                         }
                     }
                 } else {
-                    // Default path — Phase 46.1 rework (2026-05-11).
+                    // Default path — rework.
                     // The user picked the relaxed mode (or accepted
                     // the default default). V1 floor is sufficient
                     // (filesystem rules only, no AccessNet
@@ -306,18 +303,17 @@ impl LandlockSandbox {
                     posture,
                 })
             }
-            // Chunk 4: landlock has no native observe-only primitive
+            // Landlock has no native observe-only primitive
             // (RulesetStatus::NotEnforced / PartiallyEnforced /
             // FullyEnforced + CompatLevel::BestEffort don't model
-            // "allow but log"). Per the Chunk 4 plan signoff, we
-            // reject LogOnly honestly rather than invent a pseudo-
-            // mode that would pretend to observe while silently
-            // doing nothing.
+            // "allow but log"), so we reject LogOnly honestly rather
+            // than invent a pseudo-mode that would pretend to observe
+            // while silently doing nothing.
             SandboxMode::LogOnly => Err(SandboxError::ModeNotSupportedOnPlatform {
                 platform: "linux".to_string(),
                 mode: SandboxMode::LogOnly,
-                remediation: "landlock has no native observe-only primitive in \
-                         Phase 46 P5. To debug a sandbox false-positive, re-run \
+                remediation: "landlock has no native observe-only primitive. \
+                         To debug a sandbox false-positive, re-run \
                          with --no-sandbox. `--sandbox-log` remains available on \
                          macOS."
                     .to_string(),
@@ -339,12 +335,11 @@ impl LandlockSandbox {
 /// remediations so the user can pick the right one without
 /// re-reading the docs.
 ///
-/// Phase 46.1 rework (2026-05-11): the `--unsafe-full-env` partner
-/// flag was collapsed into `--no-sandbox` (Q6), so option (3) names
-/// a single flag now. Also added a fifth shortcut: drop back to the
-/// default posture via `lpm config sandbox --set default` — for many
-/// users this is the right answer because they didn't realise strict
-/// was the more restrictive opt-in.
+/// Option (3) names `--no-sandbox` as a single flag. A fifth shortcut
+/// is also available: drop back to the default posture via
+/// `lpm config sandbox --set default` — for many users this is the
+/// right answer because they didn't realise strict was the more
+/// restrictive opt-in.
 fn strict_remediation() -> String {
     "remediation options: (1) set `[sandbox] allow-degraded = true` in \
      `~/.lpm/config.toml` or `./lpm.toml` to fall back to landlock V1 \
@@ -355,7 +350,7 @@ fn strict_remediation() -> String {
      (4) upgrade the host kernel to 6.7+ to get the strict posture \
      (filesystem-write containment + outbound TCP denial via landlock \
      V4 + direct UDP / raw / AF_PACKET / AF_NETLINK denial via the \
-     Phase 46.1.1 seccomp-bpf layer; AF_UNIX intentionally allowed); \
+     seccomp-bpf layer; AF_UNIX intentionally allowed); \
      (5) run `lpm config sandbox --set default` to drop back to the \
      recommended default posture (filesystem + env containment, \
      network allowed)."
@@ -422,7 +417,7 @@ impl Sandbox for LandlockSandbox {
             }
         })?;
 
-        // Phase 46.1.1: compile the seccomp socket(2) deny filter
+        // compile the seccomp socket(2) deny filter
         // parent-side. Like the landlock ruleset, all the
         // allocating work (building the BTreeMap of rules,
         // emitting BPF instructions into a Vec<sock_filter>)
@@ -482,7 +477,7 @@ impl Sandbox for LandlockSandbox {
         //     below. The post-`take()` `None` in `seccomp_opt`
         //     drops trivially.
         //
-        // Phase 46.1.1 install order:
+        // install order:
         //   1. seccompiler::apply_filter — installs the socket(2)
         //      deny filter. apply_filter ITSELF issues
         //      prctl(PR_SET_NO_NEW_PRIVS, 1, …) first (required
@@ -496,7 +491,7 @@ impl Sandbox for LandlockSandbox {
         // lifecycle script never runs.
         unsafe {
             command.pre_exec(move || {
-                // ── Layer 1: seccomp (Phase 46.1.1) ──
+                // ── Layer 1: seccomp ──
                 // Take the BpfProgram out of the Option, then
                 // wrap it in `ManuallyDrop` so its inner
                 // `Vec<sock_filter>` is NOT freed in the child.
@@ -541,7 +536,7 @@ impl Sandbox for LandlockSandbox {
                     }
                 }
 
-                // ── Layer 2: landlock (Phase 46.1) ──
+                // ── Layer 2: landlock (the strict posture) ──
                 let rs = match ruleset_opt.take() {
                     Some(r) => r,
                     None => {
@@ -631,15 +626,14 @@ fn probe_landlock_at(abi: ABI, with_network: bool) -> Result<(), RulesetError> {
 /// Missing paths are skipped with a parent-side `tracing::debug!`
 /// advisory rather than failing the whole spawn — a partial rule
 /// set is a tighter security posture than no sandbox at all, and
-/// the escape hatch remains `--no-sandbox` (Phase 46.1 rework
-/// collapsed the legacy `--unsafe-full-env` partner per Q6) if the
-/// user needs the missing rule's access.
+/// the escape hatch remains `--no-sandbox` if the user needs the
+/// missing rule's access.
 ///
-/// Phase 46.1: when `posture` is [`BackendPosture::Strict`], the
+/// when `posture` is [`BackendPosture::Strict`], the
 /// ruleset also declares `handle_access(AccessNet::from_all(V4))`
 /// (BindTcp + ConnectTcp) but installs no `NetPort` allow rules —
 /// landlock then default-denies every TCP bind / connect, which is
-/// the kernel-level outbound network denial Phase 46.1 ships.
+/// the kernel-level outbound network denial ships.
 fn build_parent_side_ruleset(
     spec: &SandboxSpec,
     posture: &BackendPosture,
@@ -728,13 +722,11 @@ mod tests {
 
     #[test]
     fn new_rejects_logonly_with_mode_specific_error() {
-        // Chunk 4 contract: Linux refuses LogOnly with a
-        // ModeNotSupportedOnPlatform error whose remediation names
-        // `--no-sandbox` as the workaround (Phase 46.1 rework
-        // collapsed the legacy `--unsafe-full-env` partner per Q6).
-        // This test runs regardless of kernel support — the mode
-        // check happens BEFORE the posture decision so users on
-        // old kernels get the same clear message.
+        // Linux refuses LogOnly with a ModeNotSupportedOnPlatform
+        // error whose remediation names `--no-sandbox` as the
+        // workaround. This test runs regardless of kernel support —
+        // the mode check happens BEFORE the posture decision so users
+        // on old kernels get the same clear message.
         match LandlockSandbox::new(
             realistic_spec(),
             SandboxMode::LogOnly,
@@ -787,7 +779,7 @@ mod tests {
 
     #[test]
     fn new_default_options_returns_default_posture() {
-        // Phase 46.1 rework (2026-05-11): default options give the
+        // default options give the
         // relaxed default — V1 baseline, no AccessNet rules. The
         // kernel-version probe still runs (V1 floor) so this test
         // can fail with `KernelTooOld { required: "5.13" }` only on
@@ -811,7 +803,7 @@ mod tests {
 
     #[test]
     fn new_strict_either_succeeds_or_surfaces_kernel_too_old() {
-        // Phase 46.1 strict path: `deny_outbound_network = true`
+        // strict path: `deny_outbound_network = true`
         // engages V4 with AccessNet rules. On a host at or above
         // kernel 6.7, construction succeeds with `Strict` posture.
         // On a host below 6.7 (and `allow_degraded = false`), the
@@ -833,7 +825,7 @@ mod tests {
             }) => {
                 assert_eq!(required, MIN_KERNEL_VERSION_STRICT);
                 assert!(!detected.is_empty());
-                // Phase 46.1 rework: single `--no-sandbox` flag.
+                // single `--no-sandbox` flag.
                 assert!(
                     remediation.contains("--no-sandbox"),
                     "remediation must name the escape hatch: {remediation}"
@@ -850,7 +842,7 @@ mod tests {
                     remediation.contains("trustedDependencies"),
                     "remediation must name the per-package trust escape: {remediation}"
                 );
-                // Phase 46.1 rework: the wizard shortcut also lives
+                // the wizard shortcut also lives
                 // in the remediation now.
                 assert!(
                     remediation.contains("lpm config sandbox"),
@@ -861,7 +853,7 @@ mod tests {
         }
     }
 
-    /// Phase 46.1: on a Linux host below the 6.7 floor AND with
+    /// on a Linux host below the 6.7 floor AND with
     /// strict requested, the `allow_degraded = true` opt-in must
     /// produce a V1 (filesystem-only) sandbox with
     /// [`SandboxPosture::Degraded`]. On a host at or above 6.7 the
@@ -971,7 +963,7 @@ mod tests {
         // `tmp_scratch_write_shape_succeeds`). Using `/tmp`-rooted
         // probes here would test the sandbox's CORRECT /tmp
         // permission rather than its deny-default — the
-        // 2026-04-23 Linux CI surfaced exactly this false-failure.
+        // Linux CI surfaced exactly this false-failure.
         // Use `/var/tmp/lpm-probe-<pid>/` instead: `/var/tmp` is a
         // real POSIX scratch directory (persistent across reboots,
         // always writable by the test user) that is NOT in any

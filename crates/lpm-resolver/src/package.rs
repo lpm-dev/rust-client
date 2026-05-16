@@ -25,8 +25,8 @@ pub enum ResolverPackage {
         /// Format: the parent's full Display identity (e.g. `"ajv"` for a
         /// flat parent or `"ajv[eslint]"` for an already-split parent).
         /// Using the full identity propagates splits downward so
-        /// grandchildren of sibling splits stay distinct. See
-        /// `provider.rs` Phase 40 P4 comment for the rationale.
+        /// grandchildren of sibling splits stay distinct. See the
+        /// multi-version split-retry logic in `provider.rs` for rationale.
         context: Option<String>,
     },
 
@@ -38,8 +38,8 @@ pub enum ResolverPackage {
         /// Format: the parent's full Display identity (e.g. `"ajv"` for a
         /// flat parent or `"ajv[eslint]"` for an already-split parent).
         /// Using the full identity propagates splits downward so
-        /// grandchildren of sibling splits stay distinct. See
-        /// `provider.rs` Phase 40 P4 comment for the rationale.
+        /// grandchildren of sibling splits stay distinct. See the
+        /// multi-version split-retry logic in `provider.rs` for rationale.
         context: Option<String>,
     },
 }
@@ -144,14 +144,15 @@ impl ResolverPackage {
 
 /// Canonical, context-free identity of a package.
 ///
-/// **This is the load-bearing key for Phase 49's shared metadata cache.**
+/// Context-free identity of a package — the shared metadata cache key.
+///
 /// Unlike [`ResolverPackage`], `CanonicalKey` has NO `context` field, so
 /// `lodash` and `lodash[foo]` (a split retry of the same canonical package)
 /// map to the same `CanonicalKey`.
 ///
 /// ## Why this exists
 ///
-/// The Phase 49 streaming BFS walker discovers packages by parsing manifest
+/// The streaming BFS walker discovers packages by parsing manifest
 /// `dependencies` maps — it only ever sees canonical names, never split
 /// identities. If the shared cache or notify map were keyed by
 /// `ResolverPackage` directly, split retries (`ResolverPackage::with_context`)
@@ -163,9 +164,6 @@ impl ResolverPackage {
 /// any cache read, notify lookup, or insert. Do not revert this type to
 /// include a context field without re-benching and extending the split-
 /// subtree regression test in `provider.rs`.
-///
-/// See `DOCS/new-features/37-rust-client-RUNNER-VISION-phase49-streaming-
-/// resolver-preplan.md` §4.2 invariant.
 #[derive(Clone, Debug, Eq, PartialEq, Hash)]
 pub enum CanonicalKey {
     /// The root project being resolved.
@@ -299,7 +297,7 @@ mod tests {
         assert_eq!(ResolverPackage::Root.to_string(), "<root>");
     }
 
-    // --- CanonicalKey (Phase 49) ---
+    // --- CanonicalKey ---
 
     #[test]
     fn canonical_key_strips_context_from_npm() {
@@ -380,8 +378,7 @@ mod tests {
         use std::collections::HashMap;
         let mut map: HashMap<CanonicalKey, &'static str> = HashMap::new();
         map.insert(CanonicalKey::npm("lodash"), "flat");
-        // A split-context ResolverPackage must hit the SAME entry via its
-        // canonical key — this is the boundary test the preplan §4.2 cites.
+        // A split-context ResolverPackage must hit the SAME entry via its canonical key.
         let split = ResolverPackage::npm("lodash").with_context("parent");
         assert_eq!(map.get(&CanonicalKey::from(&split)), Some(&"flat"));
     }

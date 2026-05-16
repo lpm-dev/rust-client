@@ -1,4 +1,4 @@
-//! Phase 46.3 PR-2: filesystem-grant integration tests for
+//! Filesystem-grant integration tests for
 //! `lpm-sandbox-helper.exe`.
 //!
 //! Tier: cli-binary (integration). Pins the contract that:

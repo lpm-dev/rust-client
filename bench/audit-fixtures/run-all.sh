@@ -12,11 +12,11 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 # `lpm install` cwd-relative behavior, or a manual debug session)
 # leaves leftover wrappers that Node's symlink walk-up resolves
 # through. That produced false-positive PASSes for fixtures missing
-# real peer deps in their package.json — see Phase 66 4b's
+# real peer deps in their package.json — see 4b's
 # `peer-heavy/apollo-graphql`, `tooling/eslint-flat-config`, and
 # `workspace/monorepo-basic` archaeology. Wiping the parent makes
 # every suite run fixture-isolated and the baseline trustworthy.
-# §3b — same fallback chain as run-audit.sh (RUNNER_TEMP for
+# — same fallback chain as run-audit.sh (RUNNER_TEMP for
 # windows-latest CI, /tmp on Linux/macOS).
 WORK_PARENT="${LPM_AUDIT_WORK_BASE:-${RUNNER_TEMP:-/tmp}/lpm-audit-work}"
 rm -rf "$WORK_PARENT"

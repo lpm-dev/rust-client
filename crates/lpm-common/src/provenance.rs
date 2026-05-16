@@ -1,22 +1,14 @@
 //! Publisher-identity snapshot captured from a package version's
 //! Sigstore attestation bundle.
 //!
-//! Phase 46 uses this to detect **provenance drift** between a
-//! previously-approved version and a candidate version. The axios
-//! 1.14.1 compromise is the motivating case: every legitimate v1
-//! release shipped with GitHub OIDC + Sigstore provenance; the
-//! malicious v1.14.1 did not. The drift check (§7.2 of the plan)
-//! compares the tuple field-by-field.
+//! Used to detect **provenance drift** between a previously-approved
+//! version and a candidate version. The axios 1.14.1 compromise is
+//! the motivating case: every legitimate v1 release shipped with GitHub
+//! OIDC + Sigstore provenance; the malicious v1.14.1 did not. The drift
+//! check compares the tuple field-by-field.
 //!
-//! Populated from the Sigstore bundle's leaf-cert SAN. P1 defined the
-//! type's shape and the `Option<ProvenanceSnapshot>` field placements
-//! on `lpm_workspace::TrustedDependencyBinding` (added by P4) and
-//! `lpm_cli::build_state::BlockedPackage` (added by P1). P4 wires the
-//! actual fetch + parse in the CLI.
-//!
-//! **Schema-crate placement (Phase 68 relocation):** this type lives
-//! in `lpm-common` because it is pure schema consumed by both
-//! `lpm-workspace` (via `TrustedDependencyBinding.provenance_at_approval`)
+//! This type lives in `lpm-common` because it is pure schema consumed by
+//! both `lpm-workspace` (via `TrustedDependencyBinding.provenance_at_approval`)
 //! AND `lpm-global` (via `GlobalTrustedDependencies::TrustedDependencyBinding.provenance_at_approval`).
 //! Owning it in `lpm-common` keeps `lpm-global` from depending on
 //! `lpm-workspace` while still letting both bindings share one

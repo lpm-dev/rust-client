@@ -1,9 +1,9 @@
-//! Phase 46 P1 — `script-policy` config loader and [`ScriptPolicy`] enum.
+//! — `script-policy` config loader and [`ScriptPolicy`] enum.
 //!
 //! Consolidates the pre-existing ad-hoc script-related readers
 //! ([`crate::commands::install::read_auto_build_config`] in install.rs
 //! and the `read_deny_all_config` helper in build.rs) into a single
-//! typed loader so Phase 46's new `scriptPolicy` key doesn't spawn a
+//! typed loader so the new `scriptPolicy` key doesn't spawn a
 //! third ad-hoc reader. Each call returns a [`ScriptPolicyConfig`]
 //! with all four `package.json > lpm > scripts` keys and the
 //! `scriptPolicy` key, parsed once.
@@ -19,7 +19,7 @@
 //! 3. `~/.lpm/config.toml` key `script-policy` (per-user, this machine).
 //! 4. Default: [`ScriptPolicy::Deny`].
 //!
-//! ## String coercion policy (Phase 33 precedent)
+//! ## String coercion policy (precedent)
 //!
 //! `lpm config set script-policy triage` writes the value as a string
 //! under the hood (see [`crate::commands::config`]'s generic `set`
@@ -35,7 +35,7 @@ use std::path::Path;
 /// Which gate to apply to lifecycle scripts during `lpm rebuild` /
 /// autoBuild flows.
 ///
-/// See [§5 of the Phase 46 plan](../DOCS/new-features/37-rust-client-RUNNER-VISION-phase46.md)
+/// See
 /// for the user-facing description of each mode.
 ///
 /// Wire/config format is kebab-case: `"deny"` | `"allow"` | `"triage"`.
@@ -44,7 +44,7 @@ use std::path::Path;
 pub enum ScriptPolicy {
     /// **Default.** Every lifecycle script is blocked at install time
     /// and requires explicit `lpm approve-scripts`. Equivalent to the
-    /// pre-Phase-46 behavior.
+    /// pre-existing behavior.
     #[default]
     Deny,
     /// Every package trusted. `lpm rebuild` runs every lifecycle script
@@ -146,7 +146,7 @@ pub struct ScriptPolicyConfig {
     /// resolved value can ignore errors, while consumers responsible
     /// for user-facing output can surface them.
     pub policy_parse_error: Option<String>,
-    /// **Phase 46 slice 1.** `package.json > lpm > triageAdvisor`,
+    /// `package.json > lpm > triageAdvisor`,
     /// if set. The string is stored verbatim (not parsed into a
     /// `Provider` here) so the resolver layer can normalise + warn
     /// once on unknown slugs at the install-time call site rather
@@ -209,7 +209,7 @@ impl ScriptPolicyConfig {
             })
             .unwrap_or_default();
 
-        // Phase 46 slice 1: `package.json > lpm > triageAdvisor`.
+        // `package.json > lpm > triageAdvisor`.
         // Stored as a raw string; the install resolver normalises and
         // warns once if the slug is unknown.
         let triage_advisor = lpm
@@ -267,11 +267,10 @@ pub fn collapse_policy_flags(
 /// Resolve the effective [`ScriptPolicy`] through the full precedence
 /// chain.
 ///
-/// **Phase 48 P0:** this function delegates to
+/// this function delegates to
 /// [`crate::precedence::resolve_pure_policy`], which ships the unified
 /// three-layer containment model. `scriptPolicy` is a pure-policy knob
-/// of kind [`crate::precedence::PolicyKind::Legacy`] — Phase 46
-/// project-over-user precedence is preserved by default, but the
+/// of kind [`crate::precedence::PolicyKind::Legacy`] — /// project-over-user precedence is preserved by default, but the
 /// resolver now also honors the `force-security-floor` user-global
 /// kill-switch (`force-security-floor = true` in `~/.lpm/config.toml`).
 /// When the flag is set, user becomes the floor, CLI loosening flags
@@ -518,7 +517,7 @@ mod tests {
         );
     }
 
-    // ── triage_advisor reader (Phase 46 slice 1) ──────────────────
+    // ── triage_advisor reader ──────────────────────────────
     //
     // The reader stores the value verbatim; resolution + slug
     // validation happens later at the install-time call site

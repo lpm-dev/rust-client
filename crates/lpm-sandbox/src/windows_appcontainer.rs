@@ -1,15 +1,15 @@
-//! Parent-side wiring for the Phase 46.3 PR-2 AppContainer backend.
+//! Parent-side wiring for the AppContainer backend.
 //!
-//! This is the half of PR-2 that lives in the `lpm.exe` process —
-//! it builds the helper argv from a [`SandboxedCommand`] and spawns
+//! This is the half that lives in the `lpm.exe` process — it builds
+//! the helper argv from a [`SandboxedCommand`] and spawns
 //! `lpm-sandbox-helper.exe`, which in turn does the AppContainer
 //! dance (see [`crate::helper_appcontainer`] for the helper-side
 //! mechanism).
 //!
 //! ## Why a separate module
 //!
-//! Phase 46.2's [`crate::windows::WindowsSandbox`] stays UNTOUCHED
-//! (see plan §4.3) — its `decide_posture` table refuses
+//! The [`crate::windows::WindowsSandbox`] stays UNTOUCHED
+//! () — its `decide_posture` table refuses
 //! strict-without-degraded, which is the right answer for the Low
 //! IL fallback path. AppContainer's posture is different: it
 //! always delivers strict (filesystem + network) when requested.
@@ -24,7 +24,7 @@
 //!   `--writable-dir` flags).
 //! - Captures the MSVC build environment once per process via
 //!   `vcvarsall.bat` so AppContainer'd `node-gyp rebuild` keeps
-//!   working without the COM-denied `vswhere` lookup (plan §2.5).
+//!   working without the COM-denied `vswhere` lookup.
 //! - Probes for the helper binary location (npm sibling, env var
 //!   override) and falls back gracefully if it's missing.
 //!
@@ -48,10 +48,10 @@ use crate::{
 
 // ── Backend struct ───────────────────────────────────────────────────
 
-/// Phase 46.3 PR-2 Windows AppContainer backend. Constructed by
+/// AppContainer backend. Constructed by
 /// the factory in [`crate`]-side `platform_backend` when the helper
 /// binary is reachable; otherwise the factory falls back to
-/// [`crate::windows::WindowsSandbox`] (the Phase 46.2 Low IL path).
+/// [`crate::windows::WindowsSandbox`] (the Low IL path).
 #[derive(Debug)]
 pub(crate) struct AppContainerSandbox {
     spec: SandboxSpec,
@@ -63,7 +63,7 @@ pub(crate) struct AppContainerSandbox {
 /// Internal posture tag for the AppContainer backend. Strict means
 /// "no capabilities → full default-deny including outbound network";
 /// Default means "InternetClient capability granted → outbound
-/// network allowed". Unlike the Phase 46.2 Low IL backend, there is
+/// network allowed". Unlike the Low IL backend, there is
 /// no `Degraded` variant — AppContainer delivers full strict
 /// (filesystem + network) when requested.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -98,14 +98,14 @@ impl AppContainerSandbox {
                     helper_path,
                 })
             }
-            // Same shape as Phase 46.2's WindowsSandbox: no native
+            // Same shape as the WindowsSandbox backend: no native
             // AppContainer "audit-only" primitive, so LogOnly
             // surfaces with a clear pointer to --no-sandbox.
             SandboxMode::LogOnly => Err(SandboxError::ModeNotSupportedOnPlatform {
                 platform: "windows".to_string(),
                 mode: SandboxMode::LogOnly,
                 remediation: "AppContainer has no native observe-only \
-                              primitive in Phase 46.3 PR-2. To debug a sandbox \
+                              primitive. To debug a sandbox \
                               false-positive, re-run with --no-sandbox. \
                               `--sandbox-log` remains available on macOS."
                     .to_string(),
@@ -122,7 +122,7 @@ impl AppContainerSandbox {
     }
 }
 
-/// Phase 46.3 PR-2 posture decision. Pure (inputs in, outcome out).
+/// Posture decision. Pure (inputs in, outcome out).
 ///
 /// Unlike [`crate::windows::decide_posture`], this function never
 /// refuses — AppContainer can deliver full strict on every
@@ -132,9 +132,9 @@ impl AppContainerSandbox {
 /// AppContainer path.
 ///
 /// Keeping the two backends' decisions separate (rather than
-/// editing the Phase 46.2 function in place) preserves the Low IL
+/// editing the function in place) preserves the Low IL
 /// fallback's strict-without-degraded refusal contract — see plan
-/// §4.3.
+///
 pub(crate) fn decide_appcontainer_posture(
     deny_outbound_network: bool,
     _allow_degraded: bool,
@@ -165,8 +165,8 @@ impl Sandbox for AppContainerSandbox {
         for dir in readable_allow_set(&self.spec) {
             helper_cmd.arg("--readable-dir").arg(dir);
         }
-        // Phase 46.3 PR-2 (2026-05-13): tool-dir grants derived
-        // from the lifecycle child's PATH. The plan §2.3 assumed
+        // Tool-dir grants derived
+        // from the lifecycle child's PATH, derived at spawn time.
         // `C:\Program Files\nodejs` (and similar third-party
         // installer dirs) ship with an `ALL_APPLICATION_PACKAGES`
         // ACE that AppContainer matches by default — empirically
@@ -185,12 +185,12 @@ impl Sandbox for AppContainerSandbox {
         // writable_allow_set) stay on `--readable-dir` /
         // `--writable-dir` with the strict-root contract; only
         // these PATH-derived entries opt into the WARN-and-continue
-        // semantics. See plan §10.2's "Other (non-MSVC)
+        // semantics. See "Other (non-MSVC)
         // COM-dependent lifecycle scripts still break" row.
         for dir in tool_dirs_needing_explicit_grant(&cmd) {
             helper_cmd.arg("--readable-dir-best-effort").arg(dir);
         }
-        // Narrow-write grants (mirrors Phase 46.2 + the macOS/Linux
+        // Narrow-write grants (mirrors + the macOS/Linux
         // backends' writable-set). DACLs are additive, so an entry
         // appearing in both lists ends up R+W+X — fine.
         for dir in crate::windows::writable_allow_set(&self.spec) {
@@ -205,7 +205,7 @@ impl Sandbox for AppContainerSandbox {
             helper_cmd.arg("--env-clear");
         }
 
-        // Phase 46.3 PR-2 Finding 3 mitigation: lazily-cached MSVC
+        // Lazily-cached MSVC
         // build environment from `vcvarsall.bat` (the parent has
         // full COM access; the AppContainer child does not, and
         // `node-gyp rebuild` relies on the discovery surface
@@ -228,7 +228,7 @@ impl Sandbox for AppContainerSandbox {
         // function of insertion order rather than a documented
         // contract. Matches the [`crate::commands::rebuild`]
         // `find_env_case_insensitive` precedent for the same
-        // hazard on the Phase 46.2 path.
+        // hazard on the path.
         let caller_keys_lower: std::collections::HashSet<String> = cmd
             .envs
             .iter()
@@ -339,7 +339,7 @@ fn stdio_for_argv(s: SandboxStdio) -> StdioMode {
 /// grant is needed.
 ///
 /// `project_dir` is the broad-tree readable root mentioned in the
-/// plan §2.3. The narrow writable subset within it
+/// The narrow writable subset within it
 /// (`node_modules`, `.husky`, `.lpm`) lives in
 /// [`crate::windows::writable_allow_set`]; DACLs are additive so
 /// overlap is fine.
@@ -434,7 +434,7 @@ fn is_under_system_root(candidate: &std::path::Path, system_root: &std::path::Pa
 ///    layout places `lpm-sandbox-helper.exe` next to `lpm.exe`.
 ///
 /// Returns `None` when neither is reachable; the caller falls back
-/// to the Phase 46.2 Low IL backend.
+/// to the Low IL backend.
 pub fn locate_sandbox_helper() -> Option<PathBuf> {
     if let Some(raw) = std::env::var_os("LPM_SANDBOX_HELPER") {
         let p = PathBuf::from(raw);
@@ -453,7 +453,7 @@ pub fn locate_sandbox_helper() -> Option<PathBuf> {
     None
 }
 
-// ── MSVC toolchain env capture (plan §2.5) ───────────────────────
+// ── MSVC toolchain env capture ───────────────────────────────────
 
 /// Why the capture exists: AppContainer denies the COM activation
 /// path `vswhere.exe` (and node-gyp's other VS discovery) uses, so
@@ -461,7 +461,7 @@ pub fn locate_sandbox_helper() -> Option<PathBuf> {
 /// parent (Medium IL, full COM) asks Microsoft's own
 /// `vcvarsall.bat` to render the build env and we inject the
 /// resulting env vars into the AppContainer child via the helper's
-/// `--env` argv plumbing. See plan §2.5 for the maintenance trade-
+/// `--env` argv plumbing.
 /// off vs hand-rolled VS discovery (`vcvarsall.bat` is Microsoft's
 /// official setup entry point and rides their cross-version drift
 /// surface; hand-rolled discovery would be ~5-10× the ongoing
@@ -504,7 +504,7 @@ fn do_capture_msvc_env() -> Result<HashMap<String, String>, String> {
     //   Picking that one and giving up would mask an older
     //   working BuildTools install with the workload present.
     //
-    // - `-requires` would mask the cross-arch case: the plan §2.5
+    // - `-requires` would mask the cross-arch case:
     //   round-3 fix demonstrated that hardcoding
     //   `Microsoft.VisualStudio.Component.VC.Tools.x86.x64`
     //   wouldn't match an ARM64-only host. Let `vcvarsall.bat`

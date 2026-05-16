@@ -1,11 +1,12 @@
 use clap::{ArgAction, Parser, Subcommand, ValueEnum};
 use clap_complete::Shell;
+use lpm_common::color::Painted;
 use miette::{IntoDiagnostic, Result};
-use owo_colors::OwoColorize;
 
 mod auth;
 pub mod build_state;
 pub mod capability;
+mod color_policy;
 mod commands;
 pub mod constraints;
 pub mod doctor_catalog;
@@ -106,6 +107,11 @@ struct Cli {
     /// Allow insecure HTTP connections to non-localhost registries.
     #[arg(long, global = true)]
     insecure: bool,
+
+    /// Color output mode. `auto` (default) honors `FORCE_COLOR`,
+    /// `NO_COLOR`, then falls back to stdout TTY detection.
+    #[arg(long, global = true, value_enum, default_value_t = color_policy::ColorChoice::Auto)]
+    color: color_policy::ColorChoice,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
@@ -196,7 +202,7 @@ enum Commands {
 
     /// Install dependencies from package.json, or add specific packages.
     ///
-    /// SAVE POLICY (Phase 33)
+    /// SAVE POLICY
     ///
     /// By default, `lpm install <pkg>` saves `^resolvedVersion` to
     /// package.json. If you provide an explicit version or range, LPM
@@ -245,8 +251,8 @@ enum Commands {
         #[arg(long)]
         allow_new: bool,
 
-        /// **Phase 59.0 (F5)** — fail on tarball-URL deps that have no
-        /// declared SRI integrity in the manifest. Without this flag,
+        /// Fail on tarball-URL deps that have no declared SRI integrity
+        /// in the manifest. Without this flag,
         /// trust-on-first-use lets the first `lpm install` of a new
         /// tarball-URL dep accept whatever the URL returns and record
         /// the computed SRI in the lockfile; subsequent installs
@@ -268,8 +274,8 @@ enum Commands {
         /// `package.json > lpm > minimumReleaseAge` /
         /// `~/.lpm/config.toml` key `minimum-release-age-secs`.
         ///
-        /// Phase 46 P3: the full precedence chain is
-        /// `--min-release-age` (this flag, highest) → package.json →
+        /// The full precedence chain is `--min-release-age` (this flag,
+        /// highest) → package.json →
         /// `~/.lpm/config.toml` → 24h default. `--allow-new` and this
         /// flag are independent escape hatches: `--allow-new` bypasses
         /// the check entirely; `--min-release-age=<dur>` adjusts the
@@ -277,13 +283,13 @@ enum Commands {
         #[arg(long, value_name = "DUR")]
         min_release_age: Option<String>,
 
-        /// Skip the Phase 46 P4 provenance-drift check for this
+        /// Skip the provenance-drift check for this
         /// specific package name (repeatable). The drift gate blocks
         /// on publisher identity changes between a prior approval
         /// and the candidate version; this flag opts out for a named
         /// package while keeping every other package's drift check
-        /// live. Per D16, this is orthogonal to `--allow-new` — the
-        /// cooldown and drift gates are independent.
+        /// live. Orthogonal to `--allow-new` — the cooldown and drift
+        /// gates are independent.
         ///
         /// Prefer re-approving via `lpm approve-scripts` over
         /// ignoring the drift: re-approval captures the new
@@ -294,7 +300,7 @@ enum Commands {
         #[arg(long, value_name = "PKG")]
         ignore_provenance_drift: Vec<String>,
 
-        /// Blanket: skip the Phase 46 P4 provenance-drift check for
+        /// Blanket: skip the provenance-drift check for
         /// every resolved package. Composes with
         /// `--ignore-provenance-drift <pkg>` by superseding it — if
         /// both are passed, `-all` wins and the per-package list is
@@ -303,8 +309,8 @@ enum Commands {
         #[arg(long)]
         ignore_provenance_drift_all: bool,
 
-        /// Linking mode: `hoisted` (default since Phase 66 4f — npm v3+
-        /// flat layout) or `isolated` (pnpm-style strict isolation).
+        /// Linking mode: `hoisted` (default — npm v3+ flat layout) or
+        /// `isolated` (pnpm-style strict isolation).
         /// Both materialize as project `node_modules/<dep>` symlinks
         /// into the global virtual store at `~/.lpm/store/v2/links/`,
         /// so warm-install latency is identical between modes; the
@@ -331,10 +337,10 @@ enum Commands {
 
         /// Automatically run `lpm rebuild` for trusted packages after install.
         ///
-        /// Phase 57: redundant under `--policy=allow` / `--yolo` (auto-build
-        /// fires at install time when policy is allow, regardless of this
-        /// flag). Still useful under the default `deny` policy when you
-        /// have an established trust set and want to skip the explicit
+        /// Redundant under `--policy=allow` / `--yolo` (auto-build fires
+        /// at install time when policy is allow, regardless of this flag).
+        /// Still useful under the default `deny` policy when you have an
+        /// established trust set and want to skip the explicit
         /// `lpm rebuild` step.
         #[arg(long)]
         auto_build: bool,
@@ -359,13 +365,10 @@ enum Commands {
         /// scripts; the install-time build hint lists candidates so
         /// you can review and approve before any code executes.
         ///
-        /// `allow` (Phase 57): runs every lifecycle script during
+        /// `allow`: runs every lifecycle script during
         /// `lpm install`, without the tier gate. Matches `npm install`
         /// / `pnpm install` / `bun install` default semantics. The
         /// trust check is bypassed because you opted in explicitly.
-        /// (Pre-Phase-57 this flag declared intent but required a
-        /// second `--auto-build` flag to actually fire scripts; that
-        /// two-step is now collapsed.)
         ///
         /// `triage`: four-layer tiered gate. Auto-runs when every
         /// unbuilt scripted package is trusted/green; if any amber or
@@ -376,8 +379,9 @@ enum Commands {
         /// installs (`-g`), only `--auto-build` applies — `-g` uses a
         /// synthesized package.json that does not project per-project
         /// script knobs. Greens auto-execute in the filesystem sandbox;
-        /// ambers and reds never auto-execute. The LLM triage layer
-        /// is not available yet.
+        /// ambers and reds never auto-execute. The portable layers run
+        /// every time; the LLM advisor is consulted only when configured
+        /// (see `--advisor`).
         ///
         /// Precedence: this flag > `package.json > lpm > scriptPolicy`
         /// > `~/.lpm/config.toml` key `script-policy` > default (deny).
@@ -399,9 +403,8 @@ enum Commands {
         policy: Option<String>,
 
         /// Alias for `--policy=allow`. Runs every lifecycle script
-        /// during `lpm install` without the tier gate (Phase 57 —
-        /// auto-build fires automatically; no separate `--auto-build`
-        /// flag needed).
+        /// during `lpm install` without the tier gate — auto-build
+        /// fires automatically; no separate `--auto-build` flag needed.
         ///
         /// See `--policy` for the global rerun caveat (`-g` blocked
         /// scripts require uninstall+reinstall after approval).
@@ -410,10 +413,9 @@ enum Commands {
         #[arg(long, conflicts_with_all = ["policy", "triage_alias"])]
         yolo: bool,
 
-        /// Phase 46: alias for `--policy=triage`. Enables the
-        /// tiered gate (Phase 46 P2–P6): greens auto-approve and
-        /// run in the sandbox; ambers and reds route to
-        /// `lpm approve-scripts` for manual review.
+        /// Alias for `--policy=triage`. Enables the tiered gate: greens
+        /// auto-approve and run in the sandbox; ambers and reds route
+        /// to `lpm approve-scripts` for manual review.
         ///
         /// See `--policy` for the global rerun caveat (`-g` blocked
         /// scripts require uninstall+reinstall after approval).
@@ -422,7 +424,7 @@ enum Commands {
         #[arg(long = "triage", id = "triage_alias", conflicts_with_all = ["policy", "yolo"])]
         triage_alias: bool,
 
-        /// Phase 46 slice 1 — override the triage advisor for this run.
+        /// Override the triage advisor for this run.
         /// Valid values: `none` | `claude-cli` | `codex` | `ollama`.
         ///
         /// Precedence (highest first): this flag → `lpm.triageAdvisor`
@@ -441,9 +443,9 @@ enum Commands {
         )]
         advisor: Option<String>,
 
-        /// Phase 32 Phase 2: filter workspace members. Same grammar as
-        /// `lpm run --filter`. Only meaningful when adding packages — bare
-        /// `lpm install` (no packages) ignores this flag.
+        /// Filter workspace members. Same grammar as `lpm run --filter`.
+        /// Only meaningful when adding packages — bare `lpm install`
+        /// (no packages) ignores this flag.
         ///
         /// Example: `lpm install react --filter web` adds react to
         /// `packages/web/package.json` and runs the install pipeline at
@@ -453,45 +455,45 @@ enum Commands {
         #[arg(long)]
         filter: Vec<String>,
 
-        /// Phase 32 Phase 2: target the workspace root `package.json` instead
-        /// of the current member. Mutually exclusive with `--filter`. Use
-        /// when adding tooling packages that belong at the root rather than
+        /// Target the workspace root `package.json` instead of the
+        /// current member. Mutually exclusive with `--filter`. Use when
+        /// adding tooling packages that belong at the root rather than
         /// in a specific member (e.g., shared dev dependencies).
         #[arg(short = 'w', long = "workspace-root")]
         workspace_root: bool,
 
-        /// Phase 32 Phase 2: exit non-zero if `--filter` matches no members.
-        /// Recommended in CI to catch typo'd filters.
+        /// Exit non-zero if `--filter` matches no members. Recommended
+        /// in CI to catch typo'd filters.
         #[arg(long)]
         fail_if_no_match: bool,
 
-        /// Phase 32 Phase 2 (D-impl-5, 2026-04-16): skip the interactive
-        /// confirmation prompt when a filtered install will mutate more
-        /// than one workspace member's `package.json`. Mirrors `lpm init`
-        /// and `lpm publish` — JSON mode and non-TTY stdin already skip
-        /// the prompt automatically; this flag covers the interactive-
-        /// terminal-but-no-manual-review case (scripts, agents).
+        /// Skip the interactive confirmation prompt when a filtered
+        /// install will mutate more than one workspace member's
+        /// `package.json`. Mirrors `lpm init` and `lpm publish` —
+        /// JSON mode and non-TTY stdin already skip the prompt
+        /// automatically; this flag covers the interactive-terminal-
+        /// but-no-manual-review case (scripts, agents).
         #[arg(long, short = 'y')]
         yes: bool,
 
-        /// Phase 33: save the exact resolved version to `package.json`
-        /// instead of the default `^resolvedVersion`. Mutually exclusive
-        /// with `--tilde` and `--save-prefix`.
+        /// Save the exact resolved version to `package.json` instead of
+        /// the default `^resolvedVersion`. Mutually exclusive with
+        /// `--tilde` and `--save-prefix`.
         ///
         /// Example: `lpm install zod --exact` saves `"zod": "4.3.6"`.
         #[arg(long, conflicts_with_all = ["tilde", "save_prefix"])]
         exact: bool,
 
-        /// Phase 33: save `~resolvedVersion` to `package.json` instead of
-        /// the default `^resolvedVersion`. Mutually exclusive with
-        /// `--exact` and `--save-prefix`.
+        /// Save `~resolvedVersion` to `package.json` instead of the
+        /// default `^resolvedVersion`. Mutually exclusive with `--exact`
+        /// and `--save-prefix`.
         ///
         /// Example: `lpm install zod --tilde` saves `"zod": "~4.3.6"`.
         #[arg(long, conflicts_with_all = ["exact", "save_prefix"])]
         tilde: bool,
 
-        /// Phase 33: override the manifest save prefix for this install.
-        /// Valid values: `^`, `~`, or `""` (empty for exact, no prefix).
+        /// Override the manifest save prefix for this install. Valid
+        /// values: `^`, `~`, or `""` (empty for exact, no prefix).
         /// `*` is not accepted — wildcards must be requested per-package
         /// via `pkg@*`. Mutually exclusive with `--exact` and `--tilde`.
         ///
@@ -499,21 +501,18 @@ enum Commands {
         #[arg(long, value_name = "PREFIX", conflicts_with_all = ["exact", "tilde"])]
         save_prefix: Option<String>,
 
-        /// Phase 37: install the package globally into `~/.lpm/global/`
-        /// instead of into a project's `node_modules/`. Exposes the
-        /// package's bin entries on PATH via `~/.lpm/bin/`.
-        ///
-        /// The persistent install pipeline lands in M3; this M2 release
-        /// only ships the flag surface so downstream work can wire to it.
+        /// Install the package globally into `~/.lpm/global/` instead of
+        /// into a project's `node_modules/`. Exposes the package's bin
+        /// entries on PATH via `~/.lpm/bin/`.
         ///
         /// Example: `lpm install --global eslint`, `lpm install -g typescript`
         #[arg(long, short = 'g')]
         global: bool,
 
-        /// Phase 37 M4: resolve a command-name collision by transferring
-        /// ownership of `<CMD>` to the package being installed. The
-        /// previous owner keeps their row but loses that command from
-        /// PATH; the new shim points at this install.
+        /// Resolve a command-name collision by transferring ownership of
+        /// `<CMD>` to the package being installed. The previous owner
+        /// keeps their row but loses that command from PATH; the new
+        /// shim points at this install.
         ///
         /// Repeatable. Only meaningful with `-g`.
         ///
@@ -521,10 +520,10 @@ enum Commands {
         #[arg(long = "replace-bin", value_name = "CMD")]
         replace_bin: Vec<String>,
 
-        /// Phase 37 M4: install a declared bin under a different PATH
-        /// name. Format: `<orig>=<alias>` — `<orig>` must be a bin the
-        /// package declares, `<alias>` is the PATH name. Multiple
-        /// mappings comma-separated or via repeated flags.
+        /// Install a declared bin under a different PATH name.
+        /// Format: `<orig>=<alias>` — `<orig>` must be a bin the package
+        /// declares, `<alias>` is the PATH name. Multiple mappings
+        /// comma-separated or via repeated flags.
         ///
         /// When set, the declared `<orig>` name is NOT emitted as a
         /// shim; only `<alias>` is. Only meaningful with `-g`.
@@ -533,12 +532,12 @@ enum Commands {
         #[arg(long = "alias", value_name = "ORIG=ALIAS")]
         alias: Vec<String>,
 
-        /// Phase 46.1 rework (2026-05-11): engage strict sandbox for
-        /// this install's lifecycle scripts — filesystem containment,
-        /// env scrubbing, and outbound network denial. Overrides any
-        /// persistent `[sandbox] mode` config for this command only.
-        /// Auto-build (`--auto-build` and the `package.json` key
-        /// `lpm.scripts.autoBuild`) honors the same strict mode.
+        /// Engage strict sandbox for this install's lifecycle scripts —
+        /// filesystem containment, env scrubbing, and outbound network
+        /// denial. Overrides any persistent `[sandbox] mode` config for
+        /// this command only. Auto-build (`--auto-build` and the
+        /// `package.json` key `lpm.scripts.autoBuild`) honors the same
+        /// strict mode.
         ///
         /// Mutually exclusive with `--no-sandbox` and `--paranoid`
         /// (the alias).
@@ -549,9 +548,9 @@ enum Commands {
         )]
         strict_sandbox: bool,
 
-        /// Phase 46.1 rework alias for `--strict-sandbox`. Same
-        /// behaviour; ergonomic spelling. Mutually exclusive with
-        /// `--no-sandbox` and `--strict-sandbox`.
+        /// Alias for `--strict-sandbox`. Same behaviour; ergonomic
+        /// spelling. Mutually exclusive with `--no-sandbox` and
+        /// `--strict-sandbox`.
         #[arg(
             long = "paranoid",
             id = "install_paranoid",
@@ -559,12 +558,11 @@ enum Commands {
         )]
         paranoid: bool,
 
-        /// Phase 46.1 rework (2026-05-11): drop ALL containment for
-        /// this install's lifecycle scripts. Scripts run with full
-        /// host access — filesystem open, full env (credentials
-        /// included), outbound network allowed. Reserve for debugging
-        /// a sandbox false-positive. Persistent off-mode goes through
-        /// `lpm config sandbox --set none` instead.
+        /// Drop ALL containment for this install's lifecycle scripts.
+        /// Scripts run with full host access — filesystem open, full
+        /// env (credentials included), outbound network allowed. Reserve
+        /// for debugging a sandbox false-positive. Persistent off-mode
+        /// goes through `lpm config sandbox --set none` instead.
         ///
         /// Mutually exclusive with `--strict-sandbox` and `--paranoid`.
         #[arg(
@@ -581,7 +579,7 @@ enum Commands {
         /// Packages to remove (e.g., express, @lpm.dev/neo.highlight).
         packages: Vec<String>,
 
-        /// Phase 32 Phase 2: filter workspace members. Same grammar as
+        /// filter workspace members. Same grammar as
         /// `lpm run --filter`. Mutually exclusive with `-w`.
         ///
         /// Example: `lpm uninstall lodash --filter web` removes lodash from
@@ -589,30 +587,30 @@ enum Commands {
         #[arg(long)]
         filter: Vec<String>,
 
-        /// Phase 32 Phase 2: target the workspace root `package.json` instead
+        /// target the workspace root `package.json` instead
         /// of the current member.
         #[arg(short = 'w', long = "workspace-root")]
         workspace_root: bool,
 
-        /// Phase 32 Phase 2: exit non-zero if `--filter` matches no members.
+        /// exit non-zero if `--filter` matches no members.
         #[arg(long)]
         fail_if_no_match: bool,
 
-        /// Phase 32 Phase 2 (D-impl-5, 2026-04-16): skip the interactive
+        /// (): skip the interactive
         /// confirmation prompt when a filtered uninstall will mutate more
         /// than one workspace member's `package.json`. See the matching
         /// flag on `lpm install` for the full rationale.
         #[arg(long, short = 'y')]
         yes: bool,
 
-        /// Phase 37 M3.3: remove a globally-installed package.
+        /// remove a globally-installed package.
         /// Mutually exclusive with `--filter` / `-w` / `--fail-if-no-match`
         /// (those are project-scoped).
         ///
         /// Example: `lpm uninstall -g eslint`
         ///
         /// Equivalent to `lpm global remove <pkg>` — both invocations
-        /// route through the same M3.3 implementation.
+        /// route through the same `uninstall_global` implementation.
         #[arg(long, short = 'g')]
         global: bool,
     },
@@ -907,9 +905,9 @@ enum Commands {
 
     /// Manage globally-installed CLI packages under ~/.lpm/global/.
     ///
-    /// M2 ships read-only commands (`list`, `bin`, `path`). The full
-    /// install / uninstall / update surface lands in M3 alongside the
-    /// global install pipeline.
+    /// Subcommands: `list` (with `--outdated`/`--verbose`), `bin`,
+    /// `path <pkg>`, `remove <pkg>` (= `lpm uninstall -g <pkg>`),
+    /// `update [<pkg>[@<spec>]]` (with `--dry-run`).
     Global {
         #[command(subcommand)]
         action: commands::global::GlobalCmd,
@@ -917,7 +915,7 @@ enum Commands {
 
     /// Inspect and manage `trustedDependencies` in package.json.
     ///
-    /// Phase 46 P1: `lpm trust diff` shows how the current manifest's
+    ///: `lpm trust diff` shows how the current manifest's
     /// trust list differs from the last install's snapshot; `lpm trust
     /// prune` removes entries whose package is no longer installed.
     Trust {
@@ -1009,7 +1007,7 @@ enum Commands {
     /// Other lifecycle names like `prepare` / `prepublishOnly` are recognized
     /// for detection and audit, but never executed by the install pipeline.
     ///
-    /// Scripts run inside the Phase 46.1 default sandbox — filesystem-write
+    /// Scripts run inside the default sandbox — filesystem-write
     /// containment + env scrubbing, outbound network allowed. Strict mode
     /// (network denial) is opt-in via `--strict-sandbox` / `--paranoid`,
     /// `[sandbox] mode = "strict"` in `~/.lpm/config.toml` / `./lpm.toml`,
@@ -1041,7 +1039,7 @@ enum Commands {
         #[arg(long)]
         deny_all: bool,
 
-        /// Phase 46: lifecycle-script policy override (see
+        /// lifecycle-script policy override (see
         /// `lpm install --policy` for the shared semantics).
         ///
         /// For `lpm rebuild` specifically, the policy governs which
@@ -1052,10 +1050,10 @@ enum Commands {
         /// `trustedDependencies`-trusted packages only.
         ///
         /// `allow`: includes every scripted package regardless of
-        /// trust (Phase 46 close-out).
+        /// trust (close-out).
         ///
         /// `triage`: filters to trusted-only, but greens are
-        /// auto-promoted (Phase 46 P6) and appear in the rebuild
+        /// auto-promoted  and appear in the rebuild
         /// set without explicit `trustedDependencies` entries.
         ///
         /// `--all` overrides the filter under every policy.
@@ -1068,21 +1066,21 @@ enum Commands {
         )]
         policy: Option<String>,
 
-        /// Phase 46: alias for `--policy=allow`. Includes every
+        /// alias for `--policy=allow`. Includes every
         /// scripted package in the rebuild set regardless of trust
-        /// (Phase 46 close-out). Equivalent to `--all` at the
+        /// (close-out). Equivalent to `--all` at the
         /// selection step.
         #[arg(long = "yolo", id = "rebuild_yolo", conflicts_with_all = ["policy", "rebuild_triage_alias"])]
         yolo: bool,
 
-        /// Phase 46: alias for `--policy=triage`. Greens are
-        /// auto-promoted into the rebuild set (Phase 46 P6);
+        /// alias for `--policy=triage`. Greens are
+        /// auto-promoted into the rebuild set ;
         /// ambers and reds require `lpm approve-scripts`
         /// approval before they run.
         #[arg(long = "triage", id = "rebuild_triage_alias", conflicts_with_all = ["policy", "rebuild_yolo"])]
         triage_alias: bool,
 
-        /// Phase 46.1 rework (2026-05-11): drop ALL containment for
+        /// drop ALL containment for
         /// this command. Scripts run with full host access — filesystem
         /// open, full env (credentials included), outbound network
         /// allowed. Reserve for debugging a sandbox false-positive
@@ -1098,7 +1096,7 @@ enum Commands {
         )]
         no_sandbox: bool,
 
-        /// Phase 46.1 rework (2026-05-11): engage strict containment
+        /// engage strict containment
         /// for this command — filesystem-write containment + env
         /// scrubbing + outbound network denial. Overrides any
         /// persistent `[sandbox] mode` config. Mutually exclusive
@@ -1110,7 +1108,7 @@ enum Commands {
         )]
         strict_sandbox: bool,
 
-        /// Phase 46.1 rework alias for `--strict-sandbox`. Same
+        /// rework alias for `--strict-sandbox`. Same
         /// behaviour; ergonomic spelling for "I always want this
         /// strict". Mutually exclusive with `--no-sandbox` and
         /// `--strict-sandbox`.
@@ -1121,7 +1119,7 @@ enum Commands {
         )]
         paranoid: bool,
 
-        /// Phase 46 P5 Chunk 4: run lifecycle scripts in diagnostic
+        /// Run lifecycle scripts in diagnostic
         /// mode — rule triggers are logged via `sandboxd` but not
         /// enforced. **Not a safety signal.** A clean run under
         /// `--sandbox-log` does NOT indicate the script would pass
@@ -1130,7 +1128,7 @@ enum Commands {
         /// via `log show --last 5m --predicate 'senderImagePath
         /// CONTAINS "Sandbox"'` and filter by the script's PID.
         ///
-        /// macOS only in Phase 46 P5: implemented via Seatbelt's
+        /// macOS only in: implemented via Seatbelt's
         /// `(allow (with report) default)` fallback. Linux landlock
         /// has no native observe-only primitive, so `--sandbox-log`
         /// on Linux errors at sandbox init with a remediation
@@ -1145,15 +1143,31 @@ enum Commands {
         no_engine_strict: bool,
     },
 
-    /// Health check: verify auth, registry, store, project state.
+    /// Health check: verify project state, runtime, store, and (with
+    /// `--all`) auth, registry, tunnel, tooling, plugins, globals,
+    /// sandbox, and full manifest-compat.
     ///
-    /// Without a subcommand, runs the full check set against the
-    /// current project. Subcommands target the inventory surface:
+    /// Default: a fast, local-only "why is this project broken right
+    /// now?" pass — no registry probe, no `whoami`, no tunnel lookup,
+    /// no lint / fmt subprocess, no plugin update fetch. Pass `--all`
+    /// for the full sweep across every catalog row.
+    ///
+    /// Subcommands target the inventory surface (always local):
     ///
     ///   lpm doctor list                — dump every code doctor can emit
     ///   lpm doctor list --code <code>  — show one entry
     ///   lpm doctor list --category Tunnel  — filter by category
     Doctor {
+        /// Run every catalog row, including registry/auth probes,
+        /// tunnel lookup, lint+fmt subprocesses, TypeScript +
+        /// plugin reachability, global-install hygiene, sandbox
+        /// probe, and the full manifest-compat sweep. Default
+        /// `lpm doctor` runs only the fast local-health preset.
+        ///
+        /// Ignored when a subcommand is provided.
+        #[arg(long)]
+        all: bool,
+
         /// Auto-fix issues (install missing Node, run lpm install, run lpm fmt).
         ///
         /// Ignored when a subcommand is provided.
@@ -1207,7 +1221,7 @@ enum Commands {
     /// `lpm use node@22` installs Node 22 and pins it in lpm.json.
     /// Scripts then auto-use the pinned version via PATH injection.
     Use {
-        /// Node.js version spec (e.g., node@22, node@lts, 22.5.0), or "vars" to manage project env vars.
+        /// Node.js version spec (e.g., node@22, node@lts, 22.5.0). For env vars and secrets, use `lpm env`.
         spec: Option<String>,
 
         /// List installed runtime versions.
@@ -1261,7 +1275,7 @@ enum Commands {
         #[arg(long, conflicts_with_all = ["filter", "affected"])]
         all: bool,
 
-        /// Filter workspace packages with the Phase 32 grammar. Can be passed
+        /// Filter workspace packages with the grammar. Can be passed
         /// multiple times: `--filter foo --filter bar` unions the two sets.
         ///
         /// Grammar: exact name (`foo`), glob (`@scope/*`, `foo-*`),
@@ -1269,7 +1283,7 @@ enum Commands {
         /// git ref (`[origin/main]`), forward closure (`foo...`, `foo^...`),
         /// reverse closure (`...foo`, `...^foo`), exclusion (`!foo`).
         ///
-        /// Note: Phase 32 removed the legacy substring matcher per design
+        /// Note: removed the legacy substring matcher per design
         /// decision D2. `--filter core` no longer matches `@babel/core` —
         /// write `--filter '*/core'` for that.
         #[arg(long)]
@@ -1333,7 +1347,7 @@ enum Commands {
     /// self-contained output directory ready for `COPY --from=pruned` in a
     /// Dockerfile.
     ///
-    /// Phase 32 Phase 3. The deploy output contains:
+    /// The deploy output contains:
     /// - The targeted member's source files (excluding `.env*`, `node_modules`,
     ///   `.git`, and other LPM-internal state)
     /// - A `package.json` with `workspace:*` references rewritten to concrete
@@ -1346,7 +1360,7 @@ enum Commands {
     /// - `--filter` is required and must match exactly one workspace member
     /// - The output directory must be outside the workspace tree
     /// - Workspace members referenced via `workspace:*` must be PUBLISHED to
-    ///   the registry (the resolver has no local-package handling). Phase 12+
+    ///   the registry (the resolver has no local-package handling).a future release
     ///   will add unpublished workspace dep injection.
     ///
     /// **Example:**
@@ -1378,7 +1392,7 @@ enum Commands {
     /// Review and approve packages whose lifecycle scripts were blocked by
     /// LPM's default-deny security posture.
     ///
-    /// **Phase 32 Phase 4.** This command pairs with the post-install
+    /// This command pairs with the post-install
     /// warning emitted by `lpm install` when packages with `preinstall` /
     /// `install` / `postinstall` scripts are not yet covered by an existing
     /// strict approval. Approvals are bound to
@@ -1392,7 +1406,7 @@ enum Commands {
     /// - `lpm approve-scripts --yes`         — bulk approve (loud)
     /// - `lpm approve-scripts <pkg>`         — approve a specific package
     /// - `lpm approve-scripts --json`        — structured output for agents
-    /// - `lpm approve-scripts --global`      — review Phase-37 global installs
+    /// - `lpm approve-scripts --global`      — review global installs
     #[command(name = "approve-scripts")]
     ApproveScripts {
         /// Approve a specific package directly. Accepts `name` or
@@ -1409,7 +1423,7 @@ enum Commands {
         #[arg(long, conflicts_with = "yes")]
         list: bool,
 
-        /// Phase 46 close-out: preview decisions without mutating state.
+        /// close-out: preview decisions without mutating state.
         ///
         /// In project mode, `package.json`'s `trustedDependencies` stays
         /// untouched. In global mode,
@@ -1425,7 +1439,7 @@ enum Commands {
         #[arg(long)]
         dry_run: bool,
 
-        /// Phase 37 M5: operate on the global blocked set (aggregated
+        /// operate on the global blocked set (aggregated
         /// across every `lpm install -g` install root) instead of the
         /// current project. Approvals write to
         /// `~/.lpm/global/trusted-dependencies.json` rather than the
@@ -1433,7 +1447,7 @@ enum Commands {
         #[arg(long)]
         global: bool,
 
-        /// Phase 37 M5: when used with `--global`, group blocked rows by
+        /// when used with `--global`, group blocked rows by
         /// top-level globally-installed package during list and interactive
         /// review. Auto-enabled when the blocked set exceeds 10 entries.
         /// Persisted approvals still remain per dependency binding row.
@@ -1451,8 +1465,10 @@ enum Commands {
     /// store integrity — drift on a future install is a hard error.
     #[command(name = "patch")]
     Patch {
-        /// Package selector (`name@exact-version`). Only exact pins are
-        /// accepted today; range selectors are not supported yet.
+        /// Package selector: bare name (`lodash`), exact pin
+        /// (`lodash@4.17.21`), or semver range (`lodash@^4.0.0`). The
+        /// resolved exact pin is persisted in `package.json`. Dist-tags
+        /// (`latest`, `next`) are not accepted.
         key: String,
     },
 
@@ -1462,7 +1478,7 @@ enum Commands {
     /// the store baseline, writes `patches/<key>.patch`, and updates
     /// `package.json :: lpm.patchedDependencies`.
     ///
-    /// Phase 32 Phase 6.
+    ///.
     #[command(name = "patch-commit")]
     PatchCommit {
         /// The staging directory path printed by `lpm patch`.
@@ -1495,11 +1511,11 @@ enum Commands {
         fail_if_no_match: bool,
     },
 
-    /// Manage tool plugins (list installed, update to latest).
+    /// Manage tool plugins (list, update, remove).
     Plugin {
-        /// Action: list, update.
+        /// Action: `list` (alias `ls`), `update` (alias `upgrade`), `remove` (aliases `rm`, `uninstall`).
         action: String,
-        /// Plugin name (for update). Omit to update all.
+        /// Plugin name. Optional for `update` (omit to update all); required for `remove`.
         name: Option<String>,
     },
 
@@ -1509,7 +1525,7 @@ enum Commands {
         /// and `--affected` — pick one selection mode.
         #[arg(long, conflicts_with_all = ["filter", "affected"])]
         all: bool,
-        /// Filter workspace packages with the Phase 32 grammar. Can be passed
+        /// Filter workspace packages with the grammar. Can be passed
         /// multiple times: `--filter foo --filter bar` unions the two sets.
         ///
         /// Grammar: exact name (`foo`), glob (`@scope/*`, `foo-*`),
@@ -1542,7 +1558,7 @@ enum Commands {
         /// and `--affected` — pick one selection mode.
         #[arg(long, conflicts_with_all = ["filter", "affected"])]
         all: bool,
-        /// Filter workspace packages with the Phase 32 grammar. Can be passed
+        /// Filter workspace packages with the grammar. Can be passed
         /// multiple times: `--filter foo --filter bar` unions the two sets.
         #[arg(long)]
         filter: Vec<String>,
@@ -1566,7 +1582,7 @@ enum Commands {
         /// and `--affected` — pick one selection mode.
         #[arg(long, conflicts_with_all = ["filter", "affected"])]
         all: bool,
-        /// Filter workspace packages with the Phase 32 grammar. Can be passed
+        /// Filter workspace packages with the grammar. Can be passed
         /// multiple times: `--filter foo --filter bar` unions the two sets.
         #[arg(long)]
         filter: Vec<String>,
@@ -1596,7 +1612,7 @@ enum Commands {
         /// and `--affected` — pick one selection mode.
         #[arg(long, conflicts_with_all = ["filter", "affected"])]
         all: bool,
-        /// Filter workspace packages with the Phase 32 grammar. Can be passed
+        /// Filter workspace packages with the grammar. Can be passed
         /// multiple times: `--filter foo --filter bar` unions the two sets.
         #[arg(long)]
         filter: Vec<String>,
@@ -1623,7 +1639,7 @@ enum Commands {
         /// and `--affected` — pick one selection mode.
         #[arg(long, conflicts_with_all = ["filter", "affected"])]
         all: bool,
-        /// Filter workspace packages with the Phase 32 grammar. Can be passed
+        /// Filter workspace packages with the grammar. Can be passed
         /// multiple times: `--filter foo --filter bar` unions the two sets.
         #[arg(long)]
         filter: Vec<String>,
@@ -1925,7 +1941,7 @@ enum Commands {
         refresh: bool,
     },
 
-    /// Phase 34.2: hidden subcommand for background update cache refresh.
+    /// hidden subcommand for background update cache refresh.
     /// Spawned as a detached child process by the parent — never user-facing.
     #[command(name = "internal-update-check", hide = true)]
     InternalUpdateCheck,
@@ -1998,7 +2014,7 @@ enum DoctorAction {
 // `GlobalCmd` lives in `commands::global` so the subcommand type is in
 // the same module as the run() handler. Imported via the dispatch site.
 
-/// Phase 37 M3.1d: predicate that gates `lpm_global::recover()` at
+/// predicate that gates `lpm_global::recover()` at
 /// startup. Returns `true` for any command that reads or writes
 /// `~/.lpm/global/` state — recovery must run first so the manifest
 /// is settled before the command sees it. Returns `false` for everything
@@ -2008,7 +2024,7 @@ enum DoctorAction {
 /// The set is deliberately conservative: better to occasionally pay
 /// for an empty-WAL scan than to skip recovery and let a destructive
 /// command run against half-committed state.
-/// Phase 37 M0 (rev 6): emit a one-time warning if `$LPM_HOME` lives on a
+/// emit a one-time warning if `$LPM_HOME` lives on a
 /// known-unreliable network filesystem (NFS/SMB/CIFS/AFP). Marker file
 /// `~/.lpm/.network-fs-notice-shown` suppresses subsequent invocations so
 /// CI / enterprise users in known-okay setups aren't nagged repeatedly.
@@ -2076,12 +2092,12 @@ where
 
 fn command_needs_global_state(cmd: &Commands) -> bool {
     match cmd {
-        // `install -g` (the actual install pipeline lands in M3.2 — for
-        // now the dispatcher errors loudly, but recovery still runs so
+        // `install -g` (the actual install pipeline is wired; the
+        // dispatcher errors loudly for multi-package invocations, but recovery still runs so
         // a prior crashed install gets reconciled before the user
         // retries).
         Commands::Install { global: true, .. } => true,
-        // `uninstall -g` (M3.3): same reasoning as `install -g` —
+        // `uninstall -g`: same reasoning as `install -g` —
         // recovery must run first so an orphaned `[pending.<pkg>]` from
         // a crashed install gets cleaned up before uninstall sees it
         // and bails with the in-flight-install error message.
@@ -2105,7 +2121,7 @@ fn command_needs_global_state(cmd: &Commands) -> bool {
         // `doctor` reports on global state and may surface mid-tx
         // anomalies that recovery would have already cleaned up.
         Commands::Doctor { .. } => true,
-        // Phase 37 M5: `approve-scripts --global` reads the global
+        // `approve-scripts --global` reads the global
         // manifest + aggregates per-install build-state files, both
         // of which need recovery to settle first.
         Commands::ApproveScripts { global: true, .. } => true,
@@ -2113,7 +2129,7 @@ fn command_needs_global_state(cmd: &Commands) -> bool {
     }
 }
 
-/// Phase 68: assemble the per-invocation security overrides forwarded
+/// assemble the per-invocation security overrides forwarded
 /// from `lpm install -g` into the global install pipeline.
 ///
 /// Centralizes three steps that previously lived inline in the
@@ -2195,7 +2211,7 @@ fn validate_global_install_project_scoped_flags(
     fail_if_no_match: bool,
     yes: bool,
 ) -> Result<(), lpm_common::LpmError> {
-    // Phase 68: `--allow-new`, `--min-release-age`, and
+    // `--allow-new`, `--min-release-age`, and
     // `--ignore-provenance-drift[-all]` are now forwarded into the
     // global install pipeline (their gates fire end-to-end against the
     // synthetic project's package.json), so they are no longer rejected
@@ -2251,7 +2267,7 @@ fn should_suppress_update_banner(is_self_update_command: bool) -> bool {
     is_self_update_command
 }
 
-/// Phase 34.2: spawn a detached child process to refresh the update cache.
+/// spawn a detached child process to refresh the update cache.
 ///
 /// The child re-execs the current binary with `internal-update-check`.
 /// The parent never waits — the child is fully detached (setsid on Unix)
@@ -2311,17 +2327,30 @@ fn main() -> Result<()> {
     // allocator for the entire process lifetime and flushes on drop.
     #[cfg(feature = "dhat-heap")]
     let _dhat = dhat::Profiler::new_heap();
+
+    // Color policy must initialize BEFORE any styled output, including
+    // the `--version` fast path (which prints an `update_check` notice)
+    // and the bare-`lpm install` fast lane below (which prints a header
+    // and a success line). Both run pre-clap, so we pre-scan argv for
+    // `--color=<v>` to honor the flag without waiting for `Cli::parse`.
+    // `clap` will validate the value later under its `value_enum`
+    // contract; an unknown value here just falls back to env + TTY
+    // detection until clap surfaces the typo.
+    color_policy::init(color_policy::peek_color_choice_from_argv(
+        std::env::args_os(),
+    ));
+
     if argv_requests_top_level_version(std::env::args_os()) {
         print_version_with_notice();
         return Ok(());
     }
 
-    // ── Phase 34.1: sync fast lane ──────────────────────────────────
+    // ── sync fast lane ──────────────────────────────────
     // If this is a bare `lpm install` (or `lpm i`) with no disqualifying
     // flags and the project is already up to date, exit immediately
     // without starting tokio, clap, tracing, or auth.
     //
-    // Phase 44: package.json is read at most ONCE on the fast lane —
+    // package.json is read at most ONCE on the fast lane —
     // shared between the workspace-root check and the install-state
     // check. The install-state check also tries an mtime short-circuit
     // first, which skips both the lpm.lock read and the SHA-256 pass
@@ -2369,12 +2398,11 @@ fn main() -> Result<()> {
     // ── Normal async path ───────────────────────────────────────────
     // `LPM_MAX_BLOCKING_THREADS=<N>` is an opt-in diagnostic hook for
     // A/B benching the tokio blocking-pool size without a rebuild —
-    // same pattern Phase 57 used for `LPM_SKIP_SECURITY=1`. Phase 57.1
-    // measured this lever (n=20 paired, 3 cells) and found capping has
+    // same pattern used for `LPM_SKIP_SECURITY=1`.     // measured this lever (n=20 paired, 3 cells) and found capping has
     // **no measurable wall-clock effect** on `bench/fixture-large`:
     // the parked-worker `__psynch_cvwait` samples in the close-out
     // flamegraph are off the critical path. Default behavior preserves
-    // tokio's unbounded blocking pool. See the Phase 57.1 close-out doc
+    // tokio's unbounded blocking pool. See the close-out doc
     // for methodology and the negative result.
     let mut runtime_builder = tokio::runtime::Builder::new_multi_thread();
     runtime_builder.enable_all();
@@ -2405,6 +2433,13 @@ async fn async_main() -> Result<()> {
 
     let cli = Cli::parse();
 
+    // Color policy is already initialized at the top of `fn main()` via
+    // the argv pre-scan. Re-run init here so any difference between the
+    // pre-scan's flag detection and clap's parsed value (e.g., the user
+    // wrote `--color always` and the pre-scan failed for an unrelated
+    // reason) is resolved in clap's favor. `set_enabled` is idempotent.
+    color_policy::init(Some(cli.color));
+
     // Version flag short-circuit. Replaces clap's auto `-V` handler so we
     // can both (a) honour `-v` as an alias and (b) append the cached
     // "update available" notice. Runs before tracing setup / subcommand
@@ -2429,7 +2464,7 @@ async fn async_main() -> Result<()> {
 
     // Set up tracing based on verbosity.
     //
-    // **Phase 32 Phase 4 audit fix (D-impl-3, 2026-04-11):** the writer is
+    // the writer is
     // pinned to STDERR. Pre-fix this used `tracing_subscriber::fmt()`'s
     // default writer, which is STDOUT — meaning ANY `tracing::warn!` or
     // `tracing::info!` from anywhere in the CLI corrupted the `--json`
@@ -2442,11 +2477,11 @@ async fn async_main() -> Result<()> {
     } else {
         "lpm=warn"
     };
-    // **Trial 4 (2026-05-13):** when built with `--features tracy`, layer
+    // **Trial 4 :** when built with `--features tracy`, layer
     // a `TracyLayer` alongside the stderr fmt layer so the install
     // pipeline's `tracing::span!` instrumentation lands in the Tracy GUI.
     // Layered subscribers preserve the existing stderr logging contract
-    // (D-impl-3) — Tracy is purely additive.
+    // () — Tracy is purely additive.
     {
         use tracing_subscriber::layer::SubscriberExt as _;
         use tracing_subscriber::util::SubscriberInitExt as _;
@@ -2476,11 +2511,11 @@ async fn async_main() -> Result<()> {
         .as_deref()
         .unwrap_or(lpm_common::DEFAULT_REGISTRY_URL);
 
-    // Phase 35: lazy auth. Build the SessionManager from purely local
+    // lazy auth. Build the SessionManager from purely local
     // state — no network calls. Refresh is deferred to the first
     // auth-required operation, handled inside `RegistryClient` request
     // methods (Step 4). The eager `try_silent_refresh` + 24h `whoami`
-    // block that lived here pre-Phase-35 is gone.
+    // block that lived here pre-existing is gone.
     //
     // `cli.token` carries either an explicit `--token` value or the
     // `LPM_TOKEN` env (clap merges them). When the value matches
@@ -2512,7 +2547,7 @@ async fn async_main() -> Result<()> {
         client = client.with_token(bearer);
     }
 
-    // Phase 37 M3.1d: run global recovery before any command that reads
+    // run global recovery before any command that reads
     // or writes ~/.lpm/global/ state. Skipped for read-only commands
     // (`--help`, `--version`, plain project install) so path
     // construction stays side-effect-free for the common case. Idempotent
@@ -2520,7 +2555,7 @@ async fn async_main() -> Result<()> {
     if command_needs_global_state(&command)
         && let Ok(root) = lpm_common::LpmRoot::from_env()
     {
-        // Phase 37 M0 (rev 6): one-time warning when $LPM_HOME sits on
+        // one-time warning when $LPM_HOME sits on
         // NFS/SMB/CIFS — advisory locks on those filesystems are
         // famously unreliable and the install transaction's atomicity
         // guarantees degrade. Suppressed by a marker file after the
@@ -2551,7 +2586,7 @@ async fn async_main() -> Result<()> {
                             lpm_global::ReconciliationOutcome::AlreadyCommitted => {
                                 // Manifest was at the committed state
                                 // but the WAL never got the COMMIT
-                                // record (Case A from the M3.1 audit).
+                                // record (Case A from the audit).
                                 // We just emitted the missing COMMIT —
                                 // nothing user-visible changed.
                                 tracing::debug!(
@@ -2571,7 +2606,7 @@ async fn async_main() -> Result<()> {
                                 // user — they're typically transient
                                 // (Windows AV holding a file) but the
                                 // user should know there's pending
-                                // cleanup. Audit Medium from M3.3.
+                                // cleanup. Audit Medium.
                                 output::warn(&format!(
                                     "global recovery deferred tx for '{}': {}",
                                     tx.package, reason
@@ -2599,7 +2634,7 @@ async fn async_main() -> Result<()> {
     // sees the banner.
     let is_self_update_command = matches!(command, Commands::SelfUpdate { .. });
 
-    // Finding #76: wrap the entire dispatch in an async block so every
+    // wrap the entire dispatch in an async block so every
     // `?` inside a match arm body propagates to THIS block's
     // `Result<(), LpmError>` — and from there into `result`, where the
     // top-level `--json` envelope handler renders it. Pre-fix, a `?`
@@ -2676,11 +2711,10 @@ async fn async_main() -> Result<()> {
             paranoid,
             no_sandbox,
         } => {
-            // Phase 37 M3.2: route `lpm install --global` / `-g` to
-            // the persistent IsolatedInstall pipeline. M3.2 ships
-            // fresh-install only (no upgrade); upgrade lands in M3.4.
-            // Collision resolution lands in M4. The pipeline takes
-            // care of the three-phase tx (Intent + slow install +
+            // Route `lpm install --global` / `-g` to the persistent
+            // IsolatedInstall pipeline. Supports fresh install, upgrade,
+            // and collision resolution. The pipeline takes care of the
+            // three-phase tx (Intent + slow install +
             // commit) and the recovery hook above already handled
             // any prior crashed install for this command's package.
             if global {
@@ -2694,8 +2728,8 @@ async fn async_main() -> Result<()> {
                 if packages.len() > 1 {
                     return Err(lpm_common::LpmError::Script(format!(
                         "`lpm install --global` accepts a single package per invocation \
-                         in M3.2 (got {}). Run it once per package, or wait for the M3.4 \
-                         multi-target update path.",
+                         (got {}). Run it once per package, or use \
+                         `lpm global update` for multi-package upgrades.",
                         packages.len()
                     )));
                 }
@@ -2708,7 +2742,7 @@ async fn async_main() -> Result<()> {
                     fail_if_no_match,
                     yes,
                 )?;
-                // Phase 37 M4: parse collision-resolution flags. Syntactic
+                // parse collision-resolution flags. Syntactic
                 // validation only (no lookup against marker commands —
                 // that happens at commit time with authoritative data).
                 let resolution = commands::install_global::CollisionResolution::parse_from_flags(
@@ -2726,7 +2760,7 @@ async fn async_main() -> Result<()> {
                     exact,
                     tilde,
                     save_prefix,
-                ); // M3.2 honors none of these yet; M3.4 will wire selected flags.
+                ); // not wired for global install; ignored for now.
 
                 let overrides = build_install_global_overrides(
                     allow_new,
@@ -2749,7 +2783,7 @@ async fn async_main() -> Result<()> {
                 .await;
             }
 
-            // M4 audit Finding 2: reject collision-resolution flags on
+            // Audit: Finding 2: reject collision-resolution flags on
             // the non-global install path. These flags only make sense
             // for `-g` installs (the global command-shim system is the
             // ONLY surface that can collide — project installs write
@@ -2782,7 +2816,7 @@ async fn async_main() -> Result<()> {
             // invocation honors the root's `lpm.engineStrict` opt-out.
             engine_check::enforce(&cwd, no_engine_strict, cli.json)?;
 
-            // Phase 46 P3: parse `--min-release-age=<dur>` once, at the
+            //: parse `--min-release-age=<dur>` once, at the
             // clap layer, so invalid input surfaces before any install
             // work starts. `None` means the flag was absent and the
             // resolver walks the full precedence chain inside
@@ -2792,9 +2826,9 @@ async fn async_main() -> Result<()> {
                 None => None,
             };
 
-            // Phase 46 P4 Chunk 4: canonicalize
+            // canonicalize
             // `--ignore-provenance-drift <pkg>` + `--ignore-provenance-drift-all`
-            // into a single policy enum. Per Q2 of the P4 kickoff,
+            // into a single policy enum. Per Q2 of the kickoff,
             // `-all` supersedes the per-package list — no clap
             // mutex, just collapse internally.
             let drift_ignore_policy = provenance_fetch::DriftIgnorePolicy::from_cli(
@@ -2802,11 +2836,11 @@ async fn async_main() -> Result<()> {
                 ignore_provenance_drift_all,
             );
 
-            // Phase 46 P1: resolve the effective script-policy through
+            //: resolve the effective script-policy through
             // the precedence chain (CLI > package.json > global >
             // default). Clap enforces mutual exclusion between the
             // three flags, so `collapse_policy_flags` only needs to
-            // validate the `--policy` string payload. In P1 the
+            // validate the `--policy` string payload. In the
             // resolved value is logged but not yet branched on — the
             // actual tier-aware execution change lands with the
             // sandbox in a later phase.
@@ -2822,7 +2856,7 @@ async fn async_main() -> Result<()> {
             // anyway — audit v3 Finding 1).
             let script_policy_cfg =
                 script_policy_config::ScriptPolicyConfig::from_package_json(&cwd);
-            // Phase 46 P2 Chunk 5: preserve the collapsed CLI override
+            // preserve the collapsed CLI override
             // separately so we can forward it to install entry points
             // that re-resolve against a workspace member's config.
             // `effective_script_policy` below is the CWD-level view
@@ -2849,7 +2883,7 @@ async fn async_main() -> Result<()> {
                 ));
             }
 
-            // Phase 33: build the SaveFlags struct from the per-command CLI
+            // build the SaveFlags struct from the per-command CLI
             // overrides. clap already enforces mutual exclusion between
             // `--exact`, `--tilde`, and `--save-prefix`, so at most one of
             // these is set. `--save-prefix` strings are validated here so
@@ -2865,7 +2899,7 @@ async fn async_main() -> Result<()> {
             };
 
             if packages.is_empty() {
-                // Phase 32 Phase 2: --filter / -w / --fail-if-no-match only
+                // --filter / -w / --fail-if-no-match only
                 // apply when adding packages. Bare `lpm install` is the
                 // refresh-from-package.json operation and ignores them
                 // (or hard-errors if the user mistakenly passed them).
@@ -2877,7 +2911,7 @@ async fn async_main() -> Result<()> {
                             .into(),
                     ))
                 } else {
-                    // Bare install path — unchanged from pre-Phase-2.
+                    // Bare install path.
                     let eff_no_skills = no_skills || cfg.get_bool("noSkills").unwrap_or(false);
                     let eff_no_editor =
                         no_editor_setup || cfg.get_bool("noEditorSetup").unwrap_or(false);
@@ -2912,7 +2946,7 @@ async fn async_main() -> Result<()> {
                         advisor.clone(),
                         min_release_age_override,
                         drift_ignore_policy,
-                        // Phase 46.1 rework: collapse `--strict-sandbox`
+                        // collapse `--strict-sandbox`
                         // and its `--paranoid` alias into a single bool
                         // before the resolver (the chain inside
                         // `rebuild::run` already accepts a single
@@ -2923,7 +2957,7 @@ async fn async_main() -> Result<()> {
                     .await
                 }
             } else if !filter.is_empty() || workspace_root {
-                // Phase 32 Phase 2: explicit filter or -w flag → workspace-aware path.
+                // explicit filter or -w flag → workspace-aware path.
                 commands::install::run_install_filtered_add(
                     &client,
                     &cwd,
@@ -2951,8 +2985,7 @@ async fn async_main() -> Result<()> {
                 // resolution — so we ALWAYS prefer it for workspace mode.
                 // For pure standalone projects with NO workspace, the
                 // legacy `run_add_packages` is still preferred because it
-                // handles per-package Swift (SE-0292) routing, which Phase 2
-                // intentionally defers from the workspace path.
+                // handles per-package Swift (SE-0292) routing, which                 // intentionally defers from the workspace path.
                 let workspace = lpm_workspace::discover_workspace(&cwd).ok().flatten();
                 if workspace.is_some() {
                     commands::install::run_install_filtered_add(
@@ -3005,7 +3038,7 @@ async fn async_main() -> Result<()> {
             yes,
             global,
         } => {
-            // Phase 37 M3.3: `lpm uninstall -g <pkg>` routes to the
+            // `lpm uninstall -g <pkg>` routes to the
             // global uninstall pipeline. Project flags are mutually
             // exclusive with -g — no `--filter` / `-w` /
             // `--fail-if-no-match` for global ops since there's no
@@ -3021,7 +3054,7 @@ async fn async_main() -> Result<()> {
                 } else if packages.len() > 1 {
                     Err(lpm_common::LpmError::Script(format!(
                         "`lpm uninstall --global` accepts a single package per invocation \
-                         in M3.3 (got {}). Run it once per package.",
+                         (got {}). Run it once per package.",
                         packages.len()
                     )))
                 } else if let Err(error) = validate_global_uninstall_project_scoped_flags(
@@ -3497,12 +3530,12 @@ async fn async_main() -> Result<()> {
             if !dry_run {
                 engine_check::enforce(&cwd, no_engine_strict, cli.json)?;
             }
-            // Phase 46 P1: resolve the effective script-policy through
+            //: resolve the effective script-policy through
             // the precedence chain. Clap already enforced mutual-
             // exclusion between `--policy`, `--yolo`, `--triage`, so
             // at most one of the three is set per invocation.
             // `lpm rebuild` itself does not branch on the resolved value
-            // in P1 — tier-aware execution lands with the sandbox in
+            // in — tier-aware execution lands with the sandbox in
             // a later phase. Loading the config here also surfaces
             // typos in `package.json > lpm > scriptPolicy` instead of
             // silently falling through (audit Finding 2). Warning
@@ -3541,19 +3574,19 @@ async fn async_main() -> Result<()> {
                 cli.json,
                 deny_all,
                 no_sandbox,
-                // Phase 46.1 rework: `--paranoid` is a clap alias for
+                // `--paranoid` is a clap alias for
                 // `--strict-sandbox`. Either form sets the strict flag
                 // before flowing into `resolve_sandbox_mode_from_chain`.
                 strict_sandbox || paranoid,
                 sandbox_log,
-                // Phase 46 P6 Chunk 1: pass the resolved effective
+                // pass the resolved effective
                 // policy through. Previously `effective` was computed
                 // only for the typo-warning + debug log above and
-                // never reached `rebuild::run`; Chunk 1 closes that gap
-                // so Chunk 2 can consult it for green-tier promotion
+                // never reached `rebuild::run`; closes that gap
+                // so can consult it for green-tier promotion
                 // without another signature change.
                 effective,
-                // Phase 46 slice 1: standalone `lpm rebuild` has no
+                // standalone `lpm rebuild` has no
                 // install-time advisor context — only the trust
                 // manifest authorises execution here. The ephemeral
                 // advisor approvals live exclusively on the install
@@ -3562,13 +3595,27 @@ async fn async_main() -> Result<()> {
             )
             .await
         }
-        Commands::Doctor { fix, yes, action } => match action {
+        Commands::Doctor {
+            all,
+            fix,
+            yes,
+            action,
+        } => match action {
             Some(DoctorAction::List { code, category }) => {
                 commands::doctor::list(cli.json, code.as_deref(), category.as_deref())
             }
             None => {
                 let cwd = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;
-                commands::doctor::run(&client, registry_url, &cwd, cli.json, fix || yes, yes).await
+                commands::doctor::run(
+                    &client,
+                    registry_url,
+                    &cwd,
+                    cli.json,
+                    all,
+                    fix || yes,
+                    yes,
+                )
+                .await
             }
         },
         Commands::SwiftRegistry { force } => {
@@ -3720,7 +3767,7 @@ async fn async_main() -> Result<()> {
             dry_run,
         } => {
             if global {
-                // Phase 37 M5: global-scoped approve-scripts reads the
+                // global-scoped approve-scripts reads the
                 // aggregate across every `lpm install -g` install root
                 // and writes approvals to
                 // `~/.lpm/global/trusted-dependencies.json`. `--group`
@@ -3952,7 +3999,7 @@ async fn async_main() -> Result<()> {
             let https_from_config = lpm_config.as_ref().and_then(|c| c.https).unwrap_or(false);
             let https = (https || https_from_config) && !no_https;
 
-            // Resolve token if tunnel is enabled. Phase 35: go through
+            // Resolve token if tunnel is enabled. go through
             // the SessionManager attached to `client`, so the
             // refresh-only-state recovery (audit fix #1) and the
             // session-source classification both apply. `tunnel` is a
@@ -4046,7 +4093,7 @@ async fn async_main() -> Result<()> {
             args,
         } => {
             let cwd = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;
-            // Phase 35: tunnel requires a session-backed login (same
+            // tunnel requires a session-backed login (same
             // contract as `dev --tunnel` above). The session is
             // attached to `client` from main.rs; ask it for a
             // `SessionRequired` bearer.
@@ -4124,7 +4171,7 @@ async fn async_main() -> Result<()> {
         Commands::Completions { shell } => commands::completions::run(shell),
         Commands::Schema { kind, out } => commands::schema::run(&kind, out.as_deref()),
         Commands::InternalUpdateCheck => {
-            // Phase 34.2: hidden subcommand — unconditionally refresh the
+            // hidden subcommand — unconditionally refresh the
             // update cache. The parent already checked is_stale() before
             // spawning this. Runs in a detached child process.
             //
@@ -4168,7 +4215,7 @@ async fn async_main() -> Result<()> {
         eprint!("{notice}");
     }
 
-    // Phase 34.2: spawn a detached child process to refresh the update cache
+    // spawn a detached child process to refresh the update cache
     // if stale. The parent never waits for it — command exit is immediate.
     // The staleness check is sync (file stat + timestamp comparison).
     if update_check::is_stale() {
@@ -4221,7 +4268,7 @@ mod tests {
     use super::*;
     use clap::Parser;
 
-    // ─── Phase 37 audit follow-up: -v / -V / --version + verbose ───
+    // ─── audit follow-up: -v / -V / --version + verbose ───
     //
     // Pins the user-visible contract:
     // - `-v`, `-V`, `--version` all set `cli.version` (no missing-
@@ -4324,7 +4371,7 @@ mod tests {
 
     #[test]
     fn lowercase_v_after_subcommand_is_version_not_verbose() {
-        // Intentional behaviour change: pre-Phase 37 audit, `-v` was
+        // Intentional behaviour change: pre-audit, `-v` was
         // the short for `--verbose`. It is now `--version`'s alias,
         // matching npm/pnpm/yarn. Anyone scripting `lpm <cmd> -v`
         // for verbose output must switch to `--verbose`.
@@ -4381,7 +4428,7 @@ mod tests {
         print_version_with_notice();
     }
 
-    // ─── Phase 37 M3.1d: command_needs_global_state predicate ─────
+    // ─── command_needs_global_state predicate ─────
 
     fn parse(args: &[&str]) -> Commands {
         Cli::try_parse_from(args)
@@ -4496,7 +4543,7 @@ mod tests {
         ])));
     }
 
-    // -- Finding #1: CLI parser must handle `lpm run build` without `--` --
+    // -- CLI parser must handle `lpm run build` without `--` --
 
     #[test]
     fn run_single_script_parses() {
@@ -4586,7 +4633,7 @@ mod tests {
         }
     }
 
-    // ── Phase 32 Phase 1 M7: --filter as Vec<String> + --fail-if-no-match ──
+    // ── --filter as Vec<String> + --fail-if-no-match ──
 
     #[test]
     fn run_filter_flag_collects_into_vec() {
@@ -4638,7 +4685,7 @@ mod tests {
         assert!(result.is_err(), "--all and --affected must conflict");
     }
 
-    // ── Phase 32 Phase 1 M7: lpm filter subcommand ────────────────────────
+    // ── lpm filter subcommand ────────────────────────
 
     #[test]
     fn filter_command_parses_positional_exprs() {
@@ -4696,7 +4743,7 @@ mod tests {
         assert!(result.is_err(), "empty exprs must be rejected");
     }
 
-    // ── Phase 32 Phase 2 M2: install --filter / -w / --fail-if-no-match ──
+    // ── install --filter / -w / --fail-if-no-match ──
 
     #[test]
     fn install_filter_flag_collects_into_vec() {
@@ -4805,8 +4852,7 @@ mod tests {
 
     #[test]
     fn install_bare_with_no_packages_and_no_phase2_flags_parses() {
-        // Sanity: `lpm install` with no flags must still parse — Phase 2
-        // does not break the bare-refresh path.
+        // Sanity: `lpm install` with no flags must still parse —         // does not break the bare-refresh path.
         let cli = Cli::try_parse_from(["lpm", "install"]).unwrap();
         match cli.command.expect("test parse missing subcommand") {
             Commands::Install {
@@ -4862,7 +4908,7 @@ mod tests {
         }
     }
 
-    // Phase 68: the previous Phase 46 P3/P4 tests that pinned validator
+    // the previous/P4 tests that pinned validator
     // rejections for `--allow-new`, `--min-release-age`, and
     // `--ignore-provenance-drift[-all]` on `-g` are removed because
     // those flags are now FORWARDED into the global install pipeline.
@@ -4870,7 +4916,7 @@ mod tests {
     // in `tests/workflows/tests/install_global_drift.rs` and
     // `tests/workflows/tests/install_global_policy.rs`.
 
-    /// Confirm the Phase 68 contract on the validator's surface area:
+    /// Confirm the contract on the validator's surface area:
     /// the four flags previously rejected on `-g` are now accepted by
     /// the validator, and `-y` remains the project-only flag it
     /// rejects.
@@ -4890,7 +4936,7 @@ mod tests {
         validate_global_install_project_scoped_flags(false, &[], false, false, false).unwrap();
     }
 
-    // ── Phase 68 forwarding regression tests ─────────────────────────
+    // ── forwarding regression tests ─────────────────────────
     //
     // These tests pin the wiring between CLI args and
     // `InstallGlobalOverrides`. A regression that drops any of the
@@ -4903,7 +4949,7 @@ mod tests {
     use crate::provenance_fetch::DriftIgnorePolicy;
     use crate::script_policy_config::ScriptPolicy;
 
-    // ── Phase 46 slice 1 close-out — `--advisor` clap validator ────
+    // ── `--advisor` clap validator ────
     //
     // Locks the parser contract for the CLI flag wired in this slice:
     // every known provider slug + the explicit `"none"` opt-out are
@@ -5156,7 +5202,7 @@ mod tests {
         );
     }
 
-    // ── Phase 32 Phase 2 M3: uninstall --filter / -w / --fail-if-no-match ──
+    // ── uninstall --filter / -w / --fail-if-no-match ──
 
     #[test]
     fn uninstall_filter_flag_collects_into_vec() {
@@ -5279,7 +5325,7 @@ mod tests {
 
     #[test]
     fn uninstall_visible_alias_un_still_works() {
-        // The pre-Phase-2 visible alias `un` must continue to parse with
+        // The pre-existing visible alias `un` must continue to parse with
         // the new flags.
         let cli = Cli::try_parse_from(["lpm", "un", "foo", "-w"]).unwrap();
         match cli.command.expect("test parse missing subcommand") {
@@ -5295,7 +5341,7 @@ mod tests {
         }
     }
 
-    // ── Phase 32 Phase 3 M1: lpm deploy ────────────────────────────────────
+    // ── lpm deploy ────────────────────────────────────
 
     #[test]
     fn deploy_command_parses_required_output_and_filter() {
@@ -5318,7 +5364,7 @@ mod tests {
 
     #[test]
     fn deploy_command_filter_can_be_glob_or_path() {
-        // The filter expression supports the full Phase 1 grammar.
+        // The filter expression supports the full grammar.
         let cli =
             Cli::try_parse_from(["lpm", "deploy", "/prod/web", "--filter", "@scope/web"]).unwrap();
         match cli.command.expect("test parse missing subcommand") {
@@ -5376,7 +5422,7 @@ mod tests {
     fn deploy_command_filter_can_be_passed_multiple_times() {
         // Even though deploy will hard-error at runtime if more than one
         // member matches, the CLI parser must accept multiple --filter
-        // flags. The single-member assertion happens in M2, not at parse time.
+        // flags. The single-member assertion happens in `resolve_deploy_target`, not at parse time.
         let cli = Cli::try_parse_from([
             "lpm",
             "deploy",
@@ -5537,12 +5583,12 @@ mod tests {
 
     #[test]
     fn rebuild_no_sandbox_is_single_flag() {
-        // Phase 46.1 rework (2026-05-11): `--no-sandbox` collapsed the
-        // legacy `--unsafe-full-env` partner per Q6 — single flag drops
+        // `--no-sandbox` collapsed the
+        // legacy `--unsafe-full-env` partner — single flag drops
         // BOTH containment AND env scrubbing. No deprecation alias per
         // beta-cleanup policy.
         let cli = Cli::try_parse_from(["lpm", "rebuild", "--no-sandbox"])
-            .expect("`--no-sandbox` should parse standalone after Phase 46.1 rework");
+            .expect("`--no-sandbox` should parse standalone after rework");
         match cli.command.expect("test parse missing subcommand") {
             Commands::Rebuild { no_sandbox, .. } => {
                 assert!(no_sandbox, "--no-sandbox should set no_sandbox=true");
@@ -5554,13 +5600,13 @@ mod tests {
         let result = Cli::try_parse_from(["lpm", "rebuild", "--unsafe-full-env"]);
         assert!(
             result.is_err(),
-            "`--unsafe-full-env` must be removed entirely (Phase 46.1 rework Q6)"
+            "`--unsafe-full-env` must be removed entirely (rework "
         );
     }
 
     #[test]
     fn rebuild_strict_sandbox_and_no_sandbox_are_mutually_exclusive() {
-        // Phase 46.1 rework: opting INTO containment (`--strict-sandbox`
+        // opting INTO containment (`--strict-sandbox`
         // / `--paranoid`) and opting OUT entirely (`--no-sandbox`)
         // cannot coexist on the same command.
         let result = Cli::try_parse_from(["lpm", "rebuild", "--strict-sandbox", "--no-sandbox"]);
@@ -5615,7 +5661,7 @@ mod tests {
 
     #[test]
     fn install_sandbox_mode_flags_parse() {
-        // Phase 46.1 rework: install gains the same trio. Strict and
+        // install gains the same trio. Strict and
         // paranoid are aliases; both conflict with --no-sandbox.
         let cli = Cli::try_parse_from(["lpm", "install", "--strict-sandbox"])
             .expect("`lpm install --strict-sandbox` should parse");
@@ -5969,7 +6015,7 @@ mod tests {
         }
     }
 
-    // ── Phase 37 M4.1: install -g collision-resolution flags ───────────
+    // ── install -g collision-resolution flags ───────────
 
     #[test]
     fn install_global_replace_bin_flag_collects_to_vec() {
@@ -6061,7 +6107,7 @@ mod tests {
         }
     }
 
-    /// M4 audit pass 1 Finding 2: clap must still ACCEPT the flags on
+    /// Audit: pass 1 Finding 2: clap must still ACCEPT the flags on
     /// the non-global path (we reject them at dispatch, not at parse).
     /// This pins the parse-layer surface so a future change to clap's
     /// constraints doesn't accidentally reject at parse time (which

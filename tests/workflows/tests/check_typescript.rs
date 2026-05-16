@@ -59,7 +59,7 @@ fn doctor_emits_typescript_healthy_when_local_tsc_resolves() {
     make_local_tsc(&project, "");
 
     let output = lpm_with_registry(&project, "http://127.0.0.1:1")
-        .args(["doctor", "--json"])
+        .args(["doctor", "--all", "--json"])
         .output()
         .expect("failed to run lpm doctor --json");
 
@@ -83,7 +83,7 @@ fn doctor_emits_typescript_unavailable_when_declared_but_not_installed() {
         // Strip PATH so no system tsc is reachable — guarantees the
         // unavailable branch even on a developer machine.
         .env("PATH", "")
-        .args(["doctor", "--json"])
+        .args(["doctor", "--all", "--json"])
         .output()
         .expect("failed to run lpm doctor --json");
 
@@ -110,7 +110,7 @@ fn doctor_emits_typescript_unavailable_when_dep_not_declared() {
 
     let output = lpm_with_registry(&project, "http://127.0.0.1:1")
         .env("PATH", "")
-        .args(["doctor", "--json"])
+        .args(["doctor", "--all", "--json"])
         .output()
         .expect("failed to run lpm doctor --json");
 
@@ -136,7 +136,7 @@ fn doctor_emits_no_typescript_check_when_no_tsconfig_anywhere() {
 
     let output = lpm_with_registry(&project, "http://127.0.0.1:1")
         .env("PATH", "")
-        .args(["doctor", "--json"])
+        .args(["doctor", "--all", "--json"])
         .output()
         .expect("failed to run lpm doctor --json");
 
@@ -173,7 +173,7 @@ fn doctor_emits_per_member_typescript_checks_in_workspace() {
     make_local_tsc(&project, "");
 
     let output = lpm_with_registry(&project, "http://127.0.0.1:1")
-        .args(["doctor", "--json"])
+        .args(["doctor", "--all", "--json"])
         .output()
         .expect("failed to run lpm doctor --json");
 

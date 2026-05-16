@@ -1,4 +1,4 @@
-//! Phase 46 P1 — `lpm trust` user-facing subcommands.
+//! — `lpm trust` user-facing subcommands.
 //!
 //! Two subcommands, both operating on
 //! `<project_dir>/package.json > lpm > trustedDependencies` plus (for
@@ -9,7 +9,7 @@
 //!
 //! Read-only inspection of how the current manifest's trust bindings
 //! differ from the last install's snapshot. The install pipeline
-//! emits a brief notice for additions (plan §4.2); this command
+//! emits a brief notice for additions; this command
 //! gives the full picture — additions, removals, and same-key
 //! binding changes — so the user can investigate before running
 //! another install.
@@ -19,7 +19,7 @@
 //! Remove stale `trustedDependencies` entries — ones whose package
 //! name no longer appears in the resolved tree (lockfile). Useful
 //! after removing a dependency: the approval entry lingers in
-//! `package.json` forever otherwise (pre-Phase-46, `lpm rebuild`
+//! `package.json` forever otherwise (Previously, `lpm rebuild`
 //! emits a "stale trustedDependencies" warning; `prune` is the
 //! active fix).
 //!
@@ -33,8 +33,8 @@ use crate::output;
 use crate::trust_snapshot::{self, SnapshotEntry, TrustSnapshot};
 use clap::Subcommand;
 use lpm_common::LpmError;
+use lpm_common::color::Painted;
 use lpm_workspace::{TrustedDependencies, TrustedDependencyBinding};
-use owo_colors::OwoColorize;
 use std::collections::BTreeMap;
 use std::path::Path;
 
@@ -43,7 +43,7 @@ use std::path::Path;
 /// Bumped independently of `build-state.json` / `trust-snapshot.json`
 /// schemas because this is a user-facing output contract consumed by
 /// agents and scripts. Same "only on breaking changes" discipline
-/// as elsewhere in Phase 46.
+/// as elsewhere in.
 pub const SCHEMA_VERSION: u32 = 1;
 
 /// `lpm trust <subcommand>`.
@@ -457,7 +457,7 @@ fn extract_trusted_dependencies(
         LpmError::Registry(format!(
             "package.json > lpm > trustedDependencies has invalid shape: {e}. \
              Valid forms: [\"name\", ...] (legacy) or \
-             {{\"name@version\": {{integrity, scriptHash}}}} (Phase 4+)."
+             {{\"name@version\": {{integrity, scriptHash}}}}."
         ))
     })
 }

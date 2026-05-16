@@ -1,4 +1,4 @@
-//! Save-spec decision logic for `lpm install` (Phase 33).
+//! Save-spec decision logic for `lpm install`.
 //!
 //! When `lpm install <pkg>` mutates `package.json`, this module decides what
 //! string lands in the manifest. The decision is a pure function of:
@@ -10,7 +10,7 @@
 //!   against the registry and lockfile; we feed the resolved
 //!   [`lpm_semver::Version`] back into the helper after resolution so the
 //!   `^resolvedVersion` default has a real number to work with. This is
-//!   load-bearing for Phase 33's "no `*` default" rule.
+//!   load-bearing for the "no `*` default" rule.
 //! - **CLI flags.** `--exact`, `--tilde`, and `--save-prefix` override the
 //!   default for the current invocation. See [`SaveFlags`].
 //! - **User config.** `save-prefix` and `save-exact` from
@@ -26,7 +26,7 @@
 //! 2. **CLI flag override** (`--exact`, `--tilde`, `--save-prefix`).
 //! 3. **Prerelease-exact safety.** If the resolved version is a prerelease
 //!    and no CLI flag forced something else, save the exact resolved version.
-//!    Phase 33's "Prerelease Policy" — prereleases should not auto-widen
+//!    the "Prerelease Policy" — prereleases should not auto-widen
 //!    under a forgotten `save-prefix` config setting.
 //! 4. **Config.** `save-exact = true`, then `save-prefix = "^|~|"`.
 //! 5. **Default.** `^resolvedVersion`.
@@ -35,6 +35,7 @@
 //! full policy table and rationale.
 
 use lpm_common::LpmError;
+use lpm_resolver::{Specifier, SpecifierParseError};
 use lpm_semver::{Version, VersionReq};
 
 // ─── Public API ─────────────────────────────────────────────────────
@@ -60,10 +61,10 @@ pub enum UserSaveIntent {
     /// (stable → caret default, prerelease → exact).
     DistTag(String),
     /// `lpm install zod@*` — explicit wildcard. Preserved as `*`.
-    /// Phase 33: `*` is **only** allowed when the user asked for it.
+    /// `*` is **only** allowed when the user asked for it.
     Wildcard,
     /// `workspace:*`, `workspace:^`, `workspace:~`, or `workspace:<range>`.
-    /// Always preserved verbatim. Phase 33 does not change workspace
+    /// Always preserved verbatim. does not change workspace
     /// protocol semantics.
     Workspace(String),
 }
@@ -84,7 +85,7 @@ impl SaveFlags {
     /// Whether any of the per-command flags is set. Used by the stage step
     /// to decide whether to rewrite an existing dep entry: bare reinstalls
     /// (no flags) leave existing entries alone, but explicit flag overrides
-    /// always force a rewrite per the Phase 33 "do rewrite when" rule.
+    /// always force a rewrite per the "do rewrite when" rule.
     pub fn forces_rewrite(&self) -> bool {
         self.exact || self.tilde || self.save_prefix.is_some()
     }
@@ -100,7 +101,7 @@ pub struct SaveConfig {
 
 /// The valid save prefixes — never `*`. `Empty` means "exact, no prefix".
 //
-// Phase 33: variants are constructed by `SavePrefix::parse` (called by the
+// variants are constructed by `SavePrefix::parse` (called by the
 // CLI flag parser in Step 5 and the config loader in Step 6). Until those
 // steps land, the helper is exercised only by tests, so the dead-code lint
 // flags the variants as unused. Safe to remove the allow once `--save-prefix`
@@ -199,14 +200,25 @@ pub struct SaveSpecDecision {
 /// 2. `workspace:...` → [`UserSaveIntent::Workspace`]
 /// 3. Parses as [`Version`] → [`UserSaveIntent::Exact`]
 /// 4. Parses as [`lpm_semver::VersionReq`] → [`UserSaveIntent::Range`]
-/// 5. Otherwise → [`UserSaveIntent::DistTag`] (npm allows arbitrary tag names)
-pub fn parse_user_save_intent(spec: &str) -> (String, UserSaveIntent) {
+/// 5. Otherwise → [`UserSaveIntent::DistTag`] (npm allows arbitrary tag names),
+///    UNLESS the token has a colon-shaped protocol prefix that
+///    [`Specifier::parse`] rejects as unknown — see
+///    [`classify_version_token`] for the contract.
+///
+/// Returns an error when the explicit version token after `@` carries
+/// an unknown package-specifier protocol (e.g. `foo@magic:bar`,
+/// `foo@filee:./bar`) or a Windows drive-letter shape
+/// (`foo@C:\path`). Pre-fix these silently became
+/// [`UserSaveIntent::DistTag`], causing the resolver to fall back to
+/// `latest` and rewrite `package.json` with the wrong dependency —
+/// silent corruption worse than the original confusing failure.
+pub fn parse_user_save_intent(spec: &str) -> Result<(String, UserSaveIntent), LpmError> {
     let (name, version_token) = split_name_and_version_token(spec);
     let intent = match version_token {
         None => UserSaveIntent::Bare,
-        Some(token) => classify_version_token(token),
+        Some(token) => classify_version_token(token)?,
     };
-    (name, intent)
+    Ok((name, intent))
 }
 
 /// Split a CLI install argument into `(name, Some(version_token))` or
@@ -241,25 +253,56 @@ fn split_name_and_version_token(spec: &str) -> (String, Option<&str>) {
 /// parse, then range parse, with dist-tag as the fallback for anything that
 /// doesn't parse as semver. This mirrors npm's CLI semantics — `latest`,
 /// `next`, `beta`, etc. are tags, never versions.
-fn classify_version_token(token: &str) -> UserSaveIntent {
+///
+/// Before the DistTag fallback fires, the token is validated against
+/// [`Specifier::parse`]. If the parser surfaces
+/// [`SpecifierParseError::UnknownProtocol`] or
+/// [`SpecifierParseError::WindowsDriveLetterPath`], propagate the error
+/// instead of silently falling through. Pre-fix the bug at the manifest
+/// layer (item #2 v1) only covered `package.json`-side specifiers;
+/// argv-side tokens (`lpm install foo@magic:bar`) silently became
+/// `DistTag("magic:bar")` and the resolver installed `latest` with a
+/// placeholder. GPT-audit follow-up plugs that gap.
+fn classify_version_token(token: &str) -> Result<UserSaveIntent, LpmError> {
     // Empty token after `@` (e.g. `zod@`) — treat as bare. This is a
     // degenerate user input but a valid one to recover from.
     if token.is_empty() {
-        return UserSaveIntent::Bare;
+        return Ok(UserSaveIntent::Bare);
     }
     if token == "*" {
-        return UserSaveIntent::Wildcard;
+        return Ok(UserSaveIntent::Wildcard);
     }
     if token.starts_with("workspace:") {
-        return UserSaveIntent::Workspace(token.to_string());
+        return Ok(UserSaveIntent::Workspace(token.to_string()));
     }
     if Version::parse(token).is_ok() {
-        return UserSaveIntent::Exact(token.to_string());
+        return Ok(UserSaveIntent::Exact(token.to_string()));
     }
     if VersionReq::parse(token).is_ok() {
-        return UserSaveIntent::Range(token.to_string());
+        return Ok(UserSaveIntent::Range(token.to_string()));
     }
-    UserSaveIntent::DistTag(token.to_string())
+    // Final check before DistTag: an unknown protocol (`magic:bar`) or a
+    // bare Windows drive letter (`C:\path`) would otherwise corrupt the
+    // install. Other Specifier shapes (NpmAlias, Git, Tarball, File,
+    // Link) are NOT promoted here — that's a wider CLI surface change
+    // (npm-CLI-parity aliases on the install line) and out of scope.
+    //
+    // The error message stays surface-neutral: `parse_user_save_intent`
+    // is shared by `lpm install`, `lpm add`, `lpm global install`, and
+    // `lpm global update`, and the offending token is already in the
+    // message — the user knows which command they ran. Earlier commits
+    // hardcoded "on the install command line" here, which read wrong
+    // under `lpm global update foo@magic:bar` (GPT-audit follow-up).
+    if let Err(
+        err @ (SpecifierParseError::UnknownProtocol { .. }
+        | SpecifierParseError::WindowsDriveLetterPath(_)),
+    ) = Specifier::parse(token)
+    {
+        return Err(LpmError::Registry(format!(
+            "invalid version token '{token}': {err}"
+        )));
+    }
+    Ok(UserSaveIntent::DistTag(token.to_string()))
 }
 
 /// Compute the spec to write into `package.json` for a single dependency.
@@ -275,7 +318,7 @@ pub fn decide_saved_dependency_spec(
 ) -> Result<SaveSpecDecision, LpmError> {
     // ── Tier 1: explicit user input wins everything. ─────────────
     // Wildcard, Workspace, Exact, and Range are all things the user
-    // concretely typed at the command line; per Phase 33's "preserve
+    // concretely typed at the command line; per the "preserve
     // explicit user intent" rule we never reinterpret them, regardless
     // of flags or config.
     match intent {
@@ -334,8 +377,7 @@ pub fn decide_saved_dependency_spec(
 
     // ── Tier 3: prerelease-exact safety. ─────────────────────────
     // Prereleases are inherently less stable; saving `^4.4.0-beta.2`
-    // invites surprise upgrades across unstable releases. Phase 33's
-    // "Prerelease Policy" makes this exact-by-default. Sits ABOVE
+    // invites surprise upgrades across unstable releases.  the     // "Prerelease Policy" makes this exact-by-default. Sits ABOVE
     // config so a forgotten `save-prefix = "^"` does not silently
     // widen prereleases.
     if resolved.is_prerelease() {
@@ -346,8 +388,7 @@ pub fn decide_saved_dependency_spec(
     }
 
     // ── Tier 4: persistent user config. ──────────────────────────
-    // `save-exact = true` wins over `save-prefix` per the Phase 33
-    // "Config interaction rule".
+    // `save-exact = true` wins over `save-prefix` per the     // "Config interaction rule".
     if config.save_exact {
         return Ok(SaveSpecDecision {
             spec_to_write: resolved.to_string(),
@@ -362,7 +403,7 @@ pub fn decide_saved_dependency_spec(
     }
 
     // ── Tier 5: built-in default. ────────────────────────────────
-    // `^resolvedVersion` — Phase 33's load-bearing change. Replaces
+    // `^resolvedVersion` — the load-bearing change. Replaces
     // the legacy `*` default.
     Ok(SaveSpecDecision {
         spec_to_write: format!("^{resolved}"),
@@ -374,6 +415,13 @@ pub fn decide_saved_dependency_spec(
 
 #[cfg(test)]
 mod tests {
+    /// Test helper: unwrap the `Result` for the happy paths that pre-date
+    /// the GPT-audit error variant. Keeps the existing test bodies tight
+    /// and routes new error-path tests through the raw `parse_user_save_intent`.
+    fn parse_user_save_intent_unwrap(spec: &str) -> (String, super::UserSaveIntent) {
+        super::parse_user_save_intent(spec).expect("test fixture: spec must parse")
+    }
+
     use super::*;
 
     fn v(s: &str) -> Version {
@@ -384,100 +432,162 @@ mod tests {
 
     #[test]
     fn parse_unscoped_bare() {
-        let (name, intent) = parse_user_save_intent("zod");
+        let (name, intent) = parse_user_save_intent_unwrap("zod");
         assert_eq!(name, "zod");
         assert_eq!(intent, UserSaveIntent::Bare);
     }
 
     #[test]
     fn parse_unscoped_exact() {
-        let (name, intent) = parse_user_save_intent("zod@4.3.6");
+        let (name, intent) = parse_user_save_intent_unwrap("zod@4.3.6");
         assert_eq!(name, "zod");
         assert_eq!(intent, UserSaveIntent::Exact("4.3.6".into()));
     }
 
     #[test]
     fn parse_unscoped_caret_range() {
-        let (name, intent) = parse_user_save_intent("zod@^4.3.0");
+        let (name, intent) = parse_user_save_intent_unwrap("zod@^4.3.0");
         assert_eq!(name, "zod");
         assert_eq!(intent, UserSaveIntent::Range("^4.3.0".into()));
     }
 
     #[test]
     fn parse_unscoped_tilde_range() {
-        let (name, intent) = parse_user_save_intent("zod@~4.3.6");
+        let (name, intent) = parse_user_save_intent_unwrap("zod@~4.3.6");
         assert_eq!(name, "zod");
         assert_eq!(intent, UserSaveIntent::Range("~4.3.6".into()));
     }
 
     #[test]
     fn parse_unscoped_x_range() {
-        let (name, intent) = parse_user_save_intent("zod@1.x");
+        let (name, intent) = parse_user_save_intent_unwrap("zod@1.x");
         assert_eq!(name, "zod");
         assert_eq!(intent, UserSaveIntent::Range("1.x".into()));
     }
 
     #[test]
     fn parse_unscoped_dist_tag_latest() {
-        let (name, intent) = parse_user_save_intent("zod@latest");
+        let (name, intent) = parse_user_save_intent_unwrap("zod@latest");
         assert_eq!(name, "zod");
         assert_eq!(intent, UserSaveIntent::DistTag("latest".into()));
     }
 
     #[test]
     fn parse_unscoped_dist_tag_beta() {
-        let (name, intent) = parse_user_save_intent("react@beta");
+        let (name, intent) = parse_user_save_intent_unwrap("react@beta");
         assert_eq!(name, "react");
         assert_eq!(intent, UserSaveIntent::DistTag("beta".into()));
     }
 
     #[test]
     fn parse_unscoped_explicit_wildcard() {
-        let (name, intent) = parse_user_save_intent("zod@*");
+        let (name, intent) = parse_user_save_intent_unwrap("zod@*");
         assert_eq!(name, "zod");
         assert_eq!(intent, UserSaveIntent::Wildcard);
     }
 
     #[test]
     fn parse_scoped_bare() {
-        let (name, intent) = parse_user_save_intent("@lpm.dev/owner.pkg");
+        let (name, intent) = parse_user_save_intent_unwrap("@lpm.dev/owner.pkg");
         assert_eq!(name, "@lpm.dev/owner.pkg");
         assert_eq!(intent, UserSaveIntent::Bare);
     }
 
     #[test]
     fn parse_scoped_exact() {
-        let (name, intent) = parse_user_save_intent("@lpm.dev/owner.pkg@1.2.3");
+        let (name, intent) = parse_user_save_intent_unwrap("@lpm.dev/owner.pkg@1.2.3");
         assert_eq!(name, "@lpm.dev/owner.pkg");
         assert_eq!(intent, UserSaveIntent::Exact("1.2.3".into()));
     }
 
     #[test]
     fn parse_scoped_caret_range() {
-        let (name, intent) = parse_user_save_intent("@scope/foo@^1.0.0");
+        let (name, intent) = parse_user_save_intent_unwrap("@scope/foo@^1.0.0");
         assert_eq!(name, "@scope/foo");
         assert_eq!(intent, UserSaveIntent::Range("^1.0.0".into()));
     }
 
     #[test]
     fn parse_scoped_workspace_star() {
-        let (name, intent) = parse_user_save_intent("@scope/foo@workspace:*");
+        let (name, intent) = parse_user_save_intent_unwrap("@scope/foo@workspace:*");
         assert_eq!(name, "@scope/foo");
         assert_eq!(intent, UserSaveIntent::Workspace("workspace:*".into()));
     }
 
     #[test]
     fn parse_scoped_workspace_caret() {
-        let (name, intent) = parse_user_save_intent("@scope/foo@workspace:^");
+        let (name, intent) = parse_user_save_intent_unwrap("@scope/foo@workspace:^");
         assert_eq!(name, "@scope/foo");
         assert_eq!(intent, UserSaveIntent::Workspace("workspace:^".into()));
     }
 
     #[test]
     fn parse_unscoped_workspace_exact_range() {
-        let (name, intent) = parse_user_save_intent("foo@workspace:1.2.3");
+        let (name, intent) = parse_user_save_intent_unwrap("foo@workspace:1.2.3");
         assert_eq!(name, "foo");
         assert_eq!(intent, UserSaveIntent::Workspace("workspace:1.2.3".into()));
+    }
+
+    // ─── GPT-audit follow-up: unknown protocol on the CLI argv token ────
+    //
+    // Pre-fix `parse_user_save_intent("foo@magic:bar")` returned
+    // `DistTag("magic:bar")` and the resolver fell back to `latest`,
+    // rewriting `package.json` to `"foo": "^1.0.0"` — silent corruption.
+    // Now the token is routed through `Specifier::parse`; UnknownProtocol
+    // and WindowsDriveLetterPath both propagate as an `LpmError::Registry`.
+
+    #[test]
+    fn parse_rejects_unknown_protocol_token() {
+        let err = super::parse_user_save_intent("foo@magic:bar").unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("magic:"),
+            "error must surface the offending prefix, got: {msg}"
+        );
+        assert!(
+            msg.contains("unknown package specifier protocol"),
+            "error must use the canonical phrasing, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn parse_suggests_file_for_filee_typo_token() {
+        let err = super::parse_user_save_intent("local@filee:./pkg").unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("Did you mean 'file:'"),
+            "Levenshtein suggestion must point to `file:`, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn parse_rejects_windows_drive_letter_token() {
+        let err = super::parse_user_save_intent(r"badpath@C:\path\to\dir").unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("Windows drive-letter path"),
+            "error must classify as Windows drive-letter, got: {msg}"
+        );
+        assert!(
+            msg.contains("file:"),
+            "error must hint at the `file:` prefix, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn parse_preserves_legitimate_dist_tags() {
+        // Regression guard: `latest`, `beta`, `next`, custom tags — none
+        // contain `:`, so the protocol guard never fires and they keep
+        // their `DistTag` classification.
+        for tag in ["latest", "beta", "next", "canary", "rc"] {
+            let spec = format!("foo@{tag}");
+            let (_, intent) = parse_user_save_intent_unwrap(&spec);
+            assert_eq!(
+                intent,
+                UserSaveIntent::DistTag(tag.into()),
+                "tag {tag:?} must classify as DistTag"
+            );
+        }
     }
 
     // ─── decide_saved_dependency_spec — matrix rows 1-11, 13 ────
@@ -682,7 +792,7 @@ mod tests {
     }
 
     /// Row 13: `0.x` bare install still gets a caret prefix.
-    /// Phase 33 explicitly does NOT diverge from the npm/pnpm convention here.
+    /// explicitly does NOT diverge from the npm/pnpm convention here.
     #[test]
     fn row13_zerox_bare_caret() {
         let decision = decide_saved_dependency_spec(

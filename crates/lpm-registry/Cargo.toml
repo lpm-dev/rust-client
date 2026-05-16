@@ -27,8 +27,8 @@ filetime = { workspace = true }
 secrecy = { workspace = true }
 dirs = { workspace = true }
 tempfile = "3"
-# Phase 58.3 (mTLS) — encrypted PKCS#8 private-key decryption +
-# TTY passphrase prompt. See `tls_identity.rs` for the loader.
+# Encrypted PKCS#8 private-key decryption + TTY passphrase prompt.
+# See `tls_identity.rs` for the loader.
 pkcs8 = { workspace = true }
 rpassword = { workspace = true }
 
@@ -37,10 +37,9 @@ tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 tempfile = "3"
 wiremock = "0.6"
 rcgen = "0.13"
-# Phase 58.1 day-4: hand-rolled TLS test server for the cafile/strict-ssl
-# 12-cell integration matrix. Versions match the transitive deps reqwest
-# brings in (tokio-rustls 0.26 / rustls 0.23) so we don't fork the
-# trust-store impl.
+# Hand-rolled TLS test server for the cafile/strict-ssl integration matrix.
+# Versions match the transitive deps reqwest brings in (tokio-rustls 0.26 /
+# rustls 0.23) so we don't fork the trust-store impl.
 tokio-rustls = "0.26"
 rustls = { version = "0.23", features = ["ring"] }
 time = "0.3"
