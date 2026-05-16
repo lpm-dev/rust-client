@@ -283,6 +283,170 @@ async fn audit_fail_on_behavior_does_not_trigger_on_vuln_alone() {
     );
 }
 
+// ─── Fail-on policies × behavior-tag triggers ──────────────────────────
+//
+// The earlier cases pin OSV-side policy gating. These cases pin the
+// BEHAVIORAL side: a package whose source contains `eval()` (high) or
+// obfuscated patterns (critical) must drive the policy switch the same
+// way an OSV vuln drives the vuln side. Behavioral findings come from
+// the client-side scanner in `lpm-security::behavioral`; node_modules
+// is seeded directly so no install / registry-batch round-trip is
+// involved.
+
+/// Seed a node_modules package with eval() in its source — triggers
+/// the high-severity behavior bucket.
+fn seed_eval_package(project: &TempProject, name: &str) {
+    seed_node_modules_package(
+        project,
+        name,
+        &[(
+            "index.js",
+            "module.exports = function (src) { return eval(src) }\n",
+        )],
+    );
+}
+
+/// Seed a node_modules package with deliberately-obfuscated source —
+/// hex-escaped string literals + `_0xAAAA` variable names match the
+/// `lpm-security` obfuscation heuristic (see supply_chain::detect_obfuscation).
+fn seed_obfuscated_package(project: &TempProject, name: &str) {
+    seed_node_modules_package(
+        project,
+        name,
+        &[(
+            "index.js",
+            "var _0x1a2b = \"\\x48\\x65\\x6c\\x6c\\x6f\";\nvar _0x3c4d = _0x1a2b;\nmodule.exports = _0x3c4d;\n",
+        )],
+    );
+}
+
+/// Wire `lpm audit` with `LPM_OSV_URL` pointed at a mock returning no
+/// vulns, so the test isolates the behavior-tag policy path.
+fn run_audit_no_osv(
+    project: &TempProject,
+    mock: &MockRegistry,
+    extra_args: &[&str],
+) -> std::process::Output {
+    let osv_url = format!("{}/v1/querybatch", mock.url());
+    let mut cmd = lpm(project);
+    cmd.env("LPM_OSV_URL", &osv_url);
+    cmd.arg("audit");
+    for arg in extra_args {
+        cmd.arg(arg);
+    }
+    cmd.output().expect("failed to spawn lpm audit")
+}
+
+/// `--fail-on=behavior` must fire on a HIGH-severity behavioral finding
+/// like eval(). Pins the positive case for the `Behavior` arm of
+/// `FailPolicy` (audit/mod.rs::should_fail).
+#[tokio::test]
+async fn audit_fail_on_behavior_triggers_on_local_eval_finding() {
+    let project = TempProject::empty(r#"{"name":"eval-host","version":"1.0.0"}"#);
+    seed_eval_package(&project, "eval-pkg");
+
+    let mock = MockRegistry::start().await;
+    // Audit will query OSV for non-@lpm.dev packages; return empty so
+    // the only failure trigger is the behavioral finding.
+    mock.with_osv_querybatch(vec![vec![]]).await;
+
+    let out = run_audit_no_osv(&project, &mock, &["--fail-on=behavior"]);
+    assert!(
+        !out.status.success(),
+        "--fail-on=behavior must fire when eval() is detected; stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+}
+
+/// `--fail-on=behavior` must also fire on CRITICAL behavioral findings
+/// (obfuscation / protestware / high-entropy strings). Critical and
+/// high go through different branches of `should_fail`; this case
+/// pins the critical branch.
+#[tokio::test]
+async fn audit_fail_on_behavior_triggers_on_local_obfuscation_finding() {
+    let project = TempProject::empty(r#"{"name":"obfu-host","version":"1.0.0"}"#);
+    seed_obfuscated_package(&project, "obfu-pkg");
+
+    let mock = MockRegistry::start().await;
+    mock.with_osv_querybatch(vec![vec![]]).await;
+
+    let out = run_audit_no_osv(&project, &mock, &["--fail-on=behavior"]);
+    assert!(
+        !out.status.success(),
+        "--fail-on=behavior must fire when obfuscation is detected; stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+}
+
+/// Default policy (no `--fail-on` flag) is `FailPolicy::All` but with a
+/// documented backward-compat carve-out: HIGH behavioral findings only
+/// trigger failure when `--fail-on` is EXPLICITLY specified. This pins
+/// that carve-out — a project with eval() but no `--fail-on` arg must
+/// still exit 0.
+///
+/// See audit/mod.rs::should_fail (`FailPolicy::All` arm, `fail_on.is_some()`
+/// branch) for the contract.
+#[tokio::test]
+async fn audit_default_policy_does_not_trigger_on_high_behavior_alone() {
+    let project = TempProject::empty(r#"{"name":"eval-default","version":"1.0.0"}"#);
+    seed_eval_package(&project, "eval-pkg");
+
+    let mock = MockRegistry::start().await;
+    mock.with_osv_querybatch(vec![vec![]]).await;
+
+    let out = run_audit_no_osv(&project, &mock, &[]);
+    assert!(
+        out.status.success(),
+        "default (no --fail-on) policy must NOT fire on high-behavior alone (backward compat); \
+         stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+}
+
+/// Explicit `--fail-on=all` flips the backward-compat carve-out off —
+/// HIGH behavioral findings now count as failure triggers. Pairs with
+/// the test above to fence the documented difference between
+/// "default-all" and "explicit-all".
+#[tokio::test]
+async fn audit_fail_on_all_explicit_triggers_on_high_behavior() {
+    let project = TempProject::empty(r#"{"name":"eval-all","version":"1.0.0"}"#);
+    seed_eval_package(&project, "eval-pkg");
+
+    let mock = MockRegistry::start().await;
+    mock.with_osv_querybatch(vec![vec![]]).await;
+
+    let out = run_audit_no_osv(&project, &mock, &["--fail-on=all"]);
+    assert!(
+        !out.status.success(),
+        "--fail-on=all (explicit) must fire on high-behavior findings; stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+}
+
+/// `--fail-on=vuln` is the inverse-of-behavior policy: behavioral
+/// findings alone must NOT trigger exit non-zero. Pins the negative
+/// case for the `Vuln` arm of `FailPolicy`.
+#[tokio::test]
+async fn audit_fail_on_vuln_does_not_trigger_on_behavior_alone() {
+    let project = TempProject::empty(r#"{"name":"vuln-policy-behavior","version":"1.0.0"}"#);
+    seed_eval_package(&project, "eval-pkg");
+
+    let mock = MockRegistry::start().await;
+    mock.with_osv_querybatch(vec![vec![]]).await;
+
+    let out = run_audit_no_osv(&project, &mock, &["--fail-on=vuln"]);
+    assert!(
+        out.status.success(),
+        "--fail-on=vuln must NOT fire on behavioral findings alone; stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+}
+
 #[tokio::test]
 async fn audit_private_package_without_license_does_not_emit_no_license_flag() {
     let project = TempProject::empty(

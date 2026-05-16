@@ -1348,6 +1348,7 @@ fn print_json_report(
 
 // ─── Internal structs ───────────────────────────────────────────────────────
 
+#[derive(Debug)]
 struct AuditResult {
     name: String,
     version: String,
@@ -1355,6 +1356,7 @@ struct AuditResult {
     issues: Vec<AuditIssue>,
 }
 
+#[derive(Debug)]
 struct AuditIssue {
     severity: String,
     message: String,
@@ -1883,5 +1885,508 @@ mod tests {
             has_behavioral_failure,
             "--fail-on behavior must catch high-severity behaviors like eval()"
         );
+    }
+
+    // ─── collect_registry_issues: behavioral-tag → AuditIssue mapping ───
+    //
+    // Pins the 4-bucket contract (critical / dangerous / medium / notable)
+    // and the lifecycle-scripts / security-findings / vulnerabilities
+    // arms. Each bucket emits at most one AuditIssue, regardless of how
+    // many member tags fire. A silent miscategorization here would let
+    // the registry think a package is dangerous while `lpm audit` reports
+    // it as clean, so the test set is exhaustive across all 22
+    // documented behavioral_tags fields.
+
+    use lpm_registry::{BehavioralTags, SecurityFinding, VersionMetadata, Vulnerability};
+
+    fn meta_with_tags(setup: impl FnOnce(&mut BehavioralTags)) -> VersionMetadata {
+        let mut tags = BehavioralTags::default();
+        setup(&mut tags);
+        VersionMetadata {
+            behavioral_tags: Some(tags),
+            ..Default::default()
+        }
+    }
+
+    fn collect(meta: &VersionMetadata) -> Vec<AuditIssue> {
+        let mut issues = Vec::new();
+        collect_registry_issues(meta, &mut issues);
+        issues
+    }
+
+    fn find_issue<'a>(
+        issues: &'a [AuditIssue],
+        severity: &str,
+        category: &str,
+    ) -> Option<&'a AuditIssue> {
+        issues
+            .iter()
+            .find(|i| i.severity == severity && i.category == category)
+    }
+
+    // Critical bucket — obfuscated, protestware, high_entropy_strings
+
+    #[test]
+    fn registry_issue_critical_bucket_fires_for_obfuscated() {
+        let meta = meta_with_tags(|t| t.obfuscated = true);
+        let issues = collect(&meta);
+        let issue = find_issue(&issues, "critical", "supply-chain")
+            .expect("expected one critical/supply-chain issue");
+        assert_eq!(issue.source, "registry");
+        assert!(
+            issue.message.contains("obfuscated code"),
+            "msg: {}",
+            issue.message
+        );
+    }
+
+    #[test]
+    fn registry_issue_critical_bucket_fires_for_protestware() {
+        let issues = collect(&meta_with_tags(|t| t.protestware = true));
+        let issue = find_issue(&issues, "critical", "supply-chain").unwrap();
+        assert!(issue.message.contains("protestware"));
+    }
+
+    #[test]
+    fn registry_issue_critical_bucket_fires_for_high_entropy_strings() {
+        let issues = collect(&meta_with_tags(|t| t.high_entropy_strings = true));
+        let issue = find_issue(&issues, "critical", "supply-chain").unwrap();
+        assert!(issue.message.contains("high-entropy strings"));
+    }
+
+    #[test]
+    fn registry_issue_critical_bucket_emits_single_issue_with_all_three() {
+        let issues = collect(&meta_with_tags(|t| {
+            t.obfuscated = true;
+            t.protestware = true;
+            t.high_entropy_strings = true;
+        }));
+        let critical: Vec<_> = issues
+            .iter()
+            .filter(|i| i.severity == "critical" && i.category == "supply-chain")
+            .collect();
+        assert_eq!(
+            critical.len(),
+            1,
+            "critical bucket must emit ONE issue regardless of tag count"
+        );
+        // All three names must appear in the single message
+        assert!(critical[0].message.contains("obfuscated"));
+        assert!(critical[0].message.contains("protestware"));
+        assert!(critical[0].message.contains("high-entropy"));
+    }
+
+    // Dangerous bucket — eval, child_process, shell, dynamic_require
+
+    #[test]
+    fn registry_issue_dangerous_bucket_fires_for_eval() {
+        let issues = collect(&meta_with_tags(|t| t.eval = true));
+        let issue = find_issue(&issues, "high", "behavior").unwrap();
+        assert!(issue.message.contains("eval()"));
+        assert_eq!(issue.source, "registry");
+    }
+
+    #[test]
+    fn registry_issue_dangerous_bucket_fires_for_child_process() {
+        let issues = collect(&meta_with_tags(|t| t.child_process = true));
+        let issue = find_issue(&issues, "high", "behavior").unwrap();
+        assert!(issue.message.contains("child_process"));
+    }
+
+    #[test]
+    fn registry_issue_dangerous_bucket_fires_for_shell() {
+        let issues = collect(&meta_with_tags(|t| t.shell = true));
+        let issue = find_issue(&issues, "high", "behavior").unwrap();
+        assert!(issue.message.contains("shell"));
+    }
+
+    #[test]
+    fn registry_issue_dangerous_bucket_fires_for_dynamic_require() {
+        let issues = collect(&meta_with_tags(|t| t.dynamic_require = true));
+        let issue = find_issue(&issues, "high", "behavior").unwrap();
+        assert!(issue.message.contains("dynamic require"));
+    }
+
+    #[test]
+    fn registry_issue_dangerous_bucket_emits_single_issue_with_all_members() {
+        let issues = collect(&meta_with_tags(|t| {
+            t.eval = true;
+            t.child_process = true;
+            t.shell = true;
+            t.dynamic_require = true;
+        }));
+        let dangerous: Vec<_> = issues
+            .iter()
+            .filter(|i| i.severity == "high" && i.category == "behavior")
+            .collect();
+        assert_eq!(dangerous.len(), 1);
+    }
+
+    // Medium bucket — network, native_bindings, git/http/wildcard dep, no_license
+    // Emits severity=info, category=behavior, message starts with "flags:".
+
+    #[test]
+    fn registry_issue_medium_bucket_fires_for_network() {
+        let issues = collect(&meta_with_tags(|t| t.network = true));
+        // Both medium and notable share severity=info+category=behavior;
+        // distinguish by message prefix.
+        let issue = issues
+            .iter()
+            .find(|i| i.severity == "info" && i.message.starts_with("flags:"))
+            .expect("expected medium bucket issue");
+        assert!(issue.message.contains("network"));
+        assert_eq!(issue.source, "registry");
+    }
+
+    #[test]
+    fn registry_issue_medium_bucket_fires_for_each_member() {
+        for (setter, expected_token) in [
+            (
+                Box::new(|t: &mut BehavioralTags| t.native_bindings = true)
+                    as Box<dyn FnOnce(&mut BehavioralTags)>,
+                "native bindings",
+            ),
+            (Box::new(|t| t.git_dependency = true), "git dependency"),
+            (Box::new(|t| t.http_dependency = true), "http dependency"),
+            (Box::new(|t| t.wildcard_dependency = true), "wildcard dep"),
+            (Box::new(|t| t.no_license = true), "no license"),
+        ] {
+            let issues = collect(&meta_with_tags(setter));
+            let medium = issues
+                .iter()
+                .find(|i| i.message.starts_with("flags:"))
+                .unwrap_or_else(|| {
+                    panic!("expected medium bucket issue for {expected_token}; got: {issues:?}")
+                });
+            assert!(
+                medium.message.contains(expected_token),
+                "message must contain '{expected_token}'; got: {}",
+                medium.message
+            );
+        }
+    }
+
+    #[test]
+    fn registry_issue_medium_bucket_emits_single_issue_with_all_members() {
+        let issues = collect(&meta_with_tags(|t| {
+            t.network = true;
+            t.native_bindings = true;
+            t.git_dependency = true;
+            t.http_dependency = true;
+            t.wildcard_dependency = true;
+            t.no_license = true;
+        }));
+        let medium: Vec<_> = issues
+            .iter()
+            .filter(|i| i.message.starts_with("flags:"))
+            .collect();
+        assert_eq!(medium.len(), 1);
+    }
+
+    // Notable bucket — filesystem, env_vars, crypto, telemetry, minified,
+    // trivial, copyleft_license. Emits severity=info, category=behavior,
+    // message starts with "accesses".
+
+    #[test]
+    fn registry_issue_notable_bucket_fires_for_filesystem() {
+        let issues = collect(&meta_with_tags(|t| t.filesystem = true));
+        let issue = issues
+            .iter()
+            .find(|i| i.message.starts_with("accesses"))
+            .expect("expected notable bucket issue");
+        assert!(issue.message.contains("filesystem"));
+        assert_eq!(issue.severity, "info");
+        assert_eq!(issue.category, "behavior");
+        assert_eq!(issue.source, "registry");
+    }
+
+    #[test]
+    fn registry_issue_notable_bucket_fires_for_each_member() {
+        for (setter, expected_token) in [
+            (
+                Box::new(|t: &mut BehavioralTags| t.environment_vars = true)
+                    as Box<dyn FnOnce(&mut BehavioralTags)>,
+                "env vars",
+            ),
+            (Box::new(|t| t.crypto = true), "crypto"),
+            (Box::new(|t| t.telemetry = true), "telemetry"),
+            (Box::new(|t| t.minified = true), "minified"),
+            (Box::new(|t| t.trivial = true), "trivial"),
+            (Box::new(|t| t.copyleft_license = true), "copyleft"),
+        ] {
+            let issues = collect(&meta_with_tags(setter));
+            let notable = issues
+                .iter()
+                .find(|i| i.message.starts_with("accesses"))
+                .unwrap_or_else(|| panic!("expected notable bucket issue for {expected_token}"));
+            assert!(
+                notable.message.contains(expected_token),
+                "message must contain '{expected_token}'; got: {}",
+                notable.message
+            );
+        }
+    }
+
+    #[test]
+    fn registry_issue_notable_bucket_emits_single_issue_with_all_members() {
+        let issues = collect(&meta_with_tags(|t| {
+            t.filesystem = true;
+            t.environment_vars = true;
+            t.crypto = true;
+            t.telemetry = true;
+            t.minified = true;
+            t.trivial = true;
+            t.copyleft_license = true;
+        }));
+        let notable: Vec<_> = issues
+            .iter()
+            .filter(|i| i.message.starts_with("accesses"))
+            .collect();
+        assert_eq!(notable.len(), 1);
+    }
+
+    // Edge cases — empty tags, unused-by-mapping tags, all-tags-set
+
+    #[test]
+    fn registry_issue_empty_tags_emits_no_issues() {
+        let issues = collect(&meta_with_tags(|_| {}));
+        assert!(
+            issues.is_empty(),
+            "default-empty tags must produce 0 issues; got {issues:?}"
+        );
+    }
+
+    #[test]
+    fn registry_issue_url_strings_and_web_socket_not_currently_mapped() {
+        // FINDING: `url_strings` and `web_socket` exist on BehavioralTags
+        // but are not surfaced by collect_registry_issues. This test
+        // pins the current behavior. If a future change adds these to
+        // any bucket, update the test to assert the new mapping.
+        let issues = collect(&meta_with_tags(|t| {
+            t.url_strings = true;
+            t.web_socket = true;
+        }));
+        assert!(
+            issues.is_empty(),
+            "url_strings and web_socket are currently unmapped — \
+             if this changes, update the test to assert the new bucket. Got: {issues:?}"
+        );
+    }
+
+    #[test]
+    fn registry_issue_all_tags_set_emits_one_issue_per_active_bucket() {
+        let issues = collect(&meta_with_tags(|t| {
+            // Set every documented tag — all 22.
+            t.eval = true;
+            t.child_process = true;
+            t.shell = true;
+            t.network = true;
+            t.filesystem = true;
+            t.crypto = true;
+            t.dynamic_require = true;
+            t.native_bindings = true;
+            t.environment_vars = true;
+            t.web_socket = true;
+            t.obfuscated = true;
+            t.high_entropy_strings = true;
+            t.minified = true;
+            t.telemetry = true;
+            t.url_strings = true;
+            t.trivial = true;
+            t.protestware = true;
+            t.git_dependency = true;
+            t.http_dependency = true;
+            t.wildcard_dependency = true;
+            t.copyleft_license = true;
+            t.no_license = true;
+        }));
+        // 4 buckets all fire → exactly 4 issues from behavioral tags.
+        assert_eq!(
+            issues.len(),
+            4,
+            "expected one issue per active bucket; got: {issues:?}"
+        );
+        assert!(find_issue(&issues, "critical", "supply-chain").is_some());
+        assert!(find_issue(&issues, "high", "behavior").is_some());
+        assert_eq!(
+            issues
+                .iter()
+                .filter(|i| i.severity == "info" && i.category == "behavior")
+                .count(),
+            2,
+            "medium + notable both emit info/behavior"
+        );
+    }
+
+    // security_findings arm
+
+    #[test]
+    fn registry_issue_security_findings_emits_one_issue_per_finding() {
+        let meta = VersionMetadata {
+            security_findings: Some(vec![
+                SecurityFinding {
+                    severity: Some("high".into()),
+                    description: Some("hardcoded API key".into()),
+                    file: Some("index.js".into()),
+                },
+                SecurityFinding {
+                    severity: Some("moderate".into()),
+                    description: Some("unsafe regex".into()),
+                    file: None,
+                },
+            ]),
+            ..Default::default()
+        };
+        let issues = collect(&meta);
+        assert_eq!(issues.len(), 2);
+        assert!(
+            issues
+                .iter()
+                .all(|i| i.category == "security" && i.source == "registry")
+        );
+        let high = issues.iter().find(|i| i.severity == "high").unwrap();
+        assert_eq!(high.message, "hardcoded API key");
+        let moderate = issues.iter().find(|i| i.severity == "moderate").unwrap();
+        assert_eq!(moderate.message, "unsafe regex");
+    }
+
+    #[test]
+    fn registry_issue_security_finding_uses_defaults_for_missing_fields() {
+        let meta = VersionMetadata {
+            security_findings: Some(vec![SecurityFinding {
+                severity: None,
+                description: None,
+                file: None,
+            }]),
+            ..Default::default()
+        };
+        let issues = collect(&meta);
+        assert_eq!(issues.len(), 1);
+        assert_eq!(issues[0].severity, "moderate", "default severity");
+        assert_eq!(
+            issues[0].message, "security concern detected",
+            "default message"
+        );
+    }
+
+    // lifecycle_scripts arm
+
+    #[test]
+    fn registry_issue_lifecycle_scripts_emits_one_moderate_issue() {
+        let mut scripts = std::collections::HashMap::new();
+        scripts.insert("preinstall".to_string(), "node setup.js".to_string());
+        scripts.insert("postinstall".to_string(), "node build.js".to_string());
+        let meta = VersionMetadata {
+            lifecycle_scripts: Some(scripts),
+            ..Default::default()
+        };
+        let issues = collect(&meta);
+        assert_eq!(issues.len(), 1);
+        assert_eq!(issues[0].severity, "moderate");
+        assert_eq!(issues[0].category, "scripts");
+        // Both script names must appear (HashMap order is non-deterministic,
+        // assert membership rather than order).
+        assert!(issues[0].message.contains("preinstall"));
+        assert!(issues[0].message.contains("postinstall"));
+    }
+
+    #[test]
+    fn registry_issue_empty_lifecycle_scripts_emits_no_issue() {
+        let meta = VersionMetadata {
+            lifecycle_scripts: Some(std::collections::HashMap::new()),
+            ..Default::default()
+        };
+        let issues = collect(&meta);
+        assert!(issues.is_empty());
+    }
+
+    // vulnerabilities arm
+
+    #[test]
+    fn registry_issue_vulnerabilities_emits_one_issue_per_vuln() {
+        let meta = VersionMetadata {
+            vulnerabilities: Some(vec![
+                Vulnerability {
+                    id: Some("GHSA-aaaa".into()),
+                    summary: Some("rce".into()),
+                    severity: Some("HIGH".into()),
+                    aliases: None,
+                },
+                Vulnerability {
+                    id: Some("CVE-2025-0001".into()),
+                    summary: None,
+                    severity: Some("Critical".into()),
+                    aliases: None,
+                },
+            ]),
+            ..Default::default()
+        };
+        let issues = collect(&meta);
+        assert_eq!(issues.len(), 2);
+        // Severity is lowercased
+        let high = issues
+            .iter()
+            .find(|i| i.message.contains("GHSA-aaaa"))
+            .unwrap();
+        assert_eq!(high.severity, "high");
+        assert_eq!(high.category, "vulnerability");
+        assert!(high.message.contains("rce"));
+        let critical = issues
+            .iter()
+            .find(|i| i.message.contains("CVE-2025-0001"))
+            .unwrap();
+        assert_eq!(critical.severity, "critical");
+        // No summary → no " — " separator
+        assert!(!critical.message.contains(" — "));
+    }
+
+    #[test]
+    fn registry_issue_vulnerability_defaults_for_missing_fields() {
+        let meta = VersionMetadata {
+            vulnerabilities: Some(vec![Vulnerability {
+                id: None,
+                summary: None,
+                severity: None,
+                aliases: None,
+            }]),
+            ..Default::default()
+        };
+        let issues = collect(&meta);
+        assert_eq!(issues.len(), 1);
+        assert_eq!(issues[0].severity, "moderate", "default severity");
+        assert_eq!(issues[0].message, "unknown", "default id");
+    }
+
+    // Combined — multiple arms in one call
+
+    #[test]
+    fn registry_issue_combined_security_behavioral_scripts_vulns() {
+        let mut scripts = std::collections::HashMap::new();
+        scripts.insert("preinstall".to_string(), "x".to_string());
+        let meta = VersionMetadata {
+            security_findings: Some(vec![SecurityFinding {
+                severity: Some("high".into()),
+                description: Some("ai-finding".into()),
+                file: None,
+            }]),
+            behavioral_tags: Some(BehavioralTags {
+                eval: true,
+                obfuscated: true,
+                network: true,
+                ..Default::default()
+            }),
+            lifecycle_scripts: Some(scripts),
+            vulnerabilities: Some(vec![Vulnerability {
+                id: Some("CVE-2025-9999".into()),
+                summary: Some("rce".into()),
+                severity: Some("high".into()),
+                aliases: None,
+            }]),
+            ..Default::default()
+        };
+        let issues = collect(&meta);
+        // 1 security_finding + 3 active buckets (critical/dangerous/medium)
+        // + 1 lifecycle_scripts + 1 vulnerability = 6 issues.
+        assert_eq!(issues.len(), 6, "got: {issues:?}");
     }
 }
