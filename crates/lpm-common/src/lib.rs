@@ -54,6 +54,49 @@ pub fn sanitize_path_component(name: &str) -> String {
     name.replace("..", "_").replace(['/', '\\', '\0'], "-")
 }
 
+/// Default cap on small JSON/TOML state files that lpm reads at command
+/// start (project-local `.lpm/build-state.json`, `.lpm/overrides-state.json`,
+/// `.lpm/patch-state.json`, global `~/.lpm/known-projects.json`, global
+/// manifest, L4 verdict cache, etc.).
+///
+/// Real-world state files are kilobytes; a 16 MB ceiling leaves several
+/// orders of magnitude of headroom while preventing a malicious repo or
+/// same-user state writer from forcing `read_to_string` + full serde
+/// parse on a multi-GB file at every command start.
+pub const STATE_FILE_SIZE_CAP_BYTES: u64 = 16 * 1024 * 1024;
+
+/// Read a small state file with a size cap applied before any bytes
+/// are buffered. Returns `Ok(None)` when the file is missing OR larger
+/// than `cap`; returns `Ok(Some(bytes))` for files within budget;
+/// returns `Err` only when the file exists, fits the cap, and the
+/// read itself failed (disk error, permissions, etc.).
+///
+/// Caller treats the `Ok(None)` cap-overflow case the same as "missing
+/// state" — these readers all fall back to "no prior state" when the
+/// file fails to parse, so the cap is a stricter version of the
+/// existing recovery posture. A `tracing::warn` fires on the overflow
+/// arm so an operator can see the cap kicked in.
+pub fn read_capped_state_file(
+    path: &std::path::Path,
+    cap: u64,
+) -> std::io::Result<Option<Vec<u8>>> {
+    let meta = match std::fs::metadata(path) {
+        Ok(m) => m,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e),
+    };
+    if meta.len() > cap {
+        tracing::warn!(
+            path = %path.display(),
+            size = meta.len(),
+            cap = cap,
+            "state file exceeds size cap — treating as missing"
+        );
+        return Ok(None);
+    }
+    Ok(Some(std::fs::read(path)?))
+}
+
 /// Format bytes into a human-readable string (e.g., "1.2 KB", "3.4 MB").
 pub fn format_bytes(bytes: u64) -> String {
     if bytes < 1024 {
@@ -70,6 +113,46 @@ pub fn format_bytes(bytes: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── read_capped_state_file ────────────────────────────────────────
+
+    /// Files under the cap round-trip transparently.
+    #[test]
+    fn capped_state_reader_returns_file_under_cap() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        std::fs::write(&path, br#"{"ok":true}"#).unwrap();
+        let result = read_capped_state_file(&path, 64 * 1024)
+            .expect("read must succeed")
+            .expect("file under cap must return Some");
+        assert_eq!(&result, br#"{"ok":true}"#);
+    }
+
+    /// Missing files map to `Ok(None)` — same shape callers used pre-fix
+    /// via `read_to_string(..).ok()?`.
+    #[test]
+    fn capped_state_reader_treats_missing_as_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("does-not-exist.json");
+        let result = read_capped_state_file(&path, 64 * 1024).expect("missing file is not an Err");
+        assert!(result.is_none());
+    }
+
+    /// L28: files exceeding the cap are treated as missing — no bytes
+    /// are buffered and no serde parse runs. A malicious repo state
+    /// file can't force a multi-GB `read_to_string` at command start.
+    #[test]
+    fn capped_state_reader_treats_over_cap_as_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("huge.json");
+        // 1 MB file with a tiny 256-byte cap — clearly oversize.
+        std::fs::write(&path, vec![b'x'; 1024 * 1024]).unwrap();
+        let result = read_capped_state_file(&path, 256).expect("over-cap is not an Err");
+        assert!(
+            result.is_none(),
+            "file larger than cap must collapse to None"
+        );
+    }
 
     // ── is_safe_skill_name ────────────────────────────────────────────
 

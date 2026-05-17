@@ -172,9 +172,9 @@ pub fn load(path: &Path) -> Registry {
 /// registered projects" — the latter would mark every link entry as
 /// orphaned and wipe the live store under `--apply`.
 pub fn try_load(path: &Path) -> Result<Registry, LoadError> {
-    let bytes = match std::fs::read(path) {
-        Ok(b) => b,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Err(LoadError::NotFound),
+    let bytes = match crate::read_capped_state_file(path, crate::STATE_FILE_SIZE_CAP_BYTES) {
+        Ok(Some(b)) => b,
+        Ok(None) => return Err(LoadError::NotFound),
         Err(e) => return Err(LoadError::Io(e)),
     };
     match serde_json::from_slice::<Registry>(&bytes) {

@@ -302,7 +302,9 @@ fn persist_snapshot(path: &Path, file: &CacheFile) -> io::Result<()> {
 }
 
 fn load_or_default(path: &Path) -> CacheFile {
-    let Ok(bytes) = fs::read(path) else {
+    let Ok(Some(bytes)) =
+        lpm_common::read_capped_state_file(path, lpm_common::STATE_FILE_SIZE_CAP_BYTES)
+    else {
         return CacheFile::default();
     };
     match serde_json::from_slice::<CacheFile>(&bytes) {

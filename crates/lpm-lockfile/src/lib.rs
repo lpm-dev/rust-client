@@ -20,7 +20,7 @@ use serde::{Deserialize, Serialize};
 use std::path::Path;
 
 pub use binary::{BINARY_LOCKFILE_NAME, BinaryLockfileReader};
-pub use source::{SafetyContext, Source, SourceParseError, SourceSafety, source_safety};
+pub use source::{Source, SourceParseError};
 
 /// Three-tuple package identity for cross-source collision avoidance.
 ///

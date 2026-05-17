@@ -227,8 +227,10 @@ pub struct BlockedSetCapture {
 /// install.
 pub fn read_build_state(project_dir: &Path) -> Option<BuildState> {
     let path = build_state_path(project_dir);
-    let content = std::fs::read_to_string(&path).ok()?;
-    let state: BuildState = serde_json::from_str(&content).ok()?;
+    let bytes = lpm_common::read_capped_state_file(&path, lpm_common::STATE_FILE_SIZE_CAP_BYTES)
+        .ok()
+        .flatten()?;
+    let state: BuildState = serde_json::from_slice(&bytes).ok()?;
     if state.state_version > BUILD_STATE_VERSION {
         // Newer file written by a future LPM binary. We can't safely
         // interpret its semantics, so treat as missing and let the

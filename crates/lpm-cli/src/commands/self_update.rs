@@ -503,33 +503,101 @@ async fn run_standalone_update(version: &str) -> Result<(), LpmError> {
 
     // Replace the current binary
     let current_exe = std::env::current_exe().map_err(LpmError::Io)?;
+    swap_current_binary(&current_exe, &bytes)
+}
 
-    // Write to a temp file next to the current binary, then rename (atomic on same filesystem)
-    let tmp_path = current_exe.with_extension("tmp");
-    std::fs::write(&tmp_path, &bytes).map_err(|e| {
+/// Atomically swap the running binary at `current_exe` for `new_bytes`.
+///
+/// The tmp file is written next to `current_exe` (same filesystem),
+/// which keeps the eventual `rename` on Unix atomic and avoids the
+/// EXDEV mode-cross-FS case.
+///
+/// **Failure cleanup:** any error after we materialised the tmp file
+/// removes it on the way out so the install dir doesn't accumulate
+/// `lpm.tmp.*` stragglers from a half-succeeded update.
+///
+/// **Windows EBUSY:** the OS holds an exclusive handle on the running
+/// `current_exe()`, so a direct `rename(new, current_exe)` fails.
+/// The standard dance is `rename(current_exe, current_exe.old)`
+/// (legal even with a live handle), then `rename(new, current_exe)`,
+/// then best-effort delete the `.old` (OS releases the handle when
+/// this process exits, so the delete will succeed on the next run).
+fn swap_current_binary(current_exe: &std::path::Path, new_bytes: &[u8]) -> Result<(), LpmError> {
+    // Tmp path: same dir + same extension as the current binary, with a
+    // pid suffix so concurrent updaters on the same install don't
+    // collide on the staging filename. `with_extension("tmp")` would
+    // strip a Windows `.exe` extension and break the rename — keep
+    // the original extension and append `.new.<pid>` as a suffix.
+    let file_name = current_exe.file_name().ok_or_else(|| {
+        LpmError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "current_exe has no file name",
+        ))
+    })?;
+    let parent = current_exe.parent().ok_or_else(|| {
+        LpmError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "current_exe has no parent directory",
+        ))
+    })?;
+    let tmp_name = format!("{}.new.{}", file_name.to_string_lossy(), std::process::id());
+    let tmp_path = parent.join(tmp_name);
+
+    std::fs::write(&tmp_path, new_bytes).map_err(|e| {
         LpmError::Io(std::io::Error::new(
             e.kind(),
             format!("failed to write temp binary: {e}"),
         ))
     })?;
 
-    // Make executable on Unix
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&tmp_path, std::fs::Permissions::from_mode(0o755))
-            .map_err(LpmError::Io)?;
+        if let Err(e) = std::fs::set_permissions(&tmp_path, std::fs::Permissions::from_mode(0o755))
+        {
+            let _ = std::fs::remove_file(&tmp_path);
+            return Err(LpmError::Io(e));
+        }
     }
 
-    // Atomic rename
-    std::fs::rename(&tmp_path, &current_exe).map_err(|e| {
-        LpmError::Io(std::io::Error::new(
-            e.kind(),
-            format!("failed to replace binary: {e}"),
-        ))
-    })?;
+    #[cfg(windows)]
+    {
+        let old_name = format!("{}.old.{}", file_name.to_string_lossy(), std::process::id());
+        let old_path = parent.join(&old_name);
+        if let Err(e) = std::fs::rename(current_exe, &old_path) {
+            let _ = std::fs::remove_file(&tmp_path);
+            return Err(LpmError::Io(std::io::Error::new(
+                e.kind(),
+                format!("failed to move running binary aside: {e}"),
+            )));
+        }
+        if let Err(e) = std::fs::rename(&tmp_path, current_exe) {
+            // Try to restore the original binary so we don't leave the
+            // install in a broken state.
+            let _ = std::fs::rename(&old_path, current_exe);
+            let _ = std::fs::remove_file(&tmp_path);
+            return Err(LpmError::Io(std::io::Error::new(
+                e.kind(),
+                format!("failed to install new binary: {e}"),
+            )));
+        }
+        // Best-effort cleanup. The OS will release the handle on the
+        // `.old` file when this process exits; the next run of the new
+        // binary can sweep it.
+        let _ = std::fs::remove_file(&old_path);
+        return Ok(());
+    }
 
-    Ok(())
+    #[cfg(unix)]
+    {
+        std::fs::rename(&tmp_path, current_exe).map_err(|e| {
+            let _ = std::fs::remove_file(&tmp_path);
+            LpmError::Io(std::io::Error::new(
+                e.kind(),
+                format!("failed to replace binary: {e}"),
+            ))
+        })
+    }
 }
 
 /// Detect the current platform for GitHub Release binary names.
@@ -583,6 +651,63 @@ mod tests {
     fn install_method_name_not_empty() {
         let method = detect_install_method();
         assert!(!method.name().is_empty());
+    }
+
+    /// L34: the staging file lands next to `current_exe` (same FS,
+    /// preserves any extension such as `.exe`) so the rename is
+    /// atomic. Pre-fix `with_extension("tmp")` stripped Windows
+    /// `lpm.exe` to `lpm.tmp`, breaking the rename target.
+    #[test]
+    fn swap_current_binary_replaces_file_atomically() {
+        let dir = tempdir().unwrap();
+        let current = dir.path().join("lpm-test-bin");
+        std::fs::write(&current, b"old-binary").unwrap();
+        let new_bytes = b"new-binary-content";
+        swap_current_binary(&current, new_bytes).expect("swap must succeed");
+        let read = std::fs::read(&current).unwrap();
+        assert_eq!(read, new_bytes);
+        // No staging files left behind under success.
+        let leftovers: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| {
+                let n = e.unwrap().file_name().to_string_lossy().into_owned();
+                if n != "lpm-test-bin" { Some(n) } else { None }
+            })
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "swap left behind staging files: {leftovers:?}"
+        );
+    }
+
+    /// L34: extension preservation. `with_extension("tmp")` would have
+    /// turned `lpm.exe` into `lpm.tmp` — when the destination was
+    /// `lpm.exe`, the rename target on Windows would have moved a
+    /// non-executable file into place. The current staging name is
+    /// `<file_name>.new.<pid>`, which keeps the `.exe` suffix on
+    /// `current_exe` intact.
+    #[test]
+    fn swap_current_binary_keeps_destination_extension_intact() {
+        let dir = tempdir().unwrap();
+        let current = dir.path().join("lpm.exe");
+        std::fs::write(&current, b"old").unwrap();
+        swap_current_binary(&current, b"new").expect("swap must succeed");
+        assert!(current.exists(), "destination .exe still present");
+        assert_eq!(std::fs::read(&current).unwrap(), b"new");
+    }
+
+    /// On Unix the swapped binary must end up at 0o755.
+    #[cfg(unix)]
+    #[test]
+    fn swap_current_binary_sets_executable_perms_on_unix() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempdir().unwrap();
+        let current = dir.path().join("lpm-perms");
+        std::fs::write(&current, b"old").unwrap();
+        std::fs::set_permissions(&current, std::fs::Permissions::from_mode(0o644)).unwrap();
+        swap_current_binary(&current, b"new").expect("swap must succeed");
+        let mode = std::fs::metadata(&current).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o755, "expected 0o755, got 0o{mode:o}");
     }
 
     /// Per-channel detection table. Synthetic paths drive the pure
