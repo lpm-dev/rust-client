@@ -2084,8 +2084,27 @@ fn check_global_installs() -> Vec<Check> {
     // 16. Orphaned bin shims.
     out.push(check_orphaned_bin_shims(&root, &manifest));
 
+    // 16b. (L37) Shim targets — does the symlink actually point at the
+    //      expected install-root bin? Pre-fix doctor only verified
+    //      that the *filename* in `~/.lpm/bin` matched a manifest
+    //      command/alias name. A stale rollback shim that kept its
+    //      filename but had a wrong target (pointing at a deleted
+    //      install root, or — worst case — a same-user PATH hijack)
+    //      passed as `global_shims_clean`. Unix-only today; Windows
+    //      shim triples are scripts, not symlinks, and need a
+    //      separate parser (tracked as a follow-up).
+    #[cfg(unix)]
+    out.push(check_global_shim_targets(&root, &manifest));
+
     // 17. Install-root consistency.
     out.push(check_install_root_consistency(&root, &manifest));
+
+    // 18. (L39) Global trusted-dependencies state. A malformed /
+    //     future-schema trust file can break `lpm install -g` (via
+    //     synthetic `lpm.trustedDependencies`) and `lpm approve-scripts
+    //     --global`; pre-fix doctor never read the file so those
+    //     failures looked unexplained.
+    out.push(check_global_trusted_deps(&root));
 
     out
 }
@@ -2098,39 +2117,121 @@ fn check_global_manifest_validity(root: &lpm_common::LpmRoot) -> Check {
             "not present (no global installs yet)",
         );
     }
-    match lpm_global::read_for(root) {
-        Ok(manifest) => Check::pass(
-            &doctor_catalog::GLOBAL_MANIFEST_VALID,
-            &format!(
-                "{} package{}, {} alias{}, {} tombstone{}",
-                manifest.packages.len(),
-                if manifest.packages.len() == 1 {
-                    ""
-                } else {
-                    "s"
-                },
-                manifest.aliases.len(),
-                if manifest.aliases.len() == 1 {
-                    ""
-                } else {
-                    "es"
-                },
-                manifest.tombstones.len(),
-                if manifest.tombstones.len() == 1 {
-                    ""
-                } else {
-                    "s"
-                },
-            ),
-        ),
-        Err(e) => Check::fail(
-            &doctor_catalog::GLOBAL_MANIFEST_CORRUPT,
-            &format!(
-                "{}: {e}. Fix hint: inspect the file or delete it to reset the global tree.",
-                path.display(),
-            ),
-        ),
+    let manifest = match lpm_global::read_for(root) {
+        Ok(m) => m,
+        Err(e) => {
+            return Check::fail(
+                &doctor_catalog::GLOBAL_MANIFEST_CORRUPT,
+                &format!(
+                    "{}: {e}. Fix hint: inspect the file or delete it to reset the global tree.",
+                    path.display(),
+                ),
+            );
+        }
+    };
+
+    // L38: structural validation beyond TOML parseability.
+    //
+    // Check each row's invariants the install + recovery pipelines
+    // actually depend on. The TOML parser is permissive (it'll accept
+    // any string for `root`); install/recovery/uninstall use the
+    // L47 `validated_install_root_relative` shape check at write
+    // boundaries, so doctor surfaces a structurally-invalid manifest
+    // BEFORE the next `lpm install -g` / `lpm uninstall -g` /
+    // `lpm doctor --all`'s dir_size walker tries to act on it.
+    //
+    // Invariants:
+    //   - every `packages.*.root` must pass `validated_install_root_relative`
+    //   - every `aliases.<name>` must reference a package present in
+    //     `packages` AND a bin declared in that package's `commands`
+    //     (or the package's bin emission list — but `commands` is the
+    //     post-resolution authoritative list, so we use that)
+    //   - every `tombstones[]` entry must pass the same shape check
+    let global_root = root.global_root();
+    let mut issues: Vec<String> = Vec::new();
+
+    for (pkg_name, entry) in &manifest.packages {
+        if let Err(reason) = lpm_global::validated_install_root_relative(&global_root, &entry.root)
+        {
+            issues.push(format!(
+                "package '{}': root {:?} structurally invalid ({reason})",
+                lpm_common::sanitize_for_terminal(pkg_name),
+                lpm_common::sanitize_for_terminal(&entry.root),
+            ));
+        }
     }
+    for (alias_name, alias_entry) in &manifest.aliases {
+        let Some(owner) = manifest.packages.get(&alias_entry.package) else {
+            issues.push(format!(
+                "alias '{}': package '{}' is not installed (dangling alias row)",
+                lpm_common::sanitize_for_terminal(alias_name),
+                lpm_common::sanitize_for_terminal(&alias_entry.package),
+            ));
+            continue;
+        };
+        if !owner.commands.contains(&alias_entry.bin) {
+            issues.push(format!(
+                "alias '{}': bin '{}' is not declared by package '{}'",
+                lpm_common::sanitize_for_terminal(alias_name),
+                lpm_common::sanitize_for_terminal(&alias_entry.bin),
+                lpm_common::sanitize_for_terminal(&alias_entry.package),
+            ));
+        }
+    }
+    for tombstone in &manifest.tombstones {
+        if let Err(reason) = lpm_global::validated_install_root_relative(&global_root, tombstone) {
+            issues.push(format!(
+                "tombstone {:?} structurally invalid ({reason})",
+                lpm_common::sanitize_for_terminal(tombstone),
+            ));
+        }
+    }
+
+    if !issues.is_empty() {
+        let preview: Vec<String> = issues.iter().take(5).cloned().collect();
+        let more = if issues.len() > preview.len() {
+            format!(", +{} more", issues.len() - preview.len())
+        } else {
+            String::new()
+        };
+        return Check::fail(
+            &doctor_catalog::GLOBAL_MANIFEST_STRUCTURALLY_INVALID,
+            &format!(
+                "{}: {} structural issue{} ({}{}). Fix hint: inspect the file or hand-repair the \
+                 offending rows.",
+                path.display(),
+                issues.len(),
+                if issues.len() == 1 { "" } else { "s" },
+                preview.join("; "),
+                more,
+            ),
+        );
+    }
+
+    Check::pass(
+        &doctor_catalog::GLOBAL_MANIFEST_VALID,
+        &format!(
+            "{} package{}, {} alias{}, {} tombstone{}",
+            manifest.packages.len(),
+            if manifest.packages.len() == 1 {
+                ""
+            } else {
+                "s"
+            },
+            manifest.aliases.len(),
+            if manifest.aliases.len() == 1 {
+                ""
+            } else {
+                "es"
+            },
+            manifest.tombstones.len(),
+            if manifest.tombstones.len() == 1 {
+                ""
+            } else {
+                "s"
+            },
+        ),
+    )
 }
 
 fn check_bin_dir_on_path(root: &lpm_common::LpmRoot) -> Check {
@@ -2228,6 +2329,181 @@ fn check_orphaned_bin_shims(
             ),
         )
     }
+}
+
+/// L39: read `~/.lpm/global/trusted-dependencies.json` and report
+/// presence + approval count + parse health. A malformed or
+/// future-schema trust file breaks `lpm install -g` (via the
+/// synthetic `lpm.trustedDependencies` projection in
+/// `install_global::synthesize_pkg_json`) and `lpm approve-scripts
+/// --global`. Pre-fix doctor never touched the file, so a corrupt
+/// trust file looked like an unexplained install failure later.
+///
+/// The check itself is small — the trust store is a few hundred
+/// bytes typically — but it covers the same diagnostic gap that the
+/// other "state file readable + structurally valid" checks address.
+fn check_global_trusted_deps(root: &lpm_common::LpmRoot) -> Check {
+    let path = root.global_trusted_deps();
+    if !path.exists() {
+        return Check::pass(
+            &doctor_catalog::GLOBAL_TRUSTED_DEPS_ABSENT,
+            "not present (no host-global approvals yet)",
+        );
+    }
+    match lpm_global::trusted_deps::read_at(&path) {
+        Ok(value) => Check::pass(
+            &doctor_catalog::GLOBAL_TRUSTED_DEPS_VALID,
+            &format!(
+                "{} approval{}",
+                value.trusted.len(),
+                if value.trusted.len() == 1 { "" } else { "s" },
+            ),
+        ),
+        Err(e) => Check::fail(
+            &doctor_catalog::GLOBAL_TRUSTED_DEPS_CORRUPT,
+            &format!(
+                "{}: {e}. Fix hint: delete the file to reset the host-global trust list \
+                 (operators re-approve on next `lpm install -g` or `lpm approve-scripts --global`).",
+                path.display(),
+            ),
+        ),
+    }
+}
+
+/// L37: verify each manifest-owned shim in `~/.lpm/bin` is a symlink
+/// pointing at the expected `<install-root>/node_modules/.bin/<bin>`.
+///
+/// Unix-only — Windows shim artifacts are `.cmd`/`.ps1`/bash-shim
+/// scripts that exec the target via a baked-in path string, so
+/// verifying them needs a parser per shim format (tracked as a
+/// follow-up to L37). The orphaned-filename check already covers the
+/// stale-artifact-by-name shape on Windows.
+///
+/// What "wrong target" means here:
+///   - file exists at the expected path but is NOT a symlink (a
+///     regular-file replacement is the same-user PATH-hijack shape)
+///   - symlink target doesn't match the manifest-expected path
+///     (stale rollback artifact pointing at a deleted install root,
+///     or a same-user-tampered symlink pointing elsewhere entirely)
+///   - shim is missing entirely (manifest says it should exist but
+///     `~/.lpm/bin/<name>` doesn't — partial rollback or external
+///     deletion)
+///
+/// Returns a single `Check` so the pass/warn shape matches the rest
+/// of the doctor surface. Mismatches list up to 5 names so JSON
+/// consumers can drill in.
+#[cfg(unix)]
+fn check_global_shim_targets(
+    root: &lpm_common::LpmRoot,
+    manifest: &lpm_global::GlobalManifest,
+) -> Check {
+    let bin_dir = root.bin_dir();
+    if !bin_dir.exists() {
+        // No bin dir → nothing to verify. The orphaned-shim check
+        // already passes in this state; we just match it.
+        return Check::pass(
+            &doctor_catalog::GLOBAL_SHIM_TARGETS_HEALTHY,
+            "bin dir does not exist yet",
+        );
+    }
+
+    let mut expectations: Vec<(String, std::path::PathBuf)> = Vec::new();
+    // Direct commands: bin/<cmd> → <install-root>/node_modules/.bin/<cmd>
+    for entry in manifest.packages.values() {
+        let install_root = root.global_root().join(&entry.root);
+        let install_bin = install_root.join("node_modules").join(".bin");
+        for cmd in &entry.commands {
+            expectations.push((cmd.clone(), install_bin.join(cmd)));
+        }
+    }
+    // Aliases: bin/<alias_name> → <pkg's install-root>/node_modules/.bin/<alias.bin>
+    for (alias_name, alias_entry) in &manifest.aliases {
+        let Some(owner) = manifest.packages.get(&alias_entry.package) else {
+            // Alias row pointing at a non-existent package is its own
+            // structural problem; L38 surfaces it. Skip the target
+            // check here so we don't double-fail.
+            continue;
+        };
+        let install_root = root.global_root().join(&owner.root);
+        let install_bin = install_root.join("node_modules").join(".bin");
+        expectations.push((alias_name.clone(), install_bin.join(&alias_entry.bin)));
+    }
+
+    let mut mismatches: Vec<String> = Vec::new();
+    for (shim_name, expected_target) in &expectations {
+        let shim_path = bin_dir.join(shim_name);
+        let meta = match std::fs::symlink_metadata(&shim_path) {
+            Ok(m) => m,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                mismatches.push(format!(
+                    "{}: shim missing (manifest expects symlink)",
+                    lpm_common::sanitize_for_terminal(shim_name)
+                ));
+                continue;
+            }
+            Err(e) => {
+                mismatches.push(format!(
+                    "{}: cannot stat ({e})",
+                    lpm_common::sanitize_for_terminal(shim_name)
+                ));
+                continue;
+            }
+        };
+        if !meta.file_type().is_symlink() {
+            mismatches.push(format!(
+                "{}: regular file at shim path (expected symlink — possible PATH hijack)",
+                lpm_common::sanitize_for_terminal(shim_name)
+            ));
+            continue;
+        }
+        match std::fs::read_link(&shim_path) {
+            Ok(actual_target) => {
+                if actual_target != *expected_target {
+                    mismatches.push(format!(
+                        "{}: symlink points at {} (expected {})",
+                        lpm_common::sanitize_for_terminal(shim_name),
+                        lpm_common::sanitize_for_terminal(&actual_target.display().to_string()),
+                        lpm_common::sanitize_for_terminal(&expected_target.display().to_string()),
+                    ));
+                }
+            }
+            Err(e) => {
+                mismatches.push(format!(
+                    "{}: readlink failed ({e})",
+                    lpm_common::sanitize_for_terminal(shim_name)
+                ));
+            }
+        }
+    }
+
+    if mismatches.is_empty() {
+        return Check::pass(
+            &doctor_catalog::GLOBAL_SHIM_TARGETS_HEALTHY,
+            &format!(
+                "{} owned shim{} verified (symlink + target)",
+                expectations.len(),
+                if expectations.len() == 1 { "" } else { "s" },
+            ),
+        );
+    }
+    let preview: Vec<String> = mismatches.iter().take(5).cloned().collect();
+    let more = if mismatches.len() > preview.len() {
+        format!(", +{} more", mismatches.len() - preview.len())
+    } else {
+        String::new()
+    };
+    Check::warn(
+        &doctor_catalog::GLOBAL_SHIM_TARGETS_STALE,
+        &format!(
+            "{} shim{} with wrong target ({}{}). Fix hint: \
+             re-run `lpm install -g <pkg>` to reclaim the shim, or inspect \
+             `~/.lpm/bin/<name>` if the mismatch is unexpected.",
+            mismatches.len(),
+            if mismatches.len() == 1 { "" } else { "s" },
+            preview.join("; "),
+            more,
+        ),
+    )
 }
 
 fn check_install_root_consistency(
@@ -3920,6 +4196,167 @@ commands = []
         let check = check_orphaned_bin_shims(&root, &manifest);
         assert!(matches!(check.severity, Severity::Warn));
         assert!(check.detail.contains("leftover-ghost"));
+        assert!(check.detail.contains("Fix hint"));
+    }
+
+    /// L37: the shim-target verifier passes when every owned shim is a
+    /// symlink pointing at the expected `<install-root>/node_modules/.bin/<bin>`.
+    #[cfg(unix)]
+    #[test]
+    fn check_global_shim_targets_passes_when_symlinks_point_at_expected_install_bin() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = LpmRoot::from_dir(tmp.path());
+        let bin_dir = root.bin_dir();
+        std::fs::create_dir_all(&bin_dir).unwrap();
+
+        let install_root = root.global_root().join("installs/pkg@1.0.0");
+        let install_bin = install_root.join("node_modules").join(".bin");
+        std::fs::create_dir_all(&install_bin).unwrap();
+        std::fs::write(install_bin.join("bin-a"), b"").unwrap();
+
+        std::os::unix::fs::symlink(install_bin.join("bin-a"), bin_dir.join("bin-a")).unwrap();
+
+        let mut manifest = GlobalManifest::default();
+        manifest
+            .packages
+            .insert("pkg".into(), pkg_entry("installs/pkg@1.0.0"));
+        let check = check_global_shim_targets(&root, &manifest);
+        assert!(matches!(check.severity, Severity::Pass), "{}", check.detail);
+        assert!(check.detail.contains("1 owned shim verified"));
+    }
+
+    /// L37: a regular file at the shim path (the same-user PATH-hijack
+    /// shape — attacker drops their own `bin-a` script at
+    /// `~/.lpm/bin/bin-a` instead of leaving the lpm-emitted symlink)
+    /// must surface as a warning, not pass.
+    #[cfg(unix)]
+    #[test]
+    fn check_global_shim_targets_warns_when_shim_is_regular_file_not_symlink() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = LpmRoot::from_dir(tmp.path());
+        let bin_dir = root.bin_dir();
+        std::fs::create_dir_all(&bin_dir).unwrap();
+        // A regular file at the shim path instead of a symlink — the
+        // PATH-hijack shape.
+        std::fs::write(bin_dir.join("bin-a"), b"#!/bin/sh\necho hijacked").unwrap();
+
+        let mut manifest = GlobalManifest::default();
+        manifest
+            .packages
+            .insert("pkg".into(), pkg_entry("installs/pkg@1.0.0"));
+        let check = check_global_shim_targets(&root, &manifest);
+        assert!(matches!(check.severity, Severity::Warn));
+        assert!(
+            check.detail.contains("regular file at shim path"),
+            "L37: warn must name the regular-file vs symlink shape, got: {}",
+            check.detail
+        );
+        assert!(check.detail.contains("PATH hijack"));
+    }
+
+    /// L37: a symlink whose target points at the wrong install root
+    /// (stale rollback artifact, or attacker repointing the shim) must
+    /// surface as a warning naming both the expected and actual target.
+    #[cfg(unix)]
+    #[test]
+    fn check_global_shim_targets_warns_when_symlink_points_at_unexpected_target() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = LpmRoot::from_dir(tmp.path());
+        let bin_dir = root.bin_dir();
+        std::fs::create_dir_all(&bin_dir).unwrap();
+        // Symlink to a totally unrelated path — the stale/hijack shape.
+        std::os::unix::fs::symlink("/tmp/somewhere-else", bin_dir.join("bin-a")).unwrap();
+
+        let mut manifest = GlobalManifest::default();
+        manifest
+            .packages
+            .insert("pkg".into(), pkg_entry("installs/pkg@1.0.0"));
+        let check = check_global_shim_targets(&root, &manifest);
+        assert!(matches!(check.severity, Severity::Warn));
+        assert!(
+            check.detail.contains("points at /tmp/somewhere-else"),
+            "L37: warn must name the actual target, got: {}",
+            check.detail
+        );
+    }
+
+    /// L38: a manifest with TOML-valid but structurally invalid rows
+    /// (a `packages.*.root` that fails the
+    /// `validated_install_root_relative` shape check) must fail with
+    /// the new structural-invalid catalog entry, not pass.
+    #[test]
+    fn check_global_manifest_validity_fails_when_package_root_is_structurally_invalid() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = LpmRoot::from_dir(tmp.path());
+        std::fs::create_dir_all(root.global_root()).unwrap();
+        let mut manifest = GlobalManifest::default();
+        manifest.packages.insert(
+            "evilpkg".into(),
+            PackageEntry {
+                saved_spec: "^1".into(),
+                resolved: "1.0.0".into(),
+                integrity: "sha512-x".into(),
+                source: PackageSource::UpstreamNpm,
+                installed_at: Utc::now(),
+                // Poisoned shape — `..` traversal must be refused.
+                root: "../escape".into(),
+                commands: vec!["bin-a".into()],
+            },
+        );
+        lpm_global::write_for(&root, &manifest).unwrap();
+
+        let check = check_global_manifest_validity(&root);
+        assert!(matches!(check.severity, Severity::Fail), "{}", check.detail);
+        assert!(check.detail.contains("structurally invalid"));
+        assert!(check.detail.contains("../escape"));
+    }
+
+    /// L38: a dangling alias row (alias pointing at a package that
+    /// isn't in `packages`) must also fail the structural check.
+    #[test]
+    fn check_global_manifest_validity_fails_on_dangling_alias_row() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = LpmRoot::from_dir(tmp.path());
+        std::fs::create_dir_all(root.global_root()).unwrap();
+        let mut manifest = GlobalManifest::default();
+        manifest.aliases.insert(
+            "ghost-alias".into(),
+            lpm_global::AliasEntry {
+                package: "missing-pkg".into(),
+                bin: "anything".into(),
+            },
+        );
+        lpm_global::write_for(&root, &manifest).unwrap();
+
+        let check = check_global_manifest_validity(&root);
+        assert!(matches!(check.severity, Severity::Fail), "{}", check.detail);
+        assert!(check.detail.contains("ghost-alias"));
+        assert!(check.detail.contains("missing-pkg"));
+        assert!(check.detail.contains("dangling alias row"));
+    }
+
+    /// L39: trusted-deps absent → pass with "no host-global approvals"
+    /// note. Other failure modes covered by additional tests below.
+    #[test]
+    fn check_global_trusted_deps_passes_when_absent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = LpmRoot::from_dir(tmp.path());
+        let check = check_global_trusted_deps(&root);
+        assert!(matches!(check.severity, Severity::Pass));
+        assert!(check.detail.contains("not present"));
+    }
+
+    /// L39: trusted-deps malformed JSON → fail naming the schema-reset
+    /// remediation hint.
+    #[test]
+    fn check_global_trusted_deps_fails_when_malformed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = LpmRoot::from_dir(tmp.path());
+        let path = root.global_trusted_deps();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, b"{not valid json").unwrap();
+        let check = check_global_trusted_deps(&root);
+        assert!(matches!(check.severity, Severity::Fail));
         assert!(check.detail.contains("Fix hint"));
     }
 
