@@ -741,8 +741,16 @@ fn commit_locked(
         }
     } else if resolution.is_empty() {
         // Collisions exist but the user supplied no resolution.
-        // Roll back inline + error out with the remediation hint.
-        rollback_aborted_commit(root, &mut manifest, prep, &format_collisions(&observed))?;
+        // Roll back inline + error out with the remediation hint. No
+        // shims have been emitted yet at this point, so the rollback's
+        // shim-sweep list is empty.
+        rollback_aborted_commit(
+            root,
+            &mut manifest,
+            prep,
+            &format_collisions(&observed),
+            &[],
+        )?;
         return Err(collision_error(&prep.name, &observed));
     } else {
         // Flag-driven resolution. Planner consumes the observed
@@ -752,7 +760,7 @@ fn commit_locked(
             Ok(p) => p,
             Err(plan_err) => {
                 let rendered = plan_err.to_script_error(&prep.name).to_string();
-                rollback_aborted_commit(root, &mut manifest, prep, &rendered)?;
+                rollback_aborted_commit(root, &mut manifest, prep, &rendered, &[])?;
                 return Err(plan_err.to_script_error(&prep.name));
             }
         }
@@ -860,6 +868,12 @@ fn commit_locked(
     for shim_name in &plan.shim_removals {
         let _ = remove_shim(&bin_dir, shim_name);
     }
+    // Track every shim name we emit so rollback can sweep them on
+    // failure (M74). Pre-fix the rollback path only dropped the install
+    // root + pending row + WAL Abort, so any shim that landed before
+    // the failure point survived as a dangling PATH entry pointing at
+    // a deleted root.
+    let mut emitted_shims: Vec<String> = Vec::new();
     for cmd in &plan.final_commands {
         let target = install_bin.join(cmd);
         emit_shim(
@@ -869,6 +883,7 @@ fn commit_locked(
                 target,
             },
         )?;
+        emitted_shims.push(cmd.clone());
     }
     for (alias_name, alias_entry) in &plan.alias_rows_to_write {
         let target = install_bin.join(&alias_entry.bin);
@@ -879,6 +894,7 @@ fn commit_locked(
                 target,
             },
         )?;
+        emitted_shims.push(alias_name.clone());
     }
 
     // Audit follow-up: three-artifact invariant — on
@@ -909,7 +925,7 @@ fn commit_locked(
              will be reconciled by recovery on the next `lpm` invocation.",
             incomplete.join(", ")
         );
-        rollback_aborted_commit(root, &mut manifest, prep, &detail)?;
+        rollback_aborted_commit(root, &mut manifest, prep, &detail, &emitted_shims)?;
         return Err(LpmError::Script(detail));
     }
 
@@ -1629,6 +1645,12 @@ pub(crate) fn apply_ownership_change_to_manifest(
 ///
 /// Order of operations (per the audit's manifest-before-WAL
 /// invariant):
+///   0. Sweep emitted shims (M74). If a shim is locked and we cannot
+///      remove it, return Err WITHOUT writing manifest or WAL Abort
+///      so recovery picks up the half-rolled-back transaction on the
+///      next `lpm` invocation. Pre-fix this step did not exist; an
+///      emitted shim survived as a PATH entry pointing at the
+///      about-to-be-deleted install root.
 ///   1. Drop the install root (or tombstone if locked).
 ///   2. Remove `[pending.<pkg>]` row.
 ///   3. Persist manifest.
@@ -1638,7 +1660,27 @@ fn rollback_aborted_commit(
     manifest: &mut lpm_global::GlobalManifest,
     prep: &PrepResult,
     reason: &str,
+    emitted_shims: &[String],
 ) -> Result<(), LpmError> {
+    let bin_dir = root.bin_dir();
+    let mut shim_failures: Vec<String> = Vec::new();
+    for shim_name in emitted_shims {
+        if let Err(e) = remove_shim(&bin_dir, shim_name) {
+            shim_failures.push(format!("{shim_name}: {e}"));
+        }
+    }
+    if !shim_failures.is_empty() {
+        let reason = format!(
+            "could not clear {} emitted shim(s) for '{}': {}. Re-run `lpm` so recovery can \
+             retry the rollback (the pending transaction is preserved in the manifest).",
+            shim_failures.len(),
+            prep.name,
+            shim_failures.join("; ")
+        );
+        tracing::warn!("install -g rollback: deferring '{}': {reason}", prep.name);
+        return Err(LpmError::Script(reason));
+    }
+
     let install_root_ext = lpm_common::as_extended_path(&prep.install_root);
     if install_root_ext.exists()
         && let Err(e) = std::fs::remove_dir_all(&install_root_ext)
@@ -2526,7 +2568,7 @@ mod tests {
             install_root_relative: "installs/pkg@1.0.0".into(),
         };
 
-        rollback_aborted_commit(&root, &mut manifest, &prep, "test reason").unwrap();
+        rollback_aborted_commit(&root, &mut manifest, &prep, "test reason", &[]).unwrap();
 
         // Manifest pending row gone.
         let read_back = lpm_global::read_for(&root).unwrap();
@@ -2540,6 +2582,75 @@ mod tests {
             .iter()
             .any(|r| matches!(r, lpm_global::WalRecord::Abort { tx_id, .. } if tx_id == "tx1"));
         assert!(has_abort, "Abort record must be appended");
+    }
+
+    /// M74: when `rollback_aborted_commit` is handed a list of emitted
+    /// shim names, it must remove each one as part of the rollback so
+    /// no PATH entry survives pointing at the about-to-be-deleted
+    /// install root.
+    #[test]
+    #[cfg(unix)]
+    fn rollback_aborted_commit_sweeps_emitted_shims() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = lpm_common::LpmRoot::from_dir(tmp.path());
+        let install_root = root.install_root_for("pkg", "1.0.0");
+        std::fs::create_dir_all(install_root.join("node_modules").join(".bin")).unwrap();
+        let bin_target = install_root.join("node_modules").join(".bin").join("pkg");
+        std::fs::write(&bin_target, b"#!/bin/sh\necho ok\n").unwrap();
+
+        // Pre-rollback: simulate that commit_locked emitted two shims
+        // before failing. They point at this install root.
+        std::fs::create_dir_all(root.bin_dir()).unwrap();
+        std::os::unix::fs::symlink(&bin_target, root.bin_dir().join("pkg")).unwrap();
+        std::os::unix::fs::symlink(&bin_target, root.bin_dir().join("pkg-alias")).unwrap();
+        assert!(std::fs::symlink_metadata(root.bin_dir().join("pkg")).is_ok());
+        assert!(std::fs::symlink_metadata(root.bin_dir().join("pkg-alias")).is_ok());
+
+        let mut manifest = lpm_global::GlobalManifest::default();
+        manifest.pending.insert(
+            "pkg".into(),
+            lpm_global::PendingEntry {
+                saved_spec: "^1".into(),
+                resolved: "1.0.0".into(),
+                integrity: "sha512-x".into(),
+                source: lpm_global::PackageSource::LpmDev,
+                started_at: chrono::Utc::now(),
+                root: "installs/pkg@1.0.0".into(),
+                commands: vec![],
+                replaces_version: None,
+            },
+        );
+        lpm_global::write_for(&root, &manifest).unwrap();
+
+        let prep = PrepResult {
+            tx_id: "tx-shim".into(),
+            name: "pkg".into(),
+            version: lpm_semver::Version::parse("1.0.0").unwrap(),
+            saved_spec: "^1".into(),
+            integrity: "sha512-x".into(),
+            source: lpm_global::PackageSource::LpmDev,
+            install_root: install_root.clone(),
+            install_root_relative: "installs/pkg@1.0.0".into(),
+        };
+
+        rollback_aborted_commit(
+            &root,
+            &mut manifest,
+            &prep,
+            "test reason",
+            &["pkg".to_string(), "pkg-alias".to_string()],
+        )
+        .unwrap();
+
+        assert!(
+            std::fs::symlink_metadata(root.bin_dir().join("pkg")).is_err(),
+            "emitted direct-bin shim must be removed by rollback"
+        );
+        assert!(
+            std::fs::symlink_metadata(root.bin_dir().join("pkg-alias")).is_err(),
+            "emitted alias shim must be removed by rollback"
+        );
+        assert!(!install_root.exists());
     }
 
     #[test]
