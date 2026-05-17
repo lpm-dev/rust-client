@@ -77,6 +77,20 @@ pub fn read_readme(project_dir: &Path) -> Option<String> {
 // Tarball creation
 // ---------------------------------------------------------------------------
 
+/// Hard ceiling on the uncompressed tarball payload, applied
+/// incrementally while assembling. M49: pre-fix the 500 MB cap was
+/// only enforced AFTER the full `Vec<u8>` was built; a malicious or
+/// generated huge sparse file would exhaust memory before the cap
+/// fired. 500 MB matches the existing post-build limit in
+/// `publish.rs` (downstream `MAX_TARBALL_SIZE`).
+const MAX_UNCOMPRESSED_TARBALL_BYTES: u64 = 500 * 1024 * 1024;
+
+/// Per-file size ceiling. The npm registry's per-file cap is well
+/// below 500 MB in practice — anything past that is almost always a
+/// generated artifact / mistakenly-committed binary. Rejected
+/// incrementally so we don't `fs::read` the whole file before noticing.
+const MAX_TARBALL_FILE_BYTES: u64 = 200 * 1024 * 1024;
+
 /// Create a gzipped tarball from the project directory.
 ///
 /// Respects `files` field in package.json if present.
@@ -102,6 +116,7 @@ pub fn create_tarball(
     }
 
     let mut tar_data = Vec::new();
+    let mut accumulated: u64 = 0;
     {
         let mut builder = tar::Builder::new(&mut tar_data);
 
@@ -114,6 +129,29 @@ pub fn create_tarball(
             // collection and reading. Defence in depth.
             if !is_safe_entry(&full_path, &canonical_root) || !full_path.is_file() {
                 continue;
+            }
+
+            // M49: enforce per-file AND running-total caps incrementally
+            // so we never `fs::read` a multi-GB file or accumulate past
+            // the 500 MB ceiling. Pre-fix the check ran only after
+            // `create_tarball` returned, by which time the bytes were
+            // already in memory.
+            let file_size = std::fs::metadata(&full_path).map(|m| m.len()).unwrap_or(0);
+            if file_size > MAX_TARBALL_FILE_BYTES {
+                return Err(LpmError::Registry(format!(
+                    "file `{}` size {} exceeds per-file cap of {} bytes — \
+                     remove it from the publish set or add an exclusion in \
+                     package.json `files`",
+                    file.path, file_size, MAX_TARBALL_FILE_BYTES,
+                )));
+            }
+            accumulated = accumulated.saturating_add(file_size);
+            if accumulated > MAX_UNCOMPRESSED_TARBALL_BYTES {
+                return Err(LpmError::Registry(format!(
+                    "uncompressed tarball payload would exceed {} bytes (already at {} after `{}`) — \
+                     reduce the publish set or split the package",
+                    MAX_UNCOMPRESSED_TARBALL_BYTES, accumulated, file.path,
+                )));
             }
 
             let content = std::fs::read(&full_path)?;
@@ -342,6 +380,16 @@ fn collect_dir_files(
 }
 
 /// Common ignore patterns when no `files` field is specified.
+///
+/// M48: expanded the lists to cover the most common
+/// secret-bearing directory and file names that real-world
+/// projects commit alongside source code. Conservative on
+/// directory-style additions — `tests/`, `docs/`, `examples/` are
+/// intentionally NOT added because legitimate packages publish
+/// them; only the canonically-secret-bearing names are added.
+/// Full `.npmignore` / `.gitignore` parsing is a larger fix
+/// tracked separately; this hardcoded list closes the most-common
+/// accidental-secrets shape without adding a new dep.
 const IGNORE_DIRS: &[&str] = &[
     "node_modules",
     ".git",
@@ -354,6 +402,14 @@ const IGNORE_DIRS: &[&str] = &[
     ".next",
     ".nuxt",
     "build",
+    // M48: secret-bearing dirs.
+    "private",
+    "secrets",
+    ".secrets",
+    "credentials",
+    ".credentials",
+    ".vscode",
+    ".idea",
 ];
 
 const IGNORE_FILES: &[&str] = &[
@@ -364,6 +420,19 @@ const IGNORE_FILES: &[&str] = &[
     ".env",
     ".env.local",
     ".env.live",
+    // M48: additional .env shapes + private-key file shapes.
+    // The walker matches on exact basename — conservative shapes
+    // only. `*.pem` etc. would need glob support (follow-up).
+    ".env.development",
+    ".env.production",
+    ".env.staging",
+    ".env.test",
+    ".envrc",
+    "id_rsa",
+    "id_ed25519",
+    "id_ecdsa",
+    ".netrc",
+    ".pgpass",
 ];
 
 fn collect_all_files(
