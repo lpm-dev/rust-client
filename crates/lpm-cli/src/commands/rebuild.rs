@@ -910,10 +910,22 @@ async fn run_under_store_lock(
         // entirely under `--json`, which hid the degradation from
         // CI gates that consume only the JSON envelope.
         if let Some(line) = probe_sandbox.posture().degraded_warning_line() {
-            if json_output {
-                tracing::warn!(target: "lpm_cli::sandbox", "{line}");
-            } else {
+            // M65: always emit via tracing::warn (CI / RUST_LOG=warn
+            // pipelines pick it up regardless of output mode) AND via
+            // output::warn for the human path. Pre-fix, JSON mode
+            // emitted via tracing only and human mode emitted via
+            // output only — splitting the visibility unnecessarily.
+            // Now both paths fire in both modes; the degraded posture
+            // is a security signal a strict-mode user must not miss.
+            tracing::warn!(target: "lpm_cli::sandbox", "{line}");
+            if !json_output {
                 output::warn(&line);
+                output::warn(
+                    "strict sandbox requested but kernel-level network containment is NOT \
+                     enforced under this posture. Lifecycle scripts can reach the network. \
+                     Either upgrade to kernel >= 6.7 (landlock V4) or unset \
+                     `[sandbox] allow-degraded = true` to fail-closed instead of falling back.",
+                );
             }
         }
         drop(probe_sandbox);

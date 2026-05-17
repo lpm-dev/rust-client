@@ -320,6 +320,32 @@ pub async fn run(
             tokio::sync::mpsc::unbounded_channel::<lpm_tunnel::webhook::CapturedWebhook>();
         let webhook_logger = lpm_tunnel::webhook_log::WebhookLogger::new(project_dir);
 
+        // M34: `lpm dev --tunnel` persists every captured webhook —
+        // full request/response headers (including Authorization,
+        // Cookie, X-*-Signature) and bodies — under
+        // `.lpm/webhooks/*.json` + `.lpm/webhook-log*.jsonl`. The
+        // Unix mode is 0o600/0o700 so other users can't read the
+        // file, but the bytes survive `git commit` of `.lpm`, IDE
+        // indexing, support bundles, and routine backups. Surface
+        // the persistence contract once at session start so the
+        // operator can choose to redact / gitignore / archive before
+        // running with real upstream secrets.
+        tracing::warn!(
+            target: "lpm_cli::dev",
+            "tunnel webhook capture persists full request/response bodies and headers \
+             (incl. Authorization, Cookie, *-Signature) under .lpm/webhooks/ + \
+             .lpm/webhook-log*.jsonl — files are 0o600 locally but survive commits / \
+             backups / IDE indexing. Add `.lpm/webhooks/` and `.lpm/webhook-log*` to \
+             .gitignore if you haven't already."
+        );
+        if !quiet {
+            output::warn(
+                "tunnel webhook capture persists full request/response bodies and headers \
+                 under .lpm/webhooks/ + .lpm/webhook-log*.jsonl. \
+                 Add `.lpm/webhooks/` and `.lpm/webhook-log*` to .gitignore.",
+            );
+        }
+
         // Dashboard webhook channel: when --dashboard is active, webhooks are
         // forwarded to the dashboard TUI via a std::sync channel.
         let dashboard_webhook_tx: Option<std::sync::mpsc::Sender<lpm_dashboard::DashboardEvent>> =
