@@ -1188,6 +1188,42 @@ use lpm_common::symlink::create_dir_symlink_or_junction as create_dir_symlink;
 /// fallback. Mirrors `lpm-linker::link_dir_recursive`'s policy so the
 /// v2 store inherits the same CoW-on-APFS performance characteristics
 /// today's v1 wrappers already have.
+///
+/// # Accepted-posture trade-off (H22)
+///
+/// On Linux the function falls straight to [`std::fs::hard_link`],
+/// which makes the project's `node_modules/<pkg>/<file>` and the
+/// store object at `objects/<sri>/<file>` share an inode. On a CoW-
+/// capable filesystem (Btrfs, XFS with `reflink=1`, F2FS) this is
+/// safe in practice because most editor / build-tool writes
+/// `unlink`+`create` the destination, breaking the link before the
+/// kernel writes attacker-controlled bytes. On ext4 — the default
+/// Linux root FS — `unlink`+`create` still breaks the link, but a
+/// truncate-in-place write (`fs.writeFileSync` in Node, `open(O_TRUNC)`
+/// in C, `open(..., 'w')` in Python) modifies the underlying inode
+/// in place and so mutates the CAS object that every project on the
+/// machine resolving the same SRI shares.
+///
+/// The primary defense is the script-policy gate: any postinstall
+/// that could trigger the mutation must be either bundled with a
+/// `trustedDependencies` entry or explicitly approved via the
+/// triage-advisor (see `crates/lpm-cli/src/script_policy_config.rs`
+/// and the H4/L29 fixes for the surrounding gate). H22 only triggers
+/// when an approved script intentionally mutates its package files;
+/// the next install resolves the mutated SRI as a new entry, so
+/// long-term divergence is bounded by SRI rotation.
+///
+/// The long-term mitigation handle is `FICLONE` (ioctl
+/// `FS_IOC_CLONE` / `0x40049409`) attempted first on Linux, with
+/// fallback to hard_link only when the kernel returns `EOPNOTSUPP`
+/// (ext4). Reflink gives an independent inode under CoW semantics,
+/// so a project-side write doesn't touch the store object even
+/// under truncate-in-place. Implementation is deferred because the
+/// fallback path still leaves the ext4 case exposed and the right
+/// answer is to migrate the default install-pipeline write shape
+/// instead (covered by tracking-issue work outside this audit). See
+/// `private/security-findings.md` H22 for the full trade-off
+/// discussion.
 fn materialize_into(src: &Path, dst: &Path) -> Result<(), LpmError> {
     #[cfg(target_os = "macos")]
     {

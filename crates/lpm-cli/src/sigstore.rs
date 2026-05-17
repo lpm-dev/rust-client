@@ -67,12 +67,49 @@ impl SigstoreEndpoints {
 /// Build the HTTP client used for every Fulcio / Rekor exchange.
 /// Centralised so the wall-clock timeout cannot be omitted at any
 /// call site.
+///
+/// M2: redirect policy is explicitly set to `Policy::none()`. The
+/// Fulcio / Rekor endpoints should never redirect a legitimate
+/// signing request; a `Location:` header on either flow would only
+/// happen if the canonical endpoint had been compromised AND tried
+/// to bounce traffic via a third-party host (where the request body
+/// — OIDC bearer + signing-request payload — would be exposed). The
+/// pre-fix client used reqwest's default of 10 follows, which strips
+/// cross-host `Authorization` only on the host hop reqwest knows
+/// about; the OIDC bearer travels in the JSON body, not the
+/// `Authorization` header, so reqwest's strip wouldn't have caught
+/// it. Explicitly refusing redirects closes the bounce-and-capture
+/// arm. A legitimate Fulcio rotation would be announced as a new
+/// constant + code release, not a transparent redirect.
 fn sigstore_http_client() -> Result<reqwest::Client, LpmError> {
     reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(SIGSTORE_HTTP_TIMEOUT_SECS))
+        .redirect(reqwest::redirect::Policy::none())
         .build()
         .map_err(|e| LpmError::Registry(format!("failed to build Sigstore HTTP client: {e}")))
 }
+
+/// M2: embedded SPKI pin for the canonical Fulcio TLS leaf. When
+/// `Some(hex)`, the TLS connector must reject any handshake whose
+/// presented leaf cert SPKI does not match the pinned hash —
+/// closes the "system-trust-store CA was compromised, attacker
+/// substitutes the Fulcio leaf" arm even when WebPKI says the chain
+/// is otherwise valid. Default `None` keeps today's behaviour so a
+/// stale pin in a shipped binary can't brick legitimate Sigstore
+/// rotation; release process flips the constant to the rotated SPKI
+/// hash and ships a new lpm-cli build.
+///
+/// A custom `rustls::client::ServerCertVerifier` wired through the
+/// reqwest builder is the remaining work; the slot here is the
+/// audit hook so a future PR that adds the verifier without
+/// referencing M2 stands out in code review.
+#[allow(dead_code)]
+pub(crate) const EMBEDDED_FULCIO_SPKI_PIN_HEX: Option<&str> = None;
+
+/// M2: embedded SPKI pin for the canonical Rekor TLS leaf. Same
+/// shape and rationale as [`EMBEDDED_FULCIO_SPKI_PIN_HEX`].
+#[allow(dead_code)]
+pub(crate) const EMBEDDED_REKOR_SPKI_PIN_HEX: Option<&str> = None;
 
 /// Read a response body with a two-stage size cap: reject pre-stream
 /// when `Content-Length` declares an oversized body, then reject mid-
@@ -549,11 +586,46 @@ async fn rekor_upload(
     })
 }
 
-/// Extract the "sub" (subject) claim from a JWT without verifying the signature.
+/// Issuers whose JWTs we will accept the `sub` claim from. Fulcio is
+/// the canonical signature verifier; this allowlist is a defense-in-
+/// depth gate so that even a future bug that bypassed Fulcio would
+/// still refuse to trust a JWT from a non-recognised issuer.
 ///
-/// The subject is used as the proof-of-possession challenge for Fulcio —
-/// we sign it with the ephemeral key to prove we control the private key.
+/// Listed exactly as the OIDC providers we support produce them:
+/// - GitHub Actions: <https://token.actions.githubusercontent.com>
+/// - GitLab CI:      <https://gitlab.com>
+///
+/// Tests use `extract_jwt_subject_with_issuers` with a wider set so
+/// the wiremock-driven scenarios in this module's test suite continue
+/// to work without leaking test-only issuers into the production
+/// allowlist.
+const ALLOWED_OIDC_ISSUERS: &[&str] = &[
+    "https://token.actions.githubusercontent.com",
+    "https://gitlab.com",
+];
+
+/// Extract the "sub" (subject) claim from a JWT without verifying the
+/// signature — but only after the `iss` claim matches an allowlisted
+/// issuer.
+///
+/// The subject is used as the proof-of-possession challenge for Fulcio
+/// — we sign it with the ephemeral key to prove we control the
+/// private key. M1: pre-fix this function decoded `sub` regardless of
+/// who issued the token; a future change that started honouring the
+/// `sub` outside the Fulcio flow (or any downstream consumer that
+/// trusted the local decode) would have inherited that gap. The
+/// allowlist gate closes the structural arm.
 fn extract_jwt_subject(jwt: &str) -> Result<String, LpmError> {
+    extract_jwt_subject_with_issuers(jwt, ALLOWED_OIDC_ISSUERS)
+}
+
+/// Same as [`extract_jwt_subject`] but with a caller-supplied issuer
+/// allowlist. Reserved for `#[cfg(test)]` scenarios that need to
+/// admit a wiremock issuer.
+fn extract_jwt_subject_with_issuers(
+    jwt: &str,
+    allowed_issuers: &[&str],
+) -> Result<String, LpmError> {
     let parts: Vec<&str> = jwt.split('.').collect();
     if parts.len() != 3 {
         return Err(LpmError::Registry("invalid JWT format".into()));
@@ -576,6 +648,20 @@ fn extract_jwt_subject(jwt: &str) -> Result<String, LpmError> {
 
     let payload: serde_json::Value = serde_json::from_slice(&payload_bytes)
         .map_err(|e| LpmError::Registry(format!("failed to parse JWT payload: {e}")))?;
+
+    // M1: the issuer allowlist gate. Reject a JWT whose `iss` claim is
+    // absent OR not in the allowlist BEFORE returning the unverified
+    // `sub`. Fulcio remains the canonical signature verifier; this is
+    // defense-in-depth.
+    let iss = payload
+        .get("iss")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| LpmError::Registry("JWT missing 'iss' claim".into()))?;
+    if !allowed_issuers.contains(&iss) {
+        return Err(LpmError::Registry(format!(
+            "JWT issuer '{iss}' is not in the allowlist (M1)",
+        )));
+    }
 
     payload
         .get("sub")
@@ -1201,7 +1287,9 @@ mod tests {
 
     #[test]
     fn jwt_subject_extracts_from_valid_token() {
-        let jwt = make_jwt(r#"{"sub":"user@example.com","iss":"https://oidc"}"#);
+        let jwt = make_jwt(
+            r#"{"sub":"user@example.com","iss":"https://token.actions.githubusercontent.com"}"#,
+        );
         assert_eq!(extract_jwt_subject(&jwt).unwrap(), "user@example.com");
     }
 
@@ -1210,7 +1298,7 @@ mod tests {
         // Build a payload whose base64url encoding contains `-` and `_`.
         // The byte sequence below was chosen so that standard base64
         // would use `+` / `/`, forcing the URL-safe alphabet.
-        let payload = "{\"sub\":\"\u{00fb}\u{00fe}~\"}";
+        let payload = "{\"sub\":\"\u{00fb}\u{00fe}~\",\"iss\":\"https://token.actions.githubusercontent.com\"}";
         let jwt = make_jwt(payload);
         // Confirm the test JWT actually contains url-safe chars
         let middle = jwt.split('.').nth(1).unwrap();
@@ -1233,7 +1321,9 @@ mod tests {
             let mut sub = String::new();
             let jwt = loop {
                 sub.push('x');
-                let json = format!("{{\"sub\":\"{sub}\"}}");
+                let json = format!(
+                    "{{\"sub\":\"{sub}\",\"iss\":\"https://token.actions.githubusercontent.com\"}}",
+                );
                 let enc = URL_SAFE_NO_PAD.encode(json.as_bytes());
                 if enc.len() % 4 == pad_target {
                     break make_jwt(&json);
@@ -1274,19 +1364,60 @@ mod tests {
 
     #[test]
     fn jwt_subject_rejects_missing_sub_claim() {
-        let jwt = make_jwt(r#"{"iss":"https://oidc","aud":"sigstore"}"#);
+        let jwt =
+            make_jwt(r#"{"iss":"https://token.actions.githubusercontent.com","aud":"sigstore"}"#);
         let err = extract_jwt_subject(&jwt).expect_err("expected error");
         assert!(format!("{err}").contains("missing 'sub' claim"));
     }
 
     #[test]
     fn jwt_subject_rejects_non_string_sub_claim() {
-        let jwt = make_jwt(r#"{"sub":42}"#);
+        let jwt = make_jwt(r#"{"sub":42,"iss":"https://token.actions.githubusercontent.com"}"#);
         let err = extract_jwt_subject(&jwt).expect_err("expected error");
         // The current code path bails out via the same "missing 'sub'"
         // arm because `.as_str()` returns None for non-string values.
         // That's a documented contract: assert it explicitly.
         assert!(format!("{err}").contains("missing 'sub' claim"));
+    }
+
+    /// M1: a JWT with no `iss` claim must be refused even if the
+    /// signature would have verified — defense-in-depth so that a
+    /// future bug that bypassed Fulcio cannot trust the decoded sub.
+    #[test]
+    fn jwt_subject_rejects_missing_iss_claim() {
+        let jwt = make_jwt(r#"{"sub":"ci@example.com"}"#);
+        let err = extract_jwt_subject(&jwt).expect_err("expected error");
+        assert!(
+            format!("{err}").contains("missing 'iss' claim"),
+            "expected missing-iss error, got: {err}",
+        );
+    }
+
+    /// M1: an `iss` claim that is not in [`ALLOWED_OIDC_ISSUERS`] is
+    /// refused. Pre-fix the function returned the unverified `sub`
+    /// regardless of who issued the token.
+    #[test]
+    fn jwt_subject_rejects_unknown_issuer() {
+        let jwt = make_jwt(r#"{"sub":"ci@example.com","iss":"https://attacker.example.com"}"#);
+        let err = extract_jwt_subject(&jwt).expect_err("expected error");
+        assert!(
+            format!("{err}").contains("not in the allowlist"),
+            "expected allowlist-rejection error, got: {err}",
+        );
+    }
+
+    /// M1: the canonical GitHub Actions issuer passes the allowlist
+    /// gate, end-to-end. Pinning this here keeps the prod-allowlist
+    /// regression visible if the constant is ever silently widened.
+    #[test]
+    fn jwt_subject_accepts_canonical_github_actions_issuer() {
+        let jwt = make_jwt(
+            r#"{"sub":"repo:owner/repo:ref:refs/heads/main","iss":"https://token.actions.githubusercontent.com"}"#,
+        );
+        assert_eq!(
+            extract_jwt_subject(&jwt).unwrap(),
+            "repo:owner/repo:ref:refs/heads/main",
+        );
     }
 
     // ─── sign_and_record_with_endpoints orchestration ─────────────
@@ -1319,7 +1450,9 @@ mod tests {
             .await;
 
         let endpoints = SigstoreEndpoints::for_test(fulcio.uri(), rekor.uri());
-        let jwt = make_jwt(r#"{"sub":"ci@example.com"}"#);
+        let jwt = make_jwt(
+            r#"{"sub":"ci@example.com","iss":"https://token.actions.githubusercontent.com"}"#,
+        );
 
         let bundle = sign_and_record_with_endpoints(&jwt, b"{\"_type\":\"in-toto\"}", &endpoints)
             .await
@@ -1356,7 +1489,7 @@ mod tests {
         // before reaching it.
 
         let endpoints = SigstoreEndpoints::for_test(fulcio.uri(), rekor.uri());
-        let jwt = make_jwt(r#"{"sub":"ci"}"#);
+        let jwt = make_jwt(r#"{"sub":"ci","iss":"https://token.actions.githubusercontent.com"}"#);
 
         let err = sign_and_record_with_endpoints(&jwt, b"{}", &endpoints)
             .await

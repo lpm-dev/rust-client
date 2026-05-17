@@ -588,6 +588,20 @@ fn prepare_output_path(
                     )));
                 }
 
+                // M57: on Windows, `is_symlink()` only catches the
+                // `IO_REPARSE_TAG_SYMLINK` shape. Junctions, mount
+                // points, and other reparse-tagged directories carry
+                // `FILE_ATTRIBUTE_REPARSE_POINT` but are NOT classified
+                // as symlinks by `FileType`, so they would pass the
+                // check above and let `File::create` write through to
+                // the junction target on the next iteration.
+                if is_windows_reparse_point(&metadata) {
+                    return Err(LpmError::Registry(format!(
+                        "path traversal detected via reparse point in tarball target: {}",
+                        original_path.display()
+                    )));
+                }
+
                 if !metadata.is_dir() {
                     return Err(LpmError::Registry(format!(
                         "non-directory path blocks tarball extraction: {}",
@@ -647,8 +661,11 @@ fn create_leaf_file(target_path: &Path) -> Result<std::fs::File, LpmError> {
     {
         // Windows: explicit pre-create stat for the leaf-symlink
         // guard. NTFS reparse points behave differently than POSIX
-        // symlinks; mirroring the legacy behavior keeps cross-platform
-        // semantics identical.
+        // symlinks; this matches the parent-walk's reparse-point
+        // check so that junctions, mount points, and other reparse-
+        // tagged objects (which `is_symlink()` does NOT classify as
+        // symlinks) cannot redirect `File::create` writes outside the
+        // extraction root.
         match std::fs::symlink_metadata(target_path) {
             Ok(meta) if meta.file_type().is_symlink() => {
                 return Err(LpmError::Registry(format!(
@@ -656,10 +673,48 @@ fn create_leaf_file(target_path: &Path) -> Result<std::fs::File, LpmError> {
                     target_path.display()
                 )));
             }
+            // M57: catch the junction / mount-point shape that
+            // `is_symlink()` misses.
+            Ok(meta) if is_windows_reparse_point(&meta) => {
+                return Err(LpmError::Registry(format!(
+                    "path traversal detected via reparse point in tarball target: {}",
+                    target_path.display()
+                )));
+            }
             Ok(_) | Err(_) => {}
         }
         std::fs::File::create(target_path).map_err(LpmError::Io)
     }
+}
+
+/// M57: detect any NTFS reparse-point shape — symbolic links,
+/// junctions, mount points, IO_REPARSE_TAG_APPEXECLINK shims, etc.
+///
+/// `Metadata::file_type().is_symlink()` only flags reparse points
+/// whose tag is `IO_REPARSE_TAG_SYMLINK` (0xA000000C). Junctions
+/// (`IO_REPARSE_TAG_MOUNT_POINT` = 0xA0000003) and the long tail of
+/// reparse-tag variants do NOT pass that check, but their presence
+/// at a path can still redirect later file operations away from the
+/// extraction root via the underlying volume mount or junction
+/// target. Checking `FILE_ATTRIBUTE_REPARSE_POINT` directly catches
+/// every reparse-tagged inode in one bit test.
+///
+/// Returns `false` on non-Windows builds — the parent walk's
+/// `is_symlink()` check is sufficient on POSIX where junctions don't
+/// exist.
+#[cfg(windows)]
+fn is_windows_reparse_point(metadata: &std::fs::Metadata) -> bool {
+    use std::os::windows::fs::MetadataExt;
+    // 0x00000400 = FILE_ATTRIBUTE_REPARSE_POINT (winnt.h). Cross-
+    // checking via windows-sys is not worth the dep for one literal.
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
+    metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+}
+
+#[cfg(not(windows))]
+#[allow(dead_code)]
+fn is_windows_reparse_point(_metadata: &std::fs::Metadata) -> bool {
+    false
 }
 
 fn rollback_extraction(
