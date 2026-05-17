@@ -95,6 +95,18 @@ const READ_TIMEOUT: Duration = Duration::from_secs(30);
 /// Metadata cache TTL (5 minutes).
 const METADATA_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(300);
 
+/// Max bytes accepted from a single on-disk metadata cache entry.
+///
+/// The cache lives under `~/.lpm/cache/metadata/` (the trust boundary
+/// documented above the magic constant); but a same-user process that
+/// can plant a multi-GB file there would force every fresh-path read
+/// to allocate it before serde even noticed the bytes were nonsense.
+/// 100 MB matches the on-the-wire `MAX_METADATA_BYTES` cap so a
+/// legitimate worst-case packument always round-trips through the
+/// cache, while pathological files collapse to a cache miss before
+/// any decode work happens.
+const METADATA_CACHE_FILE_CAP: u64 = 100 * 1024 * 1024;
+
 /// Magic header for the manifest cache file format. Replaces the
 /// per-payload HMAC-SHA256 that used to run on every write. The cache
 /// lives at `~/.lpm/cache/metadata/` inside the user's home; if an
@@ -3351,17 +3363,34 @@ impl RegistryClient {
             return None;
         }
 
-        // Check TTL based on file modification time
-        let modified = path.metadata().ok()?.modified().ok()?;
+        // Check TTL based on file modification time AND enforce a
+        // hard size cap before any bytes are buffered. Same-user
+        // attacker who plants a multi-GB cache file no longer gets
+        // a free `Vec<u8>` allocation on every install start.
+        let meta = path.metadata().ok()?;
+        let modified = meta.modified().ok()?;
         let age = std::time::SystemTime::now().duration_since(modified).ok()?;
         if age > METADATA_CACHE_TTL {
+            return None;
+        }
+        if meta.len() > METADATA_CACHE_FILE_CAP {
+            tracing::warn!(
+                path = %path.display(),
+                size = meta.len(),
+                cap = METADATA_CACHE_FILE_CAP,
+                "metadata cache entry exceeds size cap — treating as miss"
+            );
             return None;
         }
 
         // Open with a buffered reader — avoids allocating the full file into
         // a Vec<u8> before deserialization.
         let file = std::fs::File::open(&path).ok()?;
-        let mut reader = std::io::BufReader::new(file);
+        // Bound the decoder's read window so a cache file that grows
+        // between the metadata check and the open() (race with another
+        // writer) still can't exceed the cap.
+        let mut reader =
+            std::io::BufReader::new(std::io::Read::take(file, METADATA_CACHE_FILE_CAP));
 
         // Validate magic prefix (METADATA_CACHE_MAGIC includes a trailing \n)
         let mut magic = [0u8; METADATA_CACHE_MAGIC.len()];
@@ -3398,6 +3427,20 @@ impl RegistryClient {
     fn read_cache_content(&self, key: &str) -> Option<CacheContent> {
         let path = self.cache_path(key)?;
         if !path.exists() {
+            return None;
+        }
+
+        // Reject oversized cache files before any bytes hit memory.
+        // Same boundary as `read_metadata_cache_as`; complements its
+        // TTL-only check on the stale-conditional-request path.
+        let file_size = path.metadata().ok()?.len();
+        if file_size > METADATA_CACHE_FILE_CAP {
+            tracing::warn!(
+                path = %path.display(),
+                size = file_size,
+                cap = METADATA_CACHE_FILE_CAP,
+                "metadata cache entry exceeds size cap — treating as miss"
+            );
             return None;
         }
 
@@ -8335,6 +8378,54 @@ mod tests {
         assert_eq!(
             cached.name, pkg_name,
             "round-tripped cache entry must preserve the package name"
+        );
+    }
+
+    /// M62: a cache file larger than METADATA_CACHE_FILE_CAP is
+    /// treated as a miss. The on-disk cache directory is the user's
+    /// home so this gate doesn't change the trust model — it just
+    /// prevents a pathological/hostile file from forcing every
+    /// install start to allocate a multi-GB `Vec<u8>` before serde
+    /// even notices the bytes are garbage.
+    #[test]
+    fn oversized_metadata_cache_file_collapses_to_miss() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let cache_dir = tmp.path().to_path_buf();
+        let client = RegistryClient::new().with_cache_dir(Some(cache_dir.clone()));
+
+        let pkg_name = "oversized-cache-file";
+        let key = format!("npm:{pkg_name}");
+
+        // Write a small valid entry first so the path exists.
+        let metadata: PackageMetadata =
+            serde_json::from_str(&test_metadata_json(pkg_name)).expect("parse test metadata");
+        client.write_metadata_cache(&key, &metadata, None);
+        let cache_file = client
+            .cache_path(&key)
+            .expect("cache_path resolves when cache_dir is configured");
+        assert!(cache_file.exists(), "cache write must land on disk");
+
+        // Truncate the file and pad it past the cap. We use the magic
+        // header prefix so the rejection isn't simply due to a missing
+        // magic byte — we want to prove the size check fires before
+        // the magic comparison.
+        let mut padding = METADATA_CACHE_MAGIC.to_vec();
+        padding.extend(b"\n"); // empty ETag line
+        padding.resize((METADATA_CACHE_FILE_CAP + 1024) as usize, b'x');
+        std::fs::write(&cache_file, &padding).expect("rewrite cache file oversized");
+
+        // Read must return None (cache miss).
+        let result = client.read_metadata_cache(&key);
+        assert!(
+            result.is_none(),
+            "oversized cache file must collapse to a miss"
+        );
+
+        // Same posture on the stale-conditional read path.
+        let content = client.read_cache_content(&key);
+        assert!(
+            content.is_none(),
+            "read_cache_content must also refuse oversized files"
         );
     }
 

@@ -958,13 +958,27 @@ async fn run_under_store_lock(
     {
         output::warn(line);
     }
-    if sandbox_log && !json_output {
-        output::warn(
-            "--sandbox-log: diagnostic mode only. Rule triggers are logged but NOT \
-             enforced — do not treat a clean run as a safety signal. View reported \
-             accesses via `log show --last 5m --predicate 'senderImagePath CONTAINS \
-             \"Sandbox\"'` and grep for the script's pid.",
+    if sandbox_log {
+        // The `--sandbox-log` banner is a SECURITY signal — the user
+        // has opted into permissive-with-report which leaves the
+        // install effectively unsandboxed on macOS. JSON-mode callers
+        // (CI / agents) need to know they're NOT getting enforcement,
+        // so emit via `tracing::warn` (lands on stderr regardless of
+        // mode) AND via `output::warn` for the human path. Matches
+        // the M11/L11 posture for the same class of "loud signal
+        // must survive --json" warnings.
+        tracing::warn!(
+            target: "lpm_cli::sandbox",
+            "--sandbox-log: diagnostic mode only — rule triggers are LOGGED but NOT enforced. Do not treat a clean run as a safety signal."
         );
+        if !json_output {
+            output::warn(
+                "--sandbox-log: diagnostic mode only. Rule triggers are logged but NOT \
+                 enforced — do not treat a clean run as a safety signal. View reported \
+                 accesses via `log show --last 5m --predicate 'senderImagePath CONTAINS \
+                 \"Sandbox\"'` and grep for the script's pid.",
+            );
+        }
     }
 
     for pkg in &to_build {

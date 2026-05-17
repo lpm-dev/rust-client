@@ -90,15 +90,26 @@ impl ProjectAuditCache {
     }
 
     /// Look up a cached entry. Returns the analysis if the integrity matches.
+    ///
+    /// M61: cache hits REQUIRE matching integrity on both sides. The
+    /// pre-fix degraded mode (any side missing integrity → "trust the
+    /// cache") allowed a malicious repo to ship a committed
+    /// `.lpm/audit-cache.json` alongside packages whose lockfile entries
+    /// were scrubbed of SRI. Subsequent `lpm audit` runs would return
+    /// the cached "no findings" verdict without re-scanning. Now any
+    /// arm with `None` on either side returns `None` (cache miss),
+    /// forcing a fresh behavioral scan.
     pub fn get(&self, path: &str, integrity: Option<&str>) -> Option<&PackageAnalysis> {
         let entry = self.entries.get(path)?;
 
-        // If both have integrity hashes, compare them
         match (integrity, &entry.integrity) {
             (Some(new), Some(cached)) if new == cached => Some(&entry.analysis),
-            (Some(_), Some(_)) => None, // integrity mismatch → stale
-            // No integrity to compare (degraded mode) — trust the cache
-            _ => Some(&entry.analysis),
+            // Mismatched, OR either side missing → re-scan. The
+            // discovered-side `None` case (lockfile missing SRI for a
+            // package) is the security gap M61 closes; the
+            // cached-side `None` case is harmless but means we never
+            // hit an entry written before this fix.
+            _ => None,
         }
     }
 
@@ -127,4 +138,121 @@ impl ProjectAuditCache {
 
 fn cache_path(project_root: &Path) -> PathBuf {
     project_root.join(".lpm").join("audit-cache.json")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use lpm_security::behavioral::PackageAnalysis;
+
+    fn empty_analysis() -> PackageAnalysis {
+        // Build the cheapest possible PackageAnalysis for the cache-
+        // lookup tests. Substruct defaults are derived; the parent
+        // struct is not, so we name the fields explicitly.
+        PackageAnalysis {
+            version: lpm_security::behavioral::SCHEMA_VERSION,
+            analyzed_at: "1970-01-01T00:00:00Z".into(),
+            source: Default::default(),
+            supply_chain: Default::default(),
+            manifest: Default::default(),
+            meta: Default::default(),
+        }
+    }
+
+    /// Both integrity hashes present and matching → cache hit.
+    #[test]
+    fn get_returns_entry_on_integrity_match() {
+        let mut cache = ProjectAuditCache::new("npm");
+        cache.insert(
+            "node_modules/react".into(),
+            "react".into(),
+            "18.0.0".into(),
+            Some("sha512-cachehash".into()),
+            empty_analysis(),
+            vec![],
+        );
+        assert!(
+            cache
+                .get("node_modules/react", Some("sha512-cachehash"))
+                .is_some()
+        );
+    }
+
+    /// Both integrity hashes present but different → re-scan.
+    #[test]
+    fn get_returns_none_on_integrity_mismatch() {
+        let mut cache = ProjectAuditCache::new("npm");
+        cache.insert(
+            "node_modules/react".into(),
+            "react".into(),
+            "18.0.0".into(),
+            Some("sha512-cachehash".into()),
+            empty_analysis(),
+            vec![],
+        );
+        assert!(
+            cache
+                .get("node_modules/react", Some("sha512-different"))
+                .is_none()
+        );
+    }
+
+    /// M61: discovered-side missing integrity (lockfile scrubbed of
+    /// SRI / node_modules fallback) MUST refuse the cached entry.
+    /// Pre-fix this returned `Some(analysis)` from the cache, letting
+    /// a hostile committed cache short-circuit fresh behavioral
+    /// scanning for packages whose integrity was deliberately omitted.
+    #[test]
+    fn get_returns_none_when_discovered_integrity_missing() {
+        let mut cache = ProjectAuditCache::new("npm");
+        cache.insert(
+            "node_modules/react".into(),
+            "react".into(),
+            "18.0.0".into(),
+            Some("sha512-cachehash".into()),
+            empty_analysis(),
+            vec![],
+        );
+        assert!(
+            cache.get("node_modules/react", None).is_none(),
+            "discovered-side None must NOT trust the cache — that was the M61 hole"
+        );
+    }
+
+    /// Cached-side missing integrity (entry written under an older
+    /// release that didn't record SRI) is also treated as miss. Forces
+    /// a re-scan that re-populates the entry with the new SRI field.
+    #[test]
+    fn get_returns_none_when_cached_integrity_missing() {
+        let mut cache = ProjectAuditCache::new("npm");
+        cache.insert(
+            "node_modules/react".into(),
+            "react".into(),
+            "18.0.0".into(),
+            None,
+            empty_analysis(),
+            vec![],
+        );
+        assert!(
+            cache
+                .get("node_modules/react", Some("sha512-discovered"))
+                .is_none()
+        );
+    }
+
+    /// Both sides None — also a miss. Symmetric with the other arms;
+    /// pre-fix this also collapsed to "trust the cache".
+    #[test]
+    fn get_returns_none_when_both_integrities_missing() {
+        let mut cache = ProjectAuditCache::new("npm");
+        cache.insert(
+            "node_modules/react".into(),
+            "react".into(),
+            "18.0.0".into(),
+            None,
+            empty_analysis(),
+            vec![],
+        );
+        assert!(cache.get("node_modules/react", None).is_none());
+    }
 }
