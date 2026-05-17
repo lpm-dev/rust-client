@@ -634,8 +634,16 @@ impl PackageStore {
         // Compare against expected integrity before the scan / rename.
         // Scope: sha512-only (see doc comment). Non-sha512 expected values
         // fall through; the caller chose the wrong path.
+        //
+        // L22: constant-time `ct_eq` instead of `!=` so a future
+        // attacker-influenced caller (server-side verifier, observable
+        // timing channel) doesn't see per-byte digest information leak
+        // through `String::eq`'s early exit.
         if let Some(expected) = expected_integrity {
-            if expected.starts_with("sha512-") && expected != computed_sri {
+            use subtle::ConstantTimeEq;
+            let matches_expected = expected.len() == computed_sri.len()
+                && expected.as_bytes().ct_eq(computed_sri.as_bytes()).into();
+            if expected.starts_with("sha512-") && !matches_expected {
                 let _ = std::fs::remove_dir_all(&tmp_dir);
                 return Err(LpmError::Registry(format!(
                     "integrity mismatch for {name}@{version}: expected {expected}, got {computed_sri}"

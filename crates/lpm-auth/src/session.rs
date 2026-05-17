@@ -612,20 +612,110 @@ fn is_ci_token_env() -> bool {
     ci && has_oidc
 }
 
-/// Same fingerprint shape as the legacy `try_silent_refresh` so the
-/// server treats refreshes from this client as continuous with prior
-/// logins.
-fn compute_device_fingerprint() -> String {
-    use sha2::{Digest, Sha256};
-    let hostname = std::env::var("HOSTNAME")
-        .or_else(|_| std::env::var("COMPUTERNAME"))
-        .unwrap_or_else(|_| "unknown".to_string());
-    let username = std::env::var("USER")
-        .or_else(|_| std::env::var("USERNAME"))
-        .unwrap_or_else(|_| "unknown".to_string());
-    hex::encode(Sha256::digest(
-        format!("{hostname}:{username}:lpm-cli").as_bytes(),
-    ))
+/// Per-install random device fingerprint.
+///
+/// L13: the legacy `sha256(hostname:username:lpm-cli)` shape was
+/// predictable (anyone with shell access on the box could compute it)
+/// AND leaked a stable per-user identifier to every proxy on the
+/// login / refresh path. The current shape is a 256-bit random ID
+/// generated on first use and stored in `~/.lpm/device-id` at 0o600.
+/// Subsequent runs read it back; the server still gets a stable
+/// per-install identifier (needed for the device-binding gate), but
+/// the value is unpredictable from outside the host and decoupled
+/// from username / hostname.
+///
+/// **Fallback:** if `~/.lpm/` cannot be created (read-only HOME,
+/// permission denied, exotic mount), we synthesise a process-local
+/// random value so login still proceeds. The server treats this as
+/// "new device" and the user re-pairs.
+pub fn compute_device_fingerprint() -> String {
+    use rand::RngCore;
+    use std::io::Read;
+    use std::path::PathBuf;
+
+    fn device_id_path() -> Option<PathBuf> {
+        dirs::home_dir().map(|h| h.join(".lpm").join("device-id"))
+    }
+
+    fn generate_random_id() -> String {
+        let mut bytes = [0u8; 32];
+        rand::thread_rng().fill_bytes(&mut bytes);
+        hex::encode(bytes)
+    }
+
+    let Some(path) = device_id_path() else {
+        tracing::warn!(
+            "no $HOME — using process-local device fingerprint (server will treat each run as a new device)"
+        );
+        return generate_random_id();
+    };
+
+    if let Ok(mut f) = std::fs::File::open(&path) {
+        let mut buf = String::new();
+        if f.read_to_string(&mut buf).is_ok() {
+            let trimmed = buf.trim();
+            if trimmed.len() == 64 && trimmed.chars().all(|c| c.is_ascii_hexdigit()) {
+                return trimmed.to_string();
+            }
+            tracing::warn!(
+                path = %path.display(),
+                "device-id file is malformed — regenerating"
+            );
+        }
+    }
+
+    if let Some(parent) = path.parent()
+        && let Err(e) = std::fs::create_dir_all(parent)
+    {
+        tracing::warn!(
+            path = %parent.display(),
+            "failed to create ~/.lpm for device-id ({e}) — using process-local fingerprint"
+        );
+        return generate_random_id();
+    }
+
+    let id = generate_random_id();
+    let mut open_opts = std::fs::OpenOptions::new();
+    open_opts.create(true).write(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        open_opts.mode(0o600);
+    }
+    match open_opts.open(&path) {
+        Ok(mut f) => {
+            use std::io::Write as _;
+            if let Err(e) = f.write_all(id.as_bytes()) {
+                tracing::warn!(
+                    path = %path.display(),
+                    "failed to persist device-id ({e}) — using one-shot fingerprint for this run"
+                );
+            }
+            // `OpenOptions::mode()` only applies on file creation, so
+            // a regenerate over a pre-existing 0o644 file keeps the
+            // old perms. Force 0o600 unconditionally on the just-
+            // written handle.
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                if let Err(e) =
+                    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+                {
+                    tracing::warn!(
+                        path = %path.display(),
+                        "failed to chmod device-id to 0o600 ({e})"
+                    );
+                }
+            }
+        }
+        Err(e) => {
+            tracing::warn!(
+                path = %path.display(),
+                "failed to open device-id for write ({e}) — using one-shot fingerprint for this run"
+            );
+        }
+    }
+    id
 }
 
 /// Drop tokens whose secret value is the empty string. Empty bearer
@@ -651,6 +741,91 @@ fn session_only(c: CachedToken) -> Option<SecretString> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// L13: two invocations under the same HOME return the same value
+    /// (server expects a stable per-install identifier across runs).
+    /// The first call generates and persists; the second reads it back.
+    #[test]
+    fn device_fingerprint_is_stable_across_calls_under_same_home() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let prev = std::env::var_os("HOME");
+        // SAFETY: serialized by Rust's #[test] default (single-threaded
+        // within this binary plus nextest's per-test process isolation).
+        unsafe {
+            std::env::set_var("HOME", tmp.path());
+        }
+        let first = compute_device_fingerprint();
+        let second = compute_device_fingerprint();
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("HOME", v),
+                None => std::env::remove_var("HOME"),
+            }
+        }
+        assert_eq!(first, second, "fingerprint must persist across calls");
+        assert_eq!(first.len(), 64, "32-byte random encoded as 64 hex chars");
+        assert!(
+            first.chars().all(|c| c.is_ascii_hexdigit()),
+            "fingerprint should be lowercase hex"
+        );
+    }
+
+    /// Two distinct HOMEs (≈ two distinct installs) produce distinct
+    /// random fingerprints — proves the value is not derived from
+    /// machine-identifying inputs like hostname / username.
+    #[test]
+    fn device_fingerprint_differs_across_distinct_installs() {
+        let tmp_a = tempfile::tempdir().unwrap();
+        let tmp_b = tempfile::tempdir().unwrap();
+        let prev = std::env::var_os("HOME");
+        unsafe {
+            std::env::set_var("HOME", tmp_a.path());
+        }
+        let a = compute_device_fingerprint();
+        unsafe {
+            std::env::set_var("HOME", tmp_b.path());
+        }
+        let b = compute_device_fingerprint();
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("HOME", v),
+                None => std::env::remove_var("HOME"),
+            }
+        }
+        assert_ne!(
+            a, b,
+            "distinct installs must have distinct fingerprints (random per-install)"
+        );
+    }
+
+    /// Malformed device-id file is regenerated rather than trusted.
+    #[cfg(unix)]
+    #[test]
+    fn device_fingerprint_regenerates_on_malformed_file() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let lpm_dir = tmp.path().join(".lpm");
+        std::fs::create_dir_all(&lpm_dir).unwrap();
+        let path = lpm_dir.join("device-id");
+        std::fs::write(&path, b"not-a-valid-hex-digest").unwrap();
+
+        let prev = std::env::var_os("HOME");
+        unsafe {
+            std::env::set_var("HOME", tmp.path());
+        }
+        let id = compute_device_fingerprint();
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("HOME", v),
+                None => std::env::remove_var("HOME"),
+            }
+        }
+        assert_eq!(id.len(), 64);
+        assert!(id.chars().all(|c| c.is_ascii_hexdigit()));
+        // File should also have been rewritten at 0o600.
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "rewritten device-id must be 0o600");
+    }
 
     #[test]
     fn refresh_policy_table() {

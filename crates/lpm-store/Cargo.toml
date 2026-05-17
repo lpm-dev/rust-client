@@ -24,6 +24,7 @@ hex = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 rand = { workspace = true }
+subtle = "2"
 
 [target.'cfg(unix)'.dependencies]
 # Phase 66 Phase 4a: clonefile syscall on macOS for v2 link-entry

@@ -458,7 +458,10 @@ impl Store {
         let computed_sri = crate::compute_sri_hash(tarball_data);
 
         if let Some(expected) = expected_integrity {
-            if expected.starts_with("sha512-") && expected != computed_sri {
+            use subtle::ConstantTimeEq;
+            let matches_expected = expected.len() == computed_sri.len()
+                && expected.as_bytes().ct_eq(computed_sri.as_bytes()).into();
+            if expected.starts_with("sha512-") && !matches_expected {
                 return Err(LpmError::IntegrityMismatch {
                     expected: expected.to_string(),
                     actual: computed_sri,

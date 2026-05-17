@@ -242,6 +242,23 @@ fn extract_response_data(response: &ClientMessage) -> (u16, HashMap<String, Stri
 
 // ── TOFU Certificate Pinning ──────────────────────────────────────
 
+/// Optional embedded SPKI SHA-256 pin for the canonical relay
+/// (`relay.lpm.fyi`). When `Some`, the first connect to the canonical
+/// host MUST match this pin — pure WebPKI-valid-but-unknown TOFU is
+/// rejected.
+///
+/// L3: pure TOFU on first connect lets an attacker who controls the
+/// network on the user's first `lpm dev --tunnel` capture a forged
+/// pin. The embedded pin slot is wired up here so the release pipeline
+/// can flip `None` → `Some("<canonical SPKI sha256 hex>")` to close
+/// the first-connect gap. Default stays at `None` to avoid shipping a
+/// pin that's wrong (or rotated) and would brick every install.
+///
+/// Non-canonical hosts (`LPM_TUNNEL_RELAY` override, regional relays)
+/// continue to use pure TOFU — the embedded pin would be meaningless
+/// for them.
+const EMBEDDED_CANONICAL_RELAY_SPKI_PIN_HEX: Option<&str> = None;
+
 /// Read the stored TOFU pin (hex-encoded SHA-256 of SPKI) for `host`.
 ///
 /// Looks up `~/.lpm/relay-pins/<host>` first. If absent AND `host` is
@@ -482,11 +499,41 @@ impl rustls::client::danger::ServerCertVerifier for TofuPinningVerifier {
                 tracing::debug!("TOFU certificate pin verified for {host}");
             }
             None => {
+                // L3: on the canonical relay, if an embedded SPKI pin
+                // is compiled in, the cert MUST match it on first
+                // connect — pure WebPKI-valid TOFU is no longer good
+                // enough. Closes the first-connect MITM window. The
+                // const is None by default; release flips it to
+                // `Some(...)` to enable enforcement.
+                if host == crate::relay::DEFAULT_RELAY_HOST
+                    && let Some(expected) = EMBEDDED_CANONICAL_RELAY_SPKI_PIN_HEX
+                    && expected != current_pin
+                {
+                    tracing::error!(
+                        "FIRST-CONNECT PIN MISMATCH for {host}: embedded={expected}, current={current_pin}. \
+                         The relay's certificate does not match the pin shipped with this binary."
+                    );
+                    return Err(rustls::Error::General(format!(
+                        "first-connect pin mismatch for {host} — possible MITM \
+                         (delete any stored pin and reinstall lpm if the relay legitimately rotated)"
+                    )));
+                }
+
                 // First connection (or post-upgrade migration from the
                 // legacy global pin file) — store the pin under the
-                // per-host layout.
+                // per-host layout. Warn-level so operators reviewing CI
+                // logs see when a fresh pin was captured (a pure-TOFU
+                // accept on the canonical relay is the L3 hazard
+                // surface; surfacing it is the minimum step while the
+                // embedded-pin slot is still empty).
                 if let Err(e) = write_tofu_pin(&host, &current_pin) {
                     tracing::warn!("failed to store TOFU pin for {host}: {e}");
+                } else if host == crate::relay::DEFAULT_RELAY_HOST {
+                    tracing::warn!(
+                        host = %host,
+                        pin = %current_pin,
+                        "captured first-connect TOFU pin for canonical relay — verify the SPKI hash matches the published one before relying on this install"
+                    );
                 } else {
                     tracing::info!("stored relay certificate pin (TOFU) for {host}: {current_pin}");
                 }

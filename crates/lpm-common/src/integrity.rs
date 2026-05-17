@@ -3,6 +3,7 @@ use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256, Sha512};
 use std::fmt;
+use subtle::ConstantTimeEq;
 
 /// Subresource Integrity (SRI) hash.
 ///
@@ -89,9 +90,17 @@ impl Integrity {
     }
 
     /// Verify that the given data matches this integrity hash.
+    ///
+    /// Uses [`subtle::ConstantTimeEq`] so a future caller running this
+    /// path against attacker-influenced timing (server-side verifier,
+    /// network-observable hot loop) doesn't leak per-byte digest
+    /// information through `Vec::eq`'s early-exit short-circuit. The
+    /// length check happens first — both digests are always the same
+    /// length for a given algorithm (32 for SHA-256, 64 for SHA-512)
+    /// but the explicit guard documents the precondition.
     pub fn verify(&self, data: &[u8]) -> Result<(), LpmError> {
         let computed = Self::from_bytes(self.algorithm, data);
-        if self.hash == computed.hash {
+        if self.hash.len() == computed.hash.len() && self.hash.ct_eq(&computed.hash).into() {
             Ok(())
         } else {
             Err(LpmError::IntegrityMismatch {
@@ -136,7 +145,7 @@ impl Integrity {
             }
         };
 
-        if self.hash == computed_hash {
+        if self.hash.len() == computed_hash.len() && self.hash.ct_eq(&computed_hash).into() {
             Ok(())
         } else {
             let computed = Integrity {
@@ -230,6 +239,40 @@ mod tests {
             msg.contains("sha512 digest must be 64 bytes"),
             "expected length-mismatch message, got: {msg}"
         );
+    }
+
+    /// L22: `verify` now goes through `subtle::ConstantTimeEq` so a
+    /// future caller running this path against attacker-influenced
+    /// timing doesn't leak per-byte digest information. The behavioural
+    /// contract (match → Ok, mismatch → IntegrityMismatch) stays
+    /// identical — this test pins the contract; the constant-time
+    /// guarantee comes from the type system (`ConstantTimeEq` impl).
+    #[test]
+    fn verify_returns_ok_on_match_and_mismatch_on_one_byte_flip() {
+        let data = b"the quick brown fox jumps over the lazy dog";
+        for algo in [HashAlgorithm::Sha256, HashAlgorithm::Sha512] {
+            let i = Integrity::from_bytes(algo, data);
+            assert!(
+                i.verify(data).is_ok(),
+                "verify must succeed on identical bytes"
+            );
+            // Flip the last byte and confirm verify fails.
+            let mut tampered = data.to_vec();
+            *tampered.last_mut().unwrap() ^= 0x01;
+            assert!(
+                i.verify(&tampered).is_err(),
+                "verify must fail on one-byte tamper"
+            );
+            // Flip the first byte too — the constant-time path checks
+            // every position, so an early-byte mismatch is rejected
+            // identically to a late-byte mismatch.
+            let mut tampered_early = data.to_vec();
+            tampered_early[0] ^= 0x01;
+            assert!(
+                i.verify(&tampered_early).is_err(),
+                "verify must fail regardless of which byte differs"
+            );
+        }
     }
 
     /// Computed digests round-trip through parse — same algorithm gives

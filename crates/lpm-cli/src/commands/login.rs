@@ -61,18 +61,9 @@ pub async fn run(registry_url: &str, json_output: bool) -> Result<(), LpmError> 
         hex::encode(bytes)
     };
 
-    // Compute device fingerprint for session auth (Feature 44 Part B)
-    let device_fingerprint = {
-        use sha2::{Digest, Sha256};
-        let hostname = std::env::var("HOSTNAME")
-            .or_else(|_| std::env::var("COMPUTERNAME"))
-            .unwrap_or_else(|_| "unknown".to_string());
-        let username = std::env::var("USER")
-            .or_else(|_| std::env::var("USERNAME"))
-            .unwrap_or_else(|_| "unknown".to_string());
-        let input = format!("{hostname}:{username}:lpm-cli");
-        hex::encode(Sha256::digest(input.as_bytes()))
-    };
+    // Per-install random fingerprint stored at ~/.lpm/device-id; see
+    // `lpm_auth::compute_device_fingerprint` for the L13 rationale.
+    let device_fingerprint = lpm_auth::compute_device_fingerprint();
     let device_name = std::env::var("HOSTNAME")
         .or_else(|_| std::env::var("COMPUTERNAME"))
         .unwrap_or_else(|_| "CLI".to_string());
