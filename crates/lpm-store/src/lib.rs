@@ -421,8 +421,14 @@ impl PackageStore {
             return Err(error);
         }
 
-        // Write SRI integrity hash of the original tarball for later verification.
-        // This allows `store verify --deep` to detect post-extraction tampering.
+        // Write SRI integrity hash of the original tarball. This
+        // records the tarball-time digest only — `store verify --deep`
+        // uses it for lockfile↔marker consistency (the marker matches
+        // the lockfile's claimed integrity). It does NOT re-hash the
+        // extracted on-disk bytes, so a post-extraction tamper that
+        // leaves the `.integrity` marker untouched goes undetected. A
+        // byte-integrity recompute would need a Merkle digest of the
+        // extracted directory + a place to store it; not implemented.
         let sri = compute_sri_hash(tarball_data);
         if let Err(e) = std::fs::write(tmp_dir.join(".integrity"), &sri) {
             let _ = std::fs::remove_dir_all(&tmp_dir);

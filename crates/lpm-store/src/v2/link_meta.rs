@@ -29,6 +29,14 @@ use crate::v2::graph_key::GraphKey;
 /// `links/<graph-key>/` directory (not inside `node_modules/`).
 pub const LINK_META_FILENAME: &str = ".lpm-link-meta.json";
 
+/// Maximum sidecar size `LinkMeta::read_from` will accept. Real
+/// sidecars are a few hundred bytes (one `LinkMeta` + a `deps` list);
+/// 256 KiB is several orders of magnitude of headroom while keeping
+/// the diagnostic walk fast even when a hostile writer planted many
+/// oversized files. Over-cap sidecars surface as `LpmError::Store` and
+/// the bulk enumerators treat them like a malformed sidecar.
+pub const LINK_META_MAX_BYTES: u64 = 256 * 1024;
+
 /// Schema version of the sidecar payload. Bump in lock-step with any
 /// breaking field change. Readers MUST reject unknown versions and
 /// treat the link entry as malformed (i.e., re-materialize on next
@@ -201,16 +209,35 @@ impl LinkMeta {
     /// Read a sidecar from `<link_dir>/.lpm-link-meta.json`.
     ///
     /// Returns [`LpmError::Store`] on missing-file / malformed JSON /
-    /// unknown-schema. The unknown-schema path is the load-bearing
-    /// safety: a future lpm reading a sidecar from an even-newer build
-    /// must NOT trust unknown fields.
+    /// unknown-schema / over-cap size. The unknown-schema path is the
+    /// load-bearing safety: a future lpm reading a sidecar from an
+    /// even-newer build must NOT trust unknown fields.
     ///
     /// Also validates that `name` is safe to use as a `Path::join`
     /// segment (L55). Consumers do `link_dir.join("node_modules").join(&meta.name)`
     /// without further checks; a tampered sidecar with `name = "../../etc"`
     /// or `name = "/etc/passwd"` would resolve outside the link directory.
+    ///
+    /// Sidecar reads are capped at [`LINK_META_MAX_BYTES`] via a
+    /// metadata-first check, so an oversized file planted by a hostile
+    /// same-user writer can't force the prune/doctor/store diagnostic
+    /// walk to allocate megabytes before bailing.
     pub fn read_from(link_dir: &Path) -> Result<Self, LpmError> {
         let path = link_dir.join(LINK_META_FILENAME);
+        let metadata = std::fs::metadata(&path).map_err(|e| {
+            LpmError::Store(format!(
+                "failed to read v2 link sidecar at {}: {e}",
+                path.display()
+            ))
+        })?;
+        if metadata.len() > LINK_META_MAX_BYTES {
+            return Err(LpmError::Store(format!(
+                "v2 link sidecar at {} is {} bytes; refusing to read above the {} byte cap",
+                path.display(),
+                metadata.len(),
+                LINK_META_MAX_BYTES
+            )));
+        }
         let bytes = std::fs::read(&path).map_err(|e| {
             LpmError::Store(format!(
                 "failed to read v2 link sidecar at {}: {e}",
@@ -503,6 +530,43 @@ mod tests {
         LinkMeta::touch_on_disk(&path).unwrap();
         let after_touch = meta.effective_last_referenced_at(&path);
         assert!(after_touch > original_json_field);
+    }
+
+    /// A sidecar over `LINK_META_MAX_BYTES` must be rejected by the
+    /// metadata-len gate before `std::fs::read` allocates the buffer.
+    /// Prevents a hostile same-user writer from forcing the
+    /// prune/doctor/store diagnostic walk to chew through arbitrary
+    /// bytes before deciding the entry is malformed.
+    #[test]
+    fn read_from_rejects_oversized_sidecar_before_parsing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(LINK_META_FILENAME);
+        // Write a file just past the cap. Doesn't have to be valid
+        // JSON — the size gate fires first.
+        let payload = vec![b'{'; (LINK_META_MAX_BYTES + 1) as usize];
+        std::fs::write(&path, &payload).unwrap();
+        let err = LinkMeta::read_from(dir.path()).unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("refusing to read above"), "got: {msg}");
+        assert!(msg.contains(&format!("{}", LINK_META_MAX_BYTES)));
+    }
+
+    /// A sidecar at or under the cap follows the normal parse path.
+    /// Ensures the size gate doesn't over-reject typical real
+    /// sidecars.
+    #[test]
+    fn read_from_accepts_legit_size_sidecar() {
+        let dir = tempfile::tempdir().unwrap();
+        let meta = sample_meta();
+        meta.write_to(dir.path()).unwrap();
+        let bytes = std::fs::metadata(dir.path().join(LINK_META_FILENAME))
+            .unwrap()
+            .len();
+        assert!(
+            bytes < LINK_META_MAX_BYTES,
+            "real sidecar must be well under the cap: {bytes}"
+        );
+        LinkMeta::read_from(dir.path()).unwrap();
     }
 
     /// L55: a tampered sidecar with `name = "../../etc/passwd"` must
