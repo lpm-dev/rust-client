@@ -204,6 +204,11 @@ impl LinkMeta {
     /// unknown-schema. The unknown-schema path is the load-bearing
     /// safety: a future lpm reading a sidecar from an even-newer build
     /// must NOT trust unknown fields.
+    ///
+    /// Also validates that `name` is safe to use as a `Path::join`
+    /// segment (L55). Consumers do `link_dir.join("node_modules").join(&meta.name)`
+    /// without further checks; a tampered sidecar with `name = "../../etc"`
+    /// or `name = "/etc/passwd"` would resolve outside the link directory.
     pub fn read_from(link_dir: &Path) -> Result<Self, LpmError> {
         let path = link_dir.join(LINK_META_FILENAME);
         let bytes = std::fs::read(&path).map_err(|e| {
@@ -224,6 +229,13 @@ impl LinkMeta {
                 path.display(),
                 parsed.schema,
                 LINK_META_SCHEMA_VERSION
+            )));
+        }
+        if let Err(why) = validate_name_for_path_join(&parsed.name) {
+            return Err(LpmError::Store(format!(
+                "v2 link sidecar at {} has unsafe name {:?}: {why}",
+                path.display(),
+                parsed.name
             )));
         }
         Ok(parsed)
@@ -296,6 +308,68 @@ impl LinkMeta {
         })?;
         Ok(final_path)
     }
+}
+
+/// Validate that `name` is safe to use in `link_dir.join("node_modules").join(name)`.
+/// Rejects empty, oversize, control-character, traversal, absolute,
+/// Windows-prefix, and backslash forms. Accepts unscoped names (a
+/// single segment) and one-`/` scoped names (`@scope/pkg`).
+///
+/// Centralized here because every v2 consumer joins the sidecar's
+/// `name` into a path and must trust that single source. Registry-
+/// supplied names ARE strict — this rejects only what a tampered
+/// sidecar could plausibly inject.
+fn validate_name_for_path_join(name: &str) -> Result<(), &'static str> {
+    if name.is_empty() {
+        return Err("empty name");
+    }
+    if name.len() > 214 {
+        return Err("exceeds 214-char npm limit");
+    }
+    let parts: Vec<&str> = name.split('/').collect();
+    let segments: Vec<&str> = match parts.as_slice() {
+        [single] => {
+            if single.starts_with('@') {
+                return Err("scoped name missing /package component");
+            }
+            vec![*single]
+        }
+        [scope, pkg] => {
+            if !scope.starts_with('@') {
+                return Err("two-component name must start with @scope");
+            }
+            if scope.len() < 2 {
+                return Err("empty scope after @");
+            }
+            vec![&scope[1..], *pkg]
+        }
+        _ => return Err("name has more than one /"),
+    };
+    for seg in segments {
+        validate_path_segment(seg)?;
+    }
+    Ok(())
+}
+
+fn validate_path_segment(s: &str) -> Result<(), &'static str> {
+    if s.is_empty() {
+        return Err("empty path segment");
+    }
+    if s == "." || s == ".." {
+        return Err("traversal path segment");
+    }
+    for c in s.chars() {
+        if c.is_control() {
+            return Err("control character in name");
+        }
+        if matches!(
+            c,
+            '\\' | '/' | ':' | '\0' | '*' | '?' | '"' | '<' | '>' | '|'
+        ) {
+            return Err("forbidden character in name");
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -429,6 +503,97 @@ mod tests {
         LinkMeta::touch_on_disk(&path).unwrap();
         let after_touch = meta.effective_last_referenced_at(&path);
         assert!(after_touch > original_json_field);
+    }
+
+    /// L55: a tampered sidecar with `name = "../../etc/passwd"` must
+    /// be rejected at read time so downstream `link_dir.join(name)`
+    /// can't resolve outside the link directory.
+    #[test]
+    fn read_from_rejects_sidecar_with_path_traversal_in_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut meta = sample_meta();
+        meta.name = "../../etc/passwd".into();
+        std::fs::write(
+            dir.path().join(LINK_META_FILENAME),
+            serde_json::to_vec(&meta).unwrap(),
+        )
+        .unwrap();
+        let err = LinkMeta::read_from(dir.path()).unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("unsafe name"), "got: {msg}");
+    }
+
+    /// L55: an absolute name like `/etc/passwd` must be rejected.
+    #[test]
+    fn read_from_rejects_sidecar_with_absolute_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut meta = sample_meta();
+        meta.name = "/etc/passwd".into();
+        std::fs::write(
+            dir.path().join(LINK_META_FILENAME),
+            serde_json::to_vec(&meta).unwrap(),
+        )
+        .unwrap();
+        assert!(LinkMeta::read_from(dir.path()).is_err());
+    }
+
+    /// L55: a Windows backslash or drive prefix must be rejected.
+    #[test]
+    fn read_from_rejects_sidecar_with_backslash_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut meta = sample_meta();
+        meta.name = r"foo\..\bar".into();
+        std::fs::write(
+            dir.path().join(LINK_META_FILENAME),
+            serde_json::to_vec(&meta).unwrap(),
+        )
+        .unwrap();
+        assert!(LinkMeta::read_from(dir.path()).is_err());
+    }
+
+    /// L55: a control character in the name must be rejected before
+    /// any path join (this is also a terminal-spoofing avenue if it
+    /// ever reaches a human emitter).
+    #[test]
+    fn read_from_rejects_sidecar_with_control_char_in_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut meta = sample_meta();
+        meta.name = "foo\x1b[31mbar".into();
+        std::fs::write(
+            dir.path().join(LINK_META_FILENAME),
+            serde_json::to_vec(&meta).unwrap(),
+        )
+        .unwrap();
+        assert!(LinkMeta::read_from(dir.path()).is_err());
+    }
+
+    /// L55: legit unscoped names and legit scoped names both parse OK
+    /// — the validator widens nothing for tampered shapes while keeping
+    /// the registry-supplied shapes intact.
+    #[test]
+    fn validate_name_accepts_legit_unscoped_and_scoped_shapes() {
+        assert!(validate_name_for_path_join("react").is_ok());
+        assert!(validate_name_for_path_join("@scope/pkg").is_ok());
+        assert!(validate_name_for_path_join("debug").is_ok());
+        assert!(validate_name_for_path_join("@lpm.dev/owner.pkg").is_ok());
+    }
+
+    /// L55: unit-level coverage for the validator's reject set so
+    /// future edits can't regress the contract without a failing test.
+    #[test]
+    fn validate_name_rejects_dangerous_shapes() {
+        assert!(validate_name_for_path_join("").is_err());
+        assert!(validate_name_for_path_join("..").is_err());
+        assert!(validate_name_for_path_join(".").is_err());
+        assert!(validate_name_for_path_join("../escape").is_err());
+        assert!(validate_name_for_path_join("/abs").is_err());
+        assert!(validate_name_for_path_join("a/b/c").is_err());
+        assert!(validate_name_for_path_join("@scope").is_err());
+        assert!(validate_name_for_path_join("@/pkg").is_err());
+        assert!(validate_name_for_path_join("foo\\bar").is_err());
+        assert!(validate_name_for_path_join("foo\0bar").is_err());
+        // 215 chars > 214 limit.
+        assert!(validate_name_for_path_join(&"a".repeat(215)).is_err());
     }
 
     #[test]

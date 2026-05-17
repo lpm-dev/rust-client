@@ -29,6 +29,12 @@ const OBJECTS_DIR: &str = "objects";
 /// Subdirectory holding per-graph-key link entries.
 const LINKS_DIR: &str = "links";
 
+/// One row yielded by [`Store::iter_link_entries_for_verify`]: the
+/// link directory plus either its parsed sidecar or the read/parse/
+/// schema/validation failure encountered. Named so the public
+/// signature stays readable.
+pub type VerifyLinkEntry = (PathBuf, Result<LinkMeta, LpmError>);
+
 /// `node_modules/` sub-name inside each `links/<graph-key>/` entry.
 const LINK_NODE_MODULES: &str = "node_modules";
 
@@ -710,6 +716,38 @@ impl Store {
             }
         });
         Ok(Box::new(iter) as Box<dyn Iterator<Item = (PathBuf, LinkMeta)>>)
+    }
+
+    /// Verify-specific enumeration of every v2 link directory.
+    ///
+    /// Unlike [`Self::iter_link_entries`], this surfaces sidecar
+    /// read/parse/schema/validation failures as `Err` entries instead
+    /// of silently filtering them out — a corrupt sidecar is itself a
+    /// store-integrity problem that `lpm store verify` must report
+    /// (L57). Non-directory children of `links/` are still filtered
+    /// (a stray file isn't a link entry to begin with).
+    pub fn iter_link_entries_for_verify(&self) -> Result<Vec<VerifyLinkEntry>, LpmError> {
+        let links_root = self.paths.links_root();
+        if !links_root.exists() {
+            return Ok(Vec::new());
+        }
+        let read_dir = std::fs::read_dir(&links_root).map_err(|e| {
+            LpmError::Store(format!(
+                "failed to enumerate v2 links root at {}: {e}",
+                links_root.display()
+            ))
+        })?;
+        let mut out = Vec::new();
+        for entry in read_dir {
+            let Ok(entry) = entry else { continue };
+            let link_dir = entry.path();
+            if !link_dir.is_dir() {
+                continue;
+            }
+            let result = LinkMeta::read_from(&link_dir);
+            out.push((link_dir, result));
+        }
+        Ok(out)
     }
 
     /// Find the package directory for `(name, version)` by walking the
