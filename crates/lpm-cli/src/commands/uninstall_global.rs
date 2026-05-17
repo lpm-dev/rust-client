@@ -33,7 +33,7 @@
 use crate::output;
 use chrono::Utc;
 use lpm_common::color::Painted;
-use lpm_common::{LpmError, LpmRoot, with_exclusive_lock};
+use lpm_common::{LpmError, LpmRoot, sanitize_for_terminal, with_exclusive_lock};
 use lpm_global::{
     AliasEntry, IntentPayload, PackageEntry, Shim, TxKind, WalRecord, WalWriter, emit_shim,
     read_for, remove_shim, write_for,
@@ -61,14 +61,16 @@ fn run_under_lock(root: &LpmRoot, package: &str) -> Result<UninstallOutcome, Lpm
     let active = match manifest.packages.get(package).cloned() {
         Some(a) => a,
         None => {
+            let package_safe = sanitize_for_terminal(package);
             return Err(LpmError::Script(format!(
-                "'{package}' is not globally installed. Run `lpm global list` to see what is."
+                "'{package_safe}' is not globally installed. Run `lpm global list` to see what is."
             )));
         }
     };
     if manifest.pending.contains_key(package) {
+        let package_safe = sanitize_for_terminal(package);
         return Err(LpmError::Script(format!(
-            "'{package}' has an in-flight install. Wait for it to finish (or fail) before \
+            "'{package_safe}' has an in-flight install. Wait for it to finish (or fail) before \
              uninstalling."
         )));
     }
@@ -157,22 +159,26 @@ fn run_under_lock(root: &LpmRoot, package: &str) -> Result<UninstallOutcome, Lpm
         // Append WAL Abort so the transaction is resolved (recovery
         // won't retry on next startup). The user gets a clear error
         // and can re-invoke uninstall once the holding process dies.
+        let failures_safe: Vec<String> = shim_failures
+            .iter()
+            .map(|f| sanitize_for_terminal(f))
+            .collect();
         let reason = format!(
             "shim removal failed for {} shim(s): {}",
             shim_failures.len(),
-            shim_failures.join("; ")
+            failures_safe.join("; ")
         );
         wal.append(&WalRecord::Abort {
             tx_id: tx_id.clone(),
             reason: reason.clone(),
             aborted_at: Utc::now(),
         })?;
+        let package_safe = sanitize_for_terminal(package);
         return Err(LpmError::Script(format!(
-            "uninstall of '{}' failed: {reason}.\n\n\
+            "uninstall of '{package_safe}' failed: {reason}.\n\n\
              The package's manifest entry was preserved and any shims that were removed have \
              been restored. Try again after closing tools that may be holding these files \
-             (antivirus, Explorer preview on Windows, running CLI processes).",
-            package
+             (antivirus, Explorer preview on Windows, running CLI processes)."
         )));
     }
 
@@ -289,29 +295,41 @@ fn print_success(out: &UninstallOutcome, json_output: bool) {
         println!("{}", serde_json::to_string_pretty(&body).unwrap());
         return;
     }
+    let package_safe = sanitize_for_terminal(&out.package);
+    let version_safe = sanitize_for_terminal(&out.version);
     output::success(&format!(
         "Uninstalled {}@{}",
-        out.package.bold(),
-        out.version.dimmed()
+        package_safe.bold(),
+        version_safe.dimmed()
     ));
     if !out.commands.is_empty() {
+        let commands_safe: Vec<String> = out
+            .commands
+            .iter()
+            .map(|c| sanitize_for_terminal(c))
+            .collect();
         output::info(&format!(
             "Removed command{}: {}",
             if out.commands.len() == 1 { "" } else { "s" },
-            out.commands.join(", ")
+            commands_safe.join(", ")
         ));
     }
     if !out.aliases.is_empty() {
+        let aliases_safe: Vec<String> = out
+            .aliases
+            .iter()
+            .map(|a| sanitize_for_terminal(a))
+            .collect();
         output::info(&format!(
             "Removed alias{}: {}",
             if out.aliases.len() == 1 { "" } else { "es" },
-            out.aliases.join(", ")
+            aliases_safe.join(", ")
         ));
     }
     if out.install_root_remaining {
+        let root_safe = sanitize_for_terminal(&out.install_root.display().to_string());
         output::warn(&format!(
-            "Install root could not be removed (locked or permission). Queued as tombstone for `lpm cache prune --apply` to retry: {}",
-            out.install_root.display()
+            "Install root could not be removed (locked or permission). Queued as tombstone for `lpm cache prune --apply` to retry: {root_safe}"
         ));
     }
 }
@@ -794,5 +812,25 @@ mod tests {
         let final_manifest = read_for(&root).unwrap();
         assert!(!final_manifest.packages.contains_key("foo"));
         assert!(!final_manifest.aliases.contains_key("foo-serve"));
+    }
+
+    /// A manifest entry whose name carries OSC 8 hyperlink bytes or
+    /// CSI cursor manipulation reaches `run` only through the
+    /// `not-globally-installed` error path (the user has to type the
+    /// exact same name). The error formatter still routes the supplied
+    /// name through `sanitize_for_terminal` so a pasted-from-elsewhere
+    /// hostile spec can't paint the operator's terminal via the error
+    /// surface.
+    #[test]
+    fn uninstall_not_installed_error_strips_control_bytes_from_supplied_name() {
+        let tmp = TempDir::new().unwrap();
+        let root = LpmRoot::from_dir(tmp.path());
+        let evil = "\u{1b}]8;;file:///etc/passwd\u{07}phantom\u{1b}]8;;\u{07}";
+        let err = run_under_lock(&root, evil).unwrap_err();
+        let msg = format!("{err}");
+        assert!(!msg.contains('\u{1b}'), "ESC must be scrubbed: {msg:?}");
+        assert!(!msg.contains('\u{07}'), "BEL must be scrubbed: {msg:?}");
+        assert!(msg.contains("phantom"));
+        assert!(msg.contains("not globally installed"));
     }
 }

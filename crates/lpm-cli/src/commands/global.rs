@@ -7,7 +7,7 @@
 
 use crate::output;
 use lpm_common::color::Painted;
-use lpm_common::{LpmError, LpmRoot, format_bytes};
+use lpm_common::{LpmError, LpmRoot, format_bytes, sanitize_for_terminal};
 use lpm_global::{GlobalManifest, PackageEntry};
 use std::path::Path;
 
@@ -351,13 +351,17 @@ fn emit_outdated_human(
         println!();
         println!("  {} outdated:", outdated.len().to_string().bold(),);
         for r in outdated {
+            let package_safe = sanitize_for_terminal(&r.package);
+            let current_safe = sanitize_for_terminal(&r.current);
+            let latest_safe = sanitize_for_terminal(&r.latest);
             println!(
                 "    {} {} \u{2192} {}{}",
-                r.package.bold(),
-                r.current.dimmed(),
-                r.latest.green(),
+                package_safe.bold(),
+                current_safe.dimmed(),
+                latest_safe.green(),
                 if verbose {
-                    format!("  (spec: {})", r.saved_spec.dimmed())
+                    let spec_safe = sanitize_for_terminal(&r.saved_spec);
+                    format!("  (spec: {})", spec_safe.dimmed())
                 } else {
                     String::new()
                 },
@@ -377,15 +381,21 @@ fn emit_outdated_human(
             if unresolved.len() == 1 { "" } else { "s" },
         ));
         for r in unresolved {
-            println!("    {}: {}", r.package.bold(), r.reason.dimmed());
+            let package_safe = sanitize_for_terminal(&r.package);
+            let reason_safe = sanitize_for_terminal(&r.reason);
+            println!("    {}: {}", package_safe.bold(), reason_safe.dimmed());
         }
         println!();
     }
     if !up_to_date.is_empty() && verbose {
+        let names_safe: Vec<String> = up_to_date
+            .iter()
+            .map(|n| sanitize_for_terminal(n))
+            .collect();
         output::info(&format!(
             "{} up-to-date: {}",
             up_to_date.len(),
-            up_to_date.join(", ").dimmed(),
+            names_safe.join(", ").dimmed(),
         ));
     }
 }
@@ -457,27 +467,32 @@ fn emit_list_human(root: &LpmRoot, manifest: &GlobalManifest, verbose: bool) {
         let cmds_str = if commands.is_empty() {
             "(no commands)".dimmed().to_string()
         } else {
-            commands.join(", ")
+            commands
+                .iter()
+                .map(|c| sanitize_for_terminal(c))
+                .collect::<Vec<_>>()
+                .join(", ")
         };
+        let name_safe = sanitize_for_terminal(name);
+        let resolved_safe = sanitize_for_terminal(&entry.resolved);
         println!(
             "    {} {} \u{2014} {}",
-            name.bold(),
-            format!("@{}", entry.resolved).dimmed(),
+            name_safe.bold(),
+            format!("@{resolved_safe}").dimmed(),
             cmds_str
         );
         if verbose {
             let install_root = root.global_root().join(&entry.root);
             let bytes = dir_size(&install_root).unwrap_or(0);
+            let spec_safe = sanitize_for_terminal(&entry.saved_spec);
             println!(
                 "        spec: {}    installed: {}    size: {}",
-                entry.saved_spec.dimmed(),
+                spec_safe.dimmed(),
                 entry.installed_at.format("%Y-%m-%d").to_string().dimmed(),
                 format_bytes(bytes).dimmed()
             );
-            println!(
-                "        root: {}",
-                install_root.display().to_string().dimmed()
-            );
+            let root_safe = sanitize_for_terminal(&install_root.display().to_string());
+            println!("        root: {}", root_safe.dimmed());
         }
     }
     if !manifest.aliases.is_empty() {
@@ -492,11 +507,14 @@ fn emit_list_human(root: &LpmRoot, manifest: &GlobalManifest, verbose: bool) {
             }
         );
         for (alias, entry) in &manifest.aliases {
+            let alias_safe = sanitize_for_terminal(alias);
+            let package_safe = sanitize_for_terminal(&entry.package);
+            let bin_safe = sanitize_for_terminal(&entry.bin);
             println!(
                 "    {} \u{2192} {}'s {}",
-                alias.bold(),
-                entry.package,
-                entry.bin.dimmed()
+                alias_safe.bold(),
+                package_safe,
+                bin_safe.dimmed()
             );
         }
     }
@@ -562,7 +580,10 @@ fn run_path(
             .unwrap()
         );
     } else {
-        println!("{}", install_root.display());
+        println!(
+            "{}",
+            sanitize_for_terminal(&install_root.display().to_string())
+        );
     }
     Ok(())
 }
@@ -864,5 +885,31 @@ mod tests {
         let meta = fake_metadata("eslint", &["8.0.0", "8.1.0"], &[]);
         let err = pick_latest_matching(&meta, "^9").unwrap_err();
         assert!(err.contains("no version"));
+    }
+
+    /// Manifest-controlled package / alias / version / saved-spec / install
+    /// root strings are passed through `sanitize_for_terminal` before any
+    /// styling reaches the terminal — a hostile registry or corrupted
+    /// manifest can no longer emit OSC 8 hyperlinks, OSC 52 clipboard
+    /// writes, CSI cursor manipulation, or BEL/DEL through `lpm global
+    /// list` / `lpm global path` / `lpm global list --outdated`.
+    #[test]
+    fn sanitize_for_terminal_strips_osc_and_bel_from_global_field_payload() {
+        let osc8 = "\u{1b}]8;;file:///etc/passwd\u{07}evil-pkg\u{1b}]8;;\u{07}";
+        let cleaned = sanitize_for_terminal(osc8);
+        assert!(!cleaned.contains('\u{1b}'));
+        assert!(!cleaned.contains('\u{07}'));
+        assert!(cleaned.contains("evil-pkg"));
+
+        let osc52 = "pkg\u{1b}]52;c;YmFkLXBheWxvYWQ=\u{07}";
+        let cleaned = sanitize_for_terminal(osc52);
+        assert!(!cleaned.contains('\u{1b}'));
+        assert!(!cleaned.contains('\u{07}'));
+        assert!(cleaned.starts_with("pkg"));
+
+        let csi = "1.0.0\u{1b}[2J\u{1b}[H";
+        let cleaned = sanitize_for_terminal(csi);
+        assert!(!cleaned.contains('\u{1b}'));
+        assert!(cleaned.contains("1.0.0"));
     }
 }

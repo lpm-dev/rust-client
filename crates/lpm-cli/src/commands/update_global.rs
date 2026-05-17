@@ -29,7 +29,7 @@ use crate::save_spec::{
 };
 use chrono::Utc;
 use lpm_common::color::Painted;
-use lpm_common::{LpmError, LpmRoot, with_exclusive_lock};
+use lpm_common::{LpmError, LpmRoot, sanitize_for_terminal, with_exclusive_lock};
 use lpm_global::{
     CommandCollision, InstallReadyMarker, InstallRootStatus, IntentPayload, PackageEntry,
     PackageSource, PendingEntry, Shim, TxKind, WalRecord, WalWriter, artifacts_complete, emit_shim,
@@ -78,7 +78,9 @@ pub async fn run(
             Ok(plan) => plans.push(plan),
             Err(e) => {
                 if !json_output {
-                    output::warn(&format!("planning {}: {e}", target.name.bold()));
+                    let name_safe = sanitize_for_terminal(&target.name);
+                    let reason_safe = sanitize_for_terminal(&e.to_string());
+                    output::warn(&format!("planning {}: {reason_safe}", name_safe.bold()));
                 }
                 // Continue planning other targets — one bad spec doesn't
                 // block the bulk update.
@@ -1154,11 +1156,14 @@ fn emit_dry_run(plans: &[UpgradePlan], json_output: bool) {
         match plan {
             UpgradePlan::Upgrade(prep) => {
                 any_action = true;
+                let name_safe = sanitize_for_terminal(&prep.name);
+                let current_safe = sanitize_for_terminal(&prep.current_version);
+                let new_safe = sanitize_for_terminal(&prep.new_version.to_string());
                 println!(
                     "  {} {} \u{2192} {}",
-                    prep.name.bold(),
-                    prep.current_version.dimmed(),
-                    prep.new_version.to_string().green()
+                    name_safe.bold(),
+                    current_safe.dimmed(),
+                    new_safe.green()
                 );
             }
             UpgradePlan::SaveSpecRewrite {
@@ -1169,27 +1174,35 @@ fn emit_dry_run(plans: &[UpgradePlan], json_output: bool) {
                 ..
             } => {
                 any_action = true;
+                let package_safe = sanitize_for_terminal(package);
+                let version_safe = sanitize_for_terminal(version);
+                let old_safe = sanitize_for_terminal(old_saved_spec);
+                let new_safe = sanitize_for_terminal(new_saved_spec);
                 println!(
                     "  {} {} (saved_spec {} \u{2192} {})",
-                    package.bold(),
-                    format!("@{version}").dimmed(),
-                    old_saved_spec.dimmed(),
-                    new_saved_spec.green()
+                    package_safe.bold(),
+                    format!("@{version_safe}").dimmed(),
+                    old_safe.dimmed(),
+                    new_safe.green()
                 );
             }
             UpgradePlan::AlreadyCurrent { package, version } => {
+                let package_safe = sanitize_for_terminal(package);
+                let version_safe = sanitize_for_terminal(version);
                 println!(
                     "  {} {} (already current)",
-                    package.dimmed(),
-                    format!("@{version}").dimmed()
+                    package_safe.dimmed(),
+                    format!("@{version_safe}").dimmed()
                 );
             }
             UpgradePlan::PlanError { package, reason } => {
+                let package_safe = sanitize_for_terminal(package);
+                let reason_safe = sanitize_for_terminal(reason);
                 println!(
                     "  {} {} {}",
-                    package.bold(),
+                    package_safe.bold(),
                     "could not plan:".red(),
-                    reason
+                    reason_safe
                 );
             }
         }
@@ -1253,11 +1266,14 @@ fn emit_results(results: &[UpgradeResult], json_output: bool) {
     for r in results {
         match r {
             UpgradeResult::Upgraded(out) => {
+                let name_safe = sanitize_for_terminal(&out.name);
+                let from_safe = sanitize_for_terminal(&out.from_version);
+                let to_safe = sanitize_for_terminal(&out.to_version);
                 output::success(&format!(
                     "Upgraded {} {} \u{2192} {}",
-                    out.name.bold(),
-                    out.from_version.dimmed(),
-                    out.to_version.green()
+                    name_safe.bold(),
+                    from_safe.dimmed(),
+                    to_safe.green()
                 ));
             }
             UpgradeResult::SaveSpecRewritten {
@@ -1266,23 +1282,31 @@ fn emit_results(results: &[UpgradeResult], json_output: bool) {
                 old_saved_spec,
                 new_saved_spec,
             } => {
+                let package_safe = sanitize_for_terminal(package);
+                let version_safe = sanitize_for_terminal(version);
+                let old_safe = sanitize_for_terminal(old_saved_spec);
+                let new_safe = sanitize_for_terminal(new_saved_spec);
                 output::success(&format!(
                     "Retuned {} {} (saved_spec {} \u{2192} {})",
-                    package.bold(),
-                    format!("@{version}").dimmed(),
-                    old_saved_spec.dimmed(),
-                    new_saved_spec.green()
+                    package_safe.bold(),
+                    format!("@{version_safe}").dimmed(),
+                    old_safe.dimmed(),
+                    new_safe.green()
                 ));
             }
             UpgradeResult::AlreadyCurrent { package, version } => {
+                let package_safe = sanitize_for_terminal(package);
+                let version_safe = sanitize_for_terminal(version);
                 output::info(&format!(
                     "{} {} already current",
-                    package.dimmed(),
-                    format!("@{version}").dimmed()
+                    package_safe.dimmed(),
+                    format!("@{version_safe}").dimmed()
                 ));
             }
             UpgradeResult::Failed { package, reason } => {
-                output::warn(&format!("{}: {reason}", package.bold()));
+                let package_safe = sanitize_for_terminal(package);
+                let reason_safe = sanitize_for_terminal(reason);
+                output::warn(&format!("{}: {reason_safe}", package_safe.bold()));
             }
         }
     }
@@ -1319,15 +1343,20 @@ fn execute_saved_spec_rewrite(
     with_exclusive_lock(root.global_tx_lock(), || {
         let mut manifest = read_for(root)?;
         let active = manifest.packages.get(package).ok_or_else(|| {
+            let package_safe = sanitize_for_terminal(package);
             LpmError::Script(format!(
-                "'{package}' is no longer installed. Aborting saved_spec rewrite."
+                "'{package_safe}' is no longer installed. Aborting saved_spec rewrite."
             ))
         })?;
         if let Err(diff) = active_matches_planned_snapshot(active, prior_snapshot) {
+            let package_safe = sanitize_for_terminal(package);
+            let diff_safe = sanitize_for_terminal(&diff);
+            let old_safe = sanitize_for_terminal(old_saved_spec);
+            let new_safe = sanitize_for_terminal(new_saved_spec);
             return Err(LpmError::Script(format!(
-                "'{package}' was modified by another process between planning and rewrite \
-                 ({diff}). The retune from {old_saved_spec:?} to {new_saved_spec:?} no longer \
-                 applies. Re-run `lpm global update {package}@<spec>` to plan against the \
+                "'{package_safe}' was modified by another process between planning and rewrite \
+                 ({diff_safe}). The retune from {old_safe:?} to {new_safe:?} no longer \
+                 applies. Re-run `lpm global update {package_safe}@<spec>` to plan against the \
                  current state."
             )));
         }

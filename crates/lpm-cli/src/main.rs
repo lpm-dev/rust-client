@@ -2620,7 +2620,8 @@ async fn async_main() -> Result<()> {
                                 // cleanup. Audit Medium.
                                 output::warn(&format!(
                                     "global recovery deferred tx for '{}': {}",
-                                    tx.package, reason
+                                    lpm_common::sanitize_for_terminal(&tx.package),
+                                    lpm_common::sanitize_for_terminal(reason)
                                 ));
                             }
                         }
