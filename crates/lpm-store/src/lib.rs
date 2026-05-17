@@ -581,6 +581,36 @@ impl PackageStore {
         let size_limited = SizeLimitedReader::new(reader, max_compressed_size);
         let mut hashing_reader = HashingReader::new(size_limited);
 
+        // H24 defense-in-depth pre-flight: verify the bytes start with
+        // the gzip magic (0x1F 0x8B) BEFORE the rest of the stream
+        // gets fed to the extractor and behavioral analyzer. The full
+        // integrity verification still happens after extraction (the
+        // streaming design fundamentally requires it), but a non-gzip
+        // body — for example raw HTML from a misconfigured registry
+        // or a hostile non-tarball response — now fails fast instead
+        // of running the entire extractor + analyzer path on
+        // attacker-chosen bytes. The 2 prefix bytes are hashed via
+        // the `HashingReader::read_exact` path so the final SRI still
+        // covers the full stream; they're then re-emitted into the
+        // extractor via a `Chain` so the extractor's gzip decoder
+        // sees a complete stream.
+        let mut magic = [0u8; 2];
+        if let Err(e) = std::io::Read::read_exact(&mut hashing_reader, &mut magic) {
+            let _ = std::fs::remove_dir_all(&tmp_dir);
+            let _ = hashing_reader.finalize();
+            return Err(LpmError::Io(e));
+        }
+        if magic != [0x1F, 0x8B] {
+            let _ = std::fs::remove_dir_all(&tmp_dir);
+            let _ = hashing_reader.finalize();
+            return Err(LpmError::Registry(format!(
+                "package body for {name}@{version} is not a gzip stream (first bytes: {:02x} {:02x}); refusing to extract",
+                magic[0], magic[1],
+            )));
+        }
+        let extractor_reader =
+            std::io::Read::chain(std::io::Cursor::new(magic), &mut hashing_reader);
+
         // Fused behavioral scan. `PackageAnalyzer::should_scan` is the
         // buffer predicate — true for JS/TS/JSX/TSX sources outside
         // `node_modules`/`__tests__`/`test`/hidden paths. The inspector
@@ -595,7 +625,7 @@ impl PackageStore {
         // (including `SizeLimitedReader` tripping its cap via `Read` returning
         // an error) propagate through here unchanged.
         let extract_result = lpm_extractor::extract_tarball_from_reader_with_inspector(
-            &mut hashing_reader,
+            extractor_reader,
             &tmp_dir,
             lpm_security::behavioral::PackageAnalyzer::should_scan,
             |entry| {

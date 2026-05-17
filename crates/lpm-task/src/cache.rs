@@ -223,13 +223,51 @@ fn expand_glob_pattern(pattern: &str) -> Vec<String> {
     patterns
 }
 
+/// H25: hard cap on a restored entry's size — defense against a
+/// task-cache archive whose entries grew unbounded between cache
+/// store and restore (CI shared cache, sync conflict).
+const MAX_CACHE_ENTRY_BYTES: u64 = 256 * 1024 * 1024;
+
+/// H25: hard cap on the total bytes restored across all entries —
+/// bounds the worst case where many small entries individually pass
+/// the per-entry cap but together exhaust disk.
+const MAX_CACHE_ARCHIVE_BYTES: u64 = 1024 * 1024 * 1024;
+
+/// H25: hard cap on the number of entries unpacked from a single
+/// archive — bounds the inode-pressure / filesystem-walking cost
+/// of a malicious entry-count-bomb.
+const MAX_CACHE_ARCHIVE_ENTRIES: usize = 100_000;
+
 /// Restore a .tar.gz archive to the project directory.
 ///
-/// Validates each entry path to prevent zip-slip (path traversal) attacks.
+/// H25: hardens the previously-default `entry.unpack_in(project_dir)`
+/// call. The lpm-extractor's full hardening surface (mode floors,
+/// SUID/SGID strip, entry-type filter, etc.) is not directly reusable
+/// here because lpm-extractor walks tarballs from packages while
+/// task cache restores arbitrary project files — different policy.
+/// What we DO mirror from the extractor:
+///   * Per-entry size cap (`MAX_CACHE_ENTRY_BYTES`).
+///   * Aggregate restore byte cap (`MAX_CACHE_ARCHIVE_BYTES`).
+///   * Entry count cap (`MAX_CACHE_ARCHIVE_ENTRIES`).
+///   * `preserve_permissions(false)` + `preserve_ownerships(false)`
+///     so a malicious archive can't restore SUID/SGID bits or
+///     attempt to chown into another user.
+///   * Symlink / hardlink / FIFO / char-device / block-device entry
+///     types are refused — task cache should only carry regular
+///     files and directories. Symlinks introduce arbitrary-file
+///     disclosure if the linked path later gets `cat`-ed by another
+///     task; FIFOs/devices have no legitimate task-cache purpose.
+///   * The pre-existing parent-dir / root-dir / prefix component
+///     check stays as the first-line zip-slip defense.
 fn restore_archive(archive_path: &Path, project_dir: &Path) -> Result<(), LpmError> {
     let file = std::fs::File::open(archive_path)?;
     let dec = flate2::read::GzDecoder::new(file);
     let mut archive = tar::Archive::new(dec);
+    archive.set_preserve_permissions(false);
+    archive.set_preserve_ownerships(false);
+
+    let mut total_bytes: u64 = 0;
+    let mut entries_seen: usize = 0;
 
     for entry in archive
         .entries()
@@ -237,6 +275,14 @@ fn restore_archive(archive_path: &Path, project_dir: &Path) -> Result<(), LpmErr
     {
         let mut entry = entry
             .map_err(|e| LpmError::Task(format!("failed to read cache archive entry: {e}")))?;
+
+        entries_seen += 1;
+        if entries_seen > MAX_CACHE_ARCHIVE_ENTRIES {
+            return Err(LpmError::Task(format!(
+                "task cache archive exceeds entry-count cap ({MAX_CACHE_ARCHIVE_ENTRIES} entries)"
+            )));
+        }
+
         let path = entry
             .path()
             .map_err(|e| LpmError::Task(format!("failed to read entry path: {e}")))?
@@ -252,6 +298,38 @@ fn restore_archive(archive_path: &Path, project_dir: &Path) -> Result<(), LpmErr
                 path.display()
             )));
         }
+
+        // Refuse non-regular-file entry types — only files and dirs
+        // belong in a task cache. Symlinks would allow disclosing
+        // arbitrary files via later `cat` of the restored path;
+        // hardlinks bind the cached content to an attacker-chosen
+        // existing-file path; FIFOs / char / block / GNU-sparse have
+        // no legitimate task-output meaning.
+        let header_type = entry.header().entry_type();
+        if !(header_type.is_file() || header_type.is_dir()) {
+            return Err(LpmError::Task(format!(
+                "task cache archive contains non-regular entry ({:?}): {}",
+                header_type,
+                path.display(),
+            )));
+        }
+
+        let entry_size = entry.header().size().unwrap_or(0);
+        if entry_size > MAX_CACHE_ENTRY_BYTES {
+            return Err(LpmError::Task(format!(
+                "task cache entry exceeds size cap ({} > {} bytes): {}",
+                entry_size,
+                MAX_CACHE_ENTRY_BYTES,
+                path.display(),
+            )));
+        }
+        total_bytes = total_bytes.saturating_add(entry_size);
+        if total_bytes > MAX_CACHE_ARCHIVE_BYTES {
+            return Err(LpmError::Task(format!(
+                "task cache archive exceeds aggregate cap ({MAX_CACHE_ARCHIVE_BYTES} bytes)"
+            )));
+        }
+
         entry
             .unpack_in(project_dir)
             .map_err(|e| LpmError::Task(format!("failed to unpack {}: {e}", path.display())))?;
@@ -489,6 +567,71 @@ mod tests {
             fs::read_to_string(dir.path().join("dist/output.js")).unwrap(),
             "hello"
         );
+    }
+
+    /// H25: a symlink entry in the task-cache archive is the
+    /// arbitrary-file-disclosure shape — refuse before unpack.
+    #[test]
+    fn restore_archive_refuses_symlink_entry() {
+        use flate2::Compression;
+        use flate2::write::GzEncoder;
+        use tar::Builder;
+
+        let dir = tempfile::tempdir().unwrap();
+        let archive_path = dir.path().join("symlink.tar.gz");
+
+        {
+            let file = fs::File::create(&archive_path).unwrap();
+            let enc = GzEncoder::new(file, Compression::fast());
+            let mut builder = Builder::new(enc);
+
+            let mut header = tar::Header::new_gnu();
+            header.set_size(0);
+            header.set_mode(0o777);
+            header.set_entry_type(tar::EntryType::Symlink);
+            header.set_path("evil-link").unwrap();
+            header.set_link_name("/etc/passwd").unwrap();
+            header.set_cksum();
+            builder.append(&header, std::io::empty()).unwrap();
+            builder.finish().unwrap();
+        }
+
+        let err = restore_archive(&archive_path, dir.path()).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("non-regular entry"),
+            "symlink must be rejected; got: {msg}"
+        );
+    }
+
+    /// H25: a FIFO / char-device / block-device entry has no
+    /// legitimate task-output meaning — refuse before unpack.
+    #[test]
+    fn restore_archive_refuses_fifo_entry() {
+        use flate2::Compression;
+        use flate2::write::GzEncoder;
+        use tar::Builder;
+
+        let dir = tempfile::tempdir().unwrap();
+        let archive_path = dir.path().join("fifo.tar.gz");
+
+        {
+            let file = fs::File::create(&archive_path).unwrap();
+            let enc = GzEncoder::new(file, Compression::fast());
+            let mut builder = Builder::new(enc);
+
+            let mut header = tar::Header::new_gnu();
+            header.set_size(0);
+            header.set_mode(0o600);
+            header.set_entry_type(tar::EntryType::Fifo);
+            header.set_path("evil-fifo").unwrap();
+            header.set_cksum();
+            builder.append(&header, std::io::empty()).unwrap();
+            builder.finish().unwrap();
+        }
+
+        let err = restore_archive(&archive_path, dir.path()).unwrap_err();
+        assert!(err.to_string().contains("non-regular entry"));
     }
 
     // -- glob pattern validation --

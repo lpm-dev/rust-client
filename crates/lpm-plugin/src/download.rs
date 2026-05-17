@@ -281,10 +281,24 @@ async fn resolve_verification(
     }
 
     // 2. Upstream — fetch `<asset_url>.sha256` and verify.
+    //
+    // M19: surface the trust posture. SHA-256 alone matches integrity
+    // against whatever the upstream release pipeline produced — if
+    // the upstream account is compromised, both the binary AND the
+    // sidecar can be swapped together. Sigstore / cosign / GPG
+    // verification would close that chain; until that's wired in,
+    // an upstream-verified install carries this caveat explicitly.
     let upstream_url = format!("{asset_url}.sha256");
     match fetch_upstream_checksum(client, &upstream_url).await {
         Ok(expected) => {
             verify_checksum(def.name, actual_sha256, &expected)?;
+            tracing::warn!(
+                target: "lpm_plugin::download",
+                plugin = def.name,
+                version = version,
+                platform = platform_str,
+                "plugin verified via upstream `.sha256` sidecar only — no signature/provenance check (M19). Upstream account compromise would substitute binary + sidecar together; trust is anchored on the upstream GitHub release"
+            );
             return Ok(VerificationSource::Upstream);
         }
         Err(e) => {

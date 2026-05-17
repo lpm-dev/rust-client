@@ -97,6 +97,115 @@ pub fn read_capped_state_file(
     Ok(Some(std::fs::read(path)?))
 }
 
+/// Resolve the LPM registry URL with scheme + host gating applied to
+/// any value read from the `LPM_REGISTRY_URL` environment variable.
+///
+/// Returns [`DEFAULT_REGISTRY_URL`] when the env var is unset, empty,
+/// or rejected by [`lpm_registry_url_is_accepted`]. An accepted
+/// override is logged at `warn` level so an operator scanning logs
+/// has visibility — the resolved host is the destination for
+/// LPM bearer tokens, OIDC exchanges, and vault payloads, so an
+/// unexpected redirect is the highest-severity contamination class.
+///
+/// The gating contract is the same as
+/// `release_lookup::resolve_release_url` (H9): HTTPS is accepted
+/// for any host (legitimate private mirror / on-prem appliance),
+/// HTTP is accepted only when the host is a loopback address
+/// (workflow tests against a localhost mock). Plain `http://attacker`
+/// values are refused and the lookup falls back to the default with
+/// a separate `warn` so the rejection is auditable.
+pub fn resolve_lpm_registry_url() -> String {
+    let raw = match std::env::var("LPM_REGISTRY_URL")
+        .ok()
+        .filter(|s| !s.is_empty())
+    {
+        Some(v) => v,
+        None => return DEFAULT_REGISTRY_URL.to_string(),
+    };
+    if lpm_registry_url_is_accepted(&raw) {
+        tracing::warn!(
+            registry_url = %raw,
+            "LPM_REGISTRY_URL override honoured — LPM bearer tokens, OIDC tokens, and vault payloads will be sent to this host; confirm it is expected",
+        );
+        return raw;
+    }
+    tracing::warn!(
+        registry_url = %raw,
+        default_url = DEFAULT_REGISTRY_URL,
+        "rejecting LPM_REGISTRY_URL override: only https:// (any host) or http:// loopback URLs are accepted; falling back to default",
+    );
+    DEFAULT_REGISTRY_URL.to_string()
+}
+
+/// Validate a candidate `LPM_REGISTRY_URL` override value against
+/// the H16/H9 scheme-and-host contract.
+///
+/// Implements a minimal scheme + host parse rather than pulling in
+/// the `url` crate so `lpm-common` stays dep-light. The shape we
+/// care about is just `scheme://host[:port][/...]` — full RFC 3986
+/// validation runs later inside reqwest at request time.
+pub fn lpm_registry_url_is_accepted(url: &str) -> bool {
+    let (scheme, rest) = match url.split_once("://") {
+        Some(pair) => pair,
+        None => return false,
+    };
+    if scheme.is_empty() || rest.is_empty() {
+        return false;
+    }
+    let scheme_lower = scheme.to_ascii_lowercase();
+    if scheme_lower != "http" && scheme_lower != "https" {
+        return false;
+    }
+    let authority = rest
+        .split('/')
+        .next()
+        .unwrap_or("")
+        .split('?')
+        .next()
+        .unwrap_or("")
+        .split('#')
+        .next()
+        .unwrap_or("");
+    let authority = authority
+        .rsplit_once('@')
+        .map(|(_, h)| h)
+        .unwrap_or(authority);
+    let host = if authority.starts_with('[') {
+        match authority.find(']') {
+            Some(end) => &authority[..=end],
+            None => return false,
+        }
+    } else {
+        authority.split(':').next().unwrap_or("")
+    };
+    if host.is_empty() {
+        return false;
+    }
+    if scheme_lower == "https" {
+        return true;
+    }
+    is_loopback_host(host)
+}
+
+/// Loopback host detection covering the shapes that appear in tests
+/// and on dev machines: `localhost`, every IPv4 address in
+/// `127.0.0.0/8`, the IPv6 loopback `::1`, and the bracketed
+/// `[::1]` form that `reqwest::Url::host_str` returns.
+pub fn is_loopback_host(host: &str) -> bool {
+    if host.eq_ignore_ascii_case("localhost") {
+        return true;
+    }
+    if let Ok(addr) = host.parse::<std::net::IpAddr>() {
+        return addr.is_loopback();
+    }
+    if let Some(inner) = host.strip_prefix('[').and_then(|s| s.strip_suffix(']'))
+        && let Ok(addr) = inner.parse::<std::net::IpAddr>()
+    {
+        return addr.is_loopback();
+    }
+    false
+}
+
 /// Render a registry- or lockfile-supplied string safely on a TTY.
 ///
 /// Strips the byte ranges that carry terminal semantics — control
@@ -285,5 +394,70 @@ mod tests {
     fn terminal_sanitizer_strips_del_and_bel() {
         assert_eq!(sanitize_for_terminal("a\x7fb"), "a?b");
         assert_eq!(sanitize_for_terminal("ring\x07bell"), "ring?bell");
+    }
+
+    // ── lpm_registry_url_is_accepted (H16) ────────────────────────────
+
+    /// H16: HTTPS URLs are accepted regardless of host — legitimate
+    /// private mirrors / on-prem appliances are operator-chosen and
+    /// can't be enumerated upfront.
+    #[test]
+    fn registry_url_gate_accepts_https_any_host() {
+        assert!(lpm_registry_url_is_accepted("https://lpm.dev"));
+        assert!(lpm_registry_url_is_accepted("https://lpm.example.com"));
+        assert!(lpm_registry_url_is_accepted("https://10.0.0.1:8443"));
+        assert!(lpm_registry_url_is_accepted(
+            "https://user:pass@registry.internal/some/path"
+        ));
+    }
+
+    /// H16: plain HTTP is accepted ONLY for loopback hosts — this is
+    /// the workflow-test escape hatch (wiremock binds to 127.0.0.1).
+    #[test]
+    fn registry_url_gate_accepts_http_loopback_only() {
+        assert!(lpm_registry_url_is_accepted("http://127.0.0.1:8080"));
+        assert!(lpm_registry_url_is_accepted("http://localhost"));
+        assert!(lpm_registry_url_is_accepted("http://[::1]:9000"));
+        assert!(lpm_registry_url_is_accepted("http://127.5.5.5/api"));
+    }
+
+    /// H16: plain HTTP non-loopback is the credential-exfil shape the
+    /// finding calls out — it MUST be refused so the resolver falls
+    /// back to DEFAULT_REGISTRY_URL.
+    #[test]
+    fn registry_url_gate_rejects_http_non_loopback() {
+        assert!(!lpm_registry_url_is_accepted("http://attacker.example"));
+        assert!(!lpm_registry_url_is_accepted("http://lpm.dev"));
+        assert!(!lpm_registry_url_is_accepted("http://10.0.0.1"));
+        assert!(!lpm_registry_url_is_accepted("http://192.168.1.1"));
+    }
+
+    /// H16: unsupported schemes and malformed input both collapse to
+    /// "rejected" — we never honour `ftp://` / `file://` / a bare host
+    /// string.
+    #[test]
+    fn registry_url_gate_rejects_unsupported_schemes_and_garbage() {
+        assert!(!lpm_registry_url_is_accepted("ftp://registry.npmjs.org"));
+        assert!(!lpm_registry_url_is_accepted("file:///etc/passwd"));
+        assert!(!lpm_registry_url_is_accepted("javascript:alert(1)"));
+        assert!(!lpm_registry_url_is_accepted("lpm.dev"));
+        assert!(!lpm_registry_url_is_accepted(""));
+        assert!(!lpm_registry_url_is_accepted("https://"));
+    }
+
+    /// H16: loopback shapes the helper specifically needs to cover —
+    /// `localhost`, every 127.0.0.0/8 address, and the IPv6 loopback
+    /// in both bare and bracketed forms.
+    #[test]
+    fn loopback_host_covers_localhost_and_127_block_and_v6() {
+        assert!(is_loopback_host("localhost"));
+        assert!(is_loopback_host("LocalHost"));
+        assert!(is_loopback_host("127.0.0.1"));
+        assert!(is_loopback_host("127.99.42.7"));
+        assert!(is_loopback_host("::1"));
+        assert!(is_loopback_host("[::1]"));
+        assert!(!is_loopback_host("8.8.8.8"));
+        assert!(!is_loopback_host("registry.npmjs.org"));
+        assert!(!is_loopback_host(""));
     }
 }

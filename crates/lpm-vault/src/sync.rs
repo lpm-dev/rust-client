@@ -900,6 +900,25 @@ fn wrap_keys_for_members(
 ) -> Result<Vec<(String, String)>, String> {
     let mut wrapped_keys: Vec<(String, String)> = Vec::new();
 
+    // M25: surface the (user_id, public_key) pairs every time we wrap.
+    // Pre-fix the server-supplied member set was trusted without any
+    // local pin / history check / TOFU primitive, so a compromised
+    // registry could insert an extra "member" and silently receive
+    // every subsequent share's wrapped AES key. We don't yet have a
+    // local member-pubkey pin store (tracked as follow-up; needs a
+    // sync-history JSON next to the vault data), but we DO surface
+    // each recipient so an operator scanning logs can detect a
+    // new/unexpected user_id or a flipped pubkey. The pubkey is
+    // truncated to the first 12 chars of base64 for readability —
+    // enough bits to detect a substituted key by eyeball, not enough
+    // to be a verification primitive on its own.
+    tracing::warn!(
+        target: "lpm_vault::sync",
+        recipient_count = members_with_keys.len(),
+        "wrapping vault AES key for {} org member recipient(s) — verify each listed pubkey/userId tuple matches your expected member set; a compromised server can insert extra recipients (M25)",
+        members_with_keys.len()
+    );
+
     for member in members_with_keys {
         let pub_b64 = member
             .public_key
@@ -915,6 +934,17 @@ fn wrap_keys_for_members(
                 pub_bytes.len()
             ));
         }
+
+        // M25: per-recipient audit line so each one is individually
+        // visible. The truncated pubkey gives an eyeball-comparable
+        // discriminator without dumping the full base64.
+        let pub_short = pub_b64.chars().take(12).collect::<String>();
+        tracing::warn!(
+            target: "lpm_vault::sync",
+            user_id = %member.user_id,
+            public_key_prefix = %pub_short,
+            "vault share recipient (M25)"
+        );
 
         let mut pub_key = [0u8; 32];
         pub_key.copy_from_slice(&pub_bytes);

@@ -267,7 +267,7 @@ fn write_keychain_password(service: &str, account: &str, password: &str) -> Resu
     // entries. The Swift app uses Security.framework with
     // kSecAttrAccessibleWhenUnlocked which doesn't set per-app ACLs.
     //
-    // For shared services: use -A (any-app access). The `security` CLI
+    // Default posture: use `-A` (any-app access). The `security` CLI
     // without -A or -T creates an ACL that only trusts `security` itself —
     // blocking the Swift app. With -A, any app when keychain is unlocked
     // can access (matching the Swift app's behavior). This is acceptable
@@ -275,6 +275,16 @@ fn write_keychain_password(service: &str, account: &str, password: &str) -> Resu
     // 1. macOS Keychain encrypts at rest (locked keychain = no access)
     // 2. Physical access + unlocked session already implies full compromise
     // 3. Lifecycle scripts are blocked by lpm-security (no postinstall)
+    //
+    // H5 opt-out: operators who do NOT use the Swift desktop app can set
+    // `LPM_VAULT_KEYCHAIN_RESTRICT=1` to drop `-A` and let the macOS
+    // keychain default to the more restrictive policy where only
+    // `/usr/bin/security` (the CLI we shell out to) is in the ACL.
+    // Trade-off: the Swift desktop app then cannot read the entries
+    // without the user re-approving them via the keychain prompt on
+    // first access. The default stays `-A` because the Swift app is a
+    // first-class consumer; the opt-out exists for users who want
+    // tighter posture.
     //
     // Pattern: delete + add with retry. The delete+add is not atomic, so
     // concurrent writes (e.g., parallel tests writing the __index__ entry)
@@ -291,6 +301,7 @@ fn write_keychain_password(service: &str, account: &str, password: &str) -> Resu
     // but without -A for stricter ACL.
 
     let is_shared = service == SERVICE;
+    let use_any_app_acl = is_shared && !restrict_acl_via_env();
 
     // Attempt delete+add, retry once on errSecDuplicateItem (exit 45)
     for attempt in 0..2 {
@@ -301,7 +312,7 @@ fn write_keychain_password(service: &str, account: &str, password: &str) -> Resu
             .stderr(std::process::Stdio::null())
             .status();
 
-        let extra: &[&str] = if is_shared { &["-A"] } else { &[] };
+        let extra: &[&str] = if use_any_app_acl { &["-A"] } else { &[] };
         match macos_security_add_generic_password(service, account, password, extra) {
             Ok(()) => return Ok(()),
             Err(msg) => {
@@ -316,6 +327,24 @@ fn write_keychain_password(service: &str, account: &str, password: &str) -> Resu
     }
 
     unreachable!("loop always returns")
+}
+
+/// H5: returns `true` when the operator has opted in to the
+/// more-restrictive keychain ACL by setting
+/// `LPM_VAULT_KEYCHAIN_RESTRICT=1`. Default `false` preserves the
+/// Swift desktop app's interop (current behavior).
+///
+/// Accepts `1`, `true`, `yes`, `on` (case-insensitive). Anything
+/// else (including unset) → false.
+fn restrict_acl_via_env() -> bool {
+    matches!(
+        std::env::var("LPM_VAULT_KEYCHAIN_RESTRICT")
+            .ok()
+            .as_deref()
+            .map(str::to_ascii_lowercase)
+            .as_deref(),
+        Some("1" | "true" | "yes" | "on")
+    )
 }
 
 /// Spawn `security add-generic-password` with the password piped via
@@ -530,6 +559,74 @@ mod tests {
         match delete_keychain_password(&svc, account) {
             Ok(KeychainDeleteOutcome::NotFound) => {}
             other => panic!("second delete should report NotFound, got {other:?}"),
+        }
+    }
+
+    /// Global mutex serialising the three H5 env-mutation tests so
+    /// they don't race against each other (or other tests in this
+    /// process that touch the same env var).
+    static H5_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// H5: the `LPM_VAULT_KEYCHAIN_RESTRICT` env var is the operator's
+    /// opt-out from the `-A` (any-app while unlocked) ACL. Default
+    /// off (preserves Swift-app interop); accepts `1`/`true`/`yes`/`on`.
+    #[test]
+    fn restrict_acl_env_default_off() {
+        let _g = H5_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let prior = std::env::var("LPM_VAULT_KEYCHAIN_RESTRICT").ok();
+        unsafe {
+            std::env::remove_var("LPM_VAULT_KEYCHAIN_RESTRICT");
+        }
+        assert!(
+            !restrict_acl_via_env(),
+            "default must be permissive (-A) for Swift app interop"
+        );
+        unsafe {
+            if let Some(v) = prior {
+                std::env::set_var("LPM_VAULT_KEYCHAIN_RESTRICT", v);
+            }
+        }
+    }
+
+    #[test]
+    fn restrict_acl_env_accepts_truthy_values() {
+        let _g = H5_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let prior = std::env::var("LPM_VAULT_KEYCHAIN_RESTRICT").ok();
+        for value in ["1", "true", "yes", "on", "TRUE", "Yes", "ON"] {
+            unsafe {
+                std::env::set_var("LPM_VAULT_KEYCHAIN_RESTRICT", value);
+            }
+            assert!(
+                restrict_acl_via_env(),
+                "value '{value}' must enable the restrictive ACL"
+            );
+        }
+        unsafe {
+            match prior {
+                Some(v) => std::env::set_var("LPM_VAULT_KEYCHAIN_RESTRICT", v),
+                None => std::env::remove_var("LPM_VAULT_KEYCHAIN_RESTRICT"),
+            }
+        }
+    }
+
+    #[test]
+    fn restrict_acl_env_ignores_other_values() {
+        let _g = H5_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let prior = std::env::var("LPM_VAULT_KEYCHAIN_RESTRICT").ok();
+        for value in ["0", "false", "no", "off", "asdf", ""] {
+            unsafe {
+                std::env::set_var("LPM_VAULT_KEYCHAIN_RESTRICT", value);
+            }
+            assert!(
+                !restrict_acl_via_env(),
+                "value '{value}' must NOT enable the restrictive ACL"
+            );
+        }
+        unsafe {
+            match prior {
+                Some(v) => std::env::set_var("LPM_VAULT_KEYCHAIN_RESTRICT", v),
+                None => std::env::remove_var("LPM_VAULT_KEYCHAIN_RESTRICT"),
+            }
         }
     }
 }

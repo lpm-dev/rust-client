@@ -19,6 +19,83 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::process::{Command, ExitStatus, Stdio};
 
+/// Inherited-env names that MUST be stripped from any `lpm run` /
+/// `lpm exec` child before spawn.
+///
+/// H21: the script runner spawns `sh -c <cmd>` (Unix) or
+/// `cmd /C <cmd>` (Windows) with no `env_clear()` and no scrub of
+/// the inherited process env. Pre-fix, every parent env variable
+/// (credential bearers, dynamic-linker hijack hooks) flowed
+/// verbatim into the user's `package.json > scripts` body.
+///
+/// We can't `env_clear` outright — legitimate scripts depend on
+/// `HOME`, `USER`, `LANG`, `PATH`, etc. Instead we mirror the
+/// lifecycle-script denylist (`STRIPPED_ENV_PATTERNS` in
+/// `lpm-cli/src/commands/rebuild.rs`) and explicitly `env_remove`
+/// each entry — same posture, applied at the script-runner boundary.
+///
+/// Credential carriers + dynamic-linker hijacks live in one list;
+/// suffix-shaped patterns (`*_SECRET`, `*_PASSWORD`, etc.) get
+/// stripped programmatically via `STRIPPED_INHERITED_ENV_SUFFIXES`.
+const STRIPPED_INHERITED_ENV_PATTERNS: &[&str] = &[
+    // Credential carriers
+    "LPM_TOKEN",
+    "NPM_TOKEN",
+    "NODE_AUTH_TOKEN",
+    "GITHUB_TOKEN",
+    "GH_TOKEN",
+    "GITLAB_TOKEN",
+    "BITBUCKET_TOKEN",
+    "AWS_SECRET_ACCESS_KEY",
+    "AWS_SESSION_TOKEN",
+    "AZURE_CLIENT_SECRET",
+    "LPM_KEY_PASSPHRASE",
+    // Runtime-hijack carriers
+    "LD_PRELOAD",
+    "LD_LIBRARY_PATH",
+    "LD_AUDIT",
+    "DYLD_INSERT_LIBRARIES",
+    "DYLD_LIBRARY_PATH",
+    "DYLD_FRAMEWORK_PATH",
+    "DYLD_FALLBACK_LIBRARY_PATH",
+    "NODE_OPTIONS",
+    "PYTHONPATH",
+    "PYTHONSTARTUP",
+    "GIT_SSH_COMMAND",
+    "BASH_ENV",
+    "ENV",
+    "PERL5OPT",
+    "PERL5LIB",
+    "RUBYOPT",
+    "RUBYLIB",
+];
+
+const STRIPPED_INHERITED_ENV_SUFFIXES: &[&str] = &["_SECRET", "_PASSWORD", "_KEY", "_PRIVATE_KEY"];
+
+/// Strip credential + runtime-hijack inherited env vars from `cmd`
+/// before spawn. Must run before any `command.envs(...)` that adds
+/// project-resolved `.env` values, so a project that legitimately
+/// overrides one of these names via its `.env` file (rare) still
+/// takes effect.
+///
+/// Whitelisted: explicit project `envs` map values flowing through
+/// `ShellCommand.envs`, since those are project-controlled and
+/// already gated by the project's `.env` policy.
+fn strip_inherited_env_hooks(cmd: &mut Command) {
+    for &pattern in STRIPPED_INHERITED_ENV_PATTERNS {
+        cmd.env_remove(pattern);
+    }
+    for (key, _value) in std::env::vars() {
+        let upper = key.to_ascii_uppercase();
+        if STRIPPED_INHERITED_ENV_SUFFIXES
+            .iter()
+            .any(|suffix| upper.ends_with(suffix))
+        {
+            cmd.env_remove(&key);
+        }
+    }
+}
+
 /// Max bytes accumulated per captured stream (stdout OR stderr).
 ///
 /// Mirrors the post-execution truncation cap in `commands::run` so the
@@ -92,6 +169,11 @@ pub fn spawn_shell(cmd: &ShellCommand) -> Result<ExitStatus, LpmError> {
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit());
 
+    // Scrub credential + runtime-hijack env hooks the parent process
+    // inherited (H21). Runs BEFORE project envs so a legitimate
+    // project-level override in `.env` can still take effect.
+    strip_inherited_env_hooks(&mut command);
+
     // Inject .env vars, then set PATH AFTER to prevent .env from overriding it
     if !cmd.envs.is_empty() {
         command.envs(cmd.envs);
@@ -150,6 +232,11 @@ pub fn spawn_shell_tee(cmd: &ShellCommand) -> Result<CapturedOutput, LpmError> {
         .stdin(Stdio::inherit())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+
+    // Scrub credential + runtime-hijack env hooks the parent process
+    // inherited (H21). Runs BEFORE project envs so a legitimate
+    // project-level override in `.env` can still take effect.
+    strip_inherited_env_hooks(&mut command);
 
     // Inject .env vars, then set PATH AFTER to prevent .env from overriding it
     if !cmd.envs.is_empty() {
@@ -230,6 +317,8 @@ pub fn spawn_shell_capture(cmd: &ShellCommand) -> Result<CapturedOutput, LpmErro
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
 
+    strip_inherited_env_hooks(&mut command);
+
     if !cmd.envs.is_empty() {
         command.envs(cmd.envs);
     }
@@ -303,6 +392,8 @@ pub fn spawn_shell_prefixed(
         .stdin(Stdio::inherit())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+
+    strip_inherited_env_hooks(&mut command);
 
     if !cmd.envs.is_empty() {
         command.envs(cmd.envs);
@@ -704,5 +795,109 @@ mod tests {
             "buf must end on a UTF-8 boundary"
         );
         assert!(buf.contains("[output truncated"));
+    }
+
+    /// H21: each `spawn_shell` invocation must NOT inherit a parent
+    /// `LD_PRELOAD` / `NODE_OPTIONS` / `LPM_TOKEN` value into the
+    /// `sh -c` child. Pre-fix the parent env flowed verbatim.
+    ///
+    /// Cross-platform shape: we set the env vars on the calling
+    /// process, spawn a shell that prints them, and assert the
+    /// child saw nothing. Uses Unix shell builtins because the
+    /// `#[cfg(windows)]` shape would need a different printer; the
+    /// scrub itself is platform-agnostic (`Command::env_remove`).
+    #[cfg(unix)]
+    #[test]
+    fn spawn_shell_strips_inherited_credential_and_hijack_env() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = std::env::var("PATH").unwrap_or_default();
+        let envs = empty_envs();
+        // A `_SECRET`-suffix sentinel proves the suffix-shape scrub
+        // also runs (not just the named-list scrub).
+        let suffix_secret_name = format!("TEST_{}_SECRET", std::process::id());
+        unsafe {
+            std::env::set_var("LD_PRELOAD", "/dev/null/evil.so");
+            std::env::set_var("NODE_OPTIONS", "--require=/dev/null/evil");
+            std::env::set_var("LPM_TOKEN", "secret-token-value");
+            std::env::set_var(&suffix_secret_name, "exfil-secret");
+            // Non-stripped sentinel: a generic var that should pass
+            // through so we know the scrub is targeted, not blanket.
+            std::env::set_var("LPM_NONSCRUB_SENTINEL", "kept");
+        }
+
+        let cmd = format!(
+            r#"echo "LP=${{LD_PRELOAD-unset}} NO=${{NODE_OPTIONS-unset}} TK=${{LPM_TOKEN-unset}} SE=${{{suffix_secret_name}-unset}} S=${{LPM_NONSCRUB_SENTINEL-unset}}""#
+        );
+        let result = spawn_shell_capture(&ShellCommand {
+            command: &cmd,
+            cwd: dir.path(),
+            path: &path,
+            envs: &envs,
+        });
+
+        // Clean up our env mutations even if the assertion below fails.
+        unsafe {
+            std::env::remove_var("LD_PRELOAD");
+            std::env::remove_var("NODE_OPTIONS");
+            std::env::remove_var("LPM_TOKEN");
+            std::env::remove_var(&suffix_secret_name);
+            std::env::remove_var("LPM_NONSCRUB_SENTINEL");
+        }
+
+        let result = result.expect("spawn_shell_capture failed");
+        assert!(result.status.success());
+        assert!(
+            result.stdout.contains("LP=unset"),
+            "LD_PRELOAD must NOT reach the child: {}",
+            result.stdout
+        );
+        assert!(
+            result.stdout.contains("NO=unset"),
+            "NODE_OPTIONS must NOT reach the child: {}",
+            result.stdout
+        );
+        assert!(
+            result.stdout.contains("TK=unset"),
+            "LPM_TOKEN must NOT reach the child: {}",
+            result.stdout
+        );
+        assert!(
+            result.stdout.contains("SE=unset"),
+            "*_SECRET suffix must NOT reach the child: {}",
+            result.stdout
+        );
+        assert!(
+            result.stdout.contains("S=kept"),
+            "non-scrubbed sentinel must pass through: {}",
+            result.stdout
+        );
+    }
+
+    /// H21: a value passed via the explicit `envs` map MUST still
+    /// reach the child even if its name overlaps with a stripped
+    /// pattern — the strip targets *inherited* env, not project-
+    /// supplied values.
+    #[cfg(unix)]
+    #[test]
+    fn spawn_shell_honors_project_env_even_for_stripped_names() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = std::env::var("PATH").unwrap_or_default();
+        let mut envs = HashMap::new();
+        envs.insert("NODE_OPTIONS".into(), "--require=./project-allowed".into());
+
+        let result = spawn_shell_capture(&ShellCommand {
+            command: r#"echo "NO=${NODE_OPTIONS-unset}""#,
+            cwd: dir.path(),
+            path: &path,
+            envs: &envs,
+        })
+        .unwrap();
+
+        assert!(result.status.success());
+        assert!(
+            result.stdout.contains("NO=--require=./project-allowed"),
+            "project-supplied envs map must overwrite the scrub: {}",
+            result.stdout
+        );
     }
 }

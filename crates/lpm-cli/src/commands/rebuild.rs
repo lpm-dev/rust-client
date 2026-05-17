@@ -90,7 +90,24 @@ const DEFAULT_SCRIPT_TIMEOUT_SECS: u64 = 300;
 const BUILD_MARKER: &str = ".lpm-built";
 
 /// Env var patterns to strip from script execution environment.
+///
+/// Two classes share this list:
+///   * **Credential carriers** — bearers and per-vendor tokens that
+///     a malicious lifecycle script would otherwise exfiltrate.
+///   * **Runtime-hijack carriers** (H13) — names that the dynamic
+///     linker / language runtimes consume to load attacker-supplied
+///     code into the child process. These are the same names the
+///     dotenv loader at `lpm-runner/src/dotenv.rs:256` already
+///     denies; before this fix the lifecycle path had a token-only
+///     denylist while `.env` loading had a runtime-hijack denylist,
+///     leaving an asymmetric gap where an LD_PRELOAD/NODE_OPTIONS
+///     value present on the parent process flowed verbatim into the
+///     lifecycle child. Mirroring the dotenv list here closes that
+///     asymmetry — the lifecycle child no longer inherits any
+///     dynamic-linker hijack hook from the parent's env regardless
+///     of where the value originated.
 const STRIPPED_ENV_PATTERNS: &[&str] = &[
+    // Credential carriers
     "LPM_TOKEN",
     "NPM_TOKEN",
     "NODE_AUTH_TOKEN",
@@ -101,6 +118,25 @@ const STRIPPED_ENV_PATTERNS: &[&str] = &[
     "AWS_SECRET_ACCESS_KEY",
     "AWS_SESSION_TOKEN",
     "AZURE_CLIENT_SECRET",
+    // Runtime-hijack carriers (H13). Same posture as dotenv's
+    // DENIED_ENV_VARS.
+    "LD_PRELOAD",
+    "LD_LIBRARY_PATH",
+    "LD_AUDIT",
+    "DYLD_INSERT_LIBRARIES",
+    "DYLD_LIBRARY_PATH",
+    "DYLD_FRAMEWORK_PATH",
+    "DYLD_FALLBACK_LIBRARY_PATH",
+    "NODE_OPTIONS",
+    "PYTHONPATH",
+    "PYTHONSTARTUP",
+    "GIT_SSH_COMMAND",
+    "BASH_ENV",
+    "ENV",
+    "PERL5OPT",
+    "PERL5LIB",
+    "RUBYOPT",
+    "RUBYLIB",
 ];
 
 /// Env var suffix patterns — any var ending with these is stripped.
@@ -3263,6 +3299,60 @@ mod tests {
         // PATH and HOME are always present in the test environment
         let env = build_sanitized_env();
         assert!(env.contains_key("PATH"));
+    }
+
+    /// H13: lifecycle scripts must NOT inherit any of the
+    /// dynamic-linker / language-runtime hijack hooks
+    /// (`LD_PRELOAD`, `DYLD_INSERT_LIBRARIES`, `NODE_OPTIONS`,
+    /// etc.). Pre-fix the lifecycle path used a token-only denylist
+    /// while the dotenv loader had a runtime-hijack denylist —
+    /// asymmetric. Now the lifecycle list mirrors the dotenv list.
+    #[test]
+    fn sanitized_env_strips_runtime_hijack_carriers() {
+        let _env = crate::test_env::ScopedEnv::set([
+            ("LD_PRELOAD", "/dev/null/evil.so".into()),
+            ("LD_LIBRARY_PATH", "/dev/null".into()),
+            ("LD_AUDIT", "/dev/null/audit.so".into()),
+            ("DYLD_INSERT_LIBRARIES", "/dev/null/evil.dylib".into()),
+            ("DYLD_LIBRARY_PATH", "/dev/null".into()),
+            ("DYLD_FRAMEWORK_PATH", "/dev/null".into()),
+            ("DYLD_FALLBACK_LIBRARY_PATH", "/dev/null".into()),
+            ("NODE_OPTIONS", "--require=/dev/null".into()),
+            ("PYTHONPATH", "/dev/null".into()),
+            ("PYTHONSTARTUP", "/dev/null/start.py".into()),
+            ("GIT_SSH_COMMAND", "/dev/null/ssh-evil".into()),
+            ("BASH_ENV", "/dev/null/bashrc".into()),
+            ("ENV", "/dev/null/profile".into()),
+            ("PERL5OPT", "-Mevil".into()),
+            ("PERL5LIB", "/dev/null".into()),
+            ("RUBYOPT", "-revil".into()),
+            ("RUBYLIB", "/dev/null".into()),
+        ]);
+        let env = build_sanitized_env();
+        for hijack in [
+            "LD_PRELOAD",
+            "LD_LIBRARY_PATH",
+            "LD_AUDIT",
+            "DYLD_INSERT_LIBRARIES",
+            "DYLD_LIBRARY_PATH",
+            "DYLD_FRAMEWORK_PATH",
+            "DYLD_FALLBACK_LIBRARY_PATH",
+            "NODE_OPTIONS",
+            "PYTHONPATH",
+            "PYTHONSTARTUP",
+            "GIT_SSH_COMMAND",
+            "BASH_ENV",
+            "ENV",
+            "PERL5OPT",
+            "PERL5LIB",
+            "RUBYOPT",
+            "RUBYLIB",
+        ] {
+            assert!(
+                !env.contains_key(hijack),
+                "{hijack} must be stripped from lifecycle env"
+            );
+        }
     }
 
     // ── read_lifecycle_scripts tests ─────────────────────────────

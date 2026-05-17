@@ -543,6 +543,55 @@ fn swap_current_binary(current_exe: &std::path::Path, new_bytes: &[u8]) -> Resul
     let tmp_name = format!("{}.new.{}", file_name.to_string_lossy(), std::process::id());
     let tmp_path = parent.join(tmp_name);
 
+    // L20: save a backup copy of the running binary next to itself BEFORE
+    // we install the new one, so a user who discovers the new binary is
+    // broken can rename `<lpm>.previous` back over `<lpm>` and recover
+    // without going to GitHub. The journal file is a parallel marker
+    // recording when the backup was made + the version string the user
+    // updated FROM, so a future `lpm self-rollback` command (tracked
+    // separately) can drive the rename automatically.
+    //
+    // Best-effort: if the copy fails (read-only filesystem, perms), log
+    // and continue with the install. The user opted into the update
+    // and would get a confusing "can't update" error otherwise.
+    let backup_name = format!("{}.previous", file_name.to_string_lossy());
+    let backup_path = parent.join(backup_name);
+    if let Err(e) = std::fs::copy(current_exe, &backup_path) {
+        tracing::warn!(
+            target: "lpm_cli::self_update",
+            current_exe = %current_exe.display(),
+            backup_path = %backup_path.display(),
+            error = %e,
+            "could not back up the running binary before self-update — rollback via `<binary>.previous` rename will not be available"
+        );
+    } else {
+        let journal_path = parent.join(format!(
+            "{}.update-journal.json",
+            file_name.to_string_lossy()
+        ));
+        let journal = serde_json::json!({
+            "version": 1,
+            "backup_path": backup_path.display().to_string(),
+            "current_exe": current_exe.display().to_string(),
+            "updated_at_unix_secs": std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0),
+            "previous_binary_version": env!("CARGO_PKG_VERSION"),
+        });
+        if let Err(e) = std::fs::write(
+            &journal_path,
+            serde_json::to_string_pretty(&journal).unwrap_or_default(),
+        ) {
+            tracing::warn!(
+                target: "lpm_cli::self_update",
+                journal_path = %journal_path.display(),
+                error = %e,
+                "wrote backup but failed to record update-journal sidecar — rollback via rename still possible"
+            );
+        }
+    }
+
     std::fs::write(&tmp_path, new_bytes).map_err(|e| {
         LpmError::Io(std::io::Error::new(
             e.kind(),
@@ -657,6 +706,12 @@ mod tests {
     /// preserves any extension such as `.exe`) so the rename is
     /// atomic. Pre-fix `with_extension("tmp")` stripped Windows
     /// `lpm.exe` to `lpm.tmp`, breaking the rename target.
+    ///
+    /// L20 sidecars (`<file>.previous` + `<file>.update-journal.json`)
+    /// are intentionally left in place after a successful swap so the
+    /// operator can `mv` the backup back over the destination if the
+    /// new binary turns out to be broken — they are recovery state,
+    /// not staging.
     #[test]
     fn swap_current_binary_replaces_file_atomically() {
         let dir = tempdir().unwrap();
@@ -666,17 +721,21 @@ mod tests {
         swap_current_binary(&current, new_bytes).expect("swap must succeed");
         let read = std::fs::read(&current).unwrap();
         assert_eq!(read, new_bytes);
-        // No staging files left behind under success.
+        let allowed_sidecars = ["lpm-test-bin.previous", "lpm-test-bin.update-journal.json"];
         let leftovers: Vec<_> = std::fs::read_dir(dir.path())
             .unwrap()
             .filter_map(|e| {
                 let n = e.unwrap().file_name().to_string_lossy().into_owned();
-                if n != "lpm-test-bin" { Some(n) } else { None }
+                if n == "lpm-test-bin" || allowed_sidecars.contains(&n.as_str()) {
+                    None
+                } else {
+                    Some(n)
+                }
             })
             .collect();
         assert!(
             leftovers.is_empty(),
-            "swap left behind staging files: {leftovers:?}"
+            "swap left behind unexpected staging files: {leftovers:?}"
         );
     }
 

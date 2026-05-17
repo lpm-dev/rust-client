@@ -504,8 +504,7 @@ pub async fn run(
                 }
             }
 
-            let registry_url = std::env::var("LPM_REGISTRY_URL")
-                .unwrap_or_else(|_| lpm_common::DEFAULT_REGISTRY_URL.to_string());
+            let registry_url = lpm_common::resolve_lpm_registry_url();
             let auth_token = resolve_lpm_bearer(&registry_url).await?;
 
             output::info("pushing vault to cloud...");
@@ -577,8 +576,7 @@ pub async fn run(
 
             // Org pull: different flow with X25519 decryption
             if let Some(org_slug) = org_flag {
-                let registry_url = std::env::var("LPM_REGISTRY_URL")
-                    .unwrap_or_else(|_| lpm_common::DEFAULT_REGISTRY_URL.to_string());
+                let registry_url = lpm_common::resolve_lpm_registry_url();
                 let auth_token = resolve_lpm_bearer(&registry_url).await?;
 
                 // Ensure we have a keypair
@@ -678,8 +676,7 @@ pub async fn run(
                 }
             }
 
-            let registry_url = std::env::var("LPM_REGISTRY_URL")
-                .unwrap_or_else(|_| lpm_common::DEFAULT_REGISTRY_URL.to_string());
+            let registry_url = lpm_common::resolve_lpm_registry_url();
             let auth_token = resolve_lpm_bearer(&registry_url).await?;
 
             output::info("pulling vault from cloud...");
@@ -722,8 +719,7 @@ pub async fn run(
             let vault_id = lpm_vault::vault_id::read_vault_id(project_dir)
                 .ok_or_else(|| LpmError::Script("no vault configured".into()))?;
 
-            let registry_url = std::env::var("LPM_REGISTRY_URL")
-                .unwrap_or_else(|_| lpm_common::DEFAULT_REGISTRY_URL.to_string());
+            let registry_url = lpm_common::resolve_lpm_registry_url();
             let auth_token = resolve_lpm_bearer(&registry_url).await?;
 
             let result =
@@ -771,8 +767,7 @@ pub async fn run(
                 return Err(LpmError::Script("vault is empty, nothing to share".into()));
             }
 
-            let registry_url = std::env::var("LPM_REGISTRY_URL")
-                .unwrap_or_else(|_| lpm_common::DEFAULT_REGISTRY_URL.to_string());
+            let registry_url = lpm_common::resolve_lpm_registry_url();
             let auth_token = resolve_lpm_bearer(&registry_url).await?;
 
             output::info("ensuring your X25519 public key is registered...");
@@ -841,8 +836,7 @@ pub async fn run(
             let vault_id = lpm_vault::vault_id::read_vault_id(project_dir)
                 .ok_or_else(|| LpmError::Script("no vault configured".into()))?;
 
-            let registry_url = std::env::var("LPM_REGISTRY_URL")
-                .unwrap_or_else(|_| lpm_common::DEFAULT_REGISTRY_URL.to_string());
+            let registry_url = lpm_common::resolve_lpm_registry_url();
             let auth_token = resolve_lpm_bearer(&registry_url).await?;
 
             let secrets = lpm_vault::get_all(project_dir);
@@ -938,8 +932,7 @@ pub async fn run(
             }
             let code = code.to_ascii_uppercase();
 
-            let registry_url = std::env::var("LPM_REGISTRY_URL")
-                .unwrap_or_else(|_| lpm_common::DEFAULT_REGISTRY_URL.to_string());
+            let registry_url = lpm_common::resolve_lpm_registry_url();
             // Vault pairing requires a refresh-backed session. The
             // `SessionRequired` posture rejects `LPM_TOKEN`/`--token`/
             // CI/legacy tokens with the same message the old
@@ -1001,8 +994,7 @@ pub async fn run(
         }
 
         "unpair" => {
-            let registry_url = std::env::var("LPM_REGISTRY_URL")
-                .unwrap_or_else(|_| lpm_common::DEFAULT_REGISTRY_URL.to_string());
+            let registry_url = lpm_common::resolve_lpm_registry_url();
             // Unpair revokes browser pairings — same session-backed
             // requirement as `pair`.
             let auth_token = resolve_session_bearer(&registry_url).await?;
@@ -1838,8 +1830,7 @@ fn vars_check(project_dir: &std::path::Path, json_output: bool) -> Result<(), Lp
 
 /// Get the LPM auth token and registry URL for API calls.
 async fn get_platform_auth() -> Result<(String, String), LpmError> {
-    let registry_url = std::env::var("LPM_REGISTRY_URL")
-        .unwrap_or_else(|_| lpm_common::DEFAULT_REGISTRY_URL.to_string());
+    let registry_url = lpm_common::resolve_lpm_registry_url();
     let auth_token = resolve_lpm_bearer(&registry_url).await?;
     Ok((registry_url, auth_token))
 }
@@ -2696,8 +2687,7 @@ async fn vars_oidc_pull(
     // Also check env var override for vault ID (useful in CI where lpm.json may not exist)
     let vault_id = std::env::var("LPM_VAULT_ID").unwrap_or(vault_id);
 
-    let registry_url = std::env::var("LPM_REGISTRY_URL")
-        .unwrap_or_else(|_| lpm_common::DEFAULT_REGISTRY_URL.to_string());
+    let registry_url = lpm_common::resolve_lpm_registry_url();
 
     let mut env_mode: Option<&str> = None;
     let mut output_file: Option<&str> = None;
@@ -3054,8 +3044,7 @@ fn vars_list(
 
 /// List cloud vaults — personal or org.
 async fn vars_list_remote(org_slug: Option<&str>, json_output: bool) -> Result<(), LpmError> {
-    let registry_url = std::env::var("LPM_REGISTRY_URL")
-        .unwrap_or_else(|_| lpm_common::DEFAULT_REGISTRY_URL.to_string());
+    let registry_url = lpm_common::resolve_lpm_registry_url();
     let auth_token = resolve_lpm_bearer(&registry_url).await?;
 
     if let Some(slug) = org_slug {
@@ -3202,8 +3191,7 @@ async fn vars_diff(
 
         let vault_id = lpm_vault::vault_id::read_vault_id(project_dir)
             .ok_or_else(|| LpmError::Script("no vault configured".into()))?;
-        let registry_url = std::env::var("LPM_REGISTRY_URL")
-            .unwrap_or_else(|_| lpm_common::DEFAULT_REGISTRY_URL.to_string());
+        let registry_url = lpm_common::resolve_lpm_registry_url();
         let auth_token = resolve_lpm_bearer(&registry_url).await?;
 
         let (remote, _version) =
@@ -3223,8 +3211,7 @@ async fn vars_diff(
 
         let vault_id = lpm_vault::vault_id::read_vault_id(project_dir)
             .ok_or_else(|| LpmError::Script("no vault configured".into()))?;
-        let registry_url = std::env::var("LPM_REGISTRY_URL")
-            .unwrap_or_else(|_| lpm_common::DEFAULT_REGISTRY_URL.to_string());
+        let registry_url = lpm_common::resolve_lpm_registry_url();
         let auth_token = resolve_lpm_bearer(&registry_url).await?;
 
         let (remote, _version) = lpm_vault::sync::pull(&registry_url, &auth_token, &vault_id)

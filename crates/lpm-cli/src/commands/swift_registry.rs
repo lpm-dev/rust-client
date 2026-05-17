@@ -43,6 +43,23 @@ enum TrustOutcome {
 /// 2. swift package-registry login --token <lpm_token> (HTTPS only)
 /// 3. Download signing certificate to ~/.swiftpm/security/trusted-root-certs/lpm.der
 pub async fn run(registry_url: &str, json_output: bool, force: bool) -> Result<(), LpmError> {
+    // H20: refuse to globally install SwiftPM signing trust for a
+    // registry URL that fails the same gating contract used for
+    // LPM_REGISTRY_URL itself (H16). HTTPS is accepted for any host
+    // (legitimate private mirror / on-prem appliance); HTTP only for
+    // loopback (workflow tests against wiremock). Plain HTTP non-
+    // loopback was previously passed straight to SwiftPM with
+    // `--allow-insecure-http`, which then installed `lpm.der` into
+    // `~/.swiftpm/security/trusted-root-certs/` and silently allowed
+    // every `lpmdev` Swift package to be signed against whatever
+    // cert that registry served. That's a persistent SwiftPM trust
+    // downgrade that survives across LPM sessions. Refuse upfront.
+    if !lpm_common::lpm_registry_url_is_accepted(registry_url) {
+        return Err(LpmError::Registry(format!(
+            "swift-registry setup refuses to install global SwiftPM signing trust against {registry_url}: only https:// (any host) or http:// loopback URLs are accepted (H20). Pass an https:// registry URL or unset LPM_REGISTRY_URL."
+        )));
+    }
+
     let swift_registry_url = format!("{registry_url}/api/swift-registry");
     let is_https = registry_url.starts_with("https://");
 
@@ -113,6 +130,15 @@ pub async fn run(registry_url: &str, json_output: bool, force: bool) -> Result<(
             // because there is no alternative mechanism (no env var support, no stdin pipe,
             // no config file option for token injection). The risk is mitigated by the
             // token being short-lived in the process list (command completes quickly).
+            //
+            // H19: surface the argv-leak window via tracing::warn so a same-host
+            // observer scanning logs after a swift-registry setup sees the explicit
+            // trust posture (instead of having to read source). The warn lands on
+            // stderr regardless of --json so CI / agent runs also see it.
+            tracing::warn!(
+                target: "lpm_cli::swift_registry",
+                "swift package-registry login passes the LPM bearer via `--token <value>` in process argv — token is briefly observable to same-host processes via `ps`. SPM has no stdin/env/config alternative; accepted trade-off documented in code."
+            );
             let login_result = if json_output {
                 tokio::process::Command::new("swift")
                     .args([

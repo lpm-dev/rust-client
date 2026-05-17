@@ -1302,6 +1302,24 @@ impl RegistryClient {
                 self.base_url
             )));
         }
+        // L6: when `--insecure` is the path that admitted an HTTP
+        // non-loopback URL, surface the DNS-rebinding window
+        // explicitly. The string-based scheme check happens HERE; the
+        // actual TCP connect happens later inside reqwest with a
+        // fresh DNS resolve. An attacker whose DNS server returns
+        // 127.0.0.1 (or another internal IP) on the second resolve
+        // can steer the request to a different host than the one
+        // the URL named. We can't fix the rebinding window cheaply
+        // without forking reqwest's connector (would need a resolve-
+        // once + connect-to-IP pattern), but we CAN surface the
+        // trust posture so operators see they're agreeing to it.
+        if self.allow_insecure && is_http_url(url) && !is_localhost_url(url) {
+            tracing::warn!(
+                target: "lpm_registry::client",
+                base_url = %url,
+                "--insecure HTTP non-loopback registry: there is a DNS-rebinding window between this URL validation and the eventual TCP connect. Use HTTPS to anchor the trust to a TLS cert rather than DNS"
+            );
+        }
         Ok(())
     }
 

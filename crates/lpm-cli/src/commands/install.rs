@@ -2028,6 +2028,29 @@ async fn pre_resolve_non_registry_deps(
             )));
         }
 
+        // H7: trust-on-first-use SRI capture. With no declared
+        // integrity, whatever the server returns gets pinned into the
+        // lockfile and trusted on every subsequent install. Surface
+        // the trust posture loudly so the operator sees what they're
+        // agreeing to: the project is now bound to whoever owned the
+        // server at the moment of first install. `--strict-integrity`
+        // above already hard-fails when this is unacceptable; the
+        // warn lands on the default permissive path so silent TOFU
+        // becomes visible TOFU.
+        if declared_integrity.is_none() {
+            tracing::warn!(
+                target: "lpm_cli::install",
+                local_name = %local_name,
+                tarball_url = %url,
+                "tarball+URL dep without declared SRI — trusting whatever the server returns AND pinning the computed hash into lpm.lock (trust-on-first-use). Pin via `#sha512-...` on the URL, or pass `--strict-integrity` to refuse."
+            );
+            if !json_output {
+                output::warn(&format!(
+                    "tarball+URL dep '{local_name}' has no declared SRI — pinning trust-on-first-use to {url}"
+                ));
+            }
+        }
+
         // Step 1+2: download (with optional SRI verify) and extract
         // into the CAS. If the CAS dir already exists for the same
         // computed SRI, store_tarball_at_cas_path's fast path skips
