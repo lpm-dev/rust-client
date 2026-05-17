@@ -289,9 +289,28 @@ fn reconcile_one(
         // the path as a tombstone so `store gc` / next recovery can
         // retry. Pre-fix the error was dropped silently and the path
         // sat as permanent debris (audit Low #2).
+        //
+        // L47: pre-validate the WAL-supplied `new_root_path` against
+        // the `installs/<name>@<version>` shape before any unlink. A
+        // corrupt WAL with `new_root_path = "/etc/passwd"` (or any
+        // non-shape path) skips the inline delete and the tombstone
+        // push; the orphan path still resolves via WAL Abort but no
+        // outside-tree filesystem mutation runs.
         let mut tombstoned = false;
         let new_root_ext = as_extended_path(&intent.new_root_path);
-        if new_root_ext.exists()
+        let path_shape = crate::sweep::validated_install_root_absolute(
+            &root.global_root(),
+            &intent.new_root_path,
+        );
+        if let Err(reason) = &path_shape {
+            tracing::warn!(
+                "recover: orphan-root path for tx {} is structurally invalid ({reason}); \
+                 skipping inline delete and tombstone push",
+                intent.tx_id,
+            );
+        }
+        if path_shape.is_ok()
+            && new_root_ext.exists()
             && let Err(e) = std::fs::remove_dir_all(&new_root_ext)
         {
             if let Some(rel) = relative_install_root(root, &intent.new_root_path) {
@@ -650,7 +669,21 @@ fn roll_forward_uninstall(
     //    so it's retried on the next `lpm` invocation, but don't
     //    propagate as an error (would wedge every subsequent
     //    global-state command). Audit Medium from the round.
-    let prior_commands: Vec<String> = intent
+    //
+    // L48: derive the command list from the snapshot when it is
+    // structurally valid, OR fall back to the live manifest's
+    // `[packages.<pkg>]` row when the snapshot is missing/malformed
+    // (older buggy writer, partial WAL, same-uid tamper). Pre-fix the
+    // fallback was a silent empty vector, which let recovery commit
+    // the uninstall while orphaning every emitted shim — those shims
+    // then persisted in `bin_dir` with no manifest row to reconcile
+    // them against (this is L48 + the L37 doctor blind spot together
+    // creating "invisible debris on PATH"). Fallback to the manifest
+    // row keeps the cleanup intent honest: if both the snapshot AND
+    // the manifest lack commands for this package, the package was
+    // already structurally without shims and the empty-vector path is
+    // correct.
+    let snapshot_commands: Option<Vec<String>> = intent
         .prior_active_row_json
         .as_ref()
         .and_then(|v| v.get("commands"))
@@ -659,8 +692,28 @@ fn roll_forward_uninstall(
             arr.iter()
                 .filter_map(|v| v.as_str().map(String::from))
                 .collect()
-        })
-        .unwrap_or_default();
+        });
+    let prior_commands: Vec<String> = match snapshot_commands {
+        Some(c) => c,
+        None => {
+            // Snapshot malformed → consult the live manifest. This
+            // gives recovery the same cleanup surface the original
+            // uninstall would have computed, instead of silently
+            // dropping it.
+            let fallback = manifest
+                .packages
+                .get(&intent.package)
+                .map(|e| e.commands.clone())
+                .unwrap_or_default();
+            tracing::warn!(
+                "recover: uninstall snapshot for '{}' missing/malformed commands array; \
+                 falling back to live manifest row ({} command(s))",
+                intent.package,
+                fallback.len(),
+            );
+            fallback
+        }
+    };
     let mut shim_failures: Vec<String> = Vec::new();
     for cmd in &prior_commands {
         if let Err(e) = remove_shim(&bin_dir, cmd) {
@@ -669,12 +722,35 @@ fn roll_forward_uninstall(
     }
 
     // 2. Remove alias shims from the prior ownership snapshot.
-    let prior_aliases: Vec<String> = intent
+    //
+    // L48: same snapshot-then-fallback shape as the commands step.
+    // When the snapshot's `prior_command_ownership_json.aliases`
+    // is missing/not-an-object, fall back to walking the manifest's
+    // `[aliases.*]` rows owned by this package — that's the same
+    // surface the original uninstall would have iterated.
+    let snapshot_aliases: Option<Vec<String>> = intent
         .prior_command_ownership_json
         .get("aliases")
         .and_then(|v| v.as_object())
-        .map(|m| m.keys().cloned().collect())
-        .unwrap_or_default();
+        .map(|m| m.keys().cloned().collect());
+    let prior_aliases: Vec<String> = match snapshot_aliases {
+        Some(a) => a,
+        None => {
+            let fallback: Vec<String> = manifest
+                .aliases
+                .iter()
+                .filter(|(_, entry)| entry.package == intent.package)
+                .map(|(name, _)| name.clone())
+                .collect();
+            tracing::warn!(
+                "recover: uninstall snapshot for '{}' missing/malformed aliases object; \
+                 falling back to live manifest alias rows ({} alias(es))",
+                intent.package,
+                fallback.len(),
+            );
+            fallback
+        }
+    };
     for alias_name in &prior_aliases {
         if let Err(e) = remove_shim(&bin_dir, alias_name) {
             shim_failures.push(format!("{alias_name} (alias): {e}"));
@@ -716,8 +792,16 @@ fn roll_forward_uninstall(
 
     // 6. Best-effort install-root cleanup. If this fails the tombstone
     //    we just queued keeps the retry alive for `store gc`.
+    //
+    // L47: skip the inline delete when the WAL-supplied path doesn't
+    // match the `installs/<name>@<version>` shape — the sweep step at
+    // step 4 already refused to push the relative form if it wasn't
+    // under global_root, so the tombstone retry won't fire either.
     let new_root_ext = as_extended_path(&intent.new_root_path);
-    if new_root_ext.exists() {
+    if new_root_ext.exists()
+        && crate::sweep::validated_install_root_absolute(&root.global_root(), &intent.new_root_path)
+            .is_ok()
+    {
         let _ = std::fs::remove_dir_all(&new_root_ext);
     }
 
@@ -786,8 +870,24 @@ fn roll_back_with_authoritative_commands(
     // 1. Best-effort install-root cleanup. On Windows the directory may
     //    be locked by a tool the user is running against the new
     //    version — queue it as a tombstone instead of failing.
+    //
+    // L47: pre-validate the WAL-supplied `new_root_path` against the
+    // `installs/<name>@<version>` shape before any unlink. A corrupt
+    // Intent with `new_root_path` outside `global_root` skips both
+    // the inline delete and the tombstone push (tombstones get
+    // `pending.root` which is also validated by the sweeper).
     let new_root_ext = as_extended_path(&intent.new_root_path);
-    if new_root_ext.exists()
+    let path_shape =
+        crate::sweep::validated_install_root_absolute(&root.global_root(), &intent.new_root_path);
+    if let Err(reason) = &path_shape {
+        tracing::warn!(
+            "recover: install-root path for {} is structurally invalid ({reason}); \
+             skipping inline delete and tombstone push",
+            intent.package,
+        );
+    }
+    if path_shape.is_ok()
+        && new_root_ext.exists()
         && let Err(e) = std::fs::remove_dir_all(&new_root_ext)
     {
         tracing::debug!(

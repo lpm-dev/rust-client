@@ -235,6 +235,37 @@ fn sweep_under_lock(root: &LpmRoot) -> Result<SweepReport, LpmError> {
 /// Accepting CurDir / extra path-prefix components was an explicit
 /// regression — see the second-pass audit. Real writers never produce
 /// them, so the validator does not either.
+pub fn validated_install_root_relative(
+    global_root: &Path,
+    relative_path: &str,
+) -> Result<PathBuf, String> {
+    validated_tombstone_path(global_root, relative_path)
+}
+
+/// Same shape check, but takes an absolute path. Used by recovery
+/// when the path source is a WAL Intent's `new_root_path` field —
+/// recovery doesn't know the relative form a priori. Refuses absolute
+/// paths whose `strip_prefix(global_root)` fails OR whose relative
+/// form doesn't pass `validated_install_root_relative`.
+///
+/// **L47 fix**: every `remove_dir_all` site fed by manifest- or
+/// WAL-controlled paths gates through this helper first. A poisoned
+/// `root = "../../victim"` joins under `global_root` to something
+/// outside the tree; this helper refuses before the unlink.
+pub fn validated_install_root_absolute(
+    global_root: &Path,
+    abs_path: &Path,
+) -> Result<PathBuf, String> {
+    let rel = abs_path.strip_prefix(global_root).map_err(|_| {
+        format!(
+            "refusing to act on {abs_path:?}: not under the global root \
+             (manifest / WAL may be poisoned)"
+        )
+    })?;
+    let rel_str = rel.to_string_lossy();
+    validated_tombstone_path(global_root, &rel_str)
+}
+
 fn validated_tombstone_path(global_root: &Path, relative_path: &str) -> Result<PathBuf, String> {
     if relative_path.is_empty() {
         return Err("empty tombstone path (manifest corrupt?)".to_string());

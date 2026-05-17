@@ -82,7 +82,27 @@ fn run_under_lock(root: &LpmRoot, package: &str) -> Result<UninstallOutcome, Lpm
         .map(|(k, v)| (k.clone(), v.clone()))
         .collect();
 
-    let install_root_abs = root.global_root().join(&active.root);
+    // L47: validate the manifest-supplied relative install root against
+    // the same `installs/<name>@<version>` shape the tombstone sweeper
+    // enforces, BEFORE joining + the eventual `remove_dir_all`. A
+    // poisoned `active.root` of `"."`, `"installs"`, `"../escape"`, or
+    // an absolute path is refused here rather than walking outside the
+    // global tree at the inline cleanup step below.
+    let install_root_abs = match lpm_global::validated_install_root_relative(
+        &root.global_root(),
+        &active.root,
+    ) {
+        Ok(abs) => abs,
+        Err(reason) => {
+            return Err(LpmError::Script(format!(
+                "uninstall of '{}' refused: install-root path {:?} is structurally invalid \
+                     ({reason}). The manifest may be poisoned — inspect ~/.lpm/global/manifest.toml \
+                     before retrying.",
+                sanitize_for_terminal(package),
+                sanitize_for_terminal(&active.root),
+            )));
+        }
+    };
     let tx_id = mk_tx_id();
 
     // ─── Step 1: write Intent ──────────────────────────────────────
@@ -125,9 +145,16 @@ fn run_under_lock(root: &LpmRoot, package: &str) -> Result<UninstallOutcome, Lpm
 
     if !shim_failures.is_empty() {
         // Restore the shims we already removed so PATH resolution stays
-        // consistent with the (still-unchanged) manifest. Best-effort:
-        // if restoration itself fails, the user is told and we still
-        // leave the manifest unchanged.
+        // consistent with the (still-unchanged) manifest.
+        //
+        // L50: track restoration failures and propagate them honestly.
+        // Pre-fix the user always saw "any shims that were removed have
+        // been restored" even when restoration also failed, and the
+        // WAL Abort was written regardless — leaving PATH and manifest
+        // divergent with no recovery retry. Now: if ANY restoration
+        // fails, surface the failures in the error message AND skip
+        // WAL Abort so recovery retries on the next `lpm` invocation.
+        let mut restoration_failures: Vec<String> = Vec::new();
         for cmd in &removed_command_shims {
             let target = install_bin.join(cmd);
             if let Err(e) = emit_shim(
@@ -140,6 +167,7 @@ fn run_under_lock(root: &LpmRoot, package: &str) -> Result<UninstallOutcome, Lpm
                 tracing::warn!(
                     "uninstall -g: could not restore shim '{cmd}' after partial removal: {e}"
                 );
+                restoration_failures.push(format!("{cmd}: {e}"));
             }
         }
         for (alias_name, bin) in &removed_alias_shims {
@@ -154,11 +182,9 @@ fn run_under_lock(root: &LpmRoot, package: &str) -> Result<UninstallOutcome, Lpm
                 tracing::warn!(
                     "uninstall -g: could not restore alias shim '{alias_name}' after partial removal: {e}"
                 );
+                restoration_failures.push(format!("{alias_name} (alias): {e}"));
             }
         }
-        // Append WAL Abort so the transaction is resolved (recovery
-        // won't retry on next startup). The user gets a clear error
-        // and can re-invoke uninstall once the holding process dies.
         let failures_safe: Vec<String> = shim_failures
             .iter()
             .map(|f| sanitize_for_terminal(f))
@@ -168,17 +194,48 @@ fn run_under_lock(root: &LpmRoot, package: &str) -> Result<UninstallOutcome, Lpm
             shim_failures.len(),
             failures_safe.join("; ")
         );
-        wal.append(&WalRecord::Abort {
-            tx_id: tx_id.clone(),
-            reason: reason.clone(),
-            aborted_at: Utc::now(),
-        })?;
         let package_safe = sanitize_for_terminal(package);
+        if restoration_failures.is_empty() {
+            // Pure restoration success — append WAL Abort so the
+            // transaction is resolved; the user can re-invoke once the
+            // holding process dies.
+            wal.append(&WalRecord::Abort {
+                tx_id: tx_id.clone(),
+                reason: reason.clone(),
+                aborted_at: Utc::now(),
+            })?;
+            return Err(LpmError::Script(format!(
+                "uninstall of '{package_safe}' failed: {reason}.\n\n\
+                 The package's manifest entry was preserved and any shims that were removed have \
+                 been restored. Try again after closing tools that may be holding these files \
+                 (antivirus, Explorer preview on Windows, running CLI processes)."
+            )));
+        }
+        // Restoration ALSO failed. Do NOT write WAL Abort — leave the
+        // transaction unresolved so recovery picks it up on the next
+        // `lpm` invocation. The manifest is also unchanged at this
+        // point (we never reached step 3). The user sees an honest
+        // error naming both the original failures and the restoration
+        // failures.
+        let restoration_safe: Vec<String> = restoration_failures
+            .iter()
+            .map(|f| sanitize_for_terminal(f))
+            .collect();
+        tracing::warn!(
+            "uninstall -g: restoration also failed for '{}': {}",
+            package,
+            restoration_failures.join("; ")
+        );
         return Err(LpmError::Script(format!(
             "uninstall of '{package_safe}' failed: {reason}.\n\n\
-             The package's manifest entry was preserved and any shims that were removed have \
-             been restored. Try again after closing tools that may be holding these files \
-             (antivirus, Explorer preview on Windows, running CLI processes)."
+             Restoration of the partially-removed shims ALSO failed for {} shim(s): {}. \
+             The transaction has been left in an unresolved state — the next `lpm` invocation \
+             will retry the rollback via recovery. PATH may be temporarily inconsistent until \
+             recovery succeeds; close any tools holding these files (antivirus, Explorer \
+             preview on Windows, running CLI processes) and re-run any `lpm` command to \
+             trigger recovery.",
+            restoration_failures.len(),
+            restoration_safe.join("; ")
         )));
     }
 
@@ -689,16 +746,39 @@ mod tests {
             "manifest entry must be preserved when uninstall fails"
         );
 
-        // WAL must have an Abort record so the next recovery doesn't
-        // see this as an uncompleted transaction.
+        // L50: when restoration ALSO fails (here the 0o555 perm on
+        // bin_dir blocks both `remove_shim` AND `emit_shim`), the
+        // transaction is left unresolved so recovery retries on the
+        // next `lpm` invocation. Pre-fix the WAL Abort was written
+        // regardless, leaving PATH and manifest divergent with no
+        // recovery path. Verify the new contract: NO Abort record
+        // (the unresolved Intent is the recovery handle), and the
+        // error message names BOTH the removal AND restoration
+        // failures so the operator knows the state is actively
+        // recovering.
         let scan = lpm_global::WalReader::at(root.global_wal()).scan().unwrap();
         let has_abort = scan
             .records
             .iter()
             .any(|r| matches!(r, WalRecord::Abort { .. }));
         assert!(
-            has_abort,
-            "WAL must record the Abort so recovery doesn't retry"
+            !has_abort,
+            "L50: when restoration also fails, WAL Abort must be skipped \
+             so recovery retries on next invocation"
+        );
+        let has_intent = scan
+            .records
+            .iter()
+            .any(|r| matches!(r, WalRecord::Intent(_)));
+        assert!(
+            has_intent,
+            "Intent must be on disk so recovery has the cleanup handle"
+        );
+        // Error message must surface BOTH the original removal failure
+        // and the restoration failure — honest reporting per L50.
+        assert!(
+            format!("{err}").contains("Restoration of the partially-removed shims ALSO failed"),
+            "L50: error must surface restoration failure, got: {err}"
         );
     }
 
@@ -832,5 +912,47 @@ mod tests {
         assert!(!msg.contains('\u{07}'), "BEL must be scrubbed: {msg:?}");
         assert!(msg.contains("phantom"));
         assert!(msg.contains("not globally installed"));
+    }
+
+    /// L47: a manifest poisoned with a structurally invalid `active.root`
+    /// (parent-traversal, absolute path, single segment) must be refused
+    /// before any `remove_dir_all` walks outside the global tree. The
+    /// existing tombstone sweep's `validated_install_root_relative`
+    /// helper is the canonical shape check — uninstall now gates on it
+    /// before computing the install-root path.
+    #[test]
+    fn uninstall_refuses_structurally_invalid_install_root_in_manifest() {
+        let tmp = TempDir::new().unwrap();
+        let root = LpmRoot::from_dir(tmp.path());
+        let mut manifest = GlobalManifest::default();
+        // Poisoned row: `root = "../escape"` would join under
+        // global_root() to outside-tree if not validated.
+        manifest.packages.insert(
+            "evilpkg".into(),
+            PackageEntry {
+                saved_spec: "^1".into(),
+                resolved: "1.0.0".into(),
+                integrity: "sha512-x".into(),
+                source: PackageSource::LpmDev,
+                installed_at: Utc::now(),
+                root: "../escape".into(),
+                commands: vec![],
+            },
+        );
+        write_for(&root, &manifest).unwrap();
+
+        let err = run_under_lock(&root, "evilpkg").unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("structurally invalid")
+                && msg.contains("../escape")
+                && msg.contains("manifest may be poisoned"),
+            "expected L47 refusal naming the structural invalid + manifest-poisoned, got: {msg}"
+        );
+
+        // Manifest unchanged — uninstall refused at the gate, the row
+        // is still there.
+        let after = read_for(&root).unwrap();
+        assert!(after.packages.contains_key("evilpkg"));
     }
 }
