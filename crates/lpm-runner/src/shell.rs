@@ -81,7 +81,11 @@ const STRIPPED_INHERITED_ENV_SUFFIXES: &[&str] = &["_SECRET", "_PASSWORD", "_KEY
 /// Whitelisted: explicit project `envs` map values flowing through
 /// `ShellCommand.envs`, since those are project-controlled and
 /// already gated by the project's `.env` policy.
-fn strip_inherited_env_hooks(cmd: &mut Command) {
+///
+/// Crate-public so `dlx::build_dlx_command` (which spawns a
+/// registry-distributed binary directly with no sandbox) can apply
+/// the same scrub.
+pub(crate) fn strip_inherited_env_hooks(cmd: &mut Command) {
     for &pattern in STRIPPED_INHERITED_ENV_PATTERNS {
         cmd.env_remove(pattern);
     }
