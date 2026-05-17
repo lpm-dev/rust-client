@@ -175,9 +175,42 @@ async fn run_list_outdated(
     }
 
     // Single batch call covers every globally-installed package.
-    // Step 6 fix: use the injected client (carries
-    // `--registry` + SessionManager). The local `build_registry()`
-    // helper is now unused.
+    //
+    // Accepted-posture trade-off (L41): the batch endpoint is called
+    // with every package name regardless of `entry.source`. That means
+    // an `upstream-npm` row's name is included in the POST body to the
+    // configured LPM registry, not routed through the npm-specific
+    // `get_npm_package_metadata` proxy/public-fallback path the
+    // install/update flows use.
+    //
+    // Why this is intentional for this surface:
+    //
+    //   1. The LPM Worker batch endpoint is the canonical metadata
+    //      service for both `LpmDev` and `UpstreamNpm` source kinds —
+    //      it transparently proxies npm metadata via the same `dist`
+    //      shape, which is exactly what `pick_latest_matching` expects.
+    //
+    //   2. The privacy concern that drove M15 (`outdated --include-npm`
+    //      leaking private package names to public npm) is enforced at
+    //      a different layer — install/audit's `lockfile_source_is_npm_public`
+    //      gate. That gate refuses to disclose names to a *public* npm
+    //      endpoint; routing through the configured LPM endpoint is
+    //      explicitly the authorized destination.
+    //
+    //   3. Splitting by source here would replace one batch call with
+    //      N per-package round-trips through `get_npm_package_metadata`,
+    //      and the operator's manifest can easily contain 50+ globals.
+    //      For a diagnostic surface, the latency cost is not worth the
+    //      negligible privacy delta over the existing LPM-proxy
+    //      relationship.
+    //
+    // Future hardening: if a user opts into a strict-routing mode where
+    // npm metadata must never traverse the LPM proxy, this is the site
+    // to honor it — split `names` by `entry.source`, dispatch
+    // `LpmDev` to `batch_metadata`, `UpstreamNpm` to
+    // `get_npm_package_metadata`, and merge the results. Today's
+    // posture is "the LPM batch endpoint is the canonical metadata
+    // service for this diagnostic."
     let names: Vec<String> = manifest.packages.keys().cloned().collect();
     let metadata = match client.batch_metadata(&names).await {
         Ok(m) => m,
@@ -264,9 +297,18 @@ fn pick_latest_matching(
     if let Some(v) = meta.dist_tags.get(saved_spec) {
         return Ok(v.clone());
     }
-    // Exact version: accept it verbatim if the registry still has it.
+    // Exact version: verify the registry still serves it (L42). A
+    // yanked / deleted / tampered pin should surface as `unresolved`,
+    // not silently reported up-to-date.
     if lpm_semver::Version::parse(saved_spec).is_ok() {
-        return Ok(saved_spec.to_string());
+        if meta.versions.contains_key(saved_spec) {
+            return Ok(saved_spec.to_string());
+        }
+        return Err(format!(
+            "registry no longer serves the exact-pinned version '{saved_spec}' for '{}' — \
+             the version may have been yanked or deleted upstream",
+            meta.name
+        ));
     }
     // Wildcard: highest version, period.
     if saved_spec == "*" {
@@ -849,15 +891,28 @@ mod tests {
     }
 
     #[test]
-    fn pick_latest_matching_exact_version_passes_through() {
+    fn pick_latest_matching_exact_version_present_in_registry_passes_through() {
         let meta = fake_metadata("eslint", &["9.23.0", "9.24.0"], &[]);
-        // Exact that matches the registry.
         assert_eq!(pick_latest_matching(&meta, "9.24.0").unwrap(), "9.24.0");
-        // Exact we've never heard of is STILL accepted at the
-        // "saved_spec resolved to exact" level. The caller compares
-        // against entry.resolved; a registry-missing exact shows as
-        // up-to-date (no upgrade target). Matches project install.
-        assert_eq!(pick_latest_matching(&meta, "100.0.0").unwrap(), "100.0.0");
+    }
+
+    /// L42: an exact pin the registry no longer serves (yanked / deleted /
+    /// tampered) must surface as `unresolved`. Pre-fix `pick_latest_matching`
+    /// returned `Ok(saved_spec)` verbatim and `lpm global list --outdated`
+    /// reported the package as up-to-date because `latest == entry.resolved`,
+    /// which masked a real supply-chain or registry-state signal.
+    #[test]
+    fn pick_latest_matching_exact_version_missing_from_registry_surfaces_as_unresolved() {
+        let meta = fake_metadata("eslint", &["9.23.0", "9.24.0"], &[]);
+        let err = pick_latest_matching(&meta, "100.0.0").unwrap_err();
+        assert!(
+            err.contains("registry no longer serves"),
+            "L42: missing exact pin must surface a 'no longer served' message; got: {err}"
+        );
+        assert!(
+            err.contains("100.0.0"),
+            "L42: error must name the missing version; got: {err}"
+        );
     }
 
     #[test]
