@@ -1099,16 +1099,20 @@ fn print_osv_results(osv_vulns: &[OsvVulnerability]) {
             "MODERATE" | "MEDIUM" => "⚠".yellow().to_string(),
             _ => "ℹ".cyan().to_string(),
         };
-        let summary = if vuln.summary.is_empty() {
+        let summary_text = lpm_common::sanitize_for_terminal(&vuln.summary);
+        let summary = if summary_text.is_empty() {
             String::new()
         } else {
-            format!(" — {}", vuln.summary)
+            format!(" — {summary_text}")
         };
+        let package_safe = lpm_common::sanitize_for_terminal(&vuln.package);
+        let version_safe = lpm_common::sanitize_for_terminal(&vuln.version);
+        let id_safe = lpm_common::sanitize_for_terminal(&vuln.id);
         println!(
             "    {icon} {}@{} {} [{}]{summary}",
-            vuln.package,
-            vuln.version,
-            vuln.id.bold(),
+            package_safe,
+            version_safe,
+            id_safe.bold(),
             format_severity(&vuln.severity),
         );
     }

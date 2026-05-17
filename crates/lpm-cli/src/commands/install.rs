@@ -5691,34 +5691,39 @@ async fn run_with_options_under_store_lock(
                                 unreachable!("NoDrift is filtered out above")
                             }
                         };
-                        eprintln!("    {}@{} — {}", name, version, kind);
-                        // UX: render `publisher / workflow_path`
-                        // (the identity tuple) plus the approved
-                        // release's `workflow_ref` as a trailing
-                        // "(ref: ...)" hint. The ref is NOT part of
-                        // identity equality (per the Finding 1 fix —
-                        // it varies per release) but surfacing it
-                        // here helps reviewers place the approval
-                        // temporally: "v1.14.0 was signed at
-                        // refs/tags/v1.14.0 via .../publish.yml".
+                        // Registry- and lockfile-supplied identifiers
+                        // pass through `sanitize_for_terminal` before
+                        // hitting the TTY so a crafted name like
+                        // `\x1b]8;;file:///etc/passwd\x07evil\x1b]8;;\x07`
+                        // can't render as a clickable hyperlink or
+                        // mutate the clipboard via OSC 52.
+                        let name_safe = lpm_common::sanitize_for_terminal(name);
+                        let version_safe = lpm_common::sanitize_for_terminal(version);
+                        let approved_version_safe =
+                            lpm_common::sanitize_for_terminal(approved_version);
+                        eprintln!("    {}@{} — {}", name_safe, version_safe, kind);
                         let identity = approved_snap.as_ref().and_then(|s| {
                             match (s.publisher.as_deref(), s.workflow_path.as_deref()) {
-                                (Some(pub_), Some(path)) => Some(format!("{pub_} / {path}")),
-                                (Some(pub_), None) => Some(pub_.to_string()),
+                                (Some(pub_), Some(path)) => Some(format!(
+                                    "{} / {}",
+                                    lpm_common::sanitize_for_terminal(pub_),
+                                    lpm_common::sanitize_for_terminal(path),
+                                )),
+                                (Some(pub_), None) => Some(lpm_common::sanitize_for_terminal(pub_)),
                                 _ => None,
                             }
                         });
                         let ref_hint = approved_snap
                             .as_ref()
                             .and_then(|s| s.workflow_ref.as_deref())
-                            .map(|r| format!(" (ref: {r})"))
+                            .map(|r| format!(" (ref: {})", lpm_common::sanitize_for_terminal(r)))
                             .unwrap_or_default();
                         match identity {
                             Some(ident) => eprintln!(
-                                "      last approved: v{approved_version} via {ident}{ref_hint}",
+                                "      last approved: v{approved_version_safe} via {ident}{ref_hint}",
                             ),
                             None => eprintln!(
-                                "      last approved: v{approved_version} with attestation{ref_hint}",
+                                "      last approved: v{approved_version_safe} with attestation{ref_hint}",
                             ),
                         }
                         if matches!(

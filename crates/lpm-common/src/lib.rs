@@ -97,6 +97,34 @@ pub fn read_capped_state_file(
     Ok(Some(std::fs::read(path)?))
 }
 
+/// Render a registry- or lockfile-supplied string safely on a TTY.
+///
+/// Strips the byte ranges that carry terminal semantics — control
+/// characters in `0x00-0x08`, `0x0b-0x1f`, `0x7f`, and the ESC / BEL
+/// codepoints used to begin CSI / OSC / DCS sequences. A package name
+/// like `\x1b]8;;file:///etc/passwd\x07evil-pkg\x1b]8;;\x07` no longer
+/// reaches the terminal as a clickable OSC 8 hyperlink; a name
+/// containing `\x1b]52;c;<data>\x07` no longer mutates the system
+/// clipboard via OSC 52.
+///
+/// Tab (`\x09`), newline (`\x0a`), and carriage return (`\x0d`) are
+/// preserved — install/audit progress lines legitimately contain them.
+/// Each replaced character becomes a literal `?` so the operator
+/// still sees something rather than silently-vanishing bytes.
+pub fn sanitize_for_terminal(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    for c in input.chars() {
+        let code = c as u32;
+        let safe = matches!(code, 0x09 | 0x0a | 0x0d) || (code >= 0x20 && code != 0x7f);
+        if safe {
+            out.push(c);
+        } else {
+            out.push('?');
+        }
+    }
+    out
+}
+
 /// Format bytes into a human-readable string (e.g., "1.2 KB", "3.4 MB").
 pub fn format_bytes(bytes: u64) -> String {
     if bytes < 1024 {
@@ -205,5 +233,57 @@ mod tests {
         assert_eq!(sanitize_path_component("../../etc"), "_-_-etc");
         assert_eq!(sanitize_path_component("foo/bar"), "foo-bar");
         assert_eq!(sanitize_path_component("ok.pkg"), "ok.pkg");
+    }
+
+    // ── sanitize_for_terminal ─────────────────────────────────────────
+
+    /// M71: OSC 8 hyperlink escape (used to make a registry-supplied
+    /// package name a clickable link to an arbitrary file URL) must be
+    /// stripped to literal `?`s before the string reaches the terminal.
+    #[test]
+    fn terminal_sanitizer_strips_osc8_hyperlink() {
+        let payload = "\x1b]8;;file:///etc/passwd\x07evil-pkg\x1b]8;;\x07";
+        let cleaned = sanitize_for_terminal(payload);
+        assert!(!cleaned.contains('\x1b'));
+        assert!(!cleaned.contains('\x07'));
+        assert!(cleaned.contains("evil-pkg"));
+    }
+
+    /// M71: OSC 52 clipboard-write must not reach the terminal.
+    #[test]
+    fn terminal_sanitizer_strips_osc52_clipboard() {
+        let payload = "react\x1b]52;c;cm0gLXJmIH4=\x07@1.0.0";
+        let cleaned = sanitize_for_terminal(payload);
+        assert!(!cleaned.contains('\x1b'));
+        assert!(!cleaned.contains('\x07'));
+        assert!(cleaned.contains("react"));
+        assert!(cleaned.contains("@1.0.0"));
+    }
+
+    /// M71: CSI cursor manipulation (e.g., reposition over a prompt)
+    /// is neutralised.
+    #[test]
+    fn terminal_sanitizer_strips_csi_cursor_moves() {
+        let payload = "pkg\x1b[2J\x1b[H\x1b[31mfake prompt: \x1b[0m";
+        let cleaned = sanitize_for_terminal(payload);
+        assert!(!cleaned.contains('\x1b'));
+    }
+
+    /// M71: tab / newline / carriage return are preserved — progress
+    /// lines and multi-line audit output legitimately carry them.
+    #[test]
+    fn terminal_sanitizer_preserves_whitespace_and_unicode() {
+        let cleaned = sanitize_for_terminal("line 1\nline 2\r\n\tindented\tcell");
+        assert_eq!(cleaned, "line 1\nline 2\r\n\tindented\tcell");
+        // Non-ASCII codepoints (CJK, emoji) pass through.
+        let cleaned = sanitize_for_terminal("パッケージ-🌀");
+        assert_eq!(cleaned, "パッケージ-🌀");
+    }
+
+    /// M71: DEL (0x7f) and lone BEL are stripped.
+    #[test]
+    fn terminal_sanitizer_strips_del_and_bel() {
+        assert_eq!(sanitize_for_terminal("a\x7fb"), "a?b");
+        assert_eq!(sanitize_for_terminal("ring\x07bell"), "ring?bell");
     }
 }

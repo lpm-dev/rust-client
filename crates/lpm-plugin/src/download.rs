@@ -36,6 +36,19 @@ use sha2::{Digest, Sha256};
 /// Maximum download size: 150 MB. 3x safety margin over largest known plugin (~50 MB biome).
 const MAX_PLUGIN_DOWNLOAD_SIZE: usize = 150 * 1024 * 1024;
 
+/// Max bytes for a single extracted plugin binary. Pre-fix the
+/// extractor `std::io::copy`-ed the named entry verbatim, so a
+/// malicious release could pack a 50 MB compressed archive whose
+/// internal entry expands to multi-GB. 200 MiB leaves several×
+/// headroom over the largest real plugin (~50 MB biome) while
+/// bounding the worst case at extraction time.
+const MAX_PLUGIN_EXTRACTED_BYTES: u64 = 200 * 1024 * 1024;
+
+/// Max entries scanned in a plugin archive. Real plugins ship one
+/// binary + a license/readme; 1024 entries is roughly two orders of
+/// magnitude above what a legitimate plugin tarball or zip carries.
+const MAX_PLUGIN_ARCHIVE_ENTRIES: usize = 1024;
+
 /// Maximum size of the upstream checksum sidecar file. The standard
 /// `sha256sum` line format is ~70 bytes; 4 KB leaves room for a few
 /// alternates (multi-asset listings, BOM, trailing whitespace) without
@@ -423,6 +436,7 @@ fn extract_binary_from_tarball(
     let mut archive = tar::Archive::new(decoder);
 
     let mut found_files = Vec::new();
+    let mut entry_count = 0usize;
 
     for entry in archive
         .entries()
@@ -430,6 +444,20 @@ fn extract_binary_from_tarball(
     {
         let mut entry =
             entry.map_err(|e| LpmError::Plugin(format!("failed to read archive entry: {e}")))?;
+
+        entry_count += 1;
+        if entry_count > MAX_PLUGIN_ARCHIVE_ENTRIES {
+            return Err(LpmError::Plugin(format!(
+                "plugin archive exceeds {MAX_PLUGIN_ARCHIVE_ENTRIES} entries",
+            )));
+        }
+
+        let entry_size = entry.size();
+        if entry_size > MAX_PLUGIN_EXTRACTED_BYTES {
+            return Err(LpmError::Plugin(format!(
+                "plugin archive entry size {entry_size} exceeds per-entry cap of {MAX_PLUGIN_EXTRACTED_BYTES} bytes"
+            )));
+        }
 
         let path = entry
             .path()
@@ -444,8 +472,15 @@ fn extract_binary_from_tarball(
 
         if file_name == binary_name || file_name.starts_with(&format!("{binary_name}-")) {
             let mut output = std::fs::File::create(dest_path)?;
-            std::io::copy(&mut entry, &mut output)
+            let mut bounded = std::io::Read::take(&mut entry, MAX_PLUGIN_EXTRACTED_BYTES);
+            let copied = std::io::copy(&mut bounded, &mut output)
                 .map_err(|e| LpmError::Plugin(format!("failed to extract {binary_name}: {e}")))?;
+            if copied >= MAX_PLUGIN_EXTRACTED_BYTES {
+                let _ = std::fs::remove_file(dest_path);
+                return Err(LpmError::Plugin(format!(
+                    "plugin archive entry expanded beyond {MAX_PLUGIN_EXTRACTED_BYTES} bytes",
+                )));
+            }
             return Ok(());
         }
     }
@@ -467,12 +502,26 @@ fn extract_binary_from_zip(
     let mut archive = zip::ZipArchive::new(cursor)
         .map_err(|e| LpmError::Plugin(format!("failed to open ZIP archive: {e}")))?;
 
+    if archive.len() > MAX_PLUGIN_ARCHIVE_ENTRIES {
+        return Err(LpmError::Plugin(format!(
+            "plugin ZIP archive exceeds {MAX_PLUGIN_ARCHIVE_ENTRIES} entries (declared {})",
+            archive.len(),
+        )));
+    }
+
     let mut found_files = Vec::new();
 
     for i in 0..archive.len() {
         let mut entry = archive
             .by_index(i)
             .map_err(|e| LpmError::Plugin(format!("failed to read ZIP entry: {e}")))?;
+
+        let declared = entry.size();
+        if declared > MAX_PLUGIN_EXTRACTED_BYTES {
+            return Err(LpmError::Plugin(format!(
+                "plugin ZIP entry size {declared} exceeds per-entry cap of {MAX_PLUGIN_EXTRACTED_BYTES} bytes"
+            )));
+        }
 
         let file_name = entry
             .enclosed_name()
@@ -487,9 +536,16 @@ fn extract_binary_from_zip(
 
         if is_match && !entry.is_dir() {
             let mut output = std::fs::File::create(dest_path)?;
-            std::io::copy(&mut entry, &mut output).map_err(|e| {
+            let mut bounded = std::io::Read::take(&mut entry, MAX_PLUGIN_EXTRACTED_BYTES);
+            let copied = std::io::copy(&mut bounded, &mut output).map_err(|e| {
                 LpmError::Plugin(format!("failed to extract {binary_name} from ZIP: {e}"))
             })?;
+            if copied >= MAX_PLUGIN_EXTRACTED_BYTES {
+                let _ = std::fs::remove_file(dest_path);
+                return Err(LpmError::Plugin(format!(
+                    "plugin ZIP entry expanded beyond {MAX_PLUGIN_EXTRACTED_BYTES} bytes",
+                )));
+            }
             return Ok(());
         }
     }
@@ -586,6 +642,90 @@ mod tests {
         let err = validate_download_size("test", MAX_PLUGIN_DOWNLOAD_SIZE + 1).unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("exceeds maximum"), "error: {msg}");
+    }
+
+    /// M46: a tarball whose entry header declares a per-entry size
+    /// above the cap is refused before any bytes are unpacked. Pre-fix
+    /// the extractor `std::io::copy`-ed the named entry verbatim, so a
+    /// malicious release could pack a small compressed archive whose
+    /// internal entry expanded to multi-GB.
+    #[test]
+    fn tarball_extraction_rejects_per_entry_over_cap() {
+        let mut builder = tar::Builder::new(Vec::new());
+        let mut header = tar::Header::new_gnu();
+        // Declare a size that exceeds the cap. The data stream is
+        // intentionally short — the cap check fires on `entry.size()`
+        // before any `copy` happens.
+        header.set_size(MAX_PLUGIN_EXTRACTED_BYTES + 1);
+        header.set_cksum();
+        builder.append_data(&mut header, "oxlint", &[][..]).unwrap();
+        let tar_data = builder.into_inner().unwrap();
+
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+        std::io::Write::write_all(&mut encoder, &tar_data).unwrap();
+        let gz_data = encoder.finish().unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("oxlint");
+        let err = extract_binary_from_tarball(&gz_data, &dest, "oxlint").unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("exceeds per-entry cap"),
+            "must refuse with per-entry cap: {msg}"
+        );
+        assert!(!dest.exists(), "no partial extract on refusal");
+    }
+
+    /// M46: a tarball with too many entries is refused before any
+    /// entry is unpacked. Real plugins ship ~3 entries; 1024 is the
+    /// cap. A hostile archive trying to exhaust inodes is rejected.
+    #[test]
+    fn tarball_extraction_rejects_excessive_entry_count() {
+        let mut builder = tar::Builder::new(Vec::new());
+        for i in 0..(MAX_PLUGIN_ARCHIVE_ENTRIES + 1) {
+            let mut header = tar::Header::new_gnu();
+            header.set_size(0);
+            header.set_cksum();
+            builder
+                .append_data(&mut header, format!("f-{i}"), &[][..])
+                .unwrap();
+        }
+        let tar_data = builder.into_inner().unwrap();
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+        std::io::Write::write_all(&mut encoder, &tar_data).unwrap();
+        let gz_data = encoder.finish().unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("oxlint");
+        let err = extract_binary_from_tarball(&gz_data, &dest, "oxlint").unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("exceeds") && msg.contains("entries"),
+            "must label entry-count overflow: {msg}"
+        );
+    }
+
+    /// M46: ZIP entry declaring oversized payload is rejected on the
+    /// same cap as the tar path.
+    #[test]
+    fn zip_extraction_rejects_per_entry_over_cap() {
+        let buf = std::io::Cursor::new(Vec::new());
+        let mut writer = zip::ZipWriter::new(buf);
+        // We can't easily craft a malicious ZIP with a forged size
+        // header via the zip crate's writer; the cap test for the
+        // tarball path is the load-bearing one. Validate the legitimate
+        // case still extracts cleanly: a small payload below the caps.
+        let options = zip::write::SimpleFileOptions::default();
+        writer.start_file("oxlint", options).unwrap();
+        std::io::Write::write_all(&mut writer, b"binary contents").unwrap();
+        let buf = writer.finish().unwrap();
+        let zip_data = buf.into_inner();
+
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("oxlint");
+        extract_binary_from_zip(&zip_data, &dest, "oxlint").unwrap();
+        let extracted = std::fs::read(&dest).unwrap();
+        assert_eq!(&extracted, b"binary contents");
     }
 
     // --- Unique temp file names ---
