@@ -476,7 +476,9 @@ pub fn compute_blocked_packages_with_metadata(
     //
     // Standalone callers (no install context) pass `None` →
     // identical to the pre-slice-1 behavior.
-    advisor_approvals: Option<&std::collections::HashSet<(String, String, Option<String>)>>,
+    advisor_approvals: Option<
+        &std::collections::HashSet<crate::triage_advisor_session::AdvisorApprovalKey>,
+    >,
 ) -> Vec<BlockedPackage> {
     use rayon::prelude::*;
 
@@ -502,8 +504,17 @@ pub fn compute_blocked_packages_with_metadata(
             // "still blocked" would emit stale UI + JSON. Keyed on
             // the full triple so two sources of the same coord don't
             // cross-approve.
+            // M29: the approval key includes a script_bundle_hash
+            // slot. The capture path doesn't carry the bodies here;
+            // today every approved package has exactly one bundle hash
+            // per `(name, version, integrity)` triple (whole-package
+            // classification) so an iter+match-on-three-fields is
+            // unambiguous. A future per-phase classification refactor
+            // would tighten this to a full 4-tuple lookup.
             if let Some(set) = advisor_approvals
-                && set.contains(&(name.clone(), version.clone(), integrity.clone()))
+                && set
+                    .iter()
+                    .any(|(n, v, i, _)| n == name && v == version && i == integrity)
             {
                 return None;
             }
@@ -737,7 +748,9 @@ pub fn capture_blocked_set_after_install_with_metadata(
     // `select_approvals_for_capture`); when auto-build won't fire,
     // it passes `None` so approved-but-not-run packages remain
     // visible to `lpm approve-scripts` after the session drops.
-    advisor_approvals: Option<&std::collections::HashSet<(String, String, Option<String>)>>,
+    advisor_approvals: Option<
+        &std::collections::HashSet<crate::triage_advisor_session::AdvisorApprovalKey>,
+    >,
 ) -> Result<BlockedSetCapture, LpmError> {
     let blocked = compute_blocked_packages_with_metadata(
         store,
@@ -2421,6 +2434,7 @@ mod tests {
             "amber-pkg".to_string(),
             "1.0.0".to_string(),
             Some("sha512-test-integrity".to_string()),
+            String::new(),
         ));
         let blocked_with_approval = compute_blocked_packages_with_metadata(
             &store,
@@ -2471,6 +2485,7 @@ mod tests {
             "amber-pkg".to_string(),
             "1.0.0".to_string(),
             Some("sha512-REGISTRY-source".to_string()),
+            String::new(),
         ));
         let blocked = compute_blocked_packages_with_metadata(
             &store,

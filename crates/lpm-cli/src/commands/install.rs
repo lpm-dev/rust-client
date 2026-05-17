@@ -7784,8 +7784,10 @@ fn should_auto_build(
 /// pass a hand-built `HashSet` without constructing a real session.
 fn select_approvals_for_capture(
     auto_build_attempted: bool,
-    approvals: Option<&std::collections::HashSet<(String, String, Option<String>)>>,
-) -> Option<&std::collections::HashSet<(String, String, Option<String>)>> {
+    approvals: Option<
+        &std::collections::HashSet<crate::triage_advisor_session::AdvisorApprovalKey>,
+    >,
+) -> Option<&std::collections::HashSet<crate::triage_advisor_session::AdvisorApprovalKey>> {
     if auto_build_attempted {
         approvals
     } else {
@@ -12404,6 +12406,7 @@ mod tests {
             "amber-pkg".to_string(),
             "1.0.0".to_string(),
             Some("sha512-x".to_string()),
+            String::new(),
         ));
         assert!(
             select_approvals_for_capture(false, Some(&approvals)).is_none(),
@@ -12419,6 +12422,7 @@ mod tests {
             "amber-pkg".to_string(),
             "1.0.0".to_string(),
             Some("sha512-x".to_string()),
+            String::new(),
         ));
         let view = select_approvals_for_capture(true, Some(&approvals))
             .expect("autoBuild=true MUST forward the approval view");
@@ -12427,6 +12431,7 @@ mod tests {
             "amber-pkg".to_string(),
             "1.0.0".to_string(),
             Some("sha512-x".to_string()),
+            String::new(),
         )));
     }
 

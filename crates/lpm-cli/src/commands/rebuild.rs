@@ -163,7 +163,9 @@ pub async fn run(
     // `Some(session.approvals())` so amber packages the advisor
     // approved this run can execute their scripts without a
     // persistent `trustedDependencies` entry.
-    advisor_approvals: Option<&std::collections::HashSet<(String, String, Option<String>)>>,
+    advisor_approvals: Option<
+        &std::collections::HashSet<crate::triage_advisor_session::AdvisorApprovalKey>,
+    >,
 ) -> Result<(), LpmError> {
     // Round 2: hold the shared store lock across rebuild —
     // it traverses store package dirs to read package.json, compute
@@ -207,7 +209,9 @@ async fn run_under_store_lock(
     sandbox_log: bool,
     effective_policy: ScriptPolicy,
     // see `run` for the contract.
-    advisor_approvals: Option<&std::collections::HashSet<(String, String, Option<String>)>>,
+    advisor_approvals: Option<
+        &std::collections::HashSet<crate::triage_advisor_session::AdvisorApprovalKey>,
+    >,
 ) -> Result<(), LpmError> {
     // Defense-in-depth on the sandbox flag pair. The CLI boundary
     // (clap `conflicts_with_all` on `--no-sandbox` ⊥ `--strict-sandbox`
@@ -2065,7 +2069,9 @@ pub(crate) fn evaluate_trust(
     // under triage yields [`TrustReason::AdvisorApprovedThisRun`].
     // `None` (or empty) preserves portable L1-3 behaviour — the
     // standalone `lpm rebuild` path passes `None`.
-    advisor_approvals: Option<&std::collections::HashSet<(String, String, Option<String>)>>,
+    advisor_approvals: Option<
+        &std::collections::HashSet<crate::triage_advisor_session::AdvisorApprovalKey>,
+    >,
 ) -> TrustReason {
     let candidate = evaluate_trust_unsuspended(
         package_dir,
@@ -2129,7 +2135,9 @@ fn evaluate_trust_unsuspended(
     policy: &SecurityPolicy,
     project_dir: &Path,
     effective_policy: ScriptPolicy,
-    advisor_approvals: Option<&std::collections::HashSet<(String, String, Option<String>)>>,
+    advisor_approvals: Option<
+        &std::collections::HashSet<crate::triage_advisor_session::AdvisorApprovalKey>,
+    >,
 ) -> TrustReason {
     let script_hash = compute_script_hash(package_dir);
     let strict = policy.can_run_scripts_strict(name, version, integrity, script_hash.as_deref());
@@ -2158,13 +2166,22 @@ fn evaluate_trust_unsuspended(
         // install.
         if matches!(tier, Some(StaticTier::Amber) | Some(StaticTier::AmberLlm))
             && let Some(set) = advisor_approvals
-            && set.contains(&(
-                name.to_string(),
-                version.to_string(),
-                integrity.map(str::to_string),
-            ))
         {
-            return TrustReason::AdvisorApprovedThisRun;
+            // M29: the approval key includes a script_bundle_hash that
+            // isn't available here without threading the bodies in.
+            // Today script classification is whole-package, so an
+            // approval for `(name, version, integrity)` is unique on
+            // that triple — match on the first three fields and
+            // ignore the bundle hash slot. A future per-phase refactor
+            // would tighten this to the full 4-tuple by threading the
+            // body hash through to this site.
+            let integrity_owned: Option<String> = integrity.map(str::to_string);
+            if set
+                .iter()
+                .any(|(n, v, i, _)| n == name && v == version && *i == integrity_owned)
+            {
+                return TrustReason::AdvisorApprovedThisRun;
+            }
         }
     }
 
@@ -2556,7 +2573,9 @@ pub fn all_scripted_packages_trusted(
     // this, a `Some(approvals)` install would still report "not all
     // scripts trusted" and decline autoBuild entirely — defeating
     // the whole point of advisor-enhanced triage.
-    advisor_approvals: Option<&std::collections::HashSet<(String, String, Option<String>)>>,
+    advisor_approvals: Option<
+        &std::collections::HashSet<crate::triage_advisor_session::AdvisorApprovalKey>,
+    >,
 ) -> bool {
     // Build the
     // v2 link-entry index ONCE before the per-package loop, scoped to
@@ -4529,7 +4548,12 @@ mod tests {
         let policy = SecurityPolicy::from_package_json(&dir.path().join("package.json"));
 
         let mut approvals = std::collections::HashSet::new();
-        approvals.insert(("amber-pkg".to_string(), "1.0.0".to_string(), None));
+        approvals.insert((
+            "amber-pkg".to_string(),
+            "1.0.0".to_string(),
+            None,
+            String::new(),
+        ));
 
         let reason = evaluate_trust(
             &pkg_dir,
@@ -4590,8 +4614,9 @@ mod tests {
         let scripts = read_lifecycle_scripts(&pkg_dir.join("package.json")).unwrap();
         let policy = SecurityPolicy::from_package_json(&dir.path().join("package.json"));
 
-        let approvals: std::collections::HashSet<(String, String, Option<String>)> =
-            std::collections::HashSet::new();
+        let approvals: std::collections::HashSet<
+            crate::triage_advisor_session::AdvisorApprovalKey,
+        > = std::collections::HashSet::new();
         let reason = evaluate_trust(
             &pkg_dir,
             "amber-pkg",
@@ -4621,8 +4646,18 @@ mod tests {
         let policy = SecurityPolicy::from_package_json(&dir.path().join("package.json"));
 
         let mut approvals = std::collections::HashSet::new();
-        approvals.insert(("OTHER-pkg".to_string(), "1.0.0".to_string(), None));
-        approvals.insert(("amber-pkg".to_string(), "2.0.0".to_string(), None)); // wrong version
+        approvals.insert((
+            "OTHER-pkg".to_string(),
+            "1.0.0".to_string(),
+            None,
+            String::new(),
+        ));
+        approvals.insert((
+            "amber-pkg".to_string(),
+            "2.0.0".to_string(),
+            None,
+            String::new(),
+        )); // wrong version
         let reason = evaluate_trust(
             &pkg_dir,
             "amber-pkg",
@@ -4654,7 +4689,12 @@ mod tests {
         let policy = SecurityPolicy::from_package_json(&dir.path().join("package.json"));
 
         let mut approvals = std::collections::HashSet::new();
-        approvals.insert(("amber-pkg".to_string(), "1.0.0".to_string(), None));
+        approvals.insert((
+            "amber-pkg".to_string(),
+            "1.0.0".to_string(),
+            None,
+            String::new(),
+        ));
         let reason = evaluate_trust(
             &pkg_dir,
             "amber-pkg",
@@ -4687,7 +4727,12 @@ mod tests {
         let policy = SecurityPolicy::from_package_json(&dir.path().join("package.json"));
 
         let mut approvals = std::collections::HashSet::new();
-        approvals.insert(("amber-pkg".to_string(), "1.0.0".to_string(), None));
+        approvals.insert((
+            "amber-pkg".to_string(),
+            "1.0.0".to_string(),
+            None,
+            String::new(),
+        ));
         let reason = evaluate_trust(
             &pkg_dir,
             "amber-pkg",
@@ -4731,6 +4776,7 @@ mod tests {
             "amber-pkg".to_string(),
             "1.0.0".to_string(),
             Some("sha512-registry-integrity".to_string()),
+            String::new(),
         ));
 
         // Querying for the SAME coord but a DIFFERENT integrity must
@@ -4802,7 +4848,12 @@ mod tests {
         let policy = SecurityPolicy::from_package_json(&dir.path().join("package.json"));
 
         let mut approvals = std::collections::HashSet::new();
-        approvals.insert(("green-pkg".to_string(), "1.0.0".to_string(), None));
+        approvals.insert((
+            "green-pkg".to_string(),
+            "1.0.0".to_string(),
+            None,
+            String::new(),
+        ));
         let reason = evaluate_trust(
             &pkg_dir,
             "green-pkg",

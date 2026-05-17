@@ -280,6 +280,19 @@ fn validate_ip(value: &str) -> bool {
     value.parse::<Ipv4Addr>().is_ok() || value.parse::<Ipv6Addr>().is_ok()
 }
 
+/// Maximum number of `(a|b|...)` alternation groups allowed in one
+/// pattern, and the per-group branch ceiling.
+///
+/// M58: `matches_pattern` expands alternation by recursive
+/// `format!("{prefix}{alt}{suffix}")` — a repo-controlled pattern
+/// like `(a|b)(a|b)...(a|b)` with 30 groups recurses 2^30 times and
+/// allocates the same number of intermediate `String`s. These caps
+/// bound the work to `MAX_PATTERN_BRANCHES ^ MAX_PATTERN_GROUPS` and
+/// the pattern is treated as a non-match (with `tracing::warn`) on
+/// overflow — same effect as a glob miss.
+const MAX_PATTERN_GROUPS: usize = 8;
+const MAX_PATTERN_BRANCHES: usize = 16;
+
 /// Simple pattern matching with `*` wildcards.
 ///
 /// Supports `*` as a wildcard matching any sequence of characters, and `.*` for
@@ -295,6 +308,17 @@ fn validate_ip(value: &str) -> bool {
 /// `(api|app)_key_(v1|v2)` expands via recursive calls. Nested parens `((a))` are
 /// NOT supported — the parser finds the first `(` and first `)` after it.
 fn matches_pattern(value: &str, pattern: &str) -> bool {
+    matches_pattern_bounded(value, pattern, 0)
+}
+
+fn matches_pattern_bounded(value: &str, pattern: &str, depth: usize) -> bool {
+    if depth > MAX_PATTERN_GROUPS {
+        tracing::warn!(
+            pattern = %pattern,
+            "envSchema pattern exceeds max alternation depth ({MAX_PATTERN_GROUPS}) — treating as no-match"
+        );
+        return false;
+    }
     // Handle alternation groups: `sk_(test|live)_*`
     if let Some(start) = pattern.find('(')
         && let Some(end) = pattern[start..].find(')')
@@ -303,9 +327,17 @@ fn matches_pattern(value: &str, pattern: &str) -> bool {
         let group = &pattern[start + 1..start + end];
         let suffix = &pattern[start + end + 1..];
         let alternatives: Vec<&str> = group.split('|').collect();
-        return alternatives
-            .iter()
-            .any(|alt| matches_pattern(value, &format!("{prefix}{alt}{suffix}")));
+        if alternatives.len() > MAX_PATTERN_BRANCHES {
+            tracing::warn!(
+                pattern = %pattern,
+                branches = alternatives.len(),
+                "envSchema pattern group has too many branches (max {MAX_PATTERN_BRANCHES}) — treating as no-match"
+            );
+            return false;
+        }
+        return alternatives.iter().any(|alt| {
+            matches_pattern_bounded(value, &format!("{prefix}{alt}{suffix}"), depth + 1)
+        });
     }
 
     // Simple glob matching with `*`
@@ -653,6 +685,52 @@ mod tests {
             "postgres://*"
         ));
         assert!(!matches_pattern("mysql://localhost", "postgres://*"));
+    }
+
+    /// M58: pattern alternation has bounded recursion depth.
+    /// `(a|b)(a|b)...(a|b)` with many groups would, pre-fix, recurse
+    /// 2^N times and allocate the same number of intermediate Strings.
+    /// The bound treats over-depth patterns as no-match.
+    #[test]
+    fn pattern_rejects_excessive_alternation_depth() {
+        // Pattern with > MAX_PATTERN_GROUPS groups must bail.
+        // Build `(a|b)` repeated MAX_PATTERN_GROUPS + 1 times.
+        let mut p = String::new();
+        for _ in 0..(MAX_PATTERN_GROUPS + 1) {
+            p.push_str("(a|b)");
+        }
+        // The value matches in principle but bounded matcher refuses.
+        let value: String = "a".repeat(MAX_PATTERN_GROUPS + 1);
+        assert!(
+            !matches_pattern(&value, &p),
+            "over-depth pattern must be rejected (bounded matcher returns false)"
+        );
+    }
+
+    /// M58: pattern alternation has bounded branch count per group.
+    /// A single group with too many branches is rejected before any
+    /// recursive call.
+    #[test]
+    fn pattern_rejects_groups_with_too_many_branches() {
+        let mut alternatives = Vec::with_capacity(MAX_PATTERN_BRANCHES + 1);
+        for i in 0..(MAX_PATTERN_BRANCHES + 1) {
+            alternatives.push(format!("a{i}"));
+        }
+        let pattern = format!("({})_x", alternatives.join("|"));
+        assert!(
+            !matches_pattern("a0_x", &pattern),
+            "over-branch group must be rejected"
+        );
+    }
+
+    /// Patterns within the bounds still match correctly.
+    #[test]
+    fn pattern_within_bounds_still_matches() {
+        // 8-group pattern at the depth ceiling exact-fits.
+        assert!(matches_pattern(
+            "abababab",
+            "(a|x)(b|y)(a|x)(b|y)(a|x)(b|y)(a|x)(b|y)"
+        ));
     }
 
     // ── Enum validation ──
