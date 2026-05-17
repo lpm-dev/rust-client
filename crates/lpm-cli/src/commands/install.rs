@@ -3888,6 +3888,13 @@ async fn run_with_options_under_store_lock(
             tagged.source, tagged.line
         ));
     }
+    // M7: project-local `.npmrc` refusals (today: strict-ssl=false)
+    // are surfaced even in JSON mode for the same reason as the
+    // `DISABLED` warning above — agent/CI runs need to see that a
+    // hostile config tried to downgrade TLS, even when it was refused.
+    for w in route_table.npmrc_security_warnings() {
+        output::warn(w);
+    }
 
     // `linker_mode` was resolved above — before `check_install_state` —
     // so it covers both validation (fail-loud on invalid values) and

@@ -673,6 +673,11 @@ pub struct NpmrcConfig {
     /// Non-fatal parse messages: malformed lines, deferred-feature
     /// (mTLS / per-origin TLS) notices. Caller dumps via `output::warn`.
     pub warnings: Vec<String>,
+    /// Security-grade warnings: facts the caller MUST surface even
+    /// under `--json` output (where regular warnings are silenced to
+    /// keep stdout structured). Today this carries the M7 refusal of
+    /// a project-local `.npmrc` trying to set `strict-ssl=false`.
+    pub security_warnings: Vec<String>,
     /// Fatal parse errors: missing env-var interpolation, unreadable
     /// `cafile=` paths. Caller surfaces and exits non-zero before any
     /// network. npm errors here too, so we match.
@@ -731,6 +736,22 @@ impl NpmrcConfig {
         source_dir: Option<&Path>,
         env_lookup: &dyn Fn(&str) -> Option<String>,
     ) -> Self {
+        Self::parse_layer_with_options(content, source_label, source_dir, false, env_lookup)
+    }
+
+    /// Same as [`Self::parse_layer_with_source_dir`] but allows callers
+    /// to mark the layer as project-local. A project-local layer is
+    /// owned by the repo and may be hostile under a malicious-clone
+    /// threat model — settings that downgrade security (today:
+    /// `strict-ssl=false`) are refused at parse time when sourced
+    /// from this layer.
+    pub fn parse_layer_with_options(
+        content: &str,
+        source_label: &str,
+        source_dir: Option<&Path>,
+        is_project_layer: bool,
+        env_lookup: &dyn Fn(&str) -> Option<String>,
+    ) -> Self {
         let mut cfg = NpmrcConfig::default();
 
         // Strip leading UTF-8 BOM if present. Some Windows editors save
@@ -773,6 +794,7 @@ impl NpmrcConfig {
                 &interpolated,
                 source_label,
                 source_dir,
+                is_project_layer,
                 lineno + 1,
                 &mut cfg,
             );
@@ -923,6 +945,7 @@ impl NpmrcConfig {
                 .merge_over(other_per_origin);
         }
         self.warnings.extend(other.warnings);
+        self.security_warnings.extend(other.security_warnings);
         self.errors.extend(other.errors);
     }
 
@@ -1029,13 +1052,17 @@ impl NpmrcConfig {
     pub fn discover_layer_paths(cwd: &Path, home: Option<&Path>) -> LayerDiscovery {
         let mut paths = Vec::with_capacity(4);
         let mut warnings = Vec::new();
+        let mut project_layer_index = None;
         paths.push(PathBuf::from("/usr/etc/npmrc"));
         paths.push(PathBuf::from("/etc/npmrc"));
         if let Some(h) = home {
             paths.push(h.join(".npmrc"));
         }
         match walk_for_project_npmrc(cwd, home) {
-            ProjectNpmrcOutcome::File(p) => paths.push(p),
+            ProjectNpmrcOutcome::File(p) => {
+                project_layer_index = Some(paths.len());
+                paths.push(p);
+            }
             ProjectNpmrcOutcome::NotRegular { path, kind } => {
                 warnings.push(format!(
                     "{}: project .npmrc {}; project layer skipped",
@@ -1048,7 +1075,11 @@ impl NpmrcConfig {
                 // installs don't have a project layer.
             }
         }
-        LayerDiscovery { paths, warnings }
+        LayerDiscovery {
+            paths,
+            warnings,
+            project_layer_index,
+        }
     }
 
     /// Read and merge a list of `.npmrc` files in
@@ -1066,17 +1097,27 @@ impl NpmrcConfig {
     /// `${VAR}` interpolation works the same way the single-file API
     /// does. `load_from_filesystem` wires this to the real process env.
     pub fn load_from_paths(paths: &[PathBuf], env_lookup: &dyn Fn(&str) -> Option<String>) -> Self {
+        Self::load_from_paths_with_project_index(paths, None, env_lookup)
+    }
+
+    /// Same as [`Self::load_from_paths`] but lets the caller mark which
+    /// path is the project-local layer. Used by
+    /// [`Self::load_from_filesystem`] so settings like `strict-ssl=false`
+    /// committed to a repo's `.npmrc` are refused at parse time.
+    pub fn load_from_paths_with_project_index(
+        paths: &[PathBuf],
+        project_layer_index: Option<usize>,
+        env_lookup: &dyn Fn(&str) -> Option<String>,
+    ) -> Self {
         let mut acc = NpmrcConfig::default();
-        for path in paths {
+        for (idx, path) in paths.iter().enumerate() {
             match std::fs::read_to_string(path) {
                 Ok(content) => {
                     let label = path.display().to_string();
-                    // Pass the file's parent dir so `certfile=` / `keyfile=`
-                    // / per-origin `cafile=` tagged paths resolve relative
-                    // to *this* `.npmrc` (not `${PWD}`).
                     let source_dir = path.parent();
-                    let layer = NpmrcConfig::parse_layer_with_source_dir(
-                        &content, &label, source_dir, env_lookup,
+                    let is_project = Some(idx) == project_layer_index;
+                    let layer = NpmrcConfig::parse_layer_with_options(
+                        &content, &label, source_dir, is_project, env_lookup,
                     );
                     acc.merge_over(layer);
                 }
@@ -1106,7 +1147,11 @@ impl NpmrcConfig {
     pub fn load_from_filesystem(cwd: &Path) -> Self {
         let home = dirs::home_dir();
         let discovery = Self::discover_layer_paths(cwd, home.as_deref());
-        let mut cfg = Self::load_from_paths(&discovery.paths, &|name| std::env::var(name).ok());
+        let mut cfg = Self::load_from_paths_with_project_index(
+            &discovery.paths,
+            discovery.project_layer_index,
+            &|name| std::env::var(name).ok(),
+        );
         // Discovery warnings happened first chronologically; prepend so
         // they read in the order the user would expect.
         let mut all = discovery.warnings;
@@ -1123,6 +1168,13 @@ impl NpmrcConfig {
 pub struct LayerDiscovery {
     pub paths: Vec<PathBuf>,
     pub warnings: Vec<String>,
+    /// Index into `paths` of the project-local layer (if any). The
+    /// project layer is the `.npmrc` walked-up from cwd with a regular
+    /// `package.json` marker. Anything written here is owned by the
+    /// repo and may be hostile in a malicious clone — settings like
+    /// `strict-ssl=false` are refused at parse time when sourced from
+    /// this layer.
+    pub project_layer_index: Option<usize>,
 }
 
 /// Markers that identify a directory as a project root for the
@@ -1334,6 +1386,7 @@ fn classify_and_apply(
     value: &str,
     source_label: &str,
     source_dir: Option<&Path>,
+    is_project_layer: bool,
     lineno: usize,
     cfg: &mut NpmrcConfig,
 ) {
@@ -1575,6 +1628,27 @@ fn classify_and_apply(
     if key == "strict-ssl" {
         match value.to_ascii_lowercase().as_str() {
             "false" => {
+                if is_project_layer {
+                    // M7: refuse strict-ssl=false from a project-local
+                    // .npmrc. The file is owned by the repo and can be
+                    // committed by anyone with push access; a hostile
+                    // clone with `strict-ssl=false` would silently
+                    // disable cert validation for every user who runs
+                    // `lpm install`. User-level (`~/.npmrc`) and
+                    // system-level files keep the existing behaviour
+                    // — the operator can still opt-in there.
+                    //
+                    // Push to `security_warnings` (NOT `warnings`) so
+                    // the refusal is surfaced under `--json` too —
+                    // CI / agents need to know a malicious config was
+                    // refused, not just silently no-op'd.
+                    cfg.security_warnings.push(format!(
+                        "{source_label}:{lineno}: strict-ssl=false refused — \
+                         project-local .npmrc cannot disable TLS verification; \
+                         move the setting to ~/.npmrc if you really want it"
+                    ));
+                    return;
+                }
                 cfg.tls.strict_ssl = Some(TaggedBool {
                     value: false,
                     source: source_label.to_string(),
@@ -2114,6 +2188,72 @@ mod tests {
         let tagged = lower.tls.strict_ssl.expect("higher should override");
         assert!(tagged.value);
         assert_eq!(tagged.source, "higher");
+    }
+
+    /// M7: a project-local `.npmrc` is owned by the repo and may be
+    /// hostile in a malicious-clone scenario. `strict-ssl=false`
+    /// committed there must NOT silently disable TLS verification
+    /// for anyone who runs `lpm install` in the clone. The refusal
+    /// lands in `security_warnings` (not `warnings`) so it survives
+    /// `--json` mode where routine npmrc warnings are silenced.
+    #[test]
+    fn strict_ssl_false_from_project_layer_is_refused() {
+        let cfg = NpmrcConfig::parse_layer_with_options(
+            "strict-ssl=false\n",
+            "proj/.npmrc",
+            None,
+            true, // is_project_layer
+            &no_env,
+        );
+        assert!(
+            cfg.tls.strict_ssl.is_none(),
+            "project-layer strict-ssl=false must not be applied: {:?}",
+            cfg.tls.strict_ssl
+        );
+        assert!(
+            cfg.warnings.is_empty(),
+            "refusal must NOT land in routine warnings (silenced under --json): {:?}",
+            cfg.warnings
+        );
+        assert_eq!(cfg.security_warnings.len(), 1);
+        assert!(
+            cfg.security_warnings[0].contains("refused"),
+            "security warning must label the refusal: {}",
+            cfg.security_warnings[0]
+        );
+    }
+
+    /// M7: a user-level `~/.npmrc` (is_project_layer = false) still
+    /// honours `strict-ssl=false` — the operator's explicit choice
+    /// for their own machine remains respected.
+    #[test]
+    fn strict_ssl_false_from_user_layer_is_still_honoured() {
+        let cfg = NpmrcConfig::parse_layer_with_options(
+            "strict-ssl=false\n",
+            "/home/me/.npmrc",
+            None,
+            false, // not a project layer
+            &no_env,
+        );
+        let tagged = cfg.tls.strict_ssl.expect("user-layer must still apply");
+        assert!(!tagged.value);
+        assert_eq!(tagged.source, "/home/me/.npmrc");
+    }
+
+    /// M7: a project-layer `strict-ssl=true` is silently accepted
+    /// (re-enabling verification is never dangerous, even from a
+    /// hostile repo — the operator wouldn't want that overridden).
+    #[test]
+    fn strict_ssl_true_from_project_layer_is_accepted() {
+        let cfg = NpmrcConfig::parse_layer_with_options(
+            "strict-ssl=true\n",
+            "proj/.npmrc",
+            None,
+            true,
+            &no_env,
+        );
+        let tagged = cfg.tls.strict_ssl.expect("strict-ssl=true must apply");
+        assert!(tagged.value);
     }
 
     #[test]

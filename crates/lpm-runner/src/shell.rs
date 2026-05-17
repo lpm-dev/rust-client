@@ -19,6 +19,50 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::process::{Command, ExitStatus, Stdio};
 
+/// Max bytes accumulated per captured stream (stdout OR stderr).
+///
+/// Mirrors the post-execution truncation cap in `commands::run` so the
+/// in-memory buffer never grows past it. Pre-fix, a chatty task could
+/// produce gigabytes of stdout, fill up `String`, and only get
+/// truncated AFTER the buffer was already in RAM (or written to a
+/// `stdout.log` cache file). With this cap, accumulation halts at
+/// 10 MiB while the reader keeps draining the pipe so the child
+/// doesn't block — the truncation marker is appended once.
+const MAX_CAPTURED_STREAM_BYTES: usize = 10 * 1024 * 1024;
+
+/// Append `line` (plus a newline) to `buf` unless that would push
+/// `buf.len()` past the cap; when the cap is first crossed, push a
+/// one-shot truncation marker and silently drop subsequent lines.
+///
+/// The reader thread should KEEP READING after this returns so the
+/// child's pipe doesn't fill up and stall the producer — we just
+/// stop allocating into the buffer.
+fn push_capped_line(buf: &mut String, line: &str) {
+    if buf.len() >= MAX_CAPTURED_STREAM_BYTES {
+        // Marker already written; silently drain.
+        return;
+    }
+    let remaining = MAX_CAPTURED_STREAM_BYTES - buf.len();
+    if line.len() < remaining {
+        buf.push_str(line);
+        buf.push('\n');
+        return;
+    }
+    if remaining > 0 {
+        let mut cut = remaining.saturating_sub(1);
+        // Land on a UTF-8 boundary so we don't truncate mid-codepoint.
+        while cut > 0 && !line.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        buf.push_str(&line[..cut]);
+        buf.push('\n');
+    }
+    buf.push_str(&format!(
+        "[output truncated at {} MiB]\n",
+        MAX_CAPTURED_STREAM_BYTES / (1024 * 1024),
+    ));
+}
+
 /// Configuration for spawning a shell command.
 pub struct ShellCommand<'a> {
     /// The command string to execute (passed to `sh -c` / `cmd /C`).
@@ -121,7 +165,7 @@ pub fn spawn_shell_tee(cmd: &ShellCommand) -> Result<CapturedOutput, LpmError> {
     let child_stdout = child.stdout.take();
     let child_stderr = child.stderr.take();
 
-    // Tee stdout: read from pipe, write to terminal + buffer
+    // Tee stdout: read from pipe, write to terminal + capped buffer
     let stdout_handle = std::thread::spawn(move || -> String {
         let mut buf = String::new();
         if let Some(stdout) = child_stdout {
@@ -129,14 +173,13 @@ pub fn spawn_shell_tee(cmd: &ShellCommand) -> Result<CapturedOutput, LpmError> {
             use std::io::BufRead;
             for line in reader.lines().map_while(Result::ok) {
                 println!("{line}");
-                buf.push_str(&line);
-                buf.push('\n');
+                push_capped_line(&mut buf, &line);
             }
         }
         buf
     });
 
-    // Tee stderr: read from pipe, write to terminal + buffer
+    // Tee stderr: read from pipe, write to terminal + capped buffer
     let stderr_handle = std::thread::spawn(move || -> String {
         let mut buf = String::new();
         if let Some(stderr) = child_stderr {
@@ -144,8 +187,7 @@ pub fn spawn_shell_tee(cmd: &ShellCommand) -> Result<CapturedOutput, LpmError> {
             use std::io::BufRead;
             for line in reader.lines().map_while(Result::ok) {
                 eprintln!("{line}");
-                buf.push_str(&line);
-                buf.push('\n');
+                push_capped_line(&mut buf, &line);
             }
         }
         buf
@@ -193,14 +235,52 @@ pub fn spawn_shell_capture(cmd: &ShellCommand) -> Result<CapturedOutput, LpmErro
     }
     command.env("PATH", cmd.path);
 
-    let output = command
-        .output()
+    let mut child = command
+        .spawn()
         .map_err(|e| LpmError::Script(format!("failed to execute '{}': {e}", cmd.command)))?;
 
+    // Manual piped reads (rather than `Command::output()`) so the
+    // accumulator can apply MAX_CAPTURED_STREAM_BYTES during read —
+    // `output()` would buffer the entire stream into a `Vec<u8>`
+    // regardless of size.
+    let child_stdout = child.stdout.take();
+    let child_stderr = child.stderr.take();
+
+    let stdout_handle = std::thread::spawn(move || -> String {
+        let mut buf = String::new();
+        if let Some(stdout) = child_stdout {
+            let reader = std::io::BufReader::new(stdout);
+            use std::io::BufRead;
+            for line in reader.lines().map_while(Result::ok) {
+                push_capped_line(&mut buf, &line);
+            }
+        }
+        buf
+    });
+
+    let stderr_handle = std::thread::spawn(move || -> String {
+        let mut buf = String::new();
+        if let Some(stderr) = child_stderr {
+            let reader = std::io::BufReader::new(stderr);
+            use std::io::BufRead;
+            for line in reader.lines().map_while(Result::ok) {
+                push_capped_line(&mut buf, &line);
+            }
+        }
+        buf
+    });
+
+    let status = child
+        .wait()
+        .map_err(|e| LpmError::Script(format!("failed to wait for '{}': {e}", cmd.command)))?;
+
+    let stdout = stdout_handle.join().unwrap_or_default();
+    let stderr = stderr_handle.join().unwrap_or_default();
+
     Ok(CapturedOutput {
-        status: output.status,
-        stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
-        stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+        status,
+        stdout,
+        stderr,
     })
 }
 
@@ -249,8 +329,7 @@ pub fn spawn_shell_prefixed(
             use std::io::BufRead;
             for line in reader.lines().map_while(Result::ok) {
                 eprintln!("\x1b[{}m{}\x1b[0m {}", color_out, prefix_out, line);
-                buf.push_str(&line);
-                buf.push('\n');
+                push_capped_line(&mut buf, &line);
             }
         }
         buf
@@ -264,8 +343,7 @@ pub fn spawn_shell_prefixed(
             use std::io::BufRead;
             for line in reader.lines().map_while(Result::ok) {
                 eprintln!("\x1b[{}m{}\x1b[0m {}", color_err, prefix_err, line);
-                buf.push_str(&line);
-                buf.push('\n');
+                push_capped_line(&mut buf, &line);
             }
         }
         buf
@@ -569,5 +647,62 @@ mod tests {
         .unwrap();
 
         assert!(status.success(), "all env vars should be visible");
+    }
+
+    /// M52: per-line accumulation halts at the cap. Subsequent lines
+    /// are silently dropped. The marker is emitted exactly once.
+    #[test]
+    fn push_capped_line_truncates_at_cap_with_marker() {
+        let mut buf = String::new();
+        // Fill the buffer just under the cap.
+        let big_line = "x".repeat(MAX_CAPTURED_STREAM_BYTES - 100);
+        push_capped_line(&mut buf, &big_line);
+        // Next line crosses the cap.
+        push_capped_line(&mut buf, &"y".repeat(200));
+        // A third line lands entirely past the cap.
+        push_capped_line(&mut buf, "z");
+
+        assert!(
+            buf.contains("[output truncated at 10 MiB]"),
+            "marker must be present after cap is crossed"
+        );
+        let marker_occurrences = buf.matches("[output truncated").count();
+        assert_eq!(
+            marker_occurrences, 1,
+            "marker must be appended exactly once"
+        );
+        // The buffer should not have grown materially past the cap +
+        // the marker text (account for marker + UTF-8 boundary slack).
+        assert!(
+            buf.len() <= MAX_CAPTURED_STREAM_BYTES + 64,
+            "buffer must not exceed cap: {}",
+            buf.len()
+        );
+    }
+
+    /// Below-cap lines are written verbatim. Round-trip preservation.
+    #[test]
+    fn push_capped_line_preserves_small_outputs() {
+        let mut buf = String::new();
+        push_capped_line(&mut buf, "line one");
+        push_capped_line(&mut buf, "line two");
+        assert_eq!(buf, "line one\nline two\n");
+    }
+
+    /// M52: when the last buffer byte lands inside a multibyte
+    /// codepoint, the truncator must walk back to a `char_boundary`
+    /// rather than panic on `&str` slicing.
+    #[test]
+    fn push_capped_line_handles_multibyte_at_cap_boundary() {
+        let mut buf = "x".repeat(MAX_CAPTURED_STREAM_BYTES - 4);
+        // Force the next line's content (3-byte CJK kana per char) to
+        // straddle the remaining 4-byte budget mid-codepoint.
+        let multibyte = "あ".repeat(100);
+        push_capped_line(&mut buf, &multibyte);
+        assert!(
+            buf.is_char_boundary(buf.len()),
+            "buf must end on a UTF-8 boundary"
+        );
+        assert!(buf.contains("[output truncated"));
     }
 }
