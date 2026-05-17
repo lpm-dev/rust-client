@@ -761,6 +761,16 @@ where
 /// only against concurrent `lpm` invocations that participate in
 /// the locking protocol.
 ///
+/// **Accepted-posture trade-off (L31):** under heavy concurrent
+/// activity (e.g., the user re-running `lpm install` in two
+/// terminals AND an IDE auto-formatter rewriting `package.json` in
+/// parallel), `ManifestTransaction::rollback` can clobber the
+/// editor's concurrent edits when restoring the snapshot. Trading
+/// reliable rollback semantics for cross-process notify/lock
+/// integration with IDEs was rejected as out of scope for the
+/// install layer; the documented contract is "do not edit
+/// `package.json` while an `lpm install` is in flight."
+///
 /// **The lock file's parent (`<project_dir>/.lpm/`) is created on
 /// demand by [`open_lock_file`]** — callers do not need to mkdir
 /// first. The same `.lpm/` directory holds `install-hash` and is
