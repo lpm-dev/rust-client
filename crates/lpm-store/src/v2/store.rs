@@ -457,20 +457,33 @@ impl Store {
     ) -> Result<(PathBuf, String, StageTimings), LpmError> {
         let computed_sri = crate::compute_sri_hash(tarball_data);
 
+        // M18: verify against the algorithm declared in `expected`.
+        // The v2 path mirrors v1: sha512 stays the canonical algorithm
+        // (`computed_sri`), sha256 is computed on-demand from the
+        // already-buffered tarball bytes when the lockfile declares it.
+        // Pre-fix the non-sha512 path silently trusted the computed
+        // sha512 — letting a coerced lockfile pass without any check.
         if let Some(expected) = expected_integrity {
             use subtle::ConstantTimeEq;
-            let matches_expected = expected.len() == computed_sri.len()
-                && expected.as_bytes().ct_eq(computed_sri.as_bytes()).into();
-            if expected.starts_with("sha512-") && !matches_expected {
+            let candidate_owned;
+            let candidate = if expected.starts_with("sha512-") {
+                &computed_sri
+            } else if expected.starts_with("sha256-") {
+                candidate_owned = crate::compute_sri_hash_sha256(tarball_data);
+                &candidate_owned
+            } else {
+                return Err(LpmError::Registry(format!(
+                    "unsupported integrity algorithm in v2 extract: {expected} — \
+                     expected sha512-… (preferred) or sha256-…"
+                )));
+            };
+            let matches_expected = expected.len() == candidate.len()
+                && expected.as_bytes().ct_eq(candidate.as_bytes()).into();
+            if !matches_expected {
                 return Err(LpmError::IntegrityMismatch {
                     expected: expected.to_string(),
-                    actual: computed_sri,
+                    actual: candidate.to_string(),
                 });
-            }
-            if !expected.starts_with("sha512-") {
-                tracing::warn!(
-                    "v2 store: non-sha512 expected integrity ({expected}); trusting computed {computed_sri}"
-                );
             }
         }
 

@@ -1493,6 +1493,20 @@ impl RegistryClient {
         // "error decoding response body"). The actual fault lives in the
         // `source()` chain from hyper. Walk the chain explicitly so the
         // warn log is diagnostic and not just the opaque top-level string.
+        //
+        // M60: cap the total bytes accumulated from the NDJSON stream
+        // at the same `MAX_METADATA_BYTES` ceiling the single-package
+        // metadata path uses. A hostile Worker / poisoned base URL
+        // could otherwise stream one giant line (or unbounded
+        // whitespace) and exhaust install memory before the JSON
+        // parser noticed the line was malformed.
+        if let Some(declared) = response.content_length()
+            && declared as usize > MAX_METADATA_BYTES
+        {
+            return Err(LpmError::Registry(format!(
+                "NDJSON batch: declared body length {declared} exceeds cap {MAX_METADATA_BYTES}"
+            )));
+        }
         let mut response = response;
         let mut bytes_read: u64 = 0;
         let mut chunks_read: u64 = 0;
@@ -1502,6 +1516,12 @@ impl RegistryClient {
                 Ok(Some(chunk)) => {
                     chunks_read += 1;
                     bytes_read += chunk.len() as u64;
+                    if (bytes_read as usize) > MAX_METADATA_BYTES {
+                        return Err(LpmError::Registry(format!(
+                            "NDJSON batch: streamed body exceeded cap {MAX_METADATA_BYTES} \
+                             (after {chunks_read} chunks)"
+                        )));
+                    }
                     buffer.extend_from_slice(&chunk);
                 }
                 Err(e) => {
