@@ -497,18 +497,33 @@ impl Lockfile {
 
     /// Fast read: prefer binary lockfile (mmap) if it exists and is at least
     /// as new as the TOML file. Falls back to TOML parsing.
+    ///
+    /// M69: on any metadata read error, prefer the TOML form. The
+    /// pre-fix default was to prefer the binary on metadata error,
+    /// which created a malicious-PR vector: commit a clean
+    /// human-readable `lpm.lock` (passes review) plus a poisoned
+    /// `lpm.lockb`, then engineer a metadata read failure (e.g.,
+    /// permission flip on TOML) to force binary precedence. The
+    /// install pipeline would then consume the binary while the
+    /// reviewer-visible TOML diverged silently. Defaulting to TOML
+    /// on metadata error means a reviewer's diff is what runs.
     pub fn read_fast(toml_path: &Path) -> Result<Self, LockfileError> {
         let binary_path = toml_path.with_extension("lockb");
         if binary_path.exists() {
-            // Check if binary is at least as new as TOML
             let use_binary = match (toml_path.metadata(), binary_path.metadata()) {
                 (Ok(toml_meta), Ok(bin_meta)) => {
                     match (toml_meta.modified(), bin_meta.modified()) {
                         (Ok(toml_time), Ok(bin_time)) => bin_time >= toml_time,
-                        _ => true, // If we can't check times, prefer binary
+                        // mtime unavailable but both files exist — fall
+                        // back to TOML to surface a reviewer-visible
+                        // diff rather than the opaque binary form.
+                        _ => false,
                     }
                 }
-                _ => true,
+                // Either metadata call failed. M69 prefers TOML here:
+                // the binary is opaque to PR review, so a metadata
+                // error should not be a free path to binary precedence.
+                _ => false,
             };
 
             if use_binary {

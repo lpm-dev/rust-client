@@ -400,6 +400,63 @@ impl BinaryLockfileReader {
                     ));
                 }
             }
+
+            // M68: eagerly validate name / version / source /
+            // integrity ranges so a crafted `lpm.lockb` can't
+            // silently surface `Some("")` for any of them via
+            // `read_str`'s OOB fallback. Per the lockfile contract:
+            //   - `name` / `version` MUST be non-empty (every
+            //     package has identity) — these are load-bearing for
+            //     install-graph correctness; the write path rejects
+            //     empty strings here.
+            //   - `source` / `integrity` MAY be empty (some source
+            //     kinds — directory / link — don't carry integrity,
+            //     and an empty source string serialises as the null
+            //     sentinel) — only the range fit-in-string-table
+            //     check applies.
+            //
+            // Either way, a corrupt (len=0 && off!=0) slot is
+            // rejected since it indicates writer-side corruption: a
+            // legitimate empty field uses (0, 0).
+            for (field, off_range, len_range, len_must_be_nonzero) in [
+                ("name", base..base + 4, base + 4..base + 6, true),
+                ("version", base + 6..base + 10, base + 10..base + 12, true),
+                ("source", base + 12..base + 16, base + 16..base + 18, false),
+                (
+                    "integrity",
+                    base + 18..base + 22,
+                    base + 22..base + 24,
+                    false,
+                ),
+            ] {
+                let off = u32::from_le_bytes(mmap[off_range].try_into().unwrap()) as usize;
+                let len = u16::from_le_bytes(mmap[len_range].try_into().unwrap()) as usize;
+                if len == 0 {
+                    if off != 0 {
+                        return Err(LockfileError::Deserialize(format!(
+                            "package entry {field} has zero length with non-zero offset \
+                             (corrupt — legitimate null uses (0, 0))"
+                        )));
+                    }
+                    if len_must_be_nonzero {
+                        return Err(LockfileError::Deserialize(format!(
+                            "package entry has zero-length {field} field — \
+                             every package must carry a non-empty {field}"
+                        )));
+                    }
+                    continue;
+                }
+                let end = off.checked_add(len).ok_or_else(|| {
+                    LockfileError::Deserialize(format!(
+                        "package entry {field} range overflows string table"
+                    ))
+                })?;
+                if end > string_table_len {
+                    return Err(LockfileError::Deserialize(format!(
+                        "package entry {field} range extends past string table"
+                    )));
+                }
+            }
         }
 
         Ok(Some(Self { mmap }))
@@ -1093,19 +1150,23 @@ mod tests {
 
     // ── Corruption / bounds-check tests ─────────────────────────────────────
 
+    /// M68: pre-fix `read_str` silently returned `""` on OOB offsets,
+    /// letting a crafted `lpm.lockb` surface `Some("")` for a package
+    /// name. `open()` now eagerly rejects the same corruption — the
+    /// strict-at-open contract matches the TOML loader's behaviour
+    /// for empty/missing identity fields.
     #[test]
-    fn read_str_oob_offset_returns_empty() {
+    fn open_rejects_oob_name_offset() {
         let mut binary = sample_binary();
-        // Mutate the first package entry's name_off to a huge value
-        // name_off is at HEADER_SIZE + 0 (first 4 bytes of first entry)
         let huge_off: u32 = 0xFFFF_FFFF;
         binary[HEADER_SIZE..HEADER_SIZE + 4].copy_from_slice(&huge_off.to_le_bytes());
 
-        let (_dir, reader) = open_bytes(&binary);
-        let reader = reader.unwrap().unwrap();
-        // Should return "" instead of panicking
-        let entry = reader.entry_at(0).unwrap();
-        assert_eq!(entry.name(), "");
+        let (_dir, result) = open_bytes(&binary);
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("name range") && (err.contains("overflows") || err.contains("past")),
+            "error must name the bounds failure: {err}"
+        );
     }
 
     #[test]
@@ -1176,23 +1237,22 @@ mod tests {
         );
     }
 
+    /// M68: a binary lockfile whose string table is truncated such
+    /// that a package's name/version range falls past EOF is now
+    /// rejected at `open()` rather than silently surfacing `""`.
+    /// Truncations that don't disturb the per-entry ranges (e.g.,
+    /// trim trailing dep-table bytes) still produce a structural
+    /// error via the layout consistency check.
     #[test]
-    fn truncated_string_table() {
-        // Build valid binary then truncate file so strings are cut off
+    fn truncated_string_table_is_refused_at_open() {
         let binary = sample_binary();
         let truncated = &binary[..binary.len().saturating_sub(20).max(HEADER_SIZE)];
 
-        let (_dir, reader) = open_bytes(truncated);
-        let reader = reader.unwrap().unwrap();
-        // Reading entries with truncated strings should return "" not panic
-        if let Some(entry) = reader.entry_at(0) {
-            // These calls should not panic
-            let _ = entry.name();
-            let _ = entry.version();
-            let _ = entry.source();
-            let _ = entry.integrity();
-            let _ = entry.dependencies();
-        }
+        let (_dir, result) = open_bytes(truncated);
+        assert!(
+            result.is_err(),
+            "truncated string table must be refused, not surfaced as silently-empty fields"
+        );
     }
 
     #[test]
@@ -1380,36 +1440,24 @@ mod tests {
 
     // ── read_str lower-bound validation ──────────────────────────────────
 
+    /// M68: a corrupted name_off that points past the string table
+    /// must be rejected at `open()` rather than silently surfacing
+    /// `""` later. The TOML loader has always failed here; the
+    /// binary loader now matches.
     #[test]
-    fn read_str_offset_into_header_returns_empty() {
-        // Craft a binary lockfile, then corrupt a package entry's name_off
-        // to point BEFORE the string table (into the header/entry region).
+    fn open_rejects_name_offset_past_string_table() {
         let mut binary = sample_binary();
-        // Set name_off of first entry to 0 but name_len to 4 — this would
-        // read from string_table_off + 0 which is valid. Instead, we need
-        // the absolute offset to land before string_table_off.
-        // We'll set name_off to a value that, when added to string_table_off,
-        // wraps on 32-bit or is otherwise invalid.
-        //
-        // Actually: the bug is that start < st_off wasn't checked. With the
-        // old code, off=0 len=4 would read from string_table_off which is fine.
-        // The real issue is when off as usize + st_off overflows.
-        // On 64-bit, u32::MAX + st_off won't overflow usize, but it will be
-        // past mmap.len(). The lower-bound check catches the case where
-        // checked_add overflows (returns None -> "").
-        //
-        // Test: set name_off to u32::MAX, name_len to 10. On any platform,
-        // st_off + u32::MAX will either overflow (caught by checked_add) or
-        // exceed mmap.len().
         let huge_off: u32 = u32::MAX;
         let name_len: u16 = 10;
         binary[HEADER_SIZE..HEADER_SIZE + 4].copy_from_slice(&huge_off.to_le_bytes());
         binary[HEADER_SIZE + 4..HEADER_SIZE + 6].copy_from_slice(&name_len.to_le_bytes());
 
-        let (_dir, reader) = open_bytes(&binary);
-        let reader = reader.unwrap().unwrap();
-        let entry = reader.entry_at(0).unwrap();
-        assert_eq!(entry.name(), "");
+        let (_dir, result) = open_bytes(&binary);
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("name range") && (err.contains("overflows") || err.contains("past")),
+            "error must label the bounds failure: {err}"
+        );
     }
 
     // ── Structural validation (open-time header consistency) ──────────────
