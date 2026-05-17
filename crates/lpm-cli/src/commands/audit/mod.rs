@@ -1466,6 +1466,67 @@ pub(crate) struct OsvVulnerability {
     severity: String,
 }
 
+const OSV_URL_DEFAULT: &str = "https://api.osv.dev/v1/querybatch";
+
+/// Resolve the OSV endpoint, honouring `LPM_OSV_URL` overrides only
+/// when the scheme/host combination matches the same gating contract as
+/// the H9 self-update probe (`release_lookup::resolve_release_url`):
+/// HTTPS is always accepted; plain HTTP is accepted only when the host
+/// is a loopback address so workflow tests can target a localhost mock
+/// without opening a generic env-poisoning hole. Honoured and rejected
+/// overrides both emit `warn` so operator logs surface unexpected
+/// redirects of the advisory feed.
+fn resolve_osv_url() -> String {
+    let raw = match std::env::var("LPM_OSV_URL").ok().filter(|s| !s.is_empty()) {
+        Some(v) => v,
+        None => return OSV_URL_DEFAULT.to_string(),
+    };
+    if osv_override_is_accepted(&raw) {
+        tracing::warn!(
+            override_url = %raw,
+            "LPM_OSV_URL override honoured — confirm this is expected",
+        );
+        return raw;
+    }
+    tracing::warn!(
+        override_url = %raw,
+        "rejecting LPM_OSV_URL override: plain HTTP non-loopback URL or unsupported scheme; \
+         falling back to default — set the override to an https:// URL to use a private mirror",
+    );
+    OSV_URL_DEFAULT.to_string()
+}
+
+/// Accept an override URL if it's HTTPS (any host) or HTTP pointed at
+/// a loopback address. Mirrors `release_lookup::accept_override` so the
+/// two env-driven advisory/version endpoints share an identical
+/// abuse-window posture.
+fn osv_override_is_accepted(url: &str) -> bool {
+    let parsed = match reqwest::Url::parse(url) {
+        Ok(u) => u,
+        Err(_) => return false,
+    };
+    match parsed.scheme() {
+        "https" => true,
+        "http" => parsed.host_str().map(host_is_loopback).unwrap_or(false),
+        _ => false,
+    }
+}
+
+fn host_is_loopback(host: &str) -> bool {
+    if host.eq_ignore_ascii_case("localhost") {
+        return true;
+    }
+    if let Ok(addr) = host.parse::<std::net::IpAddr>() {
+        return addr.is_loopback();
+    }
+    if let Some(inner) = host.strip_prefix('[').and_then(|s| s.strip_suffix(']'))
+        && let Ok(addr) = inner.parse::<std::net::IpAddr>()
+    {
+        return addr.is_loopback();
+    }
+    false
+}
+
 /// Query OSV.dev for known vulnerabilities.
 ///
 /// # Trust Model
@@ -1498,11 +1559,7 @@ async fn query_osv_batch(packages: &[(String, String)]) -> Result<Vec<OsvVulnera
 
     let body = serde_json::json!({ "queries": queries });
 
-    // Test hook: workflow tests redirect to a mock OSV endpoint via
-    // LPM_OSV_URL. Falls through to the public OSV API when unset, so
-    // production behavior is unchanged.
-    let osv_url = std::env::var("LPM_OSV_URL")
-        .unwrap_or_else(|_| "https://api.osv.dev/v1/querybatch".to_string());
+    let osv_url = resolve_osv_url();
 
     let response = client
         .post(&osv_url)
@@ -2489,5 +2546,39 @@ mod tests {
             msg.contains("HTTP 500") && msg.contains("degraded"),
             "error must label the failure mode: {msg}"
         );
+    }
+
+    /// M67: `LPM_OSV_URL` override gating mirrors the H9 self-update
+    /// probe — HTTPS accepted (private mirrors), HTTP only on loopback
+    /// (workflow tests), anything else falls back to the default.
+    #[test]
+    fn osv_override_accepts_https_any_host() {
+        assert!(osv_override_is_accepted(
+            "https://api.osv.dev/v1/querybatch"
+        ));
+        assert!(osv_override_is_accepted("https://osv.private.corp/v1"));
+        assert!(osv_override_is_accepted("https://example.com:8443/path"));
+    }
+
+    #[test]
+    fn osv_override_accepts_http_only_for_loopback() {
+        assert!(osv_override_is_accepted("http://127.0.0.1:8080/v1"));
+        assert!(osv_override_is_accepted("http://localhost:9090/v1"));
+        assert!(osv_override_is_accepted("http://[::1]:8080/v1"));
+    }
+
+    #[test]
+    fn osv_override_rejects_plain_http_non_loopback() {
+        assert!(!osv_override_is_accepted("http://attacker.example/v1"));
+        assert!(!osv_override_is_accepted("http://192.0.2.1/v1"));
+        assert!(!osv_override_is_accepted("http://osv.dev/v1"));
+    }
+
+    #[test]
+    fn osv_override_rejects_unsupported_schemes() {
+        assert!(!osv_override_is_accepted("ftp://osv.dev/v1"));
+        assert!(!osv_override_is_accepted("file:///etc/osv.json"));
+        assert!(!osv_override_is_accepted("javascript:alert(1)"));
+        assert!(!osv_override_is_accepted("not a url"));
     }
 }

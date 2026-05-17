@@ -83,11 +83,22 @@ impl std::fmt::Display for ValidationError {
     }
 }
 
-/// Redact a secret value for display: show first 4 and last 3 chars if long enough.
+/// Redact a secret value for display: show first 4 and last 3 *characters*
+/// if long enough.
+///
+/// `len()` and direct byte indexing would panic the moment a non-ASCII
+/// codepoint straddled either slice boundary — a malicious repo could
+/// mark a variable `secret: true`, force a format/pattern/enum failure,
+/// and ship a `.env` value containing a multibyte char to crash the
+/// command. Iterating over `char_indices` keeps us on grapheme-adjacent
+/// boundaries (still not full UAX#29, but enough to never panic).
 fn redact_value(value: &str) -> String {
-    if value.len() > 10 {
-        let start = &value[..4];
-        let end = &value[value.len() - 3..];
+    if value.chars().count() > 10 {
+        let start: String = value.chars().take(4).collect();
+        let end: String = {
+            let total = value.chars().count();
+            value.chars().skip(total - 3).collect()
+        };
         format!("{start}...{end}")
     } else {
         "••••••".to_string()
@@ -821,6 +832,43 @@ mod tests {
     fn long_secret_partially_shown() {
         let redacted = redact_value("sk_test_abc123xyz");
         assert_eq!(redacted, "sk_t...xyz");
+    }
+
+    #[test]
+    fn redact_handles_multibyte_codepoints_without_panic() {
+        // Pre-fix the byte-index slices would land mid-codepoint and
+        // panic. Each Japanese kana takes 3 UTF-8 bytes; placing a
+        // non-ASCII run at both slice boundaries forces both
+        // `value[..4]` and `value[value.len() - 3..]` to straddle.
+        let redacted = redact_value("あいうえおかきくけこさ");
+        assert_eq!(redacted, "あいうえ...けこさ");
+
+        // 4-byte codepoints (CJK extension, emoji) — same shape.
+        let redacted = redact_value("🌀🌁🌂🌃🌄🌅🌆🌇🌈🌉🌊");
+        assert_eq!(redacted, "🌀🌁🌂🌃...🌈🌉🌊");
+    }
+
+    #[test]
+    fn redact_uses_char_count_not_byte_length() {
+        // 6 chars total, but 18 UTF-8 bytes — under the
+        // visual-length threshold so it must fully redact.
+        let redacted = redact_value("あいうえおか");
+        assert_eq!(redacted, "••••••");
+    }
+
+    #[test]
+    fn validation_error_with_multibyte_secret_does_not_panic() {
+        // End-to-end check: a `secret: true` rule firing on a value
+        // dense in multibyte codepoints must format cleanly. Pre-fix
+        // this `to_string()` panicked at `byte index 4 is not a char
+        // boundary`.
+        let schema = schema_from_json(
+            r#"{"vars": {"TOKEN": {"required": true, "secret": true, "format": "url"}}}"#,
+        );
+        let mut env = HashMap::from([("TOKEN".into(), "あいうえおかきくけこさ".into())]);
+        let errors = validate(&schema, &mut env);
+        assert_eq!(errors.len(), 1);
+        let _ = errors[0].to_string();
     }
 
     // ── Multiple errors ──
