@@ -111,6 +111,11 @@ pub fn seed_blocked_build_state_with_real_hash(
 /// `approve-scripts --global` walks this file to populate the global
 /// blocked set.
 ///
+/// Default tier is `"green"` — matching what a fresh capture would
+/// write for a benign postinstall body. Workflow tests that need to
+/// exercise the M75 tier gate use [`seed_global_install_blocked_state_with_tier`]
+/// to pin a specific static tier (or omit the field for legacy state).
+///
 /// Returns the per-install `.lpm/` dir path so callers can write
 /// additional fixture state alongside (e.g. trusted-dependencies.json).
 pub fn seed_global_install_blocked_state_with_real_hash(
@@ -119,6 +124,29 @@ pub fn seed_global_install_blocked_state_with_real_hash(
     top_level_version: &str,
     blocked_name: &str,
     blocked_version: &str,
+) -> PathBuf {
+    seed_global_install_blocked_state_with_tier(
+        project,
+        top_level,
+        top_level_version,
+        blocked_name,
+        blocked_version,
+        Some("green"),
+    )
+}
+
+/// Same as [`seed_global_install_blocked_state_with_real_hash`] but
+/// takes an explicit `tier` so workflow tests can exercise the M75
+/// tier gate. Pass `Some("amber" | "amber-llm" | "red" | "green")` to
+/// pin a specific tier in the build-state JSON, or `None` to omit the
+/// `static_tier` field entirely (legacy / pre-classification state).
+pub fn seed_global_install_blocked_state_with_tier(
+    project: &TempProject,
+    top_level: &str,
+    top_level_version: &str,
+    blocked_name: &str,
+    blocked_version: &str,
+    tier: Option<&str>,
 ) -> PathBuf {
     let install_root = project
         .home()
@@ -132,6 +160,10 @@ pub fn seed_global_install_blocked_state_with_real_hash(
     let real_hash = stage_minimal_store_entry(&install_store_dir);
     let install_lpm = install_root.join(".lpm");
     std::fs::create_dir_all(&install_lpm).unwrap();
+    let tier_line = match tier {
+        Some(t) => format!(",\n            \"static_tier\": \"{t}\""),
+        None => String::new(),
+    };
     let body = format!(
         r#"{{
     "state_version": 1,
@@ -144,8 +176,7 @@ pub fn seed_global_install_blocked_state_with_real_hash(
             "integrity": "sha512-fixture-skip-verify",
             "script_hash": "{real_hash}",
             "phases_present": ["postinstall"],
-            "binding_drift": false,
-            "static_tier": "green"
+            "binding_drift": false{tier_line}
         }}
     ]
 }}"#

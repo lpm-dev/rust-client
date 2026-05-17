@@ -572,7 +572,7 @@ async fn run_under_store_lock(
         //   existing `--yes` flows before the next install
         //   recaptures the state would be a silent→P2 upgrade
         //   regression.
-        enforce_tiered_yes_gate(&effective_state.blocked_packages)?;
+        enforce_tiered_yes_gate(&effective_state.blocked_packages, GateScope::Project)?;
 
         emit_yes_warning_banner(effective_state.blocked_packages.len(), json_output);
         for blocked in &effective_state.blocked_packages {
@@ -1082,6 +1082,63 @@ fn print_package_card(blocked: &BlockedPackage) {
     println!();
 }
 
+/// Distinguishes the project and global gate call sites so the refusal
+/// error's redirect prose names the correct flag set. The substring
+/// `--yes refuses` is identical across scopes (agents already
+/// substring-match on it); only the trailing `Run ...` redirect varies.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GateScope {
+    Project,
+    Global,
+}
+
+/// Common shape consumed by [`enforce_tiered_yes_gate`]. Implemented by
+/// both [`BlockedPackage`] (project blocked set) and
+/// [`crate::global_blocked_set::AggregateBlockedRow`] (global aggregate
+/// row) so a single gate function enforces the policy at every bulk-
+/// approval call site. Without this trait, the global bulk paths
+/// historically wrote approvals straight to the trust file without any
+/// tier check — the M75 finding.
+trait TieredRow {
+    /// `name@version` for the refusal error's per-row listing.
+    fn display_id(&self) -> String;
+    /// `Some(tier)` when classification ran, `None` for legacy /
+    /// pre-classification state (passes through; see the call-site
+    /// comments for the rationale).
+    fn static_tier(&self) -> Option<lpm_security::triage::StaticTier>;
+}
+
+impl TieredRow for BlockedPackage {
+    fn display_id(&self) -> String {
+        format!("{}@{}", self.name, self.version)
+    }
+    fn static_tier(&self) -> Option<lpm_security::triage::StaticTier> {
+        self.static_tier
+    }
+}
+
+impl TieredRow for crate::global_blocked_set::AggregateBlockedRow {
+    fn display_id(&self) -> String {
+        format!("{}@{}", self.name, self.version)
+    }
+    fn static_tier(&self) -> Option<lpm_security::triage::StaticTier> {
+        self.static_tier
+    }
+}
+
+/// Blanket impl so the gate accepts both `&[Row]` and `&[&Row]`. The
+/// grouped-interactive path operates on `Vec<&AggregateBlockedRow>`
+/// (slicing the aggregate without cloning); without this impl the gate
+/// callsite would need to either clone or own the rows.
+impl<T: TieredRow + ?Sized> TieredRow for &T {
+    fn display_id(&self) -> String {
+        (**self).display_id()
+    }
+    fn static_tier(&self) -> Option<lpm_security::triage::StaticTier> {
+        (**self).static_tier()
+    }
+}
+
 /// — enforce the `--yes` refusal contract.
 ///
 /// Given the **effective** blocked-set that `--yes` would approve,
@@ -1094,14 +1151,20 @@ fn print_package_card(blocked: &BlockedPackage) {
 /// invocation. The callsite threads the returned `LpmError` up and
 /// the JSON-error wrapper in `main.rs` turns it into structured
 /// output when `--json` is set.
-fn enforce_tiered_yes_gate(blocked: &[BlockedPackage]) -> Result<(), LpmError> {
+///
+/// Generic over [`TieredRow`] so the same gate enforces the policy on
+/// both the project blocked set ([`BlockedPackage`]) and the global
+/// aggregate ([`AggregateBlockedRow`]). [`GateScope`] selects the
+/// per-flag redirect prose; the load-bearing `--yes refuses` prefix is
+/// shared across scopes for agent substring matching.
+fn enforce_tiered_yes_gate<R: TieredRow>(blocked: &[R], scope: GateScope) -> Result<(), LpmError> {
     use lpm_security::triage::StaticTier;
 
-    let refusals: Vec<&BlockedPackage> = blocked
+    let refusals: Vec<&R> = blocked
         .iter()
         .filter(|bp| {
             matches!(
-                bp.static_tier,
+                bp.static_tier(),
                 Some(StaticTier::Amber | StaticTier::AmberLlm | StaticTier::Red)
             )
         })
@@ -1119,22 +1182,33 @@ fn enforce_tiered_yes_gate(blocked: &[BlockedPackage]) -> Result<(), LpmError> {
         .iter()
         .map(|bp| {
             let tier_text = bp
-                .static_tier
+                .static_tier()
                 .map(tier_label_text)
                 .unwrap_or("unknown tier");
-            format!("    {}@{}  [{}]", bp.name, bp.version, tier_text)
+            format!("    {}  [{}]", bp.display_id(), tier_text)
         })
         .collect::<Vec<_>>()
         .join("\n");
 
+    let redirect = match scope {
+        GateScope::Project => {
+            "Run `lpm approve-scripts` (interactive walk) or \
+             `lpm approve-scripts <pkg>` to review individual packages. \
+             Use `lpm approve-scripts --list` to inspect the full blocked set first."
+        }
+        GateScope::Global => {
+            "Run `lpm approve-scripts --global` (interactive walk) or \
+             `lpm approve-scripts --global <pkg>` to review individual packages. \
+             Use `lpm approve-scripts --global --list` to inspect the full blocked set first."
+        }
+    };
+
     Err(LpmError::Script(format!(
         "--yes refuses to bulk-approve {} package(s) classified outside the \
-         green tier. Each requires explicit per-package review.\n\n{}\n\n\
-         Run `lpm approve-scripts` (interactive walk) or \
-         `lpm approve-scripts <pkg>` to review individual packages. \
-         Use `lpm approve-scripts --list` to inspect the full blocked set first.",
+         green tier. Each requires explicit per-package review.\n\n{}\n\n{}",
         refusals.len(),
         detail,
+        redirect,
     )))
 }
 
@@ -1766,6 +1840,20 @@ async fn run_global_bulk_yes(
     dry_run: bool,
     json_output: bool,
 ) -> Result<(), LpmError> {
+    // Refuse global `--yes` for any aggregate row classified outside
+    // the green tier — parity with the project `--yes` gate. The gate
+    // runs BEFORE the provenance fetch + banner emission so a refused
+    // run doesn't burn network round-trips or emit a success-shaped
+    // human/tracing line that would later need contradiction. Matches
+    // the project call-site ordering at line 575.
+    //
+    // M75: pre-fix `run_global_bulk_yes` wrote aggregate rows straight
+    // to `~/.lpm/global/trusted-dependencies.json` without any tier
+    // check. The hole was that an `amber` / `amber-llm` / `red` lifecycle
+    // script in a global tree could be approved through the bulk path
+    // while the project `--yes` would refuse the same classification.
+    enforce_tiered_yes_gate(&aggregate.rows, GateScope::Global)?;
+
     // Network fetch (provenance) happens BEFORE the lock so the
     // critical section stays bounded. Fetch failures degrade to
     // `None` per `fetch_provenance_for_pkgs` contract.
@@ -2220,6 +2308,29 @@ async fn run_global_interactive(
 
             match choice {
                 "approve_all" => {
+                    // Tier-gate parity with `--yes`. If any row in
+                    // THIS group carries a non-green tier, refuse the
+                    // bulk-approve action: surface the same refusal
+                    // error project --yes prints, then loop back to the
+                    // same group's menu so the user explicitly re-
+                    // chooses Review / Skip / Quit. Leaving the group's
+                    // rows out of `decided` is what re-enters this
+                    // group on the next loop iteration — flat-mode has
+                    // no equivalent because flat-mode is already
+                    // per-package review.
+                    //
+                    // M75: pre-fix `approve_all` wrote every row in the
+                    // group via `commit_global_approval` without any
+                    // tier check, opening the same policy hole as
+                    // `run_global_bulk_yes` did for the non-interactive
+                    // path.
+                    if let Err(gate_err) = enforce_tiered_yes_gate(&rows, GateScope::Global) {
+                        output::warn(&gate_err.to_string());
+                        // Fall through to the loop tail; same group is
+                        // re-displayed with the menu so the user can
+                        // pick Review individually instead.
+                        continue;
+                    }
                     for row in &rows {
                         let snap = provenance
                             .get(&(row.name.clone(), row.version.clone()))
@@ -2319,6 +2430,11 @@ async fn run_global_interactive(
         return Ok(());
     }
 
+    // Flat interactive path: per-row review with explicit prompts.
+    // No tier gate required here because each row is its own decision
+    // point — there is no bulk action (parity with the grouped
+    // `approve_all` shortcut which IS gated, and the project-level
+    // interactive walk which is also per-row).
     for row in &aggregate.rows {
         print_aggregate_card(row);
         let choice: &str = cliclack::select(format!("{} @ {} — approve?", row.name, row.version))
@@ -2903,7 +3019,7 @@ mod tests {
         // is a no-op today (approves nothing). The gate must not
         // refuse in this case.
         let blocked: Vec<BlockedPackage> = Vec::new();
-        assert!(enforce_tiered_yes_gate(&blocked).is_ok());
+        assert!(enforce_tiered_yes_gate(&blocked, GateScope::Project).is_ok());
     }
 
     #[test]
@@ -2914,7 +3030,7 @@ mod tests {
             make_blocked_tiered("pkg-b", "2.0.0", StaticTier::Green),
         ];
         assert!(
-            enforce_tiered_yes_gate(&blocked).is_ok(),
+            enforce_tiered_yes_gate(&blocked, GateScope::Project).is_ok(),
             "an all-green effective set must pass the --yes gate"
         );
     }
@@ -2928,7 +3044,7 @@ mod tests {
         let blocked = vec![make_blocked("esbuild", "0.25.1")];
         assert!(blocked[0].static_tier.is_none());
         assert!(
-            enforce_tiered_yes_gate(&blocked).is_ok(),
+            enforce_tiered_yes_gate(&blocked, GateScope::Project).is_ok(),
             "None static_tier (pre-P2 legacy state) must pass through \
              the --yes gate"
         );
@@ -2941,7 +3057,7 @@ mod tests {
             make_blocked_tiered("fresh-green", "1.0.0", StaticTier::Green),
             make_blocked("legacy", "1.0.0"),
         ];
-        assert!(enforce_tiered_yes_gate(&blocked).is_ok());
+        assert!(enforce_tiered_yes_gate(&blocked, GateScope::Project).is_ok());
     }
 
     #[test]
@@ -2952,7 +3068,8 @@ mod tests {
             "1.48.0",
             StaticTier::Amber,
         )];
-        let err = enforce_tiered_yes_gate(&blocked).expect_err("amber must refuse");
+        let err =
+            enforce_tiered_yes_gate(&blocked, GateScope::Project).expect_err("amber must refuse");
         let msg = err.to_string();
         assert!(msg.contains("--yes refuses"), "got: {msg}");
         assert!(msg.contains("playwright@1.48.0"), "got: {msg}");
@@ -2966,7 +3083,8 @@ mod tests {
             "3.0.0",
             StaticTier::AmberLlm,
         )];
-        let err = enforce_tiered_yes_gate(&blocked).expect_err("amber-llm must refuse");
+        let err = enforce_tiered_yes_gate(&blocked, GateScope::Project)
+            .expect_err("amber-llm must refuse");
         assert!(err.to_string().contains("--yes refuses"));
     }
 
@@ -2974,7 +3092,8 @@ mod tests {
     fn yes_gate_refuses_single_red() {
         use lpm_security::triage::StaticTier;
         let blocked = vec![make_blocked_tiered("evil-pkg", "0.0.1", StaticTier::Red)];
-        let err = enforce_tiered_yes_gate(&blocked).expect_err("red must refuse");
+        let err =
+            enforce_tiered_yes_gate(&blocked, GateScope::Project).expect_err("red must refuse");
         assert!(err.to_string().contains("--yes refuses"));
     }
 
@@ -2987,7 +3106,8 @@ mod tests {
             make_blocked("legacy", "2.0.0"),
             make_blocked_tiered("risky-b", "3.0.0", StaticTier::Red),
         ];
-        let err = enforce_tiered_yes_gate(&blocked).expect_err("mix must refuse");
+        let err =
+            enforce_tiered_yes_gate(&blocked, GateScope::Project).expect_err("mix must refuse");
         let msg = err.to_string();
 
         // Refusals listed.
@@ -3015,13 +3135,126 @@ mod tests {
         // refusal is just a dead-end.
         use lpm_security::triage::StaticTier;
         let blocked = vec![make_blocked_tiered("x", "1.0.0", StaticTier::Amber)];
-        let msg = enforce_tiered_yes_gate(&blocked)
+        let msg = enforce_tiered_yes_gate(&blocked, GateScope::Project)
             .expect_err("amber must refuse")
             .to_string();
         assert!(
             msg.contains("lpm approve-scripts")
                 && (msg.contains("interactive") || msg.contains("<pkg>") || msg.contains("--list")),
             "error must redirect to the interactive / single-pkg / list path; got: {msg}"
+        );
+    }
+
+    // ── Generalized gate over AggregateBlockedRow (global scope) ─────
+    //
+    // Pins the same refusal contract via the generic helper. Without
+    // these tests, a future refactor that drops `impl TieredRow for
+    // AggregateBlockedRow` or skips the `static_tier` field at
+    // aggregation time would silently re-open the M75 hole.
+
+    fn agg_row_tiered(
+        name: &str,
+        version: &str,
+        tier: lpm_security::triage::StaticTier,
+    ) -> crate::global_blocked_set::AggregateBlockedRow {
+        crate::global_blocked_set::AggregateBlockedRow {
+            name: name.into(),
+            version: version.into(),
+            integrity: Some("sha512-fixture".into()),
+            script_hash: Some("sha256-fixture".into()),
+            phases_present: vec!["postinstall".into()],
+            binding_drift: false,
+            static_tier: Some(tier),
+            origins: vec!["origin-pkg".into()],
+        }
+    }
+
+    fn agg_row_no_tier(
+        name: &str,
+        version: &str,
+    ) -> crate::global_blocked_set::AggregateBlockedRow {
+        crate::global_blocked_set::AggregateBlockedRow {
+            name: name.into(),
+            version: version.into(),
+            integrity: Some("sha512-fixture".into()),
+            script_hash: Some("sha256-fixture".into()),
+            phases_present: vec!["postinstall".into()],
+            binding_drift: false,
+            static_tier: None,
+            origins: vec!["origin-pkg".into()],
+        }
+    }
+
+    #[test]
+    fn yes_gate_global_allows_all_green_aggregate() {
+        use lpm_security::triage::StaticTier;
+        let rows = vec![
+            agg_row_tiered("a", "1.0.0", StaticTier::Green),
+            agg_row_tiered("b", "2.0.0", StaticTier::Green),
+        ];
+        assert!(
+            enforce_tiered_yes_gate(&rows, GateScope::Global).is_ok(),
+            "all-green aggregate must pass the global gate"
+        );
+    }
+
+    #[test]
+    fn yes_gate_global_passes_through_none_tier_legacy_state() {
+        // Pre-classification aggregate rows (e.g. fixtures or older
+        // per-install state predating the static_tier field) must
+        // continue through. Parity with the project gate's pass-through
+        // contract.
+        let rows = vec![agg_row_no_tier("legacy", "1.0.0")];
+        assert!(rows[0].static_tier.is_none());
+        assert!(enforce_tiered_yes_gate(&rows, GateScope::Global).is_ok());
+    }
+
+    #[test]
+    fn yes_gate_global_refuses_amber_aggregate_row() {
+        use lpm_security::triage::StaticTier;
+        let rows = vec![agg_row_tiered("playwright", "1.48.0", StaticTier::Amber)];
+        let err = enforce_tiered_yes_gate(&rows, GateScope::Global)
+            .expect_err("amber aggregate row must refuse");
+        let msg = err.to_string();
+        assert!(msg.contains("--yes refuses"), "got: {msg}");
+        assert!(msg.contains("playwright@1.48.0"), "got: {msg}");
+        // Scope-specific redirect prose.
+        assert!(
+            msg.contains("--global"),
+            "global-scope redirect must mention --global; got: {msg}"
+        );
+    }
+
+    #[test]
+    fn yes_gate_global_refuses_red_aggregate_row() {
+        use lpm_security::triage::StaticTier;
+        let rows = vec![agg_row_tiered("evil-pkg", "0.0.1", StaticTier::Red)];
+        let err = enforce_tiered_yes_gate(&rows, GateScope::Global)
+            .expect_err("red aggregate row must refuse");
+        assert!(err.to_string().contains("--yes refuses"));
+    }
+
+    #[test]
+    fn yes_gate_global_redirect_prose_is_scope_specific() {
+        use lpm_security::triage::StaticTier;
+        let rows = vec![agg_row_tiered("x", "1.0.0", StaticTier::Amber)];
+        let global_msg = enforce_tiered_yes_gate(&rows, GateScope::Global)
+            .expect_err("global gate must refuse")
+            .to_string();
+        // Both flag forms surface so agents redirecting users see the
+        // correct command.
+        assert!(
+            global_msg.contains("approve-scripts --global"),
+            "got: {global_msg}"
+        );
+
+        let project_blocked = vec![make_blocked_tiered("x", "1.0.0", StaticTier::Amber)];
+        let project_msg = enforce_tiered_yes_gate(&project_blocked, GateScope::Project)
+            .expect_err("project gate must refuse")
+            .to_string();
+        assert!(
+            !project_msg.contains("approve-scripts --global"),
+            "project redirect must not advise --global; got: {project_msg}"
         );
     }
 
@@ -3976,6 +4209,10 @@ mod tests {
             script_hash: Some(format!("sha256-{name}{version}")),
             phases_present: vec!["postinstall".into()],
             binding_drift: false,
+            // Default to None tier — legacy / pre-classification state.
+            // Tests that exercise the global tier gate construct rows
+            // with an explicit tier via [`row_tiered`] below.
+            static_tier: None,
             origins: origins.iter().map(|s| (*s).to_string()).collect(),
         }
     }

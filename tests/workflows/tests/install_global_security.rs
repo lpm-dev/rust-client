@@ -34,7 +34,7 @@
 
 mod support;
 
-use support::build_state::seed_global_install_blocked_state_with_real_hash;
+use support::build_state::seed_global_install_blocked_state_with_tier;
 use support::mock_registry::{MockRegistry, compute_integrity, make_tarball_from_pkg_json};
 use support::{TempProject, lpm, lpm_with_registry};
 
@@ -335,6 +335,28 @@ fn seed_global_manifest_and_blocked_state(
     blocked_name: &str,
     blocked_version: &str,
 ) {
+    seed_global_manifest_and_blocked_state_with_tier(
+        project,
+        top_level,
+        top_level_version,
+        blocked_name,
+        blocked_version,
+        Some("green"),
+    );
+}
+
+/// Same as [`seed_global_manifest_and_blocked_state`] but pins an
+/// explicit `static_tier` on the blocked row. Used by the M75 tier-gate
+/// workflow tests below. `None` omits the field entirely (pre-
+/// classification legacy state).
+fn seed_global_manifest_and_blocked_state_with_tier(
+    project: &TempProject,
+    top_level: &str,
+    top_level_version: &str,
+    blocked_name: &str,
+    blocked_version: &str,
+    tier: Option<&str>,
+) {
     let global_root = project.home().join(".lpm").join("global");
     std::fs::create_dir_all(&global_root).unwrap();
     let toml = format!(
@@ -351,12 +373,13 @@ commands = []
 "#
     );
     std::fs::write(global_root.join("manifest.toml"), toml).unwrap();
-    seed_global_install_blocked_state_with_real_hash(
+    seed_global_install_blocked_state_with_tier(
         project,
         top_level,
         top_level_version,
         blocked_name,
         blocked_version,
+        tier,
     );
 }
 
@@ -781,5 +804,145 @@ fn approve_scripts_global_yes_live_json_carries_next_step_origins() {
         !names.contains(&"esbuild"),
         "origins must NOT include the approved row's name (`esbuild`) — \
          it's a transitive blocked package, not a top-level global. names={names:?}"
+    );
+}
+
+// ── M75: tier gate parity for global bulk approval ──────────────────
+//
+// Pre-fix, `lpm approve-scripts --global --yes` wrote aggregate rows
+// straight into `~/.lpm/global/trusted-dependencies.json` without the
+// non-green tier check the project `--yes` gate enforces. A malicious
+// global dependency with an amber / amber-llm / red lifecycle script
+// could be globally approved through the bulk path even though the
+// project `--yes` path would refuse the same classification.
+
+/// `--global --yes` MUST refuse to bulk-approve any aggregate row
+/// classified outside the green tier. Pinned with `amber`, matching
+/// the project `yes_gate_refuses_single_amber` unit-test contract.
+#[test]
+fn approve_scripts_global_yes_refuses_amber_tier() {
+    let project = TempProject::empty(r#"{ "name": "global-security-test", "version": "0.0.0" }"#);
+    seed_global_manifest_and_blocked_state_with_tier(
+        &project,
+        "eslint",
+        "9.24.0",
+        "esbuild",
+        "0.25.1",
+        Some("amber"),
+    );
+
+    let out = lpm(&project)
+        .args(["--json", "approve-scripts", "--global", "--yes"])
+        .output()
+        .expect("spawn lpm approve-scripts --global --yes");
+    assert!(
+        !out.status.success(),
+        "approve-scripts --global --yes must exit non-zero when an aggregate row is amber; \
+         stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+    // The refusal message threads through main.rs's JSON error wrapper.
+    // Substring-match on the stable `--yes refuses` prefix + the
+    // refused package + the global redirect prose.
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        combined.contains("--yes refuses"),
+        "refusal must carry the stable `--yes refuses` prefix; got:\n{combined}"
+    );
+    assert!(
+        combined.contains("esbuild@0.25.1"),
+        "refusal must name the offending package; got:\n{combined}"
+    );
+    assert!(
+        combined.contains("approve-scripts --global"),
+        "global redirect must mention --global; got:\n{combined}"
+    );
+    // Trust file must be UNTOUCHED on refusal — no aggregate row should
+    // have made it into ~/.lpm/global/trusted-dependencies.json.
+    let trust_path = project
+        .home()
+        .join(".lpm")
+        .join("global")
+        .join("trusted-dependencies.json");
+    assert!(
+        !trust_path.exists(),
+        "trust file must not be written when --yes is refused; found {}",
+        trust_path.display()
+    );
+}
+
+/// `--global --yes` MUST allow bulk-approval when every aggregate row
+/// is green-tier. Verifies the gate isn't over-eager: green is the
+/// happy path.
+#[test]
+fn approve_scripts_global_yes_allows_green_tier() {
+    let project = TempProject::empty(r#"{ "name": "global-security-test", "version": "0.0.0" }"#);
+    seed_global_manifest_and_blocked_state_with_tier(
+        &project,
+        "eslint",
+        "9.24.0",
+        "esbuild",
+        "0.25.1",
+        Some("green"),
+    );
+
+    let out = lpm(&project)
+        .args(["--json", "approve-scripts", "--global", "--yes"])
+        .output()
+        .expect("spawn lpm approve-scripts --global --yes");
+    assert!(
+        out.status.success(),
+        "approve-scripts --global --yes must succeed for an all-green aggregate; \
+         stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+    let parsed: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&out.stdout).trim())
+            .expect("valid JSON envelope on stdout");
+    assert_eq!(
+        parsed.get("approved_count").and_then(|v| v.as_u64()),
+        Some(1)
+    );
+    let trust_path = project
+        .home()
+        .join(".lpm")
+        .join("global")
+        .join("trusted-dependencies.json");
+    assert!(
+        trust_path.exists(),
+        "trust file must be written on successful bulk approval; expected {}",
+        trust_path.display()
+    );
+}
+
+/// Pre-classification legacy state — build-state.json rows without the
+/// `static_tier` field — MUST pass through the global tier gate so
+/// older clients' captured state remains approvable via `--yes` after a
+/// binary upgrade. Parity with the project gate's
+/// `yes_gate_allows_none_tiered_legacy_state` contract.
+#[test]
+fn approve_scripts_global_yes_passes_through_none_tier_legacy_state() {
+    let project = TempProject::empty(r#"{ "name": "global-security-test", "version": "0.0.0" }"#);
+    seed_global_manifest_and_blocked_state_with_tier(
+        &project, "eslint", "9.24.0", "esbuild", "0.25.1",
+        None, // omit static_tier — legacy / pre-P2 state
+    );
+
+    let out = lpm(&project)
+        .args(["--json", "approve-scripts", "--global", "--yes"])
+        .output()
+        .expect("spawn lpm approve-scripts --global --yes");
+    assert!(
+        out.status.success(),
+        "approve-scripts --global --yes must succeed for legacy None-tier state; \
+         stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
     );
 }
