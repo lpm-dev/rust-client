@@ -507,9 +507,6 @@ pub fn p256_pair_wrap_key(
 mod tests {
     use super::*;
 
-    /// Lock to serialize tests that access the shared wrapping key (keyring + file).
-    static WRAPPING_KEY_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
     /// Hermetic test environment for wrapping-key tests.
     ///
     /// Tests that touch [`get_or_create_wrapping_key`] would otherwise hit
@@ -520,10 +517,14 @@ mod tests {
     /// directory, and there is no chance of cross-test or cross-CI
     /// contamination of the real user keyring/file.
     ///
-    /// Construction: takes the [`WRAPPING_KEY_LOCK`] mutex, snapshots
-    /// `HOME` + `LPM_FORCE_FILE_VAULT`, points them at a fresh tempdir
-    /// with the env var set to `"1"`. Drop restores both env vars and
-    /// releases the lock (the tempdir is cleaned up by `tempfile`).
+    /// Construction: takes the shared
+    /// [`crate::test_env_lock::ENV_LOCK`] mutex, snapshots `HOME` +
+    /// `LPM_FORCE_FILE_VAULT`, points them at a fresh tempdir with the
+    /// env var set to `"1"`. Drop restores both env vars and releases
+    /// the lock (the tempdir is cleaned up by `tempfile`). Sharing
+    /// the lock with `lib.rs::tests::with_forced_file_vault_backend`
+    /// is what closes the parallel-cascade where one module's tests
+    /// would mutate env while another module's tests were mid-flight.
     struct IsolatedVaultEnv {
         _tmp: tempfile::TempDir,
         _guard: std::sync::MutexGuard<'static, ()>,
@@ -533,11 +534,11 @@ mod tests {
 
     impl IsolatedVaultEnv {
         fn new() -> Self {
-            let guard = WRAPPING_KEY_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            let guard = crate::test_env_lock::acquire_env_lock();
             let tmp = tempfile::tempdir().expect("tempdir for isolated vault env");
             let prior_home = std::env::var_os("HOME");
             let prior_force_file = std::env::var_os("LPM_FORCE_FILE_VAULT");
-            // SAFETY: the WRAPPING_KEY_LOCK guard ensures we are the only
+            // SAFETY: the shared env-lock guard ensures we are the only
             // thread mutating these env vars while this struct is alive.
             unsafe {
                 std::env::set_var("HOME", tmp.path());
@@ -554,7 +555,7 @@ mod tests {
 
     impl Drop for IsolatedVaultEnv {
         fn drop(&mut self) {
-            // SAFETY: still holding WRAPPING_KEY_LOCK via `_guard`.
+            // SAFETY: still holding the shared env-lock via `_guard`.
             unsafe {
                 match &self.prior_home {
                     Some(v) => std::env::set_var("HOME", v),

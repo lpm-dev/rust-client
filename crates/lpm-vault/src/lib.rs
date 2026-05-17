@@ -30,6 +30,9 @@ pub mod vault_id;
 #[cfg(target_os = "macos")]
 pub mod keychain;
 
+#[cfg(test)]
+pub(crate) mod test_env_lock;
+
 use std::collections::HashMap;
 use std::path::Path;
 
@@ -699,8 +702,9 @@ fn add_to_gitignore(project_dir: &Path, file_path: &Path) {
 mod tests {
     use super::*;
 
-    // Environment-mutating tests and any remaining keychain tests are serialized.
-    static KEYCHAIN_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    // Tests share `crate::test_env_lock::ENV_LOCK` (with crypto.rs)
+    // so env mutations are serialised across the crate, not just
+    // within one module.
 
     /// Clean up Keychain items created by a test (prevents Keychain pollution).
     fn cleanup_vault(project_dir: &Path) {
@@ -716,7 +720,7 @@ mod tests {
     }
 
     fn with_forced_file_vault_backend<T>(test: impl FnOnce() -> T) -> T {
-        let _lock = KEYCHAIN_LOCK.lock().unwrap();
+        let _lock = crate::test_env_lock::acquire_env_lock();
         let temp_home = tempfile::tempdir().expect("create temp HOME");
         let original_home = std::env::var_os("HOME");
         let original_force_file_vault = std::env::var_os("LPM_FORCE_FILE_VAULT");
@@ -1115,7 +1119,7 @@ KEY3=no-quotes"#;
     /// storage layer (no subprocess, no mock registry).
     #[test]
     fn replace_all_environments_drops_local_only_envs_and_overwrites_each_env() {
-        let _lock = KEYCHAIN_LOCK.lock().unwrap();
+        let _lock = crate::test_env_lock::acquire_env_lock();
 
         let temp_home = tempfile::tempdir().expect("create temp HOME");
         let original_home = std::env::var_os("HOME");

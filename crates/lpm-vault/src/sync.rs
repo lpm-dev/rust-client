@@ -1260,17 +1260,32 @@ pub async fn get_audit_log(
 }
 
 #[cfg(test)]
+// The shared env-mutation lock is a `std::sync::Mutex`, and several
+// async tests in this module hold its guard across `.await` points
+// to keep env serialised for the full duration of the wiremock
+// round-trip. Clippy would normally flag this as `await_holding_lock`
+// because in production code that would block a tokio worker thread.
+// In tests it's safe: each `#[tokio::test]` runs in its own runtime,
+// so the only blocked thread is the test's own worker — there are no
+// other tasks to starve. Allow the lint at the module level.
+#[allow(clippy::await_holding_lock)]
 mod tests {
     use super::*;
     use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
-    use std::sync::{Arc, Mutex as StdMutex, OnceLock};
-    use tokio::sync::Mutex;
+    use std::sync::{Arc, Mutex as StdMutex};
     use wiremock::matchers::{body_string_contains, header, method, path, query_param};
     use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
 
-    fn env_lock() -> &'static Mutex<()> {
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(()))
+    /// Acquire the crate-wide env-mutation lock so this module's
+    /// tests serialise with `crypto::tests` and the top-level
+    /// `lib.rs::tests`. The lock must cover the full window from
+    /// env-mutation through any code that reads the same env vars,
+    /// so one module's test cannot read another's in-flight env
+    /// state. Blocking briefly inside `#[tokio::test]` is safe —
+    /// each tokio test runs in its own runtime, so blocking on a
+    /// `std::sync::Mutex` doesn't starve any other task.
+    fn env_lock_guard() -> std::sync::MutexGuard<'static, ()> {
+        crate::test_env_lock::acquire_env_lock()
     }
 
     /// Build a 200 response that mirrors what the LPM origin actually sends
@@ -1291,7 +1306,7 @@ mod tests {
     /// and `LPM_FORCE_FILE_VAULT`, points HOME at a fresh tempdir and
     /// pins file-only mode. Drop restores both.
     ///
-    /// Caller must already hold `env_lock()` — this struct does not
+    /// Caller must already hold `env_lock_guard()` — this struct does not
     /// acquire it. The async tests in this module take `env_lock`
     /// immediately and the lock guard outlives this struct.
     struct IsolatedVaultKeyEnv {
@@ -1305,8 +1320,8 @@ mod tests {
             let tmp = tempfile::tempdir().expect("tempdir for vault key isolation");
             let prior_home = std::env::var_os("HOME");
             let prior_force_file = std::env::var_os("LPM_FORCE_FILE_VAULT");
-            // SAFETY: caller holds env_lock(), serialising env mutation
-            // across this module's tests.
+            // SAFETY: caller holds env_lock_guard(), serialising env mutation
+            // across all of this crate's tests (shared lock).
             unsafe {
                 std::env::set_var("HOME", tmp.path());
                 std::env::set_var("LPM_FORCE_FILE_VAULT", "1");
@@ -1384,7 +1399,7 @@ mod tests {
         // falls back, returns plaintext + needs_reencrypt = true, and `pull`
         // re-encrypts under the stored key and pushes back. This pins the
         // automatic-migration contract end-to-end.
-        let _guard = env_lock().lock().await;
+        let _guard = env_lock_guard();
         let _isolated = IsolatedVaultKeyEnv::new();
 
         // Encrypt the blob under the legacy auth-token-derived key so the
@@ -1469,7 +1484,7 @@ mod tests {
         // decrypted secrets when the re-push fails (network blip, version
         // race, or transient origin error). Failure is logged at warn for
         // observability; the next successful pull retries the migration.
-        let _guard = env_lock().lock().await;
+        let _guard = env_lock_guard();
         let _isolated = IsolatedVaultKeyEnv::new();
 
         let auth_token = "auth-token";
@@ -1901,7 +1916,7 @@ mod tests {
 
     #[tokio::test]
     async fn pull_env_returns_empty_for_non_default_legacy_flat_vault() {
-        let _guard = env_lock().lock().await;
+        let _guard = env_lock_guard();
 
         // Hermetic env: force file-backed wrapping key + isolated HOME so
         // the in-process `crypto::encrypt_vault_for_sync` call below
@@ -1946,7 +1961,7 @@ mod tests {
 
     #[tokio::test]
     async fn pull_raw_times_out_when_server_stalls() {
-        let _guard = env_lock().lock().await;
+        let _guard = env_lock_guard();
         let server = MockServer::start().await;
         let original_timeout = std::env::var_os("LPM_TEST_SYNC_TIMEOUT_MS");
 
@@ -1991,7 +2006,7 @@ mod tests {
 
     #[test]
     fn push_org_with_keys_regenerates_corrupted_forced_file_key_and_skips_members_without_keys() {
-        let _guard = env_lock().blocking_lock();
+        let _guard = env_lock_guard();
         let temp = tempfile::tempdir().expect("failed to create temp home for forced vault test");
         let original_home = std::env::var_os("HOME");
         let original_force_file_vault = std::env::var_os("LPM_FORCE_FILE_VAULT");
@@ -2145,7 +2160,7 @@ mod tests {
         // creation time and never reflected later CLI pushes. This test pins
         // the contract: when the caller passes `PushMetadata`, both fields
         // land on the wire alongside the encrypted blob and wrapped keys.
-        let _guard = env_lock().blocking_lock();
+        let _guard = env_lock_guard();
         let temp = tempfile::tempdir().expect("tempdir for metadata round-trip test");
         let original_home = std::env::var_os("HOME");
         let original_force_file_vault = std::env::var_os("LPM_FORCE_FILE_VAULT");
@@ -2304,7 +2319,7 @@ mod tests {
         // supplied, the body must NOT contain `name` or `schema` fields.
         // This pins the "explicit None means don't touch dashboard
         // metadata" contract — server keeps last-known-good schema/name.
-        let _guard = env_lock().blocking_lock();
+        let _guard = env_lock_guard();
         let temp = tempfile::tempdir().expect("tempdir for None-metadata test");
         let original_home = std::env::var_os("HOME");
         let original_force_file_vault = std::env::var_os("LPM_FORCE_FILE_VAULT");
