@@ -49,6 +49,7 @@ use lpm_common::{LpmError, LpmRoot};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fs;
+use std::io::Write;
 use std::path::Path;
 
 /// Binding metadata for one entry in the global trusted-deps map.
@@ -259,31 +260,33 @@ pub fn read_at(path: &Path) -> Result<GlobalTrustedDependencies, LpmError> {
     // Windows long-path support — no-op on POSIX.
     let path = lpm_common::as_extended_path(path);
     let path = path.as_path();
-    match fs::read(path) {
-        Ok(bytes) => {
-            let value: GlobalTrustedDependencies = serde_json::from_slice(&bytes).map_err(|e| {
-                LpmError::Script(format!(
-                    "{} is malformed: {e}. Delete it to reset the global trust list, \
-                         or fix the JSON manually.",
-                    path.display()
-                ))
-            })?;
-            if value.schema_version > SCHEMA_VERSION {
-                return Err(LpmError::Script(format!(
-                    "{} was written by a newer lpm (schema {}); this binary only understands \
-                     schema up to {}. Upgrade lpm or use a compatible binary.",
-                    path.display(),
-                    value.schema_version,
-                    SCHEMA_VERSION,
-                )));
-            }
-            Ok(value)
-        }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            Ok(GlobalTrustedDependencies::default())
-        }
-        Err(e) => Err(LpmError::Io(e)),
+    // Cap the read before any bytes are buffered. A bloated trust
+    // file collapses to the same "missing state" shape callers
+    // already handle (default empty list, recoverable from the
+    // next `lpm approve-scripts --global` write).
+    let bytes =
+        match lpm_common::read_capped_state_file(path, lpm_common::STATE_FILE_SIZE_CAP_BYTES) {
+            Ok(Some(b)) => b,
+            Ok(None) => return Ok(GlobalTrustedDependencies::default()),
+            Err(e) => return Err(LpmError::Io(e)),
+        };
+    let value: GlobalTrustedDependencies = serde_json::from_slice(&bytes).map_err(|e| {
+        LpmError::Script(format!(
+            "{} is malformed: {e}. Delete it to reset the global trust list, \
+                 or fix the JSON manually.",
+            path.display()
+        ))
+    })?;
+    if value.schema_version > SCHEMA_VERSION {
+        return Err(LpmError::Script(format!(
+            "{} was written by a newer lpm (schema {}); this binary only understands \
+             schema up to {}. Upgrade lpm or use a compatible binary.",
+            path.display(),
+            value.schema_version,
+            SCHEMA_VERSION,
+        )));
     }
+    Ok(value)
 }
 
 /// Write atomically. Serialized body is pretty-printed with a
@@ -303,8 +306,29 @@ pub fn write_at(path: &Path, value: &GlobalTrustedDependencies) -> Result<(), Lp
     let mut body = serde_json::to_string_pretty(value)
         .map_err(|e| LpmError::Script(format!("serialize trusted-deps: {e}")))?;
     body.push('\n');
-    let tmp_path = path.with_extension("json.tmp");
-    fs::write(&tmp_path, body.as_bytes())?;
+    // Per-pid tmp suffix avoids racing concurrent lpm invocations on
+    // the same trust file; the parent .tx.lock serializes the
+    // logical write, but a crashed prior run could leave a stale
+    // `*.json.tmp` and the next start should not be tripped by it.
+    let tmp_path = path.with_extension(format!("json.tmp.{}", std::process::id()));
+    let tmp_path = lpm_common::as_extended_path(&tmp_path);
+    let mut open_opts = fs::OpenOptions::new();
+    open_opts.create(true).write(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        // The file lists private package names/versions plus
+        // approval hashes/provenance and drives lifecycle-script
+        // authorization. Owner-only matches the broader credential-
+        // metadata posture; it must not land world-readable on
+        // permissive umasks.
+        open_opts.mode(0o600);
+    }
+    {
+        let mut f = open_opts.open(&tmp_path).map_err(LpmError::Io)?;
+        f.write_all(body.as_bytes()).map_err(LpmError::Io)?;
+        f.sync_all().map_err(LpmError::Io)?;
+    }
     if let Err(e) = fs::rename(&tmp_path, path) {
         let _ = fs::remove_file(&tmp_path);
         return Err(LpmError::Io(e));
@@ -672,5 +696,64 @@ mod tests {
         );
         let m = gtd.matches_strict("esbuild", "0.25.1", Some("sha512-e"), Some("sha256-s"));
         assert_eq!(m, TrustMatch::Strict);
+    }
+
+    /// A bloated `trusted-dependencies.json` must collapse to the
+    /// default-empty trust list without buffering or parsing the
+    /// payload. Matches the "missing state" fall-through that other
+    /// callers of `read_capped_state_file` rely on.
+    #[test]
+    fn read_over_cap_file_returns_default_empty_trust_list() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join(FILENAME);
+        // Cap is 16 MB; write 17 MB of zeros so the cap fires.
+        let body = vec![
+            b'x';
+            (lpm_common::STATE_FILE_SIZE_CAP_BYTES as usize).saturating_add(1024 * 1024)
+        ];
+        std::fs::write(&path, &body).unwrap();
+        let read = read_at(&path).expect("over-cap must not be an error");
+        assert_eq!(read, GlobalTrustedDependencies::default());
+    }
+
+    /// The trust file lists private package names + approval hashes
+    /// and drives lifecycle-script authorization. Owner-only perms
+    /// keep it from leaking what global packages a user has trusted
+    /// on a shared host.
+    #[cfg(unix)]
+    #[test]
+    fn write_creates_file_with_0o600_perms() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join(FILENAME);
+        let mut gtd = GlobalTrustedDependencies::default();
+        gtd.insert_strict(
+            "x",
+            "1.0.0",
+            Some("sha512-e".into()),
+            Some("sha256-s".into()),
+        );
+        write_at(&path, &gtd).unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "expected 0o600, got 0o{mode:o}");
+    }
+
+    /// Successful writes must not leave a `*.json.tmp.<pid>` straggler
+    /// behind. Pins the rename-then-clean-up contract and guards
+    /// against a future refactor that breaks the same-FS rename arm.
+    #[test]
+    fn write_leaves_no_tempfile_on_success() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join(FILENAME);
+        let mut gtd = GlobalTrustedDependencies::default();
+        gtd.insert_strict("x", "1.0.0", None, None);
+        write_at(&path, &gtd).unwrap();
+        let prefix = format!("{FILENAME}.tmp.");
+        let leaks: Vec<_> = std::fs::read_dir(tmp.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().starts_with(&prefix))
+            .collect();
+        assert!(leaks.is_empty(), "tempfile leaked: {leaks:?}");
     }
 }

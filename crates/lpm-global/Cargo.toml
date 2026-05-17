@@ -8,6 +8,7 @@ description = "Phase 37 — global install state: manifest, WAL, and crash-safe 
 
 [dependencies]
 lpm-common = { workspace = true }
+lpm-lockfile = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 toml = { workspace = true }

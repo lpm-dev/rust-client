@@ -3268,7 +3268,11 @@ mod tests {
                 std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o755)).unwrap();
             }
         }
-        std::fs::write(install_root.join("lpm.lock"), b"# valid").unwrap();
+        std::fs::write(
+            install_root.join("lpm.lock"),
+            lpm_global::MINIMAL_VALID_LOCKFILE_TOML,
+        )
+        .unwrap();
         let marker =
             lpm_global::InstallReadyMarker::new(bins.iter().map(|s| (*s).to_string()).collect());
         lpm_global::write_marker(&install_root, &marker).unwrap();
