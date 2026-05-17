@@ -94,6 +94,19 @@ pub async fn run(
 
     if dry_run {
         emit_dry_run(&plans, json_output);
+        // L46: a `--dry-run` whose planning phase produced any PlanError
+        // must surface as non-zero exit + `"success": false` in JSON.
+        // Pre-fix the dry-run path always returned Ok(()), so CI / agent
+        // callers that checked the exit code or the top-level success
+        // flag treated corrupt manifest rows / registry failures /
+        // malformed saved-spec parses during the diagnostic pass as a
+        // healthy outcome.
+        let any_plan_error = plans
+            .iter()
+            .any(|p| matches!(p, UpgradePlan::PlanError { .. }));
+        if any_plan_error {
+            return Err(LpmError::ExitCode(1));
+        }
         return Ok(());
     }
 
@@ -1104,6 +1117,9 @@ fn rollback_aborted_upgrade(
 // ─── Output ──────────────────────────────────────────────────────────
 
 fn emit_dry_run(plans: &[UpgradePlan], json_output: bool) {
+    let any_plan_error = plans
+        .iter()
+        .any(|p| matches!(p, UpgradePlan::PlanError { .. }));
     if json_output {
         let entries: Vec<_> = plans
             .iter()
@@ -1143,7 +1159,7 @@ fn emit_dry_run(plans: &[UpgradePlan], json_output: bool) {
         println!(
             "{}",
             serde_json::to_string_pretty(&serde_json::json!({
-                "success": true,
+                "success": !any_plan_error,
                 "dry_run": true,
                 "plans": entries,
             }))

@@ -2618,6 +2618,25 @@ async fn async_main() -> Result<()> {
                                 // (Windows AV holding a file) but the
                                 // user should know there's pending
                                 // cleanup. Audit Medium.
+                                //
+                                // L45: ALSO emit via `tracing::warn!` so
+                                // the deferred state lands on stderr as
+                                // a structured event regardless of
+                                // `--json` mode. The stdout JSON
+                                // contract stays single-document (the
+                                // command's own envelope), and
+                                // RUST_LOG-aware automation can detect
+                                // dirty global state without scraping
+                                // human stderr. Matches the M65 / L11
+                                // pattern ("tracing::warn survives
+                                // --json for security-grade signals").
+                                tracing::warn!(
+                                    target: "lpm_cli::global_recovery",
+                                    package = %tx.package,
+                                    tx_id = %tx.tx_id,
+                                    reason = %reason,
+                                    "global recovery deferred — re-run lpm so the next sweep can retry the cleanup",
+                                );
                                 output::warn(&format!(
                                     "global recovery deferred tx for '{}': {}",
                                     lpm_common::sanitize_for_terminal(&tx.package),
@@ -2632,6 +2651,24 @@ async fn async_main() -> Result<()> {
                 // Recovery failure (most often: WAL written by newer
                 // lpm) must NOT silently let the command proceed
                 // against potentially stale state. Surface and abort.
+                //
+                // L44: in `--json` mode, route through the same
+                // `{"success": false, "error", "error_code"}` envelope
+                // that wraps dispatch errors below — otherwise the
+                // recovery path emits a miette/human diagnostic on
+                // stderr and the JSON consumer sees an empty stdout
+                // alongside a non-zero exit, breaking the
+                // `--json contract` exactly when the user most needs to
+                // parse the failure (corrupt / newer WAL, etc.).
+                if cli.json {
+                    let json = serde_json::json!({
+                        "success": false,
+                        "error": format!("{e}"),
+                        "error_code": e.error_code(),
+                    });
+                    println!("{}", serde_json::to_string_pretty(&json).unwrap());
+                    std::process::exit(1);
+                }
                 return Err(e).into_diagnostic();
             }
         }
