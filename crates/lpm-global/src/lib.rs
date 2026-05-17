@@ -37,7 +37,8 @@ pub use shim::{
     EmittedShim, Shim, ShimError, artifacts_complete, emit_shim, expected_artifacts, remove_shim,
 };
 pub use sweep::{
-    SweepFailure, SweepReport, count_pending_tombstones, sweep_tombstones, try_sweep_tombstones,
+    SweepFailure, SweepReport, count_pending_tombstones, sweep_tombstones,
+    try_count_pending_tombstones, try_sweep_tombstones,
 };
 pub use trusted_deps::{
     GlobalTrustedDependencies, TrustMatch as GlobalTrustMatch, TrustedDependencyBinding,

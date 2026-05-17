@@ -672,6 +672,13 @@ impl Store {
     /// Skips:
     /// - Non-directories at the `links/` level (defensive — a stray
     ///   file there isn't a link entry).
+    /// - **Symlinks at the `links/` level.** The store writer never
+    ///   creates symlinks at `links/<entry>`; one appearing here is a
+    ///   tamper / corruption signal that an outside-store path could
+    ///   resolve into the v2 enumeration. Symlinks are refused with a
+    ///   `tracing::warn` so callers (cache prune, rebuild lookup) never
+    ///   see a poisoned entry whose deletion target would resolve
+    ///   outside the store.
     /// - Directories with a missing or malformed sidecar (mid-write
     ///   tmp dirs from a crashed populate, prune leftovers, etc.).
     ///   These get a debug trace; callers see them as absent rather
@@ -701,7 +708,15 @@ impl Store {
         let iter = read_dir.filter_map(|entry| {
             let entry = entry.ok()?;
             let link_dir = entry.path();
-            if !link_dir.is_dir() {
+            let file_type = entry.file_type().ok()?;
+            if file_type.is_symlink() {
+                tracing::warn!(
+                    "v2 store: refusing symlinked link entry at {} (store writer never creates symlinks here; tamper signal)",
+                    link_dir.display()
+                );
+                return None;
+            }
+            if !file_type.is_dir() {
                 return None;
             }
             match LinkMeta::read_from(&link_dir) {
@@ -723,9 +738,11 @@ impl Store {
     /// Unlike [`Self::iter_link_entries`], this surfaces sidecar
     /// read/parse/schema/validation failures as `Err` entries instead
     /// of silently filtering them out — a corrupt sidecar is itself a
-    /// store-integrity problem that `lpm store verify` must report
-    /// (L57). Non-directory children of `links/` are still filtered
-    /// (a stray file isn't a link entry to begin with).
+    /// store-integrity problem that `lpm store verify` must report.
+    /// Non-directory children of `links/` are still filtered (a stray
+    /// file isn't a link entry to begin with), and symlinks at the
+    /// `links/` level surface as a corruption Err so verify reports
+    /// them rather than dereferencing into an outside-store path.
     pub fn iter_link_entries_for_verify(&self) -> Result<Vec<VerifyLinkEntry>, LpmError> {
         let links_root = self.paths.links_root();
         if !links_root.exists() {
@@ -741,7 +758,19 @@ impl Store {
         for entry in read_dir {
             let Ok(entry) = entry else { continue };
             let link_dir = entry.path();
-            if !link_dir.is_dir() {
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
+            if file_type.is_symlink() {
+                out.push((
+                    link_dir,
+                    Err(LpmError::Store(
+                        "v2 link entry is a symlink (store writer never creates symlinks at links/<entry>; refusing to follow into an outside-store path)".to_string(),
+                    )),
+                ));
+                continue;
+            }
+            if !file_type.is_dir() {
                 continue;
             }
             let result = LinkMeta::read_from(&link_dir);
@@ -912,7 +941,15 @@ impl Store {
         let iter = read_dir.filter_map(|entry| {
             let entry = entry.ok()?;
             let object_dir = entry.path();
-            if !object_dir.is_dir() {
+            let file_type = entry.file_type().ok()?;
+            if file_type.is_symlink() {
+                tracing::warn!(
+                    "v2 store: refusing symlinked object entry at {} (store writer never creates symlinks here; tamper signal)",
+                    object_dir.display()
+                );
+                return None;
+            }
+            if !file_type.is_dir() {
                 return None;
             }
             if !object_dir.join(".integrity").is_file() {
@@ -2155,6 +2192,67 @@ mod tests {
         let store = Store::at(dir.path());
         let count = store.iter_link_entries().unwrap().count();
         assert_eq!(count, 0);
+    }
+
+    /// A poisoned link entry shaped as a symlink (e.g. corrupted store,
+    /// hostile same-user writer) must NOT surface in the iterator. The
+    /// store writer never produces symlinks at `links/<entry>`; one
+    /// appearing is a tamper signal that would otherwise cause `cache
+    /// prune --apply` to delete the symlink target (outside the store).
+    #[test]
+    #[cfg(unix)]
+    fn iter_link_entries_refuses_symlinked_entry_at_links_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::at(dir.path());
+
+        let sri = synthetic_sri(b"iter_link_entries/legit");
+        write_object(
+            &store,
+            &sri,
+            &[(
+                "package.json",
+                b"{\"name\":\"legit\",\"version\":\"1.0.0\"}",
+            )],
+        );
+        store
+            .populate_link_entry(LinkEntryRequest {
+                graph_key: arc_key("legit", "1.0.0"),
+                source_sri: sri.clone(),
+                object_dir: store.paths().object_dir(&sri).unwrap(),
+                deps: vec![],
+                platform: Arc::new(sample_meta_platform()),
+            })
+            .unwrap();
+
+        let outside = dir.path().join("outside-of-store");
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(
+            outside.join(".lpm-link-meta.json"),
+            br#"{"schema":1,"name":"poisoned","version":"99.0.0","source_sri":"sha512-x","object_path":"objects/sha512-x","graph_key_digest_hex":"deadbeef","deps":[],"platform":{"os":"darwin","cpu":"arm64"},"last_referenced_at":"2024-01-01T00:00:00Z"}"#,
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(&outside, store.paths().links_root().join("poisoned")).unwrap();
+
+        let names: Vec<String> = store
+            .iter_link_entries()
+            .unwrap()
+            .map(|(_dir, meta)| meta.name)
+            .collect();
+        assert_eq!(
+            names,
+            vec!["legit".to_string()],
+            "symlinked link entry must not surface"
+        );
+
+        let verify_entries = store.iter_link_entries_for_verify().unwrap();
+        let symlink_issue = verify_entries
+            .iter()
+            .find(|(p, _)| p.file_name().and_then(|n| n.to_str()) == Some("poisoned"));
+        let (_, result) = symlink_issue.expect("verify must surface the symlinked entry");
+        assert!(
+            matches!(result, Err(LpmError::Store(msg)) if msg.contains("symlink")),
+            "verify must report the symlinked entry as a store-integrity issue, got {result:?}"
+        );
     }
 
     /// `find_link_package_dir` returns the package dir for a `(name,

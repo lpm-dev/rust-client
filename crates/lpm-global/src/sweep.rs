@@ -101,11 +101,29 @@ pub fn sweep_tombstones(root: &LpmRoot) -> Result<SweepReport, LpmError> {
 /// Count pending tombstones without acquiring the tx lock. Used for
 /// `lpm cache prune` dry-run preview — races are cosmetic (the actual
 /// non-dry-run sweep takes the lock and is authoritative).
+///
+/// Collapses any read/parse failure to `0`, matching the historical
+/// "best-effort dry-run preview" shape. Callers that need to
+/// distinguish "manifest absent / no tombstones" from "manifest exists
+/// but unreadable" should use [`try_count_pending_tombstones`].
 pub fn count_pending_tombstones(root: &LpmRoot) -> usize {
+    try_count_pending_tombstones(root).unwrap_or(0)
+}
+
+/// Count pending tombstones, surfacing read/parse failures as `Err`.
+///
+/// Returns `Ok(0)` when the global manifest file does not exist (no
+/// tombstones have been written yet). Returns `Err` when the manifest
+/// exists but cannot be read or parsed — e.g. corrupted TOML,
+/// future-schema variant, permission denied. The cache-prune emitter
+/// surfaces the `Err` as a distinct `tombstone_count_error` field so
+/// JSON consumers can tell "no tombstones" apart from "could not
+/// inspect tombstones" (L53).
+pub fn try_count_pending_tombstones(root: &LpmRoot) -> Result<usize, LpmError> {
     if !root.global_manifest().exists() {
-        return 0;
+        return Ok(0);
     }
-    read_for(root).map(|m| m.tombstones.len()).unwrap_or(0)
+    Ok(read_for(root)?.tombstones.len())
 }
 
 fn sweep_under_lock(root: &LpmRoot) -> Result<SweepReport, LpmError> {
@@ -381,6 +399,28 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let root = LpmRoot::from_dir(tmp.path());
         assert_eq!(count_pending_tombstones(&root), 0);
+    }
+
+    #[test]
+    fn try_count_pending_tombstones_returns_ok_zero_when_no_manifest() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = LpmRoot::from_dir(tmp.path());
+        assert_eq!(try_count_pending_tombstones(&root).unwrap(), 0);
+    }
+
+    #[test]
+    fn try_count_pending_tombstones_returns_err_when_manifest_is_corrupt() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = LpmRoot::from_dir(tmp.path());
+        std::fs::create_dir_all(root.global_root()).unwrap();
+        std::fs::write(root.global_manifest(), b"@@@ not toml @@@").unwrap();
+        let err = try_count_pending_tombstones(&root)
+            .expect_err("corrupt TOML must propagate as Err so cache prune can surface it");
+        let msg = err.to_string().to_lowercase();
+        assert!(
+            msg.contains("manifest") || msg.contains("toml"),
+            "error must describe the parse failure, got: {err}"
+        );
     }
 
     #[test]
