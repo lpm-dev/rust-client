@@ -177,6 +177,15 @@ fn store_wrapping_key_in_file(key: &[u8; 32]) -> Result<(), String> {
 ///
 /// Kept only for migration — old vaults may have keys wrapped with this.
 /// New code should use [`get_or_create_wrapping_key`] instead.
+///
+/// M12: this derivation has no forward secrecy. A stale bearer token
+/// captured by any side channel (process argv, log scrape, keychain
+/// leak) decrypts every pre-migration vault blob that bearer ever
+/// wrapped. The migration path in [`decrypt_vault_from_sync`] re-
+/// encrypts under the stored wrapping key on next push, but until
+/// that push runs the legacy blob remains decryptable. Operators
+/// should rotate any stored bearer that has been observed by other
+/// processes and re-push the vault.
 pub fn derive_legacy_wrapping_key(auth_token: &str) -> [u8; 32] {
     let mut hasher = Sha256::new();
     hasher.update(b"lpm-vault-wrap:");
@@ -303,8 +312,15 @@ pub fn decrypt_vault_from_sync(
     let plaintext = decrypt(&aes_key, encrypted_blob)?;
     let text = String::from_utf8(plaintext).map_err(|e| format!("utf8 error: {e}"))?;
 
-    tracing::info!(
-        "vault decrypted with legacy key — re-encrypting under stored key (caller pushes back)"
+    // M12: a legacy decryption succeeded — the blob was wrapped with
+    // SHA256("lpm-vault-wrap:" + auth_token), which has no forward
+    // secrecy. Surface the posture loudly so an operator scanning
+    // logs sees the migration window and rotates the bearer if it
+    // has been exposed anywhere (process argv pre-H4, CI log leak,
+    // backup), in addition to the implicit re-encrypt that happens
+    // on the next push.
+    tracing::warn!(
+        "vault decrypted with legacy token-derived key (no forward secrecy) — re-encrypting under stored key on next push. If the bearer that decrypted this blob has been exposed to other processes / logs / backups, rotate it before any peer can capture the same blob.",
     );
 
     Ok(DecryptResult {

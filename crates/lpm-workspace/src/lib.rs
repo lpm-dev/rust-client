@@ -1670,6 +1670,7 @@ pub fn discover_workspace(start_dir: &Path) -> Result<Option<Workspace>, Workspa
 
             if let Some(globs) = globs {
                 let members = discover_members(&current, &globs)?;
+                warn_on_member_catalogs(&members);
                 let workspace = Workspace {
                     root: current.clone(),
                     root_package,
@@ -1852,6 +1853,28 @@ fn validate_workspace_glob(pattern: &str) -> Result<(), WorkspaceError> {
         }
     }
     Ok(())
+}
+
+/// M13: emit a `tracing::warn` for every workspace member whose
+/// `package.json` declares its own `catalogs` field. The install
+/// pipeline only honours `root_package.catalogs`; member-level
+/// catalogs are silently ignored today. The data shape allows them
+/// because `PackageJson::catalogs` is a single field shared by both
+/// root and members, so a future routing-bug or refactor could start
+/// resolving per-member with no surface signal that the source was
+/// authored as if it were active. The warn surfaces the silent-drop
+/// at discovery time so a malicious / mistaken member-level catalog
+/// is visible in operator logs before any resolve runs.
+fn warn_on_member_catalogs(members: &[WorkspaceMember]) {
+    for member in members {
+        if !member.package.catalogs.is_empty() {
+            tracing::warn!(
+                member_path = %member.path.display(),
+                catalog_count = member.package.catalogs.len(),
+                "workspace member declares its own `catalogs` field — silently ignored by the resolver. Only the root package's `catalogs` are honoured (M13). Move the entries to the root package.json or remove the field to silence this warning.",
+            );
+        }
+    }
 }
 
 /// Discover workspace member packages matching the given glob patterns.
@@ -3190,6 +3213,48 @@ mod tests {
         assert!(
             msg.contains("'..'") || msg.contains("absolute"),
             "discover_workspace must refuse parent-dir glob: {msg}"
+        );
+    }
+
+    /// M13: a workspace member that declares its own `catalogs` field
+    /// in its package.json must not crash discovery — but the resolver
+    /// only honours root-level catalogs, so the silent-drop posture is
+    /// surfaced via a `tracing::warn` from `warn_on_member_catalogs`
+    /// at discovery time. The structural assertion here is that
+    /// discovery still succeeds (the warn path doesn't panic and the
+    /// member is still loaded). The visibility leg of the fix is the
+    /// warn itself, which is exercised in operator logs.
+    #[test]
+    fn discover_workspace_admits_member_with_unused_catalogs_field() {
+        let dir = tempfile::tempdir().unwrap();
+        create_package_json(
+            dir.path(),
+            r#"{
+                "name": "root-with-member-catalog",
+                "workspaces": ["packages/*"]
+            }"#,
+        );
+        let member_dir = dir.path().join("packages/widget");
+        std::fs::create_dir_all(&member_dir).unwrap();
+        create_package_json(
+            &member_dir,
+            r#"{
+                "name": "widget",
+                "version": "1.0.0",
+                "catalogs": {
+                    "default": { "react": "^18.0.0" }
+                }
+            }"#,
+        );
+        let ws = discover_workspace(dir.path())
+            .expect("discovery must not fail when a member has catalogs")
+            .expect("workspace must still be discovered");
+        assert_eq!(ws.members.len(), 1);
+        assert_eq!(ws.members[0].package.name.as_deref(), Some("widget"));
+        assert_eq!(
+            ws.members[0].package.catalogs.len(),
+            1,
+            "the member's catalogs field is still loaded into the struct (the warn surfaces the ignored-by-resolver posture, it does not strip the data)"
         );
     }
 }

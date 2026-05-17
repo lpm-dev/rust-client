@@ -36,6 +36,44 @@
 //!   harness keeps `dns_failure_seen` as a separate soft axis
 //!   for this reason.
 //!
+//! # Accepted-posture trade-off (M63)
+//!
+//! The default action is [`SeccompAction::Allow`], so every syscall
+//! that is not `socket(2)` passes through this filter untouched. That
+//! includes a number of in-sandbox primitives an approved script
+//! could chain into sandbox-escape or lateral-movement attempts:
+//!
+//! - `ptrace(2)` — could attach to a peer `lpm-rs` subprocess that
+//!   holds vault unlock state or a session bearer in memory.
+//! - `personality(2)` (`0xffffffff`) — disables ASLR for the child.
+//! - `unshare(2)` (`CLONE_NEWUSER | CLONE_NEWNS`) — enters a user
+//!   namespace where the script is "root" inside the namespace.
+//!   landlock V4 attaches to the new namespace's view, but the
+//!   attack surface widens (capabilities, mount manipulation).
+//! - `keyctl(2)` / `add_key(2)` — could manipulate the per-user
+//!   keyring.
+//! - `bpf(2)` (`BPF_PROG_LOAD`) combined with user-ns.
+//! - `io_uring_setup(2)` — landlock awareness was only added in
+//!   kernel ≥ 6.10; older kernels with `io_uring` give the script
+//!   a filesystem I/O channel outside this filter's view.
+//!
+//! `PR_SET_NO_NEW_PRIVS` (issued by `seccompiler::apply_filter`)
+//! blocks setuid escalation but NOT any of the above. The runtime
+//! defenses are: (a) the script approval gate, which any of these
+//! would require to reach the child in the first place; (b)
+//! landlock V4 filesystem rules and network containment, which still
+//! deny non-allow-listed paths and outbound TCP regardless of what
+//! the script does after a successful `unshare` / `ptrace`; (c) the
+//! `pre_exec` install order — landlock + seccomp install before
+//! `execve`, so the script can't strip them.
+//!
+//! A future hardening pass could turn this filter into a full
+//! deny-by-default seccomp profile (allowlist of "known-good"
+//! syscalls), but the deny-everything default would need a per-
+//! Node-major-version syscall inventory to avoid breaking legitimate
+//! lifecycle scripts. Tracked as accepted-posture in
+//! `private/security-findings.md` under M63.
+//!
 //! # Async-signal safety
 //!
 //! Filter compilation in [`build_socket_deny_filter`] happens

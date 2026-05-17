@@ -80,6 +80,20 @@
 //!   reported ≥ 6.7 but landlock itself isn't reachable (LSM
 //!   disabled, etc.) — we surface [`SandboxError::KernelTooOld`]
 //!   with `required: "6.7"`.
+//!
+//!   **Accepted-posture trade-off (H14):** the AF_UNIX carve-out is
+//!   asymmetric with macOS strict (Seatbelt denies every socket
+//!   family). systemd-resolved over the UNIX socket continues to
+//!   resolve from inside the sandbox, and `$SSH_AUTH_SOCK` —
+//!   typically under `/tmp` which is in the read+write allow-list —
+//!   remains reachable. Narrowing to "AF_UNIX only for fd-passing
+//!   inherited from parent" would need a per-syscall socketpair gate
+//!   that landlock+seccomp don't currently offer; the runtime defense
+//!   is the network-containment + project-output-containment posture
+//!   limiting what an in-sandbox AF_UNIX consumer can exfiltrate. A
+//!   later mitigation handle is `[sandbox] unix-socket-denylist`
+//!   listing well-known agent sockets, but it requires per-distro
+//!   path inventory and isn't shipped today.
 //! - **Degraded** (kernel < 6.7 AND `allow_degraded = true`): probe
 //!   landlock at ABI V1 (filesystem-only). The construction-side
 //!   succeeds when V1 is reachable; the install pipeline emits the

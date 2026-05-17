@@ -431,7 +431,24 @@ async fn verify_checksum(
             ))
         })?;
 
-    compare_checksum(expected_hash, data)
+    compare_checksum(expected_hash, data)?;
+
+    // M20: surface the trust posture on every successful verify.
+    // SHASUMS256.txt is fetched over HTTPS from nodejs.org but the
+    // detached `.sig` GPG signature is NOT verified, so a CA-trusted
+    // MITM (corporate proxy, mis-issued cert) or a mirror operator
+    // can swap both `node-*.tar.gz` AND `SHASUMS256.txt` in lockstep
+    // and the hash compare would still pass. Trust is anchored on
+    // nodejs.org TLS only — there is no second leg of verification.
+    // Operators on hardened CI can pin the expected Node version
+    // ahead of time and refuse to install unfamiliar major versions.
+    tracing::warn!(
+        target: "lpm_runtime::download",
+        url = %shasums_url,
+        "Node runtime SHASUMS256 verified via upstream HTTPS only — no GPG signature check (M20). Trust is anchored on nodejs.org TLS; a CA-trusted MITM or mirror operator can substitute the asset + checksum together.",
+    );
+
+    Ok(())
 }
 
 #[cfg(test)]
