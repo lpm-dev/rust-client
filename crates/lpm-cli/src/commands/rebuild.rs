@@ -732,17 +732,42 @@ async fn run_under_store_lock(
     let sanitized_env = if scrub_env {
         build_sanitized_env()
     } else {
+        // L29: when sandbox is disabled, also emit via tracing::warn
+        // so the security signal survives `--json` mode. Surfaces a
+        // CI-aware hint when `CI=true` or `GITHUB_ACTIONS=true` is
+        // set — CI pipelines that ended up at no-sandbox are almost
+        // always a misconfiguration; the hint nudges operators to
+        // gate sandbox loosening behind an explicit policy knob
+        // rather than discovering it post-incident.
+        tracing::warn!(
+            target: "lpm_cli::sandbox",
+            "sandbox disabled — credential env vars will NOT be stripped and scripts run \
+             WITHOUT filesystem / network containment."
+        );
+        let in_ci = std::env::var("CI").map(|v| !v.is_empty()).unwrap_or(false)
+            || std::env::var("GITHUB_ACTIONS")
+                .map(|v| !v.is_empty())
+                .unwrap_or(false);
+        if in_ci {
+            tracing::warn!(
+                target: "lpm_cli::sandbox",
+                "CI environment detected with sandbox disabled — review whether \
+                 `--no-sandbox` / `[sandbox] mode = \"none\"` is intentional. \
+                 Recommended: leave the default (strict via `LPM_STRICT_SANDBOX=1`) \
+                 and gate any opt-out behind a CI-specific job that explicitly sets it."
+            );
+        }
         if !json_output {
-            // Word the warning so it covers BOTH provenance paths
-            // (CLI escape OR persistent `mode = "none"`) without
-            // claiming the source. The `Source:` line on doctor /
-            // help is the right place for provenance; this is the
-            // "loud banner at the call site" the SandboxMode docs
-            // already promise.
             output::warn(
                 "sandbox disabled: credential env vars will NOT be stripped and scripts run \
                  WITHOUT filesystem / network containment.",
             );
+            if in_ci {
+                output::warn(
+                    "CI environment detected with sandbox disabled — confirm this is intentional. \
+                     The default (containment ON) is the safer posture for CI.",
+                );
+            }
         }
         std::env::vars().collect::<HashMap<String, String>>()
     };

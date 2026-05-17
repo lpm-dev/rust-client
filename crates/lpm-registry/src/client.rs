@@ -2694,6 +2694,27 @@ impl RegistryClient {
 
     /// Streaming variant of [`Self::download_tarball_routed`]. Same
     /// Custom-vs-non-Custom split.
+    ///
+    /// M66: for the non-Custom path (LpmWorker / NpmDirect), the
+    /// fresh `dist.tarball` URL's origin is verified against
+    /// `is_configured_origin` before the body is read. Pre-fix, no
+    /// origin gate applied to fresh URLs — a freshly-fetched metadata
+    /// response from a compromised mirror could point `dist.tarball`
+    /// at `https://evil.cdn/<pkg>.tgz` and pass the pipeline-level
+    /// scheme check unchallenged. The shape check (`/-/` + `.tgz`)
+    /// that `evaluate_cached_url` applies to LOCKFILE-cached URLs is
+    /// intentionally NOT applied here: a fresh packument from the
+    /// configured registry is allowed to use any path shape the
+    /// registry serves (some private registries and test mocks use
+    /// flat `/tarballs/<name>-<ver>.tgz` instead of npm's canonical
+    /// `/<pkg>/-/<pkg>-<ver>.tgz`). The origin check alone defends
+    /// against the M66 mirror-redirect shape.
+    ///
+    /// The Custom route path is exempt because its npmrc-declared
+    /// target origin is intentionally outside the `(base_url,
+    /// npm_registry_url)` pair `is_configured_origin` knows about;
+    /// the H2 auth-mismatch gate on `apply_npmrc_auth` already
+    /// enforces destination/credential parity for that flow.
     pub async fn download_tarball_streaming_routed(
         &self,
         route_table: &crate::route::RouteTable,
@@ -2707,6 +2728,12 @@ impl RegistryClient {
             let auth = route_table.auth_for_url(url);
             self.download_tarball_streaming_with_auth(url, auth).await
         } else {
+            if !self.is_configured_origin(url) {
+                return Err(LpmError::Registry(format!(
+                    "tarball URL refused — fresh dist.tarball origin is not in the configured \
+                     set (likely poisoned mirror or metadata tamper): {url}"
+                )));
+            }
             self.download_tarball_streaming(url).await
         }
     }

@@ -235,8 +235,24 @@ impl LpmRoot {
     /// The install root for a specific `(name, version)` pair, under
     /// `global/installs/`. Name is sanitized: `@scope/pkg` becomes
     /// `@scope+pkg`, matching existing `lpm-store` conventions.
+    ///
+    /// M50: also normalises `\` to `+` on every platform. Pre-fix
+    /// Windows treated `\` as a path separator, so a registry- or
+    /// spec-supplied name like `..\\..\\target` would land
+    /// `~/.lpm/global/installs/..\\..\\target@1.0.0/`, which the OS
+    /// would interpret as `~/.lpm/global/target@1.0.0/` after parent
+    /// traversal — outside the intended directory. Sanitising the
+    /// backslash on all platforms keeps Unix and Windows behaviour
+    /// in lockstep and removes the platform-specific escape.
+    /// Null bytes and traversal segments are also collapsed; the
+    /// caller is expected to have validated the name via
+    /// `PackageName`, but this is the last line of defence for the
+    /// pre-tombstone create/write/rollback path.
     pub fn install_root_for(&self, name: &str, version: &str) -> PathBuf {
-        let safe_name = name.replace('/', "+");
+        let safe_name = name
+            .replace('\0', "")
+            .replace("..", "_")
+            .replace(['/', '\\'], "+");
         self.global_installs()
             .join(format!("{safe_name}@{version}"))
     }
@@ -1032,6 +1048,39 @@ mod tests {
         let tail = p.file_name().unwrap().to_string_lossy();
         assert_eq!(tail, "@lpm.dev+owner.tool@1.2.0");
         assert!(!tail.contains('/'));
+    }
+
+    /// M50: backslashes are sanitised to `+` on every platform — not
+    /// just `/`. Pre-fix, Windows treated `\` as a path separator, so
+    /// a registry- or spec-supplied name like `..\\..\\target` would
+    /// escape the installs dir. Same posture on Unix (defence in depth
+    /// — backslash isn't a separator there but normalising keeps the
+    /// behaviour consistent).
+    #[test]
+    fn install_root_for_neutralises_windows_backslashes() {
+        let root = LpmRoot::from_dir("/tmp/lpm-test");
+        let p = root.install_root_for("evil\\..\\target", "1.0.0");
+        let tail = p.file_name().unwrap().to_string_lossy();
+        assert!(!tail.contains('\\'), "backslash must be sanitised: {tail}");
+        // The `..` substring collapses to `_` so the directory name
+        // can't be re-interpreted as a parent-traversal by the OS.
+        assert!(
+            !tail.contains(".."),
+            "parent-traversal segment must collapse: {tail}"
+        );
+    }
+
+    /// M50: null bytes in the name are stripped before path
+    /// composition. The pre-fix path could pass `\0` into
+    /// `PathBuf::join`, where Unix would happily build a path
+    /// containing the byte (which downstream POSIX syscalls might
+    /// then truncate at).
+    #[test]
+    fn install_root_for_strips_null_bytes() {
+        let root = LpmRoot::from_dir("/tmp/lpm-test");
+        let p = root.install_root_for("name\0evil", "1.0.0");
+        let tail = p.file_name().unwrap().to_string_lossy();
+        assert!(!tail.contains('\0'), "null byte must be stripped: {tail}");
     }
 
     #[test]
