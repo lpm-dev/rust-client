@@ -112,6 +112,82 @@ impl DriftIgnorePolicy {
     }
 }
 
+/// Rollout knob for the install-time and approve-time provenance
+/// verifier (Phase 2.2.b).
+///
+/// Read from the `LPM_PROVENANCE_ENFORCE` environment variable.
+/// Default is `Deny` (fail-closed). The `Warn` variant exists for
+/// the Phase 2.3 two-release rollout window: operators can ship the
+/// verifier code in warn mode for one release so a bundle-shape
+/// change at the registry surfaces as a loud log line rather than a
+/// blocked install, then flip the default to deny on the next
+/// release once telemetry confirms no spurious rejections.
+///
+/// The knob is honored by the **approval-capture path**
+/// ([`crate::commands::approve_scripts::snapshot_for_binding_with_mode`]).
+/// The install-time drift gate at `commands/install.rs` already
+/// propagates `Err(LpmError::ProvenanceVerification)` via `?` and
+/// is not gated by this knob — install-time rejection always blocks
+/// (the drift gate has its own per-package opt-out via
+/// `--ignore-provenance-drift[-all]`). This split matches Phase 2.5
+/// where the operator-facing persistent toggle is documented to
+/// affect the binding-record posture during approve-scripts.
+///
+/// Phase 2.5 will promote this enum to the orthogonal
+/// `EnforceMode` × `SkipPolicy` shape (with a third `Off` mode and
+/// the config + wizard surface). This commit ships only the
+/// rollout-knob posture; the persistent operator toggle is a
+/// follow-up.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum EnforceMode {
+    /// Fail-closed: a verifier rejection refuses the approval.
+    /// Production default starting with Phase 2.2.
+    #[default]
+    Deny,
+    /// Rollout-window posture: a verifier rejection logs loudly via
+    /// `output::warn` + `tracing::warn` but does not block the
+    /// approval. The trust binding's `provenance_at_approval` is
+    /// recorded as `None` — same effect as a transport-degraded
+    /// fetch during the approval window. Subsequent installs treat
+    /// the package as "no provenance reference" until re-approved
+    /// under `Deny` mode. Operators who set this MUST monitor the
+    /// warn log line and either remediate the registry compromise
+    /// or re-approve once the verifier accepts the bundle.
+    Warn,
+}
+
+impl EnforceMode {
+    /// Read the mode from `LPM_PROVENANCE_ENFORCE`.
+    ///
+    /// Default is `Deny`. Unknown values fall back to `Deny`
+    /// (fail-closed) with a `tracing::warn` so a typo in the env
+    /// var doesn't silently weaken the posture.
+    pub fn from_env() -> Self {
+        Self::from_env_value(std::env::var("LPM_PROVENANCE_ENFORCE").ok().as_deref())
+    }
+
+    /// Pure parser exposed for unit tests so they don't have to
+    /// mutate process-global env state. Production callers should
+    /// use [`Self::from_env`].
+    pub(crate) fn from_env_value(value: Option<&str>) -> Self {
+        match value {
+            // `unset` is explicitly mapped to `Deny` so a user who
+            // never set the var gets the safe default.
+            None => Self::Deny,
+            Some("warn") => Self::Warn,
+            Some("deny") => Self::Deny,
+            Some(other) => {
+                tracing::warn!(
+                    target = "lpm::provenance",
+                    value = %other,
+                    "ignoring unknown LPM_PROVENANCE_ENFORCE value (expected 'warn' or 'deny'); using fail-closed default"
+                );
+                Self::Deny
+            }
+        }
+    }
+}
+
 /// 7-day TTL per the plan.
 const CACHE_TTL_SECS: u64 = 7 * 24 * 60 * 60;
 
@@ -2098,5 +2174,48 @@ mod tests {
             "non-verification errors degrade (the typed-error contract is for the single-package \
              fetcher's `?`-propagation path, not the batch caller)",
         );
+    }
+
+    // ── EnforceMode env-var parsing (Phase 2.2.b rollout knob) ──────
+
+    /// Unset env → fail-closed default. This is the production
+    /// posture for users who never touch `LPM_PROVENANCE_ENFORCE`.
+    #[test]
+    fn enforce_mode_from_env_unset_is_deny() {
+        assert_eq!(EnforceMode::from_env_value(None), EnforceMode::Deny);
+    }
+
+    /// `LPM_PROVENANCE_ENFORCE=warn` → `Warn` (the rollout-window
+    /// posture). Approval-capture path logs + records None instead
+    /// of refusing.
+    #[test]
+    fn enforce_mode_from_env_warn_is_warn() {
+        assert_eq!(EnforceMode::from_env_value(Some("warn")), EnforceMode::Warn);
+    }
+
+    /// `LPM_PROVENANCE_ENFORCE=deny` → `Deny` (explicit). Same as
+    /// unset, but operators sometimes set this defensively in
+    /// CI/CD env so they can `grep` for the policy.
+    #[test]
+    fn enforce_mode_from_env_explicit_deny_is_deny() {
+        assert_eq!(EnforceMode::from_env_value(Some("deny")), EnforceMode::Deny);
+    }
+
+    /// Unknown values (typo, future-mode-from-2.5 like `"off"`, etc.)
+    /// must fall back to `Deny` so a misconfiguration NEVER silently
+    /// weakens the posture. A `tracing::warn` surfaces the
+    /// fallback; we don't assert on that here (the tracing
+    /// subscriber would need to be wired up), but the fail-closed
+    /// behavior is the load-bearing guarantee.
+    #[test]
+    fn enforce_mode_from_env_unknown_value_falls_back_to_deny() {
+        assert_eq!(
+            EnforceMode::from_env_value(Some("off")),
+            EnforceMode::Deny,
+            "unknown values must fail-closed to Deny — never silently weaken the posture",
+        );
+        assert_eq!(EnforceMode::from_env_value(Some("DENY")), EnforceMode::Deny);
+        assert_eq!(EnforceMode::from_env_value(Some("typo")), EnforceMode::Deny);
+        assert_eq!(EnforceMode::from_env_value(Some("")), EnforceMode::Deny);
     }
 }

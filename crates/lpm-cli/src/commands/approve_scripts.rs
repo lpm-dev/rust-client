@@ -115,27 +115,85 @@ async fn fetch_provenance_for_effective_set(
 }
 
 /// Resolve the `provenance_at_approval` value for one `(name, version)`
-/// pair from a batch [`ProvenanceStatus`] map, refusing approval on
-/// `VerificationRejected`.
+/// pair from a batch [`ProvenanceStatus`] map, honoring the operator's
+/// `LPM_PROVENANCE_ENFORCE` setting (Phase 2.2.b rollout knob).
 ///
 /// This is the project- and global-scope approval-capture hook that
 /// closes the SILENT-DROP attack window: a previous `.ok().flatten()`
 /// pattern collapsed verifier rejections into `None`, which the next
 /// install's drift comparator treated as "first observation" via its
-/// `(None, _) => NoDrift` arm. Routing through
-/// [`ProvenanceStatus::into_snapshot_for_binding`] propagates the
-/// typed error so the caller's `?` surfaces an actionable
-/// `LpmError::ProvenanceVerification` and the read-modify-write loop
-/// does NOT overwrite any prior trust binding.
+/// `(None, _) => NoDrift` arm.
+///
+/// Behavior under each [`EnforceMode`]:
+///
+/// - `Deny` (default): a `VerificationRejected` status returns
+///   `Err(LpmError::ProvenanceVerification(...))` and the caller's
+///   `?` short-circuits before any trust-store mutation. Prior
+///   binding stays intact.
+/// - `Warn`: a `VerificationRejected` status emits `tracing::warn` +
+///   `output::warn` (loud, named, with the verifier reason) and
+///   returns `Ok(None)`. The caller's read-modify-write proceeds,
+///   recording `provenance_at_approval: None` — same effect as a
+///   transport-degraded fetch during the approval window. This is
+///   the Phase 2.3 rollout-window posture; operators MUST monitor
+///   the warn line.
+///
+/// Non-rejection statuses (`Verified`, `Absent`, `TransportDegraded`)
+/// project identically under both modes — the mode only affects the
+/// rejection arm.
 fn snapshot_for_binding(
     provenance_by_pkg: &HashMap<(String, String), ProvenanceStatus>,
     name: &str,
     version: &str,
 ) -> Result<Option<ProvenanceSnapshot>, LpmError> {
-    match provenance_by_pkg.get(&(name.to_string(), version.to_string())) {
-        Some(status) => status.clone().into_snapshot_for_binding(name, version),
-        None => Ok(None),
+    snapshot_for_binding_with_mode(
+        provenance_by_pkg,
+        name,
+        version,
+        crate::provenance_fetch::EnforceMode::from_env(),
+    )
+}
+
+/// Pure variant of [`snapshot_for_binding`] that takes the
+/// [`EnforceMode`] explicitly, for unit tests that don't want to
+/// mutate process-global env state.
+fn snapshot_for_binding_with_mode(
+    provenance_by_pkg: &HashMap<(String, String), ProvenanceStatus>,
+    name: &str,
+    version: &str,
+    mode: crate::provenance_fetch::EnforceMode,
+) -> Result<Option<ProvenanceSnapshot>, LpmError> {
+    let status = match provenance_by_pkg.get(&(name.to_string(), version.to_string())) {
+        Some(s) => s.clone(),
+        None => return Ok(None),
+    };
+
+    // Warn-mode short-circuit: VerificationRejected logs loudly but
+    // does NOT propagate as Err, so the approval proceeds and the
+    // binding records `provenance_at_approval: None`. Every other
+    // status falls through to the default projection (Deny mode
+    // semantics — VerificationRejected returns Err there).
+    if let ProvenanceStatus::VerificationRejected { reason } = &status
+        && matches!(mode, crate::provenance_fetch::EnforceMode::Warn)
+    {
+        tracing::warn!(
+            target = "lpm::provenance",
+            pkg = %name,
+            version = %version,
+            reason = %reason,
+            enforce_mode = "warn",
+            "verifier rejected provenance bundle but LPM_PROVENANCE_ENFORCE=warn — recording approval with no provenance reference; subsequent installs will treat this as a degraded state"
+        );
+        crate::output::warn(&format!(
+            "provenance verification FAILED for {name}@{version}: {reason}\n  \
+             LPM_PROVENANCE_ENFORCE=warn — approval proceeds; the trust binding \
+             records no verified identity. Re-run with LPM_PROVENANCE_ENFORCE=deny \
+             (default) to refuse, or remediate the underlying bundle and re-approve."
+        ));
+        return Ok(None);
     }
+
+    status.into_snapshot_for_binding(name, version)
 }
 
 /// Stable schema version for the `--json` output. Bump on any breaking
@@ -2583,9 +2641,124 @@ fn print_aggregate_card(row: &crate::global_blocked_set::AggregateBlockedRow) {
 mod tests {
     use super::*;
     use crate::build_state::{BUILD_STATE_VERSION, BlockedPackage, BuildState};
+    use crate::provenance_fetch::EnforceMode;
     use lpm_workspace::TrustedDependencyBinding;
     use std::fs;
     use tempfile::tempdir;
+
+    // ── snapshot_for_binding_with_mode (Phase 2.2.b rollout knob) ───
+
+    fn verified_status() -> ProvenanceStatus {
+        ProvenanceStatus::Verified(ProvenanceSnapshot {
+            present: true,
+            publisher: Some("github:axios/axios".into()),
+            workflow_path: Some(".github/workflows/publish.yml".into()),
+            workflow_ref: Some("refs/tags/v1.14.0".into()),
+            attestation_cert_sha256: Some("sha256-leaf-aaa".into()),
+        })
+    }
+
+    fn map_with(name: &str, version: &str, status: ProvenanceStatus) -> HashMap<(String, String), ProvenanceStatus> {
+        let mut m = HashMap::new();
+        m.insert((name.to_string(), version.to_string()), status);
+        m
+    }
+
+    /// Verified bundles project identically under both modes — the
+    /// mode only gates the rejection arm.
+    #[test]
+    fn snapshot_for_binding_verified_projects_under_both_modes() {
+        let map = map_with("axios", "1.14.0", verified_status());
+        let deny = snapshot_for_binding_with_mode(&map, "axios", "1.14.0", EnforceMode::Deny)
+            .expect("Verified must succeed under Deny");
+        let warn = snapshot_for_binding_with_mode(&map, "axios", "1.14.0", EnforceMode::Warn)
+            .expect("Verified must succeed under Warn");
+        assert_eq!(deny, warn);
+        assert!(deny.is_some());
+    }
+
+    /// Under `Deny` (default production posture), a
+    /// `VerificationRejected` status returns
+    /// `Err(LpmError::ProvenanceVerification(_))` so the caller's
+    /// `?` short-circuits the approval. The prior trust binding (if
+    /// any) is preserved by the caller's read-modify-write NOT
+    /// executing.
+    #[test]
+    fn snapshot_for_binding_deny_refuses_on_verification_rejected() {
+        let map = map_with(
+            "axios",
+            "1.14.1",
+            ProvenanceStatus::VerificationRejected {
+                reason: "DSSE signature mismatch".into(),
+            },
+        );
+        let err = snapshot_for_binding_with_mode(&map, "axios", "1.14.1", EnforceMode::Deny)
+            .expect_err("Deny mode must refuse on VerificationRejected");
+        assert!(matches!(err, LpmError::ProvenanceVerification(_)));
+        let msg = err.to_string();
+        assert!(
+            msg.contains("axios") && msg.contains("1.14.1"),
+            "error must name the package + version, got: {msg}",
+        );
+        assert!(
+            msg.contains("DSSE signature mismatch"),
+            "underlying verifier reason must propagate, got: {msg}",
+        );
+    }
+
+    /// Under `Warn` (rollout-window posture), a
+    /// `VerificationRejected` status returns `Ok(None)` so the
+    /// approval proceeds and the binding records
+    /// `provenance_at_approval: None`. The loud `tracing::warn` +
+    /// `output::warn` lines are the operator-monitoring contract.
+    #[test]
+    fn snapshot_for_binding_warn_returns_none_on_verification_rejected() {
+        let map = map_with(
+            "axios",
+            "1.14.1",
+            ProvenanceStatus::VerificationRejected {
+                reason: "Rekor SET verification failed".into(),
+            },
+        );
+        let result = snapshot_for_binding_with_mode(&map, "axios", "1.14.1", EnforceMode::Warn)
+            .expect("Warn mode must allow the approval through");
+        assert!(
+            result.is_none(),
+            "Warn mode records None (no verified identity) — the loud warn log is the operator contract",
+        );
+    }
+
+    /// `Absent` and `TransportDegraded` are unchanged by the mode —
+    /// they're not attack signals, so the rollout knob doesn't gate
+    /// them.
+    #[test]
+    fn snapshot_for_binding_non_rejection_statuses_ignore_mode() {
+        let absent_map = map_with("pkg", "1.0.0", ProvenanceStatus::Absent);
+        let transport_map = map_with("pkg", "1.0.0", ProvenanceStatus::TransportDegraded);
+        for mode in [EnforceMode::Deny, EnforceMode::Warn] {
+            let absent = snapshot_for_binding_with_mode(&absent_map, "pkg", "1.0.0", mode)
+                .expect("Absent must project under both modes");
+            let snap = absent.expect("Absent projects to Some(present:false)");
+            assert!(!snap.present);
+
+            let transport = snapshot_for_binding_with_mode(&transport_map, "pkg", "1.0.0", mode)
+                .expect("TransportDegraded must project under both modes");
+            assert!(transport.is_none());
+        }
+    }
+
+    /// A package missing from the batch map projects to `Ok(None)`
+    /// under both modes — same as the pre-rollout shape. The mode
+    /// only gates statuses that are present in the map.
+    #[test]
+    fn snapshot_for_binding_missing_pkg_projects_to_none_under_both_modes() {
+        let map: HashMap<(String, String), ProvenanceStatus> = HashMap::new();
+        for mode in [EnforceMode::Deny, EnforceMode::Warn] {
+            let r = snapshot_for_binding_with_mode(&map, "pkg", "1.0.0", mode)
+                .expect("missing pkg projects to Ok(None) regardless of mode");
+            assert!(r.is_none());
+        }
+    }
 
     fn write_manifest(path: &Path, value: &serde_json::Value) {
         fs::write(path, serde_json::to_string_pretty(value).unwrap()).unwrap();
