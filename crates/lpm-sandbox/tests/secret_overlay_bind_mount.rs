@@ -25,44 +25,125 @@ use lpm_sandbox::{
 };
 use std::path::PathBuf;
 
-/// Returns true iff `unshare(CLONE_NEWUSER | CLONE_NEWNS)` succeeds
-/// from THIS process's binary identity. Hardened distros (Debian
-/// with `kernel.unprivileged_userns_clone=0`, container runtimes
-/// without `--privileged`) refuse the syscall outright. Ubuntu
-/// 24.04 ships an AppArmor `unprivileged_userns` profile that
-/// further restricts the syscall to binaries with their own
-/// AppArmor allow (e.g. `/usr/bin/unshare`) and denies it for
-/// arbitrary binaries (e.g. the cargo-built test binary running
-/// from a target/ tree).
+/// Returns true iff the FULL overlay sequence — `unshare` + the
+/// uid/gid map dance + bind-mount of `/dev/null` over a probe file
+/// — succeeds from THIS process's binary identity. The probe runs
+/// the same syscalls in the same order as the production
+/// `apply_secret_overlay_in_child`, so every host condition the
+/// real overlay needs is exercised.
 ///
-/// The probe forks and invokes `libc::unshare(CLONE_NEWUSER |
-/// CLONE_NEWNS)` directly so the AppArmor / sysctl decision is
-/// made against the SAME binary identity that will later spawn
-/// the sandbox child. Probing via `/usr/bin/unshare` (the obvious
-/// shell-call shortcut) would be asymmetric: the shell binary has
-/// its own AppArmor allow on Ubuntu 24.04, so the probe would
-/// report support even when the actual workload's `unshare(2)`
-/// will fail and the overlay will silently no-op.
+/// Why probe the full sequence and not just `unshare`:
+///
+/// - **Hardened distros** (Debian with
+///   `kernel.unprivileged_userns_clone=0`, container runtimes
+///   without `--privileged`) refuse `unshare(CLONE_NEWUSER)`
+///   outright. Stopping at unshare is enough on those hosts.
+/// - **Ubuntu 24.04 GitHub Actions runners** ship an AppArmor
+///   `unprivileged_userns` profile that permits `unshare` but
+///   does NOT permit `mount(2)` on arbitrary targets — the
+///   profile's allow-list grants `userns` capability and not
+///   `mount` capability. An `unshare`-only probe reports
+///   "supported" but the workload's silent `mount(2)` failure
+///   leaves `/bin/cat` reading the real `.env`. Probing the
+///   bind-mount itself catches this asymmetric host posture.
+/// - Probing via `/usr/bin/unshare` (the obvious shell shortcut)
+///   is also wrong: the shell binary has its own AppArmor allow,
+///   the cargo test binary doesn't — different binary identities
+///   produce different decisions.
 ///
 /// When this returns false the overlay layer is a documented
 /// no-op; skipping the runtime assertion is the correct behavior
 /// — a "shouldn't be empty" pass would mask the overlay's silent-
 /// degrade design.
 fn unshare_userns_supported() -> bool {
+    // mount(2) needs a target file that exists on the host fs; the
+    // bind-mount itself only takes effect in the new mount
+    // namespace. NamedTempFile drops at end-of-scope (after the
+    // child has exited), so the leak window is the test method.
+    let probe_target = match tempfile::NamedTempFile::new() {
+        Ok(f) => f,
+        Err(_) => return false,
+    };
+    let probe_cstring = match probe_target
+        .path()
+        .to_str()
+        .and_then(|s| std::ffi::CString::new(s).ok())
+    {
+        Some(c) => c,
+        None => return false,
+    };
+
+    // Pre-format uid_map / gid_map strings in the parent. We don't
+    // need full AS-safety here — the probe is plain test code, not
+    // pre_exec — but doing the format parent-side avoids an
+    // allocator call inside the forked child, which is cheap
+    // insurance.
+    let uid = unsafe { libc::getuid() };
+    let gid = unsafe { libc::getgid() };
+    let uid_map = format!("0 {uid} 1\n").into_bytes();
+    let gid_map = format!("0 {gid} 1\n").into_bytes();
+
     unsafe {
         let pid = libc::fork();
         if pid < 0 {
             return false;
         }
         if pid == 0 {
-            let rc = libc::unshare(libc::CLONE_NEWUSER | libc::CLONE_NEWNS);
-            libc::_exit(if rc == 0 { 0 } else { 1 });
+            if libc::unshare(libc::CLONE_NEWUSER | libc::CLONE_NEWNS) != 0 {
+                libc::_exit(11);
+            }
+            if !write_proc_file(b"/proc/self/setgroups\0", b"deny") {
+                libc::_exit(12);
+            }
+            if !write_proc_file(b"/proc/self/uid_map\0", &uid_map) {
+                libc::_exit(13);
+            }
+            if !write_proc_file(b"/proc/self/gid_map\0", &gid_map) {
+                libc::_exit(14);
+            }
+            let rc = libc::mount(
+                b"/dev/null\0".as_ptr() as *const libc::c_char,
+                probe_cstring.as_ptr(),
+                b"none\0".as_ptr() as *const libc::c_char,
+                libc::MS_BIND,
+                std::ptr::null(),
+            );
+            libc::_exit(if rc == 0 { 0 } else { 15 });
         }
         let mut status: libc::c_int = 0;
         if libc::waitpid(pid, &mut status, 0) < 0 {
             return false;
         }
         libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0
+    }
+}
+
+/// In-child helper for the probe — write `bytes` to the
+/// NUL-terminated `path` under `/proc/self/*`. Returns true on a
+/// successful full write. Mirrors `write_proc_file_assafe` in
+/// `linux_secret_overlay.rs` but as a free function so this test
+/// crate doesn't depend on private items.
+unsafe fn write_proc_file(path: &[u8], bytes: &[u8]) -> bool {
+    unsafe {
+        let fd = libc::open(path.as_ptr() as *const libc::c_char, libc::O_WRONLY);
+        if fd < 0 {
+            return false;
+        }
+        let mut written = 0usize;
+        while written < bytes.len() {
+            let n = libc::write(
+                fd,
+                bytes[written..].as_ptr() as *const libc::c_void,
+                bytes.len() - written,
+            );
+            if n <= 0 {
+                libc::close(fd);
+                return false;
+            }
+            written += n as usize;
+        }
+        libc::close(fd);
+        true
     }
 }
 
