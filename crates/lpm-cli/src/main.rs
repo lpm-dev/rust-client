@@ -40,6 +40,7 @@ mod save_spec;
 mod script_policy_config;
 pub mod security_check;
 mod sigstore;
+mod sigstore_verify;
 mod swift_manifest;
 #[cfg(test)]
 mod test_env;

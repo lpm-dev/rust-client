@@ -160,7 +160,7 @@ pub struct SigstoreBundle {
 }
 
 /// Dead Simple Signing Envelope (DSSE).
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct DsseEnvelope {
     /// Payload type URI.
     #[serde(rename = "payloadType")]
@@ -173,9 +173,10 @@ pub struct DsseEnvelope {
     pub signatures: Vec<DsseSignature>,
 }
 
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct DsseSignature {
     /// Key ID (empty for Sigstore — identity is in the certificate).
+    #[serde(default)]
     pub keyid: String,
 
     /// Base64-encoded signature.
@@ -358,22 +359,6 @@ pub struct RekorInclusionProof {
     pub tree_size: i64,
 }
 
-/// Generate a DSSE Pre-Authentication Encoding.
-///
-/// PAE(type, payload) = "DSSEv1" + SP + len(type) + SP + type + SP + len(payload) + SP + payload
-fn pae(payload_type: &str, payload: &[u8]) -> Vec<u8> {
-    let mut pae = Vec::new();
-    pae.extend_from_slice(b"DSSEv1 ");
-    pae.extend_from_slice(payload_type.len().to_string().as_bytes());
-    pae.push(b' ');
-    pae.extend_from_slice(payload_type.as_bytes());
-    pae.push(b' ');
-    pae.extend_from_slice(payload.len().to_string().as_bytes());
-    pae.push(b' ');
-    pae.extend_from_slice(payload);
-    pae
-}
-
 /// Run the complete Sigstore signing flow against the public Fulcio /
 /// Rekor instances. Thin shim around [`sign_and_record_with_endpoints`].
 pub async fn sign_and_record(
@@ -427,7 +412,7 @@ pub async fn sign_and_record_with_endpoints(
     // Sign the PAE-encoded payload with ECDSA P-256.
     // The signature is encoded as raw R||S bytes (64 bytes for P-256), NOT DER.
     // Rekor accepts both raw and DER; raw is simpler and matches npm's format.
-    let pae_bytes = pae(payload_type, slsa_statement_json);
+    let pae_bytes = crate::sigstore_verify::pae(payload_type, slsa_statement_json);
     let signature: p256::ecdsa::Signature = signing_key.sign(&pae_bytes);
     let signature_b64 = BASE64.encode(signature.to_bytes().as_slice());
 
@@ -934,13 +919,6 @@ fn split_pem_chain(text: &str) -> Result<Vec<String>, LpmError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn pae_encoding() {
-        let result = pae("application/vnd.in-toto+json", b"{}");
-        let expected = b"DSSEv1 28 application/vnd.in-toto+json 2 {}";
-        assert_eq!(result, expected);
-    }
 
     #[test]
     fn pem_to_der_basic() {

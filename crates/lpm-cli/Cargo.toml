@@ -117,6 +117,10 @@ ecdsa = { workspace = true }
 # (identity-only, not full Sigstore verification — see plan §7.1 / D5).
 x509-parser = "0.16"
 
+# Typed errors for the C1 Sigstore verifier (`sigstore_verify.rs`).
+# Matches the workspace-wide convention (`lpm_common::LpmError`).
+thiserror = { workspace = true }
+
 # Unix process group management (build.rs timeout kill)
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
