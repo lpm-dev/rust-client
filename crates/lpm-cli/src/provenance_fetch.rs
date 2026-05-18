@@ -35,7 +35,14 @@
 //! which fires immediately after the cooldown gate on fresh
 //! resolution paths.
 
+// base64 is only used by the legacy identity-only parse functions
+// (`parse_sigstore_bundle`, `find_leaf_cert_rawbytes`) which are
+// `#[cfg(test)]`-gated as of Phase 2.1 — production goes through
+// `verify_bundle_or_err` instead. Gate the imports symmetrically so
+// release builds don't carry the unused-import warning.
+#[cfg(test)]
 use base64::Engine as _;
+#[cfg(test)]
 use base64::engine::general_purpose::STANDARD as BASE64;
 use lpm_common::LpmError;
 use lpm_registry::AttestationRef;
@@ -110,9 +117,20 @@ const CACHE_TTL_SECS: u64 = 7 * 24 * 60 * 60;
 
 /// Schema version for the on-disk cache entries. Bump if the parsed
 /// `ProvenanceSnapshot` shape changes OR the SAN extractor's
-/// behaviour changes in a way that invalidates prior captures. Entries
+/// behaviour changes in a way that invalidates prior captures, OR
+/// the verification posture for cached entries changes. Entries
 /// with a mismatched version are treated as misses (re-fetch).
-const CACHE_SCHEMA_VERSION: u32 = 1;
+///
+/// **Version 2** (Phase 2.1): cache entries are now produced by the
+/// FULL cryptographic verifier (Phase 1.8's `verify_sigstore_bundle`),
+/// not by identity-only extraction. Every cached snapshot has had
+/// chain + DSSE + SCT + Rekor body + SET (and possibly inclusion
+/// proof) verified at write time. Schema-1 entries are produced by
+/// the legacy `parse_sigstore_bundle` identity-only extractor and
+/// MUST NOT be returned by the new code path — they would silently
+/// admit unverified attestations into the drift gate. The bump
+/// invalidates every legacy entry on first read.
+const CACHE_SCHEMA_VERSION: u32 = 2;
 
 /// Max attestation-bundle response size we'll read. Defends against
 /// a hostile / broken registry serving an unbounded body that would
@@ -246,11 +264,13 @@ pub async fn fetch_provenance_snapshot(
             .fetch_add(http_start.elapsed().as_nanos() as u64, Ordering::Relaxed);
     }
 
+    // Verification (Phase 2.1): bytes are in hand, run the full
+    // verifier. Failure here is NOT degraded to `Ok(None)` because
+    // it represents an attack signal (registry served a bundle that
+    // claimed signed provenance but failed crypto). Transport-class
+    // failures are already absorbed above at `fetch_bundle_bytes`.
     let parse_start = Instant::now();
-    let snapshot = match parse_bundle_or_log(&buf, url) {
-        Ok(s) => s,
-        Err(()) => return Ok(None),
-    };
+    let snapshot = verify_bundle_or_err(&buf, url)?;
     if let Some(t) = timings {
         t.parse_ns
             .fetch_add(parse_start.elapsed().as_nanos() as u64, Ordering::Relaxed);
@@ -604,44 +624,73 @@ async fn fetch_bundle_bytes(http: &reqwest::Client, url: &str) -> Result<Vec<u8>
     Ok(buf)
 }
 
-/// Parse-only — turn the raw bundle bytes into a `ProvenanceSnapshot`.
-/// `url` is forwarded only so the outer "parse returned Err" log keeps
-/// the trace stream's "which package failed how" pair adjacent. Inner
-/// failure-point tracing (`json_parse`, `cert_lookup`, `base64_decode`)
-/// lives in [`parse_sigstore_bundle`].
+/// Verify — turn the raw bundle bytes into a `ProvenanceSnapshot`
+/// AFTER cryptographic verification under Phase 1.8's
+/// `verify_sigstore_bundle`.
 ///
-/// Split out from [`fetch_and_parse`] in W1b so the
-/// production path can time parse separately from HTTP.
-fn parse_bundle_or_log(body: &[u8], url: &str) -> Result<ProvenanceSnapshot, ()> {
-    parse_sigstore_bundle(body).map_err(|()| {
-        // parse_sigstore_bundle has already emitted the
-        // failure-point-specific debug line; this outer log adds the
-        // URL so the trace stream's "which package failed how" pair
-        // stays adjacent.
-        tracing::debug!(
-            target: "lpm_cli::provenance_fetch",
-            url = %url,
-            body_bytes = body.len(),
-            stage = "parse",
-            "attestation bundle parse returned Err",
-        );
-    })
+/// Failure semantics (Phase 2.1):
+/// - `Ok(snapshot)` — bundle verified end-to-end (chain + DSSE +
+///   SCT + Rekor body + SET; inclusion proof per policy). The
+///   returned snapshot is safe to cache and feed into the drift
+///   gate.
+/// - `Err(LpmError::ProvenanceVerification(...))` — bundle bytes
+///   were structurally present but verification rejected them.
+///   The caller MUST surface this as a hard error (NOT degrade to
+///   `Ok(None)`), per the plan: "The 'degrade to NoDrift' path is
+///   reserved for genuine transport failures (per existing module
+///   comment at line 20)." A registry serving signed-but-invalid
+///   provenance is an attack signal that the operator deserves to
+///   see directly.
+///
+/// `url` is forwarded only for the outer "verify failed" debug log
+/// so the trace stream's "which package failed how" pair stays
+/// adjacent.
+fn verify_bundle_or_err(body: &[u8], url: &str) -> Result<ProvenanceSnapshot, LpmError> {
+    use crate::sigstore_verify::{IdentityExpectations, VerifyOptions, verify_sigstore_bundle};
+    match verify_sigstore_bundle(
+        body,
+        &IdentityExpectations::none(),
+        VerifyOptions::npm_attestation(),
+    ) {
+        Ok(verified) => Ok(verified.snapshot),
+        Err(verify_err) => {
+            tracing::debug!(
+                target: "lpm_cli::provenance_fetch",
+                url = %url,
+                body_bytes = body.len(),
+                error = %verify_err,
+                stage = "verify",
+                "attestation bundle verification rejected",
+            );
+            Err(LpmError::ProvenanceVerification(format!("{verify_err}")))
+        }
+    }
 }
 
 /// Pre-fused wrapper. Production calls
-/// [`fetch_bundle_bytes`] + [`parse_bundle_or_log`] directly so HTTP
-/// and parse can be timed independently; this wrapper exists so unit
-/// tests can keep their original one-call shape and is gated to
-/// test builds.
+/// [`fetch_bundle_bytes`] + [`verify_bundle_or_err`] directly so HTTP
+/// and verification can be timed independently; this wrapper exists
+/// so the legacy JSON-shape regression tests can keep their
+/// one-call shape against the identity-only parser. Marked
+/// `#[cfg(test)]` because the legacy identity-only path is no longer
+/// a production call site after Phase 2.1.
 #[cfg(test)]
 async fn fetch_and_parse(http: &reqwest::Client, url: &str) -> Result<ProvenanceSnapshot, ()> {
     let buf = fetch_bundle_bytes(http, url).await?;
-    parse_bundle_or_log(&buf, url)
+    let _ = url;
+    parse_sigstore_bundle(&buf)
 }
 
-/// Parse a Sigstore bundle JSON and extract the leaf cert + its SAN
-/// identity. Exposed for unit tests; the production path goes
-/// through [`fetch_and_parse`].
+/// Legacy identity-only Sigstore-bundle parser. Pre-Phase-2.1 this
+/// was the production call site; after Phase 2.1 the production
+/// path goes through Phase 1.8's `verify_sigstore_bundle` via
+/// [`verify_bundle_or_err`]. Kept `#[cfg(test)]` as the backing
+/// implementation for the wire-shape regression tests below — the
+/// JSON parsing logic here is structurally close to (but smaller
+/// than) the verifier's `parse_bundle_components`, and keeping
+/// these tests guards against drift in the three bundle wire
+/// shapes (v0.2 chain, v0.3 single-cert, npm wrapper).
+#[cfg(test)]
 fn parse_sigstore_bundle(body: &[u8]) -> Result<ProvenanceSnapshot, ()> {
     let bundle: serde_json::Value = serde_json::from_slice(body).map_err(|e| {
         tracing::debug!(
@@ -728,6 +777,7 @@ fn parse_sigstore_bundle(body: &[u8]) -> Result<ProvenanceSnapshot, ()> {
 ///    Fulcio-issued GitHub Actions provenance. The recursive call
 ///    walks the list in order; the publicKey-only entry returns
 ///    None and the loop falls through to the cert-bearing entry.
+#[cfg(test)]
 fn find_leaf_cert_rawbytes(v: &serde_json::Value) -> Option<String> {
     // Shape 1: legacy chain.
     if let Some(raw) = v
@@ -782,6 +832,7 @@ fn find_leaf_cert_rawbytes(v: &serde_json::Value) -> Option<String> {
 /// release (same repo, same workflow file, necessarily different ref)
 /// would register as "identity changed" and block. See the reviewer's
 /// drift-comparator finding for the full trace.
+#[cfg(test)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct SanIdentity {
     /// `github:<org>/<repo>` — stable across releases. Part of the
@@ -810,6 +861,7 @@ struct SanIdentity {
 /// calling path has already decided to materialize a snapshot —
 /// degraded identity fields still support the drift check's "both
 /// sides unknown" branch.
+#[cfg(test)]
 fn extract_san_identity(der: &[u8]) -> Option<SanIdentity> {
     use x509_parser::extensions::{GeneralName, ParsedExtension};
     use x509_parser::prelude::*;
@@ -852,6 +904,7 @@ fn extract_san_identity(der: &[u8]) -> Option<SanIdentity> {
 /// don't use `@`), but `rsplit_once` is the correct primitive either
 /// way since every legitimate GitHub Actions SAN URI has its ref
 /// delimiter as the rightmost `@`.
+#[cfg(test)]
 fn parse_github_actions_uri(uri: &str) -> Option<SanIdentity> {
     const PREFIX: &str = "https://github.com/";
     const WORKFLOWS_SEG: &str = "/.github/workflows/";
@@ -1591,6 +1644,96 @@ mod tests {
     /// plan's degraded-mode contract. Not caching this result is
     /// critical — a transient failure must not poison future
     /// installs for 7 days.
+    #[tokio::test]
+    async fn fetch_returns_provenance_verification_err_on_unverifiable_bundle() {
+        // Phase 2.1 behavioral pin: a registry that serves a 200
+        // response whose body is structurally a Sigstore bundle but
+        // cannot pass cryptographic verification MUST surface as
+        // `Err(LpmError::ProvenanceVerification(...))`, NOT degrade
+        // to `Ok(None)`. Pre-Phase-2.1 the old identity-only parse
+        // would have either returned Ok(snapshot) or Ok(None)
+        // depending on whether the JSON was well-formed; neither was
+        // an attack signal. Now the verifier's failure IS the
+        // signal.
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        // A structurally-valid Sigstore bundle JSON whose contents
+        // cannot pass verification — random certs / no real Rekor
+        // entry. Verifier rejects at chain parse / DSSE / SET /
+        // Rekor body etc. — the SPECIFIC variant doesn't matter
+        // here; the contract is "any verify failure → LpmError".
+        let der = cert_der_with_san_uri(
+            "https://github.com/attacker/forged/.github/workflows/build.yml@refs/tags/v1",
+        );
+        let bundle_bytes = sigstore_bundle_with_cert(&der).to_string().into_bytes();
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/att"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(bundle_bytes))
+            .mount(&server)
+            .await;
+
+        let cache = tempfile::tempdir().unwrap();
+        let att = AttestationRef {
+            url: Some(format!("{}/att", server.uri())),
+            provenance: None,
+        };
+        let http = reqwest::Client::new();
+        let err = fetch_provenance_snapshot(&http, cache.path(), "pkg", "1.0.0", Some(&att), None)
+            .await
+            .expect_err("unverifiable bundle must surface as ProvenanceVerification error");
+        match err {
+            LpmError::ProvenanceVerification(msg) => {
+                // Diagnostic must name a verify-side concern, not a
+                // generic JSON parse / network error.
+                assert!(
+                    !msg.is_empty(),
+                    "ProvenanceVerification error must carry a non-empty diagnostic"
+                );
+            }
+            other => panic!(
+                "expected LpmError::ProvenanceVerification on unverifiable bundle, got: {other:?}"
+            ),
+        }
+
+        // Cache MUST stay empty — we do not persist verification
+        // failures (registry might be transiently compromised; the
+        // next install retries with a fresh fetch).
+        let cached = read_cache(cache.path(), "pkg", "1.0.0").unwrap();
+        assert_eq!(cached, None, "verification failure must not be cached");
+    }
+
+    #[test]
+    fn cache_schema_v1_entry_treated_as_miss_under_v2_verification_posture() {
+        // Phase 2.1 schema bump pin: an on-disk entry with the
+        // pre-verification schema version (1) must be treated as a
+        // miss by the new code, even if the JSON is structurally
+        // valid. Without this invalidation, the new verifier would
+        // silently return a snapshot produced by the LEGACY
+        // identity-only parser — defeating the entire verifier
+        // wire-in.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path()).unwrap();
+        let stale = serde_json::json!({
+            "version": 1u32,
+            "cached_at_secs": current_epoch_secs(),
+            "snapshot": fresh_snapshot(),
+        });
+        std::fs::write(
+            dir.path().join(cache_filename("pkg", "1.0.0")),
+            stale.to_string(),
+        )
+        .unwrap();
+        let got = read_cache(dir.path(), "pkg", "1.0.0").unwrap();
+        assert_eq!(
+            got, None,
+            "schema-1 (legacy identity-only) entries must be invalidated under schema-2 \
+             (post-verification) — accepting them would defeat the verifier wire-in"
+        );
+    }
+
     #[tokio::test]
     async fn fetch_returns_none_on_network_failure_and_does_not_cache() {
         let cache = tempfile::tempdir().unwrap();
