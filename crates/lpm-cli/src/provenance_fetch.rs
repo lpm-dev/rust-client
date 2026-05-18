@@ -35,14 +35,15 @@
 //! which fires immediately after the cooldown gate on fresh
 //! resolution paths.
 
-// base64 is only used by the legacy identity-only parse functions
-// (`parse_sigstore_bundle`, `find_leaf_cert_rawbytes`) which are
-// `#[cfg(test)]`-gated as of Phase 2.1 — production goes through
-// `verify_bundle_or_err` instead. Gate the imports symmetrically so
-// release builds don't carry the unused-import warning.
-#[cfg(test)]
+// base64 is used by the legacy identity-only parse functions
+// (`parse_sigstore_bundle`, `find_leaf_cert_rawbytes`). Pre-Phase
+// 2.2.c those were `#[cfg(test)]`-gated; Phase 2.2.c adds the
+// `--unverified-provenance[-all]` operator opt-out, which routes
+// skip-listed packages through the legacy identity-only parser to
+// produce `ProvenanceStatus::Unverified(...)` without running the
+// cryptographic verifier. So the parsers are now live in release
+// builds as well.
 use base64::Engine as _;
-#[cfg(test)]
 use base64::engine::general_purpose::STANDARD as BASE64;
 use lpm_common::LpmError;
 use lpm_registry::AttestationRef;
@@ -184,6 +185,92 @@ impl EnforceMode {
                 );
                 Self::Deny
             }
+        }
+    }
+}
+
+/// Per-package opt-out for Sigstore cryptographic verification
+/// (Phase 2.2.c). Orthogonal to [`EnforceMode`]: a package excluded
+/// here is treated as if the verifier was never run, regardless of
+/// the mode. The fetch still happens (we need the bytes to extract
+/// the SAN identity) but the verifier is skipped and the resulting
+/// snapshot lands on the binding as
+/// [`lpm_common::ProvenanceStatus::Unverified`] — explicit "operator
+/// accepted the identity without crypto" rather than silently
+/// degraded.
+///
+/// The orthogonal split (rather than collapsing skip into a third
+/// `EnforceMode::Off` value) is load-bearing for the composition
+/// pinned by the Phase 2.5 ordering audit item: an operator can
+/// run `LPM_PROVENANCE_ENFORCE=warn` AND skip a specific package —
+/// the env knob still drives the rest of the install (verifier
+/// failures warn but don't block) while the skip-listed package
+/// produces `Unverified` directly. The wiring composes cleanly only
+/// if the two axes are independent.
+#[derive(Debug, Clone, Default)]
+pub enum SkipPolicy {
+    /// Verify every package (default). The verifier runs and its
+    /// outcome falls under whatever [`EnforceMode`] is active.
+    #[default]
+    None,
+    /// Skip verification for these specific package names. Empty set
+    /// is not constructible — callers use [`Self::from_cli`] which
+    /// rewrites an empty per-package list to `None`.
+    Names(HashSet<String>),
+    /// Skip verification for every resolved package on this
+    /// invocation.
+    All,
+}
+
+impl SkipPolicy {
+    /// Build the canonical policy from the two raw clap inputs.
+    /// Mirrors [`DriftIgnorePolicy::from_cli`] so the two
+    /// `--unverified-provenance{,-all}` and `--ignore-provenance-drift{,-all}`
+    /// pairs canonicalize the same way: `-all` supersedes the
+    /// per-package list (no clap mutex, just collapse).
+    pub fn from_cli(unverified_names: Vec<String>, unverified_all: bool) -> Self {
+        if unverified_all {
+            return Self::All;
+        }
+        if unverified_names.is_empty() {
+            return Self::None;
+        }
+        Self::Names(unverified_names.into_iter().collect())
+    }
+
+    /// `true` iff this specific package name is skip-listed.
+    /// `All` returns `true` for every name; `None` returns `false`
+    /// for every name; `Names` consults the set.
+    pub fn skips_name(&self, name: &str) -> bool {
+        match self {
+            Self::None => false,
+            Self::Names(set) => set.contains(name),
+            Self::All => true,
+        }
+    }
+}
+
+/// Composed verification policy: the (`EnforceMode`, `SkipPolicy`)
+/// pair that drives the install- and approve-time provenance gates.
+///
+/// Held together in one struct so `run_with_options` and the batch
+/// caller take a single parameter instead of two. The fields are
+/// independent — see [`SkipPolicy`] for why.
+#[derive(Debug, Clone, Default)]
+pub struct VerifyPolicy {
+    pub enforce: EnforceMode,
+    pub skip: SkipPolicy,
+}
+
+impl VerifyPolicy {
+    /// Construct from the install-time CLI inputs + env-resolved
+    /// enforce mode. The CLI surface lives on `Commands::Install` in
+    /// `main.rs`; this is the single canonicalization point used by
+    /// every dispatcher arm that reaches the install pipeline.
+    pub fn from_cli(unverified_names: Vec<String>, unverified_all: bool) -> Self {
+        Self {
+            enforce: EnforceMode::from_env(),
+            skip: SkipPolicy::from_cli(unverified_names, unverified_all),
         }
     }
 }
@@ -440,6 +527,16 @@ fn map_fetch_result_to_status(
 /// record a binding on rejection while still degrading to `NoDrift`
 /// on genuine transport failures.
 ///
+/// Phase 2.2.c: `verify_policy.skip` carves a per-package opt-out:
+/// for every name listed (or every name when `SkipPolicy::All`), the
+/// verifier is bypassed and the bundle is parsed through the legacy
+/// identity-only extractor; the result lands as
+/// [`ProvenanceStatus::Unverified`] (snapshot present, audit trail
+/// records the operator's downgrade). `verify_policy.enforce` only
+/// affects the verifier path — when the package is skip-listed there
+/// is nothing to enforce against. The two axes are independent on
+/// purpose (see [`SkipPolicy`] doc).
+///
 /// The lpm-vs-npm metadata-fetch dispatch by `@lpm.dev/` name prefix
 /// mirrors `install.rs::build_blocked_set_metadata`. The 5-min metadata
 /// cache absorbs the typical "install then immediately approve-scripts"
@@ -448,6 +545,7 @@ fn map_fetch_result_to_status(
 /// approvals across runs.
 pub async fn fetch_provenance_for_pkgs(
     pkgs: &[(String, String)],
+    verify_policy: &VerifyPolicy,
 ) -> HashMap<(String, String), ProvenanceStatus> {
     let cache_root = match lpm_common::paths::LpmRoot::from_env() {
         Ok(root) => root.cache_metadata_attestations(),
@@ -466,6 +564,7 @@ pub async fn fetch_provenance_for_pkgs(
     let cache_root_ref = &cache_root;
     let http_ref = &http;
     let registry_ref = &registry;
+    let skip_ref = &verify_policy.skip;
 
     let futures = pkgs.iter().map(move |(name, version)| async move {
         // lpm vs npm dispatch by name prefix mirrors
@@ -484,6 +583,18 @@ pub async fn fetch_provenance_for_pkgs(
             .and_then(|v| v.dist.as_ref())
             .and_then(|d| d.attestations.clone());
 
+        // Phase 2.2.c skip path: operator opted out of cryptographic
+        // verification for this name (or wholesale via `--unverified-
+        // provenance-all`). Pull the bytes through the legacy
+        // identity-only parser and land the snapshot as `Unverified`
+        // so the binding records the operator's downgrade explicitly
+        // instead of falsely claiming verification.
+        if skip_ref.skips_name(name) {
+            let status =
+                fetch_unverified_snapshot(http_ref, name, version, attestation_ref.as_ref()).await;
+            return ((name.clone(), version.clone()), status);
+        }
+
         let raw = fetch_provenance_snapshot(
             http_ref,
             cache_root_ref,
@@ -500,6 +611,67 @@ pub async fn fetch_provenance_for_pkgs(
         .await
         .into_iter()
         .collect()
+}
+
+/// Skip-list fetch: pull the bundle bytes, run the legacy
+/// identity-only parser, and emit [`ProvenanceStatus::Unverified`]
+/// without engaging the cryptographic verifier. Errors degrade to
+/// `TransportDegraded` — even on the skip path, a missing URL or a
+/// malformed bundle means we observed nothing; the drift comparator's
+/// `(_, None) => NoDrift` arm then absorbs it.
+///
+/// Cache-bypass on purpose: cached entries are
+/// `CACHE_SCHEMA_VERSION = 2` and were written by the verifier path
+/// (`Verified` semantics). Reading them on the skip path would
+/// silently upgrade an Unverified observation to "the operator opted
+/// out, but the cache says it was verified yesterday" — confusing
+/// the audit trail. The skip path is rare; the extra fetch is fine.
+/// We also do NOT write a cache entry: a future verifier-mode install
+/// must not be allowed to short-circuit through an entry that bypassed
+/// crypto.
+pub async fn fetch_unverified_snapshot(
+    http: &reqwest::Client,
+    name: &str,
+    version: &str,
+    attestation_ref: Option<&AttestationRef>,
+) -> ProvenanceStatus {
+    let url = match attestation_ref.and_then(|a| a.url.as_deref()) {
+        Some(u) => u,
+        None => {
+            tracing::debug!(
+                target: "lpm_cli::provenance_fetch",
+                pkg = %name,
+                version = %version,
+                "skip-list package has no attestation URL — recording Absent"
+            );
+            return ProvenanceStatus::Absent;
+        }
+    };
+    let buf = match fetch_bundle_bytes(http, url).await {
+        Ok(b) => b,
+        Err(()) => return ProvenanceStatus::TransportDegraded,
+    };
+    match parse_sigstore_bundle(&buf) {
+        Ok(snap) => {
+            tracing::warn!(
+                target = "lpm::provenance",
+                pkg = %name,
+                version = %version,
+                "operator opted out of cryptographic verification for this package; \
+                 recording identity-only snapshot (--unverified-provenance)"
+            );
+            ProvenanceStatus::Unverified(snap)
+        }
+        Err(()) => {
+            tracing::debug!(
+                target: "lpm_cli::provenance_fetch",
+                pkg = %name,
+                version = %version,
+                "skip-list package bundle failed identity-only parse — degrading to transport"
+            );
+            ProvenanceStatus::TransportDegraded
+        }
+    }
 }
 
 // ── Cache primitives ────────────────────────────────────────────
@@ -807,13 +979,12 @@ fn verify_bundle_or_err(body: &[u8], url: &str) -> Result<ProvenanceSnapshot, Lp
     }
 }
 
-/// Pre-fused wrapper. Production calls
-/// [`fetch_bundle_bytes`] + [`verify_bundle_or_err`] directly so HTTP
-/// and verification can be timed independently; this wrapper exists
-/// so the legacy JSON-shape regression tests can keep their
-/// one-call shape against the identity-only parser. Marked
-/// `#[cfg(test)]` because the legacy identity-only path is no longer
-/// a production call site after Phase 2.1.
+/// Pre-fused wrapper around the legacy identity-only parser. Used
+/// by the wire-shape regression tests below and by the Phase 2.2.c
+/// skip-list path in [`fetch_unverified_snapshot`] —
+/// production verification still routes through
+/// [`fetch_bundle_bytes`] + [`verify_bundle_or_err`] so HTTP and
+/// verification can be timed independently.
 #[cfg(test)]
 async fn fetch_and_parse(http: &reqwest::Client, url: &str) -> Result<ProvenanceSnapshot, ()> {
     let buf = fetch_bundle_bytes(http, url).await?;
@@ -822,15 +993,21 @@ async fn fetch_and_parse(http: &reqwest::Client, url: &str) -> Result<Provenance
 }
 
 /// Legacy identity-only Sigstore-bundle parser. Pre-Phase-2.1 this
-/// was the production call site; after Phase 2.1 the production
-/// path goes through Phase 1.8's `verify_sigstore_bundle` via
-/// [`verify_bundle_or_err`]. Kept `#[cfg(test)]` as the backing
-/// implementation for the wire-shape regression tests below — the
-/// JSON parsing logic here is structurally close to (but smaller
-/// than) the verifier's `parse_bundle_components`, and keeping
-/// these tests guards against drift in the three bundle wire
-/// shapes (v0.2 chain, v0.3 single-cert, npm wrapper).
-#[cfg(test)]
+/// was the production call site; Phase 2.1 routed the verify path
+/// through Phase 1.8's `verify_sigstore_bundle` (see
+/// [`verify_bundle_or_err`]). Phase 2.2.c brings it back as a live
+/// production helper for the `--unverified-provenance[-all]` opt-out
+/// path: a skip-listed package needs the SAN identity (so the drift
+/// gate can still compare publisher / workflow_path) but explicitly
+/// bypasses the cryptographic checks. The result lands on the
+/// binding as [`ProvenanceStatus::Unverified`] — distinct from
+/// `Verified` so the audit trail records the operator's downgrade.
+///
+/// Errors degrade to `Err(())` and the batch caller maps to
+/// `TransportDegraded` — even on the skip path, a malformed bundle
+/// is "we couldn't observe the identity at all," which is closer to
+/// "transport degraded" than to "operator chose to ignore crypto on
+/// a structurally-valid identity."
 fn parse_sigstore_bundle(body: &[u8]) -> Result<ProvenanceSnapshot, ()> {
     let bundle: serde_json::Value = serde_json::from_slice(body).map_err(|e| {
         tracing::debug!(
@@ -917,7 +1094,6 @@ fn parse_sigstore_bundle(body: &[u8]) -> Result<ProvenanceSnapshot, ()> {
 ///    Fulcio-issued GitHub Actions provenance. The recursive call
 ///    walks the list in order; the publicKey-only entry returns
 ///    None and the loop falls through to the cert-bearing entry.
-#[cfg(test)]
 fn find_leaf_cert_rawbytes(v: &serde_json::Value) -> Option<String> {
     // Shape 1: legacy chain.
     if let Some(raw) = v
@@ -972,7 +1148,6 @@ fn find_leaf_cert_rawbytes(v: &serde_json::Value) -> Option<String> {
 /// release (same repo, same workflow file, necessarily different ref)
 /// would register as "identity changed" and block. See the reviewer's
 /// drift-comparator finding for the full trace.
-#[cfg(test)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct SanIdentity {
     /// `github:<org>/<repo>` — stable across releases. Part of the
@@ -1001,7 +1176,6 @@ struct SanIdentity {
 /// calling path has already decided to materialize a snapshot —
 /// degraded identity fields still support the drift check's "both
 /// sides unknown" branch.
-#[cfg(test)]
 fn extract_san_identity(der: &[u8]) -> Option<SanIdentity> {
     use x509_parser::extensions::{GeneralName, ParsedExtension};
     use x509_parser::prelude::*;
@@ -1044,7 +1218,6 @@ fn extract_san_identity(der: &[u8]) -> Option<SanIdentity> {
 /// don't use `@`), but `rsplit_once` is the correct primitive either
 /// way since every legitimate GitHub Actions SAN URI has its ref
 /// delimiter as the rightmost `@`.
-#[cfg(test)]
 fn parse_github_actions_uri(uri: &str) -> Option<SanIdentity> {
     const PREFIX: &str = "https://github.com/";
     const WORKFLOWS_SEG: &str = "/.github/workflows/";
@@ -1144,6 +1317,94 @@ mod tests {
     fn drift_ignore_policy_empty_inputs_canonicalize_to_enforce_all() {
         let policy = DriftIgnorePolicy::from_cli(vec![], false);
         assert!(matches!(policy, DriftIgnorePolicy::EnforceAll));
+    }
+
+    // ── SkipPolicy::from_cli (Phase 2.2.c) ──────────────────────
+    //
+    // Mirrors the DriftIgnorePolicy canonicalization shape so an
+    // operator can rely on `--unverified-provenance{,-all}` composing
+    // the same way as `--ignore-provenance-drift{,-all}`. Each test
+    // pins one specific behavior we expect to survive future refactors.
+
+    #[test]
+    fn skip_policy_no_flags_skips_nothing() {
+        let policy = SkipPolicy::from_cli(vec![], false);
+        assert!(matches!(policy, SkipPolicy::None));
+        assert!(
+            !policy.skips_name("axios"),
+            "default policy must NOT skip verification for any name",
+        );
+    }
+
+    #[test]
+    fn skip_policy_per_package_collapses_into_set() {
+        let policy = SkipPolicy::from_cli(vec!["axios".into(), "lodash".into()], false);
+        assert!(matches!(policy, SkipPolicy::Names(_)));
+        assert!(policy.skips_name("axios"));
+        assert!(policy.skips_name("lodash"));
+        assert!(
+            !policy.skips_name("express"),
+            "unnamed packages must still verify",
+        );
+    }
+
+    #[test]
+    fn skip_policy_all_flag_alone_skips_every_name() {
+        let policy = SkipPolicy::from_cli(vec![], true);
+        assert!(matches!(policy, SkipPolicy::All));
+        assert!(policy.skips_name("any"));
+        assert!(policy.skips_name("package"));
+    }
+
+    /// Same Q2-of-kickoff semantics as DriftIgnorePolicy: `-all`
+    /// supersedes the per-package list, no clap mutex needed. Test
+    /// pins the contract — collapsing to `SkipPolicy::All` even when
+    /// per-package names are listed.
+    #[test]
+    fn skip_policy_all_flag_supersedes_per_package_list() {
+        let policy = SkipPolicy::from_cli(vec!["axios".into(), "lodash".into()], true);
+        assert!(matches!(policy, SkipPolicy::All));
+        assert!(policy.skips_name("axios"));
+        assert!(
+            policy.skips_name("express"),
+            "All variant must skip every name, including names NOT in the per-package list",
+        );
+    }
+
+    // ── VerifyPolicy (Phase 2.2.c — composed shape) ─────────────
+
+    /// The composed default `VerifyPolicy` walks the env chain for
+    /// `EnforceMode` and lands on `SkipPolicy::None`. With no env var
+    /// set the resolved enforce mode is `Deny` (fail-closed) — pin
+    /// both axes so a future change to either default surfaces in
+    /// review rather than silently weakening the posture.
+    #[test]
+    fn verify_policy_default_is_deny_and_skip_none() {
+        let policy = VerifyPolicy::default();
+        // EnforceMode::Deny is the default per `Default` derive.
+        assert_eq!(policy.enforce, EnforceMode::Deny);
+        assert!(matches!(policy.skip, SkipPolicy::None));
+    }
+
+    /// `VerifyPolicy::from_cli` composes the two axes independently:
+    /// the env-derived `EnforceMode` is untouched by the per-package
+    /// CLI flags, and vice versa. This is the load-bearing
+    /// orthogonality the Phase 2.5 ordering audit anchors on — a
+    /// future refactor that conflates the two axes would defeat
+    /// "LPM_PROVENANCE_ENFORCE=warn + --unverified-provenance foo
+    /// composes cleanly" (the test at the workflow tier).
+    #[test]
+    fn verify_policy_from_cli_composes_skip_independently_of_enforce() {
+        let policy = VerifyPolicy::from_cli(vec!["foo".into()], false);
+        // The env is unset in this test, so EnforceMode is the default
+        // (Deny). The skip-list still carves foo out — both axes are
+        // independently resolved.
+        assert_eq!(policy.enforce, EnforceMode::Deny);
+        assert!(policy.skip.skips_name("foo"));
+        assert!(
+            !policy.skip.skips_name("bar"),
+            "skip-list must NOT spill across to unrelated names",
+        );
     }
 
     // ── parse_github_actions_uri ─────────────────────────────────
@@ -1843,6 +2104,78 @@ mod tests {
         // next install retries with a fresh fetch).
         let cached = read_cache(cache.path(), "pkg", "1.0.0").unwrap();
         assert_eq!(cached, None, "verification failure must not be cached");
+    }
+
+    /// **Phase 2.2.c skip-list pin.** `fetch_unverified_snapshot`
+    /// must succeed on the same unverifiable-but-structurally-valid
+    /// bundle that `fetch_provenance_snapshot` rejects under the
+    /// `Verified` path. The legacy identity-only parser extracts the
+    /// SAN identity; the verifier is bypassed entirely; the result
+    /// lands as `ProvenanceStatus::Unverified(snap)` with the SAN
+    /// fields populated. This is the contract the
+    /// `--unverified-provenance <name>` flag depends on.
+    #[tokio::test]
+    async fn fetch_unverified_snapshot_extracts_identity_without_verifier() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let der = cert_der_with_san_uri(
+            "https://github.com/axios/axios/.github/workflows/publish.yml@refs/tags/v1.14.1",
+        );
+        let bundle_bytes = sigstore_bundle_with_cert(&der).to_string().into_bytes();
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/att"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(bundle_bytes))
+            .mount(&server)
+            .await;
+
+        let att = AttestationRef {
+            url: Some(format!("{}/att", server.uri())),
+            provenance: None,
+        };
+        let http = reqwest::Client::new();
+
+        // Same bundle that the verifier rejects via
+        // `fetch_provenance_snapshot` (see the test above) — but the
+        // skip-list path bypasses the verifier and lands on Unverified
+        // with the identity intact.
+        let status =
+            fetch_unverified_snapshot(&http, "axios", "1.14.1", Some(&att)).await;
+        match status {
+            ProvenanceStatus::Unverified(snap) => {
+                assert!(snap.present, "unverified snapshot must be present:true");
+                assert_eq!(snap.publisher.as_deref(), Some("github:axios/axios"));
+                assert_eq!(
+                    snap.workflow_path.as_deref(),
+                    Some(".github/workflows/publish.yml"),
+                    "identity-only parser must still extract workflow_path so \
+                     the drift comparator has something to compare against",
+                );
+            }
+            other => panic!(
+                "skip-list path must produce Unverified on a structurally-valid bundle, got: {other:?}"
+            ),
+        }
+    }
+
+    /// **Phase 2.2.c skip-list edge case.** When the package has no
+    /// attestation URL at all (registry returned `dist.attestations:
+    /// null` or omitted the field), the skip-list path produces
+    /// `Absent` — same signal as the verifier path. No observation
+    /// was possible to record, but we don't degrade to
+    /// `TransportDegraded` because the registry was definitive about
+    /// "no provenance shipped" (the axios drop signal direction).
+    #[tokio::test]
+    async fn fetch_unverified_snapshot_returns_absent_when_url_missing() {
+        let http = reqwest::Client::new();
+        let status =
+            fetch_unverified_snapshot(&http, "no-prov", "1.0.0", None).await;
+        assert!(
+            matches!(status, ProvenanceStatus::Absent),
+            "skip-list with no attestation URL must record Absent, got: {status:?}",
+        );
     }
 
     #[test]

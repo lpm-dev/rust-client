@@ -472,6 +472,10 @@ pub async fn run(
         None, // advisor_override: `lpm upgrade` does not expose `--advisor`
         None, // min_release_age_override: `lpm upgrade` uses the chain
         crate::provenance_fetch::DriftIgnorePolicy::default(), // drift-ignore: `lpm upgrade` enforces drift
+        // `lpm upgrade` does not surface its own
+        // `--unverified-provenance{,-all}` flags; the verifier still
+        // honors `LPM_PROVENANCE_ENFORCE` via the env-derived default.
+        crate::provenance_fetch::VerifyPolicy::default(),
         // `lpm upgrade` does not
         // surface its own sandbox-mode flags. The chain inside
         // `rebuild::run` still walks env / config / default, so

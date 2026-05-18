@@ -3394,6 +3394,15 @@ pub async fn run_with_options(
     // into this policy (D16): drift and cooldown are orthogonal, so
     // their override flags stay separate.
     drift_ignore_policy: crate::provenance_fetch::DriftIgnorePolicy,
+    // Phase 2.2.c: composed `(EnforceMode, SkipPolicy)` for the
+    // Sigstore verifier. The drift gate at the install-time call
+    // consults `verify_policy.skip` to route skip-listed packages
+    // through the legacy identity-only parser (producing
+    // `ProvenanceStatus::Unverified`) instead of hard-failing on a
+    // cryptographic rejection. Orthogonal to `drift_ignore_policy`:
+    // one suppresses the *crypto* layer, the other suppresses the
+    // *drift* layer.
+    verify_policy: crate::provenance_fetch::VerifyPolicy,
     // CLI sandbox-mode overrides.
     // `strict_sandbox=true` flips outbound network denial on for the
     // auto-build call; `no_sandbox=true` drops all containment for
@@ -3439,6 +3448,7 @@ pub async fn run_with_options(
             advisor_override,
             min_release_age_override,
             drift_ignore_policy,
+            verify_policy,
             strict_sandbox,
             no_sandbox,
         ),
@@ -3470,6 +3480,8 @@ async fn run_with_options_under_store_lock(
     advisor_override: Option<String>,
     min_release_age_override: Option<u64>,
     drift_ignore_policy: crate::provenance_fetch::DriftIgnorePolicy,
+    // see `run_with_options` for the contract.
+    verify_policy: crate::provenance_fetch::VerifyPolicy,
     // rework  — see `run_with_options` for the
     // contract. Threaded down so the auto-build call below honors the
     // user's CLI sandbox-mode override.
@@ -5667,23 +5679,91 @@ async fn run_with_options_under_store_lock(
                     })
                 };
 
-                let now_snapshot = tokio::task::block_in_place(|| {
-                    tokio::runtime::Handle::current().block_on(
-                        crate::provenance_fetch::fetch_provenance_snapshot(
-                            &http,
-                            &cache_root,
-                            &p.name,
-                            &p.version,
-                            attestation_ref.as_ref(),
-                            None,
-                        ),
-                    )
-                })
-                // Fetch errors propagate as LpmError (cache directory
-                // unwritable, etc.). Semantic degraded-fetch is already
-                // `Ok(None)` inside the fetcher and the comparator
-                // treats that as NoDrift.
-                ?;
+                // Phase 2.2.c: when the operator passed
+                // `--unverified-provenance <name>` /
+                // `--unverified-provenance-all` for this package, route
+                // the fetch through the batch caller's `Unverified`
+                // path — bytes through the legacy identity-only parser,
+                // no cryptographic checks. The drift gate still gets a
+                // populated snapshot so publisher / workflow_path
+                // identity drift is detected even when the operator
+                // opted out of crypto.
+                let now_snapshot: Option<lpm_workspace::ProvenanceSnapshot> = if verify_policy
+                    .skip
+                    .skips_name(&p.name)
+                {
+                    let status = tokio::task::block_in_place(|| {
+                        tokio::runtime::Handle::current().block_on(
+                            crate::provenance_fetch::fetch_unverified_snapshot(
+                                &http,
+                                &p.name,
+                                &p.version,
+                                attestation_ref.as_ref(),
+                            ),
+                        )
+                    });
+                    // Projection: `Unverified(snap)` → Some(snap),
+                    // `Absent` → Some(present:false), `TransportDegraded`
+                    // → None. `VerificationRejected` is unreachable on
+                    // the skip path (the verifier didn't run).
+                    status.into_snapshot_for_binding(&p.name, &p.version)?
+                } else {
+                    let raw = tokio::task::block_in_place(|| {
+                        tokio::runtime::Handle::current().block_on(
+                            crate::provenance_fetch::fetch_provenance_snapshot(
+                                &http,
+                                &cache_root,
+                                &p.name,
+                                &p.version,
+                                attestation_ref.as_ref(),
+                                None,
+                            ),
+                        )
+                    });
+                    // Phase 2.3 rollout wiring: a verifier rejection
+                    // surfaces as `Err(LpmError::ProvenanceVerification)`.
+                    // Under `EnforceMode::Deny` (default) we propagate
+                    // and the install fails — the operator opted in to
+                    // verification by NOT passing `--unverified-
+                    // provenance` for this name. Under `Warn` we log
+                    // loudly and degrade to `None` so the install
+                    // proceeds during the two-release rollout window.
+                    // Non-verification errors (cache I/O, etc.)
+                    // propagate in both modes — they are infrastructure
+                    // failures, not policy decisions.
+                    match raw {
+                        Ok(snap) => snap,
+                        Err(lpm_common::LpmError::ProvenanceVerification(reason))
+                            if matches!(
+                                verify_policy.enforce,
+                                crate::provenance_fetch::EnforceMode::Warn
+                            ) =>
+                        {
+                            if !json_output {
+                                crate::output::warn(&format!(
+                                    "provenance verification FAILED for {pkg}@{ver}: {reason}\n  \
+                                     LPM_PROVENANCE_ENFORCE=warn — install proceeds without \
+                                     verified provenance for this package. Re-run with \
+                                     LPM_PROVENANCE_ENFORCE=deny (default) to refuse, or pass \
+                                     `--unverified-provenance {pkg}` to opt out explicitly.",
+                                    pkg = p.name,
+                                    ver = p.version,
+                                ));
+                            }
+                            tracing::warn!(
+                                target = "lpm::provenance",
+                                pkg = %p.name,
+                                version = %p.version,
+                                reason = %reason,
+                                enforce_mode = "warn",
+                                "install drift gate: verifier rejected bundle but \
+                                 LPM_PROVENANCE_ENFORCE=warn — degrading to NoDrift",
+                            );
+                            None
+                        }
+                        Err(e) => return Err(e),
+                    }
+                };
 
                 let verdict = lpm_security::provenance::check_provenance_drift(
                     approved_snapshot,
@@ -10951,6 +11031,9 @@ pub async fn run_add_packages(
     // forwarded `--ignore-provenance-drift[-all]`
     // policy. Opaque pass-through — see [`run_with_options`].
     drift_ignore_policy: crate::provenance_fetch::DriftIgnorePolicy,
+    // forwarded composed Sigstore verifier policy. Opaque
+    // pass-through — see [`run_with_options`].
+    verify_policy: crate::provenance_fetch::VerifyPolicy,
     // forwarded CLI sandbox-mode
     // overrides. Opaque pass-through — see [`run_with_options`].
     strict_sandbox: bool,
@@ -11089,6 +11172,7 @@ pub async fn run_add_packages(
             advisor_override,
             min_release_age_override,
             drift_ignore_policy,
+            verify_policy,
             strict_sandbox,
             no_sandbox,
         )
@@ -11150,6 +11234,9 @@ pub async fn run_install_filtered_add(
     // forwarded `--ignore-provenance-drift[-all]`
     // policy. Opaque pass-through — see [`run_with_options`].
     drift_ignore_policy: crate::provenance_fetch::DriftIgnorePolicy,
+    // forwarded composed Sigstore verifier policy. Opaque
+    // pass-through — see [`run_with_options`].
+    verify_policy: crate::provenance_fetch::VerifyPolicy,
     // forwarded CLI sandbox-mode
     // overrides. Opaque pass-through — see [`run_with_options`].
     strict_sandbox: bool,
@@ -11399,6 +11486,11 @@ pub async fn run_install_filtered_add(
                 // Cloning an enum + HashSet of ignored names is cheap
                 // relative to the per-iteration install pipeline itself.
                 drift_ignore_policy.clone(),
+                // Same per-iteration clone rationale as drift_ignore_policy.
+                // `VerifyPolicy` carries an `EnforceMode` (Copy) and a
+                // `SkipPolicy` (HashSet of skip-listed names); cloning is
+                // bounded by the user-passed flag count.
+                verify_policy.clone(),
                 strict_sandbox,
                 no_sandbox,
             )
@@ -13757,6 +13849,7 @@ mod tests {
             None,                                                  // advisor_override
             None,                                                  // min_release_age_override
             crate::provenance_fetch::DriftIgnorePolicy::default(), // drift_ignore_policy
+            crate::provenance_fetch::VerifyPolicy::default(),      // verify_policy
             false,                                                 // strict_sandbox
             false,                                                 // no_sandbox
         )
@@ -13798,6 +13891,7 @@ mod tests {
             None,                                                  // advisor_override
             None,                                                  // min_release_age_override
             crate::provenance_fetch::DriftIgnorePolicy::default(), // drift_ignore_policy
+            crate::provenance_fetch::VerifyPolicy::default(),      // verify_policy
             false,                                                 // strict_sandbox
             false,                                                 // no_sandbox
         )

@@ -749,6 +749,10 @@ pub async fn run(
         // trustedDependencies the project defined, so legitimately-
         // identical identities pass normally.
         crate::provenance_fetch::DriftIgnorePolicy::default(),
+        // verify-policy: `lpm deploy` does not surface its own
+        // `--unverified-provenance{,-all}` flags. The verifier still
+        // honors `LPM_PROVENANCE_ENFORCE`.
+        crate::provenance_fetch::VerifyPolicy::default(),
         // `lpm deploy` does not surface its own
         // sandbox-mode flags. CI deployers can still flip strict
         // via `LPM_STRICT_SANDBOX=1`; the env tier of the chain

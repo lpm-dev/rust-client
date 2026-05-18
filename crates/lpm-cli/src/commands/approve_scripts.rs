@@ -104,6 +104,16 @@ fn approval_metadata_from_blocked(
 /// single source of truth shared with the global-scope approve path
 /// (`lpm approve-scripts --global`). This wrapper keeps the
 /// `BlockedPackage` shape callers used pre-existing working unchanged.
+///
+/// Phase 2.2.c: the `--unverified-provenance[-all]` opt-out lives on
+/// `lpm install` (not on `approve-scripts`), so the policy here uses
+/// env-derived `EnforceMode` + default `SkipPolicy::None`. An operator
+/// who set `LPM_PROVENANCE_ENFORCE=warn` for the install will still
+/// see warn behavior at approval time; per-package skip decisions are
+/// not surfaced on approve-scripts because the approval path's only
+/// job is to record a binding — degrading to identity-only there
+/// would silently strip a layer of evidence the install path already
+/// captured.
 async fn fetch_provenance_for_effective_set(
     packages: &[BlockedPackage],
 ) -> HashMap<(String, String), ProvenanceStatus> {
@@ -111,7 +121,8 @@ async fn fetch_provenance_for_effective_set(
         .iter()
         .map(|p| (p.name.clone(), p.version.clone()))
         .collect();
-    crate::provenance_fetch::fetch_provenance_for_pkgs(&pkgs).await
+    let policy = crate::provenance_fetch::VerifyPolicy::default();
+    crate::provenance_fetch::fetch_provenance_for_pkgs(&pkgs, &policy).await
 }
 
 /// Resolve the `provenance_at_approval` value for one `(name, version)`
@@ -1966,7 +1977,11 @@ async fn run_global_bulk_yes(
         .iter()
         .map(|r| (r.name.clone(), r.version.clone()))
         .collect();
-    let provenance = crate::provenance_fetch::fetch_provenance_for_pkgs(&pairs).await;
+    let provenance = crate::provenance_fetch::fetch_provenance_for_pkgs(
+        &pairs,
+        &crate::provenance_fetch::VerifyPolicy::default(),
+    )
+    .await;
 
     // Resolve each row's binding snapshot BEFORE entering the tx lock
     // so a verifier rejection (which returns
@@ -2120,7 +2135,11 @@ async fn run_global_named(
     // Phase 2.2 SILENT-DROP fix: `?` propagates a verifier rejection
     // BEFORE acquiring the lock, leaving any prior binding intact.
     let pairs = vec![(row.name.clone(), row.version.clone())];
-    let provenance = crate::provenance_fetch::fetch_provenance_for_pkgs(&pairs).await;
+    let provenance = crate::provenance_fetch::fetch_provenance_for_pkgs(
+        &pairs,
+        &crate::provenance_fetch::VerifyPolicy::default(),
+    )
+    .await;
     let snap = snapshot_for_binding(&provenance, &row.name, &row.version)?;
 
     let lock_path = root.global_tx_lock();
@@ -2386,7 +2405,11 @@ async fn run_global_interactive(
         .iter()
         .map(|r| (r.name.clone(), r.version.clone()))
         .collect();
-    let provenance = crate::provenance_fetch::fetch_provenance_for_pkgs(&pairs).await;
+    let provenance = crate::provenance_fetch::fetch_provenance_for_pkgs(
+        &pairs,
+        &crate::provenance_fetch::VerifyPolicy::default(),
+    )
+    .await;
 
     let mut approved: Vec<&crate::global_blocked_set::AggregateBlockedRow> = Vec::new();
     let mut skipped: Vec<&crate::global_blocked_set::AggregateBlockedRow> = Vec::new();

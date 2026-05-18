@@ -2489,6 +2489,10 @@ async fn handle_dependencies(
                 None, // advisor_override: `lpm add` does not expose `--advisor`
                 None, // min_release_age_override: shadcn-style add uses the chain
                 crate::provenance_fetch::DriftIgnorePolicy::default(), // drift-ignore: `lpm add` does not expose drift-override flags
+                // verify-policy: `lpm add` does not expose its own
+                // `--unverified-provenance{,-all}` flags; default
+                // honors `LPM_PROVENANCE_ENFORCE` and verifies all.
+                crate::provenance_fetch::VerifyPolicy::default(),
                 // `lpm add` does not surface its
                 // own sandbox-mode flags. The env / config / default
                 // chain inside `rebuild::run` still applies.

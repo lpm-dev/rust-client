@@ -39,6 +39,22 @@ pub enum ProvenanceStatus {
     /// The contained snapshot has `present == true` and the SAN
     /// fields populated.
     Verified(ProvenanceSnapshot),
+    /// Bundle fetched and identity extracted, but the cryptographic
+    /// verifier was bypassed because the operator carved this package
+    /// out via `--unverified-provenance <name>` /
+    /// `--unverified-provenance-all` (the `SkipPolicy` axis added in
+    /// Phase 2.2.c). The snapshot carries the same SAN identity fields
+    /// as `Verified` so drift detection still runs against the
+    /// identity tuple, but the binding's audit trail records that this
+    /// observation was NOT cryptographically attested. JSON envelope
+    /// reports `verified: "skipped"` for this state.
+    ///
+    /// **Why a distinct variant rather than collapsing back into
+    /// `Verified`:** an operator-driven skip is an explicit downgrade
+    /// — surfacing it as a separate state lets the trust binding and
+    /// approve-scripts audit trail say "this identity was accepted
+    /// without crypto" instead of falsely claiming verification.
+    Unverified(ProvenanceSnapshot),
     /// Registry returned no attestation URL for this version
     /// (definitive "no provenance shipped"). This is the axios drop
     /// signal direction — when compared against an approved-side
@@ -88,7 +104,7 @@ impl ProvenanceStatus {
         version: &str,
     ) -> Result<Option<ProvenanceSnapshot>, crate::LpmError> {
         match self {
-            ProvenanceStatus::Verified(s) => Ok(Some(s)),
+            ProvenanceStatus::Verified(s) | ProvenanceStatus::Unverified(s) => Ok(Some(s)),
             ProvenanceStatus::Absent => Ok(Some(ProvenanceSnapshot {
                 present: false,
                 ..Default::default()
@@ -99,8 +115,7 @@ impl ProvenanceStatus {
                     "verification of provenance bundle for '{name}@{version}' failed: \
                      {reason}. Approval refused so the prior trust binding \
                      (if any) is preserved. Re-run after the registry serves \
-                     a verifiable bundle, or — once the operator opt-out \
-                     ships in Phase 2.2.c — pass `--unverified-provenance \
+                     a verifiable bundle, or pass `--unverified-provenance \
                      {name}` to fall back to identity-only capture."
                 )))
             }
@@ -358,12 +373,16 @@ mod tests {
     }
 
     /// `is_rejection` lets call sites short-circuit before any
-    /// trust-store mutation. The other three states must not flag.
+    /// trust-store mutation. The other four states must not flag.
     #[test]
     fn provenance_status_is_rejection_only_for_verification_rejected() {
         assert!(
             !ProvenanceStatus::Verified(axios_snap()).is_rejection(),
             "Verified is not a rejection",
+        );
+        assert!(
+            !ProvenanceStatus::Unverified(axios_snap()).is_rejection(),
+            "Unverified (operator-skipped) is not a rejection — it's an opt-out",
         );
         assert!(!ProvenanceStatus::Absent.is_rejection(), "Absent is not a rejection");
         assert!(
@@ -377,5 +396,21 @@ mod tests {
             .is_rejection(),
             "VerificationRejected must be flagged",
         );
+    }
+
+    /// `Unverified` projects to `Some(snap)` so the operator's
+    /// explicit opt-out still records the identity in the binding —
+    /// the next install's drift gate can still compare publisher /
+    /// workflow_path. JSON envelope downstream distinguishes the
+    /// audit-trail state (`verified: "skipped"`) without losing the
+    /// drift-detection signal.
+    #[test]
+    fn provenance_status_unverified_projects_to_some_snapshot() {
+        let snap = axios_snap();
+        let status = ProvenanceStatus::Unverified(snap.clone());
+        let projected = status
+            .into_snapshot_for_binding("axios", "1.14.0")
+            .expect("Unverified must project to Ok(Some) — identity still drives drift");
+        assert_eq!(projected, Some(snap));
     }
 }
