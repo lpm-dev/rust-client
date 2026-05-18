@@ -115,6 +115,67 @@ pub enum VerifyError {
          update lpm to refresh (see private/sigstore-root-provenance.md)"
     )]
     TrustRootExpired { missing_roles: String },
+
+    /// Rekor SET (Signed Entry Timestamp) verification failed:
+    /// signature did not verify under the pinned Rekor key, the
+    /// pinned key for the entry's `logID` is absent / not active at
+    /// `integratedTime`, the SET signature was not valid DER, or the
+    /// pinned key's SPKI did not decode as ECDSA P-256.
+    #[error("Rekor SET verification failed: {0}")]
+    RekorSet(String),
+
+    /// The Rekor body did not carry a Signed Entry Timestamp, but
+    /// the caller's [`RekorInclusionProofPolicy`] required one
+    /// (`RequireSet` or `RequireBoth`). The inclusion-proof path
+    /// (Phase 1.7) is the alternative offline anchor; under `Either`
+    /// or `RequireInclusionProof` this case is not an error.
+    #[error("Rekor SET is required by policy but missing from the bundle")]
+    RekorSetMissing,
+}
+
+/// Policy for which Rekor inclusion artifacts a bundle must carry to
+/// be considered verifiable. Threaded through [`verify_rekor_set`]
+/// (Phase 1.6) and `verify_inclusion_proof` (Phase 1.7); the
+/// composed entry point (`verify_sigstore_bundle`, Phase 1.8) sets
+/// it per call site.
+///
+/// `Either` is the right default for npm-attestation consumption
+/// (some npm cohorts ship SET-only, others inclusion-proof-only,
+/// some both). `RequireBoth` is the C2 self-update default — binary
+/// swap is the highest-trust operation so we require both offline
+/// anchors. The variant is the *single* authority on what's required;
+/// there is intentionally no parallel `require_inclusion_proof: bool`
+/// (GPT round-5 H1 — adding one re-creates a dual-authority bug).
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RekorInclusionProofPolicy {
+    /// Accept the bundle if at least one of SET, inclusion proof is
+    /// present and verifies. Verify the other if it's also present
+    /// (defense in depth). Reject if both are absent.
+    Either,
+    /// SET must be present and verify. Inclusion proof is verified
+    /// only when present (advisory).
+    RequireSet,
+    /// Inclusion proof must be present and verify. SET is verified
+    /// only when present (advisory).
+    RequireInclusionProof,
+    /// Both SET and inclusion proof must be present and both must
+    /// verify. The strongest claim.
+    RequireBoth,
+}
+
+impl RekorInclusionProofPolicy {
+    /// True when SET absence should hard-fail per this policy.
+    #[allow(dead_code)]
+    pub fn requires_set(self) -> bool {
+        matches!(self, Self::RequireSet | Self::RequireBoth)
+    }
+
+    /// True when inclusion-proof absence should hard-fail per this policy.
+    #[allow(dead_code)]
+    pub fn requires_inclusion_proof(self) -> bool {
+        matches!(self, Self::RequireInclusionProof | Self::RequireBoth)
+    }
 }
 
 /// DSSE Pre-Authentication Encoding.
@@ -989,6 +1050,182 @@ pub fn trust_root() -> Result<Arc<TrustRoot>, VerifyError> {
         Ok(arc) => Ok(Arc::clone(arc)),
         Err(msg) => Err(VerifyError::TrustRoot(msg.clone())),
     }
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// Phase 1.6 — Rekor SET (Signed Entry Timestamp) verification.
+// ─────────────────────────────────────────────────────────────────────
+//
+// The SET is Rekor's offline-verifiable promise that a given entry
+// was integrated into the transparency log at `integratedTime`. It is
+// an ECDSA signature, by the Rekor instance's signing key, over a
+// canonical JSON of `{body, integratedTime, logID, logIndex}`.
+//
+// `integratedTime` returned here is the load-bearing "at_time"
+// anchor: Phase 1.3 (chain validation) uses it instead of wall-clock,
+// and Phase 6.2 (C2 self-update replay window) compares it to the
+// release `published_at`. Returning `Result<SystemTime, _>` rather
+// than `Result<(), _>` forces every caller through the time anchor.
+//
+// Canonicalization rules cached in `private/rekor-set-canonicalization.md`
+// — bug-density is highest here per the plan's ordering checklist, so
+// the byte layout is documented separately from the code that
+// implements it.
+
+/// Verify the Rekor SET in `tlog_entry` against the pinned Rekor
+/// signing key for the entry's `logID`.
+///
+/// Returns the parsed `integratedTime` as `SystemTime` so the caller
+/// (Phase 1.8) can thread it into chain validation as the
+/// `at_time` anchor.
+///
+/// Policy semantics (see [`RekorInclusionProofPolicy`]):
+/// - SET present → always verify (defense in depth across all policies)
+/// - SET absent + policy requires SET → [`VerifyError::RekorSetMissing`]
+/// - SET absent + policy tolerates absence → return `integratedTime`,
+///   no signature work
+///
+/// Sigstore profile is ECDSA P-256 + SHA-256; Rekor signs over the
+/// SHA-256 of the canonical SET input JSON. Any non-P-256 SPKI in
+/// the pinned key rejects with [`VerifyError::RekorSet`].
+#[allow(dead_code)] // wired into provenance_fetch in Phase 2.1
+pub fn verify_rekor_set(
+    tlog_entry: &crate::sigstore::TlogEntry,
+    rekor_keys: &[RekorKey],
+    policy: RekorInclusionProofPolicy,
+) -> Result<SystemTime, VerifyError> {
+    let integrated_time = parse_integrated_time(&tlog_entry.integrated_time)?;
+
+    let Some(promise) = tlog_entry.resolved_inclusion_promise() else {
+        return if policy.requires_set() {
+            Err(VerifyError::RekorSetMissing)
+        } else {
+            Ok(integrated_time)
+        };
+    };
+
+    let log_index = parse_log_index(&tlog_entry.log_index)?;
+    let log_id_bytes = hex::decode(&tlog_entry.log_id.key_id).map_err(|e| {
+        VerifyError::RekorSet(format!(
+            "TlogEntry.logId.keyId is not valid hex (Rekor canonical form): {e}"
+        ))
+    })?;
+
+    let rekor_key = rekor_keys
+        .iter()
+        .find(|k| k.log_id == log_id_bytes && k.valid_for.contains(integrated_time))
+        .ok_or_else(|| {
+            VerifyError::RekorSet(format!(
+                "no pinned Rekor key for logId={} valid at integratedTime={}",
+                tlog_entry.log_id.key_id, tlog_entry.integrated_time,
+            ))
+        })?;
+
+    let verifying_key = p256_verifying_key_from_spki(&rekor_key.spki_der).map_err(|e| {
+        VerifyError::RekorSet(format!(
+            "pinned Rekor key did not decode as ECDSA P-256 SPKI: {e}"
+        ))
+    })?;
+
+    let signature_bytes = BASE64
+        .decode(promise.signed_entry_timestamp.as_bytes())
+        .map_err(|e| VerifyError::RekorSet(format!("signedEntryTimestamp not base64: {e}")))?;
+    // Rekor SETs are DER-encoded ECDSA signatures per the Sigstore
+    // reference implementation (sigstore/rekor `pkg/util/checkpoint.go`).
+    // No raw R||S fallback here — unlike DSSE, Rekor's protocol fixes
+    // the encoding.
+    let signature = Signature::from_der(&signature_bytes).map_err(|e| {
+        VerifyError::RekorSet(format!("signedEntryTimestamp is not valid DER ECDSA: {e}"))
+    })?;
+
+    let set_input = build_set_input_canonical_json(
+        &tlog_entry.canonicalized_body,
+        integrated_time_secs(&integrated_time),
+        log_index,
+        &tlog_entry.log_id.key_id,
+    );
+    let digest = Sha256::digest(set_input.as_bytes());
+
+    verifying_key
+        .verify(digest.as_slice(), &signature)
+        .map_err(|e| {
+            VerifyError::RekorSet(format!(
+                "SET signature did not verify under the pinned Rekor key for logId={}: {e}",
+                tlog_entry.log_id.key_id,
+            ))
+        })?;
+
+    Ok(integrated_time)
+}
+
+/// Parse a stringified i64 seconds-since-epoch into [`SystemTime`].
+/// `tlog_entry.integrated_time` is a string per the schema bump
+/// in Phase 1.0 (the publish parser stringifies Rekor's API i64).
+fn parse_integrated_time(s: &str) -> Result<SystemTime, VerifyError> {
+    let secs: i64 = s.parse().map_err(|e| {
+        VerifyError::RekorSet(format!(
+            "TlogEntry.integratedTime `{s}` is not a valid i64 seconds-since-epoch: {e}"
+        ))
+    })?;
+    if secs < 0 {
+        return Err(VerifyError::RekorSet(format!(
+            "TlogEntry.integratedTime `{secs}` is negative; expected a unix timestamp"
+        )));
+    }
+    Ok(SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(secs as u64))
+}
+
+fn parse_log_index(s: &str) -> Result<i64, VerifyError> {
+    s.parse::<i64>().map_err(|e| {
+        VerifyError::RekorSet(format!("TlogEntry.logIndex `{s}` is not a valid i64: {e}"))
+    })
+}
+
+fn integrated_time_secs(t: &SystemTime) -> i64 {
+    t.duration_since(SystemTime::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+/// Decode a DER SubjectPublicKeyInfo into a P-256 `VerifyingKey`.
+/// Used to consume the `RekorKey.spki_der` material that
+/// [`TrustRoot::parse`] base64-decoded out of the trusted_root
+/// `publicKey.rawBytes` field.
+fn p256_verifying_key_from_spki(spki_der: &[u8]) -> Result<VerifyingKey, String> {
+    use p256::pkcs8::DecodePublicKey;
+    VerifyingKey::from_public_key_der(spki_der).map_err(|e| e.to_string())
+}
+
+/// Build the canonical JSON input the SET is signed over.
+///
+/// Rekor's spec (mirrored in `private/rekor-set-canonicalization.md`)
+/// fixes:
+/// - Keys in ASCII alphabetical order: `body, integratedTime, logID, logIndex`
+/// - No whitespace
+/// - `body` is the `canonicalizedBody` base64 string verbatim
+///   (Rekor signs over the base64 representation, NOT the decoded bytes)
+/// - `integratedTime` and `logIndex` are numeric i64 literals
+/// - `logID` is the hex string Rekor returns (NOT base64-decoded)
+///
+/// Implemented as a `format!()` rather than via `serde_json` because
+/// serde's default object output does not guarantee key order — going
+/// through a sorted-BTreeMap would also work but is one more hop where
+/// a subtle behavioral change could break verification. This is
+/// load-bearing for SET verify; pinned via
+/// `build_set_input_canonical_json_matches_documented_layout`.
+fn build_set_input_canonical_json(
+    canonicalized_body_b64: &str,
+    integrated_time_secs: i64,
+    log_index: i64,
+    log_id_hex: &str,
+) -> String {
+    format!(
+        r#"{{"body":"{body}","integratedTime":{integrated_time},"logID":"{log_id}","logIndex":{log_index}}}"#,
+        body = canonicalized_body_b64,
+        integrated_time = integrated_time_secs,
+        log_id = log_id_hex,
+        log_index = log_index,
+    )
 }
 
 #[cfg(test)]
@@ -2025,6 +2262,400 @@ mod tests {
             !window.contains(ts("2024-01-01T00:00:00Z")),
             "end is exclusive: a key valid until midnight Jan 1 must NOT be picked at midnight Jan 1"
         );
+    }
+
+    // ── verify_rekor_set — Phase 1.6 ──────────────────────────────
+
+    use p256::pkcs8::EncodePublicKey;
+
+    /// Helper: produce a fresh P-256 ECDSA keypair plus the SPKI
+    /// DER bytes and the sha256(SPKI) "logId" the trust-root layer
+    /// would carry. Centralised so every SET test starts from the
+    /// same shape.
+    fn p256_rekor_signing_key() -> (SigningKey, Vec<u8>, Vec<u8>) {
+        let signing_key = SigningKey::random(&mut rand::thread_rng());
+        let verifying_key = VerifyingKey::from(&signing_key);
+        let spki_der = verifying_key
+            .to_public_key_der()
+            .unwrap()
+            .as_bytes()
+            .to_vec();
+        let log_id_bytes = Sha256::digest(&spki_der).to_vec();
+        (signing_key, spki_der, log_id_bytes)
+    }
+
+    /// Build a TlogEntry whose SET is a real ECDSA signature over
+    /// the canonical SET input, signed by `signing_key`.
+    /// `integrated_time_secs` is the unix timestamp the entry
+    /// declares; the test verifier returns it as the at_time anchor.
+    fn synth_tlog_entry_with_set(
+        signing_key: &SigningKey,
+        log_id_hex: &str,
+        log_index: i64,
+        integrated_time_secs: i64,
+        canonicalized_body: &str,
+    ) -> crate::sigstore::TlogEntry {
+        let set_input = build_set_input_canonical_json(
+            canonicalized_body,
+            integrated_time_secs,
+            log_index,
+            log_id_hex,
+        );
+        let digest = Sha256::digest(set_input.as_bytes());
+        let sig: Signature = signing_key.sign(&digest);
+        let signed_entry_timestamp = BASE64.encode(sig.to_der().as_bytes());
+
+        crate::sigstore::TlogEntry {
+            log_index: log_index.to_string(),
+            log_id: crate::sigstore::LogId {
+                key_id: log_id_hex.to_string(),
+            },
+            integrated_time: integrated_time_secs.to_string(),
+            inclusion_promise: Some(crate::sigstore::RekorInclusionPromise {
+                signed_entry_timestamp,
+            }),
+            inclusion_proof: None,
+            verification: None,
+            canonicalized_body: canonicalized_body.to_string(),
+        }
+    }
+
+    fn rekor_key_active_around(log_id: Vec<u8>, spki_der: Vec<u8>, around_secs: i64) -> RekorKey {
+        let start = DateTime::<Utc>::from_timestamp(around_secs - 365 * 86400, 0).unwrap();
+        let end = DateTime::<Utc>::from_timestamp(around_secs + 365 * 86400, 0).unwrap();
+        RekorKey {
+            log_id,
+            spki_der,
+            valid_for: ValidityWindow {
+                start,
+                end: Some(end),
+            },
+        }
+    }
+
+    #[test]
+    fn build_set_input_canonical_json_matches_documented_layout() {
+        // Canonicalization pin: the exact byte string the verifier
+        // produces for a fixed input must match what's documented
+        // in private/rekor-set-canonicalization.md. A failure here is
+        // the canary that catches key-reorder, whitespace, or casing
+        // regressions before they break actual SET verification.
+        let s = build_set_input_canonical_json("Zm9vYmFy", 1700000000, 42, "wNI9atQGlz");
+        let expected =
+            r#"{"body":"Zm9vYmFy","integratedTime":1700000000,"logID":"wNI9atQGlz","logIndex":42}"#;
+        assert_eq!(
+            s, expected,
+            "SET canonical-JSON layout drift — see private/rekor-set-canonicalization.md"
+        );
+    }
+
+    #[test]
+    fn verifies_valid_rekor_set_returns_parsed_integrated_time() {
+        let (signing_key, spki_der, log_id_bytes) = p256_rekor_signing_key();
+        let log_id_hex = hex::encode(&log_id_bytes);
+        let integrated_time = 1700000000_i64;
+
+        let tlog = synth_tlog_entry_with_set(
+            &signing_key,
+            &log_id_hex,
+            42,
+            integrated_time,
+            "Zm9vYmFy", // arbitrary base64 — content doesn't affect the SET sig
+        );
+        let key = rekor_key_active_around(log_id_bytes, spki_der, integrated_time);
+
+        let returned_time = verify_rekor_set(
+            &tlog,
+            std::slice::from_ref(&key),
+            RekorInclusionProofPolicy::RequireSet,
+        )
+        .expect("a valid SET must verify under the pinned key");
+        let expected =
+            SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(integrated_time as u64);
+        assert_eq!(
+            returned_time, expected,
+            "verify_rekor_set must return the parsed integratedTime as the at_time anchor"
+        );
+    }
+
+    #[test]
+    fn rejects_bundle_with_forged_rekor_set() {
+        let (signing_key, spki_der, log_id_bytes) = p256_rekor_signing_key();
+        let log_id_hex = hex::encode(&log_id_bytes);
+        let mut tlog =
+            synth_tlog_entry_with_set(&signing_key, &log_id_hex, 42, 1700000000, "Zm9vYmFy");
+
+        // Flip one byte in the signature payload so DER still parses
+        // (signatures are 70-72 bytes; mangling the middle of the
+        // R/S integers keeps DER valid but the curve math fails).
+        let mut sig_bytes = BASE64
+            .decode(
+                tlog.inclusion_promise
+                    .as_ref()
+                    .unwrap()
+                    .signed_entry_timestamp
+                    .as_bytes(),
+            )
+            .unwrap();
+        // The DER encoding starts 0x30 LEN 0x02 LEN R... — flip a
+        // byte well inside R to keep the structure parseable.
+        let target = sig_bytes.len() / 2;
+        sig_bytes[target] ^= 0x01;
+        tlog.inclusion_promise
+            .as_mut()
+            .unwrap()
+            .signed_entry_timestamp = BASE64.encode(sig_bytes);
+
+        let key = rekor_key_active_around(log_id_bytes, spki_der, 1700000000);
+        let err = verify_rekor_set(
+            &tlog,
+            std::slice::from_ref(&key),
+            RekorInclusionProofPolicy::RequireSet,
+        )
+        .expect_err("tampered SET signature must fail verification");
+        match err {
+            VerifyError::RekorSet(msg) => assert!(
+                msg.contains("did not verify") || msg.contains("not valid DER"),
+                "expected signature-verify or DER-parse diagnostic, got: {msg}"
+            ),
+            other => panic!("expected VerifyError::RekorSet, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_bundle_with_unknown_rekor_log_id() {
+        // Bundle declares a logId that doesn't match the pinned key.
+        // Even though the signature would mathematically verify
+        // (we sign with the right key), the canonical SET input
+        // embeds the bundle's logId — different logId → different
+        // SET input → no key matches and we error before getting
+        // to ECDSA verify.
+        let (signing_key, spki_der, log_id_bytes) = p256_rekor_signing_key();
+        let unknown_log_id_hex = hex::encode([0xff_u8; 32]);
+        let tlog = synth_tlog_entry_with_set(
+            &signing_key,
+            &unknown_log_id_hex,
+            42,
+            1700000000,
+            "Zm9vYmFy",
+        );
+        let key = rekor_key_active_around(log_id_bytes, spki_der, 1700000000);
+        let err = verify_rekor_set(
+            &tlog,
+            std::slice::from_ref(&key),
+            RekorInclusionProofPolicy::RequireSet,
+        )
+        .expect_err("unknown logId must reject");
+        match err {
+            VerifyError::RekorSet(msg) => assert!(
+                msg.contains("no pinned Rekor key"),
+                "expected unknown-logId diagnostic, got: {msg}"
+            ),
+            other => panic!("expected VerifyError::RekorSet, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_bundle_with_rekor_key_outside_validity_at_integrated_time() {
+        // The pinned key's validity window doesn't contain the
+        // entry's integratedTime — even with matching logId, lookup
+        // returns None.
+        let (signing_key, spki_der, log_id_bytes) = p256_rekor_signing_key();
+        let log_id_hex = hex::encode(&log_id_bytes);
+        let tlog = synth_tlog_entry_with_set(&signing_key, &log_id_hex, 42, 1700000000, "Zm9vYmFy");
+        // Key valid 2010-2015 only; integratedTime is 2023.
+        let key = RekorKey {
+            log_id: log_id_bytes,
+            spki_der,
+            valid_for: ValidityWindow {
+                start: DateTime::parse_from_rfc3339("2010-01-01T00:00:00Z")
+                    .unwrap()
+                    .with_timezone(&Utc),
+                end: Some(
+                    DateTime::parse_from_rfc3339("2015-01-01T00:00:00Z")
+                        .unwrap()
+                        .with_timezone(&Utc),
+                ),
+            },
+        };
+        let err = verify_rekor_set(
+            &tlog,
+            std::slice::from_ref(&key),
+            RekorInclusionProofPolicy::RequireSet,
+        )
+        .expect_err("out-of-window key must reject");
+        let msg = match err {
+            VerifyError::RekorSet(msg) => msg,
+            other => panic!("expected VerifyError::RekorSet, got: {other:?}"),
+        };
+        assert!(
+            msg.contains("no pinned Rekor key"),
+            "expected unknown-key diagnostic, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn rejects_missing_set_under_require_set_policy() {
+        // Synth a TlogEntry with no inclusion_promise / no verification
+        // envelope. Under RequireSet, expect RekorSetMissing.
+        let tlog = crate::sigstore::TlogEntry {
+            log_index: "0".into(),
+            log_id: crate::sigstore::LogId {
+                key_id: String::new(),
+            },
+            integrated_time: "1700000000".into(),
+            inclusion_promise: None,
+            inclusion_proof: None,
+            verification: None,
+            canonicalized_body: String::new(),
+        };
+        let err = verify_rekor_set(&tlog, &[], RekorInclusionProofPolicy::RequireSet)
+            .expect_err("missing SET under RequireSet must reject");
+        assert!(matches!(err, VerifyError::RekorSetMissing));
+    }
+
+    #[test]
+    fn rejects_missing_set_under_require_both_policy() {
+        // RequireBoth also requires SET. Same diagnostic.
+        let tlog = crate::sigstore::TlogEntry {
+            log_index: "0".into(),
+            log_id: crate::sigstore::LogId {
+                key_id: String::new(),
+            },
+            integrated_time: "1700000000".into(),
+            inclusion_promise: None,
+            inclusion_proof: None,
+            verification: None,
+            canonicalized_body: String::new(),
+        };
+        let err = verify_rekor_set(&tlog, &[], RekorInclusionProofPolicy::RequireBoth)
+            .expect_err("missing SET under RequireBoth must reject");
+        assert!(matches!(err, VerifyError::RekorSetMissing));
+    }
+
+    #[test]
+    fn accepts_missing_set_under_either_policy_and_returns_integrated_time() {
+        // Under Either, absent SET is acceptable as long as inclusion
+        // proof carries the offline anchor. verify_rekor_set itself
+        // returns Ok(integrated_time) without verifying anything — the
+        // caller (Phase 1.8) is responsible for ensuring the inclusion
+        // proof path runs in this case.
+        let tlog = crate::sigstore::TlogEntry {
+            log_index: "0".into(),
+            log_id: crate::sigstore::LogId {
+                key_id: String::new(),
+            },
+            integrated_time: "1700000000".into(),
+            inclusion_promise: None,
+            inclusion_proof: None,
+            verification: None,
+            canonicalized_body: String::new(),
+        };
+        let t = verify_rekor_set(&tlog, &[], RekorInclusionProofPolicy::Either)
+            .expect("missing SET under Either must NOT reject (inclusion proof is the alt anchor)");
+        let expected = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1700000000);
+        assert_eq!(
+            t, expected,
+            "Either + missing SET still returns the parsed integratedTime as the at_time anchor"
+        );
+    }
+
+    #[test]
+    fn accepts_missing_set_under_require_inclusion_proof_policy() {
+        // RequireInclusionProof doesn't need SET; verify_rekor_set
+        // should not reject on absence.
+        let tlog = crate::sigstore::TlogEntry {
+            log_index: "0".into(),
+            log_id: crate::sigstore::LogId {
+                key_id: String::new(),
+            },
+            integrated_time: "1700000000".into(),
+            inclusion_promise: None,
+            inclusion_proof: None,
+            verification: None,
+            canonicalized_body: String::new(),
+        };
+        verify_rekor_set(&tlog, &[], RekorInclusionProofPolicy::RequireInclusionProof)
+            .expect("missing SET under RequireInclusionProof must NOT reject");
+    }
+
+    #[test]
+    fn verifies_set_via_legacy_verification_envelope_fallback() {
+        // A bundle that captured Rekor's API response verbatim under
+        // `verification.inclusionPromise` (the Phase 1.0 schema's
+        // fallback path) must still verify — `resolved_inclusion_promise`
+        // walks through.
+        let (signing_key, spki_der, log_id_bytes) = p256_rekor_signing_key();
+        let log_id_hex = hex::encode(&log_id_bytes);
+        let integrated_time = 1700000000_i64;
+        let canonicalized_body = "Zm9vYmFy";
+
+        let set_input =
+            build_set_input_canonical_json(canonicalized_body, integrated_time, 42, &log_id_hex);
+        let digest = Sha256::digest(set_input.as_bytes());
+        let sig: Signature = signing_key.sign(&digest);
+        let set_b64 = BASE64.encode(sig.to_der().as_bytes());
+
+        let tlog = crate::sigstore::TlogEntry {
+            log_index: "42".into(),
+            log_id: crate::sigstore::LogId { key_id: log_id_hex },
+            integrated_time: integrated_time.to_string(),
+            inclusion_promise: None, // top-level absent
+            inclusion_proof: None,
+            verification: Some(crate::sigstore::RekorVerification {
+                inclusion_promise: Some(crate::sigstore::RekorInclusionPromise {
+                    signed_entry_timestamp: set_b64,
+                }),
+                inclusion_proof: None,
+            }),
+            canonicalized_body: canonicalized_body.to_string(),
+        };
+        let key = rekor_key_active_around(log_id_bytes, spki_der, integrated_time);
+        verify_rekor_set(
+            &tlog,
+            std::slice::from_ref(&key),
+            RekorInclusionProofPolicy::RequireSet,
+        )
+        .expect("legacy-shape SET (nested under `verification`) must verify");
+    }
+
+    #[test]
+    fn rejects_set_with_malformed_integrated_time_string() {
+        let tlog = crate::sigstore::TlogEntry {
+            log_index: "0".into(),
+            log_id: crate::sigstore::LogId {
+                key_id: String::new(),
+            },
+            integrated_time: "not-a-number".into(),
+            inclusion_promise: None,
+            inclusion_proof: None,
+            verification: None,
+            canonicalized_body: String::new(),
+        };
+        let err = verify_rekor_set(&tlog, &[], RekorInclusionProofPolicy::RequireSet)
+            .expect_err("malformed integratedTime must reject");
+        match err {
+            VerifyError::RekorSet(msg) => assert!(msg.contains("integratedTime"), "got: {msg}"),
+            other => panic!("expected VerifyError::RekorSet, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_set_with_non_hex_log_id() {
+        // A bundle whose logId.keyId is not valid hex must reject —
+        // verify_rekor_set hex-decodes it to look up the trust root.
+        let (signing_key, _spki_der, _log_id_bytes) = p256_rekor_signing_key();
+        let mut tlog =
+            synth_tlog_entry_with_set(&signing_key, "not!hex!", 42, 1700000000, "Zm9vYmFy");
+        // Re-encode signed_entry_timestamp because the synth helper
+        // already used the (invalid) hex in the SET input.
+        tlog.log_id.key_id = "not!hex!".into();
+        let err = verify_rekor_set(&tlog, &[], RekorInclusionProofPolicy::RequireSet)
+            .expect_err("non-hex logId must reject");
+        match err {
+            VerifyError::RekorSet(msg) => assert!(msg.contains("not valid hex"), "got: {msg}"),
+            other => panic!("expected VerifyError::RekorSet, got: {other:?}"),
+        }
     }
 
     #[test]
