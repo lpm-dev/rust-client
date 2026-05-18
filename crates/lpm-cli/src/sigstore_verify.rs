@@ -1703,8 +1703,16 @@ fn rfc6962_verify_inclusion(
 // which is exactly what we want — bundles from 2022 still verify
 // in 2027 against the 2022 Fulcio chain that signed them.
 
+/// Sigstore profile limits cert chains to 3 (leaf + intermediate +
+/// root). Caps the depth so a forged chain with attacker-injected
+/// "intermediates" can't grow unbounded under-the-radar even if a
+/// per-link constraint somehow misfires.
+const MAX_CHAIN_LENGTH: usize = 3;
+
 /// Verify an X.509 cert chain from the bundle terminates at one of
-/// the pinned Fulcio roots, with every link valid at `at_time`.
+/// the pinned Fulcio roots, with every link valid at `at_time` and
+/// every cert satisfying its position-appropriate X.509 extension
+/// profile.
 ///
 /// `bundle_chain_der`: ordered from leaf upward — `[leaf, intermediates...]`.
 /// `fulcio_roots`: filtered by [`TrustRoot::fulcio_roots_at(at_time)`]
@@ -1712,13 +1720,27 @@ fn rfc6962_verify_inclusion(
 /// final cert byte-equals one of those roots (or is signed by one).
 ///
 /// Returns `Ok(())` only when:
-/// 1. Every cert in the chain has `notBefore <= at_time <= notAfter`.
-/// 2. Every adjacent (child, parent) pair: child's signature
+/// 1. `bundle_chain_der.len() <= MAX_CHAIN_LENGTH`.
+/// 2. Every cert has `notBefore <= at_time <= notAfter`.
+/// 3. The leaf (`chain[0]`) satisfies the Sigstore leaf profile
+///    via [`enforce_leaf_constraints`] — not flagged as a CA, no
+///    `keyCertSign` if `KeyUsage` is present, `codeSigning` in
+///    `ExtendedKeyUsage` if EKU is present.
+/// 4. Every issuer (`chain[1..]`) satisfies the issuer profile via
+///    [`enforce_issuer_constraints`] — `BasicConstraints` present
+///    and critical with `cA = TRUE`, `keyCertSign` set if `KeyUsage`
+///    is present, and `pathLenConstraint >= remaining_depth` if set.
+/// 5. Every adjacent (child, parent) pair: child's signature
 ///    verifies under parent's SPKI AND child.issuer == parent.subject.
-/// 3. The chain's top cert byte-equals a trust anchor's leaf cert,
-///    OR its signature verifies under one of the trust anchors'
-///    leaf certs (covers both "chain includes root" and
-///    "chain stops at intermediate" cases).
+/// 6. The chain's top cert byte-equals a trust anchor cert, OR its
+///    signature verifies under one of the trust anchors (which also
+///    must satisfy the issuer profile).
+///
+/// Without (3) and (4), a Sigstore-issued leaf cert (which any party
+/// can obtain via OIDC) could be used as an "intermediate" to sign a
+/// forged child leaf with attacker-controlled SAN, bypassing
+/// Sigstore's identity binding entirely. The extension enforcement
+/// is load-bearing for the verifier's core guarantee.
 #[allow(dead_code)] // wired into provenance_fetch in Phase 2.1
 pub fn verify_cert_chain(
     bundle_chain_der: &[&[u8]],
@@ -1729,6 +1751,13 @@ pub fn verify_cert_chain(
         return Err(VerifyError::Chain(
             "bundle cert chain is empty (must include at least the leaf)".into(),
         ));
+    }
+    if bundle_chain_der.len() > MAX_CHAIN_LENGTH {
+        return Err(VerifyError::Chain(format!(
+            "bundle cert chain has {} certs (Sigstore profile allows at most {})",
+            bundle_chain_der.len(),
+            MAX_CHAIN_LENGTH
+        )));
     }
     if fulcio_roots.is_empty() {
         return Err(VerifyError::Chain(
@@ -1757,7 +1786,22 @@ pub fn verify_cert_chain(
         check_cert_validity_at(cert, at_time_dt, &format!("chain[{i}]"))?;
     }
 
-    // Step 2: every adjacent (child, parent) pair must chain
+    // Step 2: position-appropriate X.509 extension profile.
+    // Leaf MUST be non-CA; every issuer above the leaf MUST be a CA
+    // with keyCertSign authority. This is the defense against the
+    // "use a real Sigstore leaf cert as a CA" forgery — closes the
+    // identity-binding bypass.
+    enforce_leaf_constraints(&parsed[0], "chain[0] (leaf)")?;
+    for (i, cert) in parsed.iter().enumerate().skip(1) {
+        // "remaining_depth" = number of intermediate CAs that follow
+        // this cert on the path to the leaf (exclusive of both this
+        // cert and the leaf). For cert at chain index i (i >= 1),
+        // that's i - 1.
+        let remaining_depth = i - 1;
+        enforce_issuer_constraints(cert, remaining_depth, &format!("chain[{i}]"))?;
+    }
+
+    // Step 3: every adjacent (child, parent) pair must chain
     // structurally and cryptographically.
     for i in 0..parsed.len().saturating_sub(1) {
         verify_chain_link(
@@ -1767,7 +1811,7 @@ pub fn verify_cert_chain(
         )?;
     }
 
-    // Step 3: terminate at a trusted anchor. Two valid shapes:
+    // Step 4: terminate at a trusted anchor. Two valid shapes:
     //   (a) the chain's top cert IS one of the trust anchor certs
     //       (bundle included the Fulcio root).
     //   (b) the chain's top cert is signed by a trust anchor
@@ -1778,6 +1822,12 @@ pub fn verify_cert_chain(
     }
 
     let top_parsed = parsed.last().expect("non-empty checked above");
+    // The anchor in case (b) sits "above" the chain — its
+    // remaining_depth equals the number of intermediates already in
+    // the chain (`bundle_chain_der.len() - 1`, since chain[0] is the
+    // leaf and the leaf doesn't count as an intermediate following
+    // the anchor).
+    let anchor_remaining_depth = bundle_chain_der.len() - 1;
     for root in fulcio_roots {
         for root_der in &root.cert_chain_der {
             let Ok((_, root_cert)) = X509Certificate::from_der(root_der) else {
@@ -1788,6 +1838,14 @@ pub fn verify_cert_chain(
             // notBefore/notAfter is still a defense — fail-closed
             // if the trust root's cert itself is out of window.
             if check_cert_validity_at(&root_cert, at_time_dt, "fulcio_root").is_err() {
+                continue;
+            }
+            // The anchor must satisfy the issuer profile too — a
+            // misissued or rotated trust-root that lacks cA=TRUE
+            // should never anchor a chain.
+            if enforce_issuer_constraints(&root_cert, anchor_remaining_depth, "fulcio_root")
+                .is_err()
+            {
                 continue;
             }
             if try_anchor_signature(top_parsed, &root_cert).is_ok() {
@@ -1802,6 +1860,129 @@ pub fn verify_cert_chain(
          ({} candidate root(s) active at integratedTime)",
         fulcio_roots.len()
     )))
+}
+
+/// X.509 extension enforcement for a cert acting as a CA — every
+/// cert above the leaf in the chain, plus the trust anchor that
+/// terminates the chain on the `try_anchor_signature` branch.
+///
+/// Required:
+/// - `BasicConstraints` present, **critical**, `cA = TRUE`. Without
+///   this, a real Sigstore leaf cert (which any party can obtain via
+///   OIDC) could be used as a forged intermediate to sign an
+///   attacker-controlled child cert.
+/// - `pathLenConstraint` (when set) `>= remaining_depth`. Sigstore's
+///   intermediate has `pathLen = 0`, which means it can sign leaves
+///   but not further intermediates — closes "stack arbitrary
+///   intermediates between a real cert and a forged leaf."
+///
+/// If `KeyUsage` is present, require `keyCertSign`. Absent is
+/// permissive (real Fulcio CAs always include it, but rcgen-synth
+/// CAs may omit it without the strict profile).
+fn enforce_issuer_constraints(
+    cert: &X509Certificate<'_>,
+    remaining_depth: usize,
+    label: &str,
+) -> Result<(), VerifyError> {
+    let bc_ext = cert
+        .basic_constraints()
+        .map_err(|e| VerifyError::Chain(format!("{label}: BasicConstraints parse failed: {e}")))?;
+    let bc = bc_ext.ok_or_else(|| {
+        VerifyError::Chain(format!(
+            "{label}: BasicConstraints extension missing — issuer cert is not authorized to \
+             sign other certs (closes 'real Sigstore leaf as CA' forgery)"
+        ))
+    })?;
+    if !bc.critical {
+        return Err(VerifyError::Chain(format!(
+            "{label}: BasicConstraints extension is not marked critical \
+             (Sigstore profile requires criticality on issuers)"
+        )));
+    }
+    if !bc.value.ca {
+        return Err(VerifyError::Chain(format!(
+            "{label}: BasicConstraints.cA is FALSE — issuer cert is not authorized to sign certs"
+        )));
+    }
+    if let Some(plc) = bc.value.path_len_constraint
+        && (plc as usize) < remaining_depth
+    {
+        return Err(VerifyError::Chain(format!(
+            "{label}: BasicConstraints.pathLenConstraint={plc} < remaining intermediate \
+             depth={remaining_depth} (forged chain trying to slip past Sigstore's path-length limit)"
+        )));
+    }
+
+    let ku_ext = cert
+        .key_usage()
+        .map_err(|e| VerifyError::Chain(format!("{label}: KeyUsage parse failed: {e}")))?;
+    if let Some(ku) = ku_ext
+        && !ku.value.key_cert_sign()
+    {
+        return Err(VerifyError::Chain(format!(
+            "{label}: KeyUsage extension does not include keyCertSign — issuer cert is not \
+             authorized to sign other certs"
+        )));
+    }
+
+    Ok(())
+}
+
+/// X.509 extension enforcement for the leaf cert (`chain[0]`).
+///
+/// Required:
+/// - `BasicConstraints` either absent OR `cA = FALSE`. A leaf
+///   flagged as a CA is structurally invalid for a Sigstore signing
+///   cert.
+///
+/// If `KeyUsage` is present, require `digitalSignature` AND reject
+/// `keyCertSign`. (A leaf that asserts `keyCertSign` is fundamentally
+/// abusable.) If `ExtendedKeyUsage` is present, require `codeSigning`
+/// per Sigstore's Fulcio leaf profile. Absent extensions are
+/// permissive — rcgen test leaves may omit them.
+fn enforce_leaf_constraints(cert: &X509Certificate<'_>, label: &str) -> Result<(), VerifyError> {
+    let bc_ext = cert
+        .basic_constraints()
+        .map_err(|e| VerifyError::Chain(format!("{label}: BasicConstraints parse failed: {e}")))?;
+    if let Some(bc) = bc_ext
+        && bc.value.ca
+    {
+        return Err(VerifyError::Chain(format!(
+            "{label}: BasicConstraints.cA is TRUE — leaf cert must NOT be a CA"
+        )));
+    }
+
+    let ku_ext = cert
+        .key_usage()
+        .map_err(|e| VerifyError::Chain(format!("{label}: KeyUsage parse failed: {e}")))?;
+    if let Some(ku) = ku_ext {
+        if !ku.value.digital_signature() {
+            return Err(VerifyError::Chain(format!(
+                "{label}: KeyUsage extension does not include digitalSignature \
+                 (Sigstore leaves must be signing-capable)"
+            )));
+        }
+        if ku.value.key_cert_sign() {
+            return Err(VerifyError::Chain(format!(
+                "{label}: KeyUsage extension includes keyCertSign — leaf cert is fundamentally \
+                 abusable as an intermediate"
+            )));
+        }
+    }
+
+    let eku_ext = cert
+        .extended_key_usage()
+        .map_err(|e| VerifyError::Chain(format!("{label}: ExtendedKeyUsage parse failed: {e}")))?;
+    if let Some(eku) = eku_ext
+        && !eku.value.code_signing
+    {
+        return Err(VerifyError::Chain(format!(
+            "{label}: ExtendedKeyUsage does not include codeSigning \
+             (Sigstore Fulcio leaf profile requires it)"
+        )));
+    }
+
+    Ok(())
 }
 
 fn anchor_contains_der(fulcio_roots: &[&FulcioRoot], top_der: &[u8]) -> bool {
@@ -4074,6 +4255,239 @@ mod tests {
         match err {
             VerifyError::Chain(msg) => assert!(msg.contains("not valid DER X.509"), "got: {msg}"),
             other => panic!("expected Chain, got: {other:?}"),
+        }
+    }
+
+    // ── verify_cert_chain — Vuln 1 (BasicConstraints bypass) ─────
+
+    /// Helper: build a P-256 cert that is NOT a CA (Sigstore leaf
+    /// shape), but used as an "issuer" — i.e. its keypair signs
+    /// another cert beneath it. This is the building block of the
+    /// Vuln 1 attack scenario.
+    fn p256_leaf_shaped_cert(params: rcgen::CertificateParams) -> (rcgen::Certificate, KeyPair) {
+        let kp = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).unwrap();
+        // is_ca defaults to NoCa, which is what we want
+        let cert = params.self_signed(&kp).unwrap();
+        (cert, kp)
+    }
+
+    #[test]
+    fn rejects_forged_leaf_signed_by_real_leaf_used_as_intermediate() {
+        // THE Vuln 1 attack: attacker obtains a legitimate Sigstore
+        // leaf cert L_attacker (non-CA) and its ephemeral private key.
+        // Within L_attacker's validity window, they sign a forged
+        // child cert L_forged with attacker-chosen SAN. The bundle
+        // ships [L_forged, L_attacker, real_fulcio_root].
+        //
+        // Pre-fix: verify_cert_chain returned Ok because no
+        // BasicConstraints check was performed on L_attacker.
+        // Post-fix: enforce_issuer_constraints on L_attacker rejects
+        // because its BasicConstraints extension is absent / cA=FALSE.
+        let (fulcio_root_cert, fulcio_root_der, fulcio_root_kp) =
+            p384_root_cert(cert_params_validity(2025));
+        // Real attacker leaf: signed by Fulcio root, NoCa, P-256.
+        // Use existing p256_leaf_signed_by which produces a NoCa leaf.
+        let real_attacker_leaf_der = p256_leaf_signed_by(
+            cert_params_validity(2025),
+            &fulcio_root_cert,
+            &fulcio_root_kp,
+        );
+        // Forge a child cert signed by real_attacker_leaf's keypair.
+        // To do this we need the keypair (rcgen returned it from
+        // p256_leaf_signed_by — but that helper discarded it). Re-build
+        // the attacker leaf so we own its keypair.
+        let (attacker_leaf_cert_obj, attacker_leaf_kp) = {
+            let leaf_kp = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).unwrap();
+            let cert = cert_params_validity(2025)
+                .signed_by(&leaf_kp, &fulcio_root_cert, &fulcio_root_kp)
+                .unwrap();
+            (cert, leaf_kp)
+        };
+        let real_attacker_leaf_der_v2 = attacker_leaf_cert_obj.der().to_vec();
+        // Build the forged child under the attacker's leaf.
+        let forged_child_der = p256_leaf_signed_by(
+            cert_params_validity(2025),
+            &attacker_leaf_cert_obj,
+            &attacker_leaf_kp,
+        );
+        let _ = real_attacker_leaf_der; // shadowed by v2 above
+
+        let fulcio_root = fulcio_root_active_at(2025, fulcio_root_der);
+        let chain: Vec<&[u8]> = vec![&forged_child_der, &real_attacker_leaf_der_v2];
+        let roots: Vec<&FulcioRoot> = vec![&fulcio_root];
+        let err = verify_cert_chain(&chain, &roots, ts_year(2025))
+            .expect_err("forged-leaf-under-real-leaf chain must reject");
+        match err {
+            VerifyError::Chain(msg) => {
+                assert!(
+                    msg.contains("BasicConstraints") || msg.contains("not authorized"),
+                    "expected BasicConstraints rejection naming the forgery, got: {msg}"
+                );
+            }
+            other => panic!("expected VerifyError::Chain, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_chain_with_ca_flagged_leaf() {
+        // A leaf cert with BasicConstraints.cA=TRUE is structurally
+        // invalid for a Sigstore signing leaf.
+        let (root_cert, root_der, root_kp) = p384_root_cert(cert_params_validity(2025));
+        // Build a "leaf" that's flagged as a CA.
+        let leaf_der = {
+            let leaf_kp = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).unwrap();
+            let mut params = cert_params_validity(2025);
+            params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+            let cert = params.signed_by(&leaf_kp, &root_cert, &root_kp).unwrap();
+            cert.der().to_vec()
+        };
+        let root = fulcio_root_active_at(2025, root_der.clone());
+        let chain: Vec<&[u8]> = vec![&leaf_der, &root_der];
+        let roots: Vec<&FulcioRoot> = vec![&root];
+        let err = verify_cert_chain(&chain, &roots, ts_year(2025))
+            .expect_err("CA-flagged leaf must reject");
+        match err {
+            VerifyError::Chain(msg) => assert!(
+                msg.contains("cA is TRUE") && msg.contains("leaf"),
+                "expected CA-flagged-leaf diagnostic, got: {msg}"
+            ),
+            other => panic!("expected VerifyError::Chain, got: {other:?}"),
+        }
+    }
+
+    // The `KeyUsage.keyCertSign`-on-leaf branch of
+    // `enforce_leaf_constraints` is not unit-tested here because
+    // rcgen 0.13.2 only emits X509v3 extensions on `signed_by`
+    // when `is_ca = IsCa::Ca(...)`. A non-CA leaf with
+    // `key_usages = [..., KeyCertSign]` ends up with ZERO extensions
+    // in the DER, so we can't generate a cert with that exact
+    // shape via rcgen. Forcing `is_ca = Ca` would make the
+    // earlier BasicConstraints.cA=TRUE check fire first, masking
+    // the keyCertSign branch.
+    //
+    // The keyCertSign check is still active in production code —
+    // a real-world malformed cert (e.g. one minted by a misissuing
+    // CA via raw DER) with `cA=FALSE` AND `KeyUsage.keyCertSign`
+    // would be rejected. Defense in depth on top of the BC check.
+
+    #[test]
+    fn rejects_chain_exceeding_max_length() {
+        // A 4-cert chain must reject pre-emptively, before any
+        // signature work, regardless of whether the certs themselves
+        // are internally consistent.
+        let (root_cert, root_der, root_kp) = p384_root_cert(cert_params_validity(2025));
+        let leaf_der = p256_leaf_signed_by(cert_params_validity(2025), &root_cert, &root_kp);
+        let chain: Vec<&[u8]> = vec![&leaf_der, &leaf_der, &leaf_der, &root_der];
+        let root = fulcio_root_active_at(2025, root_der.clone());
+        let roots: Vec<&FulcioRoot> = vec![&root];
+        let err = verify_cert_chain(&chain, &roots, ts_year(2025))
+            .expect_err("length-4 chain must reject");
+        match err {
+            VerifyError::Chain(msg) => assert!(
+                msg.contains("at most"),
+                "expected max-length diagnostic, got: {msg}"
+            ),
+            other => panic!("expected VerifyError::Chain, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_intermediate_with_path_len_constraint_exceeded() {
+        // Build a root that has pathLen=0, then chain
+        // [leaf, intermediate, root]. The intermediate (1 below root)
+        // sits at position 1; remaining_depth for the root is 1.
+        // pathLen=0 < 1 → reject.
+        let (root_cert, root_der, root_kp) = {
+            let kp = KeyPair::generate_for(&rcgen::PKCS_ECDSA_P384_SHA384).unwrap();
+            let mut params = cert_params_validity(2025);
+            params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Constrained(0));
+            let cert = params.self_signed(&kp).unwrap();
+            let der = cert.der().to_vec();
+            (cert, der, kp)
+        };
+        // Intermediate signed by the root, also a CA.
+        let intermediate_cert = {
+            let inter_kp = KeyPair::generate_for(&rcgen::PKCS_ECDSA_P384_SHA384).unwrap();
+            let mut params = cert_params_validity(2025);
+            params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+            params.signed_by(&inter_kp, &root_cert, &root_kp).unwrap()
+        };
+        let intermediate_der = intermediate_cert.der().to_vec();
+        // The leaf doesn't matter for this test — root rejects
+        // before signature work.
+        let leaf_der = p256_leaf_signed_by(cert_params_validity(2025), &root_cert, &root_kp);
+        let chain: Vec<&[u8]> = vec![&leaf_der, &intermediate_der, &root_der];
+        let root = fulcio_root_active_at(2025, root_der.clone());
+        let roots: Vec<&FulcioRoot> = vec![&root];
+        let err = verify_cert_chain(&chain, &roots, ts_year(2025))
+            .expect_err("pathLen exceeded must reject");
+        match err {
+            VerifyError::Chain(msg) => assert!(
+                msg.contains("pathLenConstraint"),
+                "expected pathLen diagnostic, got: {msg}"
+            ),
+            other => panic!("expected VerifyError::Chain, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_anchor_lacking_ca_flag_during_try_anchor_signature_path() {
+        // If the trust-root metadata pinned a Fulcio "root" cert
+        // that wasn't actually a CA, verify_cert_chain must refuse
+        // to anchor on it via the signature-verify path. Catches
+        // misconfigured operator-supplied or rotated roots that
+        // accidentally include a non-CA cert. The `try_anchor_
+        // signature` branch must enforce_issuer_constraints on the
+        // anchor before attempting the signature.
+        let (bogus_root_cert, bogus_root_kp) = p256_leaf_shaped_cert(cert_params_validity(2025));
+        // Leaf signed by the non-CA "root". The chain doesn't ship
+        // the bogus root — it's only in fulcio_roots — to force the
+        // try_anchor_signature branch.
+        let leaf_kp = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).unwrap();
+        let leaf_cert = cert_params_validity(2025)
+            .signed_by(&leaf_kp, &bogus_root_cert, &bogus_root_kp)
+            .unwrap();
+        let leaf_der = leaf_cert.der().to_vec();
+        let bogus_root_der_clone = bogus_root_cert.der().to_vec();
+        let bogus_anchor = fulcio_root_active_at(2025, bogus_root_der_clone);
+        let chain: Vec<&[u8]> = vec![&leaf_der];
+        let roots: Vec<&FulcioRoot> = vec![&bogus_anchor];
+        let err = verify_cert_chain(&chain, &roots, ts_year(2025))
+            .expect_err("non-CA anchor must reject");
+        // Since try_anchor_signature swallows the
+        // enforce_issuer_constraints error and tries the next anchor,
+        // the final diagnostic is the "no trusted Fulcio root" one.
+        // That's the right outcome — caller sees "untrusted root,"
+        // not "anchor misconfigured" (security through robust
+        // failure mode).
+        match err {
+            VerifyError::Chain(msg) => assert!(
+                msg.contains("does not match any trusted Fulcio root"),
+                "expected unanchored diagnostic, got: {msg}"
+            ),
+            other => panic!("expected VerifyError::Chain, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn vendored_fulcio_roots_satisfy_issuer_constraint_profile() {
+        // Sanity: every Fulcio root in the vendored trust root has
+        // BasicConstraints critical+cA=TRUE and (if present)
+        // KeyUsage.keyCertSign — i.e. each one passes
+        // enforce_issuer_constraints. A future rotation that vendors
+        // a non-conformant root trips this test loudly before any
+        // real install breaks.
+        let root = TrustRoot::parse(EMBEDDED_TRUST_ROOT_JSON).unwrap();
+        for (i, fulcio) in root.fulcio_roots.iter().enumerate() {
+            for (j, der) in fulcio.cert_chain_der.iter().enumerate() {
+                let (_, cert) = X509Certificate::from_der(der).unwrap();
+                // 0 = the cert is a root or topmost intermediate;
+                // no intermediates follow.
+                enforce_issuer_constraints(&cert, 0, &format!("fulcio[{i}].cert[{j}]"))
+                    .unwrap_or_else(|e| {
+                        panic!("vendored Fulcio cert[{j}] in CA[{i}] failed issuer profile: {e}")
+                    });
+            }
         }
     }
 
