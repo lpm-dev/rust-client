@@ -561,10 +561,14 @@ impl Sandbox for LandlockSandbox {
                 }
 
                 // ── Layer 0.5: resource limits (defense-in-depth DoS cap) ──
-                // setrlimit on RLIMIT_NPROC / NOFILE / CPU. Best-effort —
-                // each call ignores its return; on EPERM (already-tighter
-                // hard cap) or EINVAL (obscure kernel) we keep the
-                // inherited limit. AS-safe: three syscalls, no alloc.
+                // setrlimit on RLIMIT_NPROC / NOFILE / CPU / AS.
+                // Best-effort — each call ignores its return; on EPERM
+                // (already-tighter hard cap) or EINVAL (obscure kernel)
+                // we keep the inherited limit. AS-safe: four syscalls,
+                // no alloc. See `rlimits::apply_resource_limits_as_safe`
+                // for the per-resource rationale, including the "8 GiB
+                // RLIMIT_AS on Unix vs 2 GiB JOB_OBJECT_LIMIT_PROCESS_MEMORY
+                // on Windows" accounting-model asymmetry.
                 crate::rlimits::apply_resource_limits_as_safe();
 
                 // ── Layer 1: secret-file bind-mount overlay ──

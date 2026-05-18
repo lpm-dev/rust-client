@@ -228,6 +228,15 @@ impl Drop for AllocBudgetGuard<'_> {
         *guard = guard
             .saturating_add(self.bytes)
             .min(PARALLEL_EXTRACT_BUDGET_BYTES);
+        // `notify_all`, not `notify_one`: a single release can
+        // unblock multiple waiters with different reservation
+        // sizes simultaneously (e.g. releasing 256 MiB can satisfy
+        // both a 128 MiB and a 100 MiB waiter — total 228 MiB still
+        // fits). With `notify_one` only one would be woken and the
+        // other would stay parked even though the budget could
+        // serve it. Spurious wakeups for over-sized waiters
+        // re-enter the `while *guard < request` loop and re-park,
+        // which is cheap and never starves.
         self.budget.cv.notify_all();
     }
 }

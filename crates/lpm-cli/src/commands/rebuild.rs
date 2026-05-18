@@ -1788,9 +1788,17 @@ fn collect_unix_descendants(root: u32) -> Vec<u32> {
 /// Pure-logic helper for [`collect_unix_descendants`] — split out so
 /// the BFS-and-parser shape is covered by deterministic unit tests
 /// without spawning `ps`.
+///
+/// A `visited` set guards against pathological cycles in the input.
+/// Real `ps` output cannot contain a ppid cycle (pids form a tree by
+/// definition — every process has exactly one parent), but a
+/// malformed fixture, a future regression that produces synthetic
+/// rows, or a hostile environment that intercepts `ps` could feed
+/// one. Without the guard, a cycle like `100→200→300→200` would
+/// infinite-loop the BFS.
 #[cfg(unix)]
 fn collect_descendants_from_ps_output(text: &str, root: u32) -> Vec<u32> {
-    use std::collections::HashMap;
+    use std::collections::{HashMap, HashSet};
     let mut children: HashMap<u32, Vec<u32>> = HashMap::new();
     for line in text.lines() {
         let mut it = line.split_ascii_whitespace();
@@ -1805,11 +1813,13 @@ fn collect_descendants_from_ps_output(text: &str, root: u32) -> Vec<u32> {
         children.entry(ppid).or_default().push(pid);
     }
     let mut out = Vec::new();
+    let mut visited: HashSet<u32> = HashSet::new();
+    visited.insert(root);
     let mut frontier = vec![root];
     while let Some(p) = frontier.pop() {
         if let Some(kids) = children.get(&p) {
             for k in kids {
-                if *k != root {
+                if visited.insert(*k) {
                     out.push(*k);
                     frontier.push(*k);
                 }
@@ -1866,6 +1876,18 @@ mod kill_tree_tests {
         let ps = "  77  77\n  88  77\n";
         let got = collect_descendants_from_ps_output(ps, 77);
         assert_eq!(got, vec![88]);
+    }
+
+    #[test]
+    fn descendants_terminates_on_multi_node_ppid_cycle() {
+        // 100 → 200 → 300 → 200 forms a 2-cycle on {200, 300}.
+        // Without a visited-set the BFS would re-push 200 then 300
+        // forever. With the guard, each node is enqueued once and
+        // the walk terminates.
+        let ps = "  100   1\n  200 100\n  300 200\n  200 300\n";
+        let mut got = collect_descendants_from_ps_output(ps, 100);
+        got.sort();
+        assert_eq!(got, vec![200, 300]);
     }
 }
 

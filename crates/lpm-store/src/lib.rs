@@ -1534,18 +1534,23 @@ pub fn find_installed_package_baseline_indexed(
 ///
 /// **Multi-source-same-coords:** when two distinct sources share
 /// `(name, version)` and produce different graph keys, this helper
-/// picks the lexicographically smallest matching v2 link entry. The
-/// canonical ordering is load-bearing: a same-UID local attacker
-/// who plants `<links_root>/A@1.0.0+0000000000000000/` with a
-/// crafted sidecar gets first-match in inode order on most
-/// filesystems, but the lex sort ranks attacker-named link
-/// directories deterministically — `0000…`-prefixed names sort
-/// before legitimate hex-suffix names only when the attacker can
-/// also win the lex race, which still requires the legitimate
-/// link directory to have a lex-greater suffix. The real fix is a
-/// `(name, version, wrapper_id)` lookup once `wrapper_id` is
-/// threaded through the lockfile; canonical ordering is the
-/// pin-until-then.
+/// picks the lexicographically smallest matching v2 link entry.
+///
+/// The lex sort buys **reproducibility, not plant-attack defense.**
+/// Across runs, across filesystems (read_dir is inode-order on
+/// ext4/APFS and undefined elsewhere), and across the indexed +
+/// non-indexed variants of this lookup, the same input store now
+/// yields the same hit — patches/rebuilds become deterministic
+/// instead of inode-order-dependent. A same-UID local attacker
+/// who can plant `<links_root>/A@1.0.0+0000000000000000/` with
+/// a crafted sidecar will still win first-match deterministically
+/// (a `0000…`-prefixed graph-key suffix sorts before legitimate
+/// sha256-derived hex), and arguably more reliably than under
+/// inode-order luck — the lex sort does NOT close that attack.
+/// The actual defense against same-UID plants is the
+/// `(name, version, wrapper_id)` lookup tracked separately, which
+/// will require `wrapper_id` to flow through the lockfile;
+/// canonical ordering is the reproducibility pin in the meantime.
 pub fn find_installed_package_baseline(
     lpm_root: &lpm_common::LpmRoot,
     name: &str,

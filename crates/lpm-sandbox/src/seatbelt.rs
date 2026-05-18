@@ -427,10 +427,52 @@ fn canonicalize_or_passthrough(path: &Path, field: &str) -> Result<PathBuf, Sand
     }
 }
 
-fn scheme_quote(s: &str) -> String {
+/// Escape `s` into a quoted SBPL string literal in one pass,
+/// failing on any input character that would perturb the SBPL
+/// parser before the SBPL escape rules can contain it.
+///
+/// **Rejected characters (returns `ProfileRenderFailed`):**
+/// - C0 controls (`0x00..=0x1F`) including LF, CR, TAB, NUL
+/// - DEL (`0x7F`)
+/// - C1 controls (`0x80..=0x9F`)
+///
+/// POSIX disallows NUL in pathnames outright; the other control
+/// bytes are *technically permitted* by the filesystem but never
+/// appear in legitimate path content, and any one of them in a
+/// `sandboxWriteDirs[i]` entry is a strong injection signal. LF
+/// in particular was the documented Seatbelt-injection vector —
+/// even with `"` and `\` already escaped, a literal newline could
+/// terminate the rendered string in parsers that treat LF as a
+/// token boundary. We refuse the whole control range uniformly so
+/// callers can't bypass via a CR/TAB/NUL variant.
+///
+/// **Passed through unchanged:** regular punctuation that some
+/// sources flag as Scheme-meta (`(`, `)`, `;`, `` ` ``, `'`) — per
+/// the SBPL grammar these are valid data inside a `"..."` string
+/// literal, and rejecting them would refuse legitimate macOS paths
+/// (e.g. `/Users/<n>/work (proj)/`).
+///
+/// **Escaped:** `"` becomes `\"` and `\` becomes `\\` per the
+/// Scheme-like SBPL string literal syntax.
+///
+/// The error surfaces with a hex code-point hint (`U+XXXX`) so the
+/// offending byte itself never reaches log output, and names the
+/// field so the caller knows which path was rejected.
+fn scheme_quote_strict(s: &str, field: &str) -> Result<String, SandboxError> {
     let mut out = String::with_capacity(s.len() + 2);
     out.push('"');
-    for c in s.chars() {
+    for (idx, c) in s.char_indices() {
+        let code = c as u32;
+        if code <= 0x1F || code == 0x7F || (0x80..=0x9F).contains(&code) {
+            return Err(SandboxError::ProfileRenderFailed {
+                reason: format!(
+                    "{field} contains a control character at byte {idx} \
+                     (U+{code:04X}); paths with embedded control bytes \
+                     are refused at profile render time because they \
+                     can perturb SBPL string parsing",
+                ),
+            });
+        }
         match c {
             '"' => out.push_str("\\\""),
             '\\' => out.push_str("\\\\"),
@@ -438,52 +480,7 @@ fn scheme_quote(s: &str) -> String {
         }
     }
     out.push('"');
-    out
-}
-
-/// Strict variant of [`scheme_quote`] that fails on input containing
-/// characters that could perturb the SBPL string parser. Control
-/// characters (LF, CR, TAB, NUL, and the rest of the C0 range) are
-/// rejected — they have no place in a filesystem path, and an
-/// embedded LF on `sandboxWriteDirs[i]` (a string sourced from
-/// untrusted `package.json`) was the documented Seatbelt-injection
-/// vector: even though `"` and `\` were already escaped, a literal
-/// newline could terminate the string in parsers that treat LF as
-/// a token boundary. C1 controls (U+0080..U+009F) are rejected for
-/// the same reason — they're never legitimate path content.
-///
-/// Regular punctuation that some sources flag as Scheme-meta
-/// (`(`, `)`, `;`, `` ` ``, `'`) is passed through unchanged: per the
-/// SBPL grammar these are valid data inside a `"..."` string
-/// literal, and rejecting them would refuse legitimate paths
-/// (e.g. macOS project directories under `/Users/<n>/work (proj)/`).
-///
-/// The error surfaces as `ProfileRenderFailed` so the caller sees
-/// which field was rejected, with a hex code-point hint rather
-/// than the offending control byte itself in the message.
-fn scheme_quote_strict(s: &str, field: &str) -> Result<String, SandboxError> {
-    if let Some((idx, ch)) = s.char_indices().find(|(_, c)| is_sbpl_unsafe_char(*c)) {
-        return Err(SandboxError::ProfileRenderFailed {
-            reason: format!(
-                "{field} contains a control character at byte {idx} \
-                 (U+{cp:04X}); paths with embedded control bytes \
-                 are refused at profile render time because they \
-                 can perturb SBPL string parsing",
-                cp = ch as u32,
-            ),
-        });
-    }
-    Ok(scheme_quote(s))
-}
-
-#[inline]
-fn is_sbpl_unsafe_char(c: char) -> bool {
-    // C0 controls (0x00..=0x1F) plus DEL (0x7F) plus C1 (0x80..=0x9F).
-    // No legitimate path uses any of these. LF (0x0A) is the headline
-    // injection byte; the rest are blocked uniformly so callers
-    // can't bypass via a CR / TAB / NUL variant.
-    let code = c as u32;
-    code <= 0x1F || code == 0x7F || (0x80..=0x9F).contains(&code)
+    Ok(out)
 }
 
 /// Render the LogOnly-mode Seatbelt profile for the given
@@ -748,16 +745,17 @@ mod tests {
     }
 
     #[test]
-    fn scheme_quote_escapes_quotes_and_backslashes() {
-        assert_eq!(scheme_quote(r#"simple"#), r#""simple""#);
-        assert_eq!(scheme_quote(r#"has"quote"#), r#""has\"quote""#);
-        assert_eq!(scheme_quote(r"has\slash"), r#""has\\slash""#);
-        assert_eq!(scheme_quote(r#"both"and\slash"#), r#""both\"and\\slash""#);
+    fn scheme_quote_strict_escapes_quotes_and_backslashes() {
+        let q = |s: &str| scheme_quote_strict(s, "test").unwrap();
+        assert_eq!(q(r#"simple"#), r#""simple""#);
+        assert_eq!(q(r#"has"quote"#), r#""has\"quote""#);
+        assert_eq!(q(r"has\slash"), r#""has\\slash""#);
+        assert_eq!(q(r#"both"and\slash"#), r#""both\"and\\slash""#);
     }
 
     #[test]
-    fn scheme_quote_handles_unicode() {
-        assert_eq!(scheme_quote("café"), r#""café""#);
+    fn scheme_quote_strict_handles_unicode() {
+        assert_eq!(scheme_quote_strict("café", "test").unwrap(), r#""café""#);
     }
 
     #[test]

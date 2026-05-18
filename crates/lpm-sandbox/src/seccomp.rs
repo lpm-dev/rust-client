@@ -157,12 +157,6 @@ const TYPE_MASK: u64 = !((libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC) as u64);
 #[cfg(target_arch = "x86_64")]
 const X32_SYSCALL_BIT: i64 = 0x4000_0000;
 
-/// IPPROTO_SCTP. Not exposed by libc 0.2 on every target, so pin
-/// the IANA-assigned value here. Used to deny the
-/// `AF_INET[6] + SOCK_STREAM + IPPROTO_SCTP` shape (SCTP one-to-one),
-/// which would otherwise bypass the family/type matrix.
-const IPPROTO_SCTP: u64 = 132;
-
 /// Build the deny rule vector for `socket(2)`. The same vector is
 /// registered under both `SYS_socket` and (on x86_64) the x32
 /// `__X32_SYSCALL_BIT | SYS_socket` key so the matrix applies to
@@ -215,7 +209,12 @@ fn build_socket_rules() -> Result<Vec<SeccompRule>, seccompiler::Error> {
                 SeccompCmpOp::MaskedEq(TYPE_MASK),
                 libc::SOCK_STREAM as u64,
             )?,
-            SeccompCondition::new(2, SeccompCmpArgLen::Dword, SeccompCmpOp::Eq, IPPROTO_SCTP)?,
+            SeccompCondition::new(
+                2,
+                SeccompCmpArgLen::Dword,
+                SeccompCmpOp::Eq,
+                libc::IPPROTO_SCTP as u64,
+            )?,
         ])?,
         SeccompRule::new(vec![
             SeccompCondition::new(
@@ -230,7 +229,12 @@ fn build_socket_rules() -> Result<Vec<SeccompRule>, seccompiler::Error> {
                 SeccompCmpOp::MaskedEq(TYPE_MASK),
                 libc::SOCK_STREAM as u64,
             )?,
-            SeccompCondition::new(2, SeccompCmpArgLen::Dword, SeccompCmpOp::Eq, IPPROTO_SCTP)?,
+            SeccompCondition::new(
+                2,
+                SeccompCmpArgLen::Dword,
+                SeccompCmpOp::Eq,
+                libc::IPPROTO_SCTP as u64,
+            )?,
         ])?,
         family_only(libc::AF_PACKET)?,
         family_only(libc::AF_NETLINK)?,
