@@ -877,11 +877,23 @@ async fn try_connect(
                                         };
                                         captured.summary = webhook::summarize_webhook(&captured);
 
-                                        // Run signature diagnostics on failed webhook responses.
-                                        // Only runs when status >= 400, so zero overhead on success.
+                                        // Signature diagnostics on 4xx/5xx only. Explicit env
+                                        // allowlist — std::env::vars().collect() would silently
+                                        // leak unrelated secrets if the diagnostic ever logged
+                                        // its inputs.
                                         if captured.response_status >= 400 {
-                                            let env_vars: HashMap<String, String> =
-                                                std::env::vars().collect();
+                                            const DIAGNOSTIC_ENV_ALLOWLIST: &[&str] = &[
+                                                "STRIPE_WEBHOOK_SECRET",
+                                                "STRIPE_SIGNING_SECRET",
+                                                "GITHUB_WEBHOOK_SECRET",
+                                            ];
+                                            let mut env_vars: HashMap<String, String> =
+                                                HashMap::new();
+                                            for name in DIAGNOSTIC_ENV_ALLOWLIST {
+                                                if let Ok(v) = std::env::var(name) {
+                                                    env_vars.insert((*name).to_string(), v);
+                                                }
+                                            }
                                             captured.signature_diagnostic =
                                                 webhook_signature::diagnose_signature_failure(
                                                     &captured, &env_vars,

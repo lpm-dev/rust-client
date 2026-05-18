@@ -136,7 +136,8 @@ use windows_sys::Win32::Storage::FileSystem::{
     GetFileInformationByHandleEx, OPEN_EXISTING,
 };
 use windows_sys::Win32::System::JobObjects::{
-    AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+    AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_ACTIVE_PROCESS,
+    JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, JOB_OBJECT_LIMIT_PROCESS_MEMORY,
     JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
     SetInformationJobObject, TerminateJobObject,
 };
@@ -1160,7 +1161,20 @@ fn create_kill_on_close_job_and_attach(
     let job_owned = OwnedHandle(job);
 
     let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = unsafe { std::mem::zeroed() };
-    info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+    // Defense-in-depth DoS caps (M21):
+    //   ACTIVE_PROCESS — caps process count INSIDE this job (job-scoped,
+    //     not user-scoped — closes the fork-bomb gap the Unix
+    //     `RLIMIT_NPROC` can't fully close).
+    //   PROCESS_MEMORY — per-process commit cap, the OOM-trigger
+    //     analog. ~2 GiB per descendant; node-gyp + electron builds
+    //     legitimately reach into the GiB range so going much
+    //     lower breaks legitimate scripts.
+    //   KILL_ON_JOB_CLOSE — preserved from the prior contract.
+    info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+        | JOB_OBJECT_LIMIT_ACTIVE_PROCESS
+        | JOB_OBJECT_LIMIT_PROCESS_MEMORY;
+    info.BasicLimitInformation.ActiveProcessLimit = 512;
+    info.ProcessMemoryLimit = 2 * 1024 * 1024 * 1024;
     // SAFETY: documented call pattern; size matches the struct.
     let ok = unsafe {
         SetInformationJobObject(

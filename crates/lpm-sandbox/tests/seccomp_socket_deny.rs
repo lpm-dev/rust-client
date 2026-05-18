@@ -182,7 +182,28 @@ fn denies_udp_socket_under_strict() {
         .arg(libc::SOCK_DGRAM.to_string())
         .arg("0")
         .envs_cleared([("PATH", "/usr/bin:/bin")]);
-    let mut child = sb.spawn(cmd).expect("spawn socket-probe under strict");
+    let mut child = match sb.spawn(cmd) {
+        Ok(c) => c,
+        // L13 fail-closed under PartiallyEnforced. Some kernel
+        // builds (notably the GitHub Actions Ubuntu runners as of
+        // 2026-05) advertise landlock V4 ABI but only partially
+        // wire BindTcp/ConnectTcp under the LSM. The L13 closure
+        // explicitly refuses to spawn in that case rather than
+        // silently degrade the strict-network claim. There's no
+        // parent-side probe to detect this state without
+        // restricting the test runner itself, so the spawn-EPERM
+        // mode IS the detection: catch it and skip rather than
+        // fail. Hosts that deliver FullyEnforced still exercise
+        // the full deny-matrix assertion below.
+        Err(SandboxError::SpawnFailed { reason }) if reason.contains("Operation not permitted") => {
+            eprintln!(
+                "skipping: kernel landlock V4 is PartiallyEnforced on this host; \
+                 L13 fail-closed refused the strict spawn. reason: {reason}",
+            );
+            return;
+        }
+        Err(e) => panic!("spawn socket-probe under strict: {e:?}"),
+    };
     let status = child.wait().expect("wait socket-probe");
     assert!(
         status.success(),

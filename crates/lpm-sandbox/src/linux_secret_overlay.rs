@@ -380,6 +380,25 @@ pub(crate) unsafe fn apply_secret_overlay_in_child(spec: &SecretOverlaySpec) {
             );
         }
     }
+
+    // Step 5: remount /proc with `hidepid=2,subset=pid` to narrow the
+    // landlock /proc Read grant — blocks cross-UID introspection and
+    // trims system-wide non-pid entries. Best-effort; kernels without
+    // `subset=pid` no-op silently. (Same-UID isolation requires
+    // CLONE_NEWPID + double-fork, which `Command::pre_exec`'s single-
+    // fork-execve shape doesn't support.)
+    const PROC_PATH: &[u8] = b"/proc\0";
+    const PROC_FSTYPE: &[u8] = b"proc\0";
+    const PROC_OPTS: &[u8] = b"hidepid=2,subset=pid\0";
+    unsafe {
+        libc::mount(
+            PROC_FSTYPE.as_ptr() as *const libc::c_char,
+            PROC_PATH.as_ptr() as *const libc::c_char,
+            PROC_FSTYPE.as_ptr() as *const libc::c_char,
+            libc::MS_REMOUNT | libc::MS_NOSUID | libc::MS_NODEV | libc::MS_NOEXEC,
+            PROC_OPTS.as_ptr() as *const libc::c_void,
+        );
+    }
 }
 
 /// AS-safe `write_all`-style helper for `/proc/self/*` files.

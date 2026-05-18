@@ -482,6 +482,12 @@ impl Sandbox for LandlockSandbox {
         let mut ruleset_opt = Some(ruleset);
         let mut seccomp_opt = seccomp_program;
         let mut overlay_opt = overlay_spec;
+        // Strict posture promises TCP-egress denial, so the child must
+        // refuse `RulesetStatus::PartiallyEnforced` — a kernel build
+        // that advertises V4 but only partially wires BindTcp/ConnectTcp
+        // would otherwise silently degrade the claim. Default/Degraded
+        // only depend on V1 filesystem rules and accept partial.
+        let is_strict_posture = matches!(self.posture, BackendPosture::Strict);
 
         // SAFETY: This closure runs post-fork, pre-exec in the
         // child. The body is AS-safe: no heap allocation, no lock
@@ -513,20 +519,59 @@ impl Sandbox for LandlockSandbox {
         //     drops trivially.
         //
         // install order:
-        //   1. seccompiler::apply_filter — installs the socket(2)
-        //      deny filter. apply_filter ITSELF issues
-        //      prctl(PR_SET_NO_NEW_PRIVS, 1, …) first (required
-        //      for unprivileged seccomp install), then the
-        //      seccomp(2) syscall. Both are direct, AS-safe.
-        //   2. landlock_ruleset.restrict_self — the canonical
+        //   0. prctl(PR_SET_NO_NEW_PRIVS, 1, …) — set BEFORE the
+        //      secret-overlay `unshare(CLONE_NEWUSER)`. Inside a
+        //      fresh user namespace a process appears as uid 0
+        //      with full namespaced capabilities, which makes
+        //      any setuid binary inherited via PATH a defense-
+        //      in-depth liability and feeds kernel-CVE chains
+        //      (CVE-2022-0185 / CVE-2023-32233 chained
+        //      CLONE_NEWUSER + post-namespace setuid exec).
+        //      NO_NEW_PRIVS makes setuid bits ineffective for
+        //      this process and every child it execs.
+        //   1. secret-overlay bind-mount + procfs remount.
+        //   2. seccompiler::apply_filter — installs the socket(2)
+        //      deny filter. apply_filter ITSELF redundantly
+        //      issues prctl(PR_SET_NO_NEW_PRIVS, 1, …) (no-op
+        //      after step 0), then the seccomp(2) syscall. Both
+        //      are direct, AS-safe.
+        //   3. landlock_ruleset.restrict_self — the canonical
         //      lockdown call (also redundantly asserts
-        //      NO_NEW_PRIVS, a no-op since step 1 set it).
-        // Both layers fail-closed: any failure returns EPERM
+        //      NO_NEW_PRIVS, no-op).
+        // Every layer fail-closes: any failure returns EPERM
         // from the closure, the kernel skips execve, the
         // lifecycle script never runs.
         unsafe {
             command.pre_exec(move || {
-                // ── Layer 0: secret-file bind-mount overlay ──
+                // ── Layer 0: NO_NEW_PRIVS (must precede unshare) ──
+                // SAFETY: libc::prctl is async-signal-safe (single
+                // syscall). The trailing three args are ignored for
+                // PR_SET_NO_NEW_PRIVS but the prctl(2) prototype
+                // requires them.
+                //
+                // ENOSYS on kernels < 3.5 (PR_SET_NO_NEW_PRIVS was
+                // added in 3.5). seccompiler::apply_filter would
+                // also fail on such kernels, so the only behavior
+                // change is a more specific stderr line.
+                if libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0 {
+                    write_stderr_as_safe(
+                        b"lpm-sandbox: PR_SET_NO_NEW_PRIVS failed; refusing to enter namespace\n",
+                    );
+                    return Err(std::io::Error::from_raw_os_error(libc::EPERM));
+                }
+
+                // ── Layer 0.5: resource limits (defense-in-depth DoS cap) ──
+                // setrlimit on RLIMIT_NPROC / NOFILE / CPU / AS.
+                // Best-effort — each call ignores its return; on EPERM
+                // (already-tighter hard cap) or EINVAL (obscure kernel)
+                // we keep the inherited limit. AS-safe: four syscalls,
+                // no alloc. See `rlimits::apply_resource_limits_as_safe`
+                // for the per-resource rationale, including the "8 GiB
+                // RLIMIT_AS on Unix vs 2 GiB JOB_OBJECT_LIMIT_PROCESS_MEMORY
+                // on Windows" accounting-model asymmetry.
+                crate::rlimits::apply_resource_limits_as_safe();
+
+                // ── Layer 1: secret-file bind-mount overlay ──
                 // Best-effort: enter a user+mount namespace and
                 // bind-mount /dev/null over every enumerated
                 // project secret file. AS-safe by construction (no
@@ -552,7 +597,7 @@ impl Sandbox for LandlockSandbox {
                     crate::linux_secret_overlay::apply_secret_overlay_in_child(&spec);
                 }
 
-                // ── Layer 1: seccomp ──
+                // ── Layer 2: seccomp ──
                 // Take the BpfProgram out of the Option, then
                 // wrap it in `ManuallyDrop` so its inner
                 // `Vec<sock_filter>` is NOT freed in the child.
@@ -597,7 +642,7 @@ impl Sandbox for LandlockSandbox {
                     }
                 }
 
-                // ── Layer 2: landlock (the strict posture) ──
+                // ── Layer 3: landlock (the strict posture) ──
                 let rs = match ruleset_opt.take() {
                     Some(r) => r,
                     None => {
@@ -611,6 +656,15 @@ impl Sandbox for LandlockSandbox {
                     Ok(status) if matches!(status.ruleset, RulesetStatus::NotEnforced) => {
                         write_stderr_as_safe(
                             b"landlock: ruleset NotEnforced; refusing to run unsandboxed\n",
+                        );
+                        Err(std::io::Error::from_raw_os_error(libc::EPERM))
+                    }
+                    Ok(status)
+                        if is_strict_posture
+                            && !matches!(status.ruleset, RulesetStatus::FullyEnforced) =>
+                    {
+                        write_stderr_as_safe(
+                            b"landlock: PartiallyEnforced under strict posture; refusing\n",
                         );
                         Err(std::io::Error::from_raw_os_error(libc::EPERM))
                     }

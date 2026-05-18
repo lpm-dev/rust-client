@@ -52,6 +52,21 @@ struct Inner {
     pub local_port: u16,
     /// The tunnel URL (set after connection).
     pub tunnel_url: RwLock<Option<String>>,
+    /// Per-process random auth token gating every `/api/*` route — closes
+    /// the same-UID attacker on shared hosts (loopback bind alone is not
+    /// enough on CI runners / dev containers).
+    auth_token: String,
+}
+
+fn generate_auth_token() -> String {
+    use rand::RngCore;
+    let mut bytes = [0u8; 32];
+    rand::thread_rng().fill_bytes(&mut bytes);
+    let mut hex = String::with_capacity(64);
+    for b in bytes {
+        hex.push_str(&format!("{b:02x}"));
+    }
+    hex
 }
 
 impl InspectorState {
@@ -69,6 +84,7 @@ impl InspectorState {
                 session_id: RwLock::new(None),
                 local_port,
                 tunnel_url: RwLock::new(None),
+                auth_token: generate_auth_token(),
             }),
         }
     }
@@ -87,8 +103,14 @@ impl InspectorState {
                 session_id: RwLock::new(None),
                 local_port,
                 tunnel_url: RwLock::new(None),
+                auth_token: generate_auth_token(),
             }),
         }
+    }
+
+    /// Per-process auth token required on every `/api/*` request.
+    pub fn auth_token(&self) -> &str {
+        &self.inner.auth_token
     }
 
     /// Push a captured request into the buffer, broadcast to SSE, and persist to SQLite.

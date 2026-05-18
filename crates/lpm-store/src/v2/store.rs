@@ -1335,31 +1335,16 @@ fn materialize_into(src: &Path, dst: &Path) -> Result<(), LpmError> {
         if file_type.is_dir() {
             materialize_into(&src_path, &dst_path)?;
         } else if file_type.is_symlink() {
-            // Symlinks inside the object dir (rare — registry tarballs
-            // can contain them) round-trip as symlinks, not their
-            // dereferenced targets. Anything else would diverge from
-            // the tarball's intent.
-            let target = std::fs::read_link(&src_path).map_err(|e| {
-                LpmError::Store(format!(
-                    "failed to read v2 source symlink {}: {e}",
-                    src_path.display()
-                ))
-            })?;
-            #[cfg(unix)]
-            std::os::unix::fs::symlink(&target, &dst_path).map_err(|e| {
-                LpmError::Store(format!(
-                    "failed to create v2 dest symlink {} → {}: {e}",
-                    dst_path.display(),
-                    target.display()
-                ))
-            })?;
-            #[cfg(windows)]
-            {
-                let _ = target; // file-vs-dir distinction unused here
-                return Err(LpmError::Store(
-                    "v2 source symlinks are not yet supported on Windows".into(),
-                ));
-            }
+            // Refuse symlink entries — the extractor's `is_file()`
+            // filter blocks them at extract time, so a symlink under
+            // `objects/` means a same-UID actor planted it. Symmetric
+            // with the v1→v2 `copy_dir_recursively` refusal.
+            let target = std::fs::read_link(&src_path).unwrap_or_default();
+            return Err(LpmError::Store(format!(
+                "refusing v2 symlink entry {} → {}; symlinks must not appear under objects/",
+                src_path.display(),
+                target.display(),
+            )));
         } else if let Err(e) = std::fs::hard_link(&src_path, &dst_path) {
             tracing::trace!(
                 src = %src_path.display(),
