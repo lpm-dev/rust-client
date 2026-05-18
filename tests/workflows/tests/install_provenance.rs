@@ -617,3 +617,284 @@ async fn install_drift_does_not_block_for_project_with_no_approvals() {
         "blanket-waive advisory must only fire when the user passes the flag; got:\n{combined}"
     );
 }
+
+// ─── Phase 2.2 SILENT-DROP regression guards ──────────────────────────
+
+/// Mount a scripted package whose `dist.attestations.url` points at an
+/// unverifiable (structurally-valid v0.2 minimal) Sigstore bundle. The
+/// post-Phase-2.1 verifier rejects these on the dsseEnvelope /
+/// tlogEntries pre-flight, so the bundle reaches `approve-scripts`
+/// only via `fetch_provenance_for_pkgs` and the verifier signal IS
+/// the SILENT-DROP regression's load-bearing input.
+///
+/// Bypasses `MockRegistry::with_package` deliberately — that helper
+/// mounts a basic metadata document WITHOUT an `attestations` URL,
+/// and a second metadata mount on the same path doesn't reliably
+/// take precedence (wiremock picks the first matching mock). Here
+/// we mount the metadata directly on all three paths
+/// (`/api/registry/{name}` LPM proxy, `/{name}` npm direct, and
+/// the batch POST endpoint) with attestations included from the
+/// start, plus the tarball + the unverifiable bundle endpoint.
+async fn mount_scripted_pkg_with_unverifiable_bundle(mock: &MockRegistry, name: &str, version: &str) {
+    use support::mock_registry::{compute_integrity, make_tarball_from_pkg_json};
+
+    let pkg_json = serde_json::json!({
+        "name": name,
+        "version": version,
+        "license": "MIT",
+        "main": "index.js",
+        "scripts": { "postinstall": "node -e \"process.exit(0)\"" },
+    });
+    let tarball = make_tarball_from_pkg_json(pkg_json, &[]);
+
+    let att_url = format!("{}/-/attestations/{name}@{version}", mock.url());
+    let tarball_url = format!("{}/tarballs/{name}/-/{name}-{version}.tgz", mock.url());
+    let integrity = compute_integrity(&tarball);
+
+    let metadata = serde_json::json!({
+        "name": name,
+        "dist-tags": { "latest": version },
+        "versions": {
+            version: {
+                "name": name,
+                "version": version,
+                "scripts": { "postinstall": "node -e \"process.exit(0)\"" },
+                "dist": {
+                    "tarball": tarball_url,
+                    "integrity": integrity,
+                    "attestations": {
+                        "url": att_url,
+                        "provenance": { "predicateType": "https://slsa.dev/provenance/v1" }
+                    },
+                },
+                "dependencies": {}
+            }
+        },
+        "time": { version: "2025-01-01T00:00:00.000Z" }
+    });
+
+    let server = mock.server();
+
+    // LPM proxy path (Proxy mode).
+    Mock::given(method("GET"))
+        .and(path(format!("/api/registry/{name}")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(metadata.clone()))
+        .mount(server)
+        .await;
+
+    // npm direct path (Direct mode). Either resolution mode hits one.
+    Mock::given(method("GET"))
+        .and(path(format!("/{name}")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(metadata.clone()))
+        .mount(server)
+        .await;
+
+    // Batch metadata POST — the resolver uses this for the install path.
+    mock.with_batch_metadata(vec![metadata]).await;
+
+    // Tarball.
+    Mock::given(method("GET"))
+        .and(path(format!("/tarballs/{name}/-/{name}-{version}.tgz")))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_bytes(tarball)
+                .insert_header("content-type", "application/octet-stream"),
+        )
+        .mount(server)
+        .await;
+
+    // Unverifiable bundle — structurally-valid v0.2 minimal shape.
+    // Post-Phase-2.1 the verifier rejects this at the dsseEnvelope /
+    // tlogEntries pre-flight, which is exactly the rejection variant
+    // the SILENT-DROP fix needs.
+    let bundle = sigstore_bundle_for_identity(
+        "github:attacker/forged",
+        ".github/workflows/build.yml",
+        "refs/tags/v1.0.0",
+    );
+    Mock::given(method("GET"))
+        .and(path(format!("/-/attestations/{name}@{version}")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(bundle))
+        .mount(server)
+        .await;
+}
+
+/// **Phase 2.2.a SILENT-DROP regression guard — default deny path.**
+///
+/// Pre-fix, `fetch_provenance_for_pkgs` collapsed
+/// `Err(LpmError::ProvenanceVerification)` into `None` via
+/// `.ok().flatten()`. The approve-scripts capture path then recorded
+/// `provenance_at_approval: None`, and every subsequent install's
+/// drift comparator read that `None` and degraded to `NoDrift` —
+/// permanently disarming publisher-swap detection after one
+/// attack-window approval.
+///
+/// Post-fix, under the default `EnforceMode::Deny` posture, an
+/// unverifiable bundle MUST refuse the approval rather than silently
+/// blank the binding. This test pins:
+/// 1. `lpm approve-scripts --yes` exits non-zero
+/// 2. The error names the package + the `provenance_verification`
+///    diagnostic code so the user has actionable diagnostics
+/// 3. The manifest's `trustedDependencies` field stays absent or
+///    empty (no `provenance_at_approval: None` smuggled in)
+#[tokio::test]
+async fn approve_scripts_refuses_under_deny_when_verifier_rejects_bundle() {
+    let dep = "scripted-pkg-deny";
+    let project = TempProject::empty(&format!(
+        r#"{{"name":"silent-drop-deny","version":"1.0.0","dependencies":{{"{dep}":"^1.0.0"}}}}"#
+    ));
+    let mock = MockRegistry::start().await;
+    mount_scripted_pkg_with_unverifiable_bundle(&mock, dep, "1.0.0").await;
+
+    // Install succeeds: default-deny on scripts means the scripted
+    // package goes to the blocked set without running its postinstall.
+    let install_out = lpm_with_registry(&project, &mock.url())
+        .args(["install"])
+        .output()
+        .expect("spawn lpm install");
+    assert!(
+        install_out.status.success(),
+        "install with default-deny on a scripted package must succeed (scripts deferred)\n\
+         stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&install_out.stdout),
+        String::from_utf8_lossy(&install_out.stderr),
+    );
+
+    // Approve-scripts MUST refuse: the verifier rejects the served
+    // bundle, the typed `LpmError::ProvenanceVerification` propagates,
+    // and the approval is short-circuited before any trust-store
+    // mutation. No env override — this is the default posture.
+    //
+    // Uses the per-package approval path
+    // (`lpm approve-scripts <pkg>`), not `--yes`, because `--yes` has
+    // a separate `enforce_tiered_yes_gate` refusal for non-green tier
+    // scripts (the postinstall `node -e "process.exit(0)"` shape
+    // classifies as Red under the hand-curated blocklist). The
+    // per-package path skips that gate, so the only refusal it can
+    // emit is the verifier rejection we're pinning here.
+    let approve_out = lpm_with_registry(&project, &mock.url())
+        .args(["approve-scripts", dep])
+        .output()
+        .expect("spawn lpm approve-scripts <pkg>");
+
+    assert!(
+        !approve_out.status.success(),
+        "approve-scripts MUST refuse under default deny when the verifier rejects;\n\
+         stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&approve_out.stdout),
+        String::from_utf8_lossy(&approve_out.stderr),
+    );
+
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&approve_out.stdout),
+        String::from_utf8_lossy(&approve_out.stderr),
+    );
+    assert!(
+        combined.contains(dep),
+        "refusal error must name the package; got:\n{combined}",
+    );
+    assert!(
+        combined.contains("provenance") && combined.contains("verif"),
+        "refusal error must surface as a verification-class diagnostic; got:\n{combined}",
+    );
+
+    // Critical regression assertion: the manifest's
+    // trustedDependencies must NOT have grown a binding with
+    // `provenanceAtApproval: null`. Pre-fix, this was the SILENT-DROP
+    // smuggling vector — a null provenance reference that disarmed
+    // the drift gate for every future install.
+    let manifest_str = project.read_file("package.json");
+    let manifest: serde_json::Value = serde_json::from_str(&manifest_str).unwrap();
+    let trusted = manifest
+        .get("lpm")
+        .and_then(|v| v.get("trustedDependencies"));
+    if let Some(tdeps) = trusted {
+        // If the field exists (legacy preserve key writes can land
+        // even on refused approvals in some paths), the binding for
+        // our package MUST NOT have a provenanceAtApproval present
+        // — null is exactly what the SILENT-DROP would have written.
+        if let Some(obj) = tdeps.as_object() {
+            for (key, binding) in obj {
+                if key.starts_with(&format!("{dep}@")) {
+                    let pa = binding.get("provenanceAtApproval");
+                    assert!(
+                        pa.is_none(),
+                        "binding for {key} must NOT carry a `provenanceAtApproval` field — \
+                         that's the SILENT-DROP smuggling vector this fix closes. Got:\n\
+                         {binding:#?}",
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// **Phase 2.2.b warn-mode regression guard.**
+///
+/// Under `LPM_PROVENANCE_ENFORCE=warn`, an unverifiable bundle MUST
+/// emit a loud warning but allow the approval through. The binding
+/// records `provenance_at_approval: None` (today's
+/// transport-degrade shape), but the drift gate's load-bearing
+/// behavior — the `is_some()` filter in
+/// `provenance_reference_for_name` — means a later install with a
+/// prior valid binding for the same package would still see that
+/// prior identity as the drift reference.
+///
+/// This test pins the user-facing contract:
+/// 1. `lpm approve-scripts --yes` exits zero under warn
+/// 2. stderr/stdout contains the `provenance verification FAILED`
+///    warn line naming the package + verifier reason
+/// 3. The recovery hint mentions `LPM_PROVENANCE_ENFORCE=deny`
+#[tokio::test]
+async fn approve_scripts_under_warn_logs_and_proceeds_when_verifier_rejects() {
+    let dep = "scripted-pkg-warn";
+    let project = TempProject::empty(&format!(
+        r#"{{"name":"silent-drop-warn","version":"1.0.0","dependencies":{{"{dep}":"^1.0.0"}}}}"#
+    ));
+    let mock = MockRegistry::start().await;
+    mount_scripted_pkg_with_unverifiable_bundle(&mock, dep, "1.0.0").await;
+
+    let _ = lpm_with_registry(&project, &mock.url())
+        .args(["install"])
+        .output()
+        .expect("spawn lpm install");
+
+    // Warn-mode opt-in. The env knob is per-invocation so the test
+    // doesn't mutate process-global state. Per-package approve flow
+    // for the same reason as the deny test — skip the tier-yes gate
+    // so the verifier-rejection is the only refusal under test.
+    let approve_out = lpm_with_registry(&project, &mock.url())
+        .env("LPM_PROVENANCE_ENFORCE", "warn")
+        .args(["approve-scripts", dep])
+        .output()
+        .expect("spawn lpm approve-scripts <pkg> under warn mode");
+
+    assert!(
+        approve_out.status.success(),
+        "approve-scripts under LPM_PROVENANCE_ENFORCE=warn must succeed (non-blocking);\n\
+         stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&approve_out.stdout),
+        String::from_utf8_lossy(&approve_out.stderr),
+    );
+
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&approve_out.stdout),
+        String::from_utf8_lossy(&approve_out.stderr),
+    );
+    assert!(
+        combined.contains("provenance verification FAILED")
+            || combined.contains("provenance verification failed"),
+        "warn mode must emit a loud rejection notice (case-insensitive); got:\n{combined}",
+    );
+    assert!(
+        combined.contains(dep),
+        "warn notice must name the package; got:\n{combined}",
+    );
+    assert!(
+        combined.contains("LPM_PROVENANCE_ENFORCE=deny"),
+        "warn notice must point at the deny re-enable knob so operators know how to tighten back \
+         to fail-closed; got:\n{combined}",
+    );
+}
