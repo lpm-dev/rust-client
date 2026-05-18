@@ -38,16 +38,16 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@master
+        uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
           components: clippy, rustfmt
 
       - name: Cache cargo
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: |
             ~/.cargo/registry
@@ -83,15 +83,15 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@master
+        uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
 
       - name: Cache cargo
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: |
             ~/.cargo/registry
@@ -101,7 +101,7 @@ jobs:
           restore-keys: ${{ runner.os }}-cargo-${{ env.RUST_TOOLCHAIN }}-
 
       - name: Install nextest
-        uses: taiki-e/install-action@nextest
+        uses: taiki-e/install-action@9c6953334daacc48e55a35db9a19c771f79ffa9d # nextest
 
       # The verdaccio workflow test harness spawns one Verdaccio instance
       # per test via `npx --yes verdaccio@<VERSION>` (see
@@ -117,7 +117,7 @@ jobs:
       # the harness invalidates cleanly; the restore-keys fallback lets
       # npm fetch only the diff against the last cached snapshot.
       - name: Cache npm (Verdaccio test harness)
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: ~/.npm
           key: ${{ runner.os }}-npm-verdaccio-${{ hashFiles('tests/workflows/tests/support/verdaccio.rs') }}
@@ -183,15 +183,15 @@ jobs:
     # §3b: tolerate Windows-specific incompat for now (see job comment).
     continue-on-error: ${{ matrix.os == 'windows-latest' }}
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@master
+        uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
 
       - name: Cache cargo
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: |
             ~/.cargo/registry
@@ -201,7 +201,7 @@ jobs:
           restore-keys: ${{ runner.os }}-cargo-audit-${{ env.RUST_TOOLCHAIN }}-
 
       - name: Install Node 22
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: "22"
 
@@ -209,7 +209,7 @@ jobs:
       # mode sees the same network state. Bun ships prebuilt binaries
       # via npm; the official action handles platform detection.
       - name: Install bun
-        uses: oven-sh/setup-bun@v2
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
 
       - name: Build lpm-rs (release)
         run: cargo build --release -p lpm-cli
@@ -229,7 +229,7 @@ jobs:
       # outcomes in CI without re-running locally.
       - name: Upload audit result artifacts
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: audit-fixtures-results-${{ matrix.os }}-${{ matrix.store_version }}
           path: bench/audit-fixtures/results/
@@ -246,15 +246,15 @@ jobs:
     # in <2 minutes; this job is the long-tail safety net.
     if: github.event_name == 'workflow_dispatch' || github.event_name == 'schedule'
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@master
+        uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
 
       - name: Cache cargo
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: |
             ~/.cargo/registry
@@ -264,7 +264,7 @@ jobs:
           restore-keys: ${{ runner.os }}-cargo-realworld-${{ env.RUST_TOOLCHAIN }}-
 
       - name: Install Node 22
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: "22"
 
@@ -283,7 +283,7 @@ jobs:
 
       - name: Upload realworld result artifacts
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: realworld-audit-results
           path: bench/realworld-audit/results/
@@ -302,15 +302,15 @@ jobs:
     # and don't gate.
     if: github.event_name == 'workflow_dispatch' || github.event_name == 'schedule'
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@master
+        uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
 
       - name: Cache cargo
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: |
             ~/.cargo/registry
@@ -320,7 +320,7 @@ jobs:
           restore-keys: ${{ runner.os }}-cargo-topnpm-${{ env.RUST_TOOLCHAIN }}-
 
       - name: Install Node 22
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: "22"
 
@@ -341,7 +341,7 @@ jobs:
 
       - name: Upload top-npm result artifacts
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: top-npm-audit-results
           # The result JSONs land in bench/audit-fixtures/results/
@@ -357,15 +357,15 @@ jobs:
     # Only run benchmarks manually or on release tags — not on every push
     if: github.event_name == 'workflow_dispatch'
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@master
+        uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
 
       - name: Cache cargo
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: |
             ~/.cargo/registry
