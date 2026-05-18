@@ -25,8 +25,16 @@ serde_json = { workspace = true }
 # `prctl(PR_SET_SECCOMP, ...)` syscall — AS-safe in pre_exec.
 [target.'cfg(target_os = "linux")'.dependencies]
 landlock = "0.4"
-libc = "0.2"
 seccompiler = "0.5"
+
+# `libc` is the syscall surface for both Unix backends: Linux's
+# pre_exec uses prctl/setrlimit/write/mount/unshare directly;
+# macOS's Seatbelt backend uses setrlimit in its pre_exec. Gated
+# on `cfg(unix)` so the Linux landlock build, the macOS Seatbelt
+# build, and any future Unix-family backend all share the same
+# AS-safe primitives without needing a per-OS dep block.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
 
 # Windows backend uses Mandatory Integrity Control (drop child to Low
 # IL) plus a Job Object for kill-tree parity with Unix's process

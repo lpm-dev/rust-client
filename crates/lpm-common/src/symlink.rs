@@ -128,14 +128,16 @@ fn lexically_clean(p: &Path) -> PathBuf {
     out
 }
 
-/// Reject path strings containing cmd.exe metacharacters. Used as a
-/// defense-in-depth check before invoking `cmd /c mklink /J`.
-///
-/// Returns `Err(reason)` listing the offending character on a hit.
-/// Callers translate that into [`std::io::ErrorKind::InvalidInput`].
+/// Reject path strings containing cmd.exe metacharacters. Used before
+/// `cmd /c mklink /J` and before emitting a `.cmd` bin shim. Covers
+/// the sub-expression triple `( ) ;` and the quote-bypass triple
+/// `` ` ' \t`` so a crafted `package.json > name` can't reach cmd.exe's
+/// parser through double-quoted argument shapes.
 #[cfg(windows)]
 pub fn validate_cmd_path(path: &str) -> Result<(), String> {
-    const DANGEROUS: &[char] = &['"', '&', '|', '<', '>', '^', '%', '\n', '\r'];
+    const DANGEROUS: &[char] = &[
+        '"', '&', '|', '<', '>', '^', '%', '\n', '\r', '(', ')', ';', '`', '\'', '\t',
+    ];
     for ch in DANGEROUS {
         if path.contains(*ch) {
             return Err(format!(
@@ -164,6 +166,36 @@ mod tests {
     fn validate_cmd_path_rejects_ampersand() {
         let err = validate_cmd_path("C:\\evil & rm -rf").unwrap_err();
         assert!(err.contains('&'));
+    }
+
+    #[test]
+    fn validate_cmd_path_rejects_paren_subshell() {
+        let err = validate_cmd_path("C:\\evil(echo+pwned)\\node.exe").unwrap_err();
+        assert!(err.contains('('));
+    }
+
+    #[test]
+    fn validate_cmd_path_rejects_semicolon() {
+        let err = validate_cmd_path("C:\\evil;malicious.bat").unwrap_err();
+        assert!(err.contains(';'));
+    }
+
+    #[test]
+    fn validate_cmd_path_rejects_backtick() {
+        let err = validate_cmd_path("C:\\evil`echo`.exe").unwrap_err();
+        assert!(err.contains('`'));
+    }
+
+    #[test]
+    fn validate_cmd_path_rejects_single_quote() {
+        let err = validate_cmd_path("C:\\evil'cmd'.exe").unwrap_err();
+        assert!(err.contains('\''));
+    }
+
+    #[test]
+    fn validate_cmd_path_rejects_tab() {
+        let err = validate_cmd_path("C:\\evil\tmalicious").unwrap_err();
+        assert!(err.contains('\t'));
     }
 
     #[test]

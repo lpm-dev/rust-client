@@ -57,7 +57,7 @@ fn bench_binary_read(c: &mut Criterion) {
                 let reader = binary::BinaryLockfileReader::open(black_box(&path))
                     .unwrap()
                     .unwrap();
-                black_box(reader.to_lockfile());
+                black_box(reader.to_lockfile().unwrap());
             })
         });
     }

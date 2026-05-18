@@ -155,6 +155,21 @@ pub fn load_sandbox_write_dirs(
                 ),
             });
         }
+        if let Some((idx, ch)) = s.char_indices().find(|(_, c)| {
+            let code = *c as u32;
+            code <= 0x1F || code == 0x7F || (0x80..=0x9F).contains(&code)
+        }) {
+            return Err(SandboxError::InvalidSpec {
+                reason: format!(
+                    "{}: `lpm.scripts.sandboxWriteDirs[{i}]` contains a control character \
+                     at byte {idx} (U+{cp:04X}); paths with embedded control bytes are \
+                     refused — they have no legitimate filesystem meaning and on macOS \
+                     could perturb the rendered SBPL profile.",
+                    package_json.display(),
+                    cp = ch as u32,
+                ),
+            });
+        }
         let authored = PathBuf::from(s);
         let was_relative = !authored.is_absolute();
         let joined = if was_relative {

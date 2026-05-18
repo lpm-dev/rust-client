@@ -1,0 +1,45 @@
+# Dependabot config — keep SHA-pinned GitHub Actions current.
+#
+# Why this file matters (H14 in the cross-repo security findings):
+# every `uses: <action>@<sha>` in `.github/workflows/*.yml` is pinned
+# to a 40-char commit SHA rather than a floating `@v5` / `@stable`
+# tag, so a compromised upstream tag (the tj-actions/changed-files
+# class of attack) cannot inject code into our release pipeline. The
+# trade-off is that SHA pins go stale; without an upgrade mechanism
+# they would either drift (security patches we miss) or get bumped
+# by hand (error-prone). This config tells Dependabot to open a PR
+# whenever an action publishes a new release, including the new SHA
+# in the suggested diff.
+#
+# Review every Dependabot PR by:
+#   1. confirming the new SHA corresponds to the tagged release on
+#      the action's GitHub page (the PR body shows the comparison),
+#   2. checking the action's repo for any security advisories,
+#   3. merging via the normal CI gate (only after green).
+#
+# `target-branch` is implicitly the default branch.
+
+version: 2
+updates:
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "09:00"
+      timezone: "Etc/UTC"
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "chore(deps)"
+      include: "scope"
+    labels:
+      - "dependencies"
+      - "github-actions"
+    # Group all routine GHA bumps into one PR — keeps review burden
+    # low and lets us merge the whole batch with a single CI run.
+    groups:
+      gha-minor-and-patch:
+        applies-to: version-updates
+        update-types:
+          - "minor"
+          - "patch"

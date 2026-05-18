@@ -208,11 +208,36 @@ pub(crate) fn render_profile(
 
     // node-gyp + electron-rebuild fork helper processes + basic
     // process-info introspection the dynamic linker + libSystem
-    // call into. `process*` covers fork, exec, info, codesigning-
-    // status, and signalling; narrower splits exist but this is the
-    // least-surprising default for a script runner where sub-shells
-    // are routine.
+    // call into. We keep the `process*` wildcard for fork/exec/info
+    // but layer narrower denies on top — SBPL is last-match-wins,
+    // so any deny rule emitted AFTER the wildcard overrides for
+    // the specific operations it names.
+    //
+    // NB: SBPL does not expose `process-set-pgid` as an operation
+    // name (it is not in the Seatbelt grammar; sandbox-exec rejects
+    // it with "unbound variable: process-set-pgid"). The matching
+    // kill-tree-escape concern is closed in
+    // `lpm_sandbox::terminate_sandbox_tree` via descendant-PID
+    // enumeration; the SBPL profile only narrows process-exec here.
     out.push_str("(allow process*)\n");
+    // Block process-exec to the macOS automation / privilege-escalation
+    // surfaces. `osascript` reaches every AppleScript-controllable app
+    // through mach-lookup (which we still need to allow for libSystem),
+    // `security` is the Keychain CLI, `sudo`/`su` are explicit privilege
+    // boundary crossers, `open` launches GUI apps with the user's full
+    // session, and `codesign` is a write-capable signing oracle. None
+    // of these are legitimate post-install needs; package authors
+    // wanting GUI automation should not be reaching for `osascript`
+    // from a lifecycle script.
+    out.push_str("(deny process-exec\n");
+    out.push_str("  (literal \"/usr/bin/osascript\")\n");
+    out.push_str("  (literal \"/usr/bin/security\")\n");
+    out.push_str("  (literal \"/usr/bin/sudo\")\n");
+    out.push_str("  (literal \"/usr/bin/su\")\n");
+    out.push_str("  (literal \"/usr/bin/open\")\n");
+    out.push_str("  (literal \"/usr/bin/codesign\")\n");
+    out.push_str("  (subpath \"/Applications\")\n");
+    out.push_str(")\n");
     out.push_str("(allow signal)\n");
     // Mach lookups + sysctl reads the dynamic linker + libSystem
     // need. IOKit usage comes from libsystem (device enumeration
@@ -357,7 +382,7 @@ fn quoted_path(p: &Path, field: &str) -> Result<String, SandboxError> {
         .ok_or_else(|| SandboxError::ProfileRenderFailed {
             reason: format!("{field} is not valid UTF-8: {}", p.display()),
         })?;
-    Ok(scheme_quote(s))
+    scheme_quote_strict(s, field)
 }
 
 /// Resolve `path` through symlinks + relative components so the
@@ -402,10 +427,52 @@ fn canonicalize_or_passthrough(path: &Path, field: &str) -> Result<PathBuf, Sand
     }
 }
 
-fn scheme_quote(s: &str) -> String {
+/// Escape `s` into a quoted SBPL string literal in one pass,
+/// failing on any input character that would perturb the SBPL
+/// parser before the SBPL escape rules can contain it.
+///
+/// **Rejected characters (returns `ProfileRenderFailed`):**
+/// - C0 controls (`0x00..=0x1F`) including LF, CR, TAB, NUL
+/// - DEL (`0x7F`)
+/// - C1 controls (`0x80..=0x9F`)
+///
+/// POSIX disallows NUL in pathnames outright; the other control
+/// bytes are *technically permitted* by the filesystem but never
+/// appear in legitimate path content, and any one of them in a
+/// `sandboxWriteDirs[i]` entry is a strong injection signal. LF
+/// in particular was the documented Seatbelt-injection vector —
+/// even with `"` and `\` already escaped, a literal newline could
+/// terminate the rendered string in parsers that treat LF as a
+/// token boundary. We refuse the whole control range uniformly so
+/// callers can't bypass via a CR/TAB/NUL variant.
+///
+/// **Passed through unchanged:** regular punctuation that some
+/// sources flag as Scheme-meta (`(`, `)`, `;`, `` ` ``, `'`) — per
+/// the SBPL grammar these are valid data inside a `"..."` string
+/// literal, and rejecting them would refuse legitimate macOS paths
+/// (e.g. `/Users/<n>/work (proj)/`).
+///
+/// **Escaped:** `"` becomes `\"` and `\` becomes `\\` per the
+/// Scheme-like SBPL string literal syntax.
+///
+/// The error surfaces with a hex code-point hint (`U+XXXX`) so the
+/// offending byte itself never reaches log output, and names the
+/// field so the caller knows which path was rejected.
+fn scheme_quote_strict(s: &str, field: &str) -> Result<String, SandboxError> {
     let mut out = String::with_capacity(s.len() + 2);
     out.push('"');
-    for c in s.chars() {
+    for (idx, c) in s.char_indices() {
+        let code = c as u32;
+        if code <= 0x1F || code == 0x7F || (0x80..=0x9F).contains(&code) {
+            return Err(SandboxError::ProfileRenderFailed {
+                reason: format!(
+                    "{field} contains a control character at byte {idx} \
+                     (U+{code:04X}); paths with embedded control bytes \
+                     are refused at profile render time because they \
+                     can perturb SBPL string parsing",
+                ),
+            });
+        }
         match c {
             '"' => out.push_str("\\\""),
             '\\' => out.push_str("\\\\"),
@@ -413,7 +480,7 @@ fn scheme_quote(s: &str) -> String {
         }
     }
     out.push('"');
-    out
+    Ok(out)
 }
 
 /// Render the LogOnly-mode Seatbelt profile for the given
@@ -678,16 +745,87 @@ mod tests {
     }
 
     #[test]
-    fn scheme_quote_escapes_quotes_and_backslashes() {
-        assert_eq!(scheme_quote(r#"simple"#), r#""simple""#);
-        assert_eq!(scheme_quote(r#"has"quote"#), r#""has\"quote""#);
-        assert_eq!(scheme_quote(r"has\slash"), r#""has\\slash""#);
-        assert_eq!(scheme_quote(r#"both"and\slash"#), r#""both\"and\\slash""#);
+    fn scheme_quote_strict_escapes_quotes_and_backslashes() {
+        let q = |s: &str| scheme_quote_strict(s, "test").unwrap();
+        assert_eq!(q(r#"simple"#), r#""simple""#);
+        assert_eq!(q(r#"has"quote"#), r#""has\"quote""#);
+        assert_eq!(q(r"has\slash"), r#""has\\slash""#);
+        assert_eq!(q(r#"both"and\slash"#), r#""both\"and\\slash""#);
     }
 
     #[test]
-    fn scheme_quote_handles_unicode() {
-        assert_eq!(scheme_quote("café"), r#""café""#);
+    fn scheme_quote_strict_handles_unicode() {
+        assert_eq!(scheme_quote_strict("café", "test").unwrap(), r#""café""#);
+    }
+
+    #[test]
+    fn scheme_quote_strict_rejects_embedded_newline() {
+        // Headline SBPL-injection vector: a sandboxWriteDirs entry
+        // like `/tmp/")(allow file-read* (subpath \"/Users\")(deny default)\n//`
+        // carries a literal LF that would otherwise sit inside the
+        // rendered string. Strict refusal here makes the render
+        // fail loud before sandbox-exec ever sees the bytes.
+        let payload = "/tmp/\")(allow file-read* (subpath \"/Users\")\n//";
+        let err = scheme_quote_strict(payload, "extra_write_dirs[0]")
+            .expect_err("must refuse embedded LF");
+        match err {
+            SandboxError::ProfileRenderFailed { reason } => {
+                assert!(reason.contains("extra_write_dirs[0]"), "got: {reason}");
+                assert!(reason.contains("U+000A"), "got: {reason}");
+            }
+            other => panic!("expected ProfileRenderFailed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn scheme_quote_strict_rejects_tab_cr_nul_and_c1_controls() {
+        for bad in &["a\tb", "a\rb", "a\0b", "a\u{0085}b", "a\u{009F}b"] {
+            scheme_quote_strict(bad, "test").expect_err(&format!("must refuse {bad:?}"));
+        }
+    }
+
+    #[test]
+    fn scheme_quote_strict_passes_through_scheme_punctuation_inside_paths() {
+        // Parens / semicolons / apostrophes / backticks are legitimate
+        // path content on macOS (e.g. `/Users/x/code (work)/'thing'`).
+        // The strict gate must not refuse them — only control bytes.
+        let q = scheme_quote_strict("/Users/x/code (work)/'thing'`", "project_dir").expect("ok");
+        assert!(q.starts_with('"') && q.ends_with('"'));
+        assert!(q.contains("(work)"));
+        assert!(q.contains("'thing'"));
+        assert!(q.contains('`'));
+    }
+
+    #[test]
+    fn profile_denies_high_risk_process_exec_targets() {
+        let p = render_profile(&spec(), false).unwrap();
+        // M22: narrow process-exec denies for AppleScript automation,
+        // Keychain CLI, privilege boundaries, GUI app launching, and
+        // the signing oracle. The deny clause must follow the
+        // `(allow process*)` wildcard so SBPL last-match-wins
+        // overrides for these specific binaries.
+        let allow_idx = p.find("(allow process*)").expect("allow process* present");
+        let deny_idx = p
+            .find("(deny process-exec")
+            .expect("narrow deny process-exec block present");
+        assert!(
+            deny_idx > allow_idx,
+            "(deny process-exec ...) must come AFTER (allow process*) under last-match-wins: {p}"
+        );
+        for needed in &[
+            "/usr/bin/osascript",
+            "/usr/bin/security",
+            "/usr/bin/sudo",
+            "/usr/bin/su",
+            "/usr/bin/open",
+            "/usr/bin/codesign",
+            "/Applications",
+        ] {
+            assert!(
+                p.contains(needed),
+                "expected narrow process-exec deny for {needed}: {p}",
+            );
+        }
     }
 
     #[test]

@@ -88,6 +88,14 @@ mod linux;
 #[cfg(target_os = "linux")]
 mod seccomp;
 
+// Per-process resource limits (RLIMIT_NPROC / NOFILE / CPU) wired
+// into the Unix backends' `pre_exec` closures. Defense-in-depth
+// against fork-bomb / fd-exhaustion / CPU-spinner DoS from a
+// lifecycle script. macOS + Linux only — Windows uses
+// `JOB_OBJECT_LIMIT_*` instead, wired in `windows.rs`.
+#[cfg(unix)]
+mod rlimits;
+
 // Windows backend via Mandatory Integrity Control (drop
 // child to Low IL) + Job Object for kill-tree parity with Unix's
 // process group. See [`windows`] module docs for the mechanism + the

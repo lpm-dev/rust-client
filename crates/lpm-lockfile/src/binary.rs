@@ -587,13 +587,13 @@ impl BinaryLockfileReader {
         None
     }
 
-    /// Convert the binary lockfile back to a `Lockfile` struct.
-    ///
-    /// Note: the binary format does not store metadata fields (resolved_with),
-    /// so the returned Lockfile uses the current defaults. The TOML lockfile is
-    /// the source of truth for metadata; the binary format is a read-performance
-    /// optimization only.
-    pub fn to_lockfile(&self) -> Lockfile {
+    /// Convert the binary lockfile back to a `Lockfile`. Metadata
+    /// fields (resolved_with) aren't stored in the binary format and
+    /// fall back to defaults; the TOML lockfile is the source of truth
+    /// for metadata. Returns `Err` when entries violate cross-format
+    /// invariants (currently `@lpm.dev/*` scope-pin) — `read_fast`
+    /// falls back to the TOML form on this error.
+    pub fn to_lockfile(&self) -> Result<Lockfile, LockfileError> {
         let count = self.pkg_count() as usize;
         let mut packages = Vec::with_capacity(count);
         for i in 0..count {
@@ -601,7 +601,8 @@ impl BinaryLockfileReader {
                 packages.push(entry.to_locked_package());
             }
         }
-        Lockfile {
+        crate::Lockfile::validate_loaded_packages(&packages)?;
+        Ok(Lockfile {
             metadata: crate::LockfileMetadata {
                 lockfile_version: crate::LOCKFILE_VERSION,
                 resolved_with: Some(crate::DEFAULT_RESOLVED_WITH.to_string()),
@@ -618,7 +619,7 @@ impl BinaryLockfileReader {
             // `to_lockfile()` we'd reach is for a binary-representable
             // lockfile, which by construction has no ambient peers.
             ambient_peer_installs: Vec::new(),
-        }
+        })
     }
 
     /// Number of packages in the lockfile.
@@ -891,7 +892,7 @@ mod tests {
         std::fs::write(&path, &binary).unwrap();
 
         let reader = BinaryLockfileReader::open(&path).unwrap().unwrap();
-        let restored = reader.to_lockfile();
+        let restored = reader.to_lockfile().unwrap();
 
         assert_eq!(lf.packages.len(), restored.packages.len());
         for (orig, rest) in lf.packages.iter().zip(restored.packages.iter()) {
@@ -1416,7 +1417,7 @@ mod tests {
         assert_eq!(last.version(), "9999.0.0");
 
         // Roundtrip preserves all packages
-        let restored = reader.to_lockfile();
+        let restored = reader.to_lockfile().unwrap();
         assert_eq!(restored.packages.len(), 10000);
     }
 
@@ -1431,7 +1432,7 @@ mod tests {
         std::fs::write(&path, &binary).unwrap();
 
         let reader = BinaryLockfileReader::open(&path).unwrap().unwrap();
-        let restored = reader.to_lockfile();
+        let restored = reader.to_lockfile().unwrap();
         let toml2 = restored.to_toml().unwrap();
 
         // TOML -> binary -> TOML produces identical output
@@ -1621,7 +1622,7 @@ mod tests {
         let path = dir.path().join("lpm.lockb");
         std::fs::write(&path, &binary).unwrap();
         let reader = BinaryLockfileReader::open(&path).unwrap().unwrap();
-        let restored = reader.to_lockfile();
+        let restored = reader.to_lockfile().unwrap();
         assert_eq!(restored.packages.len(), 100);
         for pkg in &restored.packages {
             assert_eq!(pkg.source.as_deref(), Some(source));
@@ -1688,7 +1689,7 @@ mod tests {
             Some("https://registry.npmjs.org/lodash/-/lodash-4.17.21.tgz"),
         );
 
-        let restored = reader.to_lockfile();
+        let restored = reader.to_lockfile().unwrap();
         assert_eq!(
             restored.packages[0].tarball.as_deref(),
             Some("https://registry.npmjs.org/lodash/-/lodash-4.17.21.tgz"),
@@ -1982,7 +1983,7 @@ mod tests {
         assert_eq!(entry.source(), Some("directory+./packages/foo"));
         assert_eq!(entry.tarball(), None);
 
-        let restored = reader.to_lockfile();
+        let restored = reader.to_lockfile().unwrap();
         assert_eq!(restored, lf);
     }
 
@@ -2007,7 +2008,7 @@ mod tests {
         let reader = BinaryLockfileReader::open(&path).unwrap().unwrap();
         let entry = reader.find_package("linked").unwrap();
         assert_eq!(entry.source(), Some("link+../shared/linked"));
-        let restored = reader.to_lockfile();
+        let restored = reader.to_lockfile().unwrap();
         assert_eq!(restored, lf);
     }
 
@@ -2041,7 +2042,7 @@ mod tests {
         assert_eq!(entry.integrity(), Some("sha256-deadbeefcafebabe"));
         // tarball field-hint is None for non-Registry sources.
         assert_eq!(entry.tarball(), None);
-        let restored = reader.to_lockfile();
+        let restored = reader.to_lockfile().unwrap();
         assert_eq!(restored, lf);
     }
 
@@ -2107,7 +2108,7 @@ mod tests {
         write_binary(&lf, &path).unwrap();
 
         let reader = BinaryLockfileReader::open(&path).unwrap().unwrap();
-        let restored = reader.to_lockfile();
+        let restored = reader.to_lockfile().unwrap();
         assert_eq!(restored.packages.len(), 5);
         // Every package's source string survives the round-trip
         // byte-equal — the binary lockfile doesn't pre-parse Source

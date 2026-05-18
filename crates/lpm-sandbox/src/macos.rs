@@ -106,6 +106,18 @@ impl Sandbox for SeatbeltSandbox {
         {
             use std::os::unix::process::CommandExt;
             command.process_group(0);
+
+            // Per-process resource limits (defense-in-depth DoS cap).
+            // SAFETY: the closure runs post-fork pre-exec; each
+            // setrlimit is a single AS-safe syscall via libc.
+            // sandbox-exec inherits these to the lifecycle script
+            // it spawns.
+            unsafe {
+                command.pre_exec(|| {
+                    crate::rlimits::apply_resource_limits_as_safe();
+                    Ok(())
+                });
+            }
         }
 
         command.spawn().map_err(|e| SandboxError::SpawnFailed {

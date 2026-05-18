@@ -1,25 +1,61 @@
 //! axum HTTP server setup and lifecycle.
 //!
-//! Binds to `127.0.0.1:{port}` (never `0.0.0.0`) and serves:
-//! - REST API at `/api/*`
-//! - SSE stream at `/api/stream`
-//! - Embedded web UI at `/*` (SPA fallback)
-//!
-//! # Security
-//!
-//! - Binds to loopback only — not accessible from other machines on the network.
-//! - Strict CORS: only `http://127.0.0.1:{port}` and `http://localhost:{port}`
-//!   origins are allowed (using the actually-bound port). This prevents
-//!   malicious websites from exfiltrating captured traffic via cross-origin
-//!   requests.
+//! Binds to `127.0.0.1:{port}` (never `0.0.0.0`) and serves the REST
+//! API, SSE stream, and embedded web UI. Strict CORS pinned to the
+//! actually-bound port; every `/api/*` route requires the per-process
+//! auth token from `InspectorState`.
 
 use crate::InspectorHandle;
 use crate::state::InspectorState;
 use axum::Router;
+use axum::extract::{Request, State};
+use axum::http::{StatusCode, header};
+use axum::middleware::{self, Next};
+use axum::response::Response;
 use axum::routing::{get, post, put};
 use lpm_common::LpmError;
 use std::net::SocketAddr;
+use subtle::ConstantTimeEq;
 use tower_http::cors::{AllowOrigin, CorsLayer};
+
+/// Accepts the token via `Authorization: Bearer` or `?token=` (the
+/// latter for `EventSource`, which cannot set headers). Cookies are
+/// not accepted — they are host-scoped, not port-scoped, on `127.0.0.1`.
+async fn require_auth_token(
+    State(state): State<InspectorState>,
+    request: Request,
+    next: Next,
+) -> Result<Response, StatusCode> {
+    let expected = state.auth_token().as_bytes();
+
+    let presented_header = request
+        .headers()
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.strip_prefix("Bearer "))
+        .map(|s| s.as_bytes().to_vec());
+
+    let presented_query = request.uri().query().and_then(|q| {
+        for pair in q.split('&') {
+            if let Some(v) = pair.strip_prefix("token=") {
+                return Some(v.as_bytes().to_vec());
+            }
+        }
+        None
+    });
+
+    let presented = presented_header.or(presented_query);
+
+    let ok = presented
+        .as_deref()
+        .is_some_and(|p| p.len() == expected.len() && p.ct_eq(expected).into());
+
+    if !ok {
+        return Err(StatusCode::UNAUTHORIZED);
+    }
+
+    Ok(next.run(request).await)
+}
 
 /// Start the inspector server on the given port.
 ///
@@ -66,8 +102,7 @@ pub async fn start(state: InspectorState, port: u16) -> Result<InspectorHandle, 
         ])
         .allow_headers([axum::http::header::CONTENT_TYPE]);
 
-    let app = Router::new()
-        // API routes
+    let api_routes = Router::new()
         .route("/api/status", get(crate::api::status))
         .route("/api/requests", get(crate::api::list_requests))
         .route("/api/requests/{id}", get(crate::api::get_request))
@@ -112,12 +147,24 @@ pub async fn start(state: InspectorState, port: u16) -> Result<InspectorHandle, 
         .route("/api/ws/stream", get(crate::sse::ws_stream))
         .route("/api/ws/connections", get(crate::api::list_ws_connections))
         .route("/api/ws/connections/{id}", get(crate::api::list_ws_frames))
-        // Static UI (SPA fallback)
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            require_auth_token,
+        ));
+
+    // SPA fallback stays unauthenticated so the browser can fetch
+    // HTML/JS/CSS; the injected bootstrap then carries the token on
+    // every API call.
+    let app = Router::new()
+        .merge(api_routes)
         .fallback(get(crate::ui::serve_ui))
         .layer(cors)
-        .with_state(state);
+        .with_state(state.clone());
 
-    let url = format!("http://127.0.0.1:{bound_port}");
+    let url = format!(
+        "http://127.0.0.1:{bound_port}/?token={}",
+        state.auth_token()
+    );
     tracing::info!("inspector listening on {url}");
 
     // Spawn the server in a background task
@@ -155,7 +202,18 @@ mod server_tests {
             "OS-assigned ephemeral ports are typically >=1024, got {}",
             handle.port
         );
-        assert_eq!(handle.url, format!("http://127.0.0.1:{}", handle.port));
+        let base = format!("http://127.0.0.1:{}/", handle.port);
+        assert!(
+            handle.url.starts_with(&base),
+            "url {} does not start with bound base {}",
+            handle.url,
+            base,
+        );
+        assert!(
+            handle.url.contains("?token="),
+            "url {} should embed the auth token",
+            handle.url
+        );
         handle.shutdown();
     }
 

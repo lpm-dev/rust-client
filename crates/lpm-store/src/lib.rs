@@ -1534,13 +1534,23 @@ pub fn find_installed_package_baseline_indexed(
 ///
 /// **Multi-source-same-coords:** when two distinct sources share
 /// `(name, version)` and produce different graph keys, this helper
-/// picks the first v2 link entry that matches in
-/// `iter_link_entries` directory order. Non-deterministic for
-/// multi-source-same-coords + lifecycle scripts, but acceptable for
-/// the patch path (a `<name>@<version>` patch should apply equally
-/// to every graph-key sharing those coords). A full
-/// `(name, version, wrapper_id)` lookup is the proper fix once
-/// `wrapper_id` is threaded through the lockfile.
+/// picks the lexicographically smallest matching v2 link entry.
+///
+/// The lex sort buys **reproducibility, not plant-attack defense.**
+/// Across runs, across filesystems (read_dir is inode-order on
+/// ext4/APFS and undefined elsewhere), and across the indexed +
+/// non-indexed variants of this lookup, the same input store now
+/// yields the same hit — patches/rebuilds become deterministic
+/// instead of inode-order-dependent. A same-UID local attacker
+/// who can plant `<links_root>/A@1.0.0+0000000000000000/` with
+/// a crafted sidecar will still win first-match deterministically
+/// (a `0000…`-prefixed graph-key suffix sorts before legitimate
+/// sha256-derived hex), and arguably more reliably than under
+/// inode-order luck — the lex sort does NOT close that attack.
+/// The actual defense against same-UID plants is the
+/// `(name, version, wrapper_id)` lookup tracked separately, which
+/// will require `wrapper_id` to flow through the lockfile;
+/// canonical ordering is the reproducibility pin in the meantime.
 pub fn find_installed_package_baseline(
     lpm_root: &lpm_common::LpmRoot,
     name: &str,
@@ -1550,8 +1560,14 @@ pub fn find_installed_package_baseline(
     // each sidecar `.lpm-link-meta.json`; the iterator gracefully
     // skips malformed entries so a corrupt sibling never blocks a
     // valid match.
+    //
+    // Collect-and-sort by link_dir path so the first match is
+    // deterministic across runs and across filesystems (read_dir
+    // order is inode-order on ext4/APFS and undefined elsewhere).
     let store_v2 = crate::v2::Store::from_lpm_root(lpm_root);
-    for (link_dir, meta) in store_v2.iter_link_entries()? {
+    let mut entries: Vec<(PathBuf, _)> = store_v2.iter_link_entries()?.collect();
+    entries.sort_by(|a, b| a.0.cmp(&b.0));
+    for (link_dir, meta) in entries {
         if meta.name == name && meta.version == version {
             let package_dir = link_dir.join("node_modules").join(name);
             if package_dir.exists() {
@@ -3623,6 +3639,91 @@ mod tests {
             hit.package_dir, hit2.package_dir,
             "rebuilding the index against the same disk state must \
              preserve first-match identity"
+        );
+    }
+
+    /// L11 — `find_installed_package_baseline` must return a result
+    /// keyed by lexicographic ordering of link-dir paths, not
+    /// `read_dir`'s filesystem-order accident. A same-UID attacker
+    /// who plants a link entry whose path sorts before the
+    /// legitimate one must not be able to win the first-match race
+    /// merely by getting their inode allocated earlier.
+    #[test]
+    fn find_installed_package_baseline_returns_lex_smallest_match_on_coord_collision() {
+        let dir = tempfile::tempdir().unwrap();
+        let lpm_root = lpm_common::LpmRoot::from_dir(dir.path());
+        let store = V2Store::from_lpm_root(&lpm_root);
+
+        use crate::v2::{GraphKeyInputs, LinkerModeTag, PlatformTuple};
+        let key_a = crate::v2::GraphKey::derive(
+            &GraphKeyInputs::new(
+                "react",
+                "18.0.0",
+                PlatformTuple::new("darwin", "arm64", None),
+                LinkerModeTag::Isolated,
+            )
+            .with_root_link_names(Some(vec!["react".into()])),
+        );
+        let key_b = crate::v2::GraphKey::derive(
+            &GraphKeyInputs::new(
+                "react",
+                "18.0.0",
+                PlatformTuple::new("darwin", "arm64", None),
+                LinkerModeTag::Isolated,
+            )
+            .with_root_link_names(Some(vec!["react".into(), "alias".into()])),
+        );
+        assert_ne!(key_a, key_b);
+
+        let sri = f2_synthetic_sri(b"l11/react");
+        f2_write_object(
+            &store,
+            &sri,
+            &[(
+                "package.json",
+                b"{\"name\":\"react\",\"version\":\"18.0.0\"}",
+            )],
+        );
+        for key in [std::sync::Arc::new(key_a), std::sync::Arc::new(key_b)] {
+            store
+                .populate_link_entry(LinkEntryRequest {
+                    graph_key: key,
+                    source_sri: sri.clone(),
+                    object_dir: store.paths().object_dir(&sri).unwrap(),
+                    deps: vec![],
+                    platform: std::sync::Arc::new(f2_sample_meta_platform()),
+                })
+                .unwrap();
+        }
+
+        // Discover what the canonical winner SHOULD be — the
+        // lex-smallest link_dir among the two-coord matches.
+        let entries: Vec<_> = store.iter_link_entries().unwrap().collect();
+        let matching: Vec<_> = entries
+            .iter()
+            .filter(|(_, m)| m.name == "react" && m.version == "18.0.0")
+            .map(|(d, _)| d.clone())
+            .collect();
+        assert_eq!(
+            matching.len(),
+            2,
+            "fixture must yield two link entries for the colliding coords"
+        );
+        let expected = matching.iter().min().unwrap().clone();
+
+        let hit = find_installed_package_baseline(&lpm_root, "react", "18.0.0")
+            .unwrap()
+            .expect("must match one of the link entries");
+        let hit_link_dir = hit
+            .package_dir
+            .ancestors()
+            .nth(2)
+            .expect("link_dir is grandparent of package_dir")
+            .to_path_buf();
+        assert_eq!(
+            hit_link_dir, expected,
+            "find_installed_package_baseline must return the lex-smallest \
+             link entry on coord collision, not read_dir order"
         );
     }
 }
