@@ -270,6 +270,24 @@ async fn setup(server_name: Option<&str>, json_output: bool) -> Result<(), LpmEr
     let editors = get_editors();
     let configured = setup_editors(&editors, name, &default_server_config())?;
 
+    // M43: the written editor config invokes `npx -y @lpm.dev/lpm-mcp-server`
+    // with no version pin. Every editor restart re-resolves the package
+    // against the public npm registry, so a single compromised publish
+    // (or transient registry redirect) becomes editor-session code
+    // execution. We don't pin a version today — the MCP server's
+    // release cadence is independent of lpm-cli, so a hard pin would
+    // freeze the MCP server at whatever was current when this lpm-cli
+    // build shipped. Loudly surface the trust posture so an operator
+    // can pin it themselves (edit the written config to add `@x.y.z`)
+    // or wrap the command in `lpm dlx` which routes through LPM's
+    // script-policy / triage advisor.
+    tracing::warn!(
+        target: "lpm_cli::mcp",
+        "MCP setup writes an unpinned `npx -y @lpm.dev/lpm-mcp-server` autostart. \
+         Every editor restart re-resolves from npm. To pin: edit the editor config and \
+         change `@lpm.dev/lpm-mcp-server` to `@lpm.dev/lpm-mcp-server@<version>`."
+    );
+
     if json_output {
         println!(
             "{}",
@@ -277,6 +295,7 @@ async fn setup(server_name: Option<&str>, json_output: bool) -> Result<(), LpmEr
                 "success": true,
                 "server": name,
                 "configured": configured,
+                "trust_note": "autostart uses `npx -y` with no version pin — see warning on stderr",
             }))
             .unwrap()
         );
@@ -291,6 +310,11 @@ async fn setup(server_name: Option<&str>, json_output: bool) -> Result<(), LpmEr
         for editor in &configured {
             println!("  {}", editor.dimmed());
         }
+        output::warn(
+            "autostart resolves `@lpm.dev/lpm-mcp-server` from npm on every editor start. \
+             Pin a version by editing the written config (replace the package spec with `@x.y.z`) \
+             if you want a static dependency.",
+        );
         println!();
     }
 

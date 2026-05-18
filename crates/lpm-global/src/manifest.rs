@@ -170,13 +170,12 @@ pub enum PackageSource {
 pub fn read_manifest(path: &Path) -> Result<GlobalManifest, LpmError> {
     // Windows long-path support — no-op on POSIX.
     let path = as_extended_path(path);
-    let bytes = match std::fs::read(&path) {
-        Ok(b) => b,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            return Ok(GlobalManifest::default());
-        }
-        Err(e) => return Err(LpmError::Io(e)),
-    };
+    let bytes =
+        match lpm_common::read_capped_state_file(&path, lpm_common::STATE_FILE_SIZE_CAP_BYTES) {
+            Ok(Some(b)) => b,
+            Ok(None) => return Ok(GlobalManifest::default()),
+            Err(e) => return Err(LpmError::Io(e)),
+        };
     let text = std::str::from_utf8(&bytes)
         .map_err(|e| manifest_parse_error(format!("manifest is not valid UTF-8: {e}")))?;
     let manifest: GlobalManifest = toml::from_str(text)

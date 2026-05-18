@@ -698,6 +698,7 @@ mod tests {
             store_root: PathBuf::from("C:/store"),
             home_dir: PathBuf::from("C:/Users/u"),
             tmpdir: PathBuf::from("C:/Users/u/AppData/Local/Temp"),
+            secret_read_allow: Vec::new(),
             extra_write_dirs: Vec::new(),
         }
     }

@@ -3469,10 +3469,14 @@ fn offline_install_workspace_ghost_transitive_after_manifest_edit_fails_closed()
 // separation — the contract under test is "warning on stderr, JSON on
 // stdout, neither leaks into the other."
 
-/// Empty-deps install with `.npmrc strict-ssl=false` must succeed AND
-/// emit the loud warning on stderr with `<dir>/.npmrc:1` source citation.
+/// M7: a project-local `.npmrc` with `strict-ssl=false` must be
+/// REFUSED (not honored) and the refusal must be surfaced with a
+/// `<dir>/.npmrc:1` source citation. Pre-fix the setting was honored
+/// silently — a hostile commit could disable TLS verification for
+/// every teammate. Now the operator's user-level `~/.npmrc` is the
+/// only place that may opt-in.
 #[test]
-fn install_strict_ssl_false_emits_loud_warning_with_source_citation() {
+fn install_strict_ssl_false_in_project_npmrc_is_refused_with_source_citation() {
     let project =
         TempProject::empty(r#"{"name":"strict-ssl-warn","version":"1.0.0","dependencies":{}}"#);
     project.write_file(".npmrc", "strict-ssl=false\n");
@@ -3484,7 +3488,7 @@ fn install_strict_ssl_false_emits_loud_warning_with_source_citation() {
         .expect("spawn lpm install");
     assert!(
         out.status.success(),
-        "install with empty deps must succeed even with strict-ssl=false; \
+        "install with empty deps must succeed even when the project-local strict-ssl override is refused; \
          stdout:\n{}\nstderr:\n{}",
         String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr)
@@ -3492,8 +3496,8 @@ fn install_strict_ssl_false_emits_loud_warning_with_source_citation() {
 
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
-        stderr.contains("DISABLED"),
-        "stderr must contain the DISABLED warning marker; got:\n{stderr}"
+        stderr.contains("refused"),
+        "stderr must contain the refusal marker; got:\n{stderr}"
     );
     let cite = format!("{}:1", npmrc_abs.display());
     assert!(
@@ -3502,11 +3506,10 @@ fn install_strict_ssl_false_emits_loud_warning_with_source_citation() {
     );
 }
 
-/// Same warning + citation must fire under `--json`. JSON goes to
-/// stdout; the warning is on stderr — no conflict. Pre-fix the warning
-/// was wrapped in a `json_output` guard that silenced it for CI/agents.
+/// Same refusal + citation must fire under `--json`. JSON goes to
+/// stdout; the warning is on stderr — no conflict.
 #[test]
-fn install_strict_ssl_false_emits_warning_even_in_json_mode() {
+fn install_strict_ssl_false_refusal_visible_in_json_mode() {
     let project = TempProject::empty(
         r#"{"name":"strict-ssl-warn-json","version":"1.0.0","dependencies":{}}"#,
     );
@@ -3531,11 +3534,11 @@ fn install_strict_ssl_false_emits_warning_even_in_json_mode() {
     });
     assert_eq!(parsed["success"], serde_json::json!(true));
 
-    // Stderr: warning + source citation.
+    // Stderr: refusal + source citation.
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
-        stderr.contains("DISABLED"),
-        "stderr must contain DISABLED warning even under --json; got:\n{stderr}"
+        stderr.contains("refused"),
+        "stderr must contain refusal warning even under --json; got:\n{stderr}"
     );
     let cite = format!("{}:1", npmrc_abs.display());
     assert!(

@@ -1,8 +1,62 @@
 use crate::output;
+use futures::StreamExt;
 use lpm_common::LpmError;
 use lpm_common::color::Painted;
 use lpm_registry::RegistryClient;
 use std::collections::HashMap;
+
+/// Hard cap on platform-API response bodies (env / vault / OIDC
+/// endpoints called from this module). Real payloads are kilobytes;
+/// 10 MB leaves several orders of magnitude of headroom and prevents
+/// a malicious / compromised platform endpoint from OOM-ing the CLI
+/// on the `.json()` path.
+const MAX_PLATFORM_RESPONSE_BYTES: usize = 10 * 1024 * 1024;
+
+/// Drain a response body with a two-stage cap. Stage 1 refuses
+/// pre-stream when `Content-Length` exceeds the cap; stage 2 aborts
+/// mid-stream the moment another chunk would cross it.
+async fn read_capped_platform_body(response: reqwest::Response) -> Result<Vec<u8>, LpmError> {
+    if let Some(declared) = response.content_length()
+        && declared as usize > MAX_PLATFORM_RESPONSE_BYTES
+    {
+        return Err(LpmError::Script(format!(
+            "platform response too large: declared length {declared} exceeds cap {MAX_PLATFORM_RESPONSE_BYTES}"
+        )));
+    }
+    let mut buf: Vec<u8> = Vec::with_capacity(16 * 1024);
+    let mut stream = response.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|e| LpmError::Script(format!("response read error: {e}")))?;
+        if buf.len().saturating_add(chunk.len()) > MAX_PLATFORM_RESPONSE_BYTES {
+            return Err(LpmError::Script(format!(
+                "platform response too large: streamed body exceeded cap {MAX_PLATFORM_RESPONSE_BYTES}"
+            )));
+        }
+        buf.extend_from_slice(&chunk);
+    }
+    Ok(buf)
+}
+
+/// Parse a capped platform response as JSON. Used in success-path
+/// reads where the caller wants typed parse errors back.
+async fn parse_capped_platform_json<T: serde::de::DeserializeOwned>(
+    response: reqwest::Response,
+) -> Result<T, LpmError> {
+    let buf = read_capped_platform_body(response).await?;
+    serde_json::from_slice(&buf).map_err(|e| LpmError::Script(format!("parse error: {e}")))
+}
+
+/// Parse a capped platform response as JSON, falling back to a stub
+/// `{"error": "unknown error"}` value on read / cap / parse failure.
+/// Used on error-path reads where the caller only needs an `error`
+/// field to display.
+async fn parse_capped_platform_json_or_unknown(response: reqwest::Response) -> serde_json::Value {
+    match read_capped_platform_body(response).await {
+        Ok(buf) => serde_json::from_slice::<serde_json::Value>(&buf)
+            .unwrap_or_else(|_| serde_json::json!({"error": "unknown error"})),
+        Err(_) => serde_json::json!({"error": "unknown error"}),
+    }
+}
 
 fn build_sync_environments(
     all_envs: &HashMap<String, HashMap<String, String>>,
@@ -450,8 +504,7 @@ pub async fn run(
                 }
             }
 
-            let registry_url = std::env::var("LPM_REGISTRY_URL")
-                .unwrap_or_else(|_| lpm_common::DEFAULT_REGISTRY_URL.to_string());
+            let registry_url = lpm_common::resolve_lpm_registry_url();
             let auth_token = resolve_lpm_bearer(&registry_url).await?;
 
             output::info("pushing vault to cloud...");
@@ -523,8 +576,7 @@ pub async fn run(
 
             // Org pull: different flow with X25519 decryption
             if let Some(org_slug) = org_flag {
-                let registry_url = std::env::var("LPM_REGISTRY_URL")
-                    .unwrap_or_else(|_| lpm_common::DEFAULT_REGISTRY_URL.to_string());
+                let registry_url = lpm_common::resolve_lpm_registry_url();
                 let auth_token = resolve_lpm_bearer(&registry_url).await?;
 
                 // Ensure we have a keypair
@@ -624,8 +676,7 @@ pub async fn run(
                 }
             }
 
-            let registry_url = std::env::var("LPM_REGISTRY_URL")
-                .unwrap_or_else(|_| lpm_common::DEFAULT_REGISTRY_URL.to_string());
+            let registry_url = lpm_common::resolve_lpm_registry_url();
             let auth_token = resolve_lpm_bearer(&registry_url).await?;
 
             output::info("pulling vault from cloud...");
@@ -668,8 +719,7 @@ pub async fn run(
             let vault_id = lpm_vault::vault_id::read_vault_id(project_dir)
                 .ok_or_else(|| LpmError::Script("no vault configured".into()))?;
 
-            let registry_url = std::env::var("LPM_REGISTRY_URL")
-                .unwrap_or_else(|_| lpm_common::DEFAULT_REGISTRY_URL.to_string());
+            let registry_url = lpm_common::resolve_lpm_registry_url();
             let auth_token = resolve_lpm_bearer(&registry_url).await?;
 
             let result =
@@ -717,8 +767,7 @@ pub async fn run(
                 return Err(LpmError::Script("vault is empty, nothing to share".into()));
             }
 
-            let registry_url = std::env::var("LPM_REGISTRY_URL")
-                .unwrap_or_else(|_| lpm_common::DEFAULT_REGISTRY_URL.to_string());
+            let registry_url = lpm_common::resolve_lpm_registry_url();
             let auth_token = resolve_lpm_bearer(&registry_url).await?;
 
             output::info("ensuring your X25519 public key is registered...");
@@ -787,8 +836,7 @@ pub async fn run(
             let vault_id = lpm_vault::vault_id::read_vault_id(project_dir)
                 .ok_or_else(|| LpmError::Script("no vault configured".into()))?;
 
-            let registry_url = std::env::var("LPM_REGISTRY_URL")
-                .unwrap_or_else(|_| lpm_common::DEFAULT_REGISTRY_URL.to_string());
+            let registry_url = lpm_common::resolve_lpm_registry_url();
             let auth_token = resolve_lpm_bearer(&registry_url).await?;
 
             let secrets = lpm_vault::get_all(project_dir);
@@ -884,8 +932,7 @@ pub async fn run(
             }
             let code = code.to_ascii_uppercase();
 
-            let registry_url = std::env::var("LPM_REGISTRY_URL")
-                .unwrap_or_else(|_| lpm_common::DEFAULT_REGISTRY_URL.to_string());
+            let registry_url = lpm_common::resolve_lpm_registry_url();
             // Vault pairing requires a refresh-backed session. The
             // `SessionRequired` posture rejects `LPM_TOKEN`/`--token`/
             // CI/legacy tokens with the same message the old
@@ -947,8 +994,7 @@ pub async fn run(
         }
 
         "unpair" => {
-            let registry_url = std::env::var("LPM_REGISTRY_URL")
-                .unwrap_or_else(|_| lpm_common::DEFAULT_REGISTRY_URL.to_string());
+            let registry_url = lpm_common::resolve_lpm_registry_url();
             // Unpair revokes browser pairings — same session-backed
             // requirement as `pair`.
             let auth_token = resolve_session_bearer(&registry_url).await?;
@@ -1784,8 +1830,7 @@ fn vars_check(project_dir: &std::path::Path, json_output: bool) -> Result<(), Lp
 
 /// Get the LPM auth token and registry URL for API calls.
 async fn get_platform_auth() -> Result<(String, String), LpmError> {
-    let registry_url = std::env::var("LPM_REGISTRY_URL")
-        .unwrap_or_else(|_| lpm_common::DEFAULT_REGISTRY_URL.to_string());
+    let registry_url = lpm_common::resolve_lpm_registry_url();
     let auth_token = resolve_lpm_bearer(&registry_url).await?;
     Ok((registry_url, auth_token))
 }
@@ -1914,10 +1959,7 @@ async fn vars_connect(
         .map_err(|e| LpmError::Network(format!("failed to connect: {e}")))?;
 
     if !response.status().is_success() {
-        let body: serde_json::Value = response
-            .json()
-            .await
-            .unwrap_or(serde_json::json!({"error": "unknown error"}));
+        let body: serde_json::Value = parse_capped_platform_json_or_unknown(response).await;
         return Err(LpmError::Script(
             body["error"]
                 .as_str()
@@ -1926,10 +1968,7 @@ async fn vars_connect(
         ));
     }
 
-    let result: serde_json::Value = response
-        .json()
-        .await
-        .map_err(|e| LpmError::Script(format!("parse error: {e}")))?;
+    let result: serde_json::Value = parse_capped_platform_json(response).await?;
 
     if json_output {
         println!(
@@ -2036,19 +2075,13 @@ async fn vars_platform_push(
         .map_err(|e| LpmError::Network(format!("failed to reach server: {e}")))?;
 
     if !dry_run_response.status().is_success() {
-        let body: serde_json::Value = dry_run_response
-            .json()
-            .await
-            .unwrap_or(serde_json::json!({"error": "unknown error"}));
+        let body: serde_json::Value = parse_capped_platform_json_or_unknown(dry_run_response).await;
         return Err(LpmError::Script(
             body["error"].as_str().unwrap_or("push failed").to_string(),
         ));
     }
 
-    let diff: serde_json::Value = dry_run_response
-        .json()
-        .await
-        .map_err(|e| LpmError::Script(format!("parse error: {e}")))?;
+    let diff: serde_json::Value = parse_capped_platform_json(dry_run_response).await?;
 
     let added = diff["added"].as_array().map(|a| a.len()).unwrap_or(0);
     let changed = diff["changed"].as_array().map(|a| a.len()).unwrap_or(0);
@@ -2160,19 +2193,13 @@ async fn vars_platform_push(
         .map_err(|e| LpmError::Network(format!("push failed: {e}")))?;
 
     if !push_response.status().is_success() {
-        let body: serde_json::Value = push_response
-            .json()
-            .await
-            .unwrap_or(serde_json::json!({"error": "unknown error"}));
+        let body: serde_json::Value = parse_capped_platform_json_or_unknown(push_response).await;
         return Err(LpmError::Script(
             body["error"].as_str().unwrap_or("push failed").to_string(),
         ));
     }
 
-    let result: serde_json::Value = push_response
-        .json()
-        .await
-        .map_err(|e| LpmError::Script(format!("parse error: {e}")))?;
+    let result: serde_json::Value = parse_capped_platform_json(push_response).await?;
 
     if json_output {
         println!(
@@ -2268,10 +2295,7 @@ async fn vars_platform_status(
         .map_err(|e| LpmError::Network(format!("failed to reach server: {e}")))?;
 
     if !response.status().is_success() {
-        let body: serde_json::Value = response
-            .json()
-            .await
-            .unwrap_or(serde_json::json!({"error": "unknown error"}));
+        let body: serde_json::Value = parse_capped_platform_json_or_unknown(response).await;
         return Err(LpmError::Script(
             body["error"]
                 .as_str()
@@ -2280,10 +2304,7 @@ async fn vars_platform_status(
         ));
     }
 
-    let result: serde_json::Value = response
-        .json()
-        .await
-        .map_err(|e| LpmError::Script(format!("parse error: {e}")))?;
+    let result: serde_json::Value = parse_capped_platform_json(response).await?;
 
     if json_output {
         println!(
@@ -2498,19 +2519,13 @@ async fn vars_oidc_allow(
         .map_err(|e| LpmError::Network(format!("failed to reach server: {e}")))?;
 
     if !response.status().is_success() {
-        let body: serde_json::Value = response
-            .json()
-            .await
-            .unwrap_or(serde_json::json!({"error": "unknown error"}));
+        let body: serde_json::Value = parse_capped_platform_json_or_unknown(response).await;
         return Err(LpmError::Script(
             body["error"].as_str().unwrap_or("failed").to_string(),
         ));
     }
 
-    let result: serde_json::Value = response
-        .json()
-        .await
-        .map_err(|e| LpmError::Script(format!("parse error: {e}")))?;
+    let result: serde_json::Value = parse_capped_platform_json(response).await?;
 
     if !json_output {
         output::success(&format!(
@@ -2593,19 +2608,13 @@ async fn vars_oidc_list(project_dir: &std::path::Path, json_output: bool) -> Res
         .map_err(|e| LpmError::Network(format!("failed to reach server: {e}")))?;
 
     if !response.status().is_success() {
-        let body: serde_json::Value = response
-            .json()
-            .await
-            .unwrap_or(serde_json::json!({"error": "unknown error"}));
+        let body: serde_json::Value = parse_capped_platform_json_or_unknown(response).await;
         return Err(LpmError::Script(
             body["error"].as_str().unwrap_or("failed").to_string(),
         ));
     }
 
-    let result: serde_json::Value = response
-        .json()
-        .await
-        .map_err(|e| LpmError::Script(format!("parse error: {e}")))?;
+    let result: serde_json::Value = parse_capped_platform_json(response).await?;
 
     if json_output {
         println!(
@@ -2678,8 +2687,7 @@ async fn vars_oidc_pull(
     // Also check env var override for vault ID (useful in CI where lpm.json may not exist)
     let vault_id = std::env::var("LPM_VAULT_ID").unwrap_or(vault_id);
 
-    let registry_url = std::env::var("LPM_REGISTRY_URL")
-        .unwrap_or_else(|_| lpm_common::DEFAULT_REGISTRY_URL.to_string());
+    let registry_url = lpm_common::resolve_lpm_registry_url();
 
     let mut env_mode: Option<&str> = None;
     let mut output_file: Option<&str> = None;
@@ -2710,10 +2718,8 @@ async fn vars_oidc_pull(
         .map_err(|e| LpmError::Network(format!("OIDC exchange failed: {e}")))?;
 
     if !exchange_response.status().is_success() {
-        let body: serde_json::Value = exchange_response
-            .json()
-            .await
-            .unwrap_or(serde_json::json!({"error": "unknown error"}));
+        let body: serde_json::Value =
+            parse_capped_platform_json_or_unknown(exchange_response).await;
         let error = body["error"].as_str().unwrap_or("OIDC exchange failed");
         let hint = body["hint"].as_str().unwrap_or("");
         let msg = if hint.is_empty() {
@@ -2724,10 +2730,7 @@ async fn vars_oidc_pull(
         return Err(LpmError::Script(msg));
     }
 
-    let exchange_result: serde_json::Value = exchange_response
-        .json()
-        .await
-        .map_err(|e| LpmError::Script(format!("parse error: {e}")))?;
+    let exchange_result: serde_json::Value = parse_capped_platform_json(exchange_response).await?;
 
     let lpm_token = exchange_result["token"]
         .as_str()
@@ -2761,6 +2764,27 @@ async fn vars_oidc_pull(
 
         std::fs::write(file, &content)
             .map_err(|e| LpmError::Script(format!("failed to write {file}: {e}")))?;
+
+        // Restrict to owner-only on Unix. The default umask leaves
+        // dotenv files at 0o644 on most distros, which means any
+        // concurrent CI build step running as a different uid
+        // (sidecar containers, sibling daemons, shared runners) can
+        // read the plaintext secrets escrowed here. Best-effort: on
+        // filesystems without POSIX modes the chmod is a no-op, but
+        // the call is still cheap and the failure path is just a
+        // tracing::warn — never blocks the user's pipeline.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let perms = std::fs::Permissions::from_mode(0o600);
+            if let Err(e) = std::fs::set_permissions(file, perms) {
+                tracing::warn!(
+                    path = %file,
+                    error = %e,
+                    "failed to set 0o600 on env-pull dotenv file; secret may be readable by other local uids",
+                );
+            }
+        }
 
         if !json_output {
             output::success(&format!(
@@ -2850,19 +2874,13 @@ async fn vars_platform_pull(
         .map_err(|e| LpmError::Network(format!("failed to reach server: {e}")))?;
 
     if !response.status().is_success() {
-        let body: serde_json::Value = response
-            .json()
-            .await
-            .unwrap_or(serde_json::json!({"error": "unknown error"}));
+        let body: serde_json::Value = parse_capped_platform_json_or_unknown(response).await;
         return Err(LpmError::Script(
             body["error"].as_str().unwrap_or("pull failed").to_string(),
         ));
     }
 
-    let result: serde_json::Value = response
-        .json()
-        .await
-        .map_err(|e| LpmError::Script(format!("parse error: {e}")))?;
+    let result: serde_json::Value = parse_capped_platform_json(response).await?;
 
     let vars = result["vars"]
         .as_object()
@@ -3026,8 +3044,7 @@ fn vars_list(
 
 /// List cloud vaults — personal or org.
 async fn vars_list_remote(org_slug: Option<&str>, json_output: bool) -> Result<(), LpmError> {
-    let registry_url = std::env::var("LPM_REGISTRY_URL")
-        .unwrap_or_else(|_| lpm_common::DEFAULT_REGISTRY_URL.to_string());
+    let registry_url = lpm_common::resolve_lpm_registry_url();
     let auth_token = resolve_lpm_bearer(&registry_url).await?;
 
     if let Some(slug) = org_slug {
@@ -3174,8 +3191,7 @@ async fn vars_diff(
 
         let vault_id = lpm_vault::vault_id::read_vault_id(project_dir)
             .ok_or_else(|| LpmError::Script("no vault configured".into()))?;
-        let registry_url = std::env::var("LPM_REGISTRY_URL")
-            .unwrap_or_else(|_| lpm_common::DEFAULT_REGISTRY_URL.to_string());
+        let registry_url = lpm_common::resolve_lpm_registry_url();
         let auth_token = resolve_lpm_bearer(&registry_url).await?;
 
         let (remote, _version) =
@@ -3195,8 +3211,7 @@ async fn vars_diff(
 
         let vault_id = lpm_vault::vault_id::read_vault_id(project_dir)
             .ok_or_else(|| LpmError::Script("no vault configured".into()))?;
-        let registry_url = std::env::var("LPM_REGISTRY_URL")
-            .unwrap_or_else(|_| lpm_common::DEFAULT_REGISTRY_URL.to_string());
+        let registry_url = lpm_common::resolve_lpm_registry_url();
         let auth_token = resolve_lpm_bearer(&registry_url).await?;
 
         let (remote, _version) = lpm_vault::sync::pull(&registry_url, &auth_token, &vault_id)

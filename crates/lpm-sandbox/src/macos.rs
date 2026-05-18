@@ -170,6 +170,7 @@ mod tests {
             store_root: tmp.path().join("store"),
             home_dir: home,
             tmpdir,
+            secret_read_allow: Vec::new(),
             extra_write_dirs: Vec::new(),
         };
         RealisticSpec { spec, _tmp: tmp }
@@ -274,6 +275,7 @@ mod tests {
             store_root: home.join(".lpm/store"),
             home_dir: home.clone(),
             tmpdir: PathBuf::from("/tmp"),
+            secret_read_allow: Vec::new(),
             extra_write_dirs: Vec::new(),
         };
         let sb = new_for_platform(spec, SandboxMode::Enforce).unwrap();
@@ -308,6 +310,7 @@ mod tests {
             store_root: td.path().join("store"),
             home_dir: home,
             tmpdir: PathBuf::from("/tmp"),
+            secret_read_allow: Vec::new(),
             extra_write_dirs: Vec::new(),
         };
         let sb = new_for_platform(spec, SandboxMode::Enforce).unwrap();
@@ -351,6 +354,7 @@ mod tests {
             store_root: td.path().join("store"),
             home_dir: home,
             tmpdir: PathBuf::from("/tmp"),
+            secret_read_allow: Vec::new(),
             extra_write_dirs: Vec::new(),
         };
         let sb = new_for_platform(spec, SandboxMode::Enforce).unwrap();
@@ -401,6 +405,7 @@ mod tests {
             store_root: td.path().join("store"),
             home_dir: home,
             tmpdir: PathBuf::from("/tmp"),
+            secret_read_allow: Vec::new(),
             extra_write_dirs: Vec::new(),
         };
         let sb = new_for_platform(spec, SandboxMode::LogOnly).unwrap();
@@ -451,6 +456,7 @@ mod tests {
             store_root: td.path().join("store"),
             home_dir: home,
             tmpdir: PathBuf::from("/tmp"),
+            secret_read_allow: Vec::new(),
             extra_write_dirs: Vec::new(),
         };
         let sb = new_for_platform(spec, SandboxMode::LogOnly).unwrap();

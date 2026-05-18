@@ -43,6 +43,23 @@ enum TrustOutcome {
 /// 2. swift package-registry login --token <lpm_token> (HTTPS only)
 /// 3. Download signing certificate to ~/.swiftpm/security/trusted-root-certs/lpm.der
 pub async fn run(registry_url: &str, json_output: bool, force: bool) -> Result<(), LpmError> {
+    // H20: refuse to globally install SwiftPM signing trust for a
+    // registry URL that fails the same gating contract used for
+    // LPM_REGISTRY_URL itself (H16). HTTPS is accepted for any host
+    // (legitimate private mirror / on-prem appliance); HTTP only for
+    // loopback (workflow tests against wiremock). Plain HTTP non-
+    // loopback was previously passed straight to SwiftPM with
+    // `--allow-insecure-http`, which then installed `lpm.der` into
+    // `~/.swiftpm/security/trusted-root-certs/` and silently allowed
+    // every `lpmdev` Swift package to be signed against whatever
+    // cert that registry served. That's a persistent SwiftPM trust
+    // downgrade that survives across LPM sessions. Refuse upfront.
+    if !lpm_common::lpm_registry_url_is_accepted(registry_url) {
+        return Err(LpmError::Registry(format!(
+            "swift-registry setup refuses to install global SwiftPM signing trust against {registry_url}: only https:// (any host) or http:// loopback URLs are accepted (H20). Pass an https:// registry URL or unset LPM_REGISTRY_URL."
+        )));
+    }
+
     let swift_registry_url = format!("{registry_url}/api/swift-registry");
     let is_https = registry_url.starts_with("https://");
 
@@ -113,6 +130,15 @@ pub async fn run(registry_url: &str, json_output: bool, force: bool) -> Result<(
             // because there is no alternative mechanism (no env var support, no stdin pipe,
             // no config file option for token injection). The risk is mitigated by the
             // token being short-lived in the process list (command completes quickly).
+            //
+            // H19: surface the argv-leak window via tracing::warn so a same-host
+            // observer scanning logs after a swift-registry setup sees the explicit
+            // trust posture (instead of having to read source). The warn lands on
+            // stderr regardless of --json so CI / agent runs also see it.
+            tracing::warn!(
+                target: "lpm_cli::swift_registry",
+                "swift package-registry login passes the LPM bearer via `--token <value>` in process argv — token is briefly observable to same-host processes via `ps`. SPM has no stdin/env/config alternative; accepted trade-off documented in code."
+            );
             let login_result = if json_output {
                 tokio::process::Command::new("swift")
                     .args([
@@ -237,6 +263,55 @@ pub async fn run(registry_url: &str, json_output: bool, force: bool) -> Result<(
 /// If missing, runs `swift package-registry set --scope lpmdev`, installs signing cert,
 /// and configures signing trust policy — all silently.
 ///
+/// Disposition of an existing `lpmdev` scope in `registries.json`.
+/// Carries enough information for the caller to either short-circuit
+/// (URL already matches), re-resolve and surface the mismatch (URL
+/// points elsewhere), or run a fresh setup (no entry at all).
+#[derive(Debug, PartialEq)]
+enum ExistingScope {
+    /// `registries.lpmdev.url` parses cleanly and equals the expected
+    /// LPM swift-registry endpoint.
+    Matches,
+    /// A `lpmdev` entry exists but its URL differs from the expected
+    /// endpoint (or is missing/malformed). A malicious repo could
+    /// commit this to substitute the SwiftPM registry on every
+    /// teammate that runs `lpm install`; we surface a warning and
+    /// re-run setup so the scope URL is overwritten.
+    Mismatch { existing: String },
+    /// No `lpmdev` entry — first-time setup.
+    Absent,
+}
+
+/// Inspect `registries.json` and classify the state of the `lpmdev`
+/// scope. Pure, no IO failure leaks: any read/parse error is treated
+/// as `Absent` (the caller does a fresh setup, which produces a
+/// correct registry config).
+fn evaluate_existing_lpmdev_scope(
+    config_path: &std::path::Path,
+    expected_url: &str,
+) -> ExistingScope {
+    if !config_path.exists() {
+        return ExistingScope::Absent;
+    }
+    let Ok(content) = std::fs::read_to_string(config_path) else {
+        return ExistingScope::Absent;
+    };
+    let Ok(json) = serde_json::from_str::<serde_json::Value>(&content) else {
+        return ExistingScope::Absent;
+    };
+    let Some(scope) = json.get("registries").and_then(|r| r.get("lpmdev")) else {
+        return ExistingScope::Absent;
+    };
+    let existing_url = scope.get("url").and_then(|u| u.as_str()).unwrap_or("");
+    if existing_url == expected_url {
+        ExistingScope::Matches
+    } else {
+        ExistingScope::Mismatch {
+            existing: existing_url.to_string(),
+        }
+    }
+}
+
 /// Called automatically during `lpm install` so the user never has to run `lpm swift-registry`
 /// as a separate step.
 pub async fn ensure_configured(
@@ -244,22 +319,26 @@ pub async fn ensure_configured(
     package_dir: &std::path::Path,
     json_output: bool,
 ) -> Result<(), LpmError> {
-    // Check if lpmdev scope is already registered — parse JSON structure
-    // instead of substring matching to avoid false positives
-    let config_path = package_dir.join(".swiftpm/configuration/registries.json");
-    if config_path.exists()
-        && let Ok(content) = std::fs::read_to_string(&config_path)
-        && let Ok(json) = serde_json::from_str::<serde_json::Value>(&content)
-        && json
-            .get("registries")
-            .and_then(|r| r.get("lpmdev"))
-            .is_some()
-    {
-        return Ok(());
-    }
-
     let swift_registry_url = format!("{registry_url}/api/swift-registry");
     let is_https = registry_url.starts_with("https://");
+
+    let config_path = package_dir.join(".swiftpm/configuration/registries.json");
+    match evaluate_existing_lpmdev_scope(&config_path, &swift_registry_url) {
+        ExistingScope::Matches => return Ok(()),
+        ExistingScope::Mismatch { existing } => {
+            tracing::warn!(
+                existing = %existing,
+                expected = %swift_registry_url,
+                "SwiftPM `lpmdev` scope is mapped to a non-LPM URL — re-resolving",
+            );
+            if !json_output {
+                output::warn(&format!(
+                    "SwiftPM `lpmdev` scope mapped to {existing}, expected {swift_registry_url} — re-resolving"
+                ));
+            }
+        }
+        ExistingScope::Absent => {}
+    }
 
     if !json_output {
         output::info("Configuring SPM registry scope for lpmdev...");
@@ -948,5 +1027,89 @@ mod tests {
         // AlreadyConfigured, no rewrite.
         let outcome2 = configure_signing_trust(true).expect("idempotent re-run should succeed");
         assert_eq!(outcome2, TrustOutcome::AlreadyConfigured);
+    }
+
+    // ── M53: scope URL verification ──────────────────────────────
+
+    /// No registries.json yet — first-time setup.
+    #[test]
+    fn scope_eval_returns_absent_when_no_file() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("registries.json");
+        let outcome = evaluate_existing_lpmdev_scope(&path, "https://lpm.dev/api/swift-registry");
+        assert_eq!(outcome, ExistingScope::Absent);
+    }
+
+    /// `registries.json` exists but has no `lpmdev` scope — absent.
+    #[test]
+    fn scope_eval_returns_absent_when_no_lpmdev_entry() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("registries.json");
+        std::fs::write(
+            &path,
+            r#"{"registries": {"other": {"url": "https://other.example/"}}}"#,
+        )
+        .unwrap();
+        let outcome = evaluate_existing_lpmdev_scope(&path, "https://lpm.dev/api/swift-registry");
+        assert_eq!(outcome, ExistingScope::Absent);
+    }
+
+    /// The scope URL matches the resolved registry endpoint — short-circuit OK.
+    #[test]
+    fn scope_eval_returns_matches_on_url_equality() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("registries.json");
+        std::fs::write(
+            &path,
+            r#"{"registries": {"lpmdev": {"url": "https://lpm.dev/api/swift-registry"}}}"#,
+        )
+        .unwrap();
+        let outcome = evaluate_existing_lpmdev_scope(&path, "https://lpm.dev/api/swift-registry");
+        assert_eq!(outcome, ExistingScope::Matches);
+    }
+
+    /// M53: a hostile repo can commit `registries.json` with `lpmdev`
+    /// mapped to an attacker URL. The check must NOT short-circuit on
+    /// the bare presence of the entry — it must compare URLs.
+    #[test]
+    fn scope_eval_returns_mismatch_when_lpmdev_url_points_elsewhere() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("registries.json");
+        std::fs::write(
+            &path,
+            r#"{"registries": {"lpmdev": {"url": "https://attacker.example/registry"}}}"#,
+        )
+        .unwrap();
+        let outcome = evaluate_existing_lpmdev_scope(&path, "https://lpm.dev/api/swift-registry");
+        assert_eq!(
+            outcome,
+            ExistingScope::Mismatch {
+                existing: "https://attacker.example/registry".to_string(),
+            }
+        );
+    }
+
+    /// Malformed JSON / missing `url` field — fall through to fresh
+    /// setup. Treating a corrupted file as "matching" would honour
+    /// whatever happened to be on disk; treating it as Absent forces
+    /// the setup to write the correct URL.
+    #[test]
+    fn scope_eval_handles_malformed_or_partial_entries() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("registries.json");
+
+        std::fs::write(&path, "not json").unwrap();
+        assert_eq!(
+            evaluate_existing_lpmdev_scope(&path, "https://lpm.dev/api/swift-registry"),
+            ExistingScope::Absent
+        );
+
+        std::fs::write(&path, r#"{"registries": {"lpmdev": {}}}"#).unwrap();
+        assert_eq!(
+            evaluate_existing_lpmdev_scope(&path, "https://lpm.dev/api/swift-registry"),
+            ExistingScope::Mismatch {
+                existing: String::new(),
+            }
+        );
     }
 }

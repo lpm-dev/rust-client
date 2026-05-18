@@ -29,6 +29,12 @@ const OBJECTS_DIR: &str = "objects";
 /// Subdirectory holding per-graph-key link entries.
 const LINKS_DIR: &str = "links";
 
+/// One row yielded by [`Store::iter_link_entries_for_verify`]: the
+/// link directory plus either its parsed sidecar or the read/parse/
+/// schema/validation failure encountered. Named so the public
+/// signature stays readable.
+pub type VerifyLinkEntry = (PathBuf, Result<LinkMeta, LpmError>);
+
 /// `node_modules/` sub-name inside each `links/<graph-key>/` entry.
 const LINK_NODE_MODULES: &str = "node_modules";
 
@@ -349,7 +355,7 @@ impl Store {
         }
 
         if let Some(parent) = object_dir.parent() {
-            std::fs::create_dir_all(parent)
+            ensure_store_tier_dir_locked(parent)
                 .map_err(|e| LpmError::Store(format!("failed to create v2 objects dir: {e}")))?;
         }
 
@@ -357,6 +363,8 @@ impl Store {
         if tmp_dir.exists() {
             let _ = std::fs::remove_dir_all(&tmp_dir);
         }
+        create_tmp_dir_locked(&tmp_dir)
+            .map_err(|e| LpmError::Store(format!("failed to create v2 tmp staging dir: {e}")))?;
 
         // Fused extract + behavioral scan in a single pass: `should_scan`
         // filters per entry inside the tar walk, and the inspector
@@ -455,17 +463,33 @@ impl Store {
     ) -> Result<(PathBuf, String, StageTimings), LpmError> {
         let computed_sri = crate::compute_sri_hash(tarball_data);
 
+        // M18: verify against the algorithm declared in `expected`.
+        // The v2 path mirrors v1: sha512 stays the canonical algorithm
+        // (`computed_sri`), sha256 is computed on-demand from the
+        // already-buffered tarball bytes when the lockfile declares it.
+        // Pre-fix the non-sha512 path silently trusted the computed
+        // sha512 — letting a coerced lockfile pass without any check.
         if let Some(expected) = expected_integrity {
-            if expected.starts_with("sha512-") && expected != computed_sri {
+            use subtle::ConstantTimeEq;
+            let candidate_owned;
+            let candidate = if expected.starts_with("sha512-") {
+                &computed_sri
+            } else if expected.starts_with("sha256-") {
+                candidate_owned = crate::compute_sri_hash_sha256(tarball_data);
+                &candidate_owned
+            } else {
+                return Err(LpmError::Registry(format!(
+                    "unsupported integrity algorithm in v2 extract: {expected} — \
+                     expected sha512-… (preferred) or sha256-…"
+                )));
+            };
+            let matches_expected = expected.len() == candidate.len()
+                && expected.as_bytes().ct_eq(candidate.as_bytes()).into();
+            if !matches_expected {
                 return Err(LpmError::IntegrityMismatch {
                     expected: expected.to_string(),
-                    actual: computed_sri,
+                    actual: candidate.to_string(),
                 });
-            }
-            if !expected.starts_with("sha512-") {
-                tracing::warn!(
-                    "v2 store: non-sha512 expected integrity ({expected}); trusting computed {computed_sri}"
-                );
             }
         }
 
@@ -541,7 +565,7 @@ impl Store {
         }
 
         if let Some(parent) = final_dir.parent() {
-            std::fs::create_dir_all(parent)
+            ensure_store_tier_dir_locked(parent)
                 .map_err(|e| LpmError::Store(format!("failed to create v2 links dir: {e}")))?;
         }
 
@@ -549,6 +573,8 @@ impl Store {
         if tmp_dir.exists() {
             let _ = std::fs::remove_dir_all(&tmp_dir);
         }
+        create_tmp_dir_locked(&tmp_dir)
+            .map_err(|e| LpmError::Store(format!("failed to create v2 tmp staging dir: {e}")))?;
 
         // Run the atomic-staging body in a closure so a single error
         // path can clean up the tmp dir uniformly. Anything that
@@ -646,6 +672,13 @@ impl Store {
     /// Skips:
     /// - Non-directories at the `links/` level (defensive — a stray
     ///   file there isn't a link entry).
+    /// - **Symlinks at the `links/` level.** The store writer never
+    ///   creates symlinks at `links/<entry>`; one appearing here is a
+    ///   tamper / corruption signal that an outside-store path could
+    ///   resolve into the v2 enumeration. Symlinks are refused with a
+    ///   `tracing::warn` so callers (cache prune, rebuild lookup) never
+    ///   see a poisoned entry whose deletion target would resolve
+    ///   outside the store.
     /// - Directories with a missing or malformed sidecar (mid-write
     ///   tmp dirs from a crashed populate, prune leftovers, etc.).
     ///   These get a debug trace; callers see them as absent rather
@@ -675,7 +708,15 @@ impl Store {
         let iter = read_dir.filter_map(|entry| {
             let entry = entry.ok()?;
             let link_dir = entry.path();
-            if !link_dir.is_dir() {
+            let file_type = entry.file_type().ok()?;
+            if file_type.is_symlink() {
+                tracing::warn!(
+                    "v2 store: refusing symlinked link entry at {} (store writer never creates symlinks here; tamper signal)",
+                    link_dir.display()
+                );
+                return None;
+            }
+            if !file_type.is_dir() {
                 return None;
             }
             match LinkMeta::read_from(&link_dir) {
@@ -690,6 +731,52 @@ impl Store {
             }
         });
         Ok(Box::new(iter) as Box<dyn Iterator<Item = (PathBuf, LinkMeta)>>)
+    }
+
+    /// Verify-specific enumeration of every v2 link directory.
+    ///
+    /// Unlike [`Self::iter_link_entries`], this surfaces sidecar
+    /// read/parse/schema/validation failures as `Err` entries instead
+    /// of silently filtering them out — a corrupt sidecar is itself a
+    /// store-integrity problem that `lpm store verify` must report.
+    /// Non-directory children of `links/` are still filtered (a stray
+    /// file isn't a link entry to begin with), and symlinks at the
+    /// `links/` level surface as a corruption Err so verify reports
+    /// them rather than dereferencing into an outside-store path.
+    pub fn iter_link_entries_for_verify(&self) -> Result<Vec<VerifyLinkEntry>, LpmError> {
+        let links_root = self.paths.links_root();
+        if !links_root.exists() {
+            return Ok(Vec::new());
+        }
+        let read_dir = std::fs::read_dir(&links_root).map_err(|e| {
+            LpmError::Store(format!(
+                "failed to enumerate v2 links root at {}: {e}",
+                links_root.display()
+            ))
+        })?;
+        let mut out = Vec::new();
+        for entry in read_dir {
+            let Ok(entry) = entry else { continue };
+            let link_dir = entry.path();
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
+            if file_type.is_symlink() {
+                out.push((
+                    link_dir,
+                    Err(LpmError::Store(
+                        "v2 link entry is a symlink (store writer never creates symlinks at links/<entry>; refusing to follow into an outside-store path)".to_string(),
+                    )),
+                ));
+                continue;
+            }
+            if !file_type.is_dir() {
+                continue;
+            }
+            let result = LinkMeta::read_from(&link_dir);
+            out.push((link_dir, result));
+        }
+        Ok(out)
     }
 
     /// Find the package directory for `(name, version)` by walking the
@@ -775,6 +862,8 @@ impl Store {
         if tmp_dir.exists() {
             let _ = std::fs::remove_dir_all(&tmp_dir);
         }
+        create_tmp_dir_locked(&tmp_dir)
+            .map_err(|e| LpmError::Store(format!("failed to create v2 tmp staging dir: {e}")))?;
 
         copy_dir_recursively(v1_pkg_dir, &tmp_dir).map_err(|e| {
             let _ = std::fs::remove_dir_all(&tmp_dir);
@@ -852,7 +941,15 @@ impl Store {
         let iter = read_dir.filter_map(|entry| {
             let entry = entry.ok()?;
             let object_dir = entry.path();
-            if !object_dir.is_dir() {
+            let file_type = entry.file_type().ok()?;
+            if file_type.is_symlink() {
+                tracing::warn!(
+                    "v2 store: refusing symlinked object entry at {} (store writer never creates symlinks here; tamper signal)",
+                    object_dir.display()
+                );
+                return None;
+            }
+            if !file_type.is_dir() {
                 return None;
             }
             if !object_dir.join(".integrity").is_file() {
@@ -1049,9 +1146,66 @@ fn is_complete_object_dir(dir: &Path) -> bool {
 }
 
 fn tmp_sibling(dir: &Path) -> PathBuf {
-    let pid = std::process::id();
-    let tid = format!("{:?}", std::thread::current().id());
-    dir.with_extension(format!("tmp.{pid}.{tid}"))
+    // Random 64-bit suffix replaces the pid+tid pair so a same-UID
+    // attacker can't predict the tmp path and plant a symlink there
+    // before we create the dir. PID + thread::id() are both
+    // observable in /proc on Linux; the random suffix is uniformly
+    // unpredictable across all UIDs that can read the parent dir.
+    use rand::RngCore;
+    let suffix: u64 = rand::thread_rng().next_u64();
+    dir.with_extension(format!("tmp.{suffix:016x}"))
+}
+
+/// Pre-create a tmp staging dir at 0o700 on Unix so partial extracts
+/// can't be read by other UIDs on a shared host. The extractor will
+/// `create_dir_all` again on this same path — a no-op once the dir
+/// already exists at the restricted mode. On filesystems without
+/// POSIX modes the mode is silently ignored, which matches the
+/// broader credential-metadata posture.
+fn create_tmp_dir_locked(path: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        let mut b = std::fs::DirBuilder::new();
+        b.recursive(true);
+        b.mode(0o700);
+        b.create(path)
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::create_dir_all(path)
+    }
+}
+
+/// Ensure a store-tier directory exists at 0o700. Idempotent — if the
+/// directory is already present, its perms are tightened in place.
+///
+/// `~/.lpm/store/v2/objects/` and `~/.lpm/store/v2/links/` carry
+/// extracted package bytes (including private `@org/*` packages).
+/// `create_dir_all`'s default-umask creation lets shared-host /
+/// shared-CI-runner / NFS-mounted layouts disclose those bytes to
+/// every other local uid. Stamping 0o700 on the store-tier dirs
+/// closes that shape without touching how each link entry stages —
+/// the per-entry tmp dir is also 0o700, and intra-tree perms are
+/// preserved via the atomic rename.
+///
+/// No-op on platforms without POSIX modes, where the perms knob does
+/// not apply.
+fn ensure_store_tier_dir_locked(path: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        use std::os::unix::fs::PermissionsExt;
+        let mut b = std::fs::DirBuilder::new();
+        b.recursive(true);
+        b.mode(0o700);
+        b.create(path)?;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::create_dir_all(path)
+    }
 }
 
 /// Recursively copy `src/` to `dst/`. Used by the v1 → v2 cache-hit
@@ -1072,21 +1226,22 @@ fn copy_dir_recursively(src: &Path, dst: &Path) -> std::io::Result<()> {
         if ft.is_dir() {
             copy_dir_recursively(&entry_src, &entry_dst)?;
         } else if ft.is_symlink() {
-            // Preserve symlinks verbatim — the v1 store already
-            // dereferences extracts on write, so a symlink in
-            // `<v1>/.../` is an explicitly-shipped tarball symlink
-            // (rare but legal in npm), not an internal link.
-            let target = std::fs::read_link(&entry_src)?;
-            #[cfg(unix)]
-            std::os::unix::fs::symlink(&target, &entry_dst)?;
-            #[cfg(windows)]
-            {
-                if target.is_dir() {
-                    std::os::windows::fs::symlink_dir(&target, &entry_dst)?;
-                } else {
-                    std::os::windows::fs::symlink_file(&target, &entry_dst)?;
-                }
-            }
+            // Refuse to migrate symlinks from a v1 store entry into the
+            // v2 object dir (L8). The v1 extractor's `is_file()` filter
+            // already prevents symlinks from being written into store
+            // entries under normal operation, so a symlink here is
+            // either (a) a manually-planted artefact by a local attacker
+            // or (b) a regression in the v1 extractor's filter. Both
+            // cases would faithfully reproduce the symlink target into
+            // every link entry that consumed the migrated object —
+            // i.e. a `/etc/passwd` symlink becomes readable through
+            // every consuming project's node_modules. Skip with a
+            // tracing::warn so the migration completes for the
+            // surrounding files but the unsafe link is dropped.
+            tracing::warn!(
+                src = %entry_src.display(),
+                "v1→v2 copy: skipping symlink (refused — v1 store entries should not contain symlinks)",
+            );
         } else if ft.is_file() {
             std::fs::copy(&entry_src, &entry_dst)?;
         }
@@ -1108,6 +1263,42 @@ use lpm_common::symlink::create_dir_symlink_or_junction as create_dir_symlink;
 /// fallback. Mirrors `lpm-linker::link_dir_recursive`'s policy so the
 /// v2 store inherits the same CoW-on-APFS performance characteristics
 /// today's v1 wrappers already have.
+///
+/// # Accepted-posture trade-off (H22)
+///
+/// On Linux the function falls straight to [`std::fs::hard_link`],
+/// which makes the project's `node_modules/<pkg>/<file>` and the
+/// store object at `objects/<sri>/<file>` share an inode. On a CoW-
+/// capable filesystem (Btrfs, XFS with `reflink=1`, F2FS) this is
+/// safe in practice because most editor / build-tool writes
+/// `unlink`+`create` the destination, breaking the link before the
+/// kernel writes attacker-controlled bytes. On ext4 — the default
+/// Linux root FS — `unlink`+`create` still breaks the link, but a
+/// truncate-in-place write (`fs.writeFileSync` in Node, `open(O_TRUNC)`
+/// in C, `open(..., 'w')` in Python) modifies the underlying inode
+/// in place and so mutates the CAS object that every project on the
+/// machine resolving the same SRI shares.
+///
+/// The primary defense is the script-policy gate: any postinstall
+/// that could trigger the mutation must be either bundled with a
+/// `trustedDependencies` entry or explicitly approved via the
+/// triage-advisor (see `crates/lpm-cli/src/script_policy_config.rs`
+/// and the H4/L29 fixes for the surrounding gate). H22 only triggers
+/// when an approved script intentionally mutates its package files;
+/// the next install resolves the mutated SRI as a new entry, so
+/// long-term divergence is bounded by SRI rotation.
+///
+/// The long-term mitigation handle is `FICLONE` (ioctl
+/// `FS_IOC_CLONE` / `0x40049409`) attempted first on Linux, with
+/// fallback to hard_link only when the kernel returns `EOPNOTSUPP`
+/// (ext4). Reflink gives an independent inode under CoW semantics,
+/// so a project-side write doesn't touch the store object even
+/// under truncate-in-place. Implementation is deferred because the
+/// fallback path still leaves the ext4 case exposed and the right
+/// answer is to migrate the default install-pipeline write shape
+/// instead (covered by tracking-issue work outside this audit). See
+/// `private/security-findings.md` H22 for the full trade-off
+/// discussion.
 fn materialize_into(src: &Path, dst: &Path) -> Result<(), LpmError> {
     #[cfg(target_os = "macos")]
     {
@@ -2003,6 +2194,67 @@ mod tests {
         assert_eq!(count, 0);
     }
 
+    /// A poisoned link entry shaped as a symlink (e.g. corrupted store,
+    /// hostile same-user writer) must NOT surface in the iterator. The
+    /// store writer never produces symlinks at `links/<entry>`; one
+    /// appearing is a tamper signal that would otherwise cause `cache
+    /// prune --apply` to delete the symlink target (outside the store).
+    #[test]
+    #[cfg(unix)]
+    fn iter_link_entries_refuses_symlinked_entry_at_links_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::at(dir.path());
+
+        let sri = synthetic_sri(b"iter_link_entries/legit");
+        write_object(
+            &store,
+            &sri,
+            &[(
+                "package.json",
+                b"{\"name\":\"legit\",\"version\":\"1.0.0\"}",
+            )],
+        );
+        store
+            .populate_link_entry(LinkEntryRequest {
+                graph_key: arc_key("legit", "1.0.0"),
+                source_sri: sri.clone(),
+                object_dir: store.paths().object_dir(&sri).unwrap(),
+                deps: vec![],
+                platform: Arc::new(sample_meta_platform()),
+            })
+            .unwrap();
+
+        let outside = dir.path().join("outside-of-store");
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(
+            outside.join(".lpm-link-meta.json"),
+            br#"{"schema":1,"name":"poisoned","version":"99.0.0","source_sri":"sha512-x","object_path":"objects/sha512-x","graph_key_digest_hex":"deadbeef","deps":[],"platform":{"os":"darwin","cpu":"arm64"},"last_referenced_at":"2024-01-01T00:00:00Z"}"#,
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(&outside, store.paths().links_root().join("poisoned")).unwrap();
+
+        let names: Vec<String> = store
+            .iter_link_entries()
+            .unwrap()
+            .map(|(_dir, meta)| meta.name)
+            .collect();
+        assert_eq!(
+            names,
+            vec!["legit".to_string()],
+            "symlinked link entry must not surface"
+        );
+
+        let verify_entries = store.iter_link_entries_for_verify().unwrap();
+        let symlink_issue = verify_entries
+            .iter()
+            .find(|(p, _)| p.file_name().and_then(|n| n.to_str()) == Some("poisoned"));
+        let (_, result) = symlink_issue.expect("verify must surface the symlinked entry");
+        assert!(
+            matches!(result, Err(LpmError::Store(msg)) if msg.contains("symlink")),
+            "verify must report the symlinked entry as a store-integrity issue, got {result:?}"
+        );
+    }
+
     /// `find_link_package_dir` returns the package dir for a `(name,
     /// version)` that's been populated. Used by `lpm rebuild` to find
     /// transitive packages with lifecycle scripts under v2.
@@ -2212,6 +2464,114 @@ mod tests {
                 .chars()
                 .all(|c| c.is_ascii_hexdigit() && !c.is_uppercase()),
             "hex portion must be lowercase"
+        );
+    }
+
+    /// M28: tmp_sibling now uses a random 64-bit suffix instead of
+    /// the predictable pid+thread::id pair. Two calls in quick
+    /// succession should produce distinct paths with overwhelming
+    /// probability — confirms the suffix is actually random and not
+    /// re-derived from a deterministic source.
+    #[test]
+    fn tmp_sibling_produces_unpredictable_suffix_across_calls() {
+        let base = std::path::PathBuf::from("/tmp/foo-object");
+        let a = tmp_sibling(&base);
+        let b = tmp_sibling(&base);
+        assert_ne!(
+            a, b,
+            "two tmp_sibling calls on the same path must produce different suffixes",
+        );
+        // Sanity: shape is `<base>.tmp.<16-hex>`.
+        let a_name = a.file_name().unwrap().to_string_lossy().into_owned();
+        assert!(
+            a_name.starts_with("foo-object.tmp."),
+            "expected `<name>.tmp.<suffix>` shape, got {a_name}",
+        );
+        let suffix = a_name.trim_start_matches("foo-object.tmp.");
+        assert_eq!(suffix.len(), 16, "suffix should be 16 hex chars: {suffix}");
+        assert!(
+            suffix.chars().all(|c| c.is_ascii_hexdigit()),
+            "suffix should be hex: {suffix}",
+        );
+    }
+
+    /// M28: pre-created tmp staging dirs land at 0o700 on Unix so a
+    /// partial extract cannot be read by other UIDs on a shared host.
+    #[cfg(unix)]
+    #[test]
+    fn create_tmp_dir_locked_sets_0o700() {
+        use std::os::unix::fs::PermissionsExt;
+        let parent = tempfile::tempdir().unwrap();
+        let target = parent.path().join("staging");
+        create_tmp_dir_locked(&target).unwrap();
+        let mode = std::fs::metadata(&target).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o700, "expected 0o700, got 0o{mode:o}");
+    }
+
+    /// `ensure_store_tier_dir_locked` creates the store-tier dir at
+    /// 0o700 on a fresh path. Closes the shared-host disclosure shape
+    /// where `create_dir_all`'s default-umask inheritance leaves
+    /// `objects/` and `links/` at 0o755.
+    #[cfg(unix)]
+    #[test]
+    fn ensure_store_tier_dir_locked_creates_at_0o700() {
+        use std::os::unix::fs::PermissionsExt;
+        let parent = tempfile::tempdir().unwrap();
+        let target = parent.path().join("v2").join("objects");
+        ensure_store_tier_dir_locked(&target).unwrap();
+        let mode = std::fs::metadata(&target).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            mode, 0o700,
+            "store-tier dir must be 0o700 on first create, got 0o{mode:o}"
+        );
+    }
+
+    /// Idempotency: a pre-existing 0o755 dir (e.g., one created by an
+    /// older lpm release that predated this fix) is tightened in
+    /// place on the next install touch.
+    #[cfg(unix)]
+    #[test]
+    fn ensure_store_tier_dir_locked_tightens_existing_world_readable_dir() {
+        use std::os::unix::fs::PermissionsExt;
+        let parent = tempfile::tempdir().unwrap();
+        let target = parent.path().join("v2").join("links");
+        std::fs::create_dir_all(&target).unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o755)).unwrap();
+        ensure_store_tier_dir_locked(&target).unwrap();
+        let mode = std::fs::metadata(&target).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            mode, 0o700,
+            "store-tier dir must be tightened to 0o700 on re-use, got 0o{mode:o}"
+        );
+    }
+
+    /// L8: a stray symlink in a v1 store entry must NOT propagate
+    /// into the v2 object dir via the v1→v2 migration copy. A
+    /// regression or local-attacker plant would otherwise reproduce
+    /// the symlink target (e.g. `/etc/passwd`) into every consuming
+    /// link entry.
+    #[cfg(unix)]
+    #[test]
+    fn copy_dir_recursively_skips_symlinks_from_v1_source() {
+        let parent = tempfile::tempdir().unwrap();
+        let v1 = parent.path().join("v1");
+        let dst = parent.path().join("v2");
+        std::fs::create_dir_all(&v1).unwrap();
+        // Real file alongside the symlink — proves the migration
+        // completes for the surrounding files.
+        std::fs::write(v1.join("package.json"), b"{}").unwrap();
+        // Hostile symlink pointing outside the package dir.
+        std::os::unix::fs::symlink("/etc/passwd", v1.join("escape")).unwrap();
+
+        copy_dir_recursively(&v1, &dst).expect("copy should succeed");
+
+        assert!(
+            dst.join("package.json").is_file(),
+            "regular file must be copied",
+        );
+        assert!(
+            dst.join("escape").symlink_metadata().is_err(),
+            "symlink must be skipped — refusing to migrate v1→v2 symlinks",
         );
     }
 }

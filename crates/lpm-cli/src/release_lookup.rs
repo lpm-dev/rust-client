@@ -39,20 +39,97 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 /// Resolve the npm registry endpoint. Honours
 /// `LPM_NPM_REGISTRY_URL_OVERRIDE` so tests (and users behind a private
 /// npm mirror) can redirect the probe without a binary rebuild.
+///
+/// Override values are gated by [`accept_override`]: HTTPS is always
+/// accepted, plain HTTP only when the host is a loopback address (test
+/// servers, local mirrors). The override is logged at `warn` level
+/// whenever it fires so an operator scanning logs can spot an
+/// attacker-controlled redirect of the self-update version probe.
 fn npm_registry_url() -> String {
-    std::env::var("LPM_NPM_REGISTRY_URL_OVERRIDE")
-        .ok()
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| NPM_REGISTRY_URL_DEFAULT.to_string())
+    resolve_release_url("LPM_NPM_REGISTRY_URL_OVERRIDE", NPM_REGISTRY_URL_DEFAULT)
 }
 
 /// Resolve the GitHub Releases endpoint. Honours
-/// `LPM_GITHUB_RELEASES_URL_OVERRIDE` for tests.
+/// `LPM_GITHUB_RELEASES_URL_OVERRIDE` for tests. Same gating + logging
+/// contract as [`npm_registry_url`].
 fn github_releases_url() -> String {
-    std::env::var("LPM_GITHUB_RELEASES_URL_OVERRIDE")
-        .ok()
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| GITHUB_RELEASES_URL_DEFAULT.to_string())
+    resolve_release_url(
+        "LPM_GITHUB_RELEASES_URL_OVERRIDE",
+        GITHUB_RELEASES_URL_DEFAULT,
+    )
+}
+
+/// Shared override-resolution path. Reads `env_var`, validates the
+/// scheme/host combination, and falls back to `default_url` on absent
+/// or rejected values.
+///
+/// The H9 finding: env vars `LPM_NPM_REGISTRY_URL_OVERRIDE` and
+/// `LPM_GITHUB_RELEASES_URL_OVERRIDE` are honoured unconditionally,
+/// so any actor who can write env vars (compromised CI runner,
+/// dotfile pollution, malicious wrapper script) can steer the self-
+/// update version probe to an attacker host. Combined with the lack
+/// of binary signature verification on the standalone update channel
+/// (C2), this becomes one half of an RCE chain.
+///
+/// We can't outright remove the override (tests + legitimate private-
+/// mirror users depend on it) but we can shrink its abuse window:
+/// require HTTPS for any non-loopback host (so a plain `http://evil.com`
+/// is rejected), and log a `warn` whenever the override fires so the
+/// operator has audit visibility.
+fn resolve_release_url(env_var: &str, default_url: &str) -> String {
+    let raw = match std::env::var(env_var).ok().filter(|s| !s.is_empty()) {
+        Some(v) => v,
+        None => return default_url.to_string(),
+    };
+    if accept_override(&raw) {
+        tracing::warn!(
+            env_var = env_var,
+            override_url = %raw,
+            "release-lookup endpoint override honoured — confirm this is expected",
+        );
+        return raw;
+    }
+    tracing::warn!(
+        env_var = env_var,
+        override_url = %raw,
+        "rejecting release-lookup endpoint override: plain HTTP non-loopback URL; \
+         falling back to default — set the override to an https:// URL to use a private mirror",
+    );
+    default_url.to_string()
+}
+
+/// Accept an override URL if it's HTTPS (any host) or HTTP pointed at
+/// a loopback address (tests + local dev mirrors). Anything else
+/// (HTTP non-loopback, unsupported scheme, malformed URL) is refused.
+fn accept_override(url: &str) -> bool {
+    let parsed = match reqwest::Url::parse(url) {
+        Ok(u) => u,
+        Err(_) => return false,
+    };
+    match parsed.scheme() {
+        "https" => true,
+        "http" => parsed.host_str().map(is_loopback_host).unwrap_or(false),
+        _ => false,
+    }
+}
+
+/// Loopback host detection covering the cases we actually see in tests
+/// and on dev machines: `localhost`, the IPv4 loopback block
+/// `127.0.0.0/8`, and the IPv6 loopback `::1`.
+fn is_loopback_host(host: &str) -> bool {
+    if host.eq_ignore_ascii_case("localhost") {
+        return true;
+    }
+    if let Ok(addr) = host.parse::<std::net::IpAddr>() {
+        return addr.is_loopback();
+    }
+    // `[::1]` shape — strip brackets and retry.
+    if let Some(inner) = host.strip_prefix('[').and_then(|s| s.strip_suffix(']'))
+        && let Ok(addr) = inner.parse::<std::net::IpAddr>()
+    {
+        return addr.is_loopback();
+    }
+    false
 }
 
 /// Cache file shape. All fields beyond `latest` / `last_check` are
@@ -1328,5 +1405,85 @@ mod tests {
         .to_string();
         assert!(s.contains("500"));
         assert!(!s.contains(": "), "no trailing colon when body empty: {s}");
+    }
+
+    // ── Override gating (H9) ──────────────────────────────
+
+    /// HTTPS override on any host is accepted — covers legitimate
+    /// private-mirror configurations like
+    /// `https://npm.internal.example.com/@lpm-registry/cli/latest`.
+    #[test]
+    fn accept_override_allows_https_any_host() {
+        assert!(accept_override("https://npm.internal.example.com/x"));
+        assert!(accept_override(
+            "https://registry.npmjs.org/@lpm-registry/cli/latest"
+        ));
+    }
+
+    /// Plain-HTTP override on a non-loopback host is the H9 attack
+    /// shape — a compromised env var redirects the version probe to
+    /// an attacker-controlled server, which combined with the lack
+    /// of binary signature verification on the standalone update
+    /// channel (C2) becomes an RCE chain. Reject.
+    #[test]
+    fn accept_override_rejects_http_non_loopback() {
+        assert!(!accept_override("http://attacker.example/x"));
+        assert!(!accept_override("http://npm.internal.example.com/y"));
+    }
+
+    /// HTTP loopback URLs are accepted — wiremock binds to
+    /// `127.0.0.1:PORT` and the rest of this module's tests depend
+    /// on the carve-out. `localhost`, `127.0.0.1`, and IPv6 `[::1]`
+    /// all qualify.
+    #[test]
+    fn accept_override_allows_http_loopback() {
+        assert!(accept_override("http://127.0.0.1:9999/foo"));
+        assert!(accept_override("http://localhost:8080/x"));
+        assert!(accept_override("http://[::1]:8080/x"));
+        // Any address in the 127.0.0.0/8 block.
+        assert!(accept_override("http://127.255.255.254/y"));
+    }
+
+    #[test]
+    fn accept_override_rejects_unsupported_schemes_and_malformed() {
+        assert!(!accept_override("ftp://localhost/x"));
+        assert!(!accept_override("file:///tmp/foo"));
+        assert!(!accept_override("not a url"));
+        assert!(!accept_override(""));
+    }
+
+    /// End-to-end through `resolve_release_url`: a rejected override
+    /// falls back to the default URL (and emits a `warn` log; we
+    /// don't capture tracing in this unit test but the assertion
+    /// proves the fallback path is taken).
+    #[test]
+    fn resolve_release_url_falls_back_to_default_on_rejected_override() {
+        let _restore = acquire_env_override_lock();
+        // SAFETY: lock held for the lifetime of `_restore`.
+        unsafe {
+            std::env::set_var(NPM_OVERRIDE_KEY, "http://attacker.example/x");
+        }
+        assert_eq!(
+            resolve_release_url(NPM_OVERRIDE_KEY, NPM_REGISTRY_URL_DEFAULT),
+            NPM_REGISTRY_URL_DEFAULT,
+            "non-loopback HTTP override must NOT steer the lookup",
+        );
+        unsafe { std::env::remove_var(NPM_OVERRIDE_KEY) };
+    }
+
+    /// And the positive path: an accepted override IS used.
+    #[test]
+    fn resolve_release_url_honors_accepted_override() {
+        let _restore = acquire_env_override_lock();
+        // SAFETY: lock held for the lifetime of `_restore`.
+        unsafe {
+            std::env::set_var(NPM_OVERRIDE_KEY, "https://npm.internal.example.com/x");
+        }
+        assert_eq!(
+            resolve_release_url(NPM_OVERRIDE_KEY, NPM_REGISTRY_URL_DEFAULT),
+            "https://npm.internal.example.com/x",
+            "HTTPS override must steer the lookup",
+        );
+        unsafe { std::env::remove_var(NPM_OVERRIDE_KEY) };
     }
 }

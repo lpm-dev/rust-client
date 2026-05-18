@@ -65,7 +65,9 @@ use lpm_store::v2::{
     DepLink, GraphKey, LinkEntryRequest, LinkMetaPlatform, LinkerModeTag, PlatformTuple, Store,
 };
 
-use crate::{LinkResult, LinkTarget, LinkerMode, MaterializedPackage};
+use crate::{
+    LinkResult, LinkTarget, LinkerMode, MaterializedPackage, validate_bin_name, validate_bin_target,
+};
 
 /// One LinkTarget plus the source SRI needed to resolve its v2 object
 /// directory. The install pipeline carries the SRI via
@@ -850,17 +852,37 @@ fn create_root_symlinks(
             // slot, remove before re-creating. Should be a no-op after
             // `cleanup_v1_state` already wiped node_modules — defensive
             // guard for direct callers.
-            if link_path.symlink_metadata().is_ok() {
-                let _ = std::fs::remove_file(&link_path);
-                let _ = std::fs::remove_dir_all(&link_path);
+            //
+            // L24: between the cleanup remove and the create, a
+            // concurrent install racing on the same project can
+            // re-populate the slot, causing create to fail with
+            // `AlreadyExists`. Tolerate one retry after a second
+            // cleanup pass; if it still fails, escalate. Two
+            // concurrent installs on the same project is rare but
+            // possible (e.g., editor "watch" mode + CLI run); the
+            // retry keeps neither caller from being arbitrarily
+            // unlucky.
+            for attempt in 0..2u8 {
+                if link_path.symlink_metadata().is_ok() {
+                    let _ = std::fs::remove_file(&link_path);
+                    let _ = std::fs::remove_dir_all(&link_path);
+                }
+                match create_dir_symlink_or_junction(&target_path, &link_path) {
+                    Ok(()) => break,
+                    Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists && attempt == 0 => {
+                        // A racing installer re-populated the slot
+                        // between our remove and create. Loop once.
+                        continue;
+                    }
+                    Err(e) => {
+                        return Err(LpmError::Store(format!(
+                            "v2 linker: failed to create root symlink {} → {}: {e}",
+                            link_path.display(),
+                            target_path.display()
+                        )));
+                    }
+                }
             }
-            create_dir_symlink_or_junction(&target_path, &link_path).map_err(|e| {
-                LpmError::Store(format!(
-                    "v2 linker: failed to create root symlink {} → {}: {e}",
-                    link_path.display(),
-                    target_path.display()
-                ))
-            })?;
             count += 1;
         }
     }
@@ -874,14 +896,69 @@ fn create_root_symlinks(
 /// - `Some([…])` — explicit list of root names.
 /// - `None` + direct dep — single root symlink at `[name]`.
 /// - `None` + transitive — empty.
+///
+/// Filters out any name that contains a path separator or `..`
+/// component — a resolver bug (or, worst case, attacker-influenced
+/// `root_link_names` data on a future code path) could otherwise
+/// land symlink slots outside `<project>/node_modules/`. The root-
+/// symlink writer at the call site does `remove_dir_all` on the
+/// computed `link_path` before creating the symlink, so a traversal
+/// here would `remove_dir_all` an arbitrary path. Refuse-and-warn is
+/// the same posture used by the v1 bin emitter and v2's bin loop
+/// (see [`crate::validate_bin_name`]).
 fn root_link_names(target: &LinkTarget) -> Vec<String> {
-    if let Some(names) = &target.root_link_names {
+    let raw: Vec<String> = if let Some(names) = &target.root_link_names {
         names.clone()
     } else if target.is_direct {
         vec![target.name.clone()]
     } else {
         Vec::new()
+    };
+    raw.into_iter()
+        .filter(|name| {
+            if is_safe_root_link_name(name) {
+                true
+            } else {
+                tracing::warn!(
+                    "v2 linker: rejecting unsafe root_link_name {name:?} for {}@{} \
+                     — contains path separator, traversal, or null byte",
+                    target.name,
+                    target.version
+                );
+                false
+            }
+        })
+        .collect()
+}
+
+/// Reject root-symlink names whose components could escape the
+/// project's `node_modules/` directory: empty, `..`, anything with a
+/// `/`/`\\` separator or null byte. Scoped names like `@scope/pkg`
+/// are intentionally accepted — the writer handles their
+/// `@scope/` parent dir creation explicitly.
+fn is_safe_root_link_name(name: &str) -> bool {
+    if name.is_empty() || name.contains('\0') {
+        return false;
     }
+    // Scoped names are exactly `@<scope>/<pkg>`; only `/`-counts >1
+    // or backslashes (any) signal escape.
+    if name.contains('\\') {
+        return false;
+    }
+    let slash_count = name.matches('/').count();
+    if slash_count > 1 {
+        return false;
+    }
+    if slash_count == 1 && !name.starts_with('@') {
+        return false;
+    }
+    // Reject path components that are exactly `..` (anywhere in the name).
+    for component in name.split('/') {
+        if component == ".." || component == "." || component.is_empty() {
+            return false;
+        }
+    }
+    true
 }
 
 /// `.bin/` shim creation for the v2 layout. Walks each direct dep's
@@ -964,21 +1041,43 @@ fn create_bin_links_v2(
         })?;
 
         for (cmd_name, bin_rel_path) in entries {
-            // Strip the conventional `bin/` slash prefix on a sub-path
-            // to keep the shim target as the actual file inside the
-            // package dir. The v1 helper does the same.
-            bin_target.clear();
-            bin_target.push(&pkg_dir);
-            bin_target.push(&bin_rel_path);
-            if !bin_target.exists() {
-                tracing::debug!(
-                    "v2 linker: bin script {} for {}/{} missing — skipping shim",
-                    bin_target.display(),
-                    v2t.target.name,
-                    cmd_name
+            // Reject bin entries whose key would write outside `.bin/`
+            // or shadow path components — same bar as v1's hoisted
+            // emitter (lib.rs). Warn-and-skip rather than fail-install
+            // so one malformed entry doesn't abort the whole link.
+            if let Err(reason) = validate_bin_name(&cmd_name, &v2t.target.name) {
+                tracing::warn!(
+                    "v2 linker: rejecting bin \"{cmd_name}\" from {}: {reason}",
+                    v2t.target.name
                 );
                 continue;
             }
+
+            // Use validate_bin_target as a *guard only* — the canonical
+            // return value is discarded. Downstream `pathdiff::diff_paths`
+            // expects bin_target and bin_dir in the same canonical
+            // (or same non-canonical) form, and v2's bin_dir is built
+            // from the raw project_dir. Mixing forms (canonical target,
+            // raw bin_dir) produces malformed symlinks on macOS, where
+            // `/var/folders/...` and `/private/var/folders/...` share no
+            // prefix until both are canonicalised.
+            //
+            // The guard call still enforces:
+            // - rejection of `..` components in script_path
+            // - rejection of bin_rel_path whose canonical resolve
+            //   escapes the package dir (e.g. via an in-package symlink
+            //   pointing outside)
+            // - rejection of missing files (canonicalize fails)
+            if let Err(reason) = validate_bin_target(&pkg_dir, &bin_rel_path) {
+                tracing::warn!(
+                    "v2 linker: rejecting bin {cmd_name} from {}: {reason}",
+                    v2t.target.name
+                );
+                continue;
+            }
+            bin_target.clear();
+            bin_target.push(&pkg_dir);
+            bin_target.push(&bin_rel_path);
             // Make the bin file executable (npm tarballs sometimes
             // ship without the +x bit). Same fix as v1.
             #[cfg(unix)]
@@ -1789,5 +1888,218 @@ mod tests {
             );
             assert!(link.join("package.json").is_file());
         }
+    }
+
+    /// A package whose `bin` map keys a shim with a path-traversal
+    /// name must be skipped. v1's hoisted emitter has enforced this
+    /// since the validators were introduced; v2 (the default store
+    /// version) was the gap a malicious package could exploit to
+    /// shadow `/usr/bin` entries via `node_modules/.bin/`.
+    #[test]
+    fn v2_skips_bin_shim_when_bin_name_contains_path_traversal() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = V2Store::at(tmp.path().join("store"));
+        let project = tmp.path().join("project");
+        std::fs::create_dir_all(&project).unwrap();
+
+        let sri = synthetic_sri(b"v2/bin_name_traversal");
+        write_object(
+            &store,
+            &sri,
+            &[
+                (
+                    "package.json",
+                    br#"{"name":"a","version":"1.0.0","bin":{"../escape":"index.js"}}"#,
+                ),
+                ("index.js", b"console.log('a');"),
+            ],
+        );
+
+        let result = link_packages_v2(
+            &project,
+            vec![target("a", "1.0.0", &sri, true)],
+            &store,
+            LinkerMode::Isolated,
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(
+            result.bin_linked, 0,
+            "bin name with `..` must be rejected by validate_bin_name",
+        );
+        let bin_dir = project.join("node_modules").join(".bin");
+        if bin_dir.exists() {
+            assert!(
+                std::fs::read_dir(&bin_dir).unwrap().next().is_none(),
+                ".bin/ must stay empty when the only entry was rejected",
+            );
+        }
+    }
+
+    /// A package whose `bin` value points outside its own dir (the
+    /// classic `"bin": {"x": "../../bin/sh"}` shape) must be skipped.
+    /// `validate_bin_target` catches the `..` component in the joined
+    /// path before any symlink is created.
+    #[test]
+    fn v2_skips_bin_shim_when_bin_target_escapes_package_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = V2Store::at(tmp.path().join("store"));
+        let project = tmp.path().join("project");
+        std::fs::create_dir_all(&project).unwrap();
+
+        let sri = synthetic_sri(b"v2/bin_target_traversal");
+        write_object(
+            &store,
+            &sri,
+            &[(
+                "package.json",
+                br#"{"name":"a","version":"1.0.0","bin":{"x":"../../../bin/sh"}}"#,
+            )],
+        );
+
+        let result = link_packages_v2(
+            &project,
+            vec![target("a", "1.0.0", &sri, true)],
+            &store,
+            LinkerMode::Isolated,
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(
+            result.bin_linked, 0,
+            "bin target with `..` components must be rejected by validate_bin_target",
+        );
+        let shim = project.join("node_modules").join(".bin").join("x");
+        assert!(
+            shim.symlink_metadata().is_err(),
+            "no shim should be created for an escaping bin target",
+        );
+    }
+
+    /// Benign shape still works — proves the new validators don't
+    /// over-reject. A well-formed bin entry pointing at an in-package
+    /// file produces a `.bin/` symlink.
+    #[test]
+    fn v2_creates_bin_shim_for_well_formed_entry() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = V2Store::at(tmp.path().join("store"));
+        let project = tmp.path().join("project");
+        std::fs::create_dir_all(&project).unwrap();
+
+        let sri = synthetic_sri(b"v2/bin_ok");
+        write_object(
+            &store,
+            &sri,
+            &[
+                (
+                    "package.json",
+                    br#"{"name":"a","version":"1.0.0","bin":{"a":"cli.js"}}"#,
+                ),
+                ("cli.js", b"#!/usr/bin/env node\nconsole.log('hi');\n"),
+            ],
+        );
+
+        let result = link_packages_v2(
+            &project,
+            vec![target("a", "1.0.0", &sri, true)],
+            &store,
+            LinkerMode::Isolated,
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(result.bin_linked, 1, "well-formed bin entry must be linked");
+        #[cfg(unix)]
+        {
+            let shim = project.join("node_modules").join(".bin").join("a");
+            assert!(
+                shim.symlink_metadata().unwrap().file_type().is_symlink(),
+                "shim must be a symlink",
+            );
+        }
+    }
+
+    /// M16: the root-symlink writer does `remove_dir_all(&link_path)`
+    /// before creating the symlink, where `link_path` is
+    /// `<project>/node_modules/<root_link_name>`. A `..` in the
+    /// name would escape `node_modules/` and delete arbitrary
+    /// content. `root_link_names` now filters such names with a
+    /// warn-and-continue posture.
+    #[test]
+    fn root_link_names_rejects_path_traversal_components() {
+        let bad = [
+            "..",
+            "../escape",
+            "scope/../escape",
+            "deep/../../escape",
+            "with\\backslash",
+            "with\0null",
+            "",
+        ];
+        for name in bad {
+            assert!(
+                !is_safe_root_link_name(name),
+                "name {name:?} must be rejected as unsafe",
+            );
+        }
+    }
+
+    /// Positive baseline: legitimate names (plain + scoped) are
+    /// accepted so the filter doesn't over-reject.
+    #[test]
+    fn root_link_names_accepts_plain_and_scoped_names() {
+        for name in ["react", "lodash", "@scope/foo", "@a/b", "a-package_name"] {
+            assert!(
+                is_safe_root_link_name(name),
+                "name {name:?} must be accepted",
+            );
+        }
+    }
+
+    /// End-to-end through link_packages_v2: a target whose
+    /// `root_link_names` contains `..` MUST NOT create a symlink
+    /// outside `<project>/node_modules/`. Pre-fix this would have
+    /// landed a `remove_dir_all` against the escaped path.
+    #[test]
+    fn link_packages_v2_skips_root_symlink_when_name_contains_traversal() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = V2Store::at(tmp.path().join("store"));
+        let project = tmp.path().join("project");
+        std::fs::create_dir_all(&project).unwrap();
+
+        let sri = synthetic_sri(b"v2/root_link_traversal");
+        write_object(
+            &store,
+            &sri,
+            &[("package.json", b"{\"name\":\"safe\",\"version\":\"1.0.0\"}")],
+        );
+
+        let mut t = target("safe", "1.0.0", &sri, true);
+        t.target.root_link_names = Some(vec!["../escape".into(), "safe".into()]);
+
+        let result =
+            link_packages_v2(&project, vec![t], &store, LinkerMode::Isolated, None).unwrap();
+
+        // Only the safe `safe` symlink should land — the `../escape`
+        // entry filtered out by root_link_names.
+        assert_eq!(
+            result.symlinked, 1,
+            "exactly one (safe) root symlink should land",
+        );
+        assert!(
+            project
+                .join("node_modules")
+                .join("safe")
+                .symlink_metadata()
+                .is_ok(),
+            "safe root symlink must exist",
+        );
+        // The escape path must not have been touched.
+        assert!(
+            !project.join("escape").exists(),
+            "no `escape` entry should be created outside node_modules",
+        );
     }
 }

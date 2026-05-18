@@ -1670,6 +1670,7 @@ pub fn discover_workspace(start_dir: &Path) -> Result<Option<Workspace>, Workspa
 
             if let Some(globs) = globs {
                 let members = discover_members(&current, &globs)?;
+                warn_on_member_catalogs(&members);
                 let workspace = Workspace {
                     root: current.clone(),
                     root_package,
@@ -1808,11 +1809,83 @@ fn read_pnpm_workspace(path: &Path) -> Result<Option<Vec<String>>, WorkspaceErro
     }
 }
 
+/// H23: validate that a workspace glob pattern is a relative path
+/// without `..` components and without absolute-path syntax.
+///
+/// `Path::join("/abs")` discards the prefix, so `"workspaces":
+/// ["/etc/*"]` literally walks `/etc/`; `"workspaces": ["../*"]`
+/// mounts sibling repositories as workspace members. Matched
+/// `package.json` files are read and folded into the install-hash;
+/// sibling-project deps would otherwise materialize into the
+/// current project's `node_modules`. The pattern boundary is the
+/// only place to refuse this — the glob library happily walks
+/// anywhere the OS lets it.
+fn validate_workspace_glob(pattern: &str) -> Result<(), WorkspaceError> {
+    if pattern.is_empty() {
+        return Err(WorkspaceError::Parse("empty workspace glob pattern".into()));
+    }
+    let p = Path::new(pattern);
+    if p.is_absolute() {
+        return Err(WorkspaceError::Parse(format!(
+            "workspace glob '{pattern}' is absolute — must be relative to the project root"
+        )));
+    }
+    // On Windows, `C:foo` is rooted (drive-relative) without being
+    // absolute. Block that shape too by rejecting any prefix component.
+    #[cfg(windows)]
+    if p.components()
+        .any(|c| matches!(c, std::path::Component::Prefix(_)))
+    {
+        return Err(WorkspaceError::Parse(format!(
+            "workspace glob '{pattern}' contains a drive prefix — must be relative to the project root"
+        )));
+    }
+    for comp in p.components() {
+        if matches!(comp, std::path::Component::ParentDir) {
+            return Err(WorkspaceError::Parse(format!(
+                "workspace glob '{pattern}' contains '..' — must stay within the project root"
+            )));
+        }
+        if matches!(comp, std::path::Component::RootDir) {
+            return Err(WorkspaceError::Parse(format!(
+                "workspace glob '{pattern}' starts at root — must be relative to the project root"
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// M13: emit a `tracing::warn` for every workspace member whose
+/// `package.json` declares its own `catalogs` field. The install
+/// pipeline only honours `root_package.catalogs`; member-level
+/// catalogs are silently ignored today. The data shape allows them
+/// because `PackageJson::catalogs` is a single field shared by both
+/// root and members, so a future routing-bug or refactor could start
+/// resolving per-member with no surface signal that the source was
+/// authored as if it were active. The warn surfaces the silent-drop
+/// at discovery time so a malicious / mistaken member-level catalog
+/// is visible in operator logs before any resolve runs.
+fn warn_on_member_catalogs(members: &[WorkspaceMember]) {
+    for member in members {
+        if !member.package.catalogs.is_empty() {
+            tracing::warn!(
+                member_path = %member.path.display(),
+                catalog_count = member.package.catalogs.len(),
+                "workspace member declares its own `catalogs` field — silently ignored by the resolver. Only the root package's `catalogs` are honoured (M13). Move the entries to the root package.json or remove the field to silence this warning.",
+            );
+        }
+    }
+}
+
 /// Discover workspace member packages matching the given glob patterns.
 fn discover_members(root: &Path, globs: &[String]) -> Result<Vec<WorkspaceMember>, WorkspaceError> {
     let mut members = Vec::new();
+    let canonical_root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
 
     for pattern in globs {
+        // H23: refuse path-escape shapes at the manifest boundary.
+        validate_workspace_glob(pattern)?;
+
         // Resolve glob pattern relative to workspace root
         let full_pattern = root.join(pattern).join("package.json");
         let pattern_str = full_pattern.to_string_lossy().to_string();
@@ -1823,6 +1896,25 @@ fn discover_members(root: &Path, globs: &[String]) -> Result<Vec<WorkspaceMember
         for entry in paths {
             let pkg_json_path =
                 entry.map_err(|e| WorkspaceError::Io(format!("glob error: {e}")))?;
+
+            // H23 defence-in-depth: even with the pattern validated
+            // above, refuse any match whose canonical resolution
+            // doesn't sit under the canonical project root. Catches
+            // a glob match that traverses an existing symlink out
+            // of the tree.
+            let canonical_match = pkg_json_path
+                .canonicalize()
+                .unwrap_or_else(|_| pkg_json_path.clone());
+            if !canonical_match.starts_with(&canonical_root) {
+                tracing::warn!(
+                    pattern = %pattern,
+                    matched = %pkg_json_path.display(),
+                    canonical = %canonical_match.display(),
+                    canonical_root = %canonical_root.display(),
+                    "skipping workspace member outside project root (H23)"
+                );
+                continue;
+            }
 
             let member_dir = pkg_json_path.parent().unwrap().to_path_buf();
             let package = read_package_json(&pkg_json_path)?;
@@ -3051,6 +3143,119 @@ mod tests {
         assert_eq!(all.get("shared").unwrap(), "^2.0.0");
         // Member-only dep is included
         assert!(all.contains_key("only-a"));
+    }
+
+    // ── H23: workspace glob escape ────────────────────────────────
+
+    /// H23: a `..` segment in a workspace glob is the sibling-project
+    /// injection shape — refuse at the manifest boundary so the glob
+    /// library never gets to walk parent directories.
+    #[test]
+    fn discover_workspace_refuses_glob_with_parent_dir_segment() {
+        let err = validate_workspace_glob("../sibling/*").unwrap_err();
+        assert!(
+            format!("{:?}", err).contains("'..'"),
+            "error must mention the '..' rejection: {err:?}"
+        );
+    }
+
+    /// H23: `PathBuf::join("/abs")` discards the project-root prefix
+    /// and walks `/abs` instead. Absolute globs must be refused.
+    #[test]
+    fn discover_workspace_refuses_absolute_glob() {
+        // Unix absolute path. Windows test below covers the
+        // drive-prefix variant.
+        let err = validate_workspace_glob("/etc/*").unwrap_err();
+        assert!(format!("{:?}", err).contains("absolute"));
+    }
+
+    /// H23: legitimate relative globs still parse.
+    #[test]
+    fn discover_workspace_accepts_relative_globs() {
+        validate_workspace_glob("packages/*").unwrap();
+        validate_workspace_glob("apps/*/web").unwrap();
+        validate_workspace_glob("./crates/*").unwrap();
+        validate_workspace_glob("internal").unwrap();
+    }
+
+    /// H23: nested `..` deeper in the pattern is also refused. The
+    /// `Path::components()` scan walks every segment.
+    #[test]
+    fn discover_workspace_refuses_nested_parent_dir_segment() {
+        let err = validate_workspace_glob("packages/../../etc/*").unwrap_err();
+        assert!(format!("{:?}", err).contains("'..'"));
+    }
+
+    /// H23: empty pattern would degenerate to scanning the project
+    /// root + every subdirectory — refuse so the operator gets a
+    /// clear error rather than a surprising O(n) cost.
+    #[test]
+    fn discover_workspace_refuses_empty_glob() {
+        let err = validate_workspace_glob("").unwrap_err();
+        assert!(format!("{:?}", err).contains("empty"));
+    }
+
+    /// H23: end-to-end — a `package.json` declaring
+    /// `"workspaces": ["../*"]` must fail at `discover_workspace`,
+    /// not silently mount sibling-project deps. Real attack shape.
+    #[test]
+    fn discover_workspace_refuses_workspace_with_parent_glob() {
+        let dir = tempfile::tempdir().unwrap();
+        create_package_json(
+            dir.path(),
+            r#"{
+                "name": "victim",
+                "workspaces": ["../*"]
+            }"#,
+        );
+        let err = discover_workspace(dir.path()).unwrap_err();
+        let msg = format!("{:?}", err);
+        assert!(
+            msg.contains("'..'") || msg.contains("absolute"),
+            "discover_workspace must refuse parent-dir glob: {msg}"
+        );
+    }
+
+    /// M13: a workspace member that declares its own `catalogs` field
+    /// in its package.json must not crash discovery — but the resolver
+    /// only honours root-level catalogs, so the silent-drop posture is
+    /// surfaced via a `tracing::warn` from `warn_on_member_catalogs`
+    /// at discovery time. The structural assertion here is that
+    /// discovery still succeeds (the warn path doesn't panic and the
+    /// member is still loaded). The visibility leg of the fix is the
+    /// warn itself, which is exercised in operator logs.
+    #[test]
+    fn discover_workspace_admits_member_with_unused_catalogs_field() {
+        let dir = tempfile::tempdir().unwrap();
+        create_package_json(
+            dir.path(),
+            r#"{
+                "name": "root-with-member-catalog",
+                "workspaces": ["packages/*"]
+            }"#,
+        );
+        let member_dir = dir.path().join("packages/widget");
+        std::fs::create_dir_all(&member_dir).unwrap();
+        create_package_json(
+            &member_dir,
+            r#"{
+                "name": "widget",
+                "version": "1.0.0",
+                "catalogs": {
+                    "default": { "react": "^18.0.0" }
+                }
+            }"#,
+        );
+        let ws = discover_workspace(dir.path())
+            .expect("discovery must not fail when a member has catalogs")
+            .expect("workspace must still be discovered");
+        assert_eq!(ws.members.len(), 1);
+        assert_eq!(ws.members[0].package.name.as_deref(), Some("widget"));
+        assert_eq!(
+            ws.members[0].package.catalogs.len(),
+            1,
+            "the member's catalogs field is still loaded into the struct (the warn surfaces the ignored-by-resolver posture, it does not strip the data)"
+        );
     }
 }
 

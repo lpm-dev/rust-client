@@ -199,6 +199,14 @@ impl RouteTable {
         &self.npmrc.warnings
     }
 
+    /// Security-grade `.npmrc` warnings that MUST be surfaced even in
+    /// `--json` mode. Today carries M7's refusal of project-local
+    /// `strict-ssl=false`. Callers emit these unconditionally so a
+    /// hostile config doesn't slip past CI / agent runs.
+    pub fn npmrc_security_warnings(&self) -> &[String] {
+        &self.npmrc.security_warnings
+    }
+
     /// TLS overrides parsed from `.npmrc` (`cafile=` / `ca=` extra roots
     /// and `strict-ssl=false`). Callers thread this into
     /// [`RegistryClient::with_tls_overrides`](crate::client::RegistryClient::with_tls_overrides)

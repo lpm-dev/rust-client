@@ -46,11 +46,35 @@ pub(crate) const SYSTEM_READ_PATHS: &[&str] = &[
     // Locale, resolver, `ld.so.conf`, `ld.so.cache`, timezone,
     // ca-certificates — the "system configuration" reads libc and
     // network scripts expect.
+    //
+    // Accepted-posture (M56): the `/etc` grant exposes
+    // world-readable host configuration that a malicious lifecycle
+    // script can copy into allowed outputs / logs / tar caches —
+    // `/etc/machine-id`, `/etc/resolv.conf`, `/etc/hosts`, proxy /
+    // VPN / MDM markers under `/etc/sysctl.d/*`, and (when
+    // permissions allow) parts of Docker / Kubernetes / corporate
+    // tooling. Narrowing this would break the resolver + dynamic
+    // linker on every Linux distribution; the trade-off is that
+    // network containment + project-output containment must remain
+    // the primary defence against exfiltration of these reads.
     "/etc",
     // `/proc/self/*`, `/proc/cpuinfo`, `/proc/sys/kernel/*`: needed
     // by node's process module, by `uname -r`, and by tools that
     // probe their own PID. Landlock does NOT restrict procfs
     // beyond pathname enforcement, which is what we want.
+    //
+    // Accepted-posture (M54): the `/proc` grant exposes same-uid
+    // process introspection — a lifecycle script can read
+    // `/proc/<pid>/cmdline` and `/proc/<pid>/environ` for any peer
+    // process owned by the install operator. That includes a
+    // sibling `lpm-rs` invocation that holds vault unlock state /
+    // session bearer in memory at the read time. Narrowing to
+    // `/proc/self/*` would break legitimate tools (node's
+    // `process.platform`, `os-release` probes, `uname` shims) that
+    // pull from `/proc/cpuinfo`, `/proc/version`, and per-pid
+    // entries during install. Future mitigation handle: a `hidepid=2`
+    // mount or a per-task pid namespace that hides peer processes,
+    // tracked outside this audit batch's scope.
     "/proc",
     // `/dev/null`, `/dev/urandom`, `/dev/tty`, `/dev/fd/*`,
     // `/dev/std{in,out,err}`. Narrower than the Seatbelt profile
@@ -99,6 +123,27 @@ pub(crate) fn describe_rules(spec: &SandboxSpec) -> Vec<(PathBuf, RuleAccess)> {
     rules.push((nvm, RuleAccess::Read));
 
     // Read+write — the narrow write list.
+    //
+    // Accepted-posture notes (L30, M64):
+    //
+    // - **`package_dir`** is RW because postinstall scripts that
+    //   build native artifacts (esbuild, sharp, sqlite-prebuilt)
+    //   legitimately write into their own package directory. The
+    //   side-effect is that an approved script can rewrite its own
+    //   `package.json` between installs to launder the next
+    //   `script_hash` — but the trusted-bindings layer detects that
+    //   as `BindingDrift` and re-prompts. Documented at L30 in
+    //   `private/security-findings.md`.
+    //
+    // - **`~/.cache`, `~/.node-gyp`, `~/.npm`** are RW because
+    //   npm-driven tooling chains (node-gyp prebuilt-headers,
+    //   puppeteer/playwright Chromium downloads, npm-shaped install
+    //   caches) depend on them. The side-effect is that an
+    //   approved script can poison user-wide cache state for
+    //   future installs of the same package via other tools. Per
+    //   M64 this is documented and accepted; tightening would
+    //   require either a per-tool allowlist or migrating those
+    //   tools to LPM-controlled cache directories.
     rules.push((spec.package_dir.clone(), RuleAccess::ReadWrite));
     rules.push((spec.project_dir.join("node_modules"), RuleAccess::ReadWrite));
     rules.push((spec.project_dir.join(".husky"), RuleAccess::ReadWrite));
@@ -139,6 +184,7 @@ mod tests {
             store_root: PathBuf::from("/lpm-store"),
             home_dir: PathBuf::from("/home/u"),
             tmpdir: PathBuf::from("/tmp"),
+            secret_read_allow: Vec::new(),
             extra_write_dirs: Vec::new(),
         }
     }

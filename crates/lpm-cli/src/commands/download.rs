@@ -10,6 +10,7 @@ pub async fn run(
     package: &str,
     version: Option<&str>,
     output_dir: Option<&str>,
+    allow_unverified: bool,
     json_output: bool,
 ) -> Result<(), LpmError> {
     let name = PackageName::parse(package)?;
@@ -70,7 +71,21 @@ pub async fn run(
         ));
     }
 
-    // Step 3: Verify integrity
+    // Step 3: Verify integrity. Refuse-by-default for the audit-use
+    // posture: `lpm download` is documented as the tool for
+    // inspecting a package's contents, and silently accepting bytes
+    // for which the registry shipped no SRI defeats that purpose.
+    // `--allow-unverified` explicitly waives the gate for legacy
+    // sources (mirrors, GitHub release assets) that genuinely lack
+    // integrity.
+    if integrity_str.is_none() && !allow_unverified {
+        return Err(LpmError::Registry(format!(
+            "{name}@{version_key}: registry returned no integrity hash; \
+             refusing to extract an unverified tarball. Re-run with \
+             --allow-unverified if you accept the risk (audit use \
+             should not normally take that path).",
+        )));
+    }
     let integrity_verified = if let Some(sri) = integrity_str {
         let spinner = if !json_output {
             let s = cliclack::spinner();

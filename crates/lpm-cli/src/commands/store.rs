@@ -1,6 +1,8 @@
 use crate::output;
 use lpm_common::color::Painted;
-use lpm_common::{LpmError, LpmRoot, format_bytes, with_exclusive_lock, with_shared_lock};
+use lpm_common::{
+    LpmError, LpmRoot, format_bytes, sanitize_for_terminal, with_exclusive_lock, with_shared_lock,
+};
 use lpm_store::PackageStore;
 
 /// Manage the global content-addressable package store.
@@ -159,19 +161,34 @@ struct StoreVerifyEntry {
     inline_integrity: Option<String>,
 }
 
-/// Verify integrity of all packages in the store.
+/// Verify presence and lockfile-marker consistency of every store
+/// entry.
 ///
-/// Basic mode: checks that each package directory has a `package.json` and is non-empty.
-/// Deep mode (`--deep`): additionally parses `package.json` to validate name/version consistency
-/// and verifies that the directory name matches the declared name@version.
-/// Fix mode (`--fix`): auto-repair issues like stale security caches. Without `--fix`, verify is read-only.
+/// Basic mode: each package directory must exist and contain a
+/// non-empty `package.json`. Catches missing-directory, empty-
+/// directory, and missing-manifest corruption.
 ///
-/// extended to walk both the
-/// v1 store (`<store>/v1/<safe>@<ver>/`) AND the v2 link entries
-/// (`<store>/v2/links/<key>/node_modules/<name>/`). Pre-fix, this
-/// command was a silent no-op under the v2-default install pipeline:
-/// it walked v1 only and reported zero packages even though hundreds
-/// of links were materialized in v2.
+/// Deep mode (`--deep`): additionally parses `package.json` to assert
+/// the declared `name`/`version` match the store-entry coordinates,
+/// and compares the stored integrity marker (`v1` `.integrity` file or
+/// `v2` link sidecar's `source_sri`) against the current project
+/// lockfile's claimed integrity for that package. Detects marker
+/// drift and lockfile poisoning that would change the claimed source
+/// hash.
+///
+/// **Scope limit:** `--deep` does NOT re-hash the extracted on-disk
+/// bytes. The `.integrity` marker is the tarball-time digest; a
+/// post-extraction tamper that leaves the marker untouched looks
+/// healthy to `--deep`. Treat this command as a lockfile-marker
+/// consistency check, not a bytes-on-disk attestation. A byte-integrity
+/// recompute would need a Merkle digest of the extracted directory and
+/// is out of scope for the current store layout.
+///
+/// Fix mode (`--fix`): auto-repair stale `.lpm-security.json`
+/// behavioral caches. Without `--fix`, verify is read-only.
+///
+/// Walks both the v1 store (`<store>/v1/<safe>@<ver>/`) AND the v2
+/// link entries (`<store>/v2/links/<key>/node_modules/<name>/`).
 fn run_verify(
     lpm_root: &LpmRoot,
     store: &PackageStore,
@@ -180,9 +197,10 @@ fn run_verify(
     json_output: bool,
 ) -> Result<(), LpmError> {
     let mut packages: Vec<StoreVerifyEntry> = list_v1_verify_entries(store)?;
-    packages.extend(list_v2_verify_entries(lpm_root)?);
+    let (v2_entries, mut sidecar_issues) = list_v2_verify_entries(lpm_root)?;
+    packages.extend(v2_entries);
 
-    if packages.is_empty() {
+    if packages.is_empty() && sidecar_issues.is_empty() {
         if json_output {
             // F4: empty-store envelope mirrors the populated-store
             // shape so downstream consumers don't need to special-case
@@ -233,6 +251,10 @@ fn run_verify(
 
     let mut verified = 0u32;
     let mut corrupted: Vec<String> = Vec::new();
+    // L57: v2 link directories whose sidecar was missing/malformed/
+    // schema-mismatched/unsafe-name reach us as pre-seeded corruption
+    // entries. They never become "verified."
+    corrupted.append(&mut sidecar_issues);
     let mut security_mismatches = 0u32;
     let mut security_reanalyzed = 0u32;
 
@@ -243,17 +265,23 @@ fn run_verify(
             dir,
             inline_integrity,
         } = entry;
+        // L59: every state-derived field that may carry sidecar / dir
+        // / package.json control bytes goes through sanitize_for_terminal
+        // before format!. Without this a tampered sidecar can ride
+        // ESC/BEL/OSC sequences into the human emitter.
+        let safe_name = sanitize_for_terminal(name);
+        let safe_version = sanitize_for_terminal(version);
 
         // Check 1: directory exists
         if !dir.exists() {
-            corrupted.push(format!("{name}@{version} — directory missing"));
+            corrupted.push(format!("{safe_name}@{safe_version} — directory missing"));
             continue;
         }
 
         // Check 2: package.json exists
         let pkg_json_path = dir.join("package.json");
         if !pkg_json_path.exists() {
-            corrupted.push(format!("{name}@{version} — missing package.json"));
+            corrupted.push(format!("{safe_name}@{safe_version} — missing package.json"));
             continue;
         }
 
@@ -262,13 +290,16 @@ fn run_verify(
         let file_count = match std::fs::read_dir(dir) {
             Ok(entries) => entries.count(),
             Err(e) => {
-                corrupted.push(format!("{name}@{version} — unreadable directory: {e}"));
+                corrupted.push(format!(
+                    "{safe_name}@{safe_version} — unreadable directory: {}",
+                    sanitize_for_terminal(&e.to_string())
+                ));
                 continue;
             }
         };
 
         if file_count == 0 {
-            corrupted.push(format!("{name}@{version} — empty directory"));
+            corrupted.push(format!("{safe_name}@{safe_version} — empty directory"));
             continue;
         }
 
@@ -284,8 +315,9 @@ fn run_verify(
                                 && declared_name != name
                             {
                                 corrupted.push(format!(
-										"{name}@{version} — package.json name mismatch: declared '{declared_name}'"
-									));
+                                    "{safe_name}@{safe_version} — package.json name mismatch: declared '{}'",
+                                    sanitize_for_terminal(declared_name)
+                                ));
                                 continue;
                             }
                             // Validate version matches
@@ -294,19 +326,26 @@ fn run_verify(
                                 && declared_version != version
                             {
                                 corrupted.push(format!(
-										"{name}@{version} — package.json version mismatch: declared '{declared_version}'"
-									));
+                                    "{safe_name}@{safe_version} — package.json version mismatch: declared '{}'",
+                                    sanitize_for_terminal(declared_version)
+                                ));
                                 continue;
                             }
                         }
                         Err(e) => {
-                            corrupted.push(format!("{name}@{version} — invalid package.json: {e}"));
+                            corrupted.push(format!(
+                                "{safe_name}@{safe_version} — invalid package.json: {}",
+                                sanitize_for_terminal(&e.to_string())
+                            ));
                             continue;
                         }
                     }
                 }
                 Err(e) => {
-                    corrupted.push(format!("{name}@{version} — unreadable package.json: {e}"));
+                    corrupted.push(format!(
+                        "{safe_name}@{safe_version} — unreadable package.json: {}",
+                        sanitize_for_terminal(&e.to_string())
+                    ));
                     continue;
                 }
             }
@@ -324,10 +363,10 @@ fn run_verify(
                     Some(stored) => {
                         if stored != *expected_integrity {
                             corrupted.push(format!(
-								"{name}@{version} — integrity mismatch: stored '{}...' != lockfile '{}...'",
-								&stored[..stored.len().min(20)],
-								&expected_integrity[..expected_integrity.len().min(20)],
-							));
+                                "{safe_name}@{safe_version} — integrity mismatch: stored '{}...' != lockfile '{}...'",
+                                truncate_chars_safe(&sanitize_for_terminal(&stored), 20),
+                                truncate_chars_safe(&sanitize_for_terminal(expected_integrity), 20),
+                            ));
                             continue;
                         }
                     }
@@ -424,25 +463,29 @@ fn run_verify(
     // diverge.
     let (unique_coords, duplicated_count) = compute_verify_dedup_counts(&packages);
 
+    // L56: `success` must reflect whether the store is healthy.
+    // Pre-fix this was hard-coded to `true` and the process exit was
+    // always 0, so a CI gate built on `lpm store verify --json` would
+    // pass through corrupted entries. The exit signal tracks corruption
+    // (missing/empty directories, missing package.json, name/version
+    // mismatches, invalid package.json, integrity mismatches, malformed
+    // v2 sidecars per L57). Security-analysis mismatches remain advisory
+    // — they're a per-package cache refresh hint, not a corrupted-bytes
+    // signal, and the human/JSON output already names them with a
+    // `--fix` remediation pointer.
+    let success = corrupted.is_empty();
+
     if json_output {
-        let mut result = serde_json::json!({
-            "success": true,
-            // **F4** — `verified` was previously documented as "packages"
-            // but counted store entries. Renamed to `entries_verified`
-            // to match the actual semantic. `verified` retained as an
-            // alias for one release window so JSON consumers (CI
-            // dashboards, audit scripts) don't break overnight.
-            "entries_verified": verified,
-            "verified": verified,
-            "unique_coords": unique_coords,
-            "duplicated_entries": duplicated_count,
-            "corrupted": corrupted.len(),
-            "issues": corrupted,
-        });
-        if deep {
-            result["securityMismatches"] = serde_json::json!(security_mismatches);
-            result["securityReanalyzed"] = serde_json::json!(security_reanalyzed);
-        }
+        let result = build_verify_envelope(
+            success,
+            deep,
+            verified,
+            unique_coords,
+            duplicated_count,
+            &corrupted,
+            security_mismatches,
+            security_reanalyzed,
+        );
         println!("{}", serde_json::to_string_pretty(&result).unwrap());
     } else if corrupted.is_empty() {
         // F4: noun is "store entries" (truthful for v1+v2 merged
@@ -475,6 +518,14 @@ fn run_verify(
         } else {
             output::success(&msg);
         }
+        if deep {
+            // Make the scope explicit so users don't assume a clean
+            // exit attests to bytes-on-disk integrity.
+            output::info(
+                "Note: --deep verifies lockfile↔marker consistency, not extracted-bytes \
+                 integrity. Re-hashing the extracted directory contents is not implemented.",
+            );
+        }
     } else {
         output::warn(&format!("{} corrupted, {} OK", corrupted.len(), verified));
         for issue in &corrupted {
@@ -496,6 +547,15 @@ fn run_verify(
         );
     }
 
+    // L56: surface corruption to the process exit code so CI gates
+    // built on `$?` see the failure too. JSON mode already wrote its
+    // envelope to stdout (with `"success": false`); ExitCode is the
+    // explicit "I've emitted my own output, just propagate status"
+    // signal the top-level handler honours.
+    if !success {
+        return Err(LpmError::ExitCode(1));
+    }
+
     Ok(())
 }
 
@@ -510,6 +570,16 @@ fn run_verify(
 /// drove the divergence (almost always "N entries split across v1+v2
 /// during a migration" or "N entries split across graph keys via
 /// multi-source-same-coords").
+/// Truncate `s` to at most `max_chars` Unicode scalar values, using
+/// `chars().take(...)` so the slice always lands on a char boundary.
+/// L59: the pre-fix integrity-preview formatter did `&s[..s.len().min(20)]`,
+/// which can panic on non-ASCII when the byte boundary lands inside a
+/// multibyte character — a tampered sidecar with a unicode SRI prefix
+/// would crash the diagnostic path.
+fn truncate_chars_safe(s: &str, max_chars: usize) -> String {
+    s.chars().take(max_chars).collect()
+}
+
 fn compute_verify_dedup_counts(entries: &[StoreVerifyEntry]) -> (usize, usize) {
     let mut seen = std::collections::HashSet::with_capacity(entries.len());
     for entry in entries {
@@ -518,6 +588,54 @@ fn compute_verify_dedup_counts(entries: &[StoreVerifyEntry]) -> (usize, usize) {
     let unique = seen.len();
     let duplicated = entries.len().saturating_sub(unique);
     (unique, duplicated)
+}
+
+/// Build the JSON envelope `lpm store verify --json` emits to stdout.
+/// Pure compute over already-walked input, factored out so tests can
+/// assert the contract directly without capturing stdout.
+///
+/// `check_kind` names exactly what was verified — basic presence vs.
+/// lockfile-marker consistency — so CI/agent consumers don't infer
+/// "byte integrity verified" from a `--deep` envelope.
+/// `bytes_integrity_recomputed` stays `false` until a Merkle-digest
+/// pass over the extracted directory contents is implemented.
+#[allow(clippy::too_many_arguments)]
+fn build_verify_envelope(
+    success: bool,
+    deep: bool,
+    verified: u32,
+    unique_coords: usize,
+    duplicated_count: usize,
+    corrupted: &[String],
+    security_mismatches: u32,
+    security_reanalyzed: u32,
+) -> serde_json::Value {
+    let check_kind = if deep {
+        "lockfile_marker_consistency"
+    } else {
+        "presence"
+    };
+    let mut result = serde_json::json!({
+        "success": success,
+        "check_kind": check_kind,
+        "bytes_integrity_recomputed": false,
+        // **F4** — `verified` was previously documented as "packages"
+        // but counted store entries. Renamed to `entries_verified` to
+        // match the actual semantic. `verified` retained as an alias
+        // for one release window so JSON consumers (CI dashboards,
+        // audit scripts) don't break overnight.
+        "entries_verified": verified,
+        "verified": verified,
+        "unique_coords": unique_coords,
+        "duplicated_entries": duplicated_count,
+        "corrupted": corrupted.len(),
+        "issues": corrupted,
+    });
+    if deep {
+        result["securityMismatches"] = serde_json::json!(security_mismatches);
+        result["securityReanalyzed"] = serde_json::json!(security_reanalyzed);
+    }
+    result
 }
 
 fn list_v1_verify_entries(store: &PackageStore) -> Result<Vec<StoreVerifyEntry>, LpmError> {
@@ -565,25 +683,49 @@ fn list_v1_verify_entries(store: &PackageStore) -> Result<Vec<StoreVerifyEntry>,
 /// enumerate v2 link entries
 /// for `lpm store verify`. Each link's sidecar (`.lpm-link-meta.json`)
 /// supplies `(name, version, source_sri)` directly; the materialized
-/// package dir is `<link>/node_modules/<name>/`. Links missing a
-/// sidecar are silently skipped (graceful — matches
-/// [`Store::iter_link_entries`]'s contract). Multi-source-same-coords
-/// yields one entry per link, so two links sharing
-/// `(name, version)` get verified independently.
+/// package dir is `<link>/node_modules/<name>/`. Multi-source-same-coords
+/// yields one entry per link, so two links sharing `(name, version)`
+/// get verified independently.
 ///
-/// Returns an empty vec for stores with no v2 links (the common case
-/// pre-and for v1-only test fixtures).
-fn list_v2_verify_entries(lpm_root: &LpmRoot) -> Result<Vec<StoreVerifyEntry>, LpmError> {
+/// Returns `(entries, sidecar_issues)`. `sidecar_issues` lists every
+/// v2 link directory whose `.lpm-link-meta.json` was missing,
+/// malformed, schema-mismatched, or carried an unsafe name (L57). The
+/// caller folds these into the corruption list so verify reports the
+/// problem instead of inheriting the iterator's skip-on-malformed
+/// shape.
+fn list_v2_verify_entries(
+    lpm_root: &LpmRoot,
+) -> Result<(Vec<StoreVerifyEntry>, Vec<String>), LpmError> {
     let store_v2 = lpm_store::v2::Store::from_lpm_root(lpm_root);
     let mut packages = Vec::new();
-    for (link_dir, meta) in store_v2.iter_link_entries()? {
-        let pkg_dir = link_dir.join("node_modules").join(&meta.name);
-        packages.push(StoreVerifyEntry {
-            name: meta.name,
-            version: meta.version,
-            dir: pkg_dir,
-            inline_integrity: Some(meta.source_sri),
-        });
+    let mut sidecar_issues = Vec::new();
+    for (link_dir, result) in store_v2.iter_link_entries_for_verify()? {
+        match result {
+            Ok(meta) => {
+                let pkg_dir = link_dir.join("node_modules").join(&meta.name);
+                packages.push(StoreVerifyEntry {
+                    name: meta.name,
+                    version: meta.version,
+                    dir: pkg_dir,
+                    inline_integrity: Some(meta.source_sri),
+                });
+            }
+            Err(e) => {
+                // L59: link directory names live under the user's
+                // store root but may have been planted by a hostile
+                // same-user writer. The error text itself can carry
+                // sidecar bytes (filename / parse-position previews).
+                let dir_name = link_dir
+                    .file_name()
+                    .map(|s| s.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| link_dir.display().to_string());
+                sidecar_issues.push(format!(
+                    "v2 link {} — sidecar unreadable: {}",
+                    sanitize_for_terminal(&dir_name),
+                    sanitize_for_terminal(&e.to_string())
+                ));
+            }
+        }
     }
     packages.sort_by(|a, b| {
         (a.name.as_str(), a.version.as_str(), a.dir.as_path()).cmp(&(
@@ -592,7 +734,8 @@ fn list_v2_verify_entries(lpm_root: &LpmRoot) -> Result<Vec<StoreVerifyEntry>, L
             b.dir.as_path(),
         ))
     });
-    Ok(packages)
+    sidecar_issues.sort();
+    Ok((packages, sidecar_issues))
 }
 
 /// Compare two behavioral analyses for equivalence (ignoring timestamps and metadata).
@@ -818,7 +961,8 @@ mod tests {
         meta.write_to(&link_dir).unwrap();
 
         // Step 1: the v2 walker enumerates the entry.
-        let entries = list_v2_verify_entries(&lpm_root).unwrap();
+        let (entries, sidecar_issues) = list_v2_verify_entries(&lpm_root).unwrap();
+        assert!(sidecar_issues.is_empty(), "no sidecar issues expected");
         assert_eq!(
             entries.len(),
             1,
@@ -900,9 +1044,10 @@ mod tests {
         meta.write_to(&v2_link_dir).unwrap();
 
         let v1_entries = list_v1_verify_entries(&store).unwrap();
-        let v2_entries = list_v2_verify_entries(&lpm_root).unwrap();
+        let (v2_entries, v2_issues) = list_v2_verify_entries(&lpm_root).unwrap();
         assert_eq!(v1_entries.len(), 1);
         assert_eq!(v2_entries.len(), 1);
+        assert!(v2_issues.is_empty(), "no sidecar issues expected");
         assert_eq!(v1_entries[0].name, "v1-pkg");
         assert_eq!(v2_entries[0].name, "v2-pkg");
         // V1 entries leave inline_integrity None; the verify loop
@@ -913,6 +1058,177 @@ mod tests {
 
         run_verify(&lpm_root, &store, true, false, true)
             .expect("verify must walk both v1 and v2 entries");
+    }
+
+    /// L56: corrupted entries must surface as `LpmError::ExitCode(1)`
+    /// so CI gates built on `$?` see the failure. Pre-fix the function
+    /// returned `Ok(())` regardless of how many corrupted entries it
+    /// found.
+    #[test]
+    fn verify_returns_exit_code_when_corrupted_entries_present() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = PackageStore::at(dir.path().join("store"));
+
+        // Seed a v1 entry that's missing package.json.
+        let pkg_dir = dir.path().join("store").join("v1").join("test-pkg@1.0.0");
+        std::fs::create_dir_all(&pkg_dir).unwrap();
+        std::fs::write(pkg_dir.join("README.md"), "no manifest").unwrap();
+
+        let err = run_verify(&LpmRoot::from_dir(dir.path()), &store, false, false, true)
+            .expect_err("corrupted entry must surface as Err");
+        assert!(
+            matches!(err, LpmError::ExitCode(1)),
+            "expected ExitCode(1), got {err:?}"
+        );
+    }
+
+    /// L57: a v2 link directory with a malformed sidecar must reach
+    /// the verifier's corrupted list. Pre-fix `iter_link_entries`
+    /// silently filtered these out and verify reported "Store is
+    /// empty" or whatever count remained.
+    #[test]
+    fn verify_reports_malformed_v2_sidecar_as_corruption() {
+        let dir = tempfile::tempdir().unwrap();
+        let lpm_root = LpmRoot::from_dir(dir.path());
+
+        // Seed a v2 link directory with a broken sidecar.
+        let v2_links_root = dir.path().join("store").join("v2").join("links");
+        let link_dir = v2_links_root.join("broken-pkg@1.0.0+0123456789abcdef");
+        std::fs::create_dir_all(&link_dir).unwrap();
+        std::fs::write(link_dir.join(".lpm-link-meta.json"), b"{not valid json").unwrap();
+
+        let (entries, sidecar_issues) = list_v2_verify_entries(&lpm_root).unwrap();
+        assert!(entries.is_empty(), "malformed entry must not be verified");
+        assert_eq!(sidecar_issues.len(), 1, "got: {sidecar_issues:?}");
+        assert!(
+            sidecar_issues[0].contains("broken-pkg"),
+            "issue must name the affected link directory: {}",
+            sidecar_issues[0]
+        );
+        assert!(
+            sidecar_issues[0].contains("sidecar unreadable"),
+            "issue must describe the failure type: {}",
+            sidecar_issues[0]
+        );
+    }
+
+    /// L57: malformed sidecars must drive the same `ExitCode(1)` exit
+    /// as v1 corruption — proves the L56 + L57 contracts compose.
+    #[test]
+    fn verify_returns_exit_code_when_v2_sidecar_malformed() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = PackageStore::at(dir.path().join("store"));
+
+        let link_dir = dir
+            .path()
+            .join("store")
+            .join("v2")
+            .join("links")
+            .join("broken-pkg@1.0.0+0123456789abcdef");
+        std::fs::create_dir_all(&link_dir).unwrap();
+        std::fs::write(link_dir.join(".lpm-link-meta.json"), b"{not valid json").unwrap();
+
+        let err = run_verify(&LpmRoot::from_dir(dir.path()), &store, false, false, true)
+            .expect_err("malformed v2 sidecar must surface as Err");
+        assert!(matches!(err, LpmError::ExitCode(1)), "got: {err:?}");
+    }
+
+    /// L59: `truncate_chars_safe` slices on char boundaries — a
+    /// poisoned non-ASCII SRI prefix won't panic the diagnostic path
+    /// the way the pre-fix `&s[..s.len().min(20)]` did.
+    #[test]
+    fn truncate_chars_safe_handles_non_ascii_without_panic() {
+        // Each 'é' is two bytes; 30 of them is 60 bytes — pre-fix
+        // `&s[..20]` would slice mid-codepoint and panic.
+        let s = "é".repeat(30);
+        let preview = truncate_chars_safe(&s, 20);
+        assert_eq!(preview.chars().count(), 20);
+    }
+
+    /// L59: shorter strings pass through unchanged so the helper
+    /// doesn't over-trim legit short integrity prefixes.
+    #[test]
+    fn truncate_chars_safe_keeps_short_strings_intact() {
+        assert_eq!(truncate_chars_safe("sha512-abc", 20), "sha512-abc");
+        assert_eq!(truncate_chars_safe("", 20), "");
+    }
+
+    /// L59: when a package's directory name carries ESC/BEL/control
+    /// bytes, sanitize_for_terminal scrubs them before the corruption
+    /// issue is appended. Renders the post-fix invariant via the
+    /// public sanitizer applied to the same bytes the verifier reads.
+    #[test]
+    fn verify_strings_pass_through_terminal_sanitizer() {
+        let raw = "pkg\x1b]8;;file:///etc/passwd\x07evil";
+        let safe = sanitize_for_terminal(raw);
+        assert!(!safe.contains('\x1b'), "ESC byte must be scrubbed");
+        assert!(!safe.contains('\x07'), "BEL byte must be scrubbed");
+        // Printable surrounding characters survive.
+        assert!(safe.starts_with("pkg"));
+        assert!(safe.ends_with("evil"));
+    }
+
+    /// The `--json` envelope distinguishes the basic presence check
+    /// from `--deep` lockfile-marker consistency, and never claims
+    /// bytes-on-disk integrity was recomputed. CI/agent consumers can
+    /// read the field instead of inferring depth from argv.
+    #[test]
+    fn verify_envelope_carries_check_kind_and_bytes_integrity_flag() {
+        let basic = build_verify_envelope(true, false, 3, 3, 0, &[], 0, 0);
+        assert_eq!(basic["check_kind"].as_str(), Some("presence"));
+        assert_eq!(basic["bytes_integrity_recomputed"].as_bool(), Some(false));
+        assert!(
+            basic.get("securityMismatches").is_none(),
+            "basic mode omits security fields"
+        );
+
+        let deep = build_verify_envelope(true, true, 3, 3, 0, &[], 0, 0);
+        assert_eq!(
+            deep["check_kind"].as_str(),
+            Some("lockfile_marker_consistency")
+        );
+        assert_eq!(deep["bytes_integrity_recomputed"].as_bool(), Some(false));
+        assert_eq!(deep["securityMismatches"].as_u64(), Some(0));
+        assert_eq!(deep["securityReanalyzed"].as_u64(), Some(0));
+    }
+
+    /// Corrupted entries surface in the JSON envelope with
+    /// `success: false` AND the new `check_kind` / bytes flag — the
+    /// "verify returns ExitCode(1) on corruption" contract composes
+    /// with the renamed scope.
+    #[test]
+    fn verify_envelope_surfaces_corruption_with_consistent_check_kind() {
+        let issues = vec!["pkg@1.0.0 — missing package.json".to_string()];
+        let env = build_verify_envelope(false, true, 5, 5, 0, &issues, 0, 0);
+        assert_eq!(env["success"].as_bool(), Some(false));
+        assert_eq!(env["corrupted"].as_u64(), Some(1));
+        assert_eq!(
+            env["check_kind"].as_str(),
+            Some("lockfile_marker_consistency")
+        );
+        assert_eq!(env["bytes_integrity_recomputed"].as_bool(), Some(false));
+        assert_eq!(env["issues"][0].as_str(), issues[0].as_str().into());
+    }
+
+    /// L56: a clean store must continue to return Ok — proves the
+    /// success contract widens for corruption only, not blanket.
+    #[test]
+    fn verify_returns_ok_for_clean_store() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = PackageStore::at(dir.path().join("store"));
+
+        // Seed one healthy v1 entry.
+        let pkg_dir = dir.path().join("store").join("v1").join("ok-pkg@1.0.0");
+        std::fs::create_dir_all(&pkg_dir).unwrap();
+        std::fs::write(
+            pkg_dir.join("package.json"),
+            r#"{"name":"ok-pkg","version":"1.0.0"}"#,
+        )
+        .unwrap();
+        std::fs::write(pkg_dir.join("index.js"), "// nothing").unwrap();
+
+        run_verify(&LpmRoot::from_dir(dir.path()), &store, false, false, true)
+            .expect("clean store must verify Ok");
     }
 
     // ─── F4 — verify dedup-count contract ───────────────────────────

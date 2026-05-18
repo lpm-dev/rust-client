@@ -125,6 +125,13 @@ const MAX_BUNDLE_BYTES: usize = 1024 * 1024;
 /// degrade to "unknown" quickly rather than stall the install.
 const FETCH_TIMEOUT_SECS: u64 = 15;
 
+/// Maximum bytes we will read from one on-disk cache entry. A local
+/// attacker who can write under `~/.lpm/cache/metadata/attestations/`
+/// should not be able to OOM the install by planting a multi-GiB file
+/// — every legitimate entry is well under 4 KiB and the same 1 MiB
+/// bound applies on the fetch side via [`MAX_BUNDLE_BYTES`].
+const MAX_CACHE_ENTRY_BYTES: u64 = 1024 * 1024;
+
 /// perf decomposition of [`fetch_provenance_snapshot`].
 ///
 /// Each atomic accumulates time spent in one stage across many
@@ -390,23 +397,51 @@ fn read_cache(
     name: &str,
     version: &str,
 ) -> Result<Option<ProvenanceSnapshot>, LpmError> {
+    use std::io::Read;
+
     let path = cache_path(cache_root, name, version);
-    let bytes = match std::fs::read(&path) {
-        Ok(b) => b,
+    let file = match std::fs::File::open(&path) {
+        Ok(f) => f,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(LpmError::Io(e)),
     };
 
+    let metadata = file.metadata().map_err(LpmError::Io)?;
+    if metadata.len() > MAX_CACHE_ENTRY_BYTES {
+        tracing::warn!(
+            target: "lpm_cli::provenance_fetch",
+            path = %path.display(),
+            size_bytes = metadata.len(),
+            cap_bytes = MAX_CACHE_ENTRY_BYTES,
+            "provenance cache entry exceeds size cap; treating as miss",
+        );
+        return Ok(None);
+    }
+
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    std::io::BufReader::new(file)
+        .take(MAX_CACHE_ENTRY_BYTES)
+        .read_to_end(&mut bytes)
+        .map_err(LpmError::Io)?;
+
     let entry: CacheEntry = match serde_json::from_slice(&bytes) {
         Ok(e) => e,
-        Err(_) => return Ok(None), // corrupt file → treat as miss
+        Err(e) => {
+            tracing::warn!(
+                target: "lpm_cli::provenance_fetch",
+                path = %path.display(),
+                error = %e,
+                "provenance cache entry failed to parse; treating as miss",
+            );
+            return Ok(None);
+        }
     };
 
     if entry.version != CACHE_SCHEMA_VERSION {
-        return Ok(None); // schema drift → re-fetch
+        return Ok(None);
     }
     if current_epoch_secs().saturating_sub(entry.cached_at_secs) >= CACHE_TTL_SECS {
-        return Ok(None); // stale → re-fetch
+        return Ok(None);
     }
 
     Ok(Some(entry.snapshot))
@@ -1375,6 +1410,36 @@ mod tests {
         .unwrap();
         let got = read_cache(dir.path(), "pkg", "1.0.0").unwrap();
         assert_eq!(got, None, "corrupt cache must degrade to miss, not error");
+    }
+
+    /// A local attacker who can write into the cache dir should not be
+    /// able to OOM the install by dropping a multi-MiB file at a valid
+    /// cache path. `read_cache` checks the file size against
+    /// `MAX_CACHE_ENTRY_BYTES` before reading and treats anything over
+    /// the cap as a miss.
+    #[test]
+    fn cache_oversized_file_treated_as_miss() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path()).unwrap();
+        let path = dir.path().join(cache_filename("pkg", "1.0.0"));
+        // 2 MiB > the 1 MiB cap. The bytes deliberately look like
+        // valid JSON prefix to prove the size check fires *before* the
+        // parser runs.
+        let mut payload = b"{\"version\":1,\"cached_at_secs\":0,\"snapshot\":".to_vec();
+        payload.extend(std::iter::repeat_n(b'a', 2 * 1024 * 1024));
+        std::fs::write(&path, &payload).unwrap();
+        let got = read_cache(dir.path(), "pkg", "1.0.0").unwrap();
+        assert_eq!(
+            got, None,
+            "oversized cache file must degrade to miss, not OOM the install",
+        );
+        // File still on disk — the next legitimate write_cache will
+        // overwrite it via atomic rename; we don't delete from a read
+        // path to avoid concurrency footguns.
+        assert!(
+            path.exists(),
+            "read_cache must not delete the oversized file"
+        );
     }
 
     #[test]

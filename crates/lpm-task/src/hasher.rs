@@ -88,6 +88,22 @@ fn collect_input_files(project_dir: &Path, globs: &[String]) -> Vec<(String, Str
             if let Ok(entries) = glob::glob(&pattern_str) {
                 for entry in entries.flatten() {
                     if entry.is_file() {
+                        // M36: glob expansion via `is_file()` follows
+                        // symlinks. A safe-looking pattern like
+                        // `inputs: ["src/**/*"]` against a repo that
+                        // commits `src/escape -> /etc/passwd` would
+                        // hash the target file's contents and fold
+                        // them into the cache key — copying secret
+                        // material across machines / cache shares.
+                        // Require the resolved target to stay under
+                        // `project_dir` via canonicalize().
+                        if !target_stays_in_project(&entry, project_dir) {
+                            tracing::warn!(
+                                "skipping cache input outside project tree: {}",
+                                entry.display()
+                            );
+                            continue;
+                        }
                         let rel = entry
                             .strip_prefix(project_dir)
                             .unwrap_or(&entry)
@@ -124,6 +140,26 @@ fn expand_glob(pattern: &str) -> Vec<String> {
         patterns.push(format!("{pattern}/*"));
     }
     patterns
+}
+
+/// Canonicalize both the entry path and the project root and verify
+/// the entry resolves to a path under the project. Used to refuse
+/// committed symlinks that point outside the repo (`src/escape ->
+/// /etc/passwd`) before their target's bytes are folded into the
+/// cache key.
+///
+/// Returns `false` on canonicalization failure (broken symlink,
+/// permission denied, etc.) so a hostile entry can't bypass the
+/// check by becoming unreadable.
+fn target_stays_in_project(entry: &Path, project_dir: &Path) -> bool {
+    let Ok(entry_canon) = entry.canonicalize() else {
+        return false;
+    };
+    let Ok(project_canon) = project_dir.canonicalize() else {
+        // Project root unreadable — fail closed.
+        return false;
+    };
+    entry_canon.starts_with(&project_canon)
 }
 
 /// Compute SHA-256 hex string of a file using streaming reads.
@@ -344,5 +380,49 @@ mod tests {
         assert_eq!(hex::encode([0x00, 0xff, 0x0a, 0xab]), "00ff0aab");
         assert_eq!(hex::encode([]), "");
         assert_eq!(hex::encode([0xde, 0xad, 0xbe, 0xef]), "deadbeef");
+    }
+
+    /// M36: a regular file under project_dir is accepted by the
+    /// containment helper. Round-trip the obvious-allow case.
+    #[test]
+    fn target_stays_in_project_accepts_regular_file_under_root() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir_all(dir.path().join("src")).unwrap();
+        let file = dir.path().join("src/index.js");
+        fs::write(&file, "ok").unwrap();
+        assert!(target_stays_in_project(&file, dir.path()));
+    }
+
+    /// M36: a committed symlink whose target lies OUTSIDE the project
+    /// is refused. Pre-fix the hasher would `is_file()` (follows
+    /// symlink → true) and fold the target's bytes into the cache
+    /// key — copying secret material across machines.
+    #[cfg(unix)]
+    #[test]
+    fn target_stays_in_project_rejects_symlink_pointing_outside() {
+        let project = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let secret = outside.path().join("secret.env");
+        fs::write(&secret, "API_KEY=hunter2").unwrap();
+
+        let link = project.path().join("escape");
+        std::os::unix::fs::symlink(&secret, &link).unwrap();
+
+        assert!(
+            !target_stays_in_project(&link, project.path()),
+            "symlink to a file outside project_dir must be refused"
+        );
+    }
+
+    /// M36: a broken symlink also fails closed (canonicalize errs).
+    /// Without this we'd silently swallow the entry instead of
+    /// flagging it.
+    #[cfg(unix)]
+    #[test]
+    fn target_stays_in_project_rejects_broken_symlink() {
+        let project = tempfile::tempdir().unwrap();
+        let link = project.path().join("dangling");
+        std::os::unix::fs::symlink(project.path().join("does-not-exist"), &link).unwrap();
+        assert!(!target_stays_in_project(&link, project.path()));
     }
 }

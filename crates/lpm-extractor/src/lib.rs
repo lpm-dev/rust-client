@@ -90,10 +90,16 @@ fn decompress_gzip_libdeflate(compressed: &[u8]) -> Result<Vec<u8>, LpmError> {
         isize_bytes[2],
         isize_bytes[3],
     ]) as usize;
+    // Cap the *initial* allocation so a small compressed body claiming
+    // a 4 GiB ISIZE in its footer can't force a multi-GiB pre-allocation.
+    // The InsufficientSpace branch below doubles the buffer up to
+    // MAX_EXTRACTION_SIZE for legitimate large payloads; the initial
+    // allocation here is a starting hint, not a binding ceiling.
+    let initial_isize = isize_hint.min(INITIAL_ALLOCATION_CAP);
     // Floor the capacity at the compressed size — a gzip stream cannot
     // decompress to fewer bytes than its compressed length minus header/footer,
     // and tiny ISIZE values would otherwise force an immediate grow round-trip.
-    let mut capacity = isize_hint
+    let mut capacity = initial_isize
         .max(compressed.len())
         .min(MAX_EXTRACTION_SIZE as usize);
 
@@ -124,6 +130,16 @@ fn decompress_gzip_libdeflate(compressed: &[u8]) -> Result<Vec<u8>, LpmError> {
 
 /// Maximum total extraction size (5 GB) — prevents zip-bomb / tar-bomb attacks.
 const MAX_EXTRACTION_SIZE: u64 = 5 * 1024 * 1024 * 1024;
+
+/// Upper bound on the *initial* output-buffer allocation in
+/// [`decompress_gzip_libdeflate`]. Real npm packages decompress to
+/// well under this (the biggest packuments are ~10-50 MB), so 256 MiB
+/// covers the legitimate one-shot case while preventing a small
+/// compressed body from forcing a multi-GiB pre-allocation via a
+/// tampered ISIZE footer field. The grow loop in
+/// `decompress_gzip_libdeflate` handles the rare case where a real
+/// payload exceeds this initial budget.
+const INITIAL_ALLOCATION_CAP: usize = 256 * 1024 * 1024;
 
 /// Maximum single file size within a tarball (500 MB).
 const MAX_FILE_SIZE: u64 = 500 * 1024 * 1024;
@@ -572,6 +588,20 @@ fn prepare_output_path(
                     )));
                 }
 
+                // M57: on Windows, `is_symlink()` only catches the
+                // `IO_REPARSE_TAG_SYMLINK` shape. Junctions, mount
+                // points, and other reparse-tagged directories carry
+                // `FILE_ATTRIBUTE_REPARSE_POINT` but are NOT classified
+                // as symlinks by `FileType`, so they would pass the
+                // check above and let `File::create` write through to
+                // the junction target on the next iteration.
+                if is_windows_reparse_point(&metadata) {
+                    return Err(LpmError::Registry(format!(
+                        "path traversal detected via reparse point in tarball target: {}",
+                        original_path.display()
+                    )));
+                }
+
                 if !metadata.is_dir() {
                     return Err(LpmError::Registry(format!(
                         "non-directory path blocks tarball extraction: {}",
@@ -631,8 +661,11 @@ fn create_leaf_file(target_path: &Path) -> Result<std::fs::File, LpmError> {
     {
         // Windows: explicit pre-create stat for the leaf-symlink
         // guard. NTFS reparse points behave differently than POSIX
-        // symlinks; mirroring the legacy behavior keeps cross-platform
-        // semantics identical.
+        // symlinks; this matches the parent-walk's reparse-point
+        // check so that junctions, mount points, and other reparse-
+        // tagged objects (which `is_symlink()` does NOT classify as
+        // symlinks) cannot redirect `File::create` writes outside the
+        // extraction root.
         match std::fs::symlink_metadata(target_path) {
             Ok(meta) if meta.file_type().is_symlink() => {
                 return Err(LpmError::Registry(format!(
@@ -640,10 +673,48 @@ fn create_leaf_file(target_path: &Path) -> Result<std::fs::File, LpmError> {
                     target_path.display()
                 )));
             }
+            // M57: catch the junction / mount-point shape that
+            // `is_symlink()` misses.
+            Ok(meta) if is_windows_reparse_point(&meta) => {
+                return Err(LpmError::Registry(format!(
+                    "path traversal detected via reparse point in tarball target: {}",
+                    target_path.display()
+                )));
+            }
             Ok(_) | Err(_) => {}
         }
         std::fs::File::create(target_path).map_err(LpmError::Io)
     }
+}
+
+/// M57: detect any NTFS reparse-point shape — symbolic links,
+/// junctions, mount points, IO_REPARSE_TAG_APPEXECLINK shims, etc.
+///
+/// `Metadata::file_type().is_symlink()` only flags reparse points
+/// whose tag is `IO_REPARSE_TAG_SYMLINK` (0xA000000C). Junctions
+/// (`IO_REPARSE_TAG_MOUNT_POINT` = 0xA0000003) and the long tail of
+/// reparse-tag variants do NOT pass that check, but their presence
+/// at a path can still redirect later file operations away from the
+/// extraction root via the underlying volume mount or junction
+/// target. Checking `FILE_ATTRIBUTE_REPARSE_POINT` directly catches
+/// every reparse-tagged inode in one bit test.
+///
+/// Returns `false` on non-Windows builds — the parent walk's
+/// `is_symlink()` check is sufficient on POSIX where junctions don't
+/// exist.
+#[cfg(windows)]
+fn is_windows_reparse_point(metadata: &std::fs::Metadata) -> bool {
+    use std::os::windows::fs::MetadataExt;
+    // 0x00000400 = FILE_ATTRIBUTE_REPARSE_POINT (winnt.h). Cross-
+    // checking via windows-sys is not worth the dep for one literal.
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
+    metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+}
+
+#[cfg(not(windows))]
+#[allow(dead_code)]
+fn is_windows_reparse_point(_metadata: &std::fs::Metadata) -> bool {
+    false
 }
 
 fn rollback_extraction(
@@ -1486,5 +1557,47 @@ mod tests {
             0o755,
             "SGID bit MUST be stripped — same security posture as SUID"
         );
+    }
+
+    /// M17: a small compressed stream with a maliciously inflated
+    /// ISIZE footer must not pre-allocate a multi-GiB buffer. We can't
+    /// directly observe the allocation size from inside the test, but
+    /// we CAN verify that decompression of a real payload still works
+    /// when the footer claims an inflated ISIZE — proves the grow
+    /// path handles the case where the initial cap clips the hint.
+    /// Pin the constant alongside so a future bump is loud.
+    #[test]
+    fn initial_allocation_cap_bounds_pre_allocation() {
+        // The bound itself: 256 MiB. If a future change relaxes this
+        // (or removes the cap), this assertion fires and forces a
+        // review of the M17 threat model.
+        assert_eq!(
+            INITIAL_ALLOCATION_CAP,
+            256 * 1024 * 1024,
+            "initial allocation cap must stay ≤ 256 MiB to defend against \
+             hostile-ISIZE pre-allocation attacks",
+        );
+        // And the relationship to MAX_EXTRACTION_SIZE must hold —
+        // the initial cap is a starting hint, not a ceiling.
+        assert!(
+            (INITIAL_ALLOCATION_CAP as u64) < MAX_EXTRACTION_SIZE,
+            "initial cap must be strictly less than MAX_EXTRACTION_SIZE \
+             so legitimate large payloads still extract via the grow path",
+        );
+    }
+
+    /// Round-trip a real (small) gzip payload to prove the
+    /// initial-allocation cap doesn't break the common path. The
+    /// decompressed bytes must match the input.
+    #[test]
+    fn decompress_gzip_libdeflate_round_trips_small_payload() {
+        use std::io::Write;
+        let original = b"hello, libdeflate world!".repeat(100);
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        encoder.write_all(&original).unwrap();
+        let compressed = encoder.finish().unwrap();
+
+        let decompressed = decompress_gzip_libdeflate(&compressed).unwrap();
+        assert_eq!(decompressed, original);
     }
 }

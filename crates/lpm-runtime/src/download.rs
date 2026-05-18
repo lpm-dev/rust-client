@@ -98,7 +98,24 @@ pub async fn install_node(
     Ok(version.to_string())
 }
 
-/// Extract a .tar.gz archive with path traversal protection.
+/// Max decompressed bytes across all entries. Real Node distributions
+/// expand to ~150 MB; 1 GiB is several×-headroom but blocks the
+/// "small verified tarball expands into unbounded disk usage" shape
+/// that the 200 MiB download cap does not address.
+const MAX_EXTRACTED_BYTES: u64 = 1024 * 1024 * 1024;
+
+/// Max bytes per individual entry. A single 256 MiB file inside the
+/// tarball is well above anything a legitimate Node tarball carries.
+const MAX_ENTRY_BYTES: u64 = 256 * 1024 * 1024;
+
+/// Max entry count in the archive. Real Node distributions ship a few
+/// thousand files; 50 000 is roughly an order of magnitude above the
+/// real ceiling and blocks a hostile archive that emits millions of
+/// empty entries to exhaust inodes.
+const MAX_ENTRY_COUNT: usize = 50_000;
+
+/// Extract a .tar.gz archive with path traversal protection and
+/// decompression-bomb caps.
 ///
 /// Each entry is validated to ensure it does not escape the destination directory
 /// via `..` path components (zip-slip attack). See CVE-2018-1002200.
@@ -106,12 +123,35 @@ fn extract_tarball(data: &[u8], dest: &Path) -> Result<(), LpmError> {
     let decoder = flate2::read::GzDecoder::new(data);
     let mut archive = tar::Archive::new(decoder);
 
+    let mut total_bytes: u64 = 0;
+    let mut entry_count: usize = 0;
+
     for entry in archive
         .entries()
         .map_err(|e| LpmError::Script(format!("failed to read tarball entries: {e}")))?
     {
         let mut entry =
             entry.map_err(|e| LpmError::Script(format!("failed to read tarball entry: {e}")))?;
+
+        entry_count += 1;
+        if entry_count > MAX_ENTRY_COUNT {
+            return Err(LpmError::Script(format!(
+                "tarball entry count exceeds {MAX_ENTRY_COUNT}"
+            )));
+        }
+
+        let entry_size = entry.size();
+        if entry_size > MAX_ENTRY_BYTES {
+            return Err(LpmError::Script(format!(
+                "tarball entry size {entry_size} exceeds per-entry cap of {MAX_ENTRY_BYTES} bytes"
+            )));
+        }
+        total_bytes = total_bytes.saturating_add(entry_size);
+        if total_bytes > MAX_EXTRACTED_BYTES {
+            return Err(LpmError::Script(format!(
+                "tarball cumulative size {total_bytes} exceeds {MAX_EXTRACTED_BYTES} bytes"
+            )));
+        }
 
         let path = entry
             .path()
@@ -136,7 +176,8 @@ fn extract_tarball(data: &[u8], dest: &Path) -> Result<(), LpmError> {
     Ok(())
 }
 
-/// Extract a .zip archive with path traversal protection.
+/// Extract a .zip archive with path traversal protection and
+/// decompression-bomb caps.
 ///
 /// Used for Windows Node.js distributions which are distributed as .zip files.
 /// Each entry is validated to ensure it does not escape the destination directory.
@@ -147,10 +188,32 @@ fn extract_zip(data: &[u8], dest: &Path) -> Result<(), LpmError> {
     let mut archive = zip::ZipArchive::new(reader)
         .map_err(|e| LpmError::Script(format!("failed to open zip archive: {e}")))?;
 
+    if archive.len() > MAX_ENTRY_COUNT {
+        return Err(LpmError::Script(format!(
+            "zip entry count {} exceeds {MAX_ENTRY_COUNT}",
+            archive.len()
+        )));
+    }
+
+    let mut total_bytes: u64 = 0;
+
     for i in 0..archive.len() {
         let mut file = archive
             .by_index(i)
             .map_err(|e| LpmError::Script(format!("failed to read zip entry {i}: {e}")))?;
+
+        let declared = file.size();
+        if declared > MAX_ENTRY_BYTES {
+            return Err(LpmError::Script(format!(
+                "zip entry size {declared} exceeds per-entry cap of {MAX_ENTRY_BYTES} bytes"
+            )));
+        }
+        total_bytes = total_bytes.saturating_add(declared);
+        if total_bytes > MAX_EXTRACTED_BYTES {
+            return Err(LpmError::Script(format!(
+                "zip cumulative size {total_bytes} exceeds {MAX_EXTRACTED_BYTES} bytes"
+            )));
+        }
 
         let outpath = match file.enclosed_name() {
             Some(path) => dest.join(path),
@@ -368,7 +431,24 @@ async fn verify_checksum(
             ))
         })?;
 
-    compare_checksum(expected_hash, data)
+    compare_checksum(expected_hash, data)?;
+
+    // M20: surface the trust posture on every successful verify.
+    // SHASUMS256.txt is fetched over HTTPS from nodejs.org but the
+    // detached `.sig` GPG signature is NOT verified, so a CA-trusted
+    // MITM (corporate proxy, mis-issued cert) or a mirror operator
+    // can swap both `node-*.tar.gz` AND `SHASUMS256.txt` in lockstep
+    // and the hash compare would still pass. Trust is anchored on
+    // nodejs.org TLS only — there is no second leg of verification.
+    // Operators on hardened CI can pin the expected Node version
+    // ahead of time and refuse to install unfamiliar major versions.
+    tracing::warn!(
+        target: "lpm_runtime::download",
+        url = %shasums_url,
+        "Node runtime SHASUMS256 verified via upstream HTTPS only — no GPG signature check (M20). Trust is anchored on nodejs.org TLS; a CA-trusted MITM or mirror operator can substitute the asset + checksum together.",
+    );
+
+    Ok(())
 }
 
 #[cfg(test)]
@@ -509,6 +589,51 @@ mod tests {
         );
         assert!(dest.path().join("mydir/file.txt").exists());
         assert!(dest.path().join("mydir/sub/deep.txt").exists());
+    }
+
+    /// M46: a tar entry whose declared size exceeds the per-entry cap
+    /// is rejected before unpack. Without this guard, a small
+    /// compressed archive could expand into a multi-GiB on-disk file.
+    #[test]
+    fn extract_tarball_rejects_oversized_entry_declaration() {
+        // Build a raw tar entry that declares size > MAX_ENTRY_BYTES
+        // but ships only a tiny payload. The cap check fires before
+        // unpack so the missing bytes don't matter.
+        let mut header = [0u8; 512];
+        let path_bytes = b"big.bin";
+        header[..path_bytes.len()].copy_from_slice(path_bytes);
+        header[100..108].copy_from_slice(b"0000644\0");
+        header[108..116].copy_from_slice(b"0001000\0");
+        header[116..124].copy_from_slice(b"0001000\0");
+        let size_str = format!("{:011o}\0", MAX_ENTRY_BYTES + 1);
+        header[124..136].copy_from_slice(size_str.as_bytes());
+        header[136..148].copy_from_slice(b"00000000000\0");
+        header[156] = b'0';
+        header[257..263].copy_from_slice(b"ustar\0");
+        header[263..265].copy_from_slice(b"00");
+        header[148..156].copy_from_slice(b"        ");
+        let cksum: u32 = header.iter().map(|&b| b as u32).sum();
+        let cksum_str = format!("{:06o}\0 ", cksum);
+        header[148..156].copy_from_slice(&cksum_str.as_bytes()[..8]);
+
+        let mut tar_bytes = Vec::new();
+        tar_bytes.extend_from_slice(&header);
+        tar_bytes.extend_from_slice(&[0u8; 1024]); // EOF
+        let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+        gz.write_all(&tar_bytes).unwrap();
+        let gz_bytes = gz.finish().unwrap();
+
+        let dest = TempDir::new().unwrap();
+        let err = extract_tarball(&gz_bytes, dest.path()).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("per-entry cap"),
+            "must label per-entry cap rejection: {msg}"
+        );
+        assert!(
+            !dest.path().join("big.bin").exists(),
+            "no partial extract on cap failure"
+        );
     }
 
     // --- Checksum failure must be fatal ---

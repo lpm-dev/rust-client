@@ -5,7 +5,13 @@
 //! handler processes it identically to the original request.
 
 use crate::webhook::CapturedWebhook;
+use futures_util::StreamExt;
 use lpm_common::LpmError;
+
+/// Cap on replay response bodies. Matches the proxy's
+/// `MAX_RESPONSE_BODY_SIZE` so replay can't accept anything the
+/// tunnel itself would already have refused.
+const MAX_REPLAY_RESPONSE_BYTES: usize = 50 * 1024 * 1024;
 
 /// Result of replaying a webhook against the local server.
 #[derive(Debug)]
@@ -80,17 +86,44 @@ pub async fn replay_webhook(
         .map_err(|e| LpmError::Tunnel(format!("replay failed: {e}")))?;
 
     let status = resp.status().as_u16();
-    let body = resp
-        .bytes()
-        .await
-        .map_err(|e| LpmError::Tunnel(format!("failed to read replay response: {e}")))?
-        .to_vec();
+    let body = read_capped_replay_body(resp).await?;
 
     Ok(ReplayResult {
         status,
         duration_ms: start.elapsed().as_millis() as u64,
         response_body: body,
     })
+}
+
+/// Two-stage size cap on the local server's replay response.
+///
+/// Stage 1 rejects pre-stream when the server's declared
+/// `Content-Length` exceeds `MAX_REPLAY_RESPONSE_BYTES`. Stage 2
+/// streams `bytes_stream()` and aborts the moment another chunk
+/// would cross the cap, so a chunked / undeclared-length response
+/// cannot exhaust CLI memory.
+async fn read_capped_replay_body(resp: reqwest::Response) -> Result<Vec<u8>, LpmError> {
+    if let Some(declared) = resp.content_length()
+        && declared > MAX_REPLAY_RESPONSE_BYTES as u64
+    {
+        return Err(LpmError::Tunnel(format!(
+            "replay response too large: declared body length {declared} exceeds cap {MAX_REPLAY_RESPONSE_BYTES}"
+        )));
+    }
+
+    let mut buf: Vec<u8> = Vec::with_capacity(16 * 1024);
+    let mut stream = resp.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk =
+            chunk.map_err(|e| LpmError::Tunnel(format!("failed to read replay response: {e}")))?;
+        if buf.len().saturating_add(chunk.len()) > MAX_REPLAY_RESPONSE_BYTES {
+            return Err(LpmError::Tunnel(format!(
+                "replay response too large: streamed body exceeded cap {MAX_REPLAY_RESPONSE_BYTES}"
+            )));
+        }
+        buf.extend_from_slice(&chunk);
+    }
+    Ok(buf)
 }
 
 #[cfg(test)]
@@ -135,5 +168,121 @@ mod tests {
         };
         assert_eq!(result.status, 500);
         assert!(result.status >= 400);
+    }
+
+    /// Replay against a local listener whose `Content-Length` header
+    /// claims more bytes than the cap allows. The stage-1 pre-stream
+    /// check rejects before any body bytes are read.
+    #[tokio::test]
+    async fn replay_rejects_oversized_declared_content_length() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request_buf = [0u8; 1024];
+            let _ = stream.read(&mut request_buf).await;
+            let oversized = MAX_REPLAY_RESPONSE_BYTES as u64 + 1;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nContent-Length: {oversized}\r\n\r\n"
+            );
+            let _ = stream.write_all(response.as_bytes()).await;
+            let _ = stream.shutdown().await;
+        });
+
+        let captured = CapturedWebhook {
+            id: "test".into(),
+            timestamp: chrono::Utc::now().to_rfc3339(),
+            method: "POST".into(),
+            path: "/api/webhook".into(),
+            request_headers: std::collections::HashMap::new(),
+            request_body: vec![],
+            response_status: 0,
+            response_headers: std::collections::HashMap::new(),
+            response_body: vec![],
+            duration_ms: 0,
+            provider: None,
+            summary: String::new(),
+            signature_diagnostic: None,
+            auto_acked: false,
+        };
+
+        let client = reqwest::Client::new();
+        let result = replay_webhook(&client, &captured, port).await;
+        server.await.unwrap();
+
+        let err = result.expect_err("oversized declared length must be rejected");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("declared body length"),
+            "expected pre-stream rejection, got: {msg}"
+        );
+    }
+
+    /// Replay against a local listener that sends no `Content-Length`
+    /// (chunked-style) and streams body bytes past the cap. The
+    /// stage-2 mid-stream check aborts before the body finishes.
+    #[tokio::test]
+    async fn replay_rejects_streamed_body_exceeding_cap() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request_buf = [0u8; 1024];
+            let _ = stream.read(&mut request_buf).await;
+            let header = b"HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nTransfer-Encoding: chunked\r\n\r\n";
+            let _ = stream.write_all(header).await;
+            let chunk_size = 1024 * 1024;
+            let payload = vec![b'x'; chunk_size];
+            let chunk_header = format!("{:x}\r\n", chunk_size);
+            let total_chunks = (MAX_REPLAY_RESPONSE_BYTES / chunk_size) + 2;
+            for _ in 0..total_chunks {
+                if stream.write_all(chunk_header.as_bytes()).await.is_err() {
+                    break;
+                }
+                if stream.write_all(&payload).await.is_err() {
+                    break;
+                }
+                if stream.write_all(b"\r\n").await.is_err() {
+                    break;
+                }
+            }
+            let _ = stream.shutdown().await;
+        });
+
+        let captured = CapturedWebhook {
+            id: "test".into(),
+            timestamp: chrono::Utc::now().to_rfc3339(),
+            method: "POST".into(),
+            path: "/api/webhook".into(),
+            request_headers: std::collections::HashMap::new(),
+            request_body: vec![],
+            response_status: 0,
+            response_headers: std::collections::HashMap::new(),
+            response_body: vec![],
+            duration_ms: 0,
+            provider: None,
+            summary: String::new(),
+            signature_diagnostic: None,
+            auto_acked: false,
+        };
+
+        let client = reqwest::Client::new();
+        let result = replay_webhook(&client, &captured, port).await;
+        let _ = server.await;
+
+        let err = result.expect_err("streamed body past cap must be rejected");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("streamed body exceeded cap"),
+            "expected mid-stream rejection, got: {msg}"
+        );
     }
 }

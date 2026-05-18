@@ -19,13 +19,25 @@ use std::collections::HashMap;
 
 // ── cURL Export ───────────────────────────────────────────────────────
 
+/// Escape a string for safe interpolation inside a single-quoted POSIX
+/// shell word. `'foo'\''bar'` is the canonical POSIX way to embed a
+/// literal `'`: close the quoted run, emit `\'`, reopen the quoted run.
+fn shell_single_quote_escape(s: &str) -> String {
+    s.replace('\'', "'\\''")
+}
+
 /// Generate a runnable cURL command from a captured request.
 ///
 /// Preserves method, path, headers, and body. The resulting command can be
 /// copied and pasted directly into a terminal.
 pub fn to_curl(webhook: &CapturedWebhook, target_url: Option<&str>) -> String {
     let url = target_url.unwrap_or(&webhook.path);
-    let mut parts = vec![format!("curl -X {} '{url}'", webhook.method)];
+    // The webhook URL/path comes from the upstream request (attacker-
+    // controllable on a public tunnel endpoint). Without escaping, a
+    // path like `/hook'; touch /tmp/pwn #` would close our single-
+    // quoted argument and execute arbitrary shell when pasted.
+    let url_escaped = shell_single_quote_escape(url);
+    let mut parts = vec![format!("curl -X {} '{}'", webhook.method, url_escaped)];
 
     // Headers (sorted for deterministic output)
     let mut headers: Vec<(&String, &String)> = webhook.request_headers.iter().collect();
@@ -37,9 +49,12 @@ pub fn to_curl(webhook: &CapturedWebhook, target_url: Option<&str>) -> String {
         if lower == "host" || lower == "content-length" || lower == "transfer-encoding" {
             continue;
         }
-        // Escape single quotes in values
-        let escaped = value.replace('\'', "'\\''");
-        parts.push(format!("  -H '{key}: {escaped}'"));
+        // Both header NAME and VALUE flow from the captured request,
+        // so both need the same single-quote escape — a `'` in either
+        // would otherwise break out of the quoted `-H` argument.
+        let key_escaped = shell_single_quote_escape(key);
+        let value_escaped = shell_single_quote_escape(value);
+        parts.push(format!("  -H '{key_escaped}: {value_escaped}'"));
     }
 
     // Body
@@ -48,17 +63,21 @@ pub fn to_curl(webhook: &CapturedWebhook, target_url: Option<&str>) -> String {
             // Try to compact JSON for readability
             if let Ok(json) = serde_json::from_str::<serde_json::Value>(body_str) {
                 let compact = serde_json::to_string(&json).unwrap_or_else(|_| body_str.to_string());
-                let escaped = compact.replace('\'', "'\\''");
-                parts.push(format!("  -d '{escaped}'"));
+                parts.push(format!("  -d '{}'", shell_single_quote_escape(&compact)));
             } else {
-                let escaped = body_str.replace('\'', "'\\''");
-                parts.push(format!("  -d '{escaped}'"));
+                parts.push(format!("  -d '{}'", shell_single_quote_escape(body_str)));
             }
         } else {
-            // Binary body — use base64 with decode pipe
+            // Binary body — use base64 with decode pipe. Base64 output
+            // is `[A-Za-z0-9+/=]` so it has no shell-metacharacters,
+            // but escape defensively so a future change to the encoder
+            // can't introduce one.
             use base64::Engine;
             let b64 = base64::engine::general_purpose::STANDARD.encode(&webhook.request_body);
-            parts.push(format!("  --data-binary @<(echo '{b64}' | base64 -d)"));
+            parts.push(format!(
+                "  --data-binary @<(echo '{}' | base64 -d)",
+                shell_single_quote_escape(&b64)
+            ));
         }
     }
 
@@ -337,6 +356,46 @@ mod tests {
             .insert("x-test".to_string(), "it's a test".to_string());
         let curl = to_curl(&wh, None);
         assert!(curl.contains("it'\\''s a test"));
+    }
+
+    /// M45: the captured webhook URL/path is upstream-controlled. A
+    /// path like `/hook'; touch /tmp/pwn #` must NOT close our quoted
+    /// `curl '<url>'` argument and execute arbitrary shell when the
+    /// user pastes the command. Pre-fix the path interpolated raw.
+    #[test]
+    fn curl_escapes_single_quotes_in_url_path() {
+        let mut wh = make_webhook();
+        wh.path = "/hook'; touch /tmp/pwn #".to_string();
+        let curl = to_curl(&wh, None);
+        assert!(
+            !curl.contains("/hook'; touch /tmp/pwn #"),
+            "raw quote in URL path must not survive into the cURL command: {curl}"
+        );
+        assert!(
+            curl.contains("/hook'\\''; touch /tmp/pwn #"),
+            "URL path single-quote should be POSIX-escaped (`'\\''`); got: {curl}"
+        );
+    }
+
+    #[test]
+    fn curl_escapes_single_quotes_in_target_url_override() {
+        let wh = make_webhook();
+        let curl = to_curl(&wh, Some("http://localhost:4000/x'$(id)"));
+        assert!(!curl.contains("/x'$(id)"));
+        assert!(curl.contains("/x'\\''$(id)"));
+    }
+
+    /// Header names are also upstream-controlled (any HTTP client can
+    /// send a custom header key). A key like `X-Bad'; rm -rf /; #`
+    /// must not break out of the quoted `-H '<key>: <value>'` arg.
+    #[test]
+    fn curl_escapes_single_quotes_in_header_name() {
+        let mut wh = make_webhook();
+        wh.request_headers
+            .insert("X-Bad'; rm -rf /; #".to_string(), "v".to_string());
+        let curl = to_curl(&wh, None);
+        assert!(!curl.contains("X-Bad'; rm -rf /; #"));
+        assert!(curl.contains("X-Bad'\\''; rm -rf /; #"));
     }
 
     #[test]

@@ -206,6 +206,11 @@ pub async fn run(
             tagged.source, tagged.line
         ));
     }
+    // M7: project-local `.npmrc` refusals — see install.rs for the
+    // matching emission. Surfaced even in JSON mode.
+    for w in route_table.npmrc_security_warnings() {
+        output::warn(w);
+    }
     // — request-aware eager-build: `lpm add <spec>`'s
     // top-level request is exactly `{spec}`. The fetch site below
     // (`get_npm_metadata_routed(spec, …)`) and version resolution

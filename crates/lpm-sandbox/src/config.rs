@@ -435,6 +435,153 @@ fn is_descendant_of(path: &Path, ancestor: &Path) -> bool {
     path == ancestor || path.starts_with(ancestor)
 }
 
+// ── script-read-allow opt-in loader ───────────────────────────────
+
+/// Read `package.json > lpm > scripts > sandboxReadAllow` plus the
+/// `user_extra_paths` list (resolved from `~/.lpm/config.toml >
+/// script-read-allow`) and return the union as project-rooted
+/// absolute paths. Every entry must canonicalize to a path INSIDE
+/// `project_dir`; traversal-escape and absolute-outside-project
+/// entries are rejected.
+///
+/// These paths name files that lifecycle scripts are allowed to
+/// read despite matching the built-in secret-file deny list
+/// (`.env`, `.npmrc`, `*.pem`, etc.). The sandbox backends consume
+/// the list to suppress the corresponding deny rule on macOS and
+/// skip the corresponding bind-mount on Linux.
+///
+/// # Parameters
+///
+/// - `package_json`: project manifest path.
+/// - `project_dir`: project root; relative entries resolve against
+///   this, and all entries are validated to canonicalize under it.
+/// - `user_extra_paths`: project-relative path strings from
+///   `~/.lpm/config.toml > script-read-allow`. Each is joined to
+///   `project_dir` then validated alongside the package.json
+///   entries. Pass empty when the user has no global opt-ins.
+///
+/// # Resolution rules
+///
+/// - Missing `package.json`, missing `lpm` / `scripts` /
+///   `sandboxReadAllow` keys: the project contributes nothing; the
+///   result is the resolved `user_extra_paths` (if any).
+/// - The `sandboxReadAllow` key must be a JSON array of strings.
+///   Other shapes produce [`SandboxError::InvalidSpec`].
+/// - Each entry: if absolute, kept verbatim (after canonicalization);
+///   if relative, joined onto `project_dir`. The canonicalized
+///   result must remain under `project_dir`.
+/// - Empty strings are rejected (same rationale as
+///   [`load_sandbox_write_dirs`]: an empty path would resolve to
+///   `project_dir` itself, which is meaningless for a per-file
+///   opt-in).
+/// - Duplicate entries (e.g., `.env` from both the project and
+///   user lists) are deduplicated; the result is unique.
+///
+/// # Return shape
+///
+/// A `Vec<PathBuf>` of absolute, project-rooted paths suitable for
+/// passing as [`crate::SandboxSpec::secret_read_allow`].
+pub fn load_sandbox_read_allow(
+    package_json: &Path,
+    project_dir: &Path,
+    user_extra_paths: &[String],
+) -> Result<Vec<PathBuf>, SandboxError> {
+    let project_dir_canon = logical_normalize(project_dir);
+
+    // Per-project list from package.json.
+    let mut entries: Vec<(String, usize, &'static str)> = Vec::new();
+    let project_raw = match std::fs::read_to_string(package_json) {
+        Ok(s) => Some(s),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => {
+            return Err(SandboxError::InvalidSpec {
+                reason: format!("failed to read {}: {e}", package_json.display()),
+            });
+        }
+    };
+    if let Some(raw) = project_raw {
+        let json: serde_json::Value =
+            serde_json::from_str(&raw).map_err(|e| SandboxError::InvalidSpec {
+                reason: format!("{} is not valid JSON: {e}", package_json.display()),
+            })?;
+        if let Some(arr_val) = json
+            .get("lpm")
+            .and_then(|v| v.get("scripts"))
+            .and_then(|v| v.get("sandboxReadAllow"))
+        {
+            let arr = arr_val
+                .as_array()
+                .ok_or_else(|| SandboxError::InvalidSpec {
+                    reason: format!(
+                        "{}: `lpm.scripts.sandboxReadAllow` must be an array of strings, got {}",
+                        package_json.display(),
+                        arr_val
+                    ),
+                })?;
+            for (i, item) in arr.iter().enumerate() {
+                let s = item.as_str().ok_or_else(|| SandboxError::InvalidSpec {
+                    reason: format!(
+                        "{}: `lpm.scripts.sandboxReadAllow[{i}]` must be a string, got {}",
+                        package_json.display(),
+                        item
+                    ),
+                })?;
+                entries.push((s.to_string(), i, "package.json"));
+            }
+        }
+    }
+
+    // Per-user list from ~/.lpm/config.toml.
+    for (i, s) in user_extra_paths.iter().enumerate() {
+        entries.push((s.clone(), i, "~/.lpm/config.toml > script-read-allow"));
+    }
+
+    // Validate + resolve each entry.
+    let mut resolved: Vec<PathBuf> = Vec::with_capacity(entries.len());
+    let mut seen: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
+    for (authored, idx, source) in entries {
+        if authored.is_empty() {
+            return Err(SandboxError::InvalidSpec {
+                reason: format!(
+                    "{source}[{idx}] is empty; an empty entry would resolve to \
+                     project_dir itself, which is not a valid per-file opt-in"
+                ),
+            });
+        }
+        let authored_path = PathBuf::from(&authored);
+        let joined = if authored_path.is_absolute() {
+            authored_path.clone()
+        } else {
+            project_dir.join(&authored_path)
+        };
+        let canonical = logical_normalize(&joined);
+        if !is_descendant_of(&canonical, &project_dir_canon) {
+            return Err(SandboxError::InvalidSpec {
+                reason: format!(
+                    "{source}[{idx}] = {authored:?} resolves to {path} which is outside \
+                     project_dir = {project}. script-read-allow entries must name files \
+                     inside the project tree — host-system paths (`~/.ssh`, `/etc/...`) \
+                     are not exemptable through this knob.",
+                    path = canonical.display(),
+                    project = project_dir_canon.display(),
+                ),
+            });
+        }
+        // Dedup by canonical form so `.env` from project + user
+        // doesn't produce two entries in the spec. Push the
+        // canonical (`./.env` → `.env`, `secrets/../foo` →
+        // `foo`) so downstream consumers — Seatbelt's
+        // `(literal ...)` rule emitter, the Linux overlay
+        // enumerator — receive paths in the form the kernel sees
+        // at enforcement time.
+        if seen.insert(canonical.clone()) {
+            resolved.push(canonical);
+        }
+    }
+
+    Ok(resolved)
+}
+
 // ── Tests ─────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -965,5 +1112,191 @@ mod tests {
                 "a bare drive root must be flagged as 'whole-drive-namespace'"
             );
         }
+    }
+
+    // ── script-read-allow loader tests (Phase 3) ──────────────────
+
+    /// Missing `package.json` + empty user list → empty result, no
+    /// error. Common case for projects that don't opt in.
+    #[test]
+    fn read_allow_missing_package_json_and_empty_user_list() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project = tmp.path().to_path_buf();
+        let nonexistent = project.join("package.json");
+        let v = load_sandbox_read_allow(&nonexistent, &project, &[]).unwrap();
+        assert!(v.is_empty());
+    }
+
+    /// Project ships `sandboxReadAllow: [".env"]` — entry resolves
+    /// to project-rooted absolute path.
+    #[test]
+    fn read_allow_project_relative_entry_resolves_to_absolute() {
+        let e = fixture(r#"{"lpm":{"scripts":{"sandboxReadAllow":[".env"]}}}"#);
+        let v = load_sandbox_read_allow(&e.package_json, &e.project, &[]).unwrap();
+        assert_eq!(v, vec![e.project.join(".env")]);
+    }
+
+    /// User config `script-read-allow = [".npmrc"]` joins to project.
+    #[test]
+    fn read_allow_user_entry_resolves_to_project_relative_absolute() {
+        let e = fixture(r#"{}"#);
+        let user = vec![".npmrc".to_string()];
+        let v = load_sandbox_read_allow(&e.package_json, &e.project, &user).unwrap();
+        assert_eq!(v, vec![e.project.join(".npmrc")]);
+    }
+
+    /// Project + user lists are unioned. Same entry from both is
+    /// deduplicated.
+    #[test]
+    fn read_allow_project_and_user_lists_are_unioned_and_deduped() {
+        let e = fixture(r#"{"lpm":{"scripts":{"sandboxReadAllow":[".env", ".npmrc"]}}}"#);
+        let user = vec![".env".to_string(), "secrets/api.pem".to_string()];
+        let v = load_sandbox_read_allow(&e.package_json, &e.project, &user).unwrap();
+        // `.env` appears in both lists — should be deduplicated.
+        assert_eq!(
+            v.iter().filter(|p| p == &&e.project.join(".env")).count(),
+            1,
+            ".env must be deduplicated across project + user lists: {v:?}"
+        );
+        assert!(v.contains(&e.project.join(".env")));
+        assert!(v.contains(&e.project.join(".npmrc")));
+        assert!(v.contains(&e.project.join("secrets/api.pem")));
+        assert_eq!(v.len(), 3);
+    }
+
+    /// `..` traversal escape is rejected — the resolved path
+    /// canonicalizes outside `project_dir`.
+    #[test]
+    fn read_allow_traversal_escape_rejected() {
+        let e = fixture(r#"{"lpm":{"scripts":{"sandboxReadAllow":["../etc/passwd"]}}}"#);
+        match load_sandbox_read_allow(&e.package_json, &e.project, &[]) {
+            Err(SandboxError::InvalidSpec { reason }) => {
+                assert!(
+                    reason.contains("outside") && reason.contains("project_dir"),
+                    "error must name the escape: {reason}"
+                );
+                assert!(
+                    reason.contains("script-read-allow") || reason.contains("sandboxReadAllow"),
+                    "error must name the config key: {reason}"
+                );
+            }
+            other => panic!("expected InvalidSpec, got {other:?}"),
+        }
+    }
+
+    /// Absolute path outside `project_dir` is rejected — the
+    /// deny block only covers project-rooted secrets, so an
+    /// out-of-project entry is meaningless (the file was never
+    /// denied) AND would suggest a misconfiguration.
+    #[test]
+    fn read_allow_absolute_outside_project_rejected() {
+        let outside_abs = unix_abs_str("/etc/passwd");
+        let e = fixture(&format!(
+            r#"{{"lpm":{{"scripts":{{"sandboxReadAllow":["{outside_abs}"]}}}}}}"#
+        ));
+        match load_sandbox_read_allow(&e.package_json, &e.project, &[]) {
+            Err(SandboxError::InvalidSpec { reason }) => {
+                assert!(reason.contains("outside"), "rejection message: {reason}");
+            }
+            other => panic!("expected InvalidSpec, got {other:?}"),
+        }
+    }
+
+    /// User-list entry that resolves outside the project is also
+    /// rejected. Hardened-clone / dotfile-pollution scenarios.
+    #[test]
+    fn read_allow_user_entry_traversal_rejected() {
+        let e = fixture(r#"{}"#);
+        let user = vec!["../escape".to_string()];
+        match load_sandbox_read_allow(&e.package_json, &e.project, &user) {
+            Err(SandboxError::InvalidSpec { reason }) => {
+                assert!(
+                    reason.contains("outside") || reason.contains("script-read-allow"),
+                    "rejection message: {reason}"
+                );
+            }
+            other => panic!("expected InvalidSpec, got {other:?}"),
+        }
+    }
+
+    /// Empty-string entry is rejected (it would resolve to
+    /// project_dir itself).
+    #[test]
+    fn read_allow_empty_entry_rejected() {
+        let e = fixture(r#"{"lpm":{"scripts":{"sandboxReadAllow":[""]}}}"#);
+        match load_sandbox_read_allow(&e.package_json, &e.project, &[]) {
+            Err(SandboxError::InvalidSpec { reason }) => {
+                assert!(reason.contains("empty"), "rejection message: {reason}");
+            }
+            other => panic!("expected InvalidSpec, got {other:?}"),
+        }
+    }
+
+    /// Non-array `sandboxReadAllow` value is a clear error.
+    #[test]
+    fn read_allow_non_array_value_errors() {
+        let e = fixture(r#"{"lpm":{"scripts":{"sandboxReadAllow":"not-an-array"}}}"#);
+        match load_sandbox_read_allow(&e.package_json, &e.project, &[]) {
+            Err(SandboxError::InvalidSpec { reason }) => {
+                assert!(
+                    reason.contains("sandboxReadAllow") && reason.contains("array"),
+                    "rejection message: {reason}"
+                );
+            }
+            other => panic!("expected InvalidSpec, got {other:?}"),
+        }
+    }
+
+    /// Non-string array element is a clear error with index.
+    #[test]
+    fn read_allow_non_string_element_errors() {
+        let e = fixture(r#"{"lpm":{"scripts":{"sandboxReadAllow":["ok",42]}}}"#);
+        match load_sandbox_read_allow(&e.package_json, &e.project, &[]) {
+            Err(SandboxError::InvalidSpec { reason }) => {
+                assert!(reason.contains("sandboxReadAllow[1]"));
+                assert!(reason.contains("string"));
+            }
+            other => panic!("expected InvalidSpec, got {other:?}"),
+        }
+    }
+
+    /// Project absent `sandboxReadAllow` but user list non-empty:
+    /// user list is what's returned.
+    #[test]
+    fn read_allow_user_only_works_without_project_key() {
+        let e = fixture(r#"{"lpm":{"scripts":{}}}"#);
+        let user = vec![".env".to_string(), ".npmrc".to_string()];
+        let v = load_sandbox_read_allow(&e.package_json, &e.project, &user).unwrap();
+        assert_eq!(v.len(), 2);
+        assert!(v.contains(&e.project.join(".env")));
+        assert!(v.contains(&e.project.join(".npmrc")));
+    }
+
+    /// Order is preserved within each source (project entries
+    /// first, then user entries) — useful for reproducible
+    /// SBPL profile rendering.
+    #[test]
+    fn read_allow_preserves_order_project_first_then_user() {
+        let e = fixture(r#"{"lpm":{"scripts":{"sandboxReadAllow":["a.env","b.env"]}}}"#);
+        let user = vec!["c.env".to_string(), "d.env".to_string()];
+        let v = load_sandbox_read_allow(&e.package_json, &e.project, &user).unwrap();
+        assert_eq!(
+            v,
+            vec![
+                e.project.join("a.env"),
+                e.project.join("b.env"),
+                e.project.join("c.env"),
+                e.project.join("d.env"),
+            ]
+        );
+    }
+
+    /// Path nested deeper than 1 level is accepted as long as it
+    /// stays inside project_dir.
+    #[test]
+    fn read_allow_nested_project_path_accepted() {
+        let e = fixture(r#"{"lpm":{"scripts":{"sandboxReadAllow":["services/api/.env"]}}}"#);
+        let v = load_sandbox_read_allow(&e.package_json, &e.project, &[]).unwrap();
+        assert_eq!(v, vec![e.project.join("services/api/.env")]);
     }
 }

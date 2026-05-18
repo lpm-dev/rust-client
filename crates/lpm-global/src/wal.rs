@@ -55,6 +55,16 @@ use std::path::{Path, PathBuf};
 /// the next record.
 pub const RECORD_SENTINEL: u8 = 0x0A;
 
+/// Per-record payload cap (1 MiB). Real WAL records serialise to a
+/// few hundred bytes — install metadata + small `serde_json::Value`
+/// blobs. A corrupted or maliciously-crafted WAL claiming a multi-GB
+/// payload would otherwise wedge recovery on a buffer-bounds check
+/// for the length of the file itself; capping per-record keeps a
+/// stray large `len` prefix from hijacking the scanner into reading
+/// arbitrarily far past the legit tail. Mismatches are treated as
+/// torn-tail and break recovery cleanly.
+pub const MAX_RECORD_PAYLOAD_BYTES: usize = 1024 * 1024;
+
 /// Minimum bytes needed to even begin parsing a record: 4 (len) + 4
 /// (crc) + 0 (empty payload allowed) + 1 (sentinel).
 pub const MIN_RECORD_BYTES: usize = 4 + 4 + 1;
@@ -152,6 +162,40 @@ pub struct IntentPayload {
     /// deserialize cleanly.
     #[serde(default)]
     pub ownership_delta: Vec<OwnershipChange>,
+    /// Host-global trust entries this uninstall will prune from
+    /// `~/.lpm/global/trusted-dependencies.json`. Populated only on
+    /// `TxKind::Uninstall` Intents and only for trust entries that are
+    /// reachable through the uninstalling install's tree AND NOT
+    /// reachable through any other remaining global install's tree.
+    ///
+    /// Sorted by `(name, version)` for deterministic serialization.
+    /// Empty when no other globals exist, when the uninstalling
+    /// install's lockfile is unreadable, or when any other install's
+    /// lockfile is unreadable — the fail-safe collapses to "don't
+    /// prune" so a corrupt sibling install can't cause an over-broad
+    /// prune that breaks unrelated globals' next reinstall.
+    ///
+    /// Recovery replays this via `roll_forward_uninstall` so trust
+    /// pruning is crash-durable across the uninstall transaction.
+    ///
+    /// `#[serde(default)]` + `skip_serializing_if = "Vec::is_empty"`
+    /// so older WAL files (pre-M76) deserialize unchanged AND
+    /// non-uninstall Intents stay byte-identical to the pre-M76 shape.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub uninstall_trust_prune: Vec<TrustPruneEntry>,
+}
+
+/// One `(name, version)` entry pruned from the host-global trust file
+/// during uninstall. Carried on `TxKind::Uninstall` `IntentPayload`s
+/// so crash recovery can replay the prune step idempotently.
+///
+/// Encoded as `{ "name": ..., "version": ... }` rather than a tuple so
+/// future fields (e.g. an audit timestamp, the originating install)
+/// can land additively without a wire-shape break.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TrustPruneEntry {
+    pub name: String,
+    pub version: String,
 }
 
 /// One ownership mutation applied during commit and replayed during
@@ -271,11 +315,20 @@ impl WalWriter {
         if let Some(parent) = extended.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        let mut file = std::fs::OpenOptions::new()
-            .create(true)
-            .read(true)
-            .append(true)
-            .open(&extended)?;
+        let mut open_opts = std::fs::OpenOptions::new();
+        open_opts.create(true).read(true).append(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            // WAL records carry tx_id, install paths, and serialized
+            // package metadata. Not raw secrets, but on shared hosts
+            // they enumerate what tools are being installed and when
+            // — useful reconnaissance for an attacker planning a
+            // credential-theft pivot. 0o600 matches the broader
+            // credential-metadata posture.
+            open_opts.mode(0o600);
+        }
+        let mut file = open_opts.open(&extended)?;
         // Defensive: append mode positions writes at EOF on every write,
         // but seek so any caller introspecting `file.stream_position()`
         // sees a sensible value.
@@ -461,6 +514,16 @@ impl WalReader {
             let payload_len = u32::from_be_bytes(len_bytes) as usize;
             let stored_crc = u32::from_be_bytes(crc_bytes);
 
+            if payload_len > MAX_RECORD_PAYLOAD_BYTES {
+                tracing::debug!(
+                    "wal: record at offset {offset} claims payload_len {payload_len} > cap {MAX_RECORD_PAYLOAD_BYTES}",
+                );
+                stop = ScanStop::TornTail {
+                    offset: offset as u64,
+                };
+                break;
+            }
+
             let frame_end = offset
                 .checked_add(8)
                 .and_then(|x| x.checked_add(payload_len))
@@ -578,6 +641,7 @@ mod tests {
             prior_command_ownership_json: serde_json::json!({}),
             new_aliases_json: serde_json::json!({}),
             ownership_delta: Vec::new(),
+            uninstall_trust_prune: Vec::new(),
         }))
     }
 
@@ -926,6 +990,7 @@ mod tests {
                 "srv": {"package": "pkg-b", "bin": "serve"}
             }),
             ownership_delta: Vec::new(),
+            uninstall_trust_prune: Vec::new(),
         }));
         let bytes = serde_json::to_vec(&r).unwrap();
         let parsed: WalRecord = serde_json::from_slice(&bytes).unwrap();
@@ -965,5 +1030,135 @@ mod tests {
         let path = tmp.path().join("wal.jsonl");
         let w = WalWriter::open(&path).unwrap();
         assert_eq!(w.path(), path);
+    }
+
+    /// M76: Uninstall Intents carry the host-global trust prune set so
+    /// recovery can replay it after a crash. Pin the round-trip
+    /// contract — pre-fix the field didn't exist; a future refactor
+    /// that drops the `skip_serializing_if` would also break wire
+    /// shape stability for non-uninstall Intents.
+    #[test]
+    fn intent_payload_roundtrips_uninstall_trust_prune() {
+        let r = WalRecord::Intent(Box::new(IntentPayload {
+            tx_id: "tx-m76".into(),
+            kind: TxKind::Uninstall,
+            package: "eslint".into(),
+            new_root_path: PathBuf::from("/tmp/installs/eslint@9.0.0"),
+            new_row_json: serde_json::Value::Null,
+            prior_active_row_json: Some(serde_json::json!({"resolved": "9.0.0"})),
+            prior_command_ownership_json: serde_json::json!({"aliases": {}}),
+            new_aliases_json: serde_json::Value::Null,
+            ownership_delta: Vec::new(),
+            uninstall_trust_prune: vec![
+                TrustPruneEntry {
+                    name: "lodash".into(),
+                    version: "4.17.21".into(),
+                },
+                TrustPruneEntry {
+                    name: "axios".into(),
+                    version: "1.5.0".into(),
+                },
+            ],
+        }));
+        let bytes = serde_json::to_vec(&r).unwrap();
+        let parsed: WalRecord = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(r, parsed);
+    }
+
+    /// M76 forward-compat: pre-M76 WAL files on disk have no
+    /// `uninstall_trust_prune` field. Deserialization must default it
+    /// to an empty Vec without erroring. `#[serde(default)]` on the
+    /// field is the load-bearing guarantee.
+    #[test]
+    fn old_intent_payload_without_uninstall_trust_prune_still_deserializes() {
+        let json = serde_json::json!({
+            "op": "intent",
+            "tx_id": "tx-pre-m76",
+            "kind": "uninstall",
+            "package": "eslint",
+            "new_root_path": "/tmp/installs/eslint@9.0.0",
+            "new_row_json": null,
+            "prior_active_row_json": {"resolved": "9.0.0", "commands": []},
+            "prior_command_ownership_json": {"aliases": {}},
+            "new_aliases_json": null,
+            "ownership_delta": [],
+        });
+        let bytes = serde_json::to_vec(&json).unwrap();
+        let parsed: WalRecord = serde_json::from_slice(&bytes).unwrap();
+        match parsed {
+            WalRecord::Intent(p) => {
+                assert!(
+                    p.uninstall_trust_prune.is_empty(),
+                    "pre-M76 WAL entries must deserialize with an empty prune list"
+                );
+            }
+            _ => panic!("expected Intent"),
+        }
+    }
+
+    /// M76 wire-shape stability: when `uninstall_trust_prune` is empty
+    /// (every non-uninstall Intent + every uninstall on a single
+    /// global), the field must NOT serialize. Older binaries reading
+    /// the WAL must see byte-identical output for Intents written by
+    /// the M76+ binary — `skip_serializing_if = "Vec::is_empty"` is
+    /// the load-bearing guarantee.
+    #[test]
+    fn intent_payload_omits_empty_uninstall_trust_prune_on_serialize() {
+        let r = WalRecord::Intent(Box::new(IntentPayload {
+            tx_id: "tx-install".into(),
+            kind: TxKind::Install,
+            package: "eslint".into(),
+            new_root_path: PathBuf::from("/tmp/installs/eslint@9.0.0"),
+            new_row_json: serde_json::json!({"resolved": "9.0.0"}),
+            prior_active_row_json: None,
+            prior_command_ownership_json: serde_json::json!({}),
+            new_aliases_json: serde_json::json!({}),
+            ownership_delta: Vec::new(),
+            uninstall_trust_prune: Vec::new(),
+        }));
+        let bytes = serde_json::to_vec(&r).unwrap();
+        let body = std::str::from_utf8(&bytes).unwrap();
+        assert!(
+            !body.contains("uninstall_trust_prune"),
+            "empty uninstall_trust_prune must be skipped from serialized output \
+             so non-uninstall Intents stay byte-identical to pre-M76; got: {body}"
+        );
+    }
+
+    /// L10: a corrupted WAL frame claiming an oversized payload must
+    /// be treated as a torn tail so the scanner bails cleanly rather
+    /// than attempting to interpret the (possibly hostile) length
+    /// field. Pin the cap value in the same place so a future bump
+    /// has to acknowledge the threat model.
+    #[test]
+    fn oversized_record_payload_len_breaks_scan_with_torn_tail() {
+        // Sanity that the cap constant is the value we expect.
+        assert_eq!(MAX_RECORD_PAYLOAD_BYTES, 1024 * 1024);
+
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("wal");
+        // Forge a frame: len=MAX+1, garbage CRC, no body. The header
+        // alone is enough — the cap check fires before frame_end is
+        // computed, so we don't need to extend the file.
+        let mut frame: Vec<u8> = Vec::new();
+        let oversized_len: u32 = (MAX_RECORD_PAYLOAD_BYTES as u32).saturating_add(1);
+        frame.extend_from_slice(&oversized_len.to_be_bytes());
+        frame.extend_from_slice(&0u32.to_be_bytes());
+        // Pad so the buffer is at least MIN_RECORD_BYTES so the
+        // earlier "torn tail because too small" branch doesn't fire.
+        while frame.len() < MIN_RECORD_BYTES {
+            frame.push(0);
+        }
+        std::fs::write(&path, &frame).unwrap();
+
+        let scan = WalReader::at(&path).scan().unwrap();
+        assert!(
+            scan.records.is_empty(),
+            "no records should parse from an oversized-len frame",
+        );
+        match scan.stop {
+            ScanStop::TornTail { offset } => assert_eq!(offset, 0),
+            other => panic!("expected TornTail at offset 0, got {other:?}"),
+        }
     }
 }

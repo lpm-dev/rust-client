@@ -115,9 +115,46 @@ fn collect_chain(
 
     // Add this environment's file (if it has one)
     if let Some(file) = def.file() {
+        validate_env_file_path(env_name, file)?;
         chain.push(file.to_string());
     }
 
+    Ok(())
+}
+
+/// Reject `lpm.json` environment file paths that would escape the
+/// project root. Absolute paths and `..` segments are refused; the
+/// caller resolves the remaining (project-relative) path via
+/// `project_dir.join(...)`.
+///
+/// M51: a hostile `lpm.json` like
+/// `{"environments":{"prod":{"file":"../.env"}}}` would otherwise let
+/// `lpm run --env`, `lpm env print`, `lpm ci env`, or `lpm dev` load
+/// dotenv contents from outside the repo and emit / inject them
+/// into the child process or generated env files. Containment lives
+/// at the manifest boundary so every downstream consumer
+/// (`dotenv.rs`, `script.rs`, CLI emitters) gets the same guarantee.
+pub fn validate_env_file_path(env_name: &str, file: &str) -> Result<(), String> {
+    if file.is_empty() {
+        return Err(format!(
+            "environment '{env_name}' has an empty file path in lpm.json"
+        ));
+    }
+    let p = std::path::Path::new(file);
+    if p.is_absolute() {
+        return Err(format!(
+            "environment '{env_name}' file path '{file}' is absolute; must be relative to the project root"
+        ));
+    }
+    // Reject any `..` component (textual — caller still joins to
+    // project_dir, but symlink-following is left to consumers).
+    if p.components()
+        .any(|c| matches!(c, std::path::Component::ParentDir))
+    {
+        return Err(format!(
+            "environment '{env_name}' file path '{file}' contains '..'; paths must stay inside the project root"
+        ));
+    }
     Ok(())
 }
 
@@ -271,6 +308,55 @@ mod tests {
         );
         let names = list_environments(&config);
         assert_eq!(names, vec!["base", "production", "staging"]);
+    }
+
+    /// M51: env file paths that escape the project root are refused
+    /// at chain resolution time. Closes the malicious-lpm.json shape
+    /// where a `"file": "../.env"` would let `lpm run --env` /
+    /// `lpm env print` read a dotenv outside the repo.
+    #[test]
+    fn rejects_parent_dir_escape_in_env_file_path() {
+        let config = config_from_json(r#"{"prod": {"file": "../.env"}}"#);
+        let err = resolve_chain(&config, "prod").expect_err("must reject `..` segment");
+        assert!(
+            err.contains("..") && err.contains("project root"),
+            "expected escape error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn rejects_absolute_env_file_path() {
+        let config = config_from_json(r#"{"prod": {"file": "/etc/passwd"}}"#);
+        let err = resolve_chain(&config, "prod").expect_err("must reject absolute path");
+        assert!(
+            err.contains("absolute"),
+            "expected absolute-path error, got: {err}"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn rejects_absolute_env_file_path_windows() {
+        let config = config_from_json(r#"{"prod": {"file": "C:/Windows/system32/config/SAM"}}"#);
+        let err = resolve_chain(&config, "prod").expect_err("must reject windows absolute path");
+        assert!(err.contains("absolute"));
+    }
+
+    /// Nested `..` in the middle of the path is also caught — not just
+    /// leading `../`.
+    #[test]
+    fn rejects_nested_parent_dir_segment() {
+        let config = config_from_json(r#"{"prod": {"file": "subdir/../../etc/.env"}}"#);
+        let err = resolve_chain(&config, "prod").expect_err("must reject nested `..`");
+        assert!(err.contains(".."));
+    }
+
+    /// Legitimate relative paths still resolve fine.
+    #[test]
+    fn accepts_safe_relative_env_file_path() {
+        let config = config_from_json(r#"{"prod": {"file": "config/.env.prod"}}"#);
+        let chain = resolve_chain(&config, "prod").expect("safe relative path must succeed");
+        assert_eq!(chain, vec!["config/.env.prod"]);
     }
 
     #[test]

@@ -130,7 +130,12 @@ pub fn validate_bin_name(name: &str, pkg_name: &str) -> Result<(), String> {
 
 /// Validate that a bin script path does not escape its package directory via path traversal.
 /// Returns `Ok(canonical_target)` with the validated canonical path, or `Err(reason)`.
-fn validate_bin_target(pkg_dir: &Path, script_path: &str) -> Result<PathBuf, String> {
+///
+/// `pub(crate)` so [`crate::v2::create_bin_links_v2`] enforces the same
+/// containment as the v1 hoisted/isolated emitter — v2 is the default
+/// store version and a malicious package's bin entry like
+/// `"bin": {"x": "../../bin/sh"}` must be skipped, not materialised.
+pub(crate) fn validate_bin_target(pkg_dir: &Path, script_path: &str) -> Result<PathBuf, String> {
     // Quick reject: script_path must not contain `..` components
     let joined = pkg_dir.join(script_path);
     for component in joined.components() {

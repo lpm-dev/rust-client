@@ -1,7 +1,7 @@
 use crate::output;
 use lpm_common::LpmError;
 use lpm_common::color::Painted;
-use lpm_registry::RegistryClient;
+use lpm_registry::{RegistryClient, parse_capped_api_json};
 
 /// Rotate the current token (create new, revoke old).
 pub async fn run_rotate(
@@ -18,10 +18,8 @@ pub async fn run_rotate(
 
     let response = client.post_json_raw(&url, &serde_json::json!({})).await?;
 
-    let body: serde_json::Value = response
-        .json()
-        .await
-        .map_err(|e| LpmError::Registry(format!("failed to parse response: {e}")))?;
+    let body: serde_json::Value =
+        parse_capped_api_json(response, "token rotation response").await?;
 
     if let Some(new_token) = body.get("token").and_then(|t| t.as_str()) {
         // Store the new token

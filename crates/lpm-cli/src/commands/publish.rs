@@ -113,6 +113,29 @@ pub fn resolve_targets(
                 "github" => targets.push(PublishTarget::GitHub),
                 "gitlab" => targets.push(PublishTarget::GitLab),
                 url if url.starts_with("https://") => {
+                    // M30: project-level `lpm.json` can list ANY https://
+                    // URL as a publish target — a hostile commit on a
+                    // downstream fork or a compromised dev machine could
+                    // silently redirect every `lpm publish` to an
+                    // attacker host, capturing tokens + tarballs. We
+                    // can't enforce a hard allowlist (legitimate
+                    // self-hosted registries exist) but we DO emit a
+                    // loud warn so an unexpected target appears in
+                    // operator logs / human terminal before the publish
+                    // network call fires.
+                    let host = reqwest::Url::parse(url)
+                        .ok()
+                        .and_then(|u| u.host_str().map(|s| s.to_string()))
+                        .unwrap_or_else(|| url.to_string());
+                    if !is_known_publish_host(&host) {
+                        tracing::warn!(
+                            target_url = %url,
+                            host = %host,
+                            "publish.registries: routing publish to non-default host \
+                             — confirm this is intentional (the LPM bearer goes via \
+                             this host)",
+                        );
+                    }
                     targets.push(PublishTarget::Custom(url.to_string()));
                 }
                 url if url.starts_with("http://") => {
@@ -143,6 +166,18 @@ pub fn resolve_targets(
 
     // Default: LPM only
     Ok(vec![PublishTarget::Lpm])
+}
+
+/// Hosts considered "default" / first-party publish destinations.
+/// A custom URL pointing at any of these is NOT noisy; everything
+/// else triggers a `tracing::warn` so an unexpected target is
+/// visible in operator logs before the publish bearer is sent.
+fn is_known_publish_host(host: &str) -> bool {
+    matches!(
+        host,
+        "lpm.dev" | "registry.npmjs.org" | "npm.pkg.github.com" | "registry.gitlab.com"
+    ) || host.ends_with(".lpm.dev")
+        || host.ends_with(".lpm.fyi")
 }
 
 /// Deduplicate targets while preserving order.
@@ -910,6 +945,21 @@ pub async fn run(
                             let gitlab_host = gl_cfg
                                 .and_then(|c| c.registry.as_deref())
                                 .unwrap_or("https://gitlab.com");
+                            // H18: a project lpm.json can override the
+                            // gitlab host while still naming `gitlab`
+                            // as a publish target; the GITLAB_TOKEN
+                            // then flows to the overridden host. Warn
+                            // loudly when the resolved host is not
+                            // the default; the operator sees the
+                            // redirect target in logs before the
+                            // bearer is sent.
+                            if gitlab_host.trim_end_matches('/') != "https://gitlab.com" {
+                                tracing::warn!(
+                                    target_url = %gitlab_host,
+                                    "publish.gitlab.registry overridden — GitLab token will be sent to a non-default host; \
+                                     confirm this is intentional",
+                                );
+                            }
                             let url = format!(
                                 "{}/api/v4/projects/{}/packages/npm",
                                 gitlab_host.trim_end_matches('/'),

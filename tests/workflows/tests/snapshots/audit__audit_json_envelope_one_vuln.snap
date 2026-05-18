@@ -7,6 +7,8 @@ expression: envelope
   "success": true,
   "manager": "lpm",
   "degraded": false,
+  "osv_degraded": false,
+  "osv_degraded_reason": null,
   "scanned": 1,
   "checked_lpm": 0,
   "packages_with_issues": 0,

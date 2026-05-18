@@ -10,11 +10,24 @@ use std::path::{Path, PathBuf};
 ///
 /// The vault ID is stored as `"vault": "uuid-string"` at the top level of lpm.json.
 /// If lpm.json doesn't exist, creates a minimal one with just the vault field.
+///
+/// Existing IDs are validated by [`is_safe_vault_id`] before being
+/// returned. The file-fallback vault backend joins the ID into a
+/// `~/.lpm/vaults/{id}.enc` path, so an unvalidated `../` or absolute
+/// path in `lpm.json["vault"]` (e.g., from a malicious cloned repo)
+/// would let `lpm env` write/delete `.enc` files outside the vaults
+/// directory. M31.
 pub fn get_or_create_vault_id(project_dir: &Path) -> Result<String, String> {
     let (lpm_json_path, mut config) =
         read_lpm_json_value(project_dir)?.unwrap_or_else(|| empty_lpm_json(project_dir));
 
     if let Some(vault_id) = config.get("vault").and_then(|v| v.as_str()) {
+        if !is_safe_vault_id(vault_id) {
+            return Err(format!(
+                "lpm.json vault id {vault_id:?} contains path-traversal or non-portable characters; \
+                 refusing to use as a vault filename. Remove the `vault` field to regenerate."
+            ));
+        }
         return Ok(vault_id.to_string());
     }
 
@@ -25,15 +38,52 @@ pub fn get_or_create_vault_id(project_dir: &Path) -> Result<String, String> {
     Ok(vault_id)
 }
 
-/// Read the vault ID from lpm.json without creating one.
+/// Read the vault ID from lpm.json without creating one. Returns
+/// `None` when missing or when the stored value fails the
+/// [`is_safe_vault_id`] check (per M31).
 pub fn read_vault_id(project_dir: &Path) -> Option<String> {
     let lpm_json_path = project_dir.join("lpm.json");
     let content = std::fs::read_to_string(lpm_json_path).ok()?;
     let config: serde_json::Value = serde_json::from_str(&content).ok()?;
-    config
-        .get("vault")
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_string())
+    let raw = config.get("vault").and_then(|v| v.as_str())?;
+    if !is_safe_vault_id(raw) {
+        tracing::warn!(
+            vault_id = %raw,
+            "lpm.json vault id contains path-traversal or non-portable characters; ignoring",
+        );
+        return None;
+    }
+    Some(raw.to_string())
+}
+
+/// Validate that a `vault` field from `lpm.json` is safe to join into
+/// a filesystem path. Rejects empty strings, path separators (`/` and
+/// `\\`), `..`/`.` components, null bytes, anything starting with `~`,
+/// and absolute Windows drive letters. Standard UUIDs and slug-shaped
+/// IDs (alnum + `-` + `_`) pass.
+pub fn is_safe_vault_id(id: &str) -> bool {
+    if id.is_empty() || id.len() > 128 {
+        return false;
+    }
+    if id == "." || id == ".." {
+        return false;
+    }
+    if id.starts_with('~') {
+        return false;
+    }
+    // Block any control / path-meaningful byte.
+    for c in id.chars() {
+        if c.is_control() || matches!(c, '/' | '\\' | ':' | '\0') {
+            return false;
+        }
+    }
+    // Reject `..` substrings to defend against `foo..bar` shapes that
+    // some filesystems normalise. Plain `-..-` wouldn't normalise but
+    // refusing is cheap defense-in-depth.
+    if id.contains("..") {
+        return false;
+    }
+    true
 }
 
 /// Read the last known personal cloud vault version from `lpm.json`.
@@ -321,6 +371,55 @@ mod tests {
         assert_eq!(read_org_sync_version(dir.path(), "acme"), Some(4));
         assert_eq!(read_org_sync_version(dir.path(), "umbrella"), Some(9));
         assert_eq!(read_org_sync_version(dir.path(), "missing"), None);
+    }
+
+    /// M31: standard UUIDs and slug-shaped IDs pass; path-traversal
+    /// and absolute-path shapes are refused.
+    #[test]
+    fn is_safe_vault_id_accepts_uuids_and_slugs() {
+        assert!(is_safe_vault_id("550e8400-e29b-41d4-a716-446655440000"));
+        assert!(is_safe_vault_id("my-vault"));
+        assert!(is_safe_vault_id("vault_v2"));
+        assert!(is_safe_vault_id("abc123"));
+    }
+
+    #[test]
+    fn is_safe_vault_id_rejects_path_traversal_and_separators() {
+        assert!(!is_safe_vault_id(""));
+        assert!(!is_safe_vault_id("."));
+        assert!(!is_safe_vault_id(".."));
+        assert!(!is_safe_vault_id("../escape"));
+        assert!(!is_safe_vault_id("foo/bar"));
+        assert!(!is_safe_vault_id("foo\\bar"));
+        assert!(!is_safe_vault_id("/etc/passwd"));
+        assert!(!is_safe_vault_id("~/.lpm/vaults/x"));
+        assert!(!is_safe_vault_id("vault\0null"));
+        assert!(!is_safe_vault_id("foo..bar"));
+        // 129 chars — over the limit
+        assert!(!is_safe_vault_id(&"a".repeat(129)));
+    }
+
+    /// End-to-end: a malicious lpm.json vault id is refused by
+    /// get_or_create_vault_id rather than blindly used to join a
+    /// `.enc` write path.
+    #[test]
+    fn get_or_create_vault_id_refuses_path_traversal_value() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("lpm.json"),
+            r#"{"vault": "../../etc/escape"}"#,
+        )
+        .unwrap();
+        let err =
+            get_or_create_vault_id(dir.path()).expect_err("malicious vault id must be refused");
+        assert!(err.contains("path-traversal"), "got: {err}");
+    }
+
+    #[test]
+    fn read_vault_id_returns_none_for_malicious_value() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("lpm.json"), r#"{"vault": "/etc/secret"}"#).unwrap();
+        assert!(read_vault_id(dir.path()).is_none());
     }
 
     #[test]

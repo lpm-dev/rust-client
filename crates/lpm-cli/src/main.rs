@@ -192,6 +192,17 @@ enum Commands {
         /// Directory to extract into (default: current directory).
         #[arg(long, short)]
         output: Option<String>,
+
+        /// Proceed even when the registry returns no integrity hash
+        /// for the tarball. By default `lpm download` refuses to
+        /// extract an unverified tarball — the command is documented
+        /// for audit use, where silently accepting bytes without an
+        /// SRI defeats the purpose. Use this flag for sources
+        /// (legacy mirrors, GitHub release assets) that genuinely
+        /// don't ship integrity, accepting that you take on the
+        /// verification burden yourself.
+        #[arg(long = "allow-unverified")]
+        allow_unverified: bool,
     },
 
     /// Resolve dependency tree for packages.
@@ -2607,9 +2618,29 @@ async fn async_main() -> Result<()> {
                                 // (Windows AV holding a file) but the
                                 // user should know there's pending
                                 // cleanup. Audit Medium.
+                                //
+                                // L45: ALSO emit via `tracing::warn!` so
+                                // the deferred state lands on stderr as
+                                // a structured event regardless of
+                                // `--json` mode. The stdout JSON
+                                // contract stays single-document (the
+                                // command's own envelope), and
+                                // RUST_LOG-aware automation can detect
+                                // dirty global state without scraping
+                                // human stderr. Matches the M65 / L11
+                                // pattern ("tracing::warn survives
+                                // --json for security-grade signals").
+                                tracing::warn!(
+                                    target: "lpm_cli::global_recovery",
+                                    package = %tx.package,
+                                    tx_id = %tx.tx_id,
+                                    reason = %reason,
+                                    "global recovery deferred — re-run lpm so the next sweep can retry the cleanup",
+                                );
                                 output::warn(&format!(
                                     "global recovery deferred tx for '{}': {}",
-                                    tx.package, reason
+                                    lpm_common::sanitize_for_terminal(&tx.package),
+                                    lpm_common::sanitize_for_terminal(reason)
                                 ));
                             }
                         }
@@ -2620,6 +2651,24 @@ async fn async_main() -> Result<()> {
                 // Recovery failure (most often: WAL written by newer
                 // lpm) must NOT silently let the command proceed
                 // against potentially stale state. Surface and abort.
+                //
+                // L44: in `--json` mode, route through the same
+                // `{"success": false, "error", "error_code"}` envelope
+                // that wraps dispatch errors below — otherwise the
+                // recovery path emits a miette/human diagnostic on
+                // stderr and the JSON consumer sees an empty stdout
+                // alongside a non-zero exit, breaking the
+                // `--json contract` exactly when the user most needs to
+                // parse the failure (corrupt / newer WAL, etc.).
+                if cli.json {
+                    let json = serde_json::json!({
+                        "success": false,
+                        "error": format!("{e}"),
+                        "error_code": e.error_code(),
+                    });
+                    println!("{}", serde_json::to_string_pretty(&json).unwrap());
+                    std::process::exit(1);
+                }
                 return Err(e).into_diagnostic();
             }
         }
@@ -2664,12 +2713,14 @@ async fn async_main() -> Result<()> {
             package,
             package_version,
             output,
+            allow_unverified,
         } => {
             commands::download::run(
                 &client,
                 &package,
                 package_version.as_deref(),
                 output.as_deref(),
+                allow_unverified,
                 cli.json,
             )
             .await
@@ -4409,11 +4460,31 @@ mod tests {
                 package,
                 package_version,
                 output,
+                allow_unverified,
             }) => {
                 assert_eq!(package, "react");
                 assert_eq!(package_version.as_deref(), Some("1.0.0"));
                 assert!(output.is_none());
+                assert!(
+                    !allow_unverified,
+                    "allow_unverified must default to false — refuse-by-default audit posture",
+                );
             }
+            _ => panic!("expected download command"),
+        }
+    }
+
+    /// `--allow-unverified` is opt-in and must be plumbed through the
+    /// parser so a user who explicitly accepts the risk of an
+    /// integrity-less tarball can do so without the parser swallowing
+    /// the flag.
+    #[test]
+    fn download_subcommand_parses_allow_unverified_flag() {
+        let cli = Cli::try_parse_from(["lpm", "download", "react", "--allow-unverified"]).unwrap();
+        match cli.command {
+            Some(Commands::Download {
+                allow_unverified, ..
+            }) => assert!(allow_unverified, "flag must surface as true"),
             _ => panic!("expected download command"),
         }
     }

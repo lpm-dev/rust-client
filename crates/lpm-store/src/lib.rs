@@ -421,8 +421,14 @@ impl PackageStore {
             return Err(error);
         }
 
-        // Write SRI integrity hash of the original tarball for later verification.
-        // This allows `store verify --deep` to detect post-extraction tampering.
+        // Write SRI integrity hash of the original tarball. This
+        // records the tarball-time digest only — `store verify --deep`
+        // uses it for lockfile↔marker consistency (the marker matches
+        // the lockfile's claimed integrity). It does NOT re-hash the
+        // extracted on-disk bytes, so a post-extraction tamper that
+        // leaves the `.integrity` marker untouched goes undetected. A
+        // byte-integrity recompute would need a Merkle digest of the
+        // extracted directory + a place to store it; not implemented.
         let sri = compute_sri_hash(tarball_data);
         if let Err(e) = std::fs::write(tmp_dir.join(".integrity"), &sri) {
             let _ = std::fs::remove_dir_all(&tmp_dir);
@@ -581,6 +587,36 @@ impl PackageStore {
         let size_limited = SizeLimitedReader::new(reader, max_compressed_size);
         let mut hashing_reader = HashingReader::new(size_limited);
 
+        // H24 defense-in-depth pre-flight: verify the bytes start with
+        // the gzip magic (0x1F 0x8B) BEFORE the rest of the stream
+        // gets fed to the extractor and behavioral analyzer. The full
+        // integrity verification still happens after extraction (the
+        // streaming design fundamentally requires it), but a non-gzip
+        // body — for example raw HTML from a misconfigured registry
+        // or a hostile non-tarball response — now fails fast instead
+        // of running the entire extractor + analyzer path on
+        // attacker-chosen bytes. The 2 prefix bytes are hashed via
+        // the `HashingReader::read_exact` path so the final SRI still
+        // covers the full stream; they're then re-emitted into the
+        // extractor via a `Chain` so the extractor's gzip decoder
+        // sees a complete stream.
+        let mut magic = [0u8; 2];
+        if let Err(e) = std::io::Read::read_exact(&mut hashing_reader, &mut magic) {
+            let _ = std::fs::remove_dir_all(&tmp_dir);
+            let _ = hashing_reader.finalize();
+            return Err(LpmError::Io(e));
+        }
+        if magic != [0x1F, 0x8B] {
+            let _ = std::fs::remove_dir_all(&tmp_dir);
+            let _ = hashing_reader.finalize();
+            return Err(LpmError::Registry(format!(
+                "package body for {name}@{version} is not a gzip stream (first bytes: {:02x} {:02x}); refusing to extract",
+                magic[0], magic[1],
+            )));
+        }
+        let extractor_reader =
+            std::io::Read::chain(std::io::Cursor::new(magic), &mut hashing_reader);
+
         // Fused behavioral scan. `PackageAnalyzer::should_scan` is the
         // buffer predicate — true for JS/TS/JSX/TSX sources outside
         // `node_modules`/`__tests__`/`test`/hidden paths. The inspector
@@ -595,7 +631,7 @@ impl PackageStore {
         // (including `SizeLimitedReader` tripping its cap via `Read` returning
         // an error) propagate through here unchanged.
         let extract_result = lpm_extractor::extract_tarball_from_reader_with_inspector(
-            &mut hashing_reader,
+            extractor_reader,
             &tmp_dir,
             lpm_security::behavioral::PackageAnalyzer::should_scan,
             |entry| {
@@ -628,26 +664,42 @@ impl PackageStore {
             return Err(LpmError::Io(e));
         }
 
-        let (computed_sri, _compressed_size) = hashing_reader.finalize();
+        let (computed_sri, computed_sha256, _compressed_size) = hashing_reader.finalize();
         timings.extract_ms = extract_start.elapsed().as_millis();
 
-        // Compare against expected integrity before the scan / rename.
-        // Scope: sha512-only (see doc comment). Non-sha512 expected values
-        // fall through; the caller chose the wrong path.
+        // M18: verify against the algorithm declared in `expected`.
+        // Pre-fix, a non-sha512 expected (`sha256-…` from an older
+        // lockfile or a coerced one) was logged and silently trusted
+        // against the computed sha512 — meaning a lockfile coerced to
+        // `sha256-<wrong-hash>` survived the gate because no check
+        // actually ran. Now we compute BOTH digests in parallel
+        // (`HashingReader`) and compare against the one the lockfile
+        // declared.
+        //
+        // L22: constant-time `ct_eq` instead of `!=` so a future
+        // attacker-influenced caller (server-side verifier, observable
+        // timing channel) doesn't see per-byte digest information leak
+        // through `String::eq`'s early exit.
         if let Some(expected) = expected_integrity {
-            if expected.starts_with("sha512-") && expected != computed_sri {
+            use subtle::ConstantTimeEq;
+            let candidate = if expected.starts_with("sha512-") {
+                &computed_sri
+            } else if expected.starts_with("sha256-") {
+                &computed_sha256
+            } else {
                 let _ = std::fs::remove_dir_all(&tmp_dir);
                 return Err(LpmError::Registry(format!(
-                    "integrity mismatch for {name}@{version}: expected {expected}, got {computed_sri}"
+                    "unsupported integrity algorithm for {name}@{version}: {expected} — \
+                     expected sha512-… (preferred) or sha256-…"
                 )));
-            }
-            // Non-sha512 expected → log + trust computed (same fallback as
-            // download_tarball_to_file's path when verify_integrity_file
-            // succeeds with a different algo).
-            if !expected.starts_with("sha512-") {
-                tracing::warn!(
-                    "non-sha512 expected integrity for {name}@{version} — P1 streaming path trusts computed sha512"
-                );
+            };
+            let matches_expected = expected.len() == candidate.len()
+                && expected.as_bytes().ct_eq(candidate.as_bytes()).into();
+            if !matches_expected {
+                let _ = std::fs::remove_dir_all(&tmp_dir);
+                return Err(LpmError::Registry(format!(
+                    "integrity mismatch for {name}@{version}: expected {expected}, got {candidate}"
+                )));
             }
         }
 
@@ -1036,6 +1088,18 @@ pub fn compute_sri_hash(data: &[u8]) -> String {
     let hash = Sha512::digest(data);
     let b64 = base64::engine::general_purpose::STANDARD.encode(hash);
     format!("sha512-{b64}")
+}
+
+/// Compute a sha256 SRI for tarball data. Paired with
+/// [`compute_sri_hash`] so callers can verify against the algorithm
+/// declared in an `expected` SRI string instead of silently trusting
+/// a computed sha512 when the lockfile declares sha256 (M18).
+pub fn compute_sri_hash_sha256(data: &[u8]) -> String {
+    use base64::Engine;
+    use sha2::{Digest, Sha256};
+    let hash = Sha256::digest(data);
+    let b64 = base64::engine::general_purpose::STANDARD.encode(hash);
+    format!("sha256-{b64}")
 }
 
 /// Read the stored `.integrity` file for a package.
@@ -1544,45 +1608,65 @@ pub fn find_installed_package_baseline(
     Ok(None)
 }
 
-/// Transparent `Read` wrapper that feeds every byte into a SHA-512
-/// hasher as it flows through. Computes the tarball SRI inline with
-/// streaming extraction — no second pass, no temp file.
+/// Transparent `Read` wrapper that feeds every byte into BOTH a
+/// SHA-512 and a SHA-256 hasher as it flows through. Computes the
+/// tarball SRI inline with streaming extraction — no second pass, no
+/// temp file.
+///
+/// SHA-512 is canonical; SHA-256 is computed in parallel because
+/// some legitimate npm lockfile entries still ship `sha256-…` SRI
+/// (older publishes / mirrors), and M18's pre-fix behaviour was to
+/// silently trust the computed sha512 when the expected algorithm
+/// was sha256. That let a coerced lockfile pass through unchecked.
+/// Now the verifier compares against whichever computed digest
+/// matches the expected algorithm, so a sha256 expected value
+/// actually gets verified against the matching computation.
 ///
 /// After the extractor finishes consuming the stream, call
-/// [`HashingReader::finalize`] to obtain `(sri_string, bytes_seen)`.
+/// [`HashingReader::finalize`] to obtain `(sha512_sri, sha256_sri, total_bytes)`.
 struct HashingReader<R> {
     inner: R,
-    hasher: Sha512,
+    sha512: Sha512,
+    sha256: sha2::Sha256,
     bytes: u64,
 }
 
 impl<R: std::io::Read> HashingReader<R> {
     fn new(inner: R) -> Self {
+        use sha2::Digest;
         Self {
             inner,
-            hasher: Sha512::new(),
+            sha512: Sha512::new(),
+            sha256: sha2::Sha256::new(),
             bytes: 0,
         }
     }
 
-    /// Finalize the hash and return `(sri, total_bytes_read)`.
-    /// Consumes `self` because the hasher is one-shot.
-    fn finalize(self) -> (String, u64) {
+    /// Finalize both hashers and return `(sha512_sri, sha256_sri, total_bytes)`.
+    /// Consumes `self` because the hashers are one-shot.
+    fn finalize(self) -> (String, String, u64) {
         use base64::Engine;
-        let digest = self.hasher.finalize();
-        let sri = format!(
+        let sha512_digest = self.sha512.finalize();
+        let sha256_digest = self.sha256.finalize();
+        let sha512_sri = format!(
             "sha512-{}",
-            base64::engine::general_purpose::STANDARD.encode(digest)
+            base64::engine::general_purpose::STANDARD.encode(sha512_digest)
         );
-        (sri, self.bytes)
+        let sha256_sri = format!(
+            "sha256-{}",
+            base64::engine::general_purpose::STANDARD.encode(sha256_digest)
+        );
+        (sha512_sri, sha256_sri, self.bytes)
     }
 }
 
 impl<R: std::io::Read> std::io::Read for HashingReader<R> {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        use sha2::Digest;
         let n = self.inner.read(buf)?;
         if n > 0 {
-            self.hasher.update(&buf[..n]);
+            self.sha512.update(&buf[..n]);
+            self.sha256.update(&buf[..n]);
             self.bytes += n as u64;
         }
         Ok(n)
@@ -1963,6 +2047,43 @@ mod tests {
         let stored = read_stored_integrity(&path).unwrap();
         let expected = compute_sri_hash(&tarball);
         assert_ne!(stored, expected, "tampered integrity should not match");
+    }
+
+    /// M18: HashingReader produces both sha512 AND sha256 SRIs that
+    /// match the upstream `sha2` library output. Pre-fix only sha512
+    /// was computed, so a lockfile declaring sha256 was silently
+    /// trusted against the wrong digest.
+    #[test]
+    fn hashing_reader_produces_matching_dual_digests() {
+        let data = b"hello world";
+        let mut reader = HashingReader::new(std::io::Cursor::new(data));
+        let _ = std::io::copy(&mut reader, &mut std::io::sink()).unwrap();
+        let (sha512_sri, sha256_sri, bytes) = reader.finalize();
+
+        // Bytes counted match input length.
+        assert_eq!(bytes, data.len() as u64);
+
+        // sha512 SRI matches the standalone helper.
+        assert_eq!(sha512_sri, compute_sri_hash(data));
+        // sha256 SRI matches the standalone helper.
+        assert_eq!(sha256_sri, compute_sri_hash_sha256(data));
+
+        // Sanity-check the algorithm prefixes.
+        assert!(sha512_sri.starts_with("sha512-"));
+        assert!(sha256_sri.starts_with("sha256-"));
+    }
+
+    /// M18: the dual-digest helper produces stable, known-good
+    /// sha256 SRI for empty input. Combined with the test above,
+    /// this pins the (algo, output) contract for both digests so a
+    /// future refactor that drops sha256 computation fails the
+    /// verifier the same way it failed the test.
+    #[test]
+    fn compute_sri_hash_sha256_known_vector() {
+        // SHA-256 of empty string = e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
+        // base64 of that digest = 47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU=
+        let sri = compute_sri_hash_sha256(b"");
+        assert_eq!(sri, "sha256-47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU=");
     }
 
     #[test]

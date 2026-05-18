@@ -180,6 +180,17 @@ pub async fn run(json_output: bool, refresh: bool) -> Result<(), LpmError> {
         InstallMethod::Homebrew => run_shell_update("brew", &["upgrade", "lpm"])?,
         InstallMethod::Cargo => {
             let tag = format!("v{latest}");
+            // `--locked` forces resolution against the Cargo.lock
+            // shipped with the tag rather than re-solving the
+            // dependency graph at install time. Without it, an
+            // attacker who compromised any direct or transitive dep's
+            // registry entry between our release time and the user's
+            // install could inject a different transitive package
+            // version into the build — same supply-chain blast as the
+            // mutable-git-tag concern in the finding, just one hop
+            // further down. `--locked` was a behaviour change in
+            // recent cargo (now standard for reproducible installs);
+            // every modern cargo (≥1.74) supports it.
             run_shell_update(
                 "cargo",
                 &[
@@ -190,6 +201,7 @@ pub async fn run(json_output: bool, refresh: bool) -> Result<(), LpmError> {
                     &tag,
                     "lpm-cli",
                     "--force",
+                    "--locked",
                 ],
             )?;
         }
@@ -276,7 +288,7 @@ impl InstallMethod {
             InstallMethod::Npm => format!("npm install -g @lpm-registry/cli@{version}"),
             InstallMethod::Homebrew => "brew upgrade lpm".into(),
             InstallMethod::Cargo => format!(
-                "cargo install --git https://github.com/lpm-dev/rust-client --tag v{version} lpm-cli --force"
+                "cargo install --git https://github.com/lpm-dev/rust-client --tag v{version} lpm-cli --force --locked"
             ),
             InstallMethod::Standalone => standalone_command(version),
         }
@@ -491,33 +503,150 @@ async fn run_standalone_update(version: &str) -> Result<(), LpmError> {
 
     // Replace the current binary
     let current_exe = std::env::current_exe().map_err(LpmError::Io)?;
+    swap_current_binary(&current_exe, &bytes)
+}
 
-    // Write to a temp file next to the current binary, then rename (atomic on same filesystem)
-    let tmp_path = current_exe.with_extension("tmp");
-    std::fs::write(&tmp_path, &bytes).map_err(|e| {
+/// Atomically swap the running binary at `current_exe` for `new_bytes`.
+///
+/// The tmp file is written next to `current_exe` (same filesystem),
+/// which keeps the eventual `rename` on Unix atomic and avoids the
+/// EXDEV mode-cross-FS case.
+///
+/// **Failure cleanup:** any error after we materialised the tmp file
+/// removes it on the way out so the install dir doesn't accumulate
+/// `lpm.tmp.*` stragglers from a half-succeeded update.
+///
+/// **Windows EBUSY:** the OS holds an exclusive handle on the running
+/// `current_exe()`, so a direct `rename(new, current_exe)` fails.
+/// The standard dance is `rename(current_exe, current_exe.old)`
+/// (legal even with a live handle), then `rename(new, current_exe)`,
+/// then best-effort delete the `.old` (OS releases the handle when
+/// this process exits, so the delete will succeed on the next run).
+fn swap_current_binary(current_exe: &std::path::Path, new_bytes: &[u8]) -> Result<(), LpmError> {
+    // Tmp path: same dir + same extension as the current binary, with a
+    // pid suffix so concurrent updaters on the same install don't
+    // collide on the staging filename. `with_extension("tmp")` would
+    // strip a Windows `.exe` extension and break the rename — keep
+    // the original extension and append `.new.<pid>` as a suffix.
+    let file_name = current_exe.file_name().ok_or_else(|| {
+        LpmError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "current_exe has no file name",
+        ))
+    })?;
+    let parent = current_exe.parent().ok_or_else(|| {
+        LpmError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "current_exe has no parent directory",
+        ))
+    })?;
+    let tmp_name = format!("{}.new.{}", file_name.to_string_lossy(), std::process::id());
+    let tmp_path = parent.join(tmp_name);
+
+    // L20: save a backup copy of the running binary next to itself BEFORE
+    // we install the new one, so a user who discovers the new binary is
+    // broken can rename `<lpm>.previous` back over `<lpm>` and recover
+    // without going to GitHub. The journal file is a parallel marker
+    // recording when the backup was made + the version string the user
+    // updated FROM, so a future `lpm self-rollback` command (tracked
+    // separately) can drive the rename automatically.
+    //
+    // Best-effort: if the copy fails (read-only filesystem, perms), log
+    // and continue with the install. The user opted into the update
+    // and would get a confusing "can't update" error otherwise.
+    let backup_name = format!("{}.previous", file_name.to_string_lossy());
+    let backup_path = parent.join(backup_name);
+    if let Err(e) = std::fs::copy(current_exe, &backup_path) {
+        tracing::warn!(
+            target: "lpm_cli::self_update",
+            current_exe = %current_exe.display(),
+            backup_path = %backup_path.display(),
+            error = %e,
+            "could not back up the running binary before self-update — rollback via `<binary>.previous` rename will not be available"
+        );
+    } else {
+        let journal_path = parent.join(format!(
+            "{}.update-journal.json",
+            file_name.to_string_lossy()
+        ));
+        let journal = serde_json::json!({
+            "version": 1,
+            "backup_path": backup_path.display().to_string(),
+            "current_exe": current_exe.display().to_string(),
+            "updated_at_unix_secs": std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0),
+            "previous_binary_version": env!("CARGO_PKG_VERSION"),
+        });
+        if let Err(e) = std::fs::write(
+            &journal_path,
+            serde_json::to_string_pretty(&journal).unwrap_or_default(),
+        ) {
+            tracing::warn!(
+                target: "lpm_cli::self_update",
+                journal_path = %journal_path.display(),
+                error = %e,
+                "wrote backup but failed to record update-journal sidecar — rollback via rename still possible"
+            );
+        }
+    }
+
+    std::fs::write(&tmp_path, new_bytes).map_err(|e| {
         LpmError::Io(std::io::Error::new(
             e.kind(),
             format!("failed to write temp binary: {e}"),
         ))
     })?;
 
-    // Make executable on Unix
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&tmp_path, std::fs::Permissions::from_mode(0o755))
-            .map_err(LpmError::Io)?;
+        if let Err(e) = std::fs::set_permissions(&tmp_path, std::fs::Permissions::from_mode(0o755))
+        {
+            let _ = std::fs::remove_file(&tmp_path);
+            return Err(LpmError::Io(e));
+        }
     }
 
-    // Atomic rename
-    std::fs::rename(&tmp_path, &current_exe).map_err(|e| {
-        LpmError::Io(std::io::Error::new(
-            e.kind(),
-            format!("failed to replace binary: {e}"),
-        ))
-    })?;
+    #[cfg(windows)]
+    {
+        let old_name = format!("{}.old.{}", file_name.to_string_lossy(), std::process::id());
+        let old_path = parent.join(&old_name);
+        if let Err(e) = std::fs::rename(current_exe, &old_path) {
+            let _ = std::fs::remove_file(&tmp_path);
+            return Err(LpmError::Io(std::io::Error::new(
+                e.kind(),
+                format!("failed to move running binary aside: {e}"),
+            )));
+        }
+        if let Err(e) = std::fs::rename(&tmp_path, current_exe) {
+            // Try to restore the original binary so we don't leave the
+            // install in a broken state.
+            let _ = std::fs::rename(&old_path, current_exe);
+            let _ = std::fs::remove_file(&tmp_path);
+            return Err(LpmError::Io(std::io::Error::new(
+                e.kind(),
+                format!("failed to install new binary: {e}"),
+            )));
+        }
+        // Best-effort cleanup. The OS will release the handle on the
+        // `.old` file when this process exits; the next run of the new
+        // binary can sweep it.
+        let _ = std::fs::remove_file(&old_path);
+        return Ok(());
+    }
 
-    Ok(())
+    #[cfg(unix)]
+    {
+        std::fs::rename(&tmp_path, current_exe).map_err(|e| {
+            let _ = std::fs::remove_file(&tmp_path);
+            LpmError::Io(std::io::Error::new(
+                e.kind(),
+                format!("failed to replace binary: {e}"),
+            ))
+        })
+    }
 }
 
 /// Detect the current platform for GitHub Release binary names.
@@ -571,6 +700,73 @@ mod tests {
     fn install_method_name_not_empty() {
         let method = detect_install_method();
         assert!(!method.name().is_empty());
+    }
+
+    /// L34: the staging file lands next to `current_exe` (same FS,
+    /// preserves any extension such as `.exe`) so the rename is
+    /// atomic. Pre-fix `with_extension("tmp")` stripped Windows
+    /// `lpm.exe` to `lpm.tmp`, breaking the rename target.
+    ///
+    /// L20 sidecars (`<file>.previous` + `<file>.update-journal.json`)
+    /// are intentionally left in place after a successful swap so the
+    /// operator can `mv` the backup back over the destination if the
+    /// new binary turns out to be broken — they are recovery state,
+    /// not staging.
+    #[test]
+    fn swap_current_binary_replaces_file_atomically() {
+        let dir = tempdir().unwrap();
+        let current = dir.path().join("lpm-test-bin");
+        std::fs::write(&current, b"old-binary").unwrap();
+        let new_bytes = b"new-binary-content";
+        swap_current_binary(&current, new_bytes).expect("swap must succeed");
+        let read = std::fs::read(&current).unwrap();
+        assert_eq!(read, new_bytes);
+        let allowed_sidecars = ["lpm-test-bin.previous", "lpm-test-bin.update-journal.json"];
+        let leftovers: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| {
+                let n = e.unwrap().file_name().to_string_lossy().into_owned();
+                if n == "lpm-test-bin" || allowed_sidecars.contains(&n.as_str()) {
+                    None
+                } else {
+                    Some(n)
+                }
+            })
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "swap left behind unexpected staging files: {leftovers:?}"
+        );
+    }
+
+    /// L34: extension preservation. `with_extension("tmp")` would have
+    /// turned `lpm.exe` into `lpm.tmp` — when the destination was
+    /// `lpm.exe`, the rename target on Windows would have moved a
+    /// non-executable file into place. The current staging name is
+    /// `<file_name>.new.<pid>`, which keeps the `.exe` suffix on
+    /// `current_exe` intact.
+    #[test]
+    fn swap_current_binary_keeps_destination_extension_intact() {
+        let dir = tempdir().unwrap();
+        let current = dir.path().join("lpm.exe");
+        std::fs::write(&current, b"old").unwrap();
+        swap_current_binary(&current, b"new").expect("swap must succeed");
+        assert!(current.exists(), "destination .exe still present");
+        assert_eq!(std::fs::read(&current).unwrap(), b"new");
+    }
+
+    /// On Unix the swapped binary must end up at 0o755.
+    #[cfg(unix)]
+    #[test]
+    fn swap_current_binary_sets_executable_perms_on_unix() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempdir().unwrap();
+        let current = dir.path().join("lpm-perms");
+        std::fs::write(&current, b"old").unwrap();
+        std::fs::set_permissions(&current, std::fs::Permissions::from_mode(0o644)).unwrap();
+        swap_current_binary(&current, b"new").expect("swap must succeed");
+        let mode = std::fs::metadata(&current).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o755, "expected 0o755, got 0o{mode:o}");
     }
 
     /// Per-channel detection table. Synthetic paths drive the pure

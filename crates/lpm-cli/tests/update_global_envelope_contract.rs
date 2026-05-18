@@ -161,3 +161,63 @@ async fn json_update_global_failure_emits_rich_envelope_only() {
 // above is sufficient because its assertions reach inside the parsed
 // envelope (the negative `error_code is None` assertion is the
 // load-bearing one — a double-emit can't satisfy it).
+
+/// L46. `lpm --json global update --dry-run` against a manifest whose
+/// packages all fail to plan (wiremock 404s every metadata fetch) must
+/// surface `"success": false` AND exit non-zero. Pre-fix `emit_dry_run`
+/// hard-coded `"success": true` and `run` returned `Ok(())` after the
+/// dry-run emit regardless of planning outcome, so automation that
+/// gated on the top-level success flag treated corrupt manifest rows
+/// or registry failures as a healthy diagnostic outcome.
+#[tokio::test]
+async fn json_update_global_dry_run_failure_surfaces_non_zero_success_and_exit_code() {
+    let mock = MockServer::start().await;
+
+    let project = TempDir::new().expect("create temp project");
+    let lpm_home = TempDir::new().expect("create temp LPM_HOME");
+    seed_minimal_global_manifest(lpm_home.path(), "phantom-pkg", "1.0.0");
+
+    let (status, stdout, stderr) = run_lpm_with_env(
+        project.path(),
+        lpm_home.path(),
+        Some(&mock.uri()),
+        &[],
+        &["--json", "global", "update", "--dry-run"],
+    );
+
+    assert_eq!(
+        status.code(),
+        Some(1),
+        "L46: dry-run with any PlanError must exit 1 (got code={:?}, stdout={stdout:?}, stderr={stderr:?})",
+        status.code(),
+    );
+
+    let envelope = parse_json_stdout(&stdout);
+
+    assert_eq!(
+        envelope["success"],
+        serde_json::json!(false),
+        "L46: top-level success must be false when any plan failed; envelope={envelope}",
+    );
+    assert_eq!(
+        envelope["dry_run"],
+        serde_json::json!(true),
+        "L46: dry_run flag must still be true; envelope={envelope}",
+    );
+    let plans = envelope["plans"].as_array().expect("plans is array");
+    let phantom = plans
+        .iter()
+        .find(|p| p["package"] == serde_json::json!("phantom-pkg"))
+        .unwrap_or_else(|| panic!("plans must include phantom-pkg entry: {envelope}"));
+    assert_eq!(
+        phantom["action"],
+        serde_json::json!("plan_error"),
+        "phantom-pkg must surface as plan_error since wiremock 404s its metadata: {envelope}",
+    );
+    assert!(
+        envelope.get("error_code").is_none(),
+        "L46: rich dry-run envelope must NOT carry `error_code` — that field belongs to the \
+         generic top-level envelope from main.rs. The `LpmError::ExitCode(1)` return from `run` \
+         is what suppresses the generic envelope; presence here means the routing predicate broke.",
+    );
+}

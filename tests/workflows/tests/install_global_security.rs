@@ -34,7 +34,7 @@
 
 mod support;
 
-use support::build_state::seed_global_install_blocked_state_with_real_hash;
+use support::build_state::seed_global_install_blocked_state_with_tier;
 use support::mock_registry::{MockRegistry, compute_integrity, make_tarball_from_pkg_json};
 use support::{TempProject, lpm, lpm_with_registry};
 
@@ -335,6 +335,28 @@ fn seed_global_manifest_and_blocked_state(
     blocked_name: &str,
     blocked_version: &str,
 ) {
+    seed_global_manifest_and_blocked_state_with_tier(
+        project,
+        top_level,
+        top_level_version,
+        blocked_name,
+        blocked_version,
+        Some("green"),
+    );
+}
+
+/// Same as [`seed_global_manifest_and_blocked_state`] but pins an
+/// explicit `static_tier` on the blocked row. Used by the M75 tier-gate
+/// workflow tests below. `None` omits the field entirely (pre-
+/// classification legacy state).
+fn seed_global_manifest_and_blocked_state_with_tier(
+    project: &TempProject,
+    top_level: &str,
+    top_level_version: &str,
+    blocked_name: &str,
+    blocked_version: &str,
+    tier: Option<&str>,
+) {
     let global_root = project.home().join(".lpm").join("global");
     std::fs::create_dir_all(&global_root).unwrap();
     let toml = format!(
@@ -351,12 +373,13 @@ commands = []
 "#
     );
     std::fs::write(global_root.join("manifest.toml"), toml).unwrap();
-    seed_global_install_blocked_state_with_real_hash(
+    seed_global_install_blocked_state_with_tier(
         project,
         top_level,
         top_level_version,
         blocked_name,
         blocked_version,
+        tier,
     );
 }
 
@@ -781,5 +804,372 @@ fn approve_scripts_global_yes_live_json_carries_next_step_origins() {
         !names.contains(&"esbuild"),
         "origins must NOT include the approved row's name (`esbuild`) — \
          it's a transitive blocked package, not a top-level global. names={names:?}"
+    );
+}
+
+// ── M75: tier gate parity for global bulk approval ──────────────────
+//
+// Pre-fix, `lpm approve-scripts --global --yes` wrote aggregate rows
+// straight into `~/.lpm/global/trusted-dependencies.json` without the
+// non-green tier check the project `--yes` gate enforces. A malicious
+// global dependency with an amber / amber-llm / red lifecycle script
+// could be globally approved through the bulk path even though the
+// project `--yes` path would refuse the same classification.
+
+/// `--global --yes` MUST refuse to bulk-approve any aggregate row
+/// classified outside the green tier. Pinned with `amber`, matching
+/// the project `yes_gate_refuses_single_amber` unit-test contract.
+#[test]
+fn approve_scripts_global_yes_refuses_amber_tier() {
+    let project = TempProject::empty(r#"{ "name": "global-security-test", "version": "0.0.0" }"#);
+    seed_global_manifest_and_blocked_state_with_tier(
+        &project,
+        "eslint",
+        "9.24.0",
+        "esbuild",
+        "0.25.1",
+        Some("amber"),
+    );
+
+    let out = lpm(&project)
+        .args(["--json", "approve-scripts", "--global", "--yes"])
+        .output()
+        .expect("spawn lpm approve-scripts --global --yes");
+    assert!(
+        !out.status.success(),
+        "approve-scripts --global --yes must exit non-zero when an aggregate row is amber; \
+         stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+    // The refusal message threads through main.rs's JSON error wrapper.
+    // Substring-match on the stable `--yes refuses` prefix + the
+    // refused package + the global redirect prose.
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        combined.contains("--yes refuses"),
+        "refusal must carry the stable `--yes refuses` prefix; got:\n{combined}"
+    );
+    assert!(
+        combined.contains("esbuild@0.25.1"),
+        "refusal must name the offending package; got:\n{combined}"
+    );
+    assert!(
+        combined.contains("approve-scripts --global"),
+        "global redirect must mention --global; got:\n{combined}"
+    );
+    // Trust file must be UNTOUCHED on refusal — no aggregate row should
+    // have made it into ~/.lpm/global/trusted-dependencies.json.
+    let trust_path = project
+        .home()
+        .join(".lpm")
+        .join("global")
+        .join("trusted-dependencies.json");
+    assert!(
+        !trust_path.exists(),
+        "trust file must not be written when --yes is refused; found {}",
+        trust_path.display()
+    );
+}
+
+/// `--global --yes` MUST allow bulk-approval when every aggregate row
+/// is green-tier. Verifies the gate isn't over-eager: green is the
+/// happy path.
+#[test]
+fn approve_scripts_global_yes_allows_green_tier() {
+    let project = TempProject::empty(r#"{ "name": "global-security-test", "version": "0.0.0" }"#);
+    seed_global_manifest_and_blocked_state_with_tier(
+        &project,
+        "eslint",
+        "9.24.0",
+        "esbuild",
+        "0.25.1",
+        Some("green"),
+    );
+
+    let out = lpm(&project)
+        .args(["--json", "approve-scripts", "--global", "--yes"])
+        .output()
+        .expect("spawn lpm approve-scripts --global --yes");
+    assert!(
+        out.status.success(),
+        "approve-scripts --global --yes must succeed for an all-green aggregate; \
+         stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+    let parsed: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&out.stdout).trim())
+            .expect("valid JSON envelope on stdout");
+    assert_eq!(
+        parsed.get("approved_count").and_then(|v| v.as_u64()),
+        Some(1)
+    );
+    let trust_path = project
+        .home()
+        .join(".lpm")
+        .join("global")
+        .join("trusted-dependencies.json");
+    assert!(
+        trust_path.exists(),
+        "trust file must be written on successful bulk approval; expected {}",
+        trust_path.display()
+    );
+}
+
+// ── M76: uninstall trust-prune workflow tests ───────────────────────
+//
+// Pre-fix, `~/.lpm/global/trusted-dependencies.json` survived uninstall
+// and `synthesize_pkg_json` re-projected every entry into every new
+// global install. An approval originally made for one top-level global
+// remained after that global was removed and could authorize the same
+// transitive name@version in an unrelated future global install.
+//
+// The fix is reachability-aware: prune trust entries reachable only
+// through the uninstalling install's tree (computed from per-install
+// lockfiles). Workflow tests drive the live binary against seeded
+// fixtures (manifest + install roots + lockfiles + trust file).
+
+/// Write a `~/.lpm/global/manifest.toml` claiming `pkga@1.0.0` and a
+/// corresponding install root with a minimal but lockfile-parseable
+/// `lpm.lock` containing `(name, version)` pairs the M76 helper will
+/// see when walking the reachability tree.
+fn seed_global_install_with_lockfile(
+    project: &TempProject,
+    top_level: &str,
+    top_level_version: &str,
+    deps: &[(&str, &str)],
+) {
+    let global_root = project.home().join(".lpm").join("global");
+    let install_root = global_root
+        .join("installs")
+        .join(format!("{top_level}@{top_level_version}"));
+    std::fs::create_dir_all(install_root.join("node_modules").join(".bin")).unwrap();
+    let mut body = String::from("[metadata]\nlockfile-version = 2\n");
+    for (name, version) in deps {
+        body.push_str(&format!(
+            "\n[[packages]]\nname = \"{name}\"\nversion = \"{version}\"\n"
+        ));
+    }
+    std::fs::write(install_root.join("lpm.lock"), body).unwrap();
+}
+
+/// Append a `[packages.<top_level>]` row to the existing global
+/// manifest (or create the manifest if absent). Caller seeds the
+/// install root separately via `seed_global_install_with_lockfile`.
+fn append_global_manifest_row(project: &TempProject, top_level: &str, top_level_version: &str) {
+    let global_root = project.home().join(".lpm").join("global");
+    std::fs::create_dir_all(&global_root).unwrap();
+    let manifest_path = global_root.join("manifest.toml");
+    let prior = std::fs::read_to_string(&manifest_path).unwrap_or_default();
+    let body = if prior.is_empty() {
+        format!(
+            r#"schema_version = 1
+
+[packages.{top_level}]
+saved_spec = "^1"
+resolved = "{top_level_version}"
+integrity = "sha512-fixture-{top_level}"
+source = "upstream-npm"
+installed_at = "2026-04-22T00:00:00Z"
+root = "installs/{top_level}@{top_level_version}"
+commands = []
+"#
+        )
+    } else {
+        format!(
+            "{prior}\n[packages.{top_level}]\nsaved_spec = \"^1\"\nresolved = \"{top_level_version}\"\nintegrity = \"sha512-fixture-{top_level}\"\nsource = \"upstream-npm\"\ninstalled_at = \"2026-04-22T00:00:00Z\"\nroot = \"installs/{top_level}@{top_level_version}\"\ncommands = []\n"
+        )
+    };
+    std::fs::write(manifest_path, body).unwrap();
+}
+
+/// Seed `~/.lpm/global/trusted-dependencies.json` with the given
+/// `(name, version)` entries (no provenance / integrity / scriptHash —
+/// the trust-prune logic is keyed by `name@version` regardless).
+fn seed_global_trust(project: &TempProject, entries: &[(&str, &str)]) {
+    let global_root = project.home().join(".lpm").join("global");
+    std::fs::create_dir_all(&global_root).unwrap();
+    let mut map = serde_json::Map::new();
+    for (name, version) in entries {
+        map.insert(format!("{name}@{version}"), serde_json::json!({}));
+    }
+    let body = serde_json::json!({
+        "schema_version": 1,
+        "trusted": serde_json::Value::Object(map),
+    });
+    std::fs::write(
+        global_root.join("trusted-dependencies.json"),
+        serde_json::to_string_pretty(&body).unwrap(),
+    )
+    .unwrap();
+}
+
+/// Read the global trust file and return the set of keys present.
+fn read_global_trust_keys(project: &TempProject) -> Vec<String> {
+    let path = project
+        .home()
+        .join(".lpm")
+        .join("global")
+        .join("trusted-dependencies.json");
+    let body = std::fs::read_to_string(&path).unwrap_or_default();
+    if body.is_empty() {
+        return Vec::new();
+    }
+    let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+    v.get("trusted")
+        .and_then(|t| t.as_object())
+        .map(|m| m.keys().cloned().collect())
+        .unwrap_or_default()
+}
+
+/// Uninstalling the only global drops every trust entry reachable
+/// through its tree.
+#[test]
+fn uninstall_prunes_trust_entries_unique_to_this_install() {
+    let project = TempProject::empty(r#"{ "name": "global-security-test", "version": "0.0.0" }"#);
+    append_global_manifest_row(&project, "pkga", "1.0.0");
+    seed_global_install_with_lockfile(&project, "pkga", "1.0.0", &[("lodash", "4.17.21")]);
+    seed_global_trust(&project, &[("lodash", "4.17.21")]);
+
+    let out = lpm(&project)
+        .args(["--json", "uninstall", "-g", "pkga"])
+        .output()
+        .expect("spawn lpm uninstall -g");
+    assert!(
+        out.status.success(),
+        "uninstall must succeed; stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+    let parsed: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&out.stdout).trim())
+            .expect("valid JSON envelope on stdout");
+    // pkga@1.0.0 (top-level) + lodash@4.17.21 = 2 in prune set, but
+    // only lodash@4.17.21 was in the trust file, so the count of
+    // entries actually removed is 1.
+    assert_eq!(
+        parsed.get("trust_entries_pruned").and_then(|v| v.as_u64()),
+        Some(1),
+        "envelope must report `trust_entries_pruned` count; got {parsed}"
+    );
+    let keys = read_global_trust_keys(&project);
+    assert!(
+        !keys.iter().any(|k| k == "lodash@4.17.21"),
+        "lodash trust entry must be pruned; remaining keys: {keys:?}"
+    );
+}
+
+/// A trust entry reachable through ANOTHER remaining global install's
+/// tree must survive — the sibling install's reinstall still needs it.
+#[test]
+fn uninstall_keeps_trust_entries_reachable_through_other_installs() {
+    let project = TempProject::empty(r#"{ "name": "global-security-test", "version": "0.0.0" }"#);
+    append_global_manifest_row(&project, "pkga", "1.0.0");
+    append_global_manifest_row(&project, "pkgb", "1.0.0");
+    seed_global_install_with_lockfile(&project, "pkga", "1.0.0", &[("lodash", "4.17.21")]);
+    seed_global_install_with_lockfile(&project, "pkgb", "1.0.0", &[("lodash", "4.17.21")]);
+    seed_global_trust(&project, &[("lodash", "4.17.21")]);
+
+    let out = lpm(&project)
+        .args(["--json", "uninstall", "-g", "pkga"])
+        .output()
+        .expect("spawn lpm uninstall -g");
+    assert!(
+        out.status.success(),
+        "uninstall must succeed; stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+    let parsed: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&out.stdout).trim())
+            .expect("valid JSON envelope on stdout");
+    // lodash is reachable via pkgb — not prunable. pkga@1.0.0
+    // (top-level) is unique to this install but it ISN'T in the trust
+    // file, so `trust_entries_pruned` is 0.
+    assert_eq!(
+        parsed.get("trust_entries_pruned").and_then(|v| v.as_u64()),
+        Some(0),
+        "lodash reachable via pkgb must survive; got {parsed}"
+    );
+    let keys = read_global_trust_keys(&project);
+    assert!(
+        keys.iter().any(|k| k == "lodash@4.17.21"),
+        "lodash trust entry must SURVIVE; remaining keys: {keys:?}"
+    );
+}
+
+/// If a sibling install's lockfile is missing / unreadable, the
+/// prune set collapses to empty (conservative fail-safe). Uninstall
+/// still succeeds; the trust file is untouched.
+#[test]
+fn uninstall_fail_safe_when_other_install_lockfile_missing() {
+    let project = TempProject::empty(r#"{ "name": "global-security-test", "version": "0.0.0" }"#);
+    append_global_manifest_row(&project, "pkga", "1.0.0");
+    append_global_manifest_row(&project, "pkgb", "1.0.0");
+    seed_global_install_with_lockfile(&project, "pkga", "1.0.0", &[("lodash", "4.17.21")]);
+    // Seed pkgb's install root WITHOUT a lockfile — the fail-safe path.
+    let pkgb_install_root = project
+        .home()
+        .join(".lpm")
+        .join("global")
+        .join("installs")
+        .join("pkgb@1.0.0");
+    std::fs::create_dir_all(pkgb_install_root.join("node_modules").join(".bin")).unwrap();
+    seed_global_trust(&project, &[("lodash", "4.17.21")]);
+
+    let out = lpm(&project)
+        .args(["--json", "uninstall", "-g", "pkga"])
+        .output()
+        .expect("spawn lpm uninstall -g");
+    assert!(
+        out.status.success(),
+        "uninstall must succeed even when sibling lockfile is unreadable; \
+         stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+    let parsed: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&out.stdout).trim())
+            .expect("valid JSON envelope on stdout");
+    assert_eq!(
+        parsed.get("trust_entries_pruned").and_then(|v| v.as_u64()),
+        Some(0),
+        "fail-safe must result in zero entries pruned; got {parsed}"
+    );
+    let keys = read_global_trust_keys(&project);
+    assert!(
+        keys.iter().any(|k| k == "lodash@4.17.21"),
+        "lodash trust entry must survive the fail-safe; remaining keys: {keys:?}"
+    );
+}
+
+/// Pre-classification legacy state — build-state.json rows without the
+/// `static_tier` field — MUST pass through the global tier gate so
+/// older clients' captured state remains approvable via `--yes` after a
+/// binary upgrade. Parity with the project gate's
+/// `yes_gate_allows_none_tiered_legacy_state` contract.
+#[test]
+fn approve_scripts_global_yes_passes_through_none_tier_legacy_state() {
+    let project = TempProject::empty(r#"{ "name": "global-security-test", "version": "0.0.0" }"#);
+    seed_global_manifest_and_blocked_state_with_tier(
+        &project, "eslint", "9.24.0", "esbuild", "0.25.1",
+        None, // omit static_tier — legacy / pre-P2 state
+    );
+
+    let out = lpm(&project)
+        .args(["--json", "approve-scripts", "--global", "--yes"])
+        .output()
+        .expect("spawn lpm approve-scripts --global --yes");
+    assert!(
+        out.status.success(),
+        "approve-scripts --global --yes must succeed for legacy None-tier state; \
+         stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
     );
 }

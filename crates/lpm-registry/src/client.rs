@@ -95,6 +95,18 @@ const READ_TIMEOUT: Duration = Duration::from_secs(30);
 /// Metadata cache TTL (5 minutes).
 const METADATA_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(300);
 
+/// Max bytes accepted from a single on-disk metadata cache entry.
+///
+/// The cache lives under `~/.lpm/cache/metadata/` (the trust boundary
+/// documented above the magic constant); but a same-user process that
+/// can plant a multi-GB file there would force every fresh-path read
+/// to allocate it before serde even noticed the bytes were nonsense.
+/// 100 MB matches the on-the-wire `MAX_METADATA_BYTES` cap so a
+/// legitimate worst-case packument always round-trips through the
+/// cache, while pathological files collapse to a cache miss before
+/// any decode work happens.
+const METADATA_CACHE_FILE_CAP: u64 = 100 * 1024 * 1024;
+
 /// Magic header for the manifest cache file format. Replaces the
 /// per-payload HMAC-SHA256 that used to run on every write. The cache
 /// lives at `~/.lpm/cache/metadata/` inside the user's home; if an
@@ -225,6 +237,104 @@ fn cert_pem_fingerprint(pem: &[u8]) -> Arc<str> {
 /// malicious registries from exhausting memory or disk before extraction even starts.
 /// Extraction-time limits (5 GB total, 500 MB per file) remain as a second defense.
 pub const MAX_COMPRESSED_TARBALL_SIZE: u64 = 500 * 1024 * 1024;
+
+/// Hard cap on the number of bytes we will buffer from a single metadata
+/// response body. Real packuments — even for the largest npm packages
+/// like `react` or `lodash` — top out at ~10-20 MB; LPM requests the
+/// abbreviated packument format (`application/vnd.npm.install-v1+json`)
+/// which trims further. 100 MB is several×-headroom over any
+/// legitimate metadata response and orders of magnitude below a
+/// memory-exhaustion attack from a compromised mirror or MITM.
+const MAX_METADATA_BYTES: usize = 100 * 1024 * 1024;
+
+/// Hard cap for non-metadata API responses (whoami, token check,
+/// quality/skills, tunnel domain ops, publish ack, error bodies).
+/// These payloads are kilobytes in practice; 10 MB gives several
+/// orders of magnitude of headroom over the legitimate envelope and
+/// stops a hostile / compromised mirror from OOM-ing the CLI on a
+/// path that never needed metadata-sized buffers.
+const MAX_API_RESPONSE_BYTES: usize = 10 * 1024 * 1024;
+
+/// Drain a response body with a two-stage size cap.
+///
+/// Stage 1 (pre-stream): refuse when the server's declared
+/// `Content-Length` exceeds `cap` — no bytes are allocated for a
+/// hostile-declared-length response.
+///
+/// Stage 2 (mid-stream): for chunked / undeclared-length responses,
+/// accumulate `bytes_stream()` chunks into a bounded `Vec` and abort
+/// the moment another chunk would cross `cap`. Closing the response
+/// at that point drops the underlying connection.
+async fn read_capped_body(
+    response: reqwest::Response,
+    cap: usize,
+    context: &str,
+) -> Result<Vec<u8>, LpmError> {
+    use futures::StreamExt;
+
+    if let Some(declared) = response.content_length()
+        && declared as usize > cap
+    {
+        return Err(LpmError::Registry(format!(
+            "{context}: declared body length {declared} exceeds cap {cap}"
+        )));
+    }
+
+    let mut buf: Vec<u8> = Vec::with_capacity(std::cmp::min(64 * 1024, cap));
+    let mut stream = response.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk =
+            chunk.map_err(|e| LpmError::Registry(format!("{context}: body read error: {e}")))?;
+        if buf.len().saturating_add(chunk.len()) > cap {
+            return Err(LpmError::Registry(format!(
+                "{context}: streamed body exceeded cap {cap}"
+            )));
+        }
+        buf.extend_from_slice(&chunk);
+    }
+    Ok(buf)
+}
+
+/// Read a metadata-shaped JSON response with the metadata cap.
+///
+/// Wraps [`read_capped_body`] with the metadata-tier ceiling and
+/// `serde_json::from_slice`. Lets the metadata path share one
+/// streaming-cap implementation with the smaller-tier API path.
+async fn parse_capped_metadata<T: serde::de::DeserializeOwned>(
+    response: reqwest::Response,
+    context: &str,
+) -> Result<T, LpmError> {
+    let buf = read_capped_body(response, MAX_METADATA_BYTES, context).await?;
+    serde_json::from_slice(&buf)
+        .map_err(|e| LpmError::Registry(format!("{context}: failed to parse JSON: {e}")))
+}
+
+/// Read a non-metadata JSON response (whoami, token check, etc.) with
+/// the smaller API-tier cap. Exposed for callers outside this module
+/// (e.g., the `token` command, the `dlx` resolver) that operate on a
+/// raw `reqwest::Response` returned by [`RegistryClient::post_json_raw`]
+/// and would otherwise reach for `.json()` directly.
+pub async fn parse_capped_api_json<T: serde::de::DeserializeOwned>(
+    response: reqwest::Response,
+    context: &str,
+) -> Result<T, LpmError> {
+    let buf = read_capped_body(response, MAX_API_RESPONSE_BYTES, context).await?;
+    serde_json::from_slice(&buf)
+        .map_err(|e| LpmError::Registry(format!("{context}: failed to parse JSON: {e}")))
+}
+
+/// Read an error-body response as UTF-8 text under the API-tier cap.
+///
+/// Returns the empty string on cap-overflow or read errors so the
+/// caller can still construct a typed error variant — the previous
+/// `response.text().await.unwrap_or_default()` shape is preserved
+/// but the buffer is now bounded.
+async fn read_capped_error_text(response: reqwest::Response) -> String {
+    match read_capped_body(response, MAX_API_RESPONSE_BYTES, "error body").await {
+        Ok(buf) => String::from_utf8_lossy(&buf).into_owned(),
+        Err(_) => String::new(),
+    }
+}
 
 /// Result of a verified tarball download. The tarball is spooled to a temp file
 /// on disk — only the SRI hash and byte count are kept in memory.
@@ -624,19 +734,22 @@ fn build_per_origin_http_client(
     for cafile in &per_origin.cafiles {
         let resolved = cafile.resolve();
         let bytes = std::fs::read(&resolved).map_err(|e| {
+            tracing::debug!(
+                resolved_path = %resolved.display(),
+                source = %cafile.source,
+                line = cafile.line,
+                error = %e,
+                "per-origin cafile read failed",
+            );
             LpmError::Cert(format!(
-                "{}:{}: failed to read per-origin cafile for {origin} ({}): {e}",
-                cafile.source,
-                cafile.line,
-                resolved.display()
+                "{}:{}: failed to read per-origin cafile for {origin}: {e}",
+                cafile.source, cafile.line,
             ))
         })?;
         if !contains_pem_certificate_block_inline(&bytes) {
             return Err(LpmError::Cert(format!(
-                "{}:{}: per-origin cafile for {origin} ({}) contains no '-----BEGIN CERTIFICATE-----' block",
-                cafile.source,
-                cafile.line,
-                resolved.display()
+                "{}:{}: per-origin cafile for {origin} contains no '-----BEGIN CERTIFICATE-----' block",
+                cafile.source, cafile.line,
             )));
         }
         all_roots.push(TaggedRoot {
@@ -813,6 +926,18 @@ impl RegistryClient {
         let mut b = reqwest::Client::builder()
             .connect_timeout(connect_timeout)
             .read_timeout(read_timeout)
+            // Cap redirect chains explicitly. reqwest's default is also
+            // `Policy::limited(10)` plus per-redirect cross-origin
+            // sensitive-header stripping (`Authorization`, `Cookie`,
+            // `Proxy-Authorization`). Setting the policy here pins the
+            // contract in code: a future builder edit that swaps in a
+            // `Policy::none()` or a custom non-stripping policy is
+            // visible in review, not implicit via "whichever default
+            // reqwest ships this week". The cross-origin strip closes
+            // the leak window where a compromised registry could
+            // 30x to `attacker.example` and have the npmrc bearer
+            // follow.
+            .redirect(reqwest::redirect::Policy::limited(10))
             .user_agent(format!("lpm-rs/{}", env!("CARGO_PKG_VERSION")));
         if std::env::var("LPM_HTTP").as_deref() == Ok("h1-pool") {
             b = b
@@ -852,6 +977,34 @@ impl RegistryClient {
 
     /// Create a new registry client with default settings.
     pub fn new() -> Self {
+        // L25: reqwest honours HTTPS_PROXY / HTTP_PROXY / ALL_PROXY by
+        // default. A compromised CI runner or shell rc that exports
+        // these can silently route every registry request — including
+        // the bearer-bearing publish/auth flows — through an
+        // attacker proxy. We don't disable the env-proxy support
+        // (legitimate corporate proxies depend on it) but we DO log
+        // a one-shot warn so operators can spot unexpected proxy
+        // contamination. Logged at warn level so default tracing
+        // surfaces it; fires once per process per construction.
+        for var in [
+            "HTTPS_PROXY",
+            "https_proxy",
+            "HTTP_PROXY",
+            "http_proxy",
+            "ALL_PROXY",
+        ] {
+            if let Ok(val) = std::env::var(var)
+                && !val.trim().is_empty()
+            {
+                tracing::warn!(
+                    env_var = var,
+                    proxy = %val,
+                    "registry HTTP client will route through proxy from env; \
+                     confirm this is expected (the LPM bearer goes via this proxy)",
+                );
+                break;
+            }
+        }
         let default_client = Self::build_http_client(CONNECT_TIMEOUT, READ_TIMEOUT);
         let http = HttpClients::from_default_client(default_client);
 
@@ -1149,6 +1302,24 @@ impl RegistryClient {
                 self.base_url
             )));
         }
+        // L6: when `--insecure` is the path that admitted an HTTP
+        // non-loopback URL, surface the DNS-rebinding window
+        // explicitly. The string-based scheme check happens HERE; the
+        // actual TCP connect happens later inside reqwest with a
+        // fresh DNS resolve. An attacker whose DNS server returns
+        // 127.0.0.1 (or another internal IP) on the second resolve
+        // can steer the request to a different host than the one
+        // the URL named. We can't fix the rebinding window cheaply
+        // without forking reqwest's connector (would need a resolve-
+        // once + connect-to-IP pattern), but we CAN surface the
+        // trust posture so operators see they're agreeing to it.
+        if self.allow_insecure && is_http_url(url) && !is_localhost_url(url) {
+            tracing::warn!(
+                target: "lpm_registry::client",
+                base_url = %url,
+                "--insecure HTTP non-loopback registry: there is a DNS-rebinding window between this URL validation and the eventual TCP connect. Use HTTPS to anchor the trust to a TLS cert rather than DNS"
+            );
+        }
         Ok(())
     }
 
@@ -1340,6 +1511,20 @@ impl RegistryClient {
         // "error decoding response body"). The actual fault lives in the
         // `source()` chain from hyper. Walk the chain explicitly so the
         // warn log is diagnostic and not just the opaque top-level string.
+        //
+        // M60: cap the total bytes accumulated from the NDJSON stream
+        // at the same `MAX_METADATA_BYTES` ceiling the single-package
+        // metadata path uses. A hostile Worker / poisoned base URL
+        // could otherwise stream one giant line (or unbounded
+        // whitespace) and exhaust install memory before the JSON
+        // parser noticed the line was malformed.
+        if let Some(declared) = response.content_length()
+            && declared as usize > MAX_METADATA_BYTES
+        {
+            return Err(LpmError::Registry(format!(
+                "NDJSON batch: declared body length {declared} exceeds cap {MAX_METADATA_BYTES}"
+            )));
+        }
         let mut response = response;
         let mut bytes_read: u64 = 0;
         let mut chunks_read: u64 = 0;
@@ -1349,6 +1534,12 @@ impl RegistryClient {
                 Ok(Some(chunk)) => {
                     chunks_read += 1;
                     bytes_read += chunk.len() as u64;
+                    if (bytes_read as usize) > MAX_METADATA_BYTES {
+                        return Err(LpmError::Registry(format!(
+                            "NDJSON batch: streamed body exceeded cap {MAX_METADATA_BYTES} \
+                             (after {chunks_read} chunks)"
+                        )));
+                    }
                     buffer.extend_from_slice(&chunk);
                 }
                 Err(e) => {
@@ -1478,10 +1669,7 @@ impl RegistryClient {
         &self,
         response: reqwest::Response,
     ) -> Result<std::collections::HashMap<String, PackageMetadata>, LpmError> {
-        let result: serde_json::Value = response
-            .json()
-            .await
-            .map_err(|e| LpmError::Registry(format!("batch metadata parse error: {e}")))?;
+        let result: serde_json::Value = parse_capped_metadata(response, "batch metadata").await?;
 
         let packages_obj = result
             .get("packages")
@@ -1579,9 +1767,8 @@ impl RegistryClient {
                     .and_then(|v| v.to_str().ok())
                     .map(|s| s.to_string());
 
-                let metadata: PackageMetadata = response.json().await.map_err(|e| {
-                    LpmError::Registry(format!("failed to parse response from {url}: {e}"))
-                })?;
+                let metadata: PackageMetadata =
+                    parse_capped_metadata(response, &format!("get_package_metadata {url}")).await?;
 
                 self.write_metadata_cache(&cache_key, &metadata, etag.as_deref());
                 Ok(metadata)
@@ -1656,7 +1843,12 @@ impl RegistryClient {
                         .and_then(|v| v.to_str().ok())
                         .map(|s| s.to_string());
 
-                    if let Ok(metadata) = response.json::<PackageMetadata>().await {
+                    if let Ok(metadata) = parse_capped_metadata::<PackageMetadata>(
+                        response,
+                        &format!("get_npm_package_metadata (proxy) {name}"),
+                    )
+                    .await
+                    {
                         // Verify we got the right package (not a routing error)
                         if metadata.name == name
                             || metadata.versions.values().any(|v| v.name == name)
@@ -1704,9 +1896,11 @@ impl RegistryClient {
             Ok(r) => r,
             Err(e) => return finish!(Err(e)),
         };
-        let metadata_res = response.json::<PackageMetadata>().await.map_err(|e| {
-            LpmError::Registry(format!("failed to parse npm metadata for {name}: {e}"))
-        });
+        let metadata_res = parse_capped_metadata::<PackageMetadata>(
+            response,
+            &format!("get_npm_package_metadata (direct) {name}"),
+        )
+        .await;
         let metadata = match metadata_res {
             Ok(m) => m,
             Err(e) => return finish!(Err(e)),
@@ -1758,13 +1952,14 @@ impl RegistryClient {
             Ok(r) => r,
             Err(e) => return finish!(Err(e)),
         };
-        let metadata = match response.json::<PackageMetadata>().await {
+        let metadata = match parse_capped_metadata::<PackageMetadata>(
+            response,
+            &format!("get_npm_metadata_direct {name}"),
+        )
+        .await
+        {
             Ok(m) => m,
-            Err(e) => {
-                return finish!(Err(LpmError::Registry(format!(
-                    "failed to parse npm metadata for {name}: {e}"
-                ))));
-            }
+            Err(e) => return finish!(Err(e)),
         };
         self.write_metadata_cache(&cache_key, &metadata, None);
         finish!(Ok(metadata))
@@ -1973,13 +2168,14 @@ impl RegistryClient {
             Ok(r) => r,
             Err(e) => return finish!(Err(e)),
         };
-        let metadata = match response.json::<PackageMetadata>().await {
+        let metadata = match parse_capped_metadata::<PackageMetadata>(
+            response,
+            &format!("get_npm_metadata_from {name} @ {base_url}"),
+        )
+        .await
+        {
             Ok(m) => m,
-            Err(e) => {
-                return finish!(Err(LpmError::Registry(format!(
-                    "failed to parse npm metadata for {name} from {base_url}: {e}"
-                ))));
-            }
+            Err(e) => return finish!(Err(e)),
         };
         self.write_metadata_cache(&cache_key, &metadata, None);
         finish!(Ok(metadata))
@@ -2516,6 +2712,27 @@ impl RegistryClient {
 
     /// Streaming variant of [`Self::download_tarball_routed`]. Same
     /// Custom-vs-non-Custom split.
+    ///
+    /// M66: for the non-Custom path (LpmWorker / NpmDirect), the
+    /// fresh `dist.tarball` URL's origin is verified against
+    /// `is_configured_origin` before the body is read. Pre-fix, no
+    /// origin gate applied to fresh URLs — a freshly-fetched metadata
+    /// response from a compromised mirror could point `dist.tarball`
+    /// at `https://evil.cdn/<pkg>.tgz` and pass the pipeline-level
+    /// scheme check unchallenged. The shape check (`/-/` + `.tgz`)
+    /// that `evaluate_cached_url` applies to LOCKFILE-cached URLs is
+    /// intentionally NOT applied here: a fresh packument from the
+    /// configured registry is allowed to use any path shape the
+    /// registry serves (some private registries and test mocks use
+    /// flat `/tarballs/<name>-<ver>.tgz` instead of npm's canonical
+    /// `/<pkg>/-/<pkg>-<ver>.tgz`). The origin check alone defends
+    /// against the M66 mirror-redirect shape.
+    ///
+    /// The Custom route path is exempt because its npmrc-declared
+    /// target origin is intentionally outside the `(base_url,
+    /// npm_registry_url)` pair `is_configured_origin` knows about;
+    /// the H2 auth-mismatch gate on `apply_npmrc_auth` already
+    /// enforces destination/credential parity for that flow.
     pub async fn download_tarball_streaming_routed(
         &self,
         route_table: &crate::route::RouteTable,
@@ -2529,6 +2746,12 @@ impl RegistryClient {
             let auth = route_table.auth_for_url(url);
             self.download_tarball_streaming_with_auth(url, auth).await
         } else {
+            if !self.is_configured_origin(url) {
+                return Err(LpmError::Registry(format!(
+                    "tarball URL refused — fresh dist.tarball origin is not in the configured \
+                     set (likely poisoned mirror or metadata tamper): {url}"
+                )));
+            }
             self.download_tarball_streaming(url).await
         }
     }
@@ -2768,6 +2991,11 @@ impl RegistryClient {
         let timeout_secs = std::cmp::min(60 + tarball_mb * 2, 600);
         let publish_client = reqwest::Client::builder()
             .timeout(Duration::from_secs(timeout_secs))
+            // Same redirect-policy pin as the main client builder:
+            // explicit Policy::limited so a future edit can't silently
+            // expand the chain or drop the cross-origin Authorization
+            // strip that reqwest applies by default.
+            .redirect(reqwest::redirect::Policy::limited(10))
             .user_agent(format!("lpm-rs/{}", env!("CARGO_PKG_VERSION")))
             .build()
             .map_err(|e| LpmError::Network(format!("failed to build publish client: {e}")))?;
@@ -2784,9 +3012,8 @@ impl RegistryClient {
             // S4: Publish-safe send — no retry on 500, only on gateway errors
             let response = self.send_publish_safe(req, encoded_name).await?;
             let status = response.status();
-            let body: serde_json::Value = response.json().await.map_err(|e| {
-                LpmError::Registry(format!("failed to parse publish response: {e}"))
-            })?;
+            let body: serde_json::Value =
+                parse_capped_api_json(response, "publish response").await?;
 
             if status.is_success() {
                 Ok(body)
@@ -2983,10 +3210,8 @@ impl RegistryClient {
         self.execute_with_recovery(AuthPosture::SessionRequired, || async {
             let response = self.post_json_raw(&url, &body).await?;
             let status = response.status();
-            let data: serde_json::Value = response
-                .json()
-                .await
-                .map_err(|e| LpmError::Registry(format!("failed to parse response: {e}")))?;
+            let data: serde_json::Value =
+                parse_capped_api_json(response, "tunnel claim response").await?;
 
             if !status.is_success() {
                 let error = data["error"].as_str().unwrap_or("Unknown error");
@@ -3030,10 +3255,8 @@ impl RegistryClient {
             }
             let response = self.send_with_retry(req).await?;
             let status = response.status();
-            let data: serde_json::Value = response
-                .json()
-                .await
-                .map_err(|e| LpmError::Registry(format!("failed to parse response: {e}")))?;
+            let data: serde_json::Value =
+                parse_capped_api_json(response, "tunnel unclaim response").await?;
 
             if !status.is_success() {
                 let error = data["error"].as_str().unwrap_or("Unknown error");
@@ -3205,17 +3428,34 @@ impl RegistryClient {
             return None;
         }
 
-        // Check TTL based on file modification time
-        let modified = path.metadata().ok()?.modified().ok()?;
+        // Check TTL based on file modification time AND enforce a
+        // hard size cap before any bytes are buffered. Same-user
+        // attacker who plants a multi-GB cache file no longer gets
+        // a free `Vec<u8>` allocation on every install start.
+        let meta = path.metadata().ok()?;
+        let modified = meta.modified().ok()?;
         let age = std::time::SystemTime::now().duration_since(modified).ok()?;
         if age > METADATA_CACHE_TTL {
+            return None;
+        }
+        if meta.len() > METADATA_CACHE_FILE_CAP {
+            tracing::warn!(
+                path = %path.display(),
+                size = meta.len(),
+                cap = METADATA_CACHE_FILE_CAP,
+                "metadata cache entry exceeds size cap — treating as miss"
+            );
             return None;
         }
 
         // Open with a buffered reader — avoids allocating the full file into
         // a Vec<u8> before deserialization.
         let file = std::fs::File::open(&path).ok()?;
-        let mut reader = std::io::BufReader::new(file);
+        // Bound the decoder's read window so a cache file that grows
+        // between the metadata check and the open() (race with another
+        // writer) still can't exceed the cap.
+        let mut reader =
+            std::io::BufReader::new(std::io::Read::take(file, METADATA_CACHE_FILE_CAP));
 
         // Validate magic prefix (METADATA_CACHE_MAGIC includes a trailing \n)
         let mut magic = [0u8; METADATA_CACHE_MAGIC.len()];
@@ -3252,6 +3492,20 @@ impl RegistryClient {
     fn read_cache_content(&self, key: &str) -> Option<CacheContent> {
         let path = self.cache_path(key)?;
         if !path.exists() {
+            return None;
+        }
+
+        // Reject oversized cache files before any bytes hit memory.
+        // Same boundary as `read_metadata_cache_as`; complements its
+        // TTL-only check on the stale-conditional-request path.
+        let file_size = path.metadata().ok()?.len();
+        if file_size > METADATA_CACHE_FILE_CAP {
+            tracing::warn!(
+                path = %path.display(),
+                size = file_size,
+                cap = METADATA_CACHE_FILE_CAP,
+                "metadata cache entry exceeds size cap — treating as miss"
+            );
             return None;
         }
 
@@ -3422,10 +3676,7 @@ impl RegistryClient {
         let response = self
             .send_with_retry(self.build_get_with_posture(url, posture).await?)
             .await?;
-        response
-            .json()
-            .await
-            .map_err(|e| LpmError::Registry(format!("failed to parse response from {url}: {e}")))
+        parse_capped_api_json(response, &format!("response from {url}")).await
     }
 
     /// Resolve the bearer to attach for a given posture.
@@ -3562,10 +3813,7 @@ impl RegistryClient {
     /// Generic GET → deserialize JSON helper (with auth).
     async fn get_json<T: serde::de::DeserializeOwned>(&self, url: &str) -> Result<T, LpmError> {
         let response = self.send_with_retry(self.build_get(url).await?).await?;
-        response
-            .json()
-            .await
-            .map_err(|e| LpmError::Registry(format!("failed to parse response from {url}: {e}")))
+        parse_capped_api_json(response, &format!("response from {url}")).await
     }
 
     /// Send a publish request with safe retry logic (S4).
@@ -3607,18 +3855,18 @@ impl RegistryClient {
                         // Non-retryable client errors — fail immediately
                         401 => return Err(LpmError::AuthRequired),
                         403 => {
-                            let body = response.text().await.unwrap_or_default();
+                            let body = read_capped_error_text(response).await;
                             return Err(LpmError::Forbidden(body));
                         }
                         404 => {
-                            let body = response.text().await.unwrap_or_default();
+                            let body = read_capped_error_text(response).await;
                             return Err(LpmError::NotFound(body));
                         }
 
                         // S4: 500 — do NOT retry. Server may have stored the version.
                         // Check if the version now exists on the registry.
                         500 => {
-                            let body_text = response.text().await.unwrap_or_default();
+                            let body_text = read_capped_error_text(response).await;
                             tracing::warn!("publish got HTTP 500 — checking if version was stored");
 
                             // Check if the version exists by GETting the package
@@ -3670,7 +3918,7 @@ impl RegistryClient {
 
                         // Retryable gateway errors only (NOT 500)
                         502..=504 => {
-                            let body = response.text().await.unwrap_or_default();
+                            let body = read_capped_error_text(response).await;
                             last_error = Some(LpmError::Http {
                                 status,
                                 message: body,
@@ -3684,7 +3932,7 @@ impl RegistryClient {
 
                         // Other errors — fail immediately
                         _ => {
-                            let body = response.text().await.unwrap_or_default();
+                            let body = read_capped_error_text(response).await;
                             return Err(LpmError::Http {
                                 status,
                                 message: body,
@@ -3744,11 +3992,11 @@ impl RegistryClient {
                         // Non-retryable errors — fail immediately
                         401 => return Err(LpmError::AuthRequired),
                         403 => {
-                            let body = response.text().await.unwrap_or_default();
+                            let body = read_capped_error_text(response).await;
                             return Err(LpmError::Forbidden(body));
                         }
                         404 => {
-                            let body = response.text().await.unwrap_or_default();
+                            let body = read_capped_error_text(response).await;
                             return Err(LpmError::NotFound(body));
                         }
 
@@ -3770,7 +4018,7 @@ impl RegistryClient {
 
                         // Retryable: server errors and timeouts
                         408 | 500 | 502 | 503 | 504 => {
-                            let body = response.text().await.unwrap_or_default();
+                            let body = read_capped_error_text(response).await;
                             last_error = Some(LpmError::Http {
                                 status,
                                 message: body,
@@ -3784,7 +4032,7 @@ impl RegistryClient {
 
                         // Other errors — fail immediately
                         _ => {
-                            let body = response.text().await.unwrap_or_default();
+                            let body = read_capped_error_text(response).await;
                             return Err(LpmError::Http {
                                 status,
                                 message: body,
@@ -3838,8 +4086,22 @@ pub fn is_localhost_url(url: &str) -> bool {
     let normalized_host = host.trim_start_matches('[').trim_end_matches(']');
     normalized_host
         .parse::<std::net::IpAddr>()
-        .map(|ip| ip.is_loopback())
+        .map(is_loopback_ip)
         .unwrap_or(false)
+}
+
+/// Loopback check that handles both native loopback (`127.0.0.0/8`,
+/// `::1`) and the IPv4-mapped IPv6 shape (`::ffff:127.0.0.1`).
+/// Rust's `IpAddr::is_loopback` only flags the native forms, so an
+/// `http://[::ffff:127.0.0.1]/foo` URL would otherwise sneak past
+/// the localhost gate and through HTTPS-required code paths.
+fn is_loopback_ip(addr: std::net::IpAddr) -> bool {
+    match addr {
+        std::net::IpAddr::V4(v4) => v4.is_loopback(),
+        std::net::IpAddr::V6(v6) => {
+            v6.is_loopback() || v6.to_ipv4_mapped().is_some_and(|v4| v4.is_loopback())
+        }
+    }
 }
 
 /// Check if a URL uses the HTTPS scheme.
@@ -4893,6 +5155,37 @@ mod tests {
         assert!(!is_localhost_url("http://[::1].evil.com:3000"));
         assert!(!is_localhost_url("http://evil.com"));
         assert!(!is_localhost_url("https://lpm.dev"));
+    }
+
+    /// L5: IPv4-mapped IPv6 (`::ffff:127.0.0.1`) is loopback per the
+    /// human reading but Rust's `IpAddr::is_loopback` only flags the
+    /// native v4 (`127.0.0.0/8`) and v6 (`::1`) forms. Without the
+    /// mapped-v4 unwrap, an `http://[::ffff:127.0.0.1]/foo` URL would
+    /// sneak past the localhost gate. Pins the mapped-form handling.
+    #[test]
+    fn is_localhost_url_recognises_ipv4_mapped_ipv6_loopback() {
+        assert!(
+            is_localhost_url("http://[::ffff:127.0.0.1]:3000"),
+            "IPv4-mapped IPv6 loopback must be recognised",
+        );
+        assert!(
+            is_localhost_url("http://[::ffff:127.1.2.3]:3000"),
+            "any IPv4-mapped address in 127.0.0.0/8 is loopback",
+        );
+        // And the negative: a mapped non-loopback v4 is NOT loopback.
+        assert!(
+            !is_localhost_url("http://[::ffff:8.8.8.8]:3000"),
+            "mapped public IPv4 must not be treated as loopback",
+        );
+    }
+
+    /// Whole 127.0.0.0/8 block is loopback per the IPv4 spec; spot-
+    /// check a non-127.0.0.1 address inside the block to confirm the
+    /// gate doesn't accidentally pin only the canonical address.
+    #[test]
+    fn is_localhost_url_accepts_full_127_block() {
+        assert!(is_localhost_url("http://127.42.42.42:3000"));
+        assert!(is_localhost_url("http://127.255.255.254:3000"));
     }
 
     // ─── Mock HTTP Tests for ETag/304 Flow ───────────────────────────
@@ -6162,7 +6455,7 @@ mod tests {
 
         let result = client.whoami().await;
         assert!(
-            matches!(result, Err(LpmError::Registry(message)) if message.contains("failed to parse response"))
+            matches!(result, Err(LpmError::Registry(message)) if message.contains("failed to parse JSON"))
         );
     }
 
@@ -6329,7 +6622,7 @@ mod tests {
         assert!(matches!(
             result,
             Err(LpmError::Registry(message))
-                if message.contains("failed to parse response from")
+                if message.contains("failed to parse JSON")
                     && message.contains("/api/registry/check-name?name=owner.package-name")
         ));
     }
@@ -6881,7 +7174,7 @@ mod tests {
 
         assert!(matches!(
             result,
-            Err(LpmError::Registry(message)) if message.contains("batch metadata parse error")
+            Err(LpmError::Registry(message)) if message.contains("batch metadata") && message.contains("failed to parse JSON")
         ));
     }
 
@@ -8150,6 +8443,54 @@ mod tests {
         assert_eq!(
             cached.name, pkg_name,
             "round-tripped cache entry must preserve the package name"
+        );
+    }
+
+    /// M62: a cache file larger than METADATA_CACHE_FILE_CAP is
+    /// treated as a miss. The on-disk cache directory is the user's
+    /// home so this gate doesn't change the trust model — it just
+    /// prevents a pathological/hostile file from forcing every
+    /// install start to allocate a multi-GB `Vec<u8>` before serde
+    /// even notices the bytes are garbage.
+    #[test]
+    fn oversized_metadata_cache_file_collapses_to_miss() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let cache_dir = tmp.path().to_path_buf();
+        let client = RegistryClient::new().with_cache_dir(Some(cache_dir.clone()));
+
+        let pkg_name = "oversized-cache-file";
+        let key = format!("npm:{pkg_name}");
+
+        // Write a small valid entry first so the path exists.
+        let metadata: PackageMetadata =
+            serde_json::from_str(&test_metadata_json(pkg_name)).expect("parse test metadata");
+        client.write_metadata_cache(&key, &metadata, None);
+        let cache_file = client
+            .cache_path(&key)
+            .expect("cache_path resolves when cache_dir is configured");
+        assert!(cache_file.exists(), "cache write must land on disk");
+
+        // Truncate the file and pad it past the cap. We use the magic
+        // header prefix so the rejection isn't simply due to a missing
+        // magic byte — we want to prove the size check fires before
+        // the magic comparison.
+        let mut padding = METADATA_CACHE_MAGIC.to_vec();
+        padding.extend(b"\n"); // empty ETag line
+        padding.resize((METADATA_CACHE_FILE_CAP + 1024) as usize, b'x');
+        std::fs::write(&cache_file, &padding).expect("rewrite cache file oversized");
+
+        // Read must return None (cache miss).
+        let result = client.read_metadata_cache(&key);
+        assert!(
+            result.is_none(),
+            "oversized cache file must collapse to a miss"
+        );
+
+        // Same posture on the stale-conditional read path.
+        let content = client.read_cache_content(&key);
+        assert!(
+            content.is_none(),
+            "read_cache_content must also refuse oversized files"
         );
     }
 
@@ -9677,5 +10018,244 @@ mod tests {
         // Only origin1 was eager-built.
         assert!(client.http.eager.contains_key(&origin1));
         assert!(!client.http.eager.contains_key(&origin2));
+    }
+
+    /// `parse_capped_metadata` rejects responses whose declared
+    /// `Content-Length` exceeds `MAX_METADATA_BYTES` — before any
+    /// body bytes are buffered. Bypasses hyper by writing the response
+    /// preamble on a raw TCP socket so the declared-vs-actual framing
+    /// discrepancy doesn't trip wiremock's mock-server panic guard
+    /// (same trick the sigstore body-cap test uses).
+    #[tokio::test]
+    async fn parse_capped_metadata_rejects_declared_oversized_content_length() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let declared = MAX_METADATA_BYTES + 1;
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        tokio::spawn(async move {
+            if let Ok((mut socket, _)) = listener.accept().await {
+                let mut buf = [0u8; 1024];
+                let _ = socket.read(&mut buf).await;
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\n\
+                     Content-Length: {declared}\r\n\
+                     Content-Type: application/json\r\n\
+                     Connection: close\r\n\
+                     \r\n",
+                );
+                let _ = socket.write_all(resp.as_bytes()).await;
+                let _ = socket.shutdown().await;
+            }
+        });
+
+        let response = reqwest::get(format!("http://{addr}/"))
+            .await
+            .expect("connect should succeed");
+        let result: Result<serde_json::Value, _> =
+            parse_capped_metadata(response, "oversized-test").await;
+        let err = result.expect_err("oversized Content-Length must reject pre-stream");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("declared body length"),
+            "expected pre-stream rejection, got: {msg}"
+        );
+    }
+
+    /// Streaming case: server doesn't declare Content-Length so the
+    /// pre-stream check passes, but the accumulated chunks cross the
+    /// cap. wiremock serves the full body just over a small cap — we
+    /// can't realistically stream 100 MB in a unit test, so this
+    /// exercise uses the streaming arm through a small-cap helper that
+    /// parse_capped_metadata wraps internally would require exposing.
+    /// Instead we send a smaller body and rely on the pre-stream
+    /// check on Content-Length. The streaming-cap arm is exercised by
+    /// the sigstore L1 tests in `crate::sigstore`; the implementation
+    /// shape is the same.
+    #[tokio::test]
+    async fn parse_capped_metadata_accepts_response_under_cap() {
+        use wiremock::matchers::{method, path as match_path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let body = serde_json::json!({"name":"@scope/p","versions":{"1.0.0":{"name":"@scope/p","version":"1.0.0"}}});
+        Mock::given(method("GET"))
+            .and(match_path("/p"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&body))
+            .mount(&server)
+            .await;
+
+        let response = reqwest::get(format!("{}/p", server.uri()))
+            .await
+            .expect("connect");
+        let parsed: serde_json::Value = parse_capped_metadata(response, "under-cap-test")
+            .await
+            .expect("under-cap response must parse");
+        assert_eq!(parsed["name"], "@scope/p");
+    }
+
+    /// Non-metadata API responses share the streaming-cap helper with
+    /// metadata reads but cap at `MAX_API_RESPONSE_BYTES` (10 MB), one
+    /// order of magnitude below the metadata tier. A whoami / token /
+    /// publish-ack response that declares more than that must reject
+    /// before any body bytes are buffered.
+    #[tokio::test]
+    async fn parse_capped_api_json_rejects_oversized_declared_length() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let declared = MAX_API_RESPONSE_BYTES + 1;
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        tokio::spawn(async move {
+            if let Ok((mut socket, _)) = listener.accept().await {
+                let mut buf = [0u8; 1024];
+                let _ = socket.read(&mut buf).await;
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\n\
+                     Content-Length: {declared}\r\n\
+                     Content-Type: application/json\r\n\
+                     Connection: close\r\n\
+                     \r\n",
+                );
+                let _ = socket.write_all(resp.as_bytes()).await;
+                let _ = socket.shutdown().await;
+            }
+        });
+
+        let response = reqwest::get(format!("http://{addr}/"))
+            .await
+            .expect("connect");
+        let result: Result<serde_json::Value, _> =
+            parse_capped_api_json(response, "api-cap-test").await;
+        let err = result.expect_err("oversized Content-Length must reject pre-stream");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("declared body length"),
+            "expected pre-stream rejection, got: {msg}"
+        );
+    }
+
+    /// Error-body reader has the same cap. A bogus 4xx with a hostile
+    /// Content-Length must not exhaust CLI memory. The reader returns
+    /// the empty string on cap-overflow so the typed error variant
+    /// the caller wraps still gets a usable message.
+    #[tokio::test]
+    async fn read_capped_error_text_rejects_oversized_declared_length() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let declared = MAX_API_RESPONSE_BYTES + 1;
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        tokio::spawn(async move {
+            if let Ok((mut socket, _)) = listener.accept().await {
+                let mut buf = [0u8; 1024];
+                let _ = socket.read(&mut buf).await;
+                let resp = format!(
+                    "HTTP/1.1 503 Service Unavailable\r\n\
+                     Content-Length: {declared}\r\n\
+                     Content-Type: text/plain\r\n\
+                     Connection: close\r\n\
+                     \r\n",
+                );
+                let _ = socket.write_all(resp.as_bytes()).await;
+                let _ = socket.shutdown().await;
+            }
+        });
+
+        let response = reqwest::get(format!("http://{addr}/"))
+            .await
+            .expect("connect");
+        let body = read_capped_error_text(response).await;
+        assert_eq!(
+            body, "",
+            "cap-overflow on the error body must collapse to empty string, got {body:?}"
+        );
+    }
+
+    /// reqwest's `Policy::limited` (the policy we pin on every
+    /// `build_http_client_*` call) strips `Authorization`,
+    /// `Cookie`, and `Proxy-Authorization` from the request that
+    /// follows a cross-origin redirect. Pinning the property in a
+    /// behavioural test guarantees the bearer-leak hazard from a
+    /// compromised registry that 30x's to an attacker host stays
+    /// closed even if a future builder edit removes the explicit
+    /// `.redirect(Policy::limited(10))` call.
+    #[tokio::test]
+    async fn cross_host_redirect_strips_authorization_header() {
+        use wiremock::matchers::{header_exists, method, path as match_path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        use wiremock::{Request, Respond};
+
+        // Server B captures whatever the client sends after the redirect.
+        let server_b = MockServer::start().await;
+
+        // A 302 from A to B is built dynamically so the redirect target
+        // matches whatever ephemeral port the test runtime picked.
+        struct RedirectTo(String);
+        impl Respond for RedirectTo {
+            fn respond(&self, _req: &Request) -> ResponseTemplate {
+                ResponseTemplate::new(302).append_header("Location", self.0.as_str())
+            }
+        }
+
+        let server_a = MockServer::start().await;
+        let b_target = format!("{}/landing", server_b.uri());
+        Mock::given(method("GET"))
+            .and(match_path("/hop"))
+            .respond_with(RedirectTo(b_target))
+            .expect(1)
+            .mount(&server_a)
+            .await;
+
+        // Server B: any GET to `/landing` must NOT carry an
+        // `Authorization` header. `header_exists` is the negative
+        // matcher — by asserting an `expect(0)` mock on this shape
+        // we'd silently pass even if no request arrived, so we set
+        // up TWO mocks and let the harness count.
+        let bearer_hit = Mock::given(method("GET"))
+            .and(match_path("/landing"))
+            .and(header_exists("authorization"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("LEAKED"))
+            .expect(0)
+            .named("authorization-should-NOT-leak");
+        let clean_hit = Mock::given(method("GET"))
+            .and(match_path("/landing"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("OK"))
+            .expect(1)
+            .named("post-redirect-request-without-authorization");
+        server_b.register(bearer_hit).await;
+        server_b.register(clean_hit).await;
+
+        let client = RegistryClient::build_http_client_with_tls(
+            CONNECT_TIMEOUT,
+            READ_TIMEOUT,
+            &TlsOverrides::default(),
+        )
+        .expect("default TLS config builds");
+
+        let body = client
+            .get(format!("{}/hop", server_a.uri()))
+            .bearer_auth("secret-bearer-token")
+            .send()
+            .await
+            .expect("redirect chain should resolve")
+            .text()
+            .await
+            .expect("body");
+        assert_eq!(
+            body, "OK",
+            "post-redirect response must come from the no-auth mock; got {body:?}"
+        );
+
+        // wiremock asserts `expect(N)` counts on Drop; force the check
+        // explicitly so the failure mode is loud and immediate.
+        server_a.verify().await;
+        server_b.verify().await;
     }
 }

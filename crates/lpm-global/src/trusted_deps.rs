@@ -49,6 +49,7 @@ use lpm_common::{LpmError, LpmRoot};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fs;
+use std::io::Write;
 use std::path::Path;
 
 /// Binding metadata for one entry in the global trusted-deps map.
@@ -236,6 +237,26 @@ impl GlobalTrustedDependencies {
     pub fn remove(&mut self, name: &str, version: &str) -> bool {
         self.trusted.remove(&rich_key(name, version)).is_some()
     }
+
+    /// Bulk-remove trust bindings. Returns the count of entries that
+    /// were actually present and removed (entries that weren't in the
+    /// map are silently skipped — idempotent).
+    ///
+    /// Used by the uninstall path's M76 trust-prune step + recovery's
+    /// `roll_forward_uninstall` replay. Both consume an
+    /// `uninstall_trust_prune: Vec<TrustPruneEntry>` set computed
+    /// against the uninstalling install's reachable tree, and apply
+    /// it via this helper for atomic transaction shape (one
+    /// read-modify-write under `.tx.lock`).
+    pub fn remove_many(&mut self, entries: &[(&str, &str)]) -> usize {
+        let mut removed = 0usize;
+        for (name, version) in entries {
+            if self.remove(name, version) {
+                removed += 1;
+            }
+        }
+        removed
+    }
 }
 
 /// Read the global trusted-deps file. Missing file is NOT an error —
@@ -259,31 +280,33 @@ pub fn read_at(path: &Path) -> Result<GlobalTrustedDependencies, LpmError> {
     // Windows long-path support — no-op on POSIX.
     let path = lpm_common::as_extended_path(path);
     let path = path.as_path();
-    match fs::read(path) {
-        Ok(bytes) => {
-            let value: GlobalTrustedDependencies = serde_json::from_slice(&bytes).map_err(|e| {
-                LpmError::Script(format!(
-                    "{} is malformed: {e}. Delete it to reset the global trust list, \
-                         or fix the JSON manually.",
-                    path.display()
-                ))
-            })?;
-            if value.schema_version > SCHEMA_VERSION {
-                return Err(LpmError::Script(format!(
-                    "{} was written by a newer lpm (schema {}); this binary only understands \
-                     schema up to {}. Upgrade lpm or use a compatible binary.",
-                    path.display(),
-                    value.schema_version,
-                    SCHEMA_VERSION,
-                )));
-            }
-            Ok(value)
-        }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            Ok(GlobalTrustedDependencies::default())
-        }
-        Err(e) => Err(LpmError::Io(e)),
+    // Cap the read before any bytes are buffered. A bloated trust
+    // file collapses to the same "missing state" shape callers
+    // already handle (default empty list, recoverable from the
+    // next `lpm approve-scripts --global` write).
+    let bytes =
+        match lpm_common::read_capped_state_file(path, lpm_common::STATE_FILE_SIZE_CAP_BYTES) {
+            Ok(Some(b)) => b,
+            Ok(None) => return Ok(GlobalTrustedDependencies::default()),
+            Err(e) => return Err(LpmError::Io(e)),
+        };
+    let value: GlobalTrustedDependencies = serde_json::from_slice(&bytes).map_err(|e| {
+        LpmError::Script(format!(
+            "{} is malformed: {e}. Delete it to reset the global trust list, \
+                 or fix the JSON manually.",
+            path.display()
+        ))
+    })?;
+    if value.schema_version > SCHEMA_VERSION {
+        return Err(LpmError::Script(format!(
+            "{} was written by a newer lpm (schema {}); this binary only understands \
+             schema up to {}. Upgrade lpm or use a compatible binary.",
+            path.display(),
+            value.schema_version,
+            SCHEMA_VERSION,
+        )));
     }
+    Ok(value)
 }
 
 /// Write atomically. Serialized body is pretty-printed with a
@@ -303,8 +326,29 @@ pub fn write_at(path: &Path, value: &GlobalTrustedDependencies) -> Result<(), Lp
     let mut body = serde_json::to_string_pretty(value)
         .map_err(|e| LpmError::Script(format!("serialize trusted-deps: {e}")))?;
     body.push('\n');
-    let tmp_path = path.with_extension("json.tmp");
-    fs::write(&tmp_path, body.as_bytes())?;
+    // Per-pid tmp suffix avoids racing concurrent lpm invocations on
+    // the same trust file; the parent .tx.lock serializes the
+    // logical write, but a crashed prior run could leave a stale
+    // `*.json.tmp` and the next start should not be tripped by it.
+    let tmp_path = path.with_extension(format!("json.tmp.{}", std::process::id()));
+    let tmp_path = lpm_common::as_extended_path(&tmp_path);
+    let mut open_opts = fs::OpenOptions::new();
+    open_opts.create(true).write(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        // The file lists private package names/versions plus
+        // approval hashes/provenance and drives lifecycle-script
+        // authorization. Owner-only matches the broader credential-
+        // metadata posture; it must not land world-readable on
+        // permissive umasks.
+        open_opts.mode(0o600);
+    }
+    {
+        let mut f = open_opts.open(&tmp_path).map_err(LpmError::Io)?;
+        f.write_all(body.as_bytes()).map_err(LpmError::Io)?;
+        f.sync_all().map_err(LpmError::Io)?;
+    }
     if let Err(e) = fs::rename(&tmp_path, path) {
         let _ = fs::remove_file(&tmp_path);
         return Err(LpmError::Io(e));
@@ -499,6 +543,50 @@ mod tests {
         assert!(!gtd.remove("ghost", "1.0.0"));
     }
 
+    /// M76: bulk-prune helper drops only the listed entries and
+    /// returns the count actually removed. Pin both the selectivity
+    /// (other entries survive) and the count contract so the
+    /// uninstall envelope's `trust_entries_pruned` field stays
+    /// honest.
+    #[test]
+    fn remove_many_drops_only_listed_entries_returns_count() {
+        let mut gtd = GlobalTrustedDependencies::default();
+        gtd.insert_strict("a", "1.0.0", None, None);
+        gtd.insert_strict("b", "2.0.0", None, None);
+        gtd.insert_strict("c", "3.0.0", None, None);
+        let removed = gtd.remove_many(&[("a", "1.0.0"), ("c", "3.0.0")]);
+        assert_eq!(removed, 2);
+        assert!(!gtd.trusted.contains_key("a@1.0.0"));
+        assert!(gtd.trusted.contains_key("b@2.0.0"));
+        assert!(!gtd.trusted.contains_key("c@3.0.0"));
+    }
+
+    /// M76: recovery may replay the prune after a successful
+    /// in-tx prune; the second invocation must be a no-op (count = 0)
+    /// rather than an error. Same shape as the existing
+    /// [`Self::remove`] idempotency contract.
+    #[test]
+    fn remove_many_is_idempotent_for_absent_entries() {
+        let mut gtd = GlobalTrustedDependencies::default();
+        gtd.insert_strict("a", "1.0.0", None, None);
+        // First call drops the present entry.
+        assert_eq!(gtd.remove_many(&[("a", "1.0.0"), ("ghost", "9.9.9")]), 1);
+        // Second call finds nothing — returns 0, doesn't error.
+        assert_eq!(gtd.remove_many(&[("a", "1.0.0"), ("ghost", "9.9.9")]), 0);
+        assert!(gtd.trusted.is_empty());
+    }
+
+    /// M76: empty input must be safe (no-op, count = 0). Recovery's
+    /// replay path passes whatever the Intent stored, which is empty
+    /// for installs and upgrades — the common case must not panic.
+    #[test]
+    fn remove_many_empty_input_returns_zero() {
+        let mut gtd = GlobalTrustedDependencies::default();
+        gtd.insert_strict("a", "1.0.0", None, None);
+        assert_eq!(gtd.remove_many(&[]), 0);
+        assert_eq!(gtd.trusted.len(), 1);
+    }
+
     #[test]
     fn read_malformed_json_returns_script_error_naming_path() {
         let tmp = TempDir::new().unwrap();
@@ -672,5 +760,64 @@ mod tests {
         );
         let m = gtd.matches_strict("esbuild", "0.25.1", Some("sha512-e"), Some("sha256-s"));
         assert_eq!(m, TrustMatch::Strict);
+    }
+
+    /// A bloated `trusted-dependencies.json` must collapse to the
+    /// default-empty trust list without buffering or parsing the
+    /// payload. Matches the "missing state" fall-through that other
+    /// callers of `read_capped_state_file` rely on.
+    #[test]
+    fn read_over_cap_file_returns_default_empty_trust_list() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join(FILENAME);
+        // Cap is 16 MB; write 17 MB of zeros so the cap fires.
+        let body = vec![
+            b'x';
+            (lpm_common::STATE_FILE_SIZE_CAP_BYTES as usize).saturating_add(1024 * 1024)
+        ];
+        std::fs::write(&path, &body).unwrap();
+        let read = read_at(&path).expect("over-cap must not be an error");
+        assert_eq!(read, GlobalTrustedDependencies::default());
+    }
+
+    /// The trust file lists private package names + approval hashes
+    /// and drives lifecycle-script authorization. Owner-only perms
+    /// keep it from leaking what global packages a user has trusted
+    /// on a shared host.
+    #[cfg(unix)]
+    #[test]
+    fn write_creates_file_with_0o600_perms() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join(FILENAME);
+        let mut gtd = GlobalTrustedDependencies::default();
+        gtd.insert_strict(
+            "x",
+            "1.0.0",
+            Some("sha512-e".into()),
+            Some("sha256-s".into()),
+        );
+        write_at(&path, &gtd).unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "expected 0o600, got 0o{mode:o}");
+    }
+
+    /// Successful writes must not leave a `*.json.tmp.<pid>` straggler
+    /// behind. Pins the rename-then-clean-up contract and guards
+    /// against a future refactor that breaks the same-FS rename arm.
+    #[test]
+    fn write_leaves_no_tempfile_on_success() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join(FILENAME);
+        let mut gtd = GlobalTrustedDependencies::default();
+        gtd.insert_strict("x", "1.0.0", None, None);
+        write_at(&path, &gtd).unwrap();
+        let prefix = format!("{FILENAME}.tmp.");
+        let leaks: Vec<_> = std::fs::read_dir(tmp.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().starts_with(&prefix))
+            .collect();
+        assert!(leaks.is_empty(), "tempfile leaked: {leaks:?}");
     }
 }

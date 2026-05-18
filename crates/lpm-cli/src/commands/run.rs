@@ -1596,7 +1596,20 @@ pub async fn dlx(
     // `lpm_runner::dlx::touch_cache` and the rev-3 audit fix.
     install.touch();
 
-    // Execute the binary
+    // dlx is the only install/run surface with no sandbox, no
+    // triage-advisor consent gate, and no `trustedDependencies` check.
+    // Surface the trust posture on every invocation so support bundles
+    // capture which package was invoked under this posture.
+    tracing::warn!(
+        target: "lpm_cli::dlx",
+        package = package_spec,
+        "lpm dlx runs `{}` with no sandbox and no consent gate. Only invoke `lpm dlx` against packages you trust.",
+        package_spec,
+    );
+    output::warn(&format!(
+        "running `{package_spec}` with no sandbox — credential env vars are stripped, but cwd and ambient privileges are inherited"
+    ));
+
     lpm_runner::dlx::exec_dlx_binary(project_dir, install.root(), package_spec, extra_args)
 }
 

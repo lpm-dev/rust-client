@@ -180,23 +180,36 @@ fn copy_member_source_recursive(
                 std::os::unix::fs::symlink(&target, &dst_path).map_err(|e| {
                     LpmError::Script(format!("failed to recreate symlink {dst_path:?}: {e}"))
                 })?;
+                stats.files_copied += 1;
             }
             #[cfg(windows)]
             {
-                // Windows symlink handling is more complex. For,
-                // copy the symlink target's contents instead. A future
-                // phase can handle Windows junctions properly.
-                if let Ok(target_meta) = std::fs::metadata(&src_path) {
-                    if target_meta.is_dir() {
-                        std::fs::create_dir_all(&dst_path).ok();
-                        copy_member_source_recursive(&src_path, &dst_path, stats)?;
-                    } else {
-                        std::fs::copy(&src_path, &dst_path)
-                            .map_err(|e| LpmError::Script(format!("symlink copy failed: {e}")))?;
-                    }
-                }
+                // M42: a Windows symlink/junction whose target sits
+                // outside the source member tree was previously
+                // followed: `std::fs::metadata` resolves the target,
+                // dir-symlinks recursed, file-symlinks were copied
+                // with `std::fs::copy`. A malicious repo could include
+                // a junction under the member tree pointing at user
+                // secrets and have those bytes copied into the deploy
+                // output despite the deny list.
+                //
+                // Skip every symlink/junction with a tracing::warn
+                // instead. Loss of fidelity for legitimate
+                // intra-source symlinks; the safer posture matches
+                // the Unix branch's "preserve as-is, never follow"
+                // contract and refuses to silently materialise
+                // out-of-source bytes.
+                tracing::warn!(
+                    target: "lpm_cli::deploy",
+                    src = %src_path.display(),
+                    "skipping Windows symlink/junction in deploy member tree (M42 — refuses to follow out-of-source targets)"
+                );
+                stats.files_skipped += 1;
             }
-            stats.files_copied += 1;
+            #[cfg(not(any(unix, windows)))]
+            {
+                stats.files_skipped += 1;
+            }
         } else {
             // Regular file: hardlink first, fall back to copy.
             // Hardlinks are zero-cost on the same filesystem and preserve

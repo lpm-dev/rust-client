@@ -368,6 +368,14 @@ pub fn bin_name_from_spec(spec: &str) -> &str {
 /// shell injection. Arguments are passed as separate argv entries, so
 /// metacharacters like `;`, `|`, `&`, `$()` are treated as literals.
 ///
+/// Strips credential-bearing and runtime-hijack inherited env vars
+/// (`LPM_TOKEN`, `NPM_TOKEN`, `GITHUB_TOKEN`, `AWS_*`, `LD_PRELOAD`,
+/// `NODE_OPTIONS`, `*_SECRET`/`*_PASSWORD`/`*_KEY`/`*_PRIVATE_KEY`
+/// suffix matches, …) before spawn. The dlx binary is a
+/// registry-distributed third-party executable run with no sandbox;
+/// without this scrub a hostile package would receive every parent
+/// bearer plus dynamic-linker / language-runtime hijack carriers.
+///
 /// Returns the configured `Command` ready to be spawned.
 pub fn build_dlx_command(
     project_dir: &Path,
@@ -397,6 +405,7 @@ pub fn build_dlx_command(
     let path = path_parts.join(separator);
 
     let mut command = Command::new(&bin_path);
+    crate::shell::strip_inherited_env_hooks(&mut command);
     command
         .args(extra_args)
         .current_dir(project_dir)
@@ -792,6 +801,52 @@ mod tests {
             .map(|a| a.to_string_lossy().to_string())
             .collect();
         assert!(args.is_empty(), "should have no args");
+    }
+
+    #[test]
+    fn build_dlx_command_strips_credential_and_hijack_env_carriers() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache_dir = dir.path().join("cache");
+        let bin_dir = cache_dir.join("node_modules/.bin");
+        std::fs::create_dir_all(&bin_dir).unwrap();
+
+        let cmd = build_dlx_command(dir.path(), &cache_dir, "cowsay", &[]);
+
+        let stripped: Vec<&str> = cmd
+            .get_envs()
+            .filter_map(|(k, v)| if v.is_none() { k.to_str() } else { None })
+            .collect();
+
+        for required in [
+            "LPM_TOKEN",
+            "NPM_TOKEN",
+            "GITHUB_TOKEN",
+            "AWS_SECRET_ACCESS_KEY",
+            "LPM_KEY_PASSPHRASE",
+            "LD_PRELOAD",
+            "DYLD_INSERT_LIBRARIES",
+            "NODE_OPTIONS",
+            "PYTHONPATH",
+            "BASH_ENV",
+            "GIT_SSH_COMMAND",
+        ] {
+            assert!(
+                stripped.contains(&required),
+                "dlx command should env_remove `{required}`; saw stripped set {stripped:?}"
+            );
+        }
+
+        let path_override = cmd.get_envs().find_map(|(k, v)| {
+            if k.to_str() == Some("PATH") {
+                v.map(|val| val.to_string_lossy().into_owned())
+            } else {
+                None
+            }
+        });
+        assert!(
+            path_override.is_some(),
+            "PATH should still be set explicitly by the dlx command builder"
+        );
     }
 
     // --- Cache directory permissions test ---
