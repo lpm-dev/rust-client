@@ -804,7 +804,7 @@ fn extract_jwt_subject_with_issuers(
 /// starting with `-----` and base64-decoded the rest, which let a
 /// hostile Fulcio response smuggle bytes into the DER by interleaving
 /// extra labels or trailing content.
-fn pem_to_der(pem: &str) -> Result<Vec<u8>, LpmError> {
+pub(crate) fn pem_to_der(pem: &str) -> Result<Vec<u8>, LpmError> {
     const BEGIN: &str = "-----BEGIN CERTIFICATE-----";
     const END: &str = "-----END CERTIFICATE-----";
 
