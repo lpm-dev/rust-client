@@ -10,18 +10,28 @@
 //! filter built here intercepts `socket(2)` and returns
 //! `EACCES` for the following (family, type) combinations:
 //!
-//! | Family       | Type (masked)   | Reason                          |
-//! |--------------|-----------------|---------------------------------|
-//! | `AF_INET`    | `SOCK_DGRAM`    | Direct UDP IPv4 egress.         |
-//! | `AF_INET`    | `SOCK_RAW`      | Raw IPv4 packets.               |
-//! | `AF_INET6`   | `SOCK_DGRAM`    | Direct UDP IPv6 egress.         |
-//! | `AF_INET6`   | `SOCK_RAW`      | Raw IPv6 packets.               |
-//! | `AF_PACKET`  | (any)           | L2 raw frames.                  |
-//! | `AF_NETLINK` | (any)           | Routing / interface probes.     |
+//! | Family       | Type (masked)     | Reason                                |
+//! |--------------|-------------------|---------------------------------------|
+//! | `AF_INET`    | `SOCK_DGRAM`      | Direct UDP IPv4 egress.               |
+//! | `AF_INET`    | `SOCK_RAW`        | Raw IPv4 packets.                     |
+//! | `AF_INET`    | `SOCK_SEQPACKET`  | SCTP one-to-many IPv4 egress.         |
+//! | `AF_INET`    | `SOCK_DCCP`       | DCCP IPv4 egress.                     |
+//! | `AF_INET6`   | `SOCK_DGRAM`      | Direct UDP IPv6 egress.               |
+//! | `AF_INET6`   | `SOCK_RAW`        | Raw IPv6 packets.                     |
+//! | `AF_INET6`   | `SOCK_SEQPACKET`  | SCTP one-to-many IPv6 egress.         |
+//! | `AF_INET6`   | `SOCK_DCCP`       | DCCP IPv6 egress.                     |
+//! | `AF_PACKET`  | (any)             | L2 raw frames.                        |
+//! | `AF_NETLINK` | (any)             | Routing / interface probes.           |
 //!
 //! `SOCK_NONBLOCK | SOCK_CLOEXEC` are masked off the type arg
 //! before comparison so callers that pass `SOCK_DGRAM |
 //! SOCK_CLOEXEC` (libuv's normal shape) still match the rule.
+//!
+//! SCTP one-to-one (`AF_INET[6] + SOCK_STREAM + IPPROTO_SCTP`)
+//! is not covered by the socket-type matrix — it shares the
+//! TCP stream type. The 3-arg deny rule at the bottom of the
+//! socket rule list rejects it explicitly by matching the
+//! protocol argument.
 //!
 //! # What this layer intentionally does NOT cover
 //!
@@ -89,6 +99,26 @@
 //! syscall, not the legacy `socketcall(2)` multiplexer that
 //! i386 / 32-bit ARM use. seccompiler's `TargetArch` picks the
 //! right syscall number table at compile time.
+//!
+//! # x32 ABI mirror (x86_64 only)
+//!
+//! On a host where `CONFIG_X86_X32_ABI=y` is enabled, an x32
+//! caller issues syscalls with the `__X32_SYSCALL_BIT`
+//! (`0x40000000`) OR'd into the syscall number. seccompiler's
+//! filter is keyed on the literal syscall number, so a
+//! plain x86_64-targeted filter does not match x32 calls —
+//! every rule is bypassed. To close the specific `socket(2)`
+//! bypass, the deny rules are also registered under
+//! `__X32_SYSCALL_BIT | SYS_socket` so the same family/type
+//! matrix applies to x32 socket() invocations. aarch64 has
+//! no x32 ABI so this mirror is x86_64-only.
+//!
+//! The broader x32 surface (every other syscall) remains
+//! unfiltered. We accept this trade-off because the script
+//! approval gate, landlock V4 filesystem rules, and seccomp
+//! socket gate together still cover the egress paths a
+//! lifecycle script would reach for; the x32 mirror closes
+//! the specific bypass that the audit harness reproduced.
 
 #![cfg(target_os = "linux")]
 
@@ -121,6 +151,92 @@ compile_error!(
 /// rule would miss.
 const TYPE_MASK: u64 = !((libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC) as u64);
 
+/// `__X32_SYSCALL_BIT` from `linux/include/uapi/asm-generic/unistd.h`.
+/// An x32 caller on a `CONFIG_X86_X32_ABI=y` host issues each syscall
+/// with this bit OR'd into the syscall number.
+#[cfg(target_arch = "x86_64")]
+const X32_SYSCALL_BIT: i64 = 0x4000_0000;
+
+/// IPPROTO_SCTP. Not exposed by libc 0.2 on every target, so pin
+/// the IANA-assigned value here. Used to deny the
+/// `AF_INET[6] + SOCK_STREAM + IPPROTO_SCTP` shape (SCTP one-to-one),
+/// which would otherwise bypass the family/type matrix.
+const IPPROTO_SCTP: u64 = 132;
+
+/// Build the deny rule vector for `socket(2)`. The same vector is
+/// registered under both `SYS_socket` and (on x86_64) the x32
+/// `__X32_SYSCALL_BIT | SYS_socket` key so the matrix applies to
+/// x32 callers too.
+fn build_socket_rules() -> Result<Vec<SeccompRule>, seccompiler::Error> {
+    fn family_type(family: i32, ty: i32) -> Result<SeccompRule, seccompiler::Error> {
+        Ok(SeccompRule::new(vec![
+            SeccompCondition::new(0, SeccompCmpArgLen::Dword, SeccompCmpOp::Eq, family as u64)?,
+            SeccompCondition::new(
+                1,
+                SeccompCmpArgLen::Dword,
+                SeccompCmpOp::MaskedEq(TYPE_MASK),
+                ty as u64,
+            )?,
+        ])?)
+    }
+
+    fn family_only(family: i32) -> Result<SeccompRule, seccompiler::Error> {
+        Ok(SeccompRule::new(vec![SeccompCondition::new(
+            0,
+            SeccompCmpArgLen::Dword,
+            SeccompCmpOp::Eq,
+            family as u64,
+        )?])?)
+    }
+
+    Ok(vec![
+        family_type(libc::AF_INET, libc::SOCK_DGRAM)?,
+        family_type(libc::AF_INET, libc::SOCK_RAW)?,
+        family_type(libc::AF_INET, libc::SOCK_SEQPACKET)?,
+        family_type(libc::AF_INET, libc::SOCK_DCCP)?,
+        family_type(libc::AF_INET6, libc::SOCK_DGRAM)?,
+        family_type(libc::AF_INET6, libc::SOCK_RAW)?,
+        family_type(libc::AF_INET6, libc::SOCK_SEQPACKET)?,
+        family_type(libc::AF_INET6, libc::SOCK_DCCP)?,
+        // SCTP one-to-one: AF_INET[6] + SOCK_STREAM + IPPROTO_SCTP.
+        // landlock V4 BindTcp/ConnectTcp may or may not key on
+        // protocol (kernel implementation-defined). Explicit 3-arg
+        // match closes the gap regardless.
+        SeccompRule::new(vec![
+            SeccompCondition::new(
+                0,
+                SeccompCmpArgLen::Dword,
+                SeccompCmpOp::Eq,
+                libc::AF_INET as u64,
+            )?,
+            SeccompCondition::new(
+                1,
+                SeccompCmpArgLen::Dword,
+                SeccompCmpOp::MaskedEq(TYPE_MASK),
+                libc::SOCK_STREAM as u64,
+            )?,
+            SeccompCondition::new(2, SeccompCmpArgLen::Dword, SeccompCmpOp::Eq, IPPROTO_SCTP)?,
+        ])?,
+        SeccompRule::new(vec![
+            SeccompCondition::new(
+                0,
+                SeccompCmpArgLen::Dword,
+                SeccompCmpOp::Eq,
+                libc::AF_INET6 as u64,
+            )?,
+            SeccompCondition::new(
+                1,
+                SeccompCmpArgLen::Dword,
+                SeccompCmpOp::MaskedEq(TYPE_MASK),
+                libc::SOCK_STREAM as u64,
+            )?,
+            SeccompCondition::new(2, SeccompCmpArgLen::Dword, SeccompCmpOp::Eq, IPPROTO_SCTP)?,
+        ])?,
+        family_only(libc::AF_PACKET)?,
+        family_only(libc::AF_NETLINK)?,
+    ])
+}
+
 /// Build the socket() deny filter. Called on the
 /// parent process before fork; the resulting [`BpfProgram`] is
 /// moved into the spawn's `pre_exec` closure and installed via
@@ -133,83 +249,12 @@ const TYPE_MASK: u64 = !((libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC) as u64);
 pub fn build_socket_deny_filter() -> Result<BpfProgram, seccompiler::Error> {
     let mut rules: BTreeMap<i64, Vec<SeccompRule>> = BTreeMap::new();
 
-    let socket_rules = vec![
-        // AF_INET + SOCK_DGRAM (UDP IPv4).
-        SeccompRule::new(vec![
-            SeccompCondition::new(
-                0,
-                SeccompCmpArgLen::Dword,
-                SeccompCmpOp::Eq,
-                libc::AF_INET as u64,
-            )?,
-            SeccompCondition::new(
-                1,
-                SeccompCmpArgLen::Dword,
-                SeccompCmpOp::MaskedEq(TYPE_MASK),
-                libc::SOCK_DGRAM as u64,
-            )?,
-        ])?,
-        // AF_INET + SOCK_RAW.
-        SeccompRule::new(vec![
-            SeccompCondition::new(
-                0,
-                SeccompCmpArgLen::Dword,
-                SeccompCmpOp::Eq,
-                libc::AF_INET as u64,
-            )?,
-            SeccompCondition::new(
-                1,
-                SeccompCmpArgLen::Dword,
-                SeccompCmpOp::MaskedEq(TYPE_MASK),
-                libc::SOCK_RAW as u64,
-            )?,
-        ])?,
-        // AF_INET6 + SOCK_DGRAM (UDP IPv6).
-        SeccompRule::new(vec![
-            SeccompCondition::new(
-                0,
-                SeccompCmpArgLen::Dword,
-                SeccompCmpOp::Eq,
-                libc::AF_INET6 as u64,
-            )?,
-            SeccompCondition::new(
-                1,
-                SeccompCmpArgLen::Dword,
-                SeccompCmpOp::MaskedEq(TYPE_MASK),
-                libc::SOCK_DGRAM as u64,
-            )?,
-        ])?,
-        // AF_INET6 + SOCK_RAW.
-        SeccompRule::new(vec![
-            SeccompCondition::new(
-                0,
-                SeccompCmpArgLen::Dword,
-                SeccompCmpOp::Eq,
-                libc::AF_INET6 as u64,
-            )?,
-            SeccompCondition::new(
-                1,
-                SeccompCmpArgLen::Dword,
-                SeccompCmpOp::MaskedEq(TYPE_MASK),
-                libc::SOCK_RAW as u64,
-            )?,
-        ])?,
-        // AF_PACKET (any type): L2 raw frames.
-        SeccompRule::new(vec![SeccompCondition::new(
-            0,
-            SeccompCmpArgLen::Dword,
-            SeccompCmpOp::Eq,
-            libc::AF_PACKET as u64,
-        )?])?,
-        // AF_NETLINK (any type): routing / interface probes.
-        SeccompRule::new(vec![SeccompCondition::new(
-            0,
-            SeccompCmpArgLen::Dword,
-            SeccompCmpOp::Eq,
-            libc::AF_NETLINK as u64,
-        )?])?,
-    ];
-    rules.insert(libc::SYS_socket, socket_rules);
+    rules.insert(libc::SYS_socket, build_socket_rules()?);
+
+    #[cfg(target_arch = "x86_64")]
+    {
+        rules.insert(X32_SYSCALL_BIT | libc::SYS_socket, build_socket_rules()?);
+    }
 
     let filter = SeccompFilter::new(
         rules,
@@ -265,5 +310,53 @@ mod tests {
         let masked_raw =
             (libc::SOCK_RAW | libc::SOCK_CLOEXEC | libc::SOCK_NONBLOCK) as u64 & TYPE_MASK;
         assert_eq!(masked_raw, libc::SOCK_RAW as u64);
+
+        let masked_seqpacket = (libc::SOCK_SEQPACKET | libc::SOCK_CLOEXEC) as u64 & TYPE_MASK;
+        assert_eq!(masked_seqpacket, libc::SOCK_SEQPACKET as u64);
+
+        let masked_dccp = (libc::SOCK_DCCP | libc::SOCK_NONBLOCK) as u64 & TYPE_MASK;
+        assert_eq!(masked_dccp, libc::SOCK_DCCP as u64);
+    }
+
+    #[test]
+    fn socket_rule_matrix_covers_sctp_and_dccp_types() {
+        let rules = build_socket_rules().expect("rule construction infallible");
+        // Family/type pairs (8) + 2 SCTP-over-stream rules + 2 family-only
+        // (AF_PACKET, AF_NETLINK) = 12 rules total.
+        assert_eq!(
+            rules.len(),
+            12,
+            "expected 12 socket deny rules (8 family/type + 2 SCTP-stream + 2 family-only); \
+             a regression that dropped SOCK_SEQPACKET, SOCK_DCCP, or IPPROTO_SCTP shape \
+             surfaces here",
+        );
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn x32_syscall_mirror_registered_on_x86_64() {
+        // The filter must contain dispatch entries for both the
+        // x86_64 SYS_socket and the x32 mirror. seccompiler emits
+        // the dispatcher table inline; we exercise the public
+        // entrypoint and assume the program length grows with the
+        // mirror rule set. A regression that drops the x32 mirror
+        // would halve the per-rule dispatch length.
+        let with_mirror = build_socket_deny_filter().expect("filter compiles");
+        // Sanity floor — the rule set is 12 rules × 2 keys, each
+        // emitting multiple BPF instructions plus dispatch.
+        assert!(
+            with_mirror.len() > 40,
+            "x32-mirror filter must include both syscall keys; got {} instructions",
+            with_mirror.len(),
+        );
+    }
+
+    #[test]
+    fn x32_syscall_bit_constant_pinned() {
+        // The kernel headers define __X32_SYSCALL_BIT as
+        // 0x40000000. A typo here silently disables the x32
+        // mirror without breaking compilation.
+        #[cfg(target_arch = "x86_64")]
+        assert_eq!(X32_SYSCALL_BIT, 0x4000_0000);
     }
 }

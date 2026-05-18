@@ -1710,16 +1710,37 @@ fn platform_shell_invocation(cmd: &str) -> (&'static str, Vec<String>) {
 /// for exactly this reason; the kill-tree call routes through
 /// [`lpm_sandbox::terminate_sandbox_tree`] which calls
 /// `TerminateJobObject` and brings the whole tree down at once.
+///
+/// On Unix, `kill(-pid, SIGKILL)` follows the process group. A
+/// malicious lifecycle script can escape via `setpgid(0,0)` /
+/// `setsid()` — once detached, the script's pid is no longer in the
+/// pgrp the kill targets, so it survives. We close that escape by
+/// snapshotting the descendant-pid tree (via `ps -A -o pid=,ppid=`)
+/// BEFORE issuing the pgrp kill, then sending SIGKILL to each
+/// captured descendant individually. Captured pids that already died
+/// in the pgrp pass return ESRCH which we discard; pgid-detached
+/// pids still match the captured PPID chain and get killed by id.
 fn kill_process_tree(child: &mut std::process::Child) {
     #[cfg(unix)]
     {
-        // Kill the entire process group (negative PID = group kill).
-        // The child was spawned with process_group(0) so its PID is the PGID.
-        let pid = child.id() as i32;
-        // SAFETY: kill(-pid) sends SIGKILL to all processes in the group.
-        // This is the standard Unix pattern for cleaning up a process tree.
+        let pid = child.id();
+        // Snapshot descendants BEFORE the kill — once the pgrp is
+        // SIGKILL'd, surviving orphans get reparented to init (or a
+        // subreaper) and their original PPID is lost.
+        let descendants = collect_unix_descendants(pid);
+        let signed = pid as i32;
+        // SAFETY: kill(-pid) sends SIGKILL to the whole process group.
         unsafe {
-            libc::kill(-pid, libc::SIGKILL);
+            libc::kill(-signed, libc::SIGKILL);
+        }
+        // Then mop up any pgid-detached survivors by individual pid.
+        for d in descendants {
+            // SAFETY: kill(pid) sends SIGKILL to one process. ESRCH
+            // (already gone) is harmless and expected for most
+            // entries since the pgrp kill above usually catches them.
+            unsafe {
+                libc::kill(d as i32, libc::SIGKILL);
+            }
         }
     }
     #[cfg(not(unix))]
@@ -1734,6 +1755,117 @@ fn kill_process_tree(child: &mut std::process::Child) {
         // NoopSandbox routed through here).
         lpm_sandbox::terminate_sandbox_tree(child.id());
         let _ = child.kill();
+    }
+}
+
+/// Collect every descendant pid of `root` by shelling out to
+/// `ps -A -o pid=,ppid=` and walking the PPID chain. Returns an
+/// empty Vec on any failure — the caller's pgrp kill is the primary
+/// path; descendant kill is defense-in-depth against `setpgid` /
+/// `setsid` escapes (M20).
+///
+/// Output rows are `<pid> <ppid>` per line with trailing whitespace.
+/// Both BSD `ps` (macOS) and procps `ps` (Linux) honor `-A -o
+/// pid=,ppid=` identically — the `=` suffix on each format spec
+/// suppresses the header row, so no parsing of column headers is
+/// needed.
+#[cfg(unix)]
+fn collect_unix_descendants(root: u32) -> Vec<u32> {
+    let out = match std::process::Command::new("ps")
+        .args(["-A", "-o", "pid=,ppid="])
+        .output()
+    {
+        Ok(o) if o.status.success() => o.stdout,
+        _ => return Vec::new(),
+    };
+    let text = match std::str::from_utf8(&out) {
+        Ok(t) => t,
+        Err(_) => return Vec::new(),
+    };
+    collect_descendants_from_ps_output(text, root)
+}
+
+/// Pure-logic helper for [`collect_unix_descendants`] — split out so
+/// the BFS-and-parser shape is covered by deterministic unit tests
+/// without spawning `ps`.
+#[cfg(unix)]
+fn collect_descendants_from_ps_output(text: &str, root: u32) -> Vec<u32> {
+    use std::collections::HashMap;
+    let mut children: HashMap<u32, Vec<u32>> = HashMap::new();
+    for line in text.lines() {
+        let mut it = line.split_ascii_whitespace();
+        let pid = match it.next().and_then(|s| s.parse::<u32>().ok()) {
+            Some(v) => v,
+            None => continue,
+        };
+        let ppid = match it.next().and_then(|s| s.parse::<u32>().ok()) {
+            Some(v) => v,
+            None => continue,
+        };
+        children.entry(ppid).or_default().push(pid);
+    }
+    let mut out = Vec::new();
+    let mut frontier = vec![root];
+    while let Some(p) = frontier.pop() {
+        if let Some(kids) = children.get(&p) {
+            for k in kids {
+                if *k != root {
+                    out.push(*k);
+                    frontier.push(*k);
+                }
+            }
+        }
+    }
+    out
+}
+
+#[cfg(all(test, unix))]
+mod kill_tree_tests {
+    use super::collect_descendants_from_ps_output;
+
+    #[test]
+    fn descendants_bfs_walks_ppid_chain_two_levels() {
+        // root=100; 200 is child; 300 is grandchild via 200.
+        // 999 is unrelated. Expected output: {200, 300} in some order.
+        let ps = "  100   1\n  200 100\n  300 200\n  999   1\n";
+        let mut got = collect_descendants_from_ps_output(ps, 100);
+        got.sort();
+        assert_eq!(got, vec![200, 300]);
+    }
+
+    #[test]
+    fn descendants_handles_pgid_detached_orphan_by_ppid_chain() {
+        // Setpgid escapee: pid 500 detached pgrp but its PPID is
+        // still 400 (the lifecycle script root). The BFS must catch
+        // it via PPID alone.
+        let ps = "  400   1\n  500 400\n  600   1\n";
+        let got = collect_descendants_from_ps_output(ps, 400);
+        assert_eq!(got, vec![500]);
+    }
+
+    #[test]
+    fn descendants_returns_empty_on_no_match() {
+        let ps = "  10   1\n  20  10\n";
+        let got = collect_descendants_from_ps_output(ps, 999);
+        assert!(got.is_empty());
+    }
+
+    #[test]
+    fn descendants_tolerates_malformed_rows() {
+        // Garbage row + missing-ppid row + ok row. Parser must
+        // discard the malformed lines and still find the orphan.
+        let ps = "\ngarbage\n  abc def\n  10\n  20  10\n";
+        let got = collect_descendants_from_ps_output(ps, 10);
+        assert_eq!(got, vec![20]);
+    }
+
+    #[test]
+    fn descendants_does_not_include_root_in_a_self_loop() {
+        // Pathological self-parent shouldn't infinite-loop or
+        // include the root itself.
+        let ps = "  77  77\n  88  77\n";
+        let got = collect_descendants_from_ps_output(ps, 77);
+        assert_eq!(got, vec![88]);
     }
 }
 

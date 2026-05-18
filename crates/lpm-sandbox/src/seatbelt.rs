@@ -208,11 +208,36 @@ pub(crate) fn render_profile(
 
     // node-gyp + electron-rebuild fork helper processes + basic
     // process-info introspection the dynamic linker + libSystem
-    // call into. `process*` covers fork, exec, info, codesigning-
-    // status, and signalling; narrower splits exist but this is the
-    // least-surprising default for a script runner where sub-shells
-    // are routine.
+    // call into. We keep the `process*` wildcard for fork/exec/info
+    // but layer narrower denies on top — SBPL is last-match-wins,
+    // so any deny rule emitted AFTER the wildcard overrides for
+    // the specific operations it names.
+    //
+    // NB: SBPL does not expose `process-set-pgid` as an operation
+    // name (it is not in the Seatbelt grammar; sandbox-exec rejects
+    // it with "unbound variable: process-set-pgid"). The matching
+    // kill-tree-escape concern is closed in
+    // `lpm_sandbox::terminate_sandbox_tree` via descendant-PID
+    // enumeration; the SBPL profile only narrows process-exec here.
     out.push_str("(allow process*)\n");
+    // Block process-exec to the macOS automation / privilege-escalation
+    // surfaces. `osascript` reaches every AppleScript-controllable app
+    // through mach-lookup (which we still need to allow for libSystem),
+    // `security` is the Keychain CLI, `sudo`/`su` are explicit privilege
+    // boundary crossers, `open` launches GUI apps with the user's full
+    // session, and `codesign` is a write-capable signing oracle. None
+    // of these are legitimate post-install needs; package authors
+    // wanting GUI automation should not be reaching for `osascript`
+    // from a lifecycle script.
+    out.push_str("(deny process-exec\n");
+    out.push_str("  (literal \"/usr/bin/osascript\")\n");
+    out.push_str("  (literal \"/usr/bin/security\")\n");
+    out.push_str("  (literal \"/usr/bin/sudo\")\n");
+    out.push_str("  (literal \"/usr/bin/su\")\n");
+    out.push_str("  (literal \"/usr/bin/open\")\n");
+    out.push_str("  (literal \"/usr/bin/codesign\")\n");
+    out.push_str("  (subpath \"/Applications\")\n");
+    out.push_str(")\n");
     out.push_str("(allow signal)\n");
     // Mach lookups + sysctl reads the dynamic linker + libSystem
     // need. IOKit usage comes from libsystem (device enumeration
@@ -357,7 +382,7 @@ fn quoted_path(p: &Path, field: &str) -> Result<String, SandboxError> {
         .ok_or_else(|| SandboxError::ProfileRenderFailed {
             reason: format!("{field} is not valid UTF-8: {}", p.display()),
         })?;
-    Ok(scheme_quote(s))
+    scheme_quote_strict(s, field)
 }
 
 /// Resolve `path` through symlinks + relative components so the
@@ -414,6 +439,51 @@ fn scheme_quote(s: &str) -> String {
     }
     out.push('"');
     out
+}
+
+/// Strict variant of [`scheme_quote`] that fails on input containing
+/// characters that could perturb the SBPL string parser. Control
+/// characters (LF, CR, TAB, NUL, and the rest of the C0 range) are
+/// rejected — they have no place in a filesystem path, and an
+/// embedded LF on `sandboxWriteDirs[i]` (a string sourced from
+/// untrusted `package.json`) was the documented Seatbelt-injection
+/// vector: even though `"` and `\` were already escaped, a literal
+/// newline could terminate the string in parsers that treat LF as
+/// a token boundary. C1 controls (U+0080..U+009F) are rejected for
+/// the same reason — they're never legitimate path content.
+///
+/// Regular punctuation that some sources flag as Scheme-meta
+/// (`(`, `)`, `;`, `` ` ``, `'`) is passed through unchanged: per the
+/// SBPL grammar these are valid data inside a `"..."` string
+/// literal, and rejecting them would refuse legitimate paths
+/// (e.g. macOS project directories under `/Users/<n>/work (proj)/`).
+///
+/// The error surfaces as `ProfileRenderFailed` so the caller sees
+/// which field was rejected, with a hex code-point hint rather
+/// than the offending control byte itself in the message.
+fn scheme_quote_strict(s: &str, field: &str) -> Result<String, SandboxError> {
+    if let Some((idx, ch)) = s.char_indices().find(|(_, c)| is_sbpl_unsafe_char(*c)) {
+        return Err(SandboxError::ProfileRenderFailed {
+            reason: format!(
+                "{field} contains a control character at byte {idx} \
+                 (U+{cp:04X}); paths with embedded control bytes \
+                 are refused at profile render time because they \
+                 can perturb SBPL string parsing",
+                cp = ch as u32,
+            ),
+        });
+    }
+    Ok(scheme_quote(s))
+}
+
+#[inline]
+fn is_sbpl_unsafe_char(c: char) -> bool {
+    // C0 controls (0x00..=0x1F) plus DEL (0x7F) plus C1 (0x80..=0x9F).
+    // No legitimate path uses any of these. LF (0x0A) is the headline
+    // injection byte; the rest are blocked uniformly so callers
+    // can't bypass via a CR / TAB / NUL variant.
+    let code = c as u32;
+    code <= 0x1F || code == 0x7F || (0x80..=0x9F).contains(&code)
 }
 
 /// Render the LogOnly-mode Seatbelt profile for the given
@@ -688,6 +758,76 @@ mod tests {
     #[test]
     fn scheme_quote_handles_unicode() {
         assert_eq!(scheme_quote("café"), r#""café""#);
+    }
+
+    #[test]
+    fn scheme_quote_strict_rejects_embedded_newline() {
+        // Headline SBPL-injection vector: a sandboxWriteDirs entry
+        // like `/tmp/")(allow file-read* (subpath \"/Users\")(deny default)\n//`
+        // carries a literal LF that would otherwise sit inside the
+        // rendered string. Strict refusal here makes the render
+        // fail loud before sandbox-exec ever sees the bytes.
+        let payload = "/tmp/\")(allow file-read* (subpath \"/Users\")\n//";
+        let err = scheme_quote_strict(payload, "extra_write_dirs[0]")
+            .expect_err("must refuse embedded LF");
+        match err {
+            SandboxError::ProfileRenderFailed { reason } => {
+                assert!(reason.contains("extra_write_dirs[0]"), "got: {reason}");
+                assert!(reason.contains("U+000A"), "got: {reason}");
+            }
+            other => panic!("expected ProfileRenderFailed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn scheme_quote_strict_rejects_tab_cr_nul_and_c1_controls() {
+        for bad in &["a\tb", "a\rb", "a\0b", "a\u{0085}b", "a\u{009F}b"] {
+            scheme_quote_strict(bad, "test").expect_err(&format!("must refuse {bad:?}"));
+        }
+    }
+
+    #[test]
+    fn scheme_quote_strict_passes_through_scheme_punctuation_inside_paths() {
+        // Parens / semicolons / apostrophes / backticks are legitimate
+        // path content on macOS (e.g. `/Users/x/code (work)/'thing'`).
+        // The strict gate must not refuse them — only control bytes.
+        let q = scheme_quote_strict("/Users/x/code (work)/'thing'`", "project_dir").expect("ok");
+        assert!(q.starts_with('"') && q.ends_with('"'));
+        assert!(q.contains("(work)"));
+        assert!(q.contains("'thing'"));
+        assert!(q.contains('`'));
+    }
+
+    #[test]
+    fn profile_denies_high_risk_process_exec_targets() {
+        let p = render_profile(&spec(), false).unwrap();
+        // M22: narrow process-exec denies for AppleScript automation,
+        // Keychain CLI, privilege boundaries, GUI app launching, and
+        // the signing oracle. The deny clause must follow the
+        // `(allow process*)` wildcard so SBPL last-match-wins
+        // overrides for these specific binaries.
+        let allow_idx = p.find("(allow process*)").expect("allow process* present");
+        let deny_idx = p
+            .find("(deny process-exec")
+            .expect("narrow deny process-exec block present");
+        assert!(
+            deny_idx > allow_idx,
+            "(deny process-exec ...) must come AFTER (allow process*) under last-match-wins: {p}"
+        );
+        for needed in &[
+            "/usr/bin/osascript",
+            "/usr/bin/security",
+            "/usr/bin/sudo",
+            "/usr/bin/su",
+            "/usr/bin/open",
+            "/usr/bin/codesign",
+            "/Applications",
+        ] {
+            assert!(
+                p.contains(needed),
+                "expected narrow process-exec deny for {needed}: {p}",
+            );
+        }
     }
 
     #[test]

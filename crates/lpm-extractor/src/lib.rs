@@ -103,6 +103,15 @@ fn decompress_gzip_libdeflate(compressed: &[u8]) -> Result<Vec<u8>, LpmError> {
         .max(compressed.len())
         .min(MAX_EXTRACTION_SIZE as usize);
 
+    // Hold a global budget reservation for the duration of the
+    // decompress call. The guard releases on every return path
+    // (early-return, error, panic) via Drop, so concurrent rayon
+    // workers serialize at the budget boundary instead of all
+    // racing to virtual-allocate the same 256 MiB simultaneously.
+    // The guard is re-acquired on the grow path below — held
+    // across the inner `vec![0u8; capacity]` allocation, which
+    // is where the actual reservation matters.
+    let mut budget = EXTRACT_BUDGET.acquire(capacity as u64);
     let mut decompressor = libdeflater::Decompressor::new();
     loop {
         let mut output = vec![0u8; capacity];
@@ -117,7 +126,14 @@ fn decompress_gzip_libdeflate(compressed: &[u8]) -> Result<Vec<u8>, LpmError> {
                         "gzip decompression exceeded {MAX_EXTRACTION_SIZE}-byte limit"
                     )));
                 }
+                // Drop the old buffer FIRST so its bytes leave the
+                // process before we acquire the larger budget — keeps
+                // peak memory at `new_capacity` rather than
+                // `old + new`.
+                drop(output);
                 capacity = capacity.saturating_mul(2).min(MAX_EXTRACTION_SIZE as usize);
+                drop(budget);
+                budget = EXTRACT_BUDGET.acquire(capacity as u64);
             }
             Err(e) => {
                 return Err(LpmError::Registry(format!(
@@ -140,6 +156,81 @@ const MAX_EXTRACTION_SIZE: u64 = 5 * 1024 * 1024 * 1024;
 /// `decompress_gzip_libdeflate` handles the rare case where a real
 /// payload exceeds this initial budget.
 const INITIAL_ALLOCATION_CAP: usize = 256 * 1024 * 1024;
+
+/// Global ceiling on the sum of in-flight gzip-decompress output
+/// allocations across all rayon workers. The single-tarball cap
+/// (`INITIAL_ALLOCATION_CAP`) bounds one decompress call at 256 MiB,
+/// but a registry-mirror attacker can publish N small packages each
+/// of which advertises a 256 MiB ISIZE; with 8 concurrent workers
+/// the peak virtual allocation reaches ~2 GiB and OOMs containers
+/// running `vm.overcommit_memory=2` or cgroup-bounded CI runners.
+/// This budget caps the sum across workers — concurrent decompress
+/// calls serialize at the budget boundary instead of competing for
+/// virtual memory.
+///
+/// 1 GiB lets 4 simultaneous worst-case (ISIZE=256 MiB) decompresses
+/// run in parallel and an arbitrary number of small ones; legitimate
+/// npm packages decompress well below the per-call cap and rarely
+/// hold a slot for more than a few ms.
+const PARALLEL_EXTRACT_BUDGET_BYTES: u64 = 1024 * 1024 * 1024;
+
+/// Counting semaphore over bytes of in-flight allocation in
+/// `decompress_gzip_libdeflate`. Acquired on entry, released on
+/// return — see [`AllocBudgetGuard`].
+static EXTRACT_BUDGET: std::sync::LazyLock<AllocBudget> =
+    std::sync::LazyLock::new(|| AllocBudget {
+        available: std::sync::Mutex::new(PARALLEL_EXTRACT_BUDGET_BYTES),
+        cv: std::sync::Condvar::new(),
+    });
+
+struct AllocBudget {
+    available: std::sync::Mutex<u64>,
+    cv: std::sync::Condvar,
+}
+
+impl AllocBudget {
+    fn acquire(&self, bytes: u64) -> AllocBudgetGuard<'_> {
+        // Reservations larger than the whole budget would deadlock
+        // (no path to make `available >= bytes` true). Cap at the
+        // budget itself — the in-flight call still gets serialized
+        // exclusivity, which is the right behavior for an outsized
+        // legitimate tarball.
+        let request = bytes.min(PARALLEL_EXTRACT_BUDGET_BYTES);
+        let mut guard = self.available.lock().expect("EXTRACT_BUDGET poisoned");
+        while *guard < request {
+            guard = self
+                .cv
+                .wait(guard)
+                .expect("EXTRACT_BUDGET condvar poisoned");
+        }
+        *guard -= request;
+        AllocBudgetGuard {
+            budget: self,
+            bytes: request,
+        }
+    }
+}
+
+struct AllocBudgetGuard<'a> {
+    budget: &'a AllocBudget,
+    bytes: u64,
+}
+
+impl Drop for AllocBudgetGuard<'_> {
+    fn drop(&mut self) {
+        let mut guard = match self.budget.available.lock() {
+            Ok(g) => g,
+            // Poisoned mutex on parent panic — still release the
+            // bytes so other waiters don't deadlock waiting on a
+            // budget that the panicked thread held.
+            Err(p) => p.into_inner(),
+        };
+        *guard = guard
+            .saturating_add(self.bytes)
+            .min(PARALLEL_EXTRACT_BUDGET_BYTES);
+        self.budget.cv.notify_all();
+    }
+}
 
 /// Maximum single file size within a tarball (500 MB).
 const MAX_FILE_SIZE: u64 = 500 * 1024 * 1024;
@@ -1599,5 +1690,59 @@ mod tests {
 
         let decompressed = decompress_gzip_libdeflate(&compressed).unwrap();
         assert_eq!(decompressed, original);
+    }
+
+    /// L9 — the global budget must serialize a second acquire that
+    /// would exceed the ceiling, then release when the first guard
+    /// drops. Uses a private throwaway budget instance so we don't
+    /// disturb the static `EXTRACT_BUDGET` other tests share with
+    /// parallel-running suites.
+    #[test]
+    fn alloc_budget_serializes_when_request_would_exceed_ceiling() {
+        let budget = AllocBudget {
+            available: std::sync::Mutex::new(PARALLEL_EXTRACT_BUDGET_BYTES),
+            cv: std::sync::Condvar::new(),
+        };
+        let huge = PARALLEL_EXTRACT_BUDGET_BYTES;
+        let g1 = budget.acquire(huge);
+        assert_eq!(*budget.available.lock().unwrap(), 0);
+
+        let blocked = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let blocked2 = blocked.clone();
+        let budget_ref = &budget;
+        std::thread::scope(|s| {
+            s.spawn(|| {
+                let _g2 = budget_ref.acquire(huge);
+                blocked2.store(true, std::sync::atomic::Ordering::SeqCst);
+            });
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            assert!(
+                !blocked.load(std::sync::atomic::Ordering::SeqCst),
+                "second acquire must not progress while first guard holds the full budget"
+            );
+            drop(g1);
+            // Now the scoped thread can complete its acquire+drop.
+        });
+        assert_eq!(
+            *budget.available.lock().unwrap(),
+            PARALLEL_EXTRACT_BUDGET_BYTES
+        );
+        assert!(blocked.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    /// L9 — a request bigger than the entire budget caps at the
+    /// budget itself (single in-flight call), so an outsized
+    /// legitimate tarball doesn't deadlock waiting for an impossible
+    /// reservation.
+    #[test]
+    fn alloc_budget_caps_oversized_request_to_full_budget() {
+        let budget = AllocBudget {
+            available: std::sync::Mutex::new(PARALLEL_EXTRACT_BUDGET_BYTES),
+            cv: std::sync::Condvar::new(),
+        };
+        let _g = budget.acquire(PARALLEL_EXTRACT_BUDGET_BYTES * 4);
+        // The acquire returned (didn't deadlock) and consumed the
+        // whole budget rather than the impossible 4× request.
+        assert_eq!(*budget.available.lock().unwrap(), 0);
     }
 }
