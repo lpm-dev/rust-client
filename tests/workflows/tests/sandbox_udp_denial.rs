@@ -551,6 +551,28 @@ async fn postinstall_raw_packet_netlink_sockets_are_denied() {
         out.status,
     );
 
+    // L13 fail-closed: some kernel builds (notably the GitHub
+    // Actions Ubuntu runners as of 2026-05) advertise landlock V4
+    // ABI but only partially wire BindTcp/ConnectTcp under the
+    // LSM. The L13 closure refuses to install the strict sandbox
+    // in that state rather than silently degrade the network-deny
+    // claim. The lpm-sandbox child surfaces this as
+    //   `landlock: PartiallyEnforced under strict posture; refusing`
+    // on stderr, and the postinstall never runs — so the
+    // "all socket families denied" success line is naturally
+    // absent. Skip rather than fail when we see that exact
+    // surface; the test is meaningless on a host where strict
+    // can't be delivered. Hosts that DO deliver FullyEnforced
+    // still exercise the full deny-matrix assertion below.
+    if combined.contains("PartiallyEnforced under strict posture; refusing") {
+        eprintln!(
+            "skipping: kernel landlock V4 is PartiallyEnforced on this host; \
+             L13 fail-closed refused the strict sandbox install. \
+             stderr signal: 'PartiallyEnforced under strict posture; refusing'",
+        );
+        return;
+    }
+
     // The seccomp filter denied each family — socket-probe exited
     // 0 in every case and the Node script printed
     // "all socket families denied" to stdout. We assert (a) the
