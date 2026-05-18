@@ -102,9 +102,9 @@ fn unshare_userns_supported() -> bool {
                 libc::_exit(14);
             }
             let rc = libc::mount(
-                b"/dev/null\0".as_ptr() as *const libc::c_char,
+                c"/dev/null".as_ptr(),
                 probe_cstring.as_ptr(),
-                b"none\0".as_ptr() as *const libc::c_char,
+                c"none".as_ptr(),
                 libc::MS_BIND,
                 std::ptr::null(),
             );
