@@ -25,20 +25,45 @@ use lpm_sandbox::{
 };
 use std::path::PathBuf;
 
-/// Returns true iff `unshare(CLONE_NEWUSER)` succeeds on this
-/// host. Hardened distros (Debian with
-/// `kernel.unprivileged_userns_clone=0`, AppArmor profiles
-/// blocking unprivileged user namespaces, container runtimes
-/// without `--privileged`) refuse the syscall. When this returns
-/// false the overlay layer is a documented no-op; skipping the
-/// runtime assertion is the correct behavior — a "shouldn't be
-/// empty" pass would mask the overlay's silent-degrade design.
+/// Returns true iff `unshare(CLONE_NEWUSER | CLONE_NEWNS)` succeeds
+/// from THIS process's binary identity. Hardened distros (Debian
+/// with `kernel.unprivileged_userns_clone=0`, container runtimes
+/// without `--privileged`) refuse the syscall outright. Ubuntu
+/// 24.04 ships an AppArmor `unprivileged_userns` profile that
+/// further restricts the syscall to binaries with their own
+/// AppArmor allow (e.g. `/usr/bin/unshare`) and denies it for
+/// arbitrary binaries (e.g. the cargo-built test binary running
+/// from a target/ tree).
+///
+/// The probe forks and invokes `libc::unshare(CLONE_NEWUSER |
+/// CLONE_NEWNS)` directly so the AppArmor / sysctl decision is
+/// made against the SAME binary identity that will later spawn
+/// the sandbox child. Probing via `/usr/bin/unshare` (the obvious
+/// shell-call shortcut) would be asymmetric: the shell binary has
+/// its own AppArmor allow on Ubuntu 24.04, so the probe would
+/// report support even when the actual workload's `unshare(2)`
+/// will fail and the overlay will silently no-op.
+///
+/// When this returns false the overlay layer is a documented
+/// no-op; skipping the runtime assertion is the correct behavior
+/// — a "shouldn't be empty" pass would mask the overlay's silent-
+/// degrade design.
 fn unshare_userns_supported() -> bool {
-    std::process::Command::new("unshare")
-        .args(["-U", "true"])
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
+    unsafe {
+        let pid = libc::fork();
+        if pid < 0 {
+            return false;
+        }
+        if pid == 0 {
+            let rc = libc::unshare(libc::CLONE_NEWUSER | libc::CLONE_NEWNS);
+            libc::_exit(if rc == 0 { 0 } else { 1 });
+        }
+        let mut status: libc::c_int = 0;
+        if libc::waitpid(pid, &mut status, 0) < 0 {
+            return false;
+        }
+        libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0
+    }
 }
 
 fn fixture_spec(project_dir: &std::path::Path) -> SandboxSpec {
