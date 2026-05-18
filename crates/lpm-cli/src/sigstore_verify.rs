@@ -172,6 +172,31 @@ pub enum VerifyError {
     /// is "at least one valid").
     #[error("SCT verification failed: {0}")]
     Sct(String),
+
+    /// Bundle parse failed: JSON malformed, missing required field,
+    /// unrecognized shape (none of the three known: Sigstore Bundle
+    /// v0.2 chain, v0.3 single-cert, npm attestations wrapper), or
+    /// a sub-component (DSSE envelope, cert chain, tlog entry)
+    /// could not be deserialized into the schema bumped in Phase 1.0.
+    #[error("Sigstore bundle parse failed: {0}")]
+    BundleParse(String),
+
+    /// Leaf cert's identity (SAN URI or Fulcio OIDC issuer
+    /// extension) did not match the caller's `IdentityExpectations`.
+    /// Used by the C2 self-update path to bind the signing identity
+    /// to `lpm-dev/rust-client/.github/workflows/release.yml`. Not
+    /// triggered when expectations are `IdentityExpectations::none()`
+    /// (the C1 npm-drift path, where the drift comparator handles
+    /// per-package identity tracking).
+    #[error(
+        "leaf cert identity does not match expectations: {field}: expected `{expected}`, \
+         got `{actual}`"
+    )]
+    IdentityMismatch {
+        field: &'static str,
+        expected: String,
+        actual: String,
+    },
 }
 
 /// Policy for which Rekor inclusion artifacts a bundle must carry to
@@ -2755,6 +2780,592 @@ fn der_encode_length(len: usize) -> Vec<u8> {
     out.push(0x80 | nonzero.len() as u8);
     out.extend_from_slice(nonzero);
     out
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// Phase 1.8 — composed `verify_sigstore_bundle` entry point.
+// ─────────────────────────────────────────────────────────────────────
+//
+// Ties Phases 1.0–1.7 into a single callable. Phase 2.1 wires this
+// into `provenance_fetch.rs`'s install gate; C2's self-update calls
+// it with a different policy + identity expectations.
+//
+// Pipeline (each step's output is verified before the next runs):
+//   1. parse bundle → components (DSSE envelope, leaf cert DER, chain
+//      DER, tlog entry). Handles three wire shapes.
+//   2. load + check vendored trust root (Phase 1.1; fails closed if
+//      the artifact is structurally expired).
+//   3. resolve `at_time` = the tlog entry's `integratedTime` parsed
+//      via Phase 1.6's helper. Every downstream step's validity
+//      window check uses THIS time, NOT wall-clock — so old bundles
+//      still verify against retired Fulcio chains / CT log keys.
+//   4. SET verify (Phase 1.6) — also doubles as the integrated-time
+//      anchor source under `Either` policy when SET is absent (then
+//      inclusion proof carries the offline claim).
+//   5. chain validation (Phase 1.3) at `at_time`. Enforces the
+//      BasicConstraints / KeyUsage / pathLenConstraint profile that
+//      closed the security-review Vuln 1 bypass.
+//   6. DSSE envelope verify (Phase 1.2) under the leaf cert's SPKI.
+//   7. embedded SCT verify (Phase 1.4) against the pinned CT log
+//      keys, using the chain-resolved issuer SPKI as the precert
+//      input's `issuer_key_hash` source.
+//   8. semantic Rekor body match (Phase 1.5): cert + payloadHash
+//      hard-fail, envelope-hash advisory.
+//   9. inclusion proof (Phase 1.7) — policy-conditional. Verified
+//      whenever present (defense in depth); failure-on-absence
+//      gated by `RekorInclusionProofPolicy`.
+//   10. identity check against `IdentityExpectations` (optional;
+//       `none()` for C1 npm-drift, populated for C2 self-update).
+
+/// Verifier-time options. Currently carries the
+/// [`RekorInclusionProofPolicy`] only; future knobs (clock skew,
+/// optional offline-mode skip flags) will live here too without
+/// breaking the public API.
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy)]
+pub struct VerifyOptions {
+    pub rekor_inclusion_policy: RekorInclusionProofPolicy,
+}
+
+impl VerifyOptions {
+    /// `RequireBoth` — the strongest assurance posture. Used by
+    /// the C2 self-update path (binary swap is the highest-trust
+    /// operation in LPM).
+    #[allow(dead_code)]
+    pub fn strict() -> Self {
+        Self {
+            rekor_inclusion_policy: RekorInclusionProofPolicy::RequireBoth,
+        }
+    }
+
+    /// `Either` — accept SET-only OR inclusion-proof-only bundles.
+    /// Used by the C1 npm-attestation path because npm cohorts ship
+    /// either form in the wild.
+    #[allow(dead_code)]
+    pub fn npm_attestation() -> Self {
+        Self {
+            rekor_inclusion_policy: RekorInclusionProofPolicy::Either,
+        }
+    }
+}
+
+/// Optional caller-supplied pins for the leaf cert's identity.
+/// `none()` skips identity checks entirely (C1 install-side drift
+/// gate); a populated instance enforces the relevant pins (C2
+/// self-update binds to `lpm-dev/rust-client/.github/workflows/
+/// release.yml` issued under GitHub Actions OIDC).
+#[allow(dead_code)]
+#[derive(Debug, Clone, Default)]
+pub struct IdentityExpectations {
+    /// Expected OIDC issuer the Fulcio leaf was minted from, read
+    /// from the Fulcio extension at OID `1.3.6.1.4.1.57264.1.1` (or
+    /// the v2 OID `1.3.6.1.4.1.57264.1.8`, accepted symmetrically).
+    /// Example: `https://token.actions.githubusercontent.com`.
+    pub expected_issuer: Option<String>,
+    /// Required prefix on the leaf cert's SAN URI. Example:
+    /// `https://github.com/lpm-dev/rust-client/`. Off-by-one bug
+    /// site (`rust-client` vs `rust-client/`) — always include the
+    /// trailing `/` to anchor.
+    pub expected_san_uri_prefix: Option<String>,
+    /// Required workflow-path substring inside the SAN URI.
+    /// Example: `.github/workflows/release.yml`. The full SAN URI
+    /// shape is `<prefix><workflow_path>@<ref>` so substring match
+    /// is structurally safe.
+    pub expected_workflow_path: Option<String>,
+}
+
+impl IdentityExpectations {
+    /// Skip all identity checks. C1's drift gate uses this — the
+    /// drift comparator handles per-package identity tracking
+    /// against `ProvenanceSnapshot` separately.
+    #[allow(dead_code)]
+    pub fn none() -> Self {
+        Self::default()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.expected_issuer.is_none()
+            && self.expected_san_uri_prefix.is_none()
+            && self.expected_workflow_path.is_none()
+    }
+}
+
+/// The structured result of a successful bundle verification.
+/// `snapshot` carries the per-package identity for the drift gate;
+/// the trail of `integrated_time`, `leaf_cert_sha256`, `log_id`,
+/// `log_index` is the audit pin recorded into the on-disk
+/// provenance cache (Phase 2.1's `CACHE_SCHEMA_VERSION = 2`).
+#[allow(dead_code)]
+#[derive(Debug, Clone)]
+pub struct VerifiedProvenance {
+    pub snapshot: lpm_workspace::ProvenanceSnapshot,
+    pub integrated_time: SystemTime,
+    pub leaf_cert_sha256: String,
+    pub log_id: String,
+    pub log_index: i64,
+}
+
+/// Verify a Sigstore bundle end-to-end.
+///
+/// Returns `Ok(VerifiedProvenance)` only when every primitive
+/// (DSSE, chain, SCT, Rekor body, SET, inclusion proof) accepts
+/// AND the caller-supplied identity expectations match. Any single
+/// failure short-circuits with the most-specific `VerifyError`
+/// variant so the caller can surface diagnostics without a generic
+/// "verification failed" rollup.
+#[allow(dead_code)] // wired into provenance_fetch in Phase 2.1
+pub fn verify_sigstore_bundle(
+    body: &[u8],
+    expectations: &IdentityExpectations,
+    options: VerifyOptions,
+) -> Result<VerifiedProvenance, VerifyError> {
+    let components = parse_bundle_components(body)?;
+    let trust = trust_root()?;
+
+    let at_time = parse_integrated_time(&components.tlog_entry.integrated_time)?;
+
+    // SET first — its successful run also doubles as a sanity check
+    // that the trust root carries an active Rekor key for the log
+    // this bundle references. Under `Either` policy with SET absent,
+    // this is a no-op and returns the parsed integratedTime.
+    verify_rekor_set(
+        &components.tlog_entry,
+        &trust.rekor_keys,
+        options.rekor_inclusion_policy,
+    )?;
+
+    // Chain validation at the resolved `at_time`. Trust anchors are
+    // pre-filtered to those active at the same time so a retired
+    // root doesn't accidentally anchor a fresh bundle.
+    let active_fulcio: Vec<&FulcioRoot> = trust.fulcio_roots_at(at_time);
+    let chain_refs: Vec<&[u8]> = components.chain_der.iter().map(|d| d.as_slice()).collect();
+    verify_cert_chain(&chain_refs, &active_fulcio, at_time)?;
+
+    // Parse the leaf cert once for downstream consumers (DSSE,
+    // identity, issuer SPKI lookup). The lifetime is tied to
+    // `components.leaf_cert_der`.
+    let (_, leaf_parsed) = X509Certificate::from_der(&components.leaf_cert_der).map_err(|e| {
+        VerifyError::BundleParse(format!("leaf cert DER did not re-parse for DSSE: {e}"))
+    })?;
+
+    verify_dsse(&components.dsse_envelope, &leaf_parsed)?;
+
+    // SCT verify — need the immediate issuer's SPKI for the precert
+    // signed-input. Search the bundle's chain first (chain[1..]),
+    // fall back to the active trust anchors. Chain validation has
+    // already cleared the path, so a match is guaranteed.
+    let issuer_spki_der =
+        find_leaf_issuer_spki(&leaf_parsed, &components.chain_der, &trust, at_time)?;
+    verify_embedded_sct(
+        &components.leaf_cert_der,
+        &issuer_spki_der,
+        &trust.ctlog_keys,
+        at_time,
+    )?;
+
+    verify_rekor_body(
+        &components.tlog_entry,
+        &components.dsse_envelope,
+        &components.leaf_cert_der,
+    )?;
+
+    // Inclusion proof — policy-conditional. Verify whenever present
+    // (defense in depth); failure-on-absence per policy.
+    let has_inclusion_proof = components.tlog_entry.resolved_inclusion_proof().is_some();
+    match options.rekor_inclusion_policy {
+        RekorInclusionProofPolicy::RequireInclusionProof
+        | RekorInclusionProofPolicy::RequireBoth => {
+            verify_inclusion_proof(&components.tlog_entry, &trust.rekor_keys)?;
+        }
+        RekorInclusionProofPolicy::Either | RekorInclusionProofPolicy::RequireSet => {
+            if has_inclusion_proof {
+                verify_inclusion_proof(&components.tlog_entry, &trust.rekor_keys)?;
+            }
+        }
+    }
+
+    // `Either` requires SET OR inclusion proof. SET was already
+    // checked above (no-op on absence under `Either`); if neither
+    // is present, reject here.
+    if options.rekor_inclusion_policy == RekorInclusionProofPolicy::Either
+        && components.tlog_entry.resolved_inclusion_promise().is_none()
+        && !has_inclusion_proof
+    {
+        return Err(VerifyError::RekorSetMissing);
+    }
+
+    if !expectations.is_empty() {
+        check_identity_expectations(&leaf_parsed, expectations)?;
+    }
+
+    let leaf_cert_sha256 = format!(
+        "sha256-{}",
+        hex::encode(Sha256::digest(&components.leaf_cert_der))
+    );
+    let log_index = components.tlog_entry.log_index.parse::<i64>().unwrap_or(-1);
+    let snapshot = build_provenance_snapshot(&leaf_parsed, &leaf_cert_sha256);
+
+    Ok(VerifiedProvenance {
+        snapshot,
+        integrated_time: at_time,
+        leaf_cert_sha256,
+        log_id: components.tlog_entry.log_id.key_id.clone(),
+        log_index,
+    })
+}
+
+/// Parsed bundle components, with the heavy DER + DSSE work done
+/// once up front so downstream verifiers receive typed inputs.
+#[derive(Debug)]
+struct BundleComponents {
+    dsse_envelope: DsseEnvelope,
+    leaf_cert_der: Vec<u8>,
+    chain_der: Vec<Vec<u8>>,
+    tlog_entry: crate::sigstore::TlogEntry,
+}
+
+/// Parse a Sigstore bundle body into [`BundleComponents`]. Handles
+/// the three wire shapes the production fetch path already deals
+/// with (mirrors [`crate::provenance_fetch::find_leaf_cert_rawbytes`]
+/// for cert extraction):
+///
+/// 1. **Sigstore Bundle v0.2** — chain at
+///    `verificationMaterial.x509CertificateChain.certificates[]`.
+/// 2. **Sigstore Bundle v0.3** — single leaf at
+///    `verificationMaterial.certificate.rawBytes` (chain length 1;
+///    the verifier walks the leaf directly against trust anchors).
+/// 3. **npm attestations wrapper** —
+///    `{ attestations: [{ bundle: <inner> }] }`. npm ships two
+///    attestations per package: a publicKey-only publish-time
+///    attestation (skip) and a Fulcio-issued provenance
+///    attestation (use).
+fn parse_bundle_components(body: &[u8]) -> Result<BundleComponents, VerifyError> {
+    let root: serde_json::Value = serde_json::from_slice(body)
+        .map_err(|e| VerifyError::BundleParse(format!("bundle is not valid JSON: {e}")))?;
+
+    // npm wrapper case: scan attestations[*].bundle for the first
+    // parseable inner bundle.
+    if let Some(attestations) = root.get("attestations").and_then(|v| v.as_array()) {
+        let mut last_err = None;
+        for att in attestations {
+            if let Some(inner) = att.get("bundle") {
+                match parse_inner_bundle(inner) {
+                    Ok(c) => return Ok(c),
+                    Err(e) => last_err = Some(e),
+                }
+            }
+        }
+        return Err(last_err.unwrap_or_else(|| {
+            VerifyError::BundleParse(
+                "npm attestations array contained no parseable inner bundle".into(),
+            )
+        }));
+    }
+
+    parse_inner_bundle(&root)
+}
+
+fn parse_inner_bundle(bundle: &serde_json::Value) -> Result<BundleComponents, VerifyError> {
+    let verification_material = bundle
+        .get("verificationMaterial")
+        .ok_or_else(|| VerifyError::BundleParse("bundle missing `verificationMaterial`".into()))?;
+
+    // Cert chain — v0.3 single-cert OR v0.2 chain.
+    let chain_der: Vec<Vec<u8>> = if let Some(cert) = verification_material.get("certificate") {
+        let raw = cert
+            .get("rawBytes")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| {
+                VerifyError::BundleParse("v0.3 `certificate` field has no `rawBytes` string".into())
+            })?;
+        let der = BASE64
+            .decode(raw.as_bytes())
+            .map_err(|e| VerifyError::BundleParse(format!("leaf cert rawBytes not base64: {e}")))?;
+        vec![der]
+    } else if let Some(chain) = verification_material.get("x509CertificateChain") {
+        let certs = chain
+            .get("certificates")
+            .and_then(|v| v.as_array())
+            .ok_or_else(|| {
+                VerifyError::BundleParse(
+                    "v0.2 `x509CertificateChain.certificates` is not an array".into(),
+                )
+            })?;
+        if certs.is_empty() {
+            return Err(VerifyError::BundleParse(
+                "v0.2 cert chain is empty (must have at least the leaf)".into(),
+            ));
+        }
+        certs
+            .iter()
+            .enumerate()
+            .map(|(i, c)| {
+                let raw = c.get("rawBytes").and_then(|v| v.as_str()).ok_or_else(|| {
+                    VerifyError::BundleParse(format!(
+                        "v0.2 chain cert[{i}] has no `rawBytes` string"
+                    ))
+                })?;
+                BASE64.decode(raw.as_bytes()).map_err(|e| {
+                    VerifyError::BundleParse(format!("chain cert[{i}] not base64: {e}"))
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?
+    } else {
+        return Err(VerifyError::BundleParse(
+            "bundle has neither v0.3 `certificate` nor v0.2 `x509CertificateChain`".into(),
+        ));
+    };
+
+    let leaf_cert_der = chain_der
+        .first()
+        .cloned()
+        .ok_or_else(|| VerifyError::BundleParse("cert chain has no leaf".into()))?;
+
+    // DSSE envelope — required.
+    let dsse_value = bundle
+        .get("dsseEnvelope")
+        .ok_or_else(|| VerifyError::BundleParse("bundle missing `dsseEnvelope`".into()))?;
+    let dsse_envelope: DsseEnvelope = serde_json::from_value(dsse_value.clone())
+        .map_err(|e| VerifyError::BundleParse(format!("dsseEnvelope shape: {e}")))?;
+
+    // Tlog entry — take the first. Sigstore bundles ship one
+    // `tlogEntries[0]` for the canonical Rekor entry.
+    let tlog_entries = verification_material
+        .get("tlogEntries")
+        .and_then(|v| v.as_array())
+        .ok_or_else(|| {
+            VerifyError::BundleParse(
+                "bundle `verificationMaterial.tlogEntries` is not an array".into(),
+            )
+        })?;
+    let tlog_value = tlog_entries.first().ok_or_else(|| {
+        VerifyError::BundleParse("bundle `verificationMaterial.tlogEntries` is empty".into())
+    })?;
+    let tlog_entry: crate::sigstore::TlogEntry = serde_json::from_value(tlog_value.clone())
+        .map_err(|e| VerifyError::BundleParse(format!("tlogEntries[0] shape: {e}")))?;
+
+    Ok(BundleComponents {
+        dsse_envelope,
+        leaf_cert_der,
+        chain_der,
+        tlog_entry,
+    })
+}
+
+/// Find the SPKI DER of the leaf cert's immediate issuer. Tries:
+/// 1. Bundle's chain[1..] (the typical case when the bundle ships
+///    leaf + intermediate).
+/// 2. Active Fulcio trust anchors (when the bundle ships only the
+///    leaf and the chain walker traversed the path implicitly).
+///
+/// Chain validation has already cleared the path, so a match is
+/// guaranteed in any valid bundle.
+fn find_leaf_issuer_spki(
+    leaf: &X509Certificate<'_>,
+    chain_der: &[Vec<u8>],
+    trust: &TrustRoot,
+    at_time: SystemTime,
+) -> Result<Vec<u8>, VerifyError> {
+    let leaf_issuer_dn = leaf.tbs_certificate.issuer.as_raw();
+    for der in chain_der.iter().skip(1) {
+        if let Ok((_, parsed)) = X509Certificate::from_der(der)
+            && parsed.tbs_certificate.subject.as_raw() == leaf_issuer_dn
+        {
+            return Ok(parsed.tbs_certificate.subject_pki.raw.to_vec());
+        }
+    }
+    for root in trust.fulcio_roots_at(at_time) {
+        for der in &root.cert_chain_der {
+            if let Ok((_, parsed)) = X509Certificate::from_der(der)
+                && parsed.tbs_certificate.subject.as_raw() == leaf_issuer_dn
+            {
+                return Ok(parsed.tbs_certificate.subject_pki.raw.to_vec());
+            }
+        }
+    }
+    Err(VerifyError::Sct(
+        "could not locate leaf cert's immediate issuer in the bundle chain or trust root \
+         — cannot compute SCT precert input"
+            .into(),
+    ))
+}
+
+/// Fulcio OIDC issuer extension OIDs (RFC-style, dotted-decimal):
+/// - `1.3.6.1.4.1.57264.1.1` — original (v1).
+/// - `1.3.6.1.4.1.57264.1.8` — v2 (same semantic). Accept either.
+const FULCIO_OIDC_ISSUER_OID_V1: [u64; 9] = [1, 3, 6, 1, 4, 1, 57264, 1, 1];
+const FULCIO_OIDC_ISSUER_OID_V2: [u64; 9] = [1, 3, 6, 1, 4, 1, 57264, 1, 8];
+
+/// Apply `IdentityExpectations` against the leaf cert. Pre-conditioned
+/// by `expectations.is_empty()` at the call site — when populated,
+/// every Some field must match or this returns
+/// `VerifyError::IdentityMismatch`.
+fn check_identity_expectations(
+    leaf: &X509Certificate<'_>,
+    expectations: &IdentityExpectations,
+) -> Result<(), VerifyError> {
+    if let Some(expected) = &expectations.expected_issuer {
+        let actual =
+            extract_fulcio_oidc_issuer(leaf)?.ok_or_else(|| VerifyError::IdentityMismatch {
+                field: "issuer",
+                expected: expected.clone(),
+                actual: "<no Fulcio OIDC issuer extension>".into(),
+            })?;
+        if &actual != expected {
+            return Err(VerifyError::IdentityMismatch {
+                field: "issuer",
+                expected: expected.clone(),
+                actual,
+            });
+        }
+    }
+
+    if expectations.expected_san_uri_prefix.is_some()
+        || expectations.expected_workflow_path.is_some()
+    {
+        let san_uri = extract_leaf_san_uri(leaf).ok_or_else(|| VerifyError::IdentityMismatch {
+            field: "san_uri",
+            expected: expectations
+                .expected_san_uri_prefix
+                .clone()
+                .or_else(|| expectations.expected_workflow_path.clone())
+                .unwrap_or_default(),
+            actual: "<no SAN URI on leaf cert>".into(),
+        })?;
+        if let Some(prefix) = &expectations.expected_san_uri_prefix
+            && !san_uri.starts_with(prefix)
+        {
+            return Err(VerifyError::IdentityMismatch {
+                field: "san_uri_prefix",
+                expected: prefix.clone(),
+                actual: san_uri,
+            });
+        }
+        if let Some(workflow) = &expectations.expected_workflow_path
+            && !san_uri.contains(workflow)
+        {
+            return Err(VerifyError::IdentityMismatch {
+                field: "workflow_path",
+                expected: workflow.clone(),
+                actual: san_uri,
+            });
+        }
+    }
+
+    Ok(())
+}
+
+/// Extract the OIDC issuer string from the Fulcio extension at
+/// `1.3.6.1.4.1.57264.1.1` (v1) or `.1.8` (v2). The extension's
+/// value is a plain UTF-8 string (NOT a DER OCTET STRING in v1; v2
+/// uses a DER UTF8String wrapper). We try plain UTF-8 first and
+/// fall back to DER-UTF8String parsing for v2.
+fn extract_fulcio_oidc_issuer(leaf: &X509Certificate<'_>) -> Result<Option<String>, VerifyError> {
+    for ext in leaf.extensions() {
+        let components: Vec<u64> = match ext.oid.iter() {
+            Some(it) => it.collect(),
+            None => continue,
+        };
+        let is_v1 = components.as_slice() == FULCIO_OIDC_ISSUER_OID_V1;
+        let is_v2 = components.as_slice() == FULCIO_OIDC_ISSUER_OID_V2;
+        if !is_v1 && !is_v2 {
+            continue;
+        }
+        // v1: raw UTF-8 bytes. v2: DER UTF8String (tag 0x0C + length + content).
+        if is_v2 && ext.value.len() >= 2 && ext.value[0] == 0x0C {
+            let (len, consumed) = der_decode_length(&ext.value[1..]).ok_or_else(|| {
+                VerifyError::BundleParse(
+                    "Fulcio OIDC issuer v2 extension has malformed UTF8String length".into(),
+                )
+            })?;
+            let start = 1 + consumed;
+            if ext.value.len() < start + len {
+                return Err(VerifyError::BundleParse(
+                    "Fulcio OIDC issuer v2 UTF8String body truncated".into(),
+                ));
+            }
+            return Ok(Some(
+                std::str::from_utf8(&ext.value[start..start + len])
+                    .map_err(|e| {
+                        VerifyError::BundleParse(format!(
+                            "Fulcio OIDC issuer v2 body is not valid UTF-8: {e}"
+                        ))
+                    })?
+                    .to_string(),
+            ));
+        }
+        // v1 plain bytes (or v2 unwrapped fallback).
+        return Ok(Some(
+            std::str::from_utf8(ext.value)
+                .map_err(|e| {
+                    VerifyError::BundleParse(format!(
+                        "Fulcio OIDC issuer extension body is not valid UTF-8: {e}"
+                    ))
+                })?
+                .to_string(),
+        ));
+    }
+    Ok(None)
+}
+
+/// Extract the first URI-shaped SAN from the leaf cert. Sigstore
+/// Fulcio leaves carry one URI SAN with the GitHub Actions (or
+/// other OIDC-provider) workflow identity.
+fn extract_leaf_san_uri(leaf: &X509Certificate<'_>) -> Option<String> {
+    use x509_parser::extensions::{GeneralName, ParsedExtension};
+    for ext in leaf.extensions() {
+        if let ParsedExtension::SubjectAlternativeName(san) = ext.parsed_extension() {
+            for name in &san.general_names {
+                if let GeneralName::URI(uri) = name {
+                    return Some((*uri).to_string());
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Build the `ProvenanceSnapshot` consumed by the drift gate
+/// (`lpm_security::provenance::check_provenance_drift`). Reuses
+/// the leaf-cert SAN parsing already in `provenance_fetch`; this
+/// helper exists so the snapshot construction has the same shape
+/// regardless of which code path produced the leaf cert.
+fn build_provenance_snapshot(
+    leaf: &X509Certificate<'_>,
+    leaf_cert_sha256: &str,
+) -> lpm_workspace::ProvenanceSnapshot {
+    let san_uri = extract_leaf_san_uri(leaf);
+    let identity = san_uri.as_deref().and_then(parse_github_actions_identity);
+    lpm_workspace::ProvenanceSnapshot {
+        present: true,
+        publisher: identity.as_ref().map(|(p, _, _)| p.clone()),
+        workflow_path: identity.as_ref().map(|(_, w, _)| w.clone()),
+        workflow_ref: identity.as_ref().map(|(_, _, r)| r.clone()),
+        attestation_cert_sha256: Some(leaf_cert_sha256.to_string()),
+    }
+}
+
+/// Parse a GitHub Actions SAN URI into `(publisher, workflow_path,
+/// workflow_ref)`. Mirrors `provenance_fetch::parse_github_actions_uri`
+/// — kept inline in the verifier so the orchestrator doesn't reach
+/// out into the install-path module; the duplication is small (10
+/// lines) and the two stay in sync via the workflow tests that
+/// pin the JSON envelope shape.
+fn parse_github_actions_identity(uri: &str) -> Option<(String, String, String)> {
+    const PREFIX: &str = "https://github.com/";
+    const WORKFLOWS_SEG: &str = "/.github/workflows/";
+    let after_host = uri.strip_prefix(PREFIX)?;
+    let (path, workflow_ref) = after_host.rsplit_once('@')?;
+    let (org_repo, wf_tail) = path.split_once(WORKFLOWS_SEG)?;
+    let (org, repo) = org_repo.split_once('/')?;
+    if org.is_empty() || repo.is_empty() || repo.contains('/') {
+        return None;
+    }
+    Some((
+        format!("github:{org}/{repo}"),
+        format!(".github/workflows/{wf_tail}"),
+        workflow_ref.to_string(),
+    ))
 }
 
 #[cfg(test)]
@@ -5588,5 +6199,333 @@ mod tests {
             msg.contains("payloadHash"),
             "expected payloadHash diagnostic, got: {msg}"
         );
+    }
+
+    // ── Phase 1.8 — bundle parser ─────────────────────────────────
+
+    /// Build a minimal v0.2 bundle JSON (chain shape) with one leaf
+    /// cert + the supplied DSSE envelope + tlog entry.
+    fn synth_bundle_v02(
+        leaf_cert_der: &[u8],
+        chain_extras_der: &[Vec<u8>],
+        dsse: &serde_json::Value,
+        tlog: &serde_json::Value,
+    ) -> serde_json::Value {
+        let mut certs = vec![serde_json::json!({"rawBytes": BASE64.encode(leaf_cert_der)})];
+        for d in chain_extras_der {
+            certs.push(serde_json::json!({"rawBytes": BASE64.encode(d)}));
+        }
+        serde_json::json!({
+            "mediaType": "application/vnd.dev.sigstore.bundle+json;version=0.2",
+            "dsseEnvelope": dsse,
+            "verificationMaterial": {
+                "x509CertificateChain": { "certificates": certs },
+                "tlogEntries": [tlog],
+            }
+        })
+    }
+
+    /// Build a minimal v0.3 bundle JSON (single-cert shape).
+    fn synth_bundle_v03(
+        leaf_cert_der: &[u8],
+        dsse: &serde_json::Value,
+        tlog: &serde_json::Value,
+    ) -> serde_json::Value {
+        serde_json::json!({
+            "mediaType": "application/vnd.dev.sigstore.bundle.v0.3+json",
+            "dsseEnvelope": dsse,
+            "verificationMaterial": {
+                "certificate": { "rawBytes": BASE64.encode(leaf_cert_der) },
+                "tlogEntries": [tlog],
+            }
+        })
+    }
+
+    /// Wrap an inner bundle as an npm `{ attestations: [{ bundle }] }`
+    /// response.
+    fn synth_bundle_npm_wrapper(inner: &serde_json::Value) -> serde_json::Value {
+        serde_json::json!({
+            "attestations": [
+                { "predicateType": "https://slsa.dev/provenance/v1", "bundle": inner }
+            ]
+        })
+    }
+
+    fn dummy_dsse_envelope() -> serde_json::Value {
+        serde_json::json!({
+            "payloadType": "application/vnd.in-toto+json",
+            "payload": BASE64.encode(b"{}"),
+            "signatures": [{"keyid": "", "sig": BASE64.encode([0u8; 64])}],
+        })
+    }
+
+    fn dummy_tlog_entry() -> serde_json::Value {
+        serde_json::json!({
+            "logIndex": "42",
+            "logId": {"keyId": "deadbeef"},
+            "integratedTime": "1700000000",
+            "canonicalizedBody": "Zm9v",
+        })
+    }
+
+    #[test]
+    fn parses_v0_2_chain_bundle() {
+        let leaf = b"leaf-der-stand-in";
+        let intermediate = b"intermediate-der";
+        let bundle = synth_bundle_v02(
+            leaf,
+            &[intermediate.to_vec()],
+            &dummy_dsse_envelope(),
+            &dummy_tlog_entry(),
+        );
+        let body = serde_json::to_vec(&bundle).unwrap();
+        let parsed = parse_bundle_components(&body).expect("v0.2 chain bundle must parse");
+        assert_eq!(parsed.leaf_cert_der, leaf);
+        assert_eq!(parsed.chain_der.len(), 2);
+        assert_eq!(parsed.chain_der[1], intermediate);
+        assert_eq!(parsed.tlog_entry.log_index, "42");
+    }
+
+    #[test]
+    fn parses_v0_3_single_cert_bundle() {
+        let leaf = b"leaf-der-only";
+        let bundle = synth_bundle_v03(leaf, &dummy_dsse_envelope(), &dummy_tlog_entry());
+        let body = serde_json::to_vec(&bundle).unwrap();
+        let parsed = parse_bundle_components(&body).expect("v0.3 single-cert bundle must parse");
+        assert_eq!(parsed.leaf_cert_der, leaf);
+        assert_eq!(parsed.chain_der.len(), 1);
+    }
+
+    #[test]
+    fn parses_npm_attestations_wrapper() {
+        let leaf = b"leaf-from-npm";
+        let inner = synth_bundle_v03(leaf, &dummy_dsse_envelope(), &dummy_tlog_entry());
+        let wrapped = synth_bundle_npm_wrapper(&inner);
+        let body = serde_json::to_vec(&wrapped).unwrap();
+        let parsed = parse_bundle_components(&body).expect("npm wrapper must parse");
+        assert_eq!(parsed.leaf_cert_der, leaf);
+    }
+
+    #[test]
+    fn parser_rejects_bundle_without_verification_material() {
+        let bundle = serde_json::json!({"dsseEnvelope": dummy_dsse_envelope()});
+        let err = parse_bundle_components(&serde_json::to_vec(&bundle).unwrap())
+            .expect_err("missing verificationMaterial must reject");
+        match err {
+            VerifyError::BundleParse(msg) => assert!(msg.contains("verificationMaterial")),
+            other => panic!("expected BundleParse, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parser_rejects_bundle_without_dsse_envelope() {
+        let leaf = b"leaf-der";
+        let bundle = serde_json::json!({
+            "verificationMaterial": {
+                "certificate": { "rawBytes": BASE64.encode(leaf) },
+                "tlogEntries": [dummy_tlog_entry()],
+            }
+        });
+        let err = parse_bundle_components(&serde_json::to_vec(&bundle).unwrap())
+            .expect_err("missing dsseEnvelope must reject");
+        match err {
+            VerifyError::BundleParse(msg) => assert!(msg.contains("dsseEnvelope")),
+            other => panic!("expected BundleParse, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parser_rejects_bundle_with_empty_tlog_entries() {
+        let leaf = b"leaf";
+        let bundle = serde_json::json!({
+            "dsseEnvelope": dummy_dsse_envelope(),
+            "verificationMaterial": {
+                "certificate": { "rawBytes": BASE64.encode(leaf) },
+                "tlogEntries": [],
+            }
+        });
+        let err = parse_bundle_components(&serde_json::to_vec(&bundle).unwrap())
+            .expect_err("empty tlogEntries must reject");
+        match err {
+            VerifyError::BundleParse(msg) => assert!(msg.contains("tlogEntries")),
+            other => panic!("expected BundleParse, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parser_rejects_malformed_json() {
+        let err =
+            parse_bundle_components(b"not-valid-json").expect_err("malformed JSON must reject");
+        match err {
+            VerifyError::BundleParse(msg) => assert!(msg.contains("not valid JSON")),
+            other => panic!("expected BundleParse, got: {other:?}"),
+        }
+    }
+
+    // ── Phase 1.8 — identity expectations ─────────────────────────
+
+    /// Build a leaf cert with a SAN URI + optional Fulcio OIDC
+    /// issuer extension. Used to test check_identity_expectations.
+    fn leaf_with_san_and_issuer(san_uri: &str, fulcio_issuer: Option<&str>) -> Vec<u8> {
+        let issuer = fresh_sct_issuer();
+        let leaf_kp = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).unwrap();
+        let mut params = cert_params_validity(2025);
+        params.subject_alt_names = vec![rcgen::SanType::URI(
+            rcgen::Ia5String::try_from(san_uri.to_string()).unwrap(),
+        )];
+        if let Some(iss) = fulcio_issuer {
+            // Encode as plain UTF-8 (v1 extension shape).
+            params.custom_extensions = vec![rcgen::CustomExtension::from_oid_content(
+                &FULCIO_OIDC_ISSUER_OID_V1,
+                iss.as_bytes().to_vec(),
+            )];
+        }
+        let leaf = params
+            .signed_by(&leaf_kp, &issuer.cert, &issuer.kp)
+            .unwrap();
+        leaf.der().to_vec()
+    }
+
+    #[test]
+    fn identity_check_passes_when_expectations_match() {
+        let san =
+            "https://github.com/lpm-dev/rust-client/.github/workflows/release.yml@refs/tags/v1";
+        let der =
+            leaf_with_san_and_issuer(san, Some("https://token.actions.githubusercontent.com"));
+        let (_, parsed) = X509Certificate::from_der(&der).unwrap();
+        let expectations = IdentityExpectations {
+            expected_issuer: Some("https://token.actions.githubusercontent.com".into()),
+            expected_san_uri_prefix: Some("https://github.com/lpm-dev/rust-client/".into()),
+            expected_workflow_path: Some(".github/workflows/release.yml".into()),
+        };
+        check_identity_expectations(&parsed, &expectations).expect("matching identity must pass");
+    }
+
+    #[test]
+    fn identity_check_rejects_san_uri_prefix_mismatch() {
+        let san =
+            "https://github.com/other-org/other-repo/.github/workflows/release.yml@refs/tags/v1";
+        let der =
+            leaf_with_san_and_issuer(san, Some("https://token.actions.githubusercontent.com"));
+        let (_, parsed) = X509Certificate::from_der(&der).unwrap();
+        let expectations = IdentityExpectations {
+            expected_san_uri_prefix: Some("https://github.com/lpm-dev/rust-client/".into()),
+            ..IdentityExpectations::none()
+        };
+        let err = check_identity_expectations(&parsed, &expectations)
+            .expect_err("wrong org/repo SAN must reject");
+        match err {
+            VerifyError::IdentityMismatch { field, .. } => {
+                assert_eq!(field, "san_uri_prefix")
+            }
+            other => panic!("expected IdentityMismatch, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn identity_check_rejects_workflow_path_mismatch() {
+        let san = "https://github.com/lpm-dev/rust-client/.github/workflows/build.yml@refs/tags/v1";
+        let der = leaf_with_san_and_issuer(san, None);
+        let (_, parsed) = X509Certificate::from_der(&der).unwrap();
+        let expectations = IdentityExpectations {
+            expected_workflow_path: Some(".github/workflows/release.yml".into()),
+            ..IdentityExpectations::none()
+        };
+        let err = check_identity_expectations(&parsed, &expectations)
+            .expect_err("wrong workflow path must reject");
+        match err {
+            VerifyError::IdentityMismatch { field, .. } => {
+                assert_eq!(field, "workflow_path")
+            }
+            other => panic!("expected IdentityMismatch, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn identity_check_rejects_fulcio_oidc_issuer_mismatch() {
+        let san =
+            "https://github.com/lpm-dev/rust-client/.github/workflows/release.yml@refs/tags/v1";
+        let der = leaf_with_san_and_issuer(san, Some("https://malicious-issuer.example.com"));
+        let (_, parsed) = X509Certificate::from_der(&der).unwrap();
+        let expectations = IdentityExpectations {
+            expected_issuer: Some("https://token.actions.githubusercontent.com".into()),
+            ..IdentityExpectations::none()
+        };
+        let err = check_identity_expectations(&parsed, &expectations)
+            .expect_err("wrong OIDC issuer must reject");
+        match err {
+            VerifyError::IdentityMismatch { field, .. } => assert_eq!(field, "issuer"),
+            other => panic!("expected IdentityMismatch, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn identity_check_rejects_missing_oidc_issuer_when_required() {
+        let san =
+            "https://github.com/lpm-dev/rust-client/.github/workflows/release.yml@refs/tags/v1";
+        let der = leaf_with_san_and_issuer(san, None);
+        let (_, parsed) = X509Certificate::from_der(&der).unwrap();
+        let expectations = IdentityExpectations {
+            expected_issuer: Some("https://token.actions.githubusercontent.com".into()),
+            ..IdentityExpectations::none()
+        };
+        let err = check_identity_expectations(&parsed, &expectations)
+            .expect_err("missing OIDC issuer must reject when expected");
+        match err {
+            VerifyError::IdentityMismatch { field, .. } => assert_eq!(field, "issuer"),
+            other => panic!("expected IdentityMismatch, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn identity_check_passes_with_none_expectations() {
+        let san = "https://github.com/anyone/anywhere/.github/workflows/whatever.yml@anything";
+        let der = leaf_with_san_and_issuer(san, None);
+        let (_, parsed) = X509Certificate::from_der(&der).unwrap();
+        check_identity_expectations(&parsed, &IdentityExpectations::none())
+            .expect("none() must skip all checks");
+    }
+
+    // ── Phase 1.8 — VerifyOptions presets ─────────────────────────
+
+    #[test]
+    fn verify_options_strict_requires_both_set_and_inclusion_proof() {
+        let opts = VerifyOptions::strict();
+        assert_eq!(
+            opts.rekor_inclusion_policy,
+            RekorInclusionProofPolicy::RequireBoth
+        );
+    }
+
+    #[test]
+    fn verify_options_npm_attestation_allows_either() {
+        let opts = VerifyOptions::npm_attestation();
+        assert_eq!(
+            opts.rekor_inclusion_policy,
+            RekorInclusionProofPolicy::Either
+        );
+    }
+
+    // ── Phase 1.8 — find_leaf_issuer_spki ─────────────────────────
+
+    #[test]
+    fn find_leaf_issuer_spki_picks_intermediate_when_chain_provides_it() {
+        let issuer = fresh_sct_issuer();
+        let leaf_kp = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).unwrap();
+        let leaf_der = cert_params_validity(2025)
+            .signed_by(&leaf_kp, &issuer.cert, &issuer.kp)
+            .unwrap()
+            .der()
+            .to_vec();
+        let intermediate_der = issuer.cert.der().to_vec();
+
+        let (_, leaf_parsed) = X509Certificate::from_der(&leaf_der).unwrap();
+        let chain = vec![leaf_der.clone(), intermediate_der.clone()];
+        let trust = TrustRoot::parse(EMBEDDED_TRUST_ROOT_JSON).unwrap();
+        let spki = find_leaf_issuer_spki(&leaf_parsed, &chain, &trust, ts_year(2025))
+            .expect("chain-provided intermediate must resolve");
+        // Sanity: returned SPKI must be the intermediate's, not the leaf's.
+        let (_, intermediate_parsed) = X509Certificate::from_der(&intermediate_der).unwrap();
+        assert_eq!(spki, intermediate_parsed.tbs_certificate.subject_pki.raw);
     }
 }
