@@ -29,6 +29,7 @@ use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use chrono::{DateTime, Duration, Utc};
 use ecdsa::signature::Verifier;
+use ecdsa::signature::hazmat::PrehashVerifier;
 use p256::ecdsa::{Signature, VerifyingKey};
 use sha2::{Digest, Sha256};
 use std::sync::{Arc, OnceLock};
@@ -148,6 +149,18 @@ pub enum VerifyError {
     /// or `RequireSet` this case is not an error.
     #[error("Rekor inclusion proof is required by policy but missing from the bundle")]
     InclusionProofMissing,
+
+    /// X.509 chain validation failed: a cert's notBefore/notAfter
+    /// window did not contain `integratedTime`, an issuer/subject
+    /// pair didn't line up, a link's signature didn't verify under
+    /// its parent, no path to a trusted Fulcio root could be built,
+    /// or the chain used an unsupported signature algorithm.
+    /// AIA fetch is intentionally NOT implemented (the verifier
+    /// refuses to fetch missing intermediates from the URL embedded
+    /// in the cert — Sigstore bundles always ship the full chain,
+    /// and AIA fetch would re-open a supply-chain redirect arm).
+    #[error("X.509 chain validation failed: {0}")]
+    Chain(String),
 }
 
 /// Policy for which Rekor inclusion artifacts a bundle must carry to
@@ -1163,8 +1176,13 @@ pub fn verify_rekor_set(
     );
     let digest = Sha256::digest(set_input.as_bytes());
 
+    // Rekor signs the SET via Go's `ecdsa.SignASN1(key, prehash)` —
+    // the digest is the signing input, NOT re-hashed by the signer.
+    // `verify_prehash` matches that semantic; `verify` would hash
+    // the digest a second time and compute the wrong verification
+    // input. Documented in `private/rekor-set-canonicalization.md`.
     verifying_key
-        .verify(digest.as_slice(), &signature)
+        .verify_prehash(digest.as_slice(), &signature)
         .map_err(|e| {
             VerifyError::RekorSet(format!(
                 "SET signature did not verify under the pinned Rekor key for logId={}: {e}",
@@ -1538,8 +1556,11 @@ fn verify_checkpoint_signature(
         ))
     })?;
     let digest = Sha256::digest(signed_bytes.as_bytes());
+    // Same prehash semantic as the SET verifier — Rekor signs the
+    // checkpoint digest via Go's ecdsa.SignASN1 prehash protocol.
+    // Documented in `private/rekor-checkpoint-format.md`.
     verifying_key
-        .verify(digest.as_slice(), &signature)
+        .verify_prehash(digest.as_slice(), &signature)
         .map_err(|e| {
             VerifyError::InclusionProof(format!(
                 "checkpoint signature did not verify under the pinned Rekor key: {e}"
@@ -1653,6 +1674,288 @@ fn rfc6962_verify_inclusion(
         )));
     }
     Ok(r)
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// Phase 1.3 — X.509 chain validation at `integratedTime`.
+// ─────────────────────────────────────────────────────────────────────
+//
+// Hand-rolled chain walker rather than `webpki` because Sigstore's
+// validation profile differs from WebPKI/TLS:
+//   - Sigstore matches identity via SAN URI, not DNS hostname (the
+//     identity match itself lives in Phase 1.8's
+//     `IdentityExpectations`; chain validation here just ensures
+//     the leaf's signing key is rooted in a trusted Fulcio CA).
+//   - Sigstore profile fixes algorithms (P-256 leaves signed by
+//     P-384 intermediates / roots) so we don't need WebPKI's
+//     general algorithm-suite plumbing.
+//   - The chain is always short (≤3) so the walker is a small loop,
+//     not a tree-search.
+//
+// Critical: AIA fetch is NOT implemented. A Sigstore bundle that's
+// missing intermediates fails — we never fetch from a URL inside
+// the cert. That closes the "attacker steers AIA fetch to an
+// attacker-controlled CA" arm.
+//
+// `at_time` MUST be the Rekor `integratedTime` (Phase 1.6 returns
+// it), NOT wall-clock. Bundles signed by certs that have since
+// retired still verify against the integratedTime they declare,
+// which is exactly what we want — bundles from 2022 still verify
+// in 2027 against the 2022 Fulcio chain that signed them.
+
+/// Verify an X.509 cert chain from the bundle terminates at one of
+/// the pinned Fulcio roots, with every link valid at `at_time`.
+///
+/// `bundle_chain_der`: ordered from leaf upward — `[leaf, intermediates...]`.
+/// `fulcio_roots`: filtered by [`TrustRoot::fulcio_roots_at(at_time)`]
+/// at the call site; this function further enforces that the chain's
+/// final cert byte-equals one of those roots (or is signed by one).
+///
+/// Returns `Ok(())` only when:
+/// 1. Every cert in the chain has `notBefore <= at_time <= notAfter`.
+/// 2. Every adjacent (child, parent) pair: child's signature
+///    verifies under parent's SPKI AND child.issuer == parent.subject.
+/// 3. The chain's top cert byte-equals a trust anchor's leaf cert,
+///    OR its signature verifies under one of the trust anchors'
+///    leaf certs (covers both "chain includes root" and
+///    "chain stops at intermediate" cases).
+#[allow(dead_code)] // wired into provenance_fetch in Phase 2.1
+pub fn verify_cert_chain(
+    bundle_chain_der: &[&[u8]],
+    fulcio_roots: &[&FulcioRoot],
+    at_time: SystemTime,
+) -> Result<(), VerifyError> {
+    if bundle_chain_der.is_empty() {
+        return Err(VerifyError::Chain(
+            "bundle cert chain is empty (must include at least the leaf)".into(),
+        ));
+    }
+    if fulcio_roots.is_empty() {
+        return Err(VerifyError::Chain(
+            "no Fulcio roots active at integratedTime — cannot anchor any chain".into(),
+        ));
+    }
+
+    let at_time_dt: DateTime<Utc> = at_time.into();
+
+    // Parse every cert in the bundle's chain once up-front. Reject
+    // any malformed DER before any signature work runs.
+    let mut parsed: Vec<X509Certificate<'_>> = Vec::with_capacity(bundle_chain_der.len());
+    for (i, der) in bundle_chain_der.iter().enumerate() {
+        let (_, cert) = X509Certificate::from_der(der).map_err(|e| {
+            VerifyError::Chain(format!(
+                "bundle chain cert[{i}] is not valid DER X.509: {e}"
+            ))
+        })?;
+        parsed.push(cert);
+    }
+
+    // Step 1: every chain cert must be valid at `at_time`. This is
+    // the load-bearing "at_time = integratedTime" check that lets
+    // old bundles still verify against retired Fulcio chains.
+    for (i, cert) in parsed.iter().enumerate() {
+        check_cert_validity_at(cert, at_time_dt, &format!("chain[{i}]"))?;
+    }
+
+    // Step 2: every adjacent (child, parent) pair must chain
+    // structurally and cryptographically.
+    for i in 0..parsed.len().saturating_sub(1) {
+        verify_chain_link(
+            &parsed[i],
+            &parsed[i + 1],
+            &format!("chain[{i}] ⇒ chain[{}]", i + 1),
+        )?;
+    }
+
+    // Step 3: terminate at a trusted anchor. Two valid shapes:
+    //   (a) the chain's top cert IS one of the trust anchor certs
+    //       (bundle included the Fulcio root).
+    //   (b) the chain's top cert is signed by a trust anchor
+    //       (bundle stopped at the intermediate).
+    let top_der = bundle_chain_der.last().expect("non-empty checked above");
+    if anchor_contains_der(fulcio_roots, top_der) {
+        return Ok(());
+    }
+
+    let top_parsed = parsed.last().expect("non-empty checked above");
+    for root in fulcio_roots {
+        for root_der in &root.cert_chain_der {
+            let Ok((_, root_cert)) = X509Certificate::from_der(root_der) else {
+                continue;
+            };
+            // The root's own validity is gated upstream by
+            // TrustRoot::fulcio_roots_at; but the cert's intrinsic
+            // notBefore/notAfter is still a defense — fail-closed
+            // if the trust root's cert itself is out of window.
+            if check_cert_validity_at(&root_cert, at_time_dt, "fulcio_root").is_err() {
+                continue;
+            }
+            if try_anchor_signature(top_parsed, &root_cert).is_ok() {
+                return Ok(());
+            }
+        }
+    }
+
+    Err(VerifyError::Chain(format!(
+        "bundle chain's top cert does not match any trusted Fulcio root and \
+         is not signed by any trusted Fulcio root \
+         ({} candidate root(s) active at integratedTime)",
+        fulcio_roots.len()
+    )))
+}
+
+fn anchor_contains_der(fulcio_roots: &[&FulcioRoot], top_der: &[u8]) -> bool {
+    fulcio_roots
+        .iter()
+        .flat_map(|r| r.cert_chain_der.iter())
+        .any(|d| d.as_slice() == top_der)
+}
+
+fn check_cert_validity_at(
+    cert: &X509Certificate<'_>,
+    at_time: DateTime<Utc>,
+    label: &str,
+) -> Result<(), VerifyError> {
+    let validity = cert.validity();
+    let not_before = DateTime::from_timestamp(validity.not_before.timestamp(), 0)
+        .ok_or_else(|| VerifyError::Chain(format!("{label} notBefore is unrepresentable")))?;
+    let not_after = DateTime::from_timestamp(validity.not_after.timestamp(), 0)
+        .ok_or_else(|| VerifyError::Chain(format!("{label} notAfter is unrepresentable")))?;
+    if at_time < not_before || at_time > not_after {
+        return Err(VerifyError::Chain(format!(
+            "{label} validity window [{not_before}, {not_after}] does not contain integratedTime {at_time}"
+        )));
+    }
+    Ok(())
+}
+
+fn verify_chain_link(
+    child: &X509Certificate<'_>,
+    parent: &X509Certificate<'_>,
+    label: &str,
+) -> Result<(), VerifyError> {
+    // Structural: child.issuer must equal parent.subject. x509-parser
+    // exposes DER-equality comparison on `X509Name` via the wrapper's
+    // `as_raw()` (the original DER bytes), which we compare byte-wise
+    // — that's the strictest form of name equality.
+    if child.tbs_certificate.issuer.as_raw() != parent.tbs_certificate.subject.as_raw() {
+        return Err(VerifyError::Chain(format!(
+            "{label}: child.issuer DN does not equal parent.subject DN"
+        )));
+    }
+
+    // Cryptographic: child's `tbs_certificate` bytes, hashed under the
+    // signature algorithm declared on the cert, must verify under the
+    // parent's SPKI bytes.
+    let tbs_bytes = child.tbs_certificate.as_ref();
+    let sig_bytes = &child.signature_value.data;
+    let sig_alg_oid = &child.signature_algorithm.algorithm;
+    verify_ecdsa_signature_by_oid(sig_alg_oid, tbs_bytes, sig_bytes, parent, label)
+}
+
+fn try_anchor_signature(
+    top: &X509Certificate<'_>,
+    anchor: &X509Certificate<'_>,
+) -> Result<(), VerifyError> {
+    if top.tbs_certificate.issuer.as_raw() != anchor.tbs_certificate.subject.as_raw() {
+        return Err(VerifyError::Chain(
+            "top cert issuer DN does not equal trust anchor subject DN".into(),
+        ));
+    }
+    let tbs = top.tbs_certificate.as_ref();
+    let sig = &top.signature_value.data;
+    let sig_alg = &top.signature_algorithm.algorithm;
+    verify_ecdsa_signature_by_oid(sig_alg, tbs, sig, anchor, "anchor-link")
+}
+
+/// ECDSA signature OIDs we accept (Sigstore profile).
+/// - 1.2.840.10045.4.3.2 = `ecdsa-with-SHA256` (P-256 leaves)
+/// - 1.2.840.10045.4.3.3 = `ecdsa-with-SHA384` (P-384 roots/intermediates)
+const OID_ECDSA_WITH_SHA256: [u64; 7] = [1, 2, 840, 10045, 4, 3, 2];
+const OID_ECDSA_WITH_SHA384: [u64; 7] = [1, 2, 840, 10045, 4, 3, 3];
+
+fn oid_components_match(oid: &x509_parser::der_parser::oid::Oid<'_>, expected: &[u64]) -> bool {
+    let components: Vec<u64> = match oid.iter() {
+        Some(iter) => iter.collect(),
+        None => return false,
+    };
+    components.as_slice() == expected
+}
+
+fn verify_ecdsa_signature_by_oid(
+    sig_alg_oid: &x509_parser::der_parser::oid::Oid<'_>,
+    tbs_bytes: &[u8],
+    sig_bytes: &[u8],
+    parent: &X509Certificate<'_>,
+    label: &str,
+) -> Result<(), VerifyError> {
+    let spki_der = parent.public_key().raw;
+    if oid_components_match(sig_alg_oid, &OID_ECDSA_WITH_SHA256) {
+        verify_ecdsa_p256_sha256(spki_der, tbs_bytes, sig_bytes, label)
+    } else if oid_components_match(sig_alg_oid, &OID_ECDSA_WITH_SHA384) {
+        verify_ecdsa_p384_sha384(spki_der, tbs_bytes, sig_bytes, label)
+    } else {
+        Err(VerifyError::Chain(format!(
+            "{label}: unsupported signature algorithm OID {sig_alg_oid} \
+             (Sigstore profile accepts only ecdsa-with-SHA256 or ecdsa-with-SHA384)"
+        )))
+    }
+}
+
+fn verify_ecdsa_p256_sha256(
+    spki_der: &[u8],
+    tbs_bytes: &[u8],
+    sig_bytes: &[u8],
+    label: &str,
+) -> Result<(), VerifyError> {
+    use p256::pkcs8::DecodePublicKey;
+    let verifying_key = VerifyingKey::from_public_key_der(spki_der).map_err(|e| {
+        VerifyError::Chain(format!(
+            "{label}: parent SPKI did not decode as ECDSA P-256: {e}"
+        ))
+    })?;
+    let signature = Signature::from_der(sig_bytes).map_err(|e| {
+        VerifyError::Chain(format!(
+            "{label}: cert signature is not valid DER ECDSA: {e}"
+        ))
+    })?;
+    // X.509 cert signature: sigma = ECDSA-sign(key, SHA-256(TBS)).
+    // p256::ecdsa::VerifyingKey's `Verifier<Signature>::verify` impl
+    // hashes the message internally with SHA-256 — exactly the curve's
+    // standard hash for ecdsa-with-SHA256 — so passing raw TBS bytes
+    // is the right shape. Pre-hashing first would re-hash the digest
+    // and produce the wrong verification input.
+    verifying_key.verify(tbs_bytes, &signature).map_err(|e| {
+        VerifyError::Chain(format!(
+            "{label}: ECDSA P-256 signature did not verify: {e}"
+        ))
+    })
+}
+
+fn verify_ecdsa_p384_sha384(
+    spki_der: &[u8],
+    tbs_bytes: &[u8],
+    sig_bytes: &[u8],
+    label: &str,
+) -> Result<(), VerifyError> {
+    use p384::pkcs8::DecodePublicKey;
+    let verifying_key = p384::ecdsa::VerifyingKey::from_public_key_der(spki_der).map_err(|e| {
+        VerifyError::Chain(format!(
+            "{label}: parent SPKI did not decode as ECDSA P-384: {e}"
+        ))
+    })?;
+    let signature = p384::ecdsa::Signature::from_der(sig_bytes).map_err(|e| {
+        VerifyError::Chain(format!(
+            "{label}: cert signature is not valid DER ECDSA: {e}"
+        ))
+    })?;
+    // Same shape as the P-256 case — p384's Verifier hashes with
+    // SHA-384, which matches ecdsa-with-SHA384.
+    verifying_key.verify(tbs_bytes, &signature).map_err(|e| {
+        VerifyError::Chain(format!(
+            "{label}: ECDSA P-384 signature did not verify: {e}"
+        ))
+    })
 }
 
 #[cfg(test)]
@@ -2693,6 +2996,7 @@ mod tests {
 
     // ── verify_rekor_set — Phase 1.6 ──────────────────────────────
 
+    use ecdsa::signature::hazmat::PrehashSigner;
     use p256::pkcs8::EncodePublicKey;
 
     /// Helper: produce a fresh P-256 ECDSA keypair plus the SPKI
@@ -2729,7 +3033,7 @@ mod tests {
             log_id_hex,
         );
         let digest = Sha256::digest(set_input.as_bytes());
-        let sig: Signature = signing_key.sign(&digest);
+        let sig: Signature = signing_key.sign_prehash(&digest).expect("sign_prehash");
         let signed_entry_timestamp = BASE64.encode(sig.to_der().as_bytes());
 
         crate::sigstore::TlogEntry {
@@ -3020,7 +3324,7 @@ mod tests {
         let set_input =
             build_set_input_canonical_json(canonicalized_body, integrated_time, 42, &log_id_hex);
         let digest = Sha256::digest(set_input.as_bytes());
-        let sig: Signature = signing_key.sign(&digest);
+        let sig: Signature = signing_key.sign_prehash(&digest).expect("sign_prehash");
         let set_b64 = BASE64.encode(sig.to_der().as_bytes());
 
         let tlog = crate::sigstore::TlogEntry {
@@ -3176,7 +3480,7 @@ mod tests {
     ) -> String {
         let body = format!("{origin}\n{tree_size}\n{}\n", BASE64.encode(root_hash));
         let digest = Sha256::digest(body.as_bytes());
-        let sig: Signature = signing_key.sign(&digest);
+        let sig: Signature = signing_key.sign_prehash(&digest).expect("sign_prehash");
         // 4-byte key-hint prefix (informational; we don't verify it).
         let mut key_hint_plus_sig = vec![0u8; 4];
         key_hint_plus_sig.extend_from_slice(sig.to_der().as_bytes());
@@ -3548,6 +3852,250 @@ mod tests {
                 "expected unknown-logId diagnostic, got: {msg}"
             ),
             other => panic!("expected InclusionProof, got: {other:?}"),
+        }
+    }
+
+    // ── verify_cert_chain — Phase 1.3 ─────────────────────────────
+
+    /// Build a (rcgen::Certificate, DER bytes, KeyPair) triple for a
+    /// P-384 self-signed root — matches the real Sigstore Fulcio root
+    /// profile.
+    fn p384_root_cert(
+        not_before: rcgen::CertificateParams,
+    ) -> (rcgen::Certificate, Vec<u8>, KeyPair) {
+        let kp = KeyPair::generate_for(&rcgen::PKCS_ECDSA_P384_SHA384).unwrap();
+        let mut params = not_before;
+        params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        let cert = params.self_signed(&kp).unwrap();
+        let der = cert.der().to_vec();
+        (cert, der, kp)
+    }
+
+    /// Build a P-256 leaf cert signed by the given P-384 issuer —
+    /// matches the real Sigstore leaf-under-Fulcio profile. Returns
+    /// the leaf cert's DER bytes.
+    fn p256_leaf_signed_by(
+        leaf_params: rcgen::CertificateParams,
+        issuer_cert: &rcgen::Certificate,
+        issuer_kp: &KeyPair,
+    ) -> Vec<u8> {
+        let leaf_kp = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).unwrap();
+        let leaf = leaf_params
+            .signed_by(&leaf_kp, issuer_cert, issuer_kp)
+            .unwrap();
+        leaf.der().to_vec()
+    }
+
+    /// Convenience: synthesise a Fulcio-like validity window
+    /// centered on `mid_year`.
+    fn cert_params_validity(mid_year: i32) -> rcgen::CertificateParams {
+        let mut p = rcgen::CertificateParams::default();
+        p.not_before = rcgen::date_time_ymd(mid_year - 5, 1, 1);
+        p.not_after = rcgen::date_time_ymd(mid_year + 5, 1, 1);
+        p
+    }
+
+    fn ts_year(year: i32) -> SystemTime {
+        DateTime::from_timestamp(
+            chrono::NaiveDate::from_ymd_opt(year, 6, 1)
+                .unwrap()
+                .and_hms_opt(0, 0, 0)
+                .unwrap()
+                .and_utc()
+                .timestamp(),
+            0,
+        )
+        .unwrap()
+        .into()
+    }
+
+    fn fulcio_root_active_at(year: i32, root_der: Vec<u8>) -> FulcioRoot {
+        FulcioRoot {
+            cert_chain_der: vec![root_der],
+            valid_for: ValidityWindow {
+                start: DateTime::from_timestamp(
+                    chrono::NaiveDate::from_ymd_opt(year - 10, 1, 1)
+                        .unwrap()
+                        .and_hms_opt(0, 0, 0)
+                        .unwrap()
+                        .and_utc()
+                        .timestamp(),
+                    0,
+                )
+                .unwrap(),
+                end: Some(
+                    DateTime::from_timestamp(
+                        chrono::NaiveDate::from_ymd_opt(year + 10, 1, 1)
+                            .unwrap()
+                            .and_hms_opt(0, 0, 0)
+                            .unwrap()
+                            .and_utc()
+                            .timestamp(),
+                        0,
+                    )
+                    .unwrap(),
+                ),
+            },
+        }
+    }
+
+    #[test]
+    fn verifies_two_cert_chain_terminating_at_trusted_root() {
+        // Real Sigstore shape: bundle ships [leaf, root]. Trust
+        // anchor matches the top cert byte-for-byte → fast path
+        // through anchor_contains_der.
+        let (root_cert, root_der, root_kp) = p384_root_cert(cert_params_validity(2025));
+        let leaf_der = p256_leaf_signed_by(cert_params_validity(2025), &root_cert, &root_kp);
+        let root = fulcio_root_active_at(2025, root_der.clone());
+        let chain: Vec<&[u8]> = vec![&leaf_der, &root_der];
+        let roots: Vec<&FulcioRoot> = vec![&root];
+        verify_cert_chain(&chain, &roots, ts_year(2025))
+            .expect("a leaf signed by a trusted root must verify");
+    }
+
+    #[test]
+    fn verifies_leaf_only_chain_when_root_in_trust_anchors_signs_directly() {
+        // Bundle ships [leaf] only (no root). Trust anchor IS the
+        // direct signer → try_anchor_signature path.
+        let (root_cert, root_der, root_kp) = p384_root_cert(cert_params_validity(2025));
+        let leaf_der = p256_leaf_signed_by(cert_params_validity(2025), &root_cert, &root_kp);
+        let root = fulcio_root_active_at(2025, root_der);
+        let chain: Vec<&[u8]> = vec![&leaf_der];
+        let roots: Vec<&FulcioRoot> = vec![&root];
+        verify_cert_chain(&chain, &roots, ts_year(2025))
+            .expect("leaf-only chain must verify when root signs directly");
+    }
+
+    #[test]
+    fn rejects_chain_when_top_cert_not_signed_by_any_trusted_root() {
+        // Bundle's root is real but the trust anchors are a
+        // different unrelated set.
+        let (real_root_cert, real_root_der, real_root_kp) =
+            p384_root_cert(cert_params_validity(2025));
+        let leaf_der =
+            p256_leaf_signed_by(cert_params_validity(2025), &real_root_cert, &real_root_kp);
+        let (_, other_root_der, _) = p384_root_cert(cert_params_validity(2025));
+        let other = fulcio_root_active_at(2025, other_root_der);
+        let chain: Vec<&[u8]> = vec![&leaf_der, &real_root_der];
+        let roots: Vec<&FulcioRoot> = vec![&other];
+        let err = verify_cert_chain(&chain, &roots, ts_year(2025))
+            .expect_err("chain to an untrusted root must reject");
+        match err {
+            VerifyError::Chain(msg) => assert!(
+                msg.contains("does not match any trusted Fulcio root"),
+                "expected anchor-rejection diagnostic, got: {msg}"
+            ),
+            other => panic!("expected Chain, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_chain_with_leaf_out_of_validity_at_integrated_time() {
+        // Leaf valid 2020-2025; integratedTime is 2027.
+        let (root_cert, root_der, root_kp) = p384_root_cert(cert_params_validity(2025));
+        let mut leaf_params = rcgen::CertificateParams::default();
+        leaf_params.not_before = rcgen::date_time_ymd(2020, 1, 1);
+        leaf_params.not_after = rcgen::date_time_ymd(2025, 1, 1);
+        let leaf_der = p256_leaf_signed_by(leaf_params, &root_cert, &root_kp);
+        let root = fulcio_root_active_at(2025, root_der.clone());
+        let chain: Vec<&[u8]> = vec![&leaf_der, &root_der];
+        let roots: Vec<&FulcioRoot> = vec![&root];
+        let err = verify_cert_chain(&chain, &roots, ts_year(2027))
+            .expect_err("integratedTime past leaf's notAfter must reject");
+        match err {
+            VerifyError::Chain(msg) => assert!(
+                msg.contains("does not contain integratedTime"),
+                "expected validity-window diagnostic, got: {msg}"
+            ),
+            other => panic!("expected Chain, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_chain_with_leaf_signed_by_wrong_parent() {
+        // Build two unrelated chains. Splice chain-A's leaf into
+        // a bundle claiming chain-B's root is its parent.
+        let (root_a_cert, _root_a_der, root_a_kp) = p384_root_cert(cert_params_validity(2025));
+        let leaf_a_der = p256_leaf_signed_by(cert_params_validity(2025), &root_a_cert, &root_a_kp);
+        let (_, root_b_der, _) = p384_root_cert(cert_params_validity(2025));
+        let root_b = fulcio_root_active_at(2025, root_b_der.clone());
+        let chain: Vec<&[u8]> = vec![&leaf_a_der, &root_b_der];
+        let roots: Vec<&FulcioRoot> = vec![&root_b];
+        let err = verify_cert_chain(&chain, &roots, ts_year(2025))
+            .expect_err("leaf signed by a different root than declared must reject");
+        // The diagnostic could be either "issuer DN does not equal"
+        // (subject mismatch) or "ECDSA P-384 signature did not verify"
+        // (sig mismatch under a coincidentally-matching DN). Both
+        // are Chain failures.
+        match err {
+            VerifyError::Chain(msg) => assert!(
+                msg.contains("issuer DN") || msg.contains("did not verify"),
+                "expected chain-link rejection diagnostic, got: {msg}"
+            ),
+            other => panic!("expected Chain, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_empty_chain() {
+        let root = fulcio_root_active_at(2025, vec![0u8; 4]);
+        let err = verify_cert_chain(&[], std::slice::from_ref(&&root), ts_year(2025))
+            .expect_err("empty chain must reject");
+        match err {
+            VerifyError::Chain(msg) => assert!(msg.contains("empty"), "got: {msg}"),
+            other => panic!("expected Chain, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_chain_when_no_trust_anchors_active_at_integrated_time() {
+        let (root_cert, root_der, root_kp) = p384_root_cert(cert_params_validity(2025));
+        let leaf_der = p256_leaf_signed_by(cert_params_validity(2025), &root_cert, &root_kp);
+        let chain: Vec<&[u8]> = vec![&leaf_der, &root_der];
+        // Empty roots list → no anchor.
+        let err = verify_cert_chain(&chain, &[], ts_year(2025))
+            .expect_err("empty trust-anchor set must reject");
+        match err {
+            VerifyError::Chain(msg) => {
+                assert!(msg.contains("no Fulcio roots active"), "got: {msg}")
+            }
+            other => panic!("expected Chain, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_chain_with_malformed_der_in_bundle() {
+        let root = fulcio_root_active_at(2025, vec![0xab; 16]);
+        let garbage: &[u8] = &[0xff; 8];
+        let chain: Vec<&[u8]> = vec![garbage];
+        let roots: Vec<&FulcioRoot> = vec![&root];
+        let err = verify_cert_chain(&chain, &roots, ts_year(2025))
+            .expect_err("malformed DER in bundle chain must reject");
+        match err {
+            VerifyError::Chain(msg) => assert!(msg.contains("not valid DER X.509"), "got: {msg}"),
+            other => panic!("expected Chain, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn vendored_fulcio_roots_parse_as_x509_with_expected_algorithms() {
+        // Sanity: every Fulcio root in the vendored trust root parses
+        // as X.509 DER and uses the algorithms our verify_cert_chain
+        // dispatch supports. A future rotation that introduces a
+        // non-supported algorithm would fail this test loudly before
+        // breaking real installs.
+        let root = TrustRoot::parse(EMBEDDED_TRUST_ROOT_JSON).unwrap();
+        for (i, fulcio) in root.fulcio_roots.iter().enumerate() {
+            for (j, der) in fulcio.cert_chain_der.iter().enumerate() {
+                let (_, cert) = X509Certificate::from_der(der)
+                    .unwrap_or_else(|e| panic!("Fulcio root[{i}].cert[{j}] failed to parse: {e}"));
+                let sig_alg = &cert.signature_algorithm.algorithm;
+                assert!(
+                    oid_components_match(sig_alg, &OID_ECDSA_WITH_SHA256)
+                        || oid_components_match(sig_alg, &OID_ECDSA_WITH_SHA384),
+                    "Fulcio root[{i}].cert[{j}] uses unsupported sig algorithm {sig_alg}"
+                );
+            }
         }
     }
 
