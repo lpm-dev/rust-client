@@ -1,22 +1,9 @@
 //! axum HTTP server setup and lifecycle.
 //!
-//! Binds to `127.0.0.1:{port}` (never `0.0.0.0`) and serves:
-//! - REST API at `/api/*`
-//! - SSE stream at `/api/stream`
-//! - Embedded web UI at `/*` (SPA fallback)
-//!
-//! # Security
-//!
-//! - Binds to loopback only — not accessible from other machines on the network.
-//! - Strict CORS: only `http://127.0.0.1:{port}` and `http://localhost:{port}`
-//!   origins are allowed (using the actually-bound port). This prevents
-//!   malicious websites from exfiltrating captured traffic via cross-origin
-//!   requests.
-//! - Per-process random auth token gating every `/api/*` route. Loopback
-//!   binding alone does not stop a same-host other-UID attacker (CI runner,
-//!   dev container, multi-user laptop) from reading captured webhook bodies
-//!   (which may carry Stripe-Signature, GitHub HMAC, etc.) or replaying
-//!   them against arbitrary localhost ports. The token closes that gap.
+//! Binds to `127.0.0.1:{port}` (never `0.0.0.0`) and serves the REST
+//! API, SSE stream, and embedded web UI. Strict CORS pinned to the
+//! actually-bound port; every `/api/*` route requires the per-process
+//! auth token from `InspectorState`.
 
 use crate::InspectorHandle;
 use crate::state::InspectorState;
@@ -31,10 +18,9 @@ use std::net::SocketAddr;
 use subtle::ConstantTimeEq;
 use tower_http::cors::{AllowOrigin, CorsLayer};
 
-/// Reject any `/api/*` request that doesn't present the per-process auth
-/// token via `Authorization: Bearer <token>` or `?token=<token>`. The
-/// query-string form exists so `EventSource` (which can't set headers)
-/// can subscribe to the SSE stream.
+/// Accepts the token via `Authorization: Bearer` or `?token=` (the
+/// latter for `EventSource`, which cannot set headers). Cookies are
+/// not accepted — they are host-scoped, not port-scoped, on `127.0.0.1`.
 async fn require_auth_token(
     State(state): State<InspectorState>,
     request: Request,
@@ -58,14 +44,6 @@ async fn require_auth_token(
         None
     });
 
-    // Cookies are intentionally NOT accepted. Cookies on `127.0.0.1`
-    // are host-scoped, not port-scoped (RFC 6265) — an inspector
-    // cookie at `:4400` would be sent by the browser to every other
-    // service the user later visits on `127.0.0.1:N`. `sessionStorage`
-    // (which IS port-scoped per the HTML5 origin definition) is used
-    // by the SPA bootstrap in `ui.rs` instead, with the token attached
-    // to each request via the `Authorization` header or `?token=` SSE
-    // query param checked above.
     let presented = presented_header.or(presented_query);
 
     let ok = presented
@@ -174,11 +152,11 @@ pub async fn start(state: InspectorState, port: u16) -> Result<InspectorHandle, 
             require_auth_token,
         ));
 
+    // SPA fallback stays unauthenticated so the browser can fetch
+    // HTML/JS/CSS; the injected bootstrap then carries the token on
+    // every API call.
     let app = Router::new()
         .merge(api_routes)
-        // Static UI (SPA fallback) — intentionally unauthenticated so the
-        // browser can fetch HTML/JS/CSS; every API call the UI then makes
-        // carries the token from its querystring.
         .fallback(get(crate::ui::serve_ui))
         .layer(cors)
         .with_state(state.clone());

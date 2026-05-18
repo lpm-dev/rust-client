@@ -128,21 +128,11 @@ fn lexically_clean(p: &Path) -> PathBuf {
     out
 }
 
-/// Reject path strings containing cmd.exe metacharacters. Used as a
-/// defense-in-depth check before invoking `cmd /c mklink /J` and before
-/// emitting the rendered `.cmd` bin shim that wraps a package's
-/// `bin` target.
-///
-/// The denylist covers cmd.exe's full set of parser-relevant chars,
-/// including the often-forgotten sub-expression triple
-/// `( ) ;` and the quote-bypass triple `` ` ' \t``. Without those, a
-/// non-registry tarball dep with a crafted `package.json > name`
-/// (e.g., `"x(echo+pwned).js"`) reaches cmd.exe's fragile sub-expression
-/// parser where `&` and `^` inside parens can invoke commands even
-/// with double-quoting around the path.
-///
-/// Returns `Err(reason)` listing the offending character on a hit.
-/// Callers translate that into [`std::io::ErrorKind::InvalidInput`].
+/// Reject path strings containing cmd.exe metacharacters. Used before
+/// `cmd /c mklink /J` and before emitting a `.cmd` bin shim. Covers
+/// the sub-expression triple `( ) ;` and the quote-bypass triple
+/// `` ` ' \t`` so a crafted `package.json > name` can't reach cmd.exe's
+/// parser through double-quoted argument shapes.
 #[cfg(windows)]
 pub fn validate_cmd_path(path: &str) -> Result<(), String> {
     const DANGEROUS: &[char] = &[
@@ -180,8 +170,6 @@ mod tests {
 
     #[test]
     fn validate_cmd_path_rejects_paren_subshell() {
-        // `(` enters a cmd.exe sub-expression where `&` invokes commands
-        // even when the outer path is quoted.
         let err = validate_cmd_path("C:\\evil(echo+pwned)\\node.exe").unwrap_err();
         assert!(err.contains('('));
     }

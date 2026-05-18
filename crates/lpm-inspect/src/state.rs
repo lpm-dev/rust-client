@@ -52,11 +52,9 @@ struct Inner {
     pub local_port: u16,
     /// The tunnel URL (set after connection).
     pub tunnel_url: RwLock<Option<String>>,
-    /// Per-process random auth token gating every `/api/*` route.
-    /// Loopback binding stops remote attackers; the token stops same-host
-    /// other-UID attackers (CI runners, dev containers, multi-user laptops)
-    /// from reading captured webhook bodies and replaying them against
-    /// arbitrary localhost ports.
+    /// Per-process random auth token gating every `/api/*` route — closes
+    /// the same-UID attacker on shared hosts (loopback bind alone is not
+    /// enough on CI runners / dev containers).
     auth_token: String,
 }
 
@@ -110,9 +108,7 @@ impl InspectorState {
         }
     }
 
-    /// The per-process auth token required on every `/api/*` request.
-    /// Surfaced via the bound URL (`?token=...`) and as a constant-time
-    /// equality target inside the auth middleware.
+    /// Per-process auth token required on every `/api/*` request.
     pub fn auth_token(&self) -> &str {
         &self.inner.auth_token
     }

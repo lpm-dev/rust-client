@@ -6,10 +6,6 @@ mod integration_tests {
     use lpm_tunnel::webhook::CapturedWebhook;
     use std::collections::HashMap;
 
-    /// Build a URL carrying the per-process auth token via the query
-    /// param. Mirrors what the browser-side UI does after the cookie
-    /// handoff — keeps each test focused on its endpoint contract
-    /// rather than the auth wiring.
     fn url_with_token(port: u16, path: &str, token: &str) -> String {
         let sep = if path.contains('?') { '&' } else { '?' };
         format!("http://127.0.0.1:{port}{path}{sep}token={token}")
@@ -402,9 +398,6 @@ mod integration_tests {
 
     #[tokio::test]
     async fn api_rejects_unauthenticated_request() {
-        // Loopback binding alone is not enough on shared boxes (CI
-        // runners, dev containers, Codespaces). Hitting any `/api/*`
-        // path without the per-process token must return 401.
         let state = InspectorState::new(3000);
         let port = 14_408;
         let handle = match crate::start(state.clone(), port).await {
@@ -445,10 +438,8 @@ mod integration_tests {
 
     #[tokio::test]
     async fn api_rejects_cookie_auth() {
-        // Cookies on 127.0.0.1 are host-scoped, not port-scoped per
-        // RFC 6265. A cookie set at `:4400` would be sent to every
-        // other localhost service. The auth middleware must NOT
-        // accept the `lpm_inspector_token` cookie even if presented.
+        // Cookies on `127.0.0.1` are host-scoped, not port-scoped, so a
+        // cookie carrier would leak to every other localhost service.
         let state = InspectorState::new(3000);
         let port = 14_411;
         let handle = match crate::start(state.clone(), port).await {
@@ -475,8 +466,6 @@ mod integration_tests {
 
     #[tokio::test]
     async fn ui_html_response_does_not_set_inspector_cookie() {
-        // Whatever the SPA needs to remember the token, it must not be
-        // a cookie — see api_rejects_cookie_auth for the rationale.
         let state = InspectorState::new(3000);
         let port = 14_412;
         let handle = match crate::start(state.clone(), port).await {
@@ -503,8 +492,6 @@ mod integration_tests {
             }
         }
         let body = resp.text().await.unwrap();
-        // Bootstrap script must be present so the SPA can attach the
-        // token to its fetches without relying on the cookie channel.
         assert!(
             body.contains("sessionStorage.setItem(\"lpm_inspector_token\""),
             "expected SPA bootstrap to set sessionStorage; body sample: {}",

@@ -482,13 +482,11 @@ impl Sandbox for LandlockSandbox {
         let mut ruleset_opt = Some(ruleset);
         let mut seccomp_opt = seccomp_program;
         let mut overlay_opt = overlay_spec;
-        // Capture strict-posture flag before the move-closure so the
-        // child can fail-closed on `RulesetStatus::PartiallyEnforced` —
-        // an atypical kernel build (custom V4 LSM that exposes the V4
-        // ABI but only partially wires BindTcp/ConnectTcp) would
-        // otherwise silently degrade the TCP-deny claim to a no-op.
-        // Default/Degraded postures accept partial enforcement: they
-        // only depend on V1 filesystem rules.
+        // Strict posture promises TCP-egress denial, so the child must
+        // refuse `RulesetStatus::PartiallyEnforced` — a kernel build
+        // that advertises V4 but only partially wires BindTcp/ConnectTcp
+        // would otherwise silently degrade the claim. Default/Degraded
+        // only depend on V1 filesystem rules and accept partial.
         let is_strict_posture = matches!(self.posture, BackendPosture::Strict);
 
         // SAFETY: This closure runs post-fork, pre-exec in the
@@ -626,13 +624,6 @@ impl Sandbox for LandlockSandbox {
                         if is_strict_posture
                             && !matches!(status.ruleset, RulesetStatus::FullyEnforced) =>
                     {
-                        // Strict posture promises TCP-egress denial.
-                        // A `PartiallyEnforced` status means the kernel
-                        // accepted some but not all rules — under
-                        // strict, we can't tell which, so fail-closed
-                        // rather than ship the user a sandbox that
-                        // pretends to deny network while silently
-                        // letting it through.
                         write_stderr_as_safe(
                             b"landlock: PartiallyEnforced under strict posture; refusing\n",
                         );

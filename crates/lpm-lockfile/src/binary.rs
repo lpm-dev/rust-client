@@ -587,21 +587,12 @@ impl BinaryLockfileReader {
         None
     }
 
-    /// Convert the binary lockfile back to a `Lockfile` struct.
-    ///
-    /// Note: the binary format does not store metadata fields (resolved_with),
-    /// so the returned Lockfile uses the current defaults. The TOML lockfile is
-    /// the source of truth for metadata; the binary format is a read-performance
-    /// optimization only.
-    ///
-    /// Returns `Err` when the binary entries violate cross-format package
-    /// invariants — currently the `@lpm.dev/*` scope-pin (see
-    /// [`crate::Lockfile::validate_loaded_packages`]). A tampered
-    /// `lpm.lockb` that points an LPM-scoped package at a non-LPM origin
-    /// must fail here so the fast path can't bypass the
-    /// [`crate::Lockfile::from_toml`] guard; the caller (`read_fast`)
-    /// falls back to the TOML form on this error, which then fails too
-    /// with a reviewer-visible diff.
+    /// Convert the binary lockfile back to a `Lockfile`. Metadata
+    /// fields (resolved_with) aren't stored in the binary format and
+    /// fall back to defaults; the TOML lockfile is the source of truth
+    /// for metadata. Returns `Err` when entries violate cross-format
+    /// invariants (currently `@lpm.dev/*` scope-pin) — `read_fast`
+    /// falls back to the TOML form on this error.
     pub fn to_lockfile(&self) -> Result<Lockfile, LockfileError> {
         let count = self.pkg_count() as usize;
         let mut packages = Vec::with_capacity(count);

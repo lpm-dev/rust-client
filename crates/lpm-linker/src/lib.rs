@@ -117,29 +117,21 @@ pub fn validate_bin_name(name: &str, pkg_name: &str) -> Result<(), String> {
             "bin name \"{name}\" contains path separators or traversal components"
         ));
     }
-    // NTFS alternate-data-stream separator: a bin named "foo:bar" would
-    // open the ADS rather than the file on `.bin/foo.cmd` execution.
+    // NTFS alternate-data-stream separator — `foo:bar` opens the ADS.
     if name.contains(':') {
         return Err(format!(
             "bin name \"{name}\" contains ':' (NTFS alternate data stream separator)"
         ));
     }
-    // Trailing dot or space confuses CreateFile on Windows (silently
-    // strips them) so `.bin/foo.cmd` ends up pointing at a different
-    // file than the on-disk name suggests.
+    // Windows CreateFile silently strips trailing `.` and ` `.
     if name.ends_with('.') || name.ends_with(' ') {
         return Err(format!(
             "bin name \"{name}\" ends with a dot or space (invalid on Windows)"
         ));
     }
-    // Windows reserved device names — bare or with any extension. A
-    // bin named "CON" generates `.bin/CON.cmd` whose CreateFile returns
-    // a handle to the console device, corrupting the install. Microsoft's
-    // "Naming a File" docs also flag the Unicode superscript variants
-    // (`COM¹`, `LPT²`, ...) as reserved because the Win32 name-parser
-    // applies compatibility folding before the device match — so a bin
-    // named `COM¹` reaches the COM1 device regardless of the literal
-    // ASCII digits. Normalize superscript digits before comparison.
+    // Windows reserved device names — match the stem against both ASCII
+    // and Unicode-superscript digit shapes (the Win32 parser folds them
+    // together before the device match).
     const RESERVED_WIN_DEVICES: &[&str] = &[
         "CON", "PRN", "AUX", "NUL", "COM0", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7",
         "COM8", "COM9", "LPT0", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8",
@@ -3936,18 +3928,12 @@ mod tests {
 
     #[test]
     fn bin_name_windows_reserved_with_extension_rejected() {
-        // Windows treats `CON.txt` the same as `CON` — the device opens
-        // regardless of the extension.
         assert!(validate_bin_name("CON.txt", "pkg").is_err());
         assert!(validate_bin_name("nul.js", "pkg").is_err());
     }
 
     #[test]
     fn bin_name_windows_reserved_superscript_variants_rejected() {
-        // Microsoft's "Naming a File" docs flag Unicode superscript
-        // digit variants (`COM¹`, `LPT²`, ...) as reserved — the
-        // Win32 name parser applies compatibility folding so the
-        // device match fires regardless of the literal digit shape.
         for n in [
             "COM\u{00B9}",     // COM¹
             "COM\u{00B2}",     // COM²

@@ -294,18 +294,11 @@ impl LockedPackage {
         }
     }
 
-    /// Returns `Some(url)` if this is a `@lpm.dev/*` scoped package whose
-    /// Registry source URL is NOT on the lpm.dev origin (or
-    /// http://localhost for dev). Returns `None` for non-scoped packages,
-    /// non-Registry sources, or correctly-scoped URLs.
-    ///
-    /// Hard-pin defense: `evaluate_cached_url` already gates a URL by
-    /// scheme + shape + per-client configured origin set, but the
-    /// configured-origin set legitimately contains BOTH lpm.dev and
-    /// `registry.npmjs.org` so a tampered lockfile with `@lpm.dev/foo.bar`
-    /// pointed at npm.org would slip through. Scoped names should never
-    /// resolve through a non-lpm origin regardless of the wider
-    /// configured set.
+    /// Returns `Some(url)` if this is a `@lpm.dev/*` package pointing
+    /// at a non-lpm.dev origin. Scoped names must always resolve
+    /// through the LPM origin (or `http://localhost` for dev),
+    /// regardless of what other registries the client is configured to
+    /// talk to.
     pub fn lpm_scope_origin_mismatch(&self) -> Option<String> {
         if !self.name.starts_with("@lpm.dev/") {
             return None;
@@ -317,10 +310,9 @@ impl LockedPackage {
     }
 }
 
-/// Whether `url` is on a recognized LPM origin: `https://lpm.dev` (and
-/// known subdomain shapes), or `http://localhost[:port]` / `http://
-/// 127.0.0.1[:port]` for local dev. Conservative on purpose — a stray
-/// `https://lpm.dev.evil.com` must NOT pass.
+/// `https://lpm.dev` (+ subdomains) and `http://localhost` /
+/// `127.0.0.1` for local dev. Strict so `https://lpm.dev.evil.com`
+/// does NOT match.
 fn is_lpm_origin(url_str: &str) -> bool {
     let Ok(parsed) = url::Url::parse(url_str) else {
         return false;
@@ -483,12 +475,8 @@ impl Lockfile {
                 });
             }
 
-            // Scope-pin `@lpm.dev/*` to the lpm.dev origin. A VCS-write
-            // attacker who edits `lpm.lock` to redirect an LPM-scoped
-            // package to a non-LPM registry (matching the SRI to their
-            // malicious tarball) gets rejected here before any fetch.
-            // The same guard runs on the binary fast path via
-            // `validate_loaded_packages` so the .lockb form can't bypass.
+            // Scope-pin `@lpm.dev/*` to the lpm.dev origin. The binary
+            // fast path runs the same check via `validate_loaded_packages`.
             if let Some(url) = pkg.lpm_scope_origin_mismatch() {
                 return Err(LockfileError::InvalidScopeOrigin {
                     package: pkg.name.clone(),
@@ -500,15 +488,8 @@ impl Lockfile {
         Ok(lockfile)
     }
 
-    /// Run package-shape invariants that must hold on BOTH the TOML and
-    /// binary fast-path read sides. Currently:
-    /// - `@lpm.dev/*` scope-pinning to the lpm.dev origin (matches the
-    ///   per-package check inside [`Lockfile::from_toml`]).
-    ///
-    /// The binary reader (`crates/lpm-lockfile/src/binary.rs`) calls
-    /// this after materializing each `LockedPackage` so a tampered
-    /// `lpm.lockb` with an off-origin `@lpm.dev/*` entry can't slip
-    /// past while only the TOML path enforces the invariant.
+    /// Package-shape invariants that hold for both the TOML and
+    /// binary read sides. Currently: `@lpm.dev/*` scope-pinning.
     pub fn validate_loaded_packages(packages: &[LockedPackage]) -> Result<(), LockfileError> {
         for pkg in packages {
             if let Some(url) = pkg.lpm_scope_origin_mismatch() {
@@ -611,11 +592,9 @@ impl Lockfile {
                         if let Ok(lockfile) = reader.to_lockfile() {
                             return Ok(lockfile);
                         }
-                        // Binary failed a cross-format invariant
-                        // (e.g., scope-pin). Fall through to TOML so the
-                        // same defect surfaces against the reviewer-
-                        // visible source rather than as an opaque
-                        // binary-only error.
+                        // Cross-format invariant failed; fall through
+                        // to TOML so the same defect surfaces against
+                        // the reviewer-visible source.
                     }
                     Err(LockfileError::UnsupportedVersion { found, .. })
                         if found < binary::BINARY_VERSION =>
@@ -793,18 +772,11 @@ pub enum LockfileError {
     )]
     InvalidTarballHint { package: String },
 
-    /// A `@lpm.dev/*` scoped package is paired with a registry source URL
-    /// whose origin is not lpm.dev. This is a scope-pinning violation —
-    /// LPM-scoped packages must always come from the LPM origin (or
-    /// http://localhost for dev), regardless of what other registries
-    /// the resolver is otherwise allowed to talk to.
-    ///
-    /// Defends against a VCS-write attacker (compromised collaborator,
-    /// supply-chain on a pre-commit hook, pull-request auto-merge bot)
-    /// who edits `lpm.lock` to redirect a `@lpm.dev/*` entry to an
-    /// attacker-controlled registry and matches the SRI to their
-    /// malicious tarball. The hard-fail at lockfile load is stricter
-    /// than `evaluate_cached_url`'s shape-and-set check.
+    /// `@lpm.dev/*` package whose registry source URL is not on the
+    /// LPM origin. Rejected at load time so a tampered lockfile can't
+    /// redirect an LPM-scoped package to an attacker-controlled
+    /// registry, even if the SRI in the same file matches the
+    /// malicious tarball.
     #[error(
         "package {package:?} is in the @lpm.dev scope but its source URL {url:?} \
          is not on the lpm.dev origin — refusing to use an off-origin URL for an \
@@ -2071,9 +2043,6 @@ version = "1.0.0"
 
     #[test]
     fn from_toml_rejects_lpm_scope_at_lookalike_origin() {
-        // `lpm.dev.evil.com` ends with the literal `.lpm.dev` prefix only
-        // by accident — the host comparator must use exact `lpm.dev`
-        // or `*.lpm.dev` matching, not endswith-of-substring.
         let toml = "[metadata]\n\
              lockfile-version = 1\n\
              \n\
@@ -2113,8 +2082,6 @@ version = "1.0.0"
 
     #[test]
     fn from_toml_accepts_non_lpm_scope_at_any_origin() {
-        // Only @lpm.dev/* is scope-pinned. A normal npm package can
-        // point at any configured registry.
         let toml = "[metadata]\n\
              lockfile-version = 1\n\
              \n\
@@ -2127,11 +2094,6 @@ version = "1.0.0"
 
     #[test]
     fn validate_loaded_packages_rejects_binary_path_scope_mismatch() {
-        // The binary fast path (`BinaryLockfileReader::to_lockfile`)
-        // routes through `validate_loaded_packages` so a tampered
-        // `lpm.lockb` can't bypass the TOML-side scope-pin gate. Build
-        // a `LockedPackage` directly (the binary reader produces these)
-        // and confirm the cross-format validator fires the same error.
         let bad = LockedPackage {
             name: "@lpm.dev/alice.utils".into(),
             version: "1.0.0".into(),

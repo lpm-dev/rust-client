@@ -89,25 +89,12 @@ const DEFAULT_SCRIPT_TIMEOUT_SECS: u64 = 300;
 /// Build state marker filename.
 const BUILD_MARKER: &str = ".lpm-built";
 
-/// Env var patterns to strip from script execution environment.
-///
-/// Two classes share this list:
-///   * **Credential carriers** — bearers and per-vendor tokens that
-///     a malicious lifecycle script would otherwise exfiltrate.
-///   * **Runtime-hijack carriers** (H13) — names that the dynamic
-///     linker / language runtimes consume to load attacker-supplied
-///     code into the child process. These are the same names the
-///     dotenv loader at `lpm-runner/src/dotenv.rs:256` already
-///     denies; before this fix the lifecycle path had a token-only
-///     denylist while `.env` loading had a runtime-hijack denylist,
-///     leaving an asymmetric gap where an LD_PRELOAD/NODE_OPTIONS
-///     value present on the parent process flowed verbatim into the
-///     lifecycle child. Mirroring the dotenv list here closes that
-///     asymmetry — the lifecycle child no longer inherits any
-///     dynamic-linker hijack hook from the parent's env regardless
-///     of where the value originated.
+/// Env var names stripped from the lifecycle script environment.
+/// Mirrors the dotenv loader's `DENIED_ENV_VARS` so the same shape
+/// applies whether a value flowed in via parent env or via a `.env`
+/// file. `RUSTC` and `CARGO` are intentionally NOT stripped — rustup
+/// sets them to its proxy binaries.
 const STRIPPED_ENV_PATTERNS: &[&str] = &[
-    // Credential carriers
     "LPM_TOKEN",
     "NPM_TOKEN",
     "NODE_AUTH_TOKEN",
@@ -118,8 +105,6 @@ const STRIPPED_ENV_PATTERNS: &[&str] = &[
     "AWS_SECRET_ACCESS_KEY",
     "AWS_SESSION_TOKEN",
     "AZURE_CLIENT_SECRET",
-    // Runtime-hijack carriers (H13). Same posture as dotenv's
-    // DENIED_ENV_VARS.
     "LD_PRELOAD",
     "LD_LIBRARY_PATH",
     "LD_AUDIT",
@@ -137,29 +122,6 @@ const STRIPPED_ENV_PATTERNS: &[&str] = &[
     "PERL5LIB",
     "RUBYOPT",
     "RUBYLIB",
-    // Rust toolchain hijack vectors.
-    //
-    // - `RUSTC_BOOTSTRAP` — lets a stable rustc enable nightly-only
-    //   features mid-build.
-    // - `RUSTC_WRAPPER` — replaces the rustc binary with an arbitrary
-    //   user-supplied executable (sccache uses this legitimately, but
-    //   a postinstall script can't reasonably need to set it for a
-    //   downstream package).
-    // - `RUSTC_WORKSPACE_WRAPPER` — same as RUSTC_WRAPPER but applied
-    //   only when compiling the workspace's own crates. Per Cargo
-    //   docs, a single-package project counts as a workspace, so this
-    //   covers every realistic build shape.
-    // - `CARGO_BUILD_RUSTC_WRAPPER` and `CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER`
-    //   — the `[build].rustc-wrapper` / `[build].rustc-workspace-wrapper`
-    //   config keys as env vars (per Cargo's
-    //   `CARGO_BUILD_*` → `[build].*` mapping). Stripping the direct
-    //   `RUSTC_WRAPPER` variant alone leaves these as alternative
-    //   attacker channels — a lifecycle script that invokes `cargo
-    //   build` can still route rustc through an attacker binary.
-    //
-    // `RUSTC` and `CARGO` are intentionally NOT in the list — rustup
-    // sets them to its proxy binaries and stripping would break
-    // legitimate builds.
     "RUSTC_BOOTSTRAP",
     "RUSTC_WRAPPER",
     "RUSTC_WORKSPACE_WRAPPER",
@@ -3383,12 +3345,6 @@ mod tests {
         }
     }
 
-    /// Every Cargo channel that can replace `rustc` with an attacker
-    /// binary — the direct `RUSTC_*` variants and the `CARGO_BUILD_*`
-    /// config-as-env aliases — must be stripped. Per Cargo's env-var
-    /// docs the four are equivalent for `cargo build`, so a denylist
-    /// that catches only one leaves the others as a wrapper-injection
-    /// channel for any lifecycle script that touches Rust.
     #[test]
     fn sanitized_env_strips_cargo_rustc_wrapper_variants() {
         let _env = crate::test_env::ScopedEnv::set([

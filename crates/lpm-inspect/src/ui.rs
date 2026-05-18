@@ -1,39 +1,13 @@
 //! Embedded web UI serving via rust-embed.
 //!
 //! Static frontend assets are compiled into the binary at build time.
-//! The UI is a lightweight SPA that connects to the REST API and SSE stream.
-//!
-//! During development, when the `ui/dist` directory doesn't exist yet,
-//! the server returns a placeholder page with setup instructions.
-//!
-//! # Auth token handoff
-//!
-//! The inspector binds to `127.0.0.1:<port>`. Cookies on `127.0.0.1` are
-//! **not** port-scoped per RFC 6265 — a cookie set by the inspector at
-//! `:4400` would be sent by the browser to any same-host service the
-//! user later visits (`localhost:3000`, another dev tool, a malicious
-//! local listener bound to a different port). `SameSite=Strict` does
-//! not fix this because same-site is about top-level navigation
-//! origin, not port isolation.
-//!
-//! Web Storage (`localStorage` / `sessionStorage`), in contrast, IS
-//! port-scoped (per the HTML5 origin definition). So we hand the token
-//! off via an inline bootstrap script that:
-//!   1. Reads `?token=<X>` from `window.location.search`.
-//!   2. Stores the token in `sessionStorage` (cleared on tab close,
-//!      stricter than `localStorage` which persists across sessions).
-//!   3. Patches `window.fetch` to add `Authorization: Bearer <X>` to
-//!      same-origin `/api/*` requests.
-//!   4. Patches `EventSource` to append `?token=<X>` to URLs (the SSE
-//!      spec has no header-customization API).
-//!   5. `history.replaceState`s the address bar to a token-less URL so
-//!      the token doesn't leak via screenshots, browser history,
-//!      Referer headers, or new-tab inheritance.
-//!
-//! The bootstrap is injected into the HTML response BEFORE the embedded
-//! UI's own scripts run, so by the time the UI calls `fetch()` the
-//! `Authorization` header is already auto-attached. Non-HTML assets
-//! (JS, CSS, images) are returned unmodified.
+//! HTML responses are post-processed to inject an inline bootstrap
+//! script that reads the `?token=` query param into `sessionStorage`
+//! and patches `fetch` / `EventSource` to attach the token on every
+//! same-origin API call. Cookies are avoided on purpose: cookies on
+//! `127.0.0.1` are host-scoped, not port-scoped, so they would leak
+//! to any other localhost service the user visits. `sessionStorage`
+//! is port-scoped under the HTML5 origin rule.
 
 use axum::extract::State;
 use axum::http::{StatusCode, header};
@@ -42,24 +16,14 @@ use rust_embed::Embed;
 
 use crate::state::InspectorState;
 
-/// Embedded static assets from the `ui/dist` directory.
-///
-/// When building the crate, `rust-embed` includes all files from this path.
-/// If the directory doesn't exist, the embed is empty and we fall back to
-/// the placeholder page.
 #[derive(Embed)]
 #[folder = "ui/dist"]
 #[allow(clippy::upper_case_acronyms)]
 struct Assets;
 
-/// Serve an embedded static file by path.
-///
-/// Falls back to `index.html` for SPA client-side routing (any path that
-/// doesn't match a static file gets the SPA shell).
-///
-/// HTML responses are post-processed to inject the auth-token bootstrap
-/// script (see module-level docs). Non-HTML assets pass through
-/// unmodified.
+/// Serve an embedded static file by path. Falls back to `index.html`
+/// for SPA client-side routing. HTML responses get the auth-token
+/// bootstrap injected; everything else passes through unmodified.
 pub async fn serve_ui(State(state): State<InspectorState>, uri: axum::http::Uri) -> Response {
     let path = uri.path().trim_start_matches('/');
 
@@ -98,12 +62,8 @@ pub async fn serve_ui(State(state): State<InspectorState>, uri: axum::http::Uri)
     }
 }
 
-/// Inject the auth-token bootstrap script into an HTML document.
-///
-/// Inserts at `</head>` if present, otherwise prepends to `<body>`,
-/// otherwise prepends to the document. The script is the FIRST thing
-/// the browser runs in the document so `fetch` / `EventSource` are
-/// patched before the embedded UI's own scripts execute.
+/// Insert the bootstrap script as the first thing the browser executes
+/// — before `</head>` if present, else before `<body`, else at the top.
 fn inject_auth_bootstrap(html: &str, token: &str) -> String {
     let script = build_bootstrap_script(token);
     if let Some(idx) = html.find("</head>") {
@@ -117,13 +77,7 @@ fn inject_auth_bootstrap(html: &str, token: &str) -> String {
     format!("{script}{html}")
 }
 
-/// The bootstrap script as a single inline `<script>` tag. The token
-/// is embedded directly as a JS string literal; we JSON-encode it
-/// defensively so an unexpected character can't break parsing.
 fn build_bootstrap_script(token: &str) -> String {
-    // JSON-encode the token. Token is hex-only by construction, so
-    // this is paranoia; keeps the wire shape stable if that ever
-    // changes.
     let token_js = serde_json::to_string(token).unwrap_or_else(|_| "\"\"".to_string());
     format!(
         r#"<script>
@@ -131,10 +85,6 @@ fn build_bootstrap_script(token: &str) -> String {
   var T = {token_js};
   try {{ sessionStorage.setItem("lpm_inspector_token", T); }} catch (_) {{}}
 
-  // Strip ?token=... from the address bar so the token doesn't leak
-  // via screenshots, browser history, Referer headers, or new-tab
-  // inheritance. Falls back silently on browsers without
-  // history.replaceState (none in practice).
   try {{
     var u = new URL(window.location.href);
     if (u.searchParams.has("token")) {{
@@ -143,8 +93,6 @@ fn build_bootstrap_script(token: &str) -> String {
     }}
   }} catch (_) {{}}
 
-  // Wrap fetch so every same-origin /api/* request gets Bearer auth
-  // without the UI having to thread the token through call sites.
   var origFetch = window.fetch.bind(window);
   window.fetch = function (input, init) {{
     var url = typeof input === "string" ? input : (input && input.url) || "";
@@ -160,8 +108,6 @@ fn build_bootstrap_script(token: &str) -> String {
     return origFetch(input, init);
   }};
 
-  // EventSource has no header API, so the SSE auth channel is the
-  // query string. Append ?token=... transparently.
   if (typeof window.EventSource === "function") {{
     var OrigES = window.EventSource;
     function PatchedES(url, opts) {{
@@ -185,8 +131,6 @@ fn build_bootstrap_script(token: &str) -> String {
     )
 }
 
-/// Full SPA — single HTML file with embedded CSS + JS.
-/// No build tooling, no npm, no CDN. Pure vanilla JS.
 fn placeholder_html() -> String {
     include_str!("inspector_ui.html").to_string()
 }

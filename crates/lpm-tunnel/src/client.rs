@@ -877,16 +877,10 @@ async fn try_connect(
                                         };
                                         captured.summary = webhook::summarize_webhook(&captured);
 
-                                        // Run signature diagnostics on failed webhook responses.
-                                        // Only runs when status >= 400, so zero overhead on success.
-                                        //
-                                        // Explicit allowlist: pulling the entire process env into
-                                        // a HashMap and handing it to the diagnostic was a
-                                        // future-footgun — a later contributor extending the
-                                        // diagnostic to "log a hint about which env vars are set"
-                                        // would silently start leaking unrelated secrets through
-                                        // tunnel diagnostics. Only the names the diagnostic
-                                        // actually consumes get copied in.
+                                        // Signature diagnostics on 4xx/5xx only. Explicit env
+                                        // allowlist — std::env::vars().collect() would silently
+                                        // leak unrelated secrets if the diagnostic ever logged
+                                        // its inputs.
                                         if captured.response_status >= 400 {
                                             const DIAGNOSTIC_ENV_ALLOWLIST: &[&str] = &[
                                                 "STRIPE_WEBHOOK_SECRET",
