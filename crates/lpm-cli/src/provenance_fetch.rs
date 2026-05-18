@@ -124,21 +124,27 @@ impl DriftIgnorePolicy {
 /// blocked install, then flip the default to deny on the next
 /// release once telemetry confirms no spurious rejections.
 ///
-/// The knob is honored by the **approval-capture path**
-/// ([`crate::commands::approve_scripts::snapshot_for_binding_with_mode`]).
-/// The install-time drift gate at `commands/install.rs` already
-/// propagates `Err(LpmError::ProvenanceVerification)` via `?` and
-/// is not gated by this knob — install-time rejection always blocks
-/// (the drift gate has its own per-package opt-out via
-/// `--ignore-provenance-drift[-all]`). This split matches Phase 2.5
-/// where the operator-facing persistent toggle is documented to
-/// affect the binding-record posture during approve-scripts.
+/// Honored end-to-end as of Phase 2.2.d:
 ///
-/// Phase 2.5 will promote this enum to the orthogonal
-/// `EnforceMode` × `SkipPolicy` shape (with a third `Off` mode and
-/// the config + wizard surface). This commit ships only the
-/// rollout-knob posture; the persistent operator toggle is a
-/// follow-up.
+/// - **Approval-capture path** ([`crate::commands::approve_scripts::snapshot_for_binding_with_mode`]):
+///   under `Warn`, a `VerificationRejected` records the binding with
+///   `provenance_at_approval: None` instead of refusing the approval;
+///   under `Deny`, the typed error refuses the binding so the prior
+///   `provenance_at_approval` stays intact.
+/// - **Install-time drift gate** (`commands/install.rs`): under
+///   `Warn`, a verifier rejection logs an `output::warn` +
+///   `tracing::warn` and degrades the per-package status to `NoDrift`
+///   so the install proceeds; under `Deny`, the typed error
+///   `?`-propagates and the install fails. The two-axis split with
+///   `SkipPolicy` (Phase 2.2.c) keeps a per-package opt-out
+///   (`--unverified-provenance`) orthogonal to the global enforce
+///   mode — the rollout knob does not lock operators out of carving
+///   specific names out per invocation.
+///
+/// Phase 2.5 promotes this enum to a three-mode shape (`Deny | Warn
+/// | Off`) with config-file persistence and a `lpm config sigstore`
+/// wizard. The `Off` variant lands then; this commit ships only the
+/// rollout-knob (two-mode) posture.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum EnforceMode {
     /// Fail-closed: a verifier rejection refuses the approval.
