@@ -472,7 +472,7 @@ pub async fn fetch_provenance_snapshot(
 /// - `Err(other)` → `TransportDegraded` (fatal I/O degrades rather
 ///   than failing the whole batch; the per-package path retains
 ///   the typed-error contract for install-time `?`-propagation)
-fn map_fetch_result_to_status(
+pub fn map_fetch_result_to_status(
     name: &str,
     version: &str,
     result: Result<Option<ProvenanceSnapshot>, LpmError>,

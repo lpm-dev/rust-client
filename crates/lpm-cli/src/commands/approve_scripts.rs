@@ -601,6 +601,7 @@ async fn run_under_store_lock(
                 false,
                 dry_run,
                 json_output,
+                Some(&provenance_by_pkg),
             );
         }
 
@@ -613,6 +614,7 @@ async fn run_under_store_lock(
             false,
             dry_run,
             json_output,
+            Some(&provenance_by_pkg),
         );
     }
 
@@ -712,6 +714,7 @@ async fn run_under_store_lock(
             yes,
             dry_run,
             json_output,
+            Some(&provenance_by_pkg),
         );
     }
 
@@ -896,6 +899,7 @@ async fn run_under_store_lock(
         false,
         dry_run,
         json_output,
+        Some(&provenance_by_pkg),
     )
 }
 
@@ -1513,6 +1517,14 @@ fn print_summary(
     // approvals to run).
     dry_run: bool,
     json_output: bool,
+    // Phase 2.2.d: live `ProvenanceStatus` map from the batch fetch,
+    // threaded through so each blocked entry's JSON envelope can
+    // surface `provenance.verified` per package. `None` for callers
+    // that have no map in scope (the read-only `--list` path bypasses
+    // it entirely; the per-package named approval path uses the
+    // single-entry helper directly). When `Some(_)`, the map's keys
+    // are the same `(name, version)` pairs as the blocked set.
+    provenance_by_pkg: Option<&HashMap<(String, String), ProvenanceStatus>>,
 ) -> Result<(), LpmError> {
     if json_output {
         let mut warnings: Vec<serde_json::Value> = Vec::new();
@@ -1562,8 +1574,13 @@ fn print_summary(
             // happened, so `trusted` retains the pre-run state
             // and the diff reports against the prior binding
             // identically.
-            "approved": approved.iter().map(|b| blocked_to_json(b, trusted)).collect::<Vec<_>>(),
-            "skipped": skipped.iter().map(|b| blocked_to_json(b, trusted)).collect::<Vec<_>>(),
+            // Phase 2.2.d: when the live ProvenanceStatus map is in
+            // scope, each entry's JSON envelope gains a `provenance`
+            // block (`verified: true | "skipped" | false | null |
+            // "verification_rejected"`). Pre-2.2.d agents that didn't
+            // expect the key are unaffected — the field is additive.
+            "approved": approved.iter().map(|b| crate::version_diff::blocked_to_json_with_provenance(b, trusted, provenance_by_pkg)).collect::<Vec<_>>(),
+            "skipped": skipped.iter().map(|b| crate::version_diff::blocked_to_json_with_provenance(b, trusted, provenance_by_pkg)).collect::<Vec<_>>(),
             "warnings": warnings,
             "errors": [],
         });
@@ -2038,6 +2055,39 @@ async fn run_global_bulk_yes(
                 aggregate.rows.len()
             )
         };
+        // Phase 2.2.d: per-package `provenance` block for every
+        // bulk-approved row so the JSON envelope's audit trail
+        // matches the project-side `--yes` path.
+        let approved_entries: Vec<serde_json::Value> = aggregate
+            .rows
+            .iter()
+            .map(|r| {
+                let mut entry = serde_json::json!({
+                    "name": r.name,
+                    "version": r.version,
+                    "integrity": r.integrity,
+                    "script_hash": r.script_hash,
+                });
+                if let Some(status) =
+                    provenance.get(&(r.name.clone(), r.version.clone()))
+                {
+                    let (verified, rejection_reason) = status.to_json_verified();
+                    let mut prov = serde_json::Map::new();
+                    prov.insert("verified".into(), verified);
+                    if let Some(reason) = rejection_reason {
+                        prov.insert(
+                            "rejection_reason".into(),
+                            serde_json::Value::String(reason),
+                        );
+                    }
+                    entry.as_object_mut().unwrap().insert(
+                        "provenance".into(),
+                        serde_json::Value::Object(prov),
+                    );
+                }
+                entry
+            })
+            .collect();
         let mut body = serde_json::json!({
             "schema_version": SCHEMA_VERSION,
             "command": "approve-scripts",
@@ -2046,6 +2096,7 @@ async fn run_global_bulk_yes(
             "blocked_count": aggregate.rows.len(),
             "approved_count": aggregate.rows.len(),
             "skipped_count": 0,
+            "approved": approved_entries,
             "warnings": [warning],
             "errors": [],
         });
@@ -2169,6 +2220,32 @@ async fn run_global_named(
     let origins = union_origins(std::iter::once(row));
 
     if json_output {
+        // Phase 2.2.d: surface the per-package `provenance.verified`
+        // alongside the existing identity fields. Derived from the
+        // same `ProvenanceStatus` map the binding-write path
+        // consulted, so the JSON envelope and the trust binding stay
+        // mutually consistent.
+        let mut approved_entry = serde_json::json!({
+            "name": row.name,
+            "version": row.version,
+            "integrity": row.integrity,
+            "script_hash": row.script_hash,
+        });
+        if let Some(status) = provenance.get(&(row.name.clone(), row.version.clone())) {
+            let (verified, rejection_reason) = status.to_json_verified();
+            let mut prov = serde_json::Map::new();
+            prov.insert("verified".into(), verified);
+            if let Some(reason) = rejection_reason {
+                prov.insert(
+                    "rejection_reason".into(),
+                    serde_json::Value::String(reason),
+                );
+            }
+            approved_entry
+                .as_object_mut()
+                .unwrap()
+                .insert("provenance".into(), serde_json::Value::Object(prov));
+        }
         let mut body = serde_json::json!({
             "schema_version": SCHEMA_VERSION,
             "command": "approve-scripts",
@@ -2177,12 +2254,7 @@ async fn run_global_named(
             "approved_count": 1,
             "skipped_count": 0,
             "blocked_count": aggregate.rows.len(),
-            "approved": [{
-                "name": row.name,
-                "version": row.version,
-                "integrity": row.integrity,
-                "script_hash": row.script_hash,
-            }],
+            "approved": [approved_entry],
             "warnings": [],
             "errors": [],
         });

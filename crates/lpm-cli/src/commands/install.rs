@@ -5591,6 +5591,17 @@ async fn run_with_options_under_store_lock(
             "provenance-drift check waived for this install by --ignore-provenance-drift-all",
         );
     }
+    // Phase 2.2.d: per-package `ProvenanceStatus` map for the install
+    // --json envelope. Declared at this scope (rather than inside the
+    // `if has_rich_approvals` block) so the JSON emission below at the
+    // `blocked_packages` enumeration can consume it. Sparse — only
+    // packages the drift gate fetched for are present; the
+    // `blocked_to_json_with_provenance` helper omits the `provenance`
+    // block when the key is absent.
+    let mut install_provenance_status_map: HashMap<
+        (String, String),
+        lpm_common::ProvenanceStatus,
+    > = HashMap::new();
     if !used_lockfile && !drift_ignore_policy.ignores_all() {
         let trusted =
             lpm_security::SecurityPolicy::from_package_json(&project_dir.join("package.json"))
@@ -5702,6 +5713,10 @@ async fn run_with_options_under_store_lock(
                             ),
                         )
                     });
+                    // Phase 2.2.d: record for the install --json
+                    // envelope before consuming for the drift gate.
+                    install_provenance_status_map
+                        .insert((p.name.clone(), p.version.clone()), status.clone());
                     // Projection: `Unverified(snap)` → Some(snap),
                     // `Absent` → Some(present:false), `TransportDegraded`
                     // → None. `VerificationRejected` is unreachable on
@@ -5720,49 +5735,80 @@ async fn run_with_options_under_store_lock(
                             ),
                         )
                     });
-                    // Phase 2.3 rollout wiring: a verifier rejection
-                    // surfaces as `Err(LpmError::ProvenanceVerification)`.
-                    // Under `EnforceMode::Deny` (default) we propagate
-                    // and the install fails — the operator opted in to
-                    // verification by NOT passing `--unverified-
-                    // provenance` for this name. Under `Warn` we log
-                    // loudly and degrade to `None` so the install
-                    // proceeds during the two-release rollout window.
-                    // Non-verification errors (cache I/O, etc.)
-                    // propagate in both modes — they are infrastructure
-                    // failures, not policy decisions.
-                    match raw {
-                        Ok(snap) => snap,
-                        Err(lpm_common::LpmError::ProvenanceVerification(reason))
-                            if matches!(
-                                verify_policy.enforce,
-                                crate::provenance_fetch::EnforceMode::Warn
-                            ) =>
-                        {
-                            if !json_output {
-                                crate::output::warn(&format!(
-                                    "provenance verification FAILED for {pkg}@{ver}: {reason}\n  \
-                                     LPM_PROVENANCE_ENFORCE=warn — install proceeds without \
-                                     verified provenance for this package. Re-run with \
-                                     LPM_PROVENANCE_ENFORCE=deny (default) to refuse, or pass \
-                                     `--unverified-provenance {pkg}` to opt out explicitly.",
-                                    pkg = p.name,
-                                    ver = p.version,
-                                ));
-                            }
-                            tracing::warn!(
-                                target = "lpm::provenance",
-                                pkg = %p.name,
-                                version = %p.version,
-                                reason = %reason,
-                                enforce_mode = "warn",
-                                "install drift gate: verifier rejected bundle but \
-                                 LPM_PROVENANCE_ENFORCE=warn — degrading to NoDrift",
-                            );
-                            None
+                    // Phase 2.2.d + 2.3 rollout wiring combined.
+                    // Branch arms:
+                    //   - `Ok(Some(snap))`: Verified (snap.present) or
+                    //     Absent (registry served no attestation).
+                    //   - `Ok(None)`: transport-degraded; drift
+                    //     comparator absorbs as NoDrift.
+                    //   - `Err(ProvenanceVerification)`: policy
+                    //     decision per `verify_policy.enforce`. Warn
+                    //     degrades to None + loud log; Deny propagates
+                    //     the typed error and `?` refuses the install.
+                    //   - `Err(other)`: infrastructure failure (cache
+                    //     unwritable, etc.) — propagate as-is so the
+                    //     user sees a real diagnostic, not a silent
+                    //     degrade.
+                    let (snapshot_for_drift, status_for_map) = match raw {
+                        Ok(Some(snap)) if snap.present => {
+                            let status = lpm_common::ProvenanceStatus::Verified(snap.clone());
+                            (Some(snap), status)
                         }
-                        Err(e) => return Err(e),
-                    }
+                        Ok(Some(_)) => (
+                            Some(lpm_workspace::ProvenanceSnapshot {
+                                present: false,
+                                ..Default::default()
+                            }),
+                            lpm_common::ProvenanceStatus::Absent,
+                        ),
+                        Ok(None) => (None, lpm_common::ProvenanceStatus::TransportDegraded),
+                        Err(lpm_common::LpmError::ProvenanceVerification(reason)) => {
+                            let status = lpm_common::ProvenanceStatus::VerificationRejected {
+                                reason: reason.clone(),
+                            };
+                            let snapshot = match verify_policy.enforce {
+                                crate::provenance_fetch::EnforceMode::Warn => {
+                                    if !json_output {
+                                        crate::output::warn(&format!(
+                                            "provenance verification FAILED for {pkg}@{ver}: {reason}\n  \
+                                             LPM_PROVENANCE_ENFORCE=warn — install proceeds without \
+                                             verified provenance for this package. Re-run with \
+                                             LPM_PROVENANCE_ENFORCE=deny (default) to refuse, or pass \
+                                             `--unverified-provenance {pkg}` to opt out explicitly.",
+                                            pkg = p.name,
+                                            ver = p.version,
+                                        ));
+                                    }
+                                    tracing::warn!(
+                                        target = "lpm::provenance",
+                                        pkg = %p.name,
+                                        version = %p.version,
+                                        reason = %reason,
+                                        enforce_mode = "warn",
+                                        "install drift gate: verifier rejected bundle but \
+                                         LPM_PROVENANCE_ENFORCE=warn — degrading to NoDrift",
+                                    );
+                                    None
+                                }
+                                crate::provenance_fetch::EnforceMode::Deny => {
+                                    // Surface the status in the map before
+                                    // returning so a `--json` consumer that
+                                    // tees stderr can correlate the failure
+                                    // with the per-package envelope.
+                                    install_provenance_status_map.insert(
+                                        (p.name.clone(), p.version.clone()),
+                                        status,
+                                    );
+                                    return Err(LpmError::ProvenanceVerification(reason));
+                                }
+                            };
+                            (snapshot, status)
+                        }
+                        Err(other) => return Err(other),
+                    };
+                    install_provenance_status_map
+                        .insert((p.name.clone(), p.version.clone()), status_for_map);
+                    snapshot_for_drift
                 };
 
                 let verdict = lpm_security::provenance::check_provenance_drift(
@@ -7678,21 +7724,33 @@ async fn run_with_options_under_store_lock(
         );
         // + per-entry shape now
         // includes `static_tier` (P6) and `version_diff` (P7) via
-        // the shared `version_diff::blocked_to_json` helper, which
-        // is also the source of truth for the approve-scripts JSON
-        // emitter. Both sides cannot drift on the entry shape.
+        // the shared `version_diff::blocked_to_json_with_provenance`
+        // helper, which is also the source of truth for the
+        // approve-scripts JSON emitter. Both sides cannot drift on
+        // the entry shape.
         //
         // `version_diff` is `null` when no prior binding for the
         // package name exists (first-time review). When a prior
         // exists, the structured object is documented on
         // `version_diff::version_diff_to_json`.
+        //
+        // Phase 2.2.d: the per-package `provenance.verified` block
+        // emits when the drift gate captured a `ProvenanceStatus` for
+        // this `(name, version)` pair. Sparse — only packages with a
+        // rich-form `trustedDependencies` binding triggered a fetch.
         let trusted_for_json = read_trusted_deps_from_manifest(project_dir).unwrap_or_default();
         json["blocked_packages"] = serde_json::Value::Array(
             blocked_capture
                 .state
                 .blocked_packages
                 .iter()
-                .map(|bp| crate::version_diff::blocked_to_json(bp, &trusted_for_json))
+                .map(|bp| {
+                    crate::version_diff::blocked_to_json_with_provenance(
+                        bp,
+                        &trusted_for_json,
+                        Some(&install_provenance_status_map),
+                    )
+                })
                 .collect(),
         );
         println!("{}", serde_json::to_string_pretty(&json).unwrap());

@@ -820,6 +820,37 @@ pub fn blocked_to_json(
     blocked: &crate::build_state::BlockedPackage,
     trusted: &lpm_workspace::TrustedDependencies,
 ) -> serde_json::Value {
+    blocked_to_json_with_provenance(blocked, trusted, None)
+}
+
+/// Phase 2.2.d variant. Same per-entry shape as [`blocked_to_json`]
+/// PLUS an optional `provenance` block when a live
+/// [`lpm_common::ProvenanceStatus`] map is in scope (the approve-
+/// scripts batch path has one; the install --json path can build
+/// one from the drift-gate iteration).
+///
+/// The `provenance` block emits:
+/// - `verified`: `true | false | "skipped" | "verification_rejected" | null`
+/// - `rejection_reason`: present only when `verified ==
+///   "verification_rejected"`, truncated to 200 chars
+///
+/// State mapping is owned by
+/// [`lpm_common::ProvenanceStatus::to_json_verified`] — that's the
+/// single source of truth so the install + approve-scripts envelopes
+/// stay in lockstep on every new variant (Phase 2.5 will add a
+/// `"disabled"` state for `EnforceMode::Off`).
+///
+/// When `provenance_by_pkg` is `None` OR the map has no entry for
+/// `(name, version)`, the `provenance` block is omitted entirely —
+/// agents see no key rather than `null`, so pre-Phase-2.2.d JSON
+/// readers stay byte-compatible.
+pub fn blocked_to_json_with_provenance(
+    blocked: &crate::build_state::BlockedPackage,
+    trusted: &lpm_workspace::TrustedDependencies,
+    provenance_by_pkg: Option<
+        &std::collections::HashMap<(String, String), lpm_common::ProvenanceStatus>,
+    >,
+) -> serde_json::Value {
     let version_diff = match trusted.latest_binding_for_name(&blocked.name, &blocked.version) {
         None => serde_json::Value::Null,
         Some((prior_version, binding)) => {
@@ -827,7 +858,7 @@ pub fn blocked_to_json(
             version_diff_to_json(&diff)
         }
     };
-    serde_json::json!({
+    let mut entry = serde_json::json!({
         "name": blocked.name,
         "version": blocked.version,
         "integrity": blocked.integrity,
@@ -836,7 +867,25 @@ pub fn blocked_to_json(
         "binding_drift": blocked.binding_drift,
         "static_tier": blocked.static_tier,
         "version_diff": version_diff,
-    })
+    });
+    if let Some(map) = provenance_by_pkg
+        && let Some(status) = map.get(&(blocked.name.clone(), blocked.version.clone()))
+    {
+        let (verified, rejection_reason) = status.to_json_verified();
+        let mut prov = serde_json::Map::new();
+        prov.insert("verified".into(), verified);
+        if let Some(reason) = rejection_reason {
+            prov.insert(
+                "rejection_reason".into(),
+                serde_json::Value::String(reason),
+            );
+        }
+        entry.as_object_mut().unwrap().insert(
+            "provenance".into(),
+            serde_json::Value::Object(prov),
+        );
+    }
+    entry
 }
 
 #[cfg(test)]
@@ -1869,5 +1918,134 @@ mod tests {
         assert_eq!(vd["prior_version"], serde_json::json!("0.25.1"));
         assert_eq!(vd["candidate_version"], serde_json::json!("0.25.2"));
         assert_eq!(vd["script_hash_drift"], serde_json::json!(true));
+    }
+
+    // ── Phase 2.2.d: provenance.verified envelope ─────────────────
+
+    /// Backward compatibility: when `provenance_by_pkg` is `None`,
+    /// `blocked_to_json_with_provenance` MUST emit byte-identical
+    /// output to the pre-2.2.d `blocked_to_json`. Pre-2.2.d agents
+    /// that don't know about the `provenance` field stay readable.
+    #[test]
+    fn blocked_to_json_with_provenance_omits_block_when_map_is_none() {
+        use lpm_workspace::TrustedDependencies;
+        let bp = blocked_with("esbuild", "0.25.1", Some("sha256-x"));
+        let v = blocked_to_json_with_provenance(&bp, &TrustedDependencies::default(), None);
+        assert!(
+            v.get("provenance").is_none(),
+            "no map → provenance key must be absent (not null)",
+        );
+        // Sanity: structural fields still emit.
+        assert_eq!(v["name"], serde_json::json!("esbuild"));
+    }
+
+    /// Backward compatibility on the other failure mode: when the
+    /// map IS provided but doesn't contain THIS (name, version),
+    /// the entry still omits `provenance`. Used by the install path
+    /// where the drift gate only fetches for packages with rich-form
+    /// bindings.
+    #[test]
+    fn blocked_to_json_with_provenance_omits_block_when_key_missing() {
+        use lpm_common::ProvenanceStatus;
+        use lpm_workspace::TrustedDependencies;
+        use std::collections::HashMap;
+
+        let bp = blocked_with("esbuild", "0.25.1", Some("sha256-x"));
+        let mut map: HashMap<(String, String), ProvenanceStatus> = HashMap::new();
+        // A different package's status — not relevant to our entry.
+        map.insert(("axios".into(), "1.14.0".into()), ProvenanceStatus::Absent);
+        let v = blocked_to_json_with_provenance(
+            &bp,
+            &TrustedDependencies::default(),
+            Some(&map),
+        );
+        assert!(v.get("provenance").is_none());
+    }
+
+    /// `Verified` → `{ verified: true }`, no rejection_reason key.
+    #[test]
+    fn blocked_to_json_with_provenance_emits_verified_true_for_verified_status() {
+        use lpm_common::{ProvenanceSnapshot, ProvenanceStatus};
+        use lpm_workspace::TrustedDependencies;
+        use std::collections::HashMap;
+
+        let bp = blocked_with("axios", "1.14.0", Some("sha256-x"));
+        let mut map: HashMap<(String, String), ProvenanceStatus> = HashMap::new();
+        map.insert(
+            ("axios".into(), "1.14.0".into()),
+            ProvenanceStatus::Verified(ProvenanceSnapshot {
+                present: true,
+                publisher: Some("github:axios/axios".into()),
+                ..Default::default()
+            }),
+        );
+        let v = blocked_to_json_with_provenance(
+            &bp,
+            &TrustedDependencies::default(),
+            Some(&map),
+        );
+        let prov = v.get("provenance").expect("provenance block must emit");
+        assert_eq!(prov["verified"], serde_json::json!(true));
+        assert!(
+            prov.get("rejection_reason").is_none(),
+            "verified=true must not carry rejection_reason",
+        );
+    }
+
+    /// `Unverified` (operator opted out) → `{ verified: "skipped" }`.
+    /// The string sentinel is what distinguishes operator-driven
+    /// downgrade from registry-served absence.
+    #[test]
+    fn blocked_to_json_with_provenance_emits_skipped_for_unverified_status() {
+        use lpm_common::{ProvenanceSnapshot, ProvenanceStatus};
+        use lpm_workspace::TrustedDependencies;
+        use std::collections::HashMap;
+
+        let bp = blocked_with("axios", "1.14.0", Some("sha256-x"));
+        let mut map: HashMap<(String, String), ProvenanceStatus> = HashMap::new();
+        map.insert(
+            ("axios".into(), "1.14.0".into()),
+            ProvenanceStatus::Unverified(ProvenanceSnapshot {
+                present: true,
+                publisher: Some("github:axios/axios".into()),
+                ..Default::default()
+            }),
+        );
+        let v = blocked_to_json_with_provenance(
+            &bp,
+            &TrustedDependencies::default(),
+            Some(&map),
+        );
+        assert_eq!(v["provenance"]["verified"], serde_json::json!("skipped"));
+    }
+
+    /// `VerificationRejected` → string sentinel + rejection_reason.
+    #[test]
+    fn blocked_to_json_with_provenance_emits_rejection_reason() {
+        use lpm_common::ProvenanceStatus;
+        use lpm_workspace::TrustedDependencies;
+        use std::collections::HashMap;
+
+        let bp = blocked_with("axios", "1.14.1", Some("sha256-x"));
+        let mut map: HashMap<(String, String), ProvenanceStatus> = HashMap::new();
+        map.insert(
+            ("axios".into(), "1.14.1".into()),
+            ProvenanceStatus::VerificationRejected {
+                reason: "Rekor SET verification failed".into(),
+            },
+        );
+        let v = blocked_to_json_with_provenance(
+            &bp,
+            &TrustedDependencies::default(),
+            Some(&map),
+        );
+        assert_eq!(
+            v["provenance"]["verified"],
+            serde_json::json!("verification_rejected"),
+        );
+        assert_eq!(
+            v["provenance"]["rejection_reason"],
+            serde_json::json!("Rekor SET verification failed"),
+        );
     }
 }

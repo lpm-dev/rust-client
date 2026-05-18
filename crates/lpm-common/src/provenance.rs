@@ -129,6 +129,56 @@ impl ProvenanceStatus {
     pub fn is_rejection(&self) -> bool {
         matches!(self, ProvenanceStatus::VerificationRejected { .. })
     }
+
+    /// JSON envelope value for the `provenance.verified` field on the
+    /// install + approve-scripts `--json` output (Phase 2.2.d).
+    ///
+    /// Returns `(verified, rejection_reason)`:
+    /// - `Verified(_)` → (`true`, `None`)
+    /// - `Unverified(_)` → (`"skipped"`, `None`) — operator carved this
+    ///   name out via `--unverified-provenance`
+    /// - `Absent` → (`false`, `None`) — registry served no attestation
+    /// - `TransportDegraded` → (`null`, `None`) — transient unknown;
+    ///   callers MAY omit the package from the envelope or render as
+    ///   `null` if they want to surface the degrade
+    /// - `VerificationRejected { reason }` → (`"verification_rejected"`,
+    ///   `Some(reason_truncated_to_200)`)
+    ///
+    /// Five-state enum string-or-bool encoding pins the contract the
+    /// plan's risk-register row for "operator sets `sigstore.verify =
+    /// off`" depends on: downstream `lpm install --json` consumers can
+    /// branch on the string to drive audit pipelines without having to
+    /// re-derive the state from log lines.
+    ///
+    /// Reason truncation: 200 chars is the plan's documented bound. A
+    /// real `VerifyError::Display` is one short line (the verifier's
+    /// internal errors are sentence-shaped), so this only fires on
+    /// pathologically-long custom errors. The truncation marker is a
+    /// trailing `…` (single character) so the envelope stays one
+    /// well-formed JSON string even on the rare overflow.
+    pub fn to_json_verified(&self) -> (serde_json::Value, Option<String>) {
+        match self {
+            ProvenanceStatus::Verified(_) => (serde_json::Value::Bool(true), None),
+            ProvenanceStatus::Unverified(_) => {
+                (serde_json::Value::String("skipped".into()), None)
+            }
+            ProvenanceStatus::Absent => (serde_json::Value::Bool(false), None),
+            ProvenanceStatus::TransportDegraded => (serde_json::Value::Null, None),
+            ProvenanceStatus::VerificationRejected { reason } => {
+                let truncated = if reason.chars().count() > 200 {
+                    let mut s: String = reason.chars().take(199).collect();
+                    s.push('…');
+                    s
+                } else {
+                    reason.clone()
+                };
+                (
+                    serde_json::Value::String("verification_rejected".into()),
+                    Some(truncated),
+                )
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq, Hash)]
@@ -412,5 +462,77 @@ mod tests {
             .into_snapshot_for_binding("axios", "1.14.0")
             .expect("Unverified must project to Ok(Some) — identity still drives drift");
         assert_eq!(projected, Some(snap));
+    }
+
+    // ── ProvenanceStatus::to_json_verified (Phase 2.2.d) ────────
+
+    #[test]
+    fn to_json_verified_verified_is_true_no_reason() {
+        let (v, r) = ProvenanceStatus::Verified(axios_snap()).to_json_verified();
+        assert_eq!(v, serde_json::Value::Bool(true));
+        assert!(r.is_none());
+    }
+
+    #[test]
+    fn to_json_verified_unverified_is_skipped_no_reason() {
+        let (v, r) = ProvenanceStatus::Unverified(axios_snap()).to_json_verified();
+        assert_eq!(v, serde_json::Value::String("skipped".into()));
+        assert!(r.is_none(), "skipped state carries no rejection reason");
+    }
+
+    #[test]
+    fn to_json_verified_absent_is_false_no_reason() {
+        let (v, r) = ProvenanceStatus::Absent.to_json_verified();
+        assert_eq!(v, serde_json::Value::Bool(false));
+        assert!(r.is_none());
+    }
+
+    /// `TransportDegraded` is the "we don't know" signal — neither
+    /// `true`, `false`, `"skipped"`, nor `"verification_rejected"`.
+    /// `null` is the right JSON value because it lets agents
+    /// distinguish "no observation" from "observation said no
+    /// provenance shipped" (`Absent` → `false`).
+    #[test]
+    fn to_json_verified_transport_degraded_is_null_no_reason() {
+        let (v, r) = ProvenanceStatus::TransportDegraded.to_json_verified();
+        assert_eq!(v, serde_json::Value::Null);
+        assert!(r.is_none());
+    }
+
+    /// `VerificationRejected` produces the string sentinel AND a
+    /// rejection_reason. Tests pin both the string ("verification_
+    /// rejected") and that the reason is forwarded verbatim when
+    /// short.
+    #[test]
+    fn to_json_verified_verification_rejected_carries_reason() {
+        let status = ProvenanceStatus::VerificationRejected {
+            reason: "DSSE signature mismatch".into(),
+        };
+        let (v, r) = status.to_json_verified();
+        assert_eq!(
+            v,
+            serde_json::Value::String("verification_rejected".into())
+        );
+        assert_eq!(r.as_deref(), Some("DSSE signature mismatch"));
+    }
+
+    /// Pathologically-long reason gets truncated to 200 chars + `…`
+    /// so the envelope stays bounded. Regression guard for a future
+    /// `VerifyError::Display` that decides to dump a stack trace.
+    #[test]
+    fn to_json_verified_truncates_reason_past_200_chars() {
+        let long_reason = "x".repeat(500);
+        let status = ProvenanceStatus::VerificationRejected {
+            reason: long_reason,
+        };
+        let (_, r) = status.to_json_verified();
+        let r = r.expect("rejection_reason must be present");
+        let chars: Vec<char> = r.chars().collect();
+        assert_eq!(chars.len(), 200, "truncated reason must be exactly 200 chars");
+        assert_eq!(
+            chars[199], '…',
+            "trailing char must be the ellipsis marker so consumers can detect truncation"
+        );
+        assert_eq!(chars[0], 'x', "the leading 199 chars must be the original prefix");
     }
 }
