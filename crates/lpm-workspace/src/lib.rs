@@ -1085,7 +1085,7 @@ pub enum TrustedDependencies {
 // deliberately does not depend on `lpm-workspace`) can share the canonical
 // serde shape with project-level `TrustedDependencyBinding`. Callers that
 // already import from `lpm_workspace` continue to work via this re-export.
-pub use lpm_common::ProvenanceSnapshot;
+pub use lpm_common::{ProvenanceSnapshot, ProvenanceStatus};
 
 /// Binding metadata for one entry in a Rich `trustedDependencies` map.
 ///

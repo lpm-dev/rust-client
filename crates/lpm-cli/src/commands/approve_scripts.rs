@@ -27,7 +27,9 @@ use crate::build_state::{self, BlockedPackage, BuildState};
 use crate::output;
 use lpm_common::LpmError;
 use lpm_common::color::Painted;
-use lpm_workspace::{ApprovalMetadata, ProvenanceSnapshot, TrustMatch, TrustedDependencies};
+use lpm_workspace::{
+    ApprovalMetadata, ProvenanceSnapshot, ProvenanceStatus, TrustMatch, TrustedDependencies,
+};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
@@ -104,12 +106,36 @@ fn approval_metadata_from_blocked(
 /// `BlockedPackage` shape callers used pre-existing working unchanged.
 async fn fetch_provenance_for_effective_set(
     packages: &[BlockedPackage],
-) -> HashMap<(String, String), Option<ProvenanceSnapshot>> {
+) -> HashMap<(String, String), ProvenanceStatus> {
     let pkgs: Vec<(String, String)> = packages
         .iter()
         .map(|p| (p.name.clone(), p.version.clone()))
         .collect();
     crate::provenance_fetch::fetch_provenance_for_pkgs(&pkgs).await
+}
+
+/// Resolve the `provenance_at_approval` value for one `(name, version)`
+/// pair from a batch [`ProvenanceStatus`] map, refusing approval on
+/// `VerificationRejected`.
+///
+/// This is the project- and global-scope approval-capture hook that
+/// closes the SILENT-DROP attack window: a previous `.ok().flatten()`
+/// pattern collapsed verifier rejections into `None`, which the next
+/// install's drift comparator treated as "first observation" via its
+/// `(None, _) => NoDrift` arm. Routing through
+/// [`ProvenanceStatus::into_snapshot_for_binding`] propagates the
+/// typed error so the caller's `?` surfaces an actionable
+/// `LpmError::ProvenanceVerification` and the read-modify-write loop
+/// does NOT overwrite any prior trust binding.
+fn snapshot_for_binding(
+    provenance_by_pkg: &HashMap<(String, String), ProvenanceStatus>,
+    name: &str,
+    version: &str,
+) -> Result<Option<ProvenanceSnapshot>, LpmError> {
+    match provenance_by_pkg.get(&(name.to_string(), version.to_string())) {
+        Some(status) => status.clone().into_snapshot_for_binding(name, version),
+        None => Ok(None),
+    }
 }
 
 /// Stable schema version for the `--json` output. Bump on any breaking
@@ -398,7 +424,7 @@ async fn run_under_store_lock(
     // `--list` is read-only — skip the fetch entirely; the listing
     // doesn't materialize any binding so `provenance_at_approval` is
     // never consulted. Empty effective set: skip too (no-op).
-    let provenance_by_pkg: HashMap<(String, String), Option<ProvenanceSnapshot>> =
+    let provenance_by_pkg: HashMap<(String, String), ProvenanceStatus> =
         if list || effective_state.blocked_packages.is_empty() {
             HashMap::new()
         } else {
@@ -466,16 +492,23 @@ async fn run_under_store_lock(
             // write-path: carry install-time provenance + behavioral-tag captures
             // into the binding so subsequent installs can compare against them
             // (drift rule + version diff).
+            //
+            // Phase 2.2 SILENT-DROP fix: `snapshot_for_binding` returns
+            // `Err(LpmError::ProvenanceVerification(_))` when the
+            // verifier rejected the bundle, refusing the approval
+            // rather than blanking `provenance_at_approval`.
+            let snap = snapshot_for_binding(
+                &provenance_by_pkg,
+                &target.name,
+                &target.version,
+            )?;
             trusted.approve_with_metadata(
                 &target.name,
                 &target.version,
                 approval_metadata_from_blocked(
                     target,
                     capability_hash.clone(),
-                    provenance_by_pkg
-                        .get(&(target.name.clone(), target.version.clone()))
-                        .cloned()
-                        .flatten(),
+                    snap,
                 ),
             );
             approved.push(target);
@@ -577,16 +610,22 @@ async fn run_under_store_lock(
         emit_yes_warning_banner(effective_state.blocked_packages.len(), json_output);
         for blocked in &effective_state.blocked_packages {
             // write-path — see the direct-approve branch above for the rationale.
+            // Phase 2.2 SILENT-DROP fix: `?` propagates a verifier
+            // rejection so the trust binding is NOT overwritten with
+            // `None` (which would silently disarm drift detection on
+            // every subsequent install).
+            let snap = snapshot_for_binding(
+                &provenance_by_pkg,
+                &blocked.name,
+                &blocked.version,
+            )?;
             trusted.approve_with_metadata(
                 &blocked.name,
                 &blocked.version,
                 approval_metadata_from_blocked(
                     blocked,
                     capability_hash.clone(),
-                    provenance_by_pkg
-                        .get(&(blocked.name.clone(), blocked.version.clone()))
-                        .cloned()
-                        .flatten(),
+                    snap,
                 ),
             );
             approved.push(blocked);
@@ -754,16 +793,21 @@ async fn run_under_store_lock(
     // Apply approvals (atomic single write)
     for blocked in &approved {
         // write-path — see the direct-approve branch earlier for the rationale.
+        // Phase 2.2 SILENT-DROP fix: `?` on the verifier-rejection
+        // arm refuses to record an approval rather than blanking the
+        // prior `provenance_at_approval` and disarming drift checks.
+        let snap = snapshot_for_binding(
+            &provenance_by_pkg,
+            &blocked.name,
+            &blocked.version,
+        )?;
         trusted.approve_with_metadata(
             &blocked.name,
             &blocked.version,
             approval_metadata_from_blocked(
                 blocked,
                 capability_hash.clone(),
-                provenance_by_pkg
-                    .get(&(blocked.name.clone(), blocked.version.clone()))
-                    .cloned()
-                    .flatten(),
+                snap,
             ),
         );
     }
@@ -1855,8 +1899,10 @@ async fn run_global_bulk_yes(
     enforce_tiered_yes_gate(&aggregate.rows, GateScope::Global)?;
 
     // Network fetch (provenance) happens BEFORE the lock so the
-    // critical section stays bounded. Fetch failures degrade to
-    // `None` per `fetch_provenance_for_pkgs` contract.
+    // critical section stays bounded. Transport failures degrade to
+    // `ProvenanceStatus::TransportDegraded`; a verifier rejection
+    // surfaces as `VerificationRejected` (Phase 2.2 SILENT-DROP fix)
+    // and refuses the approval below.
     let pairs: Vec<(String, String)> = aggregate
         .rows
         .iter()
@@ -1864,17 +1910,30 @@ async fn run_global_bulk_yes(
         .collect();
     let provenance = crate::provenance_fetch::fetch_provenance_for_pkgs(&pairs).await;
 
+    // Resolve each row's binding snapshot BEFORE entering the tx lock
+    // so a verifier rejection (which returns
+    // `Err(LpmError::ProvenanceVerification)`) fails out before we
+    // start mutating the trust store — preserving any prior binding
+    // untouched. Doing this inside the lock would still preserve the
+    // binding (the lock body returns Err without writing), but
+    // resolving outside keeps the lock window smaller and the failure
+    // path simpler to reason about.
+    let mut row_snapshots: Vec<(usize, Option<ProvenanceSnapshot>)> =
+        Vec::with_capacity(aggregate.rows.len());
+    for (idx, row) in aggregate.rows.iter().enumerate() {
+        let snap = snapshot_for_binding(&provenance, &row.name, &row.version)?;
+        row_snapshots.push((idx, snap));
+    }
+
     // Inside the tx lock — bounded read-modify-write.
     let lock_path = root.global_tx_lock();
     let root_for_body = root;
     let aggregate_for_body = aggregate;
-    let provenance_for_body = &provenance;
+    let row_snapshots_for_body = row_snapshots;
     lpm_common::with_exclusive_lock_async(lock_path, async move {
         let mut trust = lpm_global::trusted_deps::read_for(root_for_body)?;
-        for row in &aggregate_for_body.rows {
-            let snap = provenance_for_body
-                .get(&(row.name.clone(), row.version.clone()))
-                .and_then(|s| s.clone());
+        for (idx, snap) in row_snapshots_for_body {
+            let row = &aggregate_for_body.rows[idx];
             trust.insert_binding(
                 &row.name,
                 &row.version,
@@ -2000,11 +2059,11 @@ async fn run_global_named(
 
     // fetch provenance OUTSIDE the tx lock so a slow
     // network response doesn't block parallel `--global` invocations.
+    // Phase 2.2 SILENT-DROP fix: `?` propagates a verifier rejection
+    // BEFORE acquiring the lock, leaving any prior binding intact.
     let pairs = vec![(row.name.clone(), row.version.clone())];
     let provenance = crate::provenance_fetch::fetch_provenance_for_pkgs(&pairs).await;
-    let snap = provenance
-        .get(&(row.name.clone(), row.version.clone()))
-        .and_then(|s| s.clone());
+    let snap = snapshot_for_binding(&provenance, &row.name, &row.version)?;
 
     let lock_path = root.global_tx_lock();
     let root_for_body = root;
@@ -2332,9 +2391,12 @@ async fn run_global_interactive(
                         continue;
                     }
                     for row in &rows {
-                        let snap = provenance
-                            .get(&(row.name.clone(), row.version.clone()))
-                            .and_then(|s| s.clone());
+                        // Phase 2.2 SILENT-DROP fix: a verifier
+                        // rejection on any row in this group aborts
+                        // the entire `approve_all` action with a clear
+                        // error, leaving any prior bindings for the
+                        // remaining rows untouched.
+                        let snap = snapshot_for_binding(&provenance, &row.name, &row.version)?;
                         commit_global_approval(root, row, snap, dry_run).await?;
                         approved.push(*row);
                         decided.insert(AggregateRowKey::from_row(row));
@@ -2365,9 +2427,9 @@ async fn run_global_interactive(
 
                         match row_choice {
                             "approve" => {
-                                let snap = provenance
-                                    .get(&(row.name.clone(), row.version.clone()))
-                                    .and_then(|s| s.clone());
+                                // Phase 2.2 SILENT-DROP fix.
+                                let snap =
+                                    snapshot_for_binding(&provenance, &row.name, &row.version)?;
                                 commit_global_approval(root, row, snap, dry_run).await?;
                                 approved.push(row);
                                 decided.insert(key);
@@ -2447,9 +2509,8 @@ async fn run_global_interactive(
 
         match choice {
             "approve" => {
-                let snap = provenance
-                    .get(&(row.name.clone(), row.version.clone()))
-                    .and_then(|s| s.clone());
+                // Phase 2.2 SILENT-DROP fix.
+                let snap = snapshot_for_binding(&provenance, &row.name, &row.version)?;
                 // per-row write goes through `commit_global_approval`,
                 // which acquires the global tx lock and re-reads trust
                 // from disk so the commit is race-safe against parallel

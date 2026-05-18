@@ -46,7 +46,7 @@ use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use lpm_common::LpmError;
 use lpm_registry::AttestationRef;
-use lpm_workspace::ProvenanceSnapshot;
+use lpm_workspace::{ProvenanceSnapshot, ProvenanceStatus};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
@@ -289,18 +289,80 @@ pub async fn fetch_provenance_snapshot(
     Ok(Some(snapshot))
 }
 
+/// Map one [`fetch_provenance_snapshot`] outcome to a
+/// [`ProvenanceStatus`] for the batch caller.
+///
+/// Pure mapping (no I/O) so the SILENT-DROP regression is directly
+/// testable without mocking the registry-client cascade.
+/// Phase 2.2 fix: the prior `.ok().flatten()` collapsed
+/// `Err(LpmError::ProvenanceVerification)` into the same `None` as a
+/// transport failure, blanking the approval binding and disarming
+/// drift on subsequent installs. This helper preserves the four
+/// states distinct:
+///
+/// - `Ok(Some(snap))` with `snap.present == true` → `Verified`
+/// - `Ok(Some(snap))` with `snap.present == false` → `Absent`
+///   (registry confirmed no attestation — the axios drop signal)
+/// - `Ok(None)` → `TransportDegraded`
+/// - `Err(LpmError::ProvenanceVerification(reason))` →
+///   `VerificationRejected { reason }`
+/// - `Err(other)` → `TransportDegraded` (fatal I/O degrades rather
+///   than failing the whole batch; the per-package path retains
+///   the typed-error contract for install-time `?`-propagation)
+fn map_fetch_result_to_status(
+    name: &str,
+    version: &str,
+    result: Result<Option<ProvenanceSnapshot>, LpmError>,
+) -> ProvenanceStatus {
+    match result {
+        Ok(Some(snap)) => {
+            if snap.present {
+                ProvenanceStatus::Verified(snap)
+            } else {
+                ProvenanceStatus::Absent
+            }
+        }
+        Ok(None) => ProvenanceStatus::TransportDegraded,
+        Err(LpmError::ProvenanceVerification(reason)) => {
+            tracing::warn!(
+                target = "lpm::provenance",
+                pkg = %name,
+                version = %version,
+                reason = %reason,
+                "provenance bundle rejected by verifier; approval will be refused"
+            );
+            ProvenanceStatus::VerificationRejected { reason }
+        }
+        Err(other) => {
+            tracing::debug!(
+                target = "lpm::provenance",
+                pkg = %name,
+                version = %version,
+                err = %other,
+                "provenance fetch failed (non-verification error); degrading to transport"
+            );
+            ProvenanceStatus::TransportDegraded
+        }
+    }
+}
+
 /// Batch-fetch attestation snapshots for many `(name, version)` pairs
 /// in parallel. Single source of truth for both the project-level
 /// `lpm approve-scripts` write path and the global-scope
 /// `lpm approve-scripts --global` write path (P4 parity).
 ///
-/// Returns one entry per input pair. Missing entries (no `LpmRoot`,
-/// registry didn't return metadata, no attestation URL, network
-/// failure) map to `None`. Callers degrade gracefully: a `None` value
-/// persists as `provenance_at_approval = None`, which the next
-/// install's drift gate treats as "first observation, no drift" —
-/// same behavior as the pre-existing path when the install-time
-/// fetcher degraded.
+/// Returns one [`ProvenanceStatus`] per input pair (never collapses
+/// distinct outcomes into a single `None`). Phase 2.2 SILENT-DROP fix:
+/// the previous implementation used `.ok().flatten()` here, which made
+/// a verifier rejection (`Err(LpmError::ProvenanceVerification)`)
+/// indistinguishable from a network failure. Recording the resulting
+/// `provenance_at_approval = None` would silently disarm the drift
+/// comparator's `(None, _) => NoDrift` arm on every future install,
+/// permanently defeating publisher-swap detection after a single
+/// attack-window install. The explicit match below preserves the four
+/// states end-to-end so the approval-capture path can refuse to
+/// record a binding on rejection while still degrading to `NoDrift`
+/// on genuine transport failures.
 ///
 /// The lpm-vs-npm metadata-fetch dispatch by `@lpm.dev/` name prefix
 /// mirrors `install.rs::build_blocked_set_metadata`. The 5-min metadata
@@ -310,13 +372,16 @@ pub async fn fetch_provenance_snapshot(
 /// approvals across runs.
 pub async fn fetch_provenance_for_pkgs(
     pkgs: &[(String, String)],
-) -> HashMap<(String, String), Option<ProvenanceSnapshot>> {
+) -> HashMap<(String, String), ProvenanceStatus> {
     let cache_root = match lpm_common::paths::LpmRoot::from_env() {
         Ok(root) => root.cache_metadata_attestations(),
         Err(_) => {
             // Degraded — no cache root. Match the pre-existing install
-            // behavior: every package gets `None`.
-            return pkgs.iter().map(|p| (p.clone(), None)).collect();
+            // behavior: every package degrades.
+            return pkgs
+                .iter()
+                .map(|p| (p.clone(), ProvenanceStatus::TransportDegraded))
+                .collect();
         }
     };
     let http = reqwest::Client::new();
@@ -343,7 +408,7 @@ pub async fn fetch_provenance_for_pkgs(
             .and_then(|v| v.dist.as_ref())
             .and_then(|d| d.attestations.clone());
 
-        let snapshot = fetch_provenance_snapshot(
+        let raw = fetch_provenance_snapshot(
             http_ref,
             cache_root_ref,
             name,
@@ -351,10 +416,9 @@ pub async fn fetch_provenance_for_pkgs(
             attestation_ref.as_ref(),
             None,
         )
-        .await
-        .ok()
-        .flatten();
-        ((name.clone(), version.clone()), snapshot)
+        .await;
+        let status = map_fetch_result_to_status(name, version, raw);
+        ((name.clone(), version.clone()), status)
     });
     futures::future::join_all(futures)
         .await
@@ -1933,6 +1997,106 @@ mod tests {
         assert!(
             result.is_err(),
             "declared Content-Length > cap must reject pre-stream",
+        );
+    }
+
+    // ── map_fetch_result_to_status (Phase 2.2 SILENT-DROP fix) ──────
+
+    fn snap_present() -> ProvenanceSnapshot {
+        ProvenanceSnapshot {
+            present: true,
+            publisher: Some("github:axios/axios".into()),
+            workflow_path: Some(".github/workflows/publish.yml".into()),
+            workflow_ref: Some("refs/tags/v1.14.0".into()),
+            attestation_cert_sha256: Some("sha256-leaf-aaa".into()),
+        }
+    }
+
+    /// `Ok(Some(snap))` with `present:true` (the verifier returned
+    /// a populated, identity-bound snapshot) maps to `Verified`.
+    #[test]
+    fn batch_maps_verified_snapshot_to_status_verified() {
+        let status = map_fetch_result_to_status("axios", "1.14.0", Ok(Some(snap_present())));
+        match status {
+            ProvenanceStatus::Verified(s) => assert!(s.present),
+            other => panic!("expected Verified, got {other:?}"),
+        }
+    }
+
+    /// `Ok(Some(snap{present:false}))` (registry returned no
+    /// attestation URL) maps to `Absent`. This is the axios drop
+    /// signal — it must not collapse with `TransportDegraded`.
+    #[test]
+    fn batch_maps_present_false_snapshot_to_status_absent() {
+        let absent_snap = ProvenanceSnapshot {
+            present: false,
+            ..Default::default()
+        };
+        let status = map_fetch_result_to_status("axios", "1.14.0", Ok(Some(absent_snap)));
+        assert!(
+            matches!(status, ProvenanceStatus::Absent),
+            "registry-confirmed absence must surface as Absent (the axios drop signal), \
+             not collapse with the transport-degrade path",
+        );
+    }
+
+    /// `Ok(None)` (transient fetch failure, oversized body, etc.)
+    /// maps to `TransportDegraded`. Drift comparator's
+    /// `(_, None) => NoDrift` arm absorbs this state.
+    #[test]
+    fn batch_maps_ok_none_to_status_transport_degraded() {
+        let status = map_fetch_result_to_status("axios", "1.14.0", Ok(None));
+        assert!(matches!(status, ProvenanceStatus::TransportDegraded));
+    }
+
+    /// **The SILENT-DROP regression guard.** Pre-fix, the batch
+    /// caller's `.ok().flatten()` chain collapsed
+    /// `Err(LpmError::ProvenanceVerification)` into the same `None`
+    /// as a transport failure, blanking the trust binding's
+    /// `provenance_at_approval` and disarming the drift comparator's
+    /// `(None, _) => NoDrift` arm on every subsequent install.
+    /// Post-fix, the verifier rejection MUST surface as
+    /// `VerificationRejected { reason }` distinct from
+    /// `TransportDegraded`, with the underlying verifier diagnostic
+    /// preserved so the approval-capture path can refuse the binding
+    /// and the operator can diagnose the failure mode.
+    #[test]
+    fn batch_preserves_verification_rejected_distinct_from_transport_degraded() {
+        let result = Err(LpmError::ProvenanceVerification(
+            "DSSE signature mismatch on payload hash".into(),
+        ));
+        let status = map_fetch_result_to_status("axios", "1.14.1", result);
+        match status {
+            ProvenanceStatus::VerificationRejected { reason } => {
+                assert!(
+                    reason.contains("DSSE signature mismatch"),
+                    "verifier diagnostic must propagate through the batch caller, got: {reason}",
+                );
+            }
+            ProvenanceStatus::TransportDegraded => panic!(
+                "REGRESSION — verification rejection was collapsed back into TransportDegraded. \
+                 This is exactly the SILENT-DROP bug the Phase 2.2 fix closes: subsequent \
+                 installs would treat this as a benign transient failure and never re-flag the \
+                 forged bundle.",
+            ),
+            other => panic!("expected VerificationRejected, got {other:?}"),
+        }
+    }
+
+    /// Non-verification `Err` variants (cache I/O, etc.) degrade to
+    /// `TransportDegraded` rather than failing the whole batch. The
+    /// install-time path's `?`-propagation contract is preserved by
+    /// the single-package fetcher; only the batch caller absorbs
+    /// these so one bad row doesn't take down N approvals.
+    #[test]
+    fn batch_maps_other_errors_to_status_transport_degraded() {
+        let result: Result<Option<ProvenanceSnapshot>, LpmError> =
+            Err(LpmError::Registry("simulated I/O error".into()));
+        let status = map_fetch_result_to_status("axios", "1.14.0", result);
+        assert!(
+            matches!(status, ProvenanceStatus::TransportDegraded),
+            "non-verification errors degrade (the typed-error contract is for the single-package \
+             fetcher's `?`-propagation path, not the batch caller)",
         );
     }
 }
