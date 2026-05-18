@@ -5690,20 +5690,19 @@ async fn run_with_options_under_store_lock(
                     })
                 };
 
-                // Phase 2.2.c: when the operator passed
-                // `--unverified-provenance <name>` /
-                // `--unverified-provenance-all` for this package, route
-                // the fetch through the batch caller's `Unverified`
-                // path — bytes through the legacy identity-only parser,
-                // no cryptographic checks. The drift gate still gets a
-                // populated snapshot so publisher / workflow_path
-                // identity drift is detected even when the operator
-                // opted out of crypto.
+                // Phase 2.2.c / 2.5: when the operator skip-listed this
+                // name (CLI `--unverified-provenance`) OR set the
+                // fleet-wide enforce mode to `Off` (env / config),
+                // route the fetch through the batch caller's
+                // `Unverified` path — bytes through the legacy
+                // identity-only parser, no cryptographic checks. The
+                // drift gate still gets a populated snapshot so
+                // publisher / workflow_path identity drift is detected
+                // even when the operator opted out of crypto.
                 let now_snapshot: Option<lpm_workspace::ProvenanceSnapshot> = if verify_policy
-                    .skip
-                    .skips_name(&p.name)
+                    .should_skip_verification_for(&p.name)
                 {
-                    let status = tokio::task::block_in_place(|| {
+                    let mut status = tokio::task::block_in_place(|| {
                         tokio::runtime::Handle::current().block_on(
                             crate::provenance_fetch::fetch_unverified_snapshot(
                                 &http,
@@ -5713,14 +5712,29 @@ async fn run_with_options_under_store_lock(
                             ),
                         )
                     });
+                    // Phase 2.5 re-label: fleet-wide `EnforceMode::Off`
+                    // surfaces as `Disabled` (`verified: "disabled"`),
+                    // distinct from per-package `Unverified`
+                    // (`"skipped"`). The bare helper always emits
+                    // `Unverified` on a successful identity parse;
+                    // the policy context lives here, not in the
+                    // helper.
+                    if matches!(
+                        verify_policy.enforce,
+                        crate::provenance_fetch::EnforceMode::Off
+                    ) && let lpm_common::ProvenanceStatus::Unverified(snap) = status
+                    {
+                        status = lpm_common::ProvenanceStatus::Disabled(snap);
+                    }
                     // Phase 2.2.d: record for the install --json
                     // envelope before consuming for the drift gate.
                     install_provenance_status_map
                         .insert((p.name.clone(), p.version.clone()), status.clone());
-                    // Projection: `Unverified(snap)` → Some(snap),
-                    // `Absent` → Some(present:false), `TransportDegraded`
-                    // → None. `VerificationRejected` is unreachable on
-                    // the skip path (the verifier didn't run).
+                    // Projection: `Unverified(snap)` / `Disabled(snap)`
+                    // → Some(snap), `Absent` → Some(present:false),
+                    // `TransportDegraded` → None. `VerificationRejected`
+                    // is unreachable on the skip path (the verifier
+                    // didn't run).
                     status.into_snapshot_for_binding(&p.name, &p.version)?
                 } else {
                     let raw = tokio::task::block_in_place(|| {
@@ -5790,6 +5804,18 @@ async fn run_with_options_under_store_lock(
                                     );
                                     None
                                 }
+                                // `Off` short-circuits the verifier
+                                // upstream via `should_skip_verification_for`,
+                                // so the verifier-rejection path is
+                                // unreachable in `Off` mode. Defensive
+                                // arm to keep the match exhaustive if
+                                // a future refactor accidentally
+                                // bypasses the skip-route — degrade
+                                // identically to Warn so the install
+                                // doesn't fail on a state that the
+                                // operator already declared "fleet-wide
+                                // off".
+                                crate::provenance_fetch::EnforceMode::Off => None,
                                 crate::provenance_fetch::EnforceMode::Deny => {
                                     // Surface the status in the map before
                                     // returning so a `--json` consumer that

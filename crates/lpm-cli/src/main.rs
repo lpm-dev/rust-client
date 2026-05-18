@@ -2934,16 +2934,60 @@ async fn async_main() -> Result<()> {
                 ignore_provenance_drift_all,
             );
 
-            // Phase 2.2.c: canonicalize the per-package crypto opt-out
-            // flags + env-resolved `EnforceMode` into a single
-            // `VerifyPolicy`. The two axes (enforce, skip) compose
-            // orthogonally — see `SkipPolicy` doc. The composed
-            // policy is threaded into `run_with_options` adjacent to
-            // `drift_ignore_policy`; the two checks are independent.
-            let verify_policy = provenance_fetch::VerifyPolicy::from_cli(
+            // Phase 2.2.c + 2.5: canonicalize the per-package crypto
+            // opt-out flags + env / config-resolved `EnforceMode`
+            // into a single `VerifyPolicy`. The two axes (enforce,
+            // skip) compose orthogonally — see `SkipPolicy` doc.
+            // Resolution walks the full precedence chain:
+            //   env LPM_PROVENANCE_ENFORCE
+            //     → config [sigstore].verify in ~/.lpm/config.toml
+            //       → default Deny.
+            let (verify_policy, verify_source) = provenance_fetch::VerifyPolicy::resolve_from_chain(
                 unverified_provenance,
                 unverified_provenance_all,
+                std::env::var("LPM_PROVENANCE_ENFORCE").ok().as_deref(),
+                || cfg.get_sigstore_verify(),
             );
+            // Loud-when-degraded: emit exactly one heads-up per
+            // install run when the resolved mode is not `Deny`. The
+            // hint names the source (env / config / default) and the
+            // re-enable command so an operator who flipped the knob
+            // once and forgot doesn't fly blind. Tracing target is
+            // separate so structured-log consumers can filter on
+            // `lpm::provenance` rather than scraping stderr.
+            if !cli.json
+                && !matches!(verify_policy.enforce, provenance_fetch::EnforceMode::Deny)
+            {
+                let mode_label = match verify_policy.enforce {
+                    provenance_fetch::EnforceMode::Warn => "warn",
+                    provenance_fetch::EnforceMode::Off => "off",
+                    provenance_fetch::EnforceMode::Deny => unreachable!("guarded above"),
+                };
+                output::warn(&format!(
+                    "Sigstore provenance verification posture: {} (source: {}). \
+                     Provenance attestations will {} be cryptographically verified \
+                     for this install. To re-enable fail-closed: {}.",
+                    mode_label,
+                    match verify_source {
+                        provenance_fetch::EnforceModeSource::Env => "LPM_PROVENANCE_ENFORCE env",
+                        provenance_fetch::EnforceModeSource::Config =>
+                            "[sigstore] verify in ~/.lpm/config.toml",
+                        provenance_fetch::EnforceModeSource::Default => "default",
+                    },
+                    if matches!(verify_policy.enforce, provenance_fetch::EnforceMode::Off) {
+                        "NOT"
+                    } else {
+                        "be checked but rejections will only log, not block —"
+                    },
+                    verify_source.re_enable_hint(),
+                ));
+                tracing::warn!(
+                    target = "lpm::provenance",
+                    enforce_mode = mode_label,
+                    source = ?verify_source,
+                    "sigstore verification posture is degraded for this install run",
+                );
+            }
 
             //: resolve the effective script-policy through
             // the precedence chain (CLI > package.json > global >

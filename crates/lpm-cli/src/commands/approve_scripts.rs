@@ -179,25 +179,41 @@ fn snapshot_for_binding_with_mode(
         None => return Ok(None),
     };
 
-    // Warn-mode short-circuit: VerificationRejected logs loudly but
-    // does NOT propagate as Err, so the approval proceeds and the
+    // Warn / Off short-circuit on VerificationRejected: log loudly but
+    // do NOT propagate as Err, so the approval proceeds and the
     // binding records `provenance_at_approval: None`. Every other
-    // status falls through to the default projection (Deny mode
-    // semantics — VerificationRejected returns Err there).
+    // status (Verified / Unverified / Absent / TransportDegraded)
+    // falls through to the default projection regardless of mode.
+    //
+    // Off here is the "operator opted out fleet-wide" case (Phase
+    // 2.5): a VerificationRejected reaching this point only happens
+    // when the upstream verifier path ran anyway (e.g. a code path
+    // that didn't consult `should_skip_verification_for`); treat it
+    // as a degraded observation rather than failing the approval the
+    // operator explicitly asked to allow.
     if let ProvenanceStatus::VerificationRejected { reason } = &status
-        && matches!(mode, crate::provenance_fetch::EnforceMode::Warn)
+        && matches!(
+            mode,
+            crate::provenance_fetch::EnforceMode::Warn
+                | crate::provenance_fetch::EnforceMode::Off
+        )
     {
+        let mode_label = match mode {
+            crate::provenance_fetch::EnforceMode::Warn => "warn",
+            crate::provenance_fetch::EnforceMode::Off => "off",
+            crate::provenance_fetch::EnforceMode::Deny => unreachable!("guarded by matches!"),
+        };
         tracing::warn!(
             target = "lpm::provenance",
             pkg = %name,
             version = %version,
             reason = %reason,
-            enforce_mode = "warn",
-            "verifier rejected provenance bundle but LPM_PROVENANCE_ENFORCE=warn — recording approval with no provenance reference; subsequent installs will treat this as a degraded state"
+            enforce_mode = mode_label,
+            "verifier rejected provenance bundle but LPM_PROVENANCE_ENFORCE={mode_label} — recording approval with no provenance reference; subsequent installs will treat this as a degraded state"
         );
         crate::output::warn(&format!(
             "provenance verification FAILED for {name}@{version}: {reason}\n  \
-             LPM_PROVENANCE_ENFORCE=warn — approval proceeds; the trust binding \
+             LPM_PROVENANCE_ENFORCE={mode_label} — approval proceeds; the trust binding \
              records no verified identity. Re-run with LPM_PROVENANCE_ENFORCE=deny \
              (default) to refuse, or remediate the underlying bundle and re-approve."
         ));

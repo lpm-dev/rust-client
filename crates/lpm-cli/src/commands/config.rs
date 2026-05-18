@@ -216,6 +216,26 @@ impl GlobalConfig {
         self.table.get(key)?.as_table()
     }
 
+    /// Read `[sigstore] verify` (Phase 2.5). Returns the raw string
+    /// (`"deny"` / `"warn"` / `"off"`) if present, or `None` for
+    /// absent / non-table / non-string / unknown values. The parse
+    /// happens at the consumer ([`crate::provenance_fetch::EnforceMode::resolve_from_chain`])
+    /// so unknown values fall back to the next tier in the
+    /// precedence chain with a `tracing::debug` so the gap is
+    /// diagnosable without crashing the install.
+    ///
+    /// The nested-table key path (`[sigstore].verify`, not flat
+    /// `sigstore-verify = "..."`) matches the `[sandbox] mode = "..."`
+    /// precedent; leaves room for future sigstore-scoped knobs
+    /// (trust-root override path, custom Rekor URL) without
+    /// polluting the top-level table.
+    pub fn get_sigstore_verify(&self) -> Option<String> {
+        self.get_table("sigstore")?
+            .get("verify")?
+            .as_str()
+            .map(String::from)
+    }
+
     /// Get a value that should be an array of strings, returning the
     /// entries as owned `Vec<String>`. Accepts:
     /// - A native TOML array of strings: `foo = ["a", "b"]` → `vec!["a", "b"]`.
@@ -905,5 +925,50 @@ mod wizard_tests {
             read_sandbox_mode(&path).unwrap().as_deref(),
             Some("default")
         );
+    }
+
+    // ── Phase 2.5: GlobalConfig::get_sigstore_verify ──────────────
+
+    /// `[sigstore].verify` resolves to the right string. Pin both
+    /// the table layout (nested, not flat `sigstore-verify`) and the
+    /// returned value so a future wizard wired to a different key
+    /// path (the Phase 2.5 ordering audit item 4b anchor) fails
+    /// this test loudly.
+    #[test]
+    fn global_config_get_sigstore_verify_returns_string_when_present() {
+        let (_dir, path) = tmp_config();
+        std::fs::write(&path, "[sigstore]\nverify = \"warn\"\n").unwrap();
+        let toml_val = read_config(&path).unwrap();
+        let table = match toml_val {
+            toml::Value::Table(t) => t,
+            _ => panic!("expected top-level table"),
+        };
+        let cfg = GlobalConfig { table };
+        assert_eq!(cfg.get_sigstore_verify().as_deref(), Some("warn"));
+    }
+
+    /// Absent table → `None`. Distinguishes "operator hasn't set it"
+    /// from "operator set it to a known bad value" so the precedence
+    /// chain in `EnforceMode::resolve_from_chain` can fall through.
+    #[test]
+    fn global_config_get_sigstore_verify_returns_none_when_absent() {
+        let cfg = GlobalConfig::empty();
+        assert!(cfg.get_sigstore_verify().is_none());
+    }
+
+    /// Non-string (e.g. accidentally wrote a bool) → `None`. The
+    /// `EnforceMode` parser handles unknown strings with a
+    /// tracing::warn; this layer just signals "no usable value".
+    #[test]
+    fn global_config_get_sigstore_verify_returns_none_for_non_string_value() {
+        let (_dir, path) = tmp_config();
+        std::fs::write(&path, "[sigstore]\nverify = true\n").unwrap();
+        let toml_val = read_config(&path).unwrap();
+        let table = match toml_val {
+            toml::Value::Table(t) => t,
+            _ => panic!("expected top-level table"),
+        };
+        let cfg = GlobalConfig { table };
+        assert!(cfg.get_sigstore_verify().is_none());
     }
 }

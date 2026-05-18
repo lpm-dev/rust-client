@@ -142,9 +142,8 @@ impl DriftIgnorePolicy {
 ///   specific names out per invocation.
 ///
 /// Phase 2.5 promotes this enum to a three-mode shape (`Deny | Warn
-/// | Off`) with config-file persistence and a `lpm config sigstore`
-/// wizard. The `Off` variant lands then; this commit ships only the
-/// rollout-knob (two-mode) posture.
+/// | Off`) with config-file persistence; the `lpm config sigstore`
+/// wizard is the UI surface added in Phase 2.6.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum EnforceMode {
     /// Fail-closed: a verifier rejection refuses the approval.
@@ -161,10 +160,32 @@ pub enum EnforceMode {
     /// warn log line and either remediate the registry compromise
     /// or re-approve once the verifier accepts the bundle.
     Warn,
+    /// **Operator opt-out, fleet-wide** (Phase 2.5). Skip the
+    /// verification path entirely: don't fetch the bundle, don't
+    /// parse, don't verify. The drift gate falls back to whatever
+    /// identity data the registry metadata already carries (the
+    /// pre-C1 posture, preserved as an explicit operator decision —
+    /// not a default). Equivalent to passing
+    /// `--unverified-provenance-all` on every install; persists via
+    /// `[sigstore] verify = "off"` in `~/.lpm/config.toml` or via
+    /// `LPM_PROVENANCE_ENFORCE=off`.
+    ///
+    /// **Loud when degraded.** Every install run that resolves to
+    /// `Off` emits exactly one `tracing::warn` naming the source
+    /// (env, config, or default-during-rollout) and the re-enable
+    /// command. `lpm doctor` flags `sigstore.verify != "deny"` as a
+    /// warning so the degraded posture stays visible outside install
+    /// runs. The JSON envelope reports `verified: "disabled"` for
+    /// every package so machine-readable consumers can detect the
+    /// posture-degrade without parsing log lines.
+    Off,
 }
 
 impl EnforceMode {
-    /// Read the mode from `LPM_PROVENANCE_ENFORCE`.
+    /// Read the mode from `LPM_PROVENANCE_ENFORCE`. Phase 2.5 adds
+    /// the persistent operator surface; see
+    /// [`Self::resolve_from_chain`] for the full precedence chain
+    /// (CLI > env > config > default).
     ///
     /// Default is `Deny`. Unknown values fall back to `Deny`
     /// (fail-closed) with a `tracing::warn` so a typo in the env
@@ -177,20 +198,95 @@ impl EnforceMode {
     /// mutate process-global env state. Production callers should
     /// use [`Self::from_env`].
     pub(crate) fn from_env_value(value: Option<&str>) -> Self {
+        Self::parse_str_with_source(value, "LPM_PROVENANCE_ENFORCE env var").unwrap_or(Self::Deny)
+    }
+
+    /// Parse the wire-form string against the canonical three-value
+    /// set. Returns `None` for unknown values (typo); caller decides
+    /// whether to log and fall back (env / config readers) or hard-
+    /// error (CLI-flag-style validators).
+    ///
+    /// `source` is the log context that fires when an unknown value
+    /// is rejected — e.g. "LPM_PROVENANCE_ENFORCE env var" or
+    /// "[sigstore] verify in ~/.lpm/config.toml" — so the operator
+    /// can find where the typo lives.
+    fn parse_str_with_source(value: Option<&str>, source: &'static str) -> Option<Self> {
         match value {
-            // `unset` is explicitly mapped to `Deny` so a user who
-            // never set the var gets the safe default.
-            None => Self::Deny,
-            Some("warn") => Self::Warn,
-            Some("deny") => Self::Deny,
+            None => None,
+            Some("deny") => Some(Self::Deny),
+            Some("warn") => Some(Self::Warn),
+            Some("off") => Some(Self::Off),
             Some(other) => {
                 tracing::warn!(
                     target = "lpm::provenance",
                     value = %other,
-                    "ignoring unknown LPM_PROVENANCE_ENFORCE value (expected 'warn' or 'deny'); using fail-closed default"
+                    source = source,
+                    "ignoring unknown sigstore verify mode (expected 'deny', 'warn', or 'off'); falling back to default"
                 );
-                Self::Deny
+                None
             }
+        }
+    }
+
+    /// Walk the full precedence chain (Phase 2.5): env → config →
+    /// default. The CLI flag tier is not threaded here because the
+    /// flag axis is `SkipPolicy` (per-package), not enforce-mode —
+    /// those two axes are orthogonal by design (Phase 2.2.c).
+    ///
+    /// `config_reader` is a closure that pulls the
+    /// `[sigstore].verify` value from `~/.lpm/config.toml`. Passed
+    /// in (rather than imported) so this fn stays decoupled from the
+    /// `lpm-cli::commands::config` module — the binary-only tests in
+    /// this file don't have to pull the entire config plumbing in.
+    ///
+    /// Emits a single `tracing::warn` per call when the resolved
+    /// mode is not `Deny`, naming the resolved source so operators
+    /// can find where the degraded posture lives. The warn is gated
+    /// by the caller's `OnceCell` so an install run gets exactly one
+    /// line, not one per package.
+    pub fn resolve_from_chain(
+        env_value: Option<&str>,
+        config_reader: impl FnOnce() -> Option<String>,
+    ) -> (Self, EnforceModeSource) {
+        if let Some(mode) =
+            Self::parse_str_with_source(env_value, "LPM_PROVENANCE_ENFORCE env var")
+        {
+            return (mode, EnforceModeSource::Env);
+        }
+        let config_value = config_reader();
+        if let Some(mode) = Self::parse_str_with_source(
+            config_value.as_deref(),
+            "[sigstore] verify in ~/.lpm/config.toml",
+        ) {
+            return (mode, EnforceModeSource::Config);
+        }
+        (Self::default(), EnforceModeSource::Default)
+    }
+}
+
+/// Where the resolved [`EnforceMode`] came from. Used by the loud-
+/// when-degraded warn-line emitter to tell operators which knob to
+/// flip when they want to re-enable verification.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EnforceModeSource {
+    Env,
+    Config,
+    Default,
+}
+
+impl EnforceModeSource {
+    /// Human-readable suffix for the loud-when-degraded warn line.
+    /// Used in the install-run heads-up so operators know where to
+    /// flip the knob back without consulting the source code.
+    pub fn re_enable_hint(&self) -> &'static str {
+        match self {
+            Self::Env => "unset LPM_PROVENANCE_ENFORCE or set it to 'deny'",
+            Self::Config => "run `lpm config sigstore --set deny`",
+            // Should never fire — default is Deny, so the loud line
+            // never emits with a Default source. Kept for exhaustive
+            // matching in case the default flips to Warn during the
+            // Phase 2.3 rollout window.
+            Self::Default => "set LPM_PROVENANCE_ENFORCE=deny",
         }
     }
 }
@@ -270,14 +366,61 @@ pub struct VerifyPolicy {
 
 impl VerifyPolicy {
     /// Construct from the install-time CLI inputs + env-resolved
-    /// enforce mode. The CLI surface lives on `Commands::Install` in
-    /// `main.rs`; this is the single canonicalization point used by
-    /// every dispatcher arm that reaches the install pipeline.
+    /// enforce mode. Defers to [`EnforceMode::from_env`] (env-only)
+    /// — used by internal callers (`upgrade`, `add`, `dev`, `dlx`,
+    /// etc.) that don't surface their own `--unverified-provenance`
+    /// flags and have no config-tier override resolution in scope.
+    ///
+    /// The `lpm install` dispatcher in `main.rs` uses
+    /// [`Self::resolve_from_chain`] instead so the
+    /// `[sigstore] verify` config tier is honored.
     pub fn from_cli(unverified_names: Vec<String>, unverified_all: bool) -> Self {
         Self {
             enforce: EnforceMode::from_env(),
             skip: SkipPolicy::from_cli(unverified_names, unverified_all),
         }
+    }
+
+    /// Construct via the full precedence chain (Phase 2.5).
+    ///
+    /// - **CLI** flags drive `SkipPolicy` (per-package). They don't
+    ///   touch `EnforceMode` — the two axes are orthogonal so an
+    ///   operator can set `LPM_PROVENANCE_ENFORCE=warn` AND skip a
+    ///   specific package; the env knob still drives the rest of the
+    ///   install while the skip-listed package produces `Unverified`
+    ///   directly.
+    /// - **Env** `LPM_PROVENANCE_ENFORCE` is the first tier for
+    ///   `EnforceMode` resolution.
+    /// - **Config** `[sigstore] verify` in `~/.lpm/config.toml`
+    ///   (read via `config_reader`) is the second tier.
+    /// - **Default** is `Deny` (fail-closed).
+    ///
+    /// Also returns the [`EnforceModeSource`] so the caller can
+    /// emit one loud-when-degraded log line per install run (the
+    /// `OnceCell`-gated hint that names the re-enable command).
+    pub fn resolve_from_chain(
+        unverified_names: Vec<String>,
+        unverified_all: bool,
+        env_value: Option<&str>,
+        config_reader: impl FnOnce() -> Option<String>,
+    ) -> (Self, EnforceModeSource) {
+        let (enforce, source) = EnforceMode::resolve_from_chain(env_value, config_reader);
+        let skip = SkipPolicy::from_cli(unverified_names, unverified_all);
+        (Self { enforce, skip }, source)
+    }
+
+    /// `true` iff the cryptographic verifier should be bypassed for
+    /// this specific package — either because the operator carved
+    /// it out via `--unverified-provenance` (Phase 2.2.c) OR because
+    /// `EnforceMode::Off` is the fleet-wide posture (Phase 2.5).
+    ///
+    /// Single source of truth for the "should we run verification?"
+    /// decision so the install drift gate and the batch caller stay
+    /// in lockstep. Without this, the two axes could conflate
+    /// independently at each call site (the Phase 2.5 ordering audit
+    /// item 4a anchor) and the orthogonality contract would break.
+    pub fn should_skip_verification_for(&self, name: &str) -> bool {
+        matches!(self.enforce, EnforceMode::Off) || self.skip.skips_name(name)
     }
 }
 
@@ -570,7 +713,7 @@ pub async fn fetch_provenance_for_pkgs(
     let cache_root_ref = &cache_root;
     let http_ref = &http;
     let registry_ref = &registry;
-    let skip_ref = &verify_policy.skip;
+    let verify_policy_ref = verify_policy;
 
     let futures = pkgs.iter().map(move |(name, version)| async move {
         // lpm vs npm dispatch by name prefix mirrors
@@ -589,15 +732,27 @@ pub async fn fetch_provenance_for_pkgs(
             .and_then(|v| v.dist.as_ref())
             .and_then(|d| d.attestations.clone());
 
-        // Phase 2.2.c skip path: operator opted out of cryptographic
-        // verification for this name (or wholesale via `--unverified-
-        // provenance-all`). Pull the bytes through the legacy
-        // identity-only parser and land the snapshot as `Unverified`
-        // so the binding records the operator's downgrade explicitly
-        // instead of falsely claiming verification.
-        if skip_ref.skips_name(name) {
-            let status =
+        // Phase 2.2.c / 2.5 skip path: operator opted out of
+        // cryptographic verification for this name (CLI flag) OR
+        // fleet-wide (EnforceMode::Off, per Phase 2.5). Pull the
+        // bytes through the legacy identity-only parser and land the
+        // snapshot as `Unverified` so the binding records the
+        // operator's downgrade explicitly instead of falsely
+        // claiming verification.
+        if verify_policy_ref.should_skip_verification_for(name) {
+            let mut status =
                 fetch_unverified_snapshot(http_ref, name, version, attestation_ref.as_ref()).await;
+            // Phase 2.5: distinguish fleet-wide opt-out (Disabled)
+            // from per-package skip (Unverified). The plain
+            // `fetch_unverified_snapshot` always returns `Unverified`
+            // on a successful identity-only parse — re-label here
+            // when EnforceMode::Off was the trigger so the JSON
+            // envelope reports `"disabled"` not `"skipped"`.
+            if matches!(verify_policy_ref.enforce, EnforceMode::Off)
+                && let ProvenanceStatus::Unverified(snap) = status
+            {
+                status = ProvenanceStatus::Disabled(snap);
+            }
             return ((name.clone(), version.clone()), status);
         }
 
@@ -1410,6 +1565,114 @@ mod tests {
         assert!(
             !policy.skip.skips_name("bar"),
             "skip-list must NOT spill across to unrelated names",
+        );
+    }
+
+    // ── EnforceMode parse + Phase 2.5 precedence resolver ──────
+
+    #[test]
+    fn enforce_mode_parses_three_canonical_values() {
+        assert_eq!(EnforceMode::from_env_value(Some("deny")), EnforceMode::Deny);
+        assert_eq!(EnforceMode::from_env_value(Some("warn")), EnforceMode::Warn);
+        assert_eq!(EnforceMode::from_env_value(Some("off")), EnforceMode::Off);
+    }
+
+    /// Unknown values must fall back to fail-closed `Deny` so a typo
+    /// in the env var never silently weakens the posture.
+    #[test]
+    fn enforce_mode_unknown_value_falls_back_to_deny() {
+        assert_eq!(
+            EnforceMode::from_env_value(Some("yolo")),
+            EnforceMode::Deny,
+            "unknown env value MUST fall back to fail-closed default",
+        );
+    }
+
+    /// Precedence chain (Phase 2.5): env wins over config wins over
+    /// default. Three positive cases pin each tier.
+    #[test]
+    fn enforce_mode_resolve_env_wins_over_config_and_default() {
+        let (mode, source) =
+            EnforceMode::resolve_from_chain(Some("warn"), || Some("off".to_string()));
+        assert_eq!(mode, EnforceMode::Warn);
+        assert_eq!(source, EnforceModeSource::Env);
+    }
+
+    #[test]
+    fn enforce_mode_resolve_config_used_when_env_absent() {
+        let (mode, source) = EnforceMode::resolve_from_chain(None, || Some("off".to_string()));
+        assert_eq!(mode, EnforceMode::Off);
+        assert_eq!(source, EnforceModeSource::Config);
+    }
+
+    #[test]
+    fn enforce_mode_resolve_default_when_both_absent() {
+        let (mode, source) = EnforceMode::resolve_from_chain(None, || None);
+        assert_eq!(mode, EnforceMode::Deny);
+        assert_eq!(source, EnforceModeSource::Default);
+    }
+
+    /// Edge case: env has a typo, config is valid — config wins, env
+    /// is silently ignored with a tracing::warn. This is the
+    /// "operator typo'd LPM_PROVENANCE_ENFORCE=warn1 but their
+    /// config persists the right value" path — must not crash or
+    /// hard-fall to default.
+    #[test]
+    fn enforce_mode_resolve_env_typo_falls_through_to_config() {
+        let (mode, source) =
+            EnforceMode::resolve_from_chain(Some("yolo"), || Some("warn".to_string()));
+        assert_eq!(mode, EnforceMode::Warn);
+        assert_eq!(source, EnforceModeSource::Config);
+    }
+
+    /// `should_skip_verification_for` is the single source of truth
+    /// the install drift gate and the batch caller both consult.
+    /// Both axes drive it: per-package skip-list OR fleet-wide
+    /// `EnforceMode::Off`.
+    #[test]
+    fn verify_policy_should_skip_verification_unifies_skip_and_off() {
+        // Per-package skip alone — only the named package skips.
+        let p = VerifyPolicy {
+            enforce: EnforceMode::Deny,
+            skip: SkipPolicy::Names({
+                let mut s = HashSet::new();
+                s.insert("axios".into());
+                s
+            }),
+        };
+        assert!(p.should_skip_verification_for("axios"));
+        assert!(!p.should_skip_verification_for("lodash"));
+
+        // EnforceMode::Off — every package skips, regardless of
+        // SkipPolicy.
+        let p = VerifyPolicy {
+            enforce: EnforceMode::Off,
+            skip: SkipPolicy::None,
+        };
+        assert!(p.should_skip_verification_for("axios"));
+        assert!(p.should_skip_verification_for("anything"));
+
+        // Both axes default — nothing skips.
+        let p = VerifyPolicy::default();
+        assert!(!p.should_skip_verification_for("axios"));
+    }
+
+    /// `EnforceModeSource::re_enable_hint` returns the canonical
+    /// recovery command per source — pinned so the install heads-up
+    /// line stays actionable.
+    #[test]
+    fn enforce_mode_source_re_enable_hints_are_canonical() {
+        assert!(
+            EnforceModeSource::Env
+                .re_enable_hint()
+                .contains("LPM_PROVENANCE_ENFORCE"),
+            "env hint must name the env var",
+        );
+        assert!(
+            EnforceModeSource::Config
+                .re_enable_hint()
+                .contains("lpm config sigstore"),
+            "config hint must name the wizard command",
         );
     }
 
@@ -2540,19 +2803,18 @@ mod tests {
         assert_eq!(EnforceMode::from_env_value(Some("deny")), EnforceMode::Deny);
     }
 
-    /// Unknown values (typo, future-mode-from-2.5 like `"off"`, etc.)
-    /// must fall back to `Deny` so a misconfiguration NEVER silently
-    /// weakens the posture. A `tracing::warn` surfaces the
-    /// fallback; we don't assert on that here (the tracing
-    /// subscriber would need to be wired up), but the fail-closed
-    /// behavior is the load-bearing guarantee.
+    /// Unknown values (typo, mis-cased, etc.) must fall back to
+    /// `Deny` so a misconfiguration NEVER silently weakens the
+    /// posture. A `tracing::warn` surfaces the fallback; we don't
+    /// assert on that here (the tracing subscriber would need to be
+    /// wired up), but the fail-closed behavior is the load-bearing
+    /// guarantee.
+    ///
+    /// Phase 2.5 promoted `"off"` to a valid value; it's no longer
+    /// in the unknown-fallback set. The canonical-values pin
+    /// (`enforce_mode_parses_three_canonical_values`) covers it.
     #[test]
     fn enforce_mode_from_env_unknown_value_falls_back_to_deny() {
-        assert_eq!(
-            EnforceMode::from_env_value(Some("off")),
-            EnforceMode::Deny,
-            "unknown values must fail-closed to Deny — never silently weaken the posture",
-        );
         assert_eq!(EnforceMode::from_env_value(Some("DENY")), EnforceMode::Deny);
         assert_eq!(EnforceMode::from_env_value(Some("typo")), EnforceMode::Deny);
         assert_eq!(EnforceMode::from_env_value(Some("")), EnforceMode::Deny);

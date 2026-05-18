@@ -55,6 +55,16 @@ pub enum ProvenanceStatus {
     /// approve-scripts audit trail say "this identity was accepted
     /// without crypto" instead of falsely claiming verification.
     Unverified(ProvenanceSnapshot),
+    /// Fleet-wide operator opt-out (Phase 2.5): `EnforceMode::Off`
+    /// (env `LPM_PROVENANCE_ENFORCE=off` or `[sigstore] verify =
+    /// "off"` in `~/.lpm/config.toml`) suppressed the verifier for
+    /// every package on this run. Equivalent in effect to
+    /// `--unverified-provenance-all`, but tracked as a distinct
+    /// state so the JSON envelope can report `verified: "disabled"`
+    /// (vs `"skipped"`) — downstream audit pipelines need to
+    /// distinguish "operator declined to verify any package" from
+    /// "operator surgically excluded this specific package."
+    Disabled(ProvenanceSnapshot),
     /// Registry returned no attestation URL for this version
     /// (definitive "no provenance shipped"). This is the axios drop
     /// signal direction — when compared against an approved-side
@@ -104,7 +114,9 @@ impl ProvenanceStatus {
         version: &str,
     ) -> Result<Option<ProvenanceSnapshot>, crate::LpmError> {
         match self {
-            ProvenanceStatus::Verified(s) | ProvenanceStatus::Unverified(s) => Ok(Some(s)),
+            ProvenanceStatus::Verified(s)
+            | ProvenanceStatus::Unverified(s)
+            | ProvenanceStatus::Disabled(s) => Ok(Some(s)),
             ProvenanceStatus::Absent => Ok(Some(ProvenanceSnapshot {
                 present: false,
                 ..Default::default()
@@ -137,6 +149,9 @@ impl ProvenanceStatus {
     /// - `Verified(_)` → (`true`, `None`)
     /// - `Unverified(_)` → (`"skipped"`, `None`) — operator carved this
     ///   name out via `--unverified-provenance`
+    /// - `Disabled(_)` → (`"disabled"`, `None`) — fleet-wide operator
+    ///   opt-out (`EnforceMode::Off`); distinct from `"skipped"` so
+    ///   audit pipelines can detect a posture-wide degrade
     /// - `Absent` → (`false`, `None`) — registry served no attestation
     /// - `TransportDegraded` → (`null`, `None`) — transient unknown;
     ///   callers MAY omit the package from the envelope or render as
@@ -161,6 +176,9 @@ impl ProvenanceStatus {
             ProvenanceStatus::Verified(_) => (serde_json::Value::Bool(true), None),
             ProvenanceStatus::Unverified(_) => {
                 (serde_json::Value::String("skipped".into()), None)
+            }
+            ProvenanceStatus::Disabled(_) => {
+                (serde_json::Value::String("disabled".into()), None)
             }
             ProvenanceStatus::Absent => (serde_json::Value::Bool(false), None),
             ProvenanceStatus::TransportDegraded => (serde_json::Value::Null, None),
@@ -423,7 +441,7 @@ mod tests {
     }
 
     /// `is_rejection` lets call sites short-circuit before any
-    /// trust-store mutation. The other four states must not flag.
+    /// trust-store mutation. The other five states must not flag.
     #[test]
     fn provenance_status_is_rejection_only_for_verification_rejected() {
         assert!(
@@ -433,6 +451,10 @@ mod tests {
         assert!(
             !ProvenanceStatus::Unverified(axios_snap()).is_rejection(),
             "Unverified (operator-skipped) is not a rejection — it's an opt-out",
+        );
+        assert!(
+            !ProvenanceStatus::Disabled(axios_snap()).is_rejection(),
+            "Disabled (operator fleet-wide opt-out) is not a rejection",
         );
         assert!(!ProvenanceStatus::Absent.is_rejection(), "Absent is not a rejection");
         assert!(
@@ -478,6 +500,17 @@ mod tests {
         let (v, r) = ProvenanceStatus::Unverified(axios_snap()).to_json_verified();
         assert_eq!(v, serde_json::Value::String("skipped".into()));
         assert!(r.is_none(), "skipped state carries no rejection reason");
+    }
+
+    /// `Disabled` is the fleet-wide opt-out (EnforceMode::Off). The
+    /// string sentinel `"disabled"` distinguishes it from the
+    /// per-package `"skipped"` so audit consumers see whether the
+    /// degraded posture was surgical or wholesale.
+    #[test]
+    fn to_json_verified_disabled_is_disabled_no_reason() {
+        let (v, r) = ProvenanceStatus::Disabled(axios_snap()).to_json_verified();
+        assert_eq!(v, serde_json::Value::String("disabled".into()));
+        assert!(r.is_none(), "disabled state carries no rejection reason");
     }
 
     #[test]
