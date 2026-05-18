@@ -9,12 +9,15 @@ use std::io::IsTerminal;
 /// Stores config in ~/.lpm/config.toml (user/machine config).
 /// Project config lives in package.json under "lpm" key.
 ///
-/// Beyond `get`/`set`/`delete`/`list`, three focused wizards live here:
+/// Beyond `get`/`set`/`delete`/`list`, four focused wizards live here:
 /// - `lpm config scripts` owns `script-policy = deny | triage | allow`.
 /// - `lpm config triage` owns `triage-advisor = none | claude-cli | codex | ollama`.
 /// - `lpm config sandbox` owns `[sandbox] mode = default | strict | none`.
+/// - `lpm config sigstore` owns `[sigstore] verify = deny | warn | off`
+///   (Phase 2.6 — operator persistent toggle for Sigstore provenance
+///   verification).
 ///
-/// All three default to interactive in a TTY; `--set <value>` is the
+/// All four default to interactive in a TTY; `--set <value>` is the
 /// non-interactive setter required for CI / scripted setup.
 pub async fn run(
     action: &str,
@@ -36,6 +39,9 @@ pub async fn run(
     }
     if action == "sandbox" {
         return run_sandbox_wizard(&config_path, set, json_output).await;
+    }
+    if action == "sigstore" {
+        return run_sigstore_wizard(&config_path, set, json_output).await;
     }
 
     match action {
@@ -123,7 +129,7 @@ pub async fn run(
             return Err(LpmError::Registry(format!(
                 "unknown config action: {action}. \
                  Use: get, set, delete (alias: unset), list (alias: ls), \
-                 scripts, triage, sandbox"
+                 scripts, triage, sandbox, sigstore"
             )));
         }
     }
@@ -721,6 +727,155 @@ fn announce_sandbox_set(value: &str, json_output: bool) {
     }
 }
 
+// ─────────────────────────────────────────────────────────────────────
+// `lpm config sigstore` wizard (Phase 2.6)
+// ─────────────────────────────────────────────────────────────────────
+//
+// Persists `[sigstore] verify = "deny" | "warn" | "off"` into
+// `~/.lpm/config.toml`. Mirror of the sandbox wizard above:
+//   - interactive (TTY): `cliclack::select` with the current value
+//     pre-selected, plus an extra confirmation prompt when the user
+//     picks `off` (because that turns the Sigstore verifier off
+//     fleet-wide — every attestation will be ignored).
+//   - `--set <value>`: non-interactive setter for CI / image bake
+//     dotfiles automation. Trusts the operator — no confirmation
+//     prompt even on `--set off`.
+//
+// The wizard ONLY touches `~/.lpm/config.toml`. There is no
+// project-tier sigstore knob (unlike `[sandbox] mode`); per-invocation
+// opt-out lives on the install CLI (`--unverified-provenance[-all]`).
+
+const SIGSTORE_VERIFY_VALUES: &[&str] = &["deny", "warn", "off"];
+
+async fn run_sigstore_wizard(
+    config_path: &std::path::Path,
+    set: Option<&str>,
+    json_output: bool,
+) -> Result<(), LpmError> {
+    if let Some(v) = set {
+        if !SIGSTORE_VERIFY_VALUES.contains(&v) {
+            return Err(LpmError::Registry(format!(
+                "invalid sigstore verify mode '{v}'; must be one of: {}",
+                SIGSTORE_VERIFY_VALUES.join(" | ")
+            )));
+        }
+        persist_sigstore_verify(config_path, v)?;
+        announce_sigstore_set(v, json_output);
+        return Ok(());
+    }
+
+    if !std::io::stdin().is_terminal() {
+        return Err(LpmError::Registry(
+            "lpm config sigstore requires a TTY; use `--set deny|warn|off` instead".to_string(),
+        ));
+    }
+
+    let current = read_sigstore_verify(config_path)?.unwrap_or_else(|| "deny".to_string());
+    println!();
+    println!("  current: {}", current.cyan());
+    let new_value: &str =
+        cliclack::select("How should LPM handle Sigstore provenance verification?")
+            .item(
+                "deny",
+                "deny — verify every attestation, fail-closed on errors",
+                "recommended",
+            )
+            .item(
+                "warn",
+                "warn — verify, but only log on failure",
+                "degraded",
+            )
+            .item(
+                "off",
+                "off  — skip verification entirely",
+                "NOT recommended",
+            )
+            .initial_value(current.as_str())
+            .interact()
+            .map_err(prompt_err)?;
+
+    // Confirm when the user picks `off` in the interactive wizard.
+    // The `--set off` form trusts the operator (no TTY check); only
+    // the wizard prompts. Matches the sandbox=none confirm shape.
+    if new_value == "off" {
+        println!();
+        println!(
+            "  {}: setting sigstore.verify = {} means every Sigstore attestation \
+             your registry ships will be IGNORED. Provenance drift detection \
+             still runs against unverified identity data, but a malicious or \
+             compromised registry can lie about who built a package and the \
+             install will accept it. This is the pre-C1 posture; LPM does not \
+             recommend it as a persistent setting.",
+            "warning".yellow(),
+            "off".yellow().bold(),
+        );
+        let confirmed = cliclack::confirm(
+            "Are you sure you want sigstore.verify = off for every install on this machine?",
+        )
+        .initial_value(false)
+        .interact()
+        .map_err(prompt_err)?;
+        if !confirmed {
+            println!("  Aborted. No config change.");
+            return Ok(());
+        }
+    }
+
+    persist_sigstore_verify(config_path, new_value)?;
+    announce_sigstore_set(new_value, json_output);
+    Ok(())
+}
+
+/// Read the `[sigstore] verify` value from `~/.lpm/config.toml`.
+/// Returns `None` for missing file, missing section, or missing key.
+/// Mirrors [`read_sandbox_mode`] in shape.
+fn read_sigstore_verify(config_path: &std::path::Path) -> Result<Option<String>, LpmError> {
+    let cfg = read_config(config_path)?;
+    Ok(cfg
+        .get("sigstore")
+        .and_then(|v| v.as_table())
+        .and_then(|t| t.get("verify"))
+        .and_then(|v| v.as_str())
+        .map(String::from))
+}
+
+/// Persist the resolved sigstore verify mode into `[sigstore] verify`
+/// in the config file. Creates the `[sigstore]` table if absent;
+/// preserves any sibling keys (future trust-root override path, etc.)
+/// untouched. Mirrors [`persist_sandbox_mode`] in shape.
+fn persist_sigstore_verify(config_path: &std::path::Path, value: &str) -> Result<(), LpmError> {
+    let mut cfg = read_config(config_path)?;
+    let top = cfg.as_table_mut().ok_or_else(|| {
+        LpmError::Registry("config.toml must be a TOML table at the top level".into())
+    })?;
+    let sigstore_section = top
+        .entry("sigstore".to_string())
+        .or_insert_with(|| toml::Value::Table(toml::map::Map::new()));
+    let sigstore_table = sigstore_section.as_table_mut().ok_or_else(|| {
+        LpmError::Registry(format!(
+            "{}: `[sigstore]` is not a TOML table — refusing to clobber",
+            config_path.display(),
+        ))
+    })?;
+    sigstore_table.insert("verify".to_string(), toml::Value::String(value.to_string()));
+    write_config(config_path, &cfg)
+}
+
+fn announce_sigstore_set(value: &str, json_output: bool) {
+    if json_output {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "success": true,
+                "sigstore": { "verify": value },
+            }))
+            .unwrap()
+        );
+    } else {
+        output::success(&format!("Set [sigstore] verify = {}", value.bold()));
+    }
+}
+
 /// Disclosure printed after `triage-advisor = <value>` is persisted
 /// (via either `--set` or interactive). This describes the
 /// actual install-time contract:
@@ -970,5 +1125,140 @@ mod wizard_tests {
         };
         let cfg = GlobalConfig { table };
         assert!(cfg.get_sigstore_verify().is_none());
+    }
+
+    // ── Phase 2.6: lpm config sigstore wizard (--set path) ──────
+
+    /// `--set deny|warn|off` persists into `[sigstore] verify` and
+    /// round-trips through `read_sigstore_verify`. Three values, one
+    /// test — keeps the persistence-shape contract pinned in one
+    /// place.
+    #[tokio::test]
+    async fn sigstore_wizard_set_persists_each_valid_value() {
+        for v in ["deny", "warn", "off"] {
+            let (_dir, path) = tmp_config();
+            run_sigstore_wizard(&path, Some(v), true).await.unwrap();
+            assert_eq!(
+                read_sigstore_verify(&path).unwrap().as_deref(),
+                Some(v),
+                "value '{v}' must round-trip through [sigstore] verify",
+            );
+        }
+    }
+
+    /// `--set <unknown>` errors with a message that lists the three
+    /// valid values so the operator can self-correct without
+    /// consulting docs.
+    #[tokio::test]
+    async fn sigstore_wizard_set_rejects_invalid_value() {
+        let (_dir, path) = tmp_config();
+        let err = run_sigstore_wizard(&path, Some("yolo"), true)
+            .await
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("invalid sigstore verify mode 'yolo'"), "got: {msg}");
+        assert!(msg.contains("deny"), "error must list 'deny' as a valid value: {msg}");
+        assert!(msg.contains("warn"), "error must list 'warn' as a valid value: {msg}");
+        assert!(msg.contains("off"), "error must list 'off' as a valid value: {msg}");
+        // Nothing persisted on validation failure.
+        assert!(read_sigstore_verify(&path).unwrap().is_none());
+    }
+
+    /// JSON envelope shape for the announce-set path — mirrors the
+    /// sandbox / scripts wizards so agents can branch on the same
+    /// `{success, sigstore: {verify}}` field structure.
+    #[tokio::test]
+    async fn sigstore_wizard_json_envelope_shape() {
+        let (_dir, path) = tmp_config();
+        // Capturing stdout cleanly in a unit test is awkward; this test
+        // pins that `--set` + json_output returns Ok and the
+        // persistence still happens. The envelope shape itself is
+        // pinned by hand-inspection of `announce_sigstore_set`.
+        run_sigstore_wizard(&path, Some("warn"), true)
+            .await
+            .expect("--set with json_output=true must not error");
+        assert_eq!(
+            read_sigstore_verify(&path).unwrap().as_deref(),
+            Some("warn"),
+            "JSON path must still persist before announcing",
+        );
+    }
+
+    /// Persisting sigstore.verify must not clobber sibling keys
+    /// under `[sigstore]` (room for future trust-root overrides, etc.)
+    /// nor unrelated top-level entries. This is the same defensive
+    /// guarantee the sandbox wizard pins.
+    #[tokio::test]
+    async fn sigstore_wizard_preserves_other_keys() {
+        let (_dir, path) = tmp_config();
+        std::fs::write(
+            &path,
+            "script-policy = \"triage\"\n\n[sandbox]\nmode = \"strict\"\n\n[sigstore]\ntrust-root-override = \"/path/to/custom-root.json\"\n",
+        )
+        .unwrap();
+        run_sigstore_wizard(&path, Some("off"), true).await.unwrap();
+
+        let cfg = read_config(&path).unwrap();
+        let table = cfg.as_table().unwrap();
+        // Sigstore verify landed.
+        assert_eq!(
+            table
+                .get("sigstore")
+                .and_then(|v| v.as_table())
+                .and_then(|t| t.get("verify"))
+                .and_then(|v| v.as_str()),
+            Some("off"),
+        );
+        // Sibling [sigstore].trust-root-override preserved.
+        assert_eq!(
+            table
+                .get("sigstore")
+                .and_then(|v| v.as_table())
+                .and_then(|t| t.get("trust-root-override"))
+                .and_then(|v| v.as_str()),
+            Some("/path/to/custom-root.json"),
+            "sibling [sigstore] keys must survive — wizard must not clobber them",
+        );
+        // Unrelated top-level keys preserved.
+        assert_eq!(
+            table.get("script-policy").and_then(|v| v.as_str()),
+            Some("triage"),
+        );
+        assert_eq!(
+            table
+                .get("sandbox")
+                .and_then(|v| v.as_table())
+                .and_then(|t| t.get("mode"))
+                .and_then(|v| v.as_str()),
+            Some("strict"),
+        );
+    }
+
+    /// Defensive: refuse to clobber a non-table `sigstore` top-level
+    /// value (operator wrote `sigstore = "foo"`). Honest error >
+    /// silent migration on a typed config knob. Mirrors the
+    /// sandbox wizard's equivalent guard.
+    #[tokio::test]
+    async fn sigstore_wizard_refuses_to_clobber_non_table_sigstore_key() {
+        let (_dir, path) = tmp_config();
+        std::fs::write(&path, "sigstore = \"not-a-table\"\n").unwrap();
+        let err = run_sigstore_wizard(&path, Some("warn"), true)
+            .await
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("not a TOML table"), "got: {msg}");
+    }
+
+    /// Overwrite path: setting twice must end on the second value.
+    /// Pins idempotent re-runs.
+    #[tokio::test]
+    async fn sigstore_wizard_overwrites_existing_value() {
+        let (_dir, path) = tmp_config();
+        run_sigstore_wizard(&path, Some("warn"), true).await.unwrap();
+        run_sigstore_wizard(&path, Some("deny"), true).await.unwrap();
+        assert_eq!(
+            read_sigstore_verify(&path).unwrap().as_deref(),
+            Some("deny"),
+        );
     }
 }
