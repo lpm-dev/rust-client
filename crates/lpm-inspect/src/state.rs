@@ -52,6 +52,23 @@ struct Inner {
     pub local_port: u16,
     /// The tunnel URL (set after connection).
     pub tunnel_url: RwLock<Option<String>>,
+    /// Per-process random auth token gating every `/api/*` route.
+    /// Loopback binding stops remote attackers; the token stops same-host
+    /// other-UID attackers (CI runners, dev containers, multi-user laptops)
+    /// from reading captured webhook bodies and replaying them against
+    /// arbitrary localhost ports.
+    auth_token: String,
+}
+
+fn generate_auth_token() -> String {
+    use rand::RngCore;
+    let mut bytes = [0u8; 32];
+    rand::thread_rng().fill_bytes(&mut bytes);
+    let mut hex = String::with_capacity(64);
+    for b in bytes {
+        hex.push_str(&format!("{b:02x}"));
+    }
+    hex
 }
 
 impl InspectorState {
@@ -69,6 +86,7 @@ impl InspectorState {
                 session_id: RwLock::new(None),
                 local_port,
                 tunnel_url: RwLock::new(None),
+                auth_token: generate_auth_token(),
             }),
         }
     }
@@ -87,8 +105,16 @@ impl InspectorState {
                 session_id: RwLock::new(None),
                 local_port,
                 tunnel_url: RwLock::new(None),
+                auth_token: generate_auth_token(),
             }),
         }
+    }
+
+    /// The per-process auth token required on every `/api/*` request.
+    /// Surfaced via the bound URL (`?token=...`) and as a constant-time
+    /// equality target inside the auth middleware.
+    pub fn auth_token(&self) -> &str {
+        &self.inner.auth_token
     }
 
     /// Push a captured request into the buffer, broadcast to SSE, and persist to SQLite.

@@ -23,6 +23,9 @@ base64 = { workspace = true }
 reqwest = { workspace = true }
 rusqlite = { version = "0.34", features = ["bundled"] }
 chrono = { workspace = true }
+rand = { workspace = true }
+subtle = "2"
+tower = "0.5"
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

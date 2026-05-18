@@ -6,6 +6,15 @@ mod integration_tests {
     use lpm_tunnel::webhook::CapturedWebhook;
     use std::collections::HashMap;
 
+    /// Build a URL carrying the per-process auth token via the query
+    /// param. Mirrors what the browser-side UI does after the cookie
+    /// handoff — keeps each test focused on its endpoint contract
+    /// rather than the auth wiring.
+    fn url_with_token(port: u16, path: &str, token: &str) -> String {
+        let sep = if path.contains('?') { '&' } else { '?' };
+        format!("http://127.0.0.1:{port}{path}{sep}token={token}")
+    }
+
     fn make_webhook(id: &str, status: u16) -> CapturedWebhook {
         CapturedWebhook {
             id: id.to_string(),
@@ -226,7 +235,7 @@ mod integration_tests {
         // Give the server a moment to start
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
-        let resp = reqwest::get(format!("http://127.0.0.1:{port}/api/status"))
+        let resp = reqwest::get(url_with_token(port, "/api/status", state.auth_token()))
             .await
             .unwrap();
         assert_eq!(resp.status(), 200);
@@ -254,7 +263,7 @@ mod integration_tests {
         state.push(make_webhook("w1", 200)).await;
         state.push(make_webhook("w2", 500)).await;
 
-        let resp = reqwest::get(format!("http://127.0.0.1:{port}/api/requests"))
+        let resp = reqwest::get(url_with_token(port, "/api/requests", state.auth_token()))
             .await
             .unwrap();
         assert_eq!(resp.status(), 200);
@@ -283,7 +292,7 @@ mod integration_tests {
 
         state.push(make_webhook("w1", 200)).await;
 
-        let resp = reqwest::get(format!("http://127.0.0.1:{port}/api/requests/w1"))
+        let resp = reqwest::get(url_with_token(port, "/api/requests/w1", state.auth_token()))
             .await
             .unwrap();
         assert_eq!(resp.status(), 200);
@@ -312,9 +321,13 @@ mod integration_tests {
 
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
-        let resp = reqwest::get(format!("http://127.0.0.1:{port}/api/requests/nonexistent"))
-            .await
-            .unwrap();
+        let resp = reqwest::get(url_with_token(
+            port,
+            "/api/requests/nonexistent",
+            state.auth_token(),
+        ))
+        .await
+        .unwrap();
         assert_eq!(resp.status(), 404);
 
         handle.shutdown();
@@ -341,9 +354,13 @@ mod integration_tests {
         state.push(w1).await;
         state.push(w2).await;
 
-        let resp = reqwest::get(format!("http://127.0.0.1:{port}/api/diff/diff-a/diff-b"))
-            .await
-            .unwrap();
+        let resp = reqwest::get(url_with_token(
+            port,
+            "/api/diff/diff-a/diff-b",
+            state.auth_token(),
+        ))
+        .await
+        .unwrap();
         assert_eq!(resp.status(), 200);
 
         let body: serde_json::Value = resp.json().await.unwrap();
@@ -371,10 +388,159 @@ mod integration_tests {
 
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
-        let resp = reqwest::get(format!("http://127.0.0.1:{port}/api/diff/nope1/nope2"))
+        let resp = reqwest::get(url_with_token(
+            port,
+            "/api/diff/nope1/nope2",
+            state.auth_token(),
+        ))
+        .await
+        .unwrap();
+        assert_eq!(resp.status(), 404);
+
+        handle.shutdown();
+    }
+
+    #[tokio::test]
+    async fn api_rejects_unauthenticated_request() {
+        // Loopback binding alone is not enough on shared boxes (CI
+        // runners, dev containers, Codespaces). Hitting any `/api/*`
+        // path without the per-process token must return 401.
+        let state = InspectorState::new(3000);
+        let port = 14_408;
+        let handle = match crate::start(state.clone(), port).await {
+            Ok(h) => h,
+            Err(_) => return,
+        };
+
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let resp = reqwest::get(format!("http://127.0.0.1:{port}/api/status"))
             .await
             .unwrap();
-        assert_eq!(resp.status(), 404);
+        assert_eq!(resp.status(), 401);
+
+        handle.shutdown();
+    }
+
+    #[tokio::test]
+    async fn api_rejects_wrong_token() {
+        let state = InspectorState::new(3000);
+        let port = 14_409;
+        let handle = match crate::start(state.clone(), port).await {
+            Ok(h) => h,
+            Err(_) => return,
+        };
+
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let resp = reqwest::get(format!(
+            "http://127.0.0.1:{port}/api/status?token=wrongtoken"
+        ))
+        .await
+        .unwrap();
+        assert_eq!(resp.status(), 401);
+
+        handle.shutdown();
+    }
+
+    #[tokio::test]
+    async fn api_rejects_cookie_auth() {
+        // Cookies on 127.0.0.1 are host-scoped, not port-scoped per
+        // RFC 6265. A cookie set at `:4400` would be sent to every
+        // other localhost service. The auth middleware must NOT
+        // accept the `lpm_inspector_token` cookie even if presented.
+        let state = InspectorState::new(3000);
+        let port = 14_411;
+        let handle = match crate::start(state.clone(), port).await {
+            Ok(h) => h,
+            Err(_) => return,
+        };
+
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let client = reqwest::Client::new();
+        let resp = client
+            .get(format!("http://127.0.0.1:{port}/api/status"))
+            .header(
+                "Cookie",
+                format!("lpm_inspector_token={}", state.auth_token()),
+            )
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 401);
+
+        handle.shutdown();
+    }
+
+    #[tokio::test]
+    async fn ui_html_response_does_not_set_inspector_cookie() {
+        // Whatever the SPA needs to remember the token, it must not be
+        // a cookie — see api_rejects_cookie_auth for the rationale.
+        let state = InspectorState::new(3000);
+        let port = 14_412;
+        let handle = match crate::start(state.clone(), port).await {
+            Ok(h) => h,
+            Err(_) => return,
+        };
+
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let resp = reqwest::get(format!(
+            "http://127.0.0.1:{port}/?token={}",
+            state.auth_token()
+        ))
+        .await
+        .unwrap();
+        assert_eq!(resp.status(), 200);
+        for (name, value) in resp.headers().iter() {
+            if name.as_str().eq_ignore_ascii_case("set-cookie") {
+                let v = value.to_str().unwrap_or("");
+                assert!(
+                    !v.contains("lpm_inspector_token"),
+                    "inspector must not set an auth-token cookie; got: {v}"
+                );
+            }
+        }
+        let body = resp.text().await.unwrap();
+        // Bootstrap script must be present so the SPA can attach the
+        // token to its fetches without relying on the cookie channel.
+        assert!(
+            body.contains("sessionStorage.setItem(\"lpm_inspector_token\""),
+            "expected SPA bootstrap to set sessionStorage; body sample: {}",
+            &body[..body.len().min(400)]
+        );
+        assert!(
+            body.contains("Authorization"),
+            "expected SPA bootstrap to patch fetch with Authorization header"
+        );
+        assert!(
+            body.contains("EventSource"),
+            "expected SPA bootstrap to patch EventSource"
+        );
+
+        handle.shutdown();
+    }
+
+    #[tokio::test]
+    async fn api_accepts_bearer_header() {
+        let state = InspectorState::new(3000);
+        let port = 14_410;
+        let handle = match crate::start(state.clone(), port).await {
+            Ok(h) => h,
+            Err(_) => return,
+        };
+
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let client = reqwest::Client::new();
+        let resp = client
+            .get(format!("http://127.0.0.1:{port}/api/status"))
+            .bearer_auth(state.auth_token())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
 
         handle.shutdown();
     }

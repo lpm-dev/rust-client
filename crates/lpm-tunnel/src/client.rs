@@ -879,9 +879,27 @@ async fn try_connect(
 
                                         // Run signature diagnostics on failed webhook responses.
                                         // Only runs when status >= 400, so zero overhead on success.
+                                        //
+                                        // Explicit allowlist: pulling the entire process env into
+                                        // a HashMap and handing it to the diagnostic was a
+                                        // future-footgun — a later contributor extending the
+                                        // diagnostic to "log a hint about which env vars are set"
+                                        // would silently start leaking unrelated secrets through
+                                        // tunnel diagnostics. Only the names the diagnostic
+                                        // actually consumes get copied in.
                                         if captured.response_status >= 400 {
-                                            let env_vars: HashMap<String, String> =
-                                                std::env::vars().collect();
+                                            const DIAGNOSTIC_ENV_ALLOWLIST: &[&str] = &[
+                                                "STRIPE_WEBHOOK_SECRET",
+                                                "STRIPE_SIGNING_SECRET",
+                                                "GITHUB_WEBHOOK_SECRET",
+                                            ];
+                                            let mut env_vars: HashMap<String, String> =
+                                                HashMap::new();
+                                            for name in DIAGNOSTIC_ENV_ALLOWLIST {
+                                                if let Ok(v) = std::env::var(name) {
+                                                    env_vars.insert((*name).to_string(), v);
+                                                }
+                                            }
                                             captured.signature_diagnostic =
                                                 webhook_signature::diagnose_signature_failure(
                                                     &captured, &env_vars,

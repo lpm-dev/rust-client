@@ -137,6 +137,34 @@ const STRIPPED_ENV_PATTERNS: &[&str] = &[
     "PERL5LIB",
     "RUBYOPT",
     "RUBYLIB",
+    // Rust toolchain hijack vectors.
+    //
+    // - `RUSTC_BOOTSTRAP` — lets a stable rustc enable nightly-only
+    //   features mid-build.
+    // - `RUSTC_WRAPPER` — replaces the rustc binary with an arbitrary
+    //   user-supplied executable (sccache uses this legitimately, but
+    //   a postinstall script can't reasonably need to set it for a
+    //   downstream package).
+    // - `RUSTC_WORKSPACE_WRAPPER` — same as RUSTC_WRAPPER but applied
+    //   only when compiling the workspace's own crates. Per Cargo
+    //   docs, a single-package project counts as a workspace, so this
+    //   covers every realistic build shape.
+    // - `CARGO_BUILD_RUSTC_WRAPPER` and `CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER`
+    //   — the `[build].rustc-wrapper` / `[build].rustc-workspace-wrapper`
+    //   config keys as env vars (per Cargo's
+    //   `CARGO_BUILD_*` → `[build].*` mapping). Stripping the direct
+    //   `RUSTC_WRAPPER` variant alone leaves these as alternative
+    //   attacker channels — a lifecycle script that invokes `cargo
+    //   build` can still route rustc through an attacker binary.
+    //
+    // `RUSTC` and `CARGO` are intentionally NOT in the list — rustup
+    // sets them to its proxy binaries and stripping would break
+    // legitimate builds.
+    "RUSTC_BOOTSTRAP",
+    "RUSTC_WRAPPER",
+    "RUSTC_WORKSPACE_WRAPPER",
+    "CARGO_BUILD_RUSTC_WRAPPER",
+    "CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER",
 ];
 
 /// Env var suffix patterns — any var ending with these is stripped.
@@ -3351,6 +3379,39 @@ mod tests {
             assert!(
                 !env.contains_key(hijack),
                 "{hijack} must be stripped from lifecycle env"
+            );
+        }
+    }
+
+    /// Every Cargo channel that can replace `rustc` with an attacker
+    /// binary — the direct `RUSTC_*` variants and the `CARGO_BUILD_*`
+    /// config-as-env aliases — must be stripped. Per Cargo's env-var
+    /// docs the four are equivalent for `cargo build`, so a denylist
+    /// that catches only one leaves the others as a wrapper-injection
+    /// channel for any lifecycle script that touches Rust.
+    #[test]
+    fn sanitized_env_strips_cargo_rustc_wrapper_variants() {
+        let _env = crate::test_env::ScopedEnv::set([
+            ("RUSTC_BOOTSTRAP", "1".into()),
+            ("RUSTC_WRAPPER", "/dev/null/rustc-shim".into()),
+            ("RUSTC_WORKSPACE_WRAPPER", "/dev/null/rustc-shim".into()),
+            ("CARGO_BUILD_RUSTC_WRAPPER", "/dev/null/rustc-shim".into()),
+            (
+                "CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER",
+                "/dev/null/rustc-shim".into(),
+            ),
+        ]);
+        let env = build_sanitized_env();
+        for name in [
+            "RUSTC_BOOTSTRAP",
+            "RUSTC_WRAPPER",
+            "RUSTC_WORKSPACE_WRAPPER",
+            "CARGO_BUILD_RUSTC_WRAPPER",
+            "CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER",
+        ] {
+            assert!(
+                !env.contains_key(name),
+                "{name} must be stripped from lifecycle env (rustc-wrapper hijack)"
             );
         }
     }

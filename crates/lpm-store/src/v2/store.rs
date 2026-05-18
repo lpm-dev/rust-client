@@ -1335,31 +1335,26 @@ fn materialize_into(src: &Path, dst: &Path) -> Result<(), LpmError> {
         if file_type.is_dir() {
             materialize_into(&src_path, &dst_path)?;
         } else if file_type.is_symlink() {
-            // Symlinks inside the object dir (rare — registry tarballs
-            // can contain them) round-trip as symlinks, not their
-            // dereferenced targets. Anything else would diverge from
-            // the tarball's intent.
-            let target = std::fs::read_link(&src_path).map_err(|e| {
-                LpmError::Store(format!(
-                    "failed to read v2 source symlink {}: {e}",
-                    src_path.display()
-                ))
-            })?;
-            #[cfg(unix)]
-            std::os::unix::fs::symlink(&target, &dst_path).map_err(|e| {
-                LpmError::Store(format!(
-                    "failed to create v2 dest symlink {} → {}: {e}",
-                    dst_path.display(),
-                    target.display()
-                ))
-            })?;
-            #[cfg(windows)]
-            {
-                let _ = target; // file-vs-dir distinction unused here
-                return Err(LpmError::Store(
-                    "v2 source symlinks are not yet supported on Windows".into(),
-                ));
-            }
+            // Refuse to round-trip symlinks into the link entry. The
+            // registry extractor (lpm-extractor `is_file()` filter)
+            // already rejects symlinks at extract time, so a well-
+            // behaved object dir never carries them; if one IS present,
+            // a same-UID attacker (parallel-test runner, prior
+            // compromised lifecycle script under `script-policy = allow`,
+            // future code path landing content in `objects/` outside
+            // the extractor) planted it. Following the link target
+            // through to `node_modules/<pkg>/<entry>` would let a
+            // consumer's `require('<pkg>/<entry>')` read `/etc/passwd`
+            // or any same-UID-readable file. Symmetric with the v1→v2
+            // `copy_dir_recursively` symlink refusal.
+            let target = std::fs::read_link(&src_path).unwrap_or_default();
+            return Err(LpmError::Store(format!(
+                "refusing to materialize v2 symlink entry {} → {} — symlinks must \
+                 not appear under objects/; report this as a defense-in-depth \
+                 trip if you can reproduce it",
+                src_path.display(),
+                target.display(),
+            )));
         } else if let Err(e) = std::fs::hard_link(&src_path, &dst_path) {
             tracing::trace!(
                 src = %src_path.display(),

@@ -380,6 +380,29 @@ pub(crate) unsafe fn apply_secret_overlay_in_child(spec: &SecretOverlaySpec) {
             );
         }
     }
+
+    // Step 5: remount /proc with `hidepid=2,subset=pid` so the sandbox
+    // can no longer enumerate other same-UID processes (`/proc/<pid>/
+    // environ`, `/proc/<pid>/cmdline`) or read its own JIT/address
+    // layout (`/proc/self/maps`, `dd if=/proc/self/exe`). The
+    // landlock layer grants `/proc` Read wholesale; without this
+    // remount that's a same-UID introspection oracle for every
+    // gpg-agent / ssh-agent / browser / IDE process the user runs.
+    //
+    // Best-effort: failure (kernel without procfs subset support,
+    // mount blocked by LSM) leaves the broader sandbox intact.
+    const PROC_PATH: &[u8] = b"/proc\0";
+    const PROC_FSTYPE: &[u8] = b"proc\0";
+    const PROC_OPTS: &[u8] = b"hidepid=2,subset=pid\0";
+    unsafe {
+        libc::mount(
+            PROC_FSTYPE.as_ptr() as *const libc::c_char,
+            PROC_PATH.as_ptr() as *const libc::c_char,
+            PROC_FSTYPE.as_ptr() as *const libc::c_char,
+            libc::MS_REMOUNT | libc::MS_NOSUID | libc::MS_NODEV | libc::MS_NOEXEC,
+            PROC_OPTS.as_ptr() as *const libc::c_void,
+        );
+    }
 }
 
 /// AS-safe `write_all`-style helper for `/proc/self/*` files.

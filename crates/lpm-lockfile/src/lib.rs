@@ -293,6 +293,51 @@ impl LockedPackage {
             Some(Ok(_)) => false,
         }
     }
+
+    /// Returns `Some(url)` if this is a `@lpm.dev/*` scoped package whose
+    /// Registry source URL is NOT on the lpm.dev origin (or
+    /// http://localhost for dev). Returns `None` for non-scoped packages,
+    /// non-Registry sources, or correctly-scoped URLs.
+    ///
+    /// Hard-pin defense: `evaluate_cached_url` already gates a URL by
+    /// scheme + shape + per-client configured origin set, but the
+    /// configured-origin set legitimately contains BOTH lpm.dev and
+    /// `registry.npmjs.org` so a tampered lockfile with `@lpm.dev/foo.bar`
+    /// pointed at npm.org would slip through. Scoped names should never
+    /// resolve through a non-lpm origin regardless of the wider
+    /// configured set.
+    pub fn lpm_scope_origin_mismatch(&self) -> Option<String> {
+        if !self.name.starts_with("@lpm.dev/") {
+            return None;
+        }
+        let Some(Ok(Source::Registry { url })) = self.source_kind() else {
+            return None;
+        };
+        if is_lpm_origin(&url) { None } else { Some(url) }
+    }
+}
+
+/// Whether `url` is on a recognized LPM origin: `https://lpm.dev` (and
+/// known subdomain shapes), or `http://localhost[:port]` / `http://
+/// 127.0.0.1[:port]` for local dev. Conservative on purpose — a stray
+/// `https://lpm.dev.evil.com` must NOT pass.
+fn is_lpm_origin(url_str: &str) -> bool {
+    let Ok(parsed) = url::Url::parse(url_str) else {
+        return false;
+    };
+    let scheme = parsed.scheme();
+    let host = match parsed.host_str() {
+        Some(h) => h.to_ascii_lowercase(),
+        None => return false,
+    };
+
+    if scheme == "https" {
+        return host == "lpm.dev" || host.ends_with(".lpm.dev");
+    }
+    if scheme == "http" {
+        return host == "localhost" || host == "127.0.0.1";
+    }
+    false
 }
 
 /// Default resolver-name string baked into [`Lockfile::new`]. Matches
@@ -437,9 +482,43 @@ impl Lockfile {
                     package: pkg.name.clone(),
                 });
             }
+
+            // Scope-pin `@lpm.dev/*` to the lpm.dev origin. A VCS-write
+            // attacker who edits `lpm.lock` to redirect an LPM-scoped
+            // package to a non-LPM registry (matching the SRI to their
+            // malicious tarball) gets rejected here before any fetch.
+            // The same guard runs on the binary fast path via
+            // `validate_loaded_packages` so the .lockb form can't bypass.
+            if let Some(url) = pkg.lpm_scope_origin_mismatch() {
+                return Err(LockfileError::InvalidScopeOrigin {
+                    package: pkg.name.clone(),
+                    url,
+                });
+            }
         }
 
         Ok(lockfile)
+    }
+
+    /// Run package-shape invariants that must hold on BOTH the TOML and
+    /// binary fast-path read sides. Currently:
+    /// - `@lpm.dev/*` scope-pinning to the lpm.dev origin (matches the
+    ///   per-package check inside [`Lockfile::from_toml`]).
+    ///
+    /// The binary reader (`crates/lpm-lockfile/src/binary.rs`) calls
+    /// this after materializing each `LockedPackage` so a tampered
+    /// `lpm.lockb` with an off-origin `@lpm.dev/*` entry can't slip
+    /// past while only the TOML path enforces the invariant.
+    pub fn validate_loaded_packages(packages: &[LockedPackage]) -> Result<(), LockfileError> {
+        for pkg in packages {
+            if let Some(url) = pkg.lpm_scope_origin_mismatch() {
+                return Err(LockfileError::InvalidScopeOrigin {
+                    package: pkg.name.clone(),
+                    url,
+                });
+            }
+        }
+        Ok(())
     }
 
     /// Write lockfile to disk atomically (write to .tmp, then rename).
@@ -528,7 +607,16 @@ impl Lockfile {
 
             if use_binary {
                 match BinaryLockfileReader::open(&binary_path) {
-                    Ok(Some(reader)) => return Ok(reader.to_lockfile()),
+                    Ok(Some(reader)) => {
+                        if let Ok(lockfile) = reader.to_lockfile() {
+                            return Ok(lockfile);
+                        }
+                        // Binary failed a cross-format invariant
+                        // (e.g., scope-pin). Fall through to TOML so the
+                        // same defect surfaces against the reviewer-
+                        // visible source rather than as an opaque
+                        // binary-only error.
+                    }
                     Err(LockfileError::UnsupportedVersion { found, .. })
                         if found < binary::BINARY_VERSION =>
                     {
@@ -704,6 +792,25 @@ pub enum LockfileError {
          the hint is valid only for Registry sources"
     )]
     InvalidTarballHint { package: String },
+
+    /// A `@lpm.dev/*` scoped package is paired with a registry source URL
+    /// whose origin is not lpm.dev. This is a scope-pinning violation —
+    /// LPM-scoped packages must always come from the LPM origin (or
+    /// http://localhost for dev), regardless of what other registries
+    /// the resolver is otherwise allowed to talk to.
+    ///
+    /// Defends against a VCS-write attacker (compromised collaborator,
+    /// supply-chain on a pre-commit hook, pull-request auto-merge bot)
+    /// who edits `lpm.lock` to redirect a `@lpm.dev/*` entry to an
+    /// attacker-controlled registry and matches the SRI to their
+    /// malicious tarball. The hard-fail at lockfile load is stricter
+    /// than `evaluate_cached_url`'s shape-and-set check.
+    #[error(
+        "package {package:?} is in the @lpm.dev scope but its source URL {url:?} \
+         is not on the lpm.dev origin — refusing to use an off-origin URL for an \
+         LPM-scoped package"
+    )]
+    InvalidScopeOrigin { package: String, url: String },
 }
 
 #[cfg(test)]
@@ -1942,6 +2049,106 @@ version = "1.0.0"
         ));
         let toml = lf.to_toml().expect("serialize");
         Lockfile::from_toml(&toml).expect("registry+hint must parse cleanly post-gate");
+    }
+
+    #[test]
+    fn from_toml_rejects_lpm_scope_pointed_at_non_lpm_origin() {
+        let toml = "[metadata]\n\
+             lockfile-version = 1\n\
+             \n\
+             [[packages]]\n\
+             name = \"@lpm.dev/alice.utils\"\n\
+             version = \"1.0.0\"\n\
+             source = \"registry+https://registry.npmjs.org\"\n";
+        match Lockfile::from_toml(toml) {
+            Err(LockfileError::InvalidScopeOrigin { package, url }) => {
+                assert_eq!(package, "@lpm.dev/alice.utils");
+                assert_eq!(url, "https://registry.npmjs.org");
+            }
+            other => panic!("expected InvalidScopeOrigin, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn from_toml_rejects_lpm_scope_at_lookalike_origin() {
+        // `lpm.dev.evil.com` ends with the literal `.lpm.dev` prefix only
+        // by accident — the host comparator must use exact `lpm.dev`
+        // or `*.lpm.dev` matching, not endswith-of-substring.
+        let toml = "[metadata]\n\
+             lockfile-version = 1\n\
+             \n\
+             [[packages]]\n\
+             name = \"@lpm.dev/alice.utils\"\n\
+             version = \"1.0.0\"\n\
+             source = \"registry+https://lpm.dev.evil.com\"\n";
+        match Lockfile::from_toml(toml) {
+            Err(LockfileError::InvalidScopeOrigin { .. }) => {}
+            other => panic!("expected InvalidScopeOrigin, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn from_toml_accepts_lpm_scope_at_lpm_origin() {
+        let toml = "[metadata]\n\
+             lockfile-version = 1\n\
+             \n\
+             [[packages]]\n\
+             name = \"@lpm.dev/alice.utils\"\n\
+             version = \"1.0.0\"\n\
+             source = \"registry+https://lpm.dev\"\n";
+        Lockfile::from_toml(toml).expect("https://lpm.dev must pass");
+    }
+
+    #[test]
+    fn from_toml_accepts_lpm_scope_at_localhost_for_dev() {
+        let toml = "[metadata]\n\
+             lockfile-version = 1\n\
+             \n\
+             [[packages]]\n\
+             name = \"@lpm.dev/alice.utils\"\n\
+             version = \"1.0.0\"\n\
+             source = \"registry+http://localhost:3000\"\n";
+        Lockfile::from_toml(toml).expect("localhost dev origin must pass");
+    }
+
+    #[test]
+    fn from_toml_accepts_non_lpm_scope_at_any_origin() {
+        // Only @lpm.dev/* is scope-pinned. A normal npm package can
+        // point at any configured registry.
+        let toml = "[metadata]\n\
+             lockfile-version = 1\n\
+             \n\
+             [[packages]]\n\
+             name = \"react\"\n\
+             version = \"19.0.0\"\n\
+             source = \"registry+https://registry.npmjs.org\"\n";
+        Lockfile::from_toml(toml).expect("non-LPM-scope package must pass");
+    }
+
+    #[test]
+    fn validate_loaded_packages_rejects_binary_path_scope_mismatch() {
+        // The binary fast path (`BinaryLockfileReader::to_lockfile`)
+        // routes through `validate_loaded_packages` so a tampered
+        // `lpm.lockb` can't bypass the TOML-side scope-pin gate. Build
+        // a `LockedPackage` directly (the binary reader produces these)
+        // and confirm the cross-format validator fires the same error.
+        let bad = LockedPackage {
+            name: "@lpm.dev/alice.utils".into(),
+            version: "1.0.0".into(),
+            source: Some("registry+https://registry.npmjs.org".into()),
+            integrity: Some("sha512-deadbeef".into()),
+            dependencies: vec![],
+            alias_dependencies: vec![],
+            peers: vec![],
+            tarball: None,
+        };
+        match Lockfile::validate_loaded_packages(&[bad]) {
+            Err(LockfileError::InvalidScopeOrigin { package, url }) => {
+                assert_eq!(package, "@lpm.dev/alice.utils");
+                assert_eq!(url, "https://registry.npmjs.org");
+            }
+            other => panic!("expected InvalidScopeOrigin, got {other:?}"),
+        }
     }
 
     #[test]
