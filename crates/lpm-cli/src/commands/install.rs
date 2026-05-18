@@ -13,7 +13,7 @@ use lpm_resolver::{
 use lpm_store::PackageStore;
 use lpm_workspace::PatchedDependencyEntry;
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::Mutex as AsyncMutex;
@@ -1422,7 +1422,31 @@ impl InstallPackage {
                 // `Option`-returning variant signals "not yet
                 // available" to the offline gate.
                 let abs = project_dir.join(&path);
-                abs.canonicalize().ok()
+                let canonical = abs.canonicalize().ok()?;
+                // L18: warn when the canonical resolution escapes the
+                // project tree. A `link:./packages/foo` whose target
+                // is a symlink pointing at `/etc/secret-pkg` is
+                // technically valid (the lockfile allows it) but the
+                // pattern is surprising enough — and load-bearing for
+                // any "the workspace only references content within
+                // the project tree" assumption — that it deserves a
+                // visible audit signal. Best-effort: only emit when
+                // `project_dir.canonicalize()` succeeds (it usually
+                // does; failures fall through silently).
+                if let Ok(project_canonical) = project_dir.canonicalize()
+                    && !canonical.starts_with(&project_canonical)
+                {
+                    tracing::warn!(
+                        name = %self.name,
+                        version = %self.version,
+                        link_path = %path,
+                        canonical = %canonical.display(),
+                        project_root = %project_canonical.display(),
+                        "link/directory dep resolves to a path outside the project tree \
+                         (likely via a symlink) — confirm this is intentional",
+                    );
+                }
+                Some(canonical)
             }
             _ => Some(store.package_dir(&self.name, &self.version)),
         }
@@ -2004,6 +2028,29 @@ async fn pre_resolve_non_registry_deps(
             )));
         }
 
+        // H7: trust-on-first-use SRI capture. With no declared
+        // integrity, whatever the server returns gets pinned into the
+        // lockfile and trusted on every subsequent install. Surface
+        // the trust posture loudly so the operator sees what they're
+        // agreeing to: the project is now bound to whoever owned the
+        // server at the moment of first install. `--strict-integrity`
+        // above already hard-fails when this is unacceptable; the
+        // warn lands on the default permissive path so silent TOFU
+        // becomes visible TOFU.
+        if declared_integrity.is_none() {
+            tracing::warn!(
+                target: "lpm_cli::install",
+                local_name = %local_name,
+                tarball_url = %url,
+                "tarball+URL dep without declared SRI — trusting whatever the server returns AND pinning the computed hash into lpm.lock (trust-on-first-use). Pin via `#sha512-...` on the URL, or pass `--strict-integrity` to refuse."
+            );
+            if !json_output {
+                output::warn(&format!(
+                    "tarball+URL dep '{local_name}' has no declared SRI — pinning trust-on-first-use to {url}"
+                ));
+            }
+        }
+
         // Step 1+2: download (with optional SRI verify) and extract
         // into the CAS. If the CAS dir already exists for the same
         // computed SRI, store_tarball_at_cas_path's fast path skips
@@ -2052,6 +2099,18 @@ async fn pre_resolve_non_registry_deps(
     // same bytes dedupe. Strict-integrity has no effect here — the
     // content hash IS the integrity, computed every time.
     for (local_name, raw_path) in file_tarball_specs {
+        // Reject relative paths that escape the project root via `..`
+        // components. The lockfile parser allows the `tarball+file:`
+        // shape with `../`, so a tampered manifest could otherwise
+        // read e.g. `/etc/passwd.tgz` into the LPM CAS. Absolute paths
+        // are still accepted because they are an explicit user choice
+        // (shared CI cache, etc.) and don't constitute traversal
+        // surprise.
+        if let Err(reason) = validate_local_tarball_raw_path(&raw_path) {
+            return Err(LpmError::Registry(format!(
+                "dep '{local_name}' has invalid file: path '{raw_path}': {reason}"
+            )));
+        }
         let abs_path = project_dir.join(&raw_path);
 
         // Cap reads at lpm-extractor's hard ceiling (500 MB). A
@@ -2464,6 +2523,32 @@ fn sri_to_sha256_hex(sri: &str) -> Option<String> {
         return None;
     }
     Some(int.hash.iter().map(|b| format!("{b:02x}")).collect())
+}
+
+/// Reject a `tarball+file:<raw_path>` manifest entry whose raw path
+/// contains `..` traversal components. The lockfile parser accepts
+/// the `./` / `../` / `/` shape on this scheme; without this check a
+/// tampered manifest entry like `tarball+file:../../etc/passwd.tgz`
+/// would be read into the LPM CAS as a "package", surfacing arbitrary
+/// host-filesystem content under the store's content-addressable
+/// layout. Absolute paths are still accepted (legitimate shared-cache
+/// pattern) — they're an explicit user choice, not a traversal
+/// surprise.
+fn validate_local_tarball_raw_path(raw_path: &str) -> Result<(), String> {
+    let p = Path::new(raw_path);
+    if p.is_absolute() {
+        return Ok(());
+    }
+    for component in p.components() {
+        if component == Component::ParentDir {
+            return Err(
+                "relative file: path contains `..` component, which is not permitted; \
+                 use an absolute path if the tarball lives outside the project root"
+                    .to_string(),
+            );
+        }
+    }
+    Ok(())
 }
 
 /// Read a local file with a hard byte ceiling, returning the bytes.
@@ -3825,6 +3910,13 @@ async fn run_with_options_under_store_lock(
              security risk.",
             tagged.source, tagged.line
         ));
+    }
+    // M7: project-local `.npmrc` refusals (today: strict-ssl=false)
+    // are surfaced even in JSON mode for the same reason as the
+    // `DISABLED` warning above — agent/CI runs need to see that a
+    // hostile config tried to downgrade TLS, even when it was refused.
+    for w in route_table.npmrc_security_warnings() {
+        output::warn(w);
     }
 
     // `linker_mode` was resolved above — before `check_install_state` —
@@ -5629,34 +5721,39 @@ async fn run_with_options_under_store_lock(
                                 unreachable!("NoDrift is filtered out above")
                             }
                         };
-                        eprintln!("    {}@{} — {}", name, version, kind);
-                        // UX: render `publisher / workflow_path`
-                        // (the identity tuple) plus the approved
-                        // release's `workflow_ref` as a trailing
-                        // "(ref: ...)" hint. The ref is NOT part of
-                        // identity equality (per the Finding 1 fix —
-                        // it varies per release) but surfacing it
-                        // here helps reviewers place the approval
-                        // temporally: "v1.14.0 was signed at
-                        // refs/tags/v1.14.0 via .../publish.yml".
+                        // Registry- and lockfile-supplied identifiers
+                        // pass through `sanitize_for_terminal` before
+                        // hitting the TTY so a crafted name like
+                        // `\x1b]8;;file:///etc/passwd\x07evil\x1b]8;;\x07`
+                        // can't render as a clickable hyperlink or
+                        // mutate the clipboard via OSC 52.
+                        let name_safe = lpm_common::sanitize_for_terminal(name);
+                        let version_safe = lpm_common::sanitize_for_terminal(version);
+                        let approved_version_safe =
+                            lpm_common::sanitize_for_terminal(approved_version);
+                        eprintln!("    {}@{} — {}", name_safe, version_safe, kind);
                         let identity = approved_snap.as_ref().and_then(|s| {
                             match (s.publisher.as_deref(), s.workflow_path.as_deref()) {
-                                (Some(pub_), Some(path)) => Some(format!("{pub_} / {path}")),
-                                (Some(pub_), None) => Some(pub_.to_string()),
+                                (Some(pub_), Some(path)) => Some(format!(
+                                    "{} / {}",
+                                    lpm_common::sanitize_for_terminal(pub_),
+                                    lpm_common::sanitize_for_terminal(path),
+                                )),
+                                (Some(pub_), None) => Some(lpm_common::sanitize_for_terminal(pub_)),
                                 _ => None,
                             }
                         });
                         let ref_hint = approved_snap
                             .as_ref()
                             .and_then(|s| s.workflow_ref.as_deref())
-                            .map(|r| format!(" (ref: {r})"))
+                            .map(|r| format!(" (ref: {})", lpm_common::sanitize_for_terminal(r)))
                             .unwrap_or_default();
                         match identity {
                             Some(ident) => eprintln!(
-                                "      last approved: v{approved_version} via {ident}{ref_hint}",
+                                "      last approved: v{approved_version_safe} via {ident}{ref_hint}",
                             ),
                             None => eprintln!(
-                                "      last approved: v{approved_version} with attestation{ref_hint}",
+                                "      last approved: v{approved_version_safe} with attestation{ref_hint}",
                             ),
                         }
                         if matches!(
@@ -7722,8 +7819,10 @@ fn should_auto_build(
 /// pass a hand-built `HashSet` without constructing a real session.
 fn select_approvals_for_capture(
     auto_build_attempted: bool,
-    approvals: Option<&std::collections::HashSet<(String, String, Option<String>)>>,
-) -> Option<&std::collections::HashSet<(String, String, Option<String>)>> {
+    approvals: Option<
+        &std::collections::HashSet<crate::triage_advisor_session::AdvisorApprovalKey>,
+    >,
+) -> Option<&std::collections::HashSet<crate::triage_advisor_session::AdvisorApprovalKey>> {
     if auto_build_attempted {
         approvals
     } else {
@@ -8417,6 +8516,32 @@ fn try_lockfile_fast_path(
     };
 
     let lockfile = lpm_lockfile::Lockfile::read_fast(lockfile_path).ok()?;
+
+    // L19: scan the lockfile for entries with `http://` sources and
+    // emit a single aggregate warn so re-installs against a lockfile
+    // captured under `--insecure` don't proceed silently. The
+    // per-fetch source-safety check still fires later; this one is
+    // about pre-install audit visibility — operators using
+    // `lpm install` in CI without `--insecure` should see that the
+    // lockfile carries insecure entries before the install runs.
+    let insecure_count = lockfile
+        .packages
+        .iter()
+        .filter(|p| {
+            p.source
+                .as_deref()
+                .is_some_and(|s| s.contains("+http://") || s.starts_with("http://"))
+        })
+        .count();
+    if insecure_count > 0 {
+        tracing::warn!(
+            insecure_count,
+            "lpm.lock contains {insecure_count} package(s) with insecure http:// sources \
+             (recorded by an earlier `--insecure` install); re-installs honour these without \
+             re-prompting. Re-resolve the affected entries against an https:// mirror to \
+             remove the insecure source from the lockfile.",
+        );
+    }
 
     // Validate all package sources are safe (HTTPS registries or
     // localhost). **Round-6:** in offline mode (`accept_unsafe_sources
@@ -11982,6 +12107,58 @@ mod tests {
         LOCK.get_or_init(|| Mutex::new(())).lock().unwrap()
     }
 
+    // ── local-tarball path traversal ─────────────
+
+    /// The classic exploit shape: a manifest entry like
+    /// `"foo": "file:../../../etc/passwd.tgz"` would, pre-fix, resolve
+    /// against `project_dir` and read whatever lives at the resolved
+    /// path into the LPM CAS. Rejecting `..` components at the
+    /// manifest boundary closes that door without touching the legit
+    /// `file:./local.tgz` / `file:/abs/path.tgz` shapes.
+    #[test]
+    fn validate_local_tarball_raw_path_rejects_parent_dir_components() {
+        for path in [
+            "../escape.tgz",
+            "../../escape.tgz",
+            "subdir/../../../escape.tgz",
+            "./../escape.tgz",
+        ] {
+            let err = validate_local_tarball_raw_path(path)
+                .err()
+                .unwrap_or_else(|| panic!("expected reject for {path}"));
+            assert!(err.contains("`..`"), "path {path:?} got: {err}");
+        }
+    }
+
+    #[test]
+    fn validate_local_tarball_raw_path_accepts_relative_within_project() {
+        for path in [
+            "local.tgz",
+            "./local.tgz",
+            "subdir/local.tgz",
+            "./subdir/nested/local.tgz",
+        ] {
+            assert!(
+                validate_local_tarball_raw_path(path).is_ok(),
+                "path {path:?} must be accepted"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_local_tarball_raw_path_accepts_absolute_paths() {
+        // Absolute paths are an explicit user choice (shared CI cache,
+        // CI artifact dir, etc.). The traversal-surprise risk only
+        // applies when the manifest *appears* to stay relative but
+        // sneaks out via `..`.
+        for path in ["/tmp/local.tgz", "/var/cache/lpm/foo.tgz"] {
+            assert!(
+                validate_local_tarball_raw_path(path).is_ok(),
+                "absolute path {path:?} must be accepted"
+            );
+        }
+    }
+
     // ── migration tests ───────────────────────────
 
     #[test]
@@ -12264,6 +12441,7 @@ mod tests {
             "amber-pkg".to_string(),
             "1.0.0".to_string(),
             Some("sha512-x".to_string()),
+            String::new(),
         ));
         assert!(
             select_approvals_for_capture(false, Some(&approvals)).is_none(),
@@ -12279,6 +12457,7 @@ mod tests {
             "amber-pkg".to_string(),
             "1.0.0".to_string(),
             Some("sha512-x".to_string()),
+            String::new(),
         ));
         let view = select_approvals_for_capture(true, Some(&approvals))
             .expect("autoBuild=true MUST forward the approval view");
@@ -12287,6 +12466,7 @@ mod tests {
             "amber-pkg".to_string(),
             "1.0.0".to_string(),
             Some("sha512-x".to_string()),
+            String::new(),
         )));
     }
 
@@ -15033,6 +15213,7 @@ mod tests {
                 captured_at: "unused-in-test".into(),
                 blocked_packages: packages,
                 blocked_set_fingerprint: "unused-in-test".into(),
+                drift_ignore_override: None,
             },
             previous_fingerprint: None,
             should_emit_warning: false,
@@ -15230,6 +15411,7 @@ mod tests {
                 captured_at: "unused-in-test".into(),
                 blocked_packages: packages,
                 blocked_set_fingerprint: "unused-in-test".into(),
+                drift_ignore_override: None,
             },
             previous_fingerprint: None,
             should_emit_warning: false,

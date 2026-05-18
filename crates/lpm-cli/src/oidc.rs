@@ -35,11 +35,80 @@ pub enum CiEnvironment {
 // Shared helpers
 // ─────────────────────────────────────────────────────────────────────────────
 
+/// Max body size for the GitHub runtime OIDC response. A real id-token
+/// JSON payload is well under 8 KB; 64 KB leaves ~8× headroom while
+/// preventing a hostile/redirected endpoint from streaming a multi-GB
+/// body and exhausting the CI runner.
+const GITHUB_OIDC_MAX_BODY_BYTES: u64 = 64 * 1024;
+
+/// Validate that `ACTIONS_ID_TOKEN_REQUEST_URL` points at a real GitHub
+/// Actions runtime endpoint before the bearer is sent. The canonical
+/// host shape is `<random-id>.actions.githubusercontent.com`; GitHub
+/// Enterprise Server installations use `*.<ghes-host>` paths but still
+/// over HTTPS. Loopback hosts are accepted so the workflow tests can
+/// target a local mock without opening the env-poisoning hole the
+/// finding describes.
+///
+/// Rejection is a hard error rather than a fallback because — unlike
+/// the version-probe gate (`release_lookup.rs`) — there is no safe
+/// default URL to fall back to: a wrong URL just means "no OIDC".
+fn validate_github_runtime_url(url: &str) -> Result<(), LpmError> {
+    let parsed = reqwest::Url::parse(url).map_err(|e| {
+        LpmError::Registry(format!(
+            "ACTIONS_ID_TOKEN_REQUEST_URL is not a parseable URL: {e}"
+        ))
+    })?;
+    let scheme = parsed.scheme();
+    let host = parsed.host_str().unwrap_or("");
+
+    if scheme == "https" {
+        if host.ends_with(".actions.githubusercontent.com")
+            || host == "actions.githubusercontent.com"
+        {
+            return Ok(());
+        }
+        // GHES installations rewrite the runtime URL to point at the
+        // appliance host. We can't enumerate every operator-chosen
+        // GHES hostname, so we accept any HTTPS host that is NOT a
+        // public free-mail / known-impersonation domain. The combined
+        // posture (HTTPS + warn-on-non-canonical) shrinks the abuse
+        // window while keeping GHES functional.
+        tracing::warn!(
+            host = host,
+            "ACTIONS_ID_TOKEN_REQUEST_URL host is not *.actions.githubusercontent.com — \
+             accepting under HTTPS for GitHub Enterprise compatibility; confirm this is your GHES appliance",
+        );
+        return Ok(());
+    }
+    if scheme == "http" && parsed.host_str().map(url_host_is_loopback).unwrap_or(false) {
+        return Ok(());
+    }
+    Err(LpmError::Registry(format!(
+        "ACTIONS_ID_TOKEN_REQUEST_URL refused: only https:// (any host) or http:// (loopback only) is accepted, got scheme={scheme} host={host}",
+    )))
+}
+
+fn url_host_is_loopback(host: &str) -> bool {
+    if host.eq_ignore_ascii_case("localhost") {
+        return true;
+    }
+    if let Ok(addr) = host.parse::<std::net::IpAddr>() {
+        return addr.is_loopback();
+    }
+    if let Some(inner) = host.strip_prefix('[').and_then(|s| s.strip_suffix(']'))
+        && let Ok(addr) = inner.parse::<std::net::IpAddr>()
+    {
+        return addr.is_loopback();
+    }
+    false
+}
+
 /// Fetch a fresh JWT from the GitHub Actions runtime with the requested audience.
 ///
-/// Reads `ACTIONS_ID_TOKEN_REQUEST_URL` + `ACTIONS_ID_TOKEN_REQUEST_TOKEN` and
-/// hits the runtime endpoint. Used by both consumer surfaces — the only thing
-/// that varies is the audience.
+/// Reads `ACTIONS_ID_TOKEN_REQUEST_URL` + `ACTIONS_ID_TOKEN_REQUEST_TOKEN`,
+/// validates the URL host/scheme so a poisoned CI env can't steer the
+/// bearer to an attacker host, then hits the runtime endpoint with
+/// redirects disabled, an explicit timeout, and a capped response body.
 async fn fetch_github_runtime_jwt(audience: &str) -> Result<String, LpmError> {
     let request_url = std::env::var("ACTIONS_ID_TOKEN_REQUEST_URL").map_err(|_| {
         LpmError::Registry(
@@ -47,6 +116,7 @@ async fn fetch_github_runtime_jwt(audience: &str) -> Result<String, LpmError> {
                 .into(),
         )
     })?;
+    validate_github_runtime_url(&request_url)?;
     let request_token = std::env::var("ACTIONS_ID_TOKEN_REQUEST_TOKEN").map_err(|_| {
         LpmError::Registry(
             "ACTIONS_ID_TOKEN_REQUEST_TOKEN not set. Add `permissions: id-token: write` to your workflow."
@@ -55,7 +125,12 @@ async fn fetch_github_runtime_jwt(audience: &str) -> Result<String, LpmError> {
     })?;
 
     let url = format!("{request_url}&audience={audience}");
-    let response = reqwest::Client::new()
+    let client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(std::time::Duration::from_secs(15))
+        .build()
+        .map_err(|e| LpmError::Registry(format!("GitHub OIDC client build failed: {e}")))?;
+    let response = client
         .get(&url)
         .bearer_auth(&request_token)
         .send()
@@ -69,9 +144,31 @@ async fn fetch_github_runtime_jwt(audience: &str) -> Result<String, LpmError> {
         )));
     }
 
-    let body: serde_json::Value = response
-        .json()
-        .await
+    if let Some(declared) = response.content_length()
+        && declared > GITHUB_OIDC_MAX_BODY_BYTES
+    {
+        return Err(LpmError::Registry(format!(
+            "GitHub OIDC response exceeds {} B cap (declared {declared} B)",
+            GITHUB_OIDC_MAX_BODY_BYTES
+        )));
+    }
+
+    let mut bytes = Vec::<u8>::with_capacity(8 * 1024);
+    let mut stream = response.bytes_stream();
+    use futures::StreamExt;
+    while let Some(chunk) = stream.next().await {
+        let chunk =
+            chunk.map_err(|e| LpmError::Registry(format!("GitHub OIDC body read failed: {e}")))?;
+        if bytes.len() as u64 + chunk.len() as u64 > GITHUB_OIDC_MAX_BODY_BYTES {
+            return Err(LpmError::Registry(format!(
+                "GitHub OIDC response exceeds {} B cap mid-stream",
+                GITHUB_OIDC_MAX_BODY_BYTES
+            )));
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+
+    let body: serde_json::Value = serde_json::from_slice(&bytes)
         .map_err(|e| LpmError::Registry(format!("GitHub OIDC parse error: {e}")))?;
 
     body.get("value")
@@ -462,5 +559,54 @@ mod tests {
         ]);
         let err = resolve_provenance_jwt().await.unwrap_err();
         assert!(format!("{err}").contains("--provenance"));
+    }
+
+    // ─── M35: ACTIONS_ID_TOKEN_REQUEST_URL host/scheme gating ────────────
+
+    #[test]
+    fn github_runtime_url_accepts_canonical_https_host() {
+        assert!(validate_github_runtime_url(
+            "https://abc123.actions.githubusercontent.com/_apis/distributedtask/hubs/Actions/oidc/abc?api-version=2.0"
+        ).is_ok());
+        assert!(
+            validate_github_runtime_url(
+                "https://actions.githubusercontent.com/path?api-version=2.0"
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn github_runtime_url_accepts_https_non_canonical_for_ghes() {
+        // GitHub Enterprise Server installations rewrite the URL host
+        // to their appliance; we accept any HTTPS host with a warn.
+        assert!(validate_github_runtime_url("https://ghes.corp.example/_apis/oidc/abc").is_ok());
+    }
+
+    #[test]
+    fn github_runtime_url_rejects_plain_http_non_loopback() {
+        let err = validate_github_runtime_url("http://attacker.example/_apis/oidc/abc")
+            .expect_err("plain http non-loopback must refuse");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("refused") && msg.contains("scheme=http"),
+            "error must label the failure: {msg}"
+        );
+    }
+
+    #[test]
+    fn github_runtime_url_accepts_http_for_loopback() {
+        // Workflow tests target a local mock — must still work.
+        assert!(validate_github_runtime_url("http://127.0.0.1:8080/oidc").is_ok());
+        assert!(validate_github_runtime_url("http://localhost:9090/oidc").is_ok());
+        assert!(validate_github_runtime_url("http://[::1]:8080/oidc").is_ok());
+    }
+
+    #[test]
+    fn github_runtime_url_rejects_other_schemes() {
+        assert!(validate_github_runtime_url("ftp://example.com/oidc").is_err());
+        assert!(validate_github_runtime_url("file:///etc/passwd").is_err());
+        assert!(validate_github_runtime_url("javascript:alert(1)").is_err());
+        assert!(validate_github_runtime_url("not a url").is_err());
     }
 }

@@ -57,7 +57,11 @@ fn make_complete_install_root(install_root: &Path, commands: &[&str]) {
             std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o755)).unwrap();
         }
     }
-    std::fs::write(install_root.join("lpm.lock"), b"# valid").unwrap();
+    std::fs::write(
+        install_root.join("lpm.lock"),
+        lpm_global::MINIMAL_VALID_LOCKFILE_TOML,
+    )
+    .unwrap();
     write_marker(
         install_root,
         &InstallReadyMarker::new(commands.iter().map(|command| command.to_string()).collect()),
@@ -97,6 +101,7 @@ fn install_intent(tx_id: &str, package: &str, new_root: &Path, root_relative: &s
         prior_command_ownership_json: serde_json::json!({}),
         new_aliases_json: serde_json::json!({}),
         ownership_delta: Vec::new(),
+        uninstall_trust_prune: Vec::new(),
     }))
 }
 
@@ -572,12 +577,26 @@ fn cli_uninstall_failure_emits_json_error_and_preserves_manifest_state() {
         "the existing shim should still be present after uninstall abort"
     );
 
+    // L50 contract: when shim removal AND restoration both fail (the
+    // 0o555 perm blocks emit_shim too), the transaction is left
+    // unresolved so recovery retries on next invocation. The WAL
+    // Intent stays on disk as the recovery handle; the WAL Abort is
+    // NOT written. Pre-fix the Abort was written regardless, leaving
+    // PATH and manifest divergent with no recovery path.
     let scan = lpm_global::WalReader::at(root.global_wal()).scan().unwrap();
+    assert!(
+        !scan
+            .records
+            .iter()
+            .any(|record| matches!(record, WalRecord::Abort { .. })),
+        "L50: when restoration also fails, WAL Abort must be skipped \
+         so recovery retries — Intent remains the recovery handle"
+    );
     assert!(
         scan.records
             .iter()
-            .any(|record| matches!(record, WalRecord::Abort { .. })),
-        "aborting uninstall must append a WAL abort record"
+            .any(|record| matches!(record, WalRecord::Intent(_))),
+        "Intent must still be present so recovery has the cleanup handle"
     );
 }
 

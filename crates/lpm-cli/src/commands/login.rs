@@ -61,18 +61,9 @@ pub async fn run(registry_url: &str, json_output: bool) -> Result<(), LpmError> 
         hex::encode(bytes)
     };
 
-    // Compute device fingerprint for session auth (Feature 44 Part B)
-    let device_fingerprint = {
-        use sha2::{Digest, Sha256};
-        let hostname = std::env::var("HOSTNAME")
-            .or_else(|_| std::env::var("COMPUTERNAME"))
-            .unwrap_or_else(|_| "unknown".to_string());
-        let username = std::env::var("USER")
-            .or_else(|_| std::env::var("USERNAME"))
-            .unwrap_or_else(|_| "unknown".to_string());
-        let input = format!("{hostname}:{username}:lpm-cli");
-        hex::encode(Sha256::digest(input.as_bytes()))
-    };
+    // Per-install random fingerprint stored at ~/.lpm/device-id; see
+    // `lpm_auth::compute_device_fingerprint` for the L13 rationale.
+    let device_fingerprint = lpm_auth::compute_device_fingerprint();
     let device_name = std::env::var("HOSTNAME")
         .or_else(|_| std::env::var("COMPUTERNAME"))
         .unwrap_or_else(|_| "CLI".to_string());
@@ -343,13 +334,25 @@ async fn handle_callback(
         ("400 Bad Request", render_login_page(false, None))
     };
 
-    let response = format!(
-        "HTTP/1.1 {status}\r\nContent-Type: text/html\r\nConnection: close\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: {}\r\n\r\n{body}",
-        body.len()
-    );
+    let response = format_callback_response(status, &body);
 
     let _ = stream.write_all(response.as_bytes()).await;
     let _ = stream.flush().await;
+}
+
+/// Render the HTTP response served back to the OAuth callback. The
+/// callback is reached by direct browser navigation, not by a
+/// cross-origin `fetch` from another tab, so it sends no
+/// `Access-Control-Allow-Origin` header — that wildcard previously
+/// let any web page the user had open probe the ephemeral callback
+/// port and read the success/failure HTML body (M11). The state-
+/// token check still defeats forged callbacks; this removes the
+/// probe surface entirely.
+fn format_callback_response(status: &str, body: &str) -> String {
+    format!(
+        "HTTP/1.1 {status}\r\nContent-Type: text/html\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{body}",
+        body.len()
+    )
 }
 
 /// Render the login callback HTML page.
@@ -540,4 +543,41 @@ fn render_login_page(success: bool, _username: Option<&str>) -> String {
 </body>
 </html>"#
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// M11: the callback response must NOT carry
+    /// `Access-Control-Allow-Origin: *`. Foreign tabs cannot reach
+    /// `127.0.0.1:<ephemeral>` via direct navigation but they CAN
+    /// issue cross-origin `fetch` requests if the response opts in
+    /// via CORS — the wildcard previously here did exactly that.
+    /// Pinning the absence of the header in a behavioural test
+    /// catches a future regression that re-adds it.
+    #[test]
+    fn callback_response_has_no_cors_wildcard_header() {
+        let resp = format_callback_response("200 OK", "<html>ok</html>");
+        let lower = resp.to_ascii_lowercase();
+        assert!(
+            !lower.contains("access-control-allow-origin"),
+            "callback must not emit any CORS header; got:\n{resp}"
+        );
+        assert!(
+            resp.starts_with("HTTP/1.1 200 OK\r\n"),
+            "status line preserved",
+        );
+        assert!(
+            resp.contains("Content-Length: 15\r\n"),
+            "Content-Length matches body length",
+        );
+    }
+
+    #[test]
+    fn callback_response_carries_failure_status_for_400() {
+        let resp = format_callback_response("400 Bad Request", "");
+        assert!(resp.starts_with("HTTP/1.1 400 Bad Request\r\n"));
+        assert!(resp.contains("Content-Length: 0\r\n"));
+    }
 }

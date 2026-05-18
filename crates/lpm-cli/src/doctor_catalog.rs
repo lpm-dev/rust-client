@@ -1177,6 +1177,24 @@ pub static GLOBAL_MANIFEST_CORRUPT: CheckEntry = CheckEntry {
     auto_fix: None,
 };
 
+/// L38: TOML-parseable manifest with structurally invalid rows —
+/// `packages.*.root` outside the `installs/<name>@<version>` shape,
+/// alias rows pointing at non-existent packages or non-declared bins,
+/// tombstones outside the same shape. Pre-fix the doctor only checked
+/// parseability, and downstream `lpm global list --verbose` would
+/// happily `dir_size()` on escaped paths.
+pub static GLOBAL_MANIFEST_STRUCTURALLY_INVALID: CheckEntry = CheckEntry {
+    code: "global_manifest_structurally_invalid",
+    name: "Global manifest",
+    category: Category::Globals,
+    tier: Tier::Extended,
+    description: "`~/.lpm/global/manifest.toml` parses as TOML but carries structurally invalid rows: `packages.*.root` outside the `installs/<name>@<version>` shape, alias rows pointing at non-existent packages or non-declared bins, or tombstones with the same shape violation.",
+    when_fires: "Manifest TOML is valid but one or more rows fail the L47 `validated_install_root_relative` shape check, or an alias row dangles.",
+    remediation: "Inspect `~/.lpm/global/manifest.toml`; fix the offending rows by hand or reinstall the affected globals.",
+    possible_severities: &[Severity::Fail],
+    auto_fix: None,
+};
+
 pub static GLOBAL_BIN_ON_PATH: CheckEntry = CheckEntry {
     code: "global_bin_on_path",
     name: "Global bin on PATH",
@@ -1246,6 +1264,75 @@ pub static GLOBAL_SHIMS_UNREADABLE: CheckEntry = CheckEntry {
     when_fires: "Permission denied or filesystem error reading `~/.lpm/bin`.",
     remediation: "Fix permissions; rerun doctor.",
     possible_severities: &[Severity::Warn],
+    auto_fix: None,
+};
+
+/// L37: a manifest-owned shim filename in `~/.lpm/bin` exists but its
+/// symlink target does not match the expected
+/// `<install-root>/node_modules/.bin/<bin>` shape — stale rollback
+/// artifact, same-user PATH hijack, or partial Windows-triple
+/// inconsistency. Pre-fix the doctor's shim pass only checked
+/// filenames and reported `global_shims_clean` for these.
+pub static GLOBAL_SHIM_TARGETS_HEALTHY: CheckEntry = CheckEntry {
+    code: "global_shim_targets_healthy",
+    name: "Shim targets",
+    category: Category::Globals,
+    tier: Tier::Extended,
+    description: "Every manifest-owned shim in `~/.lpm/bin` is a symlink pointing at the expected `<install-root>/node_modules/.bin/<bin>` target.",
+    when_fires: "Shim filenames AND targets line up with the manifest.",
+    remediation: "No action — informational pass.",
+    possible_severities: &[Severity::Pass],
+    auto_fix: None,
+};
+
+pub static GLOBAL_SHIM_TARGETS_STALE: CheckEntry = CheckEntry {
+    code: "global_shim_targets_stale",
+    name: "Shim targets",
+    category: Category::Globals,
+    tier: Tier::Extended,
+    description: "One or more manifest-owned shims in `~/.lpm/bin` have wrong targets — they point at a different install root, a deleted root, or a non-LPM path entirely (potential same-user PATH hijack or stale rollback artifact).",
+    when_fires: "Symlink target mismatch, regular-file shim where a symlink was expected, or unreadable shim metadata.",
+    remediation: "Re-run `lpm install -g <pkg>` to reclaim the shim, or inspect `~/.lpm/bin/<name>` if the mismatch is unexpected.",
+    possible_severities: &[Severity::Warn],
+    auto_fix: None,
+};
+
+/// L39: the global trusted-dependencies file
+/// (`~/.lpm/global/trusted-dependencies.json`) is present and reads
+/// cleanly. Reports the approval count.
+pub static GLOBAL_TRUSTED_DEPS_VALID: CheckEntry = CheckEntry {
+    code: "global_trusted_deps_valid",
+    name: "Global trusted dependencies",
+    category: Category::Globals,
+    tier: Tier::Extended,
+    description: "`~/.lpm/global/trusted-dependencies.json` parses cleanly. Reports the count of approval rows the global install path will project into new globals.",
+    when_fires: "Trust file is well-formed.",
+    remediation: "No action — informational pass.",
+    possible_severities: &[Severity::Pass],
+    auto_fix: None,
+};
+
+pub static GLOBAL_TRUSTED_DEPS_ABSENT: CheckEntry = CheckEntry {
+    code: "global_trusted_deps_absent",
+    name: "Global trusted dependencies",
+    category: Category::Globals,
+    tier: Tier::Extended,
+    description: "No global trusted-dependencies file is present (no host-global lifecycle-script approvals yet).",
+    when_fires: "`~/.lpm/global/trusted-dependencies.json` does not exist.",
+    remediation: "No action — informational pass.",
+    possible_severities: &[Severity::Pass],
+    auto_fix: None,
+};
+
+pub static GLOBAL_TRUSTED_DEPS_CORRUPT: CheckEntry = CheckEntry {
+    code: "global_trusted_deps_corrupt",
+    name: "Global trusted dependencies",
+    category: Category::Globals,
+    tier: Tier::Extended,
+    description: "`~/.lpm/global/trusted-dependencies.json` is unreadable, malformed JSON, or carries a newer schema version this binary does not understand.",
+    when_fires: "JSON parse error, schema version above the binary's max, or an I/O failure.",
+    remediation: "Inspect and repair, or delete to reset the global trust list (operators re-approving on next `lpm install -g` / `lpm approve-scripts --global`).",
+    possible_severities: &[Severity::Fail],
     auto_fix: None,
 };
 
@@ -1635,15 +1722,21 @@ pub static CLI_CATALOG: &[&CheckEntry] = &[
     &GLOBAL_MANIFEST_VALID,
     &GLOBAL_MANIFEST_ABSENT,
     &GLOBAL_MANIFEST_CORRUPT,
+    &GLOBAL_MANIFEST_STRUCTURALLY_INVALID,
     &GLOBAL_BIN_ON_PATH,
     &GLOBAL_BIN_OFF_PATH,
     &GLOBAL_SHIMS_CLEAN,
     &GLOBAL_SHIMS_NO_DIR,
     &GLOBAL_SHIMS_ORPHANS,
     &GLOBAL_SHIMS_UNREADABLE,
+    &GLOBAL_SHIM_TARGETS_HEALTHY,
+    &GLOBAL_SHIM_TARGETS_STALE,
     &GLOBAL_INSTALL_ROOTS_EMPTY,
     &GLOBAL_INSTALL_ROOTS_HEALTHY,
     &GLOBAL_INSTALL_ROOTS_UNHEALTHY,
+    &GLOBAL_TRUSTED_DEPS_VALID,
+    &GLOBAL_TRUSTED_DEPS_ABSENT,
+    &GLOBAL_TRUSTED_DEPS_CORRUPT,
     // Sandbox + script policy
     &SANDBOX_AVAILABLE,
     &SANDBOX_HELPER_MISSING,

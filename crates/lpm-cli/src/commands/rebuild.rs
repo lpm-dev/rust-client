@@ -90,7 +90,24 @@ const DEFAULT_SCRIPT_TIMEOUT_SECS: u64 = 300;
 const BUILD_MARKER: &str = ".lpm-built";
 
 /// Env var patterns to strip from script execution environment.
+///
+/// Two classes share this list:
+///   * **Credential carriers** — bearers and per-vendor tokens that
+///     a malicious lifecycle script would otherwise exfiltrate.
+///   * **Runtime-hijack carriers** (H13) — names that the dynamic
+///     linker / language runtimes consume to load attacker-supplied
+///     code into the child process. These are the same names the
+///     dotenv loader at `lpm-runner/src/dotenv.rs:256` already
+///     denies; before this fix the lifecycle path had a token-only
+///     denylist while `.env` loading had a runtime-hijack denylist,
+///     leaving an asymmetric gap where an LD_PRELOAD/NODE_OPTIONS
+///     value present on the parent process flowed verbatim into the
+///     lifecycle child. Mirroring the dotenv list here closes that
+///     asymmetry — the lifecycle child no longer inherits any
+///     dynamic-linker hijack hook from the parent's env regardless
+///     of where the value originated.
 const STRIPPED_ENV_PATTERNS: &[&str] = &[
+    // Credential carriers
     "LPM_TOKEN",
     "NPM_TOKEN",
     "NODE_AUTH_TOKEN",
@@ -101,6 +118,25 @@ const STRIPPED_ENV_PATTERNS: &[&str] = &[
     "AWS_SECRET_ACCESS_KEY",
     "AWS_SESSION_TOKEN",
     "AZURE_CLIENT_SECRET",
+    // Runtime-hijack carriers (H13). Same posture as dotenv's
+    // DENIED_ENV_VARS.
+    "LD_PRELOAD",
+    "LD_LIBRARY_PATH",
+    "LD_AUDIT",
+    "DYLD_INSERT_LIBRARIES",
+    "DYLD_LIBRARY_PATH",
+    "DYLD_FRAMEWORK_PATH",
+    "DYLD_FALLBACK_LIBRARY_PATH",
+    "NODE_OPTIONS",
+    "PYTHONPATH",
+    "PYTHONSTARTUP",
+    "GIT_SSH_COMMAND",
+    "BASH_ENV",
+    "ENV",
+    "PERL5OPT",
+    "PERL5LIB",
+    "RUBYOPT",
+    "RUBYLIB",
 ];
 
 /// Env var suffix patterns — any var ending with these is stripped.
@@ -163,7 +199,9 @@ pub async fn run(
     // `Some(session.approvals())` so amber packages the advisor
     // approved this run can execute their scripts without a
     // persistent `trustedDependencies` entry.
-    advisor_approvals: Option<&std::collections::HashSet<(String, String, Option<String>)>>,
+    advisor_approvals: Option<
+        &std::collections::HashSet<crate::triage_advisor_session::AdvisorApprovalKey>,
+    >,
 ) -> Result<(), LpmError> {
     // Round 2: hold the shared store lock across rebuild —
     // it traverses store package dirs to read package.json, compute
@@ -207,7 +245,9 @@ async fn run_under_store_lock(
     sandbox_log: bool,
     effective_policy: ScriptPolicy,
     // see `run` for the contract.
-    advisor_approvals: Option<&std::collections::HashSet<(String, String, Option<String>)>>,
+    advisor_approvals: Option<
+        &std::collections::HashSet<crate::triage_advisor_session::AdvisorApprovalKey>,
+    >,
 ) -> Result<(), LpmError> {
     // Defense-in-depth on the sandbox flag pair. The CLI boundary
     // (clap `conflicts_with_all` on `--no-sandbox` ⊥ `--strict-sandbox`
@@ -728,17 +768,42 @@ async fn run_under_store_lock(
     let sanitized_env = if scrub_env {
         build_sanitized_env()
     } else {
+        // L29: when sandbox is disabled, also emit via tracing::warn
+        // so the security signal survives `--json` mode. Surfaces a
+        // CI-aware hint when `CI=true` or `GITHUB_ACTIONS=true` is
+        // set — CI pipelines that ended up at no-sandbox are almost
+        // always a misconfiguration; the hint nudges operators to
+        // gate sandbox loosening behind an explicit policy knob
+        // rather than discovering it post-incident.
+        tracing::warn!(
+            target: "lpm_cli::sandbox",
+            "sandbox disabled — credential env vars will NOT be stripped and scripts run \
+             WITHOUT filesystem / network containment."
+        );
+        let in_ci = std::env::var("CI").map(|v| !v.is_empty()).unwrap_or(false)
+            || std::env::var("GITHUB_ACTIONS")
+                .map(|v| !v.is_empty())
+                .unwrap_or(false);
+        if in_ci {
+            tracing::warn!(
+                target: "lpm_cli::sandbox",
+                "CI environment detected with sandbox disabled — review whether \
+                 `--no-sandbox` / `[sandbox] mode = \"none\"` is intentional. \
+                 Recommended: leave the default (strict via `LPM_STRICT_SANDBOX=1`) \
+                 and gate any opt-out behind a CI-specific job that explicitly sets it."
+            );
+        }
         if !json_output {
-            // Word the warning so it covers BOTH provenance paths
-            // (CLI escape OR persistent `mode = "none"`) without
-            // claiming the source. The `Source:` line on doctor /
-            // help is the right place for provenance; this is the
-            // "loud banner at the call site" the SandboxMode docs
-            // already promise.
             output::warn(
                 "sandbox disabled: credential env vars will NOT be stripped and scripts run \
                  WITHOUT filesystem / network containment.",
             );
+            if in_ci {
+                output::warn(
+                    "CI environment detected with sandbox disabled — confirm this is intentional. \
+                     The default (containment ON) is the safer posture for CI.",
+                );
+            }
         }
         std::env::vars().collect::<HashMap<String, String>>()
     };
@@ -788,6 +853,26 @@ async fn run_under_store_lock(
         Some(&home_dir),
     )
     .map_err(|e| LpmError::Registry(format!("{e}")))?;
+
+    // Per-user `[sandbox] script-read-allow` opt-in — list of
+    // project-relative paths the user has chosen to exempt from
+    // the secret-file deny list across every project they run
+    // `lpm install` in. Per-project entries (in
+    // `package.json > lpm > scripts > sandboxReadAllow`) are
+    // unioned with this list by the loader.
+    //
+    // Empty / absent → empty list; the secret-deny block applies
+    // to every match without exception. This is the safe default.
+    let script_read_allow_user: Vec<String> = crate::commands::config::GlobalConfig::load()
+        .get_str_array("script-read-allow")
+        .unwrap_or_default();
+
+    let extra_secret_read_allow = lpm_sandbox::load_sandbox_read_allow(
+        &project_dir.join("package.json"),
+        project_dir,
+        &script_read_allow_user,
+    )
+    .map_err(|e| LpmError::Registry(format!("{e}")))?;
     // round-5 : `std::env::temp_dir()` resolves
     // tmpdir portably — POSIX checks `TMPDIR` → falls back to `/tmp`;
     // Windows checks `TMP` → `TEMP` → `USERPROFILE\AppData\Local\Temp`.
@@ -826,6 +911,7 @@ async fn run_under_store_lock(
         store_root: store_root.clone(),
         home_dir: home_dir.clone(),
         tmpdir: tmpdir.clone(),
+        secret_read_allow: Vec::new(),
         extra_write_dirs: extra_write_dirs.clone(),
     };
     lpm_sandbox::prepare_writable_dirs(&prepare_spec)
@@ -865,6 +951,7 @@ async fn run_under_store_lock(
             store_root: store_root.clone(),
             home_dir: home_dir.clone(),
             tmpdir: tmpdir.clone(),
+            secret_read_allow: Vec::new(),
             extra_write_dirs: Vec::new(),
         };
         let probe_sandbox = lpm_sandbox::new_for_platform_with_options(
@@ -876,11 +963,31 @@ async fn run_under_store_lock(
         // per-install warning: emitted once when the
         // probe's effective posture is `Degraded`. The structured
         // line names kernel + active ABI + missing dimension so log
-        // scrapers can detect the gap mechanically. JSON mode
-        // suppresses it on stderr — the doctor surface still
-        // reports the same posture for tooling consumers.
-        if !json_output && let Some(line) = probe_sandbox.posture().degraded_warning_line() {
-            output::warn(&line);
+        // scrapers can detect the gap mechanically. Human mode
+        // formats via `output::warn`; JSON mode emits the same line
+        // via `tracing::warn` so consumers running with `RUST_LOG=warn`
+        // see the degraded posture without parsing stderr — the JSON
+        // envelope on stdout stays well-formed. Previously suppressed
+        // entirely under `--json`, which hid the degradation from
+        // CI gates that consume only the JSON envelope.
+        if let Some(line) = probe_sandbox.posture().degraded_warning_line() {
+            // M65: always emit via tracing::warn (CI / RUST_LOG=warn
+            // pipelines pick it up regardless of output mode) AND via
+            // output::warn for the human path. Pre-fix, JSON mode
+            // emitted via tracing only and human mode emitted via
+            // output only — splitting the visibility unnecessarily.
+            // Now both paths fire in both modes; the degraded posture
+            // is a security signal a strict-mode user must not miss.
+            tracing::warn!(target: "lpm_cli::sandbox", "{line}");
+            if !json_output {
+                output::warn(&line);
+                output::warn(
+                    "strict sandbox requested but kernel-level network containment is NOT \
+                     enforced under this posture. Lifecycle scripts can reach the network. \
+                     Either upgrade to kernel >= 6.7 (landlock V4) or unset \
+                     `[sandbox] allow-degraded = true` to fail-closed instead of falling back.",
+                );
+            }
         }
         drop(probe_sandbox);
     }
@@ -924,13 +1031,27 @@ async fn run_under_store_lock(
     {
         output::warn(line);
     }
-    if sandbox_log && !json_output {
-        output::warn(
-            "--sandbox-log: diagnostic mode only. Rule triggers are logged but NOT \
-             enforced — do not treat a clean run as a safety signal. View reported \
-             accesses via `log show --last 5m --predicate 'senderImagePath CONTAINS \
-             \"Sandbox\"'` and grep for the script's pid.",
+    if sandbox_log {
+        // The `--sandbox-log` banner is a SECURITY signal — the user
+        // has opted into permissive-with-report which leaves the
+        // install effectively unsandboxed on macOS. JSON-mode callers
+        // (CI / agents) need to know they're NOT getting enforcement,
+        // so emit via `tracing::warn` (lands on stderr regardless of
+        // mode) AND via `output::warn` for the human path. Matches
+        // the M11/L11 posture for the same class of "loud signal
+        // must survive --json" warnings.
+        tracing::warn!(
+            target: "lpm_cli::sandbox",
+            "--sandbox-log: diagnostic mode only — rule triggers are LOGGED but NOT enforced. Do not treat a clean run as a safety signal."
         );
+        if !json_output {
+            output::warn(
+                "--sandbox-log: diagnostic mode only. Rule triggers are logged but NOT \
+                 enforced — do not treat a clean run as a safety signal. View reported \
+                 accesses via `log show --last 5m --predicate 'senderImagePath CONTAINS \
+                 \"Sandbox\"'` and grep for the script's pid.",
+            );
+        }
     }
 
     for pkg in &to_build {
@@ -1003,6 +1124,7 @@ async fn run_under_store_lock(
                 sandbox_mode,
                 &sandbox_options,
                 &extra_write_dirs,
+                &extra_secret_read_allow,
                 &store_root,
                 &home_dir,
                 &tmpdir,
@@ -1085,6 +1207,7 @@ fn execute_script(
     sandbox_mode: SandboxMode,
     sandbox_options: &lpm_sandbox::SandboxOptions,
     extra_write_dirs: &[PathBuf],
+    extra_secret_read_allow: &[PathBuf],
     store_root: &Path,
     home_dir: &Path,
     tmpdir: &Path,
@@ -1137,6 +1260,7 @@ fn execute_script(
         sandbox_mode,
         sandbox_options,
         extra_write_dirs,
+        extra_secret_read_allow,
         store_root,
         home_dir,
         tmpdir,
@@ -1441,6 +1565,7 @@ fn spawn_lifecycle_child(
     sandbox_mode: SandboxMode,
     sandbox_options: &lpm_sandbox::SandboxOptions,
     extra_write_dirs: &[PathBuf],
+    extra_secret_read_allow: &[PathBuf],
     store_root: &Path,
     home_dir: &Path,
     tmpdir: &Path,
@@ -1455,6 +1580,7 @@ fn spawn_lifecycle_child(
         store_root: store_root.to_path_buf(),
         home_dir: home_dir.to_path_buf(),
         tmpdir: tmpdir.to_path_buf(),
+        secret_read_allow: extra_secret_read_allow.to_vec(),
         extra_write_dirs: extra_write_dirs.to_vec(),
     };
     // thread the resolved `[sandbox] allow-degraded`
@@ -1682,6 +1808,29 @@ fn build_sanitized_env() -> HashMap<String, String> {
         env.insert(key, value);
     }
 
+    // M22: lifecycle scripts run with CWD = the package's directory.
+    // Nested tools (`git`, `npm`, `python`) consult package-local
+    // dotfiles by default — `<pkg>/.gitconfig`, `<pkg>/.npmrc`,
+    // `<pkg>/.netrc` — so a malicious package can plant
+    // `script-shell=/tmp/evil` or `registry=…attacker…` in a
+    // dotfile and have nested tools honour it. Neutralise the
+    // discovery path by pointing HOME / GIT_CONFIG_GLOBAL /
+    // NPM_CONFIG_GLOBALCONFIG / etc. at /dev/null on Unix (or an
+    // empty temp dir on Windows where /dev/null doesn't exist).
+    // The package's OWN scripts still run; what we suppress is the
+    // implicit "tool reads ./dotfile" surface that the package
+    // never asked for and the user never consented to.
+    #[cfg(unix)]
+    {
+        env.insert("GIT_CONFIG_GLOBAL".to_string(), "/dev/null".to_string());
+        env.insert("GIT_CONFIG_SYSTEM".to_string(), "/dev/null".to_string());
+        env.insert(
+            "NPM_CONFIG_GLOBALCONFIG".to_string(),
+            "/dev/null".to_string(),
+        );
+        env.insert("NPM_CONFIG_USERCONFIG".to_string(), "/dev/null".to_string());
+    }
+
     env
 }
 
@@ -1774,9 +1923,18 @@ fn parse_trusted_scopes(project_dir: &Path) -> Vec<String> {
 /// existing tests is preserved.
 fn name_matches_trusted_scope(package_name: &str, scopes: &[String]) -> bool {
     for pattern in scopes {
-        // Simple glob matching: "@myorg/*" matches "@myorg/anything"
+        // Simple glob matching: `@myorg/*` matches `@myorg/anything`.
+        //
+        // H15: pre-fix used `starts_with(prefix)` which also matched
+        // `@myorg-evil/pkg` against `@myorg` — a lookalike-scope
+        // bypass of the lifecycle approval gate. Require the prefix
+        // to be followed by exactly `/` so only members of `@myorg`
+        // itself qualify, never a `@myorg<suffix>` scope.
         if let Some(prefix) = pattern.strip_suffix("/*") {
-            if package_name.starts_with(prefix) && package_name.len() > prefix.len() + 1 {
+            if let Some(rest) = package_name.strip_prefix(prefix)
+                && let Some(after_sep) = rest.strip_prefix('/')
+                && !after_sep.is_empty()
+            {
                 return true;
             }
         } else if pattern == package_name {
@@ -1998,7 +2156,9 @@ pub(crate) fn evaluate_trust(
     // under triage yields [`TrustReason::AdvisorApprovedThisRun`].
     // `None` (or empty) preserves portable L1-3 behaviour — the
     // standalone `lpm rebuild` path passes `None`.
-    advisor_approvals: Option<&std::collections::HashSet<(String, String, Option<String>)>>,
+    advisor_approvals: Option<
+        &std::collections::HashSet<crate::triage_advisor_session::AdvisorApprovalKey>,
+    >,
 ) -> TrustReason {
     let candidate = evaluate_trust_unsuspended(
         package_dir,
@@ -2062,7 +2222,9 @@ fn evaluate_trust_unsuspended(
     policy: &SecurityPolicy,
     project_dir: &Path,
     effective_policy: ScriptPolicy,
-    advisor_approvals: Option<&std::collections::HashSet<(String, String, Option<String>)>>,
+    advisor_approvals: Option<
+        &std::collections::HashSet<crate::triage_advisor_session::AdvisorApprovalKey>,
+    >,
 ) -> TrustReason {
     let script_hash = compute_script_hash(package_dir);
     let strict = policy.can_run_scripts_strict(name, version, integrity, script_hash.as_deref());
@@ -2091,13 +2253,22 @@ fn evaluate_trust_unsuspended(
         // install.
         if matches!(tier, Some(StaticTier::Amber) | Some(StaticTier::AmberLlm))
             && let Some(set) = advisor_approvals
-            && set.contains(&(
-                name.to_string(),
-                version.to_string(),
-                integrity.map(str::to_string),
-            ))
         {
-            return TrustReason::AdvisorApprovedThisRun;
+            // M29: the approval key includes a script_bundle_hash that
+            // isn't available here without threading the bodies in.
+            // Today script classification is whole-package, so an
+            // approval for `(name, version, integrity)` is unique on
+            // that triple — match on the first three fields and
+            // ignore the bundle hash slot. A future per-phase refactor
+            // would tighten this to the full 4-tuple by threading the
+            // body hash through to this site.
+            let integrity_owned: Option<String> = integrity.map(str::to_string);
+            if set
+                .iter()
+                .any(|(n, v, i, _)| n == name && v == version && *i == integrity_owned)
+            {
+                return TrustReason::AdvisorApprovedThisRun;
+            }
         }
     }
 
@@ -2489,7 +2660,9 @@ pub fn all_scripted_packages_trusted(
     // this, a `Some(approvals)` install would still report "not all
     // scripts trusted" and decline autoBuild entirely — defeating
     // the whole point of advisor-enhanced triage.
-    advisor_approvals: Option<&std::collections::HashSet<(String, String, Option<String>)>>,
+    advisor_approvals: Option<
+        &std::collections::HashSet<crate::triage_advisor_session::AdvisorApprovalKey>,
+    >,
 ) -> bool {
     // Build the
     // v2 link-entry index ONCE before the per-package loop, scoped to
@@ -3126,6 +3299,60 @@ mod tests {
         // PATH and HOME are always present in the test environment
         let env = build_sanitized_env();
         assert!(env.contains_key("PATH"));
+    }
+
+    /// H13: lifecycle scripts must NOT inherit any of the
+    /// dynamic-linker / language-runtime hijack hooks
+    /// (`LD_PRELOAD`, `DYLD_INSERT_LIBRARIES`, `NODE_OPTIONS`,
+    /// etc.). Pre-fix the lifecycle path used a token-only denylist
+    /// while the dotenv loader had a runtime-hijack denylist —
+    /// asymmetric. Now the lifecycle list mirrors the dotenv list.
+    #[test]
+    fn sanitized_env_strips_runtime_hijack_carriers() {
+        let _env = crate::test_env::ScopedEnv::set([
+            ("LD_PRELOAD", "/dev/null/evil.so".into()),
+            ("LD_LIBRARY_PATH", "/dev/null".into()),
+            ("LD_AUDIT", "/dev/null/audit.so".into()),
+            ("DYLD_INSERT_LIBRARIES", "/dev/null/evil.dylib".into()),
+            ("DYLD_LIBRARY_PATH", "/dev/null".into()),
+            ("DYLD_FRAMEWORK_PATH", "/dev/null".into()),
+            ("DYLD_FALLBACK_LIBRARY_PATH", "/dev/null".into()),
+            ("NODE_OPTIONS", "--require=/dev/null".into()),
+            ("PYTHONPATH", "/dev/null".into()),
+            ("PYTHONSTARTUP", "/dev/null/start.py".into()),
+            ("GIT_SSH_COMMAND", "/dev/null/ssh-evil".into()),
+            ("BASH_ENV", "/dev/null/bashrc".into()),
+            ("ENV", "/dev/null/profile".into()),
+            ("PERL5OPT", "-Mevil".into()),
+            ("PERL5LIB", "/dev/null".into()),
+            ("RUBYOPT", "-revil".into()),
+            ("RUBYLIB", "/dev/null".into()),
+        ]);
+        let env = build_sanitized_env();
+        for hijack in [
+            "LD_PRELOAD",
+            "LD_LIBRARY_PATH",
+            "LD_AUDIT",
+            "DYLD_INSERT_LIBRARIES",
+            "DYLD_LIBRARY_PATH",
+            "DYLD_FRAMEWORK_PATH",
+            "DYLD_FALLBACK_LIBRARY_PATH",
+            "NODE_OPTIONS",
+            "PYTHONPATH",
+            "PYTHONSTARTUP",
+            "GIT_SSH_COMMAND",
+            "BASH_ENV",
+            "ENV",
+            "PERL5OPT",
+            "PERL5LIB",
+            "RUBYOPT",
+            "RUBYLIB",
+        ] {
+            assert!(
+                !env.contains_key(hijack),
+                "{hijack} must be stripped from lifecycle env"
+            );
+        }
     }
 
     // ── read_lifecycle_scripts tests ─────────────────────────────
@@ -4462,7 +4689,12 @@ mod tests {
         let policy = SecurityPolicy::from_package_json(&dir.path().join("package.json"));
 
         let mut approvals = std::collections::HashSet::new();
-        approvals.insert(("amber-pkg".to_string(), "1.0.0".to_string(), None));
+        approvals.insert((
+            "amber-pkg".to_string(),
+            "1.0.0".to_string(),
+            None,
+            String::new(),
+        ));
 
         let reason = evaluate_trust(
             &pkg_dir,
@@ -4523,8 +4755,9 @@ mod tests {
         let scripts = read_lifecycle_scripts(&pkg_dir.join("package.json")).unwrap();
         let policy = SecurityPolicy::from_package_json(&dir.path().join("package.json"));
 
-        let approvals: std::collections::HashSet<(String, String, Option<String>)> =
-            std::collections::HashSet::new();
+        let approvals: std::collections::HashSet<
+            crate::triage_advisor_session::AdvisorApprovalKey,
+        > = std::collections::HashSet::new();
         let reason = evaluate_trust(
             &pkg_dir,
             "amber-pkg",
@@ -4554,8 +4787,18 @@ mod tests {
         let policy = SecurityPolicy::from_package_json(&dir.path().join("package.json"));
 
         let mut approvals = std::collections::HashSet::new();
-        approvals.insert(("OTHER-pkg".to_string(), "1.0.0".to_string(), None));
-        approvals.insert(("amber-pkg".to_string(), "2.0.0".to_string(), None)); // wrong version
+        approvals.insert((
+            "OTHER-pkg".to_string(),
+            "1.0.0".to_string(),
+            None,
+            String::new(),
+        ));
+        approvals.insert((
+            "amber-pkg".to_string(),
+            "2.0.0".to_string(),
+            None,
+            String::new(),
+        )); // wrong version
         let reason = evaluate_trust(
             &pkg_dir,
             "amber-pkg",
@@ -4587,7 +4830,12 @@ mod tests {
         let policy = SecurityPolicy::from_package_json(&dir.path().join("package.json"));
 
         let mut approvals = std::collections::HashSet::new();
-        approvals.insert(("amber-pkg".to_string(), "1.0.0".to_string(), None));
+        approvals.insert((
+            "amber-pkg".to_string(),
+            "1.0.0".to_string(),
+            None,
+            String::new(),
+        ));
         let reason = evaluate_trust(
             &pkg_dir,
             "amber-pkg",
@@ -4620,7 +4868,12 @@ mod tests {
         let policy = SecurityPolicy::from_package_json(&dir.path().join("package.json"));
 
         let mut approvals = std::collections::HashSet::new();
-        approvals.insert(("amber-pkg".to_string(), "1.0.0".to_string(), None));
+        approvals.insert((
+            "amber-pkg".to_string(),
+            "1.0.0".to_string(),
+            None,
+            String::new(),
+        ));
         let reason = evaluate_trust(
             &pkg_dir,
             "amber-pkg",
@@ -4664,6 +4917,7 @@ mod tests {
             "amber-pkg".to_string(),
             "1.0.0".to_string(),
             Some("sha512-registry-integrity".to_string()),
+            String::new(),
         ));
 
         // Querying for the SAME coord but a DIFFERENT integrity must
@@ -4735,7 +4989,12 @@ mod tests {
         let policy = SecurityPolicy::from_package_json(&dir.path().join("package.json"));
 
         let mut approvals = std::collections::HashSet::new();
-        approvals.insert(("green-pkg".to_string(), "1.0.0".to_string(), None));
+        approvals.insert((
+            "green-pkg".to_string(),
+            "1.0.0".to_string(),
+            None,
+            String::new(),
+        ));
         let reason = evaluate_trust(
             &pkg_dir,
             "green-pkg",
@@ -5739,5 +5998,41 @@ mod tests {
             fallback.starts_with("/proj/node_modules/.bin:/usr/bin:/bin"),
             "fallback must keep the historical POSIX shape: {fallback}"
         );
+    }
+
+    /// H15: `@myorg/*` glob must match exactly the `@myorg` scope —
+    /// `@myorg-evil/pkg` is a different scope and must NOT inherit
+    /// the trust. Pre-fix the `starts_with("@myorg")` check let a
+    /// lookalike scope bypass the lifecycle approval gate.
+    #[test]
+    fn trusted_scope_glob_requires_exact_scope_boundary() {
+        let scopes = vec!["@myorg/*".to_string()];
+
+        // Real members of the trusted scope.
+        assert!(name_matches_trusted_scope("@myorg/build-helper", &scopes));
+        assert!(name_matches_trusted_scope("@myorg/x", &scopes));
+
+        // Lookalike scopes that previously matched via starts_with —
+        // must NOT match after the fix.
+        assert!(
+            !name_matches_trusted_scope("@myorg-evil/pkg", &scopes),
+            "@myorg-evil is a distinct scope and must not inherit @myorg trust",
+        );
+        assert!(
+            !name_matches_trusted_scope("@myorganization/pkg", &scopes),
+            "@myorganization is a distinct scope and must not inherit @myorg trust",
+        );
+        assert!(
+            !name_matches_trusted_scope("@myorg", &scopes),
+            "bare `@myorg` (no member) must not match `@myorg/*`",
+        );
+    }
+
+    #[test]
+    fn trusted_scope_exact_pattern_still_matches() {
+        let scopes = vec!["exact-pkg".to_string()];
+        assert!(name_matches_trusted_scope("exact-pkg", &scopes));
+        assert!(!name_matches_trusted_scope("exact-pkg-evil", &scopes));
+        assert!(!name_matches_trusted_scope("other-pkg", &scopes));
     }
 }

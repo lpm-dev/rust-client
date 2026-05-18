@@ -14,6 +14,7 @@
 
 #![cfg(target_os = "macos")]
 
+use crate::secret_paths::{SECRET_FILE_EXTENSIONS, SECRET_LITERAL_PATHS, SECRET_SUBPATH_DIRS};
 use crate::{SandboxError, SandboxSpec};
 use std::path::{Path, PathBuf};
 
@@ -149,6 +150,18 @@ pub(crate) fn render_profile(
     out.push_str(")\n");
     out.push('\n');
 
+    // Secret-file deny block — overrides the broad project_dir
+    // file-read* allow above for well-known secret conventions
+    // (`.env`, `.npmrc`, `.aws/`, `*.pem`, etc.). SBPL last-match-
+    // wins: a path covered by both the earlier allow and this deny
+    // ends up denied. The per-project / per-user
+    // `sandboxReadAllow` opt-in (Phase 3) emits a follow-up
+    // (allow file-read*) block AFTER this deny so specific files
+    // can be exempted without disabling the whole list.
+    render_secret_denies(&mut out, &canon_project_dir)?;
+    render_secret_read_allow_overrides(&mut out, &spec.secret_read_allow)?;
+    out.push('\n');
+
     // file-write*: narrow but covers the greens. Must contain the
     // package's own store dir (the compat corpus tests write markers
     // here), project `node_modules` (prisma generate),
@@ -210,6 +223,126 @@ pub(crate) fn render_profile(
     out.push_str("(allow iokit-open)\n");
 
     Ok(out)
+}
+
+/// Emit the `(deny file-read* ...)` block for well-known secret
+/// conventions. Driven by the shared catalog in
+/// [`crate::secret_paths`]; all entries are rendered project-rooted
+/// at the canonicalized `project_dir` so the rule matches the form
+/// the kernel sees at enforcement time.
+///
+/// The regex suffix family is derived from
+/// [`SECRET_FILE_EXTENSIONS`] at render time: each extension
+/// (`.pem`, `.tfvars.json`, …) becomes an SBPL regex
+/// `^<escaped-project-dir>/.*<escaped-extension>$` anchored at the
+/// project root and the file-name end. Driving both backends off
+/// the same extension list (vs. one regex list + one suffix list)
+/// guarantees `seatbelt::render_secret_denies` and
+/// `linux_secret_overlay::enumerate_project_secrets` cover
+/// identical file sets.
+///
+/// Path-existence is intentionally NOT checked — Seatbelt rules
+/// match on path shape, not on whether the file is currently
+/// present. A `.env` that the lifecycle script later creates
+/// (writing to a writable parent) and then re-reads is still
+/// denied because the path matches the literal rule.
+fn render_secret_denies(out: &mut String, canon_project_dir: &Path) -> Result<(), SandboxError> {
+    let project_str =
+        canon_project_dir
+            .to_str()
+            .ok_or_else(|| SandboxError::ProfileRenderFailed {
+                reason: format!(
+                    "canon_project_dir is not valid UTF-8: {}",
+                    canon_project_dir.display()
+                ),
+            })?;
+    let project_re_escaped = regex_escape_literal_path(project_str);
+
+    out.push_str("(deny file-read*\n");
+    for rel in SECRET_LITERAL_PATHS {
+        let abs = canon_project_dir.join(rel);
+        let q = quoted_path(&abs, "secret_deny_literal")?;
+        out.push_str(&format!("  (literal {q})\n"));
+    }
+    for rel in SECRET_SUBPATH_DIRS {
+        let abs = canon_project_dir.join(rel);
+        let q = quoted_path(&abs, "secret_deny_subpath")?;
+        out.push_str(&format!("  (subpath {q})\n"));
+    }
+    for ext in SECRET_FILE_EXTENSIONS {
+        // `.tfvars.json` → `\.tfvars\.json` — escape every dot in
+        // the extension before stitching into the anchored regex.
+        let escaped_ext = ext.replace('.', r"\.");
+        let pattern = format!("^{project_re_escaped}/.*{escaped_ext}$");
+        out.push_str(&format!("  (regex {})\n", seatbelt_regex_literal(&pattern)));
+    }
+    out.push_str(")\n");
+    Ok(())
+}
+
+/// Emit a `(allow file-read* (literal ...))` override block for each
+/// entry in [`SandboxSpec::secret_read_allow`]. SBPL last-match-wins
+/// means these allows override the deny block immediately above for
+/// the named files, without disabling the whole secret-deny list.
+///
+/// No-op when the allow list is empty (no block emitted). The
+/// loader (Phase 3) is responsible for validating that each entry
+/// is an absolute project-rooted path and rejecting traversal /
+/// out-of-project entries — this renderer just emits whatever it
+/// receives.
+fn render_secret_read_allow_overrides(
+    out: &mut String,
+    allow_list: &[PathBuf],
+) -> Result<(), SandboxError> {
+    if allow_list.is_empty() {
+        return Ok(());
+    }
+    out.push_str("(allow file-read*\n");
+    for p in allow_list {
+        let q = quoted_path(p, "secret_read_allow_override")?;
+        out.push_str(&format!("  (literal {q})\n"));
+    }
+    out.push_str(")\n");
+    Ok(())
+}
+
+/// Wrap a regex source string in the SBPL `#"..."` literal form.
+/// Apple's SBPL regex literal treats `\` as a literal pass-through
+/// character (NOT a Scheme escape), so `\.pem` in the source
+/// reaches the regex engine unchanged. Only `"` is escaped by the
+/// SBPL parser; we mirror that.
+fn seatbelt_regex_literal(r: &str) -> String {
+    let mut out = String::with_capacity(r.len() + 4);
+    out.push_str("#\"");
+    for c in r.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            _ => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
+/// Escape regex metacharacters in a literal path string so the path
+/// can be safely interpolated into a regex source. Used to anchor
+/// the per-suffix rules at the canonicalized project_dir prefix
+/// without the path's `.`, `(`, etc. being interpreted as regex
+/// metas. Unix paths rarely contain these, but project_dirs under
+/// `/private/var/folders/<uuid>/...` on macOS do (parens are
+/// possible, dots are common).
+fn regex_escape_literal_path(path: &str) -> String {
+    let mut out = String::with_capacity(path.len() + 8);
+    for c in path.chars() {
+        match c {
+            '.' | '(' | ')' | '[' | ']' | '{' | '}' | '+' | '*' | '?' | '|' | '^' | '$' | '\\' => {
+                out.push('\\');
+                out.push(c);
+            }
+            _ => out.push(c),
+        }
+    }
+    out
 }
 
 /// Escape a path into a quoted Seatbelt string literal. Handles
@@ -358,6 +491,7 @@ mod tests {
             store_root: PathBuf::from("/lpm-store"),
             home_dir: PathBuf::from("/home/u"),
             tmpdir: PathBuf::from("/var/folders/xx/T"),
+            secret_read_allow: Vec::new(),
             extra_write_dirs: Vec::new(),
         }
     }
@@ -461,10 +595,23 @@ mod tests {
     #[test]
     fn profile_does_not_allow_ssh_aws_or_keychains() {
         let p = render_profile(&spec(), false).unwrap();
-        assert!(!p.contains("/.ssh"), "ssh must never be allowed: {p}");
-        assert!(!p.contains("/.aws"), "aws must never be allowed: {p}");
+        // The Phase 1 secret-deny block legitimately mentions
+        // `.ssh` and `.aws` as project-rooted subpaths — those are
+        // DENY rules and exactly what we want. The check below
+        // scopes the assertion to the ALLOW blocks: any allow
+        // rule mentioning `.ssh` / `.aws` / Keychains would be a
+        // security regression.
+        let allow_section = extract_allow_blocks(&p);
         assert!(
-            !p.contains("(subpath \"/Library/Keychains\")"),
+            !allow_section.contains("/.ssh"),
+            "ssh must never appear in an allow rule: {p}"
+        );
+        assert!(
+            !allow_section.contains("/.aws"),
+            "aws must never appear in an allow rule: {p}"
+        );
+        assert!(
+            !allow_section.contains("(subpath \"/Library/Keychains\")"),
             "system keychain must never be allowed: {p}"
         );
         // `~/Library/Keychains/` lives under the user's home dir and
@@ -475,6 +622,34 @@ mod tests {
             !p.contains("(subpath \"/Library\")\n"),
             "broad /Library allow must not be present (only narrow subpaths): {p}"
         );
+    }
+
+    /// Concatenate the bodies of every `(allow ... )` block in the
+    /// profile. Used by allow-only path assertions that must NOT
+    /// be confused by deny-block mentions of the same path
+    /// (the Phase 1 secret deny block legitimately references
+    /// `.ssh`, `.aws`, etc. as project-rooted denies).
+    fn extract_allow_blocks(profile: &str) -> String {
+        let mut out = String::new();
+        let mut tail = profile;
+        while let Some(idx) = tail.find("(allow ") {
+            tail = &tail[idx..];
+            // Find the closing `)` at column 0 (the `\n)\n` form
+            // used by every multiline allow block) or the end of
+            // the single-line rule.
+            if let Some(end) = tail.find("\n)\n") {
+                out.push_str(&tail[..end + 3]);
+                tail = &tail[end + 3..];
+            } else if let Some(eol) = tail.find('\n') {
+                // Single-line rule like `(allow process*)`.
+                out.push_str(&tail[..eol]);
+                tail = &tail[eol..];
+            } else {
+                out.push_str(tail);
+                break;
+            }
+        }
+        out
     }
 
     #[test]
@@ -523,9 +698,18 @@ mod tests {
         // shape — the integration
         // test under tests/seatbelt_integration.rs actually shells
         // out to sandbox-exec to confirm runtime behavior.
+        //
+        // The Phase 1 secret-deny block additionally names `.ssh`
+        // as a project-rooted DENY (defense-in-depth for the
+        // `<project>/.ssh` case); the assertion below scopes to the
+        // allow section to confirm no ALLOW rule covers `.ssh`.
         let p = render_profile(&spec(), false).unwrap();
         assert!(p.contains("(deny default)"));
-        assert!(!p.contains(".ssh"));
+        let allow_section = extract_allow_blocks(&p);
+        assert!(
+            !allow_section.contains(".ssh"),
+            "no allow rule may cover .ssh: {p}"
+        );
     }
 
     #[test]
@@ -714,5 +898,308 @@ mod tests {
             }
             other => panic!("expected ProfileRenderFailed, got {other:?}"),
         }
+    }
+
+    // ── Secret-file deny block (Phase 1) ────────────────────────────
+
+    /// The deny block appears AFTER the broad
+    /// `(allow file-read* (subpath project_dir))` rule. SBPL is
+    /// last-match-wins; reversing the order would make the deny a
+    /// no-op.
+    #[test]
+    fn secret_deny_block_comes_after_broad_file_read_allow() {
+        let p = render_profile(&spec(), false).unwrap();
+        let allow_idx = p
+            .find("(allow file-read*")
+            .expect("must contain file-read* allow");
+        let deny_idx = p
+            .find("(deny file-read*")
+            .expect("must contain file-read* deny");
+        assert!(
+            deny_idx > allow_idx,
+            "deny block must follow the broad allow for last-match-wins to fire:\n{p}"
+        );
+    }
+
+    /// `.env` is the canonical dotenv file; lifecycle scripts have no
+    /// legitimate read need for it.
+    #[test]
+    fn profile_denies_dotenv_at_project_root() {
+        let p = render_profile(&spec(), false).unwrap();
+        assert!(
+            p.contains(r#"(literal "/home/u/proj/.env")"#),
+            "profile must deny project-rooted .env: {p}"
+        );
+    }
+
+    /// `.env.local`, `.env.production`, etc. are explicitly
+    /// enumerated rather than regex-matched for grep-ability and
+    /// to avoid over-matching siblings.
+    #[test]
+    fn profile_denies_env_variant_literals() {
+        let p = render_profile(&spec(), false).unwrap();
+        for variant in [
+            ".env.local",
+            ".env.development",
+            ".env.development.local",
+            ".env.production",
+            ".env.production.local",
+            ".env.staging",
+            ".env.test",
+            ".env.test.local",
+            ".envrc",
+        ] {
+            let lit = format!(r#"(literal "/home/u/proj/{variant}")"#);
+            assert!(
+                p.contains(&lit),
+                "profile must deny project-rooted {variant}: {p}"
+            );
+        }
+    }
+
+    /// `.npmrc` is the npm auth-token file; routinely commits or
+    /// drops at the project root and is the leak vector M40 closed
+    /// at the auth-matching layer.
+    #[test]
+    fn profile_denies_npmrc() {
+        let p = render_profile(&spec(), false).unwrap();
+        assert!(p.contains(r#"(literal "/home/u/proj/.npmrc")"#));
+    }
+
+    /// `.git/config` carries credential URLs (`https://user:pass@host`).
+    #[test]
+    fn profile_denies_git_config_and_credentials() {
+        let p = render_profile(&spec(), false).unwrap();
+        assert!(p.contains(r#"(literal "/home/u/proj/.git/config")"#));
+        assert!(p.contains(r#"(literal "/home/u/proj/.git/credentials")"#));
+    }
+
+    /// `.netrc` / `_netrc` (Windows form) hold http auth for curl,
+    /// git over https, etc.
+    #[test]
+    fn profile_denies_netrc_forms() {
+        let p = render_profile(&spec(), false).unwrap();
+        assert!(p.contains(r#"(literal "/home/u/proj/.netrc")"#));
+        assert!(p.contains(r#"(literal "/home/u/proj/_netrc")"#));
+    }
+
+    /// Conventionally-committed SSH key files. Project-root only —
+    /// the canonical location `~/.ssh/id_rsa` is already covered by
+    /// the no-blanket-home rule (`.ssh` isn't in any allow subpath).
+    #[test]
+    fn profile_denies_ssh_keys_at_project_root() {
+        let p = render_profile(&spec(), false).unwrap();
+        for k in [
+            "id_rsa",
+            "id_rsa.pub",
+            "id_ecdsa",
+            "id_ed25519",
+            "id_ed25519.pub",
+            "id_dsa",
+        ] {
+            let lit = format!(r#"(literal "/home/u/proj/{k}")"#);
+            assert!(p.contains(&lit), "profile must deny {k}: {p}");
+        }
+    }
+
+    /// `.ssh`, `.aws`, `.kube` etc. are denied as whole subpaths —
+    /// `.aws/credentials`, `.kube/config`, every nested file is
+    /// unreadable.
+    #[test]
+    fn profile_denies_credential_subpath_dirs() {
+        let p = render_profile(&spec(), false).unwrap();
+        for d in [
+            ".ssh",
+            ".aws",
+            ".kube",
+            ".gcp",
+            ".terraform",
+            "secrets",
+            "secret",
+        ] {
+            let sub = format!(r#"(subpath "/home/u/proj/{d}")"#);
+            assert!(p.contains(&sub), "profile must deny {d} subpath: {p}");
+        }
+    }
+
+    /// `*.pem`, `*.key`, `*.pfx`, `*.p12` regex denies at any depth.
+    /// The anchored regex must contain both `^/home/u/proj/` (the
+    /// escaped project prefix) and the suffix.
+    #[test]
+    fn profile_denies_pem_and_key_files_via_regex() {
+        let p = render_profile(&spec(), false).unwrap();
+        for suffix in [r"\.pem", r"\.key", r"\.pfx", r"\.p12"] {
+            // Project_dir `/home/u/proj` has no regex metas, so the
+            // anchored regex literal is `^/home/u/proj/.*\.pem$` etc.
+            let needle = format!(r#"#"^/home/u/proj/.*{suffix}$""#);
+            assert!(
+                p.contains(&needle),
+                "profile must contain regex {needle}: {p}"
+            );
+        }
+    }
+
+    /// `*.tfstate` and `*.tfvars` regex denies — terraform state
+    /// routinely contains plaintext secrets.
+    #[test]
+    fn profile_denies_terraform_state_and_vars_via_regex() {
+        let p = render_profile(&spec(), false).unwrap();
+        assert!(p.contains(r#"#"^/home/u/proj/.*\.tfstate$""#));
+        assert!(p.contains(r#"#"^/home/u/proj/.*\.tfvars$""#));
+        assert!(p.contains(r#"#"^/home/u/proj/.*\.tfvars\.json$""#));
+    }
+
+    /// Source files are NOT denied — the deny list targets secret
+    /// conventions only. A `src/index.ts` or `lib/foo.js` stays
+    /// readable.
+    #[test]
+    fn profile_does_not_deny_source_files() {
+        let p = render_profile(&spec(), false).unwrap();
+        assert!(
+            !p.contains(r#"(literal "/home/u/proj/src/index.ts")"#),
+            "source files must not appear in the deny block: {p}"
+        );
+        // `src/`, `lib/`, `app/`, etc. are never in any deny rule.
+        for dir in ["src", "lib", "app", "pages", "components", "tests"] {
+            let sub = format!(r#"(subpath "/home/u/proj/{dir}")"#);
+            assert!(
+                !p.contains(&sub) || !is_under_deny_block(&p, &sub),
+                "{dir} subpath must not appear inside the deny block: {p}"
+            );
+        }
+    }
+
+    /// Helper: is the given needle inside the `(deny file-read* ... )`
+    /// block? Splits on the deny opener and the next `)` at column 0.
+    fn is_under_deny_block(profile: &str, needle: &str) -> bool {
+        let Some(start) = profile.find("(deny file-read*") else {
+            return false;
+        };
+        let tail = &profile[start..];
+        // The deny block ends at the first `)\n` line (the rules
+        // inside are 2-space-indented; the closing `)` is column 0).
+        let end = tail.find("\n)\n").unwrap_or(tail.len());
+        tail[..end].contains(needle)
+    }
+
+    /// LogOnly profile inherits the secret-deny block from the
+    /// Enforce body. Last-match-wins still applies — the deny
+    /// overrides the permissive-with-report fallback for the named
+    /// secret paths.
+    #[test]
+    fn logonly_profile_inherits_secret_deny_block() {
+        let p = render_logonly_profile(&spec(), false).unwrap();
+        assert!(p.contains("(deny file-read*"));
+        assert!(p.contains(r#"(literal "/home/u/proj/.env")"#));
+        assert!(p.contains(r#"(subpath "/home/u/proj/.aws")"#));
+        assert!(p.contains(r#"#"^/home/u/proj/.*\.pem$""#));
+    }
+
+    /// Strict mode (deny_outbound_network=true) does NOT change the
+    /// secret-deny block — the denies fire regardless of strict.
+    #[test]
+    fn secret_deny_block_unchanged_under_strict_mode() {
+        let default = render_profile(&spec(), false).unwrap();
+        let strict = render_profile(&spec(), true).unwrap();
+        // The (deny file-read* ... ) block has identical body in
+        // both. Diff is only the network rule.
+        let extract_deny = |s: &str| {
+            let start = s.find("(deny file-read*").unwrap();
+            let tail = &s[start..];
+            let end = tail.find("\n)\n").unwrap();
+            tail[..end + 3].to_string()
+        };
+        assert_eq!(extract_deny(&default), extract_deny(&strict));
+    }
+
+    /// Phase 3 wiring contract: when `secret_read_allow` is non-empty,
+    /// an additional `(allow file-read* ...)` block is emitted AFTER
+    /// the deny block. Last-match-wins means the named files become
+    /// readable again while the rest of the deny list still applies.
+    #[test]
+    fn secret_read_allow_emits_allow_override_after_deny() {
+        let mut s = spec();
+        s.secret_read_allow = vec![PathBuf::from("/home/u/proj/.env")];
+        let p = render_profile(&s, false).unwrap();
+        let deny_idx = p.find("(deny file-read*").unwrap();
+        // The override block opens with `(allow file-read*` AFTER the
+        // first such block (the broad project_dir allow). Find the
+        // SECOND `(allow file-read*` and assert it's after deny.
+        let first_allow = p.find("(allow file-read*").unwrap();
+        let second_allow_offset = p[first_allow + 1..]
+            .find("(allow file-read*")
+            .expect("must have override allow when secret_read_allow non-empty");
+        let second_allow = first_allow + 1 + second_allow_offset;
+        assert!(
+            second_allow > deny_idx,
+            "override allow must come after the deny:\n{p}"
+        );
+        // The override block names the exempted literal.
+        let override_block = &p[second_allow..];
+        assert!(
+            override_block.contains(r#"(literal "/home/u/proj/.env")"#),
+            "override block must name the allowed file:\n{p}"
+        );
+    }
+
+    /// Empty `secret_read_allow` — no override block emitted (Phase 1
+    /// default state).
+    #[test]
+    fn empty_secret_read_allow_emits_no_override_block() {
+        let p = render_profile(&spec(), false).unwrap();
+        // Exactly ONE `(allow file-read*` (the broad project_dir
+        // allow) and ZERO follow-up overrides.
+        let count = p.matches("(allow file-read*").count();
+        assert_eq!(count, 1, "no override block expected:\n{p}");
+    }
+
+    /// Regex escape: project_dirs under
+    /// `/private/var/folders/<uuid>/T/...` (the macOS tempdir form
+    /// LogOnly tests stage) contain `.` characters that must be
+    /// escaped to `\.` in the regex source, or the dot becomes a
+    /// wildcard.
+    #[test]
+    fn regex_escape_literal_path_escapes_dots_and_parens() {
+        assert_eq!(
+            regex_escape_literal_path("/private/var/folders/xx.tmp/T"),
+            r"/private/var/folders/xx\.tmp/T"
+        );
+        assert_eq!(
+            regex_escape_literal_path("/path/with (paren)/dir"),
+            r"/path/with \(paren\)/dir"
+        );
+        assert_eq!(
+            regex_escape_literal_path("/safe/normal/path"),
+            "/safe/normal/path"
+        );
+    }
+
+    /// SBPL regex literal: `\` passes through (not a Scheme escape),
+    /// `"` is escaped to `\"`. Mirror of Apple bsd.sb convention.
+    #[test]
+    fn seatbelt_regex_literal_escapes_only_quotes() {
+        assert_eq!(
+            seatbelt_regex_literal(r"^/home/u/proj/.*\.pem$"),
+            r##"#"^/home/u/proj/.*\.pem$""##
+        );
+        assert_eq!(
+            seatbelt_regex_literal(r#"contains "quote""#),
+            r#"#"contains \"quote\"""#
+        );
+    }
+
+    /// Sanity: the deny block is well-formed Scheme — opens with
+    /// `(deny file-read*`, closes with `)`, no orphaned tokens.
+    #[test]
+    fn secret_deny_block_is_well_formed() {
+        let p = render_profile(&spec(), false).unwrap();
+        let start = p.find("(deny file-read*").unwrap();
+        let tail = &p[start..];
+        let end = tail.find("\n)\n").unwrap();
+        let block = &tail[..end + 3];
+        // Balanced parens within the block.
+        let opens = block.matches('(').count();
+        let closes = block.matches(')').count();
+        assert_eq!(opens, closes, "unbalanced parens in deny block:\n{block}");
     }
 }

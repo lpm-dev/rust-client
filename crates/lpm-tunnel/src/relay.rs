@@ -40,17 +40,83 @@ pub fn resolve_relay_url() -> String {
     if let Ok(val) = std::env::var("LPM_TUNNEL_RELAY")
         && !val.trim().is_empty()
     {
-        return val.trim().to_string();
+        let trimmed = val.trim().to_string();
+        return accept_relay_override(&trimmed, "LPM_TUNNEL_RELAY");
     }
 
     if let Some(home) = dirs::home_dir() {
         let path = home.join(".lpm").join("config.toml");
         if let Some(val) = read_relay_url_from_config(&path) {
-            return val;
+            return accept_relay_override(&val, "~/.lpm/config.toml tunnel.relay-url");
         }
     }
 
     crate::DEFAULT_RELAY_URL.to_string()
+}
+
+/// Gate a relay-URL override and log its use.
+///
+/// The tunnel attaches the LPM bearer token to the WebSocket connect
+/// request (M8 finding); a hijacked override could redirect the
+/// bearer to an attacker-controlled WebSocket server. Accept only
+/// `wss://` (any host — legitimate self-hosted production relay) or
+/// `ws://` on a loopback host (local dev). Anything else falls back
+/// to the default with a `warn` so the operator sees the rejection.
+/// Honoured overrides also emit a `warn` so an unexpected redirect
+/// shows up in operator logs.
+fn accept_relay_override(raw: &str, origin: &str) -> String {
+    if relay_url_is_accepted(raw) {
+        tracing::warn!(
+            origin = origin,
+            override_url = %raw,
+            "tunnel relay endpoint override honoured — confirm this is expected",
+        );
+        return raw.to_string();
+    }
+    tracing::warn!(
+        origin = origin,
+        override_url = %raw,
+        "rejecting tunnel relay override: only wss:// (any host) or ws:// (loopback host) accepted; \
+         falling back to default to avoid leaking the LPM bearer to an unexpected endpoint",
+    );
+    crate::DEFAULT_RELAY_URL.to_string()
+}
+
+/// Accept `wss://` overrides (any host) or `ws://` overrides only
+/// when the host is a loopback address. Anything else is refused.
+fn relay_url_is_accepted(url: &str) -> bool {
+    let (scheme, rest) = match url.split_once("://") {
+        Some(pair) => pair,
+        None => return false,
+    };
+    let host_port = rest.split('/').next().unwrap_or("");
+    let host = if host_port.starts_with('[') {
+        host_port
+            .split(']')
+            .next()
+            .unwrap_or("")
+            .trim_start_matches('[')
+    } else {
+        host_port.split(':').next().unwrap_or("")
+    };
+    if host.is_empty() {
+        return false;
+    }
+    match scheme.to_ascii_lowercase().as_str() {
+        "wss" => true,
+        "ws" => is_loopback_host(host),
+        _ => false,
+    }
+}
+
+fn is_loopback_host(host: &str) -> bool {
+    if host.eq_ignore_ascii_case("localhost") {
+        return true;
+    }
+    if let Ok(addr) = host.parse::<std::net::IpAddr>() {
+        return addr.is_loopback();
+    }
+    false
 }
 
 /// Best-effort TOML lookup for `tunnel.relay-url`. Missing file →
@@ -311,6 +377,55 @@ mod tests {
             path.ends_with(Path::new(".lpm/relay-pin")),
             "legacy path must not regress: {}",
             path.display()
+        );
+    }
+
+    /// M8 — `wss://` overrides on any host are accepted (legitimate
+    /// self-hosted production relay).
+    #[test]
+    fn relay_url_is_accepted_for_wss_any_host() {
+        assert!(relay_url_is_accepted("wss://relay.lpm.fyi/connect"));
+        assert!(relay_url_is_accepted("wss://self-hosted.example/connect"));
+    }
+
+    /// M8 — `ws://` overrides are accepted ONLY for loopback hosts;
+    /// `ws://attacker.example` is the leak shape and must be rejected.
+    #[test]
+    fn relay_url_is_accepted_for_ws_loopback_only() {
+        assert!(relay_url_is_accepted("ws://localhost:8787/connect"));
+        assert!(relay_url_is_accepted("ws://127.0.0.1:8787/connect"));
+        assert!(relay_url_is_accepted("ws://[::1]:8787/connect"));
+        assert!(!relay_url_is_accepted("ws://attacker.example/connect"));
+        assert!(!relay_url_is_accepted("ws://relay.lpm.fyi/connect"));
+    }
+
+    #[test]
+    fn relay_url_rejects_unsupported_schemes() {
+        assert!(!relay_url_is_accepted("http://relay.lpm.fyi/connect"));
+        assert!(!relay_url_is_accepted("https://relay.lpm.fyi/connect"));
+        assert!(!relay_url_is_accepted("ftp://relay.lpm.fyi/connect"));
+        assert!(!relay_url_is_accepted("not a url"));
+        assert!(!relay_url_is_accepted(""));
+    }
+
+    /// End-to-end: a rejected override falls back to the default URL
+    /// so the LPM bearer never gets sent to the attacker host.
+    #[test]
+    fn accept_relay_override_falls_back_on_rejected_url() {
+        assert_eq!(
+            accept_relay_override("ws://attacker.example/connect", "test"),
+            crate::DEFAULT_RELAY_URL,
+            "non-loopback ws:// override must NOT steer the connect",
+        );
+    }
+
+    /// And the positive path: an accepted override IS used.
+    #[test]
+    fn accept_relay_override_honors_accepted_url() {
+        assert_eq!(
+            accept_relay_override("wss://self-hosted.example/connect", "test"),
+            "wss://self-hosted.example/connect",
+            "wss:// override must steer the connect",
         );
     }
 }

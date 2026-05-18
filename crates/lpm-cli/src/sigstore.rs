@@ -23,6 +23,130 @@ const FULCIO_URL: &str = "https://fulcio.sigstore.dev";
 /// Rekor public instance.
 const REKOR_URL: &str = "https://rekor.sigstore.dev";
 
+/// Wall-clock budget for any single Fulcio or Rekor request, including
+/// connection, TLS handshake, and the entire response body. A hostile
+/// or unreachable endpoint must surface as an error rather than wedge
+/// `lpm publish` indefinitely.
+const SIGSTORE_HTTP_TIMEOUT_SECS: u64 = 30;
+
+/// Maximum response body bytes we will buffer from Fulcio or Rekor.
+/// Real responses are kilobyte-sized; the cap exists to prevent a
+/// compromised endpoint from streaming GiB of data into our heap. Matches
+/// the cap in [`crate::provenance_fetch`] for consistency.
+const SIGSTORE_RESPONSE_CAP_BYTES: usize = 1024 * 1024;
+
+/// Sigstore service endpoints.
+///
+/// Fields are intentionally private. Only [`Self::production`] (the
+/// pinned public instance) is wired into the publish path. A future
+/// override mechanism — e.g. an `SIGSTORE_FULCIO_URL` env var — must
+/// add a new public constructor that is visible in code review,
+/// which is the gate that prevents attestation traffic from being
+/// silently redirected to an attacker-controlled host.
+pub struct SigstoreEndpoints {
+    fulcio: String,
+    rekor: String,
+}
+
+impl SigstoreEndpoints {
+    /// Pinned public Sigstore instance.
+    pub fn production() -> Self {
+        Self {
+            fulcio: FULCIO_URL.to_string(),
+            rekor: REKOR_URL.to_string(),
+        }
+    }
+
+    /// Test-only constructor for wiremock-driven scenarios.
+    #[cfg(test)]
+    fn for_test(fulcio: String, rekor: String) -> Self {
+        Self { fulcio, rekor }
+    }
+}
+
+/// Build the HTTP client used for every Fulcio / Rekor exchange.
+/// Centralised so the wall-clock timeout cannot be omitted at any
+/// call site.
+///
+/// M2: redirect policy is explicitly set to `Policy::none()`. The
+/// Fulcio / Rekor endpoints should never redirect a legitimate
+/// signing request; a `Location:` header on either flow would only
+/// happen if the canonical endpoint had been compromised AND tried
+/// to bounce traffic via a third-party host (where the request body
+/// — OIDC bearer + signing-request payload — would be exposed). The
+/// pre-fix client used reqwest's default of 10 follows, which strips
+/// cross-host `Authorization` only on the host hop reqwest knows
+/// about; the OIDC bearer travels in the JSON body, not the
+/// `Authorization` header, so reqwest's strip wouldn't have caught
+/// it. Explicitly refusing redirects closes the bounce-and-capture
+/// arm. A legitimate Fulcio rotation would be announced as a new
+/// constant + code release, not a transparent redirect.
+fn sigstore_http_client() -> Result<reqwest::Client, LpmError> {
+    reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(SIGSTORE_HTTP_TIMEOUT_SECS))
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .map_err(|e| LpmError::Registry(format!("failed to build Sigstore HTTP client: {e}")))
+}
+
+/// M2: embedded SPKI pin for the canonical Fulcio TLS leaf. When
+/// `Some(hex)`, the TLS connector must reject any handshake whose
+/// presented leaf cert SPKI does not match the pinned hash —
+/// closes the "system-trust-store CA was compromised, attacker
+/// substitutes the Fulcio leaf" arm even when WebPKI says the chain
+/// is otherwise valid. Default `None` keeps today's behaviour so a
+/// stale pin in a shipped binary can't brick legitimate Sigstore
+/// rotation; release process flips the constant to the rotated SPKI
+/// hash and ships a new lpm-cli build.
+///
+/// A custom `rustls::client::ServerCertVerifier` wired through the
+/// reqwest builder is the remaining work; the slot here is the
+/// audit hook so a future PR that adds the verifier without
+/// referencing M2 stands out in code review.
+#[allow(dead_code)]
+pub(crate) const EMBEDDED_FULCIO_SPKI_PIN_HEX: Option<&str> = None;
+
+/// M2: embedded SPKI pin for the canonical Rekor TLS leaf. Same
+/// shape and rationale as [`EMBEDDED_FULCIO_SPKI_PIN_HEX`].
+#[allow(dead_code)]
+pub(crate) const EMBEDDED_REKOR_SPKI_PIN_HEX: Option<&str> = None;
+
+/// Read a response body with a two-stage size cap: reject pre-stream
+/// when `Content-Length` declares an oversized body, then reject mid-
+/// stream when accumulating chunks would cross the cap. The label
+/// (e.g. `"Fulcio"`) appears in error messages so a failure points at
+/// the right hop.
+async fn read_response_body_capped(
+    response: reqwest::Response,
+    label: &str,
+) -> Result<String, LpmError> {
+    use futures::StreamExt;
+
+    if let Some(declared) = response.content_length()
+        && declared as usize > SIGSTORE_RESPONSE_CAP_BYTES
+    {
+        return Err(LpmError::Registry(format!(
+            "{label} response declared body length {declared} exceeds cap {SIGSTORE_RESPONSE_CAP_BYTES}"
+        )));
+    }
+
+    let mut buf: Vec<u8> = Vec::with_capacity(8 * 1024);
+    let mut stream = response.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk
+            .map_err(|e| LpmError::Registry(format!("{label} response body read error: {e}")))?;
+        if buf.len().saturating_add(chunk.len()) > SIGSTORE_RESPONSE_CAP_BYTES {
+            return Err(LpmError::Registry(format!(
+                "{label} response streamed body exceeded cap {SIGSTORE_RESPONSE_CAP_BYTES}"
+            )));
+        }
+        buf.extend_from_slice(&chunk);
+    }
+
+    String::from_utf8(buf)
+        .map_err(|e| LpmError::Registry(format!("{label} response was not valid UTF-8: {e}")))
+}
+
 /// A complete Sigstore bundle ready to attach to a publish payload.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct SigstoreBundle {
@@ -128,16 +252,31 @@ fn pae(payload_type: &str, payload: &[u8]) -> Vec<u8> {
     pae
 }
 
-/// Run the complete Sigstore signing flow.
+/// Run the complete Sigstore signing flow against the public Fulcio /
+/// Rekor instances. Thin shim around [`sign_and_record_with_endpoints`].
+pub async fn sign_and_record(
+    oidc_token: &str,
+    slsa_statement_json: &[u8],
+) -> Result<SigstoreBundle, LpmError> {
+    sign_and_record_with_endpoints(
+        oidc_token,
+        slsa_statement_json,
+        &SigstoreEndpoints::production(),
+    )
+    .await
+}
+
+/// Run the complete Sigstore signing flow against caller-supplied endpoints.
 ///
 /// 1. Generate ephemeral keypair
 /// 2. Exchange OIDC token with Fulcio for a signing certificate
 /// 3. Sign the SLSA statement as a DSSE envelope
 /// 4. Upload to Rekor transparency log
 /// 5. Return the complete Sigstore bundle
-pub async fn sign_and_record(
+pub async fn sign_and_record_with_endpoints(
     oidc_token: &str,
     slsa_statement_json: &[u8],
+    endpoints: &SigstoreEndpoints,
 ) -> Result<SigstoreBundle, LpmError> {
     // Step 1: Generate ephemeral ECDSA P-256 keypair
     let signing_key = SigningKey::random(&mut rand::thread_rng());
@@ -157,7 +296,7 @@ pub async fn sign_and_record(
 
     // Step 3: Exchange OIDC token for Fulcio signing certificate (v2 API)
     let (cert_pem, cert_chain_der) =
-        fulcio_get_certificate(oidc_token, &public_key_pem, &proof_b64).await?;
+        fulcio_get_certificate(&endpoints.fulcio, oidc_token, &public_key_pem, &proof_b64).await?;
 
     // Step 4: Create DSSE envelope
     let payload_type = "application/vnd.in-toto+json";
@@ -180,7 +319,7 @@ pub async fn sign_and_record(
     };
 
     // Step 4: Upload to Rekor
-    let tlog_entry = rekor_upload(&dsse_envelope, &cert_pem).await?;
+    let tlog_entry = rekor_upload(&endpoints.rekor, &dsse_envelope, &cert_pem).await?;
 
     // Step 5: Build the bundle
     let verification_material = VerificationMaterial {
@@ -208,11 +347,12 @@ pub async fn sign_and_record(
 /// - PEM public key + proof-of-possession signature
 /// - Returns JSON with certificate chain
 async fn fulcio_get_certificate(
+    fulcio_url: &str,
     oidc_token: &str,
     public_key_pem: &str,
     proof_b64: &str,
 ) -> Result<(String, Vec<Vec<u8>>), LpmError> {
-    let client = reqwest::Client::new();
+    let client = sigstore_http_client()?;
 
     let body = serde_json::json!({
         "credentials": {
@@ -228,7 +368,7 @@ async fn fulcio_get_certificate(
     });
 
     let response = client
-        .post(format!("{FULCIO_URL}/api/v2/signingCert"))
+        .post(format!("{fulcio_url}/api/v2/signingCert"))
         .header("Content-Type", "application/json")
         .json(&body)
         .send()
@@ -237,7 +377,9 @@ async fn fulcio_get_certificate(
 
     if !response.status().is_success() {
         let status = response.status();
-        let text = response.text().await.unwrap_or_default();
+        let text = read_response_body_capped(response, "Fulcio")
+            .await
+            .unwrap_or_default();
         return Err(LpmError::Registry(format!(
             "Fulcio certificate exchange failed ({status}): {text}"
         )));
@@ -253,10 +395,7 @@ async fn fulcio_get_certificate(
         .unwrap_or("")
         .to_string();
 
-    let response_text = response
-        .text()
-        .await
-        .map_err(|e| LpmError::Registry(format!("Fulcio response read error: {e}")))?;
+    let response_text = read_response_body_capped(response, "Fulcio").await?;
 
     tracing::debug!("Fulcio response content-type: {content_type}");
     tracing::debug!(
@@ -269,34 +408,12 @@ async fn fulcio_get_certificate(
     // contains PEM strings that would falsely match "BEGIN CERTIFICATE".
     let (cert_pem, cert_chain_der) =
         if content_type.contains("pem") && !content_type.contains("json") {
-            // PEM chain format — split into individual certificates
-            let mut certs_pem = Vec::new();
-            let mut current = String::new();
-            let mut in_cert = false;
-
-            for line in response_text.lines() {
-                if line.contains("BEGIN CERTIFICATE") {
-                    in_cert = true;
-                    current.clear();
-                    current.push_str(line);
-                    current.push('\n');
-                } else if line.contains("END CERTIFICATE") {
-                    current.push_str(line);
-                    current.push('\n');
-                    certs_pem.push(current.clone());
-                    in_cert = false;
-                } else if in_cert {
-                    current.push_str(line);
-                    current.push('\n');
-                }
-            }
-
+            let certs_pem = split_pem_chain(&response_text)?;
             if certs_pem.is_empty() {
                 return Err(LpmError::Registry(
                     "Fulcio returned empty certificate chain".into(),
                 ));
             }
-
             let first_pem = certs_pem[0].clone();
             let ders: Result<Vec<Vec<u8>>, _> = certs_pem.iter().map(|p| pem_to_der(p)).collect();
             (first_pem, ders?)
@@ -345,8 +462,12 @@ async fn fulcio_get_certificate(
 /// Upload a signed DSSE envelope to Rekor transparency log.
 ///
 /// POST https://rekor.sigstore.dev/api/v1/log/entries
-async fn rekor_upload(envelope: &DsseEnvelope, cert_pem: &str) -> Result<TlogEntry, LpmError> {
-    let client = reqwest::Client::new();
+async fn rekor_upload(
+    rekor_url: &str,
+    envelope: &DsseEnvelope,
+    cert_pem: &str,
+) -> Result<TlogEntry, LpmError> {
+    let client = sigstore_http_client()?;
 
     use sha2::{Digest, Sha256};
 
@@ -403,7 +524,7 @@ async fn rekor_upload(envelope: &DsseEnvelope, cert_pem: &str) -> Result<TlogEnt
     });
 
     let response = client
-        .post(format!("{REKOR_URL}/api/v1/log/entries"))
+        .post(format!("{rekor_url}/api/v1/log/entries"))
         .header("Content-Type", "application/json")
         .json(&body)
         .send()
@@ -412,15 +533,16 @@ async fn rekor_upload(envelope: &DsseEnvelope, cert_pem: &str) -> Result<TlogEnt
 
     if !response.status().is_success() {
         let status = response.status();
-        let text = response.text().await.unwrap_or_default();
+        let text = read_response_body_capped(response, "Rekor")
+            .await
+            .unwrap_or_default();
         return Err(LpmError::Registry(format!(
             "Rekor transparency log upload failed ({status}): {text}"
         )));
     }
 
-    let result: serde_json::Value = response
-        .json()
-        .await
+    let response_text = read_response_body_capped(response, "Rekor").await?;
+    let result: serde_json::Value = serde_json::from_str(&response_text)
         .map_err(|e| LpmError::Registry(format!("Rekor response parse error: {e}")))?;
 
     // Rekor returns { "uuid": { ...entry } } — one entry
@@ -464,11 +586,46 @@ async fn rekor_upload(envelope: &DsseEnvelope, cert_pem: &str) -> Result<TlogEnt
     })
 }
 
-/// Extract the "sub" (subject) claim from a JWT without verifying the signature.
+/// Issuers whose JWTs we will accept the `sub` claim from. Fulcio is
+/// the canonical signature verifier; this allowlist is a defense-in-
+/// depth gate so that even a future bug that bypassed Fulcio would
+/// still refuse to trust a JWT from a non-recognised issuer.
 ///
-/// The subject is used as the proof-of-possession challenge for Fulcio —
-/// we sign it with the ephemeral key to prove we control the private key.
+/// Listed exactly as the OIDC providers we support produce them:
+/// - GitHub Actions: <https://token.actions.githubusercontent.com>
+/// - GitLab CI:      <https://gitlab.com>
+///
+/// Tests use `extract_jwt_subject_with_issuers` with a wider set so
+/// the wiremock-driven scenarios in this module's test suite continue
+/// to work without leaking test-only issuers into the production
+/// allowlist.
+const ALLOWED_OIDC_ISSUERS: &[&str] = &[
+    "https://token.actions.githubusercontent.com",
+    "https://gitlab.com",
+];
+
+/// Extract the "sub" (subject) claim from a JWT without verifying the
+/// signature — but only after the `iss` claim matches an allowlisted
+/// issuer.
+///
+/// The subject is used as the proof-of-possession challenge for Fulcio
+/// — we sign it with the ephemeral key to prove we control the
+/// private key. M1: pre-fix this function decoded `sub` regardless of
+/// who issued the token; a future change that started honouring the
+/// `sub` outside the Fulcio flow (or any downstream consumer that
+/// trusted the local decode) would have inherited that gap. The
+/// allowlist gate closes the structural arm.
 fn extract_jwt_subject(jwt: &str) -> Result<String, LpmError> {
+    extract_jwt_subject_with_issuers(jwt, ALLOWED_OIDC_ISSUERS)
+}
+
+/// Same as [`extract_jwt_subject`] but with a caller-supplied issuer
+/// allowlist. Reserved for `#[cfg(test)]` scenarios that need to
+/// admit a wiremock issuer.
+fn extract_jwt_subject_with_issuers(
+    jwt: &str,
+    allowed_issuers: &[&str],
+) -> Result<String, LpmError> {
     let parts: Vec<&str> = jwt.split('.').collect();
     if parts.len() != 3 {
         return Err(LpmError::Registry("invalid JWT format".into()));
@@ -492,6 +649,20 @@ fn extract_jwt_subject(jwt: &str) -> Result<String, LpmError> {
     let payload: serde_json::Value = serde_json::from_slice(&payload_bytes)
         .map_err(|e| LpmError::Registry(format!("failed to parse JWT payload: {e}")))?;
 
+    // M1: the issuer allowlist gate. Reject a JWT whose `iss` claim is
+    // absent OR not in the allowlist BEFORE returning the unverified
+    // `sub`. Fulcio remains the canonical signature verifier; this is
+    // defense-in-depth.
+    let iss = payload
+        .get("iss")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| LpmError::Registry("JWT missing 'iss' claim".into()))?;
+    if !allowed_issuers.contains(&iss) {
+        return Err(LpmError::Registry(format!(
+            "JWT issuer '{iss}' is not in the allowlist (M1)",
+        )));
+    }
+
     payload
         .get("sub")
         .and_then(|v| v.as_str())
@@ -499,16 +670,126 @@ fn extract_jwt_subject(jwt: &str) -> Result<String, LpmError> {
         .ok_or_else(|| LpmError::Registry("JWT missing 'sub' claim".into()))
 }
 
-/// Decode a PEM-encoded certificate to DER bytes.
+/// Decode a single PEM-encoded `CERTIFICATE` block to DER bytes.
+///
+/// Strict parser: rejects PEMs whose label is anything other than
+/// `CERTIFICATE` (so a `PRIVATE KEY` or `SIGNATURE` block can't sneak
+/// past as a cert), refuses any non-blank content between the END
+/// marker and EOF, and refuses any other `-----LABEL-----` line inside
+/// the body. The previous implementation simply stripped every line
+/// starting with `-----` and base64-decoded the rest, which let a
+/// hostile Fulcio response smuggle bytes into the DER by interleaving
+/// extra labels or trailing content.
 fn pem_to_der(pem: &str) -> Result<Vec<u8>, LpmError> {
-    let content: String = pem
-        .lines()
-        .filter(|line| !line.starts_with("-----"))
-        .collect();
+    const BEGIN: &str = "-----BEGIN CERTIFICATE-----";
+    const END: &str = "-----END CERTIFICATE-----";
+
+    let mut lines = pem.lines();
+
+    let begin = lines
+        .by_ref()
+        .map(str::trim_end)
+        .find(|l| !l.is_empty())
+        .ok_or_else(|| LpmError::Registry("PEM input is empty".into()))?;
+    if begin != BEGIN {
+        return Err(LpmError::Registry(format!(
+            "expected `{BEGIN}`, got `{begin}`"
+        )));
+    }
+
+    let mut body = String::new();
+    let mut saw_end = false;
+    for line in lines.by_ref() {
+        let trimmed = line.trim_end();
+        if trimmed == END {
+            saw_end = true;
+            break;
+        }
+        if trimmed.is_empty() {
+            continue;
+        }
+        if trimmed.starts_with("-----") {
+            return Err(LpmError::Registry(format!(
+                "unexpected PEM marker inside CERTIFICATE body: `{trimmed}`"
+            )));
+        }
+        body.push_str(trimmed);
+    }
+    if !saw_end {
+        return Err(LpmError::Registry(format!("missing `{END}` marker")));
+    }
+
+    for line in lines {
+        if !line.trim().is_empty() {
+            return Err(LpmError::Registry(format!(
+                "unexpected content after `{END}`: `{}`",
+                line.trim_end()
+            )));
+        }
+    }
 
     BASE64
-        .decode(content.as_bytes())
-        .map_err(|e| LpmError::Registry(format!("invalid PEM certificate: {e}")))
+        .decode(body.as_bytes())
+        .map_err(|e| LpmError::Registry(format!("invalid PEM certificate base64: {e}")))
+}
+
+/// Split a PEM chain (multiple `CERTIFICATE` blocks concatenated) into
+/// individual PEM strings, each still terminated by its `-----END
+/// CERTIFICATE-----` marker so it parses cleanly through [`pem_to_der`].
+///
+/// Strict parser: requires the BEGIN / END markers to appear on their
+/// own line (no substring match), refuses any non-blank content between
+/// blocks, and refuses a nested BEGIN or stray END marker. The previous
+/// implementation accepted lines that merely *contained* the marker
+/// substring, allowing a hostile Fulcio response to interleave content
+/// into the chain.
+fn split_pem_chain(text: &str) -> Result<Vec<String>, LpmError> {
+    const BEGIN: &str = "-----BEGIN CERTIFICATE-----";
+    const END: &str = "-----END CERTIFICATE-----";
+
+    let mut certs = Vec::new();
+    let mut current = String::new();
+    let mut in_cert = false;
+
+    for line in text.lines() {
+        let trimmed = line.trim_end();
+        if trimmed == BEGIN {
+            if in_cert {
+                return Err(LpmError::Registry(
+                    "nested `-----BEGIN CERTIFICATE-----` in PEM chain".into(),
+                ));
+            }
+            in_cert = true;
+            current.clear();
+            current.push_str(line);
+            current.push('\n');
+        } else if trimmed == END {
+            if !in_cert {
+                return Err(LpmError::Registry(
+                    "stray `-----END CERTIFICATE-----` in PEM chain".into(),
+                ));
+            }
+            current.push_str(line);
+            current.push('\n');
+            certs.push(std::mem::take(&mut current));
+            in_cert = false;
+        } else if in_cert {
+            current.push_str(line);
+            current.push('\n');
+        } else if !trimmed.is_empty() {
+            return Err(LpmError::Registry(format!(
+                "unexpected content outside PEM block in chain: `{trimmed}`"
+            )));
+        }
+    }
+
+    if in_cert {
+        return Err(LpmError::Registry(
+            "unterminated `-----BEGIN CERTIFICATE-----` in PEM chain".into(),
+        ));
+    }
+
+    Ok(certs)
 }
 
 #[cfg(test)]
@@ -530,6 +811,122 @@ mod tests {
     }
 
     #[test]
+    fn pem_to_der_rejects_private_key_label() {
+        let pem = "-----BEGIN PRIVATE KEY-----\nYWJj\n-----END PRIVATE KEY-----";
+        let err = pem_to_der(pem).expect_err("non-CERTIFICATE label must be rejected");
+        assert!(
+            format!("{err}").contains("expected `-----BEGIN CERTIFICATE-----`"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn pem_to_der_rejects_unexpected_marker_inside_body() {
+        let pem = "-----BEGIN CERTIFICATE-----\nYWJj\n-----BEGIN SIGNATURE-----\nZGVm\n-----END CERTIFICATE-----";
+        let err = pem_to_der(pem).expect_err("nested marker must be rejected");
+        assert!(
+            format!("{err}").contains("unexpected PEM marker inside CERTIFICATE body"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn pem_to_der_rejects_trailing_content_after_end_marker() {
+        let pem = "-----BEGIN CERTIFICATE-----\nYWJj\n-----END CERTIFICATE-----\nZGVm";
+        let err = pem_to_der(pem).expect_err("trailing content must be rejected");
+        assert!(
+            format!("{err}").contains("unexpected content after"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn pem_to_der_rejects_missing_end_marker() {
+        let pem = "-----BEGIN CERTIFICATE-----\nYWJj\n";
+        let err = pem_to_der(pem).expect_err("missing END must be rejected");
+        assert!(format!("{err}").contains("missing"), "got: {err}");
+    }
+
+    #[test]
+    fn pem_to_der_rejects_empty_input() {
+        let err = pem_to_der("").expect_err("empty input must be rejected");
+        assert!(
+            format!("{err}").contains("PEM input is empty"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn pem_to_der_ignores_leading_blank_lines() {
+        let pem = "\n\n-----BEGIN CERTIFICATE-----\nYWJj\n-----END CERTIFICATE-----\n";
+        assert_eq!(pem_to_der(pem).unwrap(), b"abc");
+    }
+
+    #[test]
+    fn split_pem_chain_handles_concatenated_blocks() {
+        let chain = format!("{PEM_CERT_LEAF}{PEM_CERT_INTERMEDIATE}{PEM_CERT_ROOT}");
+        let certs = split_pem_chain(&chain).unwrap();
+        assert_eq!(certs.len(), 3);
+        assert_eq!(pem_to_der(&certs[0]).unwrap(), b"abc");
+        assert_eq!(pem_to_der(&certs[1]).unwrap(), b"def");
+        assert_eq!(pem_to_der(&certs[2]).unwrap(), b"ghi");
+    }
+
+    #[test]
+    fn split_pem_chain_rejects_content_between_blocks() {
+        // Hostile-server smuggling case: extra base64 between an END
+        // and the next BEGIN that the lax parser would have silently
+        // ignored. Strict parser refuses.
+        let chain = format!("{PEM_CERT_LEAF}smuggled-line\n{PEM_CERT_INTERMEDIATE}");
+        let err = split_pem_chain(&chain).expect_err("inter-block content must be rejected");
+        assert!(
+            format!("{err}").contains("unexpected content outside PEM block"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn split_pem_chain_rejects_stray_end_marker() {
+        let chain = "-----END CERTIFICATE-----\n";
+        let err = split_pem_chain(chain).expect_err("stray END must be rejected");
+        assert!(format!("{err}").contains("stray"), "got: {err}");
+    }
+
+    #[test]
+    fn split_pem_chain_rejects_nested_begin_marker() {
+        let chain = "-----BEGIN CERTIFICATE-----\nYWJj\n-----BEGIN CERTIFICATE-----\nZGVm\n-----END CERTIFICATE-----\n";
+        let err = split_pem_chain(chain).expect_err("nested BEGIN must be rejected");
+        assert!(format!("{err}").contains("nested"), "got: {err}");
+    }
+
+    #[test]
+    fn split_pem_chain_rejects_unterminated_block() {
+        let chain = "-----BEGIN CERTIFICATE-----\nYWJj\n";
+        let err = split_pem_chain(chain).expect_err("missing END must be rejected");
+        assert!(format!("{err}").contains("unterminated"), "got: {err}");
+    }
+
+    #[test]
+    fn split_pem_chain_rejects_substring_marker_match() {
+        // Old parser used `line.contains("BEGIN CERTIFICATE")`, which
+        // would treat `# BEGIN CERTIFICATE comment` as a block opener.
+        // Strict parser only matches the exact marker line.
+        let chain = "# BEGIN CERTIFICATE — this is a comment\n";
+        let err =
+            split_pem_chain(chain).expect_err("substring match must be rejected as out-of-block");
+        assert!(
+            format!("{err}").contains("unexpected content outside PEM block"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn split_pem_chain_empty_input_yields_no_certs() {
+        let certs = split_pem_chain("").unwrap();
+        assert!(certs.is_empty());
+    }
+
+    #[test]
     fn dsse_envelope_serializes() {
         let envelope = DsseEnvelope {
             payload_type: "application/vnd.in-toto+json".into(),
@@ -544,6 +941,639 @@ mod tests {
         assert_eq!(json["payloadType"], "application/vnd.in-toto+json");
         assert_eq!(json["signatures"][0]["sig"], "c2lnbmF0dXJl");
     }
+
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    use wiremock::matchers::{method, path as match_path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    // ─── Fixture helpers ──────────────────────────────────────────
+
+    const PEM_CERT_LEAF: &str = "-----BEGIN CERTIFICATE-----\nYWJj\n-----END CERTIFICATE-----\n";
+    const PEM_CERT_INTERMEDIATE: &str =
+        "-----BEGIN CERTIFICATE-----\nZGVm\n-----END CERTIFICATE-----\n";
+    const PEM_CERT_ROOT: &str = "-----BEGIN CERTIFICATE-----\nZ2hp\n-----END CERTIFICATE-----\n";
+
+    fn make_jwt(payload_json: &str) -> String {
+        let header_b64 = URL_SAFE_NO_PAD.encode(br#"{"alg":"RS256","typ":"JWT"}"#);
+        let payload_b64 = URL_SAFE_NO_PAD.encode(payload_json.as_bytes());
+        let sig_b64 = URL_SAFE_NO_PAD.encode(b"fake-sig-not-verified");
+        format!("{header_b64}.{payload_b64}.{sig_b64}")
+    }
+
+    fn dsse_fixture() -> DsseEnvelope {
+        DsseEnvelope {
+            payload_type: "application/vnd.in-toto+json".into(),
+            payload: BASE64.encode(b"{}"),
+            signatures: vec![DsseSignature {
+                keyid: String::new(),
+                sig: BASE64.encode(b"sig-bytes"),
+            }],
+        }
+    }
+
+    // ─── Fulcio response parsing ──────────────────────────────────
+
+    #[tokio::test]
+    async fn fulcio_parses_pem_chain_single_cert() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(match_path("/api/v2/signingCert"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(
+                PEM_CERT_LEAF.as_bytes().to_vec(),
+                "application/pem-certificate-chain",
+            ))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let (pem, ders) = fulcio_get_certificate(&server.uri(), "tok", "key-pem", "proof")
+            .await
+            .expect("expected success");
+        assert_eq!(pem, PEM_CERT_LEAF);
+        assert_eq!(ders.len(), 1);
+        assert_eq!(ders[0], b"abc");
+    }
+
+    #[tokio::test]
+    async fn fulcio_parses_pem_chain_multi_cert() {
+        let server = MockServer::start().await;
+        let chain = format!("{PEM_CERT_LEAF}{PEM_CERT_INTERMEDIATE}{PEM_CERT_ROOT}");
+        Mock::given(method("POST"))
+            .and(match_path("/api/v2/signingCert"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_raw(chain.into_bytes(), "application/pem-certificate-chain"),
+            )
+            .mount(&server)
+            .await;
+
+        let (leaf_pem, ders) = fulcio_get_certificate(&server.uri(), "tok", "key", "proof")
+            .await
+            .expect("expected success");
+        assert_eq!(leaf_pem, PEM_CERT_LEAF);
+        assert_eq!(ders.len(), 3);
+        assert_eq!(ders[0], b"abc");
+        assert_eq!(ders[1], b"def");
+        assert_eq!(ders[2], b"ghi");
+    }
+
+    #[tokio::test]
+    async fn fulcio_parses_json_embedded_sct() {
+        let server = MockServer::start().await;
+        let body = serde_json::json!({
+            "signedCertificateEmbeddedSct": {
+                "chain": {
+                    "certificates": [PEM_CERT_LEAF, PEM_CERT_INTERMEDIATE]
+                }
+            }
+        });
+        Mock::given(method("POST"))
+            .and(match_path("/api/v2/signingCert"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "application/json")
+                    .set_body_json(body),
+            )
+            .mount(&server)
+            .await;
+
+        let (leaf_pem, ders) = fulcio_get_certificate(&server.uri(), "tok", "key", "proof")
+            .await
+            .expect("expected success");
+        assert_eq!(leaf_pem, PEM_CERT_LEAF);
+        assert_eq!(ders.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn fulcio_parses_json_detached_sct() {
+        let server = MockServer::start().await;
+        let body = serde_json::json!({
+            "signedCertificateDetachedSct": {
+                "chain": {
+                    "certificates": [PEM_CERT_LEAF]
+                }
+            }
+        });
+        Mock::given(method("POST"))
+            .and(match_path("/api/v2/signingCert"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "application/json")
+                    .set_body_json(body),
+            )
+            .mount(&server)
+            .await;
+
+        let (leaf_pem, ders) = fulcio_get_certificate(&server.uri(), "tok", "key", "proof")
+            .await
+            .expect("expected success");
+        assert_eq!(leaf_pem, PEM_CERT_LEAF);
+        assert_eq!(ders.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn fulcio_json_with_neither_chain_key_errors() {
+        let server = MockServer::start().await;
+        let body = serde_json::json!({"someOtherShape": {}});
+        Mock::given(method("POST"))
+            .and(match_path("/api/v2/signingCert"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "application/json")
+                    .set_body_json(body),
+            )
+            .mount(&server)
+            .await;
+
+        let err = fulcio_get_certificate(&server.uri(), "tok", "key", "proof")
+            .await
+            .expect_err("expected error");
+        let msg = format!("{err}");
+        assert!(msg.contains("missing certificate chain"), "got: {msg}");
+    }
+
+    #[tokio::test]
+    async fn fulcio_pem_empty_chain_errors() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(match_path("/api/v2/signingCert"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(
+                b"(no certs here)".to_vec(),
+                "application/pem-certificate-chain",
+            ))
+            .mount(&server)
+            .await;
+
+        let err = fulcio_get_certificate(&server.uri(), "tok", "key", "proof")
+            .await
+            .expect_err("expected error");
+        let msg = format!("{err}");
+        // Strict parser rejects the stray `(no certs here)` line as
+        // out-of-block content rather than reaching the "empty chain"
+        // arm below it. Either rejection is the right outcome; the
+        // assertion pins the stricter one.
+        assert!(
+            msg.contains("unexpected content outside PEM block"),
+            "got: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn fulcio_http_500_errors_with_status() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(match_path("/api/v2/signingCert"))
+            .respond_with(ResponseTemplate::new(500).set_body_string("upstream broken"))
+            .mount(&server)
+            .await;
+
+        let err = fulcio_get_certificate(&server.uri(), "tok", "key", "proof")
+            .await
+            .expect_err("expected error");
+        let msg = format!("{err}");
+        assert!(msg.contains("500"), "expected status echoed, got: {msg}");
+        assert!(
+            msg.contains("upstream broken"),
+            "expected body echoed, got: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn fulcio_json_content_type_with_begin_certificate_body_picks_json_branch() {
+        // Regression guard for the comment at the content-type-check site:
+        // "Check content-type ONLY (not body text) to choose the parser,
+        //  because v2 JSON contains PEM strings that would falsely match
+        //  'BEGIN CERTIFICATE'." A JSON-typed response whose embedded
+        //  PEM string contains the marker must still parse as JSON.
+        let server = MockServer::start().await;
+        let body = serde_json::json!({
+            "signedCertificateEmbeddedSct": {
+                "chain": {
+                    "certificates": [PEM_CERT_LEAF]
+                }
+            }
+        });
+        Mock::given(method("POST"))
+            .and(match_path("/api/v2/signingCert"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "application/json")
+                    .set_body_json(body),
+            )
+            .mount(&server)
+            .await;
+
+        let (pem, ders) = fulcio_get_certificate(&server.uri(), "tok", "key", "proof")
+            .await
+            .expect("expected JSON-branch parse");
+        assert_eq!(pem, PEM_CERT_LEAF);
+        assert_eq!(ders.len(), 1);
+    }
+
+    // ─── Rekor response parsing ───────────────────────────────────
+
+    #[tokio::test]
+    async fn rekor_parses_full_entry() {
+        let server = MockServer::start().await;
+        let body = serde_json::json!({
+            "uuid-deadbeef": {
+                "logIndex": 42,
+                "integratedTime": 1700000000_i64,
+                "logID": "log-abc",
+                "body": "base64-body",
+                "verification": {"inclusionProof": {"checkpoint": "..."}}
+            }
+        });
+        Mock::given(method("POST"))
+            .and(match_path("/api/v1/log/entries"))
+            .respond_with(ResponseTemplate::new(201).set_body_json(body))
+            .mount(&server)
+            .await;
+
+        let envelope = dsse_fixture();
+        let entry = rekor_upload(&server.uri(), &envelope, "cert-pem")
+            .await
+            .expect("expected success");
+        assert_eq!(entry.log_index, "42");
+        assert_eq!(entry.integrated_time, "1700000000");
+        assert_eq!(entry.log_id.key_id, "log-abc");
+        assert_eq!(entry.canonicalized_body, "base64-body");
+        assert!(entry.inclusion_proof.is_some());
+    }
+
+    #[tokio::test]
+    async fn rekor_omits_inclusion_proof_when_verification_missing() {
+        let server = MockServer::start().await;
+        let body = serde_json::json!({
+            "uuid": {
+                "logIndex": 7,
+                "integratedTime": 1700000000_i64,
+                "logID": "log",
+                "body": "b"
+            }
+        });
+        Mock::given(method("POST"))
+            .and(match_path("/api/v1/log/entries"))
+            .respond_with(ResponseTemplate::new(201).set_body_json(body))
+            .mount(&server)
+            .await;
+
+        let envelope = dsse_fixture();
+        let entry = rekor_upload(&server.uri(), &envelope, "cert")
+            .await
+            .unwrap();
+        assert!(entry.inclusion_proof.is_none());
+    }
+
+    #[tokio::test]
+    async fn rekor_defaults_missing_log_index_to_zero() {
+        // Current behavior: when `logIndex` is absent the function falls
+        // back to "0" rather than erroring. This test pins that
+        // contract; if the function later starts rejecting absent
+        // fields, update the test to assert the new error shape.
+        let server = MockServer::start().await;
+        let body = serde_json::json!({
+            "uuid": {
+                "integratedTime": 1700000000_i64,
+                "logID": "log",
+                "body": "b"
+            }
+        });
+        Mock::given(method("POST"))
+            .and(match_path("/api/v1/log/entries"))
+            .respond_with(ResponseTemplate::new(201).set_body_json(body))
+            .mount(&server)
+            .await;
+
+        let entry = rekor_upload(&server.uri(), &dsse_fixture(), "cert")
+            .await
+            .unwrap();
+        assert_eq!(entry.log_index, "0");
+    }
+
+    #[tokio::test]
+    async fn rekor_empty_object_response_errors() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(match_path("/api/v1/log/entries"))
+            .respond_with(ResponseTemplate::new(201).set_body_json(serde_json::json!({})))
+            .mount(&server)
+            .await;
+
+        let err = rekor_upload(&server.uri(), &dsse_fixture(), "cert")
+            .await
+            .expect_err("expected error");
+        assert!(format!("{err}").contains("Rekor response empty"));
+    }
+
+    #[tokio::test]
+    async fn rekor_http_500_errors_with_status() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(match_path("/api/v1/log/entries"))
+            .respond_with(ResponseTemplate::new(500).set_body_string("rekor down"))
+            .mount(&server)
+            .await;
+
+        let err = rekor_upload(&server.uri(), &dsse_fixture(), "cert")
+            .await
+            .expect_err("expected error");
+        let msg = format!("{err}");
+        assert!(msg.contains("500"), "expected status, got: {msg}");
+        assert!(msg.contains("rekor down"), "expected body, got: {msg}");
+    }
+
+    // ─── JWT subject extraction ───────────────────────────────────
+
+    #[test]
+    fn jwt_subject_extracts_from_valid_token() {
+        let jwt = make_jwt(
+            r#"{"sub":"user@example.com","iss":"https://token.actions.githubusercontent.com"}"#,
+        );
+        assert_eq!(extract_jwt_subject(&jwt).unwrap(), "user@example.com");
+    }
+
+    #[test]
+    fn jwt_subject_handles_base64url_chars() {
+        // Build a payload whose base64url encoding contains `-` and `_`.
+        // The byte sequence below was chosen so that standard base64
+        // would use `+` / `/`, forcing the URL-safe alphabet.
+        let payload = "{\"sub\":\"\u{00fb}\u{00fe}~\",\"iss\":\"https://token.actions.githubusercontent.com\"}";
+        let jwt = make_jwt(payload);
+        // Confirm the test JWT actually contains url-safe chars
+        let middle = jwt.split('.').nth(1).unwrap();
+        assert!(
+            middle.contains('-') || middle.contains('_'),
+            "test fixture is meant to exercise base64url decoding; got: {middle}"
+        );
+        assert_eq!(extract_jwt_subject(&jwt).unwrap(), "\u{00fb}\u{00fe}~");
+    }
+
+    #[test]
+    fn jwt_subject_handles_all_padding_lengths() {
+        // The standard-base64 padding fixup in extract_jwt_subject covers
+        // four cases (mod 4 = 0, 1, 2, 3). The "% 4 == 1" branch is
+        // invalid base64 — only 0, 2, and 3 round-trip. Cover them.
+        for pad_target in [0usize, 2, 3] {
+            // Generate JSON payloads whose URL-safe encoding has the
+            // target padding-mod. Vary the `sub` value length until it
+            // matches.
+            let mut sub = String::new();
+            let jwt = loop {
+                sub.push('x');
+                let json = format!(
+                    "{{\"sub\":\"{sub}\",\"iss\":\"https://token.actions.githubusercontent.com\"}}",
+                );
+                let enc = URL_SAFE_NO_PAD.encode(json.as_bytes());
+                if enc.len() % 4 == pad_target {
+                    break make_jwt(&json);
+                }
+                if sub.len() > 64 {
+                    panic!("could not find input whose b64url length mod 4 = {pad_target}");
+                }
+            };
+            assert_eq!(
+                extract_jwt_subject(&jwt).unwrap(),
+                sub,
+                "padding case {pad_target}"
+            );
+        }
+    }
+
+    #[test]
+    fn jwt_subject_rejects_wrong_segment_count() {
+        assert!(extract_jwt_subject("only-one-segment").is_err());
+        assert!(extract_jwt_subject("two.segments").is_err());
+        assert!(extract_jwt_subject("a.b.c.d").is_err());
+    }
+
+    #[test]
+    fn jwt_subject_rejects_non_base64_payload() {
+        let jwt = "header.this-payload-has-====-invalid-padding-chars.sig";
+        let err = extract_jwt_subject(jwt).expect_err("expected error");
+        assert!(format!("{err}").contains("decode JWT payload"));
+    }
+
+    #[test]
+    fn jwt_subject_rejects_non_json_payload() {
+        let payload_b64 = URL_SAFE_NO_PAD.encode(b"this is not json");
+        let jwt = format!("header.{payload_b64}.sig");
+        let err = extract_jwt_subject(&jwt).expect_err("expected error");
+        assert!(format!("{err}").contains("parse JWT payload"));
+    }
+
+    #[test]
+    fn jwt_subject_rejects_missing_sub_claim() {
+        let jwt =
+            make_jwt(r#"{"iss":"https://token.actions.githubusercontent.com","aud":"sigstore"}"#);
+        let err = extract_jwt_subject(&jwt).expect_err("expected error");
+        assert!(format!("{err}").contains("missing 'sub' claim"));
+    }
+
+    #[test]
+    fn jwt_subject_rejects_non_string_sub_claim() {
+        let jwt = make_jwt(r#"{"sub":42,"iss":"https://token.actions.githubusercontent.com"}"#);
+        let err = extract_jwt_subject(&jwt).expect_err("expected error");
+        // The current code path bails out via the same "missing 'sub'"
+        // arm because `.as_str()` returns None for non-string values.
+        // That's a documented contract: assert it explicitly.
+        assert!(format!("{err}").contains("missing 'sub' claim"));
+    }
+
+    /// M1: a JWT with no `iss` claim must be refused even if the
+    /// signature would have verified — defense-in-depth so that a
+    /// future bug that bypassed Fulcio cannot trust the decoded sub.
+    #[test]
+    fn jwt_subject_rejects_missing_iss_claim() {
+        let jwt = make_jwt(r#"{"sub":"ci@example.com"}"#);
+        let err = extract_jwt_subject(&jwt).expect_err("expected error");
+        assert!(
+            format!("{err}").contains("missing 'iss' claim"),
+            "expected missing-iss error, got: {err}",
+        );
+    }
+
+    /// M1: an `iss` claim that is not in [`ALLOWED_OIDC_ISSUERS`] is
+    /// refused. Pre-fix the function returned the unverified `sub`
+    /// regardless of who issued the token.
+    #[test]
+    fn jwt_subject_rejects_unknown_issuer() {
+        let jwt = make_jwt(r#"{"sub":"ci@example.com","iss":"https://attacker.example.com"}"#);
+        let err = extract_jwt_subject(&jwt).expect_err("expected error");
+        assert!(
+            format!("{err}").contains("not in the allowlist"),
+            "expected allowlist-rejection error, got: {err}",
+        );
+    }
+
+    /// M1: the canonical GitHub Actions issuer passes the allowlist
+    /// gate, end-to-end. Pinning this here keeps the prod-allowlist
+    /// regression visible if the constant is ever silently widened.
+    #[test]
+    fn jwt_subject_accepts_canonical_github_actions_issuer() {
+        let jwt = make_jwt(
+            r#"{"sub":"repo:owner/repo:ref:refs/heads/main","iss":"https://token.actions.githubusercontent.com"}"#,
+        );
+        assert_eq!(
+            extract_jwt_subject(&jwt).unwrap(),
+            "repo:owner/repo:ref:refs/heads/main",
+        );
+    }
+
+    // ─── sign_and_record_with_endpoints orchestration ─────────────
+
+    #[tokio::test]
+    async fn sign_and_record_with_endpoints_orchestrates_full_flow() {
+        let fulcio = MockServer::start().await;
+        let rekor = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(match_path("/api/v2/signingCert"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(
+                format!("{PEM_CERT_LEAF}{PEM_CERT_ROOT}").into_bytes(),
+                "application/pem-certificate-chain",
+            ))
+            .mount(&fulcio)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(match_path("/api/v1/log/entries"))
+            .respond_with(ResponseTemplate::new(201).set_body_json(serde_json::json!({
+                "uuid": {
+                    "logIndex": 99,
+                    "integratedTime": 1700000000_i64,
+                    "logID": "log",
+                    "body": "b"
+                }
+            })))
+            .mount(&rekor)
+            .await;
+
+        let endpoints = SigstoreEndpoints::for_test(fulcio.uri(), rekor.uri());
+        let jwt = make_jwt(
+            r#"{"sub":"ci@example.com","iss":"https://token.actions.githubusercontent.com"}"#,
+        );
+
+        let bundle = sign_and_record_with_endpoints(&jwt, b"{\"_type\":\"in-toto\"}", &endpoints)
+            .await
+            .expect("expected success");
+
+        assert_eq!(
+            bundle.dsse_envelope.payload_type,
+            "application/vnd.in-toto+json"
+        );
+        assert_eq!(bundle.dsse_envelope.signatures.len(), 1);
+        assert_eq!(
+            bundle
+                .verification_material
+                .x509_certificate_chain
+                .certificates
+                .len(),
+            2
+        );
+        assert_eq!(bundle.verification_material.tlog_entries.len(), 1);
+        assert_eq!(bundle.verification_material.tlog_entries[0].log_index, "99");
+    }
+
+    #[tokio::test]
+    async fn sign_and_record_with_endpoints_propagates_fulcio_error() {
+        let fulcio = MockServer::start().await;
+        let rekor = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(match_path("/api/v2/signingCert"))
+            .respond_with(ResponseTemplate::new(503).set_body_string("fulcio down"))
+            .mount(&fulcio)
+            .await;
+        // Rekor mock not strictly required — the call must short-circuit
+        // before reaching it.
+
+        let endpoints = SigstoreEndpoints::for_test(fulcio.uri(), rekor.uri());
+        let jwt = make_jwt(r#"{"sub":"ci","iss":"https://token.actions.githubusercontent.com"}"#);
+
+        let err = sign_and_record_with_endpoints(&jwt, b"{}", &endpoints)
+            .await
+            .expect_err("expected fulcio error to surface");
+        assert!(format!("{err}").contains("503"));
+    }
+
+    // ─── Body-size cap on Fulcio / Rekor responses ────────────────
+
+    #[tokio::test]
+    async fn read_response_body_capped_accepts_payload_under_cap() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(match_path("/x"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(vec![b'a'; 1024]))
+            .mount(&server)
+            .await;
+
+        let resp = reqwest::get(format!("{}/x", server.uri())).await.unwrap();
+        let body = read_response_body_capped(resp, "Test").await.unwrap();
+        assert_eq!(body.len(), 1024);
+    }
+
+    #[tokio::test]
+    async fn read_response_body_capped_rejects_oversized_stream() {
+        let server = MockServer::start().await;
+        let oversized = vec![b'a'; SIGSTORE_RESPONSE_CAP_BYTES + 1024];
+        Mock::given(method("GET"))
+            .and(match_path("/x"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(oversized))
+            .mount(&server)
+            .await;
+
+        let resp = reqwest::get(format!("{}/x", server.uri())).await.unwrap();
+        let err = read_response_body_capped(resp, "Test")
+            .await
+            .expect_err("oversized body must be rejected");
+        let msg = format!("{err}");
+        // Either the pre-stream `Content-Length` check or the
+        // mid-stream accumulator check must reject. Both error
+        // messages contain "exceed".
+        assert!(msg.contains("exceed"), "got: {msg}");
+    }
+
+    #[tokio::test]
+    async fn read_response_body_capped_rejects_declared_oversized_content_length() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        // Bypass hyper to dodge its declared-vs-actual framing panic
+        // when the response body doesn't match the declared length.
+        // Send headers with a huge Content-Length and close — the
+        // pre-stream cap rejects before reading any body.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let declared = SIGSTORE_RESPONSE_CAP_BYTES + 1;
+
+        tokio::spawn(async move {
+            if let Ok((mut socket, _)) = listener.accept().await {
+                let mut buf = [0u8; 1024];
+                let _ = socket.read(&mut buf).await;
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\n\
+                     Content-Length: {declared}\r\n\
+                     Content-Type: application/octet-stream\r\n\
+                     Connection: close\r\n\
+                     \r\n",
+                );
+                let _ = socket.write_all(resp.as_bytes()).await;
+                let _ = socket.shutdown().await;
+            }
+        });
+
+        let resp = reqwest::get(format!("http://{addr}/")).await.unwrap();
+        let err = read_response_body_capped(resp, "Test")
+            .await
+            .expect_err("declared oversized length must be rejected pre-stream");
+        assert!(
+            format!("{err}").contains("declared body length"),
+            "got: {err}"
+        );
+    }
+
+    // ─── Legacy serde-shape tests (kept; format ownership) ────────
 
     #[test]
     fn sigstore_bundle_serializes() {

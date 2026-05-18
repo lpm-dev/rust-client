@@ -35,6 +35,34 @@ pub(crate) fn should_skip_env_validation() -> bool {
     SKIP_ENV_VALIDATION.load(Ordering::Relaxed)
 }
 
+/// Escape a string for safe interpolation inside a single-quoted POSIX
+/// shell word. `'foo'\''bar'` is the canonical POSIX way to embed a
+/// literal `'`: close the quoted run, emit `\'`, reopen the quoted run.
+fn shell_single_quote(arg: &str) -> String {
+    let escaped = arg.replace('\'', "'\\''");
+    format!("'{escaped}'")
+}
+
+/// Build the shell command for a script invocation by single-quoting
+/// every runtime arg before concatenation. The script body is owned by
+/// `package.json` (developer-authored) and legitimately contains shell
+/// metacharacters (pipes, redirects, `$VAR`), so it is concatenated
+/// verbatim. Extra args, however, come from the CLI tail (already
+/// split into argv by the user's shell) and must not re-introduce
+/// metacharacter semantics — otherwise `lpm run x -- "; rm -rf ~"`
+/// detonates inside `sh -c`.
+fn assemble_shell_command(script_cmd: &str, extra_args: &[String]) -> String {
+    if extra_args.is_empty() {
+        return script_cmd.to_string();
+    }
+    let quoted = extra_args
+        .iter()
+        .map(|a| shell_single_quote(a))
+        .collect::<Vec<_>>()
+        .join(" ");
+    format!("{script_cmd} {quoted}")
+}
+
 /// Run a package.json script by name, with PATH injection, .env loading, and hooks.
 ///
 /// # Arguments
@@ -106,12 +134,7 @@ pub fn run_script_with_envs(
         }
     }
 
-    // Build the full command with extra args
-    let full_cmd = if extra_args.is_empty() {
-        script_cmd
-    } else {
-        format!("{} {}", script_cmd, extra_args.join(" "))
-    };
+    let full_cmd = assemble_shell_command(&script_cmd, extra_args);
 
     // Run the main script
     let status = shell::spawn_shell(&ShellCommand {
@@ -194,12 +217,7 @@ pub fn run_script_captured(
         }
     }
 
-    // Build full command with extra args
-    let full_cmd = if extra_args.is_empty() {
-        script_cmd
-    } else {
-        format!("{} {}", script_cmd, extra_args.join(" "))
-    };
+    let full_cmd = assemble_shell_command(&script_cmd, extra_args);
 
     // Run the main script with tee capture
     let captured = shell::spawn_shell_tee(&ShellCommand {
@@ -272,11 +290,7 @@ pub fn run_script_buffered(
         }
     }
 
-    let full_cmd = if extra_args.is_empty() {
-        script_cmd
-    } else {
-        format!("{} {}", script_cmd, extra_args.join(" "))
-    };
+    let full_cmd = assemble_shell_command(&script_cmd, extra_args);
 
     // Capture without terminal echo
     let captured = shell::spawn_shell_capture(&ShellCommand {
@@ -328,11 +342,7 @@ pub fn run_command_buffered(
     let path = bin_path::build_path_with_bins_pre_resolved(project_dir, bin_hint);
     let env_vars = resolve_and_load_env(project_dir, "", env_mode)?.vars;
 
-    let full_cmd = if extra_args.is_empty() {
-        command.to_string()
-    } else {
-        format!("{} {}", command, extra_args.join(" "))
-    };
+    let full_cmd = assemble_shell_command(command, extra_args);
 
     let captured = shell::spawn_shell_capture(&ShellCommand {
         command: &full_cmd,
@@ -370,11 +380,7 @@ pub fn run_script_prefixed(
     let path = bin_path::build_path_with_bins_pre_resolved(project_dir, bin_hint);
     let env_vars = resolve_and_load_env(project_dir, script_name, env_mode)?.vars;
 
-    let full_cmd = if extra_args.is_empty() {
-        script_cmd
-    } else {
-        format!("{} {}", script_cmd, extra_args.join(" "))
-    };
+    let full_cmd = assemble_shell_command(&script_cmd, extra_args);
 
     let captured = shell::spawn_shell_prefixed(
         &ShellCommand {
@@ -414,11 +420,7 @@ pub fn run_command_prefixed(
     let path = bin_path::build_path_with_bins_pre_resolved(project_dir, bin_hint);
     let env_vars = resolve_and_load_env(project_dir, "", env_mode)?.vars;
 
-    let full_cmd = if extra_args.is_empty() {
-        command.to_string()
-    } else {
-        format!("{} {}", command, extra_args.join(" "))
-    };
+    let full_cmd = assemble_shell_command(command, extra_args);
 
     let captured = shell::spawn_shell_prefixed(
         &ShellCommand {
@@ -461,11 +463,7 @@ pub fn run_command(
     let path = bin_path::build_path_with_bins_pre_resolved(project_dir, bin_hint);
     let env_vars = resolve_and_load_env(project_dir, "", env_mode)?.vars;
 
-    let full_cmd = if extra_args.is_empty() {
-        command.to_string()
-    } else {
-        format!("{} {}", command, extra_args.join(" "))
-    };
+    let full_cmd = assemble_shell_command(command, extra_args);
 
     let status = shell::spawn_shell(&ShellCommand {
         command: &full_cmd,
@@ -492,11 +490,7 @@ pub fn run_command_captured(
     let path = bin_path::build_path_with_bins_pre_resolved(project_dir, bin_hint);
     let env_vars = resolve_and_load_env(project_dir, "", env_mode)?.vars;
 
-    let full_cmd = if extra_args.is_empty() {
-        command.to_string()
-    } else {
-        format!("{} {}", command, extra_args.join(" "))
-    };
+    let full_cmd = assemble_shell_command(command, extra_args);
 
     let captured = shell::spawn_shell_tee(&ShellCommand {
         command: &full_cmd,
@@ -1128,5 +1122,55 @@ mod tests {
         assert!(result.is_ok());
         let output = result.unwrap();
         assert!(output.stdout.contains("prefixed-test"));
+    }
+
+    #[test]
+    fn assemble_shell_command_quotes_extra_args_against_injection() {
+        // Each runtime arg becomes a single-quoted POSIX shell word so
+        // a malicious tail like `; rm -rf ~` lands as one literal token.
+        let cmd = assemble_shell_command("echo hello", &["; rm -rf ~".into()]);
+        assert_eq!(cmd, "echo hello '; rm -rf ~'");
+
+        // Embedded single quotes are escaped via the close-escape-reopen
+        // dance — the resulting word reaches the script as the literal
+        // string `it's fine`.
+        let cmd = assemble_shell_command("echo", &["it's fine".into()]);
+        assert_eq!(cmd, r#"echo 'it'\''s fine'"#);
+
+        // Shell metacharacters in extra args are inert.
+        let cmd = assemble_shell_command(
+            "echo",
+            &["$HOME".into(), "`pwd`".into(), "&& whoami".into()],
+        );
+        assert_eq!(cmd, "echo '$HOME' '`pwd`' '&& whoami'");
+
+        // Empty extra-args list returns the script body verbatim — the
+        // body itself is package.json-authored and may contain pipes,
+        // redirects, env expansion that must work as written.
+        let cmd = assemble_shell_command("cat file | grep foo", &[]);
+        assert_eq!(cmd, "cat file | grep foo");
+    }
+
+    #[test]
+    fn extra_args_with_shell_metachars_do_not_detonate() {
+        // End-to-end: a malicious extra arg must not chain a second
+        // command. The script body is a no-op `:` that swallows all
+        // positional args; if injection succeeded the marker file
+        // would be created by the chained `touch`.
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("pwn");
+        fs::write(
+            dir.path().join("package.json"),
+            r#"{"scripts": {"noop": ":"}}"#,
+        )
+        .unwrap();
+
+        let payload = format!("; touch {}", marker.display());
+        let result = run_script(dir.path(), "noop", &[payload], None, &Unknown);
+        assert!(result.is_ok());
+        assert!(
+            !marker.exists(),
+            "shell-injected extra arg created marker — escaping is broken"
+        );
     }
 }

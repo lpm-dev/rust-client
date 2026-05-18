@@ -66,6 +66,40 @@
 //! offset by gaining real filesystem-write containment for our
 //! lifecycle-script child — the same trade-off landlock makes by
 //! granting access to specific subdirs through inheritable rules.
+//!
+//! # Accepted-posture trade-off (M55)
+//!
+//! The Low IL label survives `lpm` process exit. After a lifecycle
+//! script completes, the labelled directories remain writable by
+//! every Low IL process on the host — not just our (now-gone)
+//! lifecycle child. The audit threat model is a compromised Low IL
+//! process (a browser renderer, or any low-integrity app) using the
+//! persistent labels to poison `~/.npm`, `~/.cache`, `~/.node-gyp`,
+//! or `node_modules` between `lpm` runs, so a later normal-IL
+//! `lpm install / lpm run` picks up the planted bytes.
+//!
+//! The right fix is to revoke the Low IL label on every directory
+//! we labelled when the sandboxed process exits, so the writeable
+//! window matches the lifecycle script's lifetime. That requires
+//! either:
+//!
+//! - tracking every labelled path in the parent (we already do this
+//!   via `LABELED_ROOTS` for caching) AND running the revoke as a
+//!   `Drop` or explicit teardown step, which would also need to
+//!   handle the rare case where two concurrent `lpm` invocations
+//!   labelled overlapping paths and only one finishes; or
+//! - moving to the AppContainer backend (see
+//!   [`crate::windows_appcontainer`]) which uses DACL grants on a
+//!   per-token SID instead of integrity labels — the grants
+//!   evaporate when the AppContainer profile is destroyed.
+//!
+//! The current backend prefers persistent Low IL labels because the
+//! AppContainer flow has its own footguns (LowBox token attribute
+//! quirks, package-family-name collisions across concurrent installs)
+//! and is not yet the default. The cross-IL poisoning class is
+//! tracked as accepted posture under M55 in
+//! `private/security-findings.md`; the long-term mitigation handle is
+//! the AppContainer backend migration.
 
 #![cfg(target_os = "windows")]
 
@@ -1405,6 +1439,7 @@ mod tests {
             store_root: fake_home.join(".lpm/store"),
             home_dir: fake_home,
             tmpdir: fake_tmp,
+            secret_read_allow: Vec::new(),
             extra_write_dirs: Vec::new(),
         }
     }
@@ -1432,6 +1467,7 @@ mod tests {
             store_root: tmp_root.join("store"),
             home_dir,
             tmpdir,
+            secret_read_allow: Vec::new(),
             extra_write_dirs: Vec::new(),
         }
     }

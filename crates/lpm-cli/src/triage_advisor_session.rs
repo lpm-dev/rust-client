@@ -72,6 +72,123 @@ use lpm_triage_advisor::{
 
 use crate::output;
 
+/// Type alias for the ephemeral advisor approval key.
+///
+/// M29: keyed on `(name, version, integrity, script_bundle_hash)`.
+/// The script-bundle hash folds every `(phase, body)` pair the
+/// advisor evaluated into a SHA-256 digest. Today the same digest
+/// applies to every script of the package (whole-package
+/// classification); if a future refactor moves to per-phase
+/// classification, the key automatically distinguishes them. The
+/// integrity slot keeps source-aware identity (so a workspace
+/// `pkg@1` is distinct from a registry `pkg@1`); the bundle-hash
+/// slot keeps script-aware identity (so an approval can't leak to
+/// a sibling phase or to a different script body that happens to
+/// share the same package coordinate).
+pub type AdvisorApprovalKey = (String, String, Option<String>, String);
+
+/// Hash an ordered `(phase, body)` slice into a hex SHA-256 digest.
+/// Used to fold script bodies into [`AdvisorApprovalKey`].
+///
+/// Order is preserved (the caller passes phases in
+/// `EXECUTED_INSTALL_PHASES` order, matching `compute_script_hash`'s
+/// phase ordering). Distinct field separators (`0x1e` records,
+/// `0x00` fields) prevent the `phase="ab" body="cd"` /
+/// `phase="abc" body="d"` ambiguity that naive concatenation would
+/// have.
+pub fn compute_script_bundle_hash(amber_phases: &[(String, String)]) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    for (phase, body) in amber_phases {
+        hasher.update(phase.as_bytes());
+        hasher.update([0x00]);
+        hasher.update(body.as_bytes());
+        hasher.update([0x1e]);
+    }
+    hex::encode(hasher.finalize())
+}
+
+#[cfg(test)]
+mod bundle_hash_tests {
+    use super::compute_script_bundle_hash;
+
+    /// M29: identical phase lists hash identically.
+    #[test]
+    fn bundle_hash_is_deterministic_for_same_input() {
+        let a = vec![("preinstall".into(), "echo a".into())];
+        assert_eq!(
+            compute_script_bundle_hash(&a),
+            compute_script_bundle_hash(&a)
+        );
+    }
+
+    /// M29: different script body → different bundle hash. Pins the
+    /// per-script identity property the approval key is supposed to
+    /// guarantee against a future per-phase refactor.
+    #[test]
+    fn bundle_hash_changes_when_body_changes() {
+        let a = vec![("preinstall".into(), "echo a".into())];
+        let b = vec![("preinstall".into(), "echo b".into())];
+        assert_ne!(
+            compute_script_bundle_hash(&a),
+            compute_script_bundle_hash(&b)
+        );
+    }
+
+    /// Different phase → different hash, even with identical body.
+    #[test]
+    fn bundle_hash_changes_when_phase_changes() {
+        let a = vec![("preinstall".into(), "echo a".into())];
+        let b = vec![("postinstall".into(), "echo a".into())];
+        assert_ne!(
+            compute_script_bundle_hash(&a),
+            compute_script_bundle_hash(&b)
+        );
+    }
+
+    /// Order matters — `[a, b]` and `[b, a]` hash differently.
+    #[test]
+    fn bundle_hash_changes_with_phase_order() {
+        let a = vec![
+            ("preinstall".into(), "echo one".into()),
+            ("postinstall".into(), "echo two".into()),
+        ];
+        let b = vec![
+            ("postinstall".into(), "echo two".into()),
+            ("preinstall".into(), "echo one".into()),
+        ];
+        assert_ne!(
+            compute_script_bundle_hash(&a),
+            compute_script_bundle_hash(&b)
+        );
+    }
+
+    /// Distinct field separators close the
+    /// `phase="ab" body="cd"` vs `phase="abc" body="d"`
+    /// concatenation-ambiguity gap.
+    #[test]
+    fn bundle_hash_disambiguates_field_boundaries() {
+        let a = vec![("ab".into(), "cd".into())];
+        let b = vec![("abc".into(), "d".into())];
+        assert_ne!(
+            compute_script_bundle_hash(&a),
+            compute_script_bundle_hash(&b)
+        );
+    }
+
+    /// Empty bundle still produces a stable hash (used as the
+    /// "no amber phases" sentinel — `has_phases` filters them out at
+    /// the call site, but the helper must still be total).
+    #[test]
+    fn bundle_hash_empty_input_is_stable() {
+        let empty: Vec<(String, String)> = Vec::new();
+        let h1 = compute_script_bundle_hash(&empty);
+        let h2 = compute_script_bundle_hash(&empty);
+        assert_eq!(h1, h2);
+        assert_eq!(h1.len(), 64, "32-byte SHA-256 encoded as 64 hex chars");
+    }
+}
+
 /// Max in-flight advisor classifications inside
 /// [`AdvisorSession::classify_amber`]. parallelization
 /// : pre-parallelization, packages were classified one
@@ -111,7 +228,7 @@ pub struct AdvisorSession {
     /// the same coord with no registry integrity are distinct
     /// entries from registry installs that carry integrity, so an
     /// approval on one source cannot leak to a sibling source.
-    approvals: HashSet<(String, String, Option<String>)>,
+    approvals: HashSet<AdvisorApprovalKey>,
     /// Set to `true` after the single degrade-warning fires. Guards
     /// against repeat warnings if a future caller does extra preflight.
     warned_about_unavailable: bool,
@@ -323,126 +440,137 @@ impl AdvisorSession {
         let model_version = self.model_version.clone();
         let cache = self.cache.clone();
 
-        let results: Vec<(String, String, Option<String>, PackageAdvisorOutcome, bool)> =
-            futures::stream::iter(candidates.iter().map(|c| {
-                let cache = cache.clone();
-                let provider_slug = provider_slug.clone();
-                let template_hash = template_hash.clone();
-                let model_version = model_version.clone();
-                async move {
-                    let cache_key =
-                        build_package_cache_key(c, &template_hash, &provider_slug, &model_version);
+        let results: Vec<(
+            String,
+            String,
+            Option<String>,
+            String,
+            PackageAdvisorOutcome,
+            bool,
+        )> = futures::stream::iter(candidates.iter().map(|c| {
+            let cache = cache.clone();
+            let provider_slug = provider_slug.clone();
+            let template_hash = template_hash.clone();
+            let model_version = model_version.clone();
+            async move {
+                let cache_key =
+                    build_package_cache_key(c, &template_hash, &provider_slug, &model_version);
 
-                    // Fast path: cache hit. Map a single cached
-                    // verdict to the package-level outcome and skip
-                    // the LLM round-trip.
-                    if let Some(cache) = cache.as_deref()
-                        && let Some(verdict) = cache.lookup(&cache_key)
-                    {
-                        let outcome = match verdict {
-                            AdvisorVerdict::Approve => PackageAdvisorOutcome::Approve,
-                            AdvisorVerdict::Manual => PackageAdvisorOutcome::Manual,
-                            AdvisorVerdict::Abstain => PackageAdvisorOutcome::Abstain,
-                        };
-                        return (
-                            c.name.clone(),
-                            c.version.clone(),
-                            c.integrity.clone(),
-                            outcome,
-                            !c.amber_phases.is_empty(),
-                        );
-                    }
-
-                    // Lever #3 — borrow the referenced-
-                    // file content as a slice of `ReferencedScript`
-                    // so the prompt's "Referenced files" section
-                    // can render the embedded view.
-                    let referenced: Vec<lpm_triage_advisor::ReferencedScript<'_>> = c
-                        .referenced_scripts
-                        .iter()
-                        .map(|(filename, content)| lpm_triage_advisor::ReferencedScript {
-                            filename: filename.as_str(),
-                            content: content.as_str(),
-                        })
-                        .collect();
-                    let mut package_verdict = PackageAdvisorOutcome::Approve;
-                    for (phase, body) in &c.amber_phases {
-                        let amber = AmberScript {
-                            package_name: &c.name,
-                            package_version: &c.version,
-                            phase: phase.as_str(),
-                            script_body: body.as_str(),
-                            repository: c.repository.as_deref(),
-                            referenced_scripts: &referenced,
-                        };
-                        match adapter.classify_amber(&amber).await {
-                            Ok(AdvisorVerdict::Approve) => {}
-                            Ok(AdvisorVerdict::Manual) => {
-                                package_verdict = PackageAdvisorOutcome::Manual;
-                                break;
-                            }
-                            Ok(AdvisorVerdict::Abstain) => {
-                                package_verdict =
-                                    package_verdict.degrade_to(PackageAdvisorOutcome::Abstain);
-                            }
-                            Err(_) => {
-                                // Silent per the locked contract;
-                                // degrade to "no approval" for this
-                                // package and keep scanning the
-                                // remaining packages. Per-package
-                                // failures are NOT cached — a
-                                // future re-install may succeed.
-                                package_verdict =
-                                    package_verdict.degrade_to(PackageAdvisorOutcome::Abstain);
-                                return (
-                                    c.name.clone(),
-                                    c.version.clone(),
-                                    c.integrity.clone(),
-                                    package_verdict,
-                                    !c.amber_phases.is_empty(),
-                                );
-                            }
-                        }
-                    }
-
-                    // Persist this package's final verdict to the
-                    // cache (insert is cheap; persist happens once
-                    // at the end of the session). Map back to the
-                    // raw verdict for storage.
-                    if let Some(cache) = cache.as_deref() {
-                        let stored = match package_verdict {
-                            PackageAdvisorOutcome::Approve => AdvisorVerdict::Approve,
-                            PackageAdvisorOutcome::Manual => AdvisorVerdict::Manual,
-                            PackageAdvisorOutcome::Abstain => AdvisorVerdict::Abstain,
-                        };
-                        cache.insert(
-                            cache_key,
-                            stored,
-                            &provider_slug,
-                            &model_version,
-                            &template_hash,
-                        );
-                    }
-
-                    (
+                // Fast path: cache hit. Map a single cached
+                // verdict to the package-level outcome and skip
+                // the LLM round-trip.
+                if let Some(cache) = cache.as_deref()
+                    && let Some(verdict) = cache.lookup(&cache_key)
+                {
+                    let outcome = match verdict {
+                        AdvisorVerdict::Approve => PackageAdvisorOutcome::Approve,
+                        AdvisorVerdict::Manual => PackageAdvisorOutcome::Manual,
+                        AdvisorVerdict::Abstain => PackageAdvisorOutcome::Abstain,
+                    };
+                    return (
                         c.name.clone(),
                         c.version.clone(),
                         c.integrity.clone(),
-                        package_verdict,
+                        compute_script_bundle_hash(&c.amber_phases),
+                        outcome,
                         !c.amber_phases.is_empty(),
-                    )
+                    );
                 }
-            }))
-            .buffer_unordered(CLASSIFY_CONCURRENCY)
-            .collect()
-            .await;
+
+                // Lever #3 — borrow the referenced-
+                // file content as a slice of `ReferencedScript`
+                // so the prompt's "Referenced files" section
+                // can render the embedded view.
+                let referenced: Vec<lpm_triage_advisor::ReferencedScript<'_>> = c
+                    .referenced_scripts
+                    .iter()
+                    .map(|(filename, content)| lpm_triage_advisor::ReferencedScript {
+                        filename: filename.as_str(),
+                        content: content.as_str(),
+                    })
+                    .collect();
+                let mut package_verdict = PackageAdvisorOutcome::Approve;
+                for (phase, body) in &c.amber_phases {
+                    let amber = AmberScript {
+                        package_name: &c.name,
+                        package_version: &c.version,
+                        phase: phase.as_str(),
+                        script_body: body.as_str(),
+                        repository: c.repository.as_deref(),
+                        referenced_scripts: &referenced,
+                    };
+                    match adapter.classify_amber(&amber).await {
+                        Ok(AdvisorVerdict::Approve) => {}
+                        Ok(AdvisorVerdict::Manual) => {
+                            package_verdict = PackageAdvisorOutcome::Manual;
+                            break;
+                        }
+                        Ok(AdvisorVerdict::Abstain) => {
+                            package_verdict =
+                                package_verdict.degrade_to(PackageAdvisorOutcome::Abstain);
+                        }
+                        Err(_) => {
+                            // Silent per the locked contract;
+                            // degrade to "no approval" for this
+                            // package and keep scanning the
+                            // remaining packages. Per-package
+                            // failures are NOT cached — a
+                            // future re-install may succeed.
+                            package_verdict =
+                                package_verdict.degrade_to(PackageAdvisorOutcome::Abstain);
+                            return (
+                                c.name.clone(),
+                                c.version.clone(),
+                                c.integrity.clone(),
+                                compute_script_bundle_hash(&c.amber_phases),
+                                package_verdict,
+                                !c.amber_phases.is_empty(),
+                            );
+                        }
+                    }
+                }
+
+                // Persist this package's final verdict to the
+                // cache (insert is cheap; persist happens once
+                // at the end of the session). Map back to the
+                // raw verdict for storage.
+                if let Some(cache) = cache.as_deref() {
+                    let stored = match package_verdict {
+                        PackageAdvisorOutcome::Approve => AdvisorVerdict::Approve,
+                        PackageAdvisorOutcome::Manual => AdvisorVerdict::Manual,
+                        PackageAdvisorOutcome::Abstain => AdvisorVerdict::Abstain,
+                    };
+                    cache.insert(
+                        cache_key,
+                        stored,
+                        &provider_slug,
+                        &model_version,
+                        &template_hash,
+                    );
+                }
+
+                (
+                    c.name.clone(),
+                    c.version.clone(),
+                    c.integrity.clone(),
+                    compute_script_bundle_hash(&c.amber_phases),
+                    package_verdict,
+                    !c.amber_phases.is_empty(),
+                )
+            }
+        }))
+        .buffer_unordered(CLASSIFY_CONCURRENCY)
+        .collect()
+        .await;
 
         // Serial application of approvals — single-thread mutation,
         // no locks. Order doesn't matter because the approval set is
-        // a `HashSet` keyed by `(name, version, integrity)`.
-        for (name, version, integrity, outcome, has_phases) in results {
+        // a `HashSet` keyed by
+        // `(name, version, integrity, script_bundle_hash)`.
+        for (name, version, integrity, script_bundle_hash, outcome, has_phases) in results {
             if outcome == PackageAdvisorOutcome::Approve && has_phases {
-                self.approvals.insert((name, version, integrity));
+                self.approvals
+                    .insert((name, version, integrity, script_bundle_hash));
             }
         }
 
@@ -466,7 +594,7 @@ impl AdvisorSession {
     /// (`compute_blocked_packages_with_metadata`) both consult this
     /// view; both must see the SAME set so a package can't be
     /// blocked while its script also runs.
-    pub fn approvals(&self) -> &HashSet<(String, String, Option<String>)> {
+    pub fn approvals(&self) -> &HashSet<AdvisorApprovalKey> {
         &self.approvals
     }
 }
@@ -879,9 +1007,13 @@ mod tests {
         ];
         s.classify_amber(&reqs).await;
         assert_eq!(s.approvals().len(), 1);
+        // M29: approval key includes the script-bundle hash. Today
+        // the bundle is `[("preinstall", "echo approve-me")]`; verify
+        // the entry exists by matching on the first three fields.
         assert!(
             s.approvals()
-                .contains(&("approve-me".into(), "1.0.0".into(), None))
+                .iter()
+                .any(|(n, v, i, _)| { n == "approve-me" && v == "1.0.0" && i.is_none() })
         );
         let log = call_log.lock().await.clone();
         // Manual short-circuits the per-package loop, so we expect

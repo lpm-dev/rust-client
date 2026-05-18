@@ -48,7 +48,9 @@
 
 use crate::output;
 use chrono::{Duration as ChronoDuration, Utc};
-use lpm_common::{LpmError, LpmRoot, known_projects, with_exclusive_lock, with_shared_lock};
+use lpm_common::{
+    LpmError, LpmRoot, known_projects, sanitize_for_terminal, with_exclusive_lock, with_shared_lock,
+};
 use lpm_store::v2::Store as V2Store;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -118,6 +120,20 @@ pub struct PruneSummary {
     /// populated alongside [`Self::registry_corrupt`]. Empty on the
     /// healthy and missing-but-not-corrupt paths.
     pub registry_corrupt_reason: String,
+    /// Human-readable failure from counting pending tombstones in
+    /// dry-run preview. `Some(_)` indicates the global manifest exists
+    /// but `try_count_pending_tombstones` could not read or parse it —
+    /// the dry-run preview cannot distinguish "no tombstones" from
+    /// "tombstone state unknown" without this field. JSON consumers
+    /// rely on it to avoid treating a corrupted manifest as healthy.
+    pub tombstone_count_error: Option<String>,
+    /// Human-readable failure from `sweep_tombstones` under `--apply`.
+    /// `Some(_)` indicates the sweep returned `Err` — e.g. manifest
+    /// unreadable, future schema, permission denied. The retained list
+    /// stays empty in this case and `tombstones_swept` stays zero, so
+    /// without this field the JSON envelope would look identical to a
+    /// successful no-op sweep.
+    pub tombstone_sweep_error: Option<String>,
 }
 
 /// Entry point for the CLI dispatcher. Resolves the v2 store + flags,
@@ -195,23 +211,29 @@ fn run_locked(
             }
         }
 
-        // Sweep deferred global-uninstall tombstones — best-effort,
-        // never fails the caller. Runs unconditionally under
-        // `--apply`, including the registry-missing degraded path so
-        // `lpm uninstall -g`'s deferred-cleanup retry remains
+        // Sweep deferred global-uninstall tombstones. Errors are
+        // surfaced via `summary.tombstone_sweep_error` (and a
+        // `tracing::warn`) instead of being collapsed into an empty
+        // report — that's the L53 contract: the JSON envelope and the
+        // human output must let consumers tell "no tombstones" apart
+        // from "could not inspect tombstones." Runs unconditionally
+        // under `--apply`, including the registry-missing degraded
+        // path so `lpm uninstall -g`'s deferred-cleanup retry remains
         // reachable when `~/.lpm/known-projects.json` hasn't been
         // populated yet (registry writes are best-effort during
         // install per `crates/lpm-common/src/known_projects.rs:102`).
-        let sweep = match lpm_global::sweep_tombstones(root) {
-            Ok(s) => s,
-            Err(e) => {
-                tracing::warn!("cache prune: global tombstone sweep failed: {e}");
-                lpm_global::SweepReport::default()
+        match lpm_global::sweep_tombstones(root) {
+            Ok(sweep) => {
+                summary.tombstones_swept = sweep.swept.len();
+                summary.tombstones_retained = sweep.retained;
+                summary.tombstone_bytes_freed = sweep.freed_bytes;
             }
-        };
-        summary.tombstones_swept = sweep.swept.len();
-        summary.tombstones_retained = sweep.retained;
-        summary.tombstone_bytes_freed = sweep.freed_bytes;
+            Err(e) => {
+                let msg = e.to_string();
+                tracing::warn!("cache prune: global tombstone sweep failed: {msg}");
+                summary.tombstone_sweep_error = Some(msg);
+            }
+        }
         summary.applied = true;
     }
 
@@ -293,6 +315,8 @@ pub fn compute_prune_plan(
             // [`run_locked`] will treat as tombstone-only. The
             // tombstone count is populated so dry-run still surfaces
             // the work `--apply` will do.
+            let (tombstones_pending, tombstone_count_error) =
+                count_tombstones_with_error_capture(root);
             return Ok(PruneSummary {
                 applied: false,
                 projects_walked: 0,
@@ -304,13 +328,15 @@ pub fn compute_prune_plan(
                 object_entries_reachable: 0,
                 object_entries_orphaned: Vec::new(),
                 bytes_freed_or_eligible: 0,
-                tombstones_pending: lpm_global::count_pending_tombstones(root),
+                tombstones_pending,
                 tombstones_swept: 0,
                 tombstones_retained: Vec::new(),
                 tombstone_bytes_freed: 0,
                 registry_missing,
                 registry_corrupt,
                 registry_corrupt_reason,
+                tombstone_count_error,
+                tombstone_sweep_error: None,
             });
         }
     }
@@ -327,26 +353,39 @@ pub fn compute_prune_plan(
     // ── Step 3: BFS through link-meta sidecar `deps[].target_graph_key`
     //         to mark every reachable link entry.
     //
-    // Canonicalize every link_dir up front so the BFS frontier (which
-    // arrives canonicalized from `add_if_link_descendant`) compares
-    // cleanly against entries here. macOS's `/private/var/folders/...`
-    // canonical form vs. `/var/folders/...` symlink-shape would
-    // otherwise prevent the match and leave every entry "unreachable"
-    // even from a project that explicitly symlinks into it.
+    // Each entry carries both its raw store-child path (used for
+    // deletion under `--apply`) and its canonical path (used for BFS
+    // comparison against `add_if_link_descendant`'s canonical frontier).
+    // macOS's `/private/var/folders/...` canonical form vs.
+    // `/var/folders/...` symlink-shape requires the canonical compare;
+    // keeping the raw path for deletion ensures `remove_dir_all`
+    // operates on the actual store child even when canonicalize would
+    // resolve elsewhere. The store-side `iter_link_entries` refuses
+    // symlinks at `links/<entry>` (see store.rs), so the raw path is
+    // always a direct store child; the `starts_with` defence below is
+    // belt-and-suspenders for any future regression.
     let raw_entries: Vec<(PathBuf, lpm_store::v2::LinkMeta)> =
         v2_store.iter_link_entries()?.collect();
-    let all_link_entries: Vec<(PathBuf, lpm_store::v2::LinkMeta)> = raw_entries
-        .into_iter()
-        .map(|(dir, meta)| {
-            let canonical = std::fs::canonicalize(&dir).unwrap_or(dir);
-            (canonical, meta)
-        })
-        .collect();
+    let mut all_link_entries: Vec<(PathBuf, PathBuf, lpm_store::v2::LinkMeta)> =
+        Vec::with_capacity(raw_entries.len());
+    for (raw_dir, meta) in raw_entries {
+        let canonical_dir = std::fs::canonicalize(&raw_dir).unwrap_or_else(|_| raw_dir.clone());
+        if !canonical_dir.starts_with(&links_root_canonical) {
+            tracing::warn!(
+                "cache prune: skipping link entry at {} — canonical path {} escapes the canonical links root {} (corrupted store?)",
+                raw_dir.display(),
+                canonical_dir.display(),
+                links_root_canonical.display(),
+            );
+            continue;
+        }
+        all_link_entries.push((raw_dir, canonical_dir, meta));
+    }
 
     let mut by_digest: std::collections::HashMap<String, PathBuf> =
         std::collections::HashMap::with_capacity(all_link_entries.len());
-    for (dir, meta) in &all_link_entries {
-        by_digest.insert(meta.graph_key_digest_hex.clone(), dir.clone());
+    for (_, canonical_dir, meta) in &all_link_entries {
+        by_digest.insert(meta.graph_key_digest_hex.clone(), canonical_dir.clone());
     }
 
     let link_entries_total = all_link_entries.len();
@@ -357,8 +396,10 @@ pub fn compute_prune_plan(
         if !reachable.insert(dir.clone()) {
             continue;
         }
-        // Find this entry's sidecar and walk its dep edges.
-        if let Some((_, meta)) = all_link_entries.iter().find(|(d, _)| d == &dir) {
+        if let Some((_, _, meta)) = all_link_entries
+            .iter()
+            .find(|(_, canonical, _)| canonical == &dir)
+        {
             for dep in &meta.deps {
                 if let Some(target_dir) = by_digest.get(&dep.target_graph_key) {
                     frontier.push(target_dir.clone());
@@ -368,32 +409,24 @@ pub fn compute_prune_plan(
     }
 
     // ── Step 4: Apply --max-age filter to mark "young" orphans as live.
+    //
+    // Orphan list stores the RAW store-child path — the deletion path
+    // in `run_locked` calls `remove_dir_all` on it directly, so the
+    // canonical-form is intentionally not used for that purpose.
     let now = Utc::now();
     let mut link_entries_orphaned = Vec::new();
-    for (dir, meta) in &all_link_entries {
-        if reachable.contains(dir) {
+    for (raw_dir, canonical_dir, meta) in &all_link_entries {
+        if reachable.contains(canonical_dir) {
             continue;
         }
         if let Some(max_age) = max_age {
-            // followup #3 — the JSON `last_referenced_at`
-            // field is set at first population and never rewritten
-            // post-followup; cache-hit installs refresh the sidecar
-            // file's mtime instead. `effective_last_referenced_at`
-            // returns max(json_field, file_mtime) so this filter
-            // sees fresh installs even though the JSON itself is
-            // immutable. Schema-compatible with pre-followup
-            // sidecars (where touch rewrote the field — the json
-            // field is still ≤ mtime in the worst case).
-            let sidecar_path = dir.join(lpm_store::v2::LINK_META_FILENAME);
+            let sidecar_path = raw_dir.join(lpm_store::v2::LINK_META_FILENAME);
             let last_seen = meta.effective_last_referenced_at(&sidecar_path);
             if (now - last_seen) < max_age {
-                // Young entry — preserve under the "registry might
-                // be stale; entry might be in-use by an unrecorded
-                // project" assumption.
                 continue;
             }
         }
-        link_entries_orphaned.push(dir.clone());
+        link_entries_orphaned.push(raw_dir.clone());
     }
 
     // ── Step 5: Object orphan detection (preplan). An object is
@@ -405,13 +438,10 @@ pub fn compute_prune_plan(
     //         entirely.
     let orphan_link_set: HashSet<&PathBuf> = link_entries_orphaned.iter().collect();
     let mut object_referenced_segments: HashSet<String> = HashSet::new();
-    for (dir, meta) in &all_link_entries {
-        if orphan_link_set.contains(dir) {
+    for (raw_dir, _, meta) in &all_link_entries {
+        if orphan_link_set.contains(raw_dir) {
             continue;
         }
-        // `LinkMeta.object_path` is `objects/<segment>` relative to the
-        // store root. Strip the prefix to align with iter_object_dirs's
-        // segment.
         let segment = meta
             .object_path
             .strip_prefix("objects/")
@@ -440,6 +470,8 @@ pub fn compute_prune_plan(
             bytes_freed_or_eligible.saturating_add(dir_size(dir).unwrap_or(0));
     }
 
+    let (tombstones_pending, tombstone_count_error) = count_tombstones_with_error_capture(root);
+
     Ok(PruneSummary {
         applied: false,
         projects_walked: projects.len(),
@@ -451,14 +483,34 @@ pub fn compute_prune_plan(
         object_entries_reachable: object_referenced_segments.len(),
         object_entries_orphaned,
         bytes_freed_or_eligible,
-        tombstones_pending: lpm_global::count_pending_tombstones(root),
+        tombstones_pending,
         tombstones_swept: 0,
         tombstones_retained: Vec::new(),
         tombstone_bytes_freed: 0,
         registry_missing,
         registry_corrupt,
         registry_corrupt_reason,
+        tombstone_count_error,
+        tombstone_sweep_error: None,
     })
+}
+
+/// Count pending global-uninstall tombstones, capturing any
+/// read/parse failure as a human-readable error string. Splits "no
+/// tombstones" (returns `(0, None)`) from "could not inspect"
+/// (returns `(0, Some(reason))`) so the cache-prune emitters can
+/// surface a corruption warning instead of silently reporting zero.
+fn count_tombstones_with_error_capture(root: &LpmRoot) -> (usize, Option<String>) {
+    match lpm_global::try_count_pending_tombstones(root) {
+        Ok(n) => (n, None),
+        Err(e) => {
+            let msg = e.to_string();
+            tracing::warn!(
+                "cache prune: tombstone count unavailable (manifest unreadable?): {msg}"
+            );
+            (0, Some(msg))
+        }
+    }
 }
 
 /// Walk `<project>/node_modules/<entry>` symlinks and add any whose
@@ -545,7 +597,7 @@ fn dir_size(dir: &Path) -> std::io::Result<u64> {
     let mut total = 0u64;
     for entry in std::fs::read_dir(dir)? {
         let entry = entry?;
-        let meta = entry.metadata()?;
+        let meta = std::fs::symlink_metadata(entry.path())?;
         if meta.is_file() {
             total = total.saturating_add(meta.len());
         } else if meta.is_dir() {
@@ -563,13 +615,14 @@ fn emit_human(summary: &PruneSummary, applied: bool) {
         // garbage / wrong schema / unreadable. Treat as no roots
         // (same as missing) but flag the corruption so the user can
         // act — silently degrading would hide a real problem with
-        // their machine state.
+        // their machine state. Sanitize the reason because it can
+        // include parser-controlled bytes from the corrupt file.
         output::warn(&format!(
             "Project registry at ~/.lpm/known-projects.json is unusable ({reason}). \
              Delete the file (a fresh `lpm install` will recreate it) or pass \
              `--project <path>` to walk a specific project. Orphan detection is \
              skipped to avoid wiping the store; tombstone sweep still runs under --apply.",
-            reason = summary.registry_corrupt_reason,
+            reason = sanitize_for_terminal(&summary.registry_corrupt_reason),
         ));
     } else if summary.registry_missing {
         // Degraded path: no project registry → no roots → orphan
@@ -621,10 +674,28 @@ fn emit_human(summary: &PruneSummary, applied: bool) {
             summary.tombstones_retained.len(),
         ));
         for failure in &summary.tombstones_retained {
-            output::warn(&format!("  {}: {}", failure.relative_path, failure.reason));
+            output::warn(&format!(
+                "  {}: {}",
+                sanitize_for_terminal(&failure.relative_path),
+                sanitize_for_terminal(&failure.reason),
+            ));
         }
     }
-    if !applied && summary.tombstones_pending > 0 {
+    if let Some(reason) = &summary.tombstone_sweep_error {
+        output::warn(&format!(
+            "Could not sweep global-install tombstones ({}). The global manifest may be \
+             unreadable or corrupted — the retained list is unknown for this run.",
+            sanitize_for_terminal(reason),
+        ));
+    }
+    if let Some(reason) = &summary.tombstone_count_error {
+        output::warn(&format!(
+            "Could not inspect pending global-install tombstones ({}). Dry-run reports 0 \
+             pending but the actual count is unknown until the manifest is readable.",
+            sanitize_for_terminal(reason),
+        ));
+    }
+    if !applied && summary.tombstones_pending > 0 && summary.tombstone_count_error.is_none() {
         output::info(&format!(
             "{} pending global-install tombstone(s) — `lpm cache prune --apply` will sweep them",
             summary.tombstones_pending,
@@ -643,10 +714,16 @@ fn emit_human(summary: &PruneSummary, applied: bool) {
     }
     if !applied && summary.link_entries_orphaned.len() <= 20 {
         for dir in &summary.link_entries_orphaned {
-            println!("  link orphan: {}", dir.display());
+            println!(
+                "  link orphan: {}",
+                sanitize_for_terminal(&dir.display().to_string())
+            );
         }
         for dir in &summary.object_entries_orphaned {
-            println!("  object orphan: {}", dir.display());
+            println!(
+                "  object orphan: {}",
+                sanitize_for_terminal(&dir.display().to_string())
+            );
         }
     }
 }
@@ -685,6 +762,8 @@ fn emit_json(summary: &PruneSummary) {
             }))
             .collect::<Vec<_>>(),
         "tombstone_bytes_freed": summary.tombstone_bytes_freed,
+        "tombstone_count_error": summary.tombstone_count_error,
+        "tombstone_sweep_error": summary.tombstone_sweep_error,
     });
     println!("{}", serde_json::to_string_pretty(&json).unwrap());
 }
@@ -982,6 +1061,183 @@ mod tests {
         // After --project run the stale entry is still there.
         let still_there = known_projects::load(&root.known_projects());
         assert_eq!(still_there.projects.len(), 1);
+    }
+
+    /// A poisoned link entry shaped as a symlink resolving outside the
+    /// store must not appear in the orphan list — otherwise `--apply`
+    /// would call `remove_dir_all` on the symlink target outside the
+    /// store. The store-side filter rejects symlinks at `links/<entry>`
+    /// before the prune plan ever sees them; this regression pins that
+    /// contract from the cache-prune caller's point of view.
+    #[test]
+    #[cfg(unix)]
+    fn compute_prune_plan_drops_symlinked_link_entry_resolving_outside_store() {
+        let dir = tempfile::tempdir().unwrap();
+        let lpm_home = dir.path().join("lpm-home");
+        std::fs::create_dir_all(&lpm_home).unwrap();
+        let root = LpmRoot::from_dir(&lpm_home);
+        let store = V2Store::from_lpm_root(&root);
+
+        let used_sri = synthetic_sri(b"prune-symlink/used");
+        write_object(&store, &used_sri);
+        let used_key = key_for("used-pkg", "1.0.0");
+        store
+            .populate_link_entry(LinkEntryRequest {
+                graph_key: used_key.clone(),
+                source_sri: used_sri.clone(),
+                object_dir: store.paths().object_dir(&used_sri).unwrap(),
+                deps: vec![],
+                platform: Arc::new(sample_meta_platform()),
+            })
+            .unwrap();
+
+        let outside = dir.path().join("attacker-controlled");
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(
+            outside.join(lpm_store::v2::LINK_META_FILENAME),
+            br#"{"schema":1,"name":"poisoned","version":"99.0.0","source_sri":"sha512-x","object_path":"objects/sha512-x","graph_key_digest_hex":"deadbeef","deps":[],"platform":{"os":"darwin","cpu":"arm64"},"last_referenced_at":"2024-01-01T00:00:00Z"}"#,
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(&outside, store.paths().links_root().join("poisoned-entry"))
+            .unwrap();
+
+        let project = dir.path().join("project");
+        synthesize_project(&project, &store, &[("used-pkg", used_key.clone())]);
+        known_projects::register(&root.known_projects(), &project).unwrap();
+
+        let summary = compute_prune_plan(&root, &store, &PruneFlags::default(), None).unwrap();
+
+        assert_eq!(
+            summary.link_entries_total, 1,
+            "symlinked entry must not be counted as a valid link entry"
+        );
+        for orphan in &summary.link_entries_orphaned {
+            assert!(
+                !orphan.starts_with(&outside),
+                "orphan list must not contain a path resolving outside the store: {}",
+                orphan.display()
+            );
+            assert!(
+                orphan
+                    .file_name()
+                    .map(|n| n != "poisoned-entry")
+                    .unwrap_or(true),
+                "orphan list must not contain the symlinked entry name"
+            );
+        }
+
+        assert!(
+            outside.exists(),
+            "outside-of-store directory must still exist after the prune walk"
+        );
+    }
+
+    /// A corrupt global manifest (parseable file → garbage TOML) must
+    /// surface as `tombstone_count_error: Some(...)` in the dry-run
+    /// summary instead of collapsing to `tombstones_pending: 0` with
+    /// no signal. JSON consumers depend on this to tell "no tombstones"
+    /// apart from "could not inspect tombstones."
+    #[test]
+    #[cfg(unix)]
+    fn compute_prune_plan_surfaces_tombstone_count_error_when_manifest_is_corrupt() {
+        let dir = tempfile::tempdir().unwrap();
+        let lpm_home = dir.path().join("lpm-home");
+        std::fs::create_dir_all(&lpm_home).unwrap();
+        let root = LpmRoot::from_dir(&lpm_home);
+
+        std::fs::create_dir_all(root.global_root()).unwrap();
+        std::fs::write(
+            root.global_manifest(),
+            b"this = is = not = valid = toml\n[[",
+        )
+        .unwrap();
+
+        let store = V2Store::from_lpm_root(&root);
+        let project = dir.path().join("project");
+        std::fs::create_dir_all(project.join("node_modules")).unwrap();
+        known_projects::register(&root.known_projects(), &project).unwrap();
+
+        let summary = compute_prune_plan(&root, &store, &PruneFlags::default(), None).unwrap();
+        assert_eq!(
+            summary.tombstones_pending, 0,
+            "count collapses to 0 on read failure, but the error field carries the signal"
+        );
+        let reason = summary
+            .tombstone_count_error
+            .as_deref()
+            .expect("corrupt manifest must surface a count error");
+        assert!(
+            reason.to_lowercase().contains("manifest") || reason.to_lowercase().contains("toml"),
+            "tombstone_count_error must describe the failure, got: {reason}"
+        );
+    }
+
+    /// `--apply` against a corrupt global manifest must surface
+    /// `tombstone_sweep_error: Some(...)` instead of returning a clean
+    /// `tombstones_swept: 0, tombstones_retained: []` shape that would
+    /// look identical to a successful no-op sweep.
+    #[test]
+    #[cfg(unix)]
+    fn run_locked_surfaces_tombstone_sweep_error_when_manifest_is_corrupt() {
+        let dir = tempfile::tempdir().unwrap();
+        let lpm_home = dir.path().join("lpm-home");
+        std::fs::create_dir_all(&lpm_home).unwrap();
+        let root = LpmRoot::from_dir(&lpm_home);
+
+        std::fs::create_dir_all(root.global_root()).unwrap();
+        std::fs::write(root.global_manifest(), b"@@@ not toml @@@").unwrap();
+
+        let store = V2Store::from_lpm_root(&root);
+        let project = dir.path().join("project");
+        synthesize_project(&project, &store, &[]);
+        known_projects::register(&root.known_projects(), &project).unwrap();
+
+        let flags = PruneFlags {
+            apply: true,
+            ..PruneFlags::default()
+        };
+        let summary = run_locked(&root, &store, &flags, None).unwrap();
+
+        assert_eq!(
+            summary.tombstones_swept, 0,
+            "no tombstones were actually swept under a corrupt manifest"
+        );
+        assert!(
+            summary.tombstones_retained.is_empty(),
+            "retained list stays empty on hard sweep failure"
+        );
+        let reason = summary
+            .tombstone_sweep_error
+            .as_deref()
+            .expect("corrupt manifest must surface a sweep error under --apply");
+        assert!(
+            !reason.is_empty(),
+            "tombstone_sweep_error must be a non-empty reason, got: {reason:?}"
+        );
+    }
+
+    /// The cache-prune human emitter must scrub control bytes from
+    /// state-derived fields (tombstone failure reasons / paths,
+    /// registry corruption reasons). The sanitizer is exercised via
+    /// `sanitize_for_terminal`; this asserts a worked example so a
+    /// future refactor of `emit_human` doesn't silently drop the
+    /// scrub.
+    #[test]
+    fn sanitize_for_terminal_strips_osc_and_bel_from_sample_tombstone_reason() {
+        let raw = "installs/evil-pkg@1.0.0\x1b]8;;file:///etc/shadow\x07";
+        let cleaned = lpm_common::sanitize_for_terminal(raw);
+        assert!(
+            !cleaned.contains('\x1b'),
+            "ESC must be stripped from {raw:?}, got {cleaned:?}"
+        );
+        assert!(
+            !cleaned.contains('\x07'),
+            "BEL must be stripped from {raw:?}, got {cleaned:?}"
+        );
+        assert!(
+            cleaned.contains("installs/evil-pkg@1.0.0"),
+            "printable prefix must survive the scrub, got {cleaned:?}"
+        );
     }
 
     /// Avoid an `unused` warning on `HashMap` + `DateTime` re-exports

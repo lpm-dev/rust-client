@@ -117,8 +117,33 @@ fn store_wrapping_key_in_keyring(key: &[u8; 32]) -> Result<(), String> {
 }
 
 /// Read the wrapping key from the file fallback.
+///
+/// On Unix, refuses to surface the key when the file's mode is more
+/// permissive than 0o600 — the write-side already sets 0o600, but a
+/// host that restored the file from a backup or a user who manually
+/// `chmod`-ed it could end up with the key world-readable. Refusing
+/// at read time forces the user to notice and re-chmod (or force a
+/// fresh key by removing the file), rather than silently using a
+/// key any local UID could exfiltrate.
 fn read_wrapping_key_from_file() -> Option<[u8; 32]> {
     let key_path = dirs::home_dir()?.join(".lpm").join(".vault-key");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if let Ok(meta) = std::fs::metadata(&key_path)
+            && (meta.permissions().mode() & 0o777) > 0o600
+        {
+            tracing::warn!(
+                ".vault-key at {} has permissive mode {:o} (>0o600); refusing to use \
+                 the file-fallback wrapping key. Run `chmod 600 {}` to restore the \
+                 source, or delete the file to force a fresh key on next write.",
+                key_path.display(),
+                meta.permissions().mode() & 0o777,
+                key_path.display(),
+            );
+            return None;
+        }
+    }
     let hex_key = std::fs::read_to_string(&key_path).ok()?;
     let bytes = hex::decode(hex_key.trim()).ok()?;
     if bytes.len() != 32 {
@@ -152,6 +177,15 @@ fn store_wrapping_key_in_file(key: &[u8; 32]) -> Result<(), String> {
 ///
 /// Kept only for migration — old vaults may have keys wrapped with this.
 /// New code should use [`get_or_create_wrapping_key`] instead.
+///
+/// M12: this derivation has no forward secrecy. A stale bearer token
+/// captured by any side channel (process argv, log scrape, keychain
+/// leak) decrypts every pre-migration vault blob that bearer ever
+/// wrapped. The migration path in [`decrypt_vault_from_sync`] re-
+/// encrypts under the stored wrapping key on next push, but until
+/// that push runs the legacy blob remains decryptable. Operators
+/// should rotate any stored bearer that has been observed by other
+/// processes and re-push the vault.
 pub fn derive_legacy_wrapping_key(auth_token: &str) -> [u8; 32] {
     let mut hasher = Sha256::new();
     hasher.update(b"lpm-vault-wrap:");
@@ -278,8 +312,15 @@ pub fn decrypt_vault_from_sync(
     let plaintext = decrypt(&aes_key, encrypted_blob)?;
     let text = String::from_utf8(plaintext).map_err(|e| format!("utf8 error: {e}"))?;
 
-    tracing::info!(
-        "vault decrypted with legacy key — re-encrypting under stored key (caller pushes back)"
+    // M12: a legacy decryption succeeded — the blob was wrapped with
+    // SHA256("lpm-vault-wrap:" + auth_token), which has no forward
+    // secrecy. Surface the posture loudly so an operator scanning
+    // logs sees the migration window and rotates the bearer if it
+    // has been exposed anywhere (process argv pre-H4, CI log leak,
+    // backup), in addition to the implicit re-encrypt that happens
+    // on the next push.
+    tracing::warn!(
+        "vault decrypted with legacy token-derived key (no forward secrecy) — re-encrypting under stored key on next push. If the bearer that decrypted this blob has been exposed to other processes / logs / backups, rotate it before any peer can capture the same blob.",
     );
 
     Ok(DecryptResult {
@@ -466,9 +507,6 @@ pub fn p256_pair_wrap_key(
 mod tests {
     use super::*;
 
-    /// Lock to serialize tests that access the shared wrapping key (keyring + file).
-    static WRAPPING_KEY_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
     /// Hermetic test environment for wrapping-key tests.
     ///
     /// Tests that touch [`get_or_create_wrapping_key`] would otherwise hit
@@ -479,10 +517,14 @@ mod tests {
     /// directory, and there is no chance of cross-test or cross-CI
     /// contamination of the real user keyring/file.
     ///
-    /// Construction: takes the [`WRAPPING_KEY_LOCK`] mutex, snapshots
-    /// `HOME` + `LPM_FORCE_FILE_VAULT`, points them at a fresh tempdir
-    /// with the env var set to `"1"`. Drop restores both env vars and
-    /// releases the lock (the tempdir is cleaned up by `tempfile`).
+    /// Construction: takes the shared
+    /// [`crate::test_env_lock::ENV_LOCK`] mutex, snapshots `HOME` +
+    /// `LPM_FORCE_FILE_VAULT`, points them at a fresh tempdir with the
+    /// env var set to `"1"`. Drop restores both env vars and releases
+    /// the lock (the tempdir is cleaned up by `tempfile`). Sharing
+    /// the lock with `lib.rs::tests::with_forced_file_vault_backend`
+    /// is what closes the parallel-cascade where one module's tests
+    /// would mutate env while another module's tests were mid-flight.
     struct IsolatedVaultEnv {
         _tmp: tempfile::TempDir,
         _guard: std::sync::MutexGuard<'static, ()>,
@@ -492,11 +534,11 @@ mod tests {
 
     impl IsolatedVaultEnv {
         fn new() -> Self {
-            let guard = WRAPPING_KEY_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            let guard = crate::test_env_lock::acquire_env_lock();
             let tmp = tempfile::tempdir().expect("tempdir for isolated vault env");
             let prior_home = std::env::var_os("HOME");
             let prior_force_file = std::env::var_os("LPM_FORCE_FILE_VAULT");
-            // SAFETY: the WRAPPING_KEY_LOCK guard ensures we are the only
+            // SAFETY: the shared env-lock guard ensures we are the only
             // thread mutating these env vars while this struct is alive.
             unsafe {
                 std::env::set_var("HOME", tmp.path());
@@ -513,7 +555,7 @@ mod tests {
 
     impl Drop for IsolatedVaultEnv {
         fn drop(&mut self) {
-            // SAFETY: still holding WRAPPING_KEY_LOCK via `_guard`.
+            // SAFETY: still holding the shared env-lock via `_guard`.
             unsafe {
                 match &self.prior_home {
                     Some(v) => std::env::set_var("HOME", v),

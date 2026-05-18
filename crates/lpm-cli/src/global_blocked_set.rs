@@ -35,6 +35,7 @@
 use crate::build_state::{BlockedPackage, BuildState, build_state_path, read_build_state};
 use lpm_common::{LpmError, LpmRoot};
 use lpm_global::{GlobalManifest, GlobalTrustMatch, GlobalTrustedDependencies, read_for};
+use lpm_security::triage::StaticTier;
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
@@ -62,9 +63,43 @@ pub struct AggregateBlockedRow {
     /// through to approve-scripts for "previously approved, now drifted"
     /// messaging.
     pub binding_drift: bool,
+    /// Static-tier classification carried from the per-install
+    /// [`BlockedPackage::static_tier`]. `None` when the per-install
+    /// capture predates static-tier classification, or when the install
+    /// was captured with `script-policy = "deny" | "allow"` (no
+    /// classification applied).
+    ///
+    /// When the same `(name, version, integrity, script_hash)` aggregate
+    /// row is contributed by multiple origins, the strictest tier wins
+    /// (see [`merge_static_tier`]) — conservative for the gate that
+    /// consumes this field.
+    pub static_tier: Option<StaticTier>,
     /// Globally-installed package names (top-level of each install root)
     /// whose transitive tree contains this blocked package. Sorted.
     pub origins: Vec<String>,
+}
+
+/// Promote two tier hints to the strictest. Used at dedup-merge time
+/// when the same `(name, version, integrity, script_hash)` is reported
+/// by more than one origin and the two origins disagree on tier.
+///
+/// Precedence (most-strict first): `Red > AmberLlm > Amber > Green > None`.
+/// The gate that consumes the aggregate refuses non-green tiers, so a
+/// "promote to strictest" merge keeps the policy boundary at the most
+/// conservative reading — a Red contribution from any origin keeps the
+/// row blocked from bulk approval even if another origin labelled the
+/// same binding Green.
+fn merge_static_tier(a: Option<StaticTier>, b: Option<StaticTier>) -> Option<StaticTier> {
+    fn rank(t: Option<StaticTier>) -> u8 {
+        match t {
+            None => 0,
+            Some(StaticTier::Green) => 1,
+            Some(StaticTier::Amber) => 2,
+            Some(StaticTier::AmberLlm) => 3,
+            Some(StaticTier::Red) => 4,
+        }
+    }
+    if rank(a) >= rank(b) { a } else { b }
 }
 
 /// Output of [`aggregate_blocked_across_globals`].
@@ -133,6 +168,7 @@ pub fn aggregate_with_manifest_and_trust(
                 || blocked.binding_drift;
 
             let key = DedupKey::from_blocked(&blocked);
+            let row_tier = blocked.static_tier;
             let (row, _) = by_key.entry(key).or_insert_with(|| {
                 (
                     AggregateBlockedRow {
@@ -142,6 +178,7 @@ pub fn aggregate_with_manifest_and_trust(
                         script_hash: blocked.script_hash.clone(),
                         phases_present: blocked.phases_present.clone(),
                         binding_drift,
+                        static_tier: row_tier,
                         origins: Vec::new(),
                     },
                     Vec::new(),
@@ -157,6 +194,10 @@ pub fn aggregate_with_manifest_and_trust(
             if binding_drift {
                 row.binding_drift = true;
             }
+            // Any non-green tier seen at ANY origin promotes the row's
+            // tier to the strictest — conservative for the gate at
+            // approve-scripts --global --yes.
+            row.static_tier = merge_static_tier(row.static_tier, row_tier);
         }
     }
 
@@ -252,6 +293,7 @@ mod tests {
             blocked_set_fingerprint: compute_blocked_set_fingerprint(&blocked),
             captured_at: Utc::now().to_rfc3339(),
             blocked_packages: blocked,
+            drift_ignore_override: None,
         };
         crate::build_state::write_build_state(&install_root, &state).unwrap();
         rel_root
@@ -483,5 +525,167 @@ mod tests {
         let agg = aggregate_blocked_across_globals(&root).unwrap();
         assert!(agg.rows.is_empty());
         assert_eq!(agg.unreadable_origins, vec!["orphan".to_string()]);
+    }
+
+    fn blocked_tiered(
+        name: &str,
+        version: &str,
+        integ: Option<&str>,
+        script: Option<&str>,
+        tier: StaticTier,
+    ) -> BlockedPackage {
+        let mut b = blocked(name, version, integ, script);
+        b.static_tier = Some(tier);
+        b
+    }
+
+    /// End-to-end JSON → aggregate: writes the same `build-state.json`
+    /// shape the workflow fixtures produce, then asserts the tier
+    /// survives `read_build_state` → aggregator. Protects against a
+    /// future serde rename that breaks the wire shape — the in-memory
+    /// `aggregate_carries_static_tier_from_per_install_state` test
+    /// alone wouldn't catch a JSON-field-name regression.
+    #[test]
+    fn aggregate_reads_static_tier_from_disk_json() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = LpmRoot::from_dir(tmp.path());
+        let install_root = root.global_root().join("installs/eslint@9.24.0");
+        let lpm_dir = install_root.join(".lpm");
+        std::fs::create_dir_all(&lpm_dir).unwrap();
+        std::fs::write(
+            lpm_dir.join("build-state.json"),
+            br#"{
+    "state_version": 1,
+    "blocked_set_fingerprint": "sha256-fixture",
+    "captured_at": "2026-04-22T00:00:00Z",
+    "blocked_packages": [
+        {
+            "name": "esbuild",
+            "version": "0.25.1",
+            "integrity": "sha512-fixture",
+            "script_hash": "sha256-fixture",
+            "phases_present": ["postinstall"],
+            "binding_drift": false,
+            "static_tier": "amber"
+        }
+    ]
+}"#,
+        )
+        .unwrap();
+        let mut manifest = GlobalManifest::default();
+        manifest.packages.insert(
+            "eslint".into(),
+            pkg_entry("installs/eslint@9.24.0", "9.24.0"),
+        );
+        lpm_global::write_for(&root, &manifest).unwrap();
+
+        let agg = aggregate_blocked_across_globals(&root).unwrap();
+        assert_eq!(agg.rows.len(), 1, "expected one aggregate row");
+        assert_eq!(
+            agg.rows[0].static_tier,
+            Some(StaticTier::Amber),
+            "JSON `\"static_tier\": \"amber\"` must deserialize and \
+             propagate to the aggregate row"
+        );
+    }
+
+    /// The aggregate row must carry the per-install `static_tier` so the
+    /// `--yes` gate at approve-scripts --global can refuse non-green
+    /// bulk approvals. Pin the propagation contract — pre-fix the
+    /// aggregate dropped the tier silently and the gate had no signal.
+    #[test]
+    fn aggregate_carries_static_tier_from_per_install_state() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = LpmRoot::from_dir(tmp.path());
+
+        let rel = seed_install_with_blocked(
+            &root,
+            "eslint",
+            "9.24.0",
+            vec![blocked_tiered(
+                "esbuild",
+                "0.25.1",
+                Some("i-a"),
+                Some("s-a"),
+                StaticTier::Amber,
+            )],
+        );
+        let mut manifest = GlobalManifest::default();
+        manifest
+            .packages
+            .insert("eslint".into(), pkg_entry(&rel, "9.24.0"));
+        lpm_global::write_for(&root, &manifest).unwrap();
+
+        let agg = aggregate_blocked_across_globals(&root).unwrap();
+        assert_eq!(agg.rows.len(), 1);
+        assert_eq!(agg.rows[0].static_tier, Some(StaticTier::Amber));
+    }
+
+    /// Same `(name, version, integrity, script_hash)` reported by two
+    /// installs with disagreeing tiers must collapse to the strictest:
+    /// `Red > AmberLlm > Amber > Green > None`. The gate that consumes
+    /// this field treats non-green as refusal, so promoting to strictest
+    /// at merge is the conservative-by-design choice.
+    #[test]
+    fn aggregate_promotes_to_strictest_tier_when_origins_disagree() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = LpmRoot::from_dir(tmp.path());
+
+        // Both installs report the SAME (integrity, script_hash) so the
+        // dedup collapses them; the tier differs to exercise the merge.
+        let row_green = blocked_tiered(
+            "esbuild",
+            "0.25.1",
+            Some("i-same"),
+            Some("s-same"),
+            StaticTier::Green,
+        );
+        let row_red = blocked_tiered(
+            "esbuild",
+            "0.25.1",
+            Some("i-same"),
+            Some("s-same"),
+            StaticTier::Red,
+        );
+        let rel_a = seed_install_with_blocked(&root, "a", "1.0.0", vec![row_green]);
+        let rel_b = seed_install_with_blocked(&root, "b", "1.0.0", vec![row_red]);
+        let mut manifest = GlobalManifest::default();
+        manifest
+            .packages
+            .insert("a".into(), pkg_entry(&rel_a, "1.0.0"));
+        manifest
+            .packages
+            .insert("b".into(), pkg_entry(&rel_b, "1.0.0"));
+        lpm_global::write_for(&root, &manifest).unwrap();
+
+        let agg = aggregate_blocked_across_globals(&root).unwrap();
+        assert_eq!(agg.rows.len(), 1, "dedup should collapse to one row");
+        assert_eq!(
+            agg.rows[0].static_tier,
+            Some(StaticTier::Red),
+            "Red must dominate Green at merge"
+        );
+        assert_eq!(agg.rows[0].origins, vec!["a", "b"]);
+    }
+
+    /// Direct cover of the rank function so future edits that flip an
+    /// ordering pair (e.g. swap AmberLlm above Red) trip a test rather
+    /// than silently weaken the gate. Six representative pairings cover
+    /// every adjacency in the strictness ladder.
+    #[test]
+    fn merge_static_tier_precedence_red_over_amber_llm_over_amber_over_green_over_none() {
+        let none = None::<StaticTier>;
+        let g = Some(StaticTier::Green);
+        let a = Some(StaticTier::Amber);
+        let al = Some(StaticTier::AmberLlm);
+        let r = Some(StaticTier::Red);
+
+        assert_eq!(merge_static_tier(none, g), g);
+        assert_eq!(merge_static_tier(g, a), a);
+        assert_eq!(merge_static_tier(a, al), al);
+        assert_eq!(merge_static_tier(al, r), r);
+        // Commutative + idempotent for the equal-tier case.
+        assert_eq!(merge_static_tier(r, r), r);
+        assert_eq!(merge_static_tier(r, g), r);
     }
 }

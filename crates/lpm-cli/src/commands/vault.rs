@@ -214,15 +214,60 @@ async fn download_and_install() -> Result<PathBuf, LpmError> {
     let version = tag.strip_prefix('v').unwrap_or(tag);
     output::info(&format!("downloading {} v{}...", APP_NAME, version.bold()));
 
-    // Download zip
-    let bytes = http_client
+    // H17: surface the trust posture explicitly before the install
+    // happens. The release is fetched over HTTPS but the asset is
+    // not digest-pinned, not notarized end-to-end inside lpm, and
+    // the quarantine attribute is stripped after install. An
+    // operator scanning logs after the fact should see why their
+    // host is now running `LPM Vault.app`.
+    tracing::warn!(
+        target: "lpm_cli::vault",
+        version = %version,
+        download_url = %download_url,
+        "installing LPM Vault desktop app from GitHub release — asset is not digest-pinned by lpm and the Gatekeeper quarantine flag will be cleared after extract; trust is anchored on the GitHub release pipeline + TLS"
+    );
+    output::warn(&format!(
+        "{APP_NAME} v{version} install: app is not digest-pinned by lpm and \
+         Gatekeeper quarantine will be cleared. Trust is anchored on GitHub release + TLS."
+    ));
+
+    // H17: hard cap on the downloaded asset bytes. Real Vault.app
+    // builds are ~50 MB; 200 MB leaves several × headroom while
+    // bounding the local-disk DoS shape from a hostile registry
+    // entry (or compromised release pipeline) that returned a
+    // multi-GB asset.
+    const MAX_VAULT_ASSET_BYTES: u64 = 200 * 1024 * 1024;
+
+    let response = http_client
         .get(download_url)
         .send()
         .await
-        .map_err(|e| LpmError::Network(format!("download failed: {e}")))?
-        .bytes()
-        .await
-        .map_err(|e| LpmError::Network(format!("download read failed: {e}")))?;
+        .map_err(|e| LpmError::Network(format!("download failed: {e}")))?;
+
+    // Pre-stream cap via Content-Length when the server advertised one.
+    if let Some(declared) = response.content_length()
+        && declared > MAX_VAULT_ASSET_BYTES
+    {
+        return Err(LpmError::Network(format!(
+            "vault asset declared size {declared} exceeds cap {MAX_VAULT_ASSET_BYTES} — refusing to download",
+        )));
+    }
+
+    // Streaming cap — bail the moment the cumulative chunk read
+    // would cross the cap. Same shape as `read_capped_body` in
+    // lpm-registry but tailored to the desktop-app install size class.
+    let mut bytes: Vec<u8> = Vec::new();
+    let mut stream = response.bytes_stream();
+    use futures::StreamExt;
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|e| LpmError::Network(format!("download read failed: {e}")))?;
+        if (bytes.len() as u64).saturating_add(chunk.len() as u64) > MAX_VAULT_ASSET_BYTES {
+            return Err(LpmError::Network(format!(
+                "vault asset exceeds cap {MAX_VAULT_ASSET_BYTES} during stream — refusing to write to disk",
+            )));
+        }
+        bytes.extend_from_slice(&chunk);
+    }
 
     // Install
     let install_dir = app_install_dir();

@@ -150,8 +150,30 @@ mod landlock_rules;
 #[cfg(any(target_os = "linux", all(test, not(target_os = "windows"))))]
 mod posture_decision;
 
+// Shared secret-file path catalog consumed by the Seatbelt
+// (macOS) deny renderer AND the Linux bind-mount overlay
+// enumerator. Single source of truth — `mod secret_paths;` makes
+// drift a type-system error. Gated on macOS + Linux + non-Windows
+// tests (Windows currently has no overlay layer; the const lists
+// would be dead code there).
+#[cfg(any(
+    target_os = "macos",
+    target_os = "linux",
+    all(test, not(target_os = "windows"))
+))]
+mod secret_paths;
+
+// Linux secret-file overlay (bind-mounts /dev/null over secret
+// paths under project_dir). Same gate shape as `landlock_rules`:
+// Linux production + every non-Windows test build, so macOS unit
+// tests exercise the enumerator. The `apply_secret_overlay_in_child`
+// AS-safe hook + the `SecretOverlaySpec::build` constructor are
+// `target_os = "linux"`-gated inside the module.
+#[cfg(any(target_os = "linux", all(test, not(target_os = "windows"))))]
+mod linux_secret_overlay;
+
 pub mod config;
-pub use config::load_sandbox_write_dirs;
+pub use config::{load_sandbox_read_allow, load_sandbox_write_dirs};
 
 /// Inputs the sandbox backend needs to render its containment profile
 /// for a single post-install script invocation.
@@ -191,6 +213,20 @@ pub struct SandboxSpec {
     /// sandboxWriteDirs`. Loader resolves relative paths against
     /// [`project_dir`](Self::project_dir) before constructing the spec.
     pub extra_write_dirs: Vec<PathBuf>,
+    /// Project-relative paths the user has explicitly opted in for
+    /// lifecycle-script reads despite matching the built-in secret-file
+    /// deny list (e.g. `.env`, `*.pem`, `.aws/`). Resolved to absolute
+    /// project-rooted paths by the loader. The sandbox backends omit
+    /// the deny rule / bind-mount for any path in this list.
+    ///
+    /// Empty by default. Populated from `package.json > lpm > scripts >
+    /// sandboxReadAllow` (per-project) and `~/.lpm/config.toml >
+    /// [sandbox] script-read-allow` (per-user). Same precedence and
+    /// validation shape as [`extra_write_dirs`](Self::extra_write_dirs):
+    /// every entry must canonicalize inside `project_dir`, traversal
+    /// (`..`) and absolute paths outside the project are rejected by
+    /// the loader.
+    pub secret_read_allow: Vec<PathBuf>,
 }
 
 /// Caller-tunable knobs the sandbox factory consumes alongside
@@ -1027,6 +1063,7 @@ mod tests {
             store_root: PathBuf::from(STORE_ROOT),
             home_dir: PathBuf::from(HOME_DIR),
             tmpdir: PathBuf::from(TMPDIR),
+            secret_read_allow: Vec::new(),
             extra_write_dirs: Vec::new(),
         }
     }
@@ -1187,6 +1224,7 @@ mod tests {
             store_root: tmp.path().join("store"),
             home_dir: home.clone(),
             tmpdir: tmp.path().join("tmpdir"),
+            secret_read_allow: Vec::new(),
             extra_write_dirs: vec![extra_a.clone(), extra_b.clone()],
         };
         std::fs::create_dir_all(&spec.package_dir).unwrap();

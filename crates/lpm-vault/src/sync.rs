@@ -11,7 +11,56 @@
 //! returned unverified for the caller to format.
 
 use crate::{crypto, signature};
+use futures::StreamExt;
 use std::collections::HashMap;
+
+/// Hard cap on a single vault-sync response body. Encrypted envelopes
+/// are small (kilobytes); a multi-MB cap leaves multiple orders of
+/// magnitude of headroom while stopping a malicious / compromised
+/// platform endpoint from OOM-ing the CLI on the signed-read path
+/// that runs before any signature verification.
+const MAX_VAULT_RESPONSE_BYTES: usize = 10 * 1024 * 1024;
+
+/// Drain a response body with the vault size cap applied in two stages.
+///
+/// Stage 1 (pre-stream): refuse when the server's declared
+/// `Content-Length` exceeds `MAX_VAULT_RESPONSE_BYTES`. Stage 2
+/// (mid-stream): accumulate `bytes_stream()` chunks and abort the
+/// moment another chunk would cross the cap. Closing the response
+/// at that point drops the underlying connection.
+async fn read_capped_body(response: reqwest::Response) -> Result<Vec<u8>, String> {
+    if let Some(declared) = response.content_length()
+        && declared as usize > MAX_VAULT_RESPONSE_BYTES
+    {
+        return Err(format!(
+            "response too large: declared length {declared} exceeds cap {MAX_VAULT_RESPONSE_BYTES}"
+        ));
+    }
+
+    let mut buf: Vec<u8> = Vec::with_capacity(16 * 1024);
+    let mut stream = response.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|e| format!("response read error: {e}"))?;
+        if buf.len().saturating_add(chunk.len()) > MAX_VAULT_RESPONSE_BYTES {
+            return Err(format!(
+                "response too large: streamed body exceeded cap {MAX_VAULT_RESPONSE_BYTES}"
+            ));
+        }
+        buf.extend_from_slice(&chunk);
+    }
+    Ok(buf)
+}
+
+/// Read a (typically error) response body as UTF-8 text under the
+/// vault cap. Mirrors the previous `response.text().await.unwrap_or_default()`
+/// shape — failures become empty strings so error formatting still
+/// produces a usable message — but the buffer is now bounded.
+async fn read_capped_error_text(response: reqwest::Response) -> String {
+    match read_capped_body(response).await {
+        Ok(buf) => String::from_utf8_lossy(&buf).into_owned(),
+        Err(_) => String::new(),
+    }
+}
 
 /// Read a vault sync response and verify its `X-LPM-Signature` header
 /// against the body. Only 2xx responses are signed by the server, so
@@ -25,7 +74,7 @@ async fn read_verified_response(
     auth_token: &str,
 ) -> Result<(reqwest::StatusCode, Vec<u8>), String> {
     let status = response.status();
-    // Snapshot the signature header first — `response.bytes()` consumes
+    // Snapshot the signature header first — body-drain consumes
     // `self`, so we cannot read headers afterwards.
     let signature_header = response
         .headers()
@@ -33,11 +82,7 @@ async fn read_verified_response(
         .and_then(|v| v.to_str().ok())
         .map(str::to_owned);
 
-    let body = response
-        .bytes()
-        .await
-        .map_err(|e| format!("response read error: {e}"))?
-        .to_vec();
+    let body = read_capped_body(response).await?;
 
     if status.is_success() {
         signature::verify_response_body(&body, auth_token, signature_header.as_deref())
@@ -55,6 +100,29 @@ fn sync_request_timeout(default: std::time::Duration) -> std::time::Duration {
             .unwrap_or(default),
         Err(_) => default,
     }
+}
+
+/// Build the lpm-vault HTTP client with an explicit redirect policy
+/// pinned. reqwest's `Policy::limited` strips `Authorization` on
+/// cross-origin redirects by default; pinning it here documents the
+/// contract so a future builder edit can't drop the strip implicitly.
+/// The bearer-leak shape — a malicious or misconfigured registry
+/// 30x'ing to `attacker.example` and having our bearer follow — is
+/// the L16 hazard this closes alongside the `bearer_auth` migration.
+fn sync_http_client_builder() -> reqwest::ClientBuilder {
+    reqwest::Client::builder().redirect(reqwest::redirect::Policy::limited(10))
+}
+
+/// Percent-encode a URL path segment.
+///
+/// M32: vault sync calls interpolate `vault_id`, `org_slug`, `code`
+/// directly into the request path. Raw `/`, `?`, `#`, `..`, `&` etc.
+/// in any of those would alter the route — e.g.,
+/// `/api/orgs/{org}/vaults/{vault}` with `vault = "foo/../bar"` would
+/// hit a different endpoint server-side. Routing all path components
+/// through this helper closes the request-confusion shape.
+fn url_path_segment(s: &str) -> String {
+    urlencoding::encode(s).into_owned()
 }
 
 /// Response from push endpoint.
@@ -114,7 +182,9 @@ pub struct ListVaultsResponse {
 /// List all cloud vaults for the authenticated user.
 pub async fn list_remote(registry_url: &str, auth_token: &str) -> Result<Vec<RemoteVault>, String> {
     let url = format!("{registry_url}/api/vaults");
-    let client = reqwest::Client::new();
+    let client = sync_http_client_builder()
+        .build()
+        .map_err(|e| format!("failed to build http client: {e}"))?;
 
     let response = client
         .get(&url)
@@ -125,7 +195,7 @@ pub async fn list_remote(registry_url: &str, auth_token: &str) -> Result<Vec<Rem
         .map_err(|e| format!("network error: {e}"))?;
 
     if !response.status().is_success() {
-        let body = response.text().await.unwrap_or_default();
+        let body = read_capped_error_text(response).await;
         return Err(format!("server error: {body}"));
     }
 
@@ -183,8 +253,13 @@ pub async fn push_raw(
 
     let (encrypted_blob, wrapped_key) = crypto::encrypt_vault_for_sync(&secrets_json)?;
 
-    let client = reqwest::Client::new();
-    let url = format!("{registry_url}/api/vaults/{vault_id}/sync");
+    let client = sync_http_client_builder()
+        .build()
+        .map_err(|e| format!("failed to build http client: {e}"))?;
+    let url = format!(
+        "{registry_url}/api/vaults/{}/sync",
+        url_path_segment(vault_id)
+    );
 
     let mut body = serde_json::json!({
         "encryptedBlob": encrypted_blob,
@@ -207,7 +282,7 @@ pub async fn push_raw(
 
     let response = client
         .post(&url)
-        .header("Authorization", format!("Bearer {auth_token}"))
+        .bearer_auth(auth_token)
         .json(&body)
         .send()
         .await
@@ -241,15 +316,18 @@ pub async fn pull(
     auth_token: &str,
     vault_id: &str,
 ) -> Result<(HashMap<String, String>, i32), String> {
-    let client = reqwest::Client::builder()
+    let client = sync_http_client_builder()
         .timeout(sync_request_timeout(std::time::Duration::from_secs(30)))
         .build()
         .map_err(|e| format!("failed to build http client: {e}"))?;
-    let url = format!("{registry_url}/api/vaults/{vault_id}/sync");
+    let url = format!(
+        "{registry_url}/api/vaults/{}/sync",
+        url_path_segment(vault_id)
+    );
 
     let response = client
         .get(&url)
-        .header("Authorization", format!("Bearer {auth_token}"))
+        .bearer_auth(auth_token)
         .send()
         .await
         .map_err(|e| format!("network error: {e}"))?;
@@ -302,15 +380,18 @@ pub async fn pull_raw(
     auth_token: &str,
     vault_id: &str,
 ) -> Result<(String, i32), String> {
-    let client = reqwest::Client::builder()
+    let client = sync_http_client_builder()
         .timeout(sync_request_timeout(std::time::Duration::from_secs(30)))
         .build()
         .map_err(|e| format!("failed to build http client: {e}"))?;
-    let url = format!("{registry_url}/api/vaults/{vault_id}/sync");
+    let url = format!(
+        "{registry_url}/api/vaults/{}/sync",
+        url_path_segment(vault_id)
+    );
 
     let response = client
         .get(&url)
-        .header("Authorization", format!("Bearer {auth_token}"))
+        .bearer_auth(auth_token)
         .send()
         .await
         .map_err(|e| format!("network error: {e}"))?;
@@ -377,7 +458,7 @@ async fn attempt_legacy_reencrypt_push(
         }
     };
 
-    let client = match reqwest::Client::builder()
+    let client = match sync_http_client_builder()
         .timeout(sync_request_timeout(std::time::Duration::from_secs(15)))
         .build()
     {
@@ -388,7 +469,10 @@ async fn attempt_legacy_reencrypt_push(
         }
     };
 
-    let url = format!("{registry_url}/api/vaults/{vault_id}/sync");
+    let url = format!(
+        "{registry_url}/api/vaults/{}/sync",
+        url_path_segment(vault_id)
+    );
     let body = serde_json::json!({
         "encryptedBlob": new_blob,
         "wrappedKey": new_wrapped,
@@ -397,7 +481,7 @@ async fn attempt_legacy_reencrypt_push(
 
     match client
         .post(&url)
-        .header("Authorization", format!("Bearer {auth_token}"))
+        .bearer_auth(auth_token)
         .json(&body)
         .send()
         .await
@@ -461,7 +545,9 @@ pub async fn upload_public_key(
     auth_token: &str,
     public_key_b64: &str,
 ) -> Result<(), String> {
-    let client = reqwest::Client::new();
+    let client = sync_http_client_builder()
+        .build()
+        .map_err(|e| format!("failed to build http client: {e}"))?;
     let url = format!("{registry_url}/api/users/me/public-key");
     let body = serde_json::json!({"publicKey": public_key_b64});
 
@@ -475,7 +561,7 @@ pub async fn upload_public_key(
         .map_err(|e| format!("network error: {e}"))?;
 
     if !response.status().is_success() {
-        let body = response.text().await.unwrap_or_default();
+        let body = read_capped_error_text(response).await;
         return Err(format!("failed to upload public key: {body}"));
     }
 
@@ -487,7 +573,9 @@ pub async fn get_my_public_key(
     registry_url: &str,
     auth_token: &str,
 ) -> Result<Option<String>, String> {
-    let client = reqwest::Client::new();
+    let client = sync_http_client_builder()
+        .build()
+        .map_err(|e| format!("failed to build http client: {e}"))?;
     let url = format!("{registry_url}/api/users/me/public-key");
 
     let response = client
@@ -529,8 +617,13 @@ pub async fn get_org_member_keys(
     auth_token: &str,
     org_slug: &str,
 ) -> Result<Vec<MemberPublicKey>, String> {
-    let client = reqwest::Client::new();
-    let url = format!("{registry_url}/api/orgs/{org_slug}/members/public-keys");
+    let client = sync_http_client_builder()
+        .build()
+        .map_err(|e| format!("failed to build http client: {e}"))?;
+    let url = format!(
+        "{registry_url}/api/orgs/{}/members/public-keys",
+        url_path_segment(org_slug)
+    );
 
     let response = client
         .get(&url)
@@ -541,7 +634,7 @@ pub async fn get_org_member_keys(
         .map_err(|e| format!("network error: {e}"))?;
 
     if !response.status().is_success() {
-        let body = response.text().await.unwrap_or_default();
+        let body = read_capped_error_text(response).await;
         return Err(format!("failed to fetch member keys: {body}"));
     }
 
@@ -627,8 +720,13 @@ pub async fn list_org_vaults(
     auth_token: &str,
     org_slug: &str,
 ) -> Result<Vec<RemoteVault>, String> {
-    let client = reqwest::Client::new();
-    let url = format!("{registry_url}/api/orgs/{org_slug}/vaults");
+    let client = sync_http_client_builder()
+        .build()
+        .map_err(|e| format!("failed to build http client: {e}"))?;
+    let url = format!(
+        "{registry_url}/api/orgs/{}/vaults",
+        url_path_segment(org_slug)
+    );
 
     let response = client
         .get(&url)
@@ -639,7 +737,7 @@ pub async fn list_org_vaults(
         .map_err(|e| format!("network error: {e}"))?;
 
     if !response.status().is_success() {
-        let body = response.text().await.unwrap_or_default();
+        let body = read_capped_error_text(response).await;
         return Err(format!("server error: {body}"));
     }
 
@@ -661,8 +759,14 @@ pub async fn pull_org(
     vault_id: &str,
     private_key: &[u8; 32],
 ) -> Result<(String, i32), String> {
-    let client = reqwest::Client::new();
-    let url = format!("{registry_url}/api/orgs/{org_slug}/vaults/{vault_id}");
+    let client = sync_http_client_builder()
+        .build()
+        .map_err(|e| format!("failed to build http client: {e}"))?;
+    let url = format!(
+        "{registry_url}/api/orgs/{}/vaults/{}",
+        url_path_segment(org_slug),
+        url_path_segment(vault_id)
+    );
 
     let response = client
         .get(&url)
@@ -725,8 +829,14 @@ pub async fn push_org_with_keys(
     let wrapped_keys = wrap_keys_for_members(&aes_key, &members_with_keys)?;
 
     // 5. Push to server
-    let client = reqwest::Client::new();
-    let url = format!("{registry_url}/api/orgs/{org_slug}/vaults/{vault_id}");
+    let client = sync_http_client_builder()
+        .build()
+        .map_err(|e| format!("failed to build http client: {e}"))?;
+    let url = format!(
+        "{registry_url}/api/orgs/{}/vaults/{}",
+        url_path_segment(org_slug),
+        url_path_segment(vault_id)
+    );
 
     let keys_json: Vec<serde_json::Value> = wrapped_keys
         .iter()
@@ -790,6 +900,25 @@ fn wrap_keys_for_members(
 ) -> Result<Vec<(String, String)>, String> {
     let mut wrapped_keys: Vec<(String, String)> = Vec::new();
 
+    // M25: surface the (user_id, public_key) pairs every time we wrap.
+    // Pre-fix the server-supplied member set was trusted without any
+    // local pin / history check / TOFU primitive, so a compromised
+    // registry could insert an extra "member" and silently receive
+    // every subsequent share's wrapped AES key. We don't yet have a
+    // local member-pubkey pin store (tracked as follow-up; needs a
+    // sync-history JSON next to the vault data), but we DO surface
+    // each recipient so an operator scanning logs can detect a
+    // new/unexpected user_id or a flipped pubkey. The pubkey is
+    // truncated to the first 12 chars of base64 for readability —
+    // enough bits to detect a substituted key by eyeball, not enough
+    // to be a verification primitive on its own.
+    tracing::warn!(
+        target: "lpm_vault::sync",
+        recipient_count = members_with_keys.len(),
+        "wrapping vault AES key for {} org member recipient(s) — verify each listed pubkey/userId tuple matches your expected member set; a compromised server can insert extra recipients (M25)",
+        members_with_keys.len()
+    );
+
     for member in members_with_keys {
         let pub_b64 = member
             .public_key
@@ -805,6 +934,17 @@ fn wrap_keys_for_members(
                 pub_bytes.len()
             ));
         }
+
+        // M25: per-recipient audit line so each one is individually
+        // visible. The truncated pubkey gives an eyeball-comparable
+        // discriminator without dumping the full base64.
+        let pub_short = pub_b64.chars().take(12).collect::<String>();
+        tracing::warn!(
+            target: "lpm_vault::sync",
+            user_id = %member.user_id,
+            public_key_prefix = %pub_short,
+            "vault share recipient (M25)"
+        );
 
         let mut pub_key = [0u8; 32];
         pub_key.copy_from_slice(&pub_bytes);
@@ -839,8 +979,14 @@ pub async fn push_org(
     let aes_key = crypto::generate_aes_key();
     let encrypted_blob = crypto::encrypt(&aes_key, secrets_json.as_bytes())?;
 
-    let client = reqwest::Client::new();
-    let url = format!("{registry_url}/api/orgs/{org_slug}/vaults/{vault_id}");
+    let client = sync_http_client_builder()
+        .build()
+        .map_err(|e| format!("failed to build http client: {e}"))?;
+    let url = format!(
+        "{registry_url}/api/orgs/{}/vaults/{}",
+        url_path_segment(org_slug),
+        url_path_segment(vault_id)
+    );
 
     let keys: Vec<serde_json::Value> = wrapped_keys
         .iter()
@@ -854,7 +1000,7 @@ pub async fn push_org(
 
     let response = client
         .post(&url)
-        .header("Authorization", format!("Bearer {auth_token}"))
+        .bearer_auth(auth_token)
         .json(&body)
         .send()
         .await
@@ -889,8 +1035,10 @@ pub async fn get_pairing_session(
     auth_token: &str,
     code: &str,
 ) -> Result<PairingSession, String> {
-    let client = reqwest::Client::new();
-    let url = format!("{registry_url}/api/vault/pair/{code}");
+    let client = sync_http_client_builder()
+        .build()
+        .map_err(|e| format!("failed to build http client: {e}"))?;
+    let url = format!("{registry_url}/api/vault/pair/{}", url_path_segment(code));
 
     let response = client
         .get(&url)
@@ -901,7 +1049,7 @@ pub async fn get_pairing_session(
         .map_err(|e| format!("network error: {e}"))?;
 
     if !response.status().is_success() {
-        let body = response.text().await.unwrap_or_default();
+        let body = read_capped_error_text(response).await;
         return Err(format!("pairing error: {body}"));
     }
 
@@ -919,8 +1067,10 @@ pub async fn approve_pairing(
     encrypted_wrapping_key: &str,
     ephemeral_public_key: &str,
 ) -> Result<(), String> {
-    let client = reqwest::Client::new();
-    let url = format!("{registry_url}/api/vault/pair/{code}");
+    let client = sync_http_client_builder()
+        .build()
+        .map_err(|e| format!("failed to build http client: {e}"))?;
+    let url = format!("{registry_url}/api/vault/pair/{}", url_path_segment(code));
 
     let body = serde_json::json!({
         "encryptedWrappingKey": encrypted_wrapping_key,
@@ -937,7 +1087,7 @@ pub async fn approve_pairing(
         .map_err(|e| format!("network error: {e}"))?;
 
     if !response.status().is_success() {
-        let body = response.text().await.unwrap_or_default();
+        let body = read_capped_error_text(response).await;
         return Err(format!("approval failed: {body}"));
     }
 
@@ -946,7 +1096,9 @@ pub async fn approve_pairing(
 
 /// Revoke all browser pairings for the authenticated user.
 pub async fn unpair_all(registry_url: &str, auth_token: &str) -> Result<(), String> {
-    let client = reqwest::Client::new();
+    let client = sync_http_client_builder()
+        .build()
+        .map_err(|e| format!("failed to build http client: {e}"))?;
     let url = format!("{registry_url}/api/vault/pair/revoke-all");
 
     let response = client
@@ -960,7 +1112,7 @@ pub async fn unpair_all(registry_url: &str, auth_token: &str) -> Result<(), Stri
         .map_err(|e| format!("network error: {e}"))?;
 
     if !response.status().is_success() {
-        let body = response.text().await.unwrap_or_default();
+        let body = read_capped_error_text(response).await;
         return Err(format!("unpair failed: {body}"));
     }
 
@@ -986,11 +1138,16 @@ pub async fn ci_pull(
     vault_id: &str,
     env: Option<&str>,
 ) -> Result<(HashMap<String, String>, String), String> {
-    let client = reqwest::Client::new();
-    let mut url = format!("{registry_url}/api/vaults/{vault_id}/ci-pull");
+    let client = sync_http_client_builder()
+        .build()
+        .map_err(|e| format!("failed to build http client: {e}"))?;
+    let mut url = format!(
+        "{registry_url}/api/vaults/{}/ci-pull",
+        url_path_segment(vault_id)
+    );
     if let Some(e) = env {
         // Env names are alphanumeric/dashes — safe for query strings without encoding
-        url = format!("{url}?env={e}");
+        url = format!("{url}?env={}", url_path_segment(e));
     }
 
     let response = client
@@ -1029,7 +1186,9 @@ pub async fn upload_escrow_key(
     vault_id: &str,
     wrapping_key_hex: &str,
 ) -> Result<(), String> {
-    let client = reqwest::Client::new();
+    let client = sync_http_client_builder()
+        .build()
+        .map_err(|e| format!("failed to build http client: {e}"))?;
     let url = format!("{registry_url}/api/vault/oidc/escrow");
 
     let body = serde_json::json!({
@@ -1047,7 +1206,7 @@ pub async fn upload_escrow_key(
         .map_err(|e| format!("network error: {e}"))?;
 
     if !response.status().is_success() {
-        let body = response.text().await.unwrap_or_default();
+        let body = read_capped_error_text(response).await;
         // Try to extract error message from JSON
         if let Ok(json) = serde_json::from_str::<serde_json::Value>(&body)
             && let Some(err) = json["error"].as_str()
@@ -1067,15 +1226,20 @@ pub async fn get_audit_log(
     vault_id: &str,
     cursor: Option<&str>,
 ) -> Result<AuditResponse, String> {
-    let client = reqwest::Client::new();
-    let mut url = format!("{registry_url}/api/vaults/{vault_id}/audit");
+    let client = sync_http_client_builder()
+        .build()
+        .map_err(|e| format!("failed to build http client: {e}"))?;
+    let mut url = format!(
+        "{registry_url}/api/vaults/{}/audit",
+        url_path_segment(vault_id)
+    );
     if let Some(c) = cursor {
-        url = format!("{url}?cursor={c}");
+        url = format!("{url}?cursor={}", url_path_segment(c));
     }
 
     let response = client
         .get(&url)
-        .header("Authorization", format!("Bearer {auth_token}"))
+        .bearer_auth(auth_token)
         .send()
         .await
         .map_err(|e| format!("network error: {e}"))?;
@@ -1096,17 +1260,32 @@ pub async fn get_audit_log(
 }
 
 #[cfg(test)]
+// The shared env-mutation lock is a `std::sync::Mutex`, and several
+// async tests in this module hold its guard across `.await` points
+// to keep env serialised for the full duration of the wiremock
+// round-trip. Clippy would normally flag this as `await_holding_lock`
+// because in production code that would block a tokio worker thread.
+// In tests it's safe: each `#[tokio::test]` runs in its own runtime,
+// so the only blocked thread is the test's own worker — there are no
+// other tasks to starve. Allow the lint at the module level.
+#[allow(clippy::await_holding_lock)]
 mod tests {
     use super::*;
     use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
-    use std::sync::{Arc, Mutex as StdMutex, OnceLock};
-    use tokio::sync::Mutex;
+    use std::sync::{Arc, Mutex as StdMutex};
     use wiremock::matchers::{body_string_contains, header, method, path, query_param};
     use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
 
-    fn env_lock() -> &'static Mutex<()> {
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(()))
+    /// Acquire the crate-wide env-mutation lock so this module's
+    /// tests serialise with `crypto::tests` and the top-level
+    /// `lib.rs::tests`. The lock must cover the full window from
+    /// env-mutation through any code that reads the same env vars,
+    /// so one module's test cannot read another's in-flight env
+    /// state. Blocking briefly inside `#[tokio::test]` is safe —
+    /// each tokio test runs in its own runtime, so blocking on a
+    /// `std::sync::Mutex` doesn't starve any other task.
+    fn env_lock_guard() -> std::sync::MutexGuard<'static, ()> {
+        crate::test_env_lock::acquire_env_lock()
     }
 
     /// Build a 200 response that mirrors what the LPM origin actually sends
@@ -1127,7 +1306,7 @@ mod tests {
     /// and `LPM_FORCE_FILE_VAULT`, points HOME at a fresh tempdir and
     /// pins file-only mode. Drop restores both.
     ///
-    /// Caller must already hold `env_lock()` — this struct does not
+    /// Caller must already hold `env_lock_guard()` — this struct does not
     /// acquire it. The async tests in this module take `env_lock`
     /// immediately and the lock guard outlives this struct.
     struct IsolatedVaultKeyEnv {
@@ -1141,8 +1320,8 @@ mod tests {
             let tmp = tempfile::tempdir().expect("tempdir for vault key isolation");
             let prior_home = std::env::var_os("HOME");
             let prior_force_file = std::env::var_os("LPM_FORCE_FILE_VAULT");
-            // SAFETY: caller holds env_lock(), serialising env mutation
-            // across this module's tests.
+            // SAFETY: caller holds env_lock_guard(), serialising env mutation
+            // across all of this crate's tests (shared lock).
             unsafe {
                 std::env::set_var("HOME", tmp.path());
                 std::env::set_var("LPM_FORCE_FILE_VAULT", "1");
@@ -1171,6 +1350,48 @@ mod tests {
         }
     }
 
+    /// `read_capped_body` rejects pre-stream when the server declares a
+    /// `Content-Length` over the vault cap. A malicious / compromised
+    /// platform endpoint must not be able to coerce
+    /// `read_verified_response` into allocating a multi-GB buffer
+    /// before any signature check runs.
+    #[tokio::test]
+    async fn read_capped_body_rejects_oversized_declared_length() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let declared = MAX_VAULT_RESPONSE_BYTES + 1;
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        tokio::spawn(async move {
+            if let Ok((mut socket, _)) = listener.accept().await {
+                let mut buf = [0u8; 1024];
+                let _ = socket.read(&mut buf).await;
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\n\
+                     Content-Length: {declared}\r\n\
+                     Content-Type: application/json\r\n\
+                     Connection: close\r\n\
+                     \r\n",
+                );
+                let _ = socket.write_all(resp.as_bytes()).await;
+                let _ = socket.shutdown().await;
+            }
+        });
+
+        let response = reqwest::get(format!("http://{addr}/"))
+            .await
+            .expect("connect");
+        let err = read_capped_body(response)
+            .await
+            .expect_err("oversized declared length must reject pre-stream");
+        assert!(
+            err.contains("declared length"),
+            "expected pre-stream rejection, got: {err}"
+        );
+    }
+
     #[tokio::test]
     async fn pull_attempts_migration_repush_after_legacy_decrypt() {
         // When the cloud blob is encrypted with the legacy token-derived key
@@ -1178,7 +1399,7 @@ mod tests {
         // falls back, returns plaintext + needs_reencrypt = true, and `pull`
         // re-encrypts under the stored key and pushes back. This pins the
         // automatic-migration contract end-to-end.
-        let _guard = env_lock().lock().await;
+        let _guard = env_lock_guard();
         let _isolated = IsolatedVaultKeyEnv::new();
 
         // Encrypt the blob under the legacy auth-token-derived key so the
@@ -1263,7 +1484,7 @@ mod tests {
         // decrypted secrets when the re-push fails (network blip, version
         // race, or transient origin error). Failure is logged at warn for
         // observability; the next successful pull retries the migration.
-        let _guard = env_lock().lock().await;
+        let _guard = env_lock_guard();
         let _isolated = IsolatedVaultKeyEnv::new();
 
         let auth_token = "auth-token";
@@ -1695,7 +1916,7 @@ mod tests {
 
     #[tokio::test]
     async fn pull_env_returns_empty_for_non_default_legacy_flat_vault() {
-        let _guard = env_lock().lock().await;
+        let _guard = env_lock_guard();
 
         // Hermetic env: force file-backed wrapping key + isolated HOME so
         // the in-process `crypto::encrypt_vault_for_sync` call below
@@ -1740,7 +1961,7 @@ mod tests {
 
     #[tokio::test]
     async fn pull_raw_times_out_when_server_stalls() {
-        let _guard = env_lock().lock().await;
+        let _guard = env_lock_guard();
         let server = MockServer::start().await;
         let original_timeout = std::env::var_os("LPM_TEST_SYNC_TIMEOUT_MS");
 
@@ -1785,7 +2006,7 @@ mod tests {
 
     #[test]
     fn push_org_with_keys_regenerates_corrupted_forced_file_key_and_skips_members_without_keys() {
-        let _guard = env_lock().blocking_lock();
+        let _guard = env_lock_guard();
         let temp = tempfile::tempdir().expect("failed to create temp home for forced vault test");
         let original_home = std::env::var_os("HOME");
         let original_force_file_vault = std::env::var_os("LPM_FORCE_FILE_VAULT");
@@ -1939,7 +2160,7 @@ mod tests {
         // creation time and never reflected later CLI pushes. This test pins
         // the contract: when the caller passes `PushMetadata`, both fields
         // land on the wire alongside the encrypted blob and wrapped keys.
-        let _guard = env_lock().blocking_lock();
+        let _guard = env_lock_guard();
         let temp = tempfile::tempdir().expect("tempdir for metadata round-trip test");
         let original_home = std::env::var_os("HOME");
         let original_force_file_vault = std::env::var_os("LPM_FORCE_FILE_VAULT");
@@ -2098,7 +2319,7 @@ mod tests {
         // supplied, the body must NOT contain `name` or `schema` fields.
         // This pins the "explicit None means don't touch dashboard
         // metadata" contract — server keeps last-known-good schema/name.
-        let _guard = env_lock().blocking_lock();
+        let _guard = env_lock_guard();
         let temp = tempfile::tempdir().expect("tempdir for None-metadata test");
         let original_home = std::env::var_os("HOME");
         let original_force_file_vault = std::env::var_os("LPM_FORCE_FILE_VAULT");

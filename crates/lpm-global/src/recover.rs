@@ -289,9 +289,28 @@ fn reconcile_one(
         // the path as a tombstone so `store gc` / next recovery can
         // retry. Pre-fix the error was dropped silently and the path
         // sat as permanent debris (audit Low #2).
+        //
+        // L47: pre-validate the WAL-supplied `new_root_path` against
+        // the `installs/<name>@<version>` shape before any unlink. A
+        // corrupt WAL with `new_root_path = "/etc/passwd"` (or any
+        // non-shape path) skips the inline delete and the tombstone
+        // push; the orphan path still resolves via WAL Abort but no
+        // outside-tree filesystem mutation runs.
         let mut tombstoned = false;
         let new_root_ext = as_extended_path(&intent.new_root_path);
-        if new_root_ext.exists()
+        let path_shape = crate::sweep::validated_install_root_absolute(
+            &root.global_root(),
+            &intent.new_root_path,
+        );
+        if let Err(reason) = &path_shape {
+            tracing::warn!(
+                "recover: orphan-root path for tx {} is structurally invalid ({reason}); \
+                 skipping inline delete and tombstone push",
+                intent.tx_id,
+            );
+        }
+        if path_shape.is_ok()
+            && new_root_ext.exists()
             && let Err(e) = std::fs::remove_dir_all(&new_root_ext)
         {
             if let Some(rel) = relative_install_root(root, &intent.new_root_path) {
@@ -341,21 +360,29 @@ fn reconcile_one(
         other => return roll_back(root, manifest, wal, intent, &pending, other),
     };
 
-    // Defense in depth: recovery-side collision check (audit High from
-    // the fix round). The user-facing commit_locked already
-    // performs this check + inline-rollback, so a well-behaved install
-    // should never leave a pending row that would collide. But if
-    // state ever does leak (older binary that lacked the commit-side
-    // check, manual tampering, future bug), recovery must NOT silently
-    // commit a collision. Treat a recovery-time collision as a
-    // validate failure and roll back.
+    // Defense in depth: recovery-side collision check.
     //
-    // Use the marker-aware roll-back so leaked shims (an older binary
-    // could have emitted shims pointing at the new install before
-    // crashing) get cleaned up AND the displaced original owner's
-    // shim gets restored. the pending.commands is empty, so the
-    // default roll_back path can't see those shims.
-    let collisions = crate::find_command_collisions(manifest, &intent.package, &marker_commands);
+    // The user-facing commit_locked already runs this against the
+    // post-resolution state, so a well-behaved install will not leave
+    // a pending row that would collide here. But recovery must keep
+    // checking — leaked shims (older binary that lacked the commit-side
+    // check, manual tampering, future bug) must not silently commit.
+    //
+    // The check honours `ownership_delta` and `new_aliases_json`: a
+    // user who explicitly resolved a collision via `--replace-bin` or
+    // `--alias` recorded that resolution in the second Intent, and the
+    // post-resolution state is collision-free by construction. Pre-fix
+    // this scan ran against the raw manifest + raw marker_commands, so
+    // a crash after the second Intent was durable but before WAL Commit
+    // would roll back an install whose collisions the user had already
+    // approved. The fix replays the delta into a working view (same
+    // shape the planner uses for its residual-collision check) and
+    // tests against the PATH names that will actually be on PATH after
+    // the commit — the post-resolution direct bins plus any new alias
+    // keys.
+    let path_names = post_resolution_path_names(&marker_commands, intent);
+    let working_view = post_resolution_view(manifest, intent);
+    let collisions = crate::find_command_collisions(&working_view, &intent.package, &path_names);
     if !collisions.is_empty() {
         let synthetic_status = InstallRootStatus::MarkerCommandMismatch {
             extra: collisions.iter().map(|c| c.command.clone()).collect(),
@@ -498,16 +525,21 @@ fn roll_forward(
     //    authoritative marker, EXCEPT those that were aliased away
     //    (invariant: declared bins that are exposed under an
     //    alias MUST NOT also appear as direct shims). We compute the
-    //    aliased-away set from `ownership_delta`'s AliasInstall
-    //    entries: each `bin` field names a declared bin that is
-    //    exposed under an alias.
+    //    aliased-away set from two sources:
+    //      - `ownership_delta`'s AliasInstall entries (install path):
+    //        each `bin` field names a declared bin exposed via a new
+    //        alias the install creates.
+    //      - `new_aliases_json`'s `bin` fields (upgrade path, M73):
+    //        the snapshot of aliases the package owns post-commit. For
+    //        upgrades that preserve prior aliases, `ownership_delta`
+    //        is empty and this is the only signal.
     //
     //    Marker over pending.commands: the marker was written by the
     //    install pipeline AFTER linking the bin shims (marker contract).
     //    Previously, recovery iterated pending.commands; now
     //    the pipeline writes pending with empty commands and lets
     //    the marker be authoritative.
-    let aliased_origs: HashSet<String> = intent
+    let mut aliased_origs: HashSet<String> = intent
         .ownership_delta
         .iter()
         .filter_map(|c| match c {
@@ -515,6 +547,13 @@ fn roll_forward(
             _ => None,
         })
         .collect();
+    if let serde_json::Value::Object(m) = &intent.new_aliases_json {
+        for entry in m.values() {
+            if let Some(bin) = entry.get("bin").and_then(|v| v.as_str()) {
+                aliased_origs.insert(bin.to_string());
+            }
+        }
+    }
     let final_commands: Vec<String> = marker_commands
         .iter()
         .filter(|c| !aliased_origs.contains(c.as_str()))
@@ -630,7 +669,21 @@ fn roll_forward_uninstall(
     //    so it's retried on the next `lpm` invocation, but don't
     //    propagate as an error (would wedge every subsequent
     //    global-state command). Audit Medium from the round.
-    let prior_commands: Vec<String> = intent
+    //
+    // L48: derive the command list from the snapshot when it is
+    // structurally valid, OR fall back to the live manifest's
+    // `[packages.<pkg>]` row when the snapshot is missing/malformed
+    // (older buggy writer, partial WAL, same-uid tamper). Pre-fix the
+    // fallback was a silent empty vector, which let recovery commit
+    // the uninstall while orphaning every emitted shim — those shims
+    // then persisted in `bin_dir` with no manifest row to reconcile
+    // them against (this is L48 + the L37 doctor blind spot together
+    // creating "invisible debris on PATH"). Fallback to the manifest
+    // row keeps the cleanup intent honest: if both the snapshot AND
+    // the manifest lack commands for this package, the package was
+    // already structurally without shims and the empty-vector path is
+    // correct.
+    let snapshot_commands: Option<Vec<String>> = intent
         .prior_active_row_json
         .as_ref()
         .and_then(|v| v.get("commands"))
@@ -639,8 +692,28 @@ fn roll_forward_uninstall(
             arr.iter()
                 .filter_map(|v| v.as_str().map(String::from))
                 .collect()
-        })
-        .unwrap_or_default();
+        });
+    let prior_commands: Vec<String> = match snapshot_commands {
+        Some(c) => c,
+        None => {
+            // Snapshot malformed → consult the live manifest. This
+            // gives recovery the same cleanup surface the original
+            // uninstall would have computed, instead of silently
+            // dropping it.
+            let fallback = manifest
+                .packages
+                .get(&intent.package)
+                .map(|e| e.commands.clone())
+                .unwrap_or_default();
+            tracing::warn!(
+                "recover: uninstall snapshot for '{}' missing/malformed commands array; \
+                 falling back to live manifest row ({} command(s))",
+                intent.package,
+                fallback.len(),
+            );
+            fallback
+        }
+    };
     let mut shim_failures: Vec<String> = Vec::new();
     for cmd in &prior_commands {
         if let Err(e) = remove_shim(&bin_dir, cmd) {
@@ -649,12 +722,35 @@ fn roll_forward_uninstall(
     }
 
     // 2. Remove alias shims from the prior ownership snapshot.
-    let prior_aliases: Vec<String> = intent
+    //
+    // L48: same snapshot-then-fallback shape as the commands step.
+    // When the snapshot's `prior_command_ownership_json.aliases`
+    // is missing/not-an-object, fall back to walking the manifest's
+    // `[aliases.*]` rows owned by this package — that's the same
+    // surface the original uninstall would have iterated.
+    let snapshot_aliases: Option<Vec<String>> = intent
         .prior_command_ownership_json
         .get("aliases")
         .and_then(|v| v.as_object())
-        .map(|m| m.keys().cloned().collect())
-        .unwrap_or_default();
+        .map(|m| m.keys().cloned().collect());
+    let prior_aliases: Vec<String> = match snapshot_aliases {
+        Some(a) => a,
+        None => {
+            let fallback: Vec<String> = manifest
+                .aliases
+                .iter()
+                .filter(|(_, entry)| entry.package == intent.package)
+                .map(|(name, _)| name.clone())
+                .collect();
+            tracing::warn!(
+                "recover: uninstall snapshot for '{}' missing/malformed aliases object; \
+                 falling back to live manifest alias rows ({} alias(es))",
+                intent.package,
+                fallback.len(),
+            );
+            fallback
+        }
+    };
     for alias_name in &prior_aliases {
         if let Err(e) = remove_shim(&bin_dir, alias_name) {
             shim_failures.push(format!("{alias_name} (alias): {e}"));
@@ -673,6 +769,36 @@ fn roll_forward_uninstall(
             intent.package
         );
         return Ok(ReconciliationOutcome::Deferred { reason });
+    }
+
+    // 2b. Replay the host-global trust prune (M76).
+    //
+    // The Intent carries the prune set computed at uninstall time.
+    // `remove_many` is idempotent: a crash AFTER the original tx
+    // pruned re-enters recovery and replays here as a no-op (count
+    // = 0). A crash BEFORE the original tx pruned executes the
+    // prune for the first time here. Either way the end state is
+    // identical.
+    //
+    // Empty prune (older WAL files predating M76, OR installs/
+    // upgrades that don't prune anything, OR the conservative
+    // fail-safe at uninstall time) is a no-op — we don't even
+    // open the trust file.
+    if !intent.uninstall_trust_prune.is_empty() {
+        let mut trust = crate::trusted_deps::read_for(root)?;
+        let prune_pairs: Vec<(&str, &str)> = intent
+            .uninstall_trust_prune
+            .iter()
+            .map(|e| (e.name.as_str(), e.version.as_str()))
+            .collect();
+        let removed = trust.remove_many(&prune_pairs);
+        if removed > 0 {
+            crate::trusted_deps::write_for(root, &trust)?;
+            tracing::info!(
+                "recover: replayed uninstall trust-prune for '{}' — {removed} entries removed",
+                intent.package
+            );
+        }
     }
 
     // 3. Drop the manifest row (idempotent) + any alias rows owned by
@@ -696,8 +822,16 @@ fn roll_forward_uninstall(
 
     // 6. Best-effort install-root cleanup. If this fails the tombstone
     //    we just queued keeps the retry alive for `store gc`.
+    //
+    // L47: skip the inline delete when the WAL-supplied path doesn't
+    // match the `installs/<name>@<version>` shape — the sweep step at
+    // step 4 already refused to push the relative form if it wasn't
+    // under global_root, so the tombstone retry won't fire either.
     let new_root_ext = as_extended_path(&intent.new_root_path);
-    if new_root_ext.exists() {
+    if new_root_ext.exists()
+        && crate::sweep::validated_install_root_absolute(&root.global_root(), &intent.new_root_path)
+            .is_ok()
+    {
         let _ = std::fs::remove_dir_all(&new_root_ext);
     }
 
@@ -766,8 +900,24 @@ fn roll_back_with_authoritative_commands(
     // 1. Best-effort install-root cleanup. On Windows the directory may
     //    be locked by a tool the user is running against the new
     //    version — queue it as a tombstone instead of failing.
+    //
+    // L47: pre-validate the WAL-supplied `new_root_path` against the
+    // `installs/<name>@<version>` shape before any unlink. A corrupt
+    // Intent with `new_root_path` outside `global_root` skips both
+    // the inline delete and the tombstone push (tombstones get
+    // `pending.root` which is also validated by the sweeper).
     let new_root_ext = as_extended_path(&intent.new_root_path);
-    if new_root_ext.exists()
+    let path_shape =
+        crate::sweep::validated_install_root_absolute(&root.global_root(), &intent.new_root_path);
+    if let Err(reason) = &path_shape {
+        tracing::warn!(
+            "recover: install-root path for {} is structurally invalid ({reason}); \
+             skipping inline delete and tombstone push",
+            intent.package,
+        );
+    }
+    if path_shape.is_ok()
+        && new_root_ext.exists()
         && let Err(e) = std::fs::remove_dir_all(&new_root_ext)
     {
         tracing::debug!(
@@ -801,6 +951,15 @@ fn roll_back_with_authoritative_commands(
     //    owner's shim (pointing at their install root). The owner
     //    lookup happens BEFORE removal so we don't false-positive on
     //    aliases the new install would have written (see step 2b).
+    //
+    //    Track `remove_shim` failures (M74): a Windows lock, AV
+    //    quarantine, or concurrent recreate can leave a shim on disk
+    //    pointing at the rolled-back install root. Pre-fix these were
+    //    `let _ = remove_shim(...)` and the rollback finalized — the
+    //    leaked shim survived forever. Now any failure surfaces the
+    //    transaction as `Deferred` so the next `lpm` invocation
+    //    retries the rollback (matches the uninstall-defer shape).
+    let mut shim_failures: Vec<String> = Vec::new();
     let mut to_restore: Vec<(String, String, String)> = Vec::new(); // (cmd, owner_pkg, owner_root)
     for cmd in cleanup_commands {
         // Skip commands the recovering package itself currently owns
@@ -812,12 +971,30 @@ fn roll_back_with_authoritative_commands(
         {
             to_restore.push((cmd.clone(), owner.package.to_string(), owner_root));
         }
-        let _ = remove_shim(&bin_dir, cmd);
+        if let Err(e) = remove_shim(&bin_dir, cmd) {
+            shim_failures.push(format!("{cmd}: {e}"));
+        }
     }
     if let serde_json::Value::Object(m) = &intent.new_aliases_json {
         for alias_name in m.keys() {
-            let _ = remove_shim(&bin_dir, alias_name);
+            if let Err(e) = remove_shim(&bin_dir, alias_name) {
+                shim_failures.push(format!("{alias_name} (alias): {e}"));
+            }
         }
+    }
+    if !shim_failures.is_empty() {
+        let reason = format!(
+            "rolled-back transaction for '{}' could not clear {} shim(s): {}. \
+             Will retry on next invocation.",
+            intent.package,
+            shim_failures.len(),
+            shim_failures.join("; ")
+        );
+        tracing::warn!(
+            "recover: deferring rollback of '{}': {reason}",
+            intent.package
+        );
+        return Ok(ReconciliationOutcome::Deferred { reason });
     }
     // Re-emit any displaced owner's shim. Pointing at the owner's
     // existing `node_modules/.bin/<cmd>` per the install pipeline's
@@ -909,6 +1086,75 @@ fn roll_back_with_authoritative_commands(
     Ok(ReconciliationOutcome::RolledBack {
         reason: format!("{status:?}"),
     })
+}
+
+/// PATH names the transaction would expose AFTER its
+/// `--replace-bin`/`--alias` resolutions are applied: marker commands
+/// minus any that the user aliased away, plus every new alias key.
+///
+/// Used by the recovery-side collision check so a user-resolved
+/// install whose crash landed between the second Intent and WAL Commit
+/// is not rolled back as if the collision were unresolved.
+///
+/// "Aliased away" is the union of two sources: `ownership_delta`'s
+/// AliasInstall `bin` fields (install path with explicit `--alias`),
+/// and `new_aliases_json`'s `bin` fields (upgrade path preserving
+/// prior aliases — M73).
+fn post_resolution_path_names(marker_commands: &[String], intent: &IntentPayload) -> Vec<String> {
+    let mut aliased_origs: HashSet<String> = intent
+        .ownership_delta
+        .iter()
+        .filter_map(|c| match c {
+            OwnershipChange::AliasInstall { bin, .. } => Some(bin.clone()),
+            _ => None,
+        })
+        .collect();
+    if let serde_json::Value::Object(m) = &intent.new_aliases_json {
+        for entry in m.values() {
+            if let Some(bin) = entry.get("bin").and_then(|v| v.as_str()) {
+                aliased_origs.insert(bin.to_string());
+            }
+        }
+    }
+    let mut out: Vec<String> = marker_commands
+        .iter()
+        .filter(|c| !aliased_origs.contains(c.as_str()))
+        .cloned()
+        .collect();
+    if let serde_json::Value::Object(m) = &intent.new_aliases_json {
+        out.extend(m.keys().cloned());
+    }
+    out
+}
+
+/// Manifest clone with the "freeing" subset of `ownership_delta`
+/// applied — `DirectTransfer` and `AliasOwnerRemove` mutations that
+/// release PATH names the installing package will take. `AliasInstall`
+/// is intentionally NOT applied: replaying it would make the installing
+/// package own the new alias rows, and `find_command_collisions`'s
+/// self-owner exclusion would then hide a real third-party owner of
+/// that PATH name. Same shape the planner uses for its residual-
+/// collision check at install commit time.
+fn post_resolution_view(manifest: &GlobalManifest, intent: &IntentPayload) -> GlobalManifest {
+    let mut view = manifest.clone();
+    for change in &intent.ownership_delta {
+        match change {
+            OwnershipChange::DirectTransfer {
+                command,
+                from_package,
+                ..
+            } => {
+                if let Some(owner) = view.packages.get_mut(from_package) {
+                    owner.commands.retain(|c| c != command);
+                }
+            }
+            OwnershipChange::AliasOwnerRemove { alias_name, .. } => {
+                view.aliases.remove(alias_name);
+            }
+            OwnershipChange::AliasInstall { .. } => {}
+        }
+    }
+    view
 }
 
 /// Replay one OwnershipChange against the manifest
@@ -1186,7 +1432,7 @@ mod tests {
     use super::*;
     use crate::install_root::{InstallReadyMarker, write_marker};
     use crate::manifest::{PackageSource, write_for};
-    use crate::wal::TxKind;
+    use crate::wal::{TrustPruneEntry, TxKind};
     use std::path::{Path, PathBuf};
     use tempfile::TempDir;
 
@@ -1204,7 +1450,11 @@ mod tests {
                 std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o755)).unwrap();
             }
         }
-        std::fs::write(install_root.join("lpm.lock"), b"# valid").unwrap();
+        std::fs::write(
+            install_root.join("lpm.lock"),
+            crate::install_root::MINIMAL_VALID_LOCKFILE_TOML,
+        )
+        .unwrap();
         write_marker(
             install_root,
             &InstallReadyMarker::new(commands.iter().map(|c| c.to_string()).collect()),
@@ -1232,6 +1482,7 @@ mod tests {
             prior_command_ownership_json: serde_json::json!({}),
             new_aliases_json: serde_json::json!({}),
             ownership_delta: Vec::new(),
+            uninstall_trust_prune: Vec::new(),
         }))
     }
 
@@ -1465,6 +1716,7 @@ mod tests {
             prior_command_ownership_json: serde_json::json!({}),
             new_aliases_json: serde_json::json!({}),
             ownership_delta: Vec::new(),
+            uninstall_trust_prune: Vec::new(),
         }))
     }
 
@@ -1579,6 +1831,7 @@ mod tests {
             prior_command_ownership_json: serde_json::json!({}),
             new_aliases_json: serde_json::json!({}),
             ownership_delta: Vec::new(),
+            uninstall_trust_prune: Vec::new(),
         }));
         let mut w = WalWriter::open(root.global_wal()).unwrap();
         w.append(&intent).unwrap();
@@ -1642,6 +1895,7 @@ mod tests {
             prior_command_ownership_json: serde_json::json!({}),
             new_aliases_json: serde_json::json!({}),
             ownership_delta: Vec::new(),
+            uninstall_trust_prune: Vec::new(),
         }));
         let mut w = WalWriter::open(root.global_wal()).unwrap();
         w.append(&intent).unwrap();
@@ -1706,6 +1960,7 @@ mod tests {
             prior_command_ownership_json: serde_json::json!({}),
             new_aliases_json: serde_json::json!({}),
             ownership_delta: Vec::new(),
+            uninstall_trust_prune: Vec::new(),
         }));
         let mut w = WalWriter::open(root.global_wal()).unwrap();
         w.append(&intent).unwrap();
@@ -1821,6 +2076,7 @@ mod tests {
             }),
             new_aliases_json: serde_json::Value::Null,
             ownership_delta: Vec::new(),
+            uninstall_trust_prune: Vec::new(),
         }))
     }
 
@@ -2141,6 +2397,308 @@ mod tests {
         );
     }
 
+    /// M72: recovery's collision check must honour `ownership_delta`.
+    /// A crash after the second Intent is durable but before WAL Commit
+    /// leaves a pending row whose collisions the user explicitly
+    /// resolved via `--replace-bin`. Pre-fix recovery saw the raw
+    /// `http-server.commands = ["serve"]` and rolled back; post-fix it
+    /// applies the `DirectTransfer` from the delta to a working view
+    /// and rolls forward as the user approved.
+    #[test]
+    #[cfg(unix)]
+    fn recovery_rolls_forward_when_collision_resolved_by_replace_bin_in_delta() {
+        let tmp = TempDir::new().unwrap();
+        let root = LpmRoot::from_dir(tmp.path());
+
+        // Displaced owner: http-server@1 owns `serve`.
+        let http_server_root = root.install_root_for("http-server", "1.0.0");
+        std::fs::create_dir_all(&http_server_root).unwrap();
+        make_complete_install_root(&http_server_root, &["serve"]);
+
+        // Incoming install: foo@1 also declares a `serve` bin and the
+        // user resolved the collision with `--replace-bin serve`.
+        let foo_root = root.install_root_for("foo", "1.0.0");
+        std::fs::create_dir_all(&foo_root).unwrap();
+        make_complete_install_root(&foo_root, &["serve"]);
+
+        let displaced_row = serde_json::json!({
+            "saved_spec": "^1",
+            "resolved": "1.0.0",
+            "integrity": "sha512-old",
+            "source": "upstream-npm",
+            "installed_at": "2026-04-15T00:00:00Z",
+            "root": "installs/http-server@1.0.0",
+            "commands": ["serve"],
+        });
+
+        let mut manifest = GlobalManifest::default();
+        manifest.packages.insert(
+            "http-server".into(),
+            PackageEntry {
+                saved_spec: "^1".into(),
+                resolved: "1.0.0".into(),
+                integrity: "sha512-old".into(),
+                source: PackageSource::UpstreamNpm,
+                installed_at: Utc::now(),
+                root: "installs/http-server@1.0.0".into(),
+                commands: vec!["serve".into()],
+            },
+        );
+        manifest.pending.insert(
+            "foo".into(),
+            pending_install("foo", "installs/foo@1.0.0", &[]),
+        );
+        write_for(&root, &manifest).unwrap();
+
+        let new_row = serde_json::json!({
+            "saved_spec": "^1",
+            "resolved": "1.0.0",
+            "integrity": "sha512-x",
+            "source": "lpm-dev",
+            "installed_at": "2026-04-15T00:00:00Z",
+            "root": "installs/foo@1.0.0",
+            "commands": ["serve"],
+        });
+        let intent = WalRecord::Intent(Box::new(IntentPayload {
+            tx_id: "tx-resolved".into(),
+            kind: TxKind::Install,
+            package: "foo".into(),
+            new_root_path: foo_root.clone(),
+            new_row_json: new_row,
+            prior_active_row_json: None,
+            prior_command_ownership_json: serde_json::json!({}),
+            new_aliases_json: serde_json::json!({}),
+            ownership_delta: vec![OwnershipChange::DirectTransfer {
+                command: "serve".into(),
+                from_package: "http-server".into(),
+                from_row_snapshot: displaced_row,
+            }],
+            uninstall_trust_prune: Vec::new(),
+        }));
+        let mut w = WalWriter::open(root.global_wal()).unwrap();
+        w.append(&intent).unwrap();
+
+        let report = recover(&root).unwrap();
+        assert_eq!(
+            report.reconciled[0].outcome,
+            ReconciliationOutcome::RolledForward,
+            "user-resolved DirectTransfer must roll forward, not back"
+        );
+
+        let final_manifest = read_for(&root).unwrap();
+        assert!(final_manifest.packages.contains_key("foo"));
+        assert!(
+            !final_manifest.packages["http-server"]
+                .commands
+                .contains(&"serve".to_string()),
+            "displaced owner must lose `serve` per the delta"
+        );
+        let bin_target = std::fs::read_link(root.bin_dir().join("serve")).unwrap();
+        let expected = foo_root.join("node_modules").join(".bin").join("serve");
+        assert_eq!(
+            bin_target, expected,
+            "`serve` shim must point at the new owner"
+        );
+    }
+
+    /// M72: same scenario for `--alias` — the new bin lands under a
+    /// fresh PATH name, the original collision name is filtered out of
+    /// the post-resolution check, and the new alias key is checked
+    /// against the working view (which doesn't yet own it).
+    #[test]
+    #[cfg(unix)]
+    fn recovery_rolls_forward_when_collision_resolved_by_alias_in_delta() {
+        let tmp = TempDir::new().unwrap();
+        let root = LpmRoot::from_dir(tmp.path());
+
+        let http_server_root = root.install_root_for("http-server", "1.0.0");
+        std::fs::create_dir_all(&http_server_root).unwrap();
+        make_complete_install_root(&http_server_root, &["serve"]);
+
+        let foo_root = root.install_root_for("foo", "1.0.0");
+        std::fs::create_dir_all(&foo_root).unwrap();
+        make_complete_install_root(&foo_root, &["serve"]);
+
+        let mut manifest = GlobalManifest::default();
+        manifest.packages.insert(
+            "http-server".into(),
+            PackageEntry {
+                saved_spec: "^1".into(),
+                resolved: "1.0.0".into(),
+                integrity: "sha512-old".into(),
+                source: PackageSource::UpstreamNpm,
+                installed_at: Utc::now(),
+                root: "installs/http-server@1.0.0".into(),
+                commands: vec!["serve".into()],
+            },
+        );
+        manifest.pending.insert(
+            "foo".into(),
+            pending_install("foo", "installs/foo@1.0.0", &[]),
+        );
+        write_for(&root, &manifest).unwrap();
+
+        // `--alias serve=foo-serve`: marker still lists `serve` (the
+        // declared bin), the post-resolution exposure is `foo-serve`.
+        // post-fix: the original `serve` is filtered out and only
+        // `foo-serve` is checked against the working view, where
+        // nobody owns it yet.
+        let new_row = serde_json::json!({
+            "saved_spec": "^1",
+            "resolved": "1.0.0",
+            "integrity": "sha512-x",
+            "source": "lpm-dev",
+            "installed_at": "2026-04-15T00:00:00Z",
+            "root": "installs/foo@1.0.0",
+            "commands": [],
+        });
+        let intent = WalRecord::Intent(Box::new(IntentPayload {
+            tx_id: "tx-aliased".into(),
+            kind: TxKind::Install,
+            package: "foo".into(),
+            new_root_path: foo_root.clone(),
+            new_row_json: new_row,
+            prior_active_row_json: None,
+            prior_command_ownership_json: serde_json::json!({}),
+            new_aliases_json: serde_json::json!({
+                "foo-serve": {"package": "foo", "bin": "serve"}
+            }),
+            ownership_delta: vec![OwnershipChange::AliasInstall {
+                alias_name: "foo-serve".into(),
+                package: "foo".into(),
+                bin: "serve".into(),
+            }],
+            uninstall_trust_prune: Vec::new(),
+        }));
+        let mut w = WalWriter::open(root.global_wal()).unwrap();
+        w.append(&intent).unwrap();
+
+        let report = recover(&root).unwrap();
+        assert_eq!(
+            report.reconciled[0].outcome,
+            ReconciliationOutcome::RolledForward,
+            "user-resolved AliasInstall must roll forward — the original name was filtered out"
+        );
+
+        let final_manifest = read_for(&root).unwrap();
+        assert!(final_manifest.packages.contains_key("foo"));
+        assert!(
+            final_manifest
+                .packages
+                .get("http-server")
+                .map(|e| e.commands.contains(&"serve".to_string()))
+                .unwrap_or(false),
+            "displaced owner keeps `serve` when the new install only aliases"
+        );
+        assert!(
+            final_manifest.aliases.contains_key("foo-serve"),
+            "new alias row must land in manifest"
+        );
+    }
+
+    /// M72 negative: when a collision exists for a PATH name NOT
+    /// covered by `ownership_delta`, recovery still rolls back. Proves
+    /// the fix widens acceptance only to user-resolved collisions and
+    /// does not blanket-disable the check.
+    #[test]
+    #[cfg(unix)]
+    fn recovery_still_rolls_back_when_collision_not_covered_by_delta() {
+        let tmp = TempDir::new().unwrap();
+        let root = LpmRoot::from_dir(tmp.path());
+
+        let http_server_root = root.install_root_for("http-server", "1.0.0");
+        std::fs::create_dir_all(&http_server_root).unwrap();
+        make_complete_install_root(&http_server_root, &["serve"]);
+
+        // foo declares BOTH `serve` (resolved by replace-bin) AND
+        // `lint` (unresolved — no delta entry for it).
+        let foo_root = root.install_root_for("foo", "1.0.0");
+        std::fs::create_dir_all(&foo_root).unwrap();
+        make_complete_install_root(&foo_root, &["serve", "lint"]);
+
+        let displaced_row = serde_json::json!({
+            "saved_spec": "^1",
+            "resolved": "1.0.0",
+            "integrity": "sha512-old",
+            "source": "upstream-npm",
+            "installed_at": "2026-04-15T00:00:00Z",
+            "root": "installs/http-server@1.0.0",
+            "commands": ["serve"],
+        });
+
+        let mut manifest = GlobalManifest::default();
+        manifest.packages.insert(
+            "http-server".into(),
+            PackageEntry {
+                saved_spec: "^1".into(),
+                resolved: "1.0.0".into(),
+                integrity: "sha512-old".into(),
+                source: PackageSource::UpstreamNpm,
+                installed_at: Utc::now(),
+                root: "installs/http-server@1.0.0".into(),
+                commands: vec!["serve".into()],
+            },
+        );
+        // Third-party owner of `lint` — incoming install has no
+        // resolution for this collision.
+        manifest.packages.insert(
+            "eslint".into(),
+            PackageEntry {
+                saved_spec: "^9".into(),
+                resolved: "9.0.0".into(),
+                integrity: "sha512-z".into(),
+                source: PackageSource::UpstreamNpm,
+                installed_at: Utc::now(),
+                root: "installs/eslint@9.0.0".into(),
+                commands: vec!["lint".into()],
+            },
+        );
+        manifest.pending.insert(
+            "foo".into(),
+            pending_install("foo", "installs/foo@1.0.0", &[]),
+        );
+        write_for(&root, &manifest).unwrap();
+
+        let new_row = serde_json::json!({
+            "saved_spec": "^1",
+            "resolved": "1.0.0",
+            "integrity": "sha512-x",
+            "source": "lpm-dev",
+            "installed_at": "2026-04-15T00:00:00Z",
+            "root": "installs/foo@1.0.0",
+            "commands": ["serve", "lint"],
+        });
+        let intent = WalRecord::Intent(Box::new(IntentPayload {
+            tx_id: "tx-partial".into(),
+            kind: TxKind::Install,
+            package: "foo".into(),
+            new_root_path: foo_root,
+            new_row_json: new_row,
+            prior_active_row_json: None,
+            prior_command_ownership_json: serde_json::json!({}),
+            new_aliases_json: serde_json::json!({}),
+            // Only `serve` is in the delta — `lint` is not.
+            ownership_delta: vec![OwnershipChange::DirectTransfer {
+                command: "serve".into(),
+                from_package: "http-server".into(),
+                from_row_snapshot: displaced_row,
+            }],
+            uninstall_trust_prune: Vec::new(),
+        }));
+        let mut w = WalWriter::open(root.global_wal()).unwrap();
+        w.append(&intent).unwrap();
+
+        let report = recover(&root).unwrap();
+        assert!(
+            matches!(
+                report.reconciled[0].outcome,
+                ReconciliationOutcome::RolledBack { .. }
+            ),
+            "unresolved collision on `lint` must still roll back, got {:?}",
+            report.reconciled[0].outcome
+        );
+    }
+
     /// Truly orphaned INTENT: no pending, no matching active. Recovery
     /// must clean up the install root and emit ABORT.
     #[test]
@@ -2215,6 +2773,7 @@ mod tests {
             prior_command_ownership_json: serde_json::json!({}),
             new_aliases_json: serde_json::json!({}),
             ownership_delta: Vec::new(),
+            uninstall_trust_prune: Vec::new(),
         }));
         let mut w = WalWriter::open(root.global_wal()).unwrap();
         w.append(&intent).unwrap();
@@ -2295,6 +2854,201 @@ mod tests {
         assert!(
             std::fs::symlink_metadata(root.bin_dir().join("srv")).is_err(),
             "obsolete alias shim should be removed"
+        );
+    }
+
+    /// M74: when `remove_shim` fails during recovery rollback (e.g.,
+    /// a locked shim on Windows), the transaction must defer rather
+    /// than write WAL Abort with leaked shims surviving. Pre-fix the
+    /// errors were `let _ = remove_shim(...)` and the rollback
+    /// finalized regardless.
+    #[test]
+    #[cfg(unix)]
+    fn recovery_rollback_defers_when_shim_removal_fails() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = TempDir::new().unwrap();
+        let root = LpmRoot::from_dir(tmp.path());
+
+        // Pending install with a partial root → roll_back.
+        let install_root = root.install_root_for("pkg", "1.0.0");
+        std::fs::create_dir_all(install_root.join("node_modules").join(".bin")).unwrap();
+        std::fs::write(install_root.join("lpm.lock"), b"x").unwrap();
+
+        let mut manifest = GlobalManifest::default();
+        manifest.pending.insert(
+            "pkg".into(),
+            pending_install("pkg", "installs/pkg@1.0.0", &["pkg"]),
+        );
+        write_for(&root, &manifest).unwrap();
+
+        // Plant a shim file that cleanup will try to remove.
+        std::fs::create_dir_all(root.bin_dir()).unwrap();
+        std::os::unix::fs::symlink("/dev/null", root.bin_dir().join("pkg")).unwrap();
+
+        // Drop write perm on bin_dir so remove_shim fails (POSIX
+        // requires write on a directory to unlink children).
+        let original_perms = std::fs::metadata(root.bin_dir()).unwrap().permissions();
+        std::fs::set_permissions(root.bin_dir(), std::fs::Permissions::from_mode(0o555)).unwrap();
+
+        let mut w = WalWriter::open(root.global_wal()).unwrap();
+        w.append(&intent_install("tx-locked", "pkg", &install_root, &["pkg"]))
+            .unwrap();
+
+        let report = recover(&root);
+
+        // Restore perms before any assertion-driven panic.
+        std::fs::set_permissions(root.bin_dir(), original_perms).unwrap();
+
+        let report = report.unwrap();
+        match &report.reconciled[0].outcome {
+            ReconciliationOutcome::Deferred { reason } => {
+                assert!(
+                    reason.contains("could not clear"),
+                    "deferred reason must name shim-clear failure: {reason}"
+                );
+                assert!(reason.contains("pkg"));
+            }
+            other => panic!("expected Deferred when remove_shim fails; got {other:?}"),
+        }
+
+        // WAL must NOT have an Abort record — the rollback didn't
+        // complete and the next pass should retry.
+        let scan = WalReader::at(root.global_wal()).scan().unwrap();
+        let has_abort = scan
+            .records
+            .iter()
+            .any(|r| matches!(r, WalRecord::Abort { tx_id, .. } if tx_id == "tx-locked"));
+        assert!(
+            !has_abort,
+            "Abort must not be written when shim cleanup deferred the rollback"
+        );
+    }
+
+    /// M73: roll-forward of an upgrade Intent whose `new_aliases_json`
+    /// preserves the prior install's aliases must (1) NOT emit a direct
+    /// shim for the aliased-away bin, and (2) keep the alias row in
+    /// manifest pointing at the new install root.
+    #[test]
+    #[cfg(unix)]
+    fn roll_forward_upgrade_with_preserved_aliases_omits_aliased_away_direct_shim() {
+        let tmp = TempDir::new().unwrap();
+        let root = LpmRoot::from_dir(tmp.path());
+
+        // Prior install root exists (recovery doesn't care; tombstoning
+        // happens in step 4 of roll_forward).
+        let prior_root = root.install_root_for("foo", "1.0.0");
+        std::fs::create_dir_all(&prior_root).unwrap();
+        make_complete_install_root(&prior_root, &["dangerous"]);
+
+        // New install root has the same `dangerous` bin (we're upgrading
+        // the version, not changing the declared bins).
+        let new_root = root.install_root_for("foo", "2.0.0");
+        std::fs::create_dir_all(&new_root).unwrap();
+        make_complete_install_root(&new_root, &["dangerous"]);
+
+        // Manifest state pre-recovery: active row at 1.0.0, alias
+        // row preserved, pending row staged for 2.0.0.
+        let mut manifest = GlobalManifest::default();
+        manifest.packages.insert(
+            "foo".into(),
+            PackageEntry {
+                saved_spec: "^1".into(),
+                resolved: "1.0.0".into(),
+                integrity: "sha512-old".into(),
+                source: PackageSource::UpstreamNpm,
+                installed_at: Utc::now(),
+                root: "installs/foo@1.0.0".into(),
+                commands: vec![],
+            },
+        );
+        manifest.aliases.insert(
+            "safe-name".into(),
+            AliasEntry {
+                package: "foo".into(),
+                bin: "dangerous".into(),
+            },
+        );
+        manifest.pending.insert(
+            "foo".into(),
+            PendingEntry {
+                saved_spec: "^2".into(),
+                resolved: "2.0.0".into(),
+                integrity: "sha512-new".into(),
+                source: PackageSource::UpstreamNpm,
+                started_at: Utc::now(),
+                root: "installs/foo@2.0.0".into(),
+                commands: vec![],
+                replaces_version: Some("1.0.0".into()),
+            },
+        );
+        write_for(&root, &manifest).unwrap();
+
+        // Existing alias shim pointing at PRIOR install root.
+        std::fs::create_dir_all(root.bin_dir()).unwrap();
+        std::os::unix::fs::symlink(
+            prior_root.join("node_modules/.bin/dangerous"),
+            root.bin_dir().join("safe-name"),
+        )
+        .unwrap();
+
+        // Upgrade Intent with new_aliases_json populated per M73.
+        let new_row = serde_json::json!({
+            "saved_spec": "^2",
+            "resolved": "2.0.0",
+            "integrity": "sha512-new",
+            "source": "upstream-npm",
+            "installed_at": "2026-05-17T00:00:00Z",
+            "root": "installs/foo@2.0.0",
+            "commands": [],
+            "replaces_version": "1.0.0",
+        });
+        let prior_row = serde_json::json!({
+            "saved_spec": "^1",
+            "resolved": "1.0.0",
+            "integrity": "sha512-old",
+            "source": "upstream-npm",
+            "installed_at": "2026-05-15T00:00:00Z",
+            "root": "installs/foo@1.0.0",
+            "commands": [],
+        });
+        let intent = WalRecord::Intent(Box::new(IntentPayload {
+            tx_id: "tx-upgrade-alias".into(),
+            kind: TxKind::Upgrade,
+            package: "foo".into(),
+            new_root_path: new_root.clone(),
+            new_row_json: new_row,
+            prior_active_row_json: Some(prior_row),
+            prior_command_ownership_json: serde_json::json!({}),
+            new_aliases_json: serde_json::json!({
+                "safe-name": {"package": "foo", "bin": "dangerous"}
+            }),
+            ownership_delta: Vec::new(),
+            uninstall_trust_prune: Vec::new(),
+        }));
+        let mut w = WalWriter::open(root.global_wal()).unwrap();
+        w.append(&intent).unwrap();
+
+        let report = recover(&root).unwrap();
+        assert_eq!(
+            report.reconciled[0].outcome,
+            ReconciliationOutcome::RolledForward
+        );
+
+        let final_manifest = read_for(&root).unwrap();
+        assert!(
+            final_manifest.aliases.contains_key("safe-name"),
+            "alias row must survive upgrade roll-forward"
+        );
+        let safe_target = std::fs::read_link(root.bin_dir().join("safe-name")).unwrap();
+        let expected = new_root.join("node_modules").join(".bin").join("dangerous");
+        assert_eq!(
+            safe_target, expected,
+            "alias shim must be re-pointed at the new install root"
+        );
+        assert!(
+            std::fs::symlink_metadata(root.bin_dir().join("dangerous")).is_err(),
+            "aliased-away bin MUST NOT appear as a direct shim post-recovery"
         );
     }
 
@@ -2395,6 +3149,7 @@ mod tests {
                 "pkg2": {"package": "pkg", "bin": "pkg"}
             }),
             ownership_delta: Vec::new(),
+            uninstall_trust_prune: Vec::new(),
         }));
 
         let mut w = WalWriter::open(root.global_wal()).unwrap();
@@ -2691,6 +3446,7 @@ mod tests {
                     bin: "serve".into(),
                 },
             ],
+            uninstall_trust_prune: Vec::new(),
         };
         let json = serde_json::to_vec(&payload).unwrap();
         let parsed: IntentPayload = serde_json::from_slice(&json).unwrap();
@@ -2829,5 +3585,121 @@ mod tests {
         );
         assert_eq!(m.aliases.get("srv"), before.aliases.get("srv"));
         assert!(!m.aliases.contains_key("foo-lint"));
+    }
+
+    // ── M76: roll-forward replays the host-global trust prune ────────
+
+    /// Crash recovery for an uninstall transaction must replay the
+    /// `uninstall_trust_prune` entries that were planned at uninstall
+    /// time. Seed the WAL with an Intent carrying a populated prune
+    /// set + a trust file containing those entries, then run recovery
+    /// and assert the entries are gone, the manifest is at the post-
+    /// uninstall state, and a Commit was appended.
+    ///
+    /// Pre-fix the recovery path would replay every uninstall step
+    /// EXCEPT the trust prune, so a crash between in-tx prune (which
+    /// happens BEFORE manifest write) and the WAL Commit could leave
+    /// a stale trust entry behind on the next `lpm` invocation.
+    #[test]
+    fn roll_forward_uninstall_replays_trust_prune() {
+        let tmp = TempDir::new().unwrap();
+        let root = LpmRoot::from_dir(tmp.path());
+
+        // Seed: package "pkga" present in manifest, install root
+        // on disk, trust file contains lodash@4.17.21.
+        let install_root = root.install_root_for("pkga", "1.0.0");
+        std::fs::create_dir_all(&install_root).unwrap();
+        let mut manifest = GlobalManifest::default();
+        manifest.packages.insert(
+            "pkga".into(),
+            crate::PackageEntry {
+                saved_spec: "^1".into(),
+                resolved: "1.0.0".into(),
+                integrity: "sha512-x".into(),
+                source: crate::PackageSource::LpmDev,
+                installed_at: Utc::now(),
+                root: "installs/pkga@1.0.0".into(),
+                commands: vec![],
+            },
+        );
+        write_for(&root, &manifest).unwrap();
+        let mut trust = crate::trusted_deps::GlobalTrustedDependencies::default();
+        trust.insert_strict(
+            "lodash",
+            "4.17.21",
+            Some("sha512-l".into()),
+            Some("sha256-s".into()),
+        );
+        crate::trusted_deps::write_for(&root, &trust).unwrap();
+
+        // Write an Uninstall Intent WITHOUT a Commit — simulates a
+        // crash after Intent and before the prune+manifest steps.
+        let mut wal = WalWriter::open(root.global_wal()).unwrap();
+        wal.append(&WalRecord::Intent(Box::new(IntentPayload {
+            tx_id: "tx-m76-recover".into(),
+            kind: TxKind::Uninstall,
+            package: "pkga".into(),
+            new_root_path: install_root.clone(),
+            new_row_json: serde_json::Value::Null,
+            prior_active_row_json: Some(serde_json::json!({
+                "saved_spec": "^1",
+                "resolved": "1.0.0",
+                "integrity": "sha512-x",
+                "source": "lpm-dev",
+                "installed_at": "2026-04-22T00:00:00Z",
+                "root": "installs/pkga@1.0.0",
+                "commands": [],
+            })),
+            prior_command_ownership_json: serde_json::json!({"aliases": {}}),
+            new_aliases_json: serde_json::Value::Null,
+            ownership_delta: Vec::new(),
+            uninstall_trust_prune: vec![TrustPruneEntry {
+                name: "lodash".into(),
+                version: "4.17.21".into(),
+            }],
+        })))
+        .unwrap();
+        drop(wal);
+
+        let report = recover(&root).unwrap();
+        assert_eq!(report.reconciled.len(), 1);
+        assert_eq!(
+            report.reconciled[0].outcome,
+            ReconciliationOutcome::RolledForward,
+            "uninstall Intent must roll forward"
+        );
+
+        // Trust file is pruned.
+        let trust_after = crate::trusted_deps::read_for(&root).unwrap();
+        assert!(
+            !trust_after.trusted.contains_key("lodash@4.17.21"),
+            "recovery must replay the trust prune; got {:?}",
+            trust_after.trusted
+        );
+
+        // Manifest at post-uninstall state.
+        let manifest_after = read_for(&root).unwrap();
+        assert!(!manifest_after.packages.contains_key("pkga"));
+        assert!(
+            manifest_after
+                .tombstones
+                .iter()
+                .any(|t| t == "installs/pkga@1.0.0"),
+            "tombstone must be queued"
+        );
+
+        // After recovery, the WAL is compacted (every tx is resolved),
+        // so the file is truncated. `wal_compacted` reports that.
+        // Either way: the Intent is no longer uncompleted — running
+        // recovery a second time produces zero new reconciliations.
+        assert!(
+            report.wal_compacted,
+            "WAL must be compacted after the only Intent was rolled forward"
+        );
+        let second = recover(&root).unwrap();
+        assert!(
+            second.reconciled.is_empty(),
+            "second recovery pass must find no uncompleted Intents"
+        );
     }
 }

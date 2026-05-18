@@ -242,6 +242,23 @@ fn extract_response_data(response: &ClientMessage) -> (u16, HashMap<String, Stri
 
 // ── TOFU Certificate Pinning ──────────────────────────────────────
 
+/// Optional embedded SPKI SHA-256 pin for the canonical relay
+/// (`relay.lpm.fyi`). When `Some`, the first connect to the canonical
+/// host MUST match this pin — pure WebPKI-valid-but-unknown TOFU is
+/// rejected.
+///
+/// L3: pure TOFU on first connect lets an attacker who controls the
+/// network on the user's first `lpm dev --tunnel` capture a forged
+/// pin. The embedded pin slot is wired up here so the release pipeline
+/// can flip `None` → `Some("<canonical SPKI sha256 hex>")` to close
+/// the first-connect gap. Default stays at `None` to avoid shipping a
+/// pin that's wrong (or rotated) and would brick every install.
+///
+/// Non-canonical hosts (`LPM_TUNNEL_RELAY` override, regional relays)
+/// continue to use pure TOFU — the embedded pin would be meaningless
+/// for them.
+const EMBEDDED_CANONICAL_RELAY_SPKI_PIN_HEX: Option<&str> = None;
+
 /// Read the stored TOFU pin (hex-encoded SHA-256 of SPKI) for `host`.
 ///
 /// Looks up `~/.lpm/relay-pins/<host>` first. If absent AND `host` is
@@ -283,11 +300,31 @@ fn write_tofu_pin(host: &str, pin_hex: &str) -> Result<(), String> {
     let parent = path.parent().unwrap();
     std::fs::create_dir_all(parent)
         .map_err(|e| format!("failed to create {}: {e}", parent.display()))?;
-    std::fs::write(&path, pin_hex).map_err(|e| format!("failed to write relay pin: {e}"))?;
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+        // Open with O_CREAT|O_TRUNC|O_WRONLY and mode 0o600 so the
+        // file lands owner-only from creation rather than via a
+        // post-write chmod. Closes the race window where another
+        // process could observe the pin file between the umask-based
+        // create and the set_permissions call. The pin itself is not
+        // a secret (it's an SPKI hash), but locking it down at create
+        // time matches the broader credential-metadata posture and
+        // prevents tampering by other local UIDs.
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&path)
+            .map_err(|e| format!("failed to open relay pin for write: {e}"))?;
+        f.write_all(pin_hex.as_bytes())
+            .map_err(|e| format!("failed to write relay pin: {e}"))?;
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::write(&path, pin_hex).map_err(|e| format!("failed to write relay pin: {e}"))?;
     }
     Ok(())
 }
@@ -462,11 +499,41 @@ impl rustls::client::danger::ServerCertVerifier for TofuPinningVerifier {
                 tracing::debug!("TOFU certificate pin verified for {host}");
             }
             None => {
+                // L3: on the canonical relay, if an embedded SPKI pin
+                // is compiled in, the cert MUST match it on first
+                // connect — pure WebPKI-valid TOFU is no longer good
+                // enough. Closes the first-connect MITM window. The
+                // const is None by default; release flips it to
+                // `Some(...)` to enable enforcement.
+                if host == crate::relay::DEFAULT_RELAY_HOST
+                    && let Some(expected) = EMBEDDED_CANONICAL_RELAY_SPKI_PIN_HEX
+                    && expected != current_pin
+                {
+                    tracing::error!(
+                        "FIRST-CONNECT PIN MISMATCH for {host}: embedded={expected}, current={current_pin}. \
+                         The relay's certificate does not match the pin shipped with this binary."
+                    );
+                    return Err(rustls::Error::General(format!(
+                        "first-connect pin mismatch for {host} — possible MITM \
+                         (delete any stored pin and reinstall lpm if the relay legitimately rotated)"
+                    )));
+                }
+
                 // First connection (or post-upgrade migration from the
                 // legacy global pin file) — store the pin under the
-                // per-host layout.
+                // per-host layout. Warn-level so operators reviewing CI
+                // logs see when a fresh pin was captured (a pure-TOFU
+                // accept on the canonical relay is the L3 hazard
+                // surface; surfacing it is the minimum step while the
+                // embedded-pin slot is still empty).
                 if let Err(e) = write_tofu_pin(&host, &current_pin) {
                     tracing::warn!("failed to store TOFU pin for {host}: {e}");
+                } else if host == crate::relay::DEFAULT_RELAY_HOST {
+                    tracing::warn!(
+                        host = %host,
+                        pin = %current_pin,
+                        "captured first-connect TOFU pin for canonical relay — verify the SPKI hash matches the published one before relying on this install"
+                    );
                 } else {
                     tracing::info!("stored relay certificate pin (TOFU) for {host}: {current_pin}");
                 }
@@ -669,9 +736,19 @@ async fn try_connect(
 
     on_connected(&session);
 
-    // Create HTTP client for local proxying
+    // Create HTTP client for local proxying. `Policy::none()` disables
+    // redirect-following entirely — the local dev server should never
+    // 30x our tunnel forwarder anywhere meaningful, and an attacker-
+    // controlled `Location: http://169.254.169.254/...` from a buggy
+    // or compromised local server would otherwise let the forwarder
+    // probe cloud-metadata endpoints, AWS IMDS, or other localhost
+    // services on behalf of the relay. The relay only ever wants the
+    // dev server's direct response, never the response after a chain
+    // of redirects, so refusing them is both safer and more
+    // predictable.
     let http_client = reqwest::Client::builder()
         .no_proxy()
+        .redirect(reqwest::redirect::Policy::none())
         .build()
         .map_err(|e| LpmError::Tunnel(format!("failed to create HTTP client: {e}")))?;
 

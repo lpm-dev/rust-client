@@ -55,6 +55,7 @@ impl SandboxFixture {
             store_root: tmp.path().join("store"),
             home_dir: home,
             tmpdir: PathBuf::from("/tmp"),
+            secret_read_allow: Vec::new(),
             extra_write_dirs: Vec::new(),
         };
         lpm_sandbox::prepare_writable_dirs(&spec).expect("prepare_writable_dirs");
@@ -131,6 +132,7 @@ pub fn sandbox_supported(mode: SandboxMode) -> bool {
             store_root: home.clone(),
             home_dir: home.clone(),
             tmpdir: PathBuf::from("/tmp"),
+            secret_read_allow: Vec::new(),
             extra_write_dirs: Vec::new(),
         };
         new_for_platform(probe, mode).is_ok()

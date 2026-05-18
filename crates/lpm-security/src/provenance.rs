@@ -58,26 +58,61 @@ pub enum DriftVerdict {
     IdentityChanged,
 }
 
-/// Compare the approved-side and fresh-side snapshots using only the
-/// **stable identity fields**: `present`, `publisher`, and
-/// `workflow_path`.
+/// Compare the approved-side and fresh-side snapshots using the
+/// **stable identity fields**: `present`, `publisher`, `workflow_path`,
+/// and the **kind** of `workflow_ref` (not the specific value).
 ///
 /// Deliberately excluded from the identity tuple:
-/// - `workflow_ref` (e.g. `refs/tags/v1.14.0`) — changes every
-///   release by design; comparing it would falsely flag every patch
-///   bump as "identity changed" (this was the reviewer's critical
-///   identity changed" before the workflow field split).
+/// - The specific `workflow_ref` value (e.g. `refs/tags/v1.14.0`) —
+///   changes every release by design; comparing values would falsely
+///   flag every patch bump as "identity changed".
 /// - `attestation_cert_sha256` — Fulcio issues a fresh leaf cert per
 ///   signing invocation, so the cert SHA rotates per release even
 ///   when the GitHub Actions identity is unchanged. Retained in the
 ///   snapshot for audit / forensics, not for drift gating.
 ///
-/// Using `==` on the full struct would make `NoDrift` unreachable for any two distinct
-/// releases from the same repo — the regression guard
-/// `no_drift_when_only_workflow_ref_differs_between_releases` below
-/// exercises exactly this scenario and must stay green.
+/// **Included as of H12:** the `workflow_ref` *kind*
+/// ([`ref_kind`]) — `tags` vs `heads` vs `pull` etc. The original
+/// drift gate ignored the entire `workflow_ref` field, which let a
+/// branch-substitution attack
+/// (`refs/tags/v1.14.0` → `refs/heads/attacker-branch`) pass with
+/// `NoDrift`. Comparing only the *kind* keeps the cross-tag
+/// rotation legitimate-release shape green
+/// (`refs/tags/v1.14.0` vs `refs/tags/v1.14.1` both → `tags`) while
+/// flagging the kind-flip that's the actual attack signal.
 fn identity_equal(a: &ProvenanceSnapshot, n: &ProvenanceSnapshot) -> bool {
-    a.present == n.present && a.publisher == n.publisher && a.workflow_path == n.workflow_path
+    a.present == n.present
+        && a.publisher == n.publisher
+        && a.workflow_path == n.workflow_path
+        && ref_kind(a.workflow_ref.as_deref()) == ref_kind(n.workflow_ref.as_deref())
+}
+
+/// Classify a `workflow_ref` value (e.g. `refs/tags/v1.14.0`) into
+/// its kind — `"tags"`, `"heads"`, `"pull"`, or `"other"`.
+///
+/// A `None` input maps to `None`. The kind buckets only the second
+/// path segment of the canonical `refs/<kind>/<name>` shape; anything
+/// that doesn't start with `refs/` collapses to `"other"`.
+///
+/// Used by [`identity_equal`] to defend the H12 attack shape: an
+/// attacker with GitHub push access could mint a new attestation at
+/// `…/publish.yml@refs/heads/attacker-branch` that previously passed
+/// the drift gate (which ignored `workflow_ref` entirely). Comparing
+/// only the *kind* still allows legitimate release-ref rotation
+/// (`tags/v1.14.0` → `tags/v1.14.1`) without admitting a kind-flip.
+fn ref_kind(workflow_ref: Option<&str>) -> Option<&'static str> {
+    let raw = workflow_ref?;
+    if let Some(rest) = raw.strip_prefix("refs/") {
+        // Extract the first segment after `refs/` — that's the kind.
+        let kind = rest.split('/').next().unwrap_or("");
+        return Some(match kind {
+            "tags" => "tags",
+            "heads" => "heads",
+            "pull" => "pull",
+            _ => "other",
+        });
+    }
+    Some("other")
 }
 
 /// Compare the approved-side and fresh-side provenance snapshots.
@@ -362,6 +397,97 @@ mod tests {
         assert_eq!(
             check_provenance_drift(Some(&approved), Some(&absent)),
             DriftVerdict::ProvenanceDropped,
+        );
+    }
+
+    // ── H12: workflow_ref kind included in identity tuple ─────────
+
+    /// H12: a substitution from `refs/tags/<release>` to
+    /// `refs/heads/<branch>` is the attack signal the pre-fix
+    /// comparator missed entirely. Same publisher + workflow_path
+    /// but a kind-flip → IdentityChanged.
+    #[test]
+    fn identity_changed_when_workflow_ref_kind_flips_from_tag_to_branch() {
+        let approved = axios_v114_0();
+        let attacker = snap_full(
+            PUB_AXIOS,
+            WORKFLOW_PATH,
+            "refs/heads/attacker-branch",
+            "sha256-leaf-evil",
+        );
+        assert_eq!(
+            check_provenance_drift(Some(&approved), Some(&attacker)),
+            DriftVerdict::IdentityChanged,
+            "branch substitution must trigger drift even when publisher + workflow_path match",
+        );
+    }
+
+    /// H12: tag-to-PR substitution is also drift — `refs/pull/N/merge`
+    /// shouldn't ever be the source for a release attestation.
+    #[test]
+    fn identity_changed_when_workflow_ref_kind_flips_from_tag_to_pull_request() {
+        let approved = axios_v114_0();
+        let attacker = snap_full(
+            PUB_AXIOS,
+            WORKFLOW_PATH,
+            "refs/pull/9999/merge",
+            "sha256-leaf-pr",
+        );
+        assert_eq!(
+            check_provenance_drift(Some(&approved), Some(&attacker)),
+            DriftVerdict::IdentityChanged,
+        );
+    }
+
+    /// H12: same-kind ref rotation (the legitimate case
+    /// `v1.14.0` → `v1.14.1`) stays NoDrift. This is the cross-check
+    /// for `no_drift_when_only_workflow_ref_differs_between_releases`
+    /// — that test already proves the *value* rotation is fine; this
+    /// re-asserts that we kept *value*-rotation green after adding
+    /// kind-comparison.
+    #[test]
+    fn no_drift_when_workflow_ref_kind_matches_across_tag_rotation() {
+        let approved = axios_v114_0();
+        let new_release = axios_v114_1();
+        assert_eq!(ref_kind(approved.workflow_ref.as_deref()), Some("tags"),);
+        assert_eq!(ref_kind(new_release.workflow_ref.as_deref()), Some("tags"),);
+        assert_eq!(
+            check_provenance_drift(Some(&approved), Some(&new_release)),
+            DriftVerdict::NoDrift,
+        );
+    }
+
+    /// H12: `ref_kind` covers each canonical refs/ namespace.
+    /// Anything outside `refs/` collapses to `"other"`.
+    #[test]
+    fn ref_kind_classifies_canonical_refs_namespaces() {
+        assert_eq!(ref_kind(Some("refs/tags/v1.0.0")), Some("tags"));
+        assert_eq!(ref_kind(Some("refs/heads/main")), Some("heads"));
+        assert_eq!(ref_kind(Some("refs/pull/42/merge")), Some("pull"));
+        // Non-`refs/` shape (commit SHAs, custom refs) → "other".
+        assert_eq!(
+            ref_kind(Some("0123456789abcdef0123456789abcdef01234567")),
+            Some("other"),
+        );
+        assert_eq!(ref_kind(Some("refs/notes/some-note")), Some("other"));
+        // `None` input passes through.
+        assert_eq!(ref_kind(None), None);
+    }
+
+    /// H12: a `None` ref on the approved side and a `Some("tags/...")`
+    /// on the now side (or vice-versa) is NOT identity-equal —
+    /// approval was made under a degraded fetch on the ref side, and a
+    /// later fully-populated snapshot should be flagged for re-approval.
+    #[test]
+    fn identity_changed_when_one_side_has_ref_and_other_does_not() {
+        let approved_no_ref = ProvenanceSnapshot {
+            workflow_ref: None,
+            ..axios_v114_0()
+        };
+        let now_with_ref = axios_v114_0();
+        assert_eq!(
+            check_provenance_drift(Some(&approved_no_ref), Some(&now_with_ref)),
+            DriftVerdict::IdentityChanged,
         );
     }
 }

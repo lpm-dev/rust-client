@@ -30,14 +30,58 @@ pub mod vault_id;
 #[cfg(target_os = "macos")]
 pub mod keychain;
 
+#[cfg(test)]
+pub(crate) mod test_env_lock;
+
 use std::collections::HashMap;
 use std::path::Path;
 
 fn force_file_vault_backend() -> bool {
+    // Release builds always use the OS keychain — env contamination
+    // must not be able to redirect vault writes into a plain-file
+    // fallback that's then brute-forceable under fast-scrypt.
+    if !cfg!(debug_assertions) {
+        return false;
+    }
     matches!(
         std::env::var("LPM_FORCE_FILE_VAULT").as_deref(),
         Ok("1") | Ok("true") | Ok("TRUE") | Ok("yes") | Ok("YES")
     )
+}
+
+/// Validate a vault key against the POSIX env var name shape
+/// (`^[A-Za-z_][A-Za-z0-9_]*$`).
+///
+/// Vault values are later interpolated into shell, dotenv, Docker
+/// `--env-file`, and GitHub Actions outputs. A key like
+/// `A; touch /tmp/pwn #` turns the documented
+/// `eval $(lpm env print --format=shell)` flow into command execution.
+/// Rejecting at write time prevents the malformed key from ever
+/// landing in the keychain or the encrypted file fallback.
+fn is_valid_vault_key(name: &str) -> bool {
+    let mut chars = name.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    if !(first.is_ascii_alphabetic() || first == '_') {
+        return false;
+    }
+    chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+fn reject_invalid_keys<'a>(pairs: impl IntoIterator<Item = &'a str>) -> Result<(), String> {
+    let bad: Vec<&str> = pairs
+        .into_iter()
+        .filter(|k| !is_valid_vault_key(k))
+        .collect();
+    if bad.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "vault keys must match [A-Za-z_][A-Za-z0-9_]* (rejected: {})",
+            bad.join(", ")
+        ))
+    }
 }
 
 /// Get a single secret value by key (from "default" environment).
@@ -91,6 +135,8 @@ pub fn get_all_env(project_dir: &Path, env: &str) -> HashMap<String, String> {
 ///
 /// Creates the vault (and vault ID in lpm.json) if it doesn't exist.
 pub fn set(project_dir: &Path, pairs: &[(&str, &str)]) -> Result<(), String> {
+    reject_invalid_keys(pairs.iter().map(|(k, _)| *k))?;
+
     let vault_id = vault_id::get_or_create_vault_id(project_dir)?;
     let project_name = vault_id::read_project_name(project_dir);
     let project_path = project_dir
@@ -110,6 +156,8 @@ pub fn set(project_dir: &Path, pairs: &[(&str, &str)]) -> Result<(), String> {
 
 /// Set secrets for a specific environment.
 pub fn set_env(project_dir: &Path, env: &str, pairs: &[(&str, &str)]) -> Result<(), String> {
+    reject_invalid_keys(pairs.iter().map(|(k, _)| *k))?;
+
     let vault_id = vault_id::get_or_create_vault_id(project_dir)?;
     let project_name = vault_id::read_project_name(project_dir);
     let project_path = project_dir
@@ -131,6 +179,12 @@ pub fn replace_all_environments(
     project_dir: &Path,
     environments: &HashMap<String, HashMap<String, String>>,
 ) -> Result<(), String> {
+    reject_invalid_keys(
+        environments
+            .values()
+            .flat_map(|m| m.keys().map(String::as_str)),
+    )?;
+
     let vault_id = vault_id::get_or_create_vault_id(project_dir)?;
     let project_name = vault_id::read_project_name(project_dir);
     let project_path = project_dir
@@ -282,6 +336,73 @@ pub fn import_env_file_to_env(
     Ok(imported)
 }
 
+/// Serialize a secret map into sorted dotenv lines, applying the
+/// same quoting rules both export paths share.
+fn format_env_file_content(secrets: &HashMap<String, String>) -> String {
+    let mut lines: Vec<String> = secrets
+        .iter()
+        .map(|(k, v)| {
+            if v.contains(' ') || v.contains('"') || v.contains('\'') || v.contains('\n') {
+                format!("{k}=\"{}\"", v.replace('\\', "\\\\").replace('"', "\\\""))
+            } else {
+                format!("{k}={v}")
+            }
+        })
+        .collect();
+    lines.sort();
+    lines.join("\n") + "\n"
+}
+
+/// Atomically write a dotenv export with owner-only permissions.
+///
+/// The output contains plaintext vault secrets. `std::fs::write`
+/// honours the inherited umask (typically `0o644`), which on shared
+/// hosts exposes credentials to any local uid. Other agents on the
+/// system may also race the write — atomic rename + 0o600 closes
+/// both the perms shape and the read-during-write window.
+fn write_env_file_owner_only(output_path: &Path, content: &[u8]) -> Result<(), String> {
+    let parent = output_path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| Path::new(".").to_path_buf());
+    let file_name = output_path
+        .file_name()
+        .ok_or_else(|| format!("export path has no file name: {}", output_path.display()))?;
+
+    let tmp_name = format!(
+        ".{}.tmp.{}",
+        file_name.to_string_lossy(),
+        std::process::id()
+    );
+    let tmp = parent.join(tmp_name);
+
+    let mut open_opts = std::fs::OpenOptions::new();
+    open_opts.create(true).write(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        open_opts.mode(0o600);
+    }
+
+    {
+        let mut f = open_opts
+            .open(&tmp)
+            .map_err(|e| format!("failed to open {}: {e}", tmp.display()))?;
+        use std::io::Write as _;
+        f.write_all(content)
+            .map_err(|e| format!("failed to write {}: {e}", tmp.display()))?;
+        f.sync_all()
+            .map_err(|e| format!("failed to sync {}: {e}", tmp.display()))?;
+    }
+
+    if let Err(e) = std::fs::rename(&tmp, output_path) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(format!("failed to write {}: {e}", output_path.display()));
+    }
+    Ok(())
+}
+
 /// Export secrets from a specific environment to a .env file.
 ///
 /// Returns the number of exported secrets.
@@ -295,21 +416,8 @@ pub fn export_env_file_from_env(
         return Ok(0);
     }
 
-    let mut lines: Vec<String> = secrets
-        .iter()
-        .map(|(k, v)| {
-            if v.contains(' ') || v.contains('"') || v.contains('\'') || v.contains('\n') {
-                format!("{k}=\"{}\"", v.replace('\\', "\\\\").replace('"', "\\\""))
-            } else {
-                format!("{k}={v}")
-            }
-        })
-        .collect();
-    lines.sort();
-
-    let content = lines.join("\n") + "\n";
-    std::fs::write(output_path, content)
-        .map_err(|e| format!("failed to write {}: {e}", output_path.display()))?;
+    let content = format_env_file_content(&secrets);
+    write_env_file_owner_only(output_path, content.as_bytes())?;
 
     add_to_gitignore(project_dir, output_path);
 
@@ -325,23 +433,9 @@ pub fn export_env_file(project_dir: &Path, output_path: &Path) -> Result<usize, 
         return Ok(0);
     }
 
-    let mut lines: Vec<String> = secrets
-        .iter()
-        .map(|(k, v)| {
-            if v.contains(' ') || v.contains('"') || v.contains('\'') || v.contains('\n') {
-                format!("{k}=\"{}\"", v.replace('\\', "\\\\").replace('"', "\\\""))
-            } else {
-                format!("{k}={v}")
-            }
-        })
-        .collect();
-    lines.sort();
+    let content = format_env_file_content(&secrets);
+    write_env_file_owner_only(output_path, content.as_bytes())?;
 
-    let content = lines.join("\n") + "\n";
-    std::fs::write(output_path, content)
-        .map_err(|e| format!("failed to write {}: {e}", output_path.display()))?;
-
-    // Auto-add the output file to .gitignore
     add_to_gitignore(project_dir, output_path);
 
     Ok(secrets.len())
@@ -608,8 +702,9 @@ fn add_to_gitignore(project_dir: &Path, file_path: &Path) {
 mod tests {
     use super::*;
 
-    // Environment-mutating tests and any remaining keychain tests are serialized.
-    static KEYCHAIN_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    // Tests share `crate::test_env_lock::ENV_LOCK` (with crypto.rs)
+    // so env mutations are serialised across the crate, not just
+    // within one module.
 
     /// Clean up Keychain items created by a test (prevents Keychain pollution).
     fn cleanup_vault(project_dir: &Path) {
@@ -625,7 +720,7 @@ mod tests {
     }
 
     fn with_forced_file_vault_backend<T>(test: impl FnOnce() -> T) -> T {
-        let _lock = KEYCHAIN_LOCK.lock().unwrap();
+        let _lock = crate::test_env_lock::acquire_env_lock();
         let temp_home = tempfile::tempdir().expect("create temp HOME");
         let original_home = std::env::var_os("HOME");
         let original_force_file_vault = std::env::var_os("LPM_FORCE_FILE_VAULT");
@@ -862,6 +957,101 @@ KEY3=no-quotes"#;
         });
     }
 
+    /// M44: vault setters refuse keys that would let a downstream
+    /// shell-eval / dotenv / env-file consumer interpret the key as
+    /// command syntax. The check is independent of OS keychain
+    /// availability — it runs before the keychain hop, so we don't
+    /// need `with_forced_file_vault_backend`.
+    #[test]
+    fn set_rejects_keys_that_break_shell_or_dotenv_syntax() {
+        let dir = tempfile::tempdir().unwrap();
+        for bad in [
+            "A; touch /tmp/pwn #",
+            "FOO=$(id)",
+            "1LEADING_DIGIT",
+            "with space",
+            "with-dash",
+            "",
+            "\n",
+            "BAR\nINJECT=evil",
+        ] {
+            let err =
+                set(dir.path(), &[(bad, "v")]).expect_err(&format!("must reject key {bad:?}"));
+            assert!(
+                err.contains("vault keys must match"),
+                "expected validation error for {bad:?}, got: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn set_env_rejects_keys_that_break_shell_or_dotenv_syntax() {
+        let dir = tempfile::tempdir().unwrap();
+        let err = set_env(dir.path(), "live", &[("A; rm -rf /; #", "v")])
+            .expect_err("must reject injection-shaped key");
+        assert!(err.contains("vault keys must match"));
+    }
+
+    #[test]
+    fn replace_all_environments_rejects_invalid_keys_in_any_env() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut envs: HashMap<String, HashMap<String, String>> = HashMap::new();
+        let mut default_env = HashMap::new();
+        default_env.insert("OK_KEY".to_string(), "ok".to_string());
+        envs.insert("default".to_string(), default_env);
+        let mut live_env = HashMap::new();
+        live_env.insert("BAD KEY".to_string(), "v".to_string());
+        envs.insert("live".to_string(), live_env);
+        let err = replace_all_environments(dir.path(), &envs)
+            .expect_err("must reject if any env has an invalid key");
+        assert!(err.contains("vault keys must match"));
+    }
+
+    #[test]
+    fn set_accepts_canonical_env_var_names() {
+        with_forced_file_vault_backend(|| {
+            let dir = tempfile::tempdir().unwrap();
+            set(
+                dir.path(),
+                &[
+                    ("DB_URL", "postgres://x"),
+                    ("_HIDDEN", "h"),
+                    ("a1b2", "v"),
+                    ("API_KEY_2024", "k"),
+                ],
+            )
+            .expect("canonical names must be accepted");
+            cleanup_vault(dir.path());
+        });
+    }
+
+    /// `export_env_file` materializes plaintext vault secrets to disk.
+    /// On Unix the file must be created at 0o600 — default-umask
+    /// writes (typically 0o644) would expose credentials to every
+    /// other local uid on shared hosts.
+    #[cfg(unix)]
+    #[test]
+    fn export_env_file_is_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        with_forced_file_vault_backend(|| {
+            let dir = tempfile::tempdir().unwrap();
+            set(dir.path(), &[("DB", "postgres://localhost/x")]).unwrap();
+            let export_file = dir.path().join(".env.export-perms");
+            export_env_file(dir.path(), &export_file).expect("export must succeed");
+            let mode = std::fs::metadata(&export_file)
+                .expect("export file must exist")
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(
+                mode, 0o600,
+                "exported dotenv must be 0o600, got {:#o}",
+                mode
+            );
+            cleanup_vault(dir.path());
+        });
+    }
+
     #[test]
     fn import_no_overwrite() {
         with_forced_file_vault_backend(|| {
@@ -929,7 +1119,7 @@ KEY3=no-quotes"#;
     /// storage layer (no subprocess, no mock registry).
     #[test]
     fn replace_all_environments_drops_local_only_envs_and_overwrites_each_env() {
-        let _lock = KEYCHAIN_LOCK.lock().unwrap();
+        let _lock = crate::test_env_lock::acquire_env_lock();
 
         let temp_home = tempfile::tempdir().expect("create temp HOME");
         let original_home = std::env::var_os("HOME");

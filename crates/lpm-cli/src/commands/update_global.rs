@@ -29,11 +29,11 @@ use crate::save_spec::{
 };
 use chrono::Utc;
 use lpm_common::color::Painted;
-use lpm_common::{LpmError, LpmRoot, with_exclusive_lock};
+use lpm_common::{LpmError, LpmRoot, sanitize_for_terminal, with_exclusive_lock};
 use lpm_global::{
     CommandCollision, InstallReadyMarker, InstallRootStatus, IntentPayload, PackageEntry,
     PackageSource, PendingEntry, Shim, TxKind, WalRecord, WalWriter, artifacts_complete, emit_shim,
-    find_command_collisions, read_for, validate_install_root, write_for, write_marker,
+    find_command_collisions, read_for, remove_shim, validate_install_root, write_for, write_marker,
 };
 use lpm_registry::RegistryClient;
 use lpm_semver::{Version, VersionReq};
@@ -78,7 +78,9 @@ pub async fn run(
             Ok(plan) => plans.push(plan),
             Err(e) => {
                 if !json_output {
-                    output::warn(&format!("planning {}: {e}", target.name.bold()));
+                    let name_safe = sanitize_for_terminal(&target.name);
+                    let reason_safe = sanitize_for_terminal(&e.to_string());
+                    output::warn(&format!("planning {}: {reason_safe}", name_safe.bold()));
                 }
                 // Continue planning other targets — one bad spec doesn't
                 // block the bulk update.
@@ -92,6 +94,19 @@ pub async fn run(
 
     if dry_run {
         emit_dry_run(&plans, json_output);
+        // L46: a `--dry-run` whose planning phase produced any PlanError
+        // must surface as non-zero exit + `"success": false` in JSON.
+        // Pre-fix the dry-run path always returned Ok(()), so CI / agent
+        // callers that checked the exit code or the top-level success
+        // flag treated corrupt manifest rows / registry failures /
+        // malformed saved-spec parses during the diagnostic pass as a
+        // healthy outcome.
+        let any_plan_error = plans
+            .iter()
+            .any(|p| matches!(p, UpgradePlan::PlanError { .. }));
+        if any_plan_error {
+            return Err(LpmError::ExitCode(1));
+        }
         return Ok(());
     }
 
@@ -645,11 +660,21 @@ fn prepare_upgrade_locked(root: &LpmRoot, prep: &UpgradePrep) -> Result<StagedUp
         prior_command_ownership_json: serde_json::json!({
             "aliases": prep.prior_aliases_json,
         }),
-        new_aliases_json: serde_json::json!({}),
+        // Preserve every alias the prior version owned (M73). Pre-fix
+        // this was `{}`, which made recovery treat the upgrade as
+        // dropping every alias the user had explicitly set up — and
+        // the commit code emitted direct shims for the aliased-away
+        // bins, re-exposing names the user had aliased to safer ones.
+        // The snapshot we captured at planning time IS the authoritative
+        // "aliases this package owns post-commit" list.
+        new_aliases_json: prep.prior_aliases_json.clone(),
         // Upgrades don't resolve collisions — they keep the same package
         // owning the same commands, so
         // `find_command_collisions` never triggers non-self hits.
         ownership_delta: Vec::new(),
+        // Upgrade preserves trust (same package, same name@version semantics
+        // through the existing trust-binding drift gate). No prune.
+        uninstall_trust_prune: Vec::new(),
     })))?;
 
     manifest.pending.insert(
@@ -752,14 +777,72 @@ fn commit_upgrade_locked(
         }
     };
 
+    // M73: every prior alias's `bin` field names a declared bin that
+    // is exposed only via the alias key. Carrying these forward through
+    // the upgrade preserves the user's alias-only exposure invariant:
+    // direct shims must NOT be emitted for these bins.
+    let prior_aliases: Vec<(String, String)> = prep
+        .prior_aliases_json
+        .as_object()
+        .map(|m| {
+            m.iter()
+                .filter_map(|(k, v)| {
+                    v.get("bin")
+                        .and_then(|b| b.as_str())
+                        .map(|b| (k.clone(), b.to_string()))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let aliased_origs: std::collections::HashSet<&str> =
+        prior_aliases.iter().map(|(_, bin)| bin.as_str()).collect();
+
+    // Verify every prior alias still has its declared bin in the new
+    // package. If the upgrade dropped the bin the alias targets, the
+    // alias would become a dangling shim — refuse the upgrade rather
+    // than silently expose a broken PATH entry.
+    let marker_set: std::collections::HashSet<&str> =
+        marker_commands.iter().map(|s| s.as_str()).collect();
+    let dangling: Vec<(String, String)> = prior_aliases
+        .iter()
+        .filter(|(_, bin)| !marker_set.contains(bin.as_str()))
+        .cloned()
+        .collect();
+    if !dangling.is_empty() {
+        let detail = format!(
+            "the new version of '{}' no longer declares the bin(s) targeted by alias(es): {}. \
+             Uninstall and reinstall with the desired aliases to upgrade, or pick a version that \
+             still declares the bin.",
+            prep.name,
+            dangling
+                .iter()
+                .map(|(alias, bin)| format!("{alias} -> {bin}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        rollback_aborted_upgrade(root, &mut manifest, staged, &prep.name, &detail)?;
+        return Err(LpmError::Script(detail));
+    }
+
+    let final_commands: Vec<String> = marker_commands
+        .iter()
+        .filter(|c| !aliased_origs.contains(c.as_str()))
+        .cloned()
+        .collect();
+
     // Collision guard. Self-collisions are EXPECTED for upgrades —
     // the new install owns the same command names as the prior one.
     // `find_command_collisions` excludes self-collisions for exactly
     // this case (the exclusion was added explicitly to handle upgrades
     // correctly). So a real conflict here means
     // ANOTHER package owns one of the new commands.
+    //
+    // Scan `final_commands` (not `marker_commands`) so an aliased-away
+    // bin isn't incorrectly flagged as colliding with a third party
+    // that owns the same PATH name — the aliased-away bin won't be on
+    // PATH after this commit.
     let collisions: Vec<CommandCollision> =
-        find_command_collisions(&manifest, &prep.name, &marker_commands);
+        find_command_collisions(&manifest, &prep.name, &final_commands);
     if !collisions.is_empty() {
         // Inline rollback: drop pending row, tombstone new install
         // root (recovery sweep will retry the actual delete), write
@@ -794,9 +877,16 @@ fn commit_upgrade_locked(
     // Atomic shim swap: emit_shim's tempfile-rename swaps existing
     // shims (same command names, new install root). The user's shell
     // sees either the old or new shim, never neither.
+    //
+    // Track each emitted name so the incomplete-shim rollback path
+    // below can restore them to the prior install root (M74). Pre-fix
+    // the rollback path didn't touch these shims at all — they kept
+    // pointing at the new install root which was then tombstoned,
+    // leaving the user with dangling PATH entries.
     let bin_dir = root.bin_dir();
     let install_bin = staged.install_root.join("node_modules").join(".bin");
-    for cmd in &marker_commands {
+    let mut emitted_shims: Vec<String> = Vec::new();
+    for cmd in &final_commands {
         let target = install_bin.join(cmd);
         emit_shim(
             &bin_dir,
@@ -805,6 +895,21 @@ fn commit_upgrade_locked(
                 target,
             },
         )?;
+        emitted_shims.push(cmd.clone());
+    }
+    // Re-emit each prior alias against the new install root so the
+    // alias keeps pointing at this package's bin after the OLD root
+    // is tombstoned.
+    for (alias_name, bin) in &prior_aliases {
+        let target = install_bin.join(bin);
+        emit_shim(
+            &bin_dir,
+            &Shim {
+                command_name: alias_name.clone(),
+                target,
+            },
+        )?;
+        emitted_shims.push(alias_name.clone());
     }
 
     // Audit follow-up: three-artifact invariant — confirm
@@ -814,9 +919,14 @@ fn commit_upgrade_locked(
     // we're about to write. Recovery's roll-forward repaves shims from
     // WAL data on the next invocation if we abort here.
     let mut incomplete: Vec<String> = Vec::new();
-    for cmd in &marker_commands {
+    for cmd in &final_commands {
         if !artifacts_complete(&bin_dir, cmd) {
             incomplete.push(cmd.clone());
+        }
+    }
+    for (alias_name, _) in &prior_aliases {
+        if !artifacts_complete(&bin_dir, alias_name) {
+            incomplete.push(alias_name.clone());
         }
     }
     if !incomplete.is_empty() {
@@ -825,6 +935,22 @@ fn commit_upgrade_locked(
              will be reconciled by recovery on the next `lpm` invocation.",
             incomplete.join(", ")
         );
+        // M74: restore the prior install's shims before tombstoning the
+        // new install root. Pre-fix the emitted shims kept pointing at
+        // the (now-tombstoned) new install root — dangling PATH entries
+        // that survived the rolled-back transaction.
+        if let Err(restore_failures) =
+            restore_prior_shims_after_aborted_upgrade(root, &emitted_shims, prep)
+        {
+            let combined = format!(
+                "{detail} Additionally, the rollback could not restore {} prior shim(s): {}. \
+                 Re-run `lpm` so recovery can retry the rollback.",
+                restore_failures.len(),
+                restore_failures.join("; ")
+            );
+            tracing::warn!("update -g rollback: deferring '{}': {combined}", prep.name);
+            return Err(LpmError::Script(combined));
+        }
         rollback_aborted_upgrade(root, &mut manifest, staged, &prep.name, &detail)?;
         return Err(LpmError::Script(detail));
     }
@@ -846,10 +972,18 @@ fn commit_upgrade_locked(
         source: prep.source,
         installed_at: Utc::now(),
         root: staged.install_root_relative.clone(),
-        commands: marker_commands.clone(),
+        // `final_commands` excludes aliased-away bins per the manifest
+        // invariant (PackageEntry.commands holds only directly-exposed
+        // names). Pre-fix this stored marker_commands, which would
+        // promote aliased-away bins back to PATH after recovery.
+        commands: final_commands.clone(),
     };
     manifest.packages.insert(prep.name.clone(), active);
     manifest.pending.remove(&prep.name);
+    // Aliases are already in `manifest.aliases` from the prior install
+    // — we're carrying them forward unchanged. Same alias entries
+    // referencing the same package + bin still resolve correctly now
+    // that `packages[prep.name].root` points at the new install root.
 
     // Persist BEFORE WAL Commit (manifest-before-commit ordering invariant).
     write_for(root, &manifest)?;
@@ -865,8 +999,92 @@ fn commit_upgrade_locked(
         from_version: prep.current_version.clone(),
         to_version: prep.new_version.to_string(),
         saved_spec: prep.new_saved_spec.clone(),
-        commands: marker_commands,
+        commands: final_commands,
     })
+}
+
+/// Restore shims to point at the prior install root after an upgrade
+/// reaches the post-emit-but-pre-commit failure path (M74).
+///
+/// For each emitted shim name:
+///   - If it was a direct bin in the prior version → re-emit pointing
+///     at the prior install_bin/<name>.
+///   - If it was a prior alias key → re-emit pointing at the prior
+///     install_bin/<alias.bin>.
+///   - Otherwise (net-new shim from the upgrade) → remove it.
+///
+/// Returns `Err(Vec<String>)` listing names whose restore/remove
+/// failed. The caller must NOT write WAL Abort in that case; recovery
+/// will retry the rollback on the next `lpm` invocation.
+fn restore_prior_shims_after_aborted_upgrade(
+    root: &LpmRoot,
+    emitted_shims: &[String],
+    prep: &UpgradePrep,
+) -> Result<(), Vec<String>> {
+    let bin_dir = root.bin_dir();
+    let prior_root_relative = prep
+        .prior_active_row_json
+        .get("root")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let prior_install_bin = root
+        .global_root()
+        .join(prior_root_relative)
+        .join("node_modules")
+        .join(".bin");
+    let prior_commands: std::collections::HashSet<&str> = prep
+        .prior_active_row_json
+        .get("commands")
+        .and_then(|v| v.as_array())
+        .map(|arr| arr.iter().filter_map(|v| v.as_str()).collect())
+        .unwrap_or_default();
+    let prior_aliases: std::collections::HashMap<&str, &str> = prep
+        .prior_aliases_json
+        .as_object()
+        .map(|m| {
+            m.iter()
+                .filter_map(|(k, v)| {
+                    v.get("bin")
+                        .and_then(|b| b.as_str())
+                        .map(|b| (k.as_str(), b))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let mut failures: Vec<String> = Vec::new();
+    for name in emitted_shims {
+        if prior_commands.contains(name.as_str()) {
+            let target = prior_install_bin.join(name);
+            if let Err(e) = emit_shim(
+                &bin_dir,
+                &Shim {
+                    command_name: name.clone(),
+                    target,
+                },
+            ) {
+                failures.push(format!("restore direct {name}: {e}"));
+            }
+        } else if let Some(bin) = prior_aliases.get(name.as_str()) {
+            let target = prior_install_bin.join(bin);
+            if let Err(e) = emit_shim(
+                &bin_dir,
+                &Shim {
+                    command_name: name.clone(),
+                    target,
+                },
+            ) {
+                failures.push(format!("restore alias {name}: {e}"));
+            }
+        } else if let Err(e) = remove_shim(&bin_dir, name) {
+            failures.push(format!("remove new {name}: {e}"));
+        }
+    }
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(failures)
+    }
 }
 
 fn rollback_aborted_upgrade(
@@ -902,6 +1120,9 @@ fn rollback_aborted_upgrade(
 // ─── Output ──────────────────────────────────────────────────────────
 
 fn emit_dry_run(plans: &[UpgradePlan], json_output: bool) {
+    let any_plan_error = plans
+        .iter()
+        .any(|p| matches!(p, UpgradePlan::PlanError { .. }));
     if json_output {
         let entries: Vec<_> = plans
             .iter()
@@ -941,7 +1162,7 @@ fn emit_dry_run(plans: &[UpgradePlan], json_output: bool) {
         println!(
             "{}",
             serde_json::to_string_pretty(&serde_json::json!({
-                "success": true,
+                "success": !any_plan_error,
                 "dry_run": true,
                 "plans": entries,
             }))
@@ -954,11 +1175,14 @@ fn emit_dry_run(plans: &[UpgradePlan], json_output: bool) {
         match plan {
             UpgradePlan::Upgrade(prep) => {
                 any_action = true;
+                let name_safe = sanitize_for_terminal(&prep.name);
+                let current_safe = sanitize_for_terminal(&prep.current_version);
+                let new_safe = sanitize_for_terminal(&prep.new_version.to_string());
                 println!(
                     "  {} {} \u{2192} {}",
-                    prep.name.bold(),
-                    prep.current_version.dimmed(),
-                    prep.new_version.to_string().green()
+                    name_safe.bold(),
+                    current_safe.dimmed(),
+                    new_safe.green()
                 );
             }
             UpgradePlan::SaveSpecRewrite {
@@ -969,27 +1193,35 @@ fn emit_dry_run(plans: &[UpgradePlan], json_output: bool) {
                 ..
             } => {
                 any_action = true;
+                let package_safe = sanitize_for_terminal(package);
+                let version_safe = sanitize_for_terminal(version);
+                let old_safe = sanitize_for_terminal(old_saved_spec);
+                let new_safe = sanitize_for_terminal(new_saved_spec);
                 println!(
                     "  {} {} (saved_spec {} \u{2192} {})",
-                    package.bold(),
-                    format!("@{version}").dimmed(),
-                    old_saved_spec.dimmed(),
-                    new_saved_spec.green()
+                    package_safe.bold(),
+                    format!("@{version_safe}").dimmed(),
+                    old_safe.dimmed(),
+                    new_safe.green()
                 );
             }
             UpgradePlan::AlreadyCurrent { package, version } => {
+                let package_safe = sanitize_for_terminal(package);
+                let version_safe = sanitize_for_terminal(version);
                 println!(
                     "  {} {} (already current)",
-                    package.dimmed(),
-                    format!("@{version}").dimmed()
+                    package_safe.dimmed(),
+                    format!("@{version_safe}").dimmed()
                 );
             }
             UpgradePlan::PlanError { package, reason } => {
+                let package_safe = sanitize_for_terminal(package);
+                let reason_safe = sanitize_for_terminal(reason);
                 println!(
                     "  {} {} {}",
-                    package.bold(),
+                    package_safe.bold(),
                     "could not plan:".red(),
-                    reason
+                    reason_safe
                 );
             }
         }
@@ -1053,11 +1285,14 @@ fn emit_results(results: &[UpgradeResult], json_output: bool) {
     for r in results {
         match r {
             UpgradeResult::Upgraded(out) => {
+                let name_safe = sanitize_for_terminal(&out.name);
+                let from_safe = sanitize_for_terminal(&out.from_version);
+                let to_safe = sanitize_for_terminal(&out.to_version);
                 output::success(&format!(
                     "Upgraded {} {} \u{2192} {}",
-                    out.name.bold(),
-                    out.from_version.dimmed(),
-                    out.to_version.green()
+                    name_safe.bold(),
+                    from_safe.dimmed(),
+                    to_safe.green()
                 ));
             }
             UpgradeResult::SaveSpecRewritten {
@@ -1066,23 +1301,31 @@ fn emit_results(results: &[UpgradeResult], json_output: bool) {
                 old_saved_spec,
                 new_saved_spec,
             } => {
+                let package_safe = sanitize_for_terminal(package);
+                let version_safe = sanitize_for_terminal(version);
+                let old_safe = sanitize_for_terminal(old_saved_spec);
+                let new_safe = sanitize_for_terminal(new_saved_spec);
                 output::success(&format!(
                     "Retuned {} {} (saved_spec {} \u{2192} {})",
-                    package.bold(),
-                    format!("@{version}").dimmed(),
-                    old_saved_spec.dimmed(),
-                    new_saved_spec.green()
+                    package_safe.bold(),
+                    format!("@{version_safe}").dimmed(),
+                    old_safe.dimmed(),
+                    new_safe.green()
                 ));
             }
             UpgradeResult::AlreadyCurrent { package, version } => {
+                let package_safe = sanitize_for_terminal(package);
+                let version_safe = sanitize_for_terminal(version);
                 output::info(&format!(
                     "{} {} already current",
-                    package.dimmed(),
-                    format!("@{version}").dimmed()
+                    package_safe.dimmed(),
+                    format!("@{version_safe}").dimmed()
                 ));
             }
             UpgradeResult::Failed { package, reason } => {
-                output::warn(&format!("{}: {reason}", package.bold()));
+                let package_safe = sanitize_for_terminal(package);
+                let reason_safe = sanitize_for_terminal(reason);
+                output::warn(&format!("{}: {reason_safe}", package_safe.bold()));
             }
         }
     }
@@ -1119,15 +1362,20 @@ fn execute_saved_spec_rewrite(
     with_exclusive_lock(root.global_tx_lock(), || {
         let mut manifest = read_for(root)?;
         let active = manifest.packages.get(package).ok_or_else(|| {
+            let package_safe = sanitize_for_terminal(package);
             LpmError::Script(format!(
-                "'{package}' is no longer installed. Aborting saved_spec rewrite."
+                "'{package_safe}' is no longer installed. Aborting saved_spec rewrite."
             ))
         })?;
         if let Err(diff) = active_matches_planned_snapshot(active, prior_snapshot) {
+            let package_safe = sanitize_for_terminal(package);
+            let diff_safe = sanitize_for_terminal(&diff);
+            let old_safe = sanitize_for_terminal(old_saved_spec);
+            let new_safe = sanitize_for_terminal(new_saved_spec);
             return Err(LpmError::Script(format!(
-                "'{package}' was modified by another process between planning and rewrite \
-                 ({diff}). The retune from {old_saved_spec:?} to {new_saved_spec:?} no longer \
-                 applies. Re-run `lpm global update {package}@<spec>` to plan against the \
+                "'{package_safe}' was modified by another process between planning and rewrite \
+                 ({diff_safe}). The retune from {old_safe:?} to {new_safe:?} no longer \
+                 applies. Re-run `lpm global update {package_safe}@<spec>` to plan against the \
                  current state."
             )));
         }
@@ -1574,6 +1822,411 @@ mod tests {
         let snapshot = serde_json::json!({});
         let err = execute_saved_spec_rewrite(&root, "ghost", "x", "y", &snapshot).unwrap_err();
         assert!(format!("{err}").contains("no longer installed"));
+    }
+
+    /// Build a complete install root the upgrade commit will accept:
+    /// a `node_modules/.bin/<cmd>` for every command and a valid marker.
+    fn make_complete_install_root(install_root: &std::path::Path, commands: &[&str]) {
+        let bin = install_root.join("node_modules").join(".bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        for cmd in commands {
+            let target = bin.join(cmd);
+            std::fs::write(&target, b"#!/bin/sh\necho ok\n").unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o755)).unwrap();
+            }
+        }
+        std::fs::write(
+            install_root.join("lpm.lock"),
+            lpm_global::MINIMAL_VALID_LOCKFILE_TOML,
+        )
+        .unwrap();
+        lpm_global::write_marker(
+            install_root,
+            &lpm_global::InstallReadyMarker::new(commands.iter().map(|c| c.to_string()).collect()),
+        )
+        .unwrap();
+    }
+
+    fn pre_upgrade_manifest_with_alias(
+        root_dir: &str,
+        commands: &[&str],
+        alias_key: &str,
+        alias_bin: &str,
+    ) -> lpm_global::GlobalManifest {
+        let mut manifest = lpm_global::GlobalManifest::default();
+        manifest.packages.insert(
+            "foo".into(),
+            lpm_global::PackageEntry {
+                saved_spec: "^1".into(),
+                resolved: "1.0.0".into(),
+                integrity: "sha512-old".into(),
+                source: lpm_global::PackageSource::UpstreamNpm,
+                installed_at: chrono::Utc::now(),
+                root: root_dir.into(),
+                // commands excludes the aliased-away bin per the
+                // manifest invariant.
+                commands: commands
+                    .iter()
+                    .filter(|c| **c != alias_bin)
+                    .map(|c| c.to_string())
+                    .collect(),
+            },
+        );
+        manifest.aliases.insert(
+            alias_key.into(),
+            lpm_global::AliasEntry {
+                package: "foo".into(),
+                bin: alias_bin.into(),
+            },
+        );
+        manifest
+    }
+
+    /// M73: a `lpm global update` of a package originally installed
+    /// with `--alias dangerous=safe-name` MUST keep the alias and MUST
+    /// NOT emit a direct shim for `dangerous`. Pre-fix the commit code
+    /// looped marker_commands and ran emit_shim for every name,
+    /// re-exposing `dangerous` on PATH and stranding the `safe-name`
+    /// shim pointing at the tombstoned old install root.
+    #[test]
+    #[cfg(unix)]
+    fn upgrade_preserves_alias_and_does_not_expose_aliased_away_bin() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = lpm_common::LpmRoot::from_dir(tmp.path());
+
+        // Pre-upgrade state: foo@1.0.0 declared `dangerous`, user
+        // installed with --alias dangerous=safe-name.
+        let prior_root = root.install_root_for("foo", "1.0.0");
+        std::fs::create_dir_all(&prior_root).unwrap();
+        make_complete_install_root(&prior_root, &["dangerous"]);
+
+        let manifest = pre_upgrade_manifest_with_alias(
+            "installs/foo@1.0.0",
+            &["dangerous"],
+            "safe-name",
+            "dangerous",
+        );
+        lpm_global::write_for(&root, &manifest).unwrap();
+
+        // Existing `safe-name` shim pointing at prior install root.
+        std::fs::create_dir_all(root.bin_dir()).unwrap();
+        std::os::unix::fs::symlink(
+            prior_root.join("node_modules/.bin/dangerous"),
+            root.bin_dir().join("safe-name"),
+        )
+        .unwrap();
+
+        // Stage upgrade to foo@2.0.0 (also declares `dangerous`).
+        let new_root = root.install_root_for("foo", "2.0.0");
+        std::fs::create_dir_all(&new_root).unwrap();
+        make_complete_install_root(&new_root, &["dangerous"]);
+
+        let active = manifest.packages.get("foo").unwrap();
+        let prior_active_row_json = serde_json::json!({
+            "saved_spec": active.saved_spec,
+            "resolved": active.resolved,
+            "integrity": active.integrity,
+            "source": serde_json::to_value(active.source).unwrap(),
+            "installed_at": active.installed_at.to_rfc3339(),
+            "root": active.root,
+            "commands": active.commands,
+        });
+        let prior_aliases_json = serde_json::json!({
+            "safe-name": {"package": "foo", "bin": "dangerous"}
+        });
+        let prep = UpgradePrep {
+            name: "foo".into(),
+            current_version: "1.0.0".into(),
+            new_version: Version::parse("2.0.0").unwrap(),
+            new_saved_spec: "^2".into(),
+            new_integrity: "sha512-new".into(),
+            source: lpm_global::PackageSource::UpstreamNpm,
+            prior_active_row_json,
+            prior_aliases_json,
+        };
+
+        // Seed the pending row so commit_upgrade_locked can flip it.
+        let mut manifest_with_pending = manifest.clone();
+        manifest_with_pending.pending.insert(
+            "foo".into(),
+            lpm_global::PendingEntry {
+                saved_spec: prep.new_saved_spec.clone(),
+                resolved: prep.new_version.to_string(),
+                integrity: prep.new_integrity.clone(),
+                source: prep.source,
+                started_at: chrono::Utc::now(),
+                root: "installs/foo@2.0.0".into(),
+                commands: Vec::new(),
+                replaces_version: Some("1.0.0".into()),
+            },
+        );
+        lpm_global::write_for(&root, &manifest_with_pending).unwrap();
+
+        let staged = StagedUpgrade {
+            tx_id: "tx-upgrade".into(),
+            install_root: new_root.clone(),
+            install_root_relative: "installs/foo@2.0.0".into(),
+        };
+
+        let out = commit_upgrade_locked(&root, &prep, &staged).unwrap();
+        // The output's `commands` is the post-resolution direct-bin list.
+        // `dangerous` is aliased-away, so the upgrade output exposes nothing
+        // under that name directly.
+        assert!(
+            !out.commands.contains(&"dangerous".to_string()),
+            "post-fix: aliased-away bin must not appear as a direct command \
+             in upgrade output; got {:?}",
+            out.commands
+        );
+
+        let final_manifest = lpm_global::read_for(&root).unwrap();
+        let foo = final_manifest.packages.get("foo").expect("foo row");
+        assert_eq!(foo.resolved, "2.0.0");
+        assert!(
+            !foo.commands.contains(&"dangerous".to_string()),
+            "PackageEntry.commands must not include aliased-away bins: {:?}",
+            foo.commands
+        );
+        assert!(
+            final_manifest.aliases.contains_key("safe-name"),
+            "alias row must be preserved through upgrade"
+        );
+
+        // Shim invariant: `safe-name` shim now points at the NEW install
+        // root's `dangerous` bin; `dangerous` shim does NOT exist.
+        let safe_target = std::fs::read_link(root.bin_dir().join("safe-name")).unwrap();
+        let expected = new_root.join("node_modules").join(".bin").join("dangerous");
+        assert_eq!(
+            safe_target, expected,
+            "alias shim must be re-pointed at the new install root"
+        );
+        assert!(
+            std::fs::symlink_metadata(root.bin_dir().join("dangerous")).is_err(),
+            "aliased-away bin must NOT be exposed as a direct shim on PATH"
+        );
+    }
+
+    /// M73: upgrade refuses (rolling back the staged install root) when
+    /// the new package version no longer declares a bin that a prior
+    /// alias targets. Without this guard the alias shim would become a
+    /// dangling symlink after the old install root is tombstoned.
+    #[test]
+    #[cfg(unix)]
+    fn upgrade_refuses_when_prior_alias_bin_dropped_from_new_version() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = lpm_common::LpmRoot::from_dir(tmp.path());
+
+        let prior_root = root.install_root_for("foo", "1.0.0");
+        std::fs::create_dir_all(&prior_root).unwrap();
+        make_complete_install_root(&prior_root, &["dangerous"]);
+
+        let manifest = pre_upgrade_manifest_with_alias(
+            "installs/foo@1.0.0",
+            &["dangerous"],
+            "safe-name",
+            "dangerous",
+        );
+
+        // New version drops `dangerous` and exposes `something-else`
+        // instead — `safe-name -> dangerous` would dangle.
+        let new_root = root.install_root_for("foo", "2.0.0");
+        std::fs::create_dir_all(&new_root).unwrap();
+        make_complete_install_root(&new_root, &["something-else"]);
+
+        let active = manifest.packages.get("foo").unwrap();
+        let prior_active_row_json = serde_json::json!({
+            "saved_spec": active.saved_spec,
+            "resolved": active.resolved,
+            "integrity": active.integrity,
+            "source": serde_json::to_value(active.source).unwrap(),
+            "installed_at": active.installed_at.to_rfc3339(),
+            "root": active.root,
+            "commands": active.commands,
+        });
+        let prior_aliases_json = serde_json::json!({
+            "safe-name": {"package": "foo", "bin": "dangerous"}
+        });
+        let prep = UpgradePrep {
+            name: "foo".into(),
+            current_version: "1.0.0".into(),
+            new_version: Version::parse("2.0.0").unwrap(),
+            new_saved_spec: "^2".into(),
+            new_integrity: "sha512-new".into(),
+            source: lpm_global::PackageSource::UpstreamNpm,
+            prior_active_row_json,
+            prior_aliases_json,
+        };
+
+        let mut manifest_with_pending = manifest.clone();
+        manifest_with_pending.pending.insert(
+            "foo".into(),
+            lpm_global::PendingEntry {
+                saved_spec: prep.new_saved_spec.clone(),
+                resolved: prep.new_version.to_string(),
+                integrity: prep.new_integrity.clone(),
+                source: prep.source,
+                started_at: chrono::Utc::now(),
+                root: "installs/foo@2.0.0".into(),
+                commands: Vec::new(),
+                replaces_version: Some("1.0.0".into()),
+            },
+        );
+        lpm_global::write_for(&root, &manifest_with_pending).unwrap();
+
+        let staged = StagedUpgrade {
+            tx_id: "tx-drop".into(),
+            install_root: new_root,
+            install_root_relative: "installs/foo@2.0.0".into(),
+        };
+
+        let err = commit_upgrade_locked(&root, &prep, &staged).unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("safe-name -> dangerous"),
+            "error must name the affected alias: {msg}"
+        );
+        assert!(
+            msg.contains("Uninstall and reinstall"),
+            "error must point user at the resolution path: {msg}"
+        );
+
+        // Rollback: pending row dropped, manifest active row unchanged.
+        let final_manifest = lpm_global::read_for(&root).unwrap();
+        assert!(!final_manifest.pending.contains_key("foo"));
+        assert_eq!(
+            final_manifest.packages.get("foo").unwrap().resolved,
+            "1.0.0",
+            "pre-upgrade active row stays after refusal"
+        );
+    }
+
+    /// M74: when the upgrade post-emit rollback runs, every emitted
+    /// shim must be restored to its prior target (or removed if it was
+    /// net-new in the upgrade). Pre-fix the rollback dropped the new
+    /// install root and tombstoned it, leaving the emitted shims as
+    /// dangling PATH entries.
+    #[test]
+    #[cfg(unix)]
+    fn restore_prior_shims_re_points_direct_bins_at_prior_install_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = lpm_common::LpmRoot::from_dir(tmp.path());
+
+        let prior_root = root.install_root_for("foo", "1.0.0");
+        std::fs::create_dir_all(&prior_root).unwrap();
+        make_complete_install_root(&prior_root, &["pkg"]);
+
+        // New install root that the upgrade was emitting shims against.
+        let new_root = root.install_root_for("foo", "2.0.0");
+        std::fs::create_dir_all(&new_root).unwrap();
+        make_complete_install_root(&new_root, &["pkg", "newcmd"]);
+
+        // Emitted shims pointing at the NEW root (the pre-rollback state).
+        std::fs::create_dir_all(root.bin_dir()).unwrap();
+        std::os::unix::fs::symlink(
+            new_root.join("node_modules/.bin/pkg"),
+            root.bin_dir().join("pkg"),
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(
+            new_root.join("node_modules/.bin/newcmd"),
+            root.bin_dir().join("newcmd"),
+        )
+        .unwrap();
+
+        let prep = UpgradePrep {
+            name: "foo".into(),
+            current_version: "1.0.0".into(),
+            new_version: Version::parse("2.0.0").unwrap(),
+            new_saved_spec: "^2".into(),
+            new_integrity: "sha512-new".into(),
+            source: lpm_global::PackageSource::UpstreamNpm,
+            prior_active_row_json: serde_json::json!({
+                "saved_spec": "^1",
+                "resolved": "1.0.0",
+                "integrity": "sha512-old",
+                "source": "upstream-npm",
+                "installed_at": "2026-04-15T00:00:00Z",
+                "root": "installs/foo@1.0.0",
+                "commands": ["pkg"],
+            }),
+            prior_aliases_json: serde_json::json!({}),
+        };
+
+        restore_prior_shims_after_aborted_upgrade(
+            &root,
+            &["pkg".to_string(), "newcmd".to_string()],
+            &prep,
+        )
+        .unwrap();
+
+        // `pkg` was in prior_commands — restored to point at prior root.
+        let pkg_target = std::fs::read_link(root.bin_dir().join("pkg")).unwrap();
+        assert_eq!(pkg_target, prior_root.join("node_modules/.bin/pkg"));
+        // `newcmd` was net-new — removed entirely.
+        assert!(
+            std::fs::symlink_metadata(root.bin_dir().join("newcmd")).is_err(),
+            "net-new shim must be removed by rollback"
+        );
+    }
+
+    /// M74: aliases the prior version owned must be restored to point
+    /// at the prior install root's bin during the upgrade rollback.
+    #[test]
+    #[cfg(unix)]
+    fn restore_prior_shims_re_points_aliases_at_prior_install_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = lpm_common::LpmRoot::from_dir(tmp.path());
+
+        let prior_root = root.install_root_for("foo", "1.0.0");
+        std::fs::create_dir_all(&prior_root).unwrap();
+        make_complete_install_root(&prior_root, &["dangerous"]);
+
+        let new_root = root.install_root_for("foo", "2.0.0");
+        std::fs::create_dir_all(&new_root).unwrap();
+        make_complete_install_root(&new_root, &["dangerous"]);
+
+        // `safe-name` shim was atomically re-pointed at the NEW root
+        // before the artifacts_complete check failed.
+        std::fs::create_dir_all(root.bin_dir()).unwrap();
+        std::os::unix::fs::symlink(
+            new_root.join("node_modules/.bin/dangerous"),
+            root.bin_dir().join("safe-name"),
+        )
+        .unwrap();
+
+        let prep = UpgradePrep {
+            name: "foo".into(),
+            current_version: "1.0.0".into(),
+            new_version: Version::parse("2.0.0").unwrap(),
+            new_saved_spec: "^2".into(),
+            new_integrity: "sha512-new".into(),
+            source: lpm_global::PackageSource::UpstreamNpm,
+            prior_active_row_json: serde_json::json!({
+                "saved_spec": "^1",
+                "resolved": "1.0.0",
+                "integrity": "sha512-old",
+                "source": "upstream-npm",
+                "installed_at": "2026-04-15T00:00:00Z",
+                "root": "installs/foo@1.0.0",
+                "commands": [],
+            }),
+            prior_aliases_json: serde_json::json!({
+                "safe-name": {"package": "foo", "bin": "dangerous"}
+            }),
+        };
+
+        restore_prior_shims_after_aborted_upgrade(&root, &["safe-name".to_string()], &prep)
+            .unwrap();
+
+        let safe_target = std::fs::read_link(root.bin_dir().join("safe-name")).unwrap();
+        assert_eq!(
+            safe_target,
+            prior_root.join("node_modules/.bin/dangerous"),
+            "alias shim must be restored to point at prior install root"
+        );
     }
 
     /// Audit Medium (audit pass-2): in --json mode the failure path

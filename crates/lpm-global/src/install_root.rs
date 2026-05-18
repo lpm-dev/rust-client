@@ -27,7 +27,11 @@
 //! in the extractor + content-addressable store layers.
 
 use chrono::{DateTime, Utc};
-use lpm_common::{INSTALL_READY_MARKER, LpmError, as_extended_path};
+use lpm_common::{
+    INSTALL_READY_MARKER, LpmError, STATE_FILE_SIZE_CAP_BYTES, as_extended_path,
+    read_capped_state_file,
+};
+use lpm_lockfile::Lockfile;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
@@ -76,11 +80,20 @@ pub fn write_marker(install_root: &Path, marker: &InstallReadyMarker) -> Result<
     let serialized = serde_json::to_vec_pretty(marker)
         .map_err(|e| LpmError::Io(std::io::Error::other(format!("marker serialize: {e}"))))?;
     {
-        let mut f = std::fs::OpenOptions::new()
-            .create(true)
-            .write(true)
-            .truncate(true)
-            .open(&tmp)?;
+        let mut open_opts = std::fs::OpenOptions::new();
+        open_opts.create(true).write(true).truncate(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            // Marker carries install metadata (commands, paths,
+            // package list) — not raw secrets, but on shared hosts
+            // it lets other local uids enumerate what global tools
+            // a user has installed. 0o600 matches the broader
+            // credential-metadata posture established in the
+            // H4/L14 batch.
+            open_opts.mode(0o600);
+        }
+        let mut f = open_opts.open(&tmp)?;
         std::io::Write::write_all(&mut f, &serialized)?;
         f.sync_all()?;
     }
@@ -103,9 +116,13 @@ pub fn write_marker(install_root: &Path, marker: &InstallReadyMarker) -> Result<
 /// JSON / future schema version.
 pub fn read_marker(install_root: &Path) -> Result<Option<InstallReadyMarker>, LpmError> {
     let path = as_extended_path(&install_root.join(INSTALL_READY_MARKER));
-    let bytes = match std::fs::read(&path) {
-        Ok(b) => b,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+    // Capped read: an oversize marker file is treated the same as
+    // missing, matching the recovery semantics of every other capped
+    // state reader. A corrupted marker that's bigger than the cap
+    // would have errored on the next field anyway.
+    let bytes = match read_capped_state_file(&path, STATE_FILE_SIZE_CAP_BYTES) {
+        Ok(Some(b)) => b,
+        Ok(None) => return Ok(None),
         Err(e) => return Err(LpmError::Io(e)),
     };
     let marker: InstallReadyMarker = serde_json::from_slice(&bytes).map_err(|e| {
@@ -258,14 +275,21 @@ pub fn validate_install_root(
     if !lockfile.is_file() {
         return Ok(InstallRootStatus::MissingLockfile);
     }
-    // Cheap parseability check — read the whole file and verify it's
-    // valid UTF-8 + non-empty + starts plausibly. The lockfile crate
-    // owns the strict parse; we just want to catch torn writes here.
-    let lock_bytes = std::fs::read(&lockfile)?;
-    if lock_bytes.is_empty() {
-        return Ok(InstallRootStatus::LockfileUnparseable);
-    }
-    if std::str::from_utf8(&lock_bytes).is_err() {
+    // Strict parse through the lockfile crate so the variant name
+    // (`LockfileUnparseable`) is honest. An oversize lockfile
+    // collapses to "unparseable" rather than buffering before
+    // deciding Ready, so a corrupted same-user write can't pin the
+    // recovery decision on multi-GB read work.
+    let lock_bytes = match read_capped_state_file(&lockfile, STATE_FILE_SIZE_CAP_BYTES) {
+        Ok(Some(b)) => b,
+        Ok(None) => return Ok(InstallRootStatus::LockfileUnparseable),
+        Err(e) => return Err(LpmError::Io(e)),
+    };
+    let lock_str = match std::str::from_utf8(&lock_bytes) {
+        Ok(s) => s,
+        Err(_) => return Ok(InstallRootStatus::LockfileUnparseable),
+    };
+    if Lockfile::from_toml(lock_str).is_err() {
         return Ok(InstallRootStatus::LockfileUnparseable);
     }
 
@@ -273,6 +297,13 @@ pub fn validate_install_root(
         commands: marker.commands,
     })
 }
+
+/// Minimal TOML body that the lockfile crate's strict parser accepts.
+/// Used by recovery tests and by every test helper that needs a
+/// "valid lockfile is on disk" precondition without exercising the
+/// full resolver. Kept at module scope so consumer tests in
+/// `recover.rs` and the CLI crate can reuse it.
+pub const MINIMAL_VALID_LOCKFILE_TOML: &str = "[metadata]\nlockfile-version = 2\n";
 
 #[cfg(test)]
 mod tests {
@@ -294,7 +325,7 @@ mod tests {
                 std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o755)).unwrap();
             }
         }
-        std::fs::write(tmp.path().join("lpm.lock"), b"# valid").unwrap();
+        std::fs::write(tmp.path().join("lpm.lock"), MINIMAL_VALID_LOCKFILE_TOML).unwrap();
         let m = InstallReadyMarker::new(commands.iter().map(|c| c.to_string()).collect());
         write_marker(tmp.path(), &m).unwrap();
         tmp
@@ -350,6 +381,22 @@ mod tests {
         assert!(leaks.is_empty(), "tempfile leaked: {leaks:?}");
     }
 
+    /// L9: the marker lists installed commands + package paths.
+    /// On shared hosts a default-umask 0o644 file lets other local
+    /// uids enumerate what global tools the user has installed.
+    /// 0o600 closes the recon channel.
+    #[cfg(unix)]
+    #[test]
+    fn write_marker_creates_file_with_0o600_perms() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = TempDir::new().unwrap();
+        let m = InstallReadyMarker::new(vec!["x".into()]);
+        write_marker(tmp.path(), &m).unwrap();
+        let path = tmp.path().join(INSTALL_READY_MARKER);
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "expected 0o600, got 0o{mode:o}");
+    }
+
     // ─── validate_install_root tests ──────────────────────────────
 
     fn one(s: &str) -> Vec<String> {
@@ -397,7 +444,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         std::fs::create_dir_all(tmp.path()).unwrap();
         std::fs::create_dir_all(tmp.path().join("node_modules").join(".bin")).unwrap();
-        std::fs::write(tmp.path().join("lpm.lock"), b"x").unwrap();
+        std::fs::write(tmp.path().join("lpm.lock"), MINIMAL_VALID_LOCKFILE_TOML).unwrap();
         let status = validate_install_root(tmp.path(), Some(&one("eslint"))).unwrap();
         assert_eq!(status, InstallRootStatus::MissingMarker);
     }
@@ -407,7 +454,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         // Marker promises eslint, but the .bin/ shim never got written.
         std::fs::create_dir_all(tmp.path().join("node_modules").join(".bin")).unwrap();
-        std::fs::write(tmp.path().join("lpm.lock"), b"x").unwrap();
+        std::fs::write(tmp.path().join("lpm.lock"), MINIMAL_VALID_LOCKFILE_TOML).unwrap();
         let m = InstallReadyMarker::new(vec!["eslint".into()]);
         write_marker(tmp.path(), &m).unwrap();
         let status = validate_install_root(tmp.path(), Some(&one("eslint"))).unwrap();
@@ -496,7 +543,7 @@ mod tests {
         // Mode 0o644 — readable but not executable.
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o644)).unwrap();
-        std::fs::write(tmp.path().join("lpm.lock"), b"x").unwrap();
+        std::fs::write(tmp.path().join("lpm.lock"), MINIMAL_VALID_LOCKFILE_TOML).unwrap();
         write_marker(tmp.path(), &InstallReadyMarker::new(vec!["eslint".into()])).unwrap();
         let status = validate_install_root(tmp.path(), Some(&one("eslint"))).unwrap();
         assert_eq!(
@@ -514,7 +561,7 @@ mod tests {
         let bin = tmp.path().join("node_modules").join(".bin");
         std::fs::create_dir_all(&bin).unwrap();
         std::os::unix::fs::symlink("/does/not/exist", bin.join("eslint")).unwrap();
-        std::fs::write(tmp.path().join("lpm.lock"), b"x").unwrap();
+        std::fs::write(tmp.path().join("lpm.lock"), MINIMAL_VALID_LOCKFILE_TOML).unwrap();
         write_marker(tmp.path(), &InstallReadyMarker::new(vec!["eslint".into()])).unwrap();
         let status = validate_install_root(tmp.path(), Some(&one("eslint"))).unwrap();
         assert_eq!(
@@ -523,5 +570,105 @@ mod tests {
                 command: "eslint".into()
             }
         );
+    }
+
+    /// `LockfileUnparseable` previously fired only on empty / non-UTF-8
+    /// bytes. A lockfile that's valid UTF-8 but not valid TOML (e.g.
+    /// a torn write that produced "x") used to pass through and the
+    /// caller would commit against a lockfile the lockfile crate can't
+    /// parse. Strict-parse closes that hole.
+    #[test]
+    fn lockfile_that_is_utf8_but_not_valid_toml_returns_lockfile_unparseable() {
+        let tmp = TempDir::new().unwrap();
+        let bin = tmp.path().join("node_modules").join(".bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let target = bin.join("eslint");
+        std::fs::write(&target, b"#!/bin/sh\necho ok\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        std::fs::write(tmp.path().join("lpm.lock"), b"definitely not toml { ]\n").unwrap();
+        write_marker(tmp.path(), &InstallReadyMarker::new(vec!["eslint".into()])).unwrap();
+        let status = validate_install_root(tmp.path(), Some(&one("eslint"))).unwrap();
+        assert_eq!(status, InstallRootStatus::LockfileUnparseable);
+    }
+
+    /// A future-version lockfile (lockfile-version > supported) is
+    /// rejected by `Lockfile::from_toml`. Strict parse must surface
+    /// that as `LockfileUnparseable` so recovery rolls back rather
+    /// than committing against a lockfile this binary can't read.
+    #[test]
+    fn lockfile_with_future_version_returns_lockfile_unparseable() {
+        let tmp = TempDir::new().unwrap();
+        let bin = tmp.path().join("node_modules").join(".bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let target = bin.join("eslint");
+        std::fs::write(&target, b"#!/bin/sh\necho ok\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        std::fs::write(
+            tmp.path().join("lpm.lock"),
+            "[metadata]\nlockfile-version = 999\n",
+        )
+        .unwrap();
+        write_marker(tmp.path(), &InstallReadyMarker::new(vec!["eslint".into()])).unwrap();
+        let status = validate_install_root(tmp.path(), Some(&one("eslint"))).unwrap();
+        assert_eq!(status, InstallRootStatus::LockfileUnparseable);
+    }
+
+    /// An over-cap lockfile must collapse to `LockfileUnparseable`
+    /// without buffering all the bytes; commands rely on the cap to
+    /// stay responsive when a same-user writer drops a huge file at
+    /// the lockfile path.
+    #[test]
+    fn over_cap_lockfile_returns_lockfile_unparseable() {
+        let tmp = TempDir::new().unwrap();
+        let bin = tmp.path().join("node_modules").join(".bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let target = bin.join("eslint");
+        std::fs::write(&target, b"#!/bin/sh\necho ok\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let huge = vec![
+            b'#';
+            (lpm_common::STATE_FILE_SIZE_CAP_BYTES as usize).saturating_add(1024 * 1024)
+        ];
+        std::fs::write(tmp.path().join("lpm.lock"), &huge).unwrap();
+        write_marker(tmp.path(), &InstallReadyMarker::new(vec!["eslint".into()])).unwrap();
+        let status = validate_install_root(tmp.path(), Some(&one("eslint"))).unwrap();
+        assert_eq!(status, InstallRootStatus::LockfileUnparseable);
+    }
+
+    /// An over-cap marker file collapses to `MissingMarker` for the
+    /// same reason — the marker's content shouldn't pin recovery on
+    /// multi-GB reads. Validation then refuses to roll forward.
+    #[test]
+    fn over_cap_marker_returns_missing_marker() {
+        let tmp = TempDir::new().unwrap();
+        let bin = tmp.path().join("node_modules").join(".bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let target = bin.join("eslint");
+        std::fs::write(&target, b"#!/bin/sh\necho ok\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        std::fs::write(tmp.path().join("lpm.lock"), MINIMAL_VALID_LOCKFILE_TOML).unwrap();
+        let huge = vec![
+            b'#';
+            (lpm_common::STATE_FILE_SIZE_CAP_BYTES as usize).saturating_add(1024 * 1024)
+        ];
+        std::fs::write(tmp.path().join(INSTALL_READY_MARKER), &huge).unwrap();
+        let status = validate_install_root(tmp.path(), Some(&one("eslint"))).unwrap();
+        assert_eq!(status, InstallRootStatus::MissingMarker);
     }
 }

@@ -30,7 +30,7 @@ use crate::save_spec::{
 };
 use chrono::Utc;
 use lpm_common::color::Painted;
-use lpm_common::{LpmError, LpmRoot, with_exclusive_lock};
+use lpm_common::{LpmError, LpmRoot, sanitize_for_terminal, with_exclusive_lock};
 use lpm_global::{
     AliasEntry, CommandCollision, GlobalManifest, InstallReadyMarker, InstallRootStatus,
     IntentPayload, OwnershipChange, PackageEntry, PackageSource, PendingEntry, Shim, TxKind,
@@ -196,10 +196,12 @@ pub async fn run(
     // ─── Pre-resolve (no lock) ─────────────────────────────────────
     let resolved = pre_resolve(&registry, spec).await?;
     if !json_output {
+        let name_safe = sanitize_for_terminal(&resolved.name);
+        let version_safe = sanitize_for_terminal(&resolved.version.to_string());
         output::info(&format!(
             "{} resolved to {}",
-            resolved.name.bold(),
-            resolved.version.dimmed()
+            name_safe.bold(),
+            version_safe.dimmed()
         ));
     }
 
@@ -208,7 +210,8 @@ pub async fn run(
 
     // ─── Step 2: slow install (no lock) ────────────────────────────
     if !json_output {
-        output::info(&format!("installing {}...", spec.bold()));
+        let spec_safe = sanitize_for_terminal(spec);
+        output::info(&format!("installing {}...", spec_safe.bold()));
     }
     // Step 2 failures (network, resolution, extract, link) are
     // intentionally NOT cleaned up here: recovery's roll-back path on
@@ -219,10 +222,10 @@ pub async fn run(
     do_install(&root, &registry, &prep, json_output, &overrides).await?;
     let commands = discover_bin_commands(&prep.install_root, &prep.name)?;
     if commands.is_empty() {
+        let name_safe = sanitize_for_terminal(&prep.name);
         return Err(LpmError::Script(format!(
-            "package '{}' exposes no bin entries — `lpm install -g` is for executable tools. \
-             Install it as a project dep with `lpm install {}` and `require()`/`import` it.",
-            prep.name, prep.name
+            "package '{name_safe}' exposes no bin entries — `lpm install -g` is for executable tools. \
+             Install it as a project dep with `lpm install {name_safe}` and `require()`/`import` it."
         )));
     }
     let marker = InstallReadyMarker::new(commands.clone());
@@ -493,6 +496,10 @@ fn prepare_locked(root: &LpmRoot, resolved: &ResolvedSpec) -> Result<PrepResult,
         // flags. prepare_locked runs before marker discovery, so
         // no collisions are known yet — empty delta here is correct.
         ownership_delta: Vec::new(),
+        // Install never prunes trust — empty here serializes away via
+        // `skip_serializing_if`, so the on-disk WAL shape stays byte-
+        // identical to pre-M76.
+        uninstall_trust_prune: Vec::new(),
     })))?;
 
     manifest.pending.insert(
@@ -741,8 +748,16 @@ fn commit_locked(
         }
     } else if resolution.is_empty() {
         // Collisions exist but the user supplied no resolution.
-        // Roll back inline + error out with the remediation hint.
-        rollback_aborted_commit(root, &mut manifest, prep, &format_collisions(&observed))?;
+        // Roll back inline + error out with the remediation hint. No
+        // shims have been emitted yet at this point, so the rollback's
+        // shim-sweep list is empty.
+        rollback_aborted_commit(
+            root,
+            &mut manifest,
+            prep,
+            &format_collisions(&observed),
+            &[],
+        )?;
         return Err(collision_error(&prep.name, &observed));
     } else {
         // Flag-driven resolution. Planner consumes the observed
@@ -752,7 +767,7 @@ fn commit_locked(
             Ok(p) => p,
             Err(plan_err) => {
                 let rendered = plan_err.to_script_error(&prep.name).to_string();
-                rollback_aborted_commit(root, &mut manifest, prep, &rendered)?;
+                rollback_aborted_commit(root, &mut manifest, prep, &rendered, &[])?;
                 return Err(plan_err.to_script_error(&prep.name));
             }
         }
@@ -842,6 +857,8 @@ fn commit_locked(
         prior_command_ownership_json: serde_json::json!({}),
         new_aliases_json,
         ownership_delta: plan.ownership_delta.clone(),
+        // Install never prunes trust — see comment at prepare_locked.
+        uninstall_trust_prune: Vec::new(),
     })))?;
 
     // ─── Emit / remove shims per the plan ─────────────────────────
@@ -860,6 +877,12 @@ fn commit_locked(
     for shim_name in &plan.shim_removals {
         let _ = remove_shim(&bin_dir, shim_name);
     }
+    // Track every shim name we emit so rollback can sweep them on
+    // failure (M74). Pre-fix the rollback path only dropped the install
+    // root + pending row + WAL Abort, so any shim that landed before
+    // the failure point survived as a dangling PATH entry pointing at
+    // a deleted root.
+    let mut emitted_shims: Vec<String> = Vec::new();
     for cmd in &plan.final_commands {
         let target = install_bin.join(cmd);
         emit_shim(
@@ -869,6 +892,7 @@ fn commit_locked(
                 target,
             },
         )?;
+        emitted_shims.push(cmd.clone());
     }
     for (alias_name, alias_entry) in &plan.alias_rows_to_write {
         let target = install_bin.join(&alias_entry.bin);
@@ -879,6 +903,7 @@ fn commit_locked(
                 target,
             },
         )?;
+        emitted_shims.push(alias_name.clone());
     }
 
     // Audit follow-up: three-artifact invariant — on
@@ -904,12 +929,16 @@ fn commit_locked(
         }
     }
     if !incomplete.is_empty() {
+        let names_safe: Vec<String> = incomplete
+            .iter()
+            .map(|n| sanitize_for_terminal(n))
+            .collect();
         let detail = format!(
             "shim triple incomplete after emit for: {}. The transaction \
              will be reconciled by recovery on the next `lpm` invocation.",
-            incomplete.join(", ")
+            names_safe.join(", ")
         );
-        rollback_aborted_commit(root, &mut manifest, prep, &detail)?;
+        rollback_aborted_commit(root, &mut manifest, prep, &detail, &emitted_shims)?;
         return Err(LpmError::Script(detail));
     }
 
@@ -957,12 +986,14 @@ fn format_collisions(collisions: &[CommandCollision]) -> String {
     collisions
         .iter()
         .map(|c| {
+            let owner_safe = sanitize_for_terminal(&c.current_owner);
+            let command_safe = sanitize_for_terminal(&c.command);
             let owner = if c.via_alias {
-                format!("alias \u{2192} {}", c.current_owner)
+                format!("alias \u{2192} {owner_safe}")
             } else {
-                c.current_owner.clone()
+                owner_safe
             };
-            format!("  {} (owned by {})", c.command, owner)
+            format!("  {command_safe} (owned by {owner})")
         })
         .collect::<Vec<_>>()
         .join("\n")
@@ -997,27 +1028,31 @@ fn collision_error(installing_pkg: &str, collisions: &[CommandCollision]) -> Lpm
     // per collision. The alias prefix is deterministic from the
     // package being installed, so the user gets a reasonable default
     // they can tweak.
-    let short_pkg = short_name(installing_pkg);
+    let installing_pkg_safe = sanitize_for_terminal(installing_pkg);
+    let short_pkg = sanitize_for_terminal(short_name(installing_pkg));
     let replace_flags = collisions
         .iter()
-        .map(|c| format!("--replace-bin {}", c.command))
+        .map(|c| format!("--replace-bin {}", sanitize_for_terminal(&c.command)))
         .collect::<Vec<_>>()
         .join(" ");
     let alias_flags = {
         let mappings = collisions
             .iter()
-            .map(|c| format!("{}={short_pkg}-{}", c.command, c.command))
+            .map(|c| {
+                let cmd_safe = sanitize_for_terminal(&c.command);
+                format!("{cmd_safe}={short_pkg}-{cmd_safe}")
+            })
             .collect::<Vec<_>>()
             .join(",");
         format!("--alias {mappings}")
     };
 
     LpmError::Script(format!(
-        "'{installing_pkg}' would expose command{plural_s} that {plural_verb} already \
+        "'{installing_pkg_safe}' would expose command{plural_s} that {plural_verb} already \
          taken on this host:\n{}\n\nTo resolve, re-run with one of the following per \
-         colliding command:\n\n    lpm install -g {installing_pkg} {replace_flags}\n    \
-         lpm install -g {installing_pkg} {alias_flags}\n\n--replace-bin transfers ownership to \
-         '{installing_pkg}'; --alias installs the declared bin under a different PATH name. \
+         colliding command:\n\n    lpm install -g {installing_pkg_safe} {replace_flags}\n    \
+         lpm install -g {installing_pkg_safe} {alias_flags}\n\n--replace-bin transfers ownership to \
+         '{installing_pkg_safe}'; --alias installs the declared bin under a different PATH name. \
          Mix both as needed.",
         format_collisions(collisions),
     ))
@@ -1109,9 +1144,10 @@ fn prompt_collisions(
     use crate::prompt::prompt_err;
 
     eprintln!();
+    let installing_pkg_safe = sanitize_for_terminal(installing_pkg);
     output::warn(&format!(
         "'{}' would expose {} command{} that {} already taken on this host.",
-        installing_pkg.bold(),
+        installing_pkg_safe.bold(),
         collisions.len(),
         if collisions.len() == 1 { "" } else { "s" },
         if collisions.len() == 1 { "is" } else { "are" },
@@ -1154,7 +1190,7 @@ fn fold_choices_into_resolution(
             CollisionChoice::Cancel => {
                 return Err(LpmError::Script(format!(
                     "install cancelled: user declined to resolve collision on '{}'",
-                    collision.command
+                    sanitize_for_terminal(&collision.command)
                 )));
             }
         }
@@ -1167,35 +1203,30 @@ fn prompt_one_collision(
     installing_pkg: &str,
     collision: &CommandCollision,
 ) -> Result<CollisionChoice, std::io::Error> {
+    let installing_pkg_safe = sanitize_for_terminal(installing_pkg);
+    let command_safe = sanitize_for_terminal(&collision.command);
+    let owner_safe = sanitize_for_terminal(&collision.current_owner);
     let owner_label = if collision.via_alias {
-        format!("alias \u{2192} {}", collision.current_owner)
+        format!("alias \u{2192} {owner_safe}")
     } else {
-        collision.current_owner.clone()
+        owner_safe
     };
-    let label = format!(
-        "Command '{}' is currently owned by '{}'. How to resolve?",
-        collision.command, owner_label,
-    );
+    let label =
+        format!("Command '{command_safe}' is currently owned by '{owner_label}'. How to resolve?");
 
-    let short_pkg = short_name(installing_pkg);
-    let default_alias = format!("{short_pkg}-{}", collision.command);
+    let short_pkg = sanitize_for_terminal(short_name(installing_pkg));
+    let default_alias = format!("{short_pkg}-{command_safe}");
 
     loop {
         let choice: &str = cliclack::select(&label)
             .item(
                 "replace",
-                format!(
-                    "Replace — transfer '{}' to '{}'",
-                    collision.command, installing_pkg
-                ),
+                format!("Replace — transfer '{command_safe}' to '{installing_pkg_safe}'"),
                 "",
             )
             .item(
                 "alias",
-                format!(
-                    "Alias — install '{}' under a different PATH name",
-                    collision.command
-                ),
+                format!("Alias — install '{command_safe}' under a different PATH name"),
                 "",
             )
             .item("cancel", "Cancel — abort the install", "")
@@ -1206,23 +1237,22 @@ fn prompt_one_collision(
             "replace" => return Ok(CollisionChoice::Replace),
             "cancel" => return Ok(CollisionChoice::Cancel),
             "alias" => {
-                let alias_input: String = cliclack::input(format!(
-                    "Alias name for '{}' (PATH command)",
-                    collision.command
-                ))
-                .default_input(&default_alias)
-                .validate(|v: &String| {
-                    let trimmed = v.trim();
-                    if trimmed.is_empty() {
-                        return Err("alias name cannot be empty".to_string());
-                    }
-                    lpm_linker::validate_bin_name(trimmed, "<cli-alias>")
-                })
-                .interact()?;
+                let alias_input: String =
+                    cliclack::input(format!("Alias name for '{command_safe}' (PATH command)"))
+                        .default_input(&default_alias)
+                        .validate(|v: &String| {
+                            let trimmed = v.trim();
+                            if trimmed.is_empty() {
+                                return Err("alias name cannot be empty".to_string());
+                            }
+                            lpm_linker::validate_bin_name(trimmed, "<cli-alias>")
+                        })
+                        .interact()?;
                 let alias_name = alias_input.trim().to_string();
                 if alias_name == collision.command {
+                    let alias_safe = sanitize_for_terminal(&alias_name);
                     output::warn(&format!(
-                        "alias target '{alias_name}' is the same as the original name — \
+                        "alias target '{alias_safe}' is the same as the original name — \
                          nothing to resolve. Try again."
                     ));
                     continue;
@@ -1293,22 +1323,31 @@ pub(crate) enum PlanError {
 
 impl PlanError {
     pub(crate) fn to_script_error(&self, installing_pkg: &str) -> LpmError {
+        let installing_pkg_safe = sanitize_for_terminal(installing_pkg);
         match self {
-            PlanError::UnknownCommand { flag, command } => LpmError::Script(format!(
-                "`{flag} {command}` references a command '{command}' that '{installing_pkg}' \
-                 does not declare. Re-check the package's bin entries with `lpm info \
-                 {installing_pkg}` and retry."
-            )),
+            PlanError::UnknownCommand { flag, command } => {
+                let command_safe = sanitize_for_terminal(command);
+                LpmError::Script(format!(
+                    "`{flag} {command_safe}` references a command '{command_safe}' that \
+                     '{installing_pkg_safe}' does not declare. Re-check the package's bin \
+                     entries with `lpm info {installing_pkg_safe}` and retry."
+                ))
+            }
             PlanError::ResidualCollision { collisions } => LpmError::Script(format!(
-                "after applying collision-resolution flags, '{installing_pkg}' still conflicts \
+                "after applying collision-resolution flags, '{installing_pkg_safe}' still conflicts \
                  on:\n{}\n\nAdd `--replace-bin <cmd>` or `--alias <cmd>=<new-name>` for each of \
                  the above, or pick a different package.",
                 format_collisions(collisions)
             )),
-            PlanError::AliasTargetCollision { targets, reason } => LpmError::Script(format!(
-                "alias target conflict ({reason}): {}. Pick different alias name(s) and retry.",
-                targets.join(", ")
-            )),
+            PlanError::AliasTargetCollision { targets, reason } => {
+                let reason_safe = sanitize_for_terminal(reason);
+                let targets_safe: Vec<String> =
+                    targets.iter().map(|t| sanitize_for_terminal(t)).collect();
+                LpmError::Script(format!(
+                    "alias target conflict ({reason_safe}): {}. Pick different alias name(s) and retry.",
+                    targets_safe.join(", ")
+                ))
+            }
         }
     }
 }
@@ -1629,6 +1668,12 @@ pub(crate) fn apply_ownership_change_to_manifest(
 ///
 /// Order of operations (per the audit's manifest-before-WAL
 /// invariant):
+///   0. Sweep emitted shims (M74). If a shim is locked and we cannot
+///      remove it, return Err WITHOUT writing manifest or WAL Abort
+///      so recovery picks up the half-rolled-back transaction on the
+///      next `lpm` invocation. Pre-fix this step did not exist; an
+///      emitted shim survived as a PATH entry pointing at the
+///      about-to-be-deleted install root.
 ///   1. Drop the install root (or tombstone if locked).
 ///   2. Remove `[pending.<pkg>]` row.
 ///   3. Persist manifest.
@@ -1638,7 +1683,32 @@ fn rollback_aborted_commit(
     manifest: &mut lpm_global::GlobalManifest,
     prep: &PrepResult,
     reason: &str,
+    emitted_shims: &[String],
 ) -> Result<(), LpmError> {
+    let bin_dir = root.bin_dir();
+    let mut shim_failures: Vec<String> = Vec::new();
+    for shim_name in emitted_shims {
+        if let Err(e) = remove_shim(&bin_dir, shim_name) {
+            shim_failures.push(format!(
+                "{}: {}",
+                sanitize_for_terminal(shim_name),
+                sanitize_for_terminal(&e.to_string())
+            ));
+        }
+    }
+    if !shim_failures.is_empty() {
+        let name_safe = sanitize_for_terminal(&prep.name);
+        let reason = format!(
+            "could not clear {} emitted shim(s) for '{}': {}. Re-run `lpm` so recovery can \
+             retry the rollback (the pending transaction is preserved in the manifest).",
+            shim_failures.len(),
+            name_safe,
+            shim_failures.join("; ")
+        );
+        tracing::warn!("install -g rollback: deferring '{}': {reason}", prep.name);
+        return Err(LpmError::Script(reason));
+    }
+
     let install_root_ext = lpm_common::as_extended_path(&prep.install_root);
     if install_root_ext.exists()
         && let Err(e) = std::fs::remove_dir_all(&install_root_ext)
@@ -1691,21 +1761,29 @@ fn print_success(
         println!("{}", serde_json::to_string_pretty(&body).unwrap());
         return;
     }
+    let name_safe = sanitize_for_terminal(&out.name);
+    let version_safe = sanitize_for_terminal(&out.version);
+    let saved_spec_safe = sanitize_for_terminal(&out.saved_spec);
     output::success(&format!(
         "Installed {}@{} (saved as {})",
-        out.name.bold(),
-        out.version.dimmed(),
-        out.saved_spec.dimmed()
+        name_safe.bold(),
+        version_safe.dimmed(),
+        saved_spec_safe.dimmed()
     ));
     if out.commands.is_empty() {
         // Shouldn't happen — we error out earlier when bin entries are
         // empty — but guard the message just in case.
         return;
     }
+    let commands_safe: Vec<String> = out
+        .commands
+        .iter()
+        .map(|c| sanitize_for_terminal(c))
+        .collect();
     output::info(&format!(
         "Exposed command{} on PATH: {}",
         if out.commands.len() == 1 { "" } else { "s" },
-        out.commands.join(", ")
+        commands_safe.join(", ")
     ));
     // The banner (if any) was printed by `maybe_show_path_hint` BEFORE
     // we got here. We don't re-emit anything in human mode; the hint
@@ -1873,7 +1951,13 @@ fn emit_post_install_blocked_warning(root: &LpmRoot, prep: &PrepResult, json_out
     let preview: Vec<String> = remaining
         .iter()
         .take(5)
-        .map(|b| format!("{}@{}", b.name, b.version))
+        .map(|b| {
+            format!(
+                "{}@{}",
+                sanitize_for_terminal(&b.name),
+                sanitize_for_terminal(&b.version)
+            )
+        })
         .collect();
     if !preview.is_empty() {
         output::info(&format!(
@@ -2526,7 +2610,7 @@ mod tests {
             install_root_relative: "installs/pkg@1.0.0".into(),
         };
 
-        rollback_aborted_commit(&root, &mut manifest, &prep, "test reason").unwrap();
+        rollback_aborted_commit(&root, &mut manifest, &prep, "test reason", &[]).unwrap();
 
         // Manifest pending row gone.
         let read_back = lpm_global::read_for(&root).unwrap();
@@ -2540,6 +2624,75 @@ mod tests {
             .iter()
             .any(|r| matches!(r, lpm_global::WalRecord::Abort { tx_id, .. } if tx_id == "tx1"));
         assert!(has_abort, "Abort record must be appended");
+    }
+
+    /// M74: when `rollback_aborted_commit` is handed a list of emitted
+    /// shim names, it must remove each one as part of the rollback so
+    /// no PATH entry survives pointing at the about-to-be-deleted
+    /// install root.
+    #[test]
+    #[cfg(unix)]
+    fn rollback_aborted_commit_sweeps_emitted_shims() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = lpm_common::LpmRoot::from_dir(tmp.path());
+        let install_root = root.install_root_for("pkg", "1.0.0");
+        std::fs::create_dir_all(install_root.join("node_modules").join(".bin")).unwrap();
+        let bin_target = install_root.join("node_modules").join(".bin").join("pkg");
+        std::fs::write(&bin_target, b"#!/bin/sh\necho ok\n").unwrap();
+
+        // Pre-rollback: simulate that commit_locked emitted two shims
+        // before failing. They point at this install root.
+        std::fs::create_dir_all(root.bin_dir()).unwrap();
+        std::os::unix::fs::symlink(&bin_target, root.bin_dir().join("pkg")).unwrap();
+        std::os::unix::fs::symlink(&bin_target, root.bin_dir().join("pkg-alias")).unwrap();
+        assert!(std::fs::symlink_metadata(root.bin_dir().join("pkg")).is_ok());
+        assert!(std::fs::symlink_metadata(root.bin_dir().join("pkg-alias")).is_ok());
+
+        let mut manifest = lpm_global::GlobalManifest::default();
+        manifest.pending.insert(
+            "pkg".into(),
+            lpm_global::PendingEntry {
+                saved_spec: "^1".into(),
+                resolved: "1.0.0".into(),
+                integrity: "sha512-x".into(),
+                source: lpm_global::PackageSource::LpmDev,
+                started_at: chrono::Utc::now(),
+                root: "installs/pkg@1.0.0".into(),
+                commands: vec![],
+                replaces_version: None,
+            },
+        );
+        lpm_global::write_for(&root, &manifest).unwrap();
+
+        let prep = PrepResult {
+            tx_id: "tx-shim".into(),
+            name: "pkg".into(),
+            version: lpm_semver::Version::parse("1.0.0").unwrap(),
+            saved_spec: "^1".into(),
+            integrity: "sha512-x".into(),
+            source: lpm_global::PackageSource::LpmDev,
+            install_root: install_root.clone(),
+            install_root_relative: "installs/pkg@1.0.0".into(),
+        };
+
+        rollback_aborted_commit(
+            &root,
+            &mut manifest,
+            &prep,
+            "test reason",
+            &["pkg".to_string(), "pkg-alias".to_string()],
+        )
+        .unwrap();
+
+        assert!(
+            std::fs::symlink_metadata(root.bin_dir().join("pkg")).is_err(),
+            "emitted direct-bin shim must be removed by rollback"
+        );
+        assert!(
+            std::fs::symlink_metadata(root.bin_dir().join("pkg-alias")).is_err(),
+            "emitted alias shim must be removed by rollback"
+        );
+        assert!(!install_root.exists());
     }
 
     #[test]
@@ -3157,7 +3310,11 @@ mod tests {
                 std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o755)).unwrap();
             }
         }
-        std::fs::write(install_root.join("lpm.lock"), b"# valid").unwrap();
+        std::fs::write(
+            install_root.join("lpm.lock"),
+            lpm_global::MINIMAL_VALID_LOCKFILE_TOML,
+        )
+        .unwrap();
         let marker =
             lpm_global::InstallReadyMarker::new(bins.iter().map(|s| (*s).to_string()).collect());
         lpm_global::write_marker(&install_root, &marker).unwrap();
@@ -3218,6 +3375,7 @@ mod tests {
             prior_command_ownership_json: serde_json::json!({}),
             new_aliases_json: serde_json::json!({}),
             ownership_delta: Vec::new(),
+            uninstall_trust_prune: Vec::new(),
         })))
         .unwrap();
         drop(wal);
@@ -3311,6 +3469,7 @@ mod tests {
             prior_command_ownership_json: serde_json::json!({}),
             new_aliases_json: serde_json::json!({}),
             ownership_delta: Vec::new(),
+            uninstall_trust_prune: Vec::new(),
         })))
         .unwrap();
         drop(wal);

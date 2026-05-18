@@ -3,6 +3,7 @@ use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256, Sha512};
 use std::fmt;
+use subtle::ConstantTimeEq;
 
 /// Subresource Integrity (SRI) hash.
 ///
@@ -22,6 +23,20 @@ pub struct Integrity {
 pub enum HashAlgorithm {
     Sha256,
     Sha512,
+}
+
+impl HashAlgorithm {
+    /// Required digest length in bytes — exactly 32 for SHA-256 and
+    /// 64 for SHA-512. Used by [`Integrity::parse`] to reject
+    /// structurally-malformed SRI before any caller treats parse
+    /// success as a complete invariant.
+    #[inline]
+    pub const fn digest_len(self) -> usize {
+        match self {
+            HashAlgorithm::Sha256 => 32,
+            HashAlgorithm::Sha512 => 64,
+        }
+    }
 }
 
 impl Integrity {
@@ -45,6 +60,14 @@ impl Integrity {
             LpmError::InvalidIntegrity(format!("invalid base64 in integrity hash: {e}"))
         })?;
 
+        let expected = algorithm.digest_len();
+        if hash.len() != expected {
+            return Err(LpmError::InvalidIntegrity(format!(
+                "{algo_str} digest must be {expected} bytes, got {}",
+                hash.len()
+            )));
+        }
+
         Ok(Integrity { algorithm, hash })
     }
 
@@ -67,9 +90,17 @@ impl Integrity {
     }
 
     /// Verify that the given data matches this integrity hash.
+    ///
+    /// Uses [`subtle::ConstantTimeEq`] so a future caller running this
+    /// path against attacker-influenced timing (server-side verifier,
+    /// network-observable hot loop) doesn't leak per-byte digest
+    /// information through `Vec::eq`'s early-exit short-circuit. The
+    /// length check happens first — both digests are always the same
+    /// length for a given algorithm (32 for SHA-256, 64 for SHA-512)
+    /// but the explicit guard documents the precondition.
     pub fn verify(&self, data: &[u8]) -> Result<(), LpmError> {
         let computed = Self::from_bytes(self.algorithm, data);
-        if self.hash == computed.hash {
+        if self.hash.len() == computed.hash.len() && self.hash.ct_eq(&computed.hash).into() {
             Ok(())
         } else {
             Err(LpmError::IntegrityMismatch {
@@ -114,7 +145,7 @@ impl Integrity {
             }
         };
 
-        if self.hash == computed_hash {
+        if self.hash.len() == computed_hash.len() && self.hash.ct_eq(&computed_hash).into() {
             Ok(())
         } else {
             let computed = Integrity {
@@ -150,17 +181,21 @@ mod tests {
 
     #[test]
     fn parse_sha512_integrity() {
-        let sri = "sha512-YWJjMTIz"; // "abc123" in base64
+        // Real 64-byte SHA-512 digest (of empty input) base64-encoded.
+        let sri = "sha512-z4PhNX7vuL3xVChQ1m2AB9Yg5AULVxXcg/SpIdNs6c5H0NE8XYXysP+DGNKHfuwvY7kxvUdBeoGlODJ6+SfaPg==";
         let integrity = Integrity::parse(sri).unwrap();
         assert_eq!(integrity.algorithm, HashAlgorithm::Sha512);
+        assert_eq!(integrity.hash.len(), 64);
         assert_eq!(integrity.to_string(), sri);
     }
 
     #[test]
     fn parse_sha256_integrity() {
-        let sri = "sha256-YWJjMTIz";
+        // Real 32-byte SHA-256 digest (of empty input) base64-encoded.
+        let sri = "sha256-47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU=";
         let integrity = Integrity::parse(sri).unwrap();
         assert_eq!(integrity.algorithm, HashAlgorithm::Sha256);
+        assert_eq!(integrity.hash.len(), 32);
     }
 
     #[test]
@@ -170,12 +205,87 @@ mod tests {
 
     #[test]
     fn reject_unsupported_algorithm() {
+        // Length is irrelevant for the algorithm gate — sha1 fails first.
         assert!(Integrity::parse("sha1-YWJjMTIz").is_err());
     }
 
     #[test]
     fn reject_invalid_base64() {
         assert!(Integrity::parse("sha512-!!!notbase64!!!").is_err());
+    }
+
+    /// L27: structural digest-length validation. Pre-fix `sha256-YWJjMTIz`
+    /// (6-byte payload) parsed successfully and only failed at verify
+    /// time. Callers that treated parse success as a complete invariant
+    /// were silently accepting malformed lockfile / metadata SRI; the
+    /// parser now rejects up front.
+    #[test]
+    fn reject_sha256_with_wrong_digest_length() {
+        let err = Integrity::parse("sha256-YWJjMTIz")
+            .expect_err("6-byte SHA-256 digest must be rejected");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("sha256 digest must be 32 bytes"),
+            "expected length-mismatch message, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn reject_sha512_with_wrong_digest_length() {
+        let err = Integrity::parse("sha512-YWJjMTIz")
+            .expect_err("6-byte SHA-512 digest must be rejected");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("sha512 digest must be 64 bytes"),
+            "expected length-mismatch message, got: {msg}"
+        );
+    }
+
+    /// L22: `verify` now goes through `subtle::ConstantTimeEq` so a
+    /// future caller running this path against attacker-influenced
+    /// timing doesn't leak per-byte digest information. The behavioural
+    /// contract (match → Ok, mismatch → IntegrityMismatch) stays
+    /// identical — this test pins the contract; the constant-time
+    /// guarantee comes from the type system (`ConstantTimeEq` impl).
+    #[test]
+    fn verify_returns_ok_on_match_and_mismatch_on_one_byte_flip() {
+        let data = b"the quick brown fox jumps over the lazy dog";
+        for algo in [HashAlgorithm::Sha256, HashAlgorithm::Sha512] {
+            let i = Integrity::from_bytes(algo, data);
+            assert!(
+                i.verify(data).is_ok(),
+                "verify must succeed on identical bytes"
+            );
+            // Flip the last byte and confirm verify fails.
+            let mut tampered = data.to_vec();
+            *tampered.last_mut().unwrap() ^= 0x01;
+            assert!(
+                i.verify(&tampered).is_err(),
+                "verify must fail on one-byte tamper"
+            );
+            // Flip the first byte too — the constant-time path checks
+            // every position, so an early-byte mismatch is rejected
+            // identically to a late-byte mismatch.
+            let mut tampered_early = data.to_vec();
+            tampered_early[0] ^= 0x01;
+            assert!(
+                i.verify(&tampered_early).is_err(),
+                "verify must fail regardless of which byte differs"
+            );
+        }
+    }
+
+    /// Computed digests round-trip through parse — same algorithm gives
+    /// the same length back. Pins that the strict-length gate doesn't
+    /// regress the legitimate from_bytes-then-display-then-parse path.
+    #[test]
+    fn computed_digest_roundtrips_under_strict_length() {
+        for algo in [HashAlgorithm::Sha256, HashAlgorithm::Sha512] {
+            let i = Integrity::from_bytes(algo, b"payload");
+            let parsed = Integrity::parse(&i.to_string()).expect("computed must roundtrip");
+            assert_eq!(parsed, i);
+            assert_eq!(parsed.hash.len(), algo.digest_len());
+        }
     }
 
     #[test]

@@ -7,8 +7,16 @@ use lpm_lockfile::Lockfile;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
-/// Known integrity hash prefixes (SRI format).
-const VALID_INTEGRITY_PREFIXES: &[&str] = &["sha256-", "sha384-", "sha512-", "sha1-"];
+/// Accepted integrity hash prefixes (SRI format).
+///
+/// `sha1-` is intentionally absent — old yarn-v1 / npm lockfiles
+/// commonly carry sha1 entries, and migrating them verbatim silently
+/// downgrades supply-chain assurance for unique-version packages that
+/// aren't re-resolved. `lpm_common::integrity::Integrity::parse` also
+/// rejects sha1 at install time, so a sha1 entry in the migrated
+/// lockfile would block `lpm install` later with a less actionable
+/// error than the migrate-time warning emitted here.
+const VALID_INTEGRITY_PREFIXES: &[&str] = &["sha256-", "sha384-", "sha512-"];
 
 /// Threshold for "huge lockfile" warning.
 const HUGE_LOCKFILE_THRESHOLD: usize = 100_000;
@@ -86,16 +94,30 @@ fn check_root_deps(lockfile: &Lockfile, project_dir: &Path, warnings: &mut Vec<S
     }
 }
 
-/// Check that integrity hashes use valid SRI format.
+/// Check that integrity hashes use an accepted SRI prefix.
+///
+/// `sha1-` entries are surfaced with a dedicated message because they
+/// are common in legacy lockfiles and the install pipeline will reject
+/// them with a less actionable error — flagging the weakness at
+/// migrate time gives the user a chance to refresh the affected
+/// packages before depending on the migrated lockfile.
 fn check_integrity_format(lockfile: &Lockfile, warnings: &mut Vec<String>) {
     for pkg in &lockfile.packages {
         if let Some(ref integrity) = pkg.integrity {
+            if integrity.starts_with("sha1-") {
+                warnings.push(format!(
+                    "weak integrity hash for {}@{}: '{}' uses SHA-1, which lpm install will reject; \
+                     re-resolve this package against the upstream registry to obtain a sha256-/sha512- entry",
+                    pkg.name, pkg.version, integrity,
+                ));
+                continue;
+            }
             let valid = VALID_INTEGRITY_PREFIXES
                 .iter()
                 .any(|prefix| integrity.starts_with(prefix));
             if !valid {
                 warnings.push(format!(
-                    "invalid integrity format for {}@{}: '{}' (expected sha256-/sha384-/sha512-/sha1- prefix)",
+                    "invalid integrity format for {}@{}: '{}' (expected sha256-/sha384-/sha512- prefix)",
                     pkg.name, pkg.version, integrity,
                 ));
             }
@@ -409,7 +431,7 @@ mod tests {
     }
 
     #[test]
-    fn valid_integrity_prefixes() {
+    fn sha256_sha384_sha512_prefixes_accepted_without_warning() {
         let dir = tempfile::tempdir().unwrap();
 
         let lockfile = make_lockfile(vec![
@@ -443,22 +465,42 @@ mod tests {
                 peers: vec![],
                 tarball: None,
             },
-            LockedPackage {
-                name: "d".to_string(),
-                version: "1.0.0".to_string(),
-                source: None,
-                integrity: Some("sha1-jkl".to_string()),
-                dependencies: vec![],
-                alias_dependencies: vec![],
-                peers: vec![],
-                tarball: None,
-            },
         ]);
 
         let warnings = validate(&lockfile, dir.path());
         assert!(
-            !warnings.iter().any(|w| w.contains("invalid integrity")),
+            !warnings.iter().any(|w| w.contains("integrity")),
             "got unexpected integrity warnings: {:?}",
+            warnings,
+        );
+    }
+
+    /// SHA-1 entries surface a dedicated weak-hash warning so the user
+    /// can re-resolve before install (where the integrity parser will
+    /// hard-reject the entry with a less actionable message). Pre-fix,
+    /// `sha1-` was on the accepted-prefix list and migrated lockfiles
+    /// silently carried the weaker hash forward.
+    #[test]
+    fn sha1_integrity_surfaces_weak_hash_warning() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let lockfile = make_lockfile(vec![LockedPackage {
+            name: "legacy-pkg".to_string(),
+            version: "1.0.0".to_string(),
+            source: None,
+            integrity: Some("sha1-abcdef".to_string()),
+            dependencies: vec![],
+            alias_dependencies: vec![],
+            peers: vec![],
+            tarball: None,
+        }]);
+
+        let warnings = validate(&lockfile, dir.path());
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains("legacy-pkg") && w.contains("SHA-1")),
+            "expected weak-hash warning for legacy-pkg, got: {:?}",
             warnings,
         );
     }

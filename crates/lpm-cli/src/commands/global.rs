@@ -7,7 +7,7 @@
 
 use crate::output;
 use lpm_common::color::Painted;
-use lpm_common::{LpmError, LpmRoot, format_bytes};
+use lpm_common::{LpmError, LpmRoot, format_bytes, sanitize_for_terminal};
 use lpm_global::{GlobalManifest, PackageEntry};
 use std::path::Path;
 
@@ -175,9 +175,42 @@ async fn run_list_outdated(
     }
 
     // Single batch call covers every globally-installed package.
-    // Step 6 fix: use the injected client (carries
-    // `--registry` + SessionManager). The local `build_registry()`
-    // helper is now unused.
+    //
+    // Accepted-posture trade-off (L41): the batch endpoint is called
+    // with every package name regardless of `entry.source`. That means
+    // an `upstream-npm` row's name is included in the POST body to the
+    // configured LPM registry, not routed through the npm-specific
+    // `get_npm_package_metadata` proxy/public-fallback path the
+    // install/update flows use.
+    //
+    // Why this is intentional for this surface:
+    //
+    //   1. The LPM Worker batch endpoint is the canonical metadata
+    //      service for both `LpmDev` and `UpstreamNpm` source kinds —
+    //      it transparently proxies npm metadata via the same `dist`
+    //      shape, which is exactly what `pick_latest_matching` expects.
+    //
+    //   2. The privacy concern that drove M15 (`outdated --include-npm`
+    //      leaking private package names to public npm) is enforced at
+    //      a different layer — install/audit's `lockfile_source_is_npm_public`
+    //      gate. That gate refuses to disclose names to a *public* npm
+    //      endpoint; routing through the configured LPM endpoint is
+    //      explicitly the authorized destination.
+    //
+    //   3. Splitting by source here would replace one batch call with
+    //      N per-package round-trips through `get_npm_package_metadata`,
+    //      and the operator's manifest can easily contain 50+ globals.
+    //      For a diagnostic surface, the latency cost is not worth the
+    //      negligible privacy delta over the existing LPM-proxy
+    //      relationship.
+    //
+    // Future hardening: if a user opts into a strict-routing mode where
+    // npm metadata must never traverse the LPM proxy, this is the site
+    // to honor it — split `names` by `entry.source`, dispatch
+    // `LpmDev` to `batch_metadata`, `UpstreamNpm` to
+    // `get_npm_package_metadata`, and merge the results. Today's
+    // posture is "the LPM batch endpoint is the canonical metadata
+    // service for this diagnostic."
     let names: Vec<String> = manifest.packages.keys().cloned().collect();
     let metadata = match client.batch_metadata(&names).await {
         Ok(m) => m,
@@ -264,9 +297,18 @@ fn pick_latest_matching(
     if let Some(v) = meta.dist_tags.get(saved_spec) {
         return Ok(v.clone());
     }
-    // Exact version: accept it verbatim if the registry still has it.
+    // Exact version: verify the registry still serves it (L42). A
+    // yanked / deleted / tampered pin should surface as `unresolved`,
+    // not silently reported up-to-date.
     if lpm_semver::Version::parse(saved_spec).is_ok() {
-        return Ok(saved_spec.to_string());
+        if meta.versions.contains_key(saved_spec) {
+            return Ok(saved_spec.to_string());
+        }
+        return Err(format!(
+            "registry no longer serves the exact-pinned version '{saved_spec}' for '{}' — \
+             the version may have been yanked or deleted upstream",
+            meta.name
+        ));
     }
     // Wildcard: highest version, period.
     if saved_spec == "*" {
@@ -351,13 +393,17 @@ fn emit_outdated_human(
         println!();
         println!("  {} outdated:", outdated.len().to_string().bold(),);
         for r in outdated {
+            let package_safe = sanitize_for_terminal(&r.package);
+            let current_safe = sanitize_for_terminal(&r.current);
+            let latest_safe = sanitize_for_terminal(&r.latest);
             println!(
                 "    {} {} \u{2192} {}{}",
-                r.package.bold(),
-                r.current.dimmed(),
-                r.latest.green(),
+                package_safe.bold(),
+                current_safe.dimmed(),
+                latest_safe.green(),
                 if verbose {
-                    format!("  (spec: {})", r.saved_spec.dimmed())
+                    let spec_safe = sanitize_for_terminal(&r.saved_spec);
+                    format!("  (spec: {})", spec_safe.dimmed())
                 } else {
                     String::new()
                 },
@@ -377,15 +423,21 @@ fn emit_outdated_human(
             if unresolved.len() == 1 { "" } else { "s" },
         ));
         for r in unresolved {
-            println!("    {}: {}", r.package.bold(), r.reason.dimmed());
+            let package_safe = sanitize_for_terminal(&r.package);
+            let reason_safe = sanitize_for_terminal(&r.reason);
+            println!("    {}: {}", package_safe.bold(), reason_safe.dimmed());
         }
         println!();
     }
     if !up_to_date.is_empty() && verbose {
+        let names_safe: Vec<String> = up_to_date
+            .iter()
+            .map(|n| sanitize_for_terminal(n))
+            .collect();
         output::info(&format!(
             "{} up-to-date: {}",
             up_to_date.len(),
-            up_to_date.join(", ").dimmed(),
+            names_safe.join(", ").dimmed(),
         ));
     }
 }
@@ -457,27 +509,32 @@ fn emit_list_human(root: &LpmRoot, manifest: &GlobalManifest, verbose: bool) {
         let cmds_str = if commands.is_empty() {
             "(no commands)".dimmed().to_string()
         } else {
-            commands.join(", ")
+            commands
+                .iter()
+                .map(|c| sanitize_for_terminal(c))
+                .collect::<Vec<_>>()
+                .join(", ")
         };
+        let name_safe = sanitize_for_terminal(name);
+        let resolved_safe = sanitize_for_terminal(&entry.resolved);
         println!(
             "    {} {} \u{2014} {}",
-            name.bold(),
-            format!("@{}", entry.resolved).dimmed(),
+            name_safe.bold(),
+            format!("@{resolved_safe}").dimmed(),
             cmds_str
         );
         if verbose {
             let install_root = root.global_root().join(&entry.root);
             let bytes = dir_size(&install_root).unwrap_or(0);
+            let spec_safe = sanitize_for_terminal(&entry.saved_spec);
             println!(
                 "        spec: {}    installed: {}    size: {}",
-                entry.saved_spec.dimmed(),
+                spec_safe.dimmed(),
                 entry.installed_at.format("%Y-%m-%d").to_string().dimmed(),
                 format_bytes(bytes).dimmed()
             );
-            println!(
-                "        root: {}",
-                install_root.display().to_string().dimmed()
-            );
+            let root_safe = sanitize_for_terminal(&install_root.display().to_string());
+            println!("        root: {}", root_safe.dimmed());
         }
     }
     if !manifest.aliases.is_empty() {
@@ -492,11 +549,14 @@ fn emit_list_human(root: &LpmRoot, manifest: &GlobalManifest, verbose: bool) {
             }
         );
         for (alias, entry) in &manifest.aliases {
+            let alias_safe = sanitize_for_terminal(alias);
+            let package_safe = sanitize_for_terminal(&entry.package);
+            let bin_safe = sanitize_for_terminal(&entry.bin);
             println!(
                 "    {} \u{2192} {}'s {}",
-                alias.bold(),
-                entry.package,
-                entry.bin.dimmed()
+                alias_safe.bold(),
+                package_safe,
+                bin_safe.dimmed()
             );
         }
     }
@@ -562,7 +622,10 @@ fn run_path(
             .unwrap()
         );
     } else {
-        println!("{}", install_root.display());
+        println!(
+            "{}",
+            sanitize_for_terminal(&install_root.display().to_string())
+        );
     }
     Ok(())
 }
@@ -828,15 +891,28 @@ mod tests {
     }
 
     #[test]
-    fn pick_latest_matching_exact_version_passes_through() {
+    fn pick_latest_matching_exact_version_present_in_registry_passes_through() {
         let meta = fake_metadata("eslint", &["9.23.0", "9.24.0"], &[]);
-        // Exact that matches the registry.
         assert_eq!(pick_latest_matching(&meta, "9.24.0").unwrap(), "9.24.0");
-        // Exact we've never heard of is STILL accepted at the
-        // "saved_spec resolved to exact" level. The caller compares
-        // against entry.resolved; a registry-missing exact shows as
-        // up-to-date (no upgrade target). Matches project install.
-        assert_eq!(pick_latest_matching(&meta, "100.0.0").unwrap(), "100.0.0");
+    }
+
+    /// L42: an exact pin the registry no longer serves (yanked / deleted /
+    /// tampered) must surface as `unresolved`. Pre-fix `pick_latest_matching`
+    /// returned `Ok(saved_spec)` verbatim and `lpm global list --outdated`
+    /// reported the package as up-to-date because `latest == entry.resolved`,
+    /// which masked a real supply-chain or registry-state signal.
+    #[test]
+    fn pick_latest_matching_exact_version_missing_from_registry_surfaces_as_unresolved() {
+        let meta = fake_metadata("eslint", &["9.23.0", "9.24.0"], &[]);
+        let err = pick_latest_matching(&meta, "100.0.0").unwrap_err();
+        assert!(
+            err.contains("registry no longer serves"),
+            "L42: missing exact pin must surface a 'no longer served' message; got: {err}"
+        );
+        assert!(
+            err.contains("100.0.0"),
+            "L42: error must name the missing version; got: {err}"
+        );
     }
 
     #[test]
@@ -864,5 +940,31 @@ mod tests {
         let meta = fake_metadata("eslint", &["8.0.0", "8.1.0"], &[]);
         let err = pick_latest_matching(&meta, "^9").unwrap_err();
         assert!(err.contains("no version"));
+    }
+
+    /// Manifest-controlled package / alias / version / saved-spec / install
+    /// root strings are passed through `sanitize_for_terminal` before any
+    /// styling reaches the terminal — a hostile registry or corrupted
+    /// manifest can no longer emit OSC 8 hyperlinks, OSC 52 clipboard
+    /// writes, CSI cursor manipulation, or BEL/DEL through `lpm global
+    /// list` / `lpm global path` / `lpm global list --outdated`.
+    #[test]
+    fn sanitize_for_terminal_strips_osc_and_bel_from_global_field_payload() {
+        let osc8 = "\u{1b}]8;;file:///etc/passwd\u{07}evil-pkg\u{1b}]8;;\u{07}";
+        let cleaned = sanitize_for_terminal(osc8);
+        assert!(!cleaned.contains('\u{1b}'));
+        assert!(!cleaned.contains('\u{07}'));
+        assert!(cleaned.contains("evil-pkg"));
+
+        let osc52 = "pkg\u{1b}]52;c;YmFkLXBheWxvYWQ=\u{07}";
+        let cleaned = sanitize_for_terminal(osc52);
+        assert!(!cleaned.contains('\u{1b}'));
+        assert!(!cleaned.contains('\u{07}'));
+        assert!(cleaned.starts_with("pkg"));
+
+        let csi = "1.0.0\u{1b}[2J\u{1b}[H";
+        let cleaned = sanitize_for_terminal(csi);
+        assert!(!cleaned.contains('\u{1b}'));
+        assert!(cleaned.contains("1.0.0"));
     }
 }

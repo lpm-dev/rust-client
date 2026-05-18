@@ -2322,6 +2322,7 @@ async fn lpm_command_with_orphan_pending_tx_emits_recovery_banner() {
         prior_command_ownership_json: serde_json::json!({}),
         new_aliases_json: serde_json::json!({}),
         ownership_delta: Vec::new(),
+        uninstall_trust_prune: Vec::new(),
     }));
     let mut writer = WalWriter::open(root.global_wal()).expect("open WAL writer");
     writer.append(&intent).expect("append orphan INTENT");

@@ -103,11 +103,32 @@ pub fn resolve_npm_access(_npm_name: &str, npm_config: Option<&NpmPublishConfig>
 }
 
 /// Resolve the npm registry URL.
+///
+/// H18: a project `lpm.json` can override `publish.npm.registry` to
+/// any HTTPS host while still naming `npm` as a publish target. The
+/// publish flow then sends `NPM_TOKEN` / stored npm credentials as
+/// bearer auth to that host — token-and-tarball exfil via a hostile
+/// repo config. Pre-fix the only filter was "must be https://".
+///
+/// Post-fix we warn loudly when the resolved registry is anything
+/// other than the default `registry.npmjs.org`. Hard refusal would
+/// block legitimate self-hosted npm enterprise mirrors, so we stop
+/// at loud surfacing — operators see the redirect target in logs
+/// before the npm bearer is sent.
 pub fn resolve_npm_registry(npm_config: Option<&NpmPublishConfig>) -> String {
-    npm_config
+    let resolved = npm_config
         .and_then(|c| c.registry.as_deref())
         .unwrap_or(NPM_REGISTRY_URL)
-        .to_string()
+        .to_string();
+    if resolved.trim_end_matches('/') != NPM_REGISTRY_URL.trim_end_matches('/') {
+        tracing::warn!(
+            target_url = %resolved,
+            default_url = NPM_REGISTRY_URL,
+            "publish.npm.registry overridden — npm bearer will be sent to a non-default host; \
+             confirm this is intentional",
+        );
+    }
+    resolved
 }
 
 /// Resolve the npm dist-tag.
