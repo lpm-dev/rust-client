@@ -131,6 +131,23 @@ pub enum VerifyError {
     /// or `RequireInclusionProof` this case is not an error.
     #[error("Rekor SET is required by policy but missing from the bundle")]
     RekorSetMissing,
+
+    /// Rekor Merkle inclusion proof verification failed: signed
+    /// checkpoint did not verify under the pinned Rekor key, the
+    /// walked Merkle root did not match the checkpoint's signed
+    /// root, the proof was internally inconsistent (e.g. `logIndex`
+    /// outside the `treeSize` range), the checkpoint envelope was
+    /// malformed, or the proof's `hashes` slice had the wrong arity.
+    #[error("Rekor inclusion proof verification failed: {0}")]
+    InclusionProof(String),
+
+    /// The Rekor body did not carry an inclusion proof, but the
+    /// caller's [`RekorInclusionProofPolicy`] required one
+    /// (`RequireInclusionProof` or `RequireBoth`). The SET path
+    /// (Phase 1.6) is the alternative offline anchor; under `Either`
+    /// or `RequireSet` this case is not an error.
+    #[error("Rekor inclusion proof is required by policy but missing from the bundle")]
+    InclusionProofMissing,
 }
 
 /// Policy for which Rekor inclusion artifacts a bundle must carry to
@@ -1226,6 +1243,416 @@ fn build_set_input_canonical_json(
         log_id = log_id_hex,
         log_index = log_index,
     )
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// Phase 1.7 — Rekor Merkle inclusion proof verification.
+// ─────────────────────────────────────────────────────────────────────
+//
+// The inclusion proof is the second offline-verifiable anchor in a
+// Sigstore bundle (the first being the SET — Phase 1.6). It proves an
+// entry's existence in the transparency log at a specific tree state
+// via:
+//   1. The signed "checkpoint" — Rekor's commitment to a tree state
+//      (origin, tree size, root hash) signed with the same key that
+//      signs SETs.
+//   2. The Merkle path — sibling hashes that walk from the leaf hash
+//      up to the signed root.
+//
+// Together they bind the bundle's entry to a transparency-log root
+// the user can independently corroborate via Rekor's witness API.
+//
+// Canonicalization rules for the checkpoint signed-note format
+// cached in `private/rekor-checkpoint-format.md`; Merkle walk follows
+// RFC 6962 §2.1.1 (`hash_children(left, right) = sha256(0x01 || left
+// || right)`, `leaf_hash(data) = sha256(0x00 || data)`).
+//
+// Policy plumbing: this function verifies WHEN CALLED. The composed
+// entry point (Phase 1.8) decides whether to call based on
+// [`RekorInclusionProofPolicy`] and whether the bundle carries a
+// proof. Per the plan's GPT round-5 H1, the enum is the *single*
+// authority — there is no parallel boolean knob.
+
+/// Verify the Rekor Merkle inclusion proof attached to `tlog_entry`.
+///
+/// Steps:
+/// 1. Extract the checkpoint envelope (handles both
+///    bundle shapes — bare string or `{envelope: "..."}` object).
+/// 2. Parse + verify the checkpoint signature under the pinned
+///    Rekor key for the entry's `logID`.
+/// 3. Consistency: the checkpoint's signed tree size + root hash
+///    must agree with the inclusion proof's declared fields.
+/// 4. Compute the leaf hash from `canonicalized_body`.
+/// 5. Walk the Merkle path per RFC 6962 from leaf → computed root.
+/// 6. Compare computed root to the checkpoint's signed root.
+///
+/// Returns `Ok(())` only when every step passes. Returns
+/// [`VerifyError::InclusionProofMissing`] if the bundle carries no
+/// inclusion proof — the caller is responsible for deciding whether
+/// that's fatal per [`RekorInclusionProofPolicy`].
+#[allow(dead_code)] // wired into Phase 1.8 entry point
+pub fn verify_inclusion_proof(
+    tlog_entry: &crate::sigstore::TlogEntry,
+    rekor_keys: &[RekorKey],
+) -> Result<(), VerifyError> {
+    let proof = tlog_entry
+        .resolved_inclusion_proof()
+        .ok_or(VerifyError::InclusionProofMissing)?;
+
+    let integrated_time = parse_integrated_time(&tlog_entry.integrated_time)
+        .map_err(|e| VerifyError::InclusionProof(format!("{e}")))?;
+    let log_id_bytes = hex::decode(&tlog_entry.log_id.key_id).map_err(|e| {
+        VerifyError::InclusionProof(format!("TlogEntry.logId.keyId is not valid hex: {e}"))
+    })?;
+    let rekor_key = rekor_keys
+        .iter()
+        .find(|k| k.log_id == log_id_bytes && k.valid_for.contains(integrated_time))
+        .ok_or_else(|| {
+            VerifyError::InclusionProof(format!(
+                "no pinned Rekor key for logId={} valid at integratedTime={}",
+                tlog_entry.log_id.key_id, tlog_entry.integrated_time,
+            ))
+        })?;
+
+    let checkpoint_envelope = extract_checkpoint_envelope(&proof.checkpoint)?;
+    let trusted = verify_checkpoint_signature(&checkpoint_envelope, rekor_key)?;
+
+    // Consistency: bundle's inclusion-proof fields agree with the
+    // signed checkpoint. A bundle that says tree_size=N + root=R but
+    // whose signed checkpoint commits to a different tree state is
+    // structurally inconsistent — reject before walking the Merkle
+    // path so the diagnostic names the mismatch directly.
+    if trusted.tree_size != proof.tree_size {
+        return Err(VerifyError::InclusionProof(format!(
+            "inclusion proof tree_size={} disagrees with signed checkpoint tree_size={}",
+            proof.tree_size, trusted.tree_size,
+        )));
+    }
+    let proof_root_bytes = decode_root_hash_hex_or_base64(&proof.root_hash).map_err(|e| {
+        VerifyError::InclusionProof(format!(
+            "inclusion proof root_hash is neither valid hex nor base64: {e}"
+        ))
+    })?;
+    if proof_root_bytes != trusted.root_hash {
+        return Err(VerifyError::InclusionProof(
+            "inclusion proof root_hash disagrees with signed checkpoint root".into(),
+        ));
+    }
+
+    if proof.log_index != tlog_entry.log_index.parse::<i64>().unwrap_or(-1) {
+        return Err(VerifyError::InclusionProof(format!(
+            "inclusion proof log_index={} disagrees with TlogEntry log_index={}",
+            proof.log_index, tlog_entry.log_index,
+        )));
+    }
+    if proof.log_index < 0 || proof.tree_size <= 0 {
+        return Err(VerifyError::InclusionProof(format!(
+            "inclusion proof has non-positive log_index or tree_size: \
+             log_index={}, tree_size={}",
+            proof.log_index, proof.tree_size,
+        )));
+    }
+    if (proof.log_index as u64) >= (proof.tree_size as u64) {
+        return Err(VerifyError::InclusionProof(format!(
+            "inclusion proof log_index={} is not less than tree_size={}",
+            proof.log_index, proof.tree_size,
+        )));
+    }
+
+    let body_bytes = BASE64
+        .decode(tlog_entry.canonicalized_body.as_bytes())
+        .map_err(|e| {
+            VerifyError::InclusionProof(format!(
+                "canonicalizedBody is not valid base64 — cannot compute leaf hash: {e}"
+            ))
+        })?;
+    let leaf_hash = rfc6962_leaf_hash(&body_bytes);
+
+    let sibling_hashes = proof
+        .hashes
+        .iter()
+        .map(|h| {
+            decode_root_hash_hex_or_base64(h).map_err(|e| {
+                VerifyError::InclusionProof(format!(
+                    "inclusion proof sibling hash is neither hex nor base64: {e}"
+                ))
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    for (i, sibling) in sibling_hashes.iter().enumerate() {
+        if sibling.len() != 32 {
+            return Err(VerifyError::InclusionProof(format!(
+                "inclusion proof sibling hash {i} is {} bytes (expected 32 for sha256)",
+                sibling.len()
+            )));
+        }
+    }
+
+    let computed_root = rfc6962_verify_inclusion(
+        proof.log_index as u64,
+        proof.tree_size as u64,
+        &leaf_hash,
+        &sibling_hashes,
+    )?;
+    if computed_root != trusted.root_hash {
+        return Err(VerifyError::InclusionProof(format!(
+            "Merkle walk root does not match signed checkpoint root: \
+             computed={}, signed={}",
+            hex::encode(&computed_root),
+            hex::encode(&trusted.root_hash),
+        )));
+    }
+
+    Ok(())
+}
+
+/// Pull the checkpoint signed-note string out of an
+/// `inclusion_proof.checkpoint` field. The Sigstore Bundle v0.3 spec
+/// wraps it as `{ "envelope": "..." }`; some signers / older bundles
+/// emit a bare string. Accept both.
+fn extract_checkpoint_envelope(value: &serde_json::Value) -> Result<String, VerifyError> {
+    match value {
+        serde_json::Value::String(s) => Ok(s.clone()),
+        serde_json::Value::Object(obj) => obj
+            .get("envelope")
+            .and_then(|v| v.as_str())
+            .map(String::from)
+            .ok_or_else(|| {
+                VerifyError::InclusionProof(
+                    "inclusion proof checkpoint object has no string `envelope` field".into(),
+                )
+            }),
+        other => Err(VerifyError::InclusionProof(format!(
+            "inclusion proof checkpoint is {} (expected string or {{\"envelope\":\"...\"}} object)",
+            json_value_kind(other)
+        ))),
+    }
+}
+
+/// Parsed and signature-verified checkpoint body. Trusted = the
+/// fields below were committed to by the Rekor signing key.
+struct TrustedCheckpoint {
+    tree_size: i64,
+    root_hash: Vec<u8>,
+}
+
+/// Verify a C2SP signed-note checkpoint against the pinned Rekor key.
+///
+/// Format (canonical signed-note, mirrored in
+/// `private/rekor-checkpoint-format.md`):
+/// ```text
+/// <origin>
+/// <tree_size>
+/// <root_hash_base64>
+/// <... optional extra body lines ...>
+///
+/// — <name> <base64(key_hint || signature)>
+/// ```
+///
+/// The signed bytes are the body (lines before the empty separator),
+/// terminated by `\n`. The signature is DER-encoded ECDSA over
+/// `sha256(body_bytes)`. The 4-byte key_hint prefix is informational
+/// — we look up the Rekor key by `logId` instead, so a wrong hint
+/// doesn't cause a false reject (a wrong signature still does).
+fn verify_checkpoint_signature(
+    envelope: &str,
+    rekor_key: &RekorKey,
+) -> Result<TrustedCheckpoint, VerifyError> {
+    let (text, sig_block) = envelope.split_once("\n\n").ok_or_else(|| {
+        VerifyError::InclusionProof(
+            "checkpoint envelope is missing the empty-line separator between body and signatures"
+                .into(),
+        )
+    })?;
+    let signed_bytes = format!("{text}\n");
+
+    let mut body_lines = text.lines();
+    let _origin = body_lines
+        .next()
+        .ok_or_else(|| VerifyError::InclusionProof("checkpoint body has no origin line".into()))?;
+    let tree_size_str = body_lines.next().ok_or_else(|| {
+        VerifyError::InclusionProof("checkpoint body has no tree-size line".into())
+    })?;
+    let root_hash_b64 = body_lines.next().ok_or_else(|| {
+        VerifyError::InclusionProof("checkpoint body has no root-hash line".into())
+    })?;
+
+    let tree_size: i64 = tree_size_str.trim().parse().map_err(|e| {
+        VerifyError::InclusionProof(format!(
+            "checkpoint body tree-size line `{tree_size_str}` is not a valid i64: {e}"
+        ))
+    })?;
+    let root_hash = BASE64
+        .decode(root_hash_b64.trim().as_bytes())
+        .map_err(|e| {
+            VerifyError::InclusionProof(format!(
+                "checkpoint body root-hash line `{root_hash_b64}` is not valid base64: {e}"
+            ))
+        })?;
+    if root_hash.len() != 32 {
+        return Err(VerifyError::InclusionProof(format!(
+            "checkpoint root hash is {} bytes (expected 32 for sha256)",
+            root_hash.len()
+        )));
+    }
+
+    let mut sig_lines = sig_block.lines().filter(|l| !l.is_empty());
+    let sig_line = sig_lines.next().ok_or_else(|| {
+        VerifyError::InclusionProof("checkpoint envelope has no signature line".into())
+    })?;
+
+    // Per C2SP signed-note: "— <name> <base64>" where the em-dash is
+    // U+2014 (UTF-8: E2 80 94). Strip prefix; the name doesn't gate
+    // verification (we look the key up by logId), but the base64
+    // value is what we need.
+    let rest = sig_line
+        .strip_prefix("\u{2014} ")
+        .or_else(|| sig_line.strip_prefix("- "))
+        .ok_or_else(|| {
+            VerifyError::InclusionProof(format!(
+                "checkpoint signature line does not start with `— ` (em-dash + space): `{sig_line}`"
+            ))
+        })?;
+    let (_name, b64) = rest.split_once(' ').ok_or_else(|| {
+        VerifyError::InclusionProof(format!(
+            "checkpoint signature line is missing the base64 signature component: `{sig_line}`"
+        ))
+    })?;
+    let key_hint_plus_sig = BASE64.decode(b64.trim().as_bytes()).map_err(|e| {
+        VerifyError::InclusionProof(format!("checkpoint signature base64 did not decode: {e}"))
+    })?;
+    if key_hint_plus_sig.len() < 4 {
+        return Err(VerifyError::InclusionProof(format!(
+            "checkpoint signature is {} bytes (expected at least 4 for the key-hint prefix)",
+            key_hint_plus_sig.len()
+        )));
+    }
+    let sig_bytes = &key_hint_plus_sig[4..];
+    let signature = Signature::from_der(sig_bytes).map_err(|e| {
+        VerifyError::InclusionProof(format!("checkpoint signature is not valid DER ECDSA: {e}"))
+    })?;
+
+    let verifying_key = p256_verifying_key_from_spki(&rekor_key.spki_der).map_err(|e| {
+        VerifyError::InclusionProof(format!(
+            "pinned Rekor key did not decode as ECDSA P-256 SPKI: {e}"
+        ))
+    })?;
+    let digest = Sha256::digest(signed_bytes.as_bytes());
+    verifying_key
+        .verify(digest.as_slice(), &signature)
+        .map_err(|e| {
+            VerifyError::InclusionProof(format!(
+                "checkpoint signature did not verify under the pinned Rekor key: {e}"
+            ))
+        })?;
+
+    Ok(TrustedCheckpoint {
+        tree_size,
+        root_hash,
+    })
+}
+
+/// Decode a 32-byte sha256 from either hex (Rekor canonical) or
+/// base64 (Sigstore Bundle spec). Rekor's HTTP response uses hex for
+/// the `rootHash` and `hashes` fields, but some bundle producers
+/// re-encode as base64. Accept both to avoid false-rejecting
+/// otherwise-valid bundles.
+fn decode_root_hash_hex_or_base64(s: &str) -> Result<Vec<u8>, String> {
+    if let Ok(bytes) = hex::decode(s) {
+        return Ok(bytes);
+    }
+    BASE64
+        .decode(s.as_bytes())
+        .map_err(|e| format!("not hex; not base64 ({e})"))
+}
+
+/// `MTH({d(0)}) = SHA-256(0x00 || d(0))` per RFC 6962 §2.1.
+fn rfc6962_leaf_hash(leaf_data: &[u8]) -> Vec<u8> {
+    let mut hasher = Sha256::new();
+    hasher.update([0x00_u8]);
+    hasher.update(leaf_data);
+    hasher.finalize().to_vec()
+}
+
+/// `MTH(D[n]) = SHA-256(0x01 || MTH(D[0:k]) || MTH(D[k:n]))` per
+/// RFC 6962 §2.1, hash combination only.
+fn rfc6962_hash_children(left: &[u8], right: &[u8]) -> Vec<u8> {
+    let mut hasher = Sha256::new();
+    hasher.update([0x01_u8]);
+    hasher.update(left);
+    hasher.update(right);
+    hasher.finalize().to_vec()
+}
+
+/// RFC 6962 §2.1.1 inclusion proof walker. Mirrors the canonical
+/// implementation in `sigstore/sigstore-go`'s `pkg/verify/tlog.go`
+/// and Trillian's reference Go code. Returns the computed root hash;
+/// the caller compares against the trusted (signed) root.
+///
+/// Algorithm:
+/// - `fn` is the leaf's index inside the tree
+/// - `sn` is the rightmost leaf index (`tree_size - 1`)
+/// - For each sibling hash in the proof:
+///   - If `fn` is odd OR `fn == sn` (i.e. we're a right child OR the
+///     "last leaf" at this level), the sibling is on the LEFT.
+///     Combine `sibling || current`, then walk up "right edges"
+///     until `fn` is no longer the rightmost.
+///   - Otherwise the sibling is on the RIGHT. Combine
+///     `current || sibling`.
+///   - Then halve both `fn` and `sn` (move up a level).
+/// - After the walk, expect `sn == 0` (we reached the root) and
+///   the proof to have been exactly the right arity.
+fn rfc6962_verify_inclusion(
+    leaf_index: u64,
+    tree_size: u64,
+    leaf_hash: &[u8],
+    proof: &[Vec<u8>],
+) -> Result<Vec<u8>, VerifyError> {
+    if leaf_index >= tree_size {
+        return Err(VerifyError::InclusionProof(format!(
+            "leaf_index={leaf_index} >= tree_size={tree_size}"
+        )));
+    }
+    if tree_size == 1 {
+        if !proof.is_empty() {
+            return Err(VerifyError::InclusionProof(format!(
+                "single-leaf tree expects an empty proof; got {} entries",
+                proof.len()
+            )));
+        }
+        return Ok(leaf_hash.to_vec());
+    }
+
+    let mut fn_: u64 = leaf_index;
+    let mut sn: u64 = tree_size - 1;
+    let mut r: Vec<u8> = leaf_hash.to_vec();
+    for sibling in proof {
+        if sn == 0 {
+            return Err(VerifyError::InclusionProof(
+                "inclusion proof contains more sibling hashes than the tree depth requires".into(),
+            ));
+        }
+        if fn_ & 1 == 1 || fn_ == sn {
+            r = rfc6962_hash_children(sibling, &r);
+            // Walk up the right-edge chain while `fn_` is even and
+            // non-zero (we're at a "last leaf" position climbing
+            // through multiple right edges).
+            while fn_ & 1 == 0 {
+                fn_ >>= 1;
+                sn >>= 1;
+            }
+        } else {
+            r = rfc6962_hash_children(&r, sibling);
+        }
+        fn_ >>= 1;
+        sn >>= 1;
+    }
+    if sn != 0 {
+        return Err(VerifyError::InclusionProof(format!(
+            "inclusion proof has too few sibling hashes; reached sn={sn} (expected 0)"
+        )));
+    }
+    Ok(r)
 }
 
 #[cfg(test)]
@@ -2637,6 +3064,490 @@ mod tests {
         match err {
             VerifyError::RekorSet(msg) => assert!(msg.contains("integratedTime"), "got: {msg}"),
             other => panic!("expected VerifyError::RekorSet, got: {other:?}"),
+        }
+    }
+
+    // ── verify_inclusion_proof — Phase 1.7 ────────────────────────
+
+    /// 4-leaf Merkle tree fixture. Returns
+    /// `(leaf_hashes[4], internal_hashes[h01, h23], root, leaf_data[4])`
+    /// so individual tests can construct inclusion proofs without
+    /// recomputing the tree.
+    #[allow(clippy::type_complexity)]
+    fn four_leaf_tree() -> (
+        [Vec<u8>; 4],
+        (Vec<u8>, Vec<u8>),
+        Vec<u8>,
+        [&'static [u8]; 4],
+    ) {
+        let leaves: [&[u8]; 4] = [b"leaf-a", b"leaf-b", b"leaf-c", b"leaf-d"];
+        let h0 = rfc6962_leaf_hash(leaves[0]);
+        let h1 = rfc6962_leaf_hash(leaves[1]);
+        let h2 = rfc6962_leaf_hash(leaves[2]);
+        let h3 = rfc6962_leaf_hash(leaves[3]);
+        let h01 = rfc6962_hash_children(&h0, &h1);
+        let h23 = rfc6962_hash_children(&h2, &h3);
+        let root = rfc6962_hash_children(&h01, &h23);
+        ([h0, h1, h2, h3], (h01, h23), root, leaves)
+    }
+
+    #[test]
+    fn rfc6962_inclusion_walk_matches_documented_algorithm_for_leaf_0_in_4leaf_tree() {
+        // Pin the algorithm against a hand-derivable test vector
+        // (see private/rekor-checkpoint-format.md). For leaf 0 in a
+        // 4-leaf tree, the inclusion proof is [h(b), h(cd)].
+        let ([h0, h1, _h2, _h3], (_h01, h23), root, _) = four_leaf_tree();
+        let proof = vec![h1, h23];
+        let computed = rfc6962_verify_inclusion(0, 4, &h0, &proof)
+            .expect("known-good inclusion proof must walk to the root");
+        assert_eq!(
+            computed, root,
+            "RFC 6962 walker drifted — see private/rekor-checkpoint-format.md"
+        );
+    }
+
+    #[test]
+    fn rfc6962_inclusion_walk_matches_documented_algorithm_for_leaf_2_in_4leaf_tree() {
+        // For leaf 2 in a 4-leaf tree, proof is [h(d), h(ab)].
+        // Exercises the right-child branch + the "walk up while
+        // fn is odd" combination.
+        let ([_h0, _h1, h2, h3], (h01, _h23), root, _) = four_leaf_tree();
+        let proof = vec![h3, h01];
+        let computed = rfc6962_verify_inclusion(2, 4, &h2, &proof).unwrap();
+        assert_eq!(computed, root);
+    }
+
+    #[test]
+    fn rfc6962_inclusion_walk_matches_documented_algorithm_for_leaf_3_in_4leaf_tree() {
+        // Leaf 3: proof is [h(c), h(ab)]. Last-leaf in this subtree
+        // exercises the `fn == sn` branch.
+        let ([_h0, _h1, h2, h3], (h01, _h23), root, _) = four_leaf_tree();
+        let proof = vec![h2, h01];
+        let computed = rfc6962_verify_inclusion(3, 4, &h3, &proof).unwrap();
+        assert_eq!(computed, root);
+    }
+
+    #[test]
+    fn rfc6962_inclusion_walk_rejects_proof_with_flipped_sibling() {
+        let ([h0, h1, _h2, _h3], (_h01, h23), root, _) = four_leaf_tree();
+        // Flip one byte in the first sibling — walked root mismatches.
+        let mut tampered = h1.clone();
+        tampered[0] ^= 0x01;
+        let proof = vec![tampered, h23];
+        let computed = rfc6962_verify_inclusion(0, 4, &h0, &proof).unwrap();
+        assert_ne!(
+            computed, root,
+            "tampered sibling must produce a different walked root"
+        );
+    }
+
+    #[test]
+    fn rfc6962_inclusion_walk_single_leaf_tree_returns_leaf_hash() {
+        let leaf_data = b"only-leaf";
+        let leaf_hash = rfc6962_leaf_hash(leaf_data);
+        let computed = rfc6962_verify_inclusion(0, 1, &leaf_hash, &[]).unwrap();
+        assert_eq!(
+            computed, leaf_hash,
+            "single-leaf tree's root IS the leaf hash"
+        );
+    }
+
+    #[test]
+    fn rfc6962_inclusion_walk_rejects_leaf_index_out_of_range() {
+        let leaf_hash = rfc6962_leaf_hash(b"l");
+        let err = rfc6962_verify_inclusion(5, 4, &leaf_hash, &[])
+            .expect_err("leaf_index >= tree_size is structurally impossible");
+        match err {
+            VerifyError::InclusionProof(msg) => assert!(msg.contains("leaf_index")),
+            other => panic!("expected InclusionProof, got: {other:?}"),
+        }
+    }
+
+    /// Build a C2SP signed-note checkpoint envelope signed by
+    /// `signing_key` over `(origin, tree_size, root_hash_bytes)`.
+    /// The signature line uses the origin's first whitespace-delimited
+    /// token as the signer name — matches Rekor's actual format
+    /// (origin "rekor.sigstore.dev - 12345" → sig name "rekor.sigstore.dev").
+    fn build_signed_checkpoint(
+        signing_key: &SigningKey,
+        origin: &str,
+        tree_size: i64,
+        root_hash: &[u8],
+    ) -> String {
+        let body = format!("{origin}\n{tree_size}\n{}\n", BASE64.encode(root_hash));
+        let digest = Sha256::digest(body.as_bytes());
+        let sig: Signature = signing_key.sign(&digest);
+        // 4-byte key-hint prefix (informational; we don't verify it).
+        let mut key_hint_plus_sig = vec![0u8; 4];
+        key_hint_plus_sig.extend_from_slice(sig.to_der().as_bytes());
+        let sig_b64 = BASE64.encode(&key_hint_plus_sig);
+        let sig_name = origin.split_whitespace().next().unwrap_or(origin);
+        format!("{body}\n\u{2014} {sig_name} {sig_b64}\n")
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn synth_tlog_entry_with_inclusion_proof(
+        log_id_hex: &str,
+        log_index: i64,
+        integrated_time_secs: i64,
+        canonicalized_body_b64: &str,
+        checkpoint_envelope: String,
+        sibling_hashes_hex: Vec<String>,
+        root_hash_hex: &str,
+        tree_size: i64,
+    ) -> crate::sigstore::TlogEntry {
+        crate::sigstore::TlogEntry {
+            log_index: log_index.to_string(),
+            log_id: crate::sigstore::LogId {
+                key_id: log_id_hex.to_string(),
+            },
+            integrated_time: integrated_time_secs.to_string(),
+            inclusion_promise: None,
+            inclusion_proof: Some(crate::sigstore::RekorInclusionProof {
+                checkpoint: serde_json::Value::String(checkpoint_envelope),
+                hashes: sibling_hashes_hex,
+                log_index,
+                root_hash: root_hash_hex.to_string(),
+                tree_size,
+            }),
+            verification: None,
+            canonicalized_body: canonicalized_body_b64.to_string(),
+        }
+    }
+
+    #[test]
+    fn verifies_valid_inclusion_proof_for_4leaf_tree_leaf_0() {
+        let (signing_key, spki_der, log_id_bytes) = p256_rekor_signing_key();
+        let log_id_hex = hex::encode(&log_id_bytes);
+        let integrated_time = 1700000000_i64;
+        let ([_h0, h1, _h2, _h3], (_h01, h23), root, leaves) = four_leaf_tree();
+        let body_b64 = BASE64.encode(leaves[0]);
+
+        let checkpoint = build_signed_checkpoint(&signing_key, "rekor.sigstore.dev - 1", 4, &root);
+        let tlog = synth_tlog_entry_with_inclusion_proof(
+            &log_id_hex,
+            0,
+            integrated_time,
+            &body_b64,
+            checkpoint,
+            vec![hex::encode(&h1), hex::encode(&h23)],
+            &hex::encode(&root),
+            4,
+        );
+        let key = rekor_key_active_around(log_id_bytes, spki_der, integrated_time);
+        verify_inclusion_proof(&tlog, std::slice::from_ref(&key))
+            .expect("LPM-canonical inclusion proof for leaf 0 must verify");
+    }
+
+    #[test]
+    fn rejects_inclusion_proof_with_tampered_leaf_body() {
+        // Bundle's canonicalized_body doesn't match the leaf hash
+        // the proof was built for — Merkle walk reaches a different
+        // root than the signed one.
+        let (signing_key, spki_der, log_id_bytes) = p256_rekor_signing_key();
+        let log_id_hex = hex::encode(&log_id_bytes);
+        let integrated_time = 1700000000_i64;
+        let ([_h0, h1, _h2, _h3], (_h01, h23), root, _leaves) = four_leaf_tree();
+        let checkpoint = build_signed_checkpoint(&signing_key, "rekor.sigstore.dev - 1", 4, &root);
+        let tlog = synth_tlog_entry_with_inclusion_proof(
+            &log_id_hex,
+            0,
+            integrated_time,
+            &BASE64.encode(b"NOT-the-leaf-we-proved"),
+            checkpoint,
+            vec![hex::encode(&h1), hex::encode(&h23)],
+            &hex::encode(&root),
+            4,
+        );
+        let key = rekor_key_active_around(log_id_bytes, spki_der, integrated_time);
+        let err = verify_inclusion_proof(&tlog, std::slice::from_ref(&key))
+            .expect_err("tampered leaf body must produce a Merkle root mismatch");
+        match err {
+            VerifyError::InclusionProof(msg) => assert!(
+                msg.contains("does not match signed checkpoint root"),
+                "expected Merkle root mismatch diagnostic, got: {msg}"
+            ),
+            other => panic!("expected InclusionProof, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_inclusion_proof_with_forged_checkpoint_signature() {
+        let (_signing_key_real, spki_der, log_id_bytes) = p256_rekor_signing_key();
+        let log_id_hex = hex::encode(&log_id_bytes);
+        let integrated_time = 1700000000_i64;
+        let ([_h0, h1, _h2, _h3], (_h01, h23), root, leaves) = four_leaf_tree();
+        // Sign with a DIFFERENT key than the pinned one.
+        let (signing_key_forge, _, _) = p256_rekor_signing_key();
+        let checkpoint =
+            build_signed_checkpoint(&signing_key_forge, "rekor.sigstore.dev - 1", 4, &root);
+        let tlog = synth_tlog_entry_with_inclusion_proof(
+            &log_id_hex,
+            0,
+            integrated_time,
+            &BASE64.encode(leaves[0]),
+            checkpoint,
+            vec![hex::encode(&h1), hex::encode(&h23)],
+            &hex::encode(&root),
+            4,
+        );
+        let key = rekor_key_active_around(log_id_bytes, spki_der, integrated_time);
+        let err = verify_inclusion_proof(&tlog, std::slice::from_ref(&key))
+            .expect_err("checkpoint signed by a different key must fail");
+        match err {
+            VerifyError::InclusionProof(msg) => assert!(
+                msg.contains("signature did not verify"),
+                "expected checkpoint-sig diagnostic, got: {msg}"
+            ),
+            other => panic!("expected InclusionProof, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_inclusion_proof_with_tree_size_mismatch() {
+        let (signing_key, spki_der, log_id_bytes) = p256_rekor_signing_key();
+        let log_id_hex = hex::encode(&log_id_bytes);
+        let integrated_time = 1700000000_i64;
+        let ([_h0, h1, _h2, _h3], (_h01, h23), root, leaves) = four_leaf_tree();
+        // Checkpoint commits to tree_size=4, bundle says tree_size=8.
+        let checkpoint = build_signed_checkpoint(&signing_key, "rekor.sigstore.dev - 1", 4, &root);
+        let tlog = synth_tlog_entry_with_inclusion_proof(
+            &log_id_hex,
+            0,
+            integrated_time,
+            &BASE64.encode(leaves[0]),
+            checkpoint,
+            vec![hex::encode(&h1), hex::encode(&h23)],
+            &hex::encode(&root),
+            8, // disagrees with the signed checkpoint's 4
+        );
+        let key = rekor_key_active_around(log_id_bytes, spki_der, integrated_time);
+        let err = verify_inclusion_proof(&tlog, std::slice::from_ref(&key))
+            .expect_err("tree_size disagreement must reject before Merkle walk");
+        match err {
+            VerifyError::InclusionProof(msg) => assert!(
+                msg.contains("tree_size"),
+                "expected tree_size diagnostic, got: {msg}"
+            ),
+            other => panic!("expected InclusionProof, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_inclusion_proof_with_root_hash_mismatch_with_checkpoint() {
+        let (signing_key, spki_der, log_id_bytes) = p256_rekor_signing_key();
+        let log_id_hex = hex::encode(&log_id_bytes);
+        let integrated_time = 1700000000_i64;
+        let ([_h0, h1, _h2, _h3], (_h01, h23), root, leaves) = four_leaf_tree();
+        // Bundle declares a different root than the checkpoint signs.
+        let checkpoint = build_signed_checkpoint(&signing_key, "rekor.sigstore.dev - 1", 4, &root);
+        let bogus_root = vec![0xab_u8; 32];
+        let tlog = synth_tlog_entry_with_inclusion_proof(
+            &log_id_hex,
+            0,
+            integrated_time,
+            &BASE64.encode(leaves[0]),
+            checkpoint,
+            vec![hex::encode(&h1), hex::encode(&h23)],
+            &hex::encode(&bogus_root),
+            4,
+        );
+        let key = rekor_key_active_around(log_id_bytes, spki_der, integrated_time);
+        let err = verify_inclusion_proof(&tlog, std::slice::from_ref(&key))
+            .expect_err("root_hash disagreement must reject");
+        match err {
+            VerifyError::InclusionProof(msg) => assert!(
+                msg.contains("root_hash"),
+                "expected root_hash diagnostic, got: {msg}"
+            ),
+            other => panic!("expected InclusionProof, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_inclusion_proof_with_log_index_at_or_past_tree_size() {
+        let (signing_key, spki_der, log_id_bytes) = p256_rekor_signing_key();
+        let log_id_hex = hex::encode(&log_id_bytes);
+        let integrated_time = 1700000000_i64;
+        let ([_h0, h1, _h2, _h3], (_h01, h23), root, leaves) = four_leaf_tree();
+        let checkpoint = build_signed_checkpoint(&signing_key, "rekor.sigstore.dev - 1", 4, &root);
+        let tlog = synth_tlog_entry_with_inclusion_proof(
+            &log_id_hex,
+            4, // log_index == tree_size; structurally impossible
+            integrated_time,
+            &BASE64.encode(leaves[0]),
+            checkpoint,
+            vec![hex::encode(&h1), hex::encode(&h23)],
+            &hex::encode(&root),
+            4,
+        );
+        let key = rekor_key_active_around(log_id_bytes, spki_der, integrated_time);
+        let err = verify_inclusion_proof(&tlog, std::slice::from_ref(&key))
+            .expect_err("log_index >= tree_size must reject as structurally impossible");
+        match err {
+            VerifyError::InclusionProof(msg) => assert!(
+                msg.contains("log_index"),
+                "expected log_index diagnostic, got: {msg}"
+            ),
+            other => panic!("expected InclusionProof, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_missing_inclusion_proof_with_inclusion_proof_missing_variant() {
+        let tlog = crate::sigstore::TlogEntry {
+            log_index: "0".into(),
+            log_id: crate::sigstore::LogId {
+                key_id: String::new(),
+            },
+            integrated_time: "1700000000".into(),
+            inclusion_promise: None,
+            inclusion_proof: None,
+            verification: None,
+            canonicalized_body: String::new(),
+        };
+        let err = verify_inclusion_proof(&tlog, &[])
+            .expect_err("missing inclusion proof must surface the dedicated missing variant");
+        assert!(matches!(err, VerifyError::InclusionProofMissing));
+    }
+
+    #[test]
+    fn verifies_inclusion_proof_when_checkpoint_is_object_with_envelope_field() {
+        // Sigstore Bundle v0.3 spec shape: checkpoint is an object
+        // `{ "envelope": "..." }` rather than a bare string. Verifier
+        // accepts both via extract_checkpoint_envelope; pin that path.
+        let (signing_key, spki_der, log_id_bytes) = p256_rekor_signing_key();
+        let log_id_hex = hex::encode(&log_id_bytes);
+        let integrated_time = 1700000000_i64;
+        let ([_h0, h1, _h2, _h3], (_h01, h23), root, leaves) = four_leaf_tree();
+        let envelope = build_signed_checkpoint(&signing_key, "rekor.sigstore.dev - 1", 4, &root);
+
+        let mut tlog = crate::sigstore::TlogEntry {
+            log_index: "0".into(),
+            log_id: crate::sigstore::LogId { key_id: log_id_hex },
+            integrated_time: integrated_time.to_string(),
+            inclusion_promise: None,
+            inclusion_proof: Some(crate::sigstore::RekorInclusionProof {
+                checkpoint: serde_json::json!({"envelope": envelope}),
+                hashes: vec![hex::encode(&h1), hex::encode(&h23)],
+                log_index: 0,
+                root_hash: hex::encode(&root),
+                tree_size: 4,
+            }),
+            verification: None,
+            canonicalized_body: BASE64.encode(leaves[0]),
+        };
+        let key = rekor_key_active_around(log_id_bytes, spki_der, integrated_time);
+        verify_inclusion_proof(&tlog, std::slice::from_ref(&key))
+            .expect("Bundle v0.3 object-shape checkpoint must verify");
+
+        // Belt-and-suspenders: malformed checkpoint object → rejection.
+        tlog.inclusion_proof.as_mut().unwrap().checkpoint =
+            serde_json::json!({"not-envelope": "oops"});
+        let err = verify_inclusion_proof(&tlog, std::slice::from_ref(&key))
+            .expect_err("object-shape without `envelope` string must reject");
+        match err {
+            VerifyError::InclusionProof(msg) => assert!(
+                msg.contains("envelope"),
+                "expected envelope-shape diagnostic, got: {msg}"
+            ),
+            other => panic!("expected InclusionProof, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn verifies_inclusion_proof_via_legacy_verification_envelope_fallback() {
+        // A bundle whose inclusion proof was captured from Rekor's
+        // API response (nested under `verification.inclusionProof`)
+        // must still verify via resolved_inclusion_proof()'s
+        // fallback chain.
+        let (signing_key, spki_der, log_id_bytes) = p256_rekor_signing_key();
+        let log_id_hex = hex::encode(&log_id_bytes);
+        let integrated_time = 1700000000_i64;
+        let ([_h0, h1, _h2, _h3], (_h01, h23), root, leaves) = four_leaf_tree();
+        let envelope = build_signed_checkpoint(&signing_key, "rekor.sigstore.dev - 1", 4, &root);
+        let proof = crate::sigstore::RekorInclusionProof {
+            checkpoint: serde_json::Value::String(envelope),
+            hashes: vec![hex::encode(&h1), hex::encode(&h23)],
+            log_index: 0,
+            root_hash: hex::encode(&root),
+            tree_size: 4,
+        };
+        let tlog = crate::sigstore::TlogEntry {
+            log_index: "0".into(),
+            log_id: crate::sigstore::LogId { key_id: log_id_hex },
+            integrated_time: integrated_time.to_string(),
+            inclusion_promise: None,
+            inclusion_proof: None, // top-level absent
+            verification: Some(crate::sigstore::RekorVerification {
+                inclusion_promise: None,
+                inclusion_proof: Some(proof),
+            }),
+            canonicalized_body: BASE64.encode(leaves[0]),
+        };
+        let key = rekor_key_active_around(log_id_bytes, spki_der, integrated_time);
+        verify_inclusion_proof(&tlog, std::slice::from_ref(&key))
+            .expect("legacy-nested inclusion proof must verify via fallback");
+    }
+
+    #[test]
+    fn rejects_inclusion_proof_with_malformed_checkpoint_envelope() {
+        let (_signing_key, spki_der, log_id_bytes) = p256_rekor_signing_key();
+        let log_id_hex = hex::encode(&log_id_bytes);
+        let integrated_time = 1700000000_i64;
+        let ([_h0, h1, _h2, _h3], (_h01, h23), root, leaves) = four_leaf_tree();
+        // Checkpoint has no empty-line separator — malformed.
+        let tlog = synth_tlog_entry_with_inclusion_proof(
+            &log_id_hex,
+            0,
+            integrated_time,
+            &BASE64.encode(leaves[0]),
+            "no separator anywhere".to_string(),
+            vec![hex::encode(&h1), hex::encode(&h23)],
+            &hex::encode(&root),
+            4,
+        );
+        let key = rekor_key_active_around(log_id_bytes, spki_der, integrated_time);
+        let err = verify_inclusion_proof(&tlog, std::slice::from_ref(&key))
+            .expect_err("malformed checkpoint envelope must reject");
+        match err {
+            VerifyError::InclusionProof(msg) => assert!(
+                msg.contains("separator") || msg.contains("envelope"),
+                "expected envelope-parse diagnostic, got: {msg}"
+            ),
+            other => panic!("expected InclusionProof, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_inclusion_proof_with_wrong_pinned_rekor_key_for_log_id() {
+        let (signing_key, _spki_der, log_id_bytes) = p256_rekor_signing_key();
+        let log_id_hex = hex::encode(&log_id_bytes);
+        let integrated_time = 1700000000_i64;
+        let ([_h0, h1, _h2, _h3], (_h01, h23), root, leaves) = four_leaf_tree();
+        let checkpoint = build_signed_checkpoint(&signing_key, "rekor.sigstore.dev - 1", 4, &root);
+        let tlog = synth_tlog_entry_with_inclusion_proof(
+            &log_id_hex,
+            0,
+            integrated_time,
+            &BASE64.encode(leaves[0]),
+            checkpoint,
+            vec![hex::encode(&h1), hex::encode(&h23)],
+            &hex::encode(&root),
+            4,
+        );
+        // Pin a DIFFERENT key (different log_id_bytes), so the lookup
+        // by log_id fails → no pinned key for the entry's logID.
+        let (_, other_spki, other_log_id) = p256_rekor_signing_key();
+        let other_key = rekor_key_active_around(other_log_id, other_spki, integrated_time);
+        let err = verify_inclusion_proof(&tlog, std::slice::from_ref(&other_key))
+            .expect_err("logId without a pinned key must reject");
+        match err {
+            VerifyError::InclusionProof(msg) => assert!(
+                msg.contains("no pinned Rekor key"),
+                "expected unknown-logId diagnostic, got: {msg}"
+            ),
+            other => panic!("expected InclusionProof, got: {other:?}"),
         }
     }
 
