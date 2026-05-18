@@ -496,6 +496,10 @@ fn prepare_locked(root: &LpmRoot, resolved: &ResolvedSpec) -> Result<PrepResult,
         // flags. prepare_locked runs before marker discovery, so
         // no collisions are known yet — empty delta here is correct.
         ownership_delta: Vec::new(),
+        // Install never prunes trust — empty here serializes away via
+        // `skip_serializing_if`, so the on-disk WAL shape stays byte-
+        // identical to pre-M76.
+        uninstall_trust_prune: Vec::new(),
     })))?;
 
     manifest.pending.insert(
@@ -853,6 +857,8 @@ fn commit_locked(
         prior_command_ownership_json: serde_json::json!({}),
         new_aliases_json,
         ownership_delta: plan.ownership_delta.clone(),
+        // Install never prunes trust — see comment at prepare_locked.
+        uninstall_trust_prune: Vec::new(),
     })))?;
 
     // ─── Emit / remove shims per the plan ─────────────────────────
@@ -3369,6 +3375,7 @@ mod tests {
             prior_command_ownership_json: serde_json::json!({}),
             new_aliases_json: serde_json::json!({}),
             ownership_delta: Vec::new(),
+            uninstall_trust_prune: Vec::new(),
         })))
         .unwrap();
         drop(wal);
@@ -3462,6 +3469,7 @@ mod tests {
             prior_command_ownership_json: serde_json::json!({}),
             new_aliases_json: serde_json::json!({}),
             ownership_delta: Vec::new(),
+            uninstall_trust_prune: Vec::new(),
         })))
         .unwrap();
         drop(wal);

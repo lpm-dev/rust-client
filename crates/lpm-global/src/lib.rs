@@ -46,6 +46,6 @@ pub use trusted_deps::{
     rich_key as global_trust_key,
 };
 pub use wal::{
-    IntentPayload, OwnershipChange, ScanStop, TxKind, WalError, WalReader, WalRecord, WalScan,
-    WalWriter,
+    IntentPayload, OwnershipChange, ScanStop, TrustPruneEntry, TxKind, WalError, WalReader,
+    WalRecord, WalScan, WalWriter,
 };

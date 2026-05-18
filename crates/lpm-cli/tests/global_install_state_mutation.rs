@@ -101,6 +101,7 @@ fn install_intent(tx_id: &str, package: &str, new_root: &Path, root_relative: &s
         prior_command_ownership_json: serde_json::json!({}),
         new_aliases_json: serde_json::json!({}),
         ownership_delta: Vec::new(),
+        uninstall_trust_prune: Vec::new(),
     }))
 }
 

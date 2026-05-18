@@ -672,6 +672,9 @@ fn prepare_upgrade_locked(root: &LpmRoot, prep: &UpgradePrep) -> Result<StagedUp
         // owning the same commands, so
         // `find_command_collisions` never triggers non-self hits.
         ownership_delta: Vec::new(),
+        // Upgrade preserves trust (same package, same name@version semantics
+        // through the existing trust-binding drift gate). No prune.
+        uninstall_trust_prune: Vec::new(),
     })))?;
 
     manifest.pending.insert(

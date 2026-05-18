@@ -237,6 +237,26 @@ impl GlobalTrustedDependencies {
     pub fn remove(&mut self, name: &str, version: &str) -> bool {
         self.trusted.remove(&rich_key(name, version)).is_some()
     }
+
+    /// Bulk-remove trust bindings. Returns the count of entries that
+    /// were actually present and removed (entries that weren't in the
+    /// map are silently skipped — idempotent).
+    ///
+    /// Used by the uninstall path's M76 trust-prune step + recovery's
+    /// `roll_forward_uninstall` replay. Both consume an
+    /// `uninstall_trust_prune: Vec<TrustPruneEntry>` set computed
+    /// against the uninstalling install's reachable tree, and apply
+    /// it via this helper for atomic transaction shape (one
+    /// read-modify-write under `.tx.lock`).
+    pub fn remove_many(&mut self, entries: &[(&str, &str)]) -> usize {
+        let mut removed = 0usize;
+        for (name, version) in entries {
+            if self.remove(name, version) {
+                removed += 1;
+            }
+        }
+        removed
+    }
 }
 
 /// Read the global trusted-deps file. Missing file is NOT an error —
@@ -521,6 +541,50 @@ mod tests {
     fn remove_returns_false_for_missing_entry() {
         let mut gtd = GlobalTrustedDependencies::default();
         assert!(!gtd.remove("ghost", "1.0.0"));
+    }
+
+    /// M76: bulk-prune helper drops only the listed entries and
+    /// returns the count actually removed. Pin both the selectivity
+    /// (other entries survive) and the count contract so the
+    /// uninstall envelope's `trust_entries_pruned` field stays
+    /// honest.
+    #[test]
+    fn remove_many_drops_only_listed_entries_returns_count() {
+        let mut gtd = GlobalTrustedDependencies::default();
+        gtd.insert_strict("a", "1.0.0", None, None);
+        gtd.insert_strict("b", "2.0.0", None, None);
+        gtd.insert_strict("c", "3.0.0", None, None);
+        let removed = gtd.remove_many(&[("a", "1.0.0"), ("c", "3.0.0")]);
+        assert_eq!(removed, 2);
+        assert!(!gtd.trusted.contains_key("a@1.0.0"));
+        assert!(gtd.trusted.contains_key("b@2.0.0"));
+        assert!(!gtd.trusted.contains_key("c@3.0.0"));
+    }
+
+    /// M76: recovery may replay the prune after a successful
+    /// in-tx prune; the second invocation must be a no-op (count = 0)
+    /// rather than an error. Same shape as the existing
+    /// [`Self::remove`] idempotency contract.
+    #[test]
+    fn remove_many_is_idempotent_for_absent_entries() {
+        let mut gtd = GlobalTrustedDependencies::default();
+        gtd.insert_strict("a", "1.0.0", None, None);
+        // First call drops the present entry.
+        assert_eq!(gtd.remove_many(&[("a", "1.0.0"), ("ghost", "9.9.9")]), 1);
+        // Second call finds nothing — returns 0, doesn't error.
+        assert_eq!(gtd.remove_many(&[("a", "1.0.0"), ("ghost", "9.9.9")]), 0);
+        assert!(gtd.trusted.is_empty());
+    }
+
+    /// M76: empty input must be safe (no-op, count = 0). Recovery's
+    /// replay path passes whatever the Intent stored, which is empty
+    /// for installs and upgrades — the common case must not panic.
+    #[test]
+    fn remove_many_empty_input_returns_zero() {
+        let mut gtd = GlobalTrustedDependencies::default();
+        gtd.insert_strict("a", "1.0.0", None, None);
+        assert_eq!(gtd.remove_many(&[]), 0);
+        assert_eq!(gtd.trusted.len(), 1);
     }
 
     #[test]

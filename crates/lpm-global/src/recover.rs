@@ -771,6 +771,36 @@ fn roll_forward_uninstall(
         return Ok(ReconciliationOutcome::Deferred { reason });
     }
 
+    // 2b. Replay the host-global trust prune (M76).
+    //
+    // The Intent carries the prune set computed at uninstall time.
+    // `remove_many` is idempotent: a crash AFTER the original tx
+    // pruned re-enters recovery and replays here as a no-op (count
+    // = 0). A crash BEFORE the original tx pruned executes the
+    // prune for the first time here. Either way the end state is
+    // identical.
+    //
+    // Empty prune (older WAL files predating M76, OR installs/
+    // upgrades that don't prune anything, OR the conservative
+    // fail-safe at uninstall time) is a no-op — we don't even
+    // open the trust file.
+    if !intent.uninstall_trust_prune.is_empty() {
+        let mut trust = crate::trusted_deps::read_for(root)?;
+        let prune_pairs: Vec<(&str, &str)> = intent
+            .uninstall_trust_prune
+            .iter()
+            .map(|e| (e.name.as_str(), e.version.as_str()))
+            .collect();
+        let removed = trust.remove_many(&prune_pairs);
+        if removed > 0 {
+            crate::trusted_deps::write_for(root, &trust)?;
+            tracing::info!(
+                "recover: replayed uninstall trust-prune for '{}' — {removed} entries removed",
+                intent.package
+            );
+        }
+    }
+
     // 3. Drop the manifest row (idempotent) + any alias rows owned by
     //    this package (defensive — the original tx removed them, but
     //    re-running is safe).
@@ -1402,7 +1432,7 @@ mod tests {
     use super::*;
     use crate::install_root::{InstallReadyMarker, write_marker};
     use crate::manifest::{PackageSource, write_for};
-    use crate::wal::TxKind;
+    use crate::wal::{TrustPruneEntry, TxKind};
     use std::path::{Path, PathBuf};
     use tempfile::TempDir;
 
@@ -1452,6 +1482,7 @@ mod tests {
             prior_command_ownership_json: serde_json::json!({}),
             new_aliases_json: serde_json::json!({}),
             ownership_delta: Vec::new(),
+            uninstall_trust_prune: Vec::new(),
         }))
     }
 
@@ -1685,6 +1716,7 @@ mod tests {
             prior_command_ownership_json: serde_json::json!({}),
             new_aliases_json: serde_json::json!({}),
             ownership_delta: Vec::new(),
+            uninstall_trust_prune: Vec::new(),
         }))
     }
 
@@ -1799,6 +1831,7 @@ mod tests {
             prior_command_ownership_json: serde_json::json!({}),
             new_aliases_json: serde_json::json!({}),
             ownership_delta: Vec::new(),
+            uninstall_trust_prune: Vec::new(),
         }));
         let mut w = WalWriter::open(root.global_wal()).unwrap();
         w.append(&intent).unwrap();
@@ -1862,6 +1895,7 @@ mod tests {
             prior_command_ownership_json: serde_json::json!({}),
             new_aliases_json: serde_json::json!({}),
             ownership_delta: Vec::new(),
+            uninstall_trust_prune: Vec::new(),
         }));
         let mut w = WalWriter::open(root.global_wal()).unwrap();
         w.append(&intent).unwrap();
@@ -1926,6 +1960,7 @@ mod tests {
             prior_command_ownership_json: serde_json::json!({}),
             new_aliases_json: serde_json::json!({}),
             ownership_delta: Vec::new(),
+            uninstall_trust_prune: Vec::new(),
         }));
         let mut w = WalWriter::open(root.global_wal()).unwrap();
         w.append(&intent).unwrap();
@@ -2041,6 +2076,7 @@ mod tests {
             }),
             new_aliases_json: serde_json::Value::Null,
             ownership_delta: Vec::new(),
+            uninstall_trust_prune: Vec::new(),
         }))
     }
 
@@ -2437,6 +2473,7 @@ mod tests {
                 from_package: "http-server".into(),
                 from_row_snapshot: displaced_row,
             }],
+            uninstall_trust_prune: Vec::new(),
         }));
         let mut w = WalWriter::open(root.global_wal()).unwrap();
         w.append(&intent).unwrap();
@@ -2531,6 +2568,7 @@ mod tests {
                 package: "foo".into(),
                 bin: "serve".into(),
             }],
+            uninstall_trust_prune: Vec::new(),
         }));
         let mut w = WalWriter::open(root.global_wal()).unwrap();
         w.append(&intent).unwrap();
@@ -2645,6 +2683,7 @@ mod tests {
                 from_package: "http-server".into(),
                 from_row_snapshot: displaced_row,
             }],
+            uninstall_trust_prune: Vec::new(),
         }));
         let mut w = WalWriter::open(root.global_wal()).unwrap();
         w.append(&intent).unwrap();
@@ -2734,6 +2773,7 @@ mod tests {
             prior_command_ownership_json: serde_json::json!({}),
             new_aliases_json: serde_json::json!({}),
             ownership_delta: Vec::new(),
+            uninstall_trust_prune: Vec::new(),
         }));
         let mut w = WalWriter::open(root.global_wal()).unwrap();
         w.append(&intent).unwrap();
@@ -2984,6 +3024,7 @@ mod tests {
                 "safe-name": {"package": "foo", "bin": "dangerous"}
             }),
             ownership_delta: Vec::new(),
+            uninstall_trust_prune: Vec::new(),
         }));
         let mut w = WalWriter::open(root.global_wal()).unwrap();
         w.append(&intent).unwrap();
@@ -3108,6 +3149,7 @@ mod tests {
                 "pkg2": {"package": "pkg", "bin": "pkg"}
             }),
             ownership_delta: Vec::new(),
+            uninstall_trust_prune: Vec::new(),
         }));
 
         let mut w = WalWriter::open(root.global_wal()).unwrap();
@@ -3404,6 +3446,7 @@ mod tests {
                     bin: "serve".into(),
                 },
             ],
+            uninstall_trust_prune: Vec::new(),
         };
         let json = serde_json::to_vec(&payload).unwrap();
         let parsed: IntentPayload = serde_json::from_slice(&json).unwrap();
@@ -3542,5 +3585,121 @@ mod tests {
         );
         assert_eq!(m.aliases.get("srv"), before.aliases.get("srv"));
         assert!(!m.aliases.contains_key("foo-lint"));
+    }
+
+    // ── M76: roll-forward replays the host-global trust prune ────────
+
+    /// Crash recovery for an uninstall transaction must replay the
+    /// `uninstall_trust_prune` entries that were planned at uninstall
+    /// time. Seed the WAL with an Intent carrying a populated prune
+    /// set + a trust file containing those entries, then run recovery
+    /// and assert the entries are gone, the manifest is at the post-
+    /// uninstall state, and a Commit was appended.
+    ///
+    /// Pre-fix the recovery path would replay every uninstall step
+    /// EXCEPT the trust prune, so a crash between in-tx prune (which
+    /// happens BEFORE manifest write) and the WAL Commit could leave
+    /// a stale trust entry behind on the next `lpm` invocation.
+    #[test]
+    fn roll_forward_uninstall_replays_trust_prune() {
+        let tmp = TempDir::new().unwrap();
+        let root = LpmRoot::from_dir(tmp.path());
+
+        // Seed: package "pkga" present in manifest, install root
+        // on disk, trust file contains lodash@4.17.21.
+        let install_root = root.install_root_for("pkga", "1.0.0");
+        std::fs::create_dir_all(&install_root).unwrap();
+        let mut manifest = GlobalManifest::default();
+        manifest.packages.insert(
+            "pkga".into(),
+            crate::PackageEntry {
+                saved_spec: "^1".into(),
+                resolved: "1.0.0".into(),
+                integrity: "sha512-x".into(),
+                source: crate::PackageSource::LpmDev,
+                installed_at: Utc::now(),
+                root: "installs/pkga@1.0.0".into(),
+                commands: vec![],
+            },
+        );
+        write_for(&root, &manifest).unwrap();
+        let mut trust = crate::trusted_deps::GlobalTrustedDependencies::default();
+        trust.insert_strict(
+            "lodash",
+            "4.17.21",
+            Some("sha512-l".into()),
+            Some("sha256-s".into()),
+        );
+        crate::trusted_deps::write_for(&root, &trust).unwrap();
+
+        // Write an Uninstall Intent WITHOUT a Commit — simulates a
+        // crash after Intent and before the prune+manifest steps.
+        let mut wal = WalWriter::open(root.global_wal()).unwrap();
+        wal.append(&WalRecord::Intent(Box::new(IntentPayload {
+            tx_id: "tx-m76-recover".into(),
+            kind: TxKind::Uninstall,
+            package: "pkga".into(),
+            new_root_path: install_root.clone(),
+            new_row_json: serde_json::Value::Null,
+            prior_active_row_json: Some(serde_json::json!({
+                "saved_spec": "^1",
+                "resolved": "1.0.0",
+                "integrity": "sha512-x",
+                "source": "lpm-dev",
+                "installed_at": "2026-04-22T00:00:00Z",
+                "root": "installs/pkga@1.0.0",
+                "commands": [],
+            })),
+            prior_command_ownership_json: serde_json::json!({"aliases": {}}),
+            new_aliases_json: serde_json::Value::Null,
+            ownership_delta: Vec::new(),
+            uninstall_trust_prune: vec![TrustPruneEntry {
+                name: "lodash".into(),
+                version: "4.17.21".into(),
+            }],
+        })))
+        .unwrap();
+        drop(wal);
+
+        let report = recover(&root).unwrap();
+        assert_eq!(report.reconciled.len(), 1);
+        assert_eq!(
+            report.reconciled[0].outcome,
+            ReconciliationOutcome::RolledForward,
+            "uninstall Intent must roll forward"
+        );
+
+        // Trust file is pruned.
+        let trust_after = crate::trusted_deps::read_for(&root).unwrap();
+        assert!(
+            !trust_after.trusted.contains_key("lodash@4.17.21"),
+            "recovery must replay the trust prune; got {:?}",
+            trust_after.trusted
+        );
+
+        // Manifest at post-uninstall state.
+        let manifest_after = read_for(&root).unwrap();
+        assert!(!manifest_after.packages.contains_key("pkga"));
+        assert!(
+            manifest_after
+                .tombstones
+                .iter()
+                .any(|t| t == "installs/pkga@1.0.0"),
+            "tombstone must be queued"
+        );
+
+        // After recovery, the WAL is compacted (every tx is resolved),
+        // so the file is truncated. `wal_compacted` reports that.
+        // Either way: the Intent is no longer uncompleted — running
+        // recovery a second time produces zero new reconciliations.
+        assert!(
+            report.wal_compacted,
+            "WAL must be compacted after the only Intent was rolled forward"
+        );
+        let second = recover(&root).unwrap();
+        assert!(
+            second.reconciled.is_empty(),
+            "second recovery pass must find no uncompleted Intents"
+        );
     }
 }
