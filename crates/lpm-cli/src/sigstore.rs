@@ -525,13 +525,39 @@ async fn fulcio_get_certificate(
             let ders: Result<Vec<Vec<u8>>, _> = certs_pem.iter().map(|p| pem_to_der(p)).collect();
             (first_pem, ders?)
         } else {
-            // JSON response — parse certificate chain
+            // JSON response — parse certificate chain.
+            //
+            // Sigstore-bundle hygiene: ONLY accept the
+            // `signedCertificateEmbeddedSct` response variant. The legacy
+            // `signedCertificateDetachedSct` variant (Fulcio v1) returns
+            // the cert chain plus a separate `signedCertificateTimestamp`
+            // field — but the Sigstore Bundle v0.3 spec has no
+            // first-class detached-SCT field, so any bundle built from
+            // such a response would be signed-but-unverifiable at
+            // install time (the install-side verifier requires embedded
+            // SCTs per Phase 1.4). Reject loudly instead of building an
+            // unverifiable bundle.
             let result: serde_json::Value = serde_json::from_str(&response_text)
                 .map_err(|e| LpmError::Registry(format!("Fulcio response parse error: {e}")))?;
 
+            if result.get("signedCertificateDetachedSct").is_some() {
+                tracing::error!(
+                    target: "lpm_cli::sigstore",
+                    "Fulcio returned `signedCertificateDetachedSct` — Sigstore Bundle v0.3 \
+                     has no first-class detached-SCT field, so a bundle built from this \
+                     response would be unverifiable at install time"
+                );
+                return Err(LpmError::Registry(
+                    "Fulcio returned the legacy `signedCertificateDetachedSct` response variant; \
+                     a Sigstore Bundle built from it would be unverifiable at install time \
+                     (no embedded SCT). Update Fulcio to the v2 API that returns \
+                     `signedCertificateEmbeddedSct`."
+                        .into(),
+                ));
+            }
+
             let chain = result
                 .get("signedCertificateEmbeddedSct")
-                .or_else(|| result.get("signedCertificateDetachedSct"))
                 .and_then(|v| v.get("chain"))
                 .and_then(|v| v.get("certificates"))
                 .and_then(|v| v.as_array())
@@ -1162,13 +1188,21 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn fulcio_parses_json_detached_sct() {
+    async fn fulcio_rejects_detached_sct_response_because_bundle_cannot_persist_scts() {
+        // Phase 1.4 hygiene: a Fulcio response carrying the legacy
+        // `signedCertificateDetachedSct` variant returns the cert
+        // chain plus a separate `signedCertificateTimestamp`, but the
+        // Sigstore Bundle v0.3 spec has no first-class detached-SCT
+        // field. Accepting this would let publish build an
+        // unverifiable bundle (install-side verifier requires
+        // embedded SCTs). Reject loudly.
         let server = MockServer::start().await;
         let body = serde_json::json!({
             "signedCertificateDetachedSct": {
                 "chain": {
                     "certificates": [PEM_CERT_LEAF]
-                }
+                },
+                "signedCertificateTimestamp": "<some-base64>"
             }
         });
         Mock::given(method("POST"))
@@ -1181,11 +1215,13 @@ mod tests {
             .mount(&server)
             .await;
 
-        let (leaf_pem, ders) = fulcio_get_certificate(&server.uri(), "tok", "key", "proof")
+        let err = fulcio_get_certificate(&server.uri(), "tok", "key", "proof")
             .await
-            .expect("expected success");
-        assert_eq!(leaf_pem, PEM_CERT_LEAF);
-        assert_eq!(ders.len(), 1);
+            .expect_err("legacy detached-SCT response must reject");
+        assert!(
+            format!("{err}").contains("signedCertificateDetachedSct"),
+            "expected detached-SCT diagnostic, got: {err}"
+        );
     }
 
     #[tokio::test]
