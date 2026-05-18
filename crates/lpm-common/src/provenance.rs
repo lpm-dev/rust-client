@@ -174,12 +174,8 @@ impl ProvenanceStatus {
     pub fn to_json_verified(&self) -> (serde_json::Value, Option<String>) {
         match self {
             ProvenanceStatus::Verified(_) => (serde_json::Value::Bool(true), None),
-            ProvenanceStatus::Unverified(_) => {
-                (serde_json::Value::String("skipped".into()), None)
-            }
-            ProvenanceStatus::Disabled(_) => {
-                (serde_json::Value::String("disabled".into()), None)
-            }
+            ProvenanceStatus::Unverified(_) => (serde_json::Value::String("skipped".into()), None),
+            ProvenanceStatus::Disabled(_) => (serde_json::Value::String("disabled".into()), None),
             ProvenanceStatus::Absent => (serde_json::Value::Bool(false), None),
             ProvenanceStatus::TransportDegraded => (serde_json::Value::Null, None),
             ProvenanceStatus::VerificationRejected { reason } => {
@@ -398,7 +394,10 @@ mod tests {
         let projected = ProvenanceStatus::TransportDegraded
             .into_snapshot_for_binding("some-pkg", "1.0.0")
             .expect("TransportDegraded is not an attack signal");
-        assert!(projected.is_none(), "transport-degraded must record no binding");
+        assert!(
+            projected.is_none(),
+            "transport-degraded must record no binding"
+        );
     }
 
     /// `VerificationRejected` propagates as
@@ -456,16 +455,16 @@ mod tests {
             !ProvenanceStatus::Disabled(axios_snap()).is_rejection(),
             "Disabled (operator fleet-wide opt-out) is not a rejection",
         );
-        assert!(!ProvenanceStatus::Absent.is_rejection(), "Absent is not a rejection");
+        assert!(
+            !ProvenanceStatus::Absent.is_rejection(),
+            "Absent is not a rejection"
+        );
         assert!(
             !ProvenanceStatus::TransportDegraded.is_rejection(),
             "TransportDegraded is not a rejection",
         );
         assert!(
-            ProvenanceStatus::VerificationRejected {
-                reason: "x".into()
-            }
-            .is_rejection(),
+            ProvenanceStatus::VerificationRejected { reason: "x".into() }.is_rejection(),
             "VerificationRejected must be flagged",
         );
     }
@@ -542,10 +541,7 @@ mod tests {
             reason: "DSSE signature mismatch".into(),
         };
         let (v, r) = status.to_json_verified();
-        assert_eq!(
-            v,
-            serde_json::Value::String("verification_rejected".into())
-        );
+        assert_eq!(v, serde_json::Value::String("verification_rejected".into()));
         assert_eq!(r.as_deref(), Some("DSSE signature mismatch"));
     }
 
@@ -561,11 +557,18 @@ mod tests {
         let (_, r) = status.to_json_verified();
         let r = r.expect("rejection_reason must be present");
         let chars: Vec<char> = r.chars().collect();
-        assert_eq!(chars.len(), 200, "truncated reason must be exactly 200 chars");
+        assert_eq!(
+            chars.len(),
+            200,
+            "truncated reason must be exactly 200 chars"
+        );
         assert_eq!(
             chars[199], '…',
             "trailing char must be the ellipsis marker so consumers can detect truncation"
         );
-        assert_eq!(chars[0], 'x', "the leading 199 chars must be the original prefix");
+        assert_eq!(
+            chars[0], 'x',
+            "the leading 199 chars must be the original prefix"
+        );
     }
 }

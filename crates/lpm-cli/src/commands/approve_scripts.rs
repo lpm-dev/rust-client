@@ -194,8 +194,7 @@ fn snapshot_for_binding_with_mode(
     if let ProvenanceStatus::VerificationRejected { reason } = &status
         && matches!(
             mode,
-            crate::provenance_fetch::EnforceMode::Warn
-                | crate::provenance_fetch::EnforceMode::Off
+            crate::provenance_fetch::EnforceMode::Warn | crate::provenance_fetch::EnforceMode::Off
         )
     {
         let mode_label = match mode {
@@ -209,7 +208,9 @@ fn snapshot_for_binding_with_mode(
             version = %version,
             reason = %reason,
             enforce_mode = mode_label,
-            "verifier rejected provenance bundle but LPM_PROVENANCE_ENFORCE={mode_label} — recording approval with no provenance reference; subsequent installs will treat this as a degraded state"
+            "verifier rejected provenance bundle but enforce-mode is not deny; \
+             recording approval with no provenance reference. Subsequent installs will \
+             treat this as a degraded state until the operator re-approves under deny."
         );
         crate::output::warn(&format!(
             "provenance verification FAILED for {name}@{version}: {reason}\n  \
@@ -582,19 +583,11 @@ async fn run_under_store_lock(
             // `Err(LpmError::ProvenanceVerification(_))` when the
             // verifier rejected the bundle, refusing the approval
             // rather than blanking `provenance_at_approval`.
-            let snap = snapshot_for_binding(
-                &provenance_by_pkg,
-                &target.name,
-                &target.version,
-            )?;
+            let snap = snapshot_for_binding(&provenance_by_pkg, &target.name, &target.version)?;
             trusted.approve_with_metadata(
                 &target.name,
                 &target.version,
-                approval_metadata_from_blocked(
-                    target,
-                    capability_hash.clone(),
-                    snap,
-                ),
+                approval_metadata_from_blocked(target, capability_hash.clone(), snap),
             );
             approved.push(target);
             // close-out short-circuit the write
@@ -701,19 +694,11 @@ async fn run_under_store_lock(
             // rejection so the trust binding is NOT overwritten with
             // `None` (which would silently disarm drift detection on
             // every subsequent install).
-            let snap = snapshot_for_binding(
-                &provenance_by_pkg,
-                &blocked.name,
-                &blocked.version,
-            )?;
+            let snap = snapshot_for_binding(&provenance_by_pkg, &blocked.name, &blocked.version)?;
             trusted.approve_with_metadata(
                 &blocked.name,
                 &blocked.version,
-                approval_metadata_from_blocked(
-                    blocked,
-                    capability_hash.clone(),
-                    snap,
-                ),
+                approval_metadata_from_blocked(blocked, capability_hash.clone(), snap),
             );
             approved.push(blocked);
         }
@@ -884,19 +869,11 @@ async fn run_under_store_lock(
         // Phase 2.2 SILENT-DROP fix: `?` on the verifier-rejection
         // arm refuses to record an approval rather than blanking the
         // prior `provenance_at_approval` and disarming drift checks.
-        let snap = snapshot_for_binding(
-            &provenance_by_pkg,
-            &blocked.name,
-            &blocked.version,
-        )?;
+        let snap = snapshot_for_binding(&provenance_by_pkg, &blocked.name, &blocked.version)?;
         trusted.approve_with_metadata(
             &blocked.name,
             &blocked.version,
-            approval_metadata_from_blocked(
-                blocked,
-                capability_hash.clone(),
-                snap,
-            ),
+            approval_metadata_from_blocked(blocked, capability_hash.clone(), snap),
         );
     }
     // close-out under `--dry-run`, skip the atomic
@@ -2084,22 +2061,17 @@ async fn run_global_bulk_yes(
                     "integrity": r.integrity,
                     "script_hash": r.script_hash,
                 });
-                if let Some(status) =
-                    provenance.get(&(r.name.clone(), r.version.clone()))
-                {
+                if let Some(status) = provenance.get(&(r.name.clone(), r.version.clone())) {
                     let (verified, rejection_reason) = status.to_json_verified();
                     let mut prov = serde_json::Map::new();
                     prov.insert("verified".into(), verified);
                     if let Some(reason) = rejection_reason {
-                        prov.insert(
-                            "rejection_reason".into(),
-                            serde_json::Value::String(reason),
-                        );
+                        prov.insert("rejection_reason".into(), serde_json::Value::String(reason));
                     }
-                    entry.as_object_mut().unwrap().insert(
-                        "provenance".into(),
-                        serde_json::Value::Object(prov),
-                    );
+                    entry
+                        .as_object_mut()
+                        .unwrap()
+                        .insert("provenance".into(), serde_json::Value::Object(prov));
                 }
                 entry
             })
@@ -2252,10 +2224,7 @@ async fn run_global_named(
             let mut prov = serde_json::Map::new();
             prov.insert("verified".into(), verified);
             if let Some(reason) = rejection_reason {
-                prov.insert(
-                    "rejection_reason".into(),
-                    serde_json::Value::String(reason),
-                );
+                prov.insert("rejection_reason".into(), serde_json::Value::String(reason));
             }
             approved_entry
                 .as_object_mut()
@@ -2769,7 +2738,11 @@ mod tests {
         })
     }
 
-    fn map_with(name: &str, version: &str, status: ProvenanceStatus) -> HashMap<(String, String), ProvenanceStatus> {
+    fn map_with(
+        name: &str,
+        version: &str,
+        status: ProvenanceStatus,
+    ) -> HashMap<(String, String), ProvenanceStatus> {
         let mut m = HashMap::new();
         m.insert((name.to_string(), version.to_string()), status);
         m

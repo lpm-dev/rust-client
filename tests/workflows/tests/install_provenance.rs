@@ -635,7 +635,11 @@ async fn install_drift_does_not_block_for_project_with_no_approvals() {
 /// (`/api/registry/{name}` LPM proxy, `/{name}` npm direct, and
 /// the batch POST endpoint) with attestations included from the
 /// start, plus the tarball + the unverifiable bundle endpoint.
-async fn mount_scripted_pkg_with_unverifiable_bundle(mock: &MockRegistry, name: &str, version: &str) {
+async fn mount_scripted_pkg_with_unverifiable_bundle(
+    mock: &MockRegistry,
+    name: &str,
+    version: &str,
+) {
     use support::mock_registry::{compute_integrity, make_tarball_from_pkg_json};
 
     let pkg_json = serde_json::json!({
@@ -896,5 +900,181 @@ async fn approve_scripts_under_warn_logs_and_proceeds_when_verifier_rejects() {
         combined.contains("LPM_PROVENANCE_ENFORCE=deny"),
         "warn notice must point at the deny re-enable knob so operators know how to tighten back \
          to fail-closed; got:\n{combined}",
+    );
+}
+
+// ─── Install drift gate: warn / skip-flag composition pins ───────────
+
+/// Setup helper: project carries a rich-form approval for `PKG`, and
+/// the mock registry serves the candidate's attestation URL with an
+/// unverifiable bundle (minimal v0.2 shape — the verifier hard-fails
+/// on the dsseEnvelope / tlogEntries pre-flight). Mirrors the shape
+/// used by `setup_identity_changed` but with a verifier-rejecting
+/// bundle as the on-purpose feature.
+async fn setup_install_drift_gate_with_verifier_rejecting_candidate() -> (TempProject, MockRegistry)
+{
+    let project = TempProject::empty("");
+    write_manifest_with_approval(
+        &project,
+        ApprovedRefShape {
+            publisher: Some(APPROVED_PUBLISHER),
+            workflow_path: Some(APPROVED_WORKFLOW_PATH),
+            workflow_ref: Some("refs/tags/v1.0.0"),
+            has_provenance: true,
+        },
+    );
+    let mock = MockRegistry::start().await;
+    mount_package_version(
+        &mock,
+        CANDIDATE_VERSION,
+        AttestationShape::UrlPresent(AttestationResponse::SigstoreBundle {
+            publisher: APPROVED_PUBLISHER,
+            workflow_path: APPROVED_WORKFLOW_PATH,
+            workflow_ref: "refs/tags/v1.0.1",
+        }),
+    )
+    .await;
+    (project, mock)
+}
+
+/// Under default `EnforceMode::Deny`, an install-time verifier
+/// rejection refuses the install — `?`-propagates the typed
+/// `LpmError::ProvenanceVerification` so the user sees a real
+/// diagnostic rather than silently weakening drift detection. This
+/// is the load-bearing baseline that the warn-mode degrade test
+/// below contrasts against.
+#[tokio::test]
+async fn install_drift_gate_under_deny_blocks_when_verifier_rejects_bundle() {
+    let (project, mock) = setup_install_drift_gate_with_verifier_rejecting_candidate().await;
+    let out = lpm_with_registry(&project, &mock.url())
+        .args(["install"])
+        .output()
+        .expect("spawn lpm install");
+    assert!(
+        !out.status.success(),
+        "Deny + verifier rejection MUST block the install — \
+         silent acceptance would let a forged bundle through;\n\
+         stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+    assert!(
+        combined.contains("provenance"),
+        "rejection diagnostic must surface the 'provenance' subsystem so operators can \
+         find the failed gate; got:\n{combined}",
+    );
+}
+
+/// **Audit item #4 pin.** Under `LPM_PROVENANCE_ENFORCE=warn`, an
+/// install-time verifier rejection on a rich-form-bound package
+/// MUST NOT block the install. The drift gate degrades to NoDrift,
+/// emits a loud `output::warn`, and the install proceeds. This is
+/// the Phase 2.3 rollout-window posture — operators ship the
+/// verifier in warn mode for one release so a bundle-shape change
+/// at the registry surfaces as a log line, not a CI nuke.
+///
+/// Contrasts directly with the Deny baseline above: same fixture,
+/// same bundle, only the env knob differs.
+#[tokio::test]
+async fn install_drift_gate_under_enforce_warn_does_not_block_on_verifier_rejection() {
+    let (project, mock) = setup_install_drift_gate_with_verifier_rejecting_candidate().await;
+    let out = lpm_with_registry(&project, &mock.url())
+        .env("LPM_PROVENANCE_ENFORCE", "warn")
+        .args(["install"])
+        .output()
+        .expect("spawn lpm install under LPM_PROVENANCE_ENFORCE=warn");
+
+    assert!(
+        out.status.success(),
+        "Warn mode MUST NOT block the install on verifier rejection (rollout-window \
+         contract); stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+    assert!(
+        !drift_block_message_present(&out),
+        "drift block message must NOT appear under warn mode; got:\n{combined}",
+    );
+    assert!(
+        combined.contains("provenance verification FAILED"),
+        "warn mode MUST emit the loud `provenance verification FAILED` line so the \
+         operator sees the degraded posture; got:\n{combined}",
+    );
+    assert!(
+        combined.contains(PKG),
+        "warn line must name the package whose bundle was rejected so operators can \
+         track which dependency to remediate; got:\n{combined}",
+    );
+    assert!(
+        combined.contains("LPM_PROVENANCE_ENFORCE=deny"),
+        "warn line must point at the re-enable command so operators can tighten back \
+         to fail-closed; got:\n{combined}",
+    );
+}
+
+/// **Audit item #3 pin.** The two verification-policy axes
+/// (`EnforceMode` and `SkipPolicy`) MUST compose orthogonally:
+/// `LPM_PROVENANCE_ENFORCE=warn` + `--unverified-provenance <pkg>`
+/// on the same invocation means "warn-mode for the rest of the
+/// install, skip verification entirely for the named package."
+///
+/// Pinned via a side-effect contrast: the skip-listed package's
+/// rejection log line is ABSENT from stderr (because the verifier
+/// never ran for it) — that's the orthogonality signal. If the two
+/// axes collapsed (e.g. warn-mode also short-circuited the
+/// skip-list logic), the warn line would still fire and this test
+/// would catch it.
+///
+/// Single-package variant: the unit test
+/// `verify_policy_should_skip_verification_unifies_skip_and_off`
+/// pins the policy-decision side; this is the end-to-end pin that
+/// guards against the install pipeline ignoring the skip-list under
+/// warn mode.
+#[tokio::test]
+async fn install_skip_flag_short_circuits_verifier_under_enforce_warn() {
+    let (project, mock) = setup_install_drift_gate_with_verifier_rejecting_candidate().await;
+    let out = lpm_with_registry(&project, &mock.url())
+        .env("LPM_PROVENANCE_ENFORCE", "warn")
+        .args(["install", "--unverified-provenance", PKG])
+        .output()
+        .expect("spawn lpm install with both env-warn and skip-flag");
+
+    assert!(
+        out.status.success(),
+        "Warn + skip MUST succeed; stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+    assert!(
+        !drift_block_message_present(&out),
+        "drift block message must NOT appear; got:\n{combined}",
+    );
+    // The orthogonality signal: under skip-listed routing, the
+    // verifier never runs, so the warn-mode rejection line MUST NOT
+    // fire. If the two axes collapsed (warn-mode forces verification
+    // to run regardless of skip-list), this line would appear.
+    assert!(
+        !combined.contains("provenance verification FAILED"),
+        "skip-listed package must NOT trigger the warn-mode verifier-rejection line — \
+         the skip path bypasses the verifier entirely. Presence of this line means \
+         the SkipPolicy axis collapsed into the EnforceMode axis (orthogonality \
+         contract broken); got:\n{combined}",
     );
 }

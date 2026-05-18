@@ -248,8 +248,7 @@ impl EnforceMode {
         env_value: Option<&str>,
         config_reader: impl FnOnce() -> Option<String>,
     ) -> (Self, EnforceModeSource) {
-        if let Some(mode) =
-            Self::parse_str_with_source(env_value, "LPM_PROVENANCE_ENFORCE env var")
+        if let Some(mode) = Self::parse_str_with_source(env_value, "LPM_PROVENANCE_ENFORCE env var")
         {
             return (mode, EnforceModeSource::Env);
         }
@@ -621,7 +620,7 @@ pub async fn fetch_provenance_snapshot(
 /// - `Err(other)` → `TransportDegraded` (fatal I/O degrades rather
 ///   than failing the whole batch; the per-package path retains
 ///   the typed-error contract for install-time `?`-propagation)
-pub fn map_fetch_result_to_status(
+pub(crate) fn map_fetch_result_to_status(
     name: &str,
     version: &str,
     result: Result<Option<ProvenanceSnapshot>, LpmError>,
@@ -740,19 +739,9 @@ pub async fn fetch_provenance_for_pkgs(
         // operator's downgrade explicitly instead of falsely
         // claiming verification.
         if verify_policy_ref.should_skip_verification_for(name) {
-            let mut status =
+            let raw =
                 fetch_unverified_snapshot(http_ref, name, version, attestation_ref.as_ref()).await;
-            // Phase 2.5: distinguish fleet-wide opt-out (Disabled)
-            // from per-package skip (Unverified). The plain
-            // `fetch_unverified_snapshot` always returns `Unverified`
-            // on a successful identity-only parse — re-label here
-            // when EnforceMode::Off was the trigger so the JSON
-            // envelope reports `"disabled"` not `"skipped"`.
-            if matches!(verify_policy_ref.enforce, EnforceMode::Off)
-                && let ProvenanceStatus::Unverified(snap) = status
-            {
-                status = ProvenanceStatus::Disabled(snap);
-            }
+            let status = relabel_skip_status_for_enforce_mode(raw, verify_policy_ref.enforce);
             return ((name.clone(), version.clone()), status);
         }
 
@@ -772,6 +761,54 @@ pub async fn fetch_provenance_for_pkgs(
         .await
         .into_iter()
         .collect()
+}
+
+/// Re-label a [`ProvenanceStatus`] produced by the skip path so the
+/// JSON envelope distinguishes per-package opt-out from fleet-wide
+/// opt-out. Single source of truth for the "what does the trust
+/// binding's audit trail say happened?" decision; the install drift
+/// gate and the batch caller both go through this so they cannot
+/// drift on the labeling rule.
+///
+/// Re-label rules:
+///
+/// - `EnforceMode::Off` + `Unverified(snap)` → `Disabled(snap)`. The
+///   operator declared "we don't verify anything fleet-wide"; the
+///   bundle exists but the verifier was bypassed by global posture,
+///   so the audit trail says `verified: "disabled"` (not
+///   `"skipped"`, which is reserved for the per-package CLI carve-
+///   out).
+///
+/// - Every other `(mode, status)` pair → identity. Specifically
+///   under `Off`:
+///   - `Absent` stays `Absent` (`verified: false`): the registry
+///     served no attestation. That observation is independent of
+///     the operator's verification posture. An audit pipeline
+///     reading `verified: "disabled"` learns "operator skipped
+///     verification but the bundle was real"; reading
+///     `verified: false` learns "there was nothing to verify
+///     regardless of posture." Conflating them loses the
+///     registry-absence signal.
+///   - `TransportDegraded` stays `TransportDegraded`
+///     (`verified: null`): transient network failure is also
+///     independent of the posture choice, and `null` is the right
+///     "unknown" signal.
+///   - `Verified` and `VerificationRejected` are unreachable on the
+///     skip path (the verifier didn't run), so they pass through
+///     unchanged as a defensive identity.
+///
+/// Under `Warn` and `Deny` the skip path still runs only when
+/// `SkipPolicy` matched, so `Unverified` is the operator's surgical
+/// per-package decision and must remain `"skipped"` (not
+/// `"disabled"`). Identity again.
+pub(crate) fn relabel_skip_status_for_enforce_mode(
+    status: ProvenanceStatus,
+    mode: EnforceMode,
+) -> ProvenanceStatus {
+    match (mode, status) {
+        (EnforceMode::Off, ProvenanceStatus::Unverified(snap)) => ProvenanceStatus::Disabled(snap),
+        (_, status) => status,
+    }
 }
 
 /// Skip-list fetch: pull the bundle bytes, run the legacy
@@ -2410,8 +2447,7 @@ mod tests {
         // `fetch_provenance_snapshot` (see the test above) — but the
         // skip-list path bypasses the verifier and lands on Unverified
         // with the identity intact.
-        let status =
-            fetch_unverified_snapshot(&http, "axios", "1.14.1", Some(&att)).await;
+        let status = fetch_unverified_snapshot(&http, "axios", "1.14.1", Some(&att)).await;
         match status {
             ProvenanceStatus::Unverified(snap) => {
                 assert!(snap.present, "unverified snapshot must be present:true");
@@ -2439,12 +2475,108 @@ mod tests {
     #[tokio::test]
     async fn fetch_unverified_snapshot_returns_absent_when_url_missing() {
         let http = reqwest::Client::new();
-        let status =
-            fetch_unverified_snapshot(&http, "no-prov", "1.0.0", None).await;
+        let status = fetch_unverified_snapshot(&http, "no-prov", "1.0.0", None).await;
         assert!(
             matches!(status, ProvenanceStatus::Absent),
             "skip-list with no attestation URL must record Absent, got: {status:?}",
         );
+    }
+
+    // ── relabel_skip_status_for_enforce_mode ────────────────────
+    //
+    // Five-variant table: under each `EnforceMode`, what does each
+    // `ProvenanceStatus` produced by the skip path become? Pins the
+    // labeling contract the JSON envelope depends on. The off-axis
+    // arms (Deny, Warn under skip-list) are also pinned so a future
+    // refactor that conflates per-package skip with wholesale
+    // opt-out has to break a test.
+
+    fn synth_snap() -> ProvenanceSnapshot {
+        ProvenanceSnapshot {
+            present: true,
+            publisher: Some("github:axios/axios".into()),
+            workflow_path: Some(".github/workflows/publish.yml".into()),
+            workflow_ref: Some("refs/tags/v1.14.0".into()),
+            attestation_cert_sha256: Some("sha256-leaf".into()),
+        }
+    }
+
+    #[test]
+    fn relabel_under_off_promotes_unverified_to_disabled() {
+        let out = relabel_skip_status_for_enforce_mode(
+            ProvenanceStatus::Unverified(synth_snap()),
+            EnforceMode::Off,
+        );
+        match out {
+            ProvenanceStatus::Disabled(snap) => assert_eq!(snap, synth_snap()),
+            other => panic!(
+                "Off + Unverified must re-label to Disabled (audit-trail \
+                 contract for fleet-wide opt-out), got: {other:?}"
+            ),
+        }
+    }
+
+    /// **Item 2 audit pin.** Under fleet-wide opt-out, an `Absent`
+    /// observation MUST stay `Absent` so the JSON envelope reports
+    /// `verified: false` (registry served no attestation), not
+    /// `"disabled"`. An audit pipeline reading the envelope needs to
+    /// distinguish "operator skipped a real bundle" from "there was
+    /// nothing to verify" — conflating them would lose the
+    /// registry-absence signal that surfaces a package whose
+    /// publisher dropped attestation entirely (the axios direction).
+    #[test]
+    fn relabel_under_off_preserves_absent_distinct_from_disabled() {
+        let out = relabel_skip_status_for_enforce_mode(ProvenanceStatus::Absent, EnforceMode::Off);
+        assert!(
+            matches!(out, ProvenanceStatus::Absent),
+            "Off + Absent must stay Absent — registry-absence signal is independent of \
+             operator posture; conflating into Disabled loses the audit-trail \
+             distinction, got: {out:?}",
+        );
+    }
+
+    /// Under fleet-wide opt-out, a transient transport failure is
+    /// also a posture-independent signal — stays
+    /// `TransportDegraded` (`verified: null`) so the drift gate's
+    /// degrade-to-NoDrift contract holds.
+    #[test]
+    fn relabel_under_off_preserves_transport_degraded() {
+        let out = relabel_skip_status_for_enforce_mode(
+            ProvenanceStatus::TransportDegraded,
+            EnforceMode::Off,
+        );
+        assert!(
+            matches!(out, ProvenanceStatus::TransportDegraded),
+            "Off + TransportDegraded must stay TransportDegraded, got: {out:?}",
+        );
+    }
+
+    /// Per-package skip under non-`Off` modes (the operator
+    /// surgically carved foo out via `--unverified-provenance foo`)
+    /// keeps `Unverified` so the JSON envelope reports
+    /// `verified: "skipped"`. The label distinguishes from
+    /// `"disabled"` (which is reserved for the fleet-wide
+    /// `EnforceMode::Off` posture).
+    #[test]
+    fn relabel_under_deny_keeps_unverified_as_skipped_label() {
+        let out = relabel_skip_status_for_enforce_mode(
+            ProvenanceStatus::Unverified(synth_snap()),
+            EnforceMode::Deny,
+        );
+        assert!(
+            matches!(out, ProvenanceStatus::Unverified(_)),
+            "Deny + per-package Unverified must keep the surgical label; \
+             re-labeling to Disabled would falsely report a fleet-wide opt-out",
+        );
+    }
+
+    #[test]
+    fn relabel_under_warn_keeps_unverified_as_skipped_label() {
+        let out = relabel_skip_status_for_enforce_mode(
+            ProvenanceStatus::Unverified(synth_snap()),
+            EnforceMode::Warn,
+        );
+        assert!(matches!(out, ProvenanceStatus::Unverified(_)));
     }
 
     #[test]

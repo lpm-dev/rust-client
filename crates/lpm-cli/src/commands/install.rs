@@ -5598,10 +5598,8 @@ async fn run_with_options_under_store_lock(
     // packages the drift gate fetched for are present; the
     // `blocked_to_json_with_provenance` helper omits the `provenance`
     // block when the key is absent.
-    let mut install_provenance_status_map: HashMap<
-        (String, String),
-        lpm_common::ProvenanceStatus,
-    > = HashMap::new();
+    let mut install_provenance_status_map: HashMap<(String, String), lpm_common::ProvenanceStatus> =
+        HashMap::new();
     if !used_lockfile && !drift_ignore_policy.ignores_all() {
         let trusted =
             lpm_security::SecurityPolicy::from_package_json(&project_dir.join("package.json"))
@@ -5702,7 +5700,7 @@ async fn run_with_options_under_store_lock(
                 let now_snapshot: Option<lpm_workspace::ProvenanceSnapshot> = if verify_policy
                     .should_skip_verification_for(&p.name)
                 {
-                    let mut status = tokio::task::block_in_place(|| {
+                    let raw = tokio::task::block_in_place(|| {
                         tokio::runtime::Handle::current().block_on(
                             crate::provenance_fetch::fetch_unverified_snapshot(
                                 &http,
@@ -5712,20 +5710,17 @@ async fn run_with_options_under_store_lock(
                             ),
                         )
                     });
-                    // Phase 2.5 re-label: fleet-wide `EnforceMode::Off`
-                    // surfaces as `Disabled` (`verified: "disabled"`),
-                    // distinct from per-package `Unverified`
-                    // (`"skipped"`). The bare helper always emits
-                    // `Unverified` on a successful identity parse;
-                    // the policy context lives here, not in the
-                    // helper.
-                    if matches!(
+                    // Re-label `Unverified` → `Disabled` when fleet-
+                    // wide `EnforceMode::Off` was the trigger, so the
+                    // JSON envelope distinguishes wholesale opt-out
+                    // (`"disabled"`) from per-package CLI carve-out
+                    // (`"skipped"`). Logic shared with the batch
+                    // caller in `provenance_fetch.rs` so the two
+                    // sites cannot drift on the labeling rule.
+                    let status = crate::provenance_fetch::relabel_skip_status_for_enforce_mode(
+                        raw,
                         verify_policy.enforce,
-                        crate::provenance_fetch::EnforceMode::Off
-                    ) && let lpm_common::ProvenanceStatus::Unverified(snap) = status
-                    {
-                        status = lpm_common::ProvenanceStatus::Disabled(snap);
-                    }
+                    );
                     // Phase 2.2.d: record for the install --json
                     // envelope before consuming for the drift gate.
                     install_provenance_status_map
@@ -5799,8 +5794,8 @@ async fn run_with_options_under_store_lock(
                                         version = %p.version,
                                         reason = %reason,
                                         enforce_mode = "warn",
-                                        "install drift gate: verifier rejected bundle but \
-                                         LPM_PROVENANCE_ENFORCE=warn — degrading to NoDrift",
+                                        "install drift gate: verifier rejected bundle \
+                                         under warn enforce-mode — degrading to NoDrift",
                                     );
                                     None
                                 }
@@ -5821,10 +5816,8 @@ async fn run_with_options_under_store_lock(
                                     // returning so a `--json` consumer that
                                     // tees stderr can correlate the failure
                                     // with the per-package envelope.
-                                    install_provenance_status_map.insert(
-                                        (p.name.clone(), p.version.clone()),
-                                        status,
-                                    );
+                                    install_provenance_status_map
+                                        .insert((p.name.clone(), p.version.clone()), status);
                                     return Err(LpmError::ProvenanceVerification(reason));
                                 }
                             };

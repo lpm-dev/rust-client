@@ -780,11 +780,7 @@ async fn run_sigstore_wizard(
                 "deny — verify every attestation, fail-closed on errors",
                 "recommended",
             )
-            .item(
-                "warn",
-                "warn — verify, but only log on failure",
-                "degraded",
-            )
+            .item("warn", "warn — verify, but only log on failure", "degraded")
             .item(
                 "off",
                 "off  — skip verification entirely",
@@ -1156,10 +1152,22 @@ mod wizard_tests {
             .await
             .unwrap_err();
         let msg = err.to_string();
-        assert!(msg.contains("invalid sigstore verify mode 'yolo'"), "got: {msg}");
-        assert!(msg.contains("deny"), "error must list 'deny' as a valid value: {msg}");
-        assert!(msg.contains("warn"), "error must list 'warn' as a valid value: {msg}");
-        assert!(msg.contains("off"), "error must list 'off' as a valid value: {msg}");
+        assert!(
+            msg.contains("invalid sigstore verify mode 'yolo'"),
+            "got: {msg}"
+        );
+        assert!(
+            msg.contains("deny"),
+            "error must list 'deny' as a valid value: {msg}"
+        );
+        assert!(
+            msg.contains("warn"),
+            "error must list 'warn' as a valid value: {msg}"
+        );
+        assert!(
+            msg.contains("off"),
+            "error must list 'off' as a valid value: {msg}"
+        );
         // Nothing persisted on validation failure.
         assert!(read_sigstore_verify(&path).unwrap().is_none());
     }
@@ -1254,8 +1262,12 @@ mod wizard_tests {
     #[tokio::test]
     async fn sigstore_wizard_overwrites_existing_value() {
         let (_dir, path) = tmp_config();
-        run_sigstore_wizard(&path, Some("warn"), true).await.unwrap();
-        run_sigstore_wizard(&path, Some("deny"), true).await.unwrap();
+        run_sigstore_wizard(&path, Some("warn"), true)
+            .await
+            .unwrap();
+        run_sigstore_wizard(&path, Some("deny"), true)
+            .await
+            .unwrap();
         assert_eq!(
             read_sigstore_verify(&path).unwrap().as_deref(),
             Some("deny"),

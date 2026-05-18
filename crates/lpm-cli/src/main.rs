@@ -2950,45 +2950,49 @@ async fn async_main() -> Result<()> {
                 std::env::var("LPM_PROVENANCE_ENFORCE").ok().as_deref(),
                 || cfg.get_sigstore_verify(),
             );
-            // Loud-when-degraded: emit exactly one heads-up per
-            // install run when the resolved mode is not `Deny`. The
-            // hint names the source (env / config / default) and the
-            // re-enable command so an operator who flipped the knob
-            // once and forgot doesn't fly blind. Tracing target is
-            // separate so structured-log consumers can filter on
-            // `lpm::provenance` rather than scraping stderr.
-            if !cli.json
-                && !matches!(verify_policy.enforce, provenance_fetch::EnforceMode::Deny)
-            {
+            // Loud-when-degraded: emit one heads-up per install run
+            // when the resolved mode is not `Deny`. The hint names
+            // the source (env / config / default) and the re-enable
+            // command so an operator who flipped the knob once and
+            // forgot doesn't fly blind. Tracing always fires so
+            // structured-log consumers (JSON-mode pipelines, log
+            // forwarders) capture the posture-degrade independent of
+            // stderr; stderr `output::warn` is suppressed under
+            // `--json` because the per-package envelope is the
+            // canonical signal there.
+            if !matches!(verify_policy.enforce, provenance_fetch::EnforceMode::Deny) {
                 let mode_label = match verify_policy.enforce {
                     provenance_fetch::EnforceMode::Warn => "warn",
                     provenance_fetch::EnforceMode::Off => "off",
                     provenance_fetch::EnforceMode::Deny => unreachable!("guarded above"),
                 };
-                output::warn(&format!(
-                    "Sigstore provenance verification posture: {} (source: {}). \
-                     Provenance attestations will {} be cryptographically verified \
-                     for this install. To re-enable fail-closed: {}.",
-                    mode_label,
-                    match verify_source {
-                        provenance_fetch::EnforceModeSource::Env => "LPM_PROVENANCE_ENFORCE env",
-                        provenance_fetch::EnforceModeSource::Config =>
-                            "[sigstore] verify in ~/.lpm/config.toml",
-                        provenance_fetch::EnforceModeSource::Default => "default",
-                    },
-                    if matches!(verify_policy.enforce, provenance_fetch::EnforceMode::Off) {
-                        "NOT"
-                    } else {
-                        "be checked but rejections will only log, not block —"
-                    },
-                    verify_source.re_enable_hint(),
-                ));
                 tracing::warn!(
                     target = "lpm::provenance",
                     enforce_mode = mode_label,
                     source = ?verify_source,
                     "sigstore verification posture is degraded for this install run",
                 );
+                if !cli.json {
+                    output::warn(&format!(
+                        "Sigstore provenance verification posture: {} (source: {}). \
+                         Provenance attestations will {} be cryptographically verified \
+                         for this install. To re-enable fail-closed: {}.",
+                        mode_label,
+                        match verify_source {
+                            provenance_fetch::EnforceModeSource::Env =>
+                                "LPM_PROVENANCE_ENFORCE env",
+                            provenance_fetch::EnforceModeSource::Config =>
+                                "[sigstore] verify in ~/.lpm/config.toml",
+                            provenance_fetch::EnforceModeSource::Default => "default",
+                        },
+                        if matches!(verify_policy.enforce, provenance_fetch::EnforceMode::Off) {
+                            "NOT"
+                        } else {
+                            "be checked but rejections will only log, not block —"
+                        },
+                        verify_source.re_enable_hint(),
+                    ));
+                }
             }
 
             //: resolve the effective script-policy through
@@ -5173,7 +5177,16 @@ mod tests {
     #[test]
     fn build_install_global_overrides_threads_allow_new_and_auto_build_bools() {
         let o = build_install_global_overrides(
-            true, true, None, false, false, None, vec![], false, vec![], false,
+            true,
+            true,
+            None,
+            false,
+            false,
+            None,
+            vec![],
+            false,
+            vec![],
+            false,
         )
         .unwrap();
         assert!(
@@ -5185,11 +5198,19 @@ mod tests {
             "auto_build must reach the bundle so triage greens auto-execute"
         );
 
-        let o =
-            build_install_global_overrides(
-                false, false, None, false, false, None, vec![], false, vec![], false,
-            )
-            .unwrap();
+        let o = build_install_global_overrides(
+            false,
+            false,
+            None,
+            false,
+            false,
+            None,
+            vec![],
+            false,
+            vec![],
+            false,
+        )
+        .unwrap();
         assert!(!o.allow_new);
         assert!(!o.auto_build);
     }
@@ -5235,11 +5256,19 @@ mod tests {
         );
 
         // No override → None reaches the bundle (fallback to chain default).
-        let o =
-            build_install_global_overrides(
-                false, false, None, false, false, None, vec![], false, vec![], false,
-            )
-            .unwrap();
+        let o = build_install_global_overrides(
+            false,
+            false,
+            None,
+            false,
+            false,
+            None,
+            vec![],
+            false,
+            vec![],
+            false,
+        )
+        .unwrap();
         assert!(o.min_release_age_override.is_none());
     }
 
@@ -5310,11 +5339,19 @@ mod tests {
         ));
 
         // Empty + false → EnforceAll.
-        let o =
-            build_install_global_overrides(
-                false, false, None, false, false, None, vec![], false, vec![], false,
-            )
-            .unwrap();
+        let o = build_install_global_overrides(
+            false,
+            false,
+            None,
+            false,
+            false,
+            None,
+            vec![],
+            false,
+            vec![],
+            false,
+        )
+        .unwrap();
         assert!(matches!(
             o.drift_ignore_policy,
             DriftIgnorePolicy::EnforceAll
@@ -5340,19 +5377,35 @@ mod tests {
         assert_eq!(o.script_policy_override, Some(ScriptPolicy::Allow));
 
         // --yolo → Allow.
-        let o =
-            build_install_global_overrides(
-                false, false, None, true, false, None, vec![], false, vec![], false,
-            )
-            .unwrap();
+        let o = build_install_global_overrides(
+            false,
+            false,
+            None,
+            true,
+            false,
+            None,
+            vec![],
+            false,
+            vec![],
+            false,
+        )
+        .unwrap();
         assert_eq!(o.script_policy_override, Some(ScriptPolicy::Allow));
 
         // --triage → Triage.
-        let o =
-            build_install_global_overrides(
-                false, false, None, false, true, None, vec![], false, vec![], false,
-            )
-            .unwrap();
+        let o = build_install_global_overrides(
+            false,
+            false,
+            None,
+            false,
+            true,
+            None,
+            vec![],
+            false,
+            vec![],
+            false,
+        )
+        .unwrap();
         assert_eq!(o.script_policy_override, Some(ScriptPolicy::Triage));
 
         // --policy=deny → Deny (explicit; not ambient default).
@@ -5379,11 +5432,19 @@ mod tests {
             "HOME",
             std::ffi::OsString::from(std::env::temp_dir().to_str().unwrap()),
         )]);
-        let o =
-            build_install_global_overrides(
-                false, false, None, false, false, None, vec![], false, vec![], false,
-            )
-            .unwrap();
+        let o = build_install_global_overrides(
+            false,
+            false,
+            None,
+            false,
+            false,
+            None,
+            vec![],
+            false,
+            vec![],
+            false,
+        )
+        .unwrap();
         // The resolver returns the default — Some(Deny). We forward
         // it as `Some` so the inner pipeline's resolver doesn't
         // double-resolve.
@@ -6035,7 +6096,16 @@ mod tests {
 
         // Empty + false → `SkipPolicy::None`.
         let o = build_install_global_overrides(
-            false, false, None, false, false, None, vec![], false, vec![], false,
+            false,
+            false,
+            None,
+            false,
+            false,
+            None,
+            vec![],
+            false,
+            vec![],
+            false,
         )
         .unwrap();
         assert!(matches!(o.verify_policy.skip, SkipPolicy::None));

@@ -1708,7 +1708,7 @@ async fn run_doctor_install(client: &RegistryClient, project_dir: &Path) -> Resu
         None, // advisor_override: `lpm doctor` does not expose `--advisor`
         None, // min_release_age_override: `lpm doctor` uses the package.json/global/default chain
         crate::provenance_fetch::DriftIgnorePolicy::default(), // drift-ignore: `lpm doctor` enforces drift like a normal install
-        crate::provenance_fetch::VerifyPolicy::default(),      // verify-policy: doctor honors env-only (default Deny)
+        crate::provenance_fetch::VerifyPolicy::default(), // verify-policy: doctor honors env-only (default Deny)
         // doctor's auto-fix install does not
         // surface its own sandbox-mode flags. Falls through the
         // env / config / default chain.

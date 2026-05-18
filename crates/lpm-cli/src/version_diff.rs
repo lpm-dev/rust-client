@@ -875,15 +875,12 @@ pub fn blocked_to_json_with_provenance(
         let mut prov = serde_json::Map::new();
         prov.insert("verified".into(), verified);
         if let Some(reason) = rejection_reason {
-            prov.insert(
-                "rejection_reason".into(),
-                serde_json::Value::String(reason),
-            );
+            prov.insert("rejection_reason".into(), serde_json::Value::String(reason));
         }
-        entry.as_object_mut().unwrap().insert(
-            "provenance".into(),
-            serde_json::Value::Object(prov),
-        );
+        entry
+            .as_object_mut()
+            .unwrap()
+            .insert("provenance".into(), serde_json::Value::Object(prov));
     }
     entry
 }
@@ -1954,11 +1951,7 @@ mod tests {
         let mut map: HashMap<(String, String), ProvenanceStatus> = HashMap::new();
         // A different package's status — not relevant to our entry.
         map.insert(("axios".into(), "1.14.0".into()), ProvenanceStatus::Absent);
-        let v = blocked_to_json_with_provenance(
-            &bp,
-            &TrustedDependencies::default(),
-            Some(&map),
-        );
+        let v = blocked_to_json_with_provenance(&bp, &TrustedDependencies::default(), Some(&map));
         assert!(v.get("provenance").is_none());
     }
 
@@ -1979,11 +1972,7 @@ mod tests {
                 ..Default::default()
             }),
         );
-        let v = blocked_to_json_with_provenance(
-            &bp,
-            &TrustedDependencies::default(),
-            Some(&map),
-        );
+        let v = blocked_to_json_with_provenance(&bp, &TrustedDependencies::default(), Some(&map));
         let prov = v.get("provenance").expect("provenance block must emit");
         assert_eq!(prov["verified"], serde_json::json!(true));
         assert!(
@@ -2011,11 +2000,7 @@ mod tests {
                 ..Default::default()
             }),
         );
-        let v = blocked_to_json_with_provenance(
-            &bp,
-            &TrustedDependencies::default(),
-            Some(&map),
-        );
+        let v = blocked_to_json_with_provenance(&bp, &TrustedDependencies::default(), Some(&map));
         assert_eq!(v["provenance"]["verified"], serde_json::json!("skipped"));
     }
 
@@ -2034,11 +2019,7 @@ mod tests {
                 reason: "Rekor SET verification failed".into(),
             },
         );
-        let v = blocked_to_json_with_provenance(
-            &bp,
-            &TrustedDependencies::default(),
-            Some(&map),
-        );
+        let v = blocked_to_json_with_provenance(&bp, &TrustedDependencies::default(), Some(&map));
         assert_eq!(
             v["provenance"]["verified"],
             serde_json::json!("verification_rejected"),
