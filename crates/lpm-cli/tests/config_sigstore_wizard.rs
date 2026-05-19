@@ -1,37 +1,14 @@
-//! Cli-binary tier — `lpm config sigstore` wizard contract.
-//!
-//! **Tier-placement justification (per CLAUDE.md `# Testing Tier
-//! Discipline`):** intentionally minimal binary-surface repro for the
-//! TTY-interactive contract. The interactive `cliclack::select` /
-//! `cliclack::confirm` walk path (no `--set`, no piped stdin)
-//! cannot be exercised from the workflow tier without a real PTY;
-//! the assertions below confirm the guards that protect the
-//! interactive walk fire correctly when stdin is not a TTY. The
-//! non-interactive `--set` paths plus the `read_/persist_/announce_`
-//! seams are exhaustively covered by inline `#[cfg(test)]` tests in
-//! [`crates/lpm-cli/src/commands/config.rs`].
-//!
-//! What this file pins specifically:
-//!
-//! 1. `lpm config sigstore --set off` succeeds without a TTY and
-//!    writes `[sigstore] verify = "off"` to the isolated HOME's
-//!    `.lpm/config.toml`.
-//! 2. `lpm config sigstore` (no `--set`) outside a TTY fails with the
-//!    "requires a TTY" message naming the valid `--set` values, so a
-//!    user who accidentally runs the wizard in CI gets actionable
-//!    diagnostics instead of a hang.
-//! 3. `lpm config --json sigstore --set warn` emits the
-//!    `{"success": true, "sigstore": {"verify": "warn"}}` shape the
-//!    rest of the wizard family uses (matches `announce_*_set`).
+//! Cli-binary tier — TTY/stdin interactive behaviour for the
+//! `lpm config sigstore` wizard. Inline tests in `commands/config.rs`
+//! cover the non-interactive `--set` paths and the read/persist/announce
+//! seams; this file pins the cliclack-walk guards that fire when
+//! stdin is not a TTY.
 
 use assert_cmd::Command;
 use tempfile::TempDir;
 
-/// Build a `lpm-rs` Command in an isolated HOME. Returns the
-/// `(command, project_dir, home_dir)` so the caller can hold the
-/// TempDir guards for the duration of the test and inspect the
-/// resulting config file. Pattern mirrors
-/// `approve_scripts_interactive_tty::lpm_isolated`.
+/// Build a `lpm-rs` Command in an isolated HOME. The TempDirs are
+/// returned so the caller holds them for the test's lifetime.
 fn lpm_isolated() -> (Command, TempDir, TempDir) {
     let project = TempDir::new().expect("create temp project");
     let home = TempDir::new().expect("create temp home");

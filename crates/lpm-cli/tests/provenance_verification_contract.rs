@@ -1,59 +1,9 @@
-//! **Tier placement: cli-binary** (per CLAUDE.md `# Testing Tier
-//! Discipline`). Justification class: **parser/schema corpus**. This
-//! file iterates committed JSON fixtures under
-//! `tests/fixtures/sigstore_bundles/` and pins the *wire shapes* the
-//! verifier must continue to recognise — no binary spawn, no
-//! `TempProject`. Mirrors the layout of [`lpm_config_schema_corpus`].
+//! Cli-binary tier — parser/schema corpus. Iterates the committed
+//! JSON fixtures under `tests/fixtures/sigstore_bundles/` and pins
+//! the wire-shape inventory the parser must continue to recognise.
 //!
-//! Why a separate corpus when `sigstore_verify.rs` already carries an
-//! inline `#[cfg(test)]` block with 100+ tests?
-//!
-//! - The inline tests build bundles from rcgen + p256 primitives.
-//!   They are exhaustive on *cryptographic* behaviour (DSSE, chain,
-//!   SCT, Rekor SET, inclusion proof, identity pinning) but they say
-//!   nothing about the *exact JSON byte shape* npm and GitHub
-//!   `attest-build-provenance` actually emit. If a future serde
-//!   refactor flipped `#[serde(rename_all = "camelCase")]` off, or a
-//!   field rename slipped through, the inline tests would keep
-//!   passing while production install paths silently broke.
-//!
-//! - The committed fixtures here are pure JSON files captured / hand-
-//!   crafted to match the three wire shapes the production
-//!   [`crate::sigstore_verify::parse_bundle_components`] is documented
-//!   to accept. This corpus pins the shape inventory: if `npm` ever
-//!   ships a v4 wrapper, or GitHub adds a new media type, the new
-//!   shape lands as a fixture here *with a corresponding test*, and
-//!   adding the fixture without the shape-detection arm fails this
-//!   suite.
-//!
-//! Why not call `verify_sigstore_bundle` directly? `lpm-cli` is a
-//! `[[bin]]`-only crate (no `[lib]` target). External integration
-//! tests cannot import its Rust API. The verifier's end-to-end
-//! behaviour is covered by:
-//!
-//! - The inline `#[cfg(test)]` corpus in `crates/lpm-cli/src/sigstore_verify.rs`.
-//! - The workflow tests in `tests/workflows/tests/install_provenance.rs`
-//!   which drive the real fetch + verify path through the spawned
-//!   `lpm-rs` binary.
-//!
-//! Fixture naming:
-//!
-//! - `NN-v0.x-<descriptor>.json` — must match one of the three known
-//!   wire shapes (v0.2 chain, v0.3 single-cert, or npm wrapper).
-//! - `NN-invalid-<descriptor>.{json,txt}` — must NOT match any known
-//!   shape; either because the JSON is malformed, the wrapper is
-//!   structurally wrong, or a required field is missing.
-//!
-//! When this test fails the cause is one of:
-//!
-//!  - The wire format the registry emits drifted → add a fixture and
-//!    a shape-detection arm to `detect_shape` below.
-//!  - The parser's shape inventory is wrong → fix
-//!    `parse_bundle_components` in `sigstore_verify.rs` and update
-//!    the matching arm here.
-//!  - A fixture got hand-edited and now parses differently → restore
-//!    the fixture or, if intentional, rename it with the matching
-//!    prefix.
+//! Naming: `NN-<descriptor>.json` for positive shapes,
+//! `NN-invalid-<descriptor>.{json,txt}` for known-bad inputs.
 
 use std::collections::BTreeMap;
 use std::fs;
