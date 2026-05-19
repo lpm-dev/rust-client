@@ -1619,6 +1619,26 @@ impl TrustedDependencies {
             .max_by(|(v1, _), (v2, _)| v1.cmp(v2))
     }
 
+    /// Look up an existing rich-form binding by exact `name@version`
+    /// key. Returns `None` on Legacy state or when no entry matches.
+    ///
+    /// Used by the approval write path's provenance-preservation
+    /// logic: when a re-approval would overwrite a prior verified
+    /// snapshot with `None` (Warn-mode + verifier rejection), the
+    /// caller substitutes the prior `provenance_at_approval` rather
+    /// than silently clearing the drift reference.
+    pub fn binding_for_exact_version(
+        &self,
+        name: &str,
+        version: &str,
+    ) -> Option<&TrustedDependencyBinding> {
+        let TrustedDependencies::Rich(map) = self else {
+            return None;
+        };
+        let key = Self::rich_key(name, version);
+        map.get(&key)
+    }
+
     /// Remove an approval entry by exact `name@version` key. Returns
     /// `true` if the entry existed and was removed.
     ///

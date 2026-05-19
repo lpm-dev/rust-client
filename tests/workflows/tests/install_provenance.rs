@@ -708,14 +708,105 @@ async fn mount_scripted_pkg_with_unverifiable_bundle(
         .await;
 
     // Unverifiable bundle — structurally-valid v0.2 minimal shape.
-    // Post-Phase-2.1 the verifier rejects this at the dsseEnvelope /
-    // tlogEntries pre-flight, which is exactly the rejection variant
-    // the SILENT-DROP fix needs.
+    // Post-SILENT-DROP fix the verifier rejects this at the
+    // dsseEnvelope / tlogEntries pre-flight, which is exactly the
+    // rejection variant the fix needs to exercise.
     let bundle = sigstore_bundle_for_identity(
         "github:attacker/forged",
         ".github/workflows/build.yml",
         "refs/tags/v1.0.0",
     );
+    Mock::given(method("GET"))
+        .and(path(format!("/-/attestations/{name}@{version}")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(bundle))
+        .mount(server)
+        .await;
+}
+
+/// Same as [`mount_scripted_pkg_with_unverifiable_bundle`] but the
+/// served bundle's SAN URI encodes the supplied identity, so the
+/// install-time drift comparator passes (identity matches the
+/// pre-seeded approval). The bundle is still structurally
+/// unverifiable, so the verifier rejects it.
+///
+/// Used by the warn-mode preservation regression guard: drift must
+/// pass (we're testing what happens when the SAME version with the
+/// SAME identity gets re-approved while its bundle can't be
+/// verified), but the verifier must reject (so the snapshot
+/// projection returns `None` and the preservation logic kicks in).
+async fn mount_scripted_pkg_with_identity_matched_unverifiable_bundle(
+    mock: &MockRegistry,
+    name: &str,
+    version: &str,
+    publisher: &'static str,
+    workflow_path: &'static str,
+    workflow_ref: &'static str,
+) {
+    use support::mock_registry::{compute_integrity, make_tarball_from_pkg_json};
+
+    let pkg_json = serde_json::json!({
+        "name": name,
+        "version": version,
+        "license": "MIT",
+        "main": "index.js",
+        "scripts": { "postinstall": "node -e \"process.exit(0)\"" },
+    });
+    let tarball = make_tarball_from_pkg_json(pkg_json, &[]);
+    let att_url = format!("{}/-/attestations/{name}@{version}", mock.url());
+    let tarball_url = format!("{}/tarballs/{name}/-/{name}-{version}.tgz", mock.url());
+    let integrity = compute_integrity(&tarball);
+    let metadata = serde_json::json!({
+        "name": name,
+        "dist-tags": { "latest": version },
+        "versions": {
+            version: {
+                "name": name,
+                "version": version,
+                "scripts": { "postinstall": "node -e \"process.exit(0)\"" },
+                "dist": {
+                    "tarball": tarball_url,
+                    "integrity": integrity,
+                    "attestations": {
+                        "url": att_url,
+                        "provenance": { "predicateType": "https://slsa.dev/provenance/v1" }
+                    },
+                },
+                "dependencies": {}
+            }
+        },
+        "time": { version: "2025-01-01T00:00:00.000Z" }
+    });
+
+    let server = mock.server();
+    Mock::given(method("GET"))
+        .and(path(format!("/api/registry/{name}")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(metadata.clone()))
+        .mount(server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path(format!("/{name}")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(metadata.clone()))
+        .mount(server)
+        .await;
+    mock.with_batch_metadata(vec![metadata]).await;
+    Mock::given(method("GET"))
+        .and(path(format!("/tarballs/{name}/-/{name}-{version}.tgz")))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_bytes(tarball)
+                .insert_header("content-type", "application/octet-stream"),
+        )
+        .mount(server)
+        .await;
+
+    // Identity-matched bundle: SAN URI encodes the supplied
+    // (publisher, workflow_path, workflow_ref) so the install-time
+    // drift comparator sees the same identity as the pre-seeded
+    // approval. The bundle is still structurally minimal (no
+    // dsseEnvelope, no tlogEntries) so the cryptographic verifier
+    // rejects it — VerificationRejected propagates to the approve
+    // path's snapshot projection.
+    let bundle = sigstore_bundle_for_identity(publisher, workflow_path, workflow_ref);
     Mock::given(method("GET"))
         .and(path(format!("/-/attestations/{name}@{version}")))
         .respond_with(ResponseTemplate::new(200).set_body_json(bundle))
@@ -900,6 +991,133 @@ async fn approve_scripts_under_warn_logs_and_proceeds_when_verifier_rejects() {
         combined.contains("LPM_PROVENANCE_ENFORCE=deny"),
         "warn notice must point at the deny re-enable knob so operators know how to tighten back \
          to fail-closed; got:\n{combined}",
+    );
+}
+
+/// Warn-mode re-approval of an exact version that already carries
+/// a prior verified snapshot MUST preserve that snapshot rather
+/// than overwriting it with `provenanceAtApproval: null`. Pre-fix,
+/// `approve_with_metadata` unconditionally inserted a new entry
+/// keyed by `name@version`, and snapshot projection returned `None`
+/// under Warn+VerificationRejected — so a re-approval silently
+/// cleared the prior identity reference. Subsequent installs would
+/// then read `(None, _)` in the drift comparator and short-circuit
+/// to `NoDrift`, permanently disarming detection of publisher
+/// rotation for that exact version on that machine.
+///
+/// Setup: same identity in the pre-seed and the served bundle (so
+/// the install-time drift comparator passes), but the bundle is
+/// structurally unverifiable (verifier rejects at the DSSE /
+/// tlogEntries pre-flight). Under warn, install + approve both
+/// proceed; preservation must keep the pre-seeded snapshot intact.
+#[tokio::test]
+async fn approve_scripts_under_warn_preserves_existing_provenance_on_re_approval() {
+    let dep = "scripted-pkg-warn-preserve";
+    let version = "1.0.0";
+    let project = TempProject::empty(&format!(
+        r#"{{"name":"warn-preserve-test","version":"1.0.0","dependencies":{{"{dep}":"^1.0.0"}}}}"#,
+    ));
+
+    let pinned_publisher = "github:acme-prior/widget";
+    let pinned_workflow_path = ".github/workflows/release.yml";
+    let pinned_workflow_ref = "refs/tags/v1.0.0";
+    let pinned_cert_sha = "sha256-pinned-leaf-from-prior-approval";
+    let manifest = serde_json::json!({
+        "name": "warn-preserve-test",
+        "version": "1.0.0",
+        "dependencies": { dep: "^1.0.0" },
+        "lpm": {
+            "minimumReleaseAge": 0,
+            "trustedDependencies": {
+                format!("{dep}@{version}"): {
+                    "integrity": "sha512-prior",
+                    "scriptHash": "sha256-prior",
+                    "provenanceAtApproval": {
+                        "present": true,
+                        "publisher": pinned_publisher,
+                        "workflowPath": pinned_workflow_path,
+                        "workflowRef": pinned_workflow_ref,
+                        "attestation_cert_sha256": pinned_cert_sha,
+                    },
+                },
+            },
+        },
+    });
+    project.write_file(
+        "package.json",
+        &serde_json::to_string_pretty(&manifest).unwrap(),
+    );
+
+    let mock = MockRegistry::start().await;
+    mount_scripted_pkg_with_identity_matched_unverifiable_bundle(
+        &mock,
+        dep,
+        version,
+        pinned_publisher,
+        pinned_workflow_path,
+        pinned_workflow_ref,
+    )
+    .await;
+
+    let install_out = lpm_with_registry(&project, &mock.url())
+        .env("LPM_PROVENANCE_ENFORCE", "warn")
+        .args(["install"])
+        .output()
+        .expect("spawn lpm install under warn");
+    assert!(
+        install_out.status.success(),
+        "install under warn with identity-matched-but-unverifiable bundle must succeed;\n\
+         stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&install_out.stdout),
+        String::from_utf8_lossy(&install_out.stderr),
+    );
+
+    let approve_out = lpm_with_registry(&project, &mock.url())
+        .env("LPM_PROVENANCE_ENFORCE", "warn")
+        .args(["approve-scripts", dep])
+        .output()
+        .expect("spawn lpm approve-scripts <pkg> under warn mode");
+
+    assert!(
+        approve_out.status.success(),
+        "approve-scripts under warn MUST succeed;\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&approve_out.stdout),
+        String::from_utf8_lossy(&approve_out.stderr),
+    );
+
+    let after = project.read_file("package.json");
+    let after_json: serde_json::Value = serde_json::from_str(&after).expect("manifest parses");
+    let binding = after_json["lpm"]["trustedDependencies"]
+        .as_object()
+        .expect("rich-form trustedDependencies must persist after re-approval")
+        .get(&format!("{dep}@{version}"))
+        .unwrap_or_else(|| {
+            panic!(
+                "rich-form binding for {dep}@{version} must persist after re-approval; \
+                 got manifest:\n{after}",
+            )
+        });
+
+    let pa = binding.get("provenanceAtApproval").unwrap_or_else(|| {
+        panic!(
+            "binding MUST still carry provenanceAtApproval after a warn-mode re-approval — \
+             this is the GPT-flagged erasure regression; got binding:\n{binding:#?}",
+        )
+    });
+    assert_eq!(
+        pa["publisher"].as_str(),
+        Some(pinned_publisher),
+        "preserved publisher must equal the prior verified value, byte-for-byte; got: {pa:#?}",
+    );
+    assert_eq!(
+        pa["workflowPath"].as_str(),
+        Some(pinned_workflow_path),
+        "preserved workflowPath must equal the prior verified value; got: {pa:#?}",
+    );
+    assert_eq!(
+        pa["attestation_cert_sha256"].as_str(),
+        Some(pinned_cert_sha),
+        "preserved cert SHA must equal the prior verified value; got: {pa:#?}",
     );
 }
 

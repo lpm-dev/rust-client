@@ -78,6 +78,40 @@ fn approval_metadata_from_blocked(
     }
 }
 
+/// Build approval metadata, preserving any prior verified
+/// `provenance_at_approval` if the incoming snapshot is `None` and
+/// an existing exact-version binding carries one.
+///
+/// Why: `TrustedDependencies::approve_with_metadata` unconditionally
+/// overwrites the rich-map entry for `name@version`. Under Warn /
+/// Off, [`snapshot_for_binding_with_mode`] returns `Ok(None)` on
+/// `VerificationRejected` so the approval can proceed without the
+/// new verifier observation. If the user had previously approved
+/// the SAME exact version under Deny (with a verified snapshot
+/// recorded), a naive re-approval would silently clear that
+/// snapshot, permanently disarming drift detection for that exact
+/// version. Preserving the prior value keeps the drift reference
+/// intact while the new approval still goes through.
+///
+/// The preservation only fires when the *new* snapshot is `None`.
+/// A Verified re-approval (incoming `Some(new)`) always wins —
+/// fresh successful verification is the strongest signal.
+fn approval_metadata_preserving_existing_provenance(
+    trusted: &TrustedDependencies,
+    blocked: &BlockedPackage,
+    capability_hash: Option<String>,
+    incoming: Option<ProvenanceSnapshot>,
+) -> ApprovalMetadata {
+    let mut meta = approval_metadata_from_blocked(blocked, capability_hash, incoming);
+    if meta.provenance_at_approval.is_none()
+        && let Some(existing) = trusted.binding_for_exact_version(&blocked.name, &blocked.version)
+        && let Some(prior) = existing.provenance_at_approval.clone()
+    {
+        meta.provenance_at_approval = Some(prior);
+    }
+    meta
+}
+
 /// Fetch attestation snapshots for an effective
 /// blocked set at approval time.
 ///
@@ -584,11 +618,13 @@ async fn run_under_store_lock(
             // verifier rejected the bundle, refusing the approval
             // rather than blanking `provenance_at_approval`.
             let snap = snapshot_for_binding(&provenance_by_pkg, &target.name, &target.version)?;
-            trusted.approve_with_metadata(
-                &target.name,
-                &target.version,
-                approval_metadata_from_blocked(target, capability_hash.clone(), snap),
+            let meta = approval_metadata_preserving_existing_provenance(
+                &trusted,
+                target,
+                capability_hash.clone(),
+                snap,
             );
+            trusted.approve_with_metadata(&target.name, &target.version, meta);
             approved.push(target);
             // close-out short-circuit the write
             // under `--dry-run`; the approval intent is still
@@ -695,11 +731,13 @@ async fn run_under_store_lock(
             // `None` (which would silently disarm drift detection on
             // every subsequent install).
             let snap = snapshot_for_binding(&provenance_by_pkg, &blocked.name, &blocked.version)?;
-            trusted.approve_with_metadata(
-                &blocked.name,
-                &blocked.version,
-                approval_metadata_from_blocked(blocked, capability_hash.clone(), snap),
+            let meta = approval_metadata_preserving_existing_provenance(
+                &trusted,
+                blocked,
+                capability_hash.clone(),
+                snap,
             );
+            trusted.approve_with_metadata(&blocked.name, &blocked.version, meta);
             approved.push(blocked);
         }
         // close-out short-circuit under `--dry-run`.
@@ -866,15 +904,22 @@ async fn run_under_store_lock(
     // Apply approvals (atomic single write)
     for blocked in &approved {
         // write-path — see the direct-approve branch earlier for the rationale.
-        // Phase 2.2 SILENT-DROP fix: `?` on the verifier-rejection
-        // arm refuses to record an approval rather than blanking the
-        // prior `provenance_at_approval` and disarming drift checks.
+        // SILENT-DROP fix: `?` on the verifier-rejection arm refuses
+        // to record an approval rather than blanking the prior
+        // `provenance_at_approval` and disarming drift checks.
+        // Warn-mode preservation: when the snapshot is `None` but a
+        // prior verified snapshot exists for the exact same version,
+        // preserve it rather than overwriting with `None` —
+        // otherwise a re-approval under Warn would silently clear
+        // the prior reference and disarm drift detection.
         let snap = snapshot_for_binding(&provenance_by_pkg, &blocked.name, &blocked.version)?;
-        trusted.approve_with_metadata(
-            &blocked.name,
-            &blocked.version,
-            approval_metadata_from_blocked(blocked, capability_hash.clone(), snap),
+        let meta = approval_metadata_preserving_existing_provenance(
+            &trusted,
+            blocked,
+            capability_hash.clone(),
+            snap,
         );
+        trusted.approve_with_metadata(&blocked.name, &blocked.version, meta);
     }
     // close-out under `--dry-run`, skip the atomic
     // write; `approved` / `skipped` still fed into `print_summary`
@@ -2792,9 +2837,15 @@ mod tests {
 
     /// Under `Warn` (rollout-window posture), a
     /// `VerificationRejected` status returns `Ok(None)` so the
-    /// approval proceeds and the binding records
-    /// `provenance_at_approval: None`. The loud `tracing::warn` +
-    /// `output::warn` lines are the operator-monitoring contract.
+    /// approval can proceed without a fresh verifier observation.
+    /// This is only one half of the warn-mode contract: the write
+    /// path then runs `approval_metadata_preserving_existing_provenance`
+    /// which substitutes the prior `provenance_at_approval` if one
+    /// exists, so a re-approval under Warn does NOT clear a
+    /// previously-verified snapshot. The preservation behavior is
+    /// pinned by
+    /// `approval_metadata_preserving_existing_provenance_preserves_prior_snapshot_on_none`
+    /// below; this test pins only the snapshot-projection seam.
     #[test]
     fn snapshot_for_binding_warn_returns_none_on_verification_rejected() {
         let map = map_with(
@@ -2842,6 +2893,107 @@ mod tests {
                 .expect("missing pkg projects to Ok(None) regardless of mode");
             assert!(r.is_none());
         }
+    }
+
+    /// Load-bearing warn-mode regression guard: when the snapshot
+    /// projection returns `None` (Warn + VerificationRejected, or
+    /// any TransportDegraded), an existing exact-version binding's
+    /// `provenance_at_approval` MUST be preserved rather than
+    /// overwritten. Re-approving the same version with a `None`
+    /// snapshot must not silently clear the prior verified identity
+    /// and disarm drift detection.
+    #[test]
+    fn approval_metadata_preserving_existing_provenance_preserves_prior_snapshot_on_none() {
+        let prior_snap = ProvenanceSnapshot {
+            present: true,
+            publisher: Some("github:acme/widget".into()),
+            workflow_path: Some(".github/workflows/publish.yml".into()),
+            workflow_ref: Some("refs/tags/v1.0.0".into()),
+            attestation_cert_sha256: Some("sha256-leaf-prior".into()),
+        };
+        let mut trusted = TrustedDependencies::default();
+        trusted.approve_with_metadata(
+            "acme-widget",
+            "1.0.0",
+            ApprovalMetadata {
+                integrity: Some("sha512-prior".into()),
+                script_hash: Some("sha256-prior".into()),
+                provenance_at_approval: Some(prior_snap.clone()),
+                behavioral_tags_hash: None,
+                behavioral_tags: None,
+                capability_hash: None,
+            },
+        );
+
+        let blocked = make_blocked("acme-widget", "1.0.0");
+        let meta = approval_metadata_preserving_existing_provenance(&trusted, &blocked, None, None);
+        let preserved = meta
+            .provenance_at_approval
+            .expect("preservation must substitute prior snapshot when incoming is None");
+        assert_eq!(preserved.publisher.as_deref(), Some("github:acme/widget"));
+        assert_eq!(
+            preserved.attestation_cert_sha256.as_deref(),
+            Some("sha256-leaf-prior"),
+            "preserved snapshot must be the exact prior binding's snapshot, byte-for-byte",
+        );
+    }
+
+    /// A fresh Verified observation always wins over the prior
+    /// snapshot. Without this assertion the preservation logic
+    /// could mask a legitimate identity change (publisher rotated,
+    /// workflow path moved) by sticking with the stale prior value.
+    #[test]
+    fn approval_metadata_preserving_existing_provenance_lets_fresh_verified_win() {
+        let prior_snap = ProvenanceSnapshot {
+            present: true,
+            publisher: Some("github:acme/widget".into()),
+            attestation_cert_sha256: Some("sha256-leaf-prior".into()),
+            ..Default::default()
+        };
+        let mut trusted = TrustedDependencies::default();
+        trusted.approve_with_metadata(
+            "acme-widget",
+            "1.0.0",
+            ApprovalMetadata {
+                provenance_at_approval: Some(prior_snap.clone()),
+                ..Default::default()
+            },
+        );
+
+        let new_snap = ProvenanceSnapshot {
+            present: true,
+            publisher: Some("github:acme/widget".into()),
+            attestation_cert_sha256: Some("sha256-leaf-NEW".into()),
+            ..Default::default()
+        };
+        let blocked = make_blocked("acme-widget", "1.0.0");
+        let meta = approval_metadata_preserving_existing_provenance(
+            &trusted,
+            &blocked,
+            None,
+            Some(new_snap.clone()),
+        );
+        assert_eq!(
+            meta.provenance_at_approval
+                .expect("incoming Some must pass through")
+                .attestation_cert_sha256
+                .as_deref(),
+            Some("sha256-leaf-NEW"),
+            "fresh Verified snapshot must replace the prior — preservation only fires on None",
+        );
+    }
+
+    /// First-time approval (no prior binding) with a `None` incoming
+    /// snapshot still records `None` — there's nothing to preserve.
+    #[test]
+    fn approval_metadata_preserving_existing_provenance_passes_none_through_on_first_approval() {
+        let trusted = TrustedDependencies::default();
+        let blocked = make_blocked("first-time-pkg", "1.0.0");
+        let meta = approval_metadata_preserving_existing_provenance(&trusted, &blocked, None, None);
+        assert!(
+            meta.provenance_at_approval.is_none(),
+            "first-time approval with no prior binding has nothing to preserve",
+        );
     }
 
     fn write_manifest(path: &Path, value: &serde_json::Value) {
