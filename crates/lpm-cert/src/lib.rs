@@ -9,6 +9,7 @@
 pub mod ca;
 pub mod cert;
 pub mod framework;
+pub mod name_constraints;
 pub mod paths;
 pub mod trust;
 
