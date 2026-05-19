@@ -1,0 +1,26 @@
+---
+source: tests/workflows/tests/json_output.rs
+assertion_line: 540
+expression: envelope
+---
+{
+  "verified_true_when_cryptographic_verification_succeeded": {
+    "verified": true
+  },
+  "verified_false_when_registry_served_no_attestation": {
+    "verified": false
+  },
+  "verified_skipped_when_per_package_cli_carve_out": {
+    "verified": "skipped"
+  },
+  "verified_disabled_when_fleet_wide_sigstore_off": {
+    "verified": "disabled"
+  },
+  "verified_null_when_transport_degraded": {
+    "verified": null
+  },
+  "verified_rejected_carries_rejection_reason_sibling_field": {
+    "verified": "verification_rejected",
+    "rejection_reason": "Rekor SET verification failed: signature did not verify under pinned key"
+  }
+}

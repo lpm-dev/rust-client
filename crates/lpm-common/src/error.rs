@@ -210,6 +210,19 @@ pub enum LpmError {
         )
     )]
     SelfUpdateRateLimited(String),
+
+    #[error("provenance verification failed: {0}")]
+    #[diagnostic(
+        code(lpm::provenance_verification),
+        help(
+            "A Sigstore attestation was fetched for this package but failed cryptographic \
+             verification (chain, SET, SCT, inclusion proof, DSSE signature, Rekor body, or \
+             identity-pin check). The registry may be compromised or serving a corrupt bundle. \
+             Use `--unverified-provenance <pkg>` to opt out for this specific package if you \
+             have reason to trust it through another channel."
+        )
+    )]
+    ProvenanceVerification(String),
 }
 
 impl LpmError {
@@ -247,6 +260,7 @@ impl LpmError {
             LpmError::EngineMismatch { .. } => "engine_mismatch",
             LpmError::SelfUpdatePaused(_) => "self_update_paused",
             LpmError::SelfUpdateRateLimited(_) => "self_update_rate_limited",
+            LpmError::ProvenanceVerification(_) => "provenance_verification",
         }
     }
 }

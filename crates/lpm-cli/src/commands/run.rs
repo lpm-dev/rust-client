@@ -1566,14 +1566,14 @@ pub async fn dlx(
         crate::commands::install::run_with_options(
             client,
             install.root(),
-            false,                                                 // json_output
-            false,                                                 // offline
-            false,                                                 // force
-            false,                                                 // allow_new
-            false,                                                 // strict_integrity
-            None,                                                  // linker_override
-            false,                                                 // no_skills
-            false,                                                 // no_editor_setup
+            false,                                                   // json_output
+            false,                                                   // offline
+            false,                                                   // force
+            false,                                                   // allow_new
+            false,                                                   // strict_integrity
+            None,                                                    // linker_override
+            false,                                                   // no_skills
+            false,                                                   // no_editor_setup
             true,  // no_security_summary (dlx doesn't need it)
             false, // auto_build
             None,  // target_set: dlx is single-project
@@ -1582,6 +1582,7 @@ pub async fn dlx(
             None,  // advisor_override: `lpm dlx` does not expose `--advisor`
             None,  // min_release_age_override: `lpm dlx` uses the chain
             crate::provenance_fetch::DriftIgnorePolicy::default(), // drift-ignore: `lpm dlx` enforces drift
+            crate::provenance_fetch::VerifyPolicy::resolve_no_cli(), // verify-policy: dlx honors env + config posture chain
             // dlx does not surface its own
             // sandbox-mode flags. The env / config / default chain
             // inside `rebuild::run` still applies.

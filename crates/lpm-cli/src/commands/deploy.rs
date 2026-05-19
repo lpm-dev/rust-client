@@ -749,6 +749,11 @@ pub async fn run(
         // trustedDependencies the project defined, so legitimately-
         // identical identities pass normally.
         crate::provenance_fetch::DriftIgnorePolicy::default(),
+        // verify-policy: `lpm deploy` does not surface its own
+        // `--unverified-provenance{,-all}` flags. Honors the
+        // operator-persistent posture chain (env + `[sigstore]
+        // verify` config) for uniformity with `lpm install`.
+        crate::provenance_fetch::VerifyPolicy::resolve_no_cli(),
         // `lpm deploy` does not surface its own
         // sandbox-mode flags. CI deployers can still flip strict
         // via `LPM_STRICT_SANDBOX=1`; the env tier of the chain
