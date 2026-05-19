@@ -6730,7 +6730,7 @@ mod tests {
         );
     }
 
-    // ── Phase 1.8 — find_leaf_issuer_spki ─────────────────────────
+    // ── find_leaf_issuer_spki ─────────────────────────────────────
 
     #[test]
     fn find_leaf_issuer_spki_picks_intermediate_when_chain_provides_it() {
@@ -6751,6 +6751,76 @@ mod tests {
         // Sanity: returned SPKI must be the intermediate's, not the leaf's.
         let (_, intermediate_parsed) = X509Certificate::from_der(&intermediate_der).unwrap();
         assert_eq!(spki, intermediate_parsed.tbs_certificate.subject_pki.raw);
+    }
+
+    // ── Placeholder-fixture rejection (defense in depth) ─────────
+    //
+    // The committed fixtures at `tests/fixtures/sigstore_bundles/`
+    // are wire-shape representative but cryptographically fake
+    // (zero SPKI points, zero signatures, all-zero log_id). The
+    // contract test asserts they parse cleanly; this complement
+    // asserts they CANNOT verify against the embedded trust root.
+    // Closes the observational-only fixture-safety gap: a future
+    // edit that accidentally turned a placeholder into a real
+    // signed bundle would break here.
+
+    fn load_fixture_bundle(name: &str) -> Vec<u8> {
+        let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests")
+            .join("fixtures")
+            .join("sigstore_bundles")
+            .join(name);
+        std::fs::read(&path)
+            .unwrap_or_else(|e| panic!("read fixture {}: {e}", path.display()))
+    }
+
+    /// Walk every positive (non-`invalid`) fixture and assert the
+    /// composed verifier rejects with a NON-`BundleParse` error
+    /// variant. `BundleParse` would mean the parser stopped before
+    /// reaching crypto — that's the contract-test's territory, not
+    /// this test's. Reaching the chain/SCT/DSSE/Rekor primitives
+    /// and being rejected there is the proof that the fixture is
+    /// inert against the real trust root.
+    #[test]
+    fn placeholder_fixtures_never_verify_against_embedded_trust_root() {
+        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests")
+            .join("fixtures")
+            .join("sigstore_bundles");
+        let mut checked = 0;
+        for entry in std::fs::read_dir(&dir).expect("fixtures dir") {
+            let entry = entry.expect("dirent");
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if !name.ends_with(".json") || name.contains("invalid") {
+                continue;
+            }
+            let body = load_fixture_bundle(&name);
+            for opts in [VerifyOptions::npm_attestation(), VerifyOptions::strict()] {
+                match verify_sigstore_bundle(&body, &IdentityExpectations::none(), opts) {
+                    Ok(_) => panic!(
+                        "placeholder fixture `{name}` accidentally verified against the real \
+                         Sigstore trust root — the fixture is no longer inert. If a real \
+                         captured bundle was added, name it without `invalid` and pair it with \
+                         a positive test."
+                    ),
+                    Err(VerifyError::BundleParse(msg)) => panic!(
+                        "placeholder fixture `{name}` rejected at the parser ({msg}) instead of \
+                         reaching cryptographic primitives. The contract test's job is to pin \
+                         parser behaviour; this test must reach chain/SCT/DSSE/Rekor and be \
+                         rejected there. Fix: ensure the fixture has enough structure to parse \
+                         (valid base64 rawBytes, well-formed DSSE envelope, non-empty \
+                         tlogEntries)."
+                    ),
+                    Err(_other) => {
+                        checked += 1;
+                    }
+                }
+            }
+        }
+        assert!(
+            checked >= 6,
+            "expected at least 3 positive fixtures × 2 policies = 6 rejection checks; ran {checked}",
+        );
     }
 
     // ─── Per-primitive microbench ────────────────────────────────
