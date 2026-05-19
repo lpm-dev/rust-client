@@ -1296,16 +1296,16 @@ impl TrustedDependencies {
     /// Rich form — at that point no concrete `(integrity, script_hash)`
     /// binding exists yet. Honoring `@*` as `LegacyNameOnly` here would
     /// auto-trust every future version of the package under the
-    /// inherited name-only approval, which is the cross-version trust
-    /// laundering vulnerability documented as H17: an attacker who
-    /// compromises a previously-approved maintainer's publish flow
-    /// ships a malicious v1.0.1 that inherits v1.0.0's approval token
-    /// without integrity or script_hash checks. The user is forced
-    /// through `lpm approve-scripts` on each new version, which writes
-    /// a concrete `name@version` entry that closes the loop.
-    /// `Vec<String>` legacy form is preserved as `LegacyNameOnly`
-    /// because that shape is an explicit user-authored decision in
-    /// the manifest, distinct from the auto-generated `@*` sentinel.
+    /// inherited name-only approval, which is a cross-version trust
+    /// laundering surface: an attacker who compromises a previously-
+    /// approved maintainer's publish flow ships a malicious v1.0.1
+    /// that inherits v1.0.0's approval token without integrity or
+    /// script_hash checks. The user is forced through `lpm approve-scripts`
+    /// on each new version, which writes a concrete `name@version`
+    /// entry that closes the loop. `Vec<String>` legacy form is
+    /// preserved as `LegacyNameOnly` because that shape is an explicit
+    /// user-authored decision in the manifest, distinct from the
+    /// auto-generated `@*` sentinel.
     ///
     /// **Lookup precedence:** concrete `name@version` Rich keys are the
     /// only Rich-form keys that participate in the strict trust decision.
@@ -1329,11 +1329,11 @@ impl TrustedDependencies {
             TrustedDependencies::Rich(map) => {
                 // Concrete `name@version` is the only Rich-form key that
                 // participates in the strict trust decision. A `name@*`
-                // sentinel is an auto-generated migration marker and
-                // would auto-trust every future version of the package
-                // under the inherited name-only approval — the H17
-                // cross-version trust laundering vulnerability. See the
-                // method docstring for the full rationale.
+                // sentinel is an auto-generated migration marker; honoring
+                // it here would auto-trust every future version of the
+                // package under the inherited name-only approval. See the
+                // method docstring for the cross-version trust laundering
+                // rationale.
                 let concrete_key = Self::rich_key(name, version);
                 if let Some(stored) = map.get(&concrete_key) {
                     // Field-by-field check. A None field on either side is
@@ -1388,8 +1388,8 @@ impl TrustedDependencies {
     /// Lookup precedence mirrors [`Self::matches_strict`]:
     /// - Rich entries: only the concrete `{name}@{version}` key matches.
     ///   `name@*` migration sentinels are NOT considered a binding source
-    ///   for capability decisions — same H17 rationale as
-    ///   [`Self::matches_strict`].
+    ///   for capability decisions — same cross-version trust laundering
+    ///   rationale as [`Self::matches_strict`].
     /// - Legacy entries: returns `None` — the legacy form has no binding.
     ///   Callers treat `None` as "legacy approval, no capability hash stored,"
     ///   which collapses via `is_approved_by` to the baseline-only semantic.
@@ -1441,11 +1441,11 @@ impl TrustedDependencies {
     /// sentinels are visible to [`Self::contains_name_lenient`] so the
     /// "still approved by name" deprecation warning continues to fire,
     /// but they DO NOT participate in the strict trust gate
-    /// ([`Self::matches_strict`]) — see that method's doc for the H17
-    /// rationale. The next install of any concrete version forces
-    /// the user through `lpm approve-scripts`, which writes a full
-    /// `name@version` Rich entry that REPLACES the sentinel-only trust
-    /// with content-bound trust.
+    /// ([`Self::matches_strict`]) — see that method's doc for the
+    /// cross-version trust laundering rationale. The next install of
+    /// any concrete version forces the user through `lpm approve-scripts`,
+    /// which writes a full `name@version` Rich entry that REPLACES the
+    /// sentinel-only trust with content-bound trust.
     pub fn upgrade_to_rich(&mut self) {
         if matches!(self, TrustedDependencies::Rich(_)) {
             return;
@@ -4018,14 +4018,13 @@ mod trusted_dependencies_tests {
         // install, which writes a concrete `sharp@0.33.0` Rich entry that
         // binds the trust to the specific (integrity, script_hash) tuple.
         // Honoring the sentinel here would auto-trust every future version
-        // of sharp under the inherited name-only approval — the H17 cross-
-        // version trust laundering vulnerability.
+        // of sharp under the inherited name-only approval (cross-version
+        // trust laundering).
         assert_eq!(
             td.matches_strict("sharp", "0.33.0", Some("sha512-z"), Some("sha256-z")),
             TrustMatch::NotTrusted,
             "`name@*` migration sentinels MUST NOT auto-trust unknown \
-             versions — that is the H17 cross-version trust laundering \
-             surface. `contains_name_lenient` still walks the sentinel \
+             versions. `contains_name_lenient` still walks the sentinel \
              so the deprecation warning fires."
         );
         // The sentinel IS still visible to lenient lookups (used by the
@@ -4033,16 +4032,12 @@ mod trusted_dependencies_tests {
         assert!(td.contains_name_lenient("sharp"));
     }
 
-    /// Regression test for H17 — the H17 fix locks the new contract.
-    ///
     /// A `<name>@*` Rich-form sentinel MUST NOT auto-trust any concrete
-    /// version. This inverts the pre-fix
-    /// `matches_strict_handles_at_star_preserve_key_as_legacy_wildcard`
-    /// behavior which auto-trusted every version under the sentinel.
+    /// version. The user is forced through `lpm approve-scripts` on
+    /// each new version of the package, which writes a content-bound
+    /// `name@version` Rich entry that REPLACES the sentinel-only trust.
     #[test]
     fn matches_strict_at_star_sentinel_does_not_auto_trust_any_version() {
-        // Construct a Rich variant directly with a `@*` migration sentinel
-        // (the upgrade_to_rich marker).
         let mut map = HashMap::new();
         map.insert(
             "esbuild@*".to_string(),
@@ -4054,9 +4049,6 @@ mod trusted_dependencies_tests {
         );
         let td = TrustedDependencies::Rich(map);
 
-        // Every concrete version returns NotTrusted (was LegacyNameOnly
-        // pre-H17). The user is forced through approve-scripts on each
-        // new version, which writes a concrete `name@version` entry.
         for version in &["0.25.1", "0.25.2", "1.0.0", "0.0.0-beta.1"] {
             assert_eq!(
                 td.matches_strict("esbuild", version, None, None),
@@ -4072,7 +4064,7 @@ mod trusted_dependencies_tests {
 
     /// A scoped package whose only Rich entry is the `@scope/pkg@*`
     /// sentinel must also return NotTrusted for concrete versions —
-    /// scoped names participate in the same H17 closure as bare names.
+    /// scoped names follow the same rule as bare names.
     #[test]
     fn matches_strict_at_star_sentinel_does_not_auto_trust_scoped_package() {
         let mut map = HashMap::new();

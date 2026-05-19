@@ -4148,20 +4148,17 @@ mod tests {
         assert_eq!(trust, TrustMatch::NotTrusted);
     }
 
-    /// **H17 regression:** after `upgrade_to_rich` writes a `<name>@*`
-    /// migration sentinel, the strict gate MUST NOT auto-trust the
-    /// package — the user must concretely approve the specific version
-    /// via `lpm approve-scripts`, which writes a `name@version` Rich
-    /// entry that binds trust to `(integrity, script_hash)`. Auto-
-    /// trusting the sentinel would inherit the legacy name-only
-    /// approval onto every future version, the H17 cross-version trust
-    /// laundering surface.
+    /// After `upgrade_to_rich` writes a `<name>@*` migration sentinel
+    /// for a legacy `Vec<String>` trustedDependencies entry, the
+    /// strict gate MUST NOT auto-trust any concrete version of that
+    /// package. The user must approve the specific version via
+    /// `lpm approve-scripts`, which writes a `name@version` Rich
+    /// entry binding trust to `(integrity, script_hash)`.
     ///
-    /// Inverts the pre-H17 contract that returned `LegacyNameOnly` for
-    /// the sentinel. The legacy `Vec<String>` form retains its
-    /// `LegacyNameOnly` semantic because that is an explicit user-
-    /// authored shape; the `@*` sentinel is auto-generated and never
-    /// represented user consent to wildcard trust.
+    /// The legacy `Vec<String>` form retains `LegacyNameOnly` because
+    /// that is an explicit user-authored shape; the `@*` sentinel is
+    /// auto-generated and never represented user consent to wildcard
+    /// trust.
     #[test]
     fn build_strict_gate_legacy_upgraded_at_star_does_not_auto_trust() {
         let mut td = TrustedDependencies::Legacy(vec!["esbuild".into()]);
@@ -4175,8 +4172,8 @@ mod tests {
         assert_eq!(
             trust,
             TrustMatch::NotTrusted,
-            "post-H17: `@*` migration sentinels MUST NOT satisfy the strict \
-             gate. The user must re-approve via `lpm approve-scripts` to \
+            "`@*` migration sentinels MUST NOT satisfy the strict gate; \
+             the user must re-approve via `lpm approve-scripts` to \
              create a content-bound Rich entry."
         );
     }

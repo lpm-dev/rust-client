@@ -978,25 +978,21 @@ fn write_build_state_audit(project: &TempProject, entries: &[(&str, &str, &str, 
     );
 }
 
-/// **H17 regression — legacy bare-name upgrade no longer auto-trusts
-/// future versions.** A legacy `trustedDependencies: ["esbuild"]` that
-/// gets upgraded to the rich `esbuild@*` sentinel during `--yes`
-/// approval MUST NOT clear esbuild from the blocked set on a
-/// subsequent install where it appears as a concrete version. The
-/// `@*` sentinel is a migration marker, not a trust grant; the user
-/// must re-approve the concrete version via `lpm approve-scripts`,
-/// which writes a `esbuild@0.25.1` Rich entry with content-bound
+/// A legacy `trustedDependencies: ["esbuild"]` that gets upgraded
+/// to the rich `esbuild@*` sentinel during `--yes` approval MUST
+/// NOT clear esbuild from the blocked set on a subsequent install
+/// where it appears as a concrete version. The `@*` sentinel is a
+/// migration marker, not a trust grant; the user must re-approve
+/// the concrete version via `lpm approve-scripts`, which writes a
+/// `esbuild@0.25.1` Rich entry with content-bound
 /// `(integrity, script_hash)`. Honoring the sentinel for trust
-/// auto-trusted every future version under the inherited name-only
-/// approval — the H17 cross-version trust laundering surface.
-///
-/// Inverts the pre-H17 contract that asserted blocked_count == 0
-/// after the upgrade.
+/// would auto-trust every future version under the inherited
+/// name-only approval (cross-version trust laundering).
 #[test]
-fn approve_scripts_h17_at_star_sentinel_still_blocks_unknown_versions_after_install() {
+fn approve_scripts_at_star_sentinel_still_blocks_unknown_versions_after_install() {
     let project = TempProject::empty(
         r#"{
-  "name": "audit-h17-1",
+  "name": "approve-scripts-at-star-sentinel-fixture",
   "version": "0.0.0",
   "lpm": { "trustedDependencies": ["esbuild"] }
 }"#,
@@ -1059,7 +1055,7 @@ fn approve_scripts_h17_at_star_sentinel_still_blocks_unknown_versions_after_inst
     assert_eq!(
         parsed["blocked_count"].as_u64(),
         Some(1),
-        "H17: @* sentinel must NOT clear esbuild from the blocked set; \
+        "@* sentinel must NOT clear esbuild from the blocked set; \
          user must re-approve the concrete version via approve-scripts. \
          Envelope: {parsed:#}"
     );

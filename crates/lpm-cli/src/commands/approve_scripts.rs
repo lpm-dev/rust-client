@@ -4382,16 +4382,12 @@ mod tests {
     }
 
     /// **AUDIT REGRESSION ( +  interaction):**
-    /// **H17 regression:** after `upgrade_to_rich` writes a `<name>@*`
-    /// migration sentinel for a previously-legacy approval, the package
-    /// MUST remain in the effective blocked set until the user
-    /// concretely approves the specific version via `lpm approve-scripts`.
-    /// Honoring the sentinel here would auto-trust every future version
-    /// under the inherited name-only approval — the H17 cross-version
-    /// trust laundering surface.
-    ///
-    /// Inverts the pre-H17 contract that asserted the sentinel cleared
-    /// the package from the blocked set.
+    /// After `upgrade_to_rich` writes a `<name>@*` migration sentinel
+    /// for a previously-legacy approval, the package MUST remain in
+    /// the effective blocked set until the user concretely approves
+    /// the specific version via `lpm approve-scripts`. Honoring the
+    /// sentinel here would auto-trust every future version under the
+    /// inherited name-only approval (cross-version trust laundering).
     #[test]
     fn compute_effective_blocked_set_keeps_package_blocked_under_at_star_sentinel() {
         let state = BuildState {

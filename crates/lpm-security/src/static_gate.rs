@@ -979,6 +979,47 @@ fn is_safe_relative_path(p: &str) -> bool {
     p.split('/').all(|seg| seg != "..")
 }
 
+/// Extract the in-package relative path a `node <path>` lifecycle
+/// script delegates to. Returns `Some(path)` for any body that
+/// tokenizes (POSIX shell quoting) as exactly two tokens — the literal
+/// `node` followed by a single safe-relative `.js` / `.cjs` / `.mjs`
+/// path — and `None` for anything else.
+///
+/// Recognition mirrors the static gate's [`matches_node_relative`] and
+/// [`matches_delegating_identity_green`] rules. Every script body those
+/// two functions classify as Green via a `node <path>` shape is also
+/// detected here. Compound bodies, env-var paths, dynamic paths, and
+/// quoted shapes that escape the safe-relative check return `None` —
+/// callers fall back to treating the body as opaque (no embedded
+/// delegate annotation, no embedded review).
+///
+/// Single source of truth for three call sites that previously kept
+/// their own slightly-diverging parsers:
+/// - `lpm_security::script_hash::compute_script_hash` binds the
+///   delegate file's bytes into the approval hash so a malicious
+///   upgrade that changes the file body without changing the script
+///   string surfaces as `BindingDrift`.
+/// - `lpm_cli::build_state::parse_delegated_paths` surfaces the file
+///   contents in the advisor prompt so reviewers see the executed
+///   bytes, not just the delegate command line.
+/// - This module's classifier shapes ([`matches_node_relative`],
+///   [`matches_delegating_identity_green`]) use the tokenized path
+///   for their reserved-basename / identity-match branches.
+pub fn extract_delegate_path(body: &str) -> Option<String> {
+    let tokens = shlex::split(body)?;
+    if tokens.len() != 2 || tokens[0] != "node" {
+        return None;
+    }
+    let path = &tokens[1];
+    if !is_safe_relative_path(path) {
+        return None;
+    }
+    if !(path.ends_with(".js") || path.ends_with(".cjs") || path.ends_with(".mjs")) {
+        return None;
+    }
+    Some(path.clone())
+}
+
 // ─────────────────────────────────────────────────────────────────────
 // Delegate-to-local-file with matching identity
 // ─────────────────────────────────────────────────────────────────────
