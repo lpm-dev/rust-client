@@ -600,6 +600,18 @@ impl MockRegistry {
     }
 
     /// Mount a successful OIDC policy creation endpoint.
+    ///
+    /// Phase 3+4 of plan-security-findings-c3.md added `allowedWorkflows`
+    /// and `allowedEvents` to the policy schema. The mock verifies the
+    /// CLI sends both, so a regression that drops a field is caught here
+    /// (the mock's `.expect(1)` only fires if every `body_string_contains`
+    /// gate matches the actual request body).
+    ///
+    /// Eight parameters is intentional — the test-fixture call sites in
+    /// `env_vault.rs` are documentation-as-test for what the CLI sends.
+    /// Converting to an options struct hides the per-field intent at the
+    /// call site, which is the opposite of what these tests want.
+    #[allow(clippy::too_many_arguments)]
     pub async fn with_oidc_policy_create(
         &self,
         bearer_token: &str,
@@ -607,6 +619,8 @@ impl MockRegistry {
         repo: &str,
         branches: &[&str],
         envs: &[&str],
+        workflows: &[&str],
+        events: &[&str],
     ) -> &Self {
         let mut mock = Mock::given(method("POST"))
             .and(path("/api/vault/oidc/policies"))
@@ -619,6 +633,12 @@ impl MockRegistry {
         }
         for env_name in envs {
             mock = mock.and(body_string_contains(format!("\"{env_name}\"")));
+        }
+        for workflow in workflows {
+            mock = mock.and(body_string_contains(format!("\"{workflow}\"")));
+        }
+        for event_name in events {
+            mock = mock.and(body_string_contains(format!("\"{event_name}\"")));
         }
 
         mock.respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
