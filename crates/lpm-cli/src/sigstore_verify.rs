@@ -4721,6 +4721,202 @@ mod tests {
     }
 
     #[test]
+    fn either_policy_rejects_bundle_with_neither_set_nor_inclusion_proof() {
+        // The composed verify_sigstore_bundle entry point enforces
+        // "Either ⇒ at least one of SET, IP". That rule depends on the
+        // resolved_inclusion_promise() and resolved_inclusion_proof()
+        // helpers both surfacing None for an empty tlog entry. Pin
+        // those helpers here so a refactor that accidentally widens
+        // either accessor (e.g., synthesizes a default value) breaks
+        // a named test before the composed entry's branch silently
+        // accepts a bundle that should reject.
+        let tlog = crate::sigstore::TlogEntry {
+            log_index: "0".into(),
+            log_id: crate::sigstore::LogId {
+                key_id: String::new(),
+            },
+            integrated_time: "1700000000".into(),
+            inclusion_promise: None,
+            inclusion_proof: None,
+            verification: None,
+            canonicalized_body: String::new(),
+        };
+        assert!(
+            tlog.resolved_inclusion_promise().is_none(),
+            "empty tlog entry must surface None for resolved_inclusion_promise",
+        );
+        assert!(
+            tlog.resolved_inclusion_proof().is_none(),
+            "empty tlog entry must surface None for resolved_inclusion_proof",
+        );
+        verify_rekor_set(&tlog, &[], RekorInclusionProofPolicy::Either).expect(
+            "Either with neither must NOT reject in verify_rekor_set (composed entry enforces)",
+        );
+        let err = verify_inclusion_proof(&tlog, &[])
+            .expect_err("verify_inclusion_proof must always reject when proof is absent");
+        assert!(matches!(err, VerifyError::InclusionProofMissing));
+    }
+
+    #[test]
+    fn either_policy_accepts_inclusion_proof_only_bundle_via_primitive_seam() {
+        // Either + SET-absent + IP-present is one of the two
+        // accept arms of `Either`. verify_rekor_set is the load-
+        // bearing seam: it must NOT reject when the SET is absent
+        // and the policy is Either, regardless of whether the bundle
+        // carries an inclusion proof — that's the composed entry's
+        // job (it calls verify_inclusion_proof separately). Pin the
+        // primitive contract here.
+        let tlog = crate::sigstore::TlogEntry {
+            log_index: "1".into(),
+            log_id: crate::sigstore::LogId {
+                key_id: String::new(),
+            },
+            integrated_time: "1700000000".into(),
+            inclusion_promise: None, // SET absent
+            inclusion_proof: Some(crate::sigstore::RekorInclusionProof {
+                checkpoint: serde_json::json!({}),
+                hashes: vec![],
+                log_index: 1,
+                root_hash: String::new(),
+                tree_size: 2,
+            }),
+            verification: None,
+            canonicalized_body: String::new(),
+        };
+        verify_rekor_set(&tlog, &[], RekorInclusionProofPolicy::Either)
+            .expect("Either + SET-absent + IP-present must NOT reject at verify_rekor_set");
+    }
+
+    #[test]
+    fn either_policy_accepts_set_only_bundle_via_primitive_seam() {
+        // Either + SET-present + IP-absent is the symmetric accept
+        // arm. verify_rekor_set verifies the SET as usual; the
+        // composed entry then SKIPs the inclusion-proof step because
+        // IP is absent under Either.
+        let (signing_key, spki_der, log_id_bytes) = p256_rekor_signing_key();
+        let log_id_hex = hex::encode(&log_id_bytes);
+        let integrated_time = 1700000000_i64;
+        let canonicalized_body = "Zm9v";
+        let set_input =
+            build_set_input_canonical_json(canonicalized_body, integrated_time, 7, &log_id_hex);
+        let digest = Sha256::digest(set_input.as_bytes());
+        let sig: Signature = signing_key.sign_prehash(&digest).expect("sign_prehash");
+        let set_b64 = BASE64.encode(sig.to_der().as_bytes());
+
+        let tlog = crate::sigstore::TlogEntry {
+            log_index: "7".into(),
+            log_id: crate::sigstore::LogId { key_id: log_id_hex },
+            integrated_time: integrated_time.to_string(),
+            inclusion_promise: Some(crate::sigstore::RekorInclusionPromise {
+                signed_entry_timestamp: set_b64,
+            }),
+            inclusion_proof: None, // IP absent under Either
+            verification: None,
+            canonicalized_body: canonicalized_body.to_string(),
+        };
+        let key = rekor_key_active_around(log_id_bytes, spki_der, integrated_time);
+        verify_rekor_set(
+            &tlog,
+            std::slice::from_ref(&key),
+            RekorInclusionProofPolicy::Either,
+        )
+        .expect("Either + SET-present + IP-absent must verify the SET successfully");
+        assert!(
+            tlog.resolved_inclusion_proof().is_none(),
+            "this bundle has IP absent — the composed entry would skip verify_inclusion_proof",
+        );
+    }
+
+    #[test]
+    fn require_both_policy_rejects_when_inclusion_proof_is_absent() {
+        // RequireBoth + SET-present + IP-absent must reject at the
+        // inclusion-proof primitive — the composed entry invokes
+        // verify_inclusion_proof for RequireBoth and gets
+        // InclusionProofMissing. Symmetric to the existing
+        // rejects_missing_set_under_require_both_policy.
+        let tlog = crate::sigstore::TlogEntry {
+            log_index: "0".into(),
+            log_id: crate::sigstore::LogId {
+                key_id: String::new(),
+            },
+            integrated_time: "1700000000".into(),
+            // SET present, but IP absent (real-world: an npm bundle
+            // that ships SET only — fine under Either, refused under
+            // RequireBoth).
+            inclusion_promise: Some(crate::sigstore::RekorInclusionPromise {
+                signed_entry_timestamp: String::new(),
+            }),
+            inclusion_proof: None,
+            verification: None,
+            canonicalized_body: String::new(),
+        };
+        let err = verify_inclusion_proof(&tlog, &[])
+            .expect_err("RequireBoth + IP-absent must reject at verify_inclusion_proof");
+        assert!(matches!(err, VerifyError::InclusionProofMissing));
+    }
+
+    #[test]
+    fn require_inclusion_proof_policy_rejects_when_inclusion_proof_is_absent() {
+        // RequireInclusionProof + IP-absent is the same rejection
+        // arm as RequireBoth + IP-absent at the primitive level.
+        // Names the policy explicitly so the contract is pinned per
+        // call site (C2's strict() preset uses RequireBoth; a future
+        // policy that wants IP-without-SET would pick this).
+        let tlog = crate::sigstore::TlogEntry {
+            log_index: "0".into(),
+            log_id: crate::sigstore::LogId {
+                key_id: String::new(),
+            },
+            integrated_time: "1700000000".into(),
+            inclusion_promise: None,
+            inclusion_proof: None,
+            verification: None,
+            canonicalized_body: String::new(),
+        };
+        let err = verify_inclusion_proof(&tlog, &[])
+            .expect_err("RequireInclusionProof + IP-absent must reject at verify_inclusion_proof");
+        assert!(matches!(err, VerifyError::InclusionProofMissing));
+    }
+
+    #[test]
+    fn rfc3161_timestamp_only_bundle_rejects_because_no_embedded_sct_is_present() {
+        // Sigstore Bundle v0.3 allows `timestampVerificationData.rfc3161Timestamps[]`
+        // as an alternative-to-SCT "certificate was valid at signing time"
+        // claim. The current verifier (Phase 1.4) is embedded-SCT-only —
+        // the RFC 3161 path is documented as a tracked follow-up and
+        // rejects fail-closed.
+        //
+        // Pin the behavior at the primitive seam: a leaf cert without
+        // the SCT extension rejects with `VerifyError::Sct`, regardless
+        // of what timestampVerificationData the *bundle* might carry
+        // alongside. The verifier intentionally never looks at that
+        // field — a future implementer who wires it must add a
+        // dedicated test for the positive path.
+        let issuer = fresh_sct_issuer();
+        let leaf_kp = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).unwrap();
+        let leaf_der = build_leaf_with_optional_sct(&leaf_kp, &issuer, None);
+        let issuer_spki = issuer_spki_from_cert(&issuer.cert);
+        let (_, ct_log_key) = synth_ct_log_key(2025);
+        let err = verify_embedded_sct(
+            &leaf_der,
+            &issuer_spki,
+            std::slice::from_ref(&ct_log_key),
+            ts_year(2025),
+        )
+        .expect_err("RFC-3161-only bundle (no embedded SCT) must reject");
+        match err {
+            VerifyError::Sct(msg) => assert!(
+                msg.contains("no embedded SCT"),
+                "RFC-3161-only fallback is intentionally not honored; got: {msg}",
+            ),
+            other => panic!(
+                "RFC-3161-only fallback must reject with VerifyError::Sct (embedded-only policy); \
+                 got: {other:?}",
+            ),
+        }
+    }
+
+    #[test]
     fn verifies_set_via_legacy_verification_envelope_fallback() {
         // A bundle that captured Rekor's API response verbatim under
         // `verification.inclusionPromise` (the Phase 1.0 schema's
