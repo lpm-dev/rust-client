@@ -1091,12 +1091,20 @@ fn write_sigstore_off_to_isolated_config(project: &TempProject) {
 /// install MUST succeed against a bundle the verifier would reject,
 /// because Off short-circuits to the legacy identity-only parser.
 ///
-/// Same fixture as
-/// `install_drift_gate_under_enforce_warn_does_not_block_on_verifier_rejection`
-/// — only the resolution chain differs. Two stderr signals pin the
-/// orthogonality of `Warn` vs `Off`: the warn-mode rejection line
-/// `"provenance verification FAILED"` must be absent, and the drift
-/// block message must be absent.
+/// Three signals pin the contract — one positive proof that the Off
+/// code path ran, and two negative proofs that the verifier and the
+/// drift gate didn't intervene:
+///
+/// 1. Positive: stderr contains the
+///    `"operator opted out of cryptographic verification"` warn line
+///    emitted only from `fetch_unverified_snapshot` (the Off /
+///    SkipPolicy code path). Without this assertion the test passes
+///    if Off ever degraded to "Warn-but-silent" — verifier runs,
+///    rejection log suppressed, install succeeds. The positive
+///    log line is what distinguishes those two outcomes.
+/// 2. Negative: stderr does NOT contain the warn-mode rejection
+///    line `"provenance verification FAILED"`.
+/// 3. Negative: install does not surface the drift block message.
 #[tokio::test]
 async fn install_does_not_run_verifier_when_sigstore_verify_off_in_config() {
     let (project, mock) = setup_install_drift_gate_with_verifier_rejecting_candidate().await;
@@ -1120,6 +1128,14 @@ async fn install_does_not_run_verifier_when_sigstore_verify_off_in_config() {
          stdout:\n{}\nstderr:\n{}",
         String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr),
+    );
+    assert!(
+        combined.contains("operator opted out of cryptographic verification"),
+        "Off mode MUST emit the `opted out of cryptographic verification` warn line — \
+         that's the positive proof the legacy identity-only fetch path ran instead of the \
+         verifier. Absence of this line means either Off is silently degrading to a different \
+         path (Warn-but-silent, deny, or transport-degraded), or the `lpm=warn` tracing \
+         filter at main.rs no longer routes the lpm::provenance target to stderr. got:\n{combined}",
     );
     assert!(
         !drift_block_message_present(&out),
