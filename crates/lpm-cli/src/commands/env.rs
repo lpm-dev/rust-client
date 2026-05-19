@@ -2408,7 +2408,7 @@ async fn vars_platform_status(
 
 // ─── OIDC (Tier 5) ────────────────────────────────────────────────
 
-/// `lpm env oidc allow --provider=github --repo=owner/repo --branch=main --env=production`
+/// `lpm env oidc allow --provider=github --repo=owner/repo --workflow=.github/workflows/deploy.yml --branch=main --env=production [--events=push,workflow_dispatch] [--allow-forks]`
 async fn vars_oidc(
     args: &[&str],
     project_dir: &std::path::Path,
@@ -2416,7 +2416,10 @@ async fn vars_oidc(
 ) -> Result<(), LpmError> {
     if args.is_empty() {
         return Err(LpmError::Script(
-            "usage: lpm env oidc allow --provider=github --repo=<owner/repo> --branch=<branch> --env=<env>".into(),
+            "usage: lpm env oidc allow --provider=github --repo=<owner/repo> \
+             --workflow=.github/workflows/<file>.yml --branch=<branch> --env=<env> \
+             [--events=push,workflow_dispatch] [--allow-forks]"
+                .into(),
         ));
     }
 
@@ -2429,7 +2432,7 @@ async fn vars_oidc(
     }
 }
 
-/// `lpm env oidc allow --provider=github --repo=owner/repo --branch=main --env=production`
+/// `lpm env oidc allow --provider=github --repo=owner/repo --workflow=.github/workflows/deploy.yml --branch=main --env=production`
 async fn vars_oidc_allow(
     args: &[&str],
     project_dir: &std::path::Path,
@@ -2443,6 +2446,17 @@ async fn vars_oidc_allow(
     let mut repo: Option<&str> = None;
     let mut branches: Vec<String> = vec!["main".to_string()];
     let mut envs: Vec<String> = Vec::new();
+    // Phase 3 of plan-security-findings-c3.md — `allowedWorkflows`.
+    // No default: the server schema is `.min(1)`, and the safe default
+    // ".github/workflows/deploy.yml" guesses the user's workflow name
+    // (which is almost always wrong). Forcing the user to supply it
+    // surfaces the security model.
+    let mut workflows: Vec<String> = Vec::new();
+    // Phase 4 — `allowedEvents`. Defaults to push-only — the safest
+    // event for fork-PR exposure. Adding `pull_request_target` to
+    // this list also requires `--allow-forks` (cross-field check
+    // enforced server-side in Phase 5.2, gated on JWT fixtures).
+    let mut events: Vec<String> = vec!["push".to_string()];
     let mut allow_forks = false;
 
     for arg in args {
@@ -2454,14 +2468,46 @@ async fn vars_oidc_allow(
             branches = v.split(',').map(|s| s.trim().to_string()).collect();
         } else if let Some(v) = arg.strip_prefix("--env=") {
             envs = v.split(',').map(|s| s.trim().to_string()).collect();
+        } else if let Some(v) = arg.strip_prefix("--workflow=") {
+            workflows = v.split(',').map(|s| s.trim().to_string()).collect();
+        } else if let Some(v) = arg.strip_prefix("--events=") {
+            events = v.split(',').map(|s| s.trim().to_string()).collect();
         } else if *arg == "--allow-forks" {
             allow_forks = true;
         }
     }
 
     let repo = repo.ok_or_else(|| {
-        LpmError::Script("missing --repo flag. Usage: lpm env oidc allow --repo=owner/repo".into())
+        LpmError::Script(
+            "missing --repo flag. Usage: lpm env oidc allow --repo=owner/repo \
+             --workflow=.github/workflows/deploy.yml --branch=main --env=production"
+                .into(),
+        )
     })?;
+
+    if workflows.is_empty() {
+        return Err(LpmError::Script(
+            "missing --workflow flag. Usage: lpm env oidc allow --repo=owner/repo \
+             --workflow=.github/workflows/deploy.yml [--workflow=path2,path3]"
+                .into(),
+        ));
+    }
+
+    // Validate workflow paths client-side so the user gets a fast
+    // failure instead of waiting for the server round-trip. The shape
+    // matches the server's Zod regex
+    // (`lib/validations/vault.js::GITHUB_WORKFLOW_PATH_RE`).
+    for wf in &workflows {
+        let valid = wf.starts_with(".github/workflows/")
+            && !wf[".github/workflows/".len()..].contains('/')
+            && (wf.ends_with(".yml") || wf.ends_with(".yaml"));
+        if !valid {
+            return Err(LpmError::Script(format!(
+                "workflow path '{wf}' must be of the form `.github/workflows/<file>.yml` \
+                 (subdirectories under .github/workflows/ are not supported by GitHub Actions)"
+            )));
+        }
+    }
 
     // Canonicalize env names through resolver — OIDC policies store canonical names
     if !envs.is_empty() {
@@ -2511,6 +2557,8 @@ async fn vars_oidc_allow(
             "subject": subject,
             "allowedBranches": branches,
             "allowedEnvironments": envs,
+            "allowedWorkflows": workflows,
+            "allowedEvents": events,
             "allowForks": allow_forks,
         }))
         .timeout(std::time::Duration::from_secs(30))
@@ -2529,14 +2577,16 @@ async fn vars_oidc_allow(
 
     if !json_output {
         output::success(&format!(
-            "OIDC policy set: {provider} {} on branches [{}] for envs [{}]",
+            "OIDC policy set: {provider} {} on branches [{}] for envs [{}] via workflows [{}] events [{}]",
             repo.bold(),
             branches.join(", "),
             if envs.is_empty() {
                 "all".to_string()
             } else {
                 envs.join(", ")
-            }
+            },
+            workflows.join(", "),
+            events.join(", "),
         ));
     }
 
@@ -2631,40 +2681,47 @@ async fn vars_oidc_list(project_dir: &std::path::Path, json_output: bool) -> Res
     }
 
     println!();
+    // Render a JSON array field as a comma-joined string. Empty array
+    // or missing field collapses to an empty string; the display logic
+    // below replaces empty with `"-"` rather than `"all"` so a policy
+    // that's missing required fields doesn't read as "wide-open."
+    fn render_strings(field: &serde_json::Value) -> String {
+        field
+            .as_array()
+            .map(|a| {
+                a.iter()
+                    .filter_map(|v| v.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            })
+            .unwrap_or_default()
+    }
     for policy in policies.unwrap() {
         let provider = policy["provider"].as_str().unwrap_or("?");
         let subject = policy["subject"].as_str().unwrap_or("?");
-        let branches = policy["allowedBranches"]
-            .as_array()
-            .map(|a| {
-                a.iter()
-                    .filter_map(|v| v.as_str())
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            })
-            .unwrap_or_default();
-        let envs = policy["allowedEnvironments"]
-            .as_array()
-            .map(|a| {
-                a.iter()
-                    .filter_map(|v| v.as_str())
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            })
-            .unwrap_or_default();
+        let branches = render_strings(&policy["allowedBranches"]);
+        let envs = render_strings(&policy["allowedEnvironments"]);
+        let workflows = render_strings(&policy["allowedWorkflows"]);
+        let events = render_strings(&policy["allowedEvents"]);
         let forks = policy["allowForks"].as_bool().unwrap_or(false);
 
+        let bb = if branches.is_empty() { "-" } else { &branches };
+        let ee = if envs.is_empty() { "-" } else { &envs };
+        let ww = if workflows.is_empty() {
+            "-"
+        } else {
+            &workflows
+        };
+        let ev = if events.is_empty() { "-" } else { &events };
         println!(
-            "  {} {}  branches: [{}]  envs: [{}]{}",
+            "  {} {}\n      branches:  [{bb}]\n      envs:      [{ee}]\n      workflows: [{ww}]\n      events:    [{ev}]{}",
             provider.bold(),
             subject,
-            if branches.is_empty() {
-                "all"
+            if forks {
+                "\n      forks:     allowed"
             } else {
-                &branches
+                ""
             },
-            if envs.is_empty() { "all" } else { &envs },
-            if forks { "  forks: allowed" } else { "" }
         );
     }
     println!();
@@ -2722,12 +2779,10 @@ async fn vars_oidc_pull(
             parse_capped_platform_json_or_unknown(exchange_response).await;
         let error = body["error"].as_str().unwrap_or("OIDC exchange failed");
         let hint = body["hint"].as_str().unwrap_or("");
-        let msg = if hint.is_empty() {
-            error.to_string()
-        } else {
-            format!("{error}\n  Hint: {hint}")
-        };
-        return Err(LpmError::Script(msg));
+        let code = body["code"].as_str().unwrap_or("");
+        return Err(LpmError::Script(build_oidc_pull_error_message(
+            error, hint, code,
+        )));
     }
 
     let exchange_result: serde_json::Value = parse_capped_platform_json(exchange_response).await?;
@@ -2822,6 +2877,134 @@ async fn get_ci_oidc_token() -> Result<String, LpmError> {
     crate::oidc::resolve_registry_exchange_jwt()
         .await
         .map_err(|e| LpmError::Script(format!("{e}")))
+}
+
+/// Map a server-side error response from `POST /api/vault/oidc` to a
+/// user-facing message with a code-specific remediation hint appended.
+///
+/// Phase 2 of plan-security-findings-c3.md stamps a stable
+/// machine-readable `code` field on every 403/429 from the mint endpoint;
+/// Phase 8 (this CLI side) maps each code to an actionable next step so
+/// CI logs surface "what to do" rather than just "what failed."
+///
+/// Precedence:
+///   1. If the server sent a `hint` field, use it verbatim.
+///   2. Else if the code matches a known taxonomy entry, use the
+///      CLI-side mapping.
+///   3. Else emit just the server's `error` string.
+fn build_oidc_pull_error_message(error: &str, hint: &str, code: &str) -> String {
+    let code_hint = match code {
+        "policy_not_found" => Some(
+            "No OIDC policy exists for this repo+vault. Create one with: \
+             lpm env oidc allow --repo=<owner/repo> --workflow=.github/workflows/<file>.yml \
+             --branch=<name> --env=<name>",
+        ),
+        "policy_misconfigured" => Some(
+            "The OIDC policy exists but is missing required fields (likely a pre-migration \
+             row). Open the dashboard at <registry>/dashboard/vaults to update it.",
+        ),
+        "branch_not_allowed" => Some(
+            "The branch claim from your CI's OIDC token isn't in the policy's allowedBranches. \
+             Update the policy: lpm env oidc allow --repo=<owner/repo> --branch=<list> --workflow=...",
+        ),
+        "env_not_allowed" => Some(
+            "The requested env isn't in the policy's allowedEnvironments. Update the policy: \
+             lpm env oidc allow --repo=<owner/repo> --env=<list> --workflow=...",
+        ),
+        "workflow_not_allowed" => Some(
+            "The workflow file that minted this token isn't in the policy's allowedWorkflows. \
+             Add it: lpm env oidc allow --repo=<owner/repo> --workflow=<path>",
+        ),
+        "event_not_allowed" => Some(
+            "The CI event_name that triggered this run isn't in the policy's allowedEvents. \
+             Add it: lpm env oidc allow --repo=<owner/repo> --events=push,workflow_dispatch",
+        ),
+        "fork_not_allowed" => Some(
+            "The OIDC token was minted by a fork PR but the policy has allowForks=false. \
+             Add --allow-forks to lpm env oidc allow if this is intentional (note: only \
+             enable for public repos with trusted reviewers — pull_request_target events \
+             from forks run with BASE secrets).",
+        ),
+        "missing_branch_claim" => Some(
+            "The OIDC token from your CI provider has no branch claim. Confirm your provider \
+             sets the ref/branch claim correctly (GitHub Actions does by default; some \
+             self-hosted runners may not).",
+        ),
+        "rate_limited" => Some(
+            "Rate limit exceeded on /api/vault/oidc. Retry after the Retry-After interval. \
+             If this is a sustained issue, check whether multiple CI jobs share a runner IP.",
+        ),
+        _ => None,
+    };
+    match (hint.is_empty(), code_hint) {
+        (false, _) => format!("{error}\n  Hint: {hint}"),
+        (true, Some(h)) => format!("{error}\n  Hint: {h}"),
+        (true, None) => error.to_string(),
+    }
+}
+
+#[cfg(test)]
+mod oidc_error_hint_tests {
+    use super::build_oidc_pull_error_message;
+
+    #[test]
+    fn server_hint_takes_precedence_over_code_mapping() {
+        let msg = build_oidc_pull_error_message(
+            "Env not authorized",
+            "Run: lpm env oidc allow --env=production",
+            "env_not_allowed",
+        );
+        // Server-supplied `hint` wins; CLI-side mapping is not appended on top.
+        assert!(msg.contains("Run: lpm env oidc allow --env=production"));
+        // The branch_not_allowed string from the CLI mapping must not leak in.
+        assert!(!msg.contains("allowedBranches"));
+    }
+
+    #[test]
+    fn policy_misconfigured_code_maps_to_dashboard_hint() {
+        let msg = build_oidc_pull_error_message(
+            "OIDC policy is misconfigured (no allowed branches set).",
+            "",
+            "policy_misconfigured",
+        );
+        assert!(msg.contains("OIDC policy is misconfigured"));
+        assert!(msg.contains("dashboard"));
+        assert!(msg.contains("Hint:"));
+    }
+
+    #[test]
+    fn workflow_not_allowed_names_the_remediation_flag() {
+        let msg =
+            build_oidc_pull_error_message("Workflow not authorized", "", "workflow_not_allowed");
+        assert!(msg.contains("--workflow"));
+        assert!(msg.contains("allowedWorkflows"));
+    }
+
+    #[test]
+    fn fork_not_allowed_warns_about_pull_request_target() {
+        let msg = build_oidc_pull_error_message("Forks not allowed", "", "fork_not_allowed");
+        assert!(msg.contains("--allow-forks"));
+        assert!(msg.contains("pull_request_target"));
+    }
+
+    #[test]
+    fn rate_limited_mentions_retry_after() {
+        let msg = build_oidc_pull_error_message("rate limited", "", "rate_limited");
+        assert!(msg.contains("Retry-After"));
+    }
+
+    #[test]
+    fn unknown_code_falls_through_to_raw_error() {
+        let msg = build_oidc_pull_error_message("Something failed", "", "totally_unknown");
+        // No "Hint:" prefix because neither server-hint nor known-code matched.
+        assert_eq!(msg, "Something failed");
+    }
+
+    #[test]
+    fn no_code_no_hint_yields_raw_error() {
+        let msg = build_oidc_pull_error_message("Boom", "", "");
+        assert_eq!(msg, "Boom");
+    }
 }
 
 /// `lpm env pull --from <platform> [--env=<mode>] [--yes]`
