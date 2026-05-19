@@ -17,15 +17,17 @@ use std::path::Path;
 
 /// Write sensitive key material to a file with restricted permissions (0o600) from creation.
 ///
-/// On Unix, the file is created with mode 0o600 atomically via `OpenOptionsExt::mode()`,
-/// eliminating the TOCTOU window where the file would be world-readable.
+/// On Unix, the existing file (if any) is removed before `create_new` opens it with
+/// mode 0o600. This is the contract callers depend on: a stale 0o644 file from an
+/// earlier broken install gets replaced, not truncated-in-place with its old mode kept.
+/// `OpenOptionsExt::mode()` only applies on create — `truncate(true)` over an existing
+/// file would silently preserve the old permission bits.
 /// On non-Unix, falls back to `std::fs::write` (no permission control available).
 #[cfg(unix)]
-fn write_key_file(path: &Path, contents: &[u8]) -> std::io::Result<()> {
+pub fn write_key_file(path: &Path, contents: &[u8]) -> std::io::Result<()> {
     use std::io::Write;
     use std::os::unix::fs::OpenOptionsExt;
 
-    // Remove existing file first so create_new succeeds on regeneration
     if path.exists() {
         std::fs::remove_file(path)?;
     }
@@ -40,7 +42,7 @@ fn write_key_file(path: &Path, contents: &[u8]) -> std::io::Result<()> {
 }
 
 #[cfg(not(unix))]
-fn write_key_file(path: &Path, contents: &[u8]) -> std::io::Result<()> {
+pub fn write_key_file(path: &Path, contents: &[u8]) -> std::io::Result<()> {
     std::fs::write(path, contents)
 }
 
@@ -104,14 +106,15 @@ pub fn ensure_https(
     let ca_dir = paths::ca_dir()?;
     let project_cert_dir = paths::project_cert_dir(project_dir)?;
 
-    // Step 1: Ensure root CA exists
+    if ca_dir.exists() || !paths::ca_cert_path()?.exists() {
+        create_dir_secure(&ca_dir)
+            .map_err(|e| LpmError::Cert(format!("failed to secure cert dir: {e}")))?;
+    }
+
     let ca_freshly_installed = if !paths::ca_cert_path()?.exists() {
         tracing::info!("generating root CA...");
         let (ca_cert_pem, ca_key_pem) =
             ca::generate_ca().map_err(|e| LpmError::Cert(format!("failed to generate CA: {e}")))?;
-
-        create_dir_secure(&ca_dir)
-            .map_err(|e| LpmError::Cert(format!("failed to create cert dir: {e}")))?;
 
         let cert_path = paths::ca_cert_path()?;
         let key_path = paths::ca_key_path()?;
@@ -121,15 +124,20 @@ pub fn ensure_https(
         write_key_file(&key_path, ca_key_pem.as_bytes())
             .map_err(|e| LpmError::Cert(format!("failed to write CA key: {e}")))?;
 
-        // Install CA into trust store
         tracing::info!("installing CA into system trust store...");
         trust::install_ca(&cert_path)
             .map_err(|e| LpmError::Cert(format!("failed to install CA: {e}")))?;
 
         true
     } else {
-        // Check if CA is trusted
         let cert_path = paths::ca_cert_path()?;
+        if ca::wants_name_constraints() && !ca::cert_has_name_constraints(&cert_path)? {
+            tracing::warn!(
+                target: "lpm_cert",
+                "LPM_CERT_NAME_CONSTRAINTS is set but the installed CA at {} predates this build and has no name constraints. Run `lpm cert rotate` to replace it with a constrained CA.",
+                cert_path.display()
+            );
+        }
         if !trust::is_ca_installed(&cert_path)? {
             tracing::info!("CA exists but not trusted, installing...");
             trust::install_ca(&cert_path)
@@ -323,6 +331,32 @@ mod tests {
             mode, 0o700,
             "existing cert dir should be re-tightened to 0o700, got 0o{mode:o}"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_key_file_tightens_stale_world_readable_file() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let key_path = dir.path().join("stale.key");
+
+        std::fs::write(&key_path, b"stale-contents").unwrap();
+        std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert_eq!(
+            std::fs::metadata(&key_path).unwrap().permissions().mode() & 0o777,
+            0o644
+        );
+
+        write_key_file(&key_path, b"fresh-contents").unwrap();
+
+        let mode = std::fs::metadata(&key_path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            mode, 0o600,
+            "overwriting a pre-existing key file must reset mode to 0o600, got 0o{mode:o}"
+        );
+        let contents = std::fs::read_to_string(&key_path).unwrap();
+        assert_eq!(contents, "fresh-contents");
     }
 
     #[cfg(unix)]

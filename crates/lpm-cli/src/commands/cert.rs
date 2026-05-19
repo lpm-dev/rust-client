@@ -96,12 +96,11 @@ fn run_status(project_dir: &Path, json_output: bool) -> Result<(), LpmError> {
 fn run_trust(json_output: bool) -> Result<(), LpmError> {
     let ca_cert_path = lpm_cert::paths::ca_cert_path()?;
 
-    if !ca_cert_path.exists() {
-        // Generate CA first
-        let ca_dir = lpm_cert::paths::ca_dir()?;
-        lpm_cert::create_dir_secure(&ca_dir)
-            .map_err(|e| LpmError::Cert(format!("failed to create cert dir: {e}")))?;
+    let ca_dir = lpm_cert::paths::ca_dir()?;
+    lpm_cert::create_dir_secure(&ca_dir)
+        .map_err(|e| LpmError::Cert(format!("failed to secure cert dir: {e}")))?;
 
+    if !ca_cert_path.exists() {
         let (ca_cert_pem, ca_key_pem) = lpm_cert::ca::generate_ca()
             .map_err(|e| LpmError::Cert(format!("failed to generate CA: {e}")))?;
 
@@ -109,34 +108,14 @@ fn run_trust(json_output: bool) -> Result<(), LpmError> {
             .map_err(|e| LpmError::Cert(format!("failed to write CA cert: {e}")))?;
 
         let key_path = lpm_cert::paths::ca_key_path()?;
-        // Atomic write with restricted permissions to avoid TOCTOU race
-        // where the file is briefly world-readable between write and chmod.
-        #[cfg(unix)]
-        {
-            use std::io::Write;
-            use std::os::unix::fs::OpenOptionsExt;
-            let mut f = std::fs::OpenOptions::new()
-                .write(true)
-                .create(true)
-                .truncate(true)
-                .mode(0o600)
-                .open(&key_path)
-                .map_err(|e| LpmError::Cert(format!("failed to write CA key: {e}")))?;
-            f.write_all(ca_key_pem.as_bytes())
-                .map_err(|e| LpmError::Cert(format!("failed to write CA key: {e}")))?;
-        }
-        #[cfg(not(unix))]
-        {
-            std::fs::write(&key_path, &ca_key_pem)
-                .map_err(|e| LpmError::Cert(format!("failed to write CA key: {e}")))?;
-        }
+        lpm_cert::write_key_file(&key_path, ca_key_pem.as_bytes())
+            .map_err(|e| LpmError::Cert(format!("failed to write CA key: {e}")))?;
 
         if !json_output {
             output::success("root CA generated");
         }
     }
 
-    // Install to trust store
     lpm_cert::trust::install_ca(&ca_cert_path)?;
 
     if json_output {

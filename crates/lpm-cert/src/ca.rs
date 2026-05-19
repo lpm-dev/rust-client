@@ -3,10 +3,12 @@
 //! Generates a self-signed root CA using ECDSA P-256 with an 825-day validity period.
 //! This CA is used to sign per-project certificates for local HTTPS development.
 
+use lpm_common::LpmError;
 use rcgen::{
     BasicConstraints, CertificateParams, CidrSubnet, DistinguishedName, DnType, GeneralSubtree,
     IsCa, KeyPair, KeyUsagePurpose, NameConstraints,
 };
+use std::path::Path;
 use std::str::FromStr;
 use time::{Duration, OffsetDateTime};
 
@@ -53,12 +55,35 @@ fn permitted_subtrees() -> Vec<GeneralSubtree> {
     ]
 }
 
-/// Whether the env-flag gating NameConstraints is enabled for this process.
-fn name_constraints_enabled() -> bool {
+/// Whether `LPM_CERT_NAME_CONSTRAINTS` is set to a truthy value in the current process.
+///
+/// Used both by `generate_ca()` (to decide whether to emit the extension on new CAs)
+/// and by `ensure_https()` (to detect "user opted in, but the on-disk CA predates the
+/// flag and is unconstrained").
+pub fn wants_name_constraints() -> bool {
     matches!(
         std::env::var(NAME_CONSTRAINTS_ENV).as_deref(),
         Ok("1") | Ok("true") | Ok("yes") | Ok("on")
     )
+}
+
+/// True iff the PEM-encoded CA at `path` carries a NameConstraints extension.
+///
+/// Returns `Err` if the file is unreadable or not a valid X.509 cert; returns
+/// `Ok(false)` if the file is a valid cert but the extension is absent.
+pub fn cert_has_name_constraints(path: &Path) -> Result<bool, LpmError> {
+    let pem_str = std::fs::read_to_string(path).map_err(|e| {
+        LpmError::Cert(format!("failed to read CA cert at {}: {e}", path.display()))
+    })?;
+    let pem = pem::parse(&pem_str)
+        .map_err(|e| LpmError::Cert(format!("invalid PEM at {}: {e}", path.display())))?;
+    let (_, cert) = x509_parser::parse_x509_certificate(pem.contents())
+        .map_err(|e| LpmError::Cert(format!("invalid X.509 at {}: {e}", path.display())))?;
+
+    Ok(cert
+        .name_constraints()
+        .map_err(|e| LpmError::Cert(format!("failed to parse name constraints: {e}")))?
+        .is_some())
 }
 
 /// Options for `generate_ca_with_options`.
@@ -78,7 +103,7 @@ pub struct CaOptions {
 /// verified client-side enforcement across the supported browsers and TLS stacks.
 pub fn generate_ca() -> Result<(String, String), Box<dyn std::error::Error>> {
     generate_ca_with_options(CaOptions {
-        name_constraints: name_constraints_enabled(),
+        name_constraints: wants_name_constraints(),
     })
 }
 
@@ -274,5 +299,31 @@ mod tests {
             nc_ext.critical,
             "RFC 5280 §4.2.1.10: NameConstraints SHOULD be marked critical so non-honoring clients reject the chain"
         );
+    }
+
+    #[test]
+    fn cert_has_name_constraints_returns_false_for_unconstrained_ca() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rootCA.pem");
+        let (cert_pem, _) = generate_ca_with_options(CaOptions {
+            name_constraints: false,
+        })
+        .unwrap();
+        std::fs::write(&path, &cert_pem).unwrap();
+
+        assert!(!cert_has_name_constraints(&path).unwrap());
+    }
+
+    #[test]
+    fn cert_has_name_constraints_returns_true_for_constrained_ca() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rootCA.pem");
+        let (cert_pem, _) = generate_ca_with_options(CaOptions {
+            name_constraints: true,
+        })
+        .unwrap();
+        std::fs::write(&path, &cert_pem).unwrap();
+
+        assert!(cert_has_name_constraints(&path).unwrap());
     }
 }
