@@ -947,44 +947,16 @@ pub fn collect_referenced_scripts(pkg_dir: &Path, script_body: &str) -> Vec<(Str
     out
 }
 
-/// Extract relative paths the script body delegates to. Only matches
-/// the canonical `node <safe-relative-path>.{js,cjs,mjs}` shape — the
-/// SAME shape `lpm_security::static_gate::matches_node_relative` /
-/// `matches_delegating_identity_green` recognize. Anything fancier
-/// (env-var paths, compound bodies, dynamic paths) returns an empty
-/// list; the advisor sees the body without an embedded view.
+/// Extract relative paths the script body delegates to. Dispatches
+/// through [`lpm_security::static_gate::extract_delegate_path`] — the
+/// shared parser used by both the script-hash binding and the static
+/// gate's own classifier branches. Anything fancier than `node
+/// <safe-relative-path>.{js,cjs,mjs}` returns an empty list; the
+/// advisor sees the body without an embedded view.
 fn parse_delegated_paths(script_body: &str) -> Vec<String> {
-    let Some(tokens) = shlex::split(script_body) else {
-        return vec![];
-    };
-    if tokens.len() != 2 || tokens[0] != "node" {
-        return vec![];
-    }
-    let path = &tokens[1];
-    if !is_safe_relative_path(path) {
-        return vec![];
-    }
-    let has_js_ext = path.ends_with(".js") || path.ends_with(".cjs") || path.ends_with(".mjs");
-    if !has_js_ext {
-        return vec![];
-    }
-    vec![path.clone()]
-}
-
-/// Local mirror of `lpm_security::static_gate::is_safe_relative_path`
-/// — duplicating the small predicate avoids exposing the security
-/// crate's private helper just to read manifest scripts. Any rule
-/// change there should be mirrored here.
-fn is_safe_relative_path(p: &str) -> bool {
-    if p.is_empty()
-        || p.starts_with('/')
-        || p.starts_with('~')
-        || p.starts_with('$')
-        || p.contains('\\')
-    {
-        return false;
-    }
-    p.split('/').all(|seg| seg != "..")
+    lpm_security::static_gate::extract_delegate_path(script_body)
+        .into_iter()
+        .collect()
 }
 
 /// Read one referenced file from the package directory with the

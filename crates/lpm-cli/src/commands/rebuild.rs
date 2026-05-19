@@ -4148,15 +4148,19 @@ mod tests {
         assert_eq!(trust, TrustMatch::NotTrusted);
     }
 
-    /// **AUDIT FIX ():** the previous version of
-    /// this test asserted that `<name>@*` preserve keys did NOT satisfy
-    /// the strict gate, which broke backward compatibility — a manifest
-    /// like `["esbuild"]` lost esbuild's approval on the first
-    /// `lpm approve-scripts --yes` upgrade. The audit reproduced it. Post-fix
-    /// the strict gate matches `@*` preserve keys as `LegacyNameOnly`,
-    /// preserving the legacy semantic AND keeping the deprecation signal.
+    /// After `upgrade_to_rich` writes a `<name>@*` migration sentinel
+    /// for a legacy `Vec<String>` trustedDependencies entry, the
+    /// strict gate MUST NOT auto-trust any concrete version of that
+    /// package. The user must approve the specific version via
+    /// `lpm approve-scripts`, which writes a `name@version` Rich
+    /// entry binding trust to `(integrity, script_hash)`.
+    ///
+    /// The legacy `Vec<String>` form retains `LegacyNameOnly` because
+    /// that is an explicit user-authored shape; the `@*` sentinel is
+    /// auto-generated and never represented user consent to wildcard
+    /// trust.
     #[test]
-    fn build_strict_gate_legacy_upgraded_at_star_satisfies_as_legacy_name_only() {
+    fn build_strict_gate_legacy_upgraded_at_star_does_not_auto_trust() {
         let mut td = TrustedDependencies::Legacy(vec!["esbuild".into()]);
         td.upgrade_to_rich();
         let policy = SecurityPolicy {
@@ -4167,9 +4171,10 @@ mod tests {
             policy.can_run_scripts_strict("esbuild", "0.25.1", Some("sha512-x"), Some("sha256-y"));
         assert_eq!(
             trust,
-            TrustMatch::LegacyNameOnly,
-            "post-audit-fix: @* preserve keys must match as LegacyNameOnly \
-             so legacy approvals survive `approve-scripts --yes` upgrades"
+            TrustMatch::NotTrusted,
+            "`@*` migration sentinels MUST NOT satisfy the strict gate; \
+             the user must re-approve via `lpm approve-scripts` to \
+             create a content-bound Rich entry."
         );
     }
 
