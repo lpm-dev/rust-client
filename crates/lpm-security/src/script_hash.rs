@@ -20,18 +20,18 @@
 //! 1. The phase name as bytes (e.g., `"preinstall"`)
 //! 2. A NUL separator (`\x00`)
 //! 3. The script body as bytes if present, OR the empty byte sequence if absent
-//! 4. **If the phase body delegates to an in-package file** (the
-//!    `node <safe-relative-path>.{js,cjs,mjs}` shape that
-//!    [`crate::static_gate::extract_delegate_path`] recognizes) — a
-//!    unit separator (`\x1f` — ASCII US), the delegate path as bytes,
-//!    a NUL separator, and the SHA-256 of the delegated file's bytes.
-//!    The delegate file is read from the same `store_pkg_dir` the
-//!    `package.json` came from, so the hash binds the executed code
-//!    AND the entry point in lockstep. Without this step, two
-//!    versions of a package with byte-identical scripts maps but
-//!    different `install.js` bytes would produce the same hash, and
-//!    a content-blind `StrictBinding` would silently re-use the prior
-//!    approval across a malicious upgrade.
+//! 4. **If the phase body delegates to an in-package file** (any
+//!    shape that [`crate::static_gate::extract_delegate_path`]
+//!    recognizes — bare `node <path>` and `node -e <softfail wrapper>`
+//!    today) — a unit separator (`\x1f` — ASCII US), the delegate
+//!    path as bytes, a NUL separator, and the SHA-256 of the
+//!    delegated file's bytes. The delegate file is read from the same
+//!    `store_pkg_dir` the `package.json` came from, so the hash binds
+//!    the executed code AND the entry point in lockstep. Without this
+//!    step, two versions of a package with byte-identical scripts
+//!    maps but different `install.js` bytes would produce the same
+//!    hash, and a content-blind `StrictBinding` would silently re-use
+//!    the prior approval across a malicious upgrade.
 //! 5. A record separator (`\x1e` — ASCII RS) between phases
 //!
 //! Empty phases are explicitly hashed as the empty string so removing a
@@ -45,13 +45,17 @@
 //! Step 4 dispatches through [`crate::static_gate::extract_delegate_path`]
 //! — the single source of truth shared with
 //! `lpm_cli::build_state::parse_delegated_paths` and with the static
-//! gate's own `matches_node_relative` / `matches_delegating_identity_green`
-//! routes. Every script body the static gate classifies as Green via a
-//! `node <path>` shape is also detected here. Keeping these three call
-//! sites on one parser closes the gap where a slightly looser shape
-//! (e.g. `node ./install.js`, the leading-`.` variant the static gate
-//! accepts) would be greenlit for trust without the corresponding
-//! delegate-file binding in the hash.
+//! gate's own classifier branches (`matches_node_relative`,
+//! `matches_delegating_identity_green`, `matches_node_eval_softfail_green`).
+//! Every script-body shape the static gate classifies as Green via a
+//! delegate-to-local-file branch is also detected here, including the
+//! 3-token softfail wrapper form (`node -e "try{require('./x.js')}catch(e){}"`).
+//! Keeping these three call sites on one parser closes the gap where a
+//! looser shape would be greenlit for trust without the corresponding
+//! delegate-file binding in the hash. Any future classifier change
+//! that widens the Green set with a new delegate shape MUST extend
+//! the shared parser in the same change — the contract note on
+//! `extract_delegate_path` itself spells this out.
 //!
 //! ## Source of truth
 //!
@@ -446,29 +450,60 @@ mod tests {
         assert_ne!(h1, h2);
     }
 
-    /// Every spelling the static gate greenlights via
-    /// [`crate::static_gate::matches_delegating_identity_green`] or
-    /// [`crate::static_gate::matches_node_relative`] must produce a
-    /// distinct hash when the delegate file body changes. Coverage
-    /// gap regression: the previous narrow recognizer rejected
-    /// `node ./install.js` outright, so a package using that spelling
-    /// still passed the strict gate without delegate-body binding.
+    /// Every spelling the static gate greenlights via a
+    /// delegate-to-local-file branch must produce a distinct hash
+    /// when the delegate file body changes. Covers the three branches
+    /// the classifier accepts:
+    ///
+    /// - [`crate::static_gate::matches_node_relative`] — bare
+    ///   non-reserved-basename `node <path>`
+    /// - [`crate::static_gate::matches_delegating_identity_green`] —
+    ///   bare reserved-basename `node install.js` etc. (with manifest
+    ///   identity context the classifier separately validates)
+    /// - [`crate::static_gate::matches_node_eval_softfail_green`] —
+    ///   3-token `node -e <try-require-catch>` and
+    ///   `node -e <import-catch>` wrapper shapes
+    ///
+    /// If a future classifier change adds a new greenlit delegate
+    /// shape, the canonical procedure is: extend
+    /// `crate::static_gate::extract_delegate_path`, then add an entry
+    /// to this table. Drift between the two — a Green-classified
+    /// shape that `extract_delegate_path` doesn't recognize — is the
+    /// cross-version content-drift surface the H17 fix closes, and
+    /// recreating that drift here will silently reopen it.
     #[test]
     fn compute_script_hash_binds_delegate_for_every_greenlit_node_path_spelling() {
-        let spellings = [
+        let spellings: &[(&str, &str)] = &[
+            // Bare delegate, reserved basenames (matches_delegating_identity_green)
             ("install.js", "node install.js"),
-            ("install.js", "node ./install.js"),
             ("install.js", "node ./install.js"),
             ("install.cjs", "node install.cjs"),
             ("install.mjs", "node install.mjs"),
             ("postinstall.js", "node postinstall.js"),
             ("preinstall.js", "node preinstall.js"),
-            // Non-reserved basenames are also delegate shapes —
-            // matches_node_relative classifies these as Green
-            // unconditionally (no identity-match needed). They must
-            // also bind the delegated file.
+            // Bare delegate, non-reserved basenames (matches_node_relative,
+            // greenlit unconditionally)
             ("my-build.js", "node my-build.js"),
             ("scripts/install.js", "node scripts/install.js"),
+            // Softfail wrappers (matches_node_eval_softfail_green) —
+            // node -e with try/require/catch around an in-package file
+            (
+                "scripts/setup.js",
+                "node -e \"try{require('./scripts/setup.js')}catch(e){}\"",
+            ),
+            (
+                "bootstrap.cjs",
+                "node -e \"try{require('./bootstrap.cjs')}catch(e){}\"",
+            ),
+            (
+                "init.mjs",
+                "node -e \"import('./init.mjs').catch(() => void 0)\"",
+            ),
+            // --eval is the long-form alias for -e
+            (
+                "scripts/setup.js",
+                "node --eval \"try{require('./scripts/setup.js')}catch(e){}\"",
+            ),
         ];
         for (file, body) in spellings {
             let dir1 = tempdir().unwrap();
@@ -600,6 +635,46 @@ mod tests {
         assert_eq!(
             extract_delegate_path("node scripts/install.js"),
             Some("scripts/install.js".to_string())
+        );
+
+        // Softfail wrapper recognition — both supported shapes.
+        assert_eq!(
+            extract_delegate_path("node -e \"try{require('./scripts/setup.js')}catch(e){}\""),
+            Some("./scripts/setup.js".to_string())
+        );
+        assert_eq!(
+            extract_delegate_path("node -e \"import('./init.mjs').catch(() => void 0)\""),
+            Some("./init.mjs".to_string())
+        );
+        assert_eq!(
+            extract_delegate_path("node --eval \"try{require('./bootstrap.cjs')}catch(e){}\""),
+            Some("./bootstrap.cjs".to_string())
+        );
+
+        // Softfail wrapper with a non-empty catch body — rejected by
+        // the static gate's parse_softfail_wrapper, must also be
+        // rejected here (the catch body could itself execute code).
+        assert_eq!(
+            extract_delegate_path(
+                "node -e \"try{require('./scripts/setup.js')}catch(e){doEvil()}\""
+            ),
+            None
+        );
+
+        // Softfail wrapper whose inner path escapes the package root
+        // is rejected even though the wrapper shape itself matches.
+        assert_eq!(
+            extract_delegate_path("node -e \"try{require('../../../etc/passwd.js')}catch(e){}\""),
+            None
+        );
+
+        // Softfail wrapper whose inner path lacks a `.js`/`.cjs`/`.mjs`
+        // extension is rejected — extensionless require resolution is
+        // ambiguous (could resolve to `.js`, `.json`, `index.js`, etc.)
+        // so the hash cannot deterministically pick a file to bind.
+        assert_eq!(
+            extract_delegate_path("node -e \"try{require('./scripts/setup')}catch(e){}\""),
+            None
         );
     }
 

@@ -979,22 +979,40 @@ fn is_safe_relative_path(p: &str) -> bool {
     p.split('/').all(|seg| seg != "..")
 }
 
-/// Extract the in-package relative path a `node <path>` lifecycle
-/// script delegates to. Returns `Some(path)` for any body that
-/// tokenizes (POSIX shell quoting) as exactly two tokens — the literal
-/// `node` followed by a single safe-relative `.js` / `.cjs` / `.mjs`
-/// path — and `None` for anything else.
+/// Extract the in-package relative path a lifecycle script delegates
+/// to. Returns `Some(path)` for any body whose shape this module's
+/// classifier already recognizes as a delegate-to-local-file, and
+/// `None` for anything else.
 ///
-/// Recognition mirrors the static gate's [`matches_node_relative`] and
-/// [`matches_delegating_identity_green`] rules. Every script body those
-/// two functions classify as Green via a `node <path>` shape is also
-/// detected here. Compound bodies, env-var paths, dynamic paths, and
-/// quoted shapes that escape the safe-relative check return `None` —
-/// callers fall back to treating the body as opaque (no embedded
-/// delegate annotation, no embedded review).
+/// Recognized shapes:
 ///
-/// Single source of truth for three call sites that previously kept
-/// their own slightly-diverging parsers:
+/// 1. **Bare delegate** — `node <path>` (two POSIX-shell tokens). Same
+///    shape as [`matches_node_relative`] and
+///    [`matches_delegating_identity_green`].
+/// 2. **Softfail wrapper** — `node -e <body>` (three tokens) where the
+///    `<body>` matches one of the [`parse_softfail_wrapper`] shapes
+///    (`try{require('./X')}catch(e){}` or
+///    `import('./X').catch(()=>void 0)`). Same shape as
+///    [`matches_node_eval_softfail_green`].
+///
+/// In both cases the path must additionally be safe-relative (no
+/// absolute, no `..`, no `~`/`$`) and end in `.js` / `.cjs` / `.mjs`.
+/// Compound bodies, env-var paths, dynamic paths, and quoted shapes
+/// that escape the safe-relative check return `None`.
+///
+/// ## Contract — keep this parser aligned with the classifier
+///
+/// Every script-body shape this module classifies as Green via a
+/// delegate-to-local-file branch MUST be recognized here. If a future
+/// classifier change widens the Green set with a new delegate shape
+/// (e.g. a new wrapper template, a new module-system import form),
+/// this function MUST be extended in the same change — otherwise the
+/// script-hash binding will silently miss the new shape and the H17
+/// cross-version content-drift attack reopens through it.
+/// `softfail_wrapper_*` and `lever4_node_install_js_*` tests in this
+/// module are the canonical fixtures to mirror when adding spellings.
+///
+/// Single source of truth for three call sites:
 /// - `lpm_security::script_hash::compute_script_hash` binds the
 ///   delegate file's bytes into the approval hash so a malicious
 ///   upgrade that changes the file body without changing the script
@@ -1002,22 +1020,26 @@ fn is_safe_relative_path(p: &str) -> bool {
 /// - `lpm_cli::build_state::parse_delegated_paths` surfaces the file
 ///   contents in the advisor prompt so reviewers see the executed
 ///   bytes, not just the delegate command line.
-/// - This module's classifier shapes ([`matches_node_relative`],
-///   [`matches_delegating_identity_green`]) use the tokenized path
-///   for their reserved-basename / identity-match branches.
+/// - This module's own classifier shapes — both for the trust
+///   decision and for keeping the embedded-review path consistent.
 pub fn extract_delegate_path(body: &str) -> Option<String> {
     let tokens = shlex::split(body)?;
-    if tokens.len() != 2 || tokens[0] != "node" {
-        return None;
-    }
-    let path = &tokens[1];
-    if !is_safe_relative_path(path) {
+    let path = match tokens.as_slice() {
+        // Bare delegate: `node <path>`
+        [n, p] if n == "node" => p.clone(),
+        // Softfail wrapper: `node -e <body>` or `node --eval <body>`
+        [n, e, wrapper] if n == "node" && (e == "-e" || e == "--eval") => {
+            parse_softfail_wrapper(wrapper)?
+        }
+        _ => return None,
+    };
+    if !is_safe_relative_path(&path) {
         return None;
     }
     if !(path.ends_with(".js") || path.ends_with(".cjs") || path.ends_with(".mjs")) {
         return None;
     }
-    Some(path.clone())
+    Some(path)
 }
 
 // ─────────────────────────────────────────────────────────────────────
