@@ -1,10 +1,16 @@
 use crate::output;
 use crate::release_lookup::{
-    FetchOutcome, LookupError, clear_cache_at, default_cache_path, is_newer_semver, probe_release,
+    FetchOutcome, LookupError, clear_cache_at, default_cache_path,
+    fetch_github_release_published_at, github_release_download_url, is_newer_semver, probe_release,
     read_cache_at, write_cache_at,
+};
+use crate::sigstore_verify::{
+    IdentityExpectations, VerifiedProvenance, VerifyError, VerifyOptions,
+    extract_in_toto_subject_digest, verify_sigstore_bundle,
 };
 use lpm_common::LpmError;
 use lpm_common::color::Painted;
+use sha2::{Digest, Sha256};
 use std::process::Command;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -151,7 +157,13 @@ pub async fn run(json_output: bool, refresh: bool) -> Result<(), LpmError> {
 
     let method = detect_install_method();
 
-    if json_output {
+    // For non-Standalone channels the JSON contract is plan-only: emit
+    // the update command, return without invoking the channel's
+    // installer (the operator is expected to run it themselves so they
+    // can pipe / observe / sandbox it). Standalone is the one channel
+    // LPM can run AND attribute end-to-end, so its `--json` path runs
+    // the install and emits the captured Sigstore audit alongside.
+    if json_output && !matches!(method, InstallMethod::Standalone) {
         let json = serde_json::json!({
             "success": true,
             "current": current,
@@ -165,13 +177,16 @@ pub async fn run(json_output: bool, refresh: bool) -> Result<(), LpmError> {
         return Ok(());
     }
 
-    output::info(&format!(
-        "Updating {} → {} via {}",
-        current.dimmed(),
-        latest.green().bold(),
-        method.name().cyan()
-    ));
+    if !json_output {
+        output::info(&format!(
+            "Updating {} → {} via {}",
+            current.dimmed(),
+            latest.green().bold(),
+            method.name().cyan()
+        ));
+    }
 
+    let mut standalone_audit: Option<AttestationAudit> = None;
     match method {
         InstallMethod::Npm => {
             let pinned = format!("@lpm-registry/cli@{latest}");
@@ -206,7 +221,7 @@ pub async fn run(json_output: bool, refresh: bool) -> Result<(), LpmError> {
             )?;
         }
         InstallMethod::Standalone => {
-            run_standalone_update(&latest).await?;
+            standalone_audit = Some(run_standalone_update(&latest).await?);
         }
     }
 
@@ -232,7 +247,24 @@ pub async fn run(json_output: bool, refresh: bool) -> Result<(), LpmError> {
         }
     }
 
-    output::success(&format!("Updated to {}", latest.bold()));
+    if json_output {
+        let audit = standalone_audit
+            .as_ref()
+            .expect("json_output && Standalone implies audit was captured");
+        let json = serde_json::json!({
+            "success": true,
+            "current": current,
+            "latest": latest,
+            "up_to_date": false,
+            "install_method": method.name(),
+            "cache_hit": cache_hit,
+            "verified": true,
+            "attestation": audit_json(audit),
+        });
+        println!("{}", serde_json::to_string_pretty(&json).unwrap());
+    } else {
+        output::success(&format!("Updated to {}", latest.bold()));
+    }
 
     Ok(())
 }
@@ -258,7 +290,7 @@ fn lookup_error_to_lpm(e: LookupError) -> LpmError {
             LpmError::Network(format!("failed to check for updates: {e}"))
         }
         LookupError::RateLimited { .. } => LpmError::SelfUpdateRateLimited(e.to_string()),
-        LookupError::MalformedResponse(_) => {
+        LookupError::MalformedResponse(_) | LookupError::NotFound(_) => {
             LpmError::Network(format!("failed to check for updates: {e}"))
         }
     }
@@ -459,51 +491,393 @@ fn run_shell_update(cmd: &str, args: &[&str]) -> Result<(), LpmError> {
     Ok(())
 }
 
+/// `SHA256SUMS.txt` size cap (4 KiB). The real manifest is ~600 B
+/// today (six lines of `<sha>  <name>`); 4 KiB leaves comfortable
+/// headroom for future binaries without giving a hostile server an
+/// unbounded body.
+const MANIFEST_MAX_BYTES: usize = 4 * 1024;
+
+/// `SHA256SUMS.txt.sigstore` size cap (1 MiB). Real bundles are
+/// ~12 KiB but the protocol allows for embedded inclusion proofs that
+/// can grow; mirror the `SIGSTORE_RESPONSE_CAP_BYTES` used elsewhere.
+const BUNDLE_MAX_BYTES: usize = 1024 * 1024;
+
+/// Per-asset download cap (256 MiB). Today's largest published binary
+/// is ~30 MiB; the cap is set well above realistic growth so the
+/// guard only trips on a hostile server streaming junk.
+const ASSET_MAX_BYTES: usize = 256 * 1024 * 1024;
+
+/// Replay-window: bundle `integratedTime` must lie within
+/// `[published_at - PRE_WINDOW, published_at + POST_WINDOW]`. The
+/// 1-hour pre-window absorbs the GitHub Actions run minting the
+/// attestation before the Release object is finalized; the 24-hour
+/// post-window allows for late asset publication / re-uploads.
+const REPLAY_PRE_WINDOW: chrono::Duration = chrono::Duration::hours(1);
+const REPLAY_POST_WINDOW: chrono::Duration = chrono::Duration::hours(24);
+
+/// Captured trail of attestation metadata, surfaced into the
+/// `--json` self-update output so audit pipelines can pin which
+/// release identity actually authorised the binary swap.
+#[derive(Debug, Clone)]
+struct AttestationAudit {
+    publisher: Option<String>,
+    workflow_path: Option<String>,
+    workflow_ref: Option<String>,
+    integrated_time: chrono::DateTime<chrono::Utc>,
+    log_index: i64,
+    log_id: String,
+    leaf_cert_sha256: String,
+    manifest_sha256: String,
+    asset_sha256: String,
+    asset_name: String,
+}
+
+/// Map a `VerifyError` into the user-facing `LpmError::SelfUpdate`
+/// shape. The verifier error's `Display` already names the failing
+/// primitive (DSSE / chain / SET / SCT / Rekor body / inclusion proof
+/// / identity) so the wrapping prefix names the surface for the user.
+fn map_verify_error(e: VerifyError) -> LpmError {
+    LpmError::SelfUpdate(format!(
+        "Sigstore verification of release manifest failed: {e}"
+    ))
+}
+
+/// Parse a single line of a `sha256sum`-style manifest.
+///
+/// Lines must match `^([0-9a-f]{64})  (.+)$` — two ASCII spaces
+/// separate the hex digest from the file name (the GNU coreutils
+/// default; `shasum -a 256` produces the same shape). Anything else
+/// returns `None` so callers can choose to reject the manifest
+/// entirely rather than silently drop the malformed entry.
+fn parse_manifest_line(line: &str) -> Option<(String, String)> {
+    let line = line.trim_end_matches('\r');
+    let (sha_part, name_part) = line.split_once("  ")?;
+    if sha_part.len() != 64 || !sha_part.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
+    let sha = sha_part.to_ascii_lowercase();
+    let name = name_part.trim().to_string();
+    if name.is_empty() {
+        return None;
+    }
+    Some((sha, name))
+}
+
+/// Look up the expected SHA-256 for a given filename in a parsed
+/// `SHA256SUMS.txt` body. Skips blank lines and rejects lines that
+/// fail [`parse_manifest_line`] — a malformed manifest is an integrity
+/// failure, not a silent miss.
+fn lookup_platform_sha(manifest: &str, basename: &str) -> Result<String, LpmError> {
+    for (idx, raw_line) in manifest.lines().enumerate() {
+        if raw_line.trim().is_empty() {
+            continue;
+        }
+        let (sha, name) = parse_manifest_line(raw_line).ok_or_else(|| {
+            LpmError::SelfUpdate(format!(
+                "SHA256SUMS.txt line {} is malformed (expected `<64-hex-sha>  <filename>`); \
+                 refusing to install from a manifest we cannot fully parse",
+                idx + 1
+            ))
+        })?;
+        if name == basename {
+            return Ok(sha);
+        }
+    }
+    Err(LpmError::SelfUpdate(format!(
+        "SHA256SUMS.txt does not enumerate `{basename}` for this platform — release pipeline may be missing artifacts"
+    )))
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    hex::encode(Sha256::digest(bytes))
+}
+
+/// Fetch a bounded-size body from a URL with a 30 s timeout. Returns
+/// `Ok(Some(bytes))` on 200, `Ok(None)` on 404, and `Err` on every
+/// other shape (transport, oversized body, non-success status). The
+/// 404 / non-404 distinction is what lets the caller distinguish
+/// "release predates the integrity gate" from "release exists but
+/// something else is wrong with our download."
+async fn fetch_bounded(
+    client: &reqwest::Client,
+    url: &str,
+    max_bytes: usize,
+) -> Result<Option<Vec<u8>>, LpmError> {
+    let mut resp = client
+        .get(url)
+        .header("User-Agent", "lpm-cli")
+        .send()
+        .await
+        .map_err(|e| LpmError::Network(format!("fetch {url} failed: {e}")))?;
+
+    let status = resp.status();
+    if status.as_u16() == 404 {
+        return Ok(None);
+    }
+    if !status.is_success() {
+        return Err(LpmError::Network(format!(
+            "fetch {url} returned HTTP {}",
+            status.as_u16()
+        )));
+    }
+
+    // Reject by advertised Content-Length before any body bytes are
+    // buffered. A hostile or compromised endpoint that sets a truthful
+    // oversized Content-Length is caught here without touching the
+    // socket past the headers.
+    if let Some(advertised) = resp.content_length()
+        && advertised as usize > max_bytes
+    {
+        return Err(LpmError::SelfUpdate(format!(
+            "{url} advertises {advertised} bytes; cap of {max_bytes} would be exceeded — refusing to buffer"
+        )));
+    }
+
+    // Stream chunk-by-chunk so a hostile endpoint that omits or lies on
+    // Content-Length still trips the cap before the whole body lands in
+    // memory. Pre-size the buffer when Content-Length is present and
+    // under the cap; otherwise let the Vec grow.
+    let prealloc = resp
+        .content_length()
+        .map(|c| (c as usize).min(max_bytes))
+        .unwrap_or(0);
+    let mut buf: Vec<u8> = Vec::with_capacity(prealloc);
+    while let Some(chunk) = resp
+        .chunk()
+        .await
+        .map_err(|e| LpmError::Network(format!("fetch {url} body read failed: {e}")))?
+    {
+        if buf.len().saturating_add(chunk.len()) > max_bytes {
+            return Err(LpmError::SelfUpdate(format!(
+                "{url} body exceeded cap of {max_bytes} bytes mid-stream — aborted before full buffer"
+            )));
+        }
+        buf.extend_from_slice(&chunk);
+    }
+    Ok(Some(buf))
+}
+
+/// Cryptographically verify a release-artifact triple (manifest,
+/// Sigstore bundle, platform binary) end-to-end and return the audit
+/// trail on success. Every gate fails closed.
+fn verify_release_artifacts(
+    version: &str,
+    manifest_bytes: &[u8],
+    bundle_bytes: &[u8],
+    asset_bytes: &[u8],
+    asset_basename: &str,
+    published_at: chrono::DateTime<chrono::Utc>,
+) -> Result<AttestationAudit, LpmError> {
+    let expectations = IdentityExpectations {
+        expected_issuer: Some("https://token.actions.githubusercontent.com".to_string()),
+        expected_san_uri_prefix: Some("https://github.com/lpm-dev/rust-client/".to_string()),
+        expected_workflow_path: Some(".github/workflows/release.yml".to_string()),
+    };
+    let options = VerifyOptions::strict();
+
+    let VerifiedProvenance {
+        snapshot,
+        integrated_time,
+        leaf_cert_sha256,
+        log_id,
+        log_index,
+    } = verify_sigstore_bundle(bundle_bytes, &expectations, options).map_err(map_verify_error)?;
+
+    let integrated_time_utc: chrono::DateTime<chrono::Utc> = integrated_time.into();
+    let earliest = published_at - REPLAY_PRE_WINDOW;
+    let latest = published_at + REPLAY_POST_WINDOW;
+    if integrated_time_utc < earliest || integrated_time_utc > latest {
+        return Err(LpmError::SelfUpdate(format!(
+            "Sigstore bundle integratedTime ({integrated_time_utc}) is outside the replay window \
+             [{earliest}, {latest}] for release v{version} (published_at = {published_at}). \
+             The bundle may be a replayed attestation from a different release."
+        )));
+    }
+
+    let (subject_name, subject_sha256) =
+        extract_in_toto_subject_digest(bundle_bytes).map_err(map_verify_error)?;
+    let manifest_sha256 = sha256_hex(manifest_bytes);
+    if subject_sha256 != manifest_sha256 {
+        return Err(LpmError::SelfUpdate(format!(
+            "Sigstore bundle subject digest does not match SHA256SUMS.txt: bundle attests \
+             sha256={subject_sha256} (subject `{subject_name}`), downloaded manifest \
+             sha256={manifest_sha256}. The manifest may be tampered."
+        )));
+    }
+
+    let manifest_text = std::str::from_utf8(manifest_bytes).map_err(|e| {
+        LpmError::SelfUpdate(format!(
+            "SHA256SUMS.txt is not valid UTF-8 — refusing to parse: {e}"
+        ))
+    })?;
+    let expected_asset_sha = lookup_platform_sha(manifest_text, asset_basename)?;
+    let actual_asset_sha = sha256_hex(asset_bytes);
+    if actual_asset_sha != expected_asset_sha {
+        return Err(LpmError::SelfUpdate(format!(
+            "downloaded `{asset_basename}` SHA-256 mismatch: signed manifest declares \
+             {expected_asset_sha}, actual download is {actual_asset_sha}. \
+             Refusing to replace the running binary."
+        )));
+    }
+
+    Ok(AttestationAudit {
+        publisher: snapshot.publisher.clone(),
+        workflow_path: snapshot.workflow_path.clone(),
+        workflow_ref: snapshot.workflow_ref.clone(),
+        integrated_time: integrated_time_utc,
+        log_index,
+        log_id,
+        leaf_cert_sha256,
+        manifest_sha256,
+        asset_sha256: actual_asset_sha,
+        asset_name: asset_basename.to_string(),
+    })
+}
+
 /// Download and replace the binary in-place for standalone installations.
-async fn run_standalone_update(version: &str) -> Result<(), LpmError> {
+///
+/// Every fetched byte is anchored to the Sigstore-signed `SHA256SUMS.txt`
+/// manifest: the bundle's identity must match `lpm-dev/rust-client`'s
+/// release workflow, its `integratedTime` must lie inside a sane window
+/// around the GitHub Release `published_at`, the manifest's own hash
+/// must match the bundle's in-toto subject digest, and the downloaded
+/// binary's hash must match the manifest line for this platform. Any
+/// failure short-circuits before `swap_current_binary` is reached.
+///
+/// Returns the captured attestation audit so the caller can surface it
+/// into `--json` output (or wherever else a structured audit trail
+/// belongs). The audit is also logged via `tracing::info!`.
+async fn run_standalone_update(version: &str) -> Result<AttestationAudit, LpmError> {
+    let assets = verify_and_fetch_for_standalone(version).await?;
+    let current_exe = std::env::current_exe().map_err(LpmError::Io)?;
+    swap_current_binary(&current_exe, &assets.asset_bytes)?;
+
+    tracing::info!(
+        target: "lpm_cli::self_update",
+        publisher = assets.audit.publisher.as_deref().unwrap_or("<absent>"),
+        workflow_path = assets.audit.workflow_path.as_deref().unwrap_or("<absent>"),
+        workflow_ref = assets.audit.workflow_ref.as_deref().unwrap_or("<absent>"),
+        integrated_time = %assets.audit.integrated_time,
+        log_index = assets.audit.log_index,
+        log_id = %assets.audit.log_id,
+        leaf_cert_sha256 = %assets.audit.leaf_cert_sha256,
+        manifest_sha256 = %assets.audit.manifest_sha256,
+        asset_sha256 = %assets.audit.asset_sha256,
+        asset_name = %assets.audit.asset_name,
+        "standalone self-update verified and applied"
+    );
+    Ok(assets.audit)
+}
+
+/// Render an `AttestationAudit` as the JSON shape callers see under
+/// `--json` mode. Stable wire shape — adding new fields is fine, but
+/// renaming or removing keys is a contract break.
+fn audit_json(audit: &AttestationAudit) -> serde_json::Value {
+    serde_json::json!({
+        "publisher": audit.publisher,
+        "workflow_path": audit.workflow_path,
+        "workflow_ref": audit.workflow_ref,
+        "integrated_time": audit.integrated_time.to_rfc3339(),
+        "log_index": audit.log_index,
+        "log_id": audit.log_id,
+        "leaf_cert_sha256": audit.leaf_cert_sha256,
+        "manifest_sha256": audit.manifest_sha256,
+        "asset_sha256": audit.asset_sha256,
+        "asset_name": audit.asset_name,
+    })
+}
+
+/// Verified + bytes-ready state ready to be handed to
+/// [`swap_current_binary`]. Split out so the standalone update flow
+/// can be unit-tested through `verify_and_fetch_for_standalone`
+/// without requiring the swap step (which mutates the running binary).
+#[derive(Debug)]
+struct StandaloneAssets {
+    asset_bytes: Vec<u8>,
+    audit: AttestationAudit,
+}
+
+async fn verify_and_fetch_for_standalone(version: &str) -> Result<StandaloneAssets, LpmError> {
     let (platform, ext) = detect_platform()?;
     let binary_name = format!("lpm-{platform}{ext}");
-    let url = format!(
-        "https://github.com/lpm-dev/rust-client/releases/download/v{version}/{binary_name}"
-    );
-
-    let spinner = cliclack::spinner();
-    spinner.start(format!("Downloading {binary_name}..."));
+    let manifest_url = github_release_download_url(version, "SHA256SUMS.txt");
+    let bundle_url = github_release_download_url(version, "SHA256SUMS.txt.sigstore");
+    let asset_url = github_release_download_url(version, &binary_name);
 
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(60))
         .build()
         .map_err(|e| LpmError::Network(format!("failed to create HTTP client: {e}")))?;
 
-    let response = client
-        .get(&url)
-        .header("User-Agent", "lpm-cli")
-        .send()
+    let spinner = cliclack::spinner();
+    spinner.start(format!("Fetching signed checksums for v{version}..."));
+
+    let manifest_bytes = fetch_bounded(&client, &manifest_url, MANIFEST_MAX_BYTES)
+        .await?
+        .ok_or_else(|| {
+            spinner.stop("Signed checksums missing");
+            LpmError::SelfUpdate(format!(
+                "release v{version} does not ship SHA256SUMS.txt — this release predates LPM's \
+                 signed-install gate. Install manually from \
+                 https://github.com/lpm-dev/rust-client/releases/v{version}"
+            ))
+        })?;
+    let bundle_bytes = fetch_bounded(&client, &bundle_url, BUNDLE_MAX_BYTES)
+        .await?
+        .ok_or_else(|| {
+            spinner.stop("Sigstore bundle missing");
+            LpmError::SelfUpdate(format!(
+                "release v{version} ships SHA256SUMS.txt but not SHA256SUMS.txt.sigstore — \
+                 cannot cryptographically verify the manifest. Install manually."
+            ))
+        })?;
+
+    let published_at = fetch_github_release_published_at(version)
         .await
-        .map_err(|e| LpmError::Network(format!("download failed: {e}")))?;
+        .map_err(|e| match e {
+            LookupError::NotFound(_) => LpmError::SelfUpdate(format!(
+                "GitHub has no release at tag v{version} — cannot anchor the Sigstore replay window. \
+                 Install manually."
+            )),
+            LookupError::MalformedResponse(msg) => LpmError::SelfUpdate(format!(
+                "release v{version} did not expose a parseable `published_at` timestamp: {msg}. \
+                 Cannot anchor the Sigstore replay window."
+            )),
+            other => LpmError::Network(format!(
+                "could not fetch release metadata for v{version}: {other}"
+            )),
+        })?;
 
-    if !response.status().is_success() {
-        spinner.stop("Download failed");
-        return Err(LpmError::Network(format!(
-            "download failed: HTTP {}",
-            response.status()
-        )));
-    }
+    spinner.stop("Verifying Sigstore attestation");
 
-    let bytes = response
-        .bytes()
-        .await
-        .map_err(|e| LpmError::Network(format!("download failed: {e}")))?;
+    let asset_vec = fetch_bounded(&client, &asset_url, ASSET_MAX_BYTES)
+        .await?
+        .ok_or_else(|| {
+            LpmError::SelfUpdate(format!(
+                "release v{version} advertises `{binary_name}` in SHA256SUMS.txt but the asset is missing at {asset_url} — release-pipeline bug"
+            ))
+        })?;
 
-    spinner.stop(format!(
-        "Downloaded {} ({})",
+    let audit = verify_release_artifacts(
+        version,
+        &manifest_bytes,
+        &bundle_bytes,
+        &asset_vec,
+        &binary_name,
+        published_at,
+    )?;
+
+    output::success(&format!(
+        "Verified Sigstore attestation for {} ({}, integratedTime {})",
         binary_name,
-        format_bytes(bytes.len())
+        format_bytes(asset_vec.len()),
+        audit.integrated_time
     ));
 
-    // Replace the current binary
-    let current_exe = std::env::current_exe().map_err(LpmError::Io)?;
-    swap_current_binary(&current_exe, &bytes)
+    Ok(StandaloneAssets {
+        asset_bytes: asset_vec,
+        audit,
+    })
 }
 
 /// Atomically swap the running binary at `current_exe` for `new_bytes`.
@@ -700,6 +1074,536 @@ mod tests {
     fn install_method_name_not_empty() {
         let method = detect_install_method();
         assert!(!method.name().is_empty());
+    }
+
+    #[test]
+    fn parse_manifest_line_accepts_canonical_two_space_form() {
+        let line =
+            "abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abcd  lpm-linux-x64";
+        let (sha, name) = parse_manifest_line(line).expect("must parse");
+        assert_eq!(sha.len(), 64);
+        assert_eq!(name, "lpm-linux-x64");
+    }
+
+    #[test]
+    fn parse_manifest_line_lowercases_hex_digest() {
+        let line = "ABCDEF1234567890ABCDEF1234567890ABCDEF1234567890ABCDEF1234567890  X";
+        let (sha, _) = parse_manifest_line(line).expect("must parse");
+        assert_eq!(
+            sha,
+            "abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890"
+        );
+    }
+
+    #[test]
+    fn parse_manifest_line_rejects_short_digest() {
+        let line = "abc  lpm-linux-x64";
+        assert!(parse_manifest_line(line).is_none());
+    }
+
+    #[test]
+    fn parse_manifest_line_rejects_non_hex_digest() {
+        let line = "zzz123abc123abc123abc123abc123abc123abc123abc123abc123abc123abcd  lpm";
+        assert!(parse_manifest_line(line).is_none());
+    }
+
+    #[test]
+    fn parse_manifest_line_rejects_single_space_separator() {
+        let line = "0000000000000000000000000000000000000000000000000000000000000000 lpm";
+        assert!(parse_manifest_line(line).is_none());
+    }
+
+    #[test]
+    fn parse_manifest_line_rejects_empty_filename() {
+        let line = "0000000000000000000000000000000000000000000000000000000000000000  ";
+        assert!(parse_manifest_line(line).is_none());
+    }
+
+    #[test]
+    fn parse_manifest_line_strips_trailing_carriage_return() {
+        let line =
+            "1111111111111111111111111111111111111111111111111111111111111111  lpm-darwin-arm64\r";
+        let (sha, name) = parse_manifest_line(line).expect("must parse");
+        assert_eq!(
+            sha,
+            "1111111111111111111111111111111111111111111111111111111111111111"
+        );
+        assert_eq!(name, "lpm-darwin-arm64");
+    }
+
+    #[test]
+    fn lookup_platform_sha_returns_correct_entry() {
+        let manifest = "\
+aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa  lpm-darwin-arm64\n\
+bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb  lpm-darwin-x64\n\
+cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc  lpm-linux-x64\n\
+";
+        let got = lookup_platform_sha(manifest, "lpm-linux-x64").expect("must find");
+        assert_eq!(
+            got,
+            "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+        );
+    }
+
+    #[test]
+    fn lookup_platform_sha_returns_err_on_missing_platform() {
+        let manifest =
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa  lpm-darwin-arm64\n";
+        let err = lookup_platform_sha(manifest, "lpm-linux-x64").expect_err("must fail");
+        match err {
+            LpmError::SelfUpdate(msg) => assert!(msg.contains("lpm-linux-x64")),
+            other => panic!("wrong variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn lookup_platform_sha_skips_blank_lines() {
+        let manifest =
+            "\naaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa  lpm-linux-x64\n\n";
+        let got = lookup_platform_sha(manifest, "lpm-linux-x64").expect("must find");
+        assert!(got.starts_with("aaaa"));
+    }
+
+    #[test]
+    fn lookup_platform_sha_rejects_malformed_line() {
+        let manifest = "\
+aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa  lpm-darwin-arm64
+not-a-valid-line
+bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb  lpm-linux-x64
+";
+        let err = lookup_platform_sha(manifest, "lpm-linux-x64").expect_err("must reject");
+        match err {
+            LpmError::SelfUpdate(msg) => assert!(msg.contains("malformed")),
+            other => panic!("wrong variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sha256_hex_matches_known_vector() {
+        let got = sha256_hex(b"abc");
+        assert_eq!(
+            got,
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+    }
+
+    /// Wire-shape pin for the audit JSON surface — `--json self-update`
+    /// emits these keys for the Standalone channel and downstream
+    /// consumers (audit pipelines, CI provenance check) parse them by
+    /// name. Renaming or removing a key is a contract break; adding a
+    /// key is non-breaking.
+    #[test]
+    fn audit_json_emits_stable_wire_shape() {
+        let audit = AttestationAudit {
+            publisher: Some("github:lpm-dev/rust-client".to_string()),
+            workflow_path: Some(".github/workflows/release.yml".to_string()),
+            workflow_ref: Some("refs/tags/v1.2.3".to_string()),
+            integrated_time: chrono::DateTime::parse_from_rfc3339("2026-05-19T12:34:56Z")
+                .unwrap()
+                .with_timezone(&chrono::Utc),
+            log_index: 9876543210,
+            log_id: "c0d23d6ad406973f9559f3ba2d1ca01f8.. (truncated)".to_string(),
+            leaf_cert_sha256: "feedface".to_string(),
+            manifest_sha256: "deadbeef".to_string(),
+            asset_sha256: "cafebabe".to_string(),
+            asset_name: "lpm-linux-x64".to_string(),
+        };
+        let json = audit_json(&audit);
+        let obj = json.as_object().expect("audit_json returns an object");
+        for key in [
+            "publisher",
+            "workflow_path",
+            "workflow_ref",
+            "integrated_time",
+            "log_index",
+            "log_id",
+            "leaf_cert_sha256",
+            "manifest_sha256",
+            "asset_sha256",
+            "asset_name",
+        ] {
+            assert!(
+                obj.contains_key(key),
+                "audit_json wire shape dropped key `{key}`: {json}"
+            );
+        }
+        assert_eq!(
+            obj["integrated_time"], "2026-05-19T12:34:56+00:00",
+            "integrated_time must be RFC 3339 with explicit zone offset"
+        );
+        assert_eq!(obj["log_index"], 9876543210_i64);
+    }
+
+    // ── verify_and_fetch_for_standalone (wiremock-backed) ────────
+
+    const DOWNLOAD_OVERRIDE_KEY: &str = "LPM_GITHUB_RELEASE_DOWNLOAD_URL_OVERRIDE";
+    const RELEASE_BY_TAG_OVERRIDE_KEY: &str = "LPM_GITHUB_RELEASE_BY_TAG_URL_OVERRIDE";
+
+    /// Self-update tests mutate the same two process-global env vars
+    /// (`LPM_GITHUB_RELEASE_DOWNLOAD_URL_OVERRIDE` and
+    /// `LPM_GITHUB_RELEASE_BY_TAG_URL_OVERRIDE`). Without serialisation,
+    /// parallel `cargo test` runs would race and steer each other's
+    /// probes at the wrong wiremock instance.
+    fn standalone_env_lock() -> &'static std::sync::Mutex<()> {
+        static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+        LOCK.get_or_init(|| std::sync::Mutex::new(()))
+    }
+
+    struct StandaloneEnvGuard {
+        download_prev: Option<String>,
+        release_by_tag_prev: Option<String>,
+        _lock: std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl Drop for StandaloneEnvGuard {
+        fn drop(&mut self) {
+            unsafe {
+                match &self.download_prev {
+                    Some(v) => std::env::set_var(DOWNLOAD_OVERRIDE_KEY, v),
+                    None => std::env::remove_var(DOWNLOAD_OVERRIDE_KEY),
+                }
+                match &self.release_by_tag_prev {
+                    Some(v) => std::env::set_var(RELEASE_BY_TAG_OVERRIDE_KEY, v),
+                    None => std::env::remove_var(RELEASE_BY_TAG_OVERRIDE_KEY),
+                }
+            }
+        }
+    }
+
+    fn acquire_standalone_env(
+        download_template: &str,
+        release_by_tag_template: &str,
+    ) -> StandaloneEnvGuard {
+        let lock = standalone_env_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let guard = StandaloneEnvGuard {
+            download_prev: std::env::var(DOWNLOAD_OVERRIDE_KEY).ok(),
+            release_by_tag_prev: std::env::var(RELEASE_BY_TAG_OVERRIDE_KEY).ok(),
+            _lock: lock,
+        };
+        unsafe {
+            std::env::set_var(DOWNLOAD_OVERRIDE_KEY, download_template);
+            std::env::set_var(RELEASE_BY_TAG_OVERRIDE_KEY, release_by_tag_template);
+        }
+        guard
+    }
+
+    /// Drive `verify_and_fetch_for_standalone` against a wiremock-served
+    /// release fixture. Caller mounts the asset / manifest / bundle /
+    /// release-tag responses on the supplied [`wiremock::MockServer`],
+    /// then awaits the future — this helper just wires the env vars up.
+    async fn run_standalone_against_server<F>(
+        server: &wiremock::MockServer,
+        version: &str,
+        fut: impl FnOnce() -> F,
+    ) where
+        F: std::future::Future<Output = ()>,
+    {
+        let download_template = format!("{}/download/v{{tag}}/{{file}}", server.uri());
+        let release_by_tag_template = format!("{}/releases/tags/v{{tag}}", server.uri());
+        let _guard = acquire_standalone_env(&download_template, &release_by_tag_template);
+        let _ = version; // version is captured by the caller's future
+        fut().await;
+    }
+
+    fn mount_release_tag_with_published_at(server_uri_path: &str) -> serde_json::Value {
+        serde_json::json!({
+            "tag_name": format!("v{server_uri_path}"),
+            "published_at": "2099-01-01T00:00:00Z",
+        })
+    }
+
+    #[tokio::test]
+    async fn standalone_update_refuses_when_manifest_is_404() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/download/v0.42.0/SHA256SUMS.txt"))
+            .respond_with(wiremock::ResponseTemplate::new(404))
+            .mount(&server)
+            .await;
+
+        run_standalone_against_server(&server, "0.42.0", || async {
+            let err = verify_and_fetch_for_standalone("0.42.0")
+                .await
+                .expect_err("missing manifest must fail-closed");
+            match err {
+                LpmError::SelfUpdate(msg) => {
+                    assert!(
+                        msg.contains("predates LPM's signed-install gate"),
+                        "msg: {msg}"
+                    );
+                    assert!(msg.contains("0.42.0"), "version must appear: {msg}");
+                }
+                other => panic!("expected SelfUpdate, got {other:?}"),
+            }
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn standalone_update_refuses_when_bundle_is_404() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/download/v0.42.0/SHA256SUMS.txt"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_bytes(
+                b"0000000000000000000000000000000000000000000000000000000000000000  lpm-darwin-arm64\n"
+                    .to_vec(),
+            ))
+            .mount(&server)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(
+                "/download/v0.42.0/SHA256SUMS.txt.sigstore",
+            ))
+            .respond_with(wiremock::ResponseTemplate::new(404))
+            .mount(&server)
+            .await;
+
+        run_standalone_against_server(&server, "0.42.0", || async {
+            let err = verify_and_fetch_for_standalone("0.42.0")
+                .await
+                .expect_err("missing bundle must fail-closed");
+            match err {
+                LpmError::SelfUpdate(msg) => {
+                    assert!(
+                        msg.contains("SHA256SUMS.txt.sigstore"),
+                        "msg names the missing bundle file: {msg}"
+                    );
+                }
+                other => panic!("expected SelfUpdate, got {other:?}"),
+            }
+        })
+        .await;
+    }
+
+    /// Hostile server that serves the manifest but the bundle is
+    /// signed by axios/axios's release workflow (real npm fixture).
+    /// The verifier must reject on identity-pin BEFORE the manifest
+    /// or asset content is honoured — proves the SAN URI prefix check
+    /// is load-bearing for the C2 path.
+    #[tokio::test]
+    async fn standalone_update_refuses_when_bundle_identity_does_not_match_lpm_dev_rust_client() {
+        let axios_bundle = std::fs::read(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures/sigstore_bundles/20-real-npm-axios-1.14.0.json"),
+        )
+        .expect("axios fixture must exist");
+        let (platform, ext) = detect_platform().expect("platform must be supported");
+        let asset_name = format!("lpm-{platform}{ext}");
+        let asset_path = format!("/download/v0.42.0/{asset_name}");
+
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/download/v0.42.0/SHA256SUMS.txt"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_bytes(b"x".to_vec()))
+            .mount(&server)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(
+                "/download/v0.42.0/SHA256SUMS.txt.sigstore",
+            ))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_bytes(axios_bundle))
+            .mount(&server)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/releases/tags/v0.42.0"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(mount_release_tag_with_published_at("0.42.0")),
+            )
+            .mount(&server)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(&asset_path))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_bytes(b"x".to_vec()))
+            .mount(&server)
+            .await;
+
+        run_standalone_against_server(&server, "0.42.0", || async {
+            let err = verify_and_fetch_for_standalone("0.42.0")
+                .await
+                .expect_err("foreign-repo bundle must be rejected");
+            match err {
+                LpmError::SelfUpdate(msg) => {
+                    let lower = msg.to_ascii_lowercase();
+                    assert!(
+                        lower.contains("identity")
+                            || lower.contains("san")
+                            || lower.contains("workflow")
+                            || lower.contains("issuer"),
+                        "rejection must name the identity-pin field: {msg}"
+                    );
+                }
+                other => panic!("expected SelfUpdate, got {other:?}"),
+            }
+        })
+        .await;
+    }
+
+    /// Server returns a `releases/tags/v{tag}` JSON with no
+    /// `published_at` field — replay-window anchor cannot be
+    /// computed and the update must refuse rather than fall through.
+    #[tokio::test]
+    async fn standalone_update_refuses_when_published_at_is_missing() {
+        let axios_bundle = std::fs::read(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures/sigstore_bundles/20-real-npm-axios-1.14.0.json"),
+        )
+        .expect("axios fixture must exist");
+
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/download/v0.42.0/SHA256SUMS.txt"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_bytes(b"x".to_vec()))
+            .mount(&server)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(
+                "/download/v0.42.0/SHA256SUMS.txt.sigstore",
+            ))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_bytes(axios_bundle))
+            .mount(&server)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/releases/tags/v0.42.0"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "tag_name": "v0.42.0",
+                })),
+            )
+            .mount(&server)
+            .await;
+
+        run_standalone_against_server(&server, "0.42.0", || async {
+            let err = verify_and_fetch_for_standalone("0.42.0")
+                .await
+                .expect_err("missing published_at must fail-closed");
+            match err {
+                LpmError::SelfUpdate(msg) => {
+                    assert!(
+                        msg.contains("published_at"),
+                        "msg names the missing field: {msg}"
+                    );
+                }
+                other => panic!("expected SelfUpdate, got {other:?}"),
+            }
+        })
+        .await;
+    }
+
+    /// `releases/tags/v{tag}` returns 404 (release doesn't exist on
+    /// GitHub even though the manifest + bundle came from somewhere) —
+    /// surface as `SelfUpdate` with the manual-install hint, not as a
+    /// generic network error.
+    #[tokio::test]
+    async fn standalone_update_refuses_when_release_tag_endpoint_is_404() {
+        let axios_bundle = std::fs::read(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures/sigstore_bundles/20-real-npm-axios-1.14.0.json"),
+        )
+        .expect("axios fixture must exist");
+
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/download/v0.42.0/SHA256SUMS.txt"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_bytes(b"x".to_vec()))
+            .mount(&server)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(
+                "/download/v0.42.0/SHA256SUMS.txt.sigstore",
+            ))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_bytes(axios_bundle))
+            .mount(&server)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/releases/tags/v0.42.0"))
+            .respond_with(wiremock::ResponseTemplate::new(404))
+            .mount(&server)
+            .await;
+
+        run_standalone_against_server(&server, "0.42.0", || async {
+            let err = verify_and_fetch_for_standalone("0.42.0")
+                .await
+                .expect_err("missing release tag must fail-closed");
+            match err {
+                LpmError::SelfUpdate(msg) => {
+                    assert!(
+                        msg.contains("no release at tag v0.42.0")
+                            || msg.contains("Install manually"),
+                        "msg points the user at manual install: {msg}"
+                    );
+                }
+                other => panic!("expected SelfUpdate, got {other:?}"),
+            }
+        })
+        .await;
+    }
+
+    /// Oversized manifest body must trigger the size cap rather than
+    /// being silently accepted. Cap is `MANIFEST_MAX_BYTES = 4 KiB`.
+    #[tokio::test]
+    async fn standalone_update_refuses_when_manifest_exceeds_size_cap() {
+        let server = wiremock::MockServer::start().await;
+        // 8 KiB of zeros — well over the 4 KiB cap.
+        let huge = vec![b'0'; 8 * 1024];
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/download/v0.42.0/SHA256SUMS.txt"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_bytes(huge))
+            .mount(&server)
+            .await;
+
+        run_standalone_against_server(&server, "0.42.0", || async {
+            let err = verify_and_fetch_for_standalone("0.42.0")
+                .await
+                .expect_err("oversized manifest must be rejected");
+            match err {
+                LpmError::SelfUpdate(msg) => {
+                    assert!(msg.contains("cap of"), "msg names the cap: {msg}");
+                }
+                other => panic!("expected SelfUpdate, got {other:?}"),
+            }
+        })
+        .await;
+    }
+
+    /// Hostile endpoint that omits Content-Length and streams more
+    /// bytes than the cap allows. The mid-stream guard in
+    /// [`fetch_bounded`] must trip before the whole body buffers.
+    /// This is the defense-in-depth pair for the Content-Length pre-check.
+    #[tokio::test]
+    async fn standalone_update_refuses_when_manifest_streams_past_cap_without_content_length() {
+        let server = wiremock::MockServer::start().await;
+        let huge = vec![b'0'; 8 * 1024];
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/download/v0.42.0/SHA256SUMS.txt"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_bytes(huge)
+                    // Wiremock auto-fills Content-Length; force chunked
+                    // by setting Transfer-Encoding so the pre-check is
+                    // bypassed and the mid-stream guard is what fires.
+                    .insert_header("Transfer-Encoding", "chunked"),
+            )
+            .mount(&server)
+            .await;
+
+        run_standalone_against_server(&server, "0.42.0", || async {
+            let err = verify_and_fetch_for_standalone("0.42.0")
+                .await
+                .expect_err("oversized chunked manifest must be rejected");
+            match err {
+                LpmError::SelfUpdate(msg) => {
+                    assert!(
+                        msg.contains("mid-stream") || msg.contains("cap of"),
+                        "msg names the cap: {msg}"
+                    );
+                }
+                other => panic!("expected SelfUpdate, got {other:?}"),
+            }
+        })
+        .await;
     }
 
     /// L34: the staging file lands next to `current_exe` (same FS,

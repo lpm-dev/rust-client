@@ -7,7 +7,8 @@ on:
 
 permissions:
   contents: write
-  id-token: write # Required for npm OIDC trusted publishing (no token needed)
+  id-token: write # Required for npm OIDC trusted publishing (no token needed) + Sigstore Fulcio
+  attestations: write # Required for actions/attest-build-provenance to mint the artifact attestation
 
 env:
   # Opt in to Node.js 24 for all JavaScript actions ahead of GitHub's
@@ -100,12 +101,50 @@ jobs:
     needs: build
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
     steps:
       - name: Download all artifacts
         uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
         with:
           path: binaries
           merge-multiple: true
+
+      - name: Generate SHA256SUMS.txt
+        working-directory: binaries
+        run: |
+          sha256sum lpm-darwin-arm64 lpm-darwin-x64 \
+                    lpm-linux-x64 lpm-linux-arm64 \
+                    lpm-win32-x64.exe lpm-sandbox-helper-win32-x64.exe \
+                    > SHA256SUMS.txt
+          echo "Manifest contents:"
+          cat SHA256SUMS.txt
+
+      # Hard-fail when the manifest's filename column drifts from the set
+      # of files actually staged for upload — keeps a future contributor
+      # who adds a published binary without extending the sha256sum step
+      # from silently shipping unsigned bytes.
+      - name: Verify every published binary is enumerated in SHA256SUMS.txt
+        working-directory: binaries
+        run: |
+          ls --format=single-column | grep -vE '^SHA256SUMS\.txt(\.sigstore)?$' | sort > /tmp/published.txt
+          awk '{print $2}' SHA256SUMS.txt | sort > /tmp/manifest.txt
+          if ! diff -u /tmp/published.txt /tmp/manifest.txt; then
+            echo "::error::SHA256SUMS.txt enumeration drifted from binaries/ contents. Update the sha256sum step above to add or remove entries."
+            exit 1
+          fi
+          echo "Manifest covers every published binary."
+
+      - name: Attest SHA256SUMS.txt via Sigstore
+        id: attest
+        uses: actions/attest-build-provenance@173725a1209d09b31f9d30a3890cf2757ebbff0d # v2
+        with:
+          subject-path: binaries/SHA256SUMS.txt
+
+      - name: Stage Sigstore bundle next to manifest
+        run: cp "${{ steps.attest.outputs.bundle-path }}" binaries/SHA256SUMS.txt.sigstore
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
