@@ -823,27 +823,27 @@ pub fn blocked_to_json(
     blocked_to_json_with_provenance(blocked, trusted, None)
 }
 
-/// Phase 2.2.d variant. Same per-entry shape as [`blocked_to_json`]
-/// PLUS an optional `provenance` block when a live
-/// [`lpm_common::ProvenanceStatus`] map is in scope (the approve-
-/// scripts batch path has one; the install --json path can build
-/// one from the drift-gate iteration).
+/// Same per-entry shape as [`blocked_to_json`] PLUS an optional
+/// `provenance` block when a live [`lpm_common::ProvenanceStatus`]
+/// map is in scope (the approve-scripts batch path has one; the
+/// install --json path can build one from the drift-gate
+/// iteration).
 ///
 /// The `provenance` block emits:
-/// - `verified`: `true | false | "skipped" | "verification_rejected" | null`
+/// - `verified`: `true | false | "skipped" | "disabled" |
+///   "verification_rejected" | null`
 /// - `rejection_reason`: present only when `verified ==
 ///   "verification_rejected"`, truncated to 200 chars
 ///
 /// State mapping is owned by
 /// [`lpm_common::ProvenanceStatus::to_json_verified`] — that's the
-/// single source of truth so the install + approve-scripts envelopes
-/// stay in lockstep on every new variant (Phase 2.5 will add a
-/// `"disabled"` state for `EnforceMode::Off`).
+/// single source of truth so the install + approve-scripts
+/// envelopes stay in lockstep on every new variant.
 ///
 /// When `provenance_by_pkg` is `None` OR the map has no entry for
 /// `(name, version)`, the `provenance` block is omitted entirely —
-/// agents see no key rather than `null`, so pre-Phase-2.2.d JSON
-/// readers stay byte-compatible.
+/// agents see no key rather than `null`, so JSON readers that
+/// don't know about the `provenance` field stay byte-compatible.
 pub fn blocked_to_json_with_provenance(
     blocked: &crate::build_state::BlockedPackage,
     trusted: &lpm_workspace::TrustedDependencies,
@@ -1917,12 +1917,12 @@ mod tests {
         assert_eq!(vd["script_hash_drift"], serde_json::json!(true));
     }
 
-    // ── Phase 2.2.d: provenance.verified envelope ─────────────────
+    // ── provenance.verified envelope ──────────────────────────────
 
     /// Backward compatibility: when `provenance_by_pkg` is `None`,
     /// `blocked_to_json_with_provenance` MUST emit byte-identical
-    /// output to the pre-2.2.d `blocked_to_json`. Pre-2.2.d agents
-    /// that don't know about the `provenance` field stay readable.
+    /// output to `blocked_to_json`. JSON readers that don't know
+    /// about the `provenance` field stay readable.
     #[test]
     fn blocked_to_json_with_provenance_omits_block_when_map_is_none() {
         use lpm_workspace::TrustedDependencies;

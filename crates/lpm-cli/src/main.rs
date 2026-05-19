@@ -347,12 +347,13 @@ enum Commands {
         /// (verification is suppressed entirely for this invocation).
         ///
         /// This is the **per-invocation** opt-out and is loud at
-        /// install time (`tracing::warn`). For a persistent fleet-wide
-        /// posture (corporate-firewalled Rekor egress, air-gapped
-        /// environments), prefer the operator-scoped knob in
-        /// Phase 2.5's `[sigstore] verify = "off"` config / `lpm
-        /// config sigstore --set off` wizard — those surface the
-        /// degraded posture in `lpm doctor` so it isn't forgotten.
+        /// install time (`tracing::warn`). For a persistent fleet-
+        /// wide posture (corporate-firewalled Rekor egress, air-
+        /// gapped environments), prefer the operator-scoped knob:
+        /// `[sigstore] verify = "off"` in `~/.lpm/config.toml`, or
+        /// `lpm config sigstore --set off`. Those persisted knobs
+        /// surface the degraded posture in `lpm doctor` so it
+        /// isn't forgotten.
         #[arg(long)]
         unverified_provenance_all: bool,
 
@@ -2936,11 +2937,11 @@ async fn async_main() -> Result<()> {
                 ignore_provenance_drift_all,
             );
 
-            // Phase 2.2.c + 2.5: canonicalize the per-package crypto
-            // opt-out flags + env / config-resolved `EnforceMode`
-            // into a single `VerifyPolicy`. The two axes (enforce,
-            // skip) compose orthogonally — see `SkipPolicy` doc.
-            // Resolution walks the full precedence chain:
+            // Canonicalize the per-package crypto opt-out flags +
+            // env / config-resolved `EnforceMode` into a single
+            // `VerifyPolicy`. The two axes (enforce, skip) compose
+            // orthogonally — see `SkipPolicy` doc. Resolution walks
+            // the full precedence chain:
             //   env LPM_PROVENANCE_ENFORCE
             //     → config [sigstore].verify in ~/.lpm/config.toml
             //       → default Deny.
@@ -5982,9 +5983,10 @@ mod tests {
 
     #[test]
     fn install_unverified_provenance_flag_parses_repeatable_and_blanket() {
-        // Phase 2.2.c: per-package `--unverified-provenance <name>` is
-        // repeatable; `--unverified-provenance-all` is a blanket flag.
-        // Both must parse and reach the `Install` variant fields.
+        // Per-package `--unverified-provenance <name>` is
+        // repeatable; `--unverified-provenance-all` is a blanket
+        // flag. Both must parse and reach the `Install` variant
+        // fields.
         let cli = Cli::try_parse_from([
             "lpm",
             "install",

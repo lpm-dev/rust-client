@@ -3394,8 +3394,8 @@ pub async fn run_with_options(
     // into this policy (D16): drift and cooldown are orthogonal, so
     // their override flags stay separate.
     drift_ignore_policy: crate::provenance_fetch::DriftIgnorePolicy,
-    // Phase 2.2.c: composed `(EnforceMode, SkipPolicy)` for the
-    // Sigstore verifier. The drift gate at the install-time call
+    // Composed `(EnforceMode, SkipPolicy)` for the Sigstore
+    // verifier. The drift gate at the install-time call
     // consults `verify_policy.skip` to route skip-listed packages
     // through the legacy identity-only parser (producing
     // `ProvenanceStatus::Unverified`) instead of hard-failing on a
@@ -5591,13 +5591,13 @@ async fn run_with_options_under_store_lock(
             "provenance-drift check waived for this install by --ignore-provenance-drift-all",
         );
     }
-    // Phase 2.2.d: per-package `ProvenanceStatus` map for the install
-    // --json envelope. Declared at this scope (rather than inside the
-    // `if has_rich_approvals` block) so the JSON emission below at the
-    // `blocked_packages` enumeration can consume it. Sparse — only
-    // packages the drift gate fetched for are present; the
-    // `blocked_to_json_with_provenance` helper omits the `provenance`
-    // block when the key is absent.
+    // Per-package `ProvenanceStatus` map for the install --json
+    // envelope. Declared at this scope (rather than inside the
+    // `if has_rich_approvals` block) so the JSON emission below at
+    // the `blocked_packages` enumeration can consume it. Sparse —
+    // only packages the drift gate fetched for are present; the
+    // `blocked_to_json_with_provenance` helper omits the
+    // `provenance` block when the key is absent.
     let mut install_provenance_status_map: HashMap<(String, String), lpm_common::ProvenanceStatus> =
         HashMap::new();
     if !used_lockfile && !drift_ignore_policy.ignores_all() {
@@ -5688,15 +5688,15 @@ async fn run_with_options_under_store_lock(
                     })
                 };
 
-                // Phase 2.2.c / 2.5: when the operator skip-listed this
-                // name (CLI `--unverified-provenance`) OR set the
-                // fleet-wide enforce mode to `Off` (env / config),
-                // route the fetch through the batch caller's
-                // `Unverified` path — bytes through the legacy
-                // identity-only parser, no cryptographic checks. The
-                // drift gate still gets a populated snapshot so
-                // publisher / workflow_path identity drift is detected
-                // even when the operator opted out of crypto.
+                // When the operator skip-listed this name (CLI
+                // `--unverified-provenance`) OR set the fleet-wide
+                // enforce mode to `Off` (env / config), route the
+                // fetch through the `Unverified` path — bytes
+                // through the legacy identity-only parser, no
+                // cryptographic checks. The drift gate still gets
+                // a populated snapshot so publisher / workflow_path
+                // identity drift is detected even when the operator
+                // opted out of crypto.
                 let now_snapshot: Option<lpm_workspace::ProvenanceSnapshot> = if verify_policy
                     .should_skip_verification_for(&p.name)
                 {
@@ -5721,8 +5721,8 @@ async fn run_with_options_under_store_lock(
                         raw,
                         verify_policy.enforce,
                     );
-                    // Phase 2.2.d: record for the install --json
-                    // envelope before consuming for the drift gate.
+                    // Record for the install --json envelope
+                    // before consuming for the drift gate.
                     install_provenance_status_map
                         .insert((p.name.clone(), p.version.clone()), status.clone());
                     // Projection: `Unverified(snap)` / `Disabled(snap)`
@@ -5744,20 +5744,20 @@ async fn run_with_options_under_store_lock(
                             ),
                         )
                     });
-                    // Phase 2.2.d + 2.3 rollout wiring combined.
                     // Branch arms:
-                    //   - `Ok(Some(snap))`: Verified (snap.present) or
-                    //     Absent (registry served no attestation).
+                    //   - `Ok(Some(snap))`: Verified (snap.present)
+                    //     or Absent (registry served no attestation).
                     //   - `Ok(None)`: transport-degraded; drift
                     //     comparator absorbs as NoDrift.
                     //   - `Err(ProvenanceVerification)`: policy
-                    //     decision per `verify_policy.enforce`. Warn
-                    //     degrades to None + loud log; Deny propagates
-                    //     the typed error and `?` refuses the install.
-                    //   - `Err(other)`: infrastructure failure (cache
-                    //     unwritable, etc.) — propagate as-is so the
-                    //     user sees a real diagnostic, not a silent
-                    //     degrade.
+                    //     decision per `verify_policy.enforce`.
+                    //     Warn degrades to None + loud log; Deny
+                    //     propagates the typed error and `?`
+                    //     refuses the install.
+                    //   - `Err(other)`: infrastructure failure
+                    //     (cache unwritable, etc.) — propagate
+                    //     as-is so the user sees a real diagnostic,
+                    //     not a silent degrade.
                     let (snapshot_for_drift, status_for_map) = match raw {
                         Ok(Some(snap)) if snap.present => {
                             let status = lpm_common::ProvenanceStatus::Verified(snap.clone());
@@ -7753,10 +7753,11 @@ async fn run_with_options_under_store_lock(
         // exists, the structured object is documented on
         // `version_diff::version_diff_to_json`.
         //
-        // Phase 2.2.d: the per-package `provenance.verified` block
-        // emits when the drift gate captured a `ProvenanceStatus` for
-        // this `(name, version)` pair. Sparse — only packages with a
-        // rich-form `trustedDependencies` binding triggered a fetch.
+        // The per-package `provenance.verified` block emits when
+        // the drift gate captured a `ProvenanceStatus` for this
+        // `(name, version)` pair. Sparse — only packages with a
+        // rich-form `trustedDependencies` binding triggered a
+        // fetch.
         let trusted_for_json = read_trusted_deps_from_manifest(project_dir).unwrap_or_default();
         json["blocked_packages"] = serde_json::Value::Array(
             blocked_capture

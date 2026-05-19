@@ -970,13 +970,13 @@ async fn install_drift_gate_under_deny_blocks_when_verifier_rejects_bundle() {
     );
 }
 
-/// **Audit item #4 pin.** Under `LPM_PROVENANCE_ENFORCE=warn`, an
-/// install-time verifier rejection on a rich-form-bound package
-/// MUST NOT block the install. The drift gate degrades to NoDrift,
-/// emits a loud `output::warn`, and the install proceeds. This is
-/// the Phase 2.3 rollout-window posture — operators ship the
-/// verifier in warn mode for one release so a bundle-shape change
-/// at the registry surfaces as a log line, not a CI nuke.
+/// Under `LPM_PROVENANCE_ENFORCE=warn`, an install-time verifier
+/// rejection on a rich-form-bound package MUST NOT block the
+/// install. The drift gate degrades to NoDrift, emits a loud
+/// `output::warn`, and the install proceeds. This is the rollout-
+/// window posture: ship the verifier in warn mode for one release
+/// so a bundle-shape change at the registry surfaces as a log
+/// line, not a CI nuke.
 ///
 /// Contrasts directly with the Deny baseline above: same fixture,
 /// same bundle, only the env knob differs.
@@ -1023,8 +1023,8 @@ async fn install_drift_gate_under_enforce_warn_does_not_block_on_verifier_reject
     );
 }
 
-/// **Audit item #3 pin.** The two verification-policy axes
-/// (`EnforceMode` and `SkipPolicy`) MUST compose orthogonally:
+/// The two verification-policy axes (`EnforceMode` and
+/// `SkipPolicy`) MUST compose orthogonally:
 /// `LPM_PROVENANCE_ENFORCE=warn` + `--unverified-provenance <pkg>`
 /// on the same invocation means "warn-mode for the rest of the
 /// install, skip verification entirely for the named package."
@@ -1032,15 +1032,14 @@ async fn install_drift_gate_under_enforce_warn_does_not_block_on_verifier_reject
 /// Pinned via a side-effect contrast: the skip-listed package's
 /// rejection log line is ABSENT from stderr (because the verifier
 /// never ran for it) — that's the orthogonality signal. If the two
-/// axes collapsed (e.g. warn-mode also short-circuited the
-/// skip-list logic), the warn line would still fire and this test
+/// axes collapsed (e.g. warn-mode also short-circuited the skip-
+/// list logic), the warn line would still fire and this test
 /// would catch it.
 ///
-/// Single-package variant: the unit test
-/// `verify_policy_should_skip_verification_unifies_skip_and_off`
+/// Unit test `verify_policy_should_skip_verification_unifies_skip_and_off`
 /// pins the policy-decision side; this is the end-to-end pin that
-/// guards against the install pipeline ignoring the skip-list under
-/// warn mode.
+/// guards against the install pipeline ignoring the skip-list
+/// under warn mode.
 #[tokio::test]
 async fn install_skip_flag_short_circuits_verifier_under_enforce_warn() {
     let (project, mock) = setup_install_drift_gate_with_verifier_rejecting_candidate().await;

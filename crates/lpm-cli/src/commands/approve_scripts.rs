@@ -105,15 +105,15 @@ fn approval_metadata_from_blocked(
 /// (`lpm approve-scripts --global`). This wrapper keeps the
 /// `BlockedPackage` shape callers used pre-existing working unchanged.
 ///
-/// Phase 2.2.c: the `--unverified-provenance[-all]` opt-out lives on
-/// `lpm install` (not on `approve-scripts`), so the policy here uses
-/// env-derived `EnforceMode` + default `SkipPolicy::None`. An operator
-/// who set `LPM_PROVENANCE_ENFORCE=warn` for the install will still
-/// see warn behavior at approval time; per-package skip decisions are
-/// not surfaced on approve-scripts because the approval path's only
-/// job is to record a binding — degrading to identity-only there
-/// would silently strip a layer of evidence the install path already
-/// captured.
+/// The `--unverified-provenance[-all]` opt-out lives on
+/// `lpm install` (not on `approve-scripts`), so the policy here
+/// uses the operator-persistent posture chain (env +
+/// `[sigstore] verify` config) — same shape the install pipeline
+/// uses. `SkipPolicy` is fixed at `None` because per-package skip
+/// decisions are not surfaced on approve-scripts: the approval
+/// path's only job is to record a binding, and degrading
+/// individual packages to identity-only there would silently strip
+/// a layer of evidence the install path already captured.
 async fn fetch_provenance_for_effective_set(
     packages: &[BlockedPackage],
 ) -> HashMap<(String, String), ProvenanceStatus> {
@@ -121,7 +121,7 @@ async fn fetch_provenance_for_effective_set(
         .iter()
         .map(|p| (p.name.clone(), p.version.clone()))
         .collect();
-    let policy = crate::provenance_fetch::VerifyPolicy::default();
+    let policy = crate::provenance_fetch::VerifyPolicy::resolve_no_cli();
     crate::provenance_fetch::fetch_provenance_for_pkgs(&pkgs, &policy).await
 }
 
@@ -1510,7 +1510,7 @@ fn print_summary(
     // approvals to run).
     dry_run: bool,
     json_output: bool,
-    // Phase 2.2.d: live `ProvenanceStatus` map from the batch fetch,
+    // Live `ProvenanceStatus` map from the batch fetch,
     // threaded through so each blocked entry's JSON envelope can
     // surface `provenance.verified` per package. `None` for callers
     // that have no map in scope (the read-only `--list` path bypasses
@@ -1567,11 +1567,11 @@ fn print_summary(
             // happened, so `trusted` retains the pre-run state
             // and the diff reports against the prior binding
             // identically.
-            // Phase 2.2.d: when the live ProvenanceStatus map is in
-            // scope, each entry's JSON envelope gains a `provenance`
-            // block (`verified: true | "skipped" | false | null |
-            // "verification_rejected"`). Pre-2.2.d agents that didn't
-            // expect the key are unaffected — the field is additive.
+            // When the live ProvenanceStatus map is in scope, each
+            // entry's JSON envelope gains a `provenance` block
+            // (`verified: true | "skipped" | false | null |
+            // "verification_rejected"`). Additive — older agents
+            // that don't expect the key remain readable.
             "approved": approved.iter().map(|b| crate::version_diff::blocked_to_json_with_provenance(b, trusted, provenance_by_pkg)).collect::<Vec<_>>(),
             "skipped": skipped.iter().map(|b| crate::version_diff::blocked_to_json_with_provenance(b, trusted, provenance_by_pkg)).collect::<Vec<_>>(),
             "warnings": warnings,
@@ -1989,7 +1989,7 @@ async fn run_global_bulk_yes(
         .collect();
     let provenance = crate::provenance_fetch::fetch_provenance_for_pkgs(
         &pairs,
-        &crate::provenance_fetch::VerifyPolicy::default(),
+        &crate::provenance_fetch::VerifyPolicy::resolve_no_cli(),
     )
     .await;
 
@@ -2048,9 +2048,9 @@ async fn run_global_bulk_yes(
                 aggregate.rows.len()
             )
         };
-        // Phase 2.2.d: per-package `provenance` block for every
-        // bulk-approved row so the JSON envelope's audit trail
-        // matches the project-side `--yes` path.
+        // Per-package `provenance` block for every bulk-approved
+        // row so the JSON envelope's audit trail matches the
+        // project-side `--yes` path.
         let approved_entries: Vec<serde_json::Value> = aggregate
             .rows
             .iter()
@@ -2176,7 +2176,7 @@ async fn run_global_named(
     let pairs = vec![(row.name.clone(), row.version.clone())];
     let provenance = crate::provenance_fetch::fetch_provenance_for_pkgs(
         &pairs,
-        &crate::provenance_fetch::VerifyPolicy::default(),
+        &crate::provenance_fetch::VerifyPolicy::resolve_no_cli(),
     )
     .await;
     let snap = snapshot_for_binding(&provenance, &row.name, &row.version)?;
@@ -2208,11 +2208,11 @@ async fn run_global_named(
     let origins = union_origins(std::iter::once(row));
 
     if json_output {
-        // Phase 2.2.d: surface the per-package `provenance.verified`
-        // alongside the existing identity fields. Derived from the
-        // same `ProvenanceStatus` map the binding-write path
-        // consulted, so the JSON envelope and the trust binding stay
-        // mutually consistent.
+        // Surface the per-package `provenance.verified` alongside
+        // the existing identity fields. Derived from the same
+        // `ProvenanceStatus` map the binding-write path consulted,
+        // so the JSON envelope and the trust binding stay mutually
+        // consistent.
         let mut approved_entry = serde_json::json!({
             "name": row.name,
             "version": row.version,
@@ -2464,7 +2464,7 @@ async fn run_global_interactive(
         .collect();
     let provenance = crate::provenance_fetch::fetch_provenance_for_pkgs(
         &pairs,
-        &crate::provenance_fetch::VerifyPolicy::default(),
+        &crate::provenance_fetch::VerifyPolicy::resolve_no_cli(),
     )
     .await;
 

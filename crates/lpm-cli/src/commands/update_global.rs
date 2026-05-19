@@ -745,7 +745,7 @@ async fn do_install_upgrade(
         None, // advisor_override: global update does not expose `--advisor`
         None, // min_release_age_override: D13/D19 — global scope is out of, cooldown uses the chain
         crate::provenance_fetch::DriftIgnorePolicy::default(), // drift-ignore: D13/D19 — global scope is out of
-        crate::provenance_fetch::VerifyPolicy::default(), // verify-policy: global update honors env-only
+        crate::provenance_fetch::VerifyPolicy::resolve_no_cli(), // verify-policy: global update honors env + config posture chain
         // global update does not surface its own
         // sandbox-mode flags. The env / config / default chain
         // inside `rebuild::run` still applies.

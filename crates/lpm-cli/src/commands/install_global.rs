@@ -175,9 +175,10 @@ pub struct InstallGlobalOverrides {
     pub allow_new: bool,
     pub min_release_age_override: Option<u64>,
     pub drift_ignore_policy: crate::provenance_fetch::DriftIgnorePolicy,
-    /// Phase 2.2.c composed `(EnforceMode, SkipPolicy)` for the
-    /// install-time Sigstore verifier. Canonicalized from the
-    /// `--unverified-provenance{,-all}` flags + `LPM_PROVENANCE_ENFORCE`.
+    /// Composed `(EnforceMode, SkipPolicy)` for the install-time
+    /// Sigstore verifier. Canonicalized from the
+    /// `--unverified-provenance{,-all}` flags +
+    /// `LPM_PROVENANCE_ENFORCE` env + `[sigstore] verify` config.
     pub verify_policy: crate::provenance_fetch::VerifyPolicy,
     pub script_policy_override: Option<crate::script_policy_config::ScriptPolicy>,
     pub auto_build: bool,

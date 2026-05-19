@@ -40,14 +40,14 @@ pub enum ProvenanceStatus {
     /// fields populated.
     Verified(ProvenanceSnapshot),
     /// Bundle fetched and identity extracted, but the cryptographic
-    /// verifier was bypassed because the operator carved this package
-    /// out via `--unverified-provenance <name>` /
-    /// `--unverified-provenance-all` (the `SkipPolicy` axis added in
-    /// Phase 2.2.c). The snapshot carries the same SAN identity fields
-    /// as `Verified` so drift detection still runs against the
-    /// identity tuple, but the binding's audit trail records that this
-    /// observation was NOT cryptographically attested. JSON envelope
-    /// reports `verified: "skipped"` for this state.
+    /// verifier was bypassed because the operator carved this
+    /// package out via `--unverified-provenance <name>` /
+    /// `--unverified-provenance-all` (the `SkipPolicy` axis). The
+    /// snapshot carries the same SAN identity fields as `Verified`
+    /// so drift detection still runs against the identity tuple,
+    /// but the binding's audit trail records that this observation
+    /// was NOT cryptographically attested. JSON envelope reports
+    /// `verified: "skipped"` for this state.
     ///
     /// **Why a distinct variant rather than collapsing back into
     /// `Verified`:** an operator-driven skip is an explicit downgrade
@@ -55,10 +55,10 @@ pub enum ProvenanceStatus {
     /// approve-scripts audit trail say "this identity was accepted
     /// without crypto" instead of falsely claiming verification.
     Unverified(ProvenanceSnapshot),
-    /// Fleet-wide operator opt-out (Phase 2.5): `EnforceMode::Off`
-    /// (env `LPM_PROVENANCE_ENFORCE=off` or `[sigstore] verify =
-    /// "off"` in `~/.lpm/config.toml`) suppressed the verifier for
-    /// every package on this run. Equivalent in effect to
+    /// Fleet-wide operator opt-out: `EnforceMode::Off` (env
+    /// `LPM_PROVENANCE_ENFORCE=off` or `[sigstore] verify = "off"`
+    /// in `~/.lpm/config.toml`) suppressed the verifier for every
+    /// package on this run. Equivalent in effect to
     /// `--unverified-provenance-all`, but tracked as a distinct
     /// state so the JSON envelope can report `verified: "disabled"`
     /// (vs `"skipped"`) — downstream audit pipelines need to
@@ -142,8 +142,8 @@ impl ProvenanceStatus {
         matches!(self, ProvenanceStatus::VerificationRejected { .. })
     }
 
-    /// JSON envelope value for the `provenance.verified` field on the
-    /// install + approve-scripts `--json` output (Phase 2.2.d).
+    /// JSON envelope value for the `provenance.verified` field on
+    /// the install + approve-scripts `--json` output.
     ///
     /// Returns `(verified, rejection_reason)`:
     /// - `Verified(_)` → (`true`, `None`)
@@ -485,7 +485,7 @@ mod tests {
         assert_eq!(projected, Some(snap));
     }
 
-    // ── ProvenanceStatus::to_json_verified (Phase 2.2.d) ────────
+    // ── ProvenanceStatus::to_json_verified ──────────────────────
 
     #[test]
     fn to_json_verified_verified_is_true_no_reason() {

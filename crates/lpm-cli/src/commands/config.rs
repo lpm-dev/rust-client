@@ -14,8 +14,7 @@ use std::io::IsTerminal;
 /// - `lpm config triage` owns `triage-advisor = none | claude-cli | codex | ollama`.
 /// - `lpm config sandbox` owns `[sandbox] mode = default | strict | none`.
 /// - `lpm config sigstore` owns `[sigstore] verify = deny | warn | off`
-///   (Phase 2.6 — operator persistent toggle for Sigstore provenance
-///   verification).
+///   (operator persistent toggle for Sigstore provenance verification).
 ///
 /// All four default to interactive in a TTY; `--set <value>` is the
 /// non-interactive setter required for CI / scripted setup.
@@ -222,19 +221,19 @@ impl GlobalConfig {
         self.table.get(key)?.as_table()
     }
 
-    /// Read `[sigstore] verify` (Phase 2.5). Returns the raw string
-    /// (`"deny"` / `"warn"` / `"off"`) if present, or `None` for
-    /// absent / non-table / non-string / unknown values. The parse
-    /// happens at the consumer ([`crate::provenance_fetch::EnforceMode::resolve_from_chain`])
+    /// Read `[sigstore] verify`. Returns the raw string (`"deny"`
+    /// / `"warn"` / `"off"`) if present, or `None` for absent /
+    /// non-table / non-string / unknown values. The parse happens
+    /// at the consumer ([`crate::provenance_fetch::EnforceMode::resolve_from_chain`])
     /// so unknown values fall back to the next tier in the
-    /// precedence chain with a `tracing::debug` so the gap is
+    /// precedence chain with a `tracing::debug` — the gap is
     /// diagnosable without crashing the install.
     ///
     /// The nested-table key path (`[sigstore].verify`, not flat
-    /// `sigstore-verify = "..."`) matches the `[sandbox] mode = "..."`
-    /// precedent; leaves room for future sigstore-scoped knobs
-    /// (trust-root override path, custom Rekor URL) without
-    /// polluting the top-level table.
+    /// `sigstore-verify = "..."`) matches the
+    /// `[sandbox] mode = "..."` precedent; leaves room for future
+    /// sigstore-scoped knobs (trust-root override path, custom
+    /// Rekor URL) without polluting the top-level table.
     pub fn get_sigstore_verify(&self) -> Option<String> {
         self.get_table("sigstore")?
             .get("verify")?
@@ -728,7 +727,7 @@ fn announce_sandbox_set(value: &str, json_output: bool) {
 }
 
 // ─────────────────────────────────────────────────────────────────────
-// `lpm config sigstore` wizard (Phase 2.6)
+// `lpm config sigstore` wizard
 // ─────────────────────────────────────────────────────────────────────
 //
 // Persists `[sigstore] verify = "deny" | "warn" | "off"` into
@@ -800,8 +799,8 @@ async fn run_sigstore_wizard(
              your registry ships will be IGNORED. Provenance drift detection \
              still runs against unverified identity data, but a malicious or \
              compromised registry can lie about who built a package and the \
-             install will accept it. This is the pre-C1 posture; LPM does not \
-             recommend it as a persistent setting.",
+             install will accept it. LPM does not recommend disabled verification \
+             as a persistent setting.",
             "warning".yellow(),
             "off".yellow().bold(),
         );
@@ -1078,13 +1077,15 @@ mod wizard_tests {
         );
     }
 
-    // ── Phase 2.5: GlobalConfig::get_sigstore_verify ──────────────
+    // ── GlobalConfig::get_sigstore_verify ──────────────────────
 
     /// `[sigstore].verify` resolves to the right string. Pin both
     /// the table layout (nested, not flat `sigstore-verify`) and the
     /// returned value so a future wizard wired to a different key
-    /// path (the Phase 2.5 ordering audit item 4b anchor) fails
-    /// this test loudly.
+    /// path fails this test loudly. (Wizard write path + config
+    /// reader MUST agree on the nested-table key shape — if either
+    /// drifts, the wizard appears to succeed but installs ignore
+    /// the persisted value.)
     #[test]
     fn global_config_get_sigstore_verify_returns_string_when_present() {
         let (_dir, path) = tmp_config();
@@ -1123,7 +1124,7 @@ mod wizard_tests {
         assert!(cfg.get_sigstore_verify().is_none());
     }
 
-    // ── Phase 2.6: lpm config sigstore wizard (--set path) ──────
+    // ── lpm config sigstore wizard (--set path) ────────────────
 
     /// `--set deny|warn|off` persists into `[sigstore] verify` and
     /// round-trips through `read_sigstore_verify`. Three values, one

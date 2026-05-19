@@ -137,6 +137,7 @@ pub enum Category {
     Workspace,
     Globals,
     Sandbox,
+    Provenance,
     ManifestCompat,
 }
 
@@ -155,6 +156,7 @@ impl Category {
             Category::Workspace => "Workspace",
             Category::Globals => "Global installs",
             Category::Sandbox => "Sandbox + scripts",
+            Category::Provenance => "Sigstore provenance",
             Category::ManifestCompat => "Manifest compat",
         }
     }
@@ -1490,6 +1492,65 @@ pub static SANDBOX_PROBE_FAILED: CheckEntry = CheckEntry {
     auto_fix: None,
 };
 
+// ──────────────────────────────────────────────────────────────────
+// Sigstore provenance verification posture
+// ──────────────────────────────────────────────────────────────────
+//
+// Three rows that pin the operator-resolved `EnforceMode` (the
+// composed env > [sigstore].verify > default chain). One pass row
+// (`deny` — the recommended posture) and two warns (`warn` and
+// `off`) so the degraded posture surfaces on every `lpm doctor` run
+// even when no install is in flight.
+
+pub static SIGSTORE_VERIFY_ENFORCED: CheckEntry = CheckEntry {
+    code: "sigstore_verify_enforced",
+    name: "Sigstore verify",
+    category: Category::Provenance,
+    tier: Tier::Fast,
+    description: "Sigstore provenance verification is fail-closed: a verifier rejection on any \
+         attested package refuses the install / approval.",
+    when_fires: "Resolved enforce-mode is `deny` (the default, or explicitly set via \
+         `LPM_PROVENANCE_ENFORCE=deny` or `[sigstore] verify = \"deny\"`).",
+    remediation: "No action — informational pass.",
+    possible_severities: &[Severity::Pass],
+    auto_fix: None,
+};
+
+pub static SIGSTORE_VERIFY_WARN_MODE: CheckEntry = CheckEntry {
+    code: "sigstore_verify_warn_mode",
+    name: "Sigstore verify",
+    category: Category::Provenance,
+    tier: Tier::Fast,
+    description: "Sigstore provenance verification runs but rejections only log — they do NOT block \
+         the install or refuse the approval. Degraded posture: a forged bundle would \
+         surface as a warning line, not a refused install.",
+    when_fires: "Resolved enforce-mode is `warn` (set via `LPM_PROVENANCE_ENFORCE=warn` or \
+         `[sigstore] verify = \"warn\"`). A forged bundle would surface as a log line but \
+         the install would still proceed.",
+    remediation: "Re-enable fail-closed: unset `LPM_PROVENANCE_ENFORCE` (or set it to `deny`), or \
+         run `lpm config sigstore --set deny`.",
+    possible_severities: &[Severity::Warn],
+    auto_fix: None,
+};
+
+pub static SIGSTORE_VERIFY_DISABLED: CheckEntry = CheckEntry {
+    code: "sigstore_verify_disabled",
+    name: "Sigstore verify",
+    category: Category::Provenance,
+    tier: Tier::Fast,
+    description: "Sigstore provenance verification is disabled fleet-wide — every attestation will \
+         be IGNORED. Drift detection still runs against unverified identity data, but a \
+         malicious or compromised registry can lie about who built a package and the \
+         install will accept it.",
+    when_fires: "Resolved enforce-mode is `off` (set via `LPM_PROVENANCE_ENFORCE=off` or \
+         `[sigstore] verify = \"off\"`). LPM does not recommend disabled verification \
+         as a persistent setting.",
+    remediation: "Re-enable verification: unset `LPM_PROVENANCE_ENFORCE` (or set it to `deny`), \
+         or run `lpm config sigstore --set deny`.",
+    possible_severities: &[Severity::Warn],
+    auto_fix: None,
+};
+
 // `POLICY_SCOPE_PROJECT_ONLY` was removed — `lpm install -g`
 // now honors the same script-policy / sandbox / cooldown / drift gates
 // as project installs, so the boundary it described no longer exists.
@@ -1746,6 +1807,10 @@ pub static CLI_CATALOG: &[&CheckEntry] = &[
     &SANDBOX_UNSUPPORTED_PLATFORM,
     &SANDBOX_PROBE_FAILED,
     &POLICY_FORCE_SECURITY_FLOOR,
+    // Sigstore provenance posture
+    &SIGSTORE_VERIFY_ENFORCED,
+    &SIGSTORE_VERIFY_WARN_MODE,
+    &SIGSTORE_VERIFY_DISABLED,
 ];
 
 /// One row in the unified inventory surface used by `lpm doctor list`.
