@@ -198,7 +198,7 @@ pub fn classify_with_context(script: &str, ctx: Option<&ManifestContext<'_>>) ->
     // identity signal. Only fires when the caller supplied manifest
     // context; without it the classifier falls through to Amber.
     if let Some(ctx) = ctx
-        && matches_delegating_identity_green(&tokens, ctx)
+        && matches_delegating_identity_green(script, ctx)
     {
         return StaticTier::Green;
     }
@@ -770,7 +770,7 @@ fn tokens_match_green(tokens: &[String], script: &str) -> bool {
         Some("tsc") => matches_tsc(tokens),
         Some("prisma") => matches_prisma(tokens),
         Some("husky") => matches_husky(tokens),
-        Some("node") => matches_node_relative(tokens) || matches_node_eval_softfail_green(tokens),
+        Some("node") => matches_node_relative(script) || matches_node_eval_softfail_green(script),
         Some("exit") => matches_exit_noop(tokens),
         Some(":") => tokens.len() == 1,
         Some("echo") => matches_echo_noop(tokens, script),
@@ -872,23 +872,18 @@ fn matches_husky(tokens: &[String]) -> bool {
 /// non-escaping path inside the package directory AND the basename is
 /// not one of the reserved lifecycle basenames (see
 /// [`is_reserved_lifecycle_basename`] — the amber exception wins).
-fn matches_node_relative(tokens: &[String]) -> bool {
-    if tokens.len() != 2 {
+///
+/// Dispatches through the shared [`extract_delegate_match`] recogniser
+/// and applies the bare-shape + non-reserved-basename tier rule.
+fn matches_node_relative(body: &str) -> bool {
+    let Some(m) = extract_delegate_match(body) else {
+        return false;
+    };
+    if !matches!(m.shape, DelegateShape::Bare) {
         return false;
     }
-    let path = tokens[1].as_str();
-    if !is_safe_relative_path(path) {
-        return false;
-    }
-    let has_js_ext = path.ends_with(".js") || path.ends_with(".cjs") || path.ends_with(".mjs");
-    if !has_js_ext {
-        return false;
-    }
-    let basename = path.rsplit('/').next().unwrap_or(path);
-    if is_reserved_lifecycle_basename(basename) {
-        return false;
-    }
-    true
+    let basename = m.path.rsplit('/').next().unwrap_or(&m.path);
+    !is_reserved_lifecycle_basename(basename)
 }
 
 /// Lifecycle-phase basenames that trigger the reserved-basename
@@ -937,31 +932,15 @@ fn is_reserved_lifecycle_basename(basename: &str) -> bool {
 /// (`./postinstall`, `./_postinstall`, `./dist/bin/post-install`) and
 /// reserved-basename paths (`./scripts/postinstall.js`) out of green
 /// even when the wrapper shape itself is recognized.
-fn matches_node_eval_softfail_green(tokens: &[String]) -> bool {
-    if tokens.len() != 3 {
-        return false;
-    }
-    if tokens[0] != "node" {
-        return false;
-    }
-    if tokens[1] != "-e" && tokens[1] != "--eval" {
-        return false;
-    }
-    let Some(path) = parse_softfail_wrapper(&tokens[2]) else {
+fn matches_node_eval_softfail_green(body: &str) -> bool {
+    let Some(m) = extract_delegate_match(body) else {
         return false;
     };
-    if !is_safe_relative_path(&path) {
+    if !matches!(m.shape, DelegateShape::SoftfailWrapper) {
         return false;
     }
-    let has_js_ext = path.ends_with(".js") || path.ends_with(".cjs") || path.ends_with(".mjs");
-    if !has_js_ext {
-        return false;
-    }
-    let basename = path.rsplit('/').next().unwrap_or(&path);
-    if is_reserved_lifecycle_basename(basename) {
-        return false;
-    }
-    true
+    let basename = m.path.rsplit('/').next().unwrap_or(&m.path);
+    !is_reserved_lifecycle_basename(basename)
 }
 
 /// A path is "safe relative" if it points inside the package
@@ -979,58 +958,73 @@ fn is_safe_relative_path(p: &str) -> bool {
     p.split('/').all(|seg| seg != "..")
 }
 
-/// Extract the in-package relative path a lifecycle script delegates
-/// to. Returns `Some(path)` for any body whose shape this module's
-/// classifier already recognizes as a delegate-to-local-file, and
-/// `None` for anything else.
+/// Which delegate shape [`extract_delegate_match`] recognised. The
+/// classifier's per-shape tier rules (bare-delegate vs softfail
+/// wrapper) branch on this, while consumers that only care about the
+/// in-package path drop it via [`extract_delegate_path`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DelegateShape {
+    /// `node <path>` — two POSIX-shell tokens. Recognised by
+    /// [`matches_node_relative`] (non-reserved basename → Green
+    /// unconditionally) and by [`matches_delegating_identity_green`]
+    /// (reserved basename + identity match → Green).
+    Bare,
+    /// `node -e <body>` / `node --eval <body>` — three tokens where
+    /// `<body>` matches one of the [`parse_softfail_wrapper`] shapes.
+    /// Recognised by [`matches_node_eval_softfail_green`]
+    /// (non-reserved basename → Green; reserved basename → Amber).
+    SoftfailWrapper,
+}
+
+/// A delegate-shape match: the in-package relative path the script
+/// delegates to, plus the shape the recogniser identified.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DelegateMatch {
+    pub path: String,
+    pub shape: DelegateShape,
+}
+
+/// Recognise any script body shape this module classifies as a
+/// delegate-to-local-file and return both the in-package path and
+/// the shape that matched. `None` for anything else.
 ///
-/// Recognized shapes:
+/// This is the **single source of truth** for delegate recognition.
+/// Every classifier branch that grants Green via a delegate shape
+/// ([`matches_node_relative`], [`matches_delegating_identity_green`],
+/// [`matches_node_eval_softfail_green`]) dispatches through this
+/// function, then applies its specific tier rules to the returned
+/// shape and path. The script-hash binding
+/// (`lpm_security::script_hash::compute_script_hash`) and the
+/// advisor embed-view (`lpm_cli::build_state::parse_delegated_paths`)
+/// also read through this function. Drift between the classifier
+/// and the recogniser is structurally impossible because there's
+/// only one recogniser.
 ///
-/// 1. **Bare delegate** — `node <path>` (two POSIX-shell tokens). Same
-///    shape as [`matches_node_relative`] and
-///    [`matches_delegating_identity_green`].
-/// 2. **Softfail wrapper** — `node -e <body>` (three tokens) where the
-///    `<body>` matches one of the [`parse_softfail_wrapper`] shapes
-///    (`try{require('./X')}catch(e){}` or
-///    `import('./X').catch(()=>void 0)`). Same shape as
-///    [`matches_node_eval_softfail_green`].
+/// Recognition rules (apply to both shapes):
 ///
-/// In both cases the path must additionally be safe-relative (no
-/// absolute, no `..`, no `~`/`$`) and end in `.js` / `.cjs` / `.mjs`.
-/// Compound bodies, env-var paths, dynamic paths, and quoted shapes
-/// that escape the safe-relative check return `None`.
+/// - Path must be safe-relative (no absolute, no `..`, no `~`/`$`).
+/// - Path must end in `.js` / `.cjs` / `.mjs`. Extensionless require
+///   resolution (`./X` resolving to `X.js` / `X.json` / `X/index.js`)
+///   is ambiguous; the hash cannot deterministically pick a file to
+///   bind, so the classifier leaves these out of Green too.
 ///
-/// ## Contract — keep this parser aligned with the classifier
-///
-/// Every script-body shape this module classifies as Green via a
-/// delegate-to-local-file branch MUST be recognized here. If a future
-/// classifier change widens the Green set with a new delegate shape
-/// (e.g. a new wrapper template, a new module-system import form),
-/// this function MUST be extended in the same change — otherwise the
-/// script-hash binding will silently miss the new shape and the H17
-/// cross-version content-drift attack reopens through it.
-/// `softfail_wrapper_*` and `lever4_node_install_js_*` tests in this
-/// module are the canonical fixtures to mirror when adding spellings.
-///
-/// Single source of truth for three call sites:
-/// - `lpm_security::script_hash::compute_script_hash` binds the
-///   delegate file's bytes into the approval hash so a malicious
-///   upgrade that changes the file body without changing the script
-///   string surfaces as `BindingDrift`.
-/// - `lpm_cli::build_state::parse_delegated_paths` surfaces the file
-///   contents in the advisor prompt so reviewers see the executed
-///   bytes, not just the delegate command line.
-/// - This module's own classifier shapes — both for the trust
-///   decision and for keeping the embedded-review path consistent.
-pub fn extract_delegate_path(body: &str) -> Option<String> {
+/// Adding a new delegate shape is a one-line change here (new arm in
+/// the token-pattern match below). The classifier's per-shape tier
+/// rules pick the new shape up automatically; the script-hash binding
+/// picks it up via [`extract_delegate_path`]. The coverage test
+/// (`compute_script_hash_binds_delegate_for_every_greenlit_node_path_spelling`)
+/// must also gain the new spelling so the binding is exercised
+/// against benign-vs-malicious file pairs end-to-end.
+pub fn extract_delegate_match(body: &str) -> Option<DelegateMatch> {
     let tokens = shlex::split(body)?;
-    let path = match tokens.as_slice() {
+    let (path, shape) = match tokens.as_slice() {
         // Bare delegate: `node <path>`
-        [n, p] if n == "node" => p.clone(),
+        [n, p] if n == "node" => (p.clone(), DelegateShape::Bare),
         // Softfail wrapper: `node -e <body>` or `node --eval <body>`
-        [n, e, wrapper] if n == "node" && (e == "-e" || e == "--eval") => {
-            parse_softfail_wrapper(wrapper)?
-        }
+        [n, e, wrapper] if n == "node" && (e == "-e" || e == "--eval") => (
+            parse_softfail_wrapper(wrapper)?,
+            DelegateShape::SoftfailWrapper,
+        ),
         _ => return None,
     };
     if !is_safe_relative_path(&path) {
@@ -1039,7 +1033,14 @@ pub fn extract_delegate_path(body: &str) -> Option<String> {
     if !(path.ends_with(".js") || path.ends_with(".cjs") || path.ends_with(".mjs")) {
         return None;
     }
-    Some(path)
+    Some(DelegateMatch { path, shape })
+}
+
+/// Thin wrapper over [`extract_delegate_match`] that drops the shape
+/// info. Used by call sites that only need the in-package path
+/// (script-hash binding, advisor embed-view).
+pub fn extract_delegate_path(body: &str) -> Option<String> {
+    extract_delegate_match(body).map(|m| m.path)
 }
 
 // ─────────────────────────────────────────────────────────────────────
@@ -1081,27 +1082,18 @@ pub fn extract_delegate_path(body: &str) -> Option<String> {
 ///   is one step removed from the payload, which the reviewer sees
 ///   directly. This check alone trusts the field; the user-explicit
 ///   `lpm approve-scripts` review remains the safety floor.
-fn matches_delegating_identity_green(tokens: &[String], ctx: &ManifestContext<'_>) -> bool {
-    // The body must be exactly `node <path>` (two tokens) — same
-    // structural shape `matches_node_relative` requires.
-    if tokens.len() != 2 {
+fn matches_delegating_identity_green(body: &str, ctx: &ManifestContext<'_>) -> bool {
+    let Some(m) = extract_delegate_match(body) else {
+        return false;
+    };
+    // Only the bare-delegate shape participates in the identity-match
+    // widening today. Extending the widening to the softfail-wrapper
+    // shape would be a deliberate policy change — leave that to a
+    // separate, explicitly-reviewed update.
+    if !matches!(m.shape, DelegateShape::Bare) {
         return false;
     }
-    if tokens[0] != "node" {
-        return false;
-    }
-    let path = tokens[1].as_str();
-    if !is_safe_relative_path(path) {
-        return false;
-    }
-    // Require an explicit `.js` / `.cjs` / `.mjs` extension — same
-    // discipline `matches_node_relative` uses to avoid greenlighting
-    // extension-less or shell-script paths.
-    let has_js_ext = path.ends_with(".js") || path.ends_with(".cjs") || path.ends_with(".mjs");
-    if !has_js_ext {
-        return false;
-    }
-    let basename = path.rsplit('/').next().unwrap_or(path);
+    let basename = m.path.rsplit('/').next().unwrap_or(&m.path);
     // Only fire on the reserved-basename set — install.js /
     // postinstall.js / preinstall.js + .cjs/.mjs variants. Other
     // `node <name>.js` paths take the existing
