@@ -16,7 +16,7 @@ pub use paths::{
     project_install_lock, try_with_exclusive_lock, with_exclusive_lock, with_exclusive_lock_async,
     with_shared_lock, with_shared_lock_async,
 };
-pub use provenance::ProvenanceSnapshot;
+pub use provenance::{ProvenanceSnapshot, ProvenanceStatus};
 pub use symlink::create_dir_symlink_or_junction;
 
 /// The LPM scope prefix. All LPM packages live under this scope.

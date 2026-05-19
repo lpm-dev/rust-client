@@ -40,6 +40,7 @@ mod save_spec;
 mod script_policy_config;
 pub mod security_check;
 mod sigstore;
+mod sigstore_verify;
 mod swift_manifest;
 #[cfg(test)]
 mod test_env;
@@ -319,6 +320,42 @@ enum Commands {
         /// invocation).
         #[arg(long)]
         ignore_provenance_drift_all: bool,
+
+        /// Skip the cryptographic Sigstore verification step for this
+        /// specific package name (repeatable). The Sigstore verifier
+        /// (DSSE / Rekor body / Rekor SET / SCT / X.509 chain /
+        /// identity-pin) is bypassed; the legacy identity-only parser
+        /// still extracts the publisher / workflow_path / workflow_ref
+        /// from the bundle so the drift gate has something to compare
+        /// against. The trust binding records this observation as
+        /// "unverified" (not "verified") so the audit trail captures
+        /// the operator's downgrade.
+        ///
+        /// Orthogonal to `--ignore-provenance-drift`: one suppresses
+        /// the *crypto* layer, the other suppresses the *drift* layer.
+        /// Composing them is legal and may be appropriate when an
+        /// upstream registry's bundle shape briefly drifts; the
+        /// preferred remediation is to wait for the registry to fix it
+        /// rather than persist this flag in CI.
+        #[arg(long, value_name = "PKG")]
+        unverified_provenance: Vec<String>,
+
+        /// Blanket: skip the Sigstore verifier for every resolved
+        /// package on this invocation. Composes with
+        /// `--unverified-provenance <pkg>` by superseding it — if both
+        /// are passed, `-all` wins and the per-package list is ignored
+        /// (verification is suppressed entirely for this invocation).
+        ///
+        /// This is the **per-invocation** opt-out and is loud at
+        /// install time (`tracing::warn`). For a persistent fleet-
+        /// wide posture (corporate-firewalled Rekor egress, air-
+        /// gapped environments), prefer the operator-scoped knob:
+        /// `[sigstore] verify = "off"` in `~/.lpm/config.toml`, or
+        /// `lpm config sigstore --set off`. Those persisted knobs
+        /// surface the degraded posture in `lpm doctor` so it
+        /// isn't forgotten.
+        #[arg(long)]
+        unverified_provenance_all: bool,
 
         /// Linking mode: `hoisted` (default — npm v3+ flat layout) or
         /// `isolated` (pnpm-style strict isolation).
@@ -847,18 +884,20 @@ enum Commands {
 
     /// Manage CLI configuration.
     Config {
-        /// Action: get, set, delete, list, scripts, triage, sandbox.
+        /// Action: get, set, delete, list, scripts, triage, sandbox,
+        /// sigstore.
         action: String,
         /// Config key (for get/set/delete).
         key: Option<String>,
         /// Config value (for set).
         value: Option<String>,
         /// Non-interactive value for the `scripts` / `triage` /
-        /// `sandbox` wizards. Required when stdin is not a TTY.
-        /// Examples:
+        /// `sandbox` / `sigstore` wizards. Required when stdin is not
+        /// a TTY. Examples:
         ///   `lpm config scripts --set triage`
         ///   `lpm config triage --set claude-cli`
         ///   `lpm config sandbox --set strict`
+        ///   `lpm config sigstore --set deny`
         #[arg(long = "set", value_name = "VALUE")]
         set: Option<String>,
     },
@@ -2188,6 +2227,8 @@ fn build_install_global_overrides(
     min_release_age: Option<&str>,
     ignore_provenance_drift: Vec<String>,
     ignore_provenance_drift_all: bool,
+    unverified_provenance: Vec<String>,
+    unverified_provenance_all: bool,
 ) -> Result<commands::install_global::InstallGlobalOverrides, lpm_common::LpmError> {
     let cli_policy_override =
         crate::script_policy_config::collapse_policy_flags(policy, yolo, triage_alias)
@@ -2203,10 +2244,15 @@ fn build_install_global_overrides(
         ignore_provenance_drift,
         ignore_provenance_drift_all,
     );
+    let verify_policy = crate::provenance_fetch::VerifyPolicy::from_cli(
+        unverified_provenance,
+        unverified_provenance_all,
+    );
     Ok(commands::install_global::InstallGlobalOverrides {
         allow_new,
         min_release_age_override,
         drift_ignore_policy,
+        verify_policy,
         // Forward the resolved policy as `Some(p)` so the inner
         // pipeline's resolver doesn't double-resolve against its own
         // (project-shape) chain.
@@ -2517,6 +2563,15 @@ async fn async_main() -> Result<()> {
         registry.init();
     }
 
+    // Startup gate for `LPM_PROVENANCE_ENFORCE`: an unknown value
+    // (typo, stale spelling from an older release) must hard-fail
+    // here rather than silently downgrading to the default `Deny`.
+    // Otherwise an operator who set `LPM_PROVENANCE_ENFORCE=warm`
+    // thinking it means `warn` would get the fail-closed posture
+    // they did NOT ask for, with no signal that their intent
+    // didn't take effect.
+    provenance_fetch::EnforceMode::validate_from_env()?;
+
     let registry_url = cli
         .registry
         .as_deref()
@@ -2738,6 +2793,8 @@ async fn async_main() -> Result<()> {
             min_release_age,
             ignore_provenance_drift,
             ignore_provenance_drift_all,
+            unverified_provenance,
+            unverified_provenance_all,
             linker,
             no_skills,
             no_editor_setup,
@@ -2822,6 +2879,8 @@ async fn async_main() -> Result<()> {
                     min_release_age.as_deref(),
                     ignore_provenance_drift,
                     ignore_provenance_drift_all,
+                    unverified_provenance,
+                    unverified_provenance_all,
                 )?;
 
                 return commands::install_global::run(
@@ -2886,6 +2945,65 @@ async fn async_main() -> Result<()> {
                 ignore_provenance_drift,
                 ignore_provenance_drift_all,
             );
+
+            // Canonicalize the per-package crypto opt-out flags +
+            // env / config-resolved `EnforceMode` into a single
+            // `VerifyPolicy`. The two axes (enforce, skip) compose
+            // orthogonally — see `SkipPolicy` doc. Resolution walks
+            // the full precedence chain:
+            //   env LPM_PROVENANCE_ENFORCE
+            //     → config [sigstore].verify in ~/.lpm/config.toml
+            //       → default Deny.
+            let (verify_policy, verify_source) = provenance_fetch::VerifyPolicy::resolve_from_chain(
+                unverified_provenance,
+                unverified_provenance_all,
+                std::env::var("LPM_PROVENANCE_ENFORCE").ok().as_deref(),
+                || cfg.get_sigstore_verify(),
+            );
+            // Loud-when-degraded: emit one heads-up per install run
+            // when the resolved mode is not `Deny`. The hint names
+            // the source (env / config / default) and the re-enable
+            // command so an operator who flipped the knob once and
+            // forgot doesn't fly blind. Tracing always fires so
+            // structured-log consumers (JSON-mode pipelines, log
+            // forwarders) capture the posture-degrade independent of
+            // stderr; stderr `output::warn` is suppressed under
+            // `--json` because the per-package envelope is the
+            // canonical signal there.
+            if !matches!(verify_policy.enforce, provenance_fetch::EnforceMode::Deny) {
+                let mode_label = match verify_policy.enforce {
+                    provenance_fetch::EnforceMode::Warn => "warn",
+                    provenance_fetch::EnforceMode::Off => "off",
+                    provenance_fetch::EnforceMode::Deny => unreachable!("guarded above"),
+                };
+                tracing::warn!(
+                    target = "lpm::provenance",
+                    enforce_mode = mode_label,
+                    source = ?verify_source,
+                    "sigstore verification posture is degraded for this install run",
+                );
+                if !cli.json {
+                    output::warn(&format!(
+                        "Sigstore provenance verification posture: {} (source: {}). \
+                         Provenance attestations will {} be cryptographically verified \
+                         for this install. To re-enable fail-closed: {}.",
+                        mode_label,
+                        match verify_source {
+                            provenance_fetch::EnforceModeSource::Env =>
+                                "LPM_PROVENANCE_ENFORCE env",
+                            provenance_fetch::EnforceModeSource::Config =>
+                                "[sigstore] verify in ~/.lpm/config.toml",
+                            provenance_fetch::EnforceModeSource::Default => "default",
+                        },
+                        if matches!(verify_policy.enforce, provenance_fetch::EnforceMode::Off) {
+                            "NOT"
+                        } else {
+                            "be checked but rejections will only log, not block —"
+                        },
+                        verify_source.re_enable_hint(),
+                    ));
+                }
+            }
 
             //: resolve the effective script-policy through
             // the precedence chain (CLI > package.json > global >
@@ -2997,6 +3115,7 @@ async fn async_main() -> Result<()> {
                         advisor.clone(),
                         min_release_age_override,
                         drift_ignore_policy,
+                        verify_policy,
                         // collapse `--strict-sandbox`
                         // and its `--paranoid` alias into a single bool
                         // before the resolver (the chain inside
@@ -3026,6 +3145,7 @@ async fn async_main() -> Result<()> {
                     advisor.clone(),
                     min_release_age_override,
                     drift_ignore_policy,
+                    verify_policy,
                     strict_sandbox || paranoid,
                     no_sandbox,
                 )
@@ -3056,6 +3176,7 @@ async fn async_main() -> Result<()> {
                         advisor.clone(),
                         min_release_age_override,
                         drift_ignore_policy,
+                        verify_policy,
                         strict_sandbox || paranoid,
                         no_sandbox,
                     )
@@ -3074,6 +3195,7 @@ async fn async_main() -> Result<()> {
                         advisor.clone(),
                         min_release_age_override,
                         drift_ignore_policy,
+                        verify_policy,
                         strict_sandbox || paranoid,
                         no_sandbox,
                     )
@@ -5064,8 +5186,19 @@ mod tests {
 
     #[test]
     fn build_install_global_overrides_threads_allow_new_and_auto_build_bools() {
-        let o = build_install_global_overrides(true, true, None, false, false, None, vec![], false)
-            .unwrap();
+        let o = build_install_global_overrides(
+            true,
+            true,
+            None,
+            false,
+            false,
+            None,
+            vec![],
+            false,
+            vec![],
+            false,
+        )
+        .unwrap();
         assert!(
             o.allow_new,
             "allow_new must reach the bundle so the cooldown gate is bypassed"
@@ -5075,9 +5208,19 @@ mod tests {
             "auto_build must reach the bundle so triage greens auto-execute"
         );
 
-        let o =
-            build_install_global_overrides(false, false, None, false, false, None, vec![], false)
-                .unwrap();
+        let o = build_install_global_overrides(
+            false,
+            false,
+            None,
+            false,
+            false,
+            None,
+            vec![],
+            false,
+            vec![],
+            false,
+        )
+        .unwrap();
         assert!(!o.allow_new);
         assert!(!o.auto_build);
     }
@@ -5091,6 +5234,8 @@ mod tests {
             false,
             false,
             Some("72h"),
+            vec![],
+            false,
             vec![],
             false,
         )
@@ -5110,6 +5255,8 @@ mod tests {
             Some("0"),
             vec![],
             false,
+            vec![],
+            false,
         )
         .unwrap();
         assert_eq!(
@@ -5119,9 +5266,19 @@ mod tests {
         );
 
         // No override → None reaches the bundle (fallback to chain default).
-        let o =
-            build_install_global_overrides(false, false, None, false, false, None, vec![], false)
-                .unwrap();
+        let o = build_install_global_overrides(
+            false,
+            false,
+            None,
+            false,
+            false,
+            None,
+            vec![],
+            false,
+            vec![],
+            false,
+        )
+        .unwrap();
         assert!(o.min_release_age_override.is_none());
     }
 
@@ -5134,6 +5291,8 @@ mod tests {
             false,
             false,
             Some("garbage"),
+            vec![],
+            false,
             vec![],
             false,
         )
@@ -5159,6 +5318,8 @@ mod tests {
             None,
             vec!["axios".to_string(), "lodash".to_string()],
             false,
+            vec![],
+            false,
         )
         .unwrap();
         match o.drift_ignore_policy {
@@ -5178,6 +5339,8 @@ mod tests {
             None,
             vec!["axios".to_string()],
             true,
+            vec![],
+            false,
         )
         .unwrap();
         assert!(matches!(
@@ -5186,9 +5349,19 @@ mod tests {
         ));
 
         // Empty + false → EnforceAll.
-        let o =
-            build_install_global_overrides(false, false, None, false, false, None, vec![], false)
-                .unwrap();
+        let o = build_install_global_overrides(
+            false,
+            false,
+            None,
+            false,
+            false,
+            None,
+            vec![],
+            false,
+            vec![],
+            false,
+        )
+        .unwrap();
         assert!(matches!(
             o.drift_ignore_policy,
             DriftIgnorePolicy::EnforceAll
@@ -5207,20 +5380,42 @@ mod tests {
             None,
             vec![],
             false,
+            vec![],
+            false,
         )
         .unwrap();
         assert_eq!(o.script_policy_override, Some(ScriptPolicy::Allow));
 
         // --yolo → Allow.
-        let o =
-            build_install_global_overrides(false, false, None, true, false, None, vec![], false)
-                .unwrap();
+        let o = build_install_global_overrides(
+            false,
+            false,
+            None,
+            true,
+            false,
+            None,
+            vec![],
+            false,
+            vec![],
+            false,
+        )
+        .unwrap();
         assert_eq!(o.script_policy_override, Some(ScriptPolicy::Allow));
 
         // --triage → Triage.
-        let o =
-            build_install_global_overrides(false, false, None, false, true, None, vec![], false)
-                .unwrap();
+        let o = build_install_global_overrides(
+            false,
+            false,
+            None,
+            false,
+            true,
+            None,
+            vec![],
+            false,
+            vec![],
+            false,
+        )
+        .unwrap();
         assert_eq!(o.script_policy_override, Some(ScriptPolicy::Triage));
 
         // --policy=deny → Deny (explicit; not ambient default).
@@ -5231,6 +5426,8 @@ mod tests {
             false,
             false,
             None,
+            vec![],
+            false,
             vec![],
             false,
         )
@@ -5245,9 +5442,19 @@ mod tests {
             "HOME",
             std::ffi::OsString::from(std::env::temp_dir().to_str().unwrap()),
         )]);
-        let o =
-            build_install_global_overrides(false, false, None, false, false, None, vec![], false)
-                .unwrap();
+        let o = build_install_global_overrides(
+            false,
+            false,
+            None,
+            false,
+            false,
+            None,
+            vec![],
+            false,
+            vec![],
+            false,
+        )
+        .unwrap();
         // The resolver returns the default — Some(Deny). We forward
         // it as `Some` so the inner pipeline's resolver doesn't
         // double-resolve.
@@ -5263,6 +5470,8 @@ mod tests {
             false,
             false,
             None,
+            vec![],
+            false,
             vec![],
             false,
         )
@@ -5779,6 +5988,138 @@ mod tests {
         );
         assert!(Cli::try_parse_from(["lpm", "install", "--paranoid", "--no-sandbox"]).is_err());
         assert!(Cli::try_parse_from(["lpm", "install", "--strict-sandbox", "--paranoid"]).is_err());
+    }
+
+    #[test]
+    fn install_unverified_provenance_flag_parses_repeatable_and_blanket() {
+        // Per-package `--unverified-provenance <name>` is
+        // repeatable; `--unverified-provenance-all` is a blanket
+        // flag. Both must parse and reach the `Install` variant
+        // fields.
+        let cli = Cli::try_parse_from([
+            "lpm",
+            "install",
+            "--unverified-provenance",
+            "axios",
+            "--unverified-provenance",
+            "lodash",
+        ])
+        .expect("repeatable --unverified-provenance should parse");
+        match cli.command.expect("test parse missing subcommand") {
+            Commands::Install {
+                unverified_provenance,
+                unverified_provenance_all,
+                ..
+            } => {
+                assert_eq!(
+                    unverified_provenance,
+                    vec!["axios".to_string(), "lodash".to_string()],
+                );
+                assert!(
+                    !unverified_provenance_all,
+                    "blanket flag MUST remain false when only the per-package flag was passed",
+                );
+            }
+            _ => panic!("expected Install command"),
+        }
+
+        let cli = Cli::try_parse_from(["lpm", "install", "--unverified-provenance-all"])
+            .expect("--unverified-provenance-all should parse standalone");
+        match cli.command.expect("test parse missing subcommand") {
+            Commands::Install {
+                unverified_provenance,
+                unverified_provenance_all,
+                ..
+            } => {
+                assert!(unverified_provenance.is_empty());
+                assert!(unverified_provenance_all);
+            }
+            _ => panic!("expected Install command"),
+        }
+
+        // Composition: per-package list AND blanket flag in the same
+        // invocation. NOT a parse error (no clap mutex) — the
+        // canonicalization in `VerifyPolicy::from_cli` collapses to
+        // `SkipPolicy::All`. This mirrors the existing
+        // `--ignore-provenance-drift` shape.
+        let cli = Cli::try_parse_from([
+            "lpm",
+            "install",
+            "--unverified-provenance",
+            "axios",
+            "--unverified-provenance-all",
+        ])
+        .expect("composing per-package + blanket flag must NOT be a clap error");
+        match cli.command.expect("test parse missing subcommand") {
+            Commands::Install {
+                unverified_provenance,
+                unverified_provenance_all,
+                ..
+            } => {
+                assert_eq!(unverified_provenance, vec!["axios".to_string()]);
+                assert!(unverified_provenance_all);
+            }
+            _ => panic!("expected Install command"),
+        }
+    }
+
+    #[test]
+    fn build_install_global_overrides_canonicalizes_verify_policy() {
+        use provenance_fetch::SkipPolicy;
+
+        // Per-package list → `SkipPolicy::Names`.
+        let o = build_install_global_overrides(
+            false,
+            false,
+            None,
+            false,
+            false,
+            None,
+            vec![],
+            false,
+            vec!["axios".to_string(), "lodash".to_string()],
+            false,
+        )
+        .unwrap();
+        match o.verify_policy.skip {
+            SkipPolicy::Names(set) => {
+                assert!(set.contains("axios") && set.contains("lodash"));
+            }
+            other => panic!("expected SkipPolicy::Names, got {other:?}"),
+        }
+
+        // Blanket flag wins over per-package list (mirrors
+        // DriftIgnorePolicy semantics).
+        let o = build_install_global_overrides(
+            false,
+            false,
+            None,
+            false,
+            false,
+            None,
+            vec![],
+            false,
+            vec!["axios".to_string()],
+            true,
+        )
+        .unwrap();
+        assert!(matches!(o.verify_policy.skip, SkipPolicy::All));
+
+        // Empty + false → `SkipPolicy::None`.
+        let o = build_install_global_overrides(
+            false,
+            false,
+            None,
+            false,
+            false,
+            None,
+            vec![],
+            false,
+            vec![],
+            false,
+        )
+        .unwrap();
+        assert!(matches!(o.verify_policy.skip, SkipPolicy::None));
     }
 
     #[test]

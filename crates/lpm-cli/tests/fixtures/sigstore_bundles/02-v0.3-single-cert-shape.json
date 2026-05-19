@@ -1,0 +1,24 @@
+{
+  "mediaType": "application/vnd.dev.sigstore.bundle.v0.3+json",
+  "dsseEnvelope": {
+    "payloadType": "application/vnd.in-toto+json",
+    "payload": "eyJfdHlwZSI6Imh0dHBzOi8vaW4tdG90by5pby9TdGF0ZW1lbnQvdjEifQ==",
+    "signatures": [
+      { "keyid": "", "sig": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA" }
+    ]
+  },
+  "verificationMaterial": {
+    "certificate": {
+      "rawBytes": "MIIBHzCBxqADAgECAgEBMAoGCCqGSM49BAMCMA8xDTALBgNVBAMTBHJvb3QwHhcNMjUwMTAxMDAwMDAwWhcNMjYwMTAxMDAwMDAwWjAPMQ0wCwYDVQQDEwRsZWFmMFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAMAoGCCqGSM49BAMCA0gAMEUCIQDxAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAIgAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+    },
+    "tlogEntries": [
+      {
+        "logIndex": "43",
+        "logId": { "keyId": "0000000000000000000000000000000000000000000000000000000000000000" },
+        "integratedTime": "1700000001",
+        "canonicalizedBody": "eyJraW5kIjoiaW50b3RvIiwiYXBpVmVyc2lvbiI6IjAuMC4yIn0=",
+        "inclusionPromise": { "signedEntryTimestamp": "AAAA" }
+      }
+    ]
+  }
+}

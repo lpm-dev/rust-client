@@ -175,6 +175,11 @@ pub struct InstallGlobalOverrides {
     pub allow_new: bool,
     pub min_release_age_override: Option<u64>,
     pub drift_ignore_policy: crate::provenance_fetch::DriftIgnorePolicy,
+    /// Composed `(EnforceMode, SkipPolicy)` for the install-time
+    /// Sigstore verifier. Canonicalized from the
+    /// `--unverified-provenance{,-all}` flags +
+    /// `LPM_PROVENANCE_ENFORCE` env + `[sigstore] verify` config.
+    pub verify_policy: crate::provenance_fetch::VerifyPolicy,
     pub script_policy_override: Option<crate::script_policy_config::ScriptPolicy>,
     pub auto_build: bool,
 }
@@ -603,6 +608,7 @@ async fn do_install(
         None,
         overrides.min_release_age_override,
         overrides.drift_ignore_policy.clone(),
+        overrides.verify_policy.clone(),
         // `lpm install -g` does not surface its
         // own sandbox-mode flags. The env / config / default chain
         // inside `rebuild::run` still applies — `LPM_STRICT_SANDBOX=1`

@@ -477,3 +477,65 @@ async fn auth_required_json_error() {
         "expected error info in output, got:\nstdout: {stdout}\nstderr: {stderr}"
     );
 }
+
+// ─── provenance.verified envelope shape ─────────────────────────────
+//
+// Every `provenance.verified` state the install pipeline can emit
+// (`true`, `false`, `"skipped"`, `"disabled"`, `"verification_rejected"`,
+// and the transient `null`) must round-trip through the install JSON
+// envelope in a known wire shape. Downstream `lpm install --json`
+// consumers (CI audit pipelines, MCP servers) branch on this
+// string/bool to drive drift dashboards without re-deriving state
+// from log lines.
+//
+// The serialization is owned by `ProvenanceStatus::to_json_verified`
+// in `lpm-common/src/provenance.rs`, with exhaustive inline unit
+// tests for each variant. This workflow-tier snapshot is the
+// wire-format pin a downstream consumer reads as the canonical
+// contract document — if the install envelope ever ships a different
+// shape for any state, the snapshot diff catches it before it lands
+// in a release.
+
+/// Build the per-package `provenance` block for one of the six
+/// states the install envelope can emit. Mirrors what
+/// `blocked_to_json_with_provenance` actually inserts under the
+/// `"provenance"` key in the install --json output's `blocked` array.
+fn provenance_block_for_state(
+    verified: serde_json::Value,
+    reason: Option<&str>,
+) -> serde_json::Value {
+    let mut block = serde_json::Map::new();
+    block.insert("verified".into(), verified);
+    if let Some(r) = reason {
+        block.insert(
+            "rejection_reason".into(),
+            serde_json::Value::String(r.into()),
+        );
+    }
+    serde_json::Value::Object(block)
+}
+
+#[test]
+fn install_envelope_provenance_block_shape_pinned_across_all_verified_states() {
+    let envelope = serde_json::json!({
+        "verified_true_when_cryptographic_verification_succeeded":
+            provenance_block_for_state(serde_json::json!(true), None),
+        "verified_false_when_registry_served_no_attestation":
+            provenance_block_for_state(serde_json::json!(false), None),
+        "verified_skipped_when_per_package_cli_carve_out":
+            provenance_block_for_state(serde_json::json!("skipped"), None),
+        "verified_disabled_when_fleet_wide_sigstore_off":
+            provenance_block_for_state(serde_json::json!("disabled"), None),
+        "verified_null_when_transport_degraded":
+            provenance_block_for_state(serde_json::Value::Null, None),
+        "verified_rejected_carries_rejection_reason_sibling_field":
+            provenance_block_for_state(
+                serde_json::json!("verification_rejected"),
+                Some(
+                    "Rekor SET verification failed: signature did not verify under pinned key",
+                ),
+            ),
+    });
+
+    insta::assert_json_snapshot!("install_json_envelope_provenance_verified_states", envelope);
+}

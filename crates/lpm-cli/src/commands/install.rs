@@ -3394,6 +3394,15 @@ pub async fn run_with_options(
     // into this policy (D16): drift and cooldown are orthogonal, so
     // their override flags stay separate.
     drift_ignore_policy: crate::provenance_fetch::DriftIgnorePolicy,
+    // Composed `(EnforceMode, SkipPolicy)` for the Sigstore
+    // verifier. The drift gate at the install-time call
+    // consults `verify_policy.skip` to route skip-listed packages
+    // through the legacy identity-only parser (producing
+    // `ProvenanceStatus::Unverified`) instead of hard-failing on a
+    // cryptographic rejection. Orthogonal to `drift_ignore_policy`:
+    // one suppresses the *crypto* layer, the other suppresses the
+    // *drift* layer.
+    verify_policy: crate::provenance_fetch::VerifyPolicy,
     // CLI sandbox-mode overrides.
     // `strict_sandbox=true` flips outbound network denial on for the
     // auto-build call; `no_sandbox=true` drops all containment for
@@ -3439,6 +3448,7 @@ pub async fn run_with_options(
             advisor_override,
             min_release_age_override,
             drift_ignore_policy,
+            verify_policy,
             strict_sandbox,
             no_sandbox,
         ),
@@ -3470,6 +3480,8 @@ async fn run_with_options_under_store_lock(
     advisor_override: Option<String>,
     min_release_age_override: Option<u64>,
     drift_ignore_policy: crate::provenance_fetch::DriftIgnorePolicy,
+    // see `run_with_options` for the contract.
+    verify_policy: crate::provenance_fetch::VerifyPolicy,
     // rework  — see `run_with_options` for the
     // contract. Threaded down so the auto-build call below honors the
     // user's CLI sandbox-mode override.
@@ -5579,6 +5591,15 @@ async fn run_with_options_under_store_lock(
             "provenance-drift check waived for this install by --ignore-provenance-drift-all",
         );
     }
+    // Per-package `ProvenanceStatus` map for the install --json
+    // envelope. Declared at this scope (rather than inside the
+    // `if has_rich_approvals` block) so the JSON emission below at
+    // the `blocked_packages` enumeration can consume it. Sparse —
+    // only packages the drift gate fetched for are present; the
+    // `blocked_to_json_with_provenance` helper omits the
+    // `provenance` block when the key is absent.
+    let mut install_provenance_status_map: HashMap<(String, String), lpm_common::ProvenanceStatus> =
+        HashMap::new();
     if !used_lockfile && !drift_ignore_policy.ignores_all() {
         let trusted =
             lpm_security::SecurityPolicy::from_package_json(&project_dir.join("package.json"))
@@ -5667,23 +5688,147 @@ async fn run_with_options_under_store_lock(
                     })
                 };
 
-                let now_snapshot = tokio::task::block_in_place(|| {
-                    tokio::runtime::Handle::current().block_on(
-                        crate::provenance_fetch::fetch_provenance_snapshot(
-                            &http,
-                            &cache_root,
-                            &p.name,
-                            &p.version,
-                            attestation_ref.as_ref(),
-                            None,
+                // When the operator skip-listed this name (CLI
+                // `--unverified-provenance`) OR set the fleet-wide
+                // enforce mode to `Off` (env / config), route the
+                // fetch through the `Unverified` path — bytes
+                // through the legacy identity-only parser, no
+                // cryptographic checks. The drift gate still gets
+                // a populated snapshot so publisher / workflow_path
+                // identity drift is detected even when the operator
+                // opted out of crypto.
+                let now_snapshot: Option<lpm_workspace::ProvenanceSnapshot> = if verify_policy
+                    .should_skip_verification_for(&p.name)
+                {
+                    let raw = tokio::task::block_in_place(|| {
+                        tokio::runtime::Handle::current().block_on(
+                            crate::provenance_fetch::fetch_unverified_snapshot(
+                                &http,
+                                &p.name,
+                                &p.version,
+                                attestation_ref.as_ref(),
+                            ),
+                        )
+                    });
+                    // Re-label `Unverified` → `Disabled` when fleet-
+                    // wide `EnforceMode::Off` was the trigger, so the
+                    // JSON envelope distinguishes wholesale opt-out
+                    // (`"disabled"`) from per-package CLI carve-out
+                    // (`"skipped"`). Logic shared with the batch
+                    // caller in `provenance_fetch.rs` so the two
+                    // sites cannot drift on the labeling rule.
+                    let status = crate::provenance_fetch::relabel_skip_status_for_enforce_mode(
+                        raw,
+                        verify_policy.enforce,
+                    );
+                    // Record for the install --json envelope
+                    // before consuming for the drift gate.
+                    install_provenance_status_map
+                        .insert((p.name.clone(), p.version.clone()), status.clone());
+                    // Projection: `Unverified(snap)` / `Disabled(snap)`
+                    // → Some(snap), `Absent` → Some(present:false),
+                    // `TransportDegraded` → None. `VerificationRejected`
+                    // is unreachable on the skip path (the verifier
+                    // didn't run).
+                    status.into_snapshot_for_binding(&p.name, &p.version)?
+                } else {
+                    let raw = tokio::task::block_in_place(|| {
+                        tokio::runtime::Handle::current().block_on(
+                            crate::provenance_fetch::fetch_provenance_snapshot(
+                                &http,
+                                &cache_root,
+                                &p.name,
+                                &p.version,
+                                attestation_ref.as_ref(),
+                                None,
+                            ),
+                        )
+                    });
+                    // Branch arms:
+                    //   - `Ok(Some(snap))`: Verified (snap.present)
+                    //     or Absent (registry served no attestation).
+                    //   - `Ok(None)`: transport-degraded; drift
+                    //     comparator absorbs as NoDrift.
+                    //   - `Err(ProvenanceVerification)`: policy
+                    //     decision per `verify_policy.enforce`.
+                    //     Warn degrades to None + loud log; Deny
+                    //     propagates the typed error and `?`
+                    //     refuses the install.
+                    //   - `Err(other)`: infrastructure failure
+                    //     (cache unwritable, etc.) — propagate
+                    //     as-is so the user sees a real diagnostic,
+                    //     not a silent degrade.
+                    let (snapshot_for_drift, status_for_map) = match raw {
+                        Ok(Some(snap)) if snap.present => {
+                            let status = lpm_common::ProvenanceStatus::Verified(snap.clone());
+                            (Some(snap), status)
+                        }
+                        Ok(Some(_)) => (
+                            Some(lpm_workspace::ProvenanceSnapshot {
+                                present: false,
+                                ..Default::default()
+                            }),
+                            lpm_common::ProvenanceStatus::Absent,
                         ),
-                    )
-                })
-                // Fetch errors propagate as LpmError (cache directory
-                // unwritable, etc.). Semantic degraded-fetch is already
-                // `Ok(None)` inside the fetcher and the comparator
-                // treats that as NoDrift.
-                ?;
+                        Ok(None) => (None, lpm_common::ProvenanceStatus::TransportDegraded),
+                        Err(lpm_common::LpmError::ProvenanceVerification(reason)) => {
+                            let status = lpm_common::ProvenanceStatus::VerificationRejected {
+                                reason: reason.clone(),
+                            };
+                            let snapshot = match verify_policy.enforce {
+                                crate::provenance_fetch::EnforceMode::Warn => {
+                                    if !json_output {
+                                        crate::output::warn(&format!(
+                                            "provenance verification FAILED for {pkg}@{ver}: {reason}\n  \
+                                             LPM_PROVENANCE_ENFORCE=warn — install proceeds without \
+                                             verified provenance for this package. Re-run with \
+                                             LPM_PROVENANCE_ENFORCE=deny (default) to refuse, or pass \
+                                             `--unverified-provenance {pkg}` to opt out explicitly.",
+                                            pkg = p.name,
+                                            ver = p.version,
+                                        ));
+                                    }
+                                    tracing::warn!(
+                                        target = "lpm::provenance",
+                                        pkg = %p.name,
+                                        version = %p.version,
+                                        reason = %reason,
+                                        enforce_mode = "warn",
+                                        "install drift gate: verifier rejected bundle \
+                                         under warn enforce-mode — degrading to NoDrift",
+                                    );
+                                    None
+                                }
+                                // `Off` short-circuits the verifier
+                                // upstream via `should_skip_verification_for`,
+                                // so the verifier-rejection path is
+                                // unreachable in `Off` mode. Defensive
+                                // arm to keep the match exhaustive if
+                                // a future refactor accidentally
+                                // bypasses the skip-route — degrade
+                                // identically to Warn so the install
+                                // doesn't fail on a state that the
+                                // operator already declared "fleet-wide
+                                // off".
+                                crate::provenance_fetch::EnforceMode::Off => None,
+                                crate::provenance_fetch::EnforceMode::Deny => {
+                                    // Surface the status in the map before
+                                    // returning so a `--json` consumer that
+                                    // tees stderr can correlate the failure
+                                    // with the per-package envelope.
+                                    install_provenance_status_map
+                                        .insert((p.name.clone(), p.version.clone()), status);
+                                    return Err(LpmError::ProvenanceVerification(reason));
+                                }
+                            };
+                            (snapshot, status)
+                        }
+                        Err(other) => return Err(other),
+                    };
+                    install_provenance_status_map
+                        .insert((p.name.clone(), p.version.clone()), status_for_map);
+                    snapshot_for_drift
+                };
 
                 let verdict = lpm_security::provenance::check_provenance_drift(
                     approved_snapshot,
@@ -7598,21 +7743,34 @@ async fn run_with_options_under_store_lock(
         );
         // + per-entry shape now
         // includes `static_tier` (P6) and `version_diff` (P7) via
-        // the shared `version_diff::blocked_to_json` helper, which
-        // is also the source of truth for the approve-scripts JSON
-        // emitter. Both sides cannot drift on the entry shape.
+        // the shared `version_diff::blocked_to_json_with_provenance`
+        // helper, which is also the source of truth for the
+        // approve-scripts JSON emitter. Both sides cannot drift on
+        // the entry shape.
         //
         // `version_diff` is `null` when no prior binding for the
         // package name exists (first-time review). When a prior
         // exists, the structured object is documented on
         // `version_diff::version_diff_to_json`.
+        //
+        // The per-package `provenance.verified` block emits when
+        // the drift gate captured a `ProvenanceStatus` for this
+        // `(name, version)` pair. Sparse — only packages with a
+        // rich-form `trustedDependencies` binding triggered a
+        // fetch.
         let trusted_for_json = read_trusted_deps_from_manifest(project_dir).unwrap_or_default();
         json["blocked_packages"] = serde_json::Value::Array(
             blocked_capture
                 .state
                 .blocked_packages
                 .iter()
-                .map(|bp| crate::version_diff::blocked_to_json(bp, &trusted_for_json))
+                .map(|bp| {
+                    crate::version_diff::blocked_to_json_with_provenance(
+                        bp,
+                        &trusted_for_json,
+                        Some(&install_provenance_status_map),
+                    )
+                })
                 .collect(),
         );
         println!("{}", serde_json::to_string_pretty(&json).unwrap());
@@ -10951,6 +11109,9 @@ pub async fn run_add_packages(
     // forwarded `--ignore-provenance-drift[-all]`
     // policy. Opaque pass-through — see [`run_with_options`].
     drift_ignore_policy: crate::provenance_fetch::DriftIgnorePolicy,
+    // forwarded composed Sigstore verifier policy. Opaque
+    // pass-through — see [`run_with_options`].
+    verify_policy: crate::provenance_fetch::VerifyPolicy,
     // forwarded CLI sandbox-mode
     // overrides. Opaque pass-through — see [`run_with_options`].
     strict_sandbox: bool,
@@ -11089,6 +11250,7 @@ pub async fn run_add_packages(
             advisor_override,
             min_release_age_override,
             drift_ignore_policy,
+            verify_policy,
             strict_sandbox,
             no_sandbox,
         )
@@ -11150,6 +11312,9 @@ pub async fn run_install_filtered_add(
     // forwarded `--ignore-provenance-drift[-all]`
     // policy. Opaque pass-through — see [`run_with_options`].
     drift_ignore_policy: crate::provenance_fetch::DriftIgnorePolicy,
+    // forwarded composed Sigstore verifier policy. Opaque
+    // pass-through — see [`run_with_options`].
+    verify_policy: crate::provenance_fetch::VerifyPolicy,
     // forwarded CLI sandbox-mode
     // overrides. Opaque pass-through — see [`run_with_options`].
     strict_sandbox: bool,
@@ -11399,6 +11564,11 @@ pub async fn run_install_filtered_add(
                 // Cloning an enum + HashSet of ignored names is cheap
                 // relative to the per-iteration install pipeline itself.
                 drift_ignore_policy.clone(),
+                // Same per-iteration clone rationale as drift_ignore_policy.
+                // `VerifyPolicy` carries an `EnforceMode` (Copy) and a
+                // `SkipPolicy` (HashSet of skip-listed names); cloning is
+                // bounded by the user-passed flag count.
+                verify_policy.clone(),
                 strict_sandbox,
                 no_sandbox,
             )
@@ -13757,6 +13927,7 @@ mod tests {
             None,                                                  // advisor_override
             None,                                                  // min_release_age_override
             crate::provenance_fetch::DriftIgnorePolicy::default(), // drift_ignore_policy
+            crate::provenance_fetch::VerifyPolicy::default(),      // verify_policy
             false,                                                 // strict_sandbox
             false,                                                 // no_sandbox
         )
@@ -13798,6 +13969,7 @@ mod tests {
             None,                                                  // advisor_override
             None,                                                  // min_release_age_override
             crate::provenance_fetch::DriftIgnorePolicy::default(), // drift_ignore_policy
+            crate::provenance_fetch::VerifyPolicy::default(),      // verify_policy
             false,                                                 // strict_sandbox
             false,                                                 // no_sandbox
         )

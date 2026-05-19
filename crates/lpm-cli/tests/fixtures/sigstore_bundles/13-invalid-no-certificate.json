@@ -1,0 +1,21 @@
+{
+  "mediaType": "application/vnd.dev.sigstore.bundle.v0.3+json",
+  "dsseEnvelope": {
+    "payloadType": "application/vnd.in-toto+json",
+    "payload": "eyJfdHlwZSI6Imh0dHBzOi8vaW4tdG90by5pby9TdGF0ZW1lbnQvdjEifQ==",
+    "signatures": [
+      { "keyid": "", "sig": "AAAA" }
+    ]
+  },
+  "verificationMaterial": {
+    "tlogEntries": [
+      {
+        "logIndex": "46",
+        "logId": { "keyId": "0000000000000000000000000000000000000000000000000000000000000000" },
+        "integratedTime": "1700000004",
+        "canonicalizedBody": "eyJraW5kIjoiaW50b3RvIn0=",
+        "inclusionPromise": { "signedEntryTimestamp": "AAAA" }
+      }
+    ]
+  }
+}

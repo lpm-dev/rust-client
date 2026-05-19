@@ -910,22 +910,23 @@ async fn auto_install_if_stale(
     match crate::commands::install::run_with_options(
         client,
         project_dir,
-        false,                                                 // json_output
-        false,                                                 // offline
-        false,                                                 // force
-        false,                                                 // allow_new
-        false,                                                 // strict_integrity
-        None,                                                  // linker_override
-        false,                                                 // no_skills
-        false,                                                 // no_editor_setup
-        true,                                                  // no_security_summary
-        false,                                                 // auto_build
-        None,                                                  // target_set: dev is single-project
+        false,                                                   // json_output
+        false,                                                   // offline
+        false,                                                   // force
+        false,                                                   // allow_new
+        false,                                                   // strict_integrity
+        None,                                                    // linker_override
+        false,                                                   // no_skills
+        false,                                                   // no_editor_setup
+        true,                                                    // no_security_summary
+        false,                                                   // auto_build
+        None, // target_set: dev is single-project
         None, // direct_versions_out: dev does not finalize placeholders
         None, // script_policy_override: `lpm dev` does not expose policy flags
         None, // advisor_override: `lpm dev` does not expose `--advisor`
         None, // min_release_age_override: `lpm dev` uses the chain
         crate::provenance_fetch::DriftIgnorePolicy::default(), // drift-ignore: `lpm dev` enforces drift
+        crate::provenance_fetch::VerifyPolicy::resolve_no_cli(), // verify-policy: `lpm dev` honors env + config posture chain
         // `lpm dev` does not surface its own
         // sandbox-mode flags. The env / config / default chain
         // inside `rebuild::run` still applies.

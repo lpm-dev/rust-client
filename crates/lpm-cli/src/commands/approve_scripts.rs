@@ -27,7 +27,9 @@ use crate::build_state::{self, BlockedPackage, BuildState};
 use crate::output;
 use lpm_common::LpmError;
 use lpm_common::color::Painted;
-use lpm_workspace::{ApprovalMetadata, ProvenanceSnapshot, TrustMatch, TrustedDependencies};
+use lpm_workspace::{
+    ApprovalMetadata, ProvenanceSnapshot, ProvenanceStatus, TrustMatch, TrustedDependencies,
+};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
@@ -76,6 +78,40 @@ fn approval_metadata_from_blocked(
     }
 }
 
+/// Build approval metadata, preserving any prior verified
+/// `provenance_at_approval` if the incoming snapshot is `None` and
+/// an existing exact-version binding carries one.
+///
+/// Why: `TrustedDependencies::approve_with_metadata` unconditionally
+/// overwrites the rich-map entry for `name@version`. Under Warn /
+/// Off, [`snapshot_for_binding_with_mode`] returns `Ok(None)` on
+/// `VerificationRejected` so the approval can proceed without the
+/// new verifier observation. If the user had previously approved
+/// the SAME exact version under Deny (with a verified snapshot
+/// recorded), a naive re-approval would silently clear that
+/// snapshot, permanently disarming drift detection for that exact
+/// version. Preserving the prior value keeps the drift reference
+/// intact while the new approval still goes through.
+///
+/// The preservation only fires when the *new* snapshot is `None`.
+/// A Verified re-approval (incoming `Some(new)`) always wins —
+/// fresh successful verification is the strongest signal.
+fn approval_metadata_preserving_existing_provenance(
+    trusted: &TrustedDependencies,
+    blocked: &BlockedPackage,
+    capability_hash: Option<String>,
+    incoming: Option<ProvenanceSnapshot>,
+) -> ApprovalMetadata {
+    let mut meta = approval_metadata_from_blocked(blocked, capability_hash, incoming);
+    if meta.provenance_at_approval.is_none()
+        && let Some(existing) = trusted.binding_for_exact_version(&blocked.name, &blocked.version)
+        && let Some(prior) = existing.provenance_at_approval.clone()
+    {
+        meta.provenance_at_approval = Some(prior);
+    }
+    meta
+}
+
 /// Fetch attestation snapshots for an effective
 /// blocked set at approval time.
 ///
@@ -102,14 +138,124 @@ fn approval_metadata_from_blocked(
 /// single source of truth shared with the global-scope approve path
 /// (`lpm approve-scripts --global`). This wrapper keeps the
 /// `BlockedPackage` shape callers used pre-existing working unchanged.
+///
+/// The `--unverified-provenance[-all]` opt-out lives on
+/// `lpm install` (not on `approve-scripts`), so the policy here
+/// uses the operator-persistent posture chain (env +
+/// `[sigstore] verify` config) — same shape the install pipeline
+/// uses. `SkipPolicy` is fixed at `None` because per-package skip
+/// decisions are not surfaced on approve-scripts: the approval
+/// path's only job is to record a binding, and degrading
+/// individual packages to identity-only there would silently strip
+/// a layer of evidence the install path already captured.
 async fn fetch_provenance_for_effective_set(
     packages: &[BlockedPackage],
-) -> HashMap<(String, String), Option<ProvenanceSnapshot>> {
+) -> HashMap<(String, String), ProvenanceStatus> {
     let pkgs: Vec<(String, String)> = packages
         .iter()
         .map(|p| (p.name.clone(), p.version.clone()))
         .collect();
-    crate::provenance_fetch::fetch_provenance_for_pkgs(&pkgs).await
+    let policy = crate::provenance_fetch::VerifyPolicy::resolve_no_cli();
+    crate::provenance_fetch::fetch_provenance_for_pkgs(&pkgs, &policy).await
+}
+
+/// Resolve the `provenance_at_approval` value for one `(name, version)`
+/// pair from a batch [`ProvenanceStatus`] map, honoring the operator's
+/// `LPM_PROVENANCE_ENFORCE` setting (Phase 2.2.b rollout knob).
+///
+/// This is the project- and global-scope approval-capture hook that
+/// closes the SILENT-DROP attack window: a previous `.ok().flatten()`
+/// pattern collapsed verifier rejections into `None`, which the next
+/// install's drift comparator treated as "first observation" via its
+/// `(None, _) => NoDrift` arm.
+///
+/// Behavior under each [`EnforceMode`]:
+///
+/// - `Deny` (default): a `VerificationRejected` status returns
+///   `Err(LpmError::ProvenanceVerification(...))` and the caller's
+///   `?` short-circuits before any trust-store mutation. Prior
+///   binding stays intact.
+/// - `Warn`: a `VerificationRejected` status emits `tracing::warn` +
+///   `output::warn` (loud, named, with the verifier reason) and
+///   returns `Ok(None)`. The caller's read-modify-write proceeds,
+///   recording `provenance_at_approval: None` — same effect as a
+///   transport-degraded fetch during the approval window. This is
+///   the Phase 2.3 rollout-window posture; operators MUST monitor
+///   the warn line.
+///
+/// Non-rejection statuses (`Verified`, `Absent`, `TransportDegraded`)
+/// project identically under both modes — the mode only affects the
+/// rejection arm.
+fn snapshot_for_binding(
+    provenance_by_pkg: &HashMap<(String, String), ProvenanceStatus>,
+    name: &str,
+    version: &str,
+) -> Result<Option<ProvenanceSnapshot>, LpmError> {
+    snapshot_for_binding_with_mode(
+        provenance_by_pkg,
+        name,
+        version,
+        crate::provenance_fetch::EnforceMode::from_env(),
+    )
+}
+
+/// Pure variant of [`snapshot_for_binding`] that takes the
+/// [`EnforceMode`] explicitly, for unit tests that don't want to
+/// mutate process-global env state.
+fn snapshot_for_binding_with_mode(
+    provenance_by_pkg: &HashMap<(String, String), ProvenanceStatus>,
+    name: &str,
+    version: &str,
+    mode: crate::provenance_fetch::EnforceMode,
+) -> Result<Option<ProvenanceSnapshot>, LpmError> {
+    let status = match provenance_by_pkg.get(&(name.to_string(), version.to_string())) {
+        Some(s) => s.clone(),
+        None => return Ok(None),
+    };
+
+    // Warn / Off short-circuit on VerificationRejected: log loudly but
+    // do NOT propagate as Err, so the approval proceeds and the
+    // binding records `provenance_at_approval: None`. Every other
+    // status (Verified / Unverified / Absent / TransportDegraded)
+    // falls through to the default projection regardless of mode.
+    //
+    // Off here is the "operator opted out fleet-wide" case (Phase
+    // 2.5): a VerificationRejected reaching this point only happens
+    // when the upstream verifier path ran anyway (e.g. a code path
+    // that didn't consult `should_skip_verification_for`); treat it
+    // as a degraded observation rather than failing the approval the
+    // operator explicitly asked to allow.
+    if let ProvenanceStatus::VerificationRejected { reason } = &status
+        && matches!(
+            mode,
+            crate::provenance_fetch::EnforceMode::Warn | crate::provenance_fetch::EnforceMode::Off
+        )
+    {
+        let mode_label = match mode {
+            crate::provenance_fetch::EnforceMode::Warn => "warn",
+            crate::provenance_fetch::EnforceMode::Off => "off",
+            crate::provenance_fetch::EnforceMode::Deny => unreachable!("guarded by matches!"),
+        };
+        tracing::warn!(
+            target = "lpm::provenance",
+            pkg = %name,
+            version = %version,
+            reason = %reason,
+            enforce_mode = mode_label,
+            "verifier rejected provenance bundle but enforce-mode is not deny; \
+             recording approval with no provenance reference. Subsequent installs will \
+             treat this as a degraded state until the operator re-approves under deny."
+        );
+        crate::output::warn(&format!(
+            "provenance verification FAILED for {name}@{version}: {reason}\n  \
+             LPM_PROVENANCE_ENFORCE={mode_label} — approval proceeds; the trust binding \
+             records no verified identity. Re-run with LPM_PROVENANCE_ENFORCE=deny \
+             (default) to refuse, or remediate the underlying bundle and re-approve."
+        ));
+        return Ok(None);
+    }
+
+    status.into_snapshot_for_binding(name, version)
 }
 
 /// Stable schema version for the `--json` output. Bump on any breaking
@@ -398,7 +544,7 @@ async fn run_under_store_lock(
     // `--list` is read-only — skip the fetch entirely; the listing
     // doesn't materialize any binding so `provenance_at_approval` is
     // never consulted. Empty effective set: skip too (no-op).
-    let provenance_by_pkg: HashMap<(String, String), Option<ProvenanceSnapshot>> =
+    let provenance_by_pkg: HashMap<(String, String), ProvenanceStatus> =
         if list || effective_state.blocked_packages.is_empty() {
             HashMap::new()
         } else {
@@ -466,18 +612,19 @@ async fn run_under_store_lock(
             // write-path: carry install-time provenance + behavioral-tag captures
             // into the binding so subsequent installs can compare against them
             // (drift rule + version diff).
-            trusted.approve_with_metadata(
-                &target.name,
-                &target.version,
-                approval_metadata_from_blocked(
-                    target,
-                    capability_hash.clone(),
-                    provenance_by_pkg
-                        .get(&(target.name.clone(), target.version.clone()))
-                        .cloned()
-                        .flatten(),
-                ),
+            //
+            // Phase 2.2 SILENT-DROP fix: `snapshot_for_binding` returns
+            // `Err(LpmError::ProvenanceVerification(_))` when the
+            // verifier rejected the bundle, refusing the approval
+            // rather than blanking `provenance_at_approval`.
+            let snap = snapshot_for_binding(&provenance_by_pkg, &target.name, &target.version)?;
+            let meta = approval_metadata_preserving_existing_provenance(
+                &trusted,
+                target,
+                capability_hash.clone(),
+                snap,
             );
+            trusted.approve_with_metadata(&target.name, &target.version, meta);
             approved.push(target);
             // close-out short-circuit the write
             // under `--dry-run`; the approval intent is still
@@ -499,6 +646,7 @@ async fn run_under_store_lock(
                 false,
                 dry_run,
                 json_output,
+                Some(&provenance_by_pkg),
             );
         }
 
@@ -511,6 +659,7 @@ async fn run_under_store_lock(
             false,
             dry_run,
             json_output,
+            Some(&provenance_by_pkg),
         );
     }
 
@@ -577,18 +726,18 @@ async fn run_under_store_lock(
         emit_yes_warning_banner(effective_state.blocked_packages.len(), json_output);
         for blocked in &effective_state.blocked_packages {
             // write-path — see the direct-approve branch above for the rationale.
-            trusted.approve_with_metadata(
-                &blocked.name,
-                &blocked.version,
-                approval_metadata_from_blocked(
-                    blocked,
-                    capability_hash.clone(),
-                    provenance_by_pkg
-                        .get(&(blocked.name.clone(), blocked.version.clone()))
-                        .cloned()
-                        .flatten(),
-                ),
+            // Phase 2.2 SILENT-DROP fix: `?` propagates a verifier
+            // rejection so the trust binding is NOT overwritten with
+            // `None` (which would silently disarm drift detection on
+            // every subsequent install).
+            let snap = snapshot_for_binding(&provenance_by_pkg, &blocked.name, &blocked.version)?;
+            let meta = approval_metadata_preserving_existing_provenance(
+                &trusted,
+                blocked,
+                capability_hash.clone(),
+                snap,
             );
+            trusted.approve_with_metadata(&blocked.name, &blocked.version, meta);
             approved.push(blocked);
         }
         // close-out short-circuit under `--dry-run`.
@@ -604,6 +753,7 @@ async fn run_under_store_lock(
             yes,
             dry_run,
             json_output,
+            Some(&provenance_by_pkg),
         );
     }
 
@@ -754,18 +904,22 @@ async fn run_under_store_lock(
     // Apply approvals (atomic single write)
     for blocked in &approved {
         // write-path — see the direct-approve branch earlier for the rationale.
-        trusted.approve_with_metadata(
-            &blocked.name,
-            &blocked.version,
-            approval_metadata_from_blocked(
-                blocked,
-                capability_hash.clone(),
-                provenance_by_pkg
-                    .get(&(blocked.name.clone(), blocked.version.clone()))
-                    .cloned()
-                    .flatten(),
-            ),
+        // SILENT-DROP fix: `?` on the verifier-rejection arm refuses
+        // to record an approval rather than blanking the prior
+        // `provenance_at_approval` and disarming drift checks.
+        // Warn-mode preservation: when the snapshot is `None` but a
+        // prior verified snapshot exists for the exact same version,
+        // preserve it rather than overwriting with `None` —
+        // otherwise a re-approval under Warn would silently clear
+        // the prior reference and disarm drift detection.
+        let snap = snapshot_for_binding(&provenance_by_pkg, &blocked.name, &blocked.version)?;
+        let meta = approval_metadata_preserving_existing_provenance(
+            &trusted,
+            blocked,
+            capability_hash.clone(),
+            snap,
         );
+        trusted.approve_with_metadata(&blocked.name, &blocked.version, meta);
     }
     // close-out under `--dry-run`, skip the atomic
     // write; `approved` / `skipped` still fed into `print_summary`
@@ -783,6 +937,7 @@ async fn run_under_store_lock(
         false,
         dry_run,
         json_output,
+        Some(&provenance_by_pkg),
     )
 }
 
@@ -1400,6 +1555,14 @@ fn print_summary(
     // approvals to run).
     dry_run: bool,
     json_output: bool,
+    // Live `ProvenanceStatus` map from the batch fetch,
+    // threaded through so each blocked entry's JSON envelope can
+    // surface `provenance.verified` per package. `None` for callers
+    // that have no map in scope (the read-only `--list` path bypasses
+    // it entirely; the per-package named approval path uses the
+    // single-entry helper directly). When `Some(_)`, the map's keys
+    // are the same `(name, version)` pairs as the blocked set.
+    provenance_by_pkg: Option<&HashMap<(String, String), ProvenanceStatus>>,
 ) -> Result<(), LpmError> {
     if json_output {
         let mut warnings: Vec<serde_json::Value> = Vec::new();
@@ -1449,8 +1612,13 @@ fn print_summary(
             // happened, so `trusted` retains the pre-run state
             // and the diff reports against the prior binding
             // identically.
-            "approved": approved.iter().map(|b| blocked_to_json(b, trusted)).collect::<Vec<_>>(),
-            "skipped": skipped.iter().map(|b| blocked_to_json(b, trusted)).collect::<Vec<_>>(),
+            // When the live ProvenanceStatus map is in scope, each
+            // entry's JSON envelope gains a `provenance` block
+            // (`verified: true | "skipped" | false | null |
+            // "verification_rejected"`). Additive — older agents
+            // that don't expect the key remain readable.
+            "approved": approved.iter().map(|b| crate::version_diff::blocked_to_json_with_provenance(b, trusted, provenance_by_pkg)).collect::<Vec<_>>(),
+            "skipped": skipped.iter().map(|b| crate::version_diff::blocked_to_json_with_provenance(b, trusted, provenance_by_pkg)).collect::<Vec<_>>(),
             "warnings": warnings,
             "errors": [],
         });
@@ -1855,26 +2023,45 @@ async fn run_global_bulk_yes(
     enforce_tiered_yes_gate(&aggregate.rows, GateScope::Global)?;
 
     // Network fetch (provenance) happens BEFORE the lock so the
-    // critical section stays bounded. Fetch failures degrade to
-    // `None` per `fetch_provenance_for_pkgs` contract.
+    // critical section stays bounded. Transport failures degrade to
+    // `ProvenanceStatus::TransportDegraded`; a verifier rejection
+    // surfaces as `VerificationRejected` (Phase 2.2 SILENT-DROP fix)
+    // and refuses the approval below.
     let pairs: Vec<(String, String)> = aggregate
         .rows
         .iter()
         .map(|r| (r.name.clone(), r.version.clone()))
         .collect();
-    let provenance = crate::provenance_fetch::fetch_provenance_for_pkgs(&pairs).await;
+    let provenance = crate::provenance_fetch::fetch_provenance_for_pkgs(
+        &pairs,
+        &crate::provenance_fetch::VerifyPolicy::resolve_no_cli(),
+    )
+    .await;
+
+    // Resolve each row's binding snapshot BEFORE entering the tx lock
+    // so a verifier rejection (which returns
+    // `Err(LpmError::ProvenanceVerification)`) fails out before we
+    // start mutating the trust store — preserving any prior binding
+    // untouched. Doing this inside the lock would still preserve the
+    // binding (the lock body returns Err without writing), but
+    // resolving outside keeps the lock window smaller and the failure
+    // path simpler to reason about.
+    let mut row_snapshots: Vec<(usize, Option<ProvenanceSnapshot>)> =
+        Vec::with_capacity(aggregate.rows.len());
+    for (idx, row) in aggregate.rows.iter().enumerate() {
+        let snap = snapshot_for_binding(&provenance, &row.name, &row.version)?;
+        row_snapshots.push((idx, snap));
+    }
 
     // Inside the tx lock — bounded read-modify-write.
     let lock_path = root.global_tx_lock();
     let root_for_body = root;
     let aggregate_for_body = aggregate;
-    let provenance_for_body = &provenance;
+    let row_snapshots_for_body = row_snapshots;
     lpm_common::with_exclusive_lock_async(lock_path, async move {
         let mut trust = lpm_global::trusted_deps::read_for(root_for_body)?;
-        for row in &aggregate_for_body.rows {
-            let snap = provenance_for_body
-                .get(&(row.name.clone(), row.version.clone()))
-                .and_then(|s| s.clone());
+        for (idx, snap) in row_snapshots_for_body {
+            let row = &aggregate_for_body.rows[idx];
             trust.insert_binding(
                 &row.name,
                 &row.version,
@@ -1906,6 +2093,34 @@ async fn run_global_bulk_yes(
                 aggregate.rows.len()
             )
         };
+        // Per-package `provenance` block for every bulk-approved
+        // row so the JSON envelope's audit trail matches the
+        // project-side `--yes` path.
+        let approved_entries: Vec<serde_json::Value> = aggregate
+            .rows
+            .iter()
+            .map(|r| {
+                let mut entry = serde_json::json!({
+                    "name": r.name,
+                    "version": r.version,
+                    "integrity": r.integrity,
+                    "script_hash": r.script_hash,
+                });
+                if let Some(status) = provenance.get(&(r.name.clone(), r.version.clone())) {
+                    let (verified, rejection_reason) = status.to_json_verified();
+                    let mut prov = serde_json::Map::new();
+                    prov.insert("verified".into(), verified);
+                    if let Some(reason) = rejection_reason {
+                        prov.insert("rejection_reason".into(), serde_json::Value::String(reason));
+                    }
+                    entry
+                        .as_object_mut()
+                        .unwrap()
+                        .insert("provenance".into(), serde_json::Value::Object(prov));
+                }
+                entry
+            })
+            .collect();
         let mut body = serde_json::json!({
             "schema_version": SCHEMA_VERSION,
             "command": "approve-scripts",
@@ -1914,6 +2129,7 @@ async fn run_global_bulk_yes(
             "blocked_count": aggregate.rows.len(),
             "approved_count": aggregate.rows.len(),
             "skipped_count": 0,
+            "approved": approved_entries,
             "warnings": [warning],
             "errors": [],
         });
@@ -2000,11 +2216,15 @@ async fn run_global_named(
 
     // fetch provenance OUTSIDE the tx lock so a slow
     // network response doesn't block parallel `--global` invocations.
+    // Phase 2.2 SILENT-DROP fix: `?` propagates a verifier rejection
+    // BEFORE acquiring the lock, leaving any prior binding intact.
     let pairs = vec![(row.name.clone(), row.version.clone())];
-    let provenance = crate::provenance_fetch::fetch_provenance_for_pkgs(&pairs).await;
-    let snap = provenance
-        .get(&(row.name.clone(), row.version.clone()))
-        .and_then(|s| s.clone());
+    let provenance = crate::provenance_fetch::fetch_provenance_for_pkgs(
+        &pairs,
+        &crate::provenance_fetch::VerifyPolicy::resolve_no_cli(),
+    )
+    .await;
+    let snap = snapshot_for_binding(&provenance, &row.name, &row.version)?;
 
     let lock_path = root.global_tx_lock();
     let root_for_body = root;
@@ -2033,6 +2253,29 @@ async fn run_global_named(
     let origins = union_origins(std::iter::once(row));
 
     if json_output {
+        // Surface the per-package `provenance.verified` alongside
+        // the existing identity fields. Derived from the same
+        // `ProvenanceStatus` map the binding-write path consulted,
+        // so the JSON envelope and the trust binding stay mutually
+        // consistent.
+        let mut approved_entry = serde_json::json!({
+            "name": row.name,
+            "version": row.version,
+            "integrity": row.integrity,
+            "script_hash": row.script_hash,
+        });
+        if let Some(status) = provenance.get(&(row.name.clone(), row.version.clone())) {
+            let (verified, rejection_reason) = status.to_json_verified();
+            let mut prov = serde_json::Map::new();
+            prov.insert("verified".into(), verified);
+            if let Some(reason) = rejection_reason {
+                prov.insert("rejection_reason".into(), serde_json::Value::String(reason));
+            }
+            approved_entry
+                .as_object_mut()
+                .unwrap()
+                .insert("provenance".into(), serde_json::Value::Object(prov));
+        }
         let mut body = serde_json::json!({
             "schema_version": SCHEMA_VERSION,
             "command": "approve-scripts",
@@ -2041,12 +2284,7 @@ async fn run_global_named(
             "approved_count": 1,
             "skipped_count": 0,
             "blocked_count": aggregate.rows.len(),
-            "approved": [{
-                "name": row.name,
-                "version": row.version,
-                "integrity": row.integrity,
-                "script_hash": row.script_hash,
-            }],
+            "approved": [approved_entry],
             "warnings": [],
             "errors": [],
         });
@@ -2269,7 +2507,11 @@ async fn run_global_interactive(
         .iter()
         .map(|r| (r.name.clone(), r.version.clone()))
         .collect();
-    let provenance = crate::provenance_fetch::fetch_provenance_for_pkgs(&pairs).await;
+    let provenance = crate::provenance_fetch::fetch_provenance_for_pkgs(
+        &pairs,
+        &crate::provenance_fetch::VerifyPolicy::resolve_no_cli(),
+    )
+    .await;
 
     let mut approved: Vec<&crate::global_blocked_set::AggregateBlockedRow> = Vec::new();
     let mut skipped: Vec<&crate::global_blocked_set::AggregateBlockedRow> = Vec::new();
@@ -2332,9 +2574,12 @@ async fn run_global_interactive(
                         continue;
                     }
                     for row in &rows {
-                        let snap = provenance
-                            .get(&(row.name.clone(), row.version.clone()))
-                            .and_then(|s| s.clone());
+                        // Phase 2.2 SILENT-DROP fix: a verifier
+                        // rejection on any row in this group aborts
+                        // the entire `approve_all` action with a clear
+                        // error, leaving any prior bindings for the
+                        // remaining rows untouched.
+                        let snap = snapshot_for_binding(&provenance, &row.name, &row.version)?;
                         commit_global_approval(root, row, snap, dry_run).await?;
                         approved.push(*row);
                         decided.insert(AggregateRowKey::from_row(row));
@@ -2365,9 +2610,9 @@ async fn run_global_interactive(
 
                         match row_choice {
                             "approve" => {
-                                let snap = provenance
-                                    .get(&(row.name.clone(), row.version.clone()))
-                                    .and_then(|s| s.clone());
+                                // Phase 2.2 SILENT-DROP fix.
+                                let snap =
+                                    snapshot_for_binding(&provenance, &row.name, &row.version)?;
                                 commit_global_approval(root, row, snap, dry_run).await?;
                                 approved.push(row);
                                 decided.insert(key);
@@ -2447,9 +2692,8 @@ async fn run_global_interactive(
 
         match choice {
             "approve" => {
-                let snap = provenance
-                    .get(&(row.name.clone(), row.version.clone()))
-                    .and_then(|s| s.clone());
+                // Phase 2.2 SILENT-DROP fix.
+                let snap = snapshot_for_binding(&provenance, &row.name, &row.version)?;
                 // per-row write goes through `commit_global_approval`,
                 // which acquires the global tx lock and re-reads trust
                 // from disk so the commit is race-safe against parallel
@@ -2522,9 +2766,235 @@ fn print_aggregate_card(row: &crate::global_blocked_set::AggregateBlockedRow) {
 mod tests {
     use super::*;
     use crate::build_state::{BUILD_STATE_VERSION, BlockedPackage, BuildState};
+    use crate::provenance_fetch::EnforceMode;
     use lpm_workspace::TrustedDependencyBinding;
     use std::fs;
     use tempfile::tempdir;
+
+    // ── snapshot_for_binding_with_mode (Phase 2.2.b rollout knob) ───
+
+    fn verified_status() -> ProvenanceStatus {
+        ProvenanceStatus::Verified(ProvenanceSnapshot {
+            present: true,
+            publisher: Some("github:axios/axios".into()),
+            workflow_path: Some(".github/workflows/publish.yml".into()),
+            workflow_ref: Some("refs/tags/v1.14.0".into()),
+            attestation_cert_sha256: Some("sha256-leaf-aaa".into()),
+        })
+    }
+
+    fn map_with(
+        name: &str,
+        version: &str,
+        status: ProvenanceStatus,
+    ) -> HashMap<(String, String), ProvenanceStatus> {
+        let mut m = HashMap::new();
+        m.insert((name.to_string(), version.to_string()), status);
+        m
+    }
+
+    /// Verified bundles project identically under both modes — the
+    /// mode only gates the rejection arm.
+    #[test]
+    fn snapshot_for_binding_verified_projects_under_both_modes() {
+        let map = map_with("axios", "1.14.0", verified_status());
+        let deny = snapshot_for_binding_with_mode(&map, "axios", "1.14.0", EnforceMode::Deny)
+            .expect("Verified must succeed under Deny");
+        let warn = snapshot_for_binding_with_mode(&map, "axios", "1.14.0", EnforceMode::Warn)
+            .expect("Verified must succeed under Warn");
+        assert_eq!(deny, warn);
+        assert!(deny.is_some());
+    }
+
+    /// Under `Deny` (default production posture), a
+    /// `VerificationRejected` status returns
+    /// `Err(LpmError::ProvenanceVerification(_))` so the caller's
+    /// `?` short-circuits the approval. The prior trust binding (if
+    /// any) is preserved by the caller's read-modify-write NOT
+    /// executing.
+    #[test]
+    fn snapshot_for_binding_deny_refuses_on_verification_rejected() {
+        let map = map_with(
+            "axios",
+            "1.14.1",
+            ProvenanceStatus::VerificationRejected {
+                reason: "DSSE signature mismatch".into(),
+            },
+        );
+        let err = snapshot_for_binding_with_mode(&map, "axios", "1.14.1", EnforceMode::Deny)
+            .expect_err("Deny mode must refuse on VerificationRejected");
+        assert!(matches!(err, LpmError::ProvenanceVerification(_)));
+        let msg = err.to_string();
+        assert!(
+            msg.contains("axios") && msg.contains("1.14.1"),
+            "error must name the package + version, got: {msg}",
+        );
+        assert!(
+            msg.contains("DSSE signature mismatch"),
+            "underlying verifier reason must propagate, got: {msg}",
+        );
+    }
+
+    /// Under `Warn` (rollout-window posture), a
+    /// `VerificationRejected` status returns `Ok(None)` so the
+    /// approval can proceed without a fresh verifier observation.
+    /// This is only one half of the warn-mode contract: the write
+    /// path then runs `approval_metadata_preserving_existing_provenance`
+    /// which substitutes the prior `provenance_at_approval` if one
+    /// exists, so a re-approval under Warn does NOT clear a
+    /// previously-verified snapshot. The preservation behavior is
+    /// pinned by
+    /// `approval_metadata_preserving_existing_provenance_preserves_prior_snapshot_on_none`
+    /// below; this test pins only the snapshot-projection seam.
+    #[test]
+    fn snapshot_for_binding_warn_returns_none_on_verification_rejected() {
+        let map = map_with(
+            "axios",
+            "1.14.1",
+            ProvenanceStatus::VerificationRejected {
+                reason: "Rekor SET verification failed".into(),
+            },
+        );
+        let result = snapshot_for_binding_with_mode(&map, "axios", "1.14.1", EnforceMode::Warn)
+            .expect("Warn mode must allow the approval through");
+        assert!(
+            result.is_none(),
+            "Warn mode records None (no verified identity) — the loud warn log is the operator contract",
+        );
+    }
+
+    /// `Absent` and `TransportDegraded` are unchanged by the mode —
+    /// they're not attack signals, so the rollout knob doesn't gate
+    /// them.
+    #[test]
+    fn snapshot_for_binding_non_rejection_statuses_ignore_mode() {
+        let absent_map = map_with("pkg", "1.0.0", ProvenanceStatus::Absent);
+        let transport_map = map_with("pkg", "1.0.0", ProvenanceStatus::TransportDegraded);
+        for mode in [EnforceMode::Deny, EnforceMode::Warn] {
+            let absent = snapshot_for_binding_with_mode(&absent_map, "pkg", "1.0.0", mode)
+                .expect("Absent must project under both modes");
+            let snap = absent.expect("Absent projects to Some(present:false)");
+            assert!(!snap.present);
+
+            let transport = snapshot_for_binding_with_mode(&transport_map, "pkg", "1.0.0", mode)
+                .expect("TransportDegraded must project under both modes");
+            assert!(transport.is_none());
+        }
+    }
+
+    /// A package missing from the batch map projects to `Ok(None)`
+    /// under both modes — same as the pre-rollout shape. The mode
+    /// only gates statuses that are present in the map.
+    #[test]
+    fn snapshot_for_binding_missing_pkg_projects_to_none_under_both_modes() {
+        let map: HashMap<(String, String), ProvenanceStatus> = HashMap::new();
+        for mode in [EnforceMode::Deny, EnforceMode::Warn] {
+            let r = snapshot_for_binding_with_mode(&map, "pkg", "1.0.0", mode)
+                .expect("missing pkg projects to Ok(None) regardless of mode");
+            assert!(r.is_none());
+        }
+    }
+
+    /// Load-bearing warn-mode regression guard: when the snapshot
+    /// projection returns `None` (Warn + VerificationRejected, or
+    /// any TransportDegraded), an existing exact-version binding's
+    /// `provenance_at_approval` MUST be preserved rather than
+    /// overwritten. Re-approving the same version with a `None`
+    /// snapshot must not silently clear the prior verified identity
+    /// and disarm drift detection.
+    #[test]
+    fn approval_metadata_preserving_existing_provenance_preserves_prior_snapshot_on_none() {
+        let prior_snap = ProvenanceSnapshot {
+            present: true,
+            publisher: Some("github:acme/widget".into()),
+            workflow_path: Some(".github/workflows/publish.yml".into()),
+            workflow_ref: Some("refs/tags/v1.0.0".into()),
+            attestation_cert_sha256: Some("sha256-leaf-prior".into()),
+        };
+        let mut trusted = TrustedDependencies::default();
+        trusted.approve_with_metadata(
+            "acme-widget",
+            "1.0.0",
+            ApprovalMetadata {
+                integrity: Some("sha512-prior".into()),
+                script_hash: Some("sha256-prior".into()),
+                provenance_at_approval: Some(prior_snap.clone()),
+                behavioral_tags_hash: None,
+                behavioral_tags: None,
+                capability_hash: None,
+            },
+        );
+
+        let blocked = make_blocked("acme-widget", "1.0.0");
+        let meta = approval_metadata_preserving_existing_provenance(&trusted, &blocked, None, None);
+        let preserved = meta
+            .provenance_at_approval
+            .expect("preservation must substitute prior snapshot when incoming is None");
+        assert_eq!(preserved.publisher.as_deref(), Some("github:acme/widget"));
+        assert_eq!(
+            preserved.attestation_cert_sha256.as_deref(),
+            Some("sha256-leaf-prior"),
+            "preserved snapshot must be the exact prior binding's snapshot, byte-for-byte",
+        );
+    }
+
+    /// A fresh Verified observation always wins over the prior
+    /// snapshot. Without this assertion the preservation logic
+    /// could mask a legitimate identity change (publisher rotated,
+    /// workflow path moved) by sticking with the stale prior value.
+    #[test]
+    fn approval_metadata_preserving_existing_provenance_lets_fresh_verified_win() {
+        let prior_snap = ProvenanceSnapshot {
+            present: true,
+            publisher: Some("github:acme/widget".into()),
+            attestation_cert_sha256: Some("sha256-leaf-prior".into()),
+            ..Default::default()
+        };
+        let mut trusted = TrustedDependencies::default();
+        trusted.approve_with_metadata(
+            "acme-widget",
+            "1.0.0",
+            ApprovalMetadata {
+                provenance_at_approval: Some(prior_snap.clone()),
+                ..Default::default()
+            },
+        );
+
+        let new_snap = ProvenanceSnapshot {
+            present: true,
+            publisher: Some("github:acme/widget".into()),
+            attestation_cert_sha256: Some("sha256-leaf-NEW".into()),
+            ..Default::default()
+        };
+        let blocked = make_blocked("acme-widget", "1.0.0");
+        let meta = approval_metadata_preserving_existing_provenance(
+            &trusted,
+            &blocked,
+            None,
+            Some(new_snap.clone()),
+        );
+        assert_eq!(
+            meta.provenance_at_approval
+                .expect("incoming Some must pass through")
+                .attestation_cert_sha256
+                .as_deref(),
+            Some("sha256-leaf-NEW"),
+            "fresh Verified snapshot must replace the prior — preservation only fires on None",
+        );
+    }
+
+    /// First-time approval (no prior binding) with a `None` incoming
+    /// snapshot still records `None` — there's nothing to preserve.
+    #[test]
+    fn approval_metadata_preserving_existing_provenance_passes_none_through_on_first_approval() {
+        let trusted = TrustedDependencies::default();
+        let blocked = make_blocked("first-time-pkg", "1.0.0");
+        let meta = approval_metadata_preserving_existing_provenance(&trusted, &blocked, None, None);
+        assert!(
+            meta.provenance_at_approval.is_none(),
+            "first-time approval with no prior binding has nothing to preserve",
+        );
+    }
 
     fn write_manifest(path: &Path, value: &serde_json::Value) {
         fs::write(path, serde_json::to_string_pretty(value).unwrap()).unwrap();
