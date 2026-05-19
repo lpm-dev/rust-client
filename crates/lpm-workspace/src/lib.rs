@@ -1285,19 +1285,32 @@ impl TrustedDependencies {
     /// - [`TrustMatch::BindingDrift`] if a Rich entry exists for the
     ///   `name@version` key but at least one binding field is set on BOTH
     ///   sides and they differ.
-    /// - [`TrustMatch::LegacyNameOnly`] if the Legacy variant contains the
-    ///   bare `name` string, OR if the Rich variant contains a `<name>@*`
-    ///   preserve key (the migration sentinel from [`Self::upgrade_to_rich`]).
-    ///   Caller should warn about deprecation.
+    /// - [`TrustMatch::LegacyNameOnly`] if and only if the Legacy
+    ///   `Vec<String>` variant contains the bare `name` string. Caller
+    ///   should warn about deprecation.
     /// - [`TrustMatch::NotTrusted`] otherwise.
     ///
-    /// The `<name>@*` preserve-key path is essential: without it, a manifest
-    /// like `["esbuild"]` would lose esbuild's approval on the first
-    /// `lpm approve-scripts --yes` upgrade (which rewrites it to `esbuild@*`)
-    /// because the strict gate would only match concrete version keys.
+    /// **`<name>@*` Rich-form sentinels are NOT honored by this strict
+    /// gate.** A `name@*` entry is the migration marker [`Self::upgrade_to_rich`]
+    /// writes when transferring a legacy `Vec<String>` approval into the
+    /// Rich form — at that point no concrete `(integrity, script_hash)`
+    /// binding exists yet. Honoring `@*` as `LegacyNameOnly` here would
+    /// auto-trust every future version of the package under the
+    /// inherited name-only approval, which is a cross-version trust
+    /// laundering surface: an attacker who compromises a previously-
+    /// approved maintainer's publish flow ships a malicious v1.0.1
+    /// that inherits v1.0.0's approval token without integrity or
+    /// script_hash checks. The user is forced through `lpm approve-scripts`
+    /// on each new version, which writes a concrete `name@version`
+    /// entry that closes the loop. `Vec<String>` legacy form is
+    /// preserved as `LegacyNameOnly` because that shape is an explicit
+    /// user-authored decision in the manifest, distinct from the
+    /// auto-generated `@*` sentinel.
     ///
-    /// **Lookup precedence:** the concrete `name@version` key wins over the
-    /// `name@*` preserve key when both exist for the same name.
+    /// **Lookup precedence:** concrete `name@version` Rich keys are the
+    /// only Rich-form keys that participate in the strict trust decision.
+    /// `name@*` sentinels are still walked by [`Self::contains_name_lenient`]
+    /// for non-trust-decision use cases (e.g., the deprecation warning).
     pub fn matches_strict(
         &self,
         name: &str,
@@ -1314,7 +1327,13 @@ impl TrustedDependencies {
                 }
             }
             TrustedDependencies::Rich(map) => {
-                // Step 1: try the concrete `name@version` key first.
+                // Concrete `name@version` is the only Rich-form key that
+                // participates in the strict trust decision. A `name@*`
+                // sentinel is an auto-generated migration marker; honoring
+                // it here would auto-trust every future version of the
+                // package under the inherited name-only approval. See the
+                // method docstring for the cross-version trust laundering
+                // rationale.
                 let concrete_key = Self::rich_key(name, version);
                 if let Some(stored) = map.get(&concrete_key) {
                     // Field-by-field check. A None field on either side is
@@ -1335,16 +1354,6 @@ impl TrustedDependencies {
                         };
                     }
                     return TrustMatch::Strict;
-                }
-
-                // Step 2: fall back to the `<name>@*` preserve key. This is
-                // the legacy-upgrade migration path. The bindings on these
-                // entries are intentionally None — they encode "trust this
-                // name only" without integrity/script_hash constraints, so
-                // they MUST NOT be checked for drift.
-                let star_key = format!("{name}@*");
-                if map.contains_key(&star_key) {
-                    return TrustMatch::LegacyNameOnly;
                 }
 
                 TrustMatch::NotTrusted
@@ -1377,22 +1386,17 @@ impl TrustedDependencies {
     /// `lpm_cli::capability::CapabilitySet::is_approved_by`.
     ///
     /// Lookup precedence mirrors [`Self::matches_strict`]:
-    /// - Rich entries: concrete `{name}@{version}` key wins; the
-    ///   `{name}@*` preserve-key fallback is the secondary match.
+    /// - Rich entries: only the concrete `{name}@{version}` key matches.
+    ///   `name@*` migration sentinels are NOT considered a binding source
+    ///   for capability decisions — same cross-version trust laundering
+    ///   rationale as [`Self::matches_strict`].
     /// - Legacy entries: returns `None` — the legacy form has no binding.
     ///   Callers treat `None` as "legacy approval, no capability hash stored,"
     ///   which collapses via `is_approved_by` to the baseline-only semantic.
     pub fn get_binding(&self, name: &str, version: &str) -> Option<&TrustedDependencyBinding> {
         match self {
             TrustedDependencies::Legacy(_) => None,
-            TrustedDependencies::Rich(map) => {
-                let concrete_key = Self::rich_key(name, version);
-                if let Some(b) = map.get(&concrete_key) {
-                    return Some(b);
-                }
-                let star_key = format!("{name}@*");
-                map.get(&star_key)
-            }
+            TrustedDependencies::Rich(map) => map.get(&Self::rich_key(name, version)),
         }
     }
 
@@ -1433,11 +1437,15 @@ impl TrustedDependencies {
     /// that the manifest write path is uniform.
     ///
     /// Existing legacy entries are preserved as Rich entries with no
-    /// version pin (key = `<name>@*`) and no binding metadata. The next
-    /// install will continue to honor them via `LegacyNameOnly` because
-    /// `contains_name_lenient` walks the keys correctly. New approvals
-    /// inserted after the upgrade get full `name@version` keys with
-    /// integrity + script_hash bindings.
+    /// version pin (key = `<name>@*`) and no binding metadata. These
+    /// sentinels are visible to [`Self::contains_name_lenient`] so the
+    /// "still approved by name" deprecation warning continues to fire,
+    /// but they DO NOT participate in the strict trust gate
+    /// ([`Self::matches_strict`]) — see that method's doc for the
+    /// cross-version trust laundering rationale. The next install of
+    /// any concrete version forces the user through `lpm approve-scripts`,
+    /// which writes a full `name@version` Rich entry that REPLACES the
+    /// sentinel-only trust with content-bound trust.
     pub fn upgrade_to_rich(&mut self) {
         if matches!(self, TrustedDependencies::Rich(_)) {
             return;
@@ -4004,25 +4012,32 @@ mod trusted_dependencies_tests {
             td.matches_strict("esbuild", "0.25.1", Some("sha512-x"), Some("sha256-y")),
             TrustMatch::Strict
         );
-        // Strict lookup finds sharp as LegacyNameOnly via the `@*` preserve
-        // key — the audit fix. Pre-fix this returned `NotTrusted` and the
-        // build pipeline re-blocked sharp on the next install.
+        // Strict lookup of sharp returns NotTrusted: the `@*` migration
+        // sentinel does NOT participate in the strict trust gate. The user
+        // must re-approve sharp via `lpm approve-scripts` on the next
+        // install, which writes a concrete `sharp@0.33.0` Rich entry that
+        // binds the trust to the specific (integrity, script_hash) tuple.
+        // Honoring the sentinel here would auto-trust every future version
+        // of sharp under the inherited name-only approval (cross-version
+        // trust laundering).
         assert_eq!(
             td.matches_strict("sharp", "0.33.0", Some("sha512-z"), Some("sha256-z")),
-            TrustMatch::LegacyNameOnly,
-            "legacy `@*` preserve keys MUST satisfy the strict gate as \
-             LegacyNameOnly so users keep their legacy approvals through \
-             the upgrade. The build pipeline emits a deprecation warning so \
-             users still get nudged to upgrade to a strict binding."
+            TrustMatch::NotTrusted,
+            "`name@*` migration sentinels MUST NOT auto-trust unknown \
+             versions. `contains_name_lenient` still walks the sentinel \
+             so the deprecation warning fires."
         );
+        // The sentinel IS still visible to lenient lookups (used by the
+        // deprecation warning and the stale-trustedDependencies surface).
+        assert!(td.contains_name_lenient("sharp"));
     }
 
-    /// A `<name>@*` preserve key in a Rich variant must match ANY version of
-    /// the named package as `LegacyNameOnly`. Tests the matcher in isolation.
+    /// A `<name>@*` Rich-form sentinel MUST NOT auto-trust any concrete
+    /// version. The user is forced through `lpm approve-scripts` on
+    /// each new version of the package, which writes a content-bound
+    /// `name@version` Rich entry that REPLACES the sentinel-only trust.
     #[test]
-    fn matches_strict_handles_at_star_preserve_key_as_legacy_wildcard() {
-        // Construct a Rich variant directly with a `@*` preserve key
-        // (the upgrade_to_rich migration sentinel).
+    fn matches_strict_at_star_sentinel_does_not_auto_trust_any_version() {
         let mut map = HashMap::new();
         map.insert(
             "esbuild@*".to_string(),
@@ -4034,27 +4049,24 @@ mod trusted_dependencies_tests {
         );
         let td = TrustedDependencies::Rich(map);
 
-        // Any concrete version matches as LegacyNameOnly
         for version in &["0.25.1", "0.25.2", "1.0.0", "0.0.0-beta.1"] {
             assert_eq!(
                 td.matches_strict("esbuild", version, None, None),
-                TrustMatch::LegacyNameOnly,
-                "version {version} must match the @* preserve key"
+                TrustMatch::NotTrusted,
+                "version {version}: `@*` sentinel must not auto-trust"
             );
         }
-        // A different name must NOT match
-        assert_eq!(
-            td.matches_strict("sharp", "0.33.0", None, None),
-            TrustMatch::NotTrusted,
-            "@* keys are still scoped by name"
-        );
+
+        // contains_name_lenient still walks the sentinel — used by
+        // non-trust-decision surfaces like the deprecation warning.
+        assert!(td.contains_name_lenient("esbuild"));
     }
 
-    /// A scoped package preserved as `@scope/pkg@*` must be matched as
-    /// `LegacyNameOnly`. The `@*` parser must split on the LAST `@`, not
-    /// the first.
+    /// A scoped package whose only Rich entry is the `@scope/pkg@*`
+    /// sentinel must also return NotTrusted for concrete versions —
+    /// scoped names follow the same rule as bare names.
     #[test]
-    fn matches_strict_at_star_preserve_key_handles_scoped_package_names() {
+    fn matches_strict_at_star_sentinel_does_not_auto_trust_scoped_package() {
         let mut map = HashMap::new();
         map.insert(
             "@scope/pkg@*".to_string(),
@@ -4063,14 +4075,16 @@ mod trusted_dependencies_tests {
         let td = TrustedDependencies::Rich(map);
         assert_eq!(
             td.matches_strict("@scope/pkg", "1.2.3", None, None),
-            TrustMatch::LegacyNameOnly
+            TrustMatch::NotTrusted
         );
+        assert!(td.contains_name_lenient("@scope/pkg"));
     }
 
-    /// A concrete `name@version` rich entry must be preferred over a `name@*`
-    /// legacy preserve key when both exist: the strict binding wins.
+    /// A concrete `name@version` Rich entry is still honored when the
+    /// `name@*` sentinel exists alongside it. The sentinel doesn't grant
+    /// trust, but it doesn't break trust that the concrete entry grants.
     #[test]
-    fn matches_strict_prefers_concrete_version_key_over_at_star_for_same_name() {
+    fn matches_strict_concrete_entry_works_alongside_at_star_sentinel() {
         let mut map = HashMap::new();
         map.insert("esbuild@*".to_string(), TrustedDependencyBinding::default());
         map.insert(
@@ -4083,15 +4097,18 @@ mod trusted_dependencies_tests {
         );
         let td = TrustedDependencies::Rich(map);
 
-        // Concrete version + matching binding → Strict
+        // Concrete version + matching binding → Strict (unchanged).
         assert_eq!(
             td.matches_strict("esbuild", "0.25.1", Some("sha512-x"), Some("sha256-y")),
             TrustMatch::Strict
         );
-        // Different version → falls through to the @* preserve key
+        // Different version → NotTrusted. The `@*` sentinel does NOT
+        // grant trust to versions the user has not concretely approved.
         assert_eq!(
             td.matches_strict("esbuild", "0.25.2", None, None),
-            TrustMatch::LegacyNameOnly
+            TrustMatch::NotTrusted,
+            "the @* sentinel does NOT auto-trust unknown versions, even \
+             when a sibling concrete version is approved"
         );
         // Concrete version + DRIFTED binding → still BindingDrift on the
         // concrete entry (the @* key does NOT silently mask drift on the

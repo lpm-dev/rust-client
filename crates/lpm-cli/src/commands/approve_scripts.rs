@@ -4382,11 +4382,14 @@ mod tests {
     }
 
     /// **AUDIT REGRESSION ( +  interaction):**
-    /// after a legacy upgrade, an `<name>@*` preserve key must be
-    /// honored by the effective-blocked-set filter. This is the
-    /// composition test for both fixes.
+    /// After `upgrade_to_rich` writes a `<name>@*` migration sentinel
+    /// for a previously-legacy approval, the package MUST remain in
+    /// the effective blocked set until the user concretely approves
+    /// the specific version via `lpm approve-scripts`. Honoring the
+    /// sentinel here would auto-trust every future version under the
+    /// inherited name-only approval (cross-version trust laundering).
     #[test]
-    fn compute_effective_blocked_set_honors_at_star_preserve_key() {
+    fn compute_effective_blocked_set_keeps_package_blocked_under_at_star_sentinel() {
         let state = BuildState {
             state_version: BUILD_STATE_VERSION,
             blocked_set_fingerprint: "sha256-test".into(),
@@ -4394,7 +4397,7 @@ mod tests {
             blocked_packages: vec![make_blocked("esbuild", "0.25.1")],
             drift_ignore_override: None,
         };
-        // Simulate post-upgrade state: legacy esbuild → esbuild@*
+        // Simulate post-upgrade state: legacy esbuild → esbuild@* sentinel
         let mut td = TrustedDependencies::Legacy(vec!["esbuild".into()]);
         td.upgrade_to_rich();
 
@@ -4404,10 +4407,15 @@ mod tests {
             &crate::capability::CapabilitySet::default(),
             &crate::capability::UserBound::default(),
         );
-        assert!(
-            effective.is_empty(),
-            "after legacy upgrade, esbuild@* preserve key must satisfy the filter"
+        assert_eq!(
+            effective.len(),
+            1,
+            "esbuild@* sentinel must NOT clear esbuild@0.25.1 from the \
+             blocked set — the user must explicitly approve the concrete \
+             version via `lpm approve-scripts`, which writes a strict \
+             `esbuild@0.25.1` binding"
         );
+        assert_eq!(effective[0].name, "esbuild");
     }
 
     /// **AUDIT REGRESSION ():** `--list` must NOT include
