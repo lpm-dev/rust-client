@@ -2563,6 +2563,15 @@ async fn async_main() -> Result<()> {
         registry.init();
     }
 
+    // Startup gate for `LPM_PROVENANCE_ENFORCE`: an unknown value
+    // (typo, stale spelling from an older release) must hard-fail
+    // here rather than silently downgrading to the default `Deny`.
+    // Otherwise an operator who set `LPM_PROVENANCE_ENFORCE=warm`
+    // thinking it means `warn` would get the fail-closed posture
+    // they did NOT ask for, with no signal that their intent
+    // didn't take effect.
+    provenance_fetch::EnforceMode::validate_from_env()?;
+
     let registry_url = cli
         .registry
         .as_deref()

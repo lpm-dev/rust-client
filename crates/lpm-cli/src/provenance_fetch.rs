@@ -215,6 +215,38 @@ impl EnforceMode {
         }
     }
 
+    /// Startup gate for the `LPM_PROVENANCE_ENFORCE` env var:
+    /// unknown values hard-fail with an explicit `LpmError::Config`
+    /// listing the three valid options.
+    ///
+    /// The internal [`Self::from_env_value`] / [`Self::resolve_from_chain`]
+    /// path falls back to `Deny` on unknown values (defense-in-depth
+    /// so a code path that bypasses validation cannot weaken posture).
+    /// This gate is the operator-visible enforcement: a typo'd env
+    /// var produces a clear error at process start naming the bad
+    /// value and the valid set, rather than silently downgrading the
+    /// security posture the operator intended.
+    pub fn validate_env_value(value: Option<&str>) -> Result<(), LpmError> {
+        match value {
+            None | Some("deny") | Some("warn") | Some("off") => Ok(()),
+            // The sigstore wizard at commands/config.rs uses
+            // `LpmError::Registry` for the same shape of invalid-value
+            // rejection (`lpm config sigstore --set <bad>`); mirror that
+            // so operators get a uniform diagnostic surface.
+            Some(other) => Err(LpmError::Registry(format!(
+                "LPM_PROVENANCE_ENFORCE has unknown value `{other}`; \
+                 must be one of: deny | warn | off"
+            ))),
+        }
+    }
+
+    /// Read `LPM_PROVENANCE_ENFORCE` from the process environment and
+    /// validate it. Returns `Err(LpmError::Config)` for unknown
+    /// values so the caller can short-circuit with a clear message.
+    pub fn validate_from_env() -> Result<(), LpmError> {
+        Self::validate_env_value(std::env::var("LPM_PROVENANCE_ENFORCE").ok().as_deref())
+    }
+
     /// Walk the precedence chain: env > config > default. The CLI
     /// flag tier is not threaded here because the flag axis is
     /// `SkipPolicy` (per-package), not enforce-mode — those two
@@ -1635,15 +1667,49 @@ mod tests {
         assert_eq!(EnforceMode::from_env_value(Some("off")), EnforceMode::Off);
     }
 
-    /// Unknown values must fall back to fail-closed `Deny` so a typo
-    /// in the env var never silently weakens the posture.
+    /// Unknown values still fall back to fail-closed `Deny` at the
+    /// internal parser layer (defense-in-depth) — but the
+    /// operator-visible enforcement is the
+    /// [`EnforceMode::validate_env_value`] startup gate, which
+    /// hard-fails with [`LpmError::Registry`] so a typo never
+    /// silently downgrades the posture.
     #[test]
-    fn enforce_mode_unknown_value_falls_back_to_deny() {
+    fn enforce_mode_unknown_value_falls_back_to_deny_internally() {
         assert_eq!(
             EnforceMode::from_env_value(Some("yolo")),
             EnforceMode::Deny,
-            "unknown env value MUST fall back to fail-closed default",
+            "internal parser must fall back to fail-closed default; \
+             the startup validator catches the typo separately",
         );
+    }
+
+    #[test]
+    fn validate_env_value_accepts_the_three_canonical_values() {
+        EnforceMode::validate_env_value(Some("deny")).expect("`deny` must validate");
+        EnforceMode::validate_env_value(Some("warn")).expect("`warn` must validate");
+        EnforceMode::validate_env_value(Some("off")).expect("`off` must validate");
+        EnforceMode::validate_env_value(None).expect("absent env var must validate (unset)");
+    }
+
+    #[test]
+    fn validate_env_value_hard_fails_on_typo_and_names_the_valid_set() {
+        let err = EnforceMode::validate_env_value(Some("warm"))
+            .expect_err("typo'd value MUST hard-fail; silent default-fallback was the bug");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("warm"),
+            "error must quote the offending value; got: {msg}",
+        );
+        assert!(
+            msg.contains("deny") && msg.contains("warn") && msg.contains("off"),
+            "error must name all three valid values so the operator can fix the typo; got: {msg}",
+        );
+    }
+
+    #[test]
+    fn validate_env_value_rejects_empty_string() {
+        EnforceMode::validate_env_value(Some(""))
+            .expect_err("empty string is not the same as absent — must hard-fail");
     }
 
     /// Precedence chain: env wins over config wins over default.
