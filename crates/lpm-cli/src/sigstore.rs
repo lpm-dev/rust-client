@@ -349,14 +349,37 @@ pub struct RekorInclusionProof {
     /// Sibling hashes along the Merkle path from leaf to root.
     pub hashes: Vec<String>,
 
-    #[serde(rename = "logIndex")]
+    // Sigstore Bundle v0.3 protobuf JSON encodes int64 as JSON
+    // strings (JS-interop convention); LPM's own publish path emits
+    // bare numbers. Accept both via `de_i64_from_str_or_num`.
+    #[serde(rename = "logIndex", deserialize_with = "de_i64_from_str_or_num")]
     pub log_index: i64,
 
     #[serde(rename = "rootHash")]
     pub root_hash: String,
 
-    #[serde(rename = "treeSize")]
+    #[serde(rename = "treeSize", deserialize_with = "de_i64_from_str_or_num")]
     pub tree_size: i64,
+}
+
+/// Accept i64 as either a bare JSON number (LPM publish path) or a
+/// JSON string (Sigstore Bundle v0.3 protobuf JSON encoding, which
+/// strings int64 to avoid JS precision loss).
+fn de_i64_from_str_or_num<'de, D>(deserializer: D) -> Result<i64, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::Deserialize;
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum StrOrNum {
+        Num(i64),
+        Str(String),
+    }
+    match StrOrNum::deserialize(deserializer)? {
+        StrOrNum::Num(n) => Ok(n),
+        StrOrNum::Str(s) => s.parse().map_err(serde::de::Error::custom),
+    }
 }
 
 /// Run the complete Sigstore signing flow against the public Fulcio /

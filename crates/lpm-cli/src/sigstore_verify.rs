@@ -412,42 +412,6 @@ fn extract_p256_verifying_key(cert: &X509Certificate<'_>) -> Result<VerifyingKey
 // payload swapped in" and "Rekor entry from a different signer swapped
 // in" without coupling install-side verification to publish-side JSON.
 
-/// Top-level shape of an in-toto Rekor entry. `apiVersion` decides
-/// how to read `spec.content.envelope`; `kind` must be `"intoto"`.
-#[derive(Debug, serde::Deserialize)]
-struct RekorIntotoBody {
-    #[serde(rename = "apiVersion")]
-    api_version: String,
-    kind: String,
-    spec: RekorIntotoSpec,
-}
-
-#[derive(Debug, serde::Deserialize)]
-struct RekorIntotoSpec {
-    content: RekorIntotoContent,
-}
-
-#[derive(Debug, serde::Deserialize)]
-struct RekorIntotoContent {
-    /// 0.0.2 puts an envelope object here; 0.0.1 puts a base64-encoded
-    /// string of the envelope JSON. Kept as `Value` so a single
-    /// deserialization handles both shapes — version-specific reading
-    /// happens in [`extract_inner_envelope_object`].
-    envelope: serde_json::Value,
-
-    /// sha256 of the canonicalized envelope JSON. Advisory only —
-    /// varies across signer canonicalization, so mismatch is a debug
-    /// log, never a reject.
-    #[serde(default)]
-    hash: Option<RekorHashRef>,
-
-    /// sha256 of the raw decoded payload bytes (pre-base64).
-    /// Hard-fail: this binds the Rekor entry to exactly the in-toto
-    /// statement carried by the DSSE envelope.
-    #[serde(rename = "payloadHash", default)]
-    payload_hash: Option<RekorHashRef>,
-}
-
 #[derive(Debug, serde::Deserialize)]
 struct RekorHashRef {
     /// Hash algorithm. Today only `"sha256"` is meaningful; recorded
@@ -468,6 +432,19 @@ struct RekorHashRef {
 /// trust" check. See the module comment above for the policy
 /// (two hard-fails + one advisory). The function returns `Ok(())`
 /// when both hard-fails pass, regardless of envelope-hash agreement.
+///
+/// Two Rekor body kinds are accepted:
+/// - `intoto` (apiVersion 0.0.1 / 0.0.2) — LPM's publish-side type;
+///   nested under `spec.content.{envelope, payloadHash, hash}`.
+/// - `dsse` (apiVersion 0.0.1) — what npm and GitHub
+///   `attest-build-provenance` actually emit; flat
+///   `spec.{signatures, payloadHash, envelopeHash}`. The cert is
+///   carried as the `verifier` field (PEM, base64'd) on each
+///   signatures entry, analogous to intoto's `publicKey`.
+///
+/// Both shapes carry the same load-bearing information; the
+/// extraction handles the field-name differences and the verifier
+/// runs identical hard-fail checks against the unified view.
 #[allow(dead_code)] // wired into provenance_fetch in Phase 2.1
 pub fn verify_rekor_body(
     tlog_entry: &crate::sigstore::TlogEntry,
@@ -479,20 +456,39 @@ pub fn verify_rekor_body(
         .map_err(|e| {
             VerifyError::RekorBodyMalformed(format!("canonicalizedBody not valid base64: {e}"))
         })?;
-    let body: RekorIntotoBody = serde_json::from_slice(&body_bytes).map_err(|e| {
+    let body: serde_json::Value = serde_json::from_slice(&body_bytes).map_err(|e| {
         VerifyError::RekorBodyMalformed(format!(
-            "canonicalizedBody base64-decoded bytes were not valid intoto JSON: {e}"
+            "canonicalizedBody base64-decoded bytes were not valid JSON: {e}"
         ))
     })?;
 
-    if body.kind != "intoto" {
-        return Err(VerifyError::RekorBodyMalformed(format!(
-            "Rekor body `kind` is `{}` (expected `intoto`)",
-            body.kind
-        )));
-    }
+    let kind = body.get("kind").and_then(|v| v.as_str()).ok_or_else(|| {
+        VerifyError::RekorBodyMalformed("Rekor body missing string `kind` field".into())
+    })?;
+    let api_version = body
+        .get("apiVersion")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| {
+            VerifyError::RekorBodyMalformed("Rekor body missing string `apiVersion` field".into())
+        })?;
+    let spec = body
+        .get("spec")
+        .and_then(|v| v.as_object())
+        .ok_or_else(|| {
+            VerifyError::RekorBodyMalformed("Rekor body `spec` is not an object".into())
+        })?;
 
-    match body.api_version.as_str() {
+    let view = match kind {
+        "intoto" => extract_intoto_view(spec, api_version)?,
+        "dsse" => extract_dsse_view(spec, api_version)?,
+        other => {
+            return Err(VerifyError::RekorBodyMalformed(format!(
+                "Rekor body `kind` is `{other}` (expected `intoto` or `dsse`)",
+            )));
+        }
+    };
+
+    match api_version {
         "0.0.2" | "0.0.1" => {}
         other => {
             return Err(VerifyError::RekorBodyUnknownVersion {
@@ -501,118 +497,175 @@ pub fn verify_rekor_body(
         }
     }
 
-    // The "inner envelope" is a JSON object holding `payloadType`,
-    // `payload`, and `signatures`. In 0.0.2 it sits directly under
-    // `spec.content.envelope`; in 0.0.1 it's base64-wrapped as a
-    // string.
-    let inner_envelope = extract_inner_envelope_object(&body)?;
-
     // Hard-fail check #1: cert identity match.
-    check_rekor_body_public_key_matches_leaf_cert(&inner_envelope, leaf_cert_der)?;
+    check_rekor_body_cert_pem_matches_leaf(&view.public_key_b64, leaf_cert_der)?;
 
-    // Hard-fail check #2: payload hash match.
-    if let Some(hash_ref) = body.spec.content.payload_hash.as_ref() {
+    // Hard-fail check #2: payload hash match. Required by policy —
+    // absence is a structural defect that prevents binding the
+    // Rekor entry to the envelope payload.
+    if let Some(hash_ref) = view.payload_hash.as_ref() {
         check_rekor_body_payload_hash_matches_envelope(hash_ref, envelope)?;
     } else {
-        // The plan flags this as a known 0.0.1 gap and a strict-mode
-        // future-proofing concern. Treat absence as a structural defect
-        // — the policy is "this check is required."
         return Err(VerifyError::RekorBodyMalformed(
-            "Rekor body is missing `spec.content.payloadHash`; cannot bind entry to \
-             envelope payload"
-                .into(),
+            "Rekor body is missing payloadHash; cannot bind entry to envelope payload".into(),
         ));
     }
 
     // Advisory observation #3: envelope hash. Never rejects.
-    observe_rekor_body_envelope_hash(body.spec.content.hash.as_ref(), envelope);
+    observe_rekor_body_envelope_hash(view.envelope_hash.as_ref(), envelope);
 
     Ok(())
 }
 
-/// Read the inner envelope object out of `body.spec.content.envelope`,
-/// handling both 0.0.2 (object directly) and 0.0.1 (base64-encoded
-/// JSON string) shapes.
-fn extract_inner_envelope_object(
-    body: &RekorIntotoBody,
+/// Unified view of a Rekor body's load-bearing fields, regardless
+/// of whether the body was the `intoto` or `dsse` Rekor type.
+struct RekorBodyView {
+    /// Base64-encoded PEM of the signing cert. Both Rekor kinds
+    /// ship this; only the field name differs (intoto's
+    /// `signatures[0].publicKey` vs dsse's `signatures[0].verifier`).
+    public_key_b64: String,
+    /// Optional sha256 of raw envelope.payload — the load-bearing
+    /// payload-binding hash.
+    payload_hash: Option<RekorHashRef>,
+    /// Optional sha256 of canonical envelope JSON — advisory only.
+    envelope_hash: Option<RekorHashRef>,
+}
+
+fn extract_intoto_view(
+    spec: &serde_json::Map<String, serde_json::Value>,
+    _api_version: &str,
+) -> Result<RekorBodyView, VerifyError> {
+    let content = spec
+        .get("content")
+        .and_then(|v| v.as_object())
+        .ok_or_else(|| {
+            VerifyError::RekorBodyMalformed(
+                "intoto Rekor body missing `spec.content` object".into(),
+            )
+        })?;
+    let envelope = content.get("envelope").ok_or_else(|| {
+        VerifyError::RekorBodyMalformed(
+            "intoto Rekor body missing `spec.content.envelope` field".into(),
+        )
+    })?;
+    let inner = extract_intoto_inner_envelope(envelope)?;
+    let public_key_b64 = inner
+        .get("signatures")
+        .and_then(|v| v.as_array())
+        .and_then(|arr| arr.first())
+        .and_then(|v| v.as_object())
+        .and_then(|s| s.get("publicKey"))
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| {
+            VerifyError::RekorBodyMalformed(
+                "intoto Rekor body inner envelope has no `signatures[0].publicKey`".into(),
+            )
+        })?
+        .to_string();
+    let payload_hash = content
+        .get("payloadHash")
+        .and_then(|v| serde_json::from_value::<RekorHashRef>(v.clone()).ok());
+    let envelope_hash = content
+        .get("hash")
+        .and_then(|v| serde_json::from_value::<RekorHashRef>(v.clone()).ok());
+    Ok(RekorBodyView {
+        public_key_b64,
+        payload_hash,
+        envelope_hash,
+    })
+}
+
+fn extract_dsse_view(
+    spec: &serde_json::Map<String, serde_json::Value>,
+    _api_version: &str,
+) -> Result<RekorBodyView, VerifyError> {
+    let public_key_b64 = spec
+        .get("signatures")
+        .and_then(|v| v.as_array())
+        .and_then(|arr| arr.first())
+        .and_then(|v| v.as_object())
+        .and_then(|s| s.get("verifier"))
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| {
+            VerifyError::RekorBodyMalformed(
+                "dsse Rekor body has no `spec.signatures[0].verifier`".into(),
+            )
+        })?
+        .to_string();
+    let payload_hash = spec
+        .get("payloadHash")
+        .and_then(|v| serde_json::from_value::<RekorHashRef>(v.clone()).ok());
+    let envelope_hash = spec
+        .get("envelopeHash")
+        .and_then(|v| serde_json::from_value::<RekorHashRef>(v.clone()).ok());
+    Ok(RekorBodyView {
+        public_key_b64,
+        payload_hash,
+        envelope_hash,
+    })
+}
+
+/// Extract the in-toto inner envelope object from `spec.content.envelope`.
+/// 0.0.2 puts an envelope object here; 0.0.1 puts a base64-encoded
+/// string of the envelope JSON.
+fn extract_intoto_inner_envelope(
+    envelope: &serde_json::Value,
 ) -> Result<serde_json::Map<String, serde_json::Value>, VerifyError> {
-    match &body.spec.content.envelope {
+    match envelope {
         serde_json::Value::Object(map) => Ok(map.clone()),
         serde_json::Value::String(b64) => {
             let envelope_bytes = BASE64.decode(b64.as_bytes()).map_err(|e| {
                 VerifyError::RekorBodyMalformed(format!(
-                    "Rekor body 0.0.1 envelope string is not valid base64: {e}"
+                    "intoto 0.0.1 envelope string is not valid base64: {e}"
                 ))
             })?;
             let value: serde_json::Value =
                 serde_json::from_slice(&envelope_bytes).map_err(|e| {
                     VerifyError::RekorBodyMalformed(format!(
-                        "Rekor body 0.0.1 envelope did not decode to JSON: {e}"
+                        "intoto 0.0.1 envelope did not decode to JSON: {e}"
                     ))
                 })?;
             match value {
                 serde_json::Value::Object(map) => Ok(map),
                 other => Err(VerifyError::RekorBodyMalformed(format!(
-                    "Rekor body 0.0.1 envelope JSON root is {} (expected object)",
+                    "intoto 0.0.1 envelope JSON root is {} (expected object)",
                     json_value_kind(&other)
                 ))),
             }
         }
         other => Err(VerifyError::RekorBodyMalformed(format!(
-            "Rekor body `spec.content.envelope` is {} (expected object for 0.0.2 or \
+            "intoto `spec.content.envelope` is {} (expected object for 0.0.2 or \
              base64 string for 0.0.1)",
             json_value_kind(other)
         ))),
     }
 }
 
-/// Verify the `signatures[0].publicKey` field of the Rekor body's
-/// inner envelope binds to the same cert as the bundle's leaf cert.
+/// Verify the Rekor body's certificate-PEM field binds to the same
+/// cert as the bundle's leaf cert. Used for both the intoto type
+/// (where the field is `signatures[0].publicKey` on the inner
+/// envelope) and the dsse type (where the field is
+/// `signatures[0].verifier` on `spec.signatures`).
 ///
-/// Encoding chain: body publicKey is base64(PEM); decode → PEM →
-/// strict [`crate::sigstore::pem_to_der`] → DER. Compare DER bytes
-/// directly to `leaf_cert_der` — DER is the canonical binary form,
-/// so a byte equality there is the strongest possible "same cert"
-/// claim without re-encoding round-trips that could introduce
-/// canonicalization variance.
-fn check_rekor_body_public_key_matches_leaf_cert(
-    inner_envelope: &serde_json::Map<String, serde_json::Value>,
+/// Encoding chain: base64(PEM) → PEM → strict
+/// [`crate::sigstore::pem_to_der`] → DER. Byte-compare DER directly
+/// to `leaf_cert_der` — DER is the canonical binary form.
+fn check_rekor_body_cert_pem_matches_leaf(
+    public_key_b64: &str,
     leaf_cert_der: &[u8],
 ) -> Result<(), VerifyError> {
-    let sig_entry = inner_envelope
-        .get("signatures")
-        .and_then(|v| v.as_array())
-        .and_then(|arr| arr.first())
-        .and_then(|v| v.as_object())
-        .ok_or_else(|| {
-            VerifyError::RekorBodyMalformed(
-                "Rekor body envelope has no `signatures[0]` object".into(),
-            )
-        })?;
-
-    let public_key_b64 = sig_entry
-        .get("publicKey")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| {
-            VerifyError::RekorBodyMalformed(
-                "Rekor body envelope `signatures[0]` has no string `publicKey` field".into(),
-            )
-        })?;
-
     let pem_bytes = BASE64.decode(public_key_b64.as_bytes()).map_err(|e| {
         VerifyError::RekorBodyMalformed(format!(
-            "Rekor body envelope `signatures[0].publicKey` is not valid base64: {e}"
+            "Rekor body cert-PEM field is not valid base64: {e}"
         ))
     })?;
     let pem_str = std::str::from_utf8(&pem_bytes).map_err(|e| {
         VerifyError::RekorBodyMalformed(format!(
-            "Rekor body envelope `signatures[0].publicKey` did not base64-decode to UTF-8: {e}"
+            "Rekor body cert-PEM did not base64-decode to UTF-8: {e}"
         ))
     })?;
     let body_cert_der = crate::sigstore::pem_to_der(pem_str).map_err(|e| {
-        VerifyError::RekorBodyMalformed(format!(
-            "Rekor body envelope `signatures[0].publicKey` PEM did not parse: {e}"
-        ))
+        VerifyError::RekorBodyMalformed(format!("Rekor body cert-PEM did not parse: {e}"))
     })?;
 
     if body_cert_der != leaf_cert_der {
@@ -1171,11 +1224,7 @@ pub fn verify_rekor_set(
     };
 
     let log_index = parse_log_index(&tlog_entry.log_index)?;
-    let log_id_bytes = hex::decode(&tlog_entry.log_id.key_id).map_err(|e| {
-        VerifyError::RekorSet(format!(
-            "TlogEntry.logId.keyId is not valid hex (Rekor canonical form): {e}"
-        ))
-    })?;
+    let log_id_bytes = decode_log_id(&tlog_entry.log_id.key_id)?;
 
     let rekor_key = rekor_keys
         .iter()
@@ -1204,11 +1253,16 @@ pub fn verify_rekor_set(
         VerifyError::RekorSet(format!("signedEntryTimestamp is not valid DER ECDSA: {e}"))
     })?;
 
+    // The SET-signed payload uses the HEX form of log_id (per
+    // Rekor's `pkg/util/util.go` — `hex.EncodeToString(LogID)`).
+    // Real npm bundles ship base64 on the wire, so re-encode from
+    // the decoded bytes rather than using the raw key_id string.
+    let log_id_hex = hex::encode(&log_id_bytes);
     let set_input = build_set_input_canonical_json(
         &tlog_entry.canonicalized_body,
         integrated_time_secs(&integrated_time),
         log_index,
-        &tlog_entry.log_id.key_id,
+        &log_id_hex,
     );
     let digest = Sha256::digest(set_input.as_bytes());
 
@@ -1256,6 +1310,35 @@ fn integrated_time_secs(t: &SystemTime) -> i64 {
     t.duration_since(SystemTime::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0)
+}
+
+/// Decode a TlogEntry `logId.keyId` field into raw SHA-256 bytes.
+///
+/// Two wire encodings appear in the wild:
+/// - **Hex** (Rekor's REST API canonical form). LPM's publish path
+///   captures this verbatim — see [`crate::sigstore::TlogEntry`] note.
+/// - **Base64** (Sigstore Bundle v0.3 spec; protobuf JSON encodes
+///   `bytes` fields as standard base64).
+///
+/// Pinned Rekor keys store the log_id as raw 32-byte SHA-256, so
+/// either encoding decodes to the same comparison key. SHA-256 is
+/// 32 B → 64 hex chars OR 44 base64 chars (with padding); the
+/// length disambiguates the two encodings without false positives
+/// because hex characters are a subset of base64 characters.
+fn decode_log_id(raw: &str) -> Result<Vec<u8>, VerifyError> {
+    if raw.len() == 64 && raw.chars().all(|c| c.is_ascii_hexdigit()) {
+        return hex::decode(raw).map_err(|e| {
+            VerifyError::RekorSet(format!(
+                "TlogEntry.logId.keyId looked like hex but failed to decode: {e}"
+            ))
+        });
+    }
+    BASE64.decode(raw.as_bytes()).map_err(|e| {
+        VerifyError::RekorSet(format!(
+            "TlogEntry.logId.keyId `{raw}` is neither valid hex (Rekor canonical) \
+             nor valid base64 (Sigstore Bundle v0.3 protobuf JSON): {e}"
+        ))
+    })
 }
 
 /// Decode a DER SubjectPublicKeyInfo into a P-256 `VerifyingKey`.
@@ -1355,9 +1438,8 @@ pub fn verify_inclusion_proof(
 
     let integrated_time = parse_integrated_time(&tlog_entry.integrated_time)
         .map_err(|e| VerifyError::InclusionProof(format!("{e}")))?;
-    let log_id_bytes = hex::decode(&tlog_entry.log_id.key_id).map_err(|e| {
-        VerifyError::InclusionProof(format!("TlogEntry.logId.keyId is not valid hex: {e}"))
-    })?;
+    let log_id_bytes = decode_log_id(&tlog_entry.log_id.key_id)
+        .map_err(|e| VerifyError::InclusionProof(format!("{e}")))?;
     let rekor_key = rekor_keys
         .iter()
         .find(|k| k.log_id == log_id_bytes && k.valid_for.contains(integrated_time))
@@ -1393,12 +1475,13 @@ pub fn verify_inclusion_proof(
         ));
     }
 
-    if proof.log_index != tlog_entry.log_index.parse::<i64>().unwrap_or(-1) {
-        return Err(VerifyError::InclusionProof(format!(
-            "inclusion proof log_index={} disagrees with TlogEntry log_index={}",
-            proof.log_index, tlog_entry.log_index,
-        )));
-    }
+    // The outer `TlogEntry.logIndex` is Rekor's global virtual
+    // index across all shards; `inclusionProof.logIndex` is the
+    // per-shard tree index. Modern (sharded) Rekor returns
+    // different values for the two — they are intentionally not
+    // required to agree. The Merkle-proof check only consumes the
+    // per-shard index (it walks the per-shard tree), so we keep
+    // only the structural sanity checks below.
     if proof.log_index < 0 || proof.tree_size <= 0 {
         return Err(VerifyError::InclusionProof(format!(
             "inclusion proof has non-positive log_index or tree_size: \
@@ -3975,7 +4058,7 @@ mod tests {
             verify_rekor_body(&tlog, &envelope, &cert_der).expect_err("non-JSON body must reject");
         let msg = expect_rekor_body_malformed(err);
         assert!(
-            msg.contains("intoto JSON"),
+            msg.contains("not valid JSON"),
             "expected JSON-parse diagnostic, got: {msg}"
         );
     }
@@ -6385,9 +6468,11 @@ mod tests {
     }
 
     #[test]
-    fn rejects_set_with_non_hex_log_id() {
-        // A bundle whose logId.keyId is not valid hex must reject —
-        // verify_rekor_set hex-decodes it to look up the trust root.
+    fn rejects_set_with_log_id_that_is_neither_hex_nor_base64() {
+        // A bundle whose logId.keyId is neither valid hex (Rekor's
+        // canonical encoding) nor valid base64 (Sigstore Bundle v0.3
+        // protobuf JSON's bytes encoding) must reject — the verifier
+        // can't decode it to look up the trust root.
         let (signing_key, _spki_der, _log_id_bytes) = p256_rekor_signing_key();
         let mut tlog =
             synth_tlog_entry_with_set(&signing_key, "not!hex!", 42, 1700000000, "Zm9vYmFy");
@@ -6395,9 +6480,12 @@ mod tests {
         // already used the (invalid) hex in the SET input.
         tlog.log_id.key_id = "not!hex!".into();
         let err = verify_rekor_set(&tlog, &[], RekorInclusionProofPolicy::RequireSet)
-            .expect_err("non-hex logId must reject");
+            .expect_err("logId that is neither hex nor base64 must reject");
         match err {
-            VerifyError::RekorSet(msg) => assert!(msg.contains("not valid hex"), "got: {msg}"),
+            VerifyError::RekorSet(msg) => assert!(
+                msg.contains("neither valid hex") && msg.contains("nor valid base64"),
+                "got: {msg}"
+            ),
             other => panic!("expected VerifyError::RekorSet, got: {other:?}"),
         }
     }
@@ -6770,17 +6858,20 @@ mod tests {
             .join("fixtures")
             .join("sigstore_bundles")
             .join(name);
-        std::fs::read(&path)
-            .unwrap_or_else(|e| panic!("read fixture {}: {e}", path.display()))
+        std::fs::read(&path).unwrap_or_else(|e| panic!("read fixture {}: {e}", path.display()))
     }
 
-    /// Walk every positive (non-`invalid`) fixture and assert the
-    /// composed verifier rejects with a NON-`BundleParse` error
-    /// variant. `BundleParse` would mean the parser stopped before
-    /// reaching crypto — that's the contract-test's territory, not
-    /// this test's. Reaching the chain/SCT/DSSE/Rekor primitives
-    /// and being rejected there is the proof that the fixture is
-    /// inert against the real trust root.
+    /// Walk every placeholder fixture (positive, non-`invalid`,
+    /// non-`real-`) and assert the composed verifier rejects with a
+    /// NON-`BundleParse` error variant. `BundleParse` would mean the
+    /// parser stopped before reaching crypto — that's the contract-
+    /// test's territory, not this test's. Reaching the chain / SCT /
+    /// DSSE / Rekor primitives and being rejected there is the proof
+    /// that the fixture is inert against the real trust root.
+    ///
+    /// `real-` named fixtures are captured production bundles that
+    /// MUST verify; they're covered by `verifies_real_npm_attestation_*`
+    /// positive tests below and explicitly skipped here.
     #[test]
     fn placeholder_fixtures_never_verify_against_embedded_trust_root() {
         let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -6791,7 +6882,7 @@ mod tests {
         for entry in std::fs::read_dir(&dir).expect("fixtures dir") {
             let entry = entry.expect("dirent");
             let name = entry.file_name().to_string_lossy().into_owned();
-            if !name.ends_with(".json") || name.contains("invalid") {
+            if !name.ends_with(".json") || name.contains("invalid") || name.contains("real") {
                 continue;
             }
             let body = load_fixture_bundle(&name);
@@ -6821,6 +6912,135 @@ mod tests {
             checked >= 6,
             "expected at least 3 positive fixtures × 2 policies = 6 rejection checks; ran {checked}",
         );
+    }
+
+    // ── Real npm attestation positive path ───────────────────────
+    //
+    // Captured-from-production bundle pinned end-to-end against the
+    // embedded Sigstore trust root. Without this, a `flate2` /
+    // `x509-parser` / `webpki` upgrade that subtly breaks real-cert
+    // parsing or chain validation wouldn't fail until production.
+    //
+    // Refresh procedure (if axios@1.14.0 is yanked or the trust root
+    // rotates past its active window):
+    //
+    //   curl -fsS \
+    //     https://registry.npmjs.org/-/npm/v1/attestations/<name>@<version> \
+    //     -o crates/lpm-cli/tests/fixtures/sigstore_bundles/20-real-npm-<name>-<version>.json
+    //
+    // then rename the constants below and re-run the suite.
+
+    const REAL_NPM_FIXTURE: &str = "20-real-npm-axios-1.14.0.json";
+
+    /// End-to-end positive: a real, production npm attestation
+    /// verifies against the embedded Sigstore trust root under the
+    /// npm policy (Either: SET or inclusion proof is enough). This
+    /// is the load-bearing positive pin against silent breakage of
+    /// any verifier primitive.
+    #[test]
+    fn verifies_real_npm_attestation_for_axios_1_14_0() {
+        let body = load_fixture_bundle(REAL_NPM_FIXTURE);
+        let result = verify_sigstore_bundle(
+            &body,
+            &IdentityExpectations::none(),
+            VerifyOptions::npm_attestation(),
+        );
+        let verified = result.unwrap_or_else(|e| {
+            panic!(
+                "real npm attestation for axios@1.14.0 must verify against the embedded \
+                 Sigstore trust root; got error: {e:?}\n\n\
+                 If the trust root has rotated past the bundle's integratedTime, refresh \
+                 the fixture per the procedure documented above REAL_NPM_FIXTURE."
+            )
+        });
+        assert!(
+            verified.log_index > 0,
+            "verified bundle must carry a Rekor log_index"
+        );
+        assert!(
+            !verified.log_id.is_empty(),
+            "verified bundle must carry a Rekor log_id"
+        );
+        assert!(
+            verified.leaf_cert_sha256.starts_with("sha256-"),
+            "leaf_cert_sha256 must be in the `sha256-<hex>` audit form; got: {}",
+            verified.leaf_cert_sha256,
+        );
+    }
+
+    /// Same fixture, but assert the bundle exercises the v0.3
+    /// single-cert wire shape inside the npm wrapper. npm currently
+    /// ships its SLSA provenance attestation in this shape; if it
+    /// ever migrates to v0.2 chain, the parser must still extract
+    /// the leaf, and this test will tell us so by failing on the
+    /// shape pin (the verifier-success assertion guards the path).
+    #[test]
+    fn verifies_real_npm_attestation_v0_3_shape() {
+        let body = load_fixture_bundle(REAL_NPM_FIXTURE);
+        let root: serde_json::Value = serde_json::from_slice(&body).expect("fixture is JSON");
+        let inner_v03 = root["attestations"]
+            .as_array()
+            .expect("npm wrapper")
+            .iter()
+            .find_map(|a| {
+                let b = a.get("bundle")?;
+                let media = b.get("mediaType")?.as_str()?;
+                if media.contains("v0.3") || media.contains("version=0.3") {
+                    Some(b)
+                } else {
+                    None
+                }
+            });
+        assert!(
+            inner_v03.is_some(),
+            "axios attestation must ship at least one v0.3-shaped inner bundle; if npm \
+             migrated away from v0.3, refresh the fixture and update this test",
+        );
+        let inner = inner_v03.unwrap();
+        assert!(
+            inner["verificationMaterial"]["certificate"]["rawBytes"]
+                .as_str()
+                .is_some(),
+            "v0.3 shape requires `verificationMaterial.certificate.rawBytes`",
+        );
+        // The composed verifier picks the first parseable inner
+        // bundle. With the v0.3 SLSA-provenance shape present, the
+        // path exercised here is the v0.3 cert extraction — so a
+        // successful verify also proves the v0.3 parser arm works.
+        verify_sigstore_bundle(
+            &body,
+            &IdentityExpectations::none(),
+            VerifyOptions::npm_attestation(),
+        )
+        .expect("v0.3 path inside npm wrapper must verify");
+    }
+
+    /// Exercises the npm `{ attestations: [{ bundle: <inner> }] }`
+    /// wrapper unwrap path. The verifier scans attestations[*].bundle
+    /// for the first parseable inner; the axios fixture has two
+    /// (publish-time publicKey-only + SLSA provenance Fulcio).
+    #[test]
+    fn verifies_real_npm_attestation_list_wrapper() {
+        let body = load_fixture_bundle(REAL_NPM_FIXTURE);
+        let root: serde_json::Value = serde_json::from_slice(&body).expect("fixture is JSON");
+        let attestations = root["attestations"]
+            .as_array()
+            .expect("npm-wrapper fixture must carry top-level `attestations` array");
+        assert!(
+            !attestations.is_empty(),
+            "wrapper must have at least one attestation entry; got {}",
+            attestations.len()
+        );
+        assert!(
+            attestations.iter().any(|a| a.get("bundle").is_some()),
+            "at least one attestation entry must carry an inner `bundle`",
+        );
+        verify_sigstore_bundle(
+            &body,
+            &IdentityExpectations::none(),
+            VerifyOptions::npm_attestation(),
+        )
+        .expect("npm wrapper unwrap must reach a verifiable inner bundle");
     }
 
     // ─── Per-primitive microbench ────────────────────────────────
