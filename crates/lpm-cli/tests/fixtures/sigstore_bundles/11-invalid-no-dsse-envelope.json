@@ -1,0 +1,17 @@
+{
+  "mediaType": "application/vnd.dev.sigstore.bundle.v0.3+json",
+  "verificationMaterial": {
+    "certificate": {
+      "rawBytes": "MIIBHzCBxqADAgECAgEBMAoGCCqGSM49BAMCMA8xDTALBgNVBAMTBHJvb3QwHhcNMjUwMTAxMDAwMDAwWhcNMjYwMTAxMDAwMDAwWjAPMQ0wCwYDVQQDEwRsZWFmMFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAMAoGCCqGSM49BAMCA0gAMEUCIQDxAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAIgAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+    },
+    "tlogEntries": [
+      {
+        "logIndex": "45",
+        "logId": { "keyId": "0000000000000000000000000000000000000000000000000000000000000000" },
+        "integratedTime": "1700000003",
+        "canonicalizedBody": "eyJraW5kIjoiaW50b3RvIn0=",
+        "inclusionPromise": { "signedEntryTimestamp": "AAAA" }
+      }
+    ]
+  }
+}

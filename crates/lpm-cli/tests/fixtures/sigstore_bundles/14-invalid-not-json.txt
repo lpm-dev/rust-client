@@ -1,0 +1,5 @@
+this file is intentionally NOT JSON — it represents the wire-shape
+boundary where the verifier's bundle parser must reject before doing
+anything else. Renaming it to .json would make this an actual JSON
+parse failure with a missing-field message; keeping the .txt extension
+isolates the "input is fundamentally unparseable" case.
