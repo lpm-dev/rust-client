@@ -61,9 +61,33 @@ else
   fi
 fi
 
-# Get latest version from GitHub API
+# Resolve the API + download endpoints. Tests point both at a local
+# http.server on 127.0.0.1; production always uses GitHub. Test overrides
+# are loopback-gated — a non-loopback value triggers a hard fail rather
+# than silently steering the install at an attacker-controlled host.
+# Both env vars are validated UP FRONT (before any curl) so a single
+# malicious value is rejected even when the other is unset.
+is_loopback_http() {
+  case "$1" in
+    http://127.0.0.1*|http://127.0.0.1:*|http://localhost*|http://localhost:*|http://\[::1\]*)
+      return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+if [ -n "${LPM_INSTALL_TEST_API_URL:-}" ] && ! is_loopback_http "$LPM_INSTALL_TEST_API_URL"; then
+  echo "ERROR: LPM_INSTALL_TEST_API_URL must point at 127.0.0.1 / localhost / [::1] over http"
+  exit 1
+fi
+if [ -n "${LPM_INSTALL_TEST_DOWNLOAD_BASE:-}" ] && ! is_loopback_http "$LPM_INSTALL_TEST_DOWNLOAD_BASE"; then
+  echo "ERROR: LPM_INSTALL_TEST_DOWNLOAD_BASE must point at 127.0.0.1 / localhost / [::1] over http"
+  exit 1
+fi
+
+API_URL="${LPM_INSTALL_TEST_API_URL:-https://api.github.com/repos/$REPO/releases/latest}"
+
 echo "Detecting latest version..."
-VERSION=$(curl -fsSL "https://api.github.com/repos/$REPO/releases/latest" | grep '"tag_name"' | sed -E 's/.*"tag_name": *"([^"]+)".*/\1/')
+VERSION=$(curl -fsSL "$API_URL" | grep '"tag_name"' | sed -E 's/.*"tag_name": *"([^"]+)".*/\1/')
 
 if [ -z "$VERSION" ]; then
   echo "Failed to detect latest version. Check https://github.com/$REPO/releases"
@@ -72,7 +96,8 @@ fi
 
 echo "Installing LPM CLI $VERSION for $OS/$ARCH..."
 
-BASE_URL="https://github.com/$REPO/releases/download/$VERSION"
+BASE_URL="${LPM_INSTALL_TEST_DOWNLOAD_BASE:-https://github.com/$REPO/releases/download/$VERSION}"
+
 URL="$BASE_URL/$PLATFORM"
 MANIFEST_URL="$BASE_URL/SHA256SUMS.txt"
 BUNDLE_URL="$BASE_URL/SHA256SUMS.txt.sigstore"

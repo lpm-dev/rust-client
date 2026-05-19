@@ -157,7 +157,13 @@ pub async fn run(json_output: bool, refresh: bool) -> Result<(), LpmError> {
 
     let method = detect_install_method();
 
-    if json_output {
+    // For non-Standalone channels the JSON contract is plan-only: emit
+    // the update command, return without invoking the channel's
+    // installer (the operator is expected to run it themselves so they
+    // can pipe / observe / sandbox it). Standalone is the one channel
+    // LPM can run AND attribute end-to-end, so its `--json` path runs
+    // the install and emits the captured Sigstore audit alongside.
+    if json_output && !matches!(method, InstallMethod::Standalone) {
         let json = serde_json::json!({
             "success": true,
             "current": current,
@@ -171,13 +177,16 @@ pub async fn run(json_output: bool, refresh: bool) -> Result<(), LpmError> {
         return Ok(());
     }
 
-    output::info(&format!(
-        "Updating {} → {} via {}",
-        current.dimmed(),
-        latest.green().bold(),
-        method.name().cyan()
-    ));
+    if !json_output {
+        output::info(&format!(
+            "Updating {} → {} via {}",
+            current.dimmed(),
+            latest.green().bold(),
+            method.name().cyan()
+        ));
+    }
 
+    let mut standalone_audit: Option<AttestationAudit> = None;
     match method {
         InstallMethod::Npm => {
             let pinned = format!("@lpm-registry/cli@{latest}");
@@ -212,7 +221,7 @@ pub async fn run(json_output: bool, refresh: bool) -> Result<(), LpmError> {
             )?;
         }
         InstallMethod::Standalone => {
-            run_standalone_update(&latest).await?;
+            standalone_audit = Some(run_standalone_update(&latest).await?);
         }
     }
 
@@ -238,7 +247,24 @@ pub async fn run(json_output: bool, refresh: bool) -> Result<(), LpmError> {
         }
     }
 
-    output::success(&format!("Updated to {}", latest.bold()));
+    if json_output {
+        let audit = standalone_audit
+            .as_ref()
+            .expect("json_output && Standalone implies audit was captured");
+        let json = serde_json::json!({
+            "success": true,
+            "current": current,
+            "latest": latest,
+            "up_to_date": false,
+            "install_method": method.name(),
+            "cache_hit": cache_hit,
+            "verified": true,
+            "attestation": audit_json(audit),
+        });
+        println!("{}", serde_json::to_string_pretty(&json).unwrap());
+    } else {
+        output::success(&format!("Updated to {}", latest.bold()));
+    }
 
     Ok(())
 }
@@ -577,7 +603,7 @@ async fn fetch_bounded(
     url: &str,
     max_bytes: usize,
 ) -> Result<Option<Vec<u8>>, LpmError> {
-    let resp = client
+    let mut resp = client
         .get(url)
         .header("User-Agent", "lpm-cli")
         .send()
@@ -595,18 +621,40 @@ async fn fetch_bounded(
         )));
     }
 
-    let body = resp
-        .bytes()
-        .await
-        .map_err(|e| LpmError::Network(format!("fetch {url} body read failed: {e}")))?;
-    if body.len() > max_bytes {
+    // Reject by advertised Content-Length before any body bytes are
+    // buffered. A hostile or compromised endpoint that sets a truthful
+    // oversized Content-Length is caught here without touching the
+    // socket past the headers.
+    if let Some(advertised) = resp.content_length()
+        && advertised as usize > max_bytes
+    {
         return Err(LpmError::SelfUpdate(format!(
-            "{url} returned {} bytes; cap is {}",
-            body.len(),
-            max_bytes
+            "{url} advertises {advertised} bytes; cap of {max_bytes} would be exceeded — refusing to buffer"
         )));
     }
-    Ok(Some(body.to_vec()))
+
+    // Stream chunk-by-chunk so a hostile endpoint that omits or lies on
+    // Content-Length still trips the cap before the whole body lands in
+    // memory. Pre-size the buffer when Content-Length is present and
+    // under the cap; otherwise let the Vec grow.
+    let prealloc = resp
+        .content_length()
+        .map(|c| (c as usize).min(max_bytes))
+        .unwrap_or(0);
+    let mut buf: Vec<u8> = Vec::with_capacity(prealloc);
+    while let Some(chunk) = resp
+        .chunk()
+        .await
+        .map_err(|e| LpmError::Network(format!("fetch {url} body read failed: {e}")))?
+    {
+        if buf.len().saturating_add(chunk.len()) > max_bytes {
+            return Err(LpmError::SelfUpdate(format!(
+                "{url} body exceeded cap of {max_bytes} bytes mid-stream — aborted before full buffer"
+            )));
+        }
+        buf.extend_from_slice(&chunk);
+    }
+    Ok(Some(buf))
 }
 
 /// Cryptographically verify a release-artifact triple (manifest,
@@ -695,26 +743,48 @@ fn verify_release_artifacts(
 /// must match the bundle's in-toto subject digest, and the downloaded
 /// binary's hash must match the manifest line for this platform. Any
 /// failure short-circuits before `swap_current_binary` is reached.
-async fn run_standalone_update(version: &str) -> Result<(), LpmError> {
-    let audit = verify_and_fetch_for_standalone(version).await?;
+///
+/// Returns the captured attestation audit so the caller can surface it
+/// into `--json` output (or wherever else a structured audit trail
+/// belongs). The audit is also logged via `tracing::info!`.
+async fn run_standalone_update(version: &str) -> Result<AttestationAudit, LpmError> {
+    let assets = verify_and_fetch_for_standalone(version).await?;
     let current_exe = std::env::current_exe().map_err(LpmError::Io)?;
-    swap_current_binary(&current_exe, &audit.asset_bytes)?;
+    swap_current_binary(&current_exe, &assets.asset_bytes)?;
 
     tracing::info!(
         target: "lpm_cli::self_update",
-        publisher = audit.audit.publisher.as_deref().unwrap_or("<absent>"),
-        workflow_path = audit.audit.workflow_path.as_deref().unwrap_or("<absent>"),
-        workflow_ref = audit.audit.workflow_ref.as_deref().unwrap_or("<absent>"),
-        integrated_time = %audit.audit.integrated_time,
-        log_index = audit.audit.log_index,
-        log_id = %audit.audit.log_id,
-        leaf_cert_sha256 = %audit.audit.leaf_cert_sha256,
-        manifest_sha256 = %audit.audit.manifest_sha256,
-        asset_sha256 = %audit.audit.asset_sha256,
-        asset_name = %audit.audit.asset_name,
+        publisher = assets.audit.publisher.as_deref().unwrap_or("<absent>"),
+        workflow_path = assets.audit.workflow_path.as_deref().unwrap_or("<absent>"),
+        workflow_ref = assets.audit.workflow_ref.as_deref().unwrap_or("<absent>"),
+        integrated_time = %assets.audit.integrated_time,
+        log_index = assets.audit.log_index,
+        log_id = %assets.audit.log_id,
+        leaf_cert_sha256 = %assets.audit.leaf_cert_sha256,
+        manifest_sha256 = %assets.audit.manifest_sha256,
+        asset_sha256 = %assets.audit.asset_sha256,
+        asset_name = %assets.audit.asset_name,
         "standalone self-update verified and applied"
     );
-    Ok(())
+    Ok(assets.audit)
+}
+
+/// Render an `AttestationAudit` as the JSON shape callers see under
+/// `--json` mode. Stable wire shape — adding new fields is fine, but
+/// renaming or removing keys is a contract break.
+fn audit_json(audit: &AttestationAudit) -> serde_json::Value {
+    serde_json::json!({
+        "publisher": audit.publisher,
+        "workflow_path": audit.workflow_path,
+        "workflow_ref": audit.workflow_ref,
+        "integrated_time": audit.integrated_time.to_rfc3339(),
+        "log_index": audit.log_index,
+        "log_id": audit.log_id,
+        "leaf_cert_sha256": audit.leaf_cert_sha256,
+        "manifest_sha256": audit.manifest_sha256,
+        "asset_sha256": audit.asset_sha256,
+        "asset_name": audit.asset_name,
+    })
 }
 
 /// Verified + bytes-ready state ready to be handed to
@@ -780,30 +850,13 @@ async fn verify_and_fetch_for_standalone(version: &str) -> Result<StandaloneAsse
 
     spinner.stop("Verifying Sigstore attestation");
 
-    let asset_resp = client
-        .get(&asset_url)
-        .header("User-Agent", "lpm-cli")
-        .send()
-        .await
-        .map_err(|e| LpmError::Network(format!("download {asset_url} failed: {e}")))?;
-    if !asset_resp.status().is_success() {
-        return Err(LpmError::Network(format!(
-            "download {asset_url} returned HTTP {}",
-            asset_resp.status().as_u16()
-        )));
-    }
-    let asset_bytes = asset_resp
-        .bytes()
-        .await
-        .map_err(|e| LpmError::Network(format!("download {asset_url} body read failed: {e}")))?;
-    if asset_bytes.len() > ASSET_MAX_BYTES {
-        return Err(LpmError::SelfUpdate(format!(
-            "downloaded {binary_name} is {} bytes; cap is {}",
-            asset_bytes.len(),
-            ASSET_MAX_BYTES
-        )));
-    }
-    let asset_vec = asset_bytes.to_vec();
+    let asset_vec = fetch_bounded(&client, &asset_url, ASSET_MAX_BYTES)
+        .await?
+        .ok_or_else(|| {
+            LpmError::SelfUpdate(format!(
+                "release v{version} advertises `{binary_name}` in SHA256SUMS.txt but the asset is missing at {asset_url} — release-pipeline bug"
+            ))
+        })?;
 
     let audit = verify_release_artifacts(
         version,
@@ -1134,6 +1187,53 @@ bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb  lpm-linux-x64
         );
     }
 
+    /// Wire-shape pin for the audit JSON surface — `--json self-update`
+    /// emits these keys for the Standalone channel and downstream
+    /// consumers (audit pipelines, CI provenance check) parse them by
+    /// name. Renaming or removing a key is a contract break; adding a
+    /// key is non-breaking.
+    #[test]
+    fn audit_json_emits_stable_wire_shape() {
+        let audit = AttestationAudit {
+            publisher: Some("github:lpm-dev/rust-client".to_string()),
+            workflow_path: Some(".github/workflows/release.yml".to_string()),
+            workflow_ref: Some("refs/tags/v1.2.3".to_string()),
+            integrated_time: chrono::DateTime::parse_from_rfc3339("2026-05-19T12:34:56Z")
+                .unwrap()
+                .with_timezone(&chrono::Utc),
+            log_index: 9876543210,
+            log_id: "c0d23d6ad406973f9559f3ba2d1ca01f8.. (truncated)".to_string(),
+            leaf_cert_sha256: "feedface".to_string(),
+            manifest_sha256: "deadbeef".to_string(),
+            asset_sha256: "cafebabe".to_string(),
+            asset_name: "lpm-linux-x64".to_string(),
+        };
+        let json = audit_json(&audit);
+        let obj = json.as_object().expect("audit_json returns an object");
+        for key in [
+            "publisher",
+            "workflow_path",
+            "workflow_ref",
+            "integrated_time",
+            "log_index",
+            "log_id",
+            "leaf_cert_sha256",
+            "manifest_sha256",
+            "asset_sha256",
+            "asset_name",
+        ] {
+            assert!(
+                obj.contains_key(key),
+                "audit_json wire shape dropped key `{key}`: {json}"
+            );
+        }
+        assert_eq!(
+            obj["integrated_time"], "2026-05-19T12:34:56+00:00",
+            "integrated_time must be RFC 3339 with explicit zone offset"
+        );
+        assert_eq!(obj["log_index"], 9876543210_i64);
+    }
+
     // ── verify_and_fetch_for_standalone (wiremock-backed) ────────
 
     const DOWNLOAD_OVERRIDE_KEY: &str = "LPM_GITHUB_RELEASE_DOWNLOAD_URL_OVERRIDE";
@@ -1460,7 +1560,45 @@ bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb  lpm-linux-x64
                 .expect_err("oversized manifest must be rejected");
             match err {
                 LpmError::SelfUpdate(msg) => {
-                    assert!(msg.contains("cap is"), "msg names the cap: {msg}");
+                    assert!(msg.contains("cap of"), "msg names the cap: {msg}");
+                }
+                other => panic!("expected SelfUpdate, got {other:?}"),
+            }
+        })
+        .await;
+    }
+
+    /// Hostile endpoint that omits Content-Length and streams more
+    /// bytes than the cap allows. The mid-stream guard in
+    /// [`fetch_bounded`] must trip before the whole body buffers.
+    /// This is the defense-in-depth pair for the Content-Length pre-check.
+    #[tokio::test]
+    async fn standalone_update_refuses_when_manifest_streams_past_cap_without_content_length() {
+        let server = wiremock::MockServer::start().await;
+        let huge = vec![b'0'; 8 * 1024];
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/download/v0.42.0/SHA256SUMS.txt"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_bytes(huge)
+                    // Wiremock auto-fills Content-Length; force chunked
+                    // by setting Transfer-Encoding so the pre-check is
+                    // bypassed and the mid-stream guard is what fires.
+                    .insert_header("Transfer-Encoding", "chunked"),
+            )
+            .mount(&server)
+            .await;
+
+        run_standalone_against_server(&server, "0.42.0", || async {
+            let err = verify_and_fetch_for_standalone("0.42.0")
+                .await
+                .expect_err("oversized chunked manifest must be rejected");
+            match err {
+                LpmError::SelfUpdate(msg) => {
+                    assert!(
+                        msg.contains("mid-stream") || msg.contains("cap of"),
+                        "msg names the cap: {msg}"
+                    );
                 }
                 other => panic!("expected SelfUpdate, got {other:?}"),
             }
