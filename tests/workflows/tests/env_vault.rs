@@ -1735,6 +1735,8 @@ async fn env_oidc_list_emits_json_response() {
                 "subject": "repo:acme/repo",
                 "allowedBranches": ["main"],
                 "allowedEnvironments": ["production"],
+                "allowedWorkflows": [".github/workflows/deploy.yml"],
+                "allowedEvents": ["push"],
                 "allowForks": false,
             },
             {
@@ -1742,6 +1744,11 @@ async fn env_oidc_list_emits_json_response() {
                 "subject": "repo:acme/preview",
                 "allowedBranches": ["develop"],
                 "allowedEnvironments": ["preview"],
+                "allowedWorkflows": [
+                    ".github/workflows/ci.yml",
+                    ".github/workflows/preview.yml"
+                ],
+                "allowedEvents": ["push", "pull_request_target"],
                 "allowForks": true,
             }
         ]),
@@ -1766,8 +1773,102 @@ async fn env_oidc_list_emits_json_response() {
         .as_array()
         .expect("policies should be an array");
     assert_eq!(policies.len(), 2);
+    // Pin every field end-to-end so a future schema/CLI drift trips
+    // here, not in production.
+    assert_eq!(policies[0]["provider"], "github");
     assert_eq!(policies[0]["subject"], "repo:acme/repo");
+    assert_eq!(policies[0]["allowedBranches"], serde_json::json!(["main"]));
+    assert_eq!(
+        policies[0]["allowedEnvironments"],
+        serde_json::json!(["production"]),
+    );
+    assert_eq!(
+        policies[0]["allowedWorkflows"],
+        serde_json::json!([".github/workflows/deploy.yml"]),
+    );
+    assert_eq!(policies[0]["allowedEvents"], serde_json::json!(["push"]));
+    assert_eq!(policies[0]["allowForks"], false);
+
+    assert_eq!(policies[1]["subject"], "repo:acme/preview");
+    assert_eq!(
+        policies[1]["allowedWorkflows"],
+        serde_json::json!([".github/workflows/ci.yml", ".github/workflows/preview.yml"]),
+    );
+    assert_eq!(
+        policies[1]["allowedEvents"],
+        serde_json::json!(["push", "pull_request_target"]),
+    );
     assert_eq!(policies[1]["allowForks"], true);
+}
+
+#[tokio::test]
+async fn env_oidc_list_human_output_renders_new_fields() {
+    // Phase 8 of plan-security-findings-c3.md added allowedWorkflows
+    // and allowedEvents to the policy schema. The CLI's human-readable
+    // `lpm env oidc list` output must surface both — without this the
+    // dashboard-vs-CLI inspection paths drift (CLI users wouldn't see
+    // the policy fields that gate their next CI mint).
+    let project =
+        TempProject::empty(r#"{"name":"vault-oidc-list-human-fields","version":"1.0.0"}"#);
+    let mock = MockRegistry::start().await;
+
+    project.write_file("lpm.json", r#"{"vault":"vault-policy-list-human-1"}"#);
+
+    seed_sessions(
+        project.home(),
+        &[SessionSeed {
+            registry_url: &mock.url(),
+            access_token: Some("session-access-token"),
+            refresh_token: Some("refresh-token"),
+            session_access_expires_at: Some("2030-01-01T00:00:00Z"),
+        }],
+    );
+
+    mock.with_oidc_policy_list(
+        "session-access-token",
+        "vault-policy-list-human-1",
+        serde_json::json!([
+            {
+                "provider": "github",
+                "subject": "repo:acme/repo",
+                "allowedBranches": ["main"],
+                "allowedEnvironments": ["production"],
+                "allowedWorkflows": [".github/workflows/deploy.yml"],
+                "allowedEvents": ["push", "release"],
+                "allowForks": false,
+            }
+        ]),
+    )
+    .await;
+
+    let output = lpm(&project)
+        .env("LPM_REGISTRY_URL", mock.url())
+        .args(["env", "oidc", "list"])
+        .output()
+        .expect("failed to run oidc list");
+
+    assert!(output.status.success(), "oidc list failed");
+    let combined = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    assert!(
+        combined.contains(".github/workflows/deploy.yml"),
+        "expected workflow path in human output, got: {combined}",
+    );
+    assert!(
+        combined.contains("push") && combined.contains("release"),
+        "expected event names in human output, got: {combined}",
+    );
+    assert!(
+        combined.contains("workflows:"),
+        "expected `workflows:` label in human output, got: {combined}",
+    );
+    assert!(
+        combined.contains("events:"),
+        "expected `events:` label in human output, got: {combined}",
+    );
 }
 
 #[tokio::test]

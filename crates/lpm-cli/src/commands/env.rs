@@ -2681,40 +2681,47 @@ async fn vars_oidc_list(project_dir: &std::path::Path, json_output: bool) -> Res
     }
 
     println!();
+    // Render a JSON array field as a comma-joined string. Empty array
+    // or missing field collapses to an empty string; the display logic
+    // below replaces empty with `"-"` rather than `"all"` so a policy
+    // that's missing required fields doesn't read as "wide-open."
+    fn render_strings(field: &serde_json::Value) -> String {
+        field
+            .as_array()
+            .map(|a| {
+                a.iter()
+                    .filter_map(|v| v.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            })
+            .unwrap_or_default()
+    }
     for policy in policies.unwrap() {
         let provider = policy["provider"].as_str().unwrap_or("?");
         let subject = policy["subject"].as_str().unwrap_or("?");
-        let branches = policy["allowedBranches"]
-            .as_array()
-            .map(|a| {
-                a.iter()
-                    .filter_map(|v| v.as_str())
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            })
-            .unwrap_or_default();
-        let envs = policy["allowedEnvironments"]
-            .as_array()
-            .map(|a| {
-                a.iter()
-                    .filter_map(|v| v.as_str())
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            })
-            .unwrap_or_default();
+        let branches = render_strings(&policy["allowedBranches"]);
+        let envs = render_strings(&policy["allowedEnvironments"]);
+        let workflows = render_strings(&policy["allowedWorkflows"]);
+        let events = render_strings(&policy["allowedEvents"]);
         let forks = policy["allowForks"].as_bool().unwrap_or(false);
 
+        let bb = if branches.is_empty() { "-" } else { &branches };
+        let ee = if envs.is_empty() { "-" } else { &envs };
+        let ww = if workflows.is_empty() {
+            "-"
+        } else {
+            &workflows
+        };
+        let ev = if events.is_empty() { "-" } else { &events };
         println!(
-            "  {} {}  branches: [{}]  envs: [{}]{}",
+            "  {} {}\n      branches:  [{bb}]\n      envs:      [{ee}]\n      workflows: [{ww}]\n      events:    [{ev}]{}",
             provider.bold(),
             subject,
-            if branches.is_empty() {
-                "all"
+            if forks {
+                "\n      forks:     allowed"
             } else {
-                &branches
+                ""
             },
-            if envs.is_empty() { "all" } else { &envs },
-            if forks { "  forks: allowed" } else { "" }
         );
     }
     println!();
