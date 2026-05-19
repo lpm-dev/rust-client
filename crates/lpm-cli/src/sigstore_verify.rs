@@ -3263,6 +3263,55 @@ fn parse_inner_bundle(bundle: &serde_json::Value) -> Result<BundleComponents, Ve
     })
 }
 
+/// Extract `subject[0].name` and `subject[0].digest.sha256` from the
+/// in-toto statement carried by the DSSE payload of a Sigstore bundle.
+///
+/// Pre-condition: the caller has already verified the bundle via
+/// [`verify_sigstore_bundle`] — this function parses the wire bytes a
+/// second time but adds no new trust decisions. It is purpose-scoped
+/// to the standalone self-update path, which needs to bind the bundle
+/// to the SHA-256 of the `SHA256SUMS.txt` manifest it just downloaded.
+///
+/// Returns `(subject_name, subject_sha256)`. Hex digest is lowercase.
+pub(crate) fn extract_in_toto_subject_digest(body: &[u8]) -> Result<(String, String), VerifyError> {
+    let components = parse_bundle_components(body)?;
+    let payload_bytes = BASE64
+        .decode(components.dsse_envelope.payload.as_bytes())
+        .map_err(|e| VerifyError::BundleParse(format!("DSSE payload not base64: {e}")))?;
+    let statement: serde_json::Value = serde_json::from_slice(&payload_bytes)
+        .map_err(|e| VerifyError::BundleParse(format!("DSSE payload not JSON: {e}")))?;
+
+    let subjects = statement
+        .get("subject")
+        .and_then(|v| v.as_array())
+        .ok_or_else(|| {
+            VerifyError::BundleParse("in-toto statement has no `subject` array".into())
+        })?;
+    let subject = subjects
+        .first()
+        .ok_or_else(|| VerifyError::BundleParse("in-toto statement `subject` is empty".into()))?;
+
+    let name = subject
+        .get("name")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| {
+            VerifyError::BundleParse("in-toto statement subject[0] has no string `name`".into())
+        })?
+        .to_string();
+    let digest_sha256 = subject
+        .get("digest")
+        .and_then(|d| d.get("sha256"))
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| {
+            VerifyError::BundleParse(
+                "in-toto statement subject[0].digest.sha256 missing or not a string".into(),
+            )
+        })?
+        .to_ascii_lowercase();
+
+    Ok((name, digest_sha256))
+}
+
 /// Find the SPKI DER of the leaf cert's immediate issuer. Tries:
 /// 1. Bundle's chain[1..] (the typical case when the bundle ships
 ///    leaf + intermediate).

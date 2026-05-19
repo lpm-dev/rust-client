@@ -78,6 +78,9 @@ jobs:
           fi
           echo "✓ No fancy-regex dependencies found"
 
+      - name: install.sh smoke tests
+        run: sh tests/install-sh/run.sh
+
   test:
     name: Test
     runs-on: ubuntu-latest
