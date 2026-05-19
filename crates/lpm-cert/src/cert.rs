@@ -5,10 +5,49 @@
 
 use lpm_common::LpmError;
 use rcgen::{CertificateParams, DistinguishedName, DnType, KeyPair, SanType};
+use sha1::Digest as _;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::path::Path;
 use time::{Duration, OffsetDateTime};
 use x509_parser::extensions::GeneralName;
+
+/// SHA-256 fingerprint of the DER body of a PEM-encoded certificate at `path`.
+///
+/// "Fingerprint" in X.509 always means the digest of the DER body, never of the PEM
+/// envelope. macOS `security` and openssl both emit it as colon-separated uppercase
+/// hex (`AB:CD:…`); callers convert via `fingerprint_hex`.
+pub fn fingerprint_sha256(path: &Path) -> Result<[u8; 32], LpmError> {
+    let der = read_cert_der(path)?;
+    Ok(sha2::Sha256::digest(&der).into())
+}
+
+/// SHA-1 fingerprint (thumbprint) of the DER body of a PEM-encoded cert. SHA-1 is the
+/// identifier Windows `certutil` accepts as a `-store` search key — kept for that
+/// platform's lookup only, not for cryptographic binding.
+pub fn fingerprint_sha1(path: &Path) -> Result<[u8; 20], LpmError> {
+    let der = read_cert_der(path)?;
+    Ok(sha1::Sha1::digest(&der).into())
+}
+
+/// Format a fingerprint as uppercase colon-separated hex (`AB:CD:EF:…`).
+pub fn fingerprint_hex(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(bytes.len() * 3);
+    for (i, b) in bytes.iter().enumerate() {
+        if i > 0 {
+            out.push(':');
+        }
+        out.push_str(&format!("{b:02X}"));
+    }
+    out
+}
+
+fn read_cert_der(path: &Path) -> Result<Vec<u8>, LpmError> {
+    let pem_str = std::fs::read_to_string(path)
+        .map_err(|e| LpmError::Cert(format!("failed to read cert at {}: {e}", path.display())))?;
+    let pem = pem::parse(&pem_str)
+        .map_err(|e| LpmError::Cert(format!("invalid PEM at {}: {e}", path.display())))?;
+    Ok(pem.into_contents())
+}
 
 /// Certificate info extracted from an existing cert file.
 #[derive(Debug, Clone)]
@@ -347,5 +386,55 @@ mod tests {
 
         assert!(covers_requested_hostnames(tmp.path(), &extras).unwrap());
         assert!(!covers_requested_hostnames(tmp.path(), &["missing.test".to_string()]).unwrap());
+    }
+
+    #[test]
+    fn fingerprint_sha256_is_stable_across_reads() {
+        let (ca_pem, _) = ca::generate_ca().unwrap();
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(tmp.path(), &ca_pem).unwrap();
+
+        let a = fingerprint_sha256(tmp.path()).unwrap();
+        let b = fingerprint_sha256(tmp.path()).unwrap();
+        assert_eq!(a, b);
+        assert_eq!(a.len(), 32);
+    }
+
+    #[test]
+    fn fingerprint_sha256_differs_per_cert() {
+        let (ca_pem_a, _) = ca::generate_ca().unwrap();
+        let (ca_pem_b, _) = ca::generate_ca().unwrap();
+        let ta = tempfile::NamedTempFile::new().unwrap();
+        let tb = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(ta.path(), &ca_pem_a).unwrap();
+        std::fs::write(tb.path(), &ca_pem_b).unwrap();
+
+        let fa = fingerprint_sha256(ta.path()).unwrap();
+        let fb = fingerprint_sha256(tb.path()).unwrap();
+        assert_ne!(
+            fa, fb,
+            "two freshly-generated CAs must produce distinct SHA-256 fingerprints"
+        );
+    }
+
+    #[test]
+    fn fingerprint_sha1_length_is_20() {
+        let (ca_pem, _) = ca::generate_ca().unwrap();
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(tmp.path(), &ca_pem).unwrap();
+
+        let fp = fingerprint_sha1(tmp.path()).unwrap();
+        assert_eq!(fp.len(), 20);
+    }
+
+    #[test]
+    fn fingerprint_hex_uppercase_colon_separated() {
+        let bytes: [u8; 4] = [0xab, 0xcd, 0x12, 0x34];
+        assert_eq!(fingerprint_hex(&bytes), "AB:CD:12:34");
+    }
+
+    #[test]
+    fn fingerprint_hex_empty_input() {
+        assert_eq!(fingerprint_hex(&[]), "");
     }
 }

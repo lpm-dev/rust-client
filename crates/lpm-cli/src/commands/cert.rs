@@ -135,7 +135,14 @@ fn run_trust(json_output: bool) -> Result<(), LpmError> {
 }
 
 fn run_uninstall(json_output: bool) -> Result<(), LpmError> {
-    lpm_cert::trust::uninstall_ca()?;
+    let ca_cert_path = lpm_cert::paths::ca_cert_path()?;
+    if !ca_cert_path.exists() {
+        return Err(LpmError::Cert(format!(
+            "no on-disk CA at {}; nothing to uninstall (the fingerprint of the cert to remove is read from this file)",
+            ca_cert_path.display()
+        )));
+    }
+    lpm_cert::trust::uninstall_ca(&ca_cert_path)?;
 
     if json_output {
         println!(
