@@ -1087,28 +1087,16 @@ fn write_sigstore_off_to_isolated_config(project: &TempProject) {
     std::fs::write(&cfg, "[sigstore]\nverify = \"off\"\n").expect("write config.toml");
 }
 
-/// **Phase 2.5 operator-fleet-wide opt-out — install pipeline pin.**
+/// Operator-fleet-wide opt-out via `[sigstore] verify = "off"`:
+/// install MUST succeed against a bundle the verifier would reject,
+/// because Off short-circuits to the legacy identity-only parser.
 ///
-/// `EnforceMode::Off` (resolved from `[sigstore] verify = "off"` in
-/// the user's `~/.lpm/config.toml`) means the verifier never runs for
-/// any package. The plan's correctness claim: install MUST succeed
-/// even when the registry serves a bundle the verifier would
-/// otherwise reject, because under `Off` the legacy identity-only
-/// parser runs and the cryptographic check is bypassed wholesale.
-///
-/// Same fixture as `install_drift_gate_under_enforce_warn_does_not_block_on_verifier_rejection`;
-/// the only variable is the resolution chain. Under `warn` the
-/// verifier runs and rejects (loudly, non-fatally). Under `off` the
-/// verifier doesn't run at all; the trust binding records a
-/// `Disabled` audit label. The contrast pins the orthogonality of
-/// the `EnforceMode` axis: `Warn` and `Off` are distinct outcomes,
-/// not synonyms.
-///
-/// Two negative signals on stderr asserted explicitly:
-/// 1. The warn-mode rejection line `"provenance verification FAILED"`
-///    must NOT appear (the verifier never ran).
-/// 2. The deny-mode drift block message must NOT appear (the install
-///    succeeded).
+/// Same fixture as
+/// `install_drift_gate_under_enforce_warn_does_not_block_on_verifier_rejection`
+/// — only the resolution chain differs. Two stderr signals pin the
+/// orthogonality of `Warn` vs `Off`: the warn-mode rejection line
+/// `"provenance verification FAILED"` must be absent, and the drift
+/// block message must be absent.
 #[tokio::test]
 async fn install_does_not_run_verifier_when_sigstore_verify_off_in_config() {
     let (project, mock) = setup_install_drift_gate_with_verifier_rejecting_candidate().await;

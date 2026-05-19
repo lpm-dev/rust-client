@@ -1,39 +1,10 @@
 //! Workflow tests for the `lpm doctor` sigstore-verify posture row.
 //!
-//! The plan's Phase 2.5 risk register lists "operator sets
-//! `sigstore.verify = off` once and forgets — fleet runs unverified
-//! indefinitely" as the load-bearing footgun for the persistent
-//! opt-out. Three mitigations layer to convert "silent disable" into
-//! "loud + audited disable":
-//!
-//! 1. A `tracing::warn` on every install run naming the resolved
-//!    source key (`LPM_PROVENANCE_ENFORCE` env / `[sigstore].verify`
-//!    config / default) and the re-enable command.
-//! 2. `provenance.verified: "disabled"` per package in the install
-//!    `--json` envelope so CI audit pipelines see the degrade.
-//! 3. `lpm doctor` flags the degraded state as a warning row with
-//!    the same re-enable hint.
-//!
-//! This file is the workflow-tier pin for mitigation #3 — the
-//! `lpm doctor` posture row. Inline unit tests in
-//! [`crates/lpm-cli/src/commands/doctor.rs`] cover the
-//! `check_sigstore_verify_posture` function directly. This file
-//! drives the real `lpm-rs` binary so a future regression that
-//! breaks the wiring between `EnforceMode::resolve_from_chain`,
-//! `GlobalConfig::get_sigstore_verify`, and the doctor catalog code
-//! surfaces here.
-//!
-//! The three codes pinned (and their semantics):
-//!
-//! - `sigstore_verify_enforced` — `deny` (default or explicit). Pass.
-//! - `sigstore_verify_warn_mode` — `warn`. Warn (degraded posture).
-//! - `sigstore_verify_disabled` — `off`. Warn (full opt-out).
-//!
-//! All three rows fire under `--all`; only the warn/disabled
-//! variants need surface in default (fast) mode if the posture is
-//! degraded, but the current implementation always includes the
-//! row so an operator running `lpm doctor` sees their posture
-//! regardless of mode flags.
+//! Inline unit tests in `commands/doctor.rs` cover
+//! `check_sigstore_verify_posture` directly. This file drives the
+//! real binary so a regression in the wiring between
+//! `EnforceMode::resolve_from_chain`, `GlobalConfig::get_sigstore_verify`,
+//! and the doctor catalog surfaces here.
 
 mod support;
 

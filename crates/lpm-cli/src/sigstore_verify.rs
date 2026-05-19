@@ -4910,9 +4910,9 @@ mod tests {
     fn rfc3161_timestamp_only_bundle_rejects_because_no_embedded_sct_is_present() {
         // Sigstore Bundle v0.3 allows `timestampVerificationData.rfc3161Timestamps[]`
         // as an alternative-to-SCT "certificate was valid at signing time"
-        // claim. The current verifier (Phase 1.4) is embedded-SCT-only —
-        // the RFC 3161 path is documented as a tracked follow-up and
-        // rejects fail-closed.
+        // claim. The current verifier is embedded-SCT-only — the
+        // RFC 3161 path is documented as a tracked follow-up in
+        // private/security-findings.md and rejects fail-closed.
         //
         // Pin the behavior at the primitive seam: a leaf cert without
         // the SCT extension rejects with `VerifyError::Sct`, regardless
@@ -6753,20 +6753,10 @@ mod tests {
         assert_eq!(spki, intermediate_parsed.tbs_certificate.subject_pki.raw);
     }
 
-    // ─── Phase 4.1 — per-primitive microbench ────────────────────
+    // ─── Per-primitive microbench ────────────────────────────────
     //
-    // The plan's perf-budget gate: "the verifier adds X ms per
-    // package." Decomposed into per-step timings so a future
-    // regression points at the primitive that regressed instead of
-    // forcing a bisect over the whole composed entry.
-    //
-    // Why an `#[ignore]`-gated test instead of a `[[bench]]`
-    // Criterion harness? `lpm-cli` is a `[[bin]]`-only crate (no
-    // `[lib]`); Criterion benches need access to the library API
-    // which the binary crate doesn't expose. The inline microbench
-    // below uses the same primitives the inline tests already
-    // exercise — keeping bench colocated with the code is also
-    // friendly to "ratchet against measured baseline" workflows.
+    // `#[ignore]`-gated; `lpm-cli` is `[[bin]]`-only so a Criterion
+    // `[[bench]]` harness would have no library API to reach.
     //
     // Invocation:
     //
@@ -6774,12 +6764,8 @@ mod tests {
     //     sigstore_verify::tests::microbench_per_step_primitive_timings \
     //     -- --ignored --nocapture
     //
-    // The harness prints per-primitive (mean, p95) over N=200 hot-
-    // loop iterations with a 50-iter warmup. The numbers are NOT
-    // assertions — this is a measurement tool, not a regression
-    // gate. The plan's "if microbench drifts past ~20 ms, rollout
-    // pauses" decision lives in the bench runbook, not in the
-    // test code.
+    // Reports mean / p50 / p95 / p99 per primitive over a 50-warmup
+    // + 200-measure sample. No assertions — measurement only.
 
     #[test]
     #[ignore = "perf microbench — run via `cargo test --release ... -- --ignored --nocapture`"]
