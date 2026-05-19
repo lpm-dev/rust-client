@@ -2914,12 +2914,23 @@ pub struct VerifiedProvenance {
 /// variant so the caller can surface diagnostics without a generic
 /// "verification failed" rollup.
 #[allow(dead_code)] // wired into provenance_fetch in Phase 2.1
+#[tracing::instrument(skip_all, name = "provenance.verify", level = "debug")]
 pub fn verify_sigstore_bundle(
     body: &[u8],
     expectations: &IdentityExpectations,
     options: VerifyOptions,
 ) -> Result<VerifiedProvenance, VerifyError> {
-    let components = parse_bundle_components(body)?;
+    // Dot-namespaced span names match the existing Tracy integration
+    // convention (`linker.prepare`, `linker.one`, etc.) so Tracy
+    // captures and `tracing-flame` outputs render the verifier in
+    // the same hierarchy as the rest of the install pipeline.
+    // Each span is `debug` level — no cost when no subscriber is
+    // attached (the `tracing` crate makes unattached spans nearly
+    // free), and the inner numbers are only useful when triaging.
+    let components = {
+        let _span = tracing::debug_span!("provenance.verify.parse").entered();
+        parse_bundle_components(body)?
+    };
     let trust = trust_root()?;
 
     let at_time = parse_integrated_time(&components.tlog_entry.integrated_time)?;
@@ -2928,18 +2939,24 @@ pub fn verify_sigstore_bundle(
     // that the trust root carries an active Rekor key for the log
     // this bundle references. Under `Either` policy with SET absent,
     // this is a no-op and returns the parsed integratedTime.
-    verify_rekor_set(
-        &components.tlog_entry,
-        &trust.rekor_keys,
-        options.rekor_inclusion_policy,
-    )?;
+    {
+        let _span = tracing::debug_span!("provenance.verify.set").entered();
+        verify_rekor_set(
+            &components.tlog_entry,
+            &trust.rekor_keys,
+            options.rekor_inclusion_policy,
+        )?;
+    }
 
     // Chain validation at the resolved `at_time`. Trust anchors are
     // pre-filtered to those active at the same time so a retired
     // root doesn't accidentally anchor a fresh bundle.
     let active_fulcio: Vec<&FulcioRoot> = trust.fulcio_roots_at(at_time);
     let chain_refs: Vec<&[u8]> = components.chain_der.iter().map(|d| d.as_slice()).collect();
-    verify_cert_chain(&chain_refs, &active_fulcio, at_time)?;
+    {
+        let _span = tracing::debug_span!("provenance.verify.chain").entered();
+        verify_cert_chain(&chain_refs, &active_fulcio, at_time)?;
+    }
 
     // Parse the leaf cert once for downstream consumers (DSSE,
     // identity, issuer SPKI lookup). The lifetime is tied to
@@ -2948,7 +2965,10 @@ pub fn verify_sigstore_bundle(
         VerifyError::BundleParse(format!("leaf cert DER did not re-parse for DSSE: {e}"))
     })?;
 
-    verify_dsse(&components.dsse_envelope, &leaf_parsed)?;
+    {
+        let _span = tracing::debug_span!("provenance.verify.dsse").entered();
+        verify_dsse(&components.dsse_envelope, &leaf_parsed)?;
+    }
 
     // SCT verify — need the immediate issuer's SPKI for the precert
     // signed-input. Search the bundle's chain first (chain[1..]),
@@ -2956,18 +2976,24 @@ pub fn verify_sigstore_bundle(
     // already cleared the path, so a match is guaranteed.
     let issuer_spki_der =
         find_leaf_issuer_spki(&leaf_parsed, &components.chain_der, &trust, at_time)?;
-    verify_embedded_sct(
-        &components.leaf_cert_der,
-        &issuer_spki_der,
-        &trust.ctlog_keys,
-        at_time,
-    )?;
+    {
+        let _span = tracing::debug_span!("provenance.verify.sct").entered();
+        verify_embedded_sct(
+            &components.leaf_cert_der,
+            &issuer_spki_der,
+            &trust.ctlog_keys,
+            at_time,
+        )?;
+    }
 
-    verify_rekor_body(
-        &components.tlog_entry,
-        &components.dsse_envelope,
-        &components.leaf_cert_der,
-    )?;
+    {
+        let _span = tracing::debug_span!("provenance.verify.rekor_body").entered();
+        verify_rekor_body(
+            &components.tlog_entry,
+            &components.dsse_envelope,
+            &components.leaf_cert_der,
+        )?;
+    }
 
     // Inclusion proof — policy-conditional. Verify whenever present
     // (defense in depth); failure-on-absence per policy.
@@ -2975,10 +3001,12 @@ pub fn verify_sigstore_bundle(
     match options.rekor_inclusion_policy {
         RekorInclusionProofPolicy::RequireInclusionProof
         | RekorInclusionProofPolicy::RequireBoth => {
+            let _span = tracing::debug_span!("provenance.verify.inclusion_proof").entered();
             verify_inclusion_proof(&components.tlog_entry, &trust.rekor_keys)?;
         }
         RekorInclusionProofPolicy::Either | RekorInclusionProofPolicy::RequireSet => {
             if has_inclusion_proof {
+                let _span = tracing::debug_span!("provenance.verify.inclusion_proof").entered();
                 verify_inclusion_proof(&components.tlog_entry, &trust.rekor_keys)?;
             }
         }
@@ -6723,5 +6751,263 @@ mod tests {
         // Sanity: returned SPKI must be the intermediate's, not the leaf's.
         let (_, intermediate_parsed) = X509Certificate::from_der(&intermediate_der).unwrap();
         assert_eq!(spki, intermediate_parsed.tbs_certificate.subject_pki.raw);
+    }
+
+    // ─── Phase 4.1 — per-primitive microbench ────────────────────
+    //
+    // The plan's perf-budget gate: "the verifier adds X ms per
+    // package." Decomposed into per-step timings so a future
+    // regression points at the primitive that regressed instead of
+    // forcing a bisect over the whole composed entry.
+    //
+    // Why an `#[ignore]`-gated test instead of a `[[bench]]`
+    // Criterion harness? `lpm-cli` is a `[[bin]]`-only crate (no
+    // `[lib]`); Criterion benches need access to the library API
+    // which the binary crate doesn't expose. The inline microbench
+    // below uses the same primitives the inline tests already
+    // exercise — keeping bench colocated with the code is also
+    // friendly to "ratchet against measured baseline" workflows.
+    //
+    // Invocation:
+    //
+    //   cargo test --release -p lpm-cli --bin lpm-rs \
+    //     sigstore_verify::tests::microbench_per_step_primitive_timings \
+    //     -- --ignored --nocapture
+    //
+    // The harness prints per-primitive (mean, p95) over N=200 hot-
+    // loop iterations with a 50-iter warmup. The numbers are NOT
+    // assertions — this is a measurement tool, not a regression
+    // gate. The plan's "if microbench drifts past ~20 ms, rollout
+    // pauses" decision lives in the bench runbook, not in the
+    // test code.
+
+    #[test]
+    #[ignore = "perf microbench — run via `cargo test --release ... -- --ignored --nocapture`"]
+    fn microbench_per_step_primitive_timings() {
+        use std::time::{Duration, Instant};
+
+        const WARMUP_ITERS: usize = 50;
+        const MEASURE_ITERS: usize = 200;
+
+        fn measure<F: FnMut()>(label: &str, mut f: F) {
+            for _ in 0..WARMUP_ITERS {
+                f();
+            }
+            let mut samples = Vec::with_capacity(MEASURE_ITERS);
+            for _ in 0..MEASURE_ITERS {
+                let t0 = Instant::now();
+                f();
+                samples.push(t0.elapsed());
+            }
+            samples.sort();
+            let mean: Duration = samples.iter().sum::<Duration>() / (samples.len() as u32);
+            let p50 = samples[samples.len() / 2];
+            let p95 = samples[(samples.len() * 95) / 100];
+            let p99 = samples[(samples.len() * 99) / 100];
+            println!(
+                "  {label:<32} mean={:>8.2}µs  p50={:>8.2}µs  p95={:>8.2}µs  p99={:>8.2}µs",
+                mean.as_secs_f64() * 1_000_000.0,
+                p50.as_secs_f64() * 1_000_000.0,
+                p95.as_secs_f64() * 1_000_000.0,
+                p99.as_secs_f64() * 1_000_000.0,
+            );
+        }
+
+        println!();
+        println!("sigstore_verify per-primitive microbench:");
+        println!("  warmup={WARMUP_ITERS}  measure={MEASURE_ITERS}  build=release");
+
+        // ── verify_dsse — DSSE envelope signature ────────────────
+        {
+            let (envelope, leaf_der) = build_signed_dsse_envelope_with_self_signed_leaf();
+            let (_, leaf_parsed) = X509Certificate::from_der(&leaf_der).unwrap();
+            measure("verify_dsse", || {
+                verify_dsse(&envelope, &leaf_parsed).expect("dsse must verify under bench setup");
+            });
+        }
+
+        // ── verify_rekor_set — SET signature + canonicalization ──
+        {
+            let (signing_key, spki_der, log_id_bytes) = p256_rekor_signing_key();
+            let log_id_hex = hex::encode(&log_id_bytes);
+            let integrated_time = 1700000000_i64;
+            let canonicalized_body = "Zm9vYmFy";
+            let set_input = build_set_input_canonical_json(
+                canonicalized_body,
+                integrated_time,
+                42,
+                &log_id_hex,
+            );
+            let digest = Sha256::digest(set_input.as_bytes());
+            let sig: Signature = signing_key.sign_prehash(&digest).expect("sign_prehash");
+            let set_b64 = BASE64.encode(sig.to_der().as_bytes());
+            let tlog = crate::sigstore::TlogEntry {
+                log_index: "42".into(),
+                log_id: crate::sigstore::LogId {
+                    key_id: log_id_hex.clone(),
+                },
+                integrated_time: integrated_time.to_string(),
+                inclusion_promise: Some(crate::sigstore::RekorInclusionPromise {
+                    signed_entry_timestamp: set_b64,
+                }),
+                inclusion_proof: None,
+                verification: None,
+                canonicalized_body: canonicalized_body.into(),
+            };
+            let key = rekor_key_active_around(log_id_bytes, spki_der, integrated_time);
+            let keys = std::slice::from_ref(&key);
+            measure("verify_rekor_set", || {
+                verify_rekor_set(&tlog, keys, RekorInclusionProofPolicy::RequireSet)
+                    .expect("rekor set must verify under bench setup");
+            });
+        }
+
+        // ── verify_embedded_sct — precert reconstruction + ECDSA ──
+        {
+            let bundle = build_signed_sct_bundle_for_bench();
+            let (_, leaf_parsed) = X509Certificate::from_der(&bundle.leaf_with_sct_der).unwrap();
+            let _ = leaf_parsed; // shape sanity
+            let keys = std::slice::from_ref(&bundle.ct_log_key);
+            measure("verify_embedded_sct", || {
+                verify_embedded_sct(
+                    &bundle.leaf_with_sct_der,
+                    &bundle.issuer_spki,
+                    keys,
+                    ts_year(2025),
+                )
+                .expect("embedded SCT must verify under bench setup");
+            });
+        }
+
+        // ── verify_inclusion_proof — Merkle walk + checkpoint ECDSA ──
+        {
+            let (signing_key, spki_der, log_id_bytes) = p256_rekor_signing_key();
+            let log_id_hex = hex::encode(&log_id_bytes);
+            let integrated_time = 1700000000_i64;
+            let ([_h0, h1, _h2, _h3], (_h01, h23), root, leaves) = four_leaf_tree();
+            let checkpoint =
+                build_signed_checkpoint(&signing_key, "rekor.sigstore.dev - 1", 4, &root);
+            let tlog = synth_tlog_entry_with_inclusion_proof(
+                &log_id_hex,
+                0,
+                integrated_time,
+                &BASE64.encode(leaves[0]),
+                checkpoint,
+                vec![hex::encode(&h1), hex::encode(&h23)],
+                &hex::encode(&root),
+                4,
+            );
+            let key = rekor_key_active_around(log_id_bytes, spki_der, integrated_time);
+            let keys = std::slice::from_ref(&key);
+            measure("verify_inclusion_proof", || {
+                verify_inclusion_proof(&tlog, keys)
+                    .expect("inclusion proof must verify under bench setup");
+            });
+        }
+
+        // ── parse_bundle_components — JSON parse + base64 + serde ──
+        {
+            let leaf = b"leaf-der-stand-in";
+            let bundle = synth_bundle_v03(leaf, &dummy_dsse_envelope(), &dummy_tlog_entry());
+            let body = serde_json::to_vec(&bundle).unwrap();
+            measure("parse_bundle_components", || {
+                parse_bundle_components(&body).expect("parse must succeed under bench setup");
+            });
+        }
+
+        println!();
+        println!("  baseline (microbench only — wall-clock from `lpm install` is the");
+        println!("  authoritative perf gate; see private/sigstore-perf-runbook.md).");
+        println!();
+    }
+
+    /// Build a DSSE envelope signed by a freshly-generated leaf
+    /// cert's P-256 key. Returns `(envelope, leaf_der)` so the
+    /// bench can hold both. Mirrors what
+    /// `verifies_raw_r_s_signature_against_matching_leaf_cert`
+    /// constructs inline.
+    fn build_signed_dsse_envelope_with_self_signed_leaf() -> (DsseEnvelope, Vec<u8>) {
+        let leaf_kp = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).unwrap();
+        let mut params = cert_params_validity(2025);
+        params.subject_alt_names = vec![rcgen::SanType::URI(
+            rcgen::Ia5String::try_from("https://example.invalid/bench".to_string()).unwrap(),
+        )];
+        let cert = params.self_signed(&leaf_kp).unwrap();
+        let leaf_der = cert.der().to_vec();
+
+        let payload_bytes = b"{\"_type\":\"https://in-toto.io/Statement/v1\"}".to_vec();
+        let payload_type = "application/vnd.in-toto+json";
+        let pae_bytes = pae(payload_type, &payload_bytes);
+
+        let pkcs8 = leaf_kp.serialize_der();
+        let signing = p256::ecdsa::SigningKey::from_pkcs8_der(&pkcs8).unwrap();
+        let signature: Signature = signing.sign(&pae_bytes);
+        let sig_b64 = BASE64.encode(signature.to_bytes().as_slice());
+
+        let envelope = DsseEnvelope {
+            payload_type: payload_type.to_string(),
+            payload: BASE64.encode(&payload_bytes),
+            signatures: vec![DsseSignature {
+                keyid: String::new(),
+                sig: sig_b64,
+            }],
+        };
+        (envelope, leaf_der)
+    }
+
+    /// Bench-time SCT setup: build a leaf with one valid embedded
+    /// SCT signed by a synthetic CT-log key. Returns the leaf DER,
+    /// the issuer's SPKI, and the CT log key to pin. Mirrors
+    /// `verifies_valid_embedded_sct_against_pinned_ct_log_key`.
+    struct BenchSctBundle {
+        leaf_with_sct_der: Vec<u8>,
+        issuer_spki: Vec<u8>,
+        ct_log_key: CtLogKey,
+    }
+
+    fn build_signed_sct_bundle_for_bench() -> BenchSctBundle {
+        let issuer = fresh_sct_issuer();
+        let leaf_kp = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).unwrap();
+        let issuer_spki = issuer_spki_from_cert(&issuer.cert);
+        let issuer_key_hash = Sha256::digest(&issuer_spki).to_vec();
+        let (ct_signing_key, ct_log_key) = synth_ct_log_key(2025);
+        let timestamp_ms = 1_700_000_000_000u64;
+        let sct_extensions: &[u8] = &[];
+
+        let leaf_without_sct_der = build_leaf_with_optional_sct(&leaf_kp, &issuer, None);
+        let (_, parsed_without_sct) = X509Certificate::from_der(&leaf_without_sct_der).unwrap();
+        let precert_tbs = parsed_without_sct.tbs_certificate.as_ref().to_vec();
+
+        let mut signed_input = Vec::new();
+        signed_input.push(0u8);
+        signed_input.push(0u8);
+        signed_input.extend_from_slice(&timestamp_ms.to_be_bytes());
+        signed_input.extend_from_slice(&1u16.to_be_bytes());
+        signed_input.extend_from_slice(&issuer_key_hash);
+        let tbs_len = precert_tbs.len() as u32;
+        signed_input.push(((tbs_len >> 16) & 0xFF) as u8);
+        signed_input.push(((tbs_len >> 8) & 0xFF) as u8);
+        signed_input.push((tbs_len & 0xFF) as u8);
+        signed_input.extend_from_slice(&precert_tbs);
+        signed_input.extend_from_slice(&(sct_extensions.len() as u16).to_be_bytes());
+        signed_input.extend_from_slice(sct_extensions);
+        let sig: Signature = ct_signing_key.sign(&signed_input);
+        let sig_der = sig.to_der().as_bytes().to_vec();
+        let serialized_sct = encode_serialized_sct(
+            &ct_log_key.log_id,
+            timestamp_ms,
+            sct_extensions,
+            4,
+            3,
+            &sig_der,
+        );
+        let sct_list = encode_sct_list(&[&serialized_sct]);
+        let leaf_with_sct_der = build_leaf_with_optional_sct(&leaf_kp, &issuer, Some(&sct_list));
+
+        BenchSctBundle {
+            leaf_with_sct_der,
+            issuer_spki,
+            ct_log_key,
+        }
     }
 }
