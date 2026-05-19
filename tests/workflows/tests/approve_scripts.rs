@@ -978,17 +978,25 @@ fn write_build_state_audit(project: &TempProject, entries: &[(&str, &str, &str, 
     );
 }
 
-/// **Legacy bare-name upgrade regression.** Legacy bare-name `trustedDependencies`
-/// (`["esbuild"]`) upgrades to the rich `esbuild@*` sentinel when
-/// `--yes` runs against a state with `sharp` blocked. A subsequent
-/// install that captures `esbuild` in its build-state must NOT re-block
-/// it — the `@*` sentinel covers any version of esbuild via the
-/// LegacyNameOnly path.
+/// **H17 regression — legacy bare-name upgrade no longer auto-trusts
+/// future versions.** A legacy `trustedDependencies: ["esbuild"]` that
+/// gets upgraded to the rich `esbuild@*` sentinel during `--yes`
+/// approval MUST NOT clear esbuild from the blocked set on a
+/// subsequent install where it appears as a concrete version. The
+/// `@*` sentinel is a migration marker, not a trust grant; the user
+/// must re-approve the concrete version via `lpm approve-scripts`,
+/// which writes a `esbuild@0.25.1` Rich entry with content-bound
+/// `(integrity, script_hash)`. Honoring the sentinel for trust
+/// auto-trusted every future version under the inherited name-only
+/// approval — the H17 cross-version trust laundering surface.
+///
+/// Inverts the pre-H17 contract that asserted blocked_count == 0
+/// after the upgrade.
 #[test]
-fn approve_scripts_legacy_array_upgrade_preserves_esbuild_after_subsequent_install() {
+fn approve_scripts_h17_at_star_sentinel_still_blocks_unknown_versions_after_install() {
     let project = TempProject::empty(
         r#"{
-  "name": "audit-d-impl-1",
+  "name": "audit-h17-1",
   "version": "0.0.0",
   "lpm": { "trustedDependencies": ["esbuild"] }
 }"#,
@@ -998,7 +1006,7 @@ fn approve_scripts_legacy_array_upgrade_preserves_esbuild_after_subsequent_insta
         &[("sharp", "0.32.1", "sha512-sharp-int", "sha256-sharp-h")],
     );
 
-    // Step 1: --yes approves sharp + upgrades esbuild to @*.
+    // Step 1: --yes approves sharp + upgrades esbuild legacy → @* sentinel.
     let out1 = lpm(&project)
         .args(["approve-scripts", "--yes"])
         .output()
@@ -1014,7 +1022,7 @@ fn approve_scripts_legacy_array_upgrade_preserves_esbuild_after_subsequent_insta
     let map = td.as_object().unwrap();
     assert!(
         map.contains_key("esbuild@*"),
-        "esbuild must be preserved as the @* sentinel; got: {td}"
+        "esbuild legacy entry must be preserved as the @* sentinel; got: {td}"
     );
     assert!(
         map.contains_key("sharp@0.32.1"),
@@ -1035,7 +1043,9 @@ fn approve_scripts_legacy_array_upgrade_preserves_esbuild_after_subsequent_insta
         ],
     );
 
-    // Step 3: --list --json must show 0 blocked (esbuild covered by @*).
+    // Step 3: --list --json must show esbuild still blocked. Sharp's
+    // concrete @0.32.1 entry continues to clear sharp; the @* sentinel
+    // for esbuild does NOT auto-trust @0.25.1.
     let out2 = lpm(&project)
         .args(["--json", "approve-scripts", "--list"])
         .output()
@@ -1048,9 +1058,15 @@ fn approve_scripts_legacy_array_upgrade_preserves_esbuild_after_subsequent_insta
         serde_json::from_str(&strip_ansi(&String::from_utf8_lossy(&out2.stdout))).unwrap();
     assert_eq!(
         parsed["blocked_count"].as_u64(),
-        Some(0),
-        "@* sentinel must cover esbuild + rich entry covers sharp; envelope: {parsed:#}"
+        Some(1),
+        "H17: @* sentinel must NOT clear esbuild from the blocked set; \
+         user must re-approve the concrete version via approve-scripts. \
+         Envelope: {parsed:#}"
     );
+    let blocked = parsed["blocked"].as_array().unwrap();
+    assert_eq!(blocked.len(), 1);
+    assert_eq!(blocked[0]["name"], "esbuild");
+    assert_eq!(blocked[0]["version"], "0.25.1");
 }
 
 /// **Filter-by-current-state regression.** `approve-scripts --list` filters persisted
