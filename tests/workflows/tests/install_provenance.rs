@@ -1077,3 +1077,72 @@ async fn install_skip_flag_short_circuits_verifier_under_enforce_warn() {
          contract broken); got:\n{combined}",
     );
 }
+
+/// Persist `[sigstore] verify = "off"` to the isolated HOME's config
+/// so the install run resolves the operator-fleet-wide opt-out via
+/// `GlobalConfig::get_sigstore_verify`.
+fn write_sigstore_off_to_isolated_config(project: &TempProject) {
+    let cfg = project.home().join(".lpm").join("config.toml");
+    std::fs::create_dir_all(cfg.parent().unwrap()).expect("create ~/.lpm");
+    std::fs::write(&cfg, "[sigstore]\nverify = \"off\"\n").expect("write config.toml");
+}
+
+/// **Phase 2.5 operator-fleet-wide opt-out — install pipeline pin.**
+///
+/// `EnforceMode::Off` (resolved from `[sigstore] verify = "off"` in
+/// the user's `~/.lpm/config.toml`) means the verifier never runs for
+/// any package. The plan's correctness claim: install MUST succeed
+/// even when the registry serves a bundle the verifier would
+/// otherwise reject, because under `Off` the legacy identity-only
+/// parser runs and the cryptographic check is bypassed wholesale.
+///
+/// Same fixture as `install_drift_gate_under_enforce_warn_does_not_block_on_verifier_rejection`;
+/// the only variable is the resolution chain. Under `warn` the
+/// verifier runs and rejects (loudly, non-fatally). Under `off` the
+/// verifier doesn't run at all; the trust binding records a
+/// `Disabled` audit label. The contrast pins the orthogonality of
+/// the `EnforceMode` axis: `Warn` and `Off` are distinct outcomes,
+/// not synonyms.
+///
+/// Two negative signals on stderr asserted explicitly:
+/// 1. The warn-mode rejection line `"provenance verification FAILED"`
+///    must NOT appear (the verifier never ran).
+/// 2. The deny-mode drift block message must NOT appear (the install
+///    succeeded).
+#[tokio::test]
+async fn install_does_not_run_verifier_when_sigstore_verify_off_in_config() {
+    let (project, mock) = setup_install_drift_gate_with_verifier_rejecting_candidate().await;
+    write_sigstore_off_to_isolated_config(&project);
+
+    let out = lpm_with_registry(&project, &mock.url())
+        .args(["install"])
+        .output()
+        .expect("spawn lpm install with [sigstore] verify=off");
+
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+    assert!(
+        out.status.success(),
+        "EnforceMode::Off + verifier-rejecting bundle MUST succeed; verifier shouldn't run. \
+         If this fails, the Off short-circuit in fetch_provenance_for_pkgs has regressed \
+         or [sigstore] verify resolution is no longer reading the config file.\n\
+         stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+    assert!(
+        !drift_block_message_present(&out),
+        "drift block message must NOT appear when sigstore.verify=off — the legacy identity-only \
+         parser ran and the candidate's identity matches the approved binding; got:\n{combined}",
+    );
+    assert!(
+        !combined.contains("provenance verification FAILED"),
+        "Off mode must NOT emit the warn-mode verifier-rejection line — the verifier never \
+         ran. If this fires, the SkipPolicy/EnforceMode short-circuit at \
+         `verify_policy_ref.should_skip_verification_for` collapsed and Off is being \
+         treated like Warn; got:\n{combined}",
+    );
+}
