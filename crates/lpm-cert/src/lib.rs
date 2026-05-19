@@ -6,6 +6,7 @@
 //! 3. Generating per-project certificates signed by that CA
 //! 4. Detecting the dev framework and injecting the right env vars
 
+pub mod audit;
 pub mod ca;
 pub mod cert;
 pub mod framework;
@@ -45,6 +46,30 @@ pub fn write_key_file(path: &Path, contents: &[u8]) -> std::io::Result<()> {
 #[cfg(not(unix))]
 pub fn write_key_file(path: &Path, contents: &[u8]) -> std::io::Result<()> {
     std::fs::write(path, contents)
+}
+
+/// Static label for the platform's trust store, used as the `store` field in audit
+/// events. Lowercase + kebab to match the strings logged by other LPM subsystems.
+pub fn trust_store_label() -> &'static str {
+    if std::env::var_os("LPM_CERT_TEST_TRUST_STORE_DIR").is_some() {
+        return "test";
+    }
+    #[cfg(target_os = "macos")]
+    {
+        "macos-login"
+    }
+    #[cfg(target_os = "linux")]
+    {
+        "linux-ca-certificates"
+    }
+    #[cfg(target_os = "windows")]
+    {
+        "windows-root"
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+    {
+        "unknown"
+    }
 }
 
 /// Create `path` (parents included) and tighten its mode to `0o700` on Unix.
@@ -125,9 +150,34 @@ pub fn ensure_https(
         write_key_file(&key_path, ca_key_pem.as_bytes())
             .map_err(|e| LpmError::Cert(format!("failed to write CA key: {e}")))?;
 
+        let fp = cert::fingerprint_sha256(&cert_path)?;
+        let fp_hex = cert::fingerprint_hex(&fp);
+        audit::append_best_effort(audit::AuditAction::CaGenerate {
+            fingerprint: fp_hex.clone(),
+            validity_days: ca::CA_VALIDITY_DAYS,
+            name_constraints: ca::wants_name_constraints(),
+        });
+
         tracing::info!("installing CA into system trust store...");
-        trust::install_ca(&cert_path)
-            .map_err(|e| LpmError::Cert(format!("failed to install CA: {e}")))?;
+        match trust::install_ca(&cert_path) {
+            Ok(()) => {
+                audit::append_best_effort(audit::AuditAction::CaTrustInstall {
+                    fingerprint: fp_hex,
+                    store: trust_store_label(),
+                    status: audit::AuditStatus::Ok,
+                    error: None,
+                });
+            }
+            Err(e) => {
+                audit::append_best_effort(audit::AuditAction::CaTrustInstall {
+                    fingerprint: fp_hex,
+                    store: trust_store_label(),
+                    status: audit::AuditStatus::Error,
+                    error: Some(e.to_string()),
+                });
+                return Err(LpmError::Cert(format!("failed to install CA: {e}")));
+            }
+        }
 
         true
     } else {
