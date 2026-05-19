@@ -99,7 +99,7 @@ fn run_trust(json_output: bool) -> Result<(), LpmError> {
     if !ca_cert_path.exists() {
         // Generate CA first
         let ca_dir = lpm_cert::paths::ca_dir()?;
-        std::fs::create_dir_all(&ca_dir)
+        lpm_cert::create_dir_secure(&ca_dir)
             .map_err(|e| LpmError::Cert(format!("failed to create cert dir: {e}")))?;
 
         let (ca_cert_pem, ca_key_pem) = lpm_cert::ca::generate_ca()

@@ -44,6 +44,21 @@ fn write_key_file(path: &Path, contents: &[u8]) -> std::io::Result<()> {
     std::fs::write(path, contents)
 }
 
+/// Create `path` (parents included) and tighten its mode to `0o700` on Unix.
+///
+/// The mode is reapplied every call, not only at creation, because a pre-H11 install may
+/// have left the dir at `0o755`. On non-Unix the mode call is a no-op and the
+/// user-profile ACL governs access.
+pub fn create_dir_secure(path: &Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))?;
+    }
+    Ok(())
+}
+
 /// Result of setting up HTTPS for a project.
 #[derive(Debug)]
 pub struct HttpsSetup {
@@ -95,7 +110,7 @@ pub fn ensure_https(
         let (ca_cert_pem, ca_key_pem) =
             ca::generate_ca().map_err(|e| LpmError::Cert(format!("failed to generate CA: {e}")))?;
 
-        std::fs::create_dir_all(&ca_dir)
+        create_dir_secure(&ca_dir)
             .map_err(|e| LpmError::Cert(format!("failed to create cert dir: {e}")))?;
 
         let cert_path = paths::ca_cert_path()?;
@@ -270,6 +285,44 @@ mod tests {
         assert_eq!(mode & 0o070, 0, "key file should not be group-accessible");
         // No other read/write/execute
         assert_eq!(mode & 0o007, 0, "key file should not be world-accessible");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn create_dir_secure_sets_0700_on_fresh_dir() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let parent = tempfile::tempdir().unwrap();
+        let target = parent.path().join("certs");
+
+        create_dir_secure(&target).unwrap();
+
+        let mode = std::fs::metadata(&target).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            mode, 0o700,
+            "newly-created cert dir should be 0o700, got 0o{mode:o}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn create_dir_secure_tightens_pre_existing_dir() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let parent = tempfile::tempdir().unwrap();
+        let target = parent.path().join("certs");
+
+        // Simulate a pre-H11 install: dir already exists at 0o755.
+        std::fs::create_dir_all(&target).unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        create_dir_secure(&target).unwrap();
+
+        let mode = std::fs::metadata(&target).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            mode, 0o700,
+            "existing cert dir should be re-tightened to 0o700, got 0o{mode:o}"
+        );
     }
 
     #[cfg(unix)]
