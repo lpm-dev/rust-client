@@ -34,6 +34,22 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 const NPM_REGISTRY_URL_DEFAULT: &str = "https://registry.npmjs.org/@lpm-registry/cli/latest";
 const GITHUB_RELEASES_URL_DEFAULT: &str =
     "https://api.github.com/repos/lpm-dev/rust-client/releases/latest";
+
+/// Template for the "release by tag" endpoint. `{tag}` is substituted
+/// at call time (raw, no encoding — version strings are restricted to
+/// semver characters by the caller's earlier validation). The
+/// `LPM_GITHUB_RELEASE_BY_TAG_URL_OVERRIDE` env var, when set, is the
+/// full template (must contain `{tag}`); tests point it at wiremock.
+const GITHUB_RELEASE_BY_TAG_URL_DEFAULT: &str =
+    "https://api.github.com/repos/lpm-dev/rust-client/releases/tags/v{tag}";
+
+/// Template for release-asset download URLs. `{tag}` and `{file}` are
+/// substituted at call time. The `LPM_GITHUB_RELEASE_DOWNLOAD_URL_OVERRIDE`
+/// env var, when set, is the full template (must contain both
+/// placeholders); tests point it at a wiremock-backed loopback server.
+const GITHUB_RELEASE_DOWNLOAD_URL_DEFAULT: &str =
+    "https://github.com/lpm-dev/rust-client/releases/download/v{tag}/{file}";
+
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Resolve the npm registry endpoint. Honours
@@ -193,6 +209,10 @@ pub enum LookupError {
     HttpStatus { status: u16, body_excerpt: String },
     /// Response body present but `tag_name` missing or invalid.
     MalformedResponse(String),
+    /// Endpoint returned 404 (release tag does not exist on GitHub).
+    /// Distinct from `HttpStatus` so callers can branch cleanly on
+    /// "no such release" vs other server errors.
+    NotFound(String),
 }
 
 impl std::fmt::Display for LookupError {
@@ -229,6 +249,7 @@ impl std::fmt::Display for LookupError {
                 }
             }
             Self::MalformedResponse(msg) => write!(f, "malformed release-lookup response: {msg}"),
+            Self::NotFound(msg) => write!(f, "release not found: {msg}"),
         }
     }
 }
@@ -587,6 +608,125 @@ async fn probe_one(source: Source, cache: &mut UpdateCache) -> Result<FetchOutco
     }
 
     Ok(FetchOutcome::Fresh { version })
+}
+
+// ---------------------------------------------------------------------
+// Release-by-tag metadata (standalone self-update replay-window anchor)
+// ---------------------------------------------------------------------
+
+/// Resolve the "release by tag" endpoint with the same override gating
+/// as the latest-release path. The default URL templates `{tag}`,
+/// which the caller substitutes after override resolution so the
+/// override env var can carry its own `{tag}` placeholder (wiremock
+/// tests typically set it to `http://127.0.0.1:<port>/releases/tags/v{tag}`).
+fn github_release_by_tag_url(version: &str) -> String {
+    let template = resolve_release_url(
+        "LPM_GITHUB_RELEASE_BY_TAG_URL_OVERRIDE",
+        GITHUB_RELEASE_BY_TAG_URL_DEFAULT,
+    );
+    template.replace("{tag}", version)
+}
+
+/// Resolve a release-asset download URL with `{tag}` and `{file}`
+/// substitution after override gating. Public so the standalone
+/// self-update path (which downloads the manifest, the bundle, and
+/// the platform binary from this base) shares the override hook.
+pub fn github_release_download_url(version: &str, file: &str) -> String {
+    let template = resolve_release_url(
+        "LPM_GITHUB_RELEASE_DOWNLOAD_URL_OVERRIDE",
+        GITHUB_RELEASE_DOWNLOAD_URL_DEFAULT,
+    );
+    template.replace("{tag}", version).replace("{file}", file)
+}
+
+/// Fetch the `published_at` ISO-8601 timestamp for a specific release tag.
+///
+/// Used by the standalone self-update path to anchor the Sigstore-bundle
+/// replay-window check against the actual release publication time,
+/// decoupled from the npm-first version probe. Runs only on the
+/// standalone arm — npm/Homebrew/cargo arms have their own integrity
+/// stories and don't need a window anchor.
+///
+/// Failure shapes: `NotFound` for 404 (tag does not exist),
+/// `MalformedResponse` for missing/non-string/unparseable `published_at`,
+/// `RateLimited` / `HttpStatus` / `Transport` for the underlying network
+/// failures (kept identical to `probe_one`'s shape so the wrapping
+/// `LpmError::SelfUpdate` mapping at the call site stays uniform).
+pub async fn fetch_github_release_published_at(
+    version: &str,
+) -> Result<chrono::DateTime<chrono::Utc>, LookupError> {
+    let url = github_release_by_tag_url(version);
+
+    let client = reqwest::Client::builder()
+        .timeout(REQUEST_TIMEOUT)
+        .build()
+        .map_err(|e| LookupError::Transport(format!("failed to build HTTP client: {e}")))?;
+
+    let mut req = client
+        .get(&url)
+        .header("User-Agent", "lpm-cli")
+        .header("Accept", "application/vnd.github.v3+json");
+    if let Some(token) = github_token() {
+        req = req.header("Authorization", format!("Bearer {token}"));
+    }
+
+    let resp = req
+        .send()
+        .await
+        .map_err(|e| LookupError::Transport(e.to_string()))?;
+
+    let status = resp.status();
+
+    if status.as_u16() == 404 {
+        return Err(LookupError::NotFound(format!(
+            "GitHub has no release at tag v{version}"
+        )));
+    }
+
+    if status.as_u16() == 403
+        && resp
+            .headers()
+            .get("x-ratelimit-remaining")
+            .and_then(|v| v.to_str().ok())
+            == Some("0")
+    {
+        let reset_at = resp
+            .headers()
+            .get("x-ratelimit-reset")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| s.parse::<u64>().ok());
+        return Err(LookupError::RateLimited { reset_at });
+    }
+
+    if !status.is_success() {
+        let body = resp.text().await.unwrap_or_default();
+        let excerpt: String = body.chars().take(200).collect();
+        return Err(LookupError::HttpStatus {
+            status: status.as_u16(),
+            body_excerpt: excerpt,
+        });
+    }
+
+    let body: serde_json::Value = resp.json().await.map_err(|e| {
+        LookupError::MalformedResponse(format!("release-by-tag body not JSON: {e}"))
+    })?;
+
+    let published_at_str = body
+        .get("published_at")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| {
+            LookupError::MalformedResponse(format!(
+                "release v{version} response missing string `published_at`"
+            ))
+        })?;
+
+    chrono::DateTime::parse_from_rfc3339(published_at_str)
+        .map(|dt| dt.with_timezone(&chrono::Utc))
+        .map_err(|e| {
+            LookupError::MalformedResponse(format!(
+                "release v{version} `published_at` not RFC 3339: {e}"
+            ))
+        })
 }
 
 // ---------------------------------------------------------------------
@@ -1485,5 +1625,148 @@ mod tests {
             "HTTPS override must steer the lookup",
         );
         unsafe { std::env::remove_var(NPM_OVERRIDE_KEY) };
+    }
+
+    // ── fetch_github_release_published_at ─────────────────────────
+
+    const RELEASE_BY_TAG_OVERRIDE_KEY: &str = "LPM_GITHUB_RELEASE_BY_TAG_URL_OVERRIDE";
+
+    /// Drop guard that restores `LPM_GITHUB_RELEASE_BY_TAG_URL_OVERRIDE`
+    /// to whatever value (or absence) preceded the test. Uses the same
+    /// `env_override_lock` as the older NPM/GH overrides because all
+    /// release-lookup tests need to serialise env mutation.
+    struct ReleaseByTagOverrideGuard {
+        prev: Option<String>,
+        _lock: std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl Drop for ReleaseByTagOverrideGuard {
+        fn drop(&mut self) {
+            unsafe {
+                match &self.prev {
+                    Some(v) => std::env::set_var(RELEASE_BY_TAG_OVERRIDE_KEY, v),
+                    None => std::env::remove_var(RELEASE_BY_TAG_OVERRIDE_KEY),
+                }
+            }
+        }
+    }
+
+    async fn with_release_by_tag_override<F>(template: &str, fut: F)
+    where
+        F: std::future::Future<Output = ()>,
+    {
+        let lock = env_override_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let guard = ReleaseByTagOverrideGuard {
+            prev: std::env::var(RELEASE_BY_TAG_OVERRIDE_KEY).ok(),
+            _lock: lock,
+        };
+        unsafe { std::env::set_var(RELEASE_BY_TAG_OVERRIDE_KEY, template) };
+        fut.await;
+        drop(guard);
+    }
+
+    #[tokio::test]
+    async fn fetch_github_release_published_at_parses_timestamp() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/releases/tags/v0.42.0"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "tag_name": "v0.42.0",
+                    "published_at": "2026-05-10T12:34:56Z",
+                })),
+            )
+            .mount(&server)
+            .await;
+
+        let template = format!("{}/releases/tags/v{{tag}}", server.uri());
+        with_release_by_tag_override(&template, async {
+            let parsed = fetch_github_release_published_at("0.42.0")
+                .await
+                .expect("must parse");
+            assert_eq!(parsed.to_rfc3339(), "2026-05-10T12:34:56+00:00");
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn fetch_github_release_published_at_errors_on_404() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/releases/tags/v9.9.9"))
+            .respond_with(wiremock::ResponseTemplate::new(404))
+            .mount(&server)
+            .await;
+
+        let template = format!("{}/releases/tags/v{{tag}}", server.uri());
+        with_release_by_tag_override(&template, async {
+            let err = fetch_github_release_published_at("9.9.9")
+                .await
+                .expect_err("404 must surface");
+            assert!(
+                matches!(err, LookupError::NotFound(_)),
+                "expected NotFound, got: {err:?}"
+            );
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn fetch_github_release_published_at_errors_on_missing_field() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/releases/tags/v0.42.0"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "tag_name": "v0.42.0",
+                })),
+            )
+            .mount(&server)
+            .await;
+
+        let template = format!("{}/releases/tags/v{{tag}}", server.uri());
+        with_release_by_tag_override(&template, async {
+            let err = fetch_github_release_published_at("0.42.0")
+                .await
+                .expect_err("missing published_at must surface");
+            match err {
+                LookupError::MalformedResponse(msg) => {
+                    assert!(msg.contains("published_at"), "msg: {msg}");
+                }
+                other => panic!("wrong variant: {other:?}"),
+            }
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn fetch_github_release_published_at_errors_on_malformed_timestamp() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/releases/tags/v0.42.0"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "tag_name": "v0.42.0",
+                    "published_at": "not-a-date",
+                })),
+            )
+            .mount(&server)
+            .await;
+
+        let template = format!("{}/releases/tags/v{{tag}}", server.uri());
+        with_release_by_tag_override(&template, async {
+            let err = fetch_github_release_published_at("0.42.0")
+                .await
+                .expect_err("malformed timestamp must surface");
+            match err {
+                LookupError::MalformedResponse(msg) => {
+                    assert!(msg.contains("not RFC 3339"), "msg: {msg}");
+                }
+                other => panic!("wrong variant: {other:?}"),
+            }
+        })
+        .await;
     }
 }

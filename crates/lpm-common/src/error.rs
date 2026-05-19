@@ -223,6 +223,26 @@ pub enum LpmError {
         )
     )]
     ProvenanceVerification(String),
+
+    /// `lpm self-update` standalone path refused to swap the binary
+    /// because the release artifacts failed an integrity gate
+    /// (`SHA256SUMS.txt` missing on a release that predates the
+    /// signed-install gate, Sigstore bundle rejected, SHA mismatch,
+    /// identity pin not satisfied, replay window violated, etc.).
+    /// Distinct from `Network` so the CLI can render remediation copy
+    /// that names the manual install URL.
+    #[error("self-update refused: {0}")]
+    #[diagnostic(
+        code(lpm::self_update),
+        help(
+            "The downloaded release could not be cryptographically verified. \
+             If this is a release that predates LPM's signed-install gate, install \
+             manually from https://github.com/lpm-dev/rust-client/releases. \
+             Otherwise the release artifacts may be tampered or the manifest may be missing — \
+             retry, and if the failure persists report at https://github.com/lpm-dev/rust-client/issues."
+        )
+    )]
+    SelfUpdate(String),
 }
 
 impl LpmError {
@@ -261,6 +281,7 @@ impl LpmError {
             LpmError::SelfUpdatePaused(_) => "self_update_paused",
             LpmError::SelfUpdateRateLimited(_) => "self_update_rate_limited",
             LpmError::ProvenanceVerification(_) => "provenance_verification",
+            LpmError::SelfUpdate(_) => "self_update",
         }
     }
 }
