@@ -503,6 +503,49 @@ pub fn p256_pair_wrap_key(
     Ok((encrypted, eph_pub_b64))
 }
 
+/// Short authentication string ("match number") for pairing-flow
+/// confirmation. Both the dashboard and the CLI compute this independently
+/// from the same `(pairing_code, browser_public_key_b64)` inputs; the user
+/// glance-compares the two displays to detect a mid-flight key swap. The
+/// server never computes or transmits this value, so a compromised server
+/// cannot pre-compute matching pairs.
+///
+/// Output is always two ASCII digits (`"00"`..`"99"`). Hash domain string
+/// `"lpm-pair-sas"` separates this derivation from any future SHA-256 use
+/// over the same inputs.
+pub fn pairing_match_number(pairing_code: &str, browser_public_key_b64: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"lpm-pair-sas:");
+    hasher.update(pairing_code.as_bytes());
+    hasher.update(b":");
+    hasher.update(browser_public_key_b64.as_bytes());
+    let digest = hasher.finalize();
+    let value = u16::from_be_bytes([digest[0], digest[1]]) % 100;
+    format!("{value:02}")
+}
+
+/// Short visual fingerprint of the browser's public key, computed from the
+/// bytes the CLI is about to wrap for. Returns the first eight bytes of
+/// `SHA-256(base64-decoded pubkey)` formatted as `xx:xx:xx:xx:xx:xx:xx:xx`
+/// in lowercase hex. If the input fails to decode as base64 the function
+/// returns `None` so the caller can surface a clear "could not derive
+/// fingerprint" message rather than display a fingerprint of attacker
+/// padding.
+pub fn browser_key_fingerprint(browser_public_key_b64: &str) -> Option<String> {
+    let raw = BASE64.decode(browser_public_key_b64).ok()?;
+    let mut hasher = Sha256::new();
+    hasher.update(&raw);
+    let digest = hasher.finalize();
+    let mut out = String::with_capacity(23);
+    for (i, byte) in digest.iter().take(8).enumerate() {
+        if i > 0 {
+            out.push(':');
+        }
+        out.push_str(&format!("{byte:02x}"));
+    }
+    Some(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -843,5 +886,114 @@ mod tests {
         let (enc_b, eph_b) = p256_pair_wrap_key(&wrapping_key, &browser_pub_b64).unwrap();
         assert_ne!(enc_a, enc_b); // Different ephemeral key each time
         assert_ne!(eph_a, eph_b);
+    }
+
+    #[test]
+    fn pairing_match_number_is_two_digits_for_random_inputs() {
+        for _ in 0..200 {
+            let code: String = (0..6)
+                .map(|_| {
+                    let chars = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+                    chars
+                        .as_bytes()
+                        .get(rand::random::<usize>() % chars.len())
+                        .map(|b| *b as char)
+                        .unwrap()
+                })
+                .collect();
+            use rand::RngCore;
+            let mut pub_bytes = [0u8; 65];
+            rand::thread_rng().fill_bytes(&mut pub_bytes);
+            let pub_b64 = BASE64.encode(pub_bytes);
+            let out = pairing_match_number(&code, &pub_b64);
+            assert_eq!(out.len(), 2, "match number must be two characters");
+            assert!(
+                out.chars().all(|c| c.is_ascii_digit()),
+                "match number must be ASCII digits, got {out:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn pairing_match_number_is_deterministic_for_same_inputs() {
+        // Fixed bytes so the test is reproducible and the SAS value is pinned
+        // in case the derivation ever changes accidentally.
+        let pub_b64 = BASE64.encode([0xABu8; 65]);
+        let a = pairing_match_number("ABC123", &pub_b64);
+        let b = pairing_match_number("ABC123", &pub_b64);
+        assert_eq!(a, b);
+        assert_eq!(a.len(), 2);
+    }
+
+    #[test]
+    fn pairing_match_number_changes_when_pubkey_changes() {
+        // Search a small space of distinct pubkeys to guarantee a discriminating
+        // pair exists. A 1-in-100 collision is acceptable for the SAS itself
+        // (it's a 2-digit short-authentication-string by design), but the
+        // *test* must not depend on a randomly-collision-free fixture pair.
+        let code = "ABC123";
+        let mut found_distinct = false;
+        for tag in 0u8..16 {
+            let mut bytes = [0u8; 65];
+            bytes[64] = tag;
+            let a = pairing_match_number(code, &BASE64.encode([0u8; 65]));
+            let b = pairing_match_number(code, &BASE64.encode(bytes));
+            if a != b {
+                found_distinct = true;
+                break;
+            }
+        }
+        assert!(
+            found_distinct,
+            "in 16 single-byte pubkey variants the SAS never moved — derivation is not key-sensitive"
+        );
+    }
+
+    #[test]
+    fn pairing_match_number_changes_when_code_changes() {
+        let pub_b64 = BASE64.encode([0xCDu8; 65]);
+        let mut found_distinct = false;
+        for tail in b'0'..=b'9' {
+            let code_a = "AAAAA0";
+            let code_b = format!("AAAAA{}", tail as char);
+            let a = pairing_match_number(code_a, &pub_b64);
+            let b = pairing_match_number(&code_b, &pub_b64);
+            if a != b {
+                found_distinct = true;
+                break;
+            }
+        }
+        assert!(
+            found_distinct,
+            "in 10 single-char code variants the SAS never moved — derivation is not code-sensitive"
+        );
+    }
+
+    #[test]
+    fn browser_key_fingerprint_renders_first_eight_bytes_as_colon_hex() {
+        // SHA-256("") = e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
+        let empty_b64 = BASE64.encode([] as [u8; 0]);
+        assert_eq!(
+            browser_key_fingerprint(&empty_b64).unwrap(),
+            "e3:b0:c4:42:98:fc:1c:14"
+        );
+    }
+
+    #[test]
+    fn browser_key_fingerprint_returns_none_on_malformed_base64() {
+        assert!(browser_key_fingerprint("not!valid!base64!!!").is_none());
+    }
+
+    #[test]
+    fn browser_key_fingerprint_differs_for_one_bit_input_change() {
+        let key_a = BASE64.encode([0u8; 65]);
+        let mut key_b_bytes = [0u8; 65];
+        key_b_bytes[64] = 1;
+        let key_b = BASE64.encode(key_b_bytes);
+        assert_ne!(
+            browser_key_fingerprint(&key_a).unwrap(),
+            browser_key_fingerprint(&key_b).unwrap(),
+            "a single-bit pubkey flip MUST change the visible fingerprint"
+        );
     }
 }

@@ -2220,7 +2220,7 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
     // ── id 103: lpm env pair ──
     SurfaceV2 {
         id: 103,
-        scenarios: 7,
+        scenarios: 9,
         failure_modes_tested: &[
             "uppercases code + approves browser pairing",
             "refresh-only session pair then unpair reuses normalized session",
@@ -2229,6 +2229,8 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
             "rejects non-pending session status",
             "rejects malformed browser key",
             "pair without auth under --json emits error envelope on stdout",
+            "refuses to wrap when stdin is not a TTY and --yes is absent",
+            "renders browser key fingerprint, device label, match number, --yes audit warning before approving",
         ],
         failure_modes_known: &[
             "pairing token expiry mid-flow",
@@ -2237,8 +2239,8 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
             "pair after a logout-all on a refresh-backed session",
         ],
         json_contract_depth: JsonContractDepth::SemanticAsserts,
-        scenarios_by_file: &[("tests/workflows/tests/env_vault.rs", 7)],
-        last_audited_at: "2026-05-14",
+        scenarios_by_file: &[("tests/workflows/tests/env_vault.rs", 9)],
+        last_audited_at: "2026-05-20",
     },
     // ── id 104: lpm env unpair ──
     SurfaceV2 {
