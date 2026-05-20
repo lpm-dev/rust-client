@@ -808,8 +808,7 @@ fn write_stderr_as_safe(msg: &[u8]) {
 /// already names what's needed; `detected` is display-only.
 fn detect_kernel_version() -> String {
     std::fs::read_to_string("/proc/sys/kernel/osrelease")
-        .map(|s| s.trim().to_string())
-        .unwrap_or_else(|_| "unknown".to_string())
+        .map_or_else(|_| "unknown".to_string(), |s| s.trim().to_string())
 }
 
 #[cfg(test)]
@@ -820,9 +819,7 @@ mod tests {
 
     fn realistic_spec() -> SandboxSpec {
         let home = dirs::home_dir().expect("home dir for test");
-        let tmp = std::env::var_os("TMPDIR")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from("/tmp"));
+        let tmp = std::env::var_os("TMPDIR").map_or_else(|| PathBuf::from("/tmp"), PathBuf::from);
         SandboxSpec {
             package_dir: home.join(".lpm/store/testpkg@0.1.0"),
             project_dir: home.join("lpm-sandbox-test-project"),

@@ -122,15 +122,21 @@ fn ci_setup(args: &[&str], project_dir: &Path) -> Result<(), LpmError> {
     }
 
     match *platform {
-        "github-actions" | "github" | "gha" => setup_github_actions(project_dir, env_mode),
-        "gitlab" | "gitlab-ci" => setup_gitlab_ci(env_mode),
+        "github-actions" | "github" | "gha" => {
+            setup_github_actions(project_dir, env_mode);
+            Ok(())
+        }
+        "gitlab" | "gitlab-ci" => {
+            setup_gitlab_ci(env_mode);
+            Ok(())
+        }
         _ => Err(LpmError::Script(format!(
             "unknown CI platform: '{platform}'. Available: github-actions, gitlab"
         ))),
     }
 }
 
-fn setup_github_actions(project_dir: &Path, env_mode: &str) -> Result<(), LpmError> {
+fn setup_github_actions(project_dir: &Path, env_mode: &str) {
     let vault_id = lpm_vault::vault_id::read_vault_id(project_dir)
         .unwrap_or_else(|| "<your-vault-id>".to_string());
 
@@ -174,11 +180,9 @@ fn setup_github_actions(project_dir: &Path, env_mode: &str) -> Result<(), LpmErr
         .bold()
     );
     println!();
-
-    Ok(())
 }
 
-fn setup_gitlab_ci(env_mode: &str) -> Result<(), LpmError> {
+fn setup_gitlab_ci(env_mode: &str) {
     println!();
     println!("  {} GitLab CI OIDC Setup", "▸".bold());
     println!();
@@ -208,6 +212,4 @@ fn setup_gitlab_ci(env_mode: &str) -> Result<(), LpmError> {
         .bold()
     );
     println!();
-
-    Ok(())
 }

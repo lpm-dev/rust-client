@@ -1,3 +1,11 @@
+//! Core types shared across LPM workspace crates.
+//!
+//! Hosts the canonical [`PackageName`] parser, [`Integrity`] (SRI) helpers,
+//! [`LpmError`] (the unified error type returned by the CLI surface), and the
+//! [`LpmRoot`] / locking primitives every install pass touches. Nothing in
+//! this crate performs I/O beyond the lock-file helpers — it is the dependency
+//! floor of the workspace and must stay leaf-like.
+
 pub mod color;
 pub mod error;
 pub mod integrity;
@@ -166,10 +174,7 @@ pub fn lpm_registry_url_is_accepted(url: &str) -> bool {
         .split('#')
         .next()
         .unwrap_or("");
-    let authority = authority
-        .rsplit_once('@')
-        .map(|(_, h)| h)
-        .unwrap_or(authority);
+    let authority = authority.rsplit_once('@').map_or(authority, |(_, h)| h);
     let host = if authority.starts_with('[') {
         match authority.find(']') {
             Some(end) => &authority[..=end],

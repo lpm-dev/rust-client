@@ -124,7 +124,7 @@ fn accept_override(url: &str) -> bool {
     };
     match parsed.scheme() {
         "https" => true,
-        "http" => parsed.host_str().map(is_loopback_host).unwrap_or(false),
+        "http" => parsed.host_str().is_some_and(is_loopback_host),
         _ => false,
     }
 }

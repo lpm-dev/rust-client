@@ -268,8 +268,7 @@ impl SessionManager {
         if let Ok(Some(secret)) = self.token_for(requirement).await {
             let needs_proactive_refresh = self
                 .current_source()
-                .map(|s| s.refresh_policy() == RefreshPolicy::IfRefreshable)
-                .unwrap_or(false)
+                .is_some_and(|s| s.refresh_policy() == RefreshPolicy::IfRefreshable)
                 && crate::is_session_access_token_expired(&self.registry_url);
 
             if !needs_proactive_refresh {
@@ -741,6 +740,7 @@ fn session_only(c: CachedToken) -> Option<SecretString> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_env::ScopedEnv;
 
     /// L13: two invocations under the same HOME return the same value
     /// (server expects a stable per-install identifier across runs).
@@ -748,20 +748,9 @@ mod tests {
     #[test]
     fn device_fingerprint_is_stable_across_calls_under_same_home() {
         let tmp = tempfile::tempdir().expect("tempdir");
-        let prev = std::env::var_os("HOME");
-        // SAFETY: serialized by Rust's #[test] default (single-threaded
-        // within this binary plus nextest's per-test process isolation).
-        unsafe {
-            std::env::set_var("HOME", tmp.path());
-        }
+        let _env = ScopedEnv::set([("HOME", tmp.path().as_os_str().to_owned())]);
         let first = compute_device_fingerprint();
         let second = compute_device_fingerprint();
-        unsafe {
-            match prev {
-                Some(v) => std::env::set_var("HOME", v),
-                None => std::env::remove_var("HOME"),
-            }
-        }
         assert_eq!(first, second, "fingerprint must persist across calls");
         assert_eq!(first.len(), 64, "32-byte random encoded as 64 hex chars");
         assert!(
@@ -777,21 +766,14 @@ mod tests {
     fn device_fingerprint_differs_across_distinct_installs() {
         let tmp_a = tempfile::tempdir().unwrap();
         let tmp_b = tempfile::tempdir().unwrap();
-        let prev = std::env::var_os("HOME");
-        unsafe {
-            std::env::set_var("HOME", tmp_a.path());
-        }
-        let a = compute_device_fingerprint();
-        unsafe {
-            std::env::set_var("HOME", tmp_b.path());
-        }
-        let b = compute_device_fingerprint();
-        unsafe {
-            match prev {
-                Some(v) => std::env::set_var("HOME", v),
-                None => std::env::remove_var("HOME"),
-            }
-        }
+        let a = {
+            let _env = ScopedEnv::set([("HOME", tmp_a.path().as_os_str().to_owned())]);
+            compute_device_fingerprint()
+        };
+        let b = {
+            let _env = ScopedEnv::set([("HOME", tmp_b.path().as_os_str().to_owned())]);
+            compute_device_fingerprint()
+        };
         assert_ne!(
             a, b,
             "distinct installs must have distinct fingerprints (random per-install)"
@@ -809,17 +791,8 @@ mod tests {
         let path = lpm_dir.join("device-id");
         std::fs::write(&path, b"not-a-valid-hex-digest").unwrap();
 
-        let prev = std::env::var_os("HOME");
-        unsafe {
-            std::env::set_var("HOME", tmp.path());
-        }
+        let _env = ScopedEnv::set([("HOME", tmp.path().as_os_str().to_owned())]);
         let id = compute_device_fingerprint();
-        unsafe {
-            match prev {
-                Some(v) => std::env::set_var("HOME", v),
-                None => std::env::remove_var("HOME"),
-            }
-        }
         assert_eq!(id.len(), 64);
         assert!(id.chars().all(|c| c.is_ascii_hexdigit()));
         // File should also have been rewritten at 0o600.

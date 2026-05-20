@@ -184,28 +184,28 @@ impl L4Cache {
         let path = resolve_default_path()?;
         let ttl = resolve_ttl();
         let disabled = is_disabled();
-        Self::open_at_with(path, ttl, disabled)
+        Ok(Self::open_at_with(path, ttl, disabled))
     }
 
     /// Open the cache at an explicit path (test entry point). The
     /// caller controls both the location and the TTL. The disable
     /// flag still honors the env var.
     pub fn open_at(path: PathBuf, ttl: Duration) -> io::Result<Self> {
-        Self::open_at_with(path, ttl, is_disabled())
+        Ok(Self::open_at_with(path, ttl, is_disabled()))
     }
 
-    fn open_at_with(path: PathBuf, ttl: Duration, disabled: bool) -> io::Result<Self> {
+    fn open_at_with(path: PathBuf, ttl: Duration, disabled: bool) -> Self {
         let file = if disabled {
             CacheFile::default()
         } else {
             load_or_default(&path)
         };
-        Ok(Self {
+        Self {
             path,
             ttl,
             disabled,
             inner: Mutex::new(file),
-        })
+        }
     }
 
     /// Is this cache disabled via env? Wrapped methods are no-ops
@@ -764,7 +764,7 @@ mod tests {
         // `open_at_with` with `disabled=false` directly. Tests assert
         // on cache contents and shouldn't care about the host env.
         let cache = L4Cache {
-            path: path.clone(),
+            path,
             ttl: DEFAULT_TTL,
             disabled: false,
             inner: Mutex::new(CacheFile::default()),
@@ -844,7 +844,7 @@ mod tests {
                 "p",
                 "m",
             );
-            cache.insert(k.clone(), AdvisorVerdict::Manual, "p", "m", "h");
+            cache.insert(k, AdvisorVerdict::Manual, "p", "m", "h");
             cache.persist().unwrap();
         }
         // Re-load and confirm the verdict is still there.

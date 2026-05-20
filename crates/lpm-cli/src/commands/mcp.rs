@@ -366,7 +366,7 @@ async fn status(json_output: bool) -> Result<(), LpmError> {
         println!();
         for r in &results {
             let editor = r["editor"].as_str().unwrap_or("");
-            let servers = r["servers"].as_array().map(|a| a.len()).unwrap_or(0);
+            let servers = r["servers"].as_array().map_or(0, |a| a.len());
             let icon = if servers > 0 {
                 "✔".green().to_string()
             } else {
@@ -491,7 +491,7 @@ mod tests {
         .unwrap();
 
         let editors = vec![
-            test_editor("Windsurf", path.clone(), "mcpServers"),
+            test_editor("Windsurf", path, "mcpServers"),
             test_editor("VS Code", dir.path().join("missing.json"), "servers"),
         ];
 
@@ -702,7 +702,7 @@ mod tests {
         let path = dir.path().join("empty.json");
         std::fs::write(&path, "{}").unwrap();
 
-        let editors = vec![test_editor("Empty", path.clone(), "mcpServers")];
+        let editors = vec![test_editor("Empty", path, "mcpServers")];
         let status = status_for_editors(&editors).unwrap();
 
         assert_eq!(status.len(), 1);
@@ -718,7 +718,7 @@ mod tests {
         let path = dir.path().join("broken.json");
         std::fs::write(&path, "{not valid json").unwrap();
 
-        let editors = vec![test_editor("Broken", path.clone(), "mcpServers")];
+        let editors = vec![test_editor("Broken", path, "mcpServers")];
         let result = status_for_editors(&editors);
 
         assert!(

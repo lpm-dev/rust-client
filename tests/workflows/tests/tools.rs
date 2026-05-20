@@ -260,8 +260,7 @@ fn lint_all_happy_path_e2e_network_gated() {
     // "set, therefore on." Accepts `1` and `true` (case-insensitive).
     let enabled = std::env::var("LPM_E2E_NETWORK")
         .ok()
-        .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true"))
-        .unwrap_or(false);
+        .is_some_and(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true"));
     if !enabled {
         eprintln!(
             "skipping lint_all_happy_path_e2e_network_gated (set LPM_E2E_NETWORK=1 to run; real-network test downloads oxlint)"

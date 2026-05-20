@@ -137,7 +137,7 @@ pub fn validate_bin_name(name: &str, pkg_name: &str) -> Result<(), String> {
         "COM8", "COM9", "LPT0", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8",
         "LPT9",
     ];
-    let stem = name.split_once('.').map(|(s, _)| s).unwrap_or(name);
+    let stem = name.split_once('.').map_or(name, |(s, _)| s);
     let stem_upper: String = stem
         .chars()
         .map(|c| match c {
@@ -1180,8 +1180,7 @@ pub fn link_one_package(
         let dep_target = target
             .aliases
             .get(dep_local)
-            .map(String::as_str)
-            .unwrap_or(dep_local.as_str());
+            .map_or(dep_local.as_str(), String::as_str);
 
         // Symlink to the dep's location in .lpm/
         // Base: ../../<dep_target>@<ver>/node_modules/<dep_target>
@@ -2729,8 +2728,10 @@ fn try_clonefile(src: &Path, dst: &Path) -> bool {
         Err(_) => return false,
     };
 
-    // Clonefile(src, dst, flags) — flag 0 = no special flags
-    // Returns 0 on success, -1 on failure
+    // SAFETY: clonefile takes two NUL-terminated C strings and a flags
+    // word. Both pointers are valid for the duration of the call (the
+    // CStrings outlive it), and we pass `0` for flags (no special
+    // behavior). Returns 0 on success, -1 on failure.
     let result = unsafe { libc::clonefile(src_c.as_ptr(), dst_c.as_ptr(), 0) };
 
     if result == 0 {
@@ -6299,7 +6300,7 @@ mod tests {
         let target = LinkTarget {
             name: "local-foo".to_string(),
             version: "0.0.0".to_string(),
-            store_path: src.clone(),
+            store_path: src,
             dependencies: vec![],
             aliases: HashMap::new(),
             is_direct: true,
@@ -6397,7 +6398,7 @@ mod tests {
         let target = LinkTarget {
             name: "foo".to_string(),
             version: "1.0.0".to_string(),
-            store_path: store_path.clone(),
+            store_path,
             dependencies: vec![],
             aliases: HashMap::new(),
             is_direct: true,
@@ -6974,7 +6975,7 @@ mod tests {
         let target = LinkTarget {
             name: "local-bar".to_string(),
             version: "0.0.0".to_string(),
-            store_path: src.clone(),
+            store_path: src,
             dependencies: vec![],
             aliases: HashMap::new(),
             is_direct: true,

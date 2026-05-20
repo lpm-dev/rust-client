@@ -1169,7 +1169,7 @@ mod tests {
             via_parent: None,
         };
         set.record_hit(hit.clone());
-        set.record_hit(hit.clone());
+        set.record_hit(hit);
         let hits = set.take_hits();
         assert_eq!(hits.len(), 1);
     }

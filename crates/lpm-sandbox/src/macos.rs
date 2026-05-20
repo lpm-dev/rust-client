@@ -171,9 +171,8 @@ mod tests {
         let project_dir = tmp.path().join("proj");
         std::fs::create_dir_all(&project_dir).unwrap();
         let home = dirs::home_dir().expect("home dir for test");
-        let tmpdir = std::env::var_os("TMPDIR")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from("/tmp"));
+        let tmpdir =
+            std::env::var_os("TMPDIR").map_or_else(|| PathBuf::from("/tmp"), PathBuf::from);
         let spec = SandboxSpec {
             package_dir: pkg_dir,
             project_dir,

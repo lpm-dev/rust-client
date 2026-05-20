@@ -486,7 +486,7 @@ pub async fn run(
 
     // Step 5.1: Interactive target directory selection
     let target_dir = if target_path.is_some() {
-        resolve_target_dir(project_dir, target_path, ecosystem, swift_target)?
+        resolve_target_dir(project_dir, target_path, ecosystem, swift_target)
     } else if !yes && !json_output && is_tty && ecosystem != "swift" {
         let default_dir = detect_default_install_dir(project_dir, ecosystem);
         let default_str = default_dir
@@ -503,7 +503,7 @@ pub async fn run(
 
         project_dir.join(target)
     } else {
-        resolve_target_dir(project_dir, target_path, ecosystem, swift_target)?
+        resolve_target_dir(project_dir, target_path, ecosystem, swift_target)
     };
 
     if !json_output {
@@ -517,7 +517,7 @@ pub async fn run(
     // Step 6: Build file list (config-based or lpm.source fallback or all files)
     let files = if let Some(config) = &lpm_config {
         if let Some(files_arr) = config.get("files").and_then(|f| f.as_array()) {
-            filter_config_files(temp_dir.path(), files_arr, &inline_config)?
+            filter_config_files(temp_dir.path(), files_arr, &inline_config)
         } else {
             collect_source_with_fallback(temp_dir.path())?
         }
@@ -1363,10 +1363,10 @@ fn handle_file_conflict(
     }
 
     // Show diff preview
-    let rel_display = target_path
-        .file_name()
-        .map(|n| n.to_string_lossy().to_string())
-        .unwrap_or_else(|| target_path.display().to_string());
+    let rel_display = target_path.file_name().map_or_else(
+        || target_path.display().to_string(),
+        |n| n.to_string_lossy().to_string(),
+    );
 
     eprintln!("\n  {} File exists: {}", "\u{26a0}".yellow(), rel_display);
 
@@ -1525,10 +1525,7 @@ fn handle_dry_run(
                 && let Some(dep_config) = config.get("dependencies").and_then(|d| d.as_object())
             {
                 for (config_key, dep_map) in dep_config {
-                    let config_value = inline_config
-                        .get(config_key)
-                        .map(|s| s.as_str())
-                        .unwrap_or("");
+                    let config_value = inline_config.get(config_key).map_or("", |s| s.as_str());
                     if config_value.is_empty() {
                         continue;
                     }
@@ -1637,10 +1634,7 @@ fn collect_source_pkg_deps(
         && let Some(dep_config) = config.get("dependencies").and_then(|d| d.as_object())
     {
         for (config_key, dep_map) in dep_config {
-            let config_value = inline_config
-                .get(config_key)
-                .map(|s| s.as_str())
-                .unwrap_or("");
+            let config_value = inline_config.get(config_key).map_or("", |s| s.as_str());
             if config_value.is_empty() {
                 continue;
             }
@@ -1874,9 +1868,9 @@ fn resolve_target_dir(
     explicit_path: Option<&str>,
     ecosystem: &str,
     swift_target: Option<&str>,
-) -> Result<PathBuf, LpmError> {
+) -> PathBuf {
     if let Some(path) = explicit_path {
-        return Ok(project_dir.join(path));
+        return project_dir.join(path);
     }
 
     match ecosystem {
@@ -1886,8 +1880,7 @@ fn resolve_target_dir(
                     entries.flatten().any(|e| {
                         e.path()
                             .extension()
-                            .map(|ext| ext == "xcodeproj" || ext == "xcworkspace")
-                            .unwrap_or(false)
+                            .is_some_and(|ext| ext == "xcodeproj" || ext == "xcworkspace")
                     })
                 })
                 .unwrap_or(false);
@@ -1901,19 +1894,19 @@ fn resolve_target_dir(
                 if let Some(t) = swift_target {
                     path = path.join(t);
                 }
-                Ok(path)
+                path
             } else {
                 // SPM project: Sources/{target}
                 let mut path = project_dir.join("Sources");
                 if let Some(t) = swift_target {
                     path = path.join(t);
                 }
-                Ok(path)
+                path
             }
         }
         _ => {
             // JS: detect framework for smart defaults
-            Ok(detect_default_install_dir(project_dir, ecosystem))
+            detect_default_install_dir(project_dir, ecosystem)
         }
     }
 }
@@ -1923,7 +1916,7 @@ fn filter_config_files(
     extract_dir: &Path,
     files_rules: &[serde_json::Value],
     config: &HashMap<String, String>,
-) -> Result<Vec<(String, String)>, LpmError> {
+) -> Vec<(String, String)> {
     let provided_params: HashSet<&str> = config.keys().map(|k| k.as_str()).collect();
     let mut result = Vec::new();
 
@@ -1956,11 +1949,10 @@ fn filter_config_files(
                         // legacy string-only path.
                         let expected_str =
                             json_value_to_config_string(expected).unwrap_or_default();
-                        let actual = config.get(key).map(|s| s.as_str()).unwrap_or("");
+                        let actual = config.get(key).map_or("", |s| s.as_str());
 
                         // Support comma-separated multi-select
-                        let actual_values: Vec<&str> = actual.split(',').collect();
-                        if !actual_values.contains(&expected_str.as_str()) {
+                        if !actual.split(',').any(|x| x == expected_str.as_str()) {
                             matches = false;
                             break;
                         }
@@ -2014,7 +2006,7 @@ fn filter_config_files(
         }
     }
 
-    Ok(result)
+    result
 }
 
 /// Expand a src pattern from lpm.config.json to actual file paths.
@@ -2279,7 +2271,7 @@ fn build_save_decisions(
             resolved,
             crate::save_spec::SaveFlags::default(),
             save_config,
-        )?;
+        );
         out.push((name.clone(), decision.spec_to_write));
     }
     Ok(out)
@@ -3413,8 +3405,7 @@ mod tests {
                 "include": "when",
                 "condition": {"withTests": true},
             })];
-            let out =
-                filter_config_files(dir.path(), &rules, &config(&[("withTests", "true")])).unwrap();
+            let out = filter_config_files(dir.path(), &rules, &config(&[("withTests", "true")]));
             assert_eq!(out.len(), 1, "native-bool condition must match: {out:?}");
         }
 
@@ -3426,8 +3417,7 @@ mod tests {
                 "include": "when",
                 "condition": {"withTests": true},
             })];
-            let out = filter_config_files(dir.path(), &rules, &config(&[("withTests", "false")]))
-                .unwrap();
+            let out = filter_config_files(dir.path(), &rules, &config(&[("withTests", "false")]));
             assert!(out.is_empty(), "must exclude on opposite value: {out:?}");
         }
 
@@ -3441,8 +3431,7 @@ mod tests {
                 "include": "when",
                 "condition": {"withTests": "true"},
             })];
-            let out =
-                filter_config_files(dir.path(), &rules, &config(&[("withTests", "true")])).unwrap();
+            let out = filter_config_files(dir.path(), &rules, &config(&[("withTests", "true")]));
             assert_eq!(out.len(), 1, "legacy string condition must match: {out:?}");
         }
 
@@ -3457,7 +3446,7 @@ mod tests {
                 "include": "when",
                 "condition": {"withTests": true},
             })];
-            let out = filter_config_files(dir.path(), &rules, &HashMap::new()).unwrap();
+            let out = filter_config_files(dir.path(), &rules, &HashMap::new());
             assert_eq!(
                 out.len(),
                 1,

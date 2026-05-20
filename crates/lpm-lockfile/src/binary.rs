@@ -76,6 +76,28 @@ const DEP_ENTRY_SIZE: usize = 6;
 /// Binary lockfile filename.
 pub const BINARY_LOCKFILE_NAME: &str = "lpm.lockb";
 
+/// Little-endian `u32` read from a 4-byte window. `bytes[off..off+4]`
+/// is the caller's invariant — every call site bounds-checks `off`
+/// against the mmap length before reaching this helper, so the
+/// fixed-size conversion cannot fail.
+#[inline]
+fn read_u32_le(bytes: &[u8], off: usize) -> u32 {
+    let chunk: [u8; 4] = bytes[off..off + 4]
+        .try_into()
+        .expect("read_u32_le: caller validated 4-byte window");
+    u32::from_le_bytes(chunk)
+}
+
+/// Little-endian `u16` read from a 2-byte window. See [`read_u32_le`]
+/// for the bounds invariant.
+#[inline]
+fn read_u16_le(bytes: &[u8], off: usize) -> u16 {
+    let chunk: [u8; 2] = bytes[off..off + 2]
+        .try_into()
+        .expect("read_u16_le: caller validated 2-byte window");
+    u16::from_le_bytes(chunk)
+}
+
 // ── Writer ──────────────────────────────────────────────────────────────────
 
 /// Binary format capability check — does this lockfile fit the wire format?
@@ -296,7 +318,7 @@ impl BinaryLockfileReader {
                 "invalid binary lockfile magic".into(),
             ));
         }
-        let version = u32::from_le_bytes(mmap[4..8].try_into().unwrap());
+        let version = read_u32_le(&mmap, 4);
         // Strict version match — not `version > BINARY_VERSION`.
         // Per-entry layout differs across versions (v1 = 30B,
         // v2 = 36B), so decoding a v1 file as v2 (or vice versa)
@@ -312,8 +334,8 @@ impl BinaryLockfileReader {
         }
 
         // Validate section layout consistency
-        let pkg_count = u32::from_le_bytes(mmap[8..12].try_into().unwrap()) as usize;
-        let string_table_off = u32::from_le_bytes(mmap[12..16].try_into().unwrap()) as usize;
+        let pkg_count = read_u32_le(&mmap, 8) as usize;
+        let string_table_off = read_u32_le(&mmap, 12) as usize;
 
         let entries_end = pkg_count
             .checked_mul(ENTRY_SIZE)
@@ -350,10 +372,8 @@ impl BinaryLockfileReader {
         let string_table_len = mmap.len() - string_table_off;
         for idx in 0..pkg_count {
             let base = HEADER_SIZE + idx * ENTRY_SIZE;
-            let deps_off =
-                u32::from_le_bytes(mmap[base + 24..base + 28].try_into().unwrap()) as usize;
-            let deps_count =
-                u16::from_le_bytes(mmap[base + 28..base + 30].try_into().unwrap()) as usize;
+            let deps_off = read_u32_le(&mmap, base + 24) as usize;
+            let deps_count = read_u16_le(&mmap, base + 28) as usize;
             let deps_end = deps_off.checked_add(deps_count).ok_or_else(|| {
                 LockfileError::Deserialize("dependency range overflows dependency table".into())
             })?;
@@ -376,10 +396,8 @@ impl BinaryLockfileReader {
             //     case is not caught by `off + len > string_table_len`
             //     because `len == 0` makes that check trivially false).
             //   - `off + len` overflows or exceeds the string table.
-            let tarball_off =
-                u32::from_le_bytes(mmap[base + 30..base + 34].try_into().unwrap()) as usize;
-            let tarball_len =
-                u16::from_le_bytes(mmap[base + 34..base + 36].try_into().unwrap()) as usize;
+            let tarball_off = read_u32_le(&mmap, base + 30) as usize;
+            let tarball_len = read_u16_le(&mmap, base + 34) as usize;
             if !(tarball_off == 0 && tarball_len == 0) {
                 if tarball_len == 0 {
                     // off != 0 && len == 0 — corrupt. Legitimate
@@ -429,8 +447,8 @@ impl BinaryLockfileReader {
                     false,
                 ),
             ] {
-                let off = u32::from_le_bytes(mmap[off_range].try_into().unwrap()) as usize;
-                let len = u16::from_le_bytes(mmap[len_range].try_into().unwrap()) as usize;
+                let off = read_u32_le(&mmap, off_range.start) as usize;
+                let len = read_u16_le(&mmap, len_range.start) as usize;
                 if len == 0 {
                     if off != 0 {
                         return Err(LockfileError::Deserialize(format!(
@@ -463,11 +481,11 @@ impl BinaryLockfileReader {
     }
 
     fn pkg_count(&self) -> u32 {
-        u32::from_le_bytes(self.mmap[8..12].try_into().unwrap())
+        read_u32_le(&self.mmap, 8)
     }
 
     fn string_table_off(&self) -> usize {
-        u32::from_le_bytes(self.mmap[12..16].try_into().unwrap()) as usize
+        read_u32_le(&self.mmap, 12) as usize
     }
 
     fn read_str(&self, off: u32, len: u16) -> &str {
@@ -504,21 +522,21 @@ impl BinaryLockfileReader {
         let b = &self.mmap[base..base + ENTRY_SIZE];
         Some(PackageEntryView {
             reader: self,
-            name_off: u32::from_le_bytes(b[0..4].try_into().unwrap()),
-            name_len: u16::from_le_bytes(b[4..6].try_into().unwrap()),
-            version_off: u32::from_le_bytes(b[6..10].try_into().unwrap()),
-            version_len: u16::from_le_bytes(b[10..12].try_into().unwrap()),
-            source_off: u32::from_le_bytes(b[12..16].try_into().unwrap()),
-            source_len: u16::from_le_bytes(b[16..18].try_into().unwrap()),
-            integrity_off: u32::from_le_bytes(b[18..22].try_into().unwrap()),
-            integrity_len: u16::from_le_bytes(b[22..24].try_into().unwrap()),
-            deps_off: u32::from_le_bytes(b[24..28].try_into().unwrap()),
-            deps_count: u16::from_le_bytes(b[28..30].try_into().unwrap()),
+            name_off: read_u32_le(b, 0),
+            name_len: read_u16_le(b, 4),
+            version_off: read_u32_le(b, 6),
+            version_len: read_u16_le(b, 10),
+            source_off: read_u32_le(b, 12),
+            source_len: read_u16_le(b, 16),
+            integrity_off: read_u32_le(b, 18),
+            integrity_len: read_u16_le(b, 22),
+            deps_off: read_u32_le(b, 24),
+            deps_count: read_u16_le(b, 28),
             // v2+ — tarball slot at bytes [30..36]. Parses cleanly on
             // every v2 file; the null sentinel (0, 0) decodes to `None`
             // in `tarball()`.
-            tarball_off: u32::from_le_bytes(b[30..34].try_into().unwrap()),
-            tarball_len: u16::from_le_bytes(b[34..36].try_into().unwrap()),
+            tarball_off: read_u32_le(b, 30),
+            tarball_len: read_u16_le(b, 34),
         })
     }
 
@@ -715,8 +733,8 @@ impl<'a> PackageEntryView<'a> {
                 break;
             }
             let b = &self.reader.mmap[base..base + DEP_ENTRY_SIZE];
-            let off = u32::from_le_bytes(b[0..4].try_into().unwrap());
-            let len = u16::from_le_bytes(b[4..6].try_into().unwrap());
+            let off = read_u32_le(b, 0);
+            let len = read_u16_le(b, 4);
             deps.push(self.reader.read_str(off, len));
         }
         deps
@@ -1347,7 +1365,7 @@ mod tests {
             version: "1.0.0".to_string(),
             source: None,
             integrity: None,
-            dependencies: deps.clone(),
+            dependencies: deps,
             alias_dependencies: vec![],
             peers: vec![],
             tarball: None,

@@ -559,7 +559,7 @@ fn add_if_link_descendant(
     // The canonical path is `<store>/links/<key>/node_modules/<pkg>/`.
     // The `links/<key>` directory itself is the link entry root —
     // strip the `node_modules/<pkg>/` tail to get there.
-    let mut walk = canonical.clone();
+    let mut walk = canonical;
     while walk.parent().is_some_and(|p| p != links_root_canonical) {
         walk.pop();
     }
@@ -858,7 +858,7 @@ mod tests {
             .unwrap();
         store
             .populate_link_entry(LinkEntryRequest {
-                graph_key: orphan_key.clone(),
+                graph_key: orphan_key,
                 source_sri: orphan_sri.clone(),
                 object_dir: store.paths().object_dir(&orphan_sri).unwrap(),
                 deps: vec![],
@@ -868,7 +868,7 @@ mod tests {
 
         let project = dir.path().join("project");
         std::fs::create_dir_all(&project).unwrap();
-        synthesize_project(&project, &store, &[("used-pkg", used_key.clone())]);
+        synthesize_project(&project, &store, &[("used-pkg", used_key)]);
 
         // Register the project.
         known_projects::register(&root.known_projects(), &project).unwrap();
@@ -932,7 +932,7 @@ mod tests {
                 object_dir: store.paths().object_dir(&child_sri).unwrap(),
                 deps: vec![DepLink {
                     local: "grand".into(),
-                    target: grand_key.clone(),
+                    target: grand_key,
                 }],
                 platform: Arc::new(sample_meta_platform()),
             })
@@ -944,14 +944,14 @@ mod tests {
                 object_dir: store.paths().object_dir(&parent_sri).unwrap(),
                 deps: vec![DepLink {
                     local: "child".into(),
-                    target: child_key.clone(),
+                    target: child_key,
                 }],
                 platform: Arc::new(sample_meta_platform()),
             })
             .unwrap();
 
         let project = dir.path().join("project");
-        synthesize_project(&project, &store, &[("parent", parent_key.clone())]);
+        synthesize_project(&project, &store, &[("parent", parent_key)]);
         known_projects::register(&root.known_projects(), &project).unwrap();
 
         let summary = compute_prune_plan(&root, &store, &PruneFlags::default(), None).unwrap();
@@ -978,7 +978,7 @@ mod tests {
         let key = key_for("recent-orphan", "1.0.0");
         store
             .populate_link_entry(LinkEntryRequest {
-                graph_key: key.clone(),
+                graph_key: key,
                 source_sri: sri.clone(),
                 object_dir: store.paths().object_dir(&sri).unwrap(),
                 deps: vec![],
@@ -1023,7 +1023,7 @@ mod tests {
         let stale = dir.path().join("stale-project");
         let mut r = Registry::new();
         r.projects.push(Entry {
-            path: stale.clone(),
+            path: stale,
             last_seen: Utc::now(),
         });
         known_projects::write(&root.known_projects(), &r).unwrap();
@@ -1042,7 +1042,7 @@ mod tests {
             .unwrap();
 
         let project = dir.path().join("real-project");
-        synthesize_project(&project, &store, &[("used", key.clone())]);
+        synthesize_project(&project, &store, &[("used", key)]);
 
         let project_str = project.to_str().unwrap().to_string();
         let flags = PruneFlags {
@@ -1102,7 +1102,7 @@ mod tests {
             .unwrap();
 
         let project = dir.path().join("project");
-        synthesize_project(&project, &store, &[("used-pkg", used_key.clone())]);
+        synthesize_project(&project, &store, &[("used-pkg", used_key)]);
         known_projects::register(&root.known_projects(), &project).unwrap();
 
         let summary = compute_prune_plan(&root, &store, &PruneFlags::default(), None).unwrap();
@@ -1118,10 +1118,7 @@ mod tests {
                 orphan.display()
             );
             assert!(
-                orphan
-                    .file_name()
-                    .map(|n| n != "poisoned-entry")
-                    .unwrap_or(true),
+                orphan.file_name().is_none_or(|n| n != "poisoned-entry"),
                 "orphan list must not contain the symlinked entry name"
             );
         }

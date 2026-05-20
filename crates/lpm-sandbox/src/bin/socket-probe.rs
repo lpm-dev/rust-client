@@ -36,7 +36,7 @@ fn main() {
     if args.len() < 3 {
         eprintln!(
             "socket-probe: usage: {} <family-int> <type-int> [protocol-int]",
-            args.first().map(String::as_str).unwrap_or("socket-probe"),
+            args.first().map_or("socket-probe", String::as_str),
         );
         std::process::exit(2);
     }

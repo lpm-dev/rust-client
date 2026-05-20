@@ -119,8 +119,7 @@ fn uninstall_removes_dev_dependency_in_same_pass() {
     assert!(
         pkg_json["devDependencies"]
             .as_object()
-            .map(|o| o.get("dev-only").is_none())
-            .unwrap_or(true),
+            .is_none_or(|o| o.get("dev-only").is_none()),
         "package.json must no longer list dev-only in devDependencies; got: {pkg_json:#}"
     );
 }

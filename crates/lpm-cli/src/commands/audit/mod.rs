@@ -1511,7 +1511,7 @@ fn osv_override_is_accepted(url: &str) -> bool {
     };
     match parsed.scheme() {
         "https" => true,
-        "http" => parsed.host_str().map(host_is_loopback).unwrap_or(false),
+        "http" => parsed.host_str().is_some_and(host_is_loopback),
         _ => false,
     }
 }
@@ -2141,11 +2141,13 @@ mod tests {
             t.shell = true;
             t.dynamic_require = true;
         }));
-        let dangerous: Vec<_> = issues
-            .iter()
-            .filter(|i| i.severity == "high" && i.category == "behavior")
-            .collect();
-        assert_eq!(dangerous.len(), 1);
+        assert_eq!(
+            issues
+                .iter()
+                .filter(|i| i.severity == "high" && i.category == "behavior")
+                .count(),
+            1
+        );
     }
 
     // Medium bucket — network, native_bindings, git/http/wildcard dep, no_license
@@ -2202,11 +2204,13 @@ mod tests {
             t.wildcard_dependency = true;
             t.no_license = true;
         }));
-        let medium: Vec<_> = issues
-            .iter()
-            .filter(|i| i.message.starts_with("flags:"))
-            .collect();
-        assert_eq!(medium.len(), 1);
+        assert_eq!(
+            issues
+                .iter()
+                .filter(|i| i.message.starts_with("flags:"))
+                .count(),
+            1
+        );
     }
 
     // Notable bucket — filesystem, env_vars, crypto, telemetry, minified,
@@ -2264,11 +2268,13 @@ mod tests {
             t.trivial = true;
             t.copyleft_license = true;
         }));
-        let notable: Vec<_> = issues
-            .iter()
-            .filter(|i| i.message.starts_with("accesses"))
-            .collect();
-        assert_eq!(notable.len(), 1);
+        assert_eq!(
+            issues
+                .iter()
+                .filter(|i| i.message.starts_with("accesses"))
+                .count(),
+            1
+        );
     }
 
     // Edge cases — empty tags, unused-by-mapping tags, all-tags-set

@@ -398,7 +398,7 @@ pub fn decide_runtime_sandbox_mode(
 /// string so the install pipeline only has the decision to make,
 /// not the prose to template.
 ///
-/// GPT-5 audit  caught that the previous version only
+/// caught that the previous version only
 /// fired this banner when `--strict-sandbox` / `--paranoid` arrived
 /// on the CLI — config-set (`[sandbox] mode = "strict"`) and env-set
 /// (`LPM_STRICT_SANDBOX=1`) users got the kernel-level network
@@ -406,7 +406,7 @@ pub fn decide_runtime_sandbox_mode(
 /// the same banner regardless of source, so the gating must be on
 /// the resolved mode, not on which tier supplied it.
 ///
-/// GPT-5 audit follow-up (same day, second pass): the banner must
+/// follow-up (same day, second pass): the banner must
 /// ALSO gate on the final [`SandboxMode`], not just the resolved
 /// tier. `--sandbox-log` (macOS Seatbelt diagnostic) wins over
 /// resolved Strict in [`decide_runtime_sandbox_mode`] and produces
@@ -746,7 +746,7 @@ allow-degraded = "maybe"
 
     // ── decide_runtime_sandbox_mode  ──
     //
-    // GPT-5 audit  caught a real bug: the previous version
+    // caught a real bug: the previous version
     // of `rebuild::run_under_store_lock` computed `SandboxMode` from
     // the CLI `no_sandbox` flag alone and discarded the resolved
     // mode, so persistent `[sandbox] mode = "none"` from the wizard
@@ -775,7 +775,7 @@ allow-degraded = "maybe"
 
     #[test]
     fn decide_runtime_no_flags_config_none_yields_disabled_no_scrub() {
-        // The bug GPT-5 caught: `[sandbox] mode = "none"` from
+        // The bug `[sandbox] mode = "none"` from
         // config / the wizard MUST produce a fully-disabled runtime,
         // not silently fall back to Enforce. Symmetric with the CLI
         // `--no-sandbox` escape — same on-disk shape persisted via
@@ -856,9 +856,9 @@ allow-degraded = "maybe"
         assert!(!scrub);
     }
 
-    // ── strict_banner_for_runtime (GPT-5 audit follow-up) ──
+    // ── strict_banner_for_runtime (follow-up) ──
     //
-    // GPT-5 audit caught two related bugs here, both fixed by gating
+    // caught two related bugs here, both fixed by gating
     // on the (final SandboxMode, resolved tier) pair:
     //
     // Round 1 (Low): the banner only fired for `--strict-sandbox` /
@@ -927,7 +927,7 @@ allow-degraded = "maybe"
 
     #[test]
     fn strict_banner_suppressed_under_logonly_runtime_even_when_resolved_strict() {
-        // GPT-5 audit round 2 (Medium): the failure mode.
+        // round 2 (Medium): the failure mode.
         //
         // `lpm rebuild --strict-sandbox --sandbox-log` (or env/config
         // strict + CLI `--sandbox-log`) collapses to LogOnly in

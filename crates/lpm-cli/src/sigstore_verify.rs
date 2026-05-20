@@ -1,20 +1,19 @@
 //! Sigstore attestation verifier.
 //!
 //! Cryptographic-verification primitives that prove every claim in an
-//! in-toto statement attached to a Sigstore bundle. Phase 1.0's schema
-//! bump on [`crate::sigstore`] is the precondition; phases land
-//! incrementally:
+//! in-toto statement attached to a Sigstore bundle. The data schema in
+//! [`crate::sigstore`] is the precondition for these checks:
 //!
-//! - Phase 1.1: vendored Sigstore trust root.
-//! - Phase 1.2: DSSE envelope verification against the leaf cert (this commit).
-//! - Phase 1.3: X.509 chain validation at `integratedTime`.
-//! - Phase 1.4: embedded SCT verification.
-//! - Phase 1.5: semantic Rekor body match.
-//! - Phase 1.6: Rekor SET verification.
-//! - Phase 1.7: Merkle inclusion proof verification.
-//! - Phase 1.8: composed `verify_sigstore_bundle` entry point.
+//! - vendored Sigstore trust root.
+//! - DSSE envelope verification against the leaf cert.
+//! - X.509 chain validation at `integratedTime`.
+//! - embedded SCT verification.
+//! - semantic Rekor body match.
+//! - Rekor SET verification.
+//! - Merkle inclusion proof verification.
+//! - composed `verify_sigstore_bundle` entry point.
 //!
-//! Phase 1.2 details: PAE is re-encoded from the envelope's
+//! details: PAE is re-encoded from the envelope's
 //! `payload_type` and raw decoded `payload`, and verified against the
 //! leaf cert's SPKI via ECDSA-P256 (constant-time, via the `ecdsa`
 //! crate). Both raw R||S (64 bytes) and DER signature encodings are
@@ -41,12 +40,12 @@ use x509_parser::prelude::*;
 /// incrementally as phases ship. `#[non_exhaustive]` so consumers
 /// cannot pattern-match on a closed set — adding a new variant in a
 /// later phase is not a breaking change for the dispatcher in
-/// Phase 2.1 (`provenance_fetch.rs`'s map to
+/// (`provenance_fetch.rs`'s map to
 /// `LpmError::ProvenanceVerification`).
 ///
-/// `#[allow(dead_code)]` while Phase 1 is being built up — the only
-/// production consumer (`provenance_fetch.rs` after Phase 2.1) is
-/// pending. Tests cover the type already.
+/// `#[allow(dead_code)]` while is being built up — the only
+/// production consumer (`provenance_fetch.rs`) is pending. Tests cover
+/// the type already.
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 #[allow(dead_code)]
@@ -127,8 +126,8 @@ pub enum VerifyError {
 
     /// The Rekor body did not carry a Signed Entry Timestamp, but
     /// the caller's [`RekorInclusionProofPolicy`] required one
-    /// (`RequireSet` or `RequireBoth`). The inclusion-proof path
-    /// (Phase 1.7) is the alternative offline anchor; under `Either`
+    /// (`RequireSet` or `RequireBoth`). The inclusion-proof path is
+    /// the alternative offline anchor; under `Either`
     /// or `RequireInclusionProof` this case is not an error.
     #[error("Rekor SET is required by policy but missing from the bundle")]
     RekorSetMissing,
@@ -144,8 +143,8 @@ pub enum VerifyError {
 
     /// The Rekor body did not carry an inclusion proof, but the
     /// caller's [`RekorInclusionProofPolicy`] required one
-    /// (`RequireInclusionProof` or `RequireBoth`). The SET path
-    /// (Phase 1.6) is the alternative offline anchor; under `Either`
+    /// (`RequireInclusionProof` or `RequireBoth`). The SET path is
+    /// the alternative offline anchor; under `Either`
     /// or `RequireSet` this case is not an error.
     #[error("Rekor inclusion proof is required by policy but missing from the bundle")]
     InclusionProofMissing,
@@ -177,7 +176,7 @@ pub enum VerifyError {
     /// unrecognized shape (none of the three known: Sigstore Bundle
     /// v0.2 chain, v0.3 single-cert, npm attestations wrapper), or
     /// a sub-component (DSSE envelope, cert chain, tlog entry)
-    /// could not be deserialized into the schema bumped in Phase 1.0.
+    /// could not be deserialized into the bundle schema.
     #[error("Sigstore bundle parse failed: {0}")]
     BundleParse(String),
 
@@ -201,9 +200,8 @@ pub enum VerifyError {
 
 /// Policy for which Rekor inclusion artifacts a bundle must carry to
 /// be considered verifiable. Threaded through [`verify_rekor_set`]
-/// (Phase 1.6) and `verify_inclusion_proof` (Phase 1.7); the
-/// composed entry point (`verify_sigstore_bundle`, Phase 1.8) sets
-/// it per call site.
+/// [`verify_rekor_set`] and [`verify_inclusion_proof`]; the composed
+/// entry point ([`verify_sigstore_bundle`]) sets it per call site.
 ///
 /// `Either` is the right default for npm-attestation consumption
 /// (some npm cohorts ship SET-only, others inclusion-proof-only,
@@ -211,7 +209,7 @@ pub enum VerifyError {
 /// swap is the highest-trust operation so we require both offline
 /// anchors. The variant is the *single* authority on what's required;
 /// there is intentionally no parallel `require_inclusion_proof: bool`
-/// (GPT round-5 H1 — adding one re-creates a dual-authority bug).
+/// (adding one re-creates a dual-authority bug).
 #[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RekorInclusionProofPolicy {
@@ -290,7 +288,7 @@ pub(crate) fn pae(payload_type: &str, payload: &[u8]) -> Vec<u8> {
 ///   sigstore-rs versions) emit.
 ///
 /// The fallback decoding tries raw first; DER second.
-#[allow(dead_code)] // wired into provenance_fetch in Phase 2.1
+#[allow(dead_code)] // wired into provenance_fetch
 pub fn verify_dsse(envelope: &DsseEnvelope, cert: &X509Certificate<'_>) -> Result<(), VerifyError> {
     if envelope.signatures.is_empty() {
         return Err(VerifyError::DsseSignature(
@@ -352,7 +350,7 @@ pub fn verify_dsse(envelope: &DsseEnvelope, cert: &X509Certificate<'_>) -> Resul
 /// leaf certificate. Reject any non-P-256 SPKI explicitly — Sigstore's
 /// profile is fixed and a different curve indicates either a
 /// misissue or a substitution attack.
-#[allow(dead_code)] // consumer (`verify_dsse`) is allow-dead; transitively dead until Phase 2.1
+#[allow(dead_code)] // consumer (`verify_dsse`) is allow-dead; transitively dead
 fn extract_p256_verifying_key(cert: &X509Certificate<'_>) -> Result<VerifyingKey, VerifyError> {
     let spki = cert.public_key();
 
@@ -392,7 +390,7 @@ fn extract_p256_verifying_key(cert: &X509Certificate<'_>) -> Result<VerifyingKey
 }
 
 // ─────────────────────────────────────────────────────────────────────
-// Phase 1.5 — semantic Rekor body match.
+// semantic Rekor body match.
 // ─────────────────────────────────────────────────────────────────────
 //
 // `tlogEntries[i].canonicalizedBody` is base64(JSON) of the in-toto
@@ -445,7 +443,7 @@ struct RekorHashRef {
 /// Both shapes carry the same load-bearing information; the
 /// extraction handles the field-name differences and the verifier
 /// runs identical hard-fail checks against the unified view.
-#[allow(dead_code)] // wired into provenance_fetch in Phase 2.1
+#[allow(dead_code)] // wired into provenance_fetch
 pub fn verify_rekor_body(
     tlog_entry: &crate::sigstore::TlogEntry,
     envelope: &DsseEnvelope,
@@ -746,10 +744,7 @@ fn build_lpm_canonical_envelope_json(envelope: &DsseEnvelope) -> String {
     let mut sig_entry = serde_json::Map::new();
     if let Some(sig) = envelope.signatures.first() {
         let sig_double_b64 = BASE64.encode(sig.sig.as_bytes());
-        sig_entry.insert(
-            "sig".into(),
-            serde_json::Value::String(sig_double_b64.clone()),
-        );
+        sig_entry.insert("sig".into(), serde_json::Value::String(sig_double_b64));
     }
     let rekor_envelope = serde_json::json!({
         "payloadType": &envelope.payload_type,
@@ -771,7 +766,7 @@ fn json_value_kind(v: &serde_json::Value) -> &'static str {
 }
 
 // ─────────────────────────────────────────────────────────────────────
-// Phase 1.1 — vendored Sigstore trust root.
+// vendored Sigstore trust root.
 // ─────────────────────────────────────────────────────────────────────
 //
 // `assets/sigstore_trusted_root.json` is embedded at compile time via
@@ -785,7 +780,7 @@ fn json_value_kind(v: &serde_json::Value) -> &'static str {
 // release-engineering step that re-embeds a fresh artifact and ships
 // a new lpm-cli binary.
 //
-// Expiry policy (Phase 4 of the plan):
+// Expiry policy (of the plan):
 //   - On first load: if wall-clock > expires_at_soonest, hard-fail
 //     with `VerifyError::TrustRootExpired`.
 //   - On first load: if `expires_at_soonest - 30 days < wall-clock`,
@@ -806,7 +801,7 @@ const TRUST_ROOT_EXPIRY_WARN_DAYS: i64 = 30;
 /// Vendored Sigstore trust root. Parsed once at startup from
 /// `assets/sigstore_trusted_root.json` and cached via [`trust_root`].
 ///
-/// `#[allow(dead_code)]` while Phase 1 is being built up — Phase 1.3
+/// `#[allow(dead_code)]` while is being built up —
 /// (chain validation), 1.4 (SCT), and 1.6 (SET) are the production
 /// consumers; this commit ships the data model alone.
 #[allow(dead_code)]
@@ -832,9 +827,9 @@ pub struct FulcioRoot {
 #[derive(Debug)]
 pub struct RekorKey {
     /// Sha-256 of the SPKI bytes — what Rekor embeds as `logID` in
-    /// transparency-log entries. Stored raw so the verifier
-    /// (Phase 1.6) compares by byte slice; Rekor's API exposes it
-    /// as hex, the trust root carries it as base64 — both decode to
+    /// transparency-log entries. Stored raw so the verifier compares
+    /// by byte slice; Rekor's API exposes it as hex, the trust root
+    /// carries it as base64 — both decode to
     /// the same 32-byte hash, that's the canonical form.
     pub log_id: Vec<u8>,
     /// DER-encoded SubjectPublicKeyInfo for verifying the SET.
@@ -947,7 +942,7 @@ impl TrustRoot {
     /// embedded-bytes entry; this is the test seam and is also
     /// available for future code that wants to consume a non-embedded
     /// root (e.g. enterprise Sigstore deployments — but adding that
-    /// requires careful audit, see Phase 1.1 in the plan).
+    /// requires careful audit, see in the plan).
     pub fn parse(bytes: &[u8]) -> Result<TrustRoot, VerifyError> {
         let raw: TrustedRootJson = serde_json::from_slice(bytes)
             .map_err(|e| VerifyError::TrustRoot(format!("JSON parse: {e}")))?;
@@ -993,7 +988,7 @@ impl TrustRoot {
 
     /// Fulcio roots whose CA-level validity window contains `t`. The
     /// individual certs inside also have intrinsic notBefore/notAfter
-    /// that Phase 1.3's chain walker checks; this filter is the
+    /// that the chain walker checks; this filter is the
     /// outer gate from Sigstore's published service-window metadata.
     pub fn fulcio_roots_at(&self, t: SystemTime) -> Vec<&FulcioRoot> {
         self.fulcio_roots
@@ -1139,7 +1134,7 @@ static TRUST_ROOT_CELL: OnceLock<Result<Arc<TrustRoot>, String>> = OnceLock::new
 /// returns an error for the process lifetime, it always will. That's
 /// load-bearing: a verifier path that succeeded the first call must
 /// not silently start failing mid-install because something flapped.
-#[allow(dead_code)] // wired into provenance_fetch in Phase 2.1
+#[allow(dead_code)] // wired into provenance_fetch
 pub fn trust_root() -> Result<Arc<TrustRoot>, VerifyError> {
     let cached = TRUST_ROOT_CELL.get_or_init(|| {
         let parsed =
@@ -1172,7 +1167,7 @@ pub fn trust_root() -> Result<Arc<TrustRoot>, VerifyError> {
 }
 
 // ─────────────────────────────────────────────────────────────────────
-// Phase 1.6 — Rekor SET (Signed Entry Timestamp) verification.
+// Rekor SET (Signed Entry Timestamp) verification.
 // ─────────────────────────────────────────────────────────────────────
 //
 // The SET is Rekor's offline-verifiable promise that a given entry
@@ -1181,8 +1176,8 @@ pub fn trust_root() -> Result<Arc<TrustRoot>, VerifyError> {
 // canonical JSON of `{body, integratedTime, logID, logIndex}`.
 //
 // `integratedTime` returned here is the load-bearing "at_time"
-// anchor: Phase 1.3 (chain validation) uses it instead of wall-clock,
-// and Phase 6.2 (C2 self-update replay window) compares it to the
+// anchor: (chain validation) uses it instead of wall-clock,
+// and (C2 self-update replay window) compares it to the
 // release `published_at`. Returning `Result<SystemTime, _>` rather
 // than `Result<(), _>` forces every caller through the time anchor.
 //
@@ -1195,8 +1190,7 @@ pub fn trust_root() -> Result<Arc<TrustRoot>, VerifyError> {
 /// signing key for the entry's `logID`.
 ///
 /// Returns the parsed `integratedTime` as `SystemTime` so the caller
-/// (Phase 1.8) can thread it into chain validation as the
-/// `at_time` anchor.
+/// can thread it into chain validation as the `at_time` anchor.
 ///
 /// Policy semantics (see [`RekorInclusionProofPolicy`]):
 /// - SET present → always verify (defense in depth across all policies)
@@ -1207,7 +1201,7 @@ pub fn trust_root() -> Result<Arc<TrustRoot>, VerifyError> {
 /// Sigstore profile is ECDSA P-256 + SHA-256; Rekor signs over the
 /// SHA-256 of the canonical SET input JSON. Any non-P-256 SPKI in
 /// the pinned key rejects with [`VerifyError::RekorSet`].
-#[allow(dead_code)] // wired into provenance_fetch in Phase 2.1
+#[allow(dead_code)] // wired into provenance_fetch
 pub fn verify_rekor_set(
     tlog_entry: &crate::sigstore::TlogEntry,
     rekor_keys: &[RekorKey],
@@ -1285,7 +1279,7 @@ pub fn verify_rekor_set(
 
 /// Parse a stringified i64 seconds-since-epoch into [`SystemTime`].
 /// `tlog_entry.integrated_time` is a string per the schema bump
-/// in Phase 1.0 (the publish parser stringifies Rekor's API i64).
+/// in (the publish parser stringifies Rekor's API i64).
 fn parse_integrated_time(s: &str) -> Result<SystemTime, VerifyError> {
     let secs: i64 = s.parse().map_err(|e| {
         VerifyError::RekorSet(format!(
@@ -1383,12 +1377,12 @@ fn build_set_input_canonical_json(
 }
 
 // ─────────────────────────────────────────────────────────────────────
-// Phase 1.7 — Rekor Merkle inclusion proof verification.
+// Rekor Merkle inclusion proof verification.
 // ─────────────────────────────────────────────────────────────────────
 //
 // The inclusion proof is the second offline-verifiable anchor in a
-// Sigstore bundle (the first being the SET — Phase 1.6). It proves an
-// entry's existence in the transparency log at a specific tree state
+// Sigstore bundle (the first being the SET). It proves an entry's
+// existence in the transparency log at a specific tree state
 // via:
 //   1. The signed "checkpoint" — Rekor's commitment to a tree state
 //      (origin, tree size, root hash) signed with the same key that
@@ -1405,10 +1399,10 @@ fn build_set_input_canonical_json(
 // || right)`, `leaf_hash(data) = sha256(0x00 || data)`).
 //
 // Policy plumbing: this function verifies WHEN CALLED. The composed
-// entry point (Phase 1.8) decides whether to call based on
-// [`RekorInclusionProofPolicy`] and whether the bundle carries a
-// proof. Per the plan's GPT round-5 H1, the enum is the *single*
-// authority — there is no parallel boolean knob.
+// entry point ([`verify_sigstore_bundle`]) decides whether to call
+// based on [`RekorInclusionProofPolicy`] and whether the bundle
+// carries a proof. The enum is the *single* authority — there is
+// no parallel boolean knob.
 
 /// Verify the Rekor Merkle inclusion proof attached to `tlog_entry`.
 ///
@@ -1427,7 +1421,7 @@ fn build_set_input_canonical_json(
 /// [`VerifyError::InclusionProofMissing`] if the bundle carries no
 /// inclusion proof — the caller is responsible for deciding whether
 /// that's fatal per [`RekorInclusionProofPolicy`].
-#[allow(dead_code)] // wired into Phase 1.8 entry point
+#[allow(dead_code)] // wired into `verify_sigstore_bundle`
 pub fn verify_inclusion_proof(
     tlog_entry: &crate::sigstore::TlogEntry,
     rekor_keys: &[RekorKey],
@@ -1796,14 +1790,14 @@ fn rfc6962_verify_inclusion(
 }
 
 // ─────────────────────────────────────────────────────────────────────
-// Phase 1.3 — X.509 chain validation at `integratedTime`.
+// X.509 chain validation at `integratedTime`.
 // ─────────────────────────────────────────────────────────────────────
 //
 // Hand-rolled chain walker rather than `webpki` because Sigstore's
 // validation profile differs from WebPKI/TLS:
 //   - Sigstore matches identity via SAN URI, not DNS hostname (the
-//     identity match itself lives in Phase 1.8's
-//     `IdentityExpectations`; chain validation here just ensures
+//     identity match itself lives in `IdentityExpectations`; chain
+//     validation here just ensures
 //     the leaf's signing key is rooted in a trusted Fulcio CA).
 //   - Sigstore profile fixes algorithms (P-256 leaves signed by
 //     P-384 intermediates / roots) so we don't need WebPKI's
@@ -1816,7 +1810,7 @@ fn rfc6962_verify_inclusion(
 // the cert. That closes the "attacker steers AIA fetch to an
 // attacker-controlled CA" arm.
 //
-// `at_time` MUST be the Rekor `integratedTime` (Phase 1.6 returns
+// `at_time` MUST be the Rekor `integratedTime` (returns
 // it), NOT wall-clock. Bundles signed by certs that have since
 // retired still verify against the integratedTime they declare,
 // which is exactly what we want — bundles from 2022 still verify
@@ -1860,7 +1854,7 @@ const MAX_CHAIN_LENGTH: usize = 3;
 /// forged child leaf with attacker-controlled SAN, bypassing
 /// Sigstore's identity binding entirely. The extension enforcement
 /// is load-bearing for the verifier's core guarantee.
-#[allow(dead_code)] // wired into provenance_fetch in Phase 2.1
+#[allow(dead_code)] // wired into provenance_fetch
 pub fn verify_cert_chain(
     bundle_chain_der: &[&[u8]],
     fulcio_roots: &[&FulcioRoot],
@@ -2259,7 +2253,7 @@ fn verify_ecdsa_p384_sha384(
 }
 
 // ─────────────────────────────────────────────────────────────────────
-// Phase 1.4 — embedded SCT (Signed Certificate Timestamp) verification.
+// embedded SCT (Signed Certificate Timestamp) verification.
 // ─────────────────────────────────────────────────────────────────────
 //
 // Per RFC 6962 §3.2, a Sigstore-issued leaf cert carries one or more
@@ -2331,7 +2325,7 @@ const MIN_SCT_LEN: usize = 1 + CT_LOG_ID_LEN + 8 + 2 + 4;
 /// under one of the pinned CT log keys. A cert with no SCT
 /// extension rejects with `VerifyError::Sct` — silent skip would
 /// defeat the entire CT pin.
-#[allow(dead_code)] // wired into Phase 1.8 entry point
+#[allow(dead_code)] // wired into `verify_sigstore_bundle`
 pub fn verify_embedded_sct(
     leaf_cert_der: &[u8],
     issuer_spki_der: &[u8],
@@ -2349,8 +2343,7 @@ pub fn verify_embedded_sct(
             e.oid
                 .iter()
                 .map(|it| it.collect::<Vec<u64>>())
-                .map(|v| v.as_slice() == SCT_EXTENSION_OID_COMPONENTS)
-                .unwrap_or(false)
+                .is_some_and(|v| v.as_slice() == SCT_EXTENSION_OID_COMPONENTS)
         })
         .ok_or_else(|| {
             VerifyError::Sct(
@@ -2866,39 +2859,38 @@ fn der_encode_length(len: usize) -> Vec<u8> {
 }
 
 // ─────────────────────────────────────────────────────────────────────
-// Phase 1.8 — composed `verify_sigstore_bundle` entry point.
+// composed `verify_sigstore_bundle` entry point.
 // ─────────────────────────────────────────────────────────────────────
 //
-// Ties Phases 1.0–1.7 into a single callable. Phase 2.1 wires this
-// into `provenance_fetch.rs`'s install gate; C2's self-update calls
-// it with a different policy + identity expectations.
+// Wires the full Sigstore verifier into `provenance_fetch.rs`'s
+// install gate; C2's self-update calls it with a different policy +
+// identity expectations.
 //
 // Pipeline (each step's output is verified before the next runs):
 //   1. parse bundle → components (DSSE envelope, leaf cert DER, chain
 //      DER, tlog entry). Handles three wire shapes.
-//   2. load + check vendored trust root (Phase 1.1; fails closed if
-//      the artifact is structurally expired).
+//   2. load + check vendored trust root; fails closed if the artifact
+//      is structurally expired.
 //   3. resolve `at_time` = the tlog entry's `integratedTime` parsed
-//      via Phase 1.6's helper. Every downstream step's validity
+//      via `verify_rekor_set`. Every downstream step's validity
 //      window check uses THIS time, NOT wall-clock — so old bundles
 //      still verify against retired Fulcio chains / CT log keys.
-//   4. SET verify (Phase 1.6) — also doubles as the integrated-time
-//      anchor source under `Either` policy when SET is absent (then
-//      inclusion proof carries the offline claim).
-//   5. chain validation (Phase 1.3) at `at_time`. Enforces the
-//      BasicConstraints / KeyUsage / pathLenConstraint profile that
-//      closed the security-review Vuln 1 bypass.
-//   6. DSSE envelope verify (Phase 1.2) under the leaf cert's SPKI.
-//   7. embedded SCT verify (Phase 1.4) against the pinned CT log
-//      keys, using the chain-resolved issuer SPKI as the precert
-//      input's `issuer_key_hash` source.
-//   8. semantic Rekor body match (Phase 1.5): cert + payloadHash
-//      hard-fail, envelope-hash advisory.
-//   9. inclusion proof (Phase 1.7) — policy-conditional. Verified
-//      whenever present (defense in depth); failure-on-absence
-//      gated by `RekorInclusionProofPolicy`.
-//   10. identity check against `IdentityExpectations` (optional;
-//       `none()` for C1 npm-drift, populated for C2 self-update).
+//   4. SET verify — also doubles as the integrated-time anchor source
+//      under `Either` policy when SET is absent (then inclusion proof
+//      carries the offline claim).
+//   5. chain validation at `at_time`. Enforces the BasicConstraints /
+//      KeyUsage / pathLenConstraint profile that closed the
+//      security-review Vuln 1 bypass.
+//   6. DSSE envelope verify under the leaf cert's SPKI.
+//   7. embedded SCT verify against the pinned CT log keys, using the
+//      chain-resolved issuer SPKI as the precert `issuer_key_hash`.
+//   8. semantic Rekor body match: cert + payloadHash hard-fail,
+//      envelope-hash advisory.
+//   9. inclusion proof — policy-conditional. Verified whenever present
+//      (defense in depth); failure-on-absence gated by
+//      `RekorInclusionProofPolicy`.
+//  10. identity check against `IdentityExpectations` (optional;
+//      `none()` for C1 npm-drift, populated for C2 self-update).
 
 /// Verifier-time options. Currently carries the
 /// [`RekorInclusionProofPolicy`] only; future knobs (clock skew,
@@ -2977,7 +2969,7 @@ impl IdentityExpectations {
 /// `snapshot` carries the per-package identity for the drift gate;
 /// the trail of `integrated_time`, `leaf_cert_sha256`, `log_id`,
 /// `log_index` is the audit pin recorded into the on-disk
-/// provenance cache (Phase 2.1's `CACHE_SCHEMA_VERSION = 2`).
+/// provenance cache (`CACHE_SCHEMA_VERSION = 2`).
 #[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct VerifiedProvenance {
@@ -2996,7 +2988,7 @@ pub struct VerifiedProvenance {
 /// failure short-circuits with the most-specific `VerifyError`
 /// variant so the caller can surface diagnostics without a generic
 /// "verification failed" rollup.
-#[allow(dead_code)] // wired into provenance_fetch in Phase 2.1
+#[allow(dead_code)] // wired into provenance_fetch
 #[tracing::instrument(skip_all, name = "provenance.verify", level = "debug")]
 pub fn verify_sigstore_bundle(
     body: &[u8],
@@ -3804,7 +3796,7 @@ mod tests {
         );
     }
 
-    // ── verify_rekor_body() — Phase 1.5 ───────────────────────────
+    // ── verify_rekor_body — ───────────────────────────
 
     use crate::sigstore::{LogId, TlogEntry};
 
@@ -3987,7 +3979,7 @@ mod tests {
     #[test]
     fn accepts_rekor_body_with_envelope_hash_mismatch_alone() {
         // Pin the "envelope hash is advisory, never a rejection
-        // reason" rule from the plan (Phase 1.5, GPT round-4 H1).
+        // reason" invariant.
         // The body's `spec.content.hash.value` is mutated to a wrong
         // sha256 (all zeros) while payloadHash and publicKey stay
         // correct; verification must still succeed.
@@ -4112,7 +4104,7 @@ mod tests {
         );
     }
 
-    // ── TrustRoot — Phase 1.1 ─────────────────────────────────────
+    // ── TrustRoot — ─────────────────────────────────────
 
     fn ts(rfc3339: &str) -> SystemTime {
         DateTime::parse_from_rfc3339(rfc3339)
@@ -4564,7 +4556,7 @@ mod tests {
         );
     }
 
-    // ── verify_rekor_set — Phase 1.6 ──────────────────────────────
+    // ── verify_rekor_set — ──────────────────────────────
 
     use ecdsa::signature::hazmat::PrehashSigner;
     use p256::pkcs8::EncodePublicKey;
@@ -4839,7 +4831,7 @@ mod tests {
         // Under Either, absent SET is acceptable as long as inclusion
         // proof carries the offline anchor. verify_rekor_set itself
         // returns Ok(integrated_time) without verifying anything — the
-        // caller (Phase 1.8) is responsible for ensuring the inclusion
+        // The caller is responsible for ensuring the inclusion
         // proof path runs in this case.
         let tlog = crate::sigstore::TlogEntry {
             log_index: "0".into(),
@@ -5079,7 +5071,7 @@ mod tests {
     #[test]
     fn verifies_set_via_legacy_verification_envelope_fallback() {
         // A bundle that captured Rekor's API response verbatim under
-        // `verification.inclusionPromise` (the Phase 1.0 schema's
+        // `verification.inclusionPromise` (the schema's
         // fallback path) must still verify — `resolved_inclusion_promise`
         // walks through.
         let (signing_key, spki_der, log_id_bytes) = p256_rekor_signing_key();
@@ -5137,7 +5129,7 @@ mod tests {
         }
     }
 
-    // ── verify_inclusion_proof — Phase 1.7 ────────────────────────
+    // ── verify_inclusion_proof — ────────────────────────
 
     /// 4-leaf Merkle tree fixture. Returns
     /// `(leaf_hashes[4], internal_hashes[h01, h23], root, leaf_data[4])`
@@ -5201,7 +5193,7 @@ mod tests {
     fn rfc6962_inclusion_walk_rejects_proof_with_flipped_sibling() {
         let ([h0, h1, _h2, _h3], (_h01, h23), root, _) = four_leaf_tree();
         // Flip one byte in the first sibling — walked root mismatches.
-        let mut tampered = h1.clone();
+        let mut tampered = h1;
         tampered[0] ^= 0x01;
         let proof = vec![tampered, h23];
         let computed = rfc6962_verify_inclusion(0, 4, &h0, &proof).unwrap();
@@ -5621,7 +5613,7 @@ mod tests {
         }
     }
 
-    // ── verify_cert_chain — Phase 1.3 ─────────────────────────────
+    // ── verify_cert_chain — ─────────────────────────────
 
     /// Build a (rcgen::Certificate, DER bytes, KeyPair) triple for a
     /// P-384 self-signed root — matches the real Sigstore Fulcio root
@@ -5962,8 +5954,9 @@ mod tests {
         // are internally consistent.
         let (root_cert, root_der, root_kp) = p384_root_cert(cert_params_validity(2025));
         let leaf_der = p256_leaf_signed_by(cert_params_validity(2025), &root_cert, &root_kp);
-        let chain: Vec<&[u8]> = vec![&leaf_der, &leaf_der, &leaf_der, &root_der];
-        let root = fulcio_root_active_at(2025, root_der.clone());
+        let root_der_bytes = root_der.clone();
+        let chain: Vec<&[u8]> = vec![&leaf_der, &leaf_der, &leaf_der, &root_der_bytes];
+        let root = fulcio_root_active_at(2025, root_der);
         let roots: Vec<&FulcioRoot> = vec![&root];
         let err = verify_cert_chain(&chain, &roots, ts_year(2025))
             .expect_err("length-4 chain must reject");
@@ -6001,8 +5994,9 @@ mod tests {
         // The leaf doesn't matter for this test — root rejects
         // before signature work.
         let leaf_der = p256_leaf_signed_by(cert_params_validity(2025), &root_cert, &root_kp);
-        let chain: Vec<&[u8]> = vec![&leaf_der, &intermediate_der, &root_der];
-        let root = fulcio_root_active_at(2025, root_der.clone());
+        let root_der_bytes = root_der.clone();
+        let chain: Vec<&[u8]> = vec![&leaf_der, &intermediate_der, &root_der_bytes];
+        let root = fulcio_root_active_at(2025, root_der);
         let roots: Vec<&FulcioRoot> = vec![&root];
         let err = verify_cert_chain(&chain, &roots, ts_year(2025))
             .expect_err("pathLen exceeded must reject");
@@ -6054,7 +6048,7 @@ mod tests {
         }
     }
 
-    // ── verify_embedded_sct — Phase 1.4 ───────────────────────────
+    // ── verify_embedded_sct — ───────────────────────────
 
     /// Build a CustomExtension carrying a 1-byte dummy value. Used in
     /// tests so the leaf TBS has a non-empty extensions section both
@@ -6562,7 +6556,7 @@ mod tests {
         );
     }
 
-    // ── Phase 1.8 — bundle parser ─────────────────────────────────
+    // ── bundle parser ─────────────────────────────────
 
     /// Build a minimal v0.2 bundle JSON (chain shape) with one leaf
     /// cert + the supplied DSSE envelope + tlog entry.
@@ -6723,7 +6717,7 @@ mod tests {
         }
     }
 
-    // ── Phase 1.8 — identity expectations ─────────────────────────
+    // ── identity expectations ─────────────────────────
 
     /// Build a leaf cert with a SAN URI + optional Fulcio OIDC
     /// issuer extension. Used to test check_identity_expectations.
@@ -6847,7 +6841,7 @@ mod tests {
             .expect("none() must skip all checks");
     }
 
-    // ── Phase 1.8 — VerifyOptions presets ─────────────────────────
+    // ── VerifyOptions presets ─────────────────────────
 
     #[test]
     fn verify_options_strict_requires_both_set_and_inclusion_proof() {
@@ -7168,9 +7162,7 @@ mod tests {
             let set_b64 = BASE64.encode(sig.to_der().as_bytes());
             let tlog = crate::sigstore::TlogEntry {
                 log_index: "42".into(),
-                log_id: crate::sigstore::LogId {
-                    key_id: log_id_hex.clone(),
-                },
+                log_id: crate::sigstore::LogId { key_id: log_id_hex },
                 integrated_time: integrated_time.to_string(),
                 inclusion_promise: Some(crate::sigstore::RekorInclusionPromise {
                     signed_entry_timestamp: set_b64,

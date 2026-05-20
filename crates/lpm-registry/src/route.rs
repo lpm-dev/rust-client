@@ -130,7 +130,7 @@ impl RouteTable {
     pub fn new(mode: RouteMode, npmrc: NpmrcConfig) -> Result<Self, NpmrcLoadErrors> {
         if !npmrc.errors.is_empty() {
             return Err(NpmrcLoadErrors {
-                errors: npmrc.errors.clone(),
+                errors: npmrc.errors,
             });
         }
         Ok(Self {

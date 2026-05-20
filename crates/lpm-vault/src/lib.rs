@@ -364,8 +364,7 @@ fn write_env_file_owner_only(output_path: &Path, content: &[u8]) -> Result<(), S
     let parent = output_path
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
-        .map(Path::to_path_buf)
-        .unwrap_or_else(|| Path::new(".").to_path_buf());
+        .map_or_else(|| Path::new(".").to_path_buf(), Path::to_path_buf);
     let file_name = output_path
         .file_name()
         .ok_or_else(|| format!("export path has no file name: {}", output_path.display()))?;
@@ -663,10 +662,10 @@ fn unescape_double_quoted(value: &str) -> String {
 fn add_to_gitignore(project_dir: &Path, file_path: &Path) {
     let gitignore_path = project_dir.join(".gitignore");
 
-    let relative = file_path
-        .strip_prefix(project_dir)
-        .map(|p| p.display().to_string())
-        .unwrap_or_else(|_| file_path.display().to_string());
+    let relative = file_path.strip_prefix(project_dir).map_or_else(
+        |_| file_path.display().to_string(),
+        |p| p.display().to_string(),
+    );
 
     let existing = std::fs::read_to_string(&gitignore_path).unwrap_or_default();
 

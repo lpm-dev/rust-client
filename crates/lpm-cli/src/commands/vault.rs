@@ -149,7 +149,7 @@ async fn run_version(json_output: bool) -> Result<(), LpmError> {
     } else {
         match installed {
             Some(v) => output::field("installed", &v),
-            None => output::field("installed", &"not found".dimmed().to_string()),
+            None => output::field("installed", &"not found".dimmed()),
         }
     }
 

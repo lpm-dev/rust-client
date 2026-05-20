@@ -109,9 +109,7 @@ pub async fn run(
     };
 
     // Step 4: Extract
-    let target_dir = output_dir
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("."));
+    let target_dir = output_dir.map_or_else(|| PathBuf::from("."), PathBuf::from);
 
     let spinner = if !json_output {
         let s = cliclack::spinner();
@@ -138,10 +136,10 @@ pub async fn run(
         // Resolve to an absolute path now that extraction has created the
         // directory. Fall back to the lexical form if canonicalize fails
         // (e.g., target_dir was deleted out from under us mid-run).
-        let absolute_output_dir = target_dir
-            .canonicalize()
-            .map(|p| p.display().to_string())
-            .unwrap_or_else(|_| target_dir.display().to_string());
+        let absolute_output_dir = target_dir.canonicalize().map_or_else(
+            |_| target_dir.display().to_string(),
+            |p| p.display().to_string(),
+        );
         let json = serde_json::json!({
             "success": true,
             "package": name.to_string(),

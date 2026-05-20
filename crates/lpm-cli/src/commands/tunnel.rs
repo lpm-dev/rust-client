@@ -576,9 +576,7 @@ async fn run_replay(
     default_port: u16,
 ) -> Result<(), LpmError> {
     let logger = lpm_tunnel::webhook_log::WebhookLogger::new(project_dir);
-    let port = parse_flag_usize(args, "--port", "-p")
-        .map(|p| p as u16)
-        .unwrap_or(default_port);
+    let port = parse_flag_usize(args, "--port", "-p").map_or(default_port, |p| p as u16);
 
     let is_last = args.contains(&"--last".to_string());
     let number = args
@@ -783,8 +781,7 @@ fn print_webhook_detail(webhook: &lpm_tunnel::webhook::CapturedWebhook, index: u
 
     let provider_display = webhook
         .provider
-        .map(|p| p.to_string())
-        .unwrap_or_else(|| "unknown".to_string());
+        .map_or_else(|| "unknown".to_string(), |p| p.to_string());
 
     eprintln!();
     eprintln!("  {} Webhook #{index}", "━".repeat(40).dimmed());

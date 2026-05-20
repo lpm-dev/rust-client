@@ -717,7 +717,7 @@ async fn run_under_store_lock(
     let mut successes = 0usize;
     let mut failures = 0usize;
 
-    // rework  + GPT-5 audit follow-up
+    // rework  + follow-up
     // : resolve the full sandbox-mode precedence chain
     // ONCE up front so the env-scrub strategy AND the `SandboxMode`
     // selection both consult the same resolved state.
@@ -727,7 +727,7 @@ async fn run_under_store_lock(
     // resolved mode from the chain — so persistent
     // `[sandbox] mode = "none"` (set via `lpm config sandbox --set none`
     // or directly in `lpm.toml` / `~/.lpm/config.toml`) silently
-    // fell back to the enforced default. GPT-5's audit
+    // fell back to the enforced default.
     // caught that gap; the test
     // `sandbox_config::tests::decide_runtime_no_flags_config_none_yields_disabled_no_scrub`
     // pins the corrected contract.
@@ -907,7 +907,7 @@ async fn run_under_store_lock(
     lpm_sandbox::prepare_writable_dirs(&prepare_spec)
         .map_err(|e| LpmError::Registry(format!("{e}")))?;
 
-    // rework GPT-5 audit follow-up: `sandbox_options`
+    // rework follow-up: `sandbox_options`
     // (carrying `allow-degraded` and `deny_outbound_network`) is
     // already in scope from the resolver call up top. Do NOT
     // re-resolve here — the previous version did exactly that, but
@@ -993,7 +993,7 @@ async fn run_under_store_lock(
     // stripped + no containment" as one combined warning rather
     // than two split announcements.
     //
-    // GPT-5 audit  Low + Medium: the strict banner gate
+    // Low + Medium: the strict banner gate
     // must consult BOTH the resolved tier and the final SandboxMode.
     //
     // Round 1: pre-fix the banner only fired for `--strict-sandbox`

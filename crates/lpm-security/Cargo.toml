@@ -31,3 +31,6 @@ tempfile = "3"
 [[bench]]
 name = "behavioral"
 harness = false
+
+[lints]
+workspace = true

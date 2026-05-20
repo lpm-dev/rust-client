@@ -258,7 +258,7 @@ fn rollback_v2(
     let mut restored: Vec<String> = Vec::new();
     let mut removed_files: Vec<PathBuf> = Vec::new();
 
-    // Phase 1: Restore from backup entries.
+    // Restore from backup entries.
     if let Some(backups) = manifest.get("backups").and_then(|b| b.as_array()) {
         for entry in backups {
             let original = entry
@@ -313,7 +313,7 @@ fn rollback_v2(
         }
     }
 
-    // Phase 2: Remove files that were newly created by the migration.
+    // Remove files that were newly created by the migration.
     if let Some(created) = manifest.get("created").and_then(|c| c.as_array()) {
         for entry in created {
             let Some(rel) = entry.as_str() else {
@@ -331,7 +331,7 @@ fn rollback_v2(
         }
     }
 
-    // Phase 3: Clean up empty parent directories that were created by
+    // Clean up empty parent directories that were created by
     // the migration. Walks up each removed file's parent chain stopping
     // at the project root. A non-empty directory is left alone so we
     // never delete user content.
@@ -379,7 +379,7 @@ fn rollback_legacy_scan(
 
     let mut restored = Vec::new();
 
-    // Phase 1: Restore from .backup files in the project root.
+    // Restore from .backup files in the project root.
     let entries = std::fs::read_dir(project_dir).map_err(|e| {
         LpmError::Script(format!(
             "failed to read directory {}: {e}",
@@ -425,7 +425,7 @@ fn rollback_legacy_scan(
         restored.push(original_name.to_string());
     }
 
-    // Phase 2: Remove files that were newly created by migration.
+    // Remove files that were newly created by migration.
     for name in &created_files {
         let path = project_dir.join(name);
         if path.exists() {
@@ -545,8 +545,7 @@ pub fn resolve_manifest_path(project_dir: &Path, rel: &str) -> Result<PathBuf, L
 fn relativize_to_posix(path: &Path, project_dir: &Path) -> String {
     let rel = path
         .strip_prefix(project_dir)
-        .map(|p| p.to_path_buf())
-        .unwrap_or_else(|_| path.to_path_buf());
+        .map_or_else(|_| path.to_path_buf(), |p| p.to_path_buf());
 
     rel.components()
         .filter_map(|c| match c {

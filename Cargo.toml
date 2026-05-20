@@ -191,3 +191,17 @@ opt-level = 3
 lto = true
 codegen-units = 1
 strip = true
+
+[workspace.lints.rust]
+nonstandard_style = "deny"
+future_incompatible = "warn"
+
+[workspace.lints.clippy]
+# Lints clean across the whole workspace — CI fails immediately on regression.
+clone_on_copy = "deny"
+unnecessary_map_or = "deny"
+manual_ok_or = "deny"
+redundant_clone = "deny"
+map_unwrap_or = "deny"
+needless_collect = "deny"
+unnecessary_wraps = "deny"

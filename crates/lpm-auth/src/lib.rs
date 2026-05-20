@@ -661,17 +661,14 @@ fn session_access_token_expiry(registry: &str) -> Option<chrono::DateTime<chrono
 
 /// Returns true when a stored session access token is already expired.
 pub fn is_session_access_token_expired(registry: &str) -> bool {
-    session_access_token_expiry(registry)
-        .map(|expiry| expiry <= chrono::Utc::now())
-        .unwrap_or(false)
+    session_access_token_expiry(registry).is_some_and(|expiry| expiry <= chrono::Utc::now())
 }
 
 /// Returns true when a stored session access token should be refreshed.
 /// Missing metadata is treated as refresh-needed so older stored sessions self-heal.
 pub fn should_refresh_session_access_token(registry: &str) -> bool {
     session_access_token_expiry(registry)
-        .map(|expiry| expiry <= chrono::Utc::now() + chrono::Duration::minutes(5))
-        .unwrap_or(true)
+        .is_none_or(|expiry| expiry <= chrono::Utc::now() + chrono::Duration::minutes(5))
 }
 
 /// Returns true if the local session-expiry metadata file exists on disk but
@@ -765,8 +762,7 @@ pub struct TokenExpiry {
 pub fn is_otp_required(registry: &str) -> bool {
     read_token_expiries()
         .get(registry)
-        .map(|e| e.otp_required)
-        .unwrap_or(false)
+        .is_some_and(|e| e.otp_required)
 }
 
 /// Set the OTP/2FA preference for a registry.
@@ -1500,7 +1496,7 @@ fn clear_token_from_file(registry_url: &str) -> Result<(), String> {
         obj.remove(registry_url);
     }
 
-    if store.as_object().map(|o| o.is_empty()).unwrap_or(true) {
+    if store.as_object().is_none_or(|o| o.is_empty()) {
         // No more tokens — remove the file
         let _ = std::fs::remove_file(&path);
     } else {

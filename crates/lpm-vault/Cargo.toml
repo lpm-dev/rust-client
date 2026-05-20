@@ -40,3 +40,6 @@ urlencoding = "2"
 tempfile = "3"
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 wiremock = "0.6"
+
+[lints]
+workspace = true

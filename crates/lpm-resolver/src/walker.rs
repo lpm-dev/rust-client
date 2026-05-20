@@ -909,8 +909,7 @@ fn expand_deps_from_info(
         // `npm:<target>@<range>` alias, enqueue the target.
         let target_name: &str = ver_aliases
             .and_then(|m| m.get(dep_name))
-            .map(String::as_str)
-            .unwrap_or(dep_name.as_str());
+            .map_or(dep_name.as_str(), String::as_str);
         let dep_key = CanonicalKey::from_dep_name(target_name);
         if seen.insert(dep_key) {
             next_level.push(target_name.to_string());
@@ -950,8 +949,7 @@ async fn mount_with_delay(
     let delay_ms = delays
         .iter()
         .find(|(n, _)| *n == name)
-        .map(|(_, d)| *d)
-        .unwrap_or(0);
+        .map_or(0, |(_, d)| *d);
     Mock::given(method("GET"))
         .and(path(format!("/{name}")))
         .respond_with(

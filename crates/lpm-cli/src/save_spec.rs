@@ -315,7 +315,7 @@ pub fn decide_saved_dependency_spec(
     resolved: &Version,
     flags: SaveFlags,
     config: SaveConfig,
-) -> Result<SaveSpecDecision, LpmError> {
+) -> SaveSpecDecision {
     // ── Tier 1: explicit user input wins everything. ─────────────
     // Wildcard, Workspace, Exact, and Range are all things the user
     // concretely typed at the command line; per the "preserve
@@ -323,28 +323,28 @@ pub fn decide_saved_dependency_spec(
     // of flags or config.
     match intent {
         UserSaveIntent::Wildcard => {
-            return Ok(SaveSpecDecision {
+            return SaveSpecDecision {
                 spec_to_write: "*".to_string(),
                 reason: SaveSpecReason::PreservedUserWildcard,
-            });
+            };
         }
         UserSaveIntent::Workspace(s) => {
-            return Ok(SaveSpecDecision {
+            return SaveSpecDecision {
                 spec_to_write: s.clone(),
                 reason: SaveSpecReason::PreservedWorkspace,
-            });
+            };
         }
         UserSaveIntent::Exact(s) => {
-            return Ok(SaveSpecDecision {
+            return SaveSpecDecision {
                 spec_to_write: s.clone(),
                 reason: SaveSpecReason::PreservedUserExact,
-            });
+            };
         }
         UserSaveIntent::Range(s) => {
-            return Ok(SaveSpecDecision {
+            return SaveSpecDecision {
                 spec_to_write: s.clone(),
                 reason: SaveSpecReason::PreservedUserRange,
-            });
+            };
         }
         UserSaveIntent::Bare | UserSaveIntent::DistTag(_) => {
             // Fall through to the policy chain.
@@ -357,22 +357,22 @@ pub fn decide_saved_dependency_spec(
     // because the user just typed them — they unambiguously want this
     // behavior right now.
     if flags.exact {
-        return Ok(SaveSpecDecision {
+        return SaveSpecDecision {
             spec_to_write: resolved.to_string(),
             reason: SaveSpecReason::FlagExact,
-        });
+        };
     }
     if flags.tilde {
-        return Ok(SaveSpecDecision {
+        return SaveSpecDecision {
             spec_to_write: format!("~{resolved}"),
             reason: SaveSpecReason::FlagTilde,
-        });
+        };
     }
     if let Some(prefix) = flags.save_prefix {
-        return Ok(SaveSpecDecision {
+        return SaveSpecDecision {
             spec_to_write: prefix.render(resolved),
             reason: SaveSpecReason::FlagSavePrefix,
-        });
+        };
     }
 
     // ── Tier 3: prerelease-exact safety. ─────────────────────────
@@ -381,34 +381,34 @@ pub fn decide_saved_dependency_spec(
     // config so a forgotten `save-prefix = "^"` does not silently
     // widen prereleases.
     if resolved.is_prerelease() {
-        return Ok(SaveSpecDecision {
+        return SaveSpecDecision {
             spec_to_write: resolved.to_string(),
             reason: SaveSpecReason::PrereleaseExactSafety,
-        });
+        };
     }
 
     // ── Tier 4: persistent user config. ──────────────────────────
     // `save-exact = true` wins over `save-prefix` per the     // "Config interaction rule".
     if config.save_exact {
-        return Ok(SaveSpecDecision {
+        return SaveSpecDecision {
             spec_to_write: resolved.to_string(),
             reason: SaveSpecReason::ConfigSaveExact,
-        });
+        };
     }
     if let Some(prefix) = config.save_prefix {
-        return Ok(SaveSpecDecision {
+        return SaveSpecDecision {
             spec_to_write: prefix.render(resolved),
             reason: SaveSpecReason::ConfigSavePrefix,
-        });
+        };
     }
 
     // ── Tier 5: built-in default. ────────────────────────────────
     // `^resolvedVersion` — the load-bearing change. Replaces
     // the legacy `*` default.
-    Ok(SaveSpecDecision {
+    SaveSpecDecision {
         spec_to_write: format!("^{resolved}"),
         reason: SaveSpecReason::DefaultCaret,
-    })
+    }
 }
 
 // ─── Tests ──────────────────────────────────────────────────────────
@@ -600,8 +600,7 @@ mod tests {
             &v("4.3.6"),
             SaveFlags::default(),
             SaveConfig::default(),
-        )
-        .unwrap();
+        );
         assert_eq!(decision.spec_to_write, "^4.3.6");
         assert_eq!(decision.reason, SaveSpecReason::DefaultCaret);
     }
@@ -614,8 +613,7 @@ mod tests {
             &v("4.3.6"),
             SaveFlags::default(),
             SaveConfig::default(),
-        )
-        .unwrap();
+        );
         assert_eq!(decision.spec_to_write, "4.3.6");
         assert_eq!(decision.reason, SaveSpecReason::PreservedUserExact);
     }
@@ -628,8 +626,7 @@ mod tests {
             &v("4.3.6"),
             SaveFlags::default(),
             SaveConfig::default(),
-        )
-        .unwrap();
+        );
         assert_eq!(
             decision.spec_to_write, "^4.3.0",
             "explicit ^4.3.0 must NOT be rewritten to ^4.3.6"
@@ -645,8 +642,7 @@ mod tests {
             &v("4.3.6"),
             SaveFlags::default(),
             SaveConfig::default(),
-        )
-        .unwrap();
+        );
         assert_eq!(decision.spec_to_write, "~4.3.6");
         assert_eq!(decision.reason, SaveSpecReason::PreservedUserRange);
     }
@@ -659,8 +655,7 @@ mod tests {
             &v("4.3.6"),
             SaveFlags::default(),
             SaveConfig::default(),
-        )
-        .unwrap();
+        );
         assert_eq!(decision.spec_to_write, "^4.3.6");
         assert_eq!(decision.reason, SaveSpecReason::DefaultCaret);
     }
@@ -673,8 +668,7 @@ mod tests {
             &v("19.0.0-rc.1"),
             SaveFlags::default(),
             SaveConfig::default(),
-        )
-        .unwrap();
+        );
         assert_eq!(decision.spec_to_write, "19.0.0-rc.1");
         assert_eq!(decision.reason, SaveSpecReason::PrereleaseExactSafety);
     }
@@ -687,8 +681,7 @@ mod tests {
             &v("4.4.0-beta.2"),
             SaveFlags::default(),
             SaveConfig::default(),
-        )
-        .unwrap();
+        );
         assert_eq!(decision.spec_to_write, "4.4.0-beta.2");
         assert_eq!(decision.reason, SaveSpecReason::PrereleaseExactSafety);
     }
@@ -705,8 +698,7 @@ mod tests {
             &v("4.3.6"),
             flags,
             SaveConfig::default(),
-        )
-        .unwrap();
+        );
         assert_eq!(decision.spec_to_write, "4.3.6");
         assert_eq!(decision.reason, SaveSpecReason::FlagExact);
     }
@@ -723,8 +715,7 @@ mod tests {
             &v("4.3.6"),
             flags,
             SaveConfig::default(),
-        )
-        .unwrap();
+        );
         assert_eq!(decision.spec_to_write, "~4.3.6");
         assert_eq!(decision.reason, SaveSpecReason::FlagTilde);
     }
@@ -743,8 +734,7 @@ mod tests {
             &v("4.3.6"),
             SaveFlags::default(),
             config,
-        )
-        .unwrap();
+        );
         assert_eq!(decision.spec_to_write, "~4.3.6");
         assert_eq!(decision.reason, SaveSpecReason::ConfigSavePrefix);
     }
@@ -761,8 +751,7 @@ mod tests {
             &v("4.3.6"),
             SaveFlags::default(),
             config,
-        )
-        .unwrap();
+        );
         assert_eq!(decision.spec_to_write, "4.3.6");
         assert_eq!(decision.reason, SaveSpecReason::ConfigSaveExact);
     }
@@ -785,8 +774,7 @@ mod tests {
             &v("4.3.6"),
             flags,
             config,
-        )
-        .unwrap();
+        );
         assert_eq!(decision.spec_to_write, "^4.3.0");
         assert_eq!(decision.reason, SaveSpecReason::PreservedUserRange);
     }
@@ -800,8 +788,7 @@ mod tests {
             &v("0.12.29"),
             SaveFlags::default(),
             SaveConfig::default(),
-        )
-        .unwrap();
+        );
         assert_eq!(decision.spec_to_write, "^0.12.29");
         assert_eq!(decision.reason, SaveSpecReason::DefaultCaret);
     }
@@ -820,8 +807,7 @@ mod tests {
             save_exact: false,
         };
         let decision =
-            decide_saved_dependency_spec(&UserSaveIntent::Bare, &v("4.3.6"), flags, config)
-                .unwrap();
+            decide_saved_dependency_spec(&UserSaveIntent::Bare, &v("4.3.6"), flags, config);
         assert_eq!(decision.spec_to_write, "4.3.6");
         assert_eq!(decision.reason, SaveSpecReason::FlagExact);
     }
@@ -838,8 +824,7 @@ mod tests {
             save_exact: true,
         };
         let decision =
-            decide_saved_dependency_spec(&UserSaveIntent::Bare, &v("4.3.6"), flags, config)
-                .unwrap();
+            decide_saved_dependency_spec(&UserSaveIntent::Bare, &v("4.3.6"), flags, config);
         assert_eq!(decision.spec_to_write, "~4.3.6");
         assert_eq!(decision.reason, SaveSpecReason::FlagTilde);
     }
@@ -856,8 +841,7 @@ mod tests {
             &v("4.3.6"),
             flags,
             SaveConfig::default(),
-        )
-        .unwrap();
+        );
         assert_eq!(decision.spec_to_write, "~4.3.6");
         assert_eq!(decision.reason, SaveSpecReason::FlagSavePrefix);
     }
@@ -875,8 +859,7 @@ mod tests {
             &v("19.0.0-rc.1"),
             SaveFlags::default(),
             config,
-        )
-        .unwrap();
+        );
         assert_eq!(decision.spec_to_write, "19.0.0-rc.1");
         assert_eq!(decision.reason, SaveSpecReason::PrereleaseExactSafety);
     }
@@ -895,8 +878,7 @@ mod tests {
             &v("19.0.0-rc.1"),
             flags,
             SaveConfig::default(),
-        )
-        .unwrap();
+        );
         assert_eq!(decision.spec_to_write, "~19.0.0-rc.1");
         assert_eq!(decision.reason, SaveSpecReason::FlagTilde);
     }
@@ -915,8 +897,7 @@ mod tests {
             save_exact: true,
         };
         let decision =
-            decide_saved_dependency_spec(&UserSaveIntent::Wildcard, &v("4.3.6"), flags, config)
-                .unwrap();
+            decide_saved_dependency_spec(&UserSaveIntent::Wildcard, &v("4.3.6"), flags, config);
         assert_eq!(decision.spec_to_write, "*");
         assert_eq!(decision.reason, SaveSpecReason::PreservedUserWildcard);
     }
@@ -929,8 +910,7 @@ mod tests {
             &v("1.5.0"),
             SaveFlags::default(),
             SaveConfig::default(),
-        )
-        .unwrap();
+        );
         assert_eq!(decision.spec_to_write, "workspace:^");
         assert_eq!(decision.reason, SaveSpecReason::PreservedWorkspace);
     }
@@ -951,8 +931,7 @@ mod tests {
             &v("1.5.0"),
             flags,
             config,
-        )
-        .unwrap();
+        );
         assert_eq!(decision.spec_to_write, "workspace:*");
         assert_eq!(decision.reason, SaveSpecReason::PreservedWorkspace);
     }

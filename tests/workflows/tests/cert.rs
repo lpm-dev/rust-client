@@ -5,11 +5,30 @@ use support::{TempProject, lpm};
 fn cert_command(project: &TempProject) -> assert_cmd::Command {
     let mut cmd = lpm(project);
     cmd.env("LPM_CERT_TEST_TRUST_STORE_DIR", trust_store_dir(project));
+    cmd.env("LPM_CERT_AUDIT_DIR", audit_dir(project));
     cmd
 }
 
 fn trust_store_dir(project: &TempProject) -> std::path::PathBuf {
     project.home().join(".lpm").join("test-trust-store")
+}
+
+fn audit_dir(project: &TempProject) -> std::path::PathBuf {
+    project.home().join(".lpm").join("audit")
+}
+
+fn audit_actions(project: &TempProject) -> Vec<String> {
+    let log = audit_dir(project).join("cert.jsonl");
+    if !log.exists() {
+        return Vec::new();
+    }
+    let s = std::fs::read_to_string(&log).unwrap_or_default();
+    s.lines()
+        .filter_map(|l| {
+            let v: serde_json::Value = serde_json::from_str(l).ok()?;
+            v["action"].as_str().map(|s| s.to_string())
+        })
+        .collect()
 }
 
 fn trust_store_entry(project: &TempProject) -> std::path::PathBuf {
@@ -109,6 +128,16 @@ fn cert_trust_json_generates_ca_and_installs_into_isolated_test_store() {
             & 0o777;
         assert_eq!(mode, 0o600, "root CA key must be owner-only on unix");
     }
+
+    let actions = audit_actions(&project);
+    assert!(
+        actions.contains(&"ca.generate".to_string()),
+        "lpm cert trust must record ca.generate; got {actions:?}"
+    );
+    assert!(
+        actions.contains(&"ca.trust_install".to_string()),
+        "lpm cert trust must record ca.trust_install; got {actions:?}"
+    );
 }
 
 #[test]
@@ -147,6 +176,12 @@ fn cert_uninstall_json_removes_trust_store_entry_but_keeps_ca_files() {
         "uninstall must remove the isolated trust-store marker"
     );
 
+    let actions = audit_actions(&project);
+    assert!(
+        actions.contains(&"ca.trust_uninstall".to_string()),
+        "lpm cert uninstall must record ca.trust_uninstall; got {actions:?}"
+    );
+
     let status_output = cert_command(&project)
         .args(["cert", "status", "--json"])
         .output()
@@ -171,7 +206,10 @@ fn cert_generate_json_regenerates_when_requested_host_is_missing() {
 
     let initial = json_envelope(&initial_output, "lpm cert generate --json");
     assert_eq!(initial["success"], serde_json::json!(true));
-    assert_eq!(initial["ca_freshly_installed"], serde_json::json!(true));
+    // `lpm cert generate` declines trust-store install — the CA lands on disk
+    // but is not pushed into the trust store; the user runs `lpm cert trust`
+    // separately for that. `ca_freshly_installed` reflects trust-store state.
+    assert_eq!(initial["ca_freshly_installed"], serde_json::json!(false));
     assert_eq!(initial["cert_freshly_generated"], serde_json::json!(true));
 
     let refreshed_output = cert_command(&project)
@@ -201,8 +239,8 @@ fn cert_generate_json_regenerates_when_requested_host_is_missing() {
         "generate must write the project key"
     );
     assert!(
-        trust_store_entry(&project).exists(),
-        "generate must install the CA into the isolated test trust store"
+        !trust_store_entry(&project).exists(),
+        "generate must NOT install the CA into the trust store (use `lpm cert trust` for that)"
     );
 
     envelope["cert_path"] = serde_json::json!("[CERT_PATH]");
@@ -225,7 +263,11 @@ fn cert_generate_json_regenerates_when_requested_host_is_missing() {
         .expect("project hostnames must be an array");
 
     assert_eq!(status["ca"]["exists"], serde_json::json!(true));
-    assert_eq!(status["ca"]["trusted"], serde_json::json!(true));
+    assert_eq!(
+        status["ca"]["trusted"],
+        serde_json::json!(false),
+        "trust-store install requires an explicit `lpm cert trust`"
+    );
     assert_eq!(status["project"]["exists"], serde_json::json!(true));
     assert_eq!(status["project"]["needs_renewal"], serde_json::json!(false));
     assert!(

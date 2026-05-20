@@ -20,7 +20,10 @@ pub async fn run(
             })?;
             run_kill(port, json_output)
         }
-        "reset" => run_reset(project_dir, json_output),
+        "reset" => {
+            run_reset(project_dir, json_output);
+            Ok(())
+        }
         _ => Err(LpmError::Script(format!(
             "unknown action '{action}'. Available: list, kill, reset"
         ))),
@@ -126,7 +129,7 @@ fn run_kill(port: u16, json_output: bool) -> Result<(), LpmError> {
     Ok(())
 }
 
-fn run_reset(project_dir: &Path, json_output: bool) -> Result<(), LpmError> {
+fn run_reset(project_dir: &Path, json_output: bool) {
     ports::clear_port_overrides(project_dir);
 
     if json_output {
@@ -134,5 +137,4 @@ fn run_reset(project_dir: &Path, json_output: bool) -> Result<(), LpmError> {
     } else {
         output::success("port overrides cleared for this project");
     }
-    Ok(())
 }

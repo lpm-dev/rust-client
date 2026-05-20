@@ -191,7 +191,7 @@ pub async fn test(project_dir: &Path, args: &[String], json_output: bool) -> Res
     let env_vars = lpm_runner::dotenv::load_env_files(project_dir, None);
 
     let full_cmd = if args.is_empty() {
-        runner_cmd.clone()
+        runner_cmd
     } else {
         build_safe_command(&runner_name, &runner_cmd, args)
     };
@@ -225,7 +225,7 @@ pub async fn bench(project_dir: &Path, args: &[String], json_output: bool) -> Re
     let env_vars = lpm_runner::dotenv::load_env_files(project_dir, None);
 
     let full_cmd = if args.is_empty() {
-        cmd.clone()
+        cmd
     } else {
         build_safe_command(&runner_name, &cmd, args)
     };
@@ -938,7 +938,7 @@ fn run_test_or_bench_member(
     };
 
     let full_cmd = if args.is_empty() {
-        base_cmd.clone()
+        base_cmd
     } else {
         build_safe_command(&runner_name, &base_cmd, args)
     };
@@ -1526,7 +1526,7 @@ mod tests {
         // Member has no lpm.json, root also has no pin → both `None` → reuse.
         let dir = tempfile::tempdir().unwrap();
         let root_bin = PathBuf::from("/fake/root/oxlint");
-        let root_pin = Some(("oxlint".to_string(), None, root_bin.clone()));
+        let root_pin = Some(("oxlint".to_string(), None, root_bin));
 
         let member_version = read_tool_version(dir.path(), "oxlint");
         let (_, root_version, _) = root_pin.as_ref().unwrap();

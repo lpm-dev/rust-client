@@ -4339,8 +4339,7 @@ fn backoff_override() -> Option<Duration> {
         || std::env::var("LPM_TEST_MODE")
             .ok()
             .as_deref()
-            .map(|v| v == "1")
-            .unwrap_or(false);
+            .is_some_and(|v| v == "1");
     if !allowed {
         return None;
     }
@@ -4758,7 +4757,7 @@ mod tests {
         writer.write_metadata_cache("restart-key", &meta, Some("\"restart-etag\""));
 
         let mut reader = RegistryClient::new();
-        reader.cache_dir = writer.cache_dir.clone();
+        reader.cache_dir = writer.cache_dir;
 
         let result = reader.read_metadata_cache("restart-key");
 
@@ -8436,7 +8435,7 @@ mod tests {
         client_a.write_metadata_cache(&format!("npm:{pkg_name}"), &metadata, None);
 
         // Fresh client B pointed at the same dir reads it back.
-        let client_b = RegistryClient::new().with_cache_dir(Some(cache_path.clone()));
+        let client_b = RegistryClient::new().with_cache_dir(Some(cache_path));
         let (cached, _etag) = client_b
             .read_metadata_cache(&format!("npm:{pkg_name}"))
             .expect("fresh client with same cache_dir must read back the prior write");
@@ -8456,7 +8455,7 @@ mod tests {
     fn oversized_metadata_cache_file_collapses_to_miss() {
         let tmp = tempfile::tempdir().expect("tmp");
         let cache_dir = tmp.path().to_path_buf();
-        let client = RegistryClient::new().with_cache_dir(Some(cache_dir.clone()));
+        let client = RegistryClient::new().with_cache_dir(Some(cache_dir));
 
         let pkg_name = "oversized-cache-file";
         let key = format!("npm:{pkg_name}");
@@ -9250,9 +9249,9 @@ mod tests {
             port: None,
         };
         let mut eager = HashMap::new();
-        eager.insert(origin.clone(), cached(per_origin_client.clone()));
+        eager.insert(origin.clone(), cached(per_origin_client));
         let http = Arc::new(HttpClients {
-            default: cached(default.clone()),
+            default: cached(default),
             eager,
             lazy: tokio::sync::Mutex::new(HashMap::new()),
             tls_overrides: Arc::new(TlsOverrides::default()),
@@ -9697,7 +9696,7 @@ mod tests {
         };
         let mut per_origin_map = HashMap::new();
         per_origin_map.insert(
-            origin.clone(),
+            origin,
             crate::npmrc::OriginTlsOverrides {
                 cafiles: vec![],
                 certfile: Some(crate::npmrc::TaggedPath {

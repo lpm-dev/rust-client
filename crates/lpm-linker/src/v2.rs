@@ -501,8 +501,7 @@ fn ensure_peer_context(targets: &mut [V2Target], store: &Store) -> Result<(), Lp
         for peer_name in peer_deps.keys() {
             let is_optional = peer_deps_meta
                 .get(peer_name)
-                .map(|meta| meta.optional)
-                .unwrap_or(false);
+                .is_some_and(|meta| meta.optional);
             match by_name.get(peer_name) {
                 Some(ver) => derived.push((peer_name.clone(), ver.clone())),
                 None if !is_optional => {

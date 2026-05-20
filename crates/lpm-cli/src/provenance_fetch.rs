@@ -485,8 +485,8 @@ const CACHE_TTL_SECS: u64 = 7 * 24 * 60 * 60;
 /// the verification posture for cached entries changes. Entries
 /// with a mismatched version are treated as misses (re-fetch).
 ///
-/// **Version 2** (Phase 2.1): cache entries are now produced by the
-/// FULL cryptographic verifier (Phase 1.8's `verify_sigstore_bundle`),
+/// **Version 2**: cache entries are now produced by the FULL
+/// cryptographic verifier ([`verify_sigstore_bundle`]),
 /// not by identity-only extraction. Every cached snapshot has had
 /// chain + DSSE + SCT + Rekor body + SET (and possibly inclusion
 /// proof) verified at write time. Schema-1 entries are produced by
@@ -628,7 +628,7 @@ pub async fn fetch_provenance_snapshot(
             .fetch_add(http_start.elapsed().as_nanos() as u64, Ordering::Relaxed);
     }
 
-    // Verification (Phase 2.1): bytes are in hand, run the full
+    // Verification: bytes are in hand, run the full
     // verifier. Failure here is NOT degraded to `Ok(None)` because
     // it represents an attack signal (registry served a bundle that
     // claimed signed provenance but failed crypto). Transport-class
@@ -658,7 +658,7 @@ pub async fn fetch_provenance_snapshot(
 ///
 /// Pure mapping (no I/O) so the SILENT-DROP regression is directly
 /// testable without mocking the registry-client cascade.
-/// Phase 2.2 fix: the prior `.ok().flatten()` collapsed
+/// fix: the prior `.ok.flatten` collapsed
 /// `Err(LpmError::ProvenanceVerification)` into the same `None` as a
 /// transport failure, blanking the approval binding and disarming
 /// drift on subsequent installs. This helper preserves the four
@@ -716,7 +716,7 @@ pub(crate) fn map_fetch_result_to_status(
 /// `lpm approve-scripts --global` write path (P4 parity).
 ///
 /// Returns one [`ProvenanceStatus`] per input pair (never collapses
-/// distinct outcomes into a single `None`). Phase 2.2 SILENT-DROP fix:
+/// distinct outcomes into a single `None`). SILENT-DROP fix:
 /// the previous implementation used `.ok().flatten()` here, which made
 /// a verifier rejection (`Err(LpmError::ProvenanceVerification)`)
 /// indistinguishable from a network failure. Recording the resulting
@@ -1188,10 +1188,9 @@ async fn fetch_bundle_bytes(http: &reqwest::Client, url: &str) -> Result<Vec<u8>
 }
 
 /// Verify — turn the raw bundle bytes into a `ProvenanceSnapshot`
-/// AFTER cryptographic verification under Phase 1.8's
-/// `verify_sigstore_bundle`.
+/// AFTER cryptographic verification under [`verify_sigstore_bundle`].
 ///
-/// Failure semantics (Phase 2.1):
+/// Failure semantics:
 /// - `Ok(snapshot)` — bundle verified end-to-end (chain + DSSE +
 ///   SCT + Rekor body + SET; inclusion proof per policy). The
 ///   returned snapshot is safe to cache and feed into the drift
@@ -2456,13 +2455,13 @@ mod tests {
     /// installs for 7 days.
     #[tokio::test]
     async fn fetch_returns_provenance_verification_err_on_unverifiable_bundle() {
-        // Phase 2.1 behavioral pin: a registry that serves a 200
+        // behavioral pin: a registry that serves a 200
         // response whose body is structurally a Sigstore bundle but
         // cannot pass cryptographic verification MUST surface as
         // `Err(LpmError::ProvenanceVerification(...))`, NOT degrade
-        // to `Ok(None)`. Pre-Phase-2.1 the old identity-only parse
-        // would have either returned Ok(snapshot) or Ok(None)
-        // depending on whether the JSON was well-formed; neither was
+        // to `Ok(None)`. The old identity-only parse would have either
+        // returned Ok(snapshot) or Ok(None) depending on whether the
+        // JSON was well-formed; neither was
         // an attack signal. Now the verifier's failure IS the
         // signal.
         use wiremock::matchers::{method, path};
@@ -2685,7 +2684,7 @@ mod tests {
 
     #[test]
     fn cache_schema_v1_entry_treated_as_miss_under_v2_verification_posture() {
-        // Phase 2.1 schema bump pin: an on-disk entry with the
+        // schema bump pin: an on-disk entry with the
         // pre-verification schema version (1) must be treated as a
         // miss by the new code, even if the JSON is structurally
         // valid. Without this invalidation, the new verifier would
@@ -2914,7 +2913,7 @@ mod tests {
         );
     }
 
-    // ── map_fetch_result_to_status (Phase 2.2 SILENT-DROP fix) ──────
+    // ── map_fetch_result_to_status (SILENT-DROP fix) ──────
 
     fn snap_present() -> ProvenanceSnapshot {
         ProvenanceSnapshot {
@@ -3014,7 +3013,7 @@ mod tests {
         );
     }
 
-    // ── EnforceMode env-var parsing (Phase 2.2.b rollout knob) ──────
+    // ── EnforceMode env-var parsing (rollout knob) ──────
 
     /// Unset env → fail-closed default. This is the production
     /// posture for users who never touch `LPM_PROVENANCE_ENFORCE`.

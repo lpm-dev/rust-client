@@ -45,7 +45,7 @@ pub async fn run(
     {
         output::warn(&format!(
             "Failed to revoke browser pairings: {}",
-            e.to_string().dimmed()
+            e.dimmed()
         ));
     }
 

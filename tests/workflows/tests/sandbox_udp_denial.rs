@@ -278,9 +278,7 @@ fn node_available() -> bool {
 /// keeping the test and the sandboxed install pipeline aligned
 /// on the same allow-listed path) and falls back to `/tmp`.
 fn allowlisted_exec_dir() -> PathBuf {
-    std::env::var_os("TMPDIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("/tmp"))
+    std::env::var_os("TMPDIR").map_or_else(|| PathBuf::from("/tmp"), PathBuf::from)
 }
 
 /// True iff the most-specific `/proc/mounts` entry covering

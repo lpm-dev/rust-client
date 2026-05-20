@@ -125,7 +125,7 @@ pub struct AggregateBlockedSet {
 pub fn aggregate_blocked_across_globals(root: &LpmRoot) -> Result<AggregateBlockedSet, LpmError> {
     let manifest = read_global_manifest_or_empty(root)?;
     let trusted = lpm_global::trusted_deps::read_for(root)?;
-    aggregate_with_manifest_and_trust(root, &manifest, &trusted)
+    Ok(aggregate_with_manifest_and_trust(root, &manifest, &trusted))
 }
 
 /// Lower-level helper exposed for testing: the caller supplies the
@@ -135,7 +135,7 @@ pub fn aggregate_with_manifest_and_trust(
     root: &LpmRoot,
     manifest: &GlobalManifest,
     trusted: &GlobalTrustedDependencies,
-) -> Result<AggregateBlockedSet, LpmError> {
+) -> AggregateBlockedSet {
     // Keyed by `(name, version, integrity-or-empty, script_hash-or-empty)`
     // so DIFFERENT bindings for the same name@version stay separate.
     let mut by_key: BTreeMap<DedupKey, (AggregateBlockedRow, Vec<String>)> = BTreeMap::new();
@@ -223,10 +223,10 @@ pub fn aggregate_with_manifest_and_trust(
     });
     unreadable_origins.sort();
 
-    Ok(AggregateBlockedSet {
+    AggregateBlockedSet {
         rows,
         unreadable_origins,
-    })
+    }
 }
 
 /// Read `<install_root>/.lpm/build-state.json`. Returns `None` for

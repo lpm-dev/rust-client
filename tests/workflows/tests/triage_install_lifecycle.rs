@@ -207,7 +207,7 @@ async fn mount_batch_metadata(mock: &MockRegistry, packages: &[(&str, &str, &[u8
             );
             let mut time = serde_json::Map::new();
             time.insert(
-                version_owned.clone(),
+                version_owned,
                 serde_json::Value::String("2024-01-01T00:00:00.000Z".to_string()),
             );
             serde_json::json!({

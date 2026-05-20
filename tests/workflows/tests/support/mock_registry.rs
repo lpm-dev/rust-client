@@ -1340,7 +1340,7 @@ impl Respond for StatefulSyncPostResponder {
             .state
             .lock()
             .expect("StatefulSyncPostResponder mutex poisoned");
-        let new_version = guard.as_ref().map(|b| b.version + 1).unwrap_or(1);
+        let new_version = guard.as_ref().map_or(1, |b| b.version + 1);
         *guard = Some(StoredSyncBlob {
             encrypted_blob,
             wrapped_key,

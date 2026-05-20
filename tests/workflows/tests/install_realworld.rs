@@ -322,9 +322,7 @@ async fn install_realworld_nextjs_fixture_succeeds_through_verdaccio() {
          peak_rss={} status={:?}\n\
          stdout (first 4KB):\n{:.4096}\n\
          stderr (first 4KB):\n{:.4096}",
-        peak_rss_mib
-            .map(|m| format!("{m:.1} MiB"))
-            .unwrap_or_else(|| "<unavailable>".into()),
+        peak_rss_mib.map_or_else(|| "<unavailable>".into(), |m| format!("{m:.1} MiB")),
         output.status,
         stdout,
         stderr,
@@ -399,10 +397,7 @@ async fn install_realworld_nextjs_fixture_succeeds_through_verdaccio() {
         .filter_map(|e| e.ok())
         .filter(|e| {
             // Skip `.lpm`, `.bin`, etc. — only real package dirs.
-            e.file_name()
-                .to_str()
-                .map(|s| !s.starts_with('.'))
-                .unwrap_or(false)
+            e.file_name().to_str().is_some_and(|s| !s.starts_with('.'))
         })
         .count();
     assert!(

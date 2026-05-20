@@ -1129,7 +1129,7 @@ mod tests {
         }
     }
 
-    // ── script-read-allow loader tests (Phase 3) ──────────────────
+    // ── script-read-allow loader tests ────────────────────────────
 
     /// Missing `package.json` + empty user list → empty result, no
     /// error. Common case for projects that don't opt in.
