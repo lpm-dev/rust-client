@@ -432,6 +432,66 @@ fn reconcile_preserves_previous_files_when_marker_unresolved_and_backup_missing(
 }
 
 #[test]
+fn reconcile_refuses_to_resolve_marker_when_previous_fingerprint_mismatches() {
+    let (tmp, _g) = setup_home();
+    // Stage the "corrupted from a pre-fix branch build" state: a marker for
+    // fp_A but `.previous` actually contains fp_B (a later root that was
+    // installed by a since-broken successive rotation). Reconcile must NOT
+    // record `ca.reconcile.resolved` for fp_A — fp_A is still trusted, and
+    // uninstalling fp_B's bytes would remove the wrong cert.
+    let (_active_cert, _) = seed_root_ca();
+    seed_project_leaf(&tmp.path().join("proj"));
+
+    // `.previous` here gets a brand-new CA's bytes — its fingerprint is fp_B,
+    // unrelated to any audit event.
+    let (b_cert_pem, b_key_pem) = lpm_cert::ca::generate_ca().unwrap();
+    let ca_dir = paths::ca_dir().unwrap();
+    let prev_cert_path = ca_dir.join("rootCA.pem.previous");
+    let prev_key_path = ca_dir.join("rootCA-key.pem.previous");
+    std::fs::write(&prev_cert_path, &b_cert_pem).unwrap();
+    std::fs::write(&prev_key_path, &b_key_pem).unwrap();
+    let prev_fp_b = cert::fingerprint_hex(&cert::fingerprint_sha256(&prev_cert_path).unwrap());
+
+    let fp_a = "AA:11:22:33:44:55:66:77:88:99:00:11:22:33:44:55:66:77:88:99:AA:BB:CC:DD:EE:FF:00:11:22:33:44:55".to_string();
+    assert_ne!(fp_a, prev_fp_b);
+    audit::append(audit::AuditAction::CaReconcileRequired {
+        old_fingerprint: fp_a.clone(),
+        new_fingerprint: "ZZ".into(),
+    })
+    .unwrap();
+
+    let prev_bytes_before = std::fs::read(&prev_cert_path).unwrap();
+
+    let result =
+        lpm_cert::reconcile::reconcile(lpm_cert::reconcile::ReconcileOptions::default()).unwrap();
+
+    assert!(
+        result.pending_old_fingerprints.contains(&fp_a),
+        "marker for fp_A must remain pending, got resolved={:?} pending={:?}",
+        result.resolved_old_fingerprints,
+        result.pending_old_fingerprints
+    );
+    assert!(
+        !result.resolved_old_fingerprints.contains(&fp_a),
+        "marker for fp_A must NOT be recorded as resolved when .previous holds a different fingerprint"
+    );
+    assert!(!result.reconcile_required_cleared);
+
+    let actions = read_audit_actions(&tmp.path().join("audit"));
+    assert!(
+        !actions
+            .iter()
+            .any(|a| a == "ca.reconcile.resolved" || a == "ca.trust_uninstall"),
+        "no false resolved/uninstall events may be appended, got actions={actions:?}"
+    );
+    assert_eq!(
+        prev_bytes_before,
+        std::fs::read(&prev_cert_path).unwrap(),
+        ".previous bytes must not be touched"
+    );
+}
+
+#[test]
 fn rotate_refuses_to_overwrite_previous_while_reconcile_required_unresolved() {
     let (tmp, _g) = setup_home();
     let (active_cert, _) = seed_root_ca();

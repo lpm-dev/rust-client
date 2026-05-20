@@ -23,7 +23,7 @@
 //! 4. (reserved for future "status nag clearance" job — currently bundled into
 //!    job 2's success path.)
 
-use crate::{audit, paths, rotate, trust};
+use crate::{audit, cert, paths, rotate, trust};
 use lpm_common::LpmError;
 use serde::Serialize;
 use std::collections::BTreeSet;
@@ -63,6 +63,21 @@ pub fn reconcile(opts: ReconcileOptions) -> Result<ReconcileResult, LpmError> {
 
     let mut unresolved_old_fps = scan_unresolved_reconcile_required()?;
 
+    // Compute the fingerprint of the on-disk `.previous` bytes once. Both the
+    // grace-expiry path and the reconcile-required retry path use this to
+    // confirm that the file actually contains the cert the marker / grace entry
+    // is asking us to uninstall — otherwise we'd remove the wrong root from
+    // the trust store and record a false `resolved` event for the original
+    // marker. This can happen on developer machines that produced the
+    // pre-guard mixed state from an earlier build of this branch.
+    let prev_cert_fp_hex: Option<String> = if prev_cert.exists() {
+        cert::fingerprint_sha256(&prev_cert)
+            .ok()
+            .map(|fp| cert::fingerprint_hex(&fp))
+    } else {
+        None
+    };
+
     // Job 1: grace-window expiry.
     for entry in rotate::read_grace_entries()? {
         let scheduled = OffsetDateTime::parse(&entry.removes_at, &Rfc3339).map_err(|e| {
@@ -83,6 +98,15 @@ pub fn reconcile(opts: ReconcileOptions) -> Result<ReconcileResult, LpmError> {
             tracing::warn!(
                 "grace-expiry: cannot find rootCA.pem.previous; the old CA fingerprint {} must be removed manually (re-install the old root, then `lpm cert uninstall`)",
                 entry.fingerprint
+            );
+            out.grace_pending.push(entry.clone());
+            continue;
+        }
+        if prev_cert_fp_hex.as_deref() != Some(entry.fingerprint.as_str()) {
+            tracing::warn!(
+                "grace-expiry: rootCA.pem.previous fingerprint {:?} does not match grace entry {:?}; refusing to uninstall the wrong cert. The grace entry is preserved; the older root must be removed manually.",
+                prev_cert_fp_hex.as_deref().unwrap_or("<unknown>"),
+                entry.fingerprint,
             );
             out.grace_pending.push(entry.clone());
             continue;
@@ -119,8 +143,9 @@ pub fn reconcile(opts: ReconcileOptions) -> Result<ReconcileResult, LpmError> {
     //
     // The previous-root backup is the source of truth for the cert bytes the
     // platform needs (macOS Keychain, certutil, Linux ca-certificates) to
-    // identify the entry to remove. If it's gone we cannot proceed without
-    // manual intervention.
+    // identify the entry to remove. If it's gone or doesn't match the marker,
+    // we cannot proceed without manual intervention — and we must NOT record
+    // a `resolved` event for a fingerprint we didn't actually remove.
     let fps_to_retry: Vec<String> = unresolved_old_fps.iter().cloned().collect();
     for old_fp in fps_to_retry {
         if opts.dry_run {
@@ -131,6 +156,15 @@ pub fn reconcile(opts: ReconcileOptions) -> Result<ReconcileResult, LpmError> {
             tracing::warn!(
                 "reconcile_required is unresolved for old CA {}, but rootCA.pem.previous is missing — re-install the old root and run `lpm cert uninstall`, then re-run `lpm cert reconcile`",
                 old_fp
+            );
+            out.pending_old_fingerprints.push(old_fp);
+            continue;
+        }
+        if prev_cert_fp_hex.as_deref() != Some(old_fp.as_str()) {
+            tracing::warn!(
+                "reconcile_required marker for {} cannot be resolved: rootCA.pem.previous holds a different fingerprint {:?}. Restore the matching cert bytes (or run `lpm cert uninstall` manually with the correct cert in rootCA.pem) and re-run reconcile.",
+                old_fp,
+                prev_cert_fp_hex.as_deref().unwrap_or("<unknown>"),
             );
             out.pending_old_fingerprints.push(old_fp);
             continue;
