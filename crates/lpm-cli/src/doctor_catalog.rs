@@ -303,6 +303,41 @@ pub static AUTH_MISSING: CheckEntry = CheckEntry {
     auto_fix: None,
 };
 
+pub static VAULT_STORAGE_KEYCHAIN: CheckEntry = CheckEntry {
+    code: "vault_storage_keychain",
+    name: "Vault storage backend",
+    category: Category::Auth,
+    tier: Tier::Fast,
+    description: "Vault secrets are unlocked via the OS Keychain. The encrypted blob \
+         requires a separate ACL the user controls per-app, so a same-UID \
+         process cannot silently read vault contents.",
+    when_fires: "Running on macOS, where the keyring crate writes secrets into the OS Keychain.",
+    remediation: "No action — keychain-backed storage is the strongest available backend.",
+    possible_severities: &[Severity::Pass],
+    auto_fix: None,
+};
+
+pub static VAULT_STORAGE_FALLBACK: CheckEntry = CheckEntry {
+    code: "vault_storage_fallback",
+    name: "Vault storage backend",
+    category: Category::Auth,
+    tier: Tier::Fast,
+    description: "Vault secrets are encrypted with an on-disk key file (~/.lpm/.vault-fallback-key, \
+         0600) using AES-256-GCM + scrypt. The fallback path is correct cryptographically, \
+         but any process running as your user can read the key file and decrypt the vault — \
+         there is no per-app ACL the way macOS Keychain provides. This is a documented \
+         platform limitation, not a bug.",
+    when_fires: "Running on Linux or Windows. The keyring crate is bypassed because the vault \
+         layer is conditionally compiled to use the encrypted-file backend on non-macOS \
+         platforms (see crates/lpm-vault/src/fallback.rs).",
+    remediation: "Treat the host as the trust boundary: assume any same-UID code-execution \
+         primitive on this machine can read vault secrets. Do not run untrusted lifecycle \
+         scripts in unsandboxed mode. The Phase 46 sandbox + script-policy gates are the \
+         primary mitigation. macOS users get the stronger keychain-backed path automatically.",
+    possible_severities: &[Severity::Warn],
+    auto_fix: None,
+};
+
 // ──────────────────────────────────────────────────────────────────
 // Project state
 // ──────────────────────────────────────────────────────────────────
@@ -1704,6 +1739,8 @@ pub static CLI_CATALOG: &[&CheckEntry] = &[
     &AUTH_VALID,
     &AUTH_INVALID,
     &AUTH_MISSING,
+    &VAULT_STORAGE_KEYCHAIN,
+    &VAULT_STORAGE_FALLBACK,
     // Project state
     &PACKAGE_JSON_PRESENT,
     &PACKAGE_JSON_MISSING,
