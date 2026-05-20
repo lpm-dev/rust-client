@@ -1022,11 +1022,23 @@ pub async fn push_org(
 // ── Device Pairing (Dashboard) ───────────────────────────────────
 
 /// Response from GET /api/vault/pair/:code (pending session).
+///
+/// The CLI derives the browser-key fingerprint and the short authentication
+/// string locally from `browser_public_key` and the user-typed pairing code —
+/// trusting the server for those derived values would let a malicious server
+/// silently approve any pair, defeating the visual confirmation. Only the
+/// genuinely server-side facts (`device_label`, `created_at`,
+/// `created_from_ip`) are wire-supplied, and all three are optional so a
+/// newer CLI built against an older server still parses the response and
+/// simply omits the missing fields from the confirmation prompt.
 #[derive(serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PairingSession {
     pub status: String,
     pub browser_public_key: Option<String>,
+    pub device_label: Option<String>,
+    pub created_at: Option<String>,
+    pub created_from_ip: Option<String>,
 }
 
 /// Fetch a pending pairing session to get the browser's P-256 public key.
