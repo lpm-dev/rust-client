@@ -83,6 +83,30 @@ pub fn rotate(opts: RotateOptions) -> Result<RotateResult, LpmError> {
         )));
     }
 
+    // Before staging anything, verify there is no prior rotation state still
+    // pointing at `rootCA.pem.previous`. Promotion unconditionally overwrites
+    // those bytes; doing so while a reconcile_required or grace entry depends
+    // on them would destroy the only artifact the trust store needs to remove
+    // the older root. Surface the conflict and tell the user how to resolve.
+    let prev_cert = ca_dir.join("rootCA.pem.previous");
+    if prev_cert.exists() {
+        let unresolved = crate::reconcile::scan_unresolved_reconcile_required()?;
+        if !unresolved.is_empty() {
+            return Err(LpmError::Cert(format!(
+                "refusing to rotate: {} unresolved `ca.reconcile_required` marker(s) still depend on rootCA.pem.previous ({}). Run `lpm cert reconcile` first.",
+                unresolved.len(),
+                unresolved.iter().cloned().collect::<Vec<_>>().join(", ")
+            )));
+        }
+        let grace = read_grace_entries()?;
+        if !grace.is_empty() {
+            return Err(LpmError::Cert(format!(
+                "refusing to rotate: {} pending grace-window entry(s) still depend on rootCA.pem.previous. Run `lpm cert reconcile` after the scheduled removal time(s), or wait for the window to close.",
+                grace.len()
+            )));
+        }
+    }
+
     let mode_label = if opts.keep_old_trusted_days.is_some() {
         "grace_window"
     } else {
@@ -393,22 +417,29 @@ fn collect_project_dirs(extras: &[PathBuf]) -> Result<Vec<PathBuf>, LpmError> {
 
 /// Return the SAN entries from `leaf_path` that should be passed as
 /// `extra_hostnames` when reissuing — i.e. every DNS name + IP except the
-/// three defaults `generate_project_cert` always adds. Uses the typed
+/// three exact defaults `generate_project_cert` always adds. Uses the typed
 /// accessor in `cert::read_san_entries` so we don't depend on display formatting.
+///
+/// Loopback aliases like `127.0.0.2` or `127.1.2.3` are NOT defaults — they
+/// must round-trip through rotation. Only the literal `127.0.0.1` / `::1` /
+/// `localhost` are filtered.
 fn preserved_extra_hostnames(leaf_path: &Path) -> Result<Vec<String>, LpmError> {
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+    const DEFAULT_IPV4: Ipv4Addr = Ipv4Addr::new(127, 0, 0, 1);
+    const DEFAULT_IPV6: Ipv6Addr = Ipv6Addr::LOCALHOST;
+
     let entries = cert::read_san_entries(leaf_path)?;
     let mut sans: Vec<String> = Vec::new();
     for e in entries {
-        let s = e.as_extra_hostname();
-        match &e {
-            cert::SanEntry::Dns(d) if d == "localhost" => continue,
-            cert::SanEntry::Ip(ip) => {
-                if ip.is_loopback() {
-                    continue;
-                }
-            }
-            _ => {}
+        let skip = match &e {
+            cert::SanEntry::Dns(d) => d == "localhost",
+            cert::SanEntry::Ip(IpAddr::V4(ip)) => *ip == DEFAULT_IPV4,
+            cert::SanEntry::Ip(IpAddr::V6(ip)) => *ip == DEFAULT_IPV6,
+        };
+        if skip {
+            continue;
         }
+        let s = e.as_extra_hostname();
         if s.is_empty() {
             continue;
         }

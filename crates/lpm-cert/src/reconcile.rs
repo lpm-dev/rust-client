@@ -232,7 +232,7 @@ pub fn reconcile(opts: ReconcileOptions) -> Result<ReconcileResult, LpmError> {
 /// Walk the audit log and collect every `old_fingerprint` from
 /// `ca.reconcile_required` that has not been resolved by a subsequent
 /// `ca.reconcile.resolved` or a successful `ca.trust_uninstall`.
-fn scan_unresolved_reconcile_required() -> Result<BTreeSet<String>, LpmError> {
+pub fn scan_unresolved_reconcile_required() -> Result<BTreeSet<String>, LpmError> {
     let log = audit::audit_log_path()?;
     if !log.exists() {
         return Ok(BTreeSet::new());

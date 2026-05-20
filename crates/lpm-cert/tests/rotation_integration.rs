@@ -430,3 +430,103 @@ fn reconcile_preserves_previous_files_when_marker_unresolved_and_backup_missing(
     assert!(!prev_cert_path.exists());
     assert!(!prev_key_path.exists());
 }
+
+#[test]
+fn rotate_refuses_to_overwrite_previous_while_reconcile_required_unresolved() {
+    let (tmp, _g) = setup_home();
+    let (active_cert, _) = seed_root_ca();
+    seed_project_leaf(&tmp.path().join("proj"));
+
+    let old_fp_hex = cert::fingerprint_hex(&cert::fingerprint_sha256(&active_cert).unwrap());
+
+    // Simulate the post-promote, uninstall-failed state from a previous rotation:
+    // .previous on disk + an unresolved ca.reconcile_required marker.
+    let ca_dir = paths::ca_dir().unwrap();
+    let prev_cert_path = ca_dir.join("rootCA.pem.previous");
+    let prev_key_path = ca_dir.join("rootCA-key.pem.previous");
+    std::fs::copy(&active_cert, &prev_cert_path).unwrap();
+    std::fs::copy(paths::ca_key_path().unwrap(), &prev_key_path).unwrap();
+    audit::append(audit::AuditAction::CaReconcileRequired {
+        old_fingerprint: old_fp_hex.clone(),
+        new_fingerprint: "FUTURE".into(),
+    })
+    .unwrap();
+
+    let prev_cert_before = std::fs::read(&prev_cert_path).unwrap();
+
+    let err = rotate::rotate(rotate::RotateOptions::default()).unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        msg.contains("reconcile_required"),
+        "refusal must name the conflict, got {msg}"
+    );
+    assert!(
+        msg.contains("lpm cert reconcile"),
+        "refusal must point at `lpm cert reconcile`, got {msg}"
+    );
+
+    let prev_cert_after = std::fs::read(&prev_cert_path).unwrap();
+    assert_eq!(
+        prev_cert_before, prev_cert_after,
+        "rotate must not have overwritten rootCA.pem.previous"
+    );
+}
+
+#[test]
+fn rotate_refuses_to_overwrite_previous_while_grace_window_open() {
+    let (tmp, _g) = setup_home();
+    let (_active_cert, _) = seed_root_ca();
+    seed_project_leaf(&tmp.path().join("proj"));
+
+    // First rotation in grace-window mode. After this the active CA is new,
+    // .previous holds the old root, and a grace entry is on disk.
+    rotate::rotate(rotate::RotateOptions {
+        keep_old_trusted_days: Some(14),
+        ..Default::default()
+    })
+    .unwrap();
+    assert!(
+        paths::ca_dir()
+            .unwrap()
+            .join("rootCA.pem.previous")
+            .exists()
+    );
+
+    let err = rotate::rotate(rotate::RotateOptions::default()).unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        msg.contains("grace-window") || msg.contains("grace"),
+        "refusal must name grace conflict, got {msg}"
+    );
+}
+
+#[test]
+fn rotate_preserves_custom_loopback_alias_ip_san() {
+    use std::net::{IpAddr, Ipv4Addr};
+
+    let (tmp, _g) = setup_home();
+    let (_active_cert, _) = seed_root_ca();
+    let project = tmp.path().join("proj-loopback-alias");
+    let extras = vec!["127.0.0.2".to_string()];
+    let leaf = seed_project_leaf_with_extras(&project, &extras);
+
+    let before = cert::read_san_entries(&leaf).unwrap();
+    assert!(
+        before.iter().any(|s| matches!(
+            s,
+            cert::SanEntry::Ip(IpAddr::V4(ip)) if *ip == Ipv4Addr::new(127, 0, 0, 2)
+        )),
+        "fixture must seed 127.0.0.2 as an IP SAN"
+    );
+
+    rotate::rotate(rotate::RotateOptions::default()).unwrap();
+
+    let after = cert::read_san_entries(&leaf).unwrap();
+    assert!(
+        after.iter().any(|s| matches!(
+            s,
+            cert::SanEntry::Ip(IpAddr::V4(ip)) if *ip == Ipv4Addr::new(127, 0, 0, 2)
+        )),
+        "rotation must preserve 127.0.0.2 — only the literal 127.0.0.1 / ::1 / localhost are defaults; loopback aliases must round-trip, got {after:?}"
+    );
+}

@@ -12,7 +12,7 @@
 use lpm_common::LpmError;
 
 /// Bare-name TLD suffixes that are "obviously local" and never need
-/// `--allow-public-dns`. Match is case-insensitive on a trailing `.<tld>`.
+/// `cert.allowPublicDns`. Match is case-insensitive on a trailing `.<tld>`.
 const LOCAL_TLD_ALLOWLIST: &[&str] = &["local", "test", "localhost", "internal", "home.arpa"];
 
 /// Suffixes already covered by the built-in permitted_subtrees in `ca::permitted_subtrees`.
@@ -42,8 +42,8 @@ pub struct AcceptedDnsEntry {
 /// order. On the first invalid entry, returns `LpmError::Cert` with a message that names
 /// the offending entry and a hint at how to fix it.
 ///
-/// `allow_public_dns` corresponds to the `--allow-public-dns` flag on
-/// `lpm cert generate`. When `false` (the default), any entry whose TLD is not in
+/// `allow_public_dns` is wired from the `cert.allowPublicDns` field in
+/// `lpm.json`. When `false` (the default), any entry whose TLD is not in
 /// `LOCAL_TLD_ALLOWLIST` is rejected.
 pub fn validate_extra_permitted_dns(
     entries: &[String],
@@ -108,8 +108,8 @@ pub fn validate_extra_permitted_dns(
 
         if !allow_public_dns && !has_local_tld(&normalized) {
             return Err(LpmError::Cert(format!(
-                "cert.extra_permitted_dns entry {entry:?} ends in a non-local TLD; \
-                 pass --allow-public-dns to `lpm cert generate` to permit broadening \
+                "cert.extraPermittedDns entry {entry:?} ends in a non-local TLD; \
+                 set `cert.allowPublicDns: true` in lpm.json to permit broadening \
                  the CA to public hostnames"
             )));
         }
@@ -187,7 +187,10 @@ mod tests {
         let err = validate_extra_permitted_dns(&["evil.example".into()], false).unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("non-local TLD"), "got {msg}");
-        assert!(msg.contains("--allow-public-dns"), "got {msg}");
+        assert!(
+            msg.contains("cert.allowPublicDns"),
+            "hint must point at the actual lpm.json field, got {msg}"
+        );
     }
 
     #[test]
