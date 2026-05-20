@@ -11,9 +11,15 @@ use std::path::{Path, PathBuf};
 
 /// Convert an LPM package name to an SE-0292 registry identifier.
 ///
-/// `@lpm.dev/owner.pkg-name` → `lpmdev.owner-pkg-name`
+/// `@lpm.dev/owner.pkg-name` → `lpmdev.owner_pkg-name`
+///
+/// The `_` between owner and name is the structurally unambiguous separator:
+/// the LPM grammar forbids `_` in both owner and package name (enforced on
+/// the server via CHECK constraints `users_username_no_underscore`,
+/// `orgs_slug_no_underscore`, `packages_name_no_underscore`). SE-0292 permits
+/// `_` in the name component, so the wire format is spec-legal.
 pub fn lpm_to_se0292_id(name: &PackageName) -> String {
-    format!("lpmdev.{}-{}", name.owner, name.name)
+    format!("lpmdev.{}_{}", name.owner, name.name)
 }
 
 /// Walk up from `dir` to find a Package.swift file.
@@ -88,8 +94,8 @@ fn validate_manifest_value(value: &str, label: &str) -> Result<(), LpmError> {
 /// Add an SE-0292 registry dependency to Package.swift.
 ///
 /// Inserts:
-/// 1. `.package(id: "lpmdev.owner-pkg", from: "1.0.0")` into top-level dependencies
-/// 2. `.product(name: "ProductName", package: "lpmdev.owner-pkg")` into target dependencies
+/// 1. `.package(id: "lpmdev.owner_pkg", from: "1.0.0")` into top-level dependencies
+/// 2. `.product(name: "ProductName", package: "lpmdev.owner_pkg")` into target dependencies
 ///
 /// Idempotent — skips if the dependency already exists.
 pub fn add_registry_dependency(
@@ -733,10 +739,32 @@ mod tests {
     #[test]
     fn test_lpm_to_se0292_id() {
         let name = PackageName::parse("@lpm.dev/acme.swift-logger").unwrap();
-        assert_eq!(lpm_to_se0292_id(&name), "lpmdev.acme-swift-logger");
+        assert_eq!(lpm_to_se0292_id(&name), "lpmdev.acme_swift-logger");
 
         let name2 = PackageName::parse("@lpm.dev/neo.haptic").unwrap();
-        assert_eq!(lpm_to_se0292_id(&name2), "lpmdev.neo-haptic");
+        assert_eq!(lpm_to_se0292_id(&name2), "lpmdev.neo_haptic");
+    }
+
+    /// C1 regression: `(owner=foo-bar, name=baz)` and `(owner=foo, name=bar-baz)`
+    /// used to flatten to the same SE-0292 identifier under the old hyphen
+    /// separator, allowing cross-tenant impersonation. With the underscore
+    /// separator the two pairs MUST produce distinct identifiers — the
+    /// LPM grammar forbids `_` in owner and name (enforced server-side via
+    /// CHECK constraints), so the boundary between owner and name in
+    /// `lpmdev.<owner>_<name>` is structurally unambiguous.
+    #[test]
+    fn lpm_to_se0292_id_disambiguates_hyphenated_pairs() {
+        let a = PackageName {
+            owner: "foo-bar".into(),
+            name: "baz".into(),
+        };
+        let b = PackageName {
+            owner: "foo".into(),
+            name: "bar-baz".into(),
+        };
+        assert_eq!(lpm_to_se0292_id(&a), "lpmdev.foo-bar_baz");
+        assert_eq!(lpm_to_se0292_id(&b), "lpmdev.foo_bar-baz");
+        assert_ne!(lpm_to_se0292_id(&a), lpm_to_se0292_id(&b));
     }
 
     #[test]
@@ -760,7 +788,7 @@ let package = Package(
 
         let _result = add_registry_dependency(
             Path::new("/tmp/test-manifest.swift"),
-            "lpmdev.acme-swift-logger",
+            "lpmdev.acme_swift-logger",
             "1.0.0",
             "Logger",
             "MyApp",
@@ -769,18 +797,18 @@ let package = Package(
         // Can't test file I/O in unit test, so test the internal functions
         let content = insert_into_dependencies_array(
             input,
-            ".package(id: \"lpmdev.acme-swift-logger\", from: \"1.0.0\")",
+            ".package(id: \"lpmdev.acme_swift-logger\", from: \"1.0.0\")",
             Some("targets:"),
         )
         .unwrap();
 
-        assert!(content.contains("lpmdev.acme-swift-logger"));
+        assert!(content.contains("lpmdev.acme_swift-logger"));
         assert!(content.contains(".package(url:")); // existing dep preserved
 
         let content = insert_into_target_deps(
             &content,
             "MyApp",
-            ".product(name: \"Logger\", package: \"lpmdev.acme-swift-logger\")",
+            ".product(name: \"Logger\", package: \"lpmdev.acme_swift-logger\")",
         )
         .unwrap();
 
@@ -804,17 +832,17 @@ let package = Package(
 
         let content = insert_into_dependencies_array(
             input,
-            ".package(id: \"lpmdev.acme-logger\", from: \"1.0.0\")",
+            ".package(id: \"lpmdev.acme_logger\", from: \"1.0.0\")",
             Some("targets:"),
         )
         .unwrap();
 
-        assert!(content.contains("lpmdev.acme-logger"));
+        assert!(content.contains("lpmdev.acme_logger"));
 
         let content = insert_into_target_deps(
             &content,
             "MyApp",
-            ".product(name: \"Logger\", package: \"lpmdev.acme-logger\")",
+            ".product(name: \"Logger\", package: \"lpmdev.acme_logger\")",
         )
         .unwrap();
 
@@ -849,7 +877,7 @@ let package = Package(
         // Should insert a new top-level dependencies array before `targets:`.
         let result = insert_into_dependencies_array(
             input,
-            ".package(id: \"lpmdev.acme-logger\", from: \"1.0.0\")",
+            ".package(id: \"lpmdev.acme_logger\", from: \"1.0.0\")",
             Some("targets:"),
         );
         assert!(
@@ -863,7 +891,7 @@ let package = Package(
             "Should contain a new dependencies array"
         );
         assert!(
-            content.contains("lpmdev.acme-logger"),
+            content.contains("lpmdev.acme_logger"),
             "Should contain the new dependency"
         );
         // The new dependencies array should appear before targets:
@@ -895,7 +923,7 @@ let package = Package(
         std::fs::write(&tmp, input).unwrap();
 
         let result =
-            add_registry_dependency(&tmp, "lpmdev.acme-logger", "1.0.0", "Logger", "MyApp");
+            add_registry_dependency(&tmp, "lpmdev.acme_logger", "1.0.0", "Logger", "MyApp");
 
         let content = std::fs::read_to_string(&tmp).unwrap_or_default();
         std::fs::remove_file(&tmp).ok();
@@ -906,7 +934,7 @@ let package = Package(
             result.err()
         );
         assert!(
-            content.contains("lpmdev.acme-logger"),
+            content.contains("lpmdev.acme_logger"),
             "Package.swift should contain the new dependency"
         );
     }
@@ -971,7 +999,7 @@ import PackageDescription
 let package = Package(
     name: "MyApp",
     dependencies: [
-        .package(id: "lpmdev.acme-logger", from: "1.0.0"),
+        .package(id: "lpmdev.acme_logger", from: "1.0.0"),
     ],
     targets: [
         .target(
@@ -990,7 +1018,7 @@ let package = Package(
         let result = insert_into_target_deps(
             input,
             "FirstTarget",
-            ".product(name: \"Logger\", package: \"lpmdev.acme-logger\")",
+            ".product(name: \"Logger\", package: \"lpmdev.acme_logger\")",
         );
 
         match &result {
@@ -1041,7 +1069,7 @@ let package = Package(
 
         let result = add_registry_dependency(
             &tmp,
-            "lpmdev.acme-logger",
+            "lpmdev.acme_logger",
             "1.0.0",
             r#"Evil", package: "hack"#,
             "MyApp",
@@ -1073,7 +1101,7 @@ let package = Package(
 
         let result = add_registry_dependency(
             &tmp,
-            "lpmdev.acme-logger",
+            "lpmdev.acme_logger",
             "1.0.0\"), .package(url: \"evil",
             "Logger",
             "MyApp",
@@ -1091,7 +1119,7 @@ let package = Package(
 
         let content = insert_into_dependencies_array(
             input,
-            ".package(id: \"lpmdev.acme-logger\", from: \"1.0.0\")",
+            ".package(id: \"lpmdev.acme_logger\", from: \"1.0.0\")",
             Some("targets:"),
         )
         .unwrap();
@@ -1119,7 +1147,7 @@ let package = Package(
 
         let content = insert_into_dependencies_array(
             input,
-            ".package(id: \"lpmdev.acme-logger\", from: \"1.0.0\")",
+            ".package(id: \"lpmdev.acme_logger\", from: \"1.0.0\")",
             Some("targets:"),
         )
         .unwrap();
@@ -1164,7 +1192,7 @@ import PackageDescription
 let package = Package(
     name: "MyApp",
     dependencies: [
-        .package(id: "lpmdev.acme-logger", from: "1.0.0"),
+        .package(id: "lpmdev.acme_logger", from: "1.0.0"),
     ],
     targets: [
         .target(
@@ -1177,7 +1205,7 @@ let package = Package(
         let result = insert_into_target_deps(
             input,
             "OnlyTarget",
-            ".product(name: \"Logger\", package: \"lpmdev.acme-logger\")",
+            ".product(name: \"Logger\", package: \"lpmdev.acme_logger\")",
         );
         assert!(
             result.is_ok(),
@@ -1237,7 +1265,7 @@ let package = Package(
         std::fs::write(&tmp, input).unwrap();
 
         let result =
-            add_registry_dependency(&tmp, "lpmdev.swiftd-hue", "1.0.2", "Hue", "SwiftLPMTest");
+            add_registry_dependency(&tmp, "lpmdev.swiftd_hue", "1.0.2", "Hue", "SwiftLPMTest");
 
         let content = std::fs::read_to_string(&tmp).unwrap_or_default();
         std::fs::remove_file(&tmp).ok();
@@ -1252,7 +1280,7 @@ let package = Package(
             "Should have inserted a top-level dependencies array"
         );
         assert!(
-            content.contains("lpmdev.swiftd-hue"),
+            content.contains("lpmdev.swiftd_hue"),
             "Should contain the package dependency"
         );
         assert!(
@@ -1303,12 +1331,12 @@ let package = Package(
         let wrapper = ensure_wrapper_package(tmp.path()).unwrap();
 
         let edit =
-            add_wrapper_dependency(&wrapper.manifest_path, "lpmdev.swiftd-hue", "1.0.2", "Hue")
+            add_wrapper_dependency(&wrapper.manifest_path, "lpmdev.swiftd_hue", "1.0.2", "Hue")
                 .unwrap();
         assert!(!edit.already_exists);
 
         let content = std::fs::read_to_string(&wrapper.manifest_path).unwrap();
-        assert!(content.contains("lpmdev.swiftd-hue"));
+        assert!(content.contains("lpmdev.swiftd_hue"));
         assert!(content.contains("product(name: \"Hue\""));
 
         // Verify @_exported import was added to Exports.swift
@@ -1328,12 +1356,12 @@ let package = Package(
         let wrapper = ensure_wrapper_package(tmp.path()).unwrap();
 
         let first =
-            add_wrapper_dependency(&wrapper.manifest_path, "lpmdev.swiftd-hue", "1.0.2", "Hue")
+            add_wrapper_dependency(&wrapper.manifest_path, "lpmdev.swiftd_hue", "1.0.2", "Hue")
                 .unwrap();
         assert!(!first.already_exists);
 
         let second =
-            add_wrapper_dependency(&wrapper.manifest_path, "lpmdev.swiftd-hue", "1.0.2", "Hue")
+            add_wrapper_dependency(&wrapper.manifest_path, "lpmdev.swiftd_hue", "1.0.2", "Hue")
                 .unwrap();
         assert!(second.already_exists);
 
@@ -1351,19 +1379,19 @@ let package = Package(
         let tmp = tempfile::TempDir::new().unwrap();
         let wrapper = ensure_wrapper_package(tmp.path()).unwrap();
 
-        add_wrapper_dependency(&wrapper.manifest_path, "lpmdev.swiftd-hue", "1.0.2", "Hue")
+        add_wrapper_dependency(&wrapper.manifest_path, "lpmdev.swiftd_hue", "1.0.2", "Hue")
             .unwrap();
         add_wrapper_dependency(
             &wrapper.manifest_path,
-            "lpmdev.swiftd-haptic",
+            "lpmdev.swiftd_haptic",
             "1.0.0",
             "Haptic",
         )
         .unwrap();
 
         let content = std::fs::read_to_string(&wrapper.manifest_path).unwrap();
-        assert!(content.contains("lpmdev.swiftd-hue"));
-        assert!(content.contains("lpmdev.swiftd-haptic"));
+        assert!(content.contains("lpmdev.swiftd_hue"));
+        assert!(content.contains("lpmdev.swiftd_haptic"));
         assert!(content.contains("product(name: \"Hue\""));
         assert!(content.contains("product(name: \"Haptic\""));
 
