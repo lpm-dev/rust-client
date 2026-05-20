@@ -171,7 +171,10 @@ fn cert_generate_json_regenerates_when_requested_host_is_missing() {
 
     let initial = json_envelope(&initial_output, "lpm cert generate --json");
     assert_eq!(initial["success"], serde_json::json!(true));
-    assert_eq!(initial["ca_freshly_installed"], serde_json::json!(true));
+    // `lpm cert generate` declines trust-store install — the CA lands on disk
+    // but is not pushed into the trust store; the user runs `lpm cert trust`
+    // separately for that. `ca_freshly_installed` reflects trust-store state.
+    assert_eq!(initial["ca_freshly_installed"], serde_json::json!(false));
     assert_eq!(initial["cert_freshly_generated"], serde_json::json!(true));
 
     let refreshed_output = cert_command(&project)
@@ -201,8 +204,8 @@ fn cert_generate_json_regenerates_when_requested_host_is_missing() {
         "generate must write the project key"
     );
     assert!(
-        trust_store_entry(&project).exists(),
-        "generate must install the CA into the isolated test trust store"
+        !trust_store_entry(&project).exists(),
+        "generate must NOT install the CA into the trust store (use `lpm cert trust` for that)"
     );
 
     envelope["cert_path"] = serde_json::json!("[CERT_PATH]");
@@ -225,7 +228,11 @@ fn cert_generate_json_regenerates_when_requested_host_is_missing() {
         .expect("project hostnames must be an array");
 
     assert_eq!(status["ca"]["exists"], serde_json::json!(true));
-    assert_eq!(status["ca"]["trusted"], serde_json::json!(true));
+    assert_eq!(
+        status["ca"]["trusted"],
+        serde_json::json!(false),
+        "trust-store install requires an explicit `lpm cert trust`"
+    );
     assert_eq!(status["project"]["exists"], serde_json::json!(true));
     assert_eq!(status["project"]["needs_renewal"], serde_json::json!(false));
     assert!(

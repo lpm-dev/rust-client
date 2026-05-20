@@ -40,8 +40,21 @@ fn run_status(project_dir: &Path, json_output: bool) -> Result<(), LpmError> {
     } else {
         None
     };
+    let drifts = lpm_cert::audit_cert_permissions().unwrap_or_default();
 
     if json_output {
+        let drift_json: Vec<_> = drifts
+            .iter()
+            .map(|d| {
+                serde_json::json!({
+                    "path": d.path.to_string_lossy(),
+                    "role": d.role,
+                    "actual_mode": format!("{:o}", d.actual_mode),
+                    "expected_mode": format!("{:o}", d.expected_mode),
+                    "fix": d.chmod_hint(),
+                })
+            })
+            .collect();
         println!(
             "{}",
             serde_json::json!({
@@ -58,7 +71,8 @@ fn run_status(project_dir: &Path, json_output: bool) -> Result<(), LpmError> {
                     "expires": status.project_cert_expires,
                     "hostnames": status.project_cert_hostnames,
                     "needs_renewal": status.project_cert_needs_renewal,
-                }
+                },
+                "permission_drifts": drift_json,
             })
         );
         return Ok(());
@@ -102,6 +116,14 @@ fn run_status(project_dir: &Path, json_output: bool) -> Result<(), LpmError> {
             "  {}",
             "Run `lpm cert trust` to generate and install the CA".dimmed()
         );
+    }
+
+    if !drifts.is_empty() {
+        output::header("Permission Drift");
+        for d in &drifts {
+            output::field(d.role, &d.summary().red().to_string());
+            println!("  {}", format!("fix: {}", d.chmod_hint()).dimmed());
+        }
     }
 
     output::header("Project Certificate");
@@ -196,7 +218,11 @@ fn run_generate(
     extra_hosts: &[String],
     json_output: bool,
 ) -> Result<(), LpmError> {
-    let setup = lpm_cert::ensure_https(project_dir, extra_hosts)?;
+    let setup = lpm_cert::ensure_https_with_consent(
+        project_dir,
+        extra_hosts,
+        lpm_cert::TrustStoreConsent::Decline,
+    )?;
 
     if json_output {
         println!(

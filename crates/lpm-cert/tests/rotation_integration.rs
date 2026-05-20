@@ -259,6 +259,43 @@ fn ensure_https_reissues_leaf_when_chain_breaks() {
     assert!(cert::leaf_signed_by(&leaf_path, &active_cert).unwrap());
 }
 
+#[cfg(unix)]
+#[test]
+fn ensure_https_refuses_to_sign_with_world_readable_key() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let (tmp, _g) = setup_home();
+    let (_active_cert, active_key) = seed_root_ca();
+    let project = tmp.path().join("proj-leaky-key");
+    std::fs::create_dir_all(&project).unwrap();
+    seed_project_leaf(&project);
+
+    std::fs::set_permissions(&active_key, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+    let err = lpm_cert::ensure_https(&project, &[]);
+    assert!(err.is_err(), "expected ensure_https to refuse signing");
+    let msg = err.unwrap_err().to_string();
+    assert!(msg.contains("0o644"), "expected mode in message, got {msg}");
+    assert!(msg.contains("chmod 600"), "expected chmod hint, got {msg}");
+}
+
+#[cfg(unix)]
+#[test]
+fn audit_cert_permissions_reports_drift_on_loose_dir() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let (_tmp, _g) = setup_home();
+    let (_active_cert, _) = seed_root_ca();
+    let ca_dir = paths::ca_dir().unwrap();
+    std::fs::set_permissions(&ca_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let drifts = lpm_cert::audit_cert_permissions().unwrap();
+    assert!(
+        drifts.iter().any(|d| d.role == "cert dir"),
+        "expected cert-dir drift, got {drifts:?}"
+    );
+}
+
 #[test]
 fn ca_days_until_expiry_returns_positive_for_fresh_ca() {
     let (tmp, _g) = setup_home();

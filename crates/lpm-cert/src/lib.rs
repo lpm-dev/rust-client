@@ -87,6 +87,113 @@ pub fn ca_days_until_expiry(path: &Path) -> Option<i64> {
     Some(days.max(0))
 }
 
+/// Describes a permission-mode drift on a sensitive cert artifact.
+#[derive(Debug, Clone)]
+pub struct PermissionDrift {
+    /// Path of the drifted artifact (CA key, CA dir, etc.).
+    pub path: std::path::PathBuf,
+    /// Mode bits actually observed on disk (`& 0o777`).
+    pub actual_mode: u32,
+    /// What we require for this artifact.
+    pub expected_mode: u32,
+    /// Human-readable label of the artifact role.
+    pub role: &'static str,
+}
+
+impl PermissionDrift {
+    /// One-line summary of the drift suitable for warnings and `lpm cert status`.
+    pub fn summary(&self) -> String {
+        format!(
+            "{role} at {path} has mode 0o{actual:o}, expected 0o{expected:o}",
+            role = self.role,
+            path = self.path.display(),
+            actual = self.actual_mode,
+            expected = self.expected_mode,
+        )
+    }
+    /// chmod command line the user can copy-paste to fix the drift.
+    pub fn chmod_hint(&self) -> String {
+        format!(
+            "chmod {expected:o} {path}",
+            expected = self.expected_mode,
+            path = self.path.display(),
+        )
+    }
+}
+
+/// Audit the on-disk CA key, the CA dir, and the audit log dir for permission
+/// drift on Unix. Returns one entry per drifted artifact; empty `Vec` if clean.
+/// On non-Unix, always returns `Ok(vec![])` (modes don't apply).
+pub fn audit_cert_permissions() -> Result<Vec<PermissionDrift>, LpmError> {
+    let mut out: Vec<PermissionDrift> = Vec::new();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        fn drift_if<P: AsRef<std::path::Path>>(
+            path: P,
+            expected: u32,
+            role: &'static str,
+            out: &mut Vec<PermissionDrift>,
+        ) -> Result<(), LpmError> {
+            let p = path.as_ref();
+            if !p.exists() {
+                return Ok(());
+            }
+            let mode = std::fs::metadata(p)
+                .map_err(|e| LpmError::Cert(format!("stat {} failed: {e}", p.display())))?
+                .permissions()
+                .mode()
+                & 0o777;
+            if mode != expected {
+                out.push(PermissionDrift {
+                    path: p.to_path_buf(),
+                    actual_mode: mode,
+                    expected_mode: expected,
+                    role,
+                });
+            }
+            Ok(())
+        }
+
+        drift_if(paths::ca_dir()?, 0o700, "cert dir", &mut out)?;
+        drift_if(paths::ca_key_path()?, 0o600, "CA private key", &mut out)?;
+        let audit_dir = audit::audit_log_path()?.parent().map(|p| p.to_path_buf());
+        if let Some(dir) = audit_dir {
+            drift_if(dir, 0o700, "audit dir", &mut out)?;
+        }
+        drift_if(audit::audit_log_path()?, 0o600, "audit log", &mut out)?;
+    }
+    Ok(out)
+}
+
+/// Returns the first key-file drift if `ca_key_path()` is group- or world-readable.
+/// Used by `ensure_https` to refuse signing with a leaky key.
+pub fn ca_key_drift() -> Result<Option<PermissionDrift>, LpmError> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let key = paths::ca_key_path()?;
+        if !key.exists() {
+            return Ok(None);
+        }
+        let mode = std::fs::metadata(&key)
+            .map_err(|e| LpmError::Cert(format!("stat {} failed: {e}", key.display())))?
+            .permissions()
+            .mode()
+            & 0o777;
+        if mode & 0o077 != 0 {
+            return Ok(Some(PermissionDrift {
+                path: key,
+                actual_mode: mode,
+                expected_mode: 0o600,
+                role: "CA private key",
+            }));
+        }
+    }
+    Ok(None)
+}
+
 /// Log a yellow `warn` at <60d and a red `error` at <30d remaining. Never
 /// auto-rotates — the user is the consent boundary for trust-store mutations.
 pub fn warn_if_ca_expiring_soon(path: &Path) {
@@ -121,6 +228,72 @@ pub fn create_dir_secure(path: &Path) -> std::io::Result<()> {
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))?;
     }
     Ok(())
+}
+
+/// Caller-supplied callback that renders the consent UI and returns the user's
+/// decision. Lives in `lpm-cli` so the CA crate doesn't depend on cliclack.
+pub type ConsentCallback<'a> = Box<dyn FnOnce(&ConsentRequest) -> Result<bool, LpmError> + 'a>;
+
+/// Whether `ensure_https_with_consent` may install the CA into the OS trust store.
+pub enum TrustStoreConsent<'a> {
+    /// Install without prompting. Caller has already gathered consent
+    /// (e.g. `lpm cert trust`, or `lpm dev --https --yes`).
+    PreApproved,
+    /// Never install. Generate the CA files on disk if missing, but stop short
+    /// of pushing into the trust store. Used by `lpm cert generate`.
+    Decline,
+    /// Prompt the user via the supplied callback. The callback returns `Ok(true)`
+    /// to install or `Ok(false)` to decline.
+    Prompt(ConsentCallback<'a>),
+}
+
+impl<'a> std::fmt::Debug for TrustStoreConsent<'a> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            TrustStoreConsent::PreApproved => write!(f, "PreApproved"),
+            TrustStoreConsent::Decline => write!(f, "Decline"),
+            TrustStoreConsent::Prompt(_) => write!(f, "Prompt(<callback>)"),
+        }
+    }
+}
+
+fn resolve_consent(consent: TrustStoreConsent<'_>, ca_path: &Path) -> Result<bool, LpmError> {
+    match consent {
+        TrustStoreConsent::PreApproved => Ok(true),
+        TrustStoreConsent::Decline => Ok(false),
+        TrustStoreConsent::Prompt(callback) => {
+            let info = cert::read_cert_info(ca_path)?;
+            let mut permitted = vec![
+                "localhost".to_string(),
+                "*.local".to_string(),
+                "*.test".to_string(),
+                "127.0.0.0/8".to_string(),
+                "RFC1918 private IPs".to_string(),
+                "::1".to_string(),
+            ];
+            if !ca::wants_name_constraints() {
+                permitted = vec![
+                    "any (no name constraints — set LPM_CERT_NAME_CONSTRAINTS=1 to scope)".into(),
+                ];
+            }
+            let req = ConsentRequest {
+                fingerprint: cert::fingerprint_hex(&cert::fingerprint_sha256(ca_path)?),
+                expires: info.not_after,
+                permitted_names: permitted,
+                name_constraints_enabled: ca::wants_name_constraints(),
+            };
+            callback(&req)
+        }
+    }
+}
+
+/// Information shown to the user when asking for trust-store consent.
+#[derive(Debug, Clone)]
+pub struct ConsentRequest {
+    pub fingerprint: String,
+    pub expires: String,
+    pub permitted_names: Vec<String>,
+    pub name_constraints_enabled: bool,
 }
 
 /// Result of setting up HTTPS for a project.
@@ -165,6 +338,15 @@ pub fn ensure_https(
     project_dir: &Path,
     extra_hostnames: &[String],
 ) -> Result<HttpsSetup, LpmError> {
+    ensure_https_with_consent(project_dir, extra_hostnames, TrustStoreConsent::PreApproved)
+}
+
+/// Full-control variant of `ensure_https` exposing the trust-store consent decision.
+pub fn ensure_https_with_consent(
+    project_dir: &Path,
+    extra_hostnames: &[String],
+    consent: TrustStoreConsent<'_>,
+) -> Result<HttpsSetup, LpmError> {
     let ca_dir = paths::ca_dir()?;
     let project_cert_dir = paths::project_cert_dir(project_dir)?;
 
@@ -194,30 +376,45 @@ pub fn ensure_https(
             name_constraints: ca::wants_name_constraints(),
         });
 
-        tracing::info!("installing CA into system trust store...");
-        match trust::install_ca(&cert_path) {
-            Ok(()) => {
-                audit::append_best_effort(audit::AuditAction::CaTrustInstall {
-                    fingerprint: fp_hex,
-                    store: trust_store_label(),
-                    status: audit::AuditStatus::Ok,
-                    error: None,
-                });
+        let approved = resolve_consent(consent, &cert_path)?;
+        if approved {
+            tracing::info!("installing CA into system trust store...");
+            match trust::install_ca(&cert_path) {
+                Ok(()) => {
+                    audit::append_best_effort(audit::AuditAction::CaTrustInstall {
+                        fingerprint: fp_hex,
+                        store: trust_store_label(),
+                        status: audit::AuditStatus::Ok,
+                        error: None,
+                    });
+                }
+                Err(e) => {
+                    audit::append_best_effort(audit::AuditAction::CaTrustInstall {
+                        fingerprint: fp_hex,
+                        store: trust_store_label(),
+                        status: audit::AuditStatus::Error,
+                        error: Some(e.to_string()),
+                    });
+                    return Err(LpmError::Cert(format!("failed to install CA: {e}")));
+                }
             }
-            Err(e) => {
-                audit::append_best_effort(audit::AuditAction::CaTrustInstall {
-                    fingerprint: fp_hex,
-                    store: trust_store_label(),
-                    status: audit::AuditStatus::Error,
-                    error: Some(e.to_string()),
-                });
-                return Err(LpmError::Cert(format!("failed to install CA: {e}")));
-            }
+        } else {
+            tracing::warn!(
+                "trust-store install declined; CA files are on disk at {} but browsers will not trust them until you run `lpm cert trust`",
+                cert_path.display()
+            );
         }
 
-        true
+        approved
     } else {
         let cert_path = paths::ca_cert_path()?;
+        if let Some(drift) = ca_key_drift()? {
+            return Err(LpmError::Cert(format!(
+                "{}. Refusing to sign with a group-/world-readable private key. Fix with: {}",
+                drift.summary(),
+                drift.chmod_hint()
+            )));
+        }
         if ca::wants_name_constraints() && !ca::cert_has_name_constraints(&cert_path)? {
             tracing::warn!(
                 target: "lpm_cert",
@@ -227,9 +424,17 @@ pub fn ensure_https(
         }
         warn_if_ca_expiring_soon(&cert_path);
         if !trust::is_ca_installed(&cert_path)? {
-            tracing::info!("CA exists but not trusted, installing...");
-            trust::install_ca(&cert_path)
-                .map_err(|e| LpmError::Cert(format!("failed to install CA: {e}")))?;
+            let approved = resolve_consent(consent, &cert_path)?;
+            if approved {
+                tracing::info!("CA exists but not trusted, installing...");
+                trust::install_ca(&cert_path)
+                    .map_err(|e| LpmError::Cert(format!("failed to install CA: {e}")))?;
+            } else {
+                tracing::warn!(
+                    "trust-store install declined; browsers will not trust certificates signed by {}",
+                    cert_path.display()
+                );
+            }
         }
         false
     };

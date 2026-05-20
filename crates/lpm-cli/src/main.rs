@@ -1804,6 +1804,17 @@ enum Commands {
         #[arg(long)]
         inspect_port: Option<u16>,
 
+        /// Pre-approve the trust-store install for `--https` (skips the prompt).
+        /// Required in non-TTY contexts to avoid hanging on stdin.
+        #[arg(long, short = 'y')]
+        yes: bool,
+
+        /// Serve the root CA over plain HTTP on `port+1` so mobile devices on the
+        /// LAN can bootstrap trust. Off by default — anyone on the LAN can grab
+        /// the CA, so the flag is explicit.
+        #[arg(long)]
+        allow_ca_bootstrap: bool,
+
         /// Extra arguments passed to the dev script.
         #[arg(trailing_var_arg = true)]
         args: Vec<String>,
@@ -4159,6 +4170,8 @@ async fn async_main() -> Result<()> {
             no_dashboard,
             no_inspect,
             inspect_port,
+            yes,
+            allow_ca_bootstrap,
             args,
         } => {
             lpm_runner::script::set_skip_env_validation(no_env_check);
@@ -4236,6 +4249,8 @@ async fn async_main() -> Result<()> {
                 tunnel_auth,
                 no_inspect,
                 inspect_port,
+                yes,
+                allow_ca_bootstrap,
             )
             .await
         }
