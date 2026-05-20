@@ -243,13 +243,13 @@ pub async fn run(registry_url: &str, json_output: bool, force: bool) -> Result<(
         println!("  Use in Package.swift:");
         println!(
             "    {}",
-            ".package(id: \"lpmdev.<owner>-<package>\", from: \"1.0.0\")".dimmed()
+            ".package(id: \"lpmdev.<owner>_<package>\", from: \"1.0.0\")".dimmed()
         );
         println!();
         println!(
             "  Identity mapping: {} → {}",
             "@lpm.dev/owner.pkg".dimmed(),
-            "lpmdev.owner-pkg".bold()
+            "lpmdev.owner_pkg".bold()
         );
         println!();
     }
