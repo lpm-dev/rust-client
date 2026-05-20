@@ -297,6 +297,25 @@ pub async fn run(
         }
     }
 
+    // 2.5. Vault storage backend — surface the platform-determined
+    // unlock model so Linux/Windows users see that the on-disk
+    // fallback key file is readable by any same-UID process. Pure
+    // observability check; never blocks anything.
+    #[cfg(target_os = "macos")]
+    {
+        checks.push(Check::pass(
+            &doctor_catalog::VAULT_STORAGE_KEYCHAIN,
+            "macOS Keychain (keyring crate)",
+        ));
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        checks.push(Check::warn(
+            &doctor_catalog::VAULT_STORAGE_FALLBACK,
+            "encrypted-file fallback (~/.lpm/.vault-fallback-key, 0600)",
+        ));
+    }
+
     // 3. Global store accessible?
     let store_result = PackageStore::default_location();
     let store_ok = store_result.is_ok();

@@ -14,6 +14,36 @@ REPO="lpm-dev/rust-client"
 INSTALL_DIR="$HOME/.lpm/bin"
 BINARY_NAME="lpm"
 
+# Minimum version this installer is willing to deliver. Bumped manually
+# alongside each release that fixes a security-relevant gap. The floor
+# is a downgrade-resistance gate: an attacker who controls the GitHub
+# API response (or a downstream mirror) cannot point a fresh installer
+# at an old, known-vulnerable release — even one with a valid SHA-256
+# manifest and Sigstore signature (the old release IS authentically
+# signed; the floor refuses to install it anyway).
+#
+# Override only as documented recovery; sets the same signal as
+# LPM_INSTALL_INSECURE but scoped to the floor check.
+MIN_VERSION="v0.43.0"
+
+# Strict POSIX vX.Y.Z[-prerelease] comparator. Pre-release suffixes are
+# trimmed before comparison: `v0.43.0-rc1 < v0.43.0` per the relaxed
+# pre-release-equals-stable convention we ship in this installer.
+# Returns 0 (true) if $1 < $2, non-zero otherwise.
+version_lt() {
+  v1_=${1#v}; v1_=${v1_%%-*}
+  v2_=${2#v}; v2_=${v2_%%-*}
+  a1_=$(echo "$v1_" | cut -d. -f1); b1_=$(echo "$v1_" | cut -d. -f2); c1_=$(echo "$v1_" | cut -d. -f3)
+  a2_=$(echo "$v2_" | cut -d. -f1); b2_=$(echo "$v2_" | cut -d. -f2); c2_=$(echo "$v2_" | cut -d. -f3)
+  a1_=${a1_:-0}; b1_=${b1_:-0}; c1_=${c1_:-0}
+  a2_=${a2_:-0}; b2_=${b2_:-0}; c2_=${c2_:-0}
+  if [ "$a1_" -lt "$a2_" ]; then return 0; fi
+  if [ "$a1_" -gt "$a2_" ]; then return 1; fi
+  if [ "$b1_" -lt "$b2_" ]; then return 0; fi
+  if [ "$b1_" -gt "$b2_" ]; then return 1; fi
+  [ "$c1_" -lt "$c2_" ]
+}
+
 # Detect platform
 OS="$(uname -s)"
 ARCH="$(uname -m)"
@@ -92,6 +122,44 @@ VERSION=$(curl -fsSL "$API_URL" | grep '"tag_name"' | sed -E 's/.*"tag_name": *"
 if [ -z "$VERSION" ]; then
   echo "Failed to detect latest version. Check https://github.com/$REPO/releases"
   exit 1
+fi
+
+# Shape-validate the resolved version string before treating it as
+# semver — defends against a crafted GitHub API response that returns
+# a tag_name like `"foo"` (which would pass the empty check but fail
+# the downstream version_lt call in confusing ways).
+case "$VERSION" in
+  v[0-9]*.[0-9]*.[0-9]*) ;;
+  *)
+    echo "ERROR: detected version '$VERSION' does not match expected vX.Y.Z[-prerelease] format"
+    echo "       This is a strong tampering signal — the GitHub release API or a"
+    echo "       downstream mirror returned an unexpected tag_name. Refusing to install."
+    exit 1
+    ;;
+esac
+
+# Downgrade gate. An attacker who controls the API response can point
+# the installer at an old release that still carries valid SHA-256
+# and Sigstore signatures (it IS an authentic release) but predates
+# a fix the user is implicitly relying on. The floor refuses anything
+# below MIN_VERSION unless the user opts out by name.
+if version_lt "$VERSION" "$MIN_VERSION"; then
+  if [ "${LPM_INSTALL_MIN_VERSION_OVERRIDE:-0}" = "1" ]; then
+    echo "WARN: $VERSION is below the configured minimum $MIN_VERSION."
+    echo "      LPM_INSTALL_MIN_VERSION_OVERRIDE=1 set — proceeding anyway."
+  else
+    echo "ERROR: detected version $VERSION is below the minimum supported $MIN_VERSION."
+    echo ""
+    echo "This installer refuses to deliver releases older than $MIN_VERSION because"
+    echo "they predate at least one security fix that would otherwise be silently"
+    echo "downgraded. If you are recovering from a release-pipeline incident and need"
+    echo "an older release on purpose, set LPM_INSTALL_MIN_VERSION_OVERRIDE=1 to bypass"
+    echo "(NOT recommended; downloads will still be SHA-256 + Sigstore verified)."
+    echo ""
+    echo "If you did NOT expect to land on an old release, treat this as an attack"
+    echo "signal and check https://github.com/$REPO/releases directly."
+    exit 1
+  fi
 fi
 
 echo "Installing LPM CLI $VERSION for $OS/$ARCH..."
