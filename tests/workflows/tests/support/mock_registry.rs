@@ -280,6 +280,66 @@ impl MockRegistry {
         self
     }
 
+    /// Like [`with_pairing_session`] but with an explicit expected call
+    /// count — `expected_calls: 0` is the regression guard used by tests
+    /// that pin "the CLI must NOT reach this endpoint" (e.g. confirmation
+    /// refusal paths).
+    pub async fn with_pairing_session_call_count(
+        &self,
+        code: &str,
+        bearer_token: &str,
+        browser_public_key: &str,
+        expected_calls: u64,
+    ) -> &Self {
+        Mock::given(method("GET"))
+            .and(path(format!("/api/vault/pair/{code}")))
+            .and(header("authorization", format!("Bearer {bearer_token}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "status": "pending",
+                "browserPublicKey": browser_public_key,
+            })))
+            .expect(expected_calls)
+            .mount(&self.server)
+            .await;
+        self
+    }
+
+    /// Mount a pending pairing session that includes the optional
+    /// binding-metadata fields the new server returns (`deviceLabel`,
+    /// `createdAt`, `createdFromIp`). Any of the three may be `None` to
+    /// pin "this field absent" behavior.
+    pub async fn with_pairing_session_with_metadata(
+        &self,
+        code: &str,
+        bearer_token: &str,
+        browser_public_key: &str,
+        device_label: Option<&str>,
+        created_at: Option<&str>,
+        created_from_ip: Option<&str>,
+    ) -> &Self {
+        let mut body = serde_json::json!({
+            "status": "pending",
+            "browserPublicKey": browser_public_key,
+        });
+        if let Some(label) = device_label {
+            body["deviceLabel"] = serde_json::Value::String(label.to_string());
+        }
+        if let Some(created) = created_at {
+            body["createdAt"] = serde_json::Value::String(created.to_string());
+        }
+        if let Some(ip) = created_from_ip {
+            body["createdFromIp"] = serde_json::Value::String(ip.to_string());
+        }
+        Mock::given(method("GET"))
+            .and(path(format!("/api/vault/pair/{code}")))
+            .and(header("authorization", format!("Bearer {bearer_token}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(body))
+            .expect(1)
+            .mount(&self.server)
+            .await;
+        self
+    }
+
     /// Mount a pairing session with a custom status.
     pub async fn with_pairing_session_status(
         &self,
@@ -325,6 +385,19 @@ impl MockRegistry {
 
     /// Mount a successful pairing approval endpoint for a specific code.
     pub async fn with_pairing_approval(&self, code: &str, bearer_token: &str) -> &Self {
+        self.with_pairing_approval_call_count(code, bearer_token, 1)
+            .await
+    }
+
+    /// Like [`with_pairing_approval`] but with an explicit expected call
+    /// count — `expected_calls: 0` pins "the CLI must NOT reach the
+    /// approve POST" (used by confirmation-refusal regression tests).
+    pub async fn with_pairing_approval_call_count(
+        &self,
+        code: &str,
+        bearer_token: &str,
+        expected_calls: u64,
+    ) -> &Self {
         Mock::given(method("POST"))
             .and(path(format!("/api/vault/pair/{code}")))
             .and(header("authorization", format!("Bearer {bearer_token}")))
@@ -333,7 +406,7 @@ impl MockRegistry {
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "success": true,
             })))
-            .expect(1)
+            .expect(expected_calls)
             .mount(&self.server)
             .await;
         self

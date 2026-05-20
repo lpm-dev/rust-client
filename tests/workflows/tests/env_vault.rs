@@ -82,7 +82,7 @@ async fn env_pair_uppercases_code_and_approves_browser_pairing() {
 
     let output = lpm(&project)
         .env("LPM_REGISTRY_URL", mock.url())
-        .args(["env", "pair", "abc123"])
+        .args(["env", "pair", "abc123", "--yes"])
         .output()
         .expect("failed to run lpm env pair");
 
@@ -104,6 +104,141 @@ async fn env_pair_uppercases_code_and_approves_browser_pairing() {
     assert!(
         project.home().join(".lpm").join(".vault-key").exists(),
         "workflow vault pairing should use the file-backed wrapping key in isolated HOME"
+    );
+}
+
+#[tokio::test]
+async fn env_pair_refuses_when_stdin_is_not_a_tty_and_yes_flag_absent() {
+    use p256::elliptic_curve::sec1::ToEncodedPoint;
+
+    // The headline H1 phishing payload — "run this command from a tutorial /
+    // pipe / heredoc" — relies on the CLI completing the wrap with no human
+    // pause. Defense: refuse outright unless either (a) the user is sitting at
+    // a real terminal where the confirmation prompt can render, or (b) the
+    // user explicitly passed --yes after reading the help. The mock pair
+    // routes are mounted with `.expect(0)` so the regression check fails if
+    // the CLI ever reaches the GET (let alone the approve POST).
+    let project = TempProject::empty(r#"{"name":"vault-pair-non-tty-test","version":"1.0.0"}"#);
+    let mock = MockRegistry::start().await;
+
+    let browser_secret = P256SecretKey::random(&mut rand::thread_rng());
+    let browser_public_key = BASE64.encode(
+        browser_secret
+            .public_key()
+            .to_encoded_point(false)
+            .as_bytes(),
+    );
+    mock.with_pairing_session_call_count("NOTTY1", "session-access-token", &browser_public_key, 0)
+        .await;
+    mock.with_pairing_approval_call_count("NOTTY1", "session-access-token", 0)
+        .await;
+
+    seed_sessions(
+        project.home(),
+        &[SessionSeed {
+            registry_url: &mock.url(),
+            access_token: Some("session-access-token"),
+            refresh_token: Some("refresh-token"),
+            session_access_expires_at: Some("2030-01-01T00:00:00Z"),
+        }],
+    );
+
+    let output = lpm(&project)
+        .env("LPM_REGISTRY_URL", mock.url())
+        .args(["env", "pair", "notty1"])
+        .output()
+        .expect("failed to spawn lpm env pair without --yes");
+
+    assert!(
+        !output.status.success(),
+        "pair without --yes on non-TTY stdin must FAIL — refusing the wrap is the H1 fix.\n\
+         stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("interactive terminal") || stderr.contains("--yes"),
+        "stderr must explain why the pair refused and how to bypass: {stderr}"
+    );
+}
+
+#[tokio::test]
+async fn env_pair_with_yes_prints_browser_key_fingerprint_and_match_number_before_approving() {
+    use p256::elliptic_curve::sec1::ToEncodedPoint;
+
+    let project = TempProject::empty(r#"{"name":"vault-pair-meta-test","version":"1.0.0"}"#);
+    let mock = MockRegistry::start().await;
+
+    let browser_secret = P256SecretKey::random(&mut rand::thread_rng());
+    let browser_public_key = BASE64.encode(
+        browser_secret
+            .public_key()
+            .to_encoded_point(false)
+            .as_bytes(),
+    );
+
+    mock.with_pairing_session_with_metadata(
+        "META01",
+        "session-access-token",
+        &browser_public_key,
+        Some("Safari on iOS"),
+        Some("2026-05-20T12:34:56Z"),
+        Some("203.0.113.0/24"),
+    )
+    .await;
+    mock.with_pairing_approval("META01", "session-access-token")
+        .await;
+
+    seed_sessions(
+        project.home(),
+        &[SessionSeed {
+            registry_url: &mock.url(),
+            access_token: Some("session-access-token"),
+            refresh_token: Some("refresh-token"),
+            session_access_expires_at: Some("2030-01-01T00:00:00Z"),
+        }],
+    );
+
+    let output = lpm(&project)
+        .env("LPM_REGISTRY_URL", mock.url())
+        .args(["env", "pair", "meta01", "--yes"])
+        .output()
+        .expect("failed to run lpm env pair --yes");
+
+    assert!(
+        output.status.success(),
+        "pair --yes with metadata-rich session failed:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let combined = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    // Audit trail: even with --yes, the binding info must be in the
+    // terminal scrollback so the user has post-hoc evidence of what they
+    // approved sight-unseen.
+    assert!(
+        combined.contains("Browser key fingerprint"),
+        "binding info missing — expected fingerprint label: {combined}"
+    );
+    assert!(
+        combined.contains("Safari on iOS"),
+        "binding info missing — expected sanitized device label: {combined}"
+    );
+    assert!(
+        combined.contains("203.0.113.0/24"),
+        "binding info missing — expected createdFromIp: {combined}"
+    );
+    assert!(
+        combined.contains("Verify the dashboard shows the same number"),
+        "binding info missing — expected match-number caption: {combined}"
+    );
+    assert!(
+        combined.contains("skipped browser-identity verification"),
+        "--yes audit warning missing: {combined}"
     );
 }
 
@@ -316,7 +451,7 @@ async fn env_pair_refresh_only_session_then_unpair_reuses_normalized_session() {
 
     let pair = lpm(&project)
         .env("LPM_REGISTRY_URL", mock.url())
-        .args(["env", "pair", "rfh123"])
+        .args(["env", "pair", "rfh123", "--yes"])
         .output()
         .expect("failed to run lpm env pair with refresh-only session");
 
@@ -386,7 +521,7 @@ async fn env_pair_then_logout_revokes_pairings_and_blocks_future_pairing_command
 
     let pair = lpm(&project)
         .env("LPM_REGISTRY_URL", mock.url())
-        .args(["env", "pair", "pair01"])
+        .args(["env", "pair", "pair01", "--yes"])
         .output()
         .expect("failed to run pair before logout");
 
@@ -507,7 +642,7 @@ async fn env_pair_refresh_only_session_then_logout_revokes_pairings_and_blocks_f
 
     let pair = lpm(&project)
         .env("LPM_REGISTRY_URL", mock.url())
-        .args(["env", "pair", "rlg123"])
+        .args(["env", "pair", "rlg123", "--yes"])
         .output()
         .expect("failed to run pair before logout for refresh-only session");
 
@@ -617,7 +752,7 @@ async fn env_pair_unpair_then_logout_on_refresh_backed_session_keeps_normalized_
 
     let pair = lpm(&project)
         .env("LPM_REGISTRY_URL", mock.url())
-        .args(["env", "pair", "upl123"])
+        .args(["env", "pair", "upl123", "--yes"])
         .output()
         .expect("failed to run pair before unpair/logout refresh chain");
 
@@ -759,7 +894,7 @@ async fn env_pair_unpair_then_logout_all_on_refresh_backed_session_clears_auth_s
 
     let pair = lpm(&project)
         .env("LPM_REGISTRY_URL", mock.url())
-        .args(["env", "pair", "ual123"])
+        .args(["env", "pair", "ual123", "--yes"])
         .output()
         .expect("failed to run pair before refresh-backed logout-all chain");
 
@@ -1454,7 +1589,7 @@ async fn env_pair_surfaces_expired_code_error() {
 
     let output = lpm(&project)
         .env("LPM_REGISTRY_URL", mock.url())
-        .args(["env", "pair", "expire"])
+        .args(["env", "pair", "expire", "--yes"])
         .output()
         .expect("failed to run lpm env pair for expired code");
 
@@ -1503,7 +1638,7 @@ async fn env_pair_rejects_non_pending_session_status() {
 
     let output = lpm(&project)
         .env("LPM_REGISTRY_URL", mock.url())
-        .args(["env", "pair", "used12"])
+        .args(["env", "pair", "used12", "--yes"])
         .output()
         .expect("failed to run lpm env pair for non-pending code");
 
@@ -1539,7 +1674,7 @@ async fn env_pair_rejects_malformed_browser_key() {
 
     let output = lpm(&project)
         .env("LPM_REGISTRY_URL", mock.url())
-        .args(["env", "pair", "badkey"])
+        .args(["env", "pair", "badkey", "--yes"])
         .output()
         .expect("failed to run lpm env pair for malformed key");
 
