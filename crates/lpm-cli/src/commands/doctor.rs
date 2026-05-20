@@ -300,9 +300,10 @@ pub async fn run(
     // 3. Global store accessible?
     let store_result = PackageStore::default_location();
     let store_ok = store_result.is_ok();
-    let store_detail = store_result
-        .map(|s| s.root().display().to_string())
-        .unwrap_or_else(|_| "inaccessible".into());
+    let store_detail = store_result.map_or_else(
+        |_| "inaccessible".into(),
+        |s| s.root().display().to_string(),
+    );
     if store_ok {
         checks.push(Check::pass(
             &doctor_catalog::GLOBAL_STORE_ACCESSIBLE,
@@ -2858,7 +2859,7 @@ fn probe_sandbox_backend() -> Check {
         ),
     };
 
-    // rework GPT-5 audit follow-up : when the
+    // rework follow-up : when the
     // resolved mode is `None` (`[sandbox] mode = "none"` in
     // `~/.lpm/config.toml` / `./lpm.toml`, persisted by
     // `lpm config sandbox --set none`), the install pipeline runs
@@ -3096,7 +3097,7 @@ mod tests {
         // Pin the codes the sandbox probe is allowed to emit so the
         // automation contract for this check stays stable across
         // platforms / refactors. adds `sandbox_degraded`
-        // for the V1-fallback path; the GPT-5 audit follow-up adds
+        // for the V1-fallback path; the follow-up adds
         // `sandbox_disabled_by_user` for the persistent `mode =
         // "none"` path; It adds `sandbox_helper_missing`
         // for the Windows AppContainer-helper-not-found fallback;
@@ -3283,7 +3284,7 @@ commands = []
         );
     }
 
-    /// GPT-5 audit follow-up : when the user has set
+    /// follow-up : when the user has set
     /// `[sandbox] mode = "none"` in `~/.lpm/config.toml` (via
     /// `lpm config sandbox --set none` or by hand), the doctor probe
     /// MUST report the disabled posture instead of probing

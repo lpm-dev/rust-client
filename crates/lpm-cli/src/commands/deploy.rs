@@ -555,8 +555,7 @@ fn strip_dev_dependencies_from_deploy_manifest(output_dir: &Path) -> Result<usiz
     let stripped_count = doc
         .get("devDependencies")
         .and_then(|v| v.as_object())
-        .map(|o| o.len())
-        .unwrap_or(0);
+        .map_or(0, |o| o.len());
 
     if stripped_count == 0 {
         // Key missing or empty object: nothing to do, nothing to write.
@@ -589,8 +588,10 @@ fn read_member_name(manifest_path: &Path) -> String {
         manifest_path
             .parent()
             .and_then(|p| p.file_name())
-            .map(|n| n.to_string_lossy().to_string())
-            .unwrap_or_else(|| "(unnamed)".to_string())
+            .map_or_else(
+                || "(unnamed)".to_string(),
+                |n| n.to_string_lossy().to_string(),
+            )
     };
     let Ok(content) = std::fs::read_to_string(manifest_path) else {
         return fallback();
@@ -600,8 +601,7 @@ fn read_member_name(manifest_path: &Path) -> String {
     };
     doc.get("name")
         .and_then(|v| v.as_str())
-        .map(|s| s.to_string())
-        .unwrap_or_else(fallback)
+        .map_or_else(fallback, |s| s.to_string())
 }
 
 /// Run the `lpm deploy` command.
@@ -1043,7 +1043,7 @@ mod tests {
         assert!(err.to_string().contains("inside the workspace"));
     }
 
-    // ── GPT-5.4 audit regression (High): self-loop guard bypass ────
+    // ── regression (High): self-loop guard bypass ────
 
     #[cfg(unix)]
     #[test]

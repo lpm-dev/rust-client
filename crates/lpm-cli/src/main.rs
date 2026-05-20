@@ -1804,19 +1804,48 @@ enum Commands {
         #[arg(long)]
         inspect_port: Option<u16>,
 
+        /// Pre-approve the trust-store install for `--https` (skips the prompt).
+        /// Required in non-TTY contexts to avoid hanging on stdin.
+        #[arg(long, short = 'y')]
+        yes: bool,
+
+        /// Serve the root CA over plain HTTP on `port+1` so mobile devices on the
+        /// LAN can bootstrap trust. Off by default — anyone on the LAN can grab
+        /// the CA, so the flag is explicit.
+        #[arg(long)]
+        allow_ca_bootstrap: bool,
+
         /// Extra arguments passed to the dev script.
         #[arg(trailing_var_arg = true)]
         args: Vec<String>,
     },
 
-    /// Manage local HTTPS certificates (status, trust, uninstall, generate).
+    /// Manage local HTTPS certificates (status, trust, uninstall, generate, rotate, reconcile).
     Cert {
-        /// Action: status, trust, uninstall, generate.
+        /// Action: status, trust, uninstall, generate, rotate, reconcile.
         action: String,
 
         /// Extra hostnames to include in the certificate SAN.
         #[arg(long)]
         host: Vec<String>,
+
+        /// Additional project directories to reissue leaves for during rotate.
+        #[arg(long = "project")]
+        project: Vec<std::path::PathBuf>,
+
+        /// Defer uninstalling the old CA for this many days (rotate only).
+        /// Capped at 90.
+        #[arg(long = "keep-old-trusted")]
+        keep_old_trusted: Option<u32>,
+
+        /// On rotate, exit non-zero instead of skipping projects whose dirs
+        /// have disappeared from disk.
+        #[arg(long = "fail-on-missing")]
+        fail_on_missing: bool,
+
+        /// Dry run for reconcile: report what would happen without mutating.
+        #[arg(long = "dry-run")]
+        dry_run: bool,
     },
 
     /// Visualize the dependency graph (tree, DOT, Mermaid, JSON, stats, HTML).
@@ -2422,8 +2451,7 @@ fn main() -> Result<()> {
         let pkg_content_opt = std::fs::read_to_string(cwd.join("package.json")).ok();
         let is_workspace = pkg_content_opt
             .as_deref()
-            .map(install_state::is_workspace_root_content)
-            .unwrap_or(false);
+            .is_some_and(install_state::is_workspace_root_content);
 
         if !is_workspace && let Some(pkg_content) = pkg_content_opt.as_deref() {
             let state = install_state::check_install_state_with_content(&cwd, pkg_content);
@@ -2587,13 +2615,10 @@ async fn async_main() -> Result<()> {
     // `LPM_TOKEN` env (clap merges them). When the value matches
     // `LPM_TOKEN` exactly, treat it as env-sourced so SessionManager
     // can classify it correctly; otherwise it's an explicit flag value.
-    let explicit_flag_token = cli.token.clone().filter(|t| {
-        std::env::var("LPM_TOKEN")
-            .ok()
-            .as_deref()
-            .map(|env_v| env_v != t.as_str())
-            .unwrap_or(true)
-    });
+    let explicit_flag_token = cli
+        .token
+        .clone()
+        .filter(|t| std::env::var("LPM_TOKEN").ok().as_deref() != Some(t.as_str()));
     let session = std::sync::Arc::new(lpm_auth::SessionManager::new(
         registry_url.to_string(),
         explicit_flag_token,
@@ -4141,6 +4166,8 @@ async fn async_main() -> Result<()> {
             no_dashboard,
             no_inspect,
             inspect_port,
+            yes,
+            allow_ca_bootstrap,
             args,
         } => {
             lpm_runner::script::set_skip_env_validation(no_env_check);
@@ -4218,12 +4245,33 @@ async fn async_main() -> Result<()> {
                 tunnel_auth,
                 no_inspect,
                 inspect_port,
+                yes,
+                allow_ca_bootstrap,
             )
             .await
         }
-        Commands::Cert { action, host } => {
+        Commands::Cert {
+            action,
+            host,
+            project,
+            keep_old_trusted,
+            fail_on_missing,
+            dry_run,
+        } => {
             let cwd = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;
-            commands::cert::run(&action, &cwd, &host, cli.json).await
+            commands::cert::run(
+                &action,
+                &cwd,
+                &host,
+                cli.json,
+                commands::cert::ExtraArgs {
+                    extra_projects: project,
+                    keep_old_trusted_days: keep_old_trusted,
+                    fail_on_missing,
+                    dry_run,
+                },
+            )
+            .await
         }
         Commands::Graph {
             package,
@@ -4341,7 +4389,10 @@ async fn async_main() -> Result<()> {
         }
         Commands::Vault { action } => commands::vault::run(&action, cli.json).await,
         Commands::SelfUpdate { refresh } => commands::self_update::run(cli.json, refresh).await,
-        Commands::Completions { shell } => commands::completions::run(shell),
+        Commands::Completions { shell } => {
+            commands::completions::run(shell);
+            Ok(())
+        }
         Commands::Schema { kind, out } => commands::schema::run(&kind, out.as_deref()),
         Commands::InternalUpdateCheck => {
             // hidden subcommand — unconditionally refresh the

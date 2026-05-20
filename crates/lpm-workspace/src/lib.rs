@@ -1372,8 +1372,7 @@ impl TrustedDependencies {
                 // Match the part before `@version`, handling scoped
                 // packages (`@scope/name@version`) by finding the LAST `@`.
                 k.rfind('@')
-                    .map(|at| &k[..at] == name)
-                    .unwrap_or_else(|| k == name)
+                    .map_or_else(|| k == name, |at| &k[..at] == name)
             }),
         }
     }
@@ -1413,8 +1412,7 @@ impl TrustedDependencies {
                 // BEFORE the `@version` so callers can group by package.
                 let name = k
                     .rfind('@')
-                    .map(|at| k[..at].to_string())
-                    .unwrap_or_else(|| k.clone());
+                    .map_or_else(|| k.clone(), |at| k[..at].to_string());
                 (name, Some(v))
             })),
         }

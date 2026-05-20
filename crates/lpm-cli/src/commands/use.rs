@@ -24,7 +24,7 @@ pub async fn run(
                 LpmError::Script("missing version spec. Usage: lpm use node@22".into())
             })?;
 
-            let (runtime, version_spec) = parse_runtime_spec(spec)?;
+            let (runtime, version_spec) = parse_runtime_spec(spec);
             if runtime != "node" {
                 return Err(LpmError::Script(format!(
                     "runtime '{runtime}' not yet supported. Currently supported: node"
@@ -113,7 +113,7 @@ pub async fn run(
                 LpmError::Script("missing version. Usage: lpm use pin node@22.5.0".into())
             })?;
 
-            let (runtime, version_spec) = parse_runtime_spec(spec)?;
+            let (runtime, version_spec) = parse_runtime_spec(spec);
             if runtime != "node" {
                 return Err(LpmError::Script(format!(
                     "runtime '{runtime}' not yet supported"
@@ -180,12 +180,12 @@ pub async fn run(
     Ok(())
 }
 
-fn parse_runtime_spec(spec: &str) -> Result<(String, String), LpmError> {
+fn parse_runtime_spec(spec: &str) -> (String, String) {
     if let Some((runtime, version)) = spec.split_once('@') {
-        Ok((runtime.to_string(), version.to_string()))
+        (runtime.to_string(), version.to_string())
     } else {
         // No @ sign — assume it's a node version
-        Ok(("node".to_string(), spec.to_string()))
+        ("node".to_string(), spec.to_string())
     }
 }
 

@@ -97,10 +97,7 @@ fn render_sidebar(frame: &mut Frame, app: &DashboardApp, area: Rect) {
         .enumerate()
         .map(|(i, svc)| {
             let icon = svc.status.icon();
-            let port_str = svc
-                .port
-                .map(|p| format!(":{p}"))
-                .unwrap_or_else(|| "  —".into());
+            let port_str = svc.port.map_or_else(|| "  —".into(), |p| format!(":{p}"));
 
             let style = if i == app.selected_service {
                 Style::default().bold().fg(Color::Cyan)
@@ -405,8 +402,7 @@ fn render_webhook_detail(frame: &mut Frame, app: &DashboardApp, area: Rect, inde
 
     let provider = wh
         .provider
-        .map(|p| p.to_string())
-        .unwrap_or_else(|| "unknown".to_string());
+        .map_or_else(|| "unknown".to_string(), |p| p.to_string());
     let title = format!(
         " #{} — {} {} -> {} ",
         index + 1,
@@ -526,8 +522,7 @@ fn truncate_path(path: &str, max: usize) -> String {
         let end = path
             .char_indices()
             .nth(truncate_at)
-            .map(|(i, _)| i)
-            .unwrap_or(path.len());
+            .map_or(path.len(), |(i, _)| i);
         format!("{}...", &path[..end])
     }
 }

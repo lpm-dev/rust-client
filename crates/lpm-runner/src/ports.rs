@@ -352,7 +352,7 @@ mod tests {
         let mut doc = toml::value::Table::new();
         let mut project_table = toml::value::Table::new();
         project_table.insert("web".to_string(), toml::Value::Integer(4001));
-        doc.insert(project_key.clone(), toml::Value::Table(project_table));
+        doc.insert(project_key, toml::Value::Table(project_table));
         std::fs::write(&toml_path, toml::to_string_pretty(&doc).unwrap()).unwrap();
 
         // Verify it was written

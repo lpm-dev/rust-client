@@ -80,7 +80,7 @@ fn validate_github_runtime_url(url: &str) -> Result<(), LpmError> {
         );
         return Ok(());
     }
-    if scheme == "http" && parsed.host_str().map(url_host_is_loopback).unwrap_or(false) {
+    if scheme == "http" && parsed.host_str().is_some_and(url_host_is_loopback) {
         return Ok(());
     }
     Err(LpmError::Registry(format!(

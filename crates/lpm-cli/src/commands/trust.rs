@@ -117,7 +117,7 @@ struct DiffEntry {
 /// JSON consumers don't have to re-sort.
 fn compute_full_diff(snapshot: Option<&TrustSnapshot>, current: &TrustSnapshot) -> Vec<DiffEntry> {
     let empty = BTreeMap::new();
-    let prev = snapshot.map(|s| &s.bindings).unwrap_or(&empty);
+    let prev = snapshot.map_or(&empty, |s| &s.bindings);
     let curr = &current.bindings;
 
     let mut added: Vec<DiffEntry> = Vec::new();
@@ -174,8 +174,9 @@ async fn run_diff(project_dir: &Path, json: bool) -> Result<(), LpmError> {
     let current = TrustSnapshot::capture_current(
         pkg.lpm
             .as_ref()
-            .map(|l| &l.trusted_dependencies)
-            .unwrap_or(&TrustedDependencies::Legacy(Vec::new())),
+            .map_or(&TrustedDependencies::Legacy(Vec::new()), |l| {
+                &l.trusted_dependencies
+            }),
     );
     let entries = compute_full_diff(snapshot.as_ref(), &current);
 
@@ -474,7 +475,7 @@ fn remove_stale_from_manifest(manifest: &mut serde_json::Value, stale: &[String]
 
     if let Some(arr) = td_val.as_array_mut() {
         // Legacy form: filter the array in place.
-        arr.retain(|v| v.as_str().map(|s| !stale_set.contains(s)).unwrap_or(true));
+        arr.retain(|v| v.as_str().is_none_or(|s| !stale_set.contains(s)));
     } else if let Some(map) = td_val.as_object_mut() {
         // Rich form: filter the map in place.
         map.retain(|k, _| !stale_set.contains(k.as_str()));

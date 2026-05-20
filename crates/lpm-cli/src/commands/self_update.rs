@@ -359,13 +359,16 @@ fn standalone_command_for(version: &str, platform: &str, ext: &str, exe: Option<
         "https://github.com/lpm-dev/rust-client/releases/download/v{version}/lpm-{platform}{ext}"
     );
     let is_windows = platform.starts_with("win32");
-    let exe = exe.map(str::to_string).unwrap_or_else(|| {
-        if is_windows {
-            "%USERPROFILE%\\.lpm\\bin\\lpm.exe".to_string()
-        } else {
-            "/usr/local/bin/lpm".to_string()
-        }
-    });
+    let exe = exe.map_or_else(
+        || {
+            if is_windows {
+                "%USERPROFILE%\\.lpm\\bin\\lpm.exe".to_string()
+            } else {
+                "/usr/local/bin/lpm".to_string()
+            }
+        },
+        str::to_string,
+    );
     if is_windows {
         // PowerShell. No chmod — Windows uses the .exe extension to
         // mark executables, not a permission bit.
@@ -639,8 +642,7 @@ async fn fetch_bounded(
     // under the cap; otherwise let the Vec grow.
     let prealloc = resp
         .content_length()
-        .map(|c| (c as usize).min(max_bytes))
-        .unwrap_or(0);
+        .map_or(0, |c| (c as usize).min(max_bytes));
     let mut buf: Vec<u8> = Vec::with_capacity(prealloc);
     while let Some(chunk) = resp
         .chunk()
@@ -723,7 +725,7 @@ fn verify_release_artifacts(
     Ok(AttestationAudit {
         publisher: snapshot.publisher.clone(),
         workflow_path: snapshot.workflow_path.clone(),
-        workflow_ref: snapshot.workflow_ref.clone(),
+        workflow_ref: snapshot.workflow_ref,
         integrated_time: integrated_time_utc,
         log_index,
         log_id,

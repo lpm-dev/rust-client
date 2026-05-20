@@ -155,7 +155,7 @@ pub(crate) fn render_profile(
     // (`.env`, `.npmrc`, `.aws/`, `*.pem`, etc.). SBPL last-match-
     // wins: a path covered by both the earlier allow and this deny
     // ends up denied. The per-project / per-user
-    // `sandboxReadAllow` opt-in (Phase 3) emits a follow-up
+    // `sandboxReadAllow` opt-in emits a follow-up
     // (allow file-read*) block AFTER this deny so specific files
     // can be exempted without disabling the whole list.
     render_secret_denies(&mut out, &canon_project_dir)?;
@@ -311,7 +311,7 @@ fn render_secret_denies(out: &mut String, canon_project_dir: &Path) -> Result<()
 /// the named files, without disabling the whole secret-deny list.
 ///
 /// No-op when the allow list is empty (no block emitted). The
-/// loader (Phase 3) is responsible for validating that each entry
+/// The loader is responsible for validating that each entry
 /// is an absolute project-rooted path and rejecting traversal /
 /// out-of-project entries — this renderer just emits whatever it
 /// receives.
@@ -662,7 +662,7 @@ mod tests {
     #[test]
     fn profile_does_not_allow_ssh_aws_or_keychains() {
         let p = render_profile(&spec(), false).unwrap();
-        // The Phase 1 secret-deny block legitimately mentions
+        // The secret-deny block legitimately mentions
         // `.ssh` and `.aws` as project-rooted subpaths — those are
         // DENY rules and exactly what we want. The check below
         // scopes the assertion to the ALLOW blocks: any allow
@@ -694,7 +694,7 @@ mod tests {
     /// Concatenate the bodies of every `(allow ... )` block in the
     /// profile. Used by allow-only path assertions that must NOT
     /// be confused by deny-block mentions of the same path
-    /// (the Phase 1 secret deny block legitimately references
+    /// (the secret deny block legitimately references
     /// `.ssh`, `.aws`, etc. as project-rooted denies).
     fn extract_allow_blocks(profile: &str) -> String {
         let mut out = String::new();
@@ -837,7 +837,7 @@ mod tests {
         // test under tests/seatbelt_integration.rs actually shells
         // out to sandbox-exec to confirm runtime behavior.
         //
-        // The Phase 1 secret-deny block additionally names `.ssh`
+        // The secret-deny block additionally names `.ssh`
         // as a project-rooted DENY (defense-in-depth for the
         // `<project>/.ssh` case); the assertion below scopes to the
         // allow section to confirm no ALLOW rule covers `.ssh`.
@@ -1038,7 +1038,7 @@ mod tests {
         }
     }
 
-    // ── Secret-file deny block (Phase 1) ────────────────────────────
+    // ── Secret-file deny block ──────────────────────────────────────
 
     /// The deny block appears AFTER the broad
     /// `(allow file-read* (subpath project_dir))` rule. SBPL is
@@ -1250,7 +1250,7 @@ mod tests {
         assert_eq!(extract_deny(&default), extract_deny(&strict));
     }
 
-    /// Phase 3 wiring contract: when `secret_read_allow` is non-empty,
+    /// wiring contract: when `secret_read_allow` is non-empty,
     /// an additional `(allow file-read* ...)` block is emitted AFTER
     /// the deny block. Last-match-wins means the named files become
     /// readable again while the rest of the deny list still applies.
@@ -1280,7 +1280,7 @@ mod tests {
         );
     }
 
-    /// Empty `secret_read_allow` — no override block emitted (Phase 1
+    /// Empty `secret_read_allow` — no override block emitted (
     /// default state).
     #[test]
     fn empty_secret_read_allow_emits_no_override_block() {

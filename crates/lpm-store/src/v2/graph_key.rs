@@ -624,10 +624,7 @@ fn write_deps_raw_direct(
         let mut sorted: Vec<(&str, &str, &str)> = deps
             .iter()
             .map(|(local, ver)| {
-                let canonical = aliases
-                    .get(local)
-                    .map(|s| s.as_str())
-                    .unwrap_or(local.as_str());
+                let canonical = aliases.get(local).map_or(local.as_str(), |s| s.as_str());
                 (local.as_str(), canonical, ver.as_str())
             })
             .collect();
@@ -723,7 +720,7 @@ mod tests {
             version: "18.3.0".into(),
         };
         let ordered = base_inputs().with_peers([p1.clone(), p2.clone()]);
-        let reversed = base_inputs().with_peers([p2.clone(), p1.clone()]);
+        let reversed = base_inputs().with_peers([p2, p1]);
         assert_eq!(GraphKey::derive(&ordered), GraphKey::derive(&reversed));
     }
 
@@ -740,7 +737,7 @@ mod tests {
             target_version: "1.4.0".into(),
         };
         let a = base_inputs().with_deps([d1.clone(), d2.clone()]);
-        let b = base_inputs().with_deps([d2.clone(), d1.clone()]);
+        let b = base_inputs().with_deps([d2, d1]);
         assert_eq!(GraphKey::derive(&a), GraphKey::derive(&b));
     }
 

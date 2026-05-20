@@ -235,9 +235,7 @@ pub async fn export_redacted(
 ) -> Result<Json<crate::redact::RedactionResult>, StatusCode> {
     let webhook = state.get_by_id(&id).await.ok_or(StatusCode::NOT_FOUND)?;
     let export = crate::export::to_webhook_json(&webhook);
-    let rules = body
-        .map(|b| b.0)
-        .unwrap_or_else(crate::redact::default_rules);
+    let rules = body.map_or_else(crate::redact::default_rules, |b| b.0);
     let result = crate::redact::redact(&export, &rules);
     Ok(Json(result))
 }

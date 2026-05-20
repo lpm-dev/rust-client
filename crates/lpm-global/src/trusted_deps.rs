@@ -685,7 +685,7 @@ mod tests {
         assert_eq!(snap.publisher.as_deref(), Some("github:evanw/esbuild"));
     }
 
-    /// Pre-Phase-68 entries on disk (no `provenanceAtApproval` field)
+    /// Old on-disk entries (no `provenanceAtApproval` field)
     /// must deserialize cleanly with `provenance_at_approval = None`.
     /// Additive `serde(default)` is the load-bearing guarantee here.
     #[test]

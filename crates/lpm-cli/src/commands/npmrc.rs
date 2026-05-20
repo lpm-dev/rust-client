@@ -33,18 +33,20 @@ pub async fn run(
             .ok()
             .and_then(|content| serde_json::from_str::<serde_json::Value>(&content).ok())
             .and_then(|v| v.get("name")?.as_str().map(|s| s.to_string()))
-            .map(|name| {
-                name.chars()
-                    .map(|c| {
-                        if c.is_alphanumeric() || c == '.' || c == '-' || c == '_' {
-                            c
-                        } else {
-                            '-'
-                        }
-                    })
-                    .collect::<String>()
-            })
-            .unwrap_or_else(|| "project".to_string())
+            .map_or_else(
+                || "project".to_string(),
+                |name| {
+                    name.chars()
+                        .map(|c| {
+                            if c.is_alphanumeric() || c == '.' || c == '-' || c == '_' {
+                                c
+                            } else {
+                                '-'
+                            }
+                        })
+                        .collect::<String>()
+                },
+            )
     } else {
         "project".to_string()
     };

@@ -44,10 +44,7 @@ pub fn build_task_graph(
         for dep in &local_deps {
             let is_script = scripts.contains_key(dep);
             let is_task_with_command = tasks.get(dep).and_then(|t| t.command.as_ref()).is_some();
-            let is_meta_task = tasks
-                .get(dep)
-                .map(|t| !t.depends_on.is_empty())
-                .unwrap_or(false);
+            let is_meta_task = tasks.get(dep).is_some_and(|t| !t.depends_on.is_empty());
 
             if !is_script && !is_task_with_command && !is_meta_task {
                 return Err(format!(

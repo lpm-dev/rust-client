@@ -1137,11 +1137,7 @@ impl DependencyProvider for LpmDependencyProvider {
     ) -> Self::Priority {
         let conflict_count = stats.conflict_count();
         let key = CanonicalKey::from(package);
-        let version_count = self
-            .cache
-            .get(&key)
-            .map(|c| c.versions.len())
-            .unwrap_or(100) as u32;
+        let version_count = self.cache.get(&key).map_or(100, |c| c.versions.len()) as u32;
 
         ResolverPriority {
             conflict_count,
@@ -1256,8 +1252,7 @@ impl DependencyProvider for LpmDependencyProvider {
                     .iter()
                     .map(|(local, range)| {
                         crate::ranges::parse_npm_alias(range)
-                            .map(|a| a.target)
-                            .unwrap_or_else(|| local.clone())
+                            .map_or_else(|| local.clone(), |a| a.target)
                     })
                     .filter(|target| {
                         let key = CanonicalKey::from_dep_name(target);
@@ -1519,8 +1514,7 @@ impl DependencyProvider for LpmDependencyProvider {
             // `ResolvedPackage.dependencies`.
             let target_name: &str = ver_aliases
                 .get(dep_name)
-                .map(String::as_str)
-                .unwrap_or(dep_name.as_str());
+                .map_or(dep_name.as_str(), String::as_str);
             let base_pkg = ResolverPackage::from_dep_name(target_name);
 
             // If this dep is in the split set, create a scoped identity
@@ -2040,7 +2034,7 @@ mod tests {
     }
 
     /// Regression test for the prerelease-stripping bug found in the
-    /// 2026-05-07 hoisted-mode compatibility audit (vite-react,
+    /// hoisted-mode compatibility audit (vite-react,
     /// nextjs-minimal, babel-presets fixtures all failed with
     /// `no version satisfies range (versions available: 1)` when a
     /// dependency declared a prerelease range like `^1.0.0-beta.27`).

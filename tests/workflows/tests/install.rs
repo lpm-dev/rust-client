@@ -2171,8 +2171,7 @@ async fn install_lockfile_is_deterministic_across_fresh_installs() {
                 if let Some(start) = line.find("http://127.0.0.1:") {
                     let after_port = line[start + "http://127.0.0.1:".len()..]
                         .find('/')
-                        .map(|i| i + start + "http://127.0.0.1:".len())
-                        .unwrap_or(line.len());
+                        .map_or(line.len(), |i| i + start + "http://127.0.0.1:".len());
                     format!("{}{}{}", &line[..start], "[REGISTRY]", &line[after_port..])
                 } else {
                     line.to_owned()

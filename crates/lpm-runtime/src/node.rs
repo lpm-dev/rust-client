@@ -100,7 +100,7 @@ pub fn node_binary_path(version: &str) -> Result<PathBuf, LpmError> {
 pub fn node_bin_dir(version: &str) -> Result<PathBuf, LpmError> {
     let dir = node_version_dir(version)?;
     if cfg!(windows) {
-        Ok(dir.clone())
+        Ok(dir)
     } else {
         Ok(dir.join("bin"))
     }

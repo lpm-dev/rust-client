@@ -168,3 +168,6 @@ rcgen = { version = "0.13", features = ["pem"] }
 # validate them against the hand-authored schema so the schema cannot
 # silently drift from the consumer code in `commands/add.rs`.
 jsonschema = { version = "0.46", default-features = false }
+
+[lints]
+workspace = true

@@ -71,9 +71,9 @@ pub async fn run(client: &RegistryClient, json_output: bool) -> Result<(), LpmEr
     // 2FA
     if let Some(mfa) = user.mfa_enabled {
         let status = if mfa {
-            "enabled".green().to_string()
+            "enabled".green()
         } else {
-            "disabled".yellow().to_string()
+            "disabled".yellow()
         };
         output::field("2FA", &status);
     }
@@ -118,12 +118,10 @@ pub async fn run(client: &RegistryClient, json_output: bool) -> Result<(), LpmEr
             // Over-limit warning
             let over_storage = limits
                 .storage_bytes
-                .map(|l| usage.storage_bytes > l)
-                .unwrap_or(false);
+                .is_some_and(|l| usage.storage_bytes > l);
             let over_packages = limits
                 .private_packages
-                .map(|l| l > 0 && l != u32::MAX && usage.private_packages > l)
-                .unwrap_or(false);
+                .is_some_and(|l| l > 0 && l != u32::MAX && usage.private_packages > l);
 
             if over_storage || over_packages {
                 println!();

@@ -1370,7 +1370,7 @@ fn process_edge_inner(
             let key = (edge.canonical.clone(), target_version.clone());
             if !state.children_enqueued.contains(&key) {
                 state.children_enqueued.insert(key);
-                enqueue_child_deps(new_id, &edge.canonical, &target_version, info, state)?;
+                enqueue_child_deps(new_id, &edge.canonical, &target_version, info, state);
             }
             new_id
         }
@@ -1505,10 +1505,10 @@ fn enqueue_child_deps(
     version: &NpmVersion,
     info: &CachedPackageInfo,
     state: &mut ResolveState,
-) -> Result<(), ResolveError> {
+) {
     let ver_str = version.to_string();
     let Some(deps) = info.deps.get(&ver_str) else {
-        return Ok(()); // version has no declared deps
+        return; // version has no declared deps
     };
     let aliases = info.aliases.get(&ver_str);
     let optional_names = info.optional_dep_names.get(&ver_str);
@@ -1575,9 +1575,7 @@ fn enqueue_child_deps(
             }
         };
 
-        let optional = optional_names
-            .map(|set| set.contains(local_name))
-            .unwrap_or(false);
+        let optional = optional_names.is_some_and(|set| set.contains(local_name));
 
         state.task_queue.push_back(Edge {
             parent: parent_id,
@@ -1648,9 +1646,7 @@ fn enqueue_child_deps(
                 }
             };
 
-            let optional = optional_peers
-                .map(|set| set.contains(peer_name))
-                .unwrap_or(false);
+            let optional = optional_peers.is_some_and(|set| set.contains(peer_name));
 
             state.peer_requirements.push(PeerRequirement {
                 consumer: parent_id,
@@ -1661,8 +1657,6 @@ fn enqueue_child_deps(
             });
         }
     }
-
-    Ok(())
 }
 
 // ── Eager peer auto-install drain ─────────────────────────────────
@@ -2129,8 +2123,7 @@ where
                 let consumer_canonical = state
                     .nodes
                     .get(reqs[i].consumer as usize)
-                    .map(|n| n.canonical.to_string())
-                    .unwrap_or_else(|| "<unknown>".to_string());
+                    .map_or_else(|| "<unknown>".to_string(), |n| n.canonical.to_string());
                 (consumer_canonical, reqs[i].range.to_string())
             })
             .collect();
@@ -2151,8 +2144,7 @@ where
                 let consumer_canonical = state
                     .nodes
                     .get(r.consumer as usize)
-                    .map(|n| n.canonical.to_string())
-                    .unwrap_or_else(|| "<unknown>".to_string());
+                    .map_or_else(|| "<unknown>".to_string(), |n| n.canonical.to_string());
                 (consumer_canonical, r.range.to_string(), r.optional)
             })
             .collect(),
@@ -3121,8 +3113,7 @@ mod tests {
             &NpmVersion::parse("1.0.0").unwrap(),
             &info,
             &mut state,
-        )
-        .unwrap();
+        );
 
         let queued: Vec<&str> = state
             .task_queue
@@ -3160,8 +3151,7 @@ mod tests {
             &NpmVersion::parse("1.0.0").unwrap(),
             &info,
             &mut state,
-        )
-        .unwrap();
+        );
 
         let mut queued: Vec<&str> = state
             .task_queue
@@ -3220,8 +3210,7 @@ mod tests {
             &NpmVersion::parse("1.0.0").unwrap(),
             &info,
             &mut state,
-        )
-        .unwrap();
+        );
 
         // Only `plain-dep` should have been enqueued; `workspace-leak`
         // got skipped at the workspace-specifier guard.
@@ -3311,8 +3300,7 @@ mod tests {
             &NpmVersion::parse("1.0.0").unwrap(),
             info,
             &mut state,
-        )
-        .unwrap();
+        );
         state
     }
 

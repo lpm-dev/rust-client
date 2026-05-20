@@ -474,10 +474,7 @@ async fn run_triage_wizard(
     }
     sel = sel.item("none", "none", "Layers 1-3 only (portable triage)");
     // Default to the first detected provider when available, else "none".
-    let initial = detected
-        .first()
-        .map(|r| r.provider.slug())
-        .unwrap_or("none");
+    let initial = detected.first().map_or("none", |r| r.provider.slug());
     let chosen_slug: &str = sel.initial_value(initial).interact().map_err(prompt_err)?;
 
     // Test-invoke when a real provider is chosen. Distinguish

@@ -623,7 +623,7 @@ pub fn run_services(
                         } else {
                             let code = status.code().unwrap_or(-1);
                             let config = active_services.get(name);
-                            let should_restart = config.map(|c| c.restart).unwrap_or(false);
+                            let should_restart = config.is_some_and(|c| c.restart);
 
                             if should_restart && shutdown_state.load(Ordering::Relaxed) == 0 {
                                 to_restart.push(name.clone());
@@ -1093,8 +1093,8 @@ fn ctrlc_handler(shutdown_state: Arc<AtomicU8>, children: Arc<Mutex<Vec<(String,
         use signal_hook::consts::{SIGINT, SIGTERM};
         use signal_hook::iterator::Signals;
 
-        let state = shutdown_state.clone();
-        let kids = children.clone();
+        let state = shutdown_state;
+        let kids = children;
         if let Ok(mut signals) = Signals::new([SIGINT, SIGTERM]) {
             std::thread::spawn(move || {
                 for _ in signals.forever() {

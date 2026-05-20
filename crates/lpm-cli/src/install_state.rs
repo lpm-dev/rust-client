@@ -1309,7 +1309,7 @@ mod tests {
         // Mtime fast path with matching linker → up_to_date.
         let same = try_mtime_fast_path(p, lpm_linker::LinkerMode::Isolated);
         assert!(
-            same.map(|s| s.up_to_date).unwrap_or(false),
+            same.is_some_and(|s| s.up_to_date),
             "matching linker should keep up_to_date=true on the fast path"
         );
         // Mtime fast path with FLIPPED linker → bails (returns None).

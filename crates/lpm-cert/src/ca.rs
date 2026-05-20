@@ -1,38 +1,140 @@
 //! Root Certificate Authority generation.
 //!
-//! Generates a self-signed root CA using ECDSA P-256 with a 10-year validity period.
+//! Generates a self-signed root CA using ECDSA P-256 with an 825-day validity period.
 //! This CA is used to sign per-project certificates for local HTTPS development.
 
+use lpm_common::LpmError;
 use rcgen::{
-    BasicConstraints, CertificateParams, DistinguishedName, DnType, IsCa, KeyPair, KeyUsagePurpose,
+    BasicConstraints, CertificateParams, CidrSubnet, DistinguishedName, DnType, GeneralSubtree,
+    IsCa, KeyPair, KeyUsagePurpose, NameConstraints,
 };
+use std::path::Path;
+use std::str::FromStr;
 use time::{Duration, OffsetDateTime};
+
+/// Local-CA validity in days. Chosen as a product-security policy: bounded value of a
+/// stolen offline key, comfortably > 2× the 365d leaf cadence in `cert.rs`. The 825d
+/// number is familiar from CAB/F leaf rules — referenced as a recognizable anchor only;
+/// CAB/F does not regulate private/local CAs.
+pub const CA_VALIDITY_DAYS: i64 = 825;
+
+const NAME_CONSTRAINTS_ENV: &str = "LPM_CERT_NAME_CONSTRAINTS";
+
+/// Build the permitted-subtrees list for the local development CA.
+///
+/// RFC 5280 §4.2.1.10: DNS-name subtrees use leading-dot semantics for "any subdomain
+/// of"; a bare entry only matches the exact name. The two-entry pattern below covers
+/// both forms so e.g. `localhost` and `api.localhost` both validate.
+fn permitted_subtrees() -> Vec<GeneralSubtree> {
+    vec![
+        GeneralSubtree::DnsName("localhost".into()),
+        GeneralSubtree::DnsName(".localhost".into()),
+        GeneralSubtree::DnsName(".local".into()),
+        GeneralSubtree::DnsName(".lpm.test".into()),
+        GeneralSubtree::DnsName(".test".into()),
+        GeneralSubtree::IpAddress(
+            CidrSubnet::from_str("127.0.0.0/8").expect("static loopback CIDR"),
+        ),
+        GeneralSubtree::IpAddress(
+            CidrSubnet::from_str("::1/128").expect("static IPv6 loopback CIDR"),
+        ),
+        GeneralSubtree::IpAddress(CidrSubnet::from_str("10.0.0.0/8").expect("static RFC1918 /8")),
+        GeneralSubtree::IpAddress(
+            CidrSubnet::from_str("172.16.0.0/12").expect("static RFC1918 /12"),
+        ),
+        GeneralSubtree::IpAddress(
+            CidrSubnet::from_str("192.168.0.0/16").expect("static RFC1918 /16"),
+        ),
+        GeneralSubtree::IpAddress(
+            CidrSubnet::from_str("169.254.0.0/16").expect("static IPv4 link-local"),
+        ),
+        GeneralSubtree::IpAddress(CidrSubnet::from_str("fc00::/7").expect("static IPv6 ULA")),
+        GeneralSubtree::IpAddress(
+            CidrSubnet::from_str("fe80::/10").expect("static IPv6 link-local"),
+        ),
+    ]
+}
+
+/// Whether `LPM_CERT_NAME_CONSTRAINTS` is set to a truthy value in the current process.
+///
+/// Used both by `generate_ca()` (to decide whether to emit the extension on new CAs)
+/// and by `ensure_https()` (to detect "user opted in, but the on-disk CA predates the
+/// flag and is unconstrained").
+pub fn wants_name_constraints() -> bool {
+    matches!(
+        std::env::var(NAME_CONSTRAINTS_ENV).as_deref(),
+        Ok("1") | Ok("true") | Ok("yes") | Ok("on")
+    )
+}
+
+/// True iff the PEM-encoded CA at `path` carries a NameConstraints extension.
+///
+/// Returns `Err` if the file is unreadable or not a valid X.509 cert; returns
+/// `Ok(false)` if the file is a valid cert but the extension is absent.
+pub fn cert_has_name_constraints(path: &Path) -> Result<bool, LpmError> {
+    let pem_str = std::fs::read_to_string(path).map_err(|e| {
+        LpmError::Cert(format!("failed to read CA cert at {}: {e}", path.display()))
+    })?;
+    let pem = pem::parse(&pem_str)
+        .map_err(|e| LpmError::Cert(format!("invalid PEM at {}: {e}", path.display())))?;
+    let (_, cert) = x509_parser::parse_x509_certificate(pem.contents())
+        .map_err(|e| LpmError::Cert(format!("invalid X.509 at {}: {e}", path.display())))?;
+
+    Ok(cert
+        .name_constraints()
+        .map_err(|e| LpmError::Cert(format!("failed to parse name constraints: {e}")))?
+        .is_some())
+}
+
+/// Options for `generate_ca_with_options`.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct CaOptions {
+    /// If `true`, attach the RFC 5280 NameConstraints extension to the CA. Ignores
+    /// the `LPM_CERT_NAME_CONSTRAINTS` env var.
+    pub name_constraints: bool,
+}
 
 /// Generate a new root CA certificate and private key.
 ///
 /// Returns `(cert_pem, key_pem)` as PEM-encoded strings.
+///
+/// NameConstraints are attached only when the `LPM_CERT_NAME_CONSTRAINTS` env var is
+/// truthy (`1`/`true`/`yes`/`on`); the default omits the extension. Default-on requires
+/// verified client-side enforcement across the supported browsers and TLS stacks.
 pub fn generate_ca() -> Result<(String, String), Box<dyn std::error::Error>> {
+    generate_ca_with_options(CaOptions {
+        name_constraints: wants_name_constraints(),
+    })
+}
+
+/// Generate a new root CA with caller-supplied options. Tests use this to drive both
+/// branches deterministically without mutating process env.
+pub fn generate_ca_with_options(
+    opts: CaOptions,
+) -> Result<(String, String), Box<dyn std::error::Error>> {
     let mut params = CertificateParams::default();
 
-    // Distinguished Name
     let mut dn = DistinguishedName::new();
     dn.push(DnType::CommonName, "LPM Local Development CA");
     dn.push(DnType::OrganizationName, "LPM");
     params.distinguished_name = dn;
 
-    // CA-specific settings
+    // `Constrained(0)` forbids this CA from signing intermediates that themselves issue.
     params.is_ca = IsCa::Ca(BasicConstraints::Constrained(0));
     params.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
 
-    // 10-year validity
+    if opts.name_constraints {
+        params.name_constraints = Some(NameConstraints {
+            permitted_subtrees: permitted_subtrees(),
+            excluded_subtrees: vec![],
+        });
+    }
+
     let now = OffsetDateTime::now_utc();
     params.not_before = now;
-    params.not_after = now + Duration::days(3650);
+    params.not_after = now + Duration::days(CA_VALIDITY_DAYS);
 
-    // Generate ECDSA P-256 key pair
     let key_pair = KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256)?;
-
-    // Self-sign the CA certificate
     let cert = params.self_signed(&key_pair)?;
 
     Ok((cert.pem(), key_pair.serialize_pem()))
@@ -44,7 +146,7 @@ mod tests {
 
     #[test]
     fn generate_ca_produces_valid_pem() {
-        let (cert_pem, key_pem) = generate_ca().unwrap();
+        let (cert_pem, key_pem) = generate_ca_with_options(CaOptions::default()).unwrap();
 
         assert!(cert_pem.starts_with("-----BEGIN CERTIFICATE-----"));
         assert!(cert_pem.ends_with("-----END CERTIFICATE-----\n"));
@@ -54,17 +156,14 @@ mod tests {
 
     #[test]
     fn ca_cert_is_parseable() {
-        let (cert_pem, _) = generate_ca().unwrap();
+        let (cert_pem, _) = generate_ca_with_options(CaOptions::default()).unwrap();
 
-        // Parse with x509-parser to verify it's a valid CA
         let pem = pem::parse(&cert_pem).unwrap();
         let (_, cert) = x509_parser::parse_x509_certificate(pem.contents()).unwrap();
 
-        // Verify it's a CA
         let bc = cert.basic_constraints().unwrap().unwrap();
         assert!(bc.value.ca);
 
-        // Verify the subject CN
         let cn = cert
             .subject()
             .iter_common_name()
@@ -77,7 +176,7 @@ mod tests {
 
     #[test]
     fn ca_cert_has_path_length_constraint_zero() {
-        let (cert_pem, _) = generate_ca().unwrap();
+        let (cert_pem, _) = generate_ca_with_options(CaOptions::default()).unwrap();
 
         let pem = pem::parse(&cert_pem).unwrap();
         let (_, cert) = x509_parser::parse_x509_certificate(pem.contents()).unwrap();
@@ -92,8 +191,8 @@ mod tests {
     }
 
     #[test]
-    fn ca_cert_has_10_year_validity() {
-        let (cert_pem, _) = generate_ca().unwrap();
+    fn ca_cert_has_825_day_validity() {
+        let (cert_pem, _) = generate_ca_with_options(CaOptions::default()).unwrap();
 
         let pem = pem::parse(&cert_pem).unwrap();
         let (_, cert) = x509_parser::parse_x509_certificate(pem.contents()).unwrap();
@@ -101,12 +200,130 @@ mod tests {
         let not_before = cert.validity().not_before.to_datetime();
         let not_after = cert.validity().not_after.to_datetime();
 
-        // Should be approximately 10 years (3650 days)
-        let duration = not_after - not_before;
-        let days = duration.whole_days();
+        let days = (not_after - not_before).whole_days();
         assert!(
-            (3649..=3651).contains(&days),
-            "expected ~3650 days, got {days}"
+            (824..=826).contains(&days),
+            "expected ~825 days, got {days}"
         );
+    }
+
+    #[test]
+    fn ca_cert_has_no_name_constraints_by_default() {
+        let (cert_pem, _) = generate_ca_with_options(CaOptions {
+            name_constraints: false,
+        })
+        .unwrap();
+
+        let pem = pem::parse(&cert_pem).unwrap();
+        let (_, cert) = x509_parser::parse_x509_certificate(pem.contents()).unwrap();
+
+        assert!(
+            cert.name_constraints().unwrap().is_none(),
+            "default build (flag off) must not emit NameConstraints"
+        );
+    }
+
+    #[test]
+    fn ca_cert_has_name_constraints_when_opted_in() {
+        let (cert_pem, _) = generate_ca_with_options(CaOptions {
+            name_constraints: true,
+        })
+        .unwrap();
+
+        let pem = pem::parse(&cert_pem).unwrap();
+        let (_, cert) = x509_parser::parse_x509_certificate(pem.contents()).unwrap();
+
+        let nc_ext = cert
+            .name_constraints()
+            .unwrap()
+            .expect("name_constraints extension must be present when flag is on");
+
+        let permitted = nc_ext
+            .value
+            .permitted_subtrees
+            .as_ref()
+            .expect("permitted_subtrees must be present");
+        assert!(
+            !permitted.is_empty(),
+            "permitted_subtrees must not be empty"
+        );
+
+        let dns_names: Vec<String> = permitted
+            .iter()
+            .filter_map(|s| match &s.base {
+                x509_parser::extensions::GeneralName::DNSName(name) => Some(name.to_string()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            dns_names.iter().any(|d| d == "localhost"),
+            "expected bare `localhost` subtree, got {dns_names:?}"
+        );
+        assert!(
+            dns_names.iter().any(|d| d == ".localhost"),
+            "expected leading-dot `.localhost` subtree, got {dns_names:?}"
+        );
+        assert!(
+            dns_names.iter().any(|d| d == ".local"),
+            "expected `.local` subtree, got {dns_names:?}"
+        );
+        assert!(
+            dns_names.iter().any(|d| d == ".test"),
+            "expected `.test` subtree, got {dns_names:?}"
+        );
+
+        let has_ip_subtree = permitted
+            .iter()
+            .any(|s| matches!(s.base, x509_parser::extensions::GeneralName::IPAddress(_)));
+        assert!(
+            has_ip_subtree,
+            "expected at least one IP-address permitted subtree"
+        );
+    }
+
+    #[test]
+    fn ca_cert_name_constraints_is_critical_when_opted_in() {
+        let (cert_pem, _) = generate_ca_with_options(CaOptions {
+            name_constraints: true,
+        })
+        .unwrap();
+
+        let pem = pem::parse(&cert_pem).unwrap();
+        let (_, cert) = x509_parser::parse_x509_certificate(pem.contents()).unwrap();
+
+        let nc_ext = cert
+            .name_constraints()
+            .unwrap()
+            .expect("name_constraints extension required");
+        assert!(
+            nc_ext.critical,
+            "RFC 5280 §4.2.1.10: NameConstraints SHOULD be marked critical so non-honoring clients reject the chain"
+        );
+    }
+
+    #[test]
+    fn cert_has_name_constraints_returns_false_for_unconstrained_ca() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rootCA.pem");
+        let (cert_pem, _) = generate_ca_with_options(CaOptions {
+            name_constraints: false,
+        })
+        .unwrap();
+        std::fs::write(&path, &cert_pem).unwrap();
+
+        assert!(!cert_has_name_constraints(&path).unwrap());
+    }
+
+    #[test]
+    fn cert_has_name_constraints_returns_true_for_constrained_ca() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rootCA.pem");
+        let (cert_pem, _) = generate_ca_with_options(CaOptions {
+            name_constraints: true,
+        })
+        .unwrap();
+        std::fs::write(&path, &cert_pem).unwrap();
+
+        assert!(cert_has_name_constraints(&path).unwrap());
     }
 }

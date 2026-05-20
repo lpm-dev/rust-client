@@ -76,7 +76,7 @@ fn detect_version(path: &Path, kind: SourceKind) -> Result<u32, LpmError> {
         SourceKind::Npm => detect_npm_version(path),
         SourceKind::Yarn => detect_yarn_version(path),
         SourceKind::Pnpm => detect_pnpm_version(path),
-        SourceKind::Bun => detect_bun_version(path),
+        SourceKind::Bun => Ok(detect_bun_version(path)),
     }
 }
 
@@ -152,12 +152,12 @@ fn detect_pnpm_version(path: &Path) -> Result<u32, LpmError> {
 
 /// bun: version is determined by the extension.
 /// `.lockb` = binary format (pre-1.2), `.lock` = JSON format (1.2+).
-fn detect_bun_version(path: &Path) -> Result<u32, LpmError> {
+fn detect_bun_version(path: &Path) -> u32 {
     let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
     match ext {
-        "lockb" => Ok(0), // Binary format
-        "lock" => Ok(1),  // JSON text format
-        _ => Ok(0),
+        "lockb" => 0, // Binary format
+        "lock" => 1,  // JSON text format
+        _ => 0,
     }
 }
 

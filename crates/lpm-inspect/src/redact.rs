@@ -222,8 +222,7 @@ fn redact_string(input: &str, rules: &RedactionRules, report: &mut RedactionRepo
             let after_prefix = pos + prefix.len();
             let key_end = result[after_prefix..]
                 .find(|c: char| !c.is_alphanumeric() && c != '_' && c != '-' && c != '.')
-                .map(|p| after_prefix + p)
-                .unwrap_or(result.len());
+                .map_or(result.len(), |p| after_prefix + p);
 
             let key_type = categorize_key_prefix(prefix);
             result.replace_range(key_start..key_end, &format!("[REDACTED:{key_type}]"));

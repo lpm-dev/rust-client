@@ -146,10 +146,7 @@ async fn offline_install_capability_round_trip_end_to_end() {
     )
     .expect("build-state.json parses");
     assert_eq!(
-        bs["blocked_packages"]
-            .as_array()
-            .map(|a| a.len())
-            .unwrap_or(0),
+        bs["blocked_packages"].as_array().map_or(0, |a| a.len()),
         1,
         "initial install should block the unapproved scripted package: {bs:#}"
     );
@@ -291,10 +288,7 @@ async fn offline_install_capability_round_trip_end_to_end() {
     let bs: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(&bs_path).unwrap()).unwrap();
     assert_eq!(
-        bs["blocked_packages"]
-            .as_array()
-            .map(|a| a.len())
-            .unwrap_or(0),
+        bs["blocked_packages"].as_array().map_or(0, |a| a.len()),
         0,
         "after approve-scripts persisted the capabilityHash, the next \
          offline install's blocked set must be empty — proves the \

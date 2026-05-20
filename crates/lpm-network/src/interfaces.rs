@@ -43,7 +43,7 @@ pub fn get_network_addresses() -> Result<Vec<NetworkAddress>, String> {
         })
         .map(|iface| {
             let ip = iface.ip();
-            let name = iface.name.clone();
+            let name = iface.name;
             let iface_type = classify_interface(&name, &ip);
             let is_ipv6 = ip.is_ipv6();
 

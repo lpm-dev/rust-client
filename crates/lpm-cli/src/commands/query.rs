@@ -82,9 +82,9 @@ pub async fn run(
         // because the Some(store) branch always took priority.
         let lpm_root_outer = lpm_common::LpmRoot::from_env()?;
         let lock_path = lpm_root_outer.store_lock();
-        let lpm_root_inner = lpm_root_outer.clone();
+        let lpm_root_inner = lpm_root_outer;
         lpm_common::with_shared_lock(lock_path, || {
-            let inv = PackageInventory::from_discovery(pre_discovery)?;
+            let inv = PackageInventory::from_discovery(pre_discovery);
             for pkg in &inv.discovery.packages {
                 let pkg_dir = lpm_store::find_installed_package_baseline(
                     &lpm_root_inner,
@@ -93,8 +93,10 @@ pub async fn run(
                 )
                 .ok()
                 .flatten()
-                .map(|b| b.package_dir)
-                .unwrap_or_else(|| inv.discovery.project_root.join(&pkg.path));
+                .map_or_else(
+                    || inv.discovery.project_root.join(&pkg.path),
+                    |b| b.package_dir,
+                );
                 let key = if use_path_keys {
                     pkg.path.clone()
                 } else {
@@ -106,7 +108,7 @@ pub async fn run(
             Ok(inv)
         })?
     } else {
-        let inv = PackageInventory::from_discovery(pre_discovery)?;
+        let inv = PackageInventory::from_discovery(pre_discovery);
         for pkg in &inv.discovery.packages {
             let pkg_dir = inv.discovery.project_root.join(&pkg.path);
             let key = pkg.path.clone();
@@ -207,7 +209,8 @@ pub async fn run(
 
     // Count mode — show tag counts grouped by severity
     if count_mode {
-        return run_count_mode(&pkg_contexts, json_output);
+        run_count_mode(&pkg_contexts, json_output);
+        return Ok(());
     }
 
     // Selector mode — filter packages by selector
@@ -306,7 +309,8 @@ pub async fn run(
     // Output — Mermaid format
     if format == "mermaid" {
         if let Some(ref lf) = lockfile {
-            return output_mermaid(&matched, &lf.packages, selector_str);
+            output_mermaid(&matched, &lf.packages, selector_str);
+            return Ok(());
         }
         // For npm projects, Mermaid output is not yet supported
         // (would need to build edges from DiscoveredPackage deps)
@@ -410,7 +414,7 @@ pub async fn run(
 }
 
 /// Count mode: show tag counts for all packages, grouped by severity tier.
-fn run_count_mode(packages: &[PackageContext<'_>], json_output: bool) -> Result<(), LpmError> {
+fn run_count_mode(packages: &[PackageContext<'_>], json_output: bool) {
     let counts = count_all_tags(packages);
 
     if json_output {
@@ -430,7 +434,7 @@ fn run_count_mode(packages: &[PackageContext<'_>], json_output: bool) -> Result<
             serde_json::to_string_pretty(&serde_json::Value::Object(json_obj))
                 .unwrap_or_else(|_| "{}".into())
         );
-        return Ok(());
+        return;
     }
 
     println!(
@@ -442,16 +446,10 @@ fn run_count_mode(packages: &[PackageContext<'_>], json_output: bool) -> Result<
     // Group by severity
     #[allow(clippy::type_complexity)]
     let tiers: [(Severity, &str, fn(&str) -> String); 4] = [
-        (Severity::Critical, "Critical", |s: &str| {
-            s.red().bold().to_string()
-        }),
-        (Severity::High, "High", |s: &str| {
-            s.yellow().bold().to_string()
-        }),
-        (Severity::Medium, "Medium", |s: &str| {
-            s.cyan().bold().to_string()
-        }),
-        (Severity::Info, "Info", |s: &str| s.dimmed().to_string()),
+        (Severity::Critical, "Critical", |s: &str| s.red().bold()),
+        (Severity::High, "High", |s: &str| s.yellow().bold()),
+        (Severity::Medium, "Medium", |s: &str| s.cyan().bold()),
+        (Severity::Info, "Info", |s: &str| s.dimmed()),
     ];
 
     for (severity, label, colorize) in &tiers {
@@ -485,8 +483,6 @@ fn run_count_mode(packages: &[PackageContext<'_>], json_output: bool) -> Result<
         }
         println!();
     }
-
-    Ok(())
 }
 
 /// Collect active tag names from a package analysis (for verbose output).
@@ -623,7 +619,7 @@ fn output_mermaid(
     matched: &[&PackageContext<'_>],
     all_packages: &[lpm_lockfile::LockedPackage],
     selector_str: &str,
-) -> Result<(), LpmError> {
+) {
     use std::collections::HashSet;
 
     let matched_names: HashSet<&str> = matched.iter().map(|p| p.name).collect();
@@ -665,8 +661,6 @@ fn output_mermaid(
         let ids: Vec<String> = matched.iter().map(|p| sanitize(p.name)).collect();
         println!("    style {} fill:#f96,stroke:#333", ids.join(","));
     }
-
-    Ok(())
 }
 
 /// Query OSV.dev for vulnerabilities given `(name, version)` pairs.

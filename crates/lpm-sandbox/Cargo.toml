@@ -110,3 +110,6 @@ assert_cmd = "2"
 [[bench]]
 name = "sandbox_spawn"
 harness = false
+
+[lints]
+workspace = true

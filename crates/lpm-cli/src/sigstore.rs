@@ -264,9 +264,9 @@ pub struct TlogEntry {
 }
 
 // Consumers of these accessors land alongside the install-time
-// verifier (Phase 1.6+); the schema bump is a precondition that ships
-// ahead of the verifier so the data model is in place when verifier
-// code wires in. `#[allow(dead_code)]` matches the pattern used for
+// verifier; the schema bump is a precondition that ships ahead of the
+// verifier so the data model is in place when verifier code wires in.
+// `#[allow(dead_code)]` matches the pattern used for
 // the M2 SPKI pin slots — declared up front, consumed in a follow-up.
 #[allow(dead_code)]
 impl TlogEntry {
@@ -558,7 +558,7 @@ async fn fulcio_get_certificate(
             // first-class detached-SCT field, so any bundle built from
             // such a response would be signed-but-unverifiable at
             // install time (the install-side verifier requires embedded
-            // SCTs per Phase 1.4). Reject loudly instead of building an
+            // SCTs per spec). Reject loudly instead of building an
             // unverifiable bundle.
             let result: serde_json::Value = serde_json::from_str(&response_text)
                 .map_err(|e| LpmError::Registry(format!("Fulcio response parse error: {e}")))?;
@@ -1212,7 +1212,7 @@ mod tests {
 
     #[tokio::test]
     async fn fulcio_rejects_detached_sct_response_because_bundle_cannot_persist_scts() {
-        // Phase 1.4 hygiene: a Fulcio response carrying the legacy
+        // hygiene: a Fulcio response carrying the legacy
         // `signedCertificateDetachedSct` variant returns the cert
         // chain plus a separate `signedCertificateTimestamp`, but the
         // Sigstore Bundle v0.3 spec has no first-class detached-SCT

@@ -758,10 +758,7 @@ async fn add_simple_yes_without_path_errors_and_does_not_mutate_manifest() {
 
     let manifest: serde_json::Value =
         serde_json::from_str(&project.read_file("package.json")).unwrap();
-    let dep_count = manifest["dependencies"]
-        .as_object()
-        .map(|o| o.len())
-        .unwrap_or(0);
+    let dep_count = manifest["dependencies"].as_object().map_or(0, |o| o.len());
     assert_eq!(
         dep_count, 0,
         "guard must fire BEFORE any package.json mutation; got {dep_count} deps"
@@ -788,10 +785,7 @@ async fn add_simple_json_without_path_errors_and_does_not_mutate_manifest() {
 
     let manifest: serde_json::Value =
         serde_json::from_str(&project.read_file("package.json")).unwrap();
-    let dep_count = manifest["dependencies"]
-        .as_object()
-        .map(|o| o.len())
-        .unwrap_or(0);
+    let dep_count = manifest["dependencies"].as_object().map_or(0, |o| o.len());
     assert_eq!(dep_count, 0);
 }
 
@@ -815,10 +809,7 @@ async fn add_simple_no_tty_without_path_errors_and_does_not_mutate_manifest() {
 
     let manifest: serde_json::Value =
         serde_json::from_str(&project.read_file("package.json")).unwrap();
-    let dep_count = manifest["dependencies"]
-        .as_object()
-        .map(|o| o.len())
-        .unwrap_or(0);
+    let dep_count = manifest["dependencies"].as_object().map_or(0, |o| o.len());
     assert_eq!(dep_count, 0);
 }
 
@@ -915,10 +906,7 @@ async fn add_simple_npm_pkg_copies_files_and_surfaces_bare_imports() {
     //    the tarball's `dependencies` (60.1 dep gate).
     let manifest: serde_json::Value =
         serde_json::from_str(&project.read_file("package.json")).unwrap();
-    let dep_count = manifest["dependencies"]
-        .as_object()
-        .map(|o| o.len())
-        .unwrap_or(0);
+    let dep_count = manifest["dependencies"].as_object().map_or(0, |o| o.len());
     assert_eq!(
         dep_count, 0,
         "simple path must not auto-install deps; got {dep_count} entries"

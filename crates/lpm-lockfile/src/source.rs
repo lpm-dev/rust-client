@@ -142,7 +142,7 @@ impl Source {
         // No known prefix matched. Surface the user-typed kind for
         // a clearer error message; everything before the first '+'
         // (or the whole string if there's no '+') is what they wrote.
-        let kind = s.split_once('+').map(|(k, _)| k).unwrap_or(s);
+        let kind = s.split_once('+').map_or(s, |(k, _)| k);
         Err(SourceParseError::UnknownKind(kind.to_string()))
     }
 }

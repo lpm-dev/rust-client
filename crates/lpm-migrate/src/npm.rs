@@ -28,14 +28,14 @@ pub fn parse_str(content: &str, lockfile_version: u32) -> Result<Vec<MigratedPac
 
     // v2 and v3 both have "packages" — prefer it over "dependencies"
     if let Some(packages) = json.get("packages").and_then(|p| p.as_object()) {
-        return parse_packages_block(packages);
+        return Ok(parse_packages_block(packages));
     }
 
     // v1 fallback: use "dependencies" block
     if lockfile_version <= 1
         && let Some(deps) = json.get("dependencies").and_then(|d| d.as_object())
     {
-        return parse_dependencies_block(deps);
+        return Ok(parse_dependencies_block(deps));
     }
 
     Err(LpmError::Script(
@@ -86,9 +86,7 @@ fn extract_name_from_key(key: &str) -> Option<String> {
 }
 
 /// Parse the v2/v3 `packages` block.
-fn parse_packages_block(
-    packages: &serde_json::Map<String, Value>,
-) -> Result<Vec<MigratedPackage>, LpmError> {
+fn parse_packages_block(packages: &serde_json::Map<String, Value>) -> Vec<MigratedPackage> {
     // First pass: collect all entries and build name → version lookup
     let mut entries = Vec::with_capacity(packages.len());
     // name → version (shallowest nesting level preferred)
@@ -225,7 +223,7 @@ fn parse_packages_block(
     // Sort by name then version for deterministic output
     result.sort_by(|a, b| a.name.cmp(&b.name).then_with(|| a.version.cmp(&b.version)));
 
-    Ok(result)
+    result
 }
 
 /// Resolve a dependency's exact version using npm's node_modules resolution algorithm.
@@ -276,9 +274,7 @@ fn resolve_dependency_version(
 }
 
 /// Parse the v1 `dependencies` block (nested tree format).
-fn parse_dependencies_block(
-    deps: &serde_json::Map<String, Value>,
-) -> Result<Vec<MigratedPackage>, LpmError> {
+fn parse_dependencies_block(deps: &serde_json::Map<String, Value>) -> Vec<MigratedPackage> {
     let mut result = Vec::new();
     // First pass: collect all packages for version lookup
     let mut version_lookup: HashMap<String, String> = HashMap::new();
@@ -290,7 +286,7 @@ fn parse_dependencies_block(
     // Sort by name then version for deterministic output
     result.sort_by(|a, b| a.name.cmp(&b.name).then_with(|| a.version.cmp(&b.version)));
 
-    Ok(result)
+    result
 }
 
 /// Maximum nesting depth for v1 recursive parsing.
@@ -851,8 +847,7 @@ mod tests {
         assert!(vitest.is_dev);
 
         // Two debug packages exist
-        let debugs: Vec<_> = result.iter().filter(|p| p.name == "debug").collect();
-        assert_eq!(debugs.len(), 2);
+        assert_eq!(result.iter().filter(|p| p.name == "debug").count(), 2);
 
         // All packages have integrity
         assert!(result.iter().all(|p| p.integrity.is_some()));

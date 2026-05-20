@@ -348,7 +348,7 @@ async fn plan_upgrade(
         &new_version,
         SaveFlags::default(),
         SaveConfig::default(),
-    )?
+    )
     .spec_to_write;
 
     // Snapshot the active row up-front. Both the Upgrade and

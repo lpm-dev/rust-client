@@ -233,7 +233,7 @@ pub async fn run(
              Install it as a project dep with `lpm install {name_safe}` and `require()`/`import` it."
         )));
     }
-    let marker = InstallReadyMarker::new(commands.clone());
+    let marker = InstallReadyMarker::new(commands);
     write_marker(&prep.install_root, &marker)?;
 
     // ─── Step 3a: TTY interactive prompt ───────────────────
@@ -359,7 +359,7 @@ async fn pre_resolve(registry: &RegistryClient, spec: &str) -> Result<ResolvedSp
         &version,
         SaveFlags::default(),
         SaveConfig::default(),
-    )?;
+    );
 
     Ok(ResolvedSpec {
         name,
@@ -747,7 +747,7 @@ fn commit_locked(
         // passing through unchanged.
         ResolutionPlan {
             ownership_delta: Vec::new(),
-            final_commands: marker_commands.clone(),
+            final_commands: marker_commands,
             alias_rows_to_write: BTreeMap::new(),
             aliases_to_remove: Vec::new(),
             shim_removals: Vec::new(),
@@ -3393,7 +3393,7 @@ mod tests {
             saved_spec: "^1".into(),
             integrity: "sha512-x".into(),
             source: PackageSource::LpmDev,
-            install_root: install_root.clone(),
+            install_root,
             install_root_relative: "installs/foo@1.0.0".into(),
         };
 

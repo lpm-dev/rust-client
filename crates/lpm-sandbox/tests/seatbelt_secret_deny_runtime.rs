@@ -5,14 +5,12 @@
 //! reads. Pins SBPL last-match-wins semantics for the
 //! `(deny file-read* ...)` block emitted by
 //! [`seatbelt::render_secret_denies`].
-//!
 //! Sibling of [`seccomp_socket_deny.rs`] — runs the sandbox
 //! backend end-to-end (real `sandbox-exec` invocation) rather
 //! than asserting profile-string shape. Catches a regression
 //! where the rendered profile parses cleanly but doesn't fire
 //! at enforcement time (Apple SBPL `#"..."` regex semantics,
 //! literal canonicalisation, etc.).
-//!
 //! macOS-only: Linux has no `sandbox-exec` analogue; the Linux
 //! equivalent of this contract lives in
 //! [`secret_overlay_bind_mount.rs`].
@@ -33,9 +31,7 @@ use std::path::{Path, PathBuf};
 /// render time.
 fn fixture_spec(project_dir: &Path) -> SandboxSpec {
     let home = dirs::home_dir().expect("home dir for test");
-    let tmp = std::env::var_os("TMPDIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("/tmp"));
+    let tmp = std::env::var_os("TMPDIR").map_or_else(|| PathBuf::from("/tmp"), PathBuf::from);
     SandboxSpec {
         package_dir: home.join(".lpm/store/testpkg@0.1.0"),
         project_dir: project_dir.to_path_buf(),
@@ -207,7 +203,7 @@ fn seatbelt_does_not_deny_non_secret_project_files_at_runtime() {
     );
 }
 
-/// Phase 3 opt-in: when the user lists `.env` in
+/// opt-in: when the user lists `.env` in
 /// `secret_read_allow`, the allow-override block emitted after
 /// the deny restores read access. End-to-end gate that the
 /// override mechanism actually works at the kernel layer (not

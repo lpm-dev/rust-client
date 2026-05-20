@@ -211,7 +211,7 @@ impl Specifier {
         // like a semver operator or version (`>=1.0/2.0` is not a
         // GitHub repo handle).
         if looks_like_github_shorthand(s) {
-            return expand_github_shorthand(s);
+            return Ok(expand_github_shorthand(s));
         }
 
         // Defaults-fixes #2: catch colon-shaped protocol prefixes that
@@ -484,7 +484,7 @@ fn looks_like_github_shorthand(s: &str) -> bool {
     // Bare `user/repo[#ref]` — `is_user_repo_shape` plus a
     // bad-leading-char check to keep `>=1.0/2.0` from being
     // misclassified as a github handle.
-    let head = s.split_once('#').map(|(h, _)| h).unwrap_or(s);
+    let head = s.split_once('#').map_or(s, |(h, _)| h);
     let bad_lead = matches!(
         head.chars().next(),
         Some('@' | '>' | '<' | '=' | '~' | '^' | '.' | '/')
@@ -495,16 +495,16 @@ fn looks_like_github_shorthand(s: &str) -> bool {
     is_user_repo_shape(head)
 }
 
-fn expand_github_shorthand(s: &str) -> Result<Specifier, SpecifierParseError> {
+fn expand_github_shorthand(s: &str) -> Specifier {
     // Pre-validated by looks_like_github_shorthand; this is the
     // expansion step. Strip `.git` before re-adding so an input of
     // `foo/bar.git` doesn't canonicalize to `foo/bar.git.git`.
     let (path, refspec) = split_at_hash(s);
     let canonical_path = strip_dot_git(path);
-    Ok(Specifier::Git {
+    Specifier::Git {
         url: format!("git+https://github.com/{canonical_path}.git"),
         refspec,
-    })
+    }
 }
 
 /// Strip a trailing `.git` if present. Used during host-shorthand

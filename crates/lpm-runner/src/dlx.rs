@@ -79,7 +79,7 @@ pub fn sweep_stale_dlx_entries(root: &LpmRoot, ttl_secs: u64) -> Result<usize, L
 
         // We only sweep cache dirs — skip files, symlinks, and anything
         // that isn't a regular directory at the top level.
-        if !entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+        if !entry.file_type().is_ok_and(|t| t.is_dir()) {
             continue;
         }
 
@@ -442,7 +442,7 @@ pub fn exec_dlx_binary(
             use std::os::unix::process::ExitStatusExt;
             status
                 .code()
-                .unwrap_or_else(|| status.signal().map(|s| 128 + s).unwrap_or(1))
+                .unwrap_or_else(|| status.signal().map_or(1, |s| 128 + s))
         };
         return Err(LpmError::ExitCode(code));
     }
@@ -796,11 +796,7 @@ mod tests {
         std::fs::create_dir_all(&bin_dir).unwrap();
 
         let cmd = build_dlx_command(dir.path(), &cache_dir, "cowsay", &[]);
-        let args: Vec<String> = cmd
-            .get_args()
-            .map(|a| a.to_string_lossy().to_string())
-            .collect();
-        assert!(args.is_empty(), "should have no args");
+        assert!(cmd.get_args().next().is_none(), "should have no args");
     }
 
     #[test]

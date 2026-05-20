@@ -92,9 +92,13 @@ pub async fn run(
             verbose,
         } => run_list_outdated(client, &root, &manifest, verbose, json_output).await,
         GlobalCmd::List { outdated, verbose } => {
-            run_list(&root, &manifest, outdated, verbose, json_output)
+            run_list(&root, &manifest, outdated, verbose, json_output);
+            Ok(())
         }
-        GlobalCmd::Bin => run_bin(&root, json_output),
+        GlobalCmd::Bin => {
+            run_bin(&root, json_output);
+            Ok(())
+        }
         GlobalCmd::Path { package } => run_path(&root, &manifest, &package, json_output),
         // `lpm global remove` and `lpm uninstall -g` are two surfaces
         // for the same operation. Both route through the
@@ -117,7 +121,7 @@ fn run_list(
     _outdated: bool,
     verbose: bool,
     json_output: bool,
-) -> Result<(), LpmError> {
+) {
     // `outdated == true` is routed through `run_list_outdated` in the
     // dispatch match — this function only sees the non-outdated path.
     if json_output {
@@ -125,7 +129,6 @@ fn run_list(
     } else {
         emit_list_human(root, manifest, verbose);
     }
-    Ok(())
 }
 
 // ─── lpm global list --outdated ─────────────────────────────────
@@ -579,7 +582,7 @@ fn enrich_commands(pkg_name: &str, entry: &PackageEntry, manifest: &GlobalManife
 
 // ─── bin ───────────────────────────────────────────────────────────────
 
-fn run_bin(root: &LpmRoot, json_output: bool) -> Result<(), LpmError> {
+fn run_bin(root: &LpmRoot, json_output: bool) {
     let path = root.bin_dir();
     if json_output {
         println!(
@@ -593,7 +596,6 @@ fn run_bin(root: &LpmRoot, json_output: bool) -> Result<(), LpmError> {
     } else {
         println!("{}", path.display());
     }
-    Ok(())
 }
 
 // ─── path ──────────────────────────────────────────────────────────────

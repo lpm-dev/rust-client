@@ -76,9 +76,8 @@ pub fn link_local_package(
 
     if existing_ref.is_some() && existing_product.is_some() {
         // Find target name for the result
-        let target_name = find_main_app_target(&content)
-            .map(|(_, name)| name)
-            .unwrap_or_else(|| "Unknown".to_string());
+        let target_name =
+            find_main_app_target(&content).map_or_else(|| "Unknown".to_string(), |(_, name)| name);
 
         return Ok(XcodeLinkResult {
             package_ref_added: false,
@@ -170,7 +169,7 @@ fn find_existing_local_pkg_ref(content: &str, relative_path: &str) -> Option<Str
     let pattern_pos = content.find(&pattern)?;
     let block_start = content[..pattern_pos].rfind('\n')?;
     let before_block = &content[..block_start];
-    let id_line_start = before_block.rfind('\n').map(|i| i + 1).unwrap_or(0);
+    let id_line_start = before_block.rfind('\n').map_or(0, |i| i + 1);
     let id_line = &content[id_line_start..block_start];
     extract_object_id(id_line)
 }
@@ -230,7 +229,7 @@ fn find_main_app_target(content: &str) -> Option<(String, String)> {
             && trimmed.contains("com.apple.product-type.application")
             && !current_id.is_empty()
         {
-            return Some((current_id.clone(), current_name.clone()));
+            return Some((current_id, current_name));
         }
     }
 
@@ -371,8 +370,7 @@ fn insert_in_section_or_create(
     // Find the start of the line
     let line_start = content[..insert_before]
         .rfind('\n')
-        .map(|i| i + 1)
-        .unwrap_or(insert_before);
+        .map_or(insert_before, |i| i + 1);
 
     let section_block = format!(
         "\n/* Begin {section_name} section */\n\
@@ -402,9 +400,8 @@ fn insert_in_array_property(
 
     // Find the property within the object
     let search_from = obj_start;
-    let obj_block_end = find_block_end(&content[search_from..])
-        .map(|i| search_from + i)
-        .unwrap_or(content.len());
+    let obj_block_end =
+        find_block_end(&content[search_from..]).map_or(content.len(), |i| search_from + i);
 
     let prop_pattern = format!("{property_name} = (");
     let prop_pos = content[search_from..obj_block_end]
@@ -428,8 +425,7 @@ fn insert_in_array_property(
     // Insert before the closing )
     let close_line_start = content[..close_paren]
         .rfind('\n')
-        .map(|i| i + 1)
-        .unwrap_or(close_paren);
+        .map_or(close_paren, |i| i + 1);
 
     let mut result = String::with_capacity(content.len() + value.len() + 2);
     result.push_str(&content[..close_line_start]);
@@ -453,9 +449,8 @@ fn insert_or_create_array_property(
         LpmError::Registry(format!("Could not find object {object_id} in pbxproj"))
     })?;
 
-    let obj_block_end = find_block_end(&content[obj_start..])
-        .map(|i| obj_start + i)
-        .unwrap_or(content.len());
+    let obj_block_end =
+        find_block_end(&content[obj_start..]).map_or(content.len(), |i| obj_start + i);
 
     let prop_pattern = format!("{property_name} = (");
     let has_property = content[obj_start..obj_block_end].contains(&prop_pattern);
@@ -484,15 +479,13 @@ fn insert_or_create_array_property(
         // Fallback: insert before the closing }; of the object
         content[obj_start..obj_block_end]
             .rfind("};")
-            .map(|i| obj_start + i)
-            .unwrap_or(obj_block_end)
+            .map_or(obj_block_end, |i| obj_start + i)
     };
 
     // Find the end of the current line
     let line_end = content[insert_pos..]
         .find('\n')
-        .map(|i| insert_pos + i + 1)
-        .unwrap_or(insert_pos);
+        .map_or(insert_pos, |i| insert_pos + i + 1);
 
     let new_property = format!(
         "\t\t\t{property_name} = (\n\

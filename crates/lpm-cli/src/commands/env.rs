@@ -262,7 +262,8 @@ pub async fn run(
 
     if args.is_empty() {
         // Default: list keys
-        return vars_list(project_dir, None, false, json_output);
+        vars_list(project_dir, None, false, json_output);
+        return Ok(());
     }
 
     match args[0] {
@@ -345,7 +346,7 @@ pub async fn run(
             let (env_input, remaining) = parse_env_flag(&args[1..])?;
             let reveal = remaining.contains(&"--reveal");
             let (resolved_env, _config) = resolve_env_from_flag(env_input, project_dir)?;
-            vars_list(project_dir, resolved_env.as_deref(), reveal, json_output)?;
+            vars_list(project_dir, resolved_env.as_deref(), reveal, json_output);
         }
 
         "delete" => {
@@ -1027,7 +1028,8 @@ pub async fn run(
         }
 
         "ls" => {
-            return vars_ls(project_dir, json_output);
+            vars_ls(project_dir, json_output);
+            return Ok(());
         }
 
         "copy" | "cp" => {
@@ -1062,8 +1064,7 @@ fn vars_example(
     env_input: Option<&str>,
     json_output: bool,
 ) -> Result<(), LpmError> {
-    let config = lpm_runner::lpm_json::read_lpm_json(project_dir)
-        .map_err(|e| LpmError::Script(e.to_string()))?;
+    let config = lpm_runner::lpm_json::read_lpm_json(project_dir).map_err(LpmError::Script)?;
 
     let schema = config
         .as_ref()
@@ -1367,7 +1368,7 @@ fn vars_init(
 /// `lpm env ls` — environment overview table.
 ///
 /// Shows all environments with variable counts, schema status, and aliases.
-fn vars_ls(project_dir: &std::path::Path, json_output: bool) -> Result<(), LpmError> {
+fn vars_ls(project_dir: &std::path::Path, json_output: bool) {
     let config = lpm_runner::lpm_json::read_lpm_json(project_dir)
         .ok()
         .flatten();
@@ -1389,7 +1390,7 @@ fn vars_ls(project_dir: &std::path::Path, json_output: bool) -> Result<(), LpmEr
             output::info("no environments found");
             println!("  Run {} to set up", "lpm env init".cyan());
         }
-        return Ok(());
+        return;
     }
 
     // Build rows
@@ -1459,7 +1460,7 @@ fn vars_ls(project_dir: &std::path::Path, json_output: bool) -> Result<(), LpmEr
             "{}",
             serde_json::json!({"success": true, "environments": json_rows})
         );
-        return Ok(());
+        return;
     }
 
     // Calculate column widths
@@ -1519,8 +1520,6 @@ fn vars_ls(project_dir: &std::path::Path, json_output: bool) -> Result<(), LpmEr
         );
     }
     println!();
-
-    Ok(())
 }
 
 /// `lpm env copy <src> <dst>` — copy all secrets from one environment to another.
@@ -1707,8 +1706,7 @@ fn vars_print(args: &[&str], project_dir: &std::path::Path) -> Result<(), LpmErr
 }
 
 fn vars_check(project_dir: &std::path::Path, json_output: bool) -> Result<(), LpmError> {
-    let config = lpm_runner::lpm_json::read_lpm_json(project_dir)
-        .map_err(|e| LpmError::Script(e.to_string()))?;
+    let config = lpm_runner::lpm_json::read_lpm_json(project_dir).map_err(LpmError::Script)?;
 
     let schema = config
         .and_then(|c| c.env_schema)
@@ -1936,7 +1934,7 @@ async fn vars_connect(
         let environments = config.as_ref().and_then(|c| c.environments.as_ref());
         let resolved = lpm_env::resolver::resolve_checked(env_input, env_map, environments)
             .map_err(|e| LpmError::Script(format!("invalid --linked-env value: {e}")))?;
-        connection_config["linkedEnv"] = serde_json::Value::String(resolved.canonical.clone());
+        connection_config["linkedEnv"] = serde_json::Value::String(resolved.canonical);
     }
 
     output::info(&format!("connecting to {platform}..."));
@@ -2083,11 +2081,11 @@ async fn vars_platform_push(
 
     let diff: serde_json::Value = parse_capped_platform_json(dry_run_response).await?;
 
-    let added = diff["added"].as_array().map(|a| a.len()).unwrap_or(0);
-    let changed = diff["changed"].as_array().map(|a| a.len()).unwrap_or(0);
-    let removed = diff["removed"].as_array().map(|a| a.len()).unwrap_or(0);
+    let added = diff["added"].as_array().map_or(0, |a| a.len());
+    let changed = diff["changed"].as_array().map_or(0, |a| a.len());
+    let removed = diff["removed"].as_array().map_or(0, |a| a.len());
     let unchanged = diff["unchanged"].as_u64().unwrap_or(0);
-    let orphans = diff["orphans"].as_array().map(|a| a.len()).unwrap_or(0);
+    let orphans = diff["orphans"].as_array().map_or(0, |a| a.len());
 
     if added == 0 && changed == 0 && removed == 0 {
         if json_output {
@@ -2339,9 +2337,10 @@ async fn vars_platform_status(
             format!("{name} ({label}){env_suffix}")
         };
 
-        let push_info = last_push
-            .map(|t| format!("  last push: {t}"))
-            .unwrap_or_else(|| "  never pushed".to_string());
+        let push_info = last_push.map_or_else(
+            || "  never pushed".to_string(),
+            |t| format!("  last push: {t}"),
+        );
 
         match status {
             "synced" => {
@@ -2446,16 +2445,16 @@ async fn vars_oidc_allow(
     let mut repo: Option<&str> = None;
     let mut branches: Vec<String> = vec!["main".to_string()];
     let mut envs: Vec<String> = Vec::new();
-    // Phase 3 of plan-security-findings-c3.md — `allowedWorkflows`.
+    // of plan-security-findings-c3.md — `allowedWorkflows`.
     // No default: the server schema is `.min(1)`, and the safe default
     // ".github/workflows/deploy.yml" guesses the user's workflow name
     // (which is almost always wrong). Forcing the user to supply it
     // surfaces the security model.
     let mut workflows: Vec<String> = Vec::new();
-    // Phase 4 — `allowedEvents`. Defaults to push-only — the safest
+    // `allowedEvents`. Defaults to push-only — the safest
     // event for fork-PR exposure. Adding `pull_request_target` to
     // this list also requires `--allow-forks` (cross-field check
-    // enforced server-side in Phase 5.2, gated on JWT fixtures).
+    // enforced server-side, gated on JWT fixtures).
     let mut events: Vec<String> = vec!["push".to_string()];
     let mut allow_forks = false;
 
@@ -2882,9 +2881,9 @@ async fn get_ci_oidc_token() -> Result<String, LpmError> {
 /// Map a server-side error response from `POST /api/vault/oidc` to a
 /// user-facing message with a code-specific remediation hint appended.
 ///
-/// Phase 2 of plan-security-findings-c3.md stamps a stable
+/// of plan-security-findings-c3.md stamps a stable
 /// machine-readable `code` field on every 403/429 from the mint endpoint;
-/// Phase 8 (this CLI side) maps each code to an actionable next step so
+/// (this CLI side) maps each code to an actionable next step so
 /// CI logs surface "what to do" rather than just "what failed."
 ///
 /// Precedence:
@@ -3191,7 +3190,7 @@ fn vars_list(
     env_name: Option<&str>,
     reveal: bool,
     json_output: bool,
-) -> Result<(), LpmError> {
+) {
     let secrets = match env_name {
         Some(env) => lpm_vault::get_all_env(project_dir, env),
         None => lpm_vault::get_all(project_dir),
@@ -3221,8 +3220,6 @@ fn vars_list(
             }
         }
     }
-
-    Ok(())
 }
 
 /// List cloud vaults — personal or org.
@@ -3262,10 +3259,7 @@ async fn vars_list_remote(org_slug: Option<&str>, json_output: bool) -> Result<(
 
         output::info(&format!("Org {} vaults ({})", slug.bold(), vaults.len()));
         for v in &vaults {
-            let version = v
-                .version
-                .map(|v| format!("v{v}"))
-                .unwrap_or_else(|| "v?".into());
+            let version = v.version.map_or_else(|| "v?".into(), |v| format!("v{v}"));
             let updated = v.updated_at.as_deref().unwrap_or("?");
             println!(
                 "  {} {} {} {}",
@@ -3315,10 +3309,7 @@ async fn vars_list_remote(org_slug: Option<&str>, json_output: bool) -> Result<(
 
     output::info(&format!("Cloud vaults ({})", vaults.len()));
     for v in &vaults {
-        let version = v
-            .version
-            .map(|v| format!("v{v}"))
-            .unwrap_or_else(|| "v?".into());
+        let version = v.version.map_or_else(|| "v?".into(), |v| format!("v{v}"));
         let updated = v.updated_at.as_deref().unwrap_or("?");
         println!(
             "  {} {} {} {}",

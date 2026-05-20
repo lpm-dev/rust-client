@@ -422,12 +422,12 @@ impl Store {
         }
 
         let result = match std::fs::rename(&tmp_dir, &object_dir) {
-            Ok(()) => Ok(object_dir.clone()),
+            Ok(()) => Ok(object_dir),
             Err(_) if is_complete_object_dir(&object_dir) => {
                 // Concurrent install populated the same object first —
                 // discard our stage and use theirs.
                 let _ = std::fs::remove_dir_all(&tmp_dir);
-                Ok(object_dir.clone())
+                Ok(object_dir)
             }
             Err(e) => {
                 let _ = std::fs::remove_dir_all(&tmp_dir);
@@ -1508,7 +1508,7 @@ mod tests {
         let key = arc_key("a", "1.0.0");
         let entry = store
             .populate_link_entry(LinkEntryRequest {
-                graph_key: key.clone(),
+                graph_key: key,
                 source_sri: sri.clone(),
                 object_dir,
                 deps: vec![],
@@ -1623,8 +1623,8 @@ mod tests {
 
         let entry = store
             .populate_link_entry(LinkEntryRequest {
-                graph_key: pkg_key.clone(),
-                source_sri: pkg_sri.clone(),
+                graph_key: pkg_key,
+                source_sri: pkg_sri,
                 object_dir: pkg_obj,
                 deps: vec![DepLink {
                     local: "debug".into(),
@@ -1680,8 +1680,8 @@ mod tests {
 
         let entry = store
             .populate_link_entry(LinkEntryRequest {
-                graph_key: pkg_key.clone(),
-                source_sri: pkg_sri.clone(),
+                graph_key: pkg_key,
+                source_sri: pkg_sri,
                 object_dir: pkg_obj,
                 deps: vec![DepLink {
                     local: "@types/node".into(),
@@ -1747,7 +1747,7 @@ mod tests {
         let err = store
             .populate_link_entry(LinkEntryRequest {
                 graph_key: key.clone(),
-                source_sri: sri.clone(),
+                source_sri: sri,
                 object_dir: nonexistent_object,
                 deps: vec![],
                 platform: Arc::new(sample_meta_platform()),
@@ -1806,7 +1806,7 @@ mod tests {
 
         let entry = store
             .populate_link_entry(LinkEntryRequest {
-                graph_key: key.clone(),
+                graph_key: key,
                 source_sri: sri,
                 object_dir,
                 deps: vec![],

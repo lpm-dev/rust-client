@@ -1742,7 +1742,7 @@ mod tests {
         // And the binding produced by persisted_hash must satisfy
         // the enforce-time request via is_approved_by.
         let binding = lpm_workspace::TrustedDependencyBinding {
-            capability_hash: Some(persisted_hash.clone()),
+            capability_hash: Some(persisted_hash),
             ..Default::default()
         };
         assert!(

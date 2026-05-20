@@ -202,9 +202,7 @@ pub async fn run(
         // what the user will get post-upgrade.
         let enrich = |target_version: &str| -> (bool, PeerImpact, Option<PatchInvalidation>) {
             let meta = metadata.version(target_version);
-            let has_scripts = meta
-                .map(upgrade_engine::target_has_install_scripts)
-                .unwrap_or(false);
+            let has_scripts = meta.is_some_and(upgrade_engine::target_has_install_scripts);
             let peer_deps = meta
                 .map(|m| m.peer_dependencies.clone())
                 .unwrap_or_default();
@@ -238,9 +236,8 @@ pub async fn run(
                     continue;
                 }
 
-                let from = installed_ver
-                    .map(str::to_string)
-                    .unwrap_or_else(|| version_from_range(current_range));
+                let from =
+                    installed_ver.map_or_else(|| version_from_range(current_range), str::to_string);
                 let semver_class = upgrade_engine::classify_semver_change(&from, &target_version);
                 let (has_scripts, peer_impact, patch_inv) = enrich(&target_version);
 
@@ -269,9 +266,8 @@ pub async fn run(
                 let (abs_target, abs_range) =
                     compute_upgrade(current_range, &latest, &available_versions, true);
 
-                let from = installed_ver
-                    .map(str::to_string)
-                    .unwrap_or_else(|| version_from_range(current_range));
+                let from =
+                    installed_ver.map_or_else(|| version_from_range(current_range), str::to_string);
 
                 // Emit within-major row if it's a real upgrade
                 if let Some(ref wt) = within_target {
@@ -635,21 +631,21 @@ fn format_candidate_hint(c: &EnrichedCandidate) -> String {
 
 fn format_class_label(class: SemverClass) -> String {
     match class {
-        SemverClass::Patch => "patch".green().to_string(),
-        SemverClass::Minor => "minor".yellow().to_string(),
-        SemverClass::Major => "MAJOR".red().to_string(),
-        SemverClass::Prerelease => "pre".dimmed().to_string(),
-        SemverClass::Unknown => "?".dimmed().to_string(),
+        SemverClass::Patch => "patch".green(),
+        SemverClass::Minor => "minor".yellow(),
+        SemverClass::Major => "MAJOR".red(),
+        SemverClass::Prerelease => "pre".dimmed(),
+        SemverClass::Unknown => "?".dimmed(),
     }
 }
 
 fn format_version_colored(version: &str, class: SemverClass) -> String {
     match class {
-        SemverClass::Patch => version.green().to_string(),
-        SemverClass::Minor => version.yellow().to_string(),
-        SemverClass::Major => version.red().to_string(),
-        SemverClass::Prerelease => version.dimmed().to_string(),
-        SemverClass::Unknown => version.dimmed().to_string(),
+        SemverClass::Patch => version.green(),
+        SemverClass::Minor => version.yellow(),
+        SemverClass::Major => version.red(),
+        SemverClass::Prerelease => version.dimmed(),
+        SemverClass::Unknown => version.dimmed(),
     }
 }
 

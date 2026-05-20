@@ -514,7 +514,7 @@ fn acquire_shared_with_hint(
     let mut on_first_wait = Some(Box::new(on_first_wait) as Box<dyn FnOnce() + Send>);
     let start = std::time::Instant::now();
 
-    // Phase 1: poll the writer-queue baton until no writer is queued.
+    // poll the writer-queue baton until no writer is queued.
     // Re-open the file each iteration — the probe transitions through
     // a brief exclusive grant + immediate release; reusing the same
     // RwLock across iterations would require dropping the prior probe
@@ -535,12 +535,12 @@ fn acquire_shared_with_hint(
         std::thread::sleep(LOCK_POLL_INTERVAL);
     }
 
-    // Phase 2: acquire gate-shared. Uncontended in the steady state.
+    // acquire gate-shared. Uncontended in the steady state.
     let intent_file = open_lock_file(&intent_path)?;
     let mut intent_rw = fd_lock::RwLock::new(intent_file);
     poll_until_acquired(&mut intent_rw, LockMode::Shared, on_first_wait)?;
 
-    // Phase 3: acquire data-shared.
+    // acquire data-shared.
     let data_file = open_lock_file(data_path)?;
     let mut data_rw = fd_lock::RwLock::new(data_file);
     poll_until_acquired(&mut data_rw, LockMode::Shared, None)?;
@@ -570,7 +570,7 @@ fn acquire_exclusive_with_hint(
     let intent_path = writer_intent_path_for(data_path);
     let queue_path = writer_queue_path_for(data_path);
 
-    // Phase 1: take queue-shared. Multiple writers can each hold this
+    // take queue-shared. Multiple writers can each hold this
     // shared simultaneously — that's the point: every queued writer
     // contributes to the "writer is queued" signal readers see.
     let queue_file = open_lock_file(&queue_path)?;
@@ -581,14 +581,14 @@ fn acquire_exclusive_with_hint(
         Some(Box::new(on_first_wait)),
     )?;
 
-    // Phase 2: gate exclusive. Blocks new readers from passing the
+    // gate exclusive. Blocks new readers from passing the
     // gate. Existing in-body readers don't hold the gate so they
     // don't compete here.
     let intent_file = open_lock_file(&intent_path)?;
     let mut intent_rw = fd_lock::RwLock::new(intent_file);
     poll_until_acquired(&mut intent_rw, LockMode::Exclusive, None)?;
 
-    // Phase 3: data exclusive. Wait for in-body readers to release.
+    // data exclusive. Wait for in-body readers to release.
     let data_file = open_lock_file(data_path)?;
     let mut data_rw = fd_lock::RwLock::new(data_file);
     poll_until_acquired(&mut data_rw, LockMode::Exclusive, None)?;
@@ -1327,7 +1327,7 @@ mod tests {
         // Background shared acquire should be blocked while we hold
         // exclusive. We start it and confirm it doesn't complete
         // within a short window.
-        let lock_path_s = lock_path.clone();
+        let lock_path_s = lock_path;
         let shared_done = Arc::new(AtomicUsize::new(0));
         let shared_done_t = shared_done.clone();
         let shared_handle = std::thread::spawn(move || {
@@ -1376,7 +1376,7 @@ mod tests {
         let counter = Arc::new(AtomicUsize::new(0));
         let counter_t = counter.clone();
 
-        let lock_path_s = lock_path.clone();
+        let lock_path_s = lock_path;
         let waiter = std::thread::spawn(move || -> Result<SharedLockHandle, LpmError> {
             acquire_shared_with_hint(&lock_path_s, move || {
                 counter_t.fetch_add(1, Ordering::SeqCst);
@@ -1655,7 +1655,7 @@ mod tests {
         // Step 3: NEW reader arrives. Under the turnstile, it must
         // block at writer-intent (writer holds it exclusive) and
         // NOT acquire ahead of the queued writer.
-        let lock_path_r2 = lock_path.clone();
+        let lock_path_r2 = lock_path;
         let r2_done = Arc::new(AtomicUsize::new(0));
         let r2_done_t = r2_done.clone();
         let r2 = std::thread::spawn(move || {

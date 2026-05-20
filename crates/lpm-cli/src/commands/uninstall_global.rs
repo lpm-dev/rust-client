@@ -242,7 +242,7 @@ fn run_under_lock(root: &LpmRoot, package: &str) -> Result<UninstallOutcome, Lpm
             // transaction is resolved; the user can re-invoke once the
             // holding process dies.
             wal.append(&WalRecord::Abort {
-                tx_id: tx_id.clone(),
+                tx_id,
                 reason: reason.clone(),
                 aborted_at: Utc::now(),
             })?;
@@ -334,7 +334,7 @@ fn run_under_lock(root: &LpmRoot, package: &str) -> Result<UninstallOutcome, Lpm
 
     // ─── Step 5: append WAL Commit ─────────────────────────────────
     wal.append(&WalRecord::Commit {
-        tx_id: tx_id.clone(),
+        tx_id,
         committed_at: Utc::now(),
     })?;
 

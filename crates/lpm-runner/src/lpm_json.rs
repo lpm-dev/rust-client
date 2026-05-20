@@ -65,6 +65,33 @@ pub struct LpmJsonConfig {
     /// e.g., `{"environments": {"staging": {"extends": "base", "file": ".env.staging"}}}`
     #[serde(default)]
     pub environments: Option<EnvironmentsConfig>,
+
+    /// Local-HTTPS certificate configuration.
+    ///
+    /// Currently only `extra_permitted_dns` is honored — and only validated at
+    /// parse time. The validated entries do not yet flow into any CA-generation
+    /// code path; the consumer (project-scoped CA) ships in a follow-up. The
+    /// validator runs now to prevent future code from quietly broadening attack
+    /// surface by treating arbitrary strings from `lpm.json` as trustworthy.
+    #[serde(default)]
+    pub cert: Option<CertBlock>,
+}
+
+/// `cert` configuration block in `lpm.json`.
+#[derive(Debug, Clone, Default, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct CertBlock {
+    /// Additional DNS subtrees the (future) project-scoped CA should be permitted
+    /// to issue for. Each entry must be a bare multi-label hostname. Wildcards,
+    /// leading dots, and non-local TLDs are rejected at parse time.
+    #[serde(default, rename = "extraPermittedDns")]
+    pub extra_permitted_dns: Vec<String>,
+
+    /// Permit non-local TLDs (e.g. `staging.example.com`) in
+    /// `extraPermittedDns`. Off by default — public-internet hostnames widen
+    /// the CA's authority and require explicit opt-in.
+    #[serde(default, rename = "allowPublicDns")]
+    pub allow_public_dns: bool,
 }
 
 /// Tunnel configuration in `lpm.json`.
@@ -354,6 +381,16 @@ pub fn read_lpm_json(project_dir: &Path) -> Result<Option<LpmJsonConfig>, String
     let config: LpmJsonConfig =
         serde_json::from_str(&content).map_err(|e| format!("failed to parse lpm.json: {e}"))?;
 
+    if let Some(ref cert) = config.cert
+        && !cert.extra_permitted_dns.is_empty()
+    {
+        lpm_cert::name_constraints::validate_extra_permitted_dns(
+            &cert.extra_permitted_dns,
+            cert.allow_public_dns,
+        )
+        .map_err(|e| format!("lpm.json `cert.extraPermittedDns` rejected: {e}"))?;
+    }
+
     Ok(Some(config))
 }
 
@@ -398,6 +435,68 @@ mod tests {
     }
 
     #[test]
+    fn read_lpm_json_accepts_valid_cert_extra_permitted_dns() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("lpm.json"),
+            r#"{ "cert": { "extraPermittedDns": ["myapp.local", "api.test"] } }"#,
+        )
+        .unwrap();
+        let cfg = read_lpm_json(dir.path()).unwrap().unwrap();
+        let entries = cfg.cert.expect("cert block parsed").extra_permitted_dns;
+        assert_eq!(
+            entries,
+            vec!["myapp.local".to_string(), "api.test".to_string()]
+        );
+    }
+
+    #[test]
+    fn read_lpm_json_rejects_wildcard_cert_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("lpm.json"),
+            r#"{ "cert": { "extraPermittedDns": ["*.myapp.local"] } }"#,
+        )
+        .unwrap();
+        let err = read_lpm_json(dir.path()).unwrap_err();
+        assert!(
+            err.contains("'*'"),
+            "expected wildcard rejection, got {err}"
+        );
+        assert!(
+            err.contains("cert.extraPermittedDns"),
+            "error should name the offending config key, got {err}"
+        );
+    }
+
+    #[test]
+    fn read_lpm_json_rejects_public_tld_without_allow_flag() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("lpm.json"),
+            r#"{ "cert": { "extraPermittedDns": ["staging.example.com"] } }"#,
+        )
+        .unwrap();
+        let err = read_lpm_json(dir.path()).unwrap_err();
+        assert!(err.contains("non-local TLD"), "got {err}");
+    }
+
+    #[test]
+    fn read_lpm_json_permits_public_tld_with_allow_flag() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("lpm.json"),
+            r#"{ "cert": { "extraPermittedDns": ["staging.example.com"], "allowPublicDns": true } }"#,
+        )
+        .unwrap();
+        let cfg = read_lpm_json(dir.path()).unwrap().unwrap();
+        assert_eq!(
+            cfg.cert.unwrap().extra_permitted_dns,
+            vec!["staging.example.com".to_string()]
+        );
+    }
+
+    #[test]
     fn read_full_lpm_json() {
         let dir = tempfile::tempdir().unwrap();
         fs::write(
@@ -432,6 +531,7 @@ mod tests {
             publish: None,
             env_schema: None,
             environments: None,
+            cert: None,
         };
         assert_eq!(
             resolve_env_mode(&config, "dev"),

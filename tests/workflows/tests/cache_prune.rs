@@ -79,10 +79,7 @@ fn prune_dry_run_with_no_registry_succeeds_without_mutation() {
         "fresh HOME has no known-projects.json; expected registry_missing=true"
     );
     assert_eq!(
-        json["link_entries_orphaned"]
-            .as_array()
-            .map(Vec::len)
-            .unwrap_or(0),
+        json["link_entries_orphaned"].as_array().map_or(0, Vec::len),
         0,
         "no roots means no orphan walk; orphan list must be empty"
     );
@@ -134,18 +131,14 @@ fn prune_apply_with_no_registry_degrades_to_tombstone_only() {
         "no project registry → registry_missing must be true"
     );
     assert_eq!(
-        json["link_entries_orphaned"]
-            .as_array()
-            .map(Vec::len)
-            .unwrap_or(0),
+        json["link_entries_orphaned"].as_array().map_or(0, Vec::len),
         0,
         "registry-missing apply must not delete link entries"
     );
     assert_eq!(
         json["object_entries_orphaned"]
             .as_array()
-            .map(Vec::len)
-            .unwrap_or(0),
+            .map_or(0, Vec::len),
         0,
         "registry-missing apply must not delete objects"
     );
@@ -368,23 +361,18 @@ fn prune_apply_with_corrupt_registry_does_not_wipe_the_store() {
     assert!(
         json["registry_corrupt_reason"]
             .as_str()
-            .map(|s| !s.is_empty())
-            .unwrap_or(false),
+            .is_some_and(|s| !s.is_empty()),
         "registry_corrupt_reason must be a non-empty explanation"
     );
     assert_eq!(
-        json["link_entries_orphaned"]
-            .as_array()
-            .map(Vec::len)
-            .unwrap_or(0),
+        json["link_entries_orphaned"].as_array().map_or(0, Vec::len),
         0,
         "corrupt-registry apply must NOT report link orphans"
     );
     assert_eq!(
         json["object_entries_orphaned"]
             .as_array()
-            .map(Vec::len)
-            .unwrap_or(0),
+            .map_or(0, Vec::len),
         0,
         "corrupt-registry apply must NOT report object orphans"
     );

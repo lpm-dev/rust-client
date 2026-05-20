@@ -355,7 +355,7 @@ fn delete_install_root(abs: &Path) -> Result<u64, String> {
         Err(e) if e.kind() == ErrorKind::NotFound => return Ok(0),
         Err(e) => return Err(format!("stat failed: {e}")),
     }
-    let bytes = dir_size(&extended).unwrap_or(0);
+    let bytes = dir_size(&extended);
     match std::fs::remove_dir_all(&extended) {
         Ok(()) => Ok(bytes),
         Err(e) if e.kind() == ErrorKind::NotFound => Ok(0),
@@ -366,10 +366,10 @@ fn delete_install_root(abs: &Path) -> Result<u64, String> {
 /// Recursive tree size. Tolerant of disappearing entries (race with
 /// another process cleaning up) — missing entries contribute 0 rather
 /// than propagating the error, since this is best-effort accounting.
-fn dir_size(path: &Path) -> std::io::Result<u64> {
+fn dir_size(path: &Path) -> u64 {
     let mut total: u64 = 0;
     let Ok(entries) = std::fs::read_dir(path) else {
-        return Ok(0);
+        return 0;
     };
     for entry in entries.flatten() {
         let ft = match entry.file_type() {
@@ -377,14 +377,14 @@ fn dir_size(path: &Path) -> std::io::Result<u64> {
             Err(_) => continue,
         };
         if ft.is_dir() {
-            total = total.saturating_add(dir_size(&entry.path()).unwrap_or(0));
+            total = total.saturating_add(dir_size(&entry.path()));
         } else if ft.is_file()
             && let Ok(meta) = entry.metadata()
         {
             total = total.saturating_add(meta.len());
         }
     }
-    Ok(total)
+    total
 }
 
 #[cfg(test)]

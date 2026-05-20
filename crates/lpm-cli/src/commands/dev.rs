@@ -1,7 +1,64 @@
 use crate::output;
 use lpm_common::LpmError;
 use lpm_common::color::Painted;
+use std::io::IsTerminal;
 use std::path::Path;
+
+/// Build the consent value for `ensure_https_with_consent` based on the dev flags.
+///
+/// - `--yes` → PreApproved.
+/// - Otherwise → Prompt(callback). The callback enforces the TTY requirement
+///   only when consent is actually needed; if the CA is already trusted, the
+///   callback is never invoked and non-TTY contexts proceed cleanly.
+/// - The callback errors on decline so `lpm dev --https` aborts cleanly instead
+///   of silently continuing with an untrusted cert (which would make the dev
+///   server's HTTPS effectively useless).
+fn build_consent(yes: bool) -> lpm_cert::TrustStoreConsent<'static> {
+    if yes {
+        return lpm_cert::TrustStoreConsent::PreApproved;
+    }
+    lpm_cert::TrustStoreConsent::Prompt(Box::new(|req| {
+        if !std::io::stdin().is_terminal() {
+            return Err(LpmError::Cert(
+                "non-interactive shell: pass `--yes` to consent to the trust-store install, or run `lpm cert trust` first".into(),
+            ));
+        }
+        println!();
+        println!(
+            "  {}",
+            "LPM needs to install a local Certificate Authority into your".bold()
+        );
+        println!(
+            "  {}",
+            "system trust store to serve trusted HTTPS for development.".bold()
+        );
+        println!();
+        println!("    Subject:     LPM Local Development CA");
+        println!("    Fingerprint: {}", req.fingerprint);
+        println!("    Expires:     {}", req.expires);
+        println!("    Permitted:   {}", req.permitted_names.join(", "));
+        if !req.name_constraints_enabled {
+            println!(
+                "    {}",
+                "Note: NameConstraints disabled — set LPM_CERT_NAME_CONSTRAINTS=1 to scope the CA"
+                    .dimmed()
+            );
+        }
+        println!();
+        println!("  You can remove it at any time with `lpm cert uninstall`.");
+        println!();
+        let answer = cliclack::confirm("Install now?")
+            .initial_value(false)
+            .interact()
+            .map_err(crate::prompt::prompt_err)?;
+        if !answer {
+            return Err(LpmError::Cert(
+                "trust-store install declined; aborting `lpm dev --https`. Run `lpm cert trust` when you're ready, or pass `--yes` to skip the prompt.".into(),
+            ));
+        }
+        Ok(true)
+    }))
+}
 
 /// Run the `lpm dev` command with zero-config detection.
 ///
@@ -35,6 +92,8 @@ pub async fn run(
     tunnel_auth: bool,
     no_inspect: bool,
     inspect_port: Option<u16>,
+    yes: bool,
+    allow_ca_bootstrap: bool,
 ) -> Result<(), LpmError> {
     let port = port.unwrap_or(3000);
 
@@ -120,12 +179,12 @@ pub async fn run(
                 let dir = https_dir.clone();
                 let host_clone = host_owned.clone();
                 let net_info = network_info_for_cert;
+                let yes_local = yes;
                 let setup = tokio::task::spawn_blocking(move || {
                     let mut extra_hostnames: Vec<String> = Vec::new();
                     if let Some(h) = host_clone {
                         extra_hostnames.push(h);
                     }
-                    // If network mode, add network IPs to the cert SANs
                     if let Some(ref info) = net_info {
                         for addr in &info.addresses {
                             if !addr.is_ipv6 {
@@ -133,7 +192,8 @@ pub async fn run(
                             }
                         }
                     }
-                    lpm_cert::ensure_https(&dir, &extra_hostnames)
+                    let consent = build_consent(yes_local);
+                    lpm_cert::ensure_https_with_consent(&dir, &extra_hostnames, consent)
                 })
                 .await
                 .map_err(|e| LpmError::Script(format!("HTTPS setup panicked: {e}")))?;
@@ -214,24 +274,30 @@ pub async fn run(
             output::warn(warning);
         }
 
-        // CA install instructions for mobile
-        // Spawn a lightweight CA certificate server on port+1 for mobile device setup.
-        // Serves the root CA at / with the correct content type to trigger the
-        // iOS/Android "install profile" flow.
         if https
             && let Some(ref primary) = net_info.primary
             && let Ok(ca_cert_path) = lpm_cert::paths::ca_cert_path()
             && ca_cert_path.exists()
         {
-            let ca_cert_data = std::fs::read(&ca_cert_path).unwrap_or_default();
-            if !ca_cert_data.is_empty() {
-                let ca_port = port + 1;
-                tokio::spawn(serve_ca_cert(ca_port, ca_cert_data));
+            if allow_ca_bootstrap {
+                let ca_cert_data = std::fs::read(&ca_cert_path).unwrap_or_default();
+                if !ca_cert_data.is_empty() {
+                    let ca_port = port + 1;
+                    tokio::spawn(serve_ca_cert(ca_port, ca_cert_data));
+                    println!();
+                    println!(
+                        "  {} First time on mobile? Visit {} to install the CA certificate",
+                        "📱".dimmed(),
+                        format!("http://{}:{ca_port}", primary.ip).bold()
+                    );
+                }
+            } else {
                 println!();
                 println!(
-                    "  {} First time on mobile? Visit {} to install the CA certificate",
+                    "  {} mobile setup: enable with {} or copy {} to the device manually",
                     "📱".dimmed(),
-                    format!("http://{}:{ca_port}", primary.ip).bold()
+                    "--allow-ca-bootstrap".bold(),
+                    "rootCA.pem".bold()
                 );
             }
         }
@@ -451,8 +517,8 @@ pub async fn run(
         });
 
         // Start tunnel in background task, storing the handle for clean shutdown
-        let options_clone = options.clone();
-        let tunnel_auth_display = tunnel_auth_token.clone();
+        let options_clone = options;
+        let tunnel_auth_display = tunnel_auth_token;
         // Mirror commands/tunnel.rs: hand the connect callback a clone of the
         // inspector state so the live tunnel URL + session id are pushed to
         // the inspector UI as soon as the relay returns ServerHello.
@@ -528,10 +594,7 @@ pub async fn run(
         lpm_runner::lpm_json::read_lpm_json(project_dir).map_err(LpmError::Script)?
     };
 
-    let has_services = lpm_config
-        .as_ref()
-        .map(|c| !c.services.is_empty())
-        .unwrap_or(false);
+    let has_services = lpm_config.as_ref().is_some_and(|c| !c.services.is_empty());
 
     if has_services {
         let services = &lpm_config.as_ref().unwrap().services;
@@ -1561,7 +1624,7 @@ mod tests {
         let (orch_tx, orch_rx) = std::sync::mpsc::channel::<OrchestratorEvent>();
 
         // Spawn the bridge thread (same pattern as dev.rs)
-        let dash_tx_clone = dash_tx.clone();
+        let dash_tx_clone = dash_tx;
         std::thread::spawn(move || {
             while let Ok(event) = orch_rx.recv() {
                 let dash_event = match event {

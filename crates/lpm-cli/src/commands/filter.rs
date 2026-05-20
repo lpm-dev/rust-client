@@ -116,8 +116,7 @@ pub async fn run(
                 let pkg_name = graph
                     .members
                     .get(t.package)
-                    .map(|m| m.name.as_str())
-                    .unwrap_or("?");
+                    .map_or("?", |m| m.name.as_str());
                 serde_json::json!({
                     "package": pkg_name,
                     "package_id": t.package,
@@ -128,13 +127,7 @@ pub async fn run(
         let selected_names: Vec<&str> = explain
             .selected
             .iter()
-            .map(|&id| {
-                graph
-                    .members
-                    .get(id)
-                    .map(|m| m.name.as_str())
-                    .unwrap_or("?")
-            })
+            .map(|&id| graph.members.get(id).map_or("?", |m| m.name.as_str()))
             .collect();
         let payload = serde_json::json!({
             "input": explain.input,
@@ -218,11 +211,7 @@ fn render_human_explain(graph: &WorkspaceGraph, explain: &lpm_task::filter::Filt
     };
 
     for &id in &explain.selected {
-        let name = graph
-            .members
-            .get(id)
-            .map(|m| m.name.as_str())
-            .unwrap_or("?");
+        let name = graph.members.get(id).map_or("?", |m| m.name.as_str());
         let path = graph
             .members
             .get(id)
