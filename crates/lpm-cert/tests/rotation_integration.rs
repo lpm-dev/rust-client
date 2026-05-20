@@ -1,0 +1,275 @@
+//! End-to-end rotation tests against the test trust-store backend.
+//!
+//! Each test runs in its own process (one test binary per file), so HOME and the
+//! trust-store / audit / projects-index env vars can be mutated without racing
+//! other tests.
+
+use lpm_cert::{audit, cert, paths, projects, rotate, trust};
+use std::path::{Path, PathBuf};
+
+/// All tests in this binary share process-wide env (`HOME`, etc.), so they
+/// must serialize. Each test calls `let _g = serial_guard();` at entry.
+fn serial_guard() -> std::sync::MutexGuard<'static, ()> {
+    use std::sync::{Mutex, OnceLock};
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+}
+
+fn setup_home() -> (tempfile::TempDir, std::sync::MutexGuard<'static, ()>) {
+    let guard = serial_guard();
+    let tmp = tempfile::tempdir().unwrap();
+    unsafe {
+        std::env::set_var("HOME", tmp.path());
+        std::env::set_var(
+            "LPM_CERT_TEST_TRUST_STORE_DIR",
+            tmp.path().join("trust-store"),
+        );
+        std::env::set_var("LPM_CERT_AUDIT_DIR", tmp.path().join("audit"));
+        std::env::set_var(
+            "LPM_CERT_PROJECTS_INDEX",
+            tmp.path().join("cert-projects.json"),
+        );
+        std::env::set_var("LPM_CERT_GRACE_FILE", tmp.path().join("cert-grace.json"));
+    }
+    (tmp, guard)
+}
+
+fn seed_root_ca() -> (PathBuf, PathBuf) {
+    let cert_path = paths::ca_cert_path().unwrap();
+    let key_path = paths::ca_key_path().unwrap();
+    lpm_cert::create_dir_secure(cert_path.parent().unwrap()).unwrap();
+    let (cert_pem, key_pem) = lpm_cert::ca::generate_ca().unwrap();
+    std::fs::write(&cert_path, &cert_pem).unwrap();
+    lpm_cert::write_key_file(&key_path, key_pem.as_bytes()).unwrap();
+    trust::install_ca(&cert_path).unwrap();
+    (cert_path, key_path)
+}
+
+fn seed_project_leaf(project_dir: &Path) -> PathBuf {
+    let leaf_dir = project_dir.join(".lpm").join("certs");
+    std::fs::create_dir_all(&leaf_dir).unwrap();
+    let ca_cert = std::fs::read_to_string(paths::ca_cert_path().unwrap()).unwrap();
+    let ca_key = std::fs::read_to_string(paths::ca_key_path().unwrap()).unwrap();
+    let (cert_pem, key_pem) = cert::generate_project_cert(&ca_cert, &ca_key, &[]).unwrap();
+    let leaf_path = leaf_dir.join("cert.pem");
+    std::fs::write(&leaf_path, &cert_pem).unwrap();
+    std::fs::write(leaf_dir.join("key.pem"), &key_pem).unwrap();
+    projects::record(project_dir).unwrap();
+    leaf_path
+}
+
+fn read_audit_actions(audit_dir: &Path) -> Vec<String> {
+    let log = audit_dir.join("cert.jsonl");
+    if !log.exists() {
+        return Vec::new();
+    }
+    let s = std::fs::read_to_string(&log).unwrap_or_default();
+    s.lines()
+        .map(|l| {
+            let v: serde_json::Value = serde_json::from_str(l).unwrap();
+            v["action"].as_str().unwrap().to_string()
+        })
+        .collect()
+}
+
+#[test]
+fn rotate_replaces_root_and_reissues_indexed_leaves() {
+    let (tmp, _g) = setup_home();
+    let (active_cert, _active_key) = seed_root_ca();
+    let project_a = tmp.path().join("proj-a");
+    let leaf_a = seed_project_leaf(&project_a);
+
+    let old_fp = cert::fingerprint_sha256(&active_cert).unwrap();
+
+    let result = rotate::rotate(rotate::RotateOptions::default()).unwrap();
+
+    assert!(result.success);
+    assert!(result.ca_rotated);
+    assert_eq!(result.mode, "hard_cutover");
+    assert!(result.old_ca_uninstalled);
+    assert!(result.old_ca_removal_scheduled.is_none());
+    assert_eq!(result.reissued_leaves.len(), 1);
+
+    let new_fp = cert::fingerprint_sha256(&active_cert).unwrap();
+    assert_ne!(old_fp, new_fp);
+
+    assert!(cert::leaf_signed_by(&leaf_a, &active_cert).unwrap());
+    assert!(trust::is_ca_installed(&active_cert).unwrap());
+
+    let actions = read_audit_actions(&tmp.path().join("audit"));
+    assert!(actions.contains(&"ca.rotate.begin".to_string()));
+    assert!(actions.contains(&"ca.generate".to_string()));
+    assert!(actions.contains(&"ca.trust_install".to_string()));
+    assert!(actions.contains(&"cert.reissue".to_string()));
+    assert!(actions.contains(&"ca.rotate.promote".to_string()));
+    assert!(actions.contains(&"ca.trust_uninstall".to_string()));
+    assert!(actions.contains(&"ca.rotate.complete".to_string()));
+}
+
+#[test]
+fn rotate_skips_missing_project_dir_in_index_by_default() {
+    let (tmp, _g) = setup_home();
+    let (_active_cert, _active_key) = seed_root_ca();
+    let project_real = tmp.path().join("proj-real");
+    seed_project_leaf(&project_real);
+
+    let project_gone = tmp.path().join("proj-gone");
+    std::fs::create_dir_all(&project_gone).unwrap();
+    seed_project_leaf(&project_gone);
+    std::fs::remove_dir_all(&project_gone).unwrap();
+
+    let result = rotate::rotate(rotate::RotateOptions::default()).unwrap();
+    assert!(result.success);
+    assert_eq!(result.reissued_leaves.len(), 1);
+    assert_eq!(result.skipped_missing.len(), 1);
+    assert!(result.skipped_missing[0].contains("proj-gone"));
+}
+
+#[test]
+fn rotate_fails_on_missing_when_flag_set() {
+    let (tmp, _g) = setup_home();
+    let (_active_cert, _active_key) = seed_root_ca();
+    let project_gone = tmp.path().join("proj-gone");
+    std::fs::create_dir_all(&project_gone).unwrap();
+    seed_project_leaf(&project_gone);
+    std::fs::remove_dir_all(&project_gone).unwrap();
+
+    let result = rotate::rotate(rotate::RotateOptions {
+        skip_missing: false,
+        ..Default::default()
+    });
+    assert!(result.is_err());
+}
+
+#[test]
+fn rotate_grace_window_defers_old_ca_uninstall_and_records_schedule() {
+    let (tmp, _g) = setup_home();
+    let (active_cert, _) = seed_root_ca();
+    let project_a = tmp.path().join("proj-a");
+    seed_project_leaf(&project_a);
+
+    let old_fp = cert::fingerprint_sha256(&active_cert).unwrap();
+    let old_fp_hex = cert::fingerprint_hex(&old_fp);
+
+    let result = rotate::rotate(rotate::RotateOptions {
+        keep_old_trusted_days: Some(14),
+        ..Default::default()
+    })
+    .unwrap();
+
+    assert_eq!(result.mode, "grace_window");
+    assert!(!result.old_ca_uninstalled);
+    assert!(result.old_ca_removal_scheduled.is_some());
+
+    let entries = rotate::read_grace_entries().unwrap();
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].fingerprint, old_fp_hex);
+
+    let actions = read_audit_actions(&tmp.path().join("audit"));
+    assert!(actions.contains(&"ca.grace_scheduled".to_string()));
+}
+
+#[test]
+fn rotate_grace_window_rejects_over_max_days() {
+    let (_tmp, _g) = setup_home();
+    let (_active_cert, _) = seed_root_ca();
+
+    let err = rotate::rotate(rotate::RotateOptions {
+        keep_old_trusted_days: Some(180),
+        ..Default::default()
+    });
+    assert!(err.is_err());
+}
+
+#[test]
+fn reconcile_removes_grace_entry_when_time_has_passed() {
+    let (tmp, _g) = setup_home();
+    let (active_cert, _) = seed_root_ca();
+    let project_a = tmp.path().join("proj-a");
+    seed_project_leaf(&project_a);
+    let _ = rotate::rotate(rotate::RotateOptions {
+        keep_old_trusted_days: Some(14),
+        ..Default::default()
+    })
+    .unwrap();
+
+    let grace_path = tmp.path().join("cert-grace.json");
+    let json = std::fs::read_to_string(&grace_path).unwrap();
+    let past = json.replace(
+        &json
+            .lines()
+            .find(|l| l.contains("removes_at"))
+            .unwrap()
+            .to_string(),
+        "      \"removes_at\": \"2020-01-01T00:00:00Z\"",
+    );
+    std::fs::write(&grace_path, past).unwrap();
+
+    let result =
+        lpm_cert::reconcile::reconcile(lpm_cert::reconcile::ReconcileOptions::default()).unwrap();
+    assert!(result.success);
+    assert_eq!(result.grace_removed.len(), 1, "expected one grace removal");
+    assert!(result.grace_pending.is_empty());
+
+    let active_fp = cert::fingerprint_sha256(&active_cert).unwrap();
+    assert!(trust::is_ca_installed(&active_cert).unwrap());
+    let _ = active_fp;
+}
+
+#[test]
+fn reconcile_keeps_grace_entry_when_time_in_future() {
+    let (tmp, _g) = setup_home();
+    let (_active_cert, _) = seed_root_ca();
+    let project_a = tmp.path().join("proj-a");
+    seed_project_leaf(&project_a);
+    let _ = rotate::rotate(rotate::RotateOptions {
+        keep_old_trusted_days: Some(14),
+        ..Default::default()
+    })
+    .unwrap();
+
+    let result =
+        lpm_cert::reconcile::reconcile(lpm_cert::reconcile::ReconcileOptions::default()).unwrap();
+    assert!(result.grace_removed.is_empty());
+    assert_eq!(result.grace_pending.len(), 1);
+}
+
+#[test]
+fn ensure_https_reissues_leaf_when_chain_breaks() {
+    let (tmp, _g) = setup_home();
+    let (active_cert, active_key) = seed_root_ca();
+    let project = tmp.path().join("proj-orphan");
+    std::fs::create_dir_all(&project).unwrap();
+    let leaf_path = seed_project_leaf(&project);
+    let original_fp = cert::fingerprint_sha256(&leaf_path).unwrap();
+
+    let (new_pem, new_key_pem) = lpm_cert::ca::generate_ca().unwrap();
+    std::fs::write(&active_cert, &new_pem).unwrap();
+    lpm_cert::write_key_file(&active_key, new_key_pem.as_bytes()).unwrap();
+    trust::install_ca(&active_cert).unwrap();
+
+    let _setup = lpm_cert::ensure_https(&project, &[]).unwrap();
+    let new_fp = cert::fingerprint_sha256(&leaf_path).unwrap();
+    assert_ne!(
+        original_fp, new_fp,
+        "ensure_https must regenerate the project leaf when issuer mismatches"
+    );
+    assert!(cert::leaf_signed_by(&leaf_path, &active_cert).unwrap());
+}
+
+#[test]
+fn ca_days_until_expiry_returns_positive_for_fresh_ca() {
+    let (tmp, _g) = setup_home();
+    let (active_cert, _) = seed_root_ca();
+    let days = lpm_cert::ca_days_until_expiry(&active_cert).unwrap();
+    assert!(days > 800 && days < 830, "expected ~825 days, got {days}");
+
+    drop(audit::AuditAction::CaGenerate {
+        fingerprint: "x".into(),
+        validity_days: 0,
+        name_constraints: false,
+    });
+    drop(tmp);
+}

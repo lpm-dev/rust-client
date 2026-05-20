@@ -12,6 +12,9 @@ pub mod cert;
 pub mod framework;
 pub mod name_constraints;
 pub mod paths;
+pub mod projects;
+pub mod reconcile;
+pub mod rotate;
 pub mod trust;
 
 use lpm_common::LpmError;
@@ -69,6 +72,39 @@ pub fn trust_store_label() -> &'static str {
     #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
     {
         "unknown"
+    }
+}
+
+/// Days remaining until the CA at `path` expires. `Some(0)` for already-expired,
+/// `None` only if the cert can't be read or parsed.
+pub fn ca_days_until_expiry(path: &Path) -> Option<i64> {
+    let pem_str = std::fs::read_to_string(path).ok()?;
+    let pem = pem::parse(&pem_str).ok()?;
+    let (_, parsed) = x509_parser::parse_x509_certificate(pem.contents()).ok()?;
+    let not_after = parsed.validity().not_after.to_datetime();
+    let now = time::OffsetDateTime::now_utc();
+    let days = (not_after - now).whole_days();
+    Some(days.max(0))
+}
+
+/// Log a yellow `warn` at <60d and a red `error` at <30d remaining. Never
+/// auto-rotates — the user is the consent boundary for trust-store mutations.
+pub fn warn_if_ca_expiring_soon(path: &Path) {
+    let Some(days) = ca_days_until_expiry(path) else {
+        return;
+    };
+    if days < 30 {
+        tracing::error!(
+            target: "lpm_cert",
+            "root CA at {} expires in {days} day(s). Run `lpm cert rotate` to roll it.",
+            path.display()
+        );
+    } else if days < 60 {
+        tracing::warn!(
+            target: "lpm_cert",
+            "root CA at {} expires in {days} day(s). Plan a rotation with `lpm cert rotate`.",
+            path.display()
+        );
     }
 }
 
@@ -189,6 +225,7 @@ pub fn ensure_https(
                 cert_path.display()
             );
         }
+        warn_if_ca_expiring_soon(&cert_path);
         if !trust::is_ca_installed(&cert_path)? {
             tracing::info!("CA exists but not trusted, installing...");
             trust::install_ca(&cert_path)
@@ -197,19 +234,30 @@ pub fn ensure_https(
         false
     };
 
-    // Step 2: Ensure project certificate exists and is valid
+    let active_ca_cert = paths::ca_cert_path()?;
     let proj_cert_path = project_cert_dir.join("cert.pem");
     let proj_key_path = project_cert_dir.join("key.pem");
 
+    let needs_reissue_chain_mismatch = proj_cert_path.exists()
+        && !cert::leaf_signed_by(&proj_cert_path, &active_ca_cert).unwrap_or(false);
+
     let cert_freshly_generated = if !proj_cert_path.exists()
+        || needs_reissue_chain_mismatch
         || cert::needs_renewal(&proj_cert_path)?
         || !cert::covers_requested_hostnames(&proj_cert_path, extra_hostnames)?
     {
-        tracing::info!("generating project certificate...");
+        if needs_reissue_chain_mismatch {
+            tracing::info!(
+                "project leaf at {} no longer chains to the active CA; re-issuing",
+                proj_cert_path.display()
+            );
+        } else {
+            tracing::info!("generating project certificate...");
+        }
         std::fs::create_dir_all(&project_cert_dir)
             .map_err(|e| LpmError::Cert(format!("failed to create project cert dir: {e}")))?;
 
-        let ca_cert_pem = std::fs::read_to_string(paths::ca_cert_path()?)
+        let ca_cert_pem = std::fs::read_to_string(&active_ca_cert)
             .map_err(|e| LpmError::Cert(format!("failed to read CA cert: {e}")))?;
         let ca_key_pem = std::fs::read_to_string(paths::ca_key_path()?)
             .map_err(|e| LpmError::Cert(format!("failed to read CA key: {e}")))?;
@@ -227,6 +275,10 @@ pub fn ensure_https(
     } else {
         false
     };
+
+    if let Err(e) = projects::record(project_dir) {
+        tracing::debug!("failed to record project in cert-projects index: {e}");
+    }
 
     // Step 3: Build env vars for the dev server
     let ca_cert_path_str = paths::ca_cert_path()?.to_string_lossy().to_string();

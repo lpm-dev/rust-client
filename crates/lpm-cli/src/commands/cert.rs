@@ -1,7 +1,15 @@
 use crate::output;
 use lpm_common::LpmError;
 use lpm_common::color::Painted;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+
+#[derive(Debug, Default)]
+pub struct ExtraArgs {
+    pub extra_projects: Vec<PathBuf>,
+    pub keep_old_trusted_days: Option<u32>,
+    pub fail_on_missing: bool,
+    pub dry_run: bool,
+}
 
 /// Run the `lpm cert` subcommand.
 pub async fn run(
@@ -9,20 +17,29 @@ pub async fn run(
     project_dir: &Path,
     extra_hosts: &[String],
     json_output: bool,
+    extras: ExtraArgs,
 ) -> Result<(), LpmError> {
     match action {
         "status" => run_status(project_dir, json_output),
         "trust" => run_trust(json_output),
         "uninstall" => run_uninstall(json_output),
         "generate" => run_generate(project_dir, extra_hosts, json_output),
+        "rotate" => run_rotate(extras, json_output),
+        "reconcile" => run_reconcile(extras, json_output),
         _ => Err(LpmError::Cert(format!(
-            "unknown action '{action}'. Available: status, trust, uninstall, generate"
+            "unknown action '{action}'. Available: status, trust, uninstall, generate, rotate, reconcile"
         ))),
     }
 }
 
 fn run_status(project_dir: &Path, json_output: bool) -> Result<(), LpmError> {
     let status = lpm_cert::status(project_dir)?;
+    let ca_cert_path = lpm_cert::paths::ca_cert_path()?;
+    let days_remaining = if ca_cert_path.exists() {
+        lpm_cert::ca_days_until_expiry(&ca_cert_path)
+    } else {
+        None
+    };
 
     if json_output {
         println!(
@@ -34,6 +51,7 @@ fn run_status(project_dir: &Path, json_output: bool) -> Result<(), LpmError> {
                     "trusted": status.ca_trusted,
                     "expires": status.ca_expires,
                     "subject": status.ca_subject,
+                    "days_until_expiry": days_remaining,
                 },
                 "project": {
                     "exists": status.project_cert_exists,
@@ -60,6 +78,23 @@ fn run_status(project_dir: &Path, json_output: bool) -> Result<(), LpmError> {
         }
         if let Some(expires) = &status.ca_expires {
             output::field("expires", expires);
+        }
+        if let Some(days) = days_remaining {
+            let txt = format!("{days} days");
+            let colored = if days < 30 {
+                txt.red().to_string()
+            } else if days < 60 {
+                txt.yellow().to_string()
+            } else {
+                txt.green().to_string()
+            };
+            output::field("remaining", &colored);
+            if days < 60 {
+                println!(
+                    "  {}",
+                    "Run `lpm cert rotate` to roll the CA before it expires.".dimmed()
+                );
+            }
         }
     } else {
         output::field("status", &"not installed".red().to_string());
@@ -187,5 +222,58 @@ fn run_generate(
         output::field("key", &setup.key_path);
     }
 
+    Ok(())
+}
+
+fn run_rotate(extras: ExtraArgs, json_output: bool) -> Result<(), LpmError> {
+    let opts = lpm_cert::rotate::RotateOptions {
+        extra_projects: extras.extra_projects,
+        skip_missing: !extras.fail_on_missing,
+        keep_old_trusted_days: extras.keep_old_trusted_days,
+    };
+    let result = lpm_cert::rotate::rotate(opts)?;
+
+    if json_output {
+        println!("{}", serde_json::to_string_pretty(&result).unwrap());
+        return Ok(());
+    }
+
+    output::success("CA rotated");
+    output::field("mode", result.mode);
+    output::field("old_fingerprint", &result.old_fingerprint);
+    output::field("new_fingerprint", &result.new_fingerprint);
+    output::field("reissued", &result.reissued_leaves.len().to_string());
+    if !result.skipped_missing.is_empty() {
+        output::field("skipped_missing", &result.skipped_missing.len().to_string());
+    }
+    if let Some(when) = &result.old_ca_removal_scheduled {
+        output::field("old_ca_removes_at", when);
+    } else if result.old_ca_uninstalled {
+        output::field("old_ca_uninstalled", "true");
+    }
+    Ok(())
+}
+
+fn run_reconcile(extras: ExtraArgs, json_output: bool) -> Result<(), LpmError> {
+    let result = lpm_cert::reconcile::reconcile(lpm_cert::reconcile::ReconcileOptions {
+        dry_run: extras.dry_run,
+    })?;
+
+    if json_output {
+        println!("{}", serde_json::to_string_pretty(&result).unwrap());
+        return Ok(());
+    }
+
+    if extras.dry_run {
+        output::info("dry-run: no mutations performed");
+    } else {
+        output::success("reconcile complete");
+    }
+    output::field("grace_removed", &result.grace_removed.len().to_string());
+    output::field("grace_pending", &result.grace_pending.len().to_string());
+    output::field("stale_removed", &result.stale_removed.len().to_string());
+    if result.reconcile_required_cleared {
+        output::field("reconcile_required_cleared", "true");
+    }
     Ok(())
 }

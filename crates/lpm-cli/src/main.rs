@@ -1809,14 +1809,32 @@ enum Commands {
         args: Vec<String>,
     },
 
-    /// Manage local HTTPS certificates (status, trust, uninstall, generate).
+    /// Manage local HTTPS certificates (status, trust, uninstall, generate, rotate, reconcile).
     Cert {
-        /// Action: status, trust, uninstall, generate.
+        /// Action: status, trust, uninstall, generate, rotate, reconcile.
         action: String,
 
         /// Extra hostnames to include in the certificate SAN.
         #[arg(long)]
         host: Vec<String>,
+
+        /// Additional project directories to reissue leaves for during rotate.
+        #[arg(long = "project")]
+        project: Vec<std::path::PathBuf>,
+
+        /// Defer uninstalling the old CA for this many days (rotate only).
+        /// Capped at 90.
+        #[arg(long = "keep-old-trusted")]
+        keep_old_trusted: Option<u32>,
+
+        /// On rotate, exit non-zero instead of skipping projects whose dirs
+        /// have disappeared from disk.
+        #[arg(long = "fail-on-missing")]
+        fail_on_missing: bool,
+
+        /// Dry run for reconcile: report what would happen without mutating.
+        #[arg(long = "dry-run")]
+        dry_run: bool,
     },
 
     /// Visualize the dependency graph (tree, DOT, Mermaid, JSON, stats, HTML).
@@ -4221,9 +4239,28 @@ async fn async_main() -> Result<()> {
             )
             .await
         }
-        Commands::Cert { action, host } => {
+        Commands::Cert {
+            action,
+            host,
+            project,
+            keep_old_trusted,
+            fail_on_missing,
+            dry_run,
+        } => {
             let cwd = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;
-            commands::cert::run(&action, &cwd, &host, cli.json).await
+            commands::cert::run(
+                &action,
+                &cwd,
+                &host,
+                cli.json,
+                commands::cert::ExtraArgs {
+                    extra_projects: project,
+                    keep_old_trusted_days: keep_old_trusted,
+                    fail_on_missing,
+                    dry_run,
+                },
+            )
+            .await
         }
         Commands::Graph {
             package,

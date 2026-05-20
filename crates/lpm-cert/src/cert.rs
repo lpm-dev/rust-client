@@ -49,6 +49,25 @@ fn read_cert_der(path: &Path) -> Result<Vec<u8>, LpmError> {
     Ok(pem.into_contents())
 }
 
+/// Verify that the leaf at `leaf_path` was signed by the CA at `ca_path`. Returns
+/// `Ok(true)` on a verifying chain; `Ok(false)` on any verification failure
+/// (mismatched issuer/subject, bad signature). Errors only on unreadable input.
+///
+/// Used by `ensure_https` to detect "leaf chained to old CA after rotation" and
+/// trigger re-issuance against the active root.
+pub fn leaf_signed_by(leaf_path: &Path, ca_path: &Path) -> Result<bool, LpmError> {
+    let leaf_der = read_cert_der(leaf_path)?;
+    let ca_der = read_cert_der(ca_path)?;
+    let (_, leaf) = x509_parser::parse_x509_certificate(&leaf_der)
+        .map_err(|e| LpmError::Cert(format!("invalid leaf X.509: {e}")))?;
+    let (_, ca) = x509_parser::parse_x509_certificate(&ca_der)
+        .map_err(|e| LpmError::Cert(format!("invalid CA X.509: {e}")))?;
+    if leaf.issuer() != ca.subject() {
+        return Ok(false);
+    }
+    Ok(leaf.verify_signature(Some(ca.public_key())).is_ok())
+}
+
 /// Certificate info extracted from an existing cert file.
 #[derive(Debug, Clone)]
 pub struct CertInfo {
