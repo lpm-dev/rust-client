@@ -808,8 +808,7 @@ fn write_stderr_as_safe(msg: &[u8]) {
 /// already names what's needed; `detected` is display-only.
 fn detect_kernel_version() -> String {
     std::fs::read_to_string("/proc/sys/kernel/osrelease")
-        .map(|s| s.trim().to_string())
-        .unwrap_or_else(|_| "unknown".to_string())
+        .map_or_else(|_| "unknown".to_string(), |s| s.trim().to_string())
 }
 
 #[cfg(test)]
