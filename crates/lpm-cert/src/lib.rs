@@ -427,8 +427,26 @@ pub fn ensure_https_with_consent(
             let approved = resolve_consent(consent, &cert_path)?;
             if approved {
                 tracing::info!("CA exists but not trusted, installing...");
-                trust::install_ca(&cert_path)
-                    .map_err(|e| LpmError::Cert(format!("failed to install CA: {e}")))?;
+                let fp_hex = cert::fingerprint_hex(&cert::fingerprint_sha256(&cert_path)?);
+                match trust::install_ca(&cert_path) {
+                    Ok(()) => {
+                        audit::append_best_effort(audit::AuditAction::CaTrustInstall {
+                            fingerprint: fp_hex,
+                            store: trust_store_label(),
+                            status: audit::AuditStatus::Ok,
+                            error: None,
+                        });
+                    }
+                    Err(e) => {
+                        audit::append_best_effort(audit::AuditAction::CaTrustInstall {
+                            fingerprint: fp_hex,
+                            store: trust_store_label(),
+                            status: audit::AuditStatus::Error,
+                            error: Some(e.to_string()),
+                        });
+                        return Err(LpmError::Cert(format!("failed to install CA: {e}")));
+                    }
+                }
             } else {
                 tracing::warn!(
                     "trust-store install declined; browsers will not trust certificates signed by {}",

@@ -7,18 +7,22 @@ use std::path::Path;
 /// Build the consent value for `ensure_https_with_consent` based on the dev flags.
 ///
 /// - `--yes` → PreApproved.
-/// - Non-TTY without `--yes` → hard error (no silent prompt-skip).
-/// - TTY → an interactive prompt that prints the fingerprint and reads y/N.
+/// - Otherwise → Prompt(callback). The callback enforces the TTY requirement
+///   only when consent is actually needed; if the CA is already trusted, the
+///   callback is never invoked and non-TTY contexts proceed cleanly.
+/// - The callback errors on decline so `lpm dev --https` aborts cleanly instead
+///   of silently continuing with an untrusted cert (which would make the dev
+///   server's HTTPS effectively useless).
 fn build_consent(yes: bool) -> Result<lpm_cert::TrustStoreConsent<'static>, LpmError> {
     if yes {
         return Ok(lpm_cert::TrustStoreConsent::PreApproved);
     }
-    if !std::io::stdin().is_terminal() {
-        return Err(LpmError::Cert(
-            "non-interactive shell: pass `--yes` to consent to the trust-store install, or run `lpm cert trust` first".into(),
-        ));
-    }
     Ok(lpm_cert::TrustStoreConsent::Prompt(Box::new(|req| {
+        if !std::io::stdin().is_terminal() {
+            return Err(LpmError::Cert(
+                "non-interactive shell: pass `--yes` to consent to the trust-store install, or run `lpm cert trust` first".into(),
+            ));
+        }
         println!();
         println!(
             "  {}",
@@ -47,7 +51,12 @@ fn build_consent(yes: bool) -> Result<lpm_cert::TrustStoreConsent<'static>, LpmE
             .initial_value(false)
             .interact()
             .map_err(crate::prompt::prompt_err)?;
-        Ok(answer)
+        if !answer {
+            return Err(LpmError::Cert(
+                "trust-store install declined; aborting `lpm dev --https`. Run `lpm cert trust` when you're ready, or pass `--yes` to skip the prompt.".into(),
+            ));
+        }
+        Ok(true)
     })))
 }
 

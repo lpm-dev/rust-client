@@ -168,12 +168,39 @@ fn run_trust(json_output: bool) -> Result<(), LpmError> {
         lpm_cert::write_key_file(&key_path, ca_key_pem.as_bytes())
             .map_err(|e| LpmError::Cert(format!("failed to write CA key: {e}")))?;
 
+        let fp = lpm_cert::cert::fingerprint_sha256(&ca_cert_path)?;
+        lpm_cert::audit::append_best_effort(lpm_cert::audit::AuditAction::CaGenerate {
+            fingerprint: lpm_cert::cert::fingerprint_hex(&fp),
+            validity_days: lpm_cert::ca::CA_VALIDITY_DAYS,
+            name_constraints: lpm_cert::ca::wants_name_constraints(),
+        });
+
         if !json_output {
             output::success("root CA generated");
         }
     }
 
-    lpm_cert::trust::install_ca(&ca_cert_path)?;
+    let fp = lpm_cert::cert::fingerprint_sha256(&ca_cert_path)?;
+    let fp_hex = lpm_cert::cert::fingerprint_hex(&fp);
+    match lpm_cert::trust::install_ca(&ca_cert_path) {
+        Ok(()) => {
+            lpm_cert::audit::append_best_effort(lpm_cert::audit::AuditAction::CaTrustInstall {
+                fingerprint: fp_hex,
+                store: lpm_cert::trust_store_label(),
+                status: lpm_cert::audit::AuditStatus::Ok,
+                error: None,
+            });
+        }
+        Err(e) => {
+            lpm_cert::audit::append_best_effort(lpm_cert::audit::AuditAction::CaTrustInstall {
+                fingerprint: fp_hex,
+                store: lpm_cert::trust_store_label(),
+                status: lpm_cert::audit::AuditStatus::Error,
+                error: Some(e.to_string()),
+            });
+            return Err(e);
+        }
+    }
 
     if json_output {
         println!(
@@ -199,7 +226,27 @@ fn run_uninstall(json_output: bool) -> Result<(), LpmError> {
             ca_cert_path.display()
         )));
     }
-    lpm_cert::trust::uninstall_ca(&ca_cert_path)?;
+    let fp = lpm_cert::cert::fingerprint_sha256(&ca_cert_path)?;
+    let fp_hex = lpm_cert::cert::fingerprint_hex(&fp);
+    match lpm_cert::trust::uninstall_ca(&ca_cert_path) {
+        Ok(()) => {
+            lpm_cert::audit::append_best_effort(lpm_cert::audit::AuditAction::CaTrustUninstall {
+                fingerprint: fp_hex,
+                store: lpm_cert::trust_store_label(),
+                status: lpm_cert::audit::AuditStatus::Ok,
+                error: None,
+            });
+        }
+        Err(e) => {
+            lpm_cert::audit::append_best_effort(lpm_cert::audit::AuditAction::CaTrustUninstall {
+                fingerprint: fp_hex,
+                store: lpm_cert::trust_store_label(),
+                status: lpm_cert::audit::AuditStatus::Error,
+                error: Some(e.to_string()),
+            });
+            return Err(e);
+        }
+    }
 
     if json_output {
         println!(

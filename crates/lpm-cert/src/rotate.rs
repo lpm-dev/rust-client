@@ -218,7 +218,7 @@ fn stage_and_run(
             continue;
         }
 
-        let existing_sans = read_san_hostnames(&leaf_cert).unwrap_or_default();
+        let existing_sans = preserved_extra_hostnames(&leaf_cert).unwrap_or_default();
         let (cert_pem, key_pem) =
             cert::generate_project_cert(&staged_cert_pem, &staged_key_pem, &existing_sans)
                 .map_err(|e| {
@@ -391,22 +391,28 @@ fn collect_project_dirs(extras: &[PathBuf]) -> Result<Vec<PathBuf>, LpmError> {
     Ok(set.into_iter().collect())
 }
 
-fn read_san_hostnames(leaf_path: &Path) -> Result<Vec<String>, LpmError> {
-    let info = cert::read_cert_info(leaf_path)?;
+/// Return the SAN entries from `leaf_path` that should be passed as
+/// `extra_hostnames` when reissuing — i.e. every DNS name + IP except the
+/// three defaults `generate_project_cert` always adds. Uses the typed
+/// accessor in `cert::read_san_entries` so we don't depend on display formatting.
+fn preserved_extra_hostnames(leaf_path: &Path) -> Result<Vec<String>, LpmError> {
+    let entries = cert::read_san_entries(leaf_path)?;
     let mut sans: Vec<String> = Vec::new();
-    let defaults = ["localhost", "127.0.0.1", "::1"];
-    for entry in &info.san_entries {
-        let stripped = entry
-            .strip_prefix("DNS:")
-            .or_else(|| entry.strip_prefix("dns:"))
-            .unwrap_or(entry);
-        if stripped.starts_with("IP")
-            || defaults.iter().any(|d| stripped.contains(d))
-            || stripped.is_empty()
-        {
+    for e in entries {
+        let s = e.as_extra_hostname();
+        match &e {
+            cert::SanEntry::Dns(d) if d == "localhost" => continue,
+            cert::SanEntry::Ip(ip) => {
+                if ip.is_loopback() {
+                    continue;
+                }
+            }
+            _ => {}
+        }
+        if s.is_empty() {
             continue;
         }
-        sans.push(stripped.to_string());
+        sans.push(s);
     }
     Ok(sans)
 }

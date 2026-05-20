@@ -49,6 +49,69 @@ fn read_cert_der(path: &Path) -> Result<Vec<u8>, LpmError> {
     Ok(pem.into_contents())
 }
 
+/// A `cert.pem` SAN entry, decoded from the X.509 extension into a form callers can
+/// hand straight back to `rcgen` for reissue. Display-formatted strings from
+/// `x509_parser::GeneralName` (`DNSName("foo")`, `IPAddress(...)`) are not safe to
+/// round-trip — this enum is.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SanEntry {
+    Dns(String),
+    Ip(IpAddr),
+}
+
+impl SanEntry {
+    /// String form suitable for `generate_project_cert`'s `extra_hostnames` slice:
+    /// the bare DNS name, or the canonical IP literal. Both round-trip correctly
+    /// through the SAN parser in `cert::generate_project_cert`.
+    pub fn as_extra_hostname(&self) -> String {
+        match self {
+            SanEntry::Dns(s) => s.clone(),
+            SanEntry::Ip(ip) => ip.to_string(),
+        }
+    }
+}
+
+/// Decode every SAN in the leaf at `path` to a typed `SanEntry`. Skips entries
+/// the rotation reissue flow cannot reproduce (URI, RFC822, X400, etc.) — these
+/// are not used by `lpm-cert::generate_project_cert`.
+pub fn read_san_entries(path: &Path) -> Result<Vec<SanEntry>, LpmError> {
+    let pem_str = std::fs::read_to_string(path)
+        .map_err(|e| LpmError::Cert(format!("failed to read cert at {}: {e}", path.display())))?;
+    let pem = pem::parse(&pem_str)
+        .map_err(|e| LpmError::Cert(format!("invalid PEM at {}: {e}", path.display())))?;
+    let (_, cert) = x509_parser::parse_x509_certificate(pem.contents())
+        .map_err(|e| LpmError::Cert(format!("invalid X.509 at {}: {e}", path.display())))?;
+
+    let Some(san_ext) = cert.subject_alternative_name().ok().flatten() else {
+        return Ok(Vec::new());
+    };
+
+    let mut out: Vec<SanEntry> = Vec::with_capacity(san_ext.value.general_names.len());
+    for gn in &san_ext.value.general_names {
+        match gn {
+            GeneralName::DNSName(name) => out.push(SanEntry::Dns(name.to_string())),
+            GeneralName::IPAddress(bytes) => match bytes.len() {
+                4 => {
+                    let arr: [u8; 4] = (*bytes).try_into().unwrap();
+                    out.push(SanEntry::Ip(IpAddr::V4(Ipv4Addr::from(arr))));
+                }
+                16 => {
+                    let arr: [u8; 16] = (*bytes).try_into().unwrap();
+                    out.push(SanEntry::Ip(IpAddr::V6(Ipv6Addr::from(arr))));
+                }
+                _ => {
+                    tracing::debug!(
+                        "skipping IP-address SAN with non-{{4,16}} length: {}",
+                        bytes.len()
+                    );
+                }
+            },
+            _ => {}
+        }
+    }
+    Ok(out)
+}
+
 /// Verify that the leaf at `leaf_path` was signed by the CA at `ca_path`. Returns
 /// `Ok(true)` on a verifying chain; `Ok(false)` on any verification failure
 /// (mismatched issuer/subject, bad signature). Errors only on unreadable input.

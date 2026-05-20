@@ -97,7 +97,7 @@ pub enum AuditAction {
     #[serde(rename = "ca.reconcile.mtime_fallback")]
     CaReconcileMtimeFallback { path: String },
     #[serde(rename = "ca.reconcile.resolved")]
-    CaReconcileResolved { fingerprint: String },
+    CaReconcileResolved { old_fingerprint: String },
 }
 
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]

@@ -5,11 +5,30 @@ use support::{TempProject, lpm};
 fn cert_command(project: &TempProject) -> assert_cmd::Command {
     let mut cmd = lpm(project);
     cmd.env("LPM_CERT_TEST_TRUST_STORE_DIR", trust_store_dir(project));
+    cmd.env("LPM_CERT_AUDIT_DIR", audit_dir(project));
     cmd
 }
 
 fn trust_store_dir(project: &TempProject) -> std::path::PathBuf {
     project.home().join(".lpm").join("test-trust-store")
+}
+
+fn audit_dir(project: &TempProject) -> std::path::PathBuf {
+    project.home().join(".lpm").join("audit")
+}
+
+fn audit_actions(project: &TempProject) -> Vec<String> {
+    let log = audit_dir(project).join("cert.jsonl");
+    if !log.exists() {
+        return Vec::new();
+    }
+    let s = std::fs::read_to_string(&log).unwrap_or_default();
+    s.lines()
+        .filter_map(|l| {
+            let v: serde_json::Value = serde_json::from_str(l).ok()?;
+            v["action"].as_str().map(|s| s.to_string())
+        })
+        .collect()
 }
 
 fn trust_store_entry(project: &TempProject) -> std::path::PathBuf {
@@ -109,6 +128,16 @@ fn cert_trust_json_generates_ca_and_installs_into_isolated_test_store() {
             & 0o777;
         assert_eq!(mode, 0o600, "root CA key must be owner-only on unix");
     }
+
+    let actions = audit_actions(&project);
+    assert!(
+        actions.contains(&"ca.generate".to_string()),
+        "lpm cert trust must record ca.generate; got {actions:?}"
+    );
+    assert!(
+        actions.contains(&"ca.trust_install".to_string()),
+        "lpm cert trust must record ca.trust_install; got {actions:?}"
+    );
 }
 
 #[test]
@@ -145,6 +174,12 @@ fn cert_uninstall_json_removes_trust_store_entry_but_keeps_ca_files() {
     assert!(
         !trust_store_entry(&project).exists(),
         "uninstall must remove the isolated trust-store marker"
+    );
+
+    let actions = audit_actions(&project);
+    assert!(
+        actions.contains(&"ca.trust_uninstall".to_string()),
+        "lpm cert uninstall must record ca.trust_uninstall; got {actions:?}"
     );
 
     let status_output = cert_command(&project)

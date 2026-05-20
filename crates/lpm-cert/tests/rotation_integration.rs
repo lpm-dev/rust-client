@@ -48,11 +48,15 @@ fn seed_root_ca() -> (PathBuf, PathBuf) {
 }
 
 fn seed_project_leaf(project_dir: &Path) -> PathBuf {
+    seed_project_leaf_with_extras(project_dir, &[])
+}
+
+fn seed_project_leaf_with_extras(project_dir: &Path, extras: &[String]) -> PathBuf {
     let leaf_dir = project_dir.join(".lpm").join("certs");
     std::fs::create_dir_all(&leaf_dir).unwrap();
     let ca_cert = std::fs::read_to_string(paths::ca_cert_path().unwrap()).unwrap();
     let ca_key = std::fs::read_to_string(paths::ca_key_path().unwrap()).unwrap();
-    let (cert_pem, key_pem) = cert::generate_project_cert(&ca_cert, &ca_key, &[]).unwrap();
+    let (cert_pem, key_pem) = cert::generate_project_cert(&ca_cert, &ca_key, extras).unwrap();
     let leaf_path = leaf_dir.join("cert.pem");
     std::fs::write(&leaf_path, &cert_pem).unwrap();
     std::fs::write(leaf_dir.join("key.pem"), &key_pem).unwrap();
@@ -309,4 +313,120 @@ fn ca_days_until_expiry_returns_positive_for_fresh_ca() {
         name_constraints: false,
     });
     drop(tmp);
+}
+
+#[test]
+fn rotate_preserves_custom_dns_and_ip_sans_through_reissue() {
+    let (tmp, _g) = setup_home();
+    let (_active_cert, _active_key) = seed_root_ca();
+    let project = tmp.path().join("proj-custom-sans");
+    let extras = vec!["myapp.local".to_string(), "192.168.1.42".to_string()];
+    let leaf_before = seed_project_leaf_with_extras(&project, &extras);
+
+    let before_sans = cert::read_san_entries(&leaf_before).unwrap();
+    assert!(
+        before_sans
+            .iter()
+            .any(|s| matches!(s, cert::SanEntry::Dns(d) if d == "myapp.local")),
+        "fixture must seed `myapp.local` as a DNS SAN"
+    );
+    assert!(
+        before_sans
+            .iter()
+            .any(|s| matches!(s, cert::SanEntry::Ip(ip) if ip.to_string() == "192.168.1.42")),
+        "fixture must seed `192.168.1.42` as an IP SAN"
+    );
+
+    let result = rotate::rotate(rotate::RotateOptions::default()).unwrap();
+    assert!(result.success);
+    assert_eq!(result.reissued_leaves.len(), 1);
+
+    let after_sans = cert::read_san_entries(&leaf_before).unwrap();
+    assert!(
+        after_sans
+            .iter()
+            .any(|s| matches!(s, cert::SanEntry::Dns(d) if d == "myapp.local")),
+        "rotation must preserve custom DNS SAN, got {after_sans:?}"
+    );
+    assert!(
+        after_sans
+            .iter()
+            .any(|s| matches!(s, cert::SanEntry::Ip(ip) if ip.to_string() == "192.168.1.42")),
+        "rotation must preserve custom IP SAN, got {after_sans:?}"
+    );
+}
+
+#[test]
+fn reconcile_retries_uninstall_for_unresolved_reconcile_required() {
+    let (tmp, _g) = setup_home();
+    // Simulate the state just BEFORE the failed step-6 uninstall: trust store
+    // holds the old CA, and `.previous` is on disk pointing at it. The test
+    // trust store backend models a single trusted CA, so we pin that to the
+    // old root (not the new one) — `is_ca_installed(&prev_cert)` should be true.
+    let (active_cert, _active_key) = seed_root_ca();
+    let _ = seed_project_leaf(&tmp.path().join("proj"));
+
+    let old_fp = cert::fingerprint_sha256(&active_cert).unwrap();
+    let old_fp_hex = cert::fingerprint_hex(&old_fp);
+
+    let ca_dir = paths::ca_dir().unwrap();
+    let prev_cert_path = ca_dir.join("rootCA.pem.previous");
+    let prev_key_path = ca_dir.join("rootCA-key.pem.previous");
+    std::fs::copy(&active_cert, &prev_cert_path).unwrap();
+    std::fs::copy(paths::ca_key_path().unwrap(), &prev_key_path).unwrap();
+
+    audit::append(audit::AuditAction::CaReconcileRequired {
+        old_fingerprint: old_fp_hex.clone(),
+        new_fingerprint: "FUTURE".into(),
+    })
+    .unwrap();
+
+    assert!(trust::is_ca_installed(&prev_cert_path).unwrap());
+
+    let result =
+        lpm_cert::reconcile::reconcile(lpm_cert::reconcile::ReconcileOptions::default()).unwrap();
+
+    assert!(result.success);
+    assert!(
+        result.resolved_old_fingerprints.contains(&old_fp_hex),
+        "reconcile should resolve the unresolved marker, got resolved={:?}",
+        result.resolved_old_fingerprints
+    );
+    assert!(result.reconcile_required_cleared);
+    assert!(
+        !trust::is_ca_installed(&prev_cert_path).unwrap(),
+        "reconcile should have uninstalled the old CA via the .previous bytes"
+    );
+}
+
+#[test]
+fn reconcile_preserves_previous_files_when_marker_unresolved_and_backup_missing() {
+    let (tmp, _g) = setup_home();
+    let (_active_cert, _) = seed_root_ca();
+    let _ = seed_project_leaf(&tmp.path().join("proj"));
+
+    let ca_dir = paths::ca_dir().unwrap();
+    let prev_cert_path = ca_dir.join("rootCA.pem.previous");
+    let prev_key_path = ca_dir.join("rootCA-key.pem.previous");
+
+    // No .previous on disk and an unresolved reconcile_required event: reconcile
+    // surfaces the pending marker; it does not delete the (missing) backup, and
+    // does not pretend success.
+    audit::append(audit::AuditAction::CaReconcileRequired {
+        old_fingerprint: "AA:BB:CC".into(),
+        new_fingerprint: "11:22:33".into(),
+    })
+    .unwrap();
+
+    let result =
+        lpm_cert::reconcile::reconcile(lpm_cert::reconcile::ReconcileOptions::default()).unwrap();
+    assert!(
+        result
+            .pending_old_fingerprints
+            .contains(&"AA:BB:CC".to_string()),
+        "missing backup should leave the marker pending"
+    );
+    assert!(!result.reconcile_required_cleared);
+    assert!(!prev_cert_path.exists());
+    assert!(!prev_key_path.exists());
 }
