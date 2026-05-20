@@ -1212,7 +1212,7 @@ mod tests {
 
     #[tokio::test]
     async fn fulcio_rejects_detached_sct_response_because_bundle_cannot_persist_scts() {
-        // Phase 1.4 hygiene: a Fulcio response carrying the legacy
+        // hygiene: a Fulcio response carrying the legacy
         // `signedCertificateDetachedSct` variant returns the cert
         // chain plus a separate `signedCertificateTimestamp`, but the
         // Sigstore Bundle v0.3 spec has no first-class detached-SCT

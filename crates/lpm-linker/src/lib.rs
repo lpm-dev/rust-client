@@ -2729,8 +2729,10 @@ fn try_clonefile(src: &Path, dst: &Path) -> bool {
         Err(_) => return false,
     };
 
-    // Clonefile(src, dst, flags) — flag 0 = no special flags
-    // Returns 0 on success, -1 on failure
+    // SAFETY: clonefile takes two NUL-terminated C strings and a flags
+    // word. Both pointers are valid for the duration of the call (the
+    // CStrings outlive it), and we pass `0` for flags (no special
+    // behavior). Returns 0 on success, -1 on failure.
     let result = unsafe { libc::clonefile(src_c.as_ptr(), dst_c.as_ptr(), 0) };
 
     if result == 0 {

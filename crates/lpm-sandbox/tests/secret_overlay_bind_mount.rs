@@ -149,9 +149,7 @@ unsafe fn write_proc_file(path: &[u8], bytes: &[u8]) -> bool {
 
 fn fixture_spec(project_dir: &std::path::Path) -> SandboxSpec {
     let home = dirs::home_dir().expect("home dir for test");
-    let tmp = std::env::var_os("TMPDIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("/tmp"));
+    let tmp = std::env::var_os("TMPDIR").map_or_else(|| PathBuf::from("/tmp"), PathBuf::from);
     SandboxSpec {
         package_dir: home.join(".lpm/store/testpkg@0.1.0"),
         project_dir: project_dir.to_path_buf(),

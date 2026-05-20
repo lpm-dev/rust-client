@@ -191,3 +191,21 @@ opt-level = 3
 lto = true
 codegen-units = 1
 strip = true
+
+[workspace.lints.rust]
+nonstandard_style = "deny"
+future_incompatible = "warn"
+
+[workspace.lints.clippy]
+# Lints currently clean against the whole workspace — keep them deny
+# so regressions fail CI immediately.
+clone_on_copy = "deny"
+unnecessary_map_or = "deny"
+manual_ok_or = "deny"
+#
+# Backlog: these lints have existing offenders. Promote to `deny`
+# once each is swept by a focused follow-up pass.
+#   redundant_clone     ~36 hits  (mostly test code; perf-relevant in hot path)
+#   map_unwrap_or       ~17 hits  (idiom; map_or / map_or_else replacements)
+#   needless_collect    ~6 hits
+#   unnecessary_wraps   ~7 hits

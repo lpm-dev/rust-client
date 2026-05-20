@@ -161,7 +161,7 @@ async fn fetch_provenance_for_effective_set(
 
 /// Resolve the `provenance_at_approval` value for one `(name, version)`
 /// pair from a batch [`ProvenanceStatus`] map, honoring the operator's
-/// `LPM_PROVENANCE_ENFORCE` setting (Phase 2.2.b rollout knob).
+/// `LPM_PROVENANCE_ENFORCE` setting (rollout knob).
 ///
 /// This is the project- and global-scope approval-capture hook that
 /// closes the SILENT-DROP attack window: a previous `.ok().flatten()`
@@ -180,7 +180,7 @@ async fn fetch_provenance_for_effective_set(
 ///   returns `Ok(None)`. The caller's read-modify-write proceeds,
 ///   recording `provenance_at_approval: None` — same effect as a
 ///   transport-degraded fetch during the approval window. This is
-///   the Phase 2.3 rollout-window posture; operators MUST monitor
+///   the rollout-window posture; operators MUST monitor
 ///   the warn line.
 ///
 /// Non-rejection statuses (`Verified`, `Absent`, `TransportDegraded`)
@@ -613,7 +613,7 @@ async fn run_under_store_lock(
             // into the binding so subsequent installs can compare against them
             // (drift rule + version diff).
             //
-            // Phase 2.2 SILENT-DROP fix: `snapshot_for_binding` returns
+            // SILENT-DROP fix: `snapshot_for_binding` returns
             // `Err(LpmError::ProvenanceVerification(_))` when the
             // verifier rejected the bundle, refusing the approval
             // rather than blanking `provenance_at_approval`.
@@ -726,7 +726,7 @@ async fn run_under_store_lock(
         emit_yes_warning_banner(effective_state.blocked_packages.len(), json_output);
         for blocked in &effective_state.blocked_packages {
             // write-path — see the direct-approve branch above for the rationale.
-            // Phase 2.2 SILENT-DROP fix: `?` propagates a verifier
+            // SILENT-DROP fix: `?` propagates a verifier
             // rejection so the trust binding is NOT overwritten with
             // `None` (which would silently disarm drift detection on
             // every subsequent install).
@@ -2025,7 +2025,7 @@ async fn run_global_bulk_yes(
     // Network fetch (provenance) happens BEFORE the lock so the
     // critical section stays bounded. Transport failures degrade to
     // `ProvenanceStatus::TransportDegraded`; a verifier rejection
-    // surfaces as `VerificationRejected` (Phase 2.2 SILENT-DROP fix)
+    // surfaces as `VerificationRejected` (SILENT-DROP fix)
     // and refuses the approval below.
     let pairs: Vec<(String, String)> = aggregate
         .rows
@@ -2216,7 +2216,7 @@ async fn run_global_named(
 
     // fetch provenance OUTSIDE the tx lock so a slow
     // network response doesn't block parallel `--global` invocations.
-    // Phase 2.2 SILENT-DROP fix: `?` propagates a verifier rejection
+    // SILENT-DROP fix: `?` propagates a verifier rejection
     // BEFORE acquiring the lock, leaving any prior binding intact.
     let pairs = vec![(row.name.clone(), row.version.clone())];
     let provenance = crate::provenance_fetch::fetch_provenance_for_pkgs(
@@ -2574,7 +2574,7 @@ async fn run_global_interactive(
                         continue;
                     }
                     for row in &rows {
-                        // Phase 2.2 SILENT-DROP fix: a verifier
+                        // SILENT-DROP fix: a verifier
                         // rejection on any row in this group aborts
                         // the entire `approve_all` action with a clear
                         // error, leaving any prior bindings for the
@@ -2610,7 +2610,7 @@ async fn run_global_interactive(
 
                         match row_choice {
                             "approve" => {
-                                // Phase 2.2 SILENT-DROP fix.
+                                // SILENT-DROP fix.
                                 let snap =
                                     snapshot_for_binding(&provenance, &row.name, &row.version)?;
                                 commit_global_approval(root, row, snap, dry_run).await?;
@@ -2692,7 +2692,7 @@ async fn run_global_interactive(
 
         match choice {
             "approve" => {
-                // Phase 2.2 SILENT-DROP fix.
+                // SILENT-DROP fix.
                 let snap = snapshot_for_binding(&provenance, &row.name, &row.version)?;
                 // per-row write goes through `commit_global_approval`,
                 // which acquires the global tx lock and re-reads trust
@@ -2771,7 +2771,7 @@ mod tests {
     use std::fs;
     use tempfile::tempdir;
 
-    // ── snapshot_for_binding_with_mode (Phase 2.2.b rollout knob) ───
+    // ── snapshot_for_binding_with_mode (rollout knob) ───
 
     fn verified_status() -> ProvenanceStatus {
         ProvenanceStatus::Verified(ProvenanceSnapshot {

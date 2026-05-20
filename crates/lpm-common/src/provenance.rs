@@ -21,7 +21,7 @@ use serde::{Deserialize, Serialize};
 /// Outcome of fetching a single package's provenance bundle.
 ///
 /// Distinguishes the four states the install-time and approve-time
-/// paths must treat differently. Phase 2.1 introduced the
+/// paths must treat differently. introduced the
 /// cryptographic verifier and `LpmError::ProvenanceVerification`,
 /// but the batch caller in `provenance_fetch::fetch_provenance_for_pkgs`
 /// previously collapsed every result through `.ok().flatten()`,
@@ -345,7 +345,7 @@ mod tests {
         assert_eq!(base, base.clone());
     }
 
-    // ── ProvenanceStatus → binding projection (Phase 2.2 SILENT-DROP) ──
+    // ── ProvenanceStatus → binding projection (SILENT-DROP) ──
 
     fn axios_snap() -> ProvenanceSnapshot {
         ProvenanceSnapshot {

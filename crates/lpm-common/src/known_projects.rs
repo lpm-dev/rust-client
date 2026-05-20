@@ -247,7 +247,7 @@ pub fn register(path: &Path, project_dir: &Path) -> Result<Entry, LpmError> {
         return Ok(entry);
     }
     let entry = Entry {
-        path: canonical.clone(),
+        path: canonical,
         last_seen: now,
     };
     registry.projects.push(entry.clone());
@@ -388,7 +388,7 @@ mod tests {
             last_seen: Utc::now(),
         });
         r.projects.push(Entry {
-            path: dead.clone(),
+            path: dead,
             last_seen: Utc::now(),
         });
         write(&path, &r).unwrap();

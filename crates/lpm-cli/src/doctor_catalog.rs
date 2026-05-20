@@ -1434,7 +1434,7 @@ pub static SANDBOX_DEGRADED: CheckEntry = CheckEntry {
     auto_fix: None,
 };
 
-/// rework GPT-5 audit follow-up : the user
+/// rework follow-up : the user
 /// has persistently disabled the sandbox via
 /// `[sandbox] mode = "none"` in `~/.lpm/config.toml` / `./lpm.toml`
 /// (typically set by `lpm config sandbox --set none`). Distinct

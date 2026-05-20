@@ -1,6 +1,6 @@
 //! Cli-binary survivor — `lpm approve-scripts` TTY/interactive contract.
 //!
-//! **Tier-placement justification (Phase 65 survivor class):**
+//! **Tier-placement justification (survivor class):**
 //! intentionally minimal binary-surface repro for the TTY-interactive
 //! contract. The interactive walk path (no `--yes`, no `--list`, no
 //! `<pkg>`) cannot be exercised from the workflow tier without a real

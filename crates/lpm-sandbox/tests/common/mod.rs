@@ -130,7 +130,7 @@ pub fn sandbox_supported(mode: SandboxMode) -> bool {
             package_name: "__probe".into(),
             package_version: "0.0.0".into(),
             store_root: home.clone(),
-            home_dir: home.clone(),
+            home_dir: home,
             tmpdir: PathBuf::from("/tmp"),
             secret_read_allow: Vec::new(),
             extra_write_dirs: Vec::new(),

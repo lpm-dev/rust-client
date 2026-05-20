@@ -1043,7 +1043,7 @@ mod tests {
         assert!(err.to_string().contains("inside the workspace"));
     }
 
-    // ── GPT-5.4 audit regression (High): self-loop guard bypass ────
+    // ── regression (High): self-loop guard bypass ────
 
     #[cfg(unix)]
     #[test]

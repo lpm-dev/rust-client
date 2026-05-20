@@ -35,9 +35,7 @@ use std::path::PathBuf;
 /// is unset. The returned path is what `tempfile::tempdir_in`
 /// is called on.
 fn allowlisted_exec_dir() -> std::path::PathBuf {
-    std::env::var_os("TMPDIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("/tmp"))
+    std::env::var_os("TMPDIR").map_or_else(|| PathBuf::from("/tmp"), PathBuf::from)
 }
 
 /// True iff the most-specific `/proc/mounts` entry covering
@@ -86,9 +84,7 @@ fn path_is_noexec(path: &std::path::Path) -> bool {
 
 fn realistic_spec() -> SandboxSpec {
     let home = dirs::home_dir().expect("home dir for test");
-    let tmp = std::env::var_os("TMPDIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("/tmp"));
+    let tmp = std::env::var_os("TMPDIR").map_or_else(|| PathBuf::from("/tmp"), PathBuf::from);
     SandboxSpec {
         package_dir: home.join(".lpm/store/testpkg@0.1.0"),
         project_dir: home.join("lpm-sandbox-test-project"),

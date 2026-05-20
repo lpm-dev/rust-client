@@ -165,10 +165,10 @@ pub fn read_project_name(project_dir: &Path) -> String {
     }
 
     // Fall back to directory name
-    project_dir
-        .file_name()
-        .map(|n| n.to_string_lossy().to_string())
-        .unwrap_or_else(|| "unknown".to_string())
+    project_dir.file_name().map_or_else(
+        || "unknown".to_string(),
+        |n| n.to_string_lossy().to_string(),
+    )
 }
 
 /// Generate a UUID v4 string without external dependencies.

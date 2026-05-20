@@ -16,7 +16,7 @@
 //! cli-binary file must use these helpers — never reinvent
 //! `CommandOutput`, `run_lpm`, or a mock-registry mounter from
 //! scratch. Drift between hand-rolled subprocess helpers is what
-//! produced the phase-named regression-dump files Phase 65 cleaned
+//! produced the phase-named regression-dump files cleaned
 //! up; the canonical-helper rule is what stops it from coming back.
 //!
 //! New cli-binary files should:

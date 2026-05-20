@@ -73,3 +73,6 @@ hex = { workspace = true }
 [[bin]]
 name = "socket-probe"
 path = "../../crates/lpm-sandbox/src/bin/socket-probe.rs"
+
+[lints]
+workspace = true

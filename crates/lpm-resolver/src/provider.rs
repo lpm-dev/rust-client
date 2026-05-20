@@ -2040,7 +2040,7 @@ mod tests {
     }
 
     /// Regression test for the prerelease-stripping bug found in the
-    /// 2026-05-07 hoisted-mode compatibility audit (vite-react,
+    /// hoisted-mode compatibility audit (vite-react,
     /// nextjs-minimal, babel-presets fixtures all failed with
     /// `no version satisfies range (versions available: 1)` when a
     /// dependency declared a prerelease range like `^1.0.0-beta.27`).

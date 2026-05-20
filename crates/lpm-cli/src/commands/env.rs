@@ -2446,13 +2446,13 @@ async fn vars_oidc_allow(
     let mut repo: Option<&str> = None;
     let mut branches: Vec<String> = vec!["main".to_string()];
     let mut envs: Vec<String> = Vec::new();
-    // Phase 3 of plan-security-findings-c3.md — `allowedWorkflows`.
+    // of plan-security-findings-c3.md — `allowedWorkflows`.
     // No default: the server schema is `.min(1)`, and the safe default
     // ".github/workflows/deploy.yml" guesses the user's workflow name
     // (which is almost always wrong). Forcing the user to supply it
     // surfaces the security model.
     let mut workflows: Vec<String> = Vec::new();
-    // Phase 4 — `allowedEvents`. Defaults to push-only — the safest
+    // `allowedEvents`. Defaults to push-only — the safest
     // event for fork-PR exposure. Adding `pull_request_target` to
     // this list also requires `--allow-forks` (cross-field check
     // enforced server-side in Phase 5.2, gated on JWT fixtures).
@@ -2882,9 +2882,9 @@ async fn get_ci_oidc_token() -> Result<String, LpmError> {
 /// Map a server-side error response from `POST /api/vault/oidc` to a
 /// user-facing message with a code-specific remediation hint appended.
 ///
-/// Phase 2 of plan-security-findings-c3.md stamps a stable
+/// of plan-security-findings-c3.md stamps a stable
 /// machine-readable `code` field on every 403/429 from the mint endpoint;
-/// Phase 8 (this CLI side) maps each code to an actionable next step so
+/// (this CLI side) maps each code to an actionable next step so
 /// CI logs surface "what to do" rather than just "what failed."
 ///
 /// Precedence:

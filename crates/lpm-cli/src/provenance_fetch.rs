@@ -658,7 +658,7 @@ pub async fn fetch_provenance_snapshot(
 ///
 /// Pure mapping (no I/O) so the SILENT-DROP regression is directly
 /// testable without mocking the registry-client cascade.
-/// Phase 2.2 fix: the prior `.ok().flatten()` collapsed
+/// fix: the prior `.ok.flatten` collapsed
 /// `Err(LpmError::ProvenanceVerification)` into the same `None` as a
 /// transport failure, blanking the approval binding and disarming
 /// drift on subsequent installs. This helper preserves the four
@@ -716,7 +716,7 @@ pub(crate) fn map_fetch_result_to_status(
 /// `lpm approve-scripts --global` write path (P4 parity).
 ///
 /// Returns one [`ProvenanceStatus`] per input pair (never collapses
-/// distinct outcomes into a single `None`). Phase 2.2 SILENT-DROP fix:
+/// distinct outcomes into a single `None`). SILENT-DROP fix:
 /// the previous implementation used `.ok().flatten()` here, which made
 /// a verifier rejection (`Err(LpmError::ProvenanceVerification)`)
 /// indistinguishable from a network failure. Recording the resulting
@@ -2456,7 +2456,7 @@ mod tests {
     /// installs for 7 days.
     #[tokio::test]
     async fn fetch_returns_provenance_verification_err_on_unverifiable_bundle() {
-        // Phase 2.1 behavioral pin: a registry that serves a 200
+        // behavioral pin: a registry that serves a 200
         // response whose body is structurally a Sigstore bundle but
         // cannot pass cryptographic verification MUST surface as
         // `Err(LpmError::ProvenanceVerification(...))`, NOT degrade
@@ -2685,7 +2685,7 @@ mod tests {
 
     #[test]
     fn cache_schema_v1_entry_treated_as_miss_under_v2_verification_posture() {
-        // Phase 2.1 schema bump pin: an on-disk entry with the
+        // schema bump pin: an on-disk entry with the
         // pre-verification schema version (1) must be treated as a
         // miss by the new code, even if the JSON is structurally
         // valid. Without this invalidation, the new verifier would
@@ -2914,7 +2914,7 @@ mod tests {
         );
     }
 
-    // ── map_fetch_result_to_status (Phase 2.2 SILENT-DROP fix) ──────
+    // ── map_fetch_result_to_status (SILENT-DROP fix) ──────
 
     fn snap_present() -> ProvenanceSnapshot {
         ProvenanceSnapshot {
@@ -3014,7 +3014,7 @@ mod tests {
         );
     }
 
-    // ── EnforceMode env-var parsing (Phase 2.2.b rollout knob) ──────
+    // ── EnforceMode env-var parsing (rollout knob) ──────
 
     /// Unset env → fail-closed default. This is the production
     /// posture for users who never touch `LPM_PROVENANCE_ENFORCE`.
