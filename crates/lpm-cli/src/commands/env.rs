@@ -303,27 +303,42 @@ impl PairConfirmationView {
             code: code.to_string(),
             fingerprint: lpm_vault::crypto::browser_key_fingerprint(browser_pub_b64),
             match_number: lpm_vault::crypto::pairing_match_number(code, browser_pub_b64),
+            // Every server-supplied string that reaches the terminal must
+            // go through the same sanitizer — partial coverage (e.g.
+            // `device_label` only) lets a MITM'd or compromised server
+            // embed cursor-manipulation escapes in a sibling field and
+            // repaint the fingerprint / match-number lines.
             device_label: session
                 .device_label
                 .as_deref()
-                .map(|s| sanitize_device_label(s, 80)),
-            created_at: session.created_at.clone(),
-            created_from_ip: session.created_from_ip.clone(),
+                .map(|s| sanitize_server_string(s, 80)),
+            created_at: session
+                .created_at
+                .as_deref()
+                .map(|s| sanitize_server_string(s, 64)),
+            created_from_ip: session
+                .created_from_ip
+                .as_deref()
+                .map(|s| sanitize_server_string(s, 64)),
         }
     }
 }
 
 /// Strip ASCII control bytes (including ANSI CSI escape introducers) and
 /// truncate to `max_len` characters before rendering an attacker-influenced
-/// device label to the terminal. The dashboard sources this string from
-/// `navigator.userAgent.slice(0, 200)`, which a malicious browser tab can
-/// set to arbitrary bytes — without this guard the prompt could be made to
-/// scroll itself off-screen, repaint surrounding lines, or fake an "OK"
-/// confirmation glyph.
-fn sanitize_device_label(label: &str, max_len: usize) -> String {
-    let mut out = String::with_capacity(label.len().min(max_len));
+/// server string to the terminal. Used for every field on `PairingSession`
+/// that reaches `print_pair_confirmation` — `device_label` originates from
+/// `navigator.userAgent.slice(0, 200)` on the dashboard side (attacker can
+/// set it via a malicious browser extension or XSS on lpm.dev), and
+/// `created_at` / `created_from_ip` are echoed verbatim from the server
+/// response, which the pair-flow threat model explicitly treats as
+/// potentially adversarial. Without this guard the prompt could be made to
+/// scroll itself off-screen, repaint the fingerprint or match-number line,
+/// or fake an "OK" confirmation glyph.
+fn sanitize_server_string(value: &str, max_len: usize) -> String {
+    let mut out = String::with_capacity(value.len().min(max_len));
     let mut chars = 0usize;
-    for c in label.chars() {
+    for c in value.chars() {
         if c.is_control() {
             continue;
         }
@@ -4205,29 +4220,29 @@ mod tests {
     }
 
     #[test]
-    fn sanitize_device_label_strips_ansi_csi_escape_introducers() {
+    fn sanitize_server_string_strips_ansi_csi_escape_introducers() {
         // An attacker-controlled UA could embed \x1b[2J (clear screen) or
         // \x07 (BEL) to repaint the prompt — must be stripped, not rendered.
         let dirty = "Chrome\x1b[2Jon macOS\x07";
-        let clean = sanitize_device_label(dirty, 80);
+        let clean = sanitize_server_string(dirty, 80);
         assert_eq!(clean, "Chrome[2Jon macOS");
         assert!(!clean.contains('\x1b'));
         assert!(!clean.contains('\x07'));
     }
 
     #[test]
-    fn sanitize_device_label_truncates_with_ellipsis_at_char_boundary() {
+    fn sanitize_server_string_truncates_with_ellipsis_at_char_boundary() {
         let label = "a".repeat(200);
-        let clean = sanitize_device_label(&label, 10);
+        let clean = sanitize_server_string(&label, 10);
         // 10 ASCII chars + "…" marker.
         assert_eq!(clean.chars().count(), 11);
         assert!(clean.ends_with('…'));
     }
 
     #[test]
-    fn sanitize_device_label_preserves_legitimate_user_agents() {
+    fn sanitize_server_string_preserves_legitimate_user_agents() {
         let ua = "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_0) AppleWebKit/605.1.15";
-        let clean = sanitize_device_label(ua, 80);
+        let clean = sanitize_server_string(ua, 80);
         assert_eq!(clean, ua);
     }
 
@@ -4266,5 +4281,46 @@ mod tests {
         let label = view.device_label.as_deref().unwrap_or_default();
         assert!(!label.contains('\x1b'));
         assert!(!label.contains('\x07'));
+    }
+
+    #[test]
+    fn pair_confirmation_view_sanitizes_created_at_and_created_from_ip() {
+        // Both fields ride the same `PairingSession` JSON response as
+        // `device_label`, which the view already sanitizes. Without the
+        // same defense on these two, a malicious or MITM-routed server
+        // can embed cursor-manipulation escapes (`ESC [2A ESC [2K …`)
+        // that erase the genuine fingerprint or match-number line above
+        // and repaint a spoofed one — bypassing the visual confirmation
+        // that is this command's headline defense.
+        use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
+        let pub_b64 = BASE64.encode([0u8; 65]);
+        let session = lpm_vault::sync::PairingSession {
+            status: "pending".into(),
+            browser_public_key: Some(pub_b64.clone()),
+            device_label: None,
+            created_at: Some("2026-05-20T12:34:56Z\x1b[2A\x1b[2K".into()),
+            created_from_ip: Some("203.0.113.0/24\x07\x1b[1B".into()),
+        };
+        let view = PairConfirmationView::new("ABC123", &pub_b64, &session);
+        let created_at = view.created_at.as_deref().unwrap_or_default();
+        let ip = view.created_from_ip.as_deref().unwrap_or_default();
+        for field in [created_at, ip] {
+            assert!(
+                !field.contains('\x1b'),
+                "ESC must be stripped from {field:?}"
+            );
+            assert!(
+                !field.contains('\x07'),
+                "BEL must be stripped from {field:?}"
+            );
+            for c in field.chars() {
+                assert!(
+                    !c.is_control(),
+                    "{field:?} retained control char {c:?} — server-supplied \
+                     fields rendered to the terminal must all flow through \
+                     the same sanitizer as device_label"
+                );
+            }
+        }
     }
 }
