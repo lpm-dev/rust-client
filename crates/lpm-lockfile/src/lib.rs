@@ -836,9 +836,9 @@ mod tests {
         assert!(toml_str.contains("react"));
     }
 
-    /// Post-Phase-60 fix: every default `lpm install` writes a lockfile
-    /// produced by greedy-fusion. Pre-fix the field was hardcoded to
-    /// "pubgrub". The constructor must round-trip the resolver name
+    /// Every default `lpm install` writes a lockfile produced by
+    /// greedy-fusion — the field was previously hardcoded to "pubgrub".
+    /// The constructor must round-trip the resolver name
     /// the dispatch site picked, AND the bare `Lockfile::new()` default
     /// must agree with the install default so test/library callers
     /// don't quietly retag a fresh lockfile as pubgrub.

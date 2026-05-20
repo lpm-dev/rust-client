@@ -485,8 +485,8 @@ const CACHE_TTL_SECS: u64 = 7 * 24 * 60 * 60;
 /// the verification posture for cached entries changes. Entries
 /// with a mismatched version are treated as misses (re-fetch).
 ///
-/// **Version 2** (Phase 2.1): cache entries are now produced by the
-/// FULL cryptographic verifier (Phase 1.8's `verify_sigstore_bundle`),
+/// **Version 2**: cache entries are now produced by the FULL
+/// cryptographic verifier ([`verify_sigstore_bundle`]),
 /// not by identity-only extraction. Every cached snapshot has had
 /// chain + DSSE + SCT + Rekor body + SET (and possibly inclusion
 /// proof) verified at write time. Schema-1 entries are produced by
@@ -628,7 +628,7 @@ pub async fn fetch_provenance_snapshot(
             .fetch_add(http_start.elapsed().as_nanos() as u64, Ordering::Relaxed);
     }
 
-    // Verification (Phase 2.1): bytes are in hand, run the full
+    // Verification: bytes are in hand, run the full
     // verifier. Failure here is NOT degraded to `Ok(None)` because
     // it represents an attack signal (registry served a bundle that
     // claimed signed provenance but failed crypto). Transport-class
@@ -1188,10 +1188,9 @@ async fn fetch_bundle_bytes(http: &reqwest::Client, url: &str) -> Result<Vec<u8>
 }
 
 /// Verify — turn the raw bundle bytes into a `ProvenanceSnapshot`
-/// AFTER cryptographic verification under Phase 1.8's
-/// `verify_sigstore_bundle`.
+/// AFTER cryptographic verification under [`verify_sigstore_bundle`].
 ///
-/// Failure semantics (Phase 2.1):
+/// Failure semantics:
 /// - `Ok(snapshot)` — bundle verified end-to-end (chain + DSSE +
 ///   SCT + Rekor body + SET; inclusion proof per policy). The
 ///   returned snapshot is safe to cache and feed into the drift
@@ -2460,9 +2459,9 @@ mod tests {
         // response whose body is structurally a Sigstore bundle but
         // cannot pass cryptographic verification MUST surface as
         // `Err(LpmError::ProvenanceVerification(...))`, NOT degrade
-        // to `Ok(None)`. Pre-Phase-2.1 the old identity-only parse
-        // would have either returned Ok(snapshot) or Ok(None)
-        // depending on whether the JSON was well-formed; neither was
+        // to `Ok(None)`. The old identity-only parse would have either
+        // returned Ok(snapshot) or Ok(None) depending on whether the
+        // JSON was well-formed; neither was
         // an attack signal. Now the verifier's failure IS the
         // signal.
         use wiremock::matchers::{method, path};

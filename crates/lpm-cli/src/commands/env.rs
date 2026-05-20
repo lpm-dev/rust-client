@@ -2455,7 +2455,7 @@ async fn vars_oidc_allow(
     // `allowedEvents`. Defaults to push-only — the safest
     // event for fork-PR exposure. Adding `pull_request_target` to
     // this list also requires `--allow-forks` (cross-field check
-    // enforced server-side in Phase 5.2, gated on JWT fixtures).
+    // enforced server-side, gated on JWT fixtures).
     let mut events: Vec<String> = vec!["push".to_string()];
     let mut allow_forks = false;
 

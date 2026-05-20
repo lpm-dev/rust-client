@@ -155,7 +155,7 @@ pub(crate) fn render_profile(
     // (`.env`, `.npmrc`, `.aws/`, `*.pem`, etc.). SBPL last-match-
     // wins: a path covered by both the earlier allow and this deny
     // ends up denied. The per-project / per-user
-    // `sandboxReadAllow` opt-in (Phase 3) emits a follow-up
+    // `sandboxReadAllow` opt-in emits a follow-up
     // (allow file-read*) block AFTER this deny so specific files
     // can be exempted without disabling the whole list.
     render_secret_denies(&mut out, &canon_project_dir)?;
@@ -311,7 +311,7 @@ fn render_secret_denies(out: &mut String, canon_project_dir: &Path) -> Result<()
 /// the named files, without disabling the whole secret-deny list.
 ///
 /// No-op when the allow list is empty (no block emitted). The
-/// loader (Phase 3) is responsible for validating that each entry
+/// The loader is responsible for validating that each entry
 /// is an absolute project-rooted path and rejecting traversal /
 /// out-of-project entries — this renderer just emits whatever it
 /// receives.
@@ -1038,7 +1038,7 @@ mod tests {
         }
     }
 
-    // ── Secret-file deny block (Phase 1) ────────────────────────────
+    // ── Secret-file deny block ──────────────────────────────────────
 
     /// The deny block appears AFTER the broad
     /// `(allow file-read* (subpath project_dir))` rule. SBPL is

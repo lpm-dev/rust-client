@@ -403,7 +403,7 @@ mod tests {
     /// `VerificationRejected` propagates as
     /// `LpmError::ProvenanceVerification(_)` rather than projecting
     /// to `None`. This is the **regression guard** for the
-    /// post-Phase-2.1 SILENT-DROP audit finding: pre-fix
+    /// regression guard for the SILENT-DROP finding: pre-fix
     /// `.ok().flatten()` swallowed this state into `None`, which the
     /// drift comparator then read as "first observation, no drift"
     /// on every subsequent install — permanently disarming
