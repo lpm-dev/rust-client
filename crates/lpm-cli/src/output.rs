@@ -53,10 +53,10 @@ pub fn header(title: &str) {
 /// Format a quality tier with appropriate color.
 pub fn tier_colored(tier: &str) -> String {
     match tier.to_lowercase().as_str() {
-        "gold" => tier.yellow().bold().to_string(),
-        "silver" => tier.white().bold().to_string(),
-        "bronze" => tier.red().to_string(),
-        _ => tier.dimmed().to_string(),
+        "gold" => tier.yellow().bold(),
+        "silver" => tier.white().bold(),
+        "bronze" => tier.red(),
+        _ => tier.dimmed(),
     }
 }
 
@@ -65,20 +65,20 @@ pub fn score_colored(score: u32, max: u32) -> String {
     let pct = if max > 0 { score * 100 / max } else { 0 };
     let text = format!("{score}/{max}");
     if pct >= 80 {
-        text.green().to_string()
+        text.green()
     } else if pct >= 50 {
-        text.yellow().to_string()
+        text.yellow()
     } else {
-        text.red().to_string()
+        text.red()
     }
 }
 
 /// Format a distribution mode badge.
 pub fn mode_badge(mode: &str) -> String {
     match mode {
-        "pool" => "pool".cyan().to_string(),
-        "marketplace" => "marketplace".magenta().to_string(),
-        "private" => "private".yellow().to_string(),
-        _ => mode.dimmed().to_string(),
+        "pool" => "pool".cyan(),
+        "marketplace" => "marketplace".magenta(),
+        "private" => "private".yellow(),
+        _ => mode.dimmed(),
     }
 }

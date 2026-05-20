@@ -597,8 +597,8 @@ async fn main() -> Result<(), BoxError> {
     println!(
         "loaded top-{} packages (range: {} dl/mo … {} dl/mo)",
         top_n.len(),
-        top_n.first().map(|e| e.monthly_downloads).unwrap_or(0),
-        top_n.last().map(|e| e.monthly_downloads).unwrap_or(0),
+        top_n.first().map_or(0, |e| e.monthly_downloads),
+        top_n.last().map_or(0, |e| e.monthly_downloads),
     );
 
     let resume_records = if args.resume && args.results.exists() {
@@ -1239,7 +1239,7 @@ fn hermetic_l3_outcome(publish_age_hours: u64, attestation_present: bool) -> L3O
     let age_secs = publish_age_hours.saturating_mul(3600);
     let now = time::OffsetDateTime::now_utc();
     let published_dt = now - time::Duration::seconds(age_secs as i64);
-    let published_at = published_dt.format(&Rfc3339).ok().map(|s| s.to_string());
+    let published_at = published_dt.format(&Rfc3339).ok();
 
     let policy = SecurityPolicy::default_policy();
     let cooldown_block = policy.check_release_age(published_at.as_deref()).is_some();
@@ -1401,43 +1401,41 @@ async fn enrich_advisor_in_place(
     // uses for the verdict log line.
     const L4_CONCURRENCY: usize = 8;
     let provider_slug = provider.slug().to_string();
-    let snapshots: Vec<(usize, PackageAudit)> = targets
-        .iter()
-        .map(|&idx| (idx, audits[idx].clone()))
-        .collect();
     let advisor_ref: &dyn Advisor = &*advisor;
     let pb_for_stream = Arc::clone(&pb);
     let outcomes: Vec<(usize, Option<&'static str>, AdvisorOutcome)> =
-        futures::stream::iter(snapshots.into_iter().map(|(idx, snapshot)| {
-            let pb = Arc::clone(&pb_for_stream);
-            let cache = cache.clone();
-            let cache_template_hash = cache_template_hash.clone();
-            let cache_model_version = cache_model_version.clone();
-            let cache_provider_slug = cache_provider_slug.clone();
-            let cache_hits = Arc::clone(&cache_hits);
-            let cache_misses = Arc::clone(&cache_misses);
-            async move {
-                let (verdict_label, advisor_outcome) = classify_one_with_advisor(
-                    advisor_ref,
-                    &snapshot,
-                    cache.as_deref(),
-                    &cache_provider_slug,
-                    &cache_model_version,
-                    &cache_template_hash,
-                    &cache_hits,
-                    &cache_misses,
-                )
-                .await;
-                pb.inc(1);
-                // Non-TTY-friendly stderr milestone every 25 advisor
-                // calls. The L4 phase is slower per-item than fetch
-                // (each call is an LLM round-trip), so the milestone
-                // interval is tighter than fetch's 100 to keep the
-                // user informed during a long run.
-                emit_progress_milestone("L4 advise", &pb, 25);
-                (idx, verdict_label, advisor_outcome)
-            }
-        }))
+        futures::stream::iter(targets.iter().map(|&idx| (idx, audits[idx].clone())).map(
+            |(idx, snapshot)| {
+                let pb = Arc::clone(&pb_for_stream);
+                let cache = cache.clone();
+                let cache_template_hash = cache_template_hash.clone();
+                let cache_model_version = cache_model_version.clone();
+                let cache_provider_slug = cache_provider_slug.clone();
+                let cache_hits = Arc::clone(&cache_hits);
+                let cache_misses = Arc::clone(&cache_misses);
+                async move {
+                    let (verdict_label, advisor_outcome) = classify_one_with_advisor(
+                        advisor_ref,
+                        &snapshot,
+                        cache.as_deref(),
+                        &cache_provider_slug,
+                        &cache_model_version,
+                        &cache_template_hash,
+                        &cache_hits,
+                        &cache_misses,
+                    )
+                    .await;
+                    pb.inc(1);
+                    // Non-TTY-friendly stderr milestone every 25 advisor
+                    // calls. The L4 phase is slower per-item than fetch
+                    // (each call is an LLM round-trip), so the milestone
+                    // interval is tighter than fetch's 100 to keep the
+                    // user informed during a long run.
+                    emit_progress_milestone("L4 advise", &pb, 25);
+                    (idx, verdict_label, advisor_outcome)
+                }
+            },
+        ))
         .buffer_unordered(L4_CONCURRENCY)
         .collect()
         .await;
@@ -2099,7 +2097,7 @@ fn classify_script_with_context(script: &str, ctx: Option<&ManifestContext<'_>>)
 /// `node`.
 fn classify_shape(script: &str, tokens: &[String], tier: StaticTier) -> ScriptShape {
     let trimmed = script.trim();
-    let bare = tokens.first().map(String::as_str).unwrap_or("");
+    let bare = tokens.first().map_or("", String::as_str);
 
     // `node -e "..."` style — captures both green and amber softfail
     // wrappers under one shape (tier disambiguates at report time).
@@ -2938,11 +2936,6 @@ fn section_l3_detail(out: &mut String, audits: &[PackageAudit]) {
         .iter()
         .filter(|a| a.l3_outcome.as_ref().is_some_and(|l| l.cooldown_block))
         .collect();
-    let with_attestation: Vec<&&PackageAudit> = scripted
-        .iter()
-        .filter(|a| a.l3_outcome.as_ref().is_some_and(|l| l.attestation_present))
-        .collect();
-
     out.push_str("## Layer 3 — cooldown + attestation detail\n\n");
     out.push_str(&format!(
         "- {} of {} scripted packages have L3 data populated.\n",
@@ -2955,7 +2948,10 @@ fn section_l3_detail(out: &mut String, audits: &[PackageAudit]) {
     ));
     out.push_str(&format!(
         "- **Attestation present**: {} of {} scripted packages publish Sigstore provenance.\n\n",
-        with_attestation.len(),
+        scripted
+            .iter()
+            .filter(|a| a.l3_outcome.as_ref().is_some_and(|l| l.attestation_present))
+            .count(),
         scripted.len(),
     ));
 
@@ -2974,8 +2970,7 @@ fn section_l3_detail(out: &mut String, audits: &[PackageAudit]) {
                     a.monthly_downloads,
                     l3.published_at.as_deref().unwrap_or("?"),
                     l3.age_secs
-                        .map(|s| s.to_string())
-                        .unwrap_or_else(|| "?".to_string()),
+                        .map_or_else(|| "?".to_string(), |s| s.to_string()),
                 ));
             }
         }

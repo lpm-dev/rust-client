@@ -162,8 +162,7 @@ fn body_to_export(body: &[u8]) -> ExportBody {
 pub fn to_test_fixture(webhook: &CapturedWebhook) -> String {
     let provider_name = webhook
         .provider
-        .map(|p| p.to_string())
-        .unwrap_or_else(|| "webhook".to_string());
+        .map_or_else(|| "webhook".to_string(), |p| p.to_string());
 
     let event_type = webhook
         .summary

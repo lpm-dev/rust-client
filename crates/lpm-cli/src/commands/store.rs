@@ -715,10 +715,10 @@ fn list_v2_verify_entries(
                 // store root but may have been planted by a hostile
                 // same-user writer. The error text itself can carry
                 // sidecar bytes (filename / parse-position previews).
-                let dir_name = link_dir
-                    .file_name()
-                    .map(|s| s.to_string_lossy().into_owned())
-                    .unwrap_or_else(|| link_dir.display().to_string());
+                let dir_name = link_dir.file_name().map_or_else(
+                    || link_dir.display().to_string(),
+                    |s| s.to_string_lossy().into_owned(),
+                );
                 sidecar_issues.push(format!(
                     "v2 link {} — sidecar unreadable: {}",
                     sanitize_for_terminal(&dir_name),

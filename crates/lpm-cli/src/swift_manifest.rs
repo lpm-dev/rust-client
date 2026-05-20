@@ -164,10 +164,7 @@ fn insert_into_dependencies_array(
                 // Insert the new dependencies array on a new line before the keyword line.
                 // content[line_start..] already includes the keyword's own indentation,
                 // so we don't append kw_indent again.
-                let line_start = content[..kw_pos]
-                    .rfind('\n')
-                    .map(|i| i + 1)
-                    .unwrap_or(kw_pos);
+                let line_start = content[..kw_pos].rfind('\n').map_or(kw_pos, |i| i + 1);
                 let mut new_content = String::with_capacity(content.len() + new_deps.len() + 10);
                 new_content.push_str(&content[..line_start]);
                 new_content.push_str(&new_deps);
@@ -219,8 +216,7 @@ fn insert_into_dependencies_array(
     // Find the start of the line containing `]` — we'll insert before it
     let close_line_start = content[..close_pos]
         .rfind('\n')
-        .map(|i| i + 1)
-        .unwrap_or(close_pos);
+        .map_or(close_pos, |i| i + 1);
 
     let mut new_content = String::with_capacity(content.len() + entry.len() + 20);
 
@@ -361,8 +357,7 @@ fn insert_into_target_deps(
 
     let close_line_start = content[..close_pos]
         .rfind('\n')
-        .map(|i| i + 1)
-        .unwrap_or(close_pos);
+        .map_or(close_pos, |i| i + 1);
 
     let mut new_content = String::with_capacity(content.len() + entry.len() + 20);
 
@@ -564,7 +559,7 @@ fn indent_one_level_from_context(content: &str, base_indent: &str) -> String {
 /// Get the leading whitespace of the line containing the given position.
 /// Preserves actual whitespace characters (tabs or spaces).
 fn get_line_indent(content: &str, pos: usize) -> String {
-    let line_start = content[..pos].rfind('\n').map(|i| i + 1).unwrap_or(0);
+    let line_start = content[..pos].rfind('\n').map_or(0, |i| i + 1);
     let line = &content[line_start..pos];
     let leading = &line[..line.len() - line.trim_start().len()];
     leading.to_string()

@@ -1255,8 +1255,7 @@ impl V2BaselineIndex {
                     && entry
                         .file_name()
                         .to_str()
-                        .map(|name| name.starts_with('@'))
-                        .unwrap_or(false);
+                        .is_some_and(|name| name.starts_with('@'));
                 if !is_scope_dir {
                     continue;
                 }
@@ -3460,7 +3459,7 @@ mod tests {
             object_path: "objects/sha512-stub-consumer".into(),
             deps: vec![LinkMetaDep {
                 local: "tslib".into(),
-                target_graph_key: tslib_full.clone(),
+                target_graph_key: tslib_full,
                 target_name: "tslib".into(),
                 target_version: "2.0.0".into(),
             }],

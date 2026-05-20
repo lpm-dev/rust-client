@@ -13,11 +13,11 @@ use std::path::Path;
 /// - The callback errors on decline so `lpm dev --https` aborts cleanly instead
 ///   of silently continuing with an untrusted cert (which would make the dev
 ///   server's HTTPS effectively useless).
-fn build_consent(yes: bool) -> Result<lpm_cert::TrustStoreConsent<'static>, LpmError> {
+fn build_consent(yes: bool) -> lpm_cert::TrustStoreConsent<'static> {
     if yes {
-        return Ok(lpm_cert::TrustStoreConsent::PreApproved);
+        return lpm_cert::TrustStoreConsent::PreApproved;
     }
-    Ok(lpm_cert::TrustStoreConsent::Prompt(Box::new(|req| {
+    lpm_cert::TrustStoreConsent::Prompt(Box::new(|req| {
         if !std::io::stdin().is_terminal() {
             return Err(LpmError::Cert(
                 "non-interactive shell: pass `--yes` to consent to the trust-store install, or run `lpm cert trust` first".into(),
@@ -57,7 +57,7 @@ fn build_consent(yes: bool) -> Result<lpm_cert::TrustStoreConsent<'static>, LpmE
             ));
         }
         Ok(true)
-    })))
+    }))
 }
 
 /// Run the `lpm dev` command with zero-config detection.
@@ -192,7 +192,7 @@ pub async fn run(
                             }
                         }
                     }
-                    let consent = build_consent(yes_local)?;
+                    let consent = build_consent(yes_local);
                     lpm_cert::ensure_https_with_consent(&dir, &extra_hostnames, consent)
                 })
                 .await
@@ -517,8 +517,8 @@ pub async fn run(
         });
 
         // Start tunnel in background task, storing the handle for clean shutdown
-        let options_clone = options.clone();
-        let tunnel_auth_display = tunnel_auth_token.clone();
+        let options_clone = options;
+        let tunnel_auth_display = tunnel_auth_token;
         // Mirror commands/tunnel.rs: hand the connect callback a clone of the
         // inspector state so the live tunnel URL + session id are pushed to
         // the inspector UI as soon as the relay returns ServerHello.
@@ -594,10 +594,7 @@ pub async fn run(
         lpm_runner::lpm_json::read_lpm_json(project_dir).map_err(LpmError::Script)?
     };
 
-    let has_services = lpm_config
-        .as_ref()
-        .map(|c| !c.services.is_empty())
-        .unwrap_or(false);
+    let has_services = lpm_config.as_ref().is_some_and(|c| !c.services.is_empty());
 
     if has_services {
         let services = &lpm_config.as_ref().unwrap().services;
@@ -1627,7 +1624,7 @@ mod tests {
         let (orch_tx, orch_rx) = std::sync::mpsc::channel::<OrchestratorEvent>();
 
         // Spawn the bridge thread (same pattern as dev.rs)
-        let dash_tx_clone = dash_tx.clone();
+        let dash_tx_clone = dash_tx;
         std::thread::spawn(move || {
             while let Ok(event) = orch_rx.recv() {
                 let dash_event = match event {

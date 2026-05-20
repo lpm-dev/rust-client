@@ -18,7 +18,6 @@
 
 use clap::CommandFactory;
 use clap_complete::Shell;
-use lpm_common::LpmError;
 use std::io;
 
 /// Run the `lpm completions <shell>` command.
@@ -27,8 +26,7 @@ use std::io;
 /// argument is hardcoded to `"lpm"` — the user-facing alias users actually
 /// invoke — rather than `env!("CARGO_BIN_NAME")` (which would emit
 /// `lpm-rs` / `lpm-bin` and produce completions that never trigger).
-pub fn run(shell: Shell) -> Result<(), LpmError> {
+pub fn run(shell: Shell) {
     let mut cmd = crate::Cli::command();
     clap_complete::generate(shell, &mut cmd, "lpm", &mut io::stdout());
-    Ok(())
 }

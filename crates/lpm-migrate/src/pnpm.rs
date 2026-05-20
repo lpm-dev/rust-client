@@ -164,8 +164,7 @@ fn parse_v5_key(key: &str) -> (String, String) {
             // or `peer+dep@version` — take only the semver prefix
             let version = version_part
                 .find('_')
-                .map(|i| &version_part[..i])
-                .unwrap_or(version_part);
+                .map_or(version_part, |i| &version_part[..i]);
             (name.to_string(), version.to_string())
         }
         None => (stripped.to_string(), String::new()),

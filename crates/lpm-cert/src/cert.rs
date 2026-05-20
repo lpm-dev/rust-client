@@ -297,8 +297,7 @@ pub fn read_cert_info(cert_path: &Path) -> Result<CertInfo, LpmError> {
         .basic_constraints()
         .ok()
         .flatten()
-        .map(|bc| bc.value.ca)
-        .unwrap_or(false);
+        .is_some_and(|bc| bc.value.ca);
 
     Ok(CertInfo {
         subject,

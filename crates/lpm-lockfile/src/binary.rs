@@ -1365,7 +1365,7 @@ mod tests {
             version: "1.0.0".to_string(),
             source: None,
             integrity: None,
-            dependencies: deps.clone(),
+            dependencies: deps,
             alias_dependencies: vec![],
             peers: vec![],
             tarball: None,

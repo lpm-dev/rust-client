@@ -53,9 +53,7 @@ impl PackageInventory {
     /// (`.lpm-security.json` per package dir) — callers must hold the
     /// shared store lock around this call to avoid racing
     /// `lpm cache prune --apply` / `lpm store clean`.
-    pub fn from_discovery(
-        discovery: discovery::DiscoveryResult,
-    ) -> Result<Self, lpm_common::LpmError> {
+    pub fn from_discovery(discovery: discovery::DiscoveryResult) -> Self {
         let mut analyses: HashMap<String, PackageAnalysis> = HashMap::new();
 
         // Scannable packages: those with source on disk
@@ -71,10 +69,10 @@ impl PackageInventory {
             .collect();
 
         if scannable.is_empty() {
-            return Ok(Self {
+            return Self {
                 discovery,
                 analyses,
-            });
+            };
         }
 
         // Load project-level audit cache
@@ -156,10 +154,10 @@ impl PackageInventory {
             tracing::debug!("failed to write audit cache: {e}");
         }
 
-        Ok(Self {
+        Self {
             discovery,
             analyses,
-        })
+        }
     }
 
     /// Get all non-@lpm.dev packages as `(name, version)` pairs for OSV queries.

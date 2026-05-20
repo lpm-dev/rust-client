@@ -186,7 +186,7 @@ fn symlink_skills_to_cursor(project_dir: &Path, skills_dir: &Path) -> std::io::R
 
         for skill_entry in std::fs::read_dir(pkg_entry.path())?.flatten() {
             let skill_path = skill_entry.path();
-            if skill_path.extension().map(|e| e == "md").unwrap_or(false) {
+            if skill_path.extension().is_some_and(|e| e == "md") {
                 let skill_name = skill_path.file_name().unwrap();
                 let skill_stem = skill_path.file_stem().unwrap_or_default().to_string_lossy();
                 if !lpm_common::is_safe_skill_name(&skill_stem) {

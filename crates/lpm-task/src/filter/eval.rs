@@ -251,11 +251,10 @@ impl<'a> FilterEngine<'a> {
 
         let mut bits = PackageBits::empty(self.graph.len());
         for (idx, node) in self.graph.members.iter().enumerate() {
-            let path_str = node
-                .path
-                .canonicalize()
-                .map(|p| p.to_string_lossy().to_string())
-                .unwrap_or_else(|_| node.path.to_string_lossy().to_string());
+            let path_str = node.path.canonicalize().map_or_else(
+                |_| node.path.to_string_lossy().to_string(),
+                |p| p.to_string_lossy().to_string(),
+            );
             if matcher.is_match(&path_str) {
                 bits.set(idx);
             }

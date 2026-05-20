@@ -2308,7 +2308,7 @@ async fn lpm_command_with_orphan_pending_tx_emits_recovery_banner() {
         tx_id: "tx-orphan-1".into(),
         kind: TxKind::Install,
         package: "pkg-orphan".into(),
-        new_root_path: install_root.clone(),
+        new_root_path: install_root,
         new_row_json: serde_json::json!({
             "saved_spec": "^1",
             "resolved": "1.0.0",

@@ -554,7 +554,7 @@ impl Parser {
     }
 
     fn position(&self) -> usize {
-        self.tokens.get(self.pos).map(|(_, p)| *p).unwrap_or(0)
+        self.tokens.get(self.pos).map_or(0, |(_, p)| *p)
     }
 
     fn advance(&mut self) -> Option<(Token, usize)> {
@@ -894,7 +894,7 @@ impl<'a> DepGraph<'a> {
 
     /// Get direct dependencies of a package (by key).
     pub fn direct_deps(&self, key: &str) -> &[&'a str] {
-        self.children.get(key).map(|v| v.as_slice()).unwrap_or(&[])
+        self.children.get(key).map_or(&[], |v| v.as_slice())
     }
 }
 
@@ -1038,7 +1038,7 @@ fn matches_id(id: &str, pkg: &PackageContext<'_>) -> bool {
     // any @ that's part of the scope (e.g., @lpm.dev/owner.pkg).
     let search_start = if id.starts_with('@') {
         // Scoped package: skip past the scope (find / first)
-        id.find('/').map(|p| p + 1).unwrap_or(1)
+        id.find('/').map_or(1, |p| p + 1)
     } else {
         0
     };
@@ -2187,13 +2187,13 @@ mod tests {
         let sel = parse_selector(":eval").unwrap();
         let start = std::time::Instant::now();
 
-        let matched: Vec<_> = pkgs
+        let count = pkgs
             .iter()
             .filter(|pkg| super::matches(&sel, pkg, &graph, &all))
-            .collect();
+            .count();
 
         let elapsed = start.elapsed();
-        assert_eq!(matched.len(), 100, "10% of 1000 packages have eval");
+        assert_eq!(count, 100, "10% of 1000 packages have eval");
         assert!(
             elapsed.as_millis() < 2000,
             "query on 1000 packages must complete in < 2s, took {}ms",

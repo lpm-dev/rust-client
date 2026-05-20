@@ -327,8 +327,7 @@ fn approve_scripts_global_yes_dry_run_does_not_mutate_trust_file_and_json_carrie
         warnings
             .first()
             .and_then(|w| w.as_str())
-            .map(|s| s.contains("DRY RUN"))
-            .unwrap_or(false),
+            .is_some_and(|s| s.contains("DRY RUN")),
         "global --yes warning must reframe as DRY RUN; warnings={warnings:?}"
     );
 }

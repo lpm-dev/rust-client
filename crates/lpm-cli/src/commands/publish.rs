@@ -297,16 +297,14 @@ pub async fn run(
                 // npm: config override → package.json name. Reject @lpm.dev/.
                 npm_config
                     .and_then(|c| c.name.clone())
-                    .map(Ok)
-                    .unwrap_or_else(|| publish_npm::resolve_npm_name(name, None))?
+                    .map_or_else(|| publish_npm::resolve_npm_name(name, None), Ok)?
             }
             PublishTarget::GitHub => {
                 // GitHub: config override → npm config → package.json. Must be scoped.
                 let gh_name = github_config
                     .and_then(|c| c.name.clone())
                     .or_else(|| npm_config.and_then(|c| c.name.clone()))
-                    .map(Ok)
-                    .unwrap_or_else(|| publish_npm::resolve_npm_name(name, None))?;
+                    .map_or_else(|| publish_npm::resolve_npm_name(name, None), Ok)?;
                 if !gh_name.starts_with('@') {
                     return Err(LpmError::Registry(
                         "GitHub Packages requires scoped package names (@owner/package). \
@@ -321,15 +319,13 @@ pub async fn run(
                 gitlab_config
                     .and_then(|c| c.name.clone())
                     .or_else(|| npm_config.and_then(|c| c.name.clone()))
-                    .map(Ok)
-                    .unwrap_or_else(|| publish_npm::resolve_npm_name(name, None))?
+                    .map_or_else(|| publish_npm::resolve_npm_name(name, None), Ok)?
             }
             PublishTarget::Custom(_) => {
                 // Custom: npm config → package.json.
                 npm_config
                     .and_then(|c| c.name.clone())
-                    .map(Ok)
-                    .unwrap_or_else(|| publish_npm::resolve_npm_name(name, None))?
+                    .map_or_else(|| publish_npm::resolve_npm_name(name, None), Ok)?
             }
         };
         target_names.insert(target.key(), resolved);
@@ -786,7 +782,7 @@ pub async fn run(
                 // Wrap the entire LPM publish path so any error becomes a PublishResult
                 let lpm_result: Result<serde_json::Value, LpmError> = async {
                     let lpm_name =
-                        target_names.get("lpm").map(|s| s.as_str()).unwrap_or(name);
+                        target_names.get("lpm").map_or(name, |s| s.as_str());
 
                     // Rewrite tarball if LPM name differs from package.json name
                     let lpm_tarball = if lpm_name != name {
@@ -848,7 +844,7 @@ pub async fn run(
                 .await;
 
                 let duration = start.elapsed();
-                let lpm_name = target_names.get("lpm").map(|s| s.as_str()).unwrap_or(name);
+                let lpm_name = target_names.get("lpm").map_or(name, |s| s.as_str());
                 match lpm_result {
                     Ok(resp) => {
                         if !json_output {
@@ -1470,7 +1466,7 @@ fn collect_skill_files(dir: &Path, f: &mut dyn FnMut(&Path)) {
         let path = entry.path();
         if path.is_dir() {
             collect_skill_files(&path, f);
-        } else if path.extension().map(|e| e == "md").unwrap_or(false) {
+        } else if path.extension().is_some_and(|e| e == "md") {
             f(&path);
         }
     }
@@ -1497,16 +1493,10 @@ fn ensure_lpm_in_files(pkg_json_path: &Path, pkg_json: &serde_json::Value) -> Re
                 let mut new_content = String::with_capacity(content.len() + 32);
                 new_content.push_str(&content[..insert_pos]);
                 let after_bracket = &content[insert_pos..];
-                let indent = after_bracket
-                    .find('"')
-                    .map(|i| {
-                        let segment = &after_bracket[..i];
-                        segment
-                            .rfind('\n')
-                            .map(|nl| &segment[nl + 1..])
-                            .unwrap_or(segment)
-                    })
-                    .unwrap_or("    ");
+                let indent = after_bracket.find('"').map_or("    ", |i| {
+                    let segment = &after_bracket[..i];
+                    segment.rfind('\n').map_or(segment, |nl| &segment[nl + 1..])
+                });
                 new_content.push('\n');
                 new_content.push_str(indent);
                 new_content.push_str("\".lpm/skills\",");
@@ -1582,10 +1572,10 @@ fn compute_published_skills_digest(skills: &[lpm_registry::Skill]) -> String {
 /// Print the quality score summary line.
 fn print_quality_summary(result: &quality::QualityResult) {
     let tier = match result.score {
-        90..=100 => "Excellent".green().to_string(),
-        70..=89 => "Good".blue().to_string(),
-        50..=69 => "Fair".yellow().to_string(),
-        _ => "Needs Work".dimmed().to_string(),
+        90..=100 => "Excellent".green(),
+        70..=89 => "Good".blue(),
+        50..=69 => "Fair".yellow(),
+        _ => "Needs Work".dimmed(),
     };
     output::info(&format!(
         "Quality: {}/{} ({})",
@@ -1683,9 +1673,9 @@ fn extract_swift_metadata(manifest: &serde_json::Value) -> serde_json::Value {
         .map(|arr| {
             arr.iter()
                 .map(|p| {
-                    let product_type = p
-                        .get("type")
-                        .map(|t| {
+                    let product_type = p.get("type").map_or_else(
+                        || "library".into(),
+                        |t| {
                             if let Some(obj) = t.as_object() {
                                 obj.keys()
                                     .next()
@@ -1696,8 +1686,8 @@ fn extract_swift_metadata(manifest: &serde_json::Value) -> serde_json::Value {
                             } else {
                                 "library".into()
                             }
-                        })
-                        .unwrap_or_else(|| "library".into());
+                        },
+                    );
 
                     serde_json::json!({
                         "name": p.get("name").and_then(|v| v.as_str()).unwrap_or_default(),

@@ -174,8 +174,10 @@ fn assert_in_sync(kind: &str) {
             .lines()
             .zip(canonical.lines())
             .position(|(a, b)| a != b)
-            .map(|i| i + 1)
-            .unwrap_or_else(|| public.lines().count().max(canonical.lines().count()));
+            .map_or_else(
+                || public.lines().count().max(canonical.lines().count()),
+                |i| i + 1,
+            );
         panic!(
             "schema drift: {} differs from `lpm schema {kind}` output.\n\
              First diverging line: ~{public_first_diff}\n\

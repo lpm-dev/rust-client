@@ -81,9 +81,9 @@ fn run_status(project_dir: &Path, json_output: bool) -> Result<(), LpmError> {
     output::header("Root CA");
     if status.ca_exists {
         let trusted_str = if status.ca_trusted {
-            "trusted".green().to_string()
+            "trusted".green()
         } else {
-            "not trusted".red().to_string()
+            "not trusted".red()
         };
         output::field("status", &format!("installed ({})", trusted_str));
 
@@ -96,11 +96,11 @@ fn run_status(project_dir: &Path, json_output: bool) -> Result<(), LpmError> {
         if let Some(days) = days_remaining {
             let txt = format!("{days} days");
             let colored = if days < 30 {
-                txt.red().to_string()
+                txt.red()
             } else if days < 60 {
-                txt.yellow().to_string()
+                txt.yellow()
             } else {
-                txt.green().to_string()
+                txt.green()
             };
             output::field("remaining", &colored);
             if days < 60 {
@@ -111,7 +111,7 @@ fn run_status(project_dir: &Path, json_output: bool) -> Result<(), LpmError> {
             }
         }
     } else {
-        output::field("status", &"not installed".red().to_string());
+        output::field("status", &"not installed".red());
         println!(
             "  {}",
             "Run `lpm cert trust` to generate and install the CA".dimmed()
@@ -129,9 +129,9 @@ fn run_status(project_dir: &Path, json_output: bool) -> Result<(), LpmError> {
     output::header("Project Certificate");
     if status.project_cert_exists {
         if status.project_cert_needs_renewal {
-            output::field("status", &"needs renewal".yellow().to_string());
+            output::field("status", &"needs renewal".yellow());
         } else {
-            output::field("status", &"valid".green().to_string());
+            output::field("status", &"valid".green());
         }
         if let Some(expires) = &status.project_cert_expires {
             output::field("expires", expires);
@@ -140,7 +140,7 @@ fn run_status(project_dir: &Path, json_output: bool) -> Result<(), LpmError> {
             output::field("hostnames", &status.project_cert_hostnames.join(", "));
         }
     } else {
-        output::field("status", &"not generated".dimmed().to_string());
+        output::field("status", &"not generated".dimmed());
         println!(
             "  {}",
             "Run `lpm dev --https` or `lpm cert generate` to create".dimmed()

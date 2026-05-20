@@ -1881,7 +1881,7 @@ mod tests {
             tx_id: "tx1".into(),
             kind: TxKind::Install,
             package: "pkg".into(),
-            new_root_path: install_root.clone(),
+            new_root_path: install_root,
             new_row_json: serde_json::json!({
                 "saved_spec": "^1.0.0",
                 "resolved": "1.0.0",
@@ -1954,7 +1954,7 @@ mod tests {
             tx_id: "tx1".into(),
             kind: TxKind::Install,
             package: "pkg".into(),
-            new_root_path: install_root.clone(),
+            new_root_path: install_root,
             new_row_json: new_row,
             prior_active_row_json: None,
             prior_command_ownership_json: serde_json::json!({}),
@@ -2556,7 +2556,7 @@ mod tests {
             tx_id: "tx-aliased".into(),
             kind: TxKind::Install,
             package: "foo".into(),
-            new_root_path: foo_root.clone(),
+            new_root_path: foo_root,
             new_row_json: new_row,
             prior_active_row_json: None,
             prior_command_ownership_json: serde_json::json!({}),
@@ -2586,8 +2586,7 @@ mod tests {
             final_manifest
                 .packages
                 .get("http-server")
-                .map(|e| e.commands.contains(&"serve".to_string()))
-                .unwrap_or(false),
+                .is_some_and(|e| e.commands.contains(&"serve".to_string())),
             "displaced owner keeps `serve` when the new install only aliases"
         );
         assert!(
@@ -2767,7 +2766,7 @@ mod tests {
             tx_id: "tx1".into(),
             kind: TxKind::Install,
             package: "pkg".into(),
-            new_root_path: install_root.clone(),
+            new_root_path: install_root,
             new_row_json: new_row,
             prior_active_row_json: None,
             prior_command_ownership_json: serde_json::json!({}),
@@ -3141,7 +3140,7 @@ mod tests {
             tx_id: "tx1".into(),
             kind: TxKind::Upgrade,
             package: "pkg".into(),
-            new_root_path: new_root.clone(),
+            new_root_path: new_root,
             new_row_json: new_row,
             prior_active_row_json: Some(prior_row),
             prior_command_ownership_json: serde_json::json!({}),
@@ -3639,7 +3638,7 @@ mod tests {
             tx_id: "tx-m76-recover".into(),
             kind: TxKind::Uninstall,
             package: "pkga".into(),
-            new_root_path: install_root.clone(),
+            new_root_path: install_root,
             new_row_json: serde_json::Value::Null,
             prior_active_row_json: Some(serde_json::json!({
                 "saved_spec": "^1",

@@ -92,7 +92,7 @@ fn push_documentation_checks(
     ecosystem: &str,
 ) {
     // has-readme (8pts)
-    let readme_len = readme.map(|r| r.len()).unwrap_or(0);
+    let readme_len = readme.map_or(0, |r| r.len());
     checks.push(QualityCheck {
         id: "has-readme".into(),
         category: "documentation".into(),
@@ -248,9 +248,7 @@ fn push_js_code_quality_checks(
 
     // tree-shakable (3pts)
     let side_effects = pkg_json.get("sideEffects");
-    let tree_shakable = side_effects
-        .map(|v| v.as_bool() == Some(false) || v.is_array())
-        .unwrap_or(false)
+    let tree_shakable = side_effects.is_some_and(|v| v.as_bool() == Some(false) || v.is_array())
         || (has_exports && pkg_type == "module");
     checks.push(QualityCheck {
         id: "tree-shakable".into(),
@@ -295,8 +293,7 @@ fn push_js_code_quality_checks(
     let dep_count = pkg_json
         .get("dependencies")
         .and_then(|d| d.as_object())
-        .map(|o| o.len())
-        .unwrap_or(0);
+        .map_or(0, |o| o.len());
     let dep_pts = match dep_count {
         0 => 3,
         1..=3 => 2,
@@ -649,8 +646,7 @@ fn push_health_checks(
     let has_keywords = pkg_json
         .get("keywords")
         .and_then(|k| k.as_array())
-        .map(|a| !a.is_empty())
-        .unwrap_or(false);
+        .is_some_and(|a| !a.is_empty());
     checks.push(QualityCheck {
         id: "has-keywords".into(),
         category: "health".into(),
@@ -693,7 +689,7 @@ fn push_health_checks(
         let has_lifecycle = pkg_json
             .get("scripts")
             .and_then(|s| s.as_object())
-            .map(|scripts| {
+            .is_some_and(|scripts| {
                 scripts.keys().any(|k| {
                     matches!(
                         k.as_str(),
@@ -705,8 +701,7 @@ fn push_health_checks(
                             | "postuninstall"
                     )
                 })
-            })
-            .unwrap_or(false);
+            });
         checks.push(QualityCheck {
             id: "no-lifecycle-scripts".into(),
             category: "health".into(),

@@ -268,8 +268,7 @@ impl SessionManager {
         if let Ok(Some(secret)) = self.token_for(requirement).await {
             let needs_proactive_refresh = self
                 .current_source()
-                .map(|s| s.refresh_policy() == RefreshPolicy::IfRefreshable)
-                .unwrap_or(false)
+                .is_some_and(|s| s.refresh_policy() == RefreshPolicy::IfRefreshable)
                 && crate::is_session_access_token_expired(&self.registry_url);
 
             if !needs_proactive_refresh {

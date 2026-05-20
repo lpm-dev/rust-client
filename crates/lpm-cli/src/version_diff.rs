@@ -656,8 +656,8 @@ fn render_script_body_diff(prior: Option<&PhaseBodies>, candidate: Option<&Phase
     let formatter = diffy::PatchFormatter::new();
     let mut out = String::new();
     for phase in lpm_security::EXECUTED_INSTALL_PHASES {
-        let p = prior.get(*phase).map(String::as_str).unwrap_or("");
-        let c = candidate.get(*phase).map(String::as_str).unwrap_or("");
+        let p = prior.get(*phase).map_or("", String::as_str);
+        let c = candidate.get(*phase).map_or("", String::as_str);
         if p == c {
             continue;
         }

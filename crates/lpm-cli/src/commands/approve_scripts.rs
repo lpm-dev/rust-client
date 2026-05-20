@@ -637,7 +637,7 @@ async fn run_under_store_lock(
         } else {
             // skip path: nothing to record besides the count (typed-out
             // here to avoid an unused mut warning if we never push)
-            return print_summary(
+            print_summary(
                 &effective_state,
                 &approved,
                 &[target],
@@ -648,9 +648,10 @@ async fn run_under_store_lock(
                 json_output,
                 Some(&provenance_by_pkg),
             );
+            return Ok(());
         }
 
-        return print_summary(
+        print_summary(
             &effective_state,
             &approved,
             &skipped,
@@ -661,6 +662,7 @@ async fn run_under_store_lock(
             json_output,
             Some(&provenance_by_pkg),
         );
+        return Ok(());
     }
 
     if effective_state.blocked_packages.is_empty() {
@@ -694,7 +696,8 @@ async fn run_under_store_lock(
     // ── --list (read-only) ──────────────────────────────────────────
 
     if list {
-        return print_listing(&effective_state, &trusted, dry_run, json_output);
+        print_listing(&effective_state, &trusted, dry_run, json_output);
+        return Ok(());
     }
 
     // Track outcomes for the summary / JSON output
@@ -744,7 +747,7 @@ async fn run_under_store_lock(
         if !dry_run {
             write_back(&pkg_json_path, &mut manifest, &trusted)?;
         }
-        return print_summary(
+        print_summary(
             &effective_state,
             &approved,
             &skipped,
@@ -755,6 +758,7 @@ async fn run_under_store_lock(
             json_output,
             Some(&provenance_by_pkg),
         );
+        return Ok(());
     }
 
     // (The `<pkg>` branch is handled at the top of `run` BEFORE the
@@ -938,7 +942,8 @@ async fn run_under_store_lock(
         dry_run,
         json_output,
         Some(&provenance_by_pkg),
-    )
+    );
+    Ok(())
 }
 
 /// The interactive walk's per-package
@@ -1336,10 +1341,7 @@ fn enforce_tiered_yes_gate<R: TieredRow>(blocked: &[R], scope: GateScope) -> Res
     let detail = refusals
         .iter()
         .map(|bp| {
-            let tier_text = bp
-                .static_tier()
-                .map(tier_label_text)
-                .unwrap_or("unknown tier");
+            let tier_text = bp.static_tier().map_or("unknown tier", tier_label_text);
             format!("    {}  [{}]", bp.display_id(), tier_text)
         })
         .collect::<Vec<_>>()
@@ -1387,9 +1389,9 @@ fn colored_tier_label(tier: lpm_security::triage::StaticTier) -> String {
     use lpm_security::triage::StaticTier;
     let text = tier_label_text(tier);
     match tier {
-        StaticTier::Green => text.green().to_string(),
-        StaticTier::Amber | StaticTier::AmberLlm => text.yellow().to_string(),
-        StaticTier::Red => text.red().to_string(),
+        StaticTier::Green => text.green(),
+        StaticTier::Amber | StaticTier::AmberLlm => text.yellow(),
+        StaticTier::Red => text.red(),
     }
 }
 
@@ -1485,7 +1487,7 @@ fn print_listing(
     // read `envelope.dry_run` without branching on mode.
     dry_run: bool,
     json_output: bool,
-) -> Result<(), LpmError> {
+) {
     if json_output {
         let body = serde_json::json!({
             "schema_version": SCHEMA_VERSION,
@@ -1500,7 +1502,7 @@ fn print_listing(
             "errors": [],
         });
         println!("{}", serde_json::to_string_pretty(&body).unwrap());
-        return Ok(());
+        return;
     }
 
     output::info(&format!(
@@ -1519,7 +1521,6 @@ fn print_listing(
     output::info(
         "Run `lpm approve-scripts` (interactive), `lpm approve-scripts --yes` (bulk), or `lpm approve-scripts <pkg>` to approve.",
     );
-    Ok(())
 }
 
 /// Delegates to the shared
@@ -1563,7 +1564,7 @@ fn print_summary(
     // single-entry helper directly). When `Some(_)`, the map's keys
     // are the same `(name, version)` pairs as the blocked set.
     provenance_by_pkg: Option<&HashMap<(String, String), ProvenanceStatus>>,
-) -> Result<(), LpmError> {
+) {
     if json_output {
         let mut warnings: Vec<serde_json::Value> = Vec::new();
         if yes_flag {
@@ -1649,7 +1650,6 @@ fn print_summary(
             }
         }
     }
-    Ok(())
 }
 
 #[allow(dead_code)]
@@ -1744,7 +1744,8 @@ async fn run_global_under_store_lock(
 
     // ── List mode ─────────────────────────────────────────────────
     if list {
-        return print_global_list(&aggregate, effective_group, dry_run, json_output);
+        print_global_list(&aggregate, effective_group, dry_run, json_output);
+        return Ok(());
     }
 
     // ── Empty set short-circuit (same as project-scoped run) ────
@@ -1820,7 +1821,7 @@ fn print_global_list(
     // schema uniformity.
     dry_run: bool,
     json_output: bool,
-) -> Result<(), LpmError> {
+) {
     if json_output {
         let entries: Vec<_> = aggregate
             .rows
@@ -1850,11 +1851,11 @@ fn print_global_list(
             "errors": [],
         });
         println!("{}", serde_json::to_string_pretty(&body).unwrap());
-        return Ok(());
+        return;
     }
     if aggregate.rows.is_empty() {
         output::success("Nothing blocked globally.");
-        return Ok(());
+        return;
     }
     println!();
     output::info(&format!(
@@ -1923,7 +1924,6 @@ fn print_global_list(
         ));
     }
     println!();
-    Ok(())
 }
 
 // ─── rerun-hint helpers (origin-aware) ─────────────────────
@@ -2746,7 +2746,7 @@ fn print_aggregate_card(row: &crate::global_blocked_set::AggregateBlockedRow) {
         row.name.bold(),
         row.version.dimmed(),
         if row.binding_drift {
-            "  [binding drift]".yellow().to_string()
+            "  [binding drift]".yellow()
         } else {
             String::new()
         }
@@ -2918,7 +2918,7 @@ mod tests {
             ApprovalMetadata {
                 integrity: Some("sha512-prior".into()),
                 script_hash: Some("sha256-prior".into()),
-                provenance_at_approval: Some(prior_snap.clone()),
+                provenance_at_approval: Some(prior_snap),
                 behavioral_tags_hash: None,
                 behavioral_tags: None,
                 capability_hash: None,
@@ -2955,7 +2955,7 @@ mod tests {
             "acme-widget",
             "1.0.0",
             ApprovalMetadata {
-                provenance_at_approval: Some(prior_snap.clone()),
+                provenance_at_approval: Some(prior_snap),
                 ..Default::default()
             },
         );
@@ -2971,7 +2971,7 @@ mod tests {
             &trusted,
             &blocked,
             None,
-            Some(new_snap.clone()),
+            Some(new_snap),
         );
         assert_eq!(
             meta.provenance_at_approval
@@ -4885,10 +4885,10 @@ mod tests {
         // `(group × json)` shapes twice: once with dry_run=false,
         // once with dry_run=true. Smoke test that neither signal
         // panics the empty-aggregate branch.
-        print_global_list(&agg, false, false, false).unwrap();
-        print_global_list(&agg, true, false, false).unwrap();
-        print_global_list(&agg, false, false, true).unwrap();
-        print_global_list(&agg, false, true, true).unwrap();
+        print_global_list(&agg, false, false, false);
+        print_global_list(&agg, true, false, false);
+        print_global_list(&agg, false, false, true);
+        print_global_list(&agg, false, true, true);
     }
 
     /// `--yes` writes every aggregate row into the global trust file

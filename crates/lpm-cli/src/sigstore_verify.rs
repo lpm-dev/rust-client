@@ -744,10 +744,7 @@ fn build_lpm_canonical_envelope_json(envelope: &DsseEnvelope) -> String {
     let mut sig_entry = serde_json::Map::new();
     if let Some(sig) = envelope.signatures.first() {
         let sig_double_b64 = BASE64.encode(sig.sig.as_bytes());
-        sig_entry.insert(
-            "sig".into(),
-            serde_json::Value::String(sig_double_b64.clone()),
-        );
+        sig_entry.insert("sig".into(), serde_json::Value::String(sig_double_b64));
     }
     let rekor_envelope = serde_json::json!({
         "payloadType": &envelope.payload_type,
@@ -2346,8 +2343,7 @@ pub fn verify_embedded_sct(
             e.oid
                 .iter()
                 .map(|it| it.collect::<Vec<u64>>())
-                .map(|v| v.as_slice() == SCT_EXTENSION_OID_COMPONENTS)
-                .unwrap_or(false)
+                .is_some_and(|v| v.as_slice() == SCT_EXTENSION_OID_COMPONENTS)
         })
         .ok_or_else(|| {
             VerifyError::Sct(
@@ -3982,7 +3978,7 @@ mod tests {
 
     #[test]
     fn accepts_rekor_body_with_envelope_hash_mismatch_alone() {
-                // Pin the "envelope hash is advisory, never a rejection
+        // Pin the "envelope hash is advisory, never a rejection
         // reason" invariant.
         // The body's `spec.content.hash.value` is mutated to a wrong
         // sha256 (all zeros) while payloadHash and publicKey stay
@@ -5197,7 +5193,7 @@ mod tests {
     fn rfc6962_inclusion_walk_rejects_proof_with_flipped_sibling() {
         let ([h0, h1, _h2, _h3], (_h01, h23), root, _) = four_leaf_tree();
         // Flip one byte in the first sibling — walked root mismatches.
-        let mut tampered = h1.clone();
+        let mut tampered = h1;
         tampered[0] ^= 0x01;
         let proof = vec![tampered, h23];
         let computed = rfc6962_verify_inclusion(0, 4, &h0, &proof).unwrap();
@@ -5958,8 +5954,9 @@ mod tests {
         // are internally consistent.
         let (root_cert, root_der, root_kp) = p384_root_cert(cert_params_validity(2025));
         let leaf_der = p256_leaf_signed_by(cert_params_validity(2025), &root_cert, &root_kp);
-        let chain: Vec<&[u8]> = vec![&leaf_der, &leaf_der, &leaf_der, &root_der];
-        let root = fulcio_root_active_at(2025, root_der.clone());
+        let root_der_bytes = root_der.clone();
+        let chain: Vec<&[u8]> = vec![&leaf_der, &leaf_der, &leaf_der, &root_der_bytes];
+        let root = fulcio_root_active_at(2025, root_der);
         let roots: Vec<&FulcioRoot> = vec![&root];
         let err = verify_cert_chain(&chain, &roots, ts_year(2025))
             .expect_err("length-4 chain must reject");
@@ -5997,8 +5994,9 @@ mod tests {
         // The leaf doesn't matter for this test — root rejects
         // before signature work.
         let leaf_der = p256_leaf_signed_by(cert_params_validity(2025), &root_cert, &root_kp);
-        let chain: Vec<&[u8]> = vec![&leaf_der, &intermediate_der, &root_der];
-        let root = fulcio_root_active_at(2025, root_der.clone());
+        let root_der_bytes = root_der.clone();
+        let chain: Vec<&[u8]> = vec![&leaf_der, &intermediate_der, &root_der_bytes];
+        let root = fulcio_root_active_at(2025, root_der);
         let roots: Vec<&FulcioRoot> = vec![&root];
         let err = verify_cert_chain(&chain, &roots, ts_year(2025))
             .expect_err("pathLen exceeded must reject");
@@ -7164,9 +7162,7 @@ mod tests {
             let set_b64 = BASE64.encode(sig.to_der().as_bytes());
             let tlog = crate::sigstore::TlogEntry {
                 log_index: "42".into(),
-                log_id: crate::sigstore::LogId {
-                    key_id: log_id_hex.clone(),
-                },
+                log_id: crate::sigstore::LogId { key_id: log_id_hex },
                 integrated_time: integrated_time.to_string(),
                 inclusion_promise: Some(crate::sigstore::RekorInclusionPromise {
                     signed_entry_timestamp: set_b64,

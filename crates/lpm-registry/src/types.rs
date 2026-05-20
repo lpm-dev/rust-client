@@ -522,11 +522,7 @@ impl VersionMetadata {
             .iter()
             .find(|p| {
                 // Skip executables — prefer library products
-                p.product_type
-                    .as_ref()
-                    .and_then(|t| t.as_str())
-                    .map(|s| s != "executable")
-                    .unwrap_or(true)
+                p.product_type.as_ref().and_then(|t| t.as_str()) != Some("executable")
             })
             .map(|p| p.name.as_str())
     }
@@ -536,31 +532,21 @@ impl VersionMetadata {
         let has_findings = self
             .security_findings
             .as_ref()
-            .map(|f| !f.is_empty())
-            .unwrap_or(false);
-        let has_dangerous_tags = self
-            .behavioral_tags
-            .as_ref()
-            .map(|t| {
-                t.eval
-                    || t.child_process
-                    || t.shell
-                    || t.dynamic_require
-                    || t.obfuscated
-                    || t.protestware
-                    || t.high_entropy_strings
-            })
-            .unwrap_or(false);
+            .is_some_and(|f| !f.is_empty());
+        let has_dangerous_tags = self.behavioral_tags.as_ref().is_some_and(|t| {
+            t.eval
+                || t.child_process
+                || t.shell
+                || t.dynamic_require
+                || t.obfuscated
+                || t.protestware
+                || t.high_entropy_strings
+        });
         let has_lifecycle = self
             .lifecycle_scripts
             .as_ref()
-            .map(|s| !s.is_empty())
-            .unwrap_or(false);
-        let has_vulns = self
-            .vulnerabilities
-            .as_ref()
-            .map(|v| !v.is_empty())
-            .unwrap_or(false);
+            .is_some_and(|s| !s.is_empty());
+        let has_vulns = self.vulnerabilities.as_ref().is_some_and(|v| !v.is_empty());
         has_findings || has_dangerous_tags || has_lifecycle || has_vulns
     }
 

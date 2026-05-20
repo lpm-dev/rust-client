@@ -347,13 +347,15 @@ impl VerdaccioRegistry {
         value
             .get("token")
             .and_then(|token| token.as_str())
-            .map(ToOwned::to_owned)
-            .unwrap_or_else(|| {
-                panic!(
-                    "verdaccio bootstrap user response missing token: {}",
-                    serde_json::to_string_pretty(&value).unwrap_or_else(|_| value.to_string())
-                )
-            })
+            .map_or_else(
+                || {
+                    panic!(
+                        "verdaccio bootstrap user response missing token: {}",
+                        serde_json::to_string_pretty(&value).unwrap_or_else(|_| value.to_string())
+                    )
+                },
+                ToOwned::to_owned,
+            )
     }
 
     fn logs(&self) -> String {

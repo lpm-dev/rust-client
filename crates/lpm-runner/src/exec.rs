@@ -100,7 +100,7 @@ pub fn exec_file(
             use std::os::unix::process::ExitStatusExt;
             status
                 .code()
-                .unwrap_or_else(|| status.signal().map(|s| 128 + s).unwrap_or(1))
+                .unwrap_or_else(|| status.signal().map_or(1, |s| 128 + s))
         };
         return Err(LpmError::ExitCode(code));
     }

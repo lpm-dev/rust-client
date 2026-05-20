@@ -619,7 +619,7 @@ async fn run_tasks_parallel(
 
     // Show execution plan when there's parallelism
     let total_tasks: usize = levels.iter().map(|l| l.len()).sum();
-    if levels.len() > 1 || levels.first().map(|l| l.len()).unwrap_or(0) > 1 {
+    if levels.len() > 1 || levels.first().map_or(0, |l| l.len()) > 1 {
         eprintln!(
             "  Running {} tasks ({} parallel groups)...\n",
             total_tasks,
@@ -1327,8 +1327,7 @@ fn run_workspace_package(
         pkg.scripts.contains_key(s)
             || tasks
                 .get(s)
-                .map(|tc| tc.command.is_some() || !tc.depends_on.is_empty())
-                .unwrap_or(false)
+                .is_some_and(|tc| tc.command.is_some() || !tc.depends_on.is_empty())
     });
     if !has_any {
         return None;
@@ -1634,8 +1633,7 @@ fn is_meta_task(
     // Has task config with dependsOn?
     let has_deps = tasks
         .get(task_name)
-        .map(|tc| !tc.depends_on.is_empty())
-        .unwrap_or(false);
+        .is_some_and(|tc| !tc.depends_on.is_empty());
     if !has_deps {
         return false;
     }
@@ -1650,10 +1648,7 @@ fn is_meta_task(
     }
 
     // Has a script in package.json?
-    if pkg_scripts
-        .map(|s| s.contains_key(task_name))
-        .unwrap_or(false)
-    {
+    if pkg_scripts.is_some_and(|s| s.contains_key(task_name)) {
         return false;
     }
 
@@ -1713,8 +1708,7 @@ fn is_task_cached_with_config(
 ) -> bool {
     lpm_config
         .and_then(|c| c.tasks.get(script_name))
-        .map(|tc| tc.cache && !tc.outputs.is_empty())
-        .unwrap_or(false)
+        .is_some_and(|tc| tc.cache && !tc.outputs.is_empty())
 }
 
 /// Print a JSON summary of task results ().

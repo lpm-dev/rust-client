@@ -130,7 +130,7 @@ pub fn discover_packages(start_dir: &Path) -> Result<DiscoveryResult, LpmError> 
     // No lockfile found — try node_modules/ fallback from start_dir
     let nm_dir = start_dir.join("node_modules");
     if nm_dir.is_dir() {
-        return discover_from_node_modules(start_dir);
+        return Ok(discover_from_node_modules(start_dir));
     }
 
     Err(LpmError::NotFound(
@@ -308,7 +308,7 @@ fn discover_from_bun_lockfile(project_root: &Path) -> Result<DiscoveryResult, Lp
         // Fall back to node_modules walk if available.
         let nm_dir = project_root.join("node_modules");
         if nm_dir.is_dir() {
-            return discover_from_node_modules(project_root);
+            return Ok(discover_from_node_modules(project_root));
         }
         return Err(LpmError::NotFound(
             "bun.lockb is a binary lockfile. Run `bun install` to generate \
@@ -332,7 +332,7 @@ fn discover_from_bun_lockfile(project_root: &Path) -> Result<DiscoveryResult, Lp
 
 // ─── node_modules fallback (degraded mode) ──────────────────────────────────
 
-fn discover_from_node_modules(project_root: &Path) -> Result<DiscoveryResult, LpmError> {
+fn discover_from_node_modules(project_root: &Path) -> DiscoveryResult {
     let nm_dir = project_root.join("node_modules");
 
     // Pass 1: Read all packages and collect unresolved dependency names
@@ -392,14 +392,14 @@ fn discover_from_node_modules(project_root: &Path) -> Result<DiscoveryResult, Lp
         })
         .collect();
 
-    Ok(DiscoveryResult {
+    DiscoveryResult {
         manager: ManagerKind::FallbackNodeModules,
         lockfile_path: None,
         project_root: project_root.to_path_buf(),
         is_degraded: true,
         is_yarn_pnp: false,
         packages,
-    })
+    }
 }
 
 /// Read a single package's info from its `node_modules/<name>/package.json`.

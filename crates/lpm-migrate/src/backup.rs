@@ -545,8 +545,7 @@ pub fn resolve_manifest_path(project_dir: &Path, rel: &str) -> Result<PathBuf, L
 fn relativize_to_posix(path: &Path, project_dir: &Path) -> String {
     let rel = path
         .strip_prefix(project_dir)
-        .map(|p| p.to_path_buf())
-        .unwrap_or_else(|_| path.to_path_buf());
+        .map_or_else(|_| path.to_path_buf(), |p| p.to_path_buf());
 
     rel.components()
         .filter_map(|c| match c {

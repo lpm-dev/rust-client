@@ -767,13 +767,11 @@ pub fn capture_blocked_set_after_install_with_metadata(
     let previous_fingerprint = previous.as_ref().map(|p| p.blocked_set_fingerprint.clone());
     let previous_was_non_empty = previous
         .as_ref()
-        .map(|p| !p.blocked_packages.is_empty())
-        .unwrap_or(false);
+        .is_some_and(|p| !p.blocked_packages.is_empty());
 
     let fingerprint_changed = previous_fingerprint
         .as_deref()
-        .map(|prev| prev != fingerprint)
-        .unwrap_or(true); // no previous state → "changed" from None
+        .is_none_or(|prev| prev != fingerprint); // no previous state → "changed" from None
 
     let now_empty = blocked.is_empty();
 

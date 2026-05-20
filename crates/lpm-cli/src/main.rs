@@ -2451,8 +2451,7 @@ fn main() -> Result<()> {
         let pkg_content_opt = std::fs::read_to_string(cwd.join("package.json")).ok();
         let is_workspace = pkg_content_opt
             .as_deref()
-            .map(install_state::is_workspace_root_content)
-            .unwrap_or(false);
+            .is_some_and(install_state::is_workspace_root_content);
 
         if !is_workspace && let Some(pkg_content) = pkg_content_opt.as_deref() {
             let state = install_state::check_install_state_with_content(&cwd, pkg_content);
@@ -2616,13 +2615,10 @@ async fn async_main() -> Result<()> {
     // `LPM_TOKEN` env (clap merges them). When the value matches
     // `LPM_TOKEN` exactly, treat it as env-sourced so SessionManager
     // can classify it correctly; otherwise it's an explicit flag value.
-    let explicit_flag_token = cli.token.clone().filter(|t| {
-        std::env::var("LPM_TOKEN")
-            .ok()
-            .as_deref()
-            .map(|env_v| env_v != t.as_str())
-            .unwrap_or(true)
-    });
+    let explicit_flag_token = cli
+        .token
+        .clone()
+        .filter(|t| std::env::var("LPM_TOKEN").ok().as_deref() != Some(t.as_str()));
     let session = std::sync::Arc::new(lpm_auth::SessionManager::new(
         registry_url.to_string(),
         explicit_flag_token,
@@ -4393,7 +4389,10 @@ async fn async_main() -> Result<()> {
         }
         Commands::Vault { action } => commands::vault::run(&action, cli.json).await,
         Commands::SelfUpdate { refresh } => commands::self_update::run(cli.json, refresh).await,
-        Commands::Completions { shell } => commands::completions::run(shell),
+        Commands::Completions { shell } => {
+            commands::completions::run(shell);
+            Ok(())
+        }
         Commands::Schema { kind, out } => commands::schema::run(&kind, out.as_deref()),
         Commands::InternalUpdateCheck => {
             // hidden subcommand — unconditionally refresh the

@@ -622,8 +622,7 @@ fn format_solution(
                         .filter_map(|local_name| {
                             let target_name = cached_aliases
                                 .get(local_name)
-                                .map(String::as_str)
-                                .unwrap_or(local_name.as_str());
+                                .map_or(local_name.as_str(), String::as_str);
                             resolved_versions
                                 .get(target_name)
                                 .map(|resolved_ver| (local_name.clone(), resolved_ver.clone()))
@@ -1135,9 +1134,7 @@ pub fn validate_allowed_versions_selector(raw_key: &str) -> Result<(), String> {
 /// that the install path honors. A range that migrates clean must
 /// also compile clean.
 pub fn validate_allowed_versions_range(raw_range: &str) -> Result<(), String> {
-    crate::ranges::NpmRange::parse(raw_range)
-        .map(|_| ())
-        .map_err(|e| e.to_string())
+    crate::ranges::NpmRange::parse(raw_range).map(|_| ())
 }
 
 impl CompiledPeerRules {

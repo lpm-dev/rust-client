@@ -195,7 +195,7 @@ fn stage_and_run(
             });
             audit::append_best_effort(audit::AuditAction::CaRotateFailed {
                 old_fingerprint: old_fp_hex.to_string(),
-                new_fingerprint: Some(new_fp_hex.clone()),
+                new_fingerprint: Some(new_fp_hex),
                 step: "trust_install",
                 error: e.to_string(),
             });
@@ -354,7 +354,7 @@ fn stage_and_run(
                 })?;
                 audit::append(audit::AuditAction::CaReconcileRequired {
                     old_fingerprint: old_fp_hex.to_string(),
-                    new_fingerprint: new_fp_hex.clone(),
+                    new_fingerprint: new_fp_hex,
                 })?;
                 return Err(e);
             }

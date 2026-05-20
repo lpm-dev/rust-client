@@ -507,7 +507,7 @@ fn rotate_refuses_to_overwrite_previous_while_reconcile_required_unresolved() {
     std::fs::copy(&active_cert, &prev_cert_path).unwrap();
     std::fs::copy(paths::ca_key_path().unwrap(), &prev_key_path).unwrap();
     audit::append(audit::AuditAction::CaReconcileRequired {
-        old_fingerprint: old_fp_hex.clone(),
+        old_fingerprint: old_fp_hex,
         new_fingerprint: "FUTURE".into(),
     })
     .unwrap();

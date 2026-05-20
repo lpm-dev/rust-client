@@ -52,7 +52,7 @@ pub struct GraphStats {
 /// in user-facing summaries. Empty graph stays at 0; root-only graph
 /// reports 1; deeper trees report `max(node.depth) + 1`.
 fn level_from_node_depths<'a>(depths: impl Iterator<Item = &'a usize>) -> usize {
-    depths.max().map(|d| d + 1).unwrap_or(0)
+    depths.max().map_or(0, |d| d + 1)
 }
 
 /// The full dependency graph.
@@ -359,10 +359,10 @@ fn render_tree_node(
         } else if node.registry == Registry::Lpm {
             format!("\x1b[32m{label}\x1b[0m") // green for LPM
         } else {
-            label.clone()
+            label
         }
     } else {
-        label.clone()
+        label
     };
 
     let circular = if visited.contains(key) {
@@ -855,8 +855,7 @@ pub fn render_why(
                 graph
                     .nodes
                     .get(k)
-                    .map(|n| format!("{}@{}", n.name, n.version))
-                    .unwrap_or_else(|| k.clone())
+                    .map_or_else(|| k.clone(), |n| format!("{}@{}", n.name, n.version))
             })
             .collect::<Vec<_>>()
             .join(" → ");
@@ -972,8 +971,7 @@ fn truncate_integrity(integrity: &str) -> String {
         let cut = integrity
             .char_indices()
             .nth(KEEP)
-            .map(|(i, _)| i)
-            .unwrap_or(integrity.len());
+            .map_or(integrity.len(), |(i, _)| i);
         format!("{}…", &integrity[..cut])
     }
 }
@@ -996,8 +994,7 @@ pub fn render_why_json(
                     graph
                         .nodes
                         .get(k)
-                        .map(|n| format!("{}@{}", n.name, n.version))
-                        .unwrap_or_else(|| k.clone())
+                        .map_or_else(|| k.clone(), |n| format!("{}@{}", n.name, n.version))
                 })
                 .collect()
         })
@@ -1366,8 +1363,7 @@ mod tests {
         let mousemove_idx = html.find("'mousemove'").unwrap();
         let next_section = html[mousemove_idx..]
             .find("// Mouse up")
-            .map(|i| mousemove_idx + i)
-            .unwrap_or(html.len());
+            .map_or(html.len(), |i| mousemove_idx + i);
         let mousemove_section = &html[mousemove_idx..next_section];
         assert!(
             mousemove_section.contains("{passive: true}"),

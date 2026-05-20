@@ -62,8 +62,7 @@ fn maybe_test_panic(stage: &str) {
         || std::env::var("LPM_TEST_MODE")
             .ok()
             .as_deref()
-            .map(|v| v == "1")
-            .unwrap_or(false);
+            .is_some_and(|v| v == "1");
     if !allowed {
         return;
     }
@@ -523,11 +522,10 @@ pub(crate) fn confirm_multi_member_mutation(
             manifests.len(),
         ));
         for path in manifests {
-            let label = path
-                .parent()
-                .and_then(|p| p.file_name())
-                .map(|n| n.to_string_lossy().to_string())
-                .unwrap_or_else(|| path.display().to_string());
+            let label = path.parent().and_then(|p| p.file_name()).map_or_else(
+                || path.display().to_string(),
+                |n| n.to_string_lossy().to_string(),
+            );
             println!("  {}", label.dimmed());
         }
     }
@@ -3673,12 +3671,11 @@ async fn run_with_options_under_store_lock(
     // schema for this surface yet — callers will learn the additions
     // via `lpm trust diff` once that lands in chunk C).
     if !json_output {
-        let current_snapshot = crate::trust_snapshot::TrustSnapshot::capture_current(
-            pkg.lpm
-                .as_ref()
-                .map(|l| &l.trusted_dependencies)
-                .unwrap_or(&lpm_workspace::TrustedDependencies::Legacy(Vec::new())),
-        );
+        let current_snapshot =
+            crate::trust_snapshot::TrustSnapshot::capture_current(pkg.lpm.as_ref().map_or(
+                &lpm_workspace::TrustedDependencies::Legacy(Vec::new()),
+                |l| &l.trusted_dependencies,
+            ));
         let previous_snapshot = crate::trust_snapshot::read_snapshot(project_dir);
         let additions = current_snapshot.diff_additions(previous_snapshot.as_ref());
         if let Some(notice) = crate::trust_snapshot::format_new_bindings_notice(&additions) {
@@ -4014,8 +4011,9 @@ async fn run_with_options_under_store_lock(
     let prior_overrides_state = overrides_state::read_state(project_dir);
     let overrides_changed = prior_overrides_state
         .as_ref()
-        .map(|s| s.fingerprint != override_set.fingerprint())
-        .unwrap_or(!override_set.is_empty());
+        .map_or(!override_set.is_empty(), |s| {
+            s.fingerprint != override_set.fingerprint()
+        });
     if overrides_changed {
         tracing::debug!(
             "overrides changed since last install (fingerprint drift) — \
@@ -4041,8 +4039,9 @@ async fn run_with_options_under_store_lock(
     let prior_patch_state = patch_state::read_state(project_dir);
     let patches_changed = prior_patch_state
         .as_ref()
-        .map(|s| s.fingerprint != current_patch_fingerprint)
-        .unwrap_or(!current_patches.is_empty());
+        .map_or(!current_patches.is_empty(), |s| {
+            s.fingerprint != current_patch_fingerprint
+        });
     if patches_changed {
         tracing::debug!(
             "patches changed since last install (fingerprint drift) — \
@@ -6851,12 +6850,10 @@ async fn run_with_options_under_store_lock(
     // doesn't fire," which degrades to the pre-46 behavior.
     {
         let trust_snap_start = std::time::Instant::now();
-        let snap = crate::trust_snapshot::TrustSnapshot::capture_current(
-            pkg.lpm
-                .as_ref()
-                .map(|l| &l.trusted_dependencies)
-                .unwrap_or(&lpm_workspace::TrustedDependencies::Legacy(Vec::new())),
-        );
+        let snap = crate::trust_snapshot::TrustSnapshot::capture_current(pkg.lpm.as_ref().map_or(
+            &lpm_workspace::TrustedDependencies::Legacy(Vec::new()),
+            |l| &l.trusted_dependencies,
+        ));
         if let Err(e) = crate::trust_snapshot::write_snapshot(project_dir, &snap) {
             tracing::warn!("failed to write trust-snapshot.json: {e}");
         }
@@ -7030,8 +7027,7 @@ async fn run_with_options_under_store_lock(
                 .lpm
                 .as_ref()
                 .and_then(|l| l.strict_deps.as_deref()) // reuse as quality gate
-                .map(|_| 50u32) // warn if below 50 when any strictness is set
-                .unwrap_or(30); // default: only warn below 30
+                .map_or(30, |_| 50u32); // default: only warn below 30
 
             // Step 6 fix (empty-bearer regression #1).
             // Pre-fix this site constructed a fresh RegistryClient and
@@ -8510,13 +8506,12 @@ async fn build_blocked_set_metadata(
             .versions
             .get(&p.version)
             .and_then(|v| v.behavioral_tags.as_ref())
-            .map(|tags| {
+            .map_or((None, None), |tags| {
                 let names = tags.active_tag_names();
                 let hash = lpm_security::triage::hash_behavioral_tag_set(&names);
                 let owned: Vec<String> = names.iter().map(|s| s.to_string()).collect();
                 (Some(hash), Some(owned))
-            })
-            .unwrap_or((None, None));
+            });
 
         // Only materialize an entry if at least ONE field is populated
         // — empty entries just waste map memory. Callers get `None` for
@@ -8739,8 +8734,7 @@ fn try_lockfile_fast_path(
         let target = lockfile
             .root_aliases
             .get(local)
-            .map(String::as_str)
-            .unwrap_or(local.as_str());
+            .map_or(local.as_str(), String::as_str);
         if lockfile.find_package(target).is_none() {
             tracing::debug!(
                 "lockfile miss: {local} (resolved target {target}) not found, re-resolving"
@@ -9327,12 +9321,10 @@ async fn run_link_and_finish(
     // comparing against stale state. Non-fatal on failure.
     {
         let trust_snap_start = std::time::Instant::now();
-        let snap = crate::trust_snapshot::TrustSnapshot::capture_current(
-            pkg.lpm
-                .as_ref()
-                .map(|l| &l.trusted_dependencies)
-                .unwrap_or(&lpm_workspace::TrustedDependencies::Legacy(Vec::new())),
-        );
+        let snap = crate::trust_snapshot::TrustSnapshot::capture_current(pkg.lpm.as_ref().map_or(
+            &lpm_workspace::TrustedDependencies::Legacy(Vec::new()),
+            |l| &l.trusted_dependencies,
+        ));
         if let Err(e) = crate::trust_snapshot::write_snapshot(project_dir, &snap) {
             tracing::warn!("failed to write trust-snapshot.json: {e}");
         }
@@ -9597,7 +9589,7 @@ fn pick_speculative_version(
         if !range.satisfies(&v) {
             continue;
         }
-        let better = best.as_ref().map(|(b, _)| v > *b).unwrap_or(true);
+        let better = best.as_ref().is_none_or(|(b, _)| v > *b);
         if better {
             best = Some((v, v_str.as_str()));
         }
@@ -9813,7 +9805,7 @@ fn spawn_speculation_dispatcher(
                 };
 
                 let key = format!("{name}@{version}");
-                if !already_dispatched.insert(key.clone()) {
+                if !already_dispatched.insert(key) {
                     return;
                 }
 
@@ -10045,8 +10037,7 @@ async fn speculative_download_and_store(
                 .paths()
                 .object_dir(sri)
                 .ok()
-                .map(|dir| dir.exists())
-                .unwrap_or(false),
+                .is_some_and(|dir| dir.exists()),
             None => store.has_package(name, version),
         }
     } else {
@@ -10849,8 +10840,10 @@ pub(crate) fn stage_packages_to_manifest(
     let target_label = pkg_json_path
         .parent()
         .and_then(|p| p.file_name())
-        .map(|n| n.to_string_lossy().to_string())
-        .unwrap_or_else(|| pkg_json_path.display().to_string());
+        .map_or_else(
+            || pkg_json_path.display().to_string(),
+            |n| n.to_string_lossy().to_string(),
+        );
 
     let force_rewrite = flags.forces_rewrite();
     let mut entries: Vec<StagedEntry> = Vec::with_capacity(package_specs.len());
@@ -11060,7 +11053,7 @@ pub(crate) fn finalize_packages_in_manifest(
         })?;
 
         let decision =
-            crate::save_spec::decide_saved_dependency_spec(&entry.intent, resolved, flags, config)?;
+            crate::save_spec::decide_saved_dependency_spec(&entry.intent, resolved, flags, config);
 
         doc[dep_key][&entry.name] = serde_json::Value::String(decision.spec_to_write);
     }
@@ -11476,8 +11469,7 @@ pub async fn run_install_filtered_add(
     let workspace_root_for_config: PathBuf = lpm_workspace::discover_workspace(cwd)
         .ok()
         .flatten()
-        .map(|ws| ws.root)
-        .unwrap_or_else(|| cwd.to_path_buf());
+        .map_or_else(|| cwd.to_path_buf(), |ws| ws.root);
     let save_config =
         crate::save_config::SaveConfigLoader::load_for_project(&workspace_root_for_config)?;
 
@@ -14133,7 +14125,7 @@ mod tests {
 
         // Reproduce the prefix of run_with_options exactly:
         let pkg = lpm_workspace::read_package_json(&app_dir.join("package.json")).unwrap();
-        let mut deps = pkg.dependencies.clone();
+        let mut deps = pkg.dependencies;
         let workspace = lpm_workspace::discover_workspace(&app_dir)
             .unwrap()
             .unwrap();
@@ -14244,7 +14236,7 @@ mod tests {
 
         let app_dir = root.join("packages/app");
         let pkg = lpm_workspace::read_package_json(&app_dir.join("package.json")).unwrap();
-        let mut deps = pkg.dependencies.clone();
+        let mut deps = pkg.dependencies;
         let workspace = lpm_workspace::discover_workspace(&app_dir)
             .unwrap()
             .unwrap();
@@ -14315,7 +14307,7 @@ mod tests {
 
         let host_dir = root.join("packages/host");
         let pkg = lpm_workspace::read_package_json(&host_dir.join("package.json")).unwrap();
-        let mut deps = pkg.dependencies.clone();
+        let mut deps = pkg.dependencies;
         let workspace = lpm_workspace::discover_workspace(&host_dir)
             .unwrap()
             .unwrap();
@@ -14361,7 +14353,7 @@ mod tests {
 
         let app_dir = root.join("packages/app");
         let pkg = lpm_workspace::read_package_json(&app_dir.join("package.json")).unwrap();
-        let mut deps = pkg.dependencies.clone();
+        let mut deps = pkg.dependencies;
         let workspace = lpm_workspace::discover_workspace(&app_dir)
             .unwrap()
             .unwrap();

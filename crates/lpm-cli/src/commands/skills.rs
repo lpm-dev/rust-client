@@ -50,7 +50,7 @@ fn list_skills(project_dir: &Path, json_output: bool) -> Result<(), LpmError> {
 
         for skill_entry in std::fs::read_dir(pkg_entry.path())?.flatten() {
             let path = skill_entry.path();
-            if path.extension().map(|e| e == "md").unwrap_or(false) {
+            if path.extension().is_some_and(|e| e == "md") {
                 let name = path
                     .file_stem()
                     .unwrap_or_default()
@@ -198,7 +198,7 @@ fn validate_skills(project_dir: &Path, json_output: bool) -> Result<(), LpmError
 
         for skill_entry in std::fs::read_dir(&pkg_path).into_iter().flatten().flatten() {
             let path = skill_entry.path();
-            if !path.extension().map(|e| e == "md").unwrap_or(false) {
+            if path.extension().is_none_or(|e| e != "md") {
                 continue;
             }
 

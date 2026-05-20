@@ -300,9 +300,10 @@ pub async fn run(
     // 3. Global store accessible?
     let store_result = PackageStore::default_location();
     let store_ok = store_result.is_ok();
-    let store_detail = store_result
-        .map(|s| s.root().display().to_string())
-        .unwrap_or_else(|_| "inaccessible".into());
+    let store_detail = store_result.map_or_else(
+        |_| "inaccessible".into(),
+        |s| s.root().display().to_string(),
+    );
     if store_ok {
         checks.push(Check::pass(
             &doctor_catalog::GLOBAL_STORE_ACCESSIBLE,
