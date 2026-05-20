@@ -193,7 +193,7 @@ fn default_mode_bind_mounts_dotenv_to_empty() {
         .expect("sandbox construction");
 
     let mut cmd = SandboxedCommand::new("/bin/cat");
-    cmd.args.push(env_path.clone().into_os_string());
+    cmd.args.push(env_path.into_os_string());
     cmd.stdout = SandboxStdio::Piped;
     cmd.stderr = SandboxStdio::Piped;
 
@@ -235,7 +235,7 @@ fn default_mode_does_not_overlay_source_files() {
         .expect("sandbox construction");
 
     let mut cmd = SandboxedCommand::new("/bin/cat");
-    cmd.args.push(src_path.clone().into_os_string());
+    cmd.args.push(src_path.into_os_string());
     cmd.stdout = SandboxStdio::Piped;
     cmd.stderr = SandboxStdio::Piped;
 

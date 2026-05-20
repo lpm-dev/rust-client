@@ -819,8 +819,7 @@ mod tests {
 
     fn realistic_spec() -> SandboxSpec {
         let home = dirs::home_dir().expect("home dir for test");
-        let tmp = std::env::var_os("TMPDIR")
-            .map_or_else(|| PathBuf::from("/tmp"), PathBuf::from);
+        let tmp = std::env::var_os("TMPDIR").map_or_else(|| PathBuf::from("/tmp"), PathBuf::from);
         SandboxSpec {
             package_dir: home.join(".lpm/store/testpkg@0.1.0"),
             project_dir: home.join("lpm-sandbox-test-project"),
