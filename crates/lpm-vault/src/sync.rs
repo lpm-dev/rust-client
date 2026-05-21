@@ -539,23 +539,74 @@ pub async fn pull_env(
 
 // ── Public Key Management ─────────────────────────────────────────
 
+/// HTTP header the server expects the CLI step-up proof JWT in. Mirrors
+/// `CLI_STEP_UP_HEADER_NAME` exported from the dashboard's
+/// `lib/auth/cli-step-up.js`. Defined here as a constant so the upload
+/// site and any future caller route the proof through the same name.
+pub const CLI_STEP_UP_HEADER_NAME: &str = "X-LPM-Step-Up-Proof";
+
+/// Server response from `POST /api/users/me/public-key`.
+///
+/// The dashboard hardened that route to return a structured envelope
+/// per the WS3 public-key state machine. Old servers (pre-hardening)
+/// returned `{ status: "saved" }`; we forward-compat-parse that shape
+/// too — every field below is optional, so a missing key is just
+/// `None` rather than a deserialization failure.
+#[derive(Debug, Default, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UploadPublicKeyResponse {
+    /// `true` on 2xx success. Old servers omit this field — treat absent
+    /// as success (the route returned 2xx).
+    pub ok: Option<bool>,
+    /// `"set" | "unchanged" | "rotated"` from the WS3 route. Old servers
+    /// return `"saved"`.
+    pub status: Option<String>,
+    /// SHA-256 prefix of the new key (only on `set` and `rotated`).
+    pub fingerprint_prefix: Option<String>,
+    /// SHA-256 prefix of the previous key (only on `rotated`).
+    pub previous_fingerprint_prefix: Option<String>,
+    /// Count of `vault_org_keys` rows the rotation invalidated.
+    pub invalidated_wrapped_keys: Option<u32>,
+    /// Count of distinct orgs whose wrapped-key rows were invalidated.
+    pub affected_orgs: Option<u32>,
+}
+
 /// Upload the user's X25519 public key to the server.
+///
+/// `step_up_proof` carries the WS2 CLI step-up JWT in the
+/// `X-LPM-Step-Up-Proof` header. The server requires a proof minted
+/// with audience `vault:public-key:set` for first-set, or
+/// `vault:public-key:rotate` for rotation; an idempotent same-key
+/// repost does not require a proof and is reported back as
+/// `status: "unchanged"`.
+///
+/// Callers that pass `None` should expect the server to refuse any
+/// mutating write with HTTP 403 and the structured `code:
+/// "step_up_required"` envelope — that's the correct failure mode
+/// against the WS3-hardened server. Against pre-WS3 servers, the
+/// header is silently ignored and the legacy write path runs.
 pub async fn upload_public_key(
     registry_url: &str,
     auth_token: &str,
     public_key_b64: &str,
-) -> Result<(), String> {
+    step_up_proof: Option<&str>,
+) -> Result<UploadPublicKeyResponse, String> {
     let client = sync_http_client_builder()
         .build()
         .map_err(|e| format!("failed to build http client: {e}"))?;
     let url = format!("{registry_url}/api/users/me/public-key");
     let body = serde_json::json!({"publicKey": public_key_b64});
 
-    let response = client
+    let mut request = client
         .post(&url)
         .bearer_auth(auth_token)
         .json(&body)
-        .timeout(std::time::Duration::from_secs(15))
+        .timeout(std::time::Duration::from_secs(15));
+    if let Some(proof) = step_up_proof {
+        request = request.header(CLI_STEP_UP_HEADER_NAME, proof);
+    }
+
+    let response = request
         .send()
         .await
         .map_err(|e| format!("network error: {e}"))?;
@@ -565,10 +616,33 @@ pub async fn upload_public_key(
         return Err(format!("failed to upload public key: {body}"));
     }
 
-    Ok(())
+    // `response.json()` would happily Err if the body isn't JSON. Old
+    // servers reliably return JSON; the explicit error keeps the
+    // message tight for any future server that 2xxes with HTML.
+    response
+        .json::<UploadPublicKeyResponse>()
+        .await
+        .map_err(|e| format!("parse error: {e}"))
 }
 
 /// Check if the user's public key is already on the server.
+///
+/// Wire contract — distinguishes "no key on server" from "server is
+/// failing" so callers can branch correctly:
+///
+///   - 2xx with `{ publicKey: "<b64>" }` → `Ok(Some(...))`
+///   - 2xx with `{ publicKey: null }` or `publicKey` field absent → `Ok(None)`
+///   - 2xx whose body is malformed JSON → `Err(...)`
+///   - any non-2xx (401, 403, 5xx, redirect) → `Err(...)` with the
+///     response status + body summary
+///
+/// The previous implementation collapsed every non-2xx response to
+/// `Ok(None)`, which meant a transient 500 or a 401 (expired token)
+/// would be misclassified as "no key on server" and the silent
+/// `ensure_public_key` retry path would try to overwrite — exactly the
+/// silent-overwrite vector the WS3 server hardening was built to
+/// close. This implementation fails fast so the caller's classification
+/// path can render an honest error.
 pub async fn get_my_public_key(
     registry_url: &str,
     auth_token: &str,
@@ -586,8 +660,10 @@ pub async fn get_my_public_key(
         .await
         .map_err(|e| format!("network error: {e}"))?;
 
-    if !response.status().is_success() {
-        return Ok(None);
+    let status = response.status();
+    if !status.is_success() {
+        let body = read_capped_error_text(response).await;
+        return Err(format!("get public key: {status}: {body}"));
     }
 
     let data: serde_json::Value = response
@@ -599,6 +675,102 @@ pub async fn get_my_public_key(
         .get("publicKey")
         .and_then(|v| v.as_str())
         .map(|s| s.to_string()))
+}
+
+/// Locally-resolved sharing keypair material. The private half stays
+/// in memory and on disk (keychain on macOS, file fallback otherwise);
+/// the public half is the canonical Base64 form the server expects.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LocalPublicKeyState {
+    /// Raw 32-byte X25519 private key. Callers should not log or surface
+    /// this material.
+    pub private_key: [u8; 32],
+    /// Standard Base64 encoding of the matching X25519 public key.
+    pub public_key_b64: String,
+}
+
+/// Classification of the local-vs-server sharing-key state, produced by
+/// {@link classify_public_key_state}. The CLI command layer (Workstream
+/// 4) branches on this enum to decide whether to proceed silently,
+/// prompt for the WS2 step-up proof and register, or refuse and direct
+/// the user to the explicit `lpm env rotate-sharing-key` flow.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PublicKeyRegistrationState {
+    /// Server-stored key matches the local key. No write needed; callers
+    /// can proceed with the wrap/unwrap operation that prompted the
+    /// check.
+    Matches(LocalPublicKeyState),
+    /// Server has no key for this user. Caller must acquire a CLI
+    /// step-up proof (`vault:public-key:set` scope) and call
+    /// `upload_public_key(..., Some(proof))` to register before
+    /// proceeding.
+    NeedsInitialSet(LocalPublicKeyState),
+    /// Server has a key but it differs from the local one. The caller
+    /// MUST NOT silently overwrite — this is the silent-rotation
+    /// vector the WS3 hardening exists to close. The CLI command layer
+    /// surfaces this state by refusing the operation and instructing
+    /// the user to run the explicit rotation flow (`lpm env
+    /// rotate-sharing-key`), which acquires a `vault:public-key:rotate`
+    /// proof.
+    RotationRequired {
+        local: LocalPublicKeyState,
+        server_public_key_b64: String,
+    },
+}
+
+/// Load (or create) the local sharing keypair and classify it against
+/// the server's current state.
+///
+/// Pure classifier — does not mutate server state. Three outcomes:
+///
+///   - `Matches` — same key on both sides; caller can no-op.
+///   - `NeedsInitialSet` — no key on server; caller can register the
+///     local key with a `vault:public-key:set` proof.
+///   - `RotationRequired` — different key on server; caller MUST refuse
+///     to silently upload (the prior `ensure_public_key` path did
+///     overwrite here, which was the security bug WS3 closes).
+///
+/// All server errors propagate as `Err(...)` — a 401, 403, or 5xx will
+/// NOT be misclassified as "no key on server" the way the old
+/// `get_my_public_key` `Ok(None)` collapse did.
+pub async fn classify_public_key_state(
+    registry_url: &str,
+    auth_token: &str,
+) -> Result<PublicKeyRegistrationState, String> {
+    let local = load_local_public_key_state()?;
+    let server_key = get_my_public_key(registry_url, auth_token).await?;
+
+    match server_key {
+        None => Ok(PublicKeyRegistrationState::NeedsInitialSet(local)),
+        Some(server) if server == local.public_key_b64 => {
+            Ok(PublicKeyRegistrationState::Matches(local))
+        }
+        Some(server) => Ok(PublicKeyRegistrationState::RotationRequired {
+            local,
+            server_public_key_b64: server,
+        }),
+    }
+}
+
+/// Load the local X25519 keypair, creating one if absent. Shared by
+/// `ensure_public_key` and {@link classify_public_key_state} so the two
+/// entry points agree on storage location, generation policy, and
+/// canonical Base64 encoding.
+fn load_local_public_key_state() -> Result<LocalPublicKeyState, String> {
+    #[cfg(target_os = "macos")]
+    let (private_key, public) = if force_file_x25519_keypair() {
+        get_or_create_file_backed_x25519_keypair()?
+    } else {
+        crate::keychain::get_or_create_x25519_keypair()?
+    };
+    #[cfg(not(target_os = "macos"))]
+    let (private_key, public) = get_or_create_file_backed_x25519_keypair()?;
+
+    let public_key_b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, public);
+    Ok(LocalPublicKeyState {
+        private_key,
+        public_key_b64,
+    })
 }
 
 /// Org member public key info.
@@ -692,26 +864,26 @@ fn get_or_create_file_backed_x25519_keypair() -> Result<([u8; 32], [u8; 32]), St
 }
 
 /// Ensure the user's public key is registered on the server.
-/// Generates a keypair if none exists locally, uploads if not on server.
+///
+/// Legacy entry point retained for callers that have not yet migrated
+/// to the WS3 classification + explicit step-up flow ({@link
+/// classify_public_key_state} + proof-aware {@link upload_public_key}).
+/// Against the WS3-hardened server, the no-proof upload here will
+/// surface as a server-side `step_up_required` error for the
+/// `NeedsInitialSet` and `RotationRequired` cohorts — which is the
+/// correct failure mode; silent overwrite was the security bug WS3
+/// closes. The CLI command-layer migration in the next slice replaces
+/// every caller of this function with explicit classification +
+/// reauth UX, at which point this helper becomes a candidate for
+/// removal.
 pub async fn ensure_public_key(registry_url: &str, auth_token: &str) -> Result<[u8; 32], String> {
-    #[cfg(target_os = "macos")]
-    let (private, public) = if force_file_x25519_keypair() {
-        get_or_create_file_backed_x25519_keypair()?
-    } else {
-        crate::keychain::get_or_create_x25519_keypair()?
-    };
-    #[cfg(not(target_os = "macos"))]
-    let (private, public) = get_or_create_file_backed_x25519_keypair()?;
-
-    let pub_b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, public);
-
-    // Check if already uploaded
+    let local = load_local_public_key_state()?;
     let server_key = get_my_public_key(registry_url, auth_token).await?;
-    if server_key.as_deref() != Some(&pub_b64) {
-        upload_public_key(registry_url, auth_token, &pub_b64).await?;
+    if server_key.as_deref() != Some(&local.public_key_b64) {
+        upload_public_key(registry_url, auth_token, &local.public_key_b64, None).await?;
     }
 
-    Ok(private)
+    Ok(local.private_key)
 }
 
 /// List all shared vaults for an org.
@@ -2071,7 +2243,11 @@ mod tests {
             Mock::given(method("GET"))
                 .and(path("/api/users/me/public-key"))
                 .and(header("authorization", "Bearer auth-token"))
-                .respond_with(ResponseTemplate::new(404).set_body_string("missing"))
+                // Server's "no key on file" shape is a 200 with publicKey: null,
+                // not a 404 — the prior `Ok(None)` collapse on non-2xx hid this.
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "publicKey": null,
+                })))
                 .expect(1)
                 .mount(&server)
                 .await;
@@ -2217,7 +2393,11 @@ mod tests {
             // returns 404 and the POST upload accepts whatever the CLI sends.
             Mock::given(method("GET"))
                 .and(path("/api/users/me/public-key"))
-                .respond_with(ResponseTemplate::new(404).set_body_string("missing"))
+                // Server's "no key on file" shape is a 200 with publicKey: null,
+                // not a 404 — the prior `Ok(None)` collapse on non-2xx hid this.
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "publicKey": null,
+                })))
                 .mount(&server)
                 .await;
 
@@ -2372,7 +2552,11 @@ mod tests {
 
             Mock::given(method("GET"))
                 .and(path("/api/users/me/public-key"))
-                .respond_with(ResponseTemplate::new(404).set_body_string("missing"))
+                // Server's "no key on file" shape is a 200 with publicKey: null,
+                // not a 404 — the prior `Ok(None)` collapse on non-2xx hid this.
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "publicKey": null,
+                })))
                 .mount(&server)
                 .await;
 
@@ -2589,5 +2773,278 @@ mod tests {
             !second_ids.contains("user-a"),
             "stale recipients from prior shares must not remain in a new wrapped-key set"
         );
+    }
+
+    #[tokio::test]
+    async fn get_my_public_key_returns_err_on_non_2xx() {
+        // The previous implementation collapsed every non-2xx to
+        // `Ok(None)`, which silently turned a 401 / 403 / 500 into "no
+        // key on server" and routed the caller into the silent-overwrite
+        // path. Pin the new semantics: any non-2xx is an error.
+        let server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/api/users/me/public-key"))
+            .respond_with(ResponseTemplate::new(401).set_body_string("unauthorized"))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let err = get_my_public_key(&server.uri(), "bad-token")
+            .await
+            .expect_err("401 must propagate as Err, not Ok(None)");
+        assert!(
+            err.contains("401"),
+            "error must include the HTTP status so the caller can branch: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn get_my_public_key_returns_some_on_2xx_with_key() {
+        let server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/api/users/me/public-key"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "publicKey": "abc=",
+                "createdAt": null,
+                "updatedAt": null,
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let key = get_my_public_key(&server.uri(), "token")
+            .await
+            .expect("happy path must succeed");
+        assert_eq!(key.as_deref(), Some("abc="));
+    }
+
+    #[tokio::test]
+    async fn get_my_public_key_returns_none_on_2xx_with_null_field() {
+        let server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/api/users/me/public-key"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "publicKey": null,
+                "createdAt": null,
+                "updatedAt": null,
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let key = get_my_public_key(&server.uri(), "token")
+            .await
+            .expect("null publicKey is the explicit 'no key' signal");
+        assert!(key.is_none());
+    }
+
+    #[tokio::test]
+    async fn upload_public_key_sends_step_up_proof_header_when_provided() {
+        // The WS3 server route refuses any mutating write without a
+        // valid `X-LPM-Step-Up-Proof` header. Pin that the helper
+        // emits the header when a proof is supplied, AND that it omits
+        // the header when None is passed (so old servers don't reject
+        // a spurious empty header).
+        use std::sync::Arc;
+        use std::sync::Mutex as StdMutex;
+
+        let server = MockServer::start().await;
+        let captured_proof = Arc::new(StdMutex::new(Vec::<Option<String>>::new()));
+
+        let captured_for_responder = Arc::clone(&captured_proof);
+        #[derive(Clone)]
+        struct CaptureResponder {
+            captured: Arc<StdMutex<Vec<Option<String>>>>,
+        }
+        impl Respond for CaptureResponder {
+            fn respond(&self, request: &Request) -> ResponseTemplate {
+                let proof = request
+                    .headers
+                    .get(CLI_STEP_UP_HEADER_NAME)
+                    .map(|v| v.to_str().unwrap_or("").to_string());
+                self.captured.lock().unwrap().push(proof);
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "ok": true,
+                    "status": "set",
+                    "fingerprintPrefix": "deadbeef0bad1dea",
+                }))
+            }
+        }
+
+        Mock::given(method("POST"))
+            .and(path("/api/users/me/public-key"))
+            .respond_with(CaptureResponder {
+                captured: captured_for_responder,
+            })
+            .expect(2)
+            .mount(&server)
+            .await;
+
+        // With a proof — header must be present and match.
+        let result_with =
+            upload_public_key(&server.uri(), "auth-token", "abc=", Some("proof-jwt-here"))
+                .await
+                .expect("happy path with proof");
+        assert_eq!(result_with.status.as_deref(), Some("set"));
+        assert_eq!(result_with.ok, Some(true));
+        assert_eq!(
+            result_with.fingerprint_prefix.as_deref(),
+            Some("deadbeef0bad1dea")
+        );
+
+        // Without a proof — header must be absent.
+        upload_public_key(&server.uri(), "auth-token", "abc=", None)
+            .await
+            .expect("no-proof call still completes against this mock");
+
+        let captured = captured_proof.lock().unwrap();
+        assert_eq!(captured.len(), 2);
+        assert_eq!(captured[0].as_deref(), Some("proof-jwt-here"));
+        assert!(
+            captured[1].is_none(),
+            "passing None must NOT send the header at all"
+        );
+    }
+
+    #[tokio::test]
+    async fn upload_public_key_propagates_server_error_envelope_on_non_2xx() {
+        let server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/api/users/me/public-key"))
+            .respond_with(ResponseTemplate::new(403).set_body_json(serde_json::json!({
+                "ok": false,
+                "code": "step_up_required",
+                "error": "Fresh step-up verification required.",
+                "expectedScope": "vault:public-key:set",
+                "header": CLI_STEP_UP_HEADER_NAME,
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let err = upload_public_key(&server.uri(), "token", "abc=", None)
+            .await
+            .expect_err("403 must propagate as Err");
+        assert!(
+            err.contains("step_up_required") || err.contains("Fresh step-up"),
+            "error must surface the server envelope so the CLI can render the actionable hint: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn classify_public_key_state_matches_when_server_key_equals_local() {
+        let _guard = env_lock_guard();
+        let _isolated = IsolatedVaultKeyEnv::new();
+
+        // Pre-warm the local keypair so we know its public form.
+        let local = load_local_public_key_state().expect("load local keypair");
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/users/me/public-key"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "publicKey": local.public_key_b64.clone(),
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let state = classify_public_key_state(&server.uri(), "token")
+            .await
+            .expect("classification succeeds against happy server");
+        match state {
+            PublicKeyRegistrationState::Matches(l) => {
+                assert_eq!(l.public_key_b64, local.public_key_b64);
+            }
+            other => panic!("expected Matches, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn classify_public_key_state_needs_initial_set_when_server_returns_null() {
+        let _guard = env_lock_guard();
+        let _isolated = IsolatedVaultKeyEnv::new();
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/users/me/public-key"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "publicKey": null,
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let state = classify_public_key_state(&server.uri(), "token")
+            .await
+            .expect("classification succeeds for empty server state");
+        assert!(matches!(
+            state,
+            PublicKeyRegistrationState::NeedsInitialSet(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn classify_public_key_state_rotation_required_when_server_key_differs() {
+        // Critical regression guard: the previous `ensure_public_key`
+        // path would silently upload here, overwriting whatever key
+        // was on the server. The new classifier must surface this
+        // state so the CLI command layer can refuse and direct the
+        // user to the explicit rotation flow.
+        let _guard = env_lock_guard();
+        let _isolated = IsolatedVaultKeyEnv::new();
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/users/me/public-key"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "publicKey": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let state = classify_public_key_state(&server.uri(), "token")
+            .await
+            .expect("classification succeeds against mismatch");
+        match state {
+            PublicKeyRegistrationState::RotationRequired {
+                local: _,
+                server_public_key_b64,
+            } => {
+                assert_eq!(
+                    server_public_key_b64,
+                    "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+                );
+            }
+            other => panic!("expected RotationRequired, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn classify_public_key_state_propagates_server_errors_instead_of_collapsing() {
+        // The prior `get_my_public_key` mapped 401/500 to `Ok(None)`,
+        // which would have made the classifier return
+        // `NeedsInitialSet` for a token that was actually expired or a
+        // server that was simply broken. Pin that errors propagate.
+        let _guard = env_lock_guard();
+        let _isolated = IsolatedVaultKeyEnv::new();
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/users/me/public-key"))
+            .respond_with(ResponseTemplate::new(500).set_body_string("boom"))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let err = classify_public_key_state(&server.uri(), "token")
+            .await
+            .expect_err("server 500 must propagate, not be misclassified");
+        assert!(err.contains("500"), "got: {err}");
     }
 }
