@@ -565,13 +565,147 @@ pub async fn pull_env(
     Ok((secrets, version))
 }
 
-// ── Public Key Management ─────────────────────────────────────────
+// ── CLI Step-Up (Workstream 2 reauth) ─────────────────────────────
 
 /// HTTP header the server expects the CLI step-up proof JWT in. Mirrors
 /// `CLI_STEP_UP_HEADER_NAME` exported from the dashboard's
 /// `lib/auth/cli-step-up.js`. Defined here as a constant so the upload
 /// site and any future caller route the proof through the same name.
 pub const CLI_STEP_UP_HEADER_NAME: &str = "X-LPM-Step-Up-Proof";
+
+/// Step-up policy resolved by the server for the calling user. The CLI
+/// prompts for the credential named in `method` (or refuses outright
+/// when `unavailable`).
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CliStepUpPolicy {
+    /// `"password"`, `"totp"`, or `"unavailable"`. The CLI MUST refuse
+    /// any flow when `unavailable` because the prompt would ask for a
+    /// credential the user cannot satisfy.
+    pub method: String,
+    /// Present only when `method == "unavailable"`. Currently the only
+    /// observed value is `"set_password_required"`.
+    pub reason: Option<String>,
+    /// TTL the server applies to a freshly-minted proof. Surfaced so the
+    /// CLI can render an honest "expires in N seconds" hint.
+    pub ttl_seconds: Option<u32>,
+    /// Header name the server expects the minted proof in. Echoed so a
+    /// future server-side rename gets picked up without coordinating
+    /// constants.
+    pub header: Option<String>,
+}
+
+/// Credential the CLI supplies on mint. Two shapes — password-only for
+/// users with no MFA, and password+TOTP for MFA-enrolled users (CLI
+/// step-up cannot drive TOTP alone — see WS2's route docstring).
+pub enum CliStepUpCredential<'a> {
+    Password { password: &'a str },
+    Totp { password: &'a str, code: &'a str },
+}
+
+/// Discover the step-up method the server expects for the calling
+/// user — does not consume any credential, no rate-limit cost beyond
+/// the per-IP shield. Used by the CLI to decide what to prompt for
+/// before asking the user to type a password / TOTP.
+pub async fn discover_cli_step_up_policy(
+    registry_url: &str,
+    auth_token: &str,
+) -> Result<CliStepUpPolicy, String> {
+    let client = sync_http_client_builder()
+        .build()
+        .map_err(|e| format!("failed to build http client: {e}"))?;
+    let url = format!("{registry_url}/api/auth/cli-step-up");
+
+    let response = client
+        .get(&url)
+        .bearer_auth(auth_token)
+        .timeout(std::time::Duration::from_secs(15))
+        .send()
+        .await
+        .map_err(|e| format!("network error: {e}"))?;
+
+    let status = response.status();
+    if !status.is_success() {
+        let body = read_capped_error_text(response).await;
+        return Err(format!("step-up policy: {status}: {body}"));
+    }
+
+    response
+        .json::<CliStepUpPolicy>()
+        .await
+        .map_err(|e| format!("parse error: {e}"))
+}
+
+/// Successful mint response from `POST /api/auth/cli-step-up`.
+#[derive(Debug, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct MintCliStepUpResponse {
+    ok: Option<bool>,
+    proof: Option<String>,
+}
+
+/// Mint a CLI step-up proof against the server.
+///
+/// On success, returns the JWT the caller carries in the
+/// `X-LPM-Step-Up-Proof` header for the subsequent sensitive write
+/// (public-key set/rotate, force-push, etc).
+///
+/// On failure, the returned error includes the server's response body
+/// so the CLI can surface the structured envelope (`code:
+/// wrong_credential`, `code: rate_limited`, etc) to the user.
+pub async fn mint_cli_step_up_proof(
+    registry_url: &str,
+    auth_token: &str,
+    scope: &str,
+    credential: &CliStepUpCredential<'_>,
+) -> Result<String, String> {
+    let client = sync_http_client_builder()
+        .build()
+        .map_err(|e| format!("failed to build http client: {e}"))?;
+    let url = format!("{registry_url}/api/auth/cli-step-up");
+
+    let body = match credential {
+        CliStepUpCredential::Password { password } => serde_json::json!({
+            "scope": scope,
+            "method": "password",
+            "password": password,
+        }),
+        CliStepUpCredential::Totp { password, code } => serde_json::json!({
+            "scope": scope,
+            "method": "totp",
+            "password": password,
+            "totpCode": code,
+        }),
+    };
+
+    let response = client
+        .post(&url)
+        .bearer_auth(auth_token)
+        .json(&body)
+        .timeout(std::time::Duration::from_secs(30))
+        .send()
+        .await
+        .map_err(|e| format!("network error: {e}"))?;
+
+    let status = response.status();
+    if !status.is_success() {
+        let body = read_capped_error_text(response).await;
+        return Err(format!("step-up mint: {status}: {body}"));
+    }
+
+    let parsed = response
+        .json::<MintCliStepUpResponse>()
+        .await
+        .map_err(|e| format!("parse error: {e}"))?;
+    if parsed.ok != Some(true) {
+        return Err("step-up mint: server returned ok=false on 2xx response (unexpected)".into());
+    }
+    parsed
+        .proof
+        .ok_or_else(|| "step-up mint: server response missing proof".into())
+}
+
+// ── Public Key Management ─────────────────────────────────────────
 
 /// Server response from `POST /api/users/me/public-key`.
 ///
@@ -786,7 +920,10 @@ pub async fn classify_public_key_state(
 /// canonical Base64 encoding.
 fn load_local_public_key_state() -> Result<LocalPublicKeyState, String> {
     #[cfg(target_os = "macos")]
-    let (private_key, public) = if force_file_x25519_keypair() {
+    let (private_key, public) = if should_use_file_backed_x25519_keypair(
+        force_file_x25519_keypair(),
+        live_x25519_key_path()?.exists(),
+    ) {
         get_or_create_file_backed_x25519_keypair()?
     } else {
         crate::keychain::get_or_create_x25519_keypair()?
@@ -799,6 +936,166 @@ fn load_local_public_key_state() -> Result<LocalPublicKeyState, String> {
         private_key,
         public_key_b64,
     })
+}
+
+/// Pending sharing-keypair lifecycle helpers used by the
+/// `rotate-sharing-key` flow.
+///
+/// Rotation is split across two writes: server-side upload of the new
+/// public key, then local promotion of the matching private key into
+/// the live slot. A crash, network drop, or process kill between those
+/// two steps must NOT leave the live slot pointing at a key the server
+/// no longer knows about (the user would silently lose access to every
+/// org vault). The pending slot is the recovery primitive:
+///
+///   1. Generate a fresh keypair and persist it to the pending slot
+///      WITHOUT touching the live slot.
+///   2. Upload the pending public key with a `vault:public-key:rotate`
+///      step-up proof.
+///   3. On HTTP success, atomically promote the pending slot into the
+///      live slot.
+///   4. On restart (or any future invocation), if the pending slot
+///      contains a key that matches the server's current public key,
+///      the previous run was interrupted between steps 2 and 3 — finish
+///      promotion. If the pending slot exists but doesn't match the
+///      server, the upload failed before commit; discard the pending.
+///
+/// Storage backend: ALWAYS the file-backed slots (`.x25519_key.pending`
+/// in the user's `~/.lpm` directory). The macOS keychain backend only
+/// supports a single named entry per service/account pair; juggling a
+/// transient pending entry there adds complexity (and a multi-keychain-
+/// item ACL surface) that the file slot avoids cleanly. Promotion
+/// writes the new private key to the live slot via the same code path
+/// `get_or_create_file_backed_x25519_keypair` uses for first-set, so
+/// permissions stay consistent (`0o600` on Unix).
+
+#[derive(Debug, Clone)]
+pub struct PendingPublicKey {
+    pub private_key: [u8; 32],
+    pub public_key_b64: String,
+}
+
+fn pending_x25519_key_path() -> Result<std::path::PathBuf, String> {
+    Ok(dirs::home_dir()
+        .ok_or("no home directory")?
+        .join(".lpm")
+        .join(".x25519_key.pending"))
+}
+
+fn live_x25519_key_path() -> Result<std::path::PathBuf, String> {
+    Ok(dirs::home_dir()
+        .ok_or("no home directory")?
+        .join(".lpm")
+        .join(".x25519_key"))
+}
+
+/// Generate a fresh X25519 keypair and persist it to the pending slot.
+/// Does NOT touch the live slot. Overwrites any existing pending slot —
+/// the caller's `rotate-sharing-key` flow has already verified the
+/// pending state via [`read_pending_x25519_keypair`] and confirmed it's
+/// safe to overwrite (stale orphan from a failed prior attempt).
+pub fn create_pending_x25519_keypair() -> Result<PendingPublicKey, String> {
+    let (private_key, public_key) = crate::crypto::generate_x25519_keypair();
+    let path = pending_x25519_key_path()?;
+    let parent = path.parent().ok_or("invalid pending key path")?;
+    std::fs::create_dir_all(parent)
+        .map_err(|e| format!("failed to create pending key dir: {e}"))?;
+    std::fs::write(&path, private_key).map_err(|e| format!("failed to write pending key: {e}"))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+            .map_err(|e| format!("failed to set pending key permissions: {e}"))?;
+    }
+    Ok(PendingPublicKey {
+        private_key,
+        public_key_b64: base64::Engine::encode(
+            &base64::engine::general_purpose::STANDARD,
+            public_key,
+        ),
+    })
+}
+
+/// Read the pending slot without promoting. Returns `Ok(None)` when no
+/// pending slot exists (the steady state). Used on every
+/// `rotate-sharing-key` invocation to detect crash-interrupted prior
+/// rotations.
+pub fn read_pending_x25519_keypair() -> Result<Option<PendingPublicKey>, String> {
+    let path = pending_x25519_key_path()?;
+    if !path.exists() {
+        return Ok(None);
+    }
+    let data = std::fs::read(&path).map_err(|e| format!("failed to read pending key: {e}"))?;
+    if data.len() != 32 {
+        return Err(format!(
+            "pending key file has invalid length {} (expected 32)",
+            data.len()
+        ));
+    }
+    let mut private_key = [0u8; 32];
+    private_key.copy_from_slice(&data);
+    let secret = x25519_dalek::StaticSecret::from(private_key);
+    let public_key = x25519_dalek::PublicKey::from(&secret);
+    let public_key_b64 = base64::Engine::encode(
+        &base64::engine::general_purpose::STANDARD,
+        public_key.as_bytes(),
+    );
+    Ok(Some(PendingPublicKey {
+        private_key,
+        public_key_b64,
+    }))
+}
+
+/// Atomically promote the pending slot into the live slot.
+///
+/// Writes the pending private key to the live file with `0o600` perms,
+/// then deletes the pending file. The write-then-delete order means a
+/// crash between the two steps leaves BOTH files with the same key
+/// (next promotion is a no-op); a crash before the write leaves only
+/// pending (next rotation discovers it). Both orderings are safe; the
+/// only unsafe state would be "live updated, pending still present
+/// with a stale key" — which cannot happen because pending always
+/// holds the key we just wrote to live.
+///
+/// Also clears any prior keychain entry on macOS so subsequent
+/// `load_local_public_key_state` calls observe the new file-backed key
+/// instead of the stale keychain entry. (The keychain entry survives
+/// across rotations otherwise.)
+pub fn promote_pending_x25519_keypair() -> Result<(), String> {
+    let pending = read_pending_x25519_keypair()?.ok_or("no pending key to promote")?;
+    let live_path = live_x25519_key_path()?;
+    let parent = live_path.parent().ok_or("invalid live key path")?;
+    std::fs::create_dir_all(parent).map_err(|e| format!("failed to create live key dir: {e}"))?;
+    std::fs::write(&live_path, pending.private_key)
+        .map_err(|e| format!("failed to write live key: {e}"))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&live_path, std::fs::Permissions::from_mode(0o600))
+            .map_err(|e| format!("failed to set live key permissions: {e}"))?;
+    }
+
+    // Clear macOS keychain entry if present so subsequent reads see
+    // the file-backed key. Best-effort: a "not found" error here is
+    // expected when the user was already on the file fallback, so we
+    // intentionally swallow keychain errors.
+    #[cfg(target_os = "macos")]
+    {
+        let _ = crate::keychain::delete_x25519_keypair();
+    }
+
+    discard_pending_x25519_keypair()
+}
+
+/// Delete the pending slot without promoting. Called when the prior
+/// upload failed before commit (pending key doesn't match server's
+/// current key), or after a successful promotion.
+pub fn discard_pending_x25519_keypair() -> Result<(), String> {
+    let path = pending_x25519_key_path()?;
+    if path.exists() {
+        std::fs::remove_file(&path).map_err(|e| format!("failed to delete pending key: {e}"))?;
+    }
+    Ok(())
 }
 
 /// Org member public key info.
@@ -856,6 +1153,11 @@ fn force_file_x25519_keypair() -> bool {
         std::env::var("LPM_FORCE_FILE_VAULT").as_deref(),
         Ok("1") | Ok("true") | Ok("TRUE") | Ok("yes") | Ok("YES")
     )
+}
+
+#[cfg(target_os = "macos")]
+fn should_use_file_backed_x25519_keypair(force_file: bool, live_key_exists: bool) -> bool {
+    force_file || live_key_exists
 }
 
 fn get_or_create_file_backed_x25519_keypair() -> Result<([u8; 32], [u8; 32]), String> {
@@ -3178,5 +3480,288 @@ mod tests {
             .await
             .expect_err("server 500 must propagate, not be misclassified");
         assert!(err.contains("500"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn discover_cli_step_up_policy_parses_password_response() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/auth/cli-step-up"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "method": "password",
+                "ttlSeconds": 300,
+                "header": "X-LPM-Step-Up-Proof",
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let policy = discover_cli_step_up_policy(&server.uri(), "token")
+            .await
+            .expect("happy path");
+        assert_eq!(policy.method, "password");
+        assert!(policy.reason.is_none());
+        assert_eq!(policy.ttl_seconds, Some(300));
+        assert_eq!(policy.header.as_deref(), Some("X-LPM-Step-Up-Proof"));
+    }
+
+    #[tokio::test]
+    async fn discover_cli_step_up_policy_parses_unavailable_with_reason() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/auth/cli-step-up"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "method": "unavailable",
+                "reason": "set_password_required",
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let policy = discover_cli_step_up_policy(&server.uri(), "token")
+            .await
+            .expect("happy path");
+        assert_eq!(policy.method, "unavailable");
+        assert_eq!(policy.reason.as_deref(), Some("set_password_required"));
+    }
+
+    #[tokio::test]
+    async fn discover_cli_step_up_policy_errors_on_non_2xx() {
+        // A 401 here can't be silently collapsed — the CLI would
+        // proceed to prompt for a credential the server can't accept.
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/auth/cli-step-up"))
+            .respond_with(ResponseTemplate::new(401).set_body_string("expired token"))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let err = discover_cli_step_up_policy(&server.uri(), "token")
+            .await
+            .expect_err("401 must propagate");
+        assert!(err.contains("401"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn mint_cli_step_up_proof_password_sends_expected_body() {
+        use std::sync::Arc;
+        use std::sync::Mutex as StdMutex;
+
+        let captured = Arc::new(StdMutex::new(Vec::<String>::new()));
+        let server = MockServer::start().await;
+
+        #[derive(Clone)]
+        struct CaptureBody(Arc<StdMutex<Vec<String>>>);
+        impl Respond for CaptureBody {
+            fn respond(&self, request: &Request) -> ResponseTemplate {
+                self.0
+                    .lock()
+                    .unwrap()
+                    .push(String::from_utf8_lossy(&request.body).to_string());
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "ok": true,
+                    "proof": "test-jwt",
+                }))
+            }
+        }
+
+        Mock::given(method("POST"))
+            .and(path("/api/auth/cli-step-up"))
+            .respond_with(CaptureBody(Arc::clone(&captured)))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let proof = mint_cli_step_up_proof(
+            &server.uri(),
+            "token",
+            "vault:public-key:set",
+            &CliStepUpCredential::Password {
+                password: "hunter2",
+            },
+        )
+        .await
+        .expect("happy path");
+        assert_eq!(proof, "test-jwt");
+
+        let body = captured.lock().unwrap()[0].clone();
+        assert!(body.contains("\"method\":\"password\""));
+        assert!(body.contains("\"scope\":\"vault:public-key:set\""));
+        assert!(body.contains("\"password\":\"hunter2\""));
+        assert!(
+            !body.contains("totpCode"),
+            "password-only request must not include totpCode field: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn mint_cli_step_up_proof_totp_sends_both_password_and_code() {
+        use std::sync::Arc;
+        use std::sync::Mutex as StdMutex;
+
+        let captured = Arc::new(StdMutex::new(Vec::<String>::new()));
+        let server = MockServer::start().await;
+
+        #[derive(Clone)]
+        struct CaptureBody(Arc<StdMutex<Vec<String>>>);
+        impl Respond for CaptureBody {
+            fn respond(&self, request: &Request) -> ResponseTemplate {
+                self.0
+                    .lock()
+                    .unwrap()
+                    .push(String::from_utf8_lossy(&request.body).to_string());
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "ok": true,
+                    "proof": "totp-jwt",
+                }))
+            }
+        }
+
+        Mock::given(method("POST"))
+            .and(path("/api/auth/cli-step-up"))
+            .respond_with(CaptureBody(Arc::clone(&captured)))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let proof = mint_cli_step_up_proof(
+            &server.uri(),
+            "token",
+            "vault:public-key:rotate",
+            &CliStepUpCredential::Totp {
+                password: "hunter2",
+                code: "123456",
+            },
+        )
+        .await
+        .expect("happy path");
+        assert_eq!(proof, "totp-jwt");
+
+        let body = captured.lock().unwrap()[0].clone();
+        assert!(body.contains("\"method\":\"totp\""));
+        assert!(body.contains("\"scope\":\"vault:public-key:rotate\""));
+        assert!(body.contains("\"password\":\"hunter2\""));
+        assert!(body.contains("\"totpCode\":\"123456\""));
+    }
+
+    #[tokio::test]
+    async fn mint_cli_step_up_proof_propagates_server_error() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/auth/cli-step-up"))
+            .respond_with(ResponseTemplate::new(401).set_body_json(serde_json::json!({
+                "ok": false,
+                "code": "wrong_credential",
+                "error": "Incorrect password.",
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let err = mint_cli_step_up_proof(
+            &server.uri(),
+            "token",
+            "vault:public-key:set",
+            &CliStepUpCredential::Password { password: "wrong" },
+        )
+        .await
+        .expect_err("401 must propagate");
+        assert!(err.contains("401"), "got: {err}");
+        assert!(
+            err.contains("wrong_credential") || err.contains("Incorrect password"),
+            "error envelope should be preserved so CLI can render it: {err}"
+        );
+    }
+
+    #[test]
+    fn pending_key_lifecycle_round_trips_through_create_read_promote() {
+        // Create → read → promote, verifying that promote leaves the
+        // live slot with the pending bytes and clears the pending file.
+        let _guard = env_lock_guard();
+        let _isolated = IsolatedVaultKeyEnv::new();
+
+        // No pending at first.
+        assert!(
+            read_pending_x25519_keypair()
+                .expect("read pending")
+                .is_none(),
+            "fresh HOME should have no pending key"
+        );
+
+        // Create — pending file now exists, live slot still untouched.
+        let pending = create_pending_x25519_keypair().expect("create pending");
+        let pending_path = pending_x25519_key_path().expect("path");
+        let live_path = live_x25519_key_path().expect("path");
+        assert!(pending_path.exists(), "create must persist the pending key");
+        assert!(
+            !live_path.exists(),
+            "create must NOT touch the live slot until promotion"
+        );
+
+        // Read returns the same key bytes.
+        let read_back = read_pending_x25519_keypair()
+            .expect("read pending")
+            .expect("pending should be present");
+        assert_eq!(read_back.public_key_b64, pending.public_key_b64);
+
+        // Promote — live slot now holds the pending bytes; pending is gone.
+        promote_pending_x25519_keypair().expect("promote");
+        assert!(live_path.exists(), "live slot must be present post-promote");
+        assert!(
+            !pending_path.exists(),
+            "pending must be deleted after promote"
+        );
+        let live_bytes = std::fs::read(&live_path).expect("read live");
+        assert_eq!(live_bytes, &pending.private_key);
+
+        // Subsequent classify-equivalent: load_local_public_key_state
+        // should see the new live key.
+        let live = load_local_public_key_state().expect("load live");
+        assert_eq!(live.public_key_b64, pending.public_key_b64);
+    }
+
+    #[test]
+    fn pending_key_discard_removes_orphan_without_touching_live() {
+        let _guard = env_lock_guard();
+        let _isolated = IsolatedVaultKeyEnv::new();
+
+        // Pre-seed a live key.
+        let live = load_local_public_key_state().expect("seed live");
+        let live_path = live_x25519_key_path().expect("path");
+        assert!(live_path.exists());
+
+        // Create + discard pending.
+        let _ = create_pending_x25519_keypair().expect("create pending");
+        let pending_path = pending_x25519_key_path().expect("path");
+        assert!(pending_path.exists());
+
+        discard_pending_x25519_keypair().expect("discard");
+        assert!(!pending_path.exists());
+        assert!(live_path.exists(), "discard must NOT touch live");
+        // Live key bytes unchanged.
+        let live_after = load_local_public_key_state().expect("load live");
+        assert_eq!(live_after.public_key_b64, live.public_key_b64);
+    }
+
+    #[test]
+    fn pending_key_promote_when_no_pending_is_explicit_error() {
+        let _guard = env_lock_guard();
+        let _isolated = IsolatedVaultKeyEnv::new();
+
+        let err = promote_pending_x25519_keypair()
+            .expect_err("promote with no pending must Err, not silently succeed");
+        assert!(err.contains("no pending"), "got: {err}");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn x25519_backend_selection_uses_live_file_after_rotation_without_force_env() {
+        assert!(
+            should_use_file_backed_x25519_keypair(false, true),
+            "a promoted live file must win over the default keychain path so post-rotation reads keep using the rotated key"
+        );
+        assert!(!should_use_file_backed_x25519_keypair(false, false));
+        assert!(should_use_file_backed_x25519_keypair(true, false));
     }
 }
