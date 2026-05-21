@@ -914,7 +914,7 @@ fn select_members_with_keys(members: &[MemberPublicKey]) -> Result<Vec<&MemberPu
         .collect();
 
     if members_with_keys.is_empty() {
-        return Err("no org members have registered public keys. Each member needs to run `lpm env vars share --org` once to generate their keypair.".into());
+        return Err("no org members have registered public keys. Each member needs to run `lpm env share --org <slug>` once to generate their keypair.".into());
     }
 
     Ok(members_with_keys)
@@ -981,7 +981,7 @@ fn wrap_keys_for_members(
 
     if wrapped_keys.is_empty() {
         return Err(
-            "no org members have valid public keys. Each member needs to run `lpm env vars share --org` once to generate their keypair.".into(),
+            "no org members have valid public keys. Each member needs to run `lpm env share --org <slug>` once to generate their keypair.".into(),
         );
     }
 
