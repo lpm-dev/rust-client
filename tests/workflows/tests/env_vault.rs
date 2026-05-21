@@ -2607,3 +2607,44 @@ async fn env_oidc_allow_canonicalizes_env_aliases_before_storing_policy() {
     assert!(combined_output.contains("resolved \"dev\" → canonical \"development\""));
     assert!(combined_output.contains("envs [development]"));
 }
+
+#[tokio::test]
+async fn env_share_refuses_force_flag_with_actionable_remediation() {
+    // The share command never implemented --force — before this commit
+    // the CLI silently dropped the flag and re-sent the same request,
+    // so a user trying to resolve an org-vault version conflict with
+    // --force was lied to by the UX. The server-side org 409 hints no
+    // longer mention --force either; this assertion locks in the
+    // matching CLI refusal so the two surfaces stay in sync.
+    //
+    // The rejection fires before any vault / network state is touched,
+    // so the test does not need a configured vault, mock registry, or
+    // session seed — the CLI must refuse at flag parse time.
+    let project = TempProject::empty(r#"{"name":"share-force-refusal","version":"1.0.0"}"#);
+
+    let output = lpm(&project)
+        .args(["env", "share", "--org", "acme", "--force"])
+        .output()
+        .expect("failed to run lpm env share --force");
+
+    assert!(
+        !output.status.success(),
+        "share --force must fail with a non-zero exit:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+
+    let combined = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    assert!(
+        combined.contains("`lpm env share --force` is not supported"),
+        "expected the explicit refusal sentence; got: {combined}"
+    );
+    assert!(
+        combined.contains("lpm env pull --org"),
+        "expected the pull-then-retry remediation hint; got: {combined}"
+    );
+}
