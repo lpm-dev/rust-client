@@ -963,6 +963,19 @@ pub async fn run(
             let org_slug = org_flag
                 .ok_or_else(|| LpmError::Script("usage: lpm env share --org <org-slug>".into()))?;
 
+            // `--force` is not implemented on the share command. Before this
+            // commit the flag was silently dropped, so a user resolving a
+            // version conflict thought they were overwriting when they were
+            // sending the same request again. Reject explicitly. An explicit
+            // force surface for share is tracked as a separate change with
+            // its own reauth-proof gate; the paired server PR's org 409
+            // hints no longer mention --force.
+            if args.contains(&"--force") {
+                return Err(LpmError::Script(
+                    "`lpm env share --force` is not supported. To resolve a version conflict run `lpm env pull --org <slug>` first, then retry the share.".into(),
+                ));
+            }
+
             let vault_id = lpm_vault::vault_id::read_vault_id(project_dir).ok_or_else(|| {
                 LpmError::Script("no vault configured. Run `lpm env set` first".into())
             })?;

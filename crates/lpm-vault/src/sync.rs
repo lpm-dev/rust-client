@@ -126,11 +126,41 @@ fn url_path_segment(s: &str) -> String {
 }
 
 /// Response from push endpoint.
+///
+/// Carries both success-path fields (`version`, `status`) and the structured
+/// error-path fields the server sends with 4xx responses
+/// (`error`, `code`, `server_version`, `hint`). The error envelope is shared
+/// across the personal sync route and the org sync route. Two codes that
+/// command-layer callers may want to switch on:
+///
+///   - `vault_version_conflict` — caller's `expectedVersion` did not match
+///     the server's current version. Already produced by the existing CAS path.
+///   - `vault_expected_version_required` — caller omitted `expectedVersion`
+///     against an existing row. The server refuses the overwrite. Hint asks
+///     the user to pull first then retry.
 #[derive(Debug, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct PushResponse {
     pub version: Option<i32>,
     pub status: Option<String>,
     pub error: Option<String>,
+    pub code: Option<String>,
+    pub server_version: Option<i32>,
+    pub hint: Option<String>,
+}
+
+/// Render a server-supplied error envelope into a single user-facing string.
+/// Appends `hint` when present so the CLI surface shows both the cause and
+/// the actionable remediation in one message.
+fn format_push_error(result: &PushResponse, status: reqwest::StatusCode) -> String {
+    let base = result
+        .error
+        .clone()
+        .unwrap_or_else(|| format!("server error: {status}"));
+    match result.hint.as_deref() {
+        Some(hint) if !hint.is_empty() => format!("{base}\n\nHint: {hint}"),
+        _ => base,
+    }
 }
 
 /// Response from pull endpoint.
@@ -291,9 +321,7 @@ pub async fn push_raw(
     let (status, body) = read_verified_response(response, auth_token).await?;
     if !status.is_success() {
         if let Ok(result) = serde_json::from_slice::<PushResponse>(&body) {
-            return Err(result
-                .error
-                .unwrap_or_else(|| format!("server error: {status}")));
+            return Err(format_push_error(&result, status));
         }
 
         let message = std::str::from_utf8(&body).unwrap_or("").trim();
@@ -873,9 +901,7 @@ pub async fn push_org_with_keys(
         serde_json::from_slice(&body).map_err(|e| format!("response parse error: {e}"))?;
 
     if !status.is_success() {
-        return Err(result
-            .error
-            .unwrap_or_else(|| format!("server error: {status}")));
+        return Err(format_push_error(&result, status));
     }
 
     Ok(result)
@@ -888,7 +914,7 @@ fn select_members_with_keys(members: &[MemberPublicKey]) -> Result<Vec<&MemberPu
         .collect();
 
     if members_with_keys.is_empty() {
-        return Err("no org members have registered public keys. Each member needs to run `lpm env vars share --org` once to generate their keypair.".into());
+        return Err("no org members have registered public keys. Each member needs to run `lpm env share --org <slug>` once to generate their keypair.".into());
     }
 
     Ok(members_with_keys)
@@ -955,7 +981,7 @@ fn wrap_keys_for_members(
 
     if wrapped_keys.is_empty() {
         return Err(
-            "no org members have valid public keys. Each member needs to run `lpm env vars share --org` once to generate their keypair.".into(),
+            "no org members have valid public keys. Each member needs to run `lpm env share --org <slug>` once to generate their keypair.".into(),
         );
     }
 
@@ -1011,9 +1037,7 @@ pub async fn push_org(
         serde_json::from_slice(&body).map_err(|e| format!("response parse error: {e}"))?;
 
     if !status.is_success() {
-        return Err(result
-            .error
-            .unwrap_or_else(|| format!("server error: {status}")));
+        return Err(format_push_error(&result, status));
     }
 
     Ok(result)
@@ -2588,6 +2612,115 @@ mod tests {
         assert!(
             !second_ids.contains("user-a"),
             "stale recipients from prior shares must not remain in a new wrapped-key set"
+        );
+    }
+
+    #[test]
+    fn format_push_error_appends_hint_when_present() {
+        let response = PushResponse {
+            version: None,
+            status: None,
+            error: Some(
+                "Vault exists on the server. Pull first then push with the synced version, or pass --force to overwrite.".into(),
+            ),
+            code: Some("vault_expected_version_required".into()),
+            server_version: Some(7),
+            hint: Some("Run `lpm env pull` then retry the push.".into()),
+        };
+
+        let rendered = format_push_error(&response, reqwest::StatusCode::CONFLICT);
+        assert!(rendered.contains("Vault exists on the server"));
+        assert!(
+            rendered.contains("Hint: Run `lpm env pull` then retry the push."),
+            "hint must be surfaced so the user sees the remediation in one message: {rendered}"
+        );
+    }
+
+    #[test]
+    fn format_push_error_falls_back_to_error_only_when_hint_absent() {
+        let response = PushResponse {
+            version: None,
+            status: None,
+            error: Some("Version conflict".into()),
+            code: Some("vault_version_conflict".into()),
+            server_version: Some(9),
+            hint: None,
+        };
+
+        let rendered = format_push_error(&response, reqwest::StatusCode::CONFLICT);
+        assert_eq!(rendered, "Version conflict");
+    }
+
+    #[test]
+    fn format_push_error_falls_back_to_status_when_error_field_missing() {
+        let response = PushResponse {
+            version: None,
+            status: None,
+            error: None,
+            code: None,
+            server_version: None,
+            hint: None,
+        };
+
+        let rendered = format_push_error(&response, reqwest::StatusCode::CONFLICT);
+        assert!(
+            rendered.contains("409"),
+            "fallback must include the HTTP status so the user has something actionable: {rendered}"
+        );
+    }
+
+    #[tokio::test]
+    async fn push_raw_surfaces_expected_version_required_hint_on_409() {
+        // Pins the wire-level contract between the server's
+        // vault_expected_version_required response and what the CLI surface
+        // sees. Old clients that omit expectedVersion against an existing
+        // row now get a 409 from the server with both an error sentence and
+        // a hint; this test asserts both make it through into the Err string
+        // the command layer renders.
+        let _guard = env_lock_guard();
+        let _isolated = IsolatedVaultKeyEnv::new();
+
+        let server = MockServer::start().await;
+        let response_body = serde_json::json!({
+            "error": "Vault exists on the server. Pull first then push with the synced version, or pass --force to overwrite.",
+            "code": "vault_expected_version_required",
+            "serverVersion": 7,
+            "hint": "Run `lpm env pull` then retry the push.",
+        });
+        let body_str = serde_json::to_string(&response_body).expect("serialize");
+        let sig = signature::sign_body(body_str.as_bytes(), "auth-token");
+
+        Mock::given(method("POST"))
+            .and(path("/api/vaults/vault-1/sync"))
+            .respond_with(
+                ResponseTemplate::new(409)
+                    .set_body_string(body_str)
+                    .insert_header("content-type", "application/json")
+                    .insert_header("x-lpm-vault-signature", sig.as_str()),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let err = push_raw(
+            &server.uri(),
+            "auth-token",
+            "vault-1",
+            r#"{"API_KEY":"v"}"#,
+            None,
+            false,
+            None,
+        )
+        .await
+        .expect_err("server 409 must propagate as Err");
+
+        assert!(
+            err.contains("Vault exists on the server"),
+            "error sentence must be preserved: {err}"
+        );
+        assert!(
+            err.contains("Hint: Run `lpm env pull` then retry the push."),
+            "hint must be appended so the user gets the remediation in one shot: {err}"
         );
     }
 }
