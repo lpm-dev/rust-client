@@ -2648,3 +2648,87 @@ async fn env_share_refuses_force_flag_with_actionable_remediation() {
         "expected the pull-then-retry remediation hint; got: {combined}"
     );
 }
+
+#[tokio::test]
+async fn env_rotate_sharing_key_refuses_without_a_tty() {
+    // `lpm env rotate-sharing-key` is an interactive recovery surface
+    // — it prompts for typed `ROTATE` confirmation AND for password /
+    // TOTP via cliclack. Running it from a non-TTY context (CI,
+    // unattended runner, `curl | sh`) would either block on stdin
+    // forever or silently accept hostile input. The command MUST
+    // refuse outright at flag-parse / TTY-detect time so the operator
+    // never gets a half-rotated state.
+    //
+    // This test runs without a controlling TTY (cargo test inherits
+    // the worker's pipe-backed stdin), so the refusal must fire
+    // before any network, vault-state, or pending-key side effect.
+    let project = TempProject::empty(r#"{"name":"rotate-sharing-key-non-tty","version":"1.0.0"}"#);
+
+    let output = lpm(&project)
+        .args(["env", "rotate-sharing-key"])
+        .output()
+        .expect("failed to run lpm env rotate-sharing-key");
+
+    assert!(
+        !output.status.success(),
+        "rotate-sharing-key must fail with non-zero exit when stdin is not a TTY:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+
+    // The cliclack error box wraps long lines and inserts `│`
+    // continuation bars between segments, so we match on stable
+    // substrings that don't span those wraps. The two pinned phrases
+    // are load-bearing for the refusal semantics: the command name
+    // (so a future error-message rewrite that drops it gets caught)
+    // and "TTY" (so a regression that allows non-interactive flow
+    // gets caught).
+    let combined = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    assert!(
+        combined.contains("rotate-sharing-key"),
+        "refusal must name the command so users know what was rejected; got: {combined}"
+    );
+    assert!(
+        combined.contains("TTY"),
+        "refusal must mention the TTY requirement so users know the cause; got: {combined}"
+    );
+}
+
+#[tokio::test]
+async fn env_rotate_sharing_key_refuses_yes_flag_explicitly() {
+    // `--yes` is the conventional "skip prompt" flag elsewhere in the
+    // CLI, but for the sharing-key rotation flow there is no safe way
+    // to bypass the typed ROTATE confirmation + step-up reauth: the
+    // command's whole purpose is to be the one rotation surface that
+    // CANNOT be driven from an automated context. Pin the refusal so
+    // a future change cannot accidentally turn `--yes` into a working
+    // CI bypass.
+    let project =
+        TempProject::empty(r#"{"name":"rotate-sharing-key-yes-refused","version":"1.0.0"}"#);
+
+    let output = lpm(&project)
+        .args(["env", "rotate-sharing-key", "--yes"])
+        .output()
+        .expect("failed to run lpm env rotate-sharing-key --yes");
+
+    assert!(
+        !output.status.success(),
+        "rotate-sharing-key --yes must still fail:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+
+    let combined = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    assert!(
+        combined.contains("rotate-sharing-key") && combined.contains("TTY"),
+        "expected the explicit refusal regardless of --yes; got: {combined}"
+    );
+}

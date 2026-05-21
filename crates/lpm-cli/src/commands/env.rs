@@ -785,10 +785,13 @@ pub async fn run(
                 let registry_url = lpm_common::resolve_lpm_registry_url();
                 let auth_token = resolve_lpm_bearer(&registry_url).await?;
 
-                // Ensure we have a keypair
-                let private_key = lpm_vault::sync::ensure_public_key(&registry_url, &auth_token)
-                    .await
-                    .map_err(LpmError::Script)?;
+                // Classify the sharing-key state before fetching the
+                // wrapped vault. RotationRequired refuses silent
+                // overwrite and routes the user to
+                // `lpm env rotate-sharing-key`; NeedsInitialSet prompts
+                // for step-up reauth and registers the local key.
+                let private_key =
+                    ensure_sharing_key_ready_for_org_op(&registry_url, &auth_token, "pull").await?;
 
                 output::info(&format!("pulling vault from org {}...", org_slug.bold()));
 
@@ -989,7 +992,12 @@ pub async fn run(
             let registry_url = lpm_common::resolve_lpm_registry_url();
             let auth_token = resolve_lpm_bearer(&registry_url).await?;
 
-            output::info("ensuring your X25519 public key is registered...");
+            // Classify the sharing-key state before any wrap work. This
+            // refuses the silent-overwrite path on RotationRequired and
+            // prompts for step-up reauth on NeedsInitialSet, instead of
+            // letting `push_org_with_keys`'s internal `ensure_public_key`
+            // silently upload over whatever was on the server.
+            ensure_sharing_key_ready_for_org_op(&registry_url, &auth_token, "share").await?;
 
             let config = read_lpm_json_for_push(project_dir);
             let empty_env_map = HashMap::new();
@@ -1091,6 +1099,36 @@ pub async fn run(
                     result.version.unwrap_or(0).to_string().bold()
                 ));
             }
+        }
+
+        // Rotate the user's X25519 sharing keypair — the per-account key
+        // that org members use to encrypt vault AES keys to this user.
+        // DISTINCT from `rotate-key` (above), which rotates the
+        // wrapping-key the personal-vault blob is encrypted under.
+        //
+        // Flow:
+        //   1. Refuse if non-interactive (no TTY).
+        //   2. Crash recovery: if a pending key exists and matches the
+        //      server's current public key, the prior run committed the
+        //      server-side rotation but didn't promote locally —
+        //      finish the promotion and return.
+        //   3. Generate a fresh keypair into the pending slot WITHOUT
+        //      touching the live slot.
+        //   4. Show blast radius + require typed `ROTATE` confirmation.
+        //   5. Acquire a CLI step-up proof for
+        //      `vault:public-key:rotate`.
+        //   6. POST the new public key with the proof header.
+        //   7. On 200, atomically promote the pending slot into the
+        //      live slot. The server's response carries the counts of
+        //      invalidated wrapped keys + affected orgs so the user
+        //      knows which orgs will need to re-share before pulls
+        //      resume.
+        //
+        // A failure between steps 5 and 6 leaves the pending slot but
+        // no server-side change — the next `rotate-sharing-key`
+        // invocation discards the stale pending and starts over.
+        "rotate-sharing-key" => {
+            return env_rotate_sharing_key(args, json_output).await;
         }
 
         "list-remote" | "ls-remote" => {
@@ -1284,7 +1322,7 @@ pub async fn run(
 
         unknown => {
             return Err(LpmError::Script(format!(
-                "unknown vars action: '{unknown}'. Available: set, get, list, delete, import, export, push, pull, diff, validate, example, print, check, connect, status, log, share, rotate-key, pair, unpair, init, ls, copy"
+                "unknown vars action: '{unknown}'. Available: set, get, list, delete, import, export, push, pull, diff, validate, example, print, check, connect, status, log, share, rotate-key, rotate-sharing-key, pair, unpair, init, ls, copy"
             )));
         }
     }
@@ -3733,6 +3771,241 @@ fn expected_personal_sync_version(project_dir: &std::path::Path, force: bool) ->
 
 fn expected_org_sync_version(project_dir: &std::path::Path, org_slug: &str) -> Option<i32> {
     lpm_vault::vault_id::read_org_sync_version(project_dir, org_slug)
+}
+
+/// Shared classify-then-act helper for every org-vault flow that needs
+/// the user's X25519 sharing keypair on the server (org `share`, org
+/// `pull`). Closes the silent-overwrite vector the previous
+/// `ensure_public_key` path enabled: that helper would happily upload
+/// the local key over any server-stored key on first mismatch, so a
+/// new device reading the user's auth token could rotate the user's
+/// sharing key without re-authentication and without notification.
+///
+/// Three outcomes, mirroring the classifier enum:
+///
+///   - `Matches`: local key is already registered; return its private
+///     half and let the caller proceed with the wrap operation.
+///   - `NeedsInitialSet`: server has no key yet. Acquire a
+///     `vault:public-key:set` step-up proof via the WS2 reauth flow
+///     and upload the local public key. The user gets an out-of-band
+///     security email confirming the registration. Return the private
+///     half for the caller's wrap operation.
+///   - `RotationRequired`: server has a DIFFERENT key. Refuse to
+///     proceed and point the user at `lpm env rotate-sharing-key` —
+///     the explicit, interactive, reauthed flow that handles the
+///     blast-radius confirmation + email fan-out. The CLI MUST NOT
+///     silently overwrite here; that's the headline H16 vulnerability
+///     the WS3 server gate exists to close, and the client side has
+///     to hold its side of the contract.
+async fn ensure_sharing_key_ready_for_org_op(
+    registry_url: &str,
+    auth_token: &str,
+    op_label: &str,
+) -> Result<[u8; 32], LpmError> {
+    use lpm_vault::sync::PublicKeyRegistrationState;
+    let state = lpm_vault::sync::classify_public_key_state(registry_url, auth_token)
+        .await
+        .map_err(LpmError::Script)?;
+
+    match state {
+        PublicKeyRegistrationState::Matches(local) => Ok(local.private_key),
+        PublicKeyRegistrationState::NeedsInitialSet(local) => {
+            output::info(&format!(
+                "no sharing key on file for this account; registering this device's key \
+                 before continuing with `{op_label}`. You'll be prompted to confirm your \
+                 password (and authenticator code, if enrolled) to authorize the write."
+            ));
+            let proof = crate::step_up::request_cli_step_up_proof(
+                registry_url,
+                auth_token,
+                "vault:public-key:set",
+            )
+            .await
+            .map_err(LpmError::Script)?;
+            lpm_vault::sync::upload_public_key(
+                registry_url,
+                auth_token,
+                &local.public_key_b64,
+                Some(&proof),
+            )
+            .await
+            .map_err(LpmError::Script)?;
+            Ok(local.private_key)
+        }
+        PublicKeyRegistrationState::RotationRequired { .. } => Err(LpmError::Script(format!(
+            "refusing to {op_label}: this device's sharing key does NOT match the key on \
+                 the server. Silently overwriting the server-side key would invalidate every \
+                 org teammate's wrapped access without your knowledge — exactly the attack \
+                 surface the explicit rotation flow exists to close.\n\nIf you intentionally \
+                 want to rotate your sharing key (e.g. you lost the previous device's key), \
+                 run `lpm env rotate-sharing-key` here. That command prompts for step-up \
+                 reauth, shows the blast radius, and sends an out-of-band security email \
+                 before invalidating wrapped-key rows.",
+        ))),
+    }
+}
+
+/// Implementation of the `lpm env rotate-sharing-key` command branch.
+/// Extracted so the dispatcher arm stays small and the rotation flow
+/// can be unit-tested independently in the future. See the dispatcher
+/// docstring for the step-by-step flow.
+async fn env_rotate_sharing_key(args: Vec<&str>, json_output: bool) -> Result<(), LpmError> {
+    use std::io::IsTerminal;
+
+    // Non-interactive refusal — the prompt for typed confirmation +
+    // password / TOTP cannot work without a TTY, and silently advancing
+    // through stdin would either block forever or accept hostile input
+    // piped from an unattended runner.
+    let yes_skip = args.contains(&"--yes");
+    if !std::io::stdin().is_terminal() || yes_skip {
+        return Err(LpmError::Script(
+            "`lpm env rotate-sharing-key` is an interactive recovery surface and \
+             refuses to run without a TTY. Run it manually from your terminal."
+                .into(),
+        ));
+    }
+
+    let registry_url = lpm_common::resolve_lpm_registry_url();
+    let auth_token = resolve_lpm_bearer(&registry_url).await?;
+
+    // Crash recovery — if a pending key exists and matches the server,
+    // the previous run committed the server side but didn't promote
+    // locally. Promote and return; no second rotation needed.
+    if let Some(pending) =
+        lpm_vault::sync::read_pending_x25519_keypair().map_err(LpmError::Script)?
+    {
+        let server_key = lpm_vault::sync::get_my_public_key(&registry_url, &auth_token)
+            .await
+            .map_err(LpmError::Script)?;
+        if server_key.as_deref() == Some(&pending.public_key_b64) {
+            lpm_vault::sync::promote_pending_x25519_keypair().map_err(LpmError::Script)?;
+            if json_output {
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "success": true,
+                        "status": "resumed",
+                    })
+                );
+            } else {
+                output::success(
+                    "resumed pending sharing-key rotation: server already had the new key, \
+                     promoted the local slot.",
+                );
+            }
+            return Ok(());
+        }
+        // Pending exists but doesn't match server — last attempt failed
+        // before the server committed. Discard the orphan so the next
+        // step can re-generate.
+        output::warn(
+            "found a stale pending sharing-key from a prior failed rotation. Discarding it \
+             and starting fresh.",
+        );
+        lpm_vault::sync::discard_pending_x25519_keypair().map_err(LpmError::Script)?;
+    }
+
+    // Show blast radius. We can't precompute it locally (we don't know
+    // which orgs the user belongs to without a server roundtrip we'd
+    // duplicate post-rotation), so the message names the EFFECT
+    // honestly: every org vault wrapped to this user gets invalidated;
+    // owners/admins of each affected org must re-share before pulls
+    // resume.
+    output::warn(
+        "Rotating your sharing key invalidates EVERY org-vault wrapped-key entry stored \
+         for you. Until an owner or admin of each affected org runs \
+         `lpm env share --org <slug>` to re-wrap, you will not be able to pull those \
+         vaults. The dashboard's Member Access view will show those rows as \"Needs share\".",
+    );
+    output::info(
+        "An out-of-band security email will be sent to your account, and a separate \
+         impact email to every affected org's owners + admins.",
+    );
+
+    let typed: String =
+        cliclack::input("Type ROTATE (uppercase) to confirm. Any other input cancels.")
+            .interact()
+            .map_err(|e| LpmError::Script(format!("confirmation prompt failed: {e}")))?;
+    if typed != "ROTATE" {
+        return Err(LpmError::Script(
+            "rotation cancelled — no server-side or local state changed.".into(),
+        ));
+    }
+
+    // Acquire the WS2 step-up proof BEFORE generating the pending
+    // key — a credential refusal must not leave a stale pending file
+    // on disk.
+    let proof = crate::step_up::request_cli_step_up_proof(
+        &registry_url,
+        &auth_token,
+        "vault:public-key:rotate",
+    )
+    .await
+    .map_err(LpmError::Script)?;
+
+    let pending = lpm_vault::sync::create_pending_x25519_keypair().map_err(LpmError::Script)?;
+
+    output::info("uploading new sharing key...");
+    let response = lpm_vault::sync::upload_public_key(
+        &registry_url,
+        &auth_token,
+        &pending.public_key_b64,
+        Some(&proof),
+    )
+    .await;
+
+    let response = match response {
+        Ok(r) => r,
+        Err(e) => {
+            // Server-side write failed — discard the pending so the
+            // next attempt starts from a clean slate.
+            let _ = lpm_vault::sync::discard_pending_x25519_keypair();
+            return Err(LpmError::Script(e));
+        }
+    };
+
+    // Promote pending → live. A crash here leaves the pending slot
+    // and the server-side new key, which the crash-recovery branch
+    // at the top of this function will finish on the next run.
+    lpm_vault::sync::promote_pending_x25519_keypair().map_err(LpmError::Script)?;
+
+    if json_output {
+        println!(
+            "{}",
+            serde_json::json!({
+                "success": true,
+                "status": response.status,
+                "fingerprintPrefix": response.fingerprint_prefix,
+                "previousFingerprintPrefix": response.previous_fingerprint_prefix,
+                "invalidatedWrappedKeys": response.invalidated_wrapped_keys,
+                "affectedOrgs": response.affected_orgs,
+            })
+        );
+    } else {
+        let fp = response
+            .fingerprint_prefix
+            .as_deref()
+            .unwrap_or("(unknown)");
+        let invalidated = response.invalidated_wrapped_keys.unwrap_or(0);
+        let orgs = response.affected_orgs.unwrap_or(0);
+        output::success(&format!(
+            "sharing key rotated. New fingerprint: {}.",
+            fp.bold()
+        ));
+        if invalidated > 0 || orgs > 0 {
+            output::info(&format!(
+                "Invalidated {invalidated} wrapped-key entries across {orgs} org(s). \
+                 Ask an owner/admin of each affected org to re-share before pulling again."
+            ));
+        } else {
+            output::info(
+                "No org-vault wrapped keys were affected (you weren't sharing into any orgs \
+                 yet).",
+            );
+        }
+    }
+
+    Ok(())
 }
 
 /// Validate vault secrets against .env.example.

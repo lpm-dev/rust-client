@@ -229,6 +229,20 @@ pub fn get_or_create_x25519_keypair() -> Result<([u8; 32], [u8; 32]), String> {
     Ok((private, public))
 }
 
+/// Delete the stored X25519 private key from the Keychain. Used by the
+/// rotation promote path so subsequent `load_local_public_key_state`
+/// calls fall through to the file-backed slot the rotation just wrote.
+///
+/// Best-effort: a `not found` result is the steady state for users who
+/// were already on the file fallback. Returns `Ok(())` either way so
+/// callers don't need to special-case the absence path.
+pub fn delete_x25519_keypair() -> Result<(), String> {
+    // Reuse the existing keychain delete primitive; the underlying API
+    // returns `not found` errors which are not actionable here.
+    let _ = delete_keychain_password(SERVICE, X25519_ACCOUNT);
+    Ok(())
+}
+
 // ─── Index Management ──────────────────────────────────────────────
 
 fn read_index() -> Vec<IndexEntry> {

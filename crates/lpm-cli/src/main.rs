@@ -41,6 +41,7 @@ mod script_policy_config;
 pub mod security_check;
 mod sigstore;
 mod sigstore_verify;
+mod step_up;
 mod swift_manifest;
 #[cfg(test)]
 mod test_env;
