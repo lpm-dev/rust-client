@@ -427,9 +427,10 @@ enum Commands {
         audit_after_install: bool,
 
         /// Suppress audit-after-install for this invocation regardless
-        /// of env / config. Pairs with `--audit-after-install` so an
-        /// operator who turned the feature on globally can opt out for
-        /// a single run.
+        /// of env / config. The feature is off by default, so this flag
+        /// is only meaningful when a global config or env setting has
+        /// turned it on — it lets an operator opt out for a single run
+        /// without editing the persistent setting.
         #[arg(long, conflicts_with = "audit_after_install")]
         no_audit_after_install: bool,
 

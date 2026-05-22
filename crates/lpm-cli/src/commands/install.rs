@@ -72,6 +72,31 @@ fn maybe_test_panic(stage: &str) {
     }
 }
 
+/// Test-only failure injection for the audit-after-install wrapper.
+///
+/// Returns `true` when the workflow harness has asked us to simulate
+/// an audit-pass failure. The install pipeline then skips the real
+/// `audit::run_install_summary` call, logs a `tracing::warn!`, and
+/// proceeds as if the audit had errored — letting the workflow test
+/// pin the "errors degrade to no envelope field, install still exits
+/// 0" contract without depending on a real audit failure mode
+/// (network outage, store-lock contention, lockfile corruption).
+///
+/// Gated the same way as [`maybe_test_panic`]: enabled in debug
+/// builds OR when `LPM_TEST_MODE=1` is exported. Production release
+/// builds never honor the trigger env even if it's set.
+fn maybe_test_audit_after_install_should_fail() -> bool {
+    let allowed = cfg!(debug_assertions)
+        || std::env::var("LPM_TEST_MODE")
+            .ok()
+            .as_deref()
+            .is_some_and(|v| v == "1");
+    if !allowed {
+        return false;
+    }
+    std::env::var("LPM_TEST_AUDIT_AFTER_INSTALL_FAIL").as_deref() == Ok("1")
+}
+
 ///: per-(name, version) fetch serialization.
 ///
 /// Before, the main task `drain`ed all speculative tarball
@@ -7464,11 +7489,19 @@ async fn run_with_options_under_store_lock(
     // for operators tailing `LPM_LOG`.
     let audit_summary_for_envelope: Option<crate::commands::audit::AuditCounts> =
         if audit_after_install {
-            match crate::commands::audit::run_install_summary(client, project_dir).await {
-                Ok(opt) => opt,
-                Err(e) => {
-                    tracing::warn!("audit-after-install failed: {e}");
-                    None
+            if maybe_test_audit_after_install_should_fail() {
+                tracing::warn!(
+                    "audit-after-install failed: test-injected failure \
+                     (LPM_TEST_AUDIT_AFTER_INSTALL_FAIL=1)"
+                );
+                None
+            } else {
+                match crate::commands::audit::run_install_summary(client, project_dir).await {
+                    Ok(opt) => opt,
+                    Err(e) => {
+                        tracing::warn!("audit-after-install failed: {e}");
+                        None
+                    }
                 }
             }
         } else {

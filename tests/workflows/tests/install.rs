@@ -391,6 +391,105 @@ async fn install_audit_after_install_attaches_summary_to_json_envelope() {
     );
 }
 
+#[tokio::test]
+async fn install_audit_after_install_enabled_via_config_file() {
+    // Locks the third precedence tier — `~/.lpm/config.toml >
+    // audit-after-install = true`. Without this test, the chain
+    // documented in `lpm install --help` and config-toml.mdx has an
+    // untested rung; only CLI flag + env are otherwise exercised.
+    let mock = MockRegistry::start().await;
+    let tarball = make_tarball("ms", "2.1.3");
+    mock.with_package("ms", "2.1.3", &tarball).await;
+    mount_ms_2_1_3(&mock).await;
+
+    let project = TempProject::empty(
+        r#"{"name":"audit-cfg-on","version":"1.0.0","dependencies":{"ms":"^2.1.3"}}"#,
+    );
+
+    // Seed `<home>/.lpm/config.toml` with `audit-after-install = true`.
+    // No CLI flag, no env var — only the config-file rung resolves to
+    // true. The audit line MUST still fire.
+    let cfg_dir = project.home().join(".lpm");
+    std::fs::create_dir_all(&cfg_dir).unwrap();
+    std::fs::write(cfg_dir.join("config.toml"), "audit-after-install = true\n").unwrap();
+
+    let output = lpm_with_registry(&project, &mock.url())
+        .args([
+            "install",
+            "--no-security-summary",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
+        .output()
+        .expect("failed to run lpm install");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "install must succeed:\n{stderr}");
+    assert!(
+        stderr.contains("Audited"),
+        "`audit-after-install = true` in config.toml must enable the audit summary line; \
+         got stderr:\n{stderr}"
+    );
+}
+
+#[tokio::test]
+async fn install_audit_after_install_failure_does_not_fail_install() {
+    // Locks the "audit findings are informational only" contract.
+    // When the audit pass errors mid-flight — network outage, store-
+    // lock contention, lockfile corruption, etc. — the install
+    // pipeline MUST still exit 0 and MUST NOT attach `audit_summary`
+    // to the JSON envelope. The wrapper at the audit call site in
+    // `run_with_options_under_store_lock` owns this contract; this
+    // test pins it.
+    //
+    // Failure injection uses `LPM_TEST_AUDIT_AFTER_INSTALL_FAIL=1` +
+    // `LPM_TEST_MODE=1` (the latter is implicit in debug builds via
+    // `cfg!(debug_assertions)`). The trigger is owned by
+    // `maybe_test_audit_after_install_should_fail` in install.rs.
+    let mock = MockRegistry::start().await;
+    let tarball = make_tarball("ms", "2.1.3");
+    mock.with_package("ms", "2.1.3", &tarball).await;
+    mount_ms_2_1_3(&mock).await;
+
+    let project = TempProject::empty(
+        r#"{"name":"audit-fail","version":"1.0.0","dependencies":{"ms":"^2.1.3"}}"#,
+    );
+
+    let output = lpm_with_registry(&project, &mock.url())
+        .env("LPM_TEST_MODE", "1")
+        .env("LPM_TEST_AUDIT_AFTER_INSTALL_FAIL", "1")
+        .args([
+            "--json",
+            "install",
+            "--audit-after-install",
+            "--no-security-summary",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
+        .output()
+        .expect("failed to run lpm install");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "install MUST exit 0 even when audit-after-install errors — findings are \
+         informational only; stdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    let envelope: serde_json::Value = serde_json::from_str(&stdout)
+        .expect("install --json must emit a parseable envelope even when audit fails");
+    assert!(
+        envelope.get("audit_summary").is_none(),
+        "audit_summary MUST be absent from the envelope when the audit pass errored — \
+         partial / placeholder counts would mislead operators. Envelope:\n{stdout}"
+    );
+    assert!(
+        !stderr.contains("Audited"),
+        "human audit advisory line MUST NOT fire when the audit pass errored; \
+         got stderr:\n{stderr}"
+    );
+}
+
 #[test]
 fn install_audit_after_install_flags_are_mutually_exclusive() {
     let project =
