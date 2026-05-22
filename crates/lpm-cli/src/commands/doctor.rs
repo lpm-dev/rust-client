@@ -174,7 +174,6 @@ pub fn list(
         return Ok(());
     }
 
-    output::print_header();
     println!();
     println!(
         "  {} {} catalog entries",
@@ -241,10 +240,6 @@ pub async fn run(
     fix: bool,
     _yes: bool,
 ) -> Result<(), LpmError> {
-    if !json_output {
-        output::print_header();
-    }
-
     let mut checks: Vec<Check> = Vec::new();
     let mut fixes_applied: Vec<String> = Vec::new();
 
@@ -1740,6 +1735,8 @@ async fn run_doctor_install(client: &RegistryClient, project_dir: &Path) -> Resu
         // env / config / default chain.
         false, // strict_sandbox
         false, // no_sandbox
+        false, // verbose: internal pipeline, no user-facing Done footer
+        false, // audit_after_install: internal pipeline never runs audit
     )
     .await
 }

@@ -14,11 +14,6 @@ pub fn suppress_stdout(enabled: bool) -> Result<Option<gag::Gag>, String> {
         .map_err(|error| format!("failed to suppress stdout: {error}"))
 }
 
-/// Print the LPM header banner using cliclack intro style.
-pub fn print_header() {
-    let _ = cliclack::intro("LPM — Licensed Package Manager");
-}
-
 /// Print a success message.
 pub fn success(msg: &str) {
     let _ = cliclack::log::success(msg);
