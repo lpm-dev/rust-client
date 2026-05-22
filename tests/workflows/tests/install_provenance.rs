@@ -310,8 +310,16 @@ fn install_completed_successfully(out: &std::process::Output) -> bool {
         String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr)
     );
-    // Post-link summary marker (human mode) OR JSON success.
-    combined.contains("linked") || combined.contains("\"success\":true")
+    // Post-link summary marker (human mode) OR JSON success. The human
+    // marker is the slim-UI `Done` / `Up to date` line emitted by
+    // [`crate::install_ui`]; legacy `linked` is kept for callers still
+    // running under `--verbose` (which appends the linked/symlinked
+    // footer).
+    let lower = combined.to_lowercase();
+    lower.contains("done · ")
+        || lower.contains("up to date")
+        || combined.contains("linked")
+        || combined.contains("\"success\":true")
 }
 
 /// Stronger form: drift-block absent AND install reached the post-link

@@ -12,10 +12,6 @@ use tokio::sync::oneshot;
 /// 4. Browser redirects to `localhost:{port}/callback?token={token}`
 /// 5. We capture the token, verify it with whoami, store it
 pub async fn run(registry_url: &str, json_output: bool) -> Result<(), LpmError> {
-    if !json_output {
-        output::print_header();
-    }
-
     // Check if already logged in
     if let Some(existing) = auth::get_token(registry_url) {
         let client = lpm_registry::RegistryClient::new()

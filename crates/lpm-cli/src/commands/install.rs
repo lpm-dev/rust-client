@@ -1,3 +1,4 @@
+use crate::install_ui;
 use crate::output;
 use crate::overrides_state;
 use crate::patch_engine;
@@ -3413,6 +3414,16 @@ pub async fn run_with_options(
     // true.
     strict_sandbox: bool,
     no_sandbox: bool,
+    // Top-level `--verbose` flag (long form only — `-v` is `--version`).
+    // When true, the Done block appends a footer with per-phase timings
+    // and the on-disk lockfile size.
+    verbose: bool,
+    // Resolved audit-after-install precedence (CLI > env > config >
+    // default false). When true, the install pipeline runs the silent
+    // [`crate::commands::audit::run_install_summary`] after the Done
+    // block and emits a one-line advisory (or attaches `audit_summary`
+    // to the JSON envelope). Findings NEVER fail the install.
+    audit_after_install: bool,
 ) -> Result<(), LpmError> {
     // Round 2: hold a shared lock on the store for the
     // entire install pipeline. Multiple concurrent installs share it
@@ -3449,6 +3460,8 @@ pub async fn run_with_options(
             verify_policy,
             strict_sandbox,
             no_sandbox,
+            verbose,
+            audit_after_install,
         ),
     )
     .await
@@ -3485,18 +3498,21 @@ async fn run_with_options_under_store_lock(
     // user's CLI sandbox-mode override.
     strict_sandbox: bool,
     no_sandbox: bool,
+    // Forwarded `--verbose` flag from the CLI entry. Used only by the
+    // Done-block footer; the rest of the pipeline ignores it.
+    verbose: bool,
+    // Resolved audit-after-install boolean — see [`run_with_options`].
+    audit_after_install: bool,
 ) -> Result<(), LpmError> {
-    if !json_output {
-        output::print_header();
-    }
-
     let start = Instant::now();
 
     // Step 1: Read package.json
     let pkg_json_path = project_dir.join("package.json");
     if !pkg_json_path.exists() {
         return Err(LpmError::NotFound(
-            "no package.json found in current directory".to_string(),
+            "no package.json found in current directory or any parent. \
+             Run `lpm init` to create one, or `lpm install <pkg>` to auto-create."
+                .to_string(),
         ));
     }
 
@@ -3627,16 +3643,16 @@ async fn run_with_options_under_store_lock(
             }
             println!("{}", serde_json::to_string_pretty(&json).unwrap());
         } else {
-            // Header already printed at function entry.
-            output::success(&format!("up to date ({total_ms}ms)"));
+            install_ui::done(&format!("Up to date · {total_ms}ms"));
         }
         return Ok(());
     }
 
     let pkg_name = pkg.name.as_deref().unwrap_or("(unnamed)");
-    if !json_output {
-        output::info(&format!("Installing dependencies for {}", pkg_name.bold()));
-    }
+    // The persistent `› Resolving …` phase line is emitted below after
+    // the route table is built so it can name the actual registry hosts
+    // (e.g. `lpm.dev`, `npmjs.org`) the resolver will hit. The pre-fix
+    // `Installing dependencies for X` line was redundant with that.
 
     // + hoisted-symmetry — legacy linker-state migration.
     // Detects upgrade-in-place users (binary upgraded but
@@ -3928,6 +3944,26 @@ async fn run_with_options_under_store_lock(
         output::warn(w);
     }
 
+    // Persistent `› Resolving …` phase line. Sits ABOVE the resolver so
+    // the user sees what hosts are about to be hit before any network
+    // I/O. `is_add_invocation` distinguishes `lpm i <pkg>` (already named
+    // the target on the command line) from bare `lpm install` (where the
+    // project name is the only handle the user has on what's being
+    // resolved).
+    let is_add_invocation = direct_versions_out.is_some();
+    if !json_output {
+        let host = install_ui::short_registry_host(client.base_url());
+        let line = if is_add_invocation {
+            format!("Resolving dependencies from {host}")
+        } else {
+            format!(
+                "Resolving dependencies from {host} for {}",
+                install_ui::bold(pkg_name)
+            )
+        };
+        install_ui::phase(&line);
+    }
+
     // `linker_mode` was resolved above — before `check_install_state` —
     // so it covers both validation (fail-loud on invalid values) and
     // freshness (post-install env/config flips invalidate the cache).
@@ -4051,6 +4087,38 @@ async fn run_with_options_under_store_lock(
 
     // Step 2: Try lockfile fast path, else resolve
     let lockfile_path = project_dir.join(lpm_lockfile::LOCKFILE_NAME);
+
+    // Capture pre-install direct-dep versions BEFORE the resolver writes
+    // a fresh lockfile. The Done block compares against this snapshot to
+    // print the `+ pkg@version` diff list — only direct deps that
+    // CHANGED in this run (newly installed or upgraded). A bare
+    // `lpm install` that does no work prints no list; `lpm i react`
+    // prints just `+ react@…`; a hand-edited manifest prints exactly the
+    // diff. Reading from the lockfile (not from `node_modules`) keeps
+    // the snapshot cheap and robust against partial installs.
+    let pre_install_direct_versions: HashMap<String, String> = if lockfile_path.exists() {
+        let direct_names: std::collections::HashSet<&str> = pkg
+            .dependencies
+            .keys()
+            .chain(pkg.dev_dependencies.keys())
+            .map(String::as_str)
+            .collect();
+        lpm_lockfile::Lockfile::read_fast(&lockfile_path)
+            .ok()
+            .map(|lf| {
+                let mut map: HashMap<String, String> = HashMap::with_capacity(direct_names.len());
+                for p in &lf.packages {
+                    if direct_names.contains(p.name.as_str()) {
+                        map.entry(p.name.clone())
+                            .or_insert_with(|| p.version.clone());
+                    }
+                }
+                map
+            })
+            .unwrap_or_default()
+    } else {
+        HashMap::new()
+    };
 
     // — apply `.npmrc`-derived TLS overrides to the cloned
     // client BEFORE any network use, then shadow the parameter so every
@@ -4586,7 +4654,8 @@ async fn run_with_options_under_store_lock(
         }
         None => {
             let resolve_start = Instant::now();
-            let spinner = make_spinner("Resolving dependency tree...");
+            // The persistent `› Resolving …` phase line above already
+            // narrates that resolution is in flight — no spinner needed.
 
             // route_table is constructed above the lockfile match
             // (day-4.5) — we just borrow/clone it here.
@@ -4876,7 +4945,6 @@ async fn run_with_options_under_store_lock(
             // waits on the coord's per-key lock and returns as soon as
             // spec's atomic-rename makes it visible.
             let ms = resolve_start.elapsed().as_millis();
-            spinner.stop(format!("Resolved in {ms}ms"));
 
             // Post-resolution peer dependency check: warn about unmet peers
             // using each package's actual selected version (not a union).
@@ -4972,10 +5040,13 @@ async fn run_with_options_under_store_lock(
             apply_post_resolve_directory_link_fixup(&mut packages, &non_registry_source_deps);
 
             if !json_output {
-                output::info(&format!(
-                    "Resolved {} packages ({}ms)",
+                // Persistent second phase line. Sub-second resolves don't
+                // need their own "Resolved in Xms" beat — the count is
+                // the signal, the timing lands in the verbose footer.
+                install_ui::phase(&format!(
+                    "Installing {} {}",
                     packages.len().to_string().bold(),
-                    ms
+                    install_ui::packages_word(packages.len()),
                 ));
                 //surface best-effort peer-conflict reports as
                 // warnings so the user knows which transitive
@@ -6357,18 +6428,10 @@ async fn run_with_options_under_store_lock(
         None
     };
 
-    if !json_output {
-        if downloaded > 0 {
-            output::info(&format!(
-                "Downloaded {} packages, {} from cache ({}ms)",
-                downloaded.to_string().bold(),
-                cached,
-                fetch_ms
-            ));
-        } else {
-            output::info(&format!("All {} packages from cache", cached));
-        }
-    }
+    // Fetch / cache-hit counters are recorded into `fetch_ms` etc. and
+    // surfaced via the verbose footer and JSON envelope. The default
+    // human output is intentionally quiet here — the persistent
+    // `› Installing N packages` line above already narrates this phase.
 
     // Step 4: link_targets — already built before the fetch loop (    //b) so the event-driven path could dispatch per-pkg link work
     // during fetch. No-op here to keep the surrounding structure stable.
@@ -6376,7 +6439,6 @@ async fn run_with_options_under_store_lock(
 
     // Step 5: Link into node_modules
     let link_start = Instant::now();
-    let spinner = make_spinner("Linking node_modules...");
 
     let link_result = if event_driven_link {
         //b: event-driven path. Per-pkga future release2 tasks were
@@ -6597,7 +6659,8 @@ async fn run_with_options_under_store_lock(
     };
 
     let link_ms = link_start.elapsed().as_millis();
-    spinner.stop(format!("Linked in {link_ms}ms"));
+    // `link_ms` lands in the verbose footer and the JSON timing object;
+    // no dedicated "Linked in Xms" line.
 
     // audit fix #3: link workspace member dependencies AFTER
     // the regular linker run. The linker's stale-symlink cleanup pass at the
@@ -7164,15 +7227,9 @@ async fn run_with_options_under_store_lock(
         lpm_lockfile::ensure_gitattributes(project_dir)
             .map_err(|e| LpmError::Registry(format!("failed to ensure .gitattributes: {e}")))?;
 
-        if !json_output {
-            let lockb_path = lockfile_path.with_extension("lockb");
-            let lockb_size = std::fs::metadata(&lockb_path).map(|m| m.len()).unwrap_or(0);
-            output::info(&format!(
-                "Lockfile  lpm.lock ({} packages) + lpm.lockb ({})",
-                lockfile.packages.len(),
-                lpm_common::format_bytes(lockb_size),
-            ));
-        }
+        // The lockfile-size line moved into the `--verbose` footer at
+        // the end of the install, alongside the per-phase timing
+        // breakdown.
     } else if let Some(mut lockfile) = fast_path_lockfile.take() {
         // generalized writeback (P43-2 Change 3). When the
         // fast path ran, we skip the fresh-resolve writer above. But
@@ -7395,6 +7452,28 @@ async fn run_with_options_under_store_lock(
         &prior_patch_state,
         &applied_patches,
     );
+
+    // Audit-after-install: run a silent audit pass and stash the
+    // resulting counts. Both the JSON envelope and the human Done
+    // block consume `audit_summary_for_envelope` below; computing
+    // once here keeps the two surfaces in sync.
+    //
+    // Failure mode: never fails the install — audit findings are
+    // informational only, per the opt-in contract. Errors degrade to
+    // `None` and the install pipeline carries on. The error is logged
+    // for operators tailing `LPM_LOG`.
+    let audit_summary_for_envelope: Option<crate::commands::audit::AuditCounts> =
+        if audit_after_install {
+            match crate::commands::audit::run_install_summary(client, project_dir).await {
+                Ok(opt) => opt,
+                Err(e) => {
+                    tracing::warn!("audit-after-install failed: {e}");
+                    None
+                }
+            }
+        } else {
+            None
+        };
 
     if json_output {
         let pkg_list: Vec<serde_json::Value> = packages
@@ -7769,6 +7848,9 @@ async fn run_with_options_under_store_lock(
                 })
                 .collect(),
         );
+        if let Some(counts) = &audit_summary_for_envelope {
+            json["audit_summary"] = serde_json::to_value(counts).unwrap_or(serde_json::Value::Null);
+        }
         println!("{}", serde_json::to_string_pretty(&json).unwrap());
     } else {
         // print the override apply summary BEFORE
@@ -7845,24 +7927,102 @@ async fn run_with_options_under_store_lock(
             }
         }
 
-        println!();
-        output::success(&format!(
-            "{} packages installed in {:.1}s",
-            packages.len().to_string().bold(),
-            elapsed.as_secs_f64()
+        // Diff direct deps against the pre-install lockfile snapshot.
+        // Only deps whose resolved version CHANGED in this run land in
+        // the `+ pkg@version` list — a no-op refresh prints no list,
+        // `lpm i react` prints just `+ react@…`, and a hand-edited
+        // manifest prints exactly the diff. `collect_direct_versions`
+        // honors the resolver's `is_direct` flag so transitives never
+        // pollute the list.
+        let post_direct_versions = collect_direct_versions(&packages);
+        let mut changed_direct: Vec<(String, String)> = Vec::new();
+        for (name, post_v) in &post_direct_versions {
+            let post_str = post_v.to_string();
+            match pre_install_direct_versions.get(name) {
+                Some(pre_v) if pre_v == &post_str => continue,
+                _ => changed_direct.push((name.clone(), post_str)),
+            }
+        }
+        changed_direct.sort();
+
+        if !changed_direct.is_empty() {
+            eprintln!();
+            for (name, version) in &changed_direct {
+                install_ui::plus(name, version, None);
+            }
+        }
+
+        // Verified-via-Sigstore counter. Drift gate populates this map
+        // per package; `Verified` is the only state that earns the
+        // green checkmark line. `Unverified` (operator-skipped) and
+        // entries absent from the map are not counted — we only assert
+        // the strong signal here, never inflate it.
+        let verified_count = install_provenance_status_map
+            .values()
+            .filter(|s| matches!(s, lpm_common::ProvenanceStatus::Verified(_)))
+            .count();
+
+        let action = if is_add_invocation {
+            "added"
+        } else {
+            "installed"
+        };
+        let duration_str = install_ui::format_duration(elapsed);
+        let pkg_word = install_ui::packages_word(packages.len());
+        eprintln!();
+        install_ui::done(&format!(
+            "Done · {action} {} {pkg_word} in {}",
+            install_ui::bold(&packages.len().to_string()),
+            install_ui::green(&duration_str),
         ));
-        println!(
-            "  {} linked, {} symlinked",
-            link_result.linked.to_string().dimmed(),
-            link_result.symlinked.to_string().dimmed(),
-        );
-        println!(
-            "  resolve: {}ms  fetch: {}ms  link: {}ms",
-            resolve_ms.to_string().dimmed(),
-            fetch_ms.to_string().dimmed(),
-            link_ms.to_string().dimmed(),
-        );
-        println!();
+        if verified_count > 0 {
+            install_ui::done(&format!(
+                "{verified_count} of {} {} verified via Sigstore",
+                packages.len(),
+                install_ui::packages_word(packages.len()),
+            ));
+        }
+
+        // Audit-after-install advisory. Yellow `!` line; vulnerability
+        // count goes red when non-zero. Computed above before the
+        // human/JSON branch split so both surfaces agree.
+        if let Some(counts) = &audit_summary_for_envelope {
+            install_ui::warn(&install_ui::format_audit_advisory(
+                counts.packages_audited,
+                counts.vulnerabilities,
+                counts.suspicious,
+                counts.elapsed_ms,
+            ));
+        }
+
+        if verbose {
+            eprintln!(
+                "  {}",
+                format!("resolve: {resolve_ms}ms  fetch: {fetch_ms}ms  link: {link_ms}ms").dimmed()
+            );
+            let lockb_path = lockfile_path.with_extension("lockb");
+            let lockb_size = std::fs::metadata(&lockb_path).map(|m| m.len()).unwrap_or(0);
+            let lockfile_pkg_count = lpm_lockfile::Lockfile::read_fast(&lockfile_path)
+                .map(|lf| lf.packages.len())
+                .unwrap_or(packages.len());
+            eprintln!(
+                "  {}",
+                format!(
+                    "lpm.lock ({lockfile_pkg_count} {}) + lpm.lockb ({})",
+                    install_ui::packages_word(lockfile_pkg_count),
+                    lpm_common::format_bytes(lockb_size),
+                )
+                .dimmed()
+            );
+            eprintln!(
+                "  {}",
+                format!(
+                    "{} linked, {} symlinked",
+                    link_result.linked, link_result.symlinked,
+                )
+                .dimmed()
+            );
+        }
     }
 
     // Write install-hash so `lpm dev` knows deps are up to date.
@@ -10812,7 +10972,6 @@ pub(crate) fn stage_packages_to_manifest(
     package_specs: &[String],
     save_dev: bool,
     flags: crate::save_spec::SaveFlags,
-    json_output: bool,
 ) -> Result<StagedManifest, LpmError> {
     use crate::save_spec::{UserSaveIntent, parse_user_save_intent};
 
@@ -10837,14 +10996,6 @@ pub(crate) fn stage_packages_to_manifest(
         doc[dep_key] = serde_json::json!({});
     }
 
-    let target_label = pkg_json_path
-        .parent()
-        .and_then(|p| p.file_name())
-        .map_or_else(
-            || pkg_json_path.display().to_string(),
-            |n| n.to_string_lossy().to_string(),
-        );
-
     let force_rewrite = flags.forces_rewrite();
     let mut entries: Vec<StagedEntry> = Vec::with_capacity(package_specs.len());
     // Track whether `doc` has been mutated. no-churn rule: when
@@ -10867,14 +11018,10 @@ pub(crate) fn stage_packages_to_manifest(
         };
 
         if let Some(literal) = explicit_literal {
-            if !json_output {
-                output::info(&format!(
-                    "Adding {}@{} to {} ({target_label})",
-                    name.bold(),
-                    literal,
-                    dep_key
-                ));
-            }
+            // No per-package "Adding X to dependencies" line — the
+            // user typed the package on the command line, and the
+            // `+ pkg@version` list in the Done block confirms what
+            // landed in the manifest. Redundant cliclack-style chatter.
             doc[dep_key][&name] = serde_json::Value::String(literal);
             doc_mutated = true;
             entries.push(StagedEntry {
@@ -10901,13 +11048,10 @@ pub(crate) fn stage_packages_to_manifest(
             .and_then(|v| v.as_str())
             .is_some();
         if is_bare_reinstall && already_present && !force_rewrite {
-            if !json_output {
-                output::info(&format!(
-                    "Refreshing {} in {} ({target_label}) — keeping existing range",
-                    name.bold(),
-                    dep_key
-                ));
-            }
+            // Silent: no "Refreshing X in deps" line. The Done-block
+            // `+` list only fires when something actually changed —
+            // a bare reinstall that keeps the existing range produces
+            // no diff and therefore no list, which is the right signal.
             entries.push(StagedEntry {
                 name,
                 intent,
@@ -10919,14 +11063,8 @@ pub(crate) fn stage_packages_to_manifest(
         // Tier 3: bare/dist-tag without an existing entry, OR an existing
         // entry that the user explicitly opted to rewrite via a flag.
         // Stage a placeholder; finalize will replace it after the resolver
-        // returns the concrete version.
-        if !json_output {
-            output::info(&format!(
-                "Adding {} to {} ({target_label})",
-                name.bold(),
-                dep_key
-            ));
-        }
+        // returns the concrete version. The Done-block `+` list confirms
+        // every staged package once the resolver lands a real version.
         doc[dep_key][&name] = serde_json::Value::String(STAGE_PLACEHOLDER.to_string());
         doc_mutated = true;
         entries.push(StagedEntry {
@@ -11109,6 +11247,10 @@ pub async fn run_add_packages(
     // overrides. Opaque pass-through — see [`run_with_options`].
     strict_sandbox: bool,
     no_sandbox: bool,
+    // forwarded top-level `--verbose` flag — see [`run_with_options`].
+    verbose: bool,
+    // forwarded resolved audit-after-install boolean — see [`run_with_options`].
+    audit_after_install: bool,
 ) -> Result<(), LpmError> {
     // First pass: check if any LPM packages are Swift ecosystem
     // Route Swift packages to SE-0292 registry mode
@@ -11203,13 +11345,8 @@ pub async fn run_add_packages(
         //    `~/.lpm/config.toml` (global) for the persistent save-policy
         //    keys. CLI flags still beat config inside `decide_saved_dependency_spec`.
         let save_config = crate::save_config::SaveConfigLoader::load_for_project(project_dir)?;
-        let staged = stage_packages_to_manifest(
-            &pkg_json_path,
-            &js_packages,
-            save_dev,
-            save_flags,
-            json_output,
-        )?;
+        let staged =
+            stage_packages_to_manifest(&pkg_json_path, &js_packages, save_dev, save_flags)?;
         maybe_test_panic("after-stage");
 
         // 3. Remove lockfile so the resolver re-runs against the staged manifest.
@@ -11246,6 +11383,8 @@ pub async fn run_add_packages(
             verify_policy,
             strict_sandbox,
             no_sandbox,
+            verbose,
+            audit_after_install,
         )
         .await?;
         maybe_test_panic("after-install");
@@ -11312,6 +11451,10 @@ pub async fn run_install_filtered_add(
     // overrides. Opaque pass-through — see [`run_with_options`].
     strict_sandbox: bool,
     no_sandbox: bool,
+    // forwarded top-level `--verbose` — see [`run_with_options`].
+    verbose: bool,
+    // forwarded resolved audit-after-install boolean — see [`run_with_options`].
+    audit_after_install: bool,
 ) -> Result<(), LpmError> {
     // 1. Resolve CLI flags into a concrete target list.
     let targets = crate::commands::install_targets::resolve_install_targets(
@@ -11495,19 +11638,14 @@ pub async fn run_install_filtered_add(
         for (idx, manifest_path) in targets.member_manifests.iter().enumerate() {
             // (a) Stage the target manifest. Explicit specs land verbatim;
             //     bare/dist-tag entries get a `*` placeholder.
-            let staged = match stage_packages_to_manifest(
-                manifest_path,
-                packages,
-                save_dev,
-                save_flags,
-                json_output,
-            ) {
-                Ok(s) => s,
-                Err(e) => {
-                    last_err = Some(e);
-                    break;
-                }
-            };
+            let staged =
+                match stage_packages_to_manifest(manifest_path, packages, save_dev, save_flags) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        last_err = Some(e);
+                        break;
+                    }
+                };
 
             // Use the precomputed install root + lockfile path so the
             // transaction snapshot above and the loop below agree on the
@@ -11563,6 +11701,8 @@ pub async fn run_install_filtered_add(
                 verify_policy.clone(),
                 strict_sandbox,
                 no_sandbox,
+                verbose,
+                audit_after_install,
             )
             .await;
 
@@ -11969,12 +12109,6 @@ fn resolve_version_from_spec<'a>(
                 .join(", ")
         ))),
     }
-}
-
-fn make_spinner(msg: &str) -> cliclack::ProgressBar {
-    let spinner = cliclack::spinner();
-    spinner.start(msg);
-    spinner
 }
 
 /// Auto-install agent skills for direct LPM packages.
@@ -13300,7 +13434,6 @@ mod tests {
             &["react@18.2.0".to_string()],
             false,
             crate::save_spec::SaveFlags::default(),
-            true,
         )
         .unwrap();
 
@@ -13323,7 +13456,6 @@ mod tests {
             &["vitest@1.0.0".to_string()],
             true,
             crate::save_spec::SaveFlags::default(),
-            true,
         )
         .unwrap();
 
@@ -13354,7 +13486,6 @@ mod tests {
             &["new-pkg".to_string()],
             false,
             crate::save_spec::SaveFlags::default(),
-            true,
         )
         .unwrap();
 
@@ -13385,7 +13516,6 @@ mod tests {
             ],
             false,
             crate::save_spec::SaveFlags::default(),
-            true,
         )
         .unwrap();
 
@@ -13421,7 +13551,6 @@ mod tests {
             &["react@18.2.0".to_string()],
             false,
             crate::save_spec::SaveFlags::default(),
-            true,
         )
         .unwrap();
 
@@ -13451,7 +13580,6 @@ mod tests {
             &["ms".to_string()],
             false,
             crate::save_spec::SaveFlags::default(),
-            true,
         )
         .unwrap();
 
@@ -13493,7 +13621,6 @@ mod tests {
             &["react@latest".to_string()],
             false,
             crate::save_spec::SaveFlags::default(),
-            true,
         )
         .unwrap();
 
@@ -13531,7 +13658,7 @@ mod tests {
             ..Default::default()
         };
         let staged =
-            stage_packages_to_manifest(&pkg_path, &["ms".to_string()], false, flags, true).unwrap();
+            stage_packages_to_manifest(&pkg_path, &["ms".to_string()], false, flags).unwrap();
 
         let after = read_manifest(&pkg_path);
         // Existing entry was overwritten with the placeholder; finalize
@@ -13550,7 +13677,6 @@ mod tests {
             &["foo".to_string()],
             false,
             crate::save_spec::SaveFlags::default(),
-            true,
         );
 
         assert!(result.is_err());
@@ -13570,7 +13696,6 @@ mod tests {
             &["foo".to_string()],
             false,
             crate::save_spec::SaveFlags::default(),
-            true,
         );
 
         assert!(result.is_err(), "malformed manifest must error");
@@ -13589,7 +13714,6 @@ mod tests {
             &["foo".to_string()],
             false,
             crate::save_spec::SaveFlags::default(),
-            true,
         )
         .unwrap();
 
@@ -13623,7 +13747,6 @@ mod tests {
             &["ms".to_string()],
             false,
             crate::save_spec::SaveFlags::default(),
-            true,
         )
         .unwrap();
         // Sanity: stage left a placeholder.
@@ -13661,7 +13784,6 @@ mod tests {
             &["react@18.2.0".to_string()],
             false,
             crate::save_spec::SaveFlags::default(),
-            true,
         )
         .unwrap();
         let pre = std::fs::read_to_string(&pkg_path).unwrap();
@@ -13848,7 +13970,6 @@ mod tests {
             &["ms".to_string()],
             false,
             crate::save_spec::SaveFlags::default(),
-            true,
         )
         .unwrap();
 
@@ -13922,6 +14043,8 @@ mod tests {
             crate::provenance_fetch::VerifyPolicy::default(),      // verify_policy
             false,                                                 // strict_sandbox
             false,                                                 // no_sandbox
+            false,                                                 // verbose
+            false,                                                 // audit_after_install
         )
         .await;
 
@@ -13964,6 +14087,8 @@ mod tests {
             crate::provenance_fetch::VerifyPolicy::default(),      // verify_policy
             false,                                                 // strict_sandbox
             false,                                                 // no_sandbox
+            false,                                                 // verbose
+            false,                                                 // audit_after_install
         )
         .await;
 
@@ -14046,7 +14171,6 @@ mod tests {
             &["react@18.2.0".to_string()],
             false,
             crate::save_spec::SaveFlags::default(),
-            true,
         )
         .unwrap();
 

@@ -17,6 +17,7 @@ mod global_blocked_set;
 mod graph_render;
 mod import_rewriter;
 pub mod install_state;
+pub mod install_ui;
 pub mod intelligence;
 mod linker_config;
 mod manifest_tx;
@@ -406,6 +407,31 @@ enum Commands {
         /// > `~/.lpm/config.toml > engine-strict` > default (true).
         #[arg(long)]
         no_engine_strict: bool,
+
+        /// Run `lpm audit` once after a successful install and surface
+        /// a one-line summary (`! Audited N packages, V vulnerabilities,
+        /// S suspicious in Tms — run \`lpm audit\``).
+        ///
+        /// The summary is informational only — vulnerabilities found
+        /// here NEVER fail the install. Run `lpm audit --fail-on=...`
+        /// explicitly if you want a gating audit.
+        ///
+        /// Precedence chain (highest first):
+        ///   1. `--audit-after-install` / `--no-audit-after-install`
+        ///      (this flag pair, mutually exclusive)
+        ///   2. `LPM_AUDIT_AFTER_INSTALL` env (`1`/`true` → on,
+        ///      `0`/`false` → off)
+        ///   3. `~/.lpm/config.toml > audit-after-install = true`
+        ///   4. Default: off
+        #[arg(long, conflicts_with = "no_audit_after_install")]
+        audit_after_install: bool,
+
+        /// Suppress audit-after-install for this invocation regardless
+        /// of env / config. Pairs with `--audit-after-install` so an
+        /// operator who turned the feature on globally can opt out for
+        /// a single run.
+        #[arg(long, conflicts_with = "audit_after_install")]
+        no_audit_after_install: bool,
 
         /// Lifecycle-script policy override for this invocation.
         ///
@@ -2331,6 +2357,70 @@ fn validate_global_uninstall_project_scoped_flags(
     Ok(())
 }
 
+/// Resolve the directory that the install dispatcher should treat as
+/// the project root for this invocation. Three outcomes:
+///
+/// 1. `cwd/package.json` exists → return `cwd`.
+/// 2. An ancestor `package.json` exists → return that ancestor's
+///    directory. Mirrors npm / pnpm / yarn / bun: running `lpm install`
+///    or `lpm i <pkg>` from a project subdirectory walks up to the
+///    manifest instead of failing.
+/// 3. No manifest anywhere → if `adding_packages` (the `lpm i <pkg>`
+///    surface), create a minimal `{ "dependencies": {} }` manifest in
+///    `cwd` and return `cwd`. Otherwise return `cwd` unchanged and let
+///    the bare-install path emit its existing "no package.json found"
+///    error downstream.
+fn resolve_install_project_dir(
+    cwd: &std::path::Path,
+    adding_packages: bool,
+    json_output: bool,
+) -> Result<std::path::PathBuf, lpm_common::LpmError> {
+    if cwd.join("package.json").is_file() {
+        return Ok(cwd.to_path_buf());
+    }
+    if let Some(ancestor) = lpm_workspace::find_project_root(cwd) {
+        if !json_output {
+            crate::install_ui::phase(&format!(
+                "No package.json in {}; using {} (nearest ancestor manifest).",
+                cwd.display(),
+                ancestor.display(),
+            ));
+        }
+        return Ok(ancestor);
+    }
+    if !adding_packages {
+        return Ok(cwd.to_path_buf());
+    }
+    // Auto-create a minimal manifest so `lpm i <pkg>` mirrors
+    // `npm i <pkg>` in a fresh directory. `create_new` guards against
+    // a TOCTOU race with a parallel writer — if someone else won the
+    // race, we treat the file as already-present.
+    let pkg_json_path = cwd.join("package.json");
+    const MINIMAL_PACKAGE_JSON: &str = "{\n  \"dependencies\": {}\n}\n";
+    match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&pkg_json_path)
+    {
+        Ok(mut f) => {
+            use std::io::Write;
+            f.write_all(MINIMAL_PACKAGE_JSON.as_bytes())
+                .map_err(lpm_common::LpmError::Io)?;
+            if !json_output {
+                crate::install_ui::phase(&format!(
+                    "No package.json found in {}. Created a new one.",
+                    cwd.display(),
+                ));
+            }
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            // Lost the race — fall through and use the existing file.
+        }
+        Err(e) => return Err(lpm_common::LpmError::Io(e)),
+    }
+    Ok(cwd.to_path_buf())
+}
+
 /// Whether the trailing "update available" banner should be suppressed
 /// for this invocation.
 ///
@@ -2473,7 +2563,6 @@ fn main() -> Result<()> {
                          }}\n}}"
                     );
                 } else {
-                    output::print_header();
                     output::success(&format!("up to date ({elapsed_ms}ms)"));
                 }
                 std::process::exit(0);
@@ -2827,6 +2916,8 @@ async fn async_main() -> Result<()> {
             no_security_summary,
             auto_build,
             no_engine_strict,
+            audit_after_install,
+            no_audit_after_install,
             filter,
             workspace_root,
             fail_if_no_match,
@@ -2942,8 +3033,44 @@ async fn async_main() -> Result<()> {
                 }
             }
             let cwd = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;
+            // Resolve the project root before any downstream work
+            // touches `package.json`. Matches the directory-discovery
+            // contract of npm / pnpm / yarn / bun: if the cwd has no
+            // manifest, walk up to the nearest ancestor that does and
+            // treat THAT directory as the project root for this
+            // invocation. When nothing is found anywhere and the user
+            // is adding packages (`lpm i <pkg>` rather than bare
+            // `lpm install`), create a minimal manifest in cwd so the
+            // add path doesn't crash on the missing file. Bare install
+            // intentionally keeps the missing-manifest error — it has
+            // nothing to install against.
+            let cwd = resolve_install_project_dir(&cwd, !packages.is_empty(), cli.json)?;
             let cfg = commands::config::GlobalConfig::load();
             let eff_allow_new = allow_new || cfg.get_bool("allowNew").unwrap_or(false);
+
+            // Resolve the audit-after-install precedence chain ONCE
+            // before threading the resolved boolean into every install
+            // entry point. Order (highest first):
+            //   1. `--audit-after-install` / `--no-audit-after-install`
+            //      (clap already enforced mutual exclusion)
+            //   2. `LPM_AUDIT_AFTER_INSTALL` env
+            //      (`1`/`true`/`yes`/`on` → on, `0`/`false`/`no`/`off`
+            //      → off, anything else falls through)
+            //   3. `~/.lpm/config.toml > audit-after-install`
+            //   4. Default off.
+            let eff_audit_after_install: bool = if audit_after_install {
+                true
+            } else if no_audit_after_install {
+                false
+            } else if let Ok(env_val) = std::env::var("LPM_AUDIT_AFTER_INSTALL") {
+                match env_val.trim().to_lowercase().as_str() {
+                    "1" | "true" | "yes" | "on" => true,
+                    "0" | "false" | "no" | "off" => false,
+                    _ => cfg.get_bool("audit-after-install").unwrap_or(false),
+                }
+            } else {
+                cfg.get_bool("audit-after-install").unwrap_or(false)
+            };
 
             // engines.lpm / engines.node enforcement (workspace root).
             // Runs before any install work so a constraint violation
@@ -3149,6 +3276,8 @@ async fn async_main() -> Result<()> {
                         // `strict_sandbox` boolean).
                         strict_sandbox || paranoid,
                         no_sandbox,
+                        cli.verbose,
+                        eff_audit_after_install,
                     )
                     .await
                 }
@@ -3174,6 +3303,8 @@ async fn async_main() -> Result<()> {
                     verify_policy,
                     strict_sandbox || paranoid,
                     no_sandbox,
+                    cli.verbose,
+                    eff_audit_after_install,
                 )
                 .await
             } else {
@@ -3205,6 +3336,8 @@ async fn async_main() -> Result<()> {
                         verify_policy,
                         strict_sandbox || paranoid,
                         no_sandbox,
+                        cli.verbose,
+                        eff_audit_after_install,
                     )
                     .await
                 } else {
@@ -3224,6 +3357,8 @@ async fn async_main() -> Result<()> {
                         verify_policy,
                         strict_sandbox || paranoid,
                         no_sandbox,
+                        cli.verbose,
+                        eff_audit_after_install,
                     )
                     .await
                 }
@@ -3399,10 +3534,6 @@ async fn async_main() -> Result<()> {
                         "Provide the registry auth token",
                     )
                 };
-
-                if !cli.json {
-                    output::print_header();
-                }
 
                 // Token: from --token flag, or interactive prompt with masked input
                 let auth_token = if let Some(t) = token {

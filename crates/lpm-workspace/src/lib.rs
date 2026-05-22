@@ -1734,6 +1734,31 @@ pub fn discover_workspace(start_dir: &Path) -> Result<Option<Workspace>, Workspa
     Ok(None)
 }
 
+/// Walk up from `start_dir` to find the nearest ancestor directory
+/// that contains a `package.json` and return that directory.
+///
+/// Matches npm / pnpm / yarn / bun behavior for the "I'm in a subdir
+/// of the project, run install here" case. Returns `None` when no
+/// ancestor manifest exists all the way to the filesystem root.
+///
+/// `discover_workspace` is the right call when only a workspace root
+/// (one that declares `workspaces` globs or has a sibling
+/// `pnpm-workspace.yaml`) counts as a match. This helper is the
+/// looser counterpart — any `package.json` qualifies — used by the
+/// install dispatcher so a bare `lpm install` or `lpm i <pkg>` in a
+/// non-workspace subdirectory still finds the project root.
+pub fn find_project_root(start_dir: &Path) -> Option<PathBuf> {
+    let mut current = start_dir.to_path_buf();
+    loop {
+        if current.join("package.json").is_file() {
+            return Some(current);
+        }
+        if !current.pop() {
+            return None;
+        }
+    }
+}
+
 /// Read and parse a package.json file.
 pub fn read_package_json(path: &Path) -> Result<PackageJson, WorkspaceError> {
     let content = std::fs::read_to_string(path)
