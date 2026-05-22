@@ -3969,6 +3969,33 @@ async fn run_with_options_under_store_lock(
         output::warn(w);
     }
 
+    // Compute the actual set of registry hosts the resolver will hit
+    // for THIS project's top-level deps. Workspace-member file refs
+    // and other non-registry protocols contribute no origin — they
+    // don't route through a registry. Reused below as `eager_origins`
+    // for the per-origin TLS overrides; computing once here keeps the
+    // slim-UI resolving line and the TLS plumbing in lockstep.
+    //
+    // Showing `client.base_url()` (always `lpm.dev`) for every project
+    // would be a lie for any tree without `@lpm.dev/*` deps — the most
+    // common case. The route table knows the real destination per
+    // package; this line surfaces that truth.
+    let top_level_specs: Vec<String> = deps
+        .iter()
+        .filter_map(
+            |(local_name, range)| match lpm_resolver::Specifier::parse(range) {
+                Ok(lpm_resolver::Specifier::SemverRange(_)) => Some(local_name.clone()),
+                Ok(lpm_resolver::Specifier::NpmAlias { target, .. }) => Some(target),
+                _ => None,
+            },
+        )
+        .collect();
+    let eager_origins = route_table.effective_registry_origins(
+        &top_level_specs,
+        client.base_url(),
+        client.npm_registry_url(),
+    );
+
     // Persistent `› Resolving …` phase line. Sits ABOVE the resolver so
     // the user sees what hosts are about to be hit before any network
     // I/O. `is_add_invocation` distinguishes `lpm i <pkg>` (already named
@@ -3977,12 +4004,28 @@ async fn run_with_options_under_store_lock(
     // resolved).
     let is_add_invocation = direct_versions_out.is_some();
     if !json_output {
-        let host = install_ui::short_registry_host(client.base_url());
+        let hosts_label = if eager_origins.is_empty() {
+            // No top-level registry deps (workspace-only or empty
+            // install). Fall back to the configured worker host so the
+            // line isn't empty in the user's terminal.
+            install_ui::short_registry_host(client.base_url())
+        } else {
+            eager_origins
+                .iter()
+                .map(|o| {
+                    o.host_lower
+                        .strip_prefix("registry.")
+                        .unwrap_or(&o.host_lower)
+                        .to_owned()
+                })
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
         let line = if is_add_invocation {
-            format!("Resolving dependencies from {host}")
+            format!("Resolving dependencies from {hosts_label}")
         } else {
             format!(
-                "Resolving dependencies from {host} for {}",
+                "Resolving dependencies from {hosts_label} for {}",
                 install_ui::bold(pkg_name)
             )
         };
@@ -4152,37 +4195,12 @@ async fn run_with_options_under_store_lock(
     // directly, not `arc_client`) sees the configured client. The
     // `route_table` itself was built earlier (above the empty-deps
     // short-circuit) so its warnings always surface.
-    // — request-aware eager-build (Δ1). Filter `deps` to
-    // entries that ACTUALLY route through a registry by package name;
-    // local/file/link/tarball-URL/git/workspace specs don't, and
-    // would either eager-build unrelated origins (causing failures
-    // on configured-but-unused TLS) or mask the real registry origin
-    // for npm aliases. GPT post-T4 MEDIUM finding.
     //
-    // Mapping per Specifier variant:
-    // - SemverRange     → local_name routes through scope/default
-    // - NpmAlias{target} → target routes (NOT the local alias)
-    // - File/Link/Workspace/Tarball/Git → no registry route, skip
-    // - parse error     → skip (the install will fail later anyway)
-    //
-    // Workspace-member deps are local file refs — they don't route
-    // through registries, so they stay out of the effective set.
-    // Transitive deps surfacing later go through the lazy path.
-    let top_level_specs: Vec<String> = deps
-        .iter()
-        .filter_map(
-            |(local_name, range)| match lpm_resolver::Specifier::parse(range) {
-                Ok(lpm_resolver::Specifier::SemverRange(_)) => Some(local_name.clone()),
-                Ok(lpm_resolver::Specifier::NpmAlias { target, .. }) => Some(target),
-                _ => None,
-            },
-        )
-        .collect();
-    let eager_origins = route_table.effective_registry_origins(
-        &top_level_specs,
-        client.base_url(),
-        client.npm_registry_url(),
-    );
+    // `top_level_specs` + `eager_origins` are computed above (where the
+    // slim-UI resolving line consumes them) — both surfaces must agree
+    // on the same route map, so they share one derivation. Workspace-
+    // member file refs, link/file/tarball/git specs, and unparseable
+    // ranges all contribute no origin per `Specifier::parse`.
     let owned_client = client
         .clone_with_config()
         .with_tls_overrides_for(route_table.tls_overrides(), &eager_origins)?;
@@ -7964,10 +7982,27 @@ async fn run_with_options_under_store_lock(
         // Only deps whose resolved version CHANGED in this run land in
         // the `+ pkg@version` list — a no-op refresh prints no list,
         // `lpm i react` prints just `+ react@…`, and a hand-edited
-        // manifest prints exactly the diff. `collect_direct_versions`
-        // honors the resolver's `is_direct` flag so transitives never
+        // manifest prints exactly the diff. The resolver's `is_direct`
+        // flag scopes the diff to top-level deps so transitives never
         // pollute the list.
-        let post_direct_versions = collect_direct_versions(&packages);
+        //
+        // Inlined silent variant of [`collect_direct_versions`]. The
+        // canonical helper emits a `tracing::warn!` on duplicate
+        // `is_direct = true` entries — useful as a diagnostic for the
+        // `lpm i <pkg>` finalize path, but a latent resolver bug
+        // occasionally double-marks deps like `chalk` / `ora` when
+        // peer-rule auto-installs collide with their declared positions.
+        // Surfacing that warning on every bare install of a typical
+        // project would look broken. Silent last-wins instead.
+        let post_direct_versions: HashMap<String, lpm_semver::Version> = packages
+            .iter()
+            .filter(|p| p.is_direct)
+            .filter_map(|p| {
+                lpm_semver::Version::parse(&p.version)
+                    .ok()
+                    .map(|v| (p.name.clone(), v))
+            })
+            .collect();
         let mut changed_direct: Vec<(String, String)> = Vec::new();
         for (name, post_v) in &post_direct_versions {
             let post_str = post_v.to_string();
